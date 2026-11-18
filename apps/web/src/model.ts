@@ -1700,6 +1700,7 @@ export interface TimelineItemView {
   readonly quotesEncoded?: boolean;
   /** Ordered UTF-16 spans used to render compact sent-paste atoms. */
   readonly pastedTextRanges?: readonly TimelineInlineTextRangeView[];
+  readonly messageReferences?: readonly import("@joko/contracts").TaskMessageReferenceRange[];
   /** Service-authored receipt of the exact accepted user input. */
   readonly userInputAccepted?: true;
   readonly sharedTaskAuthor?: import("@joko/contracts").SharedTaskAuthor;

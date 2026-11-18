@@ -270,6 +270,7 @@ import type {
   UsageSnapshot
 } from "@joko/core";
 import { validInlineTextRanges, validInputMentionRanges, validModelSubstitution } from "@joko/core";
+import { validInputMessageReferences } from "@joko/contracts";
 import type { ExtraDirectoryRecord } from "./extra-directory-manager.js";
 import { TIMED_EXTENSION_INTERACTION_EXPIRED_REASON } from "./interaction-expiry.js";
 import {
@@ -1217,6 +1218,7 @@ export function toProtoInputContent(input: PromptInput): InputContent {
     "input.pasted_text_ranges"
   );
   const mentionRanges = checkedInputMentionRanges(input.text, input.mentions, input.mentionRanges ?? [], pastedTextRanges);
+  const messageReferences = checkedMessageReferences(input.text, input.messageReferences ?? [], [...pastedTextRanges, ...mentionRanges]);
   const parts: InputPart[] = [];
   if (input.text !== "" || (input.images.length === 0 && input.files.length === 0 && input.mentions.length === 0)) {
     parts.push(message<InputPart>("joko.v1.InputPart", { content: { case: "text", value: input.text } }));
@@ -1312,7 +1314,8 @@ export function toProtoInputContent(input: PromptInput): InputContent {
       start: range.start,
       end: range.end,
       mentionIndex: range.mentionIndex
-    }))
+    })),
+    messageReferences: messageReferences.map((reference) => message<contract.InputMessageReference>("joko.v1.InputMessageReference", reference))
   });
 }
 
@@ -1405,6 +1408,10 @@ export function fromProtoInputContent(
     end: range.end,
     mentionIndex: range.mentionIndex
   })), pastedTextRanges);
+  const messageReferences = checkedMessageReferences(joinedText, (content?.messageReferences ?? []).map((reference) => ({
+    start: reference.start, end: reference.end, sourceSessionId: reference.sourceSessionId,
+    messageId: reference.messageId, eventId: reference.eventId
+  })), [...pastedTextRanges, ...mentionRanges]);
   return {
     text: joinedText,
     images,
@@ -1415,7 +1422,8 @@ export function fromProtoInputContent(
     ...(content?.todoQuote ? { todoQuote: fromProtoPartnerTodoQuote(content.todoQuote) } : {}),
     ...(content?.quotesEncoded === true ? { quotesEncoded: true } : {}),
     ...(pastedTextRanges.length === 0 ? {} : { pastedTextRanges }),
-    ...(mentionRanges.length === 0 ? {} : { mentionRanges })
+    ...(mentionRanges.length === 0 ? {} : { mentionRanges }),
+    ...(messageReferences.length === 0 ? {} : { messageReferences })
   };
 }
 
@@ -1514,6 +1522,17 @@ function checkedInputMentionRanges(
     );
   }
   return ranges;
+}
+
+function checkedMessageReferences(
+  text: string,
+  references: NonNullable<PromptInput["messageReferences"]>,
+  occupied: readonly { readonly start: number; readonly end: number }[]
+): typeof references {
+  if (!validInputMessageReferences(text, references, occupied)) {
+    throw new ProtoMappingError("invalid_argument", "input.message_references", "Message references must identify exact events in ordered, non-overlapping input ranges.");
+  }
+  return references;
 }
 
 function toProtoSessionAttention(attention: CoreSessionAttention): contract.SessionAttention {

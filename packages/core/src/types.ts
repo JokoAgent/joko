@@ -286,6 +286,15 @@ export interface InputMentionRange {
   readonly mentionIndex: number;
 }
 
+/** One explicit ordinary message reference at its UTF-16 position in accepted text. */
+export interface InputMessageReferenceRange {
+  readonly start: number;
+  readonly end: number;
+  readonly sourceSessionId: string;
+  readonly messageId: string;
+  readonly eventId: string;
+}
+
 /** UTF-16 offsets identifying an inline source span with a compact display label. */
 export interface InlineTextRange {
   readonly start: number;
@@ -378,6 +387,8 @@ export interface PromptInput {
   readonly pastedTextRanges?: readonly InlineTextRange[];
   /** Exact inline occurrences; mentions without inline text may omit these ranges. */
   readonly mentionRanges?: readonly InputMentionRange[];
+  /** Exact ordinary message anchors. The Host resolves their current visible text before dispatch. */
+  readonly messageReferences?: readonly InputMessageReferenceRange[];
   /**
    * Service-owned continuation identity. Public SendInput contracts never
    * accept this field; it exists so an internally replayed prompt can retain

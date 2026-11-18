@@ -76,6 +76,7 @@ export function createTaskSharingRuntime(
             && item.entity.id === sessionId)?.expectedGeneration;
           if (!generation || generation < 1n || generation > BigInt(Number.MAX_SAFE_INTEGER)) throw new ConnectError("The source task generation is required.", Code.InvalidArgument);
           const prompt = fromProtoInputContent(payload.value.input, disposition(payload.value.deliveryMode));
+          if (prompt.messageReferences !== undefined) throw denied();
           const overrides = coreTurnOverrides(payload.value.overrides);
           return transactional(transaction => {
             const queued = host.commitQueuedInput(transaction, { operationId: request.operationId, sessionId,

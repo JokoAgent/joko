@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { taskMessageReferenceHref } from "@joko/contracts";
 import {
   appendQuoteToComposerDocument,
   appendTextToComposerDocument,
@@ -268,6 +269,18 @@ describe("composer quote documents", () => {
       display: "Pasted text (2 lines)"
     }]);
     expect(serialized.text.slice(serialized.pastedTextRanges![0]!.start, serialized.pastedTextRanges![0]!.end)).toBe(text);
+  });
+
+  it("restores only durable whole-message occurrences when identical links appear in the draft", () => {
+    const anchor = { sourceSessionId: source.sessionId, messageId: "earlier-message", eventId: "earlier-event" };
+    const href = taskMessageReferenceHref(anchor);
+    const prefix = `Earlier link ${href}\n- Then 🟢 `;
+    const text = `${prefix}${href} after`;
+    const range = { ...anchor, start: prefix.length, end: prefix.length + href.length };
+    const restored = composerDocumentFromMessage(text, false, source, "history", [], [range]);
+    expect(serializeComposerDocument(restored)).toEqual({ text, quotesEncoded: false, messageReferences: [range] });
+    const copied = composerDocumentFromMessage(text, false, { ...source, sessionId: "another-task" }, "history", [], [range]);
+    expect(serializeComposerDocument(copied)).toEqual({ text, quotesEncoded: false });
   });
 
   it("keeps multiple pasted ranges precise across quote block separators", () => {

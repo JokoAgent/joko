@@ -709,6 +709,9 @@ message InputContent {
   // the original visible message; the bounded excerpt is display data only.
   PartnerReplyQuote reply_quote = 5;
   PartnerTodoQuote todo_quote = 6;
+  // Inline references deliberately inserted from a visible ordinary message.
+  // Only the receiving task may resolve the exact event to model context.
+  repeated InputMessageReference message_references = 7;
 }
 message PartnerTodoQuote { string partner_id = 1; string todo_id = 2; uint64 revision = 3; string title = 4; }
 
@@ -724,6 +727,14 @@ message InputMentionRange {
   uint32 start = 1;
   uint32 end = 2;
   uint32 mention_index = 3;
+}
+
+message InputMessageReference {
+  uint32 start = 1;
+  uint32 end = 2;
+  string source_session_id = 3;
+  string message_id = 4;
+  string event_id = 5;
 }
 
 message InlineTextRange {

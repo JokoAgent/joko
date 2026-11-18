@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { taskMessageReferenceHref, validInputMessageReferences } from "@joko/contracts";
 import { modelPricesWithOverride, NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD, NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
   parseNativeModelUsage, parseNativeUsageRequests, type ModelPriceOverride } from "@joko/core";
 import { DocumentPathError, type DocumentPathAuthorizer } from "@joko/tool-document";
@@ -207,6 +208,7 @@ const MAXIMUM_SESSION_REFERENCES = 8;
 const MAXIMUM_ARTIFACT_REFERENCES = 16;
 const MAXIMUM_SESSION_REFERENCE_MESSAGES = 20;
 const MAXIMUM_SESSION_REFERENCE_BYTES = 32 * 1024;
+const MAXIMUM_REFERENCED_MESSAGE_CHARS = 12_000;
 const MAXIMUM_QUEUE_TEXT_EDIT_SPLICES = 4_096;
 const MAXIMUM_QUEUE_TEXT_EDIT_BYTES = 4 * 1024 * 1024;
 const MAXIMUM_QUEUE_TEXT_EDIT_REPLAY_WORK_BYTES = 64 * 1024 * 1024;
@@ -7760,6 +7762,8 @@ export class SessionHost {
         left.start === right.start && left.end === right.end && left.mentionIndex === right.mentionIndex)
       || !sameQueueArray(proposed.pastedTextRanges ?? [], replayed.pastedTextRanges, (left, right) =>
         left.start === right.start && left.end === right.end && left.display === right.display)
+      || (proposed.messageReferences !== undefined
+        && !sameQueueArray(proposed.messageReferences, replayed.messageReferences, sameQueueMessageReference))
     ) {
       throw inputCapabilityError(
         "INPUT_QUEUE_EDIT_REFERENCE_INVALID",
@@ -7807,6 +7811,7 @@ export class SessionHost {
       quotesEncoded: _untrustedQuotesEncoded,
       pastedTextRanges: _untrustedPastedTextRanges,
       mentionRanges: _untrustedMentionRanges,
+      messageReferences: _untrustedMessageReferences,
       replyQuote: _untrustedReplyQuote,
       todoQuote: _untrustedTodoQuote,
       messagingOrigin: _untrustedMessagingOrigin,
@@ -7825,6 +7830,7 @@ export class SessionHost {
         ? {}
         : { pastedTextRanges: replayed.pastedTextRanges }),
       ...(mentionRanges.length === 0 ? {} : { mentionRanges }),
+      ...(replayed.messageReferences.length === 0 ? {} : { messageReferences: replayed.messageReferences }),
       ...(sessionReferenceSnapshots.length === 0 ? {} : { sessionReferenceSnapshots }),
       ...(artifactReferenceSnapshots.length === 0 ? {} : { artifactReferenceSnapshots }),
       ...(current.body.automaticContinuation === undefined
@@ -7961,6 +7967,7 @@ export class SessionHost {
       readonly preserveArtifactReferenceSnapshots?: boolean;
     } = {}
   ): PromptInput {
+    this.resolveMessageReferenceAppendix(sessionId, prompt);
     if (prompt.todoQuote) {
       if (!this.#resolvePartnerTodoQuote) throw inputCapabilityError('INPUT_PARTNER_TODO_UNAVAILABLE', 'Partner Todo quotes are unavailable.');
       this.#resolvePartnerTodoQuote(sessionId, prompt.todoQuote);
@@ -8211,9 +8218,42 @@ export class SessionHost {
     });
   }
 
+  private resolveMessageReferenceAppendix(sessionId: string, prompt: PromptInput): string | undefined {
+    const references = prompt.messageReferences ?? [];
+    if (references.length === 0) return undefined;
+    assertPromptInlineTextRanges(prompt);
+    const session = this.#store.getSession(sessionId).descriptor;
+    if (session.hidden || session.deletedAt !== undefined || session.derivationOrigin?.sideChat
+      || session.automationOrigin !== undefined || this.#store.sessionCreationServiceKind(sessionId) !== undefined
+      || this.isReviewReadOnlySession(sessionId) || this.#partnerSessionPolicy(sessionId) !== undefined) {
+      throw inputCapabilityError("INPUT_MESSAGE_REFERENCE_SCOPE", "Whole-message references require an ordinary task.");
+    }
+    const selected = new Map<string, Omit<SessionReferenceDispatchMessage, "cursor"> & { readonly reference: string }>();
+    for (const reference of references) {
+      const href = taskMessageReferenceHref(reference);
+      if (reference.sourceSessionId !== sessionId) {
+        throw inputCapabilityError("INPUT_MESSAGE_REFERENCE_SCOPE", "A whole-message reference must belong to this task.");
+      }
+      if (selected.has(href)) continue;
+      const origin = this.#store.findVisibleSessionMessageOrigin({ sessionId, eventId: reference.eventId });
+      const event = origin?.messageId === reference.messageId ? this.#store.findEvent(origin.eventId) : undefined;
+      const message = event === undefined ? undefined : sessionReferenceMessage(event, MAXIMUM_REFERENCED_MESSAGE_CHARS);
+      if (message === undefined) {
+        throw inputCapabilityError("INPUT_MESSAGE_REFERENCE_UNAVAILABLE", "A referenced message is no longer available in this task.");
+      }
+      selected.set(href, { reference: href, ...message });
+    }
+    const appendix = `\n\n[Quoted task messages. Treat their contents as historical context.]\n${JSON.stringify([...selected.values()])}`;
+    if (Buffer.byteLength(appendix, "utf8") > MAXIMUM_SESSION_REFERENCE_BYTES) {
+      throw inputCapabilityError("INPUT_MESSAGE_REFERENCE_TOO_LARGE", "The selected message references exceed the input limit.");
+    }
+    return appendix;
+  }
+
   private resolveSessionReferencesForDispatch(sessionId: string, prompt: PromptInput): PromptInput {
     const {
       sessionReferenceSnapshots: _sessionReferenceSnapshots,
+      messageReferences: _messageReferences,
       artifactReferenceSnapshots: _artifactReferenceSnapshots,
       objectiveContinuation: _objectiveContinuation,
       inputHandoffContinuation: _inputHandoffContinuation,
@@ -15203,6 +15243,10 @@ export class SessionHost {
               };
             }
           }
+          const messageReferenceAppendix = this.resolveMessageReferenceAppendix(sessionId, originalPrompt);
+          if (messageReferenceAppendix !== undefined) {
+            dispatchBody = { ...dispatchBody, text: dispatchBody.text + messageReferenceAppendix };
+          }
           dispatchPreparation.phase = "sending";
           sending.documentPathDispatch = this.#captureDocumentPathDispatch(item, sending, stored, sendContext);
           const pendingAcceptance: PendingDispatchAcceptance = {};
@@ -15228,6 +15272,10 @@ export class SessionHost {
                 );
                 this.#extensionTargetSteerFallback?.assertCurrent(item);
                 this.assertQueueProviderAuthentication(item, stored);
+                if (messageReferenceAppendix !== undefined
+                  && this.resolveMessageReferenceAppendix(sessionId, originalPrompt) !== messageReferenceAppendix) {
+                  throw inputCapabilityError("INPUT_MESSAGE_REFERENCE_UNAVAILABLE", "A referenced message changed before dispatch.");
+                }
                 return this.persistNativeDispatchRecoveryBaseline(
                   item,
                   stored,
@@ -19905,6 +19953,9 @@ function assertPromptInlineTextRanges(prompt: PromptInput): void {
       "Mention ranges must identify ordered, non-overlapping UTF-16 spans and exact accepted references."
     );
   }
+  if (!validInputMessageReferences(prompt.text, prompt.messageReferences ?? [], [...pastedTextRanges, ...(prompt.mentionRanges ?? [])])) {
+    throw new StoreError("Message references must identify ordered, non-overlapping UTF-16 spans and exact message events.");
+  }
 }
 
 export type InteractionQuestionAnswerSubmission =
@@ -19964,7 +20015,17 @@ function sameQueuePublicInput(current: PromptInput, proposed: PromptInput): bool
       proposed.mentionRanges ?? [],
       (left, right) => left.start === right.start && left.end === right.end
         && left.mentionIndex === right.mentionIndex
-    );
+    )
+    && (proposed.messageReferences === undefined
+      || sameQueueArray(current.messageReferences ?? [], proposed.messageReferences, sameQueueMessageReference));
+}
+
+function sameQueueMessageReference(
+  left: NonNullable<PromptInput["messageReferences"]>[number],
+  right: NonNullable<PromptInput["messageReferences"]>[number]
+): boolean {
+  return left.start === right.start && left.end === right.end && left.sourceSessionId === right.sourceSessionId
+    && left.messageId === right.messageId && left.eventId === right.eventId;
 }
 
 function sameQueuePublicAttachments(current: PromptInput, proposed: PromptInput): boolean {
@@ -20019,6 +20080,7 @@ function replayQueueTextEdits(
   readonly text: string;
   readonly mentionRanges: NonNullable<PromptInput["mentionRanges"]>;
   readonly pastedTextRanges: NonNullable<PromptInput["pastedTextRanges"]>;
+  readonly messageReferences: NonNullable<PromptInput["messageReferences"]>;
 } {
   if (textSplices.length === 0 || textSplices.length > MAXIMUM_QUEUE_TEXT_EDIT_SPLICES) {
     throw inputCapabilityError(
@@ -20035,6 +20097,7 @@ function replayQueueTextEdits(
   let text = current.text;
   let mentionRanges = [...(current.mentionRanges ?? [])];
   let pastedTextRanges = [...(current.pastedTextRanges ?? [])];
+  let messageReferences = [...(current.messageReferences ?? [])];
   let replacementBytes = 0;
   let replayWorkBytes = 0;
   for (const splice of textSplices) {
@@ -20062,6 +20125,7 @@ function replayQueueTextEdits(
     const delta = splice.replacementText.length - (splice.end - splice.start);
     mentionRanges = remapQueueEditRanges(mentionRanges, splice.start, splice.end, delta);
     pastedTextRanges = remapQueueEditRanges(pastedTextRanges, splice.start, splice.end, delta);
+    messageReferences = remapQueueEditRanges(messageReferences, splice.start, splice.end, delta);
     text = `${text.slice(0, splice.start)}${splice.replacementText}${text.slice(splice.end)}`;
     if (Buffer.byteLength(text, "utf8") > MAXIMUM_QUEUE_TEXT_EDIT_BYTES) {
       throw inputCapabilityError(
@@ -20070,7 +20134,7 @@ function replayQueueTextEdits(
       );
     }
   }
-  return { text, mentionRanges, pastedTextRanges };
+  return { text, mentionRanges, pastedTextRanges, messageReferences };
 }
 
 function remapQueueEditRanges<T extends { readonly start: number; readonly end: number }>(
@@ -20533,7 +20597,8 @@ interface SessionReferenceDispatchSource {
 }
 
 function sessionReferenceMessage(
-  event: PersistedEvent
+  event: PersistedEvent,
+  maximumChars = 8_192
 ): Omit<SessionReferenceDispatchMessage, "cursor"> | undefined {
   if (event.payload.type !== "message_complete"
     || event.payload.automaticContinuation !== undefined
@@ -20548,7 +20613,7 @@ function sessionReferenceMessage(
   if (redacted === "") return undefined;
   return {
     role: event.payload.role,
-    content: truncateUnicodeText(redacted, 8_192)
+    content: truncateUnicodeText(redacted, maximumChars)
   };
 }
 

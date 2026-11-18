@@ -59,7 +59,7 @@ import { ErrorTailLocalProjectionStore, explicitErrorAttentionCursor, resolveErr
 import { hidesFromTimelineHistory, resolveActiveRetry, resolveRetryEscapeIntent, resolveRetryStopAction, type RetryEscapeInput, type RetryEscapeTarget } from "./retry-status-behavior.js";
 import { projectRuntimeRecoveryTimeline } from "../runtime-recovery.js";
 import { timelineHistoryOwnerKey } from "../timeline-history-cache.js";
-import { createMessageComposerMention, messageForkBlocked, resolveMessageDeleteTarget, resolveMessageForkTarget } from "./message-actions.js";
+import { createMessageComposerMention, messageForkBlocked, resolveMessageDeleteTarget, resolveMessageForkTarget, wholeMessageComposerReference } from "./message-actions.js";
 import { mergeTimelineWindows } from "./timeline-behavior.js";
 import { restoreMessageAttachmentDrafts, sameMessageAttachments } from "./message-attachment-roundtrip.js";
 import { canEditVisibleUserMessage, changeSetForMessageRound, lastVisibleUserMessage, sameNativeNavigationTarget, messageDialogueRewindTarget, messageRoundRunId, sessionCapabilitySupportsTarget } from "./message-rewind-behavior.js";
@@ -295,7 +295,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   }>();
   const [errorTailRevision, setErrorTailRevision] = useState(0);
   const [bottomInset, setBottomInset] = useState(0);
-  const [composerMessageMentionInsertion, setComposerMessageMentionInsertion] = useState<{ readonly id: number; readonly sessionId: string; readonly mention: NonNullable<ReturnType<typeof createMessageComposerMention>> }>();
+  const [composerMessageMentionInsertion, setComposerMessageMentionInsertion] = useState<{ readonly id: number; readonly sessionId: string; readonly mention: NonNullable<ReturnType<typeof createMessageComposerMention>>; readonly inline?: ReturnType<typeof wholeMessageComposerReference> }>();
   const [composerSelectionQuoteInsertion, setComposerSelectionQuoteInsertion] = useState<{ readonly id: number; readonly sessionId: string; readonly quotes: readonly ComposerSelectionQuoteDraft[] }>();
   const [sideChatRecovery, setSideChatRecovery] = useState<{ readonly record: PendingSideChatDraft; readonly state: "pending" | "working" | "failed" | "existing"; readonly error?: string; readonly canStartAgain?: boolean }>();
   const [sideChatRecoveryLoadError, setSideChatRecoveryLoadError] = useState<string>();
@@ -560,6 +560,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     (candidate) => !candidate.archived && candidate.remoteWorkspace === undefined
   );
   const canAddMessageReference = !reviewReadOnly && backend?.capabilities.get("input.text")?.supported === true;
+  const canAddWholeMessageReference = canAddMessageReference && !guest && controller.state.taskSource?.kind !== "joined"
+    && !session.hidden && !session.archived && !session.derivationOrigin?.sideChat
+    && session.automationOrigin === undefined && (partnerConversation === undefined || partnerConversation.kind === "task");
   const canSendRichAnswer = canAddMessageReference && !session.archived && session.state !== "closed"
     && controller.state.connectionState === "connected" && artifactCatalogDocumentOwner !== undefined;
   const richAnswerSourceKey = taskSourceKey(controller.state.taskSource ?? { kind: "own" });
@@ -974,9 +977,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         messageId: item.id,
         role: "user",
         ...(item.sourceEventId === undefined ? {} : { sourceEventId: item.sourceEventId })
-      }, "history", item.pastedTextRanges);
+      }, "history", item.pastedTextRanges, canAddWholeMessageReference ? item.messageReferences : undefined);
     return [{ text: composerDocumentPlainText(editorDocument), editorDocument }];
-  }).reverse(), [recoveryPresentationTimeline, session.id]);
+  }).reverse(), [recoveryPresentationTimeline, session.id, canAddWholeMessageReference]);
   const durableCommands = useMemo(
     () => commandRefreshSignal.filter((command) => command.sessionId === session.id),
     [commandRefreshSignal, session.id]
@@ -1463,10 +1466,13 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const addMessageToComposer = (item: TimelineItemView): void => {
     const mention = createMessageComposerMention(session.id, session.name, item);
     if (!canAddMessageReference || mention === undefined) return;
+    const inline = canAddWholeMessageReference && item.automationOrigin === undefined
+      ? wholeMessageComposerReference(mention, item) : undefined;
     setComposerMessageMentionInsertion({
       id: ++composerMessageMentionInsertionIdRef.current,
       sessionId: session.id,
-      mention
+      mention,
+      ...(inline === undefined ? {} : { inline })
     });
   };
 
@@ -1905,14 +1911,14 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         messageId: item.id,
         role: "user",
         ...(item.sourceEventId === undefined ? {} : { sourceEventId: item.sourceEventId })
-      }, "edit", item.pastedTextRanges)
-      : (item.pastedTextRanges?.length ?? 0) > 0 && text === (item.text ?? "")
+      }, "edit", item.pastedTextRanges, item.messageReferences)
+      : ((item.pastedTextRanges?.length ?? 0) > 0 || (item.messageReferences?.length ?? 0) > 0) && text === (item.text ?? "")
         ? composerDocumentFromMessage(item.text ?? "", false, {
           sessionId: sourceSessionId,
           messageId: item.id,
           role: "user",
           ...(item.sourceEventId === undefined ? {} : { sourceEventId: item.sourceEventId })
-        }, "edit", item.pastedTextRanges)
+        }, "edit", item.pastedTextRanges, item.messageReferences)
         : plainTextToComposerDocument(text);
     const imageRouted = initialBoundary.snapshot.settings.visionBridge.enabled && initialBoundary.session.model !== undefined
       && initialBoundary.snapshot.settings.visionBridge.targetModels.some((candidate) => candidate.backendId === initialBoundary.session.backendId && candidate.providerId === initialBoundary.session.model?.providerId && candidate.modelId === initialBoundary.session.model.modelId);

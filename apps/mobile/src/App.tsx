@@ -4932,6 +4932,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     const reference = identity && composerOwnerReady && state.owner && state.detail
       && (ownerKey || state.status === "offline") ? captureMobileMessageReference({ ownerKey: ownerKey ?? blockOwnerKey,
       draftOwnerKey: mobileComposerDraftIdentityKey(identity), sessionId: state.selectedId, row, draft: normalDraft,
+      includeBody: state.taskSource?.kind !== "joined" && !workerReadOnly && !partnerIdentity.partner
+        && !session?.derivationOrigin?.sideChat && row.automationOrigin === undefined,
       selection: active ? { start: normalDraft.text.length, end: normalDraft.text.length } : composerSelectionRef.current, locale }) : undefined;
     setMessageAction({ sessionId: state.selectedId, row, profileId: state.activeProfileId, ownerKey,
       ...(reference ? { reference, referenceSource: { owner: state.owner, detail: state.detail, taskSource: state.taskSource } } : {}),

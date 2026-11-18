@@ -1210,6 +1210,7 @@ button.code-host-pull-request-summary:focus-visible { outline: 2px solid var(--a
 .timeline__row { width: 100%; position: absolute; top: 0; left: 0; padding: 7px 0; }
 .timeline__row[data-index="0"] { padding-top: 28px; }
 .timeline__row.is-search-focus { z-index: 1; border-radius: 12px; outline: 2px solid color-mix(in srgb, var(--accent-edge) 72%, transparent); outline-offset: -3px; background: color-mix(in srgb, var(--accent-soft) 72%, transparent); animation: search-focus-pulse .8s ease-out 2; }
+.timeline__row:has(.message-action-menu[open]) { z-index: 2; }
 .timeline-history { max-width: min(460px, calc(100% - 24px)); min-height: 34px; position: absolute; z-index: 4; top: 8px; left: 50%; display: flex; align-items: center; gap: 7px; transform: translateX(-50%); border: 1px solid var(--line); border-radius: 999px; padding: 3px 9px; background: color-mix(in srgb, var(--surface) 94%, transparent); box-shadow: var(--shadow-sm); color: var(--text-soft); font-size: var(--text-11); backdrop-filter: blur(10px); }
 .timeline-history--error { border-color: color-mix(in srgb, var(--red) 30%, var(--line)); color: var(--red); }
 .timeline-history > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

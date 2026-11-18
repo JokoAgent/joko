@@ -1,12 +1,14 @@
 import type { JSONContent } from "@tiptap/core";
+import { validInputMessageReferences, type TaskMessageReferenceRange } from "@joko/contracts";
 import type { ComposerInlineMentionRange, ComposerSelectionQuoteDraft } from "./model.js";
+import type { ComposerRouteReferenceAttrs } from "./components/ComposerRouteReferenceNode.js";
 import { normalizedListAttrs, promoteComposerMarkdownLists } from "./composer-list-document.js";
 import {
   COMPOSER_LONG_PASTE_ATTRIBUTE_LIMIT,
   COMPOSER_PASTED_TEXT_NODE_TYPE,
   COMPOSER_ROUTE_REFERENCE_NODE_TYPE
 } from "./components/composer-paste-pipeline.js";
-import { COMPOSER_MESSAGE_REFERENCE_TEXT_LIMIT } from "./components/composer-route-reference-resolution.js";
+import { COMPOSER_MESSAGE_REFERENCE_TEXT_LIMIT, shortComposerReferenceId } from "./components/composer-route-reference-resolution.js";
 import {
   normalizeSelectionQuoteDrafts,
   parseEncodedSelectionQuoteSegments,
@@ -24,6 +26,7 @@ export interface SerializedComposerDocument {
   readonly text: string;
   readonly quotesEncoded: boolean;
   readonly pastedTextRanges?: readonly ComposerPastedTextRange[];
+  readonly messageReferences?: readonly TaskMessageReferenceRange[];
   /** Occurrences projected into the final serialized text, preserving their identity. */
   readonly mentionRanges?: readonly { readonly mentionId: string; readonly start: number; readonly end: number }[];
 }
@@ -38,6 +41,7 @@ interface SerializedBlock {
   readonly kind: "text" | "quote";
   readonly text: string;
   readonly pastedTextRanges?: readonly ComposerPastedTextRange[];
+  readonly messageReferences?: readonly TaskMessageReferenceRange[];
 }
 
 export function emptyComposerDocument(): JSONContent {
@@ -111,12 +115,14 @@ export function composerDocumentFromMessage(
   quotesEncoded: boolean,
   source: { readonly sessionId: string; readonly messageId: string; readonly sourceEventId?: string; readonly role?: "user" | "assistant" },
   purpose: "edit" | "history",
-  pastedTextRanges: readonly ComposerPastedTextRange[] = []
+  pastedTextRanges: readonly ComposerPastedTextRange[] = [],
+  messageReferences: readonly TaskMessageReferenceRange[] = []
 ): JSONContent {
   const segments = parseSelectionQuoteMessage(content, quotesEncoded).segments;
-  const pastedSegments = pastedTextRanges.length === 0
+  const localReferences = messageReferences.filter((reference) => reference.sourceSessionId === source.sessionId);
+  const pastedSegments = pastedTextRanges.length === 0 && localReferences.length === 0
     ? undefined
-    : buildSentPastedTextMessageSegments(content, quotesEncoded, pastedTextRanges);
+    : buildSentPastedTextMessageSegments(content, quotesEncoded, pastedTextRanges, localReferences);
   return quoteSegmentsToComposerDocument(segments, source, purpose, pastedSegments);
 }
 
@@ -126,10 +132,11 @@ export function composerDocumentFromEditedEncodedMessage(
   editedBody: string,
   source: { readonly sessionId: string; readonly messageId: string; readonly sourceEventId?: string; readonly role?: "user" | "assistant" },
   purpose: "edit" | "history",
-  pastedTextRanges: readonly ComposerPastedTextRange[] = []
+  pastedTextRanges: readonly ComposerPastedTextRange[] = [],
+  messageReferences: readonly TaskMessageReferenceRange[] = []
 ): JSONContent {
-  if (pastedTextRanges.length > 0 && parseSelectionQuoteMessage(encodedContent, true).body === editedBody) {
-    return composerDocumentFromMessage(encodedContent, true, source, purpose, pastedTextRanges);
+  if ((pastedTextRanges.length > 0 || messageReferences.length > 0) && parseSelectionQuoteMessage(encodedContent, true).body === editedBody) {
+    return composerDocumentFromMessage(encodedContent, true, source, purpose, pastedTextRanges, messageReferences);
   }
   const original = parseEncodedSelectionQuoteSegments(encodedContent);
   const textCount = original.filter((segment) => segment.kind === "text").length;
@@ -190,6 +197,15 @@ export function quoteSegmentsToComposerDocument(
         quoteJustEnded = false;
         continue;
       }
+      if (token.kind === "message-reference") {
+        const { sourceSessionId, messageId, eventId } = token.reference;
+        inline.push({ type: COMPOSER_ROUTE_REFERENCE_NODE_TYPE, attrs: {
+          kind: "session", display: shortComposerReferenceId(messageId), href: token.text, serialized: token.text,
+          reference: sourceSessionId, sourceMessageId: messageId, sourceEventId: eventId
+        } });
+        quoteJustEnded = false;
+        continue;
+      }
       if (token.text === "") continue;
       const normalizedText = token.text.replace(/\r\n?/gu, "\n");
       if (isPureLineBreakText(normalizedText)) {
@@ -219,6 +235,7 @@ export function serializeComposerDocument(document: unknown, mentionRanges: read
   let plainCursor = 0;
   let serialized = "";
   const pastedTextRanges: ComposerPastedTextRange[] = [];
+  const messageReferences: TaskMessageReferenceRange[] = [];
   let previousKind: SerializedBlock["kind"] | undefined;
   let suppressNextSeparator = false;
   for (let index = 0; index < blocks.length; index += 1) {
@@ -254,6 +271,7 @@ export function serializeComposerDocument(document: unknown, mentionRanges: read
         display: range.display
       });
     }
+    messageReferences.push(...offsetComposerRanges(block.messageReferences ?? [], blockStart));
     suppressNextSeparator = false;
     previousKind = block.kind;
   }
@@ -264,6 +282,7 @@ export function serializeComposerDocument(document: unknown, mentionRanges: read
     const end = Math.min(text.length, range.end - leadingTrim);
     return start < end ? [{ start, end, display: range.display }] : [];
   });
+  const projectedMessageReferences = offsetComposerRanges(messageReferences, -leadingTrim);
   let projectionIndex = 0;
   let previousEnd = 0;
   const projectedMentions = mentionRanges.map((range) => {
@@ -285,6 +304,7 @@ export function serializeComposerDocument(document: unknown, mentionRanges: read
     text,
     quotesEncoded: blocks.some((block) => block.kind === "quote"),
     ...(projectedRanges.length === 0 ? {} : { pastedTextRanges: projectedRanges }),
+    ...(projectedMessageReferences.length === 0 ? {} : { messageReferences: projectedMessageReferences }),
     ...(projectedMentions.length === 0 ? {} : { mentionRanges: projectedMentions })
   };
 }
@@ -366,22 +386,25 @@ function composerDocumentBlocks(document: JSONContent): readonly SerializedBlock
   for (const top of document.content ?? []) {
     if (top.type === "bulletList" || top.type === "orderedList") {
       const list = listSerializedProjection(top);
-      blocks.push({ kind: "text", text: list.text, ...(list.pastedTextRanges.length === 0 ? {} : { pastedTextRanges: list.pastedTextRanges }) });
+      blocks.push({ kind: "text", ...list });
       continue;
     }
     const children = top.type === "paragraph" ? top.content ?? [] : [top];
     let buffer = "";
     let bufferPastedTextRanges: ComposerPastedTextRange[] = [];
+    let bufferMessageReferences: TaskMessageReferenceRange[] = [];
     let emittedInline = false;
     const flushText = (force = false): void => {
       if (!force && buffer === "") return;
       blocks.push({
         kind: "text",
         text: buffer,
-        ...(bufferPastedTextRanges.length === 0 ? {} : { pastedTextRanges: bufferPastedTextRanges })
+        pastedTextRanges: bufferPastedTextRanges,
+        messageReferences: bufferMessageReferences
       });
       buffer = "";
       bufferPastedTextRanges = [];
+      bufferMessageReferences = [];
       emittedInline = true;
     };
     for (const child of children) {
@@ -401,7 +424,9 @@ function composerDocumentBlocks(document: JSONContent): readonly SerializedBlock
           bufferPastedTextRanges.push({ start, end: buffer.length, display: attrs.display });
         }
       }
-      else if (child.type === COMPOSER_ROUTE_REFERENCE_NODE_TYPE) buffer += routeReferenceAttrs(child.attrs)?.serialized ?? "";
+      else if (child.type === COMPOSER_ROUTE_REFERENCE_NODE_TYPE) {
+        buffer += serializeRouteReference(child, buffer.length, bufferMessageReferences);
+      }
     }
     flushText(!emittedInline);
   }
@@ -411,11 +436,13 @@ function composerDocumentBlocks(document: JSONContent): readonly SerializedBlock
 interface InlineSerializedProjection {
   readonly text: string;
   readonly pastedTextRanges: readonly ComposerPastedTextRange[];
+  readonly messageReferences: readonly TaskMessageReferenceRange[];
 }
 
 function inlineNodesSerializedProjection(nodes: readonly JSONContent[], continuationIndent = ""): InlineSerializedProjection {
   let text = "";
   const pastedTextRanges: ComposerPastedTextRange[] = [];
+  const messageReferences: TaskMessageReferenceRange[] = [];
   for (const node of nodes) {
     if (node.type === "text") text += node.text ?? "";
     else if (node.type === "hardBreak") text += `\n${continuationIndent}`;
@@ -427,13 +454,27 @@ function inlineNodesSerializedProjection(nodes: readonly JSONContent[], continua
         pastedTextRanges.push({ start, end: text.length, display: attrs.display });
       }
     }
-    else if (node.type === COMPOSER_ROUTE_REFERENCE_NODE_TYPE) text += routeReferenceAttrs(node.attrs)?.serialized ?? "";
+    else if (node.type === COMPOSER_ROUTE_REFERENCE_NODE_TYPE) text += serializeRouteReference(node, text.length, messageReferences);
     else if (node.type === COMPOSER_QUOTE_NODE_TYPE) {
       const quote = quoteAttrs(node.attrs);
       if (quote !== undefined) text += selectionQuoteModelText(quote);
     }
   }
-  return { text, pastedTextRanges };
+  return { text, pastedTextRanges, messageReferences };
+}
+
+function serializeRouteReference(node: JSONContent, start: number, messageReferences: TaskMessageReferenceRange[]): string {
+  const attrs = routeReferenceAttrs(node.attrs);
+  if (attrs === undefined) return "";
+  if (attrs.sourceMessageId !== undefined && attrs.sourceEventId !== undefined) {
+    messageReferences.push({ start, end: start + attrs.serialized.length, sourceSessionId: attrs.reference,
+      messageId: attrs.sourceMessageId, eventId: attrs.sourceEventId });
+  }
+  return attrs.serialized;
+}
+
+function offsetComposerRanges<T extends { readonly start: number; readonly end: number }>(ranges: readonly T[], offset: number): T[] {
+  return ranges.map((range) => ({ ...range, start: offset + range.start, end: offset + range.end }));
 }
 
 function listSerializedProjection(list: JSONContent, indent = ""): InlineSerializedProjection {
@@ -452,11 +493,8 @@ function listSerializedProjection(list: JSONContent, indent = ""): InlineSeriali
     const first = inlineNodesSerializedProjection(firstParagraph?.content ?? [], continuationIndent);
     lines.push({
       text: `${prefix}${first.text}`,
-      pastedTextRanges: first.pastedTextRanges.map((range) => ({
-        ...range,
-        start: prefix.length + range.start,
-        end: prefix.length + range.end
-      }))
+      pastedTextRanges: offsetComposerRanges(first.pastedTextRanges, prefix.length),
+      messageReferences: offsetComposerRanges(first.messageReferences, prefix.length)
     });
     for (const child of blocks) {
       if (child === firstParagraph) continue;
@@ -466,11 +504,8 @@ function listSerializedProjection(list: JSONContent, indent = ""): InlineSeriali
         const continuation = inlineNodesSerializedProjection(child.content ?? [], continuationIndent);
         lines.push({
           text: `${continuationIndent}${continuation.text}`,
-          pastedTextRanges: continuation.pastedTextRanges.map((range) => ({
-            ...range,
-            start: continuationIndent.length + range.start,
-            end: continuationIndent.length + range.end
-          }))
+          pastedTextRanges: offsetComposerRanges(continuation.pastedTextRanges, continuationIndent.length),
+          messageReferences: offsetComposerRanges(continuation.messageReferences, continuationIndent.length)
         });
       }
     }
@@ -481,15 +516,15 @@ function listSerializedProjection(list: JSONContent, indent = ""): InlineSeriali
 function joinSerializedLines(lines: readonly InlineSerializedProjection[]): InlineSerializedProjection {
   let text = "";
   const pastedTextRanges: ComposerPastedTextRange[] = [];
+  const messageReferences: TaskMessageReferenceRange[] = [];
   lines.forEach((line, index) => {
     if (index > 0) text += "\n";
     const lineStart = text.length;
     text += line.text;
-    for (const range of line.pastedTextRanges) {
-      pastedTextRanges.push({ ...range, start: lineStart + range.start, end: lineStart + range.end });
-    }
+    pastedTextRanges.push(...offsetComposerRanges(line.pastedTextRanges, lineStart));
+    messageReferences.push(...offsetComposerRanges(line.messageReferences, lineStart));
   });
-  return { text, pastedTextRanges };
+  return { text, pastedTextRanges, messageReferences };
 }
 
 function normalizeListNode(node: Record<string, unknown>): JSONContent | undefined {
@@ -570,7 +605,7 @@ function pastedTextAttrs(value: unknown): { readonly text: string; readonly disp
     : undefined;
 }
 
-function routeReferenceAttrs(value: unknown): { readonly kind: "session" | "project" | "path"; readonly display: string; readonly serialized: string; readonly reference: string; readonly href?: string; readonly semanticText?: string; readonly semanticTextTruncated?: boolean } | undefined {
+function routeReferenceAttrs(value: unknown): ComposerRouteReferenceAttrs | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
   const attrs = value as Record<string, unknown>;
   const kind = attrs["kind"];
@@ -580,6 +615,8 @@ function routeReferenceAttrs(value: unknown): { readonly kind: "session" | "proj
   const href = attrs["href"];
   const semanticText = attrs["semanticText"];
   const semanticTextTruncated = attrs["semanticTextTruncated"];
+  const sourceMessageId = attrs["sourceMessageId"];
+  const sourceEventId = attrs["sourceEventId"];
   if ((kind !== "session" && kind !== "project" && kind !== "path")
     || typeof display !== "string" || display.length === 0 || display.length > 500
     || typeof serialized !== "string" || serialized.length === 0 || serialized.length > 4_096
@@ -588,6 +625,13 @@ function routeReferenceAttrs(value: unknown): { readonly kind: "session" | "proj
     || (href !== undefined && href !== null && (typeof href !== "string" || href.length === 0 || href.length > 4_096))
     || (semanticText !== undefined && semanticText !== null && (typeof semanticText !== "string" || semanticText.length === 0 || semanticText.length > COMPOSER_MESSAGE_REFERENCE_TEXT_LIMIT))
     || (semanticTextTruncated !== undefined && semanticTextTruncated !== null && typeof semanticTextTruncated !== "boolean")) return undefined;
+  let messageAnchor: Pick<ComposerRouteReferenceAttrs, "sourceMessageId" | "sourceEventId"> | undefined;
+  if (sourceMessageId != null || sourceEventId != null) {
+    if (kind !== "session" || typeof sourceMessageId !== "string" || typeof sourceEventId !== "string") return undefined;
+    const range = { start: 0, end: serialized.length, sourceSessionId: reference, messageId: sourceMessageId, eventId: sourceEventId };
+    if (!validInputMessageReferences(serialized, [range]) || serialized !== href) return undefined;
+    messageAnchor = { sourceMessageId, sourceEventId };
+  }
   return {
     kind,
     display,
@@ -595,7 +639,8 @@ function routeReferenceAttrs(value: unknown): { readonly kind: "session" | "proj
     reference,
     ...(typeof href === "string" ? { href } : {}),
     ...(typeof semanticText === "string" ? { semanticText } : {}),
-    ...(semanticTextTruncated === true ? { semanticTextTruncated: true } : {})
+    ...(semanticTextTruncated === true ? { semanticTextTruncated: true } : {}),
+    ...messageAnchor
   };
 }
 

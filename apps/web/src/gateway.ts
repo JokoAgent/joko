@@ -985,6 +985,7 @@ import type {
 } from "./model.js";
 import { messageMentionWireText } from "./message-reference.js";
 import { composerDocumentPlainText, normalizeComposerDocument, serializeComposerDocument } from "./composer-quote-document.js";
+import { validInputMessageReferences } from "@joko/contracts";
 import { normalizeComposerInlineMentionRanges } from "./composer-mention-ranges.js";
 import { equalQueueItemTextEdit, queueItemEditProjection } from "./queue-item-edit.js";
 import { formatBrowserCommentsForSend, normalizeBrowserCommentTarget } from "./browser-comment-draft.js";
@@ -2311,6 +2312,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (occurrences === undefined) throw new GatewayError("The task input has invalid mention occurrences.");
     const serialized = serializeComposerDocument(document, occurrences);
     const { text, bodyStart } = formatBrowserCommentsForSend(browserComments, serialized.text);
+    const messageReferences = (serialized.messageReferences ?? []).map((range) => ({
+      ...range, start: bodyStart + range.start, end: bodyStart + range.end
+    }));
+    if (messageReferences.some((reference) => reference.sourceSessionId !== sessionId)) {
+      throw new GatewayError("A whole-message reference belongs to its original task.");
+    }
     const typedMentions = mentions.filter((mention) => mention.kind !== "message");
     const mentionIndices = new Map(typedMentions.map((mention, index) => [mention.id, index]));
     const mentionRanges = (serialized.mentionRanges ?? []).map((range) => ({
@@ -2319,6 +2326,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (mentionRanges.some((range) => !utf16Boundary(text, range.start) || !utf16Boundary(text, range.end)
       || serialized.pastedTextRanges?.some((pasted) => range.start < bodyStart + pasted.end && bodyStart + pasted.start < range.end))) {
       throw new GatewayError("The task input mention occurrence overlaps a structured text atom.");
+    }
+    const shiftedPasteRanges = (serialized.pastedTextRanges ?? []).map((range) => ({
+      ...range, start: bodyStart + range.start, end: bodyStart + range.end
+    }));
+    if (!validInputMessageReferences(text, messageReferences, [...mentionRanges, ...shiftedPasteRanges])) {
+      throw new GatewayError("The task input has invalid whole-message reference occurrences.");
     }
     if (text.length > 0) parts.push({ content: { case: "text", value: text } });
     for (const attachment of draft.attachments) {
@@ -2385,12 +2398,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           ...(draft.replyQuote ? { replyQuote: draft.replyQuote } : {}),
           ...(draft.todoQuote ? { todoQuote: draft.todoQuote } : {}),
           quotesEncoded: serialized.quotesEncoded,
-          pastedTextRanges: serialized.pastedTextRanges?.map((range) => ({
-            start: bodyStart + range.start,
-            end: bodyStart + range.end,
-            display: range.display
-          })) ?? [],
-          mentionRanges
+          pastedTextRanges: shiftedPasteRanges,
+          mentionRanges,
+          messageReferences
         },
         deliveryMode: deliveryMode(draft.deliveryMode),
         ...(admission.providerGroupRebalance === undefined ? {} : { providerGroupRebalance: admission.providerGroupRebalance }),
@@ -12963,13 +12973,17 @@ function projectTimelineEvent(
       const userText = kind.value.role === 1 ? messageInputText(userInput) : undefined;
       const userInputAccepted = kind.value.role === 1 && kind.value.userInputAccepted === true;
       const inputMentions = messageInputMentions(userInput);
-      if (!userInputAccepted && (inputMentions.length > 0 || userInput?.mentionRanges.length || userInput?.pastedTextRanges.length || userInput?.quotesEncoded || userInput?.replyQuote || userInput?.todoQuote)) {
+      const messageReferences = userInput?.messageReferences ?? [];
+      if (!userInputAccepted && (inputMentions.length > 0 || userInput?.mentionRanges.length || userInput?.pastedTextRanges.length || messageReferences.length || userInput?.quotesEncoded || userInput?.replyQuote || userInput?.todoQuote)) {
         throw new GatewayError("Orchestrator returned structured user input without an accepted receipt.");
       }
       const pastedTextRanges = userText === undefined
         ? []
         : messageInputPastedTextRanges(userInput, userText);
       const mentionRanges = messageInputMentionRanges(userInput, userText ?? "", inputMentions.length, pastedTextRanges);
+      if (!validInputMessageReferences(userText ?? "", messageReferences, [...mentionRanges, ...pastedTextRanges])) {
+        throw new GatewayError("Orchestrator returned invalid whole-message references.");
+      }
       const rawAutomationOrigin = kind.value.automationOrigin;
       const automationOrigin = rawAutomationOrigin !== undefined && rawAutomationOrigin.scheduleId.trim().length > 0
         ? {
@@ -13013,6 +13027,7 @@ function projectTimelineEvent(
         ...(kind.value.role === 1 && isLocalUserInput?.(event) === true ? { localUserInput: true } : {}),
         ...(userInputAccepted && inputMentions.length > 0 ? { inputMentions } : {}),
         ...(userInputAccepted && mentionRanges.length > 0 ? { mentionRanges } : {}),
+        ...(userInputAccepted && messageReferences.length > 0 ? { messageReferences } : {}),
         ...(userInputAccepted && userInput?.quotesEncoded === true ? { quotesEncoded: true } : {}),
         ...(userInputAccepted && userInput?.replyQuote ? { replyQuote: mapPrivateReplyQuote(userInput.replyQuote) } : {}),
         ...(userInputAccepted && userInput?.todoQuote ? { todoQuote: userInput.todoQuote } : {}),

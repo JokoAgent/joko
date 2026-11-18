@@ -1,13 +1,16 @@
 import { redactSecrets, validInlineTextRanges, validInputMentionRanges, type AdapterContext, type PromptInput } from "@joko/core";
+import { validInputMessageReferences } from "@joko/contracts";
 import type { OperationalStore } from "@joko/store";
 
 /** Author text from the durable composer envelope. Referenced content and
  * inherited native transcripts are evidence, never a new owner's request. */
 export function ownerAuthoredPromptText(input: PromptInput): string {
   const text = input.text, pasted = input.pastedTextRanges ?? [], mentions = input.mentionRanges ?? [];
+  const references = input.messageReferences ?? [];
   if (input.automaticContinuation || input.objectiveContinuation || input.inputHandoffContinuation
-    || !validInlineTextRanges(text, pasted) || !validInputMentionRanges(text, input.mentions ?? [], mentions, pasted)) return "";
-  const excluded: { start: number; end: number }[] = [...pasted, ...mentions];
+    || !validInlineTextRanges(text, pasted) || !validInputMentionRanges(text, input.mentions ?? [], mentions, pasted)
+    || !validInputMessageReferences(text, references, [...pasted, ...mentions])) return "";
+  const excluded: { start: number; end: number }[] = [...pasted, ...mentions, ...references];
   if (input.quotesEncoded) {
     const lines: { text: string; start: number; end: number }[] = [];
     const pattern = /[^\r\n]*(?:\r\n|\r|\n|$)/gu;

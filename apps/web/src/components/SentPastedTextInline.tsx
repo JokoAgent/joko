@@ -25,7 +25,7 @@ export function SentPastedTextInline({ ownerKey, segment, t, renderText }: {
       {segment.tokens.map((token, index) => {
         const start = sourceStart;
         sourceStart += token.text.length;
-        return token.kind === "text"
+        return token.kind !== "pasted"
         ? <span key={`text:${index}`}>{renderText?.(token.text, start) ?? token.text}</span>
         : <button
             className="message-user__pasted-text-chip"

@@ -14525,6 +14525,41 @@ describe("SessionHost", () => {
     return { ...fixture, adapter, before, sessionId, binding, target, authority };
   }
 
+  it("admits only exact same-task message events and retains queue occurrences through attested text edits", async () => {
+    const f = await messageNavigationFixture();
+    const origin = f.store.findVisibleSessionMessageOrigin({ sessionId: f.sessionId, role: "assistant" })!;
+    const prefix = "Review ";
+    const promptFor = (anchor: contract.TaskMessageReferenceAnchor): PromptInput => {
+      const text = prefix + contract.taskMessageReferenceHref(anchor);
+      return { text, images: [], files: [], mentions: [], disposition: "prompt",
+        messageReferences: [{ ...anchor, start: prefix.length, end: text.length }] };
+    };
+    const anchor = { sourceSessionId: f.sessionId, ...origin };
+    const enqueue = (operationId: string, prompt: PromptInput) =>
+      f.host.enqueueInput({ sessionId: f.sessionId, operationId, connection: f.connection, prompt });
+    f.store.setQueuePaused({ sessionId: f.sessionId, paused: true, traceId: "hold-reference" });
+    expect(() => enqueue("foreign-reference", promptFor({ ...anchor, sourceSessionId: "other-task" }))).toThrow(/belong to this task/u);
+    expect(() => enqueue("wrong-event-reference", promptFor({ ...anchor, eventId: "unrelated-event" }))).toThrow(/no longer available/u);
+    expect(() => enqueue("wrong-message-reference", promptFor({ ...anchor, messageId: "unrelated-message" }))).toThrow(/no longer available/u);
+
+    const prompt = promptFor(anchor);
+    const accepted = enqueue("same-message-reference", prompt);
+    const item = f.store.getQueueItem(accepted.value.queueItemId);
+    expect(item.body).toEqual(prompt);
+    const { messageReferences, ...publicInput } = item.body;
+    const insertion = "Please ";
+    const edited = f.host.canonicalQueueItemEdit(item, { ...publicInput, text: insertion + publicInput.text },
+      [{ start: 0, end: 0, replacementText: insertion }]);
+    expect(edited.messageReferences).toEqual(messageReferences!.map(range => ({ ...range,
+      start: range.start + insertion.length, end: range.end + insertion.length })));
+
+    const retargeted = promptFor({ ...anchor, eventId: "unrelated-event" });
+    const replaceAnchor = { start: prefix.length, end: publicInput.text.length, replacementText: retargeted.text.slice(prefix.length) };
+    expect(() => f.host.canonicalQueueItemEdit(item, retargeted, [replaceAnchor])).toThrow(/replayed edit receipts/u);
+    expect(f.host.canonicalQueueItemEdit(item, { ...publicInput, text: prefix + replaceAnchor.replacementText }, [replaceAnchor]))
+      .not.toHaveProperty("messageReferences");
+  });
+
   it.each(["message", "event", "boundary", "newer user"] as const)("rejects changed message navigation authority before native dispatch: %s", async (changed) => {
     const f = await messageNavigationFixture();
     const navigate = vi.spyOn(f.adapter, "navigateTree");
