@@ -64,6 +64,7 @@ import { mergeTimelineWindows } from "./timeline-behavior.js";
 import { restoreMessageAttachmentDrafts, sameMessageAttachments } from "./message-attachment-roundtrip.js";
 import { canEditVisibleUserMessage, changeSetForMessageRound, lastVisibleUserMessage, sameNativeNavigationTarget, messageDialogueRewindTarget, messageRoundRunId, sessionCapabilitySupportsTarget } from "./message-rewind-behavior.js";
 import { reconcileShareSelection, shareableTimelineMessages, toggleShareMessageSelection } from "./share-selection-behavior.js";
+import { MAXIMUM_RENDERED_SHARE_MESSAGES } from "./share-rendered-message-image.js";
 import { ShareSelectionBar } from "./ShareSelectionBar.js";
 import { Timeline, type InlinePlanVisibility } from "./Timeline.js";
 import { NativeFileActionsContext } from "./NativeFileCopyMenu.js";
@@ -1829,6 +1830,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         shareSelectionBeforeAllRef.current = undefined;
         return { sessionId: current.sessionId, selectedIds: new Set(restored), ...(current.anchorId === undefined ? {} : { anchorId: current.anchorId }) };
       }
+      if (shareableMessageIds.length > MAXIMUM_RENDERED_SHARE_MESSAGES) return current;
       shareSelectionBeforeAllRef.current = new Set(current.selectedIds);
       return { sessionId: current.sessionId, selectedIds: new Set(shareableMessageIds), ...(current.anchorId === undefined ? {} : { anchorId: current.anchorId }) };
     });

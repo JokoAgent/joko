@@ -163,6 +163,7 @@ const mobileTaskMessageRows = [
   ["share.preparing", "Preparing image…", "正在生成图片…", "正在產生圖片…", "画像を作成中…", "이미지 생성 중…"],
   ["share.failed", "The image could not be shared. Please try again.", "未能分享图片，请重试。", "無法分享圖片，請重試。", "画像を共有できませんでした。もう一度お試しください。", "이미지를 공유하지 못했습니다. 다시 시도해 주세요."],
   ["share.tooLarge", "The image is too large. Select fewer messages.", "图片过大，请减少选择的消息。", "圖片過大，請減少選取的訊息。", "画像が大きすぎます。選択するメッセージを減らしてください。", "이미지가 너무 큽니다. 메시지를 더 적게 선택해 주세요."],
+  ["share.selectionCountLimit", "Choose up to {count} messages for one image.", "一张图片最多可选 {count} 条消息。", "一張圖片最多可選 {count} 則訊息。", "画像1枚につき {count} 件まで選択できます。", "이미지 한 장에 메시지를 {count}개까지 선택할 수 있어요."],
   ["share.unknown", "Sharing was opened, but its result could not be confirmed.", "已打开系统分享，但无法确认结果。", "已開啟系統分享，但無法確認結果。", "共有画面を開きましたが、結果を確認できませんでした。", "공유 화면을 열었지만 결과를 확인하지 못했습니다."],
   ["common.save", "Save", "保存", "儲存", "保存", "저장"],
   ["common.remove", "Remove", "移除", "移除", "削除", "제거"],

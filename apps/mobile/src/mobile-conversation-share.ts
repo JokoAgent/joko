@@ -3,6 +3,8 @@ import { mobileTimelineGalleryPages, type MobileImageGalleryPage } from "./mobil
 import type { TimelineRow } from "./timeline";
 import { redactShareMessageText } from "@joko/web/share-redaction";
 
+export const MAXIMUM_MOBILE_CONVERSATION_SHARE_MESSAGES = 200;
+
 export interface MobileConversationShareImage {
   readonly uri: string;
   readonly width: number;
@@ -96,16 +98,18 @@ export class MobileConversationShareSelection {
     this.#beforeAll = undefined;
     this.#notify();
   }
-  toggleAll(orderedIds: readonly string[]): void {
-    if (!this.#owner || orderedIds.length === 0) return;
+  toggleAll(orderedIds: readonly string[]): boolean {
+    if (!this.#owner || orderedIds.length === 0) return true;
     if (this.selected(orderedIds).length === orderedIds.length) {
       this.#selected = new Set(orderedIds.filter((id) => this.#beforeAll?.includes(id)));
       this.#beforeAll = undefined;
     } else {
+      if (orderedIds.length > MAXIMUM_MOBILE_CONVERSATION_SHARE_MESSAGES) return false;
       this.#beforeAll = [...this.#selected];
       this.#selected = new Set(orderedIds);
     }
     this.#notify();
+    return true;
   }
   reconcile(owner: string | undefined, orderedIds: readonly string[]): void {
     if (!this.#owner) return;
