@@ -25,17 +25,17 @@ const snapshot = create(SnapshotSchema, {
     { workspaceId: "dialogue-workspace", targetId: "dialogue", displayName: "Dialogue", kind: WorkspaceKind.MANAGED_DIALOGUE }
   ],
   sessions: [
-    { sessionId: "pinned", backendId: "backend", targetId: "project", displayName: "Pinned task", state: SessionState.IDLE,
+    { sessionId: "pinned", backendId: "backend", targetId: "project", projectId: "project", displayName: "Pinned task", state: SessionState.IDLE,
       pinned: true, lastActivityAt: { seconds: 20n } },
-    { sessionId: "project-new", backendId: "backend", targetId: "project", displayName: "Implementation", state: SessionState.IDLE,
+    { sessionId: "project-new", backendId: "backend", targetId: "project", projectId: "project", displayName: "Implementation", state: SessionState.IDLE,
       lastActivityAt: { seconds: 15n } },
-    { sessionId: "dialogue", backendId: "backend", targetId: "dialogue", displayName: "Notes", state: SessionState.IDLE,
+    { sessionId: "dialogue", backendId: "backend", targetId: "dialogue", projectId: "dialogue", displayName: "Notes", state: SessionState.IDLE,
       lastActivityAt: { seconds: 10n } },
-    { sessionId: "archived", backendId: "backend", targetId: "project", displayName: "Old work", state: SessionState.ARCHIVED,
+    { sessionId: "archived", backendId: "backend", targetId: "project", projectId: "project", displayName: "Old work", state: SessionState.ARCHIVED,
       archived: true, lastActivityAt: { seconds: 30n } },
-    { sessionId: "same-b", backendId: "backend", targetId: "project", displayName: "Same B", state: SessionState.IDLE,
+    { sessionId: "same-b", backendId: "backend", targetId: "project", projectId: "project", displayName: "Same B", state: SessionState.IDLE,
       lastActivityAt: { seconds: 5n } },
-    { sessionId: "same-a", backendId: "backend", targetId: "project", displayName: "Same A", state: SessionState.IDLE,
+    { sessionId: "same-a", backendId: "backend", targetId: "project", projectId: "project", displayName: "Same A", state: SessionState.IDLE,
       lastActivityAt: { seconds: 5n } }
   ]
 });
@@ -72,7 +72,7 @@ describe("mobile Home presentation", () => {
       .flatMap((section) => section.items.map((item) => item.session.sessionId))).toEqual(["dialogue"]);
   });
 
-  it("matches task and target display names locally", () => {
+  it("matches task and navigation names locally", () => {
     expect(buildMobileHomeSections({ snapshot, statusFilter: "active", query: "joko SOURCE", labels })
       .flatMap((section) => section.items.map((item) => item.session.sessionId))).toEqual([
       "pinned", "project-new", "same-a", "same-b"

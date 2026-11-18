@@ -17,6 +17,7 @@ vi.mock("react-native", () => ({
 }));
 vi.mock("expo-crypto", () => ({ randomUUID: () => "follow-up-ui" }));
 vi.mock("expo-clipboard", () => ({ getStringAsync: async () => "Pasted follow-up" }));
+vi.mock("./MobileSelectableMessageText", () => ({ MobileSelectableMessageText: () => null }));
 vi.mock("./storage", () => ({ mobileAttachmentFiles: {}, mobileAttachmentCamera: {}, mobilePhotoLibrary: {} }));
 vi.mock("./MobileComposerRichInput", () => ({ MobileComposerRichInput: (props: ComponentProps<typeof MobileComposerRichInput>) => {
   rich = props; return createElement("textarea", { "aria-label": props.accessibilityLabel, value: props.draft.text, readOnly: !props.editable, onChange: () => undefined });

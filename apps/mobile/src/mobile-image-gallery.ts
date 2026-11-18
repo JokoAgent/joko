@@ -18,7 +18,7 @@ const imageExtensions = {
   "image/vnd.microsoft.icon": "ico", "image/avif": "avif", "image/heic": "heic", "image/heif": "heif", "image/tiff": "tiff"
 } as const;
 
-export type MobileImageGallerySourceKind = "workspace" | "generated" | "timeline";
+export type MobileImageGallerySourceKind = "workspace" | "generated" | "timeline" | "diagram";
 
 export interface MobileImageGalleryPage {
   readonly pageId: string;
@@ -33,6 +33,7 @@ export interface MobileImageGalleryPage {
     | { readonly kind: "workspace"; readonly relativePath: string; readonly revisionKey: string }
     | { readonly kind: "artifact"; readonly artifactId: string; readonly sessionId: string }
     | { readonly kind: "queue"; readonly queueItemId: string; readonly contentIndex: number }
+    | { readonly kind: "diagram"; readonly eventId: string }
     | MobileTimelineContentSource;
 }
 

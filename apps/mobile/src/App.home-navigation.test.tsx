@@ -10,6 +10,7 @@ import { profilePartner } from "./test/mobile-partner-profile";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MobileClient, MobileState } from "./mobile-client";
 import type { MobileHomeViewState } from "./mobile-task-home-navigation";
+import { DEFAULT_MOBILE_HOME_DISPLAY } from "./home-navigation";
 import { mobileMessage } from "./mobile-messages";
 import { buildMobileMessageDeepLink, projectMobileHomeSearchMessageFocus } from "./mobile-native-intent";
 import { useMobileHomeViewPreference } from "./mobile-home-view-preference";
@@ -20,6 +21,7 @@ import type { MobileComposerRichInput } from "./MobileComposerRichInput";
 import type { MobileDrawerProps } from "./MobileDrawer";
 import type { MobileTaskHeader } from "./MobileTaskHeader";
 import type { MobileWindowGeometry } from "./mobile-window-geometry";
+import type { MobileThemePreferenceState } from "./mobile-theme-preference";
 
 type NativeProps = {
   children?: ReactNode;
@@ -31,10 +33,12 @@ type NativeProps = {
   accessibilityElementsHidden?: boolean;
   accessibilityLiveRegion?: "none" | "polite" | "assertive";
   consumedBottomInset?: number;
+  mockPanResponder?: number;
 };
-const surface = ({ children, accessibilityLabel, testID, style, pointerEvents, accessibilityElementsHidden, accessibilityLiveRegion, consumedBottomInset }: NativeProps) => createElement("div", {
+const surface = ({ children, accessibilityLabel, testID, style, pointerEvents, accessibilityElementsHidden, accessibilityLiveRegion, consumedBottomInset, mockPanResponder }: NativeProps) => createElement("div", {
   "aria-label": accessibilityLabel, "data-testid": testID, "data-native-style": JSON.stringify(style),
-  "data-pointer-events": pointerEvents, "aria-hidden": accessibilityElementsHidden, "aria-live": accessibilityLiveRegion, "data-consumed-bottom-inset": consumedBottomInset
+  "data-pointer-events": pointerEvents, "aria-hidden": accessibilityElementsHidden, "aria-live": accessibilityLiveRegion, "data-consumed-bottom-inset": consumedBottomInset,
+  "data-pan-responder": mockPanResponder
 }, children);
 const empty = Object.freeze([]);
 const homeConnectionId = "home-connection";
@@ -44,6 +48,23 @@ const latest = vi.fn();
 let linkListener: ((event: { readonly url: string }) => void) | undefined;
 const searchHome = vi.fn(async () => {});
 const scrollToIndex = vi.fn();
+const scrollHomeTo = vi.fn();
+type NativeMeasure = (x: number, y: number, width: number, height: number) => void;
+const homeHeaderBounds = new Map<string, { readonly top: number; readonly height: number }>();
+type NativePanFixture = Record<string, (_event?: unknown, gesture?: { y0?: number; moveY?: number; dy?: number }) => unknown>;
+const panResponders: NativePanFixture[] = [];
+type HomeListProps = {
+  sections: readonly { key: string; data: readonly unknown[] }[];
+  renderItem: (value: { item: unknown; index: number }) => ReactNode;
+  renderSectionHeader: (value: { section: unknown }) => ReactNode;
+  renderSectionFooter?: (value: { section: unknown }) => ReactNode;
+  ListEmptyComponent?: ReactNode;
+  onLayout: (event: { nativeEvent: { layout: { height: number } } }) => void;
+  onContentSizeChange: (width: number, height: number) => void;
+  onScroll: (event: { nativeEvent: { contentOffset: { y: number } } }) => void;
+  scrollEnabled?: boolean;
+};
+let homeListProps: HomeListProps;
 const setSessionPinned = vi.fn(async () => true);
 const setSessionArchived = vi.fn(async (_sessionId: string, _archived: boolean, _archiveConfirmation?: string) => true);
 const archiveConfirmation = "a".repeat(64);
@@ -61,6 +82,9 @@ const suggestTaskTitle = vi.fn(async (_key: string, _signal: AbortSignal) => cre
   title: "Suggested title", status: SessionTitleSuggestionStatus.OK
 }));
 const alert = vi.fn();
+const setNativeColorScheme = vi.fn();
+const themeListeners = new Set<() => void>();
+let themeSnapshot: MobileThemePreferenceState = { preference: "system", status: "ready", saving: false };
 const reconcile = vi.fn(async () => {});
 const dismissUnconfirmed = vi.fn(async (_operationId: string) => {});
 const refresh = vi.fn(async () => {});
@@ -148,15 +172,25 @@ beforeAll(async () => {
   vi.stubGlobal("__DEV__", false);
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.doMock("react-native", () => ({
-    View: surface, Text: surface, ScrollView: surface, Image: surface, ActivityIndicator: surface,
-    SectionList: ({ sections, renderItem, renderSectionHeader, ListEmptyComponent }: {
-      sections: readonly { key: string; data: readonly unknown[] }[];
-      renderItem: (value: { item: unknown; index: number }) => ReactNode;
-      renderSectionHeader: (value: { section: unknown }) => ReactNode;
-      ListEmptyComponent?: ReactNode;
-    }) => createElement("div", { "data-testid": "home-list" }, sections.length === 0 ? ListEmptyComponent
-      : sections.map(section => createElement("section", { key: section.key }, renderSectionHeader({ section }),
-        section.data.map((item, index) => createElement("div", { key: index }, renderItem({ item, index })))))),
+    View: forwardRef((props: NativeProps, ref) => {
+      useImperativeHandle(ref, () => props.testID?.startsWith("home-project-heading:") ? {
+        measureInWindow: (callback: NativeMeasure) => {
+          const bounds = homeHeaderBounds.get(props.testID!);
+          callback(0, bounds?.top ?? 0, 320, bounds?.height ?? 0);
+        }
+      } : null, [props.testID]);
+      return surface(props);
+    }), Text: surface, ScrollView: surface, Image: surface, ActivityIndicator: surface,
+    SectionList: forwardRef((listProps: HomeListProps, ref) => {
+      homeListProps = listProps;
+      const { sections, renderItem, renderSectionHeader, renderSectionFooter, ListEmptyComponent } = listProps;
+      useImperativeHandle(ref, () => ({ getScrollResponder: () => ({ scrollTo: scrollHomeTo,
+        getNativeScrollRef: () => ({ measureInWindow: (callback: NativeMeasure) => callback(0, 100, 320, 240) })
+      }) }), []);
+      return createElement("div", { "data-testid": "home-list" }, sections.length === 0 ? ListEmptyComponent
+        : sections.map(section => createElement("section", { key: section.key }, renderSectionHeader({ section }),
+          section.data.map((item, index) => createElement("div", { key: index }, renderItem({ item, index }))), renderSectionFooter?.({ section }))));
+    }),
     FlatList: forwardRef(({ data, renderItem, ListEmptyComponent }: { data?: readonly { id: string }[];
       renderItem?: (value: { item: unknown }) => ReactNode; ListEmptyComponent?: ReactNode }, ref) => {
       useImperativeHandle(ref, () => ({ scrollToIndex, scrollToEnd() {}, scrollToOffset() {} }), []);
@@ -171,21 +205,21 @@ beforeAll(async () => {
       ? createElement("div", { "data-testid": "native-modal" }, children) : null,
     Pressable: ({ children, onPress, disabled, accessibilityLabel, accessibilityState, accessibilityRole }: {
       children?: ReactNode | ((value: { pressed: boolean }) => ReactNode); onPress?: () => void; disabled?: boolean;
-      accessibilityLabel?: string; accessibilityState?: { selected?: boolean; disabled?: boolean; checked?: boolean | "mixed" }; accessibilityRole?: string;
+      accessibilityLabel?: string; accessibilityState?: { selected?: boolean; disabled?: boolean; checked?: boolean | "mixed"; expanded?: boolean }; accessibilityRole?: string;
     }) => createElement("button", { onClick: onPress, disabled, "aria-label": accessibilityLabel,
       role: accessibilityRole === "tab" || accessibilityRole === "checkbox" ? accessibilityRole : undefined,
-      "aria-selected": accessibilityState?.selected, "aria-checked": accessibilityState?.checked },
+      "aria-selected": accessibilityState?.selected, "aria-checked": accessibilityState?.checked, "aria-expanded": accessibilityState?.expanded },
       typeof children === "function" ? children({ pressed: false }) : children),
     StyleSheet: { create: (value: unknown) => value, hairlineWidth: 1, absoluteFill: {} },
     Platform: { get OS() { return platformOS; }, select: (value: Record<string, unknown>) => value[platformOS] ?? value.default },
     AppState: { currentState: "active", addEventListener: () => ({ remove() {} }) },
     BackHandler: { addEventListener: () => ({ remove() {} }) }, Keyboard: { dismiss() {}, addListener: () => ({ remove() {} }) },
-    PanResponder: { create: () => ({ panHandlers: {} }) },
+    PanResponder: { create: (handlers: NativePanFixture) => ({ panHandlers: { mockPanResponder: panResponders.push(handlers) - 1 } }) },
     AccessibilityInfo: { announceForAccessibility() {}, setAccessibilityFocus() {}, addEventListener: () => ({ remove() {} }) },
     Linking: { getInitialURL: async () => null, addEventListener: (_event: string, listener: typeof linkListener) => {
       linkListener = listener;
       return { remove() { linkListener = undefined; } };
-    } }, Alert: { alert }, findNodeHandle: () => null, useColorScheme: () => "light",
+    } }, Alert: { alert }, Appearance: { setColorScheme: setNativeColorScheme }, findNodeHandle: () => null, useColorScheme: () => "light",
     useWindowDimensions: () => dimensions
   }));
   vi.doMock("react-native-safe-area-context", () => ({ SafeAreaProvider: surface, SafeAreaView: surface,
@@ -215,7 +249,8 @@ beforeAll(async () => {
   vi.doMock("./mobile-client", () => ({ MobileClient: class { constructor() { return client; } } }));
   vi.doMock("./storage", () => new Proxy({
     mobileLocalePreferences: { snapshot: { effectiveLocale: "en", status: "ready" }, subscribe, hydrate },
-    mobileThemePreferences: { snapshot: { preference: "system", status: "ready" }, subscribe, hydrate },
+    mobileThemePreferences: { get snapshot() { return themeSnapshot; }, hydrate,
+      subscribe(listener: () => void) { themeListeners.add(listener); return () => themeListeners.delete(listener); } },
     mobileVoicePreferences: { snapshot: {}, subscribe, hydrate },
     mobileDiagnostics: { snapshot: { enabled: false }, subscribe, hydrate, record() {}, flush: hydrate, maintainExportCache: hydrate },
     mobileUpdates: { snapshot: { startup: "ready" }, subscribe, start: hydrate },
@@ -309,12 +344,14 @@ beforeEach(async () => {
   learningPartner = undefined; learningProfileProps = undefined;
   taskWindowGeometry = undefined;
   platformOS = "android";
+  themeSnapshot = { preference: "system", status: "ready", saving: false };
+  setNativeColorScheme.mockClear();
   observedHeaderRole = "ordinary"; shareSelectionActive = false;
   headerSourceEpoch = 0;
   createNewTask.mockClear();
   await newTaskDrafts.clear({ profileId: "profile" });
   vi.useFakeTimers();
-  for (const spy of [select, searchHome, scrollToIndex, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, alert, reconcile, dismissUnconfirmed, refresh,
+  for (const spy of [select, searchHome, scrollToIndex, scrollHomeTo, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, alert, reconcile, dismissUnconfirmed, refresh,
     writeClipboard, onNew, onSelect, onMenu, onOpenShare, runNavigation, onBack, onSearchFocus, onNavigated, newTaskFlush]) spy.mockClear();
   dimensions = { width: 390, height: 844, scale: 1, fontScale: 1 }; taskNavigationPort = undefined; finishDrawerClose = undefined;
   draftFlush.mockReset().mockImplementation(originalDraftFlush);
@@ -323,10 +360,12 @@ beforeEach(async () => {
   select.mockImplementation(async sessionId => { state = { ...state, selectedId: sessionId }; });
   around.mockReset();
   latest.mockClear();
+  homeHeaderBounds.clear();
+  panResponders.length = 0;
   const sessions = [
     create(SessionSchema, { sessionId: "current", targetId: "dialogue", backendId: "backend", displayName: "Alpha", pinned: true, state: SessionState.IDLE }),
-    create(SessionSchema, { sessionId: "other", targetId: "project", backendId: "backend", displayName: "Beta", state: SessionState.IDLE }),
-    create(SessionSchema, { sessionId: "archived", targetId: "project", backendId: "backend", displayName: "Past", archived: true, state: SessionState.IDLE })
+    create(SessionSchema, { sessionId: "other", targetId: "project", projectId: "project", backendId: "backend", displayName: "Beta", state: SessionState.IDLE }),
+    create(SessionSchema, { sessionId: "archived", targetId: "project", projectId: "project", backendId: "backend", displayName: "Past", archived: true, state: SessionState.IDLE })
   ];
   const owner = create(SnapshotSchema, { snapshotId: "owner", generation: 1n, revision: { value: 1n }, sessions,
     connections: [{ connectionId: homeConnectionId }],
@@ -370,6 +409,47 @@ async function option(label: string): Promise<void> {
     vi.advanceTimersToNextFrame();
   });
 }
+
+it.each(["home", "drawer"] as const)("restores the original %s scroll after the list remounts with its viewport and content", async hostKind => {
+  const scrollOffsets = new Map<string, number>();
+  await render({ host: hostKind, scrollOffsets });
+  const previous = homeListProps;
+  await act(async () => previous.onScroll({ nativeEvent: { contentOffset: { y: 420 } } }));
+  await act(async () => root.render(null));
+  previous.onScroll({ nativeEvent: { contentOffset: { y: 900 } } });
+  await render();
+  const restored = homeListProps;
+  await act(async () => {
+    restored.onScroll({ nativeEvent: { contentOffset: { y: 0 } } });
+    restored.onContentSizeChange(400, 700);
+    restored.onLayout({ nativeEvent: { layout: { height: 360 } } });
+  });
+  expect(scrollHomeTo).not.toHaveBeenCalled();
+  await act(async () => {
+    restored.onContentSizeChange(400, 1_400);
+    restored.onContentSizeChange(400, 1_450);
+  });
+  expect(scrollHomeTo).toHaveBeenCalledExactlyOnceWith({ y: 420, animated: false });
+
+  scrollHomeTo.mockClear();
+  await render({ state: { ...state, activeProfileId: "another-owner" } });
+  await act(async () => {
+    homeListProps.onLayout({ nativeEvent: { layout: { height: 360 } } });
+    homeListProps.onContentSizeChange(400, 1_450);
+  });
+  expect(scrollHomeTo).not.toHaveBeenCalled();
+});
+
+it("does not reposition the already mounted task list when the selected task changes", async () => {
+  await render({ host: "persistent", scrollOffsets: new Map() });
+  await act(async () => homeListProps.onScroll({ nativeEvent: { contentOffset: { y: 420 } } }));
+  await render({ currentSessionId: "other" });
+  await act(async () => {
+    homeListProps.onLayout({ nativeEvent: { layout: { height: 360 } } });
+    homeListProps.onContentSizeChange(400, 1_450);
+  });
+  expect(scrollHomeTo).not.toHaveBeenCalled();
+});
 
 it("restores the Worktree branch in the actual new-task form, submits it and clears it when another project is selected", async () => {
   state = { ...state, owner: create(SnapshotSchema, { ...state.owner!,
@@ -602,13 +682,264 @@ describe("actual Home navigation hosts", () => {
     expect(host.textContent).not.toContain("Alpha");
   });
 
+  it("uses the current project or Dialogue for a moved task with the original execution Target", async () => {
+    const original = state.owner!;
+    const owner = (projectId: string | undefined) => create(SnapshotSchema, { ...original,
+      targets: [...original.targets, create(TargetSchema, { targetId: "destination", backendId: "backend", displayName: "Destination" })],
+      workspaces: [
+        create(WorkspaceDescriptorSchema, { targetId: "project", workspaceId: "original-workspace", kind: WorkspaceKind.USER_PROJECT }),
+        create(WorkspaceDescriptorSchema, { targetId: "destination", workspaceId: "destination-workspace", kind: WorkspaceKind.USER_PROJECT })
+      ],
+      sessions: original.sessions.map(session => session.sessionId === "other" ? create(SessionSchema, { ...session, projectId }) : session)
+    });
+    await render({ state: { ...state, owner: owner("project") }, runNavigation: undefined, host: "home" });
+    expect(button("Open task Beta").textContent).toContain("Project ·");
+    expect(button("Open task Beta").closest("section")?.firstElementChild?.textContent).toBe("Project");
+    const moved = owner("destination");
+    await render({ state: { ...state, owner: moved } });
+    expect(button("Open task Beta").textContent).toContain("Destination ·");
+    expect(button("Open task Beta").closest("section")?.firstElementChild?.textContent).toBe("Destination");
+    expect(moved.sessions.find(session => session.sessionId === "other")?.targetId).toBe("project");
+    await type(message("home.search"), "Destination");
+    await press("Open task Beta");
+    expect(select).toHaveBeenLastCalledWith("other");
+    expect(onSelect).toHaveBeenLastCalledWith(undefined);
+    await type(message("home.search"), "");
+    await render({ state: { ...state, owner: owner(undefined) } });
+    expect(button("Open task Beta").textContent).toContain(`${message("home.section.dialogue")} ·`);
+    expect(button("Open task Beta").closest("section")?.firstElementChild?.textContent).toBe(message("home.section.dialogue"));
+  });
+
+  it("filters ordinary tasks by project, Agent and activity and restores the selected order for the original pairing", async () => {
+    const now = Date.UTC(2026, 10, 18, 17);
+    vi.setSystemTime(now);
+    const timestamp = (offsetSeconds: number) => create(TimestampSchema, { seconds: BigInt(now / 1_000 + offsetSeconds) });
+    const project = (id: string) => create(TargetSchema, { targetId: id, displayName: "Twin project", backendId: "codex", state: TargetState.ACTIVE });
+    const workspace = (id: string) => create(WorkspaceDescriptorSchema, { targetId: id, workspaceId: `workspace-${id}`,
+      displayName: "Twin project", serverPathDisplay: `/${id}`, kind: WorkspaceKind.USER_PROJECT });
+    const makeTask = (name: string, projectId: string, backendId: string, created: number, activity: number) =>
+      create(SessionSchema, { sessionId: `${backendId}-${name.toLowerCase().replaceAll(" ", "-")}`, displayName: name,
+        projectId, targetId: projectId, backendId, state: SessionState.IDLE,
+        createdAt: timestamp(created), lastActivityAt: timestamp(activity) });
+    const pinned = create(SessionSchema, { ...makeTask("Evergreen", "west", "pi", -200_000, -100_000), pinned: true });
+    const running = makeTask("Running east", "east", "codex", -800, -120);
+    const archived = create(SessionSchema, { ...makeTask("Archived east", "east", "codex", -1_000, -15), archived: true, state: SessionState.ARCHIVED });
+    const owner = create(SnapshotSchema, { ...state.owner!, targets: [project("east"), project("west")],
+      workspaces: [workspace("east"), workspace("west")],
+      backends: [create(BackendDescriptorSchema, { backendId: "codex", displayName: "Codex" }), create(BackendDescriptorSchema, { backendId: "pi", displayName: "Pi" })],
+      sessions: [
+        running, makeTask("Newest activity", "east", "codex", -800, -10), makeTask("Newest creation", "east", "codex", -100, -60),
+        makeTask("At cutoff", "east", "codex", -100_000, -86_400), makeTask("Newest creation", "east", "pi", -150, -20),
+        makeTask("West task", "west", "codex", -200, -20), pinned, archived
+      ]
+    });
+    state = { ...state, owner };
+    const values = new Map<string, string>();
+    const storage = { getItem: async (key: string) => values.get(key) ?? null, setItem: async (key: string, value: string) => { values.set(key, value); } };
+    const Home = ({ source }: { source: string }) => {
+      const { view, change } = useMobileHomeViewPreference(source, storage);
+      return createElement(SessionsScreen, { ...props, state, viewState: view, onViewStateChange: change });
+    };
+    const titles = () => Array.from(host.querySelectorAll('[data-testid="home-list"] button[aria-label^="Open task "]'))
+      .map(row => row.getAttribute("aria-label")!.slice("Open task ".length));
+    const openDisplay = () => press(message("home.display"));
+    const closeDisplay = () => press(message("common.close"));
+    await act(async () => root.render(createElement(Home, { key: "before", source: "original-pairing" })));
+    expect(titles()).toContain("West task");
+    expect(titles().filter(title => title === "Newest creation")).toHaveLength(2);
+    await openDisplay();
+    await press("Twin project · /east");
+    await press("Codex");
+    await press(message("home.display.activity.1d"));
+    await closeDisplay();
+    expect(titles()).toEqual(["Evergreen", "Newest activity", "Newest creation", "Running east", "At cutoff"]);
+    await act(async () => vi.advanceTimersByTimeAsync(60_000));
+    expect(titles()).toEqual(["Evergreen", "Newest activity", "Newest creation", "Running east"]);
+    await type(message("home.search"), "West task");
+    expect(titles()).toEqual(["West task"]);
+    await type(message("home.search"), "");
+    await press(message("home.filter.archived"));
+    expect(titles()).toEqual(["Archived east"]);
+    await openDisplay();
+    await press("Pi");
+    await closeDisplay();
+    expect(titles()).toEqual([]);
+    expect(host.querySelector('[data-testid="home-list"]')?.textContent).toBe(message("home.empty.filters"));
+    await openDisplay();
+    await press("Codex");
+    await closeDisplay();
+    await press(message("home.filter.active"));
+
+    await openDisplay();
+    await press(message("home.display.sort.created"));
+    await closeDisplay();
+    expect(titles()).toEqual(["Evergreen", "Newest creation", "Newest activity", "Running east"]);
+    await openDisplay();
+    await press(message("home.display.sort.priority"));
+    await closeDisplay();
+    expect(titles()).toEqual(["Evergreen", "Newest activity", "Newest creation", "Running east"]);
+    state = { ...state, owner: create(SnapshotSchema, { ...owner, sessions: owner.sessions.map(session =>
+      session.sessionId === running.sessionId ? create(SessionSchema, { ...session, state: SessionState.RUNNING }) : session) }) };
+    await act(async () => root.render(createElement(Home, { key: "before", source: "original-pairing" })));
+    expect(titles()).toEqual(["Evergreen", "Running east", "Newest activity", "Newest creation"]);
+
+    await act(async () => root.render(createElement(Home, { key: "cold", source: "original-pairing" })));
+    expect(titles()).toEqual(["Evergreen", "Running east", "Newest activity", "Newest creation"]);
+    await openDisplay();
+    await press(message("home.display.reset"));
+    await closeDisplay();
+    expect(titles()).toEqual(expect.arrayContaining(["West task", "At cutoff"]));
+    expect(titles().filter(title => title === "Newest creation")).toHaveLength(2);
+    await act(async () => root.render(createElement(Home, { key: "cold", source: "another-pairing" })));
+    expect(titles().indexOf("Newest activity")).toBeLessThan(titles().indexOf("Running east"));
+  });
+
+  it("folds a long project and opens its full list at the original status with a separate scroll position", async () => {
+    const now = Date.UTC(2026, 10, 18, 17);
+    vi.setSystemTime(now);
+    const timestamp = (offsetSeconds: number) => create(TimestampSchema, { seconds: BigInt(now / 1_000 + offsetSeconds) });
+    const target = (id: string, name: string) => create(TargetSchema, { targetId: id, displayName: name, backendId: "backend", state: TargetState.ACTIVE });
+    const workspace = (id: string, name: string) => create(WorkspaceDescriptorSchema, { targetId: id, workspaceId: id,
+      displayName: name, serverPathDisplay: `/${id}`, kind: WorkspaceKind.USER_PROJECT });
+    const makeTask = (id: string, name: string, projectId: string, index: number, archived = false) => create(SessionSchema, {
+      sessionId: id, displayName: name, targetId: index === 5 ? "other" : projectId, projectId, backendId: "backend", archived,
+      state: archived ? SessionState.ARCHIVED : SessionState.IDLE,
+      createdAt: timestamp(-100_000 - index), lastActivityAt: timestamp(index === 8 ? -3_600 : -90_000 - index)
+    });
+    const ordinary = Array.from({ length: 8 }, (_, index) => makeTask(`sample-${index + 1}`, `Sample ${index + 1}`, "project", index + 1));
+    const current = makeTask("other-current", "Other active", "other", 0);
+    const owner = create(SnapshotSchema, { ...state.owner!, targets: [target("project", "Long project"), target("other", "Other project")],
+      workspaces: [workspace("project", "Long project"), workspace("other", "Other project")],
+      sessions: [...ordinary, current, makeTask("project-finished", "Finished P", "project", 0, true), makeTask("other-finished", "Finished Q", "other", 0, true)] });
+    const scrollOffsets = new Map<string, number>();
+    await render({ state: { ...state, owner, selectedId: current.sessionId }, currentSessionId: current.sessionId, scrollOffsets,
+      viewState: { search: "", statusFilter: "active", display: { ...DEFAULT_MOBILE_HOME_DISPLAY, sortBy: "created" } } });
+    const list = () => host.querySelector('[data-testid="home-list"]')!;
+    const viewAll = mobileMessage("en", "home.projectViewAll", { count: 8 });
+    const back = mobileMessage("en", "common.backTo", { label: message("common.tasks") });
+    expect(list().textContent).toContain("Sample 5");
+    expect(list().textContent).toContain("Sample 8");
+    expect(list().textContent).not.toContain("Sample 6");
+    expect(list().textContent).not.toContain("Sample 7");
+    await press("Long project");
+    expect(button("Long project").getAttribute("aria-expanded")).toBe("false");
+    expect(list().textContent).not.toContain("Sample 1");
+    expect(list().textContent).toContain("Other active");
+    expect(list().textContent).not.toContain(viewAll);
+    await press("Long project");
+    const runningOwner = create(SnapshotSchema, { ...owner, sessions: owner.sessions.map(task => task.sessionId === "sample-7"
+      ? create(SessionSchema, { ...task, state: SessionState.RUNNING }) : task) });
+    await render({ state: { ...state, owner: runningOwner } });
+    expect(list().textContent).toContain("Sample 7");
+    await act(async () => homeListProps.onScroll({ nativeEvent: { contentOffset: { y: 360 } } }));
+
+    await press(viewAll);
+    expect(list().textContent).toContain("Sample 6");
+    expect(list().textContent).toContain("Sample 5");
+    expect(list().textContent).not.toContain("Other active");
+    expect(list().textContent).not.toContain("Finished P");
+    expect(state.selectedId).toBe(current.sessionId);
+    expect(runNavigation).not.toHaveBeenCalled();
+    await act(async () => homeListProps.onScroll({ nativeEvent: { contentOffset: { y: 55 } } }));
+    await press(message("home.filter.archived"));
+    expect(list().textContent).toContain("Finished P");
+    expect(list().textContent).not.toContain("Finished Q");
+    await press(back);
+    expect(button(message("home.filter.active")).getAttribute("aria-selected")).toBe("true");
+    expect(list().textContent).toContain("Other active");
+    await act(async () => {
+      homeListProps.onLayout({ nativeEvent: { layout: { height: 400 } } });
+      homeListProps.onContentSizeChange(350, 1_100);
+    });
+    expect(scrollHomeTo).toHaveBeenCalledExactlyOnceWith({ y: 360, animated: false });
+    await press(viewAll);
+    await render({ state: { ...state, activeProfileId: "different-pairing" } });
+    expect(list().textContent).toContain("Other active");
+    expect(host.querySelector(`button[aria-label="${back}"]`)).toBeNull();
+  });
+
+  it("retains manual project moves across activity, hidden slots and cold entry on the original pairing", async () => {
+    const projectIds = ["alpha", "bravo", "charlie", "delta"] as const;
+    const names = { alpha: "Alpha project", bravo: "Bravo project", charlie: "Charlie project", delta: "Delta project" };
+    const owner = create(SnapshotSchema, { ...state.owner!, targets: projectIds.map(id => create(TargetSchema, {
+      targetId: id, displayName: names[id], backendId: "backend", state: TargetState.ACTIVE
+    })), workspaces: projectIds.map(id => create(WorkspaceDescriptorSchema, {
+      targetId: id, workspaceId: id, displayName: names[id], serverPathDisplay: `/${id}`, kind: WorkspaceKind.USER_PROJECT
+    })), sessions: projectIds.map((id, index) => create(SessionSchema, {
+      sessionId: `task-${id}`, targetId: id, projectId: id, displayName: `Task ${id}`, backendId: "backend", state: SessionState.IDLE,
+      lastActivityAt: create(TimestampSchema, { seconds: BigInt(200 - index) })
+    })) });
+    state = { ...state, owner };
+    const preferences = new Map<string, string>();
+    const storage = { getItem: async (key: string) => preferences.get(key) ?? null,
+      setItem: async (key: string, value: string) => { preferences.set(key, value); } };
+    const Home = ({ source }: { source: string }) => {
+      const { view, change } = useMobileHomeViewPreference(source, storage);
+      return createElement(SessionsScreen, { ...props, state, viewState: view, onViewStateChange: change });
+    };
+    const order = () => Array.from(host.querySelectorAll('[data-testid^="home-project-heading:"]')).map(
+      row => row.querySelector("button")?.getAttribute("aria-label"));
+    const open = () => press(message("home.display"));
+    const close = () => press(message("common.close"));
+    const handleFor = (name: string) => {
+      const label = mobileMessage("en", "home.display.reorderProject", { name });
+      const element = host.querySelector(`[aria-label="${label}"][data-pan-responder]`);
+      expect(element).not.toBeNull();
+      return panResponders[Number(element!.getAttribute("data-pan-responder"))]!;
+    };
+    await act(async () => root.render(createElement(Home, { key: "live", source: "original" })));
+    expect(order()).toEqual([names.alpha, names.bravo, names.charlie, names.delta]);
+    await open();
+    await press(message("home.display.projectOrderManual"));
+    await press(`${names.alpha} · /alpha`);
+    await press(`${names.charlie} · /charlie`);
+    await press(`${names.delta} · /delta`);
+    await close();
+    expect(order()).toEqual([names.alpha, names.charlie, names.delta]);
+    homeHeaderBounds.set("home-project-heading:project:alpha", { top: 114, height: 44 });
+    homeHeaderBounds.set("home-project-heading:project:charlie", { top: 212, height: 44 });
+    homeHeaderBounds.set("home-project-heading:project:delta", { top: 426, height: 44 });
+    const pan = handleFor(names.alpha);
+    await act(async () => {
+      pan.onPanResponderGrant!({}, { y0: 128 });
+      await vi.advanceTimersByTimeAsync(150);
+      pan.onPanResponderRelease!();
+    });
+    expect(order()).toEqual([names.alpha, names.charlie, names.delta]);
+    await act(async () => {
+      pan.onPanResponderGrant!({}, { y0: 128 });
+      await vi.advanceTimersByTimeAsync(600);
+      pan.onPanResponderMove!({}, { moveY: 272, dy: 144 });
+    });
+    expect(homeListProps.scrollEnabled).toBe(false);
+    await act(async () => { pan.onPanResponderRelease!(); pan.onPanResponderRelease!(); });
+    expect(homeListProps.scrollEnabled).toBe(true);
+    expect(order()).toEqual([names.charlie, names.alpha, names.delta]);
+    await open();
+    await press(message("home.display.reset"));
+    await close();
+    expect(order()).toEqual([names.charlie, names.bravo, names.alpha, names.delta]);
+
+    state = { ...state, owner: create(SnapshotSchema, { ...owner, sessions: owner.sessions.map(session => session.projectId === "alpha"
+      ? create(SessionSchema, { ...session, lastActivityAt: create(TimestampSchema, { seconds: 500n }) }) : session) }) };
+    await act(async () => root.render(createElement(Home, { key: "cold", source: "original" })));
+    expect(order()).toEqual([names.charlie, names.bravo, names.alpha, names.delta]);
+    const retired = handleFor(names.charlie);
+    await act(async () => { retired.onPanResponderGrant!({}, { y0: 224 }); await vi.advanceTimersByTimeAsync(600); });
+    state = { ...state, activeProfileId: "another-pairing" };
+    await act(async () => root.render(createElement(Home, { key: "cold", source: "another" })));
+    await act(async () => { retired.onPanResponderMove!({}, { moveY: 105 }); retired.onPanResponderRelease!(); });
+    expect(order()).toEqual([names.alpha, names.bravo, names.charlie, names.delta]);
+    expect(preferences.has("joko.mobile.home-display.v1.another")).toBe(false);
+  });
+
   it("sorts Home search by relevance or either activity direction and restores the ordinary list on clear", async () => {
     const owner = create(SnapshotSchema, { ...state.owner!,
       workspaces: [create(WorkspaceDescriptorSchema, { workspaceId: "project-workspace", targetId: "project", displayName: "Project", kind: WorkspaceKind.USER_PROJECT })],
       sessions: [
-        create(SessionSchema, { sessionId: "title", targetId: "project", backendId: "backend", displayName: "Needle title", state: SessionState.IDLE,
+        create(SessionSchema, { sessionId: "title", targetId: "project", projectId: "project", backendId: "backend", displayName: "Needle title", state: SessionState.IDLE,
           lastActivityAt: create(TimestampSchema, { seconds: 10n }) }),
-        create(SessionSchema, { sessionId: "body", targetId: "project", backendId: "backend", displayName: "Newer task", state: SessionState.IDLE,
+        create(SessionSchema, { sessionId: "body", targetId: "project", projectId: "project", backendId: "backend", displayName: "Newer task", state: SessionState.IDLE,
           lastActivityAt: create(TimestampSchema, { seconds: 20n }) })
       ] });
     const order = () => Array.from(host.querySelectorAll('[data-testid="home-list"] button[aria-label^="Open task "]'))
@@ -789,6 +1120,22 @@ describe("actual Home navigation hosts", () => {
 });
 
 describe("actual Task Home navigation composition", () => {
+  it("applies only the adopted Android preference to native controls and releases the override for System", async () => {
+    themeSnapshot = { preference: "system", status: "loading", saving: false };
+    await act(async () => root.render(createElement(App)));
+    expect(setNativeColorScheme).not.toHaveBeenCalled();
+    const publish = (next: MobileThemePreferenceState) => act(async () => {
+      themeSnapshot = next;
+      themeListeners.forEach(listener => listener());
+    });
+    await publish({ preference: "dark", status: "ready", saving: false });
+    await publish({ preference: "dark", status: "ready", saving: true });
+    await publish({ preference: "dark", status: "ready", saving: false, error: "Storage failed" });
+    await publish({ preference: "light", status: "ready", saving: false });
+    await publish({ preference: "system", status: "ready", saving: false });
+    expect(setNativeColorScheme.mock.calls).toEqual([["dark"], ["light"], ["unspecified"]]);
+  });
+
   it.each([true, false])("keeps late missing-message recovery on its original Task screen (back=%s)", async leave => {
     state = { ...state, saved: [{ profileId: "profile", origin: "https://node.example", serverId: "node",
       connectionId: homeConnectionId, deviceId: "phone", displayName: "Node", credentialState: "available",

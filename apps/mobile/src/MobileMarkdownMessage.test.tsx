@@ -7,11 +7,15 @@ import type { MobileMarkdownResourceClient } from "./use-mobile-markdown-resourc
 
 vi.mock("./MobileSelectableMessageText", () => ({ MobileSelectableMessageText: () => null }));
 
-const { copy, openUrl, appStateListeners, pressureListeners, nativeImages, scrollLayouts } = vi.hoisted(() => ({
+const { copy, openUrl, appStateListeners, pressureListeners, nativeImages, scrollLayouts, richSurface, shareDiagram } = vi.hoisted(() => ({
   copy: vi.fn(async () => undefined), openUrl: vi.fn(async () => undefined),
   appStateListeners: new Set<(state: string) => void>(), pressureListeners: new Set<() => void>(),
   nativeImages: new Map<string, { onError(): void; onLoad(event: { source: { width: number; height: number; isAnimated?: boolean } }): void }>(),
-  scrollLayouts: new WeakMap<HTMLElement, (event: { nativeEvent: { layout: { width: number } } }) => void>()
+  scrollLayouts: new WeakMap<HTMLElement, (event: { nativeEvent: { layout: { width: number } } }) => void>(),
+  richSurface: { mounted: false, inject: vi.fn(), receive: new WeakMap<HTMLElement, (raw: string) => void>(), dismiss: undefined as (() => void) | undefined },
+  shareDiagram: vi.fn(async (
+    _action: string, _source: unknown, _rendered: unknown, _signal: AbortSignal, beforeDispatch: () => void
+  ) => beforeDispatch())
 }));
 vi.mock("expo-clipboard", () => ({ setStringAsync: copy }));
 vi.mock("lucide-react-native", () => ({ Mail: () => null, CalendarDays: () => null, Folder: () => null,
@@ -22,8 +26,22 @@ vi.mock("react-native-svg", () => ({ default: () => null, Path: () => null, Rect
   Polygon: () => null, Polyline: () => null, Line: () => null, Circle: () => null, Text: () => null }));
 vi.mock("expo-crypto", () => ({ randomUUID: () => "render-1" }));
 vi.mock("./rich-markdown-runtime.richjs", () => ({ default: { mermaidScript: "", katexScript: "", katexCss: "" } }));
-vi.mock("./use-mobile-preview-resource-lifecycle", () => ({ useMobilePreviewResourceLifecycle: () => ({ rendererMounted: false }) }));
-vi.mock("react-native-webview", () => ({ WebView: () => null }));
+vi.mock("./mobile-image-output", () => ({ mobileImageOutput: { perform: shareDiagram } }));
+vi.mock("./use-mobile-preview-resource-lifecycle", () => ({
+  useMobilePreviewResourceLifecycle: () => ({ rendererMounted: richSurface.mounted, rendererToken: "view-token",
+    ownsRenderer: (token: string) => token === "view-token", onRendererReady() {} })
+}));
+vi.mock("react-native-webview", async () => {
+  const { forwardRef, useImperativeHandle } = await vi.importActual<typeof import("react")>("react");
+  return { WebView: forwardRef<{ injectJavaScript: typeof richSurface.inject }, {
+    source: { html: string }; onMessage?: (event: { nativeEvent: { data: string } }) => void;
+  }>(function TestWebView({ source, onMessage }, ref) {
+    useImperativeHandle(ref, () => ({ injectJavaScript: richSurface.inject }));
+    return createElement("div", { "data-rich-web-view": true, "data-html": source.html, ref: (element: HTMLDivElement | null) => {
+      if (element && onMessage) richSurface.receive.set(element, (data) => onMessage({ nativeEvent: { data } }));
+    } });
+  }) };
+});
 vi.mock("./mobile-resource-pressure", () => ({ subscribeMobileResourcePressure: (listener: () => void) => {
   pressureListeners.add(listener); return { remove: () => pressureListeners.delete(listener) };
 } }));
@@ -35,7 +53,8 @@ vi.mock("react-native-safe-area-context", () => ({ SafeAreaView: ({ children }: 
 vi.mock("react-native", () => {
   const box = ({ children, accessibilityLabel, style }: { children?: ReactNode; accessibilityLabel?: string; style?: unknown }) => {
     const viewStyle = Array.isArray(style) ? Object.assign({}, ...style.flat()) : style as Record<string, unknown> | undefined;
-    return createElement("div", { "aria-label": accessibilityLabel, "data-width": viewStyle?.width }, children);
+    return createElement("div", { "aria-label": accessibilityLabel, "data-width": viewStyle?.width,
+      "data-height": viewStyle?.height, "data-flex": viewStyle?.flex }, children);
   };
   const scroll = ({ children, horizontal, scrollEnabled, onLayout }: { children?: ReactNode; horizontal?: boolean;
     scrollEnabled?: boolean; onLayout?: (event: { nativeEvent: { layout: { width: number } } }) => void }) =>
@@ -53,7 +72,11 @@ vi.mock("react-native", () => {
         "data-decoration": textStyle?.textDecorationLine, "data-weight": textStyle?.fontWeight, "data-slant": textStyle?.fontStyle,
         "data-font": textStyle?.fontFamily }, children);
     },
-    Modal: ({ visible, children }: { visible: boolean; children?: ReactNode }) => visible ? createElement("div", {}, children) : null,
+    Platform: { OS: "ios" },
+    Modal: ({ visible, children, onDismiss }: { visible: boolean; children?: ReactNode; onDismiss?: () => void }) => {
+      richSurface.dismiss = onDismiss;
+      return visible ? createElement("div", { "data-native-modal": true }, children) : null;
+    },
     Pressable: ({ onPress, children, accessibilityRole, accessibilityLabel, disabled }: { onPress: () => void; children?: ReactNode;
       accessibilityRole?: string; accessibilityLabel?: string; disabled?: boolean }) =>
       createElement("button", { onClick: onPress, role: accessibilityRole, disabled, "aria-label": accessibilityLabel }, children),
@@ -155,6 +178,125 @@ describe("native message Markdown", () => {
       expect(container.textContent).toContain("graph TD; A-->B");
       expect(container.textContent).toContain("After");
     } finally { await act(async () => root.unmount()); }
+  });
+
+  it("fills the expanded diagram viewport and keeps the original selectable source available", async () => {
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    const source = "flowchart TD\nA --> B";
+    const colors = { surface: "#fff", background: "#fafafa", ink: "#111", muted: "#666",
+      border: "#ccc", accent: "#f90", negative: "#c33" };
+    const view = "[data-rich-web-view]";
+    const modal = () => container.querySelector<HTMLElement>("[data-native-modal]")!;
+    const press = (label: string) => act(async () => {
+      const button = Array.from(modal().querySelectorAll("button")).find((item) => item.textContent === label);
+      expect(button).toBeDefined();
+      button!.click();
+    });
+    richSurface.mounted = true;
+    try {
+      await act(async () => root.render(<MobileMarkdownMessage text={"```mermaid\n" + source + "\n```"}
+        colors={colors} locale="en" ownerKey="diagram-detail" />));
+      expect(container.querySelector<HTMLElement>(view)?.parentElement?.dataset.height).toBe("220");
+      await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Expand"]')!.click());
+      const chart = modal().querySelector<HTMLElement>(view)!;
+      expect(chart.parentElement?.dataset).toMatchObject({ flex: "1" });
+      expect(chart.parentElement?.dataset.height).toBeUndefined();
+      expect(chart.dataset.html).toContain("height:calc(100vh - 16px)");
+      await press("Source");
+      expect(modal().querySelector(view)).toBeNull();
+      expect(modal().querySelector('[data-selectable="true"]')?.textContent).toBe(source);
+      await press("Diagram");
+      expect(modal().querySelector(view)).not.toBeNull();
+      await press("Close");
+      expect(modal()).toBeNull();
+    } finally {
+      richSurface.mounted = false;
+      await act(async () => root.unmount());
+    }
+  });
+
+  it("shares the ready original diagram once and retires a receipt when leaving its chart", async () => {
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    const colors = { surface: "#fff", background: "#fafafa", ink: "#111", muted: "#666",
+      border: "#ccc", accent: "#f90", negative: "#c33" };
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+    const button = (name: string) => Array.from(container.querySelectorAll<HTMLButtonElement>("[data-native-modal] button"))
+      .find((item) => item.textContent === name)!;
+    richSurface.mounted = true;
+    richSurface.inject.mockClear();
+    shareDiagram.mockClear();
+    try {
+      await act(async () => root.render(<MobileMarkdownMessage text={"```mermaid\nflowchart TD\nA --> B\n```"}
+        colors={colors} locale="en" ownerKey="chart-export" />));
+      await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Expand"]')!.click());
+      const chart = container.querySelector<HTMLElement>("[data-native-modal] [data-rich-web-view]")!;
+      const receive = richSurface.receive.get(chart)!;
+      const reply = (requestId: string) => receive(JSON.stringify({
+        type: "joko-rich-markdown/png", instanceId: "render-1", requestId, base64: png
+      }));
+      expect(button("Export image").disabled).toBe(true);
+      await act(async () => receive(JSON.stringify({
+        type: "joko-rich-markdown/status", instanceId: "render-1", state: "ready", height: 120
+      })));
+      expect(button("Export image").disabled).toBe(false);
+      await act(async () => { const exportButton = button("Export image"); exportButton.click(); exportButton.click(); });
+      expect(richSurface.inject).toHaveBeenCalledTimes(1);
+      expect(button("Exporting…").disabled).toBe(true);
+      await act(async () => reply("another-request"));
+      expect(shareDiagram).not.toHaveBeenCalled();
+      await act(async () => reply("render-1"));
+      expect(shareDiagram).toHaveBeenCalledExactlyOnceWith("share", expect.objectContaining({
+        fileName: "Joko-diagram.png", mediaType: "image/png", width: 1, height: 1
+      }), undefined, expect.any(AbortSignal), expect.any(Function));
+      await act(async () => button("Export image").click());
+      await act(async () => button("Source").click());
+      await act(async () => reply("render-1"));
+      expect(shareDiagram).toHaveBeenCalledTimes(1);
+    } finally {
+      richSurface.mounted = false;
+      await act(async () => root.unmount());
+    }
+  });
+
+  it("opens annotation only when the original chart handoff has dismissed", async () => {
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    const colors = { surface: "#fff", background: "#fafafa", ink: "#111", muted: "#666",
+      border: "#ccc", accent: "#f90", negative: "#c33" };
+    const annotate = vi.fn();
+    const render = (ownerKey: string) => act(async () => root.render(<MobileMarkdownMessage
+      text={"```mermaid\nflowchart TD\nA --> B\n```"} colors={colors} locale="en" ownerKey={ownerKey} onAnnotateDiagram={annotate} />));
+    const request = async () => {
+      await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Expand"]')!.click());
+      const chart = container.querySelector<HTMLElement>("[data-native-modal] [data-rich-web-view]")!;
+      const receive = richSurface.receive.get(chart)!;
+      await act(async () => receive(JSON.stringify({ type: "joko-rich-markdown/status", instanceId: "render-1", state: "ready", height: 120 })));
+      const action = Array.from(container.querySelectorAll<HTMLButtonElement>("[data-native-modal] button"))
+        .find(button => button.textContent === "Annotate")!;
+      await act(async () => action.click());
+      const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+      await act(async () => receive(JSON.stringify({ type: "joko-rich-markdown/png", instanceId: "render-1", requestId: "render-1", base64: png })));
+      expect(container.querySelector("[data-native-modal]")).toBeNull();
+    };
+    richSurface.mounted = true;
+    shareDiagram.mockClear();
+    try {
+      await render("diagram-owner-one");
+      await request();
+      expect(annotate).not.toHaveBeenCalled();
+      await act(async () => { richSurface.dismiss?.(); richSurface.dismiss?.(); });
+      expect(annotate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ mediaType: "image/png", width: 1, height: 1 }));
+      await request();
+      await render("another-task");
+      await act(async () => richSurface.dismiss?.());
+      expect(annotate).toHaveBeenCalledTimes(1);
+      expect(shareDiagram).not.toHaveBeenCalled();
+    } finally {
+      richSurface.mounted = false;
+      await act(async () => root.unmount());
+    }
   });
 
   it.each([false, true])("keeps marked links, code and inline math selectable after a streamed append, dark=%s", async dark => {

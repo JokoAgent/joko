@@ -1,8 +1,39 @@
-import { WorkspaceKind, type Session, type Snapshot } from "@joko/contracts";
+import { SessionAttentionKind, SessionState, WorkspaceKind, type Session, type Snapshot } from "@joko/contracts";
 import { safeWindowRect, windowDivision, type MobileWindowGeometry } from "./mobile-window-geometry";
 
 export type MobileHomeStatusFilter = "active" | "archived" | "all";
 export type MobileHomeSearchSort = "relevance" | "activityDesc" | "activityAsc";
+export const MOBILE_HOME_ACTIVITY_FILTERS = ["all", "1d", "3d", "7d", "30d"] as const;
+export const MOBILE_HOME_TASK_SORTS = ["activity", "created", "priority"] as const;
+export const MOBILE_HOME_PROJECT_PREVIEW_LIMIT = 5;
+export type MobileHomeActivityFilter = typeof MOBILE_HOME_ACTIVITY_FILTERS[number];
+export type MobileHomeTaskSort = typeof MOBILE_HOME_TASK_SORTS[number];
+
+export interface MobileHomeDisplayPreferences {
+  readonly projectFilter: "all" | readonly string[];
+  readonly backendId: string | null;
+  readonly lastActivity: MobileHomeActivityFilter;
+  readonly sortBy: MobileHomeTaskSort;
+  readonly projectOrder: "activity" | "manual";
+  readonly manualProjectOrder: readonly string[];
+}
+
+export const DEFAULT_MOBILE_HOME_DISPLAY: MobileHomeDisplayPreferences = {
+  projectFilter: "all",
+  backendId: null,
+  lastActivity: "all",
+  sortBy: "activity",
+  projectOrder: "activity",
+  manualProjectOrder: []
+};
+
+export function hasMobileHomeDisplayFilters(display: MobileHomeDisplayPreferences): boolean {
+  return display.projectFilter !== "all" || display.backendId !== null || display.lastActivity !== "all";
+}
+
+const MOBILE_HOME_ACTIVITY_DAYS: Readonly<Record<Exclude<MobileHomeActivityFilter, "all">, number>> = {
+  "1d": 1, "3d": 3, "7d": 7, "30d": 30
+};
 
 export interface MobileHomeSearchMatch {
   readonly sessionId: string;
@@ -11,7 +42,7 @@ export interface MobileHomeSearchMatch {
 
 export interface MobileHomeSessionItem {
   readonly session: Session;
-  readonly targetName: string;
+  readonly navigationName: string;
   readonly groupKind: "dialogue" | "project";
   readonly groupKey: string;
   readonly groupTitle: string;
@@ -29,6 +60,9 @@ export interface BuildMobileHomeSectionsOptions {
   readonly statusFilter: MobileHomeStatusFilter;
   readonly query: string;
   readonly searchSort?: MobileHomeSearchSort;
+  readonly display?: MobileHomeDisplayPreferences;
+  readonly projectId?: string;
+  readonly now?: number;
   readonly messageSessionIds?: ReadonlySet<string>;
   readonly labels: {
     readonly dialogue: string;
@@ -41,29 +75,37 @@ export function buildMobileHomeSections(options: BuildMobileHomeSectionsOptions)
   const snapshot = options.snapshot;
   if (!snapshot) return [];
   const normalizedQuery = options.query.trim().toLocaleLowerCase();
+  const display = options.display ?? DEFAULT_MOBILE_HOME_DISPLAY;
+  const cutoff = display.lastActivity === "all" ? undefined
+    : (options.now ?? Date.now()) - MOBILE_HOME_ACTIVITY_DAYS[display.lastActivity] * 86_400_000;
   const targets = new Map(snapshot.targets.map((target) => [target.targetId, target]));
   const workspaces = new Map(snapshot.workspaces.map((workspace) => [workspace.targetId, workspace]));
-  const visible = snapshot.sessions.filter((session) => {
-    if (session.hidden || session.derivationOrigin?.sideChat) return false;
-    if (options.statusFilter === "active" && session.archived) return false;
-    if (options.statusFilter === "archived" && !session.archived) return false;
-    if (!normalizedQuery) return true;
-    const target = targets.get(session.targetId);
-    return session.displayName.toLocaleLowerCase().includes(normalizedQuery)
-      || target?.displayName.toLocaleLowerCase().includes(normalizedQuery) === true
-      || options.messageSessionIds?.has(session.sessionId) === true;
-  });
-  const items = visible.map((session): MobileHomeSessionItem => {
-    const target = targets.get(session.targetId);
-    const workspace = workspaces.get(session.targetId);
+  const items = snapshot.sessions.flatMap((session): MobileHomeSessionItem[] => {
+    if (session.hidden || session.derivationOrigin?.sideChat) return [];
+    if (options.statusFilter === "active" && session.archived) return [];
+    if (options.statusFilter === "archived" && !session.archived) return [];
+    const projectId = session.projectId;
+    const target = projectId === undefined ? undefined : targets.get(projectId);
+    const workspace = projectId === undefined ? undefined : workspaces.get(projectId);
     const project = workspace?.kind === WorkspaceKind.USER_PROJECT;
-    return {
+    const groupKey = project ? `project:${projectId}` : "dialogue";
+    if (options.projectId !== undefined && (!project || projectId !== options.projectId)) return [];
+    if (!normalizedQuery && !session.pinned) {
+      if (display.projectFilter !== "all" && !display.projectFilter.includes(groupKey)) return [];
+      if (display.backendId !== null && display.backendId !== session.backendId) return [];
+      if (cutoff !== undefined && sessionActivityMillis(session) < cutoff) return [];
+    }
+    const navigationName = target?.displayName || workspace?.displayName || (project ? options.labels.project : options.labels.dialogue);
+    if (normalizedQuery && !session.displayName.toLocaleLowerCase().includes(normalizedQuery)
+      && !navigationName.toLocaleLowerCase().includes(normalizedQuery)
+      && options.messageSessionIds?.has(session.sessionId) !== true) return [];
+    return [{
       session,
-      targetName: target?.displayName || options.labels.dialogue,
+      navigationName,
       groupKind: project ? "project" : "dialogue",
-      groupKey: project ? `project:${session.targetId}` : "dialogue",
-      groupTitle: project ? target?.displayName || workspace.displayName || options.labels.project : options.labels.dialogue
-    };
+      groupKey,
+      groupTitle: project ? navigationName : options.labels.dialogue
+    }];
   });
   if (normalizedQuery) {
     if (items.length === 0) return [];
@@ -87,25 +129,71 @@ export function buildMobileHomeSections(options: BuildMobileHomeSectionsOptions)
   const pinned = sortHomeItems(items.filter((item) => item.session.pinned));
   if (pinned.length > 0) sections.push({ key: "pinned", kind: "pinned", title: options.labels.pinned, items: pinned });
 
-  const groups = new Map<string, { kind: "dialogue" | "project"; title: string; items: MobileHomeSessionItem[] }>();
+  const groups = new Map<string, { kind: "dialogue" | "project"; title: string; items: MobileHomeSessionItem[]; recent: MobileHomeSessionItem }>();
   for (const item of items) {
     if (item.session.pinned) continue;
     const current = groups.get(item.groupKey);
-    if (current) current.items.push(item);
-    else groups.set(item.groupKey, { kind: item.groupKind, title: item.groupTitle, items: [item] });
+    if (current) {
+      current.items.push(item);
+      if (compareHomeItems(item, current.recent) > 0) current.recent = item;
+    } else groups.set(item.groupKey, { kind: item.groupKind, title: item.groupTitle, items: [item], recent: item });
   }
-  const grouped = [...groups.entries()].map(([key, group]): MobileHomeSection => ({
-    key,
-    kind: group.kind,
-    title: group.title,
-    items: sortHomeItems(group.items)
-  }));
-  grouped.sort((left, right) => compareHomeItems(right.items[0], left.items[0]) || left.key.localeCompare(right.key));
+  const grouped = [...groups.entries()]
+    .sort(([leftKey, left], [rightKey, right]) => compareHomeItems(right.recent, left.recent) || leftKey.localeCompare(rightKey))
+    .map(([key, group]): MobileHomeSection => ({
+      key,
+      kind: group.kind,
+      title: group.title,
+      items: sortHomeItems(group.items, display.sortBy)
+    }));
+  if (display.projectOrder === "manual" && options.projectId === undefined) {
+    const rank = new Map(display.manualProjectOrder.map((key, index) => [key, index] as const));
+    const projects = grouped.filter(section => section.kind === "project").sort((left, right) =>
+      (rank.get(left.key) ?? Number.MAX_SAFE_INTEGER) - (rank.get(right.key) ?? Number.MAX_SAFE_INTEGER));
+    return [...sections, ...projects, ...grouped.filter(section => section.kind !== "project")];
+  }
   return [...sections, ...grouped];
 }
 
-function sortHomeItems(items: readonly MobileHomeSessionItem[]): MobileHomeSessionItem[] {
-  return [...items].sort((left, right) => compareHomeItems(right, left) || left.session.sessionId.localeCompare(right.session.sessionId));
+/** Reorders the visible projects in their existing slots, retaining the position of hidden projects. */
+export function mergeMobileHomeProjectOrder(previous: readonly string[], allProjects: readonly string[], visible: readonly string[]): readonly string[] {
+  const known = new Set(allProjects);
+  const ordered = [...new Set([...previous, ...allProjects])].filter(key => known.has(key));
+  const moved = [...new Set(visible)].filter(key => known.has(key));
+  const visibleKeys = new Set(moved);
+  let next = 0;
+  return ordered.map(key => visibleKeys.has(key) ? moved[next++]! : key);
+}
+
+export function previewMobileHomeProject(
+  items: readonly MobileHomeSessionItem[], pendingInteractions: ReadonlySet<string>, now: number
+): readonly MobileHomeSessionItem[] {
+  if (items.length <= MOBILE_HOME_PROJECT_PREVIEW_LIMIT) return items;
+  return items.filter(({ session }, index) => index < MOBILE_HOME_PROJECT_PREVIEW_LIMIT
+    || sessionActivityMillis(session) >= now - 86_400_000 || homeTaskPriority(session) < 3
+    || pendingInteractions.has(session.sessionId));
+}
+
+function sessionActivityMillis(session: Session): number {
+  const time = session.lastActivityAt;
+  return time === undefined ? Number.NEGATIVE_INFINITY : Number(time.seconds) * 1_000 + time.nanos / 1_000_000;
+}
+
+function sortHomeItems(items: readonly MobileHomeSessionItem[], sortBy: MobileHomeTaskSort = "activity"): MobileHomeSessionItem[] {
+  return [...items].sort((left, right) => {
+    const byRecency = compareHomeItems(right, left);
+    const comparison = sortBy === "created" ? compareTimestamps(right.session.createdAt, left.session.createdAt)
+      : sortBy === "priority" ? homeTaskPriority(left.session) - homeTaskPriority(right.session) || byRecency : byRecency;
+    return comparison || left.session.sessionId.localeCompare(right.session.sessionId);
+  });
+}
+
+function homeTaskPriority(session: Session): number {
+  if (session.state === SessionState.WAITING || session.attention?.unread
+    && (session.attention.kind === SessionAttentionKind.AWAITING || session.attention.kind === SessionAttentionKind.ERROR)) return 0;
+  if (session.state === SessionState.RUNNING || session.state === SessionState.RECOVERING) return 2;
+  if (session.attention?.unread) return 1;
+  return 3;
 }
 
 function compareHomeItems(left: MobileHomeSessionItem | undefined, right: MobileHomeSessionItem | undefined): number {

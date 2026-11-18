@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactElement, type ReactNode, type RefObject } from "react";
 import {
-  AccessibilityInfo, ActivityIndicator, Alert, AppState, BackHandler, FlatList, Keyboard, Linking, Modal, PanResponder, Platform,
+  AccessibilityInfo, ActivityIndicator, Alert, Appearance, AppState, BackHandler, FlatList, Keyboard, Linking, Modal, PanResponder, Platform,
   Image, Pressable, ScrollView, SectionList, StyleSheet, Text, TextInput, findNodeHandle, useColorScheme,
   useWindowDimensions, View, type NativeScrollEvent
 } from "react-native";
@@ -8,6 +8,7 @@ import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from "react-native-
 import { MobileAdaptiveWindowProvider, useMobileAdaptiveWindow } from "./MobileAdaptiveWindow";
 import { MobileNavigationFrame } from "./MobileNavigationFrame";
 import { MobileTaskHeaderButtons } from "./MobileTaskHeaderChrome";
+import { MobileReorderHandle } from "./MobileReorderHandle";
 import { MobileTaskActivityProvider, MobileTaskActivityBanner, useMobileTaskActivityView } from "./MobileTaskActivity";
 import { useMobileTaskHeaderRole } from "./use-mobile-task-header-role";
 import { mobileTaskHeaderNotice } from "./mobile-task-header-notice";
@@ -20,7 +21,7 @@ import Constants from "expo-constants";
 import { randomUUID } from "expo-crypto";
 import * as Clipboard from "expo-clipboard";
 import {
-  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, ModelSourceKind, QueueItemState, RuntimeCommandInputMode, SessionState, TargetState, capabilityNames, partnerResumeMessages,
+  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, InteractionState, ModelSourceKind, QueueItemState, RuntimeCommandInputMode, SessionState, TargetState, WorkspaceKind, capabilityNames, partnerResumeMessages,
   partnerSessionTaskMessages, partnerSessionTaskReceiptLabel,
   type QueueItem, type Session
 } from "@joko/contracts";
@@ -291,10 +292,13 @@ import { readMobileScreenshotVisibleMessages } from "./mobile-screenshot-selecti
 import { useMobileScreenshotSelection } from "./use-mobile-screenshot-selection";
 import {
   buildMobileHomeSections, buildMobileHomeNavigationLayout, createSwipeRowRegistry,
-  type MobileHomeSearchMatch, type MobileHomeSearchSort, type MobileHomeStatusFilter
+  DEFAULT_MOBILE_HOME_DISPLAY, MOBILE_HOME_ACTIVITY_FILTERS, MOBILE_HOME_PROJECT_PREVIEW_LIMIT, MOBILE_HOME_TASK_SORTS,
+  hasMobileHomeDisplayFilters, mergeMobileHomeProjectOrder, previewMobileHomeProject,
+  type MobileHomeDisplayPreferences, type MobileHomeSearchMatch, type MobileHomeSearchSort, type MobileHomeSection, type MobileHomeSessionItem, type MobileHomeStatusFilter
 } from "./home-navigation";
 import { MobileTaskHomeNavigation, type MobileHomeNavigationIntent, type MobileHomeViewChange, type MobileHomeViewState,
   type MobileTaskHomeNavigationPorts } from "./mobile-task-home-navigation";
+import { useMobileHomeProjectReorder } from "./use-mobile-home-project-reorder";
 import { mobilePartnerRosterSourceKey } from "./mobile-partner-roster";
 import {
   artifactTitle,
@@ -331,7 +335,8 @@ import {
 import {
   mobileImageOutput,
   type MobileImageOutputAction,
-  type MobileImageOutputRenderedImage
+  type MobileImageOutputRenderedImage,
+  type MobileImageOutputSource
 } from "./mobile-image-output";
 import { mobileFileShare, type MobileFileShareProgress } from "./mobile-file-share";
 import { mobileOfflineAgeLabel } from "./mobile-offline-cache";
@@ -658,6 +663,7 @@ export function App() {
   const homeSourceKey = mobileHomeSourceKey(state);
   const { view: homeViewState, change: setHomeViewState } = useMobileHomeViewPreference(homeSourceKey,
     state.saved.some(profile => profile.profileId === state.activeProfileId) ? mobilePlainStorage : undefined);
+  const homeScrollOffsets = useRef(new Map<string, number>());
   const [focusTaskComposer, setFocusTaskComposer] = useState(false);
   const [incomingShareRequestRevision, setIncomingShareRequestRevision] = useState(0);
   const [nativeIntentRevision, setNativeIntentRevision] = useState(0);
@@ -744,6 +750,11 @@ export function App() {
   }, [offerNativeUrl]);
   const scheme = useColorScheme();
   const dark = resolveMobileDarkTheme(theme.preference, scheme);
+  useLayoutEffect(() => {
+    if (Platform.OS === "android" && theme.status !== "loading") {
+      Appearance.setColorScheme(theme.preference === "system" ? "unspecified" : theme.preference);
+    }
+  }, [theme.preference, theme.status]);
   const colors = useMemo(() => ({
     background: dark ? "#15191d" : "#f7f6f3", surface: dark ? "#24292d" : "#ffffff",
     ink: dark ? "#f4f4f2" : "#242a2d", muted: dark ? "#adb6b7" : "#637073",
@@ -1090,7 +1101,7 @@ export function App() {
                     setSharingLeaveJoinId(state.taskSource?.kind === "joined" ? state.taskSource.joined.joinId : undefined);
                     setPage("task-sharing");
                   }}
-                  homeNavigation={{ viewState: homeViewState, onViewStateChange: setHomeViewState, incomingShare,
+                  homeNavigation={{ viewState: homeViewState, onViewStateChange: setHomeViewState, scrollOffsets: homeScrollOffsets.current, incomingShare,
                     menuButtonRef: homeMenuButtonRef, searchFocusRequest: homeSearchFocusRequest,
                     onSearchFocus: () => setHomeSearchFocusRequest((value) => value + 1),
                     onNavigated: match => {
@@ -1230,7 +1241,7 @@ export function App() {
                   onRemoteDesktop={() => openRemoteDesktop("device", deviceId)} /> :
                 <SessionsScreen {...common} onNew={() => setPage("new")} onSelect={match => { focusHomeSearchMatch(match); setPage("task"); }}
                   onPartners={entry => { setHomePartnerEntry(entry); setPage("partner-directory"); }}
-                  viewState={homeViewState} onViewStateChange={setHomeViewState} foreground={foreground}
+                  viewState={homeViewState} onViewStateChange={setHomeViewState} scrollOffsets={homeScrollOffsets.current} foreground={foreground}
                   incomingShare={incomingShare} onOpenShare={() => setPage("new")}
                   menuButtonRef={homeMenuButtonRef} searchFocusRequest={homeSearchFocusRequest}
                   onMenu={() => { pendingHomeMenuActionRef.current = undefined; setMenuOpen(true); }} />}
@@ -1299,6 +1310,7 @@ export type TaskHomeNavigationPort = (intent: MobileHomeNavigationIntent, deferr
 export interface TaskHomeNavigationProps {
   readonly viewState: MobileHomeViewState;
   readonly onViewStateChange: MobileHomeViewChange;
+  readonly scrollOffsets?: Map<string, number>;
   readonly incomingShare: MobileIncomingShareSnapshot;
   readonly menuButtonRef: RefObject<View | null>;
   readonly searchFocusRequest: number;
@@ -1361,12 +1373,13 @@ function ConnectionScreen({ state, locale, dark, onBack, onConnected, invitation
 }
 
 export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, incomingShare, onOpenShare,
-  menuButtonRef, searchFocusRequest, viewState, onViewStateChange, currentSessionId, runNavigation,
+  menuButtonRef, searchFocusRequest, viewState, onViewStateChange, scrollOffsets, currentSessionId, runNavigation,
   foreground = AppState.currentState === "active", host = "home", newTaskInSystemBar = false, onPartners }: ScreenProps & {
   onNew: () => void; onSelect: (match?: MobileHomeSearchMatch) => void; onMenu: () => void;
   incomingShare: MobileIncomingShareSnapshot; onOpenShare: () => void;
   menuButtonRef: RefObject<View | null>; searchFocusRequest: number;
   viewState?: MobileHomeViewState; onViewStateChange?: MobileHomeViewChange;
+  scrollOffsets?: Map<string, number>;
   currentSessionId?: string; runNavigation?: (intent: MobileHomeNavigationIntent) => void;
   foreground?: boolean; host?: "home" | "drawer" | "persistent";
   newTaskInSystemBar?: boolean;
@@ -1375,9 +1388,9 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   const [localViewState, setLocalViewState] = useState<MobileHomeViewState>({ search: "", statusFilter: "active" });
   const currentView = viewState ?? localViewState;
   const { search, statusFilter, searchSort = "relevance" } = currentView;
+  const display = currentView.display ?? DEFAULT_MOBILE_HOME_DISPLAY;
   const setViewState: MobileHomeViewChange = onViewStateChange ?? setLocalViewState;
   const setSearch = (search: string): void => setViewState({ ...currentView, search });
-  const setStatusFilter = (statusFilter: MobileHomeStatusFilter): void => setViewState({ ...currentView, statusFilter }, true);
   const setSearchSort = (searchSort: MobileHomeSearchSort): void => setViewState({ ...currentView, searchSort });
   const [localError, setLocalError] = useState("");
   const [copyNotice, setCopyNotice] = useState("");
@@ -1392,12 +1405,50 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   const homeScopeKey = mobileHomeSourceKey(state);
   const homeScopeRef = useRef(homeScopeKey);
   homeScopeRef.current = homeScopeKey;
+  const [displaySource, setDisplaySource] = useState<string>();
+  const [projectFolds, setProjectFolds] = useState<{ source: string; keys: ReadonlySet<string> }>();
+  const [requestedProjectView, setRequestedProjectView] = useState<{
+    source: string; projectId: string; statusFilter: MobileHomeStatusFilter;
+  }>();
+  const projectWorkspace = requestedProjectView?.source === homeScopeKey ? state.owner?.workspaces.find(workspace =>
+    workspace.kind === WorkspaceKind.USER_PROJECT && workspace.targetId === requestedProjectView.projectId) : undefined;
+  const projectView = projectWorkspace === undefined ? undefined : requestedProjectView;
+  const foldedProjectKeys = projectFolds?.source === homeScopeKey ? projectFolds.keys : undefined;
+  const listStatusFilter = projectView?.statusFilter ?? statusFilter;
+  const setStatusFilter = (statusFilter: MobileHomeStatusFilter): void => {
+    if (projectView !== undefined) setRequestedProjectView({ ...projectView, statusFilter });
+    else setViewState({ ...currentView, statusFilter }, true);
+  };
+  const closeProjectView = useCallback(() => setRequestedProjectView(undefined), []);
+  const [filterNow, setFilterNow] = useState(Date.now);
   const [renameSession, setRenameSession] = useState<Session>();
   const [taskTagSessionId, setTaskTagSessionId] = useState<string>();
   const [renameDraft, setRenameDraft] = useState("");
   const searchRef = useRef<TextInput>(null);
+  const handledSearchFocus = useRef(0);
   const swipeRegistry = useMemo(() => createSwipeRowRegistry(), []);
-  const normalizedSearch = search.trim();
+  const normalizedSearch = projectView === undefined ? search.trim() : "";
+  const listRef = useRef<SectionList<MobileHomeSessionItem, MobileHomeSection>>(null);
+  const scrollKey = JSON.stringify(projectView === undefined ? [homeScopeKey, host, statusFilter]
+    : [homeScopeKey, host, projectView.statusFilter, projectView.projectId]);
+  const listScroll = useMemo(() => ({
+    pendingOffset: scrollOffsets?.get(scrollKey) ?? 0,
+    contentHeight: 0,
+    viewportHeight: 0
+  }), [scrollKey, scrollOffsets]);
+  const recordListScroll = foreground && normalizedSearch === "" && state.owner !== undefined;
+  const latestListScroll = useRef({ list: listScroll, enabled: recordListScroll });
+  latestListScroll.current = { list: listScroll, enabled: recordListScroll };
+  const restoreListScroll = useCallback(() => {
+    if (!mountedRef.current || latestListScroll.current.list !== listScroll || !recordListScroll || !latestListScroll.current.enabled
+      || listScroll.pendingOffset <= 0 || listScroll.viewportHeight <= 0
+      || listScroll.contentHeight < listScroll.pendingOffset + listScroll.viewportHeight) return;
+    const responder = listRef.current?.getScrollResponder();
+    if (!responder) return;
+    const offset = listScroll.pendingOffset;
+    listScroll.pendingOffset = 0;
+    responder.scrollTo({ y: offset, animated: false });
+  }, [listScroll, recordListScroll]);
   const currentSearch = state.homeSearchQuery === normalizedSearch && state.homeSearchFilter === statusFilter;
   const searchPending = foreground && (state.status === "connected" || state.status === "offline") && normalizedSearch !== ""
     && (!currentSearch || state.homeSearchStatus === "idle" || state.homeSearchStatus === "searching");
@@ -1407,17 +1458,55 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   ), [currentSearch, state.homeSearchMatches, state.homeSearchStatus]);
   const sections = useMemo(() => buildMobileHomeSections({
     snapshot: state.owner,
-    statusFilter,
-    query: search,
+    statusFilter: listStatusFilter,
+    query: projectView === undefined ? search : "",
     searchSort,
+    display: projectView === undefined ? display : { ...DEFAULT_MOBILE_HOME_DISPLAY, sortBy: display.sortBy },
+    projectId: projectView?.projectId,
+    now: filterNow,
     messageSessionIds: new Set(currentMessageMatches.keys()),
     labels: mobileHomeSectionLabels(locale)
-  }), [currentMessageMatches, locale, search, searchSort, state.owner, statusFilter]);
-  const listSections = useMemo(() => sections.map((section) => ({ ...section, data: section.items })), [sections]);
+  }), [currentMessageMatches, display, filterNow, listStatusFilter, locale, projectView, search, searchSort, state.owner]);
+  const pendingProjectInteractions = useMemo(() => new Set(state.owner?.interactions
+    .filter(interaction => interaction.state === InteractionState.PENDING).map(interaction => interaction.sessionId)), [state.owner?.interactions]);
+  const hasLongProjectPreview = projectView === undefined && sections.some(section => section.kind === "project" && section.items.length > MOBILE_HOME_PROJECT_PREVIEW_LIMIT);
+  const listSections = useMemo(() => sections.map(section => ({ ...section, data: section.kind !== "project" || projectView !== undefined
+    ? section.items : foldedProjectKeys?.has(section.key) ? [] : previewMobileHomeProject(section.items, pendingProjectInteractions, filterNow)
+  })), [filterNow, foldedProjectKeys, pendingProjectInteractions, projectView, sections]);
+  const visibleProjectKeys = useMemo(() => sections.filter(section => section.kind === "project").map(section => section.key), [sections]);
+  const projectOrder = (next: readonly string[]): readonly string[] => mergeMobileHomeProjectOrder(display.manualProjectOrder,
+    state.owner?.workspaces.filter(workspace => workspace.kind === WorkspaceKind.USER_PROJECT).map(workspace => `project:${workspace.targetId}`) ?? [], next);
+  const applyHomeDisplay = (next: MobileHomeDisplayPreferences): void => {
+    if (homeScopeKey !== mobileHomeSourceKey(client.state)) return;
+    setViewState({ ...currentView, display: next }, false, true);
+  };
+  const reorderEnabled = foreground && projectView === undefined && !normalizedSearch && display.projectOrder === "manual"
+    && (state.status === "connected" || state.status === "offline") && visibleProjectKeys.length > 1;
+  const reorderProjects = useMobileHomeProjectReorder({ enabled: reorderEnabled,
+    scope: JSON.stringify([scrollKey, visibleProjectKeys]), visibleKeys: visibleProjectKeys,
+    viewport: () => listRef.current?.getScrollResponder()?.getNativeScrollRef?.(),
+    onReorder: next => applyHomeDisplay({ ...display, manualProjectOrder: projectOrder(next) })
+  });
 
+  useEffect(() => { restoreListScroll(); }, [listSections, restoreListScroll]);
   useEffect(() => {
-    if (searchFocusRequest > 0) searchRef.current?.focus();
-  }, [searchFocusRequest]);
+    if (!foreground || normalizedSearch || (display.lastActivity === "all" && !hasLongProjectPreview)) return;
+    setFilterNow(Date.now());
+    const timer = setInterval(() => setFilterNow(Date.now()), 60_000);
+    return () => clearInterval(timer);
+  }, [display.lastActivity, foreground, hasLongProjectPreview, normalizedSearch]);
+  useEffect(() => { setDisplaySource(undefined); closeProjectView(); }, [closeProjectView, homeScopeKey]);
+  useEffect(() => {
+    if (searchFocusRequest <= handledSearchFocus.current) return;
+    if (projectView !== undefined) { closeProjectView(); return; }
+    handledSearchFocus.current = searchFocusRequest;
+    searchRef.current?.focus();
+  }, [closeProjectView, projectView, searchFocusRequest]);
+  useEffect(() => {
+    if (Platform.OS !== "android" || !foreground || projectView === undefined) return;
+    const subscription = BackHandler.addEventListener("hardwareBackPress", () => { closeProjectView(); return true; });
+    return () => subscription.remove();
+  }, [closeProjectView, foreground, projectView]);
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -1579,6 +1668,23 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     swipeRegistry.closeOpenRow();
   }, [foreground, homeScopeKey, host, swipeRegistry]);
 
+  const toggleProjectFold = (key: string): void => {
+    if (homeScopeRef.current !== homeScopeKey) return;
+    swipeRegistry.closeOpenRow();
+    setProjectFolds(previous => {
+      const keys = new Set(previous?.source === homeScopeKey ? previous.keys : []);
+      if (keys.has(key)) keys.delete(key);
+      else keys.add(key);
+      return { source: homeScopeKey, keys };
+    });
+  };
+  const openProjectView = (section: MobileHomeSection): void => {
+    const projectId = section.items[0]?.session.projectId;
+    if (projectId === undefined || homeScopeKey !== mobileHomeSourceKey(client.state)) return;
+    swipeRegistry.closeOpenRow();
+    setRequestedProjectView({ source: homeScopeKey, projectId, statusFilter });
+  };
+
   return <View style={styles.fill}>
     <View style={styles.homeHeader}>
       <Pressable ref={menuButtonRef} accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.openMenu")} onPress={() => navigate({ kind: "menu" })}
@@ -1628,18 +1734,27 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
         onPress={() => void client.refresh()} colors={colors} compact />}
     </View>}
     {state.status === "connected" && state.error && <Banner text={state.error} colors={colors} />}
-    <View style={styles.searchRow}>
+    {projectWorkspace !== undefined ? <View style={styles.searchRow}>
+      <Back colors={colors} label={mobileMessage(locale, "common.tasks")}
+        accessibilityLabel={mobileMessage(locale, "common.backTo", { label: mobileMessage(locale, "common.tasks") })} onPress={closeProjectView} />
+      <Text accessibilityRole="header" style={[styles.title, styles.fill, { color: colors.ink }]} numberOfLines={1}>{
+        state.owner?.targets.find(target => target.targetId === projectWorkspace.targetId)?.displayName || projectWorkspace.displayName
+        || mobileMessage(locale, "home.section.project")
+      }</Text>
+    </View> : <View style={styles.searchRow}>
       <TextInput ref={searchRef} accessibilityLabel={mobileMessage(locale, "home.search")}
         placeholder={mobileMessage(locale, "home.search")}
         placeholderTextColor={colors.muted} value={search} onChangeText={setSearch}
         style={[styles.input, styles.searchInput, { color: colors.ink, backgroundColor: colors.surface, borderColor: colors.border }]} />
       {searchPending && <ActivityIndicator accessibilityLabel={mobileMessage(locale, "home.search")} color={colors.accent} />}
-    </View>
+      {!normalizedSearch && <Action label={mobileMessage(locale, "home.display")} colors={colors} compact
+        onPress={() => setDisplaySource(homeScopeKey)} />}
+    </View>}
     <View accessibilityRole="tablist" style={styles.filterRow}>
       {(["active", "archived", "all"] as const).map((filter) => <Pressable key={filter} accessibilityRole="tab"
-        accessibilityState={{ selected: filter === statusFilter }} onPress={() => setStatusFilter(filter)}
-        style={[styles.filterChip, { borderColor: filter === statusFilter ? colors.accent : colors.border,
-          backgroundColor: filter === statusFilter ? colors.brandBackground : colors.surface }]}>
+        accessibilityState={{ selected: filter === listStatusFilter }} onPress={() => setStatusFilter(filter)}
+        style={[styles.filterChip, { borderColor: filter === listStatusFilter ? colors.accent : colors.border,
+          backgroundColor: filter === listStatusFilter ? colors.brandBackground : colors.surface }]}>
         <Text style={[styles.caption, { color: colors.ink }]}>{mobileMessage(locale, `home.filter.${filter}`)}</Text>
       </Pressable>)}
     </View>
@@ -1658,15 +1773,34 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
       onDismiss={() => setCopyNotice("")} />}
     <PendingReceipts items={state.pending.filter((item) => ["rename", "pin", "archive", "delete", "task-tag"].includes(item.kind))}
       colors={colors} locale={locale} disabled={state.status !== "connected"} onError={setLocalError} />
-    <SectionList sections={listSections} keyExtractor={(item) => item.session.sessionId}
-      ListHeaderComponent={onPartners && <MobileHomePartners roster={partnerRoster} groups={partnerGroupRoster} storage={mobilePlainStorage}
+    <SectionList ref={listRef} key={scrollKey} sections={listSections} keyExtractor={(item) => item.session.sessionId}
+      scrollEnabled={reorderProjects.marker === undefined} stickySectionHeadersEnabled={reorderEnabled ? false : undefined}
+      onLayout={event => { listScroll.viewportHeight = event.nativeEvent.layout.height; restoreListScroll(); }}
+      onContentSizeChange={(_width, height) => { listScroll.contentHeight = height; restoreListScroll(); }}
+      onScroll={event => {
+        const offset = event.nativeEvent.contentOffset.y;
+        if (scrollOffsets && mountedRef.current && latestListScroll.current.list === listScroll && latestListScroll.current.enabled
+          && listScroll.pendingOffset === 0 && Number.isFinite(offset) && offset >= 0) scrollOffsets.set(scrollKey, offset);
+      }}
+      scrollEventThrottle={16}
+      ListHeaderComponent={projectView === undefined && onPartners && <MobileHomePartners roster={partnerRoster} groups={partnerGroupRoster} storage={mobilePlainStorage}
         active={foreground} visible={statusFilter !== "archived"} query={search} colors={colors} locale={locale}
         canCreate={!!client.partnerCreationTransport()} onOpen={entry => navigate({ kind: "page", action: () => onPartners(entry) })} />}
-      renderSectionHeader={({ section }) => section.kind === "search" ? null
-        : <Text style={[styles.listSectionTitle, { color: colors.muted }]}>{section.title}</Text>}
+      renderSectionHeader={({ section }) => {
+        if (section.kind === "search" || (section.kind === "project" && projectView !== undefined)) return null;
+        if (section.kind !== "project") return <Text style={[styles.listSectionTitle, { color: colors.muted }]}>{section.title}</Text>;
+        return <MobileHomeProjectHeading section={section} expanded={foldedProjectKeys?.has(section.key) !== true} locale={locale} colors={colors}
+          reorderable={reorderEnabled} reorder={reorderProjects} onToggle={() => toggleProjectFold(section.key)}
+          onStartDrag={() => swipeRegistry.closeOpenRow()} />;
+      }}
+      renderSectionFooter={({ section }) => projectView === undefined && section.kind === "project" && section.data.length > 0
+        && section.data.length < section.items.length ? <Pressable accessibilityRole="button" onPress={() => openProjectView(section)} style={styles.homeProjectFooter}>
+          <Text style={[styles.label, { color: colors.accent }]}>{mobileMessage(locale, "home.projectViewAll", { count: section.items.length })}</Text>
+        </Pressable> : null}
       ListEmptyComponent={searchPending ? undefined : <Centered label={mobileMessage(locale, state.offlineSnapshotAt !== undefined
         ? "home.empty.offline" : state.status !== "connected" ? "home.empty.reconnect" : normalizedSearch
-          ? "home.empty.search" : statusFilter === "archived" ? "home.empty.archived" : "home.empty.default")} colors={colors} />}
+          ? "home.empty.search" : projectView === undefined && hasMobileHomeDisplayFilters(display) ? "home.empty.filters"
+          : listStatusFilter === "archived" ? "home.empty.archived" : "home.empty.default")} colors={colors} />}
       renderItem={({ item }) => <SwipeableSessionRow session={item.session} registry={swipeRegistry} colors={colors} locale={locale}
         onTogglePin={togglePin} onArchive={toggleArchive} onShowOptions={openOptions}
         disabled={state.status !== "connected"}>
@@ -1680,8 +1814,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
               if (swipeRegistry.closeOpenRow()) return;
               const sessionId = item.session.sessionId;
               const query = normalizedSearch.toLocaleLowerCase();
-              const targetName = state.owner?.targets.find(target => target.targetId === item.session.targetId)?.displayName;
-              const matchesName = item.session.displayName.toLocaleLowerCase().includes(query) || targetName?.toLocaleLowerCase().includes(query);
+              const matchesName = item.session.displayName.toLocaleLowerCase().includes(query) || item.navigationName.toLocaleLowerCase().includes(query);
               const match = matchesName ? undefined : currentMessageMatches.get(sessionId);
               navigate({ kind: "session", sessionId, ...(match?.eventId ? { searchMatch: match } : {}) });
             }} style={styles.sessionRowBody}>
@@ -1691,7 +1824,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
               <MobileTaskTagDots tags={item.session.taskTags} locale={locale} dark={colors.dark} />
               {item.session.pinned && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>{mobileMessage(locale, "common.pinned")}</Text>}
             </View>
-              <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{item.targetName} · {sessionState(item.session.state, locale)}</Text></View>
+              <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{item.navigationName} · {sessionState(item.session.state, locale)}</Text></View>
           </Pressable>
           <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.optionsFor", {
             name: item.session.displayName || mobileMessage(locale, "home.untitledTask")
@@ -1704,8 +1837,16 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
         </View>
       </SwipeableSessionRow>}
       refreshing={state.status === "connecting"} onRefresh={() => void client.refresh()}
-      onScrollBeginDrag={() => { swipeRegistry.closeOpenRow(); }}
+      onScrollBeginDrag={() => { listScroll.pendingOffset = 0; swipeRegistry.closeOpenRow(); }}
       contentContainerStyle={styles.list} />
+    {displaySource === homeScopeKey && foreground && !normalizedSearch && projectView === undefined && <MobileHomeDisplaySheet
+      state={state} display={display} colors={colors} locale={locale}
+      onClose={() => setDisplaySource(undefined)}
+      onChange={next => {
+        if (next.projectOrder === "manual" && display.projectOrder !== "manual" && next.manualProjectOrder.length === 0) {
+          applyHomeDisplay({ ...next, manualProjectOrder: projectOrder(visibleProjectKeys) });
+        } else applyHomeDisplay(next);
+      }} />}
     <Modal visible={(state.status === "connected" || state.status === "offline") && optionsSession !== undefined} transparent animationType="none"
       onRequestClose={closeOptions} statusBarTranslucent>
       <View style={styles.sheetRoot}>
@@ -1766,6 +1907,107 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
 }
 
 type SessionOption = "rename" | "copy-link" | "pin" | "archive" | "delete" | "tags" | `tag:${string}`;
+
+function MobileHomeProjectHeading({ section, expanded, colors, locale, reorderable, reorder, onToggle, onStartDrag }: {
+  readonly section: MobileHomeSection;
+  readonly expanded: boolean;
+  readonly colors: Colors;
+  readonly locale: MobileSupportedLocale;
+  readonly reorderable: boolean;
+  readonly reorder: ReturnType<typeof useMobileHomeProjectReorder>;
+  readonly onToggle: () => void;
+  readonly onStartDrag: () => void;
+}) {
+  const { register, marker } = reorder;
+  const { key, title } = section;
+  const registerHeading = useCallback((view: View | null) => register(key, view), [key, register]);
+  const drop = marker?.drop?.key === key ? marker.drop : undefined;
+  return <View ref={reorderable ? registerHeading : undefined} collapsable={false} testID={`home-project-heading:${key}`}
+    style={[styles.homeProjectHeading, { borderTopColor: drop?.after === false ? colors.accent : "transparent",
+      borderBottomColor: drop?.after === true ? colors.accent : "transparent", opacity: marker?.sourceKey === key ? 0.65 : 1 }]}>
+    <Pressable accessibilityRole="button" accessibilityLabel={title} accessibilityState={{ expanded }} disabled={marker !== undefined}
+      onPress={onToggle} style={[styles.homeProjectHeader, styles.fill]}>
+      <Text style={[styles.listSectionTitle, styles.fill, { color: colors.muted }]}>{title}</Text>
+      <View accessible={false} style={[styles.homeProjectChevron, { borderColor: colors.muted,
+        transform: [{ rotate: expanded ? "45deg" : "-45deg" }] }]} />
+    </Pressable>
+    {reorderable && <MobileReorderHandle label={mobileMessage(locale, "home.display.reorderProject", { name: title })}
+      hint={mobileMessage(locale, "home.display.reorderProjectHint")} color={colors.muted} style={styles.homeProjectDragHandle}
+      holdMs={600} disabled={marker !== undefined && marker.sourceKey !== key}
+      onStart={y => { onStartDrag(); reorder.start(key, y); }} onMove={y => reorder.move(key, y)}
+      onFinish={commit => reorder.finish(key, commit)} onStep={delta => reorder.step(key, delta)} />}
+  </View>;
+}
+
+function MobileHomeDisplaySheet({ state, colors, locale, display, onChange, onClose }: ScreenProps & {
+  readonly display: MobileHomeDisplayPreferences;
+  readonly onChange: (display: MobileHomeDisplayPreferences) => void;
+  readonly onClose: () => void;
+}) {
+  const { height } = useWindowDimensions();
+  const targets = new Map(state.owner?.targets.map(target => [target.targetId, target] as const));
+  const projects = state.owner?.workspaces.flatMap(workspace => {
+    const target = targets.get(workspace.targetId);
+    if (workspace.kind !== WorkspaceKind.USER_PROJECT || target?.state === TargetState.ARCHIVED || target?.state === TargetState.DELETING) return [];
+    return [{ key: `project:${workspace.targetId}`, label: target?.displayName || workspace.displayName || mobileMessage(locale, "home.section.project"), path: workspace.serverPathDisplay }];
+  }).sort((left, right) => left.label.localeCompare(right.label) || left.key.localeCompare(right.key)) ?? [];
+  const projectChoices = [{ key: "dialogue", label: mobileMessage(locale, "home.section.dialogue"), path: "" }, ...projects];
+  const updateProject = (key: string): void => {
+    const selected = display.projectFilter === "all" ? [] : display.projectFilter;
+    const next = selected.includes(key) ? selected.filter(item => item !== key) : [...selected, key];
+    onChange({ ...display, projectFilter: next.length === 0 ? "all" : next });
+  };
+  const option = (key: string, label: string, checked: boolean, select: () => void, role: "radio" | "checkbox" = "radio", detail?: string) => (
+    <Pressable key={key} accessibilityRole={role} accessibilityState={{ checked }}
+      accessibilityLabel={detail ? `${label} · ${detail}` : label} onPress={select}
+      style={[styles.homeDisplayOption, checked && { backgroundColor: colors.brandBackground }]}>
+      <View style={styles.fill}>
+        <Text style={[styles.label, { color: colors.ink }]}>{label}</Text>
+        {!!detail && <Text numberOfLines={1} style={[styles.caption, { color: colors.muted }]}>{detail}</Text>}
+      </View>
+      {checked && <Text accessible={false} style={[styles.label, { color: colors.accent }]}>✓</Text>}
+    </Pressable>
+  );
+  const title = mobileMessage(locale, "home.display");
+  return <Modal visible transparent animationType="none" statusBarTranslucent onRequestClose={onClose}>
+    <View style={styles.sheetRoot}>
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "common.cancel")} onPress={onClose} style={styles.modalBackdrop} />
+      <SafeAreaView accessibilityViewIsModal edges={["bottom", "left", "right"]}
+        style={[styles.optionSheet, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+        <Text accessibilityRole="header" style={[styles.title, { color: colors.ink }]}>{title}</Text>
+        <ScrollView style={{ maxHeight: Math.floor(height * 0.62) }}>
+          <Text accessibilityRole="header" style={[styles.listSectionTitle, { color: colors.muted }]}>{mobileMessage(locale, "home.display.projects")}</Text>
+          {option("all-projects", mobileMessage(locale, "home.display.allProjects"), display.projectFilter === "all",
+            () => onChange({ ...display, projectFilter: "all" }), "checkbox")}
+          {projectChoices.map(project => option(project.key, project.label,
+            display.projectFilter !== "all" && display.projectFilter.includes(project.key), () => updateProject(project.key), "checkbox", project.path))}
+          <Text accessibilityRole="header" style={[styles.listSectionTitle, { color: colors.muted }]}>{mobileMessage(locale, "home.display.agent")}</Text>
+          {option("all-agents", mobileMessage(locale, "home.display.allAgents"), display.backendId === null,
+            () => onChange({ ...display, backendId: null }))}
+          {state.owner?.backends.map(backend => option(`agent:${backend.backendId}`, backend.displayName || backend.backendId,
+            display.backendId === backend.backendId, () => onChange({ ...display, backendId: backend.backendId })))}
+          <Text accessibilityRole="header" style={[styles.listSectionTitle, { color: colors.muted }]}>{mobileMessage(locale, "home.display.lastActivity")}</Text>
+          {MOBILE_HOME_ACTIVITY_FILTERS.map(range => option(`range:${range}`, mobileMessage(locale, `home.display.activity.${range}`),
+            display.lastActivity === range, () => onChange({ ...display, lastActivity: range })))}
+          <Text accessibilityRole="header" style={[styles.listSectionTitle, { color: colors.muted }]}>{mobileMessage(locale, "home.display.sort")}</Text>
+          {MOBILE_HOME_TASK_SORTS.map(sortBy => option(`sort:${sortBy}`, mobileMessage(locale,
+            sortBy === "activity" ? "home.searchSort.activityDesc" : `home.display.sort.${sortBy}`),
+          display.sortBy === sortBy, () => onChange({ ...display, sortBy })))}
+          <Text accessibilityRole="header" style={[styles.listSectionTitle, { color: colors.muted }]}>{mobileMessage(locale, "home.display.projectOrder")}</Text>
+          {option("project-order-activity", mobileMessage(locale, "home.display.projectOrderActivity"), display.projectOrder === "activity",
+            () => onChange({ ...display, projectOrder: "activity" }))}
+          {option("project-order-manual", mobileMessage(locale, "home.display.projectOrderManual"), display.projectOrder === "manual",
+            () => onChange({ ...display, projectOrder: "manual" }))}
+        </ScrollView>
+        <View style={styles.actionRow}>
+          <Action label={mobileMessage(locale, "home.display.reset")} colors={colors} compact disabled={!hasMobileHomeDisplayFilters(display)}
+            onPress={() => onChange({ ...display, projectFilter: "all", backendId: null, lastActivity: "all" })} />
+          <Action label={mobileMessage(locale, "common.close")} colors={colors} compact onPress={onClose} />
+        </View>
+      </SafeAreaView>
+    </View>
+  </Modal>;
+}
 
 function MobileInputHandoffHomeEntry({ colors, state, locale, onOpen }: ScreenProps & { readonly onOpen: (sessionId: string) => void }) {
   const api = client.inputHandoffTasksApi?.();
@@ -3685,6 +3927,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   drawerMountedRef.current = drawerMounted;
   const [navigationBusy, setNavigationBusy] = useState(false);
   const [localHomeView, setLocalHomeView] = useState<MobileHomeViewState>({ search: "", statusFilter: "active" });
+  const localHomeScrollOffsets = useRef(new Map<string, number>());
   const fallbackHomeMenuRef = useRef<View>(null);
   const [fallbackHomeSearchFocus, setFallbackHomeSearchFocus] = useState(0);
   const taskHomeNavigatorRef = useRef<MobileTaskHomeNavigation | null>(null);
@@ -5304,13 +5547,16 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         if (taskMountedRef.current) setGalleryOpening(false);
       });
   };
-  const openMarkdownImage = (leaseId: string, key: string): void => {
+  const openMessageImageGallery = (begin: (signal: AbortSignal) => Promise<MobileImageGalleryDescriptor>): void => {
     if (galleryOpening || imageGallery.view || state.status !== "connected" || state.busy
       || attachmentBusy || voice.busy || fileShareBusy || conversationShare.active) return;
     setGalleryOpening(true); setLocalError(""); setComposerNotice("");
-    void imageGallery.open((signal) => client.openMarkdownImageGallery(leaseId, key, signal)).catch((error) => {
+    void imageGallery.open(begin).catch((error) => {
       if (taskMountedRef.current) setLocalError(errorText(error));
     }).finally(() => { if (taskMountedRef.current) setGalleryOpening(false); });
+  };
+  const openMarkdownImage = (leaseId: string, key: string): void => {
+    openMessageImageGallery(signal => client.openMarkdownImageGallery(leaseId, key, signal));
   };
   const markdownPathAbortRef = useRef<AbortController | undefined>(undefined);
   useEffect(() => () => { markdownPathAbortRef.current?.abort(); }, []);
@@ -6673,6 +6919,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     onMenu={homeNavigation?.onMenu ?? onHome} menuButtonRef={homeNavigation?.menuButtonRef ?? fallbackHomeMenuRef}
     searchFocusRequest={homeNavigation?.searchFocusRequest ?? fallbackHomeSearchFocus}
     viewState={homeNavigation?.viewState ?? localHomeView} onViewStateChange={homeNavigation?.onViewStateChange ?? setLocalHomeView}
+    scrollOffsets={homeNavigation?.scrollOffsets ?? localHomeScrollOffsets.current}
     currentSessionId={state.taskSource?.kind === "joined" ? undefined : state.selectedId} host={host} foreground={AppState.currentState === "active" && (host !== "drawer" || drawerOpen)}
     newTaskInSystemBar={newTaskInSystemBar}
     onPartners={homeNavigation?.onPartners}
@@ -6784,6 +7031,12 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           && mobileNativeIntentMessageMatches(activeMessageFocus, item);
         const markdownOwnerKey = `${taskDraftProfileId}/${state.selectedId}/${session?.nativeBinding?.runtimeGeneration}/${item.id}`;
         const quoteAction = nativeMessageQuoteAction(item);
+        const diagramAttachmentOwner = item.kind === "assistant" && item.completed && !item.optimistic
+          && state.status === "connected" && attachmentControls?.policy.images === true ? attachmentControls.surfaceOwnerKey : undefined;
+        const annotateDiagram = diagramAttachmentOwner === undefined ? undefined : (image: MobileImageOutputSource) => {
+          openMessageImageGallery(signal => client.openMarkdownDiagramGallery({ messageId: item.id, eventId: item.eventId,
+            attachmentOwnerKey: diagramAttachmentOwner, sourceLabel: mobileMessage(locale, "markdown.diagram") }, image, signal));
+        };
         return <View accessibilityLiveRegion={linked ? "polite" : undefined}
           {...conversationShare.rowTouchHandlers(item)}
           collapsable={false} ref={(view) => {
@@ -6874,7 +7127,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
             resourceText={item.text}
             resourceClient={client} messageId={item.id}
             resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
-            onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />;
+            onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} onAnnotateDiagram={annotateDiagram} />;
         }) : item.tool ? <MobileToolCallCard key={markdownOwnerKey} call={item.tool} ownerKey={markdownOwnerKey} colors={colors} locale={locale}
           enabled={state.status === "connected" || state.status === "offline"} />
           : item.kind === "assistant" ? <MobileMarkdownMessage key={markdownOwnerKey} text={item.text} colors={colors} locale={locale}
@@ -6883,7 +7136,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           onSendRichAnswer={sendRichAnswer}
           ownerKey={markdownOwnerKey} resourceClient={client} messageId={item.id}
           resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
-          onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />
+          onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} onAnnotateDiagram={annotateDiagram} />
           : item.kind === "user" ? <MobileUserMessageContent ownerKey={`${blockOwnerKey}/${item.id}`} text={item.text}
             quoteAction={quoteAction}
             automation={item.automationOrigin !== undefined} selectable={!item.optimistic} colors={colors} locale={locale} />
@@ -9040,6 +9293,11 @@ const styles = StyleSheet.create({
   rowOptions: { width: 52, minHeight: 66, alignItems: "center", justifyContent: "center" },
   rowOptionsText: { fontSize: 16, letterSpacing: -1 },
   listSectionTitle: { paddingHorizontal: 4, paddingTop: 10, paddingBottom: 8, fontSize: 13, fontWeight: "700", textTransform: "uppercase" },
+  homeProjectHeading: { flexDirection: "row", alignItems: "center", borderTopWidth: 2, borderBottomWidth: 2 },
+  homeProjectHeader: { minHeight: 44, flexDirection: "row", alignItems: "center", paddingRight: 10 },
+  homeProjectChevron: { width: 7, height: 7, borderRightWidth: 1.5, borderBottomWidth: 1.5 },
+  homeProjectDragHandle: { width: 44, minHeight: 44, alignItems: "center", justifyContent: "center" },
+  homeProjectFooter: { minHeight: 44, justifyContent: "center", paddingHorizontal: 8 },
   chevron: { fontSize: 28 }, center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 10, padding: 24 },
   startupLoading: { flex: 1, alignItems: "center", justifyContent: "center", gap: 16, padding: 24 },
   loadingArtwork: { width: "82%", maxWidth: 420, height: 360 },
@@ -9094,6 +9352,7 @@ const styles = StyleSheet.create({
   composerInput: { flex: 1, minHeight: 44, fontSize: 16, lineHeight: 22, paddingVertical: 8 },
   sheetRoot: { flex: 1, justifyContent: "flex-end" },
   optionSheet: { borderTopWidth: 1, borderTopLeftRadius: 22, borderTopRightRadius: 22, padding: 18, gap: 4 },
+  homeDisplayOption: { minHeight: 44, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 10, borderRadius: 8 },
   dialogRoot: { flex: 1, justifyContent: "center", padding: 24, backgroundColor: "rgba(0,0,0,0.38)" },
   renameDialog: { borderWidth: 1, borderRadius: 18, padding: 20, gap: 16 },
   taskDrawer: { flex: 1, paddingHorizontal: 14, paddingBottom: 12, gap: 10 },

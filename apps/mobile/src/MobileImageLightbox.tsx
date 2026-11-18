@@ -143,6 +143,7 @@ export function MobileImageLightbox({
   const fileName = session?.fileName ?? page?.title ?? "";
   const sourceMediaType = session?.sourceMediaType ?? page?.mediaType ?? "";
   const annotatable = session?.annotatable === true;
+  const annotateOnOpen = gallery?.descriptor.sourceKind === "diagram" && annotatable;
   const initialStrokes = useMemo(() => cloneStrokes(session?.initialStrokes ?? []), [loadKey]);
   const [strokes, setStrokes] = useState<readonly MobileImageAnnotationStroke[]>(initialStrokes);
   const [draftStroke, setDraftStroke] = useState<MobileImageAnnotationStroke>();
@@ -228,7 +229,7 @@ export function MobileImageLightbox({
     const nextStrokes = cloneStrokes(initialStrokes);
     strokesRef.current = nextStrokes;
     draftStrokeRef.current = undefined;
-    annotatingRef.current = false;
+    annotatingRef.current = annotateOnOpen;
     transformRef.current = initialTransform;
     naturalRef.current = emptySize;
     gestureRef.current = undefined;
@@ -236,7 +237,7 @@ export function MobileImageLightbox({
     closedRef.current = false;
     setStrokes(nextStrokes);
     setDraftStroke(undefined);
-    setAnnotating(false);
+    setAnnotating(annotateOnOpen);
     setTransform(initialTransform);
     setNatural(emptySize);
     decodedRef.current = undefined;
@@ -249,7 +250,7 @@ export function MobileImageLightbox({
     setOutputAction(undefined);
     setNotice("");
     setError("");
-  }, [loadKey, cancelGesture]);
+  }, [loadKey, cancelGesture, annotateOnOpen]);
 
   const backdrop = gallery?.preview;
   useEffect(() => {

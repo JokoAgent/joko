@@ -1,12 +1,13 @@
-import type { MobileHomeSearchMatch, MobileHomeSearchSort } from "./home-navigation";
+import type { MobileHomeDisplayPreferences, MobileHomeSearchMatch, MobileHomeSearchSort } from "./home-navigation";
 
 export interface MobileHomeViewState {
   readonly search: string;
   readonly statusFilter: "active" | "archived" | "all";
   readonly searchSort?: MobileHomeSearchSort;
+  readonly display?: MobileHomeDisplayPreferences;
 }
 
-export type MobileHomeViewChange = (next: MobileHomeViewState, chooseStatus?: boolean) => void;
+export type MobileHomeViewChange = (next: MobileHomeViewState, chooseStatus?: boolean, chooseDisplay?: boolean) => void;
 
 export type MobileHomeNavigationIntent =
   | { readonly kind: "session"; readonly sessionId: string; readonly searchMatch?: MobileHomeSearchMatch }

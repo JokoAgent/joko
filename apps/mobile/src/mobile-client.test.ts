@@ -1,5 +1,7 @@
 import { clone, create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { TimestampSchema } from "@bufbuild/protobuf/wkt";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import { ModelSourceKind, ModelSourceDescriptorSchema, TaskShareRuntimeControlSchema, QuestionRequestSchema, MessageBlockSchema } from "@joko/contracts";
 import { RemoteHostSchema } from "@joko/contracts";
 import { CollaborationGoalTreeSchema, CollaborationGoalStatus, CollaborationSessionRole, CollaborationWorkerStatus } from "@joko/contracts";
@@ -1143,7 +1145,9 @@ function fakeNetwork(): MobileNetwork {
     submit: vi.fn(async (_credential, operationId, mutation) => {
       toBinary(OperationMutationSchema, mutation);
       return create(OperationSchema, {
-      operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED
+        operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+        ...(mutation.payload.case !== "deleteSession" ? {} : { mutation, result: { payload: { case: "session",
+          value: create(SessionSchema, { sessionId: mutation.payload.value.sessionId, archived: true, state: SessionState.CLOSED }) } } })
       });
     }),
     waitOperation: vi.fn(async (_credential, operationId) => create(OperationSchema, {
@@ -2237,7 +2241,7 @@ function client(
   pdfPreviewFiles?: MobilePdfPreviewFiles,
   modelPreviewFiles?: MobileModelPreviewFiles,
   fileShare?: Pick<MobileFileShare, "perform">,
-  offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear" | "retireTaskTimeline" | "searchPreviews">,
+  offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear" | "retireTask" | "retireTaskTimeline" | "searchPreviews">,
   readOnlyDictionaryCache?: { clear(profileId: string): Promise<void> },
   deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, "android"),
   creationReceipts?: MobilePartnerCreationReceipts,
@@ -2254,7 +2258,7 @@ function client(
 function clientWithOfflineCache(
   network: MobileNetwork,
   storage: MobileStorage,
-  offlineCache: Pick<MobileOfflineCache, "load" | "save" | "clear" | "retireTaskTimeline" | "searchPreviews">,
+  offlineCache: Pick<MobileOfflineCache, "load" | "save" | "clear" | "retireTask" | "retireTaskTimeline" | "searchPreviews">,
   now: () => number = () => 2_000,
   newId?: () => string
 ) {
@@ -6299,7 +6303,8 @@ describe("native mobile connection and operation ownership", () => {
       save: vi.fn()
         .mockResolvedValueOnce(undefined)
         .mockRejectedValueOnce(new Error("offline storage full")),
-      clear: vi.fn(async () => undefined), retireTaskTimeline: vi.fn(async () => undefined), searchPreviews: vi.fn(async () => [])
+      clear: vi.fn(async () => undefined), retireTask: vi.fn(async () => undefined),
+      retireTaskTimeline: vi.fn(async () => undefined), searchPreviews: vi.fn(async () => [])
     };
     const network = fakeNetwork();
     network.readOwner = vi.fn(async (current) => current.profileId === otherCredential.profileId
@@ -6326,8 +6331,8 @@ describe("native mobile connection and operation ownership", () => {
     const offlineCache = {
       load: vi.fn(async () => undefined),
       save: vi.fn(async () => undefined),
-      clear: vi.fn(() => new Promise<void>((resolve) => { releaseClear = resolve; })), retireTaskTimeline: vi.fn(async () => undefined),
-      searchPreviews: vi.fn(async () => [])
+      clear: vi.fn(() => new Promise<void>((resolve) => { releaseClear = resolve; })), retireTask: vi.fn(async () => undefined),
+      retireTaskTimeline: vi.fn(async () => undefined), searchPreviews: vi.fn(async () => [])
     };
     const network = fakeNetwork();
     const saved = memoryStorage(credential);
@@ -6356,6 +6361,7 @@ describe("native mobile connection and operation ownership", () => {
       load: vi.fn(async () => undefined),
       save: vi.fn(async () => undefined),
       clear: vi.fn(async () => undefined),
+      retireTask: vi.fn(async () => undefined),
       retireTaskTimeline: vi.fn(async () => undefined), searchPreviews: vi.fn(async () => [])
     };
     const firstNetwork = fakeNetwork();
@@ -6796,7 +6802,7 @@ describe("native mobile connection and operation ownership", () => {
     const saved = memoryStorage(credential);
     const offlineCache = {
       load: vi.fn(async () => undefined), save: vi.fn(async () => undefined), clear: vi.fn(async () => undefined),
-      retireTaskTimeline: vi.fn(async () => undefined), searchPreviews: vi.fn(async () => [])
+      retireTask: vi.fn(async () => undefined), retireTaskTimeline: vi.fn(async () => undefined), searchPreviews: vi.fn(async () => [])
     };
     const app = clientWithOfflineCache(network, saved.storage, offlineCache);
     await app.start();
@@ -6819,7 +6825,7 @@ describe("native mobile connection and operation ownership", () => {
     const saved = memoryStorage(credential);
     const offlineCache = {
       load: vi.fn(async () => undefined), save: vi.fn(async () => undefined), clear: vi.fn(async () => undefined),
-      retireTaskTimeline: vi.fn(async () => undefined), searchPreviews: vi.fn(async () => [])
+      retireTask: vi.fn(async () => undefined), retireTaskTimeline: vi.fn(async () => undefined), searchPreviews: vi.fn(async () => [])
     };
     const app = clientWithOfflineCache(network, saved.storage, offlineCache);
     await app.start();
@@ -6849,7 +6855,7 @@ describe("native mobile connection and operation ownership", () => {
     const saved = memoryStorage([credential, otherCredential], credential.profileId);
     const offlineCache = {
       load: vi.fn(async () => undefined), save: vi.fn(async () => undefined), clear: vi.fn(async () => undefined),
-      retireTaskTimeline: vi.fn(async () => undefined), searchPreviews: vi.fn(async () => [])
+      retireTask: vi.fn(async () => undefined), retireTaskTimeline: vi.fn(async () => undefined), searchPreviews: vi.fn(async () => [])
     };
     const app = clientWithOfflineCache(network, saved.storage, offlineCache);
     await app.start();
@@ -9310,6 +9316,61 @@ describe("mobile Home search and task mutations", () => {
       expect(mutation.preconditions[0]?.expectedRevision?.value).toBe(9n);
     }
     expect(saved.pending()).toEqual([]);
+  });
+
+  it.each(["committed", "unknown", "rejected", "wrong task"] as const)(
+    "uses the original task deletion receipt when the next Owner read goes offline (%s)", async outcome => {
+    const owner = offlineOwnerProjection([runtimeSession, relatedSession]);
+    const detail = offlineDetailProjection(runtimeSession);
+    detail.timeline = [messageEvent];
+    const profile = profileFromCredential(credential);
+    const offline = memoryOfflineCache();
+    await offline.cache.save(profile, node, owner, offlineDetailProjection(relatedSession));
+    const network = projectedNetwork(owner);
+    vi.mocked(network.readSession).mockResolvedValue(detail);
+    const saved = memoryStorage(credential);
+    const app = clientWithOfflineCache(network, saved.storage, offline.cache);
+    await app.start();
+    expect(app.state).toMatchObject({ status: "connected", selectedId: "session" });
+    expect(app.state.detail?.timeline.map(event => event.eventId)).toContain(messageEvent.eventId);
+    const savedCacheAt = (await offline.cache.load(profile))?.cachedAt;
+    expect((await offline.cache.load(profile, "session"))?.detail?.timeline).toHaveLength(1);
+
+    if (outcome === "unknown") vi.mocked(network.submit).mockRejectedValueOnce(new Error("receipt lost"));
+    if (outcome === "rejected" || outcome === "wrong task") {
+      vi.mocked(network.submit).mockImplementationOnce(async (_credential, operationId, mutation) => create(OperationSchema, {
+        operationId, connectionId: credential.connectionId, mutation,
+        state: outcome === "rejected" ? OperationState.FAILED : OperationState.SUCCEEDED,
+        result: { payload: { case: "session", value: relatedSession } }
+      }));
+    }
+    vi.mocked(network.readOwner).mockRejectedValue(new Error("temporary network loss"));
+    const committed = outcome === "committed";
+    await expect(app.deleteSession("session")).resolves.toBe(committed);
+    if (outcome === "unknown" || outcome === "wrong task") await app.refresh();
+    expect(app.state.status).toBe("offline");
+    expect(app.state.selectedId).toBe(committed ? undefined : "session");
+    expect(app.state.detail?.timeline.map(event => event.eventId)).toEqual(committed ? undefined : [messageEvent.eventId]);
+    expect(app.state.owner?.sessions.map(session => session.sessionId)).toEqual(committed
+      ? [relatedSession.sessionId] : ["session", relatedSession.sessionId]);
+    expect(await saved.storage.loadSelection(credential.profileId)).toBe(committed ? undefined : "session");
+    expect(saved.pending()).toHaveLength(outcome === "unknown" || outcome === "wrong task" ? 1 : 0);
+
+    const restarted = new MobileOfflineCache(offline.driver, () => 2_000, () => "restarted");
+    const cached = await restarted.load(profile, "session");
+    expect(cached?.cachedAt).toBe(savedCacheAt);
+    expect(cached?.owner.sessions.some(session => session.sessionId === "session")).toBe(!committed);
+    expect(cached?.detail?.timeline.map(event => event.eventId)).toEqual(committed ? undefined : [messageEvent.eventId]);
+    expect((await restarted.load(profile, relatedSession.sessionId))?.detail?.sessions[0]?.sessionId).toBe(relatedSession.sessionId);
+    expect(network.submit).toHaveBeenCalledOnce();
+
+    if (committed) {
+      const currentOwner = offlineOwnerProjection([relatedSession]);
+      vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: currentOwner });
+      await app.refresh();
+      expect(app.state).toMatchObject({ status: "connected", selectedId: undefined, detail: undefined });
+      expect(app.state.owner?.sessions.map(session => session.sessionId)).toEqual([relatedSession.sessionId]);
+    }
   });
 
   it.each([true, false])("reports only an exact committed archive to the task page before refreshing (%s)", async committed => {
@@ -16134,6 +16195,69 @@ describe("native current-task Files ownership", () => {
       expect.objectContaining({ blobId: initialIndex === 1 ? "timeline-image-two" : "timeline-image-one", sha256Hex: "b".repeat(64) }),
       undefined
     );
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it.each(["original", "marked"] as const)("adds only the confirmed %s diagram to its exact task draft", async variant => {
+    const bytes = galleryPngBytes(5, 4);
+    const completed = timelineGalleryEvent(bytes);
+    if (completed.payload?.kind.case !== "messageCompleted") throw new Error("Missing diagram message fixture.");
+    completed.payload.kind.value.blocks = [create(MessageBlockSchema, { content: {
+      case: "text", value: "```mermaid\nflowchart TD\nA --> B\n```"
+    } })];
+    const network = projectedNetwork(timelineGallerySnapshot(completed));
+    vi.mocked(network.readAround).mockResolvedValue([completed]);
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    const originalDraft = localAttachmentDraft("Keep this draft and its two attachments");
+    drafts.composer.save(identity, originalDraft);
+    await drafts.composer.flush(identity);
+    const fixture = attachmentFileFixture();
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds(), undefined, drafts,
+      new MobileAttachmentFiles(fixture.driver, async value => bytesToHex(sha256(value))));
+    await app.start();
+    const row = timelineRows(app.state.detail?.timeline ?? [])[0]!;
+    const controls = app.taskAttachmentControls()!;
+    const png = { leaseId: "webview-receipt", fileName: "Joko-diagram.png", mediaType: "image/png", byteSize: bytes.byteLength,
+      sha256Hex: bytesToHex(sha256(bytes)), bytes, width: 5, height: 4 };
+    const open = () => app.openMarkdownDiagramGallery({ messageId: row.id, eventId: row.eventId,
+      attachmentOwnerKey: controls.surfaceOwnerKey, sourceLabel: "Diagram" }, png, new AbortController().signal);
+    const dismissed = await open();
+    app.cancelImageGallery(dismissed.leaseId);
+    expect(await drafts.composer.read(identity)).toEqual(originalDraft);
+    expect(fixture.driver.stageBytes).not.toHaveBeenCalled();
+
+    const gallery = await open();
+    expect(gallery).toMatchObject({ sourceKind: "diagram", initialIndex: 0 });
+    expect(gallery.pages).toHaveLength(1);
+    const page = await app.loadImageGalleryPage(gallery.leaseId, 0);
+    expect(page).toMatchObject({ addable: true, annotatable: true, expectedWidthPixels: 5, expectedHeightPixels: 4 });
+    app.confirmImageGalleryPageDecoded(gallery.leaseId, page.leaseId, page.pageId, { width: 5, height: 4, mediaType: "image/png" });
+    const strokes = [{ points: [{ x: 0.25, y: 0.5 }] }];
+    const marked = galleryPngBytes(4, 3);
+    const commit = () => variant === "marked"
+      ? app.commitImageGalleryPageToComposer(gallery.leaseId, page.leaseId, strokes, { bytes: marked, mediaType: "image/png", width: 4, height: 3 })
+      : app.addImageGalleryPageToComposer(gallery.leaseId, page.leaseId);
+    vi.mocked(network.readAround).mockResolvedValueOnce([]);
+    await expect(commit()).rejects.toThrow(/completed diagram message changed/u);
+    expect(await drafts.composer.read(identity)).toEqual(originalDraft);
+    expect(fixture.bytes.size).toBe(2);
+
+    const committed = await commit();
+    expect(committed.text).toBe(originalDraft.text);
+    expect(committed.attachments.slice(0, 2)).toEqual(originalDraft.attachments);
+    const appended = committed.attachments[2]!;
+    expect(appended).toMatchObject({ fileName: variant === "marked" ? "Joko-diagram-annotated.png" : "Joko-diagram.png", kind: "image" });
+    expect(fixture.bytes.get(appended.attachmentId)).toEqual(variant === "marked" ? marked : bytes);
+    if (variant === "marked") {
+      expect(appended.annotation?.strokes).toEqual(strokes);
+      expect(fixture.bytes.get(appended.annotation!.source.storageId)).toEqual(bytes);
+      const editor = await app.openComposerImageEditor({ surface: "task", attachmentId: appended.attachmentId });
+      expect(editor).toMatchObject({ initialStrokes: strokes, expectedWidthPixels: 5, expectedHeightPixels: 4 });
+      app.cancelComposerImageEditor(editor.leaseId);
+    }
+    expect(await drafts.composer.read(identity)).toEqual(committed);
+    expect(network.downloadBlob).not.toHaveBeenCalled();
     expect(network.submit).not.toHaveBeenCalled();
   });
 
