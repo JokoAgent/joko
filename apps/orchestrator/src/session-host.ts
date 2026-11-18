@@ -8673,12 +8673,9 @@ export class SessionHost {
       });
     }
 
-    const target = this.#store.getTarget(stored.descriptor.targetId);
-    const readStored = adapter.readStoredPortableNativeSession;
-    if (backend.adapterKind === "pi" && readStored !== undefined && this.canReadStoredPortableSession(stored, target)) {
-      const { backendId, id: sessionId, binding } = stored.descriptor;
-      const backendGeneration = this.requireAdapterGeneration(backendId, adapter);
-      const assertCurrent = (): void => {
+    const exportSourceFence = (source: StoredSession, target: StoredTarget, backendGeneration: number, readingDetached: boolean) => {
+      const { backendId, id: sessionId, binding } = source.descriptor;
+      return (): void => {
         this.#assertOpen();
         assertConnectionCurrent?.();
         this.assertBackendAdmissionOpen(backendId);
@@ -8686,8 +8683,9 @@ export class SessionHost {
         const latest = this.#store.getSession(sessionId);
         const latestTarget = this.#store.getTarget(target.descriptor.id);
         if (latest.descriptor.backendId !== backendId || latest.descriptor.targetId !== target.descriptor.id
-          || latest.descriptor.archived !== stored.descriptor.archived || !sameNativeBinding(latest.descriptor.binding, binding)
-          || latestTarget.revision !== target.revision || !this.canReadStoredPortableSession(latest, latestTarget)
+          || latest.descriptor.archived !== source.descriptor.archived || latest.descriptor.deletedAt !== undefined
+          || !sameNativeBinding(latest.descriptor.binding, binding) || latestTarget.revision !== target.revision
+          || (readingDetached && !this.canReadStoredPortableSession(latest, latestTarget))
           || this.#store.findPendingSessionLifecycleCleanup(sessionId) !== undefined || this.#sessionLifecycleFences.has(sessionId)
           || this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined
           || this.#store.findPendingContextRebuild(sessionId) !== undefined || this.#sessionResetLocks.has(sessionId)
@@ -8707,6 +8705,12 @@ export class SessionHost {
         }
         assertProtectedNativeExport(this.#store, latest.descriptor);
       };
+    };
+    const target = this.#store.getTarget(stored.descriptor.targetId);
+    const readStored = adapter.readStoredPortableNativeSession;
+    if (backend.adapterKind === "pi" && readStored !== undefined && this.canReadStoredPortableSession(stored, target)) {
+      const { backendId, id: sessionId, binding } = stored.descriptor;
+      const assertCurrent = exportSourceFence(stored, target, this.requireAdapterGeneration(backendId, adapter), true);
       assertCurrent();
       const release = this.registerBackendSideEffectFlight(backendId, sessionId);
       try {
@@ -8724,17 +8728,18 @@ export class SessionHost {
     const active = await this.activate(input.sessionId);
     const lease = this.beginActiveBackendSideEffect(input.sessionId, active);
     const current = lease.stored;
+    const assertCurrent = exportSourceFence(current, target, lease.backendInstanceGeneration, false);
     let nativeSession: PortableNativeSession;
     try {
       if (active.adapter !== adapter || active.adapter.exportPortableNativeSession === undefined) throw staleBackendInstanceContextError();
-      assertConnectionCurrent?.();
+      assertCurrent();
       nativeSession = await active.adapter.exportPortableNativeSession(lease.context);
       this.assertActiveBackendSideEffectLease(lease);
-      assertProtectedNativeExport(this.#store, current.descriptor);
+      assertCurrent();
     } finally {
       lease.release();
     }
-    return this.buildPortableTaskArtifact(input, current, nativeSession);
+    return this.buildPortableTaskArtifact(input, current, nativeSession, assertCurrent);
   }
 
   private canReadStoredPortableSession(stored: StoredSession, target: StoredTarget): boolean {
@@ -8754,9 +8759,9 @@ export class SessionHost {
     input: ExportPortableSessionInput,
     current: StoredSession,
     nativeSession: PortableNativeSession | undefined,
-    assertCurrent?: () => void
+    assertCurrent: () => void
   ): Promise<ExportPortableSessionResult> {
-    assertCurrent?.();
+    assertCurrent();
     const events: PersistedEvent[] = [];
     let portableMessageCount = 0;
     visitVisibleSessionEvents(this.#store, input.sessionId, (event) => {
@@ -8831,13 +8836,13 @@ export class SessionHost {
       if (error instanceof PortableSessionProjectionError) throw portableSessionProjectionLimitError();
       throw error;
     }
-    assertCurrent?.();
+    assertCurrent();
     const storedArtifact = await this.#artifactStore.ingestBytes(built.bytes, {
       fileName: `${portableFileStem(current.descriptor.title)}.jshare`,
       mimeType: "application/vnd.joko.session",
-      ...(assertCurrent === undefined ? {} : { assertCurrent })
+      assertCurrent
     });
-    assertCurrent?.();
+    assertCurrent();
     const artifact: BlobRef = {
       id: storedArtifact.id,
       sha256: storedArtifact.sha256,
@@ -10438,7 +10443,7 @@ export class SessionHost {
     let stored = this.#store.getSession(sessionId);
     const before = await active.adapter.inspectSession(stored.descriptor.binding, this.contextFor(stored));
     assertNativeResetIdle(before);
-    await this.synchronizeNativeHistory(sessionId);
+    await this.synchronizeNativeHistory(sessionId, { sessionReset: true });
     await Promise.all([
       this.#nativeHistoryTails.get(sessionId) ?? Promise.resolve(),
       this.#runtimeCommandTails.get(sessionId) ?? Promise.resolve(),

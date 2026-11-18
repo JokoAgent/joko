@@ -4114,6 +4114,46 @@ describe("SessionHost", () => {
     })]);
   });
 
+  it("retires the original portable export when the task clears during an active export's media read", async () => {
+    const fixture = await createFixture(new PortableFakeAdapter());
+    const sessionId = (await fixture.host.createSession({ operationId: "create-export-before-clear", connection: fixture.connection,
+      targetId: "target-one", title: "Export before clear", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const before = fixture.store.getSession(sessionId).descriptor;
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
+    const image = await fixture.artifacts.ingestBytes(png, { fileName: "before-clear.png", mimeType: "image/png", expiresAt: Date.now() + 60_000 });
+    const blob = fixture.store.getArtifact(image.id).blob;
+    fixture.store.transaction(() => fixture.store.adoptSessionArtifact({ blob, sessionId }));
+    appendSessionEvent(fixture.store, sessionId, "export-before-clear-image", 1_000, {
+      type: "message_complete", role: "user", blocks: [{ kind: "image", blob, alt: "Before clear" }]
+    });
+    const gate = new AsyncGate();
+    const originalRead = fixture.artifacts.readBlob.bind(fixture.artifacts);
+    const reading = vi.spyOn(fixture.artifacts, "readBlob").mockImplementationOnce(async (source) => {
+      const content = await originalRead(source);
+      gate.enter();
+      await gate.wait;
+      return content;
+    });
+    const publish = vi.spyOn(fixture.artifacts, "ingestBytes");
+    const finished = fixture.host.exportPortableSession({ sessionId });
+    const outcome = finished.then((result) => ({ result }), (error: unknown) => ({ error }));
+    try {
+      await gate.entered;
+      expect(publish).not.toHaveBeenCalled();
+      await fixture.host.resetSession({ operationId: "clear-during-export", connection: fixture.connection, sessionId,
+        body: { sessionId }, result: (session) => session.descriptor.id });
+      expect(fixture.store.getSession(sessionId).descriptor.binding.generation).toBeGreaterThan(before.binding.generation);
+      gate.release();
+      await expect(outcome).resolves.toMatchObject({ error: { publicError: { code: "PORTABLE_SESSION_EXPORT_SOURCE_CHANGED" } } });
+      expect(publish).not.toHaveBeenCalled();
+    } finally {
+      gate.release();
+      await outcome;
+      reading.mockRestore();
+      publish.mockRestore();
+    }
+  });
+
   it.each([false, true])("imports portable media only after receiving bytes are readable, with a blocked Blob path=%s", async blocked => {
     const source = await createFixture(new PortableFakeAdapter());
     const sourceSessionId = (await source.host.createSession({ operationId: "portable-media-source", connection: source.connection,
