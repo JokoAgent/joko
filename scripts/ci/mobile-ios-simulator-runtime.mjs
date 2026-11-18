@@ -17,16 +17,16 @@ const sdkRuntime = process.env.JOKO_IOS_SDK_RUNTIME ?? 'relay';
 if (!['relay', 'iroh-native', 'http-connect-native'].includes(sdkRuntime)) throw new Error('Unknown selected Mobile UI-test runtime.');
 const abort = new AbortController();
 const observationStartedAt = Date.now();
-// A full run includes up to ten minutes of cold boot and two five-minute
-// XCTest commands, plus app startup, frame capture and evidence export.
-const observationBudgetMs = (startupDiagnosticsOnly ? 4 : 30) * 60_000;
+// Cold boot, Metro, two app observations and the XCTest build took nearly
+// 26 minutes on the Intel runner. Leave the first XCTest its full five minutes.
+const observationBudgetMs = (startupDiagnosticsOnly ? 4 : 31) * 60_000;
 const observationDeadlineAt = observationStartedAt + observationBudgetMs;
 const simulatorInstallTimeoutMs = 120_000;
 const simulatorLaunchTimeoutMs = 120_000;
 // A cold Intel runner can finish the real Debug graph after four minutes.
 const metroBundleTimeoutMs = 300_000;
-const deadline = setTimeout(() => abort.abort(new Error("iOS startup and UI operation deadline exceeded.")),
-  observationBudgetMs);
+const observationDeadlineError = new Error("iOS startup and UI operation deadline exceeded.");
+const deadline = setTimeout(() => abort.abort(observationDeadlineError), observationBudgetMs);
 const stop = () => abort.abort(new Error("iOS startup observation was cancelled."));
 process.once("SIGINT", stop); process.once("SIGTERM", stop);
 let evidence, udid, deviceName, bundleId, executable, installedExecutable, metro, metroClosed = false;
@@ -362,9 +362,11 @@ async function guiCommand(args, logName, timeout) {
   const receipt = await new Promise(accept => child.once("close", (code, signal) => accept({ exitCode: code, signal })));
   clearTimeout(timer); clearTimeout(hardStop); abort.signal.removeEventListener("abort", stopChild);
   save(logName.replace(/\.log$/u, "-receipt.json"), { ...receipt, elapsedMs: Date.now() - started, timedOut,
-    cancelled: abort.signal.aborted, logTruncated: bytes === 4 * 1024 * 1024 });
+    cancelled: abort.signal.aborted, observationDeadlineReached: abort.signal.reason === observationDeadlineError,
+    logTruncated: bytes === 4 * 1024 * 1024 });
   if (spawnError || receipt.exitCode !== 0 || timedOut || abort.signal.aborted) {
     kill("SIGKILL");
+    abort.signal.throwIfAborted();
     const action = logName === "gui-build.log" ? "build" : "execution";
     const failure = timedOut ? `timed out after ${timeout} ms` : "failed";
     throw new Error(`Apple UI-test ${action} ${failure}. See ${logName} and its receipt.`);
