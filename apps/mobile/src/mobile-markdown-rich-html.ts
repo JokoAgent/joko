@@ -1,4 +1,5 @@
 import type { MobileMarkdownInlineMark } from "./mobile-markdown";
+import { repairMobileMermaidSource } from "./mobile-mermaid-repair";
 
 export interface MobileMarkdownRichRuntime {
   readonly mermaidScript: string;
@@ -47,18 +48,29 @@ export function buildMobileMarkdownRichHtml(input: {
   }
   const { colors, source, instanceId, kind } = input;
   const dark = Number.parseInt(colors.surface.slice(1, 3), 16) < 128;
+  const repaired = kind === "mermaid" ? repairMobileMermaidSource(source) : source;
+  const fillsViewport = kind === "mermaid" && input.zoomable === true;
   const render = kind === "math"
     ? `window.katex.render(source, root, { displayMode: true, throwOnError: true, trust: false, strict: 'ignore', maxExpand: 1000 }); finish('ready');`
     : `var engine = window.jokoMermaid;
       engine.initialize({ startOnLoad: false, securityLevel: 'strict', suppressErrorRendering: true,
         maxTextSize: 100000, theme: ${mobileMarkdownScriptValue(dark ? "dark" : "default")},
+        gantt: { useWidth: 760 },
         themeVariables: { background: ${mobileMarkdownScriptValue(colors.surface)},
           primaryColor: ${mobileMarkdownScriptValue(colors.background)}, primaryTextColor: ${mobileMarkdownScriptValue(colors.ink)},
           primaryBorderColor: ${mobileMarkdownScriptValue(colors.border)}, lineColor: ${mobileMarkdownScriptValue(colors.muted)} } });
-      Promise.resolve(engine.render('diagram', source)).then(function(result) {
+      async function drawDiagram() {
+        try { return await engine.render('diagram', source); }
+        catch (error) {
+          if (settled || !repairedSource) throw error;
+          return engine.render('diagram-repaired', repairedSource);
+        }
+      }
+      drawDiagram().then(function(result) {
         if (settled) return; root.innerHTML = result.svg;
         root.querySelectorAll('a').forEach(function(link) { link.removeAttribute('href'); link.removeAttribute('xlink:href'); });
         root.querySelectorAll('image,script,foreignObject iframe').forEach(function(node) { node.remove(); });
+        root.classList.add('diagram');
         finish('ready');
       }, function() { finish('error'); });`;
   const runtimeScript = kind === "math" ? runtime.katexScript : runtime.mermaidScript;
@@ -67,10 +79,12 @@ export function buildMobileMarkdownRichHtml(input: {
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; font-src data:; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
     <style>html,body{margin:0;background:${colors.surface};color:${colors.ink};font-family:system-ui,sans-serif}
     #root{box-sizing:border-box;padding:8px;overflow-x:auto}#root svg{max-width:100%;height:auto}
+    ${fillsViewport ? "#root.diagram{min-height:100vh;display:flex;align-items:center;justify-content:center}#root.diagram>svg{width:100%!important;max-width:100%!important;height:calc(100vh - 16px)!important}" : ""}
     pre{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.5 monospace;margin:0;color:${colors.muted}}
     .katex-display{margin:0}${kind === "math" ? runtime.katexCss : ""}</style></head><body>
     <div id="root"><pre>${escapeMobileMarkdownHtml(source)}</pre></div><script>
     var source=${mobileMarkdownScriptValue(source)},instanceId=${mobileMarkdownScriptValue(instanceId)};
+    var repairedSource=${mobileMarkdownScriptValue(repaired === source ? "" : repaired)};
     var root=document.getElementById('root'),settled=false;
     function report(state){window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify({
       type:'joko-rich-markdown/status',instanceId:instanceId,state:state,

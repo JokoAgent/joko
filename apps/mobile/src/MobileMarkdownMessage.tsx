@@ -83,6 +83,7 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
   const [notice, setNotice] = useState("");
   const [copying, setCopying] = useState(false);
   const [expanded, setExpanded] = useState<Extract<MobileMarkdownBlock, { type: "math" | "mermaid" }>>();
+  const [viewDiagramSource, setViewDiagramSource] = useState(false);
   const mounted = useRef(true);
   const copyPending = useRef(false);
   const currentOwner = useRef(ownerKey);
@@ -171,7 +172,10 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
     }
     if (value.type === "math" || value.type === "mermaid") return <View key={value.key}
       style={[styles.frame, { borderColor: colors.border, backgroundColor: colors.surface }]}>
-      {toolbar(value.text, mobileMessage(locale, value.type === "math" ? "markdown.math" : "markdown.diagram"), () => setExpanded(value))}
+      {toolbar(value.text, mobileMessage(locale, value.type === "math" ? "markdown.math" : "markdown.diagram"), () => {
+        setViewDiagramSource(false);
+        setExpanded(value);
+      })}
       <MobileMarkdownRichBlock kind={value.type} source={value.text} colors={colors} locale={locale} ownerKey={`${ownerKey}/${value.key}`} />
     </View>;
     if (value.type === "table") return <MobileMarkdownTable key={value.key}
@@ -202,17 +206,24 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
       </Text>)}
     </Text>)}
     {notice && <Text accessibilityLiveRegion="polite" style={[styles.caption, { color: colors.muted }]}>{notice}</Text>}
-    <Modal visible={expanded !== undefined} animationType="fade" onRequestClose={() => setExpanded(undefined)}>
+    <Modal visible={expanded !== undefined} animationType="fade"
+      supportedOrientations={["portrait", "landscape"]} onRequestClose={() => setExpanded(undefined)}>
       <SafeAreaView style={[styles.fill, { backgroundColor: colors.surface }]}>
         <View style={styles.toolbar}>
           <Text style={[styles.body, styles.fill, { color: colors.ink }]}>{mobileMessage(locale, expanded?.type === "math" ? "markdown.math" : "markdown.diagram")}</Text>
+          {expanded?.type === "mermaid" && <Pressable accessibilityRole="button"
+            onPress={() => setViewDiagramSource((visible) => !visible)} style={styles.action}>
+            <Text style={{ color: colors.accent }}>{mobileMessage(locale, viewDiagramSource ? "markdown.diagram" : "markdown.source")}</Text>
+          </Pressable>}
           <Pressable accessibilityRole="button" onPress={() => setExpanded(undefined)} style={styles.action}>
             <Text style={{ color: colors.accent }}>{mobileMessage(locale, "common.close")}</Text>
           </Pressable>
         </View>
-        {expanded && <ScrollView contentContainerStyle={styles.expanded}>
-          <MobileMarkdownRichBlock kind={expanded.type} source={expanded.text} colors={colors} locale={locale}
-            ownerKey={`${ownerKey}/expanded/${expanded.key}`} zoomable />
+        {expanded?.type === "mermaid" && !viewDiagramSource ? <MobileMarkdownRichBlock kind="mermaid"
+          source={expanded.text} colors={colors} locale={locale} ownerKey={`${ownerKey}/expanded/${expanded.key}`} zoomable />
+          : expanded && <ScrollView contentContainerStyle={styles.expanded}>
+          {expanded.type === "math" && <MobileMarkdownRichBlock kind="math" source={expanded.text} colors={colors}
+            locale={locale} ownerKey={`${ownerKey}/expanded/${expanded.key}`} zoomable />}
           {toolbar(expanded.text, mobileMessage(locale, "markdown.source"))}
           <Text selectable style={[styles.code, { color: colors.ink }]}>{expanded.text}</Text>
         </ScrollView>}
@@ -318,6 +329,7 @@ function MobileMarkdownRichBlock({ kind, source, colors, locale, ownerKey, zooma
 }) {
   const [height, setHeight] = useState(kind === "mermaid" ? 220 : 80);
   const [failed, setFailed] = useState(false);
+  const fillsViewport = kind === "mermaid" && zoomable;
   const id = useMemo(() => randomUUID(), [colors, kind, source, ownerKey, zoomable]);
   const release = useCallback(() => undefined, []);
   const failure = useCallback(() => setFailed(true), []);
@@ -326,27 +338,33 @@ function MobileMarkdownRichBlock({ kind, source, colors, locale, ownerKey, zooma
   const html = useMemo(() => source.length > 100_000 ? undefined
     : buildMobileMarkdownRichHtml({ instanceId: id, kind, source, colors, zoomable }, richRuntime), [colors, id, kind, source, zoomable]);
   useEffect(() => { setFailed(false); }, [id]);
-  if (!html || failed || !lifecycle.rendererMounted) return <View style={styles.fallback}>
-    <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "markdown.sourceFallback")}</Text>
-    <Text selectable style={[styles.code, { color: colors.ink }]}>{source}</Text>
+  if (!html || failed || !lifecycle.rendererMounted) {
+    const fallback = <>
+      <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "markdown.sourceFallback")}</Text>
+      <Text selectable style={[styles.code, { color: colors.ink }]}>{source}</Text>
+    </>;
+    return fillsViewport ? <ScrollView style={styles.fill} contentContainerStyle={styles.fallback}>{fallback}</ScrollView>
+      : <View style={styles.fallback}>{fallback}</View>;
+  }
+  return <View style={fillsViewport ? styles.fill : { height: zoomable ? Math.max(320, height) : height }}>
+    <WebView key={token} source={{ html }} originWhitelist={["about:blank"]}
+      style={[styles.fill, { backgroundColor: colors.surface }]}
+      javaScriptEnabled domStorageEnabled={false} cacheEnabled={false} incognito
+      allowFileAccess={false} allowFileAccessFromFileURLs={false} allowUniversalAccessFromFileURLs={false}
+      mixedContentMode="never" setSupportMultipleWindows={false} scrollEnabled={zoomable} nestedScrollEnabled
+      onShouldStartLoadWithRequest={(request) => request.url === "about:blank"}
+      onMessage={(event) => {
+        if (!lifecycle.ownsRenderer(token)) return;
+        const status = parseMobileMarkdownRichStatus(event.nativeEvent.data, id);
+        if (!status) return;
+        if (!fillsViewport) setHeight(status.height);
+        if (status.state === "error") setFailed(true);
+        else if (status.state === "ready") lifecycle.onRendererReady(token);
+      }}
+      onError={() => { if (lifecycle.ownsRenderer(token)) setFailed(true); }}
+      onContentProcessDidTerminate={() => { lifecycle.onRendererProcessLost(token); }}
+      onRenderProcessGone={() => { lifecycle.onRendererProcessLost(token); }} />
   </View>;
-  return <WebView key={token} source={{ html }} originWhitelist={["about:blank"]}
-    style={{ height: zoomable ? Math.max(320, height) : height, backgroundColor: colors.surface }}
-    javaScriptEnabled domStorageEnabled={false} cacheEnabled={false} incognito
-    allowFileAccess={false} allowFileAccessFromFileURLs={false} allowUniversalAccessFromFileURLs={false}
-    mixedContentMode="never" setSupportMultipleWindows={false} scrollEnabled={zoomable} nestedScrollEnabled
-    onShouldStartLoadWithRequest={(request) => request.url === "about:blank"}
-    onMessage={(event) => {
-      if (!lifecycle.ownsRenderer(token)) return;
-      const status = parseMobileMarkdownRichStatus(event.nativeEvent.data, id);
-      if (!status) return;
-      setHeight(status.height);
-      if (status.state === "error") setFailed(true);
-      else if (status.state === "ready") lifecycle.onRendererReady(token);
-    }}
-    onError={() => { if (lifecycle.ownsRenderer(token)) setFailed(true); }}
-    onContentProcessDidTerminate={() => { lifecycle.onRendererProcessLost(token); }}
-    onRenderProcessGone={() => { lifecycle.onRendererProcessLost(token); }} />;
 }
 
 const styles = StyleSheet.create({

@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { buildMobileMarkdownRichHtml, parseMobileMarkdownRichStatus, type MobileMarkdownRichRuntime } from "./mobile-markdown-rich-html";
 
 const require = createRequire(import.meta.url);
@@ -34,6 +34,41 @@ describe("mobile rich Markdown runtime", () => {
     expect(() => buildMobileMarkdownRichHtml({ ...input, source: "x".repeat(100_001) }, runtime)).toThrow("invalid");
   });
 
+  const malformedFlow = "flowchart TD\nA[foo(bar)] --> B";
+  const repairedFlow = 'flowchart TD\nA["foo(bar)"] --> B';
+  const gantt = "gantt\ndateFormat YYYY-MM-DD\nFirst task :first, 2026-11-18, 2d";
+  it.each([
+    { source: gantt, attempts: [gantt], rejected: [], state: "ready", zoomable: true },
+    { source: malformedFlow, attempts: [malformedFlow, repairedFlow], rejected: [malformedFlow], state: "ready", zoomable: false },
+    { source: malformedFlow, attempts: [malformedFlow, repairedFlow], rejected: [malformedFlow, repairedFlow], state: "error", zoomable: true },
+    { source: "invalid diagram", attempts: ["invalid diagram"], rejected: ["invalid diagram"], state: "error", zoomable: false }
+  ])("keeps the original source and reports $state after the expected Mermaid attempts", async ({ source, attempts, rejected, state, zoomable }) => {
+    const statuses: ReturnType<typeof parseMobileMarkdownRichStatus>[] = [];
+    const engine = {
+      initialize: vi.fn(),
+      render: vi.fn(async (_id: string, text: string) => {
+        if (rejected.includes(text)) throw new Error("The diagram could not be rendered.");
+        return { svg: '<svg viewBox="0 0 760 120"><title>Preview</title></svg>' };
+      })
+    };
+    const html = buildMobileMarkdownRichHtml({ instanceId: "diagram", kind: "mermaid", source, colors, zoomable },
+      { mermaidScript: "", katexScript: "", katexCss: "" });
+    const dom = new JSDOM(html, { runScripts: "dangerously", beforeParse(window: Window) {
+      Object.assign(window, { jokoMermaid: engine,
+        ReactNativeWebView: { postMessage: (value: string) => statuses.push(parseMobileMarkdownRichStatus(value, "diagram")) } });
+    } });
+    try {
+      await vi.waitFor(() => expect(statuses.at(-1)?.state).toBe(state));
+      expect(engine.initialize).toHaveBeenCalledWith(expect.objectContaining({ gantt: { useWidth: 760 }, securityLevel: "strict" }));
+      expect(engine.render.mock.calls.map(([, text]) => text)).toEqual(attempts);
+      const root = dom.window.document.querySelector("#root");
+      expect(root?.classList.contains("diagram")).toBe(state === "ready");
+      if (state === "ready") expect(root?.querySelector("svg")?.getAttribute("viewBox")).toBe("0 0 760 120");
+      else expect(root?.querySelector("pre")?.textContent).toBe(source);
+      expect(html.includes("height:calc(100vh - 16px)")).toBe(zoomable);
+    } finally { dom.window.close(); }
+  });
+
   it("builds pinned offline engines and executes real KaTeX with exact source fallback and a scoped status", async () => {
     const entry = resolve(root, "src", "rich-markdown-runtime.richjs");
     const source = transformer.testing.buildRichMarkdownRuntimeModule(readFileSync(entry, "utf8"), entry);
@@ -62,6 +97,9 @@ describe("mobile rich Markdown runtime", () => {
     const engine = mermaidDom.window.jokoMermaid;
     engine.initialize({ startOnLoad: false, securityLevel: "strict" });
     expect(await engine.parse("graph TD; A-->B")).toMatchObject({ diagramType: "flowchart-v2" });
+    await expect(engine.parse(malformedFlow)).rejects.toThrow();
+    expect(await engine.parse(repairedFlow)).toMatchObject({ diagramType: "flowchart-v2" });
+    expect(await engine.parse(gantt)).toMatchObject({ diagramType: "gantt" });
     await expect(engine.parse("this is not a diagram")).rejects.toThrow();
     mermaidDom.window.close();
   });
