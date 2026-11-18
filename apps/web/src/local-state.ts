@@ -469,7 +469,7 @@ function currentDraftRecord(value: unknown): ComposerDraftRecord | undefined {
   return value as ComposerDraftRecord;
 }
 
-export type SessionDraftSurface = "application" | `task-window:${number}`;
+export type SessionDraftSurface = "application" | `task-window:${number}` | `task-window:${number}:navigation:${string}`;
 
 export function normalizePendingSideChatDraft(value: unknown): PendingSideChatDraft | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -520,9 +520,17 @@ function sessionDraftKey(serverId: string, profileId: string, sessionId: string,
 }
 function validSessionDraftSurface(surface: string): surface is SessionDraftSurface {
   if (surface === "application") return true;
-  if (!/^task-window:(?:0|[1-9][0-9]*)$/u.test(surface)) return false;
-  const slot = Number(surface.slice("task-window:".length));
-  return Number.isSafeInteger(slot) && slot >= 0;
+  const match = /^task-window:(0|[1-9][0-9]*)(?::navigation:(.+))?$/u.exec(surface);
+  if (match === null || !Number.isSafeInteger(Number(match[1]))) return false;
+  const encoded = match[2];
+  if (encoded === undefined) return true;
+  if (encoded.length > 6_144) return false;
+  try {
+    const bootSessionId = decodeURIComponent(encoded);
+    return validConnectionIdentity(bootSessionId, 512) && encodeURIComponent(bootSessionId) === encoded;
+  } catch {
+    return false;
+  }
 }
 
 export class LocalState {

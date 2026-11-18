@@ -3079,13 +3079,25 @@ export function useAppController(): AppController {
   const draftStore = localRef.current;
   const draftServerId = state.activeProfile?.serverId;
   const draftProfileId = state.activeProfile?.id;
-  const withDraftSurface = useCallback(async <T,>(sessionId: string, run: (surface: import("./local-state.js").SessionDraftSurface) => Promise<T>): Promise<T> => {
+  const withDraftSurface = useCallback(async <T,>(sessionId: string, run: (surface: import("./local-state.js").SessionDraftSurface) => Promise<T>,
+    mode?: "current-task"): Promise<T> => {
     if (draftServerId === undefined || draftProfileId === undefined) throw new Error("Connect to Joko before using a task draft.");
     const search = window.location.search, bridge = window.jokoDesktop?.sessionWindows;
     const bootSession = new URLSearchParams(search).get("bootSession");
     const child = snapshotRef.current.sessions.find(session => session.id === sessionId);
     const sideChatSource = bootSession && bootSession !== sessionId && child?.derivationOrigin?.sideChat === true
       && child.derivationOrigin.sourceSessionId === bootSession ? bootSession : undefined;
+    const routeOwnsDraft = (route: AppRoute): boolean => route.kind === "files" ? route.sessionId === sessionId
+      : route.kind === "session" && route.sessionId === sessionId && route.partnerId === undefined && route.backgroundExtensionId === undefined
+        && (route.profileId === undefined || route.profileId === draftProfileId) && (route.serverId === undefined || route.serverId === draftServerId);
+    const navigationRevision = navigationRevisionRef.current;
+    const currentTaskRoute = (): boolean => navigationRevisionRef.current === navigationRevision && routeOwnsDraft(routeRef.current)
+      && routeOwnsDraft(routeFromHash(window.location.hash));
+    const ordinarySession = (candidate: typeof child): boolean => candidate !== undefined && !candidate.hidden && candidate.derivationOrigin?.sideChat !== true;
+    const navigationAnchor = mode === "current-task" && bootSession && bootSession !== sessionId && ordinarySession(child) && currentTaskRoute()
+      ? bootSession : undefined;
+    const anchor = sideChatSource !== undefined ? { kind: "side-chat" as const, sessionId: sideChatSource }
+      : navigationAnchor === undefined ? undefined : { kind: "navigation" as const, sessionId: navigationAnchor };
     const lineage = (value: typeof child) => value === undefined ? undefined : JSON.stringify([
       value.id, value.backendId, value.targetId, value.generation.toString(), value.derivationOrigin
     ]);
@@ -3093,12 +3105,16 @@ export function useAppController(): AppController {
     let retired = false;
     const retire = () => { retired = true; };
     window.addEventListener("pagehide", retire, { once: true });
-    const current = () => !retired && window.location.search === search && window.jokoDesktop?.sessionWindows === bridge && gatewayRef.current === artifactGateway
-      && gatewayGenerationRef.current === linkGatewayGeneration && activeProfileRef.current?.serverId === draftServerId
-      && activeProfileRef.current.id === draftProfileId
-      && (sideChatSource === undefined || lineage(snapshotRef.current.sessions.find(session => session.id === sessionId)) === originalLineage);
+    const current = (): boolean => {
+      if (retired || window.location.search !== search || window.jokoDesktop?.sessionWindows !== bridge || gatewayRef.current !== artifactGateway
+        || gatewayGenerationRef.current !== linkGatewayGeneration || activeProfileRef.current?.serverId !== draftServerId
+        || activeProfileRef.current.id !== draftProfileId) return false;
+      if (anchor === undefined) return true;
+      const candidate = snapshotRef.current.sessions.find(session => session.id === sessionId);
+      return lineage(candidate) === originalLineage && (anchor.kind === "side-chat" || (ordinarySession(candidate) && currentTaskRoute()));
+    };
     try {
-      const surface = await sessionDraftSurface(draftProfileId, sessionId, current, sideChatSource);
+      const surface = await sessionDraftSurface(draftProfileId, sessionId, current, anchor);
       if (surface !== "application" && !current()) throw new Error("The task draft window owner is no longer current.");
       const result = await run(surface);
       if (surface !== "application" && !current()) throw new Error("The task draft window owner is no longer current.");
@@ -3177,11 +3193,11 @@ export function useAppController(): AppController {
   }, [draftStore, newTaskDraftScope, composerDraftScope, artifactGateway]);
   const readDraft = useCallback<AppController["readDraft"]>(async (sessionId) => {
     if (draftServerId === undefined || draftProfileId === undefined) return Promise.reject(new Error("Connect to Joko before reading a task draft."));
-    return withDraftSurface(sessionId, surface => requireLocal(draftStore).readDraft(draftServerId, draftProfileId, sessionId, surface));
+    return withDraftSurface(sessionId, surface => requireLocal(draftStore).readDraft(draftServerId, draftProfileId, sessionId, surface), "current-task");
   }, [draftStore, draftServerId, draftProfileId, withDraftSurface]);
   const saveDraft = useCallback<AppController["saveDraft"]>(async (sessionId, draft) => {
     if (draftServerId === undefined || draftProfileId === undefined) return Promise.reject(new Error("Connect to Joko before saving a task draft."));
-    return withDraftSurface(sessionId, surface => requireLocal(draftStore).saveDraft(draftServerId, draftProfileId, sessionId, draft, surface));
+    return withDraftSurface(sessionId, surface => requireLocal(draftStore).saveDraft(draftServerId, draftProfileId, sessionId, draft, surface), "current-task");
   }, [draftStore, draftServerId, draftProfileId, withDraftSurface]);
   const navigateSessionBranch = useCallback<AppController["navigateSessionBranch"]>((sessionId, target, options) => {
     if (artifactGateway === undefined) return Promise.reject(new Error("Connect to Joko before navigating a task."));
@@ -3189,11 +3205,11 @@ export function useAppController(): AppController {
   }, [artifactGateway]);
   const readDraftSnapshot = useCallback<AppController["readDraftSnapshot"]>(async (sessionId) => {
     if (draftServerId === undefined || draftProfileId === undefined) return Promise.reject(new Error("Connect to Joko before reading a task draft."));
-    return withDraftSurface(sessionId, surface => requireLocal(draftStore).readDraftSnapshot(draftServerId, draftProfileId, sessionId, surface));
+    return withDraftSurface(sessionId, surface => requireLocal(draftStore).readDraftSnapshot(draftServerId, draftProfileId, sessionId, surface), "current-task");
   }, [draftStore, draftServerId, draftProfileId, withDraftSurface]);
   const saveDraftIfRevision = useCallback<AppController["saveDraftIfRevision"]>(async (sessionId, draft, revision) => {
     if (draftServerId === undefined || draftProfileId === undefined) return Promise.reject(new Error("Connect to Joko before saving a task draft."));
-    return withDraftSurface(sessionId, surface => requireLocal(draftStore).saveDraftIfRevision(draftServerId, draftProfileId, sessionId, draft, revision, surface));
+    return withDraftSurface(sessionId, surface => requireLocal(draftStore).saveDraftIfRevision(draftServerId, draftProfileId, sessionId, draft, revision, surface), "current-task");
   }, [draftStore, draftServerId, draftProfileId, withDraftSurface]);
   const readPendingSideChat = useCallback(async (sourceSessionId: string) => {
     if (!draftServerId || !draftProfileId) throw new Error("Connect to the original node before checking a Side Chat draft.");
