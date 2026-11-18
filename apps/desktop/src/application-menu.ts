@@ -240,7 +240,7 @@ export interface MacApplicationMenuConfigurationState {
     readonly configuration: DesktopApplicationMenuConfiguration;
     readonly ready: boolean;
   };
-  readonly apply: (patch: DesktopApplicationMenuConfigurationPatch) => {
+  readonly apply: (patch: DesktopApplicationMenuConfigurationPatch, renderer?: "primary" | "auxiliary") => {
     readonly menuChanged: boolean;
     readonly commands: readonly DesktopApplicationMenuCommand[];
   };
@@ -278,7 +278,9 @@ export function createMacApplicationMenuConfigurationState(
   const pendingCommands: DesktopApplicationMenuCommand[] = [];
   return {
     snapshot: () => ({ configuration, ready }),
-    apply: (patch) => {
+    apply: (requested, renderer = "primary") => {
+      const patch = renderer === "primary" ? requested : requested.shortcutRecording === undefined ? {}
+        : { shortcutRecording: requested.shortcutRecording };
       const next = { ...configuration, ...patch };
       const becameReady = !ready && APPLICATION_MENU_ACCELERATOR_KEYS.every((key) => Object.hasOwn(patch, key));
       const menuChanged = becameReady || !applicationMenuConfigurationsEqual(next, configuration);

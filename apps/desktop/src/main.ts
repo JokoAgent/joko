@@ -8704,9 +8704,10 @@ function registerIpc(): void {
     const recordingTransition = patch.shortcutRecording === undefined
       ? undefined
       : applicationMenuShortcutRecordingLeases.set(event.sender.id, patch.shortcutRecording);
+    const renderer = event.sender === mainWindow?.webContents ? "primary" : "auxiliary";
     const result = applicationMenuConfigurationState.apply(recordingTransition === undefined
       ? patch
-      : { ...patch, shortcutRecording: recordingTransition.active });
+      : { ...patch, shortcutRecording: recordingTransition.active }, renderer);
     if (result.menuChanged) installDesktopApplicationMenu();
     for (const command of result.commands) dispatchApplicationMenuCommand(command);
     if (recordingTransition !== undefined && !recordingTransition.wasActive && recordingTransition.active) {

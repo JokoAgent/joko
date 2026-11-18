@@ -1592,20 +1592,21 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
 
   // Subscribe before the initial full accelerator sync. Main holds menu
   // commands behind that sync, so no cold-start click can outrun this listener.
-  useEffect(() => window.jokoDesktop?.applicationMenu.onCommand((command) => {
+  useEffect(() => auxiliaryApplicationWindow ? undefined : window.jokoDesktop?.applicationMenu.onCommand((command) => {
     // Native menu commands do not traverse the DOM's modal/inert boundary.
     // Discard them while startup update owns the renderer; window chrome uses
     // its separate preload APIs and remains available.
     if (isStartupUpdateInteractionBlocked()) return;
     applicationMenuCommandQueue.handle(command);
-  }), [applicationMenuCommandQueue]);
+  }), [applicationMenuCommandQueue, auxiliaryApplicationWindow]);
   useEffect(() => {
-    if (!state.ready) return;
+    if (!state.ready || auxiliaryApplicationWindow) return;
     void window.jokoDesktop?.applicationMenu.configure(applicationMenuAccelerators).catch(() => undefined);
   }, [
     applicationMenuAccelerators.newSessionAccelerator,
     applicationMenuAccelerators.openSettingsAccelerator,
     applicationMenuAccelerators.toggleSidebarAccelerator,
+    auxiliaryApplicationWindow,
     state.ready
   ]);
 
