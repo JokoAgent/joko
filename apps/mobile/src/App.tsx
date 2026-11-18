@@ -7020,9 +7020,15 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
             onPress: () => { if (headerSourceKey && session) mutateTaskMetadata(headerSourceKey, () => client.setSessionPinned(session.sessionId, !session.pinned)); },
             disabled: !headerSourceKey || headerRole.role === undefined || state.status !== "connected" || state.busy || attachmentBusy || voice.busy },
           { id: "archive" as const, label: mobileMessage(locale, session?.archived ? "common.restore" : "common.archive"),
-            onPress: () => { if (headerSourceKey && session) mutateTaskMetadata(headerSourceKey, () => session.archived
-              ? client.setSessionArchived(session.sessionId, false)
-              : archiveMobileSession(client, session.sessionId, locale, () => taskMetadataCurrent(headerSourceKey))); },
+            onPress: () => {
+              if (!headerSourceKey || !session) return;
+              mutateTaskMetadata(headerSourceKey, () => {
+                if (session.archived) return client.setSessionArchived(session.sessionId, false);
+                const occurrence = taskMetadataOccurrence.current;
+                const current = () => taskMetadataOccurrence.current === occurrence && taskMetadataCurrent(headerSourceKey);
+                return archiveMobileSession(client, session.sessionId, locale, current, () => { if (current()) onBack(); });
+              });
+            },
             disabled: !headerSourceKey || headerRole.role === undefined || state.status !== "connected" || state.busy || attachmentBusy || voice.busy },
           { id: "delete" as const, label: mobileMessage(locale, "common.deleteTask"), destructive: true,
             onPress: deleteCurrentTask,

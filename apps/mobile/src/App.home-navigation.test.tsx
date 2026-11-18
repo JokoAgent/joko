@@ -50,7 +50,11 @@ const setSessionArchived = vi.fn(async (_sessionId: string, _archived: boolean, 
 const archiveConfirmation = "a".repeat(64);
 const prepareSessionArchive = vi.fn<MobileClient["prepareSessionArchive"]>(async sessionId => ({
   preview: { hasWorktree: false, dirty: false, activeBoundScheduleCount: 0, activeBoundScheduleNames: [], archiveConfirmation },
-  archive: () => setSessionArchived(sessionId, true, archiveConfirmation)
+  archive: async onConfirmed => {
+    const accepted = await setSessionArchived(sessionId, true, archiveConfirmation);
+    if (accepted) onConfirmed?.();
+    return accepted;
+  }
 }));
 const renameSession = vi.fn(async () => true);
 const deleteSession = vi.fn(async () => true);
@@ -438,18 +442,50 @@ describe("actual Home navigation hosts", () => {
     expect(setSessionPinned).toHaveBeenCalledExactlyOnceWith("current", false);
     expect(prepareSessionArchive).toHaveBeenCalledExactlyOnceWith("current");
     expect(setSessionArchived).toHaveBeenCalledExactlyOnceWith("current", true, archiveConfirmation);
+    expect(onBack).toHaveBeenCalledOnce();
     state = { ...state, detail: create(SnapshotSchema, { ...state.detail!, sessions: state.detail!.sessions.map(session =>
       create(SessionSchema, { ...session, archived: session.sessionId === "current" })) }) };
     await renderTask();
     expect(headerProps.actions.find(action => action.id === "archive")?.label).toBe(message("common.restore"));
     await act(async () => headerProps.actions.find(action => action.id === "archive")!.onPress());
     expect(setSessionArchived).toHaveBeenLastCalledWith("current", false);
+    expect(onBack).toHaveBeenCalledOnce();
     state = { ...state, status: "offline" }; await renderTask();
     for (const action of headerProps.actions.filter(action => ["rename", "pin", "archive", "delete"].includes(action.id))) expect(action.disabled).toBe(true);
     state = { ...state, status: "connected", taskSource: { kind: "joined" } as MobileState["taskSource"] }; await renderTask();
     expect(headerProps.actions.some(action => ["rename", "pin", "archive", "delete"].includes(action.id))).toBe(false);
     state = { ...state, taskSource: undefined }; observedHeaderRole = "worker"; headerSourceEpoch++; await renderTask();
     expect(headerProps.actions.some(action => ["rename", "pin", "archive", "delete"].includes(action.id))).toBe(false);
+  });
+
+  it("keeps the task page for an external archive, a cancelled or rejected archive, and a retired local result", async () => {
+    const activeDetail = state.detail!;
+    const setVisibleArchive = async (archived: boolean) => {
+      state = { ...state, detail: create(SnapshotSchema, { ...activeDetail, sessions: activeDetail.sessions.map(session =>
+        session.sessionId === "current" ? create(SessionSchema, { ...session, archived }) : session) }) };
+      await renderTask();
+    };
+    const archive = async () => act(async () => headerProps.actions.find(action => action.id === "archive")!.onPress());
+    await setVisibleArchive(true);
+    expect(headerProps.actions.find(action => action.id === "archive")?.label).toBe(message("common.restore"));
+    expect(onBack).not.toHaveBeenCalled();
+    await setVisibleArchive(false);
+    prepareSessionArchive.mockResolvedValueOnce({ preview: { hasWorktree: true, dirty: true,
+      activeBoundScheduleCount: 0, activeBoundScheduleNames: [], archiveConfirmation }, archive: vi.fn() });
+    await archive();
+    const buttons = alert.mock.calls.at(-1)![2] as { style?: string; onPress?: () => void }[];
+    await act(async () => buttons.find(action => action.style === "cancel")!.onPress!());
+    expect(setSessionArchived).not.toHaveBeenCalled();
+    setSessionArchived.mockResolvedValueOnce(false);
+    await archive();
+    expect(onBack).not.toHaveBeenCalled();
+    let finishArchive: ((accepted: boolean) => void) | undefined;
+    setSessionArchived.mockImplementationOnce(() => new Promise(resolve => { finishArchive = resolve; }));
+    await archive();
+    expect(finishArchive).toBeTypeOf("function");
+    state = { ...state, selectedId: "other" }; await renderTask();
+    await act(async () => finishArchive?.(true));
+    expect(onBack).not.toHaveBeenCalled();
   });
 
   it("keeps AI titles as drafts, restores cancel and retires late suggestions after manual typing or task change", async () => {

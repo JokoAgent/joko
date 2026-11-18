@@ -15124,7 +15124,7 @@ export class MobileClient {
 
   async prepareSessionArchive(sessionId: string): Promise<{
     readonly preview: SessionArchivePreview;
-    readonly archive: () => Promise<boolean>;
+    readonly archive: (onConfirmed?: () => void) => Promise<boolean>;
   }> {
     const credential = this.#ready(), abort = this.#abort;
     const session = this.#state.owner?.sessions.find((candidate) => candidate.sessionId === sessionId);
@@ -15149,15 +15149,18 @@ export class MobileClient {
         })
       ]);
       current();
-      return { preview, archive: async () => { current(); return this.setSessionArchived(sessionId, true, preview.archiveConfirmation); } };
+      return { preview, archive: async (onConfirmed) => {
+        current();
+        return this.setSessionArchived(sessionId, true, preview.archiveConfirmation, onConfirmed);
+      } };
     } finally { if (timer !== undefined) clearTimeout(timer); }
   }
 
-  async setSessionArchived(sessionId: string, archived: boolean, archiveConfirmation = ""): Promise<boolean> {
+  async setSessionArchived(sessionId: string, archived: boolean, archiveConfirmation = "", onConfirmed?: () => void): Promise<boolean> {
     return this.#mutateSession(sessionId, "archive", {
       case: "archiveSession",
       value: create(ArchiveSessionMutationSchema, { sessionId, archived, archiveConfirmation })
-    });
+    }, archived ? onConfirmed : undefined);
   }
 
   async deleteSession(sessionId: string): Promise<boolean> {
@@ -15170,7 +15173,8 @@ export class MobileClient {
   async #mutateSession(
     sessionId: string,
     kind: Extract<PendingOperation["kind"], "rename" | "pin" | "archive" | "delete">,
-    payload: OperationMutation["payload"]
+    payload: OperationMutation["payload"],
+    onArchiveConfirmed?: () => void
   ): Promise<boolean> {
     const session = this.#state.owner?.sessions.find((candidate) => candidate.sessionId === sessionId);
     const revision = session?.version?.revision;
@@ -15179,16 +15183,30 @@ export class MobileClient {
       && ["rename", "pin", "archive", "delete"].includes(item.kind))) {
       throw new Error("A previous change to this task is still pending. Check its operation before changing it again.");
     }
-    this.#ready();
+    const credential = this.#ready();
+    const epoch = this.#epoch;
     const action = this.#claimMutation();
     try {
-      return await this.#submit(create(OperationMutationSchema, {
+      const mutation = create(OperationMutationSchema, {
         preconditions: [create(OperationPreconditionSchema, {
           entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: sessionId }),
           expectedRevision: revision
         })],
         payload
-      }), { kind, sessionId });
+      });
+      if (onArchiveConfirmed === undefined) return await this.#submit(mutation, { kind, sessionId });
+      const result = await this.#submitTerminal(mutation, { kind, sessionId }, undefined, true, true, {
+        signal: this.#abort!.signal,
+        isCurrent: () => this.#current(epoch) && this.#credential === credential,
+        beforeRefresh: (operation) => {
+          const request = operation.mutation?.payload;
+          const receipt = operation.result?.payload;
+          if (operation.state === OperationState.SUCCEEDED && request?.case === "archiveSession"
+            && request.value.sessionId === sessionId && request.value.archived
+            && receipt?.case === "session" && receipt.value.sessionId === sessionId) onArchiveConfirmed();
+        }
+      });
+      return result.accepted;
     } finally { this.#releaseMutation(action); }
   }
 
