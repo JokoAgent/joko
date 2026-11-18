@@ -1,13 +1,13 @@
 import type { JSX, Ref } from "react";
 import { useEffect, useId, useImperativeHandle, useLayoutEffect, useRef, useState } from "react";
-import { AlertTriangle, Clock3, GripVertical, Pause, Pencil, Play, X, Zap } from "lucide-react";
+import { AlertTriangle, Clock3, GripVertical, Paperclip, Pause, Pencil, Play, X, Zap } from "lucide-react";
 import type { AppController } from "../controller.js";
-import type { DeliveryMode, QueueControlView, QueueItemTextEditView, QueueItemView } from "../model.js";
+import type { AttachmentDraft, DeliveryMode, QueueControlView, QueueInputAttachmentView, QueueItemAttachmentEditView, QueueItemTextEditView, QueueItemView } from "../model.js";
 import { equalQueueItemTextEdit, queueItemEditProjection, remapQueueItemTextEdit, type QueueItemTextEditTransaction } from "../queue-item-edit.js";
 import { randomUuid } from "../web-crypto.js";
-import { composerQueueWindow, resolveQueueReorderShortcut } from "./composer-behavior.js";
+import { composerQueueWindow, resolveQueueReorderShortcut, type ComposerAttachmentPolicy } from "./composer-behavior.js";
 import type { RunAction, Translator } from "./types.js";
-import { Button, IconButton, Pill, cx } from "./ui.js";
+import { Button, IconButton, Pill, cx, formatBytes } from "./ui.js";
 import { QueueLockLease } from "./queue-lock-lease.js";
 import { QueueInputPreview } from "./QueueInputPreview.js";
 import { canEditSharedQueueItem } from "../task-sharing.js";
@@ -16,11 +16,16 @@ interface QueueEditLock {
   readonly queueItemId: string;
   readonly token: string;
   readonly lease: QueueLockLease;
+  readonly abort: AbortController;
+}
+
+interface QueueAttachmentDraft extends QueueItemAttachmentEditView {
+  readonly original: readonly QueueInputAttachmentView[];
 }
 
 export interface QueueStripActions { steerSole(): boolean }
 
-export function QueueStrip({ sessionId, items, control, supportedDispositions, controller, runAction, t, expanded, onExpandedChange, actionsRef }: { readonly sessionId: string; readonly items: readonly QueueItemView[]; readonly control?: QueueControlView; readonly supportedDispositions: readonly DeliveryMode[]; readonly controller: AppController; readonly runAction: RunAction; readonly t: Translator; readonly expanded: boolean; readonly onExpandedChange: (expanded: boolean) => void; readonly actionsRef?: Ref<QueueStripActions> }): JSX.Element {
+export function QueueStrip({ sessionId, items, control, supportedDispositions, attachmentPolicy, controller, runAction, t, expanded, onExpandedChange, actionsRef }: { readonly sessionId: string; readonly items: readonly QueueItemView[]; readonly control?: QueueControlView; readonly supportedDispositions: readonly DeliveryMode[]; readonly attachmentPolicy?: ComposerAttachmentPolicy; readonly controller: AppController; readonly runAction: RunAction; readonly t: Translator; readonly expanded: boolean; readonly onExpandedChange: (expanded: boolean) => void; readonly actionsRef?: Ref<QueueStripActions> }): JSX.Element {
   const [editingId, setEditingId] = useState<string>();
   const [editingDraft, setEditingDraft] = useState<QueueItemTextEditView>(() => ({
     text: "",
@@ -28,6 +33,9 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, c
     pastedTextRanges: [],
     textSplices: []
   }));
+  const [editingAttachments, setEditingAttachments] = useState<QueueAttachmentDraft>();
+  const [attachmentError, setAttachmentError] = useState<string>();
+  const attachmentPickerRef = useRef<HTMLInputElement>(null);
   const [editLockLost, setEditLockLost] = useState(false);
   const [draggingQueueItemId, setDraggingQueueItemId] = useState<string>();
   const [dragTargetQueueItemId, setDragTargetQueueItemId] = useState<string>();
@@ -95,6 +103,7 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, c
   const releaseLease = (lease: QueueLockLease): Promise<void> => lease.release().finally(() => leasesRef.current.delete(lease));
   const releaseEditLock = (lock: QueueEditLock): Promise<void> => {
     if (editLockRef.current?.token === lock.token) editLockRef.current = undefined;
+    lock.abort.abort();
     const promise = releaseLease(lock.lease);
     runAction(`queue-edit-unlock:${lock.queueItemId}`, () => promise);
     return promise;
@@ -103,6 +112,8 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, c
     const lock = editLockRef.current;
     rememberEditorFocus();
     setEditingId(undefined);
+    setEditingAttachments(undefined);
+    setAttachmentError(undefined);
     setEditLockLost(false);
     if (lock !== undefined) void releaseEditLock(lock).catch(() => undefined);
   };
@@ -121,9 +132,11 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, c
     const previous = editLockRef.current;
     const lease = new QueueLockLease((locked) => controller.setQueueItemEditLock(item.id, token, locked));
     leasesRef.current.add(lease);
-    const lock = { queueItemId: item.id, token, lease };
+    const lock = { queueItemId: item.id, token, lease, abort: new AbortController() };
     editLockRef.current = lock;
     setEditingId(undefined);
+    setEditingAttachments(undefined);
+    setAttachmentError(undefined);
     setEditLockLost(false);
     const promise = trackItemAction(
       item.id,
@@ -141,10 +154,43 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, c
       setEditingId(item.id);
       editTransactionRef.current = undefined;
       setEditingDraft(queueItemEditProjection(item));
+      if (!guest && attachmentPolicy !== undefined) {
+        const original = item.attachments ?? [];
+        setEditingAttachments({
+          revision: item.revision,
+          generation: item.generation,
+          original,
+          retainedIndices: original.map((_file, index) => index),
+          added: [],
+          signal: lock.abort.signal
+        });
+      }
     }).catch(() => {
       if (editLockRef.current === lock) editLockRef.current = undefined;
       void releaseLease(lease).catch(() => undefined);
     });
+  };
+  const addQueueAttachments = (picked: FileList | null): void => {
+    if (picked === null || editingAttachments === undefined || attachmentPolicy === undefined) return;
+    const available = attachmentPolicy.maximumItems === undefined ? picked.length
+      : Math.max(0, attachmentPolicy.maximumItems - editingAttachments.retainedIndices.length - editingAttachments.added.length);
+    const added: AttachmentDraft[] = [];
+    let error: string | undefined;
+    for (const file of [...picked].slice(0, available)) {
+      const kind = file.type.startsWith("image/") ? "image" : "file";
+      if (!(kind === "image" ? attachmentPolicy.images : attachmentPolicy.files)) {
+        error = t("composer.attachmentUnsupported", { name: file.name });
+      } else if (attachmentPolicy.maximumBytes !== undefined && file.size > attachmentPolicy.maximumBytes) {
+        error = t("composer.attachmentTooLarge", { name: file.name, limit: formatBytes(attachmentPolicy.maximumBytes) });
+      } else {
+        added.push({ id: randomUuid(), kind, file });
+      }
+    }
+    if (attachmentPolicy.maximumItems !== undefined && picked.length > available) {
+      error = t("composer.attachmentCount", { count: attachmentPolicy.maximumItems });
+    }
+    setAttachmentError(error);
+    if (added.length > 0) setEditingAttachments({ ...editingAttachments, added: [...editingAttachments.added, ...added] });
   };
   const reacquireEditLock = (): void => {
     const lock = editLockRef.current;
@@ -305,6 +351,7 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, c
     const owner = { active: true };
     ownerRef.current = owner;
     setEditingId(undefined); setEditLockLost(false);
+    setEditingAttachments(undefined); setAttachmentError(undefined);
     setDraggingQueueItemId(undefined); setDragTargetQueueItemId(undefined);
     setQueueControlPending(false); queueControlPendingRef.current = false;
     setPendingItemIds(new Set()); pendingItemIdsRef.current.clear();
@@ -313,6 +360,7 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, c
       const pointer = pointerRef.current;
       pointerRef.current = undefined;
       if (pointer?.handle.hasPointerCapture?.(pointer.id)) pointer.handle.releasePointerCapture(pointer.id);
+      editLockRef.current?.abort.abort();
       editLockRef.current = undefined;
       const dragLock = dragLockRef.current;
       if (dragLock !== undefined) { dragLock.released = true; clearTimeout(dragLock.timer); }
@@ -365,6 +413,12 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, c
             : undefined;
         const blocked = pending || lockReason !== undefined;
         const itemDeliveryUnavailable = !supportedDispositions.includes(item.mode);
+        const attachments = !guest && editingId === item.id ? editingAttachments : undefined;
+        const attachmentsChanged = attachments !== undefined
+          && (attachments.retainedIndices.length !== attachments.original.length || attachments.added.length > 0);
+        const editUnavailable = editLockLost || pending || interactionLocked || !userEditable || itemDeliveryUnavailable;
+        const hasContent = queueEditHasContent(item, editingDraft, attachments === undefined
+          ? item.attachments?.length ?? 0 : attachments.retainedIndices.length + attachments.added.length);
         const reorder = (placement: "first" | "last" | "before" | "after", anchorQueueItemId?: string): void => {
           if (!blocked) reorderWithInteractionLock(item.id, placement, anchorQueueItemId);
         };
@@ -472,20 +526,69 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, c
               <QueueInputPreview {...item} t={t} />
               {mutable && editingId !== item.id && <div className="queue-strip__actions">{userEditable && <IconButton data-queue-edit label={t("queue.edit")} disabled={blocked || itemDeliveryUnavailable} disabledReason={lockReason ?? (itemDeliveryUnavailable ? t("queue.deliveryUnavailable") : undefined)} onClick={() => beginEdit(item)}><Pencil aria-hidden="true" /></IconButton>}{userEditable && steerSupported && <IconButton label={t("queue.steerNow")} disabled={blocked} disabledReason={lockReason} onClick={() => runWithEditLock(item, `steer-now:${item.id}`, (lockToken) => controller.steerQueueItemNow(item.id, lockToken))}><Zap aria-hidden="true" /></IconButton>}<IconButton label={t("queue.cancel")} disabled={blocked} disabledReason={lockReason} onClick={() => { const promise = trackItemAction(item.id, `cancel-queue:${item.id}`, () => controller.cancelQueueItem(item.id)); void promise?.catch(() => undefined); }}><X aria-hidden="true" /></IconButton></div>}
             </div>
-            {editingId === item.id && <form className="queue-strip__editor" aria-busy={pending || undefined} onSubmit={(event) => { event.preventDefault(); if (editLockLost || itemDeliveryUnavailable || pending || interactionLocked || !queueEditHasContent(item, editingDraft)) return; const lock = editLockRef.current; if (lock?.queueItemId !== item.id) return; if (equalQueueItemTextEdit(editingDraft, queueItemEditProjection(item))) { closeEditor(); return; } rememberEditorFocus(); const promise = trackItemAction(item.id, `edit-queue:${item.id}`, async () => { await controller.editQueueItem(item.id, editingDraft, item.mode, lock.token); if (editLockRef.current === lock) setEditingId(undefined); await releaseEditLock(lock); }); void promise?.catch(() => undefined); }} onKeyDown={(event) => {
+            {editingId === item.id && <form className="queue-strip__editor" aria-busy={pending || undefined} onSubmit={(event) => {
+              event.preventDefault();
+              if (editUnavailable || !hasContent) return;
+              const lock = editLockRef.current;
+              if (lock?.queueItemId !== item.id) return;
+              if (!attachmentsChanged && equalQueueItemTextEdit(editingDraft, queueItemEditProjection(item))) { closeEditor(); return; }
+              rememberEditorFocus();
+              const promise = trackItemAction(item.id, `edit-queue:${item.id}`, async () => {
+                if (attachmentsChanged) await controller.editQueueItem(item.id, editingDraft, item.mode, lock.token, attachments);
+                else await controller.editQueueItem(item.id, editingDraft, item.mode, lock.token);
+                if (editLockRef.current === lock) {
+                  setEditingId(undefined);
+                  setEditingAttachments(undefined);
+                  setAttachmentError(undefined);
+                }
+                await releaseEditLock(lock);
+              });
+              void promise?.catch(() => undefined);
+            }} onKeyDown={(event) => {
               if (event.key === "Escape" && !event.repeat && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229 && !pending && !interactionLocked) {
                 event.preventDefault();
                 event.stopPropagation();
                 closeEditor();
               }
-            }}><textarea ref={editorRef} rows={2} autoFocus value={editingDraft.text} disabled={pending || interactionLocked} onChange={() => undefined} aria-label={t("queue.editText")} onKeyDown={(event) => {
+            }}>
+              {attachments !== undefined && <div className="queue-strip__edit-attachments">
+                {attachments.retainedIndices.map(index => {
+                  const name = attachments.original[index]?.label || t("queue.previewUnnamedAttachment");
+                  return <span className="queue-input-preview__chip" key={`retained:${index}`}>
+                    <span title={name}>{name}</span>
+                    <IconButton label={t("queue.removeAttachment", { name })} disabled={editUnavailable} onClick={() => {
+                      setEditingAttachments({ ...attachments, retainedIndices: attachments.retainedIndices.filter(retained => retained !== index) });
+                      setAttachmentError(undefined);
+                    }}><X aria-hidden="true" /></IconButton>
+                  </span>;
+                })}
+                {attachments.added.map(attachment => <span className="queue-input-preview__chip" key={attachment.id}>
+                  <span title={attachment.file.name}>{attachment.file.name}</span>
+                  <IconButton label={t("queue.removeAttachment", { name: attachment.file.name })} disabled={editUnavailable} onClick={() => {
+                    setEditingAttachments({ ...attachments, added: attachments.added.filter(added => added.id !== attachment.id) });
+                    setAttachmentError(undefined);
+                  }}><X aria-hidden="true" /></IconButton>
+                </span>)}
+                {(attachmentPolicy?.images || attachmentPolicy?.files) && <>
+                  <Button tone="ghost" disabled={editUnavailable} onClick={() => attachmentPickerRef.current?.click()}>
+                    <Paperclip aria-hidden="true" />{t("composer.attach")}
+                  </Button>
+                  <input ref={attachmentPickerRef} type="file" hidden multiple disabled={editUnavailable}
+                    accept={attachmentPolicy.files ? undefined : "image/*"} onChange={event => {
+                      if (!editUnavailable) addQueueAttachments(event.currentTarget.files);
+                      event.currentTarget.value = "";
+                    }} />
+                </>}
+                {attachmentError && <p role="alert">{attachmentError}</p>}
+              </div>}
+              <textarea ref={editorRef} rows={2} autoFocus value={editingDraft.text} disabled={pending || interactionLocked} onChange={() => undefined} aria-label={t("queue.editText")} onKeyDown={(event) => {
               if (event.repeat || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229 || pending || interactionLocked) return;
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
                 event.stopPropagation();
                 event.currentTarget.form?.requestSubmit();
               }
-            }} />{editLockLost && <p role="alert">{t("queue.editLockLost")}</p>}{editLockLost && <Button disabled={pending || interactionLocked} onClick={reacquireEditLock}>{t("queue.reacquireEditLock")}</Button>}<Button disabled={pending} onClick={closeEditor}>{t("common.cancel")}</Button><Button type="submit" tone="primary" disabled={editLockLost || pending || interactionLocked || !queueEditHasContent(item, editingDraft) || itemDeliveryUnavailable}>{t("common.save")}</Button></form>}
+            }} />{editLockLost && <p role="alert">{t("queue.editLockLost")}</p>}{editLockLost && <Button disabled={pending || interactionLocked} onClick={reacquireEditLock}>{t("queue.reacquireEditLock")}</Button>}<Button disabled={pending} onClick={closeEditor}>{t("common.cancel")}</Button><Button type="submit" tone="primary" disabled={editUnavailable || !hasContent}>{t("common.save")}</Button></form>}
           </article>
         );
       })}</div>
@@ -510,8 +613,8 @@ function queueSourceLabel(source: QueueItemView["source"], t: Translator): strin
   return t("queue.sourceUser");
 }
 
-function queueEditHasContent(item: QueueItemView, edit: QueueItemTextEditView): boolean {
-  if (edit.text.trim().length > 0 || (item.attachments?.length ?? 0) > 0) return true;
+function queueEditHasContent(item: QueueItemView, edit: QueueItemTextEditView, attachmentCount: number): boolean {
+  if (edit.text.trim().length > 0 || attachmentCount > 0) return true;
   const originallyInline = new Set((item.mentionRanges ?? []).map((range) => range.mentionIndex));
   const stillInline = new Set(edit.mentionRanges.map((range) => range.mentionIndex));
   return item.inputMentions?.some((_mention, index) => !originallyInline.has(index) || stillInline.has(index)) ?? false;

@@ -49,7 +49,8 @@ import { TaskSharingInvitationDialog, TaskSharingNavigation } from "./components
 import { TaskSharingSession } from "./components/TaskSharingSession.js";
 import { offerTaskSharingInvitation, clearTaskSharingInvitation } from "./task-sharing-invitation.js";
 import { PortableSessionDialogHost, type PortableSessionImportRequest } from "./components/PortableSessionDialogHost.js";
-import { portableSessionImportOwnerKey, type PortableSessionImportOwner } from "./portable-session-import-connection.js";
+import { authenticatedConnectionKey } from "./connection-owner.js";
+import type { PortableSessionImportOwner } from "./portable-session-import-connection.js";
 import { PortableSessionDropTarget } from "./components/PortableSessionDropTarget.js";
 import { SessionSplitView } from "./components/SessionSplitView.js";
 import { WorkspaceFilesRoute } from "./components/WorkspaceFilesRoute.js";
@@ -318,7 +319,15 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     ? window.jokoDesktop.dedicatedHardware
     : undefined;
   const t = useCallback((key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate(state.effectiveLocale, key, values), [state.effectiveLocale]);
-  const [renameSession, setRenameSession] = useState<SessionView>();
+  const connectionOwner = authenticatedConnectionKey(state);
+  const [renameRequest, setRenameRequest] = useState<{ readonly session: SessionView; readonly owner: string }>();
+  const renameSession = renameRequest?.owner === connectionOwner ? renameRequest?.session : undefined;
+  const requestRename = (session: SessionView): void => {
+    if (connectionOwner !== undefined) setRenameRequest({ session, owner: connectionOwner });
+  };
+  useEffect(() => {
+    setRenameRequest(current => current?.owner === connectionOwner ? current : undefined);
+  }, [connectionOwner]);
   const [taskTagSessionId, setTaskTagSessionId] = useState<string>();
   const [archiveRemoval, setArchiveRemoval] = useState<SessionRemovalDialogRequest>();
   const removeArchivedProjectSessions = useRef<((sessions: readonly SessionView[], fallbackSessionIds: readonly string[]) => void) | undefined>(undefined);
@@ -339,9 +348,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const [splitMessageForks, setSplitMessageForks] = useState<readonly SplitMessageFork[]>([]);
   const [portableExportSession, setPortableExportSession] = useState<SessionView>();
   const [portableImportRequest, setPortableImportRequest] = useState<PortableSessionImportRequest>();
-  const portableImportConnectionKey = portableSessionImportOwnerKey(state);
-  const portableImportOwner = useMemo<PortableSessionImportOwner | undefined>(() => portableImportConnectionKey === undefined ? undefined : {
-    key: portableImportConnectionKey,
+  const portableImportOwner = useMemo<PortableSessionImportOwner | undefined>(() => connectionOwner === undefined ? undefined : {
+    key: connectionOwner,
     api: {
       inspectPortableSessionImport: controller.inspectPortableSessionImport,
       unlockPortableSessionImport: controller.unlockPortableSessionImport,
@@ -349,7 +357,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       commitPortableSessionImport: controller.commitPortableSessionImport,
       retryPortableSessionActivation: controller.retryPortableSessionActivation
     }
-  }, [portableImportConnectionKey, controller.inspectPortableSessionImport, controller.unlockPortableSessionImport,
+  }, [connectionOwner, controller.inspectPortableSessionImport, controller.unlockPortableSessionImport,
     controller.cancelPortableSessionImport, controller.commitPortableSessionImport, controller.retryPortableSessionActivation]);
   const portableImportOwnerRef = useRef(portableImportOwner);
   portableImportOwnerRef.current = portableImportOwner;
@@ -2109,7 +2117,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         ));
         openInspector();
       }}
-      onRename={() => setRenameSession(activeSession)}
+      onRename={() => requestRename(activeSession)}
       onManageTaskTags={() => setTaskTagSessionId(activeSession.id)}
       onPin={() => runAction(`pin:${activeSession.id}`, () => controller.pinSession(activeSession.id, !activeSession.pinned))}
       onArchive={() => requestArchiveSession(activeSession)}
@@ -2431,7 +2439,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       t={t}
       runAction={runAction}
       onOpenNavigation={() => setWindowNavigationOpen(true)}
-      onRename={setRenameSession}
+      onRename={requestRename}
       onManageTaskTags={(session) => setTaskTagSessionId(session.id)}
       onPin={(session) => runAction(`pin:${session.id}`, () => controller.pinSession(session.id, !session.pinned))}
       onArchive={requestArchiveSession}
@@ -2553,10 +2561,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         onNewDialogue={(backendId) => controller.navigate({ kind: "newSession", dialogueBackendId: backendId })}
         onRename={(session, name) => runAction(`rename:${session.id}`, () => controller.renameSession(session.id, name))}
         onSuggestTitle={(session, signal) => controller.suggestSessionTitle(session.id, signal)}
-        titleSuggestionOwnerKey={JSON.stringify([
-          state.activeProfile.id, state.activeProfile.serverId, state.activeProfile.deviceId, state.activeProfile.origin,
-          state.connectionGeneration, state.snapshot.generation.toString()
-        ])}
+        titleSuggestionOwnerKey={connectionOwner}
         onToggleTaskTag={(session, tagId, attached) => runAction(
           `task-tag:${session.id}:${tagId}:${attached ? "attach" : "detach"}`,
           () => controller.setSessionTaskTags(session.id, [session.id], [tagId], attached)
@@ -2789,7 +2794,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       <RenameSessionDialog
         session={renameSession}
         t={t}
-        onClose={() => setRenameSession(undefined)}
+        onClose={() => setRenameRequest(undefined)}
         onSuggest={renameSession !== undefined && state.snapshot.backends
           .find((backend) => backend.id === renameSession.backendId)
           ?.capabilities.get("session.ai_rename")?.supported === true
@@ -2797,7 +2802,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           : undefined}
         onRename={(name) => {
           const session = renameSession;
-          setRenameSession(undefined);
+          setRenameRequest(undefined);
           if (session !== undefined) runAction(`rename:${session.id}`, () => controller.renameSession(session.id, name));
         }}
       />

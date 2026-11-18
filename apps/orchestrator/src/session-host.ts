@@ -7758,7 +7758,8 @@ export class SessionHost {
   canonicalQueueItemEdit(
     current: QueueItemRecord,
     proposed: PromptInput,
-    textSplices: readonly { readonly start: number; readonly end: number; readonly replacementText: string }[]
+    textSplices: readonly { readonly start: number; readonly end: number; readonly replacementText: string }[],
+    attachmentEditGeneration?: bigint
   ): PromptInput {
     assertPromptInlineTextRanges(current.body);
     assertPromptInlineTextRanges(proposed);
@@ -7795,8 +7796,11 @@ export class SessionHost {
           return [];
         })();
 
-    if (textSplices.length === 0 && sameQueuePublicInput(current.body, proposed)) {
-      return { ...current.body, disposition: proposed.disposition };
+    const attachments = sameQueuePublicAttachments(current.body, proposed)
+      ? { images: current.body.images, files: current.body.files }
+      : this.canonicalQueueAttachmentEdit(current, proposed, attachmentEditGeneration);
+    if (textSplices.length === 0 && sameQueuePublicText(current.body, proposed)) {
+      return { ...current.body, ...attachments, disposition: proposed.disposition };
     }
     if (proposed.quotesEncoded === true) {
       throw inputCapabilityError(
@@ -7804,13 +7808,6 @@ export class SessionHost {
         "Edited queued input cannot introduce product-authored quote encoding."
       );
     }
-    if (!sameQueuePublicAttachments(current.body, proposed)) {
-      throw inputCapabilityError(
-        "INPUT_QUEUE_EDIT_ATTACHMENT_INVALID",
-        "Queued input editing cannot add, remove, reorder, or replace attachments."
-      );
-    }
-
     const replayed = replayQueueTextEdits(current.body, textSplices);
     const originallyInlineMentionIndexes = new Set(
       (current.body.mentionRanges ?? []).map((range) => range.mentionIndex)
@@ -7896,8 +7893,7 @@ export class SessionHost {
     return this.canonicalQueuedPrompt(current.sessionId, {
       ...publicProposal,
       text: replayed.text,
-      images: current.body.images,
-      files: current.body.files,
+      ...attachments,
       ...(current.body.replyQuote ? { replyQuote: current.body.replyQuote } : {}),
       ...(current.body.todoQuote ? { todoQuote: current.body.todoQuote } : {}),
       ...(current.body.messagingOrigin ? { messagingOrigin: current.body.messagingOrigin } : {}),
@@ -7917,6 +7913,40 @@ export class SessionHost {
         : { objectiveContinuation: current.body.objectiveContinuation }),
       ...(current.body.inputHandoffContinuation === undefined ? {} : { inputHandoffContinuation: current.body.inputHandoffContinuation })
     }, { preserveSessionReferenceSnapshots: true, preserveArtifactReferenceSnapshots: true });
+  }
+
+  private canonicalQueueAttachmentEdit(
+    current: QueueItemRecord,
+    proposed: PromptInput,
+    generation: bigint | undefined
+  ): Pick<PromptInput, "images" | "files"> {
+    const session = this.#store.getSession(current.sessionId).descriptor;
+    if (generation === undefined || generation === 0n || generation !== BigInt(session.binding.generation)
+      || session.archived || session.deletedAt !== undefined) {
+      throw inputCapabilityError(
+        "INPUT_QUEUE_EDIT_ATTACHMENT_INVALID",
+        "Changing queued attachments requires the owner's current task and input version."
+      );
+    }
+    const uploadedBlob = (blob: BlobRef, image: boolean): BlobRef => {
+      const record = this.#store.findArtifact(blob.id);
+      if (record === undefined || record.sessionId !== undefined || record.runId !== undefined
+        || (isRecord(record.metadata) && record.metadata["expiresAt"] !== undefined)
+        || !sameQueueBlob(record.blob, blob) || (image && !blob.mimeType.startsWith("image/"))) {
+        throw inputCapabilityError(
+          "INPUT_QUEUE_EDIT_ATTACHMENT_INVALID",
+          "A new queued attachment must match a completed attachment upload."
+        );
+      }
+      return record.blob;
+    };
+    return {
+      images: proposed.images.map(image => current.body.images.find(retained =>
+        sameQueueBlob(retained.blob, image.blob) && (retained.alt ?? "") === (image.alt ?? ""))
+        ?? { ...image, blob: uploadedBlob(image.blob, true) }),
+      files: proposed.files.map(file => current.body.files.find(retained => sameQueueBlob(retained.blob, file.blob))
+        ?? { blob: uploadedBlob(file.blob, false) })
+    };
   }
 
   assertInputCapabilities(sessionId: string, prompt: PromptInput): void {
@@ -20128,9 +20158,8 @@ export class InteractionDecisionValidationError extends JokoError {
   }
 }
 
-function sameQueuePublicInput(current: PromptInput, proposed: PromptInput): boolean {
+function sameQueuePublicText(current: PromptInput, proposed: PromptInput): boolean {
   return current.text === proposed.text
-    && sameQueuePublicAttachments(current, proposed)
     && sameQueueArray(current.mentions, proposed.mentions, sameQueueMention)
     && (current.quotesEncoded === true) === (proposed.quotesEncoded === true)
     && sameQueueArray(

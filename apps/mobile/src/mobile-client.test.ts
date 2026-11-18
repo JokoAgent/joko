@@ -9063,22 +9063,82 @@ describe("native mobile connection and operation ownership", () => {
     expect(network.streamOwner).toHaveBeenCalledTimes(2);
   });
 
-  it("merges only contiguous selected-task events and restores authoritative projections across gaps", async () => {
+  it("adopts later Owner events after filtered positions without losing the exact history window", async () => {
+    vi.useFakeTimers();
     const network = fakeNetwork();
     const emit = eventFeed(network);
     const app = client(network, memoryStorage(credential).storage);
     await app.start();
     expect(app.state.liveStatus).toBe("verifying");
     emit(event("eleven", 11n));
-    await vi.waitFor(() => expect(app.state.live.map((item) => item.eventId)).toEqual(["eleven"]));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(app.state.live.map((item) => item.eventId)).toEqual(["eleven"]);
     expect(app.state.liveStatus).toBe("streaming");
+    const anchor = event("anchor", 8n);
+    vi.mocked(network.readAround).mockResolvedValueOnce([anchor]);
+    await app.around(anchor.eventId);
     emit(event("eleven-duplicate", 11n));
     emit(event("foreign", 12n, "another-session"));
-    await vi.waitFor(() => expect(app.state.live).toHaveLength(1));
-    emit(event("gap", 14n));
-    await vi.waitFor(() => expect(network.inspect).toHaveBeenCalledTimes(2));
-    expect(app.state.live).toHaveLength(0);
-    expect(vi.mocked(network.streamOwner).mock.calls[0]?.[1]).toMatchObject({ sequence: 10n, generation: 1n });
+    emit(event("visible-after-filtered-group-event", 14n, "another-session"));
+    emit(event("next-visible", 15n));
+    const current = create(SnapshotSchema, { ...snapshot, snapshotId: "after-filtered-event", resumeCursor: event("edge", 15n).cursor });
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: current });
+    vi.mocked(network.readSession).mockResolvedValue(current);
+    await vi.advanceTimersByTimeAsync(180);
+    expect(app.state.owner).toBe(current);
+    expect(app.state.detail?.resumeCursor?.sequence).toBe(15n);
+    expect(app.state.live).toEqual([]);
+    expect(app.state.window).toEqual([anchor]);
+    expect(app.state.before).toEqual(anchor.cursor);
+    expect(network.inspect).toHaveBeenCalledOnce();
+    expect(network.streamOwner).toHaveBeenCalledOnce();
+
+    const earlier = event("earlier", 6n);
+    vi.mocked(network.readHistory).mockResolvedValueOnce({ events: [earlier] });
+    await app.older();
+    expect(network.readHistory).toHaveBeenCalledExactlyOnceWith(credential, "session", anchor.cursor, expect.any(AbortSignal));
+    expect(app.state.window).toEqual([earlier, anchor]);
+  });
+
+  it("replays a missed task invalidation from the last delivered event after a real stream interruption", async () => {
+    vi.useFakeTimers();
+    const network = fakeNetwork();
+    const emit = eventFeed(network, true);
+    let disconnect!: () => void;
+    const interrupted = new Promise<void>(resolve => { disconnect = resolve; });
+    const delivered = event("delivered-before-disconnect", 11n, "another-session");
+    vi.mocked(network.streamOwner).mockImplementationOnce(async function* (_credential, _after, _signal, onReady) {
+      onReady?.();
+      yield delivered;
+      await interrupted;
+      throw new ConnectError("The network connection ended.", Code.Unavailable);
+    });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const anchor = event("anchor-before-disconnect", 8n);
+    vi.mocked(network.readAround).mockResolvedValueOnce([anchor]);
+    await app.around(anchor.eventId);
+    const current = create(SnapshotSchema, { ...snapshot, resumeCursor: event("latest-snapshot", 14n).cursor });
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: current });
+    vi.mocked(network.readSession).mockResolvedValue(current);
+    disconnect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(app.state.liveStatus).toBe("polling");
+    await vi.advanceTimersByTimeAsync(4_000);
+    const resumed = vi.mocked(network.streamOwner);
+    expect(network.inspect).toHaveBeenCalledTimes(2);
+    expect(resumed).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(network.inspect).mock.invocationCallOrder[1]).toBeLessThan(resumed.mock.invocationCallOrder[1]!);
+    expect(resumed.mock.calls[1]?.[1]).toEqual(delivered.cursor);
+    expect(app.state.window).toEqual([anchor]);
+
+    emit(create(EventSchema, { ...event("lost-task-history-retirement", 13n),
+      payload: create(EventPayloadSchema, { kind: { case: "historyPruned", value: {} } }) }));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(app.state.window).toBeUndefined();
+    expect(app.state.before).toBeUndefined();
+    expect(app.state.live).toEqual([]);
+    expect(app.state.liveStatus).toBe("streaming");
   });
 
   it("replaces transient message deltas with final Snapshot content without replaying the input", async () => {

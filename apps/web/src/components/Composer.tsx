@@ -2835,7 +2835,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
           }
         }}
       >
-      {showQueue && <QueueStrip sessionId={session.id} items={sessionQueue} control={queueControl} supportedDispositions={supportedModes} controller={controller} runAction={runAction} t={t} expanded={queueExpanded} onExpandedChange={(expanded) => setQueueExpandedSessionId(expanded ? session.id : undefined)} actionsRef={queueActionsRef} />}
+      {showQueue && <QueueStrip sessionId={session.id} items={sessionQueue} control={queueControl} supportedDispositions={supportedModes} attachmentPolicy={attachmentPolicy} controller={controller} runAction={runAction} t={t} expanded={queueExpanded} onExpandedChange={(expanded) => setQueueExpandedSessionId(expanded ? session.id : undefined)} actionsRef={queueActionsRef} />}
       <div
         className={cx("composer", dragging && "is-dragging", effectiveBashMode && "composer--bash")}
         aria-busy={submissionKind !== undefined}

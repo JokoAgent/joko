@@ -1,4 +1,4 @@
-import type { AppSnapshot, ConnectionProfile, OperationApi } from "./model.js";
+import type { OperationApi } from "./model.js";
 
 export type PortableSessionImportApi = Pick<OperationApi,
   "inspectPortableSessionImport" | "unlockPortableSessionImport" | "cancelPortableSessionImport"
@@ -7,19 +7,6 @@ export type PortableSessionImportApi = Pick<OperationApi,
 export interface PortableSessionImportOwner {
   readonly key: string;
   readonly api: PortableSessionImportApi;
-}
-
-/** One authenticated connection occurrence, independent of ordinary Snapshot revisions. */
-export function portableSessionImportOwnerKey(state: {
-  readonly connectionState: string;
-  readonly activeProfile?: ConnectionProfile;
-  readonly connectionGeneration?: number;
-  readonly snapshot: Pick<AppSnapshot, "generation">;
-}): string | undefined {
-  const profile = state.activeProfile;
-  if (state.connectionState !== "connected" || !profile || state.connectionGeneration === undefined) return undefined;
-  return JSON.stringify([profile.id, profile.serverId, profile.deviceId, profile.origin,
-    state.connectionGeneration, state.snapshot.generation.toString()]);
 }
 
 /** Business calls require the captured owner. Cleanup can only reach that original API. */
