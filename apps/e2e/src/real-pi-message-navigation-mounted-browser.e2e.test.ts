@@ -173,6 +173,8 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
     expect(store.getSession(sessionId).descriptor.binding).toEqual(binding);
     const historyMarkers = () => store.listEvents({ sessionId }).filter(event => event.payload.type === "native_session_changed").map(event => event.id);
     const markersAfterNewTurn = historyMarkers(), requestsAfterNewTurn = fixture.providerRequests.length;
+    await row(newerSource.messageId).waitFor({ state: "visible", timeout: 30_000 });
+    expect(await delayedRow.locator("textarea").isDisabled()).toBe(true);
     releaseNavigation!();
     await delayedRow.getByRole("alert").waitFor({ state: "visible", timeout: 30_000 });
     expect(await delayedRow.locator("textarea").inputValue()).toBe("Preserve this attempted edit.");

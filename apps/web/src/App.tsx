@@ -853,29 +853,6 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       unsubscribe();
     };
   }, [auxiliaryApplicationWindow]);
-  useEffect(() => {
-    const pending = pendingDesktopDeepLinkDelivery;
-    if (pending === undefined) return;
-    if (desktopDeepLinkRendererOccurrenceRef.current !== pending.rendererOccurrence) return;
-    if (pending.kind === "portable") {
-      if (portableImportRequest?.id !== pending.requestId) return;
-    } else {
-      if ((state.navigationRevision ?? 0) <= pending.sourceNavigationRevision
-        || window.location.hash !== pending.expectedHash
-        || !desktopDeepLinkNavigationMatchesRoute(pending.navigation, state.route)) return;
-    }
-    const api = window.jokoDesktop?.deepLinks;
-    if (api === undefined) return;
-    setPendingDesktopDeepLinkDelivery((current) => current?.delivery.documentOccurrence === pending.delivery.documentOccurrence
-      && current.delivery.deliveryOccurrence === pending.delivery.deliveryOccurrence
-      ? undefined
-      : current);
-    void api.acknowledge({
-      documentOccurrence: pending.delivery.documentOccurrence,
-      deliveryOccurrence: pending.delivery.deliveryOccurrence
-    }).catch(() => false);
-  }, [pendingDesktopDeepLinkDelivery, portableImportRequest?.id, state.navigationRevision, state.route]);
-
   const describeSubmissionError = useCallback((error: unknown) => messageOf(error, t("error.unexpected")), [t]);
   const observeFirstInputAcceptance = useCallback((acceptance: FirstInputAcceptance, owner: NewSessionAcceptanceOwner): void => {
     if (acceptance.kind !== "objectiveDialog") return;
@@ -1353,6 +1330,30 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     && timelineHistory.historyRevision === activeTimelineHistoryRevision
     ? timelineHistory
     : undefined;
+  useEffect(() => {
+    const pending = pendingDesktopDeepLinkDelivery;
+    if (pending === undefined || desktopDeepLinkRendererOccurrenceRef.current !== pending.rendererOccurrence) return;
+    if (pending.kind === "portable") {
+      if (portableImportRequest?.id !== pending.requestId) return;
+    } else {
+      const { navigation } = pending;
+      if ((state.navigationRevision ?? 0) <= pending.sourceNavigationRevision
+        || window.location.hash !== pending.expectedHash || !desktopDeepLinkNavigationMatchesRoute(navigation, state.route)) return;
+      if (navigation.kind === "session" && (state.connectionState !== "connected" || activeHistory?.initialized !== true
+        || activeHistory.loading || activeHistory.error !== undefined || activeHistory.sessionId !== navigation.sessionId
+        || visibleSplitTasks === undefined || visibleSplitTasks.scope !== activeTaskPaneScope
+        || !visibleSplitTasks.sessionIds.includes(navigation.sessionId))) return;
+    }
+    const api = window.jokoDesktop?.deepLinks;
+    if (api === undefined) return;
+    setPendingDesktopDeepLinkDelivery((current) => current?.delivery.documentOccurrence === pending.delivery.documentOccurrence
+      && current.delivery.deliveryOccurrence === pending.delivery.deliveryOccurrence ? undefined : current);
+    void api.acknowledge({
+      documentOccurrence: pending.delivery.documentOccurrence,
+      deliveryOccurrence: pending.delivery.deliveryOccurrence
+    }).catch(() => false);
+  }, [activeHistory, activeTaskPaneScope, pendingDesktopDeepLinkDelivery, portableImportRequest?.id,
+    state.connectionState, state.navigationRevision, state.route, visibleSplitTasks]);
   const activeHistoryItems = activeHistory?.items;
   const recentAndHistoricalTimeline = useMemo(
     () => activeHistoryItems === undefined
