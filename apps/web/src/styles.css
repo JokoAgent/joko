@@ -2057,6 +2057,10 @@ button.attachment-chip__content:focus-visible { outline: 2px solid var(--accent-
 .queue-strip__text { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.queue-strip__items .icon-button { width: 23px; height: 23px; flex: 0 0 auto; }
 .queue-input-preview { display: flex; align-items: center; gap: 4px; }
 .queue-input-preview__content, .queue-input-preview__references, .queue-input-preview__attachments { min-width: 0; display: inline-flex; align-items: center; gap: 3px; }
+.queue-strip__edit-attachments { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 5px; min-width: 0; }
+.queue-strip__edit-attachments .queue-input-preview__chip { max-width: 100%; }
+.queue-strip__edit-attachments .queue-input-preview__chip > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.queue-strip__edit-attachments .icon-button { flex: 0 0 auto; width: 24px; height: 24px; }
 .queue-input-preview__content { overflow: hidden; }
 .queue-input-preview__text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .queue-input-preview__chip { min-width: 0; max-width: 180px; display: inline-flex; align-items: center; gap: 4px; border: 1px solid var(--line); border-radius: 999px; padding: 1px 6px; background: var(--surface-sunken); color: var(--text-soft); line-height: 16px; vertical-align: middle; user-select: none; }

@@ -2116,6 +2116,14 @@ export interface QueueItemTextEditView {
   readonly textSplices: readonly QueueTextEditSpliceView[];
 }
 
+export interface QueueItemAttachmentEditView {
+  readonly revision: bigint;
+  readonly generation: bigint;
+  readonly retainedIndices: readonly number[];
+  readonly added: readonly AttachmentDraft[];
+  readonly signal?: AbortSignal;
+}
+
 export interface QueueTextEditSpliceView {
   readonly start: number;
   readonly end: number;
@@ -6511,7 +6519,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   cancelQueueItem(queueItemId: string): Promise<void>;
   setQueueItemEditLock(queueItemId: string, lockToken: string, locked: boolean): Promise<void>;
   setQueueInteractionLock(sessionId: string, lockToken: string, locked: boolean): Promise<void>;
-  editQueueItem(queueItemId: string, edit: QueueItemTextEditView, mode: DeliveryMode, lockToken: string): Promise<void>;
+  editQueueItem(queueItemId: string, edit: QueueItemTextEditView, mode: DeliveryMode, lockToken: string, attachments?: QueueItemAttachmentEditView): Promise<void>;
   reorderQueueItem(queueItemId: string, placement: "first" | "last" | "before" | "after", anchorQueueItemId?: string, interactionLockToken?: string): Promise<void>;
   steerQueueItemNow(queueItemId: string, lockToken: string): Promise<void>;
   pauseQueue(sessionId: string, reason?: string): Promise<void>;

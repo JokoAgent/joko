@@ -18739,6 +18739,9 @@ async function dispatchMutation(
     case "editQueueItem": {
       const current = dependencies.store.getQueueItem(payload.value.queueItemId);
       requireEntityVersionPrecondition(mutation, contract.EntityKind.QUEUE_ITEM, current.id, "edit_queue_item");
+      const attachmentEditGeneration = mutation.preconditions.find(condition =>
+        condition.entity?.kind === contract.EntityKind.QUEUE_ITEM && condition.entity.id === current.id
+          && condition.expectedRevision !== undefined)?.expectedGeneration;
       const run = dependencies.store.getRun(current.runId).descriptor;
       if (run.source !== "user" || run.parentRunId !== undefined) {
         return unsupportedOperation(
@@ -18775,7 +18778,7 @@ async function dispatchMutation(
             start: splice.start,
             end: splice.end,
             replacementText: splice.replacementText
-          })));
+          })), attachmentEditGeneration);
           dependencies.sessionHost.assertInputCapabilities(durableCurrent.sessionId, prompt);
           const updated = store.editQueueItem({
             queueItemId: durableCurrent.id,

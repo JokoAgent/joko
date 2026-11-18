@@ -790,6 +790,7 @@ import type {
   ProviderRuntimeView,
   ProviderLoginFlowView,
   ProviderLoginMethodView,
+  QueueItemAttachmentEditView,
   QueueItemTextEditView,
   QueueItemView,
   QueueControlView,
@@ -4456,17 +4457,44 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     );
   }
 
-  async editQueueItem(queueItemId: string, edit: QueueItemTextEditView, mode: ComposerDraft["deliveryMode"], lockToken: string): Promise<void> {
+  async editQueueItem(queueItemId: string, edit: QueueItemTextEditView, mode: ComposerDraft["deliveryMode"], lockToken: string, attachments?: QueueItemAttachmentEditView): Promise<void> {
     const existing = this.#rawSnapshot?.queueItems.find((item) => item.queueItemId === queueItemId);
     if (existing === undefined) throw new GatewayError("This queued input is no longer available.");
     const originalInput = requiredQueueInput(existing);
     const original = mapQueueItem(existing);
     const editorSource = queueItemEditProjection(original);
     const sameEdit = equalQueueItemTextEdit(edit, editorSource);
-    if (sameEdit && mode === original.mode) return;
-    const input = sameEdit
+    if (sameEdit && mode === original.mode && attachments === undefined) return;
+    let input = sameEdit
       ? originalInput
       : editedQueueInput(originalInput, edit);
+    let signal: AbortSignal | undefined;
+    if (attachments !== undefined) {
+      if (this.#taskSharing !== undefined) throw new GatewayError("Changing queued attachments requires the task owner.");
+      if (original.state !== "accepted" || original.revision !== attachments.revision || original.generation !== attachments.generation) {
+        throw new GatewayError("This queued input changed while it was being edited.");
+      }
+      const scope = this.captureActionScope(attachments.signal);
+      signal = scope.signal;
+      const acceptedParts = originalInput.parts.filter(isQueueAttachmentPart);
+      if (attachments.retainedIndices.some((index, position) => !Number.isSafeInteger(index) || index < 0 || index >= acceptedParts.length
+        || (position > 0 && index <= attachments.retainedIndices[position - 1]!))) {
+        throw new GatewayError("The retained attachments do not match the queued input.");
+      }
+      const parts = [...input.parts.filter(part => !isQueueAttachmentPart(part)),
+        ...attachments.retainedIndices.map(index => acceptedParts[index]!)];
+      for (const attachment of attachments.added) {
+        const file = await materializeImageAttachment(attachment, scope.signal);
+        const blob = await this.uploadAttachment(file, scope);
+        parts.push(create(InputPartSchema, attachment.kind === "image"
+          ? { content: { case: "image", value: { blob, altText: attachment.file.name } } }
+          : { content: { case: "file", value: blob } }));
+      }
+      input = { ...input, parts };
+    }
+    if (input.parts.every(part => part.content.case === "text" && part.content.value.trim() === "")) {
+      throw new GatewayError("Queued input cannot be empty.");
+    }
     await this.submit({
       case: "editQueueItem",
       value: {
@@ -4476,7 +4504,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         lockToken,
         textSplices: sameEdit ? [] : edit.textSplices.map((splice) => create(QueueTextEditSpliceSchema, splice))
       }
-    }, true, [queueItemPrecondition(existing)]);
+    }, true, [queueItemPrecondition(existing)], signal);
   }
 
   async reorderQueueItem(queueItemId: string, placement: "first" | "last" | "before" | "after", anchorQueueItemId?: string, interactionLockToken?: string): Promise<void> {
@@ -22101,9 +22129,6 @@ function editedQueueInput(original: InputContent, edit: QueueItemTextEditView): 
     ...(edit.text.length === 0 ? [] : [create(InputPartSchema, { content: { case: "text", value: edit.text } })]),
     ...retainedParts
   ];
-  if (parts.length === 0 || edit.text.trim().length === 0 && retainedParts.length === 0) {
-    throw new GatewayError("Queued input cannot be empty.");
-  }
   return create(InputContentSchema, {
     parts,
     ...(original.replyQuote ? { replyQuote: original.replyQuote } : {}),
@@ -22116,6 +22141,10 @@ function editedQueueInput(original: InputContent, edit: QueueItemTextEditView): 
       mentionIndex: retainedMentionIndices.get(range.mentionIndex)!
     }))
   });
+}
+
+function isQueueAttachmentPart(part: InputContent["parts"][number]): boolean {
+  return part.content.case === "image" || part.content.case === "file";
 }
 
 function typedInputMention(value: string | undefined): boolean {
