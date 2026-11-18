@@ -92,6 +92,7 @@ export class MobilePushController {
   #interactive = true;
   #generation = 0;
   #hydrated = false;
+  #serverConfirmationRequired = true;
   #lastAuthorityObservation = "";
   #listeners = new Set<() => void>();
   #locale: MobilePushStoredLocale;
@@ -133,6 +134,8 @@ export class MobilePushController {
     this.#offerIntent = offerIntent;
     if (this.#started) return;
     this.#started = true;
+    this.#hydrated = false;
+    this.#serverConfirmationRequired = true;
     this.#foreground = foreground;
     this.#interactive = foreground;
     this.#generation += 1;
@@ -205,6 +208,7 @@ export class MobilePushController {
     if (state === "background") {
       if (!this.#foreground) return;
       this.#foreground = false;
+      this.#serverConfirmationRequired = true;
       this.#generation += 1;
       this.#activeController?.abort();
       this.#activeController = undefined;
@@ -272,6 +276,7 @@ export class MobilePushController {
     const observation = `${scope.ready ? "1" : "0"}\u001f${scope.activeProfileId ?? ""}\u001f${authority?.key ?? ""}`;
     if (observation === this.#lastAuthorityObservation) return;
     this.#lastAuthorityObservation = observation;
+    this.#serverConfirmationRequired = true;
     this.#generation += 1;
     this.#activeController?.abort();
     this.#activeController = undefined;
@@ -347,7 +352,8 @@ export class MobilePushController {
       if (!current()) return;
       if (!/^[0-9a-f]{64}$/u.test(tokenDigest)) throw new Error("The notification token digest is invalid.");
       let record = this.#deviceStore.snapshot.registrations.find((item) => recordMatchesAuthority(item, authority));
-      if (record?.confirmed && record.environment === this.#environment && record.locale === this.#locale
+      // A live node can remove a confirmed registration after a terminal APNs response.
+      if (!this.#serverConfirmationRequired && record?.confirmed && record.environment === this.#environment && record.locale === this.#locale
         && record.tokenDigest === tokenDigest && record.expiresAt > this.#now() + RENEWAL_WINDOW_MS) {
         this.#publish({ enabled: true, saving: this.#state.saving, status: "registered" });
         return;
@@ -388,7 +394,10 @@ export class MobilePushController {
       if (!current()) return;
       const confirmed = { ...record, confirmed: true, expiresAt: result.expiresAt };
       await this.#deviceStore.putRegistration(confirmed);
-      if (current()) this.#publish({ enabled: true, saving: this.#state.saving, status: "registered" });
+      if (current()) {
+        this.#serverConfirmationRequired = false;
+        this.#publish({ enabled: true, saving: this.#state.saving, status: "registered" });
+      }
     } catch {
       if (current()) this.#publish({ enabled: true, saving: this.#state.saving, status: "error", error: "sync" });
     } finally {

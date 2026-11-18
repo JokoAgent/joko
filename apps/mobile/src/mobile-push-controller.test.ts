@@ -202,6 +202,36 @@ describe("MobilePushController", () => {
     expect(fixture.controller.snapshot.status).toBe("registered");
   });
 
+  it.each(["foreground resume", "reconnect"] as const)("repairs a removed server registration after %s with its original ticket", async (entry) => {
+    const fixture = controllerFixture({ enabled: true });
+    let serverRegistration: string | undefined;
+    fixture.client.registerMobilePush.mockImplementation(async (_owner, { ticket }) => {
+      serverRegistration = ticket.registrationId;
+      return { expiresAt: 30 * 24 * 60 * 60 * 1_000 };
+    });
+    await fixture.controller.start(() => true);
+    const original = fixture.client.registerMobilePush.mock.calls[0]![1];
+    expect(serverRegistration).toBe(original.ticket.registrationId);
+    expect(fixture.storage.store.snapshot.registrations[0]?.confirmed).toBe(true);
+    serverRegistration = undefined;
+    if (entry === "foreground resume") {
+      fixture.controller.handleAppStateChange("background");
+      fixture.controller.handleAppStateChange("active");
+    } else {
+      fixture.client.setAuthority(undefined, "profile-1");
+      await fixture.controller.reconcile();
+      expect(fixture.controller.snapshot.status).toBe("waiting");
+      fixture.client.setAuthority(authority());
+    }
+    await fixture.controller.reconcile();
+    expect(fixture.client.registerMobilePush).toHaveBeenCalledTimes(2);
+    expect(fixture.client.registerMobilePush.mock.calls[1]?.[1]).toEqual(original);
+    expect(serverRegistration).toBe(original.ticket.registrationId);
+    expect(fixture.controller.snapshot.status).toBe("registered");
+    expect(fixture.client.unregisterMobilePush).not.toHaveBeenCalled();
+    fixture.controller.stop();
+  });
+
   it("keeps a cold background start suspended until the first active state", async () => {
     const fixture = controllerFixture({ enabled: true, permission: granted });
     const offered = vi.fn(() => true);
