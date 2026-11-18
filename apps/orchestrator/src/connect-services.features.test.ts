@@ -961,6 +961,7 @@ describe("Connect typed feature boundaries", () => {
         revision: 1n
       }),
       listRuns: () => [],
+      findPendingSessionLifecycleCleanup: () => undefined,
       findSetting: () => undefined,
       moveSessionProject,
       updateSession
