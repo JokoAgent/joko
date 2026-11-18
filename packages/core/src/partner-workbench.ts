@@ -160,7 +160,8 @@ export function partnerWorkbenchGroup(
 ): PartnerWorkbenchGroup {
   if (state === "waiting" || state === "stopped" && (kind === "session" || kind === "external")) return "waiting";
   if (state === "running") return "running";
-  if (state === "queued" || kind === "item" || verdict === "unfinished" || verdict === "idea") return "todo";
+  if (kind === "item") return state === "done" && verdict === "done" ? "done" : "todo";
+  if (state === "queued" || verdict === "unfinished" || verdict === "idea") return "todo";
   return "done";
 }
 

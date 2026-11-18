@@ -12,7 +12,8 @@ describe("workbench task projection", () => {
     expect(partnerWorkbenchGroup("running", "session", "done")).toBe("running");
     expect(partnerWorkbenchGroup("stopped", "session", "idea")).toBe("waiting");
     expect(partnerWorkbenchGroup("done", "external", "unfinished")).toBe("todo");
-    expect(partnerWorkbenchGroup("done", "item", "done")).toBe("todo");
+    expect(partnerWorkbenchGroup("done", "item", "done")).toBe("done");
+    expect(partnerWorkbenchGroup("stopped", "item", "unfinished")).toBe("todo");
     expect(derivePartnerWorkbenchAutomationState({ enabled: true })).toBe("automation");
     expect(derivePartnerWorkbenchAutomationState({ enabled: false })).toBe("stopped");
     expect(derivePartnerWorkbenchAutomationState({ enabled: false, running: true })).toBe("running");

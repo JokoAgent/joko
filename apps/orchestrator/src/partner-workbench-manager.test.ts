@@ -473,6 +473,22 @@ describe("Partner workbench service and Queue ownership", () => {
     await expect(f.workbench.continueTask(after.owner, "item:proposal", "Different request", "background-effect")).rejects.toMatchObject({ code: "WORKBENCH_INVALID" });
   });
 
+  it("projects a completed local Workbench note in Done through the public read", async () => {
+    const f = await fixture();
+    const view = await grant(f);
+    const note = { taskId: "item:finished-review", project: f.project, title: "Review handoff" };
+    const draft = await f.workbench.setJudgment(view.owner, view.state.revision, { ...note, verdict: "unfinished", next: "Read the result" });
+    expect(draft.tasks.find(task => task.id === note.taskId)).toMatchObject({ group: "todo" });
+    await f.workbench.setJudgment(draft.owner, draft.state.revision, { ...note, verdict: "done", next: null });
+    const methods = createPartnerWorkbenchConnectMethods(f.workbench, () => ({ id: "owner" }));
+    const response = create(contract.GetPartnerWorkbenchResponseSchema, await methods.getPartnerWorkbench(
+      create(contract.GetPartnerWorkbenchRequestSchema, { partnerId: f.partner.id }), {} as HandlerContext
+    ));
+    expect(response.workbench?.tasks.find(task => task.id === note.taskId)).toMatchObject({
+      state: contract.PartnerWorkbenchTaskState.DONE, group: contract.PartnerWorkbenchGroup.DONE
+    });
+  });
+
   it("recovers a completed background creation after twenty earlier Workbench receipts", { timeout: 30_000 }, async () => {
     const f = await fixture();
     let view: PartnerWorkbenchStateView = await grant(f);
