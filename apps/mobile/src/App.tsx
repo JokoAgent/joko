@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactElement, type ReactNode, type RefObject } from "react";
 import {
-  AccessibilityInfo, ActivityIndicator, Alert, AppState, BackHandler, FlatList, Keyboard, Linking, Modal, PanResponder, Platform,
+  AccessibilityInfo, ActivityIndicator, Alert, Appearance, AppState, BackHandler, FlatList, Keyboard, Linking, Modal, PanResponder, Platform,
   Image, Pressable, ScrollView, SectionList, StyleSheet, Text, TextInput, findNodeHandle, useColorScheme,
   useWindowDimensions, View, type NativeScrollEvent
 } from "react-native";
@@ -742,6 +742,11 @@ export function App() {
   }, [offerNativeUrl]);
   const scheme = useColorScheme();
   const dark = resolveMobileDarkTheme(theme.preference, scheme);
+  useLayoutEffect(() => {
+    if (Platform.OS === "android" && theme.status !== "loading") {
+      Appearance.setColorScheme(theme.preference === "system" ? "unspecified" : theme.preference);
+    }
+  }, [theme.preference, theme.status]);
   const colors = useMemo(() => ({
     background: dark ? "#15191d" : "#f7f6f3", surface: dark ? "#24292d" : "#ffffff",
     ink: dark ? "#f4f4f2" : "#242a2d", muted: dark ? "#adb6b7" : "#637073",

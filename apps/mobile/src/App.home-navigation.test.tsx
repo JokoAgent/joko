@@ -20,6 +20,7 @@ import type { MobileComposerRichInput } from "./MobileComposerRichInput";
 import type { MobileDrawerProps } from "./MobileDrawer";
 import type { MobileTaskHeader } from "./MobileTaskHeader";
 import type { MobileWindowGeometry } from "./mobile-window-geometry";
+import type { MobileThemePreferenceState } from "./mobile-theme-preference";
 
 type NativeProps = {
   children?: ReactNode;
@@ -57,6 +58,9 @@ const suggestTaskTitle = vi.fn(async (_key: string, _signal: AbortSignal) => cre
   title: "Suggested title", status: SessionTitleSuggestionStatus.OK
 }));
 const alert = vi.fn();
+const setNativeColorScheme = vi.fn();
+const themeListeners = new Set<() => void>();
+let themeSnapshot: MobileThemePreferenceState = { preference: "system", status: "ready", saving: false };
 const reconcile = vi.fn(async () => {});
 const dismissUnconfirmed = vi.fn(async (_operationId: string) => {});
 const refresh = vi.fn(async () => {});
@@ -181,7 +185,7 @@ beforeAll(async () => {
     Linking: { getInitialURL: async () => null, addEventListener: (_event: string, listener: typeof linkListener) => {
       linkListener = listener;
       return { remove() { linkListener = undefined; } };
-    } }, Alert: { alert }, findNodeHandle: () => null, useColorScheme: () => "light",
+    } }, Alert: { alert }, Appearance: { setColorScheme: setNativeColorScheme }, findNodeHandle: () => null, useColorScheme: () => "light",
     useWindowDimensions: () => dimensions
   }));
   vi.doMock("react-native-safe-area-context", () => ({ SafeAreaProvider: surface, SafeAreaView: surface,
@@ -211,7 +215,8 @@ beforeAll(async () => {
   vi.doMock("./mobile-client", () => ({ MobileClient: class { constructor() { return client; } } }));
   vi.doMock("./storage", () => new Proxy({
     mobileLocalePreferences: { snapshot: { effectiveLocale: "en", status: "ready" }, subscribe, hydrate },
-    mobileThemePreferences: { snapshot: { preference: "system", status: "ready" }, subscribe, hydrate },
+    mobileThemePreferences: { get snapshot() { return themeSnapshot; }, hydrate,
+      subscribe(listener: () => void) { themeListeners.add(listener); return () => themeListeners.delete(listener); } },
     mobileVoicePreferences: { snapshot: {}, subscribe, hydrate },
     mobileDiagnostics: { snapshot: { enabled: false }, subscribe, hydrate, record() {}, flush: hydrate, maintainExportCache: hydrate },
     mobileUpdates: { snapshot: { startup: "ready" }, subscribe, start: hydrate },
@@ -305,6 +310,8 @@ beforeEach(async () => {
   learningPartner = undefined; learningProfileProps = undefined;
   taskWindowGeometry = undefined;
   platformOS = "android";
+  themeSnapshot = { preference: "system", status: "ready", saving: false };
+  setNativeColorScheme.mockClear();
   observedHeaderRole = "ordinary"; shareSelectionActive = false;
   headerSourceEpoch = 0;
   createNewTask.mockClear();
@@ -753,6 +760,22 @@ describe("actual Home navigation hosts", () => {
 });
 
 describe("actual Task Home navigation composition", () => {
+  it("applies only the adopted Android preference to native controls and releases the override for System", async () => {
+    themeSnapshot = { preference: "system", status: "loading", saving: false };
+    await act(async () => root.render(createElement(App)));
+    expect(setNativeColorScheme).not.toHaveBeenCalled();
+    const publish = (next: MobileThemePreferenceState) => act(async () => {
+      themeSnapshot = next;
+      themeListeners.forEach(listener => listener());
+    });
+    await publish({ preference: "dark", status: "ready", saving: false });
+    await publish({ preference: "dark", status: "ready", saving: true });
+    await publish({ preference: "dark", status: "ready", saving: false, error: "Storage failed" });
+    await publish({ preference: "light", status: "ready", saving: false });
+    await publish({ preference: "system", status: "ready", saving: false });
+    expect(setNativeColorScheme.mock.calls).toEqual([["dark"], ["light"], ["unspecified"]]);
+  });
+
   it.each([true, false])("keeps late missing-message recovery on its original Task screen (back=%s)", async leave => {
     state = { ...state, saved: [{ profileId: "profile", origin: "https://node.example", serverId: "node",
       connectionId: homeConnectionId, deviceId: "phone", displayName: "Node", credentialState: "available",
