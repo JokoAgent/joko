@@ -50,7 +50,7 @@ export function toggleMachineProfile(
 }
 
 export function machineCacheFromSnapshot(profile: ConnectionProfile, snapshot: AppSnapshot, now = Date.now()): MachineCacheView {
-  const targets = new Map(snapshot.targets.map((target) => [target.id, target.name] as const));
+  const targets = new Map(snapshot.targets.map((target) => [target.id, target] as const));
   const interactions = new Map(snapshot.interactions.map((interaction) => [interaction.sessionId, interaction.kind] as const));
   return {
     profileId: profile.id,
@@ -62,27 +62,35 @@ export function machineCacheFromSnapshot(profile: ConnectionProfile, snapshot: A
       .filter((session) => !session.hidden && !session.derivationOrigin?.sideChat && safeIdentifier(session.id))
       .sort((left, right) => right.updatedAt - left.updatedAt || left.id.localeCompare(right.id))
       .slice(0, MAX_CACHED_SESSIONS)
-      .map((session) => ({
-        id: session.id,
-        name: boundedText(session.name, MAX_NAME_LENGTH) || session.id,
-        state: session.state,
-        ...(targets.get(session.targetId) === undefined ? {} : { targetName: boundedText(targets.get(session.targetId)!, MAX_NAME_LENGTH) }),
-        pinned: session.pinned,
-        archived: session.archived,
-        lastActivityAt: session.updatedAt,
-        ...(session.attention === undefined ? {} : {
-          attentionKind: session.attention.kind,
-          attentionUnread: session.attention.unread
-        }),
-        ...(interactions.get(session.id) === undefined ? {} : { interactionKind: interactions.get(session.id) }),
-        taskTags: (session.taskTags ?? []).map(({ id, name, color, presetKey, nameCustomized }) => ({
-          id,
-          name,
-          color,
-          ...(presetKey === undefined ? {} : { presetKey }),
-          nameCustomized
-        }))
-      }))
+      .map((session) => {
+        const targetName = boundedText(targets.get(session.targetId)?.name, MAX_NAME_LENGTH);
+        const project = session.projectId === undefined ? undefined : targets.get(session.projectId);
+        const projectName = boundedText(project?.name, MAX_NAME_LENGTH);
+        return {
+          id: session.id,
+          name: boundedText(session.name, MAX_NAME_LENGTH) || session.id,
+          state: session.state,
+          ...(targetName === "" ? {} : { targetName }),
+          ...(safeIdentifier(session.backendId) ? { backendId: session.backendId } : {}),
+          project: project !== undefined && !project.archived && safeIdentifier(project.id) && projectName !== ""
+            ? { id: project.id, name: projectName } : null,
+          pinned: session.pinned,
+          archived: session.archived,
+          lastActivityAt: session.updatedAt,
+          ...(session.attention === undefined ? {} : {
+            attentionKind: session.attention.kind,
+            attentionUnread: session.attention.unread
+          }),
+          ...(interactions.get(session.id) === undefined ? {} : { interactionKind: interactions.get(session.id) }),
+          taskTags: (session.taskTags ?? []).map(({ id, name, color, presetKey, nameCustomized }) => ({
+            id,
+            name,
+            color,
+            ...(presetKey === undefined ? {} : { presetKey }),
+            nameCustomized
+          }))
+        };
+      })
   };
 }
 
@@ -149,7 +157,7 @@ function normalizeCachedSession(value: unknown): MachineSessionCacheView | undef
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
   const required = ["archived", "id", "lastActivityAt", "name", "pinned", "state", "taskTags"];
-  const allowed = new Set([...required, "attentionKind", "attentionUnread", "interactionKind", "targetName"]);
+  const allowed = new Set([...required, "attentionKind", "attentionUnread", "interactionKind", "targetName", "backendId", "project"]);
   if (required.some((key) => !Object.hasOwn(record, key)) || Object.keys(record).some((key) => !allowed.has(key)) ||
     !safeIdentifier(record["id"]) || !SESSION_STATES.has(record["state"] as MachineSessionCacheView["state"]) ||
     boundedText(record["name"], MAX_NAME_LENGTH) === "" || boundedText(record["name"], MAX_NAME_LENGTH) !== record["name"] || typeof record["pinned"] !== "boolean" ||
@@ -160,11 +168,15 @@ function normalizeCachedSession(value: unknown): MachineSessionCacheView | undef
   const interactionKind = record["interactionKind"];
   const hasTargetName = Object.hasOwn(record, "targetName");
   const targetName = boundedText(record["targetName"], MAX_NAME_LENGTH);
+  const backendId = record["backendId"];
+  const project = normalizeCachedProject(record["project"]);
   const hasAttentionKind = Object.hasOwn(record, "attentionKind");
   const hasAttentionUnread = Object.hasOwn(record, "attentionUnread");
   const hasInteractionKind = Object.hasOwn(record, "interactionKind");
   if (
     (hasTargetName && (targetName === "" || targetName !== record["targetName"]))
+    || (Object.hasOwn(record, "backendId") && !safeIdentifier(backendId))
+    || (Object.hasOwn(record, "project") && project === undefined)
     || hasAttentionKind !== hasAttentionUnread
     || (hasAttentionKind && attentionKind !== "done" && attentionKind !== "awaiting" && attentionKind !== "error")
     || (hasAttentionUnread && typeof record["attentionUnread"] !== "boolean")
@@ -181,6 +193,8 @@ function normalizeCachedSession(value: unknown): MachineSessionCacheView | undef
     name: boundedText(record["name"], MAX_NAME_LENGTH),
     state: record["state"] as MachineSessionCacheView["state"],
     ...(hasTargetName ? { targetName } : {}),
+    ...(safeIdentifier(backendId) ? { backendId } : {}),
+    ...(project === undefined ? {} : { project }),
     pinned: record["pinned"],
     archived: record["archived"],
     lastActivityAt,
@@ -192,6 +206,16 @@ function normalizeCachedSession(value: unknown): MachineSessionCacheView | undef
       : {}),
     taskTags
   };
+}
+
+function normalizeCachedProject(value: unknown): MachineSessionCacheView["project"] {
+  if (value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const name = boundedText(record["name"], MAX_NAME_LENGTH);
+  if (Object.keys(record).sort().join(",") !== "id,name" || !safeIdentifier(record["id"])
+    || name === "" || name !== record["name"]) return undefined;
+  return { id: record["id"], name };
 }
 
 function normalizeCachedTaskTag(value: unknown): TaskTagDisplayView | undefined {

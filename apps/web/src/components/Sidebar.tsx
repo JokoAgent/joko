@@ -241,6 +241,10 @@ type SidebarPinnedEntry =
   | { readonly kind: "remoteSession"; readonly id: string; readonly cache: MachineCacheView; readonly session: MachineSessionCacheView }
   | { readonly kind: "project"; readonly id: string; readonly target: TargetView; readonly sessions: readonly SessionView[] };
 type SidebarPinnedSessionEntry = Exclude<SidebarPinnedEntry, { readonly kind: "project" }>;
+interface SidebarRemoteTaskEntry {
+  readonly cache: MachineCacheView;
+  readonly session: MachineSessionCacheView;
+}
 type SidebarRailPanelSection = "projects" | "dialogues";
 type SidebarRailProjectEntry =
   | { readonly kind: "local"; readonly id: string; readonly name: string; readonly target: TargetView; readonly sessions: readonly SessionView[] }
@@ -512,12 +516,11 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     : props.machineControl.profiles.filter((profile) => profile.id !== props.machineControl!.activeProfile.id
       && (props.machineControl!.selection === "all" || props.machineControl!.selection.includes(profile.id))), [props.machineControl]);
   const remoteLastActivityCutoff = sidebarLastActivityCutoff(sidebarLayout.lastActivity, Date.now());
-  const remoteContentIdentityFilterActive = sidebarLayout.backendId !== "all" || sidebarLayout.projectFilter !== "all";
-  const remoteMachineSessionCount = remoteMachineCaches.reduce((count, cache) => count + cache.sessions.filter((session) =>
-    !sidebarTaskPinned(session) && remoteSessionMatchesSidebarStatus(session, sidebarLayout.status)
-      && !remoteContentIdentityFilterActive
-      && (remoteLastActivityCutoff === undefined || session.lastActivityAt >= remoteLastActivityCutoff)
-  ).length, 0);
+  const remoteMachineTaskEntries = useMemo(() => sidebarLayout.projectFilter !== "all" ? [] : remoteMachineCaches.flatMap((cache) => cache.sessions
+    .filter((session) => !sidebarTaskPinned(session) && remoteSessionMatchesSidebarStatus(session, sidebarLayout.status)
+      && (sidebarLayout.backendId === "all" || session.backendId === sidebarLayout.backendId)
+      && (remoteLastActivityCutoff === undefined || session.lastActivityAt >= remoteLastActivityCutoff))
+    .map((session) => ({ cache, session }))), [remoteMachineCaches, remoteLastActivityCutoff, sidebarLayout.backendId, sidebarLayout.projectFilter, sidebarLayout.status]);
   const remoteMessageSearchScopeKey = JSON.stringify([currentSearchProfileId, selectedRemoteProfiles.map((profile) => [
     profile.id, profile.serverId, profile.origin, profile.endpointPublicKey, profile.transportKind,
     props.machineControl?.presenceByProfile[profile.id] ?? "offline"
@@ -770,18 +773,14 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     if (targetSessions.length === 0 && !pinnedProjectReachable) return [];
     return [{ kind: "local", id: target.id, name: target.name, target, sessions: targetSessions }];
   });
-  const railRemotePanelEntries = remoteMachineCaches.flatMap((cache) => cache.sessions
-    .filter((session) => !sidebarTaskPinned(session) && remoteSessionMatchesSidebarStatus(session, sidebarLayout.status)
-      && !remoteContentIdentityFilterActive
-      && (remoteLastActivityCutoff === undefined || session.lastActivityAt >= remoteLastActivityCutoff))
-    .map((session) => ({ cache, session })));
   const railRemoteProjectEntries = useMemo<readonly SidebarRailProjectEntry[]>(() => {
     const grouped = new Map<string, { readonly cache: MachineCacheView; readonly name: string; readonly sessions: MachineSessionCacheView[] }>();
-    for (const { cache, session } of railRemotePanelEntries) {
-      if (session.targetName === undefined) continue;
-      const id = `${cache.profileId}\u0000${session.targetName}`;
+    for (const { cache, session } of remoteMachineTaskEntries) {
+      const project = sidebarRemoteNavigationProject(session);
+      if (project === undefined) continue;
+      const id = `${cache.profileId}\u0000${project.key}`;
       const current = grouped.get(id);
-      if (current === undefined) grouped.set(id, { cache, name: `${session.targetName} · ${cache.name}`, sessions: [session] });
+      if (current === undefined) grouped.set(id, { cache, name: `${project.name} · ${cache.name}`, sessions: [session] });
       else current.sessions.push(session);
     }
     return [...grouped.entries()].map(([id, group]) => ({
@@ -795,7 +794,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       const rightActivity = right.kind === "remote" ? right.sessions[0]?.lastActivityAt ?? 0 : 0;
       return rightActivity - leftActivity || left.name.localeCompare(right.name);
     });
-  }, [railRemotePanelEntries]);
+  }, [remoteMachineTaskEntries]);
   const railProjectEntries = [...railLocalProjectEntries, ...railRemoteProjectEntries];
   const railProjectsView = sidebarSessionListView({
     items: railProjectEntries,
@@ -807,8 +806,8 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       : entry.sessions.some((session) => remoteCachedStatus(session) !== undefined)
   });
   const railDialogueSessions = railLocalPanelSessions.filter((session) => sidebarNavigationProjectId(session, hiddenProjectIds) === undefined);
-  const railRemoteDialogueEntries = railRemotePanelEntries
-    .filter(({ session }) => session.targetName === undefined)
+  const railRemoteDialogueEntries = remoteMachineTaskEntries
+    .filter(({ session }) => sidebarRemoteNavigationProject(session) === undefined)
     .sort((left, right) => right.session.lastActivityAt - left.session.lastActivityAt
       || left.cache.profileId.localeCompare(right.cache.profileId)
       || left.session.id.localeCompare(right.session.id));
@@ -829,12 +828,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     && (!hasVisibleProjectOrDialogueGroups || (visibleProjectGroupIds.every((targetId) => collapsedTargets.has(targetId))
       && (!visibleDialogueGrouped || sidebarLayout.collapsedDialogue)))
     && visibleScheduleGroupKeys.every((key) => !expandedScheduleGroupKeys.has(key));
-  const visibleRemoteDeviceIds = remoteMachineCaches
-    .filter((cache) => cache.sessions.some((session) =>
-      !sidebarTaskPinned(session) && remoteSessionMatchesSidebarStatus(session, sidebarLayout.status)
-        && !remoteContentIdentityFilterActive
-        && (remoteLastActivityCutoff === undefined || session.lastActivityAt >= remoteLastActivityCutoff)))
-    .map((cache) => cache.profileId);
+  const visibleRemoteDeviceIds = [...new Set(remoteMachineTaskEntries.map(({ cache }) => cache.profileId))];
   const localDeviceId = props.machineControl?.activeProfile.id;
   const deviceLayerActive = sidebarLayout.groupDevice
     && remoteMachineCaches.length > 0
@@ -1907,12 +1901,10 @@ export function Sidebar(props: SidebarProps): JSX.Element {
           </div>
         {!searchPopupOpen && props.machineControl !== undefined && remoteMachineCaches.length > 0 && <RemoteMachineSessionSections
           caches={remoteMachineCaches}
+          entries={remoteMachineTaskEntries}
           presenceByProfile={props.machineControl.presenceByProfile}
-          status={sidebarLayout.status}
           grouped={sidebarLayout.groupDevice}
           collapsedProfileIds={collapsedDeviceSections}
-          contentFiltersActive={sidebarLayout.backendId !== "all" || sidebarLayout.projectFilter !== "all"}
-          lastActivity={sidebarLayout.lastActivity}
           locale={props.locale}
           t={t}
           onToggleProfile={toggleDeviceSection}
@@ -1934,7 +1926,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
           ><ExtensionShortcutIcon extension={extension} /><span><strong>{extension.mainView?.title ?? extension.name}</strong><small>{extension.description}</small></span></button>)}
         </section>}
         {!searchPopupOpen && props.groupNavigation}
-        {!searchPopupOpen && pinnedEntries.length === 0 && recent.length === 0 && remoteMachineSessionCount === 0 && sidebarExtensions.length === 0 && <p className="sidebar__empty">{t("session.emptyBody")}</p>}
+        {!searchPopupOpen && pinnedEntries.length === 0 && recent.length === 0 && remoteMachineTaskEntries.length === 0 && sidebarExtensions.length === 0 && <p className="sidebar__empty">{t("session.emptyBody")}</p>}
         </nav>
 
         <nav className="sidebar__utility" aria-label={t("a11y.productNavigation")}>
@@ -3525,25 +3517,24 @@ function RemoteMachineSessionRow({ cache, session, presence, locale, t, onOpen }
   </li>;
 }
 
-function RemoteMachineSessionSections({ caches, presenceByProfile, status, grouped, collapsedProfileIds, contentFiltersActive, lastActivity, locale, t, onToggleProfile, onOpen }: {
+function sidebarRemoteNavigationProject(session: MachineSessionCacheView): { readonly key: string; readonly name: string } | undefined {
+  if (session.project !== undefined) {
+    return session.project === null ? undefined : { key: `id:${session.project.id}`, name: session.project.name };
+  }
+  return session.targetName === undefined ? undefined : { key: `legacy:${session.targetName}`, name: session.targetName };
+}
+
+function RemoteMachineSessionSections({ caches, entries, presenceByProfile, grouped, collapsedProfileIds, locale, t, onToggleProfile, onOpen }: {
   readonly caches: readonly MachineCacheView[];
+  readonly entries: readonly SidebarRemoteTaskEntry[];
   readonly presenceByProfile: Readonly<Record<string, MachinePresenceView>>;
-  readonly status: SidebarLayout["status"];
   readonly grouped: boolean;
   readonly collapsedProfileIds: ReadonlySet<string>;
-  readonly contentFiltersActive: boolean;
-  readonly lastActivity: SidebarLayout["lastActivity"];
   readonly locale: string;
   readonly t: Translator;
   readonly onToggleProfile: (profileId: string) => void;
   readonly onOpen: (profileId: string, sessionId: string) => void;
 }): JSX.Element {
-  const cutoff = sidebarLastActivityCutoff(lastActivity, Date.now());
-  const entries = caches.flatMap((cache) => cache.sessions
-    .filter((session) => !sidebarTaskPinned(session) && remoteSessionMatchesSidebarStatus(session, status)
-      && !contentFiltersActive
-      && (cutoff === undefined || session.lastActivityAt >= cutoff))
-    .map((session) => ({ cache, session })));
   const sorted = (values: typeof entries): typeof entries => [...values].sort((left, right) =>
     right.session.lastActivityAt - left.session.lastActivityAt
     || left.session.name.localeCompare(right.session.name));
