@@ -100,6 +100,8 @@ describe("OperationalBrowserState", () => {
       expect.objectContaining({ pageId: "page-7-2", url: "about:blank", state: "open" })
     ]);
 
+    restored.retireExternalPage("browser", "page-7-2", 6);
+    expect(restored.activePageId("browser")).toBe("page-7-2");
     restored.closeHumanPage("browser", "page-7-2", 7, "page-7-1");
     expect(new OperationalBrowserState(store).recoverablePages("browser", new Set())).toEqual([
       expect.objectContaining({ pageId: "page-7-1", state: "open" })

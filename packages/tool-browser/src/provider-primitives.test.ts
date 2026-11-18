@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { BrowserContext, Page, Response } from "playwright-core";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { BrowserProvider, type BrowserAction, type BrowserProviderOptions } from "./provider.js";
 
@@ -97,6 +97,9 @@ class PrimitivePage extends EventEmitter {
   waitForFileInput: (() => Promise<void>) | undefined;
   #closed = false;
   #url = "about:blank";
+  readonly #mainFrame = {
+    waitForLoadState: async (): Promise<void> => { throw new Error("The replacement document has not loaded."); }
+  };
 
   constructor(readonly contextOwner: PrimitiveContext) {
     super();
@@ -122,7 +125,7 @@ class PrimitivePage extends EventEmitter {
   async title(): Promise<string> { return "Primitive page"; }
   isClosed(): boolean { return this.#closed; }
   context(): BrowserContext { return this.contextOwner as unknown as BrowserContext; }
-  mainFrame(): object { return this; }
+  mainFrame(): object { return this.#mainFrame; }
   locator(selector: string): PrimitiveLocator { return new PrimitiveLocator(this, selector); }
   frameLocator(selector: string): { locator: (inner: string) => PrimitiveLocator } {
     this.operations.push({ kind: "frame", selector });
@@ -395,6 +398,76 @@ describe("BrowserProvider action primitives", () => {
       await rm(root, { recursive: true, force: true });
     }
   }, 20_000);
+
+  it.skipIf(process.env.JOKO_BROWSER_EXECUTABLE === undefined)("settles Chromium history navigation while a new document still waits for DOM readiness", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-browser-document-load-"));
+    const navigations: string[] = [];
+    const provider = new BrowserProvider({
+      executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, targetMode: "external",
+      profileDirectories: { sidebar: join(root, "sidebar"), external: join(root, "external") },
+      downloadDirectory: join(root, "downloads"), uploadRoots: [],
+      onActivity: activity => { if (activity.type === "navigation") navigations.push(activity.detail); }
+    });
+    let releaseScript: (() => void) | undefined;
+    const scriptGate = new Promise<void>(resolve => { releaseScript = resolve; });
+    try {
+      await provider.start();
+      const [initial] = await provider.listPages();
+      if (initial === undefined) throw new Error("Chromium did not expose a Browser page.");
+      const pageId = initial.id;
+      const takeover = await provider.beginHumanTakeover({ providerId: provider.id, pageId, generation: provider.generation, owner: "owner" });
+      const page = await provider.runHumanTakeoverOperation(takeover, async nativePage => nativePage);
+      const origin = "https://navigation.example.test";
+      const requests: string[] = [];
+      const domReadyUrls: string[] = [];
+      page.on("domcontentloaded", () => { domReadyUrls.push(page.url()); });
+      await page.route(`${origin}/**`, async route => {
+        const pathname = new URL(route.request().url()).pathname;
+        requests.push(pathname);
+        if (pathname === "/start") return route.fulfill({ contentType: "text/html", body:
+          '<!doctype html><title>Same document</title><button onclick="history.pushState({}, \'\', \'/history\')">Change route</button>' });
+        if (pathname === "/replacement") return route.fulfill({ contentType: "text/html", body:
+          '<!doctype html><title>New document</title><script defer src="/pending.js"></script>' });
+        if (pathname === "/pending.js") {
+          await scriptGate;
+          return route.fulfill({ contentType: "text/javascript", body: "window.replacementLoaded = true;" });
+        }
+        return route.abort();
+      });
+      await page.goto(`${origin}/start`, { waitUntil: "domcontentloaded" });
+      const originalDocumentId = provider.uploadDocumentId(pageId);
+      const button = await page.getByRole("button", { name: "Change route" }).boundingBox();
+      const viewport = page.viewportSize();
+      if (button === null || viewport === null) throw new Error("The Chromium page has no visible button or viewport.");
+      await provider.performHumanTakeoverAction(takeover, {
+        type: "mouseClick", button: "primary",
+        normalizedX: (button.x + button.width / 2) / (viewport.width - 1),
+        normalizedY: (button.y + button.height / 2) / (viewport.height - 1)
+      });
+      const state = async () => (await provider.listPages()).find(candidate => candidate.id === pageId);
+      await vi.waitFor(async () => expect(await state()).toMatchObject({
+        url: `${origin}/history`, title: "Same document", state: "ready", canGoBack: true
+      }), { timeout: 6_000 });
+      expect(requests.filter(path => path !== "/favicon.ico")).toEqual(["/start"]);
+      expect(domReadyUrls).toEqual([`${origin}/start`]);
+      expect(navigations.filter(url => url === `${origin}/history`)).toHaveLength(1);
+      expect(provider.uploadDocumentId(pageId)).not.toBe(originalDocumentId);
+      expect(provider.currentHumanTakeover()).toMatchObject(takeover);
+
+      await provider.performHumanTakeoverAction(takeover, { type: "navigate", url: `${origin}/replacement` });
+      await vi.waitFor(() => expect(requests).toContain("/pending.js"), { timeout: 6_000 });
+      expect(await state()).toMatchObject({ url: `${origin}/replacement`, state: "loading" });
+      expect(domReadyUrls).toEqual([`${origin}/start`]);
+      releaseScript?.();
+      await page.waitForLoadState("domcontentloaded");
+      expect(await state()).toMatchObject({ title: "New document", state: "ready" });
+      expect(domReadyUrls).toEqual([`${origin}/start`, `${origin}/replacement`]);
+    } finally {
+      releaseScript?.();
+      await provider.stop().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it("rejects unsafe URLs and out-of-bound action inputs before dispatch", async () => {
     const value = await primitiveFixture();

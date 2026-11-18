@@ -362,7 +362,7 @@ describe("session gamepad actions", () => {
     }, [userMessage]);
     await act(async () => { complete(); await Promise.all(view.pending); });
     expect(view.api.forkMessage.mock.calls[0]?.[1]()).toBe(false);
-    expect(view.api.saveDraft).not.toHaveBeenCalled();
+    expect(view.api.forkMessage.mock.calls[0]?.[0].draft?.text).toBe("Keep my source prompt");
     expect(view.api.navigate).not.toHaveBeenCalled();
     expect(userMessage.text).toBe("Keep my source prompt");
   });
@@ -424,17 +424,19 @@ describe("session gamepad actions", () => {
     expect(view.api.navigate).toHaveBeenLastCalledWith({ kind: "session", sessionId: "forked" });
   });
 
-  it("saves the original user fork prompt before navigation and does not navigate if ownership changes during save", async () => {
+  it("passes the original user fork draft before navigation and skips navigation if ownership changes before its receipt", async () => {
     const view = await mount();
     const userMessage: TimelineItemView = { ...message, kind: "user", text: "Keep my source prompt", nativeEntryId: undefined, nativeParentEntryId: "parent-entry" };
     await view.render(session, backend, false, {}, [userMessage]);
-    let completeSave!: () => void;
-    view.api.saveDraft.mockImplementationOnce(() => new Promise((resolve) => { completeSave = resolve; }));
+    let complete!: () => void;
+    view.api.forkMessage.mockImplementationOnce(() => new Promise((resolve) => { complete = () => resolve("forked"); }));
     await view.derive("fork");
-    expect(view.api.saveDraft).toHaveBeenCalledWith("forked", expect.objectContaining({ text: "Keep my source prompt", attachments: [], mentions: [] }));
+    expect(view.api.forkMessage).toHaveBeenCalledWith(expect.objectContaining({
+      draft: expect.objectContaining({ text: "Keep my source prompt", editorDocument: expect.any(Object) })
+    }), expect.any(Function), false);
     expect(view.api.navigate).not.toHaveBeenCalled();
     await view.render({ ...session, id: "other-task" });
-    await act(async () => { completeSave(); await Promise.all(view.pending); });
+    await act(async () => { complete(); await Promise.all(view.pending); });
     expect(view.api.navigate).not.toHaveBeenCalled();
   });
 

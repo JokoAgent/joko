@@ -379,6 +379,17 @@ export class OperationalBrowserState implements BrowserTransferRepository {
     this.persistPageCatalog();
   }
 
+  retireExternalPage(browserProviderId: string, pageId: string, generation: number): void {
+    const record = this.findRecoverablePage(browserProviderId, pageId);
+    if (record?.generation !== generation) return;
+    const previous = this.#pageCatalog;
+    try { this.closeHumanPage(browserProviderId, pageId, generation); }
+    catch (error) {
+      this.#pageCatalog = previous;
+      throw error;
+    }
+  }
+
   private persistPageCatalog(): void {
     this.#store.setSetting<StoredPageCatalog>(SCOPE, SCOPE_ID, PAGE_CATALOG_KEY, this.#pageCatalog);
   }

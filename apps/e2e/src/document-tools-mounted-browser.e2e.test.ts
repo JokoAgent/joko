@@ -13,7 +13,7 @@ import {
 import { PI_LIKE_PROFILE, type FakeAdapterProfile } from "@joko/testkit";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, expect, it } from "vitest";
-import { InstrumentedFakeAdapter, OrchestratorE2eFixture, routeFixtureDiscovery, waitFor } from "./fixture.js";
+import { closeCompactNavigationDrawer, InstrumentedFakeAdapter, OrchestratorE2eFixture, routeFixtureDiscovery, waitFor } from "./fixture.js";
 import { createSessionMutation, queueItemIdFrom, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim()
@@ -50,14 +50,9 @@ async function closeCompactTimelinePanels(page: Page): Promise<void> {
     page.getByRole("button", { name: "Open details", exact: true }).first()
       .waitFor({ state: "visible", timeout: 15_000 }).then(() => "closed" as const)
   ]);
+  await closeCompactNavigationDrawer(page);
   if (outcome === "open") await close.first().click();
   await dock.first().waitFor({ state: "hidden", timeout: 15_000 });
-
-  const navigationScrim = page.locator(".panel-scrim--navigation");
-  if (await navigationScrim.isVisible()) {
-    await page.locator(".sidebar.is-open").getByRole("button", { name: "Close navigation", exact: true }).click();
-  }
-  await navigationScrim.waitFor({ state: "hidden", timeout: 15_000 });
 }
 
 mountedIt("shows a task-local chart PDF in mounted Files and downloads its exact bytes", async () => {

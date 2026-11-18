@@ -55,6 +55,7 @@ export interface RealPiSystemFixtureOptions {
   readonly rootDirectory?: string;
   readonly keepRoot?: boolean;
   readonly webDirectory?: string;
+  readonly externalBrowserExecutable?: string;
   readonly port?: number;
   /** Give shared-task invitations the exact loopback server origin. */
   readonly taskSharing?: boolean;
@@ -225,6 +226,9 @@ export class RealPiSystemFixture {
         },
         artifactDirectory: join(dataDirectory, "artifacts"),
         webDirectory: options.webDirectory ?? join(rootDirectory, "web-not-used-by-connect-e2e"),
+        ...(options.externalBrowserExecutable === undefined ? {} : {
+          browser: { executablePath: options.externalBrowserExecutable, headless: false }
+        }),
         corsOrigins: []
       };
       application = await createOrchestratorApplication(config, {

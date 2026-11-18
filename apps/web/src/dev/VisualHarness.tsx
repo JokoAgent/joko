@@ -467,6 +467,11 @@ export function VisualHarness(): JSX.Element {
     const implemented = {
       state,
       taskSharing: undefined,
+      messageEditDrafts: {
+        read: async () => undefined,
+        stage: async () => false,
+        finish: async () => undefined
+      },
       mcpAppApi: () => undefined,
       extensionCardApi: () => undefined,
       extensionNetworkApi: () => undefined,

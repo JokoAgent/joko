@@ -32,6 +32,7 @@ class TargetPage extends EventEmitter {
   isClosed(): boolean { return this.#closed; }
   context(): BrowserContext { return this.contextOwner as unknown as BrowserContext; }
   mainFrame(): object { return this; }
+  async waitForLoadState(): Promise<void> {}
   async bringToFront(): Promise<void> {
     this.focusCount += 1;
     if (this.#focusError !== undefined) throw this.#focusError;

@@ -11914,6 +11914,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     };
     const signal = combinedAbortSignal(callerSignal, this.#abort?.signal);
     const options = signal === undefined ? undefined : { signal };
+    let submissionIssued = false;
     const submitOnce = async () => {
       signal?.throwIfAborted();
       await observeReceipt?.(operationId);
@@ -11934,6 +11935,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           });
         }
       }
+      submissionIssued = true;
       return client.submitOperation(request, options);
     };
     let response;
@@ -11949,7 +11951,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     } catch (error) {
       // A dropped response leaves admission uncertain. Guests and settings only
       // read the exact receipt; other ordinary actions retain their idempotent retry.
-      if (signal?.aborted === true || !isUncertainOperationSubmissionError(error)) throw error;
+      const ambiguousForkFailure = submissionIssued && readUncertainOnly && payload.case === "forkSession"
+        && ConnectError.from(error).code === Code.Unknown;
+      if (signal?.aborted === true || (!ambiguousForkFailure && !isUncertainOperationSubmissionError(error))) throw error;
       response = this.#taskSharing === undefined && !readUncertainOnly ? await submitOnce() : await client.getOperation({ operationId }, options);
     } finally { this.#sharedTaskSubmitting.delete(operationId); }
     callerSignal?.throwIfAborted();

@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BrowserContext, Page } from "playwright-core";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { BrowserLeaseConflictError } from "./leases.js";
 import { BrowserProvider } from "./provider.js";
 import {
@@ -35,7 +35,7 @@ class FakeLocator {
 class FakePage extends EventEmitter {
   #url: string;
   #closed = false;
-  readonly #mainFrame = {};
+  readonly #mainFrame = { waitForLoadState: async (): Promise<void> => {} };
   readonly #simulateCommentDocument: boolean;
   #commentElementId: string | undefined;
   readonly #commentInlineStyles = new Map<string, { value: string; priority: string }>();
@@ -720,6 +720,38 @@ describe("BrowserProvider human takeover fences", () => {
       expect(value.provider.currentHumanTakeover()).toBeUndefined();
       expect(await value.provider.listPages()).toEqual([]);
       expect(value.provider.acquireAgentLease("agent-after-close", 5_000).owner).toBe("agent-after-close");
+    } finally {
+      await value.cleanup();
+    }
+  });
+
+  it("focuses a permitted replacement before completing the close and leaves the foreign tab untouched", async () => {
+    const value = await fixture();
+    try {
+      const foreign = await begin(value.provider);
+      const foreignPage = await value.provider.runHumanTakeoverOperation(foreign, async page => page);
+      const foreignFocus = vi.spyOn(foreignPage, "bringToFront");
+      const open = (url: string) => value.provider.openHumanPage({
+        providerId: value.provider.id, generation: value.provider.generation, owner: foreign.owner, url
+      }, 5_000);
+      const sameTask = await open("https://same-task.test/replacement");
+      const sameTaskPage = await value.provider.runHumanTakeoverOperation(sameTask, async page => page);
+      const sameTaskFocus = vi.spyOn(sameTaskPage, "bringToFront");
+      const current = await open("https://same-task.test/current");
+      expect((await value.provider.listPages()).map(page => page.id)).toEqual([foreign.pageId, sameTask.pageId, current.pageId]);
+      const guard = { assertCurrent: vi.fn(), canFocusReplacement: (pageId: string) => pageId === sameTask.pageId };
+
+      const replacement = await value.provider.closeHumanPage(current, current.pageId, 5_000, guard);
+      expect(replacement?.pageId).toBe(sameTask.pageId);
+      expect(value.provider.currentHumanTakeover()).toEqual(replacement);
+      expect(sameTaskFocus).toHaveBeenCalledOnce();
+      expect(foreignFocus).not.toHaveBeenCalled();
+      expect((await value.provider.listPages()).map(page => page.id)).toEqual([foreign.pageId, sameTask.pageId]);
+
+      await expect(value.provider.closeHumanPage(replacement!, sameTask.pageId, 5_000, guard)).resolves.toBeUndefined();
+      expect(value.provider.currentHumanTakeover()).toBeUndefined();
+      expect(foreignFocus).not.toHaveBeenCalled();
+      expect((await value.provider.listPages()).map(page => page.id)).toEqual([foreign.pageId]);
     } finally {
       await value.cleanup();
     }
