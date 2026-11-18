@@ -104,7 +104,8 @@ export class ProviderGroupRuntime {
         const captured = options.sources.captureGroupPeer(member.backendId);
         const client = createClient(contract.ProviderGroupService, captured.transport);
         const state = await client.getProviderSchedulingState({ key: { backendId: captured.nativeBackendId, providerId: member.providerId }, modelId: "" }, { signal });
-        captured.assertCurrent(); this.#remoteRunning.set(member.key, state.activeTurns); return fromGroupAccountUsage(state.accountUsage);
+        captured.assertCurrent(); this.#remoteRunning.set(member.key, state.activeTurns);
+        return fromGroupAccountUsage(state.accountUsage, { includeBuckets: true });
       } });
     this.directory = new ProviderGroupDirectory({ sources: () => this.sources(), quotas, ownerGeneration: options.ownerGeneration,
       running: source => source.kind === "local" ? options.activeTurns(source.backendId, source.providerId) : this.#remoteRunning.get(source.key) ?? 0,
