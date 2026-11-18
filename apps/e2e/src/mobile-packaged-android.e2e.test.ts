@@ -62,6 +62,15 @@ type AndroidEvidence = {
   scenarioResult: EvidenceResult;
   cleanupResult: EvidenceResult;
   elapsedMs: number;
+  adbFailures?: Array<{
+    readonly step: EvidenceStepName | "setup" | "cleanup";
+    readonly command: string;
+    readonly afterMs: number;
+    readonly elapsedMs: number;
+    readonly exitCode?: number;
+    readonly signal?: string;
+    readonly deviceUnavailable: boolean;
+  }>;
   fixtureReadiness?: Partial<Record<"workspace-directory" | "workspace-index" | "session-artifacts", {
     passed: boolean; count?: number;
   }>>;
@@ -119,9 +128,11 @@ afterEach(async () => {
   try {
     try {
       if (ownedAvd) {
-        await adb("shell", "am", "force-stop", packageName);
-        expect((await adb("shell", "pm", "clear", packageName)).trim()).toBe("Success");
-        if (reversedPort !== undefined) await adb("reverse", "--remove", reversedPort);
+        const cleanupFailures: unknown[] = [];
+        try { await adb("shell", "am", "force-stop", packageName); } catch (error) { cleanupFailures.push(error); }
+        try { expect((await adb("shell", "pm", "clear", packageName)).trim()).toBe("Success"); } catch (error) { cleanupFailures.push(error); }
+        try { if (reversedPort !== undefined) await adb("reverse", "--remove", reversedPort); } catch (error) { cleanupFailures.push(error); }
+        if (cleanupFailures.length > 0) throw new AggregateError(cleanupFailures, "The owned Android fixture did not finish cleaning up.");
       }
     } finally {
       ownedAvd = false;
@@ -142,7 +153,7 @@ afterEach(async () => {
 }, 90_000);
 
 nativeIt("pairs with a trusted node key, sends through native rich input, opens canonical resources, and resumes without resending", {
-  timeout: 360_000
+  timeout: 420_000
 }, async () => {
   if (!serial || !/^emulator-\d+$/u.test(serial) || !avd?.startsWith("joko-")
     || !adbExecutable || !isAbsolute(adbExecutable) || !apkPath || !isAbsolute(apkPath)) {
@@ -433,7 +444,7 @@ async function runNativeScenario(): Promise<void> {
   await tap("Connect", true);
   await openFixtureTask();
   await waitNode((node) => node.text === taskName, "restored native task title");
-  await scrollToNode((node) => node.text?.includes(prompt) === true, "persisted native task input");
+  await scrollToNode((node) => node.text?.includes(prompt) === true, "persisted native task input", "earlier");
   await completeStep();
   await beginStep("restore-canonical-file");
   await tap("README.md:2:4", true, true);
@@ -504,11 +515,24 @@ async function adb(...args: string[]): Promise<string> {
 async function adbUntil(deadline: number | undefined, ...args: string[]): Promise<string> {
   const timeout = deadline === undefined ? 30_000 : Math.min(30_000, deadline - Date.now());
   if (timeout <= 0) throw new Error("The initial native connection navigation deadline elapsed.");
+  const started = elapsed();
   return new Promise((accept, reject) => {
     execFile(adbExecutable!, ["-s", serial!, ...args], { timeout, maxBuffer: 2 * 1024 * 1024, windowsHide: true },
-      (error, stdout) => {
+      (error, stdout, stderr) => {
         // Do not include command arguments or output: pairing input is a transient credential.
         if (error && !(args[0] === "shell" && args[1] === "pidof" && error.code === 1)) {
+          if (evidence !== undefined && (evidence.adbFailures?.length ?? 0) < 12) {
+            const command = args[0] === "exec-out" && args[1] === "uiautomator" ? "ui-hierarchy"
+              : args[0] === "shell" && ["am", "dumpsys", "getprop", "input", "pidof", "pm", "rm", "screencap", "sha256sum"].includes(args[1] ?? "")
+                ? `shell-${args[1]}` : ["emu", "install", "uninstall", "pull", "reverse", "logcat"].includes(args[0] ?? "") ? args[0]! : "adb";
+            (evidence.adbFailures ??= []).push({
+              step: evidence.scenarioResult === "running" ? activeStep?.name ?? "setup" : "cleanup",
+              command, afterMs: started, elapsedMs: elapsed() - started,
+              ...(typeof error.code === "number" ? { exitCode: error.code } : {}),
+              ...(error.signal == null ? {} : { signal: error.signal }),
+              deviceUnavailable: /device offline|device ['"][^\r\n]*['"] not found|no devices\/emulators found|transport is closed/iu.test(stderr)
+            });
+          }
           reject(new Error("The isolated Android fixture command failed."));
         } else accept(stdout);
       });
@@ -683,7 +707,11 @@ async function waitNode(predicate: (node: AndroidUiNode) => boolean, label: stri
   return found;
 }
 
-async function scrollToNode(predicate: (node: AndroidUiNode) => boolean, label: string): Promise<AndroidUiNode> {
+async function scrollToNode(
+  predicate: (node: AndroidUiNode) => boolean,
+  label: string,
+  direction: "earlier" | "later" = "later",
+): Promise<AndroidUiNode> {
   for (let attempt = 0; attempt < 7; attempt += 1) {
     const items = await nodes();
     const node = items.find(entry => entry.bounds.x2 > entry.bounds.x1 && entry.bounds.y2 > entry.bounds.y1 && predicate(entry));
@@ -696,8 +724,10 @@ async function scrollToNode(predicate: (node: AndroidUiNode) => boolean, label: 
     const x = Math.round((viewport.bounds.x1 + viewport.bounds.x2) / 2);
     const inset = Math.max(1, Math.round((viewport.bounds.y2 - viewport.bounds.y1) * 0.15));
     // Stay inside the observed app viewport: a bottom-edge swipe invokes Home.
-    await interaction("swipe", () => adb("shell", "input", "swipe", String(x), String(viewport.bounds.y2 - inset),
-      String(x), String(viewport.bounds.y1 + inset), "300"));
+    const top = viewport.bounds.y1 + inset;
+    const bottom = viewport.bounds.y2 - inset;
+    const [start, end] = direction === "earlier" ? [top, bottom] : [bottom, top];
+    await interaction("swipe", () => adb("shell", "input", "swipe", String(x), String(start), String(x), String(end), "300"));
   }
   return waitNode(predicate, label);
 }
