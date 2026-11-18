@@ -1355,10 +1355,11 @@ function event(id: string, sequence: bigint, sessionId = "session"): Event {
     payload: { kind: { case: "statusStream", value: { label: id } } } });
 }
 
-function eventFeed(network: MobileNetwork) {
+function eventFeed(network: MobileNetwork, ready = false) {
   const queued: Event[] = [];
   let wake: (() => void) | undefined;
-  network.streamOwner = vi.fn(async function* (_credential, _after, signal) {
+  network.streamOwner = vi.fn(async function* (_credential, _after, signal, onReady) {
+    if (ready) onReady?.();
     while (!signal.aborted) {
       if (!queued.length) await new Promise<void>((resolve) => {
         wake = resolve;
@@ -8899,6 +8900,43 @@ describe("native mobile connection and operation ownership", () => {
     app.setForeground(true);
     await vi.waitFor(() => expect(app.state.status).toBe("connected"));
     expect(network.inspect).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps the confirmed idle Owner stream and accepts its first late event", async () => {
+    vi.useFakeTimers();
+    const network = fakeNetwork();
+    const emit = eventFeed(network, true);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    expect(app.state.liveStatus).toBe("streaming");
+    const first = vi.mocked(network.streamOwner).mock.calls[0];
+    await vi.advanceTimersByTimeAsync(13_000);
+    expect(first?.[2].aborted).toBe(false);
+    expect(network.streamOwner).toHaveBeenCalledOnce();
+    expect(network.readOwner).toHaveBeenCalledOnce();
+
+    emit(event("first-after-idle", 11n));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(app.state.live.map(item => item.eventId)).toEqual(["first-after-idle"]);
+    expect(app.state.liveStatus).toBe("streaming");
+  });
+
+  it("falls back when the native transport delivers no frame and ignores its late ready callback", async () => {
+    vi.useFakeTimers();
+    const network = fakeNetwork();
+    eventFeed(network);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const first = vi.mocked(network.streamOwner).mock.calls[0];
+    expect(app.state.liveStatus).toBe("verifying");
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(app.state.liveStatus).toBe("polling");
+    expect(first?.[2].aborted).toBe(true);
+    first?.[3]?.();
+    expect(app.state.liveStatus).toBe("polling");
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(network.readOwner).toHaveBeenCalledTimes(2);
+    expect(network.streamOwner).toHaveBeenCalledTimes(2);
   });
 
   it("merges only contiguous selected-task events and restores authoritative projections across gaps", async () => {

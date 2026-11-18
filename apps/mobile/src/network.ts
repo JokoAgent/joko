@@ -495,7 +495,7 @@ export interface MobileNetwork {
   readHistory(credential: PairedCredential, sessionId: string, before?: EventCursor, signal?: AbortSignal): Promise<{ events: Event[]; before?: EventCursor }>;
   readAround(credential: PairedCredential, sessionId: string, eventId: string, signal?: AbortSignal): Promise<Event[]>;
   searchSessionMessages(credential: PairedCredential, query: string, status: SessionMessageSearchSessionStatus, signal?: AbortSignal): Promise<readonly SessionMessageSearchMatch[]>;
-  streamOwner(credential: PairedCredential, after: EventCursor, signal: AbortSignal): AsyncIterable<Event>;
+  streamOwner(credential: PairedCredential, after: EventCursor, signal: AbortSignal, onReady?: () => void): AsyncIterable<Event>;
   streamTaskActivity?(credential: PairedCredential, viewedSessionIds: readonly string[], signal: AbortSignal): AsyncIterable<import('@joko/contracts').TaskActivityState>;
   listWorkspaceDirectory(credential: PairedCredential, workspaceId: string, parentPath: string, signal?: AbortSignal): Promise<WorkspaceDirectorySnapshot>;
   listWorkspaceChangeSets(credential: PairedCredential, workspaceId: string, sessionId: string, signal?: AbortSignal): Promise<readonly WorkspaceChangeSet[]>;
@@ -3444,12 +3444,13 @@ export const mobileNetwork: MobileNetwork = {
       .getVoiceInputSession({ voiceInputId }, options(signal));
     return projectMobileVoiceSession(response.session);
   },
-  async *streamOwner(credential, after, signal) {
+  async *streamOwner(credential, after, signal, onReady) {
     const client = createClient(EventService, credentialTransport(credential));
     for await (const response of client.streamEvents({
       scope: { kind: { case: "owner", value: {} } }, afterCursor: after
     }, { signal })) {
       if (response.event) yield response.event;
+      else onReady?.();
     }
   },
   streamTaskActivity(credential, viewedSessionIds, signal) {

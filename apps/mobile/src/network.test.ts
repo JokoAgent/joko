@@ -1,5 +1,6 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
-import { GetProviderUsageRequestSchema, GetProviderUsageResponseSchema } from "@joko/contracts";
+import { EventCursorSchema, GetProviderUsageRequestSchema, GetProviderUsageResponseSchema,
+  StreamEventsRequestSchema, StreamEventsResponseSchema } from "@joko/contracts";
 import { ListPartnerTaskOutputsRequestSchema, ListPartnerTaskOutputsResponseSchema,
   PartnerTaskOutputSourceKind, PartnerTaskOutputReadiness, PartnerTaskOutputFileStatus } from "@joko/contracts";
 import { createHash } from "node:crypto";
@@ -166,6 +167,48 @@ beforeEach(() => {
   // Independent wire fixtures reuse this origin with different node IDs. Each
   // starts with its own trusted key; identity conflicts inside a case stay real.
   replaceEndpointTrust({ origin: "https://node.example", endpointPublicKey: mobileNetworkFixtureEndpointPublicKey });
+});
+
+it("reports decoded Owner stream readiness and preserves the original event cursor", async () => {
+  const credential: PairedCredential = { endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, profileId: "profile",
+    serverId: "server", deviceId: "phone", connectionId: "connection", origin: "https://node.example",
+    displayName: "Phone", authKey: "owner-key" };
+  const after = create(EventCursorSchema, { generation: 7n, sequence: 10n, opaqueToken: "cursor-10" });
+  let responseStream!: ReadableStreamDefaultController<Uint8Array>;
+  const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const request = new Request(input, init);
+    expect(request.headers.get("authorization")).toBe("Bearer owner-key");
+    expect(new URL(request.url).pathname).toBe("/joko.v1.EventService/StreamEvents");
+    expect(fromBinary(StreamEventsRequestSchema, new Uint8Array(await request.arrayBuffer()).subarray(5)))
+      .toMatchObject({ scope: { kind: { case: "owner" } }, afterCursor: after });
+    return new Response(new ReadableStream<Uint8Array>({ start(controller) {
+      responseStream = controller;
+      request.signal.addEventListener("abort", () => controller.error(request.signal.reason), { once: true });
+    } }), { headers: { "content-type": "application/connect+proto" } });
+  });
+  const abort = new AbortController(), onReady = vi.fn();
+  const stream = mobileNetwork.streamOwner(credential, after, abort.signal, onReady)[Symbol.asyncIterator]();
+  const first = stream.next();
+  void first.catch(() => undefined);
+  try {
+    await vi.waitFor(() => expect(responseStream).toBeDefined());
+    expect(onReady).not.toHaveBeenCalled();
+    responseStream.enqueue(new Uint8Array(5));
+    await vi.waitFor(() => expect(onReady).toHaveBeenCalledOnce());
+    const message = create(StreamEventsResponseSchema, { event: {
+      eventId: "first-event", cursor: { generation: 7n, sequence: 11n, opaqueToken: "cursor-11" }
+    } });
+    const bytes = toBinary(StreamEventsResponseSchema, message);
+    const frame = new Uint8Array(5 + bytes.byteLength);
+    new DataView(frame.buffer).setUint32(1, bytes.byteLength);
+    frame.set(bytes, 5);
+    responseStream.enqueue(frame);
+    await expect(first).resolves.toEqual({ done: false, value: message.event });
+  } finally {
+    abort.abort();
+    await stream.return?.().catch(() => undefined);
+    fetch.mockRestore();
+  }
 });
 
 describe("Mobile account usage network", () => {

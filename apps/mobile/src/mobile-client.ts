@@ -6130,8 +6130,8 @@ export class MobileClient {
     this.#streamGeneration = cursor.generation;
     this.#streamSequence = cursor.sequence;
     this.#set({ liveStatus: "verifying" });
-    // An idle stream cannot demonstrate incremental delivery on every native fetch.
-    // Until an event arrives, keep a bounded snapshot-polling fallback instead.
+    // A transport that buffers every frame cannot prove incremental delivery.
+    // Wait for decoded stream readiness or a valid event before switching to live updates.
     this.#proofTimer = setTimeout(() => {
       if (!this.#current(epoch) || this.#streamAbort !== controller || this.#state.liveStatus !== "verifying") return;
       controller.abort();
@@ -6143,9 +6143,16 @@ export class MobileClient {
   }
 
   async #consumeStream(epoch: number, credential: PairedCredential, after: EventCursor, controller: AbortController): Promise<void> {
+    const current = () => this.#current(epoch) && this.#streamAbort === controller && !controller.signal.aborted;
+    const accept = (): void => {
+      if (!current() || this.#state.liveStatus === "streaming") return;
+      if (this.#proofTimer !== undefined) clearTimeout(this.#proofTimer);
+      this.#proofTimer = undefined;
+      this.#set({ liveStatus: "streaming" });
+    };
     try {
-      for await (const event of this.network.streamOwner(credential, after, controller.signal)) {
-        if (!this.#current(epoch) || this.#streamAbort !== controller || controller.signal.aborted) return;
+      for await (const event of this.network.streamOwner(credential, after, controller.signal, accept)) {
+        if (!current()) return;
         const cursor = event.cursor;
         const payload = event.payload?.kind;
         if (payload?.case === "projectionInvalidated" && event.eventId && cursor?.opaqueToken
@@ -6178,9 +6185,7 @@ export class MobileClient {
         if (event.payload?.kind.case === "messageDeleted") {
           void this.#retireAcceptedTaskOutbox(credential, record => mobileTaskOutboxHistoryDeleted(record, event));
         }
-        if (this.#proofTimer !== undefined) clearTimeout(this.#proofTimer);
-        this.#proofTimer = undefined;
-        this.#set({ liveStatus: "streaming" });
+        accept();
         if (event.identity?.sessionId && event.identity.sessionId === this.#state.selectedId && !this.#state.window) {
           this.#set({ live: [...this.#state.live.filter((item) => item.eventId !== event.eventId), event].slice(-160) });
         }
