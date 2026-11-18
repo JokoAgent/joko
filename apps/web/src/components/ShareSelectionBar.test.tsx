@@ -61,6 +61,30 @@ describe("generated selection image ownership", () => {
     expect(view.host.querySelector('[role="status"]')?.textContent).toBe("timeline.shareSelectionCopied");
   });
 
+  it("finishes the selected image after an unselected completion arrives, and retires a changed selected source", async () => {
+    const first = deferred<Blob>();
+    const second = deferred<Blob>();
+    images.build.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    const view = mount();
+    await act(async () => button(view.host, "Copy").click());
+    const firstAction = (images.build.mock.calls[0]![0] as { readonly action: BrowserActionContext }).action;
+    const newest: TimelineItemView = { id: "three", kind: "assistant", text: "Later", sourceEventId: "later", sequence: 3n, createdAt: 2 };
+    await act(async () => view.render("one", "profile", [...messages, newest]));
+    expect(firstAction.signal.aborted).toBe(false);
+    expect(button(view.host, "Copy").disabled).toBe(true);
+    const png = new Blob(["original"]);
+    await act(async () => first.resolve(png));
+    expect(images.copy).toHaveBeenCalledExactlyOnceWith(png, firstAction);
+    expect(view.host.querySelector('[role="status"]')?.textContent).toBe("timeline.shareSelectionCopied");
+
+    await act(async () => button(view.host, "Copy").click());
+    const secondAction = (images.build.mock.calls[1]![0] as { readonly action: BrowserActionContext }).action;
+    await act(async () => view.render("one", "profile", [{ ...messages[0]!, sourceEventId: "replacement" }, messages[1]!, newest]));
+    expect(secondAction.signal.aborted).toBe(true);
+    await act(async () => second.resolve(new Blob(["retired"])));
+    expect(images.copy).toHaveBeenCalledOnce();
+  });
+
   it("allows explicit cancel during encoding and suppresses late dispatch after unmount", async () => {
     const pending = deferred<Blob>();
     images.build.mockReturnValueOnce(pending.promise);
@@ -191,7 +215,7 @@ function mount(ownerDocument: Document = document, withTimelineRoot = true) {
   roots.push(root);
   const onCancel = vi.fn();
   const getTimelineRoot = vi.fn(() => timelineRoot);
-  const render = (selected = "one", ownerKey = "profile") => root.render(<ShareSelectionBar ownerKey={ownerKey} sessionId="session" sessionName="Task" messages={[...messages]} selectedIds={new Set([selected])} locale="en" t={t} getTimelineRoot={getTimelineRoot} onToggleAll={() => undefined} onCancel={onCancel} />);
+  const render = (selected = "one", ownerKey = "profile", rows = messages) => root.render(<ShareSelectionBar ownerKey={ownerKey} sessionId="session" sessionName="Task" messages={[...rows]} selectedIds={new Set([selected])} locale="en" t={t} getTimelineRoot={getTimelineRoot} onToggleAll={() => undefined} onCancel={onCancel} />);
   act(() => render());
   return { host, root, render, onCancel, getTimelineRoot, timelineRoot };
 }

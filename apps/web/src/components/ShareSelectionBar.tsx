@@ -38,10 +38,16 @@ export function ShareSelectionBar({ ownerKey, sessionId, sessionName, messages, 
     sessionName,
     messages: shareSelectionImageMessages(selectedMessages)
   };
+  const firstSelected = selectedMessages[0];
+  const lastSelected = selectedMessages.at(-1);
+  const selectedSpan = firstSelected === undefined || lastSelected === undefined ? []
+    : messages.slice(messages.indexOf(firstSelected), messages.indexOf(lastSelected) + 1);
   const sourceKey = JSON.stringify([
+    sessionId,
     locale,
     content,
-    messages.map((message) => [message.id, message.sourceEventId, message.createdAt])
+    selectedSpan.map((message) => [message.id, message.sourceEventId, message.createdAt]),
+    selectedMessages.map((message) => message.attachments?.map((attachment) => [attachment.id, attachment.blobId]))
   ]);
   const retire = useCallback((): void => {
     const request = requestRef.current;
