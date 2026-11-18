@@ -625,6 +625,11 @@ export interface BackgroundTaskOutputResult {
   readonly workflow?: BackgroundWorkflowProgress;
 }
 
+export interface NativeSubscriptionAuthority {
+  readonly accountKey: string;
+  assertCurrent(): void;
+}
+
 export interface BackendAdapter {
   readonly id: string;
   /** Native execution support, separate from remote HTTP model inference. */
@@ -632,6 +637,8 @@ export interface BackendAdapter {
   /** Text review channels do not implicitly expose plugin one-shot inference. */
   readonly nativeTextInferenceCapabilities?: { readonly pluginOneshot: true; readonly maxTokens: boolean };
   describe(): Promise<BackendDescriptor>;
+  /** Service-private account proof for a deferred native subscription effect. */
+  captureNativeSubscriptionAuthority?(providerId: string, signal?: AbortSignal): Promise<NativeSubscriptionAuthority | undefined>;
   /** Optional native-account inference; never borrows a product Session or its tools. */
   inferNativeText?(input: NativeTextInferenceInput): Promise<string>;
   /** A prepared remote registration has a live source but no stored Target yet. */

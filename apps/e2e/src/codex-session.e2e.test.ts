@@ -4,9 +4,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import { create, fromBinary } from "@bufbuild/protobuf";
+import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { createCodexAdapter, AppServerHost, TransportFault } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
-import { EntityKind, GetOperationRequestSchema, ObjectiveStatus, OperationMutationSchema, OperationState, RetryState, RunState,
+import { EntityKind, GetOperationRequestSchema, ObjectiveStatus, OperationMutationSchema, OperationState, RetryState, RunState, ScheduleRecurrenceSchema,
   SubmitOperationRequestSchema, ToolCallState } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it, vi } from "vitest";
@@ -19,6 +20,117 @@ import {
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
   ? it : it.skip;
+
+it("keeps one-shot native Codex schedules on the saved account through refresh, logout and replacement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "joko-scheduled-account-"));
+  const authFile = join(root, "auth.json");
+  const backendId = "codex-scheduled-account";
+  const native = new FakeCodexAppServer();
+  native.codexHome = root;
+  const transports: ReturnType<FakeCodexAppServer["createTransport"]>[] = [];
+  const host = new AppServerHost({ transportFactory: () => {
+    const transport = native.createTransport();
+    transports.push(transport);
+    return transport;
+  } });
+  const realNow = Date.now;
+  let offset = 0;
+  const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + offset);
+  const initialDue = realNow() + 60_000;
+  let fixture: OrchestratorE2eFixture | undefined;
+  const writeAuthority = async (subject: string, token: string) => {
+    const accountId = `fixture-account-${subject}`;
+    const payload = Buffer.from(JSON.stringify({ sub: subject, "https://api.openai.com/auth": { chatgpt_account_id: accountId } })).toString("base64url");
+    native.account = { type: "chatgpt", email: null, planType: "plus" };
+    await writeFile(authFile, JSON.stringify({ tokens: { id_token: `fixture.${payload}.fixture`, account_id: accountId, access_token: token } }), { mode: 0o600 });
+  };
+  try {
+    await writeAuthority("A", "fixture-a-original");
+    const testHost = fixture = await OrchestratorE2eFixture.start({ rootDirectory: root, backendFactories: [{
+      instanceId: backendId, adapterKind: "codex", displayName: "Codex schedule account fixture",
+      create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host })
+    }] });
+    const owner = await testHost.pair("Schedule account owner");
+    const mutate = (mutation: Parameters<typeof submit>[2]) => submit(owner.clients.operation, owner.connectionId, mutation);
+    const targetId = testHost.targetId(backendId);
+    const store = testHost.application.store;
+    const { providerId, modelId } = store.getBackend(backendId).descriptor.models[0]!;
+    const sessionId = sessionIdFrom(await mutate(createSessionMutation({ backendId, targetId, providerId, modelId, effortId: "medium" })));
+    const scheduleInput = (name: string, triggerAt: number) => {
+      const request = createManualScheduleMutation({ backendId, targetId, sessionId, text: name,
+        execution: { model: { model: { providerId, modelId }, effortId: "medium" } } });
+      if (request.payload.case !== "createSchedule" || request.payload.value.schedule === undefined) throw new Error("Expected a Schedule input.");
+      const input = request.payload.value.schedule;
+      input.displayName = name;
+      input.recurrence = create(ScheduleRecurrenceSchema, { kind: { case: "oneShot", value: { triggerAt: timestampFromMs(triggerAt) } } });
+      return { input, request };
+    };
+    const refresh = () => mutate(create(OperationMutationSchema, { payload: { case: "refreshProviderCredential", value: { backendId, providerId } } }));
+    const dispatches = () => transports.flatMap(transport => transport.requests.filter(request => request.method === "turn/start"));
+    const histories = (scheduleId: string) => owner.clients.scheduler.listScheduleRunHistory({ scheduleId });
+    const firstId = scheduleIdFrom(await mutate(scheduleInput("Original A after refresh", initialDue).request));
+    const signedOutId = scheduleIdFrom(await mutate(scheduleInput("Original A while signed out", initialDue + 60_000).request));
+    const replacedId = scheduleIdFrom(await mutate(scheduleInput("Original A after switching to B", initialDue + 120_000).request));
+    const original = store.getSchedule(replacedId).executionSnapshot as { nativeSubscriptionAccountKey: string };
+    expect(original.nativeSubscriptionAccountKey).toMatch(/^[a-f0-9]{64}$/u);
+
+    await writeAuthority("A", "fixture-a-refreshed");
+    expect((await refresh()).state).toBe(OperationState.SUCCEEDED);
+    const finishNativeSchedule = async (scheduleId: string, due: number, text: string, count: number) => {
+      offset = due - realNow();
+      await waitFor(async () => dispatches().length, length => length === count, "the expected scheduled Codex dispatch");
+      const nativeId = store.getSession(sessionId).descriptor.binding.nativeSessionId!;
+      expect(dispatches().at(-1)?.params).toMatchObject({ threadId: nativeId, model: modelId,
+        input: [{ type: "text", text, text_elements: [] }] });
+      await waitFor(() => histories(scheduleId), result => result.history[0]?.state === RunState.RUNNING, "accepted scheduled Codex Run");
+      await native.completeTurn(nativeId);
+      await waitFor(() => histories(scheduleId), result => result.history[0]?.state === RunState.SUCCEEDED, "settled scheduled Codex Run");
+    };
+    await finishNativeSchedule(firstId, initialDue, "Original A after refresh", 1);
+
+    const logout = await mutate(create(OperationMutationSchema, { payload: { case: "logoutProvider", value: { backendId, providerId } } }));
+    expect(logout.state).toBe(OperationState.SUCCEEDED);
+    await rm(authFile);
+    const rejectOccurrence = async (scheduleId: string, due: number) => {
+      offset = due - realNow();
+      const history = await waitFor(() => histories(scheduleId), result => result.history[0]?.state === RunState.FAILED, "rejected scheduled account");
+      expect(history.history).toHaveLength(1);
+      expect(store.findQueueItemByRunId(sessionId, history.history[0]!.runId)).toBeUndefined();
+      expect(dispatches()).toHaveLength(1);
+      expect(store.getSchedule(scheduleId).enabled).toBe(false);
+    };
+    await rejectOccurrence(signedOutId, initialDue + 60_000);
+    await writeAuthority("B", "fixture-b-original");
+    expect((await refresh()).state).toBe(OperationState.SUCCEEDED);
+    await rejectOccurrence(replacedId, initialDue + 120_000);
+
+    const resaved = await mutate(create(OperationMutationSchema, { payload: { case: "updateSchedule", value: {
+      scheduleId: replacedId, schedule: scheduleInput("Explicitly authorized B", initialDue + 180_000).input
+    } } }));
+    expect(resaved.state).toBe(OperationState.SUCCEEDED);
+    const updated = store.getSchedule(replacedId).executionSnapshot as { nativeSubscriptionAccountKey: string };
+    expect(updated.nativeSubscriptionAccountKey).toMatch(/^[a-f0-9]{64}$/u);
+    expect(updated.nativeSubscriptionAccountKey).not.toBe(original.nativeSubscriptionAccountKey);
+    const publicSchedule = (await owner.clients.scheduler.getSchedule({ scheduleId: replacedId })).schedule;
+    expect(publicSchedule?.execution?.model?.model).toMatchObject({ providerId, modelId });
+    expect(publicSchedule?.execution).not.toHaveProperty("nativeSubscriptionAccountKey");
+    await finishNativeSchedule(replacedId, initialDue + 180_000, "Explicitly authorized B", 2);
+
+    const unknownId = scheduleIdFrom(await mutate(scheduleInput("Original B with a lost receipt", initialDue + 240_000).request));
+    native.dropNextTurnClientId = true;
+    native.timeoutNextTurnStart = true;
+    offset = initialDue + 240_000 - realNow();
+    const unknown = await waitFor(() => histories(unknownId), result => result.history[0]?.state === RunState.DISPATCH_UNKNOWN, "unknown automatic dispatch");
+    expect(unknown.history).toHaveLength(1);
+    expect((await owner.clients.scheduler.getSchedule({ scheduleId: unknownId })).schedule?.nextTriggerAt).toBeUndefined();
+    expect(dispatches()).toHaveLength(3);
+  } finally {
+    clock.mockRestore();
+    await fixture?.close();
+    await host.shutdown();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 it.each(["progress", "no progress", "before dispatch", "unknown dispatch"] as const)("uses the original Codex outcome on manual Retry: %s", async (failure) => {
   const backendId = "codex-manual-retry";

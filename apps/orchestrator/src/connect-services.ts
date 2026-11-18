@@ -331,6 +331,7 @@ import {
 } from "./session-host.js";
 import type { ScheduleCoordinator } from "./schedule-coordinator.js";
 import {
+  boundOneShotScheduleProvider,
   defaultScheduleExtensionSnapshot,
   scheduleExtensionSnapshot,
   scheduleWorktreeConfiguration,
@@ -18892,6 +18893,7 @@ async function dispatchMutation(
       const id = stableId("schedule", operationId);
       const candidate = scheduleInput(id, payload.value.schedule, (dependencies.now ?? Date.now)());
       await validateScheduleWorkspaceEligibility(dependencies, candidate);
+      const account = boundOneShotScheduleProvider(candidate) === undefined ? undefined : await dependencies.sessionHost.captureScheduleSubscription(candidate);
       const execution = await host.mutate({
         operationId,
         connection,
@@ -18899,7 +18901,10 @@ async function dispatchMutation(
         body: mutation,
         commit: (store) => {
           assertScriptScheduleWorkspace(store, candidate);
-          store.upsertSchedule(candidate);
+          account?.assertCurrent();
+          store.upsertSchedule(account === undefined ? candidate : {
+            ...candidate, executionSnapshot: { ...asRecord(candidate.executionSnapshot), nativeSubscriptionAccountKey: account.accountKey }
+          });
           return { accepted: true, resultCase: "schedule", entityId: id } satisfies OperationOutcome;
         }
       });
@@ -18924,6 +18929,8 @@ async function dispatchMutation(
           throw invalidArgument("Project Schedules cannot move to another Target.");
         }
       }
+      const account = input.execution?.model?.model === undefined || boundOneShotScheduleProvider(candidate) === undefined
+        ? undefined : await dependencies.sessionHost.captureScheduleSubscription(candidate);
       const commit = () => host.mutate({
         operationId,
         connection,
@@ -18931,8 +18938,10 @@ async function dispatchMutation(
         body: mutation,
         commit: (store) => {
           assertScriptScheduleWorkspace(store, candidate);
+          account?.assertCurrent();
           store.upsertSchedule({
             ...candidate,
+            ...(account === undefined ? {} : { executionSnapshot: { ...asRecord(candidate.executionSnapshot), nativeSubscriptionAccountKey: account.accountKey } }),
             expectedRevision: existing.revision
           });
           return { accepted: true, resultCase: "schedule", entityId: existing.id } satisfies OperationOutcome;

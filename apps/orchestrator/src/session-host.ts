@@ -39,6 +39,7 @@ import type {
   AcceptedNativeTurnOutcome,
   NativeSessionState,
   NativeSessionStart,
+  NativeSubscriptionAuthority,
   MessageAutomationOrigin,
   MessageBlock,
   MessageInputDelivery,
@@ -106,6 +107,7 @@ import type { PendingRuntimeHandoff, RuntimeHandoffSource } from "@joko/store";
 import type { ImportProbeAction } from "@joko/agent-import";
 import { assertPersonalDevelopmentInput, PERSONAL_DEVELOPMENT_PURPOSE_KEY, readPersonalDevelopmentPurpose } from "./personal-development-purpose.js";
 import { buildSessionHandoffText, sessionHandoffMessages } from "./session-handoff-text.js";
+import { boundOneShotScheduleProvider, scheduleNativeSubscriptionKey } from "./schedule-extensions.js";
 import type { ProviderGroupRuntime } from "./provider-group-runtime.js";
 import type { ProviderGroupSessionPort, ProviderGroupRecoveryLease, ProviderGroupRecoveryHandoff } from "./provider-group-service.js";
 import type { ProviderGroupAssignment } from "./provider-group-router.js";
@@ -3766,6 +3768,24 @@ export class SessionHost {
       if (input.deferDispatch !== true) void this.drain(input.sessionId);
     }
     return execution;
+  }
+
+  async captureScheduleSubscription(
+    schedule: Pick<ScheduleRecord, "backendId" | "targetId" | "kind" | "sessionMode" | "sessionId" | "executionSnapshot">,
+    signal?: AbortSignal
+  ): Promise<NativeSubscriptionAuthority | undefined> {
+    const providerId = boundOneShotScheduleProvider(schedule);
+    if (providerId === undefined || this.#store.getTarget(schedule.targetId).descriptor.remoteWorkspace !== undefined) return undefined;
+    const adapter = this.#adapters.get(schedule.backendId);
+    const authority = await adapter?.captureNativeSubscriptionAuthority?.(providerId, signal).catch(() => { throw scheduledSubscriptionChanged(); });
+    if (authority === undefined) return undefined;
+    const assertCurrent = () => {
+      if (this.#adapters.get(schedule.backendId) !== adapter) throw scheduledSubscriptionChanged();
+      this.assertProviderAuthenticationAvailable(schedule.backendId, providerId);
+      authority.assertCurrent();
+    };
+    assertCurrent();
+    return { accountKey: authority.accountKey, assertCurrent };
   }
 
   enqueueScheduledInput(input: {
@@ -15298,10 +15318,20 @@ export class SessionHost {
             this.#providerGroups?.service.turnStarted(sessionId);
               this.#providerGroups?.reporter.leasesChanged();
           }
+          const scheduleAdmission = run.descriptor.source === "schedule" ? this.#store.findOperation(item.operationId) : undefined;
+          const scheduleAccountKey = scheduleAdmission?.kind === "schedule_dispatch" && isRecord(scheduleAdmission.body)
+            ? scheduleNativeSubscriptionKey(scheduleAdmission.body["executionSnapshot"]) : undefined;
           const send = () => {
             telegramHistory?.assertCurrent();
             if (!reviewReadOnly && sending.adapter.sendWithDurableNativeDispatchFence !== undefined) {
-              return sending.adapter.sendWithDurableNativeDispatchFence(dispatchBody, sendContext, (preparation) => {
+              return sending.adapter.sendWithDurableNativeDispatchFence(dispatchBody, sendContext, async (preparation) => {
+                if (scheduleAccountKey !== undefined) {
+                  const providerId = item.executionOverrides?.providerId;
+                  const authority = providerId === undefined ? undefined : await sending.adapter.captureNativeSubscriptionAuthority?.(providerId, sendContext.signal)
+                    .catch(() => undefined);
+                  if (authority?.accountKey !== scheduleAccountKey) throw scheduledSubscriptionChanged();
+                  authority.assertCurrent();
+                }
                 telegramHistory?.assertCurrent();
                 this.assertDispatchAdmissionOwner(
                   item,
@@ -15325,6 +15355,7 @@ export class SessionHost {
                 );
               });
             }
+            if (scheduleAccountKey !== undefined) throw scheduledSubscriptionChanged();
             return sending.adapter.send(dispatchBody, sendContext);
           };
           if (telegramHistory === undefined) await send();
@@ -20764,6 +20795,11 @@ function providerAuthenticationRequiredFailure(): PublicError {
 
 function providerAuthenticationRequiredError(): JokoError {
   return new JokoError(providerAuthenticationRequiredFailure());
+}
+
+function scheduledSubscriptionChanged(): JokoError {
+  return new JokoError({ code: "SCHEDULE_ACCOUNT_CHANGED", message: "The original Schedule subscription account is unavailable or has changed.",
+    phase: "schedule", retryable: false, stateMayHaveChanged: false, recovery: "Open the Schedule and save it with the intended account." });
 }
 
 function backendAuthenticationRequiredFailure(backend: BackendDescriptor): PublicError {

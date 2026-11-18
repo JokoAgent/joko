@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import { manualScheduleDispatchOperationId, scheduleRunIdFromDigest } from "@joko/contracts";
-import { redactSecrets, type PermissionMode, type SessionDescriptor } from "@joko/core";
+import { redactSecrets, type NativeSubscriptionAuthority, type PermissionMode, type SessionDescriptor } from "@joko/core";
 import type {
   OperationalStore,
   ScheduleDeletionCleanupRecord,
@@ -11,7 +11,9 @@ import type {
 } from "@joko/store";
 
 import {
+  boundOneShotScheduleProvider,
   scheduleExtensionSnapshot,
+  scheduleNativeSubscriptionKey,
   scheduleWorktreeConfiguration,
   type ScheduleWorktreeConfiguration
 } from "./schedule-extensions.js";
@@ -632,6 +634,28 @@ export class ScheduleCoordinator {
       return { runId, status: "skipped" };
     }
 
+    let subscription: NativeSubscriptionAuthority | undefined;
+    if (boundOneShotScheduleProvider(schedule) !== undefined) {
+      let accountMatches = false;
+      try {
+        const savedKey = scheduleNativeSubscriptionKey(schedule.executionSnapshot);
+        subscription = await this.#host.captureScheduleSubscription(schedule, signal);
+        subscription?.assertCurrent();
+        accountMatches = subscription?.accountKey === savedKey;
+      } catch { /* The account must still be provable before this occurrence starts. */ }
+      if (this.#recovery.wasForceReleased(runId)) return { runId, status: "failed" };
+      if (signal.aborted || this.#deletionFences.has(schedule.id) || options.canDispatch?.() === false
+        || this.#store.findSchedule(schedule.id)?.revision !== schedule.revision) return { runId, status: "aborted" };
+      if (!accountMatches) {
+        this.recordPreSessionOutcome({ schedule, operationId, runId, scheduledAt,
+          ...(nextRunAt === undefined ? {} : { nextRunAt }), status: "failed", detail: {
+            reason: "The original Schedule subscription account is unavailable or has changed. Open the Schedule and save it with the intended account.",
+            costAttribution: "zero"
+          } });
+        return { runId, status: "failed" };
+      }
+    }
+
     if (extension.executionMode === "script" && this.#store.getTarget(schedule.targetId).descriptor.remoteWorkspace !== undefined) {
       this.recordPreSessionOutcome({ schedule, operationId, runId, scheduledAt,
         ...(nextRunAt === undefined ? {} : { nextRunAt }), status: "failed",
@@ -644,6 +668,7 @@ export class ScheduleCoordinator {
         && (session.descriptor.archived || session.descriptor.worktree?.state === "preserved")) {
         await this.#host.restoreScheduledTarget({ sessionId: session.descriptor.id, operationId: `${operationId}-restore`, assertCurrent: () => {
           signal.throwIfAborted();
+          subscription?.assertCurrent();
           const current = this.#store.findSchedule(schedule.id);
           if (!current || current.revision !== schedule.revision || current.sessionId !== session.descriptor.id
             || this.#deletionFences.has(schedule.id) || this.#recovery.wasForceReleased(runId) || options.canDispatch?.() === false) {
@@ -654,7 +679,7 @@ export class ScheduleCoordinator {
     }
     const preRunRevision = schedule.revision;
     this.#recovery.transition(runId, "running", { executionMode: extension.executionMode });
-    const preRun = await this.evaluatePreRunHook(schedule, runId, scheduledAt, extension.preRunHook, signal);
+    const preRun = await this.evaluatePreRunHook(schedule, runId, scheduledAt, extension.preRunHook, signal, subscription?.assertCurrent);
     if (this.#recovery.wasForceReleased(runId)) return { runId, status: "failed" };
     if (preRun !== undefined) {
       const current = this.#store.findSchedule(schedule.id);
@@ -783,7 +808,8 @@ export class ScheduleCoordinator {
     runId: string,
     scheduledAt: number,
     hook: ReturnType<typeof scheduleExtensionSnapshot>["preRunHook"],
-    signal: AbortSignal
+    signal: AbortSignal,
+    assertAccountCurrent?: () => void
   ): Promise<{ readonly result: SchedulePreRunHookResult; readonly detail: Readonly<Record<string, unknown>> } | undefined> {
     if (hook === undefined) return undefined;
     const capturedTarget = this.#store.getTarget(schedule.targetId);
@@ -793,6 +819,7 @@ export class ScheduleCoordinator {
       ? this.#host.scheduledExecutionTarget(schedule.sessionId!) : capturedTarget.descriptor;
     const assertCurrent = () => {
       signal.throwIfAborted();
+      assertAccountCurrent?.();
       if (schedule.sessionMode === "bound" || schedule.sessionMode === "persistent" && schedule.sessionId !== undefined
         && this.#store.findSession(schedule.sessionId)?.descriptor.deletedAt === undefined) this.requireUsableSession(schedule, schedule.sessionId);
       const current = this.#store.getTarget(schedule.targetId);
