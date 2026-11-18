@@ -6,13 +6,13 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { create } from "@bufbuild/protobuf";
 import { capabilityNames, CreateTargetMutationSchema, OperationMutationSchema, TargetWorkspaceInputSchema,
-  WorkspaceKind, WorktreeEligibility } from "@joko/contracts";
+  OperationState, RunState, WorkspaceKind, WorktreeEligibility } from "@joko/contracts";
 import { WorkspaceTextFileWriteError } from "@joko/orchestrator";
 import { _electron, type ElectronApplication, type Locator, type Page } from "playwright-core";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
-import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
+import { archiveMutation, createSessionMutation, deleteMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 import { createPackagedDesktopStartupEvidence, readLaunchedWindowsDesktopProcess, type OwnedWindowsDesktopProcess } from "./packaged-desktop-startup.js";
 
 const packagedIt = process.platform === "win32" && process.env.JOKO_PACKAGED_DESKTOP_EXECUTABLE?.trim()
@@ -296,6 +296,49 @@ packagedIt("converges conversation settings across real application windows and 
   expect(activeFixture.adapter().sendCalls).toHaveLength(1);
   expect(pageErrors).toEqual([]);
   console.info("Packaged settings: reload and default restores verified.");
+
+  const openedTask = sessionIds[0]!;
+  const survivor = sessionIds[1]!;
+  const generation = BigInt(activeFixture.application.store.getSession(openedTask).descriptor.binding.generation);
+  const loadedMessage = "The other Owner will delete this already visible task.";
+  const runId = queueRunIdFrom(await submit(manager.clients.operation, manager.connectionId, sendInputMutation(openedTask, generation, loadedMessage)));
+  await waitFor(() => manager.clients.run.getRun({ runId }), receipt => receipt.run?.state === RunState.SUCCEEDED, "the deletion control message to finish");
+  // Use the user-facing task-window action after the independent settings windows
+  // have completed their checks. Keep this exact reader mounted during both mutations.
+  await first.close();
+  const previousWindows = new Set(application.windows());
+  await main.locator(`.sidebar [data-session-id="${openedTask}"]`).first().click({ button: "right" });
+  await main.getByRole("menuitem", { name: "Open in new window", exact: true }).click({ noWaitAfter: true });
+  const reader = await waitFor(async () => application.windows().find(page => !previousWindows.has(page)
+    && URL.canParse(page.url()) && new URL(page.url()).searchParams.get("bootSession") === openedTask),
+  page => page !== undefined, "the original task in a separate Desktop reader", 30_000);
+  if (reader === undefined) throw new Error("The owned reader window did not open the selected task.");
+  observe(reader);
+  const loadedTimeline = reader.locator(`.timeline[data-timeline-session-id="${openedTask}"]`);
+  await loadedTimeline.getByText(loadedMessage, { exact: true }).waitFor({ state: "visible" });
+  const cachedTasks = () => reader.evaluate(async () => {
+    const open = indexedDB.open("joko-ui");
+    const database = await new Promise<IDBDatabase>((resolveDatabase, reject) => {
+      open.onsuccess = () => resolveDatabase(open.result);
+      open.onerror = () => reject(open.error);
+    });
+    try {
+      const request = database.transaction("machine-caches", "readonly").objectStore("machine-caches").getAll();
+      return await new Promise<{ id: string; archived: boolean }[]>((resolveTasks, reject) => {
+        request.onsuccess = () => resolveTasks(request.result.flatMap(cache => cache.sessions));
+        request.onerror = () => reject(request.error);
+      });
+    } finally { database.close(); }
+  });
+  expect((await submit(manager.clients.operation, manager.connectionId, archiveMutation(openedTask, true))).state).toBe(OperationState.SUCCEEDED);
+  await waitFor(cachedTasks, tasks => tasks.some(task => task.id === openedTask && task.archived), "the remote archive to enter the machine cache");
+  expect(await loadedTimeline.getByText(loadedMessage, { exact: true }).isVisible()).toBe(true);
+  expect((await submit(manager.clients.operation, manager.connectionId, deleteMutation(openedTask))).state).toBe(OperationState.SUCCEEDED);
+  await loadedTimeline.waitFor({ state: "detached" });
+  await waitFor(() => reader.evaluate(() => location.hash), hash => !hash.includes(openedTask), "the other Owner's task window to leave the deleted task");
+  await waitFor(cachedTasks, tasks => tasks.some(task => task.id === survivor) && !tasks.some(task => task.id === openedTask),
+    "the shared machine cache to remove only the deleted task");
+  expect(pageErrors).toEqual([]);
   await closeDesktop();
 });
 

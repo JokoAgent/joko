@@ -316,7 +316,7 @@ import {
   toProtoWorkspace,
   toProtoWorkspaceLocation
 } from "./proto-mapper.js";
-import { ProtoMappingError } from "./proto-mapper.js";
+import { ProtoMappingError, type EventMappingContext } from "./proto-mapper.js";
 import { TIMED_EXTENSION_INTERACTION_EXPIRED_REASON } from "./interaction-expiry.js";
 import { BROWSER_TOOLS } from "./browser-tool-bridge.js";
 import type { OperationalBrowserState, RecoverableBrowserPageRecord } from "./operational-browser-state.js";
@@ -1997,6 +1997,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     },
     streamEvents: async function* (request, context) {
       const authenticated = authenticate(context);
+      const ownerCatalog = request.scope?.kind.case === undefined || request.scope.kind.case === "owner";
       const queue = new AsyncEventQueue(context.signal);
       const stopRevocation = dependencies.connections.onRevoked(authenticated.id, () => queue.close());
       const unsubscribe = dependencies.store.subscribe((item) => { queue.push(item); });
@@ -2015,7 +2016,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
             advanced = true;
             if (eventMatchesScope(item, request.scope, dependencies)) {
               dependencies.connections.fence(authenticated);
-              yield { event: eventWithServiceCursor(item, dependencies, generation) };
+              yield { event: eventWithServiceCursor(item, dependencies, generation, ownerCatalog) };
             }
           }
           if (!advanced) {
@@ -2036,7 +2037,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
           observed = item.globalCursor;
           if (!eventMatchesScope(item, request.scope, dependencies)) continue;
           dependencies.connections.fence(authenticated);
-          yield { event: eventWithServiceCursor(item, dependencies, generation) };
+          yield { event: eventWithServiceCursor(item, dependencies, generation, ownerCatalog) };
         }
       } finally {
         unsubscribe();
@@ -7880,10 +7881,21 @@ function validateStreamCursor(cursor: contract.EventCursor, generation: bigint, 
   return decoded.sequence;
 }
 
-export function eventWithServiceCursor(item: PersistedEvent, dependencies: ConnectServiceDependencies, generation: bigint): contract.Event {
-  const mapped = toProtoEvent(item, eventContext(item, dependencies));
+export function eventWithServiceCursor(item: PersistedEvent, dependencies: ConnectServiceDependencies, generation: bigint,
+  ownerCatalog = false): contract.Event {
+  const context = eventContext(item, dependencies);
+  const mapped = toProtoEvent(item, context);
+  const deleted = ownerCatalog && item.payload.type === "session_changed" && context.session?.descriptor.deletedAt !== undefined
+    ? context.session : undefined;
   return create(contract.EventSchema, {
     ...mapped,
+    ...(deleted === undefined ? {} : { payload: create(contract.EventPayloadSchema, { kind: {
+      case: "projectionInvalidated", value: create(contract.ProjectionInvalidatedEventSchema, {
+        reason: contract.SnapshotInvalidationReason.PROJECTION_REBUILT,
+        scope: "owner",
+        minimumRevision: toProtoRevision(deleted.revision)
+      })
+    } }) }),
     cursor: toProtoEventCursor(item.globalCursor, generation, item.emittedAt)
   });
 }
@@ -7891,7 +7903,7 @@ export function eventWithServiceCursor(item: PersistedEvent, dependencies: Conne
 function eventContext(
   item: PersistedEvent,
   dependencies: ConnectServiceDependencies
-): Parameters<typeof toProtoEvent>[1] {
+): EventMappingContext {
   if (item.payload.type === "device_changed") return {};
   const store = dependencies.store;
   let session: StoredSession | undefined;
