@@ -3323,16 +3323,19 @@ export class SessionHost {
     }
     if (source.backendAcceptedAt === undefined) return source.body;
 
-    const origin = this.#store.findVisibleSessionMessageOrigin({ sessionId: run.sessionId, role: "user", includeRetainedContext: false });
-    const user = origin === undefined ? undefined : this.#store.findEvent(origin.eventId);
     const session = stored.descriptor;
-    if (user?.runId !== run.id || user.operationId !== source.operationId || user.backendId !== session.backendId
-      || user.targetId !== session.targetId || user.generation !== session.binding.generation
+    if (this.#store.findLatestRunForSessionGeneration(session.id, session.binding.generation)?.descriptor.id !== run.id
       || this.#store.listQueueItems({ sessionId: session.id, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 1 }).length > 0) {
       throw new StoreError("The original Codex input is no longer the current turn. Inspect the task before retrying.");
     }
     if (!contextRecoveryEvidence(this.#store, session.id, run.id).hasAssistantOrToolEffects) return source.body;
 
+    const origin = this.#store.findVisibleSessionMessageOrigin({ sessionId: session.id, role: "user", includeRetainedContext: false });
+    const user = origin === undefined ? undefined : this.#store.findEvent(origin.eventId);
+    if (user?.runId !== run.id || user.operationId !== source.operationId || user.backendId !== session.backendId
+      || user.targetId !== session.targetId || user.generation !== session.binding.generation) {
+      throw new StoreError("The original Codex input no longer has a visible message boundary. Inspect the task before retrying.");
+    }
     return { text: CONTINUE_INTERRUPTED_RUN, images: [], files: [], mentions: [], disposition: "prompt" };
   }
 

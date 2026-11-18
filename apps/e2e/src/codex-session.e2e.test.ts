@@ -195,8 +195,15 @@ it.each(["progress", "no progress", "before dispatch", "unknown dispatch"] as co
       await transport.emitNotification("turn/completed", { threadId, turn });
     }
     await waitFor(() => clients.run.getRun({ runId: sourceRunId }), response => response.run?.state === RunState.FAILED, "terminal retryable Codex failure");
-    expect(store.findQueueItemByRunId(sessionId, sourceRunId)?.backendAcceptedAt !== undefined).toBe(accepted);
+    const sourceQueue = store.findQueueItemByRunId(sessionId, sourceRunId);
+    expect(sourceQueue?.backendAcceptedAt !== undefined).toBe(accepted);
     expect(turnWrites()).toHaveLength(accepted ? 1 : 0);
+    if (failure === "no progress") {
+      expect(store.findLatestRunForSessionGeneration(sessionId, binding.generation)?.descriptor.id).toBe(sourceRunId);
+      const origin = store.findVisibleSessionMessageOrigin({ sessionId, role: "user", includeRetainedContext: false });
+      const ownedInput = origin === undefined ? undefined : store.findEvent(origin.eventId);
+      expect(ownedInput?.runId === sourceRunId && ownedInput.operationId === sourceQueue?.operationId).toBe(false);
+    }
 
     if (failure === "progress") {
       expect(store.findLatestAssistantReplyForRuns(sessionId, [sourceRunId])?.payload).toMatchObject({ type: "message_complete", role: "assistant",
