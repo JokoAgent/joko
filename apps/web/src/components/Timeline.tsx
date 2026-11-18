@@ -291,7 +291,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
   readonly onOpenTurnReview?: (changeSetId: string, relativePath?: string) => void;
   readonly onReobserveReview?: (reviewRunId: string) => Promise<void>;
   readonly onAddMessageToComposer?: (item: TimelineItemView) => void;
-  readonly onAddSelectionToComposer?: (quote: ComposerSelectionQuoteDraft) => void;
+  readonly onAddSelectionToComposer?: (quotes: readonly ComposerSelectionQuoteDraft[]) => void;
   readonly onAskSideChat?: (quote: ComposerSelectionQuoteDraft) => void;
   readonly onForkMessage?: (item: TimelineItemView) => void;
   readonly forkingMessageId?: string;
@@ -1532,7 +1532,10 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
       </div>
       {messageNavRailEnabled && <MessageNavRail entries={messageNavEntries} scrollRef={scrollRef} contentRef={contentRef} bottomOffset={bottomInset} resetKey={JSON.stringify([ownerKey, viewportOwnerKey])} estimateEntryTop={estimateMessageNavEntryTop} onWheelIntent={handleTimelineWheelIntent} onCoverageChange={setMessageNavRailCoversNavigation} onJump={jumpToMessageNavEntry} t={t} />}
       {previousMessageEntry !== undefined && !messageNavRailCoversNavigation && <PrevMessageJumpChip preview={previousMessageEntry.preview} label={t("timeline.jumpPreviousQuestion", { preview: previousMessageEntry.preview })} onClick={jumpToPreviousMessage} />}
-      {onAddSelectionToComposer !== undefined && shareSelection === undefined && <SelectionQuoteButton key={sessionId} sessionId={sessionId} containerRef={scrollRef} label={t("timeline.addToChat")} onCommit={onAddSelectionToComposer} onAskSideChat={onAskSideChat} sideChatLabel={t("session.sideChat")} />}
+      {onAddSelectionToComposer !== undefined && shareSelection === undefined && <SelectionQuoteButton key={sessionId} sessionId={sessionId} containerRef={scrollRef} label={t("timeline.addToChat")}
+        onCommit={(quote) => onAddSelectionToComposer([quote])}
+        onCommitMessageRange={partnerConversation === undefined || partnerConversation.kind === "task" ? onAddSelectionToComposer : undefined}
+        onAskSideChat={onAskSideChat} sideChatLabel={t("session.sideChat")} />}
       {!following && (
         <Button className="jump-latest" tone="secondary" aria-label={unreadCount > 0 ? `${t("timeline.jumpLatest")} (${unreadCount})` : t("timeline.jumpLatest")} onClick={() => { cancelTimelineNavigation(); setFocusedItemId(undefined); restoreAnchorRef.current = undefined; setTimelineFollowing(true); pinToLatest(timelineJumpBehavior(reducedMotion)); }}>
           <ChevronDown aria-hidden="true" />{t("timeline.jumpLatest")}{unreadCount > 0 && <span className="jump-latest__count">{unreadCount}</span>}
@@ -1814,6 +1817,8 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
     : quoted.excerpt : '';
   const roleLabel = role === "user" ? item.sharedTaskAuthor?.displayName || t("timeline.you") : partner?.displayName ?? t("timeline.agent");
   const selectionActive = shareSelection !== undefined;
+  const quoteBody = !searchOnly && !item.streaming && !item.samplingInterrupted && item.sourceEventId !== undefined
+    && item.partnerPrivateOrigin === undefined ? "" : undefined;
   const shareable = item.streaming !== true && (displayText.trim().length > 0 || (item.attachments?.length ?? 0) > 0);
   const shareSelected = selectionActive && shareSelection.selectedIds.has(item.id);
   const selectionControl = selectionActive && shareable && onToggleShareMessage !== undefined
@@ -1868,7 +1873,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
             <strong>{quoted.role === 'assistant' ? partner?.displayName : locale === 'zh-CN' ? '你' : 'You'}</strong><span>{quoteText || (locale === 'zh-CN' ? '仅附件消息' : 'Attachment-only message')}</span>
           </button>}
           {quotedUserMessage.segments.length > 0 && (
-            <div className="message-user__bubble message-user__bubble--quoted">
+            <div className="message-user__bubble message-user__bubble--quoted" data-selection-quote-body={quoteBody}>
               <CollapsibleUserMessageContent measureText={userMeasureText} automation={item.automationOrigin !== undefined} t={t}>
                 {userMessageSegments}
               </CollapsibleUserMessageContent>
@@ -1885,7 +1890,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
     {item.modelSubstitution && <p className="muted" role="note">{t("timeline.modelSubstitution", {
       selected: item.modelSubstitution.selectedModelId, actual: item.modelSubstitution.actualModelId
     })}</p>}
-    <div className="markdown message-assistant__body"><StreamingMarkdown text={displayText} streaming={item.streaming === true} streamFadeKey={`${sessionId}:${item.id}`} t={t} />{item.streaming && <span className={cx("streaming-cursor", reducedMotion && "streaming-cursor--reduced-motion")} aria-label={t("timeline.streaming")} />}</div>
+    <div className="markdown message-assistant__body" data-selection-quote-body={quoteBody}><StreamingMarkdown text={displayText} streaming={item.streaming === true} streamFadeKey={`${sessionId}:${item.id}`} t={t} />{item.streaming && <span className={cx("streaming-cursor", reducedMotion && "streaming-cursor--reduced-motion")} aria-label={t("timeline.streaming")} />}</div>
     {item.samplingInterrupted && <p className="message-assistant__sampling-interrupted muted" role="note">{t("timeline.samplingInterrupted")}</p>}
     {attachments}
     {partnerConversation?.confirmed && partner !== undefined && !item.streaming && displayText.trim()

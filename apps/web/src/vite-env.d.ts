@@ -496,6 +496,8 @@ interface JokoDesktopApi {
     get(): Promise<JokoDesktopAppInfo>;
   };
   readonly window: {
+    readonly startupTheme?: "dark" | "light" | "system";
+    readonly mirrorTheme?: (theme: "dark" | "light" | "system") => Promise<void>;
     minimize(): Promise<void>;
     toggleMaximize(): Promise<boolean>;
     toggleFullscreen(): Promise<boolean>;
@@ -660,6 +662,11 @@ interface JokoDesktopApi {
   readonly nativeGamepad?: import("./native-gamepad.js").NativeGamepadBridge;
   chooseFiles(): Promise<readonly JokoDesktopFile[]>;
   choosePortableSessionFile(): Promise<JokoDesktopFile | undefined>;
+  readonly portableSessionSave: {
+    choose(requestId: string, title: string): Promise<boolean>;
+    commit(requestId: string, bytes: Uint8Array): Promise<boolean>;
+    cancel(requestId: string): Promise<void>;
+  };
   readonly deepLinks: {
     takePending(): Promise<JokoDesktopDeepLinkDelivery | undefined>;
     acknowledge(acknowledgement: JokoDesktopDeepLinkAcknowledgement): Promise<boolean>;

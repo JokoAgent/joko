@@ -129,6 +129,7 @@ export function SelectionQuoteButton({
   getQuoteMetadata,
   label,
   onCommit,
+  onCommitMessageRange,
   onAskSideChat,
   sideChatLabel
 }: {
@@ -139,6 +140,7 @@ export function SelectionQuoteButton({
   readonly getQuoteMetadata?: () => SelectionQuoteFileMetadata | null;
   readonly label: string;
   readonly onCommit: (quote: ComposerSelectionQuoteDraft) => void;
+  readonly onCommitMessageRange?: (quotes: readonly ComposerSelectionQuoteDraft[]) => void;
   readonly onAskSideChat?: (quote: ComposerSelectionQuoteDraft) => void;
   readonly sideChatLabel?: string;
 }): JSX.Element | null {
@@ -194,7 +196,17 @@ export function SelectionQuoteButton({
     ownerWindow.addEventListener("resize", hide);
     const nativeSelectionContextMenu = ownerWindow.jokoDesktop?.selectionContextMenu
       ?? ownerWindow.jokoInspectorDesktop?.selectionContextMenu;
-    const unsubscribeContextMenu = nativeSelectionContextMenu?.onAddToChat(() => commit(onCommit, true));
+    const unsubscribeContextMenu = nativeSelectionContextMenu?.onAddToChat(() => {
+      const selection = ownerWindow.getSelection();
+      const quotes = onCommitMessageRange === undefined ? undefined : readOrdinaryMessageRange(sessionId, container, selection);
+      if (quotes === undefined || onCommitMessageRange === undefined) {
+        commit(onCommit, true);
+        return;
+      }
+      onCommitMessageRange(quotes);
+      selection?.removeAllRanges();
+      setAnchor(undefined);
+    });
     return () => {
       cancelPointerSample();
       ownerDocument.removeEventListener("mouseup", onMouseUp);
@@ -205,7 +217,7 @@ export function SelectionQuoteButton({
       if (!suppliedContextAttribute) container.removeAttribute("data-selection-quote-context");
       if (!suppliedJokoContextAttribute) container.removeAttribute("data-joko-selection-quote-context");
     };
-  }, [commit, containerRef, getQuoteMetadata, getQuoteText, onCommit, sessionId, sourcePath]);
+  }, [commit, containerRef, getQuoteMetadata, getQuoteText, onCommit, onCommitMessageRange, sessionId, sourcePath]);
 
   const ownerDocument = containerRef.current?.ownerDocument;
   const ownerWindow = ownerDocument?.defaultView;
@@ -234,14 +246,70 @@ export function SelectionQuoteButton({
   );
 }
 
+function readOrdinaryMessageRange(
+  sessionId: string,
+  container: HTMLElement,
+  selection: Selection | null
+): readonly ComposerSelectionQuoteDraft[] | undefined {
+  if (!container.isConnected || selection === null || selection.isCollapsed || selection.rangeCount !== 1) return undefined;
+  const range = selection.getRangeAt(0);
+  const start = selectionNodeElement(range.startContainer)?.closest("[data-selection-quote-body]");
+  const end = selectionNodeElement(range.endContainer)?.closest("[data-selection-quote-body]");
+  if (!start || !end || start === end || start.closest("[data-selection-quote-context]") !== container
+    || end.closest("[data-selection-quote-context]") !== container) return undefined;
+  const firstRow = start.closest<HTMLElement>(".timeline__row");
+  const lastRow = end.closest<HTMLElement>(".timeline__row");
+  if (!firstRow || !lastRow || firstRow === lastRow || firstRow.parentElement !== lastRow.parentElement) return undefined;
+  const firstIndex = Number(firstRow.dataset.index), lastIndex = Number(lastRow.dataset.index);
+  if (!Number.isSafeInteger(firstIndex) || !Number.isSafeInteger(lastIndex) || firstIndex >= lastIndex) return undefined;
+
+  const quotes: ComposerMessageSelectionQuoteDraft[] = [];
+  let remaining = SELECTION_QUOTE_MAX_CHARS;
+  let clipped = false;
+  let row: Element | null = firstRow;
+  for (let index = firstIndex; index <= lastIndex; index += 1) {
+    if (row === null || !row.matches(`.timeline__row[data-index="${index}"]:not([data-timeline-search-only])`)
+      || (row === lastRow) !== (index === lastIndex)) return undefined;
+    const message = row.querySelector<HTMLElement>(":scope > article[data-selection-quote-message-id]");
+    const body = message?.querySelector("[data-selection-quote-body]");
+    const messageId = message?.dataset.selectionQuoteMessageId;
+    const sourceEventId = message?.dataset.selectionQuoteSourceEventId;
+    const role = message?.dataset.selectionQuoteRole;
+    if (!body || !messageId || !sourceEventId || (role !== "user" && role !== "assistant")
+      || (index === firstIndex && body !== start) || (index === lastIndex && body !== end)
+      || body.querySelector(".message-user__content.is-collapsed") !== null) return undefined;
+
+    const part = container.ownerDocument.createRange();
+    part.selectNodeContents(body);
+    if (index === firstIndex) part.setStart(range.startContainer, range.startOffset);
+    if (index === lastIndex) part.setEnd(range.endContainer, range.endOffset);
+    const text = boundedSelectionQuoteText(part.toString());
+    if (text !== undefined) {
+      if (remaining > 0) {
+        quotes.push({ kind: "message", id: randomUuid(), sessionId, role, messageId, sourceEventId, text: text.slice(0, remaining) });
+      }
+      clipped ||= text.length > remaining;
+      remaining = Math.max(0, remaining - text.length);
+    }
+    row = row.nextElementSibling;
+  }
+  const final = quotes.at(-1);
+  if (clipped && final !== undefined) quotes[quotes.length - 1] = { ...final, text: `${final.text}…` };
+  const normalized = normalizeSelectionQuoteDrafts(quotes);
+  return normalized.length > 0 && normalized.length === quotes.length ? normalized : undefined;
+}
+
 function isRenderedFileQuoteNode(node: Node): boolean {
   const element = node.nodeType === 1 ? node as Element : node.parentElement;
   return Boolean(element?.closest("[data-workspace-file-quote-rendered]"));
 }
 
 function selectionSourceElement(node: Node): HTMLElement | null {
-  const element = node.nodeType === 1 ? node as Element : node.parentElement;
-  return element?.closest("[data-selection-quote-message-id]") as HTMLElement | null;
+  return selectionNodeElement(node)?.closest<HTMLElement>("[data-selection-quote-message-id]") ?? null;
+}
+
+function selectionNodeElement(node: Node): Element | null {
+  return node.nodeType === 1 ? node as Element : node.parentElement;
 }
 
 function getFloatingAnchor(

@@ -6424,7 +6424,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   compact(sessionId: string, customInstructions?: string): Promise<CompactSessionOutcomeView>;
   exportSession(sessionId: string, context: ArtifactDownloadContext): Promise<ArtifactDownloadOutcome>;
   exportPortableSession(
-    sessionId: string,
+    session: Pick<SessionView, "id" | "name">,
     options: { readonly password?: string; readonly excludeMedia: boolean },
     context: ArtifactDownloadContext
   ): Promise<PortableSessionExportOutcomeView>;

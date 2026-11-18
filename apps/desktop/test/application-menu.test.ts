@@ -258,6 +258,23 @@ describe("macOS application menu", () => {
     expect(state.acceptCommand("open-settings")).toEqual(["open-settings"]);
   });
 
+  it("holds commands throughout primary recovery while an auxiliary renderer configures and records keys", () => {
+    const accelerators = { newSessionAccelerator: "Command+N", openSettingsAccelerator: "Command+,", toggleSidebarAccelerator: "Command+B" };
+    const state = createMacApplicationMenuConfigurationState({ ...accelerators, shortcutRecording: false });
+    expect(state.apply(accelerators, "primary").commands).toEqual([]);
+    expect(state.resetForRendererLoad()).toBe(true);
+    expect(state.acceptCommand("new-session")).toEqual([]);
+    const stale = { ...accelerators, newSessionAccelerator: "Shift+Command+N" };
+    expect(state.apply(stale, "auxiliary")).toEqual({ menuChanged: false, commands: [] });
+    expect(state.snapshot()).toEqual({ ready: false, configuration: { ...accelerators, shortcutRecording: false } });
+    expect(state.apply({ ...stale, shortcutRecording: true }, "auxiliary")).toEqual({ menuChanged: true, commands: [] });
+    expect(state.acceptCommand("open-settings")).toEqual([]);
+    expect(state.apply(accelerators, "primary").commands).toEqual(["new-session", "open-settings"]);
+    expect(state.snapshot()).toEqual({ ready: true, configuration: { ...accelerators, shortcutRecording: true } });
+    expect(state.apply({ shortcutRecording: false }, "auxiliary")).toEqual({ menuChanged: true, commands: [] });
+    expect(state.acceptCommand("toggle-sidebar")).toEqual(["toggle-sidebar"]);
+  });
+
   it("explicitly removes Electron's application menu on non-macOS hosts", () => {
     const buildFromTemplate = vi.fn(() => ({ native: true }));
     const setApplicationMenu = vi.fn();

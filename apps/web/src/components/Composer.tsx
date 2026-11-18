@@ -136,7 +136,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   readonly controls?: ReactNode;
   readonly runningStatus?: ReactNode;
   readonly messageMentionInsertion?: { readonly id: number; readonly sessionId: string; readonly mention: ComposerMessageMentionDraft };
-  readonly selectionQuoteInsertion?: { readonly id: number; readonly sessionId: string; readonly quote: ComposerSelectionQuoteDraft };
+  readonly selectionQuoteInsertion?: { readonly id: number; readonly sessionId: string; readonly quotes: readonly ComposerSelectionQuoteDraft[] };
   readonly attachmentInsertion?: { readonly id: number; readonly sessionId: string; readonly file: File };
   readonly rewindDraftRef?: RefObject<PrepareRewindDraft | null>;
   readonly rewindDraftContinuation?: RewindDraftContinuation;
@@ -851,14 +851,14 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
       || appliedSelectionQuoteInsertionRef.current === selectionQuoteInsertion.id
     ) return;
     appliedSelectionQuoteInsertionRef.current = selectionQuoteInsertion.id;
-    const quote = normalizeSelectionQuoteDrafts([selectionQuoteInsertion.quote])[0];
-    if (quote === undefined) return;
+    const quotes = normalizeSelectionQuoteDrafts(selectionQuoteInsertion.quotes);
+    if (quotes.length === 0) return;
     markDraftEdited(session.id);
     editorRevisionRef.current += 1;
     resetHistoryNavigation();
     closePalette();
     setBashMode(false);
-    const next = appendQuoteToComposerDocument(editorDocument, quote);
+    const next = quotes.reduce(appendQuoteToComposerDocument, editorDocument);
     const nextText = composerDocumentPlainText(next);
     const nextRanges = remapComposerInlineMentionRanges(textRef.current, nextText, inlineMentionRangesRef.current);
     setEditorDocument(next);

@@ -251,6 +251,7 @@ import {
   createDesktopWindowInteractionSettingsStore,
   type DesktopWindowInteractionSettingsStore
 } from "./window-interaction-settings.js";
+import { desktopWindowBackground, isDesktopWindowTheme, openDesktopWindowAppearance } from "./window-appearance.js";
 import {
   createDesktopMainWindowCloseSettingsStore,
   parseMainWindowCloseSettingsChange,
@@ -399,6 +400,7 @@ import {
   readRegularFileSnapshot
 } from "@joko/device-peer/private-files";
 import { materializeDesktopDeepLinkNavigation } from "./portable-deep-link-materialization.js";
+import { isPortableSessionSaveRequestId, PortableSessionSave, portableSessionSaveName } from "./portable-session-save.js";
 import { DesktopTaskSharingInvitationBuffer } from "./task-sharing-invitation.js";
 import { verifyPackagedSmokeTaskSharing } from "./packaged-smoke-task-sharing.js";
 import {
@@ -944,6 +946,7 @@ let applicationMenuLocale: DesktopLocale = "en";
 let managedExtensionHostLocale: DesktopLocale | undefined;
 let managedExtensionHostLocaleSequence = 0n;
 let desktopRemoteDesktopDark: boolean | undefined;
+let desktopWindowAppearance: Awaited<ReturnType<typeof openDesktopWindowAppearance>> | undefined;
 const applicationMenuConfigurationState = createMacApplicationMenuConfigurationState({
   shortcutRecording: false,
   newSessionAccelerator: "Command+N",
@@ -1005,6 +1008,7 @@ let nativeFileOpener: NativeFileOpener | undefined;
 let nativeArtifactSourceRevealer: NativeArtifactSourceRevealer | undefined;
 let windowsOpenWithApps: WindowsOpenWithApps | undefined;
 const nativeFileActionScopes = new WeakMap<WebContents, NativeFileActionScope>();
+const portableSessionSave = new PortableSessionSave();
 type DesktopOpenWithDocumentOwnerForWindow = DesktopOpenWithDocumentOwner<WebContents>;
 const desktopOpenWithDocuments = new DesktopOpenWithDocumentAuthority<WebContents>(
   () => randomUUID(),
@@ -1229,6 +1233,9 @@ if (!app.requestSingleInstanceLock()) {
     initializeDesktopUpdateAutoSettings();
     initializeDesktopAttentionBadge();
     await initializeDesktopWindowInteractionSettings();
+    if (process.platform === "win32") {
+      desktopWindowAppearance = await openDesktopWindowAppearance(join(app.getPath("userData"), "window-appearance.txt"));
+    }
     desktopMainWindowCloseSettings = createDesktopMainWindowCloseSettingsStore(
       join(app.getPath("userData"), "main-window-close-settings.json"), process.platform
     );
@@ -1259,7 +1266,8 @@ if (!app.requestSingleInstanceLock()) {
     if (externalPackagedE2e && packagedSmokeResultPath !== undefined) {
       writeFileSync(`${packagedSmokeResultPath}.startup.json`, JSON.stringify({
         pid: process.pid, executablePath: process.execPath,
-        userDataPath: app.getPath("userData"), packaged: app.isPackaged
+        userDataPath: app.getPath("userData"), packaged: app.isPackaged,
+        backgroundColor: mainWindow?.getBackgroundColor()
       }), { flag: "wx", mode: 0o600 });
     }
     initializeDesktopDevicePeerAgentLifecycle();
@@ -1277,6 +1285,12 @@ if (!app.requestSingleInstanceLock()) {
       app.exit(1);
     }
   });
+}
+
+function ordinaryWindowStartupAppearance(): { readonly backgroundColor: string; readonly additionalArguments?: string[] } {
+  const theme = desktopWindowAppearance?.theme();
+  if (theme === undefined) return { backgroundColor: "#f2f2f2" };
+  return { backgroundColor: desktopWindowBackground(theme, nativeTheme.shouldUseDarkColors), additionalArguments: [`--joko-window-theme=${theme}`] };
 }
 
 function createWindow(): void {
@@ -1307,6 +1321,7 @@ function createWindow(): void {
   });
   managedMainWindowState = mainWindowState;
   managedInspectorWindowState = inspectorWindowState;
+  const appearance = ordinaryWindowStartupAppearance();
   const window = new BrowserWindow({
     x: mainWindowState.x,
     y: mainWindowState.y,
@@ -1314,7 +1329,7 @@ function createWindow(): void {
     height: mainWindowState.height,
     minWidth: 800,
     minHeight: 600,
-    backgroundColor: "#f2f2f2",
+    backgroundColor: appearance.backgroundColor,
     title: "Joko",
     autoHideMenuBar: true,
     show: false,
@@ -1324,6 +1339,7 @@ function createWindow(): void {
       // Sandboxed Electron preload scripts run in a restricted CommonJS
       // environment. TypeScript emits this `.cts` entry as preload.cjs.
       preload: join(sourceDirectory, "preload.cjs"),
+      ...(appearance.additionalArguments === undefined ? {} : { additionalArguments: appearance.additionalArguments }),
       contextIsolation: true,
       nodeIntegration: false,
       nodeIntegrationInWorker: false,
@@ -5617,6 +5633,7 @@ async function openSessionApplicationWindow(
     workArea: dropWorkArea,
     windowSize: initialBounds
   });
+  const appearance = ordinaryWindowStartupAppearance();
   const window = new BrowserWindow({
     x: dropBounds?.x ?? initialBounds.x,
     y: dropBounds?.y ?? initialBounds.y,
@@ -5624,7 +5641,7 @@ async function openSessionApplicationWindow(
     height: dropBounds?.height ?? initialBounds.height,
     minWidth: Math.min(800, dropBounds?.width ?? 800),
     minHeight: Math.min(600, dropBounds?.height ?? 600),
-    backgroundColor: "#f2f2f2",
+    backgroundColor: appearance.backgroundColor,
     title: "Joko",
     autoHideMenuBar: true,
     show: false,
@@ -5632,6 +5649,7 @@ async function openSessionApplicationWindow(
     ...frameOptions,
     webPreferences: {
       preload: join(sourceDirectory, "preload.cjs"),
+      ...(appearance.additionalArguments === undefined ? {} : { additionalArguments: appearance.additionalArguments }),
       contextIsolation: true,
       nodeIntegration: false,
       nodeIntegrationInWorker: false,
@@ -8686,9 +8704,10 @@ function registerIpc(): void {
     const recordingTransition = patch.shortcutRecording === undefined
       ? undefined
       : applicationMenuShortcutRecordingLeases.set(event.sender.id, patch.shortcutRecording);
+    const renderer = event.sender === mainWindow?.webContents ? "primary" : "auxiliary";
     const result = applicationMenuConfigurationState.apply(recordingTransition === undefined
       ? patch
-      : { ...patch, shortcutRecording: recordingTransition.active });
+      : { ...patch, shortcutRecording: recordingTransition.active }, renderer);
     if (result.menuChanged) installDesktopApplicationMenu();
     for (const command of result.commands) dispatchApplicationMenuCommand(command);
     if (recordingTransition !== undefined && !recordingTransition.wasActive && recordingTransition.active) {
@@ -9155,6 +9174,22 @@ function registerIpc(): void {
     const window = assertTrustedInspectorWindowSender(event);
     if (window.isMaximized()) window.unmaximize(); else window.maximize();
     return window.isMaximized();
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.windowMirrorTheme, async (event, theme: unknown) => {
+    const assertOwner = (): void => {
+      assertTrustedIpcSender(event);
+      if (quitting || event.sender !== mainWindow?.webContents && !sessionWindows.hasContents(event.sender)) {
+        throw new Error("Window appearance requires a current application window.");
+      }
+    };
+    assertOwner();
+    const appearance = desktopWindowAppearance;
+    if (!appearance || !isDesktopWindowTheme(theme)) throw new TypeError("Invalid Desktop window appearance.");
+    await appearance.save(theme, assertOwner);
+    const color = desktopWindowBackground(appearance.theme(), nativeTheme.shouldUseDarkColors);
+    for (const window of [mainWindow, ...sessionWindows.values()]) {
+      if (window && !window.isDestroyed()) window.setBackgroundColor(color);
+    }
   });
   ipcMain.handle(DESKTOP_CHANNELS.windowSetZoomFactor, (event, ...parameters: unknown[]) => {
     assertTrustedWindowControlSender(event);
@@ -9632,6 +9667,45 @@ function registerIpc(): void {
       mediaType: "application/vnd.joko.session",
       bytes: await readRegularFileSnapshot(path, MAXIMUM_NATIVE_FILE_BYTES)
     };
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.choosePortableSessionSave, async (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    const [requestId, title] = parameters;
+    if (parameters.length !== 2 || !isPortableSessionSaveRequestId(requestId) || typeof title !== "string") {
+      throw new TypeError("Portable task save selection requires a request identity and task title.");
+    }
+    const owner = trustedApplicationWindowForContents(event.sender);
+    if (owner === undefined) throw new Error("The portable task save window is no longer available.");
+    return portableSessionSave.choose(nativeFileActionScope(event), requestId, async () => {
+      const selection = await dialog.showSaveDialog(owner, {
+        defaultPath: portableSessionSaveName(title),
+        filters: [{ name: "Joko task package", extensions: ["jshare"] }]
+      });
+      return selection.canceled ? undefined : selection.filePath;
+    });
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.commitPortableSessionSave, async (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    const [requestId, bytes] = parameters;
+    if (parameters.length !== 2 || !isPortableSessionSaveRequestId(requestId) || !(bytes instanceof Uint8Array)
+      || bytes.byteLength === 0 || bytes.byteLength > MAXIMUM_NATIVE_FILE_BYTES) {
+      throw new TypeError("Portable task save requires a request identity and valid package bytes.");
+    }
+    const scope = nativeFileActionScopes.get(event.sender);
+    const owner = trustedApplicationWindowForContents(event.sender);
+    if (scope === undefined || owner === undefined) throw new Error("The portable task save window is no longer available.");
+    const receipt = await portableSessionSave.commit(scope, requestId, bytes, MAXIMUM_NATIVE_FILE_BYTES);
+    if (scope.isCurrent()) reportNativeSaveFinalization(owner, receipt);
+    return true;
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.cancelPortableSessionSave, (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    const [requestId] = parameters;
+    if (parameters.length !== 1 || !isPortableSessionSaveRequestId(requestId)) {
+      throw new TypeError("Portable task save cancellation requires a request identity.");
+    }
+    const scope = nativeFileActionScopes.get(event.sender);
+    if (scope !== undefined) portableSessionSave.cancel(scope, requestId);
   });
   ipcMain.handle(DESKTOP_CHANNELS.saveFile, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
@@ -11282,6 +11356,7 @@ function nativeFileActionScope(event: IpcMainInvokeEvent): NativeFileActionScope
     nativeFileClipboard?.retireScope(scope.id);
     nativeFileOpener?.retireScope(scope.id);
     nativeArtifactSourceRevealer?.retireScope(scope.id);
+    portableSessionSave.retire(scope);
     if (nativeFileActionScopes.get(contents) === scope) nativeFileActionScopes.delete(contents);
     contents.removeListener("did-start-navigation", navigate);
     contents.removeListener("destroyed", retire);

@@ -613,7 +613,8 @@ import {
 import { presentJokoServiceTerminology } from "./i18n/service-terminology.js";
 import { projectTimelineGeneratedFiles } from "./generated-files.js";
 import { emptySnapshot } from "./model.js";
-import { saveArtifactBlob } from "./artifact-download.js";
+import { downloadArtifactBlob, saveArtifactBlob } from "./artifact-download.js";
+import { assertBrowserActionCurrent } from "./browser-action.js";
 import {
   captureNativeArtifactSourceReveal,
   captureNativeFileCopy,
@@ -3546,19 +3547,43 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async exportPortableSession(
-    sessionId: string,
+    session: Pick<SessionView, "id" | "name">,
     options: { readonly password?: string; readonly excludeMedia: boolean },
     context: ArtifactDownloadContext
   ): Promise<PortableSessionExportOutcomeView> {
     const ownedContext = this.artifactDownloadContext(context);
+    assertBrowserActionCurrent(ownedContext);
     const client = createClient(PortableSessionService, this.requireTransport());
+    const desktop = typeof window === "undefined" ? undefined : window.jokoDesktop;
+    if (desktop !== undefined && window !== ownedContext.ownerDocument.defaultView) {
+      throw new GatewayError("The portable task save requires its originating application window.");
+    }
+    const save = desktop === undefined ? undefined : {
+      bridge: desktop.portableSessionSave,
+      requestId: window.crypto.randomUUID()
+    };
+    let saveSettled = false;
+    const cancelSave = (): void => {
+      if (save === undefined || saveSettled) return;
+      saveSettled = true;
+      void save.bridge.cancel(save.requestId).catch(() => undefined);
+    };
+    ownedContext.signal.addEventListener("abort", cancelSave, { once: true });
     try {
+      if (save !== undefined) {
+        const selected = await save.bridge.choose(save.requestId, session.name);
+        assertBrowserActionCurrent(ownedContext);
+        if (!selected) {
+          saveSettled = true;
+          return { status: "cancelled" };
+        }
+      }
       const response = await client.exportPortableSession({
-        sessionId,
+        sessionId: session.id,
         ...(options.password === undefined ? {} : { password: options.password }),
         excludeMedia: options.excludeMedia
       }, { signal: ownedContext.signal });
-      ownedContext.signal.throwIfAborted();
+      assertBrowserActionCurrent(ownedContext);
       const artifact = response.artifact;
       if (artifact === undefined || artifact.blobId.trim() === "") {
         throw new GatewayError("Orchestrator completed portable task export without an Artifact.");
@@ -3566,9 +3591,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       if (artifact.mediaType.split(";", 1)[0]?.trim().toLowerCase() !== "application/vnd.joko.session") {
         throw new GatewayError("Orchestrator returned an invalid portable task Artifact.");
       }
-      const saved = await this.downloadArtifact(artifact.blobId, artifact.fileName || "task.jshare", ownedContext);
-      return saved === "cancelled" ? { status: "cancelled" }
-        : { status: saved === "saved" ? "exported" : "dispatched", fidelity: mapPortableSessionFidelity(response.fidelity) };
+      const fidelity = mapPortableSessionFidelity(response.fidelity);
+      const blob = await this.fetchArtifact(artifact.blobId, ownedContext.signal);
+      assertBrowserActionCurrent(ownedContext);
+      if (save === undefined) {
+        downloadArtifactBlob(blob, artifact.fileName || "task.jshare", ownedContext);
+        return { status: "dispatched", fidelity };
+      }
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      assertBrowserActionCurrent(ownedContext);
+      const saved = await save.bridge.commit(save.requestId, bytes);
+      saveSettled = true;
+      assertBrowserActionCurrent(ownedContext);
+      return saved ? { status: "exported", fidelity } : { status: "cancelled" };
     } catch (error) {
       if (error instanceof ConnectError && error.code === Code.ResourceExhausted) {
         return {
@@ -3578,6 +3613,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         };
       }
       throw normalizeError(error);
+    } finally {
+      ownedContext.signal.removeEventListener("abort", cancelSave);
+      cancelSave();
     }
   }
 

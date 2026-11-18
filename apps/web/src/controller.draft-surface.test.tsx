@@ -88,6 +88,35 @@ it("routes every persisted draft and CAS operation through the exact native task
   expect(view.saveDraftIfRevision).toHaveBeenCalledWith("server", "profile", "session", DRAFT, 0, "task-window:1");
 });
 
+it("gives a navigated ordinary task its original window's independent draft slot", async () => {
+  const ordinary: SessionView = { id: "second", backendId: "native", targetId: "target", name: "Second task", state: "idle", generation: 1n,
+    pinned: false, archived: false, updatedAt: 1, permissionMode: "ask", fastMode: false, planMode: false };
+  const view = await mount([ordinary]);
+  await expect(view.current().readDraft("second")).rejects.toThrow("owner is invalid");
+  await act(async () => { await view.current().navigate({ kind: "session", sessionId: "second" }); });
+  await vi.waitFor(() => expect(view.current().state.route).toMatchObject({ kind: "session", sessionId: "second" }));
+  await view.current().readDraft("second");
+  await view.current().saveDraft("second", DRAFT);
+  await view.current().readDraftSnapshot("second");
+  await view.current().saveDraftIfRevision("second", DRAFT, 0);
+  const surface = "task-window:1:navigation:session";
+  expect(view.readDraft).toHaveBeenCalledExactlyOnceWith("server", "profile", "second", surface);
+  expect(view.saveDraft).toHaveBeenCalledExactlyOnceWith("server", "profile", "second", DRAFT, surface);
+  expect(view.readDraftSnapshot).toHaveBeenCalledExactlyOnceWith("server", "profile", "second", surface);
+  expect(view.saveDraftIfRevision).toHaveBeenCalledExactlyOnceWith("server", "profile", "second", DRAFT, 0, surface);
+  expect(new URLSearchParams(location.search).get("bootSession")).toBe("session");
+
+  let finish!: (owner: { profileId: string; sessionId: string; draftSlot: number }) => void;
+  view.getOwner.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  const retired = expect(view.current().saveDraft("second", DRAFT)).rejects.toThrow("no longer current");
+  await act(async () => { await view.current().navigate({ kind: "session", sessionId: "session" }); });
+  finish({ profileId: PROFILE.id, sessionId: "session", draftSlot: 1 });
+  await retired;
+  expect(view.saveDraft).toHaveBeenCalledOnce();
+  await view.current().saveDraft("session", DRAFT);
+  expect(view.saveDraft).toHaveBeenLastCalledWith("server", "profile", "session", DRAFT, "task-window:1");
+});
+
 it.each(["connection", "pagehide"] as const)("rejects a late native context after %s retirement before touching IndexedDB", async retirement => {
   const view = await mount(); let finish!: (value: { profileId: string; sessionId: string; draftSlot: number }) => void;
   view.getOwner.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));

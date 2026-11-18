@@ -36,16 +36,22 @@ describe("portable task package gateway", () => {
     vi.unstubAllGlobals();
   });
 
-  it("distinguishes a native save, a cancelled save, and the browser download request", async () => {
-    const saveFile = vi.fn(async () => true);
-    vi.stubGlobal("window", { jokoDesktop: { saveFile } });
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(new Uint8Array([1, 2, 3]), {
+  it("requests a package after the Desktop selection and distinguishes the file receipt from browser dispatch", async () => {
+    const session = { id: "session-1", name: "Portable task" };
+    const choose = vi.fn<(requestId: string, title: string) => Promise<boolean>>().mockResolvedValue(true);
+    const commit = vi.fn<(requestId: string, bytes: Uint8Array) => Promise<boolean>>().mockResolvedValue(true);
+    const cancel = vi.fn(async (_requestId: string) => undefined);
+    const { context } = desktopExportContext({ choose, commit, cancel });
+    const fetchPackage = vi.fn(async () => new Response(new Uint8Array([1, 2, 3]), {
       status: 200,
       headers: { "content-type": "application/vnd.joko.session" }
-    })));
+    }));
+    vi.stubGlobal("fetch", fetchPackage);
+    const exportRequested = vi.fn();
     let oversize = false;
     const transport = portableTransport(async (method, input) => {
       if (method.localName === "exportPortableSession") {
+        exportRequested();
         if (oversize) {
           expect(input).toEqual({ sessionId: "session-1", excludeMedia: false });
           throw new ConnectError("Package too large.", Code.ResourceExhausted, {
@@ -81,43 +87,78 @@ describe("portable task package gateway", () => {
     const gateway = createGateway(transport);
     await gateway.connect();
 
-    await expect(gateway.exportPortableSession("session-1", {
+    choose.mockResolvedValueOnce(false);
+    await expect(gateway.exportPortableSession(session, { excludeMedia: false }, context))
+      .resolves.toEqual({ status: "cancelled" });
+    expect(exportRequested).not.toHaveBeenCalled();
+    expect(fetchPackage).not.toHaveBeenCalled();
+    expect(commit).not.toHaveBeenCalled();
+
+    let confirmSave!: (confirmed: boolean) => void;
+    choose.mockReturnValueOnce(new Promise<boolean>((resolve) => { confirmSave = resolve; }));
+    let confirmWrite!: (written: boolean) => void;
+    commit.mockReturnValueOnce(new Promise<boolean>((resolve) => { confirmWrite = resolve; }));
+    const receiptAdopted = vi.fn();
+    const pending = gateway.exportPortableSession(session, {
       password: "transient",
       excludeMedia: false
-    }, { ownerDocument: { defaultView: window } as Document, signal: new AbortController().signal })).resolves.toEqual({ status: "exported", fidelity: "full" });
-    expect(saveFile).toHaveBeenCalledWith({
-      name: "portable-task.jshare",
-      mediaType: "application/vnd.joko.session",
-      bytes: new Uint8Array([1, 2, 3])
+    }, context).then(result => { receiptAdopted(); return result; });
+    expect(choose).toHaveBeenLastCalledWith(expect.any(String), "Portable task");
+    expect(exportRequested).not.toHaveBeenCalled();
+    confirmSave(true);
+    await vi.waitFor(() => {
+      expect(commit).toHaveBeenCalledExactlyOnceWith(choose.mock.lastCall?.[0], new Uint8Array([1, 2, 3]));
     });
-
-    saveFile.mockResolvedValueOnce(false);
-    await expect(gateway.exportPortableSession("session-1", { password: "transient", excludeMedia: false }, {
-      ownerDocument: { defaultView: window } as Document, signal: new AbortController().signal
-    })).resolves.toEqual({ status: "cancelled" });
+    expect(exportRequested).toHaveBeenCalledOnce();
+    expect(receiptAdopted).not.toHaveBeenCalled();
+    confirmWrite(true);
+    await expect(pending).resolves.toEqual({ status: "exported", fidelity: "full" });
 
     oversize = true;
-    await expect(gateway.exportPortableSession("session-1", {
-      excludeMedia: false
-    }, { ownerDocument: { defaultView: window } as Document, signal: new AbortController().signal })).resolves.toEqual({
+    await expect(gateway.exportPortableSession(session, { excludeMedia: false }, context)).resolves.toEqual({
       status: "oversize",
       mediaBytes: 7_340_032,
       limitBytes: 10_485_760
     });
+    expect(cancel).toHaveBeenCalledExactlyOnceWith(choose.mock.lastCall?.[0]);
+    expect(commit).toHaveBeenCalledOnce();
 
     oversize = false;
-    const browserWindow = { closed: false, URL: { createObjectURL: vi.fn(() => "blob:portable-task"), revokeObjectURL: vi.fn() },
+    const browserWindow = { closed: false, document: {} as Document,
+      URL: { createObjectURL: vi.fn(() => "blob:portable-task"), revokeObjectURL: vi.fn() },
       addEventListener: vi.fn(), removeEventListener: vi.fn(), setTimeout: vi.fn(() => 1), clearTimeout: vi.fn() };
     const anchor = { click: vi.fn() };
     const ownerDocument = { defaultView: browserWindow, createElement: vi.fn(() => anchor) } as unknown as Document;
+    browserWindow.document = ownerDocument;
     vi.stubGlobal("window", browserWindow);
-    await expect(gateway.exportPortableSession("session-1", { password: "transient", excludeMedia: false }, {
+    await expect(gateway.exportPortableSession(session, { password: "transient", excludeMedia: false }, {
       ownerDocument, signal: new AbortController().signal
     })).resolves.toEqual({ status: "dispatched", fidelity: "full" });
     expect(ownerDocument.createElement).toHaveBeenCalledExactlyOnceWith("a");
     expect(anchor).toMatchObject({ href: "blob:portable-task", download: "portable-task.jshare" });
     expect(anchor.click).toHaveBeenCalledOnce();
-    expect(saveFile).toHaveBeenCalledTimes(2);
+    expect(commit).toHaveBeenCalledOnce();
+    gateway.disconnect();
+  });
+
+  it("does not export when a former Desktop document returns a late save selection", async () => {
+    let confirmSave!: (confirmed: boolean) => void;
+    const choose = vi.fn((_requestId: string, _title: string) => new Promise<boolean>((resolve) => { confirmSave = resolve; }));
+    const commit = vi.fn();
+    const cancel = vi.fn(async (_requestId: string) => undefined);
+    const { context, desktopWindow } = desktopExportContext({ choose, commit, cancel });
+    const action = vi.fn(async (method: { localName: string }) => { throw new Error(`Unexpected RPC ${method.localName}`); });
+    const gateway = createGateway(portableTransport(action));
+    await gateway.connect();
+
+    const pending = gateway.exportPortableSession({ id: "session-1", name: "Portable task" }, { excludeMedia: false }, context);
+    expect(choose).toHaveBeenCalledOnce();
+    desktopWindow.document = {} as Document;
+    confirmSave(true);
+    await expect(pending).rejects.toThrow("The initiating window is no longer available.");
+    expect(action).not.toHaveBeenCalled();
+    expect(commit).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledExactlyOnceWith(choose.mock.lastCall?.[0]);
     gateway.disconnect();
   });
 
@@ -464,6 +505,15 @@ function createGateway(transport: Transport) {
     {},
     () => transport
   );
+}
+
+function desktopExportContext(portableSessionSave: NonNullable<Window["jokoDesktop"]>["portableSessionSave"]) {
+  const desktopWindow = { closed: false, document: {} as Document, crypto: globalThis.crypto,
+    jokoDesktop: { portableSessionSave } };
+  const ownerDocument = { defaultView: desktopWindow } as unknown as Document;
+  desktopWindow.document = ownerDocument;
+  vi.stubGlobal("window", desktopWindow);
+  return { context: { ownerDocument, signal: new AbortController().signal }, desktopWindow };
 }
 
 function portableTransport(handler: (method: any, input: any) => Promise<any>): Transport {

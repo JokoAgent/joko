@@ -5,6 +5,21 @@ import { recoverSideChatDraft } from "./side-chat-draft-recovery.js";
 import { bindExtensionSettingsOperationJournal, extensionSettingsProfilePin, parsePendingExtensionSettingsOperation, type ExtensionSettingsOperationReceipt } from "./extension-settings-operation.js";
 
 describe("durable composer draft surfaces", () => {
+  it("restores the exact navigated task slot without sharing a direct task window or another boot owner", async () => {
+    const database = draftDatabase();
+    const before = local(database.value);
+    await before.saveDraft("server", "profile", "second", draft("Main window"));
+    await before.saveDraft("server", "profile", "second", draft("Direct second window"), "task-window:1");
+    await before.saveDraft("server", "profile", "second", draft("From the first window"), "task-window:1:navigation:first");
+    await before.saveDraft("server", "profile", "second", draft("From the third window"), "task-window:1:navigation:third");
+    const restarted = local(database.value);
+    expect((await restarted.readDraft("server", "profile", "second", "task-window:1:navigation:first"))?.text).toBe("From the first window");
+    expect((await restarted.readDraft("server", "profile", "second", "task-window:1:navigation:third"))?.text).toBe("From the third window");
+    expect((await restarted.readDraft("server", "profile", "second", "task-window:1"))?.text).toBe("Direct second window");
+    expect((await restarted.readDraft("server", "profile", "second"))?.text).toBe("Main window");
+    expect(await restarted.readDraft("server", "profile", "first", "task-window:1")).toBeUndefined();
+  });
+
   it("cold-restores the original file and editable image vectors in task and new-task drafts", async () => {
     const database = draftDatabase(), before = local(database.value);
     const file = new File(["original image bytes"], "original.jpg", { type: "image/jpeg", lastModified: 123 });

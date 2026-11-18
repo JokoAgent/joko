@@ -55,6 +55,31 @@ afterEach(async ({ task }) => {
   }
 }, 90_000);
 
+packagedIt("applies the saved dark backing when the Windows application starts cold", { timeout: 180_000 }, async () => {
+  const first = await launchSettingsDesktop();
+  const main = await first.application.firstWindow({ timeout: 60_000 });
+  const chooseTheme = async (theme: "light" | "dark") => {
+    const label = theme === "light" ? /^(?:Theme: Light|主题: 浅色)$/u : /^(?:Theme: Dark|主题: 深色)$/u;
+    await main.getByRole("button", { name: label }).click({ timeout: 30_000 });
+    await waitFor(() => readFile(join(first.profilePath, "window-appearance.txt"), "utf8").catch(() => ""),
+      value => value.trim() === theme, "the saved Desktop theme mirror");
+  };
+  await chooseTheme("light");
+  await chooseTheme("dark");
+  await closeDesktop();
+  const reopened = await launchSettingsDesktop(first.profilePath);
+  const receipt = await waitFor(async () => {
+    try { return JSON.parse(await readFile(reopened.startupReceipt, "utf8")) as { readonly backgroundColor?: string }; }
+    catch { return undefined; }
+  }, value => value?.backgroundColor !== undefined, "the cold Windows window creation receipt");
+  expect(receipt?.backgroundColor?.toLowerCase()).toBe("#0d0d0d");
+  const page = await reopened.application.firstWindow({ timeout: 60_000 });
+  expect(await page.evaluate(() => {
+    const desktopWindow = (window as Window & { jokoDesktop?: { window?: { startupTheme?: string } } }).jokoDesktop?.window;
+    return { theme: document.documentElement.dataset.theme, startup: desktopWindow?.startupTheme };
+  })).toEqual({ theme: "dark", startup: "dark" });
+});
+
 packagedIt("converges conversation settings across real application windows and consumes fresh creation preferences", {
   timeout: 240_000
 }, async () => {
@@ -129,6 +154,20 @@ packagedIt("converges conversation settings across real application windows and 
   await selected(main.getByRole("combobox", { name: "Language", exact: true }), "English");
   console.info("Packaged settings: formal connection ready.");
 
+  await main.evaluate(() => { location.hash = "/settings/appearance"; });
+  await main.getByRole("radiogroup", { name: "Theme", exact: true }).getByRole("radio", { name: "Light", exact: true }).click();
+  await waitFor(() => readFile(join(profilePath, "window-appearance.txt"), "utf8").catch(() => ""),
+    value => value.trim() === "light", "the saved light appearance before creating task windows");
+  await main.context().addInitScript(() => {
+    const observer = new MutationObserver(() => {
+      if (document.body === null && document.documentElement?.dataset.theme === "light") {
+        (window as Window & { jokoObservedThemeBeforeBody?: string }).jokoObservedThemeBeforeBody = "light";
+        observer.disconnect();
+      }
+    });
+    observer.observe(document, { attributes: true, attributeFilter: ["data-theme"], subtree: true });
+  });
+
   const taskPages: Page[] = [];
   for (const sessionId of sessionIds) {
     await main.evaluate((id) => { location.hash = "/tasks/" + encodeURIComponent(id); }, sessionId);
@@ -143,6 +182,9 @@ packagedIt("converges conversation settings across real application windows and 
     observe(page);
     await page.locator('.timeline[data-timeline-session-id="' + sessionId + '"]')
       .waitFor({ state: "visible", timeout: 30_000 });
+    const nativeColor = await (await application.browserWindow(page)).evaluate(window => window.getBackgroundColor());
+    expect(nativeColor.toLowerCase()).toBe("#f2f2f2");
+    expect(await page.evaluate(() => (window as Window & { jokoObservedThemeBeforeBody?: string }).jokoObservedThemeBeforeBody)).toBe("light");
     taskPages.push(page);
   }
   const [first, second] = taskPages;
@@ -398,10 +440,11 @@ packagedIt("uses the original native CONNECT host after a real file draft blocks
   }
 });
 
-async function launchSettingsDesktop(): Promise<{ readonly application: ElectronApplication; readonly profilePath: string }> {
+async function launchSettingsDesktop(existingProfile?: string): Promise<{ readonly application: ElectronApplication; readonly profilePath: string; readonly startupReceipt: string }> {
   const executablePath = resolve(process.env.JOKO_PACKAGED_DESKTOP_EXECUTABLE!);
-  const profilePath = await mkdtemp(join(tmpdir(), "joko-settings-desktop-"));
+  const profilePath = existingProfile ?? await mkdtemp(join(tmpdir(), "joko-settings-desktop-"));
   profileDirectory = profilePath;
+  const startupEnvironment = startupEvidence.environment(profilePath);
   desktop = await _electron.launch({
     executablePath,
     env: {
@@ -409,7 +452,7 @@ async function launchSettingsDesktop(): Promise<{ readonly application: Electron
       JOKO_DESKTOP_MANAGED_ORCHESTRATOR: "0",
       JOKO_DESKTOP_PACKAGED_SMOKE: "1",
       JOKO_DESKTOP_SMOKE_SCOPE: "external",
-      ...startupEvidence.environment(profilePath),
+      ...startupEnvironment,
       JOKO_DESKTOP_SMOKE_USER_DATA: profilePath
     },
     timeout: 60_000
@@ -422,7 +465,7 @@ async function launchSettingsDesktop(): Promise<{ readonly application: Electron
     throw new Error("Settings Desktop launched an unexpected executable.");
   }
   console.info("Packaged settings: owned process confirmed.");
-  return { application: desktop, profilePath };
+  return { application: desktop, profilePath, startupReceipt: `${startupEnvironment.JOKO_DESKTOP_SMOKE_RESULT}.startup.json` };
 }
 
 async function pairSettingsDesktop(main: Page, activeFixture: OrchestratorE2eFixture): Promise<void> {
