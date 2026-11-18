@@ -2,6 +2,7 @@
 
 import { act, createRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import Sortable, { type SortableEvent } from "sortablejs";
 import { afterEach, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
@@ -468,6 +469,67 @@ describe("Sidebar organizer display controls", () => {
     expect(dialoguePanel.querySelector("[data-session-id='pinned-task']")).toBeNull();
     await act(async () => required(dialoguePanel.querySelector<HTMLButtonElement>("[aria-label='newTask.dialogue']")).click());
     expect(onNewDialogue).toHaveBeenCalledWith("backend");
+  });
+
+  it("preserves hidden pinned slots when changing the shown machine or reordering its pins", async () => {
+    const local = activeProfileMachineControl("local");
+    const remote = { id: "remote", serverId: "remote-server", deviceId: "remote-device", origin: "https://remote.example", name: "Remote node" };
+    const remoteSessions = ["b1", "b2"].map((id, index) => ({
+      id, name: id, state: "idle" as const, archived: false, pinned: true, taskTags: [], lastActivityAt: 20 - index
+    }));
+    const cache = { profileId: remote.id, serverId: remote.serverId, origin: remote.origin, name: remote.name, updatedAt: 50, sessions: remoteSessions };
+    const onSelectionChange = vi.fn();
+    const machineControl = {
+      ...local,
+      profiles: [...local.profiles, remote],
+      presenceByProfile: { local: "current", remote: "online" } as const,
+      caches: [cache],
+      onSelectionChange
+    };
+    const ownerLayout = {
+      ...DEFAULT_SIDEBAR_OWNER_LAYOUT,
+      manualPinnedOrder: ["a1", "remote:remote:b1", "a2", "remote:remote:b2"]
+    };
+    const onOwnerLayoutChange = vi.fn();
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      snapshot: { ...emptySnapshot(), revision: 1n, sessions: ["a1", "a2"].map((id) => ({ ...session(), id, pinned: true })) },
+      machineControl,
+      sidebarOwnerLayouts: { owner: ownerLayout },
+      onSidebarOwnerLayoutChange: onOwnerLayoutChange
+    });
+    const list = required(rendered.container.querySelector<HTMLElement>(".session-section--pinned .session-section__sortable-sessions"));
+    const ids = () => [...list.querySelectorAll<HTMLElement>("[data-sortable-id]")].map((item) => item.dataset.sortableId);
+    expect(ids()).toEqual(ownerLayout.manualPinnedOrder);
+
+    const switcher = required(rendered.container.querySelector<HTMLDetailsElement>("details.machine-switcher"));
+    await act(async () => required(switcher.querySelector<HTMLElement>("summary")).click());
+    const remoteOption = required([...switcher.querySelectorAll(".machine-switcher__profile")]
+      .find((entry) => entry.textContent?.includes(remote.name)) ?? null);
+    await act(async () => required(remoteOption.querySelector<HTMLButtonElement>("button[role='checkbox']")).click());
+    expect(onSelectionChange).toHaveBeenCalledExactlyOnceWith([remote.id]);
+    await rendered.rerenderMachineControl({ ...machineControl, selection: [remote.id] });
+    expect(ids()).toEqual(["remote:remote:b1", "remote:remote:b2"]);
+    expect(onOwnerLayoutChange).not.toHaveBeenCalled();
+
+    const afterFilteredDrag = ["a1", "remote:remote:b2", "a2", "remote:remote:b1"];
+    const item = required(list.lastElementChild);
+    const sortable = Sortable.get(list);
+    expect(sortable?.options.onEnd).toBeTypeOf("function");
+    await act(async () => {
+      list.prepend(item);
+      sortable?.options.onEnd?.({ from: list, to: list, item, oldIndex: 1, newIndex: 0 } as SortableEvent);
+    });
+    expect(onOwnerLayoutChange).toHaveBeenCalledExactlyOnceWith({ manualPinnedOrder: afterFilteredDrag });
+    await rendered.rerenderOwnerLayouts({ owner: { ...ownerLayout, manualPinnedOrder: afterFilteredDrag } });
+    await rendered.rerenderMachineControl({ ...machineControl, presenceByProfile: { local: "current", remote: "offline" } });
+    expect(ids()).toEqual(afterFilteredDrag);
+
+    onOwnerLayoutChange.mockClear();
+    await rendered.rerenderMachineControl({
+      ...machineControl,
+      caches: [{ ...cache, sessions: remoteSessions.map((task) => task.id === "b1" ? { ...task, pinned: false } : task) }]
+    });
+    expect(onOwnerLayoutChange).toHaveBeenCalledExactlyOnceWith({ manualPinnedOrder: afterFilteredDrag.slice(0, -1) });
   });
 
   it.each(["expanded", "rail"] as const)("keeps hidden-project tasks reachable as dialogues in %s navigation and restores their original group", async (mode) => {

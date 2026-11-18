@@ -497,12 +497,16 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const sessions = useMemo(() => currentMachineIncluded
     ? sessionsForSidebarStatus(snapshot.sessions, sidebarLayout.status)
     : [], [currentMachineIncluded, sidebarLayout.status, snapshot.sessions]);
-  const remoteMachineCaches = useMemo(() => props.machineControl === undefined ? [] : selectedRemoteMachineCaches(
+  const allRemoteMachineCaches = useMemo(() => props.machineControl === undefined ? [] : selectedRemoteMachineCaches(
     props.machineControl.caches,
     props.machineControl.activeProfile.id,
-    props.machineControl.selection,
+    "all",
     props.machineControl.profiles
   ), [props.machineControl]);
+  const machineSelection = props.machineControl?.selection;
+  const remoteMachineCaches = useMemo(() => machineSelection === undefined || machineSelection === "all"
+    ? allRemoteMachineCaches
+    : allRemoteMachineCaches.filter((cache) => machineSelection.includes(cache.profileId)), [allRemoteMachineCaches, machineSelection]);
   const selectedRemoteProfiles = useMemo(() => props.machineControl === undefined
     ? []
     : props.machineControl.profiles.filter((profile) => profile.id !== props.machineControl!.activeProfile.id
@@ -681,17 +685,17 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     () => [...searchOptions, ...remoteSearchOptions],
     [remoteSearchOptions, searchOptions]
   );
-  const pinnedProjectTargets = useMemo(() => currentMachineIncluded ? snapshot.targets.filter((target) =>
+  const pinnedProjectTargets = useMemo(() => snapshot.targets.filter((target) =>
     target.pinned && !target.archived && navigationSessions.some((session) => session.projectId === target.id)
-  ) : [], [currentMachineIncluded, navigationSessions, snapshot.targets]);
+  ), [navigationSessions, snapshot.targets]);
   const pinnedProjectIds = useMemo(() => new Set(pinnedProjectTargets.map((target) => target.id)), [pinnedProjectTargets]);
-  const pinnedSessions = useMemo(() => currentMachineIncluded ? sortSidebarSessions(
+  const pinnedSessions = useMemo(() => sortSidebarSessions(
     navigationSessions.filter(sidebarTaskPinned),
     "recency"
-  ) : [], [currentMachineIncluded, navigationSessions]);
-  const pinnedSessionEntries = useMemo<readonly SidebarPinnedEntry[]>(() => [
+  ), [navigationSessions]);
+  const allPinnedSessionEntries = useMemo<readonly SidebarPinnedSessionEntry[]>(() => [
     ...pinnedSessions.map((session) => ({ kind: "session" as const, id: session.id, session })),
-    ...remoteMachineCaches.flatMap((cache) => cache.sessions
+    ...allRemoteMachineCaches.flatMap((cache) => cache.sessions
       .filter(sidebarTaskPinned)
       .map((session) => ({
         kind: "remoteSession" as const,
@@ -700,28 +704,32 @@ export function Sidebar(props: SidebarProps): JSX.Element {
         session
       })))
   ].sort((left, right) => {
-    const leftActivity = left.kind === "session" ? left.session.updatedAt : left.kind === "remoteSession" ? left.session.lastActivityAt : 0;
-    const rightActivity = right.kind === "session" ? right.session.updatedAt : right.kind === "remoteSession" ? right.session.lastActivityAt : 0;
+    const leftActivity = left.kind === "session" ? left.session.updatedAt : left.session.lastActivityAt;
+    const rightActivity = right.kind === "session" ? right.session.updatedAt : right.session.lastActivityAt;
     return rightActivity - leftActivity || left.id.localeCompare(right.id);
-  }), [pinnedSessions, remoteMachineCaches]);
+  }), [allRemoteMachineCaches, pinnedSessions]);
   const allPinnedIds = useMemo(() => [
-    ...pinnedSessionEntries.map((entry) => entry.id),
+    ...allPinnedSessionEntries.map((entry) => entry.id),
     ...pinnedProjectTargets.map((target) => `${SIDEBAR_PINNED_PROJECT_PREFIX}${target.id}`)
-  ], [pinnedProjectTargets, pinnedSessionEntries]);
+  ], [allPinnedSessionEntries, pinnedProjectTargets]);
   const pinnedOrder = useMemo(() => normalizeManualSidebarOrder(
     sidebarLayout.manualPinnedOrder,
     allPinnedIds
   ), [allPinnedIds, sidebarLayout.manualPinnedOrder]);
   const pinnedRank = useMemo(() => new Map(pinnedOrder.map((id, index) => [id, index])), [pinnedOrder]);
-  const pinnedEntries = useMemo<readonly SidebarPinnedEntry[]>(() => [
-    ...pinnedSessionEntries,
-    ...pinnedProjectTargets.map((target) => ({
+  const pinnedEntries = useMemo<readonly SidebarPinnedEntry[]>(() => {
+    const visibleRemoteProfileIds = new Set(remoteMachineCaches.map((cache) => cache.profileId));
+    const entries = allPinnedSessionEntries.filter((entry) => entry.kind === "session"
+      ? currentMachineIncluded : visibleRemoteProfileIds.has(entry.cache.profileId));
+    const projects = currentMachineIncluded ? pinnedProjectTargets.map((target) => ({
       kind: "project" as const,
       id: `${SIDEBAR_PINNED_PROJECT_PREFIX}${target.id}`,
       target,
       sessions: sortSidebarSessions(navigationSessions.filter((session) => session.projectId === target.id && !session.pinned && !session.archived), sidebarLayout.sortBy, priorityContext)
-    }))
-  ].sort((left, right) => (pinnedRank.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (pinnedRank.get(right.id) ?? Number.MAX_SAFE_INTEGER)), [pinnedProjectTargets, pinnedRank, pinnedSessionEntries, priorityContext, sidebarLayout.sortBy, navigationSessions]);
+    })) : [];
+    return [...entries, ...projects].sort((left, right) =>
+      (pinnedRank.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (pinnedRank.get(right.id) ?? Number.MAX_SAFE_INTEGER));
+  }, [allPinnedSessionEntries, currentMachineIncluded, navigationSessions, pinnedProjectTargets, pinnedRank, priorityContext, remoteMachineCaches, sidebarLayout.sortBy]);
   const recent = sortSidebarSessions(filterSidebarSessions(
     sessions.filter((session) => !sidebarTaskPinned(session) && (session.archived || session.projectId === undefined || !pinnedProjectIds.has(session.projectId))),
     sidebarLayout,
