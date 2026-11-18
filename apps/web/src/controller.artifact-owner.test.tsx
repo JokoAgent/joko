@@ -849,8 +849,9 @@ it.each(["remote task", "machine menu"] as const)("keeps the old qualified route
   });
   vi.mocked(createOrchestratorGateway).mockImplementation((owner, _authKey, callbacks) => ({
     connect: async () => {
-      if (callbacks.onSnapshot) requests.push(owner!.id);
-      if (owner!.id === second.id && callbacks.onState !== undefined) await connectGate;
+      const primaryConnection = callbacks.onState !== undefined && callbacks.onLiveSnapshot === undefined;
+      if (primaryConnection) requests.push(owner!.id);
+      if (primaryConnection && owner!.id === second.id) await connectGate;
       callbacks.onSnapshot?.(snapshots.get(owner!.id)!);
       callbacks.onState?.("connected");
     },

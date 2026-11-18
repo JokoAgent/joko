@@ -49,6 +49,31 @@ function httpSource() {
 }
 
 describe("Event connection acceptance", () => {
+  it("publishes an initial Owner snapshot as live only after decoding the original stream's response", async () => {
+    timers();
+    const source = httpSource();
+    const onLiveSnapshot = vi.fn(), onSnapshot = vi.fn();
+    const gateway = createOrchestratorGateway(profile, "credential", { onLiveSnapshot, onSnapshot });
+    gateways.push(gateway);
+    await gateway.connect({ snapshotOnly: true });
+    expect(onSnapshot).toHaveBeenCalledWith(expect.objectContaining({ generation: 7n }), true);
+    expect(source.calls).toHaveLength(0);
+    expect(onLiveSnapshot.mock.calls.every(([snapshot]) => snapshot === undefined)).toBe(true);
+
+    await gateway.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    const request = source.calls[0]!;
+    const stream = acceptedStream(request.signal);
+    request.respond(stream.response);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(request.signal.aborted).toBe(false);
+    expect(onLiveSnapshot.mock.calls.every(([snapshot]) => snapshot === undefined)).toBe(true);
+    stream.accept();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onLiveSnapshot.mock.calls.filter(([snapshot]) => snapshot !== undefined))
+      .toEqual([[expect.objectContaining({ generation: 7n })]]);
+  });
+
   it("retains offline errors throughout HTTP failures and pending retries, then recovers on the idle stream's successful response", async () => {
     timers(); const source = httpSource();
     const states: GatewayConnectionState[] = [], live: boolean[] = [];
@@ -61,6 +86,7 @@ describe("Event connection acceptance", () => {
     gateways.push(gateway);
     await gateway.connect(); await vi.advanceTimersByTimeAsync(0);
     expect(source.calls).toHaveLength(1);
+    expect(live.every(ready => !ready)).toBe(true);
     const initialConnections = states.filter(state => state === "connected").length;
     for (const [index, delay] of [350, 700, 1_400].entries()) {
       source.calls[index]!.respond(new Response("Unavailable", { status: 503,

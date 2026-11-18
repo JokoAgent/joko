@@ -39,7 +39,10 @@ it("withdraws an interrupted source and requires a fresh authenticated owner sna
     },
     stream: async (method: any) => {
       streams += 1;
-      return response(method, streams === 1 ? { async *[Symbol.asyncIterator]() { throw new ConnectError("offline", Code.Unavailable); } }
+      return response(method, streams === 1 ? { async *[Symbol.asyncIterator]() {
+        yield create(StreamEventsResponseSchema);
+        throw new ConnectError("offline", Code.Unavailable);
+      } }
         : { async *[Symbol.asyncIterator]() {
           await new Promise<void>(resolve => { acceptStream = resolve; });
           yield create(StreamEventsResponseSchema);
