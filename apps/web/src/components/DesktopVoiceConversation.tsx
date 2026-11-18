@@ -80,7 +80,8 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
   const questionRef = useRef(question); questionRef.current = question;
   const blocked = interactions.some(row => row.kind !== 'question')
     || controller.state.snapshot?.queueControls.some(row => row.sessionId === session.id && row.state === 'paused') || false;
-  const current = useRef<{ live: boolean; callId?: string; kind?: string; polling: boolean; starting?: boolean; ending?: boolean; readId: number }>({ live: true, polling: false, readId: 0 });
+  const current = useRef<{ live: boolean; callId?: string; kind?: string; polling: boolean; starting?: boolean; ending?: boolean; readId: number;
+    pendingPlayback?: { readonly callId: string; readonly operationId: string } }>({ live: true, polling: false, readId: 0 });
   const blockedNow = useRef(blocked), startGeneration = useRef(0);
   useLayoutEffect(() => {
     blockedNow.current = blocked;
@@ -107,20 +108,23 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
     try {
       const result = await client.control(Action.SNAPSHOT, { callId: owner.callId ?? '' });
       if (current.current !== owner || !owner.live || owner.starting || owner.readId !== readId) return;
-      setValue(result); setError(false);
-      if (result.call?.endedAtMs === undefined && result.call) { owner.callId = result.call.callId; owner.kind = result.call.kind; }
-      if (!result.call && owner.callId) { listener.current?.stop(); player.stop(); owner.callId = undefined; setMic(false); }
+      const call = result.call?.kind === 'playback' && result.call.callId !== owner.callId ? undefined : result.call;
+      setValue({ ...result, call }); setError(false);
+      if (call?.endedAtMs === undefined && call) { owner.callId = call.callId; owner.kind = call.kind; }
+      if (!call && owner.callId) { listener.current?.stop(); player.stop(); owner.callId = undefined; owner.kind = undefined; setMic(false); }
     } catch { if (owner.live) setError(true); }
     finally { owner.polling = false; }
   }, [client, player]);
   const stop = useCallback(async () => {
-    const owner = current.current, id = owner.callId;
+    const owner = current.current, pending = owner.pendingPlayback;
+    const id = owner.callId ?? pending?.callId;
     startGeneration.current++;
     owner.readId++; owner.ending = true;
     speechGeneration.current++; semanticVersion.current++; exit.current = undefined; idleSince.current = undefined; setCountdown(undefined);
     listener.current?.stop(); player.stop(); setMic(false); setSpeaking(false);
-    owner.callId = undefined; owner.kind = undefined;
-    try { if (id) await client.control(Action.END, { callId: id }).catch(() => undefined); }
+    owner.callId = undefined; owner.kind = undefined; owner.pendingPlayback = undefined;
+    try { if (id) await client.control(Action.END, { callId: id,
+      ...(pending?.callId === id ? { playbackOnly: true, operationId: pending.operationId } : {}) }).catch(() => undefined); }
     finally { owner.ending = false; }
   }, [client, player]);
   useEffect(() => {
@@ -288,18 +292,28 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
     await stopping;
     if (!canStart()) return false;
     const callId = crypto.randomUUID(), operationId = `voice-start-${callId}`;
+    const retire = () => client.control(Action.END, { callId, ...(playbackOnly ? { playbackOnly: true, operationId } : {}) }).catch(() => undefined);
     owner.starting = true;
+    if (playbackOnly) owner.pendingPlayback = { callId, operationId };
     try {
       const result = await client.control(Action.START, { callId, operationId, selection: chosen, playbackOnly });
       if (!canStart()) {
-        await client.control(Action.END, { callId }).catch(() => undefined);
+        if (!playbackOnly || owner.pendingPlayback?.callId === callId) await retire();
         return false;
       }
+      if (!result.call || result.call.callId !== callId || result.call.endedAtMs !== undefined) throw new Error('The voice call did not start.');
       owner.callId = callId; owner.kind = playbackOnly ? 'playback' : 'conversation';
       setValue(result); spoken.current.clear(); speechRequestIds.current.clear();
       if (!playbackOnly) await startMic();
       return true;
-    } finally { owner.starting = false; }
+    } catch (error) {
+      if (playbackOnly && owner.pendingPlayback?.callId === callId) await retire();
+      if (canStart()) throw error;
+      return false;
+    } finally {
+      if (owner.pendingPlayback?.callId === callId) owner.pendingPlayback = undefined;
+      owner.starting = false;
+    }
   };
   const save = (reset: boolean) => void action(async () => {
     if (!saveRequest.current) saveRequest.current = { operationId: crypto.randomUUID(), preference: create(DesktopVoiceConversationPreferenceSchema, {

@@ -127,6 +127,33 @@ it('retains a read-aloud failure through healthy snapshots until an explicit new
   } finally { await view.dispose(); }
 });
 
+it('retires a pending playback when closing the panel and ignores its late Start reply', async () => {
+  let complete!: (call: DesktopVoiceCallRecord) => void;
+  let reportPrevious = false;
+  let original: DesktopVoiceCallRecord;
+  const view = await mountCall(request => {
+    if (request.action === Action.START) return new Promise(resolve => { complete = resolve; });
+    if (reportPrevious && request.action === Action.SNAPSHOT) return Promise.resolve(original);
+    return undefined;
+  });
+  try {
+    await view.readAloud('Close before playback starts.');
+    original = view.call();
+    const start = view.requests.find(request => request.action === Action.START)!;
+    await act(async () => document.querySelector<HTMLButtonElement>('button[aria-label="Close"]')!.click());
+    await view.unmountPanel();
+    expect(view.requests.filter(request => request.action === Action.END)).toMatchObject([{
+      callId: start.callId, operationId: start.operationId, playbackOnly: true
+    }]);
+    await act(async () => complete(original));
+    expect(DesktopSpeechPlayer.prototype.play).not.toHaveBeenCalled();
+    reportPrevious = true;
+    await view.render();
+    expect([...document.querySelectorAll<HTMLButtonElement>('button')].some(button => button.textContent === 'End call')).toBe(false);
+    expect([...document.querySelectorAll<HTMLButtonElement>('button')].some(button => button.textContent === 'Read aloud')).toBe(true);
+  } finally { await view.dispose(); }
+});
+
 it('ends the original playback lease when stopping while its speech request is in flight', async () => {
   const view = await mountCall();
   let finish!: () => void;
@@ -179,7 +206,8 @@ async function mountCall(override?: (request: ControlDesktopVoiceConversationReq
   const container = document.body.appendChild(document.createElement('div')), root = createRoot(container), onClose = vi.fn();
   const render = async () => { await act(async () => root.render(<DesktopVoiceConversationPanel controller={controller} session={session} serverId="node" onClose={onClose} />)); };
   await render();
-  return { requests, state, onClose, render, call: () => active!, listener: () => capture!,
+  return { requests, state, onClose, render, unmountPanel: async () => { await act(async () => root.render(null)); },
+    call: () => active!, listener: () => capture!,
     start: async () => { await act(async () => [...document.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Start call')!.click()); },
     readAloud: async (text?: string) => {
       if (text !== undefined) await act(async () => {

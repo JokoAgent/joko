@@ -97,6 +97,12 @@ export class DesktopVoiceConversationManager {
     }
     if (action === contract.DesktopVoiceConversationAction.START) {
       const callId = identity(request.callId, 64), chosen = selection(request.selection);
+      if (request.playbackOnly) {
+        const retirement = this.options.store.findOperation(playbackRetirementId(owner, session.id, generation, callId, identity(request.operationId)));
+        if (retirement?.status === 'completed' && retirement.kind === 'desktop_voice_retire_playback_start') {
+          throw new ConnectError('This playback was closed before it started.', Code.FailedPrecondition);
+        }
+      }
       const previous = this.#call;
       if (previous?.id === callId) {
         if (previous.owner !== owner || previous.sessionId !== session.id || previous.generation !== generation || previous.operationId !== request.operationId
@@ -165,7 +171,23 @@ export class DesktopVoiceConversationManager {
       this.#call = call; assertCurrent(); return this.#snapshot(session.id, generation, call);
     }
     const call = this.#call;
-    if (!call || call.owner !== owner || call.id !== request.callId || call.sessionId !== session.id || call.generation !== generation) throw unavailable();
+    const ownerMatches = call !== undefined && call.owner === owner && call.id === request.callId && call.sessionId === session.id && call.generation === generation;
+    const pendingPlaybackEnd = action === contract.DesktopVoiceConversationAction.END && request.playbackOnly && request.operationId !== '';
+    if (pendingPlaybackEnd) {
+      const callId = identity(request.callId, 64), startOperationId = identity(request.operationId);
+      if (call && ownerMatches) {
+        if (call.kind !== 'playback' || call.operationId !== startOperationId) throw invalid();
+      } else {
+        // END can win while the original authenticated START is still in transit.
+        const id = playbackRetirementId(owner, session.id, generation, callId, startOperationId);
+        this.options.store.runAuthorizedOperation(authority.connection.id, authority.connection.authKeyDigest,
+          { id, kind: 'desktop_voice_retire_playback_start', body: { windowId: request.windowId, sessionId: session.id, generation, callId, startOperationId } }, () => {
+            authority.assertCurrent(); return true;
+          });
+        return this.#snapshot(session.id, generation);
+      }
+    }
+    if (!call || !ownerMatches) throw unavailable();
     call.assertCurrent(); call.touchedAt = this.#now();
     switch (action) {
       case contract.DesktopVoiceConversationAction.CLASSIFY_EXIT: {
@@ -287,6 +309,9 @@ export class DesktopVoiceConversationManager {
     this.options.store.setSetting('session', saved.sessionId, `${CALL_SCOPE}${saved.record.callId}`, saved);
   }
   #now(): number { return this.options.now?.() ?? Date.now(); }
+}
+function playbackRetirementId(owner: string, sessionId: string, generation: number, callId: string, startOperationId: string): string {
+  return 'voice-retire-' + createHash('sha256').update(JSON.stringify([owner, sessionId, generation, callId, startOperationId])).digest('hex');
 }
 function selection(value: contract.DesktopSpeechSelection | undefined): SpeechSelection {
   if (!value) throw invalid();

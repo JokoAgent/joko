@@ -176,6 +176,26 @@ it('rejects the first delayed speech request after its exact playback lease ends
   } finally { await f.close(); }
 });
 
+it('accepts retirement before Start only for its exact pending playback owner', async () => {
+  const f = await fixture();
+  const Action = contract.DesktopVoiceConversationAction;
+  try {
+    const original = { callId: 'pending-read', operationId: 'original-playback-start', playbackOnly: true };
+    await f.control(Action.END, original);
+    await f.control(Action.END, original);
+    await expect(f.control(Action.START, { ...original, selection: f.speech })).rejects.toMatchObject({
+      code: Code.FailedPrecondition, message: expect.stringContaining('closed before it started')
+    });
+    expect(f.store.findOperation(original.operationId)).toBeUndefined();
+    expect((await f.control(Action.SNAPSHOT)).call).toBeUndefined();
+    expect(f.fetcher).not.toHaveBeenCalled();
+    const other = await f.control(Action.START, { ...original, windowId: 'desktop-window-two', selection: f.speech });
+    expect(other.call).toMatchObject({ callId: original.callId, kind: 'playback' });
+    await f.control(Action.END, original);
+    expect((await f.control(Action.SNAPSHOT, { windowId: 'desktop-window-two' })).call?.callId).toBe(original.callId);
+  } finally { await f.close(); }
+});
+
 it('rejects original-generation call activity after a task reset', async () => {
   const f = await fixture();
   try {
