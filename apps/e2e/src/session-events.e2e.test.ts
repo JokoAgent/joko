@@ -981,6 +981,8 @@ describe("session host, durable events, and reconnect semantics", () => {
       await railProject.press("Enter");
       const railPreview = railTasks.getByRole("button", { name: `Show all ${taskCount} tasks`, exact: true });
       await railPreview.waitFor({ state: "visible" });
+      await page.locator("[data-sidebar-rail-trigger='dialogues']").hover();
+      expect(await railPreview.isVisible()).toBe(true);
       const original = (await railTasks.boundingBox())!;
       await railPreview.click();
       await expect.poll(async () => {
