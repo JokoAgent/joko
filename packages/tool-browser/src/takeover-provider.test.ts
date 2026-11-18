@@ -35,7 +35,7 @@ class FakeLocator {
 class FakePage extends EventEmitter {
   #url: string;
   #closed = false;
-  readonly #mainFrame = {};
+  readonly #mainFrame = { waitForLoadState: async (): Promise<void> => {} };
   readonly #simulateCommentDocument: boolean;
   #commentElementId: string | undefined;
   readonly #commentInlineStyles = new Map<string, { value: string; priority: string }>();

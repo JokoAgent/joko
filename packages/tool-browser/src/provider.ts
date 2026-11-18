@@ -2117,14 +2117,9 @@ export class BrowserProvider {
       this.#pageStates.set(page, "closed");
       fenceTakeover();
     });
-    page.on("framenavigated", (frame) => {
-      if (frame === page.mainFrame()) {
-        this.#pageDocuments.set(page, randomUUID());
-        this.#pageStates.set(page, "loading");
-        this.fenceHumanCommentLedgerForNavigation(page);
-      }
-    });
-    page.on("domcontentloaded", () => {
+    const finishNavigation = () => {
+      const state = this.#pageStates.get(page);
+      if (this.#generation !== generation || page.isClosed() || state === "crashed" || state === "closed") return;
       this.#pageStates.set(page, "ready");
       void this.emit({
         at: Date.now(),
@@ -2132,7 +2127,20 @@ export class BrowserProvider {
         pageId,
         detail: sanitizeBrowserUrlForDisplay(page.url())
       });
+    };
+    page.on("framenavigated", (frame) => {
+      if (frame !== page.mainFrame()) return;
+      const documentId = randomUUID();
+      this.#pageDocuments.set(page, documentId);
+      this.#pageStates.set(page, "loading");
+      this.fenceHumanCommentLedgerForNavigation(page);
+      // Probe Playwright's already-fired load state for same-document navigation.
+      // New documents still settle through their own domcontentloaded event.
+      void frame.waitForLoadState("domcontentloaded", { timeout: 1 }).then(() => {
+        if (this.#pageDocuments.get(page) === documentId && this.#pageStates.get(page) === "loading") finishNavigation();
+      }, () => undefined);
     });
+    page.on("domcontentloaded", finishNavigation);
     page.on("console", (message) => {
       try {
         appendBoundedItem(this.#consoleMessages.get(page) ?? [], {
