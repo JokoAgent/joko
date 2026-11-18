@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { AppState, BackHandler, Keyboard } from "react-native";
+import { AppState, BackHandler, Keyboard, type GestureResponderEvent, type ViewProps } from "react-native";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import type { MobileClient } from "./mobile-client";
@@ -18,6 +18,28 @@ interface ShareJob {
   leaseId?: string;
   attach?: (handle: MobileConversationShareRendererHandle) => void;
   phase: "preparing" | "dispatching";
+}
+
+interface ShareRowTouch {
+  readonly owner: string;
+  readonly revision: number;
+  readonly messageId: string;
+  readonly eventId: string;
+  readonly x: number;
+  readonly y: number;
+  readonly startedAt: number;
+  moved: boolean;
+}
+
+const MAXIMUM_ROW_TAP_MOVEMENT = 8;
+const MAXIMUM_ROW_TAP_DURATION_MS = 450;
+
+type ShareRowTouchHandlers = Pick<ViewProps, "onTouchStart" | "onStartShouldSetResponder" | "onResponderGrant" | "onResponderMove"
+  | "onResponderRelease" | "onResponderTerminationRequest" | "onResponderTerminate">;
+
+function movedFromRowTouch(touch: ShareRowTouch, event: GestureResponderEvent): boolean {
+  const { pageX, pageY, touches } = event.nativeEvent;
+  return touches.length > 1 || Math.hypot(pageX - touch.x, pageY - touch.y) > MAXIMUM_ROW_TAP_MOVEMENT;
 }
 
 export function useMobileConversationShare(input: {
@@ -41,12 +63,14 @@ export function useMobileConversationShare(input: {
   const [notice, setNotice] = useState("");
   const [screenshotTriggered, setScreenshotTriggered] = useState(false);
   const job = useRef<ShareJob | undefined>(undefined);
+  const rowTouch = useRef<ShareRowTouch | undefined>(undefined);
   const mounted = useRef(true);
   const cancelJob = useCallback(() => {
     job.current?.controller.abort();
     if (mounted.current) setSnapshot(undefined);
   }, []);
   const cancel = useCallback(() => {
+    rowTouch.current = undefined;
     cancelJob(); selection.exit(); setNotice(""); setScreenshotTriggered(false);
   }, [cancelJob, selection]);
   useEffect(() => {
@@ -93,6 +117,38 @@ export function useMobileConversationShare(input: {
     if (busy || !ids.includes(id)) return;
     selection.toggle(id); setNotice("");
   }, [busy, ids, selection]);
+  const rowTouchHandlers = (row: TimelineRow): ShareRowTouchHandlers | undefined => {
+    if (!selection.active || owner === undefined || selection.owner !== owner || busy || !mobileMessageShareable(row)) return undefined;
+    const current = () => mounted.current && AppState.currentState === "active" && job.current === undefined
+      && selection.active && selection.owner === owner && client.conversationShareOwnerKey() === owner
+      && latest.current.rows.some(item => item.id === row.id && item.eventId === row.eventId && mobileMessageShareable(item));
+    return {
+      onTouchStart: (event) => {
+        const touch = rowTouch.current;
+        if (touch?.messageId === row.id && event.nativeEvent.touches.length > 1) touch.moved = true;
+      },
+      onStartShouldSetResponder: (event) => event.nativeEvent.touches.length === 1 && current(),
+      onResponderGrant: (event) => {
+        const { pageX, pageY } = event.nativeEvent;
+        rowTouch.current = { owner, revision: selection.revision, messageId: row.id, eventId: row.eventId, x: pageX, y: pageY,
+          startedAt: Date.now(), moved: false };
+      },
+      onResponderMove: (event) => {
+        const touch = rowTouch.current;
+        if (touch?.messageId === row.id && touch.eventId === row.eventId && movedFromRowTouch(touch, event)) touch.moved = true;
+      },
+      onResponderRelease: (event) => {
+        const touch = rowTouch.current;
+        rowTouch.current = undefined;
+        if (touch?.messageId !== row.id || touch.eventId !== row.eventId || touch.owner !== owner || touch.revision !== selection.revision
+          || touch.moved || movedFromRowTouch(touch, event) || !current()) return;
+        const duration = Date.now() - touch.startedAt;
+        if (duration >= 0 && duration <= MAXIMUM_ROW_TAP_DURATION_MS) toggle(row.id);
+      },
+      onResponderTerminationRequest: () => true,
+      onResponderTerminate: () => { rowTouch.current = undefined; }
+    };
+  };
   const toggleAll = useCallback(() => {
     if (busy) return;
     const changed = selection.toggleAll(ids);
@@ -167,5 +223,5 @@ export function useMobileConversationShare(input: {
   const selectedIds = selection.selected(ids);
   return { active: selection.active && selection.owner === owner, busy, notice, snapshot, rendererRef,
     selectedIds, allSelected: ids.length > 0 && selectedIds.length === ids.length,
-    enter, enterVisible, screenshotTriggered, toggle, toggleAll, cancel, share, locale };
+    enter, enterVisible, screenshotTriggered, toggle, rowTouchHandlers, toggleAll, cancel, share, locale };
 }

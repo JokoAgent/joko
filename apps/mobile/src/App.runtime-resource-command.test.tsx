@@ -262,7 +262,7 @@ beforeAll(async () => {
   vi.doMock("./use-mobile-audio-artwork", () => ({ useMobileAudioArtwork: () => new Map() }));
   vi.doMock("./mobile-delegated-reader", () => ({ useMobileDelegatedTasks: () => ({ entries: empty, loading: false }) }));
   vi.doMock("./use-mobile-hidden-history", () => ({ useMobileHiddenHistory: () => false }));
-  vi.doMock("./use-mobile-conversation-share", () => ({ useMobileConversationShare: () => ({ active: false, busy: false, selectedIds: [], enterVisible() {} }) }));
+  vi.doMock("./use-mobile-conversation-share", () => ({ useMobileConversationShare: () => ({ active: false, busy: false, selectedIds: [], enterVisible() {}, rowTouchHandlers() {} }) }));
   vi.doMock("./use-mobile-screenshot-selection", () => ({ useMobileScreenshotSelection() {} }));
   ({ TaskScreen } = await import("./App"));
   ({ MobileMcpAppViewsProvider } = await import("./MobileMcpAppViews"));

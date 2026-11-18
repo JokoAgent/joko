@@ -23,6 +23,7 @@ const evidenceSteps = {
   "open-task-header": { action: "navigation", assertions: ["task-title-visible", "title-between-header-controls", "header-actions-within-viewport", "file-attachment-control-enabled"] },
   "task-actions-menu": { action: "menu", assertions: ["complete-task-actions", "actions-within-viewport"] },
   "send-native-input": { action: "text-entry", assertions: ["one-completed-run", "exact-fixture-dispatch", "one-active-mobile-connection", "persisted-timeline", "owner-generation-consistent"] },
+  "tap-conversation-share-row": { action: "gesture", assertions: ["select-from-message-menu", "body-tap-deselects", "body-tap-reselects", "cancel-restores-task"] },
   "open-image-gallery": { action: "resource-navigation", assertions: ["gallery-visible", "image-decoded", "gallery-retained-across-observations"] },
   "zoom-image-gallery": { action: "gesture", assertions: ["double-tap-zoom", "zoomed-tap-keeps-gallery-open"] },
   "short-image-drag": { action: "gesture", assertions: ["zoom-reset", "short-drag-keeps-gallery-open"] },
@@ -39,7 +40,7 @@ type EvidenceAction = "tap" | "text-entry" | "launch" | "double-tap" | "swipe" |
 type EvidenceScreenshot = "header" | "actions" | "timeline" | "gallery" | "gallery-zoomed" | "gallery-drag-reset"
   | "gallery-dismissed" | "resource-links" | "file-opened" | "file" | "restored"
   | "gallery-error" | "restored-error" | "file-error" | "resource-candidate" | "resource-error"
-  | "connection-add" | "connection-error" | "connection-identity-error" | "actions-scrolled";
+  | "connection-add" | "connection-error" | "connection-identity-error" | "actions-scrolled" | "share-selection" | "share-selection-error";
 type EvidenceResult = "running" | "passed" | "failed";
 type EvidenceStep = {
   name: EvidenceStepName;
@@ -354,6 +355,24 @@ async function runNativeScenario(): Promise<void> {
     && event.payload.kind.value.blocks.some((block) => block.content.case === "text" && block.content.value === answer))).toBe(true);
 
   await screenshot("timeline");
+  await completeStep();
+  await beginStep("tap-conversation-share-row");
+  try {
+    await tap("More actions for You", true);
+    await tap("Share as image");
+    await waitNode((node) => node.text === "1 selected", "original share selection");
+    const message = () => scrollToNode((node) => node.text === prompt, "the visible user message body", "earlier");
+    await interaction("tap", async () => tapNode(await message(), true));
+    await waitNode((node) => node.text === "0 selected", "deselected by tapping the message body");
+    await interaction("tap", async () => tapNode(await message(), true));
+    await waitNode((node) => node.text === "1 selected", "reselected by tapping the message body");
+    await screenshot("share-selection");
+    await tap("Cancel");
+    await waitNode((node) => node.contentDescription === "Task actions", "task restored after share selection");
+  } catch (error) {
+    await screenshot("share-selection-error").catch(() => undefined);
+    throw error;
+  }
   await completeStep();
   await beginStep("open-image-gallery");
   await tap("Workspace image", true);

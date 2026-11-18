@@ -294,7 +294,7 @@ beforeAll(async () => {
   vi.doMock("./mobile-delegated-reader", () => ({ useMobileDelegatedTasks: () => ({ entries: empty, loading: false }) }));
   vi.doMock("./use-mobile-hidden-history", () => ({ useMobileHiddenHistory: () => false }));
   vi.doMock("./use-mobile-conversation-share", () => ({ useMobileConversationShare: () => ({ active: shareSelectionActive, busy: false, allSelected: false, toggleAll() {},
-    selectedIds: [], enterVisible() {} }) }));
+    selectedIds: [], enterVisible() {}, rowTouchHandlers() {} }) }));
   vi.doMock("./use-mobile-screenshot-selection", () => ({ useMobileScreenshotSelection() {} }));
   ({ App, SessionsScreen, TaskScreen, NewTaskScreen } = await import("./App"));
 });

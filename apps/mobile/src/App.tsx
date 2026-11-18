@@ -6750,6 +6750,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           && mobileNativeIntentMessageMatches(activeMessageFocus, item);
         const markdownOwnerKey = `${taskDraftProfileId}/${state.selectedId}/${session?.nativeBinding?.runtimeGeneration}/${item.id}`;
         return <View accessibilityLiveRegion={linked ? "polite" : undefined}
+          {...conversationShare.rowTouchHandlers(item)}
           collapsable={false} ref={(view) => {
             if (view && mobileMessageShareable(item)) screenshotMessageViewsRef.current.set(item.id, view);
             else screenshotMessageViewsRef.current.delete(item.id);
