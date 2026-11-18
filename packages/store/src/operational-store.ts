@@ -8699,6 +8699,7 @@ export class OperationalStore {
         throw new RevisionConflictError("Session", id, expectedRevision, current.revision);
       }
       const descriptor = current.descriptor;
+      if (patch.archived === false && descriptor.deletedAt !== undefined) throw new NotFoundError("Session", id);
       const binding = patch.binding ?? descriptor.binding;
       if (binding.generation < descriptor.binding.generation) {
         throw new StaleGenerationError(descriptor.binding.generation, binding.generation);
@@ -11032,7 +11033,9 @@ export class OperationalStore {
         && (payload.role !== "assistant" || !validModelSubstitution(payload.modelSubstitution))) {
         throw new StoreError("A model substitution requires an exact assistant completion and bounded model identities.");
       }
-      if (payload.type === "device_changed") throw new StoreError("Device content cannot use Session routing.");
+      if (payload.type === "device_changed" || payload.type === "extension_oauth_changed") {
+        throw new StoreError("Owner events cannot use Session routing.");
+      }
       if (payload.type === "resource_usage" && (
         input.runId === undefined || payload.runtimeGeneration !== input.generation
       )) {

@@ -17727,14 +17727,18 @@ async function dispatchMutation(
           payload.case,
           payload.value.sessionId,
           { archived: false, preserveActivityOnRestore: true },
-          existing.descriptor.worktree?.state === "preserved"
+          existing.descriptor.deletedAt === undefined && existing.descriptor.worktree?.state === "preserved"
             ? async () => {
                 if (dependencies.sessionWorktrees === undefined) {
                   throw new ConnectError("Isolated workspace lifecycle is unavailable.", Code.FailedPrecondition);
                 }
-                await dependencies.sessionWorktrees.restore(payload.value.sessionId, {
-                  assertCurrent: () => { dependencies.connections.fence(connection); }
-                });
+                const sessionId = payload.value.sessionId;
+                const assertCurrent = () => {
+                  dependencies.connections.fence(connection);
+                  if (dependencies.store.getSession(sessionId).descriptor.deletedAt !== undefined) throw new NotFoundError("Session", sessionId);
+                };
+                assertCurrent();
+                await dependencies.sessionWorktrees.restore(sessionId, { assertCurrent });
               }
             : undefined
         );

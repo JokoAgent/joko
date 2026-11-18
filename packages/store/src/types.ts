@@ -1433,7 +1433,7 @@ export interface AppendEventInput {
 }
 
 export interface PersistedSessionEvent extends EventEnvelope {
-  readonly payload: Exclude<EventEnvelope["payload"], { readonly type: "device_changed" }>;
+  readonly payload: Exclude<EventEnvelope["payload"], { readonly type: "device_changed" | "extension_oauth_changed" }>;
   readonly globalCursor: bigint;
   readonly metadata?: {
     readonly namespace: string;
@@ -1442,12 +1442,12 @@ export interface PersistedSessionEvent extends EventEnvelope {
 }
 
 /** Owner routing is empty at the public boundary; durable routing columns are NULL. */
-export interface PersistedDeviceEvent extends Omit<EventEnvelope, "payload" | "runId" | "attemptId" | "operationId" | "pi"> {
+export interface PersistedOwnerEvent extends Omit<EventEnvelope, "payload" | "runId" | "attemptId" | "operationId" | "pi"> {
   readonly backendId: "";
   readonly targetId: "";
   readonly sessionId: "";
   readonly generation: 0;
-  readonly payload: Extract<EventEnvelope["payload"], { readonly type: "device_changed" }>;
+  readonly payload: Extract<EventEnvelope["payload"], { readonly type: "device_changed" | "extension_oauth_changed" }>;
   readonly globalCursor: bigint;
   readonly runId?: never;
   readonly attemptId?: never;
@@ -1456,7 +1456,11 @@ export interface PersistedDeviceEvent extends Omit<EventEnvelope, "payload" | "r
   readonly metadata?: never;
 }
 
-export type PersistedEvent = PersistedSessionEvent | PersistedDeviceEvent;
+export interface PersistedDeviceEvent extends PersistedOwnerEvent {
+  readonly payload: Extract<PersistedOwnerEvent["payload"], { readonly type: "device_changed" }>;
+}
+
+export type PersistedEvent = PersistedSessionEvent | PersistedOwnerEvent;
 
 export interface EventQuery {
   readonly afterCursor?: bigint;

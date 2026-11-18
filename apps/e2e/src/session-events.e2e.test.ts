@@ -35,6 +35,7 @@ import {
   cloneMutation,
   compactMutation,
   createSessionMutation,
+  deleteMutation,
   editQueuedInputMutation,
   exportMutation,
   forkMutation,
@@ -654,6 +655,38 @@ describe("session host, durable events, and reconnect semantics", () => {
     const restored = (await paired.clients.session.getSession({ sessionId })).session;
     expect(restored?.archived).toBe(false);
     expect(restored?.lastActivityAt).toEqual(archived?.lastActivityAt);
+  });
+
+  it("rejects the next restore from a stale batch after another Owner deletes that task", async () => {
+    fixture = await OrchestratorE2eFixture.start({ profiles: [PI_LIKE_PROFILE] });
+    const first = await fixture.pair("Restoring Owner");
+    const second = await fixture.pair("Deleting Owner");
+    const createTask = async (displayName: string) => sessionIdFrom(await submit(first.clients.operation, first.connectionId,
+      createSessionMutation({ backendId: fixture!.adapter().id, targetId: fixture!.targetId(), displayName })));
+    const earlier = await createTask("First archived task");
+    const removed = await createTask("Next archived task");
+    for (const sessionId of [earlier, removed]) {
+      expect((await submit(first.clients.operation, first.connectionId, archiveMutation(sessionId, true))).state)
+        .toBe(OperationState.SUCCEEDED);
+    }
+    expect((await submit(first.clients.operation, first.connectionId, archiveMutation(earlier, false))).state)
+      .toBe(OperationState.SUCCEEDED);
+    expect((await submit(second.clients.operation, second.connectionId, deleteMutation(removed))).state)
+      .toBe(OperationState.SUCCEEDED);
+    const original = fixture.application.store.getSessionSnapshot(removed);
+    expect(original.session.descriptor.deletedAt).toBeDefined();
+    const staleRestoreId = randomUUID();
+    await expect(submit(first.clients.operation, first.connectionId, archiveMutation(removed, false), staleRestoreId))
+      .rejects.toMatchObject({ code: Code.NotFound });
+    const receipt = (await first.clients.operation.getOperation({ operationId: staleRestoreId })).operation;
+    expect(receipt?.state).toBe(OperationState.FAILED);
+    expect(receipt?.result).toBeUndefined();
+    const retained = fixture.application.store.getSessionSnapshot(removed);
+    expect(retained.session).toEqual(original.session);
+    expect(retained.eventSequence).toBe(original.eventSequence);
+    const owner = (await first.clients.event.getSnapshot({})).snapshot;
+    expect(owner?.sessions.find(task => task.sessionId === earlier)?.archived).toBe(false);
+    expect(owner?.sessions.some(task => task.sessionId === removed)).toBe(false);
   });
 
   it("disconnecting the event client never aborts an owned Run", async () => {
