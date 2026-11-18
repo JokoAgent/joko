@@ -60,6 +60,7 @@ function stubApplication(overrides: Record<string, unknown> = {}): OrchestratorA
     connections: { fence: () => undefined, onRevoked: () => () => undefined, ...(overrides.connections as object ?? {}) },
     sessionHost: {
       sideChatSourceAllowed: () => false,
+      hydrateBoundNativeCatalogHistory: async () => undefined,
       getSessionRuntimeControl: () => ({
         generation: 0,
         fallbackHop: 0,

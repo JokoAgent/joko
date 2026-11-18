@@ -101,10 +101,11 @@ mountedIt("recovers the same mounted video after URL, cover and player failures 
     await page.setViewportSize({ width: 390, height: 844 });
     await page.emulateMedia({ reducedMotion: "reduce", colorScheme: "dark" });
     await page.evaluate(() => { document.documentElement.dataset.theme = "dark"; });
-    const closeDetails = page.locator(".inspector-dock-group[data-edge]").getByRole("button", { name: "Close details", exact: true });
-    if (await closeDetails.isVisible()) await closeDetails.tap();
     const closeNavigation = page.getByLabel("Task navigation").getByRole("button", { name: "Close navigation", exact: true });
     if (await closeNavigation.isVisible()) await closeNavigation.tap();
+    await page.locator(".panel-scrim--navigation").waitFor({ state: "hidden" });
+    const closeDetails = page.locator(".inspector-dock-group[data-edge]").getByRole("button", { name: "Close details", exact: true });
+    if (await closeDetails.isVisible()) await closeDetails.tap();
     await failVideo(artifact.locator("video"));
     const narrowRetry = artifact.getByRole("button", { name: "Retry", exact: true });
     await narrowRetry.scrollIntoViewIfNeeded();

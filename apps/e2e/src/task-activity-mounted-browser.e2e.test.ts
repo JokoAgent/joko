@@ -1,6 +1,6 @@
 import { mkdir } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
-import { chromium, type Page } from "playwright-core";
+import { chromium, type Page, type Response } from "playwright-core";
 import { expect, it } from "vitest";
 import { OrchestratorE2eFixture } from "./fixture.js";
 import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
@@ -34,8 +34,21 @@ mountedIt("tracks real task panes across shared-owner tabs and revokes only the 
     const key = page.locator(".pair-form textarea"); if (await key.count()) await key.fill(fixture.application.linkspanIdentity!.publicKey);
     await page.getByLabel("Pairing code", { exact: true }).fill(challenge.code);
     await page.getByLabel("Device name", { exact: true }).fill(name);
-    await page.locator("form.pair-form button[type=submit]").click();
-    await page.locator(".app").waitFor({ timeout: 30_000 });
+    const responseStatuses: number[] = [];
+    const observePairing = (response: Response) => {
+      if (new URL(response.url()).pathname === "/joko.v1.ConnectionService/CompletePairing") responseStatuses.push(response.status());
+    };
+    page.on("response", observePairing);
+    try {
+      await page.locator("form.pair-form button[type=submit]").click();
+      await page.locator(".app").waitFor({ timeout: 30_000 });
+      expect(responseStatuses).toEqual([200]);
+    } catch (cause) {
+      await capture("pairing-failure", page).catch(() => undefined);
+      const persistedDevice = fixture.application.store.listDevices().some(device => device.name === name);
+      const alerts = (await page.getByRole("alert").allTextContents()).slice(0, 4).map(text => text.slice(0, 240));
+      throw new Error(`The activity fixture could not open the paired browser. ${JSON.stringify({ responseStatuses, persistedDevice, alerts })}`, { cause });
+    } finally { page.off("response", observePairing); }
     await route(page, "#/settings/general"); await page.locator(".theme-picker").waitFor();
     return fixture.application.store.listDevices().find(device => device.name === name)!.id;
   };
@@ -53,6 +66,8 @@ mountedIt("tracks real task panes across shared-owner tabs and revokes only the 
   };
   try {
     const manager = await fixture.pair("Activity task manager");
+    // Each browser below redeems an owner-issued code through the manual form.
+    fixture.application.connections.closePairingWindow();
     const tasks: string[] = [];
     for (const displayName of ["Activity task A", "Activity task B"]) tasks.push(sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
       createSessionMutation({ backendId: fixture.adapter().id, targetId: fixture.targetId(), displayName }))));
@@ -94,7 +109,9 @@ mountedIt("tracks real task panes across shared-owner tabs and revokes only the 
     await openTask(observer, tasks[0]!);
     await inline.getByRole("button", { name: `Expand active device notice: ${remoteName} is viewing tasks on this node`, exact: true }).click();
 
-    await pair(third, "Another active device"); await openTask(third, tasks[0]!);
+    const thirdId = await pair(third, "Another active device");
+    expect(thirdId).not.toBe(remoteId);
+    await openTask(third, tasks[0]!);
     await inline.getByRole("button", { name: "Manage devices", exact: true }).click();
     await observer.locator(".device-control-settings").waitFor();
     expect(await observer.evaluate(() => location.hash)).toBe("#/settings/connections");
@@ -112,6 +129,7 @@ mountedIt("tracks real task panes across shared-owner tabs and revokes only the 
     await inline.getByRole("button", { name: "Manage devices", exact: true }).waitFor();
     await confirmation.getByRole("button", { name: "Revoke access", exact: true }).click();
     await expect.poll(() => fixture.application.store.getDevice(remoteId).state).toBe("revoked");
+    expect(fixture.application.store.getDevice(thirdId).state).toBe("active");
     await inline.getByText("Another active device is viewing tasks on this node", { exact: true }).waitFor();
     await capture("original-device-revoked"); expect(errors).toEqual([]);
   } catch (error) { await capture("failure").catch(() => undefined); throw error; }
