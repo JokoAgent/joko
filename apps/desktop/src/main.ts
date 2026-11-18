@@ -251,6 +251,7 @@ import {
   createDesktopWindowInteractionSettingsStore,
   type DesktopWindowInteractionSettingsStore
 } from "./window-interaction-settings.js";
+import { desktopWindowBackground, isDesktopWindowTheme, openDesktopWindowAppearance } from "./window-appearance.js";
 import {
   createDesktopMainWindowCloseSettingsStore,
   parseMainWindowCloseSettingsChange,
@@ -945,6 +946,7 @@ let applicationMenuLocale: DesktopLocale = "en";
 let managedExtensionHostLocale: DesktopLocale | undefined;
 let managedExtensionHostLocaleSequence = 0n;
 let desktopRemoteDesktopDark: boolean | undefined;
+let desktopWindowAppearance: Awaited<ReturnType<typeof openDesktopWindowAppearance>> | undefined;
 const applicationMenuConfigurationState = createMacApplicationMenuConfigurationState({
   shortcutRecording: false,
   newSessionAccelerator: "Command+N",
@@ -1231,6 +1233,9 @@ if (!app.requestSingleInstanceLock()) {
     initializeDesktopUpdateAutoSettings();
     initializeDesktopAttentionBadge();
     await initializeDesktopWindowInteractionSettings();
+    if (process.platform === "win32") {
+      desktopWindowAppearance = await openDesktopWindowAppearance(join(app.getPath("userData"), "window-appearance.txt"));
+    }
     desktopMainWindowCloseSettings = createDesktopMainWindowCloseSettingsStore(
       join(app.getPath("userData"), "main-window-close-settings.json"), process.platform
     );
@@ -1261,7 +1266,8 @@ if (!app.requestSingleInstanceLock()) {
     if (externalPackagedE2e && packagedSmokeResultPath !== undefined) {
       writeFileSync(`${packagedSmokeResultPath}.startup.json`, JSON.stringify({
         pid: process.pid, executablePath: process.execPath,
-        userDataPath: app.getPath("userData"), packaged: app.isPackaged
+        userDataPath: app.getPath("userData"), packaged: app.isPackaged,
+        backgroundColor: mainWindow?.getBackgroundColor()
       }), { flag: "wx", mode: 0o600 });
     }
     initializeDesktopDevicePeerAgentLifecycle();
@@ -1279,6 +1285,12 @@ if (!app.requestSingleInstanceLock()) {
       app.exit(1);
     }
   });
+}
+
+function ordinaryWindowStartupAppearance(): { readonly backgroundColor: string; readonly additionalArguments?: string[] } {
+  const theme = desktopWindowAppearance?.theme();
+  if (theme === undefined) return { backgroundColor: "#f2f2f2" };
+  return { backgroundColor: desktopWindowBackground(theme, nativeTheme.shouldUseDarkColors), additionalArguments: [`--joko-window-theme=${theme}`] };
 }
 
 function createWindow(): void {
@@ -1309,6 +1321,7 @@ function createWindow(): void {
   });
   managedMainWindowState = mainWindowState;
   managedInspectorWindowState = inspectorWindowState;
+  const appearance = ordinaryWindowStartupAppearance();
   const window = new BrowserWindow({
     x: mainWindowState.x,
     y: mainWindowState.y,
@@ -1316,7 +1329,7 @@ function createWindow(): void {
     height: mainWindowState.height,
     minWidth: 800,
     minHeight: 600,
-    backgroundColor: "#f2f2f2",
+    backgroundColor: appearance.backgroundColor,
     title: "Joko",
     autoHideMenuBar: true,
     show: false,
@@ -1326,6 +1339,7 @@ function createWindow(): void {
       // Sandboxed Electron preload scripts run in a restricted CommonJS
       // environment. TypeScript emits this `.cts` entry as preload.cjs.
       preload: join(sourceDirectory, "preload.cjs"),
+      ...(appearance.additionalArguments === undefined ? {} : { additionalArguments: appearance.additionalArguments }),
       contextIsolation: true,
       nodeIntegration: false,
       nodeIntegrationInWorker: false,
@@ -5619,6 +5633,7 @@ async function openSessionApplicationWindow(
     workArea: dropWorkArea,
     windowSize: initialBounds
   });
+  const appearance = ordinaryWindowStartupAppearance();
   const window = new BrowserWindow({
     x: dropBounds?.x ?? initialBounds.x,
     y: dropBounds?.y ?? initialBounds.y,
@@ -5626,7 +5641,7 @@ async function openSessionApplicationWindow(
     height: dropBounds?.height ?? initialBounds.height,
     minWidth: Math.min(800, dropBounds?.width ?? 800),
     minHeight: Math.min(600, dropBounds?.height ?? 600),
-    backgroundColor: "#f2f2f2",
+    backgroundColor: appearance.backgroundColor,
     title: "Joko",
     autoHideMenuBar: true,
     show: false,
@@ -5634,6 +5649,7 @@ async function openSessionApplicationWindow(
     ...frameOptions,
     webPreferences: {
       preload: join(sourceDirectory, "preload.cjs"),
+      ...(appearance.additionalArguments === undefined ? {} : { additionalArguments: appearance.additionalArguments }),
       contextIsolation: true,
       nodeIntegration: false,
       nodeIntegrationInWorker: false,
@@ -9157,6 +9173,22 @@ function registerIpc(): void {
     const window = assertTrustedInspectorWindowSender(event);
     if (window.isMaximized()) window.unmaximize(); else window.maximize();
     return window.isMaximized();
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.windowMirrorTheme, async (event, theme: unknown) => {
+    const assertOwner = (): void => {
+      assertTrustedIpcSender(event);
+      if (quitting || event.sender !== mainWindow?.webContents && !sessionWindows.hasContents(event.sender)) {
+        throw new Error("Window appearance requires a current application window.");
+      }
+    };
+    assertOwner();
+    const appearance = desktopWindowAppearance;
+    if (!appearance || !isDesktopWindowTheme(theme)) throw new TypeError("Invalid Desktop window appearance.");
+    await appearance.save(theme, assertOwner);
+    const color = desktopWindowBackground(appearance.theme(), nativeTheme.shouldUseDarkColors);
+    for (const window of [mainWindow, ...sessionWindows.values()]) {
+      if (window && !window.isDestroyed()) window.setBackgroundColor(color);
+    }
   });
   ipcMain.handle(DESKTOP_CHANNELS.windowSetZoomFactor, (event, ...parameters: unknown[]) => {
     assertTrustedWindowControlSender(event);

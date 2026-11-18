@@ -496,6 +496,8 @@ interface JokoDesktopApi {
     get(): Promise<JokoDesktopAppInfo>;
   };
   readonly window: {
+    readonly startupTheme?: "dark" | "light" | "system";
+    readonly mirrorTheme?: (theme: "dark" | "light" | "system") => Promise<void>;
     minimize(): Promise<void>;
     toggleMaximize(): Promise<boolean>;
     toggleFullscreen(): Promise<boolean>;

@@ -779,6 +779,14 @@ export function useAppController(): AppController {
         if (refreshConversation) effectivePreferences = withConversationPreferences(effectivePreferences, durable);
       }
       if (cancelled) return;
+      const mirrorWindowTheme = desktop?.window?.mirrorTheme;
+      if (mirrorWindowTheme !== undefined) {
+        void withDesktopWindowThemeLock(async () => {
+          if (cancelled) return;
+          const saved = await local.readPreferences();
+          if (!cancelled) await mirrorWindowTheme(saved?.theme ?? DEFAULT_UI_PREFERENCES.theme);
+        }).catch(() => undefined);
+      }
       localRef.current = local;
       preferencesRef.current = effectivePreferences;
       setState((current) => ({
@@ -924,14 +932,15 @@ export function useAppController(): AppController {
     enqueueSessionNotificationPreferenceRefresh
   ]);
 
+  const windowTheme = state.ready ? state.preferences.theme : window.jokoDesktop?.window?.startupTheme ?? state.preferences.theme;
   useEffect(() => {
-    applyTheme(state.preferences.theme);
-    if (state.preferences.theme !== "system") return;
+    applyTheme(windowTheme);
+    if (windowTheme !== "system") return;
     const colorScheme = matchMedia("(prefers-color-scheme: dark)");
     const syncSystemThemeColor = (): void => applyTheme("system");
     colorScheme.addEventListener("change", syncSystemThemeColor);
     return () => colorScheme.removeEventListener("change", syncSystemThemeColor);
-  }, [state.preferences.theme]);
+  }, [windowTheme]);
 
   useEffect(() => {
     document.documentElement.lang = state.effectiveLocale;
@@ -1005,6 +1014,14 @@ export function useAppController(): AppController {
   const updatePreferences = useCallback(async (patch: Partial<UiPreferences>): Promise<void> => {
     await mutatePreferences((current) => ({ ...current, ...patch }));
   }, [mutatePreferences]);
+  const setTheme = useCallback((theme: Theme): Promise<void> => {
+    const mirrorWindowTheme = window.jokoDesktop?.window?.mirrorTheme;
+    if (mirrorWindowTheme === undefined) return updatePreferences({ theme });
+    return withDesktopWindowThemeLock(async () => {
+      await updatePreferences({ theme });
+      await mirrorWindowTheme(theme).catch(() => undefined);
+    });
+  }, [updatePreferences]);
   const setComposerSendShortcut = useCallback<AppController["setComposerSendShortcut"]>(
     (composerSendShortcut) => updatePreferences({ composerSendShortcut }),
     [updatePreferences]
@@ -3811,7 +3828,7 @@ export function useAppController(): AppController {
     setAutomaticConnectionEnabled,
     navigate,
     setLocale,
-    setTheme: (theme) => updatePreferences({ theme }),
+    setTheme,
     setUiFamily,
     setCodeFamily,
     setUiSize,
@@ -5433,6 +5450,10 @@ function sameOrchestratorOrigin(left: string, right: string): boolean {
   } catch {
     return false;
   }
+}
+
+function withDesktopWindowThemeLock(apply: () => Promise<void>): Promise<void> {
+  return window.navigator.locks?.request("joko:desktop-window-theme:v1", apply) ?? apply();
 }
 
 function applyTheme(theme: Theme): void {

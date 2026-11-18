@@ -105,6 +105,7 @@ const DESKTOP_CHANNELS = {
   windowToggleMaximize: "joko:window:toggle-maximize",
   windowToggleFullscreen: "joko:window:toggle-fullscreen",
   windowSetZoomFactor: "joko:window:set-zoom-factor",
+  windowMirrorTheme: "joko:window:mirror-theme",
   windowClose: "joko:window:close",
   sessionWindowOpen: "joko:session-window:open",
   sessionWindowGetOwner: "joko:session-window:owner:get",
@@ -366,6 +367,10 @@ const desktopCapabilities = Object.freeze([
   "window.activationClick"
 ] as const);
 
+const themeArgument = process.argv.findLast(arg => arg.startsWith("--joko-window-theme="))?.slice("--joko-window-theme=".length);
+const startupTheme = process.platform === "win32" && (themeArgument === "light" || themeArgument === "dark" || themeArgument === "system")
+  ? themeArgument : undefined;
+
 const desktopApi = Object.freeze({
   ...(mainDocumentOccurrence === undefined ? {} : { voiceConversation: Object.freeze({
     control: (serverId: string, bytes: Uint8Array): Promise<Uint8Array> => {
@@ -452,6 +457,8 @@ const desktopApi = Object.freeze({
     get: (): Promise<DesktopAppInfo> => ipcRenderer.invoke(DESKTOP_CHANNELS.appGetInfo)
   }),
   window: Object.freeze({
+    ...(startupTheme === undefined ? {} : { startupTheme, mirrorTheme: (theme: "light" | "dark" | "system"): Promise<void> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.windowMirrorTheme, theme) }),
     minimize: (): Promise<void> => ipcRenderer.invoke(DESKTOP_CHANNELS.windowMinimize),
     toggleMaximize: (): Promise<boolean> => ipcRenderer.invoke(DESKTOP_CHANNELS.windowToggleMaximize),
     toggleFullscreen: (): Promise<boolean> => ipcRenderer.invoke(DESKTOP_CHANNELS.windowToggleFullscreen),
