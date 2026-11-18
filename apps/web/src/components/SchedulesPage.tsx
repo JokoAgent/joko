@@ -888,11 +888,18 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
   const selectableExtraDirectories = extraDirectories.filter((directory) => directory.workspaceId === selectedTarget?.workspaceId && directory.trusted);
   const extraDirectoriesSupported = backend?.capabilities.get("workspace.extra_dirs")?.supported === true;
   const validScriptTimeout = draft.scriptTimeoutMs === undefined || (Number.isSafeInteger(draft.scriptTimeoutMs) && draft.scriptTimeoutMs > 0);
+  const timezoneValid = isValidScheduleTimeZone(draft.timezone);
+  const timezoneInvalid = draft.timezone.trim().length > 0 && !timezoneValid;
+  const onceEpoch = draft.kind === "once" && timezoneValid
+    ? scheduleEpochFromLocalDateTime(draft.expression, draft.timezone, draft.onceTriggerAt)
+    : undefined;
+  const onceInvalid = draft.kind === "once" && draft.expression.length > 0 && timezoneValid && onceEpoch === undefined;
+  const oncePast = draft.kind === "once" && draft.enabled && onceEpoch !== undefined && onceEpoch <= Date.now();
   const valid = draft.name.trim().length > 0 && draft.targetId.length > 0 &&
     (draft.sessionMode !== "bound" || draft.sessionId.length > 0) &&
     (draft.executionMode === "script" ? draft.scriptCommand.trim().length > 0 && validScriptTimeout : draft.inputText.trim().length > 0) &&
     worktreeValid &&
-    validExpression(draft);
+    timezoneValid && validExpression(draft, onceEpoch, oncePast);
   const updateTarget = (targetId: string): void => {
     const target = targets.find((candidate) => candidate.id === targetId);
     const workspace = workspaces.find((candidate) => candidate.id === target?.workspaceId);
@@ -916,12 +923,6 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
       })
     }));
   };
-  const timezoneInvalid = draft.timezone.trim().length > 0 && !isValidScheduleTimeZone(draft.timezone);
-  const onceEpoch = draft.kind === "once" && !timezoneInvalid
-    ? scheduleEpochFromLocalDateTime(draft.expression, draft.timezone)
-    : undefined;
-  const onceInvalid = draft.kind === "once" && draft.expression.length > 0 && !timezoneInvalid && onceEpoch === undefined;
-  const oncePast = draft.kind === "once" && draft.enabled && onceEpoch !== undefined && onceEpoch <= Date.now();
   return <Modal open={open} title={schedule === undefined ? t("scheduler.editorNew") : `${t("scheduler.editorEdit")} · ${schedule.name}`} description={t("scheduler.editorBody")} size="large" onClose={() => { if (!saving && !hookBusy) onClose(); }}>
     <form className="schedule-editor" onSubmit={(event) => {
       event.preventDefault();
@@ -949,7 +950,7 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
           <Button disabled={!templateReady || saving} onClick={() => {
             if (selectedTemplate === undefined || !templateReady) return;
             const patch = scheduleTemplateDraftPatch(selectedTemplate, templateParameters);
-            setDraft((current) => ({ ...current, ...patch }));
+            setDraft((current) => ({ ...current, ...patch, onceTriggerAt: undefined }));
           }}>{t("scheduler.templateUseTemplate")}</Button>
         </>}
       </fieldset>}
@@ -992,9 +993,15 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
           const session = sessions.find((candidate) => candidate.id === event.target.value);
           setDraft((current) => ({ ...current, sessionId: event.target.value, backendId: session?.backendId ?? current.backendId, providerId: session?.model?.providerId ?? "", modelId: session?.model?.modelId ?? "", effort: session?.effort, fastMode: session?.fastMode ?? false, permissionMode: session?.permissionMode ?? current.permissionMode, planMode: session?.planMode ?? current.planMode }));
         }}><option value="">—</option>{matchingSessions.map((session) => <option value={session.id} key={session.id}>{session.name}</option>)}</SelectControl></label>}
-        <label className="field"><span>{t("scheduler.recurrence")}</span><SelectControl value={draft.kind} onChange={(event) => setDraft((current) => ({ ...current, kind: event.target.value as ScheduleDraft["kind"], expression: defaultExpression(event.target.value as ScheduleDraft["kind"], current.timezone) }))}><option value="manual">{t("scheduler.manual")}</option><option value="once">{t("scheduler.once")}</option><option value="interval">{t("scheduler.interval")}</option><option value="cron">{t("scheduler.cron")}</option></SelectControl></label>
-        {draft.kind !== "manual" && <label className="field"><span>{draft.kind === "once" ? t("scheduler.triggerAt") : draft.kind === "interval" ? t("scheduler.intervalSeconds") : t("scheduler.cronExpression")}</span><input required aria-invalid={onceInvalid || oncePast || undefined} type={draft.kind === "once" ? "datetime-local" : draft.kind === "interval" ? "number" : "text"} min={draft.kind === "interval" ? 1 : undefined} value={draft.expression} onChange={(event) => setDraft((current) => ({ ...current, expression: event.target.value }))} placeholder={draft.kind === "cron" ? "0 9 * * 1-5" : undefined} />{onceInvalid && <small className="inline-error">{t("scheduler.invalidOneShot")}</small>}{oncePast && <small className="inline-error">{t("scheduler.oneShotPast")}</small>}</label>}
-        <label className="field"><span>{t("scheduler.timezone")}</span><input required list="schedule-time-zone-options" aria-invalid={timezoneInvalid || undefined} value={draft.timezone} onChange={(event) => setDraft((current) => ({ ...current, timezone: event.target.value }))} />{timezoneInvalid && <small className="inline-error">{t("scheduler.invalidTimezone")}</small>}</label>
+        <label className="field"><span>{t("scheduler.recurrence")}</span><SelectControl value={draft.kind} onChange={(event) => {
+          const kind = event.target.value as ScheduleDraft["kind"];
+          setDraft((current) => ({ ...current, ...defaultRecurrence(kind, current.timezone) }));
+        }}><option value="manual">{t("scheduler.manual")}</option><option value="once">{t("scheduler.once")}</option><option value="interval">{t("scheduler.interval")}</option><option value="cron">{t("scheduler.cron")}</option></SelectControl></label>
+        {draft.kind !== "manual" && <label className="field"><span>{draft.kind === "once" ? t("scheduler.triggerAt") : draft.kind === "interval" ? t("scheduler.intervalSeconds") : t("scheduler.cronExpression")}</span><input required aria-invalid={onceInvalid || oncePast || undefined} type={draft.kind === "once" ? "datetime-local" : draft.kind === "interval" ? "number" : "text"} min={draft.kind === "interval" ? 1 : undefined} value={draft.expression} onChange={(event) => setDraft((current) => ({ ...current, expression: event.target.value, onceTriggerAt: undefined }))} placeholder={draft.kind === "cron" ? "0 9 * * 1-5" : undefined} />{onceInvalid && <small className="inline-error">{t("scheduler.invalidOneShot")}</small>}{oncePast && <small className="inline-error">{t("scheduler.oneShotPast")}</small>}</label>}
+        <label className="field"><span>{t("scheduler.timezone")}</span><input required list="schedule-time-zone-options" aria-invalid={timezoneInvalid || undefined} value={draft.timezone} onChange={(event) => {
+          const timezone = event.target.value;
+          setDraft((current) => ({ ...current, timezone, onceTriggerAt: timezone.trim() === current.timezone.trim() ? current.onceTriggerAt : undefined }));
+        }} />{timezoneInvalid && <small className="inline-error">{t("scheduler.invalidTimezone")}</small>}</label>
         <datalist id="schedule-time-zone-options">{scheduleTimeZoneOptions(draft.timezone).map((timezone) => <option value={timezone} key={timezone} />)}</datalist>
       </div>
       {draft.executionMode === "agent" ? <label className="interaction-input"><span>{t("scheduler.scheduledInput")}</span><textarea required rows={5} value={draft.inputText} onChange={(event) => setDraft((current) => ({ ...current, inputText: event.target.value }))} placeholder={t("scheduler.inputPlaceholder")} /></label> : <label className="interaction-input"><span>{t("scheduler.scriptCommand")}</span><textarea required rows={5} spellCheck={false} value={draft.scriptCommand} onChange={(event) => setDraft((current) => ({ ...current, scriptCommand: event.target.value }))} placeholder={t("scheduler.scriptCommandPlaceholder")} /></label>}
@@ -1092,6 +1099,7 @@ export function scheduleDraft(schedule: ScheduleView | undefined, targets: reado
   const backendId = schedule?.backendId ?? target?.backendId ?? session?.backendId ?? "";
   const descriptor = models.find((candidate) => candidate.backendId === backendId && candidate.providerId === model?.providerId && candidate.modelId === model?.modelId);
   const timezone = schedule?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  const onceTriggerAt = schedule?.kind === "once" ? Date.parse(schedule.expression) : undefined;
   return {
     name: schedule?.name ?? "",
     backendId,
@@ -1100,7 +1108,9 @@ export function scheduleDraft(schedule: ScheduleView | undefined, targets: reado
     sessionId: schedule?.sessionId ?? "",
     enabled: schedule?.enabled ?? true,
     kind: schedule?.kind ?? "manual",
-    expression: schedule === undefined ? "" : schedule.kind === "once" ? scheduleLocalDateTimeFromEpoch(Date.parse(schedule.expression), timezone) : schedule.kind === "manual" ? "" : schedule.expression.replace(/s$/, ""),
+    expression: onceTriggerAt !== undefined ? scheduleLocalDateTimeFromEpoch(onceTriggerAt, timezone)
+      : schedule === undefined || schedule.kind === "manual" ? "" : schedule.expression.replace(/s$/, ""),
+    onceTriggerAt: Number.isFinite(onceTriggerAt) ? onceTriggerAt : undefined,
     timezone,
     inputText: schedule?.inputText ?? "",
     executionMode: schedule?.executionMode ?? "agent",
@@ -1126,21 +1136,19 @@ export function scheduleDraft(schedule: ScheduleView | undefined, targets: reado
   };
 }
 
-function validExpression(draft: ScheduleDraft): boolean {
-  if (!isValidScheduleTimeZone(draft.timezone)) return false;
+function validExpression(draft: ScheduleDraft, onceEpoch: number | undefined, oncePast: boolean): boolean {
   if (draft.kind === "manual") return true;
-  if (draft.kind === "once") {
-    const triggerAt = scheduleEpochFromLocalDateTime(draft.expression, draft.timezone);
-    return triggerAt !== undefined && (!draft.enabled || triggerAt > Date.now());
-  }
+  if (draft.kind === "once") return onceEpoch !== undefined && !oncePast;
   if (draft.kind === "interval") return Number.isInteger(Number(draft.expression)) && Number(draft.expression) > 0;
   return draft.expression.trim().length > 0;
 }
 
-function defaultExpression(kind: ScheduleDraft["kind"], timezone: string): string {
-  if (kind === "once") return scheduleLocalDateTimeFromEpoch(Date.now() + 3_600_000, timezone);
-  if (kind === "interval") return "3600";
-  return "";
+function defaultRecurrence(kind: ScheduleDraft["kind"], timezone: string): Pick<ScheduleDraft, "kind" | "expression" | "onceTriggerAt"> {
+  if (kind === "once") {
+    const onceTriggerAt = Math.floor((Date.now() + 3_600_000) / 60_000) * 60_000;
+    return { kind, expression: scheduleLocalDateTimeFromEpoch(onceTriggerAt, timezone), onceTriggerAt };
+  }
+  return { kind, expression: kind === "interval" ? "3600" : "", onceTriggerAt: undefined };
 }
 
 export function scheduleRuntimeLabel(status: ScheduleRuntimeStatus, runtime: SchedulerRuntimeView | undefined, t: Translator): string {

@@ -21,19 +21,27 @@ export function isValidScheduleTimeZone(timeZone: string): boolean {
 
 /** Convert a datetime-local wall clock in the selected IANA timezone. Native
  * Date.parse() would instead apply the browser's own timezone and silently
- * move a remote schedule. Nonexistent DST wall clocks fail closed. */
-export function scheduleEpochFromLocalDateTime(value: string, timeZone: string): number | undefined {
-  const intended = parseLocalDateTime(value);
-  if (intended === undefined || !isValidScheduleTimeZone(timeZone)) return undefined;
+ * move a remote schedule. Nonexistent DST wall clocks fail closed. Preserve
+ * a prefilled instant when the control still displays its local time. */
+export function scheduleEpochFromLocalDateTime(value: string, timeZone: string, preferredEpoch?: number): number | undefined {
+  const localValue = value.trim();
+  const intended = parseLocalDateTime(localValue);
+  const zone = timeZone.trim();
+  if (intended === undefined || !isValidScheduleTimeZone(zone)) return undefined;
+  if (preferredEpoch !== undefined && Number.isSafeInteger(preferredEpoch) && Number.isFinite(new Date(preferredEpoch).getTime())) {
+    const preferred = dateTimeParts(preferredEpoch, zone);
+    const compareSeconds = localValue.length > "YYYY-MM-DDTHH:mm".length;
+    if (sameDateTimeParts(preferred, intended, compareSeconds)) return preferredEpoch;
+  }
   const wallClockAsUtc = partsAsUtc(intended);
   let candidate = wallClockAsUtc;
   for (let attempt = 0; attempt < 5; attempt += 1) {
-    const actual = dateTimeParts(candidate, timeZone.trim());
+    const actual = dateTimeParts(candidate, zone);
     const delta = wallClockAsUtc - partsAsUtc(actual);
     if (delta === 0) break;
     candidate += delta;
   }
-  return sameDateTimeParts(dateTimeParts(candidate, timeZone.trim()), intended) ? candidate : undefined;
+  return sameDateTimeParts(dateTimeParts(candidate, zone), intended) ? candidate : undefined;
 }
 
 /** Render a persisted instant as the wall clock owned by its schedule, not by
@@ -45,7 +53,7 @@ export function scheduleLocalDateTimeFromEpoch(epoch: number, timeZone: string):
 }
 
 function parseLocalDateTime(value: string): DateTimeParts | undefined {
-  const match = LOCAL_DATE_TIME.exec(value.trim());
+  const match = LOCAL_DATE_TIME.exec(value);
   if (match === null) return undefined;
   const parts: DateTimeParts = {
     year: Number(match[1]),
@@ -102,9 +110,9 @@ function partsAsUtc(parts: DateTimeParts): number {
   return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
 }
 
-function sameDateTimeParts(left: DateTimeParts, right: DateTimeParts): boolean {
+function sameDateTimeParts(left: DateTimeParts, right: DateTimeParts, compareSeconds = true): boolean {
   return left.year === right.year && left.month === right.month && left.day === right.day &&
-    left.hour === right.hour && left.minute === right.minute && left.second === right.second;
+    left.hour === right.hour && left.minute === right.minute && (!compareSeconds || left.second === right.second);
 }
 
 function pad(value: number, width = 2): string {

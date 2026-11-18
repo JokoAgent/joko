@@ -91,7 +91,8 @@ export function buildUsageLimitScheduleDraft(
   now = Date.now()
 ): ScheduleDraft {
   const triggerAt = intent.resetAtMs === null ? undefined : intent.resetAtMs + 60_000;
-  const scheduled = triggerAt !== undefined && Number.isFinite(triggerAt) && triggerAt > now;
+  const onceTriggerAt = triggerAt !== undefined && Number.isSafeInteger(triggerAt) && triggerAt > now && Number.isFinite(new Date(triggerAt).getTime())
+    ? triggerAt : undefined;
   return {
     ...base,
     name: labels.name,
@@ -99,8 +100,9 @@ export function buildUsageLimitScheduleDraft(
     targetId: session?.targetId ?? base.targetId,
     sessionMode: session === undefined ? base.sessionMode : "bound",
     sessionId: session?.id ?? base.sessionId,
-    kind: scheduled ? "once" : "manual",
-    expression: scheduled ? scheduleLocalDateTimeFromEpoch(triggerAt, base.timezone) : "",
+    kind: onceTriggerAt === undefined ? "manual" : "once",
+    expression: onceTriggerAt === undefined ? "" : scheduleLocalDateTimeFromEpoch(onceTriggerAt, base.timezone),
+    onceTriggerAt,
     inputText: labels.prompt,
     executionMode: "agent",
     providerId: session?.model?.providerId ?? base.providerId,

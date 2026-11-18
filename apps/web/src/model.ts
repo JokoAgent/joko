@@ -2967,6 +2967,7 @@ export interface ScheduleDraft {
   readonly enabled: boolean;
   readonly kind: ScheduleView["kind"];
   readonly expression: string;
+  readonly onceTriggerAt?: number;
   readonly timezone: string;
   readonly inputText: string;
   readonly executionMode: ScheduleView["executionMode"];

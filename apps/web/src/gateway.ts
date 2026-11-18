@@ -24856,7 +24856,7 @@ function deliveryMode(value: ComposerDraft["deliveryMode"]): QueueDeliveryMode {
 
 function scheduleRecurrence(draft: ScheduleDraft): MessageInitShape<typeof ScheduleRecurrenceSchema> {
   if (draft.kind === "once") {
-    const triggerAt = scheduleEpochFromLocalDateTime(draft.expression, draft.timezone);
+    const triggerAt = scheduleEpochFromLocalDateTime(draft.expression, draft.timezone, draft.onceTriggerAt);
     if (triggerAt === undefined) throw new GatewayError("Enter a valid one-time trigger date in the selected IANA timezone.");
     return { kind: { case: "oneShot", value: { triggerAt: timestampFromMs(triggerAt) } } };
   }
