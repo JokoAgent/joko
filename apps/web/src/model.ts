@@ -37,6 +37,9 @@ export interface MachineSessionCacheView {
   readonly name: string;
   readonly state: SessionView["state"];
   readonly targetName?: string;
+  readonly backendId?: string;
+  /** Null identifies a Dialogue. Older caches did not carry navigation membership. */
+  readonly project?: { readonly id: string; readonly name: string } | null;
   readonly pinned: boolean;
   readonly archived: boolean;
   readonly lastActivityAt: number;

@@ -2,9 +2,11 @@
 
 import { act, createRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import Sortable, { type SortableEvent } from "sortablejs";
 import { afterEach, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
+import { machineCacheFromSnapshot } from "../machine-federation.js";
 import { emptySnapshot, type ExtensionCatalogEntryView, type ScheduleView, type SessionTitleSuggestionView, type SessionView } from "../model.js";
 import { DEFAULT_SIDEBAR_OWNER_LAYOUT, SIDEBAR_DIALOGUE_FILTER_ID, type SidebarDisplayPreferences } from "../sidebar-layout.js";
 import { Sidebar, type SidebarProps, visibleSidebarSessionIds, sessionsForSidebarStatus } from "./Sidebar.js";
@@ -470,6 +472,146 @@ describe("Sidebar organizer display controls", () => {
     expect(onNewDialogue).toHaveBeenCalledWith("backend");
   });
 
+  it("preserves hidden pinned slots when changing the shown machine or reordering its pins", async () => {
+    const local = activeProfileMachineControl("local");
+    const remote = { id: "remote", serverId: "remote-server", deviceId: "remote-device", origin: "https://remote.example", name: "Remote node" };
+    const remoteSessions = ["b1", "b2"].map((id, index) => ({
+      id, name: id, state: "idle" as const, archived: false, pinned: true, taskTags: [], lastActivityAt: 20 - index
+    }));
+    const cache = { profileId: remote.id, serverId: remote.serverId, origin: remote.origin, name: remote.name, updatedAt: 50, sessions: remoteSessions };
+    const onSelectionChange = vi.fn();
+    const machineControl = {
+      ...local,
+      profiles: [...local.profiles, remote],
+      presenceByProfile: { local: "current", remote: "online" } as const,
+      caches: [cache],
+      onSelectionChange
+    };
+    const ownerLayout = {
+      ...DEFAULT_SIDEBAR_OWNER_LAYOUT,
+      manualPinnedOrder: ["a1", "remote:remote:b1", "a2", "remote:remote:b2"]
+    };
+    const onOwnerLayoutChange = vi.fn();
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      snapshot: { ...emptySnapshot(), revision: 1n, sessions: ["a1", "a2"].map((id) => ({ ...session(), id, pinned: true })) },
+      machineControl,
+      sidebarOwnerLayouts: { owner: ownerLayout },
+      onSidebarOwnerLayoutChange: onOwnerLayoutChange
+    });
+    const list = required(rendered.container.querySelector<HTMLElement>(".session-section--pinned .session-section__sortable-sessions"));
+    const ids = () => [...list.querySelectorAll<HTMLElement>("[data-sortable-id]")].map((item) => item.dataset.sortableId);
+    expect(ids()).toEqual(ownerLayout.manualPinnedOrder);
+
+    const switcher = required(rendered.container.querySelector<HTMLDetailsElement>("details.machine-switcher"));
+    await act(async () => required(switcher.querySelector<HTMLElement>("summary")).click());
+    const remoteOption = required([...switcher.querySelectorAll(".machine-switcher__profile")]
+      .find((entry) => entry.textContent?.includes(remote.name)) ?? null);
+    await act(async () => required(remoteOption.querySelector<HTMLButtonElement>("button[role='checkbox']")).click());
+    expect(onSelectionChange).toHaveBeenCalledExactlyOnceWith([remote.id]);
+    await rendered.rerenderMachineControl({ ...machineControl, selection: [remote.id] });
+    expect(ids()).toEqual(["remote:remote:b1", "remote:remote:b2"]);
+    expect(onOwnerLayoutChange).not.toHaveBeenCalled();
+
+    const afterFilteredDrag = ["a1", "remote:remote:b2", "a2", "remote:remote:b1"];
+    const item = required(list.lastElementChild);
+    const sortable = Sortable.get(list);
+    expect(sortable?.options.onEnd).toBeTypeOf("function");
+    await act(async () => {
+      list.prepend(item);
+      sortable?.options.onEnd?.({ from: list, to: list, item, oldIndex: 1, newIndex: 0 } as SortableEvent);
+    });
+    expect(onOwnerLayoutChange).toHaveBeenCalledExactlyOnceWith({ manualPinnedOrder: afterFilteredDrag });
+    await rendered.rerenderOwnerLayouts({ owner: { ...ownerLayout, manualPinnedOrder: afterFilteredDrag } });
+    await rendered.rerenderMachineControl({ ...machineControl, presenceByProfile: { local: "current", remote: "offline" } });
+    expect(ids()).toEqual(afterFilteredDrag);
+
+    onOwnerLayoutChange.mockClear();
+    await rendered.rerenderMachineControl({
+      ...machineControl,
+      caches: [{ ...cache, sessions: remoteSessions.map((task) => task.id === "b1" ? { ...task, pinned: false } : task) }]
+    });
+    expect(onOwnerLayoutChange).toHaveBeenCalledExactlyOnceWith({ manualPinnedOrder: afterFilteredDrag.slice(0, -1) });
+  });
+
+  it("uses the cached Agent identity in expanded and rail lists and keeps same-named remote projects separate", async () => {
+    const local = activeProfileMachineControl("local");
+    const remote = { id: "remote", serverId: "remote-server", deviceId: "remote-device", origin: "https://remote.example", name: "Remote node" };
+    const target = { id: "target", backendId: "codex", name: "Local project", workspaceId: "workspace", revision: 1n, workspaceName: "Local", trusted: true, pinned: false, archived: false };
+    const east = { ...target, id: "east", name: "Twin project", workspaceId: "east-workspace" };
+    const west = { ...target, id: "west", name: "Twin project", workspaceId: "west-workspace" };
+    const remoteTask = (id: string, backendId: string, projectId: string | undefined, updatedAt: number) => ({
+      ...session(), id, name: id, backendId, projectId, updatedAt
+    });
+    const cache = machineCacheFromSnapshot(remote, {
+      ...emptySnapshot(),
+      targets: [{ ...target, name: "Execution workspace" }, east, west],
+      sessions: [
+        remoteTask("east-codex", "codex", east.id, 30),
+        remoteTask("west-codex", "codex", west.id, 20),
+        remoteTask("remote-dialogue", "codex", undefined, 10),
+        remoteTask("remote-pi", "pi", west.id, 5),
+        { ...remoteTask("remote-pinned", "pi", west.id, 40), pinned: true }
+      ]
+    }, 100);
+    const onOpenCachedSession = vi.fn();
+    const machineControl = {
+      ...local,
+      profiles: [...local.profiles, remote],
+      presenceByProfile: { local: "current", remote: "online" } as const,
+      caches: [cache],
+      onOpenCachedSession
+    };
+    const snapshot = {
+      ...emptySnapshot(),
+      revision: 1n,
+      targets: [target],
+      backends: [
+        { id: "codex", name: "Codex", version: "1", health: "healthy" as const, capabilities: new Map() },
+        { id: "pi", name: "Pi", version: "1", health: "healthy" as const, capabilities: new Map() }
+      ],
+      sessions: [remoteTask("local-codex", "codex", target.id, 30), remoteTask("local-pi", "pi", target.id, 20)]
+    };
+    const onPreferencesChange = vi.fn();
+    const preferences = DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences;
+    const expanded = await renderSidebar(preferences, onPreferencesChange, { snapshot, machineControl });
+    const listedRemoteIds = () => [...expanded.container.querySelectorAll<HTMLElement>(".remote-machine-session-sections button[data-session-id]")].map((row) => row.dataset.sessionId);
+    expect(listedRemoteIds()).toEqual(["east-codex", "west-codex", "remote-dialogue", "remote-pi"]);
+    const menu = await openOrganizer(expanded.container);
+    await act(async () => buttonWithText(menu, "nav.filters").click());
+    const filters = required(document.body.querySelector<HTMLElement>(".sidebar-list-settings__submenu"));
+    await act(async () => buttonWithText(filters, "nav.searchAgent").click());
+    const agentChoices = required(document.body.querySelectorAll<HTMLElement>(".sidebar-list-settings__submenu").item(1));
+    await act(async () => buttonWithExactText(agentChoices, "Codex").click());
+    expect(onPreferencesChange).toHaveBeenCalledExactlyOnceWith({ backendId: "codex" });
+
+    const filtered = { ...preferences, backendId: "codex" };
+    await expanded.rerender(filtered);
+    expect(listedRemoteIds()).toEqual(["east-codex", "west-codex", "remote-dialogue"]);
+    expect(expanded.container.querySelector(".sidebar-main-view [data-session-id='local-codex']")).not.toBeNull();
+    expect(expanded.container.querySelector(".sidebar-main-view [data-session-id='local-pi']")).toBeNull();
+    expect(expanded.container.querySelector(".session-section--pinned [data-session-id='remote-pinned']")).not.toBeNull();
+    await expanded.rerenderMachineControl({ ...machineControl, presenceByProfile: { local: "current", remote: "offline" } });
+    expect(listedRemoteIds()).toEqual(["east-codex", "west-codex", "remote-dialogue"]);
+
+    const rail = await renderSidebar(filtered, vi.fn(), { snapshot, machineControl, mode: "rail" });
+    const projects = required(rail.container.querySelector<HTMLButtonElement>("[data-sidebar-rail-trigger='projects']"));
+    mockRect(projects, 70, 120, 36, 36);
+    await act(async () => projects.click());
+    const projectMenu = required(document.body.querySelector(".sidebar-rail-panel[data-sidebar-rail-panel-level='1']"));
+    const twins = [...projectMenu.querySelectorAll<HTMLButtonElement>(".sidebar-rail-project__main")];
+    expect(twins.map((row) => row.querySelector("span[title]")?.textContent)).toEqual(["Twin project · Remote node", "Twin project · Remote node"]);
+    for (const [index, taskId] of ["east-codex", "west-codex"].entries()) {
+      const row = twins[index]!;
+      mockRect(row, 106, 160 + index * 34, 215, 32);
+      await act(async () => row.click());
+      const tasks = required(document.body.querySelector(".sidebar-rail-panel[data-sidebar-rail-panel-level='2']"));
+      const buttons = [...tasks.querySelectorAll<HTMLButtonElement>("button[data-session-id]")];
+      expect(buttons.map((button) => button.dataset.sessionId)).toEqual([taskId]);
+      await act(async () => buttons[0]!.click());
+      expect(onOpenCachedSession).toHaveBeenLastCalledWith(remote.id, taskId);
+    }
+  });
+
   it.each(["expanded", "rail"] as const)("keeps hidden-project tasks reachable as dialogues in %s navigation and restores their original group", async (mode) => {
     const target = { id: "target", backendId: "backend", name: "Hidden project", workspaceId: "workspace", revision: 1n, workspaceName: "Hidden project", trusted: true, pinned: false, archived: true } as const;
     const task = session();
@@ -518,6 +660,63 @@ describe("Sidebar organizer display controls", () => {
       expect(group.querySelector("[data-session-id='session']")).not.toBeNull();
       expect(rendered.container.querySelector(".sidebar-main-view .project-group--dialogue")).toBeNull();
     }
+  });
+
+  it.each(["expanded", "rail"] as const)("previews large project lists in %s navigation by default", async (mode) => {
+    const now = Date.now();
+    const targets = Array.from({ length: 21 }, (_, index) => ({
+      id: `project-${index}`, backendId: "backend", name: `Project ${index}`, workspaceId: `workspace-${index}`,
+      revision: 1n, workspaceName: `Project ${index}`, trusted: true, pinned: false, archived: false
+    }));
+    const sessions = targets.map((target, index) => ({
+      ...session(), id: `task-${index}`, targetId: target.id, projectId: target.id, updatedAt: now - index * 1_000
+    }));
+    const complete = {
+      ...emptySnapshot(),
+      revision: 1n,
+      server: { name: "Orchestrator", version: "test", health: "healthy" as const },
+      targets,
+      sessions
+    };
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      mode,
+      snapshot: { ...complete, targets: targets.slice(0, 20), sessions: sessions.slice(0, 20) }
+    });
+    let list: HTMLElement = required(rendered.container.querySelector<HTMLElement>(".sidebar-main-view"));
+    if (mode === "rail") {
+      const trigger = required(rendered.container.querySelector<HTMLButtonElement>("[data-sidebar-rail-trigger='projects']"));
+      mockRect(trigger, 70, 120, 36, 36);
+      await act(async () => trigger.click());
+      list = required(document.body.querySelector<HTMLElement>(".sidebar-rail-panel[data-sidebar-rail-panel-level='1']"));
+    }
+    const projectNames = () => [...list.querySelectorAll(".project-group__name")].map((node) => node.textContent);
+    expect(projectNames()).toHaveLength(20);
+    expect(list.querySelector(".session-list-show-all")).toBeNull();
+
+    await rendered.rerenderSnapshot(complete);
+    expect(projectNames()).toHaveLength(20);
+    expect(projectNames()).not.toContain("Project 20");
+    expect(buttonWithText(list, "nav.showAllProjects")).toBeDefined();
+
+    await rendered.rerenderActiveSessionId("task-20");
+    expect(projectNames()).toHaveLength(21);
+    expect(projectNames()).toContain("Project 20");
+    expect(list.querySelector(".session-list-show-all")).toBeNull();
+    await rendered.rerenderActiveSessionId(undefined);
+    expect(projectNames()).toHaveLength(20);
+
+    const lastTask = sessions[20]!;
+    await rendered.rerenderSnapshot({
+      ...complete,
+      sessions: [...sessions.slice(0, 20), { ...lastTask, state: "running", activeRunId: "active-tail-run" }]
+    });
+    expect(projectNames()).toHaveLength(21);
+    expect(projectNames()).toContain("Project 20");
+
+    await rendered.rerenderSnapshot(complete);
+    await act(async () => buttonWithText(list, "nav.showAllProjects").click());
+    expect(projectNames()).toHaveLength(21);
+    expect(projectNames()).toContain("Project 20");
   });
 
   it("executes the complete local project action surface with confirmation and inline rename", async () => {
@@ -835,6 +1034,44 @@ describe("Sidebar organizer display controls", () => {
     expect(rendered.container.querySelector(".sidebar-main-view [data-session-id='archived-main']")).not.toBeNull();
     const legacy = required(rendered.container.querySelector(".sidebar-main-view [data-session-id='archived-pinned']"));
     expect(legacy.querySelector(".session-row__pin")).toBeNull();
+  });
+
+  it("uses the current sidebar status for project batch actions and preserves separately pinned tasks", async () => {
+    const target = { id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n,
+      workspaceName: "Project", trusted: true, pinned: false, archived: false } as const;
+    const active = { ...session(), id: "active" };
+    const pinned = { ...session(), id: "pinned", pinned: true };
+    const archived = { ...session(), id: "archived", archived: true, pinned: true };
+    const snapshot = { ...emptySnapshot(), revision: 1n, targets: [target], sessions: [active, pinned, archived],
+      backends: [{ id: "backend", name: "Backend", version: "1", health: "healthy" as const, capabilities: new Map() }] };
+    const onSetTargetSessionsArchived = vi.fn();
+    const onArchive = vi.fn();
+    const preferences = DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences;
+    const view = await renderSidebar(preferences, vi.fn(), { snapshot, onSetTargetSessionsArchived, onArchive });
+    const openProjectMenu = async () => {
+      const more = required(view.container.querySelector<HTMLButtonElement>(".sidebar-main-view .project-group [aria-label='common.more']"));
+      mockRect(more, 220, 120, 28, 28);
+      await act(async () => more.click());
+      return required(document.body.querySelector<HTMLElement>(".sidebar-project-actions-menu"));
+    };
+    for (const status of ["active", "all", "archived"] as const) {
+      await view.rerender({ ...preferences, status });
+      const menu = await openProjectMenu();
+      const restoring = status === "archived";
+      const button = buttonWithText(menu, restoring ? "projects.unarchiveAll" : "projects.archiveAll");
+      expect(button.disabled).toBe(false);
+      await act(async () => button.click());
+      expect(onSetTargetSessionsArchived).toHaveBeenLastCalledWith(target, restoring ? [archived] : [active], !restoring);
+    }
+    await view.rerender({ ...preferences, status: "all" });
+    await view.rerenderSnapshot({ ...snapshot, sessions: [pinned, archived] });
+    expect(buttonWithText(await openProjectMenu(), "projects.archiveAll").disabled).toBe(true);
+    await act(async () => document.body.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true })));
+    const pinnedRow = required(view.container.querySelector<HTMLElement>("[data-session-id='pinned']"));
+    await act(async () => pinnedRow.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 170, clientY: 140 })));
+    const rowMenu = required(document.body.querySelector<HTMLElement>(".session-menu-popover"));
+    await act(async () => buttonWithText(rowMenu, "session.archive").click());
+    expect(onArchive).toHaveBeenCalledWith(pinned);
   });
 
   it("keeps remote expanded and rail views on the same fail-closed content filters", async () => {

@@ -10,7 +10,7 @@ import {
   selectedRemoteMachineCaches,
   toggleMachineProfile
 } from "./machine-federation.js";
-import { emptySnapshot, type AppSnapshot, type ConnectionProfile, type MachineCacheView } from "./model.js";
+import { emptySnapshot, type AppSnapshot, type ConnectionProfile, type MachineCacheView, type TargetView } from "./model.js";
 import { sessionTaskLink } from "./session-window-navigation.js";
 
 const profiles: readonly ConnectionProfile[] = [
@@ -73,6 +73,39 @@ describe("machine federation cache", () => {
       { ...session("aside", 10), derivationOrigin: { kind: "fork" as const, sideChat: true as const, sourceSessionId: "visible", sourceSessionAvailable: true, sourceMessageAvailable: true } }, session("visible", 9)] };
     expect(machineCacheFromSnapshot(profiles[1]!, snapshot, 42).sessions.map(task => task.id)).toEqual(["visible"]);
   });
+
+  it("keeps navigation project identities separate from execution names and accepts older caches", () => {
+    const target = (id: string, name: string, archived = false): TargetView => ({ id, name, archived, revision: 1n,
+      backendId: "backend-1", workspaceId: `workspace-${id}`, workspaceName: name, trusted: true, pinned: false });
+    const snapshot: AppSnapshot = {
+      ...emptySnapshot(),
+      targets: [
+        target("target-1", "Execution workspace"),
+        target("project-east", "Same name"),
+        target("project-west", "Same name"),
+        target("hidden-project", "Hidden", true)
+      ],
+      sessions: [
+        { ...session("east", 4), projectId: "project-east" },
+        { ...session("west", 3), projectId: "project-west" },
+        { ...session("hidden", 2), projectId: "hidden-project" },
+        session("dialogue", 1)
+      ]
+    };
+    const cache = machineCacheFromSnapshot(profiles[1]!, snapshot, 42);
+    expect(cache.sessions.map(({ id, backendId, targetName, project }) => ({ id, backendId, targetName, project }))).toEqual([
+      { id: "east", backendId: "backend-1", targetName: "Execution workspace", project: { id: "project-east", name: "Same name" } },
+      { id: "west", backendId: "backend-1", targetName: "Execution workspace", project: { id: "project-west", name: "Same name" } },
+      { id: "hidden", backendId: "backend-1", targetName: "Execution workspace", project: null },
+      { id: "dialogue", backendId: "backend-1", targetName: "Execution workspace", project: null }
+    ]);
+    expect(normalizeMachineCache(cache)).toEqual(cache);
+    const { backendId: _backend, project: _project, ...legacy } = cache.sessions[0]!;
+    expect(normalizeMachineCache({ ...cache, sessions: [legacy] })?.sessions).toEqual([legacy]);
+    expect(normalizeMachineCache({ ...cache, sessions: [{ ...legacy, backendId: "invalid\nidentity" }] })).toBeUndefined();
+    expect(normalizeMachineCache({ ...cache, sessions: [{ ...legacy, project: { id: "east", name: "Same name", path: "/private" } }] })).toBeUndefined();
+  });
+
   it("creates a content-light, newest-first cache with stable ties and a 500-task bound", () => {
     const sessions = Array.from({ length: 505 }, (_, index) => session(`task-${String(index).padStart(3, "0")}`, index));
     sessions.push(session("tie-z", 1_000), session("tie-a", 1_000));

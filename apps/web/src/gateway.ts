@@ -2767,7 +2767,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const scope = this.captureActionScope();
     const session = this.#rawSnapshot?.sessions.find(candidate => candidate.sessionId === sessionId);
     const revision = session?.version?.revision?.value;
-    if (session === undefined || session.projectId !== projectId || session.archived === archived || revision === undefined || revision < 1n) {
+    if (session === undefined || session.projectId !== projectId || session.archived === archived || (archived && session.pinned)
+      || revision === undefined || revision < 1n) {
       throw new GatewayError("The task changed since the project action started.");
     }
     await this.submit(payload, true, [{

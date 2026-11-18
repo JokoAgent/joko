@@ -70,7 +70,7 @@ import {
 import { sessionTaskLink } from "../session-window-navigation.js";
 import type { SessionProjectNavigationPlacement } from "../session-project-navigation.js";
 import { portableSessionExportSupported } from "../portable-session-ui.js";
-import { sidebarSessionListView } from "../sidebar-session-list.js";
+import { sidebarSessionListView, SIDEBAR_PROJECT_LIST_MINIMUM_VISIBLE } from "../sidebar-session-list.js";
 import {
   groupSidebarScheduleSessions,
   sidebarScheduleEntryActivityAt,
@@ -241,6 +241,10 @@ type SidebarPinnedEntry =
   | { readonly kind: "remoteSession"; readonly id: string; readonly cache: MachineCacheView; readonly session: MachineSessionCacheView }
   | { readonly kind: "project"; readonly id: string; readonly target: TargetView; readonly sessions: readonly SessionView[] };
 type SidebarPinnedSessionEntry = Exclude<SidebarPinnedEntry, { readonly kind: "project" }>;
+interface SidebarRemoteTaskEntry {
+  readonly cache: MachineCacheView;
+  readonly session: MachineSessionCacheView;
+}
 type SidebarRailPanelSection = "projects" | "dialogues";
 type SidebarRailProjectEntry =
   | { readonly kind: "local"; readonly id: string; readonly name: string; readonly target: TargetView; readonly sessions: readonly SessionView[] }
@@ -264,6 +268,7 @@ interface SidebarRailPreviewState {
 }
 interface SidebarProjectActions {
   readonly allSessions: readonly SessionView[];
+  readonly showArchived: boolean;
   readonly onEditTarget: (target: TargetView) => void;
   readonly onNewTaskInTarget?: (target: TargetView) => void;
   readonly onRenameTarget?: (target: TargetView, name: string) => void;
@@ -412,14 +417,13 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const [messageSearchTargetIds, setMessageSearchTargetIds] = useState<readonly string[] | "all">("all");
   const [messageSearchOwnerId, setMessageSearchOwnerId] = useState(props.sidebarOwnerId);
   const [lockedSearchTargetId, setLockedSearchTargetId] = useState<string>();
-  const [activeSearchOption, setActiveSearchOption] = useState(-1);
+  const [activeSearchOptionKey, setActiveSearchOptionKey] = useState<string>();
   const [expandedSearchSessions, setExpandedSearchSessions] = useState<ReadonlySet<string>>(() => new Set());
   const messageSearchGenerationRef = useRef(0);
-  const semanticSearchStartedGenerationRef = useRef(0);
-  const keywordSearchSucceededGenerationRef = useRef(0);
   const remoteMessageSearchGenerationRef = useRef(0);
   const searchFilterRef = useRef<HTMLDetailsElement>(null);
   const sessionListRef = useRef<HTMLElement>(null);
+  const scrollBeforeSearchRef = useRef<{ readonly ownerKey: string; readonly top: number }>(undefined);
   const projectRemovalFocusRef = useRef<{
     readonly targetId: string;
     readonly ownerId: string;
@@ -446,6 +450,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const [collapsedDeviceSections, setCollapsedDeviceSections] = useState<ReadonlySet<string>>(() => new Set());
   const [scheduleGroupFoldIntent, setScheduleGroupFoldIntent] = useState<{ readonly revision: number; readonly collapsed: boolean }>();
   const [railPanel, setRailPanel] = useState<SidebarRailPanelState>();
+  const [showAllRailProjects, setShowAllRailProjects] = useState(false);
   const [railPreview, setRailPreview] = useState<SidebarRailPreviewState>();
   const [, setScheduleGroupExpansionRevision] = useState(0);
   const railCloseTimerRef = useRef<number | undefined>(undefined);
@@ -494,23 +499,26 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const sessions = useMemo(() => currentMachineIncluded
     ? sessionsForSidebarStatus(snapshot.sessions, sidebarLayout.status)
     : [], [currentMachineIncluded, sidebarLayout.status, snapshot.sessions]);
-  const remoteMachineCaches = useMemo(() => props.machineControl === undefined ? [] : selectedRemoteMachineCaches(
+  const allRemoteMachineCaches = useMemo(() => props.machineControl === undefined ? [] : selectedRemoteMachineCaches(
     props.machineControl.caches,
     props.machineControl.activeProfile.id,
-    props.machineControl.selection,
+    "all",
     props.machineControl.profiles
   ), [props.machineControl]);
+  const machineSelection = props.machineControl?.selection;
+  const remoteMachineCaches = useMemo(() => machineSelection === undefined || machineSelection === "all"
+    ? allRemoteMachineCaches
+    : allRemoteMachineCaches.filter((cache) => machineSelection.includes(cache.profileId)), [allRemoteMachineCaches, machineSelection]);
   const selectedRemoteProfiles = useMemo(() => props.machineControl === undefined
     ? []
     : props.machineControl.profiles.filter((profile) => profile.id !== props.machineControl!.activeProfile.id
       && (props.machineControl!.selection === "all" || props.machineControl!.selection.includes(profile.id))), [props.machineControl]);
   const remoteLastActivityCutoff = sidebarLastActivityCutoff(sidebarLayout.lastActivity, Date.now());
-  const remoteContentIdentityFilterActive = sidebarLayout.backendId !== "all" || sidebarLayout.projectFilter !== "all";
-  const remoteMachineSessionCount = remoteMachineCaches.reduce((count, cache) => count + cache.sessions.filter((session) =>
-    !sidebarTaskPinned(session) && remoteSessionMatchesSidebarStatus(session, sidebarLayout.status)
-      && !remoteContentIdentityFilterActive
-      && (remoteLastActivityCutoff === undefined || session.lastActivityAt >= remoteLastActivityCutoff)
-  ).length, 0);
+  const remoteMachineTaskEntries = useMemo(() => sidebarLayout.projectFilter !== "all" ? [] : remoteMachineCaches.flatMap((cache) => cache.sessions
+    .filter((session) => !sidebarTaskPinned(session) && remoteSessionMatchesSidebarStatus(session, sidebarLayout.status)
+      && (sidebarLayout.backendId === "all" || session.backendId === sidebarLayout.backendId)
+      && (remoteLastActivityCutoff === undefined || session.lastActivityAt >= remoteLastActivityCutoff))
+    .map((session) => ({ cache, session }))), [remoteMachineCaches, remoteLastActivityCutoff, sidebarLayout.backendId, sidebarLayout.projectFilter, sidebarLayout.status]);
   const remoteMessageSearchScopeKey = JSON.stringify([currentSearchProfileId, selectedRemoteProfiles.map((profile) => [
     profile.id, profile.serverId, profile.origin, profile.endpointPublicKey, profile.transportKind,
     props.machineControl?.presenceByProfile[profile.id] ?? "offline"
@@ -664,31 +672,40 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     props.messageSearchSort,
     CONVERSATION_SEARCH_RESULT_LIMIT
   ), [currentSearchProfileId, localSearchCandidates, messageSearchError, messageSearchLoading, props.messageSearchSort, remoteSearchCandidates]);
-  const searchResults = useMemo(() => federatedSearchGroups.flatMap((group) => group.kind === "local" ? [group.result] : []), [federatedSearchGroups]);
-  const remoteSearchResults = useMemo(() => federatedSearchGroups.flatMap((group) => group.kind === "remote" ? [group.result] : []), [federatedSearchGroups]);
-  const expandedLocalSearchSessions = useMemo(() => new Set(searchResults
-    .filter((result) => expandedSearchSessions.has(federatedSessionSearchKey(currentSearchProfileId, result.session.id)))
-    .map((result) => result.session.id)), [currentSearchProfileId, expandedSearchSessions, searchResults]);
-  const searchOptions = useMemo(
-    () => flattenConversationSearchOptions(searchResults, expandedLocalSearchSessions),
-    [expandedLocalSearchSessions, searchResults]
-  );
-  const remoteSearchOptions = useMemo(() => flattenRemoteMachineSearchOptions(remoteSearchResults, expandedSearchSessions), [expandedSearchSessions, remoteSearchResults]);
-  const allSearchOptions = useMemo<readonly SidebarSearchOption[]>(
-    () => [...searchOptions, ...remoteSearchOptions],
-    [remoteSearchOptions, searchOptions]
-  );
-  const pinnedProjectTargets = useMemo(() => currentMachineIncluded ? snapshot.targets.filter((target) =>
+  const searchGroups = useMemo(() => {
+    let offset = 0;
+    return federatedSearchGroups.map((group) => {
+      const optionOffset = offset;
+      if (group.kind === "remote") {
+        const options = flattenRemoteMachineSearchOptions([group.result], expandedSearchSessions);
+        offset += options.length;
+        return { ...group, options, optionOffset };
+      }
+      const expandedIds = expandedSearchSessions.has(group.key) ? new Set([group.result.session.id]) : EMPTY_SESSION_ID_SET;
+      const options = flattenConversationSearchOptions([group.result], expandedIds);
+      offset += options.length;
+      return { ...group, options, optionOffset };
+    });
+  }, [expandedSearchSessions, federatedSearchGroups]);
+  const allSearchOptions = useMemo(() => searchGroups.flatMap<SidebarSearchOption>((group) => group.options), [searchGroups]);
+  const activeSearchOption = activeSearchOptionKey === undefined
+    ? (allSearchOptions.length > 0 ? 0 : -1)
+    : allSearchOptions.findIndex((option) => sidebarSearchOptionKey(option, currentSearchProfileId) === activeSearchOptionKey);
+  const setActiveSearchOption = (index: number): void => {
+    const option = allSearchOptions[index];
+    setActiveSearchOptionKey(option === undefined ? undefined : sidebarSearchOptionKey(option, currentSearchProfileId));
+  };
+  const pinnedProjectTargets = useMemo(() => snapshot.targets.filter((target) =>
     target.pinned && !target.archived && navigationSessions.some((session) => session.projectId === target.id)
-  ) : [], [currentMachineIncluded, navigationSessions, snapshot.targets]);
+  ), [navigationSessions, snapshot.targets]);
   const pinnedProjectIds = useMemo(() => new Set(pinnedProjectTargets.map((target) => target.id)), [pinnedProjectTargets]);
-  const pinnedSessions = useMemo(() => currentMachineIncluded ? sortSidebarSessions(
+  const pinnedSessions = useMemo(() => sortSidebarSessions(
     navigationSessions.filter(sidebarTaskPinned),
     "recency"
-  ) : [], [currentMachineIncluded, navigationSessions]);
-  const pinnedSessionEntries = useMemo<readonly SidebarPinnedEntry[]>(() => [
+  ), [navigationSessions]);
+  const allPinnedSessionEntries = useMemo<readonly SidebarPinnedSessionEntry[]>(() => [
     ...pinnedSessions.map((session) => ({ kind: "session" as const, id: session.id, session })),
-    ...remoteMachineCaches.flatMap((cache) => cache.sessions
+    ...allRemoteMachineCaches.flatMap((cache) => cache.sessions
       .filter(sidebarTaskPinned)
       .map((session) => ({
         kind: "remoteSession" as const,
@@ -697,28 +714,32 @@ export function Sidebar(props: SidebarProps): JSX.Element {
         session
       })))
   ].sort((left, right) => {
-    const leftActivity = left.kind === "session" ? left.session.updatedAt : left.kind === "remoteSession" ? left.session.lastActivityAt : 0;
-    const rightActivity = right.kind === "session" ? right.session.updatedAt : right.kind === "remoteSession" ? right.session.lastActivityAt : 0;
+    const leftActivity = left.kind === "session" ? left.session.updatedAt : left.session.lastActivityAt;
+    const rightActivity = right.kind === "session" ? right.session.updatedAt : right.session.lastActivityAt;
     return rightActivity - leftActivity || left.id.localeCompare(right.id);
-  }), [pinnedSessions, remoteMachineCaches]);
+  }), [allRemoteMachineCaches, pinnedSessions]);
   const allPinnedIds = useMemo(() => [
-    ...pinnedSessionEntries.map((entry) => entry.id),
+    ...allPinnedSessionEntries.map((entry) => entry.id),
     ...pinnedProjectTargets.map((target) => `${SIDEBAR_PINNED_PROJECT_PREFIX}${target.id}`)
-  ], [pinnedProjectTargets, pinnedSessionEntries]);
+  ], [allPinnedSessionEntries, pinnedProjectTargets]);
   const pinnedOrder = useMemo(() => normalizeManualSidebarOrder(
     sidebarLayout.manualPinnedOrder,
     allPinnedIds
   ), [allPinnedIds, sidebarLayout.manualPinnedOrder]);
   const pinnedRank = useMemo(() => new Map(pinnedOrder.map((id, index) => [id, index])), [pinnedOrder]);
-  const pinnedEntries = useMemo<readonly SidebarPinnedEntry[]>(() => [
-    ...pinnedSessionEntries,
-    ...pinnedProjectTargets.map((target) => ({
+  const pinnedEntries = useMemo<readonly SidebarPinnedEntry[]>(() => {
+    const visibleRemoteProfileIds = new Set(remoteMachineCaches.map((cache) => cache.profileId));
+    const entries = allPinnedSessionEntries.filter((entry) => entry.kind === "session"
+      ? currentMachineIncluded : visibleRemoteProfileIds.has(entry.cache.profileId));
+    const projects = currentMachineIncluded ? pinnedProjectTargets.map((target) => ({
       kind: "project" as const,
       id: `${SIDEBAR_PINNED_PROJECT_PREFIX}${target.id}`,
       target,
       sessions: sortSidebarSessions(navigationSessions.filter((session) => session.projectId === target.id && !session.pinned && !session.archived), sidebarLayout.sortBy, priorityContext)
-    }))
-  ].sort((left, right) => (pinnedRank.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (pinnedRank.get(right.id) ?? Number.MAX_SAFE_INTEGER)), [pinnedProjectTargets, pinnedRank, pinnedSessionEntries, priorityContext, sidebarLayout.sortBy, navigationSessions]);
+    })) : [];
+    return [...entries, ...projects].sort((left, right) =>
+      (pinnedRank.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (pinnedRank.get(right.id) ?? Number.MAX_SAFE_INTEGER));
+  }, [allPinnedSessionEntries, currentMachineIncluded, navigationSessions, pinnedProjectTargets, pinnedRank, priorityContext, remoteMachineCaches, sidebarLayout.sortBy]);
   const recent = sortSidebarSessions(filterSidebarSessions(
     sessions.filter((session) => !sidebarTaskPinned(session) && (session.archived || session.projectId === undefined || !pinnedProjectIds.has(session.projectId))),
     sidebarLayout,
@@ -759,18 +780,14 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     if (targetSessions.length === 0 && !pinnedProjectReachable) return [];
     return [{ kind: "local", id: target.id, name: target.name, target, sessions: targetSessions }];
   });
-  const railRemotePanelEntries = remoteMachineCaches.flatMap((cache) => cache.sessions
-    .filter((session) => !sidebarTaskPinned(session) && remoteSessionMatchesSidebarStatus(session, sidebarLayout.status)
-      && !remoteContentIdentityFilterActive
-      && (remoteLastActivityCutoff === undefined || session.lastActivityAt >= remoteLastActivityCutoff))
-    .map((session) => ({ cache, session })));
   const railRemoteProjectEntries = useMemo<readonly SidebarRailProjectEntry[]>(() => {
     const grouped = new Map<string, { readonly cache: MachineCacheView; readonly name: string; readonly sessions: MachineSessionCacheView[] }>();
-    for (const { cache, session } of railRemotePanelEntries) {
-      if (session.targetName === undefined) continue;
-      const id = `${cache.profileId}\u0000${session.targetName}`;
+    for (const { cache, session } of remoteMachineTaskEntries) {
+      const project = sidebarRemoteNavigationProject(session);
+      if (project === undefined) continue;
+      const id = `${cache.profileId}\u0000${project.key}`;
       const current = grouped.get(id);
-      if (current === undefined) grouped.set(id, { cache, name: `${session.targetName} · ${cache.name}`, sessions: [session] });
+      if (current === undefined) grouped.set(id, { cache, name: `${project.name} · ${cache.name}`, sessions: [session] });
       else current.sessions.push(session);
     }
     return [...grouped.entries()].map(([id, group]) => ({
@@ -784,11 +801,20 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       const rightActivity = right.kind === "remote" ? right.sessions[0]?.lastActivityAt ?? 0 : 0;
       return rightActivity - leftActivity || left.name.localeCompare(right.name);
     });
-  }, [railRemotePanelEntries]);
+  }, [remoteMachineTaskEntries]);
   const railProjectEntries = [...railLocalProjectEntries, ...railRemoteProjectEntries];
+  const railProjectsView = sidebarSessionListView({
+    items: railProjectEntries,
+    showAll: showAllRailProjects,
+    minimumVisible: SIDEBAR_PROJECT_LIST_MINIMUM_VISIBLE,
+    isCurrent: (entry) => entry.kind === "local" && entry.sessions.some((session) => session.id === activeSessionId),
+    hasAttention: (entry) => entry.kind === "local"
+      ? entry.target.pinned || sidebarGroupIndicatorState(entry.sessions, priorityContext) !== undefined
+      : entry.sessions.some((session) => remoteCachedStatus(session) !== undefined)
+  });
   const railDialogueSessions = railLocalPanelSessions.filter((session) => sidebarNavigationProjectId(session, hiddenProjectIds) === undefined);
-  const railRemoteDialogueEntries = railRemotePanelEntries
-    .filter(({ session }) => session.targetName === undefined)
+  const railRemoteDialogueEntries = remoteMachineTaskEntries
+    .filter(({ session }) => sidebarRemoteNavigationProject(session) === undefined)
     .sort((left, right) => right.session.lastActivityAt - left.session.lastActivityAt
       || left.cache.profileId.localeCompare(right.cache.profileId)
       || left.session.id.localeCompare(right.session.id));
@@ -809,12 +835,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     && (!hasVisibleProjectOrDialogueGroups || (visibleProjectGroupIds.every((targetId) => collapsedTargets.has(targetId))
       && (!visibleDialogueGrouped || sidebarLayout.collapsedDialogue)))
     && visibleScheduleGroupKeys.every((key) => !expandedScheduleGroupKeys.has(key));
-  const visibleRemoteDeviceIds = remoteMachineCaches
-    .filter((cache) => cache.sessions.some((session) =>
-      !sidebarTaskPinned(session) && remoteSessionMatchesSidebarStatus(session, sidebarLayout.status)
-        && !remoteContentIdentityFilterActive
-        && (remoteLastActivityCutoff === undefined || session.lastActivityAt >= remoteLastActivityCutoff)))
-    .map((cache) => cache.profileId);
+  const visibleRemoteDeviceIds = [...new Set(remoteMachineTaskEntries.map(({ cache }) => cache.profileId))];
   const localDeviceId = props.machineControl?.activeProfile.id;
   const deviceLayerActive = sidebarLayout.groupDevice
     && remoteMachineCaches.length > 0
@@ -909,8 +930,6 @@ export function Sidebar(props: SidebarProps): JSX.Element {
 
   useEffect(() => {
     const generation = ++messageSearchGenerationRef.current;
-    semanticSearchStartedGenerationRef.current = 0;
-    keywordSearchSucceededGenerationRef.current = 0;
     setMessageSearchError(undefined);
     if (normalizedQuery === "" || !currentMachineIncluded) {
       setMessageMatches([]);
@@ -931,49 +950,26 @@ export function Sidebar(props: SidebarProps): JSX.Element {
               - MESSAGE_SEARCH_ACTIVITY_DAYS[messageSearchLastActivity] * MESSAGE_SEARCH_DAY_MS
           })
     };
-    const keywordTimer = setTimeout(() => {
-      void searchMessagesRef.current(query.trim(), "keyword", searchFilters, abort.signal).then((matches) => {
+    let hybridSucceeded = false;
+    const failedStages = new Set<"keyword" | "hybrid">();
+    const searchStage = (mode: "keyword" | "hybrid"): void => {
+      void searchMessagesRef.current(query.trim(), mode, searchFilters, abort.signal).then((matches) => {
         if (messageSearchGenerationRef.current !== generation) return;
-        keywordSearchSucceededGenerationRef.current = generation;
-        if (semanticSearchStartedGenerationRef.current === generation) {
-          // Once hybrid owns the local refresh, a late keyword page only
-          // proves the fast stage succeeded; keep the current local
-          // page and uses keyword solely for remote fanout in this race.
-          setMessageSearchLoading(false);
-          setMessageSearchError(undefined);
-          return;
-        }
+        if (mode === "keyword" && hybridSucceeded) return;
+        if (mode === "hybrid") hybridSucceeded = true;
         setMessageMatches(matches);
         setMessageSearchLoading(false);
         setMessageSearchError(undefined);
       }).catch((error: unknown) => {
-        if (messageSearchWasAborted(abort.signal, error)) return;
-        if (messageSearchGenerationRef.current !== generation) return;
-        if (semanticSearchStartedGenerationRef.current === generation) return;
-        setMessageMatches([]);
+        if (messageSearchGenerationRef.current !== generation || messageSearchWasAborted(abort.signal, error)) return;
+        failedStages.add(mode);
+        if (failedStages.size < 2) return;
         setMessageSearchLoading(false);
         setMessageSearchError(t("nav.messageSearchFailed"));
       });
-    }, CONVERSATION_KEYWORD_DEBOUNCE_MS);
-    const hybridTimer = setTimeout(() => {
-      semanticSearchStartedGenerationRef.current = generation;
-      void searchMessagesRef.current(query.trim(), "hybrid", searchFilters, abort.signal).then((matches) => {
-        if (messageSearchGenerationRef.current !== generation) return;
-        setMessageMatches(matches);
-        setMessageSearchLoading(false);
-        setMessageSearchError(undefined);
-      }).catch((error: unknown) => {
-        if (messageSearchWasAborted(abort.signal, error)) return;
-        if (messageSearchGenerationRef.current !== generation) return;
-        semanticSearchStartedGenerationRef.current = 0;
-        // Keep an already-visible keyword page when semantic refresh
-        // fails. Only surface an error if neither stage produced results.
-        if (keywordSearchSucceededGenerationRef.current === generation) return;
-        setMessageMatches([]);
-        setMessageSearchLoading(false);
-        setMessageSearchError(t("nav.messageSearchFailed"));
-      });
-    }, CONVERSATION_HYBRID_DEBOUNCE_MS);
+    };
+    const keywordTimer = setTimeout(() => searchStage("keyword"), CONVERSATION_KEYWORD_DEBOUNCE_MS);
+    const hybridTimer = setTimeout(() => searchStage("hybrid"), CONVERSATION_HYBRID_DEBOUNCE_MS);
     return () => {
       clearTimeout(keywordTimer);
       clearTimeout(hybridTimer);
@@ -1048,16 +1044,12 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   }, [messageSearchBackendId, messageSearchLastActivity, messageSearchStatus, messageSearchTargetIds, normalizedQuery, query, remoteMessageSearchScopeKey, t]);
 
   useEffect(() => {
-    setActiveSearchOption((current) => allSearchOptions.length === 0 ? -1 : current < 0 || current >= allSearchOptions.length ? 0 : current);
-  }, [allSearchOptions.length]);
-
-  useEffect(() => {
     setExpandedSearchSessions(new Set());
   }, [messageSearchBackendId, messageSearchLastActivity, messageSearchStatus, messageSearchTargetIds, normalizedQuery, props.messageSearchSort]);
 
   useEffect(() => {
     if (activeSearchOption < 0) return;
-    document.getElementById(searchOptionId(activeSearchOption))?.scrollIntoView({ block: "nearest" });
+    document.getElementById(searchOptionId(activeSearchOption))?.scrollIntoView?.({ block: "nearest" });
   }, [activeSearchOption]);
 
   useEffect(() => {
@@ -1206,8 +1198,29 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     setRemoteMessageSearchError(undefined);
     setMessageSearchLoading(false);
     setRemoteMessageSearchLoading(false);
-    setActiveSearchOption(-1);
+    setActiveSearchOptionKey(undefined);
   };
+
+  const changeSearchQuery = (value: string): void => {
+    const list = sessionListRef.current;
+    if (searchContextAvailable && !searchPopupOpen && value.trim() !== "" && list !== null) {
+      scrollBeforeSearchRef.current = { ownerKey: sessionSelectionOwnerKey, top: list.scrollTop };
+    }
+    if (value !== query) setActiveSearchOptionKey(undefined);
+    setQuery(value);
+  };
+
+  useLayoutEffect(() => {
+    const list = sessionListRef.current;
+    const previous = scrollBeforeSearchRef.current;
+    if (list === null || previous === undefined) return;
+    if (searchPopupOpen) {
+      list.scrollTop = 0;
+      return;
+    }
+    scrollBeforeSearchRef.current = undefined;
+    list.scrollTop = previous.ownerKey === sessionSelectionOwnerKey ? previous.top : 0;
+  }, [normalizedQuery, searchPopupOpen, sessionSelectionOwnerKey]);
 
   const resetMessageSearchFilters = (): void => {
     setMessageSearchStatus("all");
@@ -1254,11 +1267,11 @@ export function Sidebar(props: SidebarProps): JSX.Element {
             : undefined;
     if (direction !== undefined) {
       event.preventDefault();
-      setActiveSearchOption((current) => moveConversationSearchSelection(current, allSearchOptions.length, direction));
+      setActiveSearchOption(moveConversationSearchSelection(activeSearchOption, allSearchOptions.length, direction));
       return;
     }
     if (event.key === "Enter" && !event.repeat) {
-      const selected = allSearchOptions[activeSearchOption] ?? allSearchOptions[0];
+      const selected = allSearchOptions[activeSearchOption];
       if (selected !== undefined) {
         event.preventDefault();
         activateSearchOption(selected);
@@ -1449,6 +1462,9 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     railKeyboardReturnRef.current = undefined;
   }, [cancelRailClose, cancelRailProjectClose, props.mode, props.open]);
   useEffect(() => {
+    if (railPanel?.section !== "projects") setShowAllRailProjects(false);
+  }, [railPanel?.section]);
+  useEffect(() => {
     if (railPanel === undefined) return;
     const ownerDocument = railPanel.trigger.ownerDocument;
     const ownerWindow = ownerDocument.defaultView;
@@ -1503,6 +1519,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   ]);
   const railDialogueBackend = dialogueBackends(snapshot.backends, snapshot.settings.backendSettings)[0];
   const projectActions: SidebarProjectActions = {
+    showArchived,
     allSessions: navigationSessions,
     onEditTarget: (target) => navigateAndClose({ kind: "projects", projectId: target.id }),
     onNewTaskInTarget: props.onNewTaskInTarget,
@@ -1662,7 +1679,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
             aria-controls={searchPopupOpen ? "conversation-search-results" : undefined}
             aria-activedescendant={activeSearchDescendant}
             value={query}
-            onChange={(event) => setQuery(event.target.value)}
+            onChange={(event) => changeSearchQuery(event.target.value)}
             onKeyDown={handleSearchKeyDown}
             placeholder={lockedSearchTarget === undefined ? t("nav.searchTasks") : t("nav.searchProjectPlaceholder", { name: lockedSearchTarget.name })}
           />
@@ -1783,37 +1800,41 @@ export function Sidebar(props: SidebarProps): JSX.Element {
             sessionInfoFields: toggleSidebarSessionInfoField(sidebarLayout.sessionInfoFields, field)
           })}
         />}
-        {searchPopupOpen ? (
+        {searchPopupOpen && (
           <div id="conversation-search-results" className="conversation-search-popup" role="listbox" aria-label={t("nav.searchResults")}>
-            {!messageSearchLoading && messageSearchError === undefined && <SearchResults
-              results={searchResults}
-              query={query.trim()}
-              activeSessionId={activeSessionId}
-              activeOptionIndex={activeSearchOption}
-              expandedSessionIds={expandedSearchSessions}
-              profileId={currentSearchProfileId}
-              locale={props.locale}
-              t={t}
-              onActivate={(option) => activateSearchOption(option)}
-              onActiveOptionChange={setActiveSearchOption}
-            />}
-            {remoteSearchOptions.length > 0 && <RemoteMachineSearchResults
-              options={remoteSearchOptions}
-              optionOffset={searchOptions.length}
-              activeOptionIndex={activeSearchOption}
-              query={query.trim()}
-              locale={props.locale}
-              t={t}
-              onActivate={(option) => activateSearchOption(option)}
-              onActiveOptionChange={setActiveSearchOption}
-            />}
+            {searchGroups.length > 0 && <div className="conversation-search-results">
+              {searchGroups.map((group) => group.kind === "remote" ? <RemoteMachineSearchResults
+                key={group.key}
+                options={group.options}
+                optionOffset={group.optionOffset}
+                activeOptionIndex={activeSearchOption}
+                query={query.trim()}
+                locale={props.locale}
+                t={t}
+                onActivate={activateSearchOption}
+                onActiveOptionChange={setActiveSearchOption}
+              /> : <SearchResults
+                key={group.key}
+                results={[group.result]}
+                optionOffset={group.optionOffset}
+                query={query.trim()}
+                activeSessionId={activeSessionId}
+                activeOptionIndex={activeSearchOption}
+                expandedSessionIds={expandedSearchSessions}
+                profileId={currentSearchProfileId}
+                locale={props.locale}
+                t={t}
+                onActivate={activateSearchOption}
+                onActiveOptionChange={setActiveSearchOption}
+              />)}
+            </div>}
             {(messageSearchLoading || remoteMessageSearchLoading) && <p className="sidebar-search__status" role="status"><span className="conversation-search__spinner" aria-hidden="true" />{t("nav.searchingMessages")}</p>}
             {messageSearchError !== undefined && <p className="sidebar-search__status sidebar-search__status--error" role="alert">{messageSearchError}</p>}
             {remoteMessageSearchError !== undefined && <p className="sidebar-search__status sidebar-search__status--error" role="alert">{remoteMessageSearchError}</p>}
-            {!messageSearchLoading && !remoteMessageSearchLoading && messageSearchError === undefined && remoteMessageSearchError === undefined && searchResults.length === 0 && remoteSearchOptions.length === 0 && <p className="sidebar__empty">{t("nav.noMatchingTasks")}</p>}
+            {!messageSearchLoading && !remoteMessageSearchLoading && messageSearchError === undefined && remoteMessageSearchError === undefined && allSearchOptions.length === 0 && <p className="sidebar__empty">{t("nav.noMatchingTasks")}</p>}
           </div>
-        ) : (
-          <>
+        )}
+          <div hidden={searchPopupOpen}>
             {pinnedEntries.length > 0 && <PinnedSessionSection
               viewMode={sidebarLayout.pinnedViewMode}
               title={t("nav.pinned")}
@@ -1860,16 +1881,13 @@ export function Sidebar(props: SidebarProps): JSX.Element {
                   onToggle={() => toggleDeviceSection(localDeviceId)}
                 >{localMainContent}</SidebarDeviceSection>
               : localMainContent}
-          </>
-        )}
+          </div>
         {!searchPopupOpen && props.machineControl !== undefined && remoteMachineCaches.length > 0 && <RemoteMachineSessionSections
           caches={remoteMachineCaches}
+          entries={remoteMachineTaskEntries}
           presenceByProfile={props.machineControl.presenceByProfile}
-          status={sidebarLayout.status}
           grouped={sidebarLayout.groupDevice}
           collapsedProfileIds={collapsedDeviceSections}
-          contentFiltersActive={sidebarLayout.backendId !== "all" || sidebarLayout.projectFilter !== "all"}
-          lastActivity={sidebarLayout.lastActivity}
           locale={props.locale}
           t={t}
           onToggleProfile={toggleDeviceSection}
@@ -1891,7 +1909,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
           ><ExtensionShortcutIcon extension={extension} /><span><strong>{extension.mainView?.title ?? extension.name}</strong><small>{extension.description}</small></span></button>)}
         </section>}
         {!searchPopupOpen && props.groupNavigation}
-        {!searchPopupOpen && pinnedEntries.length === 0 && recent.length === 0 && remoteMachineSessionCount === 0 && sidebarExtensions.length === 0 && <p className="sidebar__empty">{t("session.emptyBody")}</p>}
+        {!searchPopupOpen && pinnedEntries.length === 0 && recent.length === 0 && remoteMachineTaskEntries.length === 0 && sidebarExtensions.length === 0 && <p className="sidebar__empty">{t("session.emptyBody")}</p>}
         </nav>
 
         <nav className="sidebar__utility" aria-label={t("a11y.productNavigation")}>
@@ -2034,7 +2052,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
         ><SquarePen aria-hidden="true" /></IconButton>}
       </div>
       <div className="sidebar-rail-panel__scroll">
-        {railPanel.section === "projects" ? railProjectEntries.map((entry) => {
+        {railPanel.section === "projects" ? <>{railProjectsView.visibleItems.map((entry) => {
           const indicator = entry.kind === "local"
             ? sidebarGroupIndicatorState(entry.sessions, priorityContext)
             : strongestSidebarRightStatus(entry.sessions.map(remoteCachedStatus));
@@ -2072,7 +2090,11 @@ export function Sidebar(props: SidebarProps): JSX.Element {
               <ChevronRight aria-hidden="true" />
             </button>
           </div>;
-        }) : <>
+        })}{railProjectsView.overflowing && <button
+          type="button"
+          className="session-list-show-all"
+          onClick={() => setShowAllRailProjects(true)}
+        >{t("nav.showAllProjects", { count: railProjectsView.totalCount })}</button>}</> : <>
           <CollapsibleSessionRows
             sessions={railDialogueSessions}
             activeSessionId={activeSessionId}
@@ -2227,10 +2249,19 @@ function SidebarRailPanelShell({ anchor, level, onPointerEnter, onPointerLeave, 
     if (panel === null || panel === undefined || ownerWindow === null || ownerWindow === undefined) return;
     const desiredLeft = anchor.right + (level === 1 ? 12 : 8);
     const desiredTop = anchor.top - 6;
-    setPosition({
-      left: Math.max(8, Math.min(desiredLeft, ownerWindow.innerWidth - panel.offsetWidth - 8)),
-      top: Math.max(8, Math.min(desiredTop, ownerWindow.innerHeight - panel.offsetHeight - 8))
-    });
+    const updatePosition = (): void => {
+      const left = Math.max(8, Math.min(desiredLeft, ownerWindow.innerWidth - panel.offsetWidth - 8));
+      const top = Math.max(8, Math.min(desiredTop, ownerWindow.innerHeight - panel.offsetHeight - 8));
+      setPosition((current) => current?.left === left && current.top === top ? current : { left, top });
+    };
+    updatePosition();
+    const observer = typeof ownerWindow.ResizeObserver === "undefined" ? undefined : new ownerWindow.ResizeObserver(updatePosition);
+    observer?.observe(panel, { box: "border-box" });
+    ownerWindow.addEventListener("resize", updatePosition);
+    return () => {
+      observer?.disconnect();
+      ownerWindow.removeEventListener("resize", updatePosition);
+    };
   }, [anchor.right, anchor.top, level]);
   return createPortal(<div
     ref={panelRef}
@@ -2386,14 +2417,16 @@ export function projectRemoteMachineSearchResults(
     const cachedSession = cache?.serverId === trustedServerId
       ? cache.sessions.find((session) => session.id === contentMatch.match.sessionId)
       : undefined;
-    const session: MachineSessionCacheView = previous?.session ?? cachedSession ?? {
+    if (cachedSession !== undefined && !remoteSessionMatchesSidebarStatus(cachedSession, filters.status)) continue;
+    const activityAt = cachedSession?.lastActivityAt ?? Math.max(previous?.activityAt ?? Number.NEGATIVE_INFINITY, contentMatch.match.createdAt);
+    const session: MachineSessionCacheView = cachedSession ?? {
       id: contentMatch.match.sessionId,
       name: contentMatch.match.sessionId,
       state: "idle",
       pinned: false,
       archived: filters.status === "archived",
       taskTags: [],
-      lastActivityAt: contentMatch.match.createdAt
+      lastActivityAt: activityAt
     };
     const hits = [...(previous?.hits ?? []), contentMatch.match]
       .sort((left, right) => right.score - left.score || right.createdAt - left.createdAt || left.eventId.localeCompare(right.eventId));
@@ -2409,7 +2442,7 @@ export function projectRemoteMachineSearchResults(
       hits,
       relevance: previous?.relevance ?? 1,
       score: Math.max(previous?.score ?? Number.NEGATIVE_INFINITY, contentMatch.match.score),
-      activityAt: Math.max(previous?.activityAt ?? Number.NEGATIVE_INFINITY, contentMatch.match.createdAt)
+      activityAt
     });
   }
 
@@ -2526,7 +2559,7 @@ function RemoteMachineSearchResults({ options, optionOffset, activeOptionIndex, 
   readonly onActivate: (option: RemoteMachineSearchOption) => void;
   readonly onActiveOptionChange: (index: number) => void;
 }): JSX.Element {
-  return <div className="conversation-search-results conversation-search-results--remote">
+  return <>
     {options.map((option, localIndex) => {
       const optionIndex = optionOffset + localIndex;
       if (option.kind === "remoteExpand") {
@@ -2537,7 +2570,7 @@ function RemoteMachineSearchResults({ options, optionOffset, activeOptionIndex, 
           role="option"
           aria-selected={optionIndex === activeOptionIndex}
           key={option.key}
-          onMouseEnter={() => onActiveOptionChange(optionIndex)}
+          onMouseMove={() => onActiveOptionChange(optionIndex)}
           onClick={() => onActivate(option)}
         >{t("nav.searchMoreHits", { count: option.hiddenHitCount })}</button>;
       }
@@ -2557,7 +2590,7 @@ function RemoteMachineSearchResults({ options, optionOffset, activeOptionIndex, 
           type="button"
           role="option"
           aria-selected={optionIndex === activeOptionIndex}
-          onMouseEnter={() => onActiveOptionChange(optionIndex)}
+          onMouseMove={() => onActiveOptionChange(optionIndex)}
           onClick={() => onActivate(option)}
         >
           {option.kind === "remoteSession" && <Laptop aria-hidden="true" />}
@@ -2575,11 +2608,12 @@ function RemoteMachineSearchResults({ options, optionOffset, activeOptionIndex, 
         </button>
       </section>;
     })}
-  </div>;
+  </>;
 }
 
-function SearchResults({ results, query, activeSessionId, activeOptionIndex, expandedSessionIds, profileId, locale, t, onActivate, onActiveOptionChange }: {
+function SearchResults({ results, optionOffset, query, activeSessionId, activeOptionIndex, expandedSessionIds, profileId, locale, t, onActivate, onActiveOptionChange }: {
   readonly results: ReturnType<typeof projectConversationSearchResults>;
+  readonly optionOffset: number;
   readonly query: string;
   readonly activeSessionId?: string;
   readonly activeOptionIndex: number;
@@ -2590,9 +2624,9 @@ function SearchResults({ results, query, activeSessionId, activeOptionIndex, exp
   readonly onActivate: (option: ConversationSearchOption) => void;
   readonly onActiveOptionChange: (index: number) => void;
 }): JSX.Element {
-  let optionIndex = 0;
+  let optionIndex = optionOffset;
   return (
-    <div className="conversation-search-results">
+    <>
       {results.map((result) => {
         const sessionOption: ConversationSearchOption = { key: `session:${result.session.id}`, kind: "session", result };
         const sessionIndex = optionIndex++;
@@ -2607,7 +2641,7 @@ function SearchResults({ results, query, activeSessionId, activeOptionIndex, exp
               type="button"
               role="option"
               aria-selected={sessionIndex === activeOptionIndex}
-              onMouseEnter={() => onActiveOptionChange(sessionIndex)}
+              onMouseMove={() => onActiveOptionChange(sessionIndex)}
               onClick={() => onActivate(sessionOption)}
             >
               <MessageSquare aria-hidden="true" />
@@ -2629,7 +2663,7 @@ function SearchResults({ results, query, activeSessionId, activeOptionIndex, exp
                   aria-selected={hitIndex === activeOptionIndex}
                   key={hit.eventId}
                   title={hit.snippet}
-                  onMouseEnter={() => onActiveOptionChange(hitIndex)}
+                  onMouseMove={() => onActiveOptionChange(hitIndex)}
                   onClick={() => onActivate(option)}
                 >
                   <strong><HighlightedText value={hit.snippet} ranges={conversationSearchHighlightRanges(hit.snippet, query)} /></strong>
@@ -2645,19 +2679,26 @@ function SearchResults({ results, query, activeSessionId, activeOptionIndex, exp
                 type="button"
                 role="option"
                 aria-selected={expandIndex === activeOptionIndex}
-                onMouseEnter={() => onActiveOptionChange(expandIndex)}
+                onMouseMove={() => onActiveOptionChange(expandIndex)}
                 onClick={() => onActivate(option)}
               >{t("nav.searchMoreHits", { count: hiddenHitCount })}</button>;
             })()}</div>}
           </section>
         );
       })}
-    </div>
+    </>
   );
 }
 
 function searchOptionId(index: number): string {
   return `conversation-search-option-${index}`;
+}
+
+function sidebarSearchOptionKey(option: SidebarSearchOption, currentProfileId: string): string {
+  if ("profileId" in option) {
+    return JSON.stringify([option.profileId, option.kind, option.session.id, option.kind === "remoteMessage" ? option.match.eventId : null]);
+  }
+  return JSON.stringify([currentProfileId, option.kind, option.result.session.id, option.hit?.eventId ?? null]);
 }
 
 function sessionCallbacks(
@@ -3469,25 +3510,24 @@ function RemoteMachineSessionRow({ cache, session, presence, locale, t, onOpen }
   </li>;
 }
 
-function RemoteMachineSessionSections({ caches, presenceByProfile, status, grouped, collapsedProfileIds, contentFiltersActive, lastActivity, locale, t, onToggleProfile, onOpen }: {
+function sidebarRemoteNavigationProject(session: MachineSessionCacheView): { readonly key: string; readonly name: string } | undefined {
+  if (session.project !== undefined) {
+    return session.project === null ? undefined : { key: `id:${session.project.id}`, name: session.project.name };
+  }
+  return session.targetName === undefined ? undefined : { key: `legacy:${session.targetName}`, name: session.targetName };
+}
+
+function RemoteMachineSessionSections({ caches, entries, presenceByProfile, grouped, collapsedProfileIds, locale, t, onToggleProfile, onOpen }: {
   readonly caches: readonly MachineCacheView[];
+  readonly entries: readonly SidebarRemoteTaskEntry[];
   readonly presenceByProfile: Readonly<Record<string, MachinePresenceView>>;
-  readonly status: SidebarLayout["status"];
   readonly grouped: boolean;
   readonly collapsedProfileIds: ReadonlySet<string>;
-  readonly contentFiltersActive: boolean;
-  readonly lastActivity: SidebarLayout["lastActivity"];
   readonly locale: string;
   readonly t: Translator;
   readonly onToggleProfile: (profileId: string) => void;
   readonly onOpen: (profileId: string, sessionId: string) => void;
 }): JSX.Element {
-  const cutoff = sidebarLastActivityCutoff(lastActivity, Date.now());
-  const entries = caches.flatMap((cache) => cache.sessions
-    .filter((session) => !sidebarTaskPinned(session) && remoteSessionMatchesSidebarStatus(session, status)
-      && !contentFiltersActive
-      && (cutoff === undefined || session.lastActivityAt >= cutoff))
-    .map((session) => ({ cache, session })));
   const sorted = (values: typeof entries): typeof entries => [...values].sort((left, right) =>
     right.session.lastActivityAt - left.session.lastActivityAt
     || left.session.name.localeCompare(right.session.name));
@@ -3900,10 +3940,10 @@ function ProjectGroupHeading({ target, sessions, displayedSessionCount, collapse
   const [editValue, setEditValue] = useState(target.name);
   const [menu, setMenu] = useState<{ readonly x: number; readonly y: number }>();
   const [removeConfirmation, setRemoveConfirmation] = useState(false);
-  const allArchived = sessions.length > 0 && sessions.every((session) => session.archived);
-  const archiveCandidates = allArchived
+  const archiveCandidates = actions.showArchived
     ? sessions.filter((session) => session.archived)
-    : sessions.filter((session) => !session.archived && session.state !== "running" && session.state !== "waiting" && session.state !== "retrying");
+    : sessions.filter((session) => !session.archived && !session.pinned
+      && session.state !== "running" && session.state !== "waiting" && session.state !== "retrying");
   const canSetArchived = actions.onSetTargetSessionsArchived !== undefined && archiveCandidates.length > 0;
   const activeSessionCount = sessions.filter((session) => session.state === "running" || session.state === "waiting" || session.state === "retrying").length;
 
@@ -4121,7 +4161,10 @@ function ProjectGroupHeading({ target, sessions, displayedSessionCount, collapse
       {actions.onCopyTargetLink !== undefined && <button type="button" role="menuitem" onClick={() => runMenuAction(() => actions.onCopyTargetLink?.(target))}><span>{t("projects.copyLink")}</span></button>}
       <hr />
       {actions.onRemoveTarget !== undefined && <button type="button" role="menuitem" onClick={() => runMenuAction(() => setRemoveConfirmation(true))}><span>{t("projects.removeFromSidebar")}</span></button>}
-      <button type="button" role="menuitem" disabled={!canSetArchived} onClick={() => runMenuAction(() => actions.onSetTargetSessionsArchived?.(target, archiveCandidates, !allArchived))}><span>{t(allArchived ? "projects.unarchiveAll" : "projects.archiveAll")}</span></button>
+      <button type="button" role="menuitem" disabled={!canSetArchived}
+        onClick={() => runMenuAction(() => actions.onSetTargetSessionsArchived?.(target, archiveCandidates, !actions.showArchived))}>
+        <span>{t(actions.showArchived ? "projects.unarchiveAll" : "projects.archiveAll")}</span>
+      </button>
     </div>, document.body)}
     <Modal
       open={removeConfirmation}
@@ -4209,6 +4252,14 @@ function SessionSection({ title, sessions, targets, activeSessionId, locale, col
 } & SessionSectionCallbacks & SessionPriorityProps & SessionDisplayProps & ScheduleGroupPresentationProps): JSX.Element {
   const hiddenProjectIds = new Set(targets.filter((target) => target.archived).map((target) => target.id));
   const groups = targets.filter((target) => !target.archived).map((target) => ({ target, sessions: sessions.filter((session) => session.projectId === target.id) })).filter((group) => group.sessions.length > 0);
+  const [showAllProjects, setShowAllProjects] = useState(false);
+  const projectsView = sidebarSessionListView({
+    items: groups,
+    showAll: showAllProjects,
+    minimumVisible: SIDEBAR_PROJECT_LIST_MINIMUM_VISIBLE,
+    isCurrent: (group) => group.sessions.some((session) => session.id === activeSessionId),
+    hasAttention: (group) => sidebarGroupIndicatorState(group.sessions, priorityContext) !== undefined
+  });
   const dialogue = sessions.filter((session) => sidebarNavigationProjectId(session, hiddenProjectIds) === undefined);
   const renderGroup = ({ target, sessions: targetSessions }: (typeof groups)[number]): JSX.Element => {
     const allTargetSessions = projectActions.allSessions.filter((session) => session.projectId === target.id);
@@ -4295,14 +4346,19 @@ function SessionSection({ title, sessions, targets, activeSessionId, locale, col
       <h2>{title}</h2>
       <div className="session-section__projects">
         {projectOrder === "custom" ? <SortableList
-          items={groups}
+          items={projectsView.visibleItems}
           getId={(group) => group.target.id}
           onReorder={onReorderTargets}
           renderItem={renderGroup}
           reducedMotion={reducedMotion}
           handle="[data-project-header]"
           className="session-section__sortable-projects"
-        /> : groups.map(renderGroup)}
+        /> : projectsView.visibleItems.map(renderGroup)}
+        {projectsView.overflowing && <button
+          type="button"
+          className="session-list-show-all"
+          onClick={() => setShowAllProjects(true)}
+        >{t("nav.showAllProjects", { count: projectsView.totalCount })}</button>}
         {renderDialogue()}
       </div>
     </section>
@@ -5227,7 +5283,15 @@ function sidebarRightStatusLabel(status: SidebarRightStatus, t: Translator): str
 
 export function visibleSidebarSessionIds(root: HTMLElement | null): readonly string[] {
   if (root === null) return [];
-  const rows = [...root.querySelectorAll<HTMLElement>(".session-row [data-session-id]:not([data-machine-profile])")];
+  const rows = sidebarSessionElementsInVisualOrder([...root.querySelectorAll<HTMLElement>(".session-row [data-session-id]:not([data-machine-profile])")]);
+  const ids = rows.flatMap((row) => {
+    const sessionId = row.dataset.sessionId;
+    return sessionId && isRenderedSidebarSessionRow(row) ? [sessionId] : [];
+  });
+  return [...new Set(ids)];
+}
+
+export function sidebarSessionElementsInVisualOrder(rows: readonly HTMLElement[]): readonly HTMLElement[] {
   const cardGroups = new Map<HTMLElement, Array<{ readonly row: HTMLElement; readonly domIndex: number; readonly order: number }>>();
   rows.forEach((row, domIndex) => {
     const group = row.closest<HTMLElement>("[data-sidebar-card-order='row-major']");
@@ -5239,28 +5303,20 @@ export function visibleSidebarSessionIds(root: HTMLElement | null): readonly str
     entries.push({ row, domIndex, order });
     cardGroups.set(group, entries);
   });
-  const seen = new Set<string>();
   const emittedGroups = new Set<HTMLElement>();
-  const result: string[] = [];
-  const append = (row: HTMLElement): void => {
-    const sessionId = row.dataset.sessionId;
-    if (sessionId === undefined || sessionId === "" || seen.has(sessionId)) return;
-    if (!isRenderedSidebarSessionRow(row)) return;
-    seen.add(sessionId);
-    result.push(sessionId);
-  };
+  const result: HTMLElement[] = [];
   for (const row of rows) {
     const group = row.closest<HTMLElement>("[data-sidebar-card-order='row-major']");
     const groupedRows = group === null ? undefined : cardGroups.get(group);
     if (group === null || groupedRows === undefined) {
-      append(row);
+      result.push(row);
       continue;
     }
     if (emittedGroups.has(group)) continue;
     emittedGroups.add(group);
     groupedRows
       .sort((left, right) => left.order - right.order || left.domIndex - right.domIndex)
-      .forEach(({ row: groupedRow }) => append(groupedRow));
+      .forEach(({ row: groupedRow }) => result.push(groupedRow));
   }
   return result;
 }
