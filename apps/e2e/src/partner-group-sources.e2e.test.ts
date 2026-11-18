@@ -1,10 +1,12 @@
 import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import {
-  PartnerCapabilitiesSchema, PartnerDraftSchema, PartnerInitializationState,
-  PartnerModelRouteSchema, PermissionMode
+  MessageRole, PartnerCapabilitiesSchema, PartnerDraftSchema, PartnerInitializationState,
+  PartnerModelRouteSchema, PermissionMode, RunState, type Event, type Session
 } from "@joko/contracts";
 import { afterEach, expect, it, vi } from "vitest";
+import { waitFor } from "./fixture.js";
+import { createSessionMutation, queueRunIdFrom, renameMutation, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 import { REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID, RealPiSystemFixture } from "./real-pi-fixture.js";
 
 const fixtures: RealPiSystemFixture[] = [];
@@ -81,6 +83,60 @@ it("lists paired groups without switching nodes, then opens and creates on the o
   disposeClients.push(() => client.dispose());
   await client.start();
   expect(client.state.activeProfileId).toBe(a.profileId);
+
+  // A genuine hidden group turn allocates Store positions that the paired
+  // Mobile Owner never receives, even as its ordinary task stays on an anchor.
+  const ordinaryId = sessionIdFrom(await submit(firstManager.clients.operation, firstManager.connectionId, createSessionMutation({
+    backendId: "pi", targetId: "workspace-real-pi", displayName: "Ordinary anchored task",
+    providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID
+  })));
+  const generation = BigInt(first.application.store.getSession(ordinaryId).descriptor.binding.generation);
+  const runId = queueRunIdFrom(await submit(firstManager.clients.operation, firstManager.connectionId,
+    sendInputMutation(ordinaryId, generation, "An ordinary task with retained history")));
+  await waitFor(() => firstManager.clients.run.getRun({ runId }), result => result.run?.state === RunState.SUCCEEDED,
+    "ordinary task with a durable answer", 30_000);
+  await waitFor(async () => client.state.owner?.sessions.some((session: Session) => session.sessionId === ordinaryId), Boolean,
+    "ordinary task adopted by Mobile", 15_000);
+  await client.select(ordinaryId);
+  await waitFor(async () => client.state.liveStatus, status => status === "streaming", "confirmed Mobile Owner stream", 15_000);
+  const anchor = (client.state.detail?.timeline as readonly Event[] | undefined)?.find(event =>
+    event.payload?.kind.case === "messageCompleted" && event.payload.kind.value.role === MessageRole.ASSISTANT);
+  expect(anchor?.eventId).toBeDefined();
+  await client.around(anchor!.eventId);
+  const originalWindow = client.state.window, originalBefore = client.state.before;
+  expect(originalWindow?.map((event: Event) => event.eventId)).toContain(anchor!.eventId);
+  expect(originalBefore?.opaqueToken).toBeTruthy();
+  const resume = client.state.owner!.resumeCursor!;
+  const sent = await firstManager.clients.partnerGroup.sendPartnerGroupMessage({ groupId: firstGroup.id,
+    expectedRevision: firstGroup.revision, clientId: "source-group-hidden-owner-event", text: "Please answer from the private group task.",
+    mentions: { partnerIds: [firstMembers[0]!] } });
+  expect(sent.message).toBeDefined();
+  const store = first.application.store;
+  const hidden = await waitFor(async () => store.listEvents({ afterCursor: resume.sequence, limit: 500 }).find(event =>
+    event.payload.type === "message_complete" && event.payload.role === "assistant" && event.sessionId !== undefined
+    && first.application.partnerGroupRuntime?.isGroupSession(event.sessionId)), Boolean, "hidden Partner group assistant completion", 30_000);
+  if (!hidden) throw new Error("The native Partner group did not persist its expected hidden event.");
+  const renamed = "Ordinary task after the group turn";
+  await submit(firstManager.clients.operation, firstManager.connectionId, renameMutation(ordinaryId, renamed));
+  const changed = store.listEvents({ sessionId: ordinaryId, afterCursor: hidden.globalCursor, limit: 100 })
+    .find(event => event.payload.type === "session_changed");
+  expect(changed?.globalCursor).toBeGreaterThan(hidden.globalCursor);
+  const projected: Event[] = [];
+  const replay = new AbortController();
+  try {
+    for await (const event of mobileNetwork.streamOwner(a, resume, AbortSignal.any([replay.signal, AbortSignal.timeout(15_000)]))) {
+      projected.push(event);
+      if (event.eventId === changed!.id) break;
+    }
+  } finally { replay.abort(); }
+  expect(projected.at(-1)?.eventId).toBe(changed!.id);
+  expect(projected.some(event => event.identity?.sessionId === hidden.sessionId || event.cursor?.sequence === hidden.globalCursor)).toBe(false);
+  await waitFor(async () => client.state.owner?.sessions.find((session: Session) => session.sessionId === ordinaryId)?.displayName,
+    title => title === renamed, "later visible Owner event adopted by the original Mobile task", 15_000);
+  expect(client.state.window).toBe(originalWindow);
+  expect(client.state.before).toEqual(originalBefore);
+  expect(client.state.selectedId).toBe(ordinaryId);
+
   const signal = new AbortController().signal;
   const sourceA = await client.partnerGroupRosterSourceTransport(a.profileId, signal);
   const sourceB = await client.partnerGroupRosterSourceTransport(b.profileId, signal);

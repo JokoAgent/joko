@@ -1034,8 +1034,8 @@ export class MobileClient {
   #timelineRetirement = 0;
   #projectionReading = false;
   #projectionMisses = 0;
-  #streamSequence?: bigint;
-  #streamGeneration?: bigint;
+  #streamCursor?: EventCursor;
+  #ownerStreamConfirmed = false;
   #foreground = true;
   #extensionOAuthRetention?: { readonly transport: MobileExtensionTransport; readonly current: () => boolean };
   #extensionPackageReceiptRevision = 0;
@@ -4091,8 +4091,8 @@ export class MobileClient {
     this.#historyOwner = undefined;
     this.#projectionReading = false;
     this.#projectionMisses = 0;
-    this.#streamSequence = undefined;
-    this.#streamGeneration = undefined;
+    this.#streamCursor = undefined;
+    this.#ownerStreamConfirmed = false;
     this.#state = {
       ...this.#state,
       homeSearchStatus: "idle",
@@ -6130,15 +6130,19 @@ export class MobileClient {
   }
 
   #beginStream(epoch: number, credential: PairedCredential, snapshot: Snapshot): void {
-    const cursor = snapshot.resumeCursor;
-    if (!this.#current(epoch) || !cursor?.opaqueToken || cursor.generation !== snapshot.generation) {
+    const snapshotCursor = snapshot.resumeCursor;
+    if (!this.#current(epoch) || !snapshotCursor?.opaqueToken || snapshotCursor.generation !== snapshot.generation) {
       this.#set({ liveStatus: "polling" });
       return;
     }
+    // After a confirmed stream breaks, replay its last delivered cursor once
+    // the anonymous identity check and authenticated projection have succeeded.
+    const delivered = this.#ownerStreamConfirmed ? this.#streamCursor : undefined;
+    const cursor = delivered?.generation === snapshotCursor.generation && delivered.sequence <= snapshotCursor.sequence
+      ? delivered : snapshotCursor;
     const controller = new AbortController();
     this.#streamAbort = controller;
-    this.#streamGeneration = cursor.generation;
-    this.#streamSequence = cursor.sequence;
+    this.#streamCursor = cursor;
     this.#set({ liveStatus: "verifying" });
     // A transport that buffers every frame cannot prove incremental delivery.
     // Wait for decoded stream readiness or a valid event before switching to live updates.
@@ -6158,6 +6162,7 @@ export class MobileClient {
       if (!current() || this.#state.liveStatus === "streaming") return;
       if (this.#proofTimer !== undefined) clearTimeout(this.#proofTimer);
       this.#proofTimer = undefined;
+      this.#ownerStreamConfirmed = true;
       this.#set({ liveStatus: "streaming" });
     };
     try {
@@ -6165,8 +6170,15 @@ export class MobileClient {
         if (!current()) return;
         const cursor = event.cursor;
         const payload = event.payload?.kind;
-        if (payload?.case === "projectionInvalidated" && event.eventId && cursor?.opaqueToken
-          && cursor.generation === this.#streamGeneration && cursor.sequence <= (this.#streamSequence ?? 0n) + 1n) {
+        if (!event.eventId || !cursor?.opaqueToken || cursor.generation !== after.generation) {
+          this.#clearHistory();
+          void this.refresh();
+          return;
+        }
+        // Owner events are ordered, but their Store sequence also counts
+        // entries the Owner scope hides. Only earlier positions are duplicates.
+        if (cursor.sequence <= (this.#streamCursor ?? after).sequence) continue;
+        if (payload?.case === "projectionInvalidated") {
           const saving = this.#partnerProfileSave;
           const deletion = this.#sessionDeletion;
           const owner = saving?.action === this.#mutationOwner && saving?.epoch === epoch && saving?.credential === credential ? saving
@@ -6179,16 +6191,11 @@ export class MobileClient {
             if (this.#proofTimer !== undefined) clearTimeout(this.#proofTimer); this.#proofTimer = undefined;
             return;
           }
-        }
-        if (!event.eventId || !cursor || !cursor.opaqueToken || cursor.generation !== this.#streamGeneration
-          || cursor.sequence > (this.#streamSequence ?? 0n) + 1n
-          || event.payload?.kind.case === "projectionInvalidated") {
           this.#clearHistory();
           void this.refresh();
           return;
         }
-        if (cursor.sequence <= (this.#streamSequence ?? 0n)) continue;
-        this.#streamSequence = cursor.sequence;
+        this.#streamCursor = cursor;
         if (event.identity?.sessionId === this.#state.selectedId && historyInvalidated(event)) {
           if (!this.#retireStreamTimeline(event, cursor)) this.#clearHistory();
         }
@@ -6196,7 +6203,9 @@ export class MobileClient {
           void this.#retireAcceptedTaskOutbox(credential, record => mobileTaskOutboxHistoryDeleted(record, event));
         }
         accept();
-        if (event.identity?.sessionId && event.identity.sessionId === this.#state.selectedId && !this.#state.window) {
+        const detailCursor = this.#state.detail?.resumeCursor;
+        if (event.identity?.sessionId && event.identity.sessionId === this.#state.selectedId && !this.#state.window
+          && (detailCursor?.generation !== cursor.generation || detailCursor.sequence < cursor.sequence)) {
           this.#set({ live: [...this.#state.live.filter((item) => item.eventId !== event.eventId), event].slice(-160) });
         }
         this.#scheduleProjection(epoch, credential);
@@ -6204,13 +6213,17 @@ export class MobileClient {
       if (this.#current(epoch) && this.#streamAbort === controller) this.#fallbackStream();
     } catch (error) {
       if (!this.#current(epoch) || this.#streamAbort !== controller || controller.signal.aborted) return;
+      const code = (error as { code?: number })?.code;
       if (isRevoked(error)) await this.#invalidateCredential(
         epoch,
         credential.profileId,
         "This mobile connection was revoked. Forget it or pair this device again."
       );
       else if (isEndpointTrustError(error)) await this.#identityConflict(epoch, credential.profileId, message(error));
-      else if ((error as { code?: number })?.code === Code.FailedPrecondition) void this.refresh();
+      else if (code === Code.FailedPrecondition || code === Code.OutOfRange) {
+        this.#clearHistory();
+        void this.refresh();
+      }
       else this.#fallbackStream();
     }
   }
@@ -6236,8 +6249,8 @@ export class MobileClient {
     this.#projectionReading = true;
     const selectedId = this.#state.selectedId;
     const timelineRetirement = this.#timelineRetirement;
-    const generation = snapshotPoll ? this.#taskGeneration() : this.#streamGeneration;
-    const edge = snapshotPoll ? this.#state.owner?.resumeCursor?.sequence ?? 0n : this.#streamSequence ?? 0n;
+    const generation = snapshotPoll ? this.#taskGeneration() : this.#streamCursor?.generation;
+    const edge = (snapshotPoll ? this.#state.owner?.resumeCursor?.sequence : this.#streamCursor?.sequence) ?? 0n;
     try {
       let node = this.#state.node!;
       if (snapshotPoll) {
@@ -6282,7 +6295,7 @@ export class MobileClient {
       await this.#persistOfflineProjection(epoch, credential, node, owner.snapshot, detail);
       if (snapshotPoll) await this.reconcile(epoch);
       if (automationChanged && this.#state.automations.open) void this.refreshAutomations();
-      if (durable !== undefined && (this.#streamSequence ?? 0n) > durable) this.#scheduleProjection(epoch, credential);
+      if (durable !== undefined && (this.#streamCursor?.sequence ?? 0n) > durable) this.#scheduleProjection(epoch, credential);
     } catch (error) {
       if (!this.#current(epoch)) return;
       if (isRevoked(error)) await this.#invalidateCredential(
