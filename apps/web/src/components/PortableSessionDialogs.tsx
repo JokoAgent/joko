@@ -86,7 +86,7 @@ export function PortableSessionExportDialog({
   readonly onClose: () => void;
   readonly onExport: (input: { readonly password?: string; readonly excludeMedia: boolean }, context: ArtifactDownloadContext) => Promise<PortableSessionExportOutcome>;
   readonly connectionOwner: unknown;
-  readonly onExported: (fidelity: PortableSessionFidelity) => void;
+  readonly onExported: (fidelity: PortableSessionFidelity, status: "exported" | "dispatched") => void;
 }): JSX.Element {
   const [encrypt, setEncrypt] = useState(false);
   const [password, setPassword] = useState("");
@@ -154,7 +154,7 @@ export function PortableSessionExportDialog({
         }
         return;
       }
-      onExported(result.fidelity);
+      onExported(result.fidelity, result.status);
       onClose();
     } catch {
       if (current()) setError(labels.exportFailed);

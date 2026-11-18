@@ -179,7 +179,7 @@ describe("PortableSessionExportDialog", () => {
     expect(container.textContent).toContain("12 MB of media cannot fit.");
     await act(async () => buttonWithText(container, "Export without media").click());
     expect(onExport).toHaveBeenNthCalledWith(2, { password: "secret", excludeMedia: true }, { ownerDocument: document, signal: expect.any(AbortSignal) });
-    expect(onExported).toHaveBeenCalledWith("partial");
+    expect(onExported).toHaveBeenCalledWith("partial", "exported");
     expect(onClose).toHaveBeenCalledOnce();
   });
 

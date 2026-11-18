@@ -58,7 +58,7 @@ export function PortableSessionDialogHost({
   readonly worktreeSupportedTargetIds: ReadonlySet<string>;
   readonly onCloseExport: () => void;
   readonly onCloseImport: (requestId: number) => void;
-  readonly onExported: (fidelity: PortableSessionFidelity) => void;
+  readonly onExported: (fidelity: PortableSessionFidelity, status: "exported" | "dispatched") => void;
   readonly onOpenTask: (sessionId: string) => void;
 }): JSX.Element {
   const labels = useMemo(() => portableSessionDialogLabels(t, locale), [locale, t]);

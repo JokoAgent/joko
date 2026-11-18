@@ -6132,7 +6132,7 @@ export interface PortableReplacementCleanupResolutionView {
 }
 
 export type PortableSessionExportOutcomeView =
-  | { readonly status: "exported"; readonly fidelity: PortableSessionFidelityView }
+  | { readonly status: "exported" | "dispatched"; readonly fidelity: PortableSessionFidelityView }
   | { readonly status: "oversize"; readonly mediaBytes: number; readonly limitBytes: number }
   | { readonly status: "cancelled" };
 

@@ -62,8 +62,11 @@ it.each([
   [{ status: "exported", fidelity: "full" }, "Task package exported."],
   [{ status: "exported", fidelity: "partial" }, "Task package exported. Some media or native history could not be included."],
   [{ status: "exported", fidelity: "product_only" }, "Task package exported without native context."],
+  [{ status: "dispatched", fidelity: "full" }, "Task package download requested."],
+  [{ status: "dispatched", fidelity: "partial" }, "Task package download requested. Some media or native history could not be included."],
+  [{ status: "dispatched", fidelity: "product_only" }, "Task package download requested. The package contains Joko history only."],
   [{ status: "cancelled" }, undefined]
-] satisfies readonly [PortableSessionExportOutcomeView, string | undefined][])("reports the saved package result %j", async (result, expectedNotice) => {
+] satisfies readonly [PortableSessionExportOutcomeView, string | undefined][])("reports the task package delivery result %j", async (result, expectedNotice) => {
   const container = document.body.appendChild(document.createElement("div"));
   root = createRoot(container);
   const base = controller("a");

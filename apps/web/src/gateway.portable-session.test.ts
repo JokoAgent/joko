@@ -36,7 +36,7 @@ describe("portable task package gateway", () => {
     vi.unstubAllGlobals();
   });
 
-  it("exports through the native save boundary and returns typed oversize details", async () => {
+  it("distinguishes a native save, a cancelled save, and the browser download request", async () => {
     const saveFile = vi.fn(async () => true);
     vi.stubGlobal("window", { jokoDesktop: { saveFile } });
     vi.stubGlobal("fetch", vi.fn(async () => new Response(new Uint8Array([1, 2, 3]), {
@@ -104,6 +104,20 @@ describe("portable task package gateway", () => {
       mediaBytes: 7_340_032,
       limitBytes: 10_485_760
     });
+
+    oversize = false;
+    const browserWindow = { closed: false, URL: { createObjectURL: vi.fn(() => "blob:portable-task"), revokeObjectURL: vi.fn() },
+      addEventListener: vi.fn(), removeEventListener: vi.fn(), setTimeout: vi.fn(() => 1), clearTimeout: vi.fn() };
+    const anchor = { click: vi.fn() };
+    const ownerDocument = { defaultView: browserWindow, createElement: vi.fn(() => anchor) } as unknown as Document;
+    vi.stubGlobal("window", browserWindow);
+    await expect(gateway.exportPortableSession("session-1", { password: "transient", excludeMedia: false }, {
+      ownerDocument, signal: new AbortController().signal
+    })).resolves.toEqual({ status: "dispatched", fidelity: "full" });
+    expect(ownerDocument.createElement).toHaveBeenCalledExactlyOnceWith("a");
+    expect(anchor).toMatchObject({ href: "blob:portable-task", download: "portable-task.jshare" });
+    expect(anchor.click).toHaveBeenCalledOnce();
+    expect(saveFile).toHaveBeenCalledTimes(2);
     gateway.disconnect();
   });
 
