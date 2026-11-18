@@ -1,6 +1,6 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useMobileMailLink } from "./MobileExtensionMailReader";
-import { AppState, Linking, Modal, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { AppState, Linking, Modal, Pressable, ScrollView, StyleSheet, Text, View, useWindowDimensions } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
 import { randomUUID } from "expo-crypto";
@@ -174,19 +174,10 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
       {toolbar(value.text, mobileMessage(locale, value.type === "math" ? "markdown.math" : "markdown.diagram"), () => setExpanded(value))}
       <MobileMarkdownRichBlock kind={value.type} source={value.text} colors={colors} locale={locale} ownerKey={`${ownerKey}/${value.key}`} />
     </View>;
-    if (value.type === "table") return <View key={value.key} style={[styles.frame, { borderColor: colors.border }]}>
-      <ScrollView horizontal nestedScrollEnabled>
-        <View accessibilityLabel={mobileMessage(locale, "markdown.table")}>
-          {[value.header, ...value.rows.map((row) => row.cells)].map((cells, rowIndex) => <View key={rowIndex}
-            style={[styles.tableRow, rowIndex === 0 && { backgroundColor: colors.background }]}>
-            {cells.map((cell, cellIndex) => <View key={cellIndex}
-              style={[styles.cell, { borderColor: colors.border }]}>
-              <Text selectable={textSelectable(cell)} style={[bodyStyle(cell), { color: colors.ink }, rowIndex === 0 && styles.strong]}>{inlines(cell)}</Text>
-            </View>)}
-          </View>)}
-        </View>
-      </ScrollView>
-    </View>;
+    if (value.type === "table") return <MobileMarkdownTable key={value.key}
+      table={value} colors={colors} label={mobileMessage(locale, "markdown.table")} rendersInlineImage={rendersInlineImage}
+      renderCell={(cell, header) => <Text selectable={textSelectable(cell)}
+        style={[bodyStyle(cell), { color: colors.ink }, header && styles.strong]}>{inlines(cell)}</Text>} />;
     if (value.type === "blockquote") return <View key={value.key} style={[styles.quote, { borderColor: colors.accent }]}>
       <Text selectable={textSelectable(value.inlines)} style={[bodyStyle(value.inlines), { color: colors.muted }]}>{inlines(value.inlines)}</Text>
     </View>;
@@ -229,6 +220,71 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
     </Modal>
   </View>;
 });
+
+const TABLE_CELL_PADDING = 10;
+const TABLE_MIN_COLUMN_WIDTH = 96;
+const TABLE_MAX_TEXT_WIDTH = 220;
+const WIDE_TABLE_GLYPH = /[\p{Script=Han}\p{Script=Hangul}\p{Script=Hiragana}\p{Script=Katakana}\p{Extended_Pictographic}\uFF00-\uFFEF]/u;
+
+function MobileMarkdownTable({ table, colors, label, rendersInlineImage, renderCell }: {
+  readonly table: Extract<MobileMarkdownBlock, { type: "table" }>;
+  readonly colors: MobileMarkdownColors;
+  readonly label: string;
+  readonly rendersInlineImage: (inline: MobileMarkdownInline) => boolean;
+  readonly renderCell: (cell: readonly MobileMarkdownInline[], header: boolean) => ReactNode;
+}) {
+  const [viewportWidth, setViewportWidth] = useState(0);
+  const { fontScale } = useWindowDimensions();
+  const rows = useMemo(() => [table.header, ...table.rows.map((row) => row.cells)], [table]);
+  const preferredWidths = useMemo(() => {
+    const widths: number[] = [];
+    for (const row of rows) {
+      row.forEach((cell, column) => {
+        const preferred = preferredTableCellWidth(cell, fontScale, rendersInlineImage);
+        widths[column] = Math.max(widths[column] ?? TABLE_MIN_COLUMN_WIDTH, preferred);
+      });
+    }
+    return widths;
+  }, [rows, fontScale, rendersInlineImage]);
+  const minimumWidth = preferredWidths.reduce((total, width) => total + width, 0);
+  const extraWidth = Math.max(0, viewportWidth - minimumWidth);
+  const extraPerColumn = Math.floor(extraWidth / preferredWidths.length);
+  const extraRemainder = extraWidth % preferredWidths.length;
+  const widths = preferredWidths.map((width, column) =>
+    width + extraPerColumn + (column < extraRemainder ? 1 : 0));
+  return <View style={[styles.frame, { borderColor: colors.border }]}>
+    <ScrollView horizontal nestedScrollEnabled scrollEnabled={viewportWidth === 0 || minimumWidth > viewportWidth}
+      onLayout={(event) => setViewportWidth(Math.floor(event.nativeEvent.layout.width))}>
+      <View accessibilityLabel={label}>
+        {rows.map((cells, row) => <View key={row}
+          style={[styles.tableRow, row === 0 && { backgroundColor: colors.background }]}>
+          {cells.map((cell, column) => <View key={column}
+            style={[styles.cell, { width: widths[column], borderColor: colors.border }]}>
+            {renderCell(cell, row === 0)}
+          </View>)}
+        </View>)}
+      </View>
+    </ScrollView>
+  </View>;
+}
+
+function preferredTableCellWidth(cell: readonly MobileMarkdownInline[], fontScale: number,
+  rendersInlineImage: (inline: MobileMarkdownInline) => boolean): number {
+  const inset = TABLE_CELL_PADDING * 2 + 1;
+  let characters = 0;
+  let imageWidth = 0;
+  for (const inline of cell) {
+    if (inline.type === "image" && rendersInlineImage(inline)) {
+      imageWidth = Math.max(imageWidth, mobileMarkdownInlineImageSize(inline).width);
+      continue;
+    }
+    const text = inline.type === "image" ? inline.alt || "Image"
+      : inline.type === "math" ? latexToUnicodeApproximation(inline.text) : inline.text;
+    for (const char of text) characters += WIDE_TABLE_GLYPH.test(char) ? 2 : 1;
+  }
+  const textWidth = Math.min(TABLE_MAX_TEXT_WIDTH, Math.ceil(characters * 8 * fontScale) + inset);
+  return Math.max(TABLE_MIN_COLUMN_WIDTH, Math.ceil(imageWidth) + inset, textWidth);
+}
 
 function MobileMarkdownImageSpan({ inline, reference, colors, label, onOpen }: {
   readonly inline: Extract<MobileMarkdownInline, { type: "image" }>;
@@ -302,6 +358,6 @@ const styles = StyleSheet.create({
   caption: { fontSize: 12, lineHeight: 18 }, frame: { borderWidth: 1, borderRadius: 8, overflow: "hidden" },
   toolbar: { minHeight: 44, flexDirection: "row", alignItems: "center", paddingHorizontal: 10, gap: 8 },
   action: { minHeight: 44, paddingHorizontal: 8, justifyContent: "center", alignItems: "center" },
-  codeContent: { padding: 12 }, tableRow: { flexDirection: "row" }, cell: { width: 180, padding: 10, borderRightWidth: 1, borderBottomWidth: 1 },
+  codeContent: { padding: 12 }, tableRow: { flexDirection: "row" }, cell: { padding: TABLE_CELL_PADDING, borderRightWidth: 1, borderBottomWidth: 1 },
   quote: { borderLeftWidth: 3, paddingLeft: 12 }, fallback: { padding: 12, gap: 6 }, expanded: { padding: 12, gap: 12 }
 });

@@ -7,10 +7,11 @@ import type { MobileMarkdownResourceClient } from "./use-mobile-markdown-resourc
 
 vi.mock("./MobileSelectableMessageText", () => ({ MobileSelectableMessageText: () => null }));
 
-const { copy, openUrl, appStateListeners, pressureListeners, nativeImages } = vi.hoisted(() => ({
+const { copy, openUrl, appStateListeners, pressureListeners, nativeImages, scrollLayouts } = vi.hoisted(() => ({
   copy: vi.fn(async () => undefined), openUrl: vi.fn(async () => undefined),
   appStateListeners: new Set<(state: string) => void>(), pressureListeners: new Set<() => void>(),
-  nativeImages: new Map<string, { onError(): void; onLoad(event: { source: { width: number; height: number; isAnimated?: boolean } }): void }>()
+  nativeImages: new Map<string, { onError(): void; onLoad(event: { source: { width: number; height: number; isAnimated?: boolean } }): void }>(),
+  scrollLayouts: new WeakMap<HTMLElement, (event: { nativeEvent: { layout: { width: number } } }) => void>()
 }));
 vi.mock("expo-clipboard", () => ({ setStringAsync: copy }));
 vi.mock("lucide-react-native", () => ({ Mail: () => null, CalendarDays: () => null, Folder: () => null,
@@ -32,8 +33,16 @@ vi.mock("expo-image", () => ({ Image: (props: { source: { uri: string }; accessi
 } }));
 vi.mock("react-native-safe-area-context", () => ({ SafeAreaView: ({ children }: { children?: ReactNode }) => createElement("div", {}, children) }));
 vi.mock("react-native", () => {
-  const box = ({ children, accessibilityLabel }: { children?: ReactNode; accessibilityLabel?: string }) => createElement("div", { "aria-label": accessibilityLabel }, children);
-  return { View: box, ScrollView: box, TextInput: ({ value, onChangeText }: { value: string; onChangeText(value: string): void }) => createElement("input", { value, onChange: (event: { target: { value: string } }) => onChangeText(event.target.value) }),
+  const box = ({ children, accessibilityLabel, style }: { children?: ReactNode; accessibilityLabel?: string; style?: unknown }) => {
+    const viewStyle = Array.isArray(style) ? Object.assign({}, ...style.flat()) : style as Record<string, unknown> | undefined;
+    return createElement("div", { "aria-label": accessibilityLabel, "data-width": viewStyle?.width }, children);
+  };
+  const scroll = ({ children, horizontal, scrollEnabled, onLayout }: { children?: ReactNode; horizontal?: boolean;
+    scrollEnabled?: boolean; onLayout?: (event: { nativeEvent: { layout: { width: number } } }) => void }) =>
+    createElement("div", { "data-horizontal": horizontal, "data-scroll-enabled": scrollEnabled,
+      ref: (element: HTMLDivElement | null) => { if (element && onLayout) scrollLayouts.set(element, onLayout); } }, children);
+  return { View: box, ScrollView: scroll, useWindowDimensions: () => ({ width: 360, height: 800, scale: 1, fontScale: 1 }),
+    TextInput: ({ value, onChangeText }: { value: string; onChangeText(value: string): void }) => createElement("input", { value, onChange: (event: { target: { value: string } }) => onChangeText(event.target.value) }),
     Switch: ({ value, onValueChange }: { value: boolean; onValueChange(value: boolean): void }) => createElement("button", { role: "switch", "aria-checked": value, onClick: () => onValueChange(!value) }),
     Text: ({ children, onPress, accessibilityRole, accessibilityLabel, selectable, style }: {
     children?: ReactNode; onPress?: () => void; accessibilityRole?: string; accessibilityLabel?: string; selectable?: boolean; style?: unknown;
@@ -56,6 +65,37 @@ vi.mock("react-native", () => {
 });
 
 describe("native message Markdown", () => {
+  it("fits short tables to measured message width and retains horizontal scrolling for wide tables", async () => {
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    const colors = { surface: "#fff", background: "#fafafa", ink: "#111", muted: "#666",
+      border: "#ccc", accent: "#f90", negative: "#c33" };
+    const render = (text: string) => act(async () => root.render(
+      <MobileMarkdownMessage text={text} colors={colors} locale="en" ownerKey="message-table" />
+    ));
+    const scrollView = () => container.querySelector<HTMLElement>('[data-horizontal="true"]')!;
+    const measure = (width: number) => act(async () => scrollLayouts.get(scrollView())!({ nativeEvent: { layout: { width } } }));
+    const row = (index: number) => scrollView().firstElementChild!.children[index]!;
+    const widths = (index: number) => Array.from(row(index).children, (cell) => Number(cell.getAttribute("data-width")));
+    try {
+      await render("| A | B | C |\n| --- | --- | --- |\n| AA | BB | CC |");
+      await measure(326);
+      expect(widths(0)).toEqual([109, 109, 108]);
+      expect(widths(1)).toEqual(widths(0));
+      expect(row(1).querySelectorAll('[data-selectable="true"]')).toHaveLength(3);
+      expect(scrollView().dataset.scrollEnabled).toBe("false");
+
+      await measure(280);
+      expect(widths(0)).toEqual([96, 96, 96]);
+      expect(scrollView().dataset.scrollEnabled).toBe("true");
+      await render("| A | B | C | D | E |\n| --- | --- | --- | --- | --- |\n| A | B | C | D | E |");
+      await measure(326);
+      expect(widths(1)).toEqual([96, 96, 96, 96, 96]);
+      expect(row(1).textContent).toBe("ABCDE");
+      expect(scrollView().dataset.scrollEnabled).toBe("true");
+    } finally { await act(async () => root.unmount()); }
+  });
+
   it("sends a previewed rich answer only on click and retains acceptance across native row remounts", async () => {
     const container = document.createElement("div"), root = createRoot(container);
     let finish!: (accepted: boolean) => void;
