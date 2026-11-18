@@ -35,6 +35,7 @@ import {
   mobileAppCommandTesting,
   parseMobileAppCommand
 } from "./mobile-app-commands";
+import { detectMobileRuntimeCommandActivation, replaceMobileRuntimeCommandRun } from "./mobile-runtime-commands";
 
 function capability(name: string, support = CapabilitySupport.SUPPORTED) {
   return create(CapabilitySchema, { name, support });
@@ -168,6 +169,23 @@ describe("mobile app command authority and palette", () => {
       truncated: true
     });
     expect(mobileAppCommandTesting.maximumVisibleResults).toBe(20);
+  });
+
+  it("finds a loaded managed native Skill by its short prefix and inserts its exact invocation", () => {
+    const controls = createMobileAppCommandControls("authority", snapshot(), snapshot(), "session")!;
+    const nativeText = { description: "Inspect changes", source: RuntimeCommandSource.SKILL,
+      inputMode: RuntimeCommandInputMode.TEXT };
+    const skill = { ...nativeText, name: "skill:repo-audit", commandId: "native-skill", resourceId: "approved-skill" };
+    const candidates = mergeMobileCommandPaletteCandidates(controls, [
+      skill,
+      { ...nativeText, name: "skill:repo-docs", commandId: "unmanaged-skill" },
+      { ...skill, name: "skill:repo-other", commandId: "extension-command", source: RuntimeCommandSource.EXTENSION }
+    ]);
+    const draft = plainTextMobileComposerDraft("/repo review src");
+    const activation = detectMobileRuntimeCommandActivation(draft, { start: 5, end: 5 }, false)!;
+    const { items } = filterMobileCommandPaletteCandidates(candidates, activation.query);
+    expect(items).toEqual([skill]);
+    expect(replaceMobileRuntimeCommandRun(draft, activation, items[0]!).draft.text).toBe("/skill:repo-audit review src");
   });
 });
 
