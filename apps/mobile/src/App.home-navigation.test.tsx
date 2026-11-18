@@ -664,10 +664,10 @@ describe("actual Home navigation hosts", () => {
   it("uses the current project or Dialogue for a moved task with the original execution Target", async () => {
     const original = state.owner!;
     const owner = (projectId: string | undefined) => create(SnapshotSchema, { ...original,
-      targets: [...original.targets, { targetId: "destination", backendId: "backend", displayName: "Destination" }],
+      targets: [...original.targets, create(TargetSchema, { targetId: "destination", backendId: "backend", displayName: "Destination" })],
       workspaces: [
-        { targetId: "project", workspaceId: "original-workspace", kind: WorkspaceKind.USER_PROJECT },
-        { targetId: "destination", workspaceId: "destination-workspace", kind: WorkspaceKind.USER_PROJECT }
+        create(WorkspaceDescriptorSchema, { targetId: "project", workspaceId: "original-workspace", kind: WorkspaceKind.USER_PROJECT }),
+        create(WorkspaceDescriptorSchema, { targetId: "destination", workspaceId: "destination-workspace", kind: WorkspaceKind.USER_PROJECT })
       ],
       sessions: original.sessions.map(session => session.sessionId === "other" ? create(SessionSchema, { ...session, projectId }) : session)
     });
