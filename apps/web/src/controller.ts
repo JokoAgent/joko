@@ -3561,10 +3561,10 @@ export function useAppController(): AppController {
     if (artifactGateway === undefined) throw new Error("Connect to Joko before exporting a task.");
     return artifactGateway.exportSession(sessionId, context);
   }, [artifactGateway]);
-  const exportPortableSession = useCallback<AppController["exportPortableSession"]>(async (sessionId, options, context) => {
+  const exportPortableSession = useCallback<AppController["exportPortableSession"]>(async (session, options, context) => {
     context.signal.throwIfAborted();
     if (artifactGateway === undefined) throw new Error("Connect to Joko before exporting a task.");
-    return artifactGateway.exportPortableSession(sessionId, options, context);
+    return artifactGateway.exportPortableSession(session, options, context);
   }, [artifactGateway]);
   const updateAuxiliaryTextSettings = useCallback<AppController["updateAuxiliaryTextSettings"]>(async (models, expectedRevision) => {
     if (artifactGateway === undefined) throw new Error("Connect to Joko before updating auxiliary text settings.");

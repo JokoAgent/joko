@@ -77,7 +77,7 @@ export function PortableSessionDialogHost({
       onClose={onCloseExport}
       onExport={(options, context) => exportSession === undefined
         ? Promise.resolve({ status: "cancelled" })
-        : controller.exportPortableSession(exportSession.id, options, context)}
+        : controller.exportPortableSession(exportSession, options, context)}
       onExported={onExported}
     />
     {request !== undefined && importApi !== undefined && <PortableSessionImportDialog

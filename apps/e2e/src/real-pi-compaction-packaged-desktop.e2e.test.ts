@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { type Server } from "node:http";
 import { type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -20,6 +20,7 @@ import {
   SessionSnapshotScopeSchema,
   SnapshotScopeSchema
 } from "@joko/contracts";
+import { preparePortableSessionImport } from "@joko/orchestrator";
 import { _electron, type ElectronApplication, type Page, type Request } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -278,6 +279,72 @@ describe("packaged Desktop Pi compaction", () => {
     recordLifecycle("provider-ready");
     return { page, connection, clients: createE2eClients(connection.origin, connection.authKey), piSettingsFile };
   };
+
+  packagedIt("saves a real portable task only after the original Desktop window confirms a destination", { timeout: 150_000 }, async () => {
+    fixture = await RealPiSystemFixture.start({ keepRoot: true });
+    const manager = await fixture.pair("Packaged export manager");
+    const name = "Packaged portable task";
+    const prompt = "Retain this turn in the portable task package.";
+    const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId, createSessionMutation({
+      backendId: "pi", targetId: "workspace-real-pi", displayName: name,
+      providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, effortId: "off"
+    })));
+    const generation = BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation);
+    const runId = queueRunIdFrom(await submit(manager.clients.operation, manager.connectionId, sendInputMutation(sessionId, generation, prompt)));
+    await waitFor(() => manager.clients.run.getRun({ runId }), ({ run }) => run?.state === RunState.SUCCEEDED, "packaged export source turn", 30_000);
+
+    const main = await launchConnectedDesktop(fixture, "Packaged export Desktop");
+    const application = desktop!;
+    const taskRow = main.locator(`.sidebar [data-session-id="${sessionId}"]`).first();
+    await taskRow.click({ button: "right" });
+    const [page] = await Promise.all([
+      application.waitForEvent("window", { timeout: 30_000 }),
+      main.getByRole("menuitem", { name: "Open in new window", exact: true }).click({ noWaitAfter: true })
+    ]);
+    const nativeWindow = await application.browserWindow(page);
+    const windowId = await nativeWindow.evaluate(window => window.id);
+    await nativeWindow.dispose();
+    const target = resolve(profileDirectory!, "user-selected.jshare");
+    await application.evaluate(({ BrowserWindow, dialog }, { windowId, target }) => {
+      const owner = BrowserWindow.fromId(windowId);
+      const original = dialog.showSaveDialog;
+      let cancelled = false;
+      dialog.showSaveDialog = async (actualOwner: unknown) => {
+        if (owner === null || actualOwner !== owner || owner.isDestroyed()) throw new Error("Save picker used a different Desktop window.");
+        if (!cancelled) {
+          cancelled = true;
+          return { canceled: true, filePath: "" };
+        }
+        dialog.showSaveDialog = original;
+        return { canceled: false, filePath: target };
+      };
+    }, { windowId, target });
+
+    const sent: Request[] = [];
+    page.on("request", (request) => {
+      if (new URL(request.url()).pathname.endsWith("/ExportPortableSession")) sent.push(request);
+    });
+    const pane = page.locator(`.session-pane[data-input-session-id="${sessionId}"]`);
+    await pane.locator(".session-header-menu summary").click();
+    await pane.getByRole("menuitem", { name: "Export task…", exact: true }).click();
+    const exportDialog = page.getByRole("alertdialog", { name: "Export task", exact: true });
+    const exportButton = exportDialog.getByRole("button", { name: "Export", exact: true });
+    await exportButton.click();
+    await waitFor(() => exportButton.isEnabled(), Boolean, "cancelled task save returns to export options", 10_000);
+    expect(await exportDialog.getByRole("alert").count()).toBe(0);
+    expect(sent).toHaveLength(0);
+    await expect(readFile(target)).rejects.toMatchObject({ code: "ENOENT" });
+
+    await exportButton.click();
+    await page.getByText("Task package exported.", { exact: true }).waitFor({ state: "visible", timeout: 30_000 });
+    expect(sent).toHaveLength(1);
+    const saved = preparePortableSessionImport(await readFile(target));
+    expect(saved.manifest).toMatchObject({ title: name, fidelity: "full" });
+    expect(saved.nativeSession?.bytes.byteLength).toBeGreaterThan(0);
+    expect(saved.projection.messages.find(message => message.role === "user")?.blocks)
+      .toContainEqual(expect.objectContaining({ type: "text", text: prompt }));
+    await page.close();
+  });
 
   packagedIt("shows real manual outcomes, focus, route isolation and restart in the current Desktop artifact", { timeout: 180_000 }, async () => {
     let releaseSummary: (() => void) | undefined;

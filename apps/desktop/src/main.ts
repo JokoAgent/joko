@@ -399,6 +399,7 @@ import {
   readRegularFileSnapshot
 } from "@joko/device-peer/private-files";
 import { materializeDesktopDeepLinkNavigation } from "./portable-deep-link-materialization.js";
+import { isPortableSessionSaveRequestId, PortableSessionSave, portableSessionSaveName } from "./portable-session-save.js";
 import { DesktopTaskSharingInvitationBuffer } from "./task-sharing-invitation.js";
 import { verifyPackagedSmokeTaskSharing } from "./packaged-smoke-task-sharing.js";
 import {
@@ -1005,6 +1006,7 @@ let nativeFileOpener: NativeFileOpener | undefined;
 let nativeArtifactSourceRevealer: NativeArtifactSourceRevealer | undefined;
 let windowsOpenWithApps: WindowsOpenWithApps | undefined;
 const nativeFileActionScopes = new WeakMap<WebContents, NativeFileActionScope>();
+const portableSessionSave = new PortableSessionSave();
 type DesktopOpenWithDocumentOwnerForWindow = DesktopOpenWithDocumentOwner<WebContents>;
 const desktopOpenWithDocuments = new DesktopOpenWithDocumentAuthority<WebContents>(
   () => randomUUID(),
@@ -9633,6 +9635,45 @@ function registerIpc(): void {
       bytes: await readRegularFileSnapshot(path, MAXIMUM_NATIVE_FILE_BYTES)
     };
   });
+  ipcMain.handle(DESKTOP_CHANNELS.choosePortableSessionSave, async (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    const [requestId, title] = parameters;
+    if (parameters.length !== 2 || !isPortableSessionSaveRequestId(requestId) || typeof title !== "string") {
+      throw new TypeError("Portable task save selection requires a request identity and task title.");
+    }
+    const owner = trustedApplicationWindowForContents(event.sender);
+    if (owner === undefined) throw new Error("The portable task save window is no longer available.");
+    return portableSessionSave.choose(nativeFileActionScope(event), requestId, async () => {
+      const selection = await dialog.showSaveDialog(owner, {
+        defaultPath: portableSessionSaveName(title),
+        filters: [{ name: "Joko task package", extensions: ["jshare"] }]
+      });
+      return selection.canceled ? undefined : selection.filePath;
+    });
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.commitPortableSessionSave, async (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    const [requestId, bytes] = parameters;
+    if (parameters.length !== 2 || !isPortableSessionSaveRequestId(requestId) || !(bytes instanceof Uint8Array)
+      || bytes.byteLength === 0 || bytes.byteLength > MAXIMUM_NATIVE_FILE_BYTES) {
+      throw new TypeError("Portable task save requires a request identity and valid package bytes.");
+    }
+    const scope = nativeFileActionScopes.get(event.sender);
+    const owner = trustedApplicationWindowForContents(event.sender);
+    if (scope === undefined || owner === undefined) throw new Error("The portable task save window is no longer available.");
+    const receipt = await portableSessionSave.commit(scope, requestId, bytes, MAXIMUM_NATIVE_FILE_BYTES);
+    if (scope.isCurrent()) reportNativeSaveFinalization(owner, receipt);
+    return true;
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.cancelPortableSessionSave, (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    const [requestId] = parameters;
+    if (parameters.length !== 1 || !isPortableSessionSaveRequestId(requestId)) {
+      throw new TypeError("Portable task save cancellation requires a request identity.");
+    }
+    const scope = nativeFileActionScopes.get(event.sender);
+    if (scope !== undefined) portableSessionSave.cancel(scope, requestId);
+  });
   ipcMain.handle(DESKTOP_CHANNELS.saveFile, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
     if (parameters.length !== 1) throw new TypeError("Native file save requires one request object.");
@@ -11282,6 +11323,7 @@ function nativeFileActionScope(event: IpcMainInvokeEvent): NativeFileActionScope
     nativeFileClipboard?.retireScope(scope.id);
     nativeFileOpener?.retireScope(scope.id);
     nativeArtifactSourceRevealer?.retireScope(scope.id);
+    portableSessionSave.retire(scope);
     if (nativeFileActionScopes.get(contents) === scope) nativeFileActionScopes.delete(contents);
     contents.removeListener("did-start-navigation", navigate);
     contents.removeListener("destroyed", retire);

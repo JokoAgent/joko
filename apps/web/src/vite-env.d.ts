@@ -660,6 +660,11 @@ interface JokoDesktopApi {
   readonly nativeGamepad?: import("./native-gamepad.js").NativeGamepadBridge;
   chooseFiles(): Promise<readonly JokoDesktopFile[]>;
   choosePortableSessionFile(): Promise<JokoDesktopFile | undefined>;
+  readonly portableSessionSave: {
+    choose(requestId: string, title: string): Promise<boolean>;
+    commit(requestId: string, bytes: Uint8Array): Promise<boolean>;
+    cancel(requestId: string): Promise<void>;
+  };
   readonly deepLinks: {
     takePending(): Promise<JokoDesktopDeepLinkDelivery | undefined>;
     acknowledge(acknowledgement: JokoDesktopDeepLinkAcknowledgement): Promise<boolean>;

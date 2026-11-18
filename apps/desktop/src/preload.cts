@@ -230,6 +230,9 @@ const DESKTOP_CHANNELS = {
   nativeGamepadSnapshot: "joko:native-gamepad:snapshot",
   chooseFiles: "joko:files:choose",
   choosePortableSessionFile: "joko:portable-session:choose",
+  choosePortableSessionSave: "joko:portable-session:save-choose",
+  commitPortableSessionSave: "joko:portable-session:save-commit",
+  cancelPortableSessionSave: "joko:portable-session:save-cancel",
   deepLinkTakePending: "joko:deep-link:take-pending",
   deepLinkAcknowledge: "joko:deep-link:acknowledge",
   deepLinkNavigate: "joko:deep-link:navigate",
@@ -995,6 +998,25 @@ const desktopApi = Object.freeze({
   chooseFiles: (): Promise<readonly DesktopFile[]> => ipcRenderer.invoke(DESKTOP_CHANNELS.chooseFiles),
   choosePortableSessionFile: (): Promise<DesktopFile | undefined> =>
     ipcRenderer.invoke(DESKTOP_CHANNELS.choosePortableSessionFile),
+  portableSessionSave: Object.freeze({
+    choose: (requestId: string, title: string): Promise<boolean> => {
+      if (!isNativeFileActionId(requestId) || typeof title !== "string") {
+        return Promise.reject(new TypeError("The portable task save selection request is invalid."));
+      }
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.choosePortableSessionSave, requestId, title).then(parseDesktopBoolean);
+    },
+    commit: (requestId: string, bytes: Uint8Array): Promise<boolean> => {
+      if (!isNativeFileActionId(requestId) || !(bytes instanceof Uint8Array) || bytes.byteLength === 0
+        || bytes.byteLength > 256 * 1024 * 1024) {
+        return Promise.reject(new TypeError("The portable task save request is invalid."));
+      }
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.commitPortableSessionSave, requestId, bytes).then(parseDesktopBoolean);
+    },
+    cancel: (requestId: string): Promise<void> => {
+      if (!isNativeFileActionId(requestId)) return Promise.reject(new TypeError("The portable task save identity is invalid."));
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.cancelPortableSessionSave, requestId).then(() => undefined);
+    }
+  }),
   taskSharingInvitations: Object.freeze({
     subscribe: (listener: (invitation: string) => void): (() => void) => {
       if (typeof listener !== "function") throw new TypeError("The invitation listener must be a function.");

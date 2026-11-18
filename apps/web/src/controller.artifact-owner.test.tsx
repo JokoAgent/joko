@@ -487,7 +487,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   await expect(secondController.downloadArtifact("shared", "same.txt", downloadContext)).resolves.toBe("saved");
   await expect(firstController.downloadArtifact("shared", "late.txt", downloadContext)).rejects.toThrow("Download owner disconnected");
   await expect(firstController.exportSession("shared-session", downloadContext)).rejects.toThrow("Download owner disconnected");
-  await expect(firstController.exportPortableSession("shared-session", { excludeMedia: false }, downloadContext)).rejects.toThrow("Download owner disconnected");
+  await expect(firstController.exportPortableSession({ id: "shared-session", name: "Shared task" }, { excludeMedia: false }, downloadContext)).rejects.toThrow("Download owner disconnected");
   expect(gateways.get(second.id)!.download).toHaveBeenCalledExactlyOnceWith("shared", "same.txt", downloadContext);
   await secondController.updateAuxiliaryTextSettings([], 2n);
   const predictionSignal = new AbortController().signal;
