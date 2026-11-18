@@ -25,8 +25,11 @@ mountedIt("inserts distinct whole-message references at the caret and delivers o
     const firstBody = "First exact source: hazel orbit eighty";
     const secondBody = "Second exact source: bronze window seventy";
     const plainBody = "Plain link source: marble ceiling sixty";
-    const seedVisibleMessage = (id: string, text: string) => {
-      // Product history is deliberately populated separately from Pi's empty native context.
+    const seedVisibleTurn = (id: string, text: string) => {
+      // Preserve each historical turn's user boundary in the product timeline, outside Pi's current context.
+      store.appendEvent({ id: `${id}-prompt`, sessionId, backendId: session.backendId, targetId: session.targetId,
+        generation: session.binding.generation, traceId: id,
+        payload: { type: "message_complete", role: "user", blocks: [{ kind: "text", text: `Earlier prompt for ${id}` }] } });
       store.appendEvent({ id, sessionId, backendId: session.backendId, targetId: session.targetId,
         generation: session.binding.generation, traceId: id,
         payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text }] } });
@@ -35,9 +38,9 @@ mountedIt("inserts distinct whole-message references at the caret and delivers o
       const anchor = { sourceSessionId: sessionId, ...origin };
       return { anchor, href: taskMessageReferenceHref(anchor) };
     };
-    const first = seedVisibleMessage("whole-reference-first", firstBody);
-    const second = seedVisibleMessage("whole-reference-second", secondBody);
-    const plain = seedVisibleMessage("ordinary-message-link", plainBody);
+    const first = seedVisibleTurn("whole-reference-first", firstBody);
+    const second = seedVisibleTurn("whole-reference-second", secondBody);
+    const plain = seedVisibleTurn("ordinary-message-link", plainBody);
     expect(fixture.providerRequests).toEqual([]);
 
     const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Message reference browser" })).challenge!;
