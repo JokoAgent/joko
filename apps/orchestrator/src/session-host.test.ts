@@ -9912,6 +9912,46 @@ describe("SessionHost", () => {
     } });
   });
 
+  it("clears a legacy consumed one-shot at scheduler startup only while its admission still owns the revision", async () => {
+    const fixture = await createFixture();
+    const sessionId = (await fixture.host.createSession({
+      operationId: "legacy-one-shot-task", connection: fixture.connection, targetId: "target-one",
+      title: "Legacy one-shot", fastMode: false, permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    const firedAt = Date.now();
+    const nextRunAt = firedAt + 60_000;
+    const seedLegacyAdmission = async (id: string) => {
+      const schedule = fixture.store.upsertSchedule({
+        id, backendId: fixture.adapter.id, targetId: "target-one", sessionMode: "bound", sessionId,
+        name: id, kind: "one_shot", timezone: "UTC", enabled: true, nextRunAt,
+        prompt: { text: `Original ${id}`, images: [], files: [], mentions: [], disposition: "prompt" },
+        executionSnapshot: CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, overlapPolicy: "queue", misfirePolicy: "run_once"
+      });
+      // Exercise the original atomic Agent admission with the previously retained time.
+      const admitted = fixture.host.enqueueScheduledInput({
+        operationId: `manual-schedule-${id}`, schedule, sessionId, scheduledAt: firedAt, nextRunAt
+      });
+      await eventually(() => fixture.store.findScheduleRunByRunId(admitted.value.runId)?.status === "success");
+      const retained = fixture.store.getSchedule(id);
+      expect(retained).toMatchObject({ enabled: false, nextRunAt, lastRunAt: firedAt, revision: admitted.operation.revision });
+      return { retained, runId: admitted.value.runId };
+    };
+    const consumed = await seedLegacyAdmission("legacy-consumed-once");
+    const edited = await seedLegacyAdmission("legacy-consumed-then-edited");
+    const paused = fixture.store.upsertSchedule({ ...edited.retained, name: "A newly edited paused plan",
+      expectedRevision: edited.retained.revision });
+
+    const scheduler = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => firedAt });
+    cleanups.push(() => scheduler.stop());
+    scheduler.start();
+
+    expect(fixture.store.getSchedule(consumed.retained.id)).toMatchObject({ enabled: false, lastRunAt: firedAt });
+    expect(fixture.store.getSchedule(consumed.retained.id).nextRunAt).toBeUndefined();
+    expect(fixture.store.findScheduleRunByRunId(consumed.runId)).toMatchObject({ status: "success", firedAt });
+    expect(fixture.store.getSchedule(paused.id)).toMatchObject({ enabled: false, nextRunAt, revision: paused.revision });
+    expect(fixture.store.findScheduleRunByRunId(edited.runId)).toMatchObject({ status: "success", firedAt });
+  });
+
   it("treats an empty Schedule extra-directory selection as no override", async () => {
     const fixture = await createFixture(new FakeBackendAdapter(CODEX_LIKE_PROFILE));
     const sessionId = (await fixture.host.createSession({
@@ -17220,9 +17260,24 @@ describe("SessionHost", () => {
     });
   });
 
-  it("hands every surviving message and complete long text to context rebuilds", async () => {
+  it("hands every surviving message and complete long text to context rebuilds", async ({ signal, onTestFailed, onTestFinished }) => {
+    const startedAt = performance.now();
+    let phase = "fixture", seeded = 0, readState: (() => unknown) | undefined;
+    const completedPhases: Array<{ phase: string; elapsedMs: number }> = [];
+    const advance = (next: string) => { completedPhases.push({ phase, elapsedMs: Math.round(performance.now() - startedAt) }); phase = next; };
+    const snapshot = () => {
+      let state: unknown;
+      try { state = readState?.(); } catch { state = "unavailable"; }
+      return { phase, seeded, elapsedMs: Math.round(performance.now() - startedAt), completedPhases: [...completedPhases], state };
+    };
+    let aborted: ReturnType<typeof snapshot> | undefined;
+    const captureAbort = () => { aborted ??= snapshot(); };
+    signal.addEventListener("abort", captureAbort, { once: true });
+    onTestFinished(() => signal.removeEventListener("abort", captureAbort));
+    onTestFailed(() => { console.error("[context-rebuild-handoff]", JSON.stringify(aborted ?? snapshot())); });
     const adapter = new NativeContextRecoveryFakeAdapter(["context_overflow", "success"]);
     const fixture = await createFixture(adapter);
+    advance("create-session");
     const sessionId = (await fixture.host.createSession({
       operationId: "create-context-overflow-complete-handoff",
       connection: fixture.connection,
@@ -17232,6 +17287,10 @@ describe("SessionHost", () => {
       permissionMode: "ask",
       planMode: false
     })).value.sessionId;
+    readState = () => ({ nativeRebuilds: adapter.rebuildInputs.length,
+      queue: fixture.store.listQueueItems({ sessionId }).map(item => ({ id: item.id, state: item.state })),
+      runs: fixture.store.listRuns({ sessionId }).map(run => ({ id: run.descriptor.id, state: run.descriptor.state })) });
+    advance("seed-history");
     const longMessage = `long-context-start-${"x".repeat(40_000)}-long-context-end`;
     for (let index = 0; index < 401; index += 1) {
       appendSessionEvent(fixture.store, sessionId, `complete-handoff-${index}`, 10 + index, {
@@ -17242,17 +17301,21 @@ describe("SessionHost", () => {
           text: index === 200 ? longMessage : `surviving-context-${index}`
         }]
       });
+      seeded = index + 1;
     }
 
+    advance("enqueue");
     const source = fixture.host.enqueueInput({
       operationId: "context-overflow-complete-handoff-input",
       connection: fixture.connection,
       sessionId,
       prompt: { text: "trigger complete handoff", images: [], files: [], mentions: [], disposition: "prompt" }
     });
+    advance("queue-settlement");
     await eventually(() => fixture.store.listQueueItems({ sessionId }).length === 2 &&
       fixture.store.listQueueItems({ sessionId }).every((item) => item.state === "completed" || item.state === "failed"));
 
+    advance("assertions");
     expect(fixture.store.getQueueItem(source.value.queueItemId).state).toBe("failed");
     expect(adapter.rebuildInputs).toHaveLength(1);
     const handoff = adapter.rebuildInputs[0]!.handoff;

@@ -7257,6 +7257,7 @@ export class MobileClient {
   ): Promise<boolean> {
     this.#assertNoPendingAutomation(kind, scheduleId, triggerId);
     const action = this.#claimMutation();
+    const originalRunOwner = kind === "schedule-run" ? this.#automationOwnerKey() : undefined;
     try {
       const schedule = await this.#revalidateAutomationSchedule(scheduleId);
       const result = await this.#submitTerminal(
@@ -7266,7 +7267,17 @@ export class MobileClient {
         true,
         false
       );
-      if (result.definitive) await this.refreshAutomations(scheduleId);
+      if (result.definitive) {
+        if (kind !== "schedule-run") await this.refreshAutomations(scheduleId);
+        else if (originalRunOwner !== undefined && this.#automationOwnerKey() === originalRunOwner && this.#state.automations.open) {
+          await this.refreshAutomations();
+          if (this.#automationOwnerKey() === originalRunOwner && this.#state.automations.open
+            && this.#state.automations.selectedScheduleId === scheduleId) {
+            const rejection = automationMutationRejection(result, "run");
+            if (rejection !== undefined) throw rejection;
+          }
+        }
+      }
       return result.accepted && result.definitive;
     } finally { this.#releaseMutation(action); }
   }

@@ -220,6 +220,11 @@ jobs:
           test -c /dev/kvm
           sudo chmod 666 /dev/kvm
 
+      - name: Prepare rendered Android screenshot verification
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng
+
       - name: Exercise native pairing, input, resources and recovery on the isolated AVD
         uses: ReactiveCircus/android-emulator-runner@v2
         env:

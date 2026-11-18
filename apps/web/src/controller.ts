@@ -4053,7 +4053,7 @@ export function useAppController(): AppController {
     cloneSession: (sessionId, name, sourceMessage) => gateway().cloneSession(sessionId, name, sourceMessage),
     resolveInteraction: (interaction, value) => gateway().resolveInteraction(interaction, value),
     dismissInteraction: (interaction) => gateway().dismissInteraction(interaction),
-    runSchedule: (scheduleId) => gateway().runSchedule(scheduleId),
+    runSchedule: (scheduleId, operationId) => gateway().runSchedule(scheduleId, operationId),
     setScheduleEnabled: (scheduleId, enabled) => gateway().setScheduleEnabled(scheduleId, enabled),
     deleteSchedule: (scheduleId, disposition) => gateway().deleteSchedule(scheduleId, disposition),
     markScheduleRunRead: (scheduleId, triggerId) => gateway().markScheduleRunRead(scheduleId, triggerId),

@@ -420,6 +420,20 @@ describe("MobileAutomationsScreen", () => {
     expect(onOpenTask).toHaveBeenCalledTimes(1);
   });
 
+  it.each([390, 900])("shows the Run now rejection in the original detail at %i dp after a healthy refresh", async (width) => {
+    native.width = width;
+    const client = mobileClient();
+    const error = "Schedule has expired and cannot be triggered.";
+    vi.mocked(client.runAutomation).mockRejectedValueOnce(new Error(error));
+    const { container, rerender } = mount(mobileState(), client);
+    if (width < 700) await act(async () => button(container, "Open Automation Project check").click());
+    await act(async () => button(container, "Run now").click());
+    expect(client.runAutomation).toHaveBeenCalledExactlyOnceWith(projectSchedule.scheduleId);
+    rerender(mobileState({ status: "ready", error: undefined }));
+    expect(container.textContent).toContain(error);
+    expect(container.textContent).toContain("Run history (2/3)");
+  });
+
   it("shows loading, empty and error states without granting controls", () => {
     const loading = mount(mobileState({ status: "loading", schedules: [], selectedScheduleId: undefined,
       detail: undefined, history: [], historyStatus: "loading", historyTotalSize: 0 })).container;

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
+import { manualScheduleDispatchOperationId, scheduleRunIdFromDigest } from "@joko/contracts";
 import { redactSecrets, type PermissionMode, type SessionDescriptor } from "@joko/core";
 import type {
   OperationalStore,
@@ -145,6 +146,7 @@ export class ScheduleCoordinator {
 
   start(): void {
     if (this.#timer !== undefined) return;
+    this.#store.reconcileConsumedOneShotSchedules();
     this.connectRunLifecycle();
     this.observeAdmittedRuns();
     this.#recovery.start();
@@ -408,7 +410,7 @@ export class ScheduleCoordinator {
     const schedule = this.#store.getSchedule(scheduleId);
     return this.dispatchOccurrence(schedule, {
       scheduledAt: this.#now(),
-      operationId: `manual-schedule-${operationId}`,
+      operationId: manualScheduleDispatchOperationId(operationId),
       preserveNextRun: true,
       ignoreMisfire: true,
       source: "run-now",
@@ -770,7 +772,8 @@ export class ScheduleCoordinator {
       schedule,
       sessionId,
       scheduledAt,
-      ...(nextRunAt === undefined ? {} : { nextRunAt })
+      // The admitted Run consumes a one-shot, even when Run Now fired it early.
+      ...(schedule.kind === "one_shot" || nextRunAt === undefined ? {} : { nextRunAt })
     }); } catch (error) { this.#admittedRuns.delete(runId); throw error; }
     return { runId: queued.value.runId, sessionId, status: "queued" };
   }
@@ -1369,7 +1372,7 @@ function nextScheduleOccurrenceOrUndefined(schedule: ScheduleRecord, after: numb
 }
 
 function scheduledRunId(operationId: string): string {
-  return `run-${createHash("sha256").update(operationId).digest("hex").slice(0, 24)}`;
+  return scheduleRunIdFromDigest(createHash("sha256").update(operationId).digest("hex"));
 }
 
 function failedPreRunHookResult(error: unknown): SchedulePreRunHookResult {

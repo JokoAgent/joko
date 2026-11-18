@@ -1,4 +1,7 @@
+import { manualScheduleDispatchOperationId, scheduleRunIdFromDigest } from "@joko/contracts";
+
 import type { SchedulerRuntimeView } from "./model.js";
+import { randomUuid, sha256Hex } from "./web-crypto.js";
 
 /**
  * Opaque identity for one user-initiated Schedule Run Now dispatch window.
@@ -10,6 +13,7 @@ import type { SchedulerRuntimeView } from "./model.js";
  */
 export interface ScheduleRunNowDispatchAttempt {
   readonly scheduleId: string;
+  readonly operationId: string;
   readonly presentation: Promise<void>;
 }
 
@@ -21,10 +25,8 @@ export interface ScheduleRunNowDispatchTracker {
    * Synchronously opens a per-Schedule dispatch window.
    *
    * Returns `undefined` when that Schedule already has a pending window. A
-   * known runtime snapshot establishes the scheduler instance and captures all
-   * currently visible Run Now identities as the baseline. An unknown runtime
-   * deliberately has no observation baseline and therefore cannot be released
-   * early by a later snapshot.
+   * known runtime snapshot establishes the scheduler instance that can confirm
+   * the Run created by this operation.
    */
   begin(
     scheduleId: string,
@@ -39,7 +41,7 @@ export interface ScheduleRunNowDispatchTracker {
    */
   attach(
     attempt: ScheduleRunNowDispatchAttempt,
-    dispatch: () => Promise<void>
+    dispatch: (operationId: string) => Promise<void>
   ): Promise<void>;
 
   /** Applies one authoritative runtime snapshot to pending dispatch windows. */
@@ -52,7 +54,7 @@ export interface ScheduleRunNowDispatchTracker {
 interface PendingDispatch {
   readonly attempt: ScheduleRunNowDispatchAttempt;
   readonly schedulerInstanceId?: string;
-  readonly baselineRunIds: ReadonlySet<string>;
+  expectedRunId?: string;
   readonly resolvePresentation: () => void;
   readonly rejectPresentation: (reason: unknown) => void;
   attached: boolean;
@@ -93,13 +95,10 @@ class ScheduleRunNowDispatchTrackerImpl implements ScheduleRunNowDispatchTracker
       resolvePresentation = resolve;
       rejectPresentation = reject;
     });
-    const attempt: ScheduleRunNowDispatchAttempt = { scheduleId, presentation };
+    const attempt: ScheduleRunNowDispatchAttempt = { scheduleId, operationId: randomUuid(), presentation };
     const pending: PendingDispatch = {
       attempt,
       ...(runtime === undefined ? {} : { schedulerInstanceId: runtime.instanceId }),
-      baselineRunIds: runtime === undefined
-        ? new Set()
-        : runNowRunIds(runtime, scheduleId),
       resolvePresentation,
       rejectPresentation,
       attached: false,
@@ -113,7 +112,7 @@ class ScheduleRunNowDispatchTrackerImpl implements ScheduleRunNowDispatchTracker
 
   attach(
     attempt: ScheduleRunNowDispatchAttempt,
-    dispatch: () => Promise<void>
+    dispatch: (operationId: string) => Promise<void>
   ): Promise<void> {
     const pending = this.#pendingByAttempt.get(attempt);
     if (pending === undefined) throw new TypeError("Unknown Schedule Run Now dispatch attempt.");
@@ -124,17 +123,7 @@ class ScheduleRunNowDispatchTrackerImpl implements ScheduleRunNowDispatchTracker
     if (pending.presentationSettled) return pending.attempt.presentation;
     pending.attached = true;
 
-    let rpc: Promise<void>;
-    try {
-      rpc = dispatch();
-    } catch (error) {
-      this.#settleFromRpc(pending, { ok: false, error });
-      return pending.attempt.presentation;
-    }
-    void Promise.resolve(rpc).then(
-      () => this.#settleFromRpc(pending, { ok: true }),
-      (error: unknown) => this.#settleFromRpc(pending, { ok: false, error })
-    );
+    void this.#dispatch(pending, dispatch);
     return pending.attempt.presentation;
   }
 
@@ -142,20 +131,13 @@ class ScheduleRunNowDispatchTrackerImpl implements ScheduleRunNowDispatchTracker
     if (this.#adoptSchedulerInstance(runtime.instanceId)) return;
 
     for (const pending of [...this.#pendingByScheduleId.values()]) {
-      // Without a click-time baseline, a later snapshot cannot prove that an
-      // observed Run was created by this user action. Likewise, observation
-      // cannot release an attempt until its RPC has actually been dispatched.
-      if (!pending.attached || pending.schedulerInstanceId === undefined) continue;
-      if (pending.schedulerInstanceId !== runtime.instanceId) {
-        this.#resolvePresentation(pending);
-        continue;
-      }
-      const observedNewRun = runtime.runs.some((run) => run.scheduleId === pending.attempt.scheduleId
+      if (pending.expectedRunId === undefined || pending.schedulerInstanceId !== runtime.instanceId) continue;
+      // Loading and claiming can precede a definitive admission rejection.
+      const observedRun = runtime.runs.some((run) => run.scheduleId === pending.attempt.scheduleId
         && run.source === "runNow"
-        && run.runId !== undefined
-        && run.runId.length > 0
-        && !pending.baselineRunIds.has(run.runId));
-      if (observedNewRun) this.#resolvePresentation(pending);
+        && run.runId === pending.expectedRunId
+        && (run.phase === "queued" || run.phase === "running"));
+      if (observedRun) this.#resolvePresentation(pending);
     }
   }
 
@@ -176,16 +158,22 @@ class ScheduleRunNowDispatchTrackerImpl implements ScheduleRunNowDispatchTracker
     return true;
   }
 
-  #settleFromRpc(
+  async #dispatch(
     pending: PendingDispatch,
-    result: { readonly ok: true } | { readonly ok: false; readonly error: unknown }
-  ): void {
-    if (pending.presentationSettled) return;
-    if (result.ok) {
+    dispatch: (operationId: string) => Promise<void>
+  ): Promise<void> {
+    const { operationId } = pending.attempt;
+    try {
+      if (pending.schedulerInstanceId !== undefined) {
+        const source = new TextEncoder().encode(manualScheduleDispatchOperationId(operationId));
+        pending.expectedRunId = scheduleRunIdFromDigest(await sha256Hex(source.buffer));
+      }
+      if (pending.presentationSettled) return;
+      await dispatch(operationId);
       this.#resolvePresentation(pending);
-      return;
+    } catch (error) {
+      this.#rejectPresentation(pending, error);
     }
-    this.#rejectPresentation(pending, result.error);
   }
 
   #resolveAllPending(): void {
@@ -224,13 +212,4 @@ class ScheduleRunNowDispatchTrackerImpl implements ScheduleRunNowDispatchTracker
     this.#busyIds = new Set(this.#pendingByScheduleId.keys());
     this.#onBusyIdsChange(this.#busyIds);
   }
-}
-
-function runNowRunIds(runtime: SchedulerRuntimeView, scheduleId: string): ReadonlySet<string> {
-  return new Set(runtime.runs.flatMap((run) => run.scheduleId === scheduleId
-    && run.source === "runNow"
-    && run.runId !== undefined
-    && run.runId.length > 0
-    ? [run.runId]
-    : []));
 }

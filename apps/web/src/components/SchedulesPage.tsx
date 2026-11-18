@@ -184,7 +184,7 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
     if (attempt === undefined) return;
     runAction(
       `schedule-run:${scheduleId}`,
-      () => runNowDispatchTracker.attach(attempt, () => controller.runSchedule(scheduleId))
+      () => runNowDispatchTracker.attach(attempt, (operationId) => controller.runSchedule(scheduleId, operationId))
     );
   }, [controller, runAction, runNowDispatchTracker, runtime]);
 

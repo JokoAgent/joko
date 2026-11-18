@@ -15764,6 +15764,30 @@ export class OperationalStore {
     `).all(at, normalizeLimit(limit, 100), normalizeOffset(offset)) as Row[]).map(scheduleFromRow);
   }
 
+  /** Repair the retained future time only while the successful Agent admission
+   * transaction still owns the Schedule revision. Edits and pauses own a new revision. */
+  reconcileConsumedOneShotSchedules(): void {
+    this.assertOpen();
+    const rows = this.database.prepare(`
+      SELECT schedule.* FROM schedules AS schedule
+      WHERE schedule.kind = 'one_shot' AND schedule.enabled = 0
+        AND schedule.next_run_at > schedule.last_run_at
+        AND EXISTS (
+          SELECT 1 FROM schedule_run_history AS history
+          JOIN queue_items AS item ON item.run_id = history.run_id AND item.session_id = history.session_id
+          JOIN operations AS operation ON operation.id = item.operation_id
+          WHERE history.schedule_id = schedule.id AND history.fired_at = schedule.last_run_at
+            AND history.status = 'success' AND operation.kind = 'schedule_dispatch'
+            AND operation.status = 'completed' AND operation.revision = schedule.revision
+        )
+    `).all() as Row[];
+    for (const row of rows) {
+      const { nextRunAt: _retainedNextRunAt, ...schedule } = scheduleFromRow(row);
+      if (this.findPendingScheduleDeletionCleanupForSchedule(schedule.id) !== undefined) continue;
+      this.upsertSchedule({ ...schedule, expectedRevision: schedule.revision });
+    }
+  }
+
   deleteSchedule(id: string, expectedRevision?: bigint, deletionOperationId?: string): ScheduleRecord {
     return this.write(() => {
       const pendingDeletion = this.findPendingScheduleDeletionCleanupForSchedule(id);

@@ -32,7 +32,7 @@ const evidenceSteps = {
   "open-canonical-file": { action: "resource-navigation", assertions: ["canonical-file-contents", "canonical-line-focus"] },
   "copy-file-source": { action: "clipboard", assertions: ["copy-source-completed"] },
   "force-stop-and-reconnect": { action: "lifecycle", assertions: ["application-process-stopped", "application-restarted", "restored-task-title", "persisted-task-input"] },
-  "restore-canonical-file": { action: "lifecycle", assertions: ["restored-file-contents", "no-duplicate-dispatch", "one-persisted-run", "one-mobile-connection", "no-application-crash", "run-succeeded"] }
+  "restore-canonical-file": { action: "lifecycle", assertions: ["restored-file-contents", "restored-line-focus", "no-duplicate-dispatch", "one-persisted-run", "one-mobile-connection", "no-application-crash", "run-succeeded"] }
 } as const;
 type EvidenceStepName = keyof typeof evidenceSteps;
 type EvidenceAction = "tap" | "text-entry" | "launch" | "double-tap" | "swipe" | "force-stop" | "install";
@@ -450,7 +450,8 @@ async function runNativeScenario(): Promise<void> {
   await completeStep();
   await beginStep("restore-canonical-file");
   await tap("README.md:2:4", true, true);
-  await waitNode((node) => node.text?.includes("focus line") === true, "restored canonical file contents");
+  await waitNode((node) => node.text === "Line 2" || node.contentDescription === "Line 2", "restored canonical file line focus");
+  await assertRestoredMarkdown();
   await screenshot("restored");
   expect(current.adapter(profile.id).sendCalls).toHaveLength(1);
   expect(current.application.store.listRuns({ sessionId })).toHaveLength(1);
@@ -463,6 +464,25 @@ async function runNativeScenario(): Promise<void> {
   const run = current.application.store.listRuns({ sessionId })[0]!;
   expect((await manager.clients.run.getRun({ runId: run.descriptor.id })).run?.state).toBe(RunState.SUCCEEDED);
   await completeStep();
+}
+
+async function assertRestoredMarkdown(): Promise<void> {
+  try {
+    await waitNode((node) => node.text?.includes("focus line") === true, "restored canonical file contents");
+  } catch (cause) {
+    // On this owned AVD the WebView can paint normally while UiAutomation
+    // returns only the surrounding native controls after a process restart.
+    const frame = activeStep?.screenshots.find((entry) => entry.file === "restored-error.png");
+    if (frame === undefined) throw cause;
+    const path = join(dirname(apkPath!), "ui-evidence", frame.file);
+    const text = await new Promise<string>((resolve) => {
+      execFile("tesseract", [path, "stdout", "-l", "eng", "--psm", "11"],
+        { timeout: 12_000, maxBuffer: 64 * 1024, windowsHide: true }, (error, stdout) => resolve(error ? "" : stdout));
+    });
+    const rendered = text.toLowerCase().replace(/\s+/gu, " ");
+    if (!rendered.includes("readme.md") || !rendered.includes("line 2") || !rendered.includes("first focus line last")) throw cause;
+    console.log(JSON.stringify({ phase: "restored-canonical-file", observation: "screenshot-ocr", screenshot: frame.file, sha256: frame.sha256 }));
+  }
 }
 
 function elapsed(): number { return Math.round(performance.now() - evidenceStarted); }

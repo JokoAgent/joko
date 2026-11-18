@@ -3,12 +3,16 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { create } from "@bufbuild/protobuf";
+import { TimestampSchema } from "@bufbuild/protobuf/wkt";
+import { Code } from "@connectrpc/connect";
 import {
   CloneProjectScheduleToUserMutationSchema,
+  CreateScheduleMutationSchema,
   DeleteScheduleMutationSchema,
   EntityRefSchema,
   EntityKind,
   MarkAllScheduleRunsReadMutationSchema,
+  OneShotRecurrenceSchema,
   OperationMutationSchema,
   OperationPreconditionSchema,
   OperationState,
@@ -17,6 +21,9 @@ import {
   RemoveProjectScheduleMutationSchema,
   ScheduleGeneratedSessionDisposition,
   ScheduleInputSchema,
+  ScheduleMisfirePolicy,
+  ScheduleOverlapPolicy,
+  ScheduleRecurrenceSchema,
   ScheduleRunOutcome,
   ScheduleSessionMode,
   ScheduleSource,
@@ -37,7 +44,8 @@ import {
   createSessionMutation,
   scheduleIdFrom,
   sessionIdFrom,
-  submit
+  submit,
+  textInput
 } from "./operations.js";
 
 describe("Mobile Automation product chain", () => {
@@ -174,6 +182,66 @@ describe("Mobile Automation product chain", () => {
     );
     expect(reread.state).toBe(ScheduleState.DISABLED);
     expect(reread.version?.revision?.value).toBeGreaterThan(current.version!.revision!.value);
+  });
+
+  it("consumes a future one-shot when the Owner uses Run Now", async () => {
+    fixture = await OrchestratorE2eFixture.start();
+    const owner = await fixture.pair("One-shot schedule owner");
+    const backendId = fixture.adapter().id;
+    const targetId = fixture.targetId();
+    const mutate = (mutation: OperationMutation) => submit(owner.clients.operation, owner.connectionId, mutation);
+    const sessionId = sessionIdFrom(await mutate(createSessionMutation({ backendId, targetId, displayName: "One-shot task" })));
+    const triggerAt = create(TimestampSchema, { seconds: BigInt(Math.floor(Date.now() / 1000) + 3_600) });
+    const oneShot = (at: typeof triggerAt) => create(ScheduleRecurrenceSchema, {
+      kind: { case: "oneShot", value: create(OneShotRecurrenceSchema, { triggerAt: at }) }
+    });
+    const input = create(ScheduleInputSchema, {
+      displayName: "Run the plan early", backendId, targetId, sessionId, sessionMode: ScheduleSessionMode.BOUND,
+      recurrence: oneShot(triggerAt), timeZone: "UTC",
+      input: textInput("Execute the one-shot once"), overlapPolicy: ScheduleOverlapPolicy.QUEUE,
+      misfirePolicy: ScheduleMisfirePolicy.RUN_ONCE, enabled: true
+    });
+    const created = resultSchedule(await mutate(create(OperationMutationSchema, {
+      payload: { case: "createSchedule", value: create(CreateScheduleMutationSchema, { schedule: input }) }
+    })));
+    const scheduleId = created.scheduleId;
+    const detail = async () => required((await owner.clients.scheduler.getSchedule({ scheduleId })).schedule, "one-shot Schedule");
+    const enable = (schedule: Schedule, enabled: boolean) => mutate(scheduleMutation(schedule, {
+      case: "setScheduleEnabled", value: create(SetScheduleEnabledMutationSchema, { scheduleId, enabled })
+    }));
+
+    const paused = resultSchedule(await enable(created, false));
+    expect(paused.state).toBe(ScheduleState.DISABLED);
+    expect(paused.nextTriggerAt).toMatchObject(triggerAt);
+    const resumed = resultSchedule(await enable(paused, true));
+    expect(resumed.state).toBe(ScheduleState.ENABLED);
+    expect(resumed.nextTriggerAt).toMatchObject(triggerAt);
+
+    expect((await mutate(scheduleMutation(resumed, {
+      case: "triggerSchedule", value: create(TriggerScheduleMutationSchema, { scheduleId })
+    }))).state).toBe(OperationState.SUCCEEDED);
+    const consumed = await waitFor(detail, schedule => schedule.recentRuns[0]?.outcome === ScheduleRunOutcome.SUCCEEDED,
+      "original one-shot run to finish");
+    expect(consumed.state).toBe(ScheduleState.DISABLED);
+    expect(consumed.recurrence?.kind.case).toBe("oneShot");
+    expect(consumed.nextTriggerAt).toBeUndefined();
+    expect(consumed.lastTriggeredAt).toBeDefined();
+    expect(consumed.recentRuns).toHaveLength(1);
+    expect(consumed.recentRuns[0]?.sessionId).toBe(sessionId);
+    const listed = required((await owner.clients.scheduler.listSchedules({})).schedules.find(item => item.scheduleId === scheduleId), "listed Schedule");
+    expect(listed.nextTriggerAt).toBeUndefined();
+    await expect(enable(consumed, true)).rejects.toMatchObject({ code: Code.InvalidArgument });
+    expect((await detail()).recentRuns.map(run => run.runId)).toEqual([consumed.recentRuns[0]?.runId]);
+    expect(fixture.adapter().sendCalls.filter(call => call.text === "Execute the one-shot once")).toHaveLength(1);
+
+    const rearmedAt = create(TimestampSchema, { seconds: triggerAt.seconds + 3_600n });
+    const rearmed = resultSchedule(await mutate(scheduleMutation(consumed, {
+      case: "updateSchedule", value: create(UpdateScheduleMutationSchema, {
+        scheduleId, schedule: { ...input, recurrence: oneShot(rearmedAt) }
+      })
+    })));
+    expect(rearmed.state).toBe(ScheduleState.ENABLED);
+    expect(rearmed.nextTriggerAt).toMatchObject(rearmedAt);
   });
 
   it("reports unread history beyond the bounded owner snapshot and acknowledges it without deleting history", async () => {
