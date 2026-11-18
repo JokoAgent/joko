@@ -104,6 +104,8 @@ export class SessionCodeHostContextRuntime {
   private readonly store: OperationalStore;
   private readonly coordinator: CodeHostProjectionCoordinator;
   private readonly refreshes = new Map<string, SessionCodeHostRefresh>();
+  private readonly pendingBackgroundSessions = new Set<string>();
+  private backgroundRefreshScheduled = false;
   private installed = false;
 
   constructor(options: {
@@ -124,7 +126,7 @@ export class SessionCodeHostContextRuntime {
     this.installed = true;
     this.store.subscribe((event) => {
       if (event.traceId === "session-code-host-projection" || !eventCanChangeCodeHostContext(event, this.store)) return;
-      queueMicrotask(() => { void this.refreshAndPublish(event.sessionId); });
+      this.refreshSessionInBackground(event.sessionId);
     });
   }
 
@@ -180,9 +182,15 @@ export class SessionCodeHostContextRuntime {
 
   /** Core Session/Snapshot reads return the durable projection and refresh remote facts off-path. */
   refreshSessionsInBackground(sessionIds: readonly string[]): void {
-    const unique = [...new Set(sessionIds)];
-    if (unique.length === 0) return;
+    for (const sessionId of sessionIds) this.pendingBackgroundSessions.add(sessionId);
+    if (this.backgroundRefreshScheduled || this.pendingBackgroundSessions.size === 0) return;
+    this.backgroundRefreshScheduled = true;
+    // Store dispatches a committed history batch synchronously. Each Session
+    // needs one read of the resulting history, including while a Provider read is in flight.
     queueMicrotask(() => {
+      this.backgroundRefreshScheduled = false;
+      const unique = [...this.pendingBackgroundSessions];
+      this.pendingBackgroundSessions.clear();
       let cursor = 0;
       const workers = Array.from({ length: Math.min(REFRESH_CONCURRENCY, unique.length) }, async () => {
         while (cursor < unique.length) {

@@ -1,7 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
-import { chromium, type Page, type Response } from "playwright-core";
-import { expect, it } from "vitest";
+import { chromium, type Page } from "playwright-core";
+import { expect, it, vi } from "vitest";
 import { OrchestratorE2eFixture } from "./fixture.js";
 import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
 
@@ -34,21 +34,26 @@ mountedIt("tracks real task panes across shared-owner tabs and revokes only the 
     const key = page.locator(".pair-form textarea"); if (await key.count()) await key.fill(fixture.application.linkspanIdentity!.publicKey);
     await page.getByLabel("Pairing code", { exact: true }).fill(challenge.code);
     await page.getByLabel("Device name", { exact: true }).fill(name);
-    const responseStatuses: number[] = [];
-    const observePairing = (response: Response) => {
-      if (new URL(response.url()).pathname === "/joko.v1.ConnectionService/CompletePairing") responseStatuses.push(response.status());
-    };
-    page.on("response", observePairing);
+    const deviceIds: string[] = [];
+    const connections = fixture.application.connections;
+    const completePairing = connections.completePairing.bind(connections);
+    const pairingReceipt = vi.spyOn(connections, "completePairing").mockImplementation(input => {
+      const receipt = completePairing(input);
+      if (input.connectionName === name) deviceIds.push(receipt.connection.deviceId);
+      return receipt;
+    });
     try {
       await page.locator("form.pair-form button[type=submit]").click();
       await page.locator(".app").waitFor({ timeout: 30_000 });
-      expect(responseStatuses).toEqual([200]);
+      const device = fixture.application.store.listDevices().find(candidate => candidate.name === name && candidate.state === "active");
+      expect(device).toBeDefined();
+      expect(deviceIds).toEqual([device?.id]);
     } catch (cause) {
       await capture("pairing-failure", page).catch(() => undefined);
       const persistedDevice = fixture.application.store.listDevices().some(device => device.name === name);
       const alerts = (await page.getByRole("alert").allTextContents()).slice(0, 4).map(text => text.slice(0, 240));
-      throw new Error(`The activity fixture could not open the paired browser. ${JSON.stringify({ responseStatuses, persistedDevice, alerts })}`, { cause });
-    } finally { page.off("response", observePairing); }
+      throw new Error(`The activity fixture could not open the paired browser. ${JSON.stringify({ receipts: deviceIds.length, persistedDevice, alerts })}`, { cause });
+    } finally { pairingReceipt.mockRestore(); }
     await route(page, "#/settings/general"); await page.locator(".theme-picker").waitFor();
     return fixture.application.store.listDevices().find(device => device.name === name)!.id;
   };

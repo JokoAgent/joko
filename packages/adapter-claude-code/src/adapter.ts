@@ -84,7 +84,7 @@ import { ClaudeAccountUsageCache, parseClaudeAccountUsage } from "./account-usag
 import type { ClaudeManagedChildWorkspace, ClaudeManagedChildWorkspaceFactory } from "./managed-child-workspace.js";
 import { claudeCodeError } from "./errors.js";
 import type { ClaudeMcpBridgePort, ClaudeMcpCallResult, ClaudeMcpRuntimeLease, ClaudeMcpTool } from "./mcp-bridge.js";
-import { SessionSdkFailure } from "./session-sdk-owner.js";
+import { SESSION_SDK_MAXIMUM_RESULT_BYTES, SessionSdkFailure } from "./session-sdk-owner.js";
 import { readRegisteredBackgroundTaskOutput } from "./background-task-output.js";
 import { readBackgroundWorkflowProgress } from "./workflow-progress.js";
 import type { ClaudeFreshContextBindingLookup, ClaudeFreshContextIdentity, ClaudeFreshContextSnapshot } from "./fresh-context-owner.js";
@@ -175,6 +175,8 @@ const DEFAULT_NATIVE_CONTINUATION_GRACE_MS = 60_000;
 const DEFAULT_MAXIMUM_DISCOVERED_SESSIONS = 200;
 const DEFAULT_MAXIMUM_CATALOG_SESSIONS = 1_000;
 const MAX_NATIVE_HISTORY_MESSAGES = 10_000;
+const NATIVE_HISTORY_PAGE_LIMIT = MAX_NATIVE_HISTORY_MESSAGES + 1;
+const NATIVE_HISTORY_CONTINUATION_TIMEOUT_MS = 30_000;
 const MAX_PROMPT_BYTES = 1024 * 1024;
 const MAX_MANAGED_AGENT_RESULT_BYTES = 64 * 1024;
 const MAX_MCP_COMPLETE_TEXT_BYTES = 2 * 1024 * 1024;
@@ -1632,37 +1634,34 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       assertSessionInfoIdentity(info, nativeSessionId);
     }
 
-    let messages: readonly ClaudeSdkSessionMessage[];
-    try {
-      runtime.assertRuntimeCurrent();
-      messages = runtime.storedSessionAccess === undefined
-        ? await runtime.sdkRuntime.getSessionMessages(nativeSessionId, {
-            dir: runtime.runtimeWorkspaceRoot,
-            limit: MAX_NATIVE_HISTORY_MESSAGES + 1,
-            offset: 0,
-            includeSystemMessages: true
-          })
-        : await runtime.sdkRuntime.storedSessions!.getSessionMessages(nativeSessionId, {
-            dir: runtime.runtimeWorkspaceRoot,
-            limit: MAX_NATIVE_HISTORY_MESSAGES + 1,
-            offset: 0,
-            includeSystemMessages: true,
-            access: runtime.storedSessionAccess
-          });
-      runtime.assertRuntimeCurrent();
-    } catch {
-      throw claudeCodeError(
-        "NATIVE_HISTORY_READ_FAILED",
-        "The native Session history could not be read.",
-        "session_history",
-        {
-          retryable: true,
-          stateMayHaveChanged: false,
-          recovery: "Verify native Session storage and retry history synchronization."
-        }
-      );
+    const readPage = async (offset: number, signal?: AbortSignal): Promise<readonly ClaudeSdkSessionMessage[]> => {
+      const options = {
+        dir: runtime.runtimeWorkspaceRoot, limit: NATIVE_HISTORY_PAGE_LIMIT, offset, includeSystemMessages: true as const,
+        ...(signal === undefined ? {} : { signal })
+      };
+      let page: readonly ClaudeSdkSessionMessage[];
+      try {
+        runtime.assertRuntimeCurrent();
+        page = runtime.storedSessionAccess === undefined
+          ? await runtime.sdkRuntime.getSessionMessages(nativeSessionId, options)
+          : await runtime.sdkRuntime.storedSessions!.getSessionMessages(nativeSessionId, { ...options, access: runtime.storedSessionAccess });
+        runtime.assertRuntimeCurrent();
+      } catch {
+        throw nativeHistoryReadFailed("The native Session history could not be read.");
+      }
+      this.#assertCurrent(runtime, context, binding);
+      if (!Array.isArray(page)) throw invalidNativeHistory();
+      if (page.length > NATIVE_HISTORY_PAGE_LIMIT) throw nativeHistoryLimitExceeded();
+      return page;
+    };
+    const first = await readPage(0);
+    const extended = first.length === NATIVE_HISTORY_PAGE_LIMIT && !runtime.remote && runtime.storedSessionAccess === undefined;
+    let messages = first;
+    if (extended) {
+      const deadline = AbortSignal.timeout(NATIVE_HISTORY_CONTINUATION_TIMEOUT_MS);
+      const signal = context.signal === undefined ? deadline : AbortSignal.any([context.signal, deadline]);
+      messages = await completeLocalNativeHistory(first, offset => readPage(offset, signal));
     }
-    this.#assertCurrent(runtime, context, binding);
     const confirmedInfo = await this.#sessionInfo(
       nativeSessionId,
       context.target,
@@ -1677,18 +1676,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     } else {
       assertSessionInfoIdentity(confirmedInfo, nativeSessionId);
     }
-    if (!Array.isArray(messages)) throw invalidNativeHistory();
-    if (messages.length > MAX_NATIVE_HISTORY_MESSAGES) {
-      throw claudeCodeError(
-        "NATIVE_HISTORY_LIMIT_EXCEEDED",
-        "The native Session history exceeds the bounded projection limit.",
-        "session_history",
-        {
-          stateMayHaveChanged: false,
-          recovery: "Start a new native Session before importing additional history."
-        }
-      );
+    if (extended && (!Number.isFinite(info.lastModified) || info.lastModified !== confirmedInfo.lastModified)) {
+      throw nativeHistoryReadFailed("The native Session history changed during synchronization.");
     }
+    if (!extended && messages.length > MAX_NATIVE_HISTORY_MESSAGES) throw nativeHistoryLimitExceeded();
     try {
       return projectNativeHistory(messages, nativeSessionId, this.#projection, this.#supportsFreshContext(context.target));
     } catch (error) {
@@ -7591,6 +7582,41 @@ interface HistoryEntryProjection {
   readonly kind: string;
   readonly contentIndex: number;
   readonly payload: EventPayload;
+}
+
+async function completeLocalNativeHistory(
+  first: readonly ClaudeSdkSessionMessage[],
+  readPage: (offset: number) => Promise<readonly ClaudeSdkSessionMessage[]>
+): Promise<readonly ClaudeSdkSessionMessage[]> {
+  const messages = [...first];
+  let bytes = Buffer.byteLength(JSON.stringify(first), "utf8");
+  if (bytes > SESSION_SDK_MAXIMUM_RESULT_BYTES) throw nativeHistoryLimitExceeded();
+  for (;;) {
+    // Repeat the page boundary to detect shifting offsets before combining histories.
+    const page = await readPage(messages.length - 1);
+    if (page.length === 0 || JSON.stringify(page[0]) !== JSON.stringify(messages.at(-1))) {
+      throw nativeHistoryReadFailed("The native Session history changed during synchronization.");
+    }
+    const tail = page.slice(1);
+    if (tail.length > 0) {
+      bytes += Buffer.byteLength(JSON.stringify(tail), "utf8") - 1;
+      if (bytes > SESSION_SDK_MAXIMUM_RESULT_BYTES) throw nativeHistoryLimitExceeded();
+      messages.push(...tail);
+    }
+    if (page.length < NATIVE_HISTORY_PAGE_LIMIT) return messages;
+  }
+}
+
+function nativeHistoryReadFailed(message: string): JokoError {
+  return claudeCodeError("NATIVE_HISTORY_READ_FAILED", message, "session_history", {
+    retryable: true, stateMayHaveChanged: false, recovery: "Verify native Session storage and retry history synchronization."
+  });
+}
+
+function nativeHistoryLimitExceeded(): JokoError {
+  return claudeCodeError("NATIVE_HISTORY_LIMIT_EXCEEDED", "The native Session history exceeds the bounded projection limit.", "session_history", {
+    stateMayHaveChanged: false, recovery: "Start a new native Session before importing additional history."
+  });
 }
 
 function projectNativeHistory(

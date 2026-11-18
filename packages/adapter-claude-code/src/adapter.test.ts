@@ -5343,11 +5343,39 @@ describe("ClaudeCodeAdapter", () => {
     });
 
     runtime.sessions.set(nativeSessionId, sessionInfo(nativeSessionId));
-    runtime.messages.set(nativeSessionId, Array.from({ length: 10_001 }, () => valid));
+    // An SDK response larger than the requested page violates the Reader contract.
+    runtime.messages.set(nativeSessionId, Array.from({ length: 10_002 }, () => valid));
     await expect(adapter.getNativeHistoryProjection(contextFor(binding).context)).rejects.toMatchObject({
       publicError: { code: "NATIVE_HISTORY_LIMIT_EXCEEDED" }
     });
     await adapter.closeSession(binding, contextFor(binding).context);
+  });
+
+  test.each(["overlap", "source mtime"] as const)("rejects a long local history when its %s changes during the read", async (changed) => {
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime);
+    const binding = await adapter.createSession(createInput(), contextFor().context);
+    const context = contextFor(binding).context;
+    const nativeId = binding.nativeSessionId!;
+    const source = sessionInfo(nativeId);
+    const messages = Array.from({ length: 10_001 }, (_, index) => historyMessage("user",
+      `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`, nativeId, { role: "user", content: `message ${index}` }));
+    runtime.sessions.set(nativeId, source);
+    vi.spyOn(runtime, "getSessionMessages").mockImplementation(async (_id, options) => {
+      if (options.offset === 0) return messages;
+      expect(options.offset).toBe(10_000);
+      const last = messages.at(-1)!;
+      if (changed === "overlap") return [{ ...last, message: { role: "user", content: "replaced message" } }];
+      runtime.sessions.set(nativeId, { ...source, lastModified: source.lastModified + 1 });
+      return [last];
+    });
+    try {
+      await expect(adapter.getNativeHistoryProjection(context)).rejects.toMatchObject({
+        publicError: { code: "NATIVE_HISTORY_READ_FAILED", retryable: true, stateMayHaveChanged: false }
+      });
+    } finally {
+      await adapter.closeSession(binding, context);
+    }
   });
 
   test("requires a trusted Target for every full-access entry point", async () => {
