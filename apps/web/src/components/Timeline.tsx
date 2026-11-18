@@ -81,7 +81,7 @@ import { findTimelineRenderItemIndex, insertTimelineDerivationOrigin, projectTim
 import { TimelineViewportStore, countUnreadTimelineItems, maximumTimelineSequence, repairStreamingMarkdown, resolveTimelineFollowingOnScroll, resolveTimelineResizeScrollTop, shouldLoadEarlierTimeline, streamingMarkdownRenderValue, streamingMarkdownThrottleDelay, timelineJumpBehavior, timelineUnreadItemIds, type TimelineViewportState } from "./timeline-behavior.js";
 import type { Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, Spinner, Tip, TipSummary, cx, formatBytes, formatDateTime } from "./ui.js";
-import { UserMessageEditBox } from "./UserMessageEditBox.js";
+import { UserMessageEditBox, type ControlledUserMessageEditDraft, type UserMessageEditDraft } from "./UserMessageEditBox.js";
 import { AUTOMATION_USER_MESSAGE_VISUAL_LINE_THRESHOLD, mayExceedUserMessageLineThreshold, useUserMessageAutoCollapse } from "./user-message-collapse.js";
 import { MessageNavRail } from "./MessageNavRail.js";
 import { PrevMessageJumpChip } from "./PrevMessageJumpChip.js";
@@ -241,6 +241,14 @@ export interface TimelineMessageEdit {
   readonly submit: (item: TimelineItemView, text: string) => Promise<void>;
 }
 
+interface TimelineMessageEditDraft {
+  readonly owner: string;
+  readonly token: symbol;
+  readonly messageId: string;
+  readonly sourceEventId: string;
+  readonly draft: UserMessageEditDraft;
+}
+
 export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSendRichAnswer, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, unloadedGapBefore, historyLoading, historyError, historyOwnerKey, historyDeletion, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onAskSideChat, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, messageEdit, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange, onRootChange }: {
   readonly onSendRichAnswer?: (text: string, receiptKey: string) => Promise<boolean>;
   readonly ownerKey: string;
@@ -333,9 +341,20 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
   const messageNavBackfillBudgetRef = useRef<MessageNavBackfillBudget>({ sessionId, rounds: 0 });
   messageNavBackfillBudgetRef.current = resetMessageNavBackfillBudget(messageNavBackfillBudgetRef.current, sessionId);
   const [openGallery, setOpenGallery] = useState<{ readonly imageId: string; readonly trigger: HTMLElement }>();
-  const [editingMessageId, setEditingMessageId] = useState<string>();
+  const editOwner = JSON.stringify([ownerKey, sessionId, messageActionResetSignal]);
+  const [editingRow, setEditingRow] = useState<TimelineMessageEditDraft>();
+  const currentEdit = editingRow?.owner === editOwner && shareSelection === undefined
+    && !historyDeletion?.deletedEventIds.includes(editingRow.sourceEventId) ? editingRow : undefined;
   const [messageNavRailCoversNavigation, setMessageNavRailCoversNavigation] = useState(false);
-  useEffect(() => setEditingMessageId(undefined), [messageActionResetSignal, sessionId]);
+  useEffect(() => {
+    setEditingRow(previous => previous?.owner === editOwner && shareSelection === undefined
+      && !historyDeletion?.deletedEventIds.includes(previous.sourceEventId) ? previous : undefined);
+  }, [editOwner, shareSelection, historyDeletion]);
+  const beginInlineEdit = (item: TimelineItemView): void => {
+    if (item.sourceEventId === undefined || !messageEdit?.begin(item)) return;
+    setEditingRow({ owner: editOwner, token: Symbol(), messageId: item.id, sourceEventId: item.sourceEventId,
+      draft: { text: parseSelectionQuoteMessage(item.text ?? "", item.quotesEncoded === true).body, submitting: false } });
+  };
   useEffect(() => { if (!messageNavRailEnabled) setMessageNavRailCoversNavigation(false); }, [messageNavRailEnabled]);
   const loadArtifactUrl = useTimelineArtifactUrlCache(ownerKey, onArtifactUrl, onArtifactUrlRelease);
   const artworkGateway = useMemo(() => ({ acquire: onArtifactUrl, release: onArtifactUrlRelease }), [ownerKey, onArtifactUrl, onArtifactUrlRelease]);
@@ -463,6 +482,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
   }, [renderIndexByChildId, shareSelection]);
   const pageSearchOpen = useContext(DesktopPageSearchTextAccess);
   const timelineEmpty = items.length === 0;
+  const pinnedEditRow = currentEdit === undefined ? undefined : renderIndexByChildId.get(currentEdit.messageId);
   const pageSearchRows = useMemo(() => {
     const indexes = new Set<number>();
     if (!pageSearchOpen || partnerPresentation) return indexes;
@@ -477,11 +497,12 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
   const ordinaryWindowRowsRef = useRef<ReadonlySet<number>>(new Set());
   const extractTimelineRange = useCallback((range: Parameters<typeof defaultRangeExtractor>[0]): number[] => {
     const visible = defaultRangeExtractor(range);
-    if (pinnedShareRows.length === 0 && pageSearchRows.size === 0) return visible;
+    if (pinnedEditRow === undefined && pinnedShareRows.length === 0 && pageSearchRows.size === 0) return visible;
     const ordinaryWindowRows = new Set([...visible, ...pinnedShareRows]);
+    if (pinnedEditRow !== undefined) ordinaryWindowRows.add(pinnedEditRow);
     ordinaryWindowRowsRef.current = ordinaryWindowRows;
     return [...new Set([...ordinaryWindowRows, ...pageSearchRows])].sort((left, right) => left - right);
-  }, [pageSearchRows, pinnedShareRows]);
+  }, [pageSearchRows, pinnedEditRow, pinnedShareRows]);
   const virtualizer = useVirtualizer({
     count: renderItems.length,
     getScrollElement: () => scrollRef.current,
@@ -615,16 +636,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
 
   useEffect(() => {
     setOpenGallery(undefined);
-    setEditingMessageId(undefined);
   }, [sessionId]);
-
-  useEffect(() => {
-    if (shareSelection !== undefined) {
-      setEditingMessageId(undefined);
-      return;
-    }
-    if (editingMessageId !== undefined && !items.some((item) => item.id === editingMessageId)) setEditingMessageId(undefined);
-  }, [editingMessageId, items, shareSelection]);
 
   useEffect(() => {
     if (openGallery === undefined || galleryImages.some((image) => image.id === openGallery.imageId)) return;
@@ -1494,6 +1506,8 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
             if (renderItem === undefined) return null;
             const focused = focusedItemId !== undefined && renderItem.childIds.includes(focusedItemId);
             const searchOnly = isSearchOnlyRow(virtualRow.index);
+            const editing = renderItem.type === "item" && currentEdit?.messageId === renderItem.item.id
+              && currentEdit.sourceEventId === renderItem.item.sourceEventId ? currentEdit : undefined;
             return (
               <div
                 key={renderItem.key}
@@ -1516,12 +1530,15 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
                 {partnerTimeGroups.has(renderItem.key) && <div className="partner-time-group"><time dateTime={new Date(partnerTimeGroups.get(renderItem.key)!).toISOString()}>{formatPartnerTimeGroup(partnerTimeGroups.get(renderItem.key)!, locale)}</time></div>}
                 {firstPartnerUnread === renderItem.key && <div className="partner-unread-divider" role="separator"><span>{t("partners.unreadDivider")}</span></div>}
                 <TimelineSearchOnly.Provider value={searchOnly}>{renderItem.type === "item"
-                  ? <TimelineBlock sessionId={sessionId} sessionName={sessionName} item={renderItem.item} planAnimated={sessionActive} retryRunId={retryRunId} locale={locale} reducedMotion={reducedMotion} t={t} onRetry={onRetry} onRecovery={onRecovery} recoveryContext={recoveryContext} onArtifactUrl={loadArtifactUrl} onArtifactDownload={onArtifactDownload} onWorkspaceRewind={onWorkspaceRewind} onOpenGeneratedFile={onOpenGeneratedFile} onOpenTurnReview={onOpenTurnReview} onReobserveReview={onReobserveReview} onAddMessageToComposer={onAddMessageToComposer} onForkMessage={onForkMessage} forkingMessageId={forkingMessageId} shareSelection={shareSelection} onStartShareSelection={onStartShareSelection} onToggleShareMessage={onToggleShareMessage} editingMessageId={editingMessageId} messageEdit={messageEdit}
-                      onEditMessage={(item) => { if (messageEdit?.begin(item)) setEditingMessageId(item.id); }}
-                      onCancelEditMessage={() => setEditingMessageId(undefined)}
+                  ? <TimelineBlock sessionId={sessionId} sessionName={sessionName} item={renderItem.item} planAnimated={sessionActive} retryRunId={retryRunId} locale={locale} reducedMotion={reducedMotion} t={t} onRetry={onRetry} onRecovery={onRecovery} recoveryContext={recoveryContext} onArtifactUrl={loadArtifactUrl} onArtifactDownload={onArtifactDownload} onWorkspaceRewind={onWorkspaceRewind} onOpenGeneratedFile={onOpenGeneratedFile} onOpenTurnReview={onOpenTurnReview} onReobserveReview={onReobserveReview} onAddMessageToComposer={onAddMessageToComposer} onForkMessage={onForkMessage} forkingMessageId={forkingMessageId} shareSelection={shareSelection} onStartShareSelection={onStartShareSelection} onToggleShareMessage={onToggleShareMessage} messageEdit={messageEdit}
+                      editDraft={editing === undefined ? undefined : { value: editing.draft, update: draft => {
+                        setEditingRow(previous => previous?.token === editing.token ? { ...previous, draft } : previous);
+                      }}}
+                      onEditMessage={beginInlineEdit}
+                      onCancelEditMessage={() => setEditingRow(undefined)}
                       onSubmitEdit={messageEdit === undefined ? undefined : async (item, text) => {
                         await messageEdit.submit(item, text);
-                        setEditingMessageId(current => current === item.id ? undefined : current);
+                        setEditingRow(previous => previous?.token === editing?.token ? undefined : previous);
                       }} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} showMessageActions={renderItem.item.kind !== "assistant" || (assistantMessageActions.has(renderItem.item.id) && !blockedAssistantForks.has(renderItem.item.id))} />
                   : renderItem.type === "work"
                     ? <WorkGroupBlock sessionId={sessionId} sessionName={sessionName} work={renderItem} retryRunId={retryRunId} locale={locale} reducedMotion={reducedMotion} t={t} onHeaderToggle={onWorkGroupHeaderToggle} onRetry={onRetry} onRecovery={onRecovery} recoveryContext={recoveryContext} onArtifactUrl={loadArtifactUrl} onArtifactDownload={onArtifactDownload} onWorkspaceRewind={onWorkspaceRewind} />
@@ -1605,7 +1622,7 @@ function WorkGroupBlock({ sessionId, sessionName, work, retryRunId, locale, redu
   );
 }
 
-function TimelineBlock({ sessionId, sessionName, item, planAnimated = false, retryRunId, locale, reducedMotion, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editingMessageId, messageEdit, onEditMessage, onCancelEditMessage, onSubmitEdit, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, showMessageActions = true }: { readonly sessionId: string; readonly sessionName: string; readonly item: TimelineItemView; readonly planAnimated?: boolean; readonly retryRunId?: string; readonly locale: string; readonly reducedMotion: boolean; readonly t: Translator; readonly onRetry?: (error: ErrorView) => void; readonly onRecovery?: (error: ErrorView, action: ErrorRecoveryActionView) => void; readonly recoveryContext?: RecoveryActionContext; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"]; readonly onWorkspaceRewind?: (workspaceId: string, changeSetId: string) => void; readonly onOpenGeneratedFile?: (workspaceId: string, relativePath: string) => void; readonly onOpenTurnReview?: (changeSetId: string, relativePath?: string) => void; readonly onReobserveReview?: (reviewRunId: string) => Promise<void>; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onForkMessage?: (item: TimelineItemView) => void; readonly forkingMessageId?: string; readonly shareSelection?: TimelineShareSelection; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly onToggleShareMessage?: (itemId: string, extendRange: boolean) => void; readonly editingMessageId?: string; readonly messageEdit?: TimelineMessageEdit; readonly onEditMessage?: (item: TimelineItemView) => void; readonly onCancelEditMessage?: () => void; readonly onSubmitEdit?: TimelineMessageEdit["submit"]; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly rewindToStartSupported?: boolean; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string; readonly showMessageActions?: boolean }): JSX.Element {
+function TimelineBlock({ sessionId, sessionName, item, planAnimated = false, retryRunId, locale, reducedMotion, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editDraft, messageEdit, onEditMessage, onCancelEditMessage, onSubmitEdit, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, showMessageActions = true }: { readonly sessionId: string; readonly sessionName: string; readonly item: TimelineItemView; readonly planAnimated?: boolean; readonly retryRunId?: string; readonly locale: string; readonly reducedMotion: boolean; readonly t: Translator; readonly onRetry?: (error: ErrorView) => void; readonly onRecovery?: (error: ErrorView, action: ErrorRecoveryActionView) => void; readonly recoveryContext?: RecoveryActionContext; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"]; readonly onWorkspaceRewind?: (workspaceId: string, changeSetId: string) => void; readonly onOpenGeneratedFile?: (workspaceId: string, relativePath: string) => void; readonly onOpenTurnReview?: (changeSetId: string, relativePath?: string) => void; readonly onReobserveReview?: (reviewRunId: string) => Promise<void>; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onForkMessage?: (item: TimelineItemView) => void; readonly forkingMessageId?: string; readonly shareSelection?: TimelineShareSelection; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly onToggleShareMessage?: (itemId: string, extendRange: boolean) => void; readonly editDraft?: ControlledUserMessageEditDraft; readonly messageEdit?: TimelineMessageEdit; readonly onEditMessage?: (item: TimelineItemView) => void; readonly onCancelEditMessage?: () => void; readonly onSubmitEdit?: TimelineMessageEdit["submit"]; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly rewindToStartSupported?: boolean; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string; readonly showMessageActions?: boolean }): JSX.Element {
   const { workspaceId } = useContext(TimelinePersonalizationContext);
   if (item.mcpApp !== undefined) return <McpAppCard card={item.mcpApp} locale={locale} t={t} />;
   if (item.extensionCard !== undefined) return <ExtensionCard card={item.extensionCard} t={t} />;
@@ -1615,9 +1632,9 @@ function TimelineBlock({ sessionId, sessionName, item, planAnimated = false, ret
     workspaceId={workspaceId} onDownload={onArtifactDownload} connectionOwner={onArtifactUrl}
     onOpenFile={workspaceId && onOpenGeneratedFile ? relativePath => onOpenGeneratedFile(workspaceId, relativePath) : undefined} />;
   switch (item.kind) {
-    case "user": return <MessageBlock sessionId={sessionId} sessionName={sessionName} item={item} role="user" locale={locale} reducedMotion={reducedMotion} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} onAddMessageToComposer={onAddMessageToComposer} onForkMessage={onForkMessage} forking={forkingMessageId === item.id} shareSelection={shareSelection} onStartShareSelection={onStartShareSelection} onToggleShareMessage={onToggleShareMessage} editing={editingMessageId === item.id} editable={messageEdit?.messageId === item.id} stopRunningToEdit={messageEdit?.stopRunning}
-      editBlockedReason={messageEdit?.blockedReason} onEdit={onEditMessage} onCancelEdit={onCancelEditMessage} onSubmitEdit={onSubmitEdit} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} showActions={showMessageActions} />;
-    case "assistant": return <MessageBlock sessionId={sessionId} sessionName={sessionName} item={item} role="assistant" locale={locale} reducedMotion={reducedMotion} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} onAddMessageToComposer={onAddMessageToComposer} onForkMessage={onForkMessage} forking={forkingMessageId === item.id} shareSelection={shareSelection} onStartShareSelection={onStartShareSelection} onToggleShareMessage={onToggleShareMessage} editing={false} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} showActions={showMessageActions} />;
+    case "user": return <MessageBlock sessionId={sessionId} sessionName={sessionName} item={item} role="user" locale={locale} reducedMotion={reducedMotion} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} onAddMessageToComposer={onAddMessageToComposer} onForkMessage={onForkMessage} forking={forkingMessageId === item.id} shareSelection={shareSelection} onStartShareSelection={onStartShareSelection} onToggleShareMessage={onToggleShareMessage} editDraft={editDraft} editable={messageEdit?.messageId === item.id} stopRunningToEdit={messageEdit?.stopRunning}
+      editBlockedReason={messageEdit?.blockedReason ?? (editDraft !== undefined && messageEdit?.messageId !== item.id ? t("timeline.editStale") : undefined)} onEdit={onEditMessage} onCancelEdit={onCancelEditMessage} onSubmitEdit={onSubmitEdit} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} showActions={showMessageActions} />;
+    case "assistant": return <MessageBlock sessionId={sessionId} sessionName={sessionName} item={item} role="assistant" locale={locale} reducedMotion={reducedMotion} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} onAddMessageToComposer={onAddMessageToComposer} onForkMessage={onForkMessage} forking={forkingMessageId === item.id} shareSelection={shareSelection} onStartShareSelection={onStartShareSelection} onToggleShareMessage={onToggleShareMessage} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} showActions={showMessageActions} />;
     case "thinking": return <ThinkingBlock item={item} locale={locale} t={t} />;
     case "tool": return <ToolBlock item={item} locale={locale} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} />;
     case "toolResult": return <ToolBlock item={item} locale={locale} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} />;
@@ -1773,7 +1790,7 @@ export function AutomationOriginBadge({ automationOrigin, t }: {
   ><Timer aria-hidden="true" /><span>{label}</span></button>;
 }
 
-function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotion, t, onArtifactUrl, onArtifactDownload, onAddMessageToComposer, onForkMessage, forking, shareSelection, onStartShareSelection, onToggleShareMessage, editing, editable, stopRunningToEdit, editBlockedReason, onEdit, onCancelEdit, onSubmitEdit, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, showActions }: { readonly sessionId: string; readonly sessionName: string; readonly item: TimelineItemView; readonly role: "user" | "assistant"; readonly locale: string; readonly reducedMotion: boolean; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"]; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onForkMessage?: (item: TimelineItemView) => void; readonly forking: boolean; readonly shareSelection?: TimelineShareSelection; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly onToggleShareMessage?: (itemId: string, extendRange: boolean) => void; readonly editing: boolean; readonly editable: boolean; readonly stopRunningToEdit?: boolean; readonly editBlockedReason?: string; readonly onEdit?: (item: TimelineItemView) => void; readonly onCancelEdit?: () => void; readonly onSubmitEdit?: TimelineMessageEdit["submit"]; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly rewindToStartSupported?: boolean; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string; readonly showActions: boolean }): JSX.Element {
+function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotion, t, onArtifactUrl, onArtifactDownload, onAddMessageToComposer, onForkMessage, forking, shareSelection, onStartShareSelection, onToggleShareMessage, editDraft, editable, stopRunningToEdit, editBlockedReason, onEdit, onCancelEdit, onSubmitEdit, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, showActions }: { readonly sessionId: string; readonly sessionName: string; readonly item: TimelineItemView; readonly role: "user" | "assistant"; readonly locale: string; readonly reducedMotion: boolean; readonly t: Translator; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"]; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onForkMessage?: (item: TimelineItemView) => void; readonly forking: boolean; readonly shareSelection?: TimelineShareSelection; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly onToggleShareMessage?: (itemId: string, extendRange: boolean) => void; readonly editDraft?: ControlledUserMessageEditDraft; readonly editable: boolean; readonly stopRunningToEdit?: boolean; readonly editBlockedReason?: string; readonly onEdit?: (item: TimelineItemView) => void; readonly onCancelEdit?: () => void; readonly onSubmitEdit?: TimelineMessageEdit["submit"]; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly rewindToStartSupported?: boolean; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string; readonly showActions: boolean }): JSX.Element {
   const personalization = useContext(TimelinePersonalizationContext);
   const searchOnly = useContext(TimelineSearchOnly);
   const referenceActions = useMemo<TimelineReferenceActions>(() => ({
@@ -1857,9 +1874,9 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
     </button>
   </div>;
   if (role === "user") {
-    if (!searchOnly && !selectionActive && editing && onCancelEdit !== undefined && onSubmitEdit !== undefined) {
+    if (!searchOnly && !selectionActive && editDraft !== undefined && onCancelEdit !== undefined && onSubmitEdit !== undefined) {
       return <article className="message-user message-user--editing" data-user-msg-id={item.id} data-message-client-id={item.id} {...(shareable ? { [RENDERED_SHARE_MESSAGE_ATTRIBUTE]: item.id } : {})} aria-label={roleLabel}><div className="message-user__stack">{item.automationOrigin !== undefined && <AutomationOriginBadge automationOrigin={item.automationOrigin} t={t} />}
-        <UserMessageEditBox initialText={quotedUserMessage.body} t={t} onCancel={onCancelEdit}
+        <UserMessageEditBox initialText={quotedUserMessage.body} draft={editDraft} t={t} onCancel={onCancelEdit}
           blockedReason={editBlockedReason} onSubmit={(value) => onSubmitEdit(item, value)} /></div></article>;
     }
     return (

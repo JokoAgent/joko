@@ -4,16 +4,28 @@ import type { JSX, KeyboardEvent } from "react";
 import type { Translator } from "./types.js";
 import { Button, Spinner } from "./ui.js";
 
-export function UserMessageEditBox({ initialText, t, onCancel, onSubmit, blockedReason }: {
+export interface UserMessageEditDraft {
+  readonly text: string;
+  readonly submitting: boolean;
+  readonly error?: string;
+}
+
+export interface ControlledUserMessageEditDraft {
+  readonly value: UserMessageEditDraft;
+  readonly update: (next: UserMessageEditDraft) => void;
+}
+
+export function UserMessageEditBox({ initialText, draft, t, onCancel, onSubmit, blockedReason }: {
   readonly initialText: string;
+  readonly draft?: ControlledUserMessageEditDraft;
   readonly t: Translator;
   readonly onCancel: () => void;
   readonly onSubmit: (text: string) => Promise<void>;
   readonly blockedReason?: string;
 }): JSX.Element {
-  const [text, setText] = useState(initialText);
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string>();
+  const [localDraft, setLocalDraft] = useState<UserMessageEditDraft>({ text: initialText, submitting: false });
+  const { text, submitting, error } = draft?.value ?? localDraft;
+  const update = draft?.update ?? setLocalDraft;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const submittingRef = useRef(false);
 
@@ -33,17 +45,16 @@ export function UserMessageEditBox({ initialText, t, onCancel, onSubmit, blocked
 
   const save = async (): Promise<void> => {
     const value = text.trim();
-    if (value.length === 0 || submittingRef.current || blockedReason !== undefined) return;
+    if (value.length === 0 || submitting || submittingRef.current || blockedReason !== undefined) return;
     submittingRef.current = true;
-    setSubmitting(true);
-    setError(undefined);
+    update({ text, submitting: true });
     try {
       await onSubmit(value);
+      update({ text, submitting: false });
     } catch (cause) {
-      setError(cause instanceof Error && cause.message.trim().length > 0 ? cause.message : t("timeline.editFailed"));
+      update({ text, submitting: false, error: cause instanceof Error && cause.message.trim().length > 0 ? cause.message : t("timeline.editFailed") });
     } finally {
       submittingRef.current = false;
-      setSubmitting(false);
     }
   };
 
@@ -62,7 +73,7 @@ export function UserMessageEditBox({ initialText, t, onCancel, onSubmit, blocked
 
   return (
     <div className="message-user-edit" aria-label={t("timeline.editMessage")} aria-busy={submitting || undefined}>
-      <textarea ref={textareaRef} value={text} disabled={submitting} rows={1} onChange={(event) => setText(event.target.value)} onKeyDown={onKeyDown} aria-label={t("timeline.editMessage")} />
+      <textarea ref={textareaRef} value={text} disabled={submitting} rows={1} onChange={(event) => update({ text: event.target.value, error, submitting })} onKeyDown={onKeyDown} aria-label={t("timeline.editMessage")} />
       {blockedReason === undefined
         ? <p className="message-user-edit__hint"><CornerDownLeft aria-hidden="true" />{t("timeline.editSendHint")}</p>
         : <p className="message-user-edit__hint" role="status">{blockedReason}</p>}
