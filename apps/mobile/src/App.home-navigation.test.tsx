@@ -45,6 +45,17 @@ const latest = vi.fn();
 let linkListener: ((event: { readonly url: string }) => void) | undefined;
 const searchHome = vi.fn(async () => {});
 const scrollToIndex = vi.fn();
+const scrollHomeTo = vi.fn();
+type HomeListProps = {
+  sections: readonly { key: string; data: readonly unknown[] }[];
+  renderItem: (value: { item: unknown; index: number }) => ReactNode;
+  renderSectionHeader: (value: { section: unknown }) => ReactNode;
+  ListEmptyComponent?: ReactNode;
+  onLayout: (event: { nativeEvent: { layout: { height: number } } }) => void;
+  onContentSizeChange: (width: number, height: number) => void;
+  onScroll: (event: { nativeEvent: { contentOffset: { y: number } } }) => void;
+};
+let homeListProps: HomeListProps;
 const setSessionPinned = vi.fn(async () => true);
 const setSessionArchived = vi.fn(async (_sessionId: string, _archived: boolean, _archiveConfirmation?: string) => true);
 const archiveConfirmation = "a".repeat(64);
@@ -153,14 +164,14 @@ beforeAll(async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.doMock("react-native", () => ({
     View: surface, Text: surface, ScrollView: surface, Image: surface, ActivityIndicator: surface,
-    SectionList: ({ sections, renderItem, renderSectionHeader, ListEmptyComponent }: {
-      sections: readonly { key: string; data: readonly unknown[] }[];
-      renderItem: (value: { item: unknown; index: number }) => ReactNode;
-      renderSectionHeader: (value: { section: unknown }) => ReactNode;
-      ListEmptyComponent?: ReactNode;
-    }) => createElement("div", { "data-testid": "home-list" }, sections.length === 0 ? ListEmptyComponent
-      : sections.map(section => createElement("section", { key: section.key }, renderSectionHeader({ section }),
-        section.data.map((item, index) => createElement("div", { key: index }, renderItem({ item, index })))))),
+    SectionList: forwardRef((listProps: HomeListProps, ref) => {
+      homeListProps = listProps;
+      const { sections, renderItem, renderSectionHeader, ListEmptyComponent } = listProps;
+      useImperativeHandle(ref, () => ({ getScrollResponder: () => ({ scrollTo: scrollHomeTo }) }), []);
+      return createElement("div", { "data-testid": "home-list" }, sections.length === 0 ? ListEmptyComponent
+        : sections.map(section => createElement("section", { key: section.key }, renderSectionHeader({ section }),
+          section.data.map((item, index) => createElement("div", { key: index }, renderItem({ item, index }))))));
+    }),
     FlatList: forwardRef(({ data, renderItem, ListEmptyComponent }: { data?: readonly { id: string }[];
       renderItem?: (value: { item: unknown }) => ReactNode; ListEmptyComponent?: ReactNode }, ref) => {
       useImperativeHandle(ref, () => ({ scrollToIndex, scrollToEnd() {}, scrollToOffset() {} }), []);
@@ -321,7 +332,7 @@ beforeEach(async () => {
   createNewTask.mockClear();
   await newTaskDrafts.clear({ profileId: "profile" });
   vi.useFakeTimers();
-  for (const spy of [select, searchHome, scrollToIndex, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, alert, reconcile, dismissUnconfirmed, refresh,
+  for (const spy of [select, searchHome, scrollToIndex, scrollHomeTo, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, alert, reconcile, dismissUnconfirmed, refresh,
     writeClipboard, onNew, onSelect, onMenu, onOpenShare, runNavigation, onBack, onSearchFocus, onNavigated, newTaskFlush]) spy.mockClear();
   dimensions = { width: 390, height: 844, scale: 1, fontScale: 1 }; taskNavigationPort = undefined; finishDrawerClose = undefined;
   draftFlush.mockReset().mockImplementation(originalDraftFlush);
@@ -377,6 +388,47 @@ async function option(label: string): Promise<void> {
     vi.advanceTimersToNextFrame();
   });
 }
+
+it.each(["home", "drawer"] as const)("restores the original %s scroll after the list remounts with its viewport and content", async hostKind => {
+  const scrollOffsets = new Map<string, number>();
+  await render({ host: hostKind, scrollOffsets });
+  const previous = homeListProps;
+  await act(async () => previous.onScroll({ nativeEvent: { contentOffset: { y: 420 } } }));
+  await act(async () => root.render(null));
+  previous.onScroll({ nativeEvent: { contentOffset: { y: 900 } } });
+  await render();
+  const restored = homeListProps;
+  await act(async () => {
+    restored.onScroll({ nativeEvent: { contentOffset: { y: 0 } } });
+    restored.onContentSizeChange(400, 700);
+    restored.onLayout({ nativeEvent: { layout: { height: 360 } } });
+  });
+  expect(scrollHomeTo).not.toHaveBeenCalled();
+  await act(async () => {
+    restored.onContentSizeChange(400, 1_400);
+    restored.onContentSizeChange(400, 1_450);
+  });
+  expect(scrollHomeTo).toHaveBeenCalledExactlyOnceWith({ y: 420, animated: false });
+
+  scrollHomeTo.mockClear();
+  await render({ state: { ...state, activeProfileId: "another-owner" } });
+  await act(async () => {
+    homeListProps.onLayout({ nativeEvent: { layout: { height: 360 } } });
+    homeListProps.onContentSizeChange(400, 1_450);
+  });
+  expect(scrollHomeTo).not.toHaveBeenCalled();
+});
+
+it("does not reposition the already mounted task list when the selected task changes", async () => {
+  await render({ host: "persistent", scrollOffsets: new Map() });
+  await act(async () => homeListProps.onScroll({ nativeEvent: { contentOffset: { y: 420 } } }));
+  await render({ currentSessionId: "other" });
+  await act(async () => {
+    homeListProps.onLayout({ nativeEvent: { layout: { height: 360 } } });
+    homeListProps.onContentSizeChange(400, 1_450);
+  });
+  expect(scrollHomeTo).not.toHaveBeenCalled();
+});
 
 it("restores the Worktree branch in the actual new-task form, submits it and clears it when another project is selected", async () => {
   state = { ...state, owner: create(SnapshotSchema, { ...state.owner!,

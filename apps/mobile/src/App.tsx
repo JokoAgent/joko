@@ -291,7 +291,7 @@ import { readMobileScreenshotVisibleMessages } from "./mobile-screenshot-selecti
 import { useMobileScreenshotSelection } from "./use-mobile-screenshot-selection";
 import {
   buildMobileHomeSections, buildMobileHomeNavigationLayout, createSwipeRowRegistry,
-  type MobileHomeSearchMatch, type MobileHomeSearchSort, type MobileHomeStatusFilter
+  type MobileHomeSearchMatch, type MobileHomeSearchSort, type MobileHomeSection, type MobileHomeSessionItem, type MobileHomeStatusFilter
 } from "./home-navigation";
 import { MobileTaskHomeNavigation, type MobileHomeNavigationIntent, type MobileHomeViewChange, type MobileHomeViewState,
   type MobileTaskHomeNavigationPorts } from "./mobile-task-home-navigation";
@@ -656,6 +656,7 @@ export function App() {
   const homeSourceKey = mobileHomeSourceKey(state);
   const { view: homeViewState, change: setHomeViewState } = useMobileHomeViewPreference(homeSourceKey,
     state.saved.some(profile => profile.profileId === state.activeProfileId) ? mobilePlainStorage : undefined);
+  const homeScrollOffsets = useRef(new Map<string, number>());
   const [focusTaskComposer, setFocusTaskComposer] = useState(false);
   const [incomingShareRequestRevision, setIncomingShareRequestRevision] = useState(0);
   const [nativeIntentRevision, setNativeIntentRevision] = useState(0);
@@ -1093,7 +1094,7 @@ export function App() {
                     setSharingLeaveJoinId(state.taskSource?.kind === "joined" ? state.taskSource.joined.joinId : undefined);
                     setPage("task-sharing");
                   }}
-                  homeNavigation={{ viewState: homeViewState, onViewStateChange: setHomeViewState, incomingShare,
+                  homeNavigation={{ viewState: homeViewState, onViewStateChange: setHomeViewState, scrollOffsets: homeScrollOffsets.current, incomingShare,
                     menuButtonRef: homeMenuButtonRef, searchFocusRequest: homeSearchFocusRequest,
                     onSearchFocus: () => setHomeSearchFocusRequest((value) => value + 1),
                     onNavigated: match => {
@@ -1233,7 +1234,7 @@ export function App() {
                   onRemoteDesktop={() => openRemoteDesktop("device", deviceId)} /> :
                 <SessionsScreen {...common} onNew={() => setPage("new")} onSelect={match => { focusHomeSearchMatch(match); setPage("task"); }}
                   onPartners={entry => { setHomePartnerEntry(entry); setPage("partner-directory"); }}
-                  viewState={homeViewState} onViewStateChange={setHomeViewState} foreground={foreground}
+                  viewState={homeViewState} onViewStateChange={setHomeViewState} scrollOffsets={homeScrollOffsets.current} foreground={foreground}
                   incomingShare={incomingShare} onOpenShare={() => setPage("new")}
                   menuButtonRef={homeMenuButtonRef} searchFocusRequest={homeSearchFocusRequest}
                   onMenu={() => { pendingHomeMenuActionRef.current = undefined; setMenuOpen(true); }} />}
@@ -1302,6 +1303,7 @@ export type TaskHomeNavigationPort = (intent: MobileHomeNavigationIntent, deferr
 export interface TaskHomeNavigationProps {
   readonly viewState: MobileHomeViewState;
   readonly onViewStateChange: MobileHomeViewChange;
+  readonly scrollOffsets?: Map<string, number>;
   readonly incomingShare: MobileIncomingShareSnapshot;
   readonly menuButtonRef: RefObject<View | null>;
   readonly searchFocusRequest: number;
@@ -1364,12 +1366,13 @@ function ConnectionScreen({ state, locale, dark, onBack, onConnected, invitation
 }
 
 export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, incomingShare, onOpenShare,
-  menuButtonRef, searchFocusRequest, viewState, onViewStateChange, currentSessionId, runNavigation,
+  menuButtonRef, searchFocusRequest, viewState, onViewStateChange, scrollOffsets, currentSessionId, runNavigation,
   foreground = AppState.currentState === "active", host = "home", newTaskInSystemBar = false, onPartners }: ScreenProps & {
   onNew: () => void; onSelect: (match?: MobileHomeSearchMatch) => void; onMenu: () => void;
   incomingShare: MobileIncomingShareSnapshot; onOpenShare: () => void;
   menuButtonRef: RefObject<View | null>; searchFocusRequest: number;
   viewState?: MobileHomeViewState; onViewStateChange?: MobileHomeViewChange;
+  scrollOffsets?: Map<string, number>;
   currentSessionId?: string; runNavigation?: (intent: MobileHomeNavigationIntent) => void;
   foreground?: boolean; host?: "home" | "drawer" | "persistent";
   newTaskInSystemBar?: boolean;
@@ -1401,6 +1404,26 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   const searchRef = useRef<TextInput>(null);
   const swipeRegistry = useMemo(() => createSwipeRowRegistry(), []);
   const normalizedSearch = search.trim();
+  const listRef = useRef<SectionList<MobileHomeSessionItem, MobileHomeSection>>(null);
+  const scrollKey = JSON.stringify([homeScopeKey, host, statusFilter]);
+  const listScroll = useMemo(() => ({
+    pendingOffset: scrollOffsets?.get(scrollKey) ?? 0,
+    contentHeight: 0,
+    viewportHeight: 0
+  }), [scrollKey, scrollOffsets]);
+  const recordListScroll = foreground && normalizedSearch === "" && state.owner !== undefined;
+  const latestListScroll = useRef({ list: listScroll, enabled: recordListScroll });
+  latestListScroll.current = { list: listScroll, enabled: recordListScroll };
+  const restoreListScroll = useCallback(() => {
+    if (!mountedRef.current || latestListScroll.current.list !== listScroll || !recordListScroll || !latestListScroll.current.enabled
+      || listScroll.pendingOffset <= 0 || listScroll.viewportHeight <= 0
+      || listScroll.contentHeight < listScroll.pendingOffset + listScroll.viewportHeight) return;
+    const responder = listRef.current?.getScrollResponder();
+    if (!responder) return;
+    const offset = listScroll.pendingOffset;
+    listScroll.pendingOffset = 0;
+    responder.scrollTo({ y: offset, animated: false });
+  }, [listScroll, recordListScroll]);
   const currentSearch = state.homeSearchQuery === normalizedSearch && state.homeSearchFilter === statusFilter;
   const searchPending = foreground && (state.status === "connected" || state.status === "offline") && normalizedSearch !== ""
     && (!currentSearch || state.homeSearchStatus === "idle" || state.homeSearchStatus === "searching");
@@ -1418,6 +1441,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   }), [currentMessageMatches, locale, search, searchSort, state.owner, statusFilter]);
   const listSections = useMemo(() => sections.map((section) => ({ ...section, data: section.items })), [sections]);
 
+  useEffect(() => { restoreListScroll(); }, [listSections, restoreListScroll]);
   useEffect(() => {
     if (searchFocusRequest > 0) searchRef.current?.focus();
   }, [searchFocusRequest]);
@@ -1661,7 +1685,15 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
       onDismiss={() => setCopyNotice("")} />}
     <PendingReceipts items={state.pending.filter((item) => ["rename", "pin", "archive", "delete", "task-tag"].includes(item.kind))}
       colors={colors} locale={locale} disabled={state.status !== "connected"} onError={setLocalError} />
-    <SectionList sections={listSections} keyExtractor={(item) => item.session.sessionId}
+    <SectionList ref={listRef} key={scrollKey} sections={listSections} keyExtractor={(item) => item.session.sessionId}
+      onLayout={event => { listScroll.viewportHeight = event.nativeEvent.layout.height; restoreListScroll(); }}
+      onContentSizeChange={(_width, height) => { listScroll.contentHeight = height; restoreListScroll(); }}
+      onScroll={event => {
+        const offset = event.nativeEvent.contentOffset.y;
+        if (scrollOffsets && mountedRef.current && latestListScroll.current.list === listScroll && latestListScroll.current.enabled
+          && listScroll.pendingOffset === 0 && Number.isFinite(offset) && offset >= 0) scrollOffsets.set(scrollKey, offset);
+      }}
+      scrollEventThrottle={16}
       ListHeaderComponent={onPartners && <MobileHomePartners roster={partnerRoster} groups={partnerGroupRoster} storage={mobilePlainStorage}
         active={foreground} visible={statusFilter !== "archived"} query={search} colors={colors} locale={locale}
         canCreate={!!client.partnerCreationTransport()} onOpen={entry => navigate({ kind: "page", action: () => onPartners(entry) })} />}
@@ -1706,7 +1738,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
         </View>
       </SwipeableSessionRow>}
       refreshing={state.status === "connecting"} onRefresh={() => void client.refresh()}
-      onScrollBeginDrag={() => { swipeRegistry.closeOpenRow(); }}
+      onScrollBeginDrag={() => { listScroll.pendingOffset = 0; swipeRegistry.closeOpenRow(); }}
       contentContainerStyle={styles.list} />
     <Modal visible={(state.status === "connected" || state.status === "offline") && optionsSession !== undefined} transparent animationType="none"
       onRequestClose={closeOptions} statusBarTranslucent>
@@ -3687,6 +3719,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   drawerMountedRef.current = drawerMounted;
   const [navigationBusy, setNavigationBusy] = useState(false);
   const [localHomeView, setLocalHomeView] = useState<MobileHomeViewState>({ search: "", statusFilter: "active" });
+  const localHomeScrollOffsets = useRef(new Map<string, number>());
   const fallbackHomeMenuRef = useRef<View>(null);
   const [fallbackHomeSearchFocus, setFallbackHomeSearchFocus] = useState(0);
   const taskHomeNavigatorRef = useRef<MobileTaskHomeNavigation | null>(null);
@@ -6678,6 +6711,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     onMenu={homeNavigation?.onMenu ?? onHome} menuButtonRef={homeNavigation?.menuButtonRef ?? fallbackHomeMenuRef}
     searchFocusRequest={homeNavigation?.searchFocusRequest ?? fallbackHomeSearchFocus}
     viewState={homeNavigation?.viewState ?? localHomeView} onViewStateChange={homeNavigation?.onViewStateChange ?? setLocalHomeView}
+    scrollOffsets={homeNavigation?.scrollOffsets ?? localHomeScrollOffsets.current}
     currentSessionId={state.taskSource?.kind === "joined" ? undefined : state.selectedId} host={host} foreground={AppState.currentState === "active" && (host !== "drawer" || drawerOpen)}
     newTaskInSystemBar={newTaskInSystemBar}
     onPartners={homeNavigation?.onPartners}
