@@ -180,6 +180,7 @@ export class SessionWorktreeCoordinator {
         continue;
       }
       if (session.descriptor.archived) {
+        this.#activeBindings.delete(session.descriptor.id);
         this.#workspaces.unregister(binding.workspaceId);
         if (binding.state !== "preserved") {
           this.#store.updateSessionWorktreeState(session.descriptor.id, "preserved");
@@ -608,7 +609,9 @@ export class SessionWorktreeCoordinator {
     }
     const result = await this.#service.previewRemoval({ sessionId, leaseId: binding.leaseId }, options);
     if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
-    if (result.value.state !== binding.state) {
+    const keptArchive = session.descriptor.archived && binding.state === "preserved" && result.value.state === "active"
+      && this.#isKeptArchiveCheckout(sessionId, binding);
+    if (result.value.state !== binding.state && !keptArchive) {
       throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     }
     return Object.freeze({ hasWorktree: true, dirty: result.value.dirty });
@@ -672,6 +675,12 @@ export class SessionWorktreeCoordinator {
       && !cleanup.worktreeCompleted && (cleanup.disposition === "archive") === record.retainForRestore;
     if (!session.descriptor.archived && session.descriptor.deletedAt === undefined && !ownsLifecycle) return undefined;
     return session;
+  }
+
+  #isKeptArchiveCheckout(sessionId: string, binding: SessionWorktreeBinding): boolean {
+    return this.#service.listRecycleStatus().some(record =>
+      record.lease.sessionId === sessionId && record.state === "kept" && record.retainForRestore
+      && sameLease(record.lease, { ...binding, state: "active" }));
   }
 
   async #canRecycle(lease: WorktreeLease, retainForRestore: boolean): Promise<boolean> {
@@ -973,9 +982,17 @@ export class SessionWorktreeCoordinator {
     this.notifyRecycleOpportunity(sessionId);
     assertCurrent();
     if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
-    if (result.value.status !== "preserved" || result.value.reason !== "restorable"
-      || result.value.pathRemoved !== true) {
-      throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    const released = result.value.status === "preserved" && result.value.reason === "restorable" && result.value.pathRemoved === true;
+    if (!released) {
+      if (retiredArchiveOperationId === undefined || result.value.status !== "preserved"
+        || result.value.reason !== "keep" || result.value.pathRemoved !== false) {
+        throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+      }
+      const preview = await this.#service.previewRemoval({ sessionId, leaseId: binding.leaseId }, { assertCurrent });
+      assertCurrent();
+      if (!preview.ok || preview.value.state !== "active" || !this.#isKeptArchiveCheckout(sessionId, binding)) {
+        throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+      }
     }
     this.#activeBindings.delete(sessionId);
     this.#workspaces.unregister(binding.workspaceId);

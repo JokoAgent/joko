@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 import { Code } from "@connectrpc/connect";
-import { OperationState, WorktreeEligibility } from "@joko/contracts";
+import { OperationState, WorktreeEligibility, WorktreeRecycleReason, WorktreeRecycleState } from "@joko/contracts";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { OrchestratorE2eFixture } from "./fixture.js";
@@ -26,9 +26,10 @@ describe("managed worktree removal preflight", () => {
   });
 
   it.each([
-    { branchState: "preserved", removeBranch: false },
-    { branchState: "deleted", removeBranch: true }
-  ])("restores the exact worktree after a service restart with the original branch $branchState", { timeout: 60_000 }, async ({ removeBranch }) => {
+    { archiveMode: "with the original branch preserved", removeBranch: false, keepCheckout: false },
+    { archiveMode: "with the original branch deleted", removeBranch: true, keepCheckout: false },
+    { archiveMode: "with the original checkout kept", removeBranch: false, keepCheckout: true }
+  ])("archives and restores the exact worktree after a service restart $archiveMode", { timeout: 60_000 }, async ({ removeBranch, keepCheckout }) => {
     fixture = await OrchestratorE2eFixture.start();
     await initializeRepository(fixture.workspaceDirectory);
     const paired = await fixture.pair("Worktree preflight owner");
@@ -78,10 +79,12 @@ describe("managed worktree removal preflight", () => {
 
     const trackedPath = join(initialBinding.path, "README.md");
     const untrackedPath = join(initialBinding.path, "recovery-note.txt");
+    const keepPath = join(initialBinding.path, ".worktree-keep");
     await writeFile(trackedPath, "staged worktree content\n", "utf8");
     await git(initialBinding.path, ["add", "README.md"]);
     await writeFile(trackedPath, "unstaged worktree content\n", "utf8");
     await writeFile(untrackedPath, "untracked worktree content\n", "utf8");
+    if (keepCheckout) await writeFile(keepPath, "Keep this checkout\n", "utf8");
     await expect(paired.clients.worktree.getSessionWorktreeRemovalPreview({ sessionId })).resolves.toMatchObject({
       sessionId,
       hasWorktree: true,
@@ -98,7 +101,14 @@ describe("managed worktree removal preflight", () => {
       archived: true,
       worktree: { leaseId: initialBinding.leaseId, path: initialBinding.path, state: "preserved" }
     });
-    await expect(access(initialBinding.path)).rejects.toMatchObject({ code: "ENOENT" });
+    if (keepCheckout) {
+      expect(await readFile(keepPath, "utf8")).toBe("Keep this checkout\n");
+      expect(await readFile(untrackedPath, "utf8")).toBe("untracked worktree content\n");
+      await expect(paired.clients.worktree.listWorktreeRecycleStatus({})).resolves.toMatchObject({
+        records: [expect.objectContaining({ sessionId, id: initialBinding.leaseId,
+          state: WorktreeRecycleState.KEPT, reason: WorktreeRecycleReason.KEPT })]
+      });
+    } else await expect(access(initialBinding.path)).rejects.toMatchObject({ code: "ENOENT" });
     const branchRef = `refs/heads/${initialBinding.branch}`;
     if (removeBranch) {
       await git(initialBinding.repositoryRoot, ["branch", "-D", "--", initialBinding.branch]);
@@ -109,6 +119,9 @@ describe("managed worktree removal preflight", () => {
     await fixture.close({ removeRoot: false });
     fixture = await OrchestratorE2eFixture.start({ rootDirectory });
     const restartedClients = fixture.clients(paired.authKey);
+    expect(fixture.application.store.getSession(sessionId).descriptor).toMatchObject({
+      archived: true, worktree: { state: "preserved", leaseId: initialBinding.leaseId }
+    });
     if (!removeBranch) {
       await expect(restartedClients.worktree.getSessionWorktreeRemovalPreview({ sessionId })).resolves.toMatchObject({
         sessionId,
@@ -141,7 +154,11 @@ describe("managed worktree removal preflight", () => {
       .toBe("untracked worktree content\n");
     expect((await git(initialBinding.path, ["status", "--porcelain=v1"]))
       .replaceAll("\r\n", "\n"))
-      .toBe("MM README.md\n?? recovery-note.txt\n");
+      .toBe(`MM README.md\n${keepCheckout ? "?? .worktree-keep\n" : ""}?? recovery-note.txt\n`);
+    if (keepCheckout) {
+      expect(await readFile(keepPath, "utf8")).toBe("Keep this checkout\n");
+      await expect(restartedClients.worktree.listWorktreeRecycleStatus({})).resolves.toMatchObject({ records: [] });
+    }
     await expect(restartedClients.worktree.getSessionWorktreeRemovalPreview({ sessionId })).resolves.toMatchObject({
       sessionId,
       hasWorktree: true,
