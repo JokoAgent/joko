@@ -1654,6 +1654,7 @@ export interface TimelineItemView {
   readonly nativeRewindBefore?: NativeNavigationTargetView;
   /** Durable run ownership used by turn-scoped UI projections such as plans. */
   readonly runId?: string;
+  readonly failedInput?: FailedInputIdentity;
   readonly artifactOperationId?: string;
   readonly documentFile?: TimelineDocumentFileView;
   readonly documentFiles?: readonly TimelineDocumentFileView[];
@@ -2044,6 +2045,14 @@ export interface ErrorView {
   readonly severity: "waiting" | "retryable" | "blocked" | "fatal";
   readonly retryable: boolean;
   readonly recovery: readonly ErrorRecoveryActionView[];
+}
+
+export interface FailedInputIdentity {
+  readonly backendId: string;
+  readonly targetId: string;
+  readonly runId: string;
+  readonly queueItemId: string;
+  readonly operationId: string;
 }
 
 export type ErrorRecoveryActionKindView =
@@ -6305,6 +6314,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   readProviderAccountBalance?(backendId: string, providerId: string, forceRefresh: boolean, signal?: AbortSignal): Promise<import("@joko/contracts").ProviderAccountBalanceResult>;
   providerAccountResets?(): import("@joko/contracts").ProviderAccountResetApi | undefined;
   readTaskProviderGroupUsage?(sessionId: string, generation: bigint, signal?: AbortSignal): Promise<import("./provider-group-task-usage.js").TaskProviderGroupUsageView | undefined>;
+  readFailedInputModel?(sessionId: string, generation: bigint, input: FailedInputIdentity): Promise<import("./usage-limit-recovery.js").FailedInputModel | undefined>;
   readTaskProviderGroupRebalance?(sessionId: string, generation: bigint, signal?: AbortSignal): Promise<import("@joko/contracts").ProviderGroupRebalanceView | undefined>;
   getArtifactStorageStats(protectedSha256?: readonly string[]): Promise<ArtifactStorageMaintenanceView>;
   listSessionArtifacts(sessionId: string, signal?: AbortSignal): Promise<readonly ArtifactView[]>;

@@ -35,6 +35,7 @@ export interface CapturedProviderRequest {
 export type RealPiProviderReply =
   | { readonly kind: "text"; readonly text: string; readonly thinking?: string; readonly holdAfterThinking?: Promise<void> }
   | { readonly kind: "contextOverflow" }
+  | { readonly kind: "rateLimit"; readonly resetAt: number }
   | {
       readonly kind: "tool";
       readonly name: string;
@@ -463,6 +464,15 @@ export async function startLocalProvider(
             code: "context_length_exceeded"
           }
         }));
+        return;
+      }
+      if (reply.kind === "rateLimit") {
+        response.writeHead(429, { "content-type": "application/json; charset=utf-8" });
+        response.end(JSON.stringify({ error: {
+          message: `Rate limit exceeded; resets at ${Math.floor(reply.resetAt / 1_000)}`,
+          type: "rate_limit_exceeded",
+          code: "rate_limit_exceeded"
+        } }));
         return;
       }
       const id = `joko-real-pi-${requests.length}`;

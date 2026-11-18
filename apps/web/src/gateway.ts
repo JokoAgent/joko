@@ -3249,6 +3249,38 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }
   }
 
+  async readFailedInputModel(sessionId: string, generation: bigint, input: import("./model.js").FailedInputIdentity):
+    Promise<import("./usage-limit-recovery.js").FailedInputModel | undefined> {
+    if (this.#taskSharing !== undefined) return undefined;
+    const scope = this.captureActionScope();
+    const session = this.#snapshot?.sessions.find(item => item.id === sessionId);
+    if (session?.generation !== generation || session.backendId !== input.backendId || session.targetId !== input.targetId) return undefined;
+    const { operation } = await createClient(OperationService, scope.transport).getOperation(
+      { operationId: input.operationId }, { signal: scope.signal, timeoutMs: 5_000 }
+    );
+    scope.signal.throwIfAborted();
+    const current = this.#snapshot?.sessions.find(item => item.id === sessionId);
+    if (current?.generation !== generation || current.backendId !== session.backendId
+      || current.targetId !== session.targetId || this.#transport !== scope.transport) return undefined;
+    const mutation = operation?.mutation?.payload;
+    const receipt = operation?.result?.payload;
+    if (operation?.operationId !== input.operationId || operation.state !== OperationState.SUCCEEDED
+      || mutation?.case !== "sendInput" || mutation.value.sessionId !== sessionId
+      || receipt?.case !== "queueItem" || receipt.value.sessionId !== sessionId
+      || receipt.value.sourceId !== input.operationId || receipt.value.queueItemId !== input.queueItemId
+      || receipt.value.runId !== input.runId || receipt.value.backendId !== session.backendId
+      || receipt.value.targetId !== session.targetId) return undefined;
+    const selection = mutation.value.overrides?.model;
+    if (selection === undefined) return { kind: "inherited" };
+    if (!selection.model?.providerId || !selection.model.modelId) return undefined;
+    return { kind: "override", model: {
+      providerId: selection.model.providerId,
+      modelId: selection.model.modelId,
+      effort: selection.effortId || undefined,
+      fastMode: decodeModelSpeed(selection)
+    } };
+  }
+
   async prewarmSession(sessionId: string, provisionalDraftId = "", signal?: AbortSignal, expectedGeneration?: bigint): Promise<void> {
     const generation = expectedGeneration ?? this.#snapshot?.sessions.find(session => session.id === sessionId)?.generation;
     if (generation === undefined || generation < 1n) return;
@@ -13656,10 +13688,16 @@ function projectTimelineEvent(
     case "recoverableError":
     case "terminalError": {
       const error = kind.value.error;
+      const identity = event.identity;
+      const failedInput = kind.case === "terminalError" && identity?.runId && identity.queueItemId && identity.operationId
+        ? { backendId: identity.backendId, targetId: identity.targetId, runId: identity.runId,
+          queueItemId: identity.queueItemId, operationId: identity.operationId }
+        : undefined;
       if (kind.case === "terminalError") endAssistantStreams();
       replaceOrAppend({
         id: event.eventId,
-        ...(event.identity?.runId ? { runId: event.identity.runId } : {}),
+        ...(identity?.runId ? { runId: identity.runId } : {}),
+        ...(failedInput === undefined ? {} : { failedInput }),
         ...(kind.case === "terminalError" ? { runTerminal: "failed" as const } : {}),
         sequence,
         kind: "error",

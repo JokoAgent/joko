@@ -86,6 +86,7 @@ import {
   providerAccountUsageResetAt,
   stageUsageLimitScheduleIntent,
   usageLimitRecoveryHint,
+  type FailedInputModel,
   type UsageLimitRecoveryHint
 } from "../usage-limit-recovery.js";
 import { SessionHeaderActionsMenu } from "./SessionHeaderActionsMenu.js";
@@ -764,6 +765,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       ? undefined
       : resolveErrorTail(session.id, recoveryPresentationTimeline, queue, running, errorTailLocalProjection.read(candidate.localKey), session.attention);
   }, [errorTailRevision, queue, recoveryPresentationTimeline, running, session.attention, session.id]);
+  const errorTailRef = useRef(errorTailProjection);
+  errorTailRef.current = errorTailProjection;
   const visibleTimeline = useMemo(
     () => recoveryPresentationTimeline.filter((item) => !hidesFromTimelineHistory(item) && !(errorTailProjection?.hideFromTimeline === true && item.id === errorTailProjection.item.id)),
     [errorTailProjection, recoveryPresentationTimeline]
@@ -942,14 +945,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const errorTailActions = errorTailProjection?.bannerVisible === true && errorTailProjection.item.error !== undefined
     ? executableRecoveryActions(errorTailProjection.item.error, recoveryContext)
     : [];
-  const accountUsageResetAt = providerGroupUsage ? providerGroupUsage.resetAt : providerAccountUsageResetAt(
-    controller.state.snapshot.providers,
-    session.model?.providerId,
-    Date.now(),
-    { backendId: session.backendId, modelId: session.model?.modelId }
-  );
   const errorTailUsageLimitRecovery = errorTailProjection?.bannerVisible === true && errorTailProjection.item.error !== undefined
-    ? usageLimitRecoveryHint(errorTailProjection.item.error, Date.now(), accountUsageResetAt)
+    ? usageLimitRecoveryHint(errorTailProjection.item.error)
     : null;
   const stopAllBackgroundTasks = (): void => {
     if (!canStopBackgroundTasks || backgroundStopping || backgroundTaskIds.length === 0) return;
@@ -1356,10 +1353,38 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   };
 
   const scheduleUsageLimitRecovery = (hint: UsageLimitRecoveryHint): void => {
-    if (errorTailProjection?.bannerVisible !== true || reviewReadOnly) return;
-    stageUsageLimitScheduleIntent(session.id, hint);
-    controller.navigate({ kind: "schedules" });
-    void controller.setNavigationOpen(true);
+    const tail = errorTailProjection;
+    if (tail?.bannerVisible !== true || guest || reviewReadOnly) return;
+    const error = tail.item.error;
+    if (error === undefined) return;
+    const openDraft = (selection: FailedInputModel | undefined): void => {
+      const current = controllerRef.current;
+      const useTaskModel = selection?.kind === "inherited";
+      const model = selection?.kind === "override" ? selection.model : undefined;
+      const providerId = model?.providerId ?? (useTaskModel ? session.model?.providerId : undefined);
+      const modelId = model?.modelId ?? (useTaskModel ? session.model?.modelId : undefined);
+      const now = Date.now();
+      const accountReset = useTaskModel && providerGroupUsage !== undefined ? providerGroupUsage.resetAt
+        : providerAccountUsageResetAt(current.state.snapshot.providers, providerId, now, { backendId: session.backendId, modelId });
+      const recovery = usageLimitRecoveryHint(error, now, accountReset) ?? hint;
+      stageUsageLimitScheduleIntent(session.id, { ...recovery, model: useTaskModel ? undefined : model ?? null });
+      current.navigate({ kind: "schedules" });
+      void current.setNavigationOpen(true);
+    };
+    const input = tail.item.failedInput;
+    const read = controller.readFailedInputModel;
+    if (input === undefined || read === undefined) {
+      openDraft(tail.item.runId === undefined || providerGroupUsage !== undefined ? { kind: "inherited" } : undefined);
+      return;
+    }
+    const source = beginDerivedTaskAction(capturePaneMessageAction(true));
+    if (!source.isCurrent()) return;
+    runAction(`schedule-recovery:${input.runId}`, async () => {
+      const selection = await read(session.id, session.generation, input).catch(() => undefined);
+      const latest = errorTailRef.current;
+      if (!source.isCurrent() || latest?.bannerVisible !== true || latest.localKey !== tail.localKey) return;
+      openDraft(selection);
+    });
   };
 
   const setCompactConfirmation = (value: typeof compactConfirmation): void => {
@@ -2698,11 +2723,11 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       {errorTailProjection?.bannerVisible === true && <ErrorTailBanner
         item={errorTailProjection.item}
         actions={errorTailActions}
-        usageLimitRecovery={reviewReadOnly ? undefined : errorTailUsageLimitRecovery ?? undefined}
+        usageLimitRecovery={guest || reviewReadOnly ? undefined : errorTailUsageLimitRecovery ?? undefined}
         actionFailure={errorTailActionFailure?.localKey === errorTailProjection.localKey ? errorTailActionFailure.message : undefined}
         t={t}
         onAction={handleErrorTailAction}
-        onScheduleUsageRecovery={reviewReadOnly ? undefined : scheduleUsageLimitRecovery}
+        onScheduleUsageRecovery={guest || reviewReadOnly ? undefined : scheduleUsageLimitRecovery}
         onDismiss={canAcknowledgeSessionAttention ? handleErrorTailDismiss : undefined}
       />}
       {currentCompactFeedback !== undefined && !(currentCompactFeedback.phase === "busy" && activeCompaction !== undefined) && <CompactActionFeedback

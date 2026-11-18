@@ -3491,6 +3491,7 @@ export function useAppController(): AppController {
       listArtifactReferenceCatalog: async (...args: Parameters<OperationApi["listArtifactReferenceCatalog"]>) => original().listArtifactReferenceCatalog(...args),
       readSessionArtifact: async (...args: Parameters<OperationApi["readSessionArtifact"]>) => original().readSessionArtifact(...args),
       send: async (...args: Parameters<OperationApi["send"]>) => original().send(...args),
+      readFailedInputModel: (...args: Parameters<NonNullable<OperationApi["readFailedInputModel"]>>) => original().readFailedInputModel!(...args),
       confirmMessageEdit: async (...args: Parameters<OperationApi["confirmMessageEdit"]>) => original().confirmMessageEdit(...args),
       sendRichAnswer: async (...args: Parameters<OperationApi["sendRichAnswer"]>) => original().sendRichAnswer(...args),
       createTarget: async (...args: Parameters<OperationApi["createTarget"]>) => original().createTarget(...args),
