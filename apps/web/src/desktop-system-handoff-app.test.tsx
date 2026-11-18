@@ -1090,6 +1090,49 @@ describe("Desktop system handoff App boundary", () => {
     await fixture.dispose();
   });
 
+  it("keeps a task notification pending across renderer recovery until its original timeline is mounted and ready", async () => {
+    const route = { kind: "session", sessionId: "task-b", profileId: "profile-a", serverId: "server-a" } as const;
+    const task = session(route.sessionId);
+    const starting = connectedState({ route: { kind: "settings" } });
+    const disconnected: ControllerState = { ...starting, connectionState: "disconnected", activeProfile: undefined };
+    const firstDelivery = delivery(15, route);
+    const reopenedDelivery = { ...firstDelivery, documentOccurrence: "reopened-document", deliveryOccurrence: 16 };
+    const acknowledge = vi.fn(async () => true);
+    const navigate = vi.fn<AppController["navigate"]>((_route, options) => {
+      if (options?.exactHash !== undefined) window.history.replaceState(null, "", options.exactHash);
+    });
+    let onNavigate: ((value: JokoDesktopDeepLinkDelivery) => void) | undefined;
+    const api = desktopDeepLinkApi(listener => { onNavigate = listener; }, acknowledge);
+    Object.defineProperty(window, "jokoDesktop", { configurable: true, value: api });
+    const first = renderApp(disconnected, { navigate });
+    await first.render();
+    await act(async () => onNavigate?.(firstDelivery));
+    expect(navigate).toHaveBeenCalledWith(route, expect.objectContaining({ exactHash: "#/tasks/task-b?profile=profile-a&server=server-a" }));
+    await first.render({ ...disconnected, route, navigationRevision: 1 });
+    expect(acknowledge).not.toHaveBeenCalled();
+    expect(first.container.querySelector('.timeline[data-timeline-session-id="task-b"]')).toBeNull();
+    await first.dispose();
+
+    window.history.replaceState(null, "", "/");
+    Object.defineProperty(window, "jokoDesktop", { configurable: true, value: {
+      ...api, deepLinks: { ...api.deepLinks, takePending: vi.fn(async () => reopenedDelivery) }
+    } });
+    const history = deferred<Awaited<ReturnType<AppController["loadSessionTimelinePage"]>>>();
+    const loadSessionTimelinePage = vi.fn<AppController["loadSessionTimelinePage"]>(() => history.promise);
+    const reopened = renderApp(disconnected, { navigate, loadSessionTimelinePage });
+    await reopened.render();
+    await vi.waitFor(() => expect(navigate).toHaveBeenCalledTimes(2));
+    const connected = connectedState({ route, sessions: [task] });
+    await reopened.render({ ...connected, navigationRevision: 1 });
+    expect(loadSessionTimelinePage).toHaveBeenCalledWith(task.id, undefined, 240);
+    expect(acknowledge).not.toHaveBeenCalled();
+    const text = "Recovered notification task body";
+    await act(async () => history.resolve({ items: [timelineItem(text)] }));
+    expect(reopened.container.querySelector('.timeline[data-timeline-session-id="task-b"]')?.textContent).toContain(text);
+    expect(acknowledge).toHaveBeenCalledExactlyOnceWith({ documentOccurrence: "reopened-document", deliveryOccurrence: 16 });
+    await reopened.dispose();
+  });
+
   it("keeps the newest delivery and sends notifications with an exact machine route", async () => {
     let navigateListener: ((delivery: JokoDesktopDeepLinkDelivery) => void) | undefined;
     const pending = deferred<JokoDesktopDeepLinkDelivery | undefined>();
