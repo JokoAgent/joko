@@ -887,6 +887,18 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     if (sessionId !== undefined) return sessionForTaskRoute(state, sessionId);
     return [...state.snapshot.sessions].filter((session) => !session.archived && !session.hidden).sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt - a.updatedAt)[0];
   }, [state]);
+  const filesChatScope = state.route.kind === "files" && activeSession !== undefined && state.activeProfile !== undefined
+    ? JSON.stringify([state.activeProfile.serverId, state.activeProfile.id, state.connectionGeneration,
+      state.snapshot.generation.toString(), activeSession.id, activeSession.generation.toString()]) : undefined;
+  const visibleFilesChatRef = useRef<string | undefined>(undefined);
+  const [visibleFilesChat, setVisibleFilesChat] = useState<string>();
+  const onFilesChatVisibilityChange = useCallback((visible: boolean): void => {
+    if (filesChatScope === undefined) return;
+    if (visible) visibleFilesChatRef.current = filesChatScope;
+    else if (visibleFilesChatRef.current === filesChatScope) visibleFilesChatRef.current = undefined;
+    setVisibleFilesChat(visibleFilesChatRef.current);
+  }, [filesChatScope]);
+  const activeChatExposed = state.route.kind !== "files" || (filesChatScope !== undefined && visibleFilesChat === filesChatScope);
   const backgroundTaskRoute = state.route.kind === "session" && state.route.backgroundExtensionId !== undefined;
   const directedBackgroundTask = backgroundTaskRoute && activeSession?.hidden === true;
   const backgroundTaskPending = backgroundTaskRoute && state.route.kind === "session"
@@ -942,8 +954,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     if (state.route.kind === "session" && sessionSplitLayout.root !== undefined && activeSession?.archived !== true && !directedBackgroundTask) {
       return Object.freeze(sessionSplitPanes(sessionSplitLayout.root).map((pane) => pane.sessionId));
     }
-    return Object.freeze(activeSession === undefined ? [] : [activeSession.id]);
-  }, [activeSession, directedBackgroundTask, sessionSplitLayout.root, state.route.kind]);
+    return Object.freeze(activeSession === undefined || !activeChatExposed ? [] : [activeSession.id]);
+  }, [activeChatExposed, activeSession, directedBackgroundTask, sessionSplitLayout.root, state.route.kind]);
   const sidebarSnapshot = useMemo(() => {
     const sessions = applySessionProjectOverrides(state.snapshot.sessions, sessionProjectOverrides);
     return sessions === state.snapshot.sessions ? state.snapshot : { ...state.snapshot, sessions };
@@ -1145,6 +1157,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const documentForeground = useDocumentForeground();
   const attentionThroughCursor = activeSession !== undefined
     && state.connectionState === "connected"
+    && activeChatExposed
     && activeBackend?.capabilities.get("session.attention")?.supported === true
     ? viewerAttentionCursorWhenHistoryReady(activeSession, state.snapshot.generation, timelineHistory, documentForeground)
     : undefined;
@@ -1167,7 +1180,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       window.clearTimeout(pendingRetry.timer);
       attentionAckRetryTimerRef.current = undefined;
     }
-    if (activeSession === undefined || attentionThroughCursor === undefined || key === undefined) return;
+    if (activeSession === undefined || attentionThroughCursor === undefined || key === undefined
+      || (filesChatScope !== undefined && visibleFilesChatRef.current !== filesChatScope)) return;
     if (acknowledgedAttentionRef.current.has(key)) return;
     if (!attentionAckRetryTrackerRef.current.begin(key)) return;
     acknowledgedAttentionRef.current.add(key);
@@ -1198,7 +1212,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     activeAttentionAckKey,
     activeSession,
     attentionAckRetryRevision,
-    attentionThroughCursor
+    attentionThroughCursor,
+    filesChatScope
   ]);
   useEffect(() => () => {
     const retry = attentionAckRetryTimerRef.current;
@@ -2630,6 +2645,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             sessions={state.snapshot.sessions}
             banners={shellOverlays}
             chatPane={renderActiveSessionPane(true)}
+            onChatPaneVisibilityChange={onFilesChatVisibilityChange}
             t={t}
             onError={setActionError}
             onArchiveSession={requestArchiveSession}

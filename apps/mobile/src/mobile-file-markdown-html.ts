@@ -60,7 +60,10 @@ export function buildMobileFileMarkdownHtml(input: {
       blockquote{border-left:3px solid ${c.accent};padding-left:12px;color:${c.muted}}a{color:${c.accent};text-decoration:underline}
       code,pre{font:13px/20px ui-monospace,Menlo,monospace}pre{background:${c.surface};border:1px solid ${c.border};border-radius:8px;padding:12px;white-space:pre;overflow-x:auto}
       code{background:${c.surface}}.syntax-keyword,.syntax-number,.syntax-literal{color:${c.accent}}.syntax-comment,.syntax-meta{color:${c.muted}}
-      .list-row{display:flex;gap:8px}.list-marker{min-width:24px}.table-scroll{overflow-x:auto}table{border-collapse:collapse}th,td{min-width:112px;border:1px solid ${c.border};padding:8px;text-align:left}th{background:${c.surface}}
+      .list-row{display:flex;gap:8px}.list-marker{min-width:24px}
+      .table-scroll{overflow-x:auto}table{width:100%;table-layout:fixed;border-collapse:collapse}
+      th,td{min-width:0;overflow-wrap:anywhere;word-break:break-word;border:1px solid ${c.border};padding:8px;text-align:left;vertical-align:top}th{background:${c.surface}}
+      [data-display] .katex-display{overflow-x:auto;overflow-y:hidden}table [data-latex]{display:inline-block;max-width:100%;overflow-x:auto;vertical-align:middle}
       img{max-width:100%;height:auto}.image-fallback{color:${c.muted}}.line-focus{animation:line-flash .7s ease-out 2}@keyframes line-flash{from{background:${c.surface}}to{background:transparent}}
       @media(prefers-reduced-motion:reduce){.line-focus{animation:none;outline:1px solid ${c.accent}}}${hasMath ? runtime.katexCss : ""}</style></head><body><main role="article" aria-label="${escapeHtml(input.label)}">`
     + markup + '</main><script>(function(){'

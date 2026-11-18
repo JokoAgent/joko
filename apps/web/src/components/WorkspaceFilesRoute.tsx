@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -90,6 +91,7 @@ export interface WorkspaceFilesRouteProps {
   readonly sessions: readonly SessionView[];
   readonly banners?: ReactNode;
   readonly chatPane: ReactNode;
+  readonly onChatPaneVisibilityChange?: (visible: boolean) => void;
   readonly t: Translator;
   readonly onError: (message: string) => void;
   readonly onArchiveSession: (session: SessionView, onArchived?: () => void) => void;
@@ -154,6 +156,7 @@ export function WorkspaceFilesRoute({
   sessions,
   banners,
   chatPane,
+  onChatPaneVisibilityChange,
   t,
   onError,
   onArchiveSession,
@@ -181,6 +184,11 @@ export function WorkspaceFilesRoute({
     readWorkspaceChatRailCollapsed(browserStorage()),
     browserMatches(WORKSPACE_FILES_COMPACT_MEDIA_QUERY)
   ));
+  const chatPaneVisible = !railCollapsed && chatPane !== undefined && chatPane !== null;
+  useLayoutEffect(() => {
+    onChatPaneVisibilityChange?.(chatPaneVisible);
+    return () => onChatPaneVisibilityChange?.(false);
+  }, [chatPaneVisible, onChatPaneVisibilityChange]);
   const [railDrag, setRailDrag] = useState<RailDragState>();
   const railDragRef = useRef<RailDragState | undefined>(undefined);
   const rememberNavigationReturnFocus = useCallback((): void => {
