@@ -623,6 +623,43 @@ describe("CodexBackendAdapter", () => {
     expect(setup.fake.transport!.requests.filter(request => request.method === "turn/start")).toHaveLength(scenarios.length);
   });
 
+  it("dispatches an ordinary owner's leading Skill by the exact loaded mount and preserves the arguments", async () => {
+    const setup = await createSkillInputSetup();
+    const assertNativeSkillInvocationCurrent = vi.fn();
+    await setup.adapter.send(prompt(" /native-report  review src\nsecond line "), { ...setup.active, assertNativeSkillInvocationCurrent });
+    const request = setup.fake.transport!.requests.find(value => value.method === "turn/start")!;
+    expect(request.params).toMatchObject({ input: [
+      { type: "skill", name: "native-report", path: setup.mountedPath },
+      { type: "text", text: "review src\nsecond line", text_elements: [] }
+    ] });
+    expect(request.options.beforeDispatchAsync).toBeTypeOf("function");
+    expect(assertNativeSkillInvocationCurrent).toHaveBeenCalled();
+  });
+
+  it("keeps ambiguous native short names literal and rechecks the owner at native write", async () => {
+    const setup = await createSkillInputSetup();
+    const transport = setup.fake.transport!;
+    const token = "/native-report review src";
+    setup.fake.reviewSkills.push({ path: join(setup.source, "SKILL.md"), name: "native-report", enabled: true });
+    let ownsInput = true;
+    const active = { ...setup.active, assertNativeSkillInvocationCurrent: () => {
+      if (!ownsInput) throw new Error("The queue owner no longer owns the Skill command.");
+    } };
+    await setup.adapter.send(prompt(token), active);
+    expect(transport.requests.find(value => value.method === "turn/start")?.params).toMatchObject({
+      input: [{ type: "text", text: token, text_elements: [] }]
+    });
+    await setup.fake.completeTurn(setup.active.binding!.nativeSessionId!);
+    setup.fake.reviewSkills.pop();
+    const request = transport.request.bind(transport);
+    transport.request = async (method, params, options) => {
+      if (method === "turn/start" && options?.beforeDispatchAsync !== undefined) ownsInput = false;
+      return request(method, params, options);
+    };
+    await expect(setup.adapter.send(prompt(token), { ...active, operationId: "retired-short-skill-owner" })).rejects.toBeDefined();
+    expect(transport.requests.filter(value => value.method === "turn/start")).toHaveLength(1);
+  });
+
   it("dispatches an approved Skill with its exact loaded native name and file path for start and steer", async () => {
     const setup = await createSkillInputSetup();
     const authority = vi.fn();

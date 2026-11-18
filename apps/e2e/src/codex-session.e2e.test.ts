@@ -1,6 +1,7 @@
-import { randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
-import { resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 import { create, fromBinary } from "@bufbuild/protobuf";
 import { createCodexAdapter, AppServerHost } from "@joko/adapter-codex";
@@ -18,6 +19,56 @@ import {
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
   ? it : it.skip;
+
+it("routes a plain Owner Skill command through Connect to a typed native turn", async () => {
+  const backendId = "codex-native-skill";
+  const native = new FakeCodexAppServer();
+  const host = new AppServerHost({ transportFactory: () => native.createTransport() });
+  const sourcePath = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-short-skill-")));
+  const content = "---\nname: repo-audit\ndescription: Review changes\n---\nInspect the specified source files.\n";
+  const revision = `sha256:${createHash("sha256").update(`D\0\0F\0SKILL.md\0${Buffer.byteLength(content)}\0`).update(content).digest("hex")}`;
+  let fixture: OrchestratorE2eFixture | undefined;
+  try {
+    await writeFile(join(sourcePath, "SKILL.md"), content, "utf8");
+    fixture = await OrchestratorE2eFixture.start({ backendFactories: [{
+      instanceId: backendId, adapterKind: "codex", displayName: "Codex Skill command fixture",
+      create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host,
+        resolveNativeSkills: async () => [{ sourcePath, resource: { id: "approved-repo-skill", kind: "skill", name: "Repo audit",
+          source: "managed", state: "approved", revision, resourceVersion: 1n }, assertCurrent: () => undefined }]
+      })
+    }] });
+    const { clients, connectionId } = await fixture.pair("Codex Skill command Owner");
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId,
+      createSessionMutation({ backendId, targetId: fixture.targetId(backendId) })));
+    const binding = fixture.application.store.getSession(sessionId).descriptor.binding;
+    const requests = native.transport!.requests;
+    const start = requests.find(request => request.method === "thread/start")?.params as {
+      readonly config?: { readonly "skills.config"?: readonly { readonly path: string; readonly enabled: boolean }[] };
+    } | undefined;
+    const mount = start?.config?.["skills.config"]?.find(entry => entry.enabled);
+    if (mount === undefined) throw new Error("The native thread did not receive the approved Skill mount.");
+    expect(mount.path).not.toBe(join(sourcePath, "SKILL.md"));
+    native.reviewSkills.push({ path: mount.path, name: "repo-audit", description: "Review changes", enabled: true });
+    expect((await clients.session.listRuntimeCommands({ sessionId })).commands).toContainEqual(expect.objectContaining({
+      name: "repo-audit", resourceId: "approved-repo-skill", loaded: true
+    }));
+    const text = "/repo-audit review src";
+    const runId = queueRunIdFrom(await submit(clients.operation, connectionId, sendInputMutation(sessionId, BigInt(binding.generation), text)));
+    await waitFor(() => clients.run.getRun({ runId }), value => value.run?.state === RunState.RUNNING, "typed Codex Skill turn");
+    expect(requests.filter(request => request.method === "turn/start")).toEqual([
+      expect.objectContaining({ params: expect.objectContaining({ threadId: binding.nativeSessionId, input: [
+        { type: "skill", name: "repo-audit", path: mount.path }, { type: "text", text: "review src", text_elements: [] }
+      ] }) })
+    ]);
+    expect(fixture.application.store.findQueueItemByRunId(sessionId, runId)?.body).toMatchObject({ text, mentions: [] });
+    await native.completeTurn(binding.nativeSessionId!, "Inspected src.");
+    await waitFor(() => clients.run.getRun({ runId }), value => value.run?.state === RunState.SUCCEEDED, "original Codex Skill turn settlement");
+  } finally {
+    await fixture?.close();
+    await host.shutdown();
+    await rm(sourcePath, { recursive: true, force: true });
+  }
+});
 
 it("stops the original Codex Run before the first native turn write and leaves the queue paused", async () => {
   const backendId = "codex-pre-dispatch-stop";

@@ -15086,12 +15086,20 @@ export class SessionHost {
           const tracksNativeTurnDispatch = !reviewReadOnly && target.remoteWorkspace === undefined && item.disposition === "prompt"
             && run.descriptor.source === "user" && run.descriptor.parentRunId === undefined
             && this.#store.getBackend(stored.descriptor.backendId).descriptor.adapterKind === "codex";
+          const allowsNativeSkillInvocation = tracksNativeTurnDispatch && target.trusted && partnerPolicy === undefined
+            && item.body.text.trimStart().startsWith("/") && item.body.images.length === 0 && item.body.files.length === 0
+            && item.body.mentions.length === 0 && item.body.automaticContinuation === undefined && item.body.objectiveContinuation === undefined
+            && new TaskShareStore(this.#store).getAuthorForOperation(item.operationId)?.sessionId !== sessionId;
           let baseContext: AdapterContext = {
             ...turnContext,
             ...(tracksNativeTurnDispatch ? {
               signal: AbortSignal.any([turnContext.signal, dispatchPreparation.cancellation.signal]),
               onNativeTurnDispatch: () => { dispatchPreparation.nativeTurnDispatched = true; }
             } : {}),
+            ...(allowsNativeSkillInvocation ? { assertNativeSkillInvocationCurrent: () => {
+              this.assertDispatchAdmissionOwner(item, attemptId, active, stored.descriptor.binding.generation, partnerPolicy);
+              this.assertQueueProviderAuthentication(this.#store.getQueueItem(item.id), this.#store.getSession(sessionId));
+            } } : {}),
             inputQueueItemId: item.id,
             ...(attemptId === undefined ? {} : { inputAttemptId: attemptId })
           };

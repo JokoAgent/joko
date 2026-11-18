@@ -108,6 +108,8 @@ export interface AdapterContext {
   readonly assertResourceMentionCurrent?: (
     mention: Extract<PromptInput["mentions"][number], { readonly kind: "resource" }>
   ) => void;
+  /** Private Queue authority to resolve a typed native Skill invocation for an ordinary owner input. */
+  readonly assertNativeSkillInvocationCurrent?: () => void;
   readonly signal: AbortSignal;
   readonly capturePartnerLearningTurn?: (input: {
     readonly nativeOccurrence: string;

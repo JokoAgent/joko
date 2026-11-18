@@ -6,6 +6,14 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { AdapterContext, RuntimeResource } from "./adapter.js";
 import { JokoError } from "./errors.js";
 
+const productSlashCommands = new Set([
+  "clear", "cmd", "goal", "help", "joko-make", "joko-make-doctor", "jump-session", "learn", "review", "side"
+]);
+
+export function isProductSlashCommand(name: string): boolean {
+  return productSlashCommands.has(name.toLowerCase());
+}
+
 /** Private service authority, never a wire resource or a model prompt. */
 export interface ApprovedSkillSeed {
   readonly resource: RuntimeResource & { readonly kind: "skill"; readonly revision: string; readonly resourceVersion: bigint };

@@ -15,6 +15,7 @@ import {
   evaluateOrderedPolicyRules,
   NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
   NATIVE_PROMPT_IMAGE_MEDIA_TYPES,
+  isProductSlashCommand,
   redactSecrets,
   snapshotNativeSkills,
   nativeTextInferenceImages,
@@ -7291,11 +7292,6 @@ const EMPTY_PI_COMMAND_CATALOG: PiCommandCatalog = {
   managedInternalNames: new Set<string>()
 };
 
-// App-owned short invocations keep their meaning even when a Skill has that name.
-const APP_COMMAND_NAMES = new Set([
-  "clear", "cmd", "goal", "help", "joko-make", "joko-make-doctor", "jump-session", "learn", "review", "side"
-]);
-
 function isManagedInternalCommand(command: PiRpcCommandDescriptor, bridgePath: string, subagentPath: string): boolean {
   const invocationBase = command.name.replace(/:\d+$/u, "");
   const sourcePath = command.sourceInfo?.path;
@@ -7366,7 +7362,7 @@ export function resolvePiComposerSlashCommand(
     candidate.name.replace(/^\//u, "") === requested
   );
   if (matchingCommands.length === 0 && text.startsWith(`/${requested}`)
-    && !requested.includes(":") && !APP_COMMAND_NAMES.has(requested.toLowerCase())) {
+    && !requested.includes(":") && !isProductSlashCommand(requested)) {
     const invocation = `skill:${requested}`;
     const aliases = commands.filter((candidate) => candidate.loaded && candidate.name === invocation);
     const skill = aliases[0];

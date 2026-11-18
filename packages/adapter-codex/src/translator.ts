@@ -53,6 +53,7 @@ export interface CodexInputResolvers {
   readonly resolveFile?: (blob: BlobRef, context: AdapterContext) => Promise<string>;
   readonly resolveArtifactMention?: ArtifactMentionResolver;
   readonly resolveSkillMention?: (mention: Extract<PromptInput["mentions"][number], { readonly kind: "resource" }>, context: AdapterContext) => Promise<ResolvedCodexSkill>;
+  readonly resolveLeadingSkill?: (name: string) => Promise<ResolvedCodexSkill | undefined>;
   readonly maximumBlobBytes?: number;
   readonly maximumAggregateBlobBytes?: number;
   readonly maximumFileBytes?: number;
@@ -184,6 +185,24 @@ export async function translatePromptInput(
   );
   const mentionAuthorities: Array<() => void> = [];
   const mentionFileProofs: Array<(signal: AbortSignal) => Promise<void>> = [];
+  const appendSkill = (resolved: ResolvedCodexSkill, assertCurrent: () => void): void => {
+    if (resolved.name.trim().length === 0 || resolved.name.length > 256 || /[\u0000-\u001f\u007f]/u.test(resolved.name)
+      || !isAbsolute(resolved.path) || resolved.path.length > 4_096 || /[\u0000-\u001f\u007f]/u.test(resolved.path)) {
+      throw unsupportedMention();
+    }
+    assertCurrent();
+    mentionAuthorities.push(assertCurrent);
+    mentionFileProofs.push(resolved.assertFilesCurrent);
+    result.push({ type: "skill", name: resolved.name, path: resolved.path });
+  };
+  const leadingSkill = resolvers.resolveLeadingSkill && leadingCommand && input.disposition === "prompt"
+    && input.images.length === 0 && input.files.length === 0 && input.mentions.length === 0
+    && (input.pastedTextRanges?.length ?? 0) === 0
+    ? await resolvers.resolveLeadingSkill(leadingCommand[2]!.slice(1)) : undefined;
+  if (leadingSkill && leadingCommand) {
+    appendSkill(leadingSkill, leadingSkill.assertCurrent);
+    promptText = input.text.slice(leadingCommand[0].length).trim() || leadingSkill.defaultPrompt?.trim() || "";
+  }
   for (const image of input.images) {
     if (!Number.isSafeInteger(image.blob.byteLength) || image.blob.byteLength < 0) {
       throw adapterError({
@@ -271,18 +290,10 @@ export async function translatePromptInput(
     if (mention.kind === "resource") {
       context.assertResourceMentionCurrent!(mention);
       const resolved = await resolvers.resolveSkillMention!(mention, context);
-      if (resolved.name.trim().length === 0 || resolved.name.length > 256 || /[\u0000-\u001f\u007f]/u.test(resolved.name)
-        || !isAbsolute(resolved.path) || resolved.path.length > 4_096 || /[\u0000-\u001f\u007f]/u.test(resolved.path)) {
-        throw unsupportedMention();
-      }
-      const assertSkillCurrent = (): void => {
+      appendSkill(resolved, () => {
         context.assertResourceMentionCurrent!(mention);
         resolved.assertCurrent();
-      };
-      assertSkillCurrent();
-      mentionAuthorities.push(assertSkillCurrent);
-      mentionFileProofs.push(resolved.assertFilesCurrent);
-      result.push({ type: "skill", name: resolved.name, path: resolved.path });
+      });
       if (leadingRange?.mentionIndex === mentionIndex) {
         promptText = input.text.slice(leadingRange.end).trim() || resolved.defaultPrompt?.trim() || "";
       }
@@ -341,7 +352,11 @@ export async function translatePromptInput(
     });
   }
   // Approved Skills use their exact native Skill input; file references remain text.
-  if (combinedText.length > 0) result.unshift({ type: "text", text: combinedText, text_elements: [] });
+  if (combinedText.length > 0) {
+    const textInput = { type: "text" as const, text: combinedText, text_elements: [] };
+    if (leadingSkill) result.push(textInput);
+    else result.unshift(textInput);
+  }
   if (result.length === 0) {
     throw adapterError({
       code: "CODEX_PROMPT_EMPTY",
