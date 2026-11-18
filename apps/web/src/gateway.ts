@@ -1161,6 +1161,12 @@ interface MessageDeletionProjection {
   coveredCursor?: bigint;
 }
 
+interface ProviderAccountUsageRead {
+  readonly authority: string;
+  pending?: symbol;
+  sample?: { readonly sequence: number; readonly value: NonNullable<ProviderDescriptor["accountUsage"]> };
+}
+
 interface GatewayActionScope {
   readonly transport: Transport;
   readonly authKey: string;
@@ -1224,6 +1230,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   #eventRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   #eventRefreshQueued = false;
   readonly #messageDeletionProjections = new Map<string, MessageDeletionProjection>();
+  readonly #providerAccountUsageReads = new Map<string, ProviderAccountUsageRead>();
+  #providerAccountUsageSequence = 0;
   readonly #artifactUrls = new Map<string, ArtifactUrlLease>();
   readonly #workspaceTextPreviews = new WorkspaceTextPreviewCache();
   readonly #portableImportDrafts = new Map<string, { readonly expiresAt: number; readonly cancel: () => Promise<void>; readonly release: () => void }>();
@@ -1523,6 +1531,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }
     this.#eventRefreshQueued = false;
     this.#messageDeletionProjections.clear();
+    this.#providerAccountUsageReads.clear();
     this.#transport = undefined;
     this.#streamTask = undefined;
     for (const lease of this.#artifactUrls.values()) if (lease.url !== undefined) URL.revokeObjectURL(lease.url);
@@ -1557,12 +1566,40 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (normalizedProviderId.length === 0 || normalizedProviderId.length > 256 || /[\u0000-\u001f\u007f]/u.test(normalizedProviderId)) {
       throw new GatewayError("Provider ID is invalid.");
     }
-    const client = createClient(BackendService, this.requireTransport());
-    await client.getProviderUsage(
-      { backendId: normalizedBackendId, providerId: normalizedProviderId },
-      this.#abort === undefined ? undefined : { signal: this.#abort.signal }
-    );
-    await this.refresh();
+    const scope = this.captureActionScope();
+    const key = providerKey(normalizedBackendId, normalizedProviderId);
+    const providerIn = (raw: Snapshot | undefined) => raw?.providers.find(provider => providerKey(provider.backendId, provider.providerId) === key);
+    const authority = providerAccountUsageAuthority(this.#rawSnapshot, providerIn(this.#rawSnapshot));
+    const previous = this.#providerAccountUsageReads.get(key);
+    const read: ProviderAccountUsageRead | undefined = authority === undefined ? undefined
+      : previous?.authority === authority ? previous : { authority };
+    const request = Symbol();
+    if (read) { read.pending = request; this.#providerAccountUsageReads.set(key, read); }
+    try {
+      const response = await createClient(BackendService, scope.transport).getProviderUsage(
+        { backendId: normalizedBackendId, providerId: normalizedProviderId }, { signal: scope.signal }
+      );
+      scope.signal.throwIfAborted();
+      if (this.#transport !== scope.transport || read && (this.#providerAccountUsageReads.get(key) !== read || read.pending !== request)) return;
+      const raw = this.#rawSnapshot, view = this.#snapshot, provider = providerIn(raw), usage = response.accountUsage;
+      if (!read || !usage) { await this.refresh(); return; }
+      if (!raw || !view || !provider || providerAccountUsageAuthority(raw, provider) !== read.authority) return;
+      if (usage.providerId !== normalizedProviderId) throw new GatewayError("The account usage Provider changed.");
+      if (usage.observedAt && provider.accountUsage?.observedAt && timestampMs(usage.observedAt) < timestampMs(provider.accountUsage.observedAt)) return;
+
+      const updated = { ...provider, accountUsage: usage };
+      const accountUsage = mapProviderRuntime(updated).accountUsage;
+      read.sample = { sequence: ++this.#providerAccountUsageSequence, value: usage };
+      this.#rawSnapshot = { ...raw, providers: raw.providers.map(value => value === provider ? updated : value) };
+      this.#snapshot = { ...view, providers: view.providers.map(value => providerKey(value.backendId, value.id) === key ? { ...value, accountUsage } : value) };
+      this.#callbacks.onSnapshot?.(this.#snapshot);
+      if (this.#liveSnapshotConnected) this.#callbacks.onLiveSnapshot?.(this.#snapshot);
+    } finally {
+      if (read?.pending === request) {
+        read.pending = undefined;
+        if (!read.sample && this.#providerAccountUsageReads.get(key) === read) this.#providerAccountUsageReads.delete(key);
+      }
+    }
   }
 
   async readProviderAccountBalance(backendId: string, providerId: string, forceRefresh: boolean, signal?: AbortSignal): Promise<import("@joko/contracts").ProviderAccountBalanceResult> {
@@ -2200,6 +2237,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const currentDeviceNameSource = this.#taskSharing === undefined ? await this.currentDeviceNameSource(transport, signal) : undefined;
     signal?.throwIfAborted();
     const eventClient = createClient(EventService, transport);
+    const accountUsageSequence = this.#providerAccountUsageSequence;
     const [response, managedModelRuntimes] = this.#taskSharing !== undefined
       ? [{ snapshot: await this.#taskSharing.snapshot(signal) }, []] as const
       : await Promise.all([
@@ -2221,6 +2259,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       && fetchedCursor.sequence < currentCursor.sequence
     ) return;
     const previousRaw = this.#rawSnapshot;
+    raw = this.reconcileProviderAccountUsage(raw, accountUsageSequence);
     const sameGeneration = previousRaw?.generation === raw.generation;
     if (!sameGeneration) this.#inputHandoffs = [];
     const previousSessions = new Map(previousRaw?.sessions.map((session) => [session.sessionId, session.nativeBinding?.runtimeGeneration]));
@@ -2257,6 +2296,34 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     this.#snapshot = mapped;
     this.#callbacks.onSnapshot?.(mapped, true);
     if (this.#liveSnapshotConnected) this.#callbacks.onLiveSnapshot?.(mapped);
+  }
+
+  private reconcileProviderAccountUsage(raw: Snapshot, usageSequenceAtRequest: number): Snapshot {
+    if (!this.#providerAccountUsageReads.size) return raw;
+    const retained = new Set<string>();
+    const providers = raw.providers.map(provider => {
+      const key = providerKey(provider.backendId, provider.providerId);
+      const read = this.#providerAccountUsageReads.get(key);
+      if (!read || providerAccountUsageAuthority(raw, provider) !== read.authority) return provider;
+      const sample = read.sample;
+      if (sample) {
+        const fetched = provider.accountUsage?.observedAt, observed = sample.value.observedAt;
+        const fetchedAt = fetched && timestampMs(fetched), observedAt = observed && timestampMs(observed);
+        const fetchedOlder = fetchedAt !== undefined && observedAt !== undefined && fetchedAt < observedAt;
+        // Owner event cursors and account observations advance independently.
+        const readDuringSnapshot = sample.sequence > usageSequenceAtRequest
+          && (fetchedAt === undefined || observedAt === undefined || fetchedAt === observedAt);
+        if (fetchedOlder || readDuringSnapshot) {
+          retained.add(key);
+          return { ...provider, accountUsage: sample.value };
+        }
+        read.sample = undefined;
+      }
+      if (read.pending) retained.add(key);
+      return provider;
+    });
+    for (const key of this.#providerAccountUsageReads.keys()) if (!retained.has(key)) this.#providerAccountUsageReads.delete(key);
+    return { ...raw, providers };
   }
 
   private async currentDeviceNameSource(transport: Transport, signal?: AbortSignal): Promise<DeviceNameSource | undefined> {
@@ -15956,6 +16023,18 @@ function modelPriceCurrency(currency: ModelPriceCurrency): "USD" | "CNY" {
   if (currency === ModelPriceCurrency.USD) return "USD";
   if (currency === ModelPriceCurrency.CNY) return "CNY";
   throw new GatewayError("Orchestrator returned an unsupported model-price currency.");
+}
+
+function providerAccountUsageAuthority(snapshot: Snapshot | undefined, provider: ProviderDescriptor | undefined): string | undefined {
+  if (!snapshot || !provider || provider.authenticationState === AuthenticationState.SIGNED_OUT
+    || provider.authenticationState === AuthenticationState.PENDING || !provider.capabilities?.capabilities.some(capability =>
+    capability.name === capabilityNames.providerAccountUsage && capability.support === CapabilitySupport.SUPPORTED)) return undefined;
+  const backend = snapshot.backends.find(value => value.backendId === provider.backendId);
+  if (!backend) return undefined;
+  return JSON.stringify([snapshot.generation.toString(), backend.entityVersion?.generation?.toString(),
+    backend.entityVersion?.revision?.value.toString(), backend.authenticationState,
+    provider.version?.generation?.toString(), provider.version?.revision?.value.toString(), provider.authenticationState,
+    provider.accountBalanceRevision, provider.endpointDisplay]);
 }
 
 function mapProviderRuntime(provider: ProviderDescriptor, routingEnabled = true): ProviderRuntimeView {
