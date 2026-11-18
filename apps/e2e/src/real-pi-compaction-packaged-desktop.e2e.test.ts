@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { type Server } from "node:http";
 import { type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -296,11 +296,37 @@ describe("packaged Desktop Pi compaction", () => {
     const main = await launchConnectedDesktop(fixture, "Packaged export Desktop");
     const application = desktop!;
     const taskRow = main.locator(`.sidebar [data-session-id="${sessionId}"]`).first();
+    const timeline = `.timeline[data-timeline-session-id="${sessionId}"]`;
+    await taskRow.click();
+    await main.locator(timeline).getByText(prompt, { exact: true }).waitFor({ state: "visible" });
+    const existingWindows = new Set(application.windows());
     await taskRow.click({ button: "right" });
-    const [page] = await Promise.all([
-      application.waitForEvent("window", { timeout: 30_000 }),
-      main.getByRole("menuitem", { name: "Open in new window", exact: true }).click({ noWaitAfter: true })
-    ]);
+    await main.getByRole("menuitem", { name: "Open in new window", exact: true }).click({ noWaitAfter: true });
+    const page = await waitFor(async () => application.windows().find((candidate) => {
+      const url = URL.canParse(candidate.url()) ? new URL(candidate.url()) : undefined;
+      return !existingWindows.has(candidate) && url?.searchParams.get("bootSession") === sessionId;
+    }), (candidate) => candidate !== undefined, "the original packaged task window", 30_000);
+    if (page === undefined) throw new Error("The separate task window did not use the selected task identity.");
+    const pageErrors = observePageErrors(page);
+    const sent: Request[] = [];
+    page.on("request", (request) => {
+      if (new URL(request.url()).pathname.endsWith("/ExportPortableSession")) sent.push(request);
+    });
+    const pane = page.locator(`.session-pane[data-input-session-id="${sessionId}"]`);
+    try {
+      await page.locator(timeline).getByText(prompt, { exact: true }).waitFor({ state: "visible", timeout: 30_000 });
+      await pane.getByLabel(`Actions for ${name}`, { exact: true }).click();
+      await pane.getByRole("menuitem", { name: "Export task…", exact: true }).click();
+    } catch (cause) {
+      const evidence = process.env.RUNNER_TEMP === undefined ? undefined
+        : join(process.env.RUNNER_TEMP, "joko-web-evidence", "packaged-desktop", "portable-export");
+      if (evidence !== undefined) {
+        await mkdir(evidence, { recursive: true });
+        await page.screenshot({ path: join(evidence, "task-window-failure.png"), timeout: 5_000,
+          mask: [page.locator("input:visible, textarea:visible")] }).catch(() => undefined);
+      }
+      throw new Error(`The original task window did not open its export options. ${JSON.stringify({ pageErrors })}`, { cause });
+    }
     const nativeWindow = await application.browserWindow(page);
     const windowId = await nativeWindow.evaluate(window => window.id);
     await nativeWindow.dispose();
@@ -320,15 +346,9 @@ describe("packaged Desktop Pi compaction", () => {
       };
     }, { windowId, target });
 
-    const sent: Request[] = [];
-    page.on("request", (request) => {
-      if (new URL(request.url()).pathname.endsWith("/ExportPortableSession")) sent.push(request);
-    });
-    const pane = page.locator(`.session-pane[data-input-session-id="${sessionId}"]`);
-    await pane.locator(".session-header-menu summary").click();
-    await pane.getByRole("menuitem", { name: "Export task…", exact: true }).click();
     const exportDialog = page.getByRole("alertdialog", { name: "Export task", exact: true });
     const exportButton = exportDialog.getByRole("button", { name: "Export", exact: true });
+    expect(sent).toHaveLength(0);
     await exportButton.click();
     await waitFor(() => exportButton.isEnabled(), Boolean, "cancelled task save returns to export options", 10_000);
     expect(await exportDialog.getByRole("alert").count()).toBe(0);
