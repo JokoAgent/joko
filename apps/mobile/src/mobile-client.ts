@@ -456,7 +456,7 @@ import {
   type MobileTimelinePreviewArtifact
 } from "./mobile-timeline-artifacts";
 import type { MobileFileShare, MobileFileShareProgress } from "./mobile-file-share";
-import type { MobileOfflineCache, MobileOfflineCacheSnapshot } from "./mobile-offline-cache";
+import { removeMobileOwnerTask, type MobileOfflineCache, type MobileOfflineCacheSnapshot } from "./mobile-offline-cache";
 import { historyInvalidated, mobileEventWithoutCursorTicket, mobilePiHistoryRetired, retainMobileHistoryPrefix } from "./mobile-history-continuity";
 import { SnapshotSchema } from "@joko/contracts";
 import { mobileProviderUsageIdentity, mobileProviderUsageSupported, type MobileProviderUsageTransport } from "./mobile-account-usage";
@@ -1145,7 +1145,7 @@ export class MobileClient {
     private readonly pdfPreviewFiles?: MobilePdfPreviewFiles,
     private readonly modelPreviewFiles?: MobileModelPreviewFiles,
     private readonly fileShare?: Pick<MobileFileShare, "perform">,
-    private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear" | "retireTaskTimeline" | "searchPreviews">,
+    private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear" | "retireTask" | "retireTaskTimeline" | "searchPreviews">,
     private readonly readOnlyDictionaryCache?: Pick<MobileVoiceDictionaryReadOnlyCache, "clear">,
     filesThumbnailDisk?: Pick<MobileFilesThumbnailCache, "get" | "put" | "remove">,
     private readonly deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, platform),
@@ -17696,6 +17696,8 @@ export class MobileClient {
     if (operation.state === OperationState.SUCCEEDED && pending.kind === "device-rename") {
       confirmedMobileDeviceName(operation, pending.targetDeviceId!, pending.connectionId);
     }
+    if (operation.state === OperationState.SUCCEEDED && pending.kind === "delete"
+      && !await this.#adoptSessionDeletion(pending.sessionId!, epoch)) return;
     if (operation.state === OperationState.SUCCEEDED && pending.kind === "message-delete") {
       const session = this.#selectedSession();
       const generation = mobileMessageDeletionGeneration(operation, pending);
@@ -17770,6 +17772,12 @@ export class MobileClient {
       return mutation?.case === "resumeQueue" && mutation.value.sessionId === pending.sessionId;
     }
     if (this.#joinedTask || operation.operationId !== pending.operationId || operation.connectionId !== pending.connectionId) return false;
+    if (pending.kind === "delete" && operation.state === OperationState.SUCCEEDED) {
+      const mutation = operation.mutation?.payload;
+      const result = operation.result?.payload;
+      return mutation?.case === "deleteSession" && mutation.value.sessionId === pending.sessionId
+        && result?.case === "session" && result.value.sessionId === pending.sessionId;
+    }
     if (pending.kind === "session-stop") {
       const mutation = operation.mutation?.payload;
       const result = operation.result?.payload;
@@ -17789,6 +17797,32 @@ export class MobileClient {
     }
     return pending.kind !== "message-delete" || operation.state !== OperationState.SUCCEEDED
       || mobileMessageDeletionGeneration(operation, pending) !== undefined;
+  }
+
+  async #adoptSessionDeletion(sessionId: string, epoch: number): Promise<boolean> {
+    const credential = this.#credential;
+    if (!credential || this.#activeProfileId !== credential.profileId || this.#joinedTask) return false;
+    const current = () => this.#current(epoch) && this.#credential === credential;
+    const selected = this.#state.selectedId === sessionId;
+    const owner = this.#state.owner;
+    this.#timelineRetirement += 1;
+    if (selected) this.#historyOwner = undefined;
+    this.#set({ owner: owner && removeMobileOwnerTask(owner, sessionId),
+      homeSearchMatches: this.#state.homeSearchMatches.filter(match => match.sessionId !== sessionId),
+      ...(selected ? { selectedId: undefined, detail: undefined, older: [], window: undefined, live: [],
+        before: undefined, historyEnd: false, historyBusy: false } : {})
+    }, false);
+    const profile = this.#profiles.find(candidate => candidate.profileId === credential.profileId) ?? profileFromCredential(credential);
+    try {
+      await Promise.all([
+        selected ? this.storage.saveSelection(credential.profileId) : undefined,
+        this.offlineCache?.retireTask(profile, sessionId)
+      ]);
+    } catch (error) {
+      if (current()) this.#set({ error: `Joko could not finish removing the saved offline task: ${message(error)}` });
+      return false;
+    }
+    return current();
   }
 
   async reconcile(epoch = this.#epoch): Promise<void> {

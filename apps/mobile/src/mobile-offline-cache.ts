@@ -73,6 +73,17 @@ const maximumClockValue = Number.MAX_SAFE_INTEGER;
 
 class MobileOfflineCacheReadError extends Error {}
 
+export function removeMobileOwnerTask(owner: Snapshot, sessionId: string): Snapshot {
+  const retained = (item: { readonly sessionId: string }) => item.sessionId !== sessionId;
+  return create(SnapshotSchema, { ...owner,
+    sessions: owner.sessions.filter(retained), runs: owner.runs.filter(retained),
+    queueItems: owner.queueItems.filter(retained), queueControls: owner.queueControls.filter(retained),
+    schedules: owner.schedules.filter(retained), interactions: owner.interactions.filter(retained),
+    artifacts: owner.artifacts.filter(retained), toolLeases: owner.toolLeases.filter(retained),
+    timeline: owner.timeline.filter(event => event.identity?.sessionId !== sessionId)
+  });
+}
+
 export class MobileOfflineCache {
   readonly #tails = new Map<string, Promise<void>>();
   readonly #epochs = new Map<string, number>();
@@ -343,13 +354,32 @@ export class MobileOfflineCache {
     });
   }
 
+  retireTask(profile: MobileConnectionProfile, sessionId: string): Promise<void> {
+    assertIdentity(profile);
+    assertLocalId(sessionId, "task");
+    const profileId = profile.profileId;
+    this.#advanceTimelineEpoch(profileId, sessionId);
+    const epoch = this.#epoch(profileId);
+    return this.#serialized(profileId, async () => {
+      const key = manifestKey(profileId);
+      const raw = await this.storage.getItem(key);
+      if (raw === null || this.#epoch(profileId) !== epoch) return;
+      const manifest = readManifest(raw, profile);
+      const owner = readSnapshot(manifest.owner, "owner snapshot");
+      assertOwnerSnapshot(profile, manifest.node, owner);
+      const entry = manifest.details.find(candidate => candidate.sessionId === sessionId);
+      const details = manifest.details.filter(candidate => candidate !== entry);
+      await this.storage.setItem(key, stringifyManifest({ ...manifest, details,
+        owner: cacheableSnapshotJson(removeMobileOwnerTask(owner, sessionId)) }));
+      if (entry) await this.storage.removeItem(entry.key);
+    });
+  }
+
   retireTaskTimeline(profile: MobileConnectionProfile, sessionId: string, project: (snapshot: Snapshot) => Snapshot): Promise<void> {
     assertIdentity(profile);
     assertLocalId(sessionId, "task");
     const profileId = profile.profileId;
-    const timelines = this.#timelineEpochs.get(profileId) ?? new Map<string, number>();
-    this.#timelineEpochs.set(profileId, timelines);
-    timelines.set(sessionId, this.#timelineEpoch(profileId, sessionId) + 1);
+    this.#advanceTimelineEpoch(profileId, sessionId);
     const epoch = this.#epoch(profileId);
     return this.#serialized(profileId, async () => {
       if (this.#epoch(profileId) !== epoch) return;
@@ -407,6 +437,12 @@ export class MobileOfflineCache {
 
   #timelineEpoch(profileId: string, sessionId: string | undefined): number {
     return sessionId === undefined ? 0 : this.#timelineEpochs.get(profileId)?.get(sessionId) ?? 0;
+  }
+
+  #advanceTimelineEpoch(profileId: string, sessionId: string): void {
+    const timelines = this.#timelineEpochs.get(profileId) ?? new Map<string, number>();
+    this.#timelineEpochs.set(profileId, timelines);
+    timelines.set(sessionId, this.#timelineEpoch(profileId, sessionId) + 1);
   }
 
   #serialized<T>(profileId: string, action: () => Promise<T>): Promise<T> {
