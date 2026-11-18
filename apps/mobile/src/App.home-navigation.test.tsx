@@ -33,10 +33,12 @@ type NativeProps = {
   accessibilityElementsHidden?: boolean;
   accessibilityLiveRegion?: "none" | "polite" | "assertive";
   consumedBottomInset?: number;
+  mockPanResponder?: number;
 };
-const surface = ({ children, accessibilityLabel, testID, style, pointerEvents, accessibilityElementsHidden, accessibilityLiveRegion, consumedBottomInset }: NativeProps) => createElement("div", {
+const surface = ({ children, accessibilityLabel, testID, style, pointerEvents, accessibilityElementsHidden, accessibilityLiveRegion, consumedBottomInset, mockPanResponder }: NativeProps) => createElement("div", {
   "aria-label": accessibilityLabel, "data-testid": testID, "data-native-style": JSON.stringify(style),
-  "data-pointer-events": pointerEvents, "aria-hidden": accessibilityElementsHidden, "aria-live": accessibilityLiveRegion, "data-consumed-bottom-inset": consumedBottomInset
+  "data-pointer-events": pointerEvents, "aria-hidden": accessibilityElementsHidden, "aria-live": accessibilityLiveRegion, "data-consumed-bottom-inset": consumedBottomInset,
+  "data-pan-responder": mockPanResponder
 }, children);
 const empty = Object.freeze([]);
 const homeConnectionId = "home-connection";
@@ -47,6 +49,10 @@ let linkListener: ((event: { readonly url: string }) => void) | undefined;
 const searchHome = vi.fn(async () => {});
 const scrollToIndex = vi.fn();
 const scrollHomeTo = vi.fn();
+type NativeMeasure = (x: number, y: number, width: number, height: number) => void;
+const homeHeaderBounds = new Map<string, { readonly top: number; readonly height: number }>();
+type NativePanFixture = Record<string, (_event?: unknown, gesture?: { y0?: number; moveY?: number; dy?: number }) => unknown>;
+const panResponders: NativePanFixture[] = [];
 type HomeListProps = {
   sections: readonly { key: string; data: readonly unknown[] }[];
   renderItem: (value: { item: unknown; index: number }) => ReactNode;
@@ -56,6 +62,7 @@ type HomeListProps = {
   onLayout: (event: { nativeEvent: { layout: { height: number } } }) => void;
   onContentSizeChange: (width: number, height: number) => void;
   onScroll: (event: { nativeEvent: { contentOffset: { y: number } } }) => void;
+  scrollEnabled?: boolean;
 };
 let homeListProps: HomeListProps;
 const setSessionPinned = vi.fn(async () => true);
@@ -165,11 +172,21 @@ beforeAll(async () => {
   vi.stubGlobal("__DEV__", false);
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.doMock("react-native", () => ({
-    View: surface, Text: surface, ScrollView: surface, Image: surface, ActivityIndicator: surface,
+    View: forwardRef((props: NativeProps, ref) => {
+      useImperativeHandle(ref, () => props.testID?.startsWith("home-project-heading:") ? {
+        measureInWindow: (callback: NativeMeasure) => {
+          const bounds = homeHeaderBounds.get(props.testID!);
+          callback(0, bounds?.top ?? 0, 320, bounds?.height ?? 0);
+        }
+      } : null, [props.testID]);
+      return surface(props);
+    }), Text: surface, ScrollView: surface, Image: surface, ActivityIndicator: surface,
     SectionList: forwardRef((listProps: HomeListProps, ref) => {
       homeListProps = listProps;
       const { sections, renderItem, renderSectionHeader, renderSectionFooter, ListEmptyComponent } = listProps;
-      useImperativeHandle(ref, () => ({ getScrollResponder: () => ({ scrollTo: scrollHomeTo }) }), []);
+      useImperativeHandle(ref, () => ({ getScrollResponder: () => ({ scrollTo: scrollHomeTo,
+        getNativeScrollRef: () => ({ measureInWindow: (callback: NativeMeasure) => callback(0, 100, 320, 240) })
+      }) }), []);
       return createElement("div", { "data-testid": "home-list" }, sections.length === 0 ? ListEmptyComponent
         : sections.map(section => createElement("section", { key: section.key }, renderSectionHeader({ section }),
           section.data.map((item, index) => createElement("div", { key: index }, renderItem({ item, index }))), renderSectionFooter?.({ section }))));
@@ -197,7 +214,7 @@ beforeAll(async () => {
     Platform: { get OS() { return platformOS; }, select: (value: Record<string, unknown>) => value[platformOS] ?? value.default },
     AppState: { currentState: "active", addEventListener: () => ({ remove() {} }) },
     BackHandler: { addEventListener: () => ({ remove() {} }) }, Keyboard: { dismiss() {}, addListener: () => ({ remove() {} }) },
-    PanResponder: { create: () => ({ panHandlers: {} }) },
+    PanResponder: { create: (handlers: NativePanFixture) => ({ panHandlers: { mockPanResponder: panResponders.push(handlers) - 1 } }) },
     AccessibilityInfo: { announceForAccessibility() {}, setAccessibilityFocus() {}, addEventListener: () => ({ remove() {} }) },
     Linking: { getInitialURL: async () => null, addEventListener: (_event: string, listener: typeof linkListener) => {
       linkListener = listener;
@@ -343,6 +360,8 @@ beforeEach(async () => {
   select.mockImplementation(async sessionId => { state = { ...state, selectedId: sessionId }; });
   around.mockReset();
   latest.mockClear();
+  homeHeaderBounds.clear();
+  panResponders.length = 0;
   const sessions = [
     create(SessionSchema, { sessionId: "current", targetId: "dialogue", backendId: "backend", displayName: "Alpha", pinned: true, state: SessionState.IDLE }),
     create(SessionSchema, { sessionId: "other", targetId: "project", projectId: "project", backendId: "backend", displayName: "Beta", state: SessionState.IDLE }),
@@ -837,6 +856,81 @@ describe("actual Home navigation hosts", () => {
     await render({ state: { ...state, activeProfileId: "different-pairing" } });
     expect(list().textContent).toContain("Other active");
     expect(host.querySelector(`button[aria-label="${back}"]`)).toBeNull();
+  });
+
+  it("retains manual project moves across activity, hidden slots and cold entry on the original pairing", async () => {
+    const projectIds = ["alpha", "bravo", "charlie", "delta"] as const;
+    const names = { alpha: "Alpha project", bravo: "Bravo project", charlie: "Charlie project", delta: "Delta project" };
+    const owner = create(SnapshotSchema, { ...state.owner!, targets: projectIds.map(id => create(TargetSchema, {
+      targetId: id, displayName: names[id], backendId: "backend", state: TargetState.ACTIVE
+    })), workspaces: projectIds.map(id => create(WorkspaceDescriptorSchema, {
+      targetId: id, workspaceId: id, displayName: names[id], serverPathDisplay: `/${id}`, kind: WorkspaceKind.USER_PROJECT
+    })), sessions: projectIds.map((id, index) => create(SessionSchema, {
+      sessionId: `task-${id}`, targetId: id, projectId: id, displayName: `Task ${id}`, backendId: "backend", state: SessionState.IDLE,
+      lastActivityAt: create(TimestampSchema, { seconds: BigInt(200 - index) })
+    })) });
+    state = { ...state, owner };
+    const preferences = new Map<string, string>();
+    const storage = { getItem: async (key: string) => preferences.get(key) ?? null,
+      setItem: async (key: string, value: string) => { preferences.set(key, value); } };
+    const Home = ({ source }: { source: string }) => {
+      const { view, change } = useMobileHomeViewPreference(source, storage);
+      return createElement(SessionsScreen, { ...props, state, viewState: view, onViewStateChange: change });
+    };
+    const order = () => Array.from(host.querySelectorAll('[data-testid^="home-project-heading:"]')).map(
+      row => row.querySelector("button")?.getAttribute("aria-label"));
+    const open = () => press(message("home.display"));
+    const close = () => press(message("common.close"));
+    const handleFor = (name: string) => {
+      const label = mobileMessage("en", "home.display.reorderProject", { name });
+      const element = host.querySelector(`[aria-label="${label}"][data-pan-responder]`);
+      expect(element).not.toBeNull();
+      return panResponders[Number(element!.getAttribute("data-pan-responder"))]!;
+    };
+    await act(async () => root.render(createElement(Home, { key: "live", source: "original" })));
+    expect(order()).toEqual([names.alpha, names.bravo, names.charlie, names.delta]);
+    await open();
+    await press(message("home.display.projectOrderManual"));
+    await press(`${names.alpha} · /alpha`);
+    await press(`${names.charlie} · /charlie`);
+    await press(`${names.delta} · /delta`);
+    await close();
+    expect(order()).toEqual([names.alpha, names.charlie, names.delta]);
+    homeHeaderBounds.set("home-project-heading:project:alpha", { top: 114, height: 44 });
+    homeHeaderBounds.set("home-project-heading:project:charlie", { top: 212, height: 44 });
+    homeHeaderBounds.set("home-project-heading:project:delta", { top: 426, height: 44 });
+    const pan = handleFor(names.alpha);
+    await act(async () => {
+      pan.onPanResponderGrant!({}, { y0: 128 });
+      await vi.advanceTimersByTimeAsync(150);
+      pan.onPanResponderRelease!();
+    });
+    expect(order()).toEqual([names.alpha, names.charlie, names.delta]);
+    await act(async () => {
+      pan.onPanResponderGrant!({}, { y0: 128 });
+      await vi.advanceTimersByTimeAsync(600);
+      pan.onPanResponderMove!({}, { moveY: 272, dy: 144 });
+    });
+    expect(homeListProps.scrollEnabled).toBe(false);
+    await act(async () => { pan.onPanResponderRelease!(); pan.onPanResponderRelease!(); });
+    expect(homeListProps.scrollEnabled).toBe(true);
+    expect(order()).toEqual([names.charlie, names.alpha, names.delta]);
+    await open();
+    await press(message("home.display.reset"));
+    await close();
+    expect(order()).toEqual([names.charlie, names.bravo, names.alpha, names.delta]);
+
+    state = { ...state, owner: create(SnapshotSchema, { ...owner, sessions: owner.sessions.map(session => session.projectId === "alpha"
+      ? create(SessionSchema, { ...session, lastActivityAt: create(TimestampSchema, { seconds: 500n }) }) : session) }) };
+    await act(async () => root.render(createElement(Home, { key: "cold", source: "original" })));
+    expect(order()).toEqual([names.charlie, names.bravo, names.alpha, names.delta]);
+    const retired = handleFor(names.charlie);
+    await act(async () => { retired.onPanResponderGrant!({}, { y0: 224 }); await vi.advanceTimersByTimeAsync(600); });
+    state = { ...state, activeProfileId: "another-pairing" };
+    await act(async () => root.render(createElement(Home, { key: "cold", source: "another" })));
+    await act(async () => { retired.onPanResponderMove!({}, { moveY: 105 }); retired.onPanResponderRelease!(); });
+    expect(order()).toEqual([names.alpha, names.bravo, names.charlie, names.delta]);
+    expect(preferences.has("joko.mobile.home-display.v1.another")).toBe(false);
   });
 
   it("sorts Home search by relevance or either activity direction and restores the ordinary list on clear", async () => {

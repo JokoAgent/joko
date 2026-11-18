@@ -8,6 +8,7 @@ import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from "react-native-
 import { MobileAdaptiveWindowProvider, useMobileAdaptiveWindow } from "./MobileAdaptiveWindow";
 import { MobileNavigationFrame } from "./MobileNavigationFrame";
 import { MobileTaskHeaderButtons } from "./MobileTaskHeaderChrome";
+import { MobileReorderHandle } from "./MobileReorderHandle";
 import { MobileTaskActivityProvider, MobileTaskActivityBanner, useMobileTaskActivityView } from "./MobileTaskActivity";
 import { useMobileTaskHeaderRole } from "./use-mobile-task-header-role";
 import { mobileTaskHeaderNotice } from "./mobile-task-header-notice";
@@ -292,11 +293,12 @@ import { useMobileScreenshotSelection } from "./use-mobile-screenshot-selection"
 import {
   buildMobileHomeSections, buildMobileHomeNavigationLayout, createSwipeRowRegistry,
   DEFAULT_MOBILE_HOME_DISPLAY, MOBILE_HOME_ACTIVITY_FILTERS, MOBILE_HOME_PROJECT_PREVIEW_LIMIT, MOBILE_HOME_TASK_SORTS,
-  hasMobileHomeDisplayFilters, previewMobileHomeProject,
+  hasMobileHomeDisplayFilters, mergeMobileHomeProjectOrder, previewMobileHomeProject,
   type MobileHomeDisplayPreferences, type MobileHomeSearchMatch, type MobileHomeSearchSort, type MobileHomeSection, type MobileHomeSessionItem, type MobileHomeStatusFilter
 } from "./home-navigation";
 import { MobileTaskHomeNavigation, type MobileHomeNavigationIntent, type MobileHomeViewChange, type MobileHomeViewState,
   type MobileTaskHomeNavigationPorts } from "./mobile-task-home-navigation";
+import { useMobileHomeProjectReorder } from "./use-mobile-home-project-reorder";
 import { mobilePartnerRosterSourceKey } from "./mobile-partner-roster";
 import {
   artifactTitle,
@@ -1468,6 +1470,20 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   const listSections = useMemo(() => sections.map(section => ({ ...section, data: section.kind !== "project" || projectView !== undefined
     ? section.items : foldedProjectKeys?.has(section.key) ? [] : previewMobileHomeProject(section.items, pendingProjectInteractions, filterNow)
   })), [filterNow, foldedProjectKeys, pendingProjectInteractions, projectView, sections]);
+  const visibleProjectKeys = useMemo(() => sections.filter(section => section.kind === "project").map(section => section.key), [sections]);
+  const projectOrder = (next: readonly string[]): readonly string[] => mergeMobileHomeProjectOrder(display.manualProjectOrder,
+    state.owner?.workspaces.filter(workspace => workspace.kind === WorkspaceKind.USER_PROJECT).map(workspace => `project:${workspace.targetId}`) ?? [], next);
+  const applyHomeDisplay = (next: MobileHomeDisplayPreferences): void => {
+    if (homeScopeKey !== mobileHomeSourceKey(client.state)) return;
+    setViewState({ ...currentView, display: next }, false, true);
+  };
+  const reorderEnabled = foreground && projectView === undefined && !normalizedSearch && display.projectOrder === "manual"
+    && (state.status === "connected" || state.status === "offline") && visibleProjectKeys.length > 1;
+  const reorderProjects = useMobileHomeProjectReorder({ enabled: reorderEnabled,
+    scope: JSON.stringify([scrollKey, visibleProjectKeys]), visibleKeys: visibleProjectKeys,
+    viewport: () => listRef.current?.getScrollResponder()?.getNativeScrollRef?.(),
+    onReorder: next => applyHomeDisplay({ ...display, manualProjectOrder: projectOrder(next) })
+  });
 
   useEffect(() => { restoreListScroll(); }, [listSections, restoreListScroll]);
   useEffect(() => {
@@ -1755,6 +1771,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     <PendingReceipts items={state.pending.filter((item) => ["rename", "pin", "archive", "delete", "task-tag"].includes(item.kind))}
       colors={colors} locale={locale} disabled={state.status !== "connected"} onError={setLocalError} />
     <SectionList ref={listRef} key={scrollKey} sections={listSections} keyExtractor={(item) => item.session.sessionId}
+      scrollEnabled={reorderProjects.marker === undefined} stickySectionHeadersEnabled={reorderEnabled ? false : undefined}
       onLayout={event => { listScroll.viewportHeight = event.nativeEvent.layout.height; restoreListScroll(); }}
       onContentSizeChange={(_width, height) => { listScroll.contentHeight = height; restoreListScroll(); }}
       onScroll={event => {
@@ -1769,13 +1786,9 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
       renderSectionHeader={({ section }) => {
         if (section.kind === "search" || (section.kind === "project" && projectView !== undefined)) return null;
         if (section.kind !== "project") return <Text style={[styles.listSectionTitle, { color: colors.muted }]}>{section.title}</Text>;
-        const expanded = foldedProjectKeys?.has(section.key) !== true;
-        return <Pressable accessibilityRole="button" accessibilityLabel={section.title} accessibilityState={{ expanded }}
-          onPress={() => toggleProjectFold(section.key)} style={styles.homeProjectHeader}>
-          <Text style={[styles.listSectionTitle, styles.fill, { color: colors.muted }]}>{section.title}</Text>
-          <View accessible={false} style={[styles.homeProjectChevron, { borderColor: colors.muted,
-            transform: [{ rotate: expanded ? "45deg" : "-45deg" }] }]} />
-        </Pressable>;
+        return <MobileHomeProjectHeading section={section} expanded={foldedProjectKeys?.has(section.key) !== true} locale={locale} colors={colors}
+          reorderable={reorderEnabled} reorder={reorderProjects} onToggle={() => toggleProjectFold(section.key)}
+          onStartDrag={() => swipeRegistry.closeOpenRow()} />;
       }}
       renderSectionFooter={({ section }) => projectView === undefined && section.kind === "project" && section.data.length > 0
         && section.data.length < section.items.length ? <Pressable accessibilityRole="button" onPress={() => openProjectView(section)} style={styles.homeProjectFooter}>
@@ -1827,7 +1840,9 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
       state={state} display={display} colors={colors} locale={locale}
       onClose={() => setDisplaySource(undefined)}
       onChange={next => {
-        if (displaySource === mobileHomeSourceKey(client.state)) setViewState({ ...currentView, display: next }, false, true);
+        if (next.projectOrder === "manual" && display.projectOrder !== "manual" && next.manualProjectOrder.length === 0) {
+          applyHomeDisplay({ ...next, manualProjectOrder: projectOrder(visibleProjectKeys) });
+        } else applyHomeDisplay(next);
       }} />}
     <Modal visible={(state.status === "connected" || state.status === "offline") && optionsSession !== undefined} transparent animationType="none"
       onRequestClose={closeOptions} statusBarTranslucent>
@@ -1890,6 +1905,37 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
 
 type SessionOption = "rename" | "copy-link" | "pin" | "archive" | "delete" | "tags" | `tag:${string}`;
 
+function MobileHomeProjectHeading({ section, expanded, colors, locale, reorderable, reorder, onToggle, onStartDrag }: {
+  readonly section: MobileHomeSection;
+  readonly expanded: boolean;
+  readonly colors: Colors;
+  readonly locale: MobileSupportedLocale;
+  readonly reorderable: boolean;
+  readonly reorder: ReturnType<typeof useMobileHomeProjectReorder>;
+  readonly onToggle: () => void;
+  readonly onStartDrag: () => void;
+}) {
+  const { register, marker } = reorder;
+  const { key, title } = section;
+  const registerHeading = useCallback((view: View | null) => register(key, view), [key, register]);
+  const drop = marker?.drop?.key === key ? marker.drop : undefined;
+  return <View ref={reorderable ? registerHeading : undefined} collapsable={false} testID={`home-project-heading:${key}`}
+    style={[styles.homeProjectHeading, { borderTopColor: drop?.after === false ? colors.accent : "transparent",
+      borderBottomColor: drop?.after === true ? colors.accent : "transparent", opacity: marker?.sourceKey === key ? 0.65 : 1 }]}>
+    <Pressable accessibilityRole="button" accessibilityLabel={title} accessibilityState={{ expanded }} disabled={marker !== undefined}
+      onPress={onToggle} style={[styles.homeProjectHeader, styles.fill]}>
+      <Text style={[styles.listSectionTitle, styles.fill, { color: colors.muted }]}>{title}</Text>
+      <View accessible={false} style={[styles.homeProjectChevron, { borderColor: colors.muted,
+        transform: [{ rotate: expanded ? "45deg" : "-45deg" }] }]} />
+    </Pressable>
+    {reorderable && <MobileReorderHandle label={mobileMessage(locale, "home.display.reorderProject", { name: title })}
+      hint={mobileMessage(locale, "home.display.reorderProjectHint")} color={colors.muted} style={styles.homeProjectDragHandle}
+      holdMs={600} disabled={marker !== undefined && marker.sourceKey !== key}
+      onStart={y => { onStartDrag(); reorder.start(key, y); }} onMove={y => reorder.move(key, y)}
+      onFinish={commit => reorder.finish(key, commit)} onStep={delta => reorder.step(key, delta)} />}
+  </View>;
+}
+
 function MobileHomeDisplaySheet({ state, colors, locale, display, onChange, onClose }: ScreenProps & {
   readonly display: MobileHomeDisplayPreferences;
   readonly onChange: (display: MobileHomeDisplayPreferences) => void;
@@ -1944,10 +1990,15 @@ function MobileHomeDisplaySheet({ state, colors, locale, display, onChange, onCl
           {MOBILE_HOME_TASK_SORTS.map(sortBy => option(`sort:${sortBy}`, mobileMessage(locale,
             sortBy === "activity" ? "home.searchSort.activityDesc" : `home.display.sort.${sortBy}`),
           display.sortBy === sortBy, () => onChange({ ...display, sortBy })))}
+          <Text accessibilityRole="header" style={[styles.listSectionTitle, { color: colors.muted }]}>{mobileMessage(locale, "home.display.projectOrder")}</Text>
+          {option("project-order-activity", mobileMessage(locale, "home.display.projectOrderActivity"), display.projectOrder === "activity",
+            () => onChange({ ...display, projectOrder: "activity" }))}
+          {option("project-order-manual", mobileMessage(locale, "home.display.projectOrderManual"), display.projectOrder === "manual",
+            () => onChange({ ...display, projectOrder: "manual" }))}
         </ScrollView>
         <View style={styles.actionRow}>
           <Action label={mobileMessage(locale, "home.display.reset")} colors={colors} compact disabled={!hasMobileHomeDisplayFilters(display)}
-            onPress={() => onChange({ ...DEFAULT_MOBILE_HOME_DISPLAY, sortBy: display.sortBy })} />
+            onPress={() => onChange({ ...display, projectFilter: "all", backendId: null, lastActivity: "all" })} />
           <Action label={mobileMessage(locale, "common.close")} colors={colors} compact onPress={onClose} />
         </View>
       </SafeAreaView>
@@ -9243,8 +9294,10 @@ const styles = StyleSheet.create({
   rowOptions: { width: 52, minHeight: 66, alignItems: "center", justifyContent: "center" },
   rowOptionsText: { fontSize: 16, letterSpacing: -1 },
   listSectionTitle: { paddingHorizontal: 4, paddingTop: 10, paddingBottom: 8, fontSize: 13, fontWeight: "700", textTransform: "uppercase" },
+  homeProjectHeading: { flexDirection: "row", alignItems: "center", borderTopWidth: 2, borderBottomWidth: 2 },
   homeProjectHeader: { minHeight: 44, flexDirection: "row", alignItems: "center", paddingRight: 10 },
   homeProjectChevron: { width: 7, height: 7, borderRightWidth: 1.5, borderBottomWidth: 1.5 },
+  homeProjectDragHandle: { width: 44, minHeight: 44, alignItems: "center", justifyContent: "center" },
   homeProjectFooter: { minHeight: 44, justifyContent: "center", paddingHorizontal: 8 },
   chevron: { fontSize: 28 }, center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 10, padding: 24 },
   startupLoading: { flex: 1, alignItems: "center", justifyContent: "center", gap: 16, padding: 24 },

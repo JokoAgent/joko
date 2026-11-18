@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { AppState, PanResponder, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { useEffect, useRef, useState } from "react";
+import { AppState, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { TaskTag } from "@joko/contracts";
 import type { MobileTaskTagColors } from "./MobileTaskTags";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
+import { MobileReorderHandle } from "./MobileReorderHandle";
 
 export function MobileTaskTagReorderList(props: {
   readonly tags: readonly TaskTag[]; readonly revision: bigint; readonly attached: ReadonlySet<string>;
@@ -69,7 +70,7 @@ export function MobileTaskTagReorderList(props: {
     {props.tags.map((tag, index) => <View key={tag.taskTagId} onLayout={event => { rows.current.set(tag.taskTagId, event.nativeEvent.layout); }}
       style={[styles.row, { borderColor: dragging?.to === index ? props.colors.accent : props.colors.border, backgroundColor: props.colors.surface },
         dragging?.id === tag.taskTagId && styles.dragging]}>
-      <TagDragHandle label={mobileMessage(props.locale, "taskTags.reorderLabel", { name: props.name(tag) })}
+      <MobileReorderHandle label={mobileMessage(props.locale, "taskTags.reorderLabel", { name: props.name(tag) })} style={styles.handle} holdMs={250}
         hint={mobileMessage(props.locale, "taskTags.reorderHint")} disabled={props.busy || props.tags.length < 2}
         color={props.colors.muted} onStart={y => start(tag.taskTagId, y)}
         onMove={y => { if (active.current?.id === tag.taskTagId) active.current.y = y; }} onFinish={finish}
@@ -88,43 +89,6 @@ export function MobileTaskTagReorderList(props: {
     </View>)}
     {!props.tags.length && <Text style={{ color: props.colors.muted }}>{mobileMessage(props.locale, "taskTags.empty")}</Text>}
   </ScrollView>;
-}
-
-function TagDragHandle(props: { readonly label: string; readonly hint: string; readonly disabled: boolean; readonly color: string;
-  readonly onStart: (y: number) => void; readonly onMove: (y: number) => void; readonly onFinish: (commit: boolean) => void; readonly onStep: (delta: -1 | 1) => void }) {
-  const latest = useRef(props); latest.current = props;
-  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const started = useRef(false);
-  const alive = useRef(true);
-  const stop = (commit: boolean) => {
-    if (timer.current !== undefined) clearTimeout(timer.current);
-    timer.current = undefined;
-    if (started.current && alive.current) latest.current.onFinish(commit);
-    started.current = false;
-  };
-  useEffect(() => { alive.current = true; return () => { alive.current = false; if (timer.current !== undefined) clearTimeout(timer.current); }; }, []);
-  const responder = useMemo(() => PanResponder.create({
-    onStartShouldSetPanResponder: () => alive.current && !latest.current.disabled,
-    onPanResponderGrant: (_event, state) => {
-      stop(false);
-      timer.current = setTimeout(() => {
-        timer.current = undefined;
-        if (alive.current && !latest.current.disabled && AppState.currentState === "active") { started.current = true; latest.current.onStart(state.y0); }
-      }, 250);
-    },
-    onPanResponderMove: (_event, state) => {
-      if (started.current) latest.current.onMove(state.moveY);
-      else if (Math.abs(state.dy) > 8) stop(false);
-    },
-    onPanResponderRelease: () => stop(true),
-    onPanResponderTerminate: () => stop(false),
-    onPanResponderTerminationRequest: () => !started.current
-  }), []);
-  return <View {...responder.panHandlers} accessible accessibilityRole="adjustable" accessibilityLabel={props.label}
-    accessibilityHint={props.hint} accessibilityState={{ disabled: props.disabled }}
-    accessibilityActions={[{ name: "increment" }, { name: "decrement" }]}
-    onAccessibilityAction={event => { if (alive.current && !latest.current.disabled) latest.current.onStep(event.nativeEvent.actionName === "increment" ? 1 : -1); }}
-    style={styles.handle}><Text style={{ color: props.color }}>⠿</Text></View>;
 }
 
 const styles = StyleSheet.create({

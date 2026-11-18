@@ -57,6 +57,7 @@ function readHomeDisplay(value: string | null): MobileHomeDisplayPreferences {
   const record = parsed as Record<string, unknown>;
   const projectFilter = record["projectFilter"];
   const backendId = record["backendId"];
+  const manualProjectOrder = record["manualProjectOrder"];
   const projectKeys = Array.isArray(projectFilter) ? [...new Set(projectFilter.filter(
     (key): key is string => typeof key === "string" && (key === "dialogue" || key.startsWith("project:") && key.length > "project:".length)
   ))] : [];
@@ -64,6 +65,10 @@ function readHomeDisplay(value: string | null): MobileHomeDisplayPreferences {
     projectFilter: projectKeys.length > 0 ? projectKeys : "all",
     backendId: typeof backendId === "string" && backendId.length > 0 ? backendId : null,
     lastActivity: MOBILE_HOME_ACTIVITY_FILTERS.find(value => value === record["lastActivity"]) ?? "all",
-    sortBy: MOBILE_HOME_TASK_SORTS.find(value => value === record["sortBy"]) ?? "activity"
+    sortBy: MOBILE_HOME_TASK_SORTS.find(value => value === record["sortBy"]) ?? "activity",
+    projectOrder: record["projectOrder"] === "manual" ? "manual" : "activity",
+    manualProjectOrder: Array.isArray(manualProjectOrder) ? [...new Set(manualProjectOrder.filter(
+      (key): key is string => typeof key === "string" && key.startsWith("project:") && key.length > "project:".length
+    ))] : []
   };
 }

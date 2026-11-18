@@ -14,13 +14,17 @@ export interface MobileHomeDisplayPreferences {
   readonly backendId: string | null;
   readonly lastActivity: MobileHomeActivityFilter;
   readonly sortBy: MobileHomeTaskSort;
+  readonly projectOrder: "activity" | "manual";
+  readonly manualProjectOrder: readonly string[];
 }
 
 export const DEFAULT_MOBILE_HOME_DISPLAY: MobileHomeDisplayPreferences = {
   projectFilter: "all",
   backendId: null,
   lastActivity: "all",
-  sortBy: "activity"
+  sortBy: "activity",
+  projectOrder: "activity",
+  manualProjectOrder: []
 };
 
 export function hasMobileHomeDisplayFilters(display: MobileHomeDisplayPreferences): boolean {
@@ -142,7 +146,23 @@ export function buildMobileHomeSections(options: BuildMobileHomeSectionsOptions)
       title: group.title,
       items: sortHomeItems(group.items, display.sortBy)
     }));
+  if (display.projectOrder === "manual" && options.projectId === undefined) {
+    const rank = new Map(display.manualProjectOrder.map((key, index) => [key, index] as const));
+    const projects = grouped.filter(section => section.kind === "project").sort((left, right) =>
+      (rank.get(left.key) ?? Number.MAX_SAFE_INTEGER) - (rank.get(right.key) ?? Number.MAX_SAFE_INTEGER));
+    return [...sections, ...projects, ...grouped.filter(section => section.kind !== "project")];
+  }
   return [...sections, ...grouped];
+}
+
+/** Reorders the visible projects in their existing slots, retaining the position of hidden projects. */
+export function mergeMobileHomeProjectOrder(previous: readonly string[], allProjects: readonly string[], visible: readonly string[]): readonly string[] {
+  const known = new Set(allProjects);
+  const ordered = [...new Set([...previous, ...allProjects])].filter(key => known.has(key));
+  const moved = [...new Set(visible)].filter(key => known.has(key));
+  const visibleKeys = new Set(moved);
+  let next = 0;
+  return ordered.map(key => visibleKeys.has(key) ? moved[next++]! : key);
 }
 
 export function previewMobileHomeProject(
