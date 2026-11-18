@@ -865,7 +865,7 @@ describe("session host, durable events, and reconnect semantics", () => {
     releaseTurn.release();
   });
 
-  mountedTimelineIt("restores sidebar preview, pinned collapse, and manual scroll after cancelling search", { timeout: 90_000 }, async () => {
+  mountedTimelineIt("restores sidebar preview and scroll after search and keeps the rail preview reachable", { timeout: 90_000 }, async () => {
     fixture = await OrchestratorE2eFixture.start({ webDirectory: process.env.JOKO_MOUNTED_WEB_DIR! });
     const manager = await fixture.pair("Sidebar fixture Owner");
     const { store, sessionHost, workspaces } = fixture.application;
@@ -878,10 +878,12 @@ describe("session host, durable events, and reconnect semantics", () => {
     await sessionHost.registerTarget({ id: projectId, backendId, displayName, workspaceRoot, managed: false, trusted: true }, { workspaceId: projectId });
     const oldActivity = Date.now() - 3 * 24 * 60 * 60 * 1000;
     const taskCount = 18;
+    const sampleIds: string[] = [];
     for (let index = 1; index <= taskCount; index++) {
       const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
         createSessionMutation({ backendId, targetId: projectId, displayName: `Scroll sample ${index}` })));
       store.updateSession(sessionId, {}, undefined, oldActivity - index);
+      sampleIds.push(sessionId);
     }
     const pinnedId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
       createSessionMutation({ backendId, targetId: fixture.targetId(), displayName: "Pinned sidebar anchor" })));
@@ -950,6 +952,45 @@ describe("session host, durable events, and reconnect semantics", () => {
     await results.getByText("Pinned sidebar anchor", { exact: true }).waitFor({ state: "visible" });
     await search.press("Enter");
     await page.waitForFunction(sessionId => decodeURIComponent(location.hash).includes(sessionId), pinnedId);
+
+    await page.locator(".sidebar__collapse").click();
+    const railTrigger = page.locator("[data-sidebar-rail-trigger='projects']");
+    const railProjects = page.locator(".sidebar-rail-panel[data-sidebar-rail-panel-level='1']");
+    const railProject = railProjects.locator("[data-project-header]").filter({ hasText: displayName });
+    const railTasks = page.locator(".sidebar-rail-panel[data-sidebar-rail-panel-level='2']");
+    const lastSessionId = sampleIds.at(-1)!;
+    const lastTask = railTasks.locator(`button[data-session-id="${lastSessionId}"]`);
+    for (const height of [960, 480]) {
+      await page.setViewportSize({ width: 1440, height });
+      await railTrigger.press("Enter");
+      await railProject.press("Enter");
+      const railPreview = railTasks.getByRole("button", { name: `Show all ${taskCount} tasks`, exact: true });
+      await railPreview.waitFor({ state: "visible" });
+      const original = (await railTasks.boundingBox())!;
+      await railPreview.click();
+      await expect.poll(async () => {
+        const rect = (await railTasks.boundingBox())!;
+        return rect.y + rect.height;
+      }).toBeLessThanOrEqual(height - 7);
+      const expanded = (await railTasks.boundingBox())!;
+      expect(expanded.height).toBeGreaterThan(original.height);
+      if (height === 480) expect(original.y + expanded.height).toBeGreaterThan(height + 24);
+      else expect(expanded.y).toBe(original.y);
+      const scroll = railTasks.locator(".sidebar-rail-panel__scroll");
+      expect(await scroll.evaluate(node => { node.scrollTop = node.scrollHeight; return node.scrollTop; })).toBeGreaterThan(0);
+      expect(await lastTask.evaluate(node => {
+        const row = node.getBoundingClientRect();
+        const hit = document.elementFromPoint(row.left + row.width / 2, row.top + row.height / 2);
+        return node.contains(hit);
+      })).toBe(true);
+      if (height === 960) {
+        await page.keyboard.press("Escape");
+        await railTasks.waitFor({ state: "detached" });
+      } else {
+        await lastTask.click();
+        await page.waitForURL(url => url.hash.includes(lastSessionId));
+      }
+    }
   });
 
   mountedTimelineIt("keeps Stop and composer Escape available during a native Claude retry wait", { timeout: 75_000 }, async () => {

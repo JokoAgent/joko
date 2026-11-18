@@ -2249,10 +2249,19 @@ function SidebarRailPanelShell({ anchor, level, onPointerEnter, onPointerLeave, 
     if (panel === null || panel === undefined || ownerWindow === null || ownerWindow === undefined) return;
     const desiredLeft = anchor.right + (level === 1 ? 12 : 8);
     const desiredTop = anchor.top - 6;
-    setPosition({
-      left: Math.max(8, Math.min(desiredLeft, ownerWindow.innerWidth - panel.offsetWidth - 8)),
-      top: Math.max(8, Math.min(desiredTop, ownerWindow.innerHeight - panel.offsetHeight - 8))
-    });
+    const updatePosition = (): void => {
+      const left = Math.max(8, Math.min(desiredLeft, ownerWindow.innerWidth - panel.offsetWidth - 8));
+      const top = Math.max(8, Math.min(desiredTop, ownerWindow.innerHeight - panel.offsetHeight - 8));
+      setPosition((current) => current?.left === left && current.top === top ? current : { left, top });
+    };
+    updatePosition();
+    const observer = typeof ownerWindow.ResizeObserver === "undefined" ? undefined : new ownerWindow.ResizeObserver(updatePosition);
+    observer?.observe(panel, { box: "border-box" });
+    ownerWindow.addEventListener("resize", updatePosition);
+    return () => {
+      observer?.disconnect();
+      ownerWindow.removeEventListener("resize", updatePosition);
+    };
   }, [anchor.right, anchor.top, level]);
   return createPortal(<div
     ref={panelRef}
