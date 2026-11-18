@@ -87,6 +87,13 @@ describe("Pi retry status projection", () => {
     });
   });
 
+  it("stops the original turn when an auto-retrying Backend supports full Run interruption", () => {
+    const context = { ...retryEscapeContext(), canAbortRun: true };
+    expect(resolveRetryEscapeIntent(retryEscapeInput(), context)).toEqual({ kind: "abort", runId: "run-a" });
+    expect(resolveRetryEscapeIntent(retryEscapeInput(), { ...context, canAbortRetry: false }))
+      .toEqual({ kind: "abort", runId: "run-a" });
+  });
+
   it.each([
     ["repeat", { repeat: true }],
     ["IME composition", { isComposing: true }],

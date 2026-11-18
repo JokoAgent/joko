@@ -2401,7 +2401,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           !routeStillCurrent ||
           activeSessionIdRef.current !== sourceSessionId ||
           latestSession?.activeRunId !== retryEscape.runId ||
-          freshIntent?.runId !== retryEscape.runId
+          freshIntent?.runId !== retryEscape.runId ||
+          freshIntent?.kind !== retryEscape.kind
         ) return;
         event.preventDefault();
         event.stopPropagation();
