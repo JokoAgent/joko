@@ -49,7 +49,7 @@ final class JokoConnectionUITests: XCTestCase {
         // Every call site precedes any address or pairing input. Never attach a
         // later UI tree, including after a validation or transport operation.
         let prefix = stage == "pre-input-address" ? "00-address-pre-input" : "00-setup-pre-input"
-        screenshot("\(prefix)-screen")
+        screenshot("\(prefix)-screen", reportProgress: false)
         let hierarchy = Data(app.debugDescription.utf8)
         let boundedHierarchy = Data(hierarchy.prefix(128 * 1024))
         let state: [String: Any] = [
@@ -77,11 +77,24 @@ final class JokoConnectionUITests: XCTestCase {
         add(tree)
     }
 
-    private func screenshot(_ name: String) {
+    private func screenshot(_ name: String, reportProgress: Bool = true) {
         let attachment = XCTAttachment(screenshot: app.screenshot())
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
+        if reportProgress { reportCheckpoint(name) }
+    }
+
+    private func reportCheckpoint(_ name: String) {
+        if let probe = ProcessInfo.processInfo.environment["JOKO_CI_PROBE_PORT"],
+           let url = URL(string: "http://127.0.0.1:\(probe)/ci-probe-progress/\(name)") {
+            // xcodebuild may buffer its test output until completion. Report
+            // only fixed checkpoint names to the owned loopback observer.
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.timeoutInterval = 2
+            URLSession.shared.dataTask(with: request).resume()
+        }
     }
 
     private func wait(_ element: XCUIElement, _ predicate: String, timeout: TimeInterval = 10,
@@ -147,21 +160,26 @@ final class JokoConnectionUITests: XCTestCase {
                 XCTAssertFalse(noticeStillPresent, "The actual development notice must close.")
             }
         }
-        XCTAssertTrue(element.waitForExistence(timeout: 10))
         // WKWebView's page can scroll while the native keyboard is open. Scroll
         // the actual page to expose the control rather than tapping coordinates.
-        for _ in 0..<4 {
-            if element.isHittable { break }
-            connectionPage.swipeUp()
+        // A hittable element is already present. Use one native accessibility
+        // query on this path and sample again only after the UI has changed.
+        if !element.isHittable {
+            XCTAssertTrue(element.waitForExistence(timeout: 10))
+            var hittable = element.isHittable
+            for _ in 0..<4 where !hittable {
+                connectionPage.swipeUp()
+                hittable = element.isHittable
+            }
+            for _ in 0..<5 where !hittable {
+                connectionPage.swipeDown()
+                hittable = element.isHittable
+            }
+            XCTAssertTrue(hittable)
         }
-        for _ in 0..<5 {
-            if element.isHittable { break }
-            connectionPage.swipeDown()
-        }
-        XCTAssertTrue(element.isHittable)
         if atCenter {
-            // WebView tabs are exposed as switches. Hit the exact labeled tab's
-            // measured center instead of using a native switch's chosen point.
+            // Web controls can expose a native hit point outside the editable
+            // area. Use the measured center of the exact labeled element.
             element.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         } else {
             element.tap()
@@ -193,7 +211,8 @@ final class JokoConnectionUITests: XCTestCase {
                        "The exact QuickPath guide must disappear after Continue.")
     }
 
-    private func recordPublicInputMismatch(_ field: XCUIElement, expected text: String, knownPublicInvitation: Bool) {
+    private func recordPublicInputMismatch(_ field: XCUIElement, expected text: String, knownPublicInvitation: Bool,
+                                           stage: String) {
         let probe = ProcessInfo.processInfo.environment["JOKO_CI_PROBE_PORT"] ?? ""
         let publicAddress = field.label == "Joko node address" && (text == "not-an-address"
             || (!probe.isEmpty && text == "http://127.0.0.1:\(probe)"))
@@ -206,7 +225,9 @@ final class JokoConnectionUITests: XCTestCase {
         let observedText: Any = value.map { String($0.prefix(1024)) as Any } ?? NSNull()
         let diagnostic: [String: Any] = [
             "scope": knownPublicInvitation ? "fixed-public-connect-invitation-only" : "fixed-public-connection-address-only",
-            "stage": "replace",
+            "stage": stage,
+            "hasFocus": field.hasFocus,
+            "keyboardPresent": app.keyboards.firstMatch.exists,
             "valueType": observed.map { String(reflecting: type(of: $0)) } ?? "nil",
             "expectedCharacters": text.count,
             "observedCharacters": observedCharacters,
@@ -222,13 +243,23 @@ final class JokoConnectionUITests: XCTestCase {
         }
     }
 
-    private func replace(_ field: XCUIElement, with text: String, knownPublicInvitation: Bool = false) {
-        tap(field)
-        // The exact QuickPath checks and final value receipt share the
-        // existing 10s value-gate budget; do not replay keyboard input.
-        let initialGuideCheck = Date()
-        dismissQuickPathIfPresent(until: initialGuideCheck.addingTimeInterval(10))
-        let initialGuideElapsed = Date().timeIntervalSince(initialGuideCheck)
+    private func replace(_ field: XCUIElement, with text: String, knownPublicInvitation: Bool = false,
+                         traceFirstAddressEntry: Bool = false) {
+        tap(field, atCenter: true)
+        if traceFirstAddressEntry { reportCheckpoint("04-address-tapped") }
+        let keyboard = app.keyboards.firstMatch
+        let focusDeadline = Date().addingTimeInterval(10)
+        dismissQuickPathIfPresent(until: focusDeadline)
+        if !field.hasFocus && !keyboard.waitForExistence(timeout: min(2, max(0, focusDeadline.timeIntervalSinceNow)))
+            && focusDeadline.timeIntervalSinceNow > 0 {
+            tap(field, atCenter: true)
+        }
+        let keyboardReady = field.hasFocus || keyboard.waitForExistence(timeout: max(0, focusDeadline.timeIntervalSinceNow))
+        dismissQuickPathIfPresent(until: focusDeadline)
+        let readyToType = field.hasFocus || (keyboardReady && keyboard.exists)
+        if !readyToType { recordPublicInputMismatch(field, expected: text, knownPublicInvitation: knownPublicInvitation, stage: "focus") }
+        XCTAssertTrue(readyToType, "Tapping the native field must make text input available.")
+        guard readyToType else { return }
         // WKWebView's default hit point and repeated taps can leave the caret
         // at the start without selecting text. Move to the trailing side of
         // this short, single-line address, then delete its observed characters
@@ -254,8 +285,10 @@ final class JokoConnectionUITests: XCTestCase {
             XCTAssertEqual(clearedResult, .completed,
                            "The native address field must be empty before replacement.")
         }
+        if traceFirstAddressEntry { reportCheckpoint("04-address-typing") }
         field.typeText(text)
-        let valueDeadline = Date().addingTimeInterval(max(0, 10 - initialGuideElapsed))
+        if traceFirstAddressEntry { reportCheckpoint("04-address-typed") }
+        let valueDeadline = Date().addingTimeInterval(10)
         dismissQuickPathIfPresent(until: valueDeadline)
         // The native guide can appear after typing has returned. Observe it
         // between value checks inside the original deadline, without sending
@@ -269,7 +302,7 @@ final class JokoConnectionUITests: XCTestCase {
             _ = XCTWaiter.wait(for: [changed], timeout: min(1, max(0, valueDeadline.timeIntervalSinceNow)))
             valueMatches = (field.value as? String) == text
         }
-        if !valueMatches { recordPublicInputMismatch(field, expected: text, knownPublicInvitation: knownPublicInvitation) }
+        if !valueMatches { recordPublicInputMismatch(field, expected: text, knownPublicInvitation: knownPublicInvitation, stage: "replace") }
         XCTAssertTrue(valueMatches, "The native field must contain the exact requested value.")
         // The URL keyboard's real Done accessory dismisses it. On a layout
         // without that accessory, tapping the form heading blurs the field.
@@ -339,8 +372,10 @@ final class JokoConnectionUITests: XCTestCase {
         tap(https)
         wait(https, "value == '1'")
         XCTAssertEqual(https.value as? String, "1")
+        reportCheckpoint("04-https-selected")
         let inspect = button("Check node identity")
-        replace(address, with: "not-an-address")
+        replace(address, with: "not-an-address", traceFirstAddressEntry: true)
+        reportCheckpoint("04-address-value-observed")
         wait(inspect, "enabled == false")
         XCTAssertTrue(button("Request pairing").exists)
         XCTAssertTrue(button("Pair this device").exists)

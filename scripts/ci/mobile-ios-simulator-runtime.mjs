@@ -8,7 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { assertNoNotificationStartupError, collectHostResources, collectRuntimeFailureDiagnostics, isUiRunnerAccessibilityStartupFailure,
-  locateInstalledSimulatorApplication, requireSimulatorApplicationContainer, stopOwnedMetroGroup } from "./mobile-ios-runtime-diagnostics.mjs";
+  locateInstalledSimulatorApplication, readUiTestSummary, requireSimulatorApplicationContainer, stopOwnedMetroGroup } from "./mobile-ios-runtime-diagnostics.mjs";
 
 const exec = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -17,15 +17,16 @@ const sdkRuntime = process.env.JOKO_IOS_SDK_RUNTIME ?? 'relay';
 if (!['relay', 'iroh-native', 'http-connect-native'].includes(sdkRuntime)) throw new Error('Unknown selected Mobile UI-test runtime.');
 const abort = new AbortController();
 const observationStartedAt = Date.now();
-// A full run includes up to ten minutes of cold boot and two five-minute
-// XCTest commands, plus app startup, frame capture and evidence export.
-const observationBudgetMs = (startupDiagnosticsOnly ? 4 : 30) * 60_000;
+// Cold boot, Metro, two app observations and the XCTest build took nearly
+// 26 minutes on the Intel runner. Leave the first XCTest its full five minutes.
+const observationBudgetMs = (startupDiagnosticsOnly ? 4 : 31) * 60_000;
 const observationDeadlineAt = observationStartedAt + observationBudgetMs;
 const simulatorInstallTimeoutMs = 120_000;
 const simulatorLaunchTimeoutMs = 120_000;
-const metroBundleTimeoutMs = 240_000;
-const deadline = setTimeout(() => abort.abort(new Error("iOS startup and UI operation deadline exceeded.")),
-  observationBudgetMs);
+// A cold Intel runner can finish the real Debug graph after four minutes.
+const metroBundleTimeoutMs = 300_000;
+const observationDeadlineError = new Error("iOS startup and UI operation deadline exceeded.");
+const deadline = setTimeout(() => abort.abort(observationDeadlineError), observationBudgetMs);
 const stop = () => abort.abort(new Error("iOS startup observation was cancelled."));
 process.once("SIGINT", stop); process.once("SIGTERM", stop);
 let evidence, udid, deviceName, bundleId, executable, installedExecutable, metro, metroClosed = false;
@@ -361,10 +362,14 @@ async function guiCommand(args, logName, timeout) {
   const receipt = await new Promise(accept => child.once("close", (code, signal) => accept({ exitCode: code, signal })));
   clearTimeout(timer); clearTimeout(hardStop); abort.signal.removeEventListener("abort", stopChild);
   save(logName.replace(/\.log$/u, "-receipt.json"), { ...receipt, elapsedMs: Date.now() - started, timedOut,
-    cancelled: abort.signal.aborted, logTruncated: bytes === 4 * 1024 * 1024 });
+    cancelled: abort.signal.aborted, observationDeadlineReached: abort.signal.reason === observationDeadlineError,
+    logTruncated: bytes === 4 * 1024 * 1024 });
   if (spawnError || receipt.exitCode !== 0 || timedOut || abort.signal.aborted) {
     kill("SIGKILL");
-    throw new Error(`Apple UI-test ${logName === "gui-build.log" ? "build" : "execution"} failed; see ${logName} and its receipt.`);
+    abort.signal.throwIfAborted();
+    const action = logName === "gui-build.log" ? "build" : "execution";
+    const failure = timedOut ? `timed out after ${timeout} ms` : "failed";
+    throw new Error(`Apple UI-test ${action} ${failure}. See ${logName} and its receipt.`);
   }
 }
 
@@ -462,13 +467,27 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
   };
   stage = "UI-test reopened application identity verification";
   await assertIdentity("pre-ui-build");
+  const names = ["01-connection-page", "02-saved-nodes", "03-nearby", sdkRuntime === 'http-connect-native' ? "04-webrtc-unavailable" : "04-webrtc-mode", "04-invalid-address", "05-local-identity-error",
+    "06-inspection-pending", "07-cancelled-draft-retained", "08-returned-address-draft", "09-dark-theme", "10-light-theme",
+    ...(sdkRuntime === 'http-connect-native' ? ['11-http-connect-invitation'] : [])];
+  const progressNames = new Set([...names, "04-https-selected", "04-address-tapped", "04-address-typing", "04-address-typed", "04-address-value-observed"]);
   // A loopback-only Connect error endpoint exercises the real native transport.
   // It never supplies a node identity, challenge, credential or successful pair.
   let requests = 0, unexpectedRequests = 0, screenshotCount = 0;
+  let testAttempt = 0, testStartedAt;
+  const progress = [];
   const probe = createHttpServer((request, response) => {
     if (request.method === "GET" && request.url === "/ci-probe-status") {
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({ identityRequests: requests })); return;
+    }
+    const checkpoint = request.url?.startsWith("/ci-probe-progress/") ? request.url.slice("/ci-probe-progress/".length) : undefined;
+    if (request.method === "POST" && testStartedAt !== undefined && progressNames.has(checkpoint)) {
+      request.resume();
+      if (!progress.some(item => item.attempt === testAttempt && item.checkpoint === checkpoint)) {
+        progress.push({ attempt: testAttempt, checkpoint, elapsedMs: Date.now() - testStartedAt });
+      }
+      response.writeHead(204); response.end(); return;
     }
     if (request.method !== "POST" || !request.url?.endsWith("/GetServerInfo")) {
       unexpectedRequests++; response.writeHead(404); response.end(); return;
@@ -488,7 +507,21 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
     "-parallel-testing-enabled", "NO", "-maximum-concurrent-test-simulator-destinations", "1"];
   let xcresult = join(evidence, "gui.xcresult");
   const screenshots = join(evidence, "gui-screenshots");
-  let executionError;
+  const testAndReadSummary = async (logName) => {
+    testAttempt += 1;
+    testStartedAt = Date.now();
+    let executionError;
+    try {
+      await guiCommand([...common, "test-without-building", "-resultBundlePath", xcresult,
+        "-only-testing:JokoCIUITests/JokoConnectionUITests/testConnectionPageInteractions"], logName, 5 * 60_000);
+    } catch (error) { executionError = error; }
+    if (abort.signal.aborted) throw executionError ?? abort.signal.reason;
+    const summary = await readUiTestSummary(() => {
+      if (!existsSync(xcresult)) throw new Error("Apple UI testing produced no xcresult receipt.");
+      return command("xcrun", ["xcresulttool", "get", "test-results", "summary", "--path", xcresult]);
+    }, executionError);
+    return { summary, executionError };
+  };
   try {
     stage = "Apple UI-test target preparation";
     await command("ruby", [join(root, "scripts/ci/ios-prepare-ui-tests.rb"), project,
@@ -498,49 +531,33 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
     stage = "UI-test runner prepared application identity verification";
     await assertIdentity("post-ui-build");
     stage = "actual connection page UI operations";
-    try {
-      await guiCommand([...common, "test-without-building", "-resultBundlePath", xcresult,
-        "-only-testing:JokoCIUITests/JokoConnectionUITests/testConnectionPageInteractions"], "gui-test.log", 5 * 60_000);
-    } catch (error) { executionError = error; }
-    if (executionError && !abort.signal.aborted && existsSync(xcresult)) {
-      const initial = JSON.parse(await command("xcrun", ["xcresulttool", "get", "test-results", "summary", "--path", xcresult]));
-      if (isUiRunnerAccessibilityStartupFailure(initial, requests, unexpectedRequests)) {
-        save("gui-initial-summary.json", initial);
-        await assertIdentity("post-ui-build");
-        xcresult = join(evidence, "gui-retry.xcresult");
-        executionError = undefined;
-        try {
-          await guiCommand([...common, "test-without-building", "-resultBundlePath", xcresult,
-            "-only-testing:JokoCIUITests/JokoConnectionUITests/testConnectionPageInteractions"], "gui-test-retry.log", 5 * 60_000);
-        } catch (error) { executionError = error; }
-      }
+    let { summary, executionError } = await testAndReadSummary("gui-test.log");
+    if (executionError && isUiRunnerAccessibilityStartupFailure(summary, requests, unexpectedRequests)) {
+      save("gui-initial-summary.json", summary);
+      await assertIdentity("post-ui-build");
+      xcresult = join(evidence, "gui-retry.xcresult");
+      ({ summary, executionError } = await testAndReadSummary("gui-test-retry.log"));
     }
-    if (existsSync(xcresult)) {
-      stage = "Apple UI-test evidence export";
-      const summary = JSON.parse(await command("xcrun", ["xcresulttool", "get", "test-results", "summary", "--path", xcresult]));
-      save("gui-summary.json", summary);
-      await command("xcrun", ["xcresulttool", "export", "attachments", "--path", xcresult, "--output-path", screenshots], { timeout: 60_000 });
-      const names = ["01-connection-page", "02-saved-nodes", "03-nearby", sdkRuntime === 'http-connect-native' ? "04-webrtc-unavailable" : "04-webrtc-mode", "04-invalid-address", "05-local-identity-error",
-        "06-inspection-pending", "07-cancelled-draft-retained", "08-returned-address-draft", "09-dark-theme", "10-light-theme",
-        ...(sdkRuntime === 'http-connect-native' ? ['11-http-connect-invitation'] : [])];
-      const files = readdirSync(screenshots, { recursive: true });
-      screenshotCount = files.filter(name => name.endsWith(".png")).length;
-      const manifests = files.filter(name => name.endsWith(".json")).map(name => readFileSync(join(screenshots, name), "utf8")).join("\n");
-      const steps = names.map(name => ({ name, screenshotExported: manifests.includes(name) }));
-      save("gui-steps.json", { sourceCommit: expectedSha, executableSha256: expectedHash, simulatorUdid: udid, bundleId, sdkRuntime,
-        steps, screenshotCount, localIdentityRequests: requests, unexpectedRequests,
-        testExitSucceeded: !executionError, passed: !executionError && summary.result === "Passed" && summary.passedTests === 1
-          && summary.failedTests === 0 && summary.skippedTests === 0 && steps.every(step => step.screenshotExported) });
-      if (executionError || summary.result !== "Passed") {
-        try { await exportPreInputSetupFailure(screenshots, files, { expectedSha, expectedHash, requests, unexpectedRequests, steps }); }
-        catch { save("gui-pre-input-export-receipt.json", { result: "failed", onlyAllowlistedPreInputAttachmentsExported: true }); }
-      }
-      if (executionError) throw executionError;
-      if (summary.result !== "Passed" || summary.passedTests !== 1 || summary.failedTests !== 0 || summary.skippedTests !== 0
-        || !steps.every(step => step.screenshotExported) || requests !== 2 || unexpectedRequests !== 0) {
-        throw new Error("The actual UI test or its complete screenshot/transport receipts did not pass; see gui-summary.json and gui-steps.json.");
-      }
-    } else throw executionError ?? new Error("Apple UI testing produced no xcresult receipt.");
+    stage = "Apple UI-test evidence export";
+    save("gui-summary.json", summary);
+    await command("xcrun", ["xcresulttool", "export", "attachments", "--path", xcresult, "--output-path", screenshots], { timeout: 60_000 });
+    const files = readdirSync(screenshots, { recursive: true });
+    screenshotCount = files.filter(name => name.endsWith(".png")).length;
+    const manifests = files.filter(name => name.endsWith(".json")).map(name => readFileSync(join(screenshots, name), "utf8")).join("\n");
+    const steps = names.map(name => ({ name, screenshotExported: manifests.includes(name) }));
+    save("gui-steps.json", { sourceCommit: expectedSha, executableSha256: expectedHash, simulatorUdid: udid, bundleId, sdkRuntime,
+      steps, screenshotCount, localIdentityRequests: requests, unexpectedRequests,
+      testExitSucceeded: !executionError, passed: !executionError && summary.result === "Passed" && summary.passedTests === 1
+        && summary.failedTests === 0 && summary.skippedTests === 0 && steps.every(step => step.screenshotExported) });
+    if (executionError || summary.result !== "Passed") {
+      try { await exportPreInputSetupFailure(screenshots, files, { expectedSha, expectedHash, requests, unexpectedRequests, steps }); }
+      catch { save("gui-pre-input-export-receipt.json", { result: "failed", onlyAllowlistedPreInputAttachmentsExported: true }); }
+    }
+    if (executionError) throw executionError;
+    if (summary.result !== "Passed" || summary.passedTests !== 1 || summary.failedTests !== 0 || summary.skippedTests !== 0
+      || !steps.every(step => step.screenshotExported) || requests !== 2 || unexpectedRequests !== 0) {
+      throw new Error("The actual UI test or its complete screenshot/transport receipts did not pass; see gui-summary.json and gui-steps.json.");
+    }
     // XCTest activates the already observed reopened occurrence. A replacement
     // with the same executable bytes still fails this exact process fence.
     stage = "UI-tested application process identity lookup";
@@ -549,7 +566,7 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
       executableSha256: expectedHash, simulatorUdid: udid, bundleId, pid, screenshotCount,
       scope: "Real connection-page mode availability, address typing/validation, local transport error, explicit cancellation, retained draft and theme changes; selected CONNECT invitation configuration only, no CONNECT pairing or task execution." };
   } finally {
-    save("gui-local-probe.json", { loopbackOnly: true, localIdentityRequests: requests, unexpectedRequests });
+    save("gui-local-probe.json", { loopbackOnly: true, localIdentityRequests: requests, unexpectedRequests, progress });
     probe.closeAllConnections();
     await new Promise(accept => probe.close(accept));
   }
