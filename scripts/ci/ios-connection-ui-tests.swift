@@ -49,7 +49,7 @@ final class JokoConnectionUITests: XCTestCase {
         // Every call site precedes any address or pairing input. Never attach a
         // later UI tree, including after a validation or transport operation.
         let prefix = stage == "pre-input-address" ? "00-address-pre-input" : "00-setup-pre-input"
-        screenshot("\(prefix)-screen")
+        screenshot("\(prefix)-screen", reportProgress: false)
         let hierarchy = Data(app.debugDescription.utf8)
         let boundedHierarchy = Data(hierarchy.prefix(128 * 1024))
         let state: [String: Any] = [
@@ -77,11 +77,20 @@ final class JokoConnectionUITests: XCTestCase {
         add(tree)
     }
 
-    private func screenshot(_ name: String) {
+    private func screenshot(_ name: String, reportProgress: Bool = true) {
         let attachment = XCTAttachment(screenshot: app.screenshot())
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
+        if reportProgress, let probe = ProcessInfo.processInfo.environment["JOKO_CI_PROBE_PORT"],
+           let url = URL(string: "http://127.0.0.1:\(probe)/ci-probe-progress/\(name)") {
+            // xcodebuild may buffer its test output until completion. Report only
+            // the fixed checkpoint name after the genuine screenshot is attached.
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.timeoutInterval = 2
+            URLSession.shared.dataTask(with: request).resume()
+        }
     }
 
     private func wait(_ element: XCUIElement, _ predicate: String, timeout: TimeInterval = 10,
@@ -147,18 +156,23 @@ final class JokoConnectionUITests: XCTestCase {
                 XCTAssertFalse(noticeStillPresent, "The actual development notice must close.")
             }
         }
-        XCTAssertTrue(element.waitForExistence(timeout: 10))
         // WKWebView's page can scroll while the native keyboard is open. Scroll
         // the actual page to expose the control rather than tapping coordinates.
-        for _ in 0..<4 {
-            if element.isHittable { break }
-            connectionPage.swipeUp()
+        // A hittable element is already present. Use one native accessibility
+        // query on this path and sample again only after the UI has changed.
+        if !element.isHittable {
+            XCTAssertTrue(element.waitForExistence(timeout: 10))
+            var hittable = element.isHittable
+            for _ in 0..<4 where !hittable {
+                connectionPage.swipeUp()
+                hittable = element.isHittable
+            }
+            for _ in 0..<5 where !hittable {
+                connectionPage.swipeDown()
+                hittable = element.isHittable
+            }
+            XCTAssertTrue(hittable)
         }
-        for _ in 0..<5 {
-            if element.isHittable { break }
-            connectionPage.swipeDown()
-        }
-        XCTAssertTrue(element.isHittable)
         if atCenter {
             // WebView tabs are exposed as switches. Hit the exact labeled tab's
             // measured center instead of using a native switch's chosen point.

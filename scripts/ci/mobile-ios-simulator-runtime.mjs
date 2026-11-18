@@ -467,13 +467,26 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
   };
   stage = "UI-test reopened application identity verification";
   await assertIdentity("pre-ui-build");
+  const names = ["01-connection-page", "02-saved-nodes", "03-nearby", sdkRuntime === 'http-connect-native' ? "04-webrtc-unavailable" : "04-webrtc-mode", "04-invalid-address", "05-local-identity-error",
+    "06-inspection-pending", "07-cancelled-draft-retained", "08-returned-address-draft", "09-dark-theme", "10-light-theme",
+    ...(sdkRuntime === 'http-connect-native' ? ['11-http-connect-invitation'] : [])];
   // A loopback-only Connect error endpoint exercises the real native transport.
   // It never supplies a node identity, challenge, credential or successful pair.
   let requests = 0, unexpectedRequests = 0, screenshotCount = 0;
+  let testAttempt = 0, testStartedAt;
+  const progress = [];
   const probe = createHttpServer((request, response) => {
     if (request.method === "GET" && request.url === "/ci-probe-status") {
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({ identityRequests: requests })); return;
+    }
+    const checkpoint = request.url?.startsWith("/ci-probe-progress/") ? request.url.slice("/ci-probe-progress/".length) : undefined;
+    if (request.method === "POST" && testStartedAt !== undefined && names.includes(checkpoint)) {
+      request.resume();
+      if (!progress.some(item => item.attempt === testAttempt && item.checkpoint === checkpoint)) {
+        progress.push({ attempt: testAttempt, checkpoint, elapsedMs: Date.now() - testStartedAt });
+      }
+      response.writeHead(204); response.end(); return;
     }
     if (request.method !== "POST" || !request.url?.endsWith("/GetServerInfo")) {
       unexpectedRequests++; response.writeHead(404); response.end(); return;
@@ -494,6 +507,8 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
   let xcresult = join(evidence, "gui.xcresult");
   const screenshots = join(evidence, "gui-screenshots");
   const testAndReadSummary = async (logName) => {
+    testAttempt += 1;
+    testStartedAt = Date.now();
     let executionError;
     try {
       await guiCommand([...common, "test-without-building", "-resultBundlePath", xcresult,
@@ -525,9 +540,6 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
     stage = "Apple UI-test evidence export";
     save("gui-summary.json", summary);
     await command("xcrun", ["xcresulttool", "export", "attachments", "--path", xcresult, "--output-path", screenshots], { timeout: 60_000 });
-    const names = ["01-connection-page", "02-saved-nodes", "03-nearby", sdkRuntime === 'http-connect-native' ? "04-webrtc-unavailable" : "04-webrtc-mode", "04-invalid-address", "05-local-identity-error",
-      "06-inspection-pending", "07-cancelled-draft-retained", "08-returned-address-draft", "09-dark-theme", "10-light-theme",
-      ...(sdkRuntime === 'http-connect-native' ? ['11-http-connect-invitation'] : [])];
     const files = readdirSync(screenshots, { recursive: true });
     screenshotCount = files.filter(name => name.endsWith(".png")).length;
     const manifests = files.filter(name => name.endsWith(".json")).map(name => readFileSync(join(screenshots, name), "utf8")).join("\n");
@@ -553,7 +565,7 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
       executableSha256: expectedHash, simulatorUdid: udid, bundleId, pid, screenshotCount,
       scope: "Real connection-page mode availability, address typing/validation, local transport error, explicit cancellation, retained draft and theme changes; selected CONNECT invitation configuration only, no CONNECT pairing or task execution." };
   } finally {
-    save("gui-local-probe.json", { loopbackOnly: true, localIdentityRequests: requests, unexpectedRequests });
+    save("gui-local-probe.json", { loopbackOnly: true, localIdentityRequests: requests, unexpectedRequests, progress });
     probe.closeAllConnections();
     await new Promise(accept => probe.close(accept));
   }
