@@ -5696,6 +5696,43 @@ describe("CodexBackendAdapter", () => {
     expect(degraded.health).toBe("degraded");
   });
 
+  it.each(["unchanged", "signed out", "replaced"] as const)("fences a native quota reply when the original account is %s", async (change) => {
+    const setup = await createSetup();
+    await setup.adapter.readAccount();
+    const transport = setup.fake.transport!;
+    const request = transport.request.bind(transport);
+    let returned!: () => void, release!: () => void;
+    const replyReady = new Promise<void>(resolve => { returned = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let quotaReads = 0;
+    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      const reply = await request(method, params, options);
+      if (method === "account/rateLimits/read" && ++quotaReads === 1) { returned(); await gate; }
+      return reply;
+    });
+    const original = setup.adapter.readAccountUsage("openai");
+    try {
+      await replyReady;
+      if (change !== "unchanged") await setup.adapter.logout();
+      if (change === "replaced") {
+        await setup.adapter.beginLogin({ method: "oauth_browser" });
+        setup.fake.account = { type: "chatgpt", email: "replacement@example.test", planType: "team" };
+        setup.fake.accountRateLimits = { rateLimits: { planType: "team", primary: { usedPercent: 7, windowDurationMins: 300 } } };
+        await expect(setup.adapter.readAccount(true)).resolves.toMatchObject({ authenticationState: "authenticated" });
+        await expect(setup.adapter.readAccountUsage("openai")).resolves.toMatchObject({ providerId: "openai", planType: "team",
+          primaryWindow: { usedPercent: 7 } });
+        expect(quotaReads).toBe(2);
+      } else if (change === "unchanged") {
+        await expect(setup.adapter.readAccount()).resolves.toMatchObject({ authenticationState: "authenticated" });
+      }
+    } finally { release(); }
+    if (change === "unchanged") {
+      await expect(original).resolves.toMatchObject({ providerId: "openai", primaryWindow: { usedPercent: 25 } });
+    } else {
+      await expect(original).rejects.toMatchObject({ publicError: { code: "CODEX_PROVIDER_AUTHENTICATION_STATE_STALE" } });
+    }
+  });
+
   it("retires native-auth runtimes before logout without disturbing an independent managed route", async () => {
     const managedModel: ProviderModel = {
       providerId: "managed", modelId: "managed-model", displayName: "Managed", api: "openai-responses",

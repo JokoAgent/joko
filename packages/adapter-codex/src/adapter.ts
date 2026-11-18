@@ -2933,8 +2933,18 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Refresh the Backend Provider catalog before reading account usage."
       });
     }
-    await this.#ensureLocalHostStarted();
-    const response = await this.#host.request("account/rateLimits/read", undefined, { signal });
+    const generation = await this.#ensureLocalHostStarted();
+    const host = this.#host, epoch = this.#nativeAuthenticationEpoch;
+    const assertCurrent = () => {
+      this.#assertOpen();
+      signal?.throwIfAborted();
+      if (host !== this.#host || !host.isActiveGeneration(generation) || epoch !== this.#nativeAuthenticationEpoch
+        || this.#nativeAuthenticationRevoked || this.#account?.authenticationState === "pending"
+        || this.#account?.authenticationState === "signed_out") throw nativeAuthenticationObservationStale();
+    };
+    assertCurrent();
+    const response = await host.request("account/rateLimits/read", undefined, { signal, beforeDispatch: assertCurrent });
+    assertCurrent();
     return {
       providerId: this.#providerId,
       ...parseAccountRateLimits(response.value, this.#now())
