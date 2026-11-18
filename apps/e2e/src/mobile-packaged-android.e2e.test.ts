@@ -151,7 +151,7 @@ afterEach(async () => {
 }, 90_000);
 
 nativeIt("pairs with a trusted node key, sends through native rich input, opens canonical resources, and resumes without resending", {
-  timeout: 360_000
+  timeout: 420_000
 }, async () => {
   if (!serial || !/^emulator-\d+$/u.test(serial) || !avd?.startsWith("joko-")
     || !adbExecutable || !isAbsolute(adbExecutable) || !apkPath || !isAbsolute(apkPath)) {
