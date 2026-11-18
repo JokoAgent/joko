@@ -94,6 +94,7 @@ class ScriptedPiProcess extends EventEmitter {
   sessionName: string | undefined;
   isStreaming = false;
   isCompacting = false;
+  commandCatalogResponsesToSkip = 0;
   contextUsageUnavailable = false;
   contextUsageUnknown = false;
   omitModelFromState = false;
@@ -455,6 +456,10 @@ class ScriptedPiProcess extends EventEmitter {
         });
         return;
       case "get_commands":
+        if (this.commandCatalogResponsesToSkip > 0) {
+          this.commandCatalogResponsesToSkip -= 1;
+          return;
+        }
         this.#success(command, {
           commands: [
             // Pi suffixes duplicate invocations. The bridge identity must
@@ -2907,7 +2912,11 @@ describe("PiBackendAdapter", () => {
     }
   });
 
-  it("records an exact native Skill command outcome without command text or runtime paths", async () => {
+  it.each([
+    { invocation: "/repo-audit", missedReads: 0, expectedReads: 1 },
+    { invocation: "/skill:repo-audit", missedReads: 1, expectedReads: 2 },
+    { invocation: "/skill:repo-audit", missedReads: 2, expectedReads: 2 }
+  ])("dispatches $invocation only with live Skill evidence after $missedReads missed reads", async ({ invocation, missedReads, expectedReads }) => {
     let nativeProcess: ScriptedPiProcess | undefined;
     const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-skill-usage-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "joko-pi-skill-usage-workspace-"));
@@ -2920,6 +2929,7 @@ describe("PiBackendAdapter", () => {
       agentHome,
       sessionRoot: agentHome,
       versionProbe: async () => "pi 99.99.99-skill-usage-test",
+      requestTimeoutMs: 500,
       providers: [{
         id: "local",
         baseUrl: "http://127.0.0.1:11434/v1",
@@ -2956,7 +2966,7 @@ describe("PiBackendAdapter", () => {
         const runtimeSkill = valuesForArgument(spec.args, "--skill")[0]!;
         nativeProcess = new ScriptedPiProcess(spec, {
           commands: [{
-            name: "review",
+            name: "skill:repo-audit",
             description: "Run the managed review Skill",
             source: "skill",
             sourceInfo: { path: join(runtimeSkill, "SKILL.md"), scope: "temporary" }
@@ -2982,18 +2992,30 @@ describe("PiBackendAdapter", () => {
         fastMode: false,
         permissionMode: "ask"
       }, context);
-      expect(await adapter.getCommands({ ...context, binding })).toEqual([expect.objectContaining({
-        name: "review", resourceId: "native-review-skill", inputMode: "text", loaded: true
+      const bound = { ...context, binding };
+      expect(await adapter.getCommands(bound)).toEqual([expect.objectContaining({
+        name: "skill:repo-audit", resourceId: "native-review-skill", inputMode: "text", loaded: true
       })]);
-      await adapter.send({
-        text: "/review private command detail",
+      const previousReads = nativeProcess!.commands.filter(command => command.type === "get_commands").length;
+      nativeProcess!.commandCatalogResponsesToSkip = missedReads;
+      const sent = adapter.send({
+        text: `${invocation} private command detail`,
         images: [],
         files: [],
         mentions: [],
         disposition: "prompt"
-      }, { ...context, binding });
+      }, bound);
+      if (missedReads === 2) {
+        await expect(sent).rejects.toMatchObject({ publicError: { code: "PI_RPC_TIMEOUT", stateMayHaveChanged: false } });
+        expect(nativeProcess!.commands.filter(command => command.type === "get_commands")).toHaveLength(previousReads + expectedReads);
+        expect(nativeProcess!.commands.some(command => command.type === "prompt")).toBe(false);
+        expect(events.some(event => event.type === "resource_usage")).toBe(false);
+        return;
+      }
+      await sent;
+      expect(nativeProcess!.commands.filter(command => command.type === "get_commands")).toHaveLength(previousReads + expectedReads);
       expect(nativeProcess!.commands.findLast(command => command.type === "prompt")).toMatchObject({
-        message: "/review private command detail"
+        message: "/skill:repo-audit private command detail"
       });
       await vi.waitFor(() => expect(events.some((event) =>
         event.type === "resource_usage" && event.source === "native_skill_command"
@@ -5984,6 +6006,24 @@ describe("PiBackendAdapter", () => {
       extensionCommand: "unsafe-extension"
     });
     expect(escapePiComposerSlashCommand("ordinary text", commands)).toBe("ordinary text");
+  });
+
+  it("expands only an unambiguous short name of a loaded managed Skill", () => {
+    const skill = { name: "skill:repo-audit", description: "", source: "skill" as const,
+      inputMode: "text" as const, resourceId: "approved-skill", loaded: true };
+    const extension = { name: "repo-audit", description: "", source: "extension" as const, inputMode: "text" as const, loaded: true };
+    expect(resolvePiComposerSlashCommand("/repo-audit\t review src\nmore", "prompt", [skill])).toEqual({
+      message: "/skill:repo-audit\t review src\nmore",
+      skillResourceId: "approved-skill"
+    });
+    expect(resolvePiComposerSlashCommand("/repo-audit now", "prompt", [skill, extension])).toEqual({
+      message: "/repo-audit now", extensionCommand: "repo-audit"
+    });
+    expect(escapePiComposerSlashCommand("/repo-audit", [skill, { ...extension, name: skill.name }])).toBe(" /repo-audit");
+    expect(escapePiComposerSlashCommand("/repo-audit", [{ ...skill, loaded: false }])).toBe(" /repo-audit");
+    expect(escapePiComposerSlashCommand("/repo-audit", [{ ...skill, resourceId: "" }])).toBe(" /repo-audit");
+    expect(escapePiComposerSlashCommand(" /repo-audit", [skill])).toBe("  /repo-audit");
+    expect(escapePiComposerSlashCommand("/review", [{ ...skill, name: "skill:review" }])).toBe(" /review");
   });
 
   it("publishes a synchronous extension terminal only after send crosses the acceptance boundary", async () => {

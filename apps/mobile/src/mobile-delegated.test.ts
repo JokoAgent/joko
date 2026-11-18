@@ -20,6 +20,20 @@ const run = create(SubagentRunSchema, { subagentRunId: "delegated", sessionId: "
   route: { providerId: "provider", modelId: "model" } });
 
 describe("mobile delegated projection", () => {
+  it("omits native message lifecycle metadata and keeps independent completed messages with the same text", () => {
+    const entries = [
+      create(SubagentTranscriptEntrySchema, { entryId: "before", sequence: 1n, role: SubagentTranscriptRole.SYSTEM,
+        content: "message_start", systemEvent: { kind: "message-lifecycle" } }),
+      create(SubagentTranscriptEntrySchema, { entryId: "first", sequence: 2n, role: SubagentTranscriptRole.SUBAGENT, content: "message_start" }),
+      create(SubagentTranscriptEntrySchema, { entryId: "second", sequence: 3n, role: SubagentTranscriptRole.SUBAGENT, content: "message_start" }),
+      create(SubagentTranscriptEntrySchema, { entryId: "after", sequence: 4n, role: SubagentTranscriptRole.SYSTEM,
+        content: "original error", systemEvent: { kind: "message-error" } })
+    ];
+    expect(buildMobileDelegatedConversation(entries).map(item => [item.id, item.kind, item.text])).toEqual([
+      ["first", "subagent", "message_start"], ["second", "subagent", "message_start"], ["after", "system", "original error"]
+    ]);
+  });
+
   it("joins exact aliases once, keeps ordinary background state and never regresses generation/revision", () => {
     const task = (id: string) => create(BackgroundTaskSchema, { backgroundTaskId: id, sessionId: "session", displayName: "Worker",
       state: BackgroundTaskState.WAITING, version: { generation: 3n, revision: { value: 4n } } });

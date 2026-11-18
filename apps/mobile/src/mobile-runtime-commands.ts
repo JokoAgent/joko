@@ -206,6 +206,13 @@ export function detectMobileRuntimeCommandActivation(
   return { from, to, caret, query: prefix.slice(1) };
 }
 
+export function mobileRuntimeCommandHasPrefix(candidate: MobileRuntimeCommandCandidate, needle: string): boolean {
+  return candidate.name.toLowerCase().startsWith(needle)
+    || candidate.source === RuntimeCommandSource.SKILL && candidate.inputMode === RuntimeCommandInputMode.TEXT
+      && candidate.resourceId !== undefined && candidate.name.startsWith("skill:")
+      && candidate.name.slice("skill:".length).toLowerCase().startsWith(needle);
+}
+
 export function filterMobileRuntimeCommands(
   catalog: MobileRuntimeCommandCatalog,
   query: string,
@@ -213,11 +220,11 @@ export function filterMobileRuntimeCommands(
 ): MobileRuntimeCommandResults {
   const maximum = Math.max(0, Math.min(maximumVisibleResults, Number.isSafeInteger(limit) ? limit : 0));
   const needle = query.toLowerCase();
-  const matches = catalog.items.filter((candidate) => candidate.name.toLowerCase().startsWith(needle)
+  const matches = catalog.items.filter((candidate) => mobileRuntimeCommandHasPrefix(candidate, needle)
     || candidate.description.toLowerCase().includes(needle));
   const ranked = matches.sort((left, right) => {
-    const leftPrefix = left.name.toLowerCase().startsWith(needle);
-    const rightPrefix = right.name.toLowerCase().startsWith(needle);
+    const leftPrefix = mobileRuntimeCommandHasPrefix(left, needle);
+    const rightPrefix = mobileRuntimeCommandHasPrefix(right, needle);
     return Number(rightPrefix) - Number(leftPrefix) || compareRuntimeCommands(left, right);
   });
   return { items: ranked.slice(0, maximum), truncated: ranked.length > maximum };

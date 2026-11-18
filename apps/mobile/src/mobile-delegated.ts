@@ -165,6 +165,7 @@ export function buildMobileDelegatedConversation(entries: readonly SubagentTrans
   const calls = new Map<string, MobileDelegatedConversationItem>();
   const anonymous = new Map<string, MobileDelegatedConversationItem[]>();
   for (const entry of mergeMobileDelegatedTranscript([], entries)) {
+    if (entry.role === SubagentTranscriptRole.SYSTEM && entry.systemEvent?.kind === "message-lifecycle") continue;
     if (entry.role !== SubagentTranscriptRole.TOOL) {
       items.push({ id: entry.entryId, kind: entry.role === SubagentTranscriptRole.PARENT ? "parent"
         : entry.role === SubagentTranscriptRole.SUBAGENT ? "subagent" : "system", childId: entry.childId,

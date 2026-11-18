@@ -10,6 +10,7 @@ import {
   catalogModelReferencePricing,
   CapabilityDrivenBackendAdapter,
   HOST_COMPOSED_CAPABILITIES,
+  isProductSlashCommand,
   JokoError,
   NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
   NATIVE_PROMPT_IMAGE_MEDIA_TYPES,
@@ -2008,6 +2009,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
     const nativeInput = await waitForDispatchPreparation(translatePromptInput(input, context, {
       ...this.#resolvers,
+      ...(context.assertNativeSkillInvocationCurrent === undefined || yieldDispatch !== undefined ? {} : {
+        resolveLeadingSkill: (name) => this.#resolveLeadingSkill(runtime, name, { ...context, signal: dispatchSignal })
+      }),
       ...(this.#resolveNativeSkills === undefined ? {} : {
         resolveSkillMention: (mention, dispatchContext) => this.#resolveSkillMention(runtime, mention, dispatchContext)
       })
@@ -2026,7 +2030,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       inputFingerprint: codexNativeDispatchFingerprint(nativeInput.input),
       nativeHistory: projectCodexNativeHistory(durableHistory.thread, { maximumEvents: this.#maximumHistoryEvents })
     };
-    const beforeDispatchAsync = persistFence !== undefined || input.mentions.some(mention => mention.kind === "resource")
+    const beforeDispatchAsync = persistFence !== undefined || nativeInput.input.some(part => part.type === "skill")
       ? async (signal: AbortSignal) => {
           assertNativeDispatchReady(); await nativeInput.assertFilesCurrent(signal); durableHistory?.assertCurrent();
           if (persistFence !== undefined && preparation !== undefined) await persistFence(preparation);
@@ -2929,8 +2933,18 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Refresh the Backend Provider catalog before reading account usage."
       });
     }
-    await this.#ensureLocalHostStarted();
-    const response = await this.#host.request("account/rateLimits/read", undefined, { signal });
+    const generation = await this.#ensureLocalHostStarted();
+    const host = this.#host, epoch = this.#nativeAuthenticationEpoch;
+    const assertCurrent = () => {
+      this.#assertOpen();
+      signal?.throwIfAborted();
+      if (host !== this.#host || !host.isActiveGeneration(generation) || epoch !== this.#nativeAuthenticationEpoch
+        || this.#nativeAuthenticationRevoked || this.#account?.authenticationState === "pending"
+        || this.#account?.authenticationState === "signed_out") throw nativeAuthenticationObservationStale();
+    };
+    assertCurrent();
+    const response = await host.request("account/rateLimits/read", undefined, { signal, beforeDispatch: assertCurrent });
+    assertCurrent();
     return {
       providerId: this.#providerId,
       ...parseAccountRateLimits(response.value, this.#now())
@@ -4022,6 +4036,30 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     return observed;
   }
 
+  async #resolveLeadingSkill(runtime: SessionRuntime, name: string, context: AdapterContext): Promise<ResolvedCodexSkill | undefined> {
+    const snapshot = runtime.nativeSkills;
+    const assertInvocation = context.assertNativeSkillInvocationCurrent;
+    if (!assertInvocation || runtime.remote || runtime.runtimePolicy !== "standard" || !snapshot || snapshot.restrictImplicit
+      || snapshot.skills.length === 0 || name.length > 256 || /[:\\\u0000-\u001f\u007f]/u.test(name) || isProductSlashCommand(name)) return undefined;
+    const generation = runtime.hostGeneration;
+    const assertCurrent = () => {
+      context.signal.throwIfAborted();
+      this.#assertRuntimeDispatchFence(runtime, context, generation);
+      assertInvocation();
+      snapshot.assertCurrent();
+    };
+    assertCurrent();
+    const observed = await this.#loadedSkillCatalog(runtime, context).catch(() => undefined);
+    assertCurrent();
+    if (observed === undefined) return undefined;
+    const matches = [...observed.values()].filter(skill => skill.name.toLowerCase() === name.toLowerCase());
+    const native = matches.length === 1 ? matches[0] : undefined;
+    if (native === undefined || snapshot.skillOverrides[native.name] === "off") return undefined;
+    const mount = snapshot.skills.find(mount => mount.filePath === native.path);
+    if (!mount || mount.discovery || mount.seed.resource.trustedBuiltin !== undefined) return undefined;
+    return resolvedCodexSkill(native, snapshot, assertCurrent);
+  }
+
   async #resolveSkillMention(runtime: SessionRuntime,
     mention: Extract<PromptInput["mentions"][number], { readonly kind: "resource" }>, context: AdapterContext
   ): Promise<ResolvedCodexSkill> {
@@ -4044,13 +4082,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const native = (await this.#loadedSkillCatalog(runtime, context)).get(mount.filePath);
     assertCurrent();
     if (native === undefined) throw skillMentionUnavailable();
-    return { name: native.name, path: native.path, ...(native.defaultPrompt === undefined ? {} : { defaultPrompt: native.defaultPrompt }), assertCurrent,
-      assertFilesCurrent: async (signal) => {
-        assertCurrent();
-        await snapshot!.assertFilesCurrent(signal);
-        signal.throwIfAborted();
-        assertCurrent();
-      } };
+    return resolvedCodexSkill(native, snapshot!, assertCurrent);
   }
 
   async #openMcpRuntime(
@@ -7003,6 +7035,18 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       });
     }
   }
+}
+
+function resolvedCodexSkill(native: LoadedCodexSkill, snapshot: NativeSkillSnapshot, assertCurrent: () => void): ResolvedCodexSkill {
+  return {
+    name: native.name, path: native.path, defaultPrompt: native.defaultPrompt, assertCurrent,
+    assertFilesCurrent: async signal => {
+      assertCurrent();
+      await snapshot.assertFilesCurrent(signal);
+      signal.throwIfAborted();
+      assertCurrent();
+    }
+  };
 }
 
 function skillMentionUnavailable(): JokoError {

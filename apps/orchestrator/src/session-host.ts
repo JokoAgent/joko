@@ -214,6 +214,7 @@ const MAXIMUM_QUEUE_TEXT_EDIT_BYTES = 4 * 1024 * 1024;
 const MAXIMUM_QUEUE_TEXT_EDIT_REPLAY_WORK_BYTES = 64 * 1024 * 1024;
 const SESSION_COMPACTION_QUEUE_SETTING_KEY = "runtime.compaction.dispatch.queue";
 const SESSION_NATIVE_DISPATCH_RECOVERY_SETTING_KEY = "native.dispatch.recovery";
+const CONTINUE_INTERRUPTED_RUN = "Continue from the interrupted response. Do not repeat completed work or side effects.";
 const PROTECTED_NATIVE_INPUT_PREFIX = "messaging.protected-native-input:";
 const PROTECTED_MESSAGE_QUEUE_TTL_MS = 15 * 60_000;
 const MAXIMUM_PROTECTED_MESSAGE_QUEUE = 256;
@@ -3305,6 +3306,41 @@ export class SessionHost {
     );
     if (!execution.replayed) this.drainQueuedInput(input.sessionId, input.source);
     return execution;
+  }
+
+  manualRetryPrompt(run: RunDescriptor, source: QueueItemRecord): PromptInput {
+    const stored = this.#store.getSession(run.sessionId);
+    if (run.source !== "user" || source.disposition !== "prompt" || source.body.messagingOrigin !== undefined
+      || source.body.automaticContinuation !== undefined || source.body.objectiveContinuation !== undefined
+      || source.body.inputHandoffContinuation !== undefined || !this.isOrdinaryLocalCodexSession(stored)
+      || this.#store.findObjective(run.sessionId) !== undefined || this.#providerGroupApplies(source)
+      || new TaskShareStore(this.#store).getAuthorForOperation(source.operationId) !== undefined) return source.body;
+
+    if (source.state !== "failed" || source.backendAcceptedAt === undefined && run.error?.stateMayHaveChanged !== false) {
+      throw new StoreError("The original Codex input's dispatch outcome is unavailable. Inspect the task before retrying.");
+    }
+    if (source.backendAcceptedAt === undefined) return source.body;
+
+    const session = stored.descriptor;
+    if (this.#store.findLatestRunForSessionGeneration(session.id, session.binding.generation)?.descriptor.id !== run.id
+      || this.#store.listQueueItems({ sessionId: session.id, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 1 }).length > 0) {
+      throw new StoreError("The original Codex input is no longer the current turn. Inspect the task before retrying.");
+    }
+    const progressed = listAllVisibleSessionEvents(this.#store, session.id).some(event => {
+      if (event.runId !== run.id) return false;
+      const payload = event.payload;
+      if (payload.type === "workspace_diff" && payload.changeSet.completeBaseline && payload.changeSet.changes.length === 0) return false;
+      return isContextRecoverySideEffect(event);
+    });
+    if (!progressed) return source.body;
+
+    const origin = this.#store.findVisibleSessionMessageOrigin({ sessionId: session.id, role: "user", includeRetainedContext: false });
+    const user = origin === undefined ? undefined : this.#store.findEvent(origin.eventId);
+    if (user?.runId !== run.id || user.operationId !== source.operationId || user.backendId !== session.backendId
+      || user.targetId !== session.targetId || user.generation !== session.binding.generation) {
+      throw new StoreError("The original Codex input no longer has a visible message boundary. Inspect the task before retrying.");
+    }
+    return { text: CONTINUE_INTERRUPTED_RUN, images: [], files: [], mentions: [], disposition: "prompt" };
   }
 
   canReplaceBackendInstance(backendId: string): boolean {
@@ -7072,7 +7108,7 @@ export class SessionHost {
     if (!recovery || recovery.lease !== lease || !lease.isCurrent() || !options.isCurrent()) throw new StoreError("The Provider group continuation lost its original task lease.");
     const source = this.#store.findQueueItemByRunId(sessionId, recovery.runId, { includeCleared: true }); if (!source) throw new StoreError("The interrupted input is unavailable.");
     const evidence = contextRecoveryEvidence(this.#store, sessionId, recovery.runId);
-    const prompt: PromptInput = evidence.hasAssistantOrToolEffects ? { text: "Continue from the interrupted response. Do not repeat completed work or side effects.",
+    const prompt: PromptInput = evidence.hasAssistantOrToolEffects ? { text: CONTINUE_INTERRUPTED_RUN,
       images: [], files: [], mentions: [], disposition: "prompt", ...(source.body.messagingOrigin ? { messagingOrigin: source.body.messagingOrigin } : {}) } : { ...source.body, disposition: "prompt" };
     if (!lease.isCurrent() || !options.isCurrent()) throw new StoreError("The Provider group continuation was superseded.");
     this.enqueueServiceInput({ operationId: stableId("provider-group-continue", `${sessionId}:${recovery.runId}`), sessionId, source: "system", parentRunId: recovery.runId,
@@ -7202,7 +7238,7 @@ export class SessionHost {
     };
     const prompt: PromptInput = evidence.hasAssistantOrToolEffects
       ? {
-          text: "Continue from the interrupted response. Do not repeat completed work or side effects.",
+          text: CONTINUE_INTERRUPTED_RUN,
           images: [],
           files: [],
           mentions: [],
@@ -15081,12 +15117,20 @@ export class SessionHost {
           const tracksNativeTurnDispatch = !reviewReadOnly && target.remoteWorkspace === undefined && item.disposition === "prompt"
             && run.descriptor.source === "user" && run.descriptor.parentRunId === undefined
             && this.#store.getBackend(stored.descriptor.backendId).descriptor.adapterKind === "codex";
+          const allowsNativeSkillInvocation = tracksNativeTurnDispatch && target.trusted && partnerPolicy === undefined
+            && item.body.text.trimStart().startsWith("/") && item.body.images.length === 0 && item.body.files.length === 0
+            && item.body.mentions.length === 0 && item.body.automaticContinuation === undefined && item.body.objectiveContinuation === undefined
+            && new TaskShareStore(this.#store).getAuthorForOperation(item.operationId)?.sessionId !== sessionId;
           let baseContext: AdapterContext = {
             ...turnContext,
             ...(tracksNativeTurnDispatch ? {
               signal: AbortSignal.any([turnContext.signal, dispatchPreparation.cancellation.signal]),
               onNativeTurnDispatch: () => { dispatchPreparation.nativeTurnDispatched = true; }
             } : {}),
+            ...(allowsNativeSkillInvocation ? { assertNativeSkillInvocationCurrent: () => {
+              this.assertDispatchAdmissionOwner(item, attemptId, active, stored.descriptor.binding.generation, partnerPolicy);
+              this.assertQueueProviderAuthentication(this.#store.getQueueItem(item.id), this.#store.getSession(sessionId));
+            } } : {}),
             inputQueueItemId: item.id,
             ...(attemptId === undefined ? {} : { inputAttemptId: attemptId })
           };

@@ -623,6 +623,43 @@ describe("CodexBackendAdapter", () => {
     expect(setup.fake.transport!.requests.filter(request => request.method === "turn/start")).toHaveLength(scenarios.length);
   });
 
+  it("dispatches an ordinary owner's leading Skill by the exact loaded mount and preserves the arguments", async () => {
+    const setup = await createSkillInputSetup();
+    const assertNativeSkillInvocationCurrent = vi.fn();
+    await setup.adapter.send(prompt(" /native-report  review src\nsecond line "), { ...setup.active, assertNativeSkillInvocationCurrent });
+    const request = setup.fake.transport!.requests.find(value => value.method === "turn/start")!;
+    expect(request.params).toMatchObject({ input: [
+      { type: "skill", name: "native-report", path: setup.mountedPath },
+      { type: "text", text: "review src\nsecond line", text_elements: [] }
+    ] });
+    expect(request.options.beforeDispatchAsync).toBeTypeOf("function");
+    expect(assertNativeSkillInvocationCurrent).toHaveBeenCalled();
+  });
+
+  it("keeps ambiguous native short names literal and rechecks the owner at native write", async () => {
+    const setup = await createSkillInputSetup();
+    const transport = setup.fake.transport!;
+    const token = "/native-report review src";
+    setup.fake.reviewSkills.push({ path: join(setup.source, "SKILL.md"), name: "native-report", enabled: true });
+    let ownsInput = true;
+    const active = { ...setup.active, assertNativeSkillInvocationCurrent: () => {
+      if (!ownsInput) throw new Error("The queue owner no longer owns the Skill command.");
+    } };
+    await setup.adapter.send(prompt(token), active);
+    expect(transport.requests.find(value => value.method === "turn/start")?.params).toMatchObject({
+      input: [{ type: "text", text: token, text_elements: [] }]
+    });
+    await setup.fake.completeTurn(setup.active.binding!.nativeSessionId!);
+    setup.fake.reviewSkills.pop();
+    const request = transport.request.bind(transport);
+    transport.request = async (method, params, options) => {
+      if (method === "turn/start" && options?.beforeDispatchAsync !== undefined) ownsInput = false;
+      return request(method, params, options);
+    };
+    await expect(setup.adapter.send(prompt(token), { ...active, operationId: "retired-short-skill-owner" })).rejects.toBeDefined();
+    expect(transport.requests.filter(value => value.method === "turn/start")).toHaveLength(1);
+  });
+
   it("dispatches an approved Skill with its exact loaded native name and file path for start and steer", async () => {
     const setup = await createSkillInputSetup();
     const authority = vi.fn();
@@ -5657,6 +5694,43 @@ describe("CodexBackendAdapter", () => {
     expect(degraded.authenticationState).toBe("error");
     expect(degraded.models).toEqual([]);
     expect(degraded.health).toBe("degraded");
+  });
+
+  it.each(["unchanged", "signed out", "replaced"] as const)("fences a native quota reply when the original account is %s", async (change) => {
+    const setup = await createSetup();
+    await setup.adapter.readAccount();
+    const transport = setup.fake.transport!;
+    const request = transport.request.bind(transport);
+    let returned!: () => void, release!: () => void;
+    const replyReady = new Promise<void>(resolve => { returned = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let quotaReads = 0;
+    vi.spyOn(transport, "request").mockImplementation(async (method, params, options) => {
+      const reply = await request(method, params, options);
+      if (method === "account/rateLimits/read" && ++quotaReads === 1) { returned(); await gate; }
+      return reply;
+    });
+    const original = setup.adapter.readAccountUsage("openai");
+    try {
+      await replyReady;
+      if (change !== "unchanged") await setup.adapter.logout();
+      if (change === "replaced") {
+        await setup.adapter.beginLogin({ method: "oauth_browser" });
+        setup.fake.account = { type: "chatgpt", email: "replacement@example.test", planType: "team" };
+        setup.fake.accountRateLimits = { rateLimits: { planType: "team", primary: { usedPercent: 7, windowDurationMins: 300 } } };
+        await expect(setup.adapter.readAccount(true)).resolves.toMatchObject({ authenticationState: "authenticated" });
+        await expect(setup.adapter.readAccountUsage("openai")).resolves.toMatchObject({ providerId: "openai", planType: "team",
+          primaryWindow: { usedPercent: 7 } });
+        expect(quotaReads).toBe(2);
+      } else if (change === "unchanged") {
+        await expect(setup.adapter.readAccount()).resolves.toMatchObject({ authenticationState: "authenticated" });
+      }
+    } finally { release(); }
+    if (change === "unchanged") {
+      await expect(original).resolves.toMatchObject({ providerId: "openai", primaryWindow: { usedPercent: 25 } });
+    } else {
+      await expect(original).rejects.toMatchObject({ publicError: { code: "CODEX_PROVIDER_AUTHENTICATION_STATE_STALE" } });
+    }
   });
 
   it("retires native-auth runtimes before logout without disturbing an independent managed route", async () => {

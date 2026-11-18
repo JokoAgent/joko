@@ -926,7 +926,7 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     });
   });
 
-  it("executes an installed Skill through the live Pi command catalog and records exact durable usage", { timeout: 90_000 }, async () => {
+  it("dispatches the short name of an installed Pi Skill and records exact durable usage", { timeout: 90_000 }, async () => {
     fixture = await RealPiSystemFixture.start();
     const paired = await fixture.pair("Real Pi native Skill command E2E");
     const skillName = `runtime-proof-${randomUUID().slice(0, 8)}`;
@@ -960,18 +960,16 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     const commands = await paired.clients.session.listRuntimeCommands({ sessionId });
     const command = commands.commands.find((candidate) => candidate.resourceId === installed.skill.skillId);
     expect(command).toMatchObject({
+      name: `skill:${skillName}`,
       source: RuntimeCommandSource.SKILL,
       resourceId: installed.skill.skillId,
       loaded: true,
       sessionId
     });
-    if (command === undefined) throw new Error("The live Pi catalog did not expose the installed Skill command.");
-    expect(command.name).not.toBe("");
-
     const queued = await submit(
       paired.clients.operation,
       paired.connectionId,
-      sendInputMutation(sessionId, runtimeGeneration, `/${command.name} ${privateArgument}`)
+      sendInputMutation(sessionId, runtimeGeneration, `/${skillName} ${privateArgument}`)
     );
     expect(queued.state).toBe(OperationState.SUCCEEDED);
     const runId = queueRunIdFrom(queued);

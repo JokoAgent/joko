@@ -1,23 +1,184 @@
-import { randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
-import { resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 import { create, fromBinary } from "@bufbuild/protobuf";
-import { createCodexAdapter, AppServerHost } from "@joko/adapter-codex";
+import { createCodexAdapter, AppServerHost, TransportFault } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
 import { EntityKind, GetOperationRequestSchema, ObjectiveStatus, OperationMutationSchema, OperationState, RetryState, RunState,
   SubmitOperationRequestSchema, ToolCallState } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import {
   abortRunMutation, createManualScheduleMutation, createSessionMutation, pauseQueueMutation, queueRunIdFrom, resumeQueueMutation,
-  scheduleIdFrom, sendInputMutation, sessionIdFrom, submit, triggerScheduleMutation
+  retryRunMutation, runIdFrom, scheduleIdFrom, sendInputMutation, sessionIdFrom, submit, triggerScheduleMutation
 } from "./operations.js";
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
   ? it : it.skip;
+
+it.each(["progress", "no progress", "before dispatch", "unknown dispatch"] as const)("uses the original Codex outcome on manual Retry: %s", async (failure) => {
+  const backendId = "codex-manual-retry";
+  const native = new FakeCodexAppServer();
+  let rejectBeforeWrite = failure === "before dispatch";
+  const host = new AppServerHost({ transportFactory: () => {
+    const transport = native.createTransport();
+    const request = transport.request.bind(transport);
+    transport.request = async (method, params, options) => {
+      if (method === "turn/start" && rejectBeforeWrite) {
+        rejectBeforeWrite = false;
+        throw new TransportFault("not_started", "The scripted turn could not be written.");
+      }
+      return request(method, params, options);
+    };
+    return transport;
+  } });
+  let fixture: OrchestratorE2eFixture | undefined;
+  try {
+    fixture = await OrchestratorE2eFixture.start({ backendFactories: [{
+      instanceId: backendId, adapterKind: "codex", displayName: "Codex manual Retry fixture",
+      create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host })
+    }] });
+    const { clients, connectionId } = await fixture.pair("Manual retry Owner");
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId,
+      createSessionMutation({ backendId, targetId: fixture.targetId(backendId) })));
+    const store = fixture.application.store;
+    const binding = store.getSession(sessionId).descriptor.binding;
+    const threadId = binding.nativeSessionId!;
+    const text = "Inspect the current work and produce a report.";
+    if (failure === "unknown dispatch") {
+      native.dropNextTurnClientId = true;
+      native.timeoutNextTurnStart = true;
+    }
+    const sourceRunId = queueRunIdFrom(await submit(clients.operation, connectionId, sendInputMutation(sessionId, BigInt(binding.generation), text)));
+    const transport = native.transport!;
+    const turnWrites = () => transport.requests.filter(request => request.method === "turn/start");
+    const retry = retryRunMutation(sourceRunId);
+    if (failure === "unknown dispatch") {
+      await waitFor(() => clients.run.getRun({ runId: sourceRunId }), response => response.run?.state === RunState.DISPATCH_UNKNOWN, "unknown Codex dispatch");
+      expect((await submit(clients.operation, connectionId, retry)).state).toBe(OperationState.FAILED);
+      expect(store.findRunByParentId(sourceRunId)).toBeUndefined();
+      expect(turnWrites()).toHaveLength(1);
+      return;
+    }
+
+    const accepted = failure !== "before dispatch";
+    if (accepted) {
+      await waitFor(() => clients.run.getRun({ runId: sourceRunId }), response => response.run?.state === RunState.RUNNING, "accepted Codex retry source");
+      const thread = native.threads.get(threadId)!;
+      const turn = thread.turns.at(-1)!;
+      if (failure === "progress") {
+        const turnId = turn["id"];
+        if (typeof turnId !== "string") throw new Error("The original retry turn has no native identity.");
+        const item = { type: "agentMessage", id: "completed-before-failure", text: "The inspection is already complete.", phase: null, memoryCitation: null, delivery: null };
+        await transport.emitNotification("item/completed", { threadId, turnId, item, completedAtMs: Date.now() });
+        turn["items"] = [...(Array.isArray(turn["items"]) ? turn["items"] : []), item];
+      }
+      turn["status"] = "failed";
+      turn["error"] = { codexErrorInfo: "other", message: "The model operation reported a terminal failure." };
+      thread.status = { type: "idle" };
+      await transport.emitNotification("turn/completed", { threadId, turn });
+    }
+    await waitFor(() => clients.run.getRun({ runId: sourceRunId }), response => response.run?.state === RunState.FAILED, "terminal retryable Codex failure");
+    const sourceQueue = store.findQueueItemByRunId(sessionId, sourceRunId);
+    expect(sourceQueue?.backendAcceptedAt !== undefined).toBe(accepted);
+    expect(turnWrites()).toHaveLength(accepted ? 1 : 0);
+    if (failure === "no progress") {
+      expect(store.findLatestRunForSessionGeneration(sessionId, binding.generation)?.descriptor.id).toBe(sourceRunId);
+      const origin = store.findVisibleSessionMessageOrigin({ sessionId, role: "user", includeRetainedContext: false });
+      const ownedInput = origin === undefined ? undefined : store.findEvent(origin.eventId);
+      expect(ownedInput?.runId === sourceRunId && ownedInput.operationId === sourceQueue?.operationId).toBe(false);
+      const capture = await waitFor(() => Promise.resolve(store.listEvents({ sessionId }).find(event =>
+        event.runId === sourceRunId && event.payload.type === "workspace_diff")), event => event !== undefined, "the original empty Codex workspace capture");
+      expect(capture?.payload).toMatchObject({ type: "workspace_diff", changeSet: { completeBaseline: true, changes: [] } });
+    }
+
+    if (failure === "progress") {
+      expect(store.findLatestAssistantReplyForRuns(sessionId, [sourceRunId])?.payload).toMatchObject({ type: "message_complete", role: "assistant",
+        blocks: [{ kind: "text", text: "The inspection is already complete." }] });
+      const progressRead = vi.spyOn(store, "findVisibleSessionMessageOrigin").mockImplementationOnce(() => { throw new Error("Source timeline unavailable"); });
+      try {
+        const rejected = await submit(clients.operation, connectionId, retry);
+        expect(rejected.state).toBe(OperationState.FAILED);
+        expect(store.findRunByParentId(sourceRunId)).toBeUndefined();
+        expect(turnWrites()).toHaveLength(1);
+      } finally { progressRead.mockRestore(); }
+    }
+
+    const retryId = randomUUID();
+    const original = await submit(clients.operation, connectionId, retry, retryId);
+    const childId = runIdFrom(original);
+    await waitFor(() => clients.run.getRun({ runId: childId }), response => response.run?.state === RunState.RUNNING, "accepted Codex retry child");
+    const expected = failure === "progress" ? "Continue from the interrupted response. Do not repeat completed work or side effects." : text;
+    expect(turnWrites()).toHaveLength(accepted ? 2 : 1);
+    expect(turnWrites().at(-1)?.params).toMatchObject({ threadId, input: [{ type: "text", text: expected, text_elements: [] }] });
+    expect(store.findRunByParentId(sourceRunId)?.descriptor.id).toBe(childId);
+    expect(store.findQueueItemByRunId(sessionId, sourceRunId)?.body.text).toBe(text);
+    expect(store.findQueueItemByRunId(sessionId, childId)?.body.text).toBe(expected);
+    expect(store.getRun(sourceRunId).descriptor.state).toBe("failed");
+    expect(runIdFrom(await submit(clients.operation, connectionId, retry, retryId))).toBe(childId);
+    expect((await submit(clients.operation, connectionId, retry)).state).toBe(OperationState.FAILED);
+    expect(turnWrites()).toHaveLength(accepted ? 2 : 1);
+    await native.completeTurn(threadId);
+    await waitFor(() => clients.run.getRun({ runId: childId }), response => response.run?.state === RunState.SUCCEEDED, "the single retry child to settle");
+  } finally {
+    await fixture?.close();
+    await host.shutdown();
+  }
+});
+
+it("routes a plain Owner Skill command through Connect to a typed native turn", async () => {
+  const backendId = "codex-native-skill";
+  const native = new FakeCodexAppServer();
+  const host = new AppServerHost({ transportFactory: () => native.createTransport() });
+  const sourcePath = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-short-skill-")));
+  const content = "---\nname: repo-audit\ndescription: Review changes\n---\nInspect the specified source files.\n";
+  const revision = `sha256:${createHash("sha256").update(`D\0\0F\0SKILL.md\0${Buffer.byteLength(content)}\0`).update(content).digest("hex")}`;
+  let fixture: OrchestratorE2eFixture | undefined;
+  try {
+    await writeFile(join(sourcePath, "SKILL.md"), content, "utf8");
+    fixture = await OrchestratorE2eFixture.start({ backendFactories: [{
+      instanceId: backendId, adapterKind: "codex", displayName: "Codex Skill command fixture",
+      create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host,
+        resolveNativeSkills: async () => [{ sourcePath, resource: { id: "approved-repo-skill", kind: "skill", name: "Repo audit",
+          source: "managed", state: "approved", revision, resourceVersion: 1n }, assertCurrent: () => undefined }]
+      })
+    }] });
+    const { clients, connectionId } = await fixture.pair("Codex Skill command Owner");
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId,
+      createSessionMutation({ backendId, targetId: fixture.targetId(backendId) })));
+    const binding = fixture.application.store.getSession(sessionId).descriptor.binding;
+    const requests = native.transport!.requests;
+    const start = requests.find(request => request.method === "thread/start")?.params as {
+      readonly config?: { readonly "skills.config"?: readonly { readonly path: string; readonly enabled: boolean }[] };
+    } | undefined;
+    const mount = start?.config?.["skills.config"]?.find(entry => entry.enabled);
+    if (mount === undefined) throw new Error("The native thread did not receive the approved Skill mount.");
+    expect(mount.path).not.toBe(join(sourcePath, "SKILL.md"));
+    native.reviewSkills.push({ path: mount.path, name: "repo-audit", description: "Review changes", enabled: true });
+    expect((await clients.session.listRuntimeCommands({ sessionId })).commands).toContainEqual(expect.objectContaining({
+      name: "repo-audit", resourceId: "approved-repo-skill", loaded: true
+    }));
+    const text = "/repo-audit review src";
+    const runId = queueRunIdFrom(await submit(clients.operation, connectionId, sendInputMutation(sessionId, BigInt(binding.generation), text)));
+    await waitFor(() => clients.run.getRun({ runId }), value => value.run?.state === RunState.RUNNING, "typed Codex Skill turn");
+    expect(requests.filter(request => request.method === "turn/start")).toEqual([
+      expect.objectContaining({ params: expect.objectContaining({ threadId: binding.nativeSessionId, input: [
+        { type: "skill", name: "repo-audit", path: mount.path }, { type: "text", text: "review src", text_elements: [] }
+      ] }) })
+    ]);
+    expect(fixture.application.store.findQueueItemByRunId(sessionId, runId)?.body).toMatchObject({ text, mentions: [] });
+    await native.completeTurn(binding.nativeSessionId!, "Inspected src.");
+    await waitFor(() => clients.run.getRun({ runId }), value => value.run?.state === RunState.SUCCEEDED, "original Codex Skill turn settlement");
+  } finally {
+    await fixture?.close();
+    await host.shutdown();
+    await rm(sourcePath, { recursive: true, force: true });
+  }
+});
 
 it("stops the original Codex Run before the first native turn write and leaves the queue paused", async () => {
   const backendId = "codex-pre-dispatch-stop";

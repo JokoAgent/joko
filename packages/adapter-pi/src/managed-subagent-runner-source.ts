@@ -31,6 +31,8 @@ const FORMAT = 1;
 const MAX_JSON_BYTES = 512 * 1024;
 const MAX_RESULT_BYTES = 256 * 1024;
 const MAX_TRANSCRIPT_BYTES = 50 * 1024 * 1024;
+const MAX_TRANSCRIPT_TOOL_BYTES = 16 * 1024;
+const TRANSCRIPT_DETAIL_TOOLS = new Set(["read", "edit", "write", "bash", "grep", "find", "ls"]);
 const POLICY_DECISION_REQUEST_PREFIX = ${JSON.stringify(POLICY_DECISION_REQUEST_PREFIX)};
 const COMMAND_GATE_REQUEST_PREFIX = ${JSON.stringify(COMMAND_GATE_REQUEST_PREFIX)};
 const MAX_POLICY_DECISION_TITLE_BYTES = ${MAXIMUM_POLICY_DECISION_TITLE_BYTES};
@@ -948,34 +950,66 @@ async function main() {
 
   function safeTranscriptEvent(event) {
     const type = typeof event.type === "string" ? truncateUtf8(redact(event.type), 256) : "unknown";
+    const timestamp = Number.isSafeInteger(event.timestamp) ? event.timestamp : Date.now();
+    const local = config.hostedExecutionPath === undefined;
     if (type.startsWith("tool_execution_")) {
+      const toolName = typeof event.toolName === "string" ? truncateUtf8(redact(event.toolName), 256) : undefined;
+      const details = local && TRANSCRIPT_DETAIL_TOOLS.has(toolName);
+      const args = details && type === "tool_execution_start" ? transcriptToolInput(event.args) : undefined;
+      const result = type === "tool_execution_update" ? event.partialResult : event.result;
+      let output = details ? transcriptText(result, MAX_TRANSCRIPT_TOOL_BYTES) : undefined;
+      if (details && type === "tool_execution_end" && Array.isArray(result?.content) && result.content.length === 0) output = "";
       return {
         type: type,
-        toolName: typeof event.toolName === "string" ? truncateUtf8(redact(event.toolName), 256) : undefined,
+        toolName: toolName,
         toolCallId: typeof event.toolCallId === "string" ? truncateUtf8(redact(event.toolCallId), 512) : undefined,
         isError: event.isError === true,
-        timestamp: Number.isSafeInteger(event.timestamp) ? event.timestamp : Date.now()
+        args: args,
+        content: output,
+        timestamp: timestamp
       };
     }
-    if (type.startsWith("message_") && event.message && typeof event.message === "object") {
-      const text = Array.isArray(event.message.content) ? event.message.content.filter(function (block) {
-        return block && block.type === "text" && typeof block.text === "string";
-      }).map(function (block) { return { type: "text", text: truncateUtf8(redact(block.text), 256 * 1024) }; }) : [];
+    if (type.startsWith("message_")) {
+      const message = event.message;
+      if (local && (type !== "message_end" || !message || (message.role !== "user" && message.role !== "assistant"))) return undefined;
+      if (!message || typeof message !== "object") return { type: type, timestamp: timestamp };
+      const completedText = local ? transcriptText(message, MAX_RESULT_BYTES) : undefined;
+      if (local && completedText === undefined && message.stopReason !== "error") return undefined;
+      const content = local
+        ? completedText === undefined ? [] : [{ type: "text", text: completedText }]
+        : Array.isArray(message.content) ? message.content.filter(function (block) {
+          return block && block.type === "text" && typeof block.text === "string";
+        }).map(function (block) { return { type: "text", text: truncateUtf8(redact(block.text), MAX_RESULT_BYTES) }; }) : [];
       return {
         type: type,
         message: {
-          role: event.message.role === "user" ? "user" : "assistant",
-          content: text,
-          stopReason: typeof event.message.stopReason === "string" ? truncateUtf8(redact(event.message.stopReason), 64) : undefined,
-          errorMessage: typeof event.message.errorMessage === "string" ? truncateUtf8(redact(event.message.errorMessage), 4096) : undefined
+          role: message.role === "user" ? "user" : "assistant",
+          content: content,
+          stopReason: typeof message.stopReason === "string" ? truncateUtf8(redact(message.stopReason), 64) : undefined,
+          errorMessage: typeof message.errorMessage === "string" ? truncateUtf8(redact(message.errorMessage), 4096) : undefined
         },
-        timestamp: Number.isSafeInteger(event.timestamp) ? event.timestamp : Date.now()
+        timestamp: timestamp
       };
     }
-    return {
-      type: type,
-      timestamp: Number.isSafeInteger(event.timestamp) ? event.timestamp : Date.now()
-    };
+    return { type: type, timestamp: timestamp };
+  }
+
+  function transcriptText(value, limit) {
+    if (!value || !Array.isArray(value.content)) return undefined;
+    const text = value.content.flatMap(function (block) {
+      return block && block.type === "text" && typeof block.text === "string" ? [block.text] : [];
+    }).join("");
+    return text.trim() === "" ? undefined : truncateUtf8(redact(text), limit);
+  }
+
+  function transcriptToolInput(value) {
+    if (value === undefined) return undefined;
+    const input = JSON.stringify(value, function (key, item) {
+      if (/^(authorization|headers|env|environment|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|credentials?|private[_-]?key)$/iu.test(key)) return "[REDACTED]";
+      return typeof item === "string" ? redact(item) : item;
+    });
+    if (Buffer.byteLength(input, "utf8") <= MAX_TRANSCRIPT_TOOL_BYTES) return JSON.parse(input);
+    return { preview: truncateUtf8(input, MAX_TRANSCRIPT_TOOL_BYTES), truncated: true };
   }
 
   function handleLine(line) {
@@ -1019,7 +1053,8 @@ async function main() {
       flushStatus();
       return;
     }
-    appendTranscript(safeTranscriptEvent(event));
+    const transcript = safeTranscriptEvent(event);
+    if (transcript !== undefined) appendTranscript(transcript);
     if (event.type === "tool_execution_start") toolUses += 1;
     if (event.type === "message_end" && event.message && event.message.role === "assistant") latestAssistant = sanitizedClone(event.message, redact);
     if (event.type === "queue_update" && expectedQueue) {

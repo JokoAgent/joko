@@ -15,6 +15,7 @@ import {
   evaluateOrderedPolicyRules,
   NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
   NATIVE_PROMPT_IMAGE_MEDIA_TYPES,
+  isProductSlashCommand,
   redactSecrets,
   snapshotNativeSkills,
   nativeTextInferenceImages,
@@ -1458,16 +1459,8 @@ export class PiBackendAdapter implements
       ? unbridgedMessage
       : appendVisionBridgeDescriptions(unbridgedMessage, transient === undefined
         ? bridged.descriptions : bridged.descriptions.slice(0, durableInput.images.length));
-    const commandCatalog = composedMessage.trimStart().startsWith("/")
-      ? await this.#readCommandCatalog(runtime, context).catch(() => EMPTY_PI_COMMAND_CATALOG)
-      : EMPTY_PI_COMMAND_CATALOG;
     const composerCommand = composedMessage.trimStart().startsWith("/")
-      ? resolvePiComposerSlashCommand(
-          composedMessage,
-          input.disposition,
-          commandCatalog.commands,
-          commandCatalog.managedInternalNames
-        )
+      ? await this.#resolveComposerSlashInput(runtime, context, composedMessage, input.disposition)
       : { message: composedMessage };
     const message = composerCommand.message;
     const images = bridged === undefined ? await this.#resolveImages(durableInput, options) : [];
@@ -7178,6 +7171,29 @@ export class PiBackendAdapter implements
     return cache;
   }
 
+  async #resolveComposerSlashInput(
+    runtime: PiRuntime,
+    context: AdapterContext,
+    text: string,
+    disposition: PromptInput["disposition"]
+  ): Promise<ResolvedPiComposerSlashCommand> {
+    const explicitSkill = /^\/skill:[^\s]+/u.test(text.trimStart());
+    const catalog = await this.#readCommandCatalog(runtime, context).catch((error: unknown) => {
+      if (!explicitSkill) return EMPTY_PI_COMMAND_CATALOG;
+      if (error instanceof PiAdapterError && error.publicError.code === "PI_RPC_TIMEOUT") {
+        return this.#readCommandCatalog(runtime, context);
+      }
+      throw error;
+    });
+    if (explicitSkill && catalog === EMPTY_PI_COMMAND_CATALOG) {
+      throw piError("PI_SKILL_COMMAND_CATALOG_UNAVAILABLE", "Pi did not return a valid Skill command catalog", "dispatch", {
+        retryable: true,
+        recovery: "Refresh the task's loaded commands and retry the Skill invocation."
+      });
+    }
+    return resolvePiComposerSlashCommand(text, disposition, catalog.commands, catalog.managedInternalNames);
+  }
+
   async #readCommandCatalog(runtime: PiRuntime, context: AdapterContext): Promise<PiCommandCatalog> {
     const response = await runtime.transport.request({ type: "get_commands" }, { signal: context.signal });
     const data = responseData(response);
@@ -7345,6 +7361,16 @@ export function resolvePiComposerSlashCommand(
     candidate.loaded &&
     candidate.name.replace(/^\//u, "") === requested
   );
+  if (matchingCommands.length === 0 && text.startsWith(`/${requested}`)
+    && !requested.includes(":") && !isProductSlashCommand(requested)) {
+    const invocation = `skill:${requested}`;
+    const aliases = commands.filter((candidate) => candidate.loaded && candidate.name === invocation);
+    const skill = aliases[0];
+    if (aliases.length === 1 && skill?.source === "skill" && skill.inputMode === "text"
+      && skill.builtinSkill === undefined && validResourceUsageIdentity(skill.resourceId, 4_096)) {
+      return { message: `/${invocation}${text.slice(requested.length + 1)}`, skillResourceId: skill.resourceId };
+    }
+  }
   const command = matchingCommands[0];
   if (command?.source === "extension") {
     return { message: text, extensionCommand: requested };

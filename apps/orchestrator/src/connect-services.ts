@@ -18528,30 +18528,36 @@ async function dispatchMutation(
       }
       const nestedId = nestedOperationId(payload.case, operationId);
       const runId = stableId("run", nestedId);
+      const assertRetryable = (store: OperationalStore) => {
+        const current = store.getRun(run.descriptor.id).descriptor;
+        if (current.state !== "failed" || current.error?.retryable !== true) {
+          throw new StoreError("Only a retryable failed Run can be retried.");
+        }
+        const continuation = store.findRunByParentId(current.id);
+        if (continuation !== undefined && continuation.descriptor.id !== runId) {
+          throw new StoreError("This Run already has a durable continuation.");
+        }
+        return current;
+      };
       const execution = await host.mutate({
         operationId,
         connection,
         kind: payload.case,
         body: mutation,
-        precondition: (store) => {
-          const current = store.getRun(run.descriptor.id).descriptor;
-          if (current.state !== "failed" || current.error?.retryable !== true) {
-            throw new StoreError("Only a retryable failed Run can be retried.");
-          }
-          const continuation = store.findRunByParentId(current.id);
-          if (continuation !== undefined && continuation.descriptor.id !== runId) {
-            throw new StoreError("This Run already has a durable continuation.");
-          }
-        },
+        precondition: assertRetryable,
         commit: () => ({ accepted: true, resultCase: "run", entityId: runId } satisfies OperationOutcome),
         effect: async () => {
+          const store = dependencies.store;
+          const current = assertRetryable(store);
+          const source = store.findQueueItemByRunId(current.sessionId, current.id);
+          if (source?.id !== previous.id) throw new StoreError("The original durable queue input is unavailable.");
           const nested = dependencies.sessionHost.enqueueInput({
             operationId: nestedId,
             connection,
-            sessionId: run.descriptor.sessionId,
-            prompt: previous.body,
-            parentRunId: run.descriptor.id,
-            ...(previous.executionOverrides === undefined ? {} : { overrides: previous.executionOverrides })
+            sessionId: current.sessionId,
+            prompt: dependencies.sessionHost.manualRetryPrompt(current, source),
+            parentRunId: current.id,
+            ...(source.executionOverrides === undefined ? {} : { overrides: source.executionOverrides })
           });
           if (nested.value.runId !== runId) throw new Error("RetryRun returned a non-deterministic Run ID.");
         }

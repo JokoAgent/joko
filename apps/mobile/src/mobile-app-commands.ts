@@ -14,7 +14,7 @@ import {
   normalizeMobileComposerDraft,
   type MobileComposerDraft
 } from "./mobile-composer-document";
-import type { MobileRuntimeCommandCandidate } from "./mobile-runtime-commands";
+import { mobileRuntimeCommandHasPrefix, type MobileRuntimeCommandCandidate } from "./mobile-runtime-commands";
 
 export type MobileAppCommandKind = "help" | "jumpSession" | "userShell" | "sessionReset" | "review" | "sideChat";
 
@@ -216,9 +216,11 @@ export function filterMobileCommandPaletteCandidates(
 ): MobileCommandPaletteResults {
   const maximum = Math.max(0, Math.min(maximumVisibleResults, Number.isSafeInteger(limit) ? limit : 0));
   const needle = query.toLowerCase();
-  const matches = candidates.filter((candidate) => candidate.name.toLowerCase().startsWith(needle)
-    || candidate.description.toLowerCase().includes(needle)).sort((left, right) =>
-      Number(right.name.toLowerCase().startsWith(needle)) - Number(left.name.toLowerCase().startsWith(needle)));
+  const hasPrefix = (candidate: MobileCommandPaletteCandidate) => isMobileAppCommandCandidate(candidate)
+    ? candidate.name.toLowerCase().startsWith(needle)
+    : mobileRuntimeCommandHasPrefix(candidate, needle);
+  const matches = candidates.filter((candidate) => hasPrefix(candidate) || candidate.description.toLowerCase().includes(needle))
+    .sort((left, right) => Number(hasPrefix(right)) - Number(hasPrefix(left)));
   return { items: matches.slice(0, maximum), truncated: matches.length > maximum };
 }
 

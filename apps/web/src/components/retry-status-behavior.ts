@@ -30,10 +30,14 @@ export interface RetryEscapeContext {
   readonly canAbortRun?: boolean;
 }
 
-export type RetryEscapeIntent = { readonly kind: "abortRetry"; readonly runId: string } | null;
+type RetryStopAction = "abortRetry" | "abort";
+export type RetryEscapeIntent = { readonly kind: RetryStopAction; readonly runId: string } | null;
 
-export function resolveRetryStopAction(retry: RetryEscapeContext["retry"], capabilities: Pick<RetryEscapeContext, "canAbortRetry" | "canAbortRun">): "abortRetry" | "abort" | undefined {
-  if (capabilities.canAbortRetry && retry?.source === "auto") return "abortRetry";
+export function resolveRetryStopAction(retry: RetryEscapeContext["retry"], capabilities: Pick<RetryEscapeContext, "canAbortRetry" | "canAbortRun">): RetryStopAction | undefined {
+  if (retry?.source === "auto") {
+    if (capabilities.canAbortRun) return "abort";
+    if (capabilities.canAbortRetry) return "abortRetry";
+  }
   if (capabilities.canAbortRun && retry?.source === "unknown"
     && (retry.error?.code === "CLAUDE_CODE_API_RETRY" || retry.error?.code === "CODEX_NATIVE_RECONNECT")) return "abort";
   return undefined;
@@ -44,6 +48,7 @@ export function resolveRetryStopAction(retry: RetryEscapeContext["retry"], capab
  * fills the timeline/header gap while higher-priority UI gets the key first.
  */
 export function resolveRetryEscapeIntent(input: RetryEscapeInput, context: RetryEscapeContext): RetryEscapeIntent {
+  const action = resolveRetryStopAction(context.retry, context);
   if (
     input.key !== "Escape" ||
     input.repeat ||
@@ -54,9 +59,9 @@ export function resolveRetryEscapeIntent(input: RetryEscapeInput, context: Retry
     context.sessionState !== "retrying" ||
     context.activeRunId === undefined ||
     context.retry?.runId !== context.activeRunId ||
-    resolveRetryStopAction(context.retry, context) === undefined
+    action === undefined
   ) return null;
-  return { kind: "abortRetry", runId: context.activeRunId };
+  return { kind: action, runId: context.activeRunId };
 }
 
 /**

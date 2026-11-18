@@ -1742,11 +1742,19 @@ function transcriptEntry(
   }
   if (type.startsWith("message_")) {
     const message = isRecord(nested["message"]) ? nested["message"] : nested;
+    const text = messageText(message, redactValues);
+    if (physical.config["hostedExecutionPath"] === undefined && (type !== "message_end" || text === undefined
+      || message["role"] !== "user" && message["role"] !== "assistant")) {
+      const error = type === "message_end" && message["stopReason"] === "error"
+        ? optionalString(message["errorMessage"], 4_096, redactValues) : undefined;
+      return { ...base, role: "system", content: error ?? type, childId,
+        systemEvent: { kind: error === undefined ? "message-lifecycle" : "message-error" }, ...(error === undefined ? {} : { isError: true }) };
+    }
     const role = message["role"] === "user" ? "parent" : "subagent";
     return {
       ...base,
       role,
-      content: messageText(message, redactValues) ?? type,
+      content: text ?? type,
       ...(role === "subagent" ? { childId } : {}),
       ...(message["stopReason"] === "error" ? { isError: true } : {})
     };
@@ -1868,6 +1876,7 @@ function childIdOf(taskId: string): string {
 }
 
 function transcriptContent(record: Record<string, unknown>, fallback: string, redactValues: readonly string[]): string {
+  if (record["content"] === "") return "";
   return messageText(record, redactValues)
     ?? messageText(isRecord(record["result"]) ? record["result"] : {}, redactValues)
     ?? fallback;
