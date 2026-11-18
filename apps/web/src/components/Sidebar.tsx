@@ -421,6 +421,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const remoteMessageSearchGenerationRef = useRef(0);
   const searchFilterRef = useRef<HTMLDetailsElement>(null);
   const sessionListRef = useRef<HTMLElement>(null);
+  const scrollBeforeSearchRef = useRef<{ readonly ownerKey: string; readonly top: number }>(undefined);
   const projectRemovalFocusRef = useRef<{
     readonly targetId: string;
     readonly ownerId: string;
@@ -1210,6 +1211,26 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     setActiveSearchOption(-1);
   };
 
+  const changeSearchQuery = (value: string): void => {
+    const list = sessionListRef.current;
+    if (searchContextAvailable && !searchPopupOpen && value.trim() !== "" && list !== null) {
+      scrollBeforeSearchRef.current = { ownerKey: sessionSelectionOwnerKey, top: list.scrollTop };
+    }
+    setQuery(value);
+  };
+
+  useLayoutEffect(() => {
+    const list = sessionListRef.current;
+    const previous = scrollBeforeSearchRef.current;
+    if (list === null || previous === undefined) return;
+    if (searchPopupOpen) {
+      list.scrollTop = 0;
+      return;
+    }
+    scrollBeforeSearchRef.current = undefined;
+    list.scrollTop = previous.ownerKey === sessionSelectionOwnerKey ? previous.top : 0;
+  }, [normalizedQuery, searchPopupOpen, sessionSelectionOwnerKey]);
+
   const resetMessageSearchFilters = (): void => {
     setMessageSearchStatus("all");
     setMessageSearchBackendId("all");
@@ -1664,7 +1685,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
             aria-controls={searchPopupOpen ? "conversation-search-results" : undefined}
             aria-activedescendant={activeSearchDescendant}
             value={query}
-            onChange={(event) => setQuery(event.target.value)}
+            onChange={(event) => changeSearchQuery(event.target.value)}
             onKeyDown={handleSearchKeyDown}
             placeholder={lockedSearchTarget === undefined ? t("nav.searchTasks") : t("nav.searchProjectPlaceholder", { name: lockedSearchTarget.name })}
           />
@@ -1785,7 +1806,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
             sessionInfoFields: toggleSidebarSessionInfoField(sidebarLayout.sessionInfoFields, field)
           })}
         />}
-        {searchPopupOpen ? (
+        {searchPopupOpen && (
           <div id="conversation-search-results" className="conversation-search-popup" role="listbox" aria-label={t("nav.searchResults")}>
             {!messageSearchLoading && messageSearchError === undefined && <SearchResults
               results={searchResults}
@@ -1814,8 +1835,8 @@ export function Sidebar(props: SidebarProps): JSX.Element {
             {remoteMessageSearchError !== undefined && <p className="sidebar-search__status sidebar-search__status--error" role="alert">{remoteMessageSearchError}</p>}
             {!messageSearchLoading && !remoteMessageSearchLoading && messageSearchError === undefined && remoteMessageSearchError === undefined && searchResults.length === 0 && remoteSearchOptions.length === 0 && <p className="sidebar__empty">{t("nav.noMatchingTasks")}</p>}
           </div>
-        ) : (
-          <>
+        )}
+          <div hidden={searchPopupOpen}>
             {pinnedEntries.length > 0 && <PinnedSessionSection
               viewMode={sidebarLayout.pinnedViewMode}
               title={t("nav.pinned")}
@@ -1862,8 +1883,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
                   onToggle={() => toggleDeviceSection(localDeviceId)}
                 >{localMainContent}</SidebarDeviceSection>
               : localMainContent}
-          </>
-        )}
+          </div>
         {!searchPopupOpen && props.machineControl !== undefined && remoteMachineCaches.length > 0 && <RemoteMachineSessionSections
           caches={remoteMachineCaches}
           presenceByProfile={props.machineControl.presenceByProfile}

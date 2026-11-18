@@ -865,6 +865,93 @@ describe("session host, durable events, and reconnect semantics", () => {
     releaseTurn.release();
   });
 
+  mountedTimelineIt("restores sidebar preview, pinned collapse, and manual scroll after cancelling search", { timeout: 90_000 }, async () => {
+    fixture = await OrchestratorE2eFixture.start({ webDirectory: process.env.JOKO_MOUNTED_WEB_DIR! });
+    const manager = await fixture.pair("Sidebar fixture Owner");
+    const { store, sessionHost, workspaces } = fixture.application;
+    const backendId = fixture.adapter().id;
+    const projectId = "scroll-project";
+    const displayName = "Scroll project";
+    const workspaceRoot = join(fixture.rootDirectory, projectId);
+    await mkdir(workspaceRoot);
+    await workspaces.register({ id: projectId, displayName, root: workspaceRoot, trusted: true });
+    await sessionHost.registerTarget({ id: projectId, backendId, displayName, workspaceRoot, managed: false, trusted: true }, { workspaceId: projectId });
+    const oldActivity = Date.now() - 3 * 24 * 60 * 60 * 1000;
+    const taskCount = 18;
+    for (let index = 1; index <= taskCount; index++) {
+      const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
+        createSessionMutation({ backendId, targetId: projectId, displayName: `Scroll sample ${index}` })));
+      store.updateSession(sessionId, {}, undefined, oldActivity - index);
+    }
+    const pinnedId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
+      createSessionMutation({ backendId, targetId: fixture.targetId(), displayName: "Pinned sidebar anchor" })));
+    expect((await submit(manager.clients.operation, manager.connectionId, pinMutation(pinnedId, true))).state).toBe(OperationState.SUCCEEDED);
+
+    const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Search Sidebar Web" });
+    if (!challenge.challenge) throw new Error("Sidebar pairing returned no challenge.");
+    browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 540 }, locale: "en-US" });
+    await page.goto(fixture.baseUrl, { waitUntil: "domcontentloaded" });
+    await page.locator(".connection-tabs > button").nth(2).click();
+    await page.locator('details.device-authorization__manual > summary').click();
+    await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+    await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challenge.challengeId));
+    await page.getByLabel("Device name").fill("Search Sidebar Web");
+    await page.locator("form.pair-form button[type=submit]").click();
+
+    const list = page.locator(".sidebar__sessions");
+    const project = list.locator(".sidebar-main-view .project-group").filter({ has: page.getByText(displayName, { exact: true }) });
+    const rows = project.locator("button[data-session-id]");
+    const pinned = list.locator(".session-section--pinned");
+    const pinnedHeading = pinned.locator(".session-section__heading-label");
+    const preview = project.getByRole("button", { name: `Show all ${taskCount} tasks`, exact: true });
+    await preview.waitFor({ state: "visible" });
+    expect(await rows.count()).toBe(5);
+    await pinned.getByRole("button", { name: "Collapse pinned tasks", exact: true }).click();
+    await preview.click();
+    expect(await rows.count()).toBe(taskCount);
+    const offset = await list.evaluate(node => {
+      node.scrollTop = Math.floor((node.scrollHeight - node.clientHeight) / 2);
+      return node.scrollTop;
+    });
+    expect(offset).toBeGreaterThan(0);
+    const search = page.locator("#conversation-search-input");
+    const results = page.locator("#conversation-search-results");
+    for (const query of ["qxzvvqzxvt", "Scroll sample"]) {
+      await search.fill(query);
+      if (query === "Scroll sample") {
+        await results.getByText(`Scroll sample ${taskCount}`, { exact: true }).waitFor({ state: "visible" });
+        expect(await list.evaluate(node => node.scrollTop)).toBe(0);
+        expect(await list.evaluate(node => {
+          node.scrollTop = node.scrollHeight;
+          return node.scrollTop;
+        })).toBeGreaterThan(0);
+      } else {
+        await results.getByText("No matching tasks", { exact: true }).waitFor({ state: "visible" });
+      }
+      await project.waitFor({ state: "hidden" });
+      await search.press("Escape");
+      await results.waitFor({ state: "detached" });
+      await project.waitFor({ state: "visible" });
+      await browserFrames(page);
+      expect(await pinnedHeading.getAttribute("aria-expanded")).toBe("false");
+      expect(await pinned.locator(`button[data-session-id="${pinnedId}"]`).count()).toBe(0);
+      expect(await rows.count()).toBe(taskCount);
+      expect(await list.evaluate(node => node.scrollTop)).toBe(offset);
+    }
+
+    const header = project.locator("[data-project-header]");
+    await header.press("Enter");
+    await expect.poll(() => header.getAttribute("aria-expanded")).toBe("false");
+    await header.press("Enter");
+    await preview.waitFor({ state: "visible" });
+    expect(await rows.count()).toBe(5);
+    await search.fill("Pinned sidebar anchor");
+    await results.getByText("Pinned sidebar anchor", { exact: true }).waitFor({ state: "visible" });
+    await search.press("Enter");
+    await page.waitForFunction(sessionId => decodeURIComponent(location.hash).includes(sessionId), pinnedId);
+  });
+
   mountedTimelineIt("keeps Stop and composer Escape available during a native Claude retry wait", { timeout: 75_000 }, async () => {
     let activeTurn: AdapterContext | undefined;
     fixture = await OrchestratorE2eFixture.start({
