@@ -183,8 +183,10 @@ it.each(["progress", "no progress", "before dispatch", "unknown dispatch"] as co
       const thread = native.threads.get(threadId)!;
       const turn = thread.turns.at(-1)!;
       if (failure === "progress") {
+        const turnId = turn["id"];
+        if (typeof turnId !== "string") throw new Error("The original retry turn has no native identity.");
         const item = { type: "agentMessage", id: "completed-before-failure", text: "The inspection is already complete.", phase: null, memoryCitation: null, delivery: null };
-        await transport.emitNotification("item/completed", { threadId, turnId: turn["id"], item, completedAtMs: Date.now() });
+        await transport.emitNotification("item/completed", { threadId, turnId, item, completedAtMs: Date.now() });
         turn["items"] = [...(Array.isArray(turn["items"]) ? turn["items"] : []), item];
       }
       turn["status"] = "failed";
