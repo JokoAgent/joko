@@ -3,7 +3,10 @@ import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
-import { buildMobileMarkdownRichHtml, parseMobileMarkdownRichStatus, type MobileMarkdownRichRuntime } from "./mobile-markdown-rich-html";
+import {
+  buildMobileMarkdownRichHtml, parseMobileMarkdownDiagramPng, parseMobileMarkdownRichStatus,
+  requestMobileMarkdownDiagramPngScript, type MobileMarkdownRichRuntime
+} from "./mobile-markdown-rich-html";
 
 const require = createRequire(import.meta.url);
 const { JSDOM } = require("jsdom");
@@ -66,6 +69,46 @@ describe("mobile rich Markdown runtime", () => {
       if (state === "ready") expect(root?.querySelector("svg")?.getAttribute("viewBox")).toBe("0 0 760 120");
       else expect(root?.querySelector("pre")?.textContent).toBe(source);
       expect(html.includes("height:calc(100vh - 16px)")).toBe(zoomable);
+    } finally { dom.window.close(); }
+  });
+
+  it("encodes the full chart viewBox with the surface color on an explicit PNG request", async () => {
+    const receipts: string[] = [];
+    const drawnSvg: string[] = [];
+    const canvas = { fillStyle: "", fillRect: vi.fn(), drawImage: vi.fn() };
+    const engine = { initialize: vi.fn(), render: vi.fn(async () => ({
+      svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="40 -10 760 120"><title>Only the chart</title></svg>'
+    })) };
+    class ImageForCanvas {
+      onload?: () => void;
+      set src(data: string) {
+        drawnSvg.push(decodeURIComponent(data.slice(data.indexOf(",") + 1)));
+        queueMicrotask(() => this.onload?.());
+      }
+    }
+    const dom = new JSDOM(buildMobileMarkdownRichHtml({ instanceId: "chart", kind: "mermaid", colors, source: gantt, zoomable: true },
+      { mermaidScript: "", katexScript: "", katexCss: "" }), {
+      runScripts: "dangerously",
+      beforeParse(window: Window & typeof globalThis) {
+        Object.assign(window, { Image: ImageForCanvas, jokoMermaid: engine,
+          ReactNativeWebView: { postMessage: (raw: string) => receipts.push(raw) } });
+        Object.defineProperty(window.HTMLCanvasElement.prototype, "getContext", { value: () => canvas });
+        Object.defineProperty(window.HTMLCanvasElement.prototype, "toDataURL", { value: () => "data:image/png;base64,QQ==" });
+      }
+    });
+    try {
+      await vi.waitFor(() => expect(receipts.some(raw => parseMobileMarkdownRichStatus(raw, "chart")?.state === "ready")).toBe(true));
+      expect(drawnSvg).toEqual([]);
+      dom.window.eval(requestMobileMarkdownDiagramPngScript("original"));
+      await vi.waitFor(() => expect(parseMobileMarkdownDiagramPng(receipts.at(-1)!, "chart", "original")).toEqual({ base64: "QQ==" }));
+      expect(drawnSvg).toHaveLength(1);
+      expect(drawnSvg[0]).toContain('viewBox="40 -10 760 120"');
+      expect(drawnSvg[0]).toContain('width="2280" height="360"');
+      expect(drawnSvg[0]).toContain("<title>Only the chart</title>");
+      expect(canvas.fillStyle).toBe(colors.surface);
+      expect(canvas.fillRect).toHaveBeenCalledWith(0, 0, 2280, 360);
+      expect(canvas.drawImage).toHaveBeenCalledWith(expect.any(ImageForCanvas), 0, 0, 2280, 360);
+      expect(parseMobileMarkdownDiagramPng(receipts.at(-1)!, "other-chart", "original")).toBeUndefined();
     } finally { dom.window.close(); }
   });
 

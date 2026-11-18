@@ -7,12 +7,15 @@ import type { MobileMarkdownResourceClient } from "./use-mobile-markdown-resourc
 
 vi.mock("./MobileSelectableMessageText", () => ({ MobileSelectableMessageText: () => null }));
 
-const { copy, openUrl, appStateListeners, pressureListeners, nativeImages, scrollLayouts, richSurface } = vi.hoisted(() => ({
+const { copy, openUrl, appStateListeners, pressureListeners, nativeImages, scrollLayouts, richSurface, shareDiagram } = vi.hoisted(() => ({
   copy: vi.fn(async () => undefined), openUrl: vi.fn(async () => undefined),
   appStateListeners: new Set<(state: string) => void>(), pressureListeners: new Set<() => void>(),
   nativeImages: new Map<string, { onError(): void; onLoad(event: { source: { width: number; height: number; isAnimated?: boolean } }): void }>(),
   scrollLayouts: new WeakMap<HTMLElement, (event: { nativeEvent: { layout: { width: number } } }) => void>(),
-  richSurface: { mounted: false }
+  richSurface: { mounted: false, inject: vi.fn(), receive: new WeakMap<HTMLElement, (raw: string) => void>() },
+  shareDiagram: vi.fn(async (
+    _action: string, _source: unknown, _rendered: unknown, _signal: AbortSignal, beforeDispatch: () => void
+  ) => beforeDispatch())
 }));
 vi.mock("expo-clipboard", () => ({ setStringAsync: copy }));
 vi.mock("lucide-react-native", () => ({ Mail: () => null, CalendarDays: () => null, Folder: () => null,
@@ -23,11 +26,22 @@ vi.mock("react-native-svg", () => ({ default: () => null, Path: () => null, Rect
   Polygon: () => null, Polyline: () => null, Line: () => null, Circle: () => null, Text: () => null }));
 vi.mock("expo-crypto", () => ({ randomUUID: () => "render-1" }));
 vi.mock("./rich-markdown-runtime.richjs", () => ({ default: { mermaidScript: "", katexScript: "", katexCss: "" } }));
+vi.mock("./mobile-image-output", () => ({ mobileImageOutput: { perform: shareDiagram } }));
 vi.mock("./use-mobile-preview-resource-lifecycle", () => ({
-  useMobilePreviewResourceLifecycle: () => ({ rendererMounted: richSurface.mounted })
+  useMobilePreviewResourceLifecycle: () => ({ rendererMounted: richSurface.mounted, rendererToken: "view-token",
+    ownsRenderer: (token: string) => token === "view-token", onRendererReady() {} })
 }));
-vi.mock("react-native-webview", () => ({ WebView: ({ source }: { source: { html: string } }) =>
-  createElement("div", { "data-rich-web-view": true, "data-html": source.html }) }));
+vi.mock("react-native-webview", async () => {
+  const { forwardRef, useImperativeHandle } = await vi.importActual<typeof import("react")>("react");
+  return { WebView: forwardRef<{ injectJavaScript: typeof richSurface.inject }, {
+    source: { html: string }; onMessage?: (event: { nativeEvent: { data: string } }) => void;
+  }>(function TestWebView({ source, onMessage }, ref) {
+    useImperativeHandle(ref, () => ({ injectJavaScript: richSurface.inject }));
+    return createElement("div", { "data-rich-web-view": true, "data-html": source.html, ref: (element: HTMLDivElement | null) => {
+      if (element && onMessage) richSurface.receive.set(element, (data) => onMessage({ nativeEvent: { data } }));
+    } });
+  }) };
+});
 vi.mock("./mobile-resource-pressure", () => ({ subscribeMobileResourcePressure: (listener: () => void) => {
   pressureListeners.add(listener); return { remove: () => pressureListeners.delete(listener) };
 } }));
@@ -193,6 +207,50 @@ describe("native message Markdown", () => {
       expect(modal().querySelector(view)).not.toBeNull();
       await press("Close");
       expect(modal()).toBeNull();
+    } finally {
+      richSurface.mounted = false;
+      await act(async () => root.unmount());
+    }
+  });
+
+  it("shares the ready original diagram once and retires a receipt when leaving its chart", async () => {
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    const colors = { surface: "#fff", background: "#fafafa", ink: "#111", muted: "#666",
+      border: "#ccc", accent: "#f90", negative: "#c33" };
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+    const button = (name: string) => Array.from(container.querySelectorAll<HTMLButtonElement>("[data-native-modal] button"))
+      .find((item) => item.textContent === name)!;
+    richSurface.mounted = true;
+    richSurface.inject.mockClear();
+    shareDiagram.mockClear();
+    try {
+      await act(async () => root.render(<MobileMarkdownMessage text={"```mermaid\nflowchart TD\nA --> B\n```"}
+        colors={colors} locale="en" ownerKey="chart-export" />));
+      await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Expand"]')!.click());
+      const chart = container.querySelector<HTMLElement>("[data-native-modal] [data-rich-web-view]")!;
+      const receive = richSurface.receive.get(chart)!;
+      const reply = (requestId: string) => receive(JSON.stringify({
+        type: "joko-rich-markdown/png", instanceId: "render-1", requestId, base64: png
+      }));
+      expect(button("Export image").disabled).toBe(true);
+      await act(async () => receive(JSON.stringify({
+        type: "joko-rich-markdown/status", instanceId: "render-1", state: "ready", height: 120
+      })));
+      expect(button("Export image").disabled).toBe(false);
+      await act(async () => { const exportButton = button("Export image"); exportButton.click(); exportButton.click(); });
+      expect(richSurface.inject).toHaveBeenCalledTimes(1);
+      expect(button("Exporting…").disabled).toBe(true);
+      await act(async () => reply("another-request"));
+      expect(shareDiagram).not.toHaveBeenCalled();
+      await act(async () => reply("render-1"));
+      expect(shareDiagram).toHaveBeenCalledExactlyOnceWith("share", expect.objectContaining({
+        fileName: "Joko-diagram.png", mediaType: "image/png", width: 1, height: 1
+      }), undefined, expect.any(AbortSignal), expect.any(Function));
+      await act(async () => button("Export image").click());
+      await act(async () => button("Source").click());
+      await act(async () => reply("render-1"));
+      expect(shareDiagram).toHaveBeenCalledTimes(1);
     } finally {
       richSurface.mounted = false;
       await act(async () => root.unmount());

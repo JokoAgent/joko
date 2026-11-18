@@ -1081,6 +1081,8 @@ const mobileTaskMessageRows = [
   ["markdown.image", "Image", "图片", "圖片", "画像", "이미지"],
   ["markdown.expand", "Expand", "展开", "展開", "拡大", "확대"],
   ["markdown.source", "Source", "源码", "原始碼", "ソース", "원본"],
+  ["markdown.exportImage", "Export image", "导出图片", "匯出圖片", "画像をエクスポート", "이미지 내보내기"],
+  ["markdown.exportingImage", "Exporting…", "正在导出…", "正在匯出…", "エクスポート中…", "내보내는 중…"],
   ["markdown.copySource", "Copy source", "复制原文", "複製原文", "ソースをコピー", "원본 복사"],
   ["markdown.copying", "Copying…", "正在复制…", "正在複製…", "コピー中…", "복사 중…"],
   ["markdown.copied", "Source copied.", "已复制原文。", "已複製原文。", "ソースをコピーしました。", "원본을 복사했습니다."],

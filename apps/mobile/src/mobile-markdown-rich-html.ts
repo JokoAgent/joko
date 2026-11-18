@@ -29,6 +29,8 @@ export function escapeMobileMarkdownHtml(value: string): string {
 }
 
 const markTags = { strong: "strong", emphasis: "em", strikethrough: "del" } as const;
+export const MOBILE_MARKDOWN_DIAGRAM_PNG_MAXIMUM_BYTES = 8 * 1024 * 1024;
+const maximumDiagramPngBase64 = Math.ceil(MOBILE_MARKDOWN_DIAGRAM_PNG_MAXIMUM_BYTES / 3) * 4;
 
 export function wrapMobileMarkdownHtmlMarks(html: string, marks: readonly MobileMarkdownInlineMark[] | undefined): string {
   return marks?.reduceRight((inner, mark) => `<${markTags[mark]}>${inner}</${markTags[mark]}>`, html) ?? html;
@@ -56,6 +58,7 @@ export function buildMobileMarkdownRichHtml(input: {
       engine.initialize({ startOnLoad: false, securityLevel: 'strict', suppressErrorRendering: true,
         maxTextSize: 100000, theme: ${mobileMarkdownScriptValue(dark ? "dark" : "default")},
         gantt: { useWidth: 760 },
+        ${fillsViewport ? "htmlLabels: false, flowchart: { htmlLabels: false }," : ""}
         themeVariables: { background: ${mobileMarkdownScriptValue(colors.surface)},
           primaryColor: ${mobileMarkdownScriptValue(colors.background)}, primaryTextColor: ${mobileMarkdownScriptValue(colors.ink)},
           primaryBorderColor: ${mobileMarkdownScriptValue(colors.border)}, lineColor: ${mobileMarkdownScriptValue(colors.muted)} } });
@@ -92,10 +95,75 @@ export function buildMobileMarkdownRichHtml(input: {
     function finish(state){if(settled)return;settled=true;clearTimeout(timer);
       if(state==='error'){root.textContent='';var pre=document.createElement('pre');pre.textContent=source;root.appendChild(pre);}
       report(state);document.fonts && document.fonts.ready.then(function(){report(state);});}
+    ${fillsViewport ? mobileMarkdownDiagramEncoder(colors.surface) : ""}
     report('source');var timer=setTimeout(function(){finish('error');},8000);
     try{var script=document.createElement('script');script.textContent=${mobileMarkdownScriptValue(runtimeScript)};
       document.head.appendChild(script);${render}}catch(error){finish('error');}
     </script></body></html>`;
+}
+
+function mobileMarkdownDiagramEncoder(surface: string): string {
+  return `window.jokoExportMarkdownDiagram = function(requestId) {
+    function send(base64) {
+      var payload = { type: 'joko-rich-markdown/png', instanceId: instanceId, requestId: requestId };
+      if (base64) payload.base64 = base64;
+      if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify(payload));
+    }
+    try {
+      var svg = root.classList.contains('diagram') && root.querySelector(':scope > svg');
+      var bounds = svg && (svg.getAttribute('viewBox') || '').trim().split(/[\\s,]+/).map(Number);
+      if (!bounds || bounds.length !== 4 || bounds.some(function(value) { return !Number.isFinite(value); })
+        || bounds[2] <= 0 || bounds[3] <= 0) return send();
+      var width = bounds[2], height = bounds[3];
+      var scale = Math.min(3, 4096 / width, 4096 / height, Math.sqrt(12000000 / (width * height)));
+      var canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.floor(width * scale));
+      canvas.height = Math.max(1, Math.floor(height * scale));
+      var context = canvas.getContext('2d');
+      if (!context) return send();
+      var clone = svg.cloneNode(true);
+      clone.removeAttribute('style');
+      clone.setAttribute('width', String(canvas.width));
+      clone.setAttribute('height', String(canvas.height));
+      clone.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+      var data = encodeURIComponent(new XMLSerializer().serializeToString(clone));
+      if (!data || data.length > 6000000) return send();
+      var image = new Image();
+      image.onerror = function() { send(); };
+      image.onload = function() {
+        try {
+          context.fillStyle = ${mobileMarkdownScriptValue(surface)};
+          context.fillRect(0, 0, canvas.width, canvas.height);
+          context.drawImage(image, 0, 0, canvas.width, canvas.height);
+          var prefix = 'data:image/png;base64,';
+          var png = canvas.toDataURL('image/png');
+          send(png.startsWith(prefix) && png.length - prefix.length <= ${maximumDiagramPngBase64}
+            ? png.slice(prefix.length) : undefined);
+        } catch (error) { send(); }
+      };
+      image.src = 'data:image/svg+xml;charset=utf-8,' + data;
+    } catch (error) { send(); }
+  };`;
+}
+
+export function requestMobileMarkdownDiagramPngScript(requestId: string): string {
+  return `window.jokoExportMarkdownDiagram && window.jokoExportMarkdownDiagram(${mobileMarkdownScriptValue(requestId)});true;`;
+}
+
+export function parseMobileMarkdownDiagramPng(raw: string, instanceId: string, requestId: string):
+  { readonly base64: string } | { readonly failed: true } | undefined {
+  if (raw.length > maximumDiagramPngBase64 + 512) return undefined;
+  try {
+    const value = JSON.parse(raw) as Record<string, unknown>;
+    if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.type !== "joko-rich-markdown/png" || value.instanceId !== instanceId || value.requestId !== requestId) return undefined;
+    const fields = Object.keys(value);
+    if (fields.length === 3) return { failed: true };
+    if (fields.length === 4 && typeof value.base64 === "string" && value.base64.length > 0 && value.base64.length <= maximumDiagramPngBase64) {
+      return { base64: value.base64 };
+    }
+  } catch { /* The renderer must provide a bounded receipt for this request. */ }
+  return undefined;
 }
 
 export function parseMobileMarkdownRichStatus(raw: string, instanceId: string): {
