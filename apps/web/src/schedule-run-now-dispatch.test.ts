@@ -105,7 +105,9 @@ describe("Schedule Run Now dispatch tracker", () => {
     const tracker = createScheduleRunNowDispatchTracker();
     const oldRpc = deferred<void>();
     const oldAttempt = required(tracker.begin("schedule-a", runtime("owner-a")));
-    const oldPresentation = tracker.attach(oldAttempt, () => oldRpc.promise);
+    const oldDispatch = vi.fn((_operationId: string) => oldRpc.promise);
+    const oldPresentation = tracker.attach(oldAttempt, oldDispatch);
+    await vi.waitFor(() => expect(oldDispatch).toHaveBeenCalledWith(oldAttempt.operationId));
 
     tracker.observe(runtime("owner-b"));
     await expect(oldPresentation).resolves.toBeUndefined();
@@ -113,7 +115,9 @@ describe("Schedule Run Now dispatch tracker", () => {
 
     const currentRpc = deferred<void>();
     const currentAttempt = required(tracker.begin("schedule-a", runtime("owner-b")));
-    const currentPresentation = tracker.attach(currentAttempt, () => currentRpc.promise);
+    const currentDispatch = vi.fn((_operationId: string) => currentRpc.promise);
+    const currentPresentation = tracker.attach(currentAttempt, currentDispatch);
+    await vi.waitFor(() => expect(currentDispatch).toHaveBeenCalledWith(currentAttempt.operationId));
     oldRpc.reject(new Error("late retired owner response"));
     await Promise.resolve();
     await Promise.resolve();
