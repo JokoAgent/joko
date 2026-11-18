@@ -70,7 +70,7 @@ import {
 import { sessionTaskLink } from "../session-window-navigation.js";
 import type { SessionProjectNavigationPlacement } from "../session-project-navigation.js";
 import { portableSessionExportSupported } from "../portable-session-ui.js";
-import { sidebarSessionListView } from "../sidebar-session-list.js";
+import { sidebarSessionListView, SIDEBAR_PROJECT_LIST_MINIMUM_VISIBLE } from "../sidebar-session-list.js";
 import {
   groupSidebarScheduleSessions,
   sidebarScheduleEntryActivityAt,
@@ -448,6 +448,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
   const [collapsedDeviceSections, setCollapsedDeviceSections] = useState<ReadonlySet<string>>(() => new Set());
   const [scheduleGroupFoldIntent, setScheduleGroupFoldIntent] = useState<{ readonly revision: number; readonly collapsed: boolean }>();
   const [railPanel, setRailPanel] = useState<SidebarRailPanelState>();
+  const [showAllRailProjects, setShowAllRailProjects] = useState(false);
   const [railPreview, setRailPreview] = useState<SidebarRailPreviewState>();
   const [, setScheduleGroupExpansionRevision] = useState(0);
   const railCloseTimerRef = useRef<number | undefined>(undefined);
@@ -788,6 +789,15 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     });
   }, [railRemotePanelEntries]);
   const railProjectEntries = [...railLocalProjectEntries, ...railRemoteProjectEntries];
+  const railProjectsView = sidebarSessionListView({
+    items: railProjectEntries,
+    showAll: showAllRailProjects,
+    minimumVisible: SIDEBAR_PROJECT_LIST_MINIMUM_VISIBLE,
+    isCurrent: (entry) => entry.kind === "local" && entry.sessions.some((session) => session.id === activeSessionId),
+    hasAttention: (entry) => entry.kind === "local"
+      ? entry.target.pinned || sidebarGroupIndicatorState(entry.sessions, priorityContext) !== undefined
+      : entry.sessions.some((session) => remoteCachedStatus(session) !== undefined)
+  });
   const railDialogueSessions = railLocalPanelSessions.filter((session) => sidebarNavigationProjectId(session, hiddenProjectIds) === undefined);
   const railRemoteDialogueEntries = railRemotePanelEntries
     .filter(({ session }) => session.targetName === undefined)
@@ -1471,6 +1481,9 @@ export function Sidebar(props: SidebarProps): JSX.Element {
     railKeyboardReturnRef.current = undefined;
   }, [cancelRailClose, cancelRailProjectClose, props.mode, props.open]);
   useEffect(() => {
+    if (railPanel?.section !== "projects") setShowAllRailProjects(false);
+  }, [railPanel?.section]);
+  useEffect(() => {
     if (railPanel === undefined) return;
     const ownerDocument = railPanel.trigger.ownerDocument;
     const ownerWindow = ownerDocument.defaultView;
@@ -2056,7 +2069,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
         ><SquarePen aria-hidden="true" /></IconButton>}
       </div>
       <div className="sidebar-rail-panel__scroll">
-        {railPanel.section === "projects" ? railProjectEntries.map((entry) => {
+        {railPanel.section === "projects" ? <>{railProjectsView.visibleItems.map((entry) => {
           const indicator = entry.kind === "local"
             ? sidebarGroupIndicatorState(entry.sessions, priorityContext)
             : strongestSidebarRightStatus(entry.sessions.map(remoteCachedStatus));
@@ -2094,7 +2107,11 @@ export function Sidebar(props: SidebarProps): JSX.Element {
               <ChevronRight aria-hidden="true" />
             </button>
           </div>;
-        }) : <>
+        })}{railProjectsView.overflowing && <button
+          type="button"
+          className="session-list-show-all"
+          onClick={() => setShowAllRailProjects(true)}
+        >{t("nav.showAllProjects", { count: railProjectsView.totalCount })}</button>}</> : <>
           <CollapsibleSessionRows
             sessions={railDialogueSessions}
             activeSessionId={activeSessionId}
@@ -4243,6 +4260,14 @@ function SessionSection({ title, sessions, targets, activeSessionId, locale, col
 } & SessionSectionCallbacks & SessionPriorityProps & SessionDisplayProps & ScheduleGroupPresentationProps): JSX.Element {
   const hiddenProjectIds = new Set(targets.filter((target) => target.archived).map((target) => target.id));
   const groups = targets.filter((target) => !target.archived).map((target) => ({ target, sessions: sessions.filter((session) => session.projectId === target.id) })).filter((group) => group.sessions.length > 0);
+  const [showAllProjects, setShowAllProjects] = useState(false);
+  const projectsView = sidebarSessionListView({
+    items: groups,
+    showAll: showAllProjects,
+    minimumVisible: SIDEBAR_PROJECT_LIST_MINIMUM_VISIBLE,
+    isCurrent: (group) => group.sessions.some((session) => session.id === activeSessionId),
+    hasAttention: (group) => sidebarGroupIndicatorState(group.sessions, priorityContext) !== undefined
+  });
   const dialogue = sessions.filter((session) => sidebarNavigationProjectId(session, hiddenProjectIds) === undefined);
   const renderGroup = ({ target, sessions: targetSessions }: (typeof groups)[number]): JSX.Element => {
     const allTargetSessions = projectActions.allSessions.filter((session) => session.projectId === target.id);
@@ -4329,14 +4354,19 @@ function SessionSection({ title, sessions, targets, activeSessionId, locale, col
       <h2>{title}</h2>
       <div className="session-section__projects">
         {projectOrder === "custom" ? <SortableList
-          items={groups}
+          items={projectsView.visibleItems}
           getId={(group) => group.target.id}
           onReorder={onReorderTargets}
           renderItem={renderGroup}
           reducedMotion={reducedMotion}
           handle="[data-project-header]"
           className="session-section__sortable-projects"
-        /> : groups.map(renderGroup)}
+        /> : projectsView.visibleItems.map(renderGroup)}
+        {projectsView.overflowing && <button
+          type="button"
+          className="session-list-show-all"
+          onClick={() => setShowAllProjects(true)}
+        >{t("nav.showAllProjects", { count: projectsView.totalCount })}</button>}
         {renderDialogue()}
       </div>
     </section>

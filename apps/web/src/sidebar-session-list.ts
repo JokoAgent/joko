@@ -1,13 +1,14 @@
 export const SIDEBAR_SESSION_LIST_MINIMUM_VISIBLE = 5;
 export const SIDEBAR_SESSION_LIST_RECENT_WINDOW_MS = 24 * 60 * 60 * 1_000;
+export const SIDEBAR_PROJECT_LIST_MINIMUM_VISIBLE = 20;
 
 export interface SidebarSessionListViewInput<T> {
   readonly items: readonly T[];
   readonly showAll: boolean;
   readonly isCurrent: (item: T) => boolean;
   readonly hasAttention: (item: T) => boolean;
-  readonly activityAt: (item: T) => number;
-  readonly nowMs: number;
+  readonly activityAt?: (item: T) => number;
+  readonly nowMs?: number;
   readonly minimumVisible?: number;
   readonly recentWindowMs?: number;
 }
@@ -47,9 +48,9 @@ export function sidebarSessionListView<T>({
     ? Math.max(0, Math.round(minimumVisible))
     : SIDEBAR_SESSION_LIST_MINIMUM_VISIBLE;
   const boundedWindow = Number.isFinite(recentWindowMs) ? Math.max(0, recentWindowMs) : 0;
-  const recentSince = Number.isFinite(nowMs) ? nowMs - boundedWindow : Number.POSITIVE_INFINITY;
+  const recentSince = nowMs !== undefined && Number.isFinite(nowMs) ? nowMs - boundedWindow : Number.POSITIVE_INFINITY;
   const visibleAt = (item: T, index: number): boolean =>
-    index < headCount || activityAt(item) >= recentSince || hasAttention(item);
+    index < headCount || (activityAt !== undefined && activityAt(item) >= recentSince) || hasAttention(item);
 
   if (items.some((item, index) => isCurrent(item) && !visibleAt(item, index))) return allVisible();
 

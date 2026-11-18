@@ -520,6 +520,63 @@ describe("Sidebar organizer display controls", () => {
     }
   });
 
+  it.each(["expanded", "rail"] as const)("previews large project lists in %s navigation by default", async (mode) => {
+    const now = Date.now();
+    const targets = Array.from({ length: 21 }, (_, index) => ({
+      id: `project-${index}`, backendId: "backend", name: `Project ${index}`, workspaceId: `workspace-${index}`,
+      revision: 1n, workspaceName: `Project ${index}`, trusted: true, pinned: false, archived: false
+    }));
+    const sessions = targets.map((target, index) => ({
+      ...session(), id: `task-${index}`, targetId: target.id, projectId: target.id, updatedAt: now - index * 1_000
+    }));
+    const complete = {
+      ...emptySnapshot(),
+      revision: 1n,
+      server: { name: "Orchestrator", version: "test", health: "healthy" as const },
+      targets,
+      sessions
+    };
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      mode,
+      snapshot: { ...complete, targets: targets.slice(0, 20), sessions: sessions.slice(0, 20) }
+    });
+    let list: HTMLElement = required(rendered.container.querySelector<HTMLElement>(".sidebar-main-view"));
+    if (mode === "rail") {
+      const trigger = required(rendered.container.querySelector<HTMLButtonElement>("[data-sidebar-rail-trigger='projects']"));
+      mockRect(trigger, 70, 120, 36, 36);
+      await act(async () => trigger.click());
+      list = required(document.body.querySelector<HTMLElement>(".sidebar-rail-panel[data-sidebar-rail-panel-level='1']"));
+    }
+    const projectNames = () => [...list.querySelectorAll(".project-group__name")].map((node) => node.textContent);
+    expect(projectNames()).toHaveLength(20);
+    expect(list.querySelector(".session-list-show-all")).toBeNull();
+
+    await rendered.rerenderSnapshot(complete);
+    expect(projectNames()).toHaveLength(20);
+    expect(projectNames()).not.toContain("Project 20");
+    expect(buttonWithText(list, "nav.showAllProjects")).toBeDefined();
+
+    await rendered.rerenderActiveSessionId("task-20");
+    expect(projectNames()).toHaveLength(21);
+    expect(projectNames()).toContain("Project 20");
+    expect(list.querySelector(".session-list-show-all")).toBeNull();
+    await rendered.rerenderActiveSessionId(undefined);
+    expect(projectNames()).toHaveLength(20);
+
+    const lastTask = sessions[20]!;
+    await rendered.rerenderSnapshot({
+      ...complete,
+      sessions: [...sessions.slice(0, 20), { ...lastTask, state: "running", activeRunId: "active-tail-run" }]
+    });
+    expect(projectNames()).toHaveLength(21);
+    expect(projectNames()).toContain("Project 20");
+
+    await rendered.rerenderSnapshot(complete);
+    await act(async () => buttonWithText(list, "nav.showAllProjects").click());
+    expect(projectNames()).toHaveLength(21);
+    expect(projectNames()).toContain("Project 20");
+  });
+
   it("executes the complete local project action surface with confirmation and inline rename", async () => {
     const target = { id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false } as const;
     const idle = { ...session(), id: "idle-task", name: "Idle task" };
