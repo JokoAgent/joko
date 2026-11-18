@@ -205,6 +205,7 @@ export class MobilePushCoordinator {
           kind: claimed.delivery.kind,
           ...(claimed.delivery.groupTitle === undefined ? {} : { title: claimed.delivery.groupTitle }),
           intent: claimed.delivery.groupId === undefined ? mobilePushIntent(
+            this.#serverId,
             claimed.delivery.sessionId,
             claimed.delivery.messageId,
             claimed.delivery.messageEventId
@@ -323,15 +324,17 @@ function boundedIdentity(value: string, label: string): string {
   return normalized;
 }
 
-function mobilePushIntent(sessionId: string, messageId?: string, messageEventId?: string): string {
+function mobilePushIntent(serverId: string, sessionId: string, messageId?: string, messageEventId?: string): string {
   const task = boundedIdentity(sessionId, "Mobile push task ID");
   const message = messageId === undefined ? undefined : boundedIdentity(messageId, "Mobile push message ID");
   const event = messageEventId === undefined
     ? undefined
     : boundedIdentity(messageEventId, "Mobile push message Event ID");
   if (event !== undefined && message === undefined) throw new Error("Mobile push message identity is incomplete.");
-  return `joko://task/${encodeURIComponent(task)}${message === undefined ? "" :
-    `?message=${encodeURIComponent(message)}${event === undefined ? "" : `&event=${encodeURIComponent(event)}`}`}`;
+  const source = `server=${encodeURIComponent(serverId)}`;
+  const query = message === undefined ? source :
+    `message=${encodeURIComponent(message)}${event === undefined ? "" : `&event=${encodeURIComponent(event)}`}&${source}`;
+  return `joko://task/${encodeURIComponent(task)}?${query}`;
 }
 
 function boundedRetryDelay(value: number | undefined, fallback: number): number {

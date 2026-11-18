@@ -18,8 +18,8 @@ function response(data: unknown, payload?: unknown, identifier = "notification-1
 }
 
 describe("mobile notification public intent", () => {
-  it("accepts only portable public task intents from either Expo response outlet", () => {
-    const intent = "joko://task/session-1?message=message-1&event=event-1";
+  it.each(["", "&server=original-node"])("accepts portable task intents from either Expo response outlet (%s)", source => {
+    const intent = `joko://task/session-1?message=message-1&event=event-1${source}`;
     expect(parseMobileNotificationResponseIntent(response({ intent }))).toBe(intent);
     expect(parseMobileNotificationResponseIntent(response({}, { intent }))).toBe(intent);
   });

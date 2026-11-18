@@ -52,6 +52,7 @@ describe("mobile push Orchestrator boundary", () => {
     complete("new-notice-after-repair");
     await vi.waitFor(() => expect(fixture.store.listMobilePushDeliveries()[0]?.status).toBe("delivered"));
     expect(sends).toHaveLength(2);
+    expect(sends[1]?.intent).toBe("joko://task/session-1?server=server-1");
   });
 
   it("persists and deduplicates settled group steps through the original worker with a group intent", async () => {
@@ -149,7 +150,7 @@ describe("mobile push Orchestrator boundary", () => {
       token: "raw-device-token-current",
       locale: "ja",
       kind: "done",
-      intent: "joko://task/session-1?message=assistant-message&event=assistant-message"
+      intent: "joko://task/session-1?message=assistant-message&event=assistant-message&server=server-1"
     });
     expect(JSON.stringify(sends[0])).not.toContain("Private task response content");
 
