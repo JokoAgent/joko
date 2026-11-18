@@ -5,6 +5,7 @@ export type MobileHomeStatusFilter = "active" | "archived" | "all";
 export type MobileHomeSearchSort = "relevance" | "activityDesc" | "activityAsc";
 export const MOBILE_HOME_ACTIVITY_FILTERS = ["all", "1d", "3d", "7d", "30d"] as const;
 export const MOBILE_HOME_TASK_SORTS = ["activity", "created", "priority"] as const;
+export const MOBILE_HOME_PROJECT_PREVIEW_LIMIT = 5;
 export type MobileHomeActivityFilter = typeof MOBILE_HOME_ACTIVITY_FILTERS[number];
 export type MobileHomeTaskSort = typeof MOBILE_HOME_TASK_SORTS[number];
 
@@ -56,6 +57,7 @@ export interface BuildMobileHomeSectionsOptions {
   readonly query: string;
   readonly searchSort?: MobileHomeSearchSort;
   readonly display?: MobileHomeDisplayPreferences;
+  readonly projectId?: string;
   readonly now?: number;
   readonly messageSessionIds?: ReadonlySet<string>;
   readonly labels: {
@@ -83,11 +85,11 @@ export function buildMobileHomeSections(options: BuildMobileHomeSectionsOptions)
     const workspace = projectId === undefined ? undefined : workspaces.get(projectId);
     const project = workspace?.kind === WorkspaceKind.USER_PROJECT;
     const groupKey = project ? `project:${projectId}` : "dialogue";
+    if (options.projectId !== undefined && (!project || projectId !== options.projectId)) return [];
     if (!normalizedQuery && !session.pinned) {
       if (display.projectFilter !== "all" && !display.projectFilter.includes(groupKey)) return [];
       if (display.backendId !== null && display.backendId !== session.backendId) return [];
-      if (cutoff !== undefined && (!session.lastActivityAt
-        || Number(session.lastActivityAt.seconds) * 1_000 + session.lastActivityAt.nanos / 1_000_000 < cutoff)) return [];
+      if (cutoff !== undefined && sessionActivityMillis(session) < cutoff) return [];
     }
     const navigationName = target?.displayName || workspace?.displayName || (project ? options.labels.project : options.labels.dialogue);
     if (normalizedQuery && !session.displayName.toLocaleLowerCase().includes(normalizedQuery)
@@ -141,6 +143,20 @@ export function buildMobileHomeSections(options: BuildMobileHomeSectionsOptions)
       items: sortHomeItems(group.items, display.sortBy)
     }));
   return [...sections, ...grouped];
+}
+
+export function previewMobileHomeProject(
+  items: readonly MobileHomeSessionItem[], pendingInteractions: ReadonlySet<string>, now: number
+): readonly MobileHomeSessionItem[] {
+  if (items.length <= MOBILE_HOME_PROJECT_PREVIEW_LIMIT) return items;
+  return items.filter(({ session }, index) => index < MOBILE_HOME_PROJECT_PREVIEW_LIMIT
+    || sessionActivityMillis(session) >= now - 86_400_000 || homeTaskPriority(session) < 3
+    || pendingInteractions.has(session.sessionId));
+}
+
+function sessionActivityMillis(session: Session): number {
+  const time = session.lastActivityAt;
+  return time === undefined ? Number.NEGATIVE_INFINITY : Number(time.seconds) * 1_000 + time.nanos / 1_000_000;
 }
 
 function sortHomeItems(items: readonly MobileHomeSessionItem[], sortBy: MobileHomeTaskSort = "activity"): MobileHomeSessionItem[] {

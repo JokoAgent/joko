@@ -20,7 +20,7 @@ import Constants from "expo-constants";
 import { randomUUID } from "expo-crypto";
 import * as Clipboard from "expo-clipboard";
 import {
-  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, ModelSourceKind, QueueItemState, RuntimeCommandInputMode, SessionState, TargetState, WorkspaceKind, capabilityNames, partnerResumeMessages,
+  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, InteractionState, ModelSourceKind, QueueItemState, RuntimeCommandInputMode, SessionState, TargetState, WorkspaceKind, capabilityNames, partnerResumeMessages,
   partnerSessionTaskMessages, partnerSessionTaskReceiptLabel,
   type QueueItem, type Session
 } from "@joko/contracts";
@@ -291,7 +291,8 @@ import { readMobileScreenshotVisibleMessages } from "./mobile-screenshot-selecti
 import { useMobileScreenshotSelection } from "./use-mobile-screenshot-selection";
 import {
   buildMobileHomeSections, buildMobileHomeNavigationLayout, createSwipeRowRegistry,
-  DEFAULT_MOBILE_HOME_DISPLAY, MOBILE_HOME_ACTIVITY_FILTERS, MOBILE_HOME_TASK_SORTS, hasMobileHomeDisplayFilters,
+  DEFAULT_MOBILE_HOME_DISPLAY, MOBILE_HOME_ACTIVITY_FILTERS, MOBILE_HOME_PROJECT_PREVIEW_LIMIT, MOBILE_HOME_TASK_SORTS,
+  hasMobileHomeDisplayFilters, previewMobileHomeProject,
   type MobileHomeDisplayPreferences, type MobileHomeSearchMatch, type MobileHomeSearchSort, type MobileHomeSection, type MobileHomeSessionItem, type MobileHomeStatusFilter
 } from "./home-navigation";
 import { MobileTaskHomeNavigation, type MobileHomeNavigationIntent, type MobileHomeViewChange, type MobileHomeViewState,
@@ -1385,7 +1386,6 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   const display = currentView.display ?? DEFAULT_MOBILE_HOME_DISPLAY;
   const setViewState: MobileHomeViewChange = onViewStateChange ?? setLocalViewState;
   const setSearch = (search: string): void => setViewState({ ...currentView, search });
-  const setStatusFilter = (statusFilter: MobileHomeStatusFilter): void => setViewState({ ...currentView, statusFilter }, true);
   const setSearchSort = (searchSort: MobileHomeSearchSort): void => setViewState({ ...currentView, searchSort });
   const [localError, setLocalError] = useState("");
   const [copyNotice, setCopyNotice] = useState("");
@@ -1401,15 +1401,31 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   const homeScopeRef = useRef(homeScopeKey);
   homeScopeRef.current = homeScopeKey;
   const [displaySource, setDisplaySource] = useState<string>();
+  const [projectFolds, setProjectFolds] = useState<{ source: string; keys: ReadonlySet<string> }>();
+  const [requestedProjectView, setRequestedProjectView] = useState<{
+    source: string; projectId: string; statusFilter: MobileHomeStatusFilter;
+  }>();
+  const projectWorkspace = requestedProjectView?.source === homeScopeKey ? state.owner?.workspaces.find(workspace =>
+    workspace.kind === WorkspaceKind.USER_PROJECT && workspace.targetId === requestedProjectView.projectId) : undefined;
+  const projectView = projectWorkspace === undefined ? undefined : requestedProjectView;
+  const foldedProjectKeys = projectFolds?.source === homeScopeKey ? projectFolds.keys : undefined;
+  const listStatusFilter = projectView?.statusFilter ?? statusFilter;
+  const setStatusFilter = (statusFilter: MobileHomeStatusFilter): void => {
+    if (projectView !== undefined) setRequestedProjectView({ ...projectView, statusFilter });
+    else setViewState({ ...currentView, statusFilter }, true);
+  };
+  const closeProjectView = useCallback(() => setRequestedProjectView(undefined), []);
   const [filterNow, setFilterNow] = useState(Date.now);
   const [renameSession, setRenameSession] = useState<Session>();
   const [taskTagSessionId, setTaskTagSessionId] = useState<string>();
   const [renameDraft, setRenameDraft] = useState("");
   const searchRef = useRef<TextInput>(null);
+  const handledSearchFocus = useRef(0);
   const swipeRegistry = useMemo(() => createSwipeRowRegistry(), []);
-  const normalizedSearch = search.trim();
+  const normalizedSearch = projectView === undefined ? search.trim() : "";
   const listRef = useRef<SectionList<MobileHomeSessionItem, MobileHomeSection>>(null);
-  const scrollKey = JSON.stringify([homeScopeKey, host, statusFilter]);
+  const scrollKey = JSON.stringify(projectView === undefined ? [homeScopeKey, host, statusFilter]
+    : [homeScopeKey, host, projectView.statusFilter, projectView.projectId]);
   const listScroll = useMemo(() => ({
     pendingOffset: scrollOffsets?.get(scrollKey) ?? 0,
     contentHeight: 0,
@@ -1437,27 +1453,41 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   ), [currentSearch, state.homeSearchMatches, state.homeSearchStatus]);
   const sections = useMemo(() => buildMobileHomeSections({
     snapshot: state.owner,
-    statusFilter,
-    query: search,
+    statusFilter: listStatusFilter,
+    query: projectView === undefined ? search : "",
     searchSort,
-    display,
+    display: projectView === undefined ? display : { ...DEFAULT_MOBILE_HOME_DISPLAY, sortBy: display.sortBy },
+    projectId: projectView?.projectId,
     now: filterNow,
     messageSessionIds: new Set(currentMessageMatches.keys()),
     labels: mobileHomeSectionLabels(locale)
-  }), [currentMessageMatches, display, filterNow, locale, search, searchSort, state.owner, statusFilter]);
-  const listSections = useMemo(() => sections.map((section) => ({ ...section, data: section.items })), [sections]);
+  }), [currentMessageMatches, display, filterNow, listStatusFilter, locale, projectView, search, searchSort, state.owner]);
+  const pendingProjectInteractions = useMemo(() => new Set(state.owner?.interactions
+    .filter(interaction => interaction.state === InteractionState.PENDING).map(interaction => interaction.sessionId)), [state.owner?.interactions]);
+  const hasLongProjectPreview = projectView === undefined && sections.some(section => section.kind === "project" && section.items.length > MOBILE_HOME_PROJECT_PREVIEW_LIMIT);
+  const listSections = useMemo(() => sections.map(section => ({ ...section, data: section.kind !== "project" || projectView !== undefined
+    ? section.items : foldedProjectKeys?.has(section.key) ? [] : previewMobileHomeProject(section.items, pendingProjectInteractions, filterNow)
+  })), [filterNow, foldedProjectKeys, pendingProjectInteractions, projectView, sections]);
 
   useEffect(() => { restoreListScroll(); }, [listSections, restoreListScroll]);
   useEffect(() => {
-    if (!foreground || normalizedSearch || display.lastActivity === "all") return;
+    if (!foreground || normalizedSearch || (display.lastActivity === "all" && !hasLongProjectPreview)) return;
     setFilterNow(Date.now());
     const timer = setInterval(() => setFilterNow(Date.now()), 60_000);
     return () => clearInterval(timer);
-  }, [display.lastActivity, foreground, normalizedSearch]);
-  useEffect(() => { setDisplaySource(undefined); }, [homeScopeKey]);
+  }, [display.lastActivity, foreground, hasLongProjectPreview, normalizedSearch]);
+  useEffect(() => { setDisplaySource(undefined); closeProjectView(); }, [closeProjectView, homeScopeKey]);
   useEffect(() => {
-    if (searchFocusRequest > 0) searchRef.current?.focus();
-  }, [searchFocusRequest]);
+    if (searchFocusRequest <= handledSearchFocus.current) return;
+    if (projectView !== undefined) { closeProjectView(); return; }
+    handledSearchFocus.current = searchFocusRequest;
+    searchRef.current?.focus();
+  }, [closeProjectView, projectView, searchFocusRequest]);
+  useEffect(() => {
+    if (Platform.OS !== "android" || !foreground || projectView === undefined) return;
+    const subscription = BackHandler.addEventListener("hardwareBackPress", () => { closeProjectView(); return true; });
+    return () => subscription.remove();
+  }, [closeProjectView, foreground, projectView]);
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -1619,6 +1649,23 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     swipeRegistry.closeOpenRow();
   }, [foreground, homeScopeKey, host, swipeRegistry]);
 
+  const toggleProjectFold = (key: string): void => {
+    if (homeScopeRef.current !== homeScopeKey) return;
+    swipeRegistry.closeOpenRow();
+    setProjectFolds(previous => {
+      const keys = new Set(previous?.source === homeScopeKey ? previous.keys : []);
+      if (keys.has(key)) keys.delete(key);
+      else keys.add(key);
+      return { source: homeScopeKey, keys };
+    });
+  };
+  const openProjectView = (section: MobileHomeSection): void => {
+    const projectId = section.items[0]?.session.projectId;
+    if (projectId === undefined || homeScopeKey !== mobileHomeSourceKey(client.state)) return;
+    swipeRegistry.closeOpenRow();
+    setRequestedProjectView({ source: homeScopeKey, projectId, statusFilter });
+  };
+
   return <View style={styles.fill}>
     <View style={styles.homeHeader}>
       <Pressable ref={menuButtonRef} accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.openMenu")} onPress={() => navigate({ kind: "menu" })}
@@ -1668,7 +1715,14 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
         onPress={() => void client.refresh()} colors={colors} compact />}
     </View>}
     {state.status === "connected" && state.error && <Banner text={state.error} colors={colors} />}
-    <View style={styles.searchRow}>
+    {projectWorkspace !== undefined ? <View style={styles.searchRow}>
+      <Back colors={colors} label={mobileMessage(locale, "common.tasks")}
+        accessibilityLabel={mobileMessage(locale, "common.backTo", { label: mobileMessage(locale, "common.tasks") })} onPress={closeProjectView} />
+      <Text accessibilityRole="header" style={[styles.title, styles.fill, { color: colors.ink }]} numberOfLines={1}>{
+        state.owner?.targets.find(target => target.targetId === projectWorkspace.targetId)?.displayName || projectWorkspace.displayName
+        || mobileMessage(locale, "home.section.project")
+      }</Text>
+    </View> : <View style={styles.searchRow}>
       <TextInput ref={searchRef} accessibilityLabel={mobileMessage(locale, "home.search")}
         placeholder={mobileMessage(locale, "home.search")}
         placeholderTextColor={colors.muted} value={search} onChangeText={setSearch}
@@ -1676,12 +1730,12 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
       {searchPending && <ActivityIndicator accessibilityLabel={mobileMessage(locale, "home.search")} color={colors.accent} />}
       {!normalizedSearch && <Action label={mobileMessage(locale, "home.display")} colors={colors} compact
         onPress={() => setDisplaySource(homeScopeKey)} />}
-    </View>
+    </View>}
     <View accessibilityRole="tablist" style={styles.filterRow}>
       {(["active", "archived", "all"] as const).map((filter) => <Pressable key={filter} accessibilityRole="tab"
-        accessibilityState={{ selected: filter === statusFilter }} onPress={() => setStatusFilter(filter)}
-        style={[styles.filterChip, { borderColor: filter === statusFilter ? colors.accent : colors.border,
-          backgroundColor: filter === statusFilter ? colors.brandBackground : colors.surface }]}>
+        accessibilityState={{ selected: filter === listStatusFilter }} onPress={() => setStatusFilter(filter)}
+        style={[styles.filterChip, { borderColor: filter === listStatusFilter ? colors.accent : colors.border,
+          backgroundColor: filter === listStatusFilter ? colors.brandBackground : colors.surface }]}>
         <Text style={[styles.caption, { color: colors.ink }]}>{mobileMessage(locale, `home.filter.${filter}`)}</Text>
       </Pressable>)}
     </View>
@@ -1709,15 +1763,28 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
           && listScroll.pendingOffset === 0 && Number.isFinite(offset) && offset >= 0) scrollOffsets.set(scrollKey, offset);
       }}
       scrollEventThrottle={16}
-      ListHeaderComponent={onPartners && <MobileHomePartners roster={partnerRoster} groups={partnerGroupRoster} storage={mobilePlainStorage}
+      ListHeaderComponent={projectView === undefined && onPartners && <MobileHomePartners roster={partnerRoster} groups={partnerGroupRoster} storage={mobilePlainStorage}
         active={foreground} visible={statusFilter !== "archived"} query={search} colors={colors} locale={locale}
         canCreate={!!client.partnerCreationTransport()} onOpen={entry => navigate({ kind: "page", action: () => onPartners(entry) })} />}
-      renderSectionHeader={({ section }) => section.kind === "search" ? null
-        : <Text style={[styles.listSectionTitle, { color: colors.muted }]}>{section.title}</Text>}
+      renderSectionHeader={({ section }) => {
+        if (section.kind === "search" || (section.kind === "project" && projectView !== undefined)) return null;
+        if (section.kind !== "project") return <Text style={[styles.listSectionTitle, { color: colors.muted }]}>{section.title}</Text>;
+        const expanded = foldedProjectKeys?.has(section.key) !== true;
+        return <Pressable accessibilityRole="button" accessibilityLabel={section.title} accessibilityState={{ expanded }}
+          onPress={() => toggleProjectFold(section.key)} style={styles.homeProjectHeader}>
+          <Text style={[styles.listSectionTitle, styles.fill, { color: colors.muted }]}>{section.title}</Text>
+          <View accessible={false} style={[styles.homeProjectChevron, { borderColor: colors.muted,
+            transform: [{ rotate: expanded ? "45deg" : "-45deg" }] }]} />
+        </Pressable>;
+      }}
+      renderSectionFooter={({ section }) => projectView === undefined && section.kind === "project" && section.data.length > 0
+        && section.data.length < section.items.length ? <Pressable accessibilityRole="button" onPress={() => openProjectView(section)} style={styles.homeProjectFooter}>
+          <Text style={[styles.label, { color: colors.accent }]}>{mobileMessage(locale, "home.projectViewAll", { count: section.items.length })}</Text>
+        </Pressable> : null}
       ListEmptyComponent={searchPending ? undefined : <Centered label={mobileMessage(locale, state.offlineSnapshotAt !== undefined
         ? "home.empty.offline" : state.status !== "connected" ? "home.empty.reconnect" : normalizedSearch
-          ? "home.empty.search" : hasMobileHomeDisplayFilters(display) ? "home.empty.filters"
-          : statusFilter === "archived" ? "home.empty.archived" : "home.empty.default")} colors={colors} />}
+          ? "home.empty.search" : projectView === undefined && hasMobileHomeDisplayFilters(display) ? "home.empty.filters"
+          : listStatusFilter === "archived" ? "home.empty.archived" : "home.empty.default")} colors={colors} />}
       renderItem={({ item }) => <SwipeableSessionRow session={item.session} registry={swipeRegistry} colors={colors} locale={locale}
         onTogglePin={togglePin} onArchive={toggleArchive} onShowOptions={openOptions}
         disabled={state.status !== "connected"}>
@@ -1756,7 +1823,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
       refreshing={state.status === "connecting"} onRefresh={() => void client.refresh()}
       onScrollBeginDrag={() => { listScroll.pendingOffset = 0; swipeRegistry.closeOpenRow(); }}
       contentContainerStyle={styles.list} />
-    {displaySource === homeScopeKey && foreground && !normalizedSearch && <MobileHomeDisplaySheet
+    {displaySource === homeScopeKey && foreground && !normalizedSearch && projectView === undefined && <MobileHomeDisplaySheet
       state={state} display={display} colors={colors} locale={locale}
       onClose={() => setDisplaySource(undefined)}
       onChange={next => {
@@ -9176,6 +9243,9 @@ const styles = StyleSheet.create({
   rowOptions: { width: 52, minHeight: 66, alignItems: "center", justifyContent: "center" },
   rowOptionsText: { fontSize: 16, letterSpacing: -1 },
   listSectionTitle: { paddingHorizontal: 4, paddingTop: 10, paddingBottom: 8, fontSize: 13, fontWeight: "700", textTransform: "uppercase" },
+  homeProjectHeader: { minHeight: 44, flexDirection: "row", alignItems: "center", paddingRight: 10 },
+  homeProjectChevron: { width: 7, height: 7, borderRightWidth: 1.5, borderBottomWidth: 1.5 },
+  homeProjectFooter: { minHeight: 44, justifyContent: "center", paddingHorizontal: 8 },
   chevron: { fontSize: 28 }, center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 10, padding: 24 },
   startupLoading: { flex: 1, alignItems: "center", justifyContent: "center", gap: 16, padding: 24 },
   loadingArtwork: { width: "82%", maxWidth: 420, height: 360 },

@@ -10,6 +10,7 @@ import { profilePartner } from "./test/mobile-partner-profile";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MobileClient, MobileState } from "./mobile-client";
 import type { MobileHomeViewState } from "./mobile-task-home-navigation";
+import { DEFAULT_MOBILE_HOME_DISPLAY } from "./home-navigation";
 import { mobileMessage } from "./mobile-messages";
 import { buildMobileMessageDeepLink, projectMobileHomeSearchMessageFocus } from "./mobile-native-intent";
 import { useMobileHomeViewPreference } from "./mobile-home-view-preference";
@@ -50,6 +51,7 @@ type HomeListProps = {
   sections: readonly { key: string; data: readonly unknown[] }[];
   renderItem: (value: { item: unknown; index: number }) => ReactNode;
   renderSectionHeader: (value: { section: unknown }) => ReactNode;
+  renderSectionFooter?: (value: { section: unknown }) => ReactNode;
   ListEmptyComponent?: ReactNode;
   onLayout: (event: { nativeEvent: { layout: { height: number } } }) => void;
   onContentSizeChange: (width: number, height: number) => void;
@@ -166,11 +168,11 @@ beforeAll(async () => {
     View: surface, Text: surface, ScrollView: surface, Image: surface, ActivityIndicator: surface,
     SectionList: forwardRef((listProps: HomeListProps, ref) => {
       homeListProps = listProps;
-      const { sections, renderItem, renderSectionHeader, ListEmptyComponent } = listProps;
+      const { sections, renderItem, renderSectionHeader, renderSectionFooter, ListEmptyComponent } = listProps;
       useImperativeHandle(ref, () => ({ getScrollResponder: () => ({ scrollTo: scrollHomeTo }) }), []);
       return createElement("div", { "data-testid": "home-list" }, sections.length === 0 ? ListEmptyComponent
         : sections.map(section => createElement("section", { key: section.key }, renderSectionHeader({ section }),
-          section.data.map((item, index) => createElement("div", { key: index }, renderItem({ item, index }))))));
+          section.data.map((item, index) => createElement("div", { key: index }, renderItem({ item, index }))), renderSectionFooter?.({ section }))));
     }),
     FlatList: forwardRef(({ data, renderItem, ListEmptyComponent }: { data?: readonly { id: string }[];
       renderItem?: (value: { item: unknown }) => ReactNode; ListEmptyComponent?: ReactNode }, ref) => {
@@ -186,10 +188,10 @@ beforeAll(async () => {
       ? createElement("div", { "data-testid": "native-modal" }, children) : null,
     Pressable: ({ children, onPress, disabled, accessibilityLabel, accessibilityState, accessibilityRole }: {
       children?: ReactNode | ((value: { pressed: boolean }) => ReactNode); onPress?: () => void; disabled?: boolean;
-      accessibilityLabel?: string; accessibilityState?: { selected?: boolean; disabled?: boolean; checked?: boolean | "mixed" }; accessibilityRole?: string;
+      accessibilityLabel?: string; accessibilityState?: { selected?: boolean; disabled?: boolean; checked?: boolean | "mixed"; expanded?: boolean }; accessibilityRole?: string;
     }) => createElement("button", { onClick: onPress, disabled, "aria-label": accessibilityLabel,
       role: accessibilityRole === "tab" || accessibilityRole === "checkbox" ? accessibilityRole : undefined,
-      "aria-selected": accessibilityState?.selected, "aria-checked": accessibilityState?.checked },
+      "aria-selected": accessibilityState?.selected, "aria-checked": accessibilityState?.checked, "aria-expanded": accessibilityState?.expanded },
       typeof children === "function" ? children({ pressed: false }) : children),
     StyleSheet: { create: (value: unknown) => value, hairlineWidth: 1, absoluteFill: {} },
     Platform: { get OS() { return platformOS; }, select: (value: Record<string, unknown>) => value[platformOS] ?? value.default },
@@ -771,6 +773,70 @@ describe("actual Home navigation hosts", () => {
     expect(titles().filter(title => title === "Newest creation")).toHaveLength(2);
     await act(async () => root.render(createElement(Home, { key: "cold", source: "another-pairing" })));
     expect(titles().indexOf("Newest activity")).toBeLessThan(titles().indexOf("Running east"));
+  });
+
+  it("folds a long project and opens its full list at the original status with a separate scroll position", async () => {
+    const now = Date.UTC(2026, 10, 18, 17);
+    vi.setSystemTime(now);
+    const timestamp = (offsetSeconds: number) => create(TimestampSchema, { seconds: BigInt(now / 1_000 + offsetSeconds) });
+    const target = (id: string, name: string) => create(TargetSchema, { targetId: id, displayName: name, backendId: "backend", state: TargetState.ACTIVE });
+    const workspace = (id: string, name: string) => create(WorkspaceDescriptorSchema, { targetId: id, workspaceId: id,
+      displayName: name, serverPathDisplay: `/${id}`, kind: WorkspaceKind.USER_PROJECT });
+    const makeTask = (id: string, name: string, projectId: string, index: number, archived = false) => create(SessionSchema, {
+      sessionId: id, displayName: name, targetId: index === 5 ? "other" : projectId, projectId, backendId: "backend", archived,
+      state: archived ? SessionState.ARCHIVED : SessionState.IDLE,
+      createdAt: timestamp(-100_000 - index), lastActivityAt: timestamp(index === 8 ? -3_600 : -90_000 - index)
+    });
+    const ordinary = Array.from({ length: 8 }, (_, index) => makeTask(`sample-${index + 1}`, `Sample ${index + 1}`, "project", index + 1));
+    const current = makeTask("other-current", "Other active", "other", 0);
+    const owner = create(SnapshotSchema, { ...state.owner!, targets: [target("project", "Long project"), target("other", "Other project")],
+      workspaces: [workspace("project", "Long project"), workspace("other", "Other project")],
+      sessions: [...ordinary, current, makeTask("project-finished", "Finished P", "project", 0, true), makeTask("other-finished", "Finished Q", "other", 0, true)] });
+    const scrollOffsets = new Map<string, number>();
+    await render({ state: { ...state, owner, selectedId: current.sessionId }, currentSessionId: current.sessionId, scrollOffsets,
+      viewState: { search: "", statusFilter: "active", display: { ...DEFAULT_MOBILE_HOME_DISPLAY, sortBy: "created" } } });
+    const list = () => host.querySelector('[data-testid="home-list"]')!;
+    const viewAll = mobileMessage("en", "home.projectViewAll", { count: 8 });
+    const back = mobileMessage("en", "common.backTo", { label: message("common.tasks") });
+    expect(list().textContent).toContain("Sample 5");
+    expect(list().textContent).toContain("Sample 8");
+    expect(list().textContent).not.toContain("Sample 6");
+    expect(list().textContent).not.toContain("Sample 7");
+    await press("Long project");
+    expect(button("Long project").getAttribute("aria-expanded")).toBe("false");
+    expect(list().textContent).not.toContain("Sample 1");
+    expect(list().textContent).toContain("Other active");
+    expect(list().textContent).not.toContain(viewAll);
+    await press("Long project");
+    const runningOwner = create(SnapshotSchema, { ...owner, sessions: owner.sessions.map(task => task.sessionId === "sample-7"
+      ? create(SessionSchema, { ...task, state: SessionState.RUNNING }) : task) });
+    await render({ state: { ...state, owner: runningOwner } });
+    expect(list().textContent).toContain("Sample 7");
+    await act(async () => homeListProps.onScroll({ nativeEvent: { contentOffset: { y: 360 } } }));
+
+    await press(viewAll);
+    expect(list().textContent).toContain("Sample 6");
+    expect(list().textContent).toContain("Sample 5");
+    expect(list().textContent).not.toContain("Other active");
+    expect(list().textContent).not.toContain("Finished P");
+    expect(state.selectedId).toBe(current.sessionId);
+    expect(runNavigation).not.toHaveBeenCalled();
+    await act(async () => homeListProps.onScroll({ nativeEvent: { contentOffset: { y: 55 } } }));
+    await press(message("home.filter.archived"));
+    expect(list().textContent).toContain("Finished P");
+    expect(list().textContent).not.toContain("Finished Q");
+    await press(back);
+    expect(button(message("home.filter.active")).getAttribute("aria-selected")).toBe("true");
+    expect(list().textContent).toContain("Other active");
+    await act(async () => {
+      homeListProps.onLayout({ nativeEvent: { layout: { height: 400 } } });
+      homeListProps.onContentSizeChange(350, 1_100);
+    });
+    expect(scrollHomeTo).toHaveBeenCalledExactlyOnceWith({ y: 360, animated: false });
+    await press(viewAll);
+    await render({ state: { ...state, activeProfileId: "different-pairing" } });
+    expect(list().textContent).toContain("Other active");
+    expect(host.querySelector(`button[aria-label="${back}"]`)).toBeNull();
   });
 
   it("sorts Home search by relevance or either activity direction and restores the ordinary list on clear", async () => {
