@@ -63,6 +63,11 @@ export const ComposerQuoteNode = Node.create({
         parseHTML: (element: HTMLElement) => element.getAttribute("data-message-id"),
         renderHTML: (attrs: Record<string, unknown>) => dataAttribute("data-message-id", attrs["messageId"])
       },
+      toolOutputId: {
+        default: null,
+        parseHTML: (element: HTMLElement) => element.getAttribute("data-tool-output-id"),
+        renderHTML: (attrs: Record<string, unknown>) => dataAttribute("data-tool-output-id", attrs["toolOutputId"])
+      },
       sourceEventId: {
         default: null,
         parseHTML: (element: HTMLElement) => element.getAttribute("data-source-event-id"),

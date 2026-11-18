@@ -90,3 +90,77 @@ mountedIt("inserts distinct whole-message references at the caret and delivers o
     await fixture?.close();
   }
 });
+
+mountedIt("quotes the selected part of a completed tool result and sends it only with the next prompt", { timeout: 90_000 }, async () => {
+  let fixture: RealPiSystemFixture | undefined;
+  let browser: Browser | undefined;
+  try {
+    fixture = await RealPiSystemFixture.start({ webDirectory });
+    const manager = await fixture.pair("Tool result Owner");
+    const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId, createSessionMutation({
+      backendId: "pi", targetId: "workspace-real-pi", displayName: "Tool result selection", providerId: REAL_PI_PROVIDER_ID,
+      modelId: REAL_PI_MODEL_ID, effortId: "off"
+    })));
+    const store = fixture.application.store;
+    const session = store.getSession(sessionId).descriptor;
+    const append = { sessionId, backendId: session.backendId, targetId: session.targetId, generation: session.binding.generation,
+      traceId: "tool-result-selection" };
+    const callId = "ordinary-command-result";
+    const privateInput = "unselected tool input";
+    const excerpt = "Only this chosen output";
+    const unselectedOutput = "unselected neighboring output";
+    store.appendEvent({ ...append, payload: { type: "tool_start", callId, name: "bash", input: privateInput } });
+    store.appendEvent({ ...append, payload: { type: "tool_result", callId, name: "bash", isError: false, output: `${excerpt}\n${unselectedOutput}` } });
+
+    const device = "Tool result browser";
+    const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: device })).challenge!;
+    browser = await chromium.launch({ executablePath: browserPath, headless: true });
+    const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 }, reducedMotion: "reduce" });
+    await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
+    await page.locator(".connection-tabs > button").nth(2).click();
+    await page.locator("details.device-authorization__manual > summary").click();
+    await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+    await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
+    await page.getByLabel("Device name").fill(device);
+    await page.locator("form.pair-form button[type=submit]").click();
+
+    const timeline = page.locator(`.timeline[data-timeline-session-id="${sessionId}"]`);
+    await timeline.locator(".work-group__header").click();
+    const tool = timeline.locator(`[data-work-child-id="${callId}"] .tool-block`);
+    await tool.locator("summary").click();
+    const select = async (text: string) => {
+      const pre = tool.locator("pre").filter({ hasText: text });
+      await pre.scrollIntoViewIfNeeded();
+      await pre.evaluate(async (element, selected) => {
+        const node = element.firstChild!;
+        const start = node.textContent!.indexOf(selected);
+        if (start < 0) throw new Error("The fixture text is absent from the rendered tool result.");
+        const selection = window.getSelection()!;
+        selection.setBaseAndExtent(node, start, node, start + selected.length);
+        document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+        await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+      }, text);
+    };
+    const add = page.locator(".selection-quote-actions").getByRole("button", { name: "Add to chat", exact: true });
+    await select(privateInput);
+    expect(await add.count()).toBe(0);
+    await select(excerpt);
+    await add.click();
+    await page.locator(".composer-rich-editor__content [data-selection-quote-chip]").getByText(excerpt, { exact: true }).waitFor();
+    expect(store.listQueueItems({ sessionId })).toEqual([]);
+    expect(fixture.providerRequests).toEqual([]);
+    await page.locator(".session-pane .send-button").click();
+    const item = await waitFor(async () => store.listQueueItems({ sessionId })[0], value => value !== undefined, "the accepted tool selection");
+    expect(item?.body).toMatchObject({ text: `> <!-- joko-selection-quote -->\n> ${excerpt}`, quotesEncoded: true });
+    await waitFor(() => manager.clients.run.getRun({ runId: item!.runId }), response => response.run?.state === RunState.SUCCEEDED,
+      "the explicit Pi prompt with the tool selection");
+    expect(fixture.providerRequests).toHaveLength(1);
+    const wire = JSON.stringify(fixture.providerRequests[0]?.body);
+    expect(wire).toContain(excerpt);
+    expect(wire).not.toContain(unselectedOutput);
+    expect(wire).not.toContain(privateInput);
+  } finally {
+    await browser?.close();
+    await fixture?.close();
+  }
+});

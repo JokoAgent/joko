@@ -12,6 +12,7 @@ export type { ComposerSelectionQuoteDraft } from "./model.js";
 
 export type SelectionQuoteContent =
   | { readonly kind: "message"; readonly text: string }
+  | { readonly kind: "tool"; readonly text: string }
   | {
       readonly kind: "file";
       readonly text: string;
@@ -37,6 +38,7 @@ export function normalizeSelectionQuoteDrafts(value: unknown): readonly Composer
     if (id === undefined || sessionId === undefined || text === undefined || seen.has(id)) continue;
 
     const kind = record["kind"];
+    if (kind !== "tool" && hasOptionalValue(record["toolOutputId"])) continue;
     if (kind === "file") {
       if (
         hasOptionalValue(record["messageId"])
@@ -50,12 +52,20 @@ export function normalizeSelectionQuoteDrafts(value: unknown): readonly Composer
       seen.add(id);
       continue;
     }
-    if (kind !== "message") continue;
     if (
       hasOptionalValue(record["sourcePath"])
       || hasOptionalValue(record["startLine"])
       || hasOptionalValue(record["endLine"])
     ) continue;
+    if (kind === "tool") {
+      const toolOutputId = boundedIdentity(record["toolOutputId"]);
+      if (toolOutputId === undefined || hasOptionalValue(record["messageId"])
+        || hasOptionalValue(record["role"]) || hasOptionalValue(record["sourceEventId"])) continue;
+      result.push({ id, kind, text, sessionId, toolOutputId });
+      seen.add(id);
+      continue;
+    }
+    if (kind !== "message") continue;
     const messageId = boundedIdentity(record["messageId"]);
     const rawSourceEventId = record["sourceEventId"];
     const sourceEventId = hasOptionalValue(rawSourceEventId) ? boundedIdentity(rawSourceEventId) : undefined;
