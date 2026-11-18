@@ -98,6 +98,52 @@ it('waits for the original handoff acceptance before semantic exit and never sen
   } finally { await view.dispose(); }
 });
 
+it('retains a read-aloud failure through healthy snapshots until an explicit new attempt', async () => {
+  vi.useFakeTimers();
+  const view = await mountCall();
+  try {
+    const player = vi.mocked(DesktopSpeechPlayer.prototype.play);
+    player.mockRejectedValueOnce(new Error('Speech provider refused the original text.'));
+    const original = 'Read this unchanged text aloud.';
+    await view.readAloud(original);
+    expect(player).toHaveBeenCalledTimes(1);
+    expect(view.requests.some(request => request.action === Action.END)).toBe(true);
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain('Read aloud failed.');
+    const snapshots = view.requests.filter(request => request.action === Action.SNAPSHOT).length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_500); });
+    expect(view.requests.filter(request => request.action === Action.SNAPSHOT).length).toBeGreaterThan(snapshots);
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain('Read aloud failed.');
+    expect(document.querySelector<HTMLTextAreaElement>('textarea')?.value).toBe(original);
+    expect(player).toHaveBeenCalledTimes(1);
+
+    await view.readAloud();
+    expect(player).toHaveBeenCalledTimes(2);
+    expect(player.mock.calls.map(([, , , text]) => text)).toEqual([original, original]);
+    const starts = view.requests.filter(request => request.action === Action.START);
+    expect(starts).toHaveLength(2);
+    expect(starts.every(request => request.playbackOnly && request.callId !== '')).toBe(true);
+    expect(starts[0]!.callId).not.toBe(starts[1]!.callId);
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+  } finally { await view.dispose(); }
+});
+
+it('ends the original playback lease when stopping while its speech request is in flight', async () => {
+  const view = await mountCall();
+  let finish!: () => void;
+  const pending = new Promise<void>(resolve => { finish = resolve; });
+  vi.mocked(DesktopSpeechPlayer.prototype.play).mockImplementationOnce(() => pending);
+  try {
+    await view.readAloud('A single playback request.');
+    const original = view.call();
+    expect(original.kind).toBe('playback');
+    await act(async () => [...document.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Stop playback')!.click());
+    expect(view.requests.filter(request => request.action === Action.END)).toMatchObject([{ callId: original.callId }]);
+    expect(view.requests.filter(request => request.action === Action.INTERRUPT)).toHaveLength(0);
+    await act(async () => finish());
+    expect(view.requests.filter(request => request.action === Action.END)).toHaveLength(1);
+  } finally { finish(); await view.dispose(); }
+});
+
 async function mountCall(override?: (request: ControlDesktopVoiceConversationRequest) => Promise<DesktopVoiceCallRecord> | undefined, decision = 'continue') {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   const before = Object.getOwnPropertyDescriptor(window, 'jokoDesktop');
@@ -114,7 +160,7 @@ async function mountCall(override?: (request: ControlDesktopVoiceConversationReq
   Object.defineProperty(window, 'jokoDesktop', { configurable: true, value: { voiceConversation: { control: async (_serverId: string, bytes: Uint8Array) => {
     const request = fromBinary(ControlDesktopVoiceConversationRequestSchema, bytes); requests.push(request);
     if (request.action === Action.START) active = create(DesktopVoiceCallRecordSchema, {
-      callId: request.callId, sessionId: 'task', sessionGeneration: 1n, kind: 'conversation', startedAtMs: BigInt(Date.now())
+      callId: request.callId, sessionId: 'task', sessionGeneration: 1n, kind: request.playbackOnly ? 'playback' : 'conversation', startedAtMs: BigInt(Date.now())
     });
     const result = override?.(request);
     const responseCall = result ? await result : active;
@@ -122,6 +168,7 @@ async function mountCall(override?: (request: ControlDesktopVoiceConversationReq
     return toBinary(ControlDesktopVoiceConversationResponseSchema, create(ControlDesktopVoiceConversationResponseSchema, {
       ...(request.action === Action.END ? {} : { call: responseCall }), accepted: true,
       exitDecision: request.action === Action.CLASSIFY_EXIT ? decision : '',
+      models: [{ backendId: 'backend', providerId: 'provider', modelId: 'tts-1', displayName: 'Speech', providerName: 'Local fixture', protocol: 'openai', protocolLocked: true }],
       preference: { conversation: { backendId: 'backend', providerId: 'provider', modelId: 'tts-1', protocol: 'openai', voice: 'alloy' }, sentencePlayback: true }
     }));
   } } } });
@@ -134,6 +181,14 @@ async function mountCall(override?: (request: ControlDesktopVoiceConversationReq
   await render();
   return { requests, state, onClose, render, call: () => active!, listener: () => capture!,
     start: async () => { await act(async () => [...document.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Start call')!.click()); },
+    readAloud: async (text?: string) => {
+      if (text !== undefined) await act(async () => {
+        const field = document.querySelector<HTMLTextAreaElement>('textarea')!;
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(field, text);
+        field.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      await act(async () => [...document.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Read aloud')!.click());
+    },
     dispose: async () => {
       await act(async () => root.unmount()); container.remove();
       if (before) Object.defineProperty(window, 'jokoDesktop', before); else delete (window as { jokoDesktop?: unknown }).jokoDesktop;

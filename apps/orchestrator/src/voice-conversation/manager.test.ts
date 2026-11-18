@@ -160,6 +160,22 @@ it('fences competing windows, freezes exact credentials, and never repeats an un
   } finally { await f.close(); }
 });
 
+it('rejects the first delayed speech request after its exact playback lease ends', async () => {
+  const f = await fixture();
+  const Action = contract.DesktopVoiceConversationAction;
+  try {
+    const playback = await f.start('original-playback', true);
+    expect(playback.call).toMatchObject({ callId: 'original-playback', kind: 'playback' });
+    const delayedSpeech = { callId: 'original-playback', speechRequestId: 'delayed-playback-speech', text: 'Speak only if the original lease remains current.' };
+    await f.control(Action.END, { callId: delayedSpeech.callId });
+    await f.start('replacement-playback', true);
+    await expect(f.control(Action.SPEAK, delayedSpeech)).rejects.toBeDefined();
+    expect(f.store.findOperation(delayedSpeech.speechRequestId)).toBeUndefined();
+    expect(f.fetcher).not.toHaveBeenCalled();
+    expect((await f.control(Action.SNAPSHOT)).call).toMatchObject({ callId: 'replacement-playback', kind: 'playback' });
+  } finally { await f.close(); }
+});
+
 it('rejects original-generation call activity after a task reset', async () => {
   const f = await fixture();
   try {
