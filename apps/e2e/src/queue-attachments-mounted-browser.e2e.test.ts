@@ -64,7 +64,19 @@ mountedIt("adds, replaces, and clears queued attachments in place before dispatc
 
     const row = page.locator(`[data-queue-item-id="${first.queueItemId}"]`);
     const editor = row.locator("form.queue-strip__editor");
-    const openEditor = () => row.getByRole("button", { name: "Edit queued input", exact: true }).click();
+    const editButton = row.getByRole("button", { name: "Edit queued input", exact: true });
+    const findPublic = async () => (await clients.queue.listQueueItems({ sessionId })).queueItems.find(item => item.queueItemId === first.queueItemId);
+    const openEditor = async () => {
+      await waitFor(async () => {
+        const item = await findPublic();
+        const browser = await editButton.evaluateAll(nodes => nodes.map(node => ({ disabled: (node as HTMLButtonElement).disabled,
+          reason: node.closest(".tip-anchor--disabled")?.getAttribute("aria-label") })));
+        const leaseOps = fixture!.application.store.listOperations({ limit: 24 }).filter(operation => operation.kind === "setQueueItemEditLock")
+          .map(({ status, error }) => ({ status, code: error?.code, message: error?.message }));
+        return { publicItem: item === undefined ? undefined : { editLocked: item.editLocked, state: item.state }, browser, leaseOps };
+      }, value => value.publicItem?.editLocked === false && value.browser[0]?.disabled === false, "the original queued input to be editable again");
+      await editButton.click();
+    };
     const saveButton = editor.getByRole("button", { name: "Save", exact: true });
     const remove = (name: string) => editor.getByRole("button", { name: `Remove ${name} from queued input`, exact: true }).click();
     const pick = async (name: string, content: string): Promise<void> => {
@@ -116,7 +128,6 @@ mountedIt("adds, replaces, and clears queued attachments in place before dispatc
     expect(stored().body.text).toBe("");
     expect(fixture.adapter(profile.id).sendCalls).toHaveLength(0);
 
-    const findPublic = async () => (await clients.queue.listQueueItems({ sessionId })).queueItems.find(item => item.queueItemId === first.queueItemId);
     const current = (await waitFor(findPublic, item => item !== undefined && !item.editLocked, "the saved Queue lock to release"))!;
     const lockToken = randomUUID();
     await mutate(setQueueItemEditLockMutation(current, lockToken, true));
