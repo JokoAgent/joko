@@ -86,6 +86,7 @@ export interface FixtureOptions {
   readonly serverId?: string;
   readonly rootDirectory?: string;
   readonly webDirectory?: string;
+  readonly corsOrigins?: readonly string[];
   /** Exercise the real private signaling backend, never a public cleartext route. */
   readonly webRtc?: boolean;
   /** Exercise CONNECT negotiation and the real process-owned raw Noise target. */
@@ -440,7 +441,7 @@ export class OrchestratorE2eFixture {
       },
       artifactDirectory,
       webDirectory: options.webDirectory ?? join(rootDirectory, "web-not-built"),
-      corsOrigins: []
+      corsOrigins: options.corsOrigins ?? []
     };
     const connections = new RecordingConnectionManager(store);
     connections.openPairingWindow();

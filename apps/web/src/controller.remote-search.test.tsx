@@ -7,7 +7,8 @@ import { afterEach, expect, it, vi } from "vitest";
 import { useAppController, type AppController } from "./controller.js";
 import { createOrchestratorGateway, probeOrchestratorOrigin, type GatewayCallbacks, type OrchestratorGateway } from "./gateway.js";
 import { DEFAULT_UI_PREFERENCES, LocalState } from "./local-state.js";
-import { emptySnapshot, type ConnectionProfile, type SessionMessageSearchResultView } from "./model.js";
+import { remoteMachineProfileKey } from "./machine-federation.js";
+import { emptySnapshot, type AppSnapshot, type ConnectionProfile, type SessionMessageSearchMatchView, type SessionMessageSearchResultView } from "./model.js";
 
 vi.mock("./gateway.js", async (original) => ({
   ...await original<typeof import("./gateway.js")>(),
@@ -111,4 +112,40 @@ it("keeps failures distinct from empty pages and drops outcomes from retired rem
   finishWest(emptyPage);
   await rejection;
   expect(westSearch).toHaveBeenLastCalledWith("needle", expect.objectContaining({ signal: abort.signal }));
+
+  const projectId = "navigation-project";
+  const projectTarget = { id: projectId, backendId: "backend", name: "Navigation project", workspaceId: "workspace",
+    revision: 1n, workspaceName: "Navigation project", trusted: true, pinned: false, archived: false };
+  const task = { id: "moved-in", backendId: "backend", targetId: "execution-target", projectId,
+    name: "Moved in", state: "idle" as const, permissionMode: "ask" as const, planMode: false, fastMode: false,
+    pinned: false, archived: false, generation: 1n, updatedAt: 1 };
+  const projectSnapshot: AppSnapshot = { ...snapshot, targets: [projectTarget],
+    workspaces: [{ id: "workspace", targetId: projectId, name: "Navigation project", kind: "userProject",
+      serverPath: "/project", trusted: true, dirty: false, entries: [] }],
+    sessions: [task, { ...task, id: "moved-out", targetId: projectId, projectId: undefined }] };
+  await act(async () => {
+    eastBinding.onLiveSnapshot?.(projectSnapshot);
+    bindings.get("west")!.onLiveSnapshot?.(projectSnapshot);
+  });
+  const member: SessionMessageSearchMatchView = { sessionId: task.id, eventId: "event-a", timelineItemId: "item-a",
+    role: "assistant", kind: "textMessage", snippet: "needle", score: 1, createdAt: 1 };
+  const result = { ...emptyPage, matches: [member, { ...member, sessionId: "moved-out", eventId: "event-b" }] };
+  const projects = [{ profileKey: remoteMachineProfileKey(profiles[0]!), projectId }];
+  const westCalls = westSearch.mock.calls.length;
+  eastSearch.mockResolvedValueOnce(result);
+  const scoped = await app.searchRemoteSessionMessages("needle", { projects });
+  expect(scoped).toMatchObject([{ profileId: "east", status: "succeeded", matches: [member] }]);
+  expect(eastSearch).toHaveBeenLastCalledWith("needle", expect.objectContaining({ filters: { sessionIds: [task.id] } }));
+  expect(westSearch).toHaveBeenCalledTimes(westCalls);
+
+  const eastCalls = eastSearch.mock.calls.length;
+  const retiredKey = remoteMachineProfileKey({ ...profiles[0]!, origin: "https://replaced.example.test" });
+  expect(await app.searchRemoteSessionMessages("needle", { projects: [{ profileKey: retiredKey, projectId }] })).toEqual([]);
+  expect(eastSearch).toHaveBeenCalledTimes(eastCalls);
+  let releaseEast!: (page: SessionMessageSearchResultView) => void;
+  eastSearch.mockReturnValueOnce(new Promise(resolve => { releaseEast = resolve; }));
+  const moving = app.searchRemoteSessionMessages("needle", { projects });
+  await act(async () => eastBinding.onLiveSnapshot?.({ ...projectSnapshot, sessions: [{ ...task, projectId: undefined }] }));
+  releaseEast(result);
+  expect(await moving).toMatchObject([{ profileId: "east", status: "succeeded", matches: [] }]);
 });

@@ -135,6 +135,8 @@ import {
 import {
   machineCacheFromSnapshot,
   normalizeMachineSelection,
+  navigationProjectSessionIds,
+  remoteMachineProfileKey,
   selectedReachableRemoteProfileIds,
   selectedMachineProfileIds,
   type MachineSelection
@@ -300,7 +302,7 @@ export interface AppController extends OperationApi {
   refreshPartnerSource?(sourceKey: string): Promise<void>;
   openSourcePartner?(sourceKey: string, partnerId: string, destination: "session" | "settings" | "preparation"): Promise<void>;
   readSourcePartnerAvatar?(sourceKey: string, partnerId: string, revision: bigint, image: import("./partner-avatar.js").PartnerAvatarImageView, signal: AbortSignal): Promise<string>;
-  searchRemoteSessionMessages(query: string, options?: SessionMessageSearchCollectionOptions): Promise<readonly FederatedSessionMessageSearchOutcome[]>;
+  searchRemoteSessionMessages(query: string, options?: RemoteSessionMessageSearchOptions): Promise<readonly FederatedSessionMessageSearchOutcome[]>;
   retryManagedOrchestrator(): Promise<void>;
   /** Consume only the not-yet-started automatic attempt for this app open. */
   cancelAutomaticConnectionAttempt(): void;
@@ -2469,7 +2471,7 @@ export function useAppController(): AppController {
 
   const searchRemoteSessionMessages = useCallback(async (
     query: string,
-    options: SessionMessageSearchCollectionOptions = {}
+    options: RemoteSessionMessageSearchOptions = {}
   ): Promise<readonly FederatedSessionMessageSearchOutcome[]> => {
     const normalizedQuery = query.trim();
     if (normalizedQuery === "") return [];
@@ -2487,12 +2489,24 @@ export function useAppController(): AppController {
       connectedProfileIds
     );
     const profiles = new Map(profilesRef.current.map((profile) => [profile.id, profile] as const));
+    const { projects, ...searchOptions } = options;
     const searches = profileIds.map(async (profileId): Promise<FederatedSessionMessageSearchOutcome | undefined> => {
       const profile = profiles.get(profileId);
       const binding = remoteMachineGatewaysRef.current.get(profileId);
       if (profile === undefined || binding?.gateway === undefined || binding.liveEpoch === undefined) return undefined;
-      const routedOptions = remoteSessionMessageSearchOptionsForProfile(profileId, options);
+      const routedOptions = remoteSessionMessageSearchOptionsForProfile(profileId, searchOptions);
       if (routedOptions === undefined || binding.profileKey !== remoteMachineProfileKey(profile)) return undefined;
+      const projectIds = projects?.filter(project => project.profileKey === binding.profileKey).map(project => project.projectId);
+      const projectMembers = (ids: readonly string[]): ReadonlySet<string> => {
+        if (ids.length === 0 || binding.snapshot === undefined) return new Set();
+        const members = navigationProjectSessionIds(binding.snapshot);
+        return new Set(ids.flatMap(id => members.get(id) ?? []));
+      };
+      const requestedMembers = projectIds === undefined ? undefined : projectMembers(projectIds);
+      const sessionIds = requestedMembers === undefined ? undefined : (routedOptions.filters?.sessionIds ?? [...requestedMembers])
+        .filter(sessionId => requestedMembers.has(sessionId));
+      if (sessionIds?.length === 0) return undefined;
+      const scopedOptions = sessionIds === undefined ? routedOptions : { ...routedOptions, filters: { ...routedOptions.filters, sessionIds } };
       const { gateway: remoteGateway, liveEpoch: epoch } = binding;
       const sourceGeneration = binding.snapshot?.generation;
       const authority = machineCacheAuthorityRef.current.get(profileId);
@@ -2510,8 +2524,11 @@ export function useAppController(): AppController {
       if (!isCurrent()) return undefined;
       const source = { profileId, serverId: profile.serverId, epoch, isCurrent };
       try {
-        const { matches } = await remoteGateway.searchAllSessionMessages(normalizedQuery, routedOptions);
-        return { ...source, status: "succeeded", matches };
+        const { matches } = await remoteGateway.searchAllSessionMessages(normalizedQuery, scopedOptions);
+        if (projectIds === undefined || sessionIds === undefined) return { ...source, status: "succeeded", matches };
+        const currentMembers = projectMembers(projectIds);
+        const inScope = new Set(sessionIds);
+        return { ...source, status: "succeeded", matches: matches.filter(match => inScope.has(match.sessionId) && currentMembers.has(match.sessionId)) };
       } catch {
         return { ...source, status: "failed" };
       }
@@ -4655,8 +4672,13 @@ interface MachineCacheAuthority {
   readonly revoked: boolean;
 }
 
-function remoteMachineProfileKey(profile: ConnectionProfile): string {
-  return `${profile.id}\u0000${profile.origin}\u0000${profile.serverId}\u0000${profile.endpointPublicKey ?? ''}\u0000${profile.transportKind ?? 'https'}`;
+export interface RemoteSessionMessageSearchProject {
+  readonly profileKey: string;
+  readonly projectId: string;
+}
+
+export interface RemoteSessionMessageSearchOptions extends SessionMessageSearchCollectionOptions {
+  readonly projects?: readonly RemoteSessionMessageSearchProject[];
 }
 
 const REMOTE_SEARCH_ID_SEPARATOR = "\u0000";

@@ -33,6 +33,22 @@ export function selectedMachineProfileIds(
   return selection.filter((id) => available.has(id));
 }
 
+export function remoteMachineProfileKey(profile: ConnectionProfile): string {
+  return `${profile.id}\u0000${profile.origin}\u0000${profile.serverId}\u0000${profile.endpointPublicKey ?? ""}\u0000${profile.transportKind ?? "https"}`;
+}
+
+/** Navigation projects are independent of the execution target sent to a Backend. */
+export function navigationProjectSessionIds(snapshot: Pick<AppSnapshot, "targets" | "workspaces" | "sessions">): ReadonlyMap<string, readonly string[]> {
+  const workspaces = new Set(snapshot.workspaces.filter(workspace => workspace.kind === "userProject").map(workspace => workspace.targetId));
+  const projects = new Map<string, string[]>(snapshot.targets.filter(target => !target.archived && workspaces.has(target.id))
+    .map(target => [target.id, []]));
+  for (const session of snapshot.sessions) {
+    if (session.projectId === undefined || session.hidden || session.derivationOrigin?.sideChat) continue;
+    projects.get(session.projectId)?.push(session.id);
+  }
+  return projects;
+}
+
 export function toggleMachineProfile(
   selection: MachineSelection,
   profileId: string,

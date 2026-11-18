@@ -2484,6 +2484,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           activeProfile: state.activeProfile,
           presenceByProfile: state.machinePresenceByProfile,
           caches: state.machineCaches,
+          liveProjectSources: state.nativeTaskStatusLiveSources,
           selection: state.preferences.machineSelection,
           onSelectionChange: (selection) => { void controller.setMachineSelection(selection); },
           onRefresh: () => runAction("refresh-machines", () => controller.refreshMachines()),
@@ -2557,7 +2558,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         movingSessionProjectIds={movingSessionProjectIds}
         onMoveSessionProject={moveTaskToProject}
         onSearchMessages={async (query, semanticMode, filters, signal) => (await controller.searchAllSessionMessages(query, { scope: { kind: "owner" }, filters, pageSize: 100, semanticMode, signal })).matches}
-        onSearchRemoteMessages={(query, semanticMode, filters, signal) => controller.searchRemoteSessionMessages(query, { scope: { kind: "owner" }, filters, pageSize: 100, semanticMode, signal })}
+        onSearchRemoteMessages={(query, semanticMode, filters, signal, projects) => controller.searchRemoteSessionMessages(query, {
+          scope: { kind: "owner" }, filters, pageSize: 100, semanticMode, signal, ...(projects === undefined ? {} : { projects })
+        })}
         onMessageSearchSortChange={(sort) => { void controller.setMessageSearchSort(sort); }}
         onSidebarDisplayPreferencesChange={(patch) => { void controller.setSidebarDisplayPreferences(patch); }}
         onSidebarOwnerLayoutChange={(patch) => { void controller.setSidebarOwnerLayout(patch); }}
