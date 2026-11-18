@@ -200,7 +200,7 @@ it("assembles the real sandbox preload with typed menu settings, document-bound 
         : channel === DESKTOP_CHANNELS.preferredSystemLocaleGet ? "en" : false,
         on: (channel: string, listener: (...args: unknown[]) => void) => { listeners.set(channel, listener); },
         removeListener: (channel: string) => { listeners.delete(channel); } }
-    }), process: { platform: "darwin", arch: "arm64" }, crypto: { randomUUID: () => "00000000-0000-4000-8000-000000000001" },
+    }), process: { platform: "darwin", arch: "arm64", argv: [] }, crypto: { randomUUID: () => "00000000-0000-4000-8000-000000000001" },
     console, Object, Promise, Set, Map, WeakMap, BigInt, Number, String, Boolean, TypeError, RangeError, RegExp, URL, URLSearchParams,
     TextEncoder, Uint8Array, ArrayBuffer, structuredClone
   });

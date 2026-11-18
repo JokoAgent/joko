@@ -236,7 +236,7 @@ function loadPreload(
       if (specifier !== "electron") throw new Error(`Unexpected preload dependency: ${specifier}`);
       return electron;
     },
-    process: { platform },
+    process: { platform, argv: [] },
     crypto,
     console,
     Object,

@@ -36,7 +36,7 @@ vi.mock("react-native-webview", async () => {
   return { WebView: forwardRef<{ injectJavaScript: typeof richSurface.inject }, {
     source: { html: string }; onMessage?: (event: { nativeEvent: { data: string } }) => void;
   }>(function TestWebView({ source, onMessage }, ref) {
-    useImperativeHandle(ref, () => ({ injectJavaScript: richSurface.inject }));
+    useImperativeHandle(ref, () => ({ injectJavaScript: richSurface.inject }), []);
     return createElement("div", { "data-rich-web-view": true, "data-html": source.html, ref: (element: HTMLDivElement | null) => {
       if (element && onMessage) richSurface.receive.set(element, (data) => onMessage({ nativeEvent: { data } }));
     } });

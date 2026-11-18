@@ -83,7 +83,7 @@ it("the actual sandboxed preload rejects non-boolean writes and malformed OS pro
       contextBridge: { exposeInMainWorld: (_name: string, value: typeof bridge) => { bridge = value; } },
       ipcRenderer: { invoke, send: vi.fn(), sendSync: (channel: string) => channel === DESKTOP_CHANNELS.preferredSystemLocaleGet ? "en" : false,
         on: vi.fn(), removeListener: vi.fn() }
-    }), process: { platform: "win32" }, crypto: { randomUUID: () => "00000000-0000-4000-8000-000000000001" },
+    }), process: { platform: "win32", argv: [] }, crypto: { randomUUID: () => "00000000-0000-4000-8000-000000000001" },
     console, Object, Promise, Set, Map, WeakMap, BigInt, Number, String, Boolean, TypeError, RangeError, RegExp, URL, URLSearchParams,
     TextEncoder, Uint8Array, ArrayBuffer, structuredClone
   });
