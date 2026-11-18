@@ -689,6 +689,90 @@ describe("actual Home navigation hosts", () => {
     expect(button("Open task Beta").closest("section")?.firstElementChild?.textContent).toBe(message("home.section.dialogue"));
   });
 
+  it("filters ordinary tasks by project, Agent and activity and restores the selected order for the original pairing", async () => {
+    const now = Date.UTC(2026, 10, 18, 17);
+    vi.setSystemTime(now);
+    const timestamp = (offsetSeconds: number) => create(TimestampSchema, { seconds: BigInt(now / 1_000 + offsetSeconds) });
+    const project = (id: string) => create(TargetSchema, { targetId: id, displayName: "Twin project", backendId: "codex", state: TargetState.ACTIVE });
+    const workspace = (id: string) => create(WorkspaceDescriptorSchema, { targetId: id, workspaceId: `workspace-${id}`,
+      displayName: "Twin project", serverPathDisplay: `/${id}`, kind: WorkspaceKind.USER_PROJECT });
+    const makeTask = (name: string, projectId: string, backendId: string, created: number, activity: number) =>
+      create(SessionSchema, { sessionId: `${backendId}-${name.toLowerCase().replaceAll(" ", "-")}`, displayName: name,
+        projectId, targetId: projectId, backendId, state: SessionState.IDLE,
+        createdAt: timestamp(created), lastActivityAt: timestamp(activity) });
+    const pinned = create(SessionSchema, { ...makeTask("Evergreen", "west", "pi", -200_000, -100_000), pinned: true });
+    const running = makeTask("Running east", "east", "codex", -800, -120);
+    const archived = create(SessionSchema, { ...makeTask("Archived east", "east", "codex", -1_000, -15), archived: true, state: SessionState.ARCHIVED });
+    const owner = create(SnapshotSchema, { ...state.owner!, targets: [project("east"), project("west")],
+      workspaces: [workspace("east"), workspace("west")],
+      backends: [create(BackendDescriptorSchema, { backendId: "codex", displayName: "Codex" }), create(BackendDescriptorSchema, { backendId: "pi", displayName: "Pi" })],
+      sessions: [
+        running, makeTask("Newest activity", "east", "codex", -800, -10), makeTask("Newest creation", "east", "codex", -100, -60),
+        makeTask("At cutoff", "east", "codex", -100_000, -86_400), makeTask("Newest creation", "east", "pi", -150, -20),
+        makeTask("West task", "west", "codex", -200, -20), pinned, archived
+      ]
+    });
+    state = { ...state, owner };
+    const values = new Map<string, string>();
+    const storage = { getItem: async (key: string) => values.get(key) ?? null, setItem: async (key: string, value: string) => { values.set(key, value); } };
+    const Home = ({ source }: { source: string }) => {
+      const { view, change } = useMobileHomeViewPreference(source, storage);
+      return createElement(SessionsScreen, { ...props, state, viewState: view, onViewStateChange: change });
+    };
+    const titles = () => Array.from(host.querySelectorAll('[data-testid="home-list"] button[aria-label^="Open task "]'))
+      .map(row => row.getAttribute("aria-label")!.slice("Open task ".length));
+    const openDisplay = () => press(message("home.display"));
+    const closeDisplay = () => press(message("common.close"));
+    await act(async () => root.render(createElement(Home, { key: "before", source: "original-pairing" })));
+    expect(titles()).toContain("West task");
+    expect(titles().filter(title => title === "Newest creation")).toHaveLength(2);
+    await openDisplay();
+    await press("Twin project · /east");
+    await press("Codex");
+    await press(message("home.display.activity.1d"));
+    await closeDisplay();
+    expect(titles()).toEqual(["Evergreen", "Newest activity", "Newest creation", "Running east", "At cutoff"]);
+    await act(async () => vi.advanceTimersByTimeAsync(60_000));
+    expect(titles()).toEqual(["Evergreen", "Newest activity", "Newest creation", "Running east"]);
+    await type(message("home.search"), "West task");
+    expect(titles()).toEqual(["West task"]);
+    await type(message("home.search"), "");
+    await press(message("home.filter.archived"));
+    expect(titles()).toEqual(["Archived east"]);
+    await openDisplay();
+    await press("Pi");
+    await closeDisplay();
+    expect(titles()).toEqual([]);
+    expect(host.querySelector('[data-testid="home-list"]')?.textContent).toBe(message("home.empty.filters"));
+    await openDisplay();
+    await press("Codex");
+    await closeDisplay();
+    await press(message("home.filter.active"));
+
+    await openDisplay();
+    await press(message("home.display.sort.created"));
+    await closeDisplay();
+    expect(titles()).toEqual(["Evergreen", "Newest creation", "Newest activity", "Running east"]);
+    await openDisplay();
+    await press(message("home.display.sort.priority"));
+    await closeDisplay();
+    expect(titles()).toEqual(["Evergreen", "Newest activity", "Newest creation", "Running east"]);
+    state = { ...state, owner: create(SnapshotSchema, { ...owner, sessions: owner.sessions.map(session =>
+      session.sessionId === running.sessionId ? create(SessionSchema, { ...session, state: SessionState.RUNNING }) : session) }) };
+    await act(async () => root.render(createElement(Home, { key: "before", source: "original-pairing" })));
+    expect(titles()).toEqual(["Evergreen", "Running east", "Newest activity", "Newest creation"]);
+
+    await act(async () => root.render(createElement(Home, { key: "cold", source: "original-pairing" })));
+    expect(titles()).toEqual(["Evergreen", "Running east", "Newest activity", "Newest creation"]);
+    await openDisplay();
+    await press(message("home.display.reset"));
+    await closeDisplay();
+    expect(titles()).toEqual(expect.arrayContaining(["West task", "At cutoff"]));
+    expect(titles().filter(title => title === "Newest creation")).toHaveLength(2);
+    await act(async () => root.render(createElement(Home, { key: "cold", source: "another-pairing" })));
+    expect(titles().indexOf("Newest activity")).toBeLessThan(titles().indexOf("Running east"));
+  });
+
   it("sorts Home search by relevance or either activity direction and restores the ordinary list on clear", async () => {
     const owner = create(SnapshotSchema, { ...state.owner!,
       workspaces: [create(WorkspaceDescriptorSchema, { workspaceId: "project-workspace", targetId: "project", displayName: "Project", kind: WorkspaceKind.USER_PROJECT })],

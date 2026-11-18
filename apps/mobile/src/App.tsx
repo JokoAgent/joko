@@ -20,7 +20,7 @@ import Constants from "expo-constants";
 import { randomUUID } from "expo-crypto";
 import * as Clipboard from "expo-clipboard";
 import {
-  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, ModelSourceKind, QueueItemState, RuntimeCommandInputMode, SessionState, TargetState, capabilityNames, partnerResumeMessages,
+  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, ModelSourceKind, QueueItemState, RuntimeCommandInputMode, SessionState, TargetState, WorkspaceKind, capabilityNames, partnerResumeMessages,
   partnerSessionTaskMessages, partnerSessionTaskReceiptLabel,
   type QueueItem, type Session
 } from "@joko/contracts";
@@ -291,7 +291,8 @@ import { readMobileScreenshotVisibleMessages } from "./mobile-screenshot-selecti
 import { useMobileScreenshotSelection } from "./use-mobile-screenshot-selection";
 import {
   buildMobileHomeSections, buildMobileHomeNavigationLayout, createSwipeRowRegistry,
-  type MobileHomeSearchMatch, type MobileHomeSearchSort, type MobileHomeSection, type MobileHomeSessionItem, type MobileHomeStatusFilter
+  DEFAULT_MOBILE_HOME_DISPLAY, MOBILE_HOME_ACTIVITY_FILTERS, MOBILE_HOME_TASK_SORTS, hasMobileHomeDisplayFilters,
+  type MobileHomeDisplayPreferences, type MobileHomeSearchMatch, type MobileHomeSearchSort, type MobileHomeSection, type MobileHomeSessionItem, type MobileHomeStatusFilter
 } from "./home-navigation";
 import { MobileTaskHomeNavigation, type MobileHomeNavigationIntent, type MobileHomeViewChange, type MobileHomeViewState,
   type MobileTaskHomeNavigationPorts } from "./mobile-task-home-navigation";
@@ -1381,6 +1382,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   const [localViewState, setLocalViewState] = useState<MobileHomeViewState>({ search: "", statusFilter: "active" });
   const currentView = viewState ?? localViewState;
   const { search, statusFilter, searchSort = "relevance" } = currentView;
+  const display = currentView.display ?? DEFAULT_MOBILE_HOME_DISPLAY;
   const setViewState: MobileHomeViewChange = onViewStateChange ?? setLocalViewState;
   const setSearch = (search: string): void => setViewState({ ...currentView, search });
   const setStatusFilter = (statusFilter: MobileHomeStatusFilter): void => setViewState({ ...currentView, statusFilter }, true);
@@ -1398,6 +1400,8 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   const homeScopeKey = mobileHomeSourceKey(state);
   const homeScopeRef = useRef(homeScopeKey);
   homeScopeRef.current = homeScopeKey;
+  const [displaySource, setDisplaySource] = useState<string>();
+  const [filterNow, setFilterNow] = useState(Date.now);
   const [renameSession, setRenameSession] = useState<Session>();
   const [taskTagSessionId, setTaskTagSessionId] = useState<string>();
   const [renameDraft, setRenameDraft] = useState("");
@@ -1436,12 +1440,21 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     statusFilter,
     query: search,
     searchSort,
+    display,
+    now: filterNow,
     messageSessionIds: new Set(currentMessageMatches.keys()),
     labels: mobileHomeSectionLabels(locale)
-  }), [currentMessageMatches, locale, search, searchSort, state.owner, statusFilter]);
+  }), [currentMessageMatches, display, filterNow, locale, search, searchSort, state.owner, statusFilter]);
   const listSections = useMemo(() => sections.map((section) => ({ ...section, data: section.items })), [sections]);
 
   useEffect(() => { restoreListScroll(); }, [listSections, restoreListScroll]);
+  useEffect(() => {
+    if (!foreground || normalizedSearch || display.lastActivity === "all") return;
+    setFilterNow(Date.now());
+    const timer = setInterval(() => setFilterNow(Date.now()), 60_000);
+    return () => clearInterval(timer);
+  }, [display.lastActivity, foreground, normalizedSearch]);
+  useEffect(() => { setDisplaySource(undefined); }, [homeScopeKey]);
   useEffect(() => {
     if (searchFocusRequest > 0) searchRef.current?.focus();
   }, [searchFocusRequest]);
@@ -1661,6 +1674,8 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
         placeholderTextColor={colors.muted} value={search} onChangeText={setSearch}
         style={[styles.input, styles.searchInput, { color: colors.ink, backgroundColor: colors.surface, borderColor: colors.border }]} />
       {searchPending && <ActivityIndicator accessibilityLabel={mobileMessage(locale, "home.search")} color={colors.accent} />}
+      {!normalizedSearch && <Action label={mobileMessage(locale, "home.display")} colors={colors} compact
+        onPress={() => setDisplaySource(homeScopeKey)} />}
     </View>
     <View accessibilityRole="tablist" style={styles.filterRow}>
       {(["active", "archived", "all"] as const).map((filter) => <Pressable key={filter} accessibilityRole="tab"
@@ -1701,7 +1716,8 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
         : <Text style={[styles.listSectionTitle, { color: colors.muted }]}>{section.title}</Text>}
       ListEmptyComponent={searchPending ? undefined : <Centered label={mobileMessage(locale, state.offlineSnapshotAt !== undefined
         ? "home.empty.offline" : state.status !== "connected" ? "home.empty.reconnect" : normalizedSearch
-          ? "home.empty.search" : statusFilter === "archived" ? "home.empty.archived" : "home.empty.default")} colors={colors} />}
+          ? "home.empty.search" : hasMobileHomeDisplayFilters(display) ? "home.empty.filters"
+          : statusFilter === "archived" ? "home.empty.archived" : "home.empty.default")} colors={colors} />}
       renderItem={({ item }) => <SwipeableSessionRow session={item.session} registry={swipeRegistry} colors={colors} locale={locale}
         onTogglePin={togglePin} onArchive={toggleArchive} onShowOptions={openOptions}
         disabled={state.status !== "connected"}>
@@ -1740,6 +1756,12 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
       refreshing={state.status === "connecting"} onRefresh={() => void client.refresh()}
       onScrollBeginDrag={() => { listScroll.pendingOffset = 0; swipeRegistry.closeOpenRow(); }}
       contentContainerStyle={styles.list} />
+    {displaySource === homeScopeKey && foreground && !normalizedSearch && <MobileHomeDisplaySheet
+      state={state} display={display} colors={colors} locale={locale}
+      onClose={() => setDisplaySource(undefined)}
+      onChange={next => {
+        if (displaySource === mobileHomeSourceKey(client.state)) setViewState({ ...currentView, display: next }, false, true);
+      }} />}
     <Modal visible={(state.status === "connected" || state.status === "offline") && optionsSession !== undefined} transparent animationType="none"
       onRequestClose={closeOptions} statusBarTranslucent>
       <View style={styles.sheetRoot}>
@@ -1800,6 +1822,71 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
 }
 
 type SessionOption = "rename" | "copy-link" | "pin" | "archive" | "delete" | "tags" | `tag:${string}`;
+
+function MobileHomeDisplaySheet({ state, colors, locale, display, onChange, onClose }: ScreenProps & {
+  readonly display: MobileHomeDisplayPreferences;
+  readonly onChange: (display: MobileHomeDisplayPreferences) => void;
+  readonly onClose: () => void;
+}) {
+  const { height } = useWindowDimensions();
+  const targets = new Map(state.owner?.targets.map(target => [target.targetId, target] as const));
+  const projects = state.owner?.workspaces.flatMap(workspace => {
+    const target = targets.get(workspace.targetId);
+    if (workspace.kind !== WorkspaceKind.USER_PROJECT || target?.state === TargetState.ARCHIVED || target?.state === TargetState.DELETING) return [];
+    return [{ key: `project:${workspace.targetId}`, label: target?.displayName || workspace.displayName || mobileMessage(locale, "home.section.project"), path: workspace.serverPathDisplay }];
+  }).sort((left, right) => left.label.localeCompare(right.label) || left.key.localeCompare(right.key)) ?? [];
+  const projectChoices = [{ key: "dialogue", label: mobileMessage(locale, "home.section.dialogue"), path: "" }, ...projects];
+  const updateProject = (key: string): void => {
+    const selected = display.projectFilter === "all" ? [] : display.projectFilter;
+    const next = selected.includes(key) ? selected.filter(item => item !== key) : [...selected, key];
+    onChange({ ...display, projectFilter: next.length === 0 ? "all" : next });
+  };
+  const option = (key: string, label: string, checked: boolean, select: () => void, role: "radio" | "checkbox" = "radio", detail?: string) => (
+    <Pressable key={key} accessibilityRole={role} accessibilityState={{ checked }}
+      accessibilityLabel={detail ? `${label} · ${detail}` : label} onPress={select}
+      style={[styles.homeDisplayOption, checked && { backgroundColor: colors.brandBackground }]}>
+      <View style={styles.fill}>
+        <Text style={[styles.label, { color: colors.ink }]}>{label}</Text>
+        {!!detail && <Text numberOfLines={1} style={[styles.caption, { color: colors.muted }]}>{detail}</Text>}
+      </View>
+      {checked && <Text accessible={false} style={[styles.label, { color: colors.accent }]}>✓</Text>}
+    </Pressable>
+  );
+  const title = mobileMessage(locale, "home.display");
+  return <Modal visible transparent animationType="none" statusBarTranslucent onRequestClose={onClose}>
+    <View style={styles.sheetRoot}>
+      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "common.cancel")} onPress={onClose} style={styles.modalBackdrop} />
+      <SafeAreaView accessibilityViewIsModal edges={["bottom", "left", "right"]}
+        style={[styles.optionSheet, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+        <Text accessibilityRole="header" style={[styles.title, { color: colors.ink }]}>{title}</Text>
+        <ScrollView style={{ maxHeight: Math.floor(height * 0.62) }}>
+          <Text accessibilityRole="header" style={[styles.listSectionTitle, { color: colors.muted }]}>{mobileMessage(locale, "home.display.projects")}</Text>
+          {option("all-projects", mobileMessage(locale, "home.display.allProjects"), display.projectFilter === "all",
+            () => onChange({ ...display, projectFilter: "all" }), "checkbox")}
+          {projectChoices.map(project => option(project.key, project.label,
+            display.projectFilter !== "all" && display.projectFilter.includes(project.key), () => updateProject(project.key), "checkbox", project.path))}
+          <Text accessibilityRole="header" style={[styles.listSectionTitle, { color: colors.muted }]}>{mobileMessage(locale, "home.display.agent")}</Text>
+          {option("all-agents", mobileMessage(locale, "home.display.allAgents"), display.backendId === null,
+            () => onChange({ ...display, backendId: null }))}
+          {state.owner?.backends.map(backend => option(`agent:${backend.backendId}`, backend.displayName || backend.backendId,
+            display.backendId === backend.backendId, () => onChange({ ...display, backendId: backend.backendId })))}
+          <Text accessibilityRole="header" style={[styles.listSectionTitle, { color: colors.muted }]}>{mobileMessage(locale, "home.display.lastActivity")}</Text>
+          {MOBILE_HOME_ACTIVITY_FILTERS.map(range => option(`range:${range}`, mobileMessage(locale, `home.display.activity.${range}`),
+            display.lastActivity === range, () => onChange({ ...display, lastActivity: range })))}
+          <Text accessibilityRole="header" style={[styles.listSectionTitle, { color: colors.muted }]}>{mobileMessage(locale, "home.display.sort")}</Text>
+          {MOBILE_HOME_TASK_SORTS.map(sortBy => option(`sort:${sortBy}`, mobileMessage(locale,
+            sortBy === "activity" ? "home.searchSort.activityDesc" : `home.display.sort.${sortBy}`),
+          display.sortBy === sortBy, () => onChange({ ...display, sortBy })))}
+        </ScrollView>
+        <View style={styles.actionRow}>
+          <Action label={mobileMessage(locale, "home.display.reset")} colors={colors} compact disabled={!hasMobileHomeDisplayFilters(display)}
+            onPress={() => onChange({ ...DEFAULT_MOBILE_HOME_DISPLAY, sortBy: display.sortBy })} />
+          <Action label={mobileMessage(locale, "common.close")} colors={colors} compact onPress={onClose} />
+        </View>
+      </SafeAreaView>
+    </View>
+  </Modal>;
+}
 
 function MobileInputHandoffHomeEntry({ colors, state, locale, onOpen }: ScreenProps & { readonly onOpen: (sessionId: string) => void }) {
   const api = client.inputHandoffTasksApi?.();
@@ -9143,6 +9230,7 @@ const styles = StyleSheet.create({
   composerInput: { flex: 1, minHeight: 44, fontSize: 16, lineHeight: 22, paddingVertical: 8 },
   sheetRoot: { flex: 1, justifyContent: "flex-end" },
   optionSheet: { borderTopWidth: 1, borderTopLeftRadius: 22, borderTopRightRadius: 22, padding: 18, gap: 4 },
+  homeDisplayOption: { minHeight: 44, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 10, borderRadius: 8 },
   dialogRoot: { flex: 1, justifyContent: "center", padding: 24, backgroundColor: "rgba(0,0,0,0.38)" },
   renameDialog: { borderWidth: 1, borderRadius: 18, padding: 20, gap: 16 },
   taskDrawer: { flex: 1, paddingHorizontal: 14, paddingBottom: 12, gap: 10 },
