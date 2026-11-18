@@ -11,7 +11,7 @@ export interface MobileHomeSearchMatch {
 
 export interface MobileHomeSessionItem {
   readonly session: Session;
-  readonly targetName: string;
+  readonly navigationName: string;
   readonly groupKind: "dialogue" | "project";
   readonly groupKey: string;
   readonly groupTitle: string;
@@ -43,27 +43,25 @@ export function buildMobileHomeSections(options: BuildMobileHomeSectionsOptions)
   const normalizedQuery = options.query.trim().toLocaleLowerCase();
   const targets = new Map(snapshot.targets.map((target) => [target.targetId, target]));
   const workspaces = new Map(snapshot.workspaces.map((workspace) => [workspace.targetId, workspace]));
-  const visible = snapshot.sessions.filter((session) => {
-    if (session.hidden || session.derivationOrigin?.sideChat) return false;
-    if (options.statusFilter === "active" && session.archived) return false;
-    if (options.statusFilter === "archived" && !session.archived) return false;
-    if (!normalizedQuery) return true;
-    const target = targets.get(session.targetId);
-    return session.displayName.toLocaleLowerCase().includes(normalizedQuery)
-      || target?.displayName.toLocaleLowerCase().includes(normalizedQuery) === true
-      || options.messageSessionIds?.has(session.sessionId) === true;
-  });
-  const items = visible.map((session): MobileHomeSessionItem => {
-    const target = targets.get(session.targetId);
-    const workspace = workspaces.get(session.targetId);
+  const items = snapshot.sessions.flatMap((session): MobileHomeSessionItem[] => {
+    if (session.hidden || session.derivationOrigin?.sideChat) return [];
+    if (options.statusFilter === "active" && session.archived) return [];
+    if (options.statusFilter === "archived" && !session.archived) return [];
+    const projectId = session.projectId;
+    const target = projectId === undefined ? undefined : targets.get(projectId);
+    const workspace = projectId === undefined ? undefined : workspaces.get(projectId);
     const project = workspace?.kind === WorkspaceKind.USER_PROJECT;
-    return {
+    const navigationName = target?.displayName || workspace?.displayName || (project ? options.labels.project : options.labels.dialogue);
+    if (normalizedQuery && !session.displayName.toLocaleLowerCase().includes(normalizedQuery)
+      && !navigationName.toLocaleLowerCase().includes(normalizedQuery)
+      && options.messageSessionIds?.has(session.sessionId) !== true) return [];
+    return [{
       session,
-      targetName: target?.displayName || options.labels.dialogue,
+      navigationName,
       groupKind: project ? "project" : "dialogue",
-      groupKey: project ? `project:${session.targetId}` : "dialogue",
-      groupTitle: project ? target?.displayName || workspace.displayName || options.labels.project : options.labels.dialogue
-    };
+      groupKey: project ? `project:${projectId}` : "dialogue",
+      groupTitle: project ? navigationName : options.labels.dialogue
+    }];
   });
   if (normalizedQuery) {
     if (items.length === 0) return [];

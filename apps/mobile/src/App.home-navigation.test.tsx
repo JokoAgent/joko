@@ -328,8 +328,8 @@ beforeEach(async () => {
   latest.mockClear();
   const sessions = [
     create(SessionSchema, { sessionId: "current", targetId: "dialogue", backendId: "backend", displayName: "Alpha", pinned: true, state: SessionState.IDLE }),
-    create(SessionSchema, { sessionId: "other", targetId: "project", backendId: "backend", displayName: "Beta", state: SessionState.IDLE }),
-    create(SessionSchema, { sessionId: "archived", targetId: "project", backendId: "backend", displayName: "Past", archived: true, state: SessionState.IDLE })
+    create(SessionSchema, { sessionId: "other", targetId: "project", projectId: "project", backendId: "backend", displayName: "Beta", state: SessionState.IDLE }),
+    create(SessionSchema, { sessionId: "archived", targetId: "project", projectId: "project", backendId: "backend", displayName: "Past", archived: true, state: SessionState.IDLE })
   ];
   const owner = create(SnapshotSchema, { snapshotId: "owner", generation: 1n, revision: { value: 1n }, sessions,
     connections: [{ connectionId: homeConnectionId }],
@@ -573,13 +573,41 @@ describe("actual Home navigation hosts", () => {
     expect(host.textContent).not.toContain("Alpha");
   });
 
+  it("uses the current project or Dialogue for a moved task with the original execution Target", async () => {
+    const original = state.owner!;
+    const owner = (projectId: string | undefined) => create(SnapshotSchema, { ...original,
+      targets: [...original.targets, { targetId: "destination", backendId: "backend", displayName: "Destination" }],
+      workspaces: [
+        { targetId: "project", workspaceId: "original-workspace", kind: WorkspaceKind.USER_PROJECT },
+        { targetId: "destination", workspaceId: "destination-workspace", kind: WorkspaceKind.USER_PROJECT }
+      ],
+      sessions: original.sessions.map(session => session.sessionId === "other" ? create(SessionSchema, { ...session, projectId }) : session)
+    });
+    await render({ state: { ...state, owner: owner("project") }, runNavigation: undefined, host: "home" });
+    expect(button("Open task Beta").textContent).toContain("Project ·");
+    expect(button("Open task Beta").closest("section")?.firstElementChild?.textContent).toBe("Project");
+    const moved = owner("destination");
+    await render({ state: { ...state, owner: moved } });
+    expect(button("Open task Beta").textContent).toContain("Destination ·");
+    expect(button("Open task Beta").closest("section")?.firstElementChild?.textContent).toBe("Destination");
+    expect(moved.sessions.find(session => session.sessionId === "other")?.targetId).toBe("project");
+    await type(message("home.search"), "Destination");
+    await press("Open task Beta");
+    expect(select).toHaveBeenLastCalledWith("other");
+    expect(onSelect).toHaveBeenLastCalledWith(undefined);
+    await type(message("home.search"), "");
+    await render({ state: { ...state, owner: owner(undefined) } });
+    expect(button("Open task Beta").textContent).toContain(`${message("home.section.dialogue")} ·`);
+    expect(button("Open task Beta").closest("section")?.firstElementChild?.textContent).toBe(message("home.section.dialogue"));
+  });
+
   it("sorts Home search by relevance or either activity direction and restores the ordinary list on clear", async () => {
     const owner = create(SnapshotSchema, { ...state.owner!,
       workspaces: [create(WorkspaceDescriptorSchema, { workspaceId: "project-workspace", targetId: "project", displayName: "Project", kind: WorkspaceKind.USER_PROJECT })],
       sessions: [
-        create(SessionSchema, { sessionId: "title", targetId: "project", backendId: "backend", displayName: "Needle title", state: SessionState.IDLE,
+        create(SessionSchema, { sessionId: "title", targetId: "project", projectId: "project", backendId: "backend", displayName: "Needle title", state: SessionState.IDLE,
           lastActivityAt: create(TimestampSchema, { seconds: 10n }) }),
-        create(SessionSchema, { sessionId: "body", targetId: "project", backendId: "backend", displayName: "Newer task", state: SessionState.IDLE,
+        create(SessionSchema, { sessionId: "body", targetId: "project", projectId: "project", backendId: "backend", displayName: "Newer task", state: SessionState.IDLE,
           lastActivityAt: create(TimestampSchema, { seconds: 20n }) })
       ] });
     const order = () => Array.from(host.querySelectorAll('[data-testid="home-list"] button[aria-label^="Open task "]'))

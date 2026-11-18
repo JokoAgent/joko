@@ -1683,8 +1683,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
               if (swipeRegistry.closeOpenRow()) return;
               const sessionId = item.session.sessionId;
               const query = normalizedSearch.toLocaleLowerCase();
-              const targetName = state.owner?.targets.find(target => target.targetId === item.session.targetId)?.displayName;
-              const matchesName = item.session.displayName.toLocaleLowerCase().includes(query) || targetName?.toLocaleLowerCase().includes(query);
+              const matchesName = item.session.displayName.toLocaleLowerCase().includes(query) || item.navigationName.toLocaleLowerCase().includes(query);
               const match = matchesName ? undefined : currentMessageMatches.get(sessionId);
               navigate({ kind: "session", sessionId, ...(match?.eventId ? { searchMatch: match } : {}) });
             }} style={styles.sessionRowBody}>
@@ -1694,7 +1693,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
               <MobileTaskTagDots tags={item.session.taskTags} locale={locale} dark={colors.dark} />
               {item.session.pinned && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>{mobileMessage(locale, "common.pinned")}</Text>}
             </View>
-              <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{item.targetName} · {sessionState(item.session.state, locale)}</Text></View>
+              <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{item.navigationName} · {sessionState(item.session.state, locale)}</Text></View>
           </Pressable>
           <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.optionsFor", {
             name: item.session.displayName || mobileMessage(locale, "home.untitledTask")
