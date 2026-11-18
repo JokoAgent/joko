@@ -1558,7 +1558,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }
   }
 
-  async refreshProviderAccountUsage(backendId: string, providerId: string): Promise<void> {
+  async refreshProviderAccountUsage(backendId: string, providerId: string, signal?: AbortSignal): Promise<void> {
     const normalizedBackendId = backendId.trim();
     const normalizedProviderId = providerId.trim();
     if (normalizedBackendId.length === 0 || normalizedBackendId.length > 256 || /[\u0000-\u001f\u007f]/u.test(normalizedBackendId)) {
@@ -1567,7 +1567,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (normalizedProviderId.length === 0 || normalizedProviderId.length > 256 || /[\u0000-\u001f\u007f]/u.test(normalizedProviderId)) {
       throw new GatewayError("Provider ID is invalid.");
     }
-    const scope = this.captureActionScope();
+    const scope = this.captureActionScope(signal);
     const key = providerKey(normalizedBackendId, normalizedProviderId);
     const providerIn = (raw: Snapshot | undefined) => raw?.providers.find(provider => providerKey(provider.backendId, provider.providerId) === key);
     const authority = providerAccountUsageAuthority(this.#rawSnapshot, providerIn(this.#rawSnapshot));

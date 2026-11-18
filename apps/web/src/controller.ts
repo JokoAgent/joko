@@ -4014,7 +4014,7 @@ export function useAppController(): AppController {
     restoreFirstInputDraft,
     ...newTaskDraftApi,
     ...inputApi,
-    refreshProviderAccountUsage: (backendId, providerId) => gateway().refreshProviderAccountUsage(backendId, providerId),
+    refreshProviderAccountUsage: (backendId, providerId, signal) => gateway().refreshProviderAccountUsage(backendId, providerId, signal),
     readProviderAccountBalance: (backendId, providerId, forceRefresh, signal) => gateway().readProviderAccountBalance(backendId, providerId, forceRefresh, signal),
     providerAccountResets: () => gateway().providerAccountResets?.(),
     getSessionContextBudget: (sessionId, generation, signal) => gateway().getSessionContextBudget(sessionId, generation, signal),

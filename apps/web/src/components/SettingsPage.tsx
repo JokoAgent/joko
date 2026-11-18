@@ -63,6 +63,7 @@ import { resourceKindsForBackend } from "../resource-capabilities.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, ErrorBanner, IconButton, Modal, ModalBackButton, Pill, SegmentedControl, Spinner, StatusDot, Tip, cx, formatRelativeTime, CheckboxControl, SelectControl, SwitchControl } from "./ui.js";
 import { ProviderLoginDialog } from "./ProviderLoginDialog.js";
+import { ProviderAccountUsageDetails } from "./ProviderAccountUsage.js";
 import { ProviderSharingOwnerSettings } from "./ProviderSharingOwnerSettings.js";
 import { ProviderGroupOwnerSettings } from "./ProviderGroupOwnerSettings.js";
 import { ProviderMark } from "./ProviderMark.js";
@@ -4519,79 +4520,6 @@ function ProviderAddWizard({ open, providers, runtimes, runtimePending = false, 
     {runtimePending && <p role="status">{t("common.loading")}</p>}{runtimeError && <p className="danger-text" role="alert">{t("settings.localRuntime.actionFailed")}</p>}
     <label className="provider-add-wizard__search"><Search aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("settings.providerWizard.search")} aria-label={t("settings.providerWizard.search")} /></label><div className="provider-add-wizard__catalog">{groups.map((group) => <section key={group.id}><h3>{group.label}</h3>{group.runtimes?.map((runtime) => <button type="button" key={`runtime:${runtime.id}`} disabled={runtimePending} onClick={() => onChooseRuntime(runtime.id)}><span className="provider-catalog-icon" aria-hidden="true"><Server /></span><span><strong>{runtime.name}</strong><small>{t("settings.providerWizard.localSuggestion")}</small></span><Pill>BETA</Pill><ChevronRight aria-hidden="true" /></button>)}{group.providers.map((entry) => <button type="button" key={entry.id} disabled={runtimePending} onClick={() => onChoose(entry)}><span className="provider-catalog-icon" aria-hidden="true"><ProviderMark providerId={entry.provider.id} name={entry.provider.name} /></span><span><strong>{entry.provider.name}</strong><small>{[entry.backendName, providerConnectionLabel(entry.provider, t)].filter(Boolean).join(" · ")}</small></span><ChevronRight aria-hidden="true" /></button>)}</section>)}{groups.length === 0 && <p className="provider-add-wizard__empty">{t("settings.providerWizard.noMatches")}</p>}</div><button type="button" className="provider-add-wizard__custom" disabled={runtimePending} onClick={onCustom}><span className="provider-catalog-icon"><CirclePlus aria-hidden="true" /></span><span><strong>{t("settings.providerWizard.customTitle")}</strong><small>{t("settings.providerWizard.customBody")}</small></span><ChevronRight aria-hidden="true" /></button><p className="provider-add-wizard__note">{t("settings.providerWizard.authNote")}</p></div></Modal>;
 }
-
-function ProviderAccountUsageDetails({
-  runtime,
-  locale,
-  t
-}: {
-  readonly runtime: AppSnapshot["providers"][number];
-  readonly locale: Locale;
-  readonly t: Translator;
-}): JSX.Element | null {
-  const usage = runtime.accountUsage;
-  if (!runtime.capabilities.has(capabilityNames.providerAccountUsage) || usage === undefined) return null;
-  const percent = new Intl.NumberFormat(locale, { maximumFractionDigits: 1 });
-  const buckets = usage.buckets ?? [];
-  const windowRows = (buckets.length === 0 ? [
-    { key: "primary", label: t("settings.accountUsagePrimary"), window: usage.primaryWindow },
-    { key: "secondary", label: t("settings.accountUsageSecondary"), window: usage.secondaryWindow }
-  ] : buckets.flatMap((bucket) => [
-    { key: `bucket:${bucket.id}:primary`, label: `${bucket.displayName ?? bucket.id} · ${t("settings.accountUsagePrimary")}`, window: bucket.primaryWindow },
-    { key: `bucket:${bucket.id}:secondary`, label: `${bucket.displayName ?? bucket.id} · ${t("settings.accountUsageSecondary")}`, window: bucket.secondaryWindow }
-  ])).concat((usage.modelWindows ?? []).map((entry, index) => ({
-    key: `model:${index}`, label: entry.displayName, window: entry.window
-  }))).filter((row) => row.window !== undefined);
-  const formatCredits = (credits: typeof usage.credits) => {
-    const balance = credits?.balance === undefined ? undefined : t("settings.accountCreditsBalance", { balance: credits.balance });
-    const depleted = credits?.unlimited !== true && credits?.hasCredits === false;
-    const status = credits?.unlimited === true ? t("settings.accountCreditsUnlimited")
-      : depleted ? t("settings.accountCreditsNone")
-        : credits?.hasCredits === true && balance === undefined ? t("settings.accountCreditsAvailable") : undefined;
-    return { text: [balance, status].filter(Boolean).join(" · "), depleted };
-  };
-  const creditLabel = formatCredits(usage.credits);
-  const observedAt = usage.credits?.observedAt ?? usage.observedAt;
-  return <div className="provider-account-usage" role="list" aria-label={t("settings.accountUsage")}>
-    {(usage.planType !== undefined || usage.limitReached === true) && <span role="listitem">{[
-      usage.planType === undefined ? undefined : t("settings.accountPlan", { plan: usage.planType }),
-      usage.limitReached === true ? t("settings.accountLimitReached") : undefined
-    ].filter(Boolean).join(" · ")}</span>}
-    {windowRows.map((row) => <span role="listitem" key={row.key}>{[
-      row.label,
-      t("settings.accountUsagePercent", { percent: percent.format(row.window!.usedPercent) }),
-      row.window!.windowMinutes === undefined
-        ? undefined
-        : t("settings.accountUsageWindowMinutes", { minutes: new Intl.NumberFormat(locale).format(row.window!.windowMinutes) }),
-      row.window!.resetAt === undefined
-        ? undefined
-        : t("settings.accountUsageReset", { time: formatRelativeTime(row.window!.resetAt, locale) }),
-      row.window!.severity
-    ].filter(Boolean).join(" · ")}</span>)}
-    {buckets.map((bucket) => {
-      const bucketCredits = formatCredits(bucket.credits);
-      return <span role="listitem" key={`bucket:${bucket.id}:details`} className={bucketCredits.depleted ? "danger-text" : undefined}>{[
-        bucket.displayName ?? bucket.id,
-        bucket.planType === undefined ? undefined : t("settings.accountPlan", { plan: bucket.planType }),
-        bucket.limitReached === true ? t("settings.accountLimitReached") : undefined,
-        bucketCredits.text
-      ].filter(Boolean).join(" · ")}</span>;
-    })}
-    {creditLabel.text && <span role="listitem" className={creditLabel.depleted ? "danger-text" : undefined}>{creditLabel.text}</span>}
-    {usage.resetCredits !== undefined && <span role="listitem">{[
-      t("settings.accountResetCredits", { count: new Intl.NumberFormat(locale).format(usage.resetCredits.availableCount) }),
-      usage.resetCredits.earliestExpiryAt === undefined ? undefined : t("settings.accountResetCreditExpiry", { time: formatRelativeTime(usage.resetCredits.earliestExpiryAt, locale) })
-    ].filter(Boolean).join(" · ")}</span>}
-    {usage.extraUsage !== undefined && <span role="listitem">{[
-      t(usage.extraUsage.enabled ? "settings.accountExtraUsageEnabled" : "settings.accountExtraUsageDisabled"),
-      usage.extraUsage.usedPercent === undefined ? undefined : t("settings.accountUsagePercent", { percent: percent.format(usage.extraUsage.usedPercent) }),
-      usage.extraUsage.usedCredits === undefined ? undefined : t("settings.accountExtraUsageUsed", { credits: new Intl.NumberFormat(locale).format(usage.extraUsage.usedCredits) }),
-      usage.extraUsage.monthlyLimit === undefined ? undefined : t("settings.accountExtraUsageLimit", { credits: new Intl.NumberFormat(locale).format(usage.extraUsage.monthlyLimit) })
-    ].filter(Boolean).join(" · ")}</span>}
-    {observedAt !== undefined && <span role="listitem">{t("settings.accountUsageObserved", { time: formatRelativeTime(observedAt, locale) })}</span>}
-  </div>;
-}
-
 
 function providerStatusTone(state: AppSnapshot["providers"][number]["authenticationState"], enabled: boolean): string {
   if (!enabled) return "muted";

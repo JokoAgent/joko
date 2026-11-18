@@ -8,6 +8,7 @@ import type { ProviderGroupRebalanceView } from "@joko/contracts";
 import { composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
 import { dispatchGamepadOwnedAction } from "../gamepad-actions.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
+import { translate } from "../i18n.js";
 import { emptySnapshot, type BackendView, type ModelView, type PartnerProfileView, type ProviderRuntimeView, type SessionView } from "../model.js";
 import { Composer } from "./Composer.js";
 import { PartnerConversationProvider } from "./PartnerConversation.js";
@@ -40,6 +41,29 @@ afterEach(async () => {
 });
 
 describe("Composer model authorization", () => {
+  it("shows quota from the exact local subscription before any task usage and retires it on route change", async () => {
+    const read = vi.fn<AppController["refreshProviderAccountUsage"]>().mockResolvedValue(undefined);
+    const view = await mount(undefined, undefined, read);
+    const subscription = { ...provider, kind: "subscription" as const, capabilities: new Set(["provider.account_usage"]),
+      accountUsage: { primaryWindow: { usedPercent: 10 }, modelWindows: [{ modelId: model.modelId, displayName: "Current model quota", window: { usedPercent: 30 } }] } };
+    const unrelated = { ...subscription, backendId: "different-backend",
+      accountUsage: { modelWindows: [{ modelId: model.modelId, displayName: "Other account quota", window: { usedPercent: 90 } }] } };
+    await view.render([unrelated, subscription]);
+    expect(read).toHaveBeenCalledExactlyOnceWith(model.backendId, model.providerId, expect.any(AbortSignal));
+    const uses = view.host.querySelector<HTMLButtonElement>(".composer-account-usage > button")!;
+    expect(uses.textContent).toBe("70% remaining");
+    await act(async () => uses.click());
+    const region = view.host.querySelector(".composer-account-usage [role='region']");
+    expect(region?.textContent).toContain("Current model quota");
+    expect(region?.textContent).not.toContain("Other account quota");
+    const signal = read.mock.calls[0]![2]!;
+    await view.render([unrelated, subscription], { ...session, model: { ...model, source: {
+      kind: "group", displayName: "Group", nodeId: "", nodeName: "", nativeAdapterKind: "codex", groupMemberCount: 2, grouped: true
+    } } });
+    expect(signal.aborted).toBe(true);
+    expect(view.host.querySelector(".composer-account-usage")).toBeNull();
+    expect(read).toHaveBeenCalledTimes(1);
+  });
   it("keeps canonical Partner input, draft and Stop while profile settings own runtime and workspace controls", async () => {
     const partnerProfile: PartnerProfileView = { id: "partner", canonicalSessionId: session.id, homeTargetId: session.targetId, displayName: "Aster", description: "", avatar: "orbit",
       revision: 1n, profileVersion: 1n, lifecycle: "active", initializationState: "ready", invitationStage: "ready", identitySource: "Aster", templateId: "general",
@@ -252,10 +276,11 @@ describe("Composer quota balancing confirmation", () => {
   });
 });
 
-async function mount(partnerProfile?: PartnerProfileView, readRebalance?: AppController["readTaskProviderGroupRebalance"]) {
+async function mount(partnerProfile?: PartnerProfileView, readRebalance?: AppController["readTaskProviderGroupRebalance"], refreshUsage?: AppController["refreshProviderAccountUsage"]) {
   const initial = emptySnapshot();
   const api = { state: { connectionState: "connected", effectiveLocale: "en", snapshot: { ...initial, sessions: [session], providers: [provider] }, preferences: DEFAULT_UI_PREFERENCES },
     ...(readRebalance === undefined ? {} : { readTaskProviderGroupRebalance: readRebalance }),
+    ...(refreshUsage === undefined ? {} : { refreshProviderAccountUsage: refreshUsage }),
     readDraft: vi.fn(async () => ({ text: "Keep this draft" })),
     readDraftSnapshot: vi.fn(async () => ({ revision: 1, draft: { text: "Keep this draft", attachments: [], mentions: [], deliveryMode: "prompt" as const } })),
     saveDraft: vi.fn(async () => undefined), send: vi.fn(async () => undefined),
@@ -272,7 +297,7 @@ async function mount(partnerProfile?: PartnerProfileView, readRebalance?: AppCon
     readOnly={readOnly}
     autoFocus={false} queue={[]} extraDirectories={[]} resources={[]} commands={[]} messageHistory={[]}
     controls={<span data-runtime-controls>Runtime controls</span>}
-    t={(key) => key} runAction={(_key, action) => { actions.push(action().catch(() => undefined)); }} onLocalSend={() => undefined} onStop={stop} />;
+    t={(key, values) => key === "settings.providerGroups.remaining" ? translate("en", key, values) : key} runAction={(_key, action) => { actions.push(action().catch(() => undefined)); }} onLocalSend={() => undefined} onStop={stop} />;
     root.render(partnerProfile === undefined ? content : <PartnerConversationProvider controller={controller} session={currentSession} active t={(key) => key}>{content}</PartnerConversationProvider>);
   });
   await render([provider]);
