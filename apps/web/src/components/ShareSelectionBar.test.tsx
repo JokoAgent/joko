@@ -79,6 +79,19 @@ describe("generated selection image ownership", () => {
     expect(view.onCancel).toHaveBeenCalledOnce();
   });
 
+  it("keeps the current selection usable when all 81 loaded rows would exceed the image limit", async () => {
+    const view = mount();
+    const rows = Array.from({ length: 81 }, (_, index) => ({ ...messages[0]!, id: index ? `row-${index}` : "one" }));
+    await act(async () => view.render("one", "profile", rows));
+    const all = view.host.querySelector<HTMLButtonElement>('button[role="checkbox"]')!;
+    expect(all.disabled).toBe(true);
+    expect(all.getAttribute("aria-checked")).toBe("false");
+    expect(view.host.textContent).toContain("timeline.shareSelectionCountLimit");
+    expect(button(view.host, "Copy").disabled).toBe(false);
+    await act(async () => view.render("one", "profile", rows.slice(0, 80)));
+    expect(all.disabled).toBe(false);
+  });
+
   it("uses the containing Document and releases pending work and success timers on pagehide", async () => {
     vi.useFakeTimers();
     const frame = document.body.appendChild(document.createElement("iframe"));

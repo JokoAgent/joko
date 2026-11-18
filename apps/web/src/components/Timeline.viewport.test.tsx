@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ArtifactView, TimelineItemView } from "../model.js";
+import { translate } from "../i18n.js";
 import { DesktopPageSearchBar } from "./DesktopPageSearchBar.js";
 import { Timeline } from "./Timeline.js";
 import { DesktopPageSearchTextAccess, PAGE_SEARCH_ACTIVE_HIGHLIGHT } from "./desktop-page-search.js";
@@ -120,6 +121,28 @@ afterEach(async () => {
 });
 
 describe("Timeline viewport journeys", () => {
+  it("copies the ordinary user message and the filename displayed on its attachment card", async () => {
+    const writeText = vi.fn(async () => undefined);
+    const clipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    try {
+      const notes: ArtifactView = { id: "notes", blobId: "notes-blob", kind: "file", fileName: "notes.pdf",
+        title: "Meeting notes", mediaType: "application/pdf", byteSize: 8, sourceRevealAvailable: false };
+      await render({ t: (key, values) => translate("en", key, values), items: [
+        { ...item("with-file", 1, "user"), text: "See the notes.", userInputAccepted: true, attachments: [notes] }
+      ] });
+      await flushFrames();
+      const message = host.querySelector<HTMLElement>('[data-user-msg-id="with-file"]')!;
+      expect(message.querySelector(".message-attachment")?.textContent).toContain("notes.pdf");
+      await act(async () => message.querySelector<HTMLButtonElement>('.message-actions button[aria-label="Copy"]')!.click());
+      expect(writeText).toHaveBeenCalledExactlyOnceWith("See the notes.\n\nAttachments: notes.pdf");
+      expect(message.querySelector('.message-actions [role="status"]')?.textContent).toBe("Copied");
+    } finally {
+      if (clipboard === undefined) Reflect.deleteProperty(navigator, "clipboard");
+      else Object.defineProperty(navigator, "clipboard", clipboard);
+    }
+  });
+
   it("routes only a clicked assistant answer through the current timeline host", async () => {
     const send = vi.fn(async () => true);
     const text = '```joko-ui\n' + JSON.stringify({ seq: 1, op: "create", id: "continue", kind: "button",

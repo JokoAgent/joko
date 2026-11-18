@@ -2394,11 +2394,11 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         "--sidebar-expanded-width": `${state.preferences.navigationWidth}px`
       } as CSSProperties}
     >
-      <NativeTaskStatusBridge
+      {window.jokoDesktop?.capabilities.includes("native.taskStatus") === true && <NativeTaskStatusBridge
         controller={controller}
         ownsProjection={!auxiliaryApplicationWindow}
         visibleSessionIds={nativeTaskStatusVisibleSessionIds}
-      />
+      />}
       <DesktopRemoteDesktopStatus t={t} />
       <TaskActivityBanner />
       <a className="skip-link" href="#main-content">{t("app.skipToContent")}</a>
@@ -2806,8 +2806,11 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         worktreeSupportedTargetIds={portableWorktreeTargetIds}
         onCloseExport={() => setPortableExportSession(undefined)}
         onCloseImport={(requestId) => setPortableImportRequest(current => current?.id === requestId ? undefined : current)}
-        onExported={(fidelity) => setLayoutNotice(t(fidelity === "full" ? "portable.exported"
-          : fidelity === "partial" ? "portable.exportedPartial" : "portable.exportedProductOnly"))}
+        onExported={(fidelity, status) => setLayoutNotice(t(status === "dispatched"
+          ? fidelity === "full" ? "portable.downloadRequested"
+            : fidelity === "partial" ? "portable.downloadRequestedPartial" : "portable.downloadRequestedProductOnly"
+          : fidelity === "full" ? "portable.exported"
+            : fidelity === "partial" ? "portable.exportedPartial" : "portable.exportedProductOnly"))}
         onOpenTask={(sessionId) => {
           setPortableImportRequest(undefined);
           controller.navigate({ kind: "session", sessionId });

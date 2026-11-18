@@ -3,7 +3,7 @@ import { AppState, BackHandler, Keyboard } from "react-native";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import type { MobileClient } from "./mobile-client";
-import { MobileConversationShareSelection, mobileMessageShareable, type MobileConversationShareSnapshot } from "./mobile-conversation-share";
+import { MAXIMUM_MOBILE_CONVERSATION_SHARE_MESSAGES, MobileConversationShareSelection, mobileMessageShareable, type MobileConversationShareSnapshot } from "./mobile-conversation-share";
 import type { MobileConversationShareRendererHandle } from "./mobile-conversation-share-export";
 import { mobileImageOutput, type MobileImageOutput } from "./mobile-image-output";
 import { inspectMobileImageGalleryBytes } from "./mobile-image-gallery";
@@ -94,7 +94,9 @@ export function useMobileConversationShare(input: {
     selection.toggle(id); setNotice("");
   }, [busy, ids, selection]);
   const toggleAll = useCallback(() => {
-    if (!busy) { selection.toggleAll(ids); setNotice(""); }
+    if (busy) return;
+    const changed = selection.toggleAll(ids);
+    setNotice(changed ? "" : mobileMessage(latest.current.locale, "share.selectionCountLimit", { count: MAXIMUM_MOBILE_CONVERSATION_SHARE_MESSAGES }));
   }, [busy, ids, selection]);
   const rendererRef = useCallback((handle: MobileConversationShareRendererHandle | null) => {
     if (handle && job.current?.phase === "preparing" && !job.current.controller.signal.aborted) job.current.attach?.(handle);

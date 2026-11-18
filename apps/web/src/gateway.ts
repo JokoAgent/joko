@@ -3553,9 +3553,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         throw new GatewayError("Orchestrator returned an invalid portable task Artifact.");
       }
       const saved = await this.downloadArtifact(artifact.blobId, artifact.fileName || "task.jshare", ownedContext);
-      return saved !== "cancelled"
-        ? { status: "exported", fidelity: mapPortableSessionFidelity(response.fidelity) }
-        : { status: "cancelled" };
+      return saved === "cancelled" ? { status: "cancelled" }
+        : { status: saved === "saved" ? "exported" : "dispatched", fidelity: mapPortableSessionFidelity(response.fidelity) };
     } catch (error) {
       if (error instanceof ConnectError && error.code === Code.ResourceExhausted) {
         return {

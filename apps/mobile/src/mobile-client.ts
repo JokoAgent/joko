@@ -434,7 +434,7 @@ import {
 import type { MobileImageOutputSource } from "./mobile-image-output";
 import { timelineRows } from "./timeline";
 import {
-  mobileMessageShareable, projectMobileConversationShareMessage,
+  MAXIMUM_MOBILE_CONVERSATION_SHARE_MESSAGES, mobileMessageShareable, projectMobileConversationShareMessage,
   type MobileConversationShareSnapshot, type MobileConversationShareImage
 } from "./mobile-conversation-share";
 import {
@@ -9064,7 +9064,7 @@ export class MobileClient {
     if (chosen.length === 0 || chosen.length !== selectedIds.length || selected.size !== selectedIds.length) {
       throw new Error("The selected messages are no longer in the current Timeline window.");
     }
-    if (chosen.length > 200 || chosen.reduce((size, row) => size + row.text.length, 0) > 200_000) {
+    if (chosen.length > MAXIMUM_MOBILE_CONVERSATION_SHARE_MESSAGES || chosen.reduce((size, row) => size + row.text.length, 0) > 200_000) {
       throw new Error("The selected messages are too large. Select fewer messages.");
     }
     const sources = new Map<string, string>();

@@ -56,4 +56,5 @@
 @media (max-width: 720px) {
   .app:has(.inspector-dock-layout) { --dock-navigation: 0px; --dock-left: 0px; --dock-right: 0px; --dock-top: 0px; --dock-bottom: 0px; }
   .inspector-dock-group[data-edge] { position: fixed; z-index: 650; inset: 48px 0 0 15%; }
+  .app:has(> .sidebar.is-open) > .inspector-dock-layout > .inspector-dock-group[data-edge] { z-index: 99; }
 }

@@ -19,6 +19,18 @@ describe("mobile conversation image sharing", () => {
     expect(selection.active).toBe(false);
   });
 
+  it("declines select-all for 201 loaded rows without disturbing a usable selection", () => {
+    const selection = new MobileConversationShareSelection();
+    const rows = Array.from({ length: 201 }, (_, index) => `row-${index}`);
+    selection.enter("task", rows[0]!);
+    const revision = selection.revision;
+    expect(selection.toggleAll(rows)).toBe(false);
+    expect(selection.selected(rows)).toEqual([rows[0]]);
+    expect(selection.revision).toBe(revision);
+    expect(selection.toggleAll(rows.slice(0, 200))).toBe(true);
+    expect(selection.selected(rows)).toHaveLength(200);
+  });
+
   it("keeps ordered images and failure labels in place, redacts secrets and marks skipped messages", () => {
     const first = { ...message("a", ""), bodyParts: [{ kind: "text" as const, text: "before\n" },
       { kind: "image" as const, key: "image", label: "Original image" }, { kind: "text" as const, text: "after\napi_key=secret-value" }],

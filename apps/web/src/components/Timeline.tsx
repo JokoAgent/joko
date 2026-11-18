@@ -9,6 +9,7 @@ import { RichAnswerMedia } from "./RichAnswerMedia.js";
 import { useExtensionMailLinkHandler } from "./ExtensionMailReader.js";
 import { DesktopPageSearchTextAccess, PAGE_SEARCH_SCROLL_EVENT, registerDesktopPageSearchTextRow } from "./desktop-page-search.js";
 import { assertBrowserActionCurrent, type BrowserActionContext, type HttpLinkOpenOptions } from "../browser-action.js";
+import { copyTextOnInsecureHttp } from "../clipboard-action.js";
 import { defaultRangeExtractor, elementScroll, useVirtualizer } from "@tanstack/react-virtual";
 import {
   AlertCircle,
@@ -1989,9 +1990,17 @@ export function MessageActions({ ownerKey, sessionId, sessionName, item, text, a
     const current = (): boolean => ownerRef.current === owner && copyRequestRef.current === request && actionsRef.current?.isConnected === true;
     try {
       const ownerWindow = trigger.ownerDocument.defaultView;
-      if (ownerWindow?.navigator.clipboard?.writeText === undefined) throw new Error("Clipboard unavailable.");
-      const value = kind === "text" ? text : deepLink;
-      await ownerWindow.navigator.clipboard.writeText(value);
+      const fileNames = kind === "text" && item.kind === "user" && !partnerPresentation
+        ? item.attachments?.filter((attachment) => attachment.kind === "file" && attachment.fileName.trim().length > 0)
+          .map((attachment) => attachment.fileName) ?? []
+        : [];
+      const value = kind === "link" ? deepLink : fileNames.length > 0
+        ? [text, translatorRef.current("timeline.copyAttachmentNames", { names: fileNames.join(", ") })]
+          .filter((part) => part.trim().length > 0).join("\n\n")
+        : text;
+      const clipboard = ownerWindow?.navigator.clipboard;
+      if (clipboard?.writeText !== undefined) await clipboard.writeText(value);
+      else if (partnerPresentation || !copyTextOnInsecureHttp(value, trigger)) throw new Error("Clipboard unavailable.");
       if (current()) reportShareFeedback(request, "success", translatorRef.current(kind === "text" ? "timeline.blockCopied" : "timeline.linkCopied"), kind);
     } catch {
       if (current()) reportShareFeedback(request, "error", translatorRef.current(kind === "text" ? "timeline.blockCopyFailed" : "timeline.linkCopyFailed"));

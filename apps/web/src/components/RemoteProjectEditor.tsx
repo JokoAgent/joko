@@ -150,6 +150,15 @@ export function RemoteProjectEditor({ open, controller, snapshot, initialBackend
     return target !== undefined && target.revision === option.targetRevision
       && option.host.status.state === "ready" && option.host.trust !== undefined;
   };
+
+  const currentDeviceSource = async (option: DevicePeerOption, expectedOwner: string, abort: AbortController): Promise<DevicePeerOption | undefined> => {
+    const peers = await controller.listDevicePeers(abort.signal);
+    if (!isCurrent(abort, expectedOwner, option.key) || !currentSource(option)) return undefined;
+    const route = option.peer.route;
+    const candidates = peers.filter(peer => samePeerSelection(peer.route, route) && peer.route.routeGeneration >= route.routeGeneration);
+    if (candidates.length !== 1) throw new Error(t("remoteProject.deviceRouteUnavailable"));
+    return { ...option, peer: candidates[0]! };
+  };
   const clearInspection = (): void => {
     draftVersionRef.current += 1;
     inspectionAbortRef.current?.abort();
@@ -232,9 +241,10 @@ export function RemoteProjectEditor({ open, controller, snapshot, initialBackend
     const abort = new AbortController();
     recentAbortRef.current = abort;
     const sourceKey = selected.key;
-    const route = selected.peer.route;
     setDeviceRecent({ owner, sourceKey, status: "loading", entries: [] });
-    void controller.listDevicePeerRecentDirectories(route, abort.signal).then((entries) => {
+    void currentDeviceSource(selected, owner, abort).then(async (source) => {
+      if (source === undefined) return;
+      const entries = await controller.listDevicePeerRecentDirectories(source.peer.route, abort.signal);
       if (!isCurrent(abort, owner, sourceKey) || !currentSource(selected)) return;
       setDeviceRecent({ owner, sourceKey, status: "ready",
         entries: entries.map((entry) => ({ name: entry.name, path: entry.path, availability: entry.availability })) });
@@ -274,10 +284,14 @@ export function RemoteProjectEditor({ open, controller, snapshot, initialBackend
     setBrowser({ owner, sourceKey, requestedPath, status: "loading" });
     const request = selected.kind === "ssh"
       ? controller.listRemoteHostDirectories(selected.host.targetId, selected.host.id,
-        selected.targetRevision, selected.host.revision, requestedPath, abort.signal)
-      : controller.listDevicePeerDirectories(selected.peer.route, requestedPath, abort.signal);
-    void request.then((listing) => {
-      if (!isCurrent(abort, owner, sourceKey) || !currentSource(selected) || !listingMatchesSource(listing, selected)) return;
+        selected.targetRevision, selected.host.revision, requestedPath, abort.signal).then(listing => ({ source: selected, listing }))
+      : currentDeviceSource(selected, owner, abort).then(async (source) => source === undefined ? undefined : ({
+        source, listing: await controller.listDevicePeerDirectories(source.peer.route, requestedPath, abort.signal)
+      }));
+    void request.then((result) => {
+      if (result === undefined || !isCurrent(abort, owner, sourceKey) || !currentSource(selected)
+        || !listingMatchesSource(result.listing, result.source)) return;
+      const { listing } = result;
       setPath(listing.path);
       setSelectedExistingKey(undefined);
       setBrowser({ owner, sourceKey, requestedPath, status: "ready", listing });
@@ -342,29 +356,32 @@ export function RemoteProjectEditor({ open, controller, snapshot, initialBackend
     setMissing(undefined);
     const request = selected.kind === "ssh"
       ? controller.inspectRemoteHostDirectory(selected.host.targetId, selected.host.id,
-        selected.targetRevision, selected.host.revision, workspacePath, abort.signal)
-      : controller.inspectDevicePeerDirectory(selected.peer.route, workspacePath, abort.signal);
-    void request.then((inspection) => {
-      if (!isCurrent(abort, owner, sourceKey) || draftVersionRef.current !== draftVersion
-        || !currentSource(selected) || !inspectionMatchesSource(inspection, selected)) return;
+        selected.targetRevision, selected.host.revision, workspacePath, abort.signal).then(inspection => ({ source: selected, inspection }))
+      : currentDeviceSource(selected, owner, abort).then(async (source) => source === undefined ? undefined : ({
+        source, inspection: await controller.inspectDevicePeerDirectory(source.peer.route, workspacePath, abort.signal)
+      }));
+    void request.then((result) => {
+      if (result === undefined || !isCurrent(abort, owner, sourceKey) || draftVersionRef.current !== draftVersion
+        || !currentSource(selected) || !inspectionMatchesSource(result.inspection, result.source)) return;
+      const { source, inspection } = result;
       const canonicalExisting = findExisting(inspection.path);
       if (canonicalExisting !== undefined) { chooseExisting(canonicalExisting); return; }
-      if (selected.kind === "devicePeer" && !("peer" in inspection)) return;
-      if (selected.kind === "ssh" && !("hostId" in inspection)) return;
+      if (source.kind === "devicePeer" && !("peer" in inspection)) return;
+      if (source.kind === "ssh" && !("hostId" in inspection)) return;
       if ("peer" in inspection && inspection.kind === "file") {
         setInspectionError(t("remoteProject.pathIsFile", { path: inspection.path }));
         return;
       }
       const missingDirectory = "hostId" in inspection ? !inspection.exists : inspection.kind === "missing";
-      const draft: RemoteProjectDraft = selected.kind === "ssh"
+      const draft: RemoteProjectDraft = source.kind === "ssh"
         ? {
             backendId, name: projectName(inspection.path),
-            hostTargetId: selected.host.targetId, hostId: selected.host.id,
-            expectedHostTargetRevision: selected.targetRevision, expectedHostRevision: selected.host.revision,
+            hostTargetId: source.host.targetId, hostId: source.host.id,
+            expectedHostTargetRevision: source.targetRevision, expectedHostRevision: source.host.revision,
             workspacePath: inspection.path, createIfMissing: missingDirectory
           }
         : {
-            backendId, name: projectName(inspection.path), peer: { ...selected.peer.route },
+            backendId, name: projectName(inspection.path), peer: { ...source.peer.route },
             workspacePath: inspection.path, createIfMissing: missingDirectory
           };
       if (missingDirectory) setMissing({ owner, sourceKey, draftVersion, draft });
@@ -494,9 +511,12 @@ function devicePeerOptionKey(route: DevicePeerRouteIdentityView): string {
 }
 
 function samePeerRoute(left: DevicePeerRouteIdentityView, right: DevicePeerRouteIdentityView): boolean {
+  return samePeerSelection(left, right) && left.routeGeneration === right.routeGeneration;
+}
+
+function samePeerSelection(left: DevicePeerRouteIdentityView, right: DevicePeerRouteIdentityView): boolean {
   return left.targetDeviceId === right.targetDeviceId && left.relationId === right.relationId
-    && left.targetDeviceRevision === right.targetDeviceRevision && left.relationRevision === right.relationRevision
-    && left.routeGeneration === right.routeGeneration;
+    && left.targetDeviceRevision === right.targetDeviceRevision && left.relationRevision === right.relationRevision;
 }
 
 function listingMatchesSource(

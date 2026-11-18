@@ -53,6 +53,8 @@ import {
   createPublicServer,
   createLinkspanIngress,
   createLinkspanTcpIngress,
+  isPrivateLanHost,
+  isLoopbackHost,
   openLinkspanIdentity,
   type OrchestratorApplication,
   type BackendInstanceFactory,
@@ -97,6 +99,8 @@ export interface FixtureOptions {
   readonly dictionaryPeerMulticastPort?: number;
   /** Rebind the same public address for paired-client restart and offline-cache journeys. */
   readonly publicPort?: number;
+  /** Bind explicitly enabled private-LAN HTTP to one fixture-owned host interface. */
+  readonly publicLanHost?: string;
   readonly terminals?: OrchestratorApplication["terminals"];
   readonly createAuxiliaryServices?: (
     store: OperationalStore,
@@ -236,7 +240,11 @@ export class OrchestratorE2eFixture {
 
   static async start(options: FixtureOptions = {}): Promise<OrchestratorE2eFixture> {
     if (options.webRtc && options.httpConnect) throw new Error("Select one fixture transport.");
-    const publicPort = options.publicPort ?? (options.taskSharing || options.tls ? await freeFixturePort() : 0);
+    const publicHost = options.publicLanHost ?? "127.0.0.1";
+    if (options.publicLanHost && (options.tls || !isPrivateLanHost(publicHost) || isLoopbackHost(publicHost))) {
+      throw new Error("Private-LAN HTTP requires a non-loopback private interface.");
+    }
+    const publicPort = options.publicPort ?? (options.taskSharing || options.tls || options.publicLanHost ? await freeFixturePort(publicHost) : 0);
     if (!Number.isInteger(publicPort) || publicPort < 0 || publicPort > 65_535) throw new Error("Invalid fixture public port.");
     const ownsRoot = options.rootDirectory === undefined;
     const requestedRoot = options.rootDirectory ?? await mkdtemp(join(tmpdir(), "joko-e2e-"));
@@ -410,16 +418,17 @@ export class OrchestratorE2eFixture {
     });
 
     const config: OrchestratorConfig = {
-      host: "127.0.0.1",
+      host: publicHost,
       port: 0,
       internalPort: 4317,
-      publicOrigin: options.tls ? `https://127.0.0.1:${publicPort}` : options.taskSharing ? `http://127.0.0.1:${publicPort}` : "http://127.0.0.1",
+      publicOrigin: options.tls ? `https://${publicHost}:${publicPort}`
+        : options.taskSharing || options.publicLanHost ? `http://${publicHost}:${publicPort}` : `http://${publicHost}`,
       ...(options.tls ? { tls: options.tls } : {}),
       internalOrigin: "http://127.0.0.1:4317",
       dataDirectory,
       databasePath,
       allowInsecureLoopback: true,
-      allowInsecureLan: false,
+      allowInsecureLan: options.publicLanHost !== undefined,
       lanDiscoveryEnabled: false,
       piExecutable: "pi",
       piAgentHome: join(dataDirectory, "pi-agent-home"),
@@ -622,10 +631,10 @@ export class OrchestratorE2eFixture {
     };
     const server = await createPublicServer(application);
     server.log.level = "silent";
-    await server.listen({ host: "127.0.0.1", port: publicPort });
+    await server.listen({ host: publicHost, port: publicPort });
     const address = server.server.address();
     if (address === null || typeof address === "string") throw new Error("Fastify did not expose an ephemeral TCP port.");
-    const baseUrl = `${options.tls ? 'https' : 'http'}://127.0.0.1:${address.port}`;
+    const baseUrl = `${options.tls ? 'https' : 'http'}://${publicHost}:${address.port}`;
     const secureServer = options.tls || options.webRtc || options.httpConnect ? await createPublicServer(application, { secureBridge: true }) : undefined;
     const webRtcRequests = { count: 0, responses: [] as { path: string; status: number }[] };
     secureServer?.addHook('onRequest', async request => { if (request.url === '/_linkspan/webrtc') webRtcRequests.count++; });
@@ -824,11 +833,11 @@ function bigintJson(_key: string, value: unknown): unknown {
   return typeof value === "bigint" ? value.toString() : value;
 }
 
-async function freeFixturePort(): Promise<number> {
+async function freeFixturePort(host: string): Promise<number> {
   const probe = createPortProbe();
-  await new Promise<void>((resolve, reject) => { probe.once("error", reject); probe.listen(0, "127.0.0.1", resolve); });
+  await new Promise<void>((resolve, reject) => { probe.once("error", reject); probe.listen(0, host, resolve); });
   const address = probe.address();
-  if (!address || typeof address === "string") throw new Error("The fixture could not reserve a loopback port.");
+  if (!address || typeof address === "string") throw new Error("The fixture could not reserve a port on its public interface.");
   const port = address.port;
   await new Promise<void>((resolve, reject) => probe.close(error => error ? reject(error) : resolve()));
   return port;

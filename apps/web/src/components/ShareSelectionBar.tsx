@@ -6,7 +6,7 @@ import { assertBrowserActionCurrent, type BrowserActionContext } from "../browse
 import { orderedSelectedShareMessages } from "./share-selection-behavior.js";
 import { copyShareSelectionImagePng, deliverShareSelectionImagePng, downloadShareSelectionImagePng, shareSelectionImageMessages } from "./share-selection-image.js";
 import { ShareMessageImageEmptyError, ShareMessageImageTooLargeError } from "./share-message-image.js";
-import { ShareRenderedMessageImageUnavailableError, ShareRenderedMessageNotMountedError, buildRenderedShareMessageImagePng } from "./share-rendered-message-image.js";
+import { MAXIMUM_RENDERED_SHARE_MESSAGES, ShareRenderedMessageImageUnavailableError, ShareRenderedMessageNotMountedError, buildRenderedShareMessageImagePng } from "./share-rendered-message-image.js";
 import type { Translator } from "./types.js";
 import { Button, Spinner, cx } from "./ui.js";
 
@@ -33,6 +33,7 @@ export function ShareSelectionBar({ ownerKey, sessionId, sessionName, messages, 
   const selectAllRef = useRef<HTMLButtonElement>(null);
   const selectedMessages = orderedSelectedShareMessages(messages, selectedIds);
   const allSelected = messages.length > 0 && selectedMessages.length === messages.length;
+  const allExceedsLimit = !allSelected && messages.length > MAXIMUM_RENDERED_SHARE_MESSAGES;
 
   const content = {
     sessionName,
@@ -156,7 +157,7 @@ export function ShareSelectionBar({ ownerKey, sessionId, sessionName, messages, 
         role="checkbox"
         aria-checked={allSelected}
         aria-label={t("timeline.shareSelectionSelectAll")}
-        disabled={busy !== undefined || messages.length === 0}
+        disabled={busy !== undefined || messages.length === 0 || allExceedsLimit}
         onClick={onToggleAll}
       >
         <span aria-hidden="true">{allSelected && <Check />}</span>
@@ -165,6 +166,7 @@ export function ShareSelectionBar({ ownerKey, sessionId, sessionName, messages, 
       <div className="share-selection-bar__copy">
         <strong><Images aria-hidden="true" />{t("timeline.shareSelectionTitle")}</strong>
         <span>{t("timeline.shareSelectionCount", { count: selectedMessages.length })}</span>
+        {allExceedsLimit && <span>{t("timeline.shareSelectionCountLimit", { count: MAXIMUM_RENDERED_SHARE_MESSAGES })}</span>}
       </div>
       <div className="share-selection-bar__actions">
         <Button tone="ghost" onClick={() => { retire(); onCancel(); }}><X aria-hidden="true" />{t("common.cancel")}</Button>
