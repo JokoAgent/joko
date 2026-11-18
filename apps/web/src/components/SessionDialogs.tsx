@@ -28,6 +28,7 @@ export function RenameSessionDialog({ session, t, onClose, onRename, onSuggest }
     setName(session?.name ?? "");
     setGenerating(false);
     setNotice(undefined);
+    return () => { abortRef.current?.abort(); };
   }, [session?.id, session?.name]);
 
   useEffect(() => {

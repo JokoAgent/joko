@@ -1,5 +1,6 @@
 import { expect, it, vi } from "vitest";
-import { bindPortableSessionImportApi, portableSessionImportOwnerKey, type PortableSessionImportApi } from "./portable-session-import-connection.js";
+import { authenticatedConnectionKey } from "./connection-owner.js";
+import { bindPortableSessionImportApi, type PortableSessionImportApi } from "./portable-session-import-connection.js";
 import { emptySnapshot, type PortableSessionImportDraftView, type PortableSessionImportResultView } from "./model.js";
 
 function deferred<T>() {
@@ -19,13 +20,13 @@ const draft: PortableSessionImportDraftView = { draftId: "original-draft", expir
 it("binds owner identity to the exact connection occurrence while allowing normal revisions", () => {
   const state = { connectionState: "connected", connectionGeneration: 3, snapshot: emptySnapshot(), activeProfile: {
     id: "profile-a", serverId: "server-a", deviceId: "device-a", origin: "https://a.example", name: "A" } };
-  const key = portableSessionImportOwnerKey(state);
+  const key = authenticatedConnectionKey(state);
   const updated = { ...state, snapshot: { ...state.snapshot, revision: 5n } };
   expect(key).toBeDefined();
-  expect(portableSessionImportOwnerKey(updated)).toBe(key);
-  expect(portableSessionImportOwnerKey({ ...state, connectionState: "disconnected" })).toBeUndefined();
-  expect(portableSessionImportOwnerKey({ ...state, connectionGeneration: 4 })).not.toBe(key);
-  expect(portableSessionImportOwnerKey({ ...state, snapshot: { ...state.snapshot, generation: 7n } })).not.toBe(key);
+  expect(authenticatedConnectionKey(updated)).toBe(key);
+  expect(authenticatedConnectionKey({ ...state, connectionState: "disconnected" })).toBeUndefined();
+  expect(authenticatedConnectionKey({ ...state, connectionGeneration: 4 })).not.toBe(key);
+  expect(authenticatedConnectionKey({ ...state, snapshot: { ...state.snapshot, generation: 7n } })).not.toBe(key);
 });
 
 it("rejects retired business calls and cleans a late inspection only through its original API", async () => {

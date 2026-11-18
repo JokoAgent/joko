@@ -1085,6 +1085,91 @@ describe("session host, durable events, and reconnect semantics", () => {
     }
   });
 
+  mountedTimelineIt("retires a task rename form when a same-ID task opens on a different node", { timeout: 90_000 }, async () => {
+    fixture = await OrchestratorE2eFixture.start({ serverId: "task-rename-a", webDirectory: process.env.JOKO_MOUNTED_WEB_DIR! });
+    const a = fixture;
+    const b = await OrchestratorE2eFixture.start({ serverId: "task-rename-b", corsOrigins: [a.baseUrl] });
+    try {
+      const [ownerA, ownerB] = await Promise.all([a.pair("Original rename owner A"), b.pair("Original rename owner B")]);
+      const operationId = randomUUID();
+      const nameA = "Original task on node A", nameB = "Original task on node B";
+      const createTask = async (host: OrchestratorE2eFixture, owner: typeof ownerA, displayName: string) =>
+        sessionIdFrom(await submit(owner.clients.operation, owner.connectionId,
+          createSessionMutation({ backendId: host.adapter().id, targetId: host.targetId(), displayName }), operationId));
+      const [id, idB] = await Promise.all([createTask(a, ownerA, nameA), createTask(b, ownerB, nameB)]);
+      expect(idB).toBe(id);
+      const scope = create(SnapshotScopeSchema, { kind: { case: "session", value: { sessionId: id } } });
+      const readTitle = async (owner: typeof ownerA) =>
+        (await owner.clients.event.getSnapshot({ scope })).snapshot?.sessions.find(session => session.sessionId === id)?.displayName;
+      expect(await Promise.all([readTitle(ownerA), readTitle(ownerB)])).toEqual([nameA, nameB]);
+
+      browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+      const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
+      await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: a.baseUrl });
+      await page.goto(a.baseUrl, { waitUntil: "domcontentloaded" });
+      const pane = page.locator(`.session-pane[data-input-session-id="${id}"]`);
+      const title = (name: string) => pane.getByRole("button", { name, exact: true });
+      const pairAndCopyTask = async (host: OrchestratorE2eFixture, name: string) => {
+        const device = `Rename Browser ${name}`;
+        const challenge = (await host.anonymous.connection.beginPairing({ deviceDisplayName: device })).challenge;
+        if (!challenge) throw new Error("The rename fixture did not issue a pairing challenge.");
+        await page.getByRole("button", { name: "Add Joko node", exact: true }).click();
+        await page.locator("details.device-authorization__manual > summary").click();
+        await page.getByLabel("Joko node address").fill(host.baseUrl);
+        await page.getByLabel("Pairing code").fill(host.pairingCode(challenge.challengeId));
+        await page.getByLabel("Device name").fill(device);
+        await page.locator("form.pair-form button[type=submit]").click();
+        await page.locator(`.sidebar [data-session-id="${id}"]`).filter({ hasText: name }).first().click();
+        await title(name).waitFor({ state: "visible" });
+        await pane.locator("summary").and(pane.getByLabel(`Actions for ${name}`, { exact: true })).click();
+        await pane.getByRole("menuitem", { name: "Copy task link", exact: true }).click();
+        const copied = await waitFor(() => page.evaluate(() => navigator.clipboard.readText()),
+          text => URL.canParse(text) && new URLSearchParams(new URL(text).hash.split("?")[1]).has("profile"),
+          `the node-qualified task link for ${name}`);
+        await page.evaluate(() => navigator.clipboard.writeText(""));
+        return new URL(copied).hash;
+      };
+      const aHash = await pairAndCopyTask(a, nameA);
+      await page.getByRole("button", { name: "Disconnect", exact: true }).click();
+      const bHash = await pairAndCopyTask(b, nameB);
+      expect(aHash).not.toBe(bHash);
+
+      const operations: Array<{ origin: string; taskId: string; title: string }> = [];
+      page.on("request", request => {
+        const url = new URL(request.url());
+        const bytes = request.postDataBuffer();
+        if (url.pathname !== "/joko.v1.OperationService/SubmitOperation" || request.method() !== "POST" || bytes === null) return;
+        const mutation = fromBinary(SubmitOperationRequestSchema, bytes).mutation?.payload;
+        if (mutation?.case === "renameSession") operations.push({
+          origin: url.origin, taskId: mutation.value.sessionId, title: mutation.value.displayName
+        });
+      });
+      const openHash = (hash: string) => page.evaluate(value => { location.hash = value; }, hash);
+      await openHash(aHash);
+      const dialog = page.getByRole("dialog", { name: "Rename task", exact: true });
+      await title(nameA).click();
+      await dialog.getByLabel("Task name", { exact: true }).fill("Unsaved title from A");
+      await openHash(bHash);
+      await title(nameB).waitFor({ state: "visible" });
+      await dialog.waitFor({ state: "hidden" });
+      expect(operations).toEqual([]);
+      expect(await Promise.all([readTitle(ownerA), readTitle(ownerB)])).toEqual([nameA, nameB]);
+
+      await title(nameB).click();
+      const nameInput = dialog.getByLabel("Task name", { exact: true });
+      await expect.poll(() => nameInput.inputValue()).toBe(nameB);
+      await nameInput.fill("Confirmed rename on B");
+      await dialog.getByRole("button", { name: "Save", exact: true }).click();
+      await title("Confirmed rename on B").waitFor({ state: "visible" });
+      expect(operations).toEqual([{ origin: b.baseUrl, taskId: id, title: "Confirmed rename on B" }]);
+      expect(await Promise.all([readTitle(ownerA), readTitle(ownerB)])).toEqual([nameA, "Confirmed rename on B"]);
+    } finally {
+      await browser?.close();
+      browser = undefined;
+      await b.close({ removeRoot: true });
+    }
+  });
+
   mountedTimelineIt("keeps new completion unread while the Workspace Files task panel is collapsed", { timeout: 90_000 }, async () => {
     const profile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities,
       { key: "workspace.files", supported: true as const }, { key: "session.attention", supported: true as const }] } satisfies FakeAdapterProfile;
