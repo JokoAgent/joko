@@ -81,7 +81,7 @@ export class ExtensionOAuthSettings {
           if (signal.aborted) stop();
         });
       }
-    }).catch(error => {
+    }).then(() => undefined, error => {
       if (flow.phase === Phase.COMPLETE) return;
       flow.phase = Phase.FAILED; if (flow.failure === Failure.UNSPECIFIED) flow.failure = failure(error);
     }).finally(() => { flow.settledAt = Date.now(); delete flow.offer; delete flow.callback; flow.unsubscribe(); this.#retireCallback(flow); });
