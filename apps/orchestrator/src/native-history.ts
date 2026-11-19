@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import type {
   AdapterEventMetadata,
   EventPayload,
+  NativeSessionBinding,
   NativeHistoryProjection as AdapterNativeHistoryProjection
 } from "@joko/core";
 import {
@@ -10,6 +11,7 @@ import {
   NATIVE_HISTORY_ASSISTANT_STREAM_FIELD,
   NATIVE_HISTORY_ASSISTANT_TOOL_RESULT_FIELD,
   NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD,
+  NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD,
   NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
   isNativeNavigationTarget,
   nativeHistoryEventContext,
@@ -109,6 +111,32 @@ export function nativeHistoryReplayMetadata(
     observed.has(field) && Object.hasOwn(recorded.fields, field) && typeof recorded.fields[field] === typeof value
       ? recorded.fields[field]! : value
   ])) };
+}
+
+/** The current observation can grant a rewind without changing the original Event or its references. */
+export function withObservedNativeRewind(event: PersistedEvent, binding: NativeSessionBinding | undefined,
+  findMarker: () => PersistedEvent | undefined): PersistedEvent {
+  const payload = event.payload;
+  if (payload.type !== "message_complete" || payload.role !== "user" || binding === undefined
+    || event.generation !== binding.generation || event.metadata?.namespace !== "codex.native_history"
+    || event.metadata.fields["nativeHydration"] !== true) return event;
+  const identity = payload.nativeHistory?.identity;
+  if (identity === undefined || identity.parentEntryId === undefined || identity.rewindBefore !== undefined) return event;
+  const marker = findMarker();
+  if (marker?.payload.type !== "native_session_changed" || marker.payload.opaqueRef !== binding.opaqueRef
+    || marker.generation !== binding.generation || marker.sessionId !== event.sessionId
+    || marker.backendId !== event.backendId || marker.targetId !== event.targetId || marker.globalCursor < event.globalCursor
+    || marker.metadata?.namespace !== "codex.native_history"
+    || event.metadata.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] !== nativeBindingFingerprint(binding.opaqueRef)) return event;
+  const encoded = marker.metadata.fields[NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD];
+  if (typeof encoded !== "string") return event;
+  let anchors: unknown;
+  try { anchors = JSON.parse(encoded); } catch { return event; }
+  if (!Array.isArray(anchors) || !anchors.some((anchor) => Array.isArray(anchor) && anchor.length === 2
+    && anchor[0] === identity.entryId && anchor[1] === identity.parentEntryId)) return event;
+  return { ...event, payload: { ...payload, nativeHistory: { ...payload.nativeHistory,
+    identity: { ...identity, rewindBefore: { kind: "native_entry", entryId: identity.parentEntryId } }
+  } } };
 }
 
 export function observedClaudeAssistantInputEntry(

@@ -81,7 +81,7 @@ import {
   nativeStateObservationIsCurrent,
   SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY
 } from "./native-state-observation.js";
-import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD } from "./native-history.js";
+import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD, withObservedNativeRewind } from "./native-history.js";
 import { materializedRuntimeCommands, SESSION_RUNTIME_COMMANDS_SETTING_KEY } from "./runtime-command-state.js";
 
 type ProtoMessage = { readonly $typeName: string };
@@ -506,6 +506,7 @@ export class SnapshotProjector {
       const operations = scanStorePages((offset, limit) => store.listOperations({ limit, offset }))
         .filter((operation) => operationIds.has(operation.id) || operationMatches(operation, references));
       const inheritedSideChatEntries = readSideChatHistoryBoundary(store, base.session.descriptor);
+      const marker = timelineLimit === 0 ? undefined : store.findLatestNativeSessionChange(normalized.sessionId);
       const timeline = timelineLimit === 0
         ? []
         : activeNativeTimeline(
@@ -514,7 +515,7 @@ export class SnapshotProjector {
                 && sideChatHistoryEventVisible(base.session.descriptor, event, inheritedSideChatEntries)),
             base.session.descriptor.binding,
             store.getRetainedSessionContextCursors(normalized.sessionId)
-          ).slice(-timelineLimit);
+          ).slice(-timelineLimit).map((event) => withObservedNativeRewind(event, base.session.descriptor.binding, () => marker));
       const scope = proto<SnapshotScope>("joko.v1.SnapshotScope", {
         kind: {
           case: "session",

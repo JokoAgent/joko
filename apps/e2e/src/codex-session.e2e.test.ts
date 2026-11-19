@@ -16,7 +16,7 @@ import { expect, it, vi } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import {
-  abortRunMutation, createManualScheduleMutation, createSessionMutation, pauseQueueMutation, queueRunIdFrom, resumeQueueMutation,
+  abortRunMutation, createManualScheduleMutation, createSessionMutation, navigateMutation, pauseQueueMutation, queueRunIdFrom, resumeQueueMutation,
   retryRunMutation, runIdFrom, scheduleIdFrom, sendInputMutation, sessionIdFrom, submit, triggerScheduleMutation
 } from "./operations.js";
 
@@ -653,6 +653,84 @@ it("honors a Codex schedule admitted before model disablement and rejects later 
     for (const run of history) expect(run).toMatchObject({ state: RunState.FAILED, error: { code: "TURN_OVERRIDE_MODEL_UNAVAILABLE" } });
     expect(turnStarts()).toHaveLength(1);
     expect(fixture.application.store.getSession(sessionId).descriptor.binding).toEqual(binding);
+  } finally {
+    await fixture?.close();
+    await host.shutdown();
+  }
+});
+
+it("rewinds the original Legacy Codex task through its completed native fork anchor", async () => {
+  const backendId = "codex-legacy-dialogue";
+  const native = new FakeCodexAppServer();
+  const host = new AppServerHost({ transportFactory: () => native.createTransport() });
+  let fixture: OrchestratorE2eFixture | undefined;
+  try {
+    fixture = await OrchestratorE2eFixture.start({ backendFactories: [{
+      instanceId: backendId, adapterKind: "codex", displayName: "Codex Legacy history",
+      create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host })
+    }] });
+    const { clients, connectionId } = await fixture.pair("Legacy task owner");
+    const store = fixture.application.store;
+    const targetId = fixture.targetId(backendId);
+    const cwd = store.getTarget(targetId).descriptor.workspaceRoot;
+    const completed = (id: string, user: string, assistant: string) => ({ id, status: "completed", items: [
+      { type: "userMessage", id: `${id}-user`, content: [{ type: "text", text: user, text_elements: [] }] },
+      { type: "agentMessage", id: `${id}-assistant`, text: assistant, phase: null, memoryCitation: null, delivery: null }
+    ] });
+    const firstTurn = completed("original-turn-A", "Which checklist did we finish?", "The archive checklist.");
+    const laterTurn = completed("original-turn-U", "Can we draft another checklist?", "I can draft a new one.");
+    const threadId = native.seedThread(cwd, [firstTurn, laterTurn]);
+    native.threads.get(threadId)!.historyMode = "legacy";
+
+    const candidate = (await clients.session.discoverNativeSessions({ targetId })).sessions.find((session) => session.nativeSessionId === threadId);
+    if (candidate === undefined) throw new Error("The ordinary Legacy thread is missing from native discovery.");
+    const attach = createSessionMutation({ backendId, targetId, displayName: "Original Legacy task" });
+    if (attach.payload.case !== "createSession") throw new Error("Expected an attach mutation.");
+    attach.payload.value.nativeStart = create(NativeSessionStartSchema, { kind: {
+      case: "attach", value: { opaqueNativeReference: candidate.nativeReference }
+    } });
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId, attach));
+    await clients.session.listRuntimeCommands({ sessionId });
+    const binding = store.getSession(sessionId).descriptor.binding;
+    expect(binding.nativeSessionId).toBe(threadId);
+    const timeline = async () => (await clients.session.listSessionTimeline({ sessionId })).events;
+    const snapshot = async () => (await clients.event.getSnapshot({ scope: {
+      kind: { case: "session", value: { sessionId, recentTimelineItems: 200 } }
+    } })).snapshot!.timeline;
+    const userRows = (events: readonly Event[]) => events.flatMap((event) => {
+      const payload = event.payload?.kind;
+      return payload?.case === "messageStarted" && payload.value.role === MessageRole.USER ? [{ event, row: payload.value }] : [];
+    });
+    const rows = userRows(await timeline());
+    expect(rows.map(({ row }) => row.nativeIdentity?.entryId)).toEqual(["original-turn-A-user", "original-turn-U-user"]);
+    expect(rows[0]?.row.nativeIdentity?.rewindBefore).toBeUndefined();
+    const { event, row } = rows[1]!;
+    const boundary = row.nativeIdentity?.rewindBefore;
+    expect(boundary?.kind).toEqual({ case: "nativeEntryId", value: "original-turn-A-assistant" });
+    expect(userRows(await snapshot())[1]?.row.nativeIdentity?.rewindBefore).toEqual(boundary);
+    const recorded = store.findEvent(event.eventId);
+    expect(recorded?.payload).toMatchObject({ type: "message_complete", nativeHistory: { identity: { entryId: "original-turn-U-user" } } });
+    expect(recorded?.payload).not.toHaveProperty("nativeHistory.identity.rewindBefore");
+
+    const rewind = navigateMutation(sessionId, boundary!, BigInt(binding.generation));
+    if (rewind.payload.case !== "navigateSessionBranch") throw new Error("Expected a dialogue rewind.");
+    rewind.payload.value.sourceMessageId = row.messageId;
+    rewind.payload.value.sourceEventId = event.eventId;
+    const result = await submit(clients.operation, connectionId, rewind);
+    expect(result).toMatchObject({ state: OperationState.SUCCEEDED, result: { payload: { case: "acknowledgement" } } });
+    const replacement = store.getSession(sessionId).descriptor.binding;
+    expect(replacement.generation).toBe(binding.generation + 1);
+    expect(replacement.nativeSessionId).not.toBe(threadId);
+    expect(store.findNativeSessionDerivation(result.operationId)).toMatchObject({ sessionId, sourceBinding: binding, binding: replacement });
+    expect(native.threads.get(replacement.nativeSessionId!)?.turns).toEqual([firstTurn]);
+    expect(native.threads.get(threadId)?.turns).toEqual([firstTurn, laterTurn]);
+    expect(store.findEvent(event.eventId)).toEqual(recorded);
+    expect(native.transport!.requests.filter(({ method }) => method === "thread/fork").map(({ params }) => params))
+      .toEqual([expect.objectContaining({ threadId, lastTurnId: firstTurn.id, excludeTurns: true, cwd })]);
+    expect(native.transport!.requests.some(({ method }) => method === "thread/revert")).toBe(false);
+    expect(userRows(await timeline()).map(({ row: item }) => item.nativeIdentity?.entryId)).toEqual(["original-turn-A-user"]);
+    await clients.session.listRuntimeCommands({ sessionId });
+    expect(userRows(await snapshot()).map(({ row: item }) => item.nativeIdentity?.entryId)).toEqual(["original-turn-A-user"]);
   } finally {
     await fixture?.close();
     await host.shutdown();

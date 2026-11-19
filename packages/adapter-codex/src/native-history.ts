@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD } from "@joko/core";
 import type {
   AdapterEventMetadata,
   EventPayload,
@@ -25,6 +26,7 @@ import {
 
 export interface CodexNativeHistoryProjectionOptions {
   readonly maximumEvents: number;
+  readonly legacyDialogueRewind?: boolean;
 }
 
 interface ItemProjection {
@@ -80,7 +82,7 @@ export function projectCodexNativeHistory(
     ...(thread.historyMode !== "paginated" ? {} : { activeNavigationTarget: parentEntryId === undefined
       ? { kind: "session_start" as const } : { kind: "native_entry" as const, entryId: parentEntryId } }),
     activeLineage,
-    activeEntryMetadata: activeEntryMetadata(parentEntryId)
+    activeEntryMetadata: activeEntryMetadata(thread, parentEntryId, options.legacyDialogueRewind === true)
   };
 
   function appendLineage(entryId: string): void {
@@ -480,13 +482,37 @@ function terminalOutcome(status: NativeTurn["status"]): "completed" | "aborted" 
   return undefined;
 }
 
-function activeEntryMetadata(activeEntryId: string | undefined): AdapterEventMetadata {
+export function codexLegacyRewindAnchor(thread: NativeThread, nextTurnIndex: number): string | undefined {
+  if (thread.historyMode !== "legacy" || thread.ephemeral === true || thread.status?.["type"] !== "idle" || nextTurnIndex < 1) return undefined;
+  const previous = thread.turns[nextTurnIndex - 1];
+  const next = thread.turns[nextTurnIndex];
+  if (!previous || !next || !ordinaryCompletedTextTurn(previous) || !ordinaryCompletedTextTurn(next)) return undefined;
+  // Legacy materialization labels turns synthesized from old rollouts with
+  // rollout offsets. App Server requires a persisted TurnStarted anchor.
+  if (/^rollout-\d+$/u.test(previous.id)) return undefined;
+  return previous.items.at(-1)?.id;
+}
+
+function ordinaryCompletedTextTurn(turn: NativeTurn): boolean {
+  const user = turn.items[0];
+  return turn.status === "completed" && user?.type === "userMessage" && !isYieldContinuationClientId(user["clientId"])
+    && turn.items.slice(1).every((item) => item.type !== "userMessage")
+    && Array.isArray(user["content"]) && user["content"].length > 0
+    && user["content"].every((input) => isJsonObject(input) && input["type"] === "text" && typeof input["text"] === "string");
+}
+
+function activeEntryMetadata(thread: NativeThread, activeEntryId: string | undefined, allowLegacyRewind: boolean): AdapterEventMetadata {
+  const legacyAnchors = allowLegacyRewind && thread.historyMode === "legacy" ? thread.turns.flatMap((turn, index) => {
+    const anchor = codexLegacyRewindAnchor(thread, index);
+    return anchor === undefined ? [] : [[turn.items[0]!.id, anchor]];
+  }) : [];
   return {
     namespace: "codex.native_history",
     fields: {
       nativeHydration: true,
       activeLeaf: true,
-      ...(activeEntryId === undefined ? {} : { leafId: activeEntryId })
+      ...(activeEntryId === undefined ? {} : { leafId: activeEntryId }),
+      ...(legacyAnchors.length === 0 ? {} : { [NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD]: JSON.stringify(legacyAnchors) })
     }
   };
 }

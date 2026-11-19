@@ -70,7 +70,7 @@ import type {
   UserShellResult,
   UsageSnapshot
 } from "@joko/core";
-import { JokoError, NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD, NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD, containsRecognizedCredential, decideToolCall, evaluateOrderedPolicyRules, policyRiskForToolRisk, nativeHistoryEventContext, redactSecrets, supportsNativeStartNavigation, toPublicError, validInlineTextRanges, validInputMentionRanges, type ToolRisk } from "@joko/core";
+import { JokoError, NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD, NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD, NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD, containsRecognizedCredential, decideToolCall, evaluateOrderedPolicyRules, policyRiskForToolRisk, nativeHistoryEventContext, redactSecrets, supportsNativeStartNavigation, toPublicError, validInlineTextRanges, validInputMentionRanges, type ToolRisk } from "@joko/core";
 import {
   AuthorizationError,
   ensureSideChatHistoryBoundary,
@@ -133,7 +133,8 @@ import {
   NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD,
   nativeHistoryReplayMetadata,
   observedClaudeAssistantInputEntry,
-  projectNativeHistory
+  projectNativeHistory,
+  withObservedNativeRewind
 } from "./native-history.js";
 import {
   markNativeStateObservationStale as staleNativeStateObservation,
@@ -9616,7 +9617,9 @@ export class SessionHost {
       if (sourceMessage === undefined) return;
       store.authorizeConnection(authority.connection.id, authority.connection.authKeyDigest);
       const origin = store.findVisibleSessionMessageOrigin({ sessionId, eventId: sourceMessage.eventId, role: "user", includeRetainedContext: false });
-      const source = origin === undefined ? undefined : store.findEvent(origin.eventId);
+      const recorded = origin === undefined ? undefined : store.findEvent(origin.eventId);
+      const source = recorded === undefined ? undefined : withObservedNativeRewind(recorded, store.getSession(sessionId).descriptor.binding,
+        () => this.isOrdinaryLocalCodexSession(store.getSession(sessionId)) ? store.findLatestNativeSessionChange(sessionId) : undefined);
       const boundary = source?.payload.type === "message_complete" ? source.payload.nativeHistory?.identity?.rewindBefore : undefined;
       if (origin?.messageId !== sourceMessage.messageId || boundary === undefined || boundary.kind !== target.kind
         || boundary.kind === "native_entry" && (target.kind !== "native_entry" || boundary.entryId !== target.entryId)) {
@@ -18394,6 +18397,13 @@ export class SessionHost {
     const previous = store.findLatestNativeSessionChange(session.id);
     const previousPayload = previous?.payload.type === "native_session_changed" ? previous.payload : undefined;
     const activeEntryMetadata = history.activeEntryMetadata;
+    const {
+      [NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD]: _reservedParents,
+      [NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD]: observedLegacyAnchors,
+      ...activeFields
+    } = activeEntryMetadata?.fields ?? {};
+    const legacyAnchors = activeEntryMetadata?.namespace === "codex.native_history" && typeof observedLegacyAnchors === "string"
+      && this.isOrdinaryLocalCodexSession(store.getSession(session.id)) ? observedLegacyAnchors : undefined;
     let unprojectedParents: string | undefined;
     if (activeEntryMetadata?.namespace === "pi.native_history" && validNativeLineage(history)) {
       const projectedEntries = new Set(history.events.map(event => event.nativeEntryId));
@@ -18405,7 +18415,9 @@ export class SessionHost {
       previousPayload.nativeSessionId === session.binding.nativeSessionId &&
       previousPayload.leafId === history.activeEntryId;
     const previousUnprojectedParents = previous?.metadata?.fields[NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD] ?? "[]";
-    if (sameLeaf && (unprojectedParents === undefined || unprojectedParents === previousUnprojectedParents)) return;
+    const previousLegacyAnchors = previous?.metadata?.fields[NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD];
+    if (sameLeaf && (unprojectedParents === undefined || unprojectedParents === previousUnprojectedParents)
+      && legacyAnchors === previousLegacyAnchors) return;
     const leafToken = history.activeEntryId ?? "<none>";
     const markerDigest = createHash("sha256")
       .update(session.id).update("\0")
@@ -18414,7 +18426,6 @@ export class SessionHost {
       .update(leafToken)
       .digest("hex");
     const markerId = `native-leaf-${markerDigest}`;
-    const { [NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD]: _reservedParents, ...activeFields } = activeEntryMetadata?.fields ?? {};
     store.appendEventIfAbsent({
       id: markerId,
       backendId: session.backendId,
@@ -18435,7 +18446,8 @@ export class SessionHost {
         : { metadata: { namespace: activeEntryMetadata.namespace, fields: {
             ...activeFields,
             ...(unprojectedParents === undefined || unprojectedParents === "[]" ? {}
-              : { [NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD]: unprojectedParents })
+              : { [NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD]: unprojectedParents }),
+            ...(legacyAnchors === undefined ? {} : { [NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD]: legacyAnchors })
           } } })
     });
   }
