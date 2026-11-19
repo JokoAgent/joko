@@ -4554,6 +4554,7 @@ export type ExtensionLibrarySqlValueView =
 export interface ExtensionLibrarySqlStatementView {
   readonly sql: string;
   readonly parameters?: readonly ExtensionLibrarySqlValueView[];
+  readonly namedParameters?: Readonly<Record<string, ExtensionLibrarySqlValueView>>;
 }
 
 export type ExtensionLibraryCallView =

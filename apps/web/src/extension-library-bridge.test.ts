@@ -96,6 +96,18 @@ describe("Extension Library frame bridge request boundary", () => {
     }))).toBeUndefined();
   });
 
+  it("adopts ordinary bare named parameters from the iframe request", () => {
+    const sql = "SELECT body FROM notes WHERE id = :id";
+    expect(parseExtensionLibraryBridgeRequest(request({
+      kind: "sqlExecute", handleId: "sql:1", statement: { sql, parameters: { id: 7 } }
+    }))).toMatchObject({ command: { kind: "call", call: {
+      kind: "sqlExecute", handleId: "sql:1", statement: { sql, namedParameters: { id: { kind: "number", value: 7 } } }
+    } } });
+    expect(parseExtensionLibraryBridgeRequest(request({
+      kind: "sqlExecute", handleId: "sql:1", statement: { sql, parameters: { "id.invalid": 7 } }
+    }))).toBeUndefined();
+  });
+
   it("publishes an immutable current-v1 capability list", () => {
     const capabilities = extensionLibraryBridgeCapabilities(["reveal"]);
     expect(capabilities).toEqual(expect.objectContaining({

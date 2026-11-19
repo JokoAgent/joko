@@ -20,7 +20,8 @@ import {
   type ExtensionLibrarySqlHandle,
   type ExtensionLibrarySqlMigration,
   type ExtensionLibrarySqlResult,
-  type ExtensionLibrarySqlValue
+  type ExtensionLibrarySqlParameters,
+  type ExtensionLibrarySqlStatement
 } from "./extension-library-sql.js";
 import {
   assertExtensionLibraryRootIdentity,
@@ -799,11 +800,11 @@ export class ExtensionLibraryManager {
     return this.#withSession(sessionId, connectionId, input.readonly !== true, (session) => session.sql.open(input));
   }
 
-  async databaseExecute(sessionId: string, connectionId: string, handleId: string, sql: string, parameters: readonly ExtensionLibrarySqlValue[] = []): Promise<ExtensionLibrarySqlResult> {
+  async databaseExecute(sessionId: string, connectionId: string, handleId: string, sql: string, parameters: ExtensionLibrarySqlParameters = []): Promise<ExtensionLibrarySqlResult> {
     return this.#withSession(sessionId, connectionId, false, (session) => session.sql.execute(handleId, sql, parameters));
   }
 
-  async databaseBatch(sessionId: string, connectionId: string, handleId: string, statements: readonly { readonly sql: string; readonly parameters?: readonly ExtensionLibrarySqlValue[] }[]): Promise<readonly ExtensionLibrarySqlResult[]> {
+  async databaseBatch(sessionId: string, connectionId: string, handleId: string, statements: readonly ExtensionLibrarySqlStatement[]): Promise<readonly ExtensionLibrarySqlResult[]> {
     return this.#withSession(sessionId, connectionId, false, (session) => session.sql.batch(handleId, statements));
   }
 

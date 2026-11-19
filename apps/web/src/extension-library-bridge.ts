@@ -193,12 +193,34 @@ function parseCall(value: Record<string, unknown>): ExtensionLibraryCallView | u
 
 function parseStatement(value: unknown): ExtensionLibrarySqlStatementView | undefined {
   if (!plain(value) || !exact(value, ["sql", "parameters"], ["parameters"])
-    || typeof value.sql !== "string" || value.sql.length === 0 || value.sql.length > 100_000
-    || value.parameters !== undefined && (!Array.isArray(value.parameters) || value.parameters.length > 500)) return undefined;
-  const parameters = value.parameters === undefined ? undefined : value.parameters.map(parseSqlValue);
-  return parameters?.some((parameter) => parameter === undefined) === true
-    ? undefined
-    : { sql: value.sql, ...(parameters === undefined ? {} : { parameters: parameters as ExtensionLibrarySqlValueView[] }) };
+    || typeof value.sql !== "string" || value.sql.length === 0 || value.sql.length > 100_000) return undefined;
+  if (value.parameters === undefined) return { sql: value.sql };
+  if (Array.isArray(value.parameters)) {
+    if (value.parameters.length > 500) return undefined;
+    const parameters = value.parameters.map(parseSqlValue);
+    return parameters.some((parameter) => parameter === undefined)
+      ? undefined : { sql: value.sql, parameters: parameters as ExtensionLibrarySqlValueView[] };
+  }
+  if (!plain(value.parameters)) return undefined;
+  const entries = Object.entries(value.parameters);
+  if (entries.length > 500) return undefined;
+  const named: Array<readonly [string, ExtensionLibrarySqlValueView]> = [];
+  for (const [name, value] of entries) {
+    if (name.length > 100_000 || !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name)) return undefined;
+    const parameter = parseNamedSqlValue(value);
+    if (parameter === undefined) return undefined;
+    named.push([name, parameter]);
+  }
+  return { sql: value.sql, namedParameters: Object.fromEntries(named) };
+}
+
+function parseNamedSqlValue(value: unknown): ExtensionLibrarySqlValueView | undefined {
+  if (value === null) return { kind: "null" };
+  if (typeof value === "number") return parseSqlValue({ kind: "number", value });
+  if (typeof value === "bigint") return { kind: "integer", value };
+  if (typeof value === "string") return parseSqlValue({ kind: "text", value });
+  if (value instanceof Uint8Array) return parseSqlValue({ kind: "blob", value });
+  return parseSqlValue(value);
 }
 
 function parseSqlValue(value: unknown): ExtensionLibrarySqlValueView | undefined {

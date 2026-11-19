@@ -513,6 +513,8 @@ message ExtensionLibrarySqlRow {
 message ExtensionLibrarySqlStatement {
   string sql = 1;
   repeated ExtensionLibrarySqlValue parameters = 2;
+  // Bare SQLite parameter names. Use either named or positional parameters.
+  map<string, ExtensionLibrarySqlValue> named_parameters = 3;
 }
 
 message ExtensionLibrarySqlOpenOperation {

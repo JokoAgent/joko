@@ -13204,14 +13204,14 @@ async function dispatchExtensionLibraryCall(
         connectionId,
         operation.value.handleId,
         statement.sql,
-        statement.parameters.map(nativeExtensionLibrarySqlValue)
+        nativeExtensionLibrarySqlParameters(statement)
       );
       return librarySqlCallResult(value);
     }
     case "sqlBatch": {
       const values = await manager.databaseBatch(sessionId, connectionId, operation.value.handleId, operation.value.statements.map((statement) => ({
         sql: statement.sql,
-        parameters: statement.parameters.map(nativeExtensionLibrarySqlValue)
+        parameters: nativeExtensionLibrarySqlParameters(statement)
       })));
       return create(contract.ExtensionLibraryCallResultSchema, {
         result: { case: "sqlBatch", value: create(contract.ExtensionLibrarySqlBatchResultSchema, {
@@ -13252,6 +13252,13 @@ async function dispatchExtensionLibraryCall(
 function requiredLibrarySqlStatement(value: contract.ExtensionLibrarySqlStatement | undefined): contract.ExtensionLibrarySqlStatement {
   if (value === undefined) throw invalidArgument("sql statement is required");
   return value;
+}
+
+function nativeExtensionLibrarySqlParameters(statement: contract.ExtensionLibrarySqlStatement): import("./extension-library-sql.js").ExtensionLibrarySqlParameters {
+  const named = Object.entries(statement.namedParameters);
+  if (named.length === 0) return statement.parameters.map(nativeExtensionLibrarySqlValue);
+  if (statement.parameters.length > 0) throw invalidArgument("A SQL statement must choose named or positional parameters.");
+  return Object.fromEntries(named.map(([name, value]) => [name, nativeExtensionLibrarySqlValue(value)] as const));
 }
 
 function nativeExtensionLibrarySqlValue(value: contract.ExtensionLibrarySqlValue): import("./extension-library-sql.js").ExtensionLibrarySqlValue {

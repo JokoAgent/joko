@@ -559,6 +559,10 @@ describe("Extension catalog gateway", () => {
         { name: "data", value: { kind: "blob", value: new Uint8Array([1, 2]) } }
       ] }] }
     });
+    await expect(gateway.callExtensionLibrary(sessionId, {
+      kind: "sqlExecute", handleId: "handle-1",
+      statement: { sql: "SELECT id, data FROM notes WHERE id = :id", namedParameters: { id: { kind: "number", value: 9 } } }
+    })).resolves.toMatchObject({ kind: "sqlResult" });
     await expect(gateway.closeExtensionLibrary(sessionId)).resolves.toBe(true);
 
     expect(requests.find((request) => request.method === "relocateExtensionLibrary")?.input).toMatchObject({
@@ -575,6 +579,10 @@ describe("Extension catalog gateway", () => {
         { value: { case: "blobValue", value: new Uint8Array([1, 2]) } }
       ] } }
     });
+    const namedSqlRequest = requests.filter((request) => request.method === "callExtensionLibrary")[2]?.input;
+    expect(namedSqlRequest.call.operation).toMatchObject({ case: "sqlExecute", value: { statement: {
+      sql: "SELECT id, data FROM notes WHERE id = :id", parameters: [], namedParameters: { id: { value: { case: "numberValue", value: 9 } } }
+    } } });
 
     invalidOverview = true;
     await expect(gateway.getExtensionLibraryOverview(extensionId, 7n)).rejects.toThrow(/invalid Extension Library state/u);

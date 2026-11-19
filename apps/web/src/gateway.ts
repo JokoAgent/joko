@@ -710,6 +710,7 @@ import type {
   ExtensionLibrarySessionView,
   ExtensionLibrarySourceMatch,
   ExtensionLibrarySqlResultView,
+  ExtensionLibrarySqlStatementView,
   ExtensionLibrarySqlValueView,
   ExtensionLibraryTrashEntryView,
   ExtensionMainViewIconView,
@@ -19373,9 +19374,11 @@ function mapExtensionLibraryGrace(value: ProtoExtensionLibraryGraceEntry): Exten
 }
 
 function mapExtensionLibraryCall(call: ExtensionLibraryCallView) {
-  const statement = (value: { readonly sql: string; readonly parameters?: readonly ExtensionLibrarySqlValueView[] }) => ({
+  const statement = (value: ExtensionLibrarySqlStatementView) => ({
     sql: value.sql,
-    parameters: (value.parameters ?? []).map(mapExtensionLibrarySqlValueInput)
+    parameters: (value.parameters ?? []).map(mapExtensionLibrarySqlValueInput),
+    namedParameters: Object.fromEntries(Object.entries(value.namedParameters ?? {})
+      .map(([name, parameter]) => [name, mapExtensionLibrarySqlValueInput(parameter)] as const))
   });
   switch (call.kind) {
     case "read": return create(ExtensionLibraryCallSchema, { operation: { case: "read", value: {

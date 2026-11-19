@@ -298,6 +298,23 @@ describe("Connect Extension Library boundary", () => {
       }
     });
 
+    const namedId = create(contract.ExtensionLibrarySqlValueSchema, { value: { case: "numberValue", value: 7 } });
+    const namedTitle = create(contract.ExtensionLibrarySqlValueSchema, { value: { case: "textValue", value: "seventh" } });
+    await expect(call({ case: "sqlExecute", value: create(contract.ExtensionLibrarySqlExecuteOperationSchema, {
+      handleId, statement: { sql: "INSERT INTO cards(id, title) VALUES (:id, :title)", namedParameters: { id: namedId, title: namedTitle } }
+    }) })).resolves.toMatchObject({ result: { result: { case: "sqlResult", value: { changes: "1" } } } });
+    const namedStatement = { sql: "SELECT title FROM cards WHERE id = :id", namedParameters: { id: namedId } };
+    const namedRow = { cells: [{ name: "title", value: { value: { case: "textValue", value: "seventh" } } }] };
+    await expect(call({ case: "sqlExecute", value: create(contract.ExtensionLibrarySqlExecuteOperationSchema, {
+      handleId, statement: namedStatement
+    }) })).resolves.toMatchObject({ result: { result: { case: "sqlResult", value: { rows: [namedRow] } } } });
+    await expect(call({ case: "sqlBatch", value: create(contract.ExtensionLibrarySqlBatchOperationSchema, {
+      handleId, statements: [namedStatement, { sql: "SELECT title FROM cards WHERE id = ?", parameters: [namedId] }]
+    }) })).resolves.toMatchObject({ result: { result: { case: "sqlBatch", value: { results: [{ rows: [namedRow] }, { rows: [namedRow] }] } } } });
+    await expect(call({ case: "sqlExecute", value: create(contract.ExtensionLibrarySqlExecuteOperationSchema, {
+      handleId, statement: { ...namedStatement, parameters: [namedId] }
+    }) })).rejects.toMatchObject({ code: Code.InvalidArgument });
+
     await expect(libraryCall(services.extension.callExtensionLibrary, sessionId!, {
       case: "read",
       value: { path: "D:\\private.txt" }
