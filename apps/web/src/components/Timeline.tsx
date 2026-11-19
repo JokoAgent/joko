@@ -70,7 +70,7 @@ import { SelectionQuoteButton } from "./SelectionQuoteButton.js";
 import { SelectionQuoteChip } from "./SelectionQuoteChip.js";
 import { SentPastedTextInline } from "./SentPastedTextInline.js";
 import { buildSentPastedTextMessageSegments, projectSentPastedTextMessageBody } from "./sent-pasted-text.js";
-import { messageDialogueRewindTarget } from "./message-rewind-behavior.js";
+import { isPersistedStopEditSource, messageDialogueRewindTarget } from "./message-rewind-behavior.js";
 import { shareSelectionPinnedRenderIndexes } from "./share-selection-behavior.js";
 import { ShareMessageImageEmptyError, ShareMessageImageTooLargeError, deliverShareMessageImage, shareMessageImageFilename } from "./share-message-image.js";
 import { MAXIMUM_RENDERED_SHARE_MESSAGES, ShareRenderedMessageImageUnavailableError, ShareRenderedMessageNotMountedError, buildRenderedShareMessageImagePng, queryRenderedShareMessageIds } from "./share-rendered-message-image.js";
@@ -247,6 +247,7 @@ interface TimelineMessageEditDraft {
   readonly token: symbol;
   readonly messageId: string;
   readonly sourceEventId: string;
+  readonly stoppedSource?: TimelineItemView;
   readonly draft: UserMessageEditDraft;
 }
 
@@ -355,6 +356,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
   const beginInlineEdit = (item: TimelineItemView): void => {
     if (item.sourceEventId === undefined || !messageEdit?.begin(item)) return;
     setEditingRow({ owner: editOwner, token: Symbol(), messageId: item.id, sourceEventId: item.sourceEventId,
+      ...(messageEdit.stopRunning ? { stoppedSource: item } : {}),
       draft: { text: parseSelectionQuoteMessage(item.text ?? "", item.quotesEncoded === true).body, submitting: false } });
   };
   useEffect(() => { if (!messageNavRailEnabled) setMessageNavRailCoversNavigation(false); }, [messageNavRailEnabled]);
@@ -1510,7 +1512,9 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
             const focused = focusedItemId !== undefined && renderItem.childIds.includes(focusedItemId);
             const searchOnly = isSearchOnlyRow(virtualRow.index);
             const editing = renderItem.type === "item" && currentEdit?.messageId === renderItem.item.id
-              && currentEdit.sourceEventId === renderItem.item.sourceEventId ? currentEdit : undefined;
+              && (currentEdit.sourceEventId === renderItem.item.sourceEventId
+                || currentEdit.stoppedSource !== undefined && isPersistedStopEditSource(currentEdit.stoppedSource, renderItem.item))
+              ? currentEdit : undefined;
             return (
               <div
                 key={renderItem.key}

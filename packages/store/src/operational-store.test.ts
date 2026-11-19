@@ -3373,6 +3373,34 @@ describe("OperationalStore", () => {
     }
   );
 
+  it("persists the edited choice for an editable plan and preserves the earlier shape", () => {
+    const fixture = createFixture();
+    const sessionId = "session-1";
+    const draft = { kind: "plan_review", title: "Review plan", markdown: "1. Inspect\n2. Implement",
+      choices: ["execute", "stay"] } as const;
+    const approve = { kind: "plan_review", decision: "execute", feedback: "", editedPlan: "1. Read\n2. Verify.\n" } as const;
+    const previous = fixture.store.openInteraction({ sessionId, generation: 0,
+      payload: { ...draft, id: "previous-plan-shape" }, traceId: "previous-plan" });
+    const editable = fixture.store.openInteraction({ sessionId, generation: 0,
+      payload: { ...draft, id: "editable-plan-shape", editable: true }, traceId: "editable-plan" });
+    expect(() => fixture.store.resolveInteraction(previous.id, 0, approve, "previous-edited")).toThrow();
+    expect(() => fixture.store.resolveInteraction(editable.id, 0, { ...approve, decision: "stay" }, "invalid-stay")).toThrow();
+    expect(() => fixture.store.resolveInteraction(editable.id, 0, { ...approve, editedPlan: "\0" }, "invalid-input")).toThrow();
+    expect(fixture.store.getInteraction(editable.id).status).toBe("open");
+    const ordinary = { kind: "plan_review", decision: "stay", feedback: "" } as const;
+    fixture.store.resolveInteraction(previous.id, 0, ordinary, "previous-normal");
+    fixture.store.resolveInteraction(editable.id, 0, approve, "editable-approved");
+
+    const filePath = fixture.store.filePath;
+    fixture.store.close();
+    const reopened = new OperationalStore(filePath);
+    fixture.replaceStore(reopened);
+    expect(reopened.getInteraction(previous.id)).toMatchObject({ status: "resolved", decision: ordinary });
+    expect(reopened.getInteraction(editable.id)).toMatchObject({ status: "resolved", payload: { editable: true }, decision: approve });
+    expect(reopened.listEvents({ sessionId }).some(({ payload }) => payload.type === "interaction_opened"
+      && payload.interaction.id === editable.id && payload.interaction.kind === "plan_review" && payload.interaction.editable === true)).toBe(true);
+  });
+
   it("dismisses an open interaction after restart instead of accepting a response without a Backend waiter", () => {
     const fixture = createFixture();
     const session = fixture.store.getSession("session-1");

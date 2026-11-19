@@ -1,5 +1,6 @@
 import type { CapabilityView, NativeNavigationTargetView, TargetView, TimelineItemView, WorkspaceChangeSetView } from "../model.js";
 import { isInternalContinuationTimelineItem } from "../runtime-recovery.js";
+import { sameMessageAttachments } from "./message-attachment-roundtrip.js";
 
 export function sessionCapabilitySupportsTarget(capability: CapabilityView | undefined, target: TargetView | undefined): boolean {
   if (capability?.supported !== true) return false;
@@ -33,6 +34,21 @@ export function messageDialogueRewindTarget(item: TimelineItemView, allowStart =
 export function sameNativeNavigationTarget(left: NativeNavigationTargetView | undefined, right: NativeNavigationTargetView | undefined): boolean {
   return left !== undefined && right !== undefined && left.kind === right.kind
     && (left.kind === "session_start" || (right.kind === "native_entry" && left.entryId === right.entryId));
+}
+
+/** A native history read may replace the live receipt for the input whose Run was stopped. */
+export function isPersistedStopEditSource(original: TimelineItemView, current: TimelineItemView): boolean {
+  return original.kind === "user" && current.kind === "user" && original.id === current.id
+    && original.userInputAccepted === true && current.userInputAccepted === true
+    && original.nativeEntryId !== undefined && current.nativeEntryId === original.nativeEntryId
+    && original.nativeParentEntryId === current.nativeParentEntryId
+    && original.runId !== undefined && current.runId === original.runId
+    && original.inputOperationId !== undefined && current.inputOperationId === original.inputOperationId
+    && current.sourceEventId !== undefined && /^native-event-[a-f0-9]{64}$/u.test(current.sourceEventId)
+    && original.completionCursor !== undefined && current.completionCursor !== undefined && current.completionCursor > original.completionCursor
+    && original.text === current.text && original.quotesEncoded === current.quotesEncoded
+    && sameMessageAttachments(original.attachments, current.attachments)
+    && sameNativeNavigationTarget(messageDialogueRewindTarget(original), messageDialogueRewindTarget(current));
 }
 
 export function messageRoundRunId(items: readonly TimelineItemView[], userMessageId: string): string | undefined {
