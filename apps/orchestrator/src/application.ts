@@ -11,7 +11,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
   createClaudeCodeAdapter,
   readClaudeWorkflowProgressFromProfile,
-  CLAUDE_MANAGED_PROVIDER_SUPPORT,
+  CLAUDE_LOCAL_MANAGED_PROVIDER_SUPPORT,
   type ClaudeCodeCredentialPort
 } from "@joko/adapter-claude-code";
 import {
@@ -1579,7 +1579,9 @@ export async function createOrchestratorApplication(
         (route.backendId === claudeCodeBackendId && route.api === "anthropic-messages" && route.baseUrl === OLLAMA_LOOPBACK_ORIGIN)
         || (route.backendId === codexBackendId && route.api === "openai-completions" && route.baseUrl === OLLAMA_OPENAI_BASE_URL)
       )) return fetch;
-      return route.backendId === codexBackendId && route.api === "openai-completions" ? streamManagedProvider : undefined;
+      if ((route.backendId === codexBackendId && route.api === "openai-completions")
+        || (route.backendId === claudeCodeBackendId && route.api === "openai-responses")) return streamManagedProvider;
+      return undefined;
     },
     assertOwner: (owner) => {
       const session = store.getSession(owner.sessionId).descriptor;
@@ -1596,6 +1598,7 @@ export async function createOrchestratorApplication(
   const managedRuntime = (backendId: string, generation: number, support: import("@joko/core").ProviderRuntimeSupport) => {
     const port = managedProviderProxy.createRuntime({
       backendId, generation, support,
+      ...(backendId === claudeCodeBackendId ? { clientProtocol: "anthropic-messages" as const } : {}),
       assertCurrent: () => {
         const instance = backendInstances.get(backendId);
         if (instance.state !== "available" || instance.generation !== generation) throw new Error("Managed Provider Backend instance is no longer current.");
@@ -1736,7 +1739,7 @@ export async function createOrchestratorApplication(
             worktrees: () => sessionWorktrees
           })
         }),
-        managedProviders: managedRuntime(instanceId, generation, CLAUDE_MANAGED_PROVIDER_SUPPORT),
+        managedProviders: managedRuntime(instanceId, generation, CLAUDE_LOCAL_MANAGED_PROVIDER_SUPPORT),
         credentialPort: claudeCodeCredentialPort,
         resolveSubagentModel: (providerId) => subagentModels.resolve(instanceId, providerId),
         prepareManagedChildWorkspace: input => managedChildWorkspaces.prepare(input),

@@ -2899,11 +2899,12 @@ export function toProtoRuntimeCommand(
     commandId: createHash("sha256").update(identity).digest("hex"),
     name: item.name,
     description: item.description,
-    source: item.source === "extension"
-      ? contract.RuntimeCommandSource.EXTENSION
-      : item.source === "skill"
-        ? contract.RuntimeCommandSource.SKILL
-        : contract.RuntimeCommandSource.PROMPT,
+    source: {
+      extension: contract.RuntimeCommandSource.EXTENSION,
+      skill: contract.RuntimeCommandSource.SKILL,
+      prompt: contract.RuntimeCommandSource.PROMPT,
+      backend: contract.RuntimeCommandSource.BACKEND
+    }[item.source],
     resourceId: item.resourceId ?? "",
     ...(item.builtinSkill === undefined ? {} : { builtinSkill: message<contract.BuiltinSkillIdentity>("joko.v1.BuiltinSkillIdentity", item.builtinSkill) }),
     inputMode,
@@ -2926,7 +2927,7 @@ export function fromProtoRuntimeCommand(item: contract.RuntimeCommand): CoreRunt
       ? "prompt"
       : item.source === contract.RuntimeCommandSource.SKILL
         ? "skill"
-        : (() => {
+        : item.source === contract.RuntimeCommandSource.BACKEND ? "backend" : (() => {
             throw new ProtoMappingError(
               "unsupported_mapping",
               "runtime_command.source",
@@ -4825,7 +4826,7 @@ function providerApi(api: ProviderModel["api"]): ProviderApiCompatibility {
 }
 
 export function toProtoCapability(capability: Capability): ProtoCapability {
-  const scopeInvalid = (capability.key === "session.rewind_to_start" || capability.key === "session.message_delete")
+  const scopeInvalid = (capability.key === "session.rewind_to_start" || capability.key === "session.message_delete" || capability.key === "context.compact")
     && !nativeStartScopeOptionsAreValid(capability);
   return message<ProtoCapability>("joko.v1.Capability", {
     name: capability.key,
@@ -4870,7 +4871,8 @@ function capabilityReason(support: CapabilitySupport): Capability["reason"] | un
 function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | undefined {
   let kind: CapabilityOptions["kind"];
   if (capability.key === "session.rewind_to_start"
-    || (capability.key === "session.message_delete" && capability.options?.includes(SESSION_REWIND_SERVICE_NODE_ONLY_OPTION))) {
+    || ((capability.key === "session.message_delete" || capability.key === "context.compact")
+      && capability.options?.includes(SESSION_REWIND_SERVICE_NODE_ONLY_OPTION))) {
     if (!nativeStartScopeOptionsAreValid(capability)) return undefined;
     kind = {
       case: "session",

@@ -170,6 +170,7 @@ const OPAQUE_REFERENCE_PREFIX = "claude-code:session:";
 const STORED_OPAQUE_REFERENCE_PREFIX = "claude-code:stored-session:";
 const DEFAULT_INITIALIZATION_TIMEOUT_MS = 20_000;
 const DEFAULT_ADMISSION_TIMEOUT_MS = 20_000;
+const MANUAL_COMPACTION_TIMEOUT_MS = 30 * 60_000;
 const DEFAULT_TEARDOWN_TIMEOUT_MS = 5_000;
 const DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT = 90;
 const NATIVE_AUTO_COMPACT_WINDOW_MINIMUM = 100_000;
@@ -434,6 +435,10 @@ interface ActiveTurn {
   readonly backendInstanceGeneration: number;
   readonly queryGeneration: number;
   readonly operationId: string;
+  readonly manualCompaction: boolean;
+  manualCompactionStarted?: true;
+  manualCompactionBoundary?: true;
+  manualCompactionCancellation?: true;
   mcpCallCancellation: AbortController;
   readonly mcpRootToolWaiters: Map<string, Deferred<void>>;
   readonly nativeMcpToolCalls: Map<string, { readonly name: string; readonly input: Readonly<Record<string, unknown>>;
@@ -487,6 +492,13 @@ interface ActiveTurn {
   parentStreamSegment?: ParentStreamSegment;
   assistantError?: string;
   nativeRetry?: { readonly attempt: number; readonly maxAttempts: number; readonly delayMs: number };
+}
+
+interface ExplicitClaudeCompaction {
+  readonly completion: Deferred<"compacted" | "noop">;
+  consumed: boolean;
+  initialized: boolean;
+  boundaryObserved: boolean;
 }
 
 interface ManagedSubtaskRouteAdmission {
@@ -642,6 +654,7 @@ interface NativeRuntime {
   systemInitializationConfirmed: boolean;
   compacting: boolean;
   nativeCompaction?: { readonly id: string; completed: boolean; boundaryObserved: boolean };
+  explicitCompaction?: ExplicitClaudeCompaction;
   compactionContextTokens?: number;
   steerEnabled: boolean;
   inputPreparation?: AbortController;
@@ -1855,7 +1868,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
 
   override async getCommands(context: AdapterContext): Promise<readonly RuntimeCommand[]> {
     const runtime = this.#requireRuntime(context), snapshot = runtime.nativeSkills;
-    if (runtime.remote || runtime.runtimePolicy !== "standard" || !snapshot || runtime.initialization?.plugins_applied !== true) return [];
+    if (runtime.remote || runtime.runtimePolicy !== "standard") return [];
+    this.#assertCurrent(runtime, context, runtime.binding);
+    const commands: RuntimeCommand[] = hasNativeCompactCommand(runtime.initialization) ? [{
+      name: "compact", description: "Compact the conversation context.", source: "backend", inputMode: "text", loaded: true
+    }] : [];
+    if (!snapshot || runtime.initialization?.plugins_applied !== true) return commands;
     await snapshot.assertFilesCurrent(context.signal);
     this.#assertCurrent(runtime, context, runtime.binding);
     const resources = await this.getResources(context);
@@ -1868,7 +1886,6 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       names.set(name, (names.get(name) ?? 0) + 1);
     }
     const loadedById = new Map(resources.map(resource => [resource.id, resource]));
-    const commands: RuntimeCommand[] = [];
     for (const { seed, discovery } of snapshot.skills) {
       const { id, name, revision, resourceVersion, trustedBuiltin } = seed.resource;
       const loaded = loadedById.get(id);
@@ -1884,6 +1901,70 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       }
     }
     return commands;
+  }
+
+  override async compact(customInstructions: string | undefined, context: AdapterContext): Promise<"compacted" | "noop"> {
+    const runtime = this.#requireIdleRuntime(context);
+    this.#assertStandardRuntime(runtime, "compact the conversation");
+    if (runtime.remote || !hasNativeCompactCommand(runtime.initialization)) {
+      throw claudeCodeError("BACKEND_CAPABILITY_UNAVAILABLE", "Native compaction is unavailable on this Claude Session.", "compaction");
+    }
+    if (!runtime.systemInitializationConfirmed || runtime.freshSessionCanRestart) return "noop";
+    const instructions = customInstructions?.trim();
+    const operationId = context.operationId ?? randomUUID();
+    const token = Symbol();
+    const compaction: ExplicitClaudeCompaction = { completion: deferred(), consumed: false, initialized: false, boundaryObserved: false };
+    const cancellation = new AbortController();
+    const signal = AbortSignal.any([context.signal, runtime.abortController.signal, cancellation.signal]);
+    const assertCurrent = () => {
+      signal.throwIfAborted();
+      this.#assertCurrent(runtime, context, context.binding);
+      if (runtime.pendingControl !== token || runtime.explicitCompaction !== compaction) throw continuityGap();
+    };
+    runtime.pendingControl = token;
+    runtime.explicitCompaction = compaction;
+    void compaction.completion.promise.catch(() => undefined);
+    let providerLease: ManagedProviderOperationLease | undefined;
+    try {
+      assertCurrent();
+      await runtime.nativeSkills?.assertFilesCurrent(signal);
+      const prepared = await prepareClaudePrompt({
+        text: instructions ? `/compact ${instructions}` : "/compact", images: [], files: [], mentions: [], disposition: "prompt"
+      }, context, this.#inputResolvers, signal);
+      if (runtime.managedRoute !== undefined) {
+        runtime.managedRoute.assertCurrent();
+        const activation = runtime.managedRoute.activate({ operationId, signal, assertCurrent }).then((lease) => {
+          try { assertCurrent(); return lease; }
+          catch (error) { lease.release(); throw error; }
+        });
+        providerLease = await waitFor(activation, this.#admissionTimeoutMs, signal,
+          () => dispatchError("The compaction Provider authority could not be prepared in time.", false));
+      }
+      const assertInputCurrent = () => {
+        assertCurrent();
+        prepared.assertCurrent();
+        runtime.nativeSkills?.assertCurrent();
+      };
+      await waitFor(runtime.gate.offer({
+        type: "user", message: { role: "user", content: prepared.content }, parent_tool_use_id: null,
+        origin: { kind: "human" }, uuid: operationUuid(operationId)
+      }, () => { compaction.consumed = true; }, signal, assertInputCurrent), this.#admissionTimeoutMs, signal,
+      () => dispatchError("The native input stream did not consume the compaction command in time.", false));
+      const outcome = await waitFor(compaction.completion.promise, MANUAL_COMPACTION_TIMEOUT_MS, signal,
+        () => nativeCompactionOutcomeUnknown());
+      assertCurrent();
+      return outcome;
+    } catch (error) {
+      if (compaction.consumed && this.#isRuntimeCurrent(runtime)) await this.#retireRuntime(runtime);
+      if (error instanceof JokoError) throw error;
+      if (compaction.consumed) throw nativeCompactionOutcomeUnknown();
+      throw dispatchError("The native compaction command was not dispatched.", false);
+    } finally {
+      cancellation.abort();
+      providerLease?.release();
+      if (runtime.pendingControl === token) runtime.pendingControl = undefined;
+      if (runtime.explicitCompaction === compaction) runtime.explicitCompaction = undefined;
+    }
   }
 
   override send(input: PromptInput, context: AdapterContext): Promise<void> {
@@ -2003,6 +2084,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       backendInstanceGeneration: this.#instanceGeneration,
       queryGeneration: runtime.queryGeneration,
       operationId,
+      manualCompaction: !runtime.remote && runtime.runtimePolicy === "standard" && typeof prepared.content === "string"
+        && /^\/compact(?:\s|$)/u.test(prepared.content),
       mcpCallCancellation: new AbortController(),
       mcpRootToolWaiters: new Map(),
       nativeMcpToolCalls: new Map(),
@@ -3747,9 +3830,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       });
       try {
         managedRoute = await waitFor(preparing, this.#initializationTimeoutMs, context.signal, managedRouteUnavailable);
-        if (managedRoute.protocol !== "anthropic-messages" || managedRoute.providerId !== providerId
+        if (!managedProviderSupport(this.#managedProviders.support).protocols.includes(managedRoute.protocol)
+          || (managedRoute.protocol === "openai-responses" && (scoped.remote || context.hostedExecution))
+          || managedRoute.providerId !== providerId
           || managedRoute.model.providerId !== providerId || managedRoute.model.modelId !== modelId
-          || managedRoute.model.api !== "anthropic-messages") throw managedRouteUnavailable();
+          || managedRoute.model.api !== managedRoute.protocol) throw managedRouteUnavailable();
         managedRoute.assertCurrent();
         validateManagedThinkingMap(managedRoute.thinkingLevelMap);
         managedModelLimitEnvironment(managedRoute.model);
@@ -4368,6 +4453,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
 
     const turn = runtime.activeTurn;
     const isTurnInitialization = type === "system" && subtype === "init";
+    const explicit = runtime.explicitCompaction;
+    if (explicit?.consumed && isTurnInitialization) explicit.initialized = true;
     if (isTurnInitialization && turn !== undefined) {
       turn.nativeIdentityConfirmed = true;
       turn.admission.resolve(undefined);
@@ -4415,6 +4502,27 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       return;
     }
     if (turn === undefined) {
+      if (explicit?.consumed && type === "result") {
+        if (nativeSessionId !== runtime.nativeSessionId || !explicit.initialized || subtype !== "success" || envelope["is_error"] === true) {
+          explicit.completion.reject(nativeCompactionOutcomeUnknown());
+          return;
+        }
+        const output = stringValue(envelope["result"])?.trim();
+        if (explicit.boundaryObserved) {
+          explicit.completion.resolve("compacted");
+        } else if (output === "Not enough messages to compact." || output === "No messages to compact") {
+          if (runtime.compacting && runtime.nativeCompaction !== undefined) {
+            runtime.compacting = false;
+            runtime.nativeCompaction.completed = true;
+            await this.#emitNativeSystem(runtime, undefined, { type: "compaction", compactionId: runtime.nativeCompaction.id,
+              state: "no_op", reason: "manual" });
+          }
+          explicit.completion.resolve("noop");
+        } else {
+          explicit.completion.reject(nativeCompactionOutcomeUnknown());
+        }
+        return;
+      }
       if (isTurnInitialization) {
         runtime.fastModeObservation = readFastModeObservation(envelope) ?? runtime.fastModeObservation;
       }
@@ -4483,11 +4591,21 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     turn: ActiveTurn | undefined,
     envelope: Readonly<Record<string, unknown>>
   ): Promise<void> {
+    const subtype = envelope["subtype"];
+    const manualStatusBeforeInit = turn?.manualCompaction === true && turn.inputConsumed && !turn.nativeIdentityConfirmed
+      && subtype === "status" && ((!turn.stopping && envelope["status"] === "compacting")
+        || (turn.manualCompactionStarted && envelope["status"] === null));
     if (!runtime.systemInitializationConfirmed || envelope["session_id"] !== runtime.nativeSessionId
-      || (turn !== undefined && (!turn.nativeIdentityConfirmed || turn.terminalClaimed || !this.#isTurnCurrent(runtime, turn)))) return;
+      || (turn !== undefined && ((!turn.nativeIdentityConfirmed && !manualStatusBeforeInit) || turn.terminalClaimed || !this.#isTurnCurrent(runtime, turn)))) return;
     const uuid = stringValue(envelope["uuid"]);
     if (uuid === undefined || !uuidPattern().test(uuid) || runtime.systemFrameUuids.has(uuid)) return;
-    const subtype = envelope["subtype"];
+    if (manualStatusBeforeInit && turn !== undefined && !turn.manualCompactionStarted) {
+      // The locked native command can start compaction before this input's init.
+      // Acknowledge that exact consumed input without relaxing subsequent frame identity checks.
+      turn.admission.resolve(undefined);
+      await turn.eventsReady.promise;
+      if (turn.terminalClaimed || !this.#isTurnCurrent(runtime, turn)) return;
+    }
     if (subtype === "api_retry") {
       if (turn === undefined) return;
       const attempt = nativeSystemInteger(envelope["attempt"], 0xffff_ffff);
@@ -4507,6 +4625,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       if (status !== "compacting" && status !== "requesting" && status !== null) return;
       addBoundedIdentity(runtime.systemFrameUuids, uuid);
       if (status === "compacting") {
+        if (turn?.manualCompaction) turn.manualCompactionStarted = true;
         if (runtime.nativeCompaction === undefined || runtime.nativeCompaction.completed) {
           runtime.nativeCompaction = { id: `claude-code.compaction:${uuid}`, completed: false, boundaryObserved: false };
           runtime.compactionContextTokens = undefined;
@@ -4540,6 +4659,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if ((trigger !== "auto" && trigger !== "manual") || tokensBefore === undefined
       || (metadata?.["post_tokens"] !== undefined && tokensAfter === undefined)) return;
     addBoundedIdentity(runtime.systemFrameUuids, uuid);
+    if (turn?.manualCompaction && trigger === "manual") turn.manualCompactionBoundary = true;
+    if (runtime.explicitCompaction?.initialized && trigger === "manual") runtime.explicitCompaction.boundaryObserved = true;
     if (runtime.nativeCompaction === undefined || runtime.nativeCompaction.boundaryObserved) {
       runtime.nativeCompaction = { id: `claude-code.compaction:${uuid}`, completed: false, boundaryObserved: false };
     }
@@ -4691,6 +4812,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       turn.nativeMcpToolCalls.get(nativeCallId)?.retainCompleteText === true
         ? Math.min(turn.context.artifactCapacityBytes, MAX_MCP_COMPLETE_TEXT_BYTES) : undefined);
     const nativeContent = record(envelope["message"])?.["content"];
+    const localOutput = Array.isArray(nativeContent) && nativeContent.length === 1 ? record(nativeContent[0]) : undefined;
+    const localText = typeof nativeContent === "string" ? nativeContent : localOutput?.["type"] === "text" ? localOutput["text"] : undefined;
+    if (turn.manualCompaction && localText === "<local-command-stdout>Compaction canceled.</local-command-stdout>") {
+      turn.manualCompactionCancellation = true;
+    }
     if (Array.isArray(nativeContent)) for (const raw of nativeContent) {
       const block = record(raw), id = stringValue(block?.["tool_use_id"]);
       if (block?.["type"] === "tool_result" && id) turn.nativeMcpToolCalls.delete(id);
@@ -4824,7 +4950,18 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
     await this.#projectPermissionDenials(runtime, turn, envelope["permission_denials"]);
     if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
-    const result = this.#projection.result(envelope, runtime.nativeUsage.observeResult(envelope), turn.assistantError);
+    const projected = this.#projection.result(envelope, runtime.nativeUsage.observeResult(envelope), turn.assistantError);
+    const nativeOutput = stringValue(envelope["result"])?.trim();
+    const stoppedManualCompaction = turn.manualCompaction && !turn.manualCompactionBoundary && turn.interruptConfirmation !== undefined
+      && (turn.manualCompactionCancellation || nativeOutput === "Compaction canceled."
+        || nativeOutput === "<local-command-stdout>Compaction canceled.</local-command-stdout>");
+    const result = stoppedManualCompaction && projected.outcome === "completed" ? { ...projected, outcome: "aborted" as const } : projected;
+    if (stoppedManualCompaction && runtime.compacting && runtime.nativeCompaction !== undefined) {
+      runtime.compacting = false;
+      runtime.nativeCompaction.completed = true;
+      await this.#emitNativeSystem(runtime, turn, { type: "compaction", compactionId: runtime.nativeCompaction.id,
+        state: "aborted", reason: "manual" });
+    }
     await this.#settleNativeRetry(runtime, turn,
       result.outcome === "completed" ? "succeeded" : result.outcome === "aborted" ? "aborted" : "exhausted");
     await this.#emit(runtime, turn, { type: "status", key: "claude-code.lifecycle" });
@@ -4851,10 +4988,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       : { ...observedUsage, contextTokens: runtime.compactionContextTokens };
     if (runtime.compacting) {
       if (usage !== undefined) await this.#emit(runtime, turn, { type: "usage", usage });
-      throw claudeCodeError("CLAUDE_CODE_COMPACTION_OUTCOME_UNKNOWN", "The native compaction outcome could not be confirmed.", "compaction", {
-        stateMayHaveChanged: true,
-        recovery: "Inspect and restore the exact native Session before sending more input."
-      });
+      throw nativeCompactionOutcomeUnknown();
     }
     runtime.lastUsage = usage;
     const hasText = turn.blocks.some((block) => block.kind === "text");
@@ -7581,6 +7715,12 @@ function supportsIsolatedReview(cliVersion: string | undefined): boolean {
   return exactCliVersion(cliVersion, ISOLATED_REVIEW_CLI_VERSION);
 }
 
+function hasNativeCompactCommand(initialization: ClaudeSdkInitializationResult | undefined): boolean {
+  const commands = initialization?.commands;
+  return Array.isArray(commands) && commands.length <= MAX_DESCRIPTOR_ITEMS
+    && commands.some((command) => record(command)?.["name"] === "compact");
+}
+
 function supportsNativeTaskProjection(cliVersion: string | undefined): boolean {
   return exactCliVersion(cliVersion, NATIVE_TASK_CLI_VERSION);
 }
@@ -8012,6 +8152,8 @@ function capabilityManifest(
     "permission.change",
     "plan_mode",
     "context.usage",
+    "context.compact",
+    "runtime.commands",
     "workspace.extra_dirs",
     "interaction.permission",
     "interaction.question",
@@ -8024,7 +8166,7 @@ function capabilityManifest(
   }
   if (inputResolvers.readBlob !== undefined) supported.add("input.image");
   if (inputResolvers.resolveFile !== undefined) supported.add("input.file");
-  if (textResourcesSupported) { supported.add("runtime.resources"); supported.add("runtime.commands"); }
+  if (textResourcesSupported) supported.add("runtime.resources");
   if (isolatedReviewSupported) supported.add("review.isolated");
   if (nativeTasksSupported) {
     for (const capability of [
@@ -8050,7 +8192,7 @@ function capabilityManifest(
   return new Map(CAPABILITIES.map((key): [string, Capability] => {
     const implemented = supported.has(key);
     const available = key === "session.catalog" || key === "session.preview" || (installed && implemented);
-    const options = key === "session.message_delete" && freshContextSupported
+    const options = key === "context.compact" || key === "session.message_delete" && freshContextSupported
       || key === "session.rewind_to_start" && freshContextSupported && !remoteFreshContextSupported
       ? [SESSION_REWIND_SERVICE_NODE_ONLY_OPTION]
       : key === "provider.login" && supportsLogin
@@ -8452,6 +8594,13 @@ function turnAbortUnknown(message: string): () => JokoError {
     retryable: true,
     stateMayHaveChanged: true,
     recovery: "The native runtime was retired; inspect the native Session before resuming."
+  });
+}
+
+function nativeCompactionOutcomeUnknown(): JokoError {
+  return claudeCodeError("CLAUDE_CODE_COMPACTION_OUTCOME_UNKNOWN", "The native compaction outcome could not be confirmed.", "compaction", {
+    stateMayHaveChanged: true,
+    recovery: "Inspect and restore the exact native Session before sending more input."
   });
 }
 
@@ -8996,8 +9145,13 @@ export const CLAUDE_MANAGED_PROVIDER_SUPPORT: ProviderRuntimeSupport = Object.fr
   ] as const)
 });
 
+export const CLAUDE_LOCAL_MANAGED_PROVIDER_SUPPORT: ProviderRuntimeSupport = Object.freeze({
+  ...CLAUDE_MANAGED_PROVIDER_SUPPORT,
+  protocols: Object.freeze(["anthropic-messages", "openai-responses"] as const)
+});
+
 function managedProviderSupport(support: ProviderRuntimeSupport): ProviderRuntimeSupport {
-  return { protocols: support.protocols.filter((protocol) => CLAUDE_MANAGED_PROVIDER_SUPPORT.protocols.includes(protocol)),
+  return { protocols: support.protocols.filter((protocol) => CLAUDE_LOCAL_MANAGED_PROVIDER_SUPPORT.protocols.includes(protocol)),
     fields: support.fields.filter((field) => CLAUDE_MANAGED_PROVIDER_SUPPORT.fields.includes(field)) };
 }
 
@@ -9263,7 +9417,7 @@ function managedQueryEnvironment(route: ManagedProviderRouteBinding, port: Manag
   modelLimits: Readonly<Record<string, string>>): Readonly<Record<string, string | undefined>> {
   const token = port.environment[route.apiKeyEnvironment];
   const endpoint = new URL(route.baseUrl);
-  if (route.protocol !== "anthropic-messages" || token === undefined || token.length === 0
+  if (!managedProviderSupport(port.support).protocols.includes(route.protocol) || token === undefined || token.length === 0
     || !port.secretEnvironmentNames.includes(route.apiKeyEnvironment)
     || endpoint.protocol !== "http:" || !["127.0.0.1", "[::1]"].includes(endpoint.hostname)
     || endpoint.username !== "" || endpoint.password !== "" || endpoint.search !== "" || endpoint.hash !== "") throw managedRouteUnavailable();

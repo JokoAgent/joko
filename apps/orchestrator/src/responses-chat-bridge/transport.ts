@@ -1,11 +1,9 @@
 import { once } from "node:events";
 import type { ServerResponse } from "node:http";
+import { readManagedProviderResponse } from "../managed-provider-response.js";
 import { ChatSseTranslator } from "./translate-response.js";
 import { translateResponsesRequestWithContext, type TranslatedResponsesChatRequest } from "./translate-request.js";
 import { UnsupportedResponsesFeatureError, type ChatBridgeCapabilities, type ResponsesRequest } from "./types.js";
-
-const MAXIMUM_RESPONSE_BYTES = 16 * 1024 * 1024;
-const MAXIMUM_EVENT_CHARACTERS = 1024 * 1024;
 
 const DIRECT_FIELDS: ChatBridgeCapabilities["passthroughFields"] = [
   "temperature", "top_p", "frequency_penalty", "presence_penalty", "stop", "seed", "user",
@@ -37,63 +35,6 @@ export function prepareChatCompletion(
 function record(value: unknown): Readonly<Record<string, unknown>> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown> : undefined;
-}
-
-/** Read one Chat stream or a single completed Chat message under the original request authority. */
-async function* readChatResponse(input: {
-  readonly body: ReadableStream<Uint8Array>;
-  readonly sse: boolean;
-  readonly assertCurrent: () => void;
-}): AsyncGenerator<string> {
-  const reader = input.body.getReader();
-  const decoder = new TextDecoder();
-  let pending = "";
-  let bytes = 0;
-  let ended = false;
-  let data: string[] = [];
-  let eventCharacters = 0;
-  try {
-    for (;;) {
-      input.assertCurrent();
-      const chunk = await reader.read();
-      input.assertCurrent();
-      if (chunk.done) {
-        ended = true;
-        pending += decoder.decode();
-      } else {
-        bytes += chunk.value.byteLength;
-        if (bytes > MAXIMUM_RESPONSE_BYTES) throw new Error("The Chat response exceeded its size limit.");
-        pending += decoder.decode(chunk.value, { stream: true });
-      }
-      if (!input.sse) {
-        if (ended) { yield pending; return; }
-        continue;
-      }
-      if (ended) pending += "\n\n";
-      let start = 0;
-      let newline: number;
-      while ((newline = pending.indexOf("\n", start)) >= 0) {
-        const line = pending.slice(start, newline).replace(/\r$/u, "");
-        start = newline + 1;
-        if (line === "") {
-          if (data.length > 0) yield data.join("\n");
-          data = [];
-          eventCharacters = 0;
-        } else if (line.startsWith("data:")) {
-          const value = line.slice(5).replace(/^ /u, "");
-          eventCharacters += value.length + 1;
-          if (eventCharacters > MAXIMUM_EVENT_CHARACTERS) throw new Error("A Chat stream event exceeded its size limit.");
-          data.push(value);
-        }
-      }
-      if (start > 0) pending = pending.slice(start);
-      if (pending.length > MAXIMUM_EVENT_CHARACTERS) throw new Error("A Chat stream line exceeded its size limit.");
-      if (ended) return;
-    }
-  } finally {
-    if (!ended) void reader.cancel().catch(() => undefined);
-    reader.releaseLock();
-  }
 }
 
 export async function writeResponsesFromChat(input: {
@@ -128,7 +69,7 @@ export async function writeResponsesFromChat(input: {
     }
   };
   try {
-    for await (const payload of readChatResponse({ body: upstream.body, sse, assertCurrent })) {
+    for await (const payload of readManagedProviderResponse({ body: upstream.body, sse, assertCurrent })) {
       if (payload.trim() === "[DONE]" && sse) {
         translator.markTerminal();
         break;

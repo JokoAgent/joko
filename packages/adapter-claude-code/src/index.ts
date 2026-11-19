@@ -1,6 +1,7 @@
 export {
   ClaudeCodeAdapter,
   CLAUDE_MANAGED_PROVIDER_SUPPORT,
+  CLAUDE_LOCAL_MANAGED_PROVIDER_SUPPORT,
   claudeWorkspaceAuthority,
   claudeNativeDerivationOperationId,
   readClaudeWorkflowProgressFromProfile,

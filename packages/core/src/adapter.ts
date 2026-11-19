@@ -412,7 +412,7 @@ export type RuntimeCommandInputMode = "text" | "resource_mention";
 export interface RuntimeCommand {
   readonly name: string;
   readonly description: string;
-  readonly source: "extension" | "skill" | "prompt";
+  readonly source: "extension" | "skill" | "prompt" | "backend";
   readonly inputMode: RuntimeCommandInputMode;
   readonly path?: string;
   /** Exact managed Resource owner resolved inside the live runtime. */

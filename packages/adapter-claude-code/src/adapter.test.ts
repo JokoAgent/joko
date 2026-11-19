@@ -276,6 +276,86 @@ describe("ClaudeCodeAdapter", () => {
     } finally { await adapter.dispose(); }
   });
 
+  test.each(["completed", "aborted", "completed-after-stop"] as const)("accepts a manual compact before turn init and settles its native outcome: %s", async (outcome) => {
+    const runtime = new FakeSdkRuntime({ autoAdmitTurns: false });
+    const adapter = adapterFor(runtime, { admissionTimeoutMs: 1_000 });
+    try {
+      const binding = await adapter.createSession(createInput(), contextFor().context);
+      const nativeId = binding.nativeSessionId!;
+      const query = runtime.queries[0]!;
+      const previous = contextFor(binding, { operationId: "prior-initialized-input" });
+      const initial = adapter.send(textPrompt("Build a little history first"), previous.context);
+      await eventually(() => query.receivedInputs.length === 1);
+      query.push(systemInit(nativeId));
+      await initial;
+      query.push(resultMessage(nativeId, { result: "Original answer", totalCostUsd: 0 }));
+      await eventually(() => previous.events.some((event) => event.type === "done"));
+
+      const compact = contextFor(binding, { operationId: "native-manual-compact" });
+      const accepted = adapter.send(textPrompt("/compact"), compact.context);
+      await eventually(() => query.receivedInputs.length === 2);
+      query.push({ type: "system", subtype: "status", status: "compacting", uuid: randomUUID(), session_id: nativeId });
+      // Keep the per-turn init unsent until the already-running native work is acknowledged.
+      await expect(accepted).resolves.toBeUndefined();
+      await eventually(() => compact.events.some((event) => event.type === "compaction" && event.state === "started"));
+      expect(query.receivedInputs[1]!.message.content).toBe("/compact");
+      if (outcome !== "completed") await adapter.abort(compact.context);
+      query.push(systemInit(nativeId));
+      if (outcome !== "aborted") {
+        query.push({ type: "system", subtype: "compact_boundary", session_id: nativeId, uuid: randomUUID(),
+          compact_metadata: { trigger: "manual", pre_tokens: 12_000, post_tokens: 2_000 } });
+      }
+      query.push(resultMessage(nativeId, { result: outcome === "aborted" ? "Compaction canceled." : "Compacted", totalCostUsd: 0 }));
+      await eventually(() => compact.events.some((event) => event.type === "done"));
+      expect(compact.events).toContainEqual({ type: "done", outcome: outcome === "aborted" ? "aborted" : "completed" });
+      const compactions = compact.events.filter((event) => event.type === "compaction");
+      expect(compactions.at(-1)).toMatchObject({ reason: "manual", state: outcome === "aborted" ? "aborted" : "completed" });
+      expect((await adapter.inspectSession(binding, compact.context)).compacting).toBe(false);
+      expect(query.closeCalls).toBe(0);
+      expect(query.interruptCalls).toBe(outcome === "completed" ? 0 : 1);
+    } finally { await adapter.dispose(); }
+  });
+
+  test.each(["compacted", "noop"] as const)("keeps the explicit compact command in the current native Query without a conversation Run: %s", async (outcome) => {
+    const runtime = new FakeSdkRuntime({ autoAdmitTurns: false });
+    runtime.queryInitialization = { ...initialization(), commands: [{ name: "compact", description: "Compact", argumentHint: "" }] };
+    const adapter = adapterFor(runtime);
+    try {
+      const base = contextFor();
+      const binding = await adapter.createSession(createInput(), base.context);
+      const nativeId = binding.nativeSessionId!;
+      const query = runtime.queries[0]!;
+      const previous = contextFor(binding, { operationId: "typed-compact-original-input" });
+      const ordinary = adapter.send(textPrompt("One ordinary turn"), previous.context);
+      await eventually(() => query.receivedInputs.length === 1);
+      query.push(systemInit(nativeId));
+      await ordinary;
+      query.push(resultMessage(nativeId, { result: "Original reply", totalCostUsd: 0 }));
+      await eventually(() => previous.events.some((event) => event.type === "done"));
+
+      const context = contextFor(binding, { operationId: "original-compact-control" });
+      let settled = false;
+      const control = adapter.compact("Keep decisions", context.context).then((receipt) => { settled = true; return receipt; });
+      await eventually(() => query.receivedInputs.length === 2);
+      expect(query.receivedInputs[1]!.message.content).toBe("/compact Keep decisions");
+      expect(runtime.queries).toHaveLength(1);
+      query.push({ type: "system", subtype: "status", status: "compacting", uuid: randomUUID(), session_id: nativeId });
+      query.push(systemInit(nativeId));
+      await eventually(() => base.events.some((event) => event.type === "compaction" && event.state === "started"));
+      if (outcome === "compacted") {
+        query.push({ type: "system", subtype: "compact_boundary", session_id: nativeId, uuid: randomUUID(),
+          compact_metadata: { trigger: "manual", pre_tokens: 12_000, post_tokens: 2_000 } });
+        await eventually(() => base.events.some((event) => event.type === "compaction" && event.state === "completed"));
+      }
+      expect(settled).toBe(false);
+      query.push(resultMessage(nativeId, { result: outcome === "compacted" ? "Compacted" : "Not enough messages to compact.", totalCostUsd: 0 }));
+      await expect(control).resolves.toBe(outcome);
+      expect(context.events).toEqual([]);
+      expect(base.events.some((event) => event.type === "message_complete" || event.type === "done")).toBe(false);
+      expect((await adapter.inspectSession(binding, context.context)).compacting).toBe(false);
+    } finally { await adapter.dispose(); }
+  });
+
   test("retains native system failure and exhausted retry facts without exposing native error text", async () => {
     const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
     const adapter = adapterFor(runtime);
@@ -1145,6 +1225,28 @@ describe("ClaudeCodeAdapter", () => {
     expect(JSON.stringify(descriptor)).not.toContain(managed.token);
     await adapter.dispose();
     expect(managed.port.dispose).toHaveBeenCalledOnce();
+  });
+
+  test("keeps the Claude SDK on the managed Messages transport when the selected account speaks Responses", async () => {
+    const managed = managedProviderFixture({}, {}, "openai-responses");
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    try {
+      const descriptor = await adapter.describe();
+      expect(descriptor.providerRuntimeSupport?.protocols).toEqual(["openai-responses"]);
+      const modelSelection = { providerId: "configured-provider", modelId: "configured-model" };
+      expect(descriptor.models).toContainEqual(expect.objectContaining({ ...modelSelection, api: "openai-responses" }));
+      const binding = await adapter.createSession(createInput(modelSelection), contextFor().context);
+      const query = runtime.queries[0]!;
+      expect(query.params.options.env).toMatchObject({ ANTHROPIC_BASE_URL: "http://127.0.0.1:31415/routes/fixture",
+        ANTHROPIC_API_KEY: managed.token, CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1" });
+      const turn = contextFor(binding, { operationId: "openai-responses-ordinary-turn" });
+      await adapter.send(textPrompt("send through the original Claude input"), { ...turn.context, modelSelection });
+      expect(managed.activations).toHaveLength(1);
+      query.push(resultMessage(binding.nativeSessionId!, { result: "Controlled reply", totalCostUsd: 0 }));
+      await eventually(() => turn.events.some((event) => event.type === "done"));
+      expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
+    } finally { await adapter.dispose(); }
   });
 
   test("runs a foreground managed Agent in an independently configured exact child Query", async () => {
@@ -3142,6 +3244,21 @@ describe("ClaudeCodeAdapter", () => {
     } finally {
       await adapter.dispose();
     }
+  });
+
+  test.each([true, false])("publishes only the observed native compact command in the local runtime catalog: %s", async (available) => {
+    const runtime = new FakeSdkRuntime();
+    runtime.queryInitialization = { ...initialization(), plugins_applied: false, commands: [
+      { name: "help", description: "Another native command", argumentHint: "" },
+      ...(available ? [{ name: "compact", description: "Native compact", argumentHint: "" }] : [])
+    ] };
+    const adapter = adapterFor(runtime);
+    try {
+      const binding = await adapter.createSession(createInput(), contextFor().context);
+      await expect(adapter.getCommands(contextFor(binding).context)).resolves.toEqual(available ? [{
+        name: "compact", description: "Compact the conversation context.", source: "backend", inputMode: "text", loaded: true
+      }] : []);
+    } finally { await adapter.dispose(); }
   });
 
   test.each([true, false])("attests a built-in native Skill only with an exact launch plugin acknowledgement: %s", async (acknowledged) => {
@@ -7511,11 +7628,12 @@ interface FakeRuntimeOptions {
 
 function managedProviderFixture(
   thinkingLevelMap: Readonly<Record<string, string | null>> = {},
-  modelThinkingOverrides: Readonly<Record<string, Readonly<Record<string, string | null>>>> = {}
+  modelThinkingOverrides: Readonly<Record<string, Readonly<Record<string, string | null>>>> = {},
+  protocol: "anthropic-messages" | "openai-responses" = "anthropic-messages"
 ) {
   const token = "private-model-proxy-fixture-token";
   const models: ProviderModel[] = ["configured-model", "compatible-model", "second-model", "incompatible-thinking"].map((modelId) => ({
-    providerId: "configured-provider", modelId, displayName: modelId, api: "anthropic-messages",
+    providerId: "configured-provider", modelId, displayName: modelId, api: protocol,
     contextWindow: modelId === "second-model" ? 128_000 : 64_000,
     maxOutputTokens: modelId === "second-model" ? 8_000 : 4_000,
     supportsImages: true, supportsFastMode: true, thinkingLevels: ["low", "high", "unavailable"],
@@ -7536,13 +7654,13 @@ function managedProviderFixture(
   let enabled = true;
   let revision = "revision-one";
   const port: ManagedProviderRuntimePort = {
-    support: { protocols: ["anthropic-messages"], fields: ["headers", "model_input_modalities", "model_limits"] },
+    support: { protocols: [protocol], fields: ["headers", "model_input_modalities", "model_limits"] },
     environment: { JOKO_MODEL_PROXY_TOKEN: token }, secretEnvironmentNames: ["JOKO_MODEL_PROXY_TOKEN"],
     dispose: vi.fn(),
     hasProvider: (providerId) => providerId === "configured-provider",
     listModels: () => models,
     getThinkingLevelMap: (_providerId, modelId) => thinkingMapFor(modelId),
-    listProviders: () => [{ providerId: "configured-provider", displayName: "Configured Provider", api: "anthropic-messages",
+    listProviders: () => [{ providerId: "configured-provider", displayName: "Configured Provider", api: protocol,
       authenticationState: "authenticated", loginMethods: [], supportsLogin: false, supportsLogout: false, supportsRefresh: true, supportsModelRefresh: true }],
     prepare: async (owner) => {
       if (!enabled) throw new Error("The managed route is disabled.");
@@ -7550,7 +7668,7 @@ function managedProviderFixture(
       const preparedRevision = revision;
       const assertCurrent = () => { if (!enabled || disposed || preparedRevision !== revision) throw new Error("The managed route is stale."); };
       const selected = models.find((model) => model.modelId === owner.modelId)!;
-      return { providerId: owner.providerId, model: selected, thinkingLevelMap: thinkingMapFor(selected.modelId), protocol: "anthropic-messages",
+      return { providerId: owner.providerId, model: selected, thinkingLevelMap: thinkingMapFor(selected.modelId), protocol,
         revision: preparedRevision, baseUrl: "http://127.0.0.1:31415/routes/fixture", apiKeyEnvironment: "JOKO_MODEL_PROXY_TOKEN",
         assertCurrent, activate: async (input) => { assertCurrent(); input.assertCurrent(); const release = vi.fn(); activations.push({ input, release }); return { release }; },
         authorizeSubtask: async (input) => {

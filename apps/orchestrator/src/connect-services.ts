@@ -18133,7 +18133,8 @@ async function dispatchMutation(
         effect: async () => {
           compactSessionOutcome = await host.compact(
             payload.value.sessionId,
-            payload.value.customInstructions || undefined
+            payload.value.customInstructions || undefined,
+            operationId
           );
         },
         commit: () => {

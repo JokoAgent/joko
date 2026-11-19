@@ -383,6 +383,14 @@ describe("proto mapper", () => {
     }
   });
 
+  it("keeps service-node compaction scope in current v1 and preserves unscoped Backends", () => {
+    const scoped = { key: "context.compact", supported: true, options: ["service_node_only"] };
+    const publicCapability = toProtoCapability(scoped);
+    expect(publicCapability.options?.kind).toMatchObject({ case: "session", value: { serviceNodeOnly: true } });
+    expect(fromProtoCapability(publicCapability)).toEqual(scoped);
+    expect(toProtoCapability({ key: "context.compact", supported: true }).options).toBeUndefined();
+  });
+
   it("preserves exact runtime resource kinds in the public Backend capability manifest", () => {
     const stored: StoredBackend = {
       descriptor: {

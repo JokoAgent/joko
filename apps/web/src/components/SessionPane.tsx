@@ -545,7 +545,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       return { sessionId: session.id, value };
     });
   }, [session.id]);
-  const canCompact = !reviewReadOnly && !sideChatRuntimeReadOnly && backend?.capabilities.get("context.compact")?.supported === true;
+  const canCompact = !reviewReadOnly && !sideChatRuntimeReadOnly && sessionCapabilitySupportsTarget(
+    backend?.capabilities.get("context.compact"), controller.state.snapshot.targets.find((candidate) => candidate.id === session.targetId)
+  );
   const canReportSessionUsage = backend?.capabilities.get("context.usage")?.supported === true;
   const effectiveSessionUsage = statisticsUsage?.sessionId === session.id
     ? statisticsUsage.usage
@@ -1426,7 +1428,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     const freshTimeline = freshSnapshot.timelineBySession.get(sourceSessionId) ?? [];
     const stale = !compactGuardRef.current.isCurrent(sourceSessionId, pending.request.epoch)
       || freshSession === undefined
-      || freshBackend?.capabilities.get("context.compact")?.supported !== true
+      || !sessionCapabilitySupportsTarget(freshBackend?.capabilities.get("context.compact"),
+        freshSnapshot.targets.find((candidate) => candidate.id === freshSession.targetId))
       || freshSession.state === "running"
       || freshSession.state === "waiting"
       || freshSession.state === "retrying"
@@ -1452,7 +1455,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         if (
           !compactGuardRef.current.isCurrent(sourceSessionId, pending.request.epoch)
           || latest === undefined
-          || latestBackend?.capabilities.get("context.compact")?.supported !== true
+          || !sessionCapabilitySupportsTarget(latestBackend?.capabilities.get("context.compact"),
+            latestSnapshot.targets.find((candidate) => candidate.id === latest.targetId))
           || (!compactableContext && !alreadyPagedBoundary)
           || latest.state === "running"
           || latest.state === "waiting"

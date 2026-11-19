@@ -1,4 +1,6 @@
+import { RuntimeCommandInputMode, RuntimeCommandSource } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
+import { fromProtoRuntimeCommand, toProtoRuntimeCommand } from "./proto-mapper.js";
 
 import {
   materializedRuntimeCommands,
@@ -49,6 +51,18 @@ describe("runtime command state", () => {
     expect(sameRuntimeCommands(commands, commands.map((command, index) => index === 0
       ? { ...command, resourceId: "resource-changed" }
       : command))).toBe(false);
+  });
+
+  it("round-trips a Backend text command through the saved v1 catalog and client projection", () => {
+    const command = { name: "compact", description: "Compact the conversation context.", source: "backend" as const,
+      inputMode: "text" as const, loaded: true };
+    const observation = runtimeCommandsObservation(2, [command], 10);
+    const restored = materializedRuntimeCommands(observation)?.commands[0];
+    expect(restored).toEqual(command);
+    const wire = toProtoRuntimeCommand(restored!, "claude-task");
+    expect(wire).toMatchObject({ sessionId: "claude-task", source: RuntimeCommandSource.BACKEND,
+      inputMode: RuntimeCommandInputMode.TEXT, resourceId: "" });
+    expect(fromProtoRuntimeCommand(wire)).toEqual(command);
   });
 
   it("retains explicit Resource invocation mode and rejects missing or unbound modes", () => {

@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { once } from "node:events";
 import { piProviderModel } from "@joko/adapter-pi";
@@ -8,6 +8,7 @@ import type {
   ManagedProviderSmartRoutingRoute, ProviderRuntimeProtocol, ProviderRuntimeSupport
 } from "@joko/core";
 import type { ProviderCatalogManager, ProviderInferenceRoute } from "./credential-manager.js";
+import { estimateClaudeInputTokens, prepareClaudeResponsesRequest, writeClaudeResponse } from "./managed-claude-responses.js";
 import { createManagedResponsesSseRepair } from "./managed-responses-sse-repair.js";
 import { prepareChatCompletion, writeResponsesFromChat } from "./responses-chat-bridge/transport.js";
 
@@ -23,6 +24,7 @@ const SMART_TOKEN_HEADER = "x-joko-provider-proxy-token";
 interface RuntimeOwner {
   readonly backendId: string;
   readonly generation: number;
+  readonly clientProtocol?: "anthropic-messages";
   readonly token: string;
   readonly assertCurrent: () => void;
   retired: boolean;
@@ -145,6 +147,7 @@ export class ManagedProviderProxy {
     readonly backendId: string;
     readonly generation: number;
     readonly support: ProviderRuntimeSupport;
+    readonly clientProtocol?: "anthropic-messages";
     readonly assertCurrent: () => void;
   }): ManagedProviderRuntimePort {
     if (this.#origin === "" || this.#closed) throw new Error("Managed Provider proxy is not running.");
@@ -248,7 +251,7 @@ export class ManagedProviderProxy {
             };
             const active: ActiveOperation = { operationId: operation.operationId, route, abort,
               assertCurrent: operation.assertCurrent, release, subtasks: new Map(),
-              ...(route.api === "openai-completions"
+              ...(route.api === "openai-completions" || isClaudeResponsesRoute(runtime, route)
                 ? { assertCredentialsCurrent: this.#providers.captureInferenceCredentialAuthority(route) } : {}) };
             state.active = active;
             operation.signal.addEventListener("abort", release, { once: true });
@@ -294,7 +297,7 @@ export class ManagedProviderProxy {
               abort,
               assertCurrent: subtask.assertCurrent,
               release,
-              ...(route.api === "openai-completions"
+              ...(route.api === "openai-completions" || isClaudeResponsesRoute(runtime, route)
                 ? { assertCredentialsCurrent: this.#providers.captureInferenceCredentialAuthority(route) } : {})
             };
             active.subtasks.set(subtask.requestId, granted);
@@ -728,7 +731,7 @@ export class ManagedProviderProxy {
     if (request.method !== "POST" || state === undefined || !authorized(request, state.runtime.token)) return fail(response, 403);
     const operation = state.active;
     if (operation === undefined || request.headers["content-encoding"] !== undefined) return fail(response, 409);
-    const suffix = requestSuffix(state.protocol, match![2]!);
+    const suffix = requestSuffix(state.runtime.clientProtocol ?? state.protocol, match![2]!);
     if (suffix === undefined) return fail(response, 404);
     const abort = new AbortController();
     const close = () => abort.abort();
@@ -761,6 +764,13 @@ export class ManagedProviderProxy {
         route = subtask.route;
         maxOutputTokens = subtask.maxOutputTokens;
         signal = AbortSignal.any([operation.abort.signal, subtask.abort.signal, abort.signal]);
+      }
+      if (isClaudeResponsesRoute(state.runtime, route)) {
+        await this.#handleClaudeResponses(response, parsed as Record<string, unknown>, route, suffix, maxOutputTokens, signal, () => {
+          if (subtask === undefined) this.#assertOperation(state, operation);
+          else this.#assertSubtask(state, operation, subtask);
+        });
+        return;
       }
       if (route.api === "openai-completions") {
         await this.#handleChat(response, parsed as Record<string, unknown>, route, signal, () => {
@@ -830,6 +840,51 @@ export class ManagedProviderProxy {
       request.off("aborted", close);
       response.off("close", close);
     }
+  }
+
+  async #handleClaudeResponses(
+    response: ServerResponse, parsed: Record<string, unknown>, route: ProviderInferenceRoute,
+    suffix: string, maxOutputTokens: number | undefined, signal: AbortSignal, assertCurrent: () => void
+  ): Promise<void> {
+    assertCurrent();
+    signal.throwIfAborted();
+    if (suffix === "/count_tokens") {
+      const estimated = estimateClaudeInputTokens(parsed);
+      if (estimated === undefined) { fail(response, 400); return; }
+      response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+      response.end(JSON.stringify({ input_tokens: estimated }));
+      return;
+    }
+    const base = new URL(route.baseUrl.endsWith("/") ? route.baseUrl : `${route.baseUrl}/`);
+    const endpoint = route.requestPath === undefined ? new URL("responses", base) : new URL(route.requestPath, base.origin);
+    if (endpoint.origin !== base.origin) throw unavailable();
+    // Responses reasoning state can only travel back to the exact route that produced it.
+    const signaturePrefix = createHash("sha256").update(JSON.stringify([route.backendId, route.providerId, route.modelId, route.generationId]))
+      .digest("base64url") + "/";
+    let body: string;
+    try {
+      body = JSON.stringify(prepareClaudeResponsesRequest(parsed, {
+        model: route.modelId, signaturePrefix, supportsImages: route.supportsImages, maxOutputTokens
+      }));
+    } catch { fail(response, 400); return; }
+    if (Buffer.byteLength(body, "utf8") > BODY_LIMIT) { fail(response, 413); return; }
+    const headers = new Headers({ "content-type": "application/json", accept: "text/event-stream, application/json" });
+    for (const [name, value] of Object.entries(route.headers)) {
+      if (name.toLowerCase() !== SMART_TOKEN_HEADER) headers.set(name, value);
+    }
+    if (route.authorization !== undefined) headers.set("authorization", route.authorization);
+    assertCurrent();
+    signal.throwIfAborted();
+    const fetchUpstream = this.#fetchForRoute?.(route) ?? this.#fetch;
+    const upstream = await fetchUpstream(endpoint, { method: "POST", headers, body, redirect: "manual", signal });
+    assertCurrent();
+    signal.throwIfAborted();
+    if (!upstream.ok || upstream.body === null) {
+      await upstream.body?.cancel();
+      fail(response, upstream.status >= 400 && upstream.status <= 599 ? upstream.status : 502);
+      return;
+    }
+    await writeClaudeResponse({ upstream, response, model: route.modelId, signaturePrefix, streaming: parsed.stream === true, signal, assertCurrent });
   }
 
   async #handleChat(
@@ -960,6 +1015,10 @@ function requestSuffix(protocol: ProviderRuntimeProtocol, path: string): string 
 
 function codexManagedProtocol(protocol: ProviderRuntimeProtocol): boolean {
   return protocol === "openai-responses" || protocol === "openai-completions";
+}
+
+function isClaudeResponsesRoute(runtime: RuntimeOwner, route: ProviderInferenceRoute): boolean {
+  return runtime.clientProtocol === "anthropic-messages" && route.api === "openai-responses";
 }
 
 function managedOutputLimit(value: number | undefined): number | undefined {
