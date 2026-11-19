@@ -154,6 +154,53 @@ describe("Connect Git Review contracts", () => {
     }
   }, 30_000);
 
+  it("stages the visible and hidden whitespace changes when Review stages the entire file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-connect-review-whitespace-"));
+    const workspaces = new WorkspaceService();
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: root, windowsHide: true, encoding: "utf8" });
+    const path = "notes.txt";
+    const middle = Array.from({ length: 50 }, (_, index) => `stable line ${index + 1}`).join("\n");
+    const before = `state: old\n${middle}\n  indented\n`;
+    const after = `state: current\n${middle}\n    indented\n`;
+    try {
+      git("init", "--quiet");
+      git("config", "core.autocrlf", "false");
+      git("config", "diff.context", "3");
+      await writeFile(join(root, path), before);
+      git("add", "--", path);
+      git("-c", "user.name=Review Test", "-c", "user.email=review@example.test", "commit", "--quiet", "-m", "base");
+      await writeFile(join(root, path), after);
+      await workspaces.register({ id: "workspace-review", root, displayName: "Review", trusted: true });
+      const services = createConnectServices(application({ workspaces, capabilities: ["workspace.diff", "workspace.diff.sources", "workspace.diff.stage"] }));
+      const request = create(contract.GetWorkspaceDiffRequestSchema, {
+        workspaceId: "workspace-review", source: contract.GitDiffSource.UNSTAGED, ignoreWhitespace: true
+      });
+      const { diff } = await services.workspace.getWorkspaceDiff(request, context() as never);
+      const file = diff?.files[0];
+      if (diff === undefined || file === undefined) throw new Error("The filtered change is missing from Review.");
+      expect(file.relativePath).toBe(path);
+      expect(file.hunks).toHaveLength(1);
+
+      const result = await services.operation.submitOperation(create(contract.SubmitOperationRequestSchema, {
+        operationId: "stage-complete-file",
+        connectionId: connection.id,
+        mutation: create(contract.OperationMutationSchema, {
+          payload: { case: "applyWorkspaceDiffHunk", value: create(contract.ApplyWorkspaceDiffHunkMutationSchema, {
+            workspaceId: request.workspaceId, source: request.source, ignoreWhitespace: true,
+            action: contract.WorkspaceDiffAction.STAGE, target: contract.WorkspaceDiffTarget.FILE,
+            relativePath: file.relativePath, expectedRepositoryRevision: diff.repositoryRevision
+          }) }
+        })
+      }), context() as never);
+      expect(result.operation?.result?.payload?.case).toBe("acknowledgement");
+      expect(git("show", `:${path}`)).toBe(after);
+      expect(git("diff", "--", path)).toBe("");
+    } finally {
+      await workspaces.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("lists the conflicted file in a real combined diff without treating it as an ordinary hunk", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-connect-review-conflict-"));
     const workspaces = new WorkspaceService();

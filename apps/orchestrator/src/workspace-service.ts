@@ -1753,13 +1753,14 @@ export class WorkspaceService {
         throw new WorkspaceGitReviewError("Workspace diff is stale; refresh Review and retry.", "stale");
       }
       const layer = input.source === "staged" ? "index" : "workingTree";
-      let raw = await this.#readLayerDiff(workspace, layer, uniquePaths(oldPath, path), input.ignoreWhitespace === true);
+      const ignoreWhitespace = input.target === "hunk" && input.ignoreWhitespace === true;
+      let raw = await this.#readLayerDiff(workspace, layer, uniquePaths(oldPath, path), ignoreWhitespace);
       if (raw === "" && input.target === "file") {
         await this.#applyUntrackedFileMutation(workspace, input.action, path);
         return (await this.#readGitDiff(workspaceId, [], {})).repositoryRevision;
       }
       if (raw === "" && input.source === "unstaged") {
-        raw = await this.#readUntrackedDiff(workspace, [path], input.ignoreWhitespace === true);
+        raw = await this.#readUntrackedDiff(workspace, [path], ignoreWhitespace);
       }
       const filePatch = selectDiffFilePatch(raw);
       const reverse = input.action !== "stage";
@@ -1767,7 +1768,7 @@ export class WorkspaceService {
       const applyArgs = ["apply", "--whitespace=nowarn"];
       if (input.action !== "revert") applyArgs.push("--cached");
       if (reverse) applyArgs.push("--reverse");
-      if (input.ignoreWhitespace === true) applyArgs.push("--ignore-space-change");
+      if (ignoreWhitespace) applyArgs.push("--ignore-space-change");
       try {
         // `git apply` validates the complete patch before updating either the
         // index or worktree; it does not partially apply without `--reject`.
