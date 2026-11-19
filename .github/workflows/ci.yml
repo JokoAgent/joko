@@ -63,6 +63,8 @@ jobs:
       - name: Build the actual service dependency closure
         id: regression_inputs
         shell: bash
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
         run: |
           mkdir -p "$RUNNER_TEMP/orchestrator-regressions"
           pnpm install --frozen-lockfile
@@ -75,6 +77,8 @@ jobs:
       - name: Check service and dependency types
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
         shell: bash
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
         run: pnpm --filter @joko/orchestrator... -r --workspace-concurrency=2 --no-bail --if-present typecheck 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/types.log"
       - name: Check original Worktree lifecycle and retained references
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
