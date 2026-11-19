@@ -55,7 +55,7 @@ afterEach(async ({ task }) => {
   }
 }, 90_000);
 
-packagedIt("applies the saved dark backing when the Windows application starts cold", { timeout: 180_000 }, async () => {
+packagedIt("restores the saved dark backing and maximization when the Windows application starts cold", { timeout: 180_000 }, async () => {
   const first = await launchSettingsDesktop();
   const main = await first.application.firstWindow({ timeout: 60_000 });
   const chooseTheme = async (theme: "light" | "dark") => {
@@ -75,7 +75,23 @@ packagedIt("applies the saved dark backing when the Windows application starts c
   };
   await chooseTheme("light");
   await chooseTheme("dark");
+  const mainWindow = await first.application.browserWindow(main);
+  await mainWindow.evaluate(window => { window.maximize(); });
+  await waitFor(() => mainWindow.evaluate(window => window.isMaximized()), Boolean, "the original Windows maximization");
+  const missingDisplayX = await first.application.evaluate(({ screen }) =>
+    Math.max(...screen.getAllDisplays().map(({ bounds }) => bounds.x + bounds.width)) + 1_000);
   await closeDesktop();
+  const statePath = join(first.profilePath, "window-state.json");
+  const saved = JSON.parse(await readFile(statePath, "utf8")) as {
+    readonly x: number; readonly y: number; readonly width: number; readonly height: number;
+    readonly displayBounds: { readonly width: number; readonly height: number };
+    readonly isMaximized: boolean; readonly isFullScreen: boolean;
+  };
+  expect(saved).toMatchObject({ isMaximized: true, isFullScreen: false });
+  expect(saved.width).toBeGreaterThan(0);
+  expect(saved.height).toBeGreaterThan(0);
+  const unavailableDisplay = { ...saved.displayBounds, x: missingDisplayX, y: 0 };
+  await writeFile(statePath, JSON.stringify({ ...saved, x: missingDisplayX, y: 0, displayBounds: unavailableDisplay }));
   const reopened = await launchSettingsDesktop(first.profilePath);
   const receipt = await waitFor(async () => {
     try { return JSON.parse(await readFile(reopened.startupReceipt, "utf8")) as { readonly backgroundColor?: string }; }
@@ -83,6 +99,12 @@ packagedIt("applies the saved dark backing when the Windows application starts c
   }, value => value?.backgroundColor !== undefined, "the cold Windows window creation receipt");
   expect(receipt?.backgroundColor?.toLowerCase()).toBe("#0d0d0d");
   const page = await reopened.application.firstWindow({ timeout: 60_000 });
+  const reopenedWindow = await reopened.application.browserWindow(page);
+  const placement = await waitFor(() => reopenedWindow.evaluate(window => ({
+    maximized: window.isMaximized(), fullscreen: window.isFullScreen(), bounds: window.getBounds()
+  })), state => state.maximized, "the original Windows window maximized on the available display");
+  expect(placement.fullscreen).toBe(false);
+  expect(placement.bounds.x).toBeLessThan(missingDisplayX);
   expect(await page.evaluate(() => {
     const desktopWindow = (window as Window & { jokoDesktop?: { window?: { startupTheme?: string } } }).jokoDesktop?.window;
     return { theme: document.documentElement.dataset.theme, startup: desktopWindow?.startupTheme };

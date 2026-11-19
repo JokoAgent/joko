@@ -1,6 +1,16 @@
+import { readFileSync } from "node:fs";
 import type { DesktopMainWindowCloseBehavior, DesktopMainWindowCloseSettings } from "./channels.js";
 
 export type TrayHideResult = "hidden" | "unavailable" | "destroyed" | "cancelled";
+
+export function readPersistedMainWindowMaximization(file: string): boolean {
+  try {
+    const saved: unknown = JSON.parse(readFileSync(file, "utf8"));
+    return typeof saved === "object" && saved !== null
+      && "isMaximized" in saved && saved.isMaximized === true
+      && "isFullScreen" in saved && saved.isFullScreen === false;
+  } catch { return false; }
+}
 
 export interface DesktopWindowLifecycleTarget {
   isDestroyed(): boolean;

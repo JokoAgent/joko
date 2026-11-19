@@ -472,6 +472,7 @@ import {
   createDesktopMainWindowCloseController,
   hideWindowToAvailableTray,
   onDesktopWindowClosed,
+  readPersistedMainWindowMaximization,
   showWindowFromTray,
   type DesktopMainWindowCloseController
 } from "./window-lifecycle.js";
@@ -1312,9 +1313,12 @@ function createWindow(): void {
   const frameOptions = process.platform === "darwin"
     ? { titleBarStyle: "hidden" as const, trafficLightPosition: { x: 12, y: 16 } }
     : { frame: false };
+  const savedMaximized = process.platform === "win32"
+    && readPersistedMainWindowMaximization(join(app.getPath("userData"), MAIN_WINDOW_STATE_FILE));
   const mainWindowState = windowStateKeeper({
     defaultWidth: 1280,
-    defaultHeight: 800
+    defaultHeight: 800,
+    file: MAIN_WINDOW_STATE_FILE
   });
   const inspectorWindowState = windowStateKeeper({
     defaultWidth: 520,
@@ -1434,7 +1438,9 @@ function createWindow(): void {
   window.on("restore", () => refreshDedicatedHardwarePrimaryVisibility(window, true));
   window.on("hide", () => refreshDedicatedHardwarePrimaryVisibility(window));
   window.on("minimize", () => refreshDedicatedHardwarePrimaryVisibility(window));
+  const restoreMaximized = savedMaximized && !mainWindowState.isMaximized;
   mainWindowState.manage(window);
+  if (restoreMaximized && !window.isMaximized() && !window.isFullScreen()) window.maximize();
   window.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
     if (isDesktopMainDocumentReplacementNavigation(isMainFrame, isInPlace)) {
       // An attempted navigation is not proof that a replacement Document
