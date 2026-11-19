@@ -26,7 +26,7 @@ import type {
 } from "../model.js";
 import { workspaceDocumentController } from "../workspace-document-controller.js";
 import { useAppShortcut } from "../use-app-shortcut.js";
-import { isEditableWorkspaceConflict, isWorkspaceFileStaleError, type WorkspaceFileSaveDraft } from "./workspace-file-editor.js";
+import { isEditableWorkspaceConflict, isWorkspaceFileStaleError, type WorkspaceFileReconnectDraft, type WorkspaceFileSaveDraft } from "./workspace-file-editor.js";
 import {
   WorkspaceFileEditorPane,
   type WorkspaceFileEditorPaneHandle
@@ -157,6 +157,7 @@ export interface WorkspaceFileBodyProps {
   readonly line?: number | null;
   readonly onSearchJumpConsumed?: () => void;
   readonly onDirtyChange?: (dirty: boolean) => void;
+  readonly reconnectDraft?: WorkspaceFileReconnectDraft;
   readonly onSelectionQuote?: (quote: ComposerFileSelectionQuoteDraft) => void;
   /** Present only when the active task accepts image attachments. */
   readonly onImageToChat?: (file: File) => void | Promise<void>;
@@ -196,6 +197,7 @@ const WorkspaceFileBodyContent = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
   line: jumpLine,
   onSearchJumpConsumed,
   onDirtyChange,
+  reconnectDraft,
   onSelectionQuote,
   onImageToChat,
   labels: labelOverrides,
@@ -638,6 +640,7 @@ const WorkspaceFileBodyContent = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
                   mermaidRenderFailed: labels.mermaidRenderFailed
                 }}
                 onDirtyChange={setEditorDirty}
+                reconnectDraft={reconnectDraft}
                 onSearchStateChange={setDocumentSearchState}
                 selectionQuoteSessionId={onSelectionQuote === undefined ? undefined : sessionId}
                 selectionQuoteLabel={onSelectionQuote === undefined ? undefined : labels.addToChat}

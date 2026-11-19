@@ -54,6 +54,7 @@ import type { PortableSessionImportOwner } from "./portable-session-import-conne
 import { PortableSessionDropTarget } from "./components/PortableSessionDropTarget.js";
 import { SessionSplitView } from "./components/SessionSplitView.js";
 import { WorkspaceFilesRoute } from "./components/WorkspaceFilesRoute.js";
+import type { WorkspaceFileReconnectDraft } from "./components/workspace-file-editor.js";
 import { createInspectorTurnReviewRequest, type InspectorTurnReviewRequest } from "./components/inspector-review-focus.js";
 import { activateDetachedInspectorWindow } from "./components/inspector-detach.js";
 import { requestWorkspaceDocumentLeave } from "./workspace-document-lifecycle.js";
@@ -1260,6 +1261,21 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     && activeTarget !== undefined
     && activeBackend?.capabilities.get("workspace.files")?.supported === true
     && activeWorkspace !== undefined;
+  const filesDraftRef = useRef<{ readonly routeKey: string; readonly workspaceKey: string; readonly buffer: WorkspaceFileReconnectDraft } | undefined>(undefined);
+  const filesProfile = state.activeProfile;
+  const filesRouteKey = state.route.kind === "files" && state.route.file && filesProfile
+    ? JSON.stringify([filesProfile.id, filesProfile.serverId, filesProfile.deviceId, filesProfile.endpointPublicKey ?? filesProfile.origin,
+      state.route.sessionId, state.route.file]) : undefined;
+  if (filesDraftRef.current?.routeKey !== filesRouteKey || state.connectionState === "connected" && !formalFilesMode) {
+    filesDraftRef.current = undefined;
+  }
+  if (filesRouteKey && formalFilesMode && activeSession && activeWorkspace) {
+    const workspaceKey = JSON.stringify([activeSession.id, activeWorkspace.id, activeWorkspace.targetId,
+      activeWorkspace.serverPath, activeWorkspace.remoteWorkspace, activeWorkspace.trusted]);
+    if (filesDraftRef.current?.workspaceKey !== workspaceKey) {
+      filesDraftRef.current = { routeKey: filesRouteKey, workspaceKey, buffer: { current: undefined } };
+    }
+  }
   const activeTimelineHistoryRevision = activeSession === undefined
     ? 0n
     : state.snapshot.timelineHistoryRevisionBySession.get(activeSession.id) ?? 0n;
@@ -2658,6 +2674,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             target={activeTarget!}
             backend={activeBackend!}
             workspace={activeWorkspace!}
+            reconnectDraft={filesDraftRef.current?.buffer}
             sessions={state.snapshot.sessions}
             banners={shellOverlays}
             chatPane={renderActiveSessionPane(true)}

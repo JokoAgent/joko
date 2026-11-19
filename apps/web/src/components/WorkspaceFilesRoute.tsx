@@ -46,6 +46,7 @@ import type { Translator } from "./types.js";
 import { InteractionPromptSlot } from "./InteractionPortal.js";
 import { SidebarFrame, type SidebarFrameProps } from "./SidebarFrame.js";
 import { WorkspaceFileBody } from "./WorkspaceFileBody.js";
+import type { WorkspaceFileReconnectDraft } from "./workspace-file-editor.js";
 import { WorkspaceFileTabsBar } from "./WorkspaceFileTabsBar.js";
 import {
   WorkspaceFilesSidebar,
@@ -88,6 +89,7 @@ export interface WorkspaceFilesRouteProps {
   readonly target: TargetView;
   readonly backend: BackendView;
   readonly workspace: WorkspaceView;
+  readonly reconnectDraft?: WorkspaceFileReconnectDraft;
   readonly sessions: readonly SessionView[];
   readonly banners?: ReactNode;
   readonly chatPane: ReactNode;
@@ -149,6 +151,7 @@ interface FilePreviewState {
 export function WorkspaceFilesRoute({
   controller,
   route,
+  reconnectDraft,
   session,
   target,
   backend,
@@ -943,6 +946,7 @@ export function WorkspaceFilesRoute({
                   loading={selectedPreviewState?.loading ?? selectedPath !== undefined}
                   error={selectedPreviewState?.error}
                   canWrite={canWrite && selectedPreviewState?.preview !== undefined && selectedPreviewState.cached !== true}
+                  reconnectDraft={reconnectDraft}
                   search={route.search}
                   line={route.line}
                   onSearchJumpConsumed={() => navigateFile(selectedPath)}
