@@ -1,7 +1,15 @@
 import { createHash } from "node:crypto";
 import { extname } from "node:path";
 
-import type { AudioArtifactMetadata, BlobRef, PortableNativeSession } from "@joko/core";
+import {
+  redactSecrets,
+  type AudioArtifactMetadata,
+  type BlobRef,
+  type PortableNativeSession,
+  type SubagentActivityEntry,
+  type SubagentChildRun,
+  type SubagentRunDetail
+} from "@joko/core";
 import { operationBodyHash, type OperationalStore, type PersistedEvent } from "@joko/store";
 import { decodeAudioArtwork, inspectAudioArtifact } from "./audio-artifact-media.js";
 
@@ -9,6 +17,7 @@ import {
   createPortableSessionManifest,
   decodePortableSessionPackage,
   encodePortableSessionPackage,
+  MAXIMUM_PORTABLE_SESSION_WORKERS,
   PortableSessionPackageError,
   type PortableSessionFidelity,
   type PortableSessionPackage,
@@ -28,12 +37,23 @@ import {
 
 const DEFAULT_TRANSFER_LIMIT_BYTES = 256 * 1024 * 1024;
 export const PORTABLE_IMPORT_DRAFT_TTL_MS = 10 * 60 * 1_000;
+const PORTABLE_WORKER_ACTIVITY_LIMIT = 512;
+const PORTABLE_WORKER_CHILD_LIMIT = 4_096;
+const WORKER_STATES = ["queued", "running", "completed", "failed", "stopped"] as const;
+const WORKER_ACTIVITY_KINDS = [
+  "started", "progress", "message", "question", "decision", "resumed", "steered",
+  "followed_up", "completed", "failed", "stopped"
+] as const;
 
-export interface PortableCollaborationProjection {
+interface PortableCollaborationEntry {
   readonly format: 1;
   readonly workers: readonly PortableSessionWorker[];
   readonly detail: readonly unknown[];
 }
+
+type ImportedPortableWorkerDetail = Pick<
+  SubagentRunDetail, "activity" | "children" | "returnedResult" | "returnedResultTruncated"
+> & Partial<Pick<SubagentRunDetail, "startedAt" | "updatedAt" | "endedAt" | "assignment" | "summary">>;
 
 export interface PortableMediaMapItem {
   readonly sourceId: string;
@@ -51,7 +71,7 @@ export interface PreparedPortableSessionImport {
   readonly projection: PortableSessionProjection;
   readonly nativeSession?: { readonly bytes: Uint8Array; readonly nativeSessionId?: string };
   readonly media: readonly { readonly sourceId: string; readonly blob: BlobRef; readonly bytes: Uint8Array }[];
-  readonly collaboration?: PortableCollaborationProjection;
+  readonly collaboration?: ReadonlyMap<string, ImportedPortableWorkerDetail>;
 }
 
 export interface MaterializedPortableSessionImport {
@@ -60,7 +80,7 @@ export interface MaterializedPortableSessionImport {
   readonly blobs: readonly BlobRef[];
   readonly events: ReturnType<typeof portableProjectionEventPayloads>;
   readonly nativeSession?: PreparedPortableSessionImport["nativeSession"];
-  readonly collaboration?: PortableCollaborationProjection;
+  readonly collaboration?: PreparedPortableSessionImport["collaboration"];
 }
 
 export interface BuildPortableSessionExportInput {
@@ -184,7 +204,7 @@ export async function buildPortableSessionExport(
       format: 1,
       workers,
       detail: [...(input.workerDetail ?? [])]
-    } satisfies PortableCollaborationProjection), "utf8");
+    } satisfies PortableCollaborationEntry), "utf8");
     entries.push({
       path: "collaboration/workers.json",
       kind: "collaboration",
@@ -396,7 +416,7 @@ function parseMediaMap(entry: PortableSessionPackage["entries"][number]): Portab
 function parseCollaboration(
   entry: PortableSessionPackage["entries"][number],
   manifest: PortableSessionManifest
-): PortableCollaborationProjection {
+): ReadonlyMap<string, ImportedPortableWorkerDetail> {
   if (entry.kind !== "collaboration" || entry.mediaType !== "application/json") {
     throw new Error("Portable Session collaboration entry has the wrong kind.");
   }
@@ -410,7 +430,129 @@ function parseCollaboration(
     || !Array.isArray(value["detail"]) || JSON.stringify(value["workers"]) !== JSON.stringify(manifest.workers ?? [])) {
     throw new Error("Portable Session collaboration projection does not match its manifest.");
   }
-  return { format: 1, workers: manifest.workers ?? [], detail: value["detail"] };
+  const detail = new Map<string, ImportedPortableWorkerDetail>();
+  if (value["detail"].length > MAXIMUM_PORTABLE_SESSION_WORKERS) return detail;
+  const ids = new Set(manifest.workers?.map(worker => worker.id));
+  const seen = new Set<string>();
+  for (const worker of value["detail"]) {
+    if (!isRecord(worker) || typeof worker["id"] !== "string" || !ids.has(worker["id"])) continue;
+    // A repeated detail ID is ambiguous even if its first entry looked valid.
+    if (seen.has(worker["id"])) {
+      detail.delete(worker["id"]);
+      continue;
+    }
+    seen.add(worker["id"]);
+    const activity = parsePortableWorkerActivity(worker["activity"]);
+    const children = parsePortableWorkerChildren(worker["children"]);
+    const returnedResult = portableWorkerText(worker["returnedResult"], 256 * 1024);
+    const assignment = portableWorkerText(worker["assignment"], 64 * 1024);
+    const summary = portableWorkerText(worker["summary"], 64 * 1024);
+    const startedAt = portableWorkerTimestamp(worker["startedAt"]);
+    const updatedAt = portableWorkerTimestamp(worker["updatedAt"]);
+    const endedAt = portableWorkerTimestamp(worker["endedAt"]);
+    detail.set(worker["id"], {
+      activity,
+      ...(children === undefined ? {} : { children }),
+      ...(returnedResult === undefined ? {} : {
+        returnedResult,
+        ...(typeof worker["returnedResultTruncated"] === "boolean" ? { returnedResultTruncated: worker["returnedResultTruncated"] } : {})
+      }),
+      ...(assignment === undefined ? {} : { assignment }),
+      ...(summary === undefined ? {} : { summary }),
+      ...(startedAt === undefined ? {} : { startedAt }),
+      ...(updatedAt === undefined ? {} : { updatedAt }),
+      ...(endedAt === undefined ? {} : { endedAt })
+    });
+  }
+  return detail;
+}
+
+function parsePortableWorkerActivity(value: unknown): readonly SubagentActivityEntry[] {
+  if (!Array.isArray(value)) return [];
+  const activity: SubagentActivityEntry[] = [];
+  let lastSequence = -1;
+  for (const entry of value.slice(-PORTABLE_WORKER_ACTIVITY_LIMIT)) {
+    if (!isRecord(entry)) continue;
+    const sequence = entry["sequence"];
+    const kind = WORKER_ACTIVITY_KINDS.find(kind => kind === entry["kind"]);
+    const state = WORKER_STATES.find(state => state === entry["state"]);
+    const occurredAt = portableWorkerTimestamp(entry["occurredAt"]);
+    if (typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence <= lastSequence
+      || kind === undefined || state === undefined || occurredAt === undefined) continue;
+    const summary = portableWorkerText(entry["summary"], 64 * 1024);
+    const lastToolName = portableWorkerIdentity(entry["lastToolName"]);
+    activity.push({ sequence, kind, state, occurredAt,
+      ...(summary === undefined ? {} : { summary }),
+      ...(lastToolName === undefined ? {} : { lastToolName }) });
+    lastSequence = sequence;
+  }
+  return activity;
+}
+
+function parsePortableWorkerChildren(value: unknown): readonly SubagentChildRun[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const children = new Map<string, SubagentChildRun>();
+  const parents = new Map<string, string>();
+  for (const child of value.slice(0, PORTABLE_WORKER_CHILD_LIMIT)) {
+    if (!isRecord(child)) continue;
+    const id = portableWorkerIdentity(child["id"]);
+    const role = portableWorkerIdentity(child["role"]);
+    const state = WORKER_STATES.find(state => state === child["state"]);
+    if (id === undefined || role === undefined || state === undefined || children.has(id)) continue;
+    const title = portableWorkerText(child["title"], 4 * 1024);
+    const assignment = portableWorkerText(child["assignment"], 64 * 1024);
+    const result = portableWorkerText(child["result"], 256 * 1024);
+    const startedAt = portableWorkerTimestamp(child["startedAt"]);
+    const endedAt = portableWorkerTimestamp(child["endedAt"]);
+    children.set(id, {
+      id, role, identityAliases: [], readOnly: true,
+      state: state === "queued" || state === "running" ? "stopped" : state,
+      ...(title === undefined ? {} : { title }),
+      ...(assignment === undefined ? {} : { assignment }),
+      ...(result === undefined ? {} : {
+        result,
+        ...(typeof child["resultTruncated"] === "boolean" ? { resultTruncated: child["resultTruncated"] } : {})
+      }),
+      ...(startedAt === undefined ? {} : { startedAt }),
+      ...(endedAt === undefined || (startedAt !== undefined && endedAt < startedAt) ? {} : { endedAt })
+    });
+    const parentId = portableWorkerIdentity(child["parentChildId"]);
+    if (parentId !== undefined) parents.set(id, parentId);
+  }
+  // Keep only acyclic parent links between the children included in this worker.
+  const checked = new Set<string>();
+  for (const id of children.keys()) {
+    const path = new Set<string>();
+    let cursor: string | undefined = id;
+    while (cursor !== undefined && children.has(cursor) && !checked.has(cursor) && !path.has(cursor)) {
+      path.add(cursor);
+      cursor = parents.get(cursor);
+    }
+    if (cursor !== undefined && path.has(cursor)) parents.delete(cursor);
+    for (const childId of path) checked.add(childId);
+  }
+  return [...children.values()].map(child => {
+    const parent = parents.get(child.id);
+    return parent === undefined || !children.has(parent) ? child : { ...child, parentChildId: parent };
+  });
+}
+
+function portableWorkerText(value: unknown, limit: number): string | undefined {
+  return typeof value === "string" && value.length <= limit && !value.includes("\u0000")
+    ? redactSecrets(value).slice(0, limit)
+    : undefined;
+}
+
+function portableWorkerIdentity(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length > 512 || !value.trim()
+    || /[\u0000-\u001f\u007f]/u.test(value) || redactSecrets(value) !== value) return undefined;
+  return value;
+}
+
+function portableWorkerTimestamp(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= 253_402_300_799_999
+    ? value
+    : undefined;
 }
 
 function parseBlob(value: unknown): BlobRef {

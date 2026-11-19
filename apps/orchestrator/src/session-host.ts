@@ -12268,12 +12268,20 @@ export class SessionHost {
               }
             });
           });
+          const exportedAt = Date.parse(materialized.manifest.exportedAt);
+          const at = Number.isFinite(exportedAt) && exportedAt >= 0 ? exportedAt : now;
           for (const [index, worker] of (materialized.manifest.workers ?? []).entries()) {
             const workerId = stableId("imported-worker", `${sessionId}\0${worker.id}`);
             const state = importedSubagentState(worker.state);
-            const at = Number.isFinite(Date.parse(materialized.manifest.exportedAt))
-              ? Date.parse(materialized.manifest.exportedAt)
-              : now;
+            const detail = materialized.collaboration?.get(worker.id);
+            const childId = (sourceId: string) => stableId("imported-worker-child", `${workerId}\0${sourceId}`);
+            const children = detail?.children?.map(child => ({
+              ...child,
+              id: childId(child.id),
+              ...(child.parentChildId === undefined ? {} : { parentChildId: childId(child.parentChildId) })
+            }));
+            const startedAt = detail?.startedAt ?? at;
+            const updatedAt = Math.max(startedAt, detail?.updatedAt ?? at, detail?.endedAt ?? 0);
             store.appendEvent({
               backendId: descriptor.backendId,
               targetId: descriptor.targetId,
@@ -12285,17 +12293,19 @@ export class SessionHost {
               payload: {
                 type: "subagent_run",
                 run: {
+                  ...detail,
                   id: workerId,
                   sessionId,
                   logicalAgentId: workerId,
-                  identityAliases: [worker.id],
+                  identityAliases: /[\u0000-\u001f\u007f]/u.test(worker.id) || containsRecognizedCredential(worker.id) ? [] : [worker.id],
                   providerRunIds: [],
                   state,
-                  title: worker.title,
-                  ...(worker.label === undefined ? {} : { description: worker.label }),
+                  title: redactSecrets(worker.title),
+                  ...(worker.label === undefined ? {} : { description: redactSecrets(worker.label) }),
+                  readOnly: true,
                   capabilities: {
                     viewActivity: true,
-                    viewReturnedResult: false,
+                    viewReturnedResult: detail?.returnedResult !== undefined || children?.some(child => child.result !== undefined) === true,
                     viewFullTranscript: false,
                     stop: false,
                     steer: false,
@@ -12303,10 +12313,11 @@ export class SessionHost {
                     resume: false,
                     parentContext: "snapshot"
                   },
-                  startedAt: at,
-                  updatedAt: at,
-                  ...(state === "completed" || state === "failed" || state === "stopped" ? { endedAt: at } : {}),
-                  activity: []
+                  startedAt,
+                  updatedAt,
+                  endedAt: Math.max(startedAt, detail?.endedAt ?? updatedAt),
+                  activity: detail?.activity ?? [],
+                  ...(children === undefined ? {} : { children })
                 }
               },
               metadata: {

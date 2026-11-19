@@ -150,11 +150,37 @@ describe("portable Session export composition", () => {
         focused: false,
         backendCapability: "managed-subagent-v1"
       }],
-      workerDetail: [{ id: "worker", result: "done" }],
+      workerDetail: [{ id: "worker", returnedResult: "done" }],
       readBlob: async () => { throw new Error("unused"); }
     });
     expect(built).toMatchObject({ fidelity: "partial", workerCount: 1 });
     expect(decodePortableSessionPackage(built.bytes).entries.some((entry) => entry.kind === "collaboration")).toBe(true);
+    expect(preparePortableSessionImport(built.bytes).collaboration?.get("worker"))
+      .toEqual({ activity: [], returnedResult: "done" });
+  });
+
+  it("restores detail only for unambiguous Worker identities declared by the original manifest", async () => {
+    const built = await buildPortableSessionExport({
+      applicationVersion: "0.1.0",
+      title: "Task",
+      workspaceKind: "project",
+      backendCapability: "native-portable-session-v1",
+      events: [],
+      nativeSession: nativeSession("{}\n"),
+      workers: ["worker-one", "worker-two", "summary-only"].map(id => ({
+        id, title: id, state: "completed", focused: false, backendCapability: "managed-subagent-v1"
+      })),
+      workerDetail: [
+        { id: "worker-one", returnedResult: "Original result" },
+        { id: "worker-two", returnedResult: "First observation" },
+        { id: "another-worker", returnedResult: "Unrelated result" },
+        { id: "worker-two", returnedResult: "Second observation" }
+      ],
+      readBlob: async () => { throw new Error("unused"); }
+    });
+    const prepared = preparePortableSessionImport(built.bytes);
+    expect(prepared.manifest.workers?.map(worker => worker.id)).toEqual(["worker-one", "worker-two", "summary-only"]);
+    expect(prepared.collaboration).toEqual(new Map([["worker-one", { activity: [], returnedResult: "Original result" }]]));
   });
 
   it("reports bounded oversize details before package materialization", async () => {

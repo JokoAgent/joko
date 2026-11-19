@@ -1,12 +1,153 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { BlobDisposition, PermissionMode, type BlobRef } from "@joko/contracts";
+import { create } from "@bufbuild/protobuf";
+import { Code, createClient } from "@connectrpc/connect";
+import { createConnectTransport } from "@connectrpc/connect-node";
+import {
+  BlobDisposition,
+  ControlSubagentMutationSchema,
+  OperationMutationSchema,
+  OperationState,
+  PermissionMode,
+  PortableSessionFidelity,
+  SubagentControlAction,
+  SubagentRunState,
+  SubagentService,
+  capabilityNames,
+  type BlobRef
+} from "@joko/contracts";
 import type { ImportPortableNativeSessionInput, NativeSessionBinding, PortableNativeSession } from "@joko/core";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { expect, it, vi } from "vitest";
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture } from "./fixture.js";
 import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
+
+it("restores portable worker results and activity on a separate node without granting native controls", async () => {
+  let nativeControls = 0;
+  class PortableAdapter extends InstrumentedFakeAdapter {
+    async exportPortableNativeSession(): Promise<PortableNativeSession> {
+      const bytes = Buffer.from('{"type":"session","id":"portable-worker-session"}\n');
+      return { bytes, sha256: createHash("sha256").update(bytes).digest("hex"), nativeSessionId: "portable-worker-session" };
+    }
+
+    async importPortableNativeSession(input: ImportPortableNativeSessionInput, signal: AbortSignal): Promise<NativeSessionBinding> {
+      signal.throwIfAborted();
+      return { opaqueRef: `fake://${this.id}/portable/${randomUUID()}`, nativeSessionId: randomUUID(), generation: input.generation };
+    }
+
+    async controlSubagent(): Promise<void> {
+      nativeControls += 1;
+    }
+  }
+  const options = (id: string) => ({
+    profiles: [{ ...PI_LIKE_PROFILE, id, capabilities: [...PI_LIKE_PROFILE.capabilities,
+      ...["session.portable_transfer", capabilityNames.subagentsList, capabilityNames.subagentsDetail,
+        capabilityNames.subagentsTranscript, capabilityNames.subagentsStop].map(key => ({ key, supported: true }))
+    ] }],
+    createAdapter: (profile: typeof PI_LIKE_PROFILE) => new PortableAdapter(profile)
+  });
+  const source = await OrchestratorE2eFixture.start(options("portable-worker-source"));
+  const workerId = "original-worker";
+  let bytes: ArrayBuffer;
+  let sourceId: string;
+  try {
+    const paired = await source.pair();
+    const backendId = source.adapter().id;
+    const targetId = source.targetId();
+    sourceId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId, createSessionMutation({ backendId, targetId })));
+    const { store } = source.application;
+    const generation = store.getSession(sourceId).descriptor.binding.generation;
+    store.appendEvent({
+      backendId, targetId, sessionId: sourceId, generation, traceId: "observed-original-worker",
+      payload: { type: "subagent_run", run: {
+        id: workerId, sessionId: sourceId, logicalAgentId: "source-identity", parentTaskId: "source-task",
+        identityAliases: ["source-alias"], providerRunIds: ["source-native-worker"], title: "Check documentation",
+        state: "completed", readOnly: false, startedAt: 1000, updatedAt: 4000, endedAt: 4000,
+        capabilities: { viewActivity: true, viewReturnedResult: true, viewFullTranscript: true, stop: true,
+          steer: true, followUp: true, resume: true, parentContext: "live" },
+        returnedResult: "Reviewed all three sections.", returnedResultTruncated: true,
+        activity: [
+          { sequence: 1, kind: "started", state: "running", summary: "Began review.", occurredAt: 1000 },
+          { sequence: 3, kind: "completed", state: "completed", summary: "Review complete.", occurredAt: 4000 }
+        ],
+        children: [
+          { id: "source-child", identityAliases: ["source-native-child"], role: "reviewer", state: "completed", result: "Reviewed the appendix." },
+          { id: "source-child-nested", parentChildId: "source-child", identityAliases: [], role: "reviewer",
+            state: "running", awaitingApproval: true, readOnly: false }
+        ]
+      } }
+    });
+    const exported = await paired.clients.portableSession.exportPortableSession({ sessionId: sourceId });
+    expect(exported).toMatchObject({ workerCount: 1n, fidelity: PortableSessionFidelity.PARTIAL });
+    const download = (await paired.clients.artifact.getBlobDownloadTicket({ blobId: exported.artifact!.blobId })).ticket!;
+    const response = await fetch(`${source.baseUrl}${download.relativeEndpoint}`, { headers: { authorization: `Bearer ${paired.authKey}` } });
+    expect(response.status).toBe(200);
+    bytes = await response.arrayBuffer();
+  } finally {
+    await source.close({ removeRoot: true });
+  }
+
+  const receiver = await OrchestratorE2eFixture.start(options("portable-worker-receiver"));
+  try {
+    const paired = await receiver.pair();
+    const targetId = receiver.targetId();
+    const pending = (await paired.clients.artifact.beginBlobUpload({
+      fileName: "workers.jshare", mediaType: "application/vnd.joko.session", disposition: BlobDisposition.PORTABLE_IMPORT,
+      byteSize: BigInt(bytes.byteLength), sha256Hex: createHash("sha256").update(new Uint8Array(bytes)).digest("hex")
+    })).upload!;
+    const response = await fetch(`${receiver.baseUrl}${pending.ticket!.relativeEndpoint}`, { method: "PUT", body: bytes,
+      headers: { authorization: `Bearer ${paired.authKey}`, "content-type": "application/octet-stream" } });
+    expect(response.status).toBe(201);
+    const blob = (await paired.clients.artifact.completeBlobUpload({ uploadId: pending.uploadId })).blob!;
+    const draft = (await paired.clients.portableSession.inspectPortableSessionImport({ package: blob })).draft!;
+    const commit = { operationId: randomUUID(), draftId: draft.draftId, targetId, permissionMode: PermissionMode.ASK };
+    const imported = (await paired.clients.portableSession.commitPortableSessionImport(commit)).result!;
+    expect(imported).toMatchObject({ workerCount: 1n, fidelity: PortableSessionFidelity.PARTIAL });
+    const sessionId = imported.sessionId;
+    expect(sessionId).not.toBe(sourceId);
+    const client = createClient(SubagentService,
+      createConnectTransport({ baseUrl: receiver.baseUrl, httpVersion: "1.1", useBinaryFormat: true, defaultTimeoutMs: 10_000 }));
+    const auth = { headers: { authorization: `Bearer ${paired.authKey}` } };
+    const list = await client.listSubagentRuns({ sessionId }, auth);
+    expect(list.runs).toHaveLength(1);
+    const subagentRunId = list.runs[0]!.subagentRunId;
+    expect(subagentRunId).not.toBe(workerId);
+    const detail = (await client.getSubagentRun({ sessionId, subagentRunId }, auth)).run!;
+    expect(detail).toMatchObject({
+      run: { sessionId, state: SubagentRunState.COMPLETED, title: "Check documentation", readOnly: true, providerRunIds: [],
+        parentTaskId: "", logicalAgentId: subagentRunId, capabilities: {
+          viewActivity: true, viewReturnedResult: true, viewFullTranscript: false, stop: false, steer: false, followUp: false, resume: false
+        } },
+      returnedResult: "Reviewed all three sections.", returnedResultTruncated: true,
+      activity: [{ sequence: 1n, summary: "Began review." }, { sequence: 3n, summary: "Review complete." }],
+      children: [
+        { result: "Reviewed the appendix.", readOnly: true, identityAliases: [] },
+        { state: SubagentRunState.STOPPED, readOnly: true, identityAliases: [] }
+      ]
+    });
+    const [parent, child] = detail.children;
+    expect(parent?.childId).not.toBe("source-child");
+    expect(child?.childId).not.toBe("source-child-nested");
+    expect(child?.parentChildId).toBe(parent?.childId);
+    expect(child?.awaitingApproval).toBeUndefined();
+    const store = receiver.application.store;
+    expect(store.getSessionSubagentRun(sessionId, subagentRunId)?.event).toMatchObject({
+      backendId: receiver.adapter().id, targetId, sessionId, operationId: commit.operationId
+    });
+    await expect(client.listSubagentTranscript({ sessionId, subagentRunId }, auth)).rejects.toMatchObject({ code: Code.Unimplemented });
+    await expect(submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
+      payload: { case: "controlSubagent",
+        value: create(ControlSubagentMutationSchema, { sessionId, subagentRunId, action: SubagentControlAction.STOP }) }
+    }))).resolves.toMatchObject({ state: OperationState.FAILED, error: { code: "SUBAGENT_ACTION_UNAVAILABLE" } });
+    expect(nativeControls).toBe(0);
+    await expect(paired.clients.portableSession.commitPortableSessionImport(commit))
+      .resolves.toMatchObject({ replayed: true, result: { sessionId, workerCount: 1n } });
+    expect((await client.listSubagentRuns({ sessionId }, auth)).runs).toHaveLength(1);
+  } finally {
+    await receiver.close({ removeRoot: true });
+  }
+});
 
 it("expires unused portable input uploads across restart while preserving previews, imported receipts and permanent copies", async () => {
   const realNow = Date.now;
