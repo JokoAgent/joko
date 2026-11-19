@@ -51,29 +51,39 @@ interface Props {
   readonly resourceText?: string;
   readonly onOpenImage?: (leaseId: string, key: string) => void;
   readonly onOpenPath?: (leaseId: string, key: string) => void;
+  readonly onRetryPath?: (messageId: string, text: string, key: string) => void;
   readonly onAnnotateDiagram?: (image: MobileImageOutputSource) => void;
 }
 
 export const MobileMarkdownMessage = memo(function MobileMarkdownMessage(props: Props) {
-  const resources = useMobileMarkdownResources({ client: props.resourceClient, ownerKey: props.resourceOwnerKey,
-    messageId: props.messageId, text: props.resourceText ?? props.text });
+  const { messageId, resourceClient, resourceOwnerKey, onRetryPath } = props;
+  const resourceText = props.resourceText ?? props.text;
+  const resources = useMobileMarkdownResources({ client: resourceClient, ownerKey: resourceOwnerKey,
+    messageId, text: resourceText });
   const parts = useMemo(() => props.answerStateKey === undefined ? [] : splitRichAnswer(props.text), [props.answerStateKey, props.text]);
   if (props.quoteAction !== undefined && !props.streaming && props.selectable !== false) {
     return <MobileSelectableMessageText text={props.text} ink={props.colors.ink} lineHeight={23} action={props.quoteAction} />;
   }
-  if (!parts.some(part => part.kind === "rich")) return <MobilePlainMarkdownMessage {...props} preparedResources={resources} />;
+  const retryPath = onRetryPath && messageId && resourceClient && resourceOwnerKey ? (key: string) => {
+    if (resourceClient.markdownResourceOwnerKey() === resourceOwnerKey) onRetryPath(messageId, resourceText, key);
+  } : undefined;
+  const plainProps = { ...props, preparedResources: resources, retryPath };
+  if (!parts.some(part => part.kind === "rich")) return <MobilePlainMarkdownMessage {...plainProps} />;
   return <View style={styles.document}>{parts.map(part => part.kind === "rich"
     ? <MobileRichAnswer key={part.key} source={part.source} complete={part.complete || !props.streaming}
       stateKey={JSON.stringify([props.answerStateKey, part.key])} colors={props.colors} locale={props.locale}
       onSend={props.onSendRichAnswer}
       renderMedia={node => <MobileRichAnswerMedia key={JSON.stringify([part.key, node.id, node.props["src"]])} node={node} colors={props.colors} locale={props.locale} resources={resources}
-        fallback={text => <MobilePlainMarkdownMessage {...props} text={text} preparedResources={resources} />} />}
-      renderMarkdown={(text, id) => <MobilePlainMarkdownMessage {...props} key={id} text={text} preparedResources={resources} />} />
-    : <MobilePlainMarkdownMessage {...props} key={part.key} text={part.source} preparedResources={resources} />)}</View>;
+        fallback={text => <MobilePlainMarkdownMessage {...plainProps} text={text} />} />}
+      renderMarkdown={(text, id) => <MobilePlainMarkdownMessage {...plainProps} key={id} text={text} />} />
+    : <MobilePlainMarkdownMessage {...plainProps} key={part.key} text={part.source} />)}</View>;
 });
 
 const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ text, colors, locale, ownerKey, selectable = true,
-  preparedResources: resources, onOpenImage, onOpenPath, onAnnotateDiagram }: Props & { readonly preparedResources?: MobileMarkdownResourceDescriptor }) {
+  preparedResources: resources, onOpenImage, onOpenPath, retryPath, onAnnotateDiagram }: Props & {
+    readonly preparedResources?: MobileMarkdownResourceDescriptor;
+    readonly retryPath?: (key: string) => void;
+  }) {
   const previewMail = useMobileMailLink();
   const previous = useRef<MobileMarkdownParseResult | null>(null);
   const parsed = useMemo(() => parseMobileMarkdownIncremental(text, previous.current), [text]);
@@ -148,8 +158,10 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
     const value = inline.type === "image" ? inline.alt || mobileMessage(locale, "markdown.image")
       : inline.type === "math" ? latexToUnicodeApproximation(inline.text) : inline.text;
     const external = inline.type === "link" && /^(?:https?:\/\/|joko:\/\/(?:task|session|project)\/)/iu.test(inline.url);
-    const actionablePath = inline.type !== "image" ? openPath : undefined;
-    const pathCandidate = inline.type === "link" && actionablePath ? classifyChatPathLinkTarget(inline.url) : undefined;
+    const pathCandidate = inline.type === "link" && !inline.bare && (openPath || retryPath) ? classifyChatPathLinkTarget(inline.url) : undefined;
+    const actionablePath = inline.type !== "image"
+      ? openPath ?? (key && pathCandidate && retryPath ? () => retryPath(key) : undefined)
+      : undefined;
     const codeReference = inline.type === "code" || inline.type === "link" && !inline.bare && pathCandidate
       && chatPathLabelReadsAsFileReference(inline.text, pathCandidate, inline.url);
     const struck = mobileMarkdownInlineHasMark(inline, "strikethrough");

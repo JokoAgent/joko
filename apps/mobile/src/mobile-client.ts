@@ -8853,6 +8853,14 @@ export class MobileClient {
     return this.#markdownResources.prepare(this.newId(), text, this.#markdownResourceContext(messageId, text), signal);
   }
 
+  async openUnresolvedMarkdownPath(messageId: string, text: string, key: string, signal: AbortSignal): Promise<MobileFilesComposerSource | undefined> {
+    const prepared = await this.#markdownResources.prepare(this.newId(), text, this.#markdownResourceContext(messageId, text), signal, key);
+    try {
+      if (!prepared.references.has(key)) throw new Error("The message path is unavailable.");
+      return await this.openMarkdownPath(prepared.leaseId, key, signal);
+    } finally { this.#markdownResources.release(prepared.leaseId); }
+  }
+
   async openQuestionReference(interactionId: string, href: string, signal: AbortSignal): Promise<
     { readonly kind: "external"; readonly url: string } | { readonly kind: "workspace"; readonly source?: MobileFilesComposerSource }
   > {

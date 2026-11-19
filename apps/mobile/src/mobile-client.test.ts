@@ -14944,6 +14944,43 @@ describe("native current-task Files ownership", () => {
     expect(network.readWorkspaceFile).not.toHaveBeenCalled(); expect(network.submit).not.toHaveBeenCalled();
   });
 
+  it("opens the same explicit Markdown path at line seven after one directory read fails", async () => {
+    const text = "[指南](./docs/guide.md:7)";
+    const key = JSON.stringify(["link", "./docs/guide.md:7"]);
+    const event = create(EventSchema, { eventId: messageEvent.eventId, identity: messageEvent.identity, cursor: messageEvent.cursor,
+      payload: { kind: { case: "messageCompleted", value: { messageId: "markdown-completed", role: MessageRole.ASSISTANT,
+        blocks: [{ content: { case: "text", value: text } }] } } } });
+    const network = fakeNetwork();
+    configureFiles(network, create(SnapshotSchema, { ...filesSnapshot, timeline: [event], resumeCursor: event.cursor,
+      workspaces: [create(WorkspaceDescriptorSchema, { ...filesSnapshot.workspaces[0]!, serverPathDisplay: "D:\\repo" })] }));
+    const content = "1\n2\n3\n4\n5\n6\n7\n";
+    const guide = create(WorkspaceEntrySchema, { ...readme, relativePath: "docs/guide.md", displayName: "guide.md",
+      revision: { ...revision, byteSize: BigInt(content.length) } });
+    const list = vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspace, path) => ({
+      entries: path === "docs" ? [guide] : [], revision: `directory:${path}`
+    }));
+    vi.mocked(network.readAround).mockResolvedValue([event]);
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, { entry: guide,
+      content: { case: "text", value: { utf8Text: content, startByte: 0n, endByte: BigInt(content.length), totalLines: 8 } } }));
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    list.mockClear().mockRejectedValueOnce(new Error("Temporary directory read failure"));
+    const signal = new AbortController().signal;
+    const first = await app.prepareMarkdownResources("markdown-completed", text, signal);
+    expect(first.references.size).toBe(0);
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(app.state.files.open).toBe(false);
+
+    await expect(app.openUnresolvedMarkdownPath("markdown-completed", text, JSON.stringify(["link", "./docs/other.md:7"]), signal))
+      .rejects.toThrow(/path is unavailable/u);
+    expect(list).toHaveBeenCalledTimes(1);
+    await expect(app.openUnresolvedMarkdownPath("markdown-completed", text, key, signal))
+      .resolves.toMatchObject({ kind: "workspace-entry", entry: guide });
+    expect(list).toHaveBeenLastCalledWith(credential, "workspace", "docs", expect.any(AbortSignal));
+    expect(network.readWorkspaceFile).toHaveBeenCalledWith(credential, "workspace", guide.relativePath, guide.revision, expect.any(AbortSignal));
+    expect(app.state.files.preview).toMatchObject({ kind: "text", text: content, focusLine: 7 });
+    app.dispose();
+  });
+
   it("rejects spoofed Markdown text and server-deleted messages before any path opens", async () => {
     const event = create(EventSchema, { eventId: messageEvent.eventId, identity: messageEvent.identity, cursor: messageEvent.cursor,
       payload: { kind: { case: "messageCompleted", value: {
