@@ -116,6 +116,13 @@ interface PendingComposerDraftSave {
   queued: boolean;
 }
 
+export interface ComposerSelectionQuoteInsertion {
+  readonly id: number;
+  readonly sessionId: string;
+  readonly quotes: readonly ComposerSelectionQuoteDraft[];
+  readonly onApplied?: () => void;
+}
+
 export function Composer({ controller, session, backend, sessionUsage, readOnly: taskReadOnly = false, autoFocus = true, focusRequest, queue, queueControl, workspace, extraDirectories, resources, artifacts, sessions, commands, messageHistory, controls, runningStatus, messageMentionInsertion, selectionQuoteInsertion, attachmentInsertion, rewindDraftRef, rewindDraftContinuation, objectiveDialogHandoff, t, runAction, onLocalSend, onDraftMutation, onOpenObjective, onObjectiveDialogHandoffRejected, onStop, stopInFlight = false, onCompact }: {
   readonly controller: AppController;
   readonly session: SessionView;
@@ -138,7 +145,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   readonly controls?: ReactNode;
   readonly runningStatus?: ReactNode;
   readonly messageMentionInsertion?: { readonly id: number; readonly sessionId: string; readonly mention: ComposerMessageMentionDraft; readonly inline?: ComposerRouteReferenceAttrs };
-  readonly selectionQuoteInsertion?: { readonly id: number; readonly sessionId: string; readonly quotes: readonly ComposerSelectionQuoteDraft[] };
+  readonly selectionQuoteInsertion?: ComposerSelectionQuoteInsertion;
   readonly attachmentInsertion?: { readonly id: number; readonly sessionId: string; readonly file: File };
   readonly rewindDraftRef?: RefObject<PrepareRewindDraft | null>;
   readonly rewindDraftContinuation?: RewindDraftContinuation;
@@ -869,6 +876,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
       readOnly
       || selectionQuoteInsertion === undefined
       || selectionQuoteInsertion.sessionId !== session.id
+      || hydratedSession !== session.id
+      || hydratedDraftOwnerRef.current !== voiceDictionaryOwnerKey
       || appliedSelectionQuoteInsertionRef.current === selectionQuoteInsertion.id
     ) return;
     appliedSelectionQuoteInsertionRef.current = selectionQuoteInsertion.id;
@@ -887,8 +896,9 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     setText(nextText);
     replaceInlineMentionRanges(nextRanges);
     setMentions((current) => composerMentionsFromRanges(current, nextRanges));
+    selectionQuoteInsertion.onApplied?.();
     requestComposerFrame(() => richEditorRef.current?.focus());
-  }, [selectionQuoteInsertion, readOnly, session.id]);
+  }, [selectionQuoteInsertion, readOnly, hydratedSession, voiceDictionaryOwnerKey, session.id, editorDocument]);
 
   useImperativeHandle(rewindDraftRef, (): PrepareRewindDraft => async (isRewindCurrent, onPreparedRevision) => {
     const sourceController = controllerRef.current;

@@ -19353,7 +19353,10 @@ export class OperationalStore {
       let costMicros = 0;
       let costComplete = true;
       let estimated = false;
-      if (reportedCostMicros !== undefined && prior === undefined) {
+      const emptyTokenBaseline = prior === undefined || [
+        "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "total_tokens"
+      ].every(key => numberValue(prior[key]) === 0);
+      if (reportedCostMicros !== undefined && priorReported == null && emptyTokenBaseline) {
         costMicros = reportedCostMicros;
         estimated = input.reportedCostEstimated === true;
       } else if (reportedCostMicros !== undefined && priorReported !== null && priorReported !== undefined) {

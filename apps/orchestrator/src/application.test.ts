@@ -377,6 +377,8 @@ describe("Orchestrator application composition", () => {
         }
       }, {
         id: "owned-backend",
+        adapterKind: "pi",
+        models: [],
         capabilities: managedCatalog
           ? new Map([["provider.managed_catalog", { key: "provider.managed_catalog", supported: true }]])
           : new Map()

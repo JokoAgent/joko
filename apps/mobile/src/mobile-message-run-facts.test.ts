@@ -37,3 +37,34 @@ it("rebuilds model and usage facts from the exact assistant completion without i
   }
   expect(mobileMessageRunFacts({ ...row, modelSubstitution: { selectedModelId: "model", actualModelId: "model" } }, "en").modelNotice).toBeUndefined();
 });
+
+it("shows an explicitly complete zero cost separately from an unpriced completion with the same tokens", () => {
+  const events = [false, true].map((costComplete, index) => {
+    const eventId = `complete-${index}`;
+    const messageId = `answer-${index}`;
+    return create(EventSchema, {
+      eventId,
+      identity: { sessionId: "task", runId: `run-${index}` },
+      cursor: { sequence: BigInt(index + 1), generation: 1n },
+      payload: { kind: { case: "messageCompleted", value: {
+        messageId,
+        role: MessageRole.ASSISTANT,
+        blocks: [{ content: { case: "text", value: "Done" } }],
+        turnUsage: {
+          usage: { inputTokens: 800n, outputTokens: 200n, totalTokens: 1_000n, costMicros: 0n, currencyCode: "USD" },
+          costComplete,
+          tokensComplete: true,
+          completionEventId: eventId,
+          messageId
+        }
+      } } }
+    });
+  });
+  const [unpriced, zero] = timelineRows(events);
+  expect(mobileMessageRunFacts(unpriced!, "en")).toMatchObject({
+    usageLabel: "1K tokens", usageDescription: "Tokens this turn: 1K; cost unavailable"
+  });
+  expect(mobileMessageRunFacts(zero!, "en")).toMatchObject({
+    usageLabel: "$0.00", usageDescription: "Cost this turn: $0.00"
+  });
+});

@@ -12,6 +12,7 @@ import {
   BlobRefSchema,
   CompactSessionOutcome,
   CompactionState,
+  CredentialKind,
   EntityKind,
   InstallationState,
   InputPartSchema,
@@ -28,6 +29,9 @@ import {
   PortableReplacementWorktreeState,
   PortableSessionFidelity,
   PortableSessionImportStatus,
+  ProviderApiCompatibility,
+  ProviderConfigurationSchema,
+  ProviderKind,
   QueueDeliveryMode,
   ResourceAcquisitionSourceSchema,
   ResourceKind,
@@ -41,7 +45,8 @@ import {
   SessionSnapshotScopeSchema,
   SessionState,
   SnapshotScopeSchema,
-  StateImpact
+  StateImpact,
+  UsageReportGroup
 } from "@joko/contracts";
 import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD, type BlobRef } from "@joko/core";
 import { buildPortableSessionExport, preparePortableSessionImport } from "@joko/orchestrator";
@@ -128,6 +133,57 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     const usage = (await reconnected.run.getRun({ runId })).run?.usage;
     expect(usage?.completionEventId).toBe(completion?.eventId);
     expect(usage?.usage?.totalTokens).toBe(10n);
+  });
+
+  it("labels the next native Pi charge as an estimate when the custom API only returns token counts", { timeout: 120_000 }, async () => {
+    fixture = await RealPiSystemFixture.start({ providerUsage: { promptTokens: 1_000, completionTokens: 1_000 } });
+    const { clients, connectionId, authKey } = await fixture.pair("Pi local model cost owner");
+    const providers = fixture.application.providers!, credentials = fixture.application.credentials!;
+    const endpoint = providers.get("pi", REAL_PI_PROVIDER_ID).provider.baseUrl!;
+    const providerId = "user-priced-pi", modelId = "user-price-reference", credentialReferenceId = "cred_pi_price_fixture";
+    const ticket = credentials.createUploadTicket({ kind: "api_key", connectionId });
+    credentials.upload(ticket.credentialUploadTicketId, "test-only-pi-price-key", connectionId);
+    const storedKey = await submit(clients.operation, connectionId, create(OperationMutationSchema, { payload: { case: "commitCredential", value: {
+      credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId, displayName: "Local fixture key", kind: CredentialKind.API_KEY
+    } } }));
+    expect(storedKey.state).toBe(OperationState.SUCCEEDED);
+    const provider = create(ProviderConfigurationSchema, { providerId, kind: ProviderKind.API_KEY, enabled: true, displayName: "Custom fixture Provider",
+      version: { revision: { value: 0n } }, runtimes: [{ backendId: "pi", endpoint, credentialOrigin: new URL(endpoint).origin,
+        apiCompatibility: ProviderApiCompatibility.OPENAI_COMPLETIONS, credentialReferenceId, apiKeyEnvironment: "JOKO_PI_PRICE_FIXTURE_KEY",
+        authHeader: true, models: [{ modelId, displayName: "Locally priced model", contextWindowTokens: 32_000n, maximumOutputTokens: 4_096n,
+          inputCostMicrosPerMillion: 10_000_000n, outputCostMicrosPerMillion: 20_000_000n }] }] });
+    const configured = await submit(clients.operation, connectionId, create(OperationMutationSchema, { payload: { case: "upsertProvider", value: { provider } } }));
+    expect(configured.state).toBe(OperationState.SUCCEEDED);
+    expect(providers.get("pi", providerId).provider.models.find(model => model.id === modelId)?.cost)
+      .toMatchObject({ input: 10, output: 20 });
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId, createSessionMutation({
+      backendId: "pi", targetId: "workspace-real-pi", providerId, modelId
+    })));
+    const generation = (await clients.session.getSession({ sessionId })).session!.nativeBinding!.runtimeGeneration;
+    const send = async (prompt: string) => {
+      const operation = await submit(clients.operation, connectionId, sendInputMutation(sessionId, generation, prompt));
+      const runId = queueRunIdFrom(operation);
+      const settled = await waitForRealSystem(() => clients.run.getRun({ runId }), reply => reply.run?.state === RunState.SUCCEEDED && reply.run.usage?.usage !== undefined,
+        `the ${prompt} Pi usage to settle`, 30_000);
+      return { runId, usage: settled.run!.usage! };
+    };
+    expect((await send("original pricing baseline")).usage).toMatchObject({ usage: { costMicros: 30_000n, totalTokens: 2_000n }, estimated: true });
+    const second = await send("next priced turn");
+    expect(second.usage).toMatchObject({ usage: { inputTokens: 1_000n, outputTokens: 1_000n, totalTokens: 2_000n,
+      costMicros: 30_000n, currencyCode: "USD" }, estimated: true, costComplete: true });
+    expect(fixture.providerRequests.filter(request => request.body["model"] === modelId)).toHaveLength(2);
+
+    const reconnected = fixture.clients(authKey);
+    const { events } = await reconnected.session.listSessionTimeline({ sessionId });
+    const completion = events.find(event => event.eventId === second.usage.completionEventId);
+    expect(completion?.identity?.runId).toBe(second.runId);
+    expect(completion?.payload?.kind).toMatchObject({ case: "messageCompleted", value: {
+      messageId: second.usage.messageId,
+      turnUsage: { messageId: second.usage.messageId, completionEventId: second.usage.completionEventId,
+        estimated: true, usage: { costMicros: 30_000n } }
+    } });
+    const ledger = await reconnected.backend.getUsageReport({ group: UsageReportGroup.MODEL, backendId: "pi", providerId, modelId, sessionId });
+    expect(ledger.summary).toMatchObject({ estimated: true, usage: { costMicros: 60_000n, totalTokens: 4_000n } });
   });
 
   it("forks a durable Pi user node off the active branch without moving the source leaf", { timeout: 120_000 }, async () => {

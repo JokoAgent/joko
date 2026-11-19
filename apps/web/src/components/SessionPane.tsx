@@ -30,7 +30,8 @@ import type { ArtifactReferenceCatalogItemView, AttachmentDraft, NativeNavigatio
 import { appendQuoteToComposerDocument, composerDocumentFromEditedEncodedMessage, composerDocumentFromMessage, composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, StatusDot, cx, CheckboxControl } from "./ui.js";
-import { Composer, type ComposerHistoryEntry, type PrepareRewindDraft, type RewindDraftContinuation } from "./Composer.js";
+import type { FileSelectionQuoteInsertion } from "../file-selection-quote-insertion.js";
+import { Composer, type ComposerHistoryEntry, type ComposerSelectionQuoteInsertion, type PrepareRewindDraft, type RewindDraftContinuation } from "./Composer.js";
 import { CompactionStatusIndicator } from "./CompactionStatusIndicator.js";
 import { formatTokenCount, resolveDisplayContextWindow } from "./ContextCapacityRing.js";
 import { ErrorTailBanner } from "./ErrorTailBanner.js";
@@ -190,7 +191,7 @@ export function SessionPane(props: Parameters<typeof SessionPaneContent>[0]): JS
   </PartnerConversationProvider>;
 }
 
-function SessionPaneContent({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, allowSplitMessageDelete = false, onSplitMessageForkOpened, models, timeline, timelineUnloadedGapBefore, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, objectiveDialogHandoff, onObjectiveDialogHandoffHandled, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onManageTaskTags = () => undefined, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onSideChatOpened, onOpenSessionWindow }: {
+function SessionPaneContent({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, allowSplitMessageDelete = false, onSplitMessageForkOpened, models, timeline, timelineUnloadedGapBefore, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, onSelectionQuoteInsertionApplied, attachmentInsertion, objectiveDialogHandoff, onObjectiveDialogHandoffHandled, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onManageTaskTags = () => undefined, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onSideChatOpened, onOpenSessionWindow }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly target?: TargetView;
@@ -221,7 +222,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   readonly navigationOpen: boolean;
   readonly inspectorOpen: boolean;
   readonly inspectorAvailable?: boolean;
-  readonly selectionQuoteInsertion?: { readonly id: number; readonly sessionId: string; readonly quote: ComposerSelectionQuoteDraft };
+  readonly selectionQuoteInsertion?: FileSelectionQuoteInsertion;
+  readonly onSelectionQuoteInsertionApplied?: (insertion: FileSelectionQuoteInsertion) => void;
   readonly attachmentInsertion?: { readonly id: number; readonly sessionId: string; readonly file: File };
   readonly objectiveDialogHandoff?: ObjectiveDialogHandoffRequest;
   readonly onObjectiveDialogHandoffHandled?: (requestId: string) => void;
@@ -297,7 +299,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const [errorTailRevision, setErrorTailRevision] = useState(0);
   const [bottomInset, setBottomInset] = useState(0);
   const [composerMessageMentionInsertion, setComposerMessageMentionInsertion] = useState<{ readonly id: number; readonly sessionId: string; readonly mention: NonNullable<ReturnType<typeof createMessageComposerMention>>; readonly inline?: ReturnType<typeof wholeMessageComposerReference> }>();
-  const [composerSelectionQuoteInsertion, setComposerSelectionQuoteInsertion] = useState<{ readonly id: number; readonly sessionId: string; readonly quotes: readonly ComposerSelectionQuoteDraft[] }>();
+  const [composerSelectionQuoteInsertion, setComposerSelectionQuoteInsertion] = useState<ComposerSelectionQuoteInsertion>();
   const [sideChatRecovery, setSideChatRecovery] = useState<{ readonly record: PendingSideChatDraft; readonly state: "pending" | "working" | "failed" | "existing"; readonly error?: string; readonly canStartAgain?: boolean }>();
   const [sideChatRecoveryLoadError, setSideChatRecoveryLoadError] = useState<string>();
   const [sideChatRecoveryReload, setSideChatRecoveryReload] = useState(0);
@@ -1111,9 +1113,10 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     setComposerSelectionQuoteInsertion({
       id: ++composerSelectionQuoteInsertionIdRef.current,
       sessionId: selectionQuoteInsertion.sessionId,
-      quotes: [selectionQuoteInsertion.quote]
+      quotes: [selectionQuoteInsertion.quote],
+      onApplied: () => onSelectionQuoteInsertionApplied?.(selectionQuoteInsertion)
     });
-  }, [selectionQuoteInsertion, session.id]);
+  }, [selectionQuoteInsertion, onSelectionQuoteInsertionApplied, session.id]);
 
   useEffect(() => {
     if (attachmentInsertion === undefined || attachmentInsertion.sessionId !== session.id) return;
