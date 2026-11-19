@@ -12,6 +12,7 @@ import {
   HOST_COMPOSED_CAPABILITIES,
   isProductSlashCommand,
   JokoError,
+  MAXIMUM_EDITABLE_PLAN_LENGTH,
   NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
   NATIVE_PROMPT_IMAGE_MEDIA_TYPES,
   SESSION_REWIND_SERVICE_NODE_ONLY_OPTION,
@@ -5314,7 +5315,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         kind: "plan_review",
         title: "Review plan",
         markdown,
-        choices: ["execute", "stay", "refine"]
+        choices: ["execute", "stay", "refine"],
+        ...(markdown.trim() !== "" && markdown.length <= MAXIMUM_EDITABLE_PLAN_LENGTH ? { editable: true } : {})
       }, { signal: pending.abort.signal });
       if (runtime.planReview !== pending || !this.#isRuntimeCurrent(runtime, hostGeneration)) return;
       if (decision.kind === "plan_review" && decision.decision === "execute") {

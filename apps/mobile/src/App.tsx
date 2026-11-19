@@ -8161,6 +8161,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       onClose={() => setComposerAtomId(undefined)} onSavePaste={savePastedTextAtom} onRemove={removeComposerAtom} />
     <MobileInteractionSheet visible={!workerReadOnly && interactionVisible && interactions.length > 0} locale={locale}
       voiceTransport={voiceTransport} onOpenReference={openQuestionReference}
+      allowPlanEdit={state.taskSource?.kind !== "joined"}
       profileId={taskDraftProfileId} interactions={interactions} selectedId={activeInteractionId}
       busy={state.busy || interactionReceipt?.taskJoinId !== undefined} colors={colors}
       responseReceipt={interactionReceipt && interactionReceipt.taskJoinId === undefined ? {

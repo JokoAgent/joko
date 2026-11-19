@@ -25100,7 +25100,8 @@ export function interactionDecisionSubmission(resolution: contract.InteractionRe
         value: {
           kind: "plan_review",
           decision: submittedPlanReviewDecision(resolution.decision.value.decision),
-          feedback: resolution.decision.value.feedback
+          feedback: resolution.decision.value.feedback,
+          ...(resolution.decision.value.editedPlan === undefined ? {} : { editedPlan: resolution.decision.value.editedPlan })
         }
       };
     case "extensionUi":

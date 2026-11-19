@@ -187,7 +187,7 @@ export type InteractionDecision =
       readonly kind: "question";
       readonly answers: Readonly<Record<string, InteractionQuestionAnswer>>;
     }
-  | { readonly kind: "plan_review"; readonly decision: PlanReviewDecision; readonly feedback: string }
+  | { readonly kind: "plan_review"; readonly decision: PlanReviewDecision; readonly feedback: string; readonly editedPlan?: string }
   | { readonly kind: "cancelled" };
 
 export interface CreateNativeSessionInput {

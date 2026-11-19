@@ -1,4 +1,5 @@
 import { create } from "@bufbuild/protobuf";
+import { MAXIMUM_EDITABLE_PLAN_LENGTH } from "@joko/core/events";
 import { containsRecognizedCredential } from "@joko/core/errors";
 import {
   BrowserPermissionAction,
@@ -47,12 +48,12 @@ export function mobileQuestionAnswerContainsCredential(answer: MobileQuestionAns
 
 export type MobileInteractionDraft =
   | { readonly kind: "question"; readonly fieldIndex: number; readonly answers: MobileQuestionAnswers }
-  | { readonly kind: "plan"; readonly feedback: string };
+  | { readonly kind: "plan"; readonly feedback: string; readonly editedPlan?: string };
 
 export type MobileInteractionSubmission =
   | { readonly kind: "permission"; readonly decision: PermissionDecisionKind }
   | { readonly kind: "question"; readonly answers: MobileQuestionAnswers }
-  | { readonly kind: "plan"; readonly decision: PlanReviewDecisionKind; readonly feedback: string };
+  | { readonly kind: "plan"; readonly decision: PlanReviewDecisionKind; readonly feedback: string; readonly editedPlan?: string };
 
 export interface MobilePermissionDetail {
   readonly label: string;
@@ -260,9 +261,17 @@ export function createMobileInteractionResolution(
     if (submission.decision === PlanReviewDecisionKind.REFINE && feedback === "") {
       throw new Error("Describe what should change before refining the plan.");
     }
+    const editedPlan = submission.editedPlan;
+    if (editedPlan !== undefined && (!interaction.request.value.editable || submission.decision !== PlanReviewDecisionKind.EXECUTE
+      || !editedPlan.trim() || editedPlan.length > MAXIMUM_EDITABLE_PLAN_LENGTH || editedPlan.includes("\0")
+      || containsRecognizedCredential(editedPlan))) {
+      throw new Error("An edited plan must be bounded text for the original editable approval.");
+    }
     return create(InteractionResolutionSchema, {
       connectionId,
-      decision: { case: "planReview", value: create(PlanReviewResolutionSchema, { decision: submission.decision, feedback }) }
+      decision: { case: "planReview", value: create(PlanReviewResolutionSchema, {
+        decision: submission.decision, feedback, ...(editedPlan === undefined ? {} : { editedPlan })
+      }) }
     });
   }
   if (interaction.request.case !== "question" || submission.kind !== "question") {

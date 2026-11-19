@@ -6853,11 +6853,12 @@ describe("ClaudeCodeAdapter", () => {
     await adapter.dispose();
   });
 
-  test("maps permission, question, and plan tools to typed interactions with replay-safe decisions", async () => {
+  test.each([false, true])("maps permission, question, and plan tools to typed interactions with replay-safe decisions (plan edited=%s)", async (editPlan) => {
     const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
     const secret = "fixture-protected-value";
     const adapter = adapterFor(runtime, { redactValues: [secret] });
     const interactions: InteractionPayload[] = [];
+    const editedPlan = "1. Test locally\n2. Record the outcome";
     const binding = await adapter.createSession(createInput(), contextFor().context);
     const active = contextFor(binding, {
       operationId: "interactions",
@@ -6877,7 +6878,7 @@ describe("ClaudeCodeAdapter", () => {
             q4: { kind: "multiple", choiceIds: ["q4o0"], otherText: "Quoted \"route\", then tools" }
           } };
         }
-        return { kind: "plan_review", decision: "execute", feedback: "" };
+        return { kind: "plan_review", decision: "execute", feedback: "", ...(editPlan ? { editedPlan } : {}) };
       }
     });
     await adapter.send(textPrompt("interact"), active.context);
@@ -6958,10 +6959,11 @@ describe("ClaudeCodeAdapter", () => {
 
     const plan = await query.params.options.canUseTool(
       "ExitPlanMode",
-      { plan: "1. Test\n2. Ship" },
+      { plan: "1. Test\n2. Ship", keepOriginalField: true },
       permissionOptions("plan-one", "tool-plan")
     );
-    expect(plan).toMatchObject({ behavior: "allow", updatedInput: { plan: "1. Test\n2. Ship" } });
+    expect(plan).toEqual({ behavior: "allow", updatedInput: { plan: editPlan ? editedPlan : "1. Test\n2. Ship", keepOriginalField: true } });
+    expect(interactions.at(-1)).toMatchObject({ kind: "plan_review", editable: true, markdown: "1. Test\n2. Ship" });
     expect(interactions.map((interaction) => interaction.kind)).toEqual([
       "permission",
       "permission",

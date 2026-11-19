@@ -2,12 +2,12 @@
 import { act, createElement, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk } from "@joko/contracts";
+import { InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind } from "@joko/contracts";
 import { expect, it, vi } from "vitest";
 import { mobileMessage } from "./mobile-messages";
 import { createMobileInteractionResolution } from "./mobile-interactions";
 
-const native = vi.hoisted(() => ({ alert: vi.fn() }));
+const native = vi.hoisted(() => ({ alert: vi.fn(), textInputs: new Map<string, (text: string) => void>() }));
 
 vi.mock("react-native", () => {
   const box = ({ children }: { children?: ReactNode }) => createElement("div", {}, children);
@@ -23,7 +23,12 @@ vi.mock("react-native", () => {
     Text: ({ children, selectable, accessibilityRole }: {
       children?: ReactNode; selectable?: boolean; accessibilityRole?: string;
     }) => createElement("span", { role: accessibilityRole, "data-selectable": selectable ? "true" : undefined }, children),
-    TextInput: box,
+    TextInput: ({ accessibilityLabel, value, onChangeText, editable }: {
+      accessibilityLabel?: string; value?: string; editable?: boolean; onChangeText?: (text: string) => void;
+    }) => {
+      if (accessibilityLabel && onChangeText) native.textInputs.set(accessibilityLabel, onChangeText);
+      return createElement("textarea", { "aria-label": accessibilityLabel, value, readOnly: true, disabled: editable === false });
+    },
     View: box
   };
 });
@@ -42,6 +47,52 @@ import { MobileInteractionSheet } from "./MobileInteractionSheet";
 
 const colors = { background: "#fff", surface: "#fff", ink: "#111", muted: "#666", border: "#ccc", accent: "#f90",
   negative: "#b00", brandBackground: "#eee" };
+
+it("submits the exact changed plan only when approving its original editable request", async () => {
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  const host = document.body.appendChild(document.createElement("div"));
+  const root = createRoot(host);
+  const request = (revision: bigint, markdown: string) => create(InteractionSchema, {
+    interactionId: "current-plan", kind: InteractionKind.PLAN_REVIEW, state: InteractionState.PENDING,
+    backendId: "codex", targetId: "target", sessionId: "task", generation: 2n,
+    version: { revision: { value: revision }, generation: 2n },
+    request: { case: "planReview", value: { title: "Review plan", markdown, editable: true,
+      allowedDecisions: [PlanReviewDecisionKind.EXECUTE, PlanReviewDecisionKind.STAY_IN_PLAN_MODE] } }
+  });
+  const originalPlan = "1. Preserve the current implementation.";
+  const initial = request(3n, originalPlan);
+  const revised = request(4n, "1. Check the new request.");
+  const onResolve = vi.fn(async () => false);
+  const render = (interaction: ReturnType<typeof request>, allowPlanEdit = true) => act(async () => {
+    root.render(<MobileInteractionSheet visible interactions={[interaction]} busy={false} colors={colors}
+      locale="en" allowPlanEdit={allowPlanEdit} onSelect={() => undefined} onMinimize={() => undefined} onResolve={onResolve}
+      onDismiss={async () => true} onError={() => undefined} />);
+  });
+  const button = (label: string) => host.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
+  const press = (label: string) => act(async () => button(label)!.click());
+  const change = (text: string) => act(async () => native.textInputs.get("Edited plan")!(text));
+  try {
+    await render(initial);
+    await press("Edit plan");
+    expect(host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edited plan"]')?.value).toBe(originalPlan);
+    await change(" ");
+    expect(button("Approve edited plan")?.disabled).toBe(true);
+    const editedPlan = "  1. Add a verification step.\n2. Record its result.\n";
+    await change(editedPlan);
+    expect(onResolve).not.toHaveBeenCalled();
+    await press("Approve edited plan");
+    expect(onResolve).toHaveBeenCalledExactlyOnceWith(initial, { kind: "plan", decision: PlanReviewDecisionKind.EXECUTE, feedback: "", editedPlan });
+    expect(host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edited plan"]')?.value).toBe(editedPlan);
+    await render(revised, false);
+    expect(button("Edit plan")).toBeNull();
+    expect(host.querySelector('textarea[aria-label="Edited plan"]')).toBeNull();
+    expect(host.textContent).toContain("1. Check the new request.");
+  } finally {
+    await act(async () => root.unmount());
+    host.remove();
+    native.textInputs.clear();
+  }
+});
 
 function permission(revision: bigint, explanation: string, toolId?: string) {
   return create(InteractionSchema, {

@@ -1,5 +1,7 @@
 import type { MobilePlainStorageDriver } from "./connection-storage";
 import type { Interaction } from "@joko/contracts";
+import { containsRecognizedCredential } from "@joko/core/errors";
+import { MAXIMUM_EDITABLE_PLAN_LENGTH } from "@joko/core/events";
 import { mobileQuestionAnswerContainsCredential, type MobileInteractionDraft, type MobileQuestionAnswerDraft } from "./mobile-interactions";
 
 export interface MobileInteractionDraftIdentity {
@@ -240,7 +242,10 @@ function serializeRecord(identity: MobileInteractionDraftIdentity, draft: Mobile
 }
 
 function storableDraft(draft: MobileInteractionDraft): MobileInteractionDraft {
-  if (draft.kind === "plan") return draft;
+  if (draft.kind === "plan") {
+    return draft.editedPlan !== undefined && containsRecognizedCredential(draft.editedPlan)
+      ? { kind: "plan", feedback: draft.feedback } : draft;
+  }
   const answers = { ...draft.answers };
   let changed = false;
   for (const [fieldId, answer] of Object.entries(draft.answers)) {
@@ -268,11 +273,13 @@ function readRecord(serialized: string, identity: MobileInteractionDraftIdentity
 function normalizeDraft(value: unknown, kind: MobileInteractionDraftIdentity["kind"]): MobileInteractionDraft {
   if (!isRecord(value) || value["kind"] !== kind) throw new Error("The local Joko request draft does not match its request.");
   if (kind === "plan") {
-    if (Reflect.ownKeys(value).some((key) => key !== "kind" && key !== "feedback") || typeof value["feedback"] !== "string") {
+    const editedPlan = value["editedPlan"];
+    if (Reflect.ownKeys(value).some((key) => key !== "kind" && key !== "feedback" && key !== "editedPlan") || typeof value["feedback"] !== "string"
+      || (editedPlan !== undefined && (typeof editedPlan !== "string" || editedPlan.length > MAXIMUM_EDITABLE_PLAN_LENGTH || editedPlan.includes("\0")))) {
       throw new Error("The local Joko plan draft is invalid.");
     }
     boundedText(value["feedback"]);
-    return { kind: "plan", feedback: value["feedback"] };
+    return { kind: "plan", feedback: value["feedback"], ...(editedPlan === undefined ? {} : { editedPlan }) };
   }
   if (Reflect.ownKeys(value).some((key) => key !== "kind" && key !== "fieldIndex" && key !== "answers")
     || !Number.isSafeInteger(value["fieldIndex"]) || (value["fieldIndex"] as number) < 0
