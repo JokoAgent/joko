@@ -1564,23 +1564,25 @@ test("public enum wire numbers remain stable", () => {
   }
 });
 
-test("public messages allow only explicit string maps and reject Struct or Any", () => {
-  const stringMaps = new Set([
-    "joko.v1.ManagedModelRuntimeCatalogModel.descriptions",
-    "joko.v1.ServerAccessEntry.fields",
-    "joko.v1.SaveServerAccessEntryRequest.fields"
+test("public messages allow only the explicit typed maps and reject Struct or Any", () => {
+  const maps = new Map([
+    ["joko.v1.ManagedModelRuntimeCatalogModel.descriptions", { kind: "scalar", value: ScalarType.STRING }],
+    ["joko.v1.ServerAccessEntry.fields", { kind: "scalar", value: ScalarType.STRING }],
+    ["joko.v1.SaveServerAccessEntryRequest.fields", { kind: "scalar", value: ScalarType.STRING }],
+    ["joko.v1.ExtensionLibrarySqlStatement.named_parameters", { kind: "message", value: "joko.v1.ExtensionLibrarySqlValue" }]
   ]);
-  const observedStringMaps = new Set();
+  const observedMaps = new Set();
   for (const [exportName, descriptor] of Object.entries(contract)) {
     if (!exportName.endsWith("Schema") || descriptor?.kind !== "message") continue;
     for (const candidate of descriptor.fields) {
       const identity = `${descriptor.typeName}.${candidate.name}`;
-      if (stringMaps.has(identity)) {
+      const expected = maps.get(identity);
+      if (expected !== undefined) {
         assert.equal(candidate.fieldKind, "map", identity);
         assert.equal(candidate.mapKey, ScalarType.STRING, identity);
-        assert.equal(candidate.mapKind, "scalar", identity);
-        assert.equal(candidate.scalar, ScalarType.STRING, identity);
-        observedStringMaps.add(identity);
+        assert.equal(candidate.mapKind, expected.kind, identity);
+        assert.equal(expected.kind === "message" ? candidate.message?.typeName : candidate.scalar, expected.value, identity);
+        observedMaps.add(identity);
       } else {
         assert.notEqual(candidate.fieldKind, "map", `${identity} uses a map`);
       }
@@ -1590,5 +1592,5 @@ test("public messages allow only explicit string maps and reject Struct or Any",
       }
     }
   }
-  assert.deepEqual(observedStringMaps, stringMaps);
+  assert.deepEqual(observedMaps, new Set(maps.keys()));
 });
