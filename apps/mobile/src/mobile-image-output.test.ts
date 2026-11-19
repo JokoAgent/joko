@@ -71,6 +71,21 @@ describe("mobile image output", () => {
     expect(failure.removeTemporary).toHaveBeenCalledWith(temporary);
   });
 
+  it("keeps the native save outcome when removing its private file fails", async () => {
+    const driver = createDriver({ removeTemporary: vi.fn(async () => { throw new Error("cache deletion failed"); }) });
+    const output = new MobileImageOutput(driver, () => "id");
+
+    await expect(output.perform("save", pngSource())).resolves.toBeUndefined();
+    expect(driver.saveImage).toHaveBeenCalledExactlyOnceWith(temporary, "image/png");
+    expect(driver.removeTemporary).toHaveBeenCalledExactlyOnceWith(temporary);
+    expect(driver.saveImage.mock.invocationCallOrder[0]).toBeLessThan(driver.removeTemporary.mock.invocationCallOrder[0]!);
+
+    driver.saveImage.mockRejectedValueOnce(new Error("publication failed"));
+    await expect(output.perform("save", pngSource())).rejects.toThrow("publication failed");
+    expect(driver.saveImage).toHaveBeenCalledTimes(2);
+    expect(driver.removeTemporary).toHaveBeenCalledTimes(2);
+  });
+
   it("checks sharing availability before writing and retains a successful share file for deferred cleanup", async () => {
     const unavailable = createDriver({ sharingAvailable: vi.fn(async () => false) });
     await expect(new MobileImageOutput(unavailable, () => "id").perform("share", pngSource()))
