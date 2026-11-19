@@ -440,6 +440,7 @@ import { DesktopPersonalDevelopmentVersions } from "./personal-development-nativ
 import { personalVersionProfileOverride } from "./personal-development-version-bootstrap.js";
 import { resolveManagedArtifactSource, resolveManagedWorkspaceFileSource } from "./managed-artifact-source.js";
 import { bundledElectronUpdater, createElectronUpdateDriver } from "./electron-update-driver.js";
+import { openLinuxAppImageInstallation } from "./linux-appimage-update.js";
 import {
   createDesktopUpdateAutoRelaunchPolicy,
   isDesktopUpdateActivityQuietForAutoRelaunch,
@@ -1261,7 +1262,7 @@ if (!app.requestSingleInstanceLock()) {
     registerPackagedAppProtocol();
     initializeDesktopUpdateChannelSettings();
     await requireDesktopUpdateChannelSettings().initialize();
-    initializeDesktopUpdateService();
+    await initializeDesktopUpdateService();
     initializeDesktopUpdateAutoSettings();
     initializeDesktopAttentionBadge();
     await initializeDesktopWindowInteractionSettings();
@@ -7247,9 +7248,14 @@ function dispatchApplicationMenuCommand(command: DesktopApplicationMenuCommand):
   }
 }
 
-function initializeDesktopUpdateService(): void {
+async function initializeDesktopUpdateService(): Promise<void> {
   if (desktopUpdateService !== undefined) return;
   const feedUrl = selectedDesktopUpdateFeedUrl();
+  const appImage = app.isPackaged && feedUrl !== undefined ? await openLinuxAppImageInstallation({
+    imagePath: process.env["APPIMAGE"],
+    mountPath: process.env["APPDIR"],
+    resourcesPath: process.resourcesPath
+  }) : undefined;
   const service = createDesktopUpdateService({
     driver: createElectronUpdateDriver(bundledElectronUpdater(), {
       once: (_event, listener) => nativeAutoUpdater.once("before-quit-for-update", listener),
@@ -7259,6 +7265,10 @@ function initializeDesktopUpdateService(): void {
       removeUpdateDownloadedListener: (listener) =>
         nativeAutoUpdater.removeListener("update-downloaded", listener as never)
     }, {
+      ...(appImage === undefined ? {} : { linuxAppImage: {
+        installation: appImage,
+        relaunch: path => Boolean(app.relaunch({ execPath: path, args: process.argv.slice(1) }))
+      } }),
       quitHandoff: {
         once: (_event, listener) => app.once("will-quit", listener),
         removeListener: (_event, listener) => app.removeListener("will-quit", listener),
@@ -7269,7 +7279,7 @@ function initializeDesktopUpdateService(): void {
     isPackaged: app.isPackaged,
     platform: process.platform,
     currentVersion: app.getVersion(),
-    appImagePath: process.env["APPIMAGE"],
+    appImagePath: appImage?.path,
     feedUrl,
     enableBackgroundPolling: false,
     prepareToApply: stopManagedOrchestratorForUpdateApply,

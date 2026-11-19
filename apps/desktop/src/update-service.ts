@@ -72,7 +72,7 @@ export interface DesktopUpdateDriver {
    * Resolves only after the platform updater confirms its update-quit handoff.
    * A platform updater error, including a deferred macOS Squirrel error, rejects.
    */
-  readonly relaunchToInstall: () => Promise<void>;
+  readonly relaunchToInstall: (expectedVersion?: string) => Promise<void>;
   readonly onProgress: (listener: (progress: DesktopUpdateDriverProgressInfo) => void) => () => void;
   readonly onError: (listener: () => void) => () => void;
   readonly dispose?: () => void;
@@ -143,9 +143,9 @@ export function resolveDesktopUpdateAvailability(options: Pick<
   if (!options.isPackaged) return { kind: "unavailable", reason: "development" };
   if (options.feedUrl === undefined) return { kind: "unavailable", reason: "feed-unconfigured" };
   if (options.platform === "linux") {
-    // Joko does not perform an in-app Linux installer handoff. Distribution
-    // artifacts remain available, but every Linux host reports manual-only.
-    return { kind: "manual-download", reason: "linux-manual-only" };
+    return options.appImagePath === undefined
+      ? { kind: "manual-download", reason: "linux-manual-only" }
+      : { kind: "available" };
   }
   if (options.platform !== "win32" && options.platform !== "darwin") {
     return { kind: "manual-download", reason: "unsupported-platform" };
@@ -605,7 +605,7 @@ export function createDesktopUpdateService(options: DesktopUpdateServiceOptions)
     try {
       activePhase = "apply";
       activeDriverError = undefined;
-      await options.driver.relaunchToInstall();
+      await options.driver.relaunchToInstall(version);
       if (activeDriverError === "apply") throw new Error("Updater rejected the install request.");
       return { accepted: true };
     } catch {

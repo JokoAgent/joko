@@ -98,7 +98,7 @@ describe("desktop update service", () => {
     }
   });
 
-  it("reports development, absent-feed, and every Linux mode truthfully", async () => {
+  it("reports development, absent-feed, and Linux installation availability", async () => {
     expect(resolveDesktopUpdateAvailability({
       isPackaged: false,
       platform: "win32",
@@ -116,9 +116,9 @@ describe("desktop update service", () => {
     expect(resolveDesktopUpdateAvailability({
       isPackaged: true,
       platform: "linux",
-      appImagePath: "/opt/Joko.AppImage",
+      appImagePath: "/home/alex/Applications/Joko.AppImage",
       feedUrl: "https://updates.example.com/joko"
-    })).toEqual({ kind: "manual-download", reason: "linux-manual-only" });
+    })).toEqual({ kind: "available" });
 
     const driver = fakeDriver();
     const service = createDesktopUpdateService({

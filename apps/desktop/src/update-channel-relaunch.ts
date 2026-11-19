@@ -25,6 +25,7 @@ export interface DesktopQuitHandoffOptions {
   readonly handoffTimeoutMs?: number;
   readonly onQuitBlocked?: (listener: () => void) => () => void;
   readonly onWillQuit?: () => void;
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -47,6 +48,7 @@ export function requestDesktopQuitHandoff(
       if (timeout !== undefined) clearTimeout(timeout);
       timeout = undefined;
       options.app.removeListener("will-quit", accepted);
+      options.signal?.removeEventListener("abort", cancelled);
       stopQuitBlocked?.();
       stopQuitBlocked = undefined;
     };
@@ -56,6 +58,7 @@ export function requestDesktopQuitHandoff(
       cleanup();
       resolvePromise(acceptedHandoff);
     };
+    const cancelled = (): void => settle(false);
     const accepted = (event: DesktopUpdateChannelQuitEvent): void => {
       if (settled) return;
       try {
@@ -70,8 +73,13 @@ export function requestDesktopQuitHandoff(
       settle(true);
     };
 
+    if (options.signal?.aborted) {
+      settle(false);
+      return;
+    }
     try {
       options.app.once("will-quit", accepted);
+      options.signal?.addEventListener("abort", cancelled, { once: true });
       stopQuitBlocked = options.onQuitBlocked?.(() => settle(false));
       timeout = setTimeout(() => settle(false), handoffTimeoutMs);
       timeout.unref();
