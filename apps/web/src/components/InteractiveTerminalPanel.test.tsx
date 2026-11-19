@@ -50,11 +50,15 @@ it("fits the open terminal in the new typeface after it loads", async () => {
   vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(400);
   const rootElement = document.documentElement;
   const priorStyle = rootElement.getAttribute("style");
-  vi.spyOn(window, "getComputedStyle").mockImplementation(() => ({
-    fontFamily: rootElement.style.getPropertyValue("--app-font-terminal").split(",")[0] || "monospace",
-    fontSize: rootElement.style.getPropertyValue("--app-terminal-font-size") || "14px",
-    getPropertyValue: () => "#123456"
-  }) as CSSStyleDeclaration);
+  vi.spyOn(window, "getComputedStyle").mockImplementation(() => {
+    const style = document.createElement("div").style;
+    style.fontFamily = rootElement.style.getPropertyValue("--app-font-terminal").split(",")[0] || "monospace";
+    style.fontSize = rootElement.style.getPropertyValue("--app-terminal-font-size") || "14px";
+    for (const name of ["--surface", "--text", "--surface-hover", "--text-soft", "--red", "--green", "--amber", "--blue", "--purple"]) {
+      style.setProperty(name, "#123456");
+    }
+    return style;
+  });
   let releaseFont!: () => void;
   const load = vi.fn((_font: string) => new Promise<FontFace[]>((resolve) => { releaseFont = () => resolve([]); }));
   const priorFonts = Object.getOwnPropertyDescriptor(document, "fonts");
