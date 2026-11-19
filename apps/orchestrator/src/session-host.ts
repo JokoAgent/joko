@@ -11260,13 +11260,13 @@ export class SessionHost {
     const stored = this.#store.getSession(sessionId);
     const backend = this.#store.getBackend(stored.descriptor.backendId).descriptor.adapterKind;
     if (backend === "codex") return this.isLocalCodexPlanRun(stored, runId) ? backend : undefined;
-    if (backend !== "claude-code" || !this.isOrdinaryLocalPlanSession(stored)) return undefined;
+    if (backend !== "claude-agent-sdk-stdio" || !this.isOrdinaryLocalPlanSession(stored)) return undefined;
     const run = this.#store.findRun(runId)?.descriptor;
     const queue = this.#store.findQueueItemByRunId(sessionId, runId, { includeCleared: true });
     return run?.source === "user" && run.parentRunId === undefined && queue?.disposition === "prompt"
       && queue.body.messagingOrigin === undefined && queue.body.automaticContinuation === undefined
       && queue.body.objectiveContinuation === undefined
-      ? backend : undefined;
+      ? "claude-code" : undefined;
   }
 
   private isLocalCodexPlanRun(stored: StoredSession, runId: string): boolean {

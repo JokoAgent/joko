@@ -5,6 +5,7 @@ import type {
   InteractionQuestionAnswer,
   InteractionQuestionField
 } from "@joko/core";
+import { containsRecognizedCredential, MAXIMUM_EDITABLE_PLAN_LENGTH } from "@joko/core";
 
 import { StoreError } from "./errors.js";
 
@@ -39,9 +40,10 @@ export function parseCurrentInteractionPayload(value: unknown): InteractionPaylo
       return payload as unknown as InteractionPayload;
     }
     case "plan_review":
-      requireExactKeys(payload, ["id", "kind", "title", "markdown", "choices"]);
+      requireExactKeys(payload, ["id", "kind", "title", "markdown", "choices"], ["editable"]);
       requireStrings(payload, ["title", "markdown"]);
       requireEnumArray(payload["choices"], ["execute", "stay", "refine"] as const);
+      if (payload["editable"] !== undefined && typeof payload["editable"] !== "boolean") invalidPayload();
       return payload as unknown as InteractionPayload;
     case "extension_select":
     case "extension_confirm":
@@ -81,14 +83,19 @@ export function parseCurrentInteractionDecision(
       return decision as unknown as InteractionDecision;
     case "question":
       return parseQuestionDecision(payload, decision);
-    case "plan_review":
-      requireExactKeys(decision, ["kind", "decision", "feedback"]);
+    case "plan_review": {
+      requireExactKeys(decision, ["kind", "decision", "feedback"], ["editedPlan"]);
       if (decision["kind"] !== "plan_review" || typeof decision["feedback"] !== "string"
         || !isOneOf(decision["decision"], ["execute", "stay", "refine"] as const)
         || !payload.choices.includes(decision["decision"])) {
         invalidDecision();
       }
+      const editedPlan = decision["editedPlan"];
+      if (editedPlan !== undefined && (decision["decision"] !== "execute" || payload.editable !== true
+        || typeof editedPlan !== "string" || editedPlan.trim() === "" || editedPlan.length > MAXIMUM_EDITABLE_PLAN_LENGTH
+        || editedPlan.includes("\0") || containsRecognizedCredential(editedPlan))) invalidDecision();
       return decision as unknown as InteractionDecision;
+    }
     case "extension_confirm":
       if (decision["kind"] === "cancelled") return parseCancelledDecision(decision);
       requireExactKeys(decision, ["kind", "confirmed"]);

@@ -29,7 +29,7 @@ import {
   type ClaudeSdkStoredSessionRuntime,
   type ClaudeSdkUserMessage
 } from "@joko/adapter-claude-code/testing";
-import { InteractionState, MessageRole, NativeCatalogImportPresentationSchema, NativeNavigationTargetSchema, NativeSessionPlacement, NativeSessionStartSchema, OperationMutationSchema, OperationState, PermissionDecisionKind, RunState, type Event } from "@joko/contracts";
+import { InteractionState, MessageRole, NativeCatalogImportPresentationSchema, NativeNavigationTargetSchema, NativeSessionPlacement, NativeSessionStartSchema, OperationMutationSchema, OperationState, PermissionDecisionKind, PlanReviewDecisionKind, RunState, type Event } from "@joko/contracts";
 import { expect, it, vi } from "vitest";
 import { createE2eClients } from "./connect-clients.js";
 import { OrchestratorE2eFixture, waitFor, type E2eClients } from "./fixture.js";
@@ -38,6 +38,7 @@ import {
   deleteMutation,
   forkMutation,
   navigateMutation,
+  planModeMutation,
   queueRunIdFrom,
   resolvePermissionMutation,
   sendInputMutation,
@@ -836,7 +837,7 @@ it("resumes the original local Claude task before sending after its idle Query e
   }
 });
 
-it("applies a v1 owner denial to the original local Claude tool request", { timeout: 60_000 }, async () => {
+it.each(["one-time denial", "edited plan approval"] as const)("applies the v1 owner %s to the original local Claude request", { timeout: 60_000 }, async scenario => {
   const seed = await seedNativeHistory();
   let fixture: OrchestratorE2eFixture | undefined;
   let query: TextObservationQuery | undefined;
@@ -848,27 +849,44 @@ it("applies a v1 owner denial to the original local Claude tool request", { time
     }));
     const paired = await fixture.pair();
     const sessionId = await attachSource(fixture, paired, seed.sourceId);
+    const reviewingPlan = scenario === "edited plan approval";
+    if (reviewingPlan) {
+      expect((await submit(paired.clients.operation, paired.connectionId, planModeMutation(sessionId, true))).state).toBe(OperationState.SUCCEEDED);
+    }
     const generation = BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation);
     const runId = queueRunIdFrom(await submit(paired.clients.operation, paired.connectionId,
       sendInputMutation(sessionId, generation, "Request permission for the controlled operation.")));
     await waitFor(async () => query?.receivedInputs.length, count => count === 1, "the original Claude input");
+    await waitFor(() => paired.clients.run.getRun({ runId }), ({ run }) => run?.state === RunState.RUNNING, "the accepted Claude turn");
     if (canUseTool === undefined) throw new Error("The controlled Claude Query did not expose its permission callback.");
-    const nativeDecision = canUseTool("Bash", { command: "pwd" }, {
-      requestId: "deny-native-request", toolUseID: "deny-native-tool", signal: new AbortController().signal
+    const originalPlan = "1. Inspect\n2. Implement";
+    const editedPlan = "1. Inspect\n2. Verify.";
+    const nativeDecision = canUseTool(reviewingPlan ? "ExitPlanMode" : "Bash",
+      reviewingPlan ? { plan: originalPlan, context: "original option" } : { command: "pwd" }, {
+      requestId: "native-request", toolUseID: "native-tool", signal: new AbortController().signal
     });
     void nativeDecision.catch(() => undefined);
     const pending = await waitFor(() => paired.clients.interaction.listInteractions({ sessionId, runId }),
       result => result.interactions.some(item => item.state === InteractionState.PENDING), "the original Claude permission");
     const request = pending.interactions.find(item => item.state === InteractionState.PENDING)!;
-    expect(request.request).toMatchObject({ case: "permission", value: { allowedDecisions: expect.arrayContaining([PermissionDecisionKind.DENY_ONCE]) } });
-    const resolution = await submit(paired.clients.operation, paired.connectionId, resolvePermissionMutation({
+    if (reviewingPlan) expect(request.request).toMatchObject({ case: "planReview", value: { markdown: originalPlan, editable: true } });
+    else expect(request.request).toMatchObject({ case: "permission", value: { allowedDecisions: expect.arrayContaining([PermissionDecisionKind.DENY_ONCE]) } });
+    const mutation = reviewingPlan ? create(OperationMutationSchema, { payload: { case: "resolveInteraction", value: {
+      interactionId: request.interactionId, interactionGeneration: request.generation, resolution: {
+        connectionId: paired.connectionId, decision: { case: "planReview", value: { decision: PlanReviewDecisionKind.EXECUTE, editedPlan } }
+      }
+    } } }) : resolvePermissionMutation({
       connectionId: paired.connectionId, interactionId: request.interactionId, generation: request.generation,
       decision: PermissionDecisionKind.DENY_ONCE
-    }));
+    });
+    const resolution = await submit(paired.clients.operation, paired.connectionId, mutation);
     expect(resolution.state, resolution.error?.message).toBe(OperationState.SUCCEEDED);
-    await expect(nativeDecision).resolves.toMatchObject({ behavior: "deny", message: "The user denied this tool request." });
+    await expect(nativeDecision).resolves.toMatchObject(reviewingPlan
+      ? { behavior: "allow", updatedInput: { plan: editedPlan, context: "original option" } }
+      : { behavior: "deny", message: "The user denied this tool request." });
     expect(fixture.application.store.getInteraction(request.interactionId)).toMatchObject({
-      runId, status: "resolved", decision: { kind: "selected", value: "deny_once" }
+      runId, status: "resolved", decision: reviewingPlan ? { kind: "plan_review", decision: "execute", editedPlan }
+        : { kind: "selected", value: "deny_once" }
     });
     expect(query?.receivedInputs).toHaveLength(1);
   } finally {
