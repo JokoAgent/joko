@@ -76,7 +76,7 @@ export interface SessionWorktreeRecycleRecord extends Omit<WorktreeRecycleRecord
 export type SessionWorktreeRecycleSafetyCheck = (sessionId: string, binding: SessionWorktreeBinding) => Promise<boolean>;
 
 type RemoteWorktreeOwnerPort = Pick<RemoteClaudeWorktreeOwner,
-  "plan" | "derive" | "inspectExact" | "cleanupPending" | "assertExact" | "releaseExact">;
+  "plan" | "derive" | "inspectExact" | "cleanupPending" | "assertExact" | "assertReleased" | "releaseExact">;
 
 export class SessionWorktreeCoordinatorError extends Error {
   readonly code: WorktreeErrorCode;
@@ -209,7 +209,8 @@ export class SessionWorktreeCoordinator {
     if (this.#remoteOwner !== undefined) {
       for (const session of remoteSessions) {
         const binding = session.descriptor.worktree!;
-        if (session.descriptor.archived || binding.state !== "active") {
+        if (session.descriptor.archived || binding.state !== "active"
+          || (binding.remote?.binding.kind === "ssh" && this.#store.findPendingSessionLifecycleCleanup(session.descriptor.id) !== undefined)) {
           this.#workspaces.unregister(binding.workspaceId);
           continue;
         }
@@ -602,7 +603,14 @@ export class SessionWorktreeCoordinator {
     const binding = session.descriptor.worktree;
     if (binding === undefined) return Object.freeze({ hasWorktree: false, dirty: false });
     if (binding.remote !== undefined) {
-      await this.assertActiveRemoteWorktree(sessionId, binding);
+      if (binding.remote.binding.kind === "ssh" && session.descriptor.archived && binding.state === "preserved") {
+        options?.assertCurrent?.();
+        await this.#requireRemoteOwner().assertExact(sessionId, { ...binding, state: "active" }, options?.signal);
+        options?.assertCurrent?.();
+        if (!this.#hasDurableRemoteBinding(sessionId, binding)) throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+      } else {
+        await this.assertActiveRemoteWorktree(sessionId, binding);
+      }
       // The remote checkout owner does not expose a read-only dirty preview.
       // Treat it as dirty so a removal never promises a clean discard.
       return Object.freeze({ hasWorktree: true, dirty: true });
@@ -811,12 +819,24 @@ export class SessionWorktreeCoordinator {
       return;
     }
     if (binding?.remote !== undefined) {
-      if (binding.state !== "active" || !this.#hasDurableRemoteBinding(sessionId, binding)
+      const pending = binding.state === "preserved" && binding.remote.binding.kind === "ssh"
+        && expectedBinding === undefined && persistedBinding !== undefined
+        ? this.#store.findPendingSessionLifecycleCleanup(sessionId) : undefined;
+      const canReconcile = pending?.disposition === "delete" && pending.closeCompleted && pending.nativeCompleted
+        && pending.releaseWorktree && !pending.worktreeCompleted;
+      if ((binding.state !== "active" && !canReconcile) || !this.#hasDurableRemoteBinding(sessionId, binding)
         || (persistedBinding !== undefined && !samePersistedBinding(persistedBinding, binding))) {
         throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
       }
-      const outcome = await this.#requireRemoteOwner().releaseExact(sessionId, binding);
-      if (outcome === "preserved") throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+      const owner = this.#requireRemoteOwner();
+      const exactBinding: SessionWorktreeBinding = binding.state === "active" ? binding : { ...binding, state: "active" };
+      if (binding.state === "preserved" && !session?.descriptor.archived) {
+        // The previous delete already recorded a release. Confirm the manifest without another removal.
+        await owner.assertReleased(sessionId, exactBinding);
+      } else {
+        const outcome = await owner.releaseExact(sessionId, exactBinding);
+        if (outcome === "preserved") throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+      }
       this.#activeBindings.delete(sessionId);
       this.#workspaces.unregister(binding.workspaceId);
       if (persistedBinding !== undefined && persistedBinding.state !== "preserved") {
@@ -948,7 +968,6 @@ export class SessionWorktreeCoordinator {
     const session = this.#store.getSession(sessionId);
     const binding = session.descriptor.worktree;
     if (binding === undefined) return;
-    if (binding.remote !== undefined) throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     const cleanup = this.#store.findPendingSessionLifecycleCleanup(sessionId);
     const retiredArchiveOperationId = cleanup?.disposition === "archive" && cleanup.releaseWorktree
       && cleanup.closeCompleted && cleanup.nativeCompleted && !cleanup.worktreeCompleted ? cleanup.operationId : undefined;
@@ -966,6 +985,18 @@ export class SessionWorktreeCoordinator {
         throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
       }
     };
+    if (binding.remote !== undefined) {
+      if (binding.remote.binding.kind !== "ssh" || retiredArchiveOperationId === undefined) {
+        throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+      }
+      assertCurrent();
+      await this.#requireRemoteOwner().assertExact(sessionId, binding);
+      assertCurrent();
+      this.#activeBindings.delete(sessionId);
+      this.#workspaces.unregister(binding.workspaceId);
+      this.#store.updateSessionWorktreeState(sessionId, "preserved");
+      return;
+    }
     const options = { retainForRestore: true, assertCurrent };
     const result = retiredArchiveOperationId === undefined
       ? await this.#service.release(sessionId, options)
@@ -1004,7 +1035,6 @@ export class SessionWorktreeCoordinator {
     const session = this.#store.getSession(sessionId);
     const binding = session.descriptor.worktree;
     if (binding === undefined) return;
-    if (binding.remote !== undefined) throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     const target = this.#store.getTarget(session.descriptor.targetId);
     const assertCurrent = (): void => {
       options?.assertCurrent?.();
@@ -1015,19 +1045,33 @@ export class SessionWorktreeCoordinator {
         || current.worktree === undefined || !samePersistedBinding(current.worktree, binding)) {
         throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
       }
+      if (binding.remote !== undefined) {
+        options?.signal?.throwIfAborted();
+        if (this.#store.findPendingSessionLifecycleCleanup(sessionId) !== undefined) {
+          throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+        }
+      }
     };
-    const result = await this.#service.acquire({
-      sessionId,
-      cwd: binding.repositoryRoot
-    }, { ...options, assertCurrent });
-    if (!result.ok) {
+    if (binding.remote !== undefined) {
+      if (binding.remote.binding.kind !== "ssh" || !session.descriptor.archived
+        || session.descriptor.deletedAt !== undefined || binding.state !== "preserved") {
+        throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+      }
       assertCurrent();
-      throw new SessionWorktreeCoordinatorError(result.error.code);
-    }
-    const lease = result.value.lease;
-    if (!sameLease(lease, { ...binding, state: "active" })) {
-      await this.#service.release(sessionId, { retainForRestore: true }).catch(() => undefined);
-      throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+      await this.#requireRemoteOwner().assertExact(sessionId, { ...binding, state: "active" }, options?.signal);
+    } else {
+      const result = await this.#service.acquire({
+        sessionId,
+        cwd: binding.repositoryRoot
+      }, { ...options, assertCurrent });
+      if (!result.ok) {
+        assertCurrent();
+        throw new SessionWorktreeCoordinatorError(result.error.code);
+      }
+      if (!sameLease(result.value.lease, { ...binding, state: "active" })) {
+        await this.#service.release(sessionId, { retainForRestore: true }).catch(() => undefined);
+        throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+      }
     }
     try {
       assertCurrent();
@@ -1037,7 +1081,9 @@ export class SessionWorktreeCoordinator {
       this.#activeBindings.set(sessionId, this.#store.getSession(sessionId).descriptor.worktree!);
     } catch (error) {
       this.#workspaces.unregister(binding.workspaceId);
-      await this.#service.release(sessionId, { retainForRestore: true }).catch(() => undefined);
+      if (binding.remote === undefined) {
+        await this.#service.release(sessionId, { retainForRestore: true }).catch(() => undefined);
+      }
       this.#activeBindings.delete(sessionId);
       throw error;
     }

@@ -352,6 +352,8 @@ describe("remote Git checkout authority", () => {
       const manifestPath = join(storageRoot, "leases", `${lease.id}.json`);
       const active = JSON.parse(await readFile(manifestPath, "utf8")) as { phase: string };
       expect(active.phase).toBe("active");
+      await expect(service.assertReleased(lease)).rejects.toMatchObject({ code: "LEASE_CONFLICT", stateMayHaveChanged: false });
+      await expect(service.assertExact(lease)).resolves.toBeUndefined();
       await writeFile(manifestPath, JSON.stringify({ ...active, phase: "releasing" }));
       git(["worktree", "remove", lease.path]);
       await expect(readFile(join(lease.path, ".git"))).rejects.toMatchObject({ code: "ENOENT" });
@@ -360,6 +362,7 @@ describe("remote Git checkout authority", () => {
 
       await expect(service.inspectExact(plan)).resolves.toEqual({ status: "releasing", lease });
       await expect(service.assertExact(lease)).rejects.toMatchObject({ code: "LEASE_CONFLICT" });
+      await expect(service.assertReleased(lease)).rejects.toMatchObject({ code: "LEASE_CONFLICT", stateMayHaveChanged: false });
       await expect(service.cleanupPending(plan)).rejects.toMatchObject({ code: "LEASE_CONFLICT" });
       const originalRepository = join(root, "original-project");
       await rename(repositoryRoot, originalRepository);
@@ -373,6 +376,10 @@ describe("remote Git checkout authority", () => {
 
       await expect(service.releaseExact(lease)).resolves.toBe("released");
       await expect(service.inspectExact(plan)).resolves.toEqual({ status: "released" });
+      const released = await readFile(manifestPath);
+      await expect(service.assertReleased(lease)).resolves.toBeUndefined();
+      await expect(service.assertReleased({ ...lease, acquiredAt: lease.acquiredAt + 1 })).rejects.toMatchObject({ code: "LEASE_CONFLICT" });
+      expect(await readFile(manifestPath)).toEqual(released);
       await expect(service.releaseExact(lease)).resolves.toBe("released");
       expect(git(["show-ref", "--verify", "--hash", `refs/heads/${lease.branch}`]).trim()).toBe(plan.sourceCommit);
     } finally {

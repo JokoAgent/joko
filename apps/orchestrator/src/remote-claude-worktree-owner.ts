@@ -78,6 +78,11 @@ export class RemoteClaudeWorktreeOwner {
     await (await this.#captureFor(lease.remote, signal)).service.assertExact(lease, signal);
   }
 
+  async assertReleased(sessionId: string, binding: SessionWorktreeBinding): Promise<void> {
+    const lease = remoteLeaseFromBinding(sessionId, binding);
+    await (await this.#captureFor(lease.remote)).service.assertReleased(lease);
+  }
+
   async releaseExact(sessionId: string, binding: SessionWorktreeBinding, signal?: AbortSignal, assertReclamationCurrent?: () => void): Promise<"released" | "preserved"> {
     const lease = remoteLeaseFromBinding(sessionId, binding);
     return (await this.#captureFor(lease.remote, signal, undefined, assertReclamationCurrent)).service.releaseExact(lease, signal);

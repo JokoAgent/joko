@@ -803,6 +803,96 @@ describe("SessionWorktreeCoordinator lifecycle", () => {
 });
 
 describe("remote checkout coordination", () => {
+  test("archives and restores the exact retained SSH checkout without a remote write", async () => {
+    const f = await remoteFixture();
+    const binding = remoteBindingFromLease(f.plan.workspaceId, f.lease);
+    const task = f.session("child", "native://child");
+    f.store.createSession({ ...task, worktree: binding });
+    await f.worktrees.initialize();
+    expect(f.workspaces.listRegistrations()).toHaveLength(1);
+    const operationId = "archive-ssh-checkout";
+    f.store.prepareSessionLifecycleCleanup({ operationId, sessionId: task.id, disposition: "archive", releaseWorktree: true });
+    await expect(f.worktrees.archive(task.id)).rejects.toMatchObject({ code: "SESSION_CONFLICT" });
+    f.store.advanceSessionLifecycleCleanup({ operationId, phase: "close" });
+
+    await f.restart();
+    expect(f.workspaces.listRegistrations()).toEqual([]);
+    await f.worktrees.archive(task.id);
+    f.store.advanceSessionLifecycleCleanup({ operationId, phase: "worktree" });
+    f.store.finalizeSessionLifecycleCleanup({ operationId });
+    expect(f.store.getSession(task.id).descriptor).toMatchObject({ archived: true, binding: task.binding,
+      worktree: { leaseId: binding.leaseId, remote: binding.remote, state: "preserved" } });
+    await expect(f.worktrees.previewRemoval(task.id)).resolves.toEqual({ hasWorktree: true, dirty: true });
+    expect(f.workspaces.listRegistrations()).toEqual([]);
+
+    const connection = f.store.createConnection({ id: "restore-ssh-owner", name: "Owner", authKeyDigest: "restore-digest" });
+    f.owner.assertExact.mockImplementationOnce(async () => {
+      f.store.revokeConnection(connection.id);
+    });
+    await expect(f.worktrees.restore(task.id, { assertCurrent: () => {
+      f.store.authorizeConnection(connection.id, connection.authKeyDigest);
+    } })).rejects.toThrow();
+    expect(f.workspaces.listRegistrations()).toEqual([]);
+    expect(f.store.getSession(task.id).descriptor.worktree?.state).toBe("preserved");
+
+    await f.worktrees.restore(task.id);
+    f.store.updateSession(task.id, { archived: false });
+    expect(f.store.getSession(task.id).descriptor).toMatchObject({ archived: false, binding: task.binding,
+      worktree: { ...binding, updatedAt: expect.any(Number) } });
+    expect(f.workspaces.listRegistrations()).toContainEqual(expect.objectContaining({ id: binding.workspaceId, root: binding.path }));
+    expect(f.owner.derive).not.toHaveBeenCalled();
+    expect(f.owner.releaseExact).not.toHaveBeenCalled();
+  });
+
+  test("settles only the original SSH deletion after the released binding survives a restart", async () => {
+    const f = await remoteFixture();
+    const binding = remoteBindingFromLease(f.plan.workspaceId, f.lease);
+    const task = f.session("child", "native://child");
+    f.store.createSession({ ...task, worktree: binding });
+    await f.worktrees.initialize();
+    const operationId = "delete-ssh-checkout";
+    f.store.prepareSessionLifecycleCleanup({ operationId, sessionId: task.id, disposition: "delete", releaseWorktree: true });
+    f.store.advanceSessionLifecycleCleanup({ operationId, phase: "close" });
+    await f.worktrees.release(task.id);
+    expect(f.store.getSession(task.id).descriptor.worktree?.state).toBe("preserved");
+    expect(f.store.getSessionLifecycleCleanup(operationId)).toMatchObject({ state: "pending", worktreeCompleted: false });
+
+    await f.restart();
+    expect(f.workspaces.listRegistrations()).toEqual([]);
+    const preserved = f.store.getSession(task.id).descriptor.worktree!;
+    await expect(f.worktrees.release(task.id, preserved)).rejects.toMatchObject({ code: "SESSION_CONFLICT" });
+    expect(f.owner.assertReleased).not.toHaveBeenCalled();
+    f.owner.assertReleased.mockRejectedValueOnce(new Error("The original released manifest is unavailable."));
+    await expect(f.worktrees.release(task.id)).rejects.toThrow("The original released manifest is unavailable.");
+    expect(f.store.getSession(task.id).descriptor.deletedAt).toBeUndefined();
+    await f.worktrees.release(task.id);
+    expect(f.owner.assertReleased).toHaveBeenLastCalledWith(task.id, { ...preserved, state: "active" });
+    expect(f.owner.releaseExact).toHaveBeenCalledOnce();
+    f.store.advanceSessionLifecycleCleanup({ operationId, phase: "worktree" });
+    expect(f.store.finalizeSessionLifecycleCleanup({ operationId })).toMatchObject({ state: "completed" });
+    expect(f.store.getSession(task.id).descriptor).toMatchObject({ archived: true, deletedAt: expect.any(Number), binding: task.binding });
+  });
+
+  test("requires a closed delete to release the SSH checkout retained by archive", async () => {
+    const f = await remoteFixture();
+    const binding = remoteBindingFromLease(f.plan.workspaceId, f.lease);
+    const task = f.session("child", "native://child");
+    f.store.createSession({ ...task, archived: true, worktree: { ...binding, state: "preserved" } });
+    await f.worktrees.initialize();
+    const operationId = "delete-archived-ssh-checkout";
+    f.store.prepareSessionLifecycleCleanup({ operationId, sessionId: task.id, disposition: "delete", releaseWorktree: true });
+    await expect(f.worktrees.release(task.id)).rejects.toMatchObject({ code: "SESSION_CONFLICT" });
+    expect(f.owner.releaseExact).not.toHaveBeenCalled();
+    f.store.advanceSessionLifecycleCleanup({ operationId, phase: "close" });
+    f.owner.releaseExact.mockResolvedValueOnce("preserved");
+    await expect(f.worktrees.release(task.id)).rejects.toMatchObject({ code: "SESSION_CONFLICT" });
+    expect(f.store.getSession(task.id).descriptor.worktree?.state).toBe("preserved");
+    expect(f.store.getSessionLifecycleCleanup(operationId).worktreeCompleted).toBe(false);
+    await expect(f.worktrees.release(task.id)).resolves.toBeUndefined();
+    expect(f.owner.releaseExact).toHaveBeenLastCalledWith(task.id, binding);
+    expect(f.owner.assertReleased).not.toHaveBeenCalled();
+  });
+
   test("fences renamed-project reclamation to the same unadopted durable cleanup claim", async () => {
     const f = await remoteFixture("claude-agent-sdk-stdio");
     await f.worktrees.initialize();
@@ -921,7 +1011,9 @@ describe("remote checkout coordination", () => {
 
 async function remoteFixture(adapterKind = "fixture") {
   const root = await mkdtemp(join(tmpdir(), "joko-remote-worktree-coordinator-"));
-  const store = new OperationalStore(join(root, "store.db"));
+  const databasePath = join(root, "store.db");
+  const storageRoot = join(root, "local-checkouts");
+  let store = new OperationalStore(databasePath);
   store.upsertBackend({ id: "remote-backend", adapterKind, displayName: "Remote",
     version: "1", instanceGeneration: 0, health: "healthy", installationState: "installed",
     authenticationState: "not_required", capabilities: new Map(), models: [], tools: [], diagnostics: [] });
@@ -976,6 +1068,7 @@ async function remoteFixture(adapterKind = "fixture") {
     inspectExact: vi.fn(async (_plan: RemoteGitCheckoutPlan, _signal?: AbortSignal, _assertReclamationCurrent?: () => void) => ({ status: "active" as const, lease })),
     cleanupPending: vi.fn(async () => "released" as const),
     assertExact: vi.fn(async () => undefined),
+    assertReleased: vi.fn(async () => undefined),
     releaseExact: vi.fn(async (): Promise<"released" | "preserved"> => "released")
   };
   const delegate = {
@@ -983,16 +1076,30 @@ async function remoteFixture(adapterKind = "fixture") {
     unregister: vi.fn(),
     close: async () => undefined
   } as unknown as RemoteWorkspaceDelegate;
-  const workspaces = new WorkspaceService({ remoteDelegate: delegate });
-  const worktrees = new SessionWorktreeCoordinator({ store, workspaces, remoteOwner: owner,
-    storageRoot: join(root, "local-checkouts") });
-  cleanups.push(async () => {
+  let workspaces = new WorkspaceService({ remoteDelegate: delegate });
+  let worktrees = new SessionWorktreeCoordinator({ store, workspaces, remoteOwner: owner, storageRoot });
+  const close = async () => {
     worktrees.dispose();
     await workspaces.close();
     store.close();
+  };
+  cleanups.push(async () => {
+    await close();
     await rm(root, { recursive: true, force: true, maxRetries: 3 });
   });
-  return { store, workspaces, worktrees, owner, plan, lease, session };
+  return {
+    get store() { return store; },
+    get workspaces() { return workspaces; },
+    get worktrees() { return worktrees; },
+    owner, plan, lease, session,
+    async restart() {
+      await close();
+      store = new OperationalStore(databasePath);
+      workspaces = new WorkspaceService({ remoteDelegate: delegate });
+      worktrees = new SessionWorktreeCoordinator({ store, workspaces, remoteOwner: owner, storageRoot });
+      await worktrees.initialize();
+    }
+  };
 }
 
 class TargetCaptureAdapter extends FakeBackendAdapter {
