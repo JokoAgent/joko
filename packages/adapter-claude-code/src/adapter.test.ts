@@ -316,6 +316,46 @@ describe("ClaudeCodeAdapter", () => {
     } finally { await adapter.dispose(); }
   });
 
+  test.each(["compacted", "noop"] as const)("keeps the explicit compact command in the current native Query without a conversation Run: %s", async (outcome) => {
+    const runtime = new FakeSdkRuntime({ autoAdmitTurns: false });
+    runtime.queryInitialization = { ...initialization(), commands: [{ name: "compact", description: "Compact", argumentHint: "" }] };
+    const adapter = adapterFor(runtime);
+    try {
+      const base = contextFor();
+      const binding = await adapter.createSession(createInput(), base.context);
+      const nativeId = binding.nativeSessionId!;
+      const query = runtime.queries[0]!;
+      const previous = contextFor(binding, { operationId: "typed-compact-original-input" });
+      const ordinary = adapter.send(textPrompt("One ordinary turn"), previous.context);
+      await eventually(() => query.receivedInputs.length === 1);
+      query.push(systemInit(nativeId));
+      await ordinary;
+      query.push(resultMessage(nativeId, { result: "Original reply", totalCostUsd: 0 }));
+      await eventually(() => previous.events.some((event) => event.type === "done"));
+
+      const context = contextFor(binding, { operationId: "original-compact-control" });
+      let settled = false;
+      const control = adapter.compact("Keep decisions", context.context).then((receipt) => { settled = true; return receipt; });
+      await eventually(() => query.receivedInputs.length === 2);
+      expect(query.receivedInputs[1]!.message.content).toBe("/compact Keep decisions");
+      expect(runtime.queries).toHaveLength(1);
+      query.push({ type: "system", subtype: "status", status: "compacting", uuid: randomUUID(), session_id: nativeId });
+      query.push(systemInit(nativeId));
+      await eventually(() => base.events.some((event) => event.type === "compaction" && event.state === "started"));
+      if (outcome === "compacted") {
+        query.push({ type: "system", subtype: "compact_boundary", session_id: nativeId, uuid: randomUUID(),
+          compact_metadata: { trigger: "manual", pre_tokens: 12_000, post_tokens: 2_000 } });
+        await eventually(() => base.events.some((event) => event.type === "compaction" && event.state === "completed"));
+      }
+      expect(settled).toBe(false);
+      query.push(resultMessage(nativeId, { result: outcome === "compacted" ? "Compacted" : "Not enough messages to compact.", totalCostUsd: 0 }));
+      await expect(control).resolves.toBe(outcome);
+      expect(context.events).toEqual([]);
+      expect(base.events.some((event) => event.type === "message_complete" || event.type === "done")).toBe(false);
+      expect((await adapter.inspectSession(binding, context.context)).compacting).toBe(false);
+    } finally { await adapter.dispose(); }
+  });
+
   test("retains native system failure and exhausted retry facts without exposing native error text", async () => {
     const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
     const adapter = adapterFor(runtime);

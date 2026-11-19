@@ -8739,7 +8739,7 @@ export class SessionHost {
     this.recordFailure("schedule_execution_snapshot", failure);
   }
 
-  async compact(sessionId: string, customInstructions?: string): Promise<"compacted" | "noop"> {
+  async compact(sessionId: string, customInstructions?: string, operationId?: string): Promise<"compacted" | "noop"> {
     if (this.isReviewReadOnlySession(sessionId)) throw new StoreError("Reviewer compaction is disabled.");
     const trimmedInstructions = customInstructions?.trim();
     const instructions = trimmedInstructions === "" ? undefined : trimmedInstructions;
@@ -8764,7 +8764,7 @@ export class SessionHost {
         await this.#dispatchPreparations.get(sessionId)?.settled;
         const active = await this.activate(sessionId);
         const stored = this.#store.getSession(sessionId);
-        const result = await active.adapter.compact(instructions, this.contextFor(stored));
+        const result = await active.adapter.compact(instructions, this.contextFor(stored, undefined, undefined, operationId));
         if (result === "compacted") {
           // compact() acknowledges the native persistence boundary. Project it
           // immediately so the summary/tree leaf is reconnect-safe before this
