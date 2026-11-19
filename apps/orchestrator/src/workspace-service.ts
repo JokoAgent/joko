@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import type { Stats } from "node:fs";
-import { type FileHandle, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, unlink } from "node:fs/promises";
+import { type FileHandle, lstat, mkdir, open, readdir, readFile, readlink, realpath, rename, rm, stat, unlink } from "node:fs/promises";
 import { dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { WORKSPACE_PDF_PREVIEW_MAXIMUM_BYTES, reviewImageRasterMimeByExtension, workspaceEntryAbsentRevision, workspaceFileMetadataRevision as metadataFileRevision } from "@joko/contracts";
 import { JokoError, type RemoteWorkspaceBinding } from "@joko/core";
@@ -2365,7 +2365,7 @@ export class WorkspaceService {
   async #readWorktreeImageSide(workspace: WorkspaceRegistration, path: string): Promise<WorkspaceGitImageSide> {
     const mediaType = imageMediaType(path);
     if (mediaType === undefined) return missingImageSide(path);
-    const resolved = await this.#resolveGitRegularFile(workspace, path, true);
+    const resolved = await this.#resolveGitWorktreeFile(workspace, path, { allowMissing: true });
     if (resolved === undefined) return missingImageSide(path, mediaType);
     if (resolved.info.size > WORKSPACE_GIT_IMAGE_MAXIMUM_BYTES) {
       return { present: true, tooLarge: true, path, mediaType };
@@ -2378,7 +2378,7 @@ export class WorkspaceService {
   }
 
   async #readWorktreeFilePrefix(workspace: WorkspaceRegistration, path: string, maximumBytes: number): Promise<Buffer> {
-    const resolved = await this.#resolveGitRegularFile(workspace, path, false);
+    const resolved = await this.#resolveGitWorktreeFile(workspace, path);
     if (resolved === undefined) throw new WorkspaceGitReviewError("The selected workspace file is unavailable.", "unsupported");
     const handle = await open(resolved.absolute, "r");
     try {
@@ -2397,11 +2397,11 @@ export class WorkspaceService {
     }
   }
 
-  async #resolveGitRegularFile(
+  async #resolveGitWorktreeFile(
     workspace: WorkspaceRegistration,
     path: string,
-    allowMissing: boolean
-  ): Promise<{ readonly absolute: string; readonly info: Stats } | undefined> {
+    options: { readonly allowMissing?: boolean; readonly allowLeafLink?: boolean } = {}
+  ): Promise<{ readonly absolute: string; readonly info: Stats; readonly linkTarget?: Buffer } | undefined> {
     const canonical = canonicalGitRelativePath(path);
     const absolute = resolve(workspace.root, ...canonical.split("/"));
     let current = workspace.root;
@@ -2412,7 +2412,18 @@ export class WorkspaceService {
         current = resolve(current, parts[index]!);
         const info = await lstat(current);
         if (info.isSymbolicLink()) {
-          throw new WorkspaceGitReviewError("Workspace symbolic links are not supported by Review file actions.", "unsupported");
+          if (index < parts.length - 1 || options.allowLeafLink !== true) {
+            throw new WorkspaceGitReviewError("This Review action does not support symbolic links.", "unsupported");
+          }
+          const parent = dirname(absolute);
+          if (await realpath(parent) !== parent) {
+            throw new WorkspaceGitReviewError("Workspace Review path is not canonical.", "invalid");
+          }
+          const linkTarget = await readlink(absolute, { encoding: "buffer" });
+          if (!sameFileState(info, await lstat(absolute))) {
+            throw new WorkspaceGitReviewError("The symbolic link changed while Review was reading it.", "stale");
+          }
+          return { absolute, info, linkTarget };
         }
         if (index < parts.length - 1 && !info.isDirectory()) {
           throw new WorkspaceGitReviewError("Workspace Review path parent is not a directory.", "unsupported");
@@ -2425,7 +2436,7 @@ export class WorkspaceService {
       }
     } catch (error) {
       if (error instanceof WorkspaceGitReviewError) throw error;
-      if (allowMissing && isMissingFilesystemError(error)) return undefined;
+      if (options.allowMissing === true && isMissingFilesystemError(error)) return undefined;
       throw new WorkspaceGitReviewError("The selected workspace file is unavailable.", "unsupported");
     }
     if (targetInfo === undefined || !targetInfo.isFile() || targetInfo.isSymbolicLink()) {
@@ -2453,8 +2464,22 @@ export class WorkspaceService {
     if (records.length !== 1 || records[0] !== `?? ${path}`) {
       throw new WorkspaceGitReviewError("The selected file diff is stale or unsupported.", "stale");
     }
-    const resolved = await this.#resolveGitRegularFile(workspace, path, false);
+    const resolved = await this.#resolveGitWorktreeFile(workspace, path, { allowLeafLink: action === "stage" && process.platform !== "win32" });
     if (resolved === undefined) throw new WorkspaceGitReviewError("The selected file is unavailable.", "stale");
+    if (resolved.linkTarget !== undefined) {
+      try {
+        const linkText = new TextDecoder("utf-8", { fatal: true }).decode(resolved.linkTarget);
+        const target = resolve(dirname(resolved.absolute), canonicalGitRelativePath(linkText));
+        const targetPath = canonicalWorkspaceMutationPath(toSlash(relative(workspace.root, target)));
+        await this.#resolveGitWorktreeFile(workspace, targetPath);
+      } catch {
+        throw new WorkspaceGitReviewError("Review can stage only symbolic links to regular files within the workspace.", "unsupported");
+      }
+      const current = await this.#resolveGitWorktreeFile(workspace, path, { allowLeafLink: true });
+      if (current?.linkTarget === undefined || !current.linkTarget.equals(resolved.linkTarget) || !sameFileState(current.info, resolved.info)) {
+        throw new WorkspaceGitReviewError("The selected symbolic link changed before staging.", "stale");
+      }
+    }
     try {
       if (action === "stage") {
         await runProcess(this.#gitExecutable, ["add", "--", literalGitPathspec(path)], workspace.root, 20_000, 4 * 1024 * 1024);
@@ -2700,21 +2725,25 @@ export class WorkspaceService {
     let totalBytes = 0;
     for (const path of untracked) {
       let patch: string;
-      const resolved = await this.#resolveGitRegularFile(workspace, path, true).catch((error: unknown) => {
+      const resolved = await this.#resolveGitWorktreeFile(workspace, path, { allowMissing: true, allowLeafLink: true }).catch((error: unknown) => {
         if (error instanceof WorkspaceGitReviewError && error.kind === "unsupported") return undefined;
         throw error;
       });
-      if (resolved === undefined || resolved.info.size > WORKSPACE_TEXT_FILE_MAXIMUM_BYTES) {
+      if (resolved === undefined) {
+        patch = syntheticUntrackedBinaryPatch(path, "0".repeat(40));
+      } else if (resolved.linkTarget !== undefined || resolved.info.size > WORKSPACE_TEXT_FILE_MAXIMUM_BYTES) {
+        const linkTarget = resolved.linkTarget;
         const hash = await runProcess(
           this.#gitExecutable,
-          ["hash-object", "--no-filters", "--", path],
+          ["hash-object", "--no-filters", ...(linkTarget === undefined ? ["--", path] : ["--stdin"])],
           workspace.root,
           20_000,
           1024 * 1024,
-          new Set([0, 128])
+          new Set([0, 128]),
+          linkTarget
         );
         const oid = isImmutableGitObjectId(hash.stdout.trim()) ? hash.stdout.trim() : "0".repeat(40);
-        patch = syntheticUntrackedBinaryPatch(path, oid);
+        patch = syntheticUntrackedBinaryPatch(path, oid, linkTarget === undefined ? "100644" : "120000");
       } else {
         const result = await runProcess(
           this.#gitExecutable,
@@ -4086,7 +4115,7 @@ async function runProcess(
   timeoutMs: number,
   maximumOutput: number,
   accepted = new Set([0]),
-  stdin?: string
+  stdin?: string | Buffer
 ): Promise<ProcessResult> {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(executable, [...args], { cwd, windowsHide: true, stdio: [stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
@@ -4282,12 +4311,12 @@ function quotedGitPatchPath(prefix: "a" | "b", path: string): string {
   return /^[!-~]+$/u.test(value) && !/["\\]/u.test(value) ? value : JSON.stringify(value);
 }
 
-function syntheticUntrackedBinaryPatch(path: string, oid: string): string {
+function syntheticUntrackedBinaryPatch(path: string, oid: string, mode: "100644" | "120000" = "100644"): string {
   const oldPath = quotedGitPatchPath("a", path);
   const newPath = quotedGitPatchPath("b", path);
   return [
     `diff --git ${oldPath} ${newPath}`,
-    "new file mode 100644",
+    `new file mode ${mode}`,
     `index ${"0".repeat(Math.min(oid.length, 40))}..${oid}`,
     `Binary files /dev/null and ${newPath} differ`,
     ""

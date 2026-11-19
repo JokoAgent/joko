@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { createCipheriv, createHash } from "node:crypto";
-import { rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
@@ -260,6 +260,59 @@ describe("Connect Git Review contracts", () => {
       await rm(root, { recursive: true, force: true });
     }
   }, 45_000);
+
+  it.skipIf(process.platform === "win32")("stages a local symbolic link as an index entry without staging its target", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-connect-review-symlink-"));
+    const root = join(directory, "repository");
+    const workspaces = new WorkspaceService();
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: root, windowsHide: true, encoding: "utf8" });
+    const path = "guide-link.txt";
+    const outside = "sibling-link.txt";
+    try {
+      await mkdir(root);
+      git("init", "--quiet");
+      git("config", "core.symlinks", "true");
+      await writeFile(join(root, "guide.txt"), "Original guide contents.\n");
+      git("add", "--", "guide.txt");
+      git("-c", "user.name=Review Test", "-c", "user.email=review@example.test", "commit", "--quiet", "-m", "base");
+      await writeFile(join(directory, "sibling.txt"), "Another workspace.\n");
+      await symlink("guide.txt", join(root, path));
+      await symlink("../sibling.txt", join(root, outside));
+      await workspaces.register({ id: "workspace-review", root, displayName: "Review", trusted: true });
+      const services = createConnectServices(application({ workspaces, capabilities: [
+        "workspace.diff", "workspace.diff.sources", "workspace.diff.stage", "workspace.diff.revert"
+      ] }));
+      const request = create(contract.GetWorkspaceDiffRequestSchema, {
+        workspaceId: "workspace-review", source: contract.GitDiffSource.UNSTAGED
+      });
+      const { diff } = await services.workspace.getWorkspaceDiff(request, context() as never);
+      if (diff === undefined) throw new Error("Review did not return an unstaged diff.");
+      expect(diff.files).toMatchObject([path, outside].map(relativePath => ({ relativePath, binary: true, hunks: [] })));
+
+      const mutate = (relativePath: string, action: contract.WorkspaceDiffAction) => services.operation.submitOperation(
+        create(contract.SubmitOperationRequestSchema, {
+          operationId: `symlink-review-${action}-${relativePath}`,
+          connectionId: connection.id,
+          mutation: create(contract.OperationMutationSchema, {
+            payload: { case: "applyWorkspaceDiffHunk", value: create(contract.ApplyWorkspaceDiffHunkMutationSchema, {
+              workspaceId: request.workspaceId, source: request.source, action, target: contract.WorkspaceDiffTarget.FILE,
+              relativePath, expectedRepositoryRevision: diff.repositoryRevision, confirmRevert: true
+            }) }
+          })
+        }), context() as never);
+      await expect(mutate(outside, contract.WorkspaceDiffAction.STAGE)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+      await expect(mutate(path, contract.WorkspaceDiffAction.REVERT)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+      const result = await mutate(path, contract.WorkspaceDiffAction.STAGE);
+      expect(result.operation?.result?.payload?.case).toBe("acknowledgement");
+      expect(git("ls-files", "--stage", "--", path)).toMatch(/^120000 [a-f0-9]{40,64} 0\tguide-link\.txt\n$/u);
+      expect(git("show", `:${path}`)).toBe("guide.txt");
+      expect(git("diff", "--cached", "--name-only", "-z")).toBe(`${path}\0`);
+      expect(git("status", "--porcelain=v1", "-z", "--", outside)).toBe(`?? ${outside}\0`);
+    } finally {
+      await workspaces.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it("lists the conflicted file in a real combined diff without treating it as an ordinary hunk", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-connect-review-conflict-"));
