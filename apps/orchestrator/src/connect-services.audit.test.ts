@@ -162,8 +162,12 @@ it("admits only an authored Partner starter for the original task's first input"
     .events.find(event => event.eventId === eventId)?.payload?.kind;
   const start = (operationId: string, text: string, sessionId = "partner-task") => ({ operationId, connectionId: owner.id,
     mutation: create(contract.OperationMutationSchema, { preconditions: [{ entity: { kind: contract.EntityKind.SESSION, id: sessionId }, expectedGeneration: 7n }],
-      payload: { case: "sendInput", value: { sessionId, deliveryMode: contract.QueueDeliveryMode.PROMPT, partnerStarterEventId: eventId,
-        input: { parts: [{ content: { case: "text", value: text } }] } } } }) });
+      payload: { case: "sendInput", value: create(contract.SendInputMutationSchema, {
+        sessionId, deliveryMode: contract.QueueDeliveryMode.PROMPT, partnerStarterEventId: eventId,
+        input: create(contract.InputContentSchema, {
+          parts: [create(contract.InputPartSchema, { content: { case: "text", value: text } })]
+        })
+      }) } }) });
   try {
     host.appendImportMessage("partner-task", "package-welcome-test", fallback, () => undefined, opening);
     expect(drain).not.toHaveBeenCalled();

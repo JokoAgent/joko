@@ -18355,8 +18355,9 @@ async function dispatchMutation(
         : strictDerivationIdentity(payload.value.partnerStarterEventId, "send_input.partner_starter_event_id");
       if (starterEventId !== undefined && (disposition !== "prompt" || payload.value.messageEdit !== undefined
         || payload.value.providerGroupRebalance !== undefined || payload.value.overrides !== undefined
-        || payload.value.input === undefined || !equals(contract.InputContentSchema, payload.value.input, create(contract.InputContentSchema,
-          { parts: [{ content: { case: "text", value: prompt.text } }] })))) {
+        || payload.value.input === undefined || !equals(contract.InputContentSchema, payload.value.input, create(contract.InputContentSchema, {
+          parts: [create(contract.InputPartSchema, { content: { case: "text", value: prompt.text } })]
+        })))) {
         throw invalidArgument("Select one exact plain-text option from the original Partner opening.");
       }
       const finish = (execution: OperationExecution<OperationOutcome>) => {
