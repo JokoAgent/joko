@@ -41,6 +41,9 @@ export class ApnsMobilePushProvider implements MobilePushProviderPort {
 
   async send(input: MobilePushDeliveryInput, signal: AbortSignal): Promise<MobilePushDeliveryResult> {
     if (signal.aborted) return { outcome: "unknown", code: "APNS_ABORTED_UNKNOWN" };
+    if (input.collapseId !== undefined && !/^[0-9a-f]{32}$/u.test(input.collapseId)) {
+      return { outcome: "failed", code: "APNS_COLLAPSE_ID_INVALID" };
+    }
     const payload = buildApnsMobilePushPayload(input);
     if (payload.byteLength > APNS_RESPONSE_MAXIMUM_BYTES) {
       return { outcome: "failed", code: "APNS_PAYLOAD_LIMIT" };
@@ -48,12 +51,13 @@ export class ApnsMobilePushProvider implements MobilePushProviderPort {
     const origin = input.environment === "apns_sandbox"
       ? "https://api.sandbox.push.apple.com"
       : "https://api.push.apple.com";
-    return await this.request(origin, input.token, payload, signal);
+    return await this.request(origin, input.token, input.collapseId, payload, signal);
   }
 
   private async request(
     origin: string,
     token: string,
+    collapseId: string | undefined,
     payload: Buffer,
     signal: AbortSignal
   ): Promise<MobilePushDeliveryResult> {
@@ -94,6 +98,7 @@ export class ApnsMobilePushProvider implements MobilePushProviderPort {
           "apns-topic": this.#topic,
           "apns-push-type": "alert",
           "apns-priority": "10",
+          ...(collapseId === undefined ? {} : { "apns-collapse-id": collapseId }),
           "content-type": "application/json",
           "content-length": String(payload.byteLength)
         });
@@ -140,7 +145,8 @@ export class ApnsMobilePushProvider implements MobilePushProviderPort {
 export function buildApnsMobilePushPayload(input: MobilePushDeliveryInput): Buffer {
   return Buffer.from(JSON.stringify({
     aps: {
-      alert: { title: input.title ?? localizedAttentionTitle(input.locale, input.kind), ...(input.title === undefined ? {} : { body: localizedAttentionTitle(input.locale, input.kind) }) }
+      alert: { title: input.title ?? localizedAttentionTitle(input.locale, input.kind), ...(input.title === undefined ? {} : { body: localizedAttentionTitle(input.locale, input.kind) }) },
+      ...(input.collapseId === undefined ? {} : { "thread-id": input.collapseId })
     },
     intent: input.intent
   }), "utf8");
