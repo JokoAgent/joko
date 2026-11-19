@@ -1,19 +1,19 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { WorkspaceEntryListingPolicy } from "@joko/contracts";
+import { RunState, WorkspaceEntryListingPolicy } from "@joko/contracts";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it } from "vitest";
 
-import { OrchestratorE2eFixture } from "./fixture.js";
+import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
 
 const browserPath = process.env.JOKO_BROWSER_EXECUTABLE?.trim();
 const webDirectory = process.env.JOKO_MOUNTED_WEB_DIR?.trim();
 const mountedIt = browserPath && webDirectory ? it : it.skip;
 
-mountedIt("shows locally ignored directories on demand and restores the Files preference", { timeout: 90_000 }, async () => {
+mountedIt("restores the Files visibility preference and keeps a sent file quote out of the task draft", { timeout: 90_000 }, async () => {
   const profile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities, { key: "workspace.files", supported: true }] };
   let fixture: OrchestratorE2eFixture | undefined;
   let browser: Browser | undefined;
@@ -84,6 +84,37 @@ mountedIt("shows locally ignored directories on demand and restores the Files pr
     expect(await row("src/bin").count()).toBe(0);
     expect(await toggle.getAttribute("aria-pressed")).toBe("false");
     expect(await document.getByText(body, { exact: true }).isVisible()).toBe(true);
+
+    const editor = document.locator(".cm-content");
+    await editor.click();
+    await editor.press("ControlOrMeta+a");
+    await editor.dispatchEvent("mouseup", { bubbles: true });
+    await page.locator(".selection-quote-actions").getByRole("button", { name: "Add to chat", exact: true }).click();
+    const filesPane = page.locator(".session-pane--files-rail");
+    await filesPane.locator(".composer-rich-editor__content [data-selection-quote-chip]").getByText(body, { exact: true }).waitFor();
+    const store = fixture.application.store;
+    await filesPane.locator(".send-button").click();
+    const accepted = await waitFor(async () => store.listQueueItems({ sessionId })[0], value => value !== undefined, "the original file quote");
+    if (accepted === undefined) throw new Error("The file quote did not reach the task queue.");
+    expect(accepted.body.quotesEncoded).toBe(true);
+    expect(accepted.body.text).toContain("src/bin/note.txt");
+    expect(accepted.body.text).toContain(body);
+    await waitFor(() => manager.clients.run.getRun({ runId: accepted.runId }), value => value.run?.state === RunState.SUCCEEDED,
+      "the task's original file quote to settle");
+
+    await page.locator(".workspace-files-sidebar__back-slot button").click();
+    const task = page.locator(`.session-pane:not(.session-pane--files-rail)[data-input-session-id="${sessionId}"]`);
+    const draft = task.locator(".composer-rich-editor__content");
+    await draft.focus();
+    await draft.press("ControlOrMeta+End");
+    const freshPrompt = "New task input after leaving Files";
+    await page.keyboard.insertText(freshPrompt);
+    expect(await draft.locator("[data-selection-quote-chip]").count()).toBe(0);
+    await task.locator(".send-button").click();
+    const next = await waitFor(async () => store.listQueueItems({ sessionId }).find(item => item.runId !== accepted.runId),
+      value => value !== undefined, "the new input from the same task");
+    expect(next?.body.text).toBe(freshPrompt);
+    expect(next?.body.quotesEncoded).not.toBe(true);
   } finally {
     await browser?.close();
     await fixture?.close();

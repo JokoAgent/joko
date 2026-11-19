@@ -1148,6 +1148,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     fileSelectionQuoteInsertionIdRef.current = nextId;
     setFileSelectionQuoteInsertion(insertion);
   }, []);
+  const consumeFileSelectionQuote = useCallback((insertion: FileSelectionQuoteInsertion): void => {
+    setFileSelectionQuoteInsertion((current) => current === insertion ? undefined : current);
+  }, []);
   useEffect(() => {
     setFileSelectionQuoteInsertion((current) => current?.sessionId === activeSession?.id ? current : undefined);
     setFileAttachmentInsertion((current) => current?.sessionId === activeSession?.id ? current : undefined);
@@ -2113,6 +2116,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       inspectorOpen={embeddedInFiles ? false : inspectorAttached}
       inspectorAvailable={!embeddedInFiles}
       selectionQuoteInsertion={fileSelectionQuoteInsertion?.sessionId === activeSession.id ? fileSelectionQuoteInsertion : undefined}
+      onSelectionQuoteInsertionApplied={consumeFileSelectionQuote}
       attachmentInsertion={fileAttachmentInsertion?.sessionId === activeSession.id ? fileAttachmentInsertion : undefined}
       objectiveDialogHandoff={activeObjectiveDialogHandoff}
       onObjectiveDialogHandoffHandled={(requestId) => setObjectiveDialogHandoff((current) => current?.id === requestId ? undefined : current)}
