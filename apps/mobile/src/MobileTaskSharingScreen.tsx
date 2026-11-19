@@ -15,6 +15,7 @@ export function mobileTaskSharingCopy(locale: MobileSupportedLocale) {
       preview: "Preview invitation", paste: "Paste invitation", share: "Share this task", invite: "Generate and copy invitation", members: "Participants", remove: "Remove participant",
       leave: "Leave task", end: "End sharing", endAll: "End all sharing", cancel: "Cancel", confirm: "Confirm", retry: "Refresh", back: "Back", open: "Open task",
       empty: "No shared tasks.", connect: "Connect to your Home node to manage shared tasks.", unknown: "The result is unknown. Check the original action; it was not resent.",
+      inviteRejected: "This invitation was declined. Ask the task owner for a new link.",
       check: "Check action status", copied: "Invitation copied.", generated: "The invitation was generated, but its link was not received. Explicitly generate a new invitation to replace it.",
       pending: "Pending actions", ended: "Access ended", active: "Active", failed: "Failed", reconnect: "Reconnect", creating: "Working…", choose: "Choose a task to share", joinedOk: "Joined this task.",
       warning: "Invited participants can view and control this task. You can remove them or end sharing.", backend: "Backend", thinking: "Thinking", enabled: "On", disabled: "Off" },
@@ -22,6 +23,7 @@ export function mobileTaskSharingCopy(locale: MobileSupportedLocale) {
       preview: "预览邀请", paste: "粘贴邀请", share: "共享此任务", invite: "生成并复制邀请", members: "参与者", remove: "移除参与者",
       leave: "离开任务", end: "结束共享", endAll: "结束全部共享", cancel: "取消", confirm: "确认", retry: "刷新", back: "返回", open: "打开任务",
       empty: "暂无共享任务。", connect: "连接到你的 Home 节点以管理共享任务。", unknown: "结果尚未确认。请核对原操作，系统没有重新发送。",
+      inviteRejected: "此邀请已被拒绝。请向任务所有者索取新的链接。",
       check: "核对操作状态", copied: "已复制邀请。", generated: "邀请已生成，但未收到链接。请明确重新生成邀请，替换旧邀请。",
       pending: "待确认操作", ended: "访问已结束", active: "有效", failed: "失败", reconnect: "重新连接", creating: "处理中…", choose: "选择要共享的任务", joinedOk: "已加入任务。",
       warning: "受邀参与者可以观看和控制此任务。你可以移除参与者或结束共享。", backend: "Backend", thinking: "思考", enabled: "开", disabled: "关" },
@@ -29,6 +31,7 @@ export function mobileTaskSharingCopy(locale: MobileSupportedLocale) {
       preview: "招待を確認", paste: "招待を貼り付け", share: "このタスクを共有", invite: "招待を作成してコピー", members: "参加者", remove: "参加者を削除",
       leave: "タスクから退出", end: "共有を終了", endAll: "すべての共有を終了", cancel: "キャンセル", confirm: "確認", retry: "更新", back: "戻る", open: "タスクを開く",
       empty: "共有タスクはありません。", connect: "Home ノードに接続してください。", unknown: "結果は未確認です。元の操作を確認してください。再送信はしていません。",
+      inviteRejected: "この招待は拒否されました。タスクの所有者に新しいリンクを依頼してください。",
       check: "操作結果を確認", copied: "招待をコピーしました。", generated: "招待は作成されましたが、リンクを受信できませんでした。新しい招待を明示的に作成してください。",
       pending: "未確認の操作", ended: "アクセス終了", active: "有効", failed: "失敗", reconnect: "再接続", creating: "処理中…", choose: "共有するタスクを選択", joinedOk: "タスクに参加しました。",
       warning: "参加者はこのタスクを表示・操作できます。参加者の削除や共有の終了が可能です。", backend: "Backend", thinking: "思考", enabled: "オン", disabled: "オフ" },
@@ -36,6 +39,7 @@ export function mobileTaskSharingCopy(locale: MobileSupportedLocale) {
       preview: "초대 확인", paste: "초대 붙여넣기", share: "이 작업 공유", invite: "초대 생성 및 복사", members: "참여자", remove: "참여자 제거",
       leave: "작업 나가기", end: "공유 종료", endAll: "모든 공유 종료", cancel: "취소", confirm: "확인", retry: "새로 고침", back: "뒤로", open: "작업 열기",
       empty: "공유 작업이 없습니다.", connect: "Home 노드에 연결하세요.", unknown: "결과를 확인할 수 없습니다. 원래 작업의 상태를 확인하세요. 자동으로 재전송하지 않았습니다.",
+      inviteRejected: "이 초대가 거부되었습니다. 작업 소유자에게 새 링크를 요청하세요.",
       check: "작업 상태 확인", copied: "초대를 복사했습니다.", generated: "초대가 생성되었지만 링크를 받지 못했습니다. 새 초대를 명시적으로 생성하세요.",
       pending: "확인 대기 작업", ended: "접근 종료", active: "활성", failed: "실패", reconnect: "다시 연결", creating: "처리 중…", choose: "공유할 작업 선택", joinedOk: "작업에 참여했습니다.",
       warning: "초대된 참여자는 작업을 보고 제어할 수 있습니다. 참여자를 제거하거나 공유를 종료할 수 있습니다.", backend: "Backend", thinking: "사고", enabled: "켜짐", disabled: "꺼짐" }
@@ -152,7 +156,8 @@ export function MobileTaskSharingScreen({ client, state, colors, locale, foregro
           Code.InvalidArgument, Code.FailedPrecondition, Code.Unauthenticated, Code.PermissionDenied
         ].includes(failure.code);
         if (rejected) await retain(actionsRef.current.filter(action => action.operationId !== operationId));
-        setError(`${rejected ? "" : `${t.unknown} `}${errorText(failure)}`);
+        const reason = kind === "join" && failure instanceof ConnectError ? failure.rawMessage : errorText(failure);
+        setError(`${rejected ? "" : `${t.unknown} `}${reason}`);
       }
       return false;
     }
@@ -183,7 +188,7 @@ export function MobileTaskSharingScreen({ client, state, colors, locale, foregro
         if (response.intent?.operationId !== action.operationId) throw new Error("The join receipt belongs to another action.");
         if (response.intent.status === "joined" || response.intent.status === "failed") {
           await retain(actionsRef.current.filter(item => item.operationId !== action.operationId));
-          setNotice(response.intent.status === "joined" ? t.joinedOk : t.failed);
+          setNotice(response.intent.status === "joined" ? t.joinedOk : t.inviteRejected);
         } else setError(t.unknown);
       } else {
         const receipt = await api.lookupAction(action.operationId, signal);
@@ -248,7 +253,12 @@ export function MobileTaskSharingScreen({ client, state, colors, locale, foregro
     let accepted: JoinedTaskShare | undefined;
     void run("join", async (service, operationId, signal) => {
       const result = await service.join(operationId, approved.scope.draft.value, name, signal);
+      signal.throwIfAborted();
       if (result.intent?.operationId !== operationId) throw new Error("The join receipt belongs to another action.");
+      if (result.intent.status === "failed") {
+        if (ownsInvitation(approved.scope)) retirePreview();
+        throw new ConnectError(t.inviteRejected, Code.PermissionDenied);
+      }
       if (result.intent.status !== "joined" || !result.intent.joined) throw new Error(t.unknown);
       accepted = result.intent.joined;
     }).then(confirmed => {

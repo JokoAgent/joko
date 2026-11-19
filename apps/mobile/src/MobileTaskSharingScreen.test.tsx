@@ -59,7 +59,7 @@ it.each([Code.Unavailable, Code.FailedPrecondition])("recovers a rejected or nev
   expect(api.create).toHaveBeenCalledOnce();
 });
 
-it("adopts a newer native invitation without displaying or joining the earlier preview", async () => {
+it.each([false, true])("adopts only the newer native invitation and settles its Join result (rejected: %s)", async rejected => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   const shareFor = (letter: "a" | "b") => create(TaskShareSchema, {
     shareId: `share-${letter}`, sessionId: `task-${letter}`, shareGeneration: 1n, title: `Shared task ${letter.toUpperCase()}`,
@@ -78,7 +78,8 @@ it("adopts a newer native invitation without displaying or joining the earlier p
       reads.set(invitation, { signal, finish });
     })),
     join: vi.fn(async (operationId: string) => create(JoinTaskShareResponseSchema, {
-      intent: { operationId, status: "joined", joined: { joinId: "joined-b", share: shareFor("b") } }
+      intent: rejected ? { operationId, status: "failed", errorCode: "PERMISSION_DENIED" }
+        : { operationId, status: "joined", joined: { joinId: "joined-b", share: shareFor("b") } }
     }))
   };
   const openJoinedTask = vi.fn(async () => undefined), onOpenTask = vi.fn(), onInvitationConsumed = vi.fn();
@@ -121,6 +122,15 @@ it("adopts a newer native invitation without displaying or joining the earlier p
   expect(host.textContent).toContain("Shared task B · https://b.example.test");
   await click("Join task");
   expect(api.join).toHaveBeenCalledExactlyOnceWith("join-b", b, "Participant", expect.any(AbortSignal));
-  expect(openJoinedTask).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ joinId: "joined-b", share: shareFor("b") }));
-  expect(onOpenTask).toHaveBeenCalledOnce();
+  if (rejected) {
+    expect(storage.setItem.mock.lastCall).toEqual([expect.any(String), "[]"]);
+    expect(host.textContent).toContain("Ask the task owner for a new link.");
+    expect(button("Join task")).toBeUndefined();
+    expect(button("Preview invitation")?.disabled).toBe(false);
+    expect(openJoinedTask).not.toHaveBeenCalled();
+    expect(onOpenTask).not.toHaveBeenCalled();
+  } else {
+    expect(openJoinedTask).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ joinId: "joined-b", share: shareFor("b") }));
+    expect(onOpenTask).toHaveBeenCalledOnce();
+  }
 });

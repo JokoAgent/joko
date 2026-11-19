@@ -1,7 +1,7 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError, type Client } from "@connectrpc/connect";
 import { createHash } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -9,6 +9,11 @@ import * as contract from "@joko/contracts";
 import { CredentialVault } from "./credential-vault.js";
 import { TaskSharingHome, type TaskSharingHomeAuthority, type TaskSharingHomeRemote } from "./task-sharing-home.js";
 import { mkdtemp } from "./test-paths.js";
+
+vi.mock("node:fs/promises", async importOriginal => {
+  const fs = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...fs, rename: vi.fn(fs.rename) };
+});
 
 const invitation = contract.buildTaskShareInvitation({ hostOrigin: "http://127.0.0.1:34567", hostServerId: "host-server",
   endpointPublicKey: `ed25519:${"a".repeat(64)}`, shareId: "share-one", shareGeneration: 1n, inviteSecret: "a".repeat(43) });
@@ -52,6 +57,67 @@ async function owner(remote: TaskSharingHomeRemote) {
 }
 
 describe("TaskSharingHome", () => {
+  it("settles a verified Host denial after preview without retrying the original Join", async () => {
+    const value = fixture(), { home, vault, directory } = await owner(value.remote), auth = authority();
+    await home.preview(invitation, auth);
+    value.accept.mockRejectedValueOnce(new ConnectError("The task invitation is no longer available.", Code.PermissionDenied));
+    const failed = await home.join("join-rejected", invitation, "Guest", auth);
+    expect(failed).toMatchObject({ operationId: "join-rejected", status: "failed", errorCode: "PERMISSION_DENIED" });
+    expect(failed.joined).toBeUndefined();
+    expect(value.inspect).toHaveBeenCalledTimes(2);
+    expect(value.accept).toHaveBeenCalledOnce();
+    await home.dispose();
+
+    const restarted = new TaskSharingHome({ directory, vault, serverId: "home-server", connect: () => value.remote });
+    await restarted.initialize();
+    expect(await restarted.lookup("join-rejected", auth)).toEqual(failed);
+    expect(await restarted.join("join-rejected", invitation, "Guest", auth)).toEqual(failed);
+    expect(value.accept).toHaveBeenCalledOnce();
+    expect(value.lookup).not.toHaveBeenCalled();
+    expect(restarted.list().joined).toEqual([]);
+    await restarted.dispose();
+  });
+
+  it("recovers a Host-accepted Join after the first Home publish fails", async () => {
+    const value = fixture(), original = value.accept.getMockImplementation()!;
+    value.accept.mockImplementationOnce(async request => {
+      const accepted = await original(request);
+      vi.mocked(rename).mockRejectedValueOnce(new Error("The first Home publish failed."));
+      return accepted;
+    });
+    const { home, vault, directory } = await owner(value.remote), auth = authority();
+    const first = await home.join("join-save-failed", invitation, "Guest", auth);
+    expect(first).toMatchObject({ operationId: "join-save-failed", status: "unknown" });
+    expect(first.joined).toBeUndefined();
+    expect(home.list().joined).toEqual([]);
+    await home.dispose();
+
+    const restarted = new TaskSharingHome({ directory, vault, serverId: "home-server", connect: () => value.remote });
+    await restarted.initialize();
+    const recovered = await restarted.lookup(first.operationId, auth);
+    expect(recovered).toMatchObject({ operationId: first.operationId, status: "joined", joined: { member: { memberId: "member-one" } } });
+    expect(value.accept).toHaveBeenCalledOnce();
+    expect(value.lookup).toHaveBeenCalledOnce();
+    expect(restarted.list().joined).toEqual([recovered.joined]);
+    await restarted.dispose();
+  });
+
+  it("settles a previous v1 unknown intent with an exact durable member", async () => {
+    const value = fixture(), { home, vault, directory } = await owner(value.remote), auth = authority();
+    const applied = await home.join("join-old-v1", invitation, "Guest", auth);
+    await home.dispose();
+    const path = join(directory, "home.json"), disk = JSON.parse(await readFile(path, "utf8"));
+    disk.intents[0].status = "unknown";
+    disk.intents[0].errorCode = "UNAVAILABLE";
+    await writeFile(path, JSON.stringify(disk));
+    const restarted = new TaskSharingHome({ directory, vault, serverId: "home-server", connect: () => value.remote });
+    await restarted.initialize();
+    expect(await restarted.lookup(applied.operationId, auth)).toEqual(applied);
+    expect(value.lookup).not.toHaveBeenCalled();
+    expect(restarted.list().joined).toEqual([applied.joined]);
+    await restarted.dispose();
+  });
+
   it("recovers a lost Join response after restart with the sealed original secret and no second Join", async () => {
     const fixtureValue = fixture(), original = fixtureValue.accept.getMockImplementation()!;
     fixtureValue.accept.mockImplementationOnce(async request => { await original(request); throw new ConnectError("Response lost.", Code.Unavailable); });

@@ -38,6 +38,12 @@ interface StoredJoin {
   readonly credentialReference: string;
   readonly sealed: EncryptedCredential;
 }
+interface SettledJoin {
+  readonly original: StoredIntent;
+  readonly intent: StoredIntent;
+  readonly joined?: StoredJoin;
+  readonly assertCurrent: () => void;
+}
 interface StoredWrite {
   readonly joinId: string;
   readonly operationId: string;
@@ -133,14 +139,21 @@ export class TaskSharingHome {
         status: "prepared", errorCode: "" };
       this.#intents.set(operationId, intent); await this.#save(); auth.assertCurrent();
       intent.status = "sent"; await this.#save(); auth.assertCurrent();
+      let rejected = false;
       try {
         const remote = this.#remote(parsed.hostOrigin, parsed.endpointPublicKey); await remote.verify(parsed.hostServerId, auth.signal); auth.assertCurrent();
         const response = await remote.guest.acceptTaskShareJoin({ intentId: operationId, invitation, credentialSha256Hex: intent.credentialSha256Hex,
-          displayName: name, homeServerId: this.options.serverId, homeDeviceId: auth.deviceId }, { signal: auth.signal });
-        auth.assertCurrent(); await this.#accept(intent, response.share, response.member, secret); auth.assertCurrent();
+          displayName: name, homeServerId: this.options.serverId, homeDeviceId: auth.deviceId }, { signal: auth.signal }).catch((error: unknown) => {
+          // The verified Host rejects an invalid invitation before admitting this join.
+          rejected = error instanceof ConnectError && error.code === Code.PermissionDenied;
+          throw error;
+        });
+        auth.assertCurrent(); await this.#accept(intent, response.share, response.member, secret, auth);
       } catch (error) {
-        intent.status = "unknown"; intent.errorCode = safeCode(error); await this.#save(); auth.assertCurrent();
+        if (rejected) await this.#settleJoin(intent, "failed", safeCode(error), auth);
+        else { intent.status = "unknown"; intent.errorCode = safeCode(error); await this.#save(); }
       }
+      auth.assertCurrent();
       return this.#intent(intent);
     }).finally(() => this.#joinInputs.delete(operationId));
   }
@@ -347,27 +360,51 @@ export class TaskSharingHome {
     }
   }
   async #recover(intent: StoredIntent, auth: TaskSharingHomeAuthority): Promise<contract.TaskShareJoinIntent> {
-    const remote = this.#remote(intent.hostOrigin, intent.endpointPublicKey); auth.assertCurrent();
+    auth.assertCurrent();
+    // Older v1 Home files can have saved the accepted member alongside an
+    // unknown join whose tentative credential was already cleared.
+    const existing = this.#joined.get(intent.joinId);
+    if (existing && existing.endpointPublicKey === intent.endpointPublicKey) {
+      const joined = fromJsonString(contract.JoinedTaskShareSchema, existing.value);
+      const share = joined.share;
+      if (share?.hostServerId === intent.hostServerId && share.hostOrigin === intent.hostOrigin &&
+        share.shareId === intent.shareId && String(share.shareGeneration) === intent.shareGeneration &&
+        existing.credentialReference === this.#joinedReference(joined, existing.endpointPublicKey)) {
+        const secret = this.options.vault.open(existing.sealed, existing.credentialReference);
+        if (digest(secret) === intent.credentialSha256Hex || joined.status === "left" && secret === "{}") {
+          await this.#settleJoin(intent, "joined", "", auth);
+          auth.assertCurrent();
+          return this.#intent(intent);
+        }
+      }
+    }
+    const remote = this.#remote(intent.hostOrigin, intent.endpointPublicKey);
     await remote.verify(intent.hostServerId, auth.signal); auth.assertCurrent();
     const sealed = JSON.parse(this.options.vault.open(intent.sealed,
-      this.#intentReference(intent.operationId, intent.joinId, intent.hostServerId, intent.shareId))) as { secret: string };
+      this.#intentReference(intent.operationId, intent.joinId, intent.hostServerId, intent.shareId))) as { secret?: string };
+    if (typeof sealed.secret !== "string" || digest(sealed.secret) !== intent.credentialSha256Hex) throw unavailable();
     try {
       const result = await remote.guest.getTaskShareJoinReceipt({ intentId: intent.operationId, credentialSha256Hex: intent.credentialSha256Hex },
         { signal: auth.signal, headers: { authorization: `TaskShareGuest ${sealed.secret}` } });
-      auth.assertCurrent(); await this.#accept(intent, result.share, result.member, sealed.secret); auth.assertCurrent();
-    } catch (error) { intent.status = "unknown"; intent.errorCode = safeCode(error); await this.#save(); auth.assertCurrent(); }
+      auth.assertCurrent(); await this.#accept(intent, result.share, result.member, sealed.secret, auth);
+    } catch (error) { intent.status = "unknown"; intent.errorCode = safeCode(error); await this.#save(); }
+    auth.assertCurrent();
     return this.#intent(intent);
   }
-  async #accept(intent: StoredIntent, share: contract.TaskShare | undefined, member: contract.TaskShareMember | undefined, secret: string): Promise<void> {
+  async #accept(intent: StoredIntent, share: contract.TaskShare | undefined, member: contract.TaskShareMember | undefined, secret: string,
+    auth: TaskSharingHomeAuthority): Promise<void> {
     const pinnedShare = this.#checkInvitationShare({ hostOrigin: intent.hostOrigin, hostServerId: intent.hostServerId, shareId: intent.shareId,
       endpointPublicKey: intent.endpointPublicKey, shareGeneration: BigInt(intent.shareGeneration), inviteSecret: "" }, share);
     if (!member?.memberId || member.memberGeneration < 1n || member.status !== "active") throw unavailable();
     const joined = create(contract.JoinedTaskShareSchema, { joinId: intent.joinId, share: pinnedShare, member, status: "active", joinedAtMs: BigInt((this.options.now ?? Date.now)()) });
     const reference = this.#joinedReference(joined, intent.endpointPublicKey);
-    this.#joined.set(intent.joinId, { value: toJsonString(contract.JoinedTaskShareSchema, joined), endpointPublicKey: intent.endpointPublicKey, credentialReference: reference, sealed: this.options.vault.seal(secret, reference) });
-    this.#lifetimes.set(intent.joinId, new AbortController()); intent.status = "joined"; intent.errorCode = "";
-    intent.sealed = this.options.vault.seal("{}", this.#intentReference(intent.operationId, intent.joinId, intent.hostServerId, intent.shareId));
-    await this.#save();
+    await this.#settleJoin(intent, "joined", "", auth, { value: toJsonString(contract.JoinedTaskShareSchema, joined),
+      endpointPublicKey: intent.endpointPublicKey, credentialReference: reference, sealed: this.options.vault.seal(secret, reference) });
+  }
+  #settleJoin(intent: StoredIntent, status: "joined" | "failed", errorCode: string, auth: TaskSharingHomeAuthority, joined?: StoredJoin): Promise<void> {
+    const sealed = this.options.vault.seal("{}", this.#intentReference(intent.operationId, intent.joinId, intent.hostServerId, intent.shareId));
+    return this.#save({ original: intent, intent: { ...intent, status, errorCode, sealed }, assertCurrent: auth.assertCurrent,
+      ...(joined ? { joined } : {}) });
   }
   #intent(intent: StoredIntent): contract.TaskShareJoinIntent {
     const stored = this.#joined.get(intent.joinId);
@@ -400,16 +437,30 @@ export class TaskSharingHome {
     const old = this.#flights.get(key); if (old) return old as Promise<T>;
     const pending = work().finally(() => { if (this.#flights.get(key) === pending) this.#flights.delete(key); }); this.#flights.set(key, pending); return pending;
   }
-  #save(): Promise<void> {
-    const snapshot: HomeDisk = { format: 1, serverId: this.options.serverId, intents: [...this.#intents.values()].map(value => ({ ...value })),
-      joined: [...this.#joined.values()].map(value => ({ ...value })), writes: [...this.#writes.values()].map(value => ({ ...value })),
-      actions: [...this.#actions.values()].map(value => toJsonString(contract.TaskSharingActionReceiptSchema, value)) };
+  #save(settled?: SettledJoin): Promise<void> {
     const save = this.#saveFlight.then(async () => {
+      settled?.assertCurrent();
+      const joined = [...this.#joined.values()];
+      if (settled?.joined) joined.push(settled.joined);
+      const snapshot: HomeDisk = { format: 1, serverId: this.options.serverId,
+        intents: [...this.#intents.values()].map(value => settled && value === settled.original ? settled.intent : value), joined,
+        writes: [...this.#writes.values()], actions: [...this.#actions.values()].map(value => toJsonString(contract.TaskSharingActionReceiptSchema, value)) };
+      const data = JSON.stringify(snapshot);
       const temporary = join(this.options.directory, `.home-${randomUUID()}.tmp`), destination = join(this.options.directory, "home.json");
       try {
         const file = await open(temporary, "wx", 0o600);
-        try { await file.writeFile(JSON.stringify(snapshot)); await file.sync(); } finally { await file.close(); }
+        try { await file.writeFile(data); await file.sync(); } finally { await file.close(); }
+        settled?.assertCurrent();
         await rename(temporary, destination);
+        if (settled) {
+          Object.assign(settled.original, settled.intent);
+          if (settled.joined) {
+            const lifetime = new AbortController();
+            if (this.#closed) lifetime.abort();
+            this.#joined.set(settled.original.joinId, settled.joined);
+            this.#lifetimes.set(settled.original.joinId, lifetime);
+          }
+        }
       } finally { await unlink(temporary).catch(() => undefined); }
     });
     this.#saveFlight = save.catch(() => undefined); return save;
