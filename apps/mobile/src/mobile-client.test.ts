@@ -14893,9 +14893,16 @@ describe("native current-task Files ownership", () => {
     expect(prepared.references.get(imageKey)?.image).toMatchObject({ width, height });
     expect(prepared.references.get(imageKey)?.image?.nativeQuarterTurn).toBe(portrait ? true : undefined);
     expect(network.downloadBlob).toHaveBeenCalledWith(credential, imageBlob, expect.any(AbortSignal));
-    expect(await app.openMarkdownPath(prepared.leaseId, fileKey, new AbortController().signal)).toMatchObject({ kind: "workspace-entry", entry: readme });
+    const source = await app.openMarkdownPath(prepared.leaseId, fileKey, new AbortController().signal);
+    expect(source).toMatchObject({ kind: "workspace-entry", entry: readme });
     expect(app.state.files.preview).toMatchObject({ kind: "text", text: "#A\n#B\n", focusLine: 2, focusColumn: 1 });
     const filePreview = app.state.files.preview;
+    if (!source) throw new Error("The original Workspace file source is missing.");
+    vi.mocked(network.listWorkspaceDirectory).mockRejectedValueOnce(new ConnectError("The directory could not be listed", Code.Unknown));
+    await app.openFilesPreviewPager(source);
+    expect(app.state.files.preview).toBe(filePreview);
+    expect(app.state.files.previewPager).toBeUndefined();
+    expect(network.readWorkspaceFile).toHaveBeenLastCalledWith(credential, "workspace", "README.md", readme.revision, expect.any(AbortSignal));
     vi.mocked(network.readOwner).mockResolvedValue({ connection, device,
       snapshot: create(SnapshotSchema, { ...projected, snapshotId: "owner-resource-reread",
         revision: { ...projected.revision!, etag: "blob-materialized-10", value: 10n } }) });

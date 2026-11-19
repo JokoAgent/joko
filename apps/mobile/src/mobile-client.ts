@@ -7787,7 +7787,20 @@ export class MobileClient {
         window = { kind: "generated", revision: catalog.revision }; selectedKey = JSON.stringify(["artifact", artifact.artifactId]);
       } else {
         const parent = workspaceParentPath(path);
-        directory = await this.#readFilesPager(() => this.network.listWorkspaceDirectory(context.credential, context.authority.workspace.workspaceId, parent, controller.signal), controller.signal);
+        try {
+          directory = await this.#readFilesPager(() => this.network.listWorkspaceDirectory(context.credential, context.authority.workspace.workspaceId, parent, controller.signal), controller.signal);
+        } catch (error) {
+          assertCurrent();
+          const original = prior?.kind === "text" && prior.workspacePath === path ? prior : undefined;
+          const entry = original?.workspaceEntry;
+          if (original === undefined || this.#state.files.preview !== original || source.kind !== "workspace-entry"
+            || !source.entry.revision || !entry?.revision || entry.workspaceId !== context.authority.workspace.workspaceId
+            || !workspaceComposerRevisionMatches(source.entry.revision, entry.revision)) throw error;
+          // The directory only supplies neighboring pages. Keep the selected text
+          // if its own guarded read still proves the displayed revision and bytes.
+          await this.#readFilesPager(() => this.#assertWorkspaceTextUnchanged(context.credential, original, controller.signal, assertCurrent), controller.signal);
+          return;
+        }
         assertCurrent(); const seen = new Set<string>();
         for (const item of directory.entries) {
           const canonical = canonicalWorkspacePath(item.relativePath);
@@ -8531,13 +8544,7 @@ export class MobileClient {
           || !current?.revision || current.kind !== FileKind.REGULAR || current.workspaceId !== context.authority.workspace.workspaceId
           || normalizeMediaType(current.mediaType) !== normalizeMediaType(preview.mediaType)
           || !workspaceComposerRevisionMatches(current.revision, entry.revision!)) throw new Error("The canonical Workspace text file changed.");
-        const read = await this.network.readWorkspaceFile(credential, entry.workspaceId, entry.relativePath, entry.revision!, signal);
-        assertCurrent(signal);
-        assertWorkspaceFilePreview(entry.workspaceId, entry.relativePath, entry.revision!, read);
-        if (!read.entry?.revision || workspaceEntryRevisionKey(read.entry.revision) !== preview.revisionKey || read.entry.relativePath !== path
-          || read.entry.workspaceId !== entry.workspaceId || read.entry.kind !== FileKind.REGULAR || read.content.case !== "text"
-          || read.content.value.utf8Text !== preview.text || read.content.value.startByte !== preview.startByte || read.content.value.endByte !== preview.endByte
-          || read.truncated !== preview.truncated) throw new Error("The canonical Workspace text bytes changed.");
+        await this.#assertWorkspaceTextUnchanged(credential, preview, signal, () => assertCurrent(signal));
       } else {
         const catalog = await this.network.listSessionArtifacts(credential, this.#state.selectedId!, signal);
         assertCurrent(signal);
@@ -8551,6 +8558,24 @@ export class MobileClient {
       assertCurrent(signal);
     };
     return { path, assertCurrent, revalidate };
+  }
+
+  async #assertWorkspaceTextUnchanged(credential: PairedCredential, preview: Extract<MobileFilePreview, { kind: "text" }>,
+    signal: AbortSignal, assertCurrent: () => void): Promise<void> {
+    assertCurrent();
+    const entry = preview.workspaceEntry;
+    if (!entry?.revision || entry.kind !== FileKind.REGULAR || entry.relativePath !== preview.workspacePath) {
+      throw new Error("The file text has no current canonical source.");
+    }
+    const read = await this.network.readWorkspaceFile(credential, entry.workspaceId, entry.relativePath, entry.revision, signal);
+    assertCurrent();
+    assertWorkspaceFilePreview(entry.workspaceId, entry.relativePath, entry.revision, read);
+    if (!read.entry?.revision || workspaceEntryRevisionKey(read.entry.revision) !== preview.revisionKey
+      || read.entry.kind !== FileKind.REGULAR || normalizeMediaType(read.entry.mediaType) !== normalizeMediaType(preview.mediaType)
+      || read.content.case !== "text" || read.content.value.utf8Text !== preview.text || read.content.value.startByte !== preview.startByte
+      || read.content.value.endByte !== preview.endByte || read.truncated !== preview.truncated) {
+      throw new Error("The canonical Workspace text bytes changed.");
+    }
   }
 
   async addFilesItemToComposer(
