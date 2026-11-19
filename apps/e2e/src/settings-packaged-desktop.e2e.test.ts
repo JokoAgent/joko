@@ -61,8 +61,17 @@ packagedIt("applies the saved dark backing when the Windows application starts c
   const chooseTheme = async (theme: "light" | "dark") => {
     const label = theme === "light" ? /^(?:Theme: Light|主题: 浅色)$/u : /^(?:Theme: Dark|主题: 深色)$/u;
     await main.getByRole("button", { name: label }).click({ timeout: 30_000 });
-    await waitFor(() => readFile(join(first.profilePath, "window-appearance.txt"), "utf8").catch(() => ""),
-      value => value.trim() === theme, "the saved Desktop theme mirror");
+    try {
+      await waitFor(() => readFile(join(first.profilePath, "window-appearance.txt"), "utf8").catch(() => ""),
+        value => value.trim() === theme, `the saved ${theme} Desktop theme mirror`);
+    } catch (error) {
+      const renderer = await main.evaluate(() => {
+        const toggle = document.querySelector<HTMLButtonElement>(".connection-theme-toggle");
+        return { mode: document.documentElement.dataset.theme, label: toggle?.getAttribute("aria-label"), disabled: toggle?.disabled };
+      }).catch(() => undefined);
+      console.error("Packaged settings: theme selection not mirrored.", JSON.stringify({ requested: theme, renderer }));
+      throw error;
+    }
   };
   await chooseTheme("light");
   await chooseTheme("dark");

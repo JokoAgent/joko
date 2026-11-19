@@ -9178,16 +9178,28 @@ function registerIpc(): void {
     return window.isMaximized();
   });
   ipcMain.handle(DESKTOP_CHANNELS.windowMirrorTheme, async (event, theme: unknown) => {
+    const observation = externalPackagedE2e && isDesktopWindowTheme(theme) ? `window_theme_mirror_${theme}` : undefined;
+    if (observation) recordPackagedSmokeProgress(`${observation}_requested`);
     const assertOwner = (): void => {
       assertTrustedIpcSender(event);
       if (quitting || event.sender !== mainWindow?.webContents && !sessionWindows.hasContents(event.sender)) {
         throw new Error("Window appearance requires a current application window.");
       }
     };
-    assertOwner();
     const appearance = desktopWindowAppearance;
-    if (!appearance || !isDesktopWindowTheme(theme)) throw new TypeError("Invalid Desktop window appearance.");
-    await appearance.save(theme, assertOwner);
+    try {
+      assertOwner();
+      if (!appearance || !isDesktopWindowTheme(theme)) throw new TypeError("Invalid Desktop window appearance.");
+      await appearance.save(theme, assertOwner);
+      if (observation) recordPackagedSmokeProgress(`${observation}_saved`);
+    } catch (error) {
+      if (observation) {
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        const outcome = typeof code === "string" && /^[A-Z][A-Z0-9_]{1,23}$/u.test(code) ? code : "rejected";
+        recordPackagedSmokeProgress(`${observation}_failed_${outcome}`);
+      }
+      throw error;
+    }
     const color = desktopWindowBackground(appearance.theme(), nativeTheme.shouldUseDarkColors);
     for (const window of [mainWindow, ...sessionWindows.values()]) {
       if (window && !window.isDestroyed()) window.setBackgroundColor(color);
