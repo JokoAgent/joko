@@ -8507,11 +8507,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
     setLocalError("");
     void client.shareFilesItem(source, (progress) => {
       if (filesMountedRef.current && fileShareRef.current === controller) setFileShareProgress(progress);
-    }, controller.signal).then(() => {
-      if (filesMountedRef.current && fileShareRef.current === controller) {
-        setImageOutputNotice(mobileMessage(locale, "files.shareCompleted"));
-      }
-    }).catch((error) => {
+    }, controller.signal).catch((error) => {
       if (!controller.signal.aborted && filesMountedRef.current && fileShareRef.current === controller) {
         setLocalError(errorText(error));
       }

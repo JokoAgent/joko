@@ -1036,7 +1036,6 @@ const mobileTaskMessageRows = [
   ["files.workspace", "Workspace", "工作区", "工作區", "Workspace", "Workspace"],
   ["files.generated", "Generated", "生成内容", "產生內容", "生成物", "생성됨"],
   ["files.generatedCount", "Generated ({count})", "生成内容（{count}）", "產生內容（{count}）", "生成物（{count}）", "생성됨 ({count})"],
-  ["files.shareCompleted", "System file sharing completed.", "系统文件分享已完成。", "系統檔案分享已完成。", "システムのファイル共有が完了しました。", "시스템 파일 공유가 완료되었습니다."],
   ["files.offline", "Offline · showing only the in-memory view already loaded for this task. New reads are paused.", "离线 · 仅显示已为此任务加载到内存中的视图。新的读取已暂停。", "離線 · 僅顯示已為此任務載入記憶體的檢視。新的讀取已暫停。", "オフライン · このタスクですでにメモリへ読み込まれた表示のみを示しています。新しい読み込みは一時停止中です。", "오프라인 · 이 작업을 위해 메모리에 이미 불러온 보기만 표시합니다. 새 읽기는 일시 중지되었습니다."],
   ["files.verifyingGallery", "Verifying the current image gallery…", "正在验证当前图片图库…", "正在驗證目前的圖片圖庫…", "現在の画像ギャラリーを検証中…", "현재 이미지 갤러리 검증 중…"],
   ["files.watchUnavailable", "Live file refresh unavailable: {error}", "实时文件刷新不可用：{error}", "即時檔案重新整理無法使用：{error}", "ファイルのライブ更新を利用できません：{error}", "실시간 파일 새로 고침을 사용할 수 없음: {error}"],
