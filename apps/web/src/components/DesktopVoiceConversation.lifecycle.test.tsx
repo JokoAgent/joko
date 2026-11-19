@@ -2,7 +2,7 @@
 import { act } from 'react';
 import { createRoot } from 'react-dom/client';
 import { create, fromBinary, toBinary } from '@bufbuild/protobuf';
-import { ControlDesktopVoiceConversationRequestSchema, ControlDesktopVoiceConversationResponseSchema, DesktopVoiceCallRecordSchema, DesktopVoiceCallHandoffSchema,
+import { ControlDesktopVoiceConversationRequestSchema, ControlDesktopVoiceConversationResponseSchema, DesktopVoiceCallRecordSchema, DesktopVoiceCallHandoffSchema, DesktopVoiceCallTurnSchema,
   DesktopVoiceConversationAction as Action, type ControlDesktopVoiceConversationRequest, type DesktopVoiceCallRecord } from '@joko/contracts';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { AppController } from '../controller.js';
@@ -190,7 +190,7 @@ it('releases paused speech after the original microphone ends and keeps its draf
     vi.mocked(DesktopSpeechPlayer.prototype.resume).mockRestore();
     await view.start();
     const original = view.call();
-    reply = create(DesktopVoiceCallRecordSchema, { ...original, turns: [{ id: 'ordinary-reply', role: 'assistant', text: 'Keep this answer.', complete: true }] });
+    reply = create(DesktopVoiceCallRecordSchema, { ...original, turns: [create(DesktopVoiceCallTurnSchema, { id: 'ordinary-reply', role: 'assistant', text: 'Keep this answer.', complete: true })] });
     await act(async () => { await vi.advanceTimersByTimeAsync(850); });
     expect(scheduled).toHaveBeenCalledOnce();
     expect(view.requests.filter(request => request.action === Action.READ_SPEECH)).toMatchObject([{ callId: original.callId }]);
