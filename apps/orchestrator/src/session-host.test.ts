@@ -11809,7 +11809,7 @@ describe("SessionHost", () => {
   });
 
   it("attributes non-subscription exact and delegated usage as actual Schedule cost", async () => {
-    const usageMoneyKind = vi.fn((_backendId: string, _providerId: string) => "actual-cost" as const);
+    const usageMoneyKind = vi.fn((_backendId: string, _providerId: string, _modelId: string) => "actual-cost" as const);
     const fixture = await createFixture(new ScheduleUsageFakeAdapter(), {
       usageMoneyKind
     });
@@ -11852,7 +11852,7 @@ describe("SessionHost", () => {
         }
       }
     });
-    expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "test");
+    expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "test", "text");
   });
 
   it("keeps token-priced metered usage in actual cost when the runtime reports no cost", async () => {
@@ -11900,6 +11900,46 @@ describe("SessionHost", () => {
       ?.costMoney?.amount ?? 0)).toBeGreaterThan(4.9);
     expect(detail).not.toHaveProperty("estimatedValueMoney");
   });
+
+  it.each([{ name: "the owner's reference rates", reportedCost: 0 }, { name: "a reported amount", reportedCost: 0.075 }])(
+    "uses the correct Schedule column for Codex Responses usage from $name", async ({ reportedCost }) => {
+      const adapter = new TokenPricedScheduleUsageFakeAdapter("codex-schedule-usage-fixture");
+      const describe = adapter.describe.bind(adapter);
+      vi.spyOn(adapter, "describe").mockImplementation(async () => {
+        const descriptor = await describe();
+        return { ...descriptor, adapterKind: "codex", models: descriptor.models.map(model => model.modelId === "text"
+          ? { ...model, api: "openai-responses" } : model) };
+      });
+      vi.spyOn(adapter, "send").mockImplementation(async (_input, context) => {
+        await context.emit({ type: "usage", usage: { ...tokenPricedUsage(), inputTokens: 1000, outputTokens: 1000, totalTokens: 2000, cost: reportedCost } });
+        await context.emit({ type: "done", outcome: "completed" });
+      });
+      const fixture = await createFixture(adapter, { usageMoneyKind: () => "actual-cost" });
+      fixture.store.upsertModelPriceOverride({ ownerId: "orchestrator", backendId: adapter.id, providerId: "test", modelId: "text",
+        values: { currencyCode: "USD", input: 10, output: 20 } });
+      const sessionId = (await fixture.host.createSession({ operationId: "create-bound-priced-task", connection: fixture.connection,
+        targetId: "target-one", title: "Original bound task", providerId: "test", modelId: "text", effort: "off",
+        fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+      const schedule = fixture.store.upsertSchedule({ id: "prices-bound-codex", backendId: adapter.id, targetId: "target-one", sessionMode: "bound", sessionId,
+        name: "Codex usage", kind: "manual", timezone: "UTC", enabled: true, overlapPolicy: "queue", misfirePolicy: "run_once",
+        prompt: { text: "Record one turn", images: [], files: [], mentions: [], disposition: "prompt" },
+        executionSnapshot: { ...CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, providerId: "test", modelId: "text", permissionMode: "ask", planMode: false } });
+      const coordinator = new ScheduleCoordinator(fixture.store, fixture.host);
+      cleanups.push(() => coordinator.stop());
+      const dispatched = await coordinator.runNowWithResult(schedule.id, "bound-priced-run");
+      await eventually(() => fixture.store.getRun(dispatched.runId).descriptor.state === "completed");
+      expect(dispatched.sessionId).toBe(sessionId);
+      const run = fixture.store.findScheduleRunByRunId(dispatched.runId);
+      if (reportedCost > 0) {
+        expect(run?.detail).toMatchObject({ costMoney: { amount: reportedCost, currency: "USD", kind: "actual-cost", approximate: false } });
+        expect(run?.detail).not.toHaveProperty("estimatedValueMoney");
+      } else {
+        expect(run?.detail).toMatchObject({ estimatedValueMoney: {
+          amount: 0.03, currency: "USD", kind: "value-estimate", approximate: true, estimateReasons: ["reference-price"]
+        } });
+        expect(run?.detail).not.toHaveProperty("costMoney");
+      }
+    });
 
   it("attributes subscription Pi usage as value estimate without inventing actual spend", async () => {
     const fixture = await createFixture(new ScheduleUsageFakeAdapter(), {
@@ -11951,7 +11991,7 @@ describe("SessionHost", () => {
   });
 
   it("fails closed to reference value when the exact Backend has no billing provenance", async () => {
-    const usageMoneyKind = vi.fn((_backendId: string, _providerId: string) => "reference-value" as const);
+    const usageMoneyKind = vi.fn((_backendId: string, _providerId: string, _modelId: string) => "reference-value" as const);
     const fixture = await createFixture(new ScheduleUsageFakeAdapter(), {
       usageMoneyKind
     });
@@ -11993,7 +12033,7 @@ describe("SessionHost", () => {
       }
     });
     expect(detail).not.toHaveProperty("costMoney");
-    expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "test");
+    expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "test", "text");
     expect(fixture.store.listUsageLedger({ ownerId: "orchestrator" })).toEqual(
       expect.arrayContaining([expect.objectContaining({
         backendId: fixture.adapter.id,

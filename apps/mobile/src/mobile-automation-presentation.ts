@@ -2,6 +2,7 @@ import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import type {
   MobileAutomationFilter,
+  MobileAutomationMoney,
   MobileAutomationPreRun,
   MobileAutomationRun,
   MobileAutomationRunState,
@@ -227,19 +228,25 @@ export function formatMobileAutomationDuration(value: number | undefined, locale
 
 export function formatMobileAutomationCost(run: MobileAutomationRun, locale: MobileSupportedLocale): string {
   const attribution = mobileAutomationCostAttributionLabel(locale, run.costAttribution);
-  const cost = run.cost ?? run.estimatedValue;
-  if (cost) {
-    const sign = cost.amountMicros < 0n ? "-" : "";
-    const absolute = cost.amountMicros < 0n ? -cost.amountMicros : cost.amountMicros;
-    const whole = absolute / 1_000_000n;
-    const fraction = (absolute % 1_000_000n).toString().padStart(6, "0").replace(/0+$/u, "") || "0";
+  const amounts: string[] = [];
+  if (run.cost) amounts.push(mobileMessage(locale, "automation.cost.actual", { value: formatMobileAutomationMoney(run.cost) }));
+  if (run.estimatedValue) amounts.push(mobileMessage(locale, "automation.cost.estimatedValue", { value: formatMobileAutomationMoney(run.estimatedValue) }));
+  if (amounts.length > 0) {
     return mobileMessage(locale, "automation.cost.value", {
-      value: `${cost.approximate ? "≈" : ""}${sign}${whole.toString()}.${fraction} ${cost.currencyCode}`,
+      value: amounts.join(" · "),
       attribution
     });
   }
   if (run.zeroCost || run.costAttribution === "zero") return mobileMessage(locale, "automation.cost.zero");
   return mobileMessage(locale, "automation.cost.label", { attribution });
+}
+
+function formatMobileAutomationMoney(cost: MobileAutomationMoney): string {
+  const sign = cost.amountMicros < 0n ? "-" : "";
+  const absolute = cost.amountMicros < 0n ? -cost.amountMicros : cost.amountMicros;
+  const whole = absolute / 1_000_000n;
+  const fraction = (absolute % 1_000_000n).toString().padStart(6, "0").replace(/0+$/u, "") || "0";
+  return `${cost.approximate ? "≈" : ""}${sign}${whole.toString()}.${fraction} ${cost.currencyCode}`;
 }
 
 export function mobileAutomationTemplatePresentation(

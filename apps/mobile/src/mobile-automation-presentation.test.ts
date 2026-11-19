@@ -105,7 +105,10 @@ describe("mobile Automation presentation", () => {
     expect(formatMobileAutomationDuration(undefined, "zh-CN")).toBe("时长不可用");
     expect(formatMobileAutomationDuration(250, "ja")).toBe("250 ミリ秒");
     expect(formatMobileAutomationDuration(65_400, "ko")).toBe("1분 5초");
-    expect(formatMobileAutomationCost(run, "zh-CN")).toBe("≈1.25 USD · 混合");
+    expect(formatMobileAutomationCost(run, "zh-CN")).toBe("成本 ≈1.25 USD · 混合");
+    const estimatedValue = { amountMicros: 30_000n, currencyCode: "USD", approximate: true };
+    expect(formatMobileAutomationCost({ ...run, cost: undefined, estimatedValue }, "zh-CN")).toBe("估算价值 ≈0.03 USD · 混合");
+    expect(formatMobileAutomationCost({ ...run, estimatedValue }, "en")).toBe("Cost ≈1.25 USD · Estimated value ≈0.03 USD · mixed");
     expect(formatMobileAutomationCost({ ...run, cost: undefined, zeroCost: true, costAttribution: "zero" }, "ja"))
       .toBe("トークン費用なし");
   });

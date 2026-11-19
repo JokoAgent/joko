@@ -17609,7 +17609,10 @@ export class SessionHost {
       currencyCode
     });
     if (scheduleUsage !== undefined && result.changed) {
-      const valueEstimate = usageMoneyKind !== "actual-cost";
+      const userPricedCodexUsage = backend.adapterKind === "codex" && model?.api === "openai-responses"
+        && reportedCostMicros === undefined && result.estimated && priceOverride?.values.input !== undefined
+        && priceOverride.values.output !== undefined;
+      const valueEstimate = usageMoneyKind !== "actual-cost" || userPricedCodexUsage;
       const approximate = valueEstimate || result.estimated;
       const estimateReasons = valueEstimate || result.estimated
         ? usageMoneyKind === "subscription-value"
