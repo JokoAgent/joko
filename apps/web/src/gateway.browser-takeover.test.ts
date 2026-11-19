@@ -367,7 +367,7 @@ describe("remote browser takeover gateway", () => {
     });
     await gateway.performBrowserTakeoverAction("browser-1", "page-1", {
       kind: "navigate",
-      url: "https://openai.com/docs"
+      url: "https://openai.com/docs#install"
     });
     await gateway.performBrowserTakeoverAction("browser-1", "page-1", {
       kind: "navigationCommand",
@@ -384,13 +384,16 @@ describe("remote browser takeover gateway", () => {
           modifiers: [BrowserTakeoverKeyModifier.CONTROL, BrowserTakeoverKeyModifier.SHIFT]
         }
       },
-      { case: "navigate", value: { url: "https://openai.com/docs" } },
+      { case: "navigate", value: { url: "https://openai.com/docs#install" } },
       { case: "navigationCommand", value: { command: BrowserTakeoverNavigationCommandKind.FORWARD } }
     ]);
 
     await expect(gateway.performBrowserTakeoverAction("browser-1", "page-1", {
       kind: "navigate",
       url: "https://example.test/callback?access_token=secret"
+    })).rejects.toThrow("Credential-shaped");
+    await expect(gateway.performBrowserTakeoverAction("browser-1", "page-1", {
+      kind: "navigate", url: "https://example.test/#token"
     })).rejects.toThrow("Credential-shaped");
     gateway.disconnect();
   });

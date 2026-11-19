@@ -425,7 +425,8 @@ describe("BrowserProvider action primitives", () => {
         const pathname = new URL(route.request().url()).pathname;
         requests.push(pathname);
         if (pathname === "/start") return route.fulfill({ contentType: "text/html", body:
-          '<!doctype html><title>Same document</title><button onclick="history.pushState({}, \'\', \'/history\')">Change route</button>' });
+          '<!doctype html><title>Same document</title><button onclick="history.pushState({}, \'\', \'/history\')">Change route</button>'
+          + '<div style="height:1600px"></div><h2 id="install">Install</h2><div style="height:800px"></div>' });
         if (pathname === "/replacement") return route.fulfill({ contentType: "text/html", body:
           '<!doctype html><title>New document</title><script defer src="/pending.js"></script>' });
         if (pathname === "/pending.js") {
@@ -453,6 +454,13 @@ describe("BrowserProvider action primitives", () => {
       expect(navigations.filter(url => url === `${origin}/history`)).toHaveLength(1);
       expect(provider.uploadDocumentId(pageId)).not.toBe(originalDocumentId);
       expect(provider.currentHumanTakeover()).toMatchObject(takeover);
+
+      await provider.performHumanTakeoverAction(takeover, { type: "navigate", url: `${origin}/history#install` });
+      expect(page.url()).toBe(`${origin}/history#install`);
+      await vi.waitFor(async () => expect(await page.evaluate(() => window.scrollY)).toBeGreaterThan(0), { timeout: 6_000 });
+      expect(await state()).toMatchObject({ url: `${origin}/history`, state: "ready" });
+      expect(requests.filter(path => path !== "/favicon.ico")).toEqual(["/start"]);
+      expect(domReadyUrls).toEqual([`${origin}/start`]);
 
       await provider.performHumanTakeoverAction(takeover, { type: "navigate", url: `${origin}/replacement` });
       await vi.waitFor(() => expect(requests).toContain("/pending.js"), { timeout: 6_000 });

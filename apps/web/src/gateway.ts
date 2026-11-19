@@ -25325,12 +25325,22 @@ function durableBrowserTakeoverUrl(value: string): string {
   if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username !== "" || url.password !== "") {
     throw new GatewayError("Only credential-free HTTP(S) browser navigation is allowed.");
   }
-  if (url.hash !== "" || [...url.searchParams].some(([name, item]) =>
+  if (!isBrowserDocumentAnchor(url.hash) || [...url.searchParams].some(([name, item]) =>
     /(?:^|[_-])(?:access|auth|bearer|code|credential|jwt|key|password|secret|session|signature|token)(?:$|[_-])/iu.test(name)
     || (item.length >= 32 && /^[A-Za-z0-9._~+/=-]+$/u.test(item)))) {
     throw new GatewayError("Credential-shaped URL material cannot enter durable Browser operations.");
   }
   return url.href;
+}
+
+function isBrowserDocumentAnchor(hash: string): boolean {
+  if (!hash) return true;
+  let anchor: string;
+  try { anchor = decodeURIComponent(hash.slice(1)); }
+  catch { return false; }
+  return /^[\p{L}][\p{L}\p{N}_-]{0,63}$/u.test(anchor)
+    && !/(?:^|[_-])(?:access|auth|bearer|code|credential|jwt|key|password|secret|session|signature|token)(?:$|[_-])/iu.test(anchor)
+    && !/^[A-Za-z0-9]{32,}$/u.test(anchor);
 }
 
 function browserActivityKind(value: BrowserActivityKind): BrowserActivityView["kind"] {

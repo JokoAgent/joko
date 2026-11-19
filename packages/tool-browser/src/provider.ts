@@ -1485,7 +1485,7 @@ export class BrowserProvider {
         break;
       case "navigate":
         this.#pageStates.set(page, "loading");
-        await page.goto(validateTakeoverNavigationUrl(action.url), { waitUntil: "commit" });
+        if (await page.goto(validateTakeoverNavigationUrl(action.url), { waitUntil: "commit" }) === null) this.#pageStates.set(page, "ready");
         break;
       case "navigationCommand":
         switch (action.command) {
@@ -1512,6 +1512,9 @@ export class BrowserProvider {
         if (navigation && !page.isClosed()) this.#pageStates.set(page, "ready");
         if (action.type === "textInput" || action.type === "keyPress" && /^[a-z0-9]$/u.test(action.key)) {
           throw new BrowserTakeoverConflictError("Browser could not confirm the keyboard input.");
+        }
+        if (action.type === "navigate" && action.url.includes("#")) {
+          throw new BrowserTakeoverConflictError("Browser could not confirm navigation to the document anchor.");
         }
         throw error;
       }
