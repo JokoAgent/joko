@@ -492,6 +492,13 @@ export class BrowserProvider {
   readonly #pageStates = new WeakMap<Page, BrowserPageState["state"]>();
   readonly #requestedPageCloses = new WeakSet<Page>();
   readonly #externalPageCloses = new Set<Promise<void>>();
+  readonly #humanPopupSources = new WeakMap<Page, {
+    readonly documentId: string;
+    readonly origin: string;
+    readonly assertCurrent: () => void;
+    readonly adopt: (page: BrowserPageState) => void;
+  }>();
+  readonly #adoptedSidebarPopups = new WeakSet<Page>();
   readonly #pageDocuments = new WeakMap<Page, string>();
   readonly #consoleMessages = new WeakMap<Page, BrowserConsoleMessageSnapshot[]>();
   readonly #httpRequestSummaries = new WeakMap<Page, BrowserHttpRequestSummary[]>();
@@ -1429,7 +1436,12 @@ export class BrowserProvider {
   }
 
   /** Executes one bounded remote-human input under the exact active fence. */
-  performHumanTakeoverAction(fence: BrowserTakeoverFence, input: BrowserTakeoverInput, assertCurrent?: () => void): Promise<void> {
+  performHumanTakeoverAction(
+    fence: BrowserTakeoverFence,
+    input: BrowserTakeoverInput,
+    assertCurrent?: () => void,
+    adoptPopup?: (page: BrowserPageState) => void
+  ): Promise<void> {
     let action: BrowserTakeoverInput;
     try {
       validateTakeoverInput(input);
@@ -1449,6 +1461,20 @@ export class BrowserProvider {
         }
         const x = action.normalizedX * Math.max(0, viewport.width - 1);
         const y = action.normalizedY * Math.max(0, viewport.height - 1);
+        const openerUrl = page.url();
+        const documentId = this.documentIdForPage(page);
+        if (adoptPopup && this.#targetMode === "sidebar" && action.button === "primary" && documentId !== undefined
+          && openerUrl !== "about:blank" && !isWorkspaceHtmlPreviewUrl(openerUrl)) {
+          this.#humanPopupSources.set(page, {
+            documentId,
+            origin: new URL(validateWebUrl(openerUrl)).origin,
+            assertCurrent: () => {
+              this.assertHumanTakeover(fence);
+              assertCurrent?.();
+            },
+            adopt: adoptPopup
+          });
+        }
         await page.mouse.click(x, y, { button: mapMouseButton(action.button), clickCount: action.clickCount ?? 1 });
         break;
       }
@@ -2155,6 +2181,7 @@ export class BrowserProvider {
     };
     page.on("framenavigated", (frame) => {
       if (frame !== page.mainFrame()) return;
+      this.#humanPopupSources.delete(page);
       const documentId = randomUUID();
       this.#pageDocuments.set(page, documentId);
       this.#pageStates.set(page, "loading");
@@ -2198,8 +2225,28 @@ export class BrowserProvider {
       const id = `dialog-${this.#nextDialogId++}`;
       this.#dialogs.get(page)?.set(id, dialog);
     });
+    page.on("popup", (popup) => void this.adoptHumanPopup(page, popup).catch(() => undefined));
     page.on("download", (download) => void this.handleDownload(pageId, generation, download).catch(() => undefined));
     void this.emit({ at: Date.now(), type: "page", pageId, detail: "Page opened." });
+  }
+
+  private async adoptHumanPopup(opener: Page, popup: Page): Promise<void> {
+    const source = this.#humanPopupSources.get(opener);
+    if (source === undefined || this.#context !== opener.context() || opener.context() !== popup.context()
+      || this.documentIdForPage(opener) !== source.documentId) return;
+    this.#humanPopupSources.delete(opener);
+    source.assertCurrent();
+    if (popup.url() === "about:blank") {
+      await popup.waitForURL((url) => url.href !== "about:blank", { waitUntil: "commit", timeout: 5_000 });
+    }
+    const documentId = this.documentIdForPage(popup), url = popup.url();
+    if (documentId === undefined || isWorkspaceHtmlPreviewUrl(url) || new URL(validateWebUrl(url)).origin !== source.origin) return;
+    const projection = await withTimeout(this.pageState(popup), 2_000, "The Browser popup did not become readable.");
+    if (projection.documentId !== documentId || this.documentIdForPage(popup) !== documentId
+      || this.documentIdForPage(opener) !== source.documentId) return;
+    source.assertCurrent();
+    source.adopt(projection);
+    this.#adoptedSidebarPopups.add(popup);
   }
 
   private async closeOwnedPage(page: Page): Promise<void> {
@@ -2210,7 +2257,7 @@ export class BrowserProvider {
 
   private observeExternalPageClose(page: Page, pageId: string, generation: number): void {
     const notify = this.#options.onExternalPageClosed;
-    if (notify === undefined || this.#targetMode !== "external" || generation !== this.#generation
+    if (notify === undefined || (this.#targetMode !== "external" && !this.#adoptedSidebarPopups.has(page)) || generation !== this.#generation
       || this.#context === undefined || page.context() !== this.#context) return;
     const context = this.#context;
     const survivor = context.pages().find(candidate => candidate !== page && !candidate.isClosed()

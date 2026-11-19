@@ -23643,7 +23643,21 @@ async function dispatchMutation(
           assertPageCurrent();
         },
         effect: async () => {
-          await dependencies.browserProvider!.performHumanTakeoverAction(current, input, assertEffectCurrent);
+          await dependencies.browserProvider!.performHumanTakeoverAction(current, input, assertEffectCurrent, (popup) => {
+            const projection = durableBrowserPageProjection(popup);
+            if (projection === undefined) return;
+            requireBrowserState(dependencies.browserState).recordHumanPage({
+              browserProviderId: current.providerId,
+              pageId: popup.id,
+              generation: current.generation,
+              sessionId: pageOwner.sessionId,
+              targetId: pageOwner.targetId,
+              bindingGeneration: pageOwner.bindingGeneration,
+              url: projection.url,
+              title: projection.title,
+              updatedAt: (dependencies.now ?? Date.now)()
+            }, { active: false });
+          });
           updatedPage = (await dependencies.browserProvider!.listPages()).find((page) => page.id === current.pageId);
           assertEffectCurrent();
         },

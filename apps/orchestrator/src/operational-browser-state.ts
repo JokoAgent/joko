@@ -350,8 +350,9 @@ export class OperationalBrowserState implements BrowserTransferRepository {
     if (existing !== undefined && !samePageOwner(existing, parsed)) {
       throw new BrowserSessionAuthorityError("Browser page identity is already owned by another authority.");
     }
-    this.#pageCatalog = catalogWithOpenPage(this.#pageCatalog, parsed, options);
-    this.persistPageCatalog();
+    const next = catalogWithOpenPage(this.#pageCatalog, parsed, options);
+    this.#store.setSetting<StoredPageCatalog>(SCOPE, SCOPE_ID, PAGE_CATALOG_KEY, next);
+    this.#pageCatalog = next;
   }
 
   closeHumanPage(browserProviderId: string, pageId: string, generation: number, nextActivePageId?: string): void {
