@@ -101,7 +101,8 @@ it("uses the current Backend default for a new task when its remembered model ha
   const firstTask = await mount(original);
   await vi.waitFor(() => expect(readAppDefaultModelPreference("node").current).toMatchObject({ modelId: first.modelId, effort: "low" }));
   await send(firstTask.container);
-  expect(onSubmit).toHaveBeenNthCalledWith(1, expect.objectContaining({ targetId: "target", providerId: first.providerId, modelId: first.modelId, effort: "low" }),
+  expect(onSubmit).toHaveBeenNthCalledWith(1, expect.objectContaining({ selection: { kind: "target", targetId: "target" },
+    providerId: first.providerId, modelId: first.modelId, effort: "low" }),
     expect.objectContaining({ text: "Use the current project model" }), expect.anything());
   await firstTask.close();
 
@@ -109,7 +110,8 @@ it("uses the current Backend default for a new task when its remembered model ha
   await vi.waitFor(() => expect(nextTask.container.querySelector(".model-picker-trigger")?.textContent).toContain(second.name));
   expect(readAppDefaultModelPreference("node").current?.modelId).toBe(first.modelId);
   await send(nextTask.container);
-  expect(onSubmit).toHaveBeenNthCalledWith(2, expect.objectContaining({ targetId: "target", providerId: second.providerId, modelId: second.modelId, effort: "high" }),
+  expect(onSubmit).toHaveBeenNthCalledWith(2, expect.objectContaining({ selection: { kind: "target", targetId: "target" },
+    providerId: second.providerId, modelId: second.modelId, effort: "high" }),
     expect.objectContaining({ text: "Use the current project model" }), expect.anything());
   await nextTask.close();
 

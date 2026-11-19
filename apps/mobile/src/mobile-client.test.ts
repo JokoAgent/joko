@@ -7850,6 +7850,7 @@ describe("native mobile connection and operation ownership", () => {
 
   it.each([true, false])("settles only a confirmed worker capacity rejection (detail=%s)", async confirmed => {
     const owner = clone(SnapshotSchema, snapshot);
+    owner.settings = create(SettingsSnapshotSchema, {});
     owner.scope = create(SnapshotScopeSchema, { kind: { case: "owner", value: create(OwnerSnapshotScopeSchema, {}) } });
     const network = projectedNetwork(owner), drafts = memoryDraftStores(), storage = memoryStorage(credential).storage;
     const tree = create(CollaborationGoalTreeSchema, { goal: { goalId: "full-goal", leadId: "lead", leadSessionId: "session",
@@ -7872,6 +7873,7 @@ describe("native mobile connection and operation ownership", () => {
     const signal = new AbortController().signal, api = app.taskCollaborationApi()!;
     const form = { role: "reviewer", targetId: "target", initialTask: "", permissionMode: PermissionMode.ASK };
     await expect(api.create(await api.load(signal), form, signal)).rejects.toMatchObject({ code: Code.ResourceExhausted });
+    expect(createWorker).toHaveBeenCalledOnce();
     expect(await api.restore(signal)).toEqual(form);
     if (confirmed) expect(app.state.pending).toEqual([]);
     else expect(app.state.pending).toMatchObject([{ kind: "collaboration-create", state: "unknown", sessionId: "session" }]);

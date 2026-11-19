@@ -68,7 +68,7 @@ describe("mobile Automation authoring", () => {
     const existing: MobileAutomationSchedule = {
       scheduleId: "one-shot", displayName: "Original plan", state: "enabled", source: "dialogue",
       backendId: "backend", targetId: "target", sessionMode: "bound", sessionId: "session", recurrence: "once",
-      recurrenceLabel: instant, recurrenceExpression: instant, timeZone: "UTC", inputText: "Run the task",
+      recurrenceLabel: instant, recurrenceExpression: instant, timeZone: "UTC", inputText: "Run the task", editableInputText: "Run the task",
       executionMode: "agent", permissionMode: "ask", planMode: false, useWorktree: false, refreshWorktreeRemote: false,
       extraDirectoryIds: [], silentWhenIdle: false, notifyDesktop: true, overlapPolicy: "queue", misfirePolicy: "runOnce",
       unreadRunCount: 0, recentRuns: [], revision: { value: 2n, etag: "one-shot-r2" }, generation: 1n

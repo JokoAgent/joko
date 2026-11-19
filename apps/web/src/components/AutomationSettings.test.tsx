@@ -337,7 +337,7 @@ describe("AutomationSettings", () => {
       ...base.settings.androidAutomation, devices: [], configuredDefaultDeviceSerial: "", issue: "driverError", failureReason: "permission denied"
     } } });
     const card = required(view.querySelector('[data-automation-card="android"]'));
-    expect(card.querySelector('[role="status"]')?.textContent).toContain("permission denied");
+    expect(card.querySelector(".automation-android__device-row small")?.textContent).toContain("permission denied");
     expect(card.querySelector(".automation-android__guide")).toBeNull();
     await act(async () => required(card.querySelector<HTMLButtonElement>(".automation-android__refresh")).click());
     expect(controller.probeAndroidAutomation).toHaveBeenCalledWith(true);
