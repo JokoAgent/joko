@@ -127,7 +127,8 @@ export function evaluateMobileBundleUpdate(input: {
   readonly currentRuntimeVersion: string | undefined;
   readonly release: MobileUpdateRelease;
 }): MobileBundleUpdateEvaluation {
-  if (!isMobileUpdateVersion(input.currentVersion) || !boundedIdentity(input.currentRuntimeVersion)
+  if (!isMobileUpdateVersion(input.currentVersion)
+    || input.currentRuntimeVersion !== undefined && !boundedIdentity(input.currentRuntimeVersion)
     || compareMobileUpdateVersions(input.release.version, input.currentVersion) <= 0) {
     return Object.freeze({ needsUpdate: false, forced: false });
   }

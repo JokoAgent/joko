@@ -52,6 +52,7 @@ import { mobileMessage } from "./mobile-messages";
 import type { MobileVoiceTransport } from "./mobile-voice-input";
 import { MobileQuestionTextInput } from "./MobileQuestionTextInput";
 import { splitQuestionReferences } from "@joko/contracts";
+import { MAXIMUM_EDITABLE_PLAN_LENGTH } from "@joko/core/events";
 import { clipBareHttpAutolinkText } from "./mobile-markdown-url-boundary";
 
 export interface MobileInteractionSheetColors {
@@ -79,6 +80,7 @@ export function MobileInteractionSheet({
   onDismiss,
   responseReceipt,
   onError,
+  allowPlanEdit = false,
   voiceTransport,
   onOpenReference
 }: {
@@ -96,6 +98,7 @@ export function MobileInteractionSheet({
   readonly responseReceipt?: { readonly operationId: string; readonly state: "accepted" | "unknown";
     readonly check: (interaction: Interaction, operationId: string) => Promise<boolean> };
   readonly onError: (message: string) => void;
+  readonly allowPlanEdit?: boolean;
   readonly voiceTransport?: MobileVoiceTransport;
   readonly onOpenReference?: (interactionId: string, href: string) => void;
 }) {
@@ -313,7 +316,7 @@ export function MobileInteractionSheet({
                     onDraft={updateDraft} onResolve={(answers) => void settle({ kind: "question", answers })} />
                   : interaction.request.case === "planReview" && draft?.kind === "plan"
                     ? <PlanRequest interaction={interaction} draft={draft} disabled={responseDisabled} colors={colors} locale={locale}
-                      onDraft={updateDraft} onResolve={(decision, feedback) => void settle({ kind: "plan", decision, feedback })} />
+                      allowPlanEdit={allowPlanEdit} onDraft={updateDraft} onResolve={(submission) => void settle(submission)} />
                     : <Text accessibilityRole="alert" style={[sheetStyles.error, { color: colors.negative }]}>{mobileMessage(locale, "interaction.draftMismatch")}</Text>}
         </ScrollView>
         <View style={[sheetStyles.footer, { borderColor: colors.border }]}>
@@ -509,21 +512,33 @@ function QuestionFieldInput({ field, answer, disabled, colors, locale, ownerKey,
   return null;
 }
 
-function PlanRequest({ interaction, draft, disabled, colors, locale, onDraft, onResolve }: {
+function PlanRequest({ interaction, draft, disabled, colors, locale, allowPlanEdit, onDraft, onResolve }: {
   readonly interaction: Interaction;
   readonly draft: Extract<MobileInteractionDraft, { readonly kind: "plan" }>;
   readonly disabled: boolean;
   readonly colors: MobileInteractionSheetColors;
   readonly locale: MobileSupportedLocale;
+  readonly allowPlanEdit: boolean;
   readonly onDraft: (draft: MobileInteractionDraft) => void;
-  readonly onResolve: (decision: PlanReviewDecisionKind, feedback: string) => void;
+  readonly onResolve: (submission: Extract<MobileInteractionSubmission, { readonly kind: "plan" }>) => void;
 }) {
   if (interaction.request.case !== "planReview") return null;
   const request = interaction.request.value;
+  const canEdit = allowPlanEdit && request.editable && request.markdown.trim() !== ""
+    && request.markdown.length <= MAXIMUM_EDITABLE_PLAN_LENGTH && request.allowedDecisions.includes(PlanReviewDecisionKind.EXECUTE);
+  const editedPlan = canEdit ? draft.editedPlan : undefined;
   return <View style={sheetStyles.sectionStack}>
-    <Text selectable style={[sheetStyles.planText, { color: colors.ink, backgroundColor: colors.background, borderColor: colors.border }]}>
-      {request.markdown || mobileMessage(locale, "interaction.noPlan")}
-    </Text>
+    {editedPlan === undefined
+      ? <Text selectable style={[sheetStyles.planText, { color: colors.ink, backgroundColor: colors.background, borderColor: colors.border }]}>
+          {request.markdown || mobileMessage(locale, "interaction.noPlan")}
+        </Text>
+      : <TextInput accessibilityLabel={mobileMessage(locale, "interaction.plan.editedText")} multiline autoFocus
+          editable={!disabled} value={editedPlan} maxLength={MAXIMUM_EDITABLE_PLAN_LENGTH}
+          onChangeText={(text) => onDraft({ ...draft, editedPlan: text })}
+          style={[sheetStyles.textInput, sheetStyles.multilineInput, { color: colors.ink, borderColor: colors.border, backgroundColor: colors.surface }]} />}
+    {canEdit && <SheetButton label={mobileMessage(locale, editedPlan === undefined ? "interaction.plan.edit" : "interaction.plan.useOriginal")}
+      colors={colors} disabled={disabled} quiet onPress={() => onDraft(editedPlan === undefined
+        ? { ...draft, editedPlan: request.markdown } : { kind: "plan", feedback: draft.feedback })} />}
     {request.steps.length > 0 && <View style={sheetStyles.stepStack}>
       {request.steps.map((step, index) => <View key={step.stepId} style={[sheetStyles.stepCard, { borderColor: colors.border }]}>
         <Text style={[sheetStyles.questionLabel, { color: colors.ink }]}>{index + 1}. {step.title || step.stepId}</Text>
@@ -535,15 +550,21 @@ function PlanRequest({ interaction, draft, disabled, colors, locale, onDraft, on
       <Text style={[sheetStyles.questionLabel, { color: colors.ink }]}>{mobileMessage(locale, "interaction.feedback")}</Text>
       <TextInput accessibilityLabel={mobileMessage(locale, "interaction.planFeedback")} multiline editable={!disabled} value={draft.feedback}
         placeholder={mobileMessage(locale, "interaction.planPlaceholder")} placeholderTextColor={colors.muted}
-        onChangeText={(feedback) => onDraft({ kind: "plan", feedback })}
+        onChangeText={(feedback) => onDraft({ ...draft, feedback })}
         style={[sheetStyles.textInput, sheetStyles.multilineInput,
           { color: colors.ink, borderColor: colors.border, backgroundColor: colors.surface }]} />
     </View>
     <View style={sheetStyles.decisionStack}>
-      {request.allowedDecisions.map((decision) => <SheetButton key={decision} label={mobilePlanDecisionLabel(decision, locale)}
-        colors={colors} disabled={disabled || decision === PlanReviewDecisionKind.REFINE && draft.feedback.trim() === ""}
-        quiet={decision === PlanReviewDecisionKind.STAY_IN_PLAN_MODE}
-        onPress={() => onResolve(decision, draft.feedback)} />)}
+      {request.allowedDecisions.map((decision) => {
+        const approvedText = decision === PlanReviewDecisionKind.EXECUTE && editedPlan !== request.markdown ? editedPlan : undefined;
+        return <SheetButton key={decision}
+          label={approvedText === undefined ? mobilePlanDecisionLabel(decision, locale) : mobileMessage(locale, "interaction.plan.executeEdited")}
+          colors={colors} disabled={disabled || decision === PlanReviewDecisionKind.REFINE && draft.feedback.trim() === ""
+            || approvedText !== undefined && approvedText.trim() === ""}
+          quiet={decision === PlanReviewDecisionKind.STAY_IN_PLAN_MODE}
+          onPress={() => onResolve({ kind: "plan", decision, feedback: draft.feedback,
+            ...(approvedText === undefined ? {} : { editedPlan: approvedText }) })} />;
+      })}
     </View>
   </View>;
 }

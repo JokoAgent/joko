@@ -7,7 +7,7 @@ import {
   createChildRuntimeEnvironment,
   type DurableProcessOwnerOptions
 } from "@joko/runtime-governance";
-import { NATIVE_PROMPT_IMAGE_MEDIA_TYPES, assertHostedExecution } from "@joko/core";
+import { MAXIMUM_EDITABLE_PLAN_LENGTH, NATIVE_PROMPT_IMAGE_MEDIA_TYPES, assertHostedExecution } from "@joko/core";
 import { assertClaudeHostedModel, claudeHostedEnvironment, claudeHostedPrompt, claudeHostedSettings, prepareClaudeHostedExecution, sameClaudeHostedExecution } from "./hosted-execution.js";
 import { CLAUDE_HOSTED_DISALLOWED_TOOLS, CLAUDE_HOSTED_EXECUTOR_SERVER, CLAUDE_HOSTED_GUEST_TOOLS, createClaudeHostedTools } from "./hosted-tools.js";
 import {
@@ -6391,17 +6391,19 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     options: ClaudeCanUseToolOptions
   ): Promise<ClaudePermissionResult> {
     const markdown = this.#projection.text(input["plan"] ?? input["content"] ?? "Review the proposed plan.");
+    const editable = typeof input["plan"] === "string" && markdown.trim() !== "" && markdown.length <= MAXIMUM_EDITABLE_PLAN_LENGTH;
     const interaction: InteractionPayload = {
       id: interactionId(runtime, options.requestId),
       kind: "plan_review",
       title: this.#projection.identifier(options.title, "Review plan"),
       markdown,
-      choices: ["execute", "stay", "refine"]
+      choices: ["execute", "stay", "refine"],
+      ...(editable ? { editable: true } : {})
     };
     const decision = await this.#requestInteraction(runtime, turn, interaction, options.signal);
     if (decision.kind === "plan_review" && decision.decision === "execute"
       && this.#isTurnCurrent(runtime, turn) && !options.signal.aborted) {
-      return { behavior: "allow", updatedInput: input };
+      return { behavior: "allow", updatedInput: decision.editedPlan === undefined ? input : { ...input, plan: decision.editedPlan } };
     }
     const feedback = decision.kind === "plan_review"
       ? this.#projection.text(decision.feedback, 2048)

@@ -162,6 +162,18 @@ describe("mobile interactions", () => {
       .toThrow(/Describe what should change/u);
   });
 
+  it("retains the exact edited plan on approval for the original editable request", () => {
+    const plan = planInteraction("editable-plan", 0n, true);
+    const editedPlan = "  First verify the input.\nThen make the change.\n";
+    const submission = { kind: "plan", decision: PlanReviewDecisionKind.EXECUTE, feedback: "", editedPlan } as const;
+    expect(createMobileInteractionResolution(plan, submission, "connection").decision)
+      .toMatchObject({ case: "planReview", value: { decision: PlanReviewDecisionKind.EXECUTE, editedPlan } });
+    expect(() => createMobileInteractionResolution(planInteraction("readable-plan"), submission, "connection"))
+      .toThrow(/original editable approval/u);
+    expect(() => createMobileInteractionResolution(plan, { ...submission, decision: PlanReviewDecisionKind.REFINE, feedback: "Narrow the scope" }, "connection"))
+      .toThrow(/original editable approval/u);
+  });
+
   it("enforces multiple-choice capacity while preserving exact Other authority", () => {
     let answer = toggleMobileQuestionChoice(multiple, undefined, "web");
     answer = setMobileQuestionOther(multiple, answer, "Desktop");
@@ -238,7 +250,7 @@ function permissionInteraction(id: string, risk: PermissionRisk, created = 0n): 
   });
 }
 
-function planInteraction(id: string, created = 0n): Interaction {
+function planInteraction(id: string, created = 0n, editable = false): Interaction {
   return create(InteractionSchema, {
     interactionId: id,
     kind: InteractionKind.PLAN_REVIEW,
@@ -251,6 +263,7 @@ function planInteraction(id: string, created = 0n): Interaction {
     request: { case: "planReview", value: {
       title: "Review plan",
       markdown: "# Plan",
+      editable,
       steps: [{ stepId: "one", title: "First" }],
       allowedDecisions: [PlanReviewDecisionKind.EXECUTE, PlanReviewDecisionKind.REFINE]
     } },

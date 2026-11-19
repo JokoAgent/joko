@@ -49,6 +49,7 @@ import { MobileNativeIntentNotice } from "./MobileNativeIntentNotice";
 import {
   MobileClient,
   type MobileQueueEditLease,
+  type MobileTaskReadingPosition,
   type SavedMobileConnection
 } from "./mobile-client";
 import {
@@ -289,7 +290,7 @@ import { MobileConversationShareBar } from "./MobileConversationShareBar";
 import { MobileConversationShareRenderer } from "./MobileConversationShareRenderer";
 import { mobileMessageShareable } from "./mobile-conversation-share";
 import { useMobileConversationShare } from "./use-mobile-conversation-share";
-import { readMobileScreenshotVisibleMessages } from "./mobile-screenshot-selection";
+import { measureMobileWindowFrame, readMobileScreenshotVisibleMessages } from "./mobile-screenshot-selection";
 import { useMobileScreenshotSelection } from "./use-mobile-screenshot-selection";
 import {
   buildMobileHomeSections, buildMobileHomeNavigationLayout, createSwipeRowRegistry,
@@ -676,6 +677,10 @@ export function App() {
   const [nativeIntentRecovery, setNativeIntentRecovery] = useState<MobileNativeIntentRecovery>();
   const [nativeIntentMessageFocus, setNativeIntentMessageFocus] = useState<MobileNativeIntentMessageFocus & { readonly homeSourceKey?: string }>();
   const homeMessageFocusRequest = useRef(0);
+  const [homeReadingPosition, setHomeReadingPosition] = useState<MobileTaskReadingPosition>();
+  const handleReadingPosition = useCallback((position: MobileTaskReadingPosition) => {
+    setHomeReadingPosition(current => current === position ? undefined : current);
+  }, []);
   const [nativeIntentGroupSelection, setNativeIntentGroupSelection] = useState<MobilePartnerGroupSelection>();
   const [deviceId, setDeviceId] = useState<string>();
   const [remoteDesktopEntry, setRemoteDesktopEntry] = useState<MobileRemoteDesktopEntry>();
@@ -1030,11 +1035,12 @@ export function App() {
     setMenuOpen(false);
   };
   const handleComposerFocused = useCallback(() => setFocusTaskComposer(false), []);
-  const focusHomeSearchMatch = (match?: MobileHomeSearchMatch): void => {
+  const focusHomeSearchMatch = (match?: MobileHomeSearchMatch, restoreReading = false): void => {
     const current = client.state;
     const focus = match !== undefined && AppState.currentState === "active"
       ? projectMobileHomeSearchMessageFocus(current, match, --homeMessageFocusRequest.current) : undefined;
     setNativeIntentMessageFocus(focus ? { ...focus, homeSourceKey: mobileHomeSourceKey(current) } : undefined);
+    setHomeReadingPosition(restoreReading && match === undefined ? client.taskReadingPosition() : undefined);
   };
   return (
     <SafeAreaProvider>
@@ -1102,6 +1108,7 @@ export function App() {
                   setPage("task");
                 }} /> :
                 page === "task" ? <TaskScreen {...common}
+                  readingPosition={homeReadingPosition} onReadingPositionHandled={handleReadingPosition}
                   onTaskSharing={() => {
                     setSharingSessionId(state.taskSource?.kind === "joined" ? undefined : state.selectedId);
                     setSharingLeaveJoinId(state.taskSource?.kind === "joined" ? state.taskSource.joined.joinId : undefined);
@@ -1245,7 +1252,7 @@ export function App() {
                   onDevice={(id) => { setDeviceId(id); setPage("device"); }} /> :
                 page === "device" && deviceId ? <DeviceScreen {...common} deviceId={deviceId} onBack={() => setPage("devices")}
                   onRemoteDesktop={() => openRemoteDesktop("device", deviceId)} /> :
-                <SessionsScreen {...common} onNew={() => setPage("new")} onSelect={match => { focusHomeSearchMatch(match); setPage("task"); }}
+                <SessionsScreen {...common} onNew={() => setPage("new")} onSelect={match => { focusHomeSearchMatch(match, true); setPage("task"); }}
                   onPartners={entry => { setHomePartnerEntry(entry); setPage("partner-directory"); }}
                   viewState={homeViewState} onViewStateChange={setHomeViewState} scrollOffsets={homeScrollOffsets.current} foreground={foreground}
                   incomingShare={incomingShare} onOpenShare={() => setPage("new")}
@@ -3920,7 +3927,7 @@ interface MobileTaskTimelineFollow {
 }
 
 export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onOpenPartnerThread, onRemoteDesktop, focusComposer, onComposerFocused, onTaskSharing,
-  messageFocus, onMessageFocusConsumed, onOpenDerivationOrigin, partnerSettingsEntry, onPartnerSettingsEntryConsumed, homeNavigation }: ScreenProps & {
+  messageFocus, onMessageFocusConsumed, readingPosition, onReadingPositionHandled, onOpenDerivationOrigin, partnerSettingsEntry, onPartnerSettingsEntryConsumed, homeNavigation }: ScreenProps & {
   onBack: () => void; onHome: () => void; onNew: () => void; onFiles: (source?: MobileFilesComposerSource) => void;
   onOpenPartnerThread: (preview: NonNullable<TimelineRow["partnerPrivatePreview"]>) => void;
   onRemoteDesktop: (targetDeviceId: string) => void;
@@ -3928,6 +3935,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   focusComposer: boolean; onComposerFocused: () => void;
   messageFocus?: MobileNativeIntentMessageFocus;
   onMessageFocusConsumed?: (focus: MobileNativeIntentMessageFocus) => void;
+  readingPosition?: MobileTaskReadingPosition;
+  onReadingPositionHandled?: (position: MobileTaskReadingPosition) => void;
   onOpenDerivationOrigin: (authorityKey: string, signal: AbortSignal) => Promise<boolean>;
   partnerSettingsEntry?: { readonly profileId: string; readonly sessionId: string; readonly partnerId: string };
   onPartnerSettingsEntryConsumed?: () => void;
@@ -4083,6 +4092,13 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const [timelineVisibility, setTimelineVisibility] = useState<{ key: string; ids: ReadonlySet<string> }>();
   const timelineViewability = useRef({ itemVisiblePercentThreshold: 1, minimumViewTime: 80 }).current;
   const screenshotMessageViewsRef = useRef(new Map<string, View>());
+  const visibleReadingRow = useRef<{ readonly owner: string; readonly row: TimelineRow | undefined } | undefined>(undefined);
+  const readingScrollMetrics = useRef<{ readonly owner: string; readonly nearLatest: boolean } | undefined>(undefined);
+  const readingMeasurement = useRef<AbortController | undefined>(undefined);
+  const recordReadingPosition = useRef<(() => void) | undefined>(undefined);
+  const [readyReadingPosition, setReadyReadingPosition] = useState<{
+    readonly position: MobileTaskReadingPosition; readonly owner: string;
+  }>();
   const messageFocusRetryRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const messageFocusRetryKeyRef = useRef<string | undefined>(undefined);
   const composerPasteEditableRef = useRef(false);
@@ -4118,6 +4134,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const onTimelineRowsVisible = useMemo(() => ({ viewableItems }: { readonly viewableItems: readonly { readonly item: MobileWorkItem<TimelineRow>; readonly isViewable: boolean }[] }) => {
     const rowIds = (item: MobileWorkItem<TimelineRow>): string[] => isWorkGroup(item) ? item.children.flatMap(rowIds) : [item.id];
     const next = new Set(viewableItems.filter((item) => item.isViewable).flatMap((item) => rowIds(item.item)));
+    const first = viewableItems.find(({ item, isViewable }) => isViewable && !isWorkGroup(item) && mobileMessageShareable(item))?.item;
+    visibleReadingRow.current = { owner: timelineOwnerKey, row: first && !isWorkGroup(first) ? first : undefined };
+    recordReadingPosition.current?.();
     setTimelineVisibility((previous) => previous?.key === timelineOwnerKey
       && previous.ids.size === next.size && [...next].every((id) => previous.ids.has(id)) ? previous : { key: timelineOwnerKey, ids: next });
     setVisiblePartnerRows((previous) => previous.ownerKey === partnerConversationTransport?.ownerKey
@@ -4404,13 +4423,36 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const quoteFocus = replyQuoteFocus && replyQuoteFocus.ownerKey === client.taskHeaderSourceKey() && replyQuoteFocus.generation === session?.nativeBinding?.runtimeGeneration.toString()
     ? replyQuoteFocus.focus : undefined;
   const activeMessageFocus = (quoteFocus ?? messageFocus)?.sessionId === state.selectedId ? quoteFocus ?? messageFocus : undefined;
-  const messageFocusIndex = activeMessageFocus === undefined
+  const requestedReadingPosition = readingPosition?.sessionId === state.selectedId ? readingPosition : undefined;
+  const ordinaryReadingTask = headerRole.role === "ordinary" && partnerIdentity.ready && !partnerIdentity.partner;
+  const useReadingPosition = requestedReadingPosition !== undefined && activeMessageFocus === undefined && !focusComposer && !searchVisible;
+  useEffect(() => {
+    if (!requestedReadingPosition) return;
+    if (!useReadingPosition || (headerRole.role !== undefined && partnerIdentity.ready && !ordinaryReadingTask)) {
+      onReadingPositionHandled?.(requestedReadingPosition);
+      return;
+    }
+    if (!ordinaryReadingTask || !headerSourceKey) return;
+    const abort = new AbortController();
+    void client.restoreTaskReadingPosition(requestedReadingPosition, abort.signal).then(found => {
+      if (abort.signal.aborted) return;
+      if (found) setReadyReadingPosition({ position: requestedReadingPosition, owner: headerSourceKey });
+      else onReadingPositionHandled?.(requestedReadingPosition);
+    }).catch(() => { if (!abort.signal.aborted) onReadingPositionHandled?.(requestedReadingPosition); });
+    return () => abort.abort();
+  }, [headerRole.role, headerSourceKey, onReadingPositionHandled, ordinaryReadingTask, partnerIdentity.ready,
+    requestedReadingPosition, useReadingPosition]);
+  const readingFocus = useReadingPosition && readyReadingPosition && readyReadingPosition.position === requestedReadingPosition
+    && readyReadingPosition.owner === headerSourceKey ? readyReadingPosition.position : undefined;
+  const readingFocusOwner = readingFocus ? headerSourceKey : undefined;
+  const messageFocusIndex = activeMessageFocus === undefined && readingFocus === undefined
     ? -1
     : displayRows.findIndex((item) => mobileWorkContains(item,
-      (row) => mobileNativeIntentMessageMatches(activeMessageFocus, row)));
-  const messageFocusKey = activeMessageFocus && messageFocusIndex >= 0
+      (row) => activeMessageFocus ? mobileNativeIntentMessageMatches(activeMessageFocus, row)
+        : readingFocus !== undefined && row.id === readingFocus.messageId && row.eventId === readingFocus.eventId));
+  const messageFocusKey = messageFocusIndex < 0 ? undefined : activeMessageFocus
     ? `${activeMessageFocus.requestId}\u001f${activeMessageFocus.messageId}\u001f${activeMessageFocus.messageEventId ?? ""}`
-    : undefined;
+    : JSON.stringify(["reading-position", headerSourceKey, readingFocus?.eventId]);
   const activeMessageFocusId = activeMessageFocus?.requestId;
   const sendFollowSource = state.status === "connected" && state.taskSource?.kind !== "joined"
     && partnerIdentity.ready && !partnerIdentity.partner && headerRole.role === "ordinary" && !searchVisible
@@ -4471,14 +4513,21 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   useEffect(() => {
     if (messageFocusKey === undefined || messageFocusIndex < 0) {
       setMessageFocusHighlight(undefined);
+      if (readingFocus) onReadingPositionHandled?.(readingFocus);
       return;
     }
     messageFocusRetryKeyRef.current = undefined;
-    setMessageFocusHighlight(messageFocusKey);
+    setMessageFocusHighlight(readingFocus ? undefined : messageFocusKey);
     const frame = requestAnimationFrame(() => {
-      timelineListRef.current?.scrollToIndex({ index: messageFocusIndex, animated: false, viewPosition: 0.5 });
+      const list = timelineListRef.current;
+      if (!list || readingFocus && client.taskHeaderSourceKey() !== readingFocusOwner) return;
+      const follow = latestTimelineFollowRef.current;
+      if (readingFocus && follow && follow.sourceKey === readingFocusOwner) follow.position = "earlier";
+      list.scrollToIndex({ index: messageFocusIndex, animated: false, viewPosition: readingFocus ? 0 : 0.5,
+        ...(readingFocus ? { viewOffset: readingFocus.viewOffset } : {}) });
+      if (readingFocus && messageFocusRetryKeyRef.current === undefined) onReadingPositionHandled?.(readingFocus);
     });
-    const highlightTimer = setTimeout(() => {
+    const highlightTimer = readingFocus ? undefined : setTimeout(() => {
       setMessageFocusHighlight((current) => current === messageFocusKey ? undefined : current);
     }, 3_000);
     return () => {
@@ -4488,7 +4537,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       messageFocusRetryRef.current = undefined;
       messageFocusRetryKeyRef.current = undefined;
     };
-  }, [messageFocusIndex, messageFocusKey]);
+  }, [messageFocusIndex, messageFocusKey, onReadingPositionHandled, readingFocus, readingFocusOwner]);
   const unknown = state.pending.some((item) => item.kind === "send" && item.sessionId === state.selectedId && item.state === "unknown");
   const queueItems = client.taskQueueItems();
   const sharedQueueResume = state.taskSource?.kind === "joined" ? client.taskSharedQueueResumeControl() : undefined;
@@ -4674,7 +4723,39 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     initialTimelineTailRef.current = { ownerKey: initialTailOwnerKey, requested: false, finished: false };
   }
   const initialTimelineTail = initialTimelineTailRef.current;
-  if (activeMessageFocus !== undefined || searchVisible || state.window !== undefined || conversationShare.active) initialTimelineTail.finished = true;
+  if (activeMessageFocus !== undefined || readingFocus !== undefined && messageFocusIndex >= 0
+    || searchVisible || state.window !== undefined || conversationShare.active) initialTimelineTail.finished = true;
+  const observeReadingScroll = ({ contentOffset, contentSize, layoutMeasurement }: NativeScrollEvent): void => {
+    if (layoutMeasurement.height > 0) readingScrollMetrics.current = { owner: timelineOwnerKey,
+      nearLatest: contentSize.height - contentOffset.y - layoutMeasurement.height <= 16 };
+  };
+  recordReadingPosition.current = () => {
+    const metrics = readingScrollMetrics.current;
+    if (!headerSourceKey || !ordinaryReadingTask || useReadingPosition || activeMessageFocus || searchVisible || conversationShare.active
+      || !initialTimelineTail.finished || !taskMountedRef.current || AppState.currentState !== "active"
+      || state.historyBusy || client.state.historyBusy || metrics?.owner !== timelineOwnerKey
+      || client.taskHeaderSourceKey() !== headerSourceKey) return;
+    readingMeasurement.current?.abort();
+    if (metrics.nearLatest && state.window === undefined) {
+      client.rememberTaskReadingPosition(headerSourceKey);
+      return;
+    }
+    const visible = visibleReadingRow.current;
+    const row = visible?.owner === timelineOwnerKey ? visible.row : undefined;
+    const viewport = timelineViewportRef.current;
+    const message = row ? screenshotMessageViewsRef.current.get(row.id) : undefined;
+    if (!row || !viewport || !message) return;
+    const measurement = new AbortController();
+    readingMeasurement.current = measurement;
+    void Promise.all([measureMobileWindowFrame(viewport, measurement.signal), measureMobileWindowFrame(message, measurement.signal)])
+      .then(([list, item]) => {
+        if (!list || !item || measurement.signal.aborted || !taskMountedRef.current
+          || viewport !== timelineViewportRef.current || visibleReadingRow.current !== visible
+          || screenshotMessageViewsRef.current.get(row.id) !== message
+          || item.y >= list.y + list.height || item.y + item.height <= list.y) return;
+        client.rememberTaskReadingPosition(headerSourceKey, { messageId: row.id, eventId: row.eventId, viewOffset: item.y - list.y });
+      }).finally(() => { if (readingMeasurement.current === measurement) readingMeasurement.current = undefined; });
+  };
   const loadTimelineEarlier = (): void => {
     initialTimelineTail.finished = true;
     const owner = client.taskHeaderSourceKey();
@@ -4698,7 +4779,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       if (newerHistoryRef.current === request) newerHistoryRef.current = undefined;
     });
   };
-  const initialTailAvailable = state.status === "connected" && state.detail !== undefined && state.taskSource?.kind !== "joined"
+  const initialTailAvailable = state.status === "connected" && state.detail !== undefined && state.taskSource?.kind !== "joined" && !useReadingPosition
     && state.window === undefined && !state.historyBusy && !conversationShare.active && partnerIdentity.ready && !partnerIdentity.partner
     && headerRole.role === "ordinary" && headerSourceKey !== undefined && displayRows.length > 0;
   const scrollInitialTimelineTail = useCallback((measured: boolean) => {
@@ -4764,6 +4845,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     follow.motion = "idle";
     follow.streamingWhenUnpinned = undefined;
     setNewTimelineMessages(undefined);
+    readingMeasurement.current?.abort();
+    client.rememberTaskReadingPosition(follow.sourceKey);
     list.scrollToEnd({ animated: false });
   };
   const conversationShareColors = useMemo(() => ({ background: colors.background, surfaceElevated: colors.surface,
@@ -5177,6 +5260,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     });
     return () => {
       taskMountedRef.current = false;
+      readingMeasurement.current?.abort();
       newerHistoryRef.current?.abort();
       newerHistoryRef.current = undefined;
       subscription(); lifecycle.remove(); taskHomeNavigator.retire();
@@ -7440,6 +7524,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       maintainVisibleContentPosition={earlierPagingAvailable ? { minIndexForVisible: 1 } : undefined}
       viewabilityConfig={timelineViewability} onViewableItemsChanged={onTimelineRowsVisible}
       scrollEventThrottle={100} onScroll={(event) => {
+        observeReadingScroll(event.nativeEvent);
         if (initialTimelineTail.requested && !initialTimelineTail.finished) {
           const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
           if (layoutMeasurement.height > 0 && contentSize.height - contentOffset.y - layoutMeasurement.height <= 1) initialTimelineTail.finished = true;
@@ -7449,6 +7534,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       }}
       onScrollBeginDrag={(event) => {
         initialTimelineTail.finished = true;
+        if (useReadingPosition && requestedReadingPosition) onReadingPositionHandled?.(requestedReadingPosition);
         retireSendFollowForTimeline();
         const follow = currentTimelineFollow();
         if (follow) {
@@ -7459,6 +7545,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         }
       }}
       onScrollEndDrag={(event) => {
+        observeReadingScroll(event.nativeEvent);
+        recordReadingPosition.current?.();
         const follow = currentTimelineFollow();
         if (follow?.motion !== "dragging") return;
         observeTimelineScroll(event.nativeEvent);
@@ -7469,6 +7557,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         if (follow?.motion === "released") follow.motion = "momentum";
       }}
       onMomentumScrollEnd={(event) => {
+        observeReadingScroll(event.nativeEvent);
+        recordReadingPosition.current?.();
         const follow = currentTimelineFollow();
         if (follow?.motion !== "momentum") return;
         observeTimelineScroll(event.nativeEvent);
@@ -7514,14 +7604,18 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           }, 80);
           return;
         }
-        if (messageFocusHighlight === undefined || messageFocusKey !== messageFocusHighlight) return;
+        if (messageFocusKey === undefined || index !== messageFocusIndex
+          || readingFocus === undefined && messageFocusKey !== messageFocusHighlight) return;
         if (messageFocusRetryKeyRef.current === messageFocusKey) return;
         messageFocusRetryKeyRef.current = messageFocusKey;
         timelineListRef.current?.scrollToOffset({ offset: Math.max(0, averageItemLength * index), animated: false });
         if (messageFocusRetryRef.current !== undefined) clearTimeout(messageFocusRetryRef.current);
         messageFocusRetryRef.current = setTimeout(() => {
-          if (taskMountedRef.current && messageFocusKey === messageFocusHighlight) {
-            timelineListRef.current?.scrollToIndex({ index, animated: false, viewPosition: 0.5 });
+          const current = readingFocus ? client.taskHeaderSourceKey() === readingFocusOwner : messageFocusKey === messageFocusHighlight;
+          if (taskMountedRef.current && current) {
+            timelineListRef.current?.scrollToIndex({ index, animated: false, viewPosition: readingFocus ? 0 : 0.5,
+              ...(readingFocus ? { viewOffset: readingFocus.viewOffset } : {}) });
+            if (readingFocus) onReadingPositionHandled?.(readingFocus);
           }
           messageFocusRetryRef.current = undefined;
         }, 80);
@@ -7532,6 +7626,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         <View style={styles.historyActions}>
         {state.window && <Action label={mobileMessage(locale, "task.returnLatest")} colors={colors} onPress={() => {
           const request = newerHistoryRef.current;
+          if (headerSourceKey && ordinaryReadingTask) {
+            readingMeasurement.current?.abort();
+            client.rememberTaskReadingPosition(headerSourceKey);
+          }
           client.latest();
           newerHistoryRef.current = undefined;
           request?.abort();
@@ -8071,6 +8169,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       onClose={() => setComposerAtomId(undefined)} onSavePaste={savePastedTextAtom} onRemove={removeComposerAtom} />
     <MobileInteractionSheet visible={!workerReadOnly && interactionVisible && interactions.length > 0} locale={locale}
       voiceTransport={voiceTransport} onOpenReference={openQuestionReference}
+      allowPlanEdit={state.taskSource?.kind !== "joined"}
       profileId={taskDraftProfileId} interactions={interactions} selectedId={activeInteractionId}
       busy={state.busy || interactionReceipt?.taskJoinId !== undefined} colors={colors}
       responseReceipt={interactionReceipt && interactionReceipt.taskJoinId === undefined ? {

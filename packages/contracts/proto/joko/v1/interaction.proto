@@ -239,6 +239,7 @@ message PlanReviewRequest {
   string markdown = 2;
   repeated PlanStep steps = 3;
   repeated PlanReviewDecisionKind allowed_decisions = 4;
+  bool editable = 5;
 }
 
 message PlanStep {
@@ -342,6 +343,8 @@ message QuestionMultipleChoiceAnswer {
 message PlanReviewResolution {
   PlanReviewDecisionKind decision = 1;
   string feedback = 2;
+  // The replacement text is accepted only for execution of the original editable plan.
+  optional string edited_plan = 3;
 }
 
 message ExtensionUiResolution {

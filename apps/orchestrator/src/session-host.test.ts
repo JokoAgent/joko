@@ -16194,8 +16194,10 @@ describe("SessionHost", () => {
       && fixture.store.getRun(continuation.descriptor.id).descriptor.state === "completed");
   });
 
-  const planReviewDecisions = ["execute", "refine", "stay", "dismiss"] as const;
-  it.each(planReviewDecisions)("holds the mounted Codex Queue until plan review settles with %s", async (decision) => {
+  const planReviewDecisions = ["execute", "execute-edited", "refine", "stay", "dismiss"] as const;
+  it.each(planReviewDecisions)("holds the mounted Codex Queue until plan review settles with %s", async (scenario) => {
+    const decision = scenario === "execute-edited" ? "execute" : scenario;
+    const editedPlan = scenario === "execute-edited" ? "1. Inspect\n2. Add the missing test.\n" : undefined;
     const directory = mkdtempSync(join(tmpdir(), "joko-codex-plan-host-"));
     const store = new OperationalStore(join(directory, "store.db"));
     const repository = new OperationalArtifactRepository(store);
@@ -16282,7 +16284,8 @@ describe("SessionHost", () => {
       payload: {
         kind: "plan_review",
         markdown: "1. Inspect\n2. Implement",
-        choices: ["execute", "stay", "refine"]
+        choices: ["execute", "stay", "refine"],
+        editable: true
       }
     });
 
@@ -16297,8 +16300,17 @@ describe("SessionHost", () => {
     if (decision === "dismiss") {
       host.dismissInteraction(interaction.id, interaction.generation, "Owner dismissed review", "test:mounted-plan-dismiss");
     } else {
-      host.resolveInteraction(interaction.id, interaction.generation,
-        { kind: "plan_review", decision, feedback }, `test:mounted-plan-${decision}`);
+      const submission = { kind: "plan_review", decision, feedback, ...(editedPlan === undefined ? {} : { editedPlan }) } as const;
+      if (editedPlan !== undefined) {
+        expect(() => host.resolveInteraction(interaction.id, interaction.generation, submission, "test:edited-plan-no-owner"))
+          .toThrow(/original local plan/u);
+        expect(() => host.resolveInteraction(interaction.id, interaction.generation,
+          { ...submission, decision: "stay" }, "test:edited-plan-wrong-decision", undefined, connection.id))
+          .toThrow(/original editable approval/u);
+        expect(store.getInteraction(interaction.id).status).toBe("open");
+        expect(store.findRunByParentId(source.value.runId)).toBeUndefined();
+      }
+      host.resolveInteraction(interaction.id, interaction.generation, submission, `test:mounted-plan-${decision}`, undefined, connection.id);
     }
     expect(store.getInteraction(interaction.id).status).toBe(decision === "dismiss" ? "dismissed" : "resolved");
     expect(store.getSession(sessionId).descriptor.planMode).toBe(decision !== "execute");
@@ -16320,9 +16332,10 @@ describe("SessionHost", () => {
     await eventually(() => store.getRun(queued.value.runId).descriptor.state === "completed");
     if (child !== undefined) {
       await eventually(() => turnStarts().length === 3);
+      const implementation = editedPlan === undefined ? "Implement the plan." : `Implement the approved plan below.\n\n${editedPlan}`;
       expect(turnStarts().at(-1)?.params).toMatchObject({
         clientUserMessageId: store.findQueueItemByRunId(sessionId, child.descriptor.id)?.operationId,
-        input: [{ type: "text", text: decision === "execute" ? "Implement the plan." : feedback, text_elements: [] }],
+        input: [{ type: "text", text: decision === "execute" ? implementation : feedback, text_elements: [] }],
         collaborationMode: { mode: decision === "execute" ? "default" : "plan" }
       });
       await fake.completeTurn(binding.nativeSessionId!, "Plan continuation handled");

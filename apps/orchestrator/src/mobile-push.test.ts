@@ -22,6 +22,35 @@ afterEach(async () => {
 });
 
 describe("mobile push Orchestrator boundary", () => {
+  it("groups ordinary completions only when their source node and task match", async () => {
+    const deliver = async (serverId: string): Promise<readonly MobilePushDeliveryInput[]> => {
+      const fixture = await createFixture();
+      fixture.store.createSession({ ...fixture.store.getSession("session-1").descriptor,
+        id: "session-2", binding: { opaqueRef: "native/second.jsonl", generation: 0 } });
+      const sent: MobilePushDeliveryInput[] = [];
+      const coordinator = new MobilePushCoordinator({ store: fixture.store, vault: fixture.vault, serverId, now: () => 1_000,
+        provider: { send: async input => { sent.push(input); return { outcome: "delivered", code: "APNS_200" }; } } });
+      cleanups.push(() => coordinator.close());
+      coordinator.register({ connectionId: fixture.connection.id, deviceId: fixture.connection.deviceId, expectedDeviceRevision: fixture.deviceRevision,
+        environment: "apns_sandbox", locale: "en", deviceToken: "collapse-test-token", registrationId: "collapse-registration", revocationSecret: "c".repeat(43) });
+      coordinator.start();
+      for (const [id, sessionId] of [["first", "session-1"], ["second", "session-1"], ["third", "session-2"]] as const) {
+        fixture.store.createRun({ id, sessionId, source: "user", state: "running", createdAt: 1_000 });
+        fixture.store.updateRunState({ runId: id, state: "completed", traceId: id });
+      }
+      await vi.waitFor(() => expect(fixture.store.listMobilePushDeliveries().filter(item => item.status === "delivered")).toHaveLength(3));
+      return sent;
+    };
+    const [source, otherSource] = await Promise.all([deliver("server-left"), deliver("server-right")]);
+    const firstTask = source.filter(({ intent }) => new URL(intent).pathname === "/session-1");
+    expect(firstTask).toHaveLength(2);
+    const collapseId = firstTask[0]?.collapseId;
+    expect(collapseId).toMatch(/^[0-9a-f]{32}$/u);
+    expect(firstTask[1]?.collapseId).toBe(collapseId);
+    expect(source.find(({ intent }) => new URL(intent).pathname === "/session-2")?.collapseId).not.toBe(collapseId);
+    expect(otherSource.find(({ intent }) => new URL(intent).pathname === "/session-1")?.collapseId).not.toBe(collapseId);
+  });
+
   it("restores the original authorized registration after a terminal APNs rejection without replaying the failed notice", async () => {
     const fixture = await createFixture();
     const sends: MobilePushDeliveryInput[] = [];
@@ -150,6 +179,7 @@ describe("mobile push Orchestrator boundary", () => {
       token: "raw-device-token-current",
       locale: "ja",
       kind: "done",
+      collapseId: expect.stringMatching(/^[0-9a-f]{32}$/u),
       intent: "joko://task/session-1?message=assistant-message&event=assistant-message&server=server-1"
     });
     expect(JSON.stringify(sends[0])).not.toContain("Private task response content");

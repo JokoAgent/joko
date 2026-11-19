@@ -8720,6 +8720,57 @@ describe("native mobile connection and operation ownership", () => {
     expect(app.state.window).toBeUndefined();
   });
 
+  it.each([false, true])("restores the ordinary task reading position on reselection (older page=%s)", async older => {
+    const network = fakeNetwork();
+    const reply = (id: string, sequence: bigint) => create(EventSchema, {
+      ...event(`event-${id}`, sequence),
+      payload: create(EventPayloadSchema, {
+        kind: { case: "messageCompleted", value: create(MessageCompletedEventSchema, {
+          messageId: id,
+          role: MessageRole.ASSISTANT,
+          blocks: [create(MessageBlockSchema, { content: { case: "text", value: id } })]
+        }) }
+      })
+    });
+    const previous = reply("previous", 2n), recent = reply("recent", 10n);
+    const owner = runtimeControlProjection();
+    const detail = create(SnapshotSchema, { ...runtimeControlProjection(runtimeSession, true), timeline: [recent] });
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: owner });
+    vi.mocked(network.readSession).mockResolvedValue(detail);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start(); await app.select("session");
+    if (older) {
+      vi.mocked(network.readHistory).mockResolvedValueOnce({ events: [previous], before: previous.cursor });
+      await app.older();
+    }
+    const anchor = older ? previous : recent, firstSource = app.taskHeaderSourceKey()!;
+    expect(firstSource).toBeDefined();
+    app.rememberTaskReadingPosition(firstSource, { messageId: "another-message", eventId: anchor.eventId, viewOffset: -24 });
+    expect(app.taskReadingPosition()).toBeUndefined();
+    app.rememberTaskReadingPosition(firstSource, { messageId: older ? "previous" : "recent", eventId: anchor.eventId, viewOffset: -24 });
+    const position = app.taskReadingPosition()!;
+    expect(position).toMatchObject({ sessionId: "session", eventId: anchor.eventId, viewOffset: -24 });
+    app.leaveTask(); await app.select("session");
+    expect(app.state.older).toHaveLength(0);
+    expect(app.taskHeaderSourceKey()).not.toBe(firstSource);
+    app.rememberTaskReadingPosition(firstSource);
+    expect(app.taskReadingPosition()).toBe(position);
+    const abort = new AbortController();
+    if (older) vi.mocked(network.readAround).mockResolvedValueOnce([previous]);
+    await expect(app.restoreTaskReadingPosition(position, abort.signal)).resolves.toBe(true);
+    expect(network.readAround).toHaveBeenCalledTimes(older ? 1 : 0);
+    if (older) {
+      expect(network.readAround).toHaveBeenCalledWith(credential, "session", anchor.eventId, expect.any(AbortSignal));
+      expect(app.state.window).toEqual([previous]);
+      expect(app.state.windowHasNewer).toBe(true);
+    }
+    await app.select();
+    expect(app.taskReadingPosition()).toBeUndefined();
+    await expect(app.restoreTaskReadingPosition(position, abort.signal)).resolves.toBe(false);
+    expect(network.readAround).toHaveBeenCalledTimes(older ? 1 : 0);
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])("copies from authenticated A, switches to B, and reopens only A through the real Mobile client (message=%s)", async message => {
     const network = fakeNetwork();
     const b: PairedCredential = { ...otherCredential, serverId: "node-B", origin: "http://192.168.1.21:4318" };

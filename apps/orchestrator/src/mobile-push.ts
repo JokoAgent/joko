@@ -22,6 +22,7 @@ export interface MobilePushDeliveryInput {
   readonly kind: "done" | "awaiting" | "error";
   readonly intent: string;
   readonly title?: string;
+  readonly collapseId?: string;
 }
 
 export type MobilePushDeliveryResult =
@@ -198,11 +199,14 @@ export class MobilePushCoordinator {
           claimed.registration.sealedToken,
           mobilePushCredentialReference(this.#serverId, claimed.registration.id, "token")
         );
+        const collapseId = claimed.delivery.kind === "done" && claimed.delivery.groupId === undefined
+          ? createHash("sha256").update(JSON.stringify([this.#serverId, claimed.delivery.sessionId]), "utf8").digest("hex").slice(0, 32) : undefined;
         result = await this.#provider!.send({
           environment: claimed.registration.environment,
           token,
           locale: claimed.registration.locale,
           kind: claimed.delivery.kind,
+          ...(collapseId === undefined ? {} : { collapseId }),
           ...(claimed.delivery.groupTitle === undefined ? {} : { title: claimed.delivery.groupTitle }),
           intent: claimed.delivery.groupId === undefined ? mobilePushIntent(
             this.#serverId,

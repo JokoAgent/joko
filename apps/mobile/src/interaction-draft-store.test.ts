@@ -41,7 +41,8 @@ describe("mobile interaction draft store", () => {
     const store = new MobileInteractionDraftStore(memory.driver);
     store.save(first, { kind: "question", fieldIndex: 0, answers: { answer: { kind: "text", value: "one" } } });
     store.save(first, { kind: "question", fieldIndex: 1, answers: { answer: { kind: "text", value: "latest" } } });
-    store.save(second, { kind: "plan", feedback: "change scope" });
+    const planDraft = { kind: "plan", feedback: "change scope", editedPlan: "1. Test the current scope\n" } as const;
+    store.save(second, planDraft);
     await vi.advanceTimersByTimeAsync(mobileInteractionDraftTesting.persistDebounceMilliseconds);
     await store.flush();
 
@@ -50,6 +51,7 @@ describe("mobile interaction draft store", () => {
     const copy = store.readSync(first);
     if (copy?.kind === "question") (copy.answers.answer as { value: string }).value = "mutated";
     expect(store.readSync(first)).toMatchObject({ answers: { answer: { value: "latest" } } });
+    await expect(new MobileInteractionDraftStore(memory.driver).read(second)).resolves.toEqual(planDraft);
   });
 
   it("omits recognized credentials from saved Question text and cleans the exact legacy draft on load", async () => {

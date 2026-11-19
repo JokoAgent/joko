@@ -523,6 +523,13 @@ export interface NearbyMobileNode extends DiscoveredNodeRecord {
   readonly health: number;
 }
 
+export interface MobileTaskReadingPosition {
+  readonly sessionId: string;
+  readonly messageId: string;
+  readonly eventId: string;
+  readonly viewOffset: number;
+}
+
 export interface MobileState {
   readonly connectionEntries?: { readonly profileId: string; readonly entries: readonly import('@joko/connection-transport/entries').ConnectionEntryView[]; readonly returnToPreferred: boolean; readonly notice?: string };
   readonly status: "starting" | "unpaired" | "connecting" | "connected" | "offline" | "revoked";
@@ -1052,6 +1059,7 @@ export class MobileClient {
   #projectionTimer?: ReturnType<typeof setTimeout>;
   #streamAbort?: AbortController;
   #historyOwner?: symbol;
+  readonly #taskReadingPositions = new Map<string, MobileTaskReadingPosition>();
   #timelineRetirement = 0;
   #projectionReading = false;
   #projectionMisses = 0;
@@ -10000,6 +10008,33 @@ export class MobileClient {
     } finally {
       history.finish();
     }
+  }
+
+  taskReadingPosition(): MobileTaskReadingPosition | undefined {
+    const owner = this.#joinedTask ? undefined : this.#taskAuthorityKey();
+    return owner ? this.#taskReadingPositions.get(owner) : undefined;
+  }
+
+  rememberTaskReadingPosition(sourceKey: string, anchor?: Omit<MobileTaskReadingPosition, "sessionId">): void {
+    const owner = this.#joinedTask ? undefined : this.#taskAuthorityKey();
+    const sessionId = this.#state.selectedId;
+    if (!owner || !sessionId || sourceKey !== this.taskHeaderSourceKey()) return;
+    if (!anchor) { this.#taskReadingPositions.delete(owner); return; }
+    const message = this.#completedMessageEvent(anchor.eventId)?.payload?.kind;
+    if ((message?.case !== "messageStarted" && message?.case !== "messageCompleted")
+      || anchor.messageId !== (message.value.messageId || anchor.eventId) || !Number.isFinite(anchor.viewOffset)) return;
+    this.#taskReadingPositions.delete(owner);
+    this.#taskReadingPositions.set(owner, Object.freeze({ ...anchor, sessionId }));
+    if (this.#taskReadingPositions.size > 8) this.#taskReadingPositions.delete(this.#taskReadingPositions.keys().next().value!);
+  }
+
+  async restoreTaskReadingPosition(position: MobileTaskReadingPosition, signal: AbortSignal): Promise<boolean> {
+    const key = this.taskHeaderSourceKey();
+    const current = () => !signal.aborted && key !== undefined && key === this.taskHeaderSourceKey()
+      && this.taskReadingPosition() === position;
+    if (!current()) return false;
+    if (!this.#completedMessageEvent(position.eventId)) await this.around(position.eventId, signal, { allowNewer: true });
+    return current() && this.#completedMessageEvent(position.eventId) !== undefined;
   }
 
   async around(eventId: string, signal?: AbortSignal, options?: { readonly allowNewer: boolean }): Promise<void> {

@@ -1359,6 +1359,10 @@ describe("session host, durable events, and reconnect semantics", () => {
     await page.locator("form.pair-form button[type=submit]").click();
     const timeline = page.locator(`.timeline[data-timeline-session-id="${sessionId}"]`);
     await timeline.waitFor({ state: "visible", timeout: 20_000 });
+    const jumpToLatest = page.locator(".jump-latest");
+    await waitFor(async () => (await viewportGeometry(page)).distanceFromEnd <= 2 || await jumpToLatest.isVisible(),
+      settled => settled, "the initially loaded Timeline position");
+    if (await jumpToLatest.isVisible()) await jumpToLatest.click();
     const beforeHold = await settledViewportGeometry(page);
     expect(beforeHold.height).toBeGreaterThan(300);
     expect(beforeHold.scrollHeight).toBeGreaterThan(beforeHold.height * 3);

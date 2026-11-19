@@ -2268,7 +2268,8 @@ export function fromProtoInteractionDecision(resolution: InteractionResolution):
         kind: "decision",
         value: {
           decision: planDecisionName(resolution.decision.value.decision),
-          feedback: resolution.decision.value.feedback
+          feedback: resolution.decision.value.feedback,
+          ...(resolution.decision.value.editedPlan === undefined ? {} : { editedPlan: resolution.decision.value.editedPlan })
         }
       };
     case "extensionUi":
@@ -4285,7 +4286,8 @@ function toProtoInteractionRequest(payload: InteractionPayload): ProtoInteractio
           title: payload.title,
           markdown: payload.markdown,
           steps: [],
-          allowedDecisions: payload.choices.map(planDecision).filter((value) => value !== PlanReviewDecisionKind.UNSPECIFIED)
+          allowedDecisions: payload.choices.map(planDecision).filter((value) => value !== PlanReviewDecisionKind.UNSPECIFIED),
+          editable: payload.editable === true
         })
       };
     case "extension_select":
@@ -4331,6 +4333,7 @@ function fromProtoInteractionRequest(interaction: ProtoInteraction): Interaction
         kind: "plan_review",
         title: interaction.request.value.title,
         markdown: interaction.request.value.markdown,
+        ...(interaction.request.value.editable ? { editable: true } : {}),
         choices: interaction.request.value.allowedDecisions
           .map(planDecisionName)
           .filter((value): value is PlanReviewDecision => value !== "unspecified")
@@ -4473,12 +4476,13 @@ function toProtoInteractionResolution(interaction: InteractionRecord): Interacti
       break;
     }
     case "plan_review": {
-      const record = requireInteractionDecisionRecord(decision, "plan_review", ["decision", "feedback"]);
+      const record = requireInteractionDecisionRecord(decision, "plan_review", ["decision", "feedback"], ["editedPlan"]);
       mapped = {
         case: "planReview",
         value: message<PlanReviewResolution>("joko.v1.PlanReviewResolution", {
           decision: planDecision(requireInteractionDecisionString(record, "decision")),
-          feedback: requireInteractionDecisionString(record, "feedback")
+          feedback: requireInteractionDecisionString(record, "feedback"),
+          ...(Object.hasOwn(record, "editedPlan") ? { editedPlan: requireInteractionDecisionString(record, "editedPlan") } : {})
         })
       };
       break;
@@ -4746,10 +4750,11 @@ function booleanField(value: Readonly<Record<string, unknown>>, key: string): bo
 function requireInteractionDecisionRecord(
   value: unknown,
   kind: "selected" | "confirmed" | "question" | "plan_review" | "cancelled",
-  fields: readonly string[]
+  fields: readonly string[],
+  optionalFields: readonly string[] = []
 ): Readonly<Record<string, unknown>> {
   const record = objectValue(value);
-  const allowed = new Set(["kind", ...fields]);
+  const allowed = new Set(["kind", ...fields, ...optionalFields]);
   if (
     !Object.hasOwn(record, "kind")
     || record["kind"] !== kind

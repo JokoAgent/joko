@@ -1,11 +1,33 @@
-import { describe, expect, it } from "vitest";
+import { generateKeyPairSync } from "node:crypto";
+import { EventEmitter } from "node:events";
+import { describe, expect, it, vi } from "vitest";
 
 import {
+  ApnsMobilePushProvider,
   buildApnsMobilePushPayload,
   classifyApnsResponse
 } from "./apns-mobile-push-provider.js";
 
+const { connect } = vi.hoisted(() => ({ connect: vi.fn() }));
+vi.mock("node:http2", () => ({ connect }));
+
 describe("generic APNs mobile push provider", () => {
+  it("sends the same bounded collapse identity in the HTTP/2 header and APNs thread payload", async () => {
+    const response = new EventEmitter();
+    const end = vi.fn(() => { response.emit("response", { ":status": 200 }); response.emit("end"); });
+    const stream = Object.assign(response, { end, destroy: vi.fn() });
+    const request = vi.fn(() => stream);
+    connect.mockReturnValueOnce(Object.assign(new EventEmitter(), { request, close: vi.fn(), destroy: vi.fn() }));
+    const key = generateKeyPairSync("ec", { namedCurve: "prime256v1" }).privateKey.export({ format: "pem", type: "pkcs8" });
+    const provider = new ApnsMobilePushProvider({ teamId: "team", keyId: "key", privateKeyPem: String(key), topic: "app.joko.mobile" });
+    const collapseId = "a".repeat(32);
+    const input = { environment: "apns_sandbox", token: "fixture-token", locale: "en", kind: "done", intent: "joko://task/session-1", collapseId } as const;
+    await expect(provider.send(input, new AbortController().signal)).resolves.toEqual({ outcome: "delivered", code: "APNS_200" });
+    expect(request).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ "apns-collapse-id": collapseId }));
+    expect(end).toHaveBeenCalledExactlyOnceWith(buildApnsMobilePushPayload(input));
+    expect(JSON.parse(buildApnsMobilePushPayload(input).toString("utf8"))).toMatchObject({ aps: { "thread-id": collapseId } });
+  });
+
   it.each([
     ["en", "Task finished", "Task needs your reply", "Task needs attention"],
     ["zh-CN", "任务已完成", "任务需要你的回复", "任务需要处理"],

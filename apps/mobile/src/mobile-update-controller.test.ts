@@ -3,6 +3,7 @@ import { MobileUpdateController } from "./mobile-update-controller";
 import { MobileUpdateDeviceStore } from "./mobile-update-device-store";
 import type {
   MobileUpdateConfiguration,
+  MobileUpdatePlatform,
   MobileUpdateRelease,
   MobileUpdateRuntime
 } from "./mobile-update";
@@ -195,6 +196,28 @@ describe("MobileUpdateController", () => {
     expect(harness.runtime.checkOta).not.toHaveBeenCalled();
   });
 
+  it("uses the iOS bundle feed on startup and recheck when disabled OTA omits the native runtime identity", async () => {
+    const forced = releaseRecord({ version: "1.0.1", minVersion: "1.0.1" });
+    const harness = createHarness({
+      platform: "ios",
+      configuration: { ...fullConfiguration, otaEnabled: false },
+      runtimePatch: {
+        info: runtimeInfo({ runtimeVersion: undefined, isEnabled: false }),
+        fetchRelease: vi.fn().mockResolvedValueOnce(forced).mockResolvedValueOnce(forced).mockResolvedValueOnce(null)
+      }
+    });
+    await harness.controller.start(true);
+    await vi.waitFor(() => expect(harness.controller.snapshot.forced).toEqual(forced));
+    expect(harness.runtime.fetchRelease).toHaveBeenCalledWith(fullConfiguration.releaseFeedUrl, "ios", "stable", 100);
+    await harness.controller.manualCheck();
+    expect(harness.controller.snapshot.manualOutcome).toBe("update-available");
+    await harness.controller.recheckForced();
+    expect(harness.controller.snapshot.forced).toBeUndefined();
+    expect(harness.runtime.fetchRelease).toHaveBeenCalledTimes(3);
+    expect(harness.runtime.configureChannel).not.toHaveBeenCalled();
+    expect(harness.runtime.checkOta).not.toHaveBeenCalled();
+  });
+
   it("does not report up to date or enter OTA when the release authority is malformed", async () => {
     const harness = createHarness({
       configuration: fullConfiguration,
@@ -291,6 +314,47 @@ describe("MobileUpdateController", () => {
     expect(harness.controller.snapshot.pendingRestart).toBe(true);
   });
 
+  it.each(["https://download.joko.app/mobile-new", null])("retires the iOS optional prompt after handoff, with resumed install URL %s", async (url) => {
+    let now = 1_000;
+    const first = releaseRecord();
+    const next = url === null ? null : releaseRecord({ installUrl: url });
+    const harness = createHarness({
+      platform: "ios",
+      configuration: fullConfiguration,
+      now: () => now,
+      runtimePatch: { fetchRelease: vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(next).mockResolvedValueOnce(next) }
+    });
+    await harness.controller.start(true);
+    await vi.waitFor(() => expect(harness.controller.snapshot.prompt).toEqual(first));
+    await harness.controller.openUpdate(first);
+    expect(harness.controller.snapshot.prompt).toBeUndefined();
+
+    harness.controller.handleAppStateChange("background");
+    now += 5 * 60_000;
+    await harness.controller.handleAppStateChange("active");
+    expect(harness.runtime.fetchRelease).toHaveBeenCalledTimes(2);
+    expect(harness.controller.snapshot.prompt).toBeUndefined();
+    await harness.controller.openUpdate(first);
+    expect(harness.runtime.openRelease).toHaveBeenCalledExactlyOnceWith(first);
+
+    await harness.controller.manualCheck();
+    expect(harness.controller.snapshot.prompt).toEqual(next ?? undefined);
+    expect(harness.controller.snapshot.manualOutcome).toBe(next ? "update-available" : "up-to-date");
+  });
+
+  it("keeps the iOS optional prompt when its install page could not be opened", async () => {
+    const release = releaseRecord();
+    const harness = createHarness({
+      platform: "ios",
+      configuration: fullConfiguration,
+      runtimePatch: { fetchRelease: vi.fn(async () => release), openRelease: vi.fn().mockRejectedValueOnce(new Error("unavailable")) }
+    });
+    await harness.controller.start(true);
+    await vi.waitFor(() => expect(harness.controller.snapshot.prompt).toEqual(release));
+    await expect(harness.controller.openUpdate(release)).rejects.toThrow("unavailable");
+    expect(harness.controller.snapshot).toMatchObject({ prompt: release, actionError: "install" });
+  });
+
   it("persists beta before publishing it and rolls back when native channel configuration fails", async () => {
     const harness = createHarness({ configuration: otaConfiguration });
     await harness.controller.start(true);
@@ -364,6 +428,7 @@ describe("MobileUpdateController", () => {
 
 function createHarness(options: {
   configuration: MobileUpdateConfiguration;
+  platform?: MobileUpdatePlatform;
   initialRecord?: string | null;
   runtimePatch?: Partial<MockRuntime>;
   now?: () => number;
@@ -372,7 +437,7 @@ function createHarness(options: {
   const runtime = runtimeStub(options.runtimePatch);
   const controller = new MobileUpdateController({
     configuration: options.configuration,
-    platform: "android",
+    platform: options.platform ?? "android",
     runtime,
     deviceStore: new MobileUpdateDeviceStore(storage),
     now: options.now,

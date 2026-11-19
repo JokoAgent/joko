@@ -2536,6 +2536,7 @@ describe("proto mapper", () => {
     });
 
     for (const decision of ["execute", "stay", "refine"] as const) {
+      const editedPlan = decision === "execute" ? "1. Inspect.\n2. Add a verification step.\n" : undefined;
       const plan: InteractionRecord = {
         id: `plan-${decision}`,
         sessionId: "session-1",
@@ -2547,18 +2548,19 @@ describe("proto mapper", () => {
           kind: "plan_review",
           title: "Review Pi plan",
           markdown: "1. Inspect\n2. Change",
-          choices: ["execute", "stay", "refine"]
+          choices: ["execute", "stay", "refine"],
+          ...(editedPlan === undefined ? {} : { editable: true })
         },
-        decision: { kind: "plan_review", decision, feedback: `feedback:${decision}` },
+        decision: { kind: "plan_review", decision, feedback: `feedback:${decision}`, ...(editedPlan === undefined ? {} : { editedPlan }) },
         createdAt: 1_000,
         resolvedAt: 2_000,
         revision: 10n
       };
-      const protoPlan = toProtoInteraction(plan, { backendId: "pi", targetId: "target-1" });
+      const protoPlan = toProtoInteraction(plan, { backendId: editedPlan === undefined ? "pi" : "codex", targetId: "target-1" });
       expect(fromProtoInteraction(protoPlan, "trace-plan").payload).toEqual(plan.payload);
       expect(fromProtoInteractionDecision(protoPlan.resolution!)).toEqual({
         kind: "decision",
-        value: { decision, feedback: `feedback:${decision}` }
+        value: { decision, feedback: `feedback:${decision}`, ...(editedPlan === undefined ? {} : { editedPlan }) }
       });
     }
   });

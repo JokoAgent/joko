@@ -140,6 +140,8 @@ export function MobileImageLightbox({
 }: MobileImageLightboxProps) {
   const page = gallery?.descriptor.pages[gallery.pageIndex];
   const loadKey = session?.leaseId ?? gallery?.pageKey ?? "";
+  const pageKey = gallery?.pageKey ?? loadKey;
+  const timelineGallery = gallery?.descriptor.sourceKind === "timeline";
   const fileName = session?.fileName ?? page?.title ?? "";
   const sourceMediaType = session?.sourceMediaType ?? page?.mediaType ?? "";
   const annotatable = session?.annotatable === true;
@@ -159,6 +161,7 @@ export function MobileImageLightbox({
   const [error, setError] = useState("");
   const [foreground, setForeground] = useState(AppState.currentState === "active");
   const [chromeBusy, setChromeBusy] = useState(false);
+  const [chromeVisible, setChromeVisible] = useState(true);
   const { burnIn, host } = useMobileAnnotationBurn();
   const strokesRef = useRef(strokes);
   const draftStrokeRef = useRef(draftStroke);
@@ -182,6 +185,7 @@ export function MobileImageLightbox({
   const galleryRef = useRef(gallery);
   const closeCallbackRef = useRef(onClose);
   const loadOwnerRef = useRef(loadKey);
+  const transformOwnerRef = useRef<string | undefined>(undefined);
   loadOwnerRef.current = loadKey;
   strokesRef.current = strokes;
   draftStrokeRef.current = draftStroke;
@@ -230,16 +234,20 @@ export function MobileImageLightbox({
     strokesRef.current = nextStrokes;
     draftStrokeRef.current = undefined;
     annotatingRef.current = annotateOnOpen;
-    transformRef.current = initialTransform;
-    naturalRef.current = emptySize;
+    if (transformOwnerRef.current !== pageKey) {
+      transformOwnerRef.current = pageKey;
+      transformRef.current = initialTransform;
+      naturalRef.current = emptySize;
+      setTransform(initialTransform);
+      setNatural(emptySize);
+      setChromeVisible(true);
+    }
     gestureRef.current = undefined;
     lastTapRef.current = undefined;
     closedRef.current = false;
     setStrokes(nextStrokes);
     setDraftStroke(undefined);
     setAnnotating(annotateOnOpen);
-    setTransform(initialTransform);
-    setNatural(emptySize);
     decodedRef.current = undefined;
     nativeActivityRef.current = false;
     sawExpectedInactiveRef.current = false;
@@ -250,7 +258,7 @@ export function MobileImageLightbox({
     setOutputAction(undefined);
     setNotice("");
     setError("");
-  }, [loadKey, cancelGesture, annotateOnOpen]);
+  }, [loadKey, pageKey, cancelGesture, annotateOnOpen]);
 
   const backdrop = gallery?.preview;
   useEffect(() => {
@@ -558,12 +566,14 @@ export function MobileImageLightbox({
       } else {
         const pending = { at: now, point: tap };
         lastTapRef.current = pending;
-        if (!annotatingRef.current && !mobileLightboxIsZoomed(transformRef.current.scale)) {
+        if (!annotatingRef.current && (timelineGallery || !mobileLightboxIsZoomed(transformRef.current.scale))) {
           tapTimerRef.current = setTimeout(() => {
             if (!canInteract() || gestureRef.current || lastTapRef.current !== pending
-              || annotatingRef.current || mobileLightboxIsZoomed(transformRef.current.scale)) return;
+              || annotatingRef.current) return;
+            const zoomed = mobileLightboxIsZoomed(transformRef.current.scale);
             clearPendingTap();
-            close();
+            if (timelineGallery) setChromeVisible((visible) => zoomed || !visible);
+            else if (!zoomed) close();
           }, MOBILE_LIGHTBOX_DOUBLE_TAP_MILLISECONDS);
         }
       }
@@ -571,7 +581,7 @@ export function MobileImageLightbox({
     onPanResponderTerminate: () => {
       if (loadOwnerRef.current === loadKey) cancelGesture();
     }
-  }), [locale, annotatable, initialStrokes, canInteract, cancelGesture, clearPendingTap, resetDismiss, resetPage, dismissY, pageX, close, loadKey]);
+  }), [locale, annotatable, initialStrokes, canInteract, cancelGesture, clearPendingTap, resetDismiss, resetPage, dismissY, pageX, close, loadKey, timelineGallery]);
 
   const displayed = mobileContainedImageSize(container, natural);
   const paths = [...strokes, ...(draftStroke ? [draftStroke] : [])];
@@ -582,6 +592,7 @@ export function MobileImageLightbox({
     && container.width > 0 && container.height > 0;
   const gallerySession = gallery ? session : undefined;
   const readOnly = gallerySession?.readOnly === true;
+  const chromeHidden = chromeBusy || !chromeVisible;
   const originalOnly = session?.originalOnly === true || session?.animated === true || gallerySession?.expectedAnimated === true
     || mobileImageOutputMediaType(sourceMediaType) === undefined;
   const canAnnotate = !readOnly && annotatable && session?.originalOnly !== true && session?.animated !== true
@@ -921,9 +932,9 @@ export function MobileImageLightbox({
         </View>}
         </Animated.View>
       </View>
-      <Animated.View testID="image-lightbox-chrome" pointerEvents={chromeBusy ? "none" : "box-none"}
-        accessibilityElementsHidden={chromeBusy} importantForAccessibility={chromeBusy ? "no-hide-descendants" : "auto"}
-        style={[styles.chrome, { opacity: chromeBusy ? 0 : dismissY.interpolate({
+      <Animated.View testID="image-lightbox-chrome" pointerEvents={chromeHidden ? "none" : "box-none"}
+        accessibilityElementsHidden={chromeHidden} importantForAccessibility={chromeHidden ? "no-hide-descendants" : "auto"}
+        style={[styles.chrome, { opacity: chromeHidden ? 0 : dismissY.interpolate({
           inputRange: [-300, 0, 300], outputRange: [0.4, 1, 0.4], extrapolate: "clamp"
         }) }]}>
       <SafeAreaView pointerEvents="box-none" style={styles.chromeSafeArea} edges={["top", "right", "bottom", "left"]}>

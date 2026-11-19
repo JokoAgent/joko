@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { taskMessageReferenceHref, validInputMessageReferences } from "@joko/contracts";
-import { modelPricesWithOverride, NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD, NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
+import { MAXIMUM_EDITABLE_PLAN_LENGTH, modelPricesWithOverride, NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD, NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
   parseNativeModelUsage, parseNativeUsageRequests, type ModelPriceOverride } from "@joko/core";
 import { DocumentPathError, type DocumentPathAuthorizer } from "@joko/tool-document";
 import { DOCUMENT_TOOL_PROVIDER_ID } from "./document-tool-provider.js";
@@ -11028,6 +11028,12 @@ export class SessionHost {
       pending.approval.assertCurrent();
     }
     const decision = validatedInteractionDecision(interaction.payload, submission);
+    if (decision.kind === "plan_review" && decision.editedPlan !== undefined) {
+      const owner = this.editablePlanBackend(interaction.sessionId, interaction.runId);
+      if (connectionId === undefined || owner === undefined || (owner === "claude-code" && pending?.generation !== generation)) {
+        throw new AuthorizationError("The original local plan is no longer available to edit and approve.");
+      }
+    }
     if (pending?.generation === generation && !this.backendInstanceGenerationOwnsContext(
       interaction.sessionId,
       pending.backendInstanceGeneration,
@@ -11094,9 +11100,9 @@ export class SessionHost {
     const sourceRun = store.getRun(interaction.runId).descriptor;
     if (sourceRun.sessionId !== interaction.sessionId || sourceRun.state !== "completed") return undefined;
     const feedback = decision.feedback.trim();
-    const text = decision.decision === "execute"
-      ? "Implement the plan."
-      : feedback;
+    const text = decision.decision !== "execute" ? feedback
+      : decision.editedPlan === undefined || decision.editedPlan === interaction.payload.markdown ? "Implement the plan."
+      : `Implement the approved plan below.\n\n${decision.editedPlan}`;
     if (text.length === 0) return undefined;
     const prompt: PromptInput = {
       text,
@@ -11207,15 +11213,33 @@ export class SessionHost {
   }
 
   private isOrdinaryLocalCodexSession(stored: StoredSession): boolean {
+    return this.#store.getBackend(stored.descriptor.backendId).descriptor.adapterKind === "codex"
+      && this.isOrdinaryLocalPlanSession(stored);
+  }
+
+  private isOrdinaryLocalPlanSession(stored: StoredSession): boolean {
     const session = stored.descriptor;
-    return this.#store.getBackend(session.backendId).descriptor.adapterKind === "codex"
-      && session.remoteWorkspace === undefined
+    return session.remoteWorkspace === undefined
       && this.#store.getTarget(session.targetId).descriptor.remoteWorkspace === undefined
       && session.automationOrigin === undefined && session.derivationOrigin?.sideChat !== true
       && !session.hidden && !session.archived && session.deletedAt === undefined
       && this.#store.sessionCreationServiceKind(session.id) === undefined
       && this.#partnerSessionPolicy(session.id) === undefined
       && this.#store.findSessionRuntimePolicy(session.id) === undefined;
+  }
+
+  private editablePlanBackend(sessionId: string, runId: string | undefined): "codex" | "claude-code" | undefined {
+    if (runId === undefined) return undefined;
+    const stored = this.#store.getSession(sessionId);
+    const backend = this.#store.getBackend(stored.descriptor.backendId).descriptor.adapterKind;
+    if (backend === "codex") return this.isLocalCodexPlanRun(stored, runId) ? backend : undefined;
+    if (backend !== "claude-code" || !this.isOrdinaryLocalPlanSession(stored)) return undefined;
+    const run = this.#store.findRun(runId)?.descriptor;
+    const queue = this.#store.findQueueItemByRunId(sessionId, runId, { includeCleared: true });
+    return run?.source === "user" && run.parentRunId === undefined && queue?.disposition === "prompt"
+      && queue.body.messagingOrigin === undefined && queue.body.automaticContinuation === undefined
+      && queue.body.objectiveContinuation === undefined
+      ? backend : undefined;
   }
 
   private isLocalCodexPlanRun(stored: StoredSession, runId: string): boolean {
@@ -17004,6 +17028,8 @@ export class SessionHost {
       return Promise.resolve({ kind: "cancelled" });
     }
     validateInteractionRequestDeclaration(interaction);
+    const payload = interaction.kind === "plan_review" && interaction.editable === true
+      && this.editablePlanBackend(sessionId, runId) === undefined ? { ...interaction, editable: false } : interaction;
     this.touchActiveSession(sessionId);
     const input = {
       sessionId,
@@ -17011,7 +17037,7 @@ export class SessionHost {
       ...(attemptId === undefined ? {} : { attemptId }),
       ...(operationId === undefined ? {} : { operationId }),
       generation,
-      payload: interaction,
+      payload,
       traceId: `interaction:${interaction.id}`
     };
     if (interaction.kind === "plan_review" && runId !== undefined
@@ -20157,7 +20183,7 @@ export type InteractionDecisionSubmission =
         readonly value: InteractionQuestionAnswerSubmission;
       }[];
     }
-  | { readonly kind: "plan_review"; readonly decision: string; readonly feedback?: string }
+  | { readonly kind: "plan_review"; readonly decision: string; readonly feedback?: string; readonly editedPlan?: string }
   | {
       readonly kind: "extension";
       readonly result:
@@ -21349,7 +21375,7 @@ function validatedPlanReviewDecision(
   payload: Extract<InteractionPayload, { readonly kind: "plan_review" }>,
   submission: Readonly<Record<string, unknown>>
 ): InteractionDecision {
-  if (!hasExactKeys(submission, ["kind", "decision"], ["feedback"])
+  if (!hasExactKeys(submission, ["kind", "decision"], ["feedback", "editedPlan"])
     || submission["kind"] !== "plan_review") {
     throw invalidInteractionDecision("Plan review response does not match the open plan review.");
   }
@@ -21362,10 +21388,17 @@ function validatedPlanReviewDecision(
   if (feedback !== undefined && typeof feedback !== "string") {
     throw invalidInteractionDecision("Plan review feedback must be text when supplied.");
   }
+  const editedPlan = submission["editedPlan"];
+  if (editedPlan !== undefined && (decision !== "execute" || payload.editable !== true
+    || typeof editedPlan !== "string" || editedPlan.trim() === "" || editedPlan.length > MAXIMUM_EDITABLE_PLAN_LENGTH
+    || editedPlan.includes("\0") || containsRecognizedCredential(editedPlan))) {
+    throw invalidInteractionDecision("An edited plan must be bounded text for the original editable approval.");
+  }
   return {
     kind: "plan_review",
     decision: decision as "execute" | "stay" | "refine",
-    feedback: feedback ?? ""
+    feedback: feedback ?? "",
+    ...(editedPlan === undefined ? {} : { editedPlan })
   };
 }
 

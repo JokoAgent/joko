@@ -596,6 +596,7 @@ export interface WorkspaceEntryProjection {
 }
 
 export type PlanReviewDecision = "execute" | "stay" | "refine";
+export const MAXIMUM_EDITABLE_PLAN_LENGTH = 32_000;
 
 export interface InteractionQuestionChoice {
   readonly id: string;
@@ -655,6 +656,7 @@ export type InteractionPayload =
       readonly title: string;
       readonly markdown: string;
       readonly choices: readonly PlanReviewDecision[];
+      readonly editable?: boolean;
     }
   | {
       readonly id: InteractionId;
