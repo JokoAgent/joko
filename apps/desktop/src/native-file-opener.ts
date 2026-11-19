@@ -238,6 +238,7 @@ export class NativeFileOpener {
       await this.#persist();
       if (!current()) return { status: "cancelled" };
       await verifyMaterializedFile(path, bytes.byteLength);
+      if (!current()) return { status: "cancelled" };
       dispatched = true;
       let errorMessage: string;
       try {
