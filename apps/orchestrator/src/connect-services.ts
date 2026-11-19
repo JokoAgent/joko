@@ -9900,11 +9900,16 @@ async function backendProviderDescriptorWithAccountUsage(
           create(contract.CapabilitySchema, { name: "provider.account_resets", support: contract.CapabilitySupport.SUPPORTED, reason: "" })] })
     });
   if (!backendProviderAccountUsageAvailable(dependencies, descriptor, providerId)) return provider;
-  const adapter = fromSnapshot ? dependencies.adapters().find(candidate => candidate.id === descriptor.id) as
-    (BackendAdapter & BackendProviderAccountOperations) | undefined : undefined;
-  const accountUsage = adapter?.peekAccountUsage !== undefined
-    ? peekBackendProviderAccountUsageSnapshot(dependencies, descriptor, providerId, adapter)
-    : await backendProviderAccountUsageSnapshot(dependencies, descriptor, providerId, signal);
+  let accountUsage: contract.ProviderAccountUsageSnapshot | undefined;
+  // Paired Device quota is read explicitly for the selected Provider. Catalog
+  // projection should not fan out to remote devices or cache their quotas.
+  if (descriptor.adapterKind !== "hosted") {
+    const adapter = fromSnapshot ? dependencies.adapters().find(candidate => candidate.id === descriptor.id) as
+      (BackendAdapter & BackendProviderAccountOperations) | undefined : undefined;
+    accountUsage = adapter?.peekAccountUsage !== undefined
+      ? peekBackendProviderAccountUsageSnapshot(dependencies, descriptor, providerId, adapter)
+      : await backendProviderAccountUsageSnapshot(dependencies, descriptor, providerId, signal);
+  }
   const capabilities = [
     ...(provider.capabilities?.capabilities ?? []).filter((capability) =>
       capability.name !== PROVIDER_ACCOUNT_USAGE_CAPABILITY),

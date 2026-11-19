@@ -12453,12 +12453,15 @@ describe("native current-task runtime controls", () => {
     expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({ payload: { case: "createSession", value: {
       backendId: "backend", targetId: "target", model: { model: { providerId: "beta", modelId: "b" }, effortId: "high", fastMode: true } } } });
   });
-  it("retires readonly account usage on background and never sends a model or user input mutation", async () => {
+  it.each([ModelSourceKind.LOCAL, ModelSourceKind.DEVICE])("reads and retires readonly account usage for task Source kind %s", async kind => {
     const network = fakeNetwork();
     const withQuota = (detail: boolean) => {
       const projection = runtimeControlProjection(runtimeSession, detail);
+      projection.models = projection.models.map(model => create(ModelDescriptorSchema, {
+        ...model, source: create(ModelSourceDescriptorSchema, { kind, nodeId: kind === ModelSourceKind.DEVICE ? "original-execution-node" : "local-node" })
+      }));
       if (!detail) projection.providers = projection.providers.map(provider => create(ProviderDescriptorSchema, {
-        ...provider, authenticationState: AuthenticationState.AUTHENTICATED,
+        ...provider, authenticationState: kind === ModelSourceKind.DEVICE ? AuthenticationState.NOT_REQUIRED : AuthenticationState.AUTHENTICATED,
         version: create(EntityVersionSchema, { generation: 0n, revision: create(RevisionSchema, { value: 1n }) }),
         capabilities: create(CapabilityManifestSchema, { schemaVersion: "joko.provider.v1", capabilities: [create(CapabilitySchema, { name: capabilityNames.providerAccountUsage, support: CapabilitySupport.SUPPORTED })] })
       }));
@@ -12471,17 +12474,23 @@ describe("native current-task runtime controls", () => {
       await new Promise<void>(resolve => { release = resolve; });
       return create(ProviderAccountUsageSnapshotSchema, { providerId, primaryWindow: { usedPercent: 70 } });
     });
+    vi.mocked(network.getProviderUsage).mockResolvedValueOnce(create(ProviderAccountUsageSnapshotSchema, {
+      providerId: "alpha", primaryWindow: { usedPercent: 37 }
+    }));
     const app = client(network, memoryStorage(credential).storage);
     await app.start();
     const transport = app.taskProviderUsageTransport();
     expect(transport).toBeDefined();
     await expect(transport!.read("foreign-backend", "alpha", new AbortController().signal)).rejects.toThrow(/unavailable/u);
+    await expect(transport!.read("backend", "alpha", new AbortController().signal)).resolves.toMatchObject({
+      providerId: "alpha", primaryWindow: { usedPercent: 37 }
+    });
     const reading = transport!.read("backend", "alpha", new AbortController().signal);
     app.setForeground(false);
     release();
     await expect(reading).rejects.toThrow(/owner changed/u);
     expect(app.taskProviderUsageTransport()).toBeUndefined();
-    expect(network.getProviderUsage).toHaveBeenCalledOnce();
+    expect(network.getProviderUsage).toHaveBeenCalledTimes(2);
     expect(network.submit).not.toHaveBeenCalled();
   });
 
