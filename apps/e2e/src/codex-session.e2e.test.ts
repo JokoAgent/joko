@@ -8,9 +8,9 @@ import { create, fromBinary } from "@bufbuild/protobuf";
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { createCodexAdapter, AppServerHost, TransportFault } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
-import { EntityKind, GetOperationRequestSchema, MessageRole, NativeCatalogImportPresentationSchema, NativeSessionPlacement, NativeSessionStartSchema,
+import { CreateTargetMutationSchema, EntityKind, GetOperationRequestSchema, MessageRole, NativeCatalogImportPresentationSchema, NativeSessionPlacement, NativeSessionStartSchema,
   ObjectiveStatus, OperationMutationSchema, OperationState, RetryState, RunState, ScheduleRecurrenceSchema,
-  SubmitOperationRequestSchema, ToolCallState, type Event } from "@joko/contracts";
+  SubmitOperationRequestSchema, TargetWorkspaceInputSchema, ToolCallState, WorkspaceKind, type Event } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it, vi } from "vitest";
 
@@ -49,9 +49,19 @@ it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog t
       create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host,
         profileDirectory, catalogProfileDirectories: [profileDirectory] })
     }] });
-    const targetId = fixture.targetId(backendId);
+    const cwd = join(root, "user-project");
+    await mkdir(cwd);
+    const { clients, connectionId } = await fixture.pair("Local catalog Owner");
+    const project = await submit(clients.operation, connectionId, create(OperationMutationSchema, {
+      payload: { case: "createTarget", value: create(CreateTargetMutationSchema, {
+        backendId, displayName: "Original catalog project",
+        workspace: create(TargetWorkspaceInputSchema, { kind: WorkspaceKind.USER_PROJECT, serverPath: cwd })
+      }) }
+    }));
+    if (project.result?.payload.case !== "target") throw new Error("The catalog project was not created.");
+    const targetId = project.result.payload.value.targetId;
     const store = fixture.application.store;
-    const cwd = store.getTarget(targetId).descriptor.workspaceRoot;
+    expect(store.getTarget(targetId).descriptor).toMatchObject({ managed: false, workspaceRoot: cwd });
     const seeded = native.seedThread(cwd, [{ id: turnId, status: "completed", items: [
       { id: "original-user", type: "userMessage", content: [{ type: "text", text: question, text_elements: [] }] },
       { id: "original-assistant", type: "agentMessage", text: answer, phase: null, memoryCitation: null, delivery: null }
@@ -86,7 +96,6 @@ it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog t
         .run(threadId, cwd, rollout, "Original catalog history", at.getTime() / 1_000, at.getTime() / 1_000 + 5);
     } finally { database.close(); }
 
-    const { clients, connectionId } = await fixture.pair("Local catalog Owner");
     const catalog = await clients.session.scanNativeSessionCatalog({ backendId, force: true });
     const entry = catalog.entries.find(candidate => candidate.nativeSessionId === threadId);
     if (entry === undefined) throw new Error("The original local Codex catalog entry is missing.");
