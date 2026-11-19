@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { type BigIntStats } from "node:fs";
@@ -835,6 +836,7 @@ export class PiBackendAdapter implements
   readonly #nativePreviewCatalog: PiNativePreviewCatalog;
   readonly #runtimes = new Map<string, PiRuntime>();
   readonly #runtimeStarts = new Map<string, Promise<PiRuntime>>();
+  readonly #terminalPublication = new AsyncLocalStorage<{ readonly runtime: PiRuntime; pending: boolean }>();
   readonly #spawnProfiles = new Map<string, SessionSpawnProfile>();
   readonly #workingContextRecoveries = new Map<string, { readonly binding: NativeSessionBinding; readonly profile: SessionSpawnProfile;
     readonly targetId: string; readonly workspaceRoot: string; readonly backendInstanceGeneration: number | undefined;
@@ -6015,20 +6017,21 @@ export class PiBackendAdapter implements
               await this.#compactAtConfiguredThreshold(runtime, eventContext, true);
             }
             runtime.translator.setContext(eventContext);
-            await runtime.translator.translate(
-              event,
-              event.type === "agent_settled" && lifecycle !== undefined
-                ? lifecycle.participants.map((participant) => participant.context)
-                : undefined
-            );
-            if (event.type === "tool_execution_end") {
-              await emitExactRuntimeToolUsage(runtime, eventContext, rawEvent);
-            }
             if (event.type === "agent_settled" && lifecycle !== undefined) {
+              const publication = { runtime, pending: true };
+              try {
+                const participants = lifecycle.participants.map((participant) => participant.context);
+                await this.#terminalPublication.run(publication, () => runtime.translator.translate(event, participants));
+              } finally {
+                publication.pending = false;
+              }
               const outcome = runtime.translator.terminalOutcome();
               for (const participant of lifecycle.participants) {
                 await emitExactSkillCommandUsage(participant, outcome);
               }
+            } else {
+              await runtime.translator.translate(event);
+              if (event.type === "tool_execution_end") await emitExactRuntimeToolUsage(runtime, eventContext, rawEvent);
             }
           }
         })
@@ -6429,7 +6432,11 @@ export class PiBackendAdapter implements
     if (runtime.transport.generation !== generation) throw piError("PI_STALE_GENERATION", "Refusing to stop a newer Pi runtime generation", "shutdown");
     await runtime.transport.terminate(runtime.generationLease.generation.options.shutdownTimeoutMs ?? 5_000);
     if (this.#runtimes.get(sessionId) === runtime) this.#runtimes.delete(sessionId);
-    await runtime.eventChain.catch(() => undefined);
+    const publication = this.#terminalPublication.getStore();
+    // Restoring a per-turn model can recycle the process from its own settled
+    // callback. Process exit fences later events, while the callback must return
+    // before its old event chain can finish.
+    if (publication?.runtime !== runtime || !publication.pending) await runtime.eventChain.catch(() => undefined);
     await this.#finalizeRuntime(runtime);
   }
 

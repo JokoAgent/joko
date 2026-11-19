@@ -1679,7 +1679,7 @@ export class ProviderCatalogManager {
       const known = new Set(current.provider.models.map(model => model.id));
       const codexApiKeyResponses = current.kind === "api_key" && current.provider.api === "openai-responses"
         && current.nativeCredentialReferenceId === undefined && Object.keys(current.credentialBindings).length > 0
-        && this.#store.findBackend(current.backendId)?.descriptor.adapterKind === "codex";
+        && this.#store.listBackends().some(({ descriptor }) => descriptor.id === current.backendId && descriptor.adapterKind === "codex");
       const additions = discovered.filter(model => !known.has(model.id)).map(model => {
         const managed = discoveredManagedModel(model, customPiApi);
         return codexApiKeyResponses && model.cost !== undefined && isManagedChatModel(managed) ? { ...managed, cost: model.cost } : managed;

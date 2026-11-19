@@ -12955,7 +12955,7 @@ async function extensionLibraryEffect<T>(action: () => T | Promise<T>): Promise<
                 ? Code.FailedPrecondition
                 : Code.Internal;
     const details = error instanceof ExtensionLibraryFileNotFoundError
-      ? [{ desc: contract.ErrorInfoSchema, value: create(contract.ErrorInfoSchema, { code: contract.EXTENSION_LIBRARY_FILE_NOT_FOUND }) }]
+      ? [{ desc: contract.ErrorInfoSchema, value: createProtoMessage(contract.ErrorInfoSchema, { code: contract.EXTENSION_LIBRARY_FILE_NOT_FOUND }) }]
       : undefined;
     throw new ConnectError(redactSecrets(error.message), code, undefined, details);
   }

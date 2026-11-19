@@ -11851,7 +11851,7 @@ describe("SessionHost", () => {
   });
 
   it("attributes non-subscription exact and delegated usage as actual Schedule cost", async () => {
-    const usageMoneyKind = vi.fn((_backendId: string, _providerId: string, _modelId: string) => "actual-cost" as const);
+    const usageMoneyKind = vi.fn((_backendId: string, _providerId: string) => "actual-cost" as const);
     const fixture = await createFixture(new ScheduleUsageFakeAdapter(), {
       usageMoneyKind
     });
@@ -11895,6 +11895,7 @@ describe("SessionHost", () => {
       }
     });
     expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "test", "text");
+    expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "vision", "multimodal");
   });
 
   it("keeps token-priced metered usage in actual cost when the runtime reports no cost", async () => {
@@ -11958,7 +11959,7 @@ describe("SessionHost", () => {
       });
       const fixture = await createFixture(adapter, { usageMoneyKind: () => "actual-cost" });
       fixture.store.upsertModelPriceOverride({ ownerId: "orchestrator", backendId: adapter.id, providerId: "test", modelId: "text",
-        values: { currencyCode: "USD", input: 10, output: 20 } });
+        values: { currencyCode: "USD", input: 10, output: 20, cacheRead: null, cacheWrite: null } });
       const sessionId = (await fixture.host.createSession({ operationId: "create-bound-priced-task", connection: fixture.connection,
         targetId: "target-one", title: "Original bound task", providerId: "test", modelId: "text", effort: "off",
         fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
@@ -12033,7 +12034,7 @@ describe("SessionHost", () => {
   });
 
   it("fails closed to reference value when the exact Backend has no billing provenance", async () => {
-    const usageMoneyKind = vi.fn((_backendId: string, _providerId: string, _modelId: string) => "reference-value" as const);
+    const usageMoneyKind = vi.fn((_backendId: string, _providerId: string) => "reference-value" as const);
     const fixture = await createFixture(new ScheduleUsageFakeAdapter(), {
       usageMoneyKind
     });
@@ -19440,13 +19441,16 @@ function nativeReferenceUsageFixture(options: { readonly sdkCost?: number; reado
 
 class NativeModelUsageFakeAdapter extends FakeBackendAdapter {
   observation = nativeModelUsageFixture();
+  #observedUsage?: UsageSnapshot;
   constructor(readonly children = true, models = PI_LIKE_PROFILE.models) { super({ ...PI_LIKE_PROFILE, models, id: "native-model-usage-fake", capabilities: [
     ...PI_LIKE_PROFILE.capabilities, { key: "subagents.list", supported: true }, { key: "subagents.detail", supported: true }
   ] }); }
   override async inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
-    const { usage: _initialUsage, ...state } = await super.inspectSession(binding, context); return state;
+    const { usage: _initialUsage, ...state } = await super.inspectSession(binding, context);
+    return { ...state, ...(this.#observedUsage === undefined ? {} : { usage: this.#observedUsage }) };
   }
   override async send(_input: PromptInput, context: AdapterContext): Promise<void> {
+    this.#observedUsage = this.observation;
     await context.emit({ type: "usage", usage: this.observation }); await context.emit({ type: "usage", usage: this.observation });
     if (this.children) {
       const base = portableWorkerRun(context.sessionId, 0);

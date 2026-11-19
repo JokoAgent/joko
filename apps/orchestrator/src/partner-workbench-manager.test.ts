@@ -6,7 +6,7 @@ import type { NativeSessionBinding, NativeSessionCatalogEntry, NativeSessionCata
 import { OperationalStore, PartnerStore, PartnerWorkbenchStore, PartnerRoutineStore } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { create } from "@bufbuild/protobuf";
+import { create, toJsonString } from "@bufbuild/protobuf";
 import { Code, ConnectError, createClient, type HandlerContext } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
 import * as contract from "@joko/contracts";
@@ -156,10 +156,8 @@ describe("Partner workbench service and Queue ownership", () => {
     });
     const methods = createPartnerWorkbenchConnectMethods(f.workbench, () => ({ id: "owner" }));
     const request = create(contract.GetPartnerWorkbenchRequestSchema, { partnerId: f.partner.id });
-    const read = async () => {
-      const response = create(contract.GetPartnerWorkbenchResponseSchema, await methods.getPartnerWorkbench(request, {} as HandlerContext));
-      return response.workbench?.tasks.find(task => task.id === "item:login")?.pullRequest;
-    };
+    const readWorkbench = async () => create(contract.GetPartnerWorkbenchResponseSchema, await methods.getPartnerWorkbench(request, {} as HandlerContext));
+    const read = async () => (await readWorkbench()).workbench?.tasks.find(task => task.id === "item:login")?.pullRequest;
     await vi.waitFor(async () => {
       expect(await read()).toMatchObject({ observed: anonymousStatus === 200, reference: { webUrl },
         state: anonymousStatus === 200 ? contract.CodeHostPullRequestState.OPEN : contract.CodeHostPullRequestState.UNSPECIFIED });
@@ -178,7 +176,7 @@ describe("Partner workbench service and Queue ownership", () => {
     });
     expect(command).toHaveBeenCalledTimes(2);
     expect(anonymousRequests).toBe(1);
-    expect(JSON.stringify(await read())).not.toContain(token);
+    expect(toJsonString(contract.GetPartnerWorkbenchResponseSchema, await readWorkbench())).not.toContain(token);
 
     now += 60_001;
     authenticatedStatus = 503;

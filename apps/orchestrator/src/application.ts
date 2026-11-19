@@ -4345,7 +4345,7 @@ export function providerUsageMoneyKind(
   const kind = entry?.kind;
   if (backend.adapterKind === "pi" && entry?.kind === "api_key" && modelId !== undefined &&
     entry.provider.baseUrl !== undefined && entry.nativeCredentialReferenceId === undefined &&
-    Object.keys(entry.credentialBindings).length > 0) {
+    entry.authenticationState === "authenticated" && entry.credentialReferenceIds.length > 0) {
     const model = entry.provider.models.find(candidate => candidate.id === modelId);
     const effectiveApi = backend.models.find(candidate => candidate.providerId === providerId && candidate.modelId === modelId)?.api;
     // Pi's Chat Completions client calculates these amounts from the local model rates.

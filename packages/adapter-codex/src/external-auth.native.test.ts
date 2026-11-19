@@ -23,10 +23,34 @@ function environment(home: string) {
 describe.skipIf(!binary)("published native ephemeral account contract", () => {
   it("pins reset control-plane auth and independent process leases to the current published SDK generation without quota or model requests", async () => {
     const home = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-reset-identity-"))), auth = join(home, "auth.json");
-    const credentials = (account: string, email: string) => JSON.stringify({ auth_mode: "chatgpt", tokens: {
-      id_token: token("fixture", account, email), access_token: token("fixture", account, email), refresh_token: "private-original-refresh", account_id: account
+    const first = { id: "first-workspace", email: "first@example.invalid" };
+    const selected = { id: "selected-workspace", email: "selected@example.invalid" };
+    const accounts = [first, selected];
+    const accessToken = (account: typeof first) => token("fixture", account.id, account.email);
+    const credentials = (account: typeof first) => JSON.stringify({ auth_mode: "chatgpt", OPENAI_API_KEY: null,
+      last_refresh: new Date().toISOString(), tokens: {
+      id_token: accessToken(account), access_token: accessToken(account), refresh_token: "private-original-refresh", account_id: account.id
     } });
-    await writeFile(auth, credentials("first-workspace", "first@example.invalid"));
+    // Even refreshToken:false loads Enterprise requirements and discovers the
+    // workspace. Serve the pinned SDK's two bootstrap reads on loopback.
+    const requests: { route: "requirements" | "workspace" | "unexpected"; status: number; account: string | undefined }[] = [];
+    const server = createServer((request, response) => {
+      request.resume();
+      const path = request.method === "GET" ? request.url?.split("?", 1)[0] : undefined;
+      const route = path === "/backend-api/wham/config/bundle" ? "requirements"
+        : path === "/backend-api/wham/accounts/check" ? "workspace" : "unexpected";
+      const account = accounts.find(candidate => request.headers.authorization === `Bearer ${accessToken(candidate)}`)?.id;
+      const status = route === "unexpected" ? 404 : 200;
+      requests.push({ route, status, account });
+      if (route === "unexpected") { response.writeHead(status).end(); return; }
+      const body = route === "requirements" ? {} : { accounts: accounts.map(({ id }) => ({ id,
+        workspace_backend_origin: `https://127.0.0.1:${(server.address() as import("node:net").AddressInfo).port}`,
+        account_routing_override: "NO_CONSTRAINT"
+      })) };
+      response.writeHead(status, { "content-type": "application/json" });
+      response.end(JSON.stringify(body));
+    });
+    await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
     const processRoot = join(home, "processes"), processOwner: DurableProcessOwnerOptions = {
       rootDirectory: processRoot, instanceId: "native-reset-owner", generation: 1, recoverStale: false,
       supervisor: { capture: async pid => `owned-${pid}`, captureSync: pid => `owned-${pid}`,
@@ -39,6 +63,7 @@ describe.skipIf(!binary)("published native ephemeral account contract", () => {
     const original = new AppServerHost({ transport: { command: binary!, cwd: home, env: environment(home),
       args: ["app-server", "--listen", "stdio://", "-c", 'cli_auth_credentials_store="file"'], processOwner } });
     const observations: unknown[] = [], transports: StdioJsonRpcTransport[] = [];
+    let stage = "original host initialization";
     const request = StdioJsonRpcTransport.prototype.request;
     const observation = vi.spyOn(StdioJsonRpcTransport.prototype, "request").mockImplementation(async function (this: StdioJsonRpcTransport, method, params, options = {}) {
       if (method !== "account/rateLimits/read") return request.call(this, method, params, options);
@@ -47,24 +72,45 @@ describe.skipIf(!binary)("published native ephemeral account contract", () => {
       options.beforeDispatch?.(); await options.beforeDispatchAsync?.(options.signal ?? new AbortController().signal); options.beforeDispatch?.();
       transports.push(this); expect(this.processOwner).toBe(original.processOwner);
       expect(await readdir(join(processRoot, "1"))).toHaveLength(2);
+      stage = "isolated host account/read";
       observations.push(await request.call(this, "account/read", { refreshToken: false }));
       return { rateLimits: { primary: { usedPercent: 0, windowDurationMins: 300, resetsAt: 1_900_000_000 } }, rateLimitResetCredits: { availableCount: 0, credits: [] } };
     });
     const owner = new CodexBackendAdapter({ host: original, profileDirectory: home, instanceGeneration: 1,
       appServer: { transport: { command: binary!, cwd: home, env: environment(home), processOwner } } });
     try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Missing private account routing listener.");
+      await writeFile(join(home, "config.toml"), `chatgpt_base_url = "http://127.0.0.1:${address.port}/backend-api/"\n[features]\nplugins = false\nremote_plugin = false\n`);
+      const backendOrigin = `https://127.0.0.1:${address.port}`;
+      await writeFile(auth, credentials(first));
       await original.ensureStarted();
-      expect((await original.request("account/read", { refreshToken: false })).value).toMatchObject({ account: { email: "first@example.invalid" } });
-      const replacement = credentials("selected-workspace", "selected@example.invalid"); await writeFile(auth, replacement);
+      stage = "original host account/read";
+      expect((await original.request("account/read", { refreshToken: false })).value).toMatchObject({
+        account: { type: "chatgpt", email: first.email }, workspaceRouting: { chatgptAccountId: first.id, backendOrigin }
+      });
+      const replacement = credentials(selected); await writeFile(auth, replacement);
+      stage = "isolated account reset host initialization";
       const facts = await owner.readAccountRateLimitResets({ providerId: "openai", assertCurrent() {} });
+      stage = "account reset result and process retirement";
       expect(facts.accountLabel).toBe("…kspace"); expect(facts.credits?.availableCount).toBe(0);
-      expect(observations).toEqual([expect.objectContaining({ account: expect.objectContaining({ type: "chatgpt", email: "selected@example.invalid" }) })]);
+      expect(observations).toEqual([expect.objectContaining({ account: expect.objectContaining({ type: "chatgpt", email: selected.email }),
+        workspaceRouting: expect.objectContaining({ chatgptAccountId: selected.id, backendOrigin }) })]);
       expect(await readFile(auth, "utf8")).toBe(replacement);
       expect(original.isActiveGeneration(original.generation)).toBe(true); expect(transports).toHaveLength(1); expect(transports[0]!.running).toBe(false);
       expect(await readdir(join(processRoot, "1"))).toHaveLength(1);
+      expect(new Set(requests.filter(request => request.route === "workspace").map(request => request.account))).toEqual(new Set([first.id, selected.id]));
+      expect(requests.filter(request => request.route === "unexpected")).toEqual([]);
+    } catch (cause) {
+      throw new Error(`Native account fixture failed during ${stage}. Loopback receipts: ${JSON.stringify(requests.slice(-12))}`, { cause });
     } finally {
       try { await owner.dispose(); await original.shutdown(); }
-      finally { observation.mockRestore(); await rm(home, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 }); }
+      finally {
+        observation.mockRestore();
+        server.closeAllConnections();
+        await new Promise<void>(resolve => server.close(() => resolve()));
+        await rm(home, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 });
+      }
     }
   }, 60_000);
 

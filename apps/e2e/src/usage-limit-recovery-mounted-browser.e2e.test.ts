@@ -26,6 +26,9 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
   const defaultModelName = "Task default quota model";
   let fixture: RealPiSystemFixture | undefined;
   let browser: Browser | undefined;
+  let releaseRestoredModel!: () => void;
+  const restoreGate = new Promise<void>(resolve => { releaseRestoredModel = resolve; });
+  let restoringModel = false;
   const checkpoint = (phase: string) => { console.info(`Quota recovery fixture ${phase}`); };
   try {
     const configureDefaultProvider = async (host: RealPiSystemFixture) => {
@@ -46,15 +49,38 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
       backendId: "pi", targetId: "workspace-real-pi", displayName: "Quota recovery task", providerId: defaultProviderId, modelId: defaultModelId
     })));
     const session = fixture.application.store.getSession(sessionId).descriptor;
+    const host = fixture.application.sessionHost;
+    const originalStore = fixture.application.store;
+    let originalRunId: string | undefined;
+    const originalModelRestore = await host.invokeBackendAdapter("pi", adapter => {
+      const setModel = adapter.setModel.bind(adapter);
+      return vi.spyOn(adapter, "setModel").mockImplementation(async (providerId, modelId, context) => {
+        const originalRun = originalRunId === undefined ? undefined : originalStore.getRun(originalRunId).descriptor;
+        const restoresOriginalModel = context.sessionId === sessionId && context.generation === session.binding.generation
+          && providerId === defaultProviderId && modelId === defaultModelId
+          && originalRun?.sessionId === sessionId && originalRun.state === "failed";
+        if (restoresOriginalModel) checkpoint("restoring the failed turn's original model");
+        const result = await setModel(providerId, modelId, context);
+        if (restoresOriginalModel) {
+          expect(result).toMatchObject({ modelId: defaultModelId, providerId: defaultProviderId });
+          checkpoint("confirmed the restored model and native runtime");
+          restoringModel = true;
+          await restoreGate;
+        }
+        return result;
+      });
+    });
     const original = sendInputMutation(sessionId, BigInt(session.binding.generation), "Use the per-turn quota Provider");
     if (original.payload.case !== "sendInput") throw new Error("The fixture must submit a real sendInput.");
     const model = create(ModelSelectionSchema, { model: { providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID }, effortId: "off" });
     original.payload.value.overrides = create(PerTurnOverridesSchema, { model });
     const admitted = await submit(owner.clients.operation, owner.connectionId, original);
     const runId = queueRunIdFrom(admitted);
+    originalRunId = runId;
     const queueItemId = queueItemIdFrom(admitted);
     checkpoint("waiting for the original rate limit");
     await waitFor(() => owner.clients.run.getRun({ runId }), value => value.run?.state === RunState.FAILED, "the original Pi rate limit");
+    checkpoint("reading the original failed queue item");
     await waitFor(async () => fixture!.application.store.getQueueItem(queueItemId), value => value.state === "failed",
       "the original Pi input to finish settling its queue item");
     expect(fixture.providerRequests.length).toBeGreaterThan(0);
@@ -62,14 +88,16 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
     expect(fixture.application.store.getQueueItem(queueItemId).executionOverrides)
       .toMatchObject({ providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID });
     expect(fixture.application.store.getSession(sessionId).descriptor.providerId).toBe(defaultProviderId);
+    await waitFor(async () => restoringModel, value => value, "the native model restoration ACK before Host adoption");
 
     checkpoint("closing the original fixture for the cold receipt");
     const closeOriginalApplication = fixture.application.close.bind(fixture.application);
-    const host = fixture.application.sessionHost;
     const disposeOriginalHost = host.dispose.bind(host);
     const hostClosing = vi.spyOn(host, "dispose").mockImplementation(async () => {
       checkpoint("disposing the original SessionHost");
-      await disposeOriginalHost();
+      const disposed = disposeOriginalHost();
+      releaseRestoredModel();
+      await disposed;
       checkpoint("disposed the original SessionHost");
     });
     const adapterClosing = await host.invokeBackendAdapter("pi", adapter => {
@@ -86,7 +114,7 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
       checkpoint("closed the original Orchestrator");
     });
     try { await fixture.close(); }
-    finally { closing.mockRestore(); hostClosing.mockRestore(); adapterClosing.mockRestore(); }
+    finally { closing.mockRestore(); hostClosing.mockRestore(); adapterClosing.mockRestore(); originalModelRestore.mockRestore(); }
     checkpoint("opening the service on the original database");
     fixture = await RealPiSystemFixture.start({ rootDirectory, webDirectory });
     checkpoint("configuring the restarted service");
@@ -168,7 +196,11 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
       expect(item?.executionOverrides).toMatchObject({ providerId: schedule.providerId, modelId: schedule.modelId });
     }
     expect(fixture.providerRequests.map(({ body }) => body["model"])).toEqual([REAL_PI_MODEL_ID, defaultModelId]);
+  } catch (error) {
+    checkpoint(error instanceof Error ? error.message : "failed before producing an original receipt");
+    throw error;
   } finally {
+    releaseRestoredModel();
     checkpoint("closing the browser and service");
     clock.mockRestore();
     await browser?.close();

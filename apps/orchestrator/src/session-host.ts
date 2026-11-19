@@ -8632,6 +8632,10 @@ export class SessionHost {
   private async restoreTurnOverrideLease(runId: string): Promise<void> {
     const lease = this.#turnOverrideLeases.get(runId);
     if (lease === undefined) return;
+    if (this.#disposed) {
+      this.#turnOverrideLeases.delete(runId);
+      return;
+    }
     if (
       this.#sessionLifecycleFences.has(lease.sessionId)
       || this.#store.findPendingSessionLifecycleCleanup(lease.sessionId) !== undefined
@@ -8675,8 +8679,11 @@ export class SessionHost {
     );
     try {
       await this.restoreRuntimeConfiguration(lease, active, context);
-      this.assertActiveBackendSideEffectLease(sideEffect);
+      if (!this.#disposed) this.assertActiveBackendSideEffectLease(sideEffect);
     } catch (error) {
+      // Shutdown joins this effect before disposing the Adapter. Closing here
+      // can also join the native terminal event that is still awaiting us.
+      if (this.#disposed) return;
       await active.adapter.closeSession(sideEffect.stored.descriptor.binding, context).catch(() => undefined);
       this.deleteActiveSession(lease.sessionId, active);
       this.recordFailure("turn_override_restore", error);

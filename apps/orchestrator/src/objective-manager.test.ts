@@ -140,10 +140,8 @@ describe("ObjectiveManager", () => {
   });
 
   it.each(["refinement", "original"] as const)("completes the initial Claude Goal after the user selects %s", async choiceId => {
-    const fixture = createFixture();
+    const fixture = createFixture({ adapterKind: "claude-agent-sdk-stdio" });
     const session = fixture.store.getSession(fixture.sessionId).descriptor;
-    const backend = fixture.store.getBackend(session.backendId).descriptor;
-    fixture.store.upsertBackend({ ...backend, adapterKind: "claude-agent-sdk-stdio" });
     const originalText = "Improve the README", refinedText = "Document the CLI flags in README.md";
     await fixture.manager.set({ operationId: "set-clarified-goal", sessionId: fixture.sessionId, text: originalText });
     const pending = fixture.host.admissions[0]!;
@@ -157,9 +155,11 @@ describe("ObjectiveManager", () => {
     settleRun(fixture.store, pending, "completed", verdict("complete", "The README now documents the flags", refinedText));
     await fixture.manager.onRunSettled({ sessionId: fixture.sessionId, runId: pending.runId, outcome: "completed" });
     const text = choiceId === "refinement" ? refinedText : originalText;
-    expect(fixture.store.getObjective(fixture.sessionId)).toMatchObject({ status: "complete", text, turnsUsed: 1 });
-    expect(fixture.store.listEvents({ sessionId: fixture.sessionId }).some(({ payload }) => payload.type === "objective_lifecycle"
-      && payload.action === "completed" && payload.objectiveText === text)).toBe(true);
+    const objective = fixture.store.getObjective(fixture.sessionId);
+    expect(objective).toMatchObject({ status: "complete", text, turnsUsed: 1 });
+    const completions = fixture.store.listEvents({ sessionId: fixture.sessionId }).filter(({ payload }) =>
+      payload.type === "objective_lifecycle" && payload.action === "completed");
+    expect(completions).toMatchObject([{ payload: { status: "complete", ownerGeneration: objective.ownerGeneration, turnsUsed: 1 } }]);
     expect(fixture.host.admissions).toHaveLength(1);
   });
 
@@ -575,7 +575,10 @@ describe("ObjectiveManager", () => {
   });
 });
 
-interface FixtureOptions { readonly now?: () => number }
+interface FixtureOptions {
+  readonly now?: () => number;
+  readonly adapterKind?: string;
+}
 
 function createFixture(options: FixtureOptions = {}) {
   const directory = mkdtempSync(join(tmpdir(), "joko-objective-"));
@@ -584,7 +587,7 @@ function createFixture(options: FixtureOptions = {}) {
     id: "backend-one",
     displayName: "Backend",
     version: "test",
-    adapterKind: "fixture",
+    adapterKind: options.adapterKind ?? "fixture",
     instanceGeneration: 1,
     installationState: "installed",
     authenticationState: "not_required",
