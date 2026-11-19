@@ -139,6 +139,56 @@ describe("Inspector menus", () => {
     colors.mockRestore();
   });
 
+  it("keeps terminal create and close receipts when earlier lists arrive late", async () => {
+    const colors = vi.spyOn(window, "getComputedStyle").mockReturnValue({ getPropertyValue: () => "#123456" } as unknown as CSSStyleDeclaration);
+    const created = { id: "late-list-pty", sessionId: "session-one", targetId: "target-one", generation: 1n, status: "running", exitConfirmed: false,
+      shellId: "shell", shellLabel: "Shell", cwd: "/workspace", columns: 80, rows: 24, createdAt: 1, updatedAt: 1 };
+    let finishInitial!: (records: readonly typeof created[]) => void;
+    let finishReconnect!: (records: readonly typeof created[]) => void;
+    const listTerminals = vi.fn()
+      .mockReturnValueOnce(new Promise(resolve => { finishInitial = resolve; }))
+      .mockReturnValueOnce(new Promise(resolve => { finishReconnect = resolve; }));
+    const createTerminal = vi.fn(async () => created);
+    const closeTerminal = vi.fn(async () => undefined);
+    const api = {
+      state: { connectionState: "connected", preferences: DEFAULT_UI_PREFERENCES },
+      getTerminalCapabilities: vi.fn(async () => ({ support: "supported", shells: [{ id: "shell", label: "Shell" }], defaultShellId: "shell",
+        maximumTerminals: 16, maximumInputBytes: 65_536, maximumColumns: 500, maximumRows: 200 })),
+      listTerminals, createTerminal, closeTerminal, setInspectorOpen: vi.fn(async () => undefined), releaseArtifactUrl: vi.fn()
+    } as unknown as AppController;
+    const host = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(host); roots.push(root);
+    const render = (connected: boolean) => act(async () => root.render(<Inspector controller={{ ...api, state: { ...api.state, connectionState: connected ? "connected" : "reconnecting" } }}
+      snapshot={emptySnapshot()} session={session()} timeline={[]} open t={t} runAction={() => undefined} onClose={vi.fn()} onSelectionQuote={vi.fn()} />));
+    const screen = () => host.querySelector(`textarea[aria-label="${created.id}"]`);
+    try {
+      await render(true);
+      expect(listTerminals).toHaveBeenCalledOnce();
+      await act(async () => host.querySelector<HTMLButtonElement>(`button[aria-label="${t("inspector.addTab")}"]`)!.click());
+      await act(async () => [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+        .find(button => button.textContent === t("terminal.new"))!.click());
+      await settle();
+      const originalScreen = screen();
+      expect(originalScreen).not.toBeNull();
+      await act(async () => finishInitial([]));
+      expect(screen()).toBe(originalScreen);
+      expect(createTerminal).toHaveBeenCalledOnce();
+      expect(closeTerminal).not.toHaveBeenCalled();
+
+      await render(false);
+      await render(true);
+      expect(listTerminals).toHaveBeenCalledTimes(2);
+      await act(async () => host.querySelector<HTMLButtonElement>(`button[aria-label="${t("terminal.close")}"]`)!.click());
+      expect(closeTerminal).toHaveBeenCalledExactlyOnceWith("session-one", created.id, 1n);
+      await act(async () => finishReconnect([created]));
+      expect(screen()).toBeNull();
+    } finally {
+      finishInitial([]);
+      finishReconnect([]);
+      colors.mockRestore();
+    }
+  });
+
   it("creates independent terminals, focuses an existing terminal by shortcut, and kills only an explicitly closed tab", async () => {
     writeTerminalShellPreference("shell");
     let color = "#123456";

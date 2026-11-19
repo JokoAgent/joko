@@ -80,6 +80,21 @@ describe("session notification tracker", () => {
     expect(tracker.observe("owner", [session("one", attention("error", 30n, true))])).toEqual([]);
   });
 
+  it.each(["done", "error"] as const)("keeps one %s notification as its acknowledgement cursor advances", (kind) => {
+    const tracker = new SessionNotificationTracker();
+    const terminal = attention(kind, 50n);
+    tracker.observe("owner", [session("task")]);
+    expect(tracker.observe("owner", [session("task", terminal)])).toEqual([
+      { sessionId: "task", title: "Task task", kind }
+    ]);
+
+    const settled = { ...terminal, attentionCursor: cursor(51n), updatedAt: 51 };
+    expect(tracker.observe("owner", [session("task", settled)])).toEqual([]);
+    expect(tracker.observe("owner", [session("task", { ...settled, unread: false })])).toEqual([]);
+    expect(tracker.observe("owner", [session("task", { ...settled, attentionCursor: cursor(52n) })])).toEqual([]);
+    expect(tracker.observe("owner", [session("task", attention(kind, 60n))])).toHaveLength(1);
+  });
+
   it("notifies for a newly-created task after the initial snapshot and prunes deleted identities", () => {
     const tracker = new SessionNotificationTracker();
     tracker.observe("owner", []);

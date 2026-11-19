@@ -3,6 +3,7 @@ import { act } from "react";
 import { createPortal } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
+import { applyAppearanceTypography, DEFAULT_APPEARANCE_PREFERENCES } from "../appearance-settings.js";
 import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
 import type { TerminalAppearanceView, TerminalCapabilitiesView, TerminalUpdateView, TerminalView } from "../model.js";
@@ -11,10 +12,16 @@ import { InteractiveTerminalPanel } from "./InteractiveTerminalPanel.js";
 const mocks = vi.hoisted(() => ({ terminals: [] as any[], fit: vi.fn(), links: [] as ((event: MouseEvent, uri: string) => void)[] }));
 vi.mock("@xterm/xterm", () => ({ Terminal: class {
   options: any; cols = 90; rows = 30; input = (_data: string) => {}; key = (_event: KeyboardEvent) => true;
-  selection = ""; write = vi.fn((_data: string, parsed?: () => void) => parsed?.()); reset = vi.fn(); dispose = vi.fn(); focus = vi.fn(() => this.element?.querySelector("textarea")?.focus()); element: HTMLElement | undefined; resize = vi.fn();
+  selection = ""; write = vi.fn((_data: string, parsed?: () => void) => parsed?.()); reset = vi.fn(); dispose = vi.fn(); focus = vi.fn(() => this.textarea?.focus()); element: HTMLElement | undefined; resize = vi.fn();
+  textarea: HTMLTextAreaElement | undefined; modes = { sendFocusMode: false };
   parser = { registerCsiHandler: vi.fn(() => ({ dispose: vi.fn() })), registerDcsHandler: vi.fn(() => ({ dispose: vi.fn() })), registerOscHandler: vi.fn(() => ({ dispose: vi.fn() })) };
   constructor(options: any) { this.options = options; mocks.terminals.push(this); }
-  open(slot: HTMLElement) { this.element = slot; slot.appendChild(slot.ownerDocument.createElement("textarea")).className = "xterm-helper-textarea"; }
+  open(slot: HTMLElement) {
+    this.element = slot;
+    this.textarea = slot.appendChild(slot.ownerDocument.createElement("textarea"));
+    this.textarea.className = "xterm-helper-textarea";
+    this.textarea.addEventListener("blur", () => { if (this.modes.sendFocusMode && !this.options.disableStdin) this.input("\x1b[O"); });
+  }
   loadAddon() {} attachCustomKeyEventHandler(handler: typeof this.key) { this.key = handler; }
   onData(handler: typeof this.input) { this.input = handler; return { dispose: vi.fn() }; }
   hasSelection() { return this.selection !== ""; } getSelection() { return this.selection; }
@@ -36,6 +43,62 @@ afterEach(async () => {
 const capabilities: TerminalCapabilitiesView = { support: "supported", shells: [{ id: "shell", label: "Shell" }], defaultShellId: "shell", maximumTerminals: 16, maximumInputBytes: 5, maximumColumns: 500, maximumRows: 200 };
 const initial: TerminalView = { id: "terminal-one", sessionId: "session-one", targetId: "target-one", generation: 1n, status: "running", exitConfirmed: false, shellId: "shell", shellLabel: "Shell", cwd: "/workspace", columns: 80, rows: 24, createdAt: 1, updatedAt: 1 };
 const t = (key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate("en", key, values);
+
+it("fits the open terminal in the new typeface after it loads", async () => {
+  vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+  vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(700);
+  vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(400);
+  const rootElement = document.documentElement;
+  const priorStyle = rootElement.getAttribute("style");
+  const computedStyle = document.createElement("div").style;
+  vi.spyOn(window, "getComputedStyle").mockImplementation(() => {
+    computedStyle.fontFamily = rootElement.style.getPropertyValue("--app-font-terminal").split(",")[0] || "monospace";
+    computedStyle.fontSize = rootElement.style.getPropertyValue("--app-terminal-font-size") || "14px";
+    return computedStyle;
+  });
+  let releaseFont!: () => void;
+  const load = vi.fn((_font: string) => new Promise<FontFace[]>((resolve) => { releaseFont = () => resolve([]); }));
+  const priorFonts = Object.getOwnPropertyDescriptor(document, "fonts");
+  Object.defineProperty(document, "fonts", { configurable: true, value: {
+    ready: Promise.resolve(), check: (font: string) => !font.includes("Fixture Mono"), load
+  } });
+  const watchTerminal = vi.fn<AppController["watchTerminal"]>(async (_session, _terminal, _generation, _appearance, update, _after, signal) => {
+    await update({ kind: "reset", terminal: initial, appearanceRevision: 1n, activeColorOverrides: "", sequence: 1n, data: "Original screen" });
+    if (signal === undefined || signal.aborted) return;
+    await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+  });
+  const controller = {
+    state: { connectionState: "connected" }, watchTerminal, getTerminal: vi.fn(async () => initial),
+    updateTerminalAppearance: vi.fn<AppController["updateTerminalAppearance"]>(async (_session, _terminal, _generation, appearance) => ({
+      accepted: true, acceptedViewRevision: appearance.viewRevision, appearanceRevision: 1n, ownsDefaults: false
+    }))
+  } as unknown as AppController;
+  try {
+    root = createRoot(document.body.appendChild(document.createElement("div")));
+    await act(async () => root!.render(<InteractiveTerminalPanel active controller={controller} sessionId={initial.sessionId}
+      terminalId={initial.id} capabilities={capabilities} t={t} onState={vi.fn()} />));
+    await vi.waitFor(() => expect(mocks.fit).toHaveBeenCalled());
+    const terminal = mocks.terminals[0];
+    const fits = mocks.fit.mock.calls.length;
+    expect(terminal.options).toMatchObject({ fontFamily: "monospace", fontSize: 14 });
+
+    await act(async () => applyAppearanceTypography({ ...DEFAULT_APPEARANCE_PREFERENCES,
+      terminalFamily: '"Fixture Mono"', terminalSize: 18
+    }, [rootElement]));
+    await vi.waitFor(() => expect(load).toHaveBeenCalledExactlyOnceWith('18px "Fixture Mono"'));
+    expect(terminal.options).toMatchObject({ fontFamily: "monospace", fontSize: 14 });
+    await act(async () => releaseFont());
+    await vi.waitFor(() => expect(terminal.options).toMatchObject({ fontFamily: '"Fixture Mono"', fontSize: 18 }));
+    expect(mocks.fit.mock.calls.length).toBeGreaterThan(fits);
+    expect(watchTerminal).toHaveBeenCalledOnce();
+    expect(terminal.write).toHaveBeenCalledWith("Original screen", expect.any(Function));
+    expect(terminal.dispose).not.toHaveBeenCalled();
+  } finally {
+    if (priorFonts === undefined) Reflect.deleteProperty(document, "fonts");
+    else Object.defineProperty(document, "fonts", priorFonts);
+    if (priorStyle === null) rootElement.removeAttribute("style"); else rootElement.setAttribute("style", priorStyle);
+  }
+});
 
 it("waits for the live appearance acknowledgement, replays current overrides after queued theme changes and retires old connections", async () => {
   vi.stubGlobal("ResizeObserver", class { observe = vi.fn(); disconnect = vi.fn(); });
@@ -114,6 +177,14 @@ it("waits for the live appearance acknowledgement, replays current overrides aft
   expect(api.writeTerminal).not.toHaveBeenCalled();
   await act(async () => terminal.input("ok"));
   expect(api.writeTerminal).toHaveBeenCalledWith("session-one", "terminal-one", 1n, expect.any(String), 1n, "ok", expect.any(AbortSignal));
+  terminal.modes.sendFocusMode = true;
+  const beforeBlur = updateAppearance.mock.calls.length;
+  await act(async () => outside.focus());
+  expect(api.writeTerminal).toHaveBeenLastCalledWith("session-one", "terminal-one", 1n, watches[0]!.appearance.viewId, 2n, "\x1b[O", expect.any(AbortSignal));
+  expect(updateAppearance).toHaveBeenCalledTimes(beforeBlur);
+  await act(async () => terminal.input("\x1b[O"));
+  expect(api.writeTerminal).toHaveBeenCalledTimes(2);
+  terminal.modes.sendFocusMode = false;
   let rejectOld!: (reason: Error) => void;
   updateAppearance.mockImplementationOnce(async () => new Promise((_, reject) => { rejectOld = reject; }));
   color = "#abcdef";

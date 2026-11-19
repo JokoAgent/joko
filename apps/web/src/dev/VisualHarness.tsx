@@ -305,7 +305,8 @@ export function VisualHarness(): JSX.Element {
 
   useEffect(() => {
     applyAppearanceTypography(state.preferences, [document.documentElement, document.body]);
-  }, [state.preferences.codeFamily, state.preferences.codeSize, state.preferences.uiFamily, state.preferences.uiSize]);
+  }, [state.preferences.codeFamily, state.preferences.codeSize, state.preferences.terminalFamily, state.preferences.terminalSize,
+    state.preferences.uiFamily, state.preferences.uiSize]);
 
   useEffect(() => {
     if (scenario.scenario !== "files") return;
@@ -1233,11 +1234,17 @@ export function VisualHarness(): JSX.Element {
       setCodeFamily: async (codeFamily: string): Promise<void> => {
         setState((current) => ({ ...current, preferences: { ...current.preferences, codeFamily: normalizeFontFamily(codeFamily) } }));
       },
+      setTerminalFamily: async (terminalFamily: string): Promise<void> => {
+        setState((current) => ({ ...current, preferences: { ...current.preferences, terminalFamily: normalizeFontFamily(terminalFamily) } }));
+      },
       setUiSize: async (uiSize: number): Promise<void> => {
         setState((current) => ({ ...current, preferences: { ...current.preferences, uiSize: clampUiSize(uiSize) } }));
       },
       setCodeSize: async (codeSize: number): Promise<void> => {
         setState((current) => ({ ...current, preferences: { ...current.preferences, codeSize: clampCodeSize(codeSize) } }));
+      },
+      setTerminalSize: async (terminalSize: number | null): Promise<void> => {
+        setState((current) => ({ ...current, preferences: { ...current.preferences, terminalSize: terminalSize === null ? null : clampCodeSize(terminalSize) } }));
       },
       setComposerSendShortcut: async (composerSendShortcut: ComposerSendShortcutPreference): Promise<void> => {
         setState((current) => ({ ...current, preferences: { ...current.preferences, composerSendShortcut } }));

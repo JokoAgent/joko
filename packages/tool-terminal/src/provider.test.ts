@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, realpath, rm, symlink } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { Terminal } from "@xterm/headless";
@@ -6,6 +6,7 @@ import { describe, expect, test, vi } from "vitest";
 import { TERMINAL_UNICODE_CORPUS } from "./i18n/unicode.test-fixture.js";
 import { TerminalProvider, TERMINAL_LIMITS, type TerminalPty, type TerminalPtyFactory, type TerminalRuntime } from "./provider.js";
 import { TerminalError, type TerminalDescriptor, type TerminalReference, type TerminalScope, type TerminalShell } from "./types.js";
+import { discoverTerminalShells } from "./shells.js";
 
 const shell: TerminalShell = { id: "test-shell", label: "Test shell", executable: process.execPath, args: [], isDefault: true };
 
@@ -14,6 +15,74 @@ let nextView = 0;
 const appearance = () => ({ viewId: `view-${++nextView}`, viewRevision: 1, palette });
 
 describe("TerminalProvider", () => {
+  test.runIf(process.platform !== "win32").each(["zsh", "custom-shell"])("uses the exact login %s executable for auto while keeping explicit selection and restart", async (name) => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-terminal-shell-"));
+    const workspaceRoot = await realpath(directory);
+    const ptys: FakePty[] = [];
+    const spawn = vi.fn<TerminalPtyFactory>(() => { const pty = new FakePty(); ptys.push(pty); return pty; });
+    const pathDirectory = join(workspaceRoot, "path");
+    const preferredDirectory = join(workspaceRoot, "custom shell");
+    const preferred = join(preferredDirectory, name);
+    const explicit = join(pathDirectory, "zsh");
+    const environment = { PATH: pathDirectory, SHELL: preferred, PRIVATE_API_KEY: "not-for-terminal" };
+    const provider = new TerminalProvider({ spawn, environment });
+    const scope = { sessionId: "login-shell-task", targetId: "target", workspaceRoot, initialPalette: palette };
+    try {
+      await mkdir(pathDirectory);
+      await mkdir(preferredDirectory);
+      for (const executable of [preferred, explicit]) {
+        await writeFile(executable, "#!/bin/sh\nexit 0\n");
+        await chmod(executable, 0o755);
+      }
+      const shells = await provider.discoverShells();
+      expect(shells.filter((candidate) => candidate.isDefault)).toEqual([
+        expect.objectContaining({ executable: preferred, label: name })
+      ]);
+      expect(shells.find((candidate) => candidate.id === "zsh")?.executable).toBe(explicit);
+      const automatic = await provider.create({ ...scope, id: "automatic" });
+      expect(spawn).toHaveBeenLastCalledWith(preferred, [], expect.objectContaining({ cwd: workspaceRoot }), expect.any(AbortSignal));
+      expect(spawn.mock.calls.at(-1)![2].env).not.toHaveProperty("PRIVATE_API_KEY");
+      await provider.create({ ...scope, id: "explicit", shellId: "zsh" });
+      expect(spawn).toHaveBeenLastCalledWith(explicit, [], expect.any(Object), expect.any(AbortSignal));
+      environment.SHELL = explicit;
+      ptys[0]!.exit(0);
+      await provider.snapshot(ref(scope, automatic));
+      await provider.restart(ref(scope, automatic));
+      expect(spawn).toHaveBeenLastCalledWith(preferred, [], expect.any(Object), expect.any(AbortSignal));
+    } finally {
+      await provider.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test.runIf(process.platform !== "win32")("falls back from unavailable login shells and reuses an already discovered executable", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-terminal-shell-fallback-"));
+    const root = await realpath(directory);
+    try {
+      const executable = join(root, "zsh");
+      const unavailable = join(root, "not-executable");
+      await writeFile(executable, "#!/bin/sh\nexit 0\n");
+      await chmod(executable, 0o755);
+      await writeFile(unavailable, "#!/bin/sh\nexit 0\n");
+      await chmod(unavailable, 0o644);
+      for (const preferred of [undefined, join(root, "missing"), root, unavailable, "zsh", "\0invalid"]) {
+        const shells = await discoverTerminalShells({ PATH: root, SHELL: preferred });
+        expect(shells.filter((candidate) => candidate.isDefault)).toEqual([
+          expect.objectContaining({ id: "zsh", executable })
+        ]);
+      }
+      const shells = await discoverTerminalShells({ PATH: root, SHELL: executable });
+      expect(shells.filter((candidate) => candidate.executable === executable)).toHaveLength(1);
+      expect(shells.find((candidate) => candidate.id === "zsh")?.isDefault).toBe(true);
+      const alias = join(root, "login-alias");
+      await symlink(executable, alias);
+      const aliased = await discoverTerminalShells({ PATH: root, SHELL: alias });
+      expect(aliased.find((candidate) => candidate.isDefault)?.executable).toBe(alias);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   test("uses one remote runtime for POSIX shell discovery, canonical cwd and spawn without touching local facilities", async () => {
     const fixture = remoteSetup();
     try {
@@ -217,6 +286,39 @@ describe("TerminalProvider", () => {
       expect(restored.buffer.active.getLine(0)!.translateToString(true)).toBe("normal");
       expect(restored.buffer.active.getLine(1)!.getCell(0)!.getFgColor()).toBe(1);
     } finally { restored.dispose(); await fixture.dispose(); }
+  });
+
+  test.each([undefined, 0])("keeps the normal scrolling margins across RESET for cursor %s", async afterSequence => {
+    const fixture = await setup({ maximumOutputFrames: 2 });
+    const options = { cols: 20, rows: 6, allowProposedApi: true, logLevel: "off" as const };
+    const restored = new Terminal(options), current = new Terminal(options);
+    const visibleRows = (terminal: Terminal) => Array.from({ length: 5 }, (_, index) =>
+      terminal.buffer.normal.getLine(terminal.buffer.normal.baseY + index)!.translateToString(true));
+    try {
+      const descriptor = await fixture.provider.create({ ...fixture.scope, id: "scroll-region", cols: options.cols, rows: options.rows });
+      const reference = ref(fixture.scope, descriptor), pty = fixture.ptys[0]!;
+      pty.output("\x1b[2;");
+      pty.output("4r\x1b[1;1HA\x1b[2;1HB\x1b[3;1HC\x1b[4;1HD");
+      pty.output("\x1b[5;1HE");
+      const stream = fixture.provider.stream({ ...reference, appearance: appearance(), ...(afterSequence === undefined ? {} : { afterSequence }) });
+      try {
+        const checkpoint = (await stream.next()).value;
+        if (!checkpoint || checkpoint.kind !== "reset") throw new Error("The view did not receive a RESET checkpoint.");
+        await parsed(restored, checkpoint.serialized);
+        expect(visibleRows(restored)).toEqual(["A", "B", "C", "D", "E"]);
+        expect([restored.buffer.normal.cursorX, restored.buffer.normal.cursorY]).toEqual([1, 4]);
+        pty.output("\x1b[4;1H\x1bDZ");
+        const delta = (await stream.next()).value;
+        if (!delta || delta.kind !== "output") throw new Error("The view did not receive the next PTY output.");
+        expect(delta.generation).toBe(descriptor.generation);
+        await parsed(restored, delta.data);
+        await parsed(current, (await fixture.provider.snapshot(reference)).serialized);
+        expect(visibleRows(current)).toEqual(["A", "C", "D", "Z", "E"]);
+        expect(visibleRows(restored)).toEqual(visibleRows(current));
+        expect(pty.writes).toEqual([]);
+        expect(pty.killCalls).toBe(0);
+      } finally { await stream.return!(); }
+    } finally { current.dispose(); restored.dispose(); await fixture.dispose(); }
   });
 
   test("retains five thousand history lines across reattachment while evicting older output", async () => {

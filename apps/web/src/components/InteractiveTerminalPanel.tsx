@@ -3,6 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { RotateCw } from "lucide-react";
+import { copyTextOnInsecureHttp } from "../clipboard-action.js";
 import type { AppController } from "../controller.js";
 import type { TerminalCapabilitiesView, TerminalView } from "../model.js";
 import { readTerminalAppearance } from "../terminal-appearance.js";
@@ -40,7 +41,8 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
   const dimensionsRef = useRef("");
   const overridesRef = useRef("");
   const displayAbortRef = useRef(new AbortController());
-  const appearanceRef = useRef<{ signal: AbortSignal; viewId: string; synchronize: (focus: boolean) => Promise<void>; cancelFocus: () => void; captureControl: () => { readonly signal: AbortSignal; readonly ready: Promise<void> } } | undefined>(undefined);
+  const appearanceRef = useRef<{ signal: AbortSignal; viewId: string; synchronize: (focus: boolean) => Promise<void>; cancelFocus: () => void;
+    ownsControl: () => boolean; captureControl: () => { readonly signal: AbortSignal; readonly ready: Promise<void> } } | undefined>(undefined);
   const connectionOwner = controller.watchTerminal;
   const writerRef = useRef({ id: randomUuid(), sequence: 0n, generation: 0n, blocked: false, chain: Promise.resolve() });
   const scope = `${controller.state.activeProfile?.serverId ?? ""}\u0000${controller.state.activeProfile?.id ?? ""}\u0000${sessionId}\u0000${terminalId}`;
@@ -92,12 +94,28 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
     terminal.attachCustomKeyEventHandler((event) => {
       if (event.type === "keydown" && event.code === "KeyC" && (event.ctrlKey || event.metaKey) && !event.altKey && !event.isComposing && terminal.hasSelection()) {
         event.preventDefault();
-        void ownerWindow.navigator.clipboard?.writeText(terminal.getSelection()).catch(() => undefined);
+        const text = terminal.getSelection();
+        const clipboard = ownerWindow.navigator.clipboard;
+        if (clipboard?.writeText !== undefined) void clipboard.writeText(text).catch(() => undefined);
+        else {
+          let copied = false;
+          try { copied = copyTextOnInsecureHttp(text, slot); } catch { /* The browser may deny synchronous copy. */ }
+          setInputNotice(copied ? undefined : latest.current.t("workspace.clipboardUnavailable"));
+        }
         return false;
       }
       return true;
     });
+    let textareaBlur: FocusEvent | undefined;
+    const markFocusLoss = (event: FocusEvent): void => {
+      if (!event.isTrusted || event.target !== terminal.textarea || !terminal.modes.sendFocusMode) return;
+      // xterm emits the report synchronously from the textarea's blur handler.
+      textareaBlur = event;
+    };
+    slot.addEventListener("blur", markFocusLoss, true);
     const input = terminal.onData((data) => {
+      const focusReport = data === "\x1b[O" && textareaBlur?.eventPhase === Event.AT_TARGET;
+      if (focusReport) textareaBlur = undefined;
       const current = descriptorRef.current;
       if (current === undefined || current.status !== "running" || connectionRef.current !== "ready" || !latest.current.active || latest.current.capabilities.support === "disabledByPolicy" || latest.current.controller.state.connectionState !== "connected") return;
       if (data === "") return;
@@ -112,7 +130,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
       if (writerRef.current.generation !== current.generation || writerRef.current.id !== appearance.viewId) writerRef.current = { id: appearance.viewId, sequence: 0n, generation: current.generation, blocked: false, chain: Promise.resolve() };
       const writer = writerRef.current;
       if (writer.blocked) return;
-      const admission = appearance.captureControl();
+      const admission = focusReport ? { signal: appearance.signal, ready: Promise.resolve() } : appearance.captureControl();
       void admission.ready.catch(() => undefined);
       let sent = false;
       writer.chain = writer.chain.then(async () => {
@@ -123,6 +141,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
           return;
         }
         if (appearance.signal.aborted || appearanceRef.current !== appearance || writerRef.current !== writer) return;
+        if (focusReport && (!latest.current.active || !appearance.ownsControl())) return;
         if (admission.signal.aborted || latest.current.capabilities.support === "disabledByPolicy") {
           if (sent) { writer.blocked = true; terminal.options.disableStdin = true; setError(latest.current.t("terminal.inputUncertain")); }
           return;
@@ -138,6 +157,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
       });
     });
     let frame: number | undefined;
+    let fontLoad: { readonly font: string; settled: boolean } | undefined;
     let resizeChain = Promise.resolve();
     const fitTerminal = (): void => {
       if (frame !== undefined) return;
@@ -145,8 +165,24 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
         frame = undefined;
         if (!alive || restoringScreenRef.current || !latest.current.active || slot.clientWidth <= 0 || slot.clientHeight <= 0) return;
         const style = ownerWindow.getComputedStyle(slot);
-        terminal.options.fontFamily = style.fontFamily;
-        terminal.options.fontSize = Number.parseFloat(style.fontSize) || 14;
+        const family = style.fontFamily;
+        const size = Number.parseFloat(style.fontSize) || 14;
+        const fonts = slot.ownerDocument.fonts;
+        const font = `${size}px ${family}`;
+        if (family && fonts !== undefined && !fonts.check(font)) {
+          if (fontLoad?.font !== font) {
+            const load = { font, settled: false };
+            fontLoad = load;
+            const settle = (): void => {
+              load.settled = true;
+              if (alive && fontLoad === load) fitTerminal();
+            };
+            void fonts.load(font).then(settle, settle);
+          }
+          if (!fontLoad.settled) return;
+        }
+        terminal.options.fontFamily = family;
+        terminal.options.fontSize = size;
         fit.fit();
         const columns = Math.max(2, Math.min(terminal.cols, latest.current.capabilities.maximumColumns));
         const rows = Math.max(1, Math.min(terminal.rows, latest.current.capabilities.maximumRows));
@@ -201,6 +237,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
       themeObserver.disconnect();
       colorScheme?.removeEventListener("change", refreshTheme);
       ownerWindow.removeEventListener("pageshow", refreshTheme);
+      slot.removeEventListener("blur", markFocusLoss, true);
       input.dispose();
       queries.forEach((query) => query.dispose());
       terminal.dispose();
@@ -338,7 +375,9 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
           });
           return task;
         };
-        const appearance = { signal, viewId, synchronize, cancelFocus, captureControl: () => ({ signal: AbortSignal.any([signal, focusLifetime.signal]), ready: synchronize(true) }) };
+        const appearance = { signal, viewId, synchronize, cancelFocus,
+          ownsControl: () => current() && registered && confirmed?.ownsDefaults === true && confirmed.revision === appearanceRevision,
+          captureControl: () => ({ signal: AbortSignal.any([signal, focusLifetime.signal]), ready: synchronize(true) }) };
         appearanceRef.current = appearance;
         const initialAppearance = { viewId, viewRevision, palette: readTerminalAppearance(slot).palette };
         await api.watchTerminal(sessionId, terminalId, value.generation, initialAppearance, async (update) => {

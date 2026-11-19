@@ -208,6 +208,8 @@ const UI_PREFERENCE_KEYS = [
   "sidebarOwnerLayouts",
   "streamFadeEnabled",
   "showPartnerReplyQuotes",
+  "terminalFamily",
+  "terminalSize",
   "theme",
   "uiFamily",
   "uiSize",
@@ -239,8 +241,10 @@ export function normalizeUiPreferences(value: unknown): UiPreferences {
     !samePersistedValue(appearance, {
       uiFamily: record["uiFamily"],
       codeFamily: record["codeFamily"],
+      terminalFamily: record["terminalFamily"],
       uiSize: record["uiSize"],
       codeSize: record["codeSize"],
+      terminalSize: record["terminalSize"],
       windowZoom: record["windowZoom"]
     })
     || (record["locale"] !== "system" && record["locale"] !== "en" && record["locale"] !== "zh-CN" && record["locale"] !== "en-XA")

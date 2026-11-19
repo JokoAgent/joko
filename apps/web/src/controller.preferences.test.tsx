@@ -1148,6 +1148,20 @@ it("adopts durable appearance and bases zoom intent on the latest cross-controll
   publishAppearancePreferencesChange();
   await vi.waitFor(() => expect(second!.state.preferences).toMatchObject({ uiSize: 18, codeSize: 20 }));
 
+  await act(async () => {
+    await first!.setTerminalFamily('  "Consolas"  ');
+    await first!.setTerminalSize(18);
+  });
+  await vi.waitFor(() => {
+    expect(second!.state.preferences).toMatchObject({ codeSize: 20, codeFamily: "", terminalSize: 18, terminalFamily: '"Consolas"' });
+    expect(document.documentElement.style.getPropertyValue("--app-terminal-font-size")).toBe("18px");
+    expect(document.documentElement.style.getPropertyValue("--app-code-font-size")).toBe("20px");
+    expect(document.documentElement.style.getPropertyValue("--app-font-terminal")).toBe('"Consolas", var(--font-mono)');
+  });
+  await act(async () => { await second!.setTerminalSize(null); });
+  await vi.waitFor(() => expect(first!.state.preferences).toMatchObject({ codeSize: 20, terminalSize: null, terminalFamily: '"Consolas"' }));
+  expect(document.documentElement.style.getPropertyValue("--app-terminal-font-size")).toBe("");
+
   const retiredSecond = second!;
   await act(async () => { root?.render(<Probe owner="first" />); });
   await act(async () => { await first!.setCodeFamily("Mono"); });

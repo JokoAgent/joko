@@ -4,6 +4,7 @@ import { GetSnapshotResponseSchema, MessageRole, RunState } from "@joko/contract
 import type { AdapterContext, NativeHistoryEventContext, PromptInput } from "@joko/core";
 import { isPrivateLanHost } from "@joko/orchestrator";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
+import { TerminalProvider } from "@joko/tool-terminal";
 import { chromium, type Browser, type Locator, type Page } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -27,11 +28,15 @@ describe("mounted Timeline Markdown documents", () => {
     }
   });
 
-  mountedIt("copies message text and its canonical link on an explicitly enabled private HTTP node", { timeout: 90_000 }, async (context) => {
+  mountedIt("copies message text, its canonical link and a terminal selection on an explicitly enabled private HTTP node", { timeout: 90_000 }, async (context) => {
     const publicLanHost = Object.values(networkInterfaces()).flatMap((addresses) => addresses ?? [])
       .find((address) => address.family === "IPv4" && !address.internal && isPrivateLanHost(address.address))?.address;
     if (publicLanHost === undefined) { context.skip(); return; }
-    fixture = await OrchestratorE2eFixture.start({ webDirectory: process.env.JOKO_MOUNTED_WEB_DIR!, publicLanHost });
+    const terminalText = "LANCLIPBOARD";
+    const terminals = new TerminalProvider({ shells: async () => [{ id: "test-tty", label: "Test TTY", executable: process.execPath,
+      args: ["-e", `process.stdin.setRawMode(true);process.stdin.resume();process.stdout.write(${JSON.stringify(terminalText + "\r\n")});process.stdin.on('data',bytes=>process.stdout.write('INPUT:'+bytes.toString('hex')+'\\r\\n'));`],
+      isDefault: true }] });
+    fixture = await OrchestratorE2eFixture.start({ webDirectory: process.env.JOKO_MOUNTED_WEB_DIR!, publicLanHost, terminals });
     const manager = await fixture.pair("Private HTTP manager");
     const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
       createSessionMutation({ backendId: fixture.adapter().id, targetId: fixture.targetId(), displayName: "Private HTTP task" })));
@@ -91,6 +96,26 @@ describe("mounted Timeline Markdown documents", () => {
     const anchor = new URL(link.hash.slice(1), link.origin);
     expect(anchor.pathname).toBe(`/tasks/${encodeURIComponent(sessionId)}`);
     expect(Object.fromEntries(anchor.searchParams)).toEqual({ event: messageId, message: messageId });
+
+    await page.getByRole("button", { name: "Add tab", exact: true }).click();
+    await page.getByRole("menuitem", { name: "New terminal", exact: true }).click();
+    const terminal = page.locator(".interactive-terminal .xterm");
+    const row = terminal.locator(".xterm-rows > div").filter({ hasText: terminalText });
+    await row.dblclick({ position: { x: 18, y: 8 } });
+    await terminal.locator(".xterm-selection > div").first().waitFor({ state: "visible" });
+    const input = terminal.locator("textarea.xterm-helper-textarea");
+    expect(await input.evaluate(element => element === document.activeElement)).toBe(true);
+    await page.keyboard.press("ControlOrMeta+c");
+    expect(await input.evaluate(element => element === document.activeElement)).toBe(true);
+    expect(await clipboardValue()).toBe(terminalText);
+    const liveTerminals = (await manager.clients.terminal.listTerminals({ sessionId })).terminals;
+    expect(liveTerminals).toHaveLength(1);
+    const native = liveTerminals[0]!;
+    await input.press("x");
+    const screen = await waitFor(async () => (await manager.clients.terminal.getTerminal({
+      sessionId, terminalId: native.id, generation: native.generation
+    })).serialized, value => value.includes("INPUT:78"), "terminal input after copying the selection");
+    expect(screen).not.toContain("INPUT:03");
     expect(pageErrors).toEqual([]);
   });
 

@@ -325,8 +325,10 @@ export interface AppController extends OperationApi {
   setTheme(theme: Theme): Promise<void>;
   setUiFamily(family: string): Promise<void>;
   setCodeFamily(family: string): Promise<void>;
+  setTerminalFamily(family: string): Promise<void>;
   setUiSize(size: number): Promise<void>;
   setCodeSize(size: number): Promise<void>;
+  setTerminalSize(size: number | null): Promise<void>;
   changeWindowZoom(intent: WindowZoomIntent): Promise<number>;
   setComposerSendShortcut(shortcut: ComposerSendShortcutPreference): Promise<void>;
   setMessageSearchSort(sort: MessageSearchSortPreference): Promise<void>;
@@ -961,7 +963,8 @@ export function useAppController(): AppController {
 
   useEffect(() => {
     applyAppearanceTypography(state.preferences, [document.documentElement, document.body]);
-  }, [state.preferences.codeFamily, state.preferences.codeSize, state.preferences.uiFamily, state.preferences.uiSize]);
+  }, [state.preferences.codeFamily, state.preferences.codeSize, state.preferences.terminalFamily, state.preferences.terminalSize,
+    state.preferences.uiFamily, state.preferences.uiSize]);
 
   useEffect(() => {
     if (!state.ready) return;
@@ -1047,12 +1050,20 @@ export function useAppController(): AppController {
     (codeFamily) => updatePreferences({ codeFamily: normalizeFontFamily(codeFamily) }),
     [updatePreferences]
   );
+  const setTerminalFamily = useCallback<AppController["setTerminalFamily"]>(
+    (terminalFamily) => updatePreferences({ terminalFamily: normalizeFontFamily(terminalFamily) }),
+    [updatePreferences]
+  );
   const setUiSize = useCallback<AppController["setUiSize"]>(
     (uiSize) => updatePreferences({ uiSize: clampUiSize(uiSize) }),
     [updatePreferences]
   );
   const setCodeSize = useCallback<AppController["setCodeSize"]>(
     (codeSize) => updatePreferences({ codeSize: clampCodeSize(codeSize) }),
+    [updatePreferences]
+  );
+  const setTerminalSize = useCallback<AppController["setTerminalSize"]>(
+    (terminalSize) => updatePreferences({ terminalSize: terminalSize === null ? null : clampCodeSize(terminalSize) }),
     [updatePreferences]
   );
   const setSessionNotificationsEnabled = useCallback<AppController["setSessionNotificationsEnabled"]>(
@@ -3908,8 +3919,10 @@ export function useAppController(): AppController {
     setTheme,
     setUiFamily,
     setCodeFamily,
+    setTerminalFamily,
     setUiSize,
     setCodeSize,
+    setTerminalSize,
     changeWindowZoom,
     setComposerSendShortcut,
     setMessageSearchSort: (messageSearchSort) => updatePreferences({ messageSearchSort }),
@@ -4728,7 +4741,7 @@ export function useAppController(): AppController {
     openArtifactFile,
     openArtifactFileWithApplication,
     revealArtifactSource
-}), [portableImportApi, catalogGateway, taskGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, readPendingMessageFork, forkMessage, messageEditDrafts, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, acquireArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, readTaskProviderGroupUsage, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
+}), [portableImportApi, catalogGateway, taskGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, readPendingMessageFork, forkMessage, messageEditDrafts, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, acquireArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, readTaskProviderGroupUsage, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setTerminalFamily, setTerminalSize, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {

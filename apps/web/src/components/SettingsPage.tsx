@@ -507,6 +507,8 @@ function useSettingsSaveFeedback(onSuccess: (text: string) => void): SettingsSav
 
 export function AppearanceSettings({ controller, locale, theme, onSuccess, onOpenPi, showHeading = true, t }: { readonly controller: AppController; readonly locale: Locale; readonly theme: Theme; readonly onSuccess: (text: string) => void; readonly onOpenPi: () => void; readonly showHeading?: boolean; readonly t: Translator }): JSX.Element {
   const appearance = controller.state.preferences;
+  const setTerminalSize = controller.setTerminalSize;
+  const resetTerminalSize = useCallback(() => setTerminalSize(null), [setTerminalSize]);
   const localePreference = appearance.locale;
   const themeSave = useSettingsSaveFeedback(onSuccess);
   const themePickerRef = useRef<HTMLDivElement>(null);
@@ -748,6 +750,33 @@ export function AppearanceSettings({ controller, locale, theme, onSuccess, onOpe
           defaultValue={14}
           normalize={clampCodeSize}
           onChange={controller.setCodeSize}
+          onSuccess={onSuccess}
+          t={t}
+        />
+        <FontFamilySetting
+          label={t("settings.appearance.terminalFamily")}
+          description={t("settings.appearance.terminalFamilyBody")}
+          value={appearance.terminalFamily}
+          presets={[
+            { id: "default", label: t("settings.appearance.terminalMatchCodeFont"), family: "" },
+            { id: "jetbrainsMono", label: t("settings.appearance.fontJetBrains"), family: '"JetBrains Mono Variable", "JetBrains Mono"' }
+          ]}
+          preview={"$ git status --short\n M src/index.ts"}
+          fallback="var(--font-mono)"
+          onChange={controller.setTerminalFamily}
+          onSuccess={onSuccess}
+          t={t}
+        />
+        <FontSizeSetting
+          label={t("settings.appearance.terminalSize")}
+          description={t("settings.appearance.terminalSizeBody")}
+          value={appearance.terminalSize ?? appearance.codeSize}
+          min={10}
+          max={24}
+          defaultValue={appearance.codeSize}
+          normalize={clampCodeSize}
+          onChange={setTerminalSize}
+          resetOverride={{ customized: appearance.terminalSize !== null, restore: resetTerminalSize }}
           onSuccess={onSuccess}
           t={t}
         />
@@ -2726,7 +2755,7 @@ function fontFamilyDisplayName(value: string): string {
     : trimmed;
 }
 
-export function FontSizeSetting({ label, description, value, min, max, defaultValue, normalize, onChange, onSuccess, t }: {
+export function FontSizeSetting({ label, description, value, min, max, defaultValue, normalize, onChange, resetOverride, onSuccess, t }: {
   readonly label: string;
   readonly description: string;
   readonly value: number;
@@ -2735,6 +2764,7 @@ export function FontSizeSetting({ label, description, value, min, max, defaultVa
   readonly defaultValue: number;
   readonly normalize: (size: number) => number;
   readonly onChange: (size: number) => Promise<void>;
+  readonly resetOverride?: { readonly customized: boolean; readonly restore: () => Promise<void> };
   readonly onSuccess: (message: string) => void;
   readonly t: Translator;
 }): JSX.Element {
@@ -2744,7 +2774,8 @@ export function FontSizeSetting({ label, description, value, min, max, defaultVa
   const draftRef = useRef(draft);
   valueRef.current = value;
   draftRef.current = draft;
-  const actionOwner = useMemo(() => ({ action: onChange }), [onChange]);
+  const restoreDefault = resetOverride?.restore;
+  const actionOwner = useMemo(() => ({ action: onChange, restore: restoreDefault }), [onChange, restoreDefault]);
   const committedOwnerRef = useRef<typeof actionOwner | undefined>(undefined);
   const nextIntentRef = useRef(0);
   const batchRef = useRef<{
@@ -2806,9 +2837,10 @@ export function FontSizeSetting({ label, description, value, min, max, defaultVa
     const normalized = normalize(requested);
     const existing = batchRef.current?.owner === actionOwner ? batchRef.current : undefined;
     const desired = existing?.latest.value ?? valueRef.current;
+    const restore = reset ? actionOwner.restore : undefined;
     updateDraft(String(normalized));
     setRangeValue(normalized);
-    if (normalized === desired) return;
+    if (normalized === desired && restore === undefined) return;
     const intent = { id: ++nextIntentRef.current, value: normalized, reset };
     const batch = existing ?? {
       owner: actionOwner,
@@ -2820,7 +2852,7 @@ export function FontSizeSetting({ label, description, value, min, max, defaultVa
     batch.active.add(intent.id);
     batchRef.current = batch;
     setFeedback({ owner: actionOwner, pending: true });
-    void actionOwner.action(normalized).then(
+    void (restore === undefined ? actionOwner.action(normalized) : restore()).then(
       () => settle(batch, intent.id, "success"),
       () => settle(batch, intent.id, "failure")
     );
@@ -2843,7 +2875,7 @@ export function FontSizeSetting({ label, description, value, min, max, defaultVa
         <div><strong>{label}</strong><span>{description}</span>{pending && <span role="status">{t("common.working")}</span>}</div>
         <IconButton
           label={t("settings.appearance.fontReset")}
-          disabled={pending || value === defaultValue}
+          disabled={pending || !(resetOverride?.customized ?? (value !== defaultValue))}
           aria-busy={pending}
           onClick={() => persist(defaultValue, true)}
         ><RotateCcw aria-hidden="true" /></IconButton>
