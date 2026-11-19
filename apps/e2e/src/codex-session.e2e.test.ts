@@ -23,7 +23,12 @@ import {
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
   ? it : it.skip;
 
-it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog task without a cold executable", async (mode) => {
+it.each([
+  { mode: "legacy", inlinePng: "none", name: "reads the original legacy Codex catalog task without a cold executable" },
+  { mode: "paginated", inlinePng: "none", name: "reads the original paginated Codex catalog task without a cold executable" },
+  { mode: "paginated", inlinePng: "fresh", name: "restores the original inline PNG in the formal Codex catalog task" },
+  { mode: "paginated", inlinePng: "existing", name: "restores the original inline PNG for an immutable pre-upgrade Codex User Event" }
+] as const)("$name", async ({ mode, inlinePng }) => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-offline-catalog-")));
   const profileDirectory = join(root, "codex-home");
   const backendId = "codex-offline-catalog";
@@ -31,6 +36,7 @@ it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog t
   const turnId = "original-completed-turn";
   const question = "Which deliverables did we finish?";
   const answer = "We finished the review and release notes.";
+  const originalPng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAD0lEQVR4nGPQSDlxIkUDAAlTAqltBY9kAAAAAElFTkSuQmCC", "base64");
   const native = new FakeCodexAppServer();
   native.codexHome = profileDirectory;
   let executablePresent = true;
@@ -51,7 +57,7 @@ it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog t
     }] });
     const cwd = join(root, "user-project");
     await mkdir(cwd);
-    const { clients, connectionId } = await fixture.pair("Local catalog Owner");
+    const { clients, connectionId, authKey } = await fixture.pair("Local catalog Owner");
     const project = await submit(clients.operation, connectionId, create(OperationMutationSchema, {
       payload: { case: "createTarget", value: create(CreateTargetMutationSchema, {
         backendId, displayName: "Original catalog project",
@@ -66,8 +72,10 @@ it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog t
     expect(trust.state).toBe(OperationState.SUCCEEDED);
     const store = fixture.application.store;
     expect(store.getTarget(targetId).descriptor).toMatchObject({ managed: false, trusted: true, workspaceRoot: cwd });
+    const originalInput: Record<string, string | []>[] = [{ type: "text", text: question, text_elements: [] }];
+    if (inlinePng !== "none") originalInput.push({ type: "image", url: `data:image/png;base64,${originalPng.toString("base64")}` });
     const seeded = native.seedThread(cwd, [{ id: turnId, status: "completed", items: [
-      { id: "original-user", type: "userMessage", content: [{ type: "text", text: question, text_elements: [] }] },
+      { id: "original-user", type: "userMessage", content: originalInput },
       { id: "original-assistant", type: "agentMessage", text: answer, phase: null, memoryCitation: null, delivery: null }
     ] }]);
     native.threads.set(threadId, { ...native.threads.get(seeded)!, id: threadId });
@@ -83,7 +91,7 @@ it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog t
       }] } },
       ...(mode === "legacy" ? [event("user_message", { message: question }), event("agent_message", { message: answer })] : [
         event("item_completed", { thread_id: threadId, turn_id: turnId,
-          item: { type: "UserMessage", id: "original-user", content: [{ type: "text", text: question, text_elements: [] }] } }),
+          item: { type: "UserMessage", id: "original-user", content: originalInput } }),
         event("item_completed", { thread_id: threadId, turn_id: turnId,
           item: { type: "AgentMessage", id: "original-assistant", content: [{ type: "Text", text: answer }] } })
       ]),
@@ -134,7 +142,7 @@ it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog t
     for (const read of readers) {
       const visible = await read();
       expect(failedStarts, `${read.name} must not start the cold executable`).toBe(startsBeforeReading);
-      expect(messages(visible)).toMatchObject([
+      expect(messages(visible)).toMatchObject(inlinePng !== "none" ? [] : [
         { case: "messageStarted", value: { role: MessageRole.USER, userInputAccepted: false,
           userInput: { parts: [{ content: { case: "text", value: question } }] } } },
         { case: "messageCompleted", value: { role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: answer } }] } }
@@ -144,11 +152,56 @@ it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog t
     expect(await readFile(rollout, "utf8")).toBe(sourceBytes);
 
     executablePresent = true;
+    const rawUser = () => store.listEvents({ sessionId, messageCompleteOnly: true }).find((event) =>
+      event.payload.type === "message_complete" && event.payload.role === "user" && event.payload.nativeHistory?.identity?.entryId === "original-user");
+    let beforeRepair: ReturnType<typeof rawUser>;
+    if (inlinePng === "existing") {
+      const oldProjection = vi.spyOn(store, "findNativeCatalogCreation").mockReturnValue(undefined);
+      try {
+        await clients.session.listRuntimeCommands({ sessionId });
+        beforeRepair = rawUser();
+        expect(beforeRepair?.payload).toMatchObject({ blocks: [{ kind: "text", text: question }, { kind: "text", text: "[Image input]" }] });
+        expect(store.countArtifacts({ sessionId })).toBe(0);
+        await fixture.application.sessionHost.closeIfActive(sessionId);
+      } finally { oldProjection.mockRestore(); }
+    }
     await clients.session.listRuntimeCommands({ sessionId });
     const canonical = messages(await timeline());
     expect(canonical.map(message => message.value.nativeIdentity?.entryId)).toEqual(["original-user", "original-assistant"]);
     expect(messages(await snapshot())).toEqual(canonical);
-    expect(store.listEvents({ sessionId }).some(event => event.payload.type === "history_pruned")).toBe(true);
+    if (inlinePng === "none") {
+      expect(store.listEvents({ sessionId }).some(event => event.payload.type === "history_pruned")).toBe(true);
+      return;
+    }
+
+    const user = canonical[0];
+    if (user?.case !== "messageStarted") throw new Error("The original User Message is missing.");
+    const parts = user.value.userInput?.parts;
+    expect(parts?.map(part => part.content.case)).toEqual(["text", "image"]);
+    expect(parts?.[0]?.content).toEqual({ case: "text", value: question });
+    const image = parts?.[1]?.content;
+    if (image?.case !== "image" || image.value.blob === undefined) throw new Error("The original PNG is missing.");
+    const blob = image.value.blob;
+    expect(user.value.userInputAccepted).toBe(false);
+    expect(store.listQueueItems({ sessionId, includeCleared: true })).toEqual([]);
+    expect(store.listRuns({ sessionId })).toEqual([]);
+    expect(blob).toMatchObject({ mediaType: "image/png", byteSize: BigInt(originalPng.length),
+      sha256Hex: createHash("sha256").update(originalPng).digest("hex") });
+    expect(store.getArtifact(blob.blobId)).toMatchObject({ sessionId });
+    expect(rawUser()?.payload).toMatchObject({ blocks: [{ kind: "text", text: question }, { kind: "text", text: "[Image input]" }] });
+    if (beforeRepair !== undefined) expect(rawUser()).toEqual(beforeRepair);
+    const thumbnail = await clients.artifact.getImageThumbnail({ expectedSourceBlob: blob, maximumEdgePixels: 256 });
+    expect(thumbnail.sourceBlob).toEqual(blob);
+    expect(thumbnail.result).toMatchObject({ case: "thumbnail", value: { sourceWidthPixels: 2, sourceHeightPixels: 1 } });
+    const original = await clients.artifact.getBlobDownloadTicket({ blobId: blob.blobId });
+    const download = await fetch(`${fixture.baseUrl}${original.ticket!.relativeEndpoint}`, { headers: { authorization: `Bearer ${authKey}` } });
+    expect(download.status).toBe(200);
+    expect(Buffer.from(await download.arrayBuffer())).toEqual(originalPng);
+    await fixture.application.sessionHost.closeIfActive(sessionId);
+    await clients.session.listRuntimeCommands({ sessionId });
+    expect(messages(await timeline())).toEqual(canonical);
+    expect(store.countArtifacts({ sessionId })).toBe(1);
+    expect(await readFile(rollout, "utf8")).toBe(sourceBytes);
   } finally {
     await fixture?.close();
     await host.shutdown();

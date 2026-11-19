@@ -94,7 +94,7 @@ import {
   type NativeThread,
   type NativeTurn
 } from "./protocol.js";
-import { codexLegacyRewindAnchor, codexNativeDispatchFingerprint, projectCodexNativeHistory } from "./native-history.js";
+import { codexLegacyRewindAnchor, codexNativeDispatchFingerprint, materializeCodexHistoryImages, projectCodexNativeHistory } from "./native-history.js";
 import { readCodexNativeSessionPreview } from "./native-session-preview.js";
 import { readCodexCatalogRolloutMessages } from "./catalog-rollout-history.js";
 import { codexAccountResetFacts } from "./account-rate-limit-resets.js";
@@ -1932,7 +1932,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         legacyDialogueRewind: this.#supportsLegacyDialogueRewind(runtime)
       });
       history.assertCurrent();
-      return projection;
+      return this.#hosted === undefined
+        ? await materializeCodexHistoryImages(history.thread, projection, context, history.assertCurrent)
+        : projection;
     } catch (error) {
       throw this.#requestFailure(error, "probe", "CODEX_NATIVE_HISTORY_UNAVAILABLE", false);
     }

@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
-import { NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD } from "@joko/core";
+import { NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD, NATIVE_HISTORY_USER_IMAGES_FIELD } from "@joko/core";
 import type {
+  AdapterContext,
   AdapterEventMetadata,
+  BlobRef,
   EventPayload,
   MessageBlock,
   NativeHistoryProjectedEvent,
@@ -132,6 +134,53 @@ export function projectCodexNativeHistory(
       });
     }
   }
+}
+
+/** Restore only inline bytes from the same complete, bound App Server read. */
+export async function materializeCodexHistoryImages(thread: NativeThread, projection: NativeHistoryProjection,
+  context: Pick<AdapterContext, "target" | "runtimePolicy" | "persistentReadOnly" | "artifactCapacityBytes" | "materializeNativeHistoryImage">,
+  assertCurrent: () => void): Promise<NativeHistoryProjection> {
+  const materialize = context.materializeNativeHistoryImage;
+  if (thread.historyMode !== "paginated" || thread.ephemeral === true || context.target.remoteWorkspace !== undefined
+    || context.runtimePolicy !== undefined || context.persistentReadOnly !== undefined || materialize === undefined) return projection;
+  const references: [string, number, BlobRef][] = [];
+  for (const turn of thread.turns) {
+    if (turn.status !== "completed") continue;
+    for (const item of turn.items) {
+      if (item.type !== "userMessage" || isYieldContinuationClientId(item["clientId"])) continue;
+      const sources: [number, string][] = [];
+      userMessageBlocks(item, (blockIndex, url) => {
+        if (typeof url === "string" && url.startsWith(INLINE_PNG_PREFIX)) sources.push([blockIndex, url]);
+      });
+      if (sources.length === 0) continue;
+      const inputFingerprint = nativeUserFingerprint(item);
+      for (const [blockIndex, url] of sources) {
+        const png = inlineCodexPng(url, context.artifactCapacityBytes);
+        if (png === undefined) continue;
+        assertCurrent();
+        const blob = await materialize({ nativeEntryId: item.id, inputFingerprint, blockIndex, png, assertCurrent });
+        assertCurrent();
+        if (blob !== undefined) references.push([item.id, blockIndex, blob]);
+      }
+    }
+  }
+  if (references.length === 0 || projection.activeEntryMetadata === undefined) return projection;
+  return { ...projection, activeEntryMetadata: { ...projection.activeEntryMetadata,
+    fields: { ...projection.activeEntryMetadata.fields, [NATIVE_HISTORY_USER_IMAGES_FIELD]: JSON.stringify(references) }
+  } };
+}
+
+const INLINE_PNG_PREFIX = "data:image/png;base64,";
+
+function inlineCodexPng(url: string, maximumBytes: number): Buffer | undefined {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1) return undefined;
+  const encoded = url.slice(INLINE_PNG_PREFIX.length);
+  if (encoded.length > Math.ceil(maximumBytes / 3) * 4) return undefined;
+  const bytes = Buffer.from(encoded, "base64");
+  if (bytes.length < 33 || bytes.length > maximumBytes || bytes.toString("base64") !== encoded
+    || bytes.readBigUInt64BE(0) !== 0x89504e470d0a1a0an || bytes.readUInt32BE(8) !== 13
+    || bytes.toString("ascii", 12, 16) !== "IHDR" || bytes.readUInt32BE(16) === 0 || bytes.readUInt32BE(20) === 0) return undefined;
+  return bytes;
 }
 
 function projectItem(
@@ -402,7 +451,7 @@ function safeStructuredOutput(value: JsonValue | undefined): string {
   return value === undefined ? "" : safeJson(value, 256 * 1024);
 }
 
-function userMessageBlocks(item: NativeThreadItem): readonly MessageBlock[] {
+function userMessageBlocks(item: NativeThreadItem, observeInlineImage?: (blockIndex: number, url: unknown) => void): readonly MessageBlock[] {
   if (!Array.isArray(item["content"])) {
     return [{ kind: "text", text: "[Codex user input unavailable]" }];
   }
@@ -416,6 +465,9 @@ function userMessageBlocks(item: NativeThreadItem): readonly MessageBlock[] {
         }
         break;
       case "image":
+        observeInlineImage?.(blocks.length, content["url"]);
+        blocks.push({ kind: "text", text: "[Image input]" });
+        break;
       case "localImage":
         blocks.push({ kind: "text", text: "[Image input]" });
         break;

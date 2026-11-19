@@ -70,7 +70,7 @@ import type {
   UserShellResult,
   UsageSnapshot
 } from "@joko/core";
-import { JokoError, NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD, NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD, NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD, containsRecognizedCredential, decideToolCall, evaluateOrderedPolicyRules, policyRiskForToolRisk, nativeHistoryEventContext, redactSecrets, supportsNativeStartNavigation, toPublicError, validInlineTextRanges, validInputMentionRanges, type ToolRisk } from "@joko/core";
+import { JokoError, NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD, NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD, NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD, NATIVE_HISTORY_USER_IMAGES_FIELD, containsRecognizedCredential, decideToolCall, evaluateOrderedPolicyRules, policyRiskForToolRisk, nativeHistoryEventContext, redactSecrets, supportsNativeStartNavigation, toPublicError, validInlineTextRanges, validInputMentionRanges, type ToolRisk } from "@joko/core";
 import {
   AuthorizationError,
   ensureSideChatHistoryBoundary,
@@ -133,8 +133,9 @@ import {
   NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD,
   nativeHistoryReplayMetadata,
   observedClaudeAssistantInputEntry,
+  observedNativeUserImages,
   projectNativeHistory,
-  withObservedNativeRewind
+  withObservedNativeUserPresentation
 } from "./native-history.js";
 import {
   markNativeStateObservationStale as staleNativeStateObservation,
@@ -1793,16 +1794,8 @@ export class SessionHost {
     const adapter = this.#adapters.get(session.backendId);
     if (adapter?.readBoundNativeCatalogHistory === undefined || this.#store.findLatestNativeSessionChange(sessionId) !== undefined
       || this.#store.hasNativeCatalogRolloutHistory(sessionId)) return;
-    const original = this.#store.findNativeCatalogCreation(sessionId);
-    if (original === undefined || !isRecord(original.body) || original.body["targetId"] !== session.targetId) return;
-    const start = original.body["nativeStart"];
-    if (!isRecord(start) || start["kind"] !== "attach") return;
-    if (start["nativeReference"] !== session.binding.opaqueRef) {
-      const adoption = this.#store.findNativeCatalogAdoption(original.id);
-      if (adoption?.state !== "adopted" || adoption.sessionId !== session.id || adoption.targetId !== session.targetId
-        || adoption.backendId !== session.backendId || adoption.binding.opaqueRef !== session.binding.opaqueRef
-        || adoption.binding.nativeSessionId !== session.binding.nativeSessionId) return;
-    }
+    const catalogOperationId = this.nativeCatalogAttachmentOperationId(session);
+    if (catalogOperationId === undefined) return;
     const target = this.#store.getTarget(session.targetId);
     if (isTargetDeleted(target) || !target.descriptor.trusted || target.descriptor.remoteWorkspace !== undefined
       || target.descriptor.backendId !== session.backendId) return;
@@ -1827,7 +1820,7 @@ export class SessionHost {
         || store.findLatestNativeSessionChange(session.id) !== undefined) return;
       // This projection belongs to the original durable thread. A failed cold
       // resume can advance the execution generation without changing it.
-      store.appendNativeCatalogRolloutHistory(current, original.id, messages);
+      store.appendNativeCatalogRolloutHistory(current, catalogOperationId, messages);
     });
   }
 
@@ -9618,7 +9611,7 @@ export class SessionHost {
       store.authorizeConnection(authority.connection.id, authority.connection.authKeyDigest);
       const origin = store.findVisibleSessionMessageOrigin({ sessionId, eventId: sourceMessage.eventId, role: "user", includeRetainedContext: false });
       const recorded = origin === undefined ? undefined : store.findEvent(origin.eventId);
-      const source = recorded === undefined ? undefined : withObservedNativeRewind(recorded, store.getSession(sessionId).descriptor.binding,
+      const source = recorded === undefined ? undefined : withObservedNativeUserPresentation(recorded, store.getSession(sessionId).descriptor.binding,
         () => this.isOrdinaryLocalCodexSession(store.getSession(sessionId)) ? store.findLatestNativeSessionChange(sessionId) : undefined);
       const boundary = source?.payload.type === "message_complete" ? source.payload.nativeHistory?.identity?.rewindBefore : undefined;
       if (origin?.messageId !== sourceMessage.messageId || boundary === undefined || boundary.kind !== target.kind
@@ -17962,6 +17955,76 @@ export class SessionHost {
     )?.value)?.commands ?? [];
   }
 
+  private nativeCatalogAttachmentOperationId(session: SessionDescriptor): string | undefined {
+    const original = this.#store.findNativeCatalogCreation(session.id);
+    if (original === undefined || !isRecord(original.body) || original.body["targetId"] !== session.targetId) return undefined;
+    const start = original.body["nativeStart"];
+    if (!isRecord(start) || start["kind"] !== "attach") return undefined;
+    if (start["nativeReference"] === session.binding.opaqueRef) return original.id;
+    const adoption = this.#store.findNativeCatalogAdoption(original.id);
+    if (adoption?.state !== "adopted" || adoption.sessionId !== session.id || adoption.targetId !== session.targetId
+      || adoption.backendId !== session.backendId || adoption.binding.opaqueRef !== session.binding.opaqueRef
+      || adoption.binding.nativeSessionId !== session.binding.nativeSessionId) return undefined;
+    return original.id;
+  }
+
+  private withImportedCodexImageAuthority(lease: ActiveBackendSideEffectLease, staging: Map<string, BlobRef>,
+    verify: Array<() => void>): AdapterContext {
+    const { context, stored, sessionId } = lease;
+    const session = stored.descriptor;
+    if (!context.target.trusted || !this.isOrdinaryLocalCodexSession(stored)
+      || this.nativeCatalogAttachmentOperationId(session) === undefined) return context;
+    const target = this.#store.getTarget(session.targetId);
+    if (isTargetDeleted(target) || !target.descriptor.trusted || target.descriptor.backendId !== session.backendId) return context;
+    const bindingFingerprint = nativeBindingFingerprint(session.binding.opaqueRef);
+    const observations = observedNativeUserImages(session.binding, this.#store.findLatestNativeSessionChange(sessionId));
+    return { ...context, materializeNativeHistoryImage: async (input) => {
+      const assertOwner = () => {
+        context.signal.throwIfAborted();
+        const current = this.assertActiveBackendSideEffectLease(lease);
+        if (current.descriptor.binding.opaqueRef !== session.binding.opaqueRef || current.descriptor.targetId !== session.targetId
+          || this.#store.getTarget(session.targetId).revision !== target.revision || !this.isOrdinaryLocalCodexSession(current)) {
+          throw new StoreError("The imported image source changed during native history observation.");
+        }
+        input.assertCurrent();
+      };
+      const permitsOriginalInput = () => {
+        if (protectedNativeInputFingerprints(this.#store, sessionId, bindingFingerprint).has(input.inputFingerprint)) return false;
+        const existing = this.#store.findEvent(deterministicNativeEventId(sessionId, bindingFingerprint,
+          input.nativeEntryId, "message_user", 0), { includeTombstoned: true });
+        if (existing === undefined) {
+          return this.#store.listRuns({ sessionId, limit: 1 }).length === 0
+            && this.#store.listQueueItems({ sessionId, includeCleared: true, limit: 1 }).length === 0;
+        }
+        const payload = existing.payload;
+        if (existing.sessionId !== sessionId || existing.backendId !== session.backendId || existing.targetId !== session.targetId
+          || existing.runId !== undefined || existing.metadata?.namespace !== "codex.native_history"
+          || existing.metadata.fields["nativeDispatchFingerprint"] !== input.inputFingerprint
+          || existing.metadata.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] !== bindingFingerprint
+          || payload.type !== "message_complete" || payload.role !== "user" || payload.acceptedInput !== undefined
+          || payload.partnerPrivateOrigin !== undefined) return false;
+        const block = payload.blocks[input.blockIndex];
+        return block?.kind === "text" && block.text === "[Image input]";
+      };
+      assertOwner();
+      if (!permitsOriginalInput()) return undefined;
+      verify.push(() => {
+        assertOwner();
+        if (!permitsOriginalInput()) throw new StoreError("The imported image input owner changed during observation.");
+      });
+      const digest = createHash("sha256").update(input.png).digest("hex");
+      const prior = observations.find(([entry, index]) => entry === input.nativeEntryId && index === input.blockIndex)?.[2];
+      if (prior?.sha256 === digest && prior.byteLength === input.png.byteLength) return prior;
+      const staged = staging.get(digest);
+      if (staged !== undefined) return staged;
+      const bytes = await this.#artifactStore.ingestBytes(input.png, { fileName: `codex-${digest.slice(0, 16)}.png`,
+        mimeType: "image/png", expiresAt: Date.now() + 10 * 60_000, assertCurrent: assertOwner });
+      const blob = this.#store.getArtifact(bytes.id).blob;
+      staging.set(digest, blob);
+      return blob;
+    } };
+  }
+
   private synchronizeNativeHistory(
     sessionId: string,
     allowance: BackendSideEffectAdmissionAllowance = {},
@@ -17976,11 +18039,14 @@ export class SessionHost {
       return Promise.reject(error);
     }
     const previous = this.#nativeHistoryTails.get(sessionId) ?? Promise.resolve();
+    const stagedImages = new Map<string, BlobRef>();
     const operation = previous.catch(() => undefined).then(async () => {
       if (this.#disposed) return undefined;
       this.assertActiveBackendSideEffectLease(lease);
       const stored = lease.stored;
-      const history = await active.adapter.getNativeHistoryProjection!(lease.context);
+      const verifyImages: Array<() => void> = [];
+      const context = confirmation === undefined ? this.withImportedCodexImageAuthority(lease, stagedImages, verifyImages) : lease.context;
+      const history = await active.adapter.getNativeHistoryProjection!(context);
       this.assertActiveBackendSideEffectLease(lease);
       const current = this.#store.getSession(sessionId);
       if (current.descriptor.binding.generation !== stored.descriptor.binding.generation) {
@@ -18009,6 +18075,7 @@ export class SessionHost {
         : undefined;
       let confirmed: AcceptedNativeTurnOutcome | undefined;
       const recovered = this.#store.transaction((store) => {
+        for (const verify of verifyImages) verify();
         const journal = nativeDispatchRecoveryJournal(store.findSetting(
           "session",
           sessionId,
@@ -18039,6 +18106,7 @@ export class SessionHost {
             nativeEntryIds: historyOwner.nativeEntryIds
           }
         );
+        for (const blob of stagedImages.values()) store.adoptSessionArtifact({ blob, sessionId });
         if (recovered === undefined) return undefined;
         const state = recovered.outcome === "completed"
           ? "completed"
@@ -18095,6 +18163,7 @@ export class SessionHost {
         removeNativeDispatchRecoveryEntry(store, sessionId, recovered.baseline.runId);
         return recovered;
       });
+      stagedImages.clear();
       if (recovered !== undefined) {
         const recoveredRunId = recovered.baseline.runId;
         this.clearRunSilenceWatchdog(sessionId);
@@ -18114,7 +18183,13 @@ export class SessionHost {
         void this.drain(sessionId);
       }
       return confirmed;
-    }).finally(() => lease.release());
+    }).finally(() => {
+      try {
+        if (stagedImages.size > 0) this.#store.releaseArtifactStaging([...stagedImages.values()].map((blob) => blob.id));
+      } finally {
+        lease.release();
+      }
+    });
     const tail = operation.then(() => undefined, () => undefined);
     this.#nativeHistoryTails.set(sessionId, tail);
     void tail.then(() => {
@@ -18400,6 +18475,7 @@ export class SessionHost {
     const {
       [NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD]: _reservedParents,
       [NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD]: observedLegacyAnchors,
+      [NATIVE_HISTORY_USER_IMAGES_FIELD]: observedImages,
       ...activeFields
     } = activeEntryMetadata?.fields ?? {};
     const legacyAnchors = activeEntryMetadata?.namespace === "codex.native_history" && typeof observedLegacyAnchors === "string"
@@ -18410,14 +18486,17 @@ export class SessionHost {
       unprojectedParents = JSON.stringify(history.activeLineage!.flatMap(({ entryId, parentEntryId }) =>
         parentEntryId !== undefined && !projectedEntries.has(entryId) ? [[entryId, parentEntryId]] : []));
     }
-    const sameLeaf = previousPayload !== undefined &&
+    const sameBinding = previousPayload !== undefined &&
       previousPayload.opaqueRef === session.binding.opaqueRef &&
-      previousPayload.nativeSessionId === session.binding.nativeSessionId &&
-      previousPayload.leafId === history.activeEntryId;
+      previousPayload.nativeSessionId === session.binding.nativeSessionId;
+    const sameLeaf = sameBinding && previousPayload?.leafId === history.activeEntryId;
     const previousUnprojectedParents = previous?.metadata?.fields[NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD] ?? "[]";
     const previousLegacyAnchors = previous?.metadata?.fields[NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD];
+    const previousImages = sameBinding ? previous?.metadata?.fields[NATIVE_HISTORY_USER_IMAGES_FIELD] : undefined;
+    const images = activeEntryMetadata?.namespace === "codex.native_history" && typeof observedImages === "string"
+      && this.isOrdinaryLocalCodexSession(store.getSession(session.id)) ? observedImages : previousImages;
     if (sameLeaf && (unprojectedParents === undefined || unprojectedParents === previousUnprojectedParents)
-      && legacyAnchors === previousLegacyAnchors) return;
+      && legacyAnchors === previousLegacyAnchors && images === previousImages) return;
     const leafToken = history.activeEntryId ?? "<none>";
     const markerDigest = createHash("sha256")
       .update(session.id).update("\0")
@@ -18447,7 +18526,8 @@ export class SessionHost {
             ...activeFields,
             ...(unprojectedParents === undefined || unprojectedParents === "[]" ? {}
               : { [NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD]: unprojectedParents }),
-            ...(legacyAnchors === undefined ? {} : { [NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD]: legacyAnchors })
+            ...(legacyAnchors === undefined ? {} : { [NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD]: legacyAnchors }),
+            ...(images === undefined ? {} : { [NATIVE_HISTORY_USER_IMAGES_FIELD]: images })
           } } })
     });
   }

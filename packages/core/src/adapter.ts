@@ -133,6 +133,14 @@ export interface AdapterContext {
   readonly readNativeHistoryProjection?: (
     identity: Pick<NativeHistoryProjectedEvent, "nativeEntryId" | "projectionKind" | "contentIndex">
   ) => EventPayload | undefined;
+  /** Adopt original inline image bytes from an authorized native history import. */
+  readonly materializeNativeHistoryImage?: (input: {
+    readonly nativeEntryId: string;
+    readonly blockIndex: number;
+    readonly inputFingerprint: string;
+    readonly png: Uint8Array;
+    readonly assertCurrent: () => void;
+  }) => Promise<BlobRef | undefined>;
   readonly storeArtifact: (sourcePath: string, options?: {
     fileName?: string;
     mimeType?: string;

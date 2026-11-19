@@ -151,7 +151,7 @@ import {
 } from "./artifact-maintenance.js";
 import { NATIVE_PI_SETTINGS_DEFAULTS, type OrchestratorApplication, type SessionContextDefaultsResolver } from "./application.js";
 import { projectBackgroundTaskHistory } from "./background-task-history.js";
-import { withObservedNativeRewind } from "./native-history.js";
+import { withObservedNativeUserPresentation } from "./native-history.js";
 import {
   modelRoutingEnabled,
   readBackendModelAccess,
@@ -7937,7 +7937,7 @@ function validateStreamCursor(cursor: contract.EventCursor, generation: bigint, 
 export function eventWithServiceCursor(item: PersistedEvent, dependencies: ConnectServiceDependencies, generation: bigint,
   ownerCatalog = false): contract.Event {
   const context = eventContext(item, dependencies);
-  const mapped = toProtoEvent(withObservedNativeRewind(item, context.session?.descriptor.binding,
+  const mapped = toProtoEvent(withObservedNativeUserPresentation(item, context.session?.descriptor.binding,
     () => dependencies.store.findLatestNativeSessionChange(item.sessionId)), context);
   const deleted = ownerCatalog && item.payload.type === "session_changed" && context.session?.descriptor.deletedAt !== undefined
     ? context.session : undefined;
