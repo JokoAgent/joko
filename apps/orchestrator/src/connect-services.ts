@@ -1934,9 +1934,9 @@ export function createConnectServices(application: OrchestratorApplication, proj
       const scope = request.scope ?? create(contract.SnapshotScopeSchema, {
         kind: { case: "owner", value: create(contract.OwnerSnapshotScopeSchema, {}) }
       });
-      if (scope.kind.case === "session" && scope.kind.value.recentTimelineItems > 0 && scope.kind.value.sessionId.trim() !== "") {
-        await dependencies.sessionHost.hydrateBoundNativeCatalogHistory(scope.kind.value.sessionId, authenticated, signal);
-      }
+      const coldNativeCatalogRead = scope.kind.case === "session" && scope.kind.value.recentTimelineItems > 0
+        && scope.kind.value.sessionId.trim() !== ""
+        && await dependencies.sessionHost.hydrateBoundNativeCatalogHistory(scope.kind.value.sessionId, authenticated, signal);
       const projected = projectStoreSnapshot(dependencies.store, scope, {
         server: serverInfo(dependencies, now()),
         now,
@@ -1950,7 +1950,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
           dependencies.sessionHost.getSessionRuntimeControl(sessionId).effective
       });
       const createdAt = now();
-      const enriched = await enrichSnapshot(dependencies, projected, scope, createdAt, signal);
+      const enriched = await enrichSnapshot(dependencies, projected, scope, createdAt, coldNativeCatalogRead, signal);
       return {
         snapshot: create(contract.SnapshotSchema, {
           ...enriched,
@@ -14835,6 +14835,7 @@ async function enrichSnapshot(
   projected: contract.Snapshot,
   scope: contract.SnapshotScope,
   at: number,
+  coldNativeCatalogRead: boolean,
   signal?: AbortSignal
 ): Promise<contract.Snapshot> {
   const scopeCase = scope.kind.case;
@@ -14874,7 +14875,7 @@ async function enrichSnapshot(
     provider
   ] as const));
   // Opening imported Codex history from disk can succeed while its executable is unavailable.
-  const readingCatalogHistory = scope.kind.case === "session" && projected.backends.some(backend =>
+  const readingCatalogHistory = coldNativeCatalogRead || scope.kind.case === "session" && projected.backends.some(backend =>
     backendRecords.get(backend.backendId)?.descriptor.adapterKind === "codex")
     && dependencies.store.hasNativeCatalogRolloutHistory(scope.kind.value.sessionId, { activeOnly: true });
   await Promise.all([...authoritativeProviderMap].map(async ([key, provider]) => {

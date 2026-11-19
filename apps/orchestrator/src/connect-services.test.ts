@@ -19,7 +19,7 @@ function stubApplication(overrides: Record<string, unknown> = {}): OrchestratorA
     blobTransfers: {},
     artifactRepository: {},
     workspaces: {},
-    sessionHost: { hydrateBoundNativeCatalogHistory: async () => undefined },
+    sessionHost: { hydrateBoundNativeCatalogHistory: async () => false },
     scheduler: {},
     adapters: [],
     browserActivity: [],

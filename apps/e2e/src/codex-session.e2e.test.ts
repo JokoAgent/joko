@@ -191,7 +191,8 @@ it.each([
     expect(rawUser()?.payload).toMatchObject({ blocks: [{ kind: "text", text: question }, { kind: "text", text: "[Image input]" }] });
     if (beforeRepair !== undefined) expect(rawUser()).toEqual(beforeRepair);
     const thumbnail = await clients.artifact.getImageThumbnail({ expectedSourceBlob: blob, maximumEdgePixels: 256 });
-    expect(thumbnail.sourceBlob).toEqual(blob);
+    const stored = await fixture.application.artifacts.get(blob.blobId);
+    expect(thumbnail.sourceBlob).toEqual({ ...blob, createdAt: timestampFromMs(stored.createdAt) });
     expect(thumbnail.result).toMatchObject({ case: "thumbnail", value: { sourceWidthPixels: 2, sourceHeightPixels: 1 } });
     const original = await clients.artifact.getBlobDownloadTicket({ blobId: blob.blobId });
     const download = await fetch(`${fixture.baseUrl}${original.ticket!.relativeEndpoint}`, { headers: { authorization: `Bearer ${authKey}` } });
