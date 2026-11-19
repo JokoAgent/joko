@@ -372,6 +372,7 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
                     const selected = schedule.id === selectedId;
                     const status = scheduleDisplayStatus(schedule);
                     const runPending = pendingRunNowIds.has(schedule.id);
+                    const boundTaskUnavailable = schedule.sessionMode === "bound" && !sessions.some((session) => session.id === schedule.sessionId);
                     const runtimeStatus = scheduleRuntimeStatus(runtime, schedule.id);
                     return <div id={`schedule-row-${schedule.id}`} role="listitem" className={`schedule-master__row${selected ? " is-selected" : ""}${status === "paused" ? " is-paused" : ""}`} key={schedule.id}>
                       <button type="button" className="schedule-master__row-main" aria-current={selected ? "true" : undefined} onClick={() => selectSchedule(schedule)} onDoubleClick={() => setEditor(schedule)}>
@@ -379,7 +380,7 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
                         <span><span className="schedule-master__row-title"><strong>{schedule.name}</strong>{schedule.unreadRunCount > 0 && <span className="schedule-run-unread-count" aria-label={t("scheduler.unreadRunCount", { count: schedule.unreadRunCount })}>{schedule.unreadRunCount}</span>}{schedule.source === "project" && <span className="schedule-source-chip" title={t("scheduler.projectSourceTooltip", { path: schedule.projectConfigPath ?? ".joko/automations/schedules.json" })}><FolderGit2 aria-hidden="true" />{t("scheduler.projectSource")}</span>}</span><small>{runtimeStatus !== undefined ? scheduleRuntimeLabel(runtimeStatus, runtime, t) : runPending ? t("scheduler.runtimeLoading") : status === "expired" ? t("scheduler.once") : schedule.nextRunAt === undefined ? scheduleKind(schedule.kind, t) : t("scheduler.nextRunRelative", { time: formatRelativeTime(schedule.nextRunAt, locale) })}</small></span>
                       </button>
                       <div className="schedule-master__row-actions">
-                        <IconButton disabled={runPending} label={`${t("scheduler.runNow")} · ${schedule.name}`} onClick={() => runScheduleOnce(schedule.id)}><Play aria-hidden="true" /></IconButton>
+                        <IconButton disabled={runPending || boundTaskUnavailable} disabledReason={boundTaskUnavailable ? t("scheduler.runTaskUnavailable") : undefined} label={`${t("scheduler.runNow")} · ${schedule.name}`} onClick={() => runScheduleOnce(schedule.id)}><Play aria-hidden="true" /></IconButton>
                         <ScheduleRowMenu
                           schedule={schedule}
                           expired={status === "expired"}
@@ -587,6 +588,7 @@ function ScheduleDetail({ controller, schedule, sessions, session, target, runti
   const recentHistoryRef = useRef(schedule.history);
   recentHistoryRef.current = schedule.history;
   const displayStatus = scheduleDisplayStatus(schedule);
+  const boundTaskUnavailable = schedule.sessionMode === "bound" && session === undefined;
   const historyEntries = useMemo(
     () => groupScheduleHistoryRuns(history, schedule.sessionMode === "persistent" || schedule.sessionMode === "bound"),
     [history, schedule.sessionMode]
@@ -713,8 +715,8 @@ function ScheduleDetail({ controller, schedule, sessions, session, target, runti
   return (
     <article className="schedule-detail">
       <header className="schedule-detail__header">
-        <div><h2>{schedule.name}</h2><p>{target?.workspaceName ?? target?.name ?? schedule.targetId} · {session?.name ?? scheduleSessionModeLabel(schedule.sessionMode, t)}</p></div>
-        <div className="schedule-detail__actions"><Button tone="primary" disabled={runPending} onClick={onRun}><Play aria-hidden="true" />{t("scheduler.runNow")}</Button><Button onClick={onEdit}><Pencil aria-hidden="true" />{t("scheduler.edit")}</Button><Button disabled={displayStatus === "expired"} onClick={onToggle}>{schedule.enabled ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}{schedule.enabled ? t("common.disable") : t("common.enable")}</Button><Button tone="ghost" className="danger-text" onClick={onDelete}><Trash2 aria-hidden="true" />{t("common.delete")}</Button></div>
+        <div><h2>{schedule.name}</h2><p>{target?.workspaceName ?? target?.name ?? schedule.targetId} · {boundTaskUnavailable ? t("scheduler.runTaskUnavailable") : session?.name ?? scheduleSessionModeLabel(schedule.sessionMode, t)}</p></div>
+        <div className="schedule-detail__actions"><Button tone="primary" disabled={runPending || boundTaskUnavailable} onClick={onRun}><Play aria-hidden="true" />{t("scheduler.runNow")}</Button><Button onClick={onEdit}><Pencil aria-hidden="true" />{t("scheduler.edit")}</Button><Button disabled={displayStatus === "expired"} onClick={onToggle}>{schedule.enabled ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}{schedule.enabled ? t("common.disable") : t("common.enable")}</Button><Button tone="ghost" className="danger-text" onClick={onDelete}><Trash2 aria-hidden="true" />{t("common.delete")}</Button></div>
       </header>
       <dl className="schedule-facts">
         {runtimeStatus !== undefined && <div><dt>{t("scheduler.runtimeStatus")}</dt><dd><Pill tone={runtimeStatus.kind === "capacity" ? "warning" : "success"}>{scheduleRuntimeLabel(runtimeStatus, runtime, t)}</Pill></dd></div>}

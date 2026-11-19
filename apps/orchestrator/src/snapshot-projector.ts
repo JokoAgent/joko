@@ -3,6 +3,8 @@ import { readWorkerWorkspaceBinding } from "./collaboration-worker-workspace.js"
 import { readProvisionalSession } from "./session-prewarm.js";
 import { sessionTaskActivity } from "./session-task-activity.js";
 import { isPartnerRoutineSchedule } from "./partner-routine-schedule.js";
+import { scheduleProjectAutomationOrigin } from "./project-automation-config.js";
+import { scheduleExtensionSnapshot } from "./schedule-extensions.js";
 
 import type {
   BackendSnapshotScope,
@@ -313,8 +315,19 @@ export class SnapshotProjector {
       const visibleRunIds = new Set(runs.map((run) => run.descriptor.id));
       const queueItems = scanStorePages((offset, limit) => store.listQueueItems({ limit, offset }))
         .filter((item) => visibleSessionIds.has(item.sessionId) && visibleRunIds.has(item.runId));
+      const localTargetIds = new Set(base.targets.filter(({ descriptor }) => descriptor.remoteWorkspace === undefined)
+        .map(({ descriptor }) => descriptor.id));
       const schedules = store.listSchedules().filter(schedule => !isPartnerRoutineSchedule(schedule))
-        .filter((schedule) => schedule.sessionId === undefined || visibleSessionIds.has(schedule.sessionId));
+        .filter((schedule) => {
+          if (schedule.sessionId === undefined || visibleSessionIds.has(schedule.sessionId)) return true;
+          if (schedule.kind !== "manual" || schedule.sessionMode !== "bound" || !localTargetIds.has(schedule.targetId)
+            || scheduleProjectAutomationOrigin(schedule.executionSnapshot) !== undefined
+            || scheduleExtensionSnapshot(schedule.executionSnapshot).executionMode !== "agent"
+            || this.options.hideSessionFromCatalog?.(schedule.sessionId) === true) return false;
+          const boundTask = store.findSession(schedule.sessionId)?.descriptor;
+          // The independent Automation history outlives an ordinary task's tombstone.
+          return boundTask?.deletedAt !== undefined && boundTask.hidden !== true;
+        });
       const interactions = scanStorePages((offset, limit) => store.listInteractions({ limit, offset }))
         .filter((interaction) => visibleSessionIds.has(interaction.sessionId)
           || interaction.payload.kind === "permission" && interaction.payload.toolName === "plugin_managed_task");

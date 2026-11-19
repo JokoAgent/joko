@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import { createConnectTransport } from "@connectrpc/connect-node";
-import { QueueDispatchState, QueueItemState, RunState, ScheduleState, type QueueControl } from "@joko/contracts";
+import { OperationState, QueueDispatchState, QueueItemState, RunState, ScheduleSessionMode, ScheduleState, type QueueControl } from "@joko/contracts";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -9,6 +9,7 @@ import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import {
   createManualScheduleMutation,
   createSessionMutation,
+  deleteMutation,
   pauseQueueMutation,
   queueItemIdFrom,
   queueRunIdFrom,
@@ -16,7 +17,8 @@ import {
   scheduleIdFrom,
   sendInputMutation,
   sessionIdFrom,
-  submit
+  submit,
+  triggerScheduleMutation
 } from "./operations.js";
 
 describe("Orchestrator restart recovery and unattended schedules", () => {
@@ -180,6 +182,40 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
     expect(fixture.adapter().sendCalls.some((item) => item.text === "scheduled while UI is absent")).toBe(true);
     const schedules = await observer.clients.scheduler.listSchedules({ sessionId });
     expect(schedules.schedules[0]?.scheduleId).toBe(scheduleId);
+  });
+
+  it("keeps a bound manual Automation and its original successful history visible after task deletion", async () => {
+    const host = fixture = await OrchestratorE2eFixture.start();
+    const { clients, connectionId } = await host.pair("Automation owner");
+    const backendId = host.adapter().id;
+    const targetId = host.targetId();
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId, createSessionMutation({ backendId, targetId })));
+    const scheduleId = scheduleIdFrom(await submit(clients.operation, connectionId, createManualScheduleMutation({
+      backendId, targetId, sessionId, sessionMode: ScheduleSessionMode.BOUND, text: "Keep this completed occurrence"
+    })));
+    expect((await submit(clients.operation, connectionId, triggerScheduleMutation(scheduleId))).state).toBe(OperationState.SUCCEEDED);
+    const completed = await waitFor(
+      () => clients.scheduler.listScheduleRunHistory({ scheduleId }),
+      ({ history }) => history.length === 1 && history[0]?.state === RunState.SUCCEEDED,
+      "the original bound manual occurrence"
+    );
+    const [original] = completed.history;
+    expect(original?.sessionId).toBe(sessionId);
+    expect(original?.runId).toBeTruthy();
+
+    expect((await submit(clients.operation, connectionId, deleteMutation(sessionId))).state).toBe(OperationState.SUCCEEDED);
+    expect(host.application.store.getSession(sessionId).descriptor.deletedAt).toBeDefined();
+    const snapshot = (await clients.event.getSnapshot({})).snapshot;
+    expect(snapshot?.sessions.some((task) => task.sessionId === sessionId)).toBe(false);
+    expect(snapshot?.runs.some((run) => run.runId === original?.runId)).toBe(false);
+    expect(snapshot?.schedules).toEqual([expect.objectContaining({
+      scheduleId, sessionId, recentRuns: [expect.objectContaining({
+        triggerId: original?.triggerId, runId: original?.runId, sessionId, state: RunState.SUCCEEDED
+      })]
+    })]);
+    expect((await clients.scheduler.listSchedules({})).schedules.map((schedule) => schedule.scheduleId)).toEqual([scheduleId]);
+    expect((await clients.scheduler.listScheduleRunHistory({ scheduleId })).history).toEqual(completed.history);
+    expect(host.adapter().sendCalls).toHaveLength(1);
   });
 
   it("saves and dispatches each exact one-shot quota recovery instant in a repeated hour", async () => {
