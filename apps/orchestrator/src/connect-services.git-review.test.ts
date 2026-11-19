@@ -176,7 +176,7 @@ describe("Connect Git Review contracts", () => {
         workspaceId: "workspace-review", source: contract.GitDiffSource.UNSTAGED, ignoreWhitespace: true
       });
       const { diff } = await services.workspace.getWorkspaceDiff(request, context() as never);
-      const file = diff?.files[0];
+      const file = diff?.files?.[0];
       if (diff === undefined || file === undefined) throw new Error("The filtered change is missing from Review.");
       expect(file.relativePath).toBe(path);
       expect(file.hunks).toHaveLength(1);

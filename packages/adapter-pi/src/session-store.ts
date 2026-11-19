@@ -3,7 +3,7 @@ import { constants, createReadStream, type Stats } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, posix, relative, resolve, sep, win32 } from "node:path";
 import { CURRENT_SESSION_VERSION, SessionManager } from "@earendil-works/pi-coding-agent";
-import type { NativeSessionBinding, RemoteWorkspaceBinding } from "@joko/core";
+import type { ImportPortableNativeSessionResult, NativeSessionBinding, PortableNativeMessageIdentity, RemoteWorkspaceBinding } from "@joko/core";
 import { asPiError, piError, redactedDiagnostic } from "./errors.js";
 import { MAX_SAFE_PI_JSONL_RECORD_BYTES, StrictJsonLineDecoder } from "./jsonl.js";
 import { isRecord } from "./protocol.js";
@@ -54,6 +54,8 @@ export interface PiPortableSessionImportOptions {
   readonly generation: number;
   readonly nativeSessionId?: string;
   readonly maximumBytes?: number;
+  readonly messageIdentities?: readonly PortableNativeMessageIdentity[];
+  readonly activeEntryId?: string | null;
 }
 
 export interface PiDetachedForkMaterialization {
@@ -63,6 +65,7 @@ export interface PiDetachedForkMaterialization {
 }
 
 const DEFAULT_PORTABLE_SESSION_LIMIT_BYTES = 512 * 1024 * 1024;
+type PiCustomEntry = Extract<ReturnType<SessionManager["getEntries"]>[number], { type: "custom" }>;
 
 function remoteFreshWorkspaceRoot(workspaceRoot: string, binding: RemoteWorkspaceBinding): string {
   const paths = binding.kind === "device_peer" && /^[A-Za-z]:\\/u.test(binding.workspaceRoot) ? win32 : posix;
@@ -388,7 +391,7 @@ export class PiSessionStore {
   async importPortableSession(
     source: Uint8Array,
     options: PiPortableSessionImportOptions
-  ): Promise<NativeSessionBinding> {
+  ): Promise<ImportPortableNativeSessionResult> {
     const limit = portableSessionLimit(options.maximumBytes);
     if (!Number.isSafeInteger(options.generation) || options.generation < 1) {
       throw piError("PI_SESSION_IMPORT_GENERATION_INVALID", "Portable Session generation is invalid", "session");
@@ -398,7 +401,8 @@ export class PiSessionStore {
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(desiredId)) {
       throw piError("PI_SESSION_IMPORT_ID_INVALID", "Portable native Session ID is invalid", "session");
     }
-    const normalized = rewritePortableSessionBytes(source, canonicalWorkspace, desiredId, limit);
+    const { bytes: normalized, confirmed } = rewritePortableSessionBytes(source, canonicalWorkspace, desiredId, limit,
+      options.messageIdentities, options.activeEntryId);
     await this.initialize();
     const sharedRoot = join(this.sessionsRoot, "shared");
     await mkdir(sharedRoot, { recursive: true });
@@ -419,7 +423,7 @@ export class PiSessionStore {
       if (binding.nativeSessionId !== desiredId) {
         throw piError("PI_SESSION_IMPORT_ID_MISMATCH", "Portable native Session identity could not be materialized", "session");
       }
-      return binding;
+      return { ...binding, ...(confirmed.length === 0 ? {} : { confirmedMessageIdentities: confirmed }) };
     } catch (error) {
       await unlink(target).catch(() => undefined);
       throw asPiError(error, {
@@ -913,12 +917,28 @@ function rewritePortableSessionBytes(
   source: Uint8Array,
   workspaceRoot: string,
   nativeSessionId: string,
-  maximumBytes: number
-): Buffer {
+  maximumBytes: number,
+  messageIdentities: readonly PortableNativeMessageIdentity[] = [],
+  activeEntryId?: string | null
+): { readonly bytes: Buffer; readonly confirmed: readonly PortableNativeMessageIdentity[] } {
   inspectPortableSessionBytes(source, maximumBytes);
+  const requested = new Map(messageIdentities.map(identity => [identity.entryId, identity]));
+  const seen = new Set<string>();
+  const confirmed = new Map<string, PortableNativeMessageIdentity>();
+  const positionIds = activeEntryId === undefined ? undefined : new Set<string>();
   const lines: string[] = [];
   let recordIndex = 0;
   let outputBytes = 0;
+  let lastEntryId: string | null = null;
+  let selectedEntryCount = 0;
+  const appendRecord = (entry: Record<string, unknown> | PiCustomEntry) => {
+    const line = JSON.stringify(entry);
+    outputBytes += Buffer.byteLength(line, "utf8") + 1;
+    if (!Number.isSafeInteger(outputBytes) || outputBytes > maximumBytes) {
+      throw piError("PI_SESSION_PORTABLE_SIZE_INVALID", "Rewritten portable native Session exceeds the size limit", "session");
+    }
+    lines.push(line);
+  };
   const decoder = new StrictJsonLineDecoder({
     maxRecordBytes: Math.min(source.byteLength, maximumBytes, MAX_SAFE_PI_JSONL_RECORD_BYTES),
     onValue(value) {
@@ -933,12 +953,20 @@ function rewritePortableSessionBytes(
       } else if (value.type === "session") {
         throw piError("PI_SESSION_PORTABLE_HEADER_DUPLICATED", "Portable native Session contains a duplicate header", "session");
       }
-      const line = JSON.stringify(next);
-      outputBytes += Buffer.byteLength(line, "utf8") + 1;
-      if (!Number.isSafeInteger(outputBytes) || outputBytes > maximumBytes) {
-        throw piError("PI_SESSION_PORTABLE_SIZE_INVALID", "Rewritten portable native Session exceeds the size limit", "session");
+      if (recordIndex > 1 && typeof value.id === "string") {
+        positionIds?.add(value.id);
+        lastEntryId = value.id;
+        if (value.id === activeEntryId) selectedEntryCount += 1;
+        const expected = requested.get(value.id);
+        if (expected !== undefined) {
+          if (seen.has(value.id)) confirmed.delete(value.id);
+          else if (value.type === "message" && isRecord(value.message) && value.message.role === expected.role) {
+            confirmed.set(value.id, expected);
+          }
+          seen.add(value.id);
+        }
       }
-      lines.push(line);
+      appendRecord(next);
     }
   });
   try {
@@ -950,7 +978,19 @@ function rewritePortableSessionBytes(
       cause: error
     });
   }
-  return Buffer.from(`${lines.join("\n")}\n`, "utf8");
+  if (activeEntryId !== undefined && activeEntryId !== null && selectedEntryCount !== 1) {
+    throw piError("PI_SESSION_PORTABLE_POSITION_INVALID", "The exported native history position is absent or ambiguous.", "session");
+  }
+  if (activeEntryId !== undefined && activeEntryId !== lastEntryId) {
+    // Pi reopens at the last serialized entry. A custom entry retains the
+    // selected parent without putting another message into model context.
+    let id = randomUUID();
+    while (positionIds?.has(id)) id = randomUUID();
+    appendRecord({
+      type: "custom", id, parentId: activeEntryId, timestamp: new Date().toISOString(), customType: "joko.portable_position"
+    } satisfies PiCustomEntry);
+  }
+  return { bytes: Buffer.from(`${lines.join("\n")}\n`, "utf8"), confirmed: [...confirmed.values()] };
 }
 
 async function canonicalWorkspaceRoot(workspaceRoot: string): Promise<string> {

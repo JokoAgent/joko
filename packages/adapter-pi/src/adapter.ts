@@ -50,6 +50,7 @@ import {
   type NativeHistoryProjection,
   type NativeMessageIdentity,
   type ImportPortableNativeSessionInput,
+  type ImportPortableNativeSessionResult,
   type NativeSessionState,
   type NativeTextInferenceInput,
   type KnownCapability,
@@ -2839,7 +2840,7 @@ export class PiBackendAdapter implements
   async importPortableNativeSession(
     input: ImportPortableNativeSessionInput,
     signal: AbortSignal
-  ): Promise<NativeSessionBinding> {
+  ): Promise<ImportPortableNativeSessionResult> {
     signal.throwIfAborted();
     await this.validateTarget(input.target);
     if (input.target.remoteWorkspace !== undefined) {
@@ -2850,7 +2851,9 @@ export class PiBackendAdapter implements
     const binding = await this.#sessionStore.importPortableSession(input.bytes, {
       workspaceRoot: input.target.workspaceRoot,
       generation: input.generation,
-      ...(input.nativeSessionId === undefined ? {} : { nativeSessionId: input.nativeSessionId })
+      ...(input.nativeSessionId === undefined ? {} : { nativeSessionId: input.nativeSessionId }),
+      ...(input.messageIdentities === undefined ? {} : { messageIdentities: input.messageIdentities }),
+      ...(input.activeEntryId === undefined ? {} : { activeEntryId: input.activeEntryId })
     });
     signal.throwIfAborted();
     return binding;

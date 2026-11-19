@@ -43,7 +43,7 @@ import {
   SnapshotScopeSchema,
   StateImpact
 } from "@joko/contracts";
-import type { BlobRef } from "@joko/core";
+import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD, type BlobRef } from "@joko/core";
 import { buildPortableSessionExport, preparePortableSessionImport } from "@joko/orchestrator";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -706,14 +706,19 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     const upload = async (nativeSessionId: string) => {
       const bytes = Buffer.from([
         JSON.stringify({ type: "session", version: 3, id: nativeSessionId, timestamp, cwd: workspaceDirectory }),
-        JSON.stringify({ type: "message", id: "user-one", parentId: null, timestamp, message: { role: "user", content: "Frozen Pi history" } })
+        JSON.stringify({ type: "message", id: "user-one", parentId: null, timestamp, message: { role: "user", content: "Frozen Pi history" } }),
+        JSON.stringify({ type: "message", id: "user-abandoned", parentId: null, timestamp, message: { role: "user", content: "Rewound Pi history" } })
       ].join("\n") + "\n");
+      const nativeBindingFingerprint = createHash("sha256").update(nativeSessionId).digest("hex");
       const encoded = await buildPortableSessionExport({
         applicationVersion: "0.1.0", exportedAt: timestamp, title: "Encrypted Pi history", workspaceKind: "project",
         backendCapability: "native-portable-session-v1", password,
         nativeSession: { bytes, sha256: createHash("sha256").update(bytes).digest("hex"), nativeSessionId },
+        nativeBindingFingerprint, nativeActiveEntryId: "user-one",
         events: [{ emittedAt: Date.parse(timestamp), payload: { type: "message_complete", role: "user",
-          blocks: [{ kind: "text", text: "Frozen Pi history" }] } }],
+          blocks: [{ kind: "text", text: "Product copy of the selected Pi history" }],
+          nativeHistory: { identity: { entryId: "user-one" } } },
+          metadata: { namespace: "pi.native_history", fields: { [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: nativeBindingFingerprint } } }],
         readBlob: blob => artifacts.readBlob(blob)
       });
       const file = await artifacts.ingestBytes(encoded.bytes, { mimeType: "application/vnd.joko.session", fileName: "encrypted.jshare" });
@@ -738,8 +743,14 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     const first = await commit(await prepare(firstPackage), false);
     if (first.result === undefined) throw new Error("First Pi package returned no import result.");
     const firstId = first.result.sessionId;
-    expect(first.result).toMatchObject({ replacedSessionIds: [], fidelity: PortableSessionFidelity.FULL });
+    expect(first.result).toMatchObject({ replacedSessionIds: [], fidelity: PortableSessionFidelity.FULL, status: PortableSessionImportStatus.READY });
     expect(store.getSession(firstId).descriptor.binding.nativeSessionId).not.toBe("frozen-history");
+    const timeline = await paired.clients.session.listSessionTimeline({ sessionId: firstId });
+    const visibleMessages = timeline.events.flatMap(event => event.payload?.kind.case === "messageCompleted" ? [event.payload.kind.value] : []);
+    expect(visibleMessages).toMatchObject([{
+      role: MessageRole.USER, nativeIdentity: { entryId: "user-one" },
+      blocks: [{ content: { case: "text", value: "Product copy of the selected Pi history" } }]
+    }]);
 
     const secondDraftId = await prepare(secondPackage);
     const refusedOperation = randomUUID();

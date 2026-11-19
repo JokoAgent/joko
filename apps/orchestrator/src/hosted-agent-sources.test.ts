@@ -365,7 +365,12 @@ it("preserves a paired Source's remote project authority and follows an adopted 
     }, { timeout: 10_000 });
     await scheduler.tick();
     expect(adoptedTaskPrompts).toEqual([expect.stringContaining("Adopt the same task on B"), "Run the saved Automation on B"]);
-    expect(opens.filter(item => item.sessionId === originalSessionId)).toEqual([expect.objectContaining({ targetId: "automation-project" })]);
+    const adoptedOpens = opens.filter(item => item.sessionId === originalSessionId);
+    const adoptedBinding = store.getSession(originalSessionId).descriptor.binding;
+    const opening = { backendId: "device-pi", targetId: "automation-project", nativeSessionId: adoptedBinding.nativeSessionId };
+    expect(adoptedOpens[0]).toMatchObject({ ...opening, start: "create" });
+    expect(adoptedOpens).toHaveLength(2);
+    expect(adoptedOpens[1]).toMatchObject({ ...opening, start: "resume", generation: adoptedBinding.generation });
     expect(store.getSchedule(scheduleId)).toMatchObject({ enabled: false, name: "Renamed original plan", lastRunAt: dueAt });
 
     let releaseQuota!: () => void;

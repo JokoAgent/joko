@@ -206,28 +206,33 @@ export function omitUnavailablePortableProjectionBlobs(
 }
 
 export function portableProjectionEventPayloads(
-  projection: PortableSessionProjection
+  projection: PortableSessionProjection,
+  nativeMessageEntries?: ReadonlyMap<number, string>
 ): readonly { readonly emittedAt: number; readonly payload: EventPayload }[] {
   validatePortableSessionProjection(projection);
-  const events: { sourceOrder: number; emittedAt: number; payload: EventPayload }[] = projection.messages.map((message) => ({
-    sourceOrder: message.sourceOrder,
-    emittedAt: message.emittedAt,
-    payload: {
-      type: "message_complete",
-      role: message.role,
-      blocks: message.blocks,
-      ...(message.acceptedInput === undefined ? {} : { acceptedInput: message.acceptedInput }),
-      ...(message.usage === undefined ? {} : { usage: message.usage }),
-      ...(message.generationDurationMs === undefined
-        ? {}
-        : { generationDurationMs: message.generationDurationMs }),
-      ...(message.generationReliable === undefined
-        ? {}
-        : { generationReliable: message.generationReliable }),
-      ...(message.automationOrigin === undefined ? {} : { automationOrigin: message.automationOrigin }),
-      ...(message.inputDelivery === undefined ? {} : { inputDelivery: message.inputDelivery })
-    }
-  }));
+  const events: { sourceOrder: number; emittedAt: number; payload: EventPayload }[] = projection.messages.map((message) => {
+    const entryId = nativeMessageEntries?.get(message.sourceOrder);
+    return {
+      sourceOrder: message.sourceOrder,
+      emittedAt: message.emittedAt,
+      payload: {
+        type: "message_complete",
+        role: message.role,
+        blocks: message.blocks,
+        ...(entryId === undefined ? {} : { nativeHistory: { identity: { entryId } } }),
+        ...(message.acceptedInput === undefined ? {} : { acceptedInput: message.acceptedInput }),
+        ...(message.usage === undefined ? {} : { usage: message.usage }),
+        ...(message.generationDurationMs === undefined
+          ? {}
+          : { generationDurationMs: message.generationDurationMs }),
+        ...(message.generationReliable === undefined
+          ? {}
+          : { generationReliable: message.generationReliable }),
+        ...(message.automationOrigin === undefined ? {} : { automationOrigin: message.automationOrigin }),
+        ...(message.inputDelivery === undefined ? {} : { inputDelivery: message.inputDelivery })
+      }
+    };
+  });
   return [...events, ...projection.artifacts].sort((left, right) => left.sourceOrder - right.sourceOrder)
     .map(({ emittedAt, payload }) => ({ emittedAt, payload }));
 }

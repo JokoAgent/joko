@@ -4124,6 +4124,48 @@ describe("SessionHost", () => {
     })]);
   });
 
+  it("exports the active product messages without resurfacing a discarded native branch", async () => {
+    const fixture = await createFixture(new PortableFakeAdapter());
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-portable-active-branch", connection: fixture.connection, targetId: "target-one",
+      title: "Active branch", fastMode: false, permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    const { backendId, targetId, binding } = fixture.store.getSession(sessionId).descriptor;
+    const scope = { backendId, targetId, sessionId, generation: binding.generation };
+    const metadata = { namespace: "fake.native_history", fields: {
+      nativeHydration: true, [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: nativeBindingFingerprint(binding.opaqueRef)
+    } };
+    const messages = [
+      ["abandoned-branch", "Output on the abandoned branch"],
+      ["selected-branch", "Output on the selected branch"]
+    ] as const;
+    for (const [entryId, text] of messages) {
+      fixture.store.appendEvent({
+        ...scope, metadata, traceId: `portable:${entryId}`, payload: {
+          type: "message_complete", role: "assistant", blocks: [{ kind: "text", text }],
+          nativeHistory: { identity: { entryId } }
+        }
+      });
+    }
+    fixture.store.appendEvent({
+      ...scope, traceId: "portable:branch-marker", payload: {
+        type: "native_session_changed", opaqueRef: binding.opaqueRef, leafId: "selected-branch",
+        ...(binding.nativeSessionId === undefined ? {} : { nativeSessionId: binding.nativeSessionId })
+      }
+    });
+    fixture.store.appendEvent({ ...scope, traceId: "portable:product-message", payload: {
+      type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Local product history" }]
+    } });
+    expect(fixture.store.listEvents({ sessionId, messageCompleteOnly: true })).toHaveLength(3);
+    const exported = await fixture.host.exportPortableSession({ sessionId });
+    const decoded = decodePortableSessionPackage((await fixture.artifacts.readBlob(exported.artifact)).data);
+    const projection = decodePortableSessionProjection(decoded.entries.find(entry => entry.path === "projection/messages.json")!.bytes);
+    expect(projection.messages.map(message => message.blocks)).toEqual([
+      [{ kind: "text", text: "Output on the selected branch" }],
+      [{ kind: "text", text: "Local product history" }]
+    ]);
+  });
+
   it("retires the original portable export when the task clears during an active export's media read", async () => {
     const fixture = await createFixture(new PortableFakeAdapter());
     const sessionId = (await fixture.host.createSession({ operationId: "create-export-before-clear", connection: fixture.connection,
@@ -4805,6 +4847,65 @@ describe("SessionHost", () => {
       value: { sessionId: importedSessionId, status: "ready" }
     });
     expect(adapter.importedNativeText).toHaveLength(1);
+  });
+
+  it("reconciles only a confirmed portable message with its native identity after a failed first activation", async () => {
+    const adapter = new PortableFakeAdapter();
+    const importNative = adapter.importPortableNativeSession.bind(adapter);
+    const readHistory = adapter.getNativeHistoryProjection.bind(adapter);
+    const entryId = "portable-native-message";
+    const confirmed = { entryId, role: "assistant" } as const;
+    const observeImport = vi.spyOn(adapter, "importPortableNativeSession").mockImplementation(async (input, signal) => ({
+      ...await importNative(input, signal), confirmedMessageIdentities: [confirmed]
+    }));
+    vi.spyOn(adapter, "getNativeHistoryProjection").mockImplementation(async context => {
+      const history = await readHistory(context);
+      return { ...history, events: history.events.map(event => ({
+        ...event, metadata: { namespace: "fake.native_history", fields: { nativeHydration: true } }
+      })) };
+    });
+    const fixture = await createFixture(adapter);
+    const sourceId = (await fixture.host.createSession({ operationId: "create-portable-linked-history",
+      connection: fixture.connection, targetId: "target-one", title: "Transfer history",
+      permissionMode: "ask", fastMode: false, planMode: false })).value.sessionId;
+    const { backendId, targetId, binding } = fixture.store.getSession(sourceId).descriptor;
+    const caption = "Product history retained from its own file.";
+    const blocks = [{ kind: "text" as const, text: caption }];
+    for (const linked of [true, false]) {
+      fixture.store.appendEvent({
+        backendId, targetId, sessionId: sourceId, generation: binding.generation, traceId: `portable-linked:${linked}`,
+        ...(linked ? { metadata: { namespace: "fake.native_history", fields: {
+          nativeHydration: true, [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: nativeBindingFingerprint(binding.opaqueRef)
+        } } } : {}),
+        payload: { type: "message_complete", role: "assistant", blocks, ...(linked ? { nativeHistory: { identity: { entryId } } } : {}) }
+      });
+    }
+    const exported = await fixture.host.exportPortableSession({ sessionId: sourceId });
+    expect(exported.messageCount).toBe(2);
+    adapter.portableActivationFailuresRemaining = 1;
+    const imported = await fixture.host.importPortableSession({ operationId: "import-portable-linked-history",
+      connection: fixture.connection, targetId, package: exported.artifact,
+      permissionMode: "ask", fastMode: false, planMode: false, overwrite: false });
+    const sessionId = imported.value.sessionId;
+    expect(observeImport).toHaveBeenCalledWith(expect.objectContaining({ messageIdentities: [confirmed] }), expect.any(AbortSignal));
+    expect(imported.value.status).toBe("imported_activation_failed");
+    const visible = () => fixture.store.listEvents({ sessionId, activeNativeTimeline: true, messageCompleteOnly: true });
+    expect(visible().map(event => event.payload)).toEqual([
+      { type: "message_complete", role: "assistant", blocks, nativeHistory: { identity: { entryId } } },
+      { type: "message_complete", role: "assistant", blocks }
+    ]);
+    await expect(fixture.host.retryPortableSessionActivation({ connection: fixture.connection, sessionId }))
+      .resolves.toEqual({ sessionId, status: "ready" });
+    const adopted = visible();
+    expect(adopted).toHaveLength(2);
+    expect(adopted.map(event => event.payload)).toEqual(expect.arrayContaining([
+      { type: "message_complete", role: "assistant", blocks },
+      { type: "message_complete", role: "assistant", blocks, nativeHistory: { identity: { entryId } } }
+    ]));
+    expect(adopted.find(event => event.id.startsWith("native-"))?.metadata?.fields["nativeHydration"]).toBe(true);
+    await fixture.host.detach(sessionId);
+    await fixture.host.resume(sessionId);
+    expect(visible().map(event => event.id)).toEqual(adopted.map(event => event.id));
   });
 
   it("keeps a committed portable task when its activation receipt cannot be updated", async () => {

@@ -79,7 +79,7 @@ describe("Connect service composition", () => {
           receipts: [{ kind: contract.PartnerLearningKind.MEMORY, entryId: "memory-1", title: "Preference", action: contract.PartnerLearningAction.CREATED }] } } });
     }
     expect(getFeedback).toHaveBeenCalledTimes(3);
-    expect(connections.fence).toHaveBeenCalledOnce();
+    expect(connections.fence.mock.calls).toEqual(Array.from({ length: 5 }, () => [{ id: "owner" }]));
     signal.abort(); await iterator.return?.();
   });
   it("registers every public service and RPC handler", () => {

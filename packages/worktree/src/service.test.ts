@@ -195,7 +195,7 @@ describe("EphemeralWorktreeService", () => {
     const tracked = join(path, "tracked.txt");
     await writeFile(tracked, "original staged edit\n");
     await git(path, ["add", "tracked.txt"]);
-    const metadata = await realpath(await git(path, ["rev-parse", "--absolute-git-dir"]));
+    const metadata = await realpath((await git(path, ["rev-parse", "--absolute-git-dir"])).replace(/\r?\n$/u, ""));
     const metadataRoot = await realpath(join(fixture.repositoryRoot, ".git", "worktrees"));
     const metadataRelative = relative(metadataRoot, metadata);
     if (!metadataRelative || isAbsolute(metadataRelative) || metadataRelative === ".." || metadataRelative.startsWith(`..${sep}`)) {

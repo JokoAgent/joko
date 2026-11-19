@@ -1,4 +1,5 @@
 import type {
+  EventQuery,
   InteractionRecord,
   MessagingInboundRequestRecord,
   OperationalStore,
@@ -20,7 +21,16 @@ export function visitVisibleSessionEvents(
   visitor: (event: PersistedEvent) => void,
   pageSize = COMPLETE_SCAN_PAGE_SIZE
 ): void {
-  visitSessionEvents(store, sessionId, visitor, false, pageSize);
+  visitSessionEvents(store, sessionId, visitor, {}, pageSize);
+}
+
+export function visitActiveSessionTimelineEvents(
+  store: OperationalStore,
+  sessionId: string,
+  visitor: (event: PersistedEvent) => void,
+  pageSize = COMPLETE_SCAN_PAGE_SIZE
+): void {
+  visitSessionEvents(store, sessionId, visitor, { activeNativeTimeline: true }, pageSize);
 }
 
 export function visitSessionEventsIncludingTombstones(
@@ -29,14 +39,14 @@ export function visitSessionEventsIncludingTombstones(
   visitor: (event: PersistedEvent) => void,
   pageSize = COMPLETE_SCAN_PAGE_SIZE
 ): void {
-  visitSessionEvents(store, sessionId, visitor, true, pageSize);
+  visitSessionEvents(store, sessionId, visitor, { includeTombstoned: true }, pageSize);
 }
 
 function visitSessionEvents(
   store: OperationalStore,
   sessionId: string,
   visitor: (event: PersistedEvent) => void,
-  includeTombstoned: boolean,
+  visibility: Pick<EventQuery, "activeNativeTimeline" | "includeTombstoned">,
   pageSize: number
 ): void {
   assertPageSize(pageSize);
@@ -44,7 +54,7 @@ function visitSessionEvents(
   while (true) {
     const page = store.listEvents({
       sessionId,
-      ...(includeTombstoned ? { includeTombstoned: true } : {}),
+      ...visibility,
       ...(afterCursor === undefined ? {} : { afterCursor }),
       limit: pageSize
     });

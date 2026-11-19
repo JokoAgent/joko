@@ -363,12 +363,26 @@ export interface StoredPortableNativeSessionInput {
   readonly assertCurrent: () => void;
 }
 
+export interface PortableNativeMessageIdentity {
+  readonly entryId: string;
+  readonly role: "user" | "assistant";
+}
+
 export interface ImportPortableNativeSessionInput {
   readonly target: TargetDescriptor;
   readonly bytes: Uint8Array;
   readonly generation: number;
   /** Optional package-local identity. An Adapter may replace it to avoid collisions. */
   readonly nativeSessionId?: string;
+  /** Product message identities to verify against the native persistence being imported. */
+  readonly messageIdentities?: readonly PortableNativeMessageIdentity[];
+  /** The exported native position. Null means the task start. */
+  readonly activeEntryId?: string | null;
+}
+
+export interface ImportPortableNativeSessionResult extends NativeSessionBinding {
+  /** Requested identities observed with the same role in the materialized native history. */
+  readonly confirmedMessageIdentities?: readonly PortableNativeMessageIdentity[];
 }
 
 /**
@@ -752,7 +766,7 @@ export interface BackendAdapter {
   importPortableNativeSession?(
     input: ImportPortableNativeSessionInput,
     signal: AbortSignal
-  ): Promise<NativeSessionBinding>;
+  ): Promise<ImportPortableNativeSessionResult>;
   getTree(context: AdapterContext): Promise<SessionTree>;
   navigateTree(
     target: import("./types.js").NativeNavigationTarget,
