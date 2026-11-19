@@ -5,14 +5,14 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
-import { resetWorktreeRemovalPreflightCache } from "../worktree-removal-preflight.js";
+import * as worktreeRemoval from "../worktree-removal-preflight.js";
 import { VisualHarness } from "./VisualHarness.js";
 
 const roots: Root[] = [];
 
 beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-  resetWorktreeRemovalPreflightCache();
+  worktreeRemoval.resetWorktreeRemovalPreflightCache();
   window.localStorage.clear();
   window.history.replaceState(null, "", "/__visual-harness__?scenario=session&running=1&queue=1&interaction=0&theme=light");
   Object.defineProperty(window, "matchMedia", {
@@ -328,6 +328,29 @@ describe("Session visual harness", () => {
 
     expect(document.documentElement.dataset.harnessLastAction).toBe("archive:session-2:true");
     expect(document.body.querySelector(".modal[aria-modal='true']")).toBeNull();
+  }, 10_000);
+
+  it("keeps the later task selection when a sidebar archive settles", async () => {
+    const preview = Promise.withResolvers<worktreeRemoval.WorktreeRemovalPreflightSummary>();
+    const inspect = vi.spyOn(worktreeRemoval, "summarizeSessionArchivePreflights").mockReturnValueOnce(preview.promise);
+    onTestFinished(() => { inspect.mockRestore(); });
+    window.history.replaceState(null, "", "/__visual-harness__?scenario=session&running=0&interaction=0&theme=light");
+    const container = document.body.appendChild(document.createElement("div"));
+    await renderHarness(container);
+    const task = (id: string) => required(container.querySelector<HTMLElement>(`.sidebar [data-session-id='${id}']`));
+    await act(async () => { task("session-2").click(); await flushUi(); });
+    expect(task("session-2").getAttribute("aria-current")).toBe("page");
+    const archive = required(task("session-2").closest(".session-row")?.querySelector<HTMLButtonElement>(".session-row__quick-archive"));
+    await act(async () => { archive.click(); await flushUi(); });
+    expect(inspect).toHaveBeenCalledExactlyOnceWith(["session-2"], expect.any(Function));
+    await act(async () => { task("session-3").click(); await flushUi(); });
+    expect(task("session-3").getAttribute("aria-current")).toBe("page");
+    expect(container.querySelector(".session-section--pinned [data-session-id='session-1']")).not.toBeNull();
+
+    await act(async () => { preview.resolve({ clean: 1, dirty: 0, unknown: 0 }); await flushUi(); });
+    expect(document.documentElement.dataset.harnessLastAction).toBe("archive:session-2:true");
+    expect(task("session-3").getAttribute("aria-current")).toBe("page");
+    expect(task("session-1").getAttribute("aria-current")).toBeNull();
   }, 10_000);
 
   it("warns before preserving a dirty worktree through task archival", async () => {
