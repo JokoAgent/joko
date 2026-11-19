@@ -3,6 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { RotateCw } from "lucide-react";
+import { copyTextOnInsecureHttp } from "../clipboard-action.js";
 import type { AppController } from "../controller.js";
 import type { TerminalCapabilitiesView, TerminalView } from "../model.js";
 import { readTerminalAppearance } from "../terminal-appearance.js";
@@ -93,7 +94,14 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
     terminal.attachCustomKeyEventHandler((event) => {
       if (event.type === "keydown" && event.code === "KeyC" && (event.ctrlKey || event.metaKey) && !event.altKey && !event.isComposing && terminal.hasSelection()) {
         event.preventDefault();
-        void ownerWindow.navigator.clipboard?.writeText(terminal.getSelection()).catch(() => undefined);
+        const text = terminal.getSelection();
+        const clipboard = ownerWindow.navigator.clipboard;
+        if (clipboard?.writeText !== undefined) void clipboard.writeText(text).catch(() => undefined);
+        else {
+          let copied = false;
+          try { copied = copyTextOnInsecureHttp(text, slot); } catch { /* The browser may deny synchronous copy. */ }
+          setInputNotice(copied ? undefined : latest.current.t("workspace.clipboardUnavailable"));
+        }
         return false;
       }
       return true;
