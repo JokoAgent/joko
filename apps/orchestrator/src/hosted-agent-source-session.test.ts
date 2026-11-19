@@ -5,6 +5,7 @@ import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createClient, createRouterTransport } from "@connectrpc/connect";
 import { createPiAdapter } from "@joko/adapter-pi";
 import { HostedAgentSourceAdapter } from "@joko/adapter-hosted";
+import { JokoError } from "@joko/core";
 import type { AdapterContext, BackendDescriptor, Capability } from "@joko/core";
 import { HostedAgentService } from "@joko/contracts";
 import { OperationalStore, HostedAgentStore } from "@joko/store";
@@ -13,7 +14,7 @@ import { ArtifactStore } from "./artifact-store.js";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { SessionHost } from "./session-host.js";
 import { BackendInstanceRegistry } from "./backend-instance-registry.js";
-import { HostedAgentHost } from "./hosted-agent-host.js";
+import { HostedAgentHost, HostedAgentHostError } from "./hosted-agent-host.js";
 import { HostedAgentRun } from "./hosted-agent-run.js";
 import { HostedAgentSessionSlots } from "./hosted-agent-limits.js";
 import { HostedAgentConnectClient } from "./hosted-agent-connect-client.js";
@@ -96,6 +97,7 @@ it("dispatches the durable product queue through a native Source Adapter and res
   const nativeDatabase = new OperationalStore(join(root, "native.sqlite")), slots = new HostedAgentSessionSlots();
   const nativeStore = new HostedAgentStore(nativeDatabase), principal = { id: "source-hub", deviceId: "original-device", trust: "owner" as const, assertCurrent: () => {} };
   let enabled = true, idleClockOffset = 0, releasedWorkspaces = 0;
+  let phase = "initializing";
   const nativeStarts: { readonly start: string; readonly nativeSessionId: string }[] = [];
   const nativeHost = new HostedAgentHost({ providerIdleMinutes: () => 30,
     createRun: options => { nativeStarts.push({ start: options.start, nativeSessionId: options.nativeSessionId }); return HostedAgentRun.create(options); },
@@ -117,6 +119,19 @@ it("dispatches the durable product queue through a native Source Adapter and res
       providers: [{ id: "provider", api: "openai-completions", baseUrl: `http://127.0.0.1:${address.port}/v1`, apiKeyEnv: "MODEL_NODE_KEY",
         models: [{ id: "native-model", contextWindow: 32768, maxTokens: 1024, input: ["text", "image"] }] }] });
     } }) });
+  const callNative = nativeHost.call.bind(nativeHost);
+  vi.spyOn(nativeHost, "call").mockImplementation(async (...parameters) => {
+    try { return await callNative(...parameters); }
+    catch (error) {
+      if (parameters[3].kind === "history") {
+        const code = error instanceof HostedAgentHostError ? error.code
+          : error instanceof JokoError ? error.publicError.code : error instanceof Error ? error.name : "unknown";
+        const frame = error instanceof Error ? error.stack?.split("\n").slice(1, 3).map(line => line.trim().slice(0, 200)) : undefined;
+        console.info("Source native history failed", JSON.stringify({ phase, enabled, releasedWorkspaces, activeSlots: slots.summary().total, code, frame }));
+      }
+      throw error;
+    }
+  });
   const client = new HostedAgentConnectClient(createClient(HostedAgentService, createRouterTransport(router => {
     router.service(HostedAgentService, createHostedAgentConnectService({ host: nativeHost, authenticate: () => principal }));
   })), principal.assertCurrent);
@@ -214,6 +229,7 @@ it("dispatches the durable product queue through a native Source Adapter and res
     const upload = await source.artifacts.ingestBytes(Buffer.from("RETAINED_SOURCE_UPLOAD"), { fileName: "upload.txt", mimeType: "text/plain" });
     const uploadBlob = source.store.getArtifact(upload.id).blob;
     for (const operationId of ["first-source-turn", "source-turn-with-upload", "restored-source-turn"]) {
+      phase = operationId;
       const resource = (await source.host.getResources(sessionId)).find(value => value.id === "source-approved")!;
       expect(resource.state).toBe("loaded");
       const input = { operationId, sessionId, connection, prompt: { text: "Read the original files and any retained upload.", images: [{ blob: imageBlob }], files: operationId === "source-turn-with-upload" ? [{ blob: uploadBlob }] : [],
@@ -251,13 +267,17 @@ it("dispatches the durable product queue through a native Source Adapter and res
     ]);
     expect(imageRequests).toBe(6);
     expect(source.store.listSettingsByKeyPrefix("service", "hosted-inputs.v1", "")).toHaveLength(1);
+    phase = "provider-paused";
     enabled = false; await nativeHost.sweep();
     const last = source.host.enqueueInput({ operationId: "paused-source-turn", sessionId, connection,
       prompt: { text: "Do not select a local substitute.", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
     source.host.requestQueueDrain(sessionId);
     await vi.waitFor(() => expect(source.store.getQueueItem(last.queueItemId).state).toBe("failed"), { timeout: 15_000 });
     expect(modelRequests).toBe(6); expect(source.store.getSession(sessionId).descriptor.backendId).toBe(sourceId);
+    phase = "provider-resumed";
     enabled = true; await source.host.resume(sessionId);
+
+    phase = "native-deletion";
     await source.host.deleteNativeSession(sessionId, "delete-source-native");
     expect(slots.summary().total).toBe(0); expect(modelRequests).toBe(6);
     expect(source.store.listSettingsByKeyPrefix("service", "hosted-inputs.v1", "")).toEqual([]);
