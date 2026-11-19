@@ -264,6 +264,7 @@ import type {
   SessionLifecycleCleanupPhase,
   SessionLifecycleCleanupRecord,
   NativeCatalogAdoptionRecord,
+  ManagedTargetTrashIntent,
   PortableReplacementCleanupRecord,
   SessionSnapshot,
   SessionAttentionRecord,
@@ -9393,6 +9394,46 @@ export class OperationalStore {
     const operation = this.findOperation<T>(id);
     if (operation === undefined) throw new NotFoundError("Operation", id);
     return operation;
+  }
+
+  /** Settle the original client claim from a verified, already observed directory move. */
+  settleRecoveredManagedTargetTrash(input: { readonly targetId: string; readonly targetRevision: bigint;
+    readonly intent: ManagedTargetTrashIntent; readonly outcome: "moved" | "not-moved" }): void {
+    this.transaction(() => {
+      const { intent } = input, target = this.getTarget(input.targetId);
+      const metadata = isRecord(target.metadata) ? target.metadata : {};
+      const { pendingManagedWorkspaceTrash: pending, state, ...retained } = metadata;
+      const operation = this.getOperation(intent.operationId);
+      const payload = isRecord(operation.body) && isRecord(operation.body["payload"]) ? operation.body["payload"] : undefined;
+      const value = isRecord(payload?.["value"]) ? payload["value"] : undefined;
+      if (target.revision !== input.targetRevision || metadata["deletedAt"] !== undefined || state !== "deleting"
+        || !target.descriptor.managed || target.descriptor.remoteWorkspace !== undefined || target.descriptor.workspaceRoot !== intent.workspaceRoot
+        || !isRecord(pending) || operationBodyHash(pending) !== operationBodyHash(intent)
+        || operation.connectionId === undefined || operation.kind !== "deleteTarget" || operation.completionMode !== "external_effect"
+        || operation.bodyHash !== intent.bodyHash || payload?.["case"] !== "deleteTarget" || value?.["targetId"] !== input.targetId
+        || value?.["deleteManagedWorkspace"] !== true
+        || operation.status !== "started" && !(operation.status === "failed" && operation.error?.code === "EFFECT_OUTCOME_UNKNOWN")) {
+        throw new StoreError("The managed workspace recovery does not own the original Target and Operation.");
+      }
+      const moved = input.outcome === "moved";
+      if (moved && this.listSessions({ targetId: input.targetId, includeArchived: true, includeDeleted: false, limit: 1 }).length > 0) {
+        throw new StoreError("The managed workspace is still referenced by a product task.");
+      }
+      this.upsertTarget(target.descriptor, moved ? { ...retained, state: "archived", deletedAt: intent.startedAt,
+        deletionReason: "managed workspace moved to trash", managedWorkspaceTrashPath: intent.trashPath, deletionOperationId: operation.id }
+        : { ...retained, ...(intent.previousState === undefined ? {} : { state: intent.previousState }) });
+      const response = moved ? { accepted: true, resultCase: "target", entityId: input.targetId } : undefined;
+      const error = moved ? undefined : { code: "WORKSPACE_TRASH_NOT_MOVED", message: "The managed workspace stayed at its original path.",
+        phase: "effect", retryable: true, stateMayHaveChanged: false, recovery: "Confirm the project deletion again to start a new operation." };
+      const settled = this.database.prepare(`
+        UPDATE operations SET status = ?, response_json = ?, error_json = ?, updated_at = ?, revision = ?
+        WHERE id = ? AND body_hash = ? AND status = ?
+      `).run(moved ? "completed" : "failed", response === undefined ? null : serializeJson(response),
+        error === undefined ? null : serializeJson(error), this.now(), asSqlInteger(this.requireActiveRevision()),
+        operation.id, intent.bodyHash, operation.status);
+      if (settled.changes !== 1) throw new OperationInProgressError(operation.id);
+      this.currentFrame().operationChanges.push(operation.id);
+    });
   }
 
   findOperation<T = unknown>(id: string): OperationRecord<T> | undefined {

@@ -1,13 +1,16 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, realpath, rename } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
+import type { ManagedTargetTrashIntent, OperationalStore } from "@joko/store";
+
+type DirectoryIdentity = ManagedTargetTrashIntent["directory"];
 
 export interface ManagedWorkspaceTrashRequest {
   readonly managedRoot: string;
   readonly workspaceRoot: string;
   readonly targetId: string;
   readonly operationId: string;
-  readonly assertMoveAllowed?: () => void;
+  readonly beforeMove?: (directory: DirectoryIdentity, trashedPath: string) => void;
 }
 
 export interface ManagedWorkspaceTrashResult {
@@ -57,6 +60,7 @@ export async function moveManagedWorkspaceToTrash(
     throw error;
   });
   if (destination !== undefined) {
+    if (request.beforeMove !== undefined) throw new Error("The original workspace move requires its recorded receipt.");
     if (await pathExists(workspaceRoot)) {
       throw new Error("Managed workspace trash destination already exists while the source is still present.");
     }
@@ -64,10 +68,12 @@ export async function moveManagedWorkspaceToTrash(
     return { originalRoot: workspaceRoot, trashRoot, trashedPath };
   }
 
-  await assertCanonicalDirectory(workspaceRoot, "Managed workspace");
-  request.assertMoveAllowed?.();
+  const directory = await assertCanonicalDirectory(workspaceRoot, "Managed workspace");
+  if (request.beforeMove !== undefined && directory.inode === "0") throw new Error("The managed workspace has no stable directory identity.");
+  request.beforeMove?.(directory, trashedPath);
   await rename(workspaceRoot, trashedPath);
-  await assertCanonicalDirectory(trashedPath, "Trashed managed workspace");
+  const moved = await assertCanonicalDirectory(trashedPath, "Trashed managed workspace");
+  if (request.beforeMove !== undefined && !sameDirectory(directory, moved)) throw new Error("The managed workspace changed during the move.");
   return { originalRoot: workspaceRoot, trashRoot, trashedPath };
 }
 
@@ -82,8 +88,63 @@ export function managedWorkspaceTrashPath(request: ManagedWorkspaceTrashRequest)
   return resolve(managedRoot, ".trash", `workspace-${digest}`);
 }
 
-async function assertCanonicalDirectory(path: string, label: string): Promise<void> {
-  const info = await lstat(path).catch((error: unknown) => {
+/** Inspect the original two paths without repeating the external effect. */
+export async function inspectManagedWorkspaceTrash(
+  managedRoot: string, targetId: string, intent: ManagedTargetTrashIntent
+): Promise<"moved" | "not-moved" | "unknown"> {
+  if (intent.managedRoot !== managedRoot || !isStrictDescendant(managedRoot, intent.workspaceRoot)
+    || managedWorkspaceContainsPath(resolve(managedRoot, ".trash"), intent.workspaceRoot)
+    || managedWorkspaceTrashPath({ managedRoot, targetId, workspaceRoot: intent.workspaceRoot, operationId: intent.operationId }) !== intent.trashPath) {
+    return "unknown";
+  }
+  try {
+    await assertCanonicalDirectory(managedRoot, "Managed workspace root");
+    const sourceExists = await pathExists(intent.workspaceRoot);
+    const trashExists = await pathExists(intent.trashPath);
+    if (sourceExists === trashExists) return "unknown";
+    const observed = await assertCanonicalDirectory(sourceExists ? intent.workspaceRoot : intent.trashPath, "Managed workspace evidence");
+    if (!sameDirectory(intent.directory, observed)) return "unknown";
+    // A separately recreated source or destination must remain untouched.
+    if (await pathExists(sourceExists ? intent.trashPath : intent.workspaceRoot)) return "unknown";
+    return sourceExists ? "not-moved" : "moved";
+  } catch { return "unknown"; }
+}
+
+export async function recoverManagedWorkspaceTrash(store: OperationalStore, managedRoot: string): Promise<void> {
+  for (const target of store.listTargets()) {
+    if (!isRecord(target.metadata) || !Object.hasOwn(target.metadata, "pendingManagedWorkspaceTrash")) continue;
+    const targetId = target.descriptor.id;
+    try {
+      const intent = readTrashIntent(target.metadata["pendingManagedWorkspaceTrash"]);
+      const outcome = await inspectManagedWorkspaceTrash(managedRoot, targetId, intent);
+      if (outcome === "unknown") throw new Error("The original workspace location is uncertain.");
+      store.settleRecoveredManagedTargetTrash({ targetId, targetRevision: target.revision, intent, outcome });
+    } catch {
+      store.appendDiagnostic({ severity: "warning", component: "workspace", code: "MANAGED_WORKSPACE_TRASH_UNCONFIRMED",
+        message: "The original managed project deletion could not be confirmed.", details: { targetId } });
+    }
+  }
+}
+
+function readTrashIntent(value: unknown): ManagedTargetTrashIntent {
+  if (!isRecord(value) || value["format"] !== 1 || typeof value["operationId"] !== "string"
+    || typeof value["bodyHash"] !== "string" || !/^sha256:[a-f0-9]{64}$/u.test(value["bodyHash"])
+    || typeof value["workspaceRoot"] !== "string" || typeof value["managedRoot"] !== "string" || typeof value["trashPath"] !== "string"
+    || typeof value["startedAt"] !== "number" || !Number.isSafeInteger(value["startedAt"])
+    || value["previousState"] !== undefined && typeof value["previousState"] !== "string") throw new Error("The managed workspace recovery record is invalid.");
+  const directory = value["directory"];
+  if (!isRecord(directory) || ["device", "inode", "birthtime"].some(key => {
+    const entry = directory[key];
+    return typeof entry !== "string" || !/^-?[0-9]{1,32}$/u.test(entry);
+  })) {
+    throw new Error("The managed workspace directory identity is invalid.");
+  }
+  normalizedAbsolute(value["workspaceRoot"], "Managed workspace");
+  return value as unknown as ManagedTargetTrashIntent;
+}
+
+async function assertCanonicalDirectory(path: string, label: string): Promise<DirectoryIdentity> {
+  const info = await lstat(path, { bigint: true }).catch((error: unknown) => {
     throw new Error(`${label} is unavailable.`, { cause: error });
   });
   if (!info.isDirectory() || info.isSymbolicLink()) {
@@ -95,6 +156,18 @@ async function assertCanonicalDirectory(path: string, label: string): Promise<vo
   if (!samePath(canonical, path)) {
     throw new Error(`${label} contains a path alias, symlink, or junction.`);
   }
+  const confirmed = await lstat(path, { bigint: true });
+  if (!confirmed.isDirectory() || confirmed.isSymbolicLink() || confirmed.dev !== info.dev || confirmed.ino !== info.ino
+    || confirmed.birthtimeNs !== info.birthtimeNs) throw new Error(`${label} changed while its identity was read.`);
+  return { device: info.dev.toString(), inode: info.ino.toString(), birthtime: info.birthtimeNs.toString() };
+}
+
+function sameDirectory(first: DirectoryIdentity, second: DirectoryIdentity): boolean {
+  return first.inode !== "0" && first.device === second.device && first.inode === second.inode && first.birthtime === second.birthtime;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function normalizedAbsolute(value: string, label: string): string {
