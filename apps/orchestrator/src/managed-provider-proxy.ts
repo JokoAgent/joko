@@ -861,13 +861,13 @@ export class ManagedProviderProxy {
     // Responses reasoning state can only travel back to the exact route that produced it.
     const signaturePrefix = createHash("sha256").update(JSON.stringify([route.backendId, route.providerId, route.modelId, route.generationId]))
       .digest("base64url") + "/";
-    let body: Buffer;
+    let body: string;
     try {
-      body = Buffer.from(JSON.stringify(prepareClaudeResponsesRequest(parsed, {
+      body = JSON.stringify(prepareClaudeResponsesRequest(parsed, {
         model: route.modelId, signaturePrefix, supportsImages: route.supportsImages, maxOutputTokens
-      })));
+      }));
     } catch { fail(response, 400); return; }
-    if (body.byteLength > BODY_LIMIT) { fail(response, 413); return; }
+    if (Buffer.byteLength(body, "utf8") > BODY_LIMIT) { fail(response, 413); return; }
     const headers = new Headers({ "content-type": "application/json", accept: "text/event-stream, application/json" });
     for (const [name, value] of Object.entries(route.headers)) {
       if (name.toLowerCase() !== SMART_TOKEN_HEADER) headers.set(name, value);
