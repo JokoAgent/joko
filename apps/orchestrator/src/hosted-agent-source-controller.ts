@@ -36,7 +36,8 @@ export function createHostedAgentSourceController(options: {
   readonly resolveProxy?: HostedAgentClaudeWebFetchOptions["resolveProxy"];
   readonly environmentProxyForTarget?: HostedAgentClaudeWebFetchOptions["environmentProxyForTarget"];
 }): HostedAgentSourceController {
-  const owners = new Map<string, HostedAgentOperationOwner>(), port = options.poller.attach(options.runId);
+  const owners = new Map<string, HostedAgentOperationOwner>(), port = options.poller.attach(options.runId,
+    () => nativeRelay?.busy === true || claudeExecutor.busy);
   const backgroundTasks = new Map<string, { readonly operationId: string; readonly context: AdapterContext;
     readonly authority: NativeToolAuthorization | undefined; readonly scopeId: string; readonly background: boolean; readonly title: string; executor: HostedAgentExecutor | undefined }>();
   const activeBackgroundScopes = new Map<string, string>();
@@ -202,6 +203,7 @@ export function createHostedAgentSourceController(options: {
       }) });
     },
     start: () => controller.start(), abortPending: () => controller.abortPending(),
+    get idleReclaimed() { return controller.idleReclaimed; },
     projectResult: value => controller.projectResult(value), projectState: state => controller.projectState(state), projectHistory: history => controller.projectHistory(history),
     stop: async () => { lifetime.abort(); await claudeExecutor.dispose(); await controller.stop(); await nativeRelay?.close(); port.detach(); initialExecutor.dispose(); for (const owner of owners.values()) owner.executor.dispose(); owners.clear();
       for (const task of backgroundTasks.values()) task.executor?.dispose(); backgroundTasks.clear(); activeBackgroundScopes.clear(); backgroundResumes.clear(); }

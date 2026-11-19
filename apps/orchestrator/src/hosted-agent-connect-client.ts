@@ -44,12 +44,12 @@ export class HostedAgentConnectClient implements HostedAgentTransport {
   async poll(cursors: Parameters<HostedAgentTransport["poll"]>[0], signal: AbortSignal): ReturnType<HostedAgentTransport["poll"]> {
     this.#check(signal);
     const result = await this.#client.pollHostedAgents(create(contract.PollHostedAgentsRequestSchema, { format: HOSTED_AGENT_WIRE_FORMAT,
-      cursors: cursors.map(cursor => ({ runId: cursor.runId, after: BigInt(cursor.after) })) }), { signal });
+      cursors: cursors.map(cursor => ({ runId: cursor.runId, after: BigInt(cursor.after), holdsNative: cursor.holdsNative === true })) }), { signal });
     this.#check(signal); assertHostedAgentWireFormat(result.format);
     return result.runs.map(run => {
       const frames = decodeHostedAgentValue(run.framesJson), cursor = Number(run.cursor);
-      if (!Array.isArray(frames) || !Number.isSafeInteger(cursor) || cursor < 0) throw new HostedAgentWireError();
-      return { runId: run.runId, cursor, finished: run.finished, frames: frames as HostedAgentFrame[] };
+      if (!Array.isArray(frames) || !Number.isSafeInteger(cursor) || cursor < 0 || run.idleReclaimed && !run.finished) throw new HostedAgentWireError();
+      return { runId: run.runId, cursor, finished: run.finished, frames: frames as HostedAgentFrame[], ...(run.idleReclaimed ? { idleReclaimed: true } : {}) };
     });
   }
   async reply(runId: string, id: string, value: Parameters<HostedAgentTransport["reply"]>[2], signal: AbortSignal): Promise<void> {

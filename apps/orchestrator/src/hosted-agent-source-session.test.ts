@@ -5,6 +5,7 @@ import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createClient, createRouterTransport } from "@connectrpc/connect";
 import { createPiAdapter } from "@joko/adapter-pi";
 import { HostedAgentSourceAdapter } from "@joko/adapter-hosted";
+import { JokoError } from "@joko/core";
 import type { AdapterContext, BackendDescriptor, Capability } from "@joko/core";
 import { HostedAgentService } from "@joko/contracts";
 import { OperationalStore, HostedAgentStore } from "@joko/store";
@@ -13,7 +14,8 @@ import { ArtifactStore } from "./artifact-store.js";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { SessionHost } from "./session-host.js";
 import { BackendInstanceRegistry } from "./backend-instance-registry.js";
-import { HostedAgentHost } from "./hosted-agent-host.js";
+import { HostedAgentHost, HostedAgentHostError } from "./hosted-agent-host.js";
+import { HostedAgentRun } from "./hosted-agent-run.js";
 import { HostedAgentSessionSlots } from "./hosted-agent-limits.js";
 import { HostedAgentConnectClient } from "./hosted-agent-connect-client.js";
 import { HostedAgentPoller } from "./hosted-agent-poller.js";
@@ -94,8 +96,13 @@ it("dispatches the durable product queue through a native Source Adapter and res
   const address = model.address(); if (!address || typeof address === "string") throw new Error("Missing model listener.");
   const nativeDatabase = new OperationalStore(join(root, "native.sqlite")), slots = new HostedAgentSessionSlots();
   const nativeStore = new HostedAgentStore(nativeDatabase), principal = { id: "source-hub", deviceId: "original-device", trust: "owner" as const, assertCurrent: () => {} };
-  let enabled = true;
-  const nativeHost = new HostedAgentHost({ authorize: () => ({ root: modelRoot, store: nativeStore, slots, artifactCapacityBytes: 1024 * 1024, modelIds: ["native-model"],
+  let enabled = true, idleClockOffset = 0, releasedWorkspaces = 0;
+  let phase = "initializing";
+  const nativeStarts: { readonly start: string; readonly nativeSessionId: string }[] = [];
+  const nativeHost = new HostedAgentHost({ providerIdleMinutes: () => 30,
+    createRun: options => { nativeStarts.push({ start: options.start, nativeSessionId: options.nativeSessionId }); return HostedAgentRun.create(options); },
+    authorize: () => ({ root: modelRoot, store: nativeStore, slots, artifactCapacityBytes: 1024 * 1024, modelIds: ["native-model"],
+    now: () => Date.now() + idleClockOffset,
     assertCurrent: () => { if (!enabled) throw new Error("Provider access was paused."); },
     assertModelAllowed: (providerId, modelId) => { if (!enabled || providerId !== "provider" || modelId !== "native-model") throw new Error("Unavailable Provider model."); },
     createAdapter: async ({ home, readBlob, execution, sourceMcp }) => {
@@ -112,6 +119,19 @@ it("dispatches the durable product queue through a native Source Adapter and res
       providers: [{ id: "provider", api: "openai-completions", baseUrl: `http://127.0.0.1:${address.port}/v1`, apiKeyEnv: "MODEL_NODE_KEY",
         models: [{ id: "native-model", contextWindow: 32768, maxTokens: 1024, input: ["text", "image"] }] }] });
     } }) });
+  const callNative = nativeHost.call.bind(nativeHost);
+  vi.spyOn(nativeHost, "call").mockImplementation(async (...parameters) => {
+    try { return await callNative(...parameters); }
+    catch (error) {
+      if (parameters[3].kind === "history") {
+        const code = error instanceof HostedAgentHostError ? error.code
+          : error instanceof JokoError ? error.publicError.code : error instanceof Error ? error.name : "unknown";
+        const frame = error instanceof Error ? error.stack?.split("\n").slice(1, 3).map(line => line.trim().slice(0, 200)) : undefined;
+        console.info("Source native history failed", JSON.stringify({ phase, enabled, releasedWorkspaces, activeSlots: slots.summary().total, code, frame }));
+      }
+      throw error;
+    }
+  });
   const client = new HostedAgentConnectClient(createClient(HostedAgentService, createRouterTransport(router => {
     router.service(HostedAgentService, createHostedAgentConnectService({ host: nativeHost, authenticate: () => principal }));
   })), principal.assertCurrent);
@@ -152,7 +172,7 @@ it("dispatches the durable product queue through a native Source Adapter and res
     adapter = new HostedAgentSourceAdapter({ id: sourceId, source: { targetDeviceId: "model-node", backendId: "pi", controllerDeviceId: principal.deviceId },
       onRuntimeUnavailable: context => sourceHost?.invalidateRuntime({ backendId: sourceId,
         backendInstanceGeneration: context.backendInstanceGeneration!, sessionId: context.sessionId, generation: context.generation }),
-      describe: () => descriptor, assertContext, resources: context => resources.resources(context), releaseWorkspace: async context => { await mcps.get(context.generation)?.close(); mcps.delete(context.generation); await attachments.release(context); await resources.release(context); },
+      describe: () => descriptor, assertContext, resources: context => resources.resources(context), releaseWorkspace: async context => { await mcps.get(context.generation)?.close(); mcps.delete(context.generation); await attachments.release(context); await resources.release(context); releasedWorkspaces++; },
       deleteWorkspace: context => attachments.forget(context.sessionId),
       prepareInput: (input, context, shadow) => prepareSourceWorkspaceInput(input, context, { shadow, workspaceId: "original-target", resources, assertCurrent: () => assertContext(context), attachments: attachments.begin(context, shadow) }),
       workspace: async context => { await attachments.capture(context); mcps.set(context.generation, new HostedAgentSourceMcp({ store, router, context, assertCurrent: () => assertContext(context), includeToolPolicy: () => true }));
@@ -209,6 +229,7 @@ it("dispatches the durable product queue through a native Source Adapter and res
     const upload = await source.artifacts.ingestBytes(Buffer.from("RETAINED_SOURCE_UPLOAD"), { fileName: "upload.txt", mimeType: "text/plain" });
     const uploadBlob = source.store.getArtifact(upload.id).blob;
     for (const operationId of ["first-source-turn", "source-turn-with-upload", "restored-source-turn"]) {
+      phase = operationId;
       const resource = (await source.host.getResources(sessionId)).find(value => value.id === "source-approved")!;
       expect(resource.state).toBe("loaded");
       const input = { operationId, sessionId, connection, prompt: { text: "Read the original files and any retained upload.", images: [{ blob: imageBlob }], files: operationId === "source-turn-with-upload" ? [{ blob: uploadBlob }] : [],
@@ -223,6 +244,15 @@ it("dispatches the durable product queue through a native Source Adapter and res
       if (operationId === "first-source-turn") {
         expect(source.store.findMakerMemoryEntry("original-target", "project", "source-proof")?.body).toBe("ORIGINAL_MEMORY_BODY");
         expect(modelRequests).toBe(2);
+        expect(slots.summary().total).toBe(1);
+        // Advance only the native owner's idle clock. Source polling and the
+        // service disconnect clock remain live on the same authenticated link.
+        idleClockOffset = 31 * 60_000;
+        await nativeHost.sweep(); idleClockOffset = 0;
+        expect(slots.summary().total).toBe(0);
+        await vi.waitFor(() => expect(releasedWorkspaces).toBe(1));
+        expect(source.store.getSession(sessionId).descriptor.binding.opaqueRef).toBe(retainedBinding);
+        expect(source.store.getRun(accepted.runId).descriptor.state).toBe("completed");
       }
       if (operationId === "source-turn-with-upload") {
         expect(modelRequests).toBe(4);
@@ -231,15 +261,23 @@ it("dispatches the durable product queue through a native Source Adapter and res
       }
     }
     expect(modelRequests).toBe(6);
+    expect(nativeStarts.slice(0, 2)).toEqual([
+      { start: "create", nativeSessionId: nativeStarts[0]!.nativeSessionId },
+      { start: "resume", nativeSessionId: nativeStarts[0]!.nativeSessionId }
+    ]);
     expect(imageRequests).toBe(6);
     expect(source.store.listSettingsByKeyPrefix("service", "hosted-inputs.v1", "")).toHaveLength(1);
+    phase = "provider-paused";
     enabled = false; await nativeHost.sweep();
     const last = source.host.enqueueInput({ operationId: "paused-source-turn", sessionId, connection,
       prompt: { text: "Do not select a local substitute.", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
     source.host.requestQueueDrain(sessionId);
     await vi.waitFor(() => expect(source.store.getQueueItem(last.queueItemId).state).toBe("failed"), { timeout: 15_000 });
     expect(modelRequests).toBe(6); expect(source.store.getSession(sessionId).descriptor.backendId).toBe(sourceId);
+    phase = "provider-resumed";
     enabled = true; await source.host.resume(sessionId);
+
+    phase = "native-deletion";
     await source.host.deleteNativeSession(sessionId, "delete-source-native");
     expect(slots.summary().total).toBe(0); expect(modelRequests).toBe(6);
     expect(source.store.listSettingsByKeyPrefix("service", "hosted-inputs.v1", "")).toEqual([]);

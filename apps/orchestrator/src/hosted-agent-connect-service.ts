@@ -53,7 +53,8 @@ export function createHostedAgentConnectService(options: HostedAgentConnectOptio
     return create(contract.HostedAgentSettingsSchema, { revision: snapshot.revision, remoteControlEnabled: snapshot.value.remoteControlEnabled,
       providers: snapshot.value.providers.map(provider => ({ backendId: provider.backendId, providerId: provider.providerId, enabled: provider.enabled,
         modelAccess: contract.toRemoteModelAccess(provider.modelIds) })),
-      limits: owner.settings.limits(), limitsOverridden: snapshot.value.limits !== undefined, usage: owner.slots.summary(), idleReleaseMinutes: owner.settings.idleReleaseMinutes() });
+      limits: owner.settings.limits(), limitsOverridden: snapshot.value.limits !== undefined, usage: owner.slots.summary(),
+      idleReleaseMinutes: owner.settings.idleReleaseMinutes(), providerIdleMinutes: owner.settings.providerIdleMinutes() });
   };
   return {
     getHostedAgentCatalog: (request, context) => invoke(request.format, context, async principal => {
@@ -72,6 +73,11 @@ export function createHostedAgentConnectService(options: HostedAgentConnectOptio
         }
         case "limits": update = { kind: "limits", value: request.update.value }; break;
         case "idleReleaseMinutes": update = { kind: "idle_release", minutes: request.update.value }; break;
+        case "providerIdleMinutes": {
+          const minutes = request.update.value;
+          if (!Number.isSafeInteger(minutes) || minutes < 0 || minutes > 1440) throw new HostedAgentWireError();
+          update = { kind: "provider_idle", minutes }; break;
+        }
         case "modelAccess": {
           const provider = request.update.value; identity(provider.backendId); identity(provider.providerId);
           if (!provider.access) throw new HostedAgentWireError();
@@ -110,9 +116,9 @@ export function createHostedAgentConnectService(options: HostedAgentConnectOptio
       }
     }),
     pollHostedAgents: (request, context) => invoke(request.format, context, async principal => {
-      const runs = await options.host.poll(principal, request.cursors.map(cursor => ({ runId: identity(cursor.runId), after: integer(cursor.after) })), context.signal);
+      const runs = await options.host.poll(principal, request.cursors.map(cursor => ({ runId: identity(cursor.runId), after: integer(cursor.after), holdsNative: cursor.holdsNative })), context.signal);
       return create(contract.PollHostedAgentsResponseSchema, { format, runs: runs.map(run => ({ runId: run.runId, cursor: BigInt(run.cursor),
-        finished: run.finished, framesJson: encodeHostedAgentValue(run.frames) })) });
+        finished: run.finished, idleReclaimed: run.idleReclaimed === true, framesJson: encodeHostedAgentValue(run.frames) })) });
     }),
     replyHostedAgent: (request, context) => invoke(request.format, context, async principal => {
       await options.host.reply(principal, identity(request.runId), identity(request.requestId), decodeHostedAgentReply(request.resultJson));

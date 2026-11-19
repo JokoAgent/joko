@@ -18,6 +18,7 @@ import { HostedAgentNavigation } from "./hosted-agent-navigation.js";
 export type HostedAgentCall = HostedNativeCommand;
 
 export interface HostedAgentRunOptions {
+  readonly now?: () => number;
   readonly runId: string;
   readonly nativeSessionId: string;
   readonly start: "create" | "resume";
@@ -117,11 +118,16 @@ export class HostedAgentRun {
   readonly #navigation: HostedAgentNavigation;
   #navigating = false;
   #idleReleaseId?: string;
+  #idleReclaimSelected = false;
+  #idleReclaimed = false;
+  #idleReclaimFlight?: Promise<boolean>;
+  #sourceBusy = false;
   readonly #activeBackground = new Set<string>();
   readonly #observedBackground = new Set<string>();
-  #lastActivity = Date.now();
+  #lastActivity: number;
 
   private constructor(options: HostedAgentRunOptions) {
+    this.#lastActivity = (options.now ?? Date.now)();
     if (!options.runId || options.runId.length > 512 || !isAbsolute(options.root) || resolve(options.root) !== options.root
       || !["owner", "guest"].includes(options.trust) || !options.providerId || !options.modelId
       || !options.source.authorityId || !options.source.deviceId || !options.source.sessionId || !options.source.targetId
@@ -151,6 +157,14 @@ export class HostedAgentRun {
   get sourceSessionId(): string { return this.#options.source.sessionId; }
   get ready(): boolean { return this.#ready && !this.#lifetime.signal.aborted; }
   get initializing(): boolean { return !this.#startupSettled && !this.#lifetime.signal.aborted; }
+  get idleReclaiming(): boolean { return this.#idleReclaimSelected; }
+  get idleReclaimed(): boolean { return this.#idleReclaimed; }
+  holdSourceExecution(busy: boolean): void {
+    this.#options.assertCurrent();
+    if (busy || this.#sourceBusy) this.#lastActivity = this.#now();
+    this.#sourceBusy = busy;
+  }
+  #now(): number { return (this.#options.now ?? Date.now)(); }
   checkAuthority(): void { this.#assertAuthority(); }
   get workspaceRoot(): string { return join(this.#options.root, this.#storageKey, "workspace"); }
   hasNativeDerivation(operationId: string): boolean { return this.#derivations.has(operationId); }
@@ -285,7 +299,7 @@ export class HostedAgentRun {
         } else if (resumed.permissionMode !== "ask" || resumed.fastMode !== false) throw new Error("The native Side Chat did not confirm its immutable read-only launch profile.");
       } else this.#binding = await this.#adapter.createSession(creation, this.#context);
       this.#assertAuthority(); this.#options.store.bind(this.id, this.#leaseId, this.#binding);
-      this.#context = { ...this.#context, binding: this.#binding }; this.#ready = true;
+      this.#context = { ...this.#context, binding: this.#binding }; this.#lastActivity = this.#now(); this.#ready = true;
     } catch (error) {
       this.#lifetime.abort(); this.exchange.finish(); await this.#channel?.close();
       try { await this.#disposeNative(); } catch { throw new Error("Hosted Agent startup cleanup could not be confirmed."); }
@@ -308,7 +322,7 @@ export class HostedAgentRun {
         this.#usageObserved = false; this.#usageFollowUps.delete(usageOwner);
       }
     }
-    if (["done", "run_state", "tool_start", "tool_result", "background_task", "subagent_run", "subagent_transcript"].includes(event.type)) this.#lastActivity = Date.now();
+    if (["done", "run_state", "tool_start", "tool_result", "background_task", "subagent_run", "subagent_transcript"].includes(event.type)) this.#lastActivity = this.#now();
     this.#observeBackground(event);
     if (event.type === "background_task" && this.#adapter?.getBackgroundWorkflowProgress) this.#options.store.observeBackgroundTaskBinding(this.id, this.#leaseId, event.taskId,
       event.startedAt, event.state === "running" || event.state === "waiting" || event.state === "queued");
@@ -491,7 +505,7 @@ export class HostedAgentRun {
       throw new Error(prior.state === "pending" ? "The prior native outcome is unknown; the operation was not repeated." : "The prior native operation failed and was not repeated.");
     }
     this.#options.store.claimCall(this.id, this.#leaseId, id, digest);
-    if (command.kind !== "idle_release") this.#lastActivity = Date.now();
+    if (command.kind !== "idle_release") this.#lastActivity = this.#now();
     let result: unknown;
     try { result = await this.#invoke(id, command); }
     catch (error) {
@@ -629,7 +643,7 @@ export class HostedAgentRun {
     else this.#activeBackground.add(id);
   }
   #idleBusy(id: string): boolean {
-    return !!this.#activeProvider || !!this.#shellOperationId || this.#navigating || this.#toolOwners.size > 0
+    return this.#sourceBusy || !!this.#activeProvider || !!this.#shellOperationId || this.#navigating || this.#toolOwners.size > 0
       || this.#backgroundRegistrations.size > 0 || this.#backgroundResumes.size > 0 || this.#activeBackground.size > 0
       || this.exchange.pendingRequests > 0
       || [...this.#receipts, ...this.#observations].some(([call, receipt]) => call !== id && !receipt.settled);
@@ -643,11 +657,41 @@ export class HostedAgentRun {
       this.#assertCurrent();
     }
     const state = await this.#adapter!.inspectSession(this.#binding!, context); this.#assertCurrent();
-    if (state.streaming || state.compacting || state.pendingMessages > 0 || this.#idleBusy(id) || Date.now() - this.#lastActivity < idleMinutes * 60_000) return false;
+    if (state.streaming || state.compacting || state.pendingMessages > 0 || this.#idleBusy(id) || this.#now() - this.#lastActivity < idleMinutes * 60_000) return false;
     // Fence dispatch synchronously before any process cleanup awaits. A lost
     // response is reconciled through this exact release identity, never a new run.
     this.#idleReleaseId = id; this.#ready = false;
     await this.#channel?.close(); await this.#disposeNative(); return true;
+  }
+  /** Provider-owned reclamation is independent of controller pool pressure.
+   * Once selected, only this exact native owner's cleanup may be retried. */
+  reclaimIdle(minutes: number): Promise<boolean> {
+    return this.#idleReclaimFlight ??= this.#reclaimIdle(minutes).finally(() => { this.#idleReclaimFlight = undefined; });
+  }
+  async #reclaimIdle(minutes: number): Promise<boolean> {
+    if (this.#idleReclaimed) return true;
+    if (!this.#idleReclaimSelected) {
+      if (!Number.isSafeInteger(minutes) || minutes < 0 || minutes > 1440) throw new Error("Provider idle reclamation threshold is invalid.");
+      if (!minutes || !this.ready) return false;
+      this.#assertCurrent();
+      if (this.#sourceBusy || this.#idleBusy("") || this.#navigation.read()) { this.#lastActivity = this.#now(); return false; }
+      const context = this.#operationContext(this.#options.runId);
+      if (this.#adapter!.getNativeHistoryProjection && !this.#persistentReadOnly) {
+        const history = await this.#adapter!.getNativeHistoryProjection(context);
+        for (const event of history.events) this.#observeBackground(event.payload, true);
+        this.#assertCurrent();
+      }
+      const state = await this.#adapter!.inspectSession(this.#binding!, context); this.#assertCurrent();
+      if (state.streaming || state.compacting || state.pendingMessages > 0 || this.#sourceBusy || this.#idleBusy("") || this.#navigation.read()) {
+        this.#lastActivity = this.#now(); return false;
+      }
+      if (this.#now() - this.#lastActivity < minutes * 60_000) return false;
+      // No await between the last busy check and fencing all new native calls.
+      this.#idleReclaimSelected = true; this.#ready = false;
+    }
+    this.#options.assertCurrent();
+    await this.#channel?.close(); await this.#disposeNative();
+    this.#idleReclaimed = true; this.exchange.finish(); return true;
   }
   async #idleReleaseStatus(id: string): Promise<"busy" | "released" | "unknown"> {
     this.#options.assertCurrent();

@@ -7,6 +7,7 @@ export interface HostedAgentSettingsView {
   readonly limits: { readonly perDevice: number; readonly total: number };
   readonly limitsOverridden: boolean;
   readonly idleReleaseMinutes?: number;
+  readonly providerIdleMinutes?: number;
   readonly usage?: { readonly total: number; readonly devices: number; readonly maximumDevice: number };
 }
 export interface HostedAgentCatalogView {
@@ -20,7 +21,8 @@ export type HostedAgentSettingsUpdate =
   | { readonly kind: "modelAccess"; readonly backendId: string; readonly providerId: string; readonly modelIds: readonly string[] | undefined }
   | { readonly kind: "limits"; readonly perDevice: number; readonly total: number }
   | { readonly kind: "resetLimits" }
-  | { readonly kind: "idleRelease"; readonly minutes: number };
+  | { readonly kind: "idleRelease"; readonly minutes: number }
+  | { readonly kind: "providerIdle"; readonly minutes: number };
 export interface HostedAgentSettingsApi {
   getHostedAgentSettings(signal?: AbortSignal): Promise<HostedAgentSettingsView>;
   getHostedAgentCatalog(signal?: AbortSignal): Promise<HostedAgentCatalogView>;
@@ -36,7 +38,8 @@ export function projectHostedAgentSettings(value: HostedAgentSettings | undefine
   if (new Set(providers.map(provider => JSON.stringify([provider.backendId, provider.providerId]))).size !== providers.length) throw new Error("Invalid hosted Agent Providers.");
   if (value.usage && ![value.usage.total, value.usage.devices, value.usage.maximumDevice].every(number => Number.isSafeInteger(number) && number >= 0)) throw new Error("Invalid hosted Agent usage.");
   if (!Number.isSafeInteger(value.idleReleaseMinutes) || value.idleReleaseMinutes < 0 || value.idleReleaseMinutes > 120) throw new Error("Invalid native idle release threshold.");
-  return { revision: value.revision, remoteControlEnabled: value.remoteControlEnabled, providers, limits: { perDevice: value.limits.perDevice, total: value.limits.total }, idleReleaseMinutes: value.idleReleaseMinutes,
+  if (!Number.isSafeInteger(value.providerIdleMinutes) || value.providerIdleMinutes < 0 || value.providerIdleMinutes > 1440) throw new Error("Invalid Provider idle reclamation threshold.");
+  return { revision: value.revision, remoteControlEnabled: value.remoteControlEnabled, providers, limits: { perDevice: value.limits.perDevice, total: value.limits.total }, idleReleaseMinutes: value.idleReleaseMinutes, providerIdleMinutes: value.providerIdleMinutes,
     limitsOverridden: value.limitsOverridden, ...(value.usage ? { usage: { total: value.usage.total, devices: value.usage.devices, maximumDevice: value.usage.maximumDevice } } : {}) };
 }
 export function projectHostedAgentCatalog(value: GetHostedAgentCatalogResponse): HostedAgentCatalogView {
@@ -69,6 +72,8 @@ export function hostedAgentSettingsMutation(update: HostedAgentSettingsUpdate): 
     case "resetLimits": return { case: "resetLimits", value: { $typeName: "joko.v1.HostedAgentResetLimits" } };
     case "idleRelease": if (!Number.isSafeInteger(update.minutes) || update.minutes < 0 || update.minutes > 120) throw new Error("Idle release must be whole minutes from 0 to 120.");
       return { case: "idleReleaseMinutes", value: update.minutes };
+    case "providerIdle": if (!Number.isSafeInteger(update.minutes) || update.minutes < 0 || update.minutes > 1440) throw new Error("Provider idle reclamation must be whole minutes from 0 to 1440.");
+      return { case: "providerIdleMinutes", value: update.minutes };
   }
 }
 function validLimit(value: number): boolean { return Number.isSafeInteger(value) && value >= 1 && value <= 1_000; }

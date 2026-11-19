@@ -61,8 +61,9 @@ describe.skipIf(!binary)("Hosted native Codex Source executor", () => {
       await request("message", { id: 6, method: "process/start", params: { processId: "native-command", argv: [process.execPath, "-e", "setTimeout(() => { console.log(process.cwd()); }, 500);"],
         cwd: "file:///hosted/workspace", env: { SystemRoot: process.env["SystemRoot"], TEMP: root }, tty: false } });
       expect(gate.snapshot().running).toBe(1);
+      expect(relay.busy).toBe(true);
       await until(() => messages.some(message => message.method === "process/closed"));
-      expect(gate.snapshot().running).toBe(0); expect(messages.find(message => message.id === 6)?.error).toBeUndefined();
+      expect(gate.snapshot().running).toBe(0); expect(relay.busy).toBe(false); expect(messages.find(message => message.id === 6)?.error).toBeUndefined();
       const output = messages.filter(message => message.method === "process/output").map(message => Buffer.from((message.params as { chunk: string }).chunk, "base64").toString()).join("");
       expect(output.trim()).toBe(virtual); expect(actions).toContainEqual({ kind: "exec", command: expect.any(String), cwd: project });
       expect(JSON.stringify(messages)).not.toContain(JSON.stringify(project).slice(1, -1));
@@ -70,7 +71,8 @@ describe.skipIf(!binary)("Hosted native Codex Source executor", () => {
         "console.log('BACKGROUND_READY'); setTimeout(() => require('node:fs').writeFileSync('orphaned.txt','orphan'), 1200);"],
         cwd: "file:///hosted/workspace", env: { SystemRoot: process.env["SystemRoot"], TEMP: root }, tty: false } });
       await until(() => messages.some(message => message.method === "process/output" && Buffer.from((message.params as { chunk: string }).chunk, "base64").toString().includes("BACKGROUND_READY")));
-      await relay.close(); expect(gate.snapshot().running).toBe(0);
+      expect(relay.busy).toBe(true);
+      await relay.close(); expect(gate.snapshot().running).toBe(0); expect(relay.busy).toBe(false);
       await new Promise(resolve => setTimeout(resolve, 1500));
       await expect(readFile(join(project, "orphaned.txt"))).rejects.toMatchObject({ code: "ENOENT" });
     } finally {

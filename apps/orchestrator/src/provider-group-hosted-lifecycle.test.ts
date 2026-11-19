@@ -14,7 +14,7 @@ import { ProviderGroupRouter } from "./provider-group-router.js";
 import type { ProviderGroupRuntime } from "./provider-group-runtime.js";
 import { ProviderGroupUsage } from "./provider-group-usage.js";
 import { HostedAgentConnectClient } from "./hosted-agent-connect-client.js";
-import { createHostedAgentConnectService } from "./hosted-agent-connect-service.js";
+import { createHostedAgentConnectService, type HostedAgentLifecycleEndpointPort } from "./hosted-agent-connect-service.js";
 import { decodeHostedWorkflowProgress } from "./hosted-agent-workflow-wire.js";
 import type { HostedWorkflowProgressCommand } from "./hosted-agent-workflow-progress.js";
 
@@ -44,7 +44,7 @@ function fixture(localMember = false) {
   const directory = new ProviderGroupDirectory({ sources: () => sources, quotas, running: () => 0, ownerGeneration: () => "original-owner" });
   const runtime = { store: groups, directory, leases, router: new ProviderGroupRouter(groups, directory, leases),
     usage: new ProviderGroupUsage(groups, new ProviderGroupUsageStore(store, "local-node")), nodeName: () => "This computer" } as unknown as ProviderGroupRuntime;
-  const base = new HostedAgentHost({ authorize: () => { throw new Error("This original route must stay on its selected remote member."); } });
+  const base: HostedAgentLifecycleEndpointPort = new HostedAgentHost({ authorize: () => { throw new Error("This original route must stay on its selected remote member."); } });
   let live = true, closeUnknown = false, nativeAlive = false, nativeClosures = 0;
   const principal: HostedAgentPrincipal = { id: "approved-guest", deviceId: "source-device", trust: "guest", assertCurrent: () => {
     if (!live) throw new Error("The original authorization was retired.");

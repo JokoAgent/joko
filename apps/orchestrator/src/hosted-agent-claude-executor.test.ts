@@ -89,6 +89,7 @@ describe("Claude Source MCP executor", () => {
       expect(first).toMatchObject({ isError: false, content: [{ text: expect.stringContaining("child") }] });
       expect(await f.call("Bash", { command: "pwd" })).toMatchObject({ isError: false, content: [{ text: expect.stringContaining("child") }] });
       const launch = await f.call("Bash", { command: "printf 'source-first\\n'; sleep 30", run_in_background: true });
+      expect(f.helper.busy).toBe(true);
       const id = /shell-[a-f0-9-]+/u.exec(JSON.stringify(launch))?.[0]; expect(id).toBeDefined();
       let observed = "";
       for (let attempt = 0; attempt < 80 && !observed.includes("source-first"); attempt++) {
@@ -98,6 +99,7 @@ describe("Claude Source MCP executor", () => {
       expect(observed).toContain("source-first");
       expect(await f.call("KillShell", { shell_id: id })).toMatchObject({ isError: false });
       expect(await f.call("BashOutput", { bash_id: id })).toMatchObject({ content: [{ text: expect.stringContaining("completed") }] });
+      expect(f.helper.busy).toBe(false);
     } finally { await f.close(); }
   }, 30_000);
   it("pages completed Source output past four MiB without splitting UTF-8 or consuming it on a rejected filter", async () => {

@@ -12,6 +12,7 @@ interface PendingPoll {
   readonly resolve: (value: Awaited<ReturnType<HostedAgentRunPort["poll"]>>) => void;
   readonly reject: (error: Error) => void;
   readonly detach: () => void;
+  readonly holdsNative: () => boolean;
 }
 
 /** Source-computer connection owner. Per-task controllers can await their own
@@ -26,7 +27,7 @@ export class HostedAgentPoller {
   #closed = false;
 
   constructor(transport: HostedAgentTransport) { this.#transport = transport; }
-  attach(runId: string): HostedAgentRunPort & { detach(): void } {
+  attach(runId: string, holdsNative: () => boolean = () => false): HostedAgentRunPort & { detach(): void } {
     if (this.#closed || !runId || runId.length > 512 || this.#attached.has(runId)) throw new Error("Hosted Agent poll ownership is invalid.");
     this.#attached.add(runId);
     const assertAttached = () => { if (this.#closed || !this.#attached.has(runId)) throw new Error("Hosted Agent poll ownership has closed."); };
@@ -37,7 +38,7 @@ export class HostedAgentPoller {
         const result = new Promise<Awaited<ReturnType<HostedAgentRunPort["poll"]>>>((resolve, reject) => {
           const abort = () => { const pending = this.#pending.get(runId); if (pending?.signal !== signal) return;
             this.#pending.delete(runId); pending.detach(); reject(new Error("Hosted Agent polling was cancelled.")); this.#active?.abort(); };
-          this.#pending.set(runId, { after, signal, resolve, reject, detach: () => signal.removeEventListener("abort", abort) });
+          this.#pending.set(runId, { after, signal, resolve, reject, holdsNative, detach: () => signal.removeEventListener("abort", abort) });
           signal.addEventListener("abort", abort, { once: true }); if (signal.aborted) abort();
         });
         this.#active?.abort(); this.#start(); return result;
@@ -60,7 +61,7 @@ export class HostedAgentPoller {
   }
   async #consume(): Promise<void> {
     while (!this.#closed && this.#pending.size) {
-      const pending = new Map(this.#pending), cursors = [...pending].map(([runId, value]) => ({ runId, after: value.after }));
+      const pending = new Map(this.#pending), cursors = [...pending].map(([runId, value]) => ({ runId, after: value.after, ...(value.holdsNative() ? { holdsNative: true } : {}) }));
       const active = new AbortController(); this.#active = active;
       try {
         const batches = await this.#transport.poll(cursors, active.signal);
@@ -69,7 +70,8 @@ export class HostedAgentPoller {
         for (const batch of batches) {
           const owner = pending.get(batch.runId);
           if (!owner || seen.has(batch.runId) || !Array.isArray(batch.frames) || !Number.isSafeInteger(batch.cursor) || batch.cursor < owner.after
-            || typeof batch.finished !== "boolean") throw new Error("Hosted Agent poll returned an invalid owner or cursor.");
+            || typeof batch.finished !== "boolean" || batch.idleReclaimed !== undefined && (typeof batch.idleReclaimed !== "boolean"
+              || batch.idleReclaimed && !batch.finished)) throw new Error("Hosted Agent poll returned an invalid owner or cursor.");
           seen.add(batch.runId); let cursor = owner.after;
           for (const frame of batch.frames) { if (frame.sequence !== ++cursor) throw new Error("Hosted Agent poll returned a cursor gap."); }
           if (cursor !== batch.cursor) throw new Error("Hosted Agent poll returned an invalid final cursor.");
