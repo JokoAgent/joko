@@ -2,7 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { chromium, type Page } from "playwright-core";
 import { expect, it, vi } from "vitest";
-import { OrchestratorE2eFixture } from "./fixture.js";
+import { closeCompactNavigationDrawer, OrchestratorE2eFixture } from "./fixture.js";
 import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
 
 const browserPath = process.env.JOKO_BROWSER_EXECUTABLE?.trim(), webDirectory = process.env.JOKO_MOUNTED_WEB_DIR?.trim();
@@ -57,15 +57,10 @@ mountedIt("tracks real task panes across shared-owner tabs and revokes only the 
     await route(page, "#/settings/general"); await page.locator(".theme-picker").waitFor();
     return fixture.application.store.listDevices().find(device => device.name === name)!.id;
   };
-  const closeNavigationDrawer = async (page: Page) => {
-    const scrim = page.locator(".panel-scrim--navigation");
-    if (await scrim.isVisible()) await page.locator(".sidebar__mobile-close").click();
-    await scrim.waitFor({ state: "hidden" });
-  };
   const openTask = async (page: Page, id: string) => {
     await route(page, `#/tasks/${encodeURIComponent(id)}`);
     await page.locator(`.session-pane[data-input-session-id='${id}'] .session-composer-layer`).waitFor();
-    await closeNavigationDrawer(page);
+    await closeCompactNavigationDrawer(page);
     const closeDetails = page.locator(".inspector-dock-group[data-edge]").getByRole("button", { name: "Close details", exact: true }).first();
     if (await closeDetails.isVisible()) await closeDetails.click();
   };
@@ -93,9 +88,12 @@ mountedIt("tracks real task panes across shared-owner tabs and revokes only the 
     await tab.getByRole("button", { name: "Saved nodes", exact: true }).click();
     await tab.locator(".connection-card .profile-card").filter({ hasText: fixture.baseUrl }).getByRole("button", { name: "Connect", exact: true }).click();
     await tab.locator(".app").waitFor({ timeout: 30_000 }); await openTask(tab, tasks[1]!);
-    await expect.poll(() => fixture.application.connections.taskActivity.snapshot().activeDevices.map(device => device.deviceId)).toEqual([remoteId]);
+    const activity = fixture.application.connections.taskActivity;
+    await expect.poll(() => tasks.map(id => activity.hasRemoteTaskView(id))).toEqual([true, true]);
+    expect(activity.snapshot().activeDevices.map(device => device.deviceId)).toEqual([remoteId]);
     await remote.close();
-    expect(fixture.application.connections.taskActivity.snapshot().activeDevices.map(device => device.deviceId)).toEqual([remoteId]);
+    expect(activity.snapshot().activeDevices.map(device => device.deviceId)).toEqual([remoteId]);
+    await expect.poll(() => tasks.map(id => activity.hasRemoteTaskView(id))).toEqual([false, true]);
     await route(tab, "#/settings/general"); await tab.locator(".theme-picker").waitFor();
     await expect.poll(() => fixture.application.connections.taskActivity.snapshot().activeDevices).toEqual([]);
     await expect.poll(() => observer.locator(".task-activity").count()).toBe(0);
@@ -104,7 +102,7 @@ mountedIt("tracks real task panes across shared-owner tabs and revokes only the 
     await inline.getByText(`${remoteName} is viewing tasks on this node`, { exact: true }).waitFor();
     expect(await observer.locator(".task-activity--floating").count()).toBe(0);
     await observer.setViewportSize({ width: 320, height: 740 });
-    await closeNavigationDrawer(observer);
+    await closeCompactNavigationDrawer(observer);
     expect(await observer.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     await capture("inline-light-320");
     await inline.getByRole("button", { name: "Collapse active device notice", exact: true }).click();
@@ -124,7 +122,7 @@ mountedIt("tracks real task panes across shared-owner tabs and revokes only the 
     await route(observer, "#/settings/general");
     await observer.locator(".theme-picker").getByRole("radio", { name: "Dark", exact: true }).click();
     await openTask(observer, tasks[0]!); await observer.setViewportSize({ width: 390, height: 844 });
-    await closeNavigationDrawer(observer);
+    await closeCompactNavigationDrawer(observer);
     await capture("inline-dark-390-multiple");
     await route(third, "#/settings/general"); await third.locator(".theme-picker").waitFor();
     await inline.getByRole("button", { name: "Revoke access", exact: true }).click();

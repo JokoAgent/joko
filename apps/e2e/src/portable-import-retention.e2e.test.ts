@@ -11,6 +11,7 @@ import {
   OperationState,
   PermissionMode,
   PortableSessionFidelity,
+  StateImpact,
   SubagentControlAction,
   SubagentRunState,
   SubagentService,
@@ -141,7 +142,8 @@ it("restores portable worker results and activity on a separate node without gra
         value: create(ControlSubagentMutationSchema, { sessionId, subagentRunId, action: SubagentControlAction.STOP }) }
     }));
     expect(control, control.error?.message).toMatchObject({ state: OperationState.FAILED,
-      error: { code: "SUBAGENT_ACTION_UNAVAILABLE", stateMayHaveChanged: false } });
+      error: { code: "SUBAGENT_ACTION_UNAVAILABLE", phase: "subagent_control", retryable: false,
+        queueImpact: StateImpact.UNCHANGED, workspaceImpact: StateImpact.UNCHANGED, nativeSessionImpact: StateImpact.UNCHANGED } });
     expect(nativeControls).toBe(0);
     await expect(paired.clients.portableSession.commitPortableSessionImport(commit))
       .resolves.toMatchObject({ replayed: true, result: { sessionId, workerCount: 1n } });

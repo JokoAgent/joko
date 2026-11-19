@@ -4,7 +4,7 @@ import { chromium, type Browser } from "playwright-core";
 import { afterEach, expect, it } from "vitest";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 
-import { OrchestratorE2eFixture, routeFixtureDiscovery, waitFor } from "./fixture.js";
+import { closeCompactNavigationDrawer, OrchestratorE2eFixture, routeFixtureDiscovery, waitFor } from "./fixture.js";
 import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim()
@@ -117,11 +117,8 @@ mountedIt("reads Markdown, code and plain attachments from the task and pending 
     await capture("narrow-dark-code");
     await page.keyboard.press("Escape");
     await dialog.waitFor({ state: "detached" });
-    const navigationScrim = page.locator("button.panel-scrim--navigation");
-    if (await navigationScrim.isVisible()) await navigationScrim.click();
+    await closeCompactNavigationDrawer(page);
     if (await closeDetails.isVisible()) await closeDetails.click();
-    const closeNavigation = page.getByLabel("Task navigation").getByRole("button", { name: "Close navigation", exact: true });
-    if (await closeNavigation.isVisible()) await closeNavigation.click();
     await preview("literal.txt").click();
     expect(await dialog.locator("main > pre").textContent()).toBe(PLAIN);
     expect(await dialog.locator("h1, .cm-editor").count()).toBe(0);
