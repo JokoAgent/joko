@@ -330,6 +330,19 @@ describe("AutomationSettings", () => {
     expect(controller.setAndroidAdbPath).toHaveBeenCalledWith();
   });
 
+  it("shows a device-enumeration failure with a recheck and without device connection instructions", async () => {
+    const controller = controllerFixture();
+    const base = snapshot({ androidEnabled: true });
+    const view = await render(controller, { ...base, settings: { ...base.settings, androidAutomation: {
+      ...base.settings.androidAutomation, devices: [], configuredDefaultDeviceSerial: "", issue: "driverError", failureReason: "permission denied"
+    } } });
+    const card = required(view.querySelector('[data-automation-card="android"]'));
+    expect(card.querySelector('[role="status"]')?.textContent).toContain("permission denied");
+    expect(card.querySelector(".automation-android__guide")).toBeNull();
+    await act(async () => required(card.querySelector<HTMLButtonElement>(".automation-android__refresh")).click());
+    expect(controller.probeAndroidAutomation).toHaveBeenCalledWith(true);
+  });
+
   it("keeps recovery controls for a persisted ADB path that fails preparation", async () => {
     const controller = controllerFixture();
     const base = snapshot({ androidEnabled: true });

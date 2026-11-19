@@ -98,10 +98,12 @@ export class AndroidRuntimeSupervisor implements AndroidAutomationRuntimeControl
 
 function mapRuntimeStatus(status: AndroidRuntimeStatus): AndroidAutomationProbe {
   const preparation = status.installation.preparation;
+  const adbAvailable = status.installation.state === "installed";
+  const deviceEnumerationFailed = adbAvailable && status.issue === "no_device" && status.error !== undefined;
   return {
     support: status.supported ? "supported" : "platformLimited",
     supportReason: status.supported ? "" : "Android automation is unavailable on this platform.",
-    adbAvailable: status.installation.state === "installed",
+    adbAvailable,
     adbPath: status.installation.executablePath,
     adbPathSource: status.installation.pathSource,
     preparationSupported: preparation?.supported ?? false,
@@ -118,7 +120,7 @@ function mapRuntimeStatus(status: AndroidRuntimeStatus): AndroidAutomationProbe 
       usb: device.usb
     })),
     defaultDeviceSerial: status.selectedDeviceSerial,
-    issue: mapIssue(status.issue),
+    issue: deviceEnumerationFailed ? "driverError" : mapIssue(status.issue),
     failureReason: status.error,
     platform: status.platform
   };

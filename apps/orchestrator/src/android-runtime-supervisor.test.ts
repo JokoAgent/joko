@@ -74,6 +74,19 @@ describe("AndroidRuntimeSupervisor", () => {
     });
   });
 
+  it("keeps ADB installed and distinguishes failed enumeration from an observed empty list", async () => {
+    const empty = statusFixture({ selectedDeviceSerial: undefined, devices: [], issue: "no_device" });
+    const runtime = runtimeFixture(empty);
+    runtime.probe.mockResolvedValueOnce({ ...empty, error: "permission denied" });
+    const factory = { create: () => runtime.runtime } as unknown as AndroidAutomationRuntimeFactory;
+    const supervisor = new AndroidRuntimeSupervisor({ factory });
+    try {
+      await expect(supervisor.status({ fresh: true })).resolves.toMatchObject({ adbAvailable: true, adbVersion: "1.0.41",
+        devices: [], issue: "driverError", failureReason: "permission denied" });
+      await expect(supervisor.status({ fresh: true })).resolves.toMatchObject({ adbAvailable: true, devices: [], issue: "noDevice" });
+    } finally { await supervisor.dispose(); }
+  });
+
   it("forwards session cleanup and disposes the final runtime", async () => {
     const fixture = runtimeFixture(statusFixture());
     const factory = {
