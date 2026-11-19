@@ -458,10 +458,11 @@ import { resolveDesktopUpdateFeedUrl } from "./update-feed.js";
 import { fetchDesktopUpdateManifestVersion } from "./update-manifest.js";
 import { createDesktopUpdateService, type DesktopUpdateService } from "./update-service.js";
 import { runDesktopUpdateStartupCheck } from "./update-startup.js";
-import { popUpDesktopTrayMenu, usesJavaScriptTrayMenuPopup } from "./tray-menu.js";
+import { createWindowsTrayQuitAction, popUpDesktopTrayMenu, usesJavaScriptTrayMenuPopup } from "./tray-menu.js";
 import {
   resolveDesktopRemoteDesktopTrayLabels,
-  resolveDesktopTrayMenuLabels
+  resolveDesktopTrayMenuLabels,
+  resolveDesktopTrayQuitLabels
 } from "./i18n/tray-menu.js";
 import {
   desktopMainWindowCloseLabels,
@@ -927,6 +928,26 @@ let managedOrchestratorStatus: DesktopManagedOrchestratorStatus = process.env["J
   ? { state: "disabled" }
   : { state: "starting" };
 let managedOrchestratorInitialization: Promise<DesktopManagedOrchestratorStatus> | undefined;
+const requestWindowsTrayQuit = createWindowsTrayQuitAction({
+  getRuntime: () => managedOrchestratorRuntime,
+  isQuitting: () => quitting || managedOrchestratorExitFence.shutdownStarted,
+  probeActivity: probeCurrentManagedRuntimeActivity,
+  confirmQuit: async () => {
+    const labels = resolveDesktopTrayQuitLabels(applicationMenuLocale);
+    const result = await dialog.showMessageBox({
+      type: "warning",
+      title: labels.title,
+      message: labels.title,
+      detail: labels.detail,
+      buttons: [labels.cancel, labels.quit],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true
+    });
+    return result.response === 1;
+  },
+  quit: () => app.quit()
+});
 let desktopDevicePeerAgentLifecycle: DesktopDevicePeerAgentLifecycle | undefined;
 let desktopRemoteDesktopSettings: DesktopRemoteDesktopSettingsStore | undefined;
 let desktopRemoteDesktopHost: DesktopRemoteDesktopHost | undefined;
@@ -7089,7 +7110,14 @@ function buildTrayContextMenu(): Menu {
       }
     ] satisfies Electron.MenuItemConstructorOptions[]),
     { type: "separator" },
-    { label: labels.quit, click: () => app.quit() }
+    {
+      label: labels.quit,
+      click: process.platform === "win32" ? () => {
+        void requestWindowsTrayQuit().catch(() => {
+          process.stderr.write("JOKO_DESKTOP_TRAY_QUIT_CONFIRMATION_FAILED\n");
+        });
+      } : () => app.quit()
+    }
   ];
   return Menu.buildFromTemplate(template);
 }
