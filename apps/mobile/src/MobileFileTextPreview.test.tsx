@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+import { create } from "@bufbuild/protobuf";
+import { FileKind, WorkspaceEntrySchema } from "@joko/contracts";
 import { act, createElement, forwardRef, useImperativeHandle, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -16,11 +18,13 @@ const native = vi.hoisted(() => ({
   scrollToIndex: vi.fn(), scrollToOffset: vi.fn(), inject: vi.fn(), openURL: vi.fn(async (_url: string) => undefined), canOpenURL: vi.fn(async () => true),
   currentState: "active", appListeners: new Set<(value: string) => void>(), pressureListeners: new Set<() => void>(),
   layout: undefined as ((event: { nativeEvent: { lines: { text: string; y: number }[] } }) => void) | undefined,
-  web: undefined as { source: { html: string }; originWhitelist: readonly string[]; onLoad?(): void; onLoadEnd?(): void;
+  web: undefined as { source: { html: string; uri?: string }; originWhitelist: readonly string[]; onLoad?(): void; onLoadEnd?(): void;
     menuItems?: readonly { key: string; label: string }[];
+    onMessage?(event: { nativeEvent: { data: string } }): void;
     onCustomMenuSelection?(event: { nativeEvent: { key: string; label: string; selectedText: string } }): void;
     onRenderProcessGone?(): void; onShouldStartLoadWithRequest(request: { url: string }): boolean } | undefined,
-  list: undefined as { data: readonly string[]; onScrollToIndexFailed(info: { averageItemLength: number; index: number }): void } | undefined
+  list: undefined as { data: readonly string[]; onScrollToIndexFailed(info: { averageItemLength: number; index: number }): void } | undefined,
+  address: undefined as { value: string; accessibilityLabel: string; onChangeText(value: string): void; onSubmitEditing(): void } | undefined
 }));
 vi.mock("./rich-markdown-runtime.richjs", () => ({ default: { mermaidScript: "", katexScript: "", katexCss: "" } }));
 vi.mock("./mobile-resource-pressure", () => ({ mobileResourcePressureSupported: () => true, subscribeMobileResourcePressure: (listener: () => void) => {
@@ -49,6 +53,10 @@ vi.mock("react-native", () => {
     Pressable: ({ children, onPress, accessibilityLabel, accessibilityState, disabled }: { children?: ReactNode; onPress(): void; accessibilityLabel?: string; disabled?: boolean;
       accessibilityState?: { selected?: boolean } }) => createElement("button", { onClick: onPress, "aria-label": accessibilityLabel,
         disabled, "aria-pressed": accessibilityState?.selected }, children),
+    TextInput: forwardRef((props: NonNullable<typeof native.address>, ref) => {
+      useImperativeHandle(ref, () => ({ blur: vi.fn() })); native.address = props;
+      return createElement("input", { "aria-label": props.accessibilityLabel, readOnly: true, value: props.value });
+    }),
     Linking: { openURL: native.openURL, canOpenURL: native.canOpenURL }, Platform: { select: (options: { android: string }) => options.android },
     StyleSheet: { create: (value: unknown) => value },
     AppState: { get currentState() { return native.currentState; }, addEventListener: (_type: string, listener: (state: string) => void) => {
@@ -259,6 +267,54 @@ describe("native file reading", () => {
     await act(async () => { native.currentState = "background"; native.appListeners.forEach((listener) => listener("background")); });
     await act(async () => { late({ ...descriptor, leaseId: "html-late" }); }); expect(client.releaseFilesHtmlResources).toHaveBeenCalledWith("html-late");
     expect(container.querySelector("[data-document]")).toBeNull();
+    await act(async () => { root.unmount(); });
+  });
+
+  it("uses file-reader history and fresh reads, and opens a separate WebView on native address submission", async () => {
+    const container = document.createElement("div"); const root = createRoot(container);
+    const initial = '<a href="./details.html#section">Details</a>';
+    const size = BigInt(new TextEncoder().encode(initial).length);
+    const documentPath = "docs/index.html", childPath = "docs/details.html";
+    const preview = { ...base, workspaceEntry: create(WorkspaceEntrySchema, { workspaceId: "workspace", kind: FileKind.REGULAR, relativePath: documentPath }),
+      workspacePath: documentPath, sourceLabel: documentPath, fileName: "index.html", text: initial, byteSize: size, endByte: size };
+    let childHtml = "<h1 id=section>Details document</h1>";
+    let nextLease = 0;
+    const client = { filesHtmlResourceOwnerKey: () => "html-owner",
+      prepareFilesHtmlResources: vi.fn(async (_preview: unknown, _signal: AbortSignal, path?: string): Promise<MobileFileHtmlDescriptor> => ({
+        leaseId: `html-${++nextLease}`, html: path === childPath ? childHtml : initial, total: 0, failed: 0, overBudget: 0, overLimit: 0
+      })), assertFilesHtmlResourcesCurrent: vi.fn(), releaseFilesHtmlResources: vi.fn(), subscribe: () => () => undefined,
+      filesMarkdownResourceOwnerKey: () => undefined, prepareFilesMarkdownResources: vi.fn(), assertMarkdownResourcesCurrent: vi.fn(), releaseMarkdownResources: vi.fn() };
+    const click = async (label: string) => act(async () => { container.querySelector<HTMLButtonElement>(`[aria-label="${label}"]`)!.click(); });
+    const message = (view: NonNullable<typeof native.web>, lease: string, link: string) => act(async () => {
+      view.onMessage!({ nativeEvent: { data: JSON.stringify([lease, link]) } });
+    });
+    await act(async () => { root.render(createElement(MobileFileTextPreview, { preview, colors, locale: "en", client, workspaceHtmlNavigation: true })); });
+    const original = native.web!;
+    expect(original.source.html).toContain(initial);
+    expect(native.address?.value).toBe(documentPath);
+    await message(original, "html-1", "https://example.invalid/other.html");
+    expect(client.prepareFilesHtmlResources).toHaveBeenCalledOnce();
+    await message(original, "html-1", "./details.html#section");
+    expect(client.releaseFilesHtmlResources).toHaveBeenCalledWith("html-1");
+    expect(native.web?.source.html).toContain(childHtml);
+    expect(native.address?.value).toBe(childPath + "#section");
+    await message(original, "html-1", "outdated.html");
+    expect(client.prepareFilesHtmlResources).toHaveBeenCalledTimes(2);
+    await click("Previous page"); expect(native.web?.source.html).toContain(initial);
+    await click("Next page"); expect(native.web?.source.html).toContain(childHtml);
+    childHtml = "<h1 id=section>Refreshed details document</h1>";
+    await click("Refresh"); expect(native.web?.source.html).toContain(childHtml);
+    expect(client.prepareFilesHtmlResources.mock.calls.map(([, , path]) => path)).toEqual([documentPath, childPath, documentPath, childPath, childPath]);
+
+    const fileView = native.web!;
+    await act(async () => { native.address?.onChangeText("https://example.invalid/website"); });
+    await click("Open");
+    expect(client.releaseFilesHtmlResources).toHaveBeenCalledWith("html-5");
+    expect(native.web).toMatchObject({ source: { uri: "https://example.invalid/website" }, incognito: true, sharedCookiesEnabled: false, allowFileAccess: false });
+    expect(native.web).not.toHaveProperty("onMessage");
+    expect(fileView.onShouldStartLoadWithRequest({ url: "about:blank#retired" })).toBe(false);
+    await click("Previous page");
+    expect(native.web?.source.html).toContain(childHtml);
     await act(async () => { root.unmount(); });
   });
 

@@ -5,7 +5,7 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import { createRequire } from "node:module";
 import { describe, expect, it, vi } from "vitest";
 import { MobileFileHtmlReader, type MobileFileHtmlContext } from "./mobile-file-html-reader";
-import { withHtmlPreviewCsp } from "./mobile-file-html";
+import { allowMobileHtmlWebsiteNavigation, mobileHtmlWebsiteAddress, resolveMobileHtmlDocumentLink, withHtmlPreviewCsp } from "./mobile-file-html";
 import { collectHtmlLocalResourceRefs, planHtmlResourceFetches, applyHtmlResourceUrls, fetchHtmlResourceUrls, resolveHtmlResourcePath } from "./mobile-file-html-resources";
 const { JSDOM } = createRequire(import.meta.url)("jsdom");
 
@@ -15,6 +15,21 @@ function resource(text: string, mediaType = "text/javascript") {
     byteSize: BigInt(bytes.length), sha256Hex: bytesToHex(sha256(bytes)) }) };
 }
 describe("HTML file resource ownership", () => {
+  it("resolves documents below the original preview directory and validates explicit website addresses separately", () => {
+    const root = "docs/index.html";
+    expect(resolveMobileHtmlDocumentLink(root, root, "./details.html#overview")).toEqual({ path: "docs/details.html", fragment: "#overview" });
+    expect(resolveMobileHtmlDocumentLink(root, root, "examples/")).toEqual({ path: "docs/examples/index.html", fragment: "" });
+    expect(resolveMobileHtmlDocumentLink(root, "docs/examples/index.html", "../Caf%C3%A9.html")).toEqual({ path: "docs/Café.html", fragment: "" });
+    for (const href of ["#overview", "../other.html", "https://example.invalid/page.html", "/docs/details.html", "draft.txt", "./.private.html"]) {
+      expect(resolveMobileHtmlDocumentLink(root, root, href)).toBeUndefined();
+    }
+    expect(mobileHtmlWebsiteAddress("example.invalid:443/docs")).toBe("https://example.invalid/docs");
+    expect(allowMobileHtmlWebsiteNavigation("http://127.0.0.1:3000/")).toBe(true);
+    for (const href of ["https://user@example.invalid/docs", "file:///docs/details.html", "javascript:void(0)", "docs/index.html"]) {
+      expect(mobileHtmlWebsiteAddress(href)).toBeUndefined();
+    }
+  });
+
   it("collects real attributes and CSS, keeps raw text intact and bounds every resource to the canonical parent", () => {
     const html = '<!-- <script><img src=comment.png> --><script>const fake = "<img src=private.png>";</script><textarea><img src=hidden.png></textarea>'
       + '<style>p{background:url(./a.png)}</style><div style="background:url(a.png?cache=1)"></div>'

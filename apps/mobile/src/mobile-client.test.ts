@@ -14487,6 +14487,47 @@ describe("native current-task Files ownership", () => {
     expect(app.filesHtmlResourceOwnerKey(preview)).toBeUndefined(); expect(network.submit).not.toHaveBeenCalled();
   });
 
+  it("reads each requested HTML page through the original Workspace and retires its pending document on close", async () => {
+    const originalHtml = '<a href="./details.html">Details</a>';
+    const childHtml = "<h1>Current details</h1>";
+    const file = (path: string, text: string) => {
+      const bytes = new TextEncoder().encode(text);
+      return create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: path, kind: FileKind.REGULAR, mediaType: "text/html",
+        revision: { opaqueRevision: `sha256:${sha256Hex(bytes)}:${bytes.length}`, byteSize: BigInt(bytes.length), sha256Hex: sha256Hex(bytes) } });
+    };
+    const original = file("docs/index.html", originalHtml);
+    const child = file("docs/details.html", childHtml);
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspaceId, parent) => ({
+      entries: parent === "docs" ? [original, child] : [sourceDirectory], revision: "directory-" + parent }));
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, { entry: original,
+      content: { case: "text", value: { utf8Text: originalHtml, startByte: 0n, endByte: original.revision!.byteSize, totalLines: 1 } } }));
+    const childSnapshot = { html: childHtml, file: { $typeName: "joko.v1.WorkspaceHtmlReference" as const,
+      workspaceId: "workspace", relativePath: child.relativePath, expectedRevision: "workspace-html:" + "a".repeat(64) } };
+    const snapshot = vi.mocked(network.readWorkspaceHtmlSnapshot).mockResolvedValue(childSnapshot);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start(); await app.openFiles(); await app.openFilesDirectory("docs");
+    await app.previewWorkspaceEntry(app.state.files.entries.find((entry) => entry.relativePath === original.relativePath)!);
+    const preview = app.state.files.preview; if (preview?.kind !== "text") throw new Error("HTML fixture missing");
+    const load = (path: string) => app.prepareFilesHtmlResources(preview, new AbortController().signal, path);
+    await expect(load("other/private.html")).rejects.toThrow(/current Workspace preview directory/u);
+    expect(snapshot).not.toHaveBeenCalled();
+    const page = await load(child.relativePath);
+    expect(page.html).toBe(childHtml); expect(app.state.files.preview).toBe(preview);
+    expect(snapshot).toHaveBeenCalledExactlyOnceWith(credential, handoffSnapshot.sessions[0]!.sessionId,
+      { workspaceId: "workspace", relativePath: child.relativePath, expectedRevision: "" }, expect.any(AbortSignal));
+    expect(() => app.assertFilesHtmlResourcesCurrent(page.leaseId)).not.toThrow();
+    app.releaseFilesHtmlResources(page.leaseId);
+    snapshot.mockResolvedValueOnce({ ...childSnapshot, html: "Unmatched document bytes" });
+    await expect(load(child.relativePath)).rejects.toThrow(/did not match the selected file/u);
+    let finish!: (value: typeof childSnapshot) => void;
+    snapshot.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const late = expect(load(child.relativePath)).rejects.toThrow(/source changed|cancelled|aborted/iu);
+    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+    app.closeFilesPreview(); finish(childSnapshot); await late;
+    expect(app.state.files.preview).toBeUndefined(); expect(network.submit).not.toHaveBeenCalled();
+  });
+
   it("freezes conversation images from authenticated canonical sources and rejects deletion before sharing", async () => {
     const bytes = galleryPngBytes(5, 4);
     const event = timelineGalleryEvent(bytes);

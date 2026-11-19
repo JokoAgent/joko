@@ -94,7 +94,7 @@ import { buildMobileMessageDeepLink, buildMobileTaskDeepLink, parseMobileNativeI
 import { awaitMobileMarkdownResourceRead, MobileMarkdownResourceReader, type MobileMarkdownResourceContext, type MobileMarkdownResourceDescriptor } from "./mobile-markdown-resources";
 import { mobileFileTextSource, normalizeMobileFileText } from "./mobile-file-text-source";
 import { MobileFileHtmlReader, type MobileFileHtmlContext, type MobileFileHtmlDescriptor } from "./mobile-file-html-reader";
-import { mobileFileHtmlComplete } from "./mobile-file-html";
+import { isMobileHtmlDocumentPath, mobileFileHtmlComplete } from "./mobile-file-html";
 import { HtmlResourceBudgetError } from "./mobile-file-html-resources";
 import { mobileGeneratedPreviewPages, mobileWorkspacePreviewPages, type MobileFilesPreviewPage, type MobileFilesPreviewPager } from "./mobile-files-preview-pager";
 import { MobileTimelineImageReader, type MobileTimelineImageContext, type MobileTimelineImagePreview } from "./mobile-timeline-images";
@@ -1123,6 +1123,8 @@ export class MobileClient {
   #conversationShare?: MobileConversationShareLease;
   #markdownResources = new MobileMarkdownResourceReader();
   #fileHtmlResources = new MobileFileHtmlReader();
+  #filesHtmlDocument?: { readonly id: string; readonly preview: Extract<MobileFilePreview, { kind: "text" }>;
+    readonly path: string; readonly controller: AbortController };
   #timelineImages = new MobileTimelineImageReader();
   #galleryBlobRead: ReturnType<MobileNetwork["downloadBlob"]> | undefined;
   #filesThumbnails: MobileFilesThumbnailReader;
@@ -4072,6 +4074,10 @@ export class MobileClient {
       this.#state = { ...next, files: { ...next.files, preview: undefined, previewPager: undefined } };
     }
     this.#markdownResources.retireStale();
+    const htmlDocument = this.#filesHtmlDocument;
+    if (htmlDocument && !this.filesHtmlResourceOwnerKey(htmlDocument.preview)) {
+      this.releaseFilesHtmlResources(htmlDocument.id);
+    }
     this.#fileHtmlResources.retireStale();
     this.#timelineImages.retainOwner(this.#taskAuthorityKey(true));
     this.#timelineImages.retireStale();
@@ -4125,6 +4131,7 @@ export class MobileClient {
     this.#retireImageGallery();
     if (this.#conversationShare) this.releaseConversationShare(this.#conversationShare.leaseId);
     this.#markdownResources.releaseAll();
+    if (this.#filesHtmlDocument) this.releaseFilesHtmlResources(this.#filesHtmlDocument.id);
     this.#fileHtmlResources.releaseAll();
     this.#timelineImages.releaseAll();
     this.#filesThumbnails.releaseAll();
@@ -8901,76 +8908,126 @@ export class MobileClient {
       && !this.#imageGallery ? JSON.stringify([owner, this.#filesEpoch, preview.sourceLabel, preview.revisionKey]) : undefined;
   }
 
-  async prepareFilesHtmlResources(preview: Extract<MobileFilePreview, { kind: "text" }>, signal: AbortSignal): Promise<MobileFileHtmlDescriptor> {
+  async prepareFilesHtmlResources(preview: Extract<MobileFilePreview, { kind: "text" }>, signal: AbortSignal,
+    documentPath?: string): Promise<MobileFileHtmlDescriptor> {
     const credential = this.#ready(); const ownerKey = this.filesHtmlResourceOwnerKey(preview);
     if (!ownerKey || !mobileFileHtmlComplete(preview)) throw new Error("The HTML page has no current complete file source.");
+    const root = preview.workspaceEntry;
+    const id = this.newId();
+    const navigation = documentPath === undefined ? undefined : { id, preview, path: documentPath, controller: new AbortController() };
+    if (navigation) {
+      if (this.#state.files.preview !== preview || !root || !isMobileHtmlDocumentPath(root.relativePath, navigation.path)) {
+        throw new Error("Select an HTML document in the current Workspace preview directory.");
+      }
+      if (this.#filesHtmlDocument) this.releaseFilesHtmlResources(this.#filesHtmlDocument.id);
+      this.#filesHtmlDocument = navigation;
+    }
     const assertCurrent = (currentSignal?: AbortSignal): void => {
       currentSignal?.throwIfAborted();
-      if (this.#disposed || this.#credential !== credential || this.filesHtmlResourceOwnerKey(preview) !== ownerKey) {
+      if (this.#disposed || this.#credential !== credential || this.filesHtmlResourceOwnerKey(preview) !== ownerKey
+        || navigation && this.#filesHtmlDocument !== navigation) {
         throw new Error("The HTML file source changed.");
       }
     };
-    const entry = preview.workspaceEntry; let context: MobileFileHtmlContext = { assertCurrent };
-    if (entry) {
-      const files = this.#filesContext();
-      if (!entry.revision || entry.kind !== FileKind.REGULAR || entry.workspaceId !== files.authority.workspace.workspaceId
-        || entry.relativePath !== preview.sourceLabel || workspaceEntryRevisionKey(entry.revision) !== preview.revisionKey) {
-        throw new Error("The HTML page has no canonical Workspace source.");
-      }
-      const revalidateEntry = async (currentSignal: AbortSignal): Promise<void> => {
-        assertCurrent(currentSignal);
-        const directory = await this.network.listWorkspaceDirectory(credential, entry.workspaceId, workspaceParentPath(entry.relativePath), currentSignal);
-        assertCurrent(currentSignal);
-        const matches = directory.entries.filter((candidate) => candidate.relativePath === entry.relativePath);
-        const fresh = matches.length === 1 ? matches[0] : undefined;
-        if (!directory.revision || !fresh?.revision || fresh.kind !== FileKind.REGULAR || fresh.workspaceId !== entry.workspaceId
-          || normalizeMediaType(fresh.mediaType) !== normalizeMediaType(entry.mediaType) || fresh.revision.byteSize !== entry.revision!.byteSize
-          || !workspaceComposerRevisionMatches(fresh.revision, entry.revision!)) throw new Error("The authenticated HTML file changed.");
-      };
-      let snapshotRevision = "";
-      const revalidateSource = async (currentSignal: AbortSignal): Promise<void> => {
-        await revalidateEntry(currentSignal);
-        const snapshot = await this.network.readWorkspaceHtmlSnapshot(credential, files.authority.sessionId,
-          { workspaceId: entry.workspaceId, relativePath: entry.relativePath, expectedRevision: snapshotRevision }, currentSignal);
-        assertCurrent(currentSignal);
-        if (snapshot.file.workspaceId !== entry.workspaceId || snapshot.file.relativePath !== entry.relativePath
-          || !/^workspace-html:[0-9a-f]{64}$/u.test(snapshot.file.expectedRevision)
-          || snapshotRevision !== "" && snapshot.file.expectedRevision !== snapshotRevision || snapshot.html !== preview.text) {
-          throw new Error("The authenticated HTML snapshot changed.");
-        }
-        snapshotRevision = snapshot.file.expectedRevision;
-      };
-      context = { baseDirectory: workspaceParentPath(entry.relativePath), assertCurrent, revalidateSource,
-        readResource: async (target, maximumBytes, currentSignal) => {
-          await revalidateEntry(currentSignal);
-          const path = canonicalWorkspacePath(target.relativePath); const parent = workspaceParentPath(path);
-          const base = workspaceParentPath(entry.relativePath);
-          if (base && !path.startsWith(base + "/")) throw new Error("The HTML resource left its parent directory.");
-          const directory = await this.network.listWorkspaceDirectory(credential, entry.workspaceId, parent, currentSignal);
-          assertCurrent(currentSignal);
-          const matches = directory.entries.filter((candidate) => candidate.relativePath === path);
-          const resource = matches.length === 1 ? matches[0] : undefined;
-          if (!directory.revision || !resource?.revision || resource.kind !== FileKind.REGULAR || resource.workspaceId !== entry.workspaceId) {
-            throw new Error("The HTML resource has no current canonical file.");
-          }
-          if (resource.revision.byteSize < 0n || resource.revision.byteSize > BigInt(maximumBytes)) {
-            throw new HtmlResourceBudgetError("The HTML resource exceeded its byte budget.");
-          }
-          const materialized = await this.network.materializeWorkspaceFileBlob(credential, entry.workspaceId, path, resource.revision, currentSignal);
-          assertCurrent(currentSignal);
-          const blob = workspaceComposerBlob(entry.workspaceId, resource, { $typeName: "joko.v1.FilePreview", entry: materialized.entry,
-            content: { case: "blob", value: materialized.blob }, truncated: false });
-          if (!blob || blob.byteSize !== resource.revision.byteSize || blob.byteSize > BigInt(maximumBytes)) throw new Error("The HTML resource Blob changed.");
-          const downloaded = await this.network.downloadBlob(credential, blob, currentSignal); assertCurrent(currentSignal);
-          await revalidateEntry(currentSignal);
-          return { blob, ...downloaded };
-        } };
+    const readSignal = navigation ? AbortSignal.any([signal, navigation.controller.signal, AbortSignal.timeout(15_000)]) : signal;
+    try {
+      const document = root ? await this.#prepareWorkspaceHtmlDocument(preview, root, navigation?.path, credential, assertCurrent, readSignal)
+        : { html: preview.text, context: { assertCurrent } };
+      assertCurrent(readSignal);
+      return await this.#fileHtmlResources.prepare(id, document.html, document.context, readSignal);
+    } catch (error) {
+      this.releaseFilesHtmlResources(id);
+      throw error;
     }
-    return this.#fileHtmlResources.prepare(this.newId(), preview.text, context, signal);
+  }
+
+  async #prepareWorkspaceHtmlDocument(preview: Extract<MobileFilePreview, { kind: "text" }>, root: WorkspaceEntry, documentPath: string | undefined,
+    credential: PairedCredential, assertCurrent: (signal?: AbortSignal) => void, signal: AbortSignal): Promise<{ html: string; context: MobileFileHtmlContext }> {
+    const files = this.#filesContext();
+    if (!root.revision || root.kind !== FileKind.REGULAR || root.workspaceId !== files.authority.workspace.workspaceId
+      || root.relativePath !== preview.sourceLabel || workspaceEntryRevisionKey(root.revision) !== preview.revisionKey) {
+      throw new Error("The HTML page has no canonical Workspace source.");
+    }
+    const workspaceId = root.workspaceId;
+    const readEntry = async (path: string, currentSignal: AbortSignal) => {
+      assertCurrent(currentSignal);
+      const directory = await awaitMobileMarkdownResourceRead(this.network.listWorkspaceDirectory(credential, workspaceId,
+        workspaceParentPath(path), currentSignal), currentSignal);
+      assertCurrent(currentSignal);
+      const matches = directory.entries.filter((candidate) => candidate.relativePath === path);
+      const fresh = matches.length === 1 ? matches[0] : undefined;
+      if (!directory.revision || !fresh?.revision || fresh.kind !== FileKind.REGULAR || fresh.workspaceId !== workspaceId) {
+        throw new Error("The authenticated HTML file is unavailable.");
+      }
+      return { entry: fresh, revision: fresh.revision };
+    };
+    const { entry, revision } = documentPath === undefined ? { entry: root, revision: root.revision } : await readEntry(documentPath, signal);
+    const relativePath = entry.relativePath;
+    const base = workspaceParentPath(relativePath);
+    const revalidateEntry = async (currentSignal: AbortSignal): Promise<void> => {
+      const fresh = await readEntry(relativePath, currentSignal);
+      if (normalizeMediaType(fresh.entry.mediaType) !== normalizeMediaType(entry.mediaType) || fresh.revision.byteSize !== revision.byteSize
+        || !workspaceComposerRevisionMatches(fresh.revision, revision)) throw new Error("The authenticated HTML file changed.");
+    };
+    let snapshotRevision = "";
+    const readSnapshot = async (currentSignal: AbortSignal): Promise<string> => {
+      assertCurrent(currentSignal);
+      const snapshot = await awaitMobileMarkdownResourceRead(this.network.readWorkspaceHtmlSnapshot(credential, files.authority.sessionId,
+        { workspaceId, relativePath, expectedRevision: snapshotRevision }, currentSignal), currentSignal);
+      assertCurrent(currentSignal);
+      if (snapshot.file.workspaceId !== workspaceId || snapshot.file.relativePath !== relativePath
+        || !/^workspace-html:[0-9a-f]{64}$/u.test(snapshot.file.expectedRevision)
+        || snapshotRevision !== "" && snapshot.file.expectedRevision !== snapshotRevision) {
+        throw new Error("The authenticated HTML snapshot changed.");
+      }
+      snapshotRevision = snapshot.file.expectedRevision;
+      return snapshot.html;
+    };
+    let html = preview.text;
+    if (documentPath !== undefined) {
+      if (normalizeMediaType(entry.mediaType) !== "text/html" || revision.byteSize < 0n || revision.byteSize > 2_097_152n) {
+        throw new Error("HTML previews require a complete file of at most 2 MiB.");
+      }
+      html = await readSnapshot(signal);
+      const bytes = new TextEncoder().encode(html);
+      if (BigInt(bytes.byteLength) !== revision.byteSize || revision.sha256Hex && bytesToHex(sha256(bytes)) !== revision.sha256Hex) {
+        throw new Error("The authenticated HTML snapshot did not match the selected file.");
+      }
+      await revalidateEntry(signal);
+    }
+    const revalidateSource = async (currentSignal: AbortSignal): Promise<void> => {
+      await revalidateEntry(currentSignal);
+      if (await readSnapshot(currentSignal) !== html) throw new Error("The authenticated HTML snapshot changed.");
+    };
+    return { html, context: { baseDirectory: base, assertCurrent, revalidateSource,
+      readResource: async (target, maximumBytes, currentSignal) => {
+        await revalidateEntry(currentSignal);
+        const path = canonicalWorkspacePath(target.relativePath);
+        if (base && !path.startsWith(base + "/")) throw new Error("The HTML resource left its parent directory.");
+        const { entry: resource, revision: resourceRevision } = await readEntry(path, currentSignal);
+        if (resourceRevision.byteSize < 0n || resourceRevision.byteSize > BigInt(maximumBytes)) {
+          throw new HtmlResourceBudgetError("The HTML resource exceeded its byte budget.");
+        }
+        const materialized = await this.network.materializeWorkspaceFileBlob(credential, workspaceId, path, resourceRevision, currentSignal);
+        assertCurrent(currentSignal);
+        const blob = workspaceComposerBlob(workspaceId, resource, { $typeName: "joko.v1.FilePreview", entry: materialized.entry,
+          content: { case: "blob", value: materialized.blob }, truncated: false });
+        if (!blob || blob.byteSize !== resourceRevision.byteSize || blob.byteSize > BigInt(maximumBytes)) throw new Error("The HTML resource Blob changed.");
+        const downloaded = await this.network.downloadBlob(credential, blob, currentSignal);
+        assertCurrent(currentSignal);
+        await revalidateEntry(currentSignal);
+        return { blob, ...downloaded };
+      } } };
   }
 
   assertFilesHtmlResourcesCurrent(leaseId: string): void { this.#fileHtmlResources.assertCurrent(leaseId); }
-  releaseFilesHtmlResources(leaseId: string): void { this.#fileHtmlResources.release(leaseId); }
+  releaseFilesHtmlResources(leaseId: string): void {
+    this.#fileHtmlResources.release(leaseId);
+    if (this.#filesHtmlDocument?.id === leaseId) {
+      this.#filesHtmlDocument.controller.abort();
+      this.#filesHtmlDocument = undefined;
+    }
+  }
 
   timelineImagePreviewOwnerKey(): string | undefined { return this.#taskAuthorityKey(true); }
 
@@ -17254,7 +17311,9 @@ export class MobileClient {
 
   #scheduleFilesRefresh(context: MobileFilesContext, epoch: number, signal: AbortSignal, change: WorkspaceFileChange): void {
     const path = this.#state.files.preview?.workspacePath;
-    if (path !== undefined && workspaceWatchChangeAffectsPath(change, path)) this.closeFilesPreview();
+    const html = this.#filesHtmlDocument;
+    if (path !== undefined && workspaceWatchChangeAffectsPath(change, path)
+      || html && html.preview === this.#state.files.preview && workspaceWatchChangeAffectsPath(change, html.path)) this.closeFilesPreview();
     if (signal.aborted || !this.#currentFiles(epoch, context.key) || this.#credential !== context.credential) return;
     if (this.#filesRefreshTimer !== undefined) clearTimeout(this.#filesRefreshTimer);
     this.#filesRefreshTimer = setTimeout(() => {

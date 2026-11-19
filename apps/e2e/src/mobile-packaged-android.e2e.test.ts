@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import { capabilityNames, RunState } from "@joko/contracts";
@@ -34,7 +35,9 @@ const evidenceSteps = {
   "open-canonical-file": { action: "resource-navigation", assertions: ["canonical-file-contents", "canonical-line-focus"] },
   "copy-file-source": { action: "clipboard", assertions: ["copy-source-completed"] },
   "force-stop-and-reconnect": { action: "lifecycle", assertions: ["application-process-stopped", "application-restarted", "restored-task-title", "persisted-task-input"] },
-  "restore-canonical-file": { action: "lifecycle", assertions: ["restored-file-contents", "restored-line-focus", "no-duplicate-dispatch", "one-persisted-run", "one-mobile-connection", "no-application-crash", "run-succeeded"] }
+  "restore-canonical-file": { action: "lifecycle", assertions: ["restored-file-contents", "restored-line-focus", "no-duplicate-dispatch", "one-persisted-run", "one-mobile-connection", "no-application-crash", "run-succeeded"] },
+  "browse-workspace-html": { action: "resource-navigation", assertions: ["canonical-html-link", "child-document-fragment", "back-and-forward", "document-reload"] },
+  "open-isolated-html-website": { action: "native-address", assertions: ["native-address-entry", "website-rendered", "no-node-credentials", "return-to-file-history"] }
 } as const;
 type EvidenceStepName = keyof typeof evidenceSteps;
 type EvidenceAction = "tap" | "text-entry" | "launch" | "double-tap" | "swipe" | "force-stop" | "install";
@@ -43,7 +46,7 @@ type EvidenceScreenshot = "header" | "actions" | "timeline" | "gallery" | "galle
   | "gallery-error" | "restored-error" | "file-error" | "resource-candidate" | "resource-error"
   | "connection-add" | "connection-error" | "connection-identity-error" | "actions-scrolled" | "share-selection" | "share-selection-error"
   | "native-user-quote-menu" | "native-assistant-quote-menu"
-  | "native-user-message-quote" | "native-assistant-message-quote" | "native-message-quote-error";
+  | "native-user-message-quote" | "native-assistant-message-quote" | "native-message-quote-error" | "html-guide" | "html-website";
 type EvidenceResult = "running" | "passed" | "failed";
 type EvidenceStep = {
   name: EvidenceStepName;
@@ -151,7 +154,7 @@ afterEach(async () => {
 }, 90_000);
 
 nativeIt("pairs with a trusted node key, sends through native rich input, opens canonical resources, and resumes without resending", {
-  timeout: 420_000
+  timeout: 480_000
 }, async () => {
   if (!serial || !/^emulator-\d+$/u.test(serial) || !avd?.startsWith("joko-")
     || !adbExecutable || !isAbsolute(adbExecutable) || !apkPath || !isAbsolute(apkPath)) {
@@ -232,6 +235,11 @@ async function runNativeScenario(): Promise<void> {
   await writeFile(join(current.workspaceDirectory, "images", "pixel.png"), Buffer.from(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"));
   await writeFile(join(current.workspaceDirectory, "README.md"), "first\nfocus line\nlast\n");
+  await mkdir(join(current.workspaceDirectory, "html-guide"));
+  await writeFile(join(current.workspaceDirectory, "html-guide", "index.html"),
+    '<meta name="viewport" content="width=device-width"><a style="display:block;padding:20px;font-size:24px" href="./details.html#chapter">Open the guide</a>');
+  await writeFile(join(current.workspaceDirectory, "html-guide", "details.html"),
+    '<meta name="viewport" content="width=device-width"><h1 id="chapter">Workspace guide chapter</h1>');
   const manager = await current.pair("Android fixture manager");
   const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
     createSessionMutation({ backendId: profile.id, targetId: current.targetId(profile.id), displayName: taskName })));
@@ -505,6 +513,66 @@ async function runNativeScenario(): Promise<void> {
   }
   const run = current.application.store.listRuns({ sessionId })[0]!;
   expect((await manager.clients.run.getRun({ runId: run.descriptor.id })).run?.state).toBe(RunState.SUCCEEDED);
+  await completeStep();
+
+  await beginStep("browse-workspace-html");
+  await tap("Back to Files");
+  await tap("Open directory html-guide");
+  await tap("Preview file index.html");
+  await tap("Open the guide");
+  const detailsAddress = "html-guide/details.html#chapter";
+  const waitAddress = (value: string) => waitNode((node) => node.className === "android.widget.EditText" && node.text === value, "HTML display path " + value);
+  const waitChapter = () => waitNode((node) => node.text === "Workspace guide chapter" || node.contentDescription === "Workspace guide chapter", "rendered Workspace guide chapter");
+  await waitAddress(detailsAddress);
+  await waitChapter();
+  await tap("Previous page");
+  await waitAddress("html-guide/index.html");
+  await waitNode((node) => node.text === "Open the guide" || node.contentDescription === "Open the guide", "back to the rendered guide link");
+  await tap("Next page");
+  await waitAddress(detailsAddress);
+  await waitChapter();
+  await tap("Refresh");
+  await waitChapter();
+  await screenshot("html-guide");
+  await completeStep();
+
+  await beginStep("open-isolated-html-website");
+  const siteRequests: boolean[] = [];
+  const site = createServer((request, response) => {
+    if (request.url !== "/viewer") { response.writeHead(404).end(); return; }
+    siteRequests.push(request.headers.authorization !== undefined || request.headers.cookie !== undefined);
+    response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end(
+      '<meta name="viewport" content="width=device-width"><h1>Isolated website fixture</h1>');
+  });
+  await new Promise<void>((resolve, reject) => {
+    site.once("error", reject); site.listen(0, "127.0.0.1", () => { site.removeListener("error", reject); resolve(); });
+  });
+  const sitePort = site.address();
+  let siteReverse: string | undefined;
+  try {
+    if (!sitePort || typeof sitePort === "string") throw new Error("The owned website fixture has no TCP address.");
+    const port = "tcp:" + sitePort.port;
+    await adb("reverse", port, port); siteReverse = port;
+    const url = `http://127.0.0.1:${sitePort.port}/viewer`;
+    await interaction("text-entry", async () => {
+      await tapNode(await waitAddress(detailsAddress));
+      await adb("shell", "input", "keyevent", "KEYCODE_MOVE_END", ...Array<string>(detailsAddress.length).fill("KEYCODE_DEL"));
+      await adb("shell", "input", "text", `'${url}'`);
+      await adb("shell", "input", "keyevent", "KEYCODE_BACK");
+    });
+    await waitAddress(url);
+    expect(siteRequests).toEqual([]);
+    await tap("Open");
+    await waitNode((node) => node.text === "Isolated website fixture" || node.contentDescription === "Isolated website fixture", "isolated website rendered in the native app");
+    expect(siteRequests.length).toBeGreaterThan(0); expect(siteRequests.every((credentialSent) => !credentialSent)).toBe(true);
+    await screenshot("html-website");
+    await tap("Previous page");
+    await waitAddress(detailsAddress);
+    await waitChapter();
+  } finally {
+    try { if (siteReverse !== undefined) await adb("reverse", "--remove", siteReverse); }
+    finally { site.closeAllConnections(); await new Promise<void>((resolve) => site.close(() => resolve())); }
+  }
   await completeStep();
 }
 

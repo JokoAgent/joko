@@ -8621,7 +8621,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
           } else openResult(source.result);
         }} />}
     </View>
-    <FilePreviewModal colors={colors} preview={files.preview} source={currentPreviewSource} pager={files.previewPager}
+    <FilePreviewModal colors={colors} preview={files.preview} source={currentPreviewSource} pager={files.previewPager} workspaceHtmlNavigation
       onQuoted={() => { setPreviewSource(undefined); client.closeFiles(); onAdded(); }}
       onNavigate={(id, key) => run(() => client.selectFilesPreviewPage(id, key))} busy={handoffBusy} locale={locale}
       sharing={fileShareBusy} shareProgress={fileShareProgress}
@@ -8718,11 +8718,12 @@ function FileSearchResultRow({ result, colors, locale, disabled, shareDisabled, 
 
 function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sharing = false, shareProgress, backLabel,
   backAccessibilityLabel, loadingLabel, locale, copying = false, copyLabel, copyStatus, onCopy,
-  onAdd, onOpenImage, onShare, onClose, onQuoted }: {
+  onAdd, onOpenImage, onShare, onClose, onQuoted, workspaceHtmlNavigation }: {
   colors: Colors;
   preview: MobileFilePreview | undefined;
   source?: MobileFilesComposerSource;
   pager?: FilesPreviewPager;
+  workspaceHtmlNavigation?: boolean;
   onNavigate?: (pagerId: string, pageKey: string) => void;
   busy: boolean;
   sharing?: boolean;
@@ -8904,7 +8905,8 @@ function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sh
             />
           </View>
           : preview.kind === "text" ? <MobileFileTextPreview key={preview.revisionKey + "/" + preview.focusLine + "/" + preview.focusColumn}
-            preview={preview} locale={locale} colors={colors} client={client} onViewChange={onTextViewChange} actions={{ ...textActions, busy: blocked || !textActions.available }} />
+            preview={preview} locale={locale} colors={colors} client={client} onViewChange={onTextViewChange}
+            workspaceHtmlNavigation={workspaceHtmlNavigation} actions={{ ...textActions, busy: blocked || !textActions.available }} />
           : <View style={styles.previewMessage}>
             <Text accessibilityRole="alert" style={[styles.label, { color: preview.kind === "error" ? colors.negative : colors.ink }]}>
               {mobileMessage(locale, preview.kind === "error" ? "preview.unavailable" : "preview.noInApp")}
