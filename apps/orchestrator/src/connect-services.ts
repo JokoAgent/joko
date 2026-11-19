@@ -1930,6 +1930,9 @@ export function createConnectServices(application: OrchestratorApplication, proj
       const scope = request.scope ?? create(contract.SnapshotScopeSchema, {
         kind: { case: "owner", value: create(contract.OwnerSnapshotScopeSchema, {}) }
       });
+      if (scope.kind.case === "session" && scope.kind.value.recentTimelineItems > 0 && scope.kind.value.sessionId.trim() !== "") {
+        await dependencies.sessionHost.hydrateBoundNativeCatalogHistory(scope.kind.value.sessionId, authenticated, signal);
+      }
       const projected = projectStoreSnapshot(dependencies.store, scope, {
         server: serverInfo(dependencies, now()),
         now,
@@ -2980,14 +2983,16 @@ export function createConnectServices(application: OrchestratorApplication, proj
       const result = paginate(values, request.page);
       return { backgroundTasks: result.values, page: result.page };
     },
-    listSessionTimeline: (request, context) => {
-      authenticate(context);
+    listSessionTimeline: (request, context) => readAuthorized(context, async (authenticated, signal) => {
       const aroundEventId = request.aroundEventId.trim();
       if (aroundEventId !== "" && request.beforeCursor !== undefined) {
         throw invalidArgument("around_event_id and before_cursor are mutually exclusive");
       }
       if (request.aroundEventId !== "" && aroundEventId === "") {
         throw invalidArgument("around_event_id must not be blank");
+      }
+      if (aroundEventId === "" && request.beforeCursor === undefined && request.sessionId.trim() !== "") {
+        await dependencies.sessionHost.hydrateBoundNativeCatalogHistory(request.sessionId, authenticated, signal);
       }
       const before = request.beforeCursor === undefined
         ? undefined
@@ -3015,7 +3020,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
           ? toProtoEventCursor(selected[0].globalCursor, generation, now())
           : undefined
       };
-    },
+    }),
     searchSessionMessages: async (request, context) => {
       authenticate(context);
       const scope = request.scope.case === "sessionId"

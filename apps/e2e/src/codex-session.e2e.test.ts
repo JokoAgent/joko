@@ -1,14 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { create, fromBinary } from "@bufbuild/protobuf";
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { createCodexAdapter, AppServerHost, TransportFault } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
-import { EntityKind, GetOperationRequestSchema, ObjectiveStatus, OperationMutationSchema, OperationState, RetryState, RunState, ScheduleRecurrenceSchema,
-  SubmitOperationRequestSchema, ToolCallState } from "@joko/contracts";
+import { EntityKind, GetOperationRequestSchema, MessageRole, NativeCatalogImportPresentationSchema, NativeSessionPlacement, NativeSessionStartSchema,
+  ObjectiveStatus, OperationMutationSchema, OperationState, RetryState, RunState, ScheduleRecurrenceSchema,
+  SubmitOperationRequestSchema, ToolCallState, type Event } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it, vi } from "vitest";
 
@@ -20,6 +22,122 @@ import {
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
   ? it : it.skip;
+
+it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog task without a cold executable", async (mode) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-offline-catalog-")));
+  const profileDirectory = join(root, "codex-home");
+  const backendId = "codex-offline-catalog";
+  const threadId = randomUUID();
+  const turnId = "original-completed-turn";
+  const question = "Which deliverables did we finish?";
+  const answer = "We finished the review and release notes.";
+  const native = new FakeCodexAppServer();
+  native.codexHome = profileDirectory;
+  let executablePresent = true;
+  let failedStarts = 0;
+  const host = new AppServerHost({ transportFactory: () => {
+    if (executablePresent) return native.createTransport();
+    failedStarts += 1;
+    throw new TransportFault("spawn_failed", "The original configured Codex executable is unavailable.");
+  } });
+  let fixture: OrchestratorE2eFixture | undefined;
+  try {
+    const sessions = join(profileDirectory, "sessions");
+    await mkdir(sessions, { recursive: true });
+    fixture = await OrchestratorE2eFixture.start({ rootDirectory: root, backendFactories: [{
+      instanceId: backendId, adapterKind: "codex", displayName: "Codex catalog history fixture",
+      create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host,
+        profileDirectory, catalogProfileDirectories: [profileDirectory] })
+    }] });
+    const targetId = fixture.targetId(backendId);
+    const store = fixture.application.store;
+    const cwd = store.getTarget(targetId).descriptor.workspaceRoot;
+    const seeded = native.seedThread(cwd, [{ id: turnId, status: "completed", items: [
+      { id: "original-user", type: "userMessage", content: [{ type: "text", text: question, text_elements: [] }] },
+      { id: "original-assistant", type: "agentMessage", text: answer, phase: null, memoryCitation: null, delivery: null }
+    ] }]);
+    native.threads.set(threadId, { ...native.threads.get(seeded)!, id: threadId });
+    native.threads.delete(seeded);
+
+    const at = new Date("2026-02-05T08:30:00Z");
+    const event = (type: string, fields: Record<string, unknown> = {}) => ({ type: "event_msg", payload: { type, ...fields } });
+    const records = [
+      { type: "session_meta", payload: { id: threadId, cwd, source: "cli", history_mode: mode } },
+      event("task_started", { turn_id: turnId }),
+      { type: "response_item", payload: { type: "message", role: "user", content: [{
+        type: "input_text", text: "<environment_context>Private runtime settings</environment_context>"
+      }] } },
+      ...(mode === "legacy" ? [event("user_message", { message: question }), event("agent_message", { message: answer })] : [
+        event("item_completed", { thread_id: threadId, turn_id: turnId,
+          item: { type: "UserMessage", id: "original-user", content: [{ type: "text", text: question, text_elements: [] }] } }),
+        event("item_completed", { thread_id: threadId, turn_id: turnId,
+          item: { type: "AgentMessage", id: "original-assistant", content: [{ type: "Text", text: answer }] } })
+      ]),
+      event("task_complete", { turn_id: turnId })
+    ];
+    const rollout = join(sessions, `rollout-2026-02-05T08-30-00-${threadId}.jsonl`);
+    const sourceBytes = records.map((record, index) => JSON.stringify({ ...record,
+      timestamp: new Date(at.getTime() + index * 1_000).toISOString() })).join("\n") + "\n";
+    await writeFile(rollout, sourceBytes);
+    const database = new DatabaseSync(join(profileDirectory, "state_5.sqlite"));
+    try {
+      database.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, rollout_path TEXT, title TEXT, source TEXT, created_at INTEGER, updated_at INTEGER, archived INTEGER)");
+      database.prepare("INSERT INTO threads VALUES (?, ?, ?, ?, 'cli', ?, ?, 0)")
+        .run(threadId, cwd, rollout, "Original catalog history", at.getTime() / 1_000, at.getTime() / 1_000 + 5);
+    } finally { database.close(); }
+
+    const { clients, connectionId } = await fixture.pair("Local catalog Owner");
+    const catalog = await clients.session.scanNativeSessionCatalog({ backendId, force: true });
+    const entry = catalog.entries.find(candidate => candidate.nativeSessionId === threadId);
+    if (entry === undefined) throw new Error("The original local Codex catalog entry is missing.");
+    expect(entry.projectTargetId).toBe(targetId);
+    const mutation = createSessionMutation({ backendId, targetId, displayName: "Original catalog history" });
+    if (mutation.payload.case !== "createSession") throw new Error("Expected a catalog import mutation.");
+    mutation.payload.value.initialPlacement = NativeSessionPlacement.PROJECT;
+    mutation.payload.value.nativeStart = create(NativeSessionStartSchema, { kind: {
+      case: "attach", value: { opaqueNativeReference: entry.nativeReference }
+    } });
+    mutation.payload.value.catalogImport = create(NativeCatalogImportPresentationSchema, {
+      projectId: targetId, snapshotToken: catalog.snapshotToken, createdAt: entry.createdAt, modifiedAt: entry.modifiedAt
+    });
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId, mutation));
+    expect(store.listEvents({ sessionId, messageCompleteOnly: true })).toEqual([]);
+
+    executablePresent = false;
+    await native.transport!.exit(false);
+    await expect(clients.session.listRuntimeCommands({ sessionId })).rejects.toThrow();
+    const startsBeforeReading = failedStarts;
+    expect(startsBeforeReading).toBeGreaterThan(0);
+    const timeline = async () => (await clients.session.listSessionTimeline({ sessionId })).events;
+    const snapshot = async () => (await clients.event.getSnapshot({
+      scope: { kind: { case: "session", value: { sessionId, recentTimelineItems: 200 } } }
+    })).snapshot!.timeline;
+    const completed = (events: readonly Event[]) => events.flatMap(({ payload }) => payload.case === "messageCompleted" ? [payload.value] : []);
+    await expect(fixture.anonymous.session.listSessionTimeline({ sessionId })).rejects.toThrow();
+    const [first, second] = mode === "legacy" ? [await timeline(), await snapshot()] : [await snapshot(), await timeline()];
+    for (const visible of [first, second]) {
+      expect(completed(visible)).toMatchObject([{
+        role: MessageRole.USER, blocks: [{ content: { case: "text", value: question } }]
+      }, {
+        role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: answer } }]
+      }]);
+      expect(completed(visible).every(message => message.nativeIdentity === undefined)).toBe(true);
+    }
+    expect(failedStarts).toBe(startsBeforeReading);
+    expect(await readFile(rollout, "utf8")).toBe(sourceBytes);
+
+    executablePresent = true;
+    await clients.session.listRuntimeCommands({ sessionId });
+    const canonical = completed(await timeline());
+    expect(canonical.map(message => message.nativeIdentity?.entryId)).toEqual(["original-user", "original-assistant"]);
+    expect(completed(await snapshot())).toEqual(canonical);
+    expect(store.listEvents({ sessionId }).some(event => event.payload.type === "history_pruned")).toBe(true);
+  } finally {
+    await fixture?.close();
+    await host.shutdown();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 it("keeps one-shot native Codex schedules on the saved account through refresh, logout and replacement", async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-scheduled-account-"));

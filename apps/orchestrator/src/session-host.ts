@@ -74,6 +74,7 @@ import { JokoError, NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD, containsRecognizedC
 import {
   AuthorizationError,
   ensureSideChatHistoryBoundary,
+  isTargetDeleted,
   InvalidStateTransitionError,
   OperationConflictError,
   OperationInProgressError,
@@ -1774,6 +1775,56 @@ export class SessionHost {
     const result = await owner.adapter.readNativeSessionPreview(entry);
     if (this.#adapters.get(backendId) !== owner.adapter || this.#adapterGenerations.get(backendId) !== owner.generation) throw new StoreError("The native preview owner changed. Refresh its sources.");
     return result;
+  }
+
+  async hydrateBoundNativeCatalogHistory(
+    sessionId: string,
+    connection: Pick<ConnectionRecord, "id" | "authKeyDigest">,
+    signal: AbortSignal
+  ): Promise<void> {
+    signal.throwIfAborted();
+    if (this.#disposed) return;
+    const session = this.#store.findSession(sessionId)?.descriptor;
+    if (session === undefined || session.deletedAt !== undefined || session.hidden || session.remoteWorkspace !== undefined) return;
+    const adapter = this.#adapters.get(session.backendId);
+    if (adapter?.readBoundNativeCatalogHistory === undefined || this.#store.findLatestNativeSessionChange(sessionId) !== undefined
+      || this.#store.hasNativeCatalogRolloutHistory(sessionId)) return;
+    const original = this.#store.findNativeCatalogCreation(sessionId);
+    if (original === undefined || !isRecord(original.body) || original.body["targetId"] !== session.targetId) return;
+    const start = original.body["nativeStart"];
+    if (!isRecord(start) || start["kind"] !== "attach") return;
+    if (start["nativeReference"] !== session.binding.opaqueRef) {
+      const adoption = this.#store.findNativeCatalogAdoption(original.id);
+      if (adoption?.state !== "adopted" || adoption.sessionId !== session.id || adoption.targetId !== session.targetId
+        || adoption.backendId !== session.backendId || adoption.binding.opaqueRef !== session.binding.opaqueRef
+        || adoption.binding.nativeSessionId !== session.binding.nativeSessionId) return;
+    }
+    const target = this.#store.getTarget(session.targetId);
+    if (isTargetDeleted(target) || !target.descriptor.trusted || target.descriptor.remoteWorkspace !== undefined
+      || target.descriptor.backendId !== session.backendId) return;
+    const adapterGeneration = this.requireAdapterGeneration(session.backendId, adapter);
+    let messages: NativeSessionPreview["messages"] | undefined;
+    try {
+      messages = await adapter.readBoundNativeCatalogHistory({ binding: session.binding, target: target.descriptor, signal });
+    } catch {
+      signal.throwIfAborted();
+      return;
+    }
+    signal.throwIfAborted();
+    if (messages === undefined || messages.length === 0 || this.#disposed) return;
+    this.#store.transaction((store) => {
+      store.authorizeConnection(connection.id, connection.authKeyDigest);
+      const current = store.findSession(session.id)?.descriptor;
+      if (current === undefined || current.deletedAt !== undefined || current.hidden || current.targetId !== session.targetId
+        || current.backendId !== session.backendId || current.remoteWorkspace !== undefined
+        || current.binding.opaqueRef !== session.binding.opaqueRef || current.binding.nativeSessionId !== session.binding.nativeSessionId
+        || this.#adapters.get(session.backendId) !== adapter || this.#adapterGenerations.get(session.backendId) !== adapterGeneration
+        || store.getTarget(session.targetId).revision !== target.revision
+        || store.findLatestNativeSessionChange(session.id) !== undefined) return;
+      // This projection belongs to the original durable thread. A failed cold
+      // resume can advance the execution generation without changing it.
+      store.appendNativeCatalogRolloutHistory(current, original.id, messages);
+    });
   }
 
   async scanNativeSessionCatalog(backendId: string, force = false): Promise<NativeSessionCatalogResult> {
@@ -17999,6 +18050,9 @@ export class SessionHost {
       readonly nativeEntryIds: ReadonlySet<string>;
     }
   ): void {
+    if (adapter.readBoundNativeCatalogHistory !== undefined) {
+      store.retireNativeCatalogRolloutHistory(session.id, stableId("operation", `retire-catalog-rollout:${session.id}`));
+    }
     type AcceptedUserMetadata = {
       readonly acceptedInput: PromptInput | undefined;
       readonly automationOrigin: Extract<EventPayload, { readonly type: "message_complete" }>["automationOrigin"];

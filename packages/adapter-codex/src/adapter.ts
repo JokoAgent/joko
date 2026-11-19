@@ -96,6 +96,7 @@ import {
 } from "./protocol.js";
 import { codexNativeDispatchFingerprint, projectCodexNativeHistory } from "./native-history.js";
 import { readCodexNativeSessionPreview } from "./native-session-preview.js";
+import { readCodexCatalogRolloutMessages } from "./catalog-rollout-history.js";
 import { codexAccountResetFacts } from "./account-rate-limit-resets.js";
 import {
   inspectCodexCatalogMaterialization,
@@ -104,6 +105,7 @@ import {
 } from "./session-materialization.js";
 import {
   codexProfileKey,
+  readCodexCatalogHistorySource,
   scanCodexSessionCatalog,
   type CodexCatalogSource
 } from "./session-catalog.js";
@@ -1811,6 +1813,27 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const nativeId = parseNativeReference(entry.nativeReference).threadId;
     if (source === undefined || entry.nativeSessionId !== nativeId) throw expiredCatalogReference();
     return readCodexNativeSessionPreview(source, nativeId);
+  }
+
+  async readBoundNativeCatalogHistory({ binding, target, signal }: {
+    readonly binding: NativeSessionBinding;
+    readonly target: TargetDescriptor;
+    readonly signal: AbortSignal;
+  }): Promise<NativeSessionPreview["messages"] | undefined> {
+    if (target.remoteWorkspace !== undefined || !target.trusted || this.#hosted !== undefined) return undefined;
+    signal.throwIfAborted();
+    const scope = await this.#readScope(target, signal, { startLocalHost: false });
+    const reference = parseNativeReference(binding.opaqueRef);
+    if (reference.profileKey !== scope.profileKey || reference.sourceFingerprint !== undefined || reference.threadId !== binding.nativeSessionId) {
+      return undefined;
+    }
+    const owned = await readCodexCatalogHistorySource(this.#profileDirectory, scope.profileKey, reference.threadId);
+    if (owned === undefined || relative(scope.workspaceRoot, await realpath(owned.workingDirectory)) !== "") return undefined;
+    signal.throwIfAborted();
+    const messages = await readCodexCatalogRolloutMessages(owned.source, reference.threadId, scope.workspaceRoot);
+    signal.throwIfAborted();
+    scope.assertAuthorityCurrent();
+    return messages;
   }
 
   async bindCatalogSession(
