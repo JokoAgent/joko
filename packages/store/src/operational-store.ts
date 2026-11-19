@@ -15997,6 +15997,17 @@ export class OperationalStore {
     `).all(at, normalizeLimit(limit, 100), normalizeOffset(offset)) as Row[]).map(scheduleFromRow);
   }
 
+  listExpiredEnabledSchedules(at: number, afterId = "", limit = 100): ScheduleRecord[] {
+    this.assertOpen();
+    return (this.database.prepare(`
+      SELECT * FROM schedules
+      WHERE enabled = 1 AND id > ? AND json_extract(execution_snapshot_json, '$.scheduler.format') = 1
+        AND json_type(execution_snapshot_json, '$.scheduler.expireAt') = 'integer'
+        AND json_extract(execution_snapshot_json, '$.scheduler.expireAt') BETWEEN 0 AND ?
+      ORDER BY id LIMIT ?
+    `).all(afterId, at, normalizeLimit(limit, 100)) as Row[]).map(scheduleFromRow);
+  }
+
   /** Repair the retained future time only while the successful Agent admission
    * transaction still owns the Schedule revision. Edits and pauses own a new revision. */
   reconcileConsumedOneShotSchedules(): void {

@@ -373,6 +373,7 @@ export class ScheduleCoordinator {
       this.wakeQueuedRuns();
       void this.#host.reconcileScheduledWorktrees?.();
       const dueAt = this.#now(), dueSchedules: ScheduleRecord[] = [];
+      this.expireSchedulesAt(dueAt);
       // Capture every page before dispatch can advance or disable a due row.
       // Active occurrences can occupy the first page while later rows need slots.
       for (let offset = 0; ; offset += 100) {
@@ -1257,9 +1258,23 @@ export class ScheduleCoordinator {
     }
   }
 
+  private expireSchedulesAt(at: number): void {
+    let afterId = "";
+    while (true) {
+      const expired = this.#store.listExpiredEnabledSchedules(at, afterId);
+      for (const schedule of expired) {
+        // Let an occurrence already admitted before the cutoff settle under its own revision.
+        if ((this.#activeOccurrences.get(schedule.id)?.size ?? 0) === 0) this.expireSchedule(schedule, at);
+        afterId = schedule.id;
+      }
+      if (expired.length < 100) return;
+    }
+  }
+
   private expireSchedule(schedule: ScheduleRecord, now: number): void {
-    const current = this.#store.getSchedule(schedule.id);
-    if (!current.enabled) return;
+    const current = this.#store.findSchedule(schedule.id);
+    if (!current?.enabled || current.revision !== schedule.revision || this.#deletionFences.has(schedule.id)
+      || this.#store.findPendingScheduleDeletionCleanupForSchedule(schedule.id) !== undefined) return;
     this.#store.upsertSchedule(copyScheduleForCoordinator(current, {
       enabled: false,
       expectedRevision: current.revision,
