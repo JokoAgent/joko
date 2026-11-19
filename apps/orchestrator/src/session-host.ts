@@ -17300,7 +17300,8 @@ export class SessionHost {
       this.settleReviewRuntime(sessionId, this.reviewRuntimeOutcome(sessionId, outcome));
       return;
     }
-    await this.synchronizeNativeHistory(sessionId)
+    await this.synchronizeNativeHistory(sessionId, {}, outcome === "aborted" && settledRunId !== undefined
+      ? { interruptedRunId: settledRunId } : undefined)
       .catch((error: unknown) => this.recordFailure("native_history_settled_sync", error));
     const terminalUsageObserved = await this.refreshRuntimeUsage(sessionId, true, settledRunId)
       .catch((error: unknown) => {
@@ -18045,8 +18046,11 @@ export class SessionHost {
   private synchronizeNativeHistory(
     sessionId: string,
     allowance: BackendSideEffectAdmissionAllowance = {},
-    confirmation?: { readonly runId: string; readonly attemptId: string; readonly nativeTurnId: string }
+    observation?: { readonly runId: string; readonly attemptId: string; readonly nativeTurnId: string }
+      | { readonly interruptedRunId: string }
   ): Promise<AcceptedNativeTurnOutcome | undefined> {
+    const confirmation = observation !== undefined && "nativeTurnId" in observation ? observation : undefined;
+    const interruptedRunId = observation !== undefined && "interruptedRunId" in observation ? observation.interruptedRunId : undefined;
     const active = this.#active.get(sessionId);
     if (active?.adapter.getNativeHistoryProjection === undefined) return Promise.resolve(undefined);
     let lease: ActiveBackendSideEffectLease;
@@ -18104,7 +18108,10 @@ export class SessionHost {
           ? undefined
           : nativeDispatchRecoveryIsCompleted(store, current.descriptor, baseline, history);
         const acceptedOwners = journal?.entries.flatMap((entry) => {
-          const ownership = nativeDispatchHistoryOwnership(store, current.descriptor, entry, history, "accepted", confirmation?.nativeTurnId);
+          const ownership = nativeDispatchHistoryOwnership(store, current.descriptor, entry, history, "accepted", {
+            expectedCodexTurnId: confirmation?.nativeTurnId,
+            interruptedCodexRun: entry.runId === interruptedRunId && this.isOrdinaryLocalCodexSession(current)
+          });
           return ownership === undefined ? [] : [ownership];
         }) ?? [];
         const historyOwner = recovered ?? (acceptedOwners.length === 1 ? acceptedOwners[0] : undefined);
@@ -20263,7 +20270,7 @@ function nativeDispatchHistoryOwnership(
   baseline: NativeDispatchRecoveryBaseline,
   history: NativeHistoryProjection,
   mode: "recovery" | "accepted",
-  expectedCodexTurnId?: string
+  options: { readonly expectedCodexTurnId?: string | undefined; readonly interruptedCodexRun?: boolean } = {}
 ): NativeDispatchHistoryOwnership | undefined {
   const lineage = history.activeLineage;
   if (
@@ -20352,10 +20359,20 @@ function nativeDispatchHistoryOwnership(
       && event.payload.type === "status" && event.payload.key === key && event.metadata?.fields["turnStatus"] === state)
     && [...eventsByEntry.values()].every(events => events.every(event =>
       event.metadata?.namespace === "codex.native_history" && event.metadata.fields["turnId"] === turnId));
-  if (expectedCodexTurnId !== undefined && turnId === expectedCodexTurnId) {
+  const confirmsCodexTurn = options.expectedCodexTurnId !== undefined && turnId === options.expectedCodexTurnId;
+  if (typeof turnId === "string" && confirmsCodexTurn) {
     if (codexTurnStatus("native_turn_in_progress", "inProgress")) return { baseline, outcome: "in_progress", nativeEntryIds: suffixIds, codexTurnId: turnId };
     if (codexTurnStatus("native_turn_failed", "failed")) return { baseline, outcome: "failed", nativeEntryIds: suffixIds, codexTurnId: turnId };
-    if (codexTurnStatus("native_turn_interrupted", "interrupted")) return { baseline, outcome: "aborted", nativeEntryIds: suffixIds, codexTurnId: turnId };
+  }
+  const usageEntryId = run.descriptor.usage?.messageId;
+  const acceptedInterruptedUsage = mode === "accepted" && options.interruptedCodexRun === true
+    && run.descriptor.source === "user" && run.descriptor.parentRunId === undefined
+    && history.activeNavigationTarget?.kind === "native_entry" && usageEntryId !== undefined
+    && terminalAssistantMessages.length === 0
+    && eventsByEntry.get(usageEntryId)?.some(event => event.payload.type === "message_complete" && event.payload.role === "assistant");
+  if (typeof turnId === "string" && (confirmsCodexTurn || acceptedInterruptedUsage)
+    && codexTurnStatus("native_turn_interrupted", "interrupted")) {
+    return { baseline, outcome: "aborted", nativeEntryIds: suffixIds, codexTurnId: turnId };
   }
   if (mode === "recovery" && terminalAssistantMessages.length === 0 && codexTurnStatus("native_turn_failed", "failed")) {
     return { baseline, outcome: "failed", nativeEntryIds: suffixIds };

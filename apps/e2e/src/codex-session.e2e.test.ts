@@ -568,6 +568,83 @@ it("stops the original Codex Run before the first native turn write and leaves t
   }
 });
 
+it("keeps observed usage on the original Codex answer when a completed tool is the last interrupted item", async () => {
+  const backendId = "codex-interrupted-usage";
+  const native = new FakeCodexAppServer();
+  const host = new AppServerHost({ transportFactory: () => native.createTransport() });
+  let fixture: OrchestratorE2eFixture | undefined;
+  try {
+    fixture = await OrchestratorE2eFixture.start({ backendFactories: [{
+      instanceId: backendId, adapterKind: "codex", displayName: "Codex interrupted usage fixture",
+      create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host })
+    }] });
+    const { clients, connectionId, authKey } = await fixture.pair("Interrupted Codex usage owner");
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId,
+      createSessionMutation({ backendId, targetId: fixture.targetId(backendId) })));
+    const store = fixture.application.store;
+    const binding = store.getSession(sessionId).descriptor.binding;
+    const threadId = binding.nativeSessionId!;
+    const sent = await submit(clients.operation, connectionId,
+      sendInputMutation(sessionId, BigInt(binding.generation), "Check the working tree."));
+    const runId = queueRunIdFrom(sent);
+    await waitFor(async () => store.findQueueItemByRunId(sessionId, runId),
+      item => item?.state === "backend_accepted", "the accepted original Codex turn");
+    const thread = native.threads.get(threadId)!;
+    expect(thread.historyMode).toBe("paginated");
+    const turn = thread.turns[0]!;
+    const turnId = String(turn["id"]);
+    const assistant = { type: "agentMessage", id: "observed-codex-answer", text: "I have the first result.", phase: null };
+    const command = { type: "commandExecution", id: "observed-codex-command", command: "git status --short",
+      status: "completed", exitCode: 0, aggregatedOutput: "", durationMs: 1 };
+    const transport = native.transport!;
+    const report = (method: string, item: JsonObject) => transport.emitNotification(method, { threadId, turnId, item });
+    await report("item/started", { ...assistant, text: "" });
+    await transport.emitNotification("item/agentMessage/delta", { threadId, turnId, itemId: assistant.id, delta: assistant.text });
+    await report("item/completed", assistant);
+    await report("item/started", { ...command, status: "inProgress", exitCode: null });
+    await report("item/completed", command);
+    const originalItems = turn["items"];
+    expect(Array.isArray(originalItems)).toBe(true);
+    turn["items"] = [...(Array.isArray(originalItems) ? originalItems : []), assistant, command];
+    const sample = { totalTokens: 11, inputTokens: 8, outputTokens: 3, cachedInputTokens: 1, reasoningOutputTokens: 0 };
+    await transport.emitNotification("thread/tokenUsage/updated", {
+      threadId, turnId, tokenUsage: { total: sample, last: sample, modelContextWindow: 128_000 }
+    });
+    const originalUsage = (await waitFor(() => clients.run.getRun({ runId }),
+      ({ run }) => run?.usage?.usage?.totalTokens === 11n && run.usage.messageId === assistant.id,
+      "the exact usage on the original live answer")).run!.usage!;
+    const stop = await submit(clients.operation, connectionId, abortRunMutation(runId));
+    expect(stop.state, stop.error?.message).toBe(OperationState.SUCCEEDED);
+    expect(transport.requests.filter(request => request.method === "turn/interrupt").map(request => request.params))
+      .toEqual([{ threadId, turnId }]);
+    expect(turn["status"]).toBe("interrupted");
+    thread.status = { type: "idle" };
+    await transport.emitNotification("turn/completed", { threadId, turn });
+    const settled = (await waitFor(() => clients.run.getRun({ runId }),
+      ({ run }) => run?.state === RunState.ABORTED, "the original Codex interruption")).run!;
+    expect(settled.usage).toMatchObject({ usage: { totalTokens: 11n }, messageId: assistant.id });
+    expect(settled.usage!.completionEventId).not.toBe(originalUsage.completionEventId);
+
+    const reader = fixture.clients(authKey);
+    const scope = { kind: { case: "session" as const, value: { sessionId, recentTimelineItems: 200 } } };
+    const snapshot = (await reader.event.getSnapshot({ scope })).snapshot!;
+    expect(snapshot.runs.find(run => run.runId === runId)?.usage).toEqual(settled.usage);
+    for (const events of [snapshot.timeline, (await reader.session.listSessionTimeline({ sessionId })).events]) {
+      const assistantEvents = events.filter(event => event.payload?.kind.case === "messageCompleted"
+        && event.payload.kind.value.role === MessageRole.ASSISTANT);
+      expect(assistantEvents).toHaveLength(1);
+      expect(assistantEvents[0]).toMatchObject({ eventId: settled.usage!.completionEventId,
+        identity: { runId, operationId: sent.operationId }, payload: { kind: { value: {
+          nativeIdentity: { entryId: assistant.id }, messageId: assistant.id,
+          blocks: [{ content: { case: "text", value: assistant.text } }], turnUsage: settled.usage
+        } } } });
+    }
+  } finally {
+    await fixture?.close();
+    await host.shutdown();
+  }
+});
+
 it("holds the same Codex Objective when its interrupted native turn completes naturally", async () => {
   const backendId = "codex-objective-stop";
   const native = new FakeCodexAppServer();
