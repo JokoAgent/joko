@@ -70,7 +70,7 @@ import type {
   UserShellResult,
   UsageSnapshot
 } from "@joko/core";
-import { JokoError, NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD, containsRecognizedCredential, decideToolCall, evaluateOrderedPolicyRules, policyRiskForToolRisk, nativeHistoryEventContext, redactSecrets, supportsNativeStartNavigation, toPublicError, validInlineTextRanges, validInputMentionRanges, type ToolRisk } from "@joko/core";
+import { JokoError, NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD, NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD, containsRecognizedCredential, decideToolCall, evaluateOrderedPolicyRules, policyRiskForToolRisk, nativeHistoryEventContext, redactSecrets, supportsNativeStartNavigation, toPublicError, validInlineTextRanges, validInputMentionRanges, type ToolRisk } from "@joko/core";
 import {
   AuthorizationError,
   ensureSideChatHistoryBoundary,
@@ -16096,6 +16096,20 @@ export class SessionHost {
       ...(binding === undefined ? {} : { binding }),
       ...(operationId === undefined ? {} : { operationId }),
       signal,
+      ...(runId !== undefined && attemptId !== undefined && runtimePolicy === undefined &&
+        target.remoteWorkspace === undefined && backend.adapterKind === "pi" ? {
+        canContinueManagedSubagentResult: (): boolean => {
+          const run = this.#store.findRun(runId)?.descriptor;
+          const item = this.#store.findQueueItemByRunId(sessionId, runId);
+          if (run?.source !== "user" || run.state !== "running" || item?.disposition !== "prompt" ||
+            item.body.messagingOrigin !== undefined) return false;
+          try { context.nativeToolAuthorization!.assertCurrent(); } catch { return false; }
+          return !this.#store.getSession(sessionId).descriptor.planMode &&
+            policySnapshotFor(this.#store, target).generation === context.policySnapshot?.generation &&
+            !this.#store.listQueueItems({ sessionId, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 2 })
+              .some(candidate => candidate.id !== item.id);
+        }
+      } : {}),
       ...(runId !== undefined && attemptId !== undefined && runtimePolicy === undefined
         && target.remoteWorkspace?.kind === "ssh" && backend.adapterKind === "codex"
         && this.#store.findRun(runId)?.descriptor.source === "user" ? {
@@ -18386,11 +18400,19 @@ export class SessionHost {
 
     const previous = store.findLatestNativeSessionChange(session.id);
     const previousPayload = previous?.payload.type === "native_session_changed" ? previous.payload : undefined;
+    const activeEntryMetadata = history.activeEntryMetadata;
+    let unprojectedParents: string | undefined;
+    if (activeEntryMetadata?.namespace === "pi.native_history" && validNativeLineage(history)) {
+      const projectedEntries = new Set(history.events.map(event => event.nativeEntryId));
+      unprojectedParents = JSON.stringify(history.activeLineage!.flatMap(({ entryId, parentEntryId }) =>
+        parentEntryId !== undefined && !projectedEntries.has(entryId) ? [[entryId, parentEntryId]] : []));
+    }
     const sameLeaf = previousPayload !== undefined &&
       previousPayload.opaqueRef === session.binding.opaqueRef &&
       previousPayload.nativeSessionId === session.binding.nativeSessionId &&
       previousPayload.leafId === history.activeEntryId;
-    if (sameLeaf) return;
+    const previousUnprojectedParents = previous?.metadata?.fields[NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD] ?? "[]";
+    if (sameLeaf && (unprojectedParents === undefined || unprojectedParents === previousUnprojectedParents)) return;
     const leafToken = history.activeEntryId ?? "<none>";
     const markerDigest = createHash("sha256")
       .update(session.id).update("\0")
@@ -18399,7 +18421,7 @@ export class SessionHost {
       .update(leafToken)
       .digest("hex");
     const markerId = `native-leaf-${markerDigest}`;
-    const activeEntryMetadata = history.activeEntryMetadata;
+    const { [NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD]: _reservedParents, ...activeFields } = activeEntryMetadata?.fields ?? {};
     store.appendEventIfAbsent({
       id: markerId,
       backendId: session.backendId,
@@ -18417,7 +18439,11 @@ export class SessionHost {
       ...(activeEntryMetadata?.pi === undefined ? {} : { pi: activeEntryMetadata.pi }),
       ...(activeEntryMetadata === undefined
         ? {}
-        : { metadata: { namespace: activeEntryMetadata.namespace, fields: activeEntryMetadata.fields } })
+        : { metadata: { namespace: activeEntryMetadata.namespace, fields: {
+            ...activeFields,
+            ...(unprojectedParents === undefined || unprojectedParents === "[]" ? {}
+              : { [NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD]: unprojectedParents })
+          } } })
     });
   }
 

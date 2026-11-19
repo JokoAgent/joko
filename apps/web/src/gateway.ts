@@ -396,6 +396,7 @@ import {
   ToolCallOutputMode,
   ToolCallState,
   readDocumentOutput,
+  readPiGeneratedImages,
   ToolService,
   ToolPolicyEffectiveSource,
   TransferDirection,
@@ -13440,14 +13441,29 @@ function projectTimelineEvent(
       );
       const privateSent = kind.case === "toolCallCompleted" && call.runId === (event.identity?.runId ?? "")
         && call.attemptId === (event.identity?.attemptId ?? "") ? partnerPrivateSentReceipt(call, sessionId) : undefined;
+      const generatedBlobs = new Set(readPiGeneratedImages(event).map(blob => blob.blobId));
       const referencedBlobs = new Set((toolItem.attachments ?? []).map((attachment) => attachment.blobId));
       if (referencedBlobs.size > 0) {
         for (let index = items.length - 1; index >= 0; index -= 1) {
           const item = items[index];
-          if (item?.artifact !== undefined && referencedBlobs.has(item.artifact.blobId)) items.splice(index, 1);
+          if (item?.artifact !== undefined && item.generatedImageFromTool !== true && referencedBlobs.has(item.artifact.blobId)) items.splice(index, 1);
         }
       }
-      replaceOrAppend(privateSent === undefined ? toolItem : { ...toolItem, partnerPrivateSent: privateSent });
+      const promotedImages = new Map<string, ArtifactView>();
+      const attachments = toolItem.attachments?.filter(attachment => {
+        if (attachment.kind !== "image" || !generatedBlobs.has(attachment.blobId)) return true;
+        promotedImages.set(attachment.blobId, attachment);
+        return false;
+      });
+      replaceOrAppend({ ...toolItem, ...(promotedImages.size === 0 ? {} : { attachments }),
+        ...(privateSent === undefined ? {} : { partnerPrivateSent: privateSent }) });
+      for (const artifact of promotedImages.values()) {
+        if (items.some(item => item.kind === "assistant" && item.runId === call.runId
+          && item.attachments?.some(attachment => attachment.kind === "image" && attachment.blobId === artifact.blobId))) continue;
+        replaceOrAppend({ id: `${event.eventId}:generated-image:${artifact.blobId}`, sourceEventId: event.eventId,
+          sequence, kind: "image", createdAt, runId: call.runId, generatedImageFromTool: true,
+          title: artifact.title, artifact });
+      }
       break;
     }
     case "statusStream": {
@@ -13885,6 +13901,7 @@ function reconcileCompletedAssistantMessage(
   const firstTextIndex = completed.blocks.findIndex((block) => block.content.case === "text");
   const finalText = opening?.greeting ?? completedMessageText(completed.blocks);
   const attachments = completedMessageAttachments(completed.blocks);
+  const visibleImages = new Set(attachments.filter(attachment => attachment.kind === "image").map(attachment => attachment.blobId));
   const finalItems: Array<{ readonly contentIndex: number; readonly item: TimelineItemView }> = [];
   const projectedToolItems = new Map<string, { contentIndex: number; item: TimelineItemView }>();
 
@@ -14050,6 +14067,7 @@ function reconcileCompletedAssistantMessage(
   const removableIndexes = items.flatMap((item, index) =>
     ((item.kind === "assistant" || item.kind === "thinking") && belongsToMessage(item))
       || finalToolCallIds.has(item.id) && (item.kind === "tool" || item.kind === "toolResult")
+      || item.generatedImageFromTool === true && item.runId === event.identity?.runId && item.artifact !== undefined && visibleImages.has(item.artifact.blobId)
       ? [index]
       : []
   );

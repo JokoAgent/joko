@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD, type EventPayload } from "@joko/core";
+import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD, NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD, type EventPayload } from "@joko/core";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { OperationalStore } from "./index.js";
@@ -62,6 +62,30 @@ describe("historical task reference visibility", () => {
       binding: { opaqueRef: "native/rebound.jsonl", generation: current.descriptor.binding.generation + 1 }
     }, current.revision);
     expect(() => store.listSessionReferenceMessageEvents(snapshot)).toThrow("history authority changed");
+  });
+
+  it("keeps visible native ancestors across private links and freezes those links for a reference", () => {
+    const store = createFixture();
+    appendNativeMessage(store, "user-event", "user", undefined, "user", "original user question");
+    appendNativeMessage(store, "summary-event", "summary", "hidden-result", "assistant", "visible completion");
+    appendNativeMessage(store, "sibling-event", "sibling", undefined, "assistant", "unrelated branch completion");
+    store.appendEvent({
+      id: "summary-marker", backendId: "backend", targetId: "target", sessionId: "source", generation: 0,
+      traceId: "test:summary-marker",
+      payload: { type: "native_session_changed", opaqueRef: "native/source.jsonl", leafId: "summary" },
+      metadata: { namespace: "pi.native_history", fields: {
+        [NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD]: JSON.stringify([["hidden-result", "user"]])
+      } }
+    });
+    const visible = () => store.listEvents({ sessionId: "source", messageCompleteOnly: true, activeNativeTimeline: true }).map(event => event.id);
+    expect(visible()).toEqual(["user-event", "summary-event"]);
+    expect(store.searchSessionMessages({ scope: { sessionId: "source" }, query: "original user question" }).matches.map(event => event.eventId))
+      .toEqual(["user-event"]);
+    const snapshot = store.captureSessionReferenceSnapshot("source", 0);
+
+    appendMarker(store, "sibling-marker", "sibling");
+    expect(visible()).toEqual(["sibling-event"]);
+    expect(store.listSessionReferenceMessageEvents(snapshot).map(event => event.id)).toEqual(["user-event", "summary-event"]);
   });
 });
 

@@ -3,6 +3,7 @@ import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStream
 import { chmod, copyFile, link, lstat, mkdir, open, readdir, readFile, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { createServer, type Server } from "node:http";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
@@ -135,10 +136,12 @@ interface BrokerFixture {
   readonly recoveryIdentity: string;
   readonly compatibilityHash: string;
   readonly nodeExecutable?: string;
+  readonly electronExecutable?: string;
 }
 
 async function brokerFixture(source = REMOTE_PI_BROKER_SOURCE): Promise<BrokerFixture> {
-  const root = await mkdtemp(join(tmpdir(), "joko-broker-"));
+  const socketParent = process.platform === "darwin" ? await realpath("/tmp") : tmpdir();
+  const root = await mkdtemp(join(socketParent, "joko-broker-"));
   const managedRoot = join(root, ".joko", "pi-broker");
   const identity = digest("durable-broker-identity").slice(0, 32);
   const runtimeRoot = join(root, ".joko", "runtime", identity);
@@ -423,7 +426,7 @@ function bootstrap(
       : {})
   };
   const shape = {
-    command: fixture.nodeExecutable ?? process.execPath,
+    command: fixture.electronExecutable === undefined ? fixture.nodeExecutable ?? process.execPath : "node",
     args: [fixture.childPath],
     cwd: fixture.root,
     env
@@ -533,7 +536,7 @@ async function startBridge(
   readonly state: AuthorityState;
 }> {
   const startedAt = performance.now();
-  const child = spawn(fixture.nodeExecutable ?? process.execPath, [
+  const child = spawn(fixture.electronExecutable ?? fixture.nodeExecutable ?? process.execPath, [
     fixture.sourcePath,
     "bridge",
     fixture.managedRoot,
@@ -541,7 +544,11 @@ async function startBridge(
     value.launchHash,
     randomUUID()
   ], {
-    env: { ...process.env, JOKO_REMOTE_BROKER_SOURCE_HASH: fixture.sourceHash ?? REMOTE_PI_BROKER_SOURCE_SHA256 },
+    env: {
+      ...process.env,
+      ...(fixture.electronExecutable === undefined ? {} : { ELECTRON_RUN_AS_NODE: "1" }),
+      JOKO_REMOTE_BROKER_SOURCE_HASH: fixture.sourceHash ?? REMOTE_PI_BROKER_SOURCE_SHA256
+    },
     stdio: ["pipe", "pipe", "pipe"]
   });
   let diagnostics = "";
@@ -776,6 +783,16 @@ async function exactKill(pid: number, mode: "daemon" | "owner", sourcePath: stri
   if (process.platform === "win32") {
     process.kill(pid, "SIGKILL");
     await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+    return;
+  }
+  if (process.platform === "darwin") {
+    const observation = spawnSync("/bin/ps", ["-ww", "-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 4_000 });
+    expect(observation.status).toBe(0);
+    expect(observation.stdout).toContain(` ${sourcePath} ${mode} `);
+    process.kill(pid, "SIGKILL");
+    await waitUntil(() => {
+      try { process.kill(pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+    });
     return;
   }
   const fields = (await readFile(`/proc/${pid}/cmdline`, "utf8")).split("\0");
@@ -1054,8 +1071,12 @@ async function processHasArgument(argument: string): Promise<boolean> {
 }
 
 async function authorityKill(fixture: BrokerFixture, authority: AuthorityEnvelope): Promise<void> {
-  const child = spawn(process.execPath, [fixture.sourcePath, "kill", fixture.managedRoot], {
-    env: { ...process.env, JOKO_REMOTE_BROKER_SOURCE_HASH: fixture.sourceHash ?? REMOTE_PI_BROKER_SOURCE_SHA256 },
+  const child = spawn(fixture.electronExecutable ?? process.execPath, [fixture.sourcePath, "kill", fixture.managedRoot], {
+    env: {
+      ...process.env,
+      ...(fixture.electronExecutable === undefined ? {} : { ELECTRON_RUN_AS_NODE: "1" }),
+      JOKO_REMOTE_BROKER_SOURCE_HASH: fixture.sourceHash ?? REMOTE_PI_BROKER_SOURCE_SHA256
+    },
     stdio: ["pipe", "pipe", "pipe"]
   });
   child.stdin.end(`${JSON.stringify({
@@ -1346,10 +1367,56 @@ try {
     }
   }, 15_000);
 
-  it.runIf(process.platform === "linux" || process.platform === "win32")(
-    "keeps the exact child and replay alive across manager crash, then rotates relay authority",
-    async () => {
-      const fixture = await brokerFixture();
+  it.runIf(process.platform === "darwin")("proves the stock macOS process birth, unjoined argv and bootstrap identity", async () => {
+    const directory = await mkdtemp(join(await realpath("/tmp"), "joko-darwin-owner-"));
+    const harnessPath = join(directory, "process-identity.mjs");
+    const harness = REMOTE_PI_BROKER_SOURCE.replace("main().catch(() => process.exit(1));", String.raw`
+const executable = await realpath(process.execPath);
+const cwd = await realpath(dirname(process.argv[1]));
+const args = ["-e", "setInterval(() => {}, 1000)", "--", "two words", ""];
+const spawnIdentity = "a".repeat(64);
+const child = spawn(executable, args, { cwd, env: { JOKO_PI_SPAWN_IDENTITY: spawnIdentity }, stdio: "ignore" });
+const exited = new Promise((resolveExit, rejectExit) => {
+  child.once("exit", (_code, signal) => resolveExit(signal));
+  child.once("error", rejectExit);
+});
+try {
+  const fingerprint = await waitForFingerprint(child.pid);
+  const current = await recordedProcessFingerprint(fingerprint);
+  const childIdentity = { spawnIdentity, childCommandHash: fingerprint.commandHash, childExecutableHash: fingerprint.executableHash,
+    childCwdHash: digestBytes(Buffer.from(cwd)) };
+  const confirmed = await bootstrapChildMatches(fingerprint, childIdentity);
+  const wrongSpawn = await bootstrapChildMatches(fingerprint, { ...childIdentity, spawnIdentity: "b".repeat(64) });
+  const stopped = await stopExactProcess(fingerprint);
+  process.stdout.write(JSON.stringify({ exactArguments: exactProcessArguments(fingerprint.args, [executable, ...args]),
+    sameObservation: fingerprintsMatch(current, fingerprint), confirmed, wrongSpawn, stopped, signal: await exited }));
+} finally {
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+}
+`);
+    try {
+      expect(harness).not.toBe(REMOTE_PI_BROKER_SOURCE);
+      await writeFile(harnessPath, harness, { mode: 0o600 });
+      const result = spawnSync(process.execPath, [harnessPath], { encoding: "utf8", timeout: 24_000, maxBuffer: 16 * 1024 });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        exactArguments: true, sameObservation: true, confirmed: true, wrongSpawn: false, stopped: true, signal: "SIGTERM"
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it.runIf(["linux", "win32", "darwin"].includes(process.platform)).each(
+    process.platform === "win32" ? ["Node", "Electron"] : ["Node"]
+  )(
+    "keeps the exact child and replay alive across manager crash, then rotates relay authority (%s)",
+    async (runtime) => {
+      const electronExecutable = runtime === "Electron"
+        ? await realpath(createRequire(new URL("../../desktop/package.json", import.meta.url))("electron") as string)
+        : undefined;
+      const fixture: BrokerFixture = { ...await brokerFixture(), ...(electronExecutable === undefined ? {} : { electronExecutable }) };
       const firstUpstream = await upstream();
       const currentBearerOne = "orchestrator-current-bearer-one-000000000000";
       const currentBearerTwo = "orchestrator-current-bearer-two-000000000000";
@@ -1360,6 +1427,7 @@ try {
       try {
         const firstBootstrap = bootstrap(fixture, 1, currentBearerOne, firstUpstream.port);
         firstBridge = await startBridge(fixture, firstBootstrap, true, true);
+        finalAuthority = firstBridge.authority;
         firstBridge.process.stdin.write(sequencedFrame(FRAME_STDIN, 1, Buffer.from("call\n")));
         const firstOutput = sequenced(await nextFrameOfType(firstBridge.reader, FRAME_STDOUT));
         expect(firstOutput.content.toString("utf8")).toContain("response:");
@@ -1371,7 +1439,7 @@ try {
         firstBridge.process.stdin.write(sequencedFrame(FRAME_OUTPUT_ACK, firstOutput.sequence));
         firstBridge.process.stdin.write(sequencedFrame(FRAME_STDIN, 2, Buffer.from("node\n")));
         const nodeOutput = sequenced(await nextFrameOfType(firstBridge.reader, FRAME_STDOUT));
-        expect(nodeOutput.content.toString("utf8")).toBe(`node:${await realpath(process.execPath)}\n`);
+        expect(nodeOutput.content.toString("utf8")).toBe(`node:${electronExecutable ?? await realpath(process.execPath)}\n`);
         firstBridge.process.stdin.write(sequencedFrame(FRAME_OUTPUT_ACK, nodeOutput.sequence));
         firstBridge.process.stdin.write(sequencedFrame(FRAME_STDIN, 3, Buffer.from("leak\n")));
         const redactedOutput = sequenced(await nextFrameOfType(firstBridge.reader, FRAME_STDOUT));
@@ -1441,7 +1509,7 @@ try {
         await rm(fixture.root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
       }
     },
-    process.platform === "win32" ? 120_000 : 30_000
+    process.platform === "linux" ? 30_000 : 120_000
   );
 
   it.runIf(process.platform === "linux" || process.platform === "win32")(

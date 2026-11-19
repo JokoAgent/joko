@@ -9,6 +9,7 @@ export const MANAGED_SUBAGENT_PROVIDER_CREDENTIAL_NAMES_ENV = "JOKO_PI_SUBAGENT_
 export const MANAGED_SUBAGENT_DEPTH_ENV = "JOKO_PI_SUBAGENT_DEPTH";
 export const MANAGED_SUBAGENT_PARENT_PID_ENV = "JOKO_PI_SUBAGENT_PARENT_PID";
 export const MANAGED_SUBAGENT_ACTIVITY_MARKER = "__jokoSubagentActivity";
+export const MANAGED_SUBAGENT_DELIVERY_REQUEST = "joko:managed-subagent-result";
 export const MANAGED_SUBAGENT_SOFT_LIMIT_ENV = "JOKO_PI_WORKER_SOFT_LIMIT";
 export const MANAGED_SUBAGENT_HARD_LIMIT_ENV = "JOKO_PI_WORKER_HARD_LIMIT";
 export const MANAGED_SUBAGENT_IDLE_RELEASE_ENV = "JOKO_PI_WORKER_IDLE_RELEASE_MINUTES";
@@ -48,6 +49,7 @@ const STATUS_TOOL_NAME = "subagent_status";
 const COMMAND_NAME = "subagents";
 const CONTROL_COMMAND_NAME = "joko-stop-background-task";
 const MARKER = "__jokoSubagentActivity";
+const DELIVERY_REQUEST = "${MANAGED_SUBAGENT_DELIVERY_REQUEST}";
 const DEPTH_ENV = "JOKO_PI_SUBAGENT_DEPTH";
 const PARENT_PID_ENV = "JOKO_PI_SUBAGENT_PARENT_PID";
 const CREDENTIAL_NAMES_ENV = "JOKO_PI_SUBAGENT_CREDENTIAL_ENV_NAMES";
@@ -2798,6 +2800,51 @@ export default function jokoManagedSubagent(pi) {
     if (discoveryTimer && typeof discoveryTimer.unref === "function") discoveryTimer.unref();
   });
 
+  const pendingResults = new Map();
+  pi.on("agent_settled", function () { pendingResults.clear(); });
+  pi.on("agent_end", async function (event, ctx) {
+    if (pendingResults.size === 0) return;
+    const final = event.messages.findLast(message => message.role === "assistant");
+    if (final?.stopReason !== "stop" || !ctx.hasUI) { pendingResults.clear(); return; }
+    const current = () => !ctx.isIdle() && !ctx.hasPendingMessages() && !ctx.signal?.aborted;
+    const authorized = async () => {
+      try {
+        return current() && await ctx.ui.input(DELIVERY_REQUEST, undefined,
+          { signal: ctx.signal, timeout: 1500 }) === "allowed" && current();
+      } catch { return false; }
+    };
+    const results = [];
+    const consumed = [];
+    while (pendingResults.size > 0) {
+      if (!await authorized()) { pendingResults.clear(); return; }
+      for (const [id, deadline] of pendingResults) {
+        const job = jobs.get(id);
+        if (!job || job.status === "aborted") {
+          pendingResults.delete(id);
+        } else if (job.status === "completed" || job.status === "failed") {
+          const result = await job.completion;
+          if ((job.endedAt ?? Date.now()) <= deadline) {
+            consumed.push(id);
+            results.push(job.agent + " subagent " + id + " " + job.status + ":\n" + result.text);
+          }
+          pendingResults.delete(id);
+        } else if (Date.now() >= deadline) {
+          pendingResults.delete(id);
+        }
+      }
+      if (results.length > 0) {
+        if (!await authorized()) { pendingResults.clear(); return; }
+        // The published Pi session stays active through this awaited hook.
+        // Its original prompt drains follow-ups before emitting agent_settled.
+        pi.sendMessage({ customType: "joko-managed-subagent-result",
+          content: "Managed subagent results for the original request:\n\n" + fitOutput(results).join("\n\n"),
+          details: { taskIds: consumed }, display: false }, { deliverAs: "followUp", triggerTurn: true });
+        return;
+      }
+      if (pendingResults.size > 0) await new Promise(resolveWait => setTimeout(resolveWait, DURABLE_OBSERVER_INTERVAL_MS));
+    }
+  });
+
   const thinkingSchema = Type.Union([
     Type.Literal("off"), Type.Literal("minimal"), Type.Literal("low"), Type.Literal("medium"),
     Type.Literal("high"), Type.Literal("xhigh"), Type.Literal("max")
@@ -2834,6 +2881,7 @@ export default function jokoManagedSubagent(pi) {
       thinking: Type.Optional(thinkingSchema),
       tasks: Type.Optional(Type.Array(taskSchema, { minItems: 1, maxItems: MAX_TASKS })),
       background: Type.Optional(Type.Boolean({ default: false })),
+      notify: Type.Optional(Type.Boolean({ default: true })),
       isolation: Type.Optional(Type.Union([Type.Literal("inherit"), Type.Literal("require-worktree")])),
       context: Type.Optional(Type.Union([Type.Literal("fresh"), Type.Literal("fork")])),
       timeoutSeconds: Type.Optional(Type.Integer({ minimum: MIN_TIMEOUT_SECONDS, maximum: MAX_TIMEOUT_SECONDS, default: DEFAULT_TIMEOUT_SECONDS }))
@@ -2886,6 +2934,9 @@ export default function jokoManagedSubagent(pi) {
             isError: true
           };
         }
+        if (params.notify !== false) {
+          for (const job of launched) pendingResults.set(job.id, Date.now() + job.timeoutMs + DURABLE_CONTROL_TIMEOUT_MS);
+        }
         return {
           content: [{ type: "text", text: (warning ? warning + "\n\n" : "") + "Started " + launched.length + " durable background subagent task(s). Worker tasks remain write-enabled through the managed approval bridge; other profiles remain read-only. They continue after the parent runtime closes; use subagent_status to list, inspect, wait, cancel, steer, follow_up, or resume them." }],
           details: Object.assign(activityOf(launched[0], "queued", launched.length + " durable background task(s) queued"), { workerLimitWarning: warning })
@@ -2936,6 +2987,7 @@ export default function jokoManagedSubagent(pi) {
       const job = jobs.get(taskId);
       if (!job) return { content: [{ type: "text", text: "Unknown managed subagent task." }], isError: true };
       if (action === "inspect") {
+        if (["completed", "failed", "aborted"].includes(job.status)) pendingResults.delete(job.id);
         return {
           content: [{ type: "text", text: job.status + ": " + clampText(job.summary, MAX_OUTPUT_CHARS) }],
           details: detailedActivityOf(job),
@@ -2946,6 +2998,7 @@ export default function jokoManagedSubagent(pi) {
         if (job.status !== "queued" && job.status !== "running" && job.status !== "waiting") {
           return { content: [{ type: "text", text: "Managed subagent task is already terminal." }], details: detailedActivityOf(job), isError: true };
         }
+        pendingResults.delete(job.id);
         await requestAbort(job, "cancelled");
         const cancelled = await job.completion;
         return { content: [{ type: "text", text: cancelled.text }], details: detailedActivityOf(job), isError: cancelled.isError === true };
@@ -2976,6 +3029,7 @@ export default function jokoManagedSubagent(pi) {
           if (signal.aborted) stopped(); else signal.addEventListener("abort", stopped, { once: true });
         })
       ]);
+      if (["completed", "failed", "aborted"].includes(job.status)) pendingResults.delete(job.id);
       return { content: [{ type: "text", text: result.text }], details: detailedActivityOf(job), isError: result.isError === true };
     }
   });

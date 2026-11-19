@@ -81,6 +81,8 @@ export interface AdapterContext {
   readonly transientPromptAttachments?: Pick<PromptInput, "images" | "files">;
   /** Private authority of the requested Run and Attempt for an interrupt. */
   readonly assertRunControlCurrent?: () => void;
+  /** Authorizes adopting a managed child result within this original user Run. */
+  readonly canContinueManagedSubagentResult?: () => boolean;
   /** Reads a disconnected, already admitted native turn through its original durable receipt. */
   readonly observeAcceptedNativeTurn?: (nativeTurnId: string) => Promise<AcceptedNativeTurnOutcome | "retired" | undefined>;
   /** Private authority for one user-owned dispatch. A Backend may recover a

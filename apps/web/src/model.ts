@@ -1659,6 +1659,7 @@ export interface TimelineItemView {
   readonly runId?: string;
   readonly failedInput?: FailedInputIdentity;
   readonly artifactOperationId?: string;
+  readonly generatedImageFromTool?: true;
   readonly documentFile?: TimelineDocumentFileView;
   readonly documentFiles?: readonly TimelineDocumentFileView[];
   readonly documentFileSourceIds?: readonly string[];
