@@ -252,7 +252,8 @@ function BrowserToolCard({ source, allowUploads, selected, captured, sessions, c
           onStoreCapture(browserId, pageId, blobId);
         }} />}
       </div>
-      {page !== undefined && <BrowserLedger controller={controller} browser={browser} page={page} locale={locale} t={t} runAction={runAction} />}
+      {page !== undefined && <BrowserLedger key={JSON.stringify([browser.id, browser.generation.toString(), page.id])}
+        controller={controller} browser={browser} page={page} locale={locale} t={t} />}
       <footer><Button onClick={() => runAction(`browser-restart:${browser.id}`, () => controller.restartBrowser(browser.id))}><RefreshCcw aria-hidden="true" />{t("browser.recover")}</Button>{browser.takeover?.state === "active" && browser.takeover.connectionId === controller.state.activeProfile?.id && <Button tone="primary" onClick={() => runAction(`browser-release:${browser.id}`, () => controller.endBrowserTakeover(browser.id))}>{t("browser.release")}</Button>}</footer>
     </article>;
 }
@@ -858,7 +859,7 @@ function RemoteBrowserCanvas({ browserId, blobId, page, enabled, commentMode, co
   </section>;
 }
 
-function BrowserLedger({ controller, browser, page, locale, t, runAction }: { readonly controller: AppController; readonly browser: BrowserView; readonly page: BrowserPageView; readonly locale: string; readonly t: Translator; readonly runAction: RunAction }): JSX.Element {
+function BrowserLedger({ controller, browser, page, locale, t }: { readonly controller: AppController; readonly browser: BrowserView; readonly page: BrowserPageView; readonly locale: string; readonly t: Translator }): JSX.Element {
   const [activity, setActivity] = useState<readonly BrowserActivityView[]>([]);
   const [transfers, setTransfers] = useState<readonly BrowserTransferView[]>([]);
   const [loading, setLoading] = useState(true);

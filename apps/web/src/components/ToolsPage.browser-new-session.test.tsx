@@ -2,16 +2,16 @@
 
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AppController } from "../controller.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import { emptySnapshot, type AppSnapshot, type BrowserView, type NewSessionLocalDraft } from "../model.js";
+import { emptySnapshot, type AppSnapshot, type BrowserActivityView, type BrowserTransferView, type BrowserView, type NewSessionLocalDraft } from "../model.js";
 import { ToolsPage } from "./ToolsPage.js";
 
 const roots: Root[] = [];
 
-beforeAll(() => {
+beforeEach(() => {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 });
 
@@ -82,6 +82,56 @@ describe("Tools Browser new-task annotations", () => {
     await act(async () => buttonWithText(host, "browser.commentOpenTask").click());
     expect(navigate).toHaveBeenCalledExactlyOnceWith({ kind: "newSession" });
   });
+});
+
+it("keeps the selected Browser page's ledger when a previous page finishes refreshing", async () => {
+  const initial = snapshot();
+  const browser = initial.browsers[0]!;
+  const firstPage = browser.pages[0]!;
+  const secondPage = { ...firstPage, id: "page-2", title: "Second page", url: "https://example.test/second" };
+  const transfer: BrowserTransferView = {
+    id: "transfer-1", browserId: browser.id, pageId: firstPage.id, direction: "download", state: "completed",
+    blobId: "blob-first", fileName: "first-page.txt", mediaType: "text/plain", byteSize: 12, startedAt: 0
+  };
+  const activity: BrowserActivityView = {
+    id: "activity-1", pageId: firstPage.id, kind: "download", description: "First page download", occurredAt: 0
+  };
+  const lateTransfers = deferred<readonly BrowserTransferView[]>();
+  const lateActivity = deferred<readonly BrowserActivityView[]>();
+  const listBrowserTransfers = vi.fn(async (_browserId: string, pageId: string) => pageId === firstPage.id ? lateTransfers.promise : [])
+    .mockResolvedValueOnce([transfer]);
+  const listBrowserActivity = vi.fn(async (_browserId: string, pageId: string) => pageId === firstPage.id ? lateActivity.promise : [])
+    .mockResolvedValueOnce([activity]);
+  const focusBrowserPage = vi.fn(async (_browserId: string, pageId: string) => pageId);
+  const downloadArtifact = vi.fn();
+  const controller = {
+    state: { preferences: DEFAULT_UI_PREFERENCES, activeProfile: { id: "profile-1", serverId: "server-1" } },
+    readNewSessionDraft: vi.fn(async () => undefined), getArtifactUrl: vi.fn(async () => "data:image/png;base64,iVBORw0KGgo="),
+    releaseArtifactUrl: vi.fn(), listBrowserTransfers, listBrowserActivity, focusBrowserPage, downloadArtifact
+  } as unknown as AppController;
+  const host = document.body.appendChild(document.createElement("div"));
+  const root = createRoot(host);
+  roots.push(root);
+
+  await act(async () => root.render(<ToolsPage controller={controller}
+    snapshot={{ ...initial, browsers: [{ ...browser, pages: [firstPage, secondPage] }] }} locale="en" t={(key) => key}
+    runAction={(_key, action) => { void action(); }} onOpenNavigation={() => undefined} />));
+  const ledger = () => required(host.querySelector(".browser-ledger"));
+  expect(ledger().textContent).toContain(transfer.fileName);
+  await act(async () => buttonWithText(ledger(), "common.refresh").click());
+  expect(listBrowserTransfers).toHaveBeenCalledTimes(2);
+  await act(async () => required(host.querySelector<HTMLButtonElement>(`button[title="${secondPage.url}"]`)).click());
+  expect(focusBrowserPage).toHaveBeenCalledWith(browser.id, secondPage.id);
+  expect(listBrowserTransfers).toHaveBeenLastCalledWith(browser.id, secondPage.id);
+  expect(ledger().textContent).toContain("browser.noTransfers");
+  await act(async () => {
+    lateTransfers.resolve([transfer]);
+    lateActivity.resolve([activity]);
+  });
+  expect(ledger().textContent).not.toContain(transfer.fileName);
+  expect(ledger().textContent).not.toContain(activity.description);
+  expect(ledger().querySelector('button[title="common.download"]')).toBeNull();
+  expect(downloadArtifact).not.toHaveBeenCalled();
 });
 
 function snapshot(): AppSnapshot {
@@ -165,6 +215,12 @@ async function settle(): Promise<void> {
 function buttonWithText(container: ParentNode, text: string): HTMLButtonElement {
   return required([...container.querySelectorAll<HTMLButtonElement>("button")]
     .find((button) => button.textContent?.trim() === text));
+}
+
+function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
 }
 
 function required<T>(value: T | null | undefined): T {
