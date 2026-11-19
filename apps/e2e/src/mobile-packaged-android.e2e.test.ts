@@ -532,7 +532,9 @@ async function runNativeScenario(): Promise<void> {
   await tap("Preview file index.html");
   await tap("Open the guide");
   const detailsAddress = "html-guide/details.html#chapter";
-  const waitAddress = (value: string) => waitNode((node) => node.className === "android.widget.EditText" && node.text === value, "HTML display path " + value);
+  const isAddressField = (node: AndroidUiNode) => node.className === "android.widget.EditText" && node.contentDescription === "Page address";
+  const waitAddress = (value: string) => waitNode((node) => isAddressField(node) && (node.text ?? "") === value,
+    value === "" ? "cleared HTML address field" : "HTML display path " + value);
   const waitChapter = () => waitNode((node) => node.text === "Workspace guide chapter" || node.contentDescription === "Workspace guide chapter", "rendered Workspace guide chapter");
   await waitAddress(detailsAddress);
   await waitChapter();
@@ -565,13 +567,22 @@ async function runNativeScenario(): Promise<void> {
     const port = "tcp:" + sitePort.port;
     await adb("reverse", port, port); siteReverse = port;
     const url = `http://127.0.0.1:${sitePort.port}/viewer`;
+    const addressField = await waitAddress(detailsAddress);
     await interaction("text-entry", async () => {
-      await tapNode(await waitAddress(detailsAddress));
-      await adb("shell", "input", "keyevent", "KEYCODE_MOVE_END", ...Array<string>(detailsAddress.length).fill("KEYCODE_DEL"));
-      await adb("shell", "input", "text", `'${url}'`);
-      await adb("shell", "input", "keyevent", "KEYCODE_BACK");
+      try {
+        await tapNode(addressField);
+        // Replace the selection in the real native field after React Native has adopted the clear.
+        await adb("shell", "input", "keycombination", "KEYCODE_CTRL_LEFT", "KEYCODE_A");
+        await adb("shell", "input", "keyevent", "KEYCODE_DEL");
+        await waitAddress("");
+        await adb("shell", "input", "text", `'${url}'`);
+        await waitAddress(url);
+      } catch (error) {
+        await screenshot("html-website-address-error").catch(() => undefined);
+        const observed = await nodes(Date.now() + 5_000).catch(() => []);
+        throw new Error(`Native HTML address entry did not settle. Address field: ${JSON.stringify(observed.find(isAddressField)?.text ?? null)}`, { cause: error });
+      }
     });
-    await waitAddress(url);
     expect(siteRequests).toEqual([]);
     await tap("Open");
     await waitNode((node) => node.text === "Isolated website fixture" || node.contentDescription === "Isolated website fixture", "isolated website rendered in the native app");
