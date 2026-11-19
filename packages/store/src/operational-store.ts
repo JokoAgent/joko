@@ -426,6 +426,7 @@ const MAX_MESSAGE_SEARCH_LIMIT = 100;
 const MAX_MESSAGE_SEARCH_QUERY_LENGTH = 256;
 const MAX_MESSAGE_SEARCH_PAGE_TOKEN_LENGTH = 2_048;
 const DEFAULT_QUEUE_LOCK_TTL_MS = 90_000;
+const MESSAGING_DEFAULT_OUTBOX_CAPACITY = 256;
 const MIN_QUEUE_LOCK_TTL_MS = 5_000;
 const MAX_QUEUE_LOCK_TTL_MS = 300_000;
 const MAX_MESSAGE_SEARCH_OFFSET = Number.MAX_SAFE_INTEGER;
@@ -7151,7 +7152,7 @@ export class OperationalStore {
         return existing;
       }
       const maximumPending = messagingBoundedInteger(
-        input.maximumPending ?? 256,
+        input.maximumPending ?? MESSAGING_DEFAULT_OUTBOX_CAPACITY,
         1,
         10_000,
         "delivery outbox capacity"
@@ -7263,6 +7264,43 @@ export class OperationalStore {
       ${clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`}
       ORDER BY created_at DESC, id DESC LIMIT ?
     `).all(...params, limit) as Row[]).map(messagingDeliveryFromRow);
+  }
+
+  listDismissedTelegramPermissionCards(input: {
+    readonly connectionId: string;
+    readonly channelGeneration: number;
+    readonly ownerProviderUserId: string;
+  }): MessagingDeliveryRecord[] {
+    this.assertOpen();
+    const connectionId = messagingIdentity(input.connectionId, "connection ID");
+    const channelGeneration = messagingPositiveInteger(input.channelGeneration, "channel generation");
+    const owner = messagingIdentity(input.ownerProviderUserId, "Telegram owner ID", 512);
+    return (this.database.prepare(`
+      SELECT delivery.* FROM messaging_deliveries AS delivery
+      JOIN messaging_conversations AS conversation ON conversation.id = delivery.conversation_id
+      JOIN interactions AS interaction ON interaction.id = json_extract(delivery.payload_json, '$.interactionId')
+      WHERE delivery.connection_id = ? AND delivery.channel_generation = ?
+        AND delivery.kind = 'interaction' AND delivery.status = 'sent' AND delivery.provider_message_id IS NOT NULL
+        AND delivery.dedupe_key = 'interaction:' || interaction.id || ':open'
+        AND json_extract(delivery.payload_json, '$.action') = 'open'
+        AND json_array_length(delivery.payload_json, '$.buttons') > 0
+        AND conversation.connection_id = delivery.connection_id AND conversation.channel_generation = delivery.channel_generation
+        AND conversation.status = 'active' AND conversation.conversation_kind = 'direct'
+        AND conversation.provider_conversation_id = ? AND conversation.partner_id IS NULL
+        AND interaction.kind = 'permission' AND interaction.status = 'dismissed'
+        AND interaction.session_id = conversation.session_id AND interaction.generation = conversation.session_generation
+        AND interaction.generation = json_extract(delivery.payload_json, '$.interactionGeneration')
+        AND NOT EXISTS (
+          SELECT 1 FROM messaging_deliveries AS closing
+          WHERE closing.connection_id = delivery.connection_id AND closing.channel_generation = delivery.channel_generation
+            AND closing.dedupe_key = 'interaction:' || interaction.id || ':close'
+        )
+      ORDER BY delivery.created_at DESC, delivery.id DESC
+      LIMIT max(0, ? - (
+        SELECT COUNT(*) FROM messaging_deliveries
+        WHERE connection_id = ? AND channel_generation = ? AND status IN ('pending', 'dispatching', 'failed')
+      ))
+    `).all(connectionId, channelGeneration, owner, MESSAGING_DEFAULT_OUTBOX_CAPACITY, connectionId, channelGeneration) as Row[]).map(messagingDeliveryFromRow);
   }
 
   findSentMessagingInteractionDelivery(input: {

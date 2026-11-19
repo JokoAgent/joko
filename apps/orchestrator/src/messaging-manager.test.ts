@@ -2714,6 +2714,77 @@ describe("MessagingManager", () => {
       .toHaveLength(2);
   });
 
+  it("clears the original dismissed Telegram permission after restart behind a thousand newer deliveries", async () => {
+    const transport = new FakeTelegramTransport(directMessageBatch());
+    const reconnected = new FakeTelegramTransport({ events: [], groupObservations: [], ignored: [] });
+    const adapter = new PermissionFakeAdapter();
+    let currentTransport = transport;
+    const fixture = await createFixture(() => currentTransport, () => adapter);
+    fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const created = fixture.manager.createTelegramConnection({ ownerProviderUserId: "42",
+      configuration: { ...DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION, emojiReactions: "off" } });
+    const enabled = await replaceCredential(fixture, created, "old-permission", true);
+    const store = fixture.store;
+    const key = { connectionId: enabled.id, channelGeneration: enabled.generation };
+    const openCard = () => store.findMessagingDeliveryByDedupe({ ...key, dedupeKey: "interaction:permission-one:open" });
+    await vi.waitFor(() => expect(openCard()?.status).toBe("sent"));
+    const original = openCard()!;
+    const payload = { format: 1, address: transport.sentInteractionCards[0]!.address, text: "Previously sent notice" };
+    store.transaction(transaction => {
+      for (let index = 1; index <= 1_000; index += 1) {
+        const at = original.createdAt + index;
+        const delivery = transaction.enqueueMessagingDelivery({ connectionId: enabled.id, expectedChannelGeneration: enabled.generation,
+          conversationId: original.conversationId, dedupeKey: `newer-notice:${index}`, kind: "notice", partIndex: 0, partCount: 1,
+          payload, payloadHash: operationBodyHash(payload), availableAt: at, createdAt: at });
+        const claimToken = `fixture-sent-notice:${index}`;
+        const claimed = transaction.claimNextMessagingDelivery({ connectionId: enabled.id, expectedChannelGeneration: enabled.generation, claimToken, claimedAt: at });
+        if (claimed?.id !== delivery.id) throw new Error("Expected to claim the fixture's newer notice.");
+        transaction.settleMessagingDelivery({ deliveryId: claimed.id, expectedRevision: claimed.revision, claimToken,
+          status: "sent", providerMessageId: String(index + 100), settledAt: at });
+      }
+    });
+    expect(store.listMessagingDeliveries({ connectionId: enabled.id, statuses: ["sent"], limit: 1_000 }))
+      .not.toContainEqual(expect.objectContaining({ id: original.id }));
+
+    currentTransport = reconnected;
+    await fixture.restartManager(() => {
+      expect(store.recoverStartup("restart-old-telegram-permission").dismissedInteractionIds).toContain("permission-one");
+    });
+    await vi.waitFor(() => expect(store.findMessagingDeliveryByDedupe({ ...key, dedupeKey: "interaction:permission-one:close" }))
+      .toMatchObject({ status: "sent", providerMessageId: original.providerMessageId }));
+    expect(reconnected.clearedInteractionCards).toEqual([{ address: payload.address, messageId: original.providerMessageId }]);
+    expect(reconnected.sentInteractionCards).toEqual([]);
+    expect(store.getInteraction("permission-one")).toMatchObject({ status: "dismissed" });
+    expect(adapter.decision).toBeUndefined();
+  });
+
+  it("removes a dismissed Telegram permission keyboard when the owner clicks its original button", async () => {
+    let releaseCallback!: () => void;
+    const callback = new Promise<void>(resolve => { releaseCallback = resolve; });
+    const transport = new InteractiveTelegramTransport("allow_once", () => callback);
+    const adapter = new PermissionFakeAdapter();
+    const fixture = await createFixture(() => transport, () => adapter);
+    fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const created = fixture.manager.createTelegramConnection({ ownerProviderUserId: "42",
+      configuration: { ...DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION, emojiReactions: "off" } });
+    try {
+      const enabled = await replaceCredential(fixture, created, "dismissed-button", true);
+      const store = fixture.store;
+      const key = { connectionId: enabled.id, channelGeneration: enabled.generation };
+      await vi.waitFor(() => expect(store.findMessagingDeliveryByDedupe({ ...key, dedupeKey: "interaction:permission-one:open" })?.status).toBe("sent"));
+      const pending = store.getInteraction("permission-one");
+      store.dismissInteraction(pending.id, pending.generation, "The original permission is unavailable.", "retire-without-clear-receipt");
+      expect(store.findMessagingDeliveryByDedupe({ ...key, dedupeKey: "interaction:permission-one:close" })).toBeUndefined();
+      releaseCallback();
+      await vi.waitFor(() => expect(store.findMessagingDeliveryByDedupe({ ...key, dedupeKey: "interaction:permission-one:close" }))
+        .toMatchObject({ status: "sent", providerMessageId: "card-1" }));
+      expect(transport.clearedInteractionCards).toEqual([{ address: transport.sentInteractionCards[0]!.address, messageId: "card-1" }]);
+      expect(transport.interactionAnswers[0]).toEqual({ text: "This action is no longer available.", showAlert: true });
+      expect(store.getInteraction(pending.id)).toMatchObject({ status: "dismissed" });
+      expect(adapter.decision).toBeUndefined();
+    } finally { releaseCallback(); }
+  });
+
   it("resolves a typed multi-field question from an exact Telegram reply without admitting another Queue turn", async () => {
     const transport = new QuestionReplyTelegramTransport();
     const adapter = new QuestionFakeAdapter();
@@ -4659,7 +4730,7 @@ class InteractiveTelegramTransport extends FakeTelegramTransport {
   #releaseInteractionPoll: (() => void) | undefined;
   #releaseStalePoll: (() => void) | undefined;
 
-  constructor(private readonly decision: "allow_once" | "deny_once" = "allow_once") {
+  constructor(private readonly decision: "allow_once" | "deny_once" = "allow_once", private readonly beforeCallback?: () => Promise<void>) {
     super(directMessageBatch());
   }
 
@@ -4680,6 +4751,8 @@ class InteractiveTelegramTransport extends FakeTelegramTransport {
           else input.signal?.addEventListener("abort", abort, { once: true });
         });
       }
+      await this.beforeCallback?.();
+      input.signal?.throwIfAborted();
       return { updates: [{ update_id: 10 }], nextCursor: "11" };
     }
     if (input.cursor === "11") {

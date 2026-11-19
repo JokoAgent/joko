@@ -3115,6 +3115,14 @@ export class MessagingManager {
             completed = true;
           } else {
             outcomeCode = "stale_action";
+            if (connection.channel === "telegram" && event.speaker.isOwner && conversation.conversationKind === "direct"
+              && conversation.partnerId === undefined && conversation.providerConversationId === connection.ownerProviderUserId
+              && card.action === "open" && button?.submission.kind === "permission" && pending.kind === "permission"
+              && pending.status === "dismissed" && pending.sessionId === conversation.sessionId
+              && pending.generation === conversation.sessionGeneration && pending.generation === card.interactionGeneration) {
+              this.#retireSentInteractionIfSettled(connection, delivery);
+              this.#scheduleDeliveryDrain(connection.id);
+            }
           }
         } catch {
           outcomeCode = "invalid_action";
@@ -4495,6 +4503,12 @@ export class MessagingManager {
       limit: 1_000
     })) {
       if (delivery.kind === "interaction") this.#retireSentInteractionIfSettled(connection, delivery);
+    }
+    if (connection.channel === "telegram" && connection.ownerProviderUserId !== undefined) {
+      for (const delivery of this.#store.listDismissedTelegramPermissionCards({ connectionId: connection.id,
+        channelGeneration: connection.generation, ownerProviderUserId: connection.ownerProviderUserId })) {
+        this.#retireSentInteractionIfSettled(connection, delivery);
+      }
     }
   }
 
