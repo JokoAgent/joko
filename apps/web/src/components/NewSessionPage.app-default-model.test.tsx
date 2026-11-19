@@ -81,7 +81,7 @@ it("uses the current Backend default for a new task when its remembered model ha
   const save = vi.fn(async (_draft: NewSessionLocalDraft) => undefined), onSubmit = vi.fn(async () => undefined);
   const mount = async (snapshot: AppSnapshot, draft?: NewSessionLocalDraft) => {
     const controller = { state: { activeProfile: { id: "connection", serverId: "node", origin: "http://127.0.0.1", deviceId: "device" }, snapshot,
-      route: { kind: "newSession" }, connectionGeneration: 1n, navigationRevision: 1, connectionState: "connected", preferences: { locale: "en", newSessionWorktreeEnabled: false } },
+      route: { kind: "newSession" }, connectionGeneration: 1, navigationRevision: 1, connectionState: "connected", preferences: { locale: "en", newSessionWorktreeEnabled: false } },
     readNewSessionDraft: vi.fn(async () => draft), saveNewSessionDraft: save, prepareTargetWorkspace: vi.fn(async () => undefined),
     probeTargetWorktree: vi.fn(async () => ({ eligibility: "unavailable" })), listTargetWorktreeSources: vi.fn(async () => []),
     refreshProviderModels: vi.fn(async () => undefined) } as unknown as AppController;
