@@ -2035,10 +2035,11 @@ export async function createOrchestratorApplication(
     scheduleRunNotifications,
     worktrees: sessionWorktrees,
     usageOwnerId: serverId,
-    usageMoneyKind: (backendId, providerId) => providerUsageMoneyKind(
+    usageMoneyKind: (backendId, providerId, modelId) => providerUsageMoneyKind(
       providers,
       store.getBackend(backendId).descriptor,
-      providerId
+      providerId,
+      modelId
     ),
     backendEnabled: (backendId) => store.findSetting<{ readonly enabled?: boolean }>(
       "service",
@@ -4330,13 +4331,23 @@ function proxyBypassed(target: URL, configured: string | undefined): boolean {
 
 export function providerUsageMoneyKind(
   providers: Pick<ProviderCatalogManager, "list">,
-  backend: Pick<BackendDescriptor, "id" | "capabilities">,
-  providerId: string
+  backend: Pick<BackendDescriptor, "id" | "adapterKind" | "capabilities" | "models">,
+  providerId: string,
+  modelId?: string
 ): "actual-cost" | "subscription-value" | "reference-value" {
   if (backend.capabilities.get(MANAGED_PROVIDER_CATALOG_CAPABILITY)?.supported !== true) {
     return "reference-value";
   }
-  const kind = providers.list(backend.id).find((entry) => entry.provider.id === providerId)?.kind;
+  const entry = providers.list(backend.id).find((candidate) => candidate.provider.id === providerId);
+  const kind = entry?.kind;
+  if (backend.adapterKind === "pi" && entry?.kind === "api_key" && modelId !== undefined &&
+    entry.provider.baseUrl !== undefined && entry.nativeCredentialReferenceId === undefined &&
+    Object.keys(entry.credentialBindings).length > 0) {
+    const model = entry.provider.models.find(candidate => candidate.id === modelId);
+    const effectiveApi = backend.models.find(candidate => candidate.providerId === providerId && candidate.modelId === modelId)?.api;
+    // Pi's Chat Completions client calculates these amounts from the local model rates.
+    if (model?.cost !== undefined && (effectiveApi ?? model.api ?? entry.provider.api) === "openai-completions") return "reference-value";
+  }
   if (kind === "managed" || kind === "api_key" || kind === "oauth" || kind === "custom_endpoint") {
     return "actual-cost";
   }

@@ -1102,7 +1102,8 @@ export class SessionHost {
   readonly #usageOwnerId: string;
   readonly #usageMoneyKind: (
     backendId: string,
-    providerId: string
+    providerId: string,
+    modelId: string
   ) => "actual-cost" | "subscription-value" | "reference-value";
   readonly #sessionRuntimeFallbackEnabled: () => boolean;
   readonly #partnerSessionRetiring: (sessionId: string) => boolean;
@@ -1261,10 +1262,11 @@ export class SessionHost {
       readonly backendRetirementTimeoutMs?: number;
       /** Stable Orchestrator node identity; never accepted from an RPC request. */
       readonly usageOwnerId?: string;
-      /** Exact Backend/Provider billing provenance; never inferred from a global Provider ID. */
+      /** Billing provenance for the exact Backend, Provider, and model. */
       readonly usageMoneyKind?: (
         backendId: string,
-        providerId: string
+        providerId: string,
+        modelId: string
       ) => "actual-cost" | "subscription-value" | "reference-value";
       /** Owner setting read at decision time; the default is deliberately off. */
       readonly sessionRuntimeFallbackEnabled?: () => boolean;
@@ -16154,7 +16156,8 @@ export class SessionHost {
                 ? listAllQueueItems(store, { sessionId }).find(candidate => candidate.runId === runId) : undefined;
               const publishedPayload: EventPayload = durablePayload.type === "message_complete" && durablePayload.role === "assistant" && durablePayload.usage !== undefined
                 ? { ...durablePayload, usageIsEstimate: this.#usageMoneyKind(target.backendId,
-                  usageItem?.executionOverrides?.providerId ?? session.descriptor.providerId ?? "") !== "actual-cost" }
+                  usageItem?.executionOverrides?.providerId ?? session.descriptor.providerId ?? "",
+                  usageItem?.executionOverrides?.modelId ?? session.descriptor.modelId ?? "") !== "actual-cost" }
                 : durablePayload;
               const event = store.appendEvent({
               backendId: target.backendId,
@@ -17473,7 +17476,7 @@ export class SessionHost {
         if (!models) throw new StoreError("The native per-model usage partition is invalid.");
         const requests = native.requests === undefined ? [] : parseNativeUsageRequests(native.requests, models);
         if (!requests) throw new StoreError("The native request usage partition is invalid.");
-        const subscriptionValue = this.#usageMoneyKind(session.descriptor.backendId, providerId) === "subscription-value";
+        const subscriptionValue = this.#usageMoneyKind(session.descriptor.backendId, providerId, modelId) === "subscription-value";
         if (provesProviderAvailable) clearProviderRateLimit(store, session.descriptor.backendId, providerId);
         const remaining = { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens,
           cacheWriteTokens: usage.cacheWriteTokens, totalTokens: usage.totalTokens, costMicros: Math.round(usage.cost * 1_000_000) };
@@ -17533,7 +17536,7 @@ export class SessionHost {
     const substitution = runUsageId === undefined ? undefined : store.findRunModelSubstitution(runUsageId);
     const canPriceReference = referencePricingKnown && (nativeReferenceRequest || native?.costComplete !== false
       && childAccounting?.costComplete !== false && !(substitution?.selectedModelId === modelId));
-    const usageMoneyKind = this.#usageMoneyKind(session.descriptor.backendId, providerId);
+    const usageMoneyKind = this.#usageMoneyKind(session.descriptor.backendId, providerId, modelId);
     const nativeSubscriptionValue = native !== undefined && usageMoneyKind === "subscription-value";
     if (provesProviderAvailable) {
       clearProviderRateLimit(store, session.descriptor.backendId, providerId);
