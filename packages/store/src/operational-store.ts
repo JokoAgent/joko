@@ -2283,6 +2283,7 @@ export class OperationalStore {
         JOIN product_sessions AS session ON session.id = delivery.session_id
         WHERE delivery.status = 'pending' AND delivery.available_at <= ?
           AND session.hidden = 0
+          AND (delivery.group_id IS NOT NULL OR (session.archived = 0 AND session.deleted_at IS NULL))
           AND registration.expires_at > ?
           AND connection.state = 'active' AND connection.device_id = registration.device_id
           AND device.state = 'active' AND device.kind = 'mobile'
@@ -2345,14 +2346,21 @@ export class OperationalStore {
         ).run(current.registrationId);
         return undefined;
       }
-      const hiddenRetry = input.outcome === "retry" && this.getSession(current.sessionId).descriptor.hidden === true;
-      const handoffClosedRetry = input.outcome === "retry" && current.outcomeCode === "INPUT_HANDOFF_CLOSED";
-      const suppressRetry = hiddenRetry || handoffClosedRetry;
-      const status = suppressRetry ? "failed" : input.outcome === "retry" ? "pending" : input.outcome;
-      const availableAt = input.outcome === "retry" && !suppressRetry
+      let retryBlocked: string | undefined;
+      if (input.outcome === "retry") {
+        const session = this.getSession(current.sessionId).descriptor;
+        if (session.hidden) retryBlocked = "TASK_HIDDEN";
+        else if (current.outcomeCode === "INPUT_HANDOFF_CLOSED") retryBlocked = current.outcomeCode;
+        else if (current.groupId === undefined) {
+          if (session.deletedAt !== undefined || current.outcomeCode === "TASK_DELETED") retryBlocked = "TASK_DELETED";
+          else if (session.archived || current.outcomeCode === "TASK_ARCHIVED") retryBlocked = "TASK_ARCHIVED";
+        }
+      }
+      const status = retryBlocked ? "failed" : input.outcome === "retry" ? "pending" : input.outcome;
+      const availableAt = input.outcome === "retry" && !retryBlocked
         ? safeNonNegativeInteger(input.retryAt, "Mobile push retry time")
         : current.availableAt;
-      if (input.outcome === "retry" && !suppressRetry && availableAt <= at) {
+      if (input.outcome === "retry" && !retryBlocked && availableAt <= at) {
         throw new StoreError("Mobile push retry time must be in the future.");
       }
       this.database.prepare(`
@@ -2363,7 +2371,7 @@ export class OperationalStore {
       `).run(
         status,
         availableAt,
-        hiddenRetry ? "TASK_HIDDEN" : handoffClosedRetry ? "INPUT_HANDOFF_CLOSED" : code,
+        retryBlocked ?? code,
         at,
         asSqlInteger(this.requireActiveRevision()),
         id,
@@ -2384,6 +2392,7 @@ export class OperationalStore {
       JOIN mobile_push_registrations AS registration ON registration.id = delivery.registration_id
       JOIN product_sessions AS session ON session.id = delivery.session_id
       WHERE delivery.status = 'pending' AND registration.expires_at > ? AND session.hidden = 0
+        AND (delivery.group_id IS NOT NULL OR (session.archived = 0 AND session.deleted_at IS NULL))
     `).get(this.now()) as Row | undefined;
     const value = row?.["available_at"];
     return value === null || value === undefined ? undefined : numberValue(value);
@@ -8716,6 +8725,16 @@ export class OperationalStore {
       );
       if (patch.hidden === true) this.database.prepare(`UPDATE mobile_push_deliveries SET status = 'failed', outcome_code = 'TASK_HIDDEN', updated_at = ?, revision = ? WHERE session_id = ? AND status = 'pending'`)
         .run(now, asSqlInteger(this.requireActiveRevision()), id);
+      const pushRetirement = patch.deletedAt !== undefined ? "TASK_DELETED"
+        : patch.archived !== undefined && (patch.archived || descriptor.archived) ? "TASK_ARCHIVED" : undefined;
+      if (pushRetirement) {
+        this.database.prepare(`UPDATE mobile_push_deliveries
+          SET status = CASE WHEN status = 'pending' THEN 'failed' ELSE status END,
+              outcome_code = CASE WHEN outcome_code = 'INPUT_HANDOFF_CLOSED' THEN outcome_code ELSE ? END,
+              updated_at = ?, revision = ?
+          WHERE session_id = ? AND group_id IS NULL AND status IN ('pending', 'dispatching')`)
+          .run(pushRetirement, now, asSqlInteger(this.requireActiveRevision()), id);
+      }
       if (descriptor.deletedAt === undefined && patch.deletedAt !== undefined) {
         this.database.prepare("DELETE FROM session_objectives WHERE session_id = ?").run(id);
         this.database.prepare("DELETE FROM session_objective_generations WHERE session_id = ?").run(id);
@@ -14990,7 +15009,8 @@ export class OperationalStore {
     at: number,
     runId?: string
   ): void {
-    if (session.descriptor.hidden || this.suppressSessionNotifications?.(session.descriptor.id) === true) return;
+    if (session.descriptor.hidden || session.descriptor.archived || session.descriptor.deletedAt !== undefined
+      || this.suppressSessionNotifications?.(session.descriptor.id) === true) return;
     const message = this.latestMobilePushMessageOrigin(
       session.descriptor.id,
       attention.subjectCursor,

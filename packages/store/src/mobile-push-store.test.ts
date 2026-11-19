@@ -59,6 +59,38 @@ describe("mobile push durable boundary", () => {
       .toMatchObject({ status: "failed", outcomeCode: "TASK_HIDDEN" });
     store.updateSession("session-1", { hidden: false }); expect(store.claimNextMobilePushDelivery(2000)).toBeUndefined();
   });
+  it.each(["archive", "delete"] as const)("retires a task's pending and in-flight retries on %s without consuming group notices", (action) => {
+    const { store } = createFixture();
+    const connection = store.createConnection({ id: "lifecycle-mobile", name: "Phone", authKeyDigest: "lifecycle-mobile-digest",
+      device: { defaultName: "Phone", kind: "mobile", platform: "iOS", appVersion: "1" }, pairedAt: 10 });
+    const device = store.getDevice(connection.deviceId);
+    store.putMobilePushRegistration({ id: "lifecycle-registration", connectionId: connection.id, deviceId: device.id, expectedDeviceRevision: device.revision,
+      environment: "apns_sandbox", locale: "en", tokenDigest: digest("a"), sealedToken: sealedCredential(1, "encrypted-token"),
+      revocationSecretDigest: digest("b"), sealedRevocationSecret: sealedCredential(2, "encrypted-secret"), expiresAt: 50_000, now: 1_000 });
+    const done = (id: string, at: number) => store.appendEvent({ id, backendId: "pi", targetId: "target-1", sessionId: "session-1", generation: 0,
+      emittedAt: at, traceId: `push:${id}`, payload: { type: "done", outcome: "completed" } });
+    done("pending-backoff", 1_100);
+    const pending = store.claimNextMobilePushDelivery(1_200)!;
+    const retry = (claim: NonNullable<ReturnType<OperationalStore["claimNextMobilePushDelivery"]>>, now: number) => store.finishMobilePushDelivery({
+      deliveryId: claim.delivery.id, claimToken: claim.delivery.claimToken!, outcome: "retry", outcomeCode: "APNS_5XX", retryAt: 4_000, now
+    });
+    expect(retry(pending, 1_210)).toMatchObject({ status: "pending" });
+    done("still-dispatching", 1_300);
+    const inFlight = store.claimNextMobilePushDelivery(1_400)!;
+    expect(inFlight.delivery.id).not.toBe(pending.delivery.id);
+    store.updateSession("session-1", { archived: true, ...(action === "delete" ? { deletedAt: 1_500 } : {}) }, undefined, 1_500);
+    const outcomeCode = action === "delete" ? "TASK_DELETED" : "TASK_ARCHIVED";
+    const deliveries = store.listMobilePushDeliveries();
+    expect(deliveries.find(row => row.id === pending.delivery.id)).toMatchObject({ status: "failed", outcomeCode, attempts: 1 });
+    expect(deliveries.find(row => row.id === inFlight.delivery.id)).toMatchObject({ status: "dispatching", outcomeCode, attempts: 1 });
+    expect(store.nextMobilePushDeliveryAt()).toBeUndefined();
+    expect(store.claimNextMobilePushDelivery(4_010)).toBeUndefined();
+    if (action === "archive") store.updateSession("session-1", { archived: false }, undefined, 4_020);
+    expect(retry(inFlight, 4_030)).toMatchObject({ status: "failed", outcomeCode, attempts: 1 });
+    if (action === "archive") store.updateSession("session-1", { archived: true }, undefined, 4_040);
+    store.enqueuePartnerGroupStepPush({ groupId: "independent-group", groupTitle: "Group notice", sourceSessionId: "session-1", subjectSequence: 1n, kind: "awaiting" });
+    expect(store.claimNextMobilePushDelivery(4_050)?.delivery).toMatchObject({ groupId: "independent-group", status: "dispatching" });
+  });
   it("fences iOS registration, queues each attention subject once, and retires exact authority", () => {
     const { store, filePath } = createFixture();
     const connection = store.createConnection({
