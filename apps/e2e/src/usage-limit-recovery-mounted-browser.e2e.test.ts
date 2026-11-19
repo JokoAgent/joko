@@ -55,6 +55,8 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
     const queueItemId = queueItemIdFrom(admitted);
     checkpoint("waiting for the original rate limit");
     await waitFor(() => owner.clients.run.getRun({ runId }), value => value.run?.state === RunState.FAILED, "the original Pi rate limit");
+    await waitFor(async () => fixture!.application.store.getQueueItem(queueItemId), value => value.state === "failed",
+      "the original Pi input to finish settling its queue item");
     expect(fixture.providerRequests.length).toBeGreaterThan(0);
     expect(fixture.providerRequests.every(({ body }) => body["model"] === REAL_PI_MODEL_ID)).toBe(true);
     expect(fixture.application.store.getQueueItem(queueItemId).executionOverrides)
@@ -63,13 +65,28 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
 
     checkpoint("closing the original fixture for the cold receipt");
     const closeOriginalApplication = fixture.application.close.bind(fixture.application);
+    const host = fixture.application.sessionHost;
+    const disposeOriginalHost = host.dispose.bind(host);
+    const hostClosing = vi.spyOn(host, "dispose").mockImplementation(async () => {
+      checkpoint("disposing the original SessionHost");
+      await disposeOriginalHost();
+      checkpoint("disposed the original SessionHost");
+    });
+    const adapterClosing = await host.invokeBackendAdapter("pi", adapter => {
+      const disposeOriginalAdapter = adapter.dispose.bind(adapter);
+      return vi.spyOn(adapter, "dispose").mockImplementation(async () => {
+        checkpoint("disposing the original Pi Adapter");
+        await disposeOriginalAdapter();
+        checkpoint("disposed the original Pi Adapter");
+      });
+    });
     const closing = vi.spyOn(fixture.application, "close").mockImplementation(async () => {
       checkpoint("closing the original Orchestrator");
       await closeOriginalApplication();
       checkpoint("closed the original Orchestrator");
     });
     try { await fixture.close(); }
-    finally { closing.mockRestore(); }
+    finally { closing.mockRestore(); hostClosing.mockRestore(); adapterClosing.mockRestore(); }
     checkpoint("opening the service on the original database");
     fixture = await RealPiSystemFixture.start({ rootDirectory, webDirectory });
     checkpoint("configuring the restarted service");

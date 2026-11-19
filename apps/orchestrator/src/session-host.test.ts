@@ -6917,6 +6917,48 @@ describe("SessionHost", () => {
     expect(adapter.sendCalls).toBe(1);
   });
 
+  it("wakes the original queued item when its persisted edit lock expires after a cold reopen", async () => {
+    const fixture = await createFixture(new SendCountingFakeAdapter());
+    const sessionId = (await fixture.host.createSession({ operationId: "cold-lock-create", connection: fixture.connection,
+      targetId: "target-one", title: "Recover edit lock", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    fixture.store.setQueuePaused({ sessionId, paused: true, traceId: "hold original input for setup" });
+    const queued = fixture.host.enqueueInput({ operationId: "cold-lock-input", connection: fixture.connection, sessionId,
+      prompt: { text: "send the original input", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+    await fixture.host.dispose();
+    const startedAt = Date.now();
+    const ttlMs = 90_000;
+    fixture.store.setQueueItemEditLock({ queueItemId: queued.queueItemId, connectionId: fixture.connection.id,
+      lockToken: "retained-edit-lock", locked: true, at: startedAt, ttlMs });
+    fixture.store.setQueuePaused({ sessionId, paused: false, traceId: "queue was unpaused at shutdown" });
+    fixture.store.close();
+
+    vi.useFakeTimers({ now: startedAt, toFake: ["Date", "setTimeout", "clearTimeout"] });
+    try {
+      const store = new OperationalStore(join(fixture.directory, "store.db"), { now: Date.now });
+      cleanups.push(() => store.close());
+      const artifacts = new ArtifactStore({ rootDirectory: join(fixture.directory, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [fixture.directory] });
+      await artifacts.initialize();
+      const adapter = new SendCountingFakeAdapter();
+      const host = new SessionHost(store, artifacts, [adapter]);
+      cleanups.push(() => host.dispose());
+      const claim = vi.spyOn(store, "claimNextQueueItem");
+      await host.initialize();
+      await vi.waitFor(() => expect(claim).toHaveBeenCalledTimes(1), { interval: 1 });
+      expect(claim.mock.results[0]?.value).toBeUndefined();
+      expect(store.getQueueItem(queued.queueItemId)).toMatchObject({ state: "accepted", editLocked: true });
+
+      await vi.advanceTimersByTimeAsync(startedAt + ttlMs - Date.now() - 1);
+      expect(adapter.sendCalls).toBe(0);
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.waitFor(() => expect(store.getRun(queued.runId).descriptor.state).toBe("completed"));
+      expect(store.getQueueItem(queued.queueItemId)).toMatchObject({ state: "completed", editLocked: false });
+      expect(store.listQueueItems({ sessionId })).toHaveLength(1);
+      expect(adapter.sendCalls).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("holds accepted input before claim while a Backend generation change is pending", async () => {
     const adapter = new SendCountingFakeAdapter();
     let blocked = true;

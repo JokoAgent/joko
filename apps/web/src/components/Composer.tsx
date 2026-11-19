@@ -315,9 +315,10 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   }, [t, workspace?.id, workspace?.revision, workspaceMentionReload, workspaceMentionsAvailable]);
 
   const modelRouteUnavailable = !modelSourceAccess(backend, session.model, session.model, controller.state.snapshot.providers).available;
+  const queueDispositions = useMemo(() => advertisedQueueDeliveryModes(backend), [backend]);
   const supportedModes = useMemo(
-    () => modelRouteUnavailable ? [] : deliveryModesFor(session, backend),
-    [backend, modelRouteUnavailable, session]
+    () => modelRouteUnavailable ? [] : deliveryModesFor(session, queueDispositions),
+    [modelRouteUnavailable, queueDispositions, session]
   );
   const taskModel = session.model;
   const subscriptionProvider = !guest && !readOnly && controller.state.connectionState === "connected"
@@ -2847,7 +2848,9 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
           }
         }}
       >
-      {showQueue && <QueueStrip sessionId={session.id} items={sessionQueue} control={queueControl} supportedDispositions={supportedModes} attachmentPolicy={attachmentPolicy} controller={controller} runAction={runAction} t={t} expanded={queueExpanded} onExpandedChange={(expanded) => setQueueExpandedSessionId(expanded ? session.id : undefined)} actionsRef={queueActionsRef} />}
+      {showQueue && <QueueStrip sessionId={session.id} items={sessionQueue} control={queueControl} supportedDispositions={queueDispositions}
+        steerSupported={supportedModes.includes("steer")} attachmentPolicy={attachmentPolicy} controller={controller} runAction={runAction} t={t}
+        expanded={queueExpanded} onExpandedChange={(expanded) => setQueueExpandedSessionId(expanded ? session.id : undefined)} actionsRef={queueActionsRef} />}
       <div
         className={cx("composer", dragging && "is-dragging", effectiveBashMode && "composer--bash")}
         aria-busy={submissionKind !== undefined}
@@ -3349,8 +3352,7 @@ function ComposerPalette({ title, items, empty, t, onSelect, onClose, embedded =
   );
 }
 
-function deliveryModesFor(session: SessionView, backend?: BackendView): readonly DeliveryMode[] {
-  const advertised = advertisedQueueDeliveryModes(backend);
+function deliveryModesFor(session: SessionView, advertised: readonly DeliveryMode[]): readonly DeliveryMode[] {
   if (session.state !== "running" && session.state !== "waiting" && session.state !== "retrying") {
     return advertised.includes("prompt") ? ["prompt"] : [];
   }

@@ -332,7 +332,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   }, [connectionOwner]);
   const [taskTagSessionId, setTaskTagSessionId] = useState<string>();
   const [archiveRemoval, setArchiveRemoval] = useState<SessionRemovalDialogRequest>();
-  const removeArchivedProjectSessions = useRef<((sessions: readonly SessionView[], fallbackSessionIds: readonly string[]) => void) | undefined>(undefined);
+  const removeArchivedSessions = useRef<((sessions: readonly SessionView[], navigate?: boolean, fallbackSessionIds?: readonly string[]) => void) | undefined>(undefined);
   const [deleteRemoval, setDeleteRemoval] = useState<SessionRemovalDialogRequest>();
   const [actionError, setActionError] = useState<string>();
   const [retryableMessageDeepLinkKey, setRetryableMessageDeepLinkKey] = useState<string>();
@@ -2198,7 +2198,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       !removed.has(sessionId) && controllerRef.current.state.snapshot.sessions.some(session => session.id === sessionId && !session.archived));
     controller.navigate(replacement === undefined ? { kind: "session" } : { kind: "session", sessionId: replacement });
   };
-  removeArchivedProjectSessions.current = (sessions, fallbackSessionIds) => removeSessionsFromNavigation(sessions, true, fallbackSessionIds);
+  removeArchivedSessions.current = removeSessionsFromNavigation;
   const setProjectSessionsArchived = async (
     project: ProjectSessionArchiveRequest,
     sessions: readonly SessionView[],
@@ -2225,7 +2225,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     if (!current()) return;
     if (archived && completed.length > 0) {
       const unchangedRoute = controllerRef.current.state.navigationRevision === navigationRevision;
-      removeArchivedProjectSessions.current?.(completed, unchangedRoute ? originalPaneIds : []);
+      removeArchivedSessions.current?.(completed, true, unchangedRoute ? originalPaneIds : []);
     }
     if (firstFailure !== undefined) throw firstFailure.error;
   };
@@ -2271,9 +2271,21 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       await setProjectSessionsArchived(projectArchive, sessions, true, preflight);
       return;
     }
-    for (const session of sessions) await controller.archiveSession(session.id, true, preflight?.archiveConfirmations?.[session.id]);
-    removeSessionsFromNavigation(sessions, onArchived === undefined);
-    onArchived?.();
+    const owner = state.activeProfile;
+    if (owner === undefined) return;
+    const isCurrentOwner = (): boolean => {
+      const current = controllerRef.current.state;
+      return current.ready && current.connectionState === "connected" && current.activeProfile !== undefined
+        && current.connectionGeneration === state.connectionGeneration
+        && current.activeProfile.id === owner.id && current.activeProfile.serverId === owner.serverId;
+    };
+    for (const session of sessions) {
+      if (!isCurrentOwner()) return;
+      await controllerRef.current.archiveSession(session.id, true, preflight?.archiveConfirmations?.[session.id]);
+    }
+    if (!isCurrentOwner()) return;
+    removeArchivedSessions.current?.(sessions, onArchived === undefined);
+    if (controllerRef.current.state.navigationRevision === state.navigationRevision) onArchived?.();
   };
   const requestArchiveSessions = (
     sessions: readonly SessionView[],

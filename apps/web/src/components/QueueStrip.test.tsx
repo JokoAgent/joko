@@ -35,14 +35,29 @@ async function fixture() {
   const failures: unknown[] = [];
   const runAction: RunAction = (_key, action) => { void action().catch((error: unknown) => failures.push(error)); };
   const host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
-  const render = async (items = initial, owner = controller, control?: QueueControlView) => act(async () => root!.render(<QueueStrip sessionId="task" items={items} control={control}
-    controller={owner as unknown as AppController} supportedDispositions={["followUp", "steer"]} runAction={runAction} t={(key) => key}
+  const render = async (items = initial, owner = controller, control?: QueueControlView, steerSupported = true) => act(async () => root!.render(<QueueStrip sessionId="task" items={items} control={control}
+    controller={owner as unknown as AppController} supportedDispositions={["prompt", "followUp", "steer"]} steerSupported={steerSupported} runAction={runAction} t={(key) => key}
     expanded={false} onExpandedChange={vi.fn()} actionsRef={actions} />));
   await render();
   const row = (id = "first") => host.querySelector<HTMLElement>(`[data-queue-item-id="${id}"]`)!;
   const button = (label: string, id = "first") => [...row(id).querySelectorAll<HTMLButtonElement>("button")].find((value) => value.getAttribute("aria-label") === label || value.textContent === label)!;
   return { host, controller, failures, render, row, button, actions };
 }
+it("reopens an accepted prompt for editing while immediate steer is unavailable", async () => {
+  const f = await fixture();
+  const item = { ...initial[0]!, mode: "prompt" as const };
+  const control = { sessionId: "task", revision: 2n, generation: 1n, state: "paused", interactionLocked: false, queuedItemCount: 1 } as const;
+  await f.render([item], f.controller, control, false);
+  expect(f.actions.current?.steerSole()).toBe(false);
+  await act(async () => f.button("queue.edit").click());
+  await change(f.row().querySelector("textarea")!, "Retain the original delivery mode");
+  const editor = f.row().querySelector("form")!;
+  await act(async () => editor.requestSubmit());
+  expect(f.controller.editQueueItem).toHaveBeenCalledWith(item.id, expect.objectContaining({ text: "Retain the original delivery mode" }), "prompt", expect.any(String));
+  await f.render([{ ...item, text: "Retain the original delivery mode", revision: item.revision + 1n }], f.controller, control, false);
+  expect(f.button("queue.edit").disabled).toBe(false);
+  expect(f.controller.steerQueueItemNow).not.toHaveBeenCalled();
+});
 it("steers a sole eligible input with the row lock and declines ambiguous, foreign, edited, or pending input", async () => {
   const f = await fixture();
   expect(f.actions.current?.steerSole()).toBe(false);
