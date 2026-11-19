@@ -157,11 +157,17 @@ type BrowserCommentElementDesignRecord = BrowserCommentDesignRecord & {
   readonly originalStyles: Record<BrowserCommentDesignProperty, BrowserCommentInlineStyle>;
 };
 
-export type BrowserDownloadHandler = (
-  pageId: string,
-  verifiedLocalPath: string,
-  sanitizedFileName: string
-) => Promise<void> | void;
+export interface BrowserDownloadSource {
+  readonly pageId: string;
+  readonly generation: number;
+  readonly fileName: string;
+  readonly assertCurrent: () => void;
+  /** Valid until the download handler settles. Never expose this path in public state. */
+  readonly stage: () => Promise<string>;
+  readonly cancel: () => Promise<void>;
+}
+
+export type BrowserDownloadHandler = (source: BrowserDownloadSource) => Promise<"completed" | "cancelled">;
 
 /**
  * Selects where the persistent Browser surface is presented.
@@ -211,10 +217,8 @@ export interface BrowserProviderOptions {
   readonly onActivity?: (activity: BrowserActivity) => Promise<void> | void;
   readonly onExternalPageClosed?: (providerId: string, pageId: string, generation: number) => void;
   /**
-   * Receives a private, canonical path that is guaranteed to be a regular file
-   * inside downloadDirectory. The path is never copied into public activity.
-   * Consumers should finish ingesting the file before the returned promise
-   * settles; the provider removes the staging file afterwards.
+   * Receives the native download as soon as Chromium announces it. The
+   * provider owns the staging file and removes it after the handler settles.
    */
   readonly onDownload?: BrowserDownloadHandler;
   readonly maximumDownloadBytes?: number;
@@ -2409,8 +2413,10 @@ export class BrowserProvider {
   private async handleDownload(pageId: string, generation: number, download: Download): Promise<void> {
     const handler = this.#downloadHandler;
     let staged: Awaited<ReturnType<typeof stageBrowserDownload>> | undefined;
+    const generationSignal = this.#generationAbort.signal;
+    const isCurrent = () => generation === this.#generation && this.#context !== undefined && !generationSignal.aborted;
     try {
-      if (generation !== this.#generation || this.#context === undefined) {
+      if (!isCurrent()) {
         await download.cancel().catch(() => undefined);
         return;
       }
@@ -2419,14 +2425,27 @@ export class BrowserProvider {
         await this.emit({ at: Date.now(), type: "download", pageId, detail: "A browser download was blocked by host policy." });
         return;
       }
-      staged = await stageBrowserDownload(download, this.#options.downloadDirectory, this.#maximumDownloadBytes);
-      if (generation !== this.#generation || this.#context === undefined) return;
-      await handler?.(pageId, staged.verifiedLocalPath, staged.fileName);
-      await this.emit({ at: Date.now(), type: "download", pageId, detail: "Browser download completed." });
+      const assertCurrent = () => {
+        if (!isCurrent() || this.#options.canDownload?.() === false) throw new Error("Browser download is no longer authorized.");
+      };
+      const fileName = sanitizeBrowserFileName(download.suggestedFilename());
+      const stage = async () => {
+        assertCurrent();
+        staged = await stageBrowserDownload(download, this.#options.downloadDirectory, this.#maximumDownloadBytes, fileName);
+        assertCurrent();
+        return staged.verifiedLocalPath;
+      };
+      let outcome: "completed" | "cancelled" = "completed";
+      if (handler === undefined) await stage();
+      else outcome = await handler({ pageId, generation, fileName, assertCurrent, stage, cancel: () => download.cancel() });
+      if (!isCurrent()) return;
+      await this.emit({ at: Date.now(), type: "download", pageId, detail: outcome === "cancelled"
+        ? "A browser download was cancelled before ingest."
+        : "Browser download completed." });
     } catch {
-      if (generation !== this.#generation || this.#context === undefined) return;
+      if (!isCurrent()) return;
       const failure = await download.failure().catch(() => undefined);
-      if (generation !== this.#generation || this.#context === undefined) return;
+      if (!isCurrent()) return;
       await this.emit({ at: Date.now(), type: "download", pageId, detail: failure === "canceled"
         ? "A browser download was cancelled before ingest."
         : "A browser download failed validation or ingest." });
@@ -4222,12 +4241,12 @@ async function enforceBrowserDownloadLimit(context: BrowserContext, downloadDire
 export async function stageBrowserDownload(
   download: Pick<Download, "suggestedFilename" | "path" | "saveAs">,
   downloadDirectory: string,
-  maximumBytes: number
+  maximumBytes: number,
+  fileName = sanitizeBrowserFileName(download.suggestedFilename())
 ): Promise<{ readonly verifiedLocalPath: string; readonly fileName: string }> {
   const original = await download.path();
   const canonicalRoot = await realpath(downloadDirectory);
   await validateBrowserDownloadFile(original, canonicalRoot, maximumBytes);
-  const fileName = sanitizeBrowserFileName(download.suggestedFilename());
   const extension = extname(fileName).slice(0, 32);
   const destination = join(canonicalRoot, `${randomUUID()}${extension}`);
   try {
@@ -4257,7 +4276,6 @@ async function validateBrowserDownloadFile(path: string, canonicalRoot: string, 
 export function sanitizeBrowserFileName(value: string): string {
   const leaf = value.replaceAll("\\", "/").split("/").at(-1) ?? "";
   let safe = leaf.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").trim().replace(/[. ]+$/u, "");
-  if (safe === "" || safe === "." || safe === "..") safe = `download-${Date.now()}`;
   if (/^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/iu.test(safe)) safe = `_${safe}`;
-  return safe.slice(0, 180);
+  return safe.slice(0, 180).replace(/[.\s]+$/u, "") || `download-${Date.now()}`;
 }

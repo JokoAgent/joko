@@ -512,6 +512,10 @@ message BrowserTransfer {
   google.protobuf.Timestamp started_at = 9;
   google.protobuf.Timestamp completed_at = 10;
   ErrorInfo error = 11;
+  // Sanitized display name learned from the Browser before a Blob is available.
+  string file_name = 12;
+  // Native download is still accepting cancellation in this Provider process.
+  bool cancellable = 13;
 }
 
 enum BrowserActivityKind {

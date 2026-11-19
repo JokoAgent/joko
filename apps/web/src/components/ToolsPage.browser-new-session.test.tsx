@@ -185,6 +185,41 @@ it("offers the original completed download after closing its source page and reo
   expect(downloadArtifact).toHaveBeenCalledExactlyOnceWith(download.blobId, download.fileName, expect.objectContaining({ signal: expect.any(AbortSignal) }));
 });
 
+it("cancels the selected Owner download and refreshes the original row", async () => {
+  const initial = snapshot();
+  const browser = initial.browsers[0]!;
+  const page = browser.pages[0]!;
+  const download: BrowserTransferView = { id: "slow-download", browserId: browser.id, pageId: page.id,
+    direction: "download", state: "running", cancellable: true, fileName: "waiting.txt", mediaType: "", byteSize: 0, startedAt: 0 };
+  const entries = vi.fn(async (): Promise<readonly BrowserTransferView[]> => [download]);
+  const cancelBrowserDownload = vi.fn(async () => {
+    entries.mockResolvedValue([{ ...download, state: "cancelled", cancellable: false }]);
+  });
+  const controller = {
+    state: { preferences: DEFAULT_UI_PREFERENCES, activeProfile: { id: "profile-1", serverId: "server-1" } },
+    readNewSessionDraft: vi.fn(async () => undefined),
+    getArtifactUrl: vi.fn(async () => "data:image/png;base64,iVBORw0KGgo="),
+    releaseArtifactUrl: vi.fn(), updateBrowserCommentDesign: vi.fn(async () => []),
+    listBrowserActivity: vi.fn(async () => []), listBrowserTransfers: entries, cancelBrowserDownload
+  } as unknown as AppController;
+  const host = document.body.appendChild(document.createElement("div"));
+  const root = createRoot(host);
+  roots.push(root);
+  const render = (current: BrowserView) => act(async () => root.render(<ToolsPage controller={controller}
+    snapshot={{ ...initial, browsers: [current] }} locale="en" t={key => key}
+    runAction={(_key, action) => { void action(); }} onOpenNavigation={() => undefined} />));
+  const cancelButton = () => host.querySelector<HTMLButtonElement>('[aria-label="browser.cancelDownload"]');
+  await render({ ...browser, takeover: { ...browser.takeover!, connectionId: "other-device" } });
+  expect(cancelButton()).toBeNull();
+  await render(browser);
+  await act(async () => required(cancelButton()).click());
+  expect(cancelBrowserDownload).toHaveBeenCalledExactlyOnceWith(browser.id, page.id, download.id);
+  const row = required(host.querySelector("section.browser-ledger article"));
+  expect(row.textContent).toContain(download.fileName);
+  expect(row.textContent).toContain("browser.transferCancelled");
+  expect(cancelButton()).toBeNull();
+});
+
 function snapshot(): AppSnapshot {
   const initial = emptySnapshot();
   const browser: BrowserView = {

@@ -3549,12 +3549,7 @@ export async function createOrchestratorApplication(
       if (configuredBrowser.targetMode !== configuredSettings.automationTarget()) {
         await configuredBrowser.setTargetMode(configuredSettings.automationTarget());
       }
-      configuredBrowser.setDownloadHandler(async (pageId, verifiedLocalPath, sanitizedFileName) => {
-        if (!configuredSettings.downloadAllowed()) {
-          throw new Error("Browser downloads are disabled by the active host policy.");
-        }
-        await configuredTransfers.onDownload(pageId, verifiedLocalPath, sanitizedFileName);
-      });
+      configuredBrowser.setDownloadHandler(configuredTransfers.onDownload);
       const browserNodeGeneration = durableRuntimeGeneration();
       const browserNodeRouter = new AuthenticatedBrowserRemoteNodeRouter({
         localNodeId: serverId,

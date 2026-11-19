@@ -4827,6 +4827,17 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return this.readBrowserTransfers(browserId, "", true);
   }
 
+  async cancelBrowserDownload(browserId: string, pageId: string, transferId: string): Promise<void> {
+    const browser = this.#rawSnapshot?.browsers.find(candidate => candidate.browserProviderId === browserId);
+    const takeover = this.requireOwnedBrowserTakeover(browserId);
+    if (browser === undefined || takeover.pageId !== pageId || takeover.generation !== browser.generation) {
+      throw new GatewayError("The Browser takeover fence does not match this page generation.");
+    }
+    await this.submit({ case: "cancelBrowserDownload", value: {
+      browserProviderId: browserId, pageId, browserTransferId: transferId, takeoverId: takeover.takeoverId, generation: takeover.generation
+    } });
+  }
+
   private async readBrowserTransfers(browserId: string, pageId: string, completedDownloads: boolean): Promise<readonly BrowserTransferView[]> {
     const client = createClient(BrowserService, this.requireTransport());
     const values: BrowserTransferView[] = [];
@@ -17445,7 +17456,8 @@ function mapBrowserTransfer(transfer: BrowserTransfer): BrowserTransferView {
     state: browserTransferState(transfer.state),
     ...(blob?.blobId ? { blobId: blob.blobId } : {}),
     ...(transfer.artifact?.artifactId ? { artifactId: transfer.artifact.artifactId } : {}),
-    fileName: blob?.fileName || transfer.artifact?.title || transfer.browserTransferId,
+    fileName: blob?.fileName || transfer.fileName || transfer.artifact?.title || transfer.browserTransferId,
+    ...(transfer.cancellable ? { cancellable: true } : {}),
     mediaType: blob?.mediaType ?? "",
     byteSize: numberValue(blob?.byteSize),
     startedAt: timestampMs(transfer.startedAt),

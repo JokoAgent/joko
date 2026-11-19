@@ -1,6 +1,6 @@
 import type { BlobRef } from "@joko/core";
 import * as contract from "@joko/contracts";
-import type { BrowserAction, BrowserLease, BrowserLeaseFence, BrowserTakeover } from "@joko/tool-browser";
+import type { BrowserAction, BrowserDownloadSource, BrowserLease, BrowserLeaseFence, BrowserTakeover } from "@joko/tool-browser";
 import { describe, expect, it, vi } from "vitest";
 
 import type { ArtifactRecord } from "./artifact-store.js";
@@ -21,6 +21,11 @@ const sourceBlob: BlobRef = {
 };
 
 const uploadOwner = (id: string) => ({ id, documentId: "document-one", assertCurrent: () => undefined });
+
+function downloadSource(path: string, fileName: string): BrowserDownloadSource {
+  return { pageId: "page-download", generation: 7, fileName, assertCurrent: () => undefined,
+    stage: async () => path, cancel: async () => undefined };
+}
 
 class FakeArtifacts implements BrowserTransferArtifactStore {
   readonly calls: string[] = [];
@@ -344,7 +349,7 @@ describe("BrowserTransferCoordinator", () => {
     const provider = new FakeProvider();
     const transfers = new BrowserTransferCoordinator({ artifacts, provider, now: () => 2_000 });
 
-    const transfer = await transfers.ingestDownload("page-download", "D:\\browser-private\\random.pdf", "report.pdf");
+    const transfer = await transfers.ingestDownload(downloadSource("D:\\browser-private\\random.pdf", "report.pdf"));
 
     expect(transfer.state).toBe(contract.BrowserTransferState.COMPLETED);
     expect(transfer.direction).toBe(contract.TransferDirection.DOWNLOAD);
@@ -360,12 +365,13 @@ describe("BrowserTransferCoordinator", () => {
     const provider = new FakeProvider();
     const transfers = new BrowserTransferCoordinator({ artifacts, provider });
 
-    const rejectedPath = await transfers.ingestDownload("page-download", "D:\\private\\secret.pdf", "report.pdf");
-    const rejectedName = await transfers.ingestDownload("page-download", "D:\\private\\secret.pdf", "../secret.pdf");
+    const rejectedPath = await transfers.ingestDownload(downloadSource("D:\\private\\secret.pdf", "report.pdf"));
+    const rejectedName = await transfers.ingestDownload(downloadSource("D:\\private\\secret.pdf", "../secret.pdf"));
 
     expect(rejectedPath.state).toBe(contract.BrowserTransferState.FAILED);
     expect(rejectedPath.error?.message).not.toContain("D:\\private");
     expect(rejectedName.state).toBe(contract.BrowserTransferState.FAILED);
+    expect(rejectedName.fileName).toBe("");
     expect(artifacts.calls).toHaveLength(1);
   });
 
@@ -374,7 +380,7 @@ describe("BrowserTransferCoordinator", () => {
     artifacts.ingestFailure = true;
     const transfers = new BrowserTransferCoordinator({ artifacts, provider: new FakeProvider() });
 
-    await expect(transfers.onDownload("page-download", "D:\\private\\secret.pdf", "report.pdf"))
+    await expect(transfers.onDownload(downloadSource("D:\\private\\secret.pdf", "report.pdf")))
       .rejects.toThrow("artifact ingest failed");
     expect(transfers.list({ state: contract.BrowserTransferState.FAILED })).toHaveLength(1);
   });

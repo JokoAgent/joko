@@ -103,7 +103,10 @@ it.skipIf(process.env.JOKO_BROWSER_EXECUTABLE === undefined)("cancels known and 
   const provider = new BrowserProvider({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, targetMode: "sidebar",
     profileDirectories: { sidebar: join(root, "sidebar"), external: join(root, "external") },
     downloadDirectory, uploadRoots: [], maximumDownloadBytes,
-    onDownload: async (_pageId, path, fileName) => { published.push({ fileName, bytes: await readFile(path) }); },
+    onDownload: async source => {
+      published.push({ fileName: source.fileName, bytes: await readFile(await source.stage()) });
+      return "completed";
+    },
     onActivity: ({ type, detail }) => { if (type === "download") activities.push(detail); }
   });
   try {

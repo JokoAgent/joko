@@ -23164,6 +23164,27 @@ async function dispatchMutation(
         }
       );
     }
+    case "cancelBrowserDownload": {
+      const { browserProvider: provider, browserTransfers: transfers } = dependencies;
+      if (provider === undefined || transfers === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Browser file transfer is not configured.");
+      }
+      const value = payload.value;
+      requireOpaqueTakeoverId(value.browserTransferId, "Browser transfer ID");
+      const current = requireOwnedBrowserPageFence(provider, connection.id, { ...value, currentPageId: value.pageId });
+      const owner = requireActiveBrowserPageAuthority(dependencies.browserState, provider.id, current.pageId, current.generation);
+      const assertCurrent = () => {
+        dependencies.connections.fence(connection);
+        provider.assertHumanTakeover(current);
+        requireActiveBrowserPageAuthority(dependencies.browserState, provider.id, current.pageId, current.generation, owner);
+      };
+      return ackOperation(dependencies, operationId, connection, mutation, payload.case, async () => {
+        await provider.runHumanTakeoverOperation(current, async () => {
+          const cancelled = await transfers.cancelDownload(value.browserTransferId, current.pageId, current.generation, assertCurrent);
+          if (!cancelled) throw new ConnectError("The Browser download can no longer be cancelled.", Code.FailedPrecondition);
+        }, assertCurrent);
+      }, assertCurrent);
+    }
     case "beginBrowserTakeover": {
       if (dependencies.browserProvider === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Browser Provider is not configured.");
       if (dependencies.browserSettings?.anyTargetEnabled() === false) throw new ConnectError("Browser Provider is disabled for every project.", Code.FailedPrecondition);
