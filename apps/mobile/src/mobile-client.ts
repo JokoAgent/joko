@@ -8468,7 +8468,7 @@ export class MobileClient {
   }
 
   async prepareFileTextSourceCopy(preview: Extract<MobileFilePreview, { kind: "text" }>, signal: AbortSignal): Promise<MobileFilesClipboardLease> {
-    const source = this.#fileTextActionSource(preview);
+    const source = this.#fileTextActionSource(preview, "copy");
     source.assertCurrent(signal);
     await this.#readFilesPager(() => source.revalidate(signal), signal);
     source.assertCurrent(signal);
@@ -8477,7 +8477,7 @@ export class MobileClient {
 
   async addFileTextQuoteToComposer(preview: Extract<MobileFilePreview, { kind: "text" }>, selectedText: string, signal: AbortSignal): Promise<void> {
     if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
-    const source = this.#fileTextActionSource(preview);
+    const source = this.#fileTextActionSource(preview, "quote");
     const identity = { profileId: this.#ready().profileId, sessionId: this.#state.selectedId! };
     const snapshot = await this.composerDrafts.readSnapshot(identity);
     source.assertCurrent(signal);
@@ -8493,7 +8493,7 @@ export class MobileClient {
     } catch (error) { await this.#restoreFilesComposerDraft(identity, snapshot, next); throw error; }
   }
 
-  #fileTextActionSource(preview: Extract<MobileFilePreview, { kind: "text" }>): {
+  #fileTextActionSource(preview: Extract<MobileFilePreview, { kind: "text" }>, action: "copy" | "quote"): {
     readonly path: string; assertCurrent(signal?: AbortSignal): void; revalidate(signal: AbortSignal): Promise<void>
   } {
     const credential = this.#ready(); const task = this.#taskAuthorityKey();
@@ -8527,7 +8527,7 @@ export class MobileClient {
         const directory = await this.network.listWorkspaceDirectory(credential, entry.workspaceId, workspaceParentPath(entry.relativePath), signal);
         assertCurrent(signal);
         const matches = directory.entries.filter((item) => item.relativePath === entry.relativePath); const current = matches.length === 1 ? matches[0] : undefined;
-        if (!directory.revision || pager?.window.kind === "workspace" && directory.revision !== pager.window.revision
+        if (!directory.revision || action === "copy" && pager?.window.kind === "workspace" && directory.revision !== pager.window.revision
           || !current?.revision || current.kind !== FileKind.REGULAR || current.workspaceId !== context.authority.workspace.workspaceId
           || normalizeMediaType(current.mediaType) !== normalizeMediaType(preview.mediaType)
           || !workspaceComposerRevisionMatches(current.revision, entry.revision!)) throw new Error("The canonical Workspace text file changed.");

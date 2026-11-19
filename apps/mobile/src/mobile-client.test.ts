@@ -14198,6 +14198,22 @@ describe("native current-task Files ownership", () => {
     await expect(f.app.addFileTextQuoteToComposer(f.preview, selected, new AbortController().signal)).rejects.toThrow(/canonical source/u);
   });
 
+  it("quotes the original Workspace Markdown after an unrelated sibling enters the directory", async () => {
+    const f = await textActionFixture();
+    f.drafts.composer.save(f.identity, plainTextMobileComposerDraft("Question"));
+    vi.mocked(f.network.listWorkspaceDirectory).mockResolvedValueOnce({ revision: "text-directory-with-sibling", entries: [
+      f.observed, create(WorkspaceEntrySchema, { ...f.observed, relativePath: "docs/new.md", displayName: "new.md" })
+    ] });
+    const selection = "Selected 😀 text";
+    await f.app.addFileTextQuoteToComposer(f.preview, selection, new AbortController().signal);
+    expect(f.network.readWorkspaceFile).toHaveBeenLastCalledWith(credential, "workspace", "docs/README.md",
+      f.preview.workspaceEntry!.revision, expect.any(AbortSignal));
+    expect(await f.drafts.composer.read(f.identity)).toMatchObject({ text: "Question\n\n⟦Quote from File⟧", atoms: [
+      { kind: "file-quote", sourceSessionId: f.identity.sessionId, sourcePath: "docs/README.md", text: selection }
+    ] });
+    expect(f.network.submit).not.toHaveBeenCalled();
+  });
+
   it("rejects changed bytes and source windows, preserves concurrent drafts and rolls back a failed quote flush", async () => {
     const f = await textActionFixture(); const original = plainTextMobileComposerDraft("Original");
     f.drafts.composer.save(f.identity, original); await f.drafts.composer.flush(f.identity);
