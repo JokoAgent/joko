@@ -103,10 +103,17 @@ function FileMarkdownReader({ preview, text, colors, locale, client, focusLine, 
     work.current = undefined; setResources(undefined);
   }, [client]);
   const ownerKey = JSON.stringify([preview.sourceLabel, preview.revisionKey]);
-  const lifecycle = useMobilePreviewResourceLifecycle({ ownerKey, releaseRenderer: stop, reportFailure: useCallback(() => setFailed(true), []) });
+  const retainOnInactive = Platform.OS === "ios";
+  const lifecycle = useMobilePreviewResourceLifecycle({ ownerKey, releaseRenderer: stop,
+    reportFailure: useCallback(() => setFailed(true), []), retainReadyRendererOnInactive: retainOnInactive });
   const token = lifecycle.rendererToken;
   useEffect(() => () => actionRef.current?.cancel(), [token]);
   const ownsRenderer = (candidate: string) => alive.current && current.current === preview && AppState.currentState === "active" && lifecycle.ownsRenderer(candidate);
+  const onProcessLost = () => {
+    if (!alive.current || current.current !== preview) return;
+    if (ownsRenderer(token)) actionRef.current?.cancel();
+    lifecycle.onRendererProcessLost(token);
+  };
   useEffect(() => {
     const owner = client?.filesMarkdownResourceOwnerKey(preview);
     if (!client || !owner || !lifecycle.rendererMounted) return;
@@ -116,7 +123,9 @@ function FileMarkdownReader({ preview, text, colors, locale, client, focusLine, 
       else if (request.descriptor?.references.size) { try { client.assertMarkdownResourcesCurrent(request.descriptor.leaseId); } catch { stop(); } }
     });
     void client.prepareFilesMarkdownResources(preview, request.controller.signal).then((result) => {
-      if (work.current !== request || request.controller.signal.aborted || current.current !== preview || AppState.currentState !== "active") {
+      const state = AppState.currentState;
+      if (work.current !== request || request.controller.signal.aborted || current.current !== preview ||
+        (state !== "active" && !(retainOnInactive && state === "inactive"))) {
         client.releaseMarkdownResources(result.leaseId); return;
       }
       try { if (result.references.size) client.assertMarkdownResourcesCurrent(result.leaseId); }
@@ -124,16 +133,19 @@ function FileMarkdownReader({ preview, text, colors, locale, client, focusLine, 
       request.descriptor = result; setResources(result);
     }).catch(() => { if (work.current === request) stop(); });
     return () => { unsubscribe(); stop(); };
-  }, [client, lifecycle.rendererGeneration, lifecycle.rendererMounted, preview, stop]);
+  }, [client, lifecycle.rendererGeneration, lifecycle.rendererMounted, preview, retainOnInactive, stop]);
   const html = useMemo(() => buildMobileFileMarkdownHtml({ text, colors, focusLine, label: preview.title }, richRuntime),
     [colors, focusLine, preview.title, text]);
+  const source = useMemo(() => ({ baseUrl: "about:blank", html }), [html]);
   useEffect(() => {
-    if (alive.current && readyToken === token && lifecycle.ownsRenderer(token)) webView.current?.injectJavaScript(mobileFileMarkdownImagesScript(resources));
-  }, [lifecycle.ownsRenderer, readyToken, resources, token]);
+    if (alive.current && readyToken === token && lifecycle.ownsRenderer(token)) {
+      webView.current?.injectJavaScript(mobileFileMarkdownImagesScript(resources));
+    }
+  }, [lifecycle.ownsRenderer, lifecycle.phase, readyToken, resources, token]);
   if (failed) return <Text accessibilityRole="alert" style={[styles.notice, { color: colors.negative }]}>{mobileMessage(locale, "files.preview.renderFailed")}</Text>;
   if (!lifecycle.rendererMounted) return <View style={styles.fill} />;
   return <View style={styles.fill}>{notice && <Text accessibilityRole="alert" style={[styles.notice, { color: colors.negative }]}>{notice}</Text>}
-    <WebView ref={webView} key={token} source={{ baseUrl: "about:blank", html }} originWhitelist={["*"]} style={[styles.fill, { backgroundColor: colors.background }]}
+    <WebView ref={webView} key={token} source={source} originWhitelist={["*"]} style={[styles.fill, { backgroundColor: colors.background }]}
     scrollEnabled javaScriptEnabled allowFileAccess={false} allowFileAccessFromFileURLs={false} allowUniversalAccessFromFileURLs={false}
     sharedCookiesEnabled={false} thirdPartyCookiesEnabled={false} domStorageEnabled={false} setSupportMultipleWindows={false}
     menuItems={actions && !actions.busy ? [{ key: "joko-file-quote", label: mobileMessage(locale, "files.preview.quoteSelection") }] : undefined}
@@ -152,8 +164,8 @@ function FileMarkdownReader({ preview, text, colors, locale, client, focusLine, 
       return false;
     }} onLoad={() => { if (ownsRenderer(token)) { lifecycle.onRendererReady(token); setReadyToken(token); } }}
     onError={() => { if (ownsRenderer(token)) { actionRef.current?.cancel(); stop(); setFailed(true); } }}
-    onContentProcessDidTerminate={() => { if (ownsRenderer(token)) { actionRef.current?.cancel(); lifecycle.onRendererProcessLost(token); } }}
-    onRenderProcessGone={() => { if (ownsRenderer(token)) { actionRef.current?.cancel(); lifecycle.onRendererProcessLost(token); } }} />
+    onContentProcessDidTerminate={onProcessLost}
+    onRenderProcessGone={onProcessLost} />
   </View>;
 }
 
