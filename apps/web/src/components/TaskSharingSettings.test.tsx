@@ -26,8 +26,9 @@ async function fixture(options: { readonly sessionId?: string; readonly invitati
   vi.spyOn(LocalState, "open").mockResolvedValue(local as unknown as LocalState);
   const api = { list: vi.fn().mockResolvedValue({ owned: [], joined: [], intents: [] }),
     create: vi.fn().mockResolvedValue({ share }), invite: vi.fn().mockResolvedValue({ invitation, share }),
-    preview: vi.fn().mockResolvedValue({ share }), join: vi.fn().mockResolvedValue({ intent: { joined, status: "joined" } }),
-    lookupJoin: vi.fn().mockResolvedValue({ intent: { joined, status: "joined" } }),
+    preview: vi.fn().mockResolvedValue({ share }),
+    join: vi.fn().mockImplementation(async (operationId: string) => ({ intent: { operationId, joined, status: "joined" } })),
+    lookupJoin: vi.fn().mockImplementation(async (operationId: string) => ({ intent: { operationId, joined, status: "joined" } })),
     lookupAction: vi.fn(), endAll: vi.fn(), end: vi.fn().mockResolvedValue({ share: { ...share, status: "ended" } }), leave: vi.fn(), remove: vi.fn() };
   const controller = { taskSharing: api, state: { snapshot: emptySnapshot(), activeProfile: { id: "home", serverId: "home-server" }, connectionGeneration: 1, route: { kind: "settings" } }, navigate: vi.fn() } as unknown as AppController;
   const documentOwner = options.ownerDocument ?? document;
@@ -132,6 +133,19 @@ describe("Task Sharing management", () => {
     expect(f.api.join).toHaveBeenCalledWith(expect.any(String), invitation, "Guest", expect.any(AbortSignal));
     expect(f.local.saveTaskSharingAction).toHaveBeenCalledOnce(); expect(f.local.finishTaskSharingAction).toHaveBeenCalledOnce();
     expect(f.pending.size).toBe(0);
+  });
+  it("retires a verified Join rejection and returns to invitation preview", async () => {
+    const f = await fixture({ invitation });
+    f.api.join.mockImplementationOnce(async (operationId: string) => ({ intent: { operationId, status: "failed", errorCode: "PERMISSION_DENIED" } }));
+    await input(f.host.querySelector<HTMLInputElement>("[data-task-sharing-name]")!, "Guest");
+    await act(async () => { f.host.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+    await click(f.host.querySelector<HTMLElement>("[data-task-sharing-join]")!);
+    expect(f.api.join).toHaveBeenCalledOnce();
+    expect(f.pending.size).toBe(0);
+    expect(f.host.textContent).toContain("taskSharing.inviteRejected");
+    expect(f.host.querySelector("[data-task-sharing-join]")).toBeNull();
+    expect(f.host.querySelector<HTMLButtonElement>("[data-task-sharing-preview]")?.disabled).toBe(false);
+    expect(f.controller.navigate).not.toHaveBeenCalled();
   });
   it("recovers the original unknown action by receipt without generating another invitation", async () => {
     const action = { kind: "invite" as const, operationId: "00000000-0000-4000-8000-000000000001" };

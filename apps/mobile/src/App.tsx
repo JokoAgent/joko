@@ -636,6 +636,9 @@ export function App() {
     setPageState(next);
   }, [retireNativeIntentHistory]);
   const [taskInvitation, setTaskInvitation] = useState<string>();
+  const consumeTaskInvitation = useCallback((invitation: string) => {
+    setTaskInvitation(current => current === invitation ? undefined : current);
+  }, []);
   const [deviceInvitation, setDeviceInvitation] = useState<string>();
   const [deviceReview, setDeviceReview] = useState<DeviceAuthorizationReview>();
   const [sharingSessionId, setSharingSessionId] = useState<string>();
@@ -1185,7 +1188,7 @@ export function App() {
                     void client.markPartnerPrivateVisible(partnerId, threadId, throughSequence);
                   }} /> :
                 page === "task-sharing" ? <MobileTaskSharingScreen {...common} client={client} foreground={foreground} storage={mobilePlainStorage}
-                  invitation={taskInvitation} onInvitationConsumed={() => setTaskInvitation(undefined)} initialSessionId={sharingSessionId}
+                  invitation={taskInvitation} onInvitationConsumed={consumeTaskInvitation} initialSessionId={sharingSessionId}
                   leaveJoinId={sharingLeaveJoinId} onLeavePromptConsumed={() => setSharingLeaveJoinId(undefined)}
                   onBack={() => { setSharingSessionId(undefined); void client.select().then(() => setPage("settings")); }} onOpenTask={() => setPage("task")} /> :
                 page === "settings" ? <MobileSettingsScreen colors={colors} state={state} foreground={foreground}
@@ -8041,11 +8044,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
     setLocalError("");
     void client.shareFilesItem(source, (progress) => {
       if (filesMountedRef.current && fileShareRef.current === controller) setFileShareProgress(progress);
-    }, controller.signal).then(() => {
-      if (filesMountedRef.current && fileShareRef.current === controller) {
-        setImageOutputNotice(mobileMessage(locale, "files.shareCompleted"));
-      }
-    }).catch((error) => {
+    }, controller.signal).catch((error) => {
       if (!controller.signal.aborted && filesMountedRef.current && fileShareRef.current === controller) {
         setLocalError(errorText(error));
       }

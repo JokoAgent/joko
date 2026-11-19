@@ -38,6 +38,22 @@ interface StoredJoin {
   readonly credentialReference: string;
   readonly sealed: EncryptedCredential;
 }
+interface SettledJoin {
+  readonly kind: "join";
+  readonly original: StoredIntent;
+  readonly intent: StoredIntent;
+  readonly joined?: StoredJoin;
+  readonly assertCurrent: () => void;
+}
+interface SettledLeave {
+  readonly kind: "leave";
+  readonly original: contract.TaskSharingActionReceipt | undefined;
+  readonly receipt: contract.TaskSharingActionReceipt;
+  readonly joinId: string;
+  readonly stored: StoredJoin;
+  readonly joined?: StoredJoin;
+  readonly assertCurrent: () => void;
+}
 interface StoredWrite {
   readonly joinId: string;
   readonly operationId: string;
@@ -133,14 +149,21 @@ export class TaskSharingHome {
         status: "prepared", errorCode: "" };
       this.#intents.set(operationId, intent); await this.#save(); auth.assertCurrent();
       intent.status = "sent"; await this.#save(); auth.assertCurrent();
+      let rejected = false;
       try {
         const remote = this.#remote(parsed.hostOrigin, parsed.endpointPublicKey); await remote.verify(parsed.hostServerId, auth.signal); auth.assertCurrent();
         const response = await remote.guest.acceptTaskShareJoin({ intentId: operationId, invitation, credentialSha256Hex: intent.credentialSha256Hex,
-          displayName: name, homeServerId: this.options.serverId, homeDeviceId: auth.deviceId }, { signal: auth.signal });
-        auth.assertCurrent(); await this.#accept(intent, response.share, response.member, secret); auth.assertCurrent();
+          displayName: name, homeServerId: this.options.serverId, homeDeviceId: auth.deviceId }, { signal: auth.signal }).catch((error: unknown) => {
+          // The verified Host rejects an invalid invitation before admitting this join.
+          rejected = error instanceof ConnectError && error.code === Code.PermissionDenied;
+          throw error;
+        });
+        auth.assertCurrent(); await this.#accept(intent, response.share, response.member, secret, auth);
       } catch (error) {
-        intent.status = "unknown"; intent.errorCode = safeCode(error); await this.#save(); auth.assertCurrent();
+        if (rejected) await this.#settleJoin(intent, "failed", safeCode(error), auth);
+        else { intent.status = "unknown"; intent.errorCode = safeCode(error); await this.#save(); }
       }
+      auth.assertCurrent();
       return this.#intent(intent);
     }).finally(() => this.#joinInputs.delete(operationId));
   }
@@ -160,11 +183,17 @@ export class TaskSharingHome {
         for (;;) {
           if (signal.aborted) { auth.assertCurrent(); return; }
           const joinId = pending.shift(); if (joinId === undefined) return;
+          const bounded: TaskSharingHomeAuthority = { ...auth, signal,
+            assertCurrent: () => { auth.assertCurrent(); signal.throwIfAborted(); } };
+          const leave = this.#pendingLeave(joinId);
+          if (leave) {
+            try { await this.lookupAction(leave.operationId, bounded); }
+            catch { auth.assertCurrent(); }
+            if (this.#pendingLeave(joinId)) continue;
+          }
           const stored = this.#joined.get(joinId); if (!stored) continue;
           const before = fromJsonString(contract.JoinedTaskShareSchema, stored.value);
           if (!["active", "disconnected"].includes(before.status)) continue;
-          const bounded: TaskSharingHomeAuthority = { ...auth, signal,
-            assertCurrent: () => { auth.assertCurrent(); signal.throwIfAborted(); } };
           try {
             const state = await this.snapshot(joinId, bounded); auth.assertCurrent();
             if (this.#joined.get(joinId) !== stored) continue;
@@ -236,37 +265,34 @@ export class TaskSharingHome {
     if (oldReceipt) {
       if (oldReceipt.kind !== "task_share_leave" || oldReceipt.joined?.joinId !== joinId) throw new ConnectError("The action has different input.", Code.AlreadyExists);
       if (oldReceipt.status === "applied" && oldReceipt.joined) return oldReceipt.joined;
+      if (oldReceipt.status === "failed" && oldReceipt.errorCode === "NOT_FOUND") throw new ConnectError("No task leave was admitted with this identity.", Code.NotFound);
       throw new ConnectError("Check the original leave receipt before taking another action.", Code.FailedPrecondition);
     }
+    if (this.#pendingLeave(joinId)) throw new ConnectError("The leave result is unknown. Check its original receipt.", Code.FailedPrecondition);
     return this.#single(`leave:${joinId}`, async () => {
       const stored = this.#joined.get(joinId); if (!stored) throw unavailable();
       const before = fromJsonString(contract.JoinedTaskShareSchema, stored.value);
       if (["revoked", "ended", "left"].includes(before.status)) {
-        auth.assertCurrent();
-        const next = create(contract.JoinedTaskShareSchema, { ...before, status: "left", errorCode: "" });
-        this.#joined.set(joinId, { ...stored, value: toJsonString(contract.JoinedTaskShareSchema, next),
-          sealed: this.options.vault.seal("{}", stored.credentialReference) });
-        this.#lifetimes.get(joinId)?.abort();
-        this.#actions.set(operationId, create(contract.TaskSharingActionReceiptSchema, { operationId, kind: "task_share_leave", status: "applied", joined: next }));
-        await this.#save(); auth.assertCurrent(); return next;
+        return this.#adoptLeave(operationId, undefined, stored, before, auth);
       }
-      this.#actions.set(operationId, create(contract.TaskSharingActionReceiptSchema, { operationId, kind: "task_share_leave", status: "sent", joined: before }));
+      const sent = create(contract.TaskSharingActionReceiptSchema, { operationId, kind: "task_share_leave", status: "sent", joined: before });
+      this.#actions.set(operationId, sent);
       await this.#save(); auth.assertCurrent(); this.#lifetimes.get(joinId)?.abort();
-      try { return await this.#withRemote(joinId, auth, async (remote, scope, options) => {
-        const response = await remote.guest.leaveSharedTask({ scope, operationId }, options); auth.assertCurrent();
-        if (!response.share || !response.member || response.share.shareId !== scope.shareId || response.share.sessionId !== scope.sessionId
-          || response.share.hostServerId !== scope.hostServerId || response.member.memberId !== scope.memberId
-          || response.member.memberGeneration < scope.memberGeneration) throw unavailable();
-        return fromJsonString(contract.JoinedTaskShareSchema, this.#joined.get(joinId)!.value);
-      }, true).then(async joined => {
-      const next = create(contract.JoinedTaskShareSchema, { ...joined, status: "left", errorCode: "" });
-      const old = this.#joined.get(joinId)!; this.#joined.set(joinId, { ...old, value: toJsonString(contract.JoinedTaskShareSchema, next),
-        sealed: this.options.vault.seal("{}", old.credentialReference) });
-      this.#actions.set(operationId, create(contract.TaskSharingActionReceiptSchema, { operationId, kind: "task_share_leave", status: "applied", joined: next }));
-      this.#lifetimes.get(joinId)?.abort(); await this.#save(); return next;
-      }); } catch (error) {
-        this.#actions.set(operationId, create(contract.TaskSharingActionReceiptSchema, { operationId, kind: "task_share_leave", status: "unknown", errorCode: safeCode(error), joined: before }));
-        await this.#save(); throw error;
+      try {
+        await this.#withRemote(joinId, auth, async (remote, scope, options) => {
+          const response = await remote.guest.leaveSharedTask({ scope, operationId }, options); auth.assertCurrent();
+          if (!response.share || !response.member || response.share.shareId !== scope.shareId || response.share.sessionId !== scope.sessionId
+            || response.share.hostServerId !== scope.hostServerId || response.member.memberId !== scope.memberId
+            || response.member.memberGeneration < scope.memberGeneration) throw unavailable();
+        }, true);
+        const joined = fromJsonString(contract.JoinedTaskShareSchema, stored.value);
+        return await this.#adoptLeave(operationId, sent, stored, joined, auth);
+      } catch (error) {
+        if (this.#actions.get(operationId) === sent) {
+          this.#actions.set(operationId, create(contract.TaskSharingActionReceiptSchema, { ...sent, status: "unknown", errorCode: safeCode(error) }));
+          await this.#save();
+        }
+        throw error;
       }
     });
   }
@@ -274,27 +300,47 @@ export class TaskSharingHome {
     const value = this.#actions.get(contract.taskShareIdentity(operationId));
     if (!value) return undefined;
     if (auth && value.kind === "task_share_leave" && ["unknown", "sent"].includes(value.status) && value.joined) {
-      const joinId = value.joined.joinId, stored = this.#joined.get(joinId);
-      if (stored) {
-        const joined = fromJsonString(contract.JoinedTaskShareSchema, stored.value);
-        auth.assertCurrent();
-        const remote = this.#remote(joined.share!.hostOrigin, stored.endpointPublicKey);
-        await remote.verify(joined.share!.hostServerId, auth.signal); auth.assertCurrent();
-        const secret = this.options.vault.open(stored.sealed, stored.credentialReference);
-        const response = await remote.guest.getSharedTaskLeaveReceipt({ operationId,
-          scope: contract.scopeForJoinedTask(joined) }, { signal: auth.signal, headers: { authorization: `TaskShareGuest ${secret}` } });
-        auth.assertCurrent();
-        if (this.#joined.get(joinId) !== stored || this.#actions.get(operationId) !== value) throw unavailable();
-        if (response.applied) {
-          const next = create(contract.JoinedTaskShareSchema, { ...joined, status: "left", errorCode: "" });
-          this.#joined.set(joinId, { ...stored, value: toJsonString(contract.JoinedTaskShareSchema, next),
-            sealed: this.options.vault.seal("{}", stored.credentialReference) });
-          this.#actions.set(operationId, create(contract.TaskSharingActionReceiptSchema, { operationId, kind: "task_share_leave", status: "applied", joined: next }));
-          this.#lifetimes.get(joinId)?.abort(); await this.#save(); auth.assertCurrent();
-        }
+      const joinId = value.joined.joinId;
+      auth.assertCurrent();
+      if (!this.#flights.has(`leave:${joinId}`)) {
+        return this.#single(`leave-receipt:${operationId}`, () => this.#recoverLeave(value, joinId, auth));
       }
     }
+    return create(contract.TaskSharingActionReceiptSchema, value);
+  }
+  async #recoverLeave(value: contract.TaskSharingActionReceipt, joinId: string, auth: TaskSharingHomeAuthority): Promise<contract.TaskSharingActionReceipt> {
+    const { operationId } = value, stored = this.#joined.get(joinId);
+    if (!stored) return create(contract.TaskSharingActionReceiptSchema, value);
+    const joined = fromJsonString(contract.JoinedTaskShareSchema, stored.value);
+    auth.assertCurrent();
+    const remote = this.#remote(joined.share!.hostOrigin, stored.endpointPublicKey);
+    await remote.verify(joined.share!.hostServerId, auth.signal); auth.assertCurrent();
+    const secret = this.options.vault.open(stored.sealed, stored.credentialReference);
+    const response = await remote.guest.getSharedTaskLeaveReceipt({ operationId,
+      scope: contract.scopeForJoinedTask(value.joined!) }, { signal: auth.signal, headers: { authorization: `TaskShareGuest ${secret}` } })
+      .catch((error: unknown) => {
+        if (!(error instanceof ConnectError) || error.code !== Code.NotFound) throw error;
+        return undefined;
+      });
+    auth.assertCurrent();
+    if (this.#joined.get(joinId) !== stored || this.#actions.get(operationId) !== value) throw unavailable();
+    if (response === undefined) {
+      const receipt = create(contract.TaskSharingActionReceiptSchema, { ...value, status: "failed", errorCode: "NOT_FOUND", joined });
+      await this.#save({ kind: "leave", original: value, receipt, joinId, stored, assertCurrent: () => auth.assertCurrent() });
+    } else if (response.applied) {
+      await this.#adoptLeave(operationId, value, stored, joined, auth);
+    }
+    auth.assertCurrent();
     return create(contract.TaskSharingActionReceiptSchema, this.#actions.get(operationId)!);
+  }
+  async #adoptLeave(operationId: string, original: contract.TaskSharingActionReceipt | undefined, stored: StoredJoin,
+    joined: contract.JoinedTaskShare, auth: TaskSharingHomeAuthority): Promise<contract.JoinedTaskShare> {
+    const next = create(contract.JoinedTaskShareSchema, { ...joined, status: "left", errorCode: "" });
+    const receipt = create(contract.TaskSharingActionReceiptSchema, { operationId, kind: "task_share_leave", status: "applied", joined: next });
+    await this.#save({ kind: "leave", original, receipt, joinId: joined.joinId, stored, assertCurrent: () => auth.assertCurrent(),
+      joined: { ...stored, value: toJsonString(contract.JoinedTaskShareSchema, next), sealed: this.options.vault.seal("{}", stored.credentialReference) } });
+    auth.assertCurrent();
+    return next;
   }
   transfer(joinId: string, transfer: contract.TaskShareAttachmentTransfer | undefined, auth: TaskSharingHomeAuthority): Promise<contract.TaskShareAttachmentResult> {
     if (!transfer || transfer.action.case === undefined || transfer.action.case === "write" && transfer.action.value.data.byteLength > contract.TASK_SHARE_ATTACHMENT_CHUNK_BYTES
@@ -313,8 +359,7 @@ export class TaskSharingHome {
     if (!stored || this.#closed) throw unavailable();
     const joined = fromJsonString(contract.JoinedTaskShareSchema, stored.value); this.#validateJoined(joined);
     if (!["active", "disconnected"].includes(joined.status)) throw new ConnectError("The shared task access has ended.", Code.PermissionDenied);
-    if (!leaving && [...this.#actions.values()].some(action => action.kind === "task_share_leave"
-      && action.joined?.joinId === joinId && ["sent", "unknown"].includes(action.status))) {
+    if (!leaving && this.#pendingLeave(joinId)) {
       throw new ConnectError("The leave result is unknown. Check its original receipt.", Code.FailedPrecondition);
     }
     const lifetime = this.#lifetimes.get(joinId)!;
@@ -346,28 +391,56 @@ export class TaskSharingHome {
       throw unavailable();
     }
   }
+  #pendingLeave(joinId: string): contract.TaskSharingActionReceipt | undefined {
+    return [...this.#actions.values()].find(action => action.kind === "task_share_leave"
+      && action.joined?.joinId === joinId && ["sent", "unknown"].includes(action.status));
+  }
   async #recover(intent: StoredIntent, auth: TaskSharingHomeAuthority): Promise<contract.TaskShareJoinIntent> {
-    const remote = this.#remote(intent.hostOrigin, intent.endpointPublicKey); auth.assertCurrent();
+    auth.assertCurrent();
+    // Older v1 Home files can have saved the accepted member alongside an
+    // unknown join whose tentative credential was already cleared.
+    const existing = this.#joined.get(intent.joinId);
+    if (existing && existing.endpointPublicKey === intent.endpointPublicKey) {
+      const joined = fromJsonString(contract.JoinedTaskShareSchema, existing.value);
+      const share = joined.share;
+      if (share?.hostServerId === intent.hostServerId && share.hostOrigin === intent.hostOrigin &&
+        share.shareId === intent.shareId && String(share.shareGeneration) === intent.shareGeneration &&
+        existing.credentialReference === this.#joinedReference(joined, existing.endpointPublicKey)) {
+        const secret = this.options.vault.open(existing.sealed, existing.credentialReference);
+        if (digest(secret) === intent.credentialSha256Hex || joined.status === "left" && secret === "{}") {
+          await this.#settleJoin(intent, "joined", "", auth);
+          auth.assertCurrent();
+          return this.#intent(intent);
+        }
+      }
+    }
+    const remote = this.#remote(intent.hostOrigin, intent.endpointPublicKey);
     await remote.verify(intent.hostServerId, auth.signal); auth.assertCurrent();
     const sealed = JSON.parse(this.options.vault.open(intent.sealed,
-      this.#intentReference(intent.operationId, intent.joinId, intent.hostServerId, intent.shareId))) as { secret: string };
+      this.#intentReference(intent.operationId, intent.joinId, intent.hostServerId, intent.shareId))) as { secret?: string };
+    if (typeof sealed.secret !== "string" || digest(sealed.secret) !== intent.credentialSha256Hex) throw unavailable();
     try {
       const result = await remote.guest.getTaskShareJoinReceipt({ intentId: intent.operationId, credentialSha256Hex: intent.credentialSha256Hex },
         { signal: auth.signal, headers: { authorization: `TaskShareGuest ${sealed.secret}` } });
-      auth.assertCurrent(); await this.#accept(intent, result.share, result.member, sealed.secret); auth.assertCurrent();
-    } catch (error) { intent.status = "unknown"; intent.errorCode = safeCode(error); await this.#save(); auth.assertCurrent(); }
+      auth.assertCurrent(); await this.#accept(intent, result.share, result.member, sealed.secret, auth);
+    } catch (error) { intent.status = "unknown"; intent.errorCode = safeCode(error); await this.#save(); }
+    auth.assertCurrent();
     return this.#intent(intent);
   }
-  async #accept(intent: StoredIntent, share: contract.TaskShare | undefined, member: contract.TaskShareMember | undefined, secret: string): Promise<void> {
+  async #accept(intent: StoredIntent, share: contract.TaskShare | undefined, member: contract.TaskShareMember | undefined, secret: string,
+    auth: TaskSharingHomeAuthority): Promise<void> {
     const pinnedShare = this.#checkInvitationShare({ hostOrigin: intent.hostOrigin, hostServerId: intent.hostServerId, shareId: intent.shareId,
       endpointPublicKey: intent.endpointPublicKey, shareGeneration: BigInt(intent.shareGeneration), inviteSecret: "" }, share);
     if (!member?.memberId || member.memberGeneration < 1n || member.status !== "active") throw unavailable();
     const joined = create(contract.JoinedTaskShareSchema, { joinId: intent.joinId, share: pinnedShare, member, status: "active", joinedAtMs: BigInt((this.options.now ?? Date.now)()) });
     const reference = this.#joinedReference(joined, intent.endpointPublicKey);
-    this.#joined.set(intent.joinId, { value: toJsonString(contract.JoinedTaskShareSchema, joined), endpointPublicKey: intent.endpointPublicKey, credentialReference: reference, sealed: this.options.vault.seal(secret, reference) });
-    this.#lifetimes.set(intent.joinId, new AbortController()); intent.status = "joined"; intent.errorCode = "";
-    intent.sealed = this.options.vault.seal("{}", this.#intentReference(intent.operationId, intent.joinId, intent.hostServerId, intent.shareId));
-    await this.#save();
+    await this.#settleJoin(intent, "joined", "", auth, { value: toJsonString(contract.JoinedTaskShareSchema, joined),
+      endpointPublicKey: intent.endpointPublicKey, credentialReference: reference, sealed: this.options.vault.seal(secret, reference) });
+  }
+  #settleJoin(intent: StoredIntent, status: "joined" | "failed", errorCode: string, auth: TaskSharingHomeAuthority, joined?: StoredJoin): Promise<void> {
+    const sealed = this.options.vault.seal("{}", this.#intentReference(intent.operationId, intent.joinId, intent.hostServerId, intent.shareId));
+    return this.#save({ kind: "join", original: intent, intent: { ...intent, status, errorCode, sealed }, assertCurrent: () => auth.assertCurrent(),
+      ...(joined ? { joined } : {}) });
   }
   #intent(intent: StoredIntent): contract.TaskShareJoinIntent {
     const stored = this.#joined.get(intent.joinId);
@@ -400,16 +473,51 @@ export class TaskSharingHome {
     const old = this.#flights.get(key); if (old) return old as Promise<T>;
     const pending = work().finally(() => { if (this.#flights.get(key) === pending) this.#flights.delete(key); }); this.#flights.set(key, pending); return pending;
   }
-  #save(): Promise<void> {
-    const snapshot: HomeDisk = { format: 1, serverId: this.options.serverId, intents: [...this.#intents.values()].map(value => ({ ...value })),
-      joined: [...this.#joined.values()].map(value => ({ ...value })), writes: [...this.#writes.values()].map(value => ({ ...value })),
-      actions: [...this.#actions.values()].map(value => toJsonString(contract.TaskSharingActionReceiptSchema, value)) };
+  #save(transition?: SettledJoin | SettledLeave): Promise<void> {
+    const adoption = transition?.kind === "join" ? transition : undefined;
+    const departure = transition?.kind === "leave" ? transition : undefined;
+    const assertCurrent = () => {
+      transition?.assertCurrent();
+      if (departure && (this.#actions.get(departure.receipt.operationId) !== departure.original ||
+        this.#joined.get(departure.joinId) !== departure.stored)) throw unavailable();
+    };
     const save = this.#saveFlight.then(async () => {
+      assertCurrent();
+      const joined = [...this.#joined.entries()].map(([joinId, value]) =>
+        departure?.joined && joinId === departure.joinId ? departure.joined : value);
+      if (adoption?.joined) joined.push(adoption.joined);
+      const actions = [...this.#actions.values()].map(value => departure && value === departure.original ? departure.receipt : value);
+      if (departure && departure.original === undefined) actions.push(departure.receipt);
+      const snapshot: HomeDisk = { format: 1, serverId: this.options.serverId,
+        intents: [...this.#intents.values()].map(value => adoption && value === adoption.original ? adoption.intent : value), joined,
+        writes: [...this.#writes.values()], actions: actions.map(value => toJsonString(contract.TaskSharingActionReceiptSchema, value)) };
+      const data = JSON.stringify(snapshot);
       const temporary = join(this.options.directory, `.home-${randomUUID()}.tmp`), destination = join(this.options.directory, "home.json");
       try {
         const file = await open(temporary, "wx", 0o600);
-        try { await file.writeFile(JSON.stringify(snapshot)); await file.sync(); } finally { await file.close(); }
+        try { await file.writeFile(data); await file.sync(); } finally { await file.close(); }
+        assertCurrent();
         await rename(temporary, destination);
+        if (adoption) {
+          Object.assign(adoption.original, adoption.intent);
+          if (adoption.joined) {
+            const lifetime = new AbortController();
+            if (this.#closed) lifetime.abort();
+            this.#joined.set(adoption.original.joinId, adoption.joined);
+            this.#lifetimes.set(adoption.original.joinId, lifetime);
+          }
+        }
+        if (departure) {
+          this.#actions.set(departure.receipt.operationId, departure.receipt);
+          if (departure.joined) {
+            this.#joined.set(departure.joinId, departure.joined);
+            this.#lifetimes.get(departure.joinId)?.abort();
+          } else if (!this.#closed && this.#joined.get(departure.joinId) === departure.stored &&
+            ["active", "disconnected"].includes(departure.receipt.joined?.status ?? "")) {
+            this.#lifetimes.get(departure.joinId)?.abort();
+            this.#lifetimes.set(departure.joinId, new AbortController());
+          }
+        }
       } finally { await unlink(temporary).catch(() => undefined); }
     });
     this.#saveFlight = save.catch(() => undefined); return save;
@@ -426,6 +534,9 @@ export function createTaskSharingHomeRemote(origin: string, endpointPublicKey: s
   } };
 }
 function digest(value: string | Uint8Array): string { return createHash("sha256").update(value).digest("hex"); }
-function safeCode(error: unknown): string { return error instanceof ConnectError ? Code[error.code].toUpperCase() : "UNAVAILABLE"; }
+function safeCode(error: unknown): string {
+  const code = error instanceof ConnectError ? Code[error.code] : undefined;
+  return code?.replace(/([a-z])([A-Z])/g, "$1_$2").toUpperCase() ?? "UNAVAILABLE";
+}
 function unavailable(): ConnectError { return new ConnectError("The shared task is temporarily unavailable. Check the original receipt before retrying.", Code.Unavailable); }
 function isMissing(error: unknown): boolean { return error instanceof Error && "code" in error && error.code === "ENOENT"; }

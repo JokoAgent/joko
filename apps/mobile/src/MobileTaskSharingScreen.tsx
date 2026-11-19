@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Alert, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import { Code, ConnectError } from "@connectrpc/connect";
@@ -15,6 +15,7 @@ export function mobileTaskSharingCopy(locale: MobileSupportedLocale) {
       preview: "Preview invitation", paste: "Paste invitation", share: "Share this task", invite: "Generate and copy invitation", members: "Participants", remove: "Remove participant",
       leave: "Leave task", end: "End sharing", endAll: "End all sharing", cancel: "Cancel", confirm: "Confirm", retry: "Refresh", back: "Back", open: "Open task",
       empty: "No shared tasks.", connect: "Connect to your Home node to manage shared tasks.", unknown: "The result is unknown. Check the original action; it was not resent.",
+      inviteRejected: "This invitation was declined. Ask the task owner for a new link.",
       check: "Check action status", copied: "Invitation copied.", generated: "The invitation was generated, but its link was not received. Explicitly generate a new invitation to replace it.",
       pending: "Pending actions", ended: "Access ended", active: "Active", failed: "Failed", reconnect: "Reconnect", creating: "Working…", choose: "Choose a task to share", joinedOk: "Joined this task.",
       warning: "Invited participants can view and control this task. You can remove them or end sharing.", backend: "Backend", thinking: "Thinking", enabled: "On", disabled: "Off" },
@@ -22,6 +23,7 @@ export function mobileTaskSharingCopy(locale: MobileSupportedLocale) {
       preview: "预览邀请", paste: "粘贴邀请", share: "共享此任务", invite: "生成并复制邀请", members: "参与者", remove: "移除参与者",
       leave: "离开任务", end: "结束共享", endAll: "结束全部共享", cancel: "取消", confirm: "确认", retry: "刷新", back: "返回", open: "打开任务",
       empty: "暂无共享任务。", connect: "连接到你的 Home 节点以管理共享任务。", unknown: "结果尚未确认。请核对原操作，系统没有重新发送。",
+      inviteRejected: "此邀请已被拒绝。请向任务所有者索取新的链接。",
       check: "核对操作状态", copied: "已复制邀请。", generated: "邀请已生成，但未收到链接。请明确重新生成邀请，替换旧邀请。",
       pending: "待确认操作", ended: "访问已结束", active: "有效", failed: "失败", reconnect: "重新连接", creating: "处理中…", choose: "选择要共享的任务", joinedOk: "已加入任务。",
       warning: "受邀参与者可以观看和控制此任务。你可以移除参与者或结束共享。", backend: "Backend", thinking: "思考", enabled: "开", disabled: "关" },
@@ -29,6 +31,7 @@ export function mobileTaskSharingCopy(locale: MobileSupportedLocale) {
       preview: "招待を確認", paste: "招待を貼り付け", share: "このタスクを共有", invite: "招待を作成してコピー", members: "参加者", remove: "参加者を削除",
       leave: "タスクから退出", end: "共有を終了", endAll: "すべての共有を終了", cancel: "キャンセル", confirm: "確認", retry: "更新", back: "戻る", open: "タスクを開く",
       empty: "共有タスクはありません。", connect: "Home ノードに接続してください。", unknown: "結果は未確認です。元の操作を確認してください。再送信はしていません。",
+      inviteRejected: "この招待は拒否されました。タスクの所有者に新しいリンクを依頼してください。",
       check: "操作結果を確認", copied: "招待をコピーしました。", generated: "招待は作成されましたが、リンクを受信できませんでした。新しい招待を明示的に作成してください。",
       pending: "未確認の操作", ended: "アクセス終了", active: "有効", failed: "失敗", reconnect: "再接続", creating: "処理中…", choose: "共有するタスクを選択", joinedOk: "タスクに参加しました。",
       warning: "参加者はこのタスクを表示・操作できます。参加者の削除や共有の終了が可能です。", backend: "Backend", thinking: "思考", enabled: "オン", disabled: "オフ" },
@@ -36,6 +39,7 @@ export function mobileTaskSharingCopy(locale: MobileSupportedLocale) {
       preview: "초대 확인", paste: "초대 붙여넣기", share: "이 작업 공유", invite: "초대 생성 및 복사", members: "참여자", remove: "참여자 제거",
       leave: "작업 나가기", end: "공유 종료", endAll: "모든 공유 종료", cancel: "취소", confirm: "확인", retry: "새로 고침", back: "뒤로", open: "작업 열기",
       empty: "공유 작업이 없습니다.", connect: "Home 노드에 연결하세요.", unknown: "결과를 확인할 수 없습니다. 원래 작업의 상태를 확인하세요. 자동으로 재전송하지 않았습니다.",
+      inviteRejected: "이 초대가 거부되었습니다. 작업 소유자에게 새 링크를 요청하세요.",
       check: "작업 상태 확인", copied: "초대를 복사했습니다.", generated: "초대가 생성되었지만 링크를 받지 못했습니다. 새 초대를 명시적으로 생성하세요.",
       pending: "확인 대기 작업", ended: "접근 종료", active: "활성", failed: "실패", reconnect: "다시 연결", creating: "처리 중…", choose: "공유할 작업 선택", joinedOk: "작업에 참여했습니다.",
       warning: "초대된 참여자는 작업을 보고 제어할 수 있습니다. 참여자를 제거하거나 공유를 종료할 수 있습니다.", backend: "Backend", thinking: "사고", enabled: "켜짐", disabled: "꺼짐" }
@@ -45,33 +49,63 @@ export function mobileTaskSharingCopy(locale: MobileSupportedLocale) {
 }
 
 type Action = { readonly operationId: string; readonly kind: "create" | "invite" | "remove" | "end" | "endAll" | "leave" | "join" };
+interface InvitationScope {
+  readonly draft: { readonly value: string };
+  readonly ownerKey: string;
+  readonly lifetime: AbortSignal;
+}
+
 export function MobileTaskSharingScreen({ client, state, colors, locale, foreground, storage, invitation: incoming,
   onInvitationConsumed, onBack, onOpenTask, initialSessionId, leaveJoinId, onLeavePromptConsumed }: {
   readonly client: MobileClient; readonly state: MobileState; readonly colors: MobileSettingsColors;
   readonly locale: MobileSupportedLocale; readonly foreground: boolean;
   readonly storage: Pick<MobilePlainStorageDriver, "getItem" | "setItem">;
-  readonly invitation?: string; readonly onInvitationConsumed: () => void; readonly onBack: () => void;
+  readonly invitation?: string; readonly onInvitationConsumed: (invitation: string) => void; readonly onBack: () => void;
   readonly onOpenTask: () => void; readonly initialSessionId?: string;
   readonly leaveJoinId?: string; readonly onLeavePromptConsumed?: () => void;
 }) {
   const t = mobileTaskSharingCopy(locale), api = client.taskSharingApi();
+  const notAdmitted = locale.startsWith("zh") ? "节点未接纳此操作，可以重新操作。" : "The node did not accept this action. You can try again.";
   const ownerKey = client.taskSharingOwnerKey();
   const [catalog, setCatalog] = useState<ListTaskSharesResponse>();
   const [tab, setTab] = useState<"owned" | "joined">(leaveJoinId ? "joined" : "owned");
-  const [invitation, setInvitation] = useState(incoming ?? ""), [displayName, setDisplayName] = useState("");
-  const [preview, setPreview] = useState<TaskShare>();
-  const [busy, setBusy] = useState(false), [error, setError] = useState(""), [notice, setNotice] = useState("");
+  const [invitation, setInvitation] = useState(() => ({ value: incoming ?? "" })), [displayName, setDisplayName] = useState("");
+  const invitationRef = useRef(invitation);
+  const previewRequest = useRef<AbortController | undefined>(undefined);
+  const [preview, setPreview] = useState<{ readonly scope: InvitationScope; readonly share: TaskShare }>();
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const [actionBusy, setActionBusy] = useState(false), [error, setError] = useState(""), [notice, setNotice] = useState("");
+  const busy = actionBusy || previewBusy;
   const [actions, setActions] = useState<readonly Action[]>([]);
   const [actionsLoaded, setActionsLoaded] = useState(false);
   const [selectedId, setSelectedId] = useState(initialSessionId);
   const controller = useRef<AbortController | undefined>(undefined), refresh = useRef<() => Promise<void>>(async () => {});
   const currentOwner = useRef(ownerKey); currentOwner.current = ownerKey;
+  const currentForeground = useRef(foreground); currentForeground.current = foreground;
   const storageKey = `joko.mobile.shared-task.actions.v1:${ownerKey ?? ""}`;
   const actionsRef = useRef(actions); actionsRef.current = actions;
-  useEffect(() => { if (incoming) { setInvitation(incoming); setPreview(undefined); onInvitationConsumed(); } }, [incoming, onInvitationConsumed]);
+  const retirePreview = useCallback(() => {
+    previewRequest.current?.abort();
+    previewRequest.current = undefined;
+    setPreview(undefined);
+    setPreviewBusy(false);
+  }, []);
+  const replaceInvitation = useCallback((value: string) => {
+    retirePreview();
+    const next = { value };
+    invitationRef.current = next;
+    setInvitation(next);
+  }, [retirePreview]);
+  useLayoutEffect(() => {
+    if (!incoming) return;
+    replaceInvitation(incoming);
+    setError("");
+    onInvitationConsumed(incoming);
+  }, [incoming, onInvitationConsumed, replaceInvitation]);
   useEffect(() => {
     const abort = new AbortController(); controller.current = abort;
-    setCatalog(undefined); setActions([]); setActionsLoaded(false); setBusy(false); setError(""); setNotice("");
+    retirePreview();
+    setCatalog(undefined); setActions([]); setActionsLoaded(false); setActionBusy(false); setError(""); setNotice("");
     if (!api || !ownerKey || !foreground) return () => abort.abort();
     let timer: ReturnType<typeof setTimeout> | undefined, flight: Promise<void> | undefined;
     const read = (): Promise<void> => flight ??= (async () => {
@@ -98,7 +132,7 @@ export function MobileTaskSharingScreen({ client, state, colors, locale, foregro
     }).catch(failure => { if (!abort.signal.aborted) setError(errorText(failure)); });
     void read();
     return () => { abort.abort(); if (timer) clearTimeout(timer); refresh.current = async () => {}; };
-  }, [ownerKey, foreground, storage, storageKey]);
+  }, [ownerKey, foreground, storage, storageKey, retirePreview]);
   const retain = async (next: readonly Action[]) => {
     await storage.setItem(storageKey, JSON.stringify(next));
     if (currentOwner.current === ownerKey && !controller.current?.signal.aborted) { actionsRef.current = next; setActions(next); }
@@ -107,7 +141,7 @@ export function MobileTaskSharingScreen({ client, state, colors, locale, foregro
     if (!api || !ownerKey || currentOwner.current !== ownerKey || busy || !actionsLoaded || !controller.current || controller.current.signal.aborted) return;
     if (actionsRef.current.length) { setError(t.unknown); return false; }
     const signal = controller.current.signal, operationId = client.newTaskSharingActionId();
-    setBusy(true); setError(""); setNotice("");
+    setActionBusy(true); setError(""); setNotice("");
     let dispatched = false;
     try {
       await retain([...actionsRef.current, { operationId, kind }].slice(-64)); signal.throwIfAborted();
@@ -123,11 +157,12 @@ export function MobileTaskSharingScreen({ client, state, colors, locale, foregro
           Code.InvalidArgument, Code.FailedPrecondition, Code.Unauthenticated, Code.PermissionDenied
         ].includes(failure.code);
         if (rejected) await retain(actionsRef.current.filter(action => action.operationId !== operationId));
-        setError(`${rejected ? "" : `${t.unknown} `}${errorText(failure)}`);
+        const reason = kind === "join" && failure instanceof ConnectError ? failure.rawMessage : errorText(failure);
+        setError(`${rejected ? "" : `${t.unknown} `}${reason}`);
       }
       return false;
     }
-    finally { if (!signal.aborted && currentOwner.current === ownerKey) setBusy(false); }
+    finally { if (!signal.aborted && currentOwner.current === ownerKey) setActionBusy(false); }
   };
   const confirm = (title: string, callback: () => void) => Alert.alert(title, t.warning, [
     { text: t.cancel, style: "cancel" }, { text: t.confirm, style: "destructive", onPress: callback }
@@ -145,7 +180,7 @@ export function MobileTaskSharingScreen({ client, state, colors, locale, foregro
     <Text style={{ color: colors.accent }}>{label}</Text></Pressable>;
   const lookup = async (action: Action) => {
     if (!api || currentOwner.current !== ownerKey || !controller.current || busy) return;
-    const signal = controller.current.signal; setBusy(true); setError("");
+    const signal = controller.current.signal; setActionBusy(true); setError("");
     let readingReceipt = true;
     try {
       if (action.kind === "join") {
@@ -154,14 +189,15 @@ export function MobileTaskSharingScreen({ client, state, colors, locale, foregro
         if (response.intent?.operationId !== action.operationId) throw new Error("The join receipt belongs to another action.");
         if (response.intent.status === "joined" || response.intent.status === "failed") {
           await retain(actionsRef.current.filter(item => item.operationId !== action.operationId));
-          setNotice(response.intent.status === "joined" ? t.joinedOk : t.failed);
+          setNotice(response.intent.status === "joined" ? t.joinedOk : t.inviteRejected);
         } else setError(t.unknown);
       } else {
         const receipt = await api.lookupAction(action.operationId, signal);
         readingReceipt = false;
         if (receipt.status === "applied" || receipt.status === "failed") {
           await retain(actionsRef.current.filter(item => item.operationId !== action.operationId));
-          setNotice(action.kind === "invite" && receipt.status === "applied" ? t.generated : receipt.status === "failed" ? t.failed : t.active);
+          if (action.kind === "leave" && receipt.status === "failed" && receipt.errorCode === "NOT_FOUND") setNotice(notAdmitted);
+          else setNotice(action.kind === "invite" && receipt.status === "applied" ? t.generated : receipt.status === "failed" ? t.failed : t.active);
         } else setError(t.unknown);
       }
       await refresh.current();
@@ -169,18 +205,69 @@ export function MobileTaskSharingScreen({ client, state, colors, locale, foregro
       if (!signal.aborted && currentOwner.current === ownerKey) {
         if (readingReceipt && failure instanceof ConnectError && failure.code === Code.NotFound) {
           await retain(actionsRef.current.filter(item => item.operationId !== action.operationId));
-          setNotice(locale.startsWith("zh") ? "节点未接纳此操作，可以重新操作。" : "The node did not accept this action. You can try again.");
+          setNotice(notAdmitted);
         } else setError(errorText(failure));
       }
     }
-    finally { if (!signal.aborted && currentOwner.current === ownerKey) setBusy(false); }
+    finally { if (!signal.aborted && currentOwner.current === ownerKey) setActionBusy(false); }
   };
   const openJoined = async (joined: JoinedTaskShare) => {
     if (currentOwner.current !== ownerKey || controller.current?.signal.aborted) return;
-    setBusy(true); setError("");
+    setActionBusy(true); setError("");
     try { await client.openJoinedTask(joined); if (currentOwner.current === ownerKey) onOpenTask(); }
     catch (failure) { setError(errorText(failure)); }
-    finally { setBusy(false); }
+    finally { setActionBusy(false); }
+  };
+  const ownsInvitation = (scope: InvitationScope): boolean => currentForeground.current && currentOwner.current === scope.ownerKey
+    && controller.current?.signal === scope.lifetime && !scope.lifetime.aborted && invitationRef.current === scope.draft;
+  const invitationScope = (): InvitationScope | undefined => {
+    const lifetime = controller.current?.signal;
+    return ownerKey && lifetime && foreground && !lifetime.aborted ? { draft: invitationRef.current, ownerKey, lifetime } : undefined;
+  };
+  const pasteInvitation = (): void => {
+    const scope = invitationScope();
+    if (!scope || busy) return;
+    void Clipboard.getStringAsync().then(value => {
+      if (!ownsInvitation(scope)) return;
+      parseTaskShareInvitation(value);
+      replaceInvitation(value);
+    }).catch(failure => { if (ownsInvitation(scope)) setError(errorText(failure)); });
+  };
+  const readInvitationPreview = (): void => {
+    const scope = invitationScope();
+    if (!api || !scope || !scope.draft.value || busy || previewRequest.current) return;
+    setPreview(undefined); setPreviewBusy(true); setError("");
+    const request = new AbortController(); previewRequest.current = request;
+    const signal = AbortSignal.any([request.signal, scope.lifetime]);
+    const current = () => !signal.aborted && previewRequest.current === request && ownsInvitation(scope);
+    void api.preview(scope.draft.value, signal).then(result => {
+      if (current() && result.share) setPreview({ scope, share: result.share });
+    }).catch(failure => { if (current()) setError(errorText(failure)); }).finally(() => {
+      if (!current()) return;
+      previewRequest.current = undefined;
+      setPreviewBusy(false);
+    });
+  };
+  const confirmedPreview = preview && ownsInvitation(preview.scope) ? preview : undefined;
+  const joinInvitation = (approved: NonNullable<typeof confirmedPreview>): void => {
+    const name = displayName.trim();
+    if (!name || previewRequest.current || !ownsInvitation(approved.scope)) return;
+    let accepted: JoinedTaskShare | undefined;
+    void run("join", async (service, operationId, signal) => {
+      const result = await service.join(operationId, approved.scope.draft.value, name, signal);
+      signal.throwIfAborted();
+      if (result.intent?.operationId !== operationId) throw new Error("The join receipt belongs to another action.");
+      if (result.intent.status === "failed") {
+        if (ownsInvitation(approved.scope)) retirePreview();
+        throw new ConnectError(t.inviteRejected, Code.PermissionDenied);
+      }
+      if (result.intent.status !== "joined" || !result.intent.joined) throw new Error(t.unknown);
+      accepted = result.intent.joined;
+    }).then(confirmed => {
+      if (!confirmed || !accepted || !ownsInvitation(approved.scope)) return;
+      replaceInvitation(""); setTab("joined");
+      void openJoined(accepted);
+    });
   };
   const inputStyle = { color: colors.ink, borderColor: colors.border, borderWidth: 1, borderRadius: 8, padding: 12 };
   return <ScrollView contentContainerStyle={{ padding: 16, gap: 12, backgroundColor: colors.background }} keyboardShouldPersistTaps="handled">
@@ -234,22 +321,14 @@ export function MobileTaskSharingScreen({ client, state, colors, locale, foregro
       </>}
       {catalog && !(tab === "owned" ? catalog.owned : catalog.joined).length && <Text style={{ color: colors.muted }}>{t.empty}</Text>}
       <Text accessibilityRole="header" style={{ color: colors.ink, fontSize: 20 }}>{t.join}</Text>
-      <TextInput accessibilityLabel={t.invitation} value={invitation} onChangeText={value => { setInvitation(value); setPreview(undefined); }}
+      <TextInput accessibilityLabel={t.invitation} value={invitation.value} onChangeText={replaceInvitation}
         maxLength={8192} autoCapitalize="none" autoCorrect={false} style={inputStyle} editable={!busy} />
-      {button(t.paste, () => void Clipboard.getStringAsync().then(value => { parseTaskShareInvitation(value); setInvitation(value); setPreview(undefined); }).catch(failure => setError(errorText(failure))))}
+      {button(t.paste, pasteInvitation)}
       <TextInput accessibilityLabel={t.name} placeholder={t.name} value={displayName} onChangeText={setDisplayName} maxLength={120} style={inputStyle} editable={!busy} />
-      {button(t.preview, () => { if (!api || !controller.current) return; setBusy(true); setError("");
-        void api.preview(invitation, controller.current.signal).then(result => setPreview(result.share)).catch(failure => setError(errorText(failure))).finally(() => setBusy(false));
-      }, busy || !invitation)}
-      {preview && <><Text style={{ color: colors.ink }}>{preview.title || preview.sessionId} · {preview.hostOrigin}</Text><Text style={{ color: colors.muted }}>{t.warning}</Text>
-        {button(t.join, () => { let accepted: JoinedTaskShare | undefined;
-          void run("join", async (service, operationId, signal) => {
-          const result = await service.join(operationId, invitation, displayName.trim(), signal);
-          if (result.intent?.operationId !== operationId) throw new Error("The join receipt belongs to another action.");
-          if (result.intent.status !== "joined" || !result.intent.joined) throw new Error(t.unknown);
-          accepted = result.intent.joined; setInvitation(""); setPreview(undefined); setTab("joined");
-        }).then(confirmed => { if (confirmed && accepted) void openJoined(accepted); });
-        }, busy || !displayName.trim())}</>}
+      {button(t.preview, readInvitationPreview, busy || !invitation.value)}
+      {confirmedPreview && <><Text style={{ color: colors.ink }}>{confirmedPreview.share.title || confirmedPreview.share.sessionId} · {confirmedPreview.share.hostOrigin}</Text>
+        <Text style={{ color: colors.muted }}>{t.warning}</Text>
+        {button(t.join, () => joinInvitation(confirmedPreview), busy || !displayName.trim())}</>}
       {!!actions.length && <Text style={{ color: colors.ink }}>{t.pending}</Text>}
       {actions.map(action => <View key={action.operationId}><Text selectable style={{ color: colors.muted }}>{action.operationId}</Text>{button(t.check, () => void lookup(action))}</View>)}
     </>}

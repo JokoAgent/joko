@@ -65,7 +65,7 @@ export function TaskSharingSettings({ controller, t, sessionId, initialInvitatio
     }
     catch (cause) {
       if (!signal.aborted) {
-        setError(cause instanceof Error ? cause.message : t("taskSharing.unavailable"));
+        setError(kind === "join" && cause instanceof ConnectError ? cause.rawMessage : cause instanceof Error ? cause.message : t("taskSharing.unavailable"));
         const definite = cause instanceof ConnectError && [Code.InvalidArgument, Code.PermissionDenied, Code.NotFound, Code.FailedPrecondition].includes(cause.code);
         if (kind !== "preview" && !recorded) {
           if (admitted && !definite) setUnknown({ operationId: id, kind });
@@ -112,11 +112,14 @@ export function TaskSharingSettings({ controller, t, sessionId, initialInvitatio
         if (pending.kind === "join") {
           const result = await api.lookupJoin(pending.operationId, signal);
           signal.throwIfAborted();
-          if (!result.intent?.joined && result.intent?.status !== "failed") throw new Error(t("taskSharing.unknown"));
+          if (result.intent?.operationId !== pending.operationId) throw new Error(t("taskSharing.unknown"));
+          if (result.intent.status === "failed") setNotice(t("taskSharing.inviteRejected"));
+          else if (result.intent.status !== "joined" || !result.intent.joined) throw new Error(t("taskSharing.unknown"));
         } else {
           const result = await api.lookupAction(pending.operationId, signal);
           signal.throwIfAborted();
           if (result.status !== "applied" && result.status !== "failed") throw new Error(t("taskSharing.unknown"));
+          if (result.kind === "task_share_leave" && result.status === "failed" && result.errorCode === "NOT_FOUND") setNotice(t("taskSharing.notAdmitted"));
           if (result.kind === "task_share_invite" && result.status === "applied") setNotice(t("taskSharing.invitationLost"));
           if (result.failedShareIds.length > 0) setNotice(t("taskSharing.partial", { count: result.failedShareIds.length }));
         }
@@ -168,7 +171,13 @@ export function TaskSharingSettings({ controller, t, sessionId, initialInvitatio
         <Button data-task-sharing-preview type="submit" disabled={busy || !!unknown || !invitation.trim()}>{t("taskSharing.preview")}</Button>
         {preview && <article className="settings-card settings-card--content"><h3>{preview.title || preview.sessionId}</h3><p>{preview.hostOrigin}</p><div className="settings-actions"><Button data-task-sharing-join tone="primary" disabled={busy || !!unknown || !name.trim()} onClick={() => { void run("join", async (id, signal) => {
           const result = await api.join(id, invitation, name.trim(), signal);
-          if (!result.intent?.joined) throw new ConnectError(t("taskSharing.unknown"), Code.Unknown);
+          signal.throwIfAborted();
+          if (result.intent?.operationId !== id) throw new ConnectError(t("taskSharing.unknown"), Code.Unknown);
+          if (result.intent.status === "failed") {
+            setPreview(undefined);
+            throw new ConnectError(t("taskSharing.inviteRejected"), Code.PermissionDenied);
+          }
+          if (result.intent.status !== "joined" || !result.intent.joined) throw new ConnectError(t("taskSharing.unknown"), Code.Unknown);
           setInvitation(""); setPreview(undefined); clearTaskSharingInvitation(invitation); open(result.intent.joined);
         }); }}>{t("taskSharing.confirmJoin")}</Button><Button disabled={busy} onClick={() => setPreview(undefined)}>{t("common.cancel")}</Button></div></article>}
       </form>}
