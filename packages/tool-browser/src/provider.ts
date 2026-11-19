@@ -301,6 +301,21 @@ export interface BrowserDialogSnapshot {
   readonly defaultValue: string;
 }
 
+export interface BrowserClickReceipt {
+  readonly page: BrowserPageState;
+  readonly dialog?: BrowserDialogSnapshot;
+}
+
+interface PendingBrowserClickDialog {
+  readonly page: Page;
+  readonly before: BrowserPageState;
+  readonly id: string;
+  readonly completion: Promise<void>;
+  readonly release: () => void;
+  readonly retire: () => void;
+  responding: boolean;
+}
+
 export type BrowserExtractField = string | {
   readonly selector?: string;
   readonly attr?: string;
@@ -510,6 +525,8 @@ export class BrowserProvider {
   #nextConsoleMessageSequence = 1;
   #nextHttpRequestSequence = 1;
   #nextDialogId = 1;
+  #watchClickDialog?: (page: Page, id: string, dialog: Dialog) => void;
+  #pendingClickDialog?: PendingBrowserClickDialog;
   #lifecycleTail: Promise<void> = Promise.resolve();
   #lifecycleEpoch = 0;
   #recoveryInFlight: Promise<void> | undefined;
@@ -849,6 +866,9 @@ export class BrowserProvider {
       const originalPage = this.requireRequestedTakeoverPage(requested);
       if (this.#leases.current() !== undefined) {
         throw new BrowserTakeoverConflictError("Browser Provider has an active agent control lease.");
+      }
+      if (this.#pendingClickDialog !== undefined) {
+        throw new BrowserTakeoverConflictError("Resolve the outstanding Browser confirmation before taking control.");
       }
       if (this.#takeovers.current() !== undefined) {
         throw new BrowserTakeoverConflictError("Browser Provider already has an active human takeover.");
@@ -1674,11 +1694,7 @@ export class BrowserProvider {
         await page.goto(safeAction.url, { waitUntil: "domcontentloaded" });
         break;
       case "click":
-        await page.locator(safeAction.selector).click({
-          button: safeAction.button,
-          ...(safeAction.doubleClick === true ? { clickCount: 2 } : {}),
-          ...(safeAction.modifiers === undefined ? {} : { modifiers: [...safeAction.modifiers] })
-        });
+        await clickBrowserLocator(page, safeAction);
         break;
       case "doubleClick":
         await page.locator(safeAction.selector).dblclick();
@@ -1763,19 +1779,74 @@ export class BrowserProvider {
     });
   }
 
+  /** Yield the agent request while its native click is blocked by a page dialog. */
+  clickWithDialog(
+    pageId: string,
+    lease: BrowserLeaseFence,
+    action: Extract<BrowserAction, { type: "click" }>,
+    signal?: AbortSignal
+  ): Promise<BrowserClickReceipt> {
+    const fence = copyAgentFence(lease), safePageId = validatePublicPageId(pageId);
+    const safeAction = validateAndCopyBrowserAction(action);
+    if (safeAction.type !== "click") throw new TypeError("A Browser click action is required.");
+    return this.withAgentControl(fence, async () => {
+      const page = this.requirePageNow(safePageId);
+      assertBrowserPageContentReadable(page);
+      if (this.#dialogs.get(page)?.size) throw new Error("Resolve the pending Browser dialog before clicking.");
+      const before = await this.pageState(page);
+      const generationSignal = this.#generationAbort.signal;
+      generationSignal.throwIfAborted();
+      signal?.throwIfAborted();
+      const deadline = Date.now() + MAXIMUM_WAIT_MILLISECONDS;
+      let watch!: (page: Page, id: string, dialog: Dialog) => void;
+      const observed = new Promise<{ readonly id: string; readonly dialog: Dialog }>((resolve) => {
+        watch = (source, id, dialog) => { if (source === page) resolve({ id, dialog }); };
+      });
+      this.#watchClickDialog = watch;
+      const completion = clickBrowserLocator(page, safeAction).then(async () => {
+        if (!generationSignal.aborted) await this.emit({ at: Date.now(), type: "action", pageId: safePageId, detail: "click" });
+      });
+      let pending: { readonly id: string; readonly dialog: Dialog } | undefined;
+      try { pending = await Promise.race([observed, completion.then(() => undefined)]); }
+      finally { if (this.#watchClickDialog === watch) this.#watchClickDialog = undefined; }
+      if (pending === undefined) return { page: await this.pageState(page) };
+      const { id, dialog } = pending;
+      let timer: ReturnType<typeof setTimeout>;
+      const release = () => {
+        clearTimeout(timer);
+        generationSignal.removeEventListener("abort", retire);
+        signal?.removeEventListener("abort", retire);
+        if (this.#pendingClickDialog === blocker) this.#pendingClickDialog = undefined;
+      };
+      const retire = () => {
+        if (blocker.responding || this.#pendingClickDialog !== blocker) return;
+        blocker.responding = true;
+        this.#dialogs.get(page)?.delete(id);
+        void dialog.dismiss().catch(() => undefined).then(() => completion.catch(() => undefined)).finally(release);
+      };
+      const blocker: PendingBrowserClickDialog = { page, before, id, completion, release, retire, responding: false };
+      this.#pendingClickDialog = blocker;
+      timer = setTimeout(retire, Math.max(0, deadline - Date.now()));
+      timer.unref();
+      generationSignal.addEventListener("abort", retire, { once: true });
+      signal?.addEventListener("abort", retire, { once: true });
+      void completion.catch(retire);
+      if (generationSignal.aborted || signal?.aborted) {
+        retire();
+        generationSignal.throwIfAborted();
+        signal?.throwIfAborted();
+      }
+      return { page: before, dialog: browserDialogSnapshot(safePageId, id, dialog) };
+    });
+  }
+
   listDialogs(pageId: string, lease: BrowserLeaseFence): Promise<readonly BrowserDialogSnapshot[]> {
     const fence = copyAgentFence(lease);
     const safePageId = validatePublicPageId(pageId);
     return this.withAgentControl(fence, async () => {
       const page = this.requirePageNow(safePageId);
-      return [...(this.#dialogs.get(page)?.entries() ?? [])].map(([id, dialog]) => ({
-        id,
-        pageId: safePageId,
-        type: sanitizeDiagnosticLabel(dialog.type(), "dialog"),
-        message: sanitizeConsoleMessageText(dialog.message()),
-        defaultValue: sanitizeConsoleMessageText(dialog.defaultValue())
-      }));
-    });
+      return [...(this.#dialogs.get(page)?.entries() ?? [])].map(([id, dialog]) => browserDialogSnapshot(safePageId, id, dialog));
+    }, true);
   }
 
   handleDialog(
@@ -1797,10 +1868,29 @@ export class BrowserProvider {
         : validateBoundedString(input.dialogId, "Browser dialog ID", 256);
       const dialog = id === undefined ? undefined : dialogs?.get(id);
       if (dialog === undefined || id === undefined) throw new Error("Browser dialog does not exist or is no longer pending.");
-      if (input.accept) await dialog.accept(promptText);
-      else await dialog.dismiss();
+      const blocked = this.#pendingClickDialog;
+      if (blocked !== undefined) {
+        if (blocked.page !== page || blocked.id !== id || blocked.responding || input.dialogId !== id) {
+          throw new Error("Respond to the exact pending Browser dialog ID.");
+        }
+        blocked.responding = true;
+      }
+      try {
+        if (input.accept) await dialog.accept(promptText);
+        else await dialog.dismiss();
+      } catch (error) {
+        if (blocked !== undefined) {
+          blocked.responding = false;
+          blocked.retire();
+        }
+        throw error;
+      }
       dialogs?.delete(id);
-    });
+      if (blocked !== undefined) {
+        try { await blocked.completion; }
+        finally { blocked.release(); }
+      }
+    }, true);
   }
 
   /** Captures image bytes only; no page metadata or local path is returned. */
@@ -2224,6 +2314,7 @@ export class BrowserProvider {
     page.on("dialog", (dialog) => {
       const id = `dialog-${this.#nextDialogId++}`;
       this.#dialogs.get(page)?.set(id, dialog);
+      this.#watchClickDialog?.(page, id, dialog);
     });
     page.on("popup", (popup) => void this.adoptHumanPopup(page, popup).catch(() => undefined));
     page.on("download", (download) => void this.handleDownload(pageId, generation, download).catch(() => undefined));
@@ -2367,12 +2458,15 @@ export class BrowserProvider {
     return this.requirePageNow(request.pageId);
   }
 
-  private withAgentControl<T>(fence: BrowserLeaseFence, operation: () => Promise<T>): Promise<T> {
+  private withAgentControl<T>(fence: BrowserLeaseFence, operation: () => Promise<T>, resolvesDialogs = false): Promise<T> {
     return this.queueLifecycle(async () => {
       if (fence.providerId !== this.id || fence.generation !== this.#generation || this.#takeovers.current() !== undefined) {
         throw new BrowserLeaseConflictError("Browser agent lease is missing, expired, or fenced.");
       }
       this.#leases.assert(fence);
+      if (!resolvesDialogs && this.#pendingClickDialog !== undefined) {
+        throw new Error("A Browser confirmation is pending. Use the dialog action first.");
+      }
       const result = await raceAgainstAbort(operation(), this.#generationAbort.signal);
       this.#leases.assert(fence);
       if (this.#takeovers.current() !== undefined) {
@@ -2404,6 +2498,7 @@ export class BrowserProvider {
   }
 
   private async pageState(page: Page): Promise<BrowserPageState> {
+    if (this.#pendingClickDialog?.page === page && !page.isClosed()) return this.#pendingClickDialog.before;
     const navigation = await browserNavigationAvailability(page);
     const documentId = this.documentIdForPage(page);
     const currentUrl = page.url();
@@ -2783,6 +2878,24 @@ function assertBrowserPageContentReadable(page: Page): void {
   if (!browserPageContentIsReadable(page.url())) {
     throw new Error("Browser page content is available only for HTTP(S) pages or a blank page.");
   }
+}
+
+function clickBrowserLocator(page: Page, action: Extract<BrowserAction, { type: "click" }>): Promise<void> {
+  return page.locator(action.selector).click({
+    button: action.button,
+    ...(action.doubleClick === true ? { clickCount: 2 } : {}),
+    ...(action.modifiers === undefined ? {} : { modifiers: [...action.modifiers] })
+  });
+}
+
+function browserDialogSnapshot(pageId: string, id: string, dialog: Dialog): BrowserDialogSnapshot {
+  return {
+    id,
+    pageId,
+    type: sanitizeDiagnosticLabel(dialog.type(), "dialog"),
+    message: sanitizeConsoleMessageText(dialog.message()),
+    defaultValue: sanitizeConsoleMessageText(dialog.defaultValue())
+  };
 }
 
 function browserPageContentIsReadable(value: string): boolean {

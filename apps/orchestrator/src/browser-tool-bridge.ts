@@ -194,7 +194,7 @@ const unifiedSchema = objectSchema({
   inputRef: { type: "string", minLength: 1, maxLength: 256 },
   query: elementQuerySchema,
   timeoutMs: { type: "integer", minimum: 1, maximum: MAXIMUM_WAIT_MILLISECONDS },
-  dialogId: { type: "string", minLength: 1, maxLength: 256 },
+  dialogId: { type: "string", minLength: 1, maxLength: 256, description: "For a page-dialog barrier returned by act, pass that barrier's exact dialogId with accept." },
   accept: { type: "boolean" },
   promptText: { type: "string", maxLength: MAXIMUM_ACTION_TEXT_LENGTH },
   filter: { type: "string", maxLength: 4_096 },
@@ -1027,8 +1027,9 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       }
       case "dialog": {
         const pageId = this.#unifiedPageId(input);
+        const responds = input["accept"] !== undefined;
         return this.#withLease(async (lease) => {
-          if (input["accept"] === undefined) {
+          if (!responds) {
             return this.#result(action, { dialogs: await this.#browser.listDialogs(pageId, lease) });
           }
           await this.#browser.handleDialog(pageId, lease, {
@@ -1037,7 +1038,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
             promptText: optionalString(input, "promptText", MAXIMUM_ACTION_TEXT_LENGTH)
           });
           return this.#result(action, { handled: true });
-        });
+        }, () => responds || this.#browser.targetMode !== "sidebar");
       }
       case "act":
         return this.#executeUnifiedAct(input, signal);
@@ -1104,14 +1105,23 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       case "click": {
         const selector = this.#browser.resolveElementSelector(pageId, target);
         const modifiers = optionalModifiers(request, "modifiers");
-        return this.#unifiedActResult("act", { targetId: pageId }, {
-          type: "click",
+        const click = {
+          type: "click" as const,
           selector,
           ...(request["button"] === undefined ? {} : {
             button: requiredEnum(request, "button", ["left", "middle", "right"] as const)
           }),
           ...(request["doubleClick"] === undefined ? {} : { doubleClick: requiredBoolean(request, "doubleClick") }),
           ...(modifiers === undefined ? {} : { modifiers })
+        };
+        if (this.#browser.targetMode !== "sidebar") return this.#unifiedActResult("act", { targetId: pageId }, click);
+        const receipt = await this.#withLease((lease) => this.#browser.clickWithDialog(pageId, lease, click, signal),
+          (result) => result.dialog === undefined);
+        return this.#result("act", {
+          page: publicPage(receipt.page),
+          ...(receipt.dialog === undefined ? {} : { barrier: {
+            kind: "page-dialog", dialogId: receipt.dialog.id, dialog: receipt.dialog
+          } })
         });
       }
       case "clickCoords":
@@ -1560,6 +1570,8 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       const epoch = this.#syncResultEpoch(), state = this.#recipeTask();
       if (action === "recipe") { state.recorder.clear(); return result; }
       const payload = result.structuredContent, data = isRecord(payload?.["data"]) ? payload["data"] : undefined;
+      const barrier = data?.["barrier"];
+      if (isRecord(barrier) && barrier["kind"] === "page-dialog") return result;
       const page = isRecord(data?.["page"]) ? data["page"] : isRecord(data?.["tab"]) ? data["tab"] : undefined;
       const pageId = typeof page?.["id"] === "string" ? page["id"] : typeof args["targetId"] === "string" ? args["targetId"]
         : typeof request?.["targetId"] === "string" ? request["targetId"] : this.#activePageIds.size === 1 ? [...this.#activePageIds][0] : undefined;
@@ -1910,7 +1922,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       if (isSecretPage(page.url)) throw new Error("The owner entered private text on this page. Script evaluation, network and console reads are paused until this tab leaves the page. Use snapshot or screenshot, or navigate on.");
   }
 
-  async #withLease<T>(callback: (lease: BrowserLease) => Promise<T>): Promise<T> {
+  async #withLease<T>(callback: (lease: BrowserLease) => Promise<T>, shouldRefresh: (result: T) => boolean = () => true): Promise<T> {
     this.#assertSessionContext();
     for (const pageId of this.#activePageIds) this.#assertPageContext(pageId);
     const leaseOwner = this.#activeContext === undefined
@@ -1919,7 +1931,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     const lease = this.#browser.acquireAgentLease(leaseOwner, 60_000);
     try {
       const result = await callback(lease);
-      await this.#refreshActivePageDescriptors();
+      if (shouldRefresh(result)) await this.#refreshActivePageDescriptors();
       this.#assertSessionContext();
       for (const pageId of this.#activePageIds) this.#assertPageContext(pageId);
       return result;
