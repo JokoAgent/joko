@@ -45,7 +45,7 @@ import { workspaceMediaTypeForPath as mediaTypeForPath } from "./workspace-file-
 import { listProjectDirectories } from "./project-directory-browser.js";
 import type { ExtensionProjectPolicies, ExtensionProject } from "./extension-project-policy.js";
 import { inspectRemoteHostDirectory, validateRemoteHostDirectoryPath } from "./remote-host-directory-browser.js";
-import { equals, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { create as createProtoMessage, equals, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError, type ConnectRouter, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
 import { issueAuthorizedIrohRelayInvitation } from "./linkspan-iroh-lease.js";
 import {
@@ -18355,8 +18355,8 @@ async function dispatchMutation(
         : strictDerivationIdentity(payload.value.partnerStarterEventId, "send_input.partner_starter_event_id");
       if (starterEventId !== undefined && (disposition !== "prompt" || payload.value.messageEdit !== undefined
         || payload.value.providerGroupRebalance !== undefined || payload.value.overrides !== undefined
-        || payload.value.input === undefined || !equals(contract.InputContentSchema, payload.value.input, create(contract.InputContentSchema, {
-          parts: [create(contract.InputPartSchema, { content: { case: "text", value: prompt.text } })]
+        || payload.value.input === undefined || !equals(contract.InputContentSchema, payload.value.input, createProtoMessage(contract.InputContentSchema, {
+          parts: [{ content: { case: "text", value: prompt.text } }]
         })))) {
         throw invalidArgument("Select one exact plain-text option from the original Partner opening.");
       }
