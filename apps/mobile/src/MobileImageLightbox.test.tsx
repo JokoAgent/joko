@@ -12,13 +12,19 @@ const native = vi.hoisted(() => ({ state: "active", listeners: new Set<(state: s
   gestures: undefined as PanResponderCallbacks | undefined, offset: 0, spring: vi.fn(), burn: vi.fn(), raster: vi.fn(), valueIndex: 0, pageOffset: 0,
   autoAnimate: true, timing: vi.fn(), finishAnimation: undefined as ((result: { finished: boolean }) => void) | undefined }));
 vi.mock("react-native", () => {
-  const box = ({ children, testID, pointerEvents, accessibilityElementsHidden, importantForAccessibility }: {
-    children?: ReactNode; testID?: string; pointerEvents?: string; accessibilityElementsHidden?: boolean; importantForAccessibility?: string;
+  function geometry(style: unknown) {
+    const { left, top, transform } = Object.assign({}, ...(Array.isArray(style) ? style : [style])) as {
+      left?: number; top?: number; transform?: { scale?: number }[];
+    };
+    return { "data-left": left, "data-top": top, "data-scale": transform?.find((entry) => entry.scale !== undefined)?.scale };
+  }
+  const box = ({ children, testID, pointerEvents, accessibilityElementsHidden, importantForAccessibility, style }: {
+    children?: ReactNode; testID?: string; pointerEvents?: string; accessibilityElementsHidden?: boolean; importantForAccessibility?: string; style?: unknown;
   }) => createElement("div", { "data-testid": testID, "data-pointer-events": pointerEvents,
-    "aria-hidden": accessibilityElementsHidden, "data-accessibility": importantForAccessibility }, children);
-  return { View: ({ children, accessibilityRole, onLayout }: { children?: ReactNode; accessibilityRole?: string; onLayout?: (event: unknown) => void }) => {
+    "aria-hidden": accessibilityElementsHidden, "data-accessibility": importantForAccessibility, ...geometry(style) }, children);
+  return { View: ({ children, accessibilityRole, onLayout, style }: { children?: ReactNode; accessibilityRole?: string; onLayout?: (event: unknown) => void; style?: unknown }) => {
     if (accessibilityRole === "image") native.layout = onLayout;
-    return createElement("div", {}, children);
+    return createElement("div", geometry(style), children);
   }, Text: ({ children }: { children?: ReactNode }) => createElement("span", {}, children),
     Modal: ({ children, visible }: { children?: ReactNode; visible: boolean }) => visible ? createElement("div", { role: "dialog" }, children) : null,
     ActivityIndicator: box, StatusBar: box, Platform: { OS: "android" },
@@ -211,9 +217,10 @@ describe("lightbox dismissal and gesture ownership", () => {
     expect(close).not.toHaveBeenCalled(); expect(output).not.toHaveBeenCalled();
   });
 
-  it("delays single-tap dismissal for double-tap zoom and never closes after zoomed, long or returning drag gestures", async () => {
+  it("toggles the timeline gallery controls on a single tap and reserves double tap for zoom", async () => {
     vi.useFakeTimers();
-    const page = session("image/png", false); await render(page);
+    const page = session("image/png", false); await render(page); await load(page);
+    const chrome = () => host.querySelector('[data-testid="image-lightbox-chrome"]')!;
     await tap(); await act(async () => vi.advanceTimersByTime(279)); expect(close).not.toHaveBeenCalled();
     await tap(); await act(async () => vi.advanceTimersByTime(300)); expect(close).not.toHaveBeenCalled();
     expect(host.textContent).toContain("2.5");
@@ -230,8 +237,16 @@ describe("lightbox dismissal and gesture ownership", () => {
     await act(async () => vi.advanceTimersByTime(501));
     await act(async () => native.gestures!.onPanResponderRelease!(touch(), motion()));
     await act(async () => vi.advanceTimersByTime(300)); expect(close).not.toHaveBeenCalled();
-    await tap(); await act(async () => vi.advanceTimersByTime(280)); expect(close).toHaveBeenCalledOnce();
-    expect(decoded).not.toHaveBeenCalled(); expect(output).not.toHaveBeenCalled();
+    await tap(); await act(async () => vi.advanceTimersByTime(280));
+    expect(chrome().getAttribute("aria-hidden")).toBe("true");
+    expect(chrome().getAttribute("data-pointer-events")).toBe("none");
+    expect(close).not.toHaveBeenCalled();
+    await tap(); await act(async () => vi.advanceTimersByTime(280));
+    expect(chrome().getAttribute("aria-hidden")).toBe("false");
+    expect(chrome().getAttribute("data-pointer-events")).toBe("box-none");
+    expect(close).not.toHaveBeenCalled();
+    await act(async () => button("image.close")!.click());
+    expect(close).toHaveBeenCalledOnce(); expect(decoded).toHaveBeenCalledOnce(); expect(output).not.toHaveBeenCalled();
   });
 
   it("moves and springs a short vertical drag, closes at the distance or converted speed threshold, and preserves horizontal navigation", async () => {
@@ -278,11 +293,11 @@ describe("lightbox dismissal and gesture ownership", () => {
   });
 
   it("keeps the active lease closeable when a parent replaces its callback and clears timers at unmount", async () => {
-    vi.useFakeTimers(); const page = session("image/png", false); await render(page); await tap();
+    vi.useFakeTimers(); const page = { ...session("image/png", false), sourceKind: "workspace" as const }; await render(page); await tap();
     const nextClose = vi.fn();
     await act(async () => root.render(createElement(MobileImageLightbox, { session: page, locale: "en", onClose: nextClose, onSave: save, gallery: controls(page) })));
     await act(async () => vi.advanceTimersByTime(280)); expect(nextClose).toHaveBeenCalledOnce(); expect(close).not.toHaveBeenCalled();
-    await render(session("image/png", false, "unmount-page")); await tap();
+    await render({ ...session("image/png", false, "unmount-page"), sourceKind: "workspace" }); await tap();
     await act(async () => root.render(null)); await act(async () => vi.advanceTimersByTime(300)); expect(close).not.toHaveBeenCalled();
   });
 });
@@ -347,19 +362,34 @@ describe("native image gallery formats and ownership", () => {
     expect(native.burn).toHaveBeenCalledOnce();
     expect(save).toHaveBeenCalledOnce();
   });
-  it("opens a pending page with an independent preview and keeps that layer through original fetch and native decode", async () => {
-    const page = session("image/png", false); const preview = { leaseId: "cached-preview", uri: "data:image/png;base64,cached", width: 1, height: 1, mediaType: "image/png", animated: false };
+  it("keeps zoom and pan from the warm preview through original fetch and native decode", async () => {
+    const page = session("image/png", false); const preview = { leaseId: "cached-preview", uri: "data:image/png;base64,cached", width: 150, height: 150, mediaType: "image/png", animated: false };
     const pending = { ...controls(page), preview, busy: true };
     await act(async () => root.render(createElement(MobileImageLightbox, { locale: "en", onClose: close, onSave: save, onOutputAction: output, gallery: pending })));
     await act(async () => native.layout?.({ nativeEvent: { layout: { width: 400, height: 300 } } }));
     expect(host.querySelector('[data-image="' + preview.uri + '"]')).not.toBeNull();
     expect(button("image.next")!.disabled).toBe(false); expect(button("image.copy")!.disabled).toBe(true); expect(button("image.share")!.disabled).toBe(true);
+    await act(async () => {
+      native.gestures!.onPanResponderGrant!(touch([{ x: 150, y: 150 }, { x: 250, y: 150 }]), motion());
+      native.gestures!.onPanResponderMove!(touch([{ x: 120, y: 185 }, { x: 320, y: 185 }]), motion());
+      native.gestures!.onPanResponderRelease!(touch([]), motion());
+    });
+    const imagePosition = (uri: string) => {
+      const layer = host.querySelector(`[data-image="${uri}"]`)!.parentElement!;
+      return [layer.dataset.scale, layer.parentElement!.dataset.left, layer.parentElement!.dataset.top];
+    };
+    const zoomed = imagePosition(preview.uri);
+    expect(zoomed).toEqual(["2", "70", "35"]);
     await act(async () => root.render(createElement(MobileImageLightbox, { session: page, locale: "en", onClose: close, onSave: save, onOutputAction: output, gallery: { ...pending, busy: false } })));
     expect(host.querySelector('[data-image="' + preview.uri + '"]')).not.toBeNull(); expect(native.images.get(page.previewUri)).toBeDefined();
     expect(button("image.share")!.disabled).toBe(true); expect(button("image.addOriginal")!.disabled).toBe(true);
     await load(page);
     expect(host.querySelector('[data-image="' + preview.uri + '"]')).toBeNull(); expect(button("image.share")!.disabled).toBe(false);
     expect(button("image.addOriginal")!.disabled).toBe(false); expect(decoded).toHaveBeenCalledOnce();
+    expect(imagePosition(page.previewUri)).toEqual(zoomed);
+    const next = { ...session("image/png", false, "new-image"), pageIndex: 1 };
+    await render(next); await load(next);
+    expect(imagePosition(next.previewUri)).toEqual(["1", "50", "0"]);
   });
 
   it("keeps failed current pages navigable, retries in place and fences old decode and cache-layer errors", async () => {
