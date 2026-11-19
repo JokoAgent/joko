@@ -155,7 +155,7 @@ export function parseMenubarSnapshot(value: unknown): DesktopMenubarSnapshot {
   };
   const view = value["view"];
   if (!record(view) || !keys(view, ["locale", "moneySymbol", "strings", "statusTextByMode", "updatedAtMs", "headlinePrimary",
-    "headlineSecondary", "headlineAlert", "sources", "details", "taskSummary", "tasks", "usage", "manage", "settings"], ["gate"]) ||
+    "headlineSecondary", "headlineAlert", "sources", "details", "taskSummary", "tasks", "usage", "manage", "settings"], ["gate", "activities", "attentionCount"]) ||
     !bounded(view, 0) || JSON.stringify(view).length > 512_000 ||
     (view["locale"] !== "en" && view["locale"] !== "zh-CN" && view["locale"] !== "en-XA") || !display(view["moneySymbol"], 32) ||
     (view["gate"] !== undefined && view["gate"] !== "connection") ||
@@ -175,6 +175,12 @@ export function parseMenubarSnapshot(value: unknown): DesktopMenubarSnapshot {
       throw new TypeError("Invalid menu bar task.");
     }
     taskIds.add(task["sessionId"]);
+  }
+  const activities = view["activities"], attentionCount = view["attentionCount"];
+  if (activities !== undefined || attentionCount !== undefined) {
+    if (!Array.isArray(activities) || !menuArray(menuTaskActivity)(activities) || typeof attentionCount !== "number"
+      || !Number.isSafeInteger(attentionCount) || attentionCount < activities.filter(activity => activity.attention).length
+      || new Set(activities.map(activity => activity.sessionId)).size !== activities.length) throw new TypeError("Invalid menu bar task activity.");
   }
   for (const [id, detail] of Object.entries(view["details"])) {
     if (!identity(id, 1024) || !record(detail) || detail["id"] !== id || !record(detail["action"])) throw new TypeError("Invalid menu bar detail.");
@@ -238,6 +244,8 @@ const menuDetail = menuObject({ id: menuString, logoSvg: menuString, title: menu
   facts: menuArray(menuObject({ label: menuString, value: menuString, sub: menuString })), actionLabel: menuString, action: menuAction });
 const menuTask = menuObject({ sessionId: menuString, title: menuString, harness: menuHarness, logoSvg: menuString,
   value: menuNumber, tokens: menuNumber, running: menuBoolean, startedAtMs: menuNullable(timestamp), idleStatus: menuString, meta: menuString });
+const menuTaskActivity = menuObject({ sessionId: value => identity(value, 1024), title: value => display(value, 160),
+  phase, status: value => display(value, 160), preview: value => display(value, 240), attention: menuBoolean, updatedAtMs: timestamp });
 const menuModel = menuObject({ name: menuString, harness: menuHarness, money: menuNumber, tokens: menuNumber });
 const menuTriple: MenuField = value => Array.isArray(value) && value.length === 3 && value.every(menuNumber);
 const menuUsageScope = menuObject({ daily: menuArray(menuObject({ money: menuTriple, paid: menuNumber, tokens: menuTriple })),

@@ -141,6 +141,16 @@ export interface MenubarTask {
   meta: string;
 }
 
+export interface MenubarTaskActivity {
+  sessionId: string;
+  title: string;
+  phase: 'running' | 'interaction' | 'completed' | 'error';
+  status: string;
+  preview: string;
+  attention: boolean;
+  updatedAtMs: number;
+}
+
 export interface MenubarModelUsage {
   name: string;
   harness: 'first' | 'second' | 'other';
@@ -199,6 +209,8 @@ export interface MenubarView {
   details: Record<string, MenubarDetail>;
   taskSummary: string;
   tasks: MenubarTask[];
+  activities?: MenubarTaskActivity[];
+  attentionCount?: number;
   usage: MenubarUsage;
   manage: MenubarManageRow[];
   settings: MenubarSettings;

@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { buildMenubarView, capabilityNames, MENU_BAR_MESSAGES, type MenubarSettings, type MenubarView, type MenubarSourceInput,
-  type MenubarSubscriptionInput, type MenubarTaskInput, type MenubarUsageScopeInput, type MenubarHarness } from "@joko/contracts";
+  type MenubarSubscriptionInput, type MenubarTaskActivity, type MenubarTaskInput, type MenubarUsageScopeInput, type MenubarHarness } from "@joko/contracts";
 import type { AppController, ControllerState } from "./controller.js";
-import type { AppSnapshot, ConnectionProfile, OperationApi, ProviderRuntimeView, UsageHistoryView, UsageReportEntryView,
+import type { AppSnapshot, ConnectionProfile, OperationApi, PartnerProfileView, ProviderRuntimeView, SessionView, UsageHistoryView, UsageReportEntryView,
   UsageHistorySummaryView, ProviderAccountUsageWindowView } from "./model.js";
 import { selectedMachineProfileIds } from "./machine-federation.js";
 import { newSessionProviderModel } from "./new-session-provider-model.js";
+import { projectNativeTaskStatusSnapshot } from "./native-task-status-bridge.js";
 import { randomUuid, sha256Hex } from "./web-crypto.js";
 
 export interface DesktopMenuBarSource {
@@ -14,14 +15,17 @@ export interface DesktopMenuBarSource {
   readonly selected: boolean;
   readonly connectionGeneration?: number;
   readonly epoch?: number;
+  readonly partners?: readonly PartnerProfileView[];
 }
 export interface DesktopMenuBarUsage { readonly history: UsageHistoryView; readonly tasks: readonly UsageReportEntryView[]; readonly accountRefreshFailed?: boolean }
 interface UsageReading { readonly value?: DesktopMenuBarUsage; readonly failed?: boolean }
-export interface DesktopMenuBarRoute { readonly source: DesktopMenuBarSource; readonly sessionId: string; readonly generation: bigint }
+export interface DesktopMenuBarRoute { readonly source: DesktopMenuBarSource; readonly sessionId: string; readonly generation: bigint;
+  readonly activity?: true; readonly partnerId?: string }
 export interface DesktopMenuBarProviderRoute { readonly source: DesktopMenuBarSource; readonly backendId: string; readonly providerId: string; readonly modelId: string }
 export interface DesktopMenuBarProjection { readonly view: MenubarView; readonly routes: ReadonlyMap<string, DesktopMenuBarRoute>;
   readonly providerRoutes: ReadonlyMap<string, DesktopMenuBarProviderRoute>; readonly sourceKeys: ReadonlySet<string> }
 const MARK = "joko:mark";
+const unreadActivityLifetimeMs = 4 * 60 * 60 * 1_000;
 const text = (value: string): string => value.replace(/[\u0000-\u001f\u007f]/gu, " ").slice(0, 4096);
 const positive = (value: number | undefined): number => typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
 const dayKey = (time: number): string => { const date = new Date(time); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`; };
@@ -29,6 +33,9 @@ const profileKey = (profile: ConnectionProfile): readonly string[] => [profile.i
 export const desktopMenuBarSourceKey = (source: DesktopMenuBarSource): string => JSON.stringify([
   ...profileKey(source.profile), source.snapshot.generation.toString(), source.epoch ?? null, source.connectionGeneration ?? null
 ]);
+const desktopMenuBarTaskId = (source: DesktopMenuBarSource, session: SessionView): Promise<string> =>
+  opaque("task", [...profileKey(source.profile), source.snapshot.generation.toString(), source.epoch ?? null,
+    source.connectionGeneration ?? null, session.id, session.generation.toString()]);
 
 /** Only authenticated live snapshots participate; cached/offline machine cards never supply usage or actions. */
 export function desktopMenuBarSources(state: ControllerState): readonly DesktopMenuBarSource[] {
@@ -41,7 +48,7 @@ export function desktopMenuBarSources(state: ControllerState): readonly DesktopM
     const saved = state.profiles.find(profile => profile.id === source.profile.id);
     if (!saved || !selected.has(saved.id) || keys.has(saved.id) || JSON.stringify(profileKey(saved)) !== JSON.stringify(profileKey(source.profile))) return [];
     keys.add(saved.id);
-    return [{ profile: saved, snapshot: source.snapshot, epoch: source.epoch, selected: true }];
+    return [{ profile: saved, snapshot: source.snapshot, epoch: source.epoch, selected: true, partners: source.partners }];
   })];
 }
 
@@ -96,7 +103,8 @@ const amount = (summary: UsageHistorySummaryView, currency: string): number => s
 
 /** Pure service-fact mapping apart from stable SHA-256 route identities; no Provider/runtime or credential I/O. */
 export async function projectDesktopMenuBar(input: { readonly sources: readonly DesktopMenuBarSource[]; readonly readings: ReadonlyMap<string, UsageReading>;
-  readonly settings: MenubarSettings; readonly locale: string; readonly now: number }): Promise<DesktopMenuBarProjection> {
+  readonly settings: MenubarSettings; readonly locale: string; readonly now: number;
+  readonly visibleLocalSessionId?: string }): Promise<DesktopMenuBarProjection> {
   const locale = input.locale === "zh-CN" ? "zh-CN" : "en", messages = MENU_BAR_MESSAGES[locale];
   const names = [...new Set(input.sources.flatMap(source => source.snapshot.backends.map(backend => backend.name)))].sort((a, b) => a.localeCompare(b));
   const labels: Record<MenubarHarness, string> = { first: text(names[0] ?? "Backend 1"), second: text(names[1] ?? "Backend 2"), other: locale === "zh-CN" ? "其他" : "Other" };
@@ -152,6 +160,7 @@ export async function projectDesktopMenuBar(input: { readonly sources: readonly 
   const displayed = input.settings.scope === "local" ? local : selected;
   const sources: MenubarSourceInput[] = [], tasks: MenubarTaskInput[] = [], routes = new Map<string, DesktopMenuBarRoute>(),
     providerRoutes = new Map<string, DesktopMenuBarProviderRoute>(), detailActions = new Map<string, { id: string; name: string }>();
+  const activities: MenubarTaskActivity[] = [];
   for (const source of displayed) {
     const reading = input.readings.get(desktopMenuBarSourceKey(source))?.value;
     const codexRoutes = new Set(source.snapshot.models.filter(model => model.source?.kind === "local" && model.source.nativeAdapterKind === "codex")
@@ -199,14 +208,43 @@ export async function projectDesktopMenuBar(input: { readonly sources: readonly 
     const report = new Map((reading?.tasks ?? []).filter(entry => entry.sessionId).map(entry => [entry.sessionId, entry]));
     const visible = source.snapshot.sessions.filter(session => !session.hidden && (report.has(session.id) || ["running", "waiting", "retrying"].includes(session.state)));
     for (const session of visible) {
-      const entry = report.get(session.id), id = await opaque("task", [...profileKey(source.profile), source.snapshot.generation.toString(),
-        source.epoch ?? null, source.connectionGeneration ?? null, session.id, session.generation.toString()]);
+      const entry = report.get(session.id), id = await desktopMenuBarTaskId(source, session);
       const running = ["running", "waiting", "retrying"].includes(session.state);
       tasks.push({ sessionId: id, title: text(`${session.name}${source.epoch === undefined ? "" : ` · ${source.profile.name}`}`),
         harness: harness(source, session.backendId), model: text(session.model?.name ?? entry?.modelId ?? ""), tokensToday: positive(entry?.summary.usage.totalTokens),
         valueToday: entry && currency ? amount(entry.summary, currency) : 0, contextPercent: session.context ? session.context.utilizationRatio * 100 : null,
         running, startedAtMs: session.activeRunStartedAt ?? null, lastActiveAtMs: session.updatedAt });
       routes.set(id, { source, sessionId: session.id, generation: session.generation });
+    }
+    const liveSessions = source.snapshot.sessions.filter(session => !session.archived && !session.hidden && session.state !== "closed");
+    const statusBySession = new Map(projectNativeTaskStatusSnapshot({ ownerId: source.profile.id, revision: 0n, locale,
+      sessions: liveSessions, interactions: source.snapshot.interactions, timelineBySession: source.snapshot.timelineBySession,
+      inputHandoffs: source.snapshot.inputHandoffs }).sessions.map(entry => [entry.sessionId, entry]));
+    const partnersBySession = new Map((source.partners ?? []).filter(partner => partner.canonicalSessionId
+      && (partner.lifecycle === "active" || partner.lifecycle === "paused")).map(partner => [partner.canonicalSessionId!, partner]));
+    for (const session of liveSessions) {
+      const activity = statusBySession.get(session.id), partner = partnersBySession.get(session.id);
+      const unreadReply = (partner?.activity.unreadReplyCount ?? 0) > 0;
+      const phase = activity?.phase ?? (unreadReply ? "completed" : undefined);
+      if (!phase) continue;
+      const terminal = phase === "completed" || phase === "error";
+      const unread = session.attention?.unread === true || unreadReply;
+      const updatedAtMs = terminal ? Math.max(session.attention?.updatedAt ?? 0, unreadReply ? partner?.activity.latestReplyAt ?? session.updatedAt : 0)
+        : activity?.updatedAt ?? session.updatedAt;
+      if (terminal && (!unread || updatedAtMs <= input.now - unreadActivityLifetimeMs)) continue;
+      if (phase === "interaction" && source.epoch === undefined && input.visibleLocalSessionId === session.id
+        && activity?.interactionKind !== "permission") continue;
+      const status = uiStrings[`activity.${phase}`]!;
+      const sessionId = await opaque("activity", [desktopMenuBarSourceKey(source), session.id, session.generation.toString(), partner?.id ?? null]);
+      const name = partner?.displayName || session.name || uiStrings.activityUntitled!;
+      const preview = phase === "interaction" ? activity?.detail : session.taskActivity?.completedReplySummary
+        || (unreadReply ? partner?.activity.latestReplyPreview : undefined) || activity?.activityLines.at(-1)?.text || activity?.detail;
+      activities.push({ sessionId, phase, status,
+        title: input.settings.privacy ? uiStrings.activityPrivate! : text(source.epoch === undefined ? name : `${name} · ${source.profile.name}`).slice(0, 160),
+        preview: input.settings.privacy ? status : text(preview || status).replace(/\s+/gu, " ").trim().slice(0, 240),
+        attention: phase === "interaction" || terminal || unreadReply, updatedAtMs });
+      routes.set(sessionId, { source, sessionId: session.id, generation: session.generation, activity: true,
+        ...(partner ? { partnerId: partner.id } : {}) });
     }
     // History can include deleted/archived groups absent from the live directory. Keep their accounting,
     // while the missing native generation deliberately grants no navigation action.
@@ -226,6 +264,12 @@ export async function projectDesktopMenuBar(input: { readonly sources: readonly 
       return generated === undefined ? at : at === null ? generated : Math.min(at, generated);
     }, null), harnessLogos: { first: MARK, second: MARK, other: MARK }, uiStrings, t,
     ...(local.length === 0 ? { gate: "connection" as const } : {}) });
+  if (!view.gate) {
+    activities.sort((a, b) => b.updatedAtMs - a.updatedAtMs);
+    const attention = activities.filter(entry => entry.attention);
+    view.activities = [...attention.slice(0, 80), ...activities.filter(entry => !entry.attention).slice(0, 80)];
+    view.attentionCount = attention.length;
+  }
   for (const detail of Object.values(view.details)) {
     const action = detailActions.get(detail.id);
     detail.action = action ? { kind: "new-task", providerId: action.id } : { kind: "open-app" };
@@ -300,7 +344,8 @@ export async function projectDesktopMenuBar(input: { readonly sources: readonly 
   if (omitted) for (const scope of ["local", "all"] as const) view.usage.scopes[scope].note += locale === "zh-CN"
     ? "\n部分条目超过菜单栏显示预算，请在应用中查看完整用量。" : "\nSome entries exceed the menu bar display budget; open the app for the complete usage report.";
   boundDisplay(view);
-  return { view, routes: new Map([...routes].filter(([id]) => view.tasks.some(task => task.sessionId === id))),
+  const visibleRouteIds = new Set([...view.tasks, ...(view.activities ?? [])].map(entry => entry.sessionId));
+  return { view, routes: new Map([...routes].filter(([id]) => visibleRouteIds.has(id))),
     providerRoutes: new Map([...providerRoutes].filter(([id]) => Object.values(view.details).some(detail => detail.action.kind === "new-task" && detail.action.providerId === id))),
     sourceKeys: new Set(input.sources.map(desktopMenuBarSourceKey)) };
 }
@@ -316,8 +361,13 @@ function currentSource(source: DesktopMenuBarSource, state: ControllerState): Ap
   return snapshot?.generation === source.snapshot.generation ? snapshot : undefined;
 }
 export function desktopMenuBarRouteCurrent(route: DesktopMenuBarRoute, state: ControllerState): boolean {
-  return currentSource(route.source, state)?.sessions.some(session => session.id === route.sessionId
-    && session.generation === route.generation && !session.hidden) === true;
+  if (currentSource(route.source, state)?.sessions.some(session => session.id === route.sessionId
+    && session.generation === route.generation && !session.hidden
+    && (route.activity !== true || !session.archived && session.state !== "closed")) !== true) return false;
+  if (!route.partnerId) return true;
+  return state.nativeTaskStatusLiveSources?.some(source => source.profile.id === route.source.profile.id
+    && source.epoch === route.source.epoch && source.partners.some(partner => partner.id === route.partnerId
+      && partner.canonicalSessionId === route.sessionId && (partner.lifecycle === "active" || partner.lifecycle === "paused"))) === true;
 }
 export function desktopMenuBarProviderRouteCurrent(route: DesktopMenuBarProviderRoute, state: ControllerState): boolean {
   const snapshot = route.source.epoch === undefined ? currentSource(route.source, state) : undefined;
@@ -332,11 +382,28 @@ export function useDesktopMenuBar(controller: AppController, ownsProjection: boo
   const owner = useRef(`renderer:${randomUuid()}`), revision = useRef(0n), projection = useRef<DesktopMenuBarProjection | undefined>(undefined);
   const [settings, setSettings] = useState<MenubarSettings>(), [available, setAvailable] = useState(false), [refresh, setRefresh] = useState(0),
     [readings, setReadings] = useState<ReadonlyMap<string, UsageReading>>(new Map());
+  const [windowFocused, setWindowFocused] = useState(false);
+  const route = controller.state.route;
+  const visibleLocalSessionId = windowFocused && route.kind === "session" && controller.state.taskSource?.kind !== "joined"
+    && (route.profileId === undefined || route.profileId === controller.state.activeProfile?.id) ? route.sessionId : undefined;
   const sources = useMemo(() => desktopMenuBarSources(controller.state), [controller.state.activeProfile, controller.state.connectionState,
     controller.state.connectionGeneration, controller.state.snapshot, controller.state.profiles, controller.state.nativeTaskStatusLiveSources,
     controller.state.preferences.machineSelection]);
   const sourcesRef = useRef(sources); sourcesRef.current = sources;
   const key = sources.map(desktopMenuBarSourceKey).sort().join("\n");
+  useEffect(() => {
+    if (!api || !ownsProjection) return;
+    const update = () => setWindowFocused(!document.hidden && document.hasFocus());
+    update();
+    window.addEventListener("focus", update);
+    window.addEventListener("blur", update);
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      window.removeEventListener("focus", update);
+      window.removeEventListener("blur", update);
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, [api, ownsProjection]);
   useEffect(() => {
     if (!api || !ownsProjection) return;
     let current = true, settingsChanged = false;
@@ -367,12 +434,12 @@ export function useDesktopMenuBar(controller: AppController, ownsProjection: boo
       if (!current) return; projection.current = value;
       void api.publish({ ownerId: owner.current, revision: (++revision.current).toString(), view: value.view }).catch(() => undefined);
     };
-    void projectDesktopMenuBar({ sources, readings, settings, locale: controller.state.effectiveLocale, now: Date.now() }).then(publish).catch(() => {
+    void projectDesktopMenuBar({ sources, readings, settings, locale: controller.state.effectiveLocale, now: Date.now(), visibleLocalSessionId }).then(publish).catch(() => {
       if (current) void projectDesktopMenuBar({ sources: [], readings: new Map(), settings,
         locale: controller.state.effectiveLocale, now: Date.now() }).then(publish).catch(() => undefined);
     });
     return () => { current = false; projection.current = undefined; };
-  }, [api, ownsProjection, available, settings, sources, readings, controller.state.effectiveLocale]);
+  }, [api, ownsProjection, available, settings, sources, readings, controller.state.effectiveLocale, visibleLocalSessionId]);
   useEffect(() => {
     if (!api || !ownsProjection) return;
     return api.onAction(action => {
@@ -406,7 +473,8 @@ export function useDesktopMenuBar(controller: AppController, ownsProjection: boo
       if (!route || !desktopMenuBarRouteCurrent(route, current.state)) return;
       const isCurrent = () => desktopMenuBarRouteCurrent(route, latest.current.state);
       if (route.source.epoch === undefined) current.navigate({ kind: "session", sessionId: route.sessionId }, { isCurrent });
-      else void current.openMachineSession(route.source.profile.id, route.sessionId, { expectedGeneration: route.generation, isCurrent }).catch(() => undefined);
+      else void current.openMachineSession(route.source.profile.id, route.sessionId, { expectedGeneration: route.generation, isCurrent,
+        ...(route.partnerId ? { partnerId: route.partnerId } : {}) }).catch(() => undefined);
     });
   }, [api, ownsProjection]);
 }
