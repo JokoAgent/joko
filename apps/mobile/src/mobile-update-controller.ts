@@ -196,13 +196,19 @@ export class MobileUpdateController {
   }
 
   async openUpdate(target: MobileUpdateRelease): Promise<void> {
-    const current = this.#state.forced ?? this.#state.prompt;
+    const { forced, prompt } = this.#state;
+    const current = forced ?? prompt;
     if (!current || !sameRelease(current, target)) return;
+    const generation = this.#generation;
     this.#patch({ actionError: undefined });
     try {
       await this.#runtime.openRelease(current);
+      if (this.#platform === "ios" && forced === undefined && generation === this.#generation
+        && this.#state.forced === undefined && this.#state.prompt === current) {
+        this.dismissPrompt();
+      }
     } catch (cause) {
-      if (sameRelease(this.#state.forced ?? this.#state.prompt, current)) {
+      if (generation === this.#generation && (this.#state.forced ?? this.#state.prompt) === current) {
         this.#patch({ actionError: "install" });
       }
       throw cause;

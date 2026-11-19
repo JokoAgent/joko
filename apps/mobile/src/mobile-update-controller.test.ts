@@ -314,6 +314,47 @@ describe("MobileUpdateController", () => {
     expect(harness.controller.snapshot.pendingRestart).toBe(true);
   });
 
+  it.each(["https://download.joko.app/mobile-new", null])("retires the iOS optional prompt after handoff, with resumed install URL %s", async (url) => {
+    let now = 1_000;
+    const first = releaseRecord();
+    const next = url === null ? null : releaseRecord({ installUrl: url });
+    const harness = createHarness({
+      platform: "ios",
+      configuration: fullConfiguration,
+      now: () => now,
+      runtimePatch: { fetchRelease: vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(next).mockResolvedValueOnce(next) }
+    });
+    await harness.controller.start(true);
+    await vi.waitFor(() => expect(harness.controller.snapshot.prompt).toEqual(first));
+    await harness.controller.openUpdate(first);
+    expect(harness.controller.snapshot.prompt).toBeUndefined();
+
+    harness.controller.handleAppStateChange("background");
+    now += 5 * 60_000;
+    await harness.controller.handleAppStateChange("active");
+    expect(harness.runtime.fetchRelease).toHaveBeenCalledTimes(2);
+    expect(harness.controller.snapshot.prompt).toBeUndefined();
+    await harness.controller.openUpdate(first);
+    expect(harness.runtime.openRelease).toHaveBeenCalledExactlyOnceWith(first);
+
+    await harness.controller.manualCheck();
+    expect(harness.controller.snapshot.prompt).toEqual(next ?? undefined);
+    expect(harness.controller.snapshot.manualOutcome).toBe(next ? "update-available" : "up-to-date");
+  });
+
+  it("keeps the iOS optional prompt when its install page could not be opened", async () => {
+    const release = releaseRecord();
+    const harness = createHarness({
+      platform: "ios",
+      configuration: fullConfiguration,
+      runtimePatch: { fetchRelease: vi.fn(async () => release), openRelease: vi.fn().mockRejectedValueOnce(new Error("unavailable")) }
+    });
+    await harness.controller.start(true);
+    await vi.waitFor(() => expect(harness.controller.snapshot.prompt).toEqual(release));
+    await expect(harness.controller.openUpdate(release)).rejects.toThrow("unavailable");
+    expect(harness.controller.snapshot).toMatchObject({ prompt: release, actionError: "install" });
+  });
+
   it("persists beta before publishing it and rolls back when native channel configuration fails", async () => {
     const harness = createHarness({ configuration: otaConfiguration });
     await harness.controller.start(true);
