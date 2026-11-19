@@ -456,6 +456,31 @@ describe("ObjectiveManager", () => {
     }
   });
 
+  it("resumes the current Pi Goal after a budget edit during the original capacity wait", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+    const fixture = createFixture();
+    await fixture.manager.set({ ...setInput("set-capacity-wait-edit", fixture), maximumTurns: 5 });
+    const pending = fixture.host.admissions[0]!;
+    failRun(fixture.store, pending, overloadError());
+    await fixture.manager.onRunSettled({ sessionId: fixture.sessionId, runId: pending.runId, outcome: "failed" });
+    const interrupted = fixture.store.getObjective(fixture.sessionId);
+    expect(interrupted).toMatchObject({ status: "usage_limited", usageResetAt: Date.now() + 60_000, maximumTurns: 5 });
+    await vi.advanceTimersByTimeAsync(20_000);
+    const edited = await fixture.manager.update({ operationId: "extend-waiting-budget", sessionId: fixture.sessionId,
+      expectedRevision: interrupted.revision, expectedOwnerGeneration: interrupted.ownerGeneration, maximumTurns: 8 });
+    expect(edited).toMatchObject({ status: "usage_limited", usageResetAt: interrupted.usageResetAt, maximumTurns: 8, text: interrupted.text });
+    expect(edited.ownerGeneration).toBeGreaterThan(interrupted.ownerGeneration);
+    await vi.advanceTimersByTimeAsync(39_999);
+    expect(fixture.host.admissions).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fixture.host.admissions).toHaveLength(2);
+    expect(fixture.store.getObjective(fixture.sessionId)).toMatchObject({ status: "active", maximumTurns: 8,
+      pendingRunId: fixture.host.admissions[1]!.runId, lastReason: "upstream capacity wait ended; resuming objective" });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fixture.host.admissions).toHaveLength(2);
+  });
+
   it.each([
     { info: "usageLimitExceeded", status: "usage_limited" },
     { info: { httpConnectionFailed: { httpStatusCode: 429 } }, status: "usage_limited" },

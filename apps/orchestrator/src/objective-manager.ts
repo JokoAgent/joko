@@ -99,7 +99,7 @@ export class ObjectiveManager {
   readonly #now: () => number;
   readonly #locks = new Map<string, Promise<void>>();
   readonly #listeners = new Map<string, Set<ObjectiveListener>>();
-  readonly #usageTimers = new Map<string, { readonly at: number; readonly timer: NodeJS.Timeout }>();
+  readonly #usageTimers = new Map<string, { readonly at: number; readonly ownerGeneration: number; readonly timer: NodeJS.Timeout }>();
   readonly #dispatchTimers = new Map<string, NodeJS.Timeout>();
   #unsubscribe?: () => void;
   #closed = false;
@@ -819,19 +819,21 @@ export class ObjectiveManager {
   }
 
   #scheduleUsageResume(objective: ObjectiveRecord): void {
-    if (objective.usageResetAt === undefined || objective.status !== "usage_limited") {
+    const { sessionId, usageResetAt, ownerGeneration } = objective;
+    if (usageResetAt === undefined || objective.status !== "usage_limited") {
       this.#cancelUsageTimer(objective.sessionId);
       return;
     }
-    const existing = this.#usageTimers.get(objective.sessionId);
-    if (existing?.at === objective.usageResetAt) return;
+    const existing = this.#usageTimers.get(sessionId);
+    if (existing?.at === usageResetAt && existing.ownerGeneration === ownerGeneration) return;
     if (existing !== undefined) clearTimeout(existing.timer);
-    const delay = Math.max(0, Math.min(2_147_483_647, objective.usageResetAt - this.#now()));
+    const delay = Math.max(0, Math.min(2_147_483_647, usageResetAt - this.#now()));
     const timer = setTimeout(() => {
-      this.#usageTimers.delete(objective.sessionId);
-      void this.#autoResumeUsage(objective.sessionId, objective.ownerGeneration, objective.usageResetAt!);
+      if (this.#usageTimers.get(sessionId)?.timer !== timer) return;
+      this.#usageTimers.delete(sessionId);
+      void this.#autoResumeUsage(sessionId, ownerGeneration, usageResetAt);
     }, delay);
-    this.#usageTimers.set(objective.sessionId, { at: objective.usageResetAt, timer });
+    this.#usageTimers.set(sessionId, { at: usageResetAt, ownerGeneration, timer });
   }
 
   async #autoResumeUsage(sessionId: string, ownerGeneration: number, resetAt: number): Promise<void> {
