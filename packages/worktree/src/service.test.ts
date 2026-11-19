@@ -1385,6 +1385,51 @@ describe("EphemeralWorktreeService", () => {
     });
   });
 
+  test("creates from the exact selected remote tracking branch only when refresh was requested", { timeout: 40_000 }, async () => {
+    const fixture = await createRepositoryFixture();
+    const cwd = fixture.repositoryRoot, remoteRoot = join(fixture.root, "remote.git"), writer = join(fixture.root, "writer");
+    const original = (await git(cwd, ["rev-parse", "HEAD"])).trim();
+    await git(cwd, ["branch", "release"]);
+    await git(fixture.root, ["clone", "--bare", cwd, remoteRoot]);
+    await git(cwd, ["remote", "add", "origin", remoteRoot]);
+    await git(cwd, ["fetch", "origin"]);
+    await git(fixture.root, ["clone", remoteRoot, writer]);
+    await git(writer, ["-c", "user.name=Joko Test", "-c", "user.email=test@invalid.example", "commit", "--allow-empty", "-m", "advance remote"]);
+    await git(writer, ["push", "origin", "HEAD:refs/heads/release", "HEAD:refs/heads/main"]);
+    const next = (await git(writer, ["rev-parse", "HEAD"])).trim();
+    const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
+    unwrap(await service.initialize());
+    try {
+      const sourceRef = "refs/remotes/origin/release";
+      const old = unwrap(await service.acquire({ sessionId: "from-local-tracking-ref", cwd, sourceRef }));
+      expect(old.lease.source).toMatchObject({ ref: sourceRef, commit: original, refreshed: false });
+      expect((await git(old.lease.path, ["rev-parse", "HEAD"])).trim()).toBe(original);
+
+      const refreshed = unwrap(await service.acquire({ sessionId: "from-refreshed-tracking-ref", cwd, sourceRef, refreshRemote: true }));
+      expect(refreshed.lease.source).toMatchObject({ ref: sourceRef, commit: next, refreshed: true, strategy: "explicit", remote: "origin" });
+      expect((await git(refreshed.lease.path, ["rev-parse", "HEAD"])).trim()).toBe(next);
+      const untouched = (await git(cwd, ["rev-parse", "HEAD", "refs/heads/release", "refs/remotes/origin/main"])).trim().split(/\r?\n/u);
+      expect(untouched).toEqual([original, original, original]);
+      const local = unwrap(await service.acquire({ sessionId: "from-explicit-local-ref", cwd, sourceRef: "refs/heads/main", refreshRemote: true }));
+      expect(local.lease.source).toMatchObject({ commit: original, refreshed: false });
+
+      const renamed = "refs/remotes/origin/stable";
+      await git(cwd, ["config", "--unset-all", "remote.origin.fetch"]);
+      await git(cwd, ["config", "--add", "remote.origin.fetch", `+refs/heads/release:${renamed}`]);
+      await git(cwd, ["config", "--add", "remote.origin.fetch", "+refs/heads/release:refs/remotes/origin/another"]);
+      await git(cwd, ["config", "remote.origin.prune", "true"]);
+      await git(cwd, ["update-ref", renamed, original]);
+      await git(cwd, ["update-ref", "refs/remotes/origin/another", original]);
+      const aliased = unwrap(await service.acquire({ sessionId: "from-renamed-tracking-ref", cwd, sourceRef: renamed, refreshRemote: true }));
+      expect(aliased.lease.source).toMatchObject({ ref: renamed, commit: next, refreshed: true });
+      expect((await git(cwd, ["rev-parse", "refs/remotes/origin/another"])).trim()).toBe(original);
+
+      await git(cwd, ["config", "--add", "remote.origin.fetch", "^refs/heads/release"]);
+      expectFailure(await service.acquire({ sessionId: "from-excluded-tracking-ref", cwd, sourceRef: renamed, refreshRemote: true }), "SOURCE_NOT_FOUND");
+      expect(service.snapshot().active.map(lease => lease.sessionId)).not.toContain("from-excluded-tracking-ref");
+    } finally { service.dispose(); }
+  });
+
   test("rejects linked checkouts, nested storage, invalid sources, and aborted calls", async () => {
     const fixture = await createRepositoryFixture();
     const linkedPath = join(fixture.root, "linked");
