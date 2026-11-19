@@ -61,6 +61,32 @@ describe("mobile Automation authoring", () => {
     expect(saved).toMatchObject({ displayName: "Renamed script", sessionMode: ScheduleSessionMode.BOUND, sessionId: "session" });
     expect(saved.execution?.model).toBeUndefined();
   });
+  it.each([
+    ["America/New_York", "2026-11-01T06:30:00.000Z", "2026-11-01T05:45:00Z", "2026-11-01T01:30", "2026-11-01T02:30", "2026-11-01T07:30:00Z"],
+    ["UTC", "2027-01-01T00:00:45.123Z", "2026-12-31T22:00:00Z", "2027-01-01T00:00", "2027-01-01T01:00", "2027-01-01T01:00:00Z"]
+  ])("keeps a saved one-shot instant through a name-only edit in %s", (timeZone, savedAt, now, wallTime, editedWallTime, editedAt) => {
+    const owner = authoringOwner();
+    const existing: MobileAutomationSchedule = {
+      scheduleId: "one-shot", displayName: "Saved task", state: "enabled", source: "dialogue",
+      backendId: "backend", targetId: "target", sessionMode: "fresh", recurrence: "once", recurrenceLabel: savedAt,
+      recurrenceExpression: savedAt, timeZone, inputText: "Run the task", editableInputText: "Run the task",
+      executionMode: "agent", permissionMode: "ask", planMode: false, useWorktree: false, refreshWorktreeRemote: false,
+      extraDirectoryIds: [], silentWhenIdle: false, notifyDesktop: true, overlapPolicy: "queue", misfirePolicy: "runOnce",
+      unreadRunCount: 0, recentRuns: [], revision: { value: 2n, etag: "one-shot-r2" }, generation: 1n
+    };
+    const draft = createMobileAutomationDraft(owner, existing);
+    expect(draft.expression).toBe(wallTime);
+    const save = (expression: string) => buildMobileAutomationScheduleInput(owner, {
+      ...draft, name: "Renamed task", expression
+    }, existing, undefined, Date.parse(now)).schedule;
+    const expectedRecurrence = (instant: string) => ({
+      kind: { case: "oneShot", value: { triggerAt: {
+        seconds: BigInt(Math.floor(Date.parse(instant) / 1000)), nanos: (Date.parse(instant) % 1000) * 1_000_000
+      } } }
+    });
+    expect(save(wallTime)).toMatchObject({ displayName: "Renamed task", recurrence: expectedRecurrence(savedAt) });
+    expect(save(editedWallTime).recurrence).toMatchObject(expectedRecurrence(editedAt));
+  });
   it("builds all current v1 agent fields from current target authority", () => {
     const owner = authoringOwner();
     const draft = {

@@ -418,7 +418,11 @@ export function buildMobileAutomationScheduleInput(
   if (draft.recurrence === "manual") {
     recurrence = { kind: { case: "manual", value: {} } } as ScheduleInput["recurrence"];
   } else if (draft.recurrence === "once") {
-    const epoch = mobileScheduleEpochFromLocalDateTime(draft.expression, timeZone);
+    const savedEpoch = existing?.recurrence === "once" && existing.timeZone === timeZone
+      ? Date.parse(existing.recurrenceExpression) : undefined;
+    const unchanged = savedEpoch !== undefined && Number.isFinite(savedEpoch)
+      && draft.expression.trim() === mobileScheduleLocalDateTimeFromEpoch(savedEpoch, timeZone);
+    const epoch = unchanged ? savedEpoch : mobileScheduleEpochFromLocalDateTime(draft.expression, timeZone);
     if (epoch === undefined) throw new Error("Enter a valid one-shot time in the selected time zone.");
     if (draft.enabled && epoch <= now) throw new Error("An enabled one-shot Automation must run in the future.");
     recurrence = { kind: { case: "oneShot", value: { triggerAt: timestamp(epoch) } } } as ScheduleInput["recurrence"];
