@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, fork, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
@@ -15,11 +15,12 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const startupDiagnosticsOnly = process.argv.length === 3 && process.argv[2] === "--startup-diagnostics";
 const sdkRuntime = process.env.JOKO_IOS_SDK_RUNTIME ?? 'relay';
 if (!['relay', 'iroh-native', 'http-connect-native'].includes(sdkRuntime)) throw new Error('Unknown selected Mobile UI-test runtime.');
+const verifyWorkspacePdf = !startupDiagnosticsOnly && sdkRuntime === "relay" && process.env.JOKO_IOS_WORKSPACE_PDF === "1";
 const abort = new AbortController();
 const observationStartedAt = Date.now();
 // Cold boot, Metro, two app observations and the XCTest build took nearly
 // 26 minutes on the Intel runner. Leave the first XCTest its full five minutes.
-const observationBudgetMs = (startupDiagnosticsOnly ? 4 : 31) * 60_000;
+const observationBudgetMs = (startupDiagnosticsOnly ? 4 : verifyWorkspacePdf ? 37 : 31) * 60_000;
 const observationDeadlineAt = observationStartedAt + observationBudgetMs;
 const simulatorInstallTimeoutMs = 120_000;
 const simulatorLaunchTimeoutMs = 120_000;
@@ -31,6 +32,7 @@ const stop = () => abort.abort(new Error("iOS startup observation was cancelled.
 process.once("SIGINT", stop); process.once("SIGTERM", stop);
 let evidence, udid, deviceName, bundleId, executable, installedExecutable, metro, metroClosed = false;
 let preInputApplication;
+let pdfPairingFormActive = false;
 let stage = "preconditions";
 const startupCommandReceipts = [];
 const hostResourceSnapshots = [];
@@ -448,6 +450,58 @@ async function exportPreInputSetupFailure(screenshots, files, { expectedSha, exp
     screenshotExported: screen !== undefined, hierarchyExported: tree !== undefined });
 }
 
+function startWorkspacePdfFixture() {
+  const child = fork(join(root, "apps/e2e/src/ios-workspace-pdf-fixture.ts"), [], {
+    cwd: root, execArgv: ["--import", "tsx"], stdio: ["ignore", "ignore", "inherit", "ipc"]
+  });
+  let inputs, pairingCode, paired = false, exit, childError;
+  const issuedCodes = [];
+  child.once("error", (error) => { childError = error; });
+  const exited = new Promise((accept) => child.once("close", (code, signal) => {
+    exit = { code, signal }; accept(exit);
+  }));
+  child.on("message", (message) => {
+    if (message.kind === "ready" && /^http:\/\/127\.0\.0\.1:\d+$/u.test(message.origin)
+      && typeof message.publicKey === "string" && /^[0-9a-f]{64}$/u.test(message.pdfSha256)) {
+      inputs = { origin: message.origin, publicKey: message.publicKey, pdfSha256: message.pdfSha256 };
+    } else if (message.kind === "pairingCode" && typeof message.code === "string") {
+      issuedCodes.push(message.code);
+      pairingCode = message.code;
+      pdfPairingFormActive = true;
+    } else if (message.kind === "paired") {
+      paired = true;
+      pdfPairingFormActive = false;
+    }
+  });
+  return {
+    get inputs() { return inputs; },
+    get pairingCode() { return pairingCode; },
+    get paired() { return paired; },
+    get pairingRequests() { return issuedCodes.length; },
+    async ready() {
+      const deadline = Date.now() + 45_000;
+      while (!inputs && exit === undefined && !childError && Date.now() < deadline) {
+        await delay(150, undefined, { signal: abort.signal });
+      }
+      if (!inputs || exit || childError) throw new Error("The owned PDF task node did not become ready.");
+    },
+    async close() {
+      if (child.connected) child.disconnect();
+      const stop = setTimeout(() => child.kill("SIGKILL"), 5_000);
+      const result = await exited;
+      clearTimeout(stop);
+      for (const name of ["gui-test.log", "gui-test-retry.log"]) {
+        const path = join(evidence, name);
+        if (!existsSync(path) || !issuedCodes.length) continue;
+        let text = readFileSync(path, "utf8");
+        for (const code of issuedCodes) text = text.replaceAll(code, "[pairing code]");
+        writeFileSync(path, text);
+      }
+      if (result.code !== 0 || childError) throw new Error("The owned PDF task node did not close cleanly.");
+    }
+  };
+}
+
 async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopenedPid, minimumOsVersion) {
   const owner = { udid, bundleId, installedExecutable };
   const assertIdentity = async (phase) => {
@@ -469,14 +523,23 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
   await assertIdentity("pre-ui-build");
   const names = ["01-connection-page", "02-saved-nodes", "03-nearby", sdkRuntime === 'http-connect-native' ? "04-webrtc-unavailable" : "04-webrtc-mode", "04-invalid-address", "05-local-identity-error",
     "06-inspection-pending", "07-cancelled-draft-retained", "08-returned-address-draft", "09-dark-theme", "10-light-theme",
-    ...(sdkRuntime === 'http-connect-native' ? ['11-http-connect-invitation'] : [])];
+    ...(sdkRuntime === 'http-connect-native' ? ['11-http-connect-invitation'] : []),
+    ...(verifyWorkspacePdf ? ["11-original-workspace-pdf", "12-native-pdf-selection", "13-pdf-word-pasted"] : [])];
   const progressNames = new Set([...names, "04-https-selected", "04-address-tapped", "04-address-typing", "04-address-typed", "04-address-value-observed"]);
   // A loopback-only Connect error endpoint exercises the real native transport.
   // It never supplies a node identity, challenge, credential or successful pair.
   let requests = 0, unexpectedRequests = 0, screenshotCount = 0;
+  let workspacePdf;
   let testAttempt = 0, testStartedAt;
   const progress = [];
   const probe = createHttpServer((request, response) => {
+    if (request.method === "GET" && (request.url === "/ci-pdf-fixture" || request.url === "/ci-pdf-pairing-code")) {
+      const value = request.url === "/ci-pdf-fixture" ? workspacePdf?.inputs
+        : workspacePdf?.pairingCode ? { code: workspacePdf.pairingCode } : undefined;
+      if (!value) { response.writeHead(204); response.end(); return; }
+      response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+      response.end(JSON.stringify(value)); return;
+    }
     if (request.method === "GET" && request.url === "/ci-probe-status") {
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({ identityRequests: requests })); return;
@@ -506,14 +569,14 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
     "-destination", `platform=iOS Simulator,id=${udid}`, "-destination-timeout", "30", "-derivedDataPath", derivedData,
     "-parallel-testing-enabled", "NO", "-maximum-concurrent-test-simulator-destinations", "1"];
   let xcresult = join(evidence, "gui.xcresult");
-  const screenshots = join(evidence, "gui-screenshots");
+  const screenshots = join(evidence, "ui-test-attachments");
   const testAndReadSummary = async (logName) => {
     testAttempt += 1;
     testStartedAt = Date.now();
     let executionError;
     try {
       await guiCommand([...common, "test-without-building", "-resultBundlePath", xcresult,
-        "-only-testing:JokoCIUITests/JokoConnectionUITests/testConnectionPageInteractions"], logName, 5 * 60_000);
+        "-only-testing:JokoCIUITests/JokoConnectionUITests/testConnectionPageInteractions"], logName, (verifyWorkspacePdf ? 8 : 5) * 60_000);
     } catch (error) { executionError = error; }
     if (abort.signal.aborted) throw executionError ?? abort.signal.reason;
     const summary = await readUiTestSummary(() => {
@@ -523,6 +586,11 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
     return { summary, executionError };
   };
   try {
+    if (verifyWorkspacePdf) {
+      stage = "owned workspace PDF task preparation";
+      workspacePdf = startWorkspacePdfFixture();
+      await workspacePdf.ready();
+    }
     stage = "Apple UI-test target preparation";
     await command("ruby", [join(root, "scripts/ci/ios-prepare-ui-tests.rb"), project,
       join(root, "scripts/ci/ios-connection-ui-tests.swift"), String(port), String(probePort), minimumOsVersion, sdkRuntime]);
@@ -542,20 +610,44 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
     save("gui-summary.json", summary);
     await command("xcrun", ["xcresulttool", "export", "attachments", "--path", xcresult, "--output-path", screenshots], { timeout: 60_000 });
     const files = readdirSync(screenshots, { recursive: true });
-    screenshotCount = files.filter(name => name.endsWith(".png")).length;
-    const manifests = files.filter(name => name.endsWith(".json")).map(name => readFileSync(join(screenshots, name), "utf8")).join("\n");
-    const steps = names.map(name => ({ name, screenshotExported: manifests.includes(name) }));
+    const attachments = files.filter(name => name.endsWith(".json")).flatMap((name) => {
+      const manifest = JSON.parse(readFileSync(join(screenshots, name), "utf8"));
+      return Array.isArray(manifest) ? manifest : [];
+    }).filter((entry) => entry.testIdentifier === "JokoConnectionUITests/testConnectionPageInteractions()")
+      .flatMap((entry) => entry.attachments ?? []).filter((attachment) => attachment.deviceId === udid);
+    const selectedScreenshots = join(evidence, "gui-screenshots");
+    mkdirSync(selectedScreenshots, { recursive: true });
+    const steps = names.map((name) => {
+      const matches = attachments.filter((attachment) => new RegExp(`^${name}(?:_[0-9]+_[A-Fa-f0-9-]{36})?(?:\\.png)?$`, "u")
+        .test(attachment.suggestedHumanReadableName ?? "")
+        && /^[a-f0-9-]{36}\.png$/iu.test(attachment.exportedFileName ?? ""));
+      if (matches.length !== 1) return { name, screenshotExported: false };
+      const path = join(screenshots, matches[0].exportedFileName);
+      if (!lstatSync(path).isFile()) return { name, screenshotExported: false };
+      const bytes = readFileSync(path);
+      if (!bytes.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))) return { name, screenshotExported: false };
+      writeFileSync(join(selectedScreenshots, `${name}.png`), bytes);
+      return { name, screenshotExported: true, sha256: createHash("sha256").update(bytes).digest("hex") };
+    });
+    screenshotCount = steps.filter(step => step.screenshotExported).length;
+    const pdfTask = workspacePdf === undefined ? undefined : {
+      pdfSha256: workspacePdf.inputs?.pdfSha256, pairingRequests: workspacePdf.pairingRequests,
+      pairedIosDevice: workspacePdf.paired,
+      passed: workspacePdf.paired && workspacePdf.pairingRequests === 1 && steps.slice(-3).every(step => step.screenshotExported)
+    };
     save("gui-steps.json", { sourceCommit: expectedSha, executableSha256: expectedHash, simulatorUdid: udid, bundleId, sdkRuntime,
-      steps, screenshotCount, localIdentityRequests: requests, unexpectedRequests,
+      steps, screenshotCount, localIdentityRequests: requests, unexpectedRequests, pdfTask,
       testExitSucceeded: !executionError, passed: !executionError && summary.result === "Passed" && summary.passedTests === 1
-        && summary.failedTests === 0 && summary.skippedTests === 0 && steps.every(step => step.screenshotExported) });
+        && summary.failedTests === 0 && summary.skippedTests === 0 && steps.every(step => step.screenshotExported)
+        && (!verifyWorkspacePdf || pdfTask?.passed === true) });
     if (executionError || summary.result !== "Passed") {
       try { await exportPreInputSetupFailure(screenshots, files, { expectedSha, expectedHash, requests, unexpectedRequests, steps }); }
       catch { save("gui-pre-input-export-receipt.json", { result: "failed", onlyAllowlistedPreInputAttachmentsExported: true }); }
     }
     if (executionError) throw executionError;
     if (summary.result !== "Passed" || summary.passedTests !== 1 || summary.failedTests !== 0 || summary.skippedTests !== 0
-      || !steps.every(step => step.screenshotExported) || requests !== 2 || unexpectedRequests !== 0) {
+      || !steps.every(step => step.screenshotExported) || requests !== 2 || unexpectedRequests !== 0
+      || (verifyWorkspacePdf && pdfTask?.passed !== true)) {
       throw new Error("The actual UI test or its complete screenshot/transport receipts did not pass; see gui-summary.json and gui-steps.json.");
     }
     // XCTest activates the already observed reopened occurrence. A replacement
@@ -563,12 +655,14 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
     stage = "UI-tested application process identity lookup";
     const pid = await assertIdentity("post-ui-test");
     return { passed: true, test: "JokoConnectionUITests/testConnectionPageInteractions", sourceCommit: expectedSha, sdkRuntime,
-      executableSha256: expectedHash, simulatorUdid: udid, bundleId, pid, screenshotCount,
-      scope: "Real connection-page mode availability, address typing/validation, local transport error, explicit cancellation, retained draft and theme changes; selected CONNECT invitation configuration only, no CONNECT pairing or task execution." };
+      executableSha256: expectedHash, simulatorUdid: udid, bundleId, pid, screenshotCount, pdfTask,
+      scope: pdfTask ? "Connection-page checks and native copy/paste from a paired task's original workspace PDF."
+        : "Connection-page modes, address typing and validation, the local error and cancellation, retained draft, theme changes and selected CONNECT invitation configuration." };
   } finally {
     save("gui-local-probe.json", { loopbackOnly: true, localIdentityRequests: requests, unexpectedRequests, progress });
     probe.closeAllConnections();
     await new Promise(accept => probe.close(accept));
+    await workspacePdf?.close();
   }
 }
 async function capturePostUiFrame(ocr, identity, expectedPid) {
@@ -786,13 +880,14 @@ async function main() {
     assertNoNotificationStartupError(readFileSync(join(evidence, "metro.log"), "utf8"));
     result = { passed: true, sourceCommit: await command("git", ["rev-parse", "HEAD"]), bundleId, simulatorUdid: udid,
       observations: [first, reopened], firstProcessTerminated: true, gui, postGuiFrame,
-      scope: "Actual iOS Simulator startup/reopen plus Apple XCTest connection-page taps, typing, local error/cancel, draft retention and theme changes on the same application bytes.",
-      limits: ["Connection-page interactions use an owned loopback failure endpoint; no paired node, task execution, physical device, signed IPA or APNs were tested.",
+      scope: gui.pdfTask ? "Actual iOS Simulator startup/reopen, connection-page checks and paired workspace PDF selection and clipboard paste on the same application bytes."
+        : "Actual iOS Simulator startup/reopen plus XCTest connection-page taps, typing, local error and cancellation, draft retention and theme changes on the same application bytes.",
+      limits: ["Connection-page failure and pairing fixtures use owned loopback servers. Physical devices, signed IPAs and APNs are outside this check.",
         "Simulator does not exercise the physical device's first local network privacy permission."] };
   } catch (error) {
     if (evidence) {
       await recordHostResources("failed-operation").catch(() => undefined);
-      if (udid) await command("xcrun", ["simctl", "io", udid, "screenshot", "--type=png", join(evidence, "failure.png")], { cleanup: true }).catch(() => undefined);
+      if (udid && !pdfPairingFormActive) await command("xcrun", ["simctl", "io", udid, "screenshot", "--type=png", join(evidence, "failure.png")], { cleanup: true }).catch(() => undefined);
       save("failure.json", { stage, message: error.message, simulatorUdid: udid, bundleId,
         scope: startupDiagnosticsOnly ? "simulator-startup-command-probe" : "joko-app-runtime-and-gui", noGuiSuccessClaimed: true });
       const diagnostics = await collectRuntimeFailureDiagnostics({ bundleId, executable, installedExecutable,
@@ -807,6 +902,7 @@ async function main() {
       save("result.json", result);
       process.stdout.write(startupDiagnosticsOnly ? "Owned Simulator startup commands and framebuffer capture passed; no application GUI was tested.\n"
         : "Actual Joko Simulator startup, reopen and connection-page UI operations passed.\n");
+      if (result.gui?.pdfTask?.passed) process.stdout.write("An actual paired task copied Quartz from its original workspace PDF and pasted Quartz into the same task.\n");
     }
     else if (result) throw new Error("Simulator observations passed but owned cleanup failed; see cleanup.json.");
   }

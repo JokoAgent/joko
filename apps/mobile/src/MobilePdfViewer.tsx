@@ -244,6 +244,7 @@ export function MobilePdfViewer({
       sharedCookiesEnabled={false}
       source={source}
       style={{ backgroundColor: "transparent", flex: 1 }}
+      textInteractionEnabled
       thirdPartyCookiesEnabled={false}
     /> : <View accessible accessibilityRole="text" accessibilityLabel={releasedLabel}
       accessibilityState={{ busy: resource.phase === "recovering", disabled: resource.phase !== "recovering" }}

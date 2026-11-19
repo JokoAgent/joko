@@ -195,8 +195,35 @@ export function buildMobilePdfViewerHtml({
     button:focus-visible { outline: 3px solid ${cssColor(accent)}; outline-offset: 1px; }
     #pages { align-items: center; display: flex; flex: 1 1 auto; flex-direction: column; gap: 16px; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 16px; }
     .page { align-items: center; background: ${cssColor(surface)}; border: 1px solid ${cssColor(border)}; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.12); display: flex; flex: 0 0 auto; justify-content: center; min-height: 320px; overflow: hidden; position: relative; width: min(100%, 760px); }
-    .page-label { color: ${cssColor(muted)}; font-size: 13px; left: 12px; position: absolute; top: 10px; z-index: 1; }
+    .page-label { color: ${cssColor(muted)}; font-size: 13px; left: 12px; pointer-events: none; position: absolute; top: 10px; z-index: 1; }
     .page-content { max-width: 100%; position: relative; }
+    .page-selection { inset: 0; position: absolute; transform-origin: top left; }
+    .page-text {
+      --scale-round-x: 1px;
+      --scale-round-y: 1px;
+      --min-font-size: 1;
+      line-height: 1;
+      position: absolute;
+      text-align: initial;
+      transform-origin: top left;
+      -webkit-text-size-adjust: none;
+      text-size-adjust: none;
+      -webkit-user-select: text;
+      user-select: text;
+    }
+    .page-text[data-main-rotation="90"] { transform: rotate(90deg) translateY(-100%); }
+    .page-text[data-main-rotation="180"] { transform: rotate(180deg) translate(-100%, -100%); }
+    .page-text[data-main-rotation="270"] { transform: rotate(270deg) translateX(-100%); }
+    .page-text > span, .page-text > br {
+      color: transparent;
+      cursor: text;
+      font-size: calc(var(--total-scale-factor) * var(--min-font-size) * var(--font-height, 0px));
+      position: absolute;
+      transform: rotate(var(--rotate, 0deg)) scaleX(var(--scale-x, 1)) scale(calc(1 / var(--min-font-size)));
+      transform-origin: top left;
+      white-space: pre;
+    }
+    .page-text ::selection { background: rgba(54, 112, 219, 0.32); color: transparent; }
     button.page-link { background: transparent; border: 0; border-radius: 0; min-height: 0; min-width: 0; padding: 0; position: absolute; z-index: 2; }
     canvas { display: block; max-width: 100%; }
     .page-error { color: #b42318; max-width: 80%; text-align: center; }
@@ -227,11 +254,19 @@ export function buildMobilePdfViewerHtml({
       var disposed = false;
       var loadingTask = null;
       var pdfDocument = null;
+      var textSelectionAllowed = false;
       var observer = null;
       var renderGeneration = 0;
       var linkRequest = 0;
       var renderTasks = new Map();
       var rendered = new Map();
+      var textLayers = new WeakMap();
+      var textLayerResizer = typeof ResizeObserver === 'function' ? new ResizeObserver(function (entries) {
+        entries.forEach(function (entry) {
+          var selection = textLayers.get(entry.target);
+          if (selection) sizeTextSelection(selection, entry.contentRect);
+        });
+      }) : null;
       var resident = [];
       var seen = new Set();
       var pageCount = 0;
@@ -393,6 +428,12 @@ export function buildMobilePdfViewerHtml({
       }
       function removePageContent(content) {
         if (!content) return;
+        var selection = textLayers.get(content);
+        if (selection) {
+          textLayers.delete(content);
+          if (textLayerResizer) textLayerResizer.unobserve(content);
+          if (!selection.ready) selection.layer.cancel();
+        }
         var canvas = content.querySelector('canvas');
         if (canvas) { canvas.width = 1; canvas.height = 1; }
         content.remove();
@@ -443,6 +484,7 @@ export function buildMobilePdfViewerHtml({
           var drawing = { canvas: canvas, viewport: viewport, view: page.view };
           rendered.set(pageNumber, drawing); seen.add(pageNumber); touchResident(pageNumber);
           emit(seen.size === pageCount ? 'complete' : 'rendering', null);
+          if (textSelectionAllowed) void renderPageText(page, content, viewport).catch(function () {});
           void renderPageLinks(page, content, viewport, generation).catch(function () {});
           return drawing;
         } catch (error) {
@@ -451,6 +493,32 @@ export function buildMobilePdfViewerHtml({
           var message = document.createElement('p'); message.className = 'page-error'; message.setAttribute('role','alert');
           message.textContent = text(labels.pageError, { page: pageNumber }); section.appendChild(message);
           emit('error', error);
+        }
+      }
+      function sizeTextSelection(selection, rect) {
+        if (rect.width <= 0 || rect.height <= 0) return;
+        selection.overlay.style.transform = 'scale(' + (rect.width / selection.viewport.width)
+          + ', ' + (rect.height / selection.viewport.height) + ')';
+      }
+      async function renderPageText(page, content, viewport) {
+        if (!content.isConnected) return;
+        var overlay = document.createElement('div'); overlay.className = 'page-selection';
+        var text = document.createElement('div'); text.className = 'page-text';
+        text.style.setProperty('--total-scale-factor', String(viewport.scale * viewport.userUnit));
+        overlay.appendChild(text);
+        var layer = new window.pdfjsLib.TextLayer({ container: text, viewport: viewport,
+          textContentSource: page.streamTextContent() });
+        var selection = { layer: layer, overlay: overlay, viewport: viewport, ready: false };
+        textLayers.set(content, selection);
+        try {
+          await layer.render();
+          if (!content.isConnected || layer.textDivs.length === 0) return;
+          selection.ready = true;
+          content.appendChild(overlay);
+          sizeTextSelection(selection, content.getBoundingClientRect());
+          if (textLayerResizer) textLayerResizer.observe(content);
+        } finally {
+          if (!selection.ready) textLayers.delete(content);
         }
       }
       async function renderPageLinks(page, content, viewport, generation) {
@@ -520,8 +588,14 @@ export function buildMobilePdfViewerHtml({
           useWorkerFetch: false, useSystemFonts: false, useWasm: false, isOffscreenCanvasSupported: false,
           isImageDecoderSupported: false, enableHWA: false, canvasMaxAreaInBytes: 33554432 });
         pdfDocument = await loadingTask.promise;
+        if (disposed) return;
         pageCount = pdfDocument.numPages;
         if (!Number.isSafeInteger(pageCount) || pageCount < 1 || pageCount > MAX_PAGES) throw new Error('The PDF page count exceeds the mobile preview budget.');
+        try {
+          var permissions = await pdfDocument.getPermissions();
+          textSelectionAllowed = permissions === null || permissions.includes(window.pdfjsLib.PermissionFlag.COPY);
+        } catch (_) {}
+        if (disposed) return;
         var fragment = document.createDocumentFragment();
         for (var pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
           var section = document.createElement('section'); section.className = 'page'; section.id = 'page-' + String(pageNumber);
@@ -549,6 +623,7 @@ export function buildMobilePdfViewerHtml({
       async function dispose() {
         if (disposed) return; disposed = true; bytes = null; resourceCache = Object.create(null);
         if (observer) observer.disconnect(); observer = null; renderTasks.forEach(function (task) { task.cancel(); }); renderTasks.clear();
+        if (textLayerResizer) textLayerResizer.disconnect();
         document.querySelectorAll('.page-content').forEach(removePageContent);
         rendered.clear();
         try { if (loadingTask) await loadingTask.destroy(); else if (pdfDocument) await pdfDocument.destroy(); } catch (_) {}

@@ -484,9 +484,9 @@ jobs:
     runs-on: macos-15-intel
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
-    # Cold Linkspan preparation can take 20 minutes before the bounded GUI
-    # step starts. Reserve time for that preparation and the evidence upload.
-    timeout-minutes: 65
+    # Cold Linkspan preparation and the paired task fixture build run before
+    # the bounded native observations and their evidence upload.
+    timeout-minutes: 75
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -537,6 +537,10 @@ jobs:
           JOKO_LINKSPAN_BUILD_BACKENDS: ${{ inputs.sdk_runtime == 'http-connect-native' && 'http-connect-native' || inputs.sdk_runtime == 'iroh-native' && 'iroh-native,webrtc' || 'iroh-relay,tailcat-relay,webrtc' }}
         run: pnpm --filter @joko/mobile prepare:workspace-inputs
 
+      - name: Build the paired workspace PDF fixture dependencies
+        if: ${{ (inputs.sdk_runtime || 'relay') == 'relay' }}
+        run: pnpm --filter @joko/e2e... -r --if-present build
+
       - name: Download this run's compiled Simulator app
         uses: actions/download-artifact@v4
         with:
@@ -548,14 +552,15 @@ jobs:
           mkdir -p "$RUNNER_TEMP/joko-ios-simulator-app"
           tar -xzf "$RUNNER_TEMP/joko-ios-artifact/joko-ios-simulator-debug.tar.gz" -C "$RUNNER_TEMP/joko-ios-simulator-app"
 
-      - name: Observe the actual iOS app startup, termination and reopen
-        timeout-minutes: 33
+      - name: Observe actual iOS startup, native GUI, and paired PDF copy
+        timeout-minutes: 39
         run: node scripts/ci/mobile-ios-simulator-runtime.mjs
         env:
           JOKO_IOS_SDK_RUNTIME: ${{ inputs.sdk_runtime || 'relay' }}
           JOKO_LINKSPAN_BUILD_BACKENDS: ${{ inputs.sdk_runtime == 'http-connect-native' && 'http-connect-native' || inputs.sdk_runtime == 'iroh-native' && 'iroh-native,webrtc' || 'iroh-relay,tailcat-relay,webrtc' }}
           JOKO_IOS_SIMULATOR_APP_PATH: ${{ runner.temp }}/joko-ios-simulator-app/Joko.app
           JOKO_IOS_RUNTIME_EVIDENCE_DIR: ${{ runner.temp }}/joko-ios-runtime-evidence
+          JOKO_IOS_WORKSPACE_PDF: ${{ (inputs.sdk_runtime || 'relay') == 'relay' && '1' || '0' }}
 
       - name: Upload bounded iOS Simulator startup evidence
         if: ${{ always() }}
@@ -595,4 +600,8 @@ jobs:
           retention-days: 3
 
       - name: Record iOS GUI scope
-        run: printf '%s\n' 'Simulator app startup/terminate/reopen and XCUITest connection-page tap/type/error/cancel/theme operations passed with exact app identity, XCTest receipts and named screenshots. No paired task execution, signed IPA, physical device, APNs or account integration was verified.' >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          printf '%s\n' 'The Simulator app passed startup, termination, reopen and the connection-page checks.' >> "$GITHUB_STEP_SUMMARY"
+          if [ '${{ inputs.sdk_runtime || 'relay' }}' = relay ]; then
+            printf '%s\n' 'The paired workspace task opened the original PDF and pasted the word copied from its native text menu.' >> "$GITHUB_STEP_SUMMARY"
+          fi

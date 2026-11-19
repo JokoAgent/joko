@@ -18,12 +18,15 @@ describe("offline mobile PDF viewer runtime", () => {
     let captured: Uint8Array | undefined;
     const targetRef = { num: 5, gen: 0 };
     const getPageIndex = vi.fn(async () => 1);
+    const getPermissions = vi.fn(async () => [512]); // The PDF allows accessibility extraction and denies ordinary copying.
+    const streamTextContent = vi.fn();
     const scrollToDestination = vi.fn();
     const testWindow = window as unknown as Window & {
       ReactNativeWebView: { postMessage(value: string): void };
       pdfjsWorker: object;
-      pdfjsLib: { AnnotationType: { LINK: number }; getDocument(input: { data: Uint8Array }): {
+      pdfjsLib: { AnnotationType: { LINK: number }; PermissionFlag: { COPY: number }; getDocument(input: { data: Uint8Array }): {
         promise: Promise<{ numPages: number; getPage(pageNumber: number): Promise<unknown>;
+          getPermissions(): Promise<number[]>;
           getPageIndex(ref: typeof targetRef): Promise<number>; destroy(): Promise<void> }>;
         destroy(): Promise<void>;
       } };
@@ -32,15 +35,18 @@ describe("offline mobile PDF viewer runtime", () => {
     testWindow.pdfjsWorker = {};
     testWindow.pdfjsLib = {
       AnnotationType: { LINK: 2 },
+      PermissionFlag: { COPY: 16 },
       getDocument(input) {
         captured = Uint8Array.from(input.data);
         return {
           promise: Promise.resolve({
             numPages: 2,
             getPageIndex,
+            getPermissions,
             async getPage(pageNumber) {
               return {
                 view: [0, 0, 100, 120],
+                streamTextContent,
                 getViewport({ scale }: { scale: number }) {
                   const point = (x: number, y: number) => [x * scale, (120 - y) * scale];
                   return { width: 100 * scale, height: 120 * scale, convertToViewportPoint: point,
@@ -121,6 +127,9 @@ describe("offline mobile PDF viewer runtime", () => {
     expect(posted.some((message) => message["state"] === "error")).toBe(false);
     expect(document.querySelectorAll(".page")).toHaveLength(2);
     expect(document.querySelectorAll("canvas")).toHaveLength(2);
+    expect(getPermissions).toHaveBeenCalledOnce();
+    expect(streamTextContent).not.toHaveBeenCalled();
+    expect(document.querySelector(".page-text")).toBeNull();
 
     dispatch(buildMobilePdfViewerCommand("runtime-1", { command: "dispose" }));
     await vi.waitFor(() => expect(document.querySelectorAll(".page")).toHaveLength(0));

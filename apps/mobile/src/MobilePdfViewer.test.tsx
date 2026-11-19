@@ -28,6 +28,7 @@ const bridge = vi.hoisted(() => ({
     allowFileAccess: boolean;
     allowFileAccessFromFileURLs: boolean;
     allowUniversalAccessFromFileURLs: boolean;
+    textInteractionEnabled: boolean;
     onContentProcessDidTerminate: () => void;
     onMessage: (event: { nativeEvent: { data: string } }) => void;
     onRenderProcessGone: () => boolean;
@@ -112,7 +113,7 @@ describe("MobilePdfViewer", () => {
     })));
 
     expect(bridge.mounts).toBe(1);
-    expect(bridge.props).toMatchObject({ allowFileAccess: false, allowFileAccessFromFileURLs: false,
+    expect(bridge.props).toMatchObject({ allowFileAccess: false, allowFileAccessFromFileURLs: false, textInteractionEnabled: true,
       allowUniversalAccessFromFileURLs: false });
     expect(bridge.props?.source.html).not.toContain("file:///cache");
     await message({ type: "joko-pdf-viewer/status", instanceId: "pdf-1", state: "ready",
