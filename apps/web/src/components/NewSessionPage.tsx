@@ -26,6 +26,7 @@ import { ensureNewSessionModelProject } from "../new-session-model-project.js";
 import { contactsDraftOwnerMatches, type ContactsDraftOwner } from "../contacts-draft.js";
 import { resolveNewSessionModelRequest } from "../new-session-provider-model.js";
 import {
+  composerDirectoryReferencesAllowed,
   composerDocumentIsEmpty,
   composerDocumentPlainText,
   emptyComposerDocument,
@@ -1493,7 +1494,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
 
   const draftMedia = [...attachments, ...browserComments.map((item) => item.screenshot)];
   const attachmentsAllowed = draftAttachmentsAllowed(draftMedia, attachmentPolicy);
-  const mentionsAllowed = newTaskMentionsAllowed(
+  const mentionsAllowed = composerDirectoryReferencesAllowed(editorDocument, mentionPolicy.directories, usableWorkspace?.id) && newTaskMentionsAllowed(
     composerMentionsFromRanges(mentions, inlineMentionRanges),
     mentionPolicy,
     usableWorkspace?.id
@@ -2021,7 +2022,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   });
 
   const updateInternalDrop = (dataTransfer: DataTransfer, clientX: number, clientY: number): boolean => {
-    const state = classifyComposerInternalDrop(dataTransfer, usableWorkspace?.id);
+    const state = classifyComposerInternalDrop(dataTransfer, usableWorkspace?.id, mentionPolicy.directories);
     if (state.kind === "none") {
       richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
       return false;
@@ -2037,7 +2038,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   };
 
   const consumeInternalDrop = (dataTransfer: DataTransfer, clientX: number, clientY: number): boolean => {
-    const state = classifyComposerInternalDrop(dataTransfer, usableWorkspace?.id);
+    const state = classifyComposerInternalDrop(dataTransfer, usableWorkspace?.id, mentionPolicy.directories);
     if (state.kind === "none") {
       richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
       return false;
@@ -2120,6 +2121,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       && (options.allowEmpty === true || !composerDocumentIsEmpty(sourceEditorDocument) || sourceAttachments.length > 0 || sourceBrowserComments.length > 0)
       && attachmentsAllowed
       && newTaskMentionsAllowed(sourceMentions, mentionPolicy, usableWorkspace?.id)
+      && composerDirectoryReferencesAllowed(sourceEditorDocument, mentionPolicy.directories, usableWorkspace?.id)
       && worktreeDecisionReady
       && !(worktreePreferenceRelevant && worktreePreferenceSavingRef.current)
       && fullAccessConfirmationRef.current === undefined
@@ -2242,6 +2244,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         && voiceRoot?.isConnected === true && voiceRoot.ownerDocument === ownerDocument && !ownerWindow.closed
         && editorDocumentRef.current === sourceDraft && attachmentsRef.current === sourceAttachments && browserCommentsRef.current === sourceBrowserComments
         && newTaskMentionsAllowed(sourceMentions, mentionPolicyRef.current, workspaceIdRef.current)
+        && composerDirectoryReferencesAllowed(sourceEditorDocument, mentionPolicyRef.current.directories, workspaceIdRef.current)
     };
     submissionOriginRef.current = owner;
     submittingRef.current = true;

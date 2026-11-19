@@ -388,6 +388,33 @@ describe("native message Markdown", () => {
     expect(container.textContent).toBe("");
   });
 
+  it("keeps an explicit Workspace link clickable after the initial probe returns no reference", async () => {
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    let owner: string | undefined = "workspace-owner";
+    const releaseMarkdownResources = vi.fn();
+    const client: MobileMarkdownResourceClient = {
+      prepareMarkdownResources: vi.fn(async () => ({ leaseId: "empty-lease", references: new Map() })),
+      assertMarkdownResourcesCurrent: vi.fn(), releaseMarkdownResources,
+      markdownResourceOwnerKey: () => owner, subscribe: () => () => {}
+    };
+    const onRetryPath = vi.fn();
+    const text = "[指南](./docs/guide.md:7) `./docs/example.md`";
+    await act(async () => root.render(<MobileMarkdownMessage text={text} ownerKey="task/message" locale="zh-CN"
+      colors={{ background: "#fff", surface: "#fff", ink: "#222", muted: "#555", border: "#ccc", accent: "#96f", negative: "#c21" }}
+      resourceClient={client} resourceOwnerKey="workspace-owner" messageId="completed-1" onRetryPath={onRetryPath} />));
+
+    expect(releaseMarkdownResources).toHaveBeenCalledWith("empty-lease");
+    const links = container.querySelectorAll<HTMLElement>('[role="link"]');
+    expect(Array.from(links, link => link.textContent)).toEqual(["指南"]);
+    await act(async () => links[0]!.click());
+    expect(onRetryPath).toHaveBeenCalledWith("completed-1", text, JSON.stringify(["link", "./docs/guide.md:7"]));
+    owner = undefined;
+    await act(async () => links[0]!.click());
+    expect(onRetryPath).toHaveBeenCalledTimes(1);
+    await act(async () => root.unmount());
+  });
+
   it("mounts formatted text, keeps its prefix on append and copies the exact code source", async () => {
     const container = document.createElement("div");
     const root = createRoot(container);

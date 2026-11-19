@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -3948,7 +3948,7 @@ describe("Connect security and protocol audit", () => {
   });
 
   it("moves only a managed Target workspace into recoverable trash before tombstoning it", async () => {
-    const dataDirectory = mkdtempSync(join(tmpdir(), "joko-target-delete-audit-"));
+    const dataDirectory = realpathSync(mkdtempSync(join(tmpdir(), "joko-target-delete-audit-")));
     cleanups.push(() => rmSync(dataDirectory, { recursive: true, force: true }));
     const managedRoot = join(dataDirectory, "managed-workspaces");
     const workspaceRoot = join(managedRoot, "target-managed");
@@ -3966,14 +3966,21 @@ describe("Connect security and protocol audit", () => {
       revision: 1n,
       updatedAt: 1
     };
-    const upsertTarget = vi.fn();
+    let current: Omit<typeof existing, "metadata"> & { readonly metadata: unknown } = existing;
+    const upsertTarget = vi.fn((descriptor: typeof existing.descriptor, metadata: unknown) => {
+      current = { ...current, descriptor, metadata, revision: current.revision + 1n };
+      return current;
+    });
     const unregister = vi.fn();
-    const store = {
+    const storage = {
       findOperation: () => undefined,
-      getTarget: () => existing,
+      getTarget: () => current,
+      listTargets: () => [current],
       listSessions: () => [],
+      authorizeConnection: vi.fn(),
       upsertTarget
     };
+    const store = { ...storage, transaction: (callback: (value: typeof storage) => unknown) => callback(storage) };
     const mutation = create(contract.OperationMutationSchema, {
       preconditions: [],
       payload: { case: "deleteTarget", value: create(contract.DeleteTargetMutationSchema, {
@@ -4026,6 +4033,9 @@ describe("Connect security and protocol audit", () => {
     expect(readdirSync(join(managedRoot, ".trash"))).toHaveLength(1);
     expect(mutate).toHaveBeenCalledWith(expect.objectContaining({
       targetSessionCreationFenceId: existing.descriptor.id
+    }));
+    expect(upsertTarget).toHaveBeenCalledWith(existing.descriptor, expect.objectContaining({
+      state: "deleting", pendingManagedWorkspaceTrash: expect.objectContaining({ operationId: record.id, format: 1 })
     }));
     expect(upsertTarget).toHaveBeenCalledWith(existing.descriptor, expect.objectContaining({
       state: "archived",

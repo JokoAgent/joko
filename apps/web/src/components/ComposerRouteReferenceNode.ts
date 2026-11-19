@@ -13,6 +13,7 @@ export interface ComposerRouteReferenceAttrs {
   readonly semanticTextTruncated?: boolean;
   readonly sourceMessageId?: string;
   readonly sourceEventId?: string;
+  readonly directoryWorkspaceId?: string;
 }
 
 export const ComposerRouteReferenceNode = Node.create({
@@ -60,7 +61,8 @@ export const ComposerRouteReferenceNode = Node.create({
         renderHTML: (attrs: Record<string, unknown>) => attrs["semanticTextTruncated"] === true ? { "data-semantic-text-truncated": "true" } : {}
       },
       sourceMessageId: { default: null, rendered: false, parseHTML: () => null },
-      sourceEventId: { default: null, rendered: false, parseHTML: () => null }
+      sourceEventId: { default: null, rendered: false, parseHTML: () => null },
+      directoryWorkspaceId: { default: null, rendered: false, parseHTML: () => null }
     };
   },
   parseHTML: () => [{ tag: "span[data-composer-mention]" }],

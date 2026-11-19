@@ -14955,9 +14955,16 @@ describe("native current-task Files ownership", () => {
     expect(prepared.references.get(imageKey)?.image).toMatchObject({ width, height });
     expect(prepared.references.get(imageKey)?.image?.nativeQuarterTurn).toBe(portrait ? true : undefined);
     expect(network.downloadBlob).toHaveBeenCalledWith(credential, imageBlob, expect.any(AbortSignal));
-    expect(await app.openMarkdownPath(prepared.leaseId, fileKey, new AbortController().signal)).toMatchObject({ kind: "workspace-entry", entry: readme });
+    const source = await app.openMarkdownPath(prepared.leaseId, fileKey, new AbortController().signal);
+    expect(source).toMatchObject({ kind: "workspace-entry", entry: readme });
     expect(app.state.files.preview).toMatchObject({ kind: "text", text: "#A\n#B\n", focusLine: 2, focusColumn: 1 });
     const filePreview = app.state.files.preview;
+    if (!source) throw new Error("The original Workspace file source is missing.");
+    vi.mocked(network.listWorkspaceDirectory).mockRejectedValueOnce(new ConnectError("The directory could not be listed", Code.Unknown));
+    await app.openFilesPreviewPager(source);
+    expect(app.state.files.preview).toBe(filePreview);
+    expect(app.state.files.previewPager).toBeUndefined();
+    expect(network.readWorkspaceFile).toHaveBeenLastCalledWith(credential, "workspace", "README.md", readme.revision, expect.any(AbortSignal));
     vi.mocked(network.readOwner).mockResolvedValue({ connection, device,
       snapshot: create(SnapshotSchema, { ...projected, snapshotId: "owner-resource-reread",
         revision: { ...projected.revision!, etag: "blob-materialized-10", value: 10n } }) });
@@ -15020,6 +15027,43 @@ describe("native current-task Files ownership", () => {
     vi.mocked(network.readSession).mockResolvedValue(create(SnapshotSchema, { ...projected, interactions: [] }));
     await expect(app.openQuestionReference(question.interactionId, "README.md:1", new AbortController().signal)).rejects.toThrow(/question changed/u);
     expect(network.readWorkspaceFile).not.toHaveBeenCalled(); expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("opens the same explicit Markdown path at line seven after one directory read fails", async () => {
+    const text = "[指南](./docs/guide.md:7)";
+    const key = JSON.stringify(["link", "./docs/guide.md:7"]);
+    const event = create(EventSchema, { eventId: messageEvent.eventId, identity: messageEvent.identity, cursor: messageEvent.cursor,
+      payload: { kind: { case: "messageCompleted", value: { messageId: "markdown-completed", role: MessageRole.ASSISTANT,
+        blocks: [{ content: { case: "text", value: text } }] } } } });
+    const network = fakeNetwork();
+    configureFiles(network, create(SnapshotSchema, { ...filesSnapshot, timeline: [event], resumeCursor: event.cursor,
+      workspaces: [create(WorkspaceDescriptorSchema, { ...filesSnapshot.workspaces[0]!, serverPathDisplay: "D:\\repo" })] }));
+    const content = "1\n2\n3\n4\n5\n6\n7\n";
+    const guide = create(WorkspaceEntrySchema, { ...readme, relativePath: "docs/guide.md", displayName: "guide.md",
+      revision: { ...revision, byteSize: BigInt(content.length) } });
+    const list = vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspace, path) => ({
+      entries: path === "docs" ? [guide] : [], revision: `directory:${path}`
+    }));
+    vi.mocked(network.readAround).mockResolvedValue([event]);
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, { entry: guide,
+      content: { case: "text", value: { utf8Text: content, startByte: 0n, endByte: BigInt(content.length), totalLines: 8 } } }));
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    list.mockClear().mockRejectedValueOnce(new Error("Temporary directory read failure"));
+    const signal = new AbortController().signal;
+    const first = await app.prepareMarkdownResources("markdown-completed", text, signal);
+    expect(first.references.size).toBe(0);
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(app.state.files.open).toBe(false);
+
+    await expect(app.openUnresolvedMarkdownPath("markdown-completed", text, JSON.stringify(["link", "./docs/other.md:7"]), signal))
+      .rejects.toThrow(/path is unavailable/u);
+    expect(list).toHaveBeenCalledTimes(1);
+    await expect(app.openUnresolvedMarkdownPath("markdown-completed", text, key, signal))
+      .resolves.toMatchObject({ kind: "workspace-entry", entry: guide });
+    expect(list).toHaveBeenLastCalledWith(credential, "workspace", "docs", expect.any(AbortSignal));
+    expect(network.readWorkspaceFile).toHaveBeenCalledWith(credential, "workspace", guide.relativePath, guide.revision, expect.any(AbortSignal));
+    expect(app.state.files.preview).toMatchObject({ kind: "text", text: content, focusLine: 7 });
+    app.dispose();
   });
 
   it("rejects spoofed Markdown text and server-deleted messages before any path opens", async () => {

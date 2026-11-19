@@ -1035,6 +1035,7 @@ export function App() {
     setMenuOpen(false);
   };
   const handleComposerFocused = useCallback(() => setFocusTaskComposer(false), []);
+  const returnFromFiles = (): void => { setPage(client.state.selectedId ? "task" : "home"); };
   const focusHomeSearchMatch = (match?: MobileHomeSearchMatch, restoreReading = false): void => {
     const current = client.state;
     const focus = match !== undefined && AppState.currentState === "active"
@@ -1053,6 +1054,7 @@ export function App() {
         }
         if (page === "partner-identities" || page === "partner-network") { setPage("partner-directory"); return true; }
         if (page === "device") { setPage("devices"); return true; }
+        if (page === "files") { returnFromFiles(); return true; }
         if (["settings", "connections", "devices", "automations", "extensions", "partner-resources"].includes(page)) {
           setPage("home"); return true;
         }
@@ -1143,7 +1145,7 @@ export function App() {
                   messageFocus={nativeIntentMessageFocus?.homeSourceKey === undefined || nativeIntentMessageFocus.homeSourceKey === homeSourceKey
                     ? nativeIntentMessageFocus : undefined} /> :
                 page === "remote-desktop" && remoteDesktopEntry ? <View style={styles.fill} /> :
-                page === "files" ? <FilesScreen {...common} initialSource={filesInitialSource} onBack={() => setPage("task")}
+                page === "files" ? <FilesScreen {...common} initialSource={filesInitialSource} onBack={returnFromFiles}
                   onAdded={() => {
                     setFocusTaskComposer(true);
                     setPage("task");
@@ -5710,13 +5712,13 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   };
   const markdownPathAbortRef = useRef<AbortController | undefined>(undefined);
   useEffect(() => () => { markdownPathAbortRef.current?.abort(); }, []);
-  const openMarkdownPath = (leaseId: string, key: string): void => {
+  const openMessageMarkdownPath = (open: (signal: AbortSignal) => Promise<MobileFilesComposerSource | undefined>): void => {
     if (markdownPathAbortRef.current || galleryOpening || imageGallery.view || state.timelinePreview
       || state.status !== "connected" || state.busy || attachmentBusy || voice.busy || fileShareBusy || conversationShare.active) return;
     const controller = new AbortController(); markdownPathAbortRef.current = controller;
     const deadline = setTimeout(() => controller.abort(), 15_000);
     setGalleryOpening(true); setLocalError(""); setComposerNotice("");
-    void client.openMarkdownPath(leaseId, key, controller.signal).then((source) => {
+    void open(controller.signal).then((source) => {
       if (taskMountedRef.current && !controller.signal.aborted) onFiles(source);
     }).catch((error) => {
       if (taskMountedRef.current) setLocalError(errorText(error));
@@ -5724,6 +5726,12 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       clearTimeout(deadline); if (markdownPathAbortRef.current === controller) markdownPathAbortRef.current = undefined;
       if (taskMountedRef.current) setGalleryOpening(false);
     });
+  };
+  const openMarkdownPath = (leaseId: string, key: string): void => {
+    openMessageMarkdownPath(signal => client.openMarkdownPath(leaseId, key, signal));
+  };
+  const retryMarkdownPath = (messageId: string, text: string, key: string): void => {
+    openMessageMarkdownPath(signal => client.openUnresolvedMarkdownPath(messageId, text, key, signal));
   };
   const questionReferenceAbortRef = useRef<AbortController | undefined>(undefined);
   useEffect(() => () => { questionReferenceAbortRef.current?.abort(); questionReferenceAbortRef.current = undefined; },
@@ -7277,7 +7285,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
             resourceText={item.text}
             resourceClient={client} messageId={item.id}
             resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
-            onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} onAnnotateDiagram={annotateDiagram} />;
+            onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} onRetryPath={retryMarkdownPath} onAnnotateDiagram={annotateDiagram} />;
         }) : item.tool ? <MobileToolCallCard key={markdownOwnerKey} call={item.tool} ownerKey={markdownOwnerKey} colors={colors} locale={locale}
           enabled={state.status === "connected" || state.status === "offline"} />
           : item.kind === "assistant" ? <MobileMarkdownMessage key={markdownOwnerKey} text={item.text} colors={colors} locale={locale}
@@ -7286,7 +7294,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           onSendRichAnswer={sendRichAnswer}
           ownerKey={markdownOwnerKey} resourceClient={client} messageId={item.id}
           resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
-          onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} onAnnotateDiagram={annotateDiagram} />
+          onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} onRetryPath={retryMarkdownPath} onAnnotateDiagram={annotateDiagram} />
           : item.kind === "user" ? <MobileUserMessageContent ownerKey={`${blockOwnerKey}/${item.id}`} text={item.text}
             quoteAction={quoteAction}
             automation={item.automationOrigin !== undefined} selectable={!item.optimistic} colors={colors} locale={locale} />

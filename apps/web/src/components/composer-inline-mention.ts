@@ -1,5 +1,6 @@
 import type { JSONContent } from "@tiptap/core";
 import { normalizeComposerDocument } from "../composer-quote-document.js";
+import { serializeComposerMentionPath, withDirectorySlash } from "../composer-mention-path.js";
 import { normalizeComposerInlineMentionRanges } from "../composer-mention-ranges.js";
 import {
   COMPOSER_PASTED_TEXT_NODE_TYPE,
@@ -25,6 +26,7 @@ export interface ComposerInlineMentionActivation {
 }
 
 export type { ComposerInlineMentionRange } from "../model.js";
+export { composerDirectoryQueryToken, serializeComposerMentionPath } from "../composer-mention-path.js";
 
 export interface ComposerMentionCatalogItem {
   readonly id: string;
@@ -76,22 +78,6 @@ export function detectComposerInlineMention(
     candidate = candidate === 0 ? -1 : text.lastIndexOf("@", candidate - 1);
   }
   return null;
-}
-
-/** Serialize one selected path without treating backslashes as escape syntax. */
-export function serializeComposerMentionPath(path: string, directory = false): string {
-  const value = directory ? withDirectorySlash(path) : path;
-  return needsMentionQuotes(value)
-    ? `@"${value.replace(/"/gu, '\\"')}"`
-    : `@${value}`;
-}
-
-/** Directory selection stays an open query so the next level can be selected. */
-export function composerDirectoryQueryToken(path: string): string {
-  const value = withDirectorySlash(path);
-  return needsMentionQuotes(value)
-    ? `@"${value.replace(/"/gu, '\\"')}`
-    : `@${value}`;
 }
 
 export function composerMentionCatalog(
@@ -595,14 +581,6 @@ function uniqueCatalog(items: readonly ComposerMentionCatalogItem[]): ComposerMe
     seen.add(key);
     return true;
   });
-}
-
-function needsMentionQuotes(path: string): boolean {
-  return /\s/u.test(path) || path.includes('"');
-}
-
-function withDirectorySlash(path: string): string {
-  return path.replace(/[\\/]+$/u, "") + "/";
 }
 
 function normalizedPath(path: string): string {

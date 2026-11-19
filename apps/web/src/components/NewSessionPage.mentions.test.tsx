@@ -122,11 +122,31 @@ describe("NewSessionPage directory mentions", () => {
       }]
     }), expect.anything());
   });
+
+  it.each(["workspace-1", "foreign-workspace"])("checks the original workspace of a restored Files drop from %s", async (workspaceId) => {
+    const token = '@"design docs/"';
+    const editorDocument = { type: "doc", content: [{ type: "paragraph", content: [{
+      type: "composerRouteReference", attrs: {
+        kind: "path", display: "design docs", serialized: token, reference: "design docs", directoryWorkspaceId: workspaceId
+      }
+    }] }] };
+    const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft) => undefined);
+    const { container } = await renderPage(onSubmit, async () => ({ paths: [], truncated: false, revision: "files" }), editorDocument);
+    expect(editorElement?.textContent).toBe(token);
+    if (workspaceId === "workspace-1") {
+      await act(async () => sendButton(container).click());
+      expect(onSubmit).toHaveBeenCalledExactlyOnceWith(expect.anything(), expect.objectContaining({ text: token, editorDocument }), expect.anything());
+    } else {
+      expect(sendButton(container).disabled).toBe(true);
+      expect(onSubmit).not.toHaveBeenCalled();
+    }
+  });
 });
 
 async function renderPage(
   onSubmit: (session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>,
-  listWorkspaceFiles: () => Promise<{ readonly paths: readonly string[]; readonly truncated: boolean; readonly revision: string }>
+  listWorkspaceFiles: () => Promise<{ readonly paths: readonly string[]; readonly truncated: boolean; readonly revision: string }>,
+  editorDocument?: JSONContent
 ): Promise<{ readonly container: HTMLDivElement }> {
   const snapshotValue = snapshot();
   const controller = {
@@ -135,7 +155,8 @@ async function renderPage(
       snapshot: snapshotValue,
       preferences: { locale: "en", composerSendShortcut: "enter", newSessionWorktreeEnabled: false }
     },
-    readNewSessionDraft: vi.fn(async () => draft()),
+    readNewSessionDraft: vi.fn(async () => editorDocument === undefined ? draft()
+      : { ...draft(), editorDocument, text: composerDocumentPlainText(editorDocument) }),
     saveNewSessionDraft: vi.fn(async () => undefined),
     prepareTargetWorkspace: vi.fn(async () => undefined),
     probeTargetWorktree: vi.fn(async (targetId: string) => ({ targetId, eligibility: "unavailable", canRefreshRemote: false })),

@@ -991,6 +991,7 @@ import type {
 } from "./model.js";
 import { messageMentionWireText } from "./message-reference.js";
 import { composerDocumentPlainText, normalizeComposerDocument, serializeComposerDocument } from "./composer-quote-document.js";
+import { workspacePathBasename } from "./components/workspace-tree-state.js";
 import { validInputMessageReferences } from "@joko/contracts";
 import { normalizeComposerInlineMentionRanges } from "./composer-mention-ranges.js";
 import { equalQueueItemTextEdit, queueItemEditProjection } from "./queue-item-edit.js";
@@ -2396,7 +2397,26 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const mentionRanges = (serialized.mentionRanges ?? []).map((range) => ({
       start: bodyStart + range.start, end: bodyStart + range.end, mentionIndex: mentionIndices.get(range.mentionId)!
     }));
-    if (mentionRanges.some((range) => !utf16Boundary(text, range.start) || !utf16Boundary(text, range.end)
+    if (serialized.directoryReferences !== undefined) {
+      const directoryIndices = new Map(typedMentions.flatMap((mention, index) =>
+        mention.kind === "workspace" && mention.directory === true && mention.lineRange === undefined
+          ? [[JSON.stringify([mention.workspaceId, mention.reference]), index] as const] : []));
+      let nextMentionIndex = typedMentions.length;
+      for (const reference of serialized.directoryReferences) {
+        const identity = JSON.stringify([reference.workspaceId, reference.path]);
+        let mentionIndex = directoryIndices.get(identity);
+        if (mentionIndex === undefined) {
+          mentionIndex = nextMentionIndex++;
+          directoryIndices.set(identity, mentionIndex);
+          mentions.push({ kind: "workspace", id: identity, reference: reference.path, label: workspacePathBasename(reference.path),
+            workspaceId: reference.workspaceId, directory: true, token: serialized.text.slice(reference.start, reference.end) });
+        }
+        mentionRanges.push({ start: bodyStart + reference.start, end: bodyStart + reference.end, mentionIndex });
+      }
+      mentionRanges.sort((left, right) => left.start - right.start);
+    }
+    if (mentionRanges.some((range, index) => (index > 0 && mentionRanges[index - 1]!.end > range.start)
+      || !utf16Boundary(text, range.start) || !utf16Boundary(text, range.end)
       || serialized.pastedTextRanges?.some((pasted) => range.start < bodyStart + pasted.end && bodyStart + pasted.start < range.end))) {
       throw new GatewayError("The task input mention occurrence overlaps a structured text atom.");
     }

@@ -356,6 +356,7 @@ import { OperationalWorkspaceChangeJournal } from "./workspace-change-stream.js"
 import { DurableWorkspaceRunCapture, prepareRunProjectGit } from "./workspace-run-capture.js";
 import { PartnerTaskOutputProjection } from "./partner-task-outputs.js";
 import { WorkspaceService } from "./workspace-service.js";
+import { recoverManagedWorkspaceTrash } from "./managed-workspace-trash.js";
 import { OperationalCodeHostSessionAuthorization } from "./session-code-host-context.js";
 
 const MANAGED_PROVIDER_CATALOG_CAPABILITY = "provider.managed_catalog";
@@ -3296,6 +3297,9 @@ export async function createOrchestratorApplication(
   };
 
   try {
+    if (config.dataDirectory !== undefined) {
+      await recoverManagedWorkspaceTrash(store, resolve(config.dataDirectory, "managed-workspaces"));
+    }
     const backendTargets: readonly {
       readonly backendId: string;
       readonly targetId: string;

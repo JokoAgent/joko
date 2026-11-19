@@ -102,6 +102,7 @@ import type {
   DeviceRecord,
   ExtensionUsageSubject,
   InteractionRecord,
+  ManagedTargetTrashIntent,
   MobilePushRegistrationRecord,
   OperationExecution,
   OperationRecord,
@@ -441,7 +442,7 @@ import {
 } from "./workspace-service.js";
 import type { GitState, WorkspaceEntryListingPolicy, WorkspaceEntryRecord, WorkspaceFilePreview, WorkspaceGitCommitResult, WorkspaceGitImageSide, WorkspaceGitPushResult, WorkspaceGitReviewSource, WorkspaceRegistration, WorkspaceSearchResult, WorkspaceService as NativeWorkspaceService } from "./workspace-service.js";
 import type { WorkspaceFileChangeRecord, WorkspaceFileChangeScope } from "./workspace-change-stream.js";
-import { moveManagedWorkspaceToTrash } from "./managed-workspace-trash.js";
+import { inspectManagedWorkspaceTrash, managedWorkspaceContainsPath, moveManagedWorkspaceToTrash } from "./managed-workspace-trash.js";
 import type { DiscoveredNodeRecord } from "./lan-discovery.js";
 import type { MessageSearchEmbeddingCoordinator, MessageSearchSemanticMode } from "./message-search-embedding.js";
 import { LANGUAGE_TOOL_SETTING_KEY, languageToolsEnabled } from "./lsp-tool-bridge.js";
@@ -17361,12 +17362,27 @@ async function dispatchMutation(
           throw new ConnectError("The managed workspace trash root is not configured.", Code.FailedPrecondition);
         }
         const deletedAt = Date.now();
+        let targetRevision = existing.revision;
+        const pendingTrash: { intent?: ManagedTargetTrashIntent } = {};
         let trashedPath: string | undefined;
+        const assertExclusiveWorkspace = (store: OperationalStore): void => {
+          const usedByAnotherProject = store.listTargets().some(target => target.descriptor.id !== existing.descriptor.id
+            && !isTargetDeleted(target) && target.descriptor.remoteWorkspace === undefined
+            && managedWorkspaceContainsPath(existing.descriptor.workspaceRoot, target.descriptor.workspaceRoot));
+          if (usedByAnotherProject) {
+            throw new ConnectError("Another project uses this directory. Keep the workspace when deleting this project.", Code.FailedPrecondition);
+          }
+        };
         const assertDeletionPrecondition = (store: OperationalStore): void => {
           const current = requireUndeletedTarget(store, existing.descriptor.id);
-          if (current.revision !== existing.revision) {
-            throw new RevisionConflictError("Target", current.descriptor.id, existing.revision, current.revision);
+          if (current.revision !== targetRevision) {
+            throw new RevisionConflictError("Target", current.descriptor.id, targetRevision, current.revision);
           }
+          const pending = asRecord(current.metadata)["pendingManagedWorkspaceTrash"];
+          if (pending !== undefined && (pendingTrash.intent === undefined || operationBodyHash(pending) !== operationBodyHash(pendingTrash.intent))) {
+            throw new ConnectError("Check the original managed project deletion before starting another action.", Code.FailedPrecondition);
+          }
+          if (payload.value.deleteManagedWorkspace && trashedPath === undefined) assertExclusiveWorkspace(store);
           const currentSessions = store.listSessions({
             targetId: existing.descriptor.id,
             includeArchived: true,
@@ -17388,15 +17404,42 @@ async function dispatchMutation(
           ...(payload.value.deleteManagedWorkspace ? {
             targetSessionCreationFenceId: existing.descriptor.id,
             effect: async () => {
-              const trashed = await moveManagedWorkspaceToTrash({
-                managedRoot: resolve(dependencies.managedWorkspaceRoot!),
-                workspaceRoot: existing.descriptor.workspaceRoot,
-                targetId: existing.descriptor.id,
-                operationId
-              });
-              trashedPath = trashed.trashedPath;
+              const managedRoot = resolve(dependencies.managedWorkspaceRoot!);
+              try {
+                const trashed = await moveManagedWorkspaceToTrash({
+                  managedRoot,
+                  workspaceRoot: existing.descriptor.workspaceRoot,
+                  targetId: existing.descriptor.id,
+                  operationId,
+                  beforeMove(directory, trashPath) {
+                    const previousState = stringValue(metadata["state"]);
+                    const intent: ManagedTargetTrashIntent = { format: 1, operationId, bodyHash: operationBodyHash(mutation),
+                      managedRoot, workspaceRoot: existing.descriptor.workspaceRoot, trashPath, directory, startedAt: deletedAt,
+                      ...(previousState === undefined ? {} : { previousState }) };
+                    targetRevision = dependencies.store.transaction((store) => {
+                      store.authorizeConnection(connection.id, connection.authKeyDigest);
+                      assertDeletionPrecondition(store);
+                      return store.upsertTarget(existing.descriptor, { ...metadata, state: "deleting", pendingManagedWorkspaceTrash: intent }).revision;
+                    });
+                    pendingTrash.intent = intent;
+                  }
+                });
+                trashedPath = trashed.trashedPath;
+              } catch (error) {
+                const intent = pendingTrash.intent;
+                if (intent === undefined) throw error;
+                const outcome = await inspectManagedWorkspaceTrash(managedRoot, existing.descriptor.id, intent);
+                if (outcome === "unknown") throw error;
+                if (outcome === "not-moved") {
+                  dependencies.store.settleRecoveredManagedTargetTrash({ targetId: existing.descriptor.id, targetRevision, intent, outcome });
+                  delete pendingTrash.intent;
+                  throw error;
+                }
+                trashedPath = intent.trashPath;
+              }
               dependencies.workspaceService.unregister(workspaceId);
-            }
+            },
+            preserveClaimOnEffectFailure: () => pendingTrash.intent !== undefined
           } : {}),
           commit: (store) => {
             assertDeletionPrecondition(store);
@@ -17410,13 +17453,16 @@ async function dispatchMutation(
             return { accepted: true, resultCase: "target", entityId: existing.descriptor.id } satisfies OperationOutcome;
           }
         });
-        dependencies.workspaceService.unregister(workspaceId);
+        if (execution.operation.status === "completed") dependencies.workspaceService.unregister(workspaceId);
         return presented(execution);
       });
     }
     case "createSession": {
       return dependencies.targetWorkspaceRuntime.run(payload.value.targetId, async () => {
       const target = dependencies.store.getTarget(payload.value.targetId);
+      if (asRecord(target.metadata)["pendingManagedWorkspaceTrash"] !== undefined) {
+        throw new ConnectError("The managed project deletion is awaiting its original receipt.", Code.FailedPrecondition);
+      }
       if (payload.value.backendId === "" || payload.value.backendId !== target.descriptor.backendId) {
         throw invalidArgument("create_session.backend_id must match the selected Target backend");
       }

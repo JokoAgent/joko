@@ -152,9 +152,10 @@ export class MobileMarkdownResourceReader {
   #activeReads = 0;
   #waiting: { grant(): void; cancel(): void; readonly signal: AbortSignal }[] = [];
 
-  async prepare(id: string, text: string, context: MobileMarkdownResourceContext, signal: AbortSignal): Promise<MobileMarkdownResourceDescriptor> {
+  async prepare(id: string, text: string, context: MobileMarkdownResourceContext, signal: AbortSignal, onlyPathKey?: string): Promise<MobileMarkdownResourceDescriptor> {
     context.assertCurrent(signal);
-    const candidates = collectMobileMarkdownResourceCandidates(text, context.workdir, context.baseDirectory, context.maximumSourceCharacters);
+    const collected = collectMobileMarkdownResourceCandidates(text, context.workdir, context.baseDirectory, context.maximumSourceCharacters);
+    const candidates = onlyPathKey === undefined ? collected : collected.filter(candidate => candidate.kind === "path" && candidate.key === onlyPathKey);
     if (!candidates.length) return { leaseId: id, references: new Map() };
     if (this.#leases.size >= 64 || this.#leases.has(id)) throw new Error("The message resource limit was reached.");
     const lease: Lease = { id, context, controller: new AbortController(), candidates,

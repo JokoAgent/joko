@@ -339,6 +339,94 @@ final class JokoConnectionUITests: XCTestCase {
         XCTFail("The second native identity request did not reach the owned local server.")
     }
 
+    private func pdfFixtureInput(_ path: String, waitForCode: Bool = false) throws -> [String: String]? {
+        let port = try XCTUnwrap(ProcessInfo.processInfo.environment["JOKO_CI_PROBE_PORT"])
+        let endpoint = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/\(path)"))
+        let deadline = Date().addingTimeInterval(20)
+        repeat {
+            let completed = XCTestExpectation(description: "Read the owned PDF task fixture")
+            var input: [String: String]?
+            var status: Int?
+            var request = URLRequest(url: endpoint, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 2)
+            request.httpMethod = "GET"
+            let task = URLSession.shared.dataTask(with: request) { data, response, _ in
+                status = (response as? HTTPURLResponse)?.statusCode
+                if let data, status == 200 {
+                    input = try? JSONSerialization.jsonObject(with: data) as? [String: String]
+                }
+                completed.fulfill()
+            }
+            task.resume()
+            if XCTWaiter.wait(for: [completed], timeout: 3) == .completed {
+                if let input { return input }
+                if status == 204 && !waitForCode { return nil }
+            }
+            task.cancel()
+            Thread.sleep(forTimeInterval: 0.25)
+        } while Date() < deadline
+        return try XCTUnwrap(nil as [String: String]?, "The owned PDF task fixture must return the expected input.")
+    }
+
+    private func textMenuAction(_ label: String) throws -> XCUIElement {
+        let deadline = Date().addingTimeInterval(10)
+        repeat {
+            for action in [app.menuItems[label].firstMatch, app.buttons[label].firstMatch] {
+                if action.exists && action.isHittable { return action }
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        } while Date() < deadline
+        return try XCTUnwrap(nil as XCUIElement?, "The system text menu must offer \(label).")
+    }
+
+    private func copyOriginalWorkspacePdf(_ inputs: [String: String]) throws {
+        let origin = try XCTUnwrap(inputs["origin"])
+        let key = try XCTUnwrap(inputs["publicKey"])
+        let address = connectionPage.textFields["Joko node address"].firstMatch
+        replace(address, with: origin)
+        let pin = connectionPage.textViews["Trusted node invitation or public key"].firstMatch
+        XCTAssertTrue(pin.waitForExistence(timeout: 10))
+        replace(pin, with: key)
+        tap(button("Check node identity"))
+        let request = button("Request pairing")
+        wait(request, "enabled == true")
+        tap(request)
+        let pairing = try XCTUnwrap(pdfFixtureInput("ci-pdf-pairing-code", waitForCode: true))
+        let code = try XCTUnwrap(pairing["code"])
+        let field = connectionPage.textFields["Pairing code"].firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 10))
+        replace(field, with: code)
+        tap(button("Pair this device"))
+
+        let task = app.buttons["Open task Original workspace PDF task"].firstMatch
+        XCTAssertTrue(task.waitForExistence(timeout: 35))
+        tap(task)
+        let link = app.links["Reference PDF"].firstMatch
+        XCTAssertTrue(link.waitForExistence(timeout: 25))
+        tap(link)
+        let word = app.webViews.staticTexts["Quartz"].firstMatch
+        XCTAssertTrue(word.waitForExistence(timeout: 35))
+        XCTAssertTrue(word.isHittable)
+        XCTAssertTrue(app.buttons["Fit PDF pages to width"].firstMatch.exists)
+        screenshot("11-original-workspace-pdf")
+        word.press(forDuration: 0.8)
+        let copy = try textMenuAction("Copy")
+        screenshot("12-native-pdf-selection")
+        copy.tap()
+
+        tap(app.buttons["Back to Task"].firstMatch)
+        XCTAssertTrue(app.staticTexts["Original workspace PDF task"].firstMatch.waitForExistence(timeout: 10))
+        let composer = app.webViews.textViews["Task message"].firstMatch
+        XCTAssertTrue(composer.waitForExistence(timeout: 10))
+        tap(composer, atCenter: true)
+        composer.press(forDuration: 0.8)
+        try textMenuAction("Paste").tap()
+        let allowPaste = app.alerts.buttons["Allow Paste"].firstMatch
+        if allowPaste.waitForExistence(timeout: 2) { allowPaste.tap() }
+        wait(composer, "value == 'Quartz'")
+        XCTAssertEqual(composer.value as? String, "Quartz")
+        screenshot("13-pdf-word-pasted")
+    }
+
     func testConnectionPageInteractions() throws {
         screenshot("01-connection-page")
         tap(tab("Saved nodes"), atCenter: true, beforeConnectionInput: true)
@@ -442,6 +530,9 @@ final class JokoConnectionUITests: XCTestCase {
             let unavailableText = "This connection requires a native binding included in a Desktop or Mobile build. An ordinary browser cannot open this proxy connection."
             XCTAssertFalse(connectionPage.staticTexts.matching(NSPredicate(format: "label == %@", unavailableText)).firstMatch.exists)
             screenshot("11-http-connect-invitation")
+        }
+        if sdkRuntime == "relay", let pdf = try pdfFixtureInput("ci-pdf-fixture") {
+            try copyOriginalWorkspacePdf(pdf)
         }
         XCTAssertEqual(app.state, .runningForeground)
     }

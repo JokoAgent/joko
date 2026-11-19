@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, rename } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { create } from "@bufbuild/protobuf";
@@ -17,7 +17,7 @@ import {
   TargetWorkspaceInputSchema,
   WorkspaceKind
 } from "@joko/contracts";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OrchestratorE2eFixture } from "./fixture.js";
 import {
@@ -102,6 +102,82 @@ describe("remote connection auth and durable operations", () => {
     expect(fixture.application.store.getTarget(targetId)).toEqual(current);
     await submit(first.clients.operation, first.connectionId, edit({ displayName: "reviewed current edit" }, current.revision));
     expect(fixture.application.store.getTarget(targetId).descriptor.displayName).toBe("reviewed current edit");
+  });
+
+  it("preserves a second project's files and task when deleting a managed project at the same root", async () => {
+    fixture = await OrchestratorE2eFixture.start();
+    const { clients, connectionId } = await fixture.pair("Shared directory Owner");
+    const backendId = fixture.adapter().id;
+    const createProject = async (displayName: string, kind: WorkspaceKind, serverPath?: string) => {
+      const operation = await submit(clients.operation, connectionId, create(OperationMutationSchema, { payload: {
+        case: "createTarget", value: create(CreateTargetMutationSchema, { backendId, displayName, workspace: create(TargetWorkspaceInputSchema, {
+          kind, createIfMissing: kind === WorkspaceKind.MANAGED_DIALOGUE, ...(serverPath === undefined ? {} : { serverPath })
+        }) })
+      } }));
+      if (operation.result?.payload.case !== "target") throw new Error("The project was not created.");
+      return operation.result.payload.value;
+    };
+    const managed = await createProject("Managed project", WorkspaceKind.MANAGED_DIALOGUE);
+    const root = fixture.application.store.getTarget(managed.targetId).descriptor.workspaceRoot;
+    const document = join(root, "shared.txt");
+    await writeFile(document, "The other project still uses this file.", "utf8");
+    const other = await createProject("Second project", WorkspaceKind.USER_PROJECT, root);
+    const task = sessionIdFrom(await submit(clients.operation, connectionId, createSessionMutation({ backendId, targetId: other.targetId })));
+    const remove = (deleteManagedWorkspace: boolean) => submit(clients.operation, connectionId, create(OperationMutationSchema, { payload: {
+      case: "deleteTarget", value: { targetId: managed.targetId, deleteManagedWorkspace }
+    } }));
+    await expect(remove(true)).rejects.toMatchObject({ code: Code.FailedPrecondition, rawMessage: expect.stringMatching(/Another project uses this directory/u) });
+    expect((await clients.workspace.getWorkspace({ workspaceId: managed.workspaceId })).workspace?.targetId).toBe(managed.targetId);
+    expect((await remove(false)).state).toBe(OperationState.SUCCEEDED);
+    expect(await readFile(document, "utf8")).toBe("The other project still uses this file.");
+    expect((await clients.workspace.getWorkspace({ workspaceId: other.workspaceId })).workspace?.targetId).toBe(other.targetId);
+    expect((await clients.session.getSession({ sessionId: task })).session?.targetId).toBe(other.targetId);
+  });
+
+  it("settles the original managed project removal across a cold start after its directory moved", async () => {
+    fixture = await OrchestratorE2eFixture.start();
+    const rootDirectory = fixture.rootDirectory;
+    try {
+      const owner = await fixture.pair("Managed directory recovery owner");
+      const { clients, connectionId } = owner;
+      const backendId = fixture.adapter().id, store = fixture.application.store;
+      const created = await submit(clients.operation, connectionId, create(OperationMutationSchema, { payload: {
+        case: "createTarget", value: create(CreateTargetMutationSchema, { backendId, displayName: "Managed recovery project",
+          workspace: create(TargetWorkspaceInputSchema, { kind: WorkspaceKind.MANAGED_DIALOGUE, createIfMissing: true }) })
+      } }));
+      if (created.result?.payload.case !== "target") throw new Error("The managed recovery project was not created.");
+      const { targetId, workspaceId } = created.result.payload.value;
+      const workspaceRoot = store.getTarget(targetId).descriptor.workspaceRoot;
+      await writeFile(join(workspaceRoot, "project.txt"), "Original managed workspace bytes.", "utf8");
+      const operationId = randomUUID();
+      const mutation = create(OperationMutationSchema, { payload: { case: "deleteTarget", value: { targetId, deleteManagedWorkspace: true } } });
+      const complete = vi.spyOn(store, "completeAuthorizedDeferredEffectOperation").mockImplementationOnce(() => {
+        throw new Error("Stop after the original move and before the product commit.");
+      });
+      try { await expect(submit(clients.operation, connectionId, mutation, operationId)).rejects.toThrow(); }
+      finally { complete.mockRestore(); }
+      expect(store.getOperation(operationId).status).toBe("started");
+      const target = store.getTarget(targetId);
+      expect(target.metadata).toMatchObject({ state: "deleting", pendingManagedWorkspaceTrash: { operationId, format: 1 } });
+      const { trashPath } = (target.metadata as { pendingManagedWorkspaceTrash: { trashPath: string } }).pendingManagedWorkspaceTrash;
+      await expect(readFile(join(workspaceRoot, "project.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(join(trashPath, "project.txt"), "utf8")).toBe("Original managed workspace bytes.");
+      await expect(submit(clients.operation, connectionId, mutation)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+
+      await fixture.close({ removeRoot: false });
+      fixture = await OrchestratorE2eFixture.start({ rootDirectory });
+      const reconnected = fixture.clients(owner.authKey);
+      const receipt = (await reconnected.operation.getOperation({ operationId })).operation;
+      expect(receipt).toMatchObject({ operationId, state: OperationState.SUCCEEDED, result: { payload: { case: "target", value: { targetId } } } });
+      expect(fixture.application.store.getTarget(targetId).metadata).toMatchObject({ state: "archived", managedWorkspaceTrashPath: trashPath, deletionOperationId: operationId });
+      expect(fixture.application.store.getTarget(targetId).metadata).not.toHaveProperty("pendingManagedWorkspaceTrash");
+      await expect(reconnected.workspace.getWorkspace({ workspaceId })).rejects.toMatchObject({ code: Code.NotFound });
+      expect((await submit(reconnected.operation, connectionId, mutation, operationId)).state).toBe(OperationState.SUCCEEDED);
+      expect(await readFile(join(trashPath, "project.txt"), "utf8")).toBe("Original managed workspace bytes.");
+    } finally {
+      try { await fixture.close({ removeRoot: false }); }
+      finally { fixture = undefined; await rm(rootDirectory, { recursive: true, force: true, maxRetries: 3 }); }
+    }
   });
 
   it("revalidates an unavailable project directory through authenticated Connect and creates the task after retry", async () => {

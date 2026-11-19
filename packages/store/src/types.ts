@@ -329,6 +329,18 @@ export interface StoredTarget {
   readonly revision: bigint;
 }
 
+export interface ManagedTargetTrashIntent {
+  readonly format: 1;
+  readonly operationId: string;
+  readonly bodyHash: string;
+  readonly managedRoot: string;
+  readonly workspaceRoot: string;
+  readonly trashPath: string;
+  readonly directory: { readonly device: string; readonly inode: string; readonly birthtime: string };
+  readonly startedAt: UnixMillis;
+  readonly previousState?: string;
+}
+
 export function isTargetDeleted({ metadata }: StoredTarget): boolean {
   return typeof metadata === "object" && metadata !== null
     && "deletedAt" in metadata && metadata.deletedAt !== undefined;

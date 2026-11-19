@@ -36,17 +36,19 @@ const evidenceSteps = {
   "copy-file-source": { action: "clipboard", assertions: ["copy-source-completed"] },
   "force-stop-and-reconnect": { action: "lifecycle", assertions: ["application-process-stopped", "application-restarted", "restored-task-title", "persisted-task-input"] },
   "restore-canonical-file": { action: "lifecycle", assertions: ["restored-file-contents", "restored-line-focus", "no-duplicate-dispatch", "one-persisted-run", "one-mobile-connection", "no-application-crash", "run-succeeded"] },
+  "system-back-from-files": { action: "navigation", assertions: ["opened-task-files-root", "system-back-restores-same-task"] },
   "browse-workspace-html": { action: "resource-navigation", assertions: ["canonical-html-link", "child-document-fragment", "back-and-forward", "document-reload"] },
-  "open-isolated-html-website": { action: "native-address", assertions: ["native-address-entry", "website-rendered", "no-node-credentials", "return-to-file-history"] }
+  "open-isolated-html-website": { action: "native-address", assertions: ["native-address-entry", "website-request-received", "website-rendered", "no-node-credentials", "return-to-file-history"] }
 } as const;
 type EvidenceStepName = keyof typeof evidenceSteps;
-type EvidenceAction = "tap" | "text-entry" | "launch" | "double-tap" | "swipe" | "force-stop" | "install";
+type EvidenceAction = "tap" | "text-entry" | "launch" | "double-tap" | "swipe" | "force-stop" | "install" | "system-back";
 type EvidenceScreenshot = "header" | "actions" | "timeline" | "gallery" | "gallery-zoomed" | "gallery-drag-reset"
   | "gallery-dismissed" | "resource-links" | "file-opened" | "file" | "restored"
   | "gallery-error" | "restored-error" | "file-error" | "resource-candidate" | "resource-error"
   | "connection-add" | "connection-error" | "connection-identity-error" | "actions-scrolled" | "share-selection" | "share-selection-error"
   | "native-user-quote-menu" | "native-assistant-quote-menu"
-  | "native-user-message-quote" | "native-assistant-message-quote" | "native-message-quote-error" | "html-guide" | "html-website";
+  | "native-user-message-quote" | "native-assistant-message-quote" | "native-message-quote-error" | "html-guide" | "html-website"
+  | "html-guide-refresh-error" | "html-website-address-error" | "html-website-render-error";
 type EvidenceResult = "running" | "passed" | "failed";
 type EvidenceStep = {
   name: EvidenceStepName;
@@ -87,6 +89,7 @@ type AndroidEvidence = {
     source: { commit: string; tree: "clean"; productionGate: "passed" | "bypassed" | "unavailable" };
     installedSha256?: string;
   };
+  website?: { addressEntered: boolean; requestCount: number; requestsWithCredentials: number };
   steps: EvidenceStep[];
 };
 
@@ -526,8 +529,20 @@ async function runNativeScenario(): Promise<void> {
   expect((await manager.clients.run.getRun({ runId: run.descriptor.id })).run?.state).toBe(RunState.SUCCEEDED);
   await completeStep();
 
-  await beginStep("browse-workspace-html");
+  await beginStep("system-back-from-files");
   await tap("Back to Files");
+  await tap("Back to Task");
+  await waitNode((node) => node.text === taskName, "original task before opening Files");
+  await tap("Files");
+  await waitNode((node) => node.contentDescription === "Open directory html-guide" && node.enabled, "task Files root contents");
+  await interaction("system-back", () => adb("shell", "input", "keyevent", "KEYCODE_BACK"));
+  await waitFor(nodes, (items) => items.some(node => node.text === taskName)
+    && items.some(node => node.contentDescription === "Back to Tasks")
+    && !items.some(node => node.contentDescription === "Back to Task"), "original task after Android Back on Files", 15_000);
+  await completeStep();
+
+  await beginStep("browse-workspace-html");
+  await tap("Files");
   await tap("Open directory html-guide");
   await tap("Preview file index.html");
   await tap("Open the guide");
@@ -535,7 +550,9 @@ async function runNativeScenario(): Promise<void> {
   const isAddressField = (node: AndroidUiNode) => node.className === "android.widget.EditText" && node.contentDescription === "Page address";
   const waitAddress = (value: string) => waitNode((node) => isAddressField(node) && (node.text ?? "") === value,
     value === "" ? "cleared HTML address field" : "HTML display path " + value);
-  const waitChapter = () => waitNode((node) => node.text === "Workspace guide chapter" || node.contentDescription === "Workspace guide chapter", "rendered Workspace guide chapter");
+  const chapter = "Workspace guide chapter";
+  const refreshedChapter = "Refreshed Workspace guide chapter";
+  const waitChapter = (text = chapter) => waitNode((node) => node.text === text || node.contentDescription === text, "rendered " + text);
   await waitAddress(detailsAddress);
   await waitChapter();
   await tap("Previous page");
@@ -544,13 +561,36 @@ async function runNativeScenario(): Promise<void> {
   await tap("Next page");
   await waitAddress(detailsAddress);
   await waitChapter();
-  await tap("Refresh");
-  await waitChapter();
+  await writeFile(join(current.workspaceDirectory, "html-guide", "details.html"),
+    `<meta name="viewport" content="width=device-width"><h1 id="chapter">${refreshedChapter}</h1>`);
+  try {
+    await interaction("tap", async () => {
+      const refresh = await waitFor(async () => {
+        const items = await nodes();
+        const address = items.find(node => isAddressField(node) && node.text === detailsAddress);
+        const next = items.find(node => node.contentDescription === "Next page" && node.bounds.x2 > node.bounds.x1);
+        if (!address || !next) return undefined;
+        return items.find(node => node.enabled && node.clickable && node.contentDescription === "Refresh"
+          && node.bounds.x1 >= next.bounds.x2 && node.bounds.x2 > node.bounds.x1
+          && node.bounds.y1 < next.bounds.y2 && node.bounds.y2 > next.bounds.y1 && node.bounds.y2 <= address.bounds.y1);
+      }, (node) => node !== undefined, "Refresh in the native HTML navigation row", 15_000);
+      await tapNode(refresh!);
+    });
+    await waitAddress(detailsAddress);
+    await waitChapter(refreshedChapter);
+  } catch (error) {
+    await screenshot("html-guide-refresh-error").catch(() => undefined);
+    const observed = await nodes(Date.now() + 5_000).catch(() => []);
+    throw new Error("The refreshed Workspace document did not render. Native nodes: " + JSON.stringify(observed.slice(0, 80)
+      .map(node => ({ text: node.text?.slice(0, 180), label: node.contentDescription?.slice(0, 160), bounds: node.bounds }))), { cause: error });
+  }
   await screenshot("html-guide");
   await completeStep();
 
   await beginStep("open-isolated-html-website");
   const siteRequests: boolean[] = [];
+  const websiteEvidence = { addressEntered: false, requestCount: 0, requestsWithCredentials: 0 };
+  evidence!.website = websiteEvidence;
   const site = createServer((request, response) => {
     if (request.url !== "/viewer") { response.writeHead(404).end(); return; }
     siteRequests.push(request.headers.authorization !== undefined || request.headers.cookie !== undefined);
@@ -577,6 +617,7 @@ async function runNativeScenario(): Promise<void> {
         await waitAddress("");
         await adb("shell", "input", "text", `'${url}'`);
         await waitAddress(url);
+        websiteEvidence.addressEntered = true;
       } catch (error) {
         await screenshot("html-website-address-error").catch(() => undefined);
         const observed = await nodes(Date.now() + 5_000).catch(() => []);
@@ -584,14 +625,35 @@ async function runNativeScenario(): Promise<void> {
       }
     });
     expect(siteRequests).toEqual([]);
-    await tap("Open");
-    await waitNode((node) => node.text === "Isolated website fixture" || node.contentDescription === "Isolated website fixture", "isolated website rendered in the native app");
-    expect(siteRequests.length).toBeGreaterThan(0); expect(siteRequests.every((credentialSent) => !credentialSent)).toBe(true);
-    await screenshot("html-website");
-    await tap("Previous page");
-    await waitAddress(detailsAddress);
-    await waitChapter();
+    try {
+      await interaction("tap", async () => {
+        const open = await waitFor(async () => {
+          const items = await nodes();
+          const field = items.find(node => isAddressField(node) && node.text === url);
+          if (field === undefined) return undefined;
+          return items.find(node => node.enabled && node.clickable && node.contentDescription === "Open"
+            && node.bounds.x1 >= field.bounds.x2 && node.bounds.x2 > node.bounds.x1
+            && node.bounds.y1 < field.bounds.y2 && node.bounds.y2 > field.bounds.y1);
+        }, (node) => node !== undefined, "Open in the native HTML address row", 15_000);
+        await tapNode(open!);
+      });
+      await waitFor(async () => siteRequests.length, (count) => count > 0, "request to the isolated website fixture", 25_000);
+      await waitNode((node) => node.text === "Isolated website fixture" || node.contentDescription === "Isolated website fixture", "isolated website rendered in the native app");
+      expect(siteRequests.every((credentialSent) => !credentialSent)).toBe(true);
+      await screenshot("html-website");
+      await tap("Previous page");
+      await waitAddress(detailsAddress);
+      await waitChapter(refreshedChapter);
+    } catch (error) {
+      await screenshot("html-website-render-error").catch(() => undefined);
+      const observed = await nodes(Date.now() + 5_000).catch(() => []);
+      const messages = observed.flatMap(node => [node.text, node.contentDescription]).filter(value =>
+        value === "Enter a valid web address without credentials." || value === "Could not load this website. Refresh or return to the file.");
+      throw new Error(`Native HTML website step failed after ${siteRequests.length} fixture requests. Address: ${JSON.stringify(observed.find(isAddressField)?.text ?? null)}. UI messages: ${JSON.stringify(messages)}`, { cause: error });
+    }
   } finally {
+    websiteEvidence.requestCount = siteRequests.length;
+    websiteEvidence.requestsWithCredentials = siteRequests.filter(Boolean).length;
     try { if (siteReverse !== undefined) await adb("reverse", "--remove", siteReverse); }
     finally { site.closeAllConnections(); await new Promise<void>((resolve) => site.close(() => resolve())); }
   }
