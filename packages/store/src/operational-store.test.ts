@@ -3322,7 +3322,7 @@ describe("OperationalStore", () => {
 
   it.each(["after Done", "after Run and Attempt settlement", "a different Operation"] as const)(
     "recovers the original Claude input on restart with %s", (interruption) => {
-      const fixture = createFixture("claude-code");
+      const fixture = createFixture("claude-agent-sdk-stdio");
       const store = fixture.store;
       const session = store.getSession("session-1").descriptor;
       const connection = store.createConnection({ id: "claude-owner", name: "Claude Owner", authKeyDigest: "claude-owner-digest" });

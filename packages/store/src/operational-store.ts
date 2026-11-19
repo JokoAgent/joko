@@ -14733,7 +14733,7 @@ export class OperationalStore {
       || item.body.inputHandoffContinuation !== undefined) return false;
     const session = this.getSession(item.sessionId).descriptor;
     if (session.remoteWorkspace !== undefined || session.hidden || session.deletedAt !== undefined
-      || this.getBackend(session.backendId).descriptor.adapterKind !== "claude-code") return false;
+      || this.getBackend(session.backendId).descriptor.adapterKind !== "claude-agent-sdk-stdio") return false;
     const run = this.getRun(item.runId).descriptor;
     if (run.source !== "user" || run.parentRunId !== undefined || run.sessionId !== session.id || run.activeAttemptId !== item.attemptId
       || run.state !== "completed" && (run.state === "dispatch_unknown" || !RUN_TRANSITIONS[run.state].has("completed"))) return false;
