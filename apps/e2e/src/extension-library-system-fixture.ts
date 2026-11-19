@@ -31,6 +31,7 @@ export interface ExtensionLibrarySystemFixtureOptions {
   readonly rootDirectory?: string;
   readonly webDirectory?: string;
   readonly keepRoot?: boolean;
+  readonly beforePreviewImage?: (method: string) => Promise<void>;
 }
 
 /**
@@ -120,6 +121,12 @@ export class ExtensionLibrarySystemFixture {
       application.connections.openPairingWindow();
       publicServer = await createPublicServer(application);
       publicServer.log.level = "silent";
+      const beforePreviewImage = options.beforePreviewImage;
+      if (beforePreviewImage !== undefined) publicServer.addHook("preHandler", async request => {
+        if (/^\/v1\/extensions\/main-views\/[^/]+\/[^/]+\/preview\.png$/u.test(request.url)) {
+          await beforePreviewImage(request.method);
+        }
+      });
       await publicServer.listen({ host: "127.0.0.1", port: 0 });
       const address = publicServer.server.address();
       if (address === null || typeof address === "string") {

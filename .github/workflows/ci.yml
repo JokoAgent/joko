@@ -521,17 +521,17 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-      - name: Check history navigation and artifact fixture ownership
+      - name: Check history navigation, artifact ownership and Browser transfers
         if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' }}
         timeout-minutes: 3
         shell: bash
-        run: pnpm --filter @joko/web exec vitest run src/components/Timeline.viewport.test.tsx src/components/Timeline.test.ts src/components/timeline-follow-intent.test.ts src/dev/VisualHarness.artifact-storage.test.tsx 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-owners.log"
+        run: pnpm --filter @joko/web exec vitest run src/components/Timeline.viewport.test.tsx src/components/Timeline.test.ts src/components/timeline-follow-intent.test.ts src/dev/VisualHarness.artifact-storage.test.tsx src/components/ToolsPage.browser-new-session.test.tsx src/gateway.browser-ledger.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-owners.log"
 
       - name: Run the affected production Web chains (Linux)
         if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' && steps.browser.outcome == 'success' && runner.os == 'Linux' }}
         timeout-minutes: 15
         shell: bash
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts src/paired-backends.e2e.test.ts src/discord-messaging.e2e.test.ts src/provider-configuration-mounted-browser.e2e.test.ts src/worktree-branch-sync-mounted-browser.e2e.test.ts src/partner-mounted-browser.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts src/timeline-markdown.e2e.test.ts src/browser-external-tab-lifecycle.e2e.test.ts src/extension-library-mounted-browser.e2e.test.ts src/paired-backends.e2e.test.ts src/discord-messaging.e2e.test.ts src/provider-configuration-mounted-browser.e2e.test.ts src/worktree-branch-sync-mounted-browser.e2e.test.ts src/partner-mounted-browser.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
         env:
           XDG_SESSION_TYPE: x11
           WAYLAND_DISPLAY: ""
