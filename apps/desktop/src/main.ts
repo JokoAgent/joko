@@ -34,7 +34,7 @@ import { basename, extname, isAbsolute, join, resolve } from "node:path";
 import { execFile, spawn } from "node:child_process";
 import { hostname, release as operatingSystemRelease } from "node:os";
 import { appendFileSync, writeFileSync } from "node:fs";
-import { lstat, readdir, realpath, stat, unlink } from "node:fs/promises";
+import { lstat, readFile, readdir, realpath, stat, unlink } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
@@ -724,6 +724,7 @@ interface InspectorWindowEntry {
   readonly occurrence: string;
   readonly lifecycle: InspectorWindowLifecycle<BrowserWindow, BrowserWindow>;
   readonly frameName: string;
+  readonly state: windowStateKeeper.State;
   closing: boolean;
 }
 const inspectorWindows = new Map<BrowserWindow, InspectorWindowEntry>();
@@ -856,7 +857,6 @@ let globalVoiceMuteSystemAudio = true;
 let globalVoiceSystemAudioOwner: number | undefined;
 let globalVoiceSystemAudioOwnerSequence = 0;
 let managedMainWindowState: windowStateKeeper.State | undefined;
-let managedInspectorWindowState: windowStateKeeper.State | undefined;
 let managedRuntimeProcessMonitorWindowState: windowStateKeeper.State | undefined;
 const sessionWindows = new SessionWindowRegistry<BrowserWindow, WebContents>();
 const extensionWindows = new Map<string, BrowserWindow>();
@@ -1061,6 +1061,7 @@ const RUNTIME_PROCESS_MONITOR_WINDOW_DEFAULT_GEOMETRY = Object.freeze({ width: 5
 const EXTENSION_WINDOW_STATE_PREFIX = "extension-window-state-";
 const MAXIMUM_EXTENSION_WINDOWS = 32;
 const MAIN_WINDOW_STATE_FILE = "window-state.json";
+const INSPECTOR_WINDOW_STATE_FILE = "inspector-window-state.json";
 const RUNTIME_PROCESS_MONITOR_WINDOW_STATE_FILE = "runtime-process-monitor-window-state.json";
 const WINDOWS_ATTENTION_OVERLAY_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="#e5484d"/><circle cx="8" cy="8" r="3" fill="#ffffff"/></svg>';
 
@@ -1324,6 +1325,14 @@ function ordinaryWindowStartupAppearance(): { readonly backgroundColor: string; 
   return { backgroundColor: desktopWindowBackground(theme, nativeTheme.shouldUseDarkColors), additionalArguments: [`--joko-window-theme=${theme}`] };
 }
 
+function loadInspectorWindowState(): windowStateKeeper.State {
+  return windowStateKeeper({
+    defaultWidth: INSPECTOR_WINDOW_DEFAULT_GEOMETRY.width,
+    defaultHeight: INSPECTOR_WINDOW_DEFAULT_GEOMETRY.height,
+    file: INSPECTOR_WINDOW_STATE_FILE
+  });
+}
+
 function createWindow(): void {
   desktopRemoteDesktopViewerPrewarm.cancel();
   const retiredDocument = mainWindowDocuments.retireCurrent();
@@ -1348,13 +1357,7 @@ function createWindow(): void {
     defaultHeight: 800,
     file: MAIN_WINDOW_STATE_FILE
   });
-  const inspectorWindowState = windowStateKeeper({
-    defaultWidth: 520,
-    defaultHeight: 860,
-    file: "inspector-window-state.json"
-  });
   managedMainWindowState = mainWindowState;
-  managedInspectorWindowState = inspectorWindowState;
   const appearance = ordinaryWindowStartupAppearance();
   const window = new BrowserWindow({
     x: mainWindowState.x,
@@ -1578,6 +1581,7 @@ function createWindow(): void {
       if (inspectorWindows.size >= 8 || [...inspectorWindows.values()].some(entry => entry.frameName === frameName)) {
         return { action: "deny" };
       }
+      const inspectorWindowState = loadInspectorWindowState();
       const inspectorFrameOptions = process.platform === "darwin"
         ? { titleBarStyle: "hidden" as const, trafficLightPosition: { x: 12, y: 16 } }
         : { frame: false };
@@ -1624,7 +1628,6 @@ function createWindow(): void {
       childWindow.destroy();
       return;
     }
-    inspectorWindowState.manage(childWindow);
     installInspectorWindowSecurity(childWindow, window, details.frameName);
   });
   window.webContents.on("will-navigate", (event, url) => {
@@ -2476,9 +2479,20 @@ async function verifyPackagedSmokeInspectorMultipleWindows(owner: BrowserWindow)
     await waitForPackagedSmokeInspectorDestroyed(first.window, "first independent window retirement");
     const surviving = await second.window.webContents.executeJavaScript("window.jokoInspectorDesktop.window.identity()", true);
     if (surviving !== second.occurrence || inspectorWindows.get(second.window) !== second) throw new Error("Closing one Inspector invalidated another.");
+    const { width: originalWidth, height: originalHeight } = second.window.getBounds();
+    second.window.setSize(originalWidth === 420 ? 480 : 420, originalHeight);
+    await waitForPackagedSmokeInspectorCondition(() => second.window.getBounds().width !== originalWidth,
+      "surviving Inspector resize after its sibling closed");
+    const { width, height } = second.window.getBounds();
     void second.window.webContents.executeJavaScript("window.jokoInspectorDesktop.window.close('passive')", true).catch(() => undefined);
     await waitForPackagedSmokeInspectorDestroyed(second.window, "second independent window retirement");
     if (inspectorWindows.size !== 0 || inspectorWindow !== undefined) throw new Error("Independent Inspectors retained retired native ownership.");
+    const saved = JSON.parse(await readFile(join(app.getPath("userData"), INSPECTOR_WINDOW_STATE_FILE), "utf8")) as {
+      readonly width?: unknown;
+      readonly height?: unknown;
+    };
+    if (saved.width !== width || saved.height !== height) throw new Error("The surviving Inspector did not persist its new window size.");
+    recordPackagedSmokeProgress("inspector_surviving_window_geometry_verified");
     recordPackagedSmokeProgress("inspector_multiple_windows_and_close_veto_verified");
   } finally {
     for (const entry of [...inspectorWindows.values()]) if (names.includes(entry.frameName)) destroyInspectorWindow(entry.window);
@@ -6593,12 +6607,8 @@ async function resetDesktopApplicationLayout(initiatingContents: WebContents): P
     if (window.isDestroyed()) resetDormantManagedWindowState(state);
     else targets.push({ window, state, defaults: EXTENSION_WINDOW_DEFAULT_GEOMETRY });
   }
-  if (managedInspectorWindowState !== undefined) {
-    if (liveInspectorWindows().length) {
-      for (const child of liveInspectorWindows()) targets.push({ window: child, state: managedInspectorWindowState, defaults: INSPECTOR_WINDOW_DEFAULT_GEOMETRY });
-    } else {
-      resetDormantManagedWindowState(managedInspectorWindowState);
-    }
+  for (const { window, state } of inspectorWindows.values()) {
+    if (!window.isDestroyed()) targets.push({ window, state, defaults: INSPECTOR_WINDOW_DEFAULT_GEOMETRY });
   }
   if (managedRuntimeProcessMonitorWindowState !== undefined) {
     if (runtimeProcessMonitorWindow !== undefined && !runtimeProcessMonitorWindow.isDestroyed()) {
@@ -6621,8 +6631,8 @@ async function resetDesktopApplicationLayout(initiatingContents: WebContents): P
       entry.name.endsWith(".json") && !openExtensionStateFiles.has(entry.name)
     ? [unlink(join(app.getPath("userData"), entry.name)).catch(() => undefined)]
     : []));
-  if (inspectorWindow === undefined || inspectorWindow.isDestroyed()) {
-    await unlink(join(app.getPath("userData"), "inspector-window-state.json")).catch(() => undefined);
+  if (liveInspectorWindows().length === 0) {
+    await unlink(join(app.getPath("userData"), INSPECTOR_WINDOW_STATE_FILE)).catch(() => undefined);
   }
   if (mainWindow === undefined || mainWindow.isDestroyed()) {
     await unlink(join(app.getPath("userData"), MAIN_WINDOW_STATE_FILE)).catch(() => undefined);
@@ -6866,7 +6876,10 @@ function showCurrentMainWindowOwner(owner: WebContents): boolean {
   return showMainWindow() && owner === mainWindow?.webContents && !owner.isDestroyed();
 }
 
-function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: BrowserWindow, frameName = INSPECTOR_WINDOW_FRAME_NAME): void {
+function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: BrowserWindow, frameName: string): void {
+  // The keeper owns a single native window and removes its listeners on close.
+  const state = loadInspectorWindowState();
+  state.manage(childWindow);
   const occurrence = randomUUID();
   const lifecycle = new InspectorWindowLifecycle({
     owner,
@@ -6877,7 +6890,7 @@ function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: Brows
       inspectorWindows.get(candidateChild)?.occurrence === occurrence,
     retire: (_candidateOwner, candidateChild) => retireInspectorWindow(candidateChild)
   });
-  const entry: InspectorWindowEntry = { window: childWindow, owner, occurrence, lifecycle, frameName, closing: false };
+  const entry: InspectorWindowEntry = { window: childWindow, owner, occurrence, lifecycle, frameName, state, closing: false };
   inspectorWindows.set(childWindow, entry);
   syncFirstInspectorWindow();
   childWindow.webContents.setZoomFactor(currentWindowZoomFactor);
