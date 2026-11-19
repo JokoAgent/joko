@@ -17289,6 +17289,33 @@ describe("native current-task Files ownership", () => {
     expect(watch).toHaveBeenCalledTimes(2);
   });
 
+  it("starts the same Workspace watch when Files refresh recovers its initial index failure", async () => {
+    const network = fakeNetwork(); configureFiles(network);
+    vi.mocked(network.listWorkspaceFileIndex).mockRejectedValueOnce(new ConnectError("Index temporarily unavailable", Code.Unavailable));
+    let publish!: () => void;
+    const watch = vi.mocked(network.watchWorkspace).mockImplementation(async function* (_credential, _workspace, signal) {
+      await new Promise<void>((resolve) => { publish = resolve; });
+      if (signal.aborted) return;
+      yield create(WorkspaceFileChangeSchema, { workspaceId: "workspace", kind: WorkspaceFileChangeKind.MODIFIED,
+        relativePath: readme.relativePath, sequence: 1n, streamRevision: "watch-1" });
+      await new Promise<void>((resolve) => {
+        if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+    });
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles();
+    try {
+      expect(app.state.files).toMatchObject({ status: "error", watchStatus: "idle" });
+      expect(watch).not.toHaveBeenCalled();
+      await app.refreshFiles();
+      expect(app.state.files).toMatchObject({ status: "ready", watchStatus: "watching" });
+      expect(watch).toHaveBeenCalledExactlyOnceWith(credential, "workspace", expect.any(AbortSignal));
+      const entries = [sourceDirectory, readme, create(WorkspaceEntrySchema, { ...readme, relativePath: "later.txt" })];
+      vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries, revision: "directory-after-watch" });
+      publish();
+      await vi.waitFor(() => expect(app.state.files.entries).toEqual(entries));
+    } finally { app.closeFiles(); }
+  });
+
   it("cancels a scheduled Files watch retry when the user leaves and creates a fresh watch on reopen", async () => {
     const network = fakeNetwork();
     configureFiles(network);
