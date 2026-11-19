@@ -6311,6 +6311,7 @@ const en = {
   ,"worktree.branch.refresh": "Refresh branch status"
   ,"worktree.branch.counts": "Ahead {ahead} · Behind {behind} · Local changes {dirty}"
   ,"worktree.branch.updated": "Updated commits: {count}."
+  ,"worktree.branch.busy": "Another branch update is running in this repository. Try again after it finishes."
   ,"worktree.branch.no-remote": "This branch has no configured remote."
   ,"worktree.branch.missing-remote": "The configured remote branch is unavailable."
   ,"worktree.branch.not-local": "The selected local branch no longer exists."
@@ -10389,6 +10390,7 @@ const zhBase: Record<MessageKey, string> = {
   "worktree.branch.refresh": "刷新分支状态",
   "worktree.branch.counts": "领先 {ahead} · 落后 {behind} · 本地变更 {dirty}",
   "worktree.branch.updated": "分支更新完成：{count} 个提交。",
+  "worktree.branch.busy": "此仓库正在更新另一个分支，请在更新完成后重试。",
   "worktree.branch.no-remote": "此分支没有配置远端。",
   "worktree.branch.missing-remote": "配置的远端分支不可用。",
   "worktree.branch.not-local": "所选本地分支已不存在。",

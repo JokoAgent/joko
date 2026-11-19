@@ -63,6 +63,19 @@ it("recovers an unconfirmed admission with the retained operation ID and never s
   await f.show(); expect(f.poll).toHaveBeenCalledWith(original, expect.any(AbortSignal)); expect(f.start).toHaveBeenCalledOnce();
   expect(document.body.textContent).toContain("Updated commits: 1."); expect(localStorage.length).toBe(0);
 });
+it("clears a confirmed busy receipt and permits a new explicit attempt", async () => {
+  const f = fixture();
+  f.start.mockImplementationOnce(async ({ operationId }) => ({ operationId, pending: false, unknown: false, updated: 0, errorCode: "busy", status }));
+  await f.show(); await f.click("Update selected branch");
+  expect(document.querySelector('[role="alert"]')?.textContent).toContain("Another branch update is running");
+  expect(document.body.textContent).not.toContain("Updated commits: 0");
+  expect(f.button("Update selected branch").disabled).toBe(false);
+  expect(localStorage.length).toBe(0);
+  expect(f.updated).not.toHaveBeenCalled();
+  await f.click("Update selected branch");
+  expect(f.start.mock.calls[1]?.[0].operationId).not.toBe(f.start.mock.calls[0]?.[0].operationId);
+  expect(f.updated).toHaveBeenCalledOnce();
+});
 it("keeps a blocked branch and unavailable receipt storage from admitting an update", async () => {
   const f = fixture(); f.read.mockResolvedValue({ ...status, blocked: "diverged" }); await f.show();
   expect(f.button("Update selected branch").disabled).toBe(true); expect(document.body.textContent).toContain("histories have diverged");

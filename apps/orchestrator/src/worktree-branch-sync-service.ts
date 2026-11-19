@@ -117,7 +117,8 @@ export function createWorktreeBranchSyncService(coordinator: SessionWorktreeCoor
         store.completeAuthorizedDeferredEffectOperation<Receipt>(owner.connectionId, owner.authKeyDigest, key, claim.operation.bodyHash, () => {
           current.assertCurrent();
           return { operationId: request.operationId, pending: false, unknown: false, updated: result.updated,
-            status: { ...result.status, revision: opaqueRevision(result.status, request.targetId, current.target.revision) } };
+            status: { ...result.status, revision: opaqueRevision(result.status, request.targetId, current.target.revision) },
+            ...(result.errorCode === undefined ? {} : { errorCode: result.errorCode }) };
         });
       }).catch(() => { /* The started receipt remains visible as unknown; never redispatch. */ }).finally(() => active.delete(key));
       return create(contract.SyncTargetWorktreeBranchResponseSchema, { operation: proto({ operationId: request.operationId, pending: true, unknown: false, updated: 0 }) });

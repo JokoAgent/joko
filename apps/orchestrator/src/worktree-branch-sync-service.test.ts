@@ -21,7 +21,7 @@ function fixture() {
   const status: WorktreeBranchStatus = { branch: "main", remoteOnly: false, remote: "origin", remoteBranch: "main", ahead: 0, behind: 1, dirtyFiles: 0, revision: "a".repeat(64) };
   let settle!: (result: WorktreeBranchSyncResult) => void;
   const gate = new Promise<WorktreeBranchSyncResult>(resolve => { settle = resolve; });
-  const branchStatus = vi.fn(async () => ({ ...status }));
+  const branchStatus = vi.fn<SessionWorktreeCoordinator["branchStatus"]>(async () => ({ ...status }));
   const syncBranch = vi.fn(async (_target: TargetDescriptor, _ref: string, _revision: string, assertCurrent: () => void) => { const result = await gate; assertCurrent(); return result; });
   const coordinator = { branchStatus, syncBranch } as unknown as SessionWorktreeCoordinator;
   const context = (foreign = false) => ({ signal: new AbortController().signal, foreign }) as unknown as HandlerContext;
@@ -31,10 +31,10 @@ function fixture() {
   });
   return { store, target, owner, other, status, branchStatus, syncBranch, settle, api, context };
 }
-async function request(f: ReturnType<typeof fixture>, api: ReturnType<ReturnType<typeof fixture>["api"]>, operationId = "branch-operation-one") {
+async function request(f: ReturnType<typeof fixture>, api: ReturnType<ReturnType<typeof fixture>["api"]>, operationId = "branch-operation-one", sourceRef = "refs/heads/main") {
   const value = await api.getTargetWorktreeBranchStatus(create(contract.GetTargetWorktreeBranchStatusRequestSchema,
-    { targetId: "target", sourceRef: "refs/heads/main" }), f.context());
-  return create(contract.SyncTargetWorktreeBranchRequestSchema, { targetId: "target", sourceRef: "refs/heads/main", operationId, expectedRevision: value.status!.revision });
+    { targetId: "target", sourceRef }), f.context());
+  return create(contract.SyncTargetWorktreeBranchRequestSchema, { targetId: "target", sourceRef, operationId, expectedRevision: value.status!.revision });
 }
 it("journals admission, permits observation after request disconnect, and replays the exact owner receipt once", async () => {
   const f = fixture(), api = f.api(), input = await request(f, api), abort = new AbortController();
@@ -53,6 +53,25 @@ it("journals admission, permits observation after request disconnect, and replay
   expect((await f.api().syncTargetWorktreeBranch(input, f.context())).operation).toEqual(result.operation);
   expect(f.syncBranch).toHaveBeenCalledOnce();
   expect(JSON.stringify(result)).not.toContain(process.cwd()); expect(JSON.stringify(result)).not.toContain(f.owner.authKeyDigest);
+});
+it("completes the original busy receipt while an independent branch update still holds the repository lane", async () => {
+  const f = fixture(), api = f.api(), first = await request(f, api);
+  const secondStatus = { ...f.status, branch: "other", revision: "c".repeat(64) };
+  f.branchStatus.mockImplementation(async (_target, ref) => ref === "refs/heads/other" ? secondStatus : f.status);
+  f.syncBranch.mockImplementationOnce(f.syncBranch.getMockImplementation()!);
+  f.syncBranch.mockImplementationOnce(async () => ({ status: secondStatus, updated: 0, errorCode: "busy" }));
+  const second = await request(f, api, "branch-operation-two", "refs/heads/other");
+  await api.syncTargetWorktreeBranch(first, f.context());
+  await api.syncTargetWorktreeBranch(second, f.context());
+  const read = (operationId: string) => api.getWorktreeBranchSyncOperation(create(contract.GetWorktreeBranchSyncOperationRequestSchema, { operationId }), f.context());
+  await vi.waitFor(async () => expect((await read(second.operationId)).operation).toMatchObject({ operationId: second.operationId,
+    pending: false, unknown: false, updated: 0, errorCode: "busy", status: { branch: "other" } }));
+  expect((await read(first.operationId)).operation?.pending).toBe(true);
+  const replay = await f.api().syncTargetWorktreeBranch(second, f.context());
+  expect(replay.operation).toEqual((await read(second.operationId)).operation);
+  expect(f.syncBranch).toHaveBeenCalledTimes(2);
+  f.settle({ status: f.status, updated: 1 });
+  await vi.waitFor(async () => expect((await read(first.operationId)).operation?.updated).toBe(1));
 });
 it("binds the observed repository Target and retains unknown effects through service recreation", async () => {
   const f = fixture(), api = f.api(), input = await request(f, api);

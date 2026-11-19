@@ -119,7 +119,8 @@ export function WorktreeBranchSync({ api, ownerKey, targetId, sourceRef, disable
     </div>
     {status && <p className="muted" role="status">{t("worktree.branch.counts", { ahead: status.ahead, behind: status.behind, dirty: status.dirtyFiles })}</p>}
     {status?.blocked && <p className="inline-error" role="alert">{t(`worktree.branch.${status.blocked}`)}</p>}
-    {receipt && !receipt.pending && !receipt.unknown && !receipt.status?.blocked && <p role="status">{t("worktree.branch.updated", { count: receipt.updated })}</p>}
+    {receipt && !receipt.pending && !receipt.unknown && !receipt.status?.blocked && !receipt.errorCode && <p role="status">{t("worktree.branch.updated", { count: receipt.updated })}</p>}
+    {receipt?.errorCode === "busy" && <p className="inline-error" role="alert">{t("worktree.branch.busy")}</p>}
     {(receipt?.unknown || journal && error) && <p role="alert">{t("worktree.branch.unknown")}</p>}
     {error && !journal && <p className="inline-error" role="alert">{t("worktree.branch.unavailable")}</p>}
     {storageError && <p className="inline-error" role="alert">{t("worktree.branch.receiptUnavailable")}</p>}
