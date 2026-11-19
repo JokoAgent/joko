@@ -3747,9 +3747,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       });
       try {
         managedRoute = await waitFor(preparing, this.#initializationTimeoutMs, context.signal, managedRouteUnavailable);
-        if (managedRoute.protocol !== "anthropic-messages" || managedRoute.providerId !== providerId
+        if (!managedProviderSupport(this.#managedProviders.support).protocols.includes(managedRoute.protocol)
+          || (managedRoute.protocol === "openai-responses" && (scoped.remote || context.hostedExecution))
+          || managedRoute.providerId !== providerId
           || managedRoute.model.providerId !== providerId || managedRoute.model.modelId !== modelId
-          || managedRoute.model.api !== "anthropic-messages") throw managedRouteUnavailable();
+          || managedRoute.model.api !== managedRoute.protocol) throw managedRouteUnavailable();
         managedRoute.assertCurrent();
         validateManagedThinkingMap(managedRoute.thinkingLevelMap);
         managedModelLimitEnvironment(managedRoute.model);
@@ -9001,8 +9003,13 @@ export const CLAUDE_MANAGED_PROVIDER_SUPPORT: ProviderRuntimeSupport = Object.fr
   ] as const)
 });
 
+export const CLAUDE_LOCAL_MANAGED_PROVIDER_SUPPORT: ProviderRuntimeSupport = Object.freeze({
+  ...CLAUDE_MANAGED_PROVIDER_SUPPORT,
+  protocols: Object.freeze(["anthropic-messages", "openai-responses"] as const)
+});
+
 function managedProviderSupport(support: ProviderRuntimeSupport): ProviderRuntimeSupport {
-  return { protocols: support.protocols.filter((protocol) => CLAUDE_MANAGED_PROVIDER_SUPPORT.protocols.includes(protocol)),
+  return { protocols: support.protocols.filter((protocol) => CLAUDE_LOCAL_MANAGED_PROVIDER_SUPPORT.protocols.includes(protocol)),
     fields: support.fields.filter((field) => CLAUDE_MANAGED_PROVIDER_SUPPORT.fields.includes(field)) };
 }
 
@@ -9268,7 +9275,7 @@ function managedQueryEnvironment(route: ManagedProviderRouteBinding, port: Manag
   modelLimits: Readonly<Record<string, string>>): Readonly<Record<string, string | undefined>> {
   const token = port.environment[route.apiKeyEnvironment];
   const endpoint = new URL(route.baseUrl);
-  if (route.protocol !== "anthropic-messages" || token === undefined || token.length === 0
+  if (!managedProviderSupport(port.support).protocols.includes(route.protocol) || token === undefined || token.length === 0
     || !port.secretEnvironmentNames.includes(route.apiKeyEnvironment)
     || endpoint.protocol !== "http:" || !["127.0.0.1", "[::1]"].includes(endpoint.hostname)
     || endpoint.username !== "" || endpoint.password !== "" || endpoint.search !== "" || endpoint.hash !== "") throw managedRouteUnavailable();

@@ -15,7 +15,8 @@ async function fixture(
   nativeResponses = false,
   protocol: "openai-responses" | "openai-completions" | "anthropic-messages" = "openai-responses",
   providerId = "provider",
-  configuredPath?: string
+  configuredPath?: string | null,
+  clientProtocol?: "anthropic-messages"
 ) {
   const directory = await mkdtemp(join(tmpdir(), "joko-provider-proxy-"));
   const store = new OperationalStore(join(directory, "store.db"));
@@ -28,6 +29,7 @@ async function fixture(
   const receivedBodies: Record<string, unknown>[] = [];
   const forwardedProxyTokens: Array<string | undefined> = [];
   const forwardedFedrampHeaders: Array<string | undefined> = [];
+  const forwardedClaudeKeys: Array<string | undefined> = [];
   const nativeReceived: {
     path: string;
     model: string;
@@ -47,7 +49,8 @@ async function fixture(
     received.push({ path: request.url!, model: body.model, authorization: request.headers.authorization });
     forwardedProxyTokens.push(request.headers["x-joko-provider-proxy-token"] as string | undefined);
     forwardedFedrampHeaders.push(request.headers["x-openai-fedramp"] as string | undefined);
-    if (configuredPath !== undefined && request.url !== configuredPath && request.url !== `${configuredPath.replace(/\/$/u, "")}/compact`) {
+    forwardedClaudeKeys.push(request.headers["x-api-key"] as string | undefined);
+    if (typeof configuredPath === "string" && request.url !== configuredPath && request.url !== `${configuredPath.replace(/\/$/u, "")}/compact`) {
       response.writeHead(404); response.end(); return;
     }
     if (reject) { response.writeHead(302, { location: "https://external.invalid/", "content-type": "text/plain" }); response.end("upstream-private-detail"); return; }
@@ -122,10 +125,12 @@ async function fixture(
     assertOwner: () => { if (!ownerCurrent || !sessionPresent) throw new Error("Owner changed"); }
   });
   await proxy.start();
-  const port = proxy.createRuntime({ backendId: "runtime", generation: 3, support: { protocols: [protocol], fields: [] }, assertCurrent: () => { if (!ownerCurrent) throw new Error("Runtime changed"); } });
+  const port = proxy.createRuntime({ backendId: "runtime", generation: 3, support: { protocols: [protocol], fields: [] }, clientProtocol,
+    assertCurrent: () => { if (!ownerCurrent) throw new Error("Runtime changed"); } });
   const owner = { backendId: "runtime", backendInstanceGeneration: 3, targetId: "target", sessionId: "session", sessionGeneration: 4, providerId, modelId: "model" };
-  const requestPath = configuredPath ?? (protocol === "anthropic-messages" ? "/custom/messages"
+  const requestPath = configuredPath === null ? undefined : configuredPath ?? (protocol === "anthropic-messages" ? "/custom/messages"
     : protocol === "openai-completions" ? "/custom/chat/completions" : "/custom/responses");
+  const baseUrl = configuredPath === null ? `${endpoint}/v1` : endpoint;
   const catalogModels = [
     { id: "model", input: ["text"] as const, contextWindow: 64_000, maxTokens: 4_000 },
     { id: "child-model", input: ["text"] as const, contextWindow: 128_000, maxTokens: 8_000 }
@@ -135,7 +140,7 @@ async function fixture(
     const ticket = credentials.createUploadTicket(); credentials.upload(ticket.credentialUploadTicketId, secret);
     await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: reference, displayName: "Provider credential", kind: "api_key" });
     await providers.upsertConfiguration({ providerId, displayName: "Provider", kind: "custom_endpoint", enabled: true, expectedVersion: revision,
-      runtimes: [{ backendId: "runtime", provider: { id: providerId, api: protocol, baseUrl: endpoint, apiKeyEnv: "PROVIDER_KEY",
+      runtimes: [{ backendId: "runtime", provider: { id: providerId, api: protocol, baseUrl, apiKeyEnv: "PROVIDER_KEY",
         headers: { "X-Joko-Provider-Proxy-Token": { env: "PROVIDER_KEY" } },
         models: catalogModels },
         credentialBindings: { PROVIDER_KEY: reference }, credentialOrigin: endpoint, requestPath }] });
@@ -165,7 +170,7 @@ async function fixture(
       expectedVersion: 1n
     });
   };
-  return { directory, store, credentials, providers, proxy, port, owner, received, receivedBodies, nativeReceived, forwardedProxyTokens, forwardedFedrampHeaders,
+  return { directory, store, credentials, providers, proxy, port, owner, received, receivedBodies, nativeReceived, forwardedProxyTokens, forwardedFedrampHeaders, forwardedClaudeKeys,
     disableModel: (modelId: string) => disabledModels.add(modelId),
     write, markProviderUnavailable, requestPath,
     token: port.environment[port.secretEnvironmentNames[0]!]!, toolOutcome: () => toolOutcome,
@@ -190,6 +195,63 @@ function responsesEvents(body: string): Record<string, unknown>[] {
 }
 
 describe("Managed Provider native proxy", () => {
+  it("translates a Claude SDK Messages turn through the selected account's standard Responses endpoint", async () => {
+    const f = await fixture(false, "openai-responses", "claude-response-provider", null, "anthropic-messages");
+    try {
+      expect(f.port.listModels()).toContainEqual(expect.objectContaining({ providerId: f.owner.providerId, modelId: f.owner.modelId, api: "openai-responses" }));
+      const binding = await f.port.prepare(f.owner);
+      const lease = await binding.activate({ operationId: "ordinary-claude-turn", signal: new AbortController().signal, assertCurrent: () => undefined });
+      const request = (path: string, body: Record<string, unknown>) => fetch(`${binding.baseUrl}${path}`, {
+        method: "POST", headers: { "x-api-key": f.token, "content-type": "application/json" },
+        body: JSON.stringify({ model: f.owner.modelId, messages: [{ role: "user", content: "Hello from Claude" }], ...body })
+      });
+      try {
+        const count = await request("/v1/messages/count_tokens", {});
+        expect(count.status).toBe(200);
+        expect(await count.json()).toEqual({ input_tokens: expect.any(Number) });
+        expect(f.received).toEqual([]);
+
+        const id = "resp-1";
+        const response = { id, status: "completed", output: [], usage: { input_tokens: 12, output_tokens: 3, input_tokens_details: { cached_tokens: 4 } } };
+        const item = { id: "msg-1", type: "message", role: "assistant", content: [] };
+        f.respondWith([
+          { type: "response.created", response: { id, status: "in_progress" } },
+          { type: "response.output_item.added", output_index: 0, item },
+          { type: "response.output_text.delta", output_index: 0, delta: "Exact reply" },
+          { type: "response.output_item.done", output_index: 0, item },
+          { type: "response.completed", response }
+        ].map(chatEvent).join(""));
+        const turn = await request("/v1/messages", { max_tokens: 5_000, stream: true });
+        expect(turn.status).toBe(200);
+        expect(turn.headers.get("content-type")).toContain("text/event-stream");
+        expect(responsesEvents(await turn.text())).toEqual([
+          expect.objectContaining({ type: "message_start", message: expect.objectContaining({ model: f.owner.modelId }) }),
+          expect.objectContaining({ type: "content_block_start" }),
+          { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Exact reply" } },
+          { type: "content_block_stop", index: 0 },
+          { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null },
+            usage: { input_tokens: 8, output_tokens: 3, cache_read_input_tokens: 4, cache_creation_input_tokens: 0 } },
+          { type: "message_stop" }
+        ]);
+        expect(f.received).toEqual([{ path: "/v1/responses", model: "model", authorization: "Bearer first-private-provider-credential" }]);
+        expect(f.receivedBodies).toEqual([{ model: "model", max_output_tokens: 4_000, stream: true, store: false,
+          input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "Hello from Claude" }] }] }]);
+        expect(f.forwardedProxyTokens).toEqual([undefined]);
+        expect(f.forwardedClaudeKeys).toEqual([undefined]);
+
+        const fallback = await request("/v1/messages", { max_tokens: 2_000, stream: false });
+        expect(fallback.status).toBe(200);
+        expect(await fallback.json()).toMatchObject({ type: "message", model: "model", content: [{ type: "text", text: "Exact reply" }] });
+
+        f.respondWith(chatEvent({ type: "response.failed", response: { error: { message: "private upstream details" } } }));
+        const failed = await request("/v1/messages", { max_tokens: 2_000, stream: true });
+        expect(responsesEvents(await failed.text())).toEqual([{ type: "error", error: {
+          type: "api_error", message: "The Responses Provider reported a failed request."
+        } }]);
+      } finally { lease.release(); binding.dispose(); }
+    } finally { await f.dispose(); }
+  });
+
   it("sends the exact saved Responses path and appends a distinct compact suffix", async () => {
     const f = await fixture(false, "openai-responses", "provider", "/tenant/responses/");
     try {

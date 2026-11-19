@@ -1147,6 +1147,28 @@ describe("ClaudeCodeAdapter", () => {
     expect(managed.port.dispose).toHaveBeenCalledOnce();
   });
 
+  test("keeps the Claude SDK on the managed Messages transport when the selected account speaks Responses", async () => {
+    const managed = managedProviderFixture({}, {}, "openai-responses");
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    try {
+      const descriptor = await adapter.describe();
+      expect(descriptor.providerRuntimeSupport?.protocols).toEqual(["openai-responses"]);
+      const modelSelection = { providerId: "configured-provider", modelId: "configured-model" };
+      expect(descriptor.models).toContainEqual(expect.objectContaining({ ...modelSelection, api: "openai-responses" }));
+      const binding = await adapter.createSession(createInput(modelSelection), contextFor().context);
+      const query = runtime.queries[0]!;
+      expect(query.params.options.env).toMatchObject({ ANTHROPIC_BASE_URL: "http://127.0.0.1:31415/routes/fixture",
+        ANTHROPIC_API_KEY: managed.token, CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1" });
+      const turn = contextFor(binding, { operationId: "openai-responses-ordinary-turn" });
+      await adapter.send(textPrompt("send through the original Claude input"), { ...turn.context, modelSelection });
+      expect(managed.activations).toHaveLength(1);
+      query.push(resultMessage(binding.nativeSessionId!, { result: "Controlled reply", totalCostUsd: 0 }));
+      await eventually(() => turn.events.some((event) => event.type === "done"));
+      expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
+    } finally { await adapter.dispose(); }
+  });
+
   test("runs a foreground managed Agent in an independently configured exact child Query", async () => {
     const managed = managedProviderFixture();
     const runtime = new FakeSdkRuntime({
@@ -7511,11 +7533,12 @@ interface FakeRuntimeOptions {
 
 function managedProviderFixture(
   thinkingLevelMap: Readonly<Record<string, string | null>> = {},
-  modelThinkingOverrides: Readonly<Record<string, Readonly<Record<string, string | null>>>> = {}
+  modelThinkingOverrides: Readonly<Record<string, Readonly<Record<string, string | null>>>> = {},
+  protocol: "anthropic-messages" | "openai-responses" = "anthropic-messages"
 ) {
   const token = "private-model-proxy-fixture-token";
   const models: ProviderModel[] = ["configured-model", "compatible-model", "second-model", "incompatible-thinking"].map((modelId) => ({
-    providerId: "configured-provider", modelId, displayName: modelId, api: "anthropic-messages",
+    providerId: "configured-provider", modelId, displayName: modelId, api: protocol,
     contextWindow: modelId === "second-model" ? 128_000 : 64_000,
     maxOutputTokens: modelId === "second-model" ? 8_000 : 4_000,
     supportsImages: true, supportsFastMode: true, thinkingLevels: ["low", "high", "unavailable"],
@@ -7536,13 +7559,13 @@ function managedProviderFixture(
   let enabled = true;
   let revision = "revision-one";
   const port: ManagedProviderRuntimePort = {
-    support: { protocols: ["anthropic-messages"], fields: ["headers", "model_input_modalities", "model_limits"] },
+    support: { protocols: [protocol], fields: ["headers", "model_input_modalities", "model_limits"] },
     environment: { JOKO_MODEL_PROXY_TOKEN: token }, secretEnvironmentNames: ["JOKO_MODEL_PROXY_TOKEN"],
     dispose: vi.fn(),
     hasProvider: (providerId) => providerId === "configured-provider",
     listModels: () => models,
     getThinkingLevelMap: (_providerId, modelId) => thinkingMapFor(modelId),
-    listProviders: () => [{ providerId: "configured-provider", displayName: "Configured Provider", api: "anthropic-messages",
+    listProviders: () => [{ providerId: "configured-provider", displayName: "Configured Provider", api: protocol,
       authenticationState: "authenticated", loginMethods: [], supportsLogin: false, supportsLogout: false, supportsRefresh: true, supportsModelRefresh: true }],
     prepare: async (owner) => {
       if (!enabled) throw new Error("The managed route is disabled.");
@@ -7550,7 +7573,7 @@ function managedProviderFixture(
       const preparedRevision = revision;
       const assertCurrent = () => { if (!enabled || disposed || preparedRevision !== revision) throw new Error("The managed route is stale."); };
       const selected = models.find((model) => model.modelId === owner.modelId)!;
-      return { providerId: owner.providerId, model: selected, thinkingLevelMap: thinkingMapFor(selected.modelId), protocol: "anthropic-messages",
+      return { providerId: owner.providerId, model: selected, thinkingLevelMap: thinkingMapFor(selected.modelId), protocol,
         revision: preparedRevision, baseUrl: "http://127.0.0.1:31415/routes/fixture", apiKeyEnvironment: "JOKO_MODEL_PROXY_TOKEN",
         assertCurrent, activate: async (input) => { assertCurrent(); input.assertCurrent(); const release = vi.fn(); activations.push({ input, release }); return { release }; },
         authorizeSubtask: async (input) => {
