@@ -541,7 +541,7 @@ jobs:
         if: ${{ (inputs.sdk_runtime || 'relay') == 'relay' }}
         env:
           NODE_OPTIONS: --max-old-space-size=4096
-        run: pnpm --filter @joko/e2e... -r --if-present build
+        run: rustup run 1.99.0 pnpm --filter @joko/e2e... -r --if-present build
 
       - name: Download this run's compiled Simulator app
         uses: actions/download-artifact@v4
