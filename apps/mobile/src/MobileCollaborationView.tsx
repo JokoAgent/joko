@@ -53,7 +53,9 @@ export function mobileWorkerFormValid(form: MobileWorkerForm | undefined, target
 export function mobileCollaborationCapacity(view: MobileCollaborationView, locale: MobileSupportedLocale): string | undefined {
   if (!view.settings) return undefined;
   const active = view.tree?.workers.filter(value => !value.runtimeReleased && value.status !== CollaborationWorkerStatus.ARCHIVED).length ?? 0;
-  return mobileCollaborationCopy(locale).capacity.replace("{count}", String(active)).replace("{soft}", String(view.settings.workerSoftLimit))
+  const copy = mobileCollaborationCopy(locale);
+  const capacity = view.settings.workerIdleReleaseMinutes === 0 ? copy.capacityWithoutIdleRelease : copy.capacity;
+  return capacity.replace("{count}", String(active)).replace("{soft}", String(view.settings.workerSoftLimit))
     .replace("{hard}", String(view.settings.workerHardLimit)).replace("{minutes}", String(view.settings.workerIdleReleaseMinutes));
 }
 export function MobileCollaborationViewContent(props: MobileCollaborationViewProps) {
