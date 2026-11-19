@@ -32,10 +32,10 @@ class FakeArtifacts implements BrowserTransferArtifactStore {
   resolveFailure = false;
   ingestFailure = false;
 
-  async resolveBlobPath(blob: BlobRef): Promise<string> {
+  async resolveBlobFile(blob: BlobRef): Promise<{ path: string; fileName?: string }> {
     this.calls.push(`resolve:${blob.id}`);
     if (this.resolveFailure) throw new Error("D:\\private\\source is not approved");
-    return "D:\\artifacts\\verified-upload.txt";
+    return { path: "D:\\artifacts\\verified-upload.txt", fileName: blob.fileName };
   }
 
   async ingestPath(sourcePath: string, options?: { fileName?: string }): Promise<ArtifactRecord> {
@@ -316,11 +316,11 @@ describe("BrowserTransferCoordinator", () => {
   it("keeps a resolving upload fenced before the next Browser generation is published", async () => {
     const artifacts = new FakeArtifacts();
     const provider = new FakeProvider();
-    let finishResolve!: (path: string) => void;
+    let finishResolve!: (file: { path: string; fileName?: string }) => void;
     let finishRecovery!: () => void;
-    const path = new Promise<string>(resolve => { finishResolve = resolve; });
+    const path = new Promise<{ path: string; fileName?: string }>(resolve => { finishResolve = resolve; });
     const recovering = new Promise<void>(resolve => { finishRecovery = resolve; });
-    const resolvePath = vi.spyOn(artifacts, "resolveBlobPath").mockReturnValue(path);
+    const resolvePath = vi.spyOn(artifacts, "resolveBlobFile").mockReturnValue(path);
     const recoverProvider = provider.recover.bind(provider);
     vi.spyOn(provider, "recover").mockImplementation(async () => { await recovering; await recoverProvider(); });
     const transfers = new BrowserTransferCoordinator({ artifacts, provider });
@@ -333,12 +333,12 @@ describe("BrowserTransferCoordinator", () => {
       const retired = transfers.get(original.browserTransferId)!;
       expect(retired).toMatchObject({ state: contract.BrowserTransferState.FAILED, error: { code: "BROWSER_GENERATION_FENCED" } });
       expect(provider.generation).toBe(7);
-      finishResolve("D:\\artifacts\\verified-upload.txt");
+      finishResolve({ path: "D:\\artifacts\\verified-upload.txt", fileName: "original-upload.txt" });
       expect(await uploading).toEqual(retired);
       expect(provider.calls).toEqual([]);
       expect(provider.actions).toEqual([]);
     } finally {
-      finishResolve("D:\\artifacts\\verified-upload.txt");
+      finishResolve({ path: "D:\\artifacts\\verified-upload.txt", fileName: "original-upload.txt" });
       finishRecovery();
       await restarting;
     }

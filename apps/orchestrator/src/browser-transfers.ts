@@ -9,7 +9,7 @@ import { sanitizeBrowserFileName, type BrowserDownloadHandler, type BrowserDownl
 import type { ArtifactStore } from "./artifact-store.js";
 import { toProtoTimestamp } from "./proto-mapper.js";
 
-export type BrowserTransferArtifactStore = Pick<ArtifactStore, "resolveBlobPath" | "ingestPath">;
+export type BrowserTransferArtifactStore = Pick<ArtifactStore, "resolveBlobFile" | "ingestPath">;
 
 export type BrowserTransferProvider = Pick<BrowserProvider, "generation" | "acquireAgentLease" | "releaseAgentLease" | "uploadFiles" | "recover">;
 
@@ -370,7 +370,11 @@ export class BrowserTransferCoordinator {
       validateConnection(connection);
       assertCurrent();
       phase = "blob_resolution";
-      const paths = await Promise.all(records.map(member => this.#artifacts.resolveBlobPath(member.blob!)));
+      const files = await Promise.all(records.map(async member => {
+        const blob = member.blob!;
+        const file = await this.#artifacts.resolveBlobFile(blob);
+        return { ...file, sha256: blob.sha256, byteLength: blob.byteLength };
+      }));
       assertCurrent();
       let owner: BrowserTakeoverFence | BrowserLeaseFence;
       if (isOwnedTakeoverPage(connection.humanTakeover, record, connection)) owner = connection.humanTakeover;
@@ -381,15 +385,19 @@ export class BrowserTransferCoordinator {
         owner = lease;
       }
       phase = "browser_action";
-      await this.#provider.uploadFiles(record.pageId, owner, { type: "upload", selector: inputSelector, paths }, {
+      await this.#provider.uploadFiles(record.pageId, owner, {
+        type: "upload", selector: inputSelector, paths: files.map(file => file.path)
+      }, {
         documentId: connection.documentId,
+        fileIdentities: files,
         assertCurrent,
         markDispatched: () => {
           assertCurrent();
           const startedAt = this.#now();
-          for (const member of records) {
+          for (const [index, member] of records.entries()) {
             member.state = contract.BrowserTransferState.RUNNING;
             member.startedAt = startedAt;
+            member.blob = { ...member.blob!, fileName: files[index]!.fileName };
           }
           this.persistRecords(records);
         }

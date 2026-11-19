@@ -316,16 +316,21 @@ export class ArtifactStore {
 
   /** Resolve a blob to a verified regular file for a fenced backend process. */
   async resolveBlobPath(blob: BlobRef): Promise<string> {
+    return (await this.resolveBlobFile(blob)).path;
+  }
+
+  /** The stored name and verified local file come from the same registered Blob. */
+  async resolveBlobFile(blob: BlobRef): Promise<{ readonly path: string; readonly fileName?: string }> {
     const dispatch = this.dispatchInputArtifact(blob.id);
     if (dispatch !== undefined) {
       assertBlobIdentity(blob, dispatch.file);
-      return (await dispatch.verify()).canonical;
+      return { path: (await dispatch.verify()).canonical, fileName: dispatch.file.fileName };
     }
     const artifact = await this.requireArtifact(blob.id);
     assertBlobIdentity(blob, artifact);
     await this.verifyStoragePath(artifact);
     this.#recordStorageAccess(artifact);
-    return artifact.storagePath;
+    return { path: artifact.storagePath, fileName: artifact.fileName };
   }
 
   /** Read a verified blob for Pi's native image RPC payload. */

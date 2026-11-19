@@ -14,6 +14,8 @@ import {
 import { isWithin } from "@joko/core/policy";
 import { installHtmlSnapshot, isWorkspaceHtmlPreviewUrl, validateHtmlSnapshot, type BrowserHtmlSnapshot } from "./html-preview.js";
 import { BrowserProxyRequestGate, type BrowserProxyRequestGateHandle } from "./proxy-request-gate.js";
+import { prepareBrowserUploadRoot, removeBrowserUploadSelection, stageBrowserUploadSelection,
+  type BrowserUploadFileIdentity } from "./upload-staging.js";
 import {
   browserProxyRouteKey, buildBrowserProxyLaunchArgs, parseBrowserProxyServer, publicBrowserProxyRoute,
   type BrowserProxyRoute, type BrowserStartOptions
@@ -489,8 +491,11 @@ export class BrowserProvider {
   readonly #nativeContexts = new Map<BrowserContext, {
     readonly route: BrowserProxyRoute;
     readonly gate?: BrowserProxyRequestGateHandle;
+    readonly uploadCleanup: Set<Promise<void>>;
     retirement?: Promise<void>;
   }>();
+  readonly #uploadRootsByProfile = new Map<string, Promise<string>>();
+  readonly #uploadSelections = new WeakMap<Page, Set<string>>();
   readonly #htmlContexts = new Set<BrowserContext>();
   readonly #htmlPageOwners = new Map<Page, {
     readonly context: BrowserContext;
@@ -753,8 +758,11 @@ export class BrowserProvider {
     if (record.retirement !== undefined) return record.retirement;
     record.gate?.beginRetirement();
     const retirement = (async () => {
+      const pages = context.pages();
       try { await context.close(); }
       catch { this.#routeBlocked = true; throw new Error("The owned Browser writer retirement is unconfirmed; stop it before retrying."); }
+      for (const page of pages) this.releasePageUploadSelections(page);
+      await Promise.all(record.uploadCleanup);
       await record.gate?.dispose();
       this.#nativeContexts.delete(context);
     })();
@@ -796,7 +804,7 @@ export class BrowserProvider {
     const gate = route.mode === "direct" ? undefined
       : (this.#options.createProxyRequestGate?.(context, route, () => this.proxyGateFailed(context, lifecycleEpoch))
         ?? new BrowserProxyRequestGate(context, route, () => this.proxyGateFailed(context, lifecycleEpoch)));
-    this.#nativeContexts.set(context, { route, ...(gate === undefined ? {} : { gate }) });
+    this.#nativeContexts.set(context, { route, ...(gate === undefined ? {} : { gate }), uploadCleanup: new Set() });
     const onAbort = () => this.proxyGateFailed(context, lifecycleEpoch);
     options?.signal?.addEventListener("abort", onAbort, { once: true });
     try {
@@ -816,6 +824,7 @@ export class BrowserProvider {
       this.#routeBlocked = false;
       context.on("page", (page) => this.bindPage(page));
       for (const page of context.pages()) this.bindPage(page);
+      void this.prepareUploadRoot(profileDirectory).catch(() => undefined);
       await this.emit({ at: Date.now(), type: "started", detail: `Browser generation ${this.#generation} started.` });
     } catch (error) {
       if (route.mode === "proxied") this.#routeBlocked = true;
@@ -1598,7 +1607,8 @@ export class BrowserProvider {
     pageId: string,
     owner: BrowserLeaseFence | BrowserTakeoverFence,
     action: Extract<BrowserAction, { type: "upload" }>,
-    guard: { readonly documentId: string; readonly assertCurrent: () => void; readonly markDispatched: () => void }
+    guard: { readonly documentId: string; readonly assertCurrent: () => void; readonly markDispatched: () => void;
+      readonly fileIdentities?: readonly BrowserUploadFileIdentity[] }
   ): Promise<void> {
     const safePageId = validatePublicPageId(pageId);
     const { selector, paths } = validateBrowserUploadAction(action);
@@ -1608,7 +1618,7 @@ export class BrowserProvider {
       await this.runHumanTakeoverOperation(takeover, (page) => this.setFileInput(page, selector, paths, guard.documentId, () => {
         this.assertHumanTakeover(takeover);
         guard.assertCurrent();
-      }, guard.markDispatched), guard.assertCurrent);
+      }, guard.markDispatched, guard.fileIdentities), guard.assertCurrent);
       return;
     }
     const lease = copyAgentFence(owner);
@@ -1617,7 +1627,7 @@ export class BrowserProvider {
       await this.setFileInput(page, selector, paths, guard.documentId, () => {
         this.#leases.assert(lease);
         guard.assertCurrent();
-      }, guard.markDispatched);
+      }, guard.markDispatched, guard.fileIdentities);
       await this.emit({ at: Date.now(), type: "action", pageId: safePageId, detail: "upload" });
     });
   }
@@ -2254,12 +2264,14 @@ export class BrowserProvider {
     page.on("crash", () => {
       this.#pageStates.set(page, "crashed");
       fenceTakeover();
+      this.releasePageUploadSelections(page);
       void this.emit({ at: Date.now(), type: "crashed", pageId, detail: "Page crashed." });
     });
     page.on("close", () => {
       const crashed = this.#pageStates.get(page) === "crashed";
       this.#pageStates.set(page, "closed");
       fenceTakeover();
+      this.releasePageUploadSelections(page);
       if (!crashed && !this.#requestedPageCloses.has(page)) this.observeExternalPageClose(page, pageId, generation);
     });
     const finishNavigation = () => {
@@ -2546,7 +2558,8 @@ export class BrowserProvider {
     paths: readonly string[],
     documentId: string | undefined,
     assertCurrent: () => void,
-    markDispatched?: () => void
+    markDispatched?: () => void,
+    fileIdentities?: readonly BrowserUploadFileIdentity[]
   ): Promise<void> {
     const assertUploadCurrent = () => {
       assertCurrent();
@@ -2564,19 +2577,51 @@ export class BrowserProvider {
       assertUploadCurrent();
       throw new BrowserTakeoverConflictError("The Browser file input is no longer available in the original document.");
     }
+    let selection: Awaited<ReturnType<typeof stageBrowserUploadSelection>> | undefined;
+    let retained = false;
     try {
       assertUploadCurrent();
       if (files.length > 1 && !await input.evaluate(element => element instanceof HTMLInputElement
         && element.type === "file" && element.multiple)) {
         throw new Error("The selected Browser file input does not accept multiple files.");
       }
+      if (fileIdentities !== undefined) {
+        const root = await this.prepareUploadRoot(this.#profileDirectories[this.#targetMode]);
+        selection = await stageBrowserUploadSelection(root, files, fileIdentities, assertUploadCurrent);
+      }
       assertUploadCurrent();
       markDispatched?.();
-      await input.setInputFiles(files);
+      if (selection !== undefined) {
+        const current = this.#uploadSelections.get(page) ?? new Set<string>();
+        current.add(selection.directory);
+        this.#uploadSelections.set(page, current);
+        retained = true;
+      }
+      await input.setInputFiles(selection === undefined ? files : [...selection.files]);
       assertCurrent();
     } finally {
       await input.dispose().catch(() => undefined);
+      if (selection !== undefined && !retained) await removeBrowserUploadSelection(selection.directory).catch(() => undefined);
     }
+  }
+
+  private prepareUploadRoot(profileDirectory: string): Promise<string> {
+    const existing = this.#uploadRootsByProfile.get(profileDirectory);
+    if (existing !== undefined) return existing;
+    const preparation = prepareBrowserUploadRoot(profileDirectory);
+    this.#uploadRootsByProfile.set(profileDirectory, preparation);
+    void preparation.catch(() => { this.#uploadRootsByProfile.delete(profileDirectory); });
+    return preparation;
+  }
+
+  private releasePageUploadSelections(page: Page): void {
+    const selections = this.#uploadSelections.get(page);
+    if (selections === undefined) return;
+    this.#uploadSelections.delete(page);
+    const owner = this.#nativeContexts.get(page.context())?.uploadCleanup;
+    const cleanup = Promise.allSettled([...selections].map(removeBrowserUploadSelection)).then(() => undefined);
+    owner?.add(cleanup);
+    void cleanup.then(() => owner?.delete(cleanup));
   }
 
   private async emit(activity: BrowserActivity): Promise<void> {
