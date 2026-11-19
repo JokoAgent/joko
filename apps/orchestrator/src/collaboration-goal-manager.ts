@@ -13,6 +13,7 @@ import {
   OperationInProgressError,
   RevisionConflictError,
   StoreError,
+  collaborationWorkerSessionOperationId,
   operationBodyHash,
   type CollaborationDispatchRecord,
   type CollaborationGoalRecord,
@@ -1110,7 +1111,7 @@ export class CollaborationGoalManager {
     let worker = this.#store.getCollaborationWorker(workerId);
     if (worker.status !== "provisioning") return worker;
     const goal = this.#store.getCollaborationGoal(worker.goalId);
-    const sessionOperationId = serviceOperationId(worker.createOperationId, "session");
+    const sessionOperationId = collaborationWorkerSessionOperationId(worker.createOperationId);
     const sessionOperation = this.#store.findOperation<{ readonly sessionId: string }>(sessionOperationId);
     if (sessionOperation?.status === "started") {
       worker = this.#markWorkerUnknown(worker.id, "COLLABORATION_WORKER_CREATE_UNKNOWN",

@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { backup, DatabaseSync } from "node:sqlite";
 
 import { createClient, createRouterTransport } from "@connectrpc/connect";
 import { CollaborationService, CollaborationWorkerStatus } from "@joko/contracts";
 import { DEFAULT_COLLABORATION_SETTINGS, WorkerHardLimitError } from "@joko/runtime-governance";
-import { OperationalStore, RevisionConflictError, operationBodyHash } from "@joko/store";
+import { OperationalStore, RevisionConflictError, collaborationWorkerSessionOperationId, operationBodyHash } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -625,6 +626,53 @@ describe("CollaborationGoalManager", () => {
       status: worker.status,
       runtimeReleased: true
     });
+  });
+
+  it("binds the original successfully created worker Session during a cold recovery", async () => {
+    const fixture = await createFixture();
+    const goal = fixture.manager.createGoal({ operationId: "worker-committed-session-goal", leadSessionId: fixture.leadSessionId,
+      expectedSessionGeneration: fixture.leadGeneration, title: "Continue original creation", objective: "Bind the committed worker session." }).goal;
+    const input = workerInput(goal.id, goal.revision, fixture.leadSessionId, {
+      operationId: "worker-committed-session-create", label: "Verifier", role: "verification", assignment: ""
+    });
+    const sessionOperationId = collaborationWorkerSessionOperationId(input.operationId);
+    const directory = dirname(fixture.store.filePath);
+    const coldPath = join(directory, "cold-worker-committed.db");
+    const createService = fixture.host.createServiceSession.bind(fixture.host);
+    vi.spyOn(fixture.host, "createServiceSession").mockImplementationOnce(async request => {
+      const result = await createService(request);
+      expect(request.operationId).toBe(sessionOperationId);
+      expect(fixture.store.getOperation(input.operationId).status).toBe("started");
+      expect(fixture.store.getOperation(sessionOperationId)).toMatchObject({ status: "completed", response: result.value });
+      expect(fixture.store.findCollaborationWorkerByCreateOperation(input.operationId)).toMatchObject({ status: "provisioning" });
+      const source = new DatabaseSync(fixture.store.filePath, { readOnly: true });
+      try { await backup(source, coldPath); }
+      finally { source.close(); }
+      return result;
+    });
+    const original = await fixture.manager.createWorker(input);
+    const sessionId = original.worker.sessionId!;
+
+    const reopened = new OperationalStore(coldPath);
+    const artifacts = new ArtifactStore({ rootDirectory: join(directory, "cold-artifacts"),
+      repository: new OperationalArtifactRepository(reopened), ingestRoots: [directory] });
+    const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    const nativeCreate = vi.spyOn(adapter, "createSession");
+    const host = new SessionHost(reopened, artifacts, [adapter]);
+    const recovered = new CollaborationGoalManager({ store: reopened, sessionHost: host, readSettings: () => DEFAULT_COLLABORATION_SETTINGS });
+    cleanups.push(async () => { await recovered.close(); await host.dispose(); reopened.close(); });
+    await artifacts.initialize();
+    await host.initialize();
+    expect(reopened.getOperation(input.operationId).status).toBe("started");
+    const sessionIds = reopened.listSessions({ includeArchived: true }).map(session => session.descriptor.id);
+    await recovered.initialize();
+    const worker = recovered.getTree(goal.id).workers[0]!;
+    expect(worker).toMatchObject({ id: original.worker.id, status: "idle", sessionId, sessionGeneration: original.worker.sessionGeneration });
+    expect(reopened.getOperation(input.operationId)).toMatchObject({ status: "completed", response: { workerId: worker.id } });
+    expect((await recovered.createWorker(input)).worker.id).toBe(worker.id);
+    expect(reopened.listSessions({ includeArchived: true }).map(session => session.descriptor.id)).toEqual(sessionIds);
+    expect(reopened.listQueueItems({ sessionId })).toEqual([]);
+    expect(nativeCreate).not.toHaveBeenCalled();
   });
 
   it("recovers an interrupted worker creation as unknown without replaying the native Session effect", async () => {
