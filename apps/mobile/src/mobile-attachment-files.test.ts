@@ -10,6 +10,15 @@ import type {
   MobilePickedAttachmentCandidate
 } from "./mobile-attachments";
 
+const nativePicker = vi.hoisted(() => ({ pickFileAsync: vi.fn() }));
+vi.mock("expo-modules-core", () => ({
+  requireNativeModule: (name: string) => {
+    if (name !== "FileSystem") throw new Error(`Unexpected native module ${name}.`);
+    return { FileSystemFile: class {}, FileSystemDirectory: class {}, pickFileAsync: nativePicker.pickFileAsync };
+  },
+  uuid: { v4: () => "picker-test" }
+}));
+
 vi.mock("expo-crypto", async () => {
   const { createHash } = await import("node:crypto");
   return {
@@ -99,6 +108,17 @@ describe("mobile durable attachment files", () => {
 
     expect(newId).not.toHaveBeenCalled();
     expect(fixture.driver.stage).not.toHaveBeenCalled();
+  });
+
+  it.each(["ERR_PICKER_CANCELLED", "ERR_FILE_PICKING_CANCELLED"])("separates native cancellation %s from a failed launch", async (code) => {
+    const newId = vi.fn(() => "unused");
+    const files = new MobileAttachmentFiles();
+    const launchFailure = Object.assign(new Error("No presentation activity was available."), { code: "ERR_MISSING_ACTIVITY" });
+    nativePicker.pickFileAsync.mockRejectedValueOnce(launchFailure).mockRejectedValueOnce(Object.assign(new Error("Cancelled"), { code }));
+
+    await expect(files.pickAndStage("profile", [], policy, newId)).rejects.toBe(launchFailure);
+    await expect(files.pickAndStage("profile", [], policy, newId)).resolves.toEqual([]);
+    expect(newId).not.toHaveBeenCalled();
   });
 
   it("copies picker URIs into exact-profile durable storage, hashes in order, and recovers after restart", async () => {

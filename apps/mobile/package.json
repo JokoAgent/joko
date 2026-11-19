@@ -8,7 +8,7 @@
     "autolinking": {
       "android": {
         "exclude": ["expo-notifications", "react-native-screens"],
-        "buildFromSource": ["expo-image"]
+        "buildFromSource": ["expo-file-system", "expo-image"]
       },
       "ios": {
         "buildFromSource": ["expo-image-manipulator"]

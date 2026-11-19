@@ -1,0 +1,39 @@
+diff --git a/android/src/main/java/expo/modules/filesystem/FilePickerContract.kt b/android/src/main/java/expo/modules/filesystem/FilePickerContract.kt
+--- a/android/src/main/java/expo/modules/filesystem/FilePickerContract.kt
++++ b/android/src/main/java/expo/modules/filesystem/FilePickerContract.kt
+@@ -45,7 +45,10 @@ internal class FilePickerContract(private val appContextProvider: AppContextProvid
+     val takeFlags = (intent.flags.and((Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)))
+     if (intent.clipData == null) {
+       val uri = intent.data?.also {
+-        contentResolver.takePersistableUriPermission(it, takeFlags)
++        // The attachment flow stages the selected file while the transient grant is live.
++        if (input.pickerType == PickerType.DIRECTORY) {
++          contentResolver.takePersistableUriPermission(it, takeFlags)
++        }
+       }
+       val pickedPath = when (input.pickerType) {
+         PickerType.DIRECTORY -> FileSystemDirectory(uri ?: Uri.EMPTY)
+@@ -58,7 +61,9 @@ internal class FilePickerContract(private val appContextProvider: AppContextProvid
+     val count = intent.clipData!!.itemCount
+     for (i in 0 until count) {
+       intent.clipData!!.getItemAt(i).uri?.let {
+-        contentResolver.takePersistableUriPermission(it, takeFlags)
++        if (input.pickerType == PickerType.DIRECTORY) {
++          contentResolver.takePersistableUriPermission(it, takeFlags)
++        }
+         pickedPaths.add(
+           when (input.pickerType) {
+             PickerType.FILE -> FileSystemFile(it)
+diff --git a/src/File.ts b/src/File.ts
+--- a/src/File.ts
++++ b/src/File.ts
+@@ -126,7 +126,8 @@ export class File extends ExpoFileSystem.FileSystemFile implements Blob {
+         canceled: false,
+       };
+     } catch (e) {
+-      if (usingOldAPI) {
++      const code = e !== null && typeof e === 'object' && 'code' in e ? e.code : undefined;
++      if (usingOldAPI || (code !== 'ERR_PICKER_CANCELLED' && code !== 'ERR_FILE_PICKING_CANCELLED')) {
+         throw e;
+       }
+       return {
