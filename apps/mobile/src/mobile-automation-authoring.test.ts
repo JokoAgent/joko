@@ -61,6 +61,26 @@ describe("mobile Automation authoring", () => {
     expect(saved).toMatchObject({ displayName: "Renamed script", sessionMode: ScheduleSessionMode.BOUND, sessionId: "session" });
     expect(saved.execution?.model).toBeUndefined();
   });
+  it("renames the saved task-default one-shot after the original task adopts a paired Backend", () => {
+    const owner = authoringOwner();
+    owner.sessions[0]!.backendId = "paired-pi";
+    const instant = "2099-01-01T10:00:00.000Z";
+    const existing: MobileAutomationSchedule = {
+      scheduleId: "one-shot", displayName: "Original plan", state: "enabled", source: "dialogue",
+      backendId: "backend", targetId: "target", sessionMode: "bound", sessionId: "session", recurrence: "once",
+      recurrenceLabel: instant, recurrenceExpression: instant, timeZone: "UTC", inputText: "Run the task",
+      executionMode: "agent", permissionMode: "ask", planMode: false, useWorktree: false, refreshWorktreeRemote: false,
+      extraDirectoryIds: [], silentWhenIdle: false, notifyDesktop: true, overlapPolicy: "queue", misfirePolicy: "runOnce",
+      unreadRunCount: 0, recentRuns: [], revision: { value: 2n, etag: "one-shot-r2" }, generation: 1n
+    };
+
+    const draft = createMobileAutomationDraft(owner, existing);
+    const { schedule, boundSession } = buildMobileAutomationScheduleInput(owner, { ...draft, name: "Renamed plan" }, existing, undefined);
+    expect(schedule).toMatchObject({ displayName: "Renamed plan", backendId: "backend", targetId: "target", sessionId: "session" });
+    expect(schedule.execution?.model).toBeUndefined();
+    expect(boundSession?.backendId).toBe("paired-pi");
+    expect(() => buildMobileAutomationScheduleInput(owner, draft, undefined, undefined)).toThrow(/active task/);
+  });
   it.each([
     ["America/New_York", "2026-11-01T06:30:00.000Z", "2026-11-01T05:45:00Z", "2026-11-01T01:30", "2026-11-01T02:30", "2026-11-01T07:30:00Z"],
     ["UTC", "2027-01-01T00:00:45.123Z", "2026-12-31T22:00:00Z", "2027-01-01T00:00", "2027-01-01T01:00", "2027-01-01T01:00:00Z"]

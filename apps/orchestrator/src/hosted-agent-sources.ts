@@ -125,6 +125,11 @@ export class HostedAgentSources {
   }
   source(backendId: string): HostedAgentDeviceSource | undefined { return this.#entries.get(backendId)?.record.source; }
   sourceKind(backendId: string): "device" | "share" | undefined { const entry = this.#entries.get(backendId); return entry ? entry.record.received ? "share" : "device" : undefined; }
+  isReadyPairedPiBackend(backendId: string): boolean {
+    const entry = this.#entries.get(backendId);
+    return entry !== undefined && entry.available && entry.record.remoteControlEnabled
+      && entry.record.received === undefined && entry.catalog.nativeAdapterKind === "pi";
+  }
   groupCatalog(): readonly { readonly backendId: string; readonly source: HostedAgentDeviceSource; readonly name: string;
     readonly available: boolean; readonly catalog: contract.HostedAgentBackendCatalog; readonly received?: ProviderSharingReceivedIdentity }[] {
     return [...this.#entries.values()].map(entry => ({ backendId: entry.id, source: entry.record.source, name: entry.record.deviceName,

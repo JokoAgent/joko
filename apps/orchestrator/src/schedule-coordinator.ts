@@ -48,6 +48,7 @@ export interface ScheduleCoordinatorOptions {
   readonly tickMs?: number;
   readonly misfireGraceMs?: number;
   readonly now?: () => number;
+  readonly isPairedPiBackend?: (backendId: string) => boolean;
   /** Content-free transition hook for destructive-action quiet-period fencing. */
   readonly onActivityTransition?: () => void;
   readonly executePreRunHook?: (input: SchedulePreRunHookInput) => Promise<SchedulePreRunHookResult>;
@@ -83,6 +84,7 @@ export class ScheduleCoordinator {
   readonly #tickMs: number;
   readonly #misfireGraceMs: number;
   readonly #now: () => number;
+  readonly #isPairedPiBackend: (backendId: string) => boolean;
   readonly #onActivityTransition: () => void;
   readonly #executePreRunHook: (input: SchedulePreRunHookInput) => Promise<SchedulePreRunHookResult>;
   readonly #validatePreRunHookBinding: typeof validateScheduleHookScriptBinding;
@@ -112,6 +114,7 @@ export class ScheduleCoordinator {
     this.#tickMs = options.tickMs ?? 1_000;
     this.#misfireGraceMs = options.misfireGraceMs ?? 5 * 60_000;
     this.#now = options.now ?? Date.now;
+    this.#isPairedPiBackend = options.isPairedPiBackend ?? (() => false);
     this.#onActivityTransition = options.onActivityTransition ?? (() => undefined);
     this.#executePreRunHook = options.executePreRunHook ?? executeSchedulePreRunHook;
     this.#validatePreRunHookBinding = options.validatePreRunHookBinding ?? validateScheduleHookScriptBinding;
@@ -795,6 +798,14 @@ export class ScheduleCoordinator {
       return { runId, sessionId, status: "aborted" };
     }
 
+    const currentSession = this.#store.getSession(sessionId).descriptor;
+    const boundBackendId = currentSession.backendId === schedule.backendId ? undefined : currentSession.backendId;
+    if (boundBackendId !== undefined && (!this.#store.scheduleMatchesSession(schedule, currentSession) || !this.#isPairedPiBackend(boundBackendId))) {
+      this.recordPreSessionOutcome({ schedule, operationId, runId, scheduledAt,
+        ...(nextRunAt === undefined ? {} : { nextRunAt }), status: "failed",
+        detail: { reason: "The adopted task Backend is no longer available as a paired Pi route.", costAttribution: "zero" } });
+      return { runId, status: "failed" };
+    }
     const busy = this.#store.listRuns({ sessionId, activeOnly: true }).length > 0;
     const alreadyQueued = this.#store.listQueuedScheduleRuns().some((run) =>
       run.scheduleId === schedule.id && run.sessionId === sessionId);
@@ -818,6 +829,7 @@ export class ScheduleCoordinator {
       schedule,
       sessionId,
       scheduledAt,
+      ...(boundBackendId === undefined ? {} : { boundBackendId }),
       // The admitted Run consumes a one-shot, even when Run Now fired it early.
       ...(schedule.kind === "one_shot" || nextRunAt === undefined ? {} : { nextRunAt })
     }); } catch (error) { this.#admittedRuns.delete(runId); throw error; }
@@ -1382,10 +1394,7 @@ export class ScheduleCoordinator {
     if (session.descriptor.deletedAt !== undefined || session.descriptor.archived) {
       throw new Error("The task bound to this Schedule is archived or deleted.");
     }
-    if (
-      session.descriptor.backendId !== schedule.backendId ||
-      session.descriptor.targetId !== schedule.targetId
-    ) {
+    if (!this.#store.scheduleMatchesSession(schedule, session.descriptor)) {
       throw new Error("The task bound to this Schedule no longer matches its routing.");
     }
     return sessionId;

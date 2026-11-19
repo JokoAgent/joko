@@ -3861,13 +3861,31 @@ export class SessionHost {
     readonly schedule: ScheduleRecord;
     readonly sessionId: string;
     readonly scheduledAt: number;
+    readonly boundBackendId?: string;
     readonly nextRunAt?: number;
   }): OperationExecution<EnqueueResult> {
     const sessionId = input.sessionId;
-    this.assertBackendAdmissionOpen(this.#store.getSession(sessionId).descriptor.backendId);
+    const session = this.#store.getSession(sessionId).descriptor;
+    this.assertBackendAdmissionOpen(session.backendId);
     this.assertSessionNotPendingScheduleDeletion(sessionId);
     this.assertMessageDeletionAdmission(sessionId);
-    const overrides = scheduleTurnOverrides(input.schedule.executionSnapshot);
+    const savedOverrides = scheduleTurnOverrides(input.schedule.executionSnapshot);
+    let overrides = savedOverrides;
+    if (input.boundBackendId !== undefined) {
+      if (session.backendId !== input.boundBackendId || !this.#store.scheduleMatchesSession(input.schedule, session)
+        || session.providerId === undefined || session.modelId === undefined) {
+        throw new StoreError("The Schedule lost its adopted task Backend before admission.");
+      }
+      overrides = {
+        ...savedOverrides,
+        providerId: session.providerId,
+        modelId: session.modelId,
+        ...(session.effort === undefined ? {} : { effort: session.effort }),
+        fastMode: session.fastMode,
+        permissionMode: savedOverrides?.permissionMode ?? session.permissionMode,
+        planMode: savedOverrides?.planMode ?? session.planMode
+      };
+    }
     let acceptedPrompt = input.schedule.prompt;
     let validationCause: unknown;
     let validationFailure: PublicError | undefined;
@@ -3897,7 +3915,8 @@ export class SessionHost {
       sessionId,
       scheduledAt: input.scheduledAt,
       prompt: acceptedPrompt,
-      executionSnapshot: input.schedule.executionSnapshot
+      executionSnapshot: input.schedule.executionSnapshot,
+      ...(input.boundBackendId === undefined ? {} : { boundBackendId: input.boundBackendId })
     };
     const execution = this.#store.runOperation(
       { id: input.operationId, kind: "schedule_dispatch", body },
@@ -15168,6 +15187,18 @@ export class SessionHost {
         )) return;
         if (!bypassesCompaction && this.compactionBlocksDispatch(sessionId)) return;
         const claimSession = this.#store.getSession(sessionId);
+        const scheduled = this.#store.getRun(pending.runId).descriptor.source === "schedule";
+        const scheduleAdmission = scheduled ? this.#store.findOperation(pending.operationId) : undefined;
+        if (scheduleAdmission?.kind === "schedule_dispatch" && isRecord(scheduleAdmission.body)
+          && typeof scheduleAdmission.body["boundBackendId"] === "string"
+          && scheduleAdmission.body["boundBackendId"] !== claimSession.descriptor.backendId) {
+          this.#failExpiredApplicationInput(pending, {
+            code: "SCHEDULE_EXECUTION_SNAPSHOT_FAILED", message: "The task changed Backend after the Schedule triggered.",
+            phase: "schedule", retryable: false, stateMayHaveChanged: false,
+            recovery: "Open the Schedule and trigger it again for the current task Backend."
+          });
+          continue;
+        }
         if (this.#backendDispatchBlocked(claimSession.descriptor.backendId)) return;
         if (this.localCodexPlanReviewBlocksDispatch(claimSession)) return;
         const authenticationFailure = this.queueProviderAuthenticationFailure(pending, claimSession);
@@ -15184,8 +15215,7 @@ export class SessionHost {
           });
           continue;
         }
-        const scheduleGate = this.#store.getRun(pending.runId).descriptor.source === "schedule"
-          ? this.#scheduleDispatchGate : undefined;
+        const scheduleGate = scheduled ? this.#scheduleDispatchGate : undefined;
         if (scheduleGate?.acquire(pending.runId) === false) return;
         let claimedItem: ReturnType<OperationalStore["claimNextQueueItem"]>;
         try {

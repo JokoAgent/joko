@@ -993,6 +993,11 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
         })}><option value="fresh">{t("scheduler.sessionFresh")}</option>{draft.executionMode === "agent" && <option value="persistent">{t("scheduler.sessionPersistent")}</option>}{!projectOwned && <option value="bound">{t("scheduler.sessionBound")}</option>}</SelectControl></label>
         {draft.sessionMode === "bound" && <label className="field"><span>{t("scheduler.session")}</span><SelectControl required value={draft.sessionId} onChange={(event) => {
           const session = sessions.find((candidate) => candidate.id === event.target.value);
+          if (savedBoundTaskDefault(schedule) && session && session.id === schedule.sessionId && session.backendId !== schedule.backendId) {
+            setDraft((current) => ({ ...current, sessionId: session.id, backendId: schedule.backendId,
+              providerId: "", modelId: "", effort: undefined, fastMode: false }));
+            return;
+          }
           setDraft((current) => ({ ...current, sessionId: event.target.value, backendId: session?.backendId ?? current.backendId, providerId: session?.model?.providerId ?? "", modelId: session?.model?.modelId ?? "", effort: session?.effort, fastMode: session?.fastMode ?? false, permissionMode: session?.permissionMode ?? current.permissionMode, planMode: session?.planMode ?? current.planMode }));
         }}><option value="">—</option>{matchingSessions.map((session) => <option value={session.id} key={session.id}>{session.name}</option>)}</SelectControl></label>}
         <label className="field"><span>{t("scheduler.recurrence")}</span><SelectControl value={draft.kind} onChange={(event) => {
@@ -1093,11 +1098,18 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
   </Modal>;
 }
 
+function savedBoundTaskDefault(schedule: ScheduleView | undefined): schedule is ScheduleView & { readonly sessionId: string } {
+  return schedule?.source === "user" && schedule.kind === "once" && schedule.sessionMode === "bound"
+    && schedule.sessionId !== undefined && schedule.executionMode === "agent" && schedule.model === undefined
+    && !schedule.useWorktree && schedule.preRunHook === undefined && schedule.extraDirectoryIds.length === 0;
+}
+
 export function scheduleDraft(schedule: ScheduleView | undefined, targets: readonly TargetView[], sessions: readonly SessionView[], models: readonly ModelView[], backends: readonly BackendView[] = []): ScheduleDraft {
   const availableTarget = targets.find((candidate) => !candidate.archived && (backends.length === 0 || scheduleTargetAvailable(candidate, backends)));
   const target = targets.find((candidate) => candidate.id === schedule?.targetId) ?? availableTarget;
   const session = sessions.find((candidate) => candidate.id === schedule?.sessionId) ?? sessions.find((candidate) => candidate.targetId === target?.id);
-  const model = schedule?.model ?? session?.model;
+  const followTask = savedBoundTaskDefault(schedule);
+  const model = followTask ? undefined : schedule?.model ?? session?.model;
   const backendId = schedule?.backendId ?? target?.backendId ?? session?.backendId ?? "";
   const descriptor = models.find((candidate) => candidate.backendId === backendId && candidate.providerId === model?.providerId && candidate.modelId === model?.modelId);
   const timezone = schedule?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
@@ -1121,8 +1133,8 @@ export function scheduleDraft(schedule: ScheduleView | undefined, targets: reado
     scriptDispatchSessions: schedule?.script?.capabilities.includes("sessions.dispatch") ?? false,
     providerId: model?.providerId ?? "",
     modelId: model?.modelId ?? "",
-    effort: schedule?.model?.effort ?? session?.effort ?? descriptor?.efforts[0],
-    fastMode: schedule?.model?.fastMode ?? session?.fastMode ?? false,
+    effort: followTask ? undefined : schedule?.model?.effort ?? session?.effort ?? descriptor?.efforts[0],
+    fastMode: followTask ? false : schedule?.model?.fastMode ?? session?.fastMode ?? false,
     permissionMode: schedule?.permissionMode ?? session?.permissionMode ?? "ask",
     planMode: schedule?.planMode ?? session?.planMode ?? false,
     useWorktree: schedule?.useWorktree ?? false,
