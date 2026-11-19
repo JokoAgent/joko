@@ -50,7 +50,7 @@ type EvidenceScreenshot = "header" | "actions" | "timeline" | "gallery" | "galle
   | "connection-add" | "connection-error" | "connection-identity-error" | "actions-scrolled" | "share-selection" | "share-selection-error"
   | "native-user-quote-menu" | "native-assistant-quote-menu"
   | "native-user-message-quote" | "native-assistant-message-quote" | "native-message-quote-error" | "html-guide" | "html-website"
-  | "html-website-address-error" | "html-website-render-error";
+  | "html-guide-refresh-error" | "html-website-address-error" | "html-website-render-error";
 type EvidenceResult = "running" | "passed" | "failed";
 type EvidenceStep = {
   name: EvidenceStepName;
@@ -558,7 +558,9 @@ async function runNativeScenario(): Promise<void> {
   const isAddressField = (node: AndroidUiNode) => node.className === "android.widget.EditText" && node.contentDescription === "Page address";
   const waitAddress = (value: string) => waitNode((node) => isAddressField(node) && (node.text ?? "") === value,
     value === "" ? "cleared HTML address field" : "HTML display path " + value);
-  const waitChapter = () => waitNode((node) => node.text === "Workspace guide chapter" || node.contentDescription === "Workspace guide chapter", "rendered Workspace guide chapter");
+  const chapter = "Workspace guide chapter";
+  const refreshedChapter = "Refreshed Workspace guide chapter";
+  const waitChapter = (text = chapter) => waitNode((node) => node.text === text || node.contentDescription === text, "rendered " + text);
   await waitAddress(detailsAddress);
   await waitChapter();
   await tap("Previous page");
@@ -567,8 +569,29 @@ async function runNativeScenario(): Promise<void> {
   await tap("Next page");
   await waitAddress(detailsAddress);
   await waitChapter();
-  await tap("Refresh");
-  await waitChapter();
+  await writeFile(join(current.workspaceDirectory, "html-guide", "details.html"),
+    `<meta name="viewport" content="width=device-width"><h1 id="chapter">${refreshedChapter}</h1>`);
+  try {
+    await interaction("tap", async () => {
+      const refresh = await waitFor(async () => {
+        const items = await nodes();
+        const address = items.find(node => isAddressField(node) && node.text === detailsAddress);
+        const next = items.find(node => node.contentDescription === "Next page" && node.bounds.x2 > node.bounds.x1);
+        if (!address || !next) return undefined;
+        return items.find(node => node.enabled && node.clickable && node.contentDescription === "Refresh"
+          && node.bounds.x1 >= next.bounds.x2 && node.bounds.x2 > node.bounds.x1
+          && node.bounds.y1 < next.bounds.y2 && node.bounds.y2 > next.bounds.y1 && node.bounds.y2 <= address.bounds.y1);
+      }, (node) => node !== undefined, "Refresh in the native HTML navigation row", 15_000);
+      await tapNode(refresh!);
+    });
+    await waitAddress(detailsAddress);
+    await waitChapter(refreshedChapter);
+  } catch (error) {
+    await screenshot("html-guide-refresh-error").catch(() => undefined);
+    const observed = await nodes(Date.now() + 5_000).catch(() => []);
+    throw new Error("The refreshed Workspace document did not render. Native nodes: " + JSON.stringify(observed.slice(0, 80)
+      .map(node => ({ text: node.text?.slice(0, 180), label: node.contentDescription?.slice(0, 160), bounds: node.bounds }))), { cause: error });
+  }
   await screenshot("html-guide");
   await completeStep();
 
@@ -630,7 +653,7 @@ async function runNativeScenario(): Promise<void> {
       await screenshot("html-website");
       await tap("Previous page");
       await waitAddress(detailsAddress);
-      await waitChapter();
+      await waitChapter(refreshedChapter);
     } catch (error) {
       await screenshot("html-website-render-error").catch(() => undefined);
       const observed = await nodes(Date.now() + 5_000).catch(() => []);
