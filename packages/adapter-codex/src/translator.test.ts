@@ -92,7 +92,15 @@ describe("Codex interaction translation", () => {
       totalTokens: 546_000, contextTokens: 273_000, contextWindow: 872_000,
       pricingContext: { inputTokens: 272_000, fastMode: true }, cost: 0
     } }]);
-    expect(state.usage).toEqual(second[0]?.type === "usage" ? second[0].usage : undefined);
+    expect(state.usage).toEqual({ threadId: "thread-one", turnId: "turn-two",
+      snapshot: second[0]?.type === "usage" ? second[0].usage : undefined });
+
+    const completion = (threadId: string, turnId: string) => translator.translate("item/completed", {
+      threadId, turnId, item: { id: "commentary", type: "agentMessage", text: "Checking the status.", phase: "commentary" }
+    }, state)[0];
+    expect(completion("thread-one", "turn-three")).not.toHaveProperty("usage");
+    expect(completion("other-thread", "turn-two")).not.toHaveProperty("usage");
+    expect(completion("thread-one", "turn-two")).toHaveProperty("usage", state.usage?.snapshot);
   });
 
   it("preserves every completed native assistant item as a distinct message boundary", () => {

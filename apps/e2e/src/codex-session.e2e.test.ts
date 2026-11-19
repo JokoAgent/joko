@@ -769,6 +769,71 @@ it("keeps a Codex thread and durable Queue on the production HTTP/SQLite/Connect
   }
 });
 
+it("keeps previous Codex usage off current commentary through a fresh task read during tool execution", async () => {
+  const backendId = "codex-running-usage";
+  const native = new FakeCodexAppServer();
+  const host = new AppServerHost({ transportFactory: () => native.createTransport() });
+  let fixture: OrchestratorE2eFixture | undefined;
+  try {
+    const service = fixture = await OrchestratorE2eFixture.start({ backendFactories: [{ instanceId: backendId, adapterKind: "codex",
+      displayName: "Codex running usage fixture", create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host }) }] });
+    const { authKey, clients, connectionId } = await service.pair("Codex usage Owner");
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId,
+      createSessionMutation({ backendId, targetId: service.targetId(backendId) })));
+    const store = service.application.store;
+    const binding = store.getSession(sessionId).descriptor.binding;
+    const threadId = binding.nativeSessionId;
+    if (threadId === undefined) throw new Error("The task has no native Codex thread.");
+
+    const send = async (text: string) => {
+      const admitted = await submit(clients.operation, connectionId, sendInputMutation(sessionId, BigInt(binding.generation), text));
+      const runId = queueRunIdFrom(admitted);
+      await waitFor(async () => store.listQueueItems({ sessionId }), items => items.some(item => item.runId === runId && item.state === "backend_accepted"),
+        "the native acknowledgement for the original Run");
+      const turnId = native.threads.get(threadId)?.turns.at(-1)?.["id"];
+      if (typeof turnId !== "string") throw new Error("No native turn for the accepted Run.");
+      return { runId, turnId };
+    };
+    const first = await send("Finish the first turn");
+    await native.completeTurn(threadId, "First answer.");
+    await waitFor(() => clients.run.getRun({ runId: first.runId }), ({ run }) => run?.state === RunState.SUCCEEDED, "first Codex Run to settle");
+    expect(store.listEvents({ sessionId }).some(event => event.runId === first.runId && event.payload.type === "usage"
+      && event.payload.usage.totalTokens === 10)).toBe(true);
+
+    const current = await send("Check the workspace next");
+    expect(current.turnId).not.toBe(first.turnId);
+    const commentary = { type: "agentMessage", id: "current-commentary", text: "I will check the workspace.",
+      phase: "commentary", memoryCitation: null, delivery: null };
+    const command = { type: "commandExecution", id: "current-command", command: "git status --short", status: "inProgress" };
+    await native.transport!.emitNotification("item/completed", { threadId, turnId: current.turnId, item: commentary });
+    await native.transport!.emitNotification("item/started", { threadId, turnId: current.turnId, item: command });
+    const restored = service.clients(authKey);
+    expect((await restored.event.getSnapshot({})).snapshot?.runs.find(run => run.runId === current.runId)?.state).toBe(RunState.RUNNING);
+    expect((await restored.tool.getToolCall({ toolCallId: command.id })).toolCall).toMatchObject({ runId: current.runId, state: ToolCallState.RUNNING });
+    const scoped = (await restored.event.getSnapshot({
+      scope: { kind: { case: "session", value: { sessionId, recentTimelineItems: 240 } } }
+    })).snapshot!.timeline;
+    const history = (await restored.session.listSessionTimeline({ sessionId, limit: 240 })).events;
+    for (const events of [scoped, history]) {
+      const same = events.filter(event => event.payload?.kind.case === "messageCompleted" && event.payload.kind.value.messageId === commentary.id);
+      expect(same).toHaveLength(1);
+      expect(same[0]?.identity?.runId).toBe(current.runId);
+      const completed = same[0]?.payload?.kind;
+      if (completed?.case !== "messageCompleted") throw new Error("Original Codex commentary is missing.");
+      expect(completed.value.blocks).toMatchObject([{ content: { case: "text", value: commentary.text } }]);
+      expect(completed.value.usage).toBeUndefined();
+      expect(completed.value.turnUsage).toBeUndefined();
+    }
+    expect(store.listEvents({ sessionId }).some(event => event.runId === current.runId && event.payload.type === "usage")).toBe(false);
+    await native.transport!.emitNotification("item/completed", { threadId, turnId: current.turnId, item: { ...command, status: "completed" } });
+    await native.completeTurn(threadId, "Workspace checked.");
+    await waitFor(() => restored.run.getRun({ runId: current.runId }), ({ run }) => run?.state === RunState.SUCCEEDED, "current Codex Run to settle");
+  } finally {
+    await fixture?.close();
+    await host.shutdown();
+  }
+});
+
 it("persists current Codex step plans consistently through generated timeline, Snapshot and tool details", async () => {
   const backendId = "codex-step-plan";
   const native = new FakeCodexAppServer();

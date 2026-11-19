@@ -8839,7 +8839,7 @@ function stateFromRuntime(runtime: SessionRuntime, thread?: NativeThread): Nativ
     fastMode: runtime.fastMode,
     permissionMode: runtime.permissionMode,
     planMode: runtime.planMode,
-    ...(runtime.state.usage === undefined ? {} : { usage: runtime.state.usage })
+    ...(runtime.state.usage === undefined ? {} : { usage: runtime.state.usage.snapshot })
   };
 }
 
