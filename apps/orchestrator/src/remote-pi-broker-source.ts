@@ -1725,7 +1725,7 @@ async function spawnBootstrapSentinel(root, record) {
 }
 async function runBootstrapSentinel(root, expectedIdentity, expectedHash, expectedOwnerIdentity) {
   const canonicalRoot = await secureDirectory(root);
-  if (!(["linux", "win32"].includes(process.platform))) fail();
+  if (!(["linux", "win32", "darwin"].includes(process.platform))) fail();
   const paths = sessionPaths(canonicalRoot, expectedIdentity);
   for (;;) {
     const record = await readBootstrapRecord(paths, expectedIdentity);
@@ -4343,7 +4343,7 @@ async function reapManagedRunnersAfterOwnerLoss(record) {
 }
 async function runJanitor(root, expectedIdentity, expectedHash, expectedOwnerIdentity, values) {
   const canonicalRoot = await secureDirectory(root);
-  if (!(["linux", "win32"].includes(process.platform)) || values.length !== 14) fail();
+  if (!(["linux", "win32", "darwin"].includes(process.platform)) || values.length !== 14) fail();
   const paths = sessionPaths(canonicalRoot, expectedIdentity);
   const owner = {
     pid: positiveInteger(Number(values[0])),
@@ -4418,7 +4418,7 @@ async function runJanitor(root, expectedIdentity, expectedHash, expectedOwnerIde
 }
 async function runBootstrapReaper(root, expectedIdentity, expectedHash, expectedOwnerIdentity, values) {
   const canonicalRoot = await secureDirectory(root);
-  if (!(["linux", "win32"].includes(process.platform)) || values.length !== 4) fail();
+  if (!(["linux", "win32", "darwin"].includes(process.platform)) || values.length !== 4) fail();
   const paths = sessionPaths(canonicalRoot, expectedIdentity);
   const record = await readBootstrapRecord(paths, expectedIdentity);
   if (record.launchHash !== expectedHash || record.ownerIdentity !== expectedOwnerIdentity) fail();
