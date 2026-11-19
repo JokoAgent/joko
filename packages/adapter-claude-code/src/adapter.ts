@@ -1855,7 +1855,15 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
 
   override async getCommands(context: AdapterContext): Promise<readonly RuntimeCommand[]> {
     const runtime = this.#requireRuntime(context), snapshot = runtime.nativeSkills;
-    if (runtime.remote || runtime.runtimePolicy !== "standard" || !snapshot || runtime.initialization?.plugins_applied !== true) return [];
+    if (runtime.remote || runtime.runtimePolicy !== "standard") return [];
+    this.#assertCurrent(runtime, context, runtime.binding);
+    const nativeCommands = runtime.initialization?.commands;
+    const nativeCompact = Array.isArray(nativeCommands) && nativeCommands.length <= MAX_DESCRIPTOR_ITEMS
+      && nativeCommands.some((command) => command !== null && typeof command === "object" && command["name"] === "compact");
+    const commands: RuntimeCommand[] = nativeCompact ? [{
+      name: "compact", description: "Compact the conversation context.", source: "backend", inputMode: "text", loaded: true
+    }] : [];
+    if (!snapshot || runtime.initialization?.plugins_applied !== true) return commands;
     await snapshot.assertFilesCurrent(context.signal);
     this.#assertCurrent(runtime, context, runtime.binding);
     const resources = await this.getResources(context);
@@ -1868,7 +1876,6 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       names.set(name, (names.get(name) ?? 0) + 1);
     }
     const loadedById = new Map(resources.map(resource => [resource.id, resource]));
-    const commands: RuntimeCommand[] = [];
     for (const { seed, discovery } of snapshot.skills) {
       const { id, name, revision, resourceVersion, trustedBuiltin } = seed.resource;
       const loaded = loadedById.get(id);
@@ -8019,6 +8026,7 @@ function capabilityManifest(
     "permission.change",
     "plan_mode",
     "context.usage",
+    "runtime.commands",
     "workspace.extra_dirs",
     "interaction.permission",
     "interaction.question",
@@ -8031,7 +8039,7 @@ function capabilityManifest(
   }
   if (inputResolvers.readBlob !== undefined) supported.add("input.image");
   if (inputResolvers.resolveFile !== undefined) supported.add("input.file");
-  if (textResourcesSupported) { supported.add("runtime.resources"); supported.add("runtime.commands"); }
+  if (textResourcesSupported) supported.add("runtime.resources");
   if (isolatedReviewSupported) supported.add("review.isolated");
   if (nativeTasksSupported) {
     for (const capability of [

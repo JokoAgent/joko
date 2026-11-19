@@ -2900,11 +2900,12 @@ export function toProtoRuntimeCommand(
     commandId: createHash("sha256").update(identity).digest("hex"),
     name: item.name,
     description: item.description,
-    source: item.source === "extension"
-      ? contract.RuntimeCommandSource.EXTENSION
-      : item.source === "skill"
-        ? contract.RuntimeCommandSource.SKILL
-        : contract.RuntimeCommandSource.PROMPT,
+    source: {
+      extension: contract.RuntimeCommandSource.EXTENSION,
+      skill: contract.RuntimeCommandSource.SKILL,
+      prompt: contract.RuntimeCommandSource.PROMPT,
+      backend: contract.RuntimeCommandSource.BACKEND
+    }[item.source],
     resourceId: item.resourceId ?? "",
     ...(item.builtinSkill === undefined ? {} : { builtinSkill: message<contract.BuiltinSkillIdentity>("joko.v1.BuiltinSkillIdentity", item.builtinSkill) }),
     inputMode,
@@ -2927,7 +2928,7 @@ export function fromProtoRuntimeCommand(item: contract.RuntimeCommand): CoreRunt
       ? "prompt"
       : item.source === contract.RuntimeCommandSource.SKILL
         ? "skill"
-        : (() => {
+        : item.source === contract.RuntimeCommandSource.BACKEND ? "backend" : (() => {
             throw new ProtoMappingError(
               "unsupported_mapping",
               "runtime_command.source",

@@ -89,7 +89,7 @@ function normalizeRuntimeCommand(value: RuntimeCommand, index: number): RuntimeC
     throw new Error(`Runtime command ${index} has an invalid invocation name.`);
   }
   const source = value["source"];
-  if (source !== "extension" && source !== "prompt" && source !== "skill") {
+  if (source !== "extension" && source !== "prompt" && source !== "skill" && source !== "backend") {
     throw new Error(`Runtime command ${index} has an invalid source.`);
   }
   if (typeof value["loaded"] !== "boolean") throw new Error(`Runtime command ${index} has an invalid loaded state.`);

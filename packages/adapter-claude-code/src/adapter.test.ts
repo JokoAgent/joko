@@ -3166,6 +3166,21 @@ describe("ClaudeCodeAdapter", () => {
     }
   });
 
+  test.each([true, false])("publishes only the observed native compact command in the local runtime catalog: %s", async (available) => {
+    const runtime = new FakeSdkRuntime();
+    runtime.queryInitialization = { ...initialization(), plugins_applied: false, commands: [
+      { name: "help", description: "Another native command", argumentHint: "" },
+      ...(available ? [{ name: "compact", description: "Native compact", argumentHint: "" }] : [])
+    ] };
+    const adapter = adapterFor(runtime);
+    try {
+      const binding = await adapter.createSession(createInput(), contextFor().context);
+      await expect(adapter.getCommands(contextFor(binding).context)).resolves.toEqual(available ? [{
+        name: "compact", description: "Compact the conversation context.", source: "backend", inputMode: "text", loaded: true
+      }] : []);
+    } finally { await adapter.dispose(); }
+  });
+
   test.each([true, false])("attests a built-in native Skill only with an exact launch plugin acknowledgement: %s", async (acknowledged) => {
     const source = await realpath(await mkdtemp(join(tmpdir(), "joko-claude-builtin-")));
     const body = "---\nname: joko-plugin-creator\ndescription: Create plugins\n---\nFollow references/packaging.md.\n";
