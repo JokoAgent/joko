@@ -13,6 +13,8 @@ import {
   TelegramEmojiReactions,
   TelegramGroupActivation,
   TelegramReplyQuoteMode,
+  UpdateDiscordMessagingConfigurationRequestSchema,
+  UpdateDiscordMessagingConfigurationResponseSchema,
   UpdateFeishuMessagingConfigurationRequestSchema,
   UpdateFeishuMessagingConfigurationResponseSchema,
   type MessagingConnection
@@ -228,7 +230,7 @@ describe("mounted Messaging Settings product chain", () => {
     await discordConfigurationDialog.getByRole("button", { name: "Save", exact: true }).click();
     await discordConfigurationDialog.waitFor({ state: "hidden" });
 
-    await waitFor(
+    const persistedDiscord = await waitFor(
       () => inspector.clients.messaging.getMessagingSettings({}),
       (value) => value.connections.some((connection) =>
         connection.discordConfiguration?.lifecycleAnnouncements === false
@@ -246,6 +248,7 @@ describe("mounted Messaging Settings product chain", () => {
       "the mounted Discord behavior matrix",
       15_000
     );
+    await browserErrors.verifyConfigurationRecovery("discord", persistedDiscord.connections);
 
     await settings.getByRole("button", { name: "Add WeCom", exact: true }).first().click();
     const wecomCreateDialog = page.getByRole("dialog", { name: "Add WeCom" });
@@ -479,7 +482,7 @@ describe("mounted Messaging Settings product chain", () => {
       "the mounted Lark behavior matrix",
       15_000
     );
-    await browserErrors.verifyFeishuRecovery(persistedFeishuAndLark.connections);
+    await browserErrors.verifyConfigurationRecovery("feishu", persistedFeishuAndLark.connections);
 
     await card.getByRole("button", { name: "Clear token", exact: true }).click();
     const clearDialog = page.getByRole("alertdialog", { name: "Clear bot token?" });
@@ -581,7 +584,7 @@ describe("mounted Messaging Settings product chain", () => {
 function observeBrowserErrors(page: Page) {
   const errors: string[] = [];
   const recovered: string[] = [];
-  const feishuSaves: Response[] = [];
+  const configurationSaves: Record<"discord" | "feishu", Response[]> = { discord: [], feishu: [] };
   page.on("pageerror", (error) => errors.push(`pageerror:${error.message}`));
   page.on("console", (message) => {
     if (message.type() === "error") {
@@ -591,22 +594,24 @@ function observeBrowserErrors(page: Page) {
   });
   page.on("response", (response) => {
     if (response.status() >= 400) errors.push(`response:${response.status()}:${response.url()}`);
-    if (new URL(response.url()).pathname === "/joko.v1.MessagingService/UpdateFeishuMessagingConfiguration") {
-      feishuSaves.push(response);
-    }
+    const path = new URL(response.url()).pathname;
+    if (path === "/joko.v1.MessagingService/UpdateDiscordMessagingConfiguration") configurationSaves.discord.push(response);
+    if (path === "/joko.v1.MessagingService/UpdateFeishuMessagingConfiguration") configurationSaves.feishu.push(response);
   });
   return {
-    clear: () => { errors.splice(0); recovered.splice(0); feishuSaves.splice(0); },
-    verifyFeishuRecovery: async (persisted: readonly MessagingConnection[]) => {
+    clear: () => { errors.splice(0); recovered.splice(0); configurationSaves.discord.splice(0); configurationSaves.feishu.splice(0); },
+    verifyConfigurationRecovery: async (channel: "discord" | "feishu", persisted: readonly MessagingConnection[]) => {
       // Runtime cursor updates can race a save. Accept only an actual revision-only
       // retry with an unchanged payload, a successful receipt, and durable settings.
-      const saves = feishuSaves.map(response => {
+      const saves = configurationSaves[channel].map(response => {
         const request = response.request();
         expect(request.method()).toBe("POST");
         expect(request.headers()["content-type"]).toMatch(/^application\/proto/u);
-        const bytes = required(request.postDataBuffer(), "Feishu configuration request");
+        const bytes = required(request.postDataBuffer(), `${channel} configuration request`);
         expect(bytes.length).toBeLessThanOrEqual(64 * 1024);
-        return { response, input: fromBinary(UpdateFeishuMessagingConfigurationRequestSchema, bytes) };
+        const input = channel === "discord" ? fromBinary(UpdateDiscordMessagingConfigurationRequestSchema, bytes)
+          : fromBinary(UpdateFeishuMessagingConfigurationRequestSchema, bytes);
+        return { response, input };
       });
       const verifiedConnections = new Set<string>();
       for (const [index, failed] of saves.entries()) {
@@ -616,23 +621,29 @@ function observeBrowserErrors(page: Page) {
         });
         expect(verifiedConnections.has(failed.input.connectionId)).toBe(false);
         const retry = required(saves.slice(index + 1).find(save =>
-          save.input.connectionId === failed.input.connectionId), "successful Feishu revision retry");
+          save.input.connectionId === failed.input.connectionId), `successful ${channel} revision retry`);
         expect(retry.response.status()).toBe(200);
         expect(retry.input.expectedGeneration).toBe(failed.input.expectedGeneration);
-        expect(retry.input.configuration).toEqual(required(failed.input.configuration, "original Feishu configuration"));
+        expect(retry.input.configuration).toEqual(required(failed.input.configuration, `original ${channel} configuration`));
+        if ("ownerProviderUserId" in failed.input && "ownerProviderUserId" in retry.input) {
+          expect(retry.input.ownerProviderUserId).toBe(failed.input.ownerProviderUserId);
+        }
         expect(required(retry.input.expectedRevision, "retry revision").value)
           .toBeGreaterThan(required(failed.input.expectedRevision, "original revision").value);
-        const receipt = required(fromBinary(UpdateFeishuMessagingConfigurationResponseSchema,
-          await retry.response.body()).connection, "Feishu save receipt");
+        const body = await retry.response.body();
+        const response = channel === "discord" ? fromBinary(UpdateDiscordMessagingConfigurationResponseSchema, body)
+          : fromBinary(UpdateFeishuMessagingConfigurationResponseSchema, body);
+        const receipt = required(response.connection, `${channel} save receipt`);
+        const receiptConfiguration = channel === "discord" ? receipt.discordConfiguration : receipt.feishuConfiguration;
         expect(receipt.connectionId).toBe(failed.input.connectionId);
         expect(receipt.generation).toBe(retry.input.expectedGeneration + 1n);
-        expect(receipt.feishuConfiguration).toEqual(retry.input.configuration);
+        expect(receiptConfiguration).toEqual(retry.input.configuration);
         expect(required(receipt.revision, "saved revision").value)
           .toBeGreaterThan(required(retry.input.expectedRevision, "retry revision").value);
         const durable = required(persisted.find(connection => connection.connectionId === receipt.connectionId),
-          "durable Feishu settings");
+          `durable ${channel} settings`);
         expect(durable.generation).toBe(receipt.generation);
-        expect(durable.feishuConfiguration).toEqual(receipt.feishuConfiguration);
+        expect(channel === "discord" ? durable.discordConfiguration : durable.feishuConfiguration).toEqual(receiptConfiguration);
         expect(required(durable.revision, "durable revision").value)
           .toBeGreaterThanOrEqual(required(receipt.revision, "saved revision").value);
         verifiedConnections.add(failed.input.connectionId);
