@@ -3,9 +3,9 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { readWorktreeBranchStatus, syncWorktreeBranch } from "./branch-sync.js";
-import { runGit } from "./git.js";
+import * as gitRunner from "./git.js";
 import { WorktreeOperationControl } from "./operation.js";
 
 const execute = promisify(execFile), roots: string[] = [];
@@ -46,6 +46,32 @@ it("reads without fetching, then fast-forwards a checked-out branch and preserve
   expect(await readFile(join(f.local, "other.txt"), "utf8")).toBe("local edits\n");
   expect(await readFile(join(f.local, "tracked.txt"), "utf8")).toMatch(/^advanced\r?\n$/u);
 });
+it("returns a definite busy outcome for another branch before launching its fetch", { timeout: 40_000 }, async () => {
+  const f = await fixture(), next = await f.advance();
+  await git(f.seed, "push", "origin", "main:refs/heads/other");
+  await git(f.local, "update-ref", "refs/remotes/origin/other", f.original);
+  await git(f.local, "branch", "--track", "other", "origin/other");
+  let entered!: () => void, release!: () => void;
+  const fetching = new Promise<void>(resolve => { entered = resolve; });
+  const hold = new Promise<void>(resolve => { release = resolve; });
+  const nativeRun = gitRunner.runGit;
+  const observed = vi.spyOn(gitRunner, "runGit").mockImplementation(async (...args) => {
+    if (args[0].includes("+refs/heads/main:refs/remotes/origin/main")) { entered(); await hold; }
+    return nativeRun(...args);
+  });
+  const first = f.sync();
+  try {
+    await Promise.race([fetching, first.then(() => { throw new Error("Original update settled before reaching the fetch gate."); })]);
+    expect(await f.sync("refs/heads/other")).toMatchObject({ status: { branch: "other" }, updated: 0, errorCode: "busy" });
+    expect(observed.mock.calls.some(([argv]) => argv.includes("+refs/heads/other:refs/remotes/origin/other"))).toBe(false);
+    expect(await git(f.local, "rev-parse", "refs/remotes/origin/other")).toBe(f.original);
+  } finally {
+    release();
+    try { await first; } finally { observed.mockRestore(); }
+  }
+  expect(await f.sync("refs/heads/other")).toMatchObject({ updated: 1 });
+  expect((await git(f.local, "rev-parse", "refs/heads/main", "refs/heads/other")).split(/\r?\n/u)).toEqual([next, next]);
+});
 it("updates an unchecked local branch and a remote-only ref without switching the current checkout", { timeout: 40_000 }, async () => {
   const f = await fixture(); await git(f.local, "checkout", "-b", "work");
   const first = await f.advance(); expect((await f.sync()).updated).toBe(1);
@@ -82,7 +108,10 @@ it("updates another worktree in place, blocks ignored-file collisions, and rejec
     await expect(readWorktreeBranchStatus(f.local, sourceRef)).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
   }
   await git(f.local, "config", "branch.work.remote", "origin"); await git(f.local, "config", "branch.work.merge", "refs/heads/deleted");
+  await git(f.local, "update-ref", "refs/remotes/origin/deleted", f.original);
   expect(await f.sync("refs/heads/work")).toMatchObject({ updated: 0, status: { blocked: "missing-remote" } });
+  expect((await readWorktreeBranchStatus(f.local, "refs/heads/work")).blocked).toBeUndefined();
+  expect(await git(f.local, "rev-parse", "refs/remotes/origin/deleted")).toBe(f.original);
 });
 it("fences revocation and a changed remote configuration after the fetch before any local branch write", { timeout: 40_000 }, async () => {
   const f = await fixture(), next = await f.advance(); let revoked = false;
@@ -127,10 +156,10 @@ it("allows continuing Git progress within its operation deadline and retires a s
   await writeFile(progress, "process.stdout.write('started\\n'); let count=0; const timer=setInterval(()=>{process.stdout.write('progress\\n');if(++count===6){clearInterval(timer);process.stdout.write('complete\\n');}},500);\n");
   await writeFile(stalled, "setTimeout(()=>{},20000);\n");
   const command = (path: string) => "!node '" + path.replaceAll("\\", "/").replaceAll("'", "'\"'\"'") + "'";
-  const result = await runGit(["-c", `alias.joko-progress=${command(progress)}`, "joko-progress"], f.local,
+  const result = await gitRunner.runGit(["-c", `alias.joko-progress=${command(progress)}`, "joko-progress"], f.local,
     new WorktreeOperationControl({ timeoutMs: 15_000 }, 15_000), { idleTimeoutMs: 2_000, timeoutCapMs: 15_000 });
   expect(result.stdout).toContain("complete");
-  await expect(runGit(["-c", `alias.joko-stalled=${command(stalled)}`, "joko-stalled"], f.local,
+  await expect(gitRunner.runGit(["-c", `alias.joko-stalled=${command(stalled)}`, "joko-stalled"], f.local,
     new WorktreeOperationControl({ timeoutMs: 15_000 }, 15_000), { idleTimeoutMs: 500, timeoutCapMs: 15_000 }))
     .rejects.toMatchObject({ code: "OPERATION_TIMEOUT" });
 });

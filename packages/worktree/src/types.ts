@@ -75,7 +75,7 @@ export interface WorktreeAcquireRequest {
   readonly cwd: string;
   /** Optional commit-ish. Omit to resolve the repository's preferred task base. */
   readonly sourceRef?: string;
-  /** Bounded best-effort refresh of the remote default branch. */
+  /** Refresh the selected remote tracking branch, or try the remote default when no source was selected. */
   readonly refreshRemote?: boolean;
 }
 

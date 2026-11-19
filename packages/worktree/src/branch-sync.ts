@@ -20,6 +20,7 @@ export interface WorktreeBranchStatus {
 export interface WorktreeBranchSyncResult {
   readonly status: WorktreeBranchStatus;
   readonly updated: number;
+  readonly errorCode?: "busy";
 }
 interface Inspection {
   readonly detection: WorktreeCwdDetection;
@@ -57,7 +58,7 @@ export async function syncWorktreeBranch(input: {
   if (before.status.revision !== input.expectedRevision) return changed(before);
   if (before.status.blocked) return { status: before.status, updated: 0 };
   const key = before.detection.gitCommonDirectory;
-  if (mutations.has(key)) throw new WorktreeServiceError("SESSION_CONFLICT", "A branch update is already running for this repository.");
+  if (mutations.has(key)) return { status: before.status, updated: 0, errorCode: "busy" };
   mutations.add(key);
   try {
     // Repeat the complete observation after acquiring the repository lane.

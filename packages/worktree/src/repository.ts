@@ -14,6 +14,7 @@ import {
 const COMMIT_PATTERN = /^[a-f0-9]{40,64}$/u;
 const REMOTE_REFRESH_STEP_MS = 15_000;
 const REMOTE_QUERY_STEP_MS = 10_000;
+const REMOTE_REF_PREFIX = "refs/remotes/";
 
 export async function probeWorktreeCwd(
   cwdInput: string,
@@ -75,9 +76,14 @@ export async function resolveWorktreeSource(
 ): Promise<WorktreeSourceResolution> {
   if (sourceRef !== undefined) {
     const accepted = validateSourceRef(sourceRef);
-    const commit = await resolveCommit(detection.repositoryRoot, accepted, control);
+    const root = detection.repositoryRoot;
+    const commit = await resolveCommit(root, accepted, control);
     if (commit === null) {
       throw new WorktreeServiceError("SOURCE_NOT_FOUND", "The requested source ref does not resolve to a commit.");
+    }
+    if (refreshRemote && accepted.startsWith(REMOTE_REF_PREFIX) && !accepted.endsWith("/HEAD")
+      && await optionalGit(["check-ref-format", accepted], root, control) !== null) {
+      return refreshSelectedRemoteSource(root, accepted, control);
     }
     return Object.freeze({ ref: accepted, commit, refreshed: false, strategy: "explicit" });
   }
@@ -193,6 +199,51 @@ export async function resolveWorktreeSource(
     strategy: "head",
     ...(remoteFailureReason === undefined ? {} : { reason: remoteFailureReason })
   });
+}
+
+async function refreshSelectedRemoteSource(root: string, ref: string, control: WorktreeOperationControl): Promise<WorktreeSourceResolution> {
+  if (await optionalGit(["show-ref", "--verify", "--hash", ref], root, control) === null) {
+    throw new WorktreeServiceError("SOURCE_NOT_FOUND", "The selected tracking ref no longer exists.");
+  }
+  if (await optionalGit(["symbolic-ref", "--quiet", ref], root, control) !== null) {
+    throw new WorktreeServiceError("REPOSITORY_UNSAFE", "A branch tracking ref must be direct.");
+  }
+  const remotes = (await runGit(["remote"], root, control)).stdout.trim().split(/\r?\n/u);
+  const remote = remotes.filter(name => name && ref.startsWith(`${REMOTE_REF_PREFIX}${name}/`))
+    .sort((left, right) => right.length - left.length)[0];
+  if (!remote) throw new WorktreeServiceError("SOURCE_NOT_FOUND", "The selected branch has no configured remote.");
+  const configured = await optionalGit(["config", "--null", "--get-all", `remote.${remote}.fetch`], root, control);
+  const refspecs = configured?.split("\0") ?? [];
+  const sources = new Set<string>();
+  for (const spec of refspecs) {
+    const [source, destination] = spec.replace(/^\+/u, "").split(":");
+    if (!source?.startsWith("refs/heads/") || !destination) continue;
+    const capture = matchRefspec(destination, ref);
+    if (capture === undefined) continue;
+    const candidate = source.replace("*", () => capture);
+    if (!refspecs.some(other => other.startsWith("^") && matchRefspec(other.slice(1), candidate) !== undefined)) {
+      sources.add(candidate);
+    }
+  }
+  if (sources.size !== 1) throw new WorktreeServiceError("SOURCE_NOT_FOUND", "The selected tracking ref has no unique configured source branch.");
+  const [source] = sources;
+  await runGit(["check-ref-format", source!], root, control);
+  // A selected source refresh owns just this tracking ref, even when the
+  // configured remote would also update or prune other refs.
+  await runGit(["fetch", "--quiet", "--no-tags", "--no-prune", "--no-prune-tags", "--recurse-submodules=no",
+    "--no-write-fetch-head", "--refmap=", "--", remote, `+${source}:${ref}`], root, control,
+  { timeoutCapMs: REMOTE_REFRESH_STEP_MS, environment: { GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "Never" } });
+  const commit = await resolveCommit(root, ref, control);
+  if (commit === null) throw new WorktreeServiceError("SOURCE_NOT_FOUND", "The refreshed tracking ref does not resolve to a commit.");
+  return Object.freeze({ ref, commit, refreshed: true, strategy: "explicit", remote });
+}
+
+function matchRefspec(pattern: string, ref: string): string | undefined {
+  const wildcard = pattern.indexOf("*");
+  if (wildcard < 0) return pattern === ref ? "" : undefined;
+  const prefix = pattern.slice(0, wildcard), suffix = pattern.slice(wildcard + 1);
+  if (ref.length < prefix.length + suffix.length || !ref.startsWith(prefix) || !ref.endsWith(suffix)) return undefined;
+  return ref.slice(prefix.length, ref.length - suffix.length);
 }
 
 export async function listWorktreeSources(
