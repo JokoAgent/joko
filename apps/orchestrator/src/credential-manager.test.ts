@@ -3,8 +3,9 @@ import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { OperationalStore } from "@joko/store";
-import { provisionManagedCatalog } from "@joko/adapter-pi";
+import { provisionManagedCatalog, type PiManagedModel } from "@joko/adapter-pi";
 import { describe, expect, it, vi } from "vitest";
 
 import { CredentialManager, ProviderCatalogManager } from "./credential-manager.js";
@@ -844,6 +845,72 @@ describe("ProviderCatalogManager", () => {
       credentialReferenceIds: ["cred_byom_test"]
     });
     store.close();
+  });
+
+  it("materializes the exact custom OpenCode Go model APIs in the local Pi generation", async () => {
+    const { root, credentials, store } = await fixture();
+    const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" });
+    providers.initialize();
+    const ticket = credentials.createUploadTicket();
+    credentials.upload(ticket.credentialUploadTicketId, "go-route-test-secret");
+    await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId,
+      credentialReferenceId: "cred_go_route_test", displayName: "Go fixture key", kind: "api_key" });
+    const go = "https://opencode.ai/zen/go/v1", luna = "gpt-5.6-luna", deepseek = "deepseek-v4-flash";
+    const models: readonly PiManagedModel[] = [{ id: deepseek }, { id: luna }];
+    const variants = [
+      { id: "custom-go", baseUrl: go, models },
+      { id: "explicit-model", baseUrl: go, models: [{ id: deepseek }, { id: luna, api: "openai-completions" as const }] },
+      { id: "explicit-path", baseUrl: go, models, requestPath: "/zen/go/v1/chat/completions" },
+      { id: "other-path", baseUrl: "https://opencode.ai/zen/v1", models },
+      { id: "single-model", baseUrl: go, models: [{ id: luna }] }
+    ];
+    try {
+      for (const [position, variant] of variants.entries()) {
+        const { requestPath, ...configured } = variant;
+        const apiKeyEnv = `GO_ROUTE_TEST_${position}`;
+        await providers.upsert({ backendId: "pi", credentialOrigin: "https://opencode.ai", kind: "custom_endpoint",
+          displayName: configured.id, enabled: true, supportsLogin: false, supportsLogout: true, supportsRefresh: false,
+          provider: { ...configured, api: "openai-completions", apiKeyEnv },
+          credentialBindings: { [apiKeyEnv]: "cred_go_route_test" }, ...(requestPath === undefined ? {} : { requestPath }) });
+      }
+      const snapshotsRoot = join(root, "go-snapshots");
+      const previous = await providers.createPiGenerationSnapshot({ snapshotsRoot, hosted: true });
+      const previousFile = join(previous.agentHome, "models.json");
+      const originalModels = await readFile(previousFile, "utf8");
+      expect(previous.providers.find(item => item.id === "custom-go")?.models.find(model => model.id === luna)?.api).toBeUndefined();
+
+      const restored = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" });
+      restored.initialize();
+      const current = await restored.createPiGenerationSnapshot({ snapshotsRoot });
+      expect(current.catalogGeneration).toBe(previous.catalogGeneration);
+      expect(current.agentHome).not.toBe(previous.agentHome);
+      expect(await readFile(previousFile, "utf8")).toBe(originalModels);
+      expect(restored.get("pi", "custom-go").provider.models.find(model => model.id === luna)?.api).toBeUndefined();
+      expect(await readFile(join(current.agentHome, "models.json"), "utf8")).not.toContain("go-route-test-secret");
+      const runtime = await ModelRuntime.create({ modelsPath: join(current.agentHome, "models.json"), modelsStorePath: join(root, "pi-model-library"),
+        allowModelNetwork: false, refreshOnCreate: false,
+        credentials: { read: async () => undefined, list: async () => [], modify: async () => undefined, delete: async () => {} } });
+      const requests: { readonly url: string; readonly method: string; readonly model: unknown }[] = [];
+      const fetch: typeof globalThis.fetch = async (input, init) => {
+        const request = new Request(input, init);
+        const body = await request.json() as { readonly model?: unknown };
+        requests.push({ url: request.url, method: request.method, model: body.model });
+        return Response.json({ error: { message: "Fixture captured the model request" } }, { status: 400 });
+      };
+      for (const [modelId, api] of [[luna, "openai-responses"], [deepseek, "openai-completions"]] as const) {
+        const model = runtime.getModel("custom-go", modelId);
+        expect(model).toMatchObject({ api, baseUrl: go, provider: "custom-go" });
+        await runtime.complete(model!, { messages: [{ role: "user", content: "Read the test input", timestamp: 1 }] },
+          { env: current.environment, fetch });
+      }
+      expect(requests).toEqual([
+        { url: `${go}/responses`, method: "POST", model: luna },
+        { url: `${go}/chat/completions`, method: "POST", model: deepseek }
+      ]);
+      for (const variant of variants.slice(1)) {
+        expect(runtime.getModel(variant.id, luna)).toMatchObject({ api: "openai-completions", baseUrl: variant.baseUrl });
+      }
+    } finally { store.close(); }
   });
 
   it("unlinks the native Provider at logout without deleting independently owned credentials", async () => {

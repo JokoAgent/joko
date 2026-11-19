@@ -2200,6 +2200,7 @@ export class ProviderCatalogManager {
   async createPiGenerationSnapshot(input: {
     readonly snapshotsRoot: string;
     readonly settings?: PiManagedSettings;
+    readonly hosted?: boolean;
     readonly providerEnabled?: (providerId: string) => boolean;
     readonly modelEnabled?: (providerId: string, modelId: string) => boolean;
   }): Promise<PiProviderGenerationSnapshot> {
@@ -2209,15 +2210,22 @@ export class ProviderCatalogManager {
     }
     return this.#mutate(async () => {
       const generation = this.#generation;
+      let usesOpenCodeGoResponses = false;
       const entries = [...this.#entries.values()].flatMap((entry): ManagedProviderEntry[] => {
         if (
           entry.backendId !== this.#nativeBackendId || !entry.enabled
           || !this.#providerEnabled(entry.backendId, entry.provider.id)
           || input.providerEnabled?.(entry.provider.id) === false
         ) return [];
+        const responsesModel = input.hosted === true || this.#nativeEntries.has(entry.provider.id)
+          ? undefined : automaticOpenCodeGoResponsesModel(entry);
         const models = entry.provider.models.filter((model) =>
           isManagedChatModel(model) && this.#modelEnabled(entry.backendId, entry.provider.id, model.id)
-          && input.modelEnabled?.(entry.provider.id, model.id) !== false);
+          && input.modelEnabled?.(entry.provider.id, model.id) !== false).map((model): PiManagedModel => {
+            if (model !== responsesModel) return model;
+            usesOpenCodeGoResponses = true;
+            return { ...model, api: "openai-responses" };
+          });
         return models.length === 0 ? [] : [{ ...entry, provider: { ...entry.provider, models } }];
       });
       const environment: Record<string, string> = {};
@@ -2232,8 +2240,10 @@ export class ProviderCatalogManager {
       }
       try {
         await mkdir(input.snapshotsRoot, { recursive: true, mode: 0o700 });
-        const finalPath = join(input.snapshotsRoot, `generation-${generation}`);
-        const temporary = join(input.snapshotsRoot, `.generation-${generation}-${randomUUID()}.tmp`);
+        // A generation materialized by an earlier build remains immutable.
+        const snapshotName = `generation-${generation}${usesOpenCodeGoResponses ? "-opencode-go-responses" : ""}`;
+        const finalPath = join(input.snapshotsRoot, snapshotName);
+        const temporary = join(input.snapshotsRoot, `.${snapshotName}-${randomUUID()}.tmp`);
         try {
           await provisionManagedCatalog(temporary, entries.map((entry) => entry.provider), input.settings ?? {});
           await writeFile(join(temporary, "joko-generation.json"), JSON.stringify({
@@ -2720,6 +2730,15 @@ function discoveredManagedModel(model: DiscoveredProviderModel, customPiApi: PiM
   return materializeDiscoveredModel({ id: model.id, defaultVisible, metadataOverrides: [], discoveredMetadata: {
     ...metadata, ...(model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow })
   } });
+}
+
+function automaticOpenCodeGoResponsesModel(entry: ManagedProviderEntry): PiManagedModel | undefined {
+  const { provider } = entry;
+  if (provider.baseUrl !== "https://opencode.ai/zen/go/v1" || provider.api !== "openai-completions" ||
+    entry.requestPath !== undefined || provider.id === "opencode-go" || provider.id === "opencode" ||
+    provider.modelOverrides?.["gpt-5.6-luna"] !== undefined ||
+    !provider.models.some(model => model.id === "deepseek-v4-flash" && (model.api === undefined || model.api === "openai-completions"))) return undefined;
+  return provider.models.find(model => model.id === "gpt-5.6-luna" && model.api === undefined);
 }
 
 function validateProviderEntry(entry: ManagedProviderEntry): void {

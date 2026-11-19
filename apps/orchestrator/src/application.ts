@@ -1869,7 +1869,7 @@ export async function createOrchestratorApplication(
         creation.signal.throwIfAborted();
         const hostedSettings = effectivePiSettings(baseSettings, store.findSetting<unknown>("service", "orchestrator", `settings.pi.${piBackendId}`)?.value);
         const allowed = new Set(creation.providerIds);
-        const snapshot = await providers.createPiGenerationSnapshot({ snapshotsRoot: join(creation.home, "provider-snapshots", randomUUID()), settings: hostedSettings,
+        const snapshot = await providers.createPiGenerationSnapshot({ snapshotsRoot: join(creation.home, "provider-snapshots", randomUUID()), settings: hostedSettings, hosted: true,
           providerEnabled: providerId => allowed.has(providerId) && providerRoutingEnabled(store, piBackendId, providerId),
           modelEnabled: (providerId, modelId) => modelRoutingEnabled(store, piBackendId, providerId, modelId)
             && (creation.trust === "owner" || creation.modelIds.includes(modelId)) });
