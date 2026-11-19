@@ -35,7 +35,8 @@ describe('Android in-app installation', () => {
     controller.retry();
     await settle();
     expect(io.requestPermission).toHaveBeenCalledOnce();
-    expect(io.install).toHaveBeenCalledWith(file, target.version, expect.any(AbortSignal));
+    expect(io.download).toHaveBeenCalledWith(target, expect.any(AbortSignal), expect.any(Function));
+    expect(io.install).toHaveBeenCalledWith(file, target, expect.any(AbortSignal));
     expect(controller.getSnapshot().phase).toBe('ready');
     controller.close();
     expect(io.remove).not.toHaveBeenCalled(); // Android still owns the handoff.
@@ -99,7 +100,7 @@ describe('Android in-app installation', () => {
     let progress!: (value: number | null) => void;
     const { controller, io } = setup({
       hasPermission: vi.fn(async () => true),
-      download: vi.fn((_url, s, p) => { signal = s; progress = p; return downloaded.promise; }),
+      download: vi.fn((_target, s, p) => { signal = s; progress = p; return downloaded.promise; }),
     });
     controller.start(target);
     controller.start(target);

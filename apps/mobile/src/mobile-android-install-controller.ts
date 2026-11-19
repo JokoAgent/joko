@@ -10,8 +10,8 @@ export interface MobileAndroidInstallIO {
   supported(): boolean;
   hasPermission(): Promise<boolean>;
   requestPermission(): Promise<boolean>;
-  download(url: string, signal: AbortSignal, progress: (value: number | null) => void): Promise<string>;
-  install(uri: string, version: string, signal: AbortSignal): Promise<void>;
+  download(target: MobileAndroidInstallTarget, signal: AbortSignal, progress: (value: number | null) => void): Promise<string>;
+  install(uri: string, target: MobileAndroidInstallTarget, signal: AbortSignal): Promise<void>;
   remove(uri: string): Promise<void>;
   openBrowser(url: string): Promise<void>;
 }
@@ -81,7 +81,7 @@ export class MobileAndroidInstallController {
       }
       if (!this.file) {
         this.update({ phase: 'downloading', target, progress: null });
-        const file = await this.io.download(target.installUrl, operation.signal, (progress) => {
+        const file = await this.io.download(target, operation.signal, (progress) => {
           if (current()) this.update({ phase: 'downloading', target, progress });
         });
         if (!current()) { await this.io.remove(file).catch(() => undefined); return; }
@@ -90,7 +90,7 @@ export class MobileAndroidInstallController {
       }
       this.update({ phase: 'installing', target, progress: 1 });
       this.handedToInstaller = true;
-      await this.io.install(this.file, target.version, operation.signal);
+      await this.io.install(this.file, target, operation.signal);
       if (current()) this.update({ phase: 'ready', target, progress: 1 });
       // Launching Android's installer is not proof that the update was installed.
     } catch {

@@ -50,7 +50,7 @@ describe("MobileAndroidUpdateSheet", () => {
     let signal!: AbortSignal;
     shared.controller = new MobileAndroidInstallController({ supported: () => true,
       hasPermission: async () => false, requestPermission,
-      download: async (_url, abort, update) => { signal = abort; progress = update; return new Promise(() => undefined); },
+      download: async (_target, abort, update) => { signal = abort; progress = update; return new Promise(() => undefined); },
       install: async () => undefined, remove: async () => undefined, openBrowser: async () => undefined });
     render();
     await act(async () => { shared.controller.start(target); });
