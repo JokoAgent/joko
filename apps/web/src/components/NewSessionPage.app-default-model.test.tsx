@@ -1,16 +1,20 @@
 // @vitest-environment jsdom
-import { act, forwardRef, useImperativeHandle } from "react";
+import { act, forwardRef, useImperativeHandle, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
+import { plainTextToComposerDocument } from "../composer-quote-document.js";
 import { emptySnapshot, type AppSnapshot, type ModelView, type NewSessionLocalDraft } from "../model.js";
 import { readAppDefaultModelPreference, setAppDefaultModelPreference } from "../app-default-model-preferences.js";
 import { setModelConfiguration, resetModelPickerPreferencesForTests } from "../model-picker-preferences.js";
 import { NewSessionPage } from "./NewSessionPage.js";
 
-vi.mock("./ComposerRichTextEditor.js", () => ({ ComposerRichTextEditor: forwardRef(function Editor(_props, ref) {
+type EditorProps = ComponentProps<typeof import("./ComposerRichTextEditor.js").ComposerRichTextEditor>;
+vi.mock("./ComposerRichTextEditor.js", () => ({ ComposerRichTextEditor: forwardRef(function Editor(props: EditorProps, ref) {
   useImperativeHandle(ref, () => ({ focus: vi.fn(), focusFromBlankSurface: vi.fn(), insertRouteReference: vi.fn(), routeReferenceDrop: vi.fn(), insertText: vi.fn(), editPastedText: vi.fn() }));
-  return <div />;
+  return <button type="button" data-testid="write-input" onClick={() => props.onDocumentChange(
+    plainTextToComposerDocument("Use the current project model"), false, ranges => ranges
+  )}>Write input</button>;
 }) }));
 vi.mock("./HomeUsageDashboard.js", () => ({ HomeUsageDashboard: () => null }));
 const roots: Root[] = [];
@@ -56,6 +60,66 @@ it("initializes a future task from exact model effort preferences only when no e
   await act(async () => root.render(<NewSessionPage controller={controller} snapshot={snapshot} navigationOpen t={key => key} onOpenNavigation={() => undefined} onClose={() => undefined} onSubmit={vi.fn()} />));
   await vi.waitFor(() => expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ modelId: "first", effort: "high" })));
   expect(readAppDefaultModelPreference("node").current).toMatchObject({ modelId: "first", effort: "high" });
+});
+
+it("uses the current Backend default for a new task when its remembered model has been disabled", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const empty = emptySnapshot(), first = model("primary", "first"), second = model("primary", "second");
+  const backendSettings = { backendId: "primary", enabled: true, permissionMode: "ask" as const, planMode: false };
+  const original: AppSnapshot = {
+    ...empty,
+    backends: [{ id: "primary", name: "Primary", version: "1", health: "healthy", instanceGeneration: 1, capabilities: new Map(
+      ["input.text", "model.switch", "model.effort"].map(name => [name, { name, supported: true, options: [] }])) }],
+    targets: [{ id: "target", backendId: "primary", name: "Target", workspaceId: "workspace", workspaceName: "Workspace", revision: 1n, trusted: true, pinned: false, archived: false }],
+    workspaces: [{ id: "workspace", targetId: "target", name: "Workspace", kind: "userProject", serverPath: "/fixture", trusted: true, dirty: false, revision: "workspace-1", entries: [] }],
+    models: [first, second],
+    settings: { ...empty.settings, backendSettings: [{ ...backendSettings, model: { providerId: first.providerId, modelId: first.modelId, effort: "low", fastMode: false } }] }
+  };
+  const updated: AppSnapshot = { ...original, models: [{ ...first, routingEnabled: false }, second], settings: { ...original.settings,
+    backendSettings: [{ ...backendSettings, model: { providerId: second.providerId, modelId: second.modelId, effort: "high", fastMode: false },
+      modelAccess: { disabledProviderIds: [], disabledModels: [{ providerId: first.providerId, modelId: first.modelId }] } }] } };
+  const save = vi.fn(async (_draft: NewSessionLocalDraft) => undefined), onSubmit = vi.fn(async () => undefined);
+  const mount = async (snapshot: AppSnapshot, draft?: NewSessionLocalDraft) => {
+    const controller = { state: { activeProfile: { id: "connection", serverId: "node", origin: "http://127.0.0.1", deviceId: "device" }, snapshot,
+      route: { kind: "newSession" }, connectionGeneration: 1n, navigationRevision: 1, connectionState: "connected", preferences: { locale: "en", newSessionWorktreeEnabled: false } },
+    readNewSessionDraft: vi.fn(async () => draft), saveNewSessionDraft: save, prepareTargetWorkspace: vi.fn(async () => undefined),
+    probeTargetWorktree: vi.fn(async () => ({ eligibility: "unavailable" })), listTargetWorktreeSources: vi.fn(async () => []),
+    refreshProviderModels: vi.fn(async () => undefined) } as unknown as AppController;
+    const container = document.body.appendChild(document.createElement("div")), root = createRoot(container); roots.push(root);
+    await act(async () => root.render(<NewSessionPage controller={controller} snapshot={snapshot} initialTargetId="target" navigationOpen
+      t={key => key} onOpenNavigation={() => undefined} onClose={() => undefined} onSubmit={onSubmit} />));
+    return { container, close: async () => { await act(async () => root.unmount()); roots.splice(roots.indexOf(root), 1); container.remove(); } };
+  };
+  const send = async (container: HTMLElement) => {
+    const write = container.querySelector<HTMLButtonElement>('[data-testid="write-input"]')!;
+    await act(async () => write.click());
+    const submit = container.querySelector<HTMLButtonElement>("button.send-button")!;
+    await vi.waitFor(() => expect(submit.disabled).toBe(false));
+    await act(async () => submit.click());
+  };
+
+  const firstTask = await mount(original);
+  await vi.waitFor(() => expect(readAppDefaultModelPreference("node").current).toMatchObject({ modelId: first.modelId, effort: "low" }));
+  await send(firstTask.container);
+  expect(onSubmit).toHaveBeenNthCalledWith(1, expect.objectContaining({ targetId: "target", providerId: first.providerId, modelId: first.modelId, effort: "low" }),
+    expect.objectContaining({ text: "Use the current project model" }), expect.anything());
+  await firstTask.close();
+
+  const nextTask = await mount(updated);
+  await vi.waitFor(() => expect(nextTask.container.querySelector(".model-picker-trigger")?.textContent).toContain(second.name));
+  expect(readAppDefaultModelPreference("node").current?.modelId).toBe(first.modelId);
+  await send(nextTask.container);
+  expect(onSubmit).toHaveBeenNthCalledWith(2, expect.objectContaining({ targetId: "target", providerId: second.providerId, modelId: second.modelId, effort: "high" }),
+    expect.objectContaining({ text: "Use the current project model" }), expect.anything());
+  await nextTask.close();
+
+  save.mockClear();
+  const restored = await mount(updated, { selection: { kind: "target", targetId: "target" }, nativeStart: { kind: "fresh" },
+    providerId: first.providerId, modelId: first.modelId, fastMode: false, permissionMode: "ask", planMode: false,
+    text: "My existing draft", editorDocument: plainTextToComposerDocument("My existing draft"), mentions: [], inlineMentionRanges: [], attachments: [] });
+  await vi.waitFor(() => expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ text: "My existing draft", modelId: first.modelId })));
+  expect(restored.container.querySelector<HTMLButtonElement>("button.send-button")?.disabled).toBe(true);
+  expect(onSubmit).toHaveBeenCalledTimes(2);
 });
 
 it("uses the actual New Task picker preference for future tasks and preserves the current draft's other axes", async () => {
