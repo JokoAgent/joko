@@ -112,7 +112,8 @@ it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog t
     const snapshot = async () => (await clients.event.getSnapshot({
       scope: { kind: { case: "session", value: { sessionId, recentTimelineItems: 200 } } }
     })).snapshot!.timeline;
-    const completed = (events: readonly Event[]) => events.flatMap(({ payload }) => payload.case === "messageCompleted" ? [payload.value] : []);
+    const completed = (events: readonly Event[]) => events.flatMap(({ payload }) =>
+      payload?.kind.case === "messageCompleted" ? [payload.kind.value] : []);
     await expect(fixture.anonymous.session.listSessionTimeline({ sessionId })).rejects.toThrow();
     const [first, second] = mode === "legacy" ? [await timeline(), await snapshot()] : [await snapshot(), await timeline()];
     for (const visible of [first, second]) {
