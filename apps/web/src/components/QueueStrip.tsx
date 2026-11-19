@@ -25,7 +25,7 @@ interface QueueAttachmentDraft extends QueueItemAttachmentEditView {
 
 export interface QueueStripActions { steerSole(): boolean }
 
-export function QueueStrip({ sessionId, items, control, supportedDispositions, attachmentPolicy, controller, runAction, t, expanded, onExpandedChange, actionsRef }: { readonly sessionId: string; readonly items: readonly QueueItemView[]; readonly control?: QueueControlView; readonly supportedDispositions: readonly DeliveryMode[]; readonly attachmentPolicy?: ComposerAttachmentPolicy; readonly controller: AppController; readonly runAction: RunAction; readonly t: Translator; readonly expanded: boolean; readonly onExpandedChange: (expanded: boolean) => void; readonly actionsRef?: Ref<QueueStripActions> }): JSX.Element {
+export function QueueStrip({ sessionId, items, control, supportedDispositions, steerSupported, attachmentPolicy, controller, runAction, t, expanded, onExpandedChange, actionsRef }: { readonly sessionId: string; readonly items: readonly QueueItemView[]; readonly control?: QueueControlView; readonly supportedDispositions: readonly DeliveryMode[]; readonly steerSupported: boolean; readonly attachmentPolicy?: ComposerAttachmentPolicy; readonly controller: AppController; readonly runAction: RunAction; readonly t: Translator; readonly expanded: boolean; readonly onExpandedChange: (expanded: boolean) => void; readonly actionsRef?: Ref<QueueStripActions> }): JSX.Element {
   const [editingId, setEditingId] = useState<string>();
   const [editingDraft, setEditingDraft] = useState<QueueItemTextEditView>(() => ({
     text: "",
@@ -368,7 +368,6 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, a
       for (const lease of leasesRef.current) void releaseLease(lease).catch(() => undefined);
     };
   }, [sessionId, controller.setQueueItemEditLock, controller.setQueueInteractionLock]);
-  const steerSupported = supportedDispositions.includes("steer");
   const deliveryUnavailable = supportedDispositions.length === 0;
   useImperativeHandle(actionsRef, () => ({
     steerSole: () => {

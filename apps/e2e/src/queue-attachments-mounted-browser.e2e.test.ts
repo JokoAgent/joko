@@ -48,7 +48,8 @@ mountedIt("adds, replaces, and clears queued attachments in place before dispatc
     const first = queueItemFrom(await mutate(send));
     const follower = queueItemFrom(await mutate(sendInputMutation(sessionId, generation, "Unchanged later input")));
     const stored = () => fixture!.application.store.getQueueItem(first.queueItemId);
-    const firstIdentity = { runId: stored().runId, operationId: stored().operationId, createdAt: stored().createdAt, position: stored().position };
+    const firstIdentity = { runId: stored().runId, operationId: stored().operationId, createdAt: stored().createdAt,
+      position: stored().position, disposition: stored().disposition };
 
     const device = "Queue attachments Browser";
     const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: device })).challenge!;
@@ -77,7 +78,7 @@ mountedIt("adds, replaces, and clears queued attachments in place before dispatc
             return { status, code: "code" in details && typeof details.code === "string" ? details.code : undefined,
               message: "message" in details && typeof details.message === "string" ? details.message : undefined };
           });
-        return { publicItem: item === undefined ? undefined : { editLocked: item.editLocked, state: item.state }, browser, leaseOps };
+        return { publicItem: item === undefined ? undefined : { editLocked: item.editLocked, state: item.state, mode: item.deliveryMode }, browser, leaseOps };
       }, value => value.publicItem?.editLocked === false && value.browser[0]?.disabled === false, "the original queued input to be editable again");
       await editButton.click();
     };
