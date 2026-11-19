@@ -512,8 +512,7 @@ export class ComputerRuntime {
   } = {}): Promise<ComputerRuntimeUpdateCheck> {
     const updating = this.#updateInFlight !== undefined;
     const refreshDue = Date.now() - this.#updateCheckedAt >= UPDATE_REFRESH_INTERVAL_MS;
-    if (this.#cachedUpdate !== undefined && options.fresh !== true) {
-      if (!updating && refreshDue) void this.#startUpdateCheck(options.fetchImpl ?? this.#fetchImpl, options.signal);
+    if (this.#cachedUpdate !== undefined && options.fresh !== true && (updating || !refreshDue)) {
       return { ...this.#cachedUpdate, updating };
     }
     const result = await this.#startUpdateCheck(options.fetchImpl ?? this.#fetchImpl, options.signal);

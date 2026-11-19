@@ -2,7 +2,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 import ts from "typescript";
 
 import { isLspToolError, LspToolError } from "./errors.js";
-import { LspOperationControl, validateTimeout } from "./operation.js";
+import { LspOperationControl, MAXIMUM_OPERATION_TIMEOUT_MS, validateTimeout } from "./operation.js";
 import type {
   LspBridgeResponse,
   LspCallHierarchySource,
@@ -58,13 +58,6 @@ export interface TypeScriptLspBridgeOptions {
   readonly now?: () => number;
 }
 
-interface WorkspacePoolEntry {
-  readonly key: string;
-  readonly workspace: TypeScriptWorkspace;
-  activeOperations: number;
-  idleTimer: NodeJS.Timeout | undefined;
-}
-
 interface WorkspaceLease {
   readonly workspace: TypeScriptWorkspace;
   readonly release: () => void;
@@ -72,7 +65,11 @@ interface WorkspaceLease {
 
 interface WorkspaceSlot {
   readonly key: string;
-  readonly entry: Promise<WorkspacePoolEntry>;
+  readonly workspace: Promise<TypeScriptWorkspace>;
+  readonly initialization: AbortController;
+  ready: boolean;
+  users: number;
+  idleTimer: NodeJS.Timeout | undefined;
 }
 
 export class TypeScriptLspBridge {
@@ -178,24 +175,14 @@ export class TypeScriptLspBridge {
     const key = poolKey(workspaceRoot);
     const slot = this.#pool.get(key);
     if (slot === undefined) return false;
-    this.#pool.delete(key);
-    void slot.entry.then((entry) => {
-      if (entry.idleTimer !== undefined) clearTimeout(entry.idleTimer);
-      entry.workspace.dispose();
-    }, () => undefined);
+    this.disposeSlot(slot);
     return true;
   }
 
   dispose(): void {
     if (this.#disposed) return;
     this.#disposed = true;
-    for (const slot of this.#pool.values()) {
-      void slot.entry.then((entry) => {
-        if (entry.idleTimer !== undefined) clearTimeout(entry.idleTimer);
-        entry.workspace.dispose();
-      }, () => undefined);
-    }
-    this.#pool.clear();
+    for (const slot of this.#pool.values()) this.disposeSlot(slot);
   }
 
   private executeInWorkspace(
@@ -438,52 +425,57 @@ export class TypeScriptLspBridge {
       });
     }
     const key = poolKey(workspaceRoot);
-    let slot = this.#pool.get(key);
-    if (slot === undefined) {
-      let entryPromise!: Promise<WorkspacePoolEntry>;
-      entryPromise = TypeScriptWorkspace.create(
-        workspaceRoot,
-        { maximumFiles: this.#maximumWorkspaceFiles },
-        control
-      ).then((workspace) => ({ key, workspace, activeOperations: 0, idleTimer: undefined }), (error) => {
-        if (this.#pool.get(key)?.entry === entryPromise) this.#pool.delete(key);
-        throw error;
-      });
-      slot = { key, entry: entryPromise };
-      this.#pool.set(key, slot);
-    }
-    const entry = await slot.entry;
-    control.check();
-    if (entry.idleTimer !== undefined) {
-      clearTimeout(entry.idleTimer);
-      entry.idleTimer = undefined;
-    }
-    entry.activeOperations += 1;
+    const slot = this.#pool.get(key) ?? this.openWorkspaceSlot(key, workspaceRoot);
+    clearTimeout(slot.idleTimer);
+    slot.idleTimer = undefined;
+    slot.users += 1;
     let released = false;
-    return {
-      workspace: entry.workspace,
-      release: () => {
-        if (released) return;
-        released = true;
-        entry.activeOperations = Math.max(0, entry.activeOperations - 1);
-        if (entry.activeOperations !== 0 || this.#disposed) return;
-        const timer = setTimeout(() => this.disposeIdleEntry(entry), this.#idleDisposeMs);
-        timer.unref?.();
-        entry.idleTimer = timer;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      slot.users -= 1;
+      if (slot.users !== 0 || this.#pool.get(key) !== slot) return;
+      if (!slot.ready) {
+        this.disposeSlot(slot);
+        return;
       }
+      slot.idleTimer = setTimeout(() => {
+        if (slot.users === 0 && this.#pool.get(key) === slot) this.disposeSlot(slot);
+      }, this.#idleDisposeMs);
+      slot.idleTimer.unref();
     };
+    try {
+      const workspace = await control.waitFor(slot.workspace);
+      if (this.#pool.get(key) !== slot) throw new LspToolError("ABORTED", "The LSP workspace was retired.");
+      return { workspace, release };
+    } catch (error) {
+      release();
+      throw error;
+    }
   }
 
-  private disposeIdleEntry(entry: WorkspacePoolEntry): void {
-    entry.idleTimer = undefined;
-    if (entry.activeOperations !== 0) return;
-    const slot = this.#pool.get(entry.key);
-    if (slot === undefined) return;
-    void slot.entry.then((current) => {
-      if (current !== entry || entry.activeOperations !== 0) return;
-      if (this.#pool.get(entry.key) === slot) this.#pool.delete(entry.key);
-      entry.workspace.dispose();
-    }, () => undefined);
+  private openWorkspaceSlot(key: string, workspaceRoot: string): WorkspaceSlot {
+    // A shared cold index belongs to its active callers collectively.
+    const initialization = new AbortController();
+    const control = new LspOperationControl({ signal: initialization.signal }, MAXIMUM_OPERATION_TIMEOUT_MS, this.#now);
+    const workspace = TypeScriptWorkspace.create(workspaceRoot, { maximumFiles: this.#maximumWorkspaceFiles }, control)
+      .then((ready) => {
+        slot.ready = true;
+        return ready;
+      }, (error: unknown) => {
+        if (this.#pool.get(key) === slot) this.#pool.delete(key);
+        throw error;
+      });
+    const slot: WorkspaceSlot = { key, workspace, initialization, ready: false, users: 0, idleTimer: undefined };
+    this.#pool.set(key, slot);
+    return slot;
+  }
+
+  private disposeSlot(slot: WorkspaceSlot): void {
+    this.#pool.delete(slot.key);
+    clearTimeout(slot.idleTimer);
+    slot.initialization.abort();
+    void slot.workspace.then((workspace) => workspace.dispose(), () => undefined);
   }
 }
 

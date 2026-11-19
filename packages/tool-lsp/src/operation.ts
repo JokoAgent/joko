@@ -40,6 +40,27 @@ export class LspOperationControl {
   cancellationRequested(): boolean {
     return this.signal?.aborted === true || this.#now() >= this.deadlineAtMs;
   }
+
+  async waitFor<T>(work: Promise<T>): Promise<T> {
+    this.check();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(new LspToolError("ABORTED", "The LSP operation was aborted."));
+      this.signal?.addEventListener("abort", onAbort, { once: true });
+      timeout = setTimeout(() => reject(new LspToolError("DEADLINE_EXCEEDED", "The LSP operation exceeded its deadline.")),
+        Math.max(0, this.deadlineAtMs - this.#now()));
+      timeout.unref();
+    });
+    try {
+      const value = await Promise.race([work, cancelled]);
+      this.check();
+      return value;
+    } finally {
+      clearTimeout(timeout);
+      if (onAbort !== undefined) this.signal?.removeEventListener("abort", onAbort);
+    }
+  }
 }
 
 export function validateTimeout(value: number, field: string): number {

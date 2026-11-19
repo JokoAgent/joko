@@ -1,10 +1,11 @@
 import { mkdir, mkdtemp, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TypeScriptLspBridge } from "./provider.js";
 import { LSP_TOOL_ACTIONS } from "./types.js";
+import { TypeScriptWorkspace } from "./workspace.js";
 
 const roots: string[] = [];
 
@@ -13,6 +14,72 @@ afterEach(async () => {
 });
 
 describe("TypeScript LSP bridge capabilities", () => {
+  it.each(["abort", "deadline"] as const)("keeps a second cold hover alive after the first caller's %s", async retirement => {
+    const fixture = await workspaceFixture(), bridge = new TypeScriptLspBridge();
+    const firstOwner = new AbortController();
+    let releaseIndex!: () => void;
+    const scanning = new Promise<void>(resolve => { releaseIndex = resolve; });
+    const createWorkspace = TypeScriptWorkspace.create;
+    const initialize = vi.spyOn(TypeScriptWorkspace, "create").mockImplementationOnce(async (...input) => {
+      await scanning;
+      return createWorkspace(...input);
+    });
+    const request = { action: "hover" as const, workspaceRoot: fixture.root, file: "lib.ts", line: 2, column: 18 };
+    const settled = vi.fn();
+    const first = bridge.call(request, { signal: firstOwner.signal, timeoutMs: retirement === "deadline" ? 100 : 10_000 })
+      .then(result => { settled(result); return result; });
+    const second = bridge.call(request, { timeoutMs: 10_000 });
+    try {
+      expect(initialize).toHaveBeenCalledTimes(1);
+      if (retirement === "abort") firstOwner.abort();
+      await vi.waitFor(() => expect(settled).toHaveBeenCalledWith(expect.objectContaining({ ok: false,
+        error: expect.objectContaining({ code: retirement === "abort" ? "ABORTED" : "DEADLINE_EXCEEDED" }) })), { timeout: 3_000 });
+      expect(initialize.mock.calls[0]?.[2].signal?.aborted).toBe(false);
+      expect(bridge.workspaceCount).toBe(1);
+
+      releaseIndex();
+      await expect(second).resolves.toMatchObject({ ok: true, result: { action: "hover",
+        items: [expect.objectContaining({ display: expect.stringContaining("greet") })] } });
+      expect(initialize).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseIndex();
+      await Promise.allSettled([first, second]);
+      initialize.mockRestore();
+      bridge.dispose();
+    }
+  });
+
+  it("retires an unfinished cold index when its last caller cancels", async () => {
+    const fixture = await workspaceFixture(), bridge = new TypeScriptLspBridge();
+    let releaseIndex!: () => void;
+    const scanning = new Promise<void>(resolve => { releaseIndex = resolve; });
+    const createWorkspace = TypeScriptWorkspace.create;
+    const initialize = vi.spyOn(TypeScriptWorkspace, "create").mockImplementationOnce(async (...input) => {
+      await scanning;
+      return createWorkspace(...input);
+    });
+    const controller = new AbortController();
+    const request = { action: "hover" as const, workspaceRoot: fixture.root, file: "lib.ts", line: 2, column: 18 };
+    const settled = vi.fn();
+    const first = bridge.call(request, { signal: controller.signal }).then(result => { settled(result); return result; });
+    try {
+      controller.abort();
+      await vi.waitFor(() => expect(settled).toHaveBeenCalledWith(expect.objectContaining({ ok: false,
+        error: expect.objectContaining({ code: "ABORTED" }) })), { timeout: 3_000 });
+      expect(bridge.workspaceCount).toBe(0);
+      expect(initialize.mock.calls[0]?.[2].signal?.aborted).toBe(true);
+      releaseIndex();
+      await expect(bridge.call(request)).resolves.toMatchObject({ ok: true });
+      expect(initialize).toHaveBeenCalledTimes(2);
+      expect(bridge.workspaceCount).toBe(1);
+    } finally {
+      releaseIndex();
+      await Promise.allSettled([first, initialize.mock.results[0]?.value]);
+      initialize.mockRestore();
+      bridge.dispose();
+    }
+  });
+
   it.each(["types", "exports"])("resolves installed package %s metadata without exposing dependency locations", async (metadata) => {
     const fixture = await workspaceFixture();
     const packageRoot = join(fixture.root, "node_modules", "example-lib");
