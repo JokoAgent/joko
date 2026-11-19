@@ -622,7 +622,7 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
       }
     });
 
-    const source = fixture.application.store.listEvents({ sessionId }).map((event) => event.payload)
+    const source = fixture.application.store.listEvents({ sessionId, activeNativeTimeline: true }).map((event) => event.payload)
       .find((payload) => payload.type === "message_complete" && payload.role === "assistant");
     if (source?.type !== "message_complete") throw new Error("The settled Pi turn has no assistant message.");
     expect(source.usage?.pricingContext).toMatchObject({ inputTokens: 7 });
@@ -703,11 +703,14 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     await sessionHost.registerTarget({ ...store.getTarget(targetId).descriptor, id: anotherTargetId });
     const password = "portable e2e package password";
     const timestamp = new Date().toISOString();
+    const messageTimestamp = Date.parse(timestamp);
     const upload = async (nativeSessionId: string) => {
       const bytes = Buffer.from([
         JSON.stringify({ type: "session", version: 3, id: nativeSessionId, timestamp, cwd: workspaceDirectory }),
-        JSON.stringify({ type: "message", id: "user-one", parentId: null, timestamp, message: { role: "user", content: "Frozen Pi history" } }),
-        JSON.stringify({ type: "message", id: "user-abandoned", parentId: null, timestamp, message: { role: "user", content: "Rewound Pi history" } })
+        JSON.stringify({ type: "message", id: "user-one", parentId: null, timestamp,
+          message: { role: "user", content: "Frozen Pi history", timestamp: messageTimestamp } }),
+        JSON.stringify({ type: "message", id: "user-abandoned", parentId: null, timestamp,
+          message: { role: "user", content: "Rewound Pi history", timestamp: messageTimestamp } })
       ].join("\n") + "\n");
       const nativeBindingFingerprint = createHash("sha256").update(nativeSessionId).digest("hex");
       const encoded = await buildPortableSessionExport({
@@ -715,7 +718,7 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
         backendCapability: "native-portable-session-v1", password,
         nativeSession: { bytes, sha256: createHash("sha256").update(bytes).digest("hex"), nativeSessionId },
         nativeBindingFingerprint, nativeActiveEntryId: "user-one",
-        events: [{ emittedAt: Date.parse(timestamp), payload: { type: "message_complete", role: "user",
+        events: [{ emittedAt: messageTimestamp, payload: { type: "message_complete", role: "user",
           blocks: [{ kind: "text", text: "Product copy of the selected Pi history" }],
           nativeHistory: { identity: { entryId: "user-one" } } },
           metadata: { namespace: "pi.native_history", fields: { [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: nativeBindingFingerprint } } }],
@@ -743,13 +746,15 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     const first = await commit(await prepare(firstPackage), false);
     if (first.result === undefined) throw new Error("First Pi package returned no import result.");
     const firstId = first.result.sessionId;
-    expect(first.result).toMatchObject({ replacedSessionIds: [], fidelity: PortableSessionFidelity.FULL, status: PortableSessionImportStatus.READY });
+    expect(first.result, first.result.activationError?.message).toMatchObject({
+      replacedSessionIds: [], fidelity: PortableSessionFidelity.FULL, status: PortableSessionImportStatus.READY
+    });
     expect(store.getSession(firstId).descriptor.binding.nativeSessionId).not.toBe("frozen-history");
     const timeline = await paired.clients.session.listSessionTimeline({ sessionId: firstId });
-    const visibleMessages = timeline.events.flatMap(event => event.payload?.kind.case === "messageCompleted" ? [event.payload.kind.value] : []);
+    const visibleMessages = timeline.events.flatMap(event => event.payload?.kind.case === "messageStarted" ? [event.payload.kind.value] : []);
     expect(visibleMessages).toMatchObject([{
       role: MessageRole.USER, nativeIdentity: { entryId: "user-one" },
-      blocks: [{ content: { case: "text", value: "Product copy of the selected Pi history" } }]
+      userInput: { parts: [{ content: { case: "text", value: "Product copy of the selected Pi history" } }] }
     }]);
 
     const secondDraftId = await prepare(secondPackage);
