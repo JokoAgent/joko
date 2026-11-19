@@ -195,6 +195,27 @@ describe("Desktop application-menu bridge", () => {
     expect(openSettings).toHaveBeenCalledOnce();
   });
 
+  it("keeps Settings available while the same native update check is pending", async () => {
+    let releaseCheck!: () => void;
+    const check = new Promise<void>(resolve => { releaseCheck = resolve; });
+    const checkForUpdates = vi.fn(() => check);
+    const openSettings = vi.fn();
+    const queue = createDesktopApplicationMenuCommandQueue({
+      getPreferences: () => ({ navigationOpen: true, windowZoom: 1 }),
+      openAbout: vi.fn(), openHelp: vi.fn(), openNewSession: vi.fn(), openTaskStatusSettings: vi.fn(),
+      openSettings, checkForUpdates, setNavigationOpen: vi.fn(), changeWindowZoom: vi.fn(async () => 1)
+    });
+
+    queue.handle("check-for-updates");
+    queue.handle("open-settings");
+    queue.handle("check-for-updates");
+    try {
+      await vi.waitFor(() => expect(openSettings).toHaveBeenCalledOnce());
+      expect(checkForUpdates).toHaveBeenCalledOnce();
+    } finally { releaseCheck(); }
+    await queue.whenIdle();
+  });
+
   it("projects Darwin defaults, remaps, disables, and unmappable keys", () => {
     expect(desktopApplicationMenuAccelerators({})).toEqual({
       newSessionAccelerator: "Command+N",

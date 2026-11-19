@@ -59,6 +59,7 @@ export type DesktopUpdateCheckResultView =
 export interface DesktopUpdateCheckNotice {
   readonly key:
     | "desktop.updateAvailableVersion"
+    | "desktop.updateDownloadingTitle"
     | "desktop.updateCurrent"
     | "desktop.updateFailed"
     | "desktop.updateUnavailable"
@@ -95,8 +96,9 @@ export function createDesktopApplicationMenuCommandQueue(
   let preferences: DesktopApplicationMenuPreferenceView | undefined;
   let pending = 0;
   let tail = Promise.resolve();
+  let pendingUpdateCheck: Promise<void> | undefined;
 
-  const run = async (command: DesktopApplicationMenuCommand): Promise<void> => {
+  const run = async (command: Exclude<DesktopApplicationMenuCommand, "check-for-updates">): Promise<void> => {
     if (command === "open-about") {
       await actions.openAbout();
       return;
@@ -115,10 +117,6 @@ export function createDesktopApplicationMenuCommandQueue(
     }
     if (command === "open-task-status-settings") {
       await actions.openTaskStatusSettings();
-      return;
-    }
-    if (command === "check-for-updates") {
-      await actions.checkForUpdates();
       return;
     }
     if (command === "toggle-sidebar") {
@@ -143,6 +141,13 @@ export function createDesktopApplicationMenuCommandQueue(
 
   return {
     handle: (command) => {
+      if (command === "check-for-updates") {
+        // A network-backed update request has no dependency on menu navigation or preferences.
+        pendingUpdateCheck ??= Promise.resolve().then(() => actions.checkForUpdates())
+          .catch((error: unknown) => { actions.onError?.(error); })
+          .finally(() => { pendingUpdateCheck = undefined; });
+        return;
+      }
       pending += 1;
       tail = tail
         .then(() => run(command))
@@ -158,7 +163,7 @@ export function createDesktopApplicationMenuCommandQueue(
     sync: (next) => {
       if (pending === 0) preferences = next;
     },
-    whenIdle: () => tail
+    whenIdle: async () => { await Promise.all([tail, pendingUpdateCheck]); }
   };
 }
 

@@ -1627,12 +1627,16 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       if (await navigateFromApplicationMenu({ kind: "settings" })) window.location.hash = "#/settings/taskStatus";
     },
     checkForUpdates: async () => {
-      const result = await window.jokoDesktop?.checkForUpdates();
-      if (result === undefined) return;
+      const desktop = window.jokoDesktop;
+      if (desktop === undefined) return;
+      const status = await desktop.updates?.getStatus().catch(() => undefined);
+      const notice: DesktopUpdateCheckNotice = status?.status === "downloading" && status.startup !== true
+        ? { key: "desktop.updateDownloadingTitle", values: { version: status.version } }
+        : desktopUpdateCheckNotice(await desktop.checkForUpdates());
       applicationMenuNoticeIdRef.current += 1;
       setApplicationMenuNotice({
         id: applicationMenuNoticeIdRef.current,
-        ...desktopUpdateCheckNotice(result)
+        ...notice
       });
     },
     setNavigationOpen: async (open) => setWindowNavigationOpen(open),
