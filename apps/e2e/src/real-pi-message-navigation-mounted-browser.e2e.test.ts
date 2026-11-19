@@ -158,34 +158,53 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
     expect(store.findVisibleSessionMessageOrigin({ sessionId, eventId: rewindSource.eventId })).toBeUndefined();
     await capture("reloaded-row-rewound-dark-narrow.png");
 
-    const delayedSource = await send("Keep this original row if the edit becomes stale.");
+    const delayedText = "Keep this original row if the edit becomes stale.";
+    const editedText = "Preserve this attempted edit.";
+    const newerText = "New input from the other paired client.";
+    const delayedSource = await send(delayedText);
     await page.setViewportSize({ width: 1440, height: 960 }); await page.emulateMedia({ colorScheme: "light" });
     await reload();
     const delayedRow = row(delayedSource.messageId);
     await delayedRow.hover(); await delayedRow.getByRole("button", { name: "Edit message", exact: true }).click();
-    await delayedRow.locator("textarea").fill("Preserve this attempted edit.");
+    await delayedRow.locator("textarea").fill(editedText);
     holdNextNavigation = true;
     await delayedRow.getByRole("button", { name: "Send edited message", exact: true }).click();
     await waitFor(() => Promise.resolve(navigation.mock.calls.length), count => count === 3, "the delayed original edit request");
     expect(navigation.mock.calls[2]![5].sourceMessage).toEqual({ ...delayedSource, requireLatestUser: true });
+    const staleOperationId = navigation.mock.calls[2]![5].operationId;
     const revisionBeforeNewInput = store.getSession(sessionId).revision;
-    const newerSource = await send("New input from the other paired client.");
+    const requestsBeforeNewTurn = fixture.providerRequests.length;
+    const newerSource = await send(newerText);
     expect(store.getSession(sessionId).descriptor.binding).toEqual(binding);
     const historyMarkers = () => store.listEvents({ sessionId }).filter(event => event.payload.type === "native_session_changed").map(event => event.id);
     const markersAfterNewTurn = historyMarkers(), requestsAfterNewTurn = fixture.providerRequests.length;
     await row(newerSource.messageId).waitFor({ state: "visible", timeout: 30_000 });
     expect(await delayedRow.locator("textarea").isDisabled()).toBe(true);
+    const requestsBeforeRelease = fixture.providerRequests.length;
     releaseNavigation!();
     await delayedRow.getByRole("alert").waitFor({ state: "visible", timeout: 30_000 });
-    expect(await delayedRow.locator("textarea").inputValue()).toBe("Preserve this attempted edit.");
+    expect(await delayedRow.locator("textarea").inputValue()).toBe(editedText);
     expect(await delayedRow.locator("textarea").isEnabled()).toBe(true);
     for (const source of [delayedSource, newerSource]) {
       expect(store.findVisibleSessionMessageOrigin({ sessionId, eventId: source.eventId })).toEqual(source);
     }
     expect(historyMarkers()).toEqual(markersAfterNewTurn);
-    expect(fixture.providerRequests).toHaveLength(requestsAfterNewTurn);
     expect(navigation).toHaveBeenCalledTimes(3);
-    expect(store.getOperation(navigation.mock.calls[2]![5].operationId).status).toBe("failed");
+    expect(store.getOperation(staleOperationId).status).toBe("failed");
+    expect(store.listQueueItems({ sessionId }).some(item => item.operationId === staleOperationId)).toBe(false);
+    const newerTurnBodies = fixture.providerRequests.slice(requestsBeforeNewTurn, requestsAfterNewTurn).map(({ body }) => JSON.stringify(body));
+    const extraRequests = fixture.providerRequests.slice(requestsAfterNewTurn).map(({ method, url, body }, index) => {
+      const messages: readonly unknown[] = Array.isArray(body["messages"]) ? body["messages"] : [];
+      const serialized = JSON.stringify(body);
+      return {
+        method, url, model: body["model"], beforeEditReleased: requestsAfterNewTurn + index < requestsBeforeRelease,
+        roles: messages.map(message => message && typeof message === "object" && "role" in message ? String(message.role) : ""),
+        matchesNewerTurnBody: newerTurnBodies.includes(serialized),
+        containsDelayedText: serialized.includes(delayedText), containsEditedText: serialized.includes(editedText),
+        containsNewerText: serialized.includes(newerText)
+      };
+    });
+    expect(extraRequests, "Provider requests observed after the newer input settled").toEqual([]);
     await capture("delayed-edit-rejected-original-and-new-input-preserved.png");
 
     holdNextResponse = true;

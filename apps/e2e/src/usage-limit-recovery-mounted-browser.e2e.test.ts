@@ -26,6 +26,7 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
   const defaultModelName = "Task default quota model";
   let fixture: RealPiSystemFixture | undefined;
   let browser: Browser | undefined;
+  const checkpoint = (phase: string) => { console.info(`Quota recovery fixture ${phase}`); };
   try {
     const configureDefaultProvider = async (host: RealPiSystemFixture) => {
       const providers = host.application.providers!;
@@ -35,6 +36,7 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
         provider: { ...local, id: defaultProviderId, models: [{ ...local.models[0]!, id: defaultModelId, name: defaultModelName }] } });
       await host.application.refreshPiGeneration!();
     };
+    checkpoint("starting the original Pi service");
     fixture = await RealPiSystemFixture.start({ rootDirectory, webDirectory,
       piSettings: { retry: { enabled: false, provider: { maxRetries: 0 } } },
       providerResponder: () => ({ kind: "rateLimit", resetAt }) });
@@ -51,6 +53,7 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
     const admitted = await submit(owner.clients.operation, owner.connectionId, original);
     const runId = queueRunIdFrom(admitted);
     const queueItemId = queueItemIdFrom(admitted);
+    checkpoint("waiting for the original rate limit");
     await waitFor(() => owner.clients.run.getRun({ runId }), value => value.run?.state === RunState.FAILED, "the original Pi rate limit");
     expect(fixture.providerRequests.length).toBeGreaterThan(0);
     expect(fixture.providerRequests.every(({ body }) => body["model"] === REAL_PI_MODEL_ID)).toBe(true);
@@ -58,8 +61,18 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
       .toMatchObject({ providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID });
     expect(fixture.application.store.getSession(sessionId).descriptor.providerId).toBe(defaultProviderId);
 
-    await fixture.close();
+    checkpoint("closing the original fixture for the cold receipt");
+    const closeOriginalApplication = fixture.application.close.bind(fixture.application);
+    const closing = vi.spyOn(fixture.application, "close").mockImplementation(async () => {
+      checkpoint("closing the original Orchestrator");
+      await closeOriginalApplication();
+      checkpoint("closed the original Orchestrator");
+    });
+    try { await fixture.close(); }
+    finally { closing.mockRestore(); }
+    checkpoint("opening the service on the original database");
     fixture = await RealPiSystemFixture.start({ rootDirectory, webDirectory });
+    checkpoint("configuring the restarted service");
     await configureDefaultProvider(fixture);
     const service = fixture.clients(owner.authKey);
     // Supply the unrelated account window through the service's public Provider projection.
@@ -78,9 +91,11 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
     expect(cold?.mutation?.payload).toMatchObject({ case: "sendInput", value: { overrides: { model } } });
     expect(cold?.result?.payload).toMatchObject({ case: "queueItem", value: { queueItemId, runId } });
 
+    checkpoint("pairing the mounted browser");
     const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Quota recovery browser" })).challenge!;
     browser = await chromium.launch({ executablePath: browserPath, headless: true });
     const page = await browser.newPage({ locale: "en-US", timezoneId: "UTC", viewport: { width: 1440, height: 960 } });
+    page.setDefaultTimeout(15_000);
     const taskUrl = `${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`;
     await page.goto(taskUrl, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
@@ -96,6 +111,7 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
       { name: "Continue with chosen Provider", providerId: defaultProviderId, modelId: defaultModelId, triggerAt: trigger + 60_000 }
     ];
     for (const [index, schedule] of schedules.entries()) {
+      checkpoint(`opening the recovery editor for ${schedule.providerId}`);
       const banner = page.getByTestId("error-tail-banner");
       await banner.getByRole("button", { name: "Continue after reset", exact: true }).click();
       const editor = page.getByRole("dialog", { name: "Create schedule", exact: true });
@@ -114,6 +130,7 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
       await waitFor(() => service.scheduler.listSchedules({ sessionId }), result => result.schedules.some(value => value.displayName === schedule.name), "the scheduled recovery");
       await editor.waitFor({ state: "hidden" });
       if (index + 1 < schedules.length) {
+        checkpoint("reopening the task from the saved node");
         await page.goto(taskUrl, { waitUntil: "domcontentloaded" });
         await page.getByRole("button", { name: "Saved nodes", exact: true }).click();
         await page.locator(".connection-card .profile-card").filter({ hasText: fixture.baseUrl })
@@ -122,6 +139,7 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
     }
 
     for (const schedule of schedules) {
+      checkpoint(`waiting for the occurrence on ${schedule.providerId}`);
       const saved = (await service.scheduler.listSchedules({ sessionId })).schedules.find(value => value.displayName === schedule.name)!;
       expect(saved.execution?.model?.model).toMatchObject({ providerId: schedule.providerId, modelId: schedule.modelId });
       expect(saved.nextTriggerAt?.seconds).toBe(BigInt(schedule.triggerAt / 1_000));
@@ -134,6 +152,7 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
     }
     expect(fixture.providerRequests.map(({ body }) => body["model"])).toEqual([REAL_PI_MODEL_ID, defaultModelId]);
   } finally {
+    checkpoint("closing the browser and service");
     clock.mockRestore();
     await browser?.close();
     await fixture?.close();
