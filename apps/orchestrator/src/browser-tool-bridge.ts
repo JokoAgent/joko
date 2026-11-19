@@ -1015,15 +1015,14 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         const uploadOwner = this.#uploadOwner(pageId, signal);
         const artifactIds = requiredStringArray(input, "paths", 16, 512);
         const selector = this.#browser.resolveElementSelector(pageId, unifiedElementTarget(input, "inputRef"));
-        const uploaded = [];
+        const files = [];
         for (const artifactId of artifactIds) {
           signal?.throwIfAborted();
-          const artifact = await this.#artifacts.get(artifactId);
-          const transfer = await this.#transfers.upload(artifact, pageId, selector, uploadOwner);
-          uploaded.push(publicTransfer(transfer));
+          files.push(await this.#artifacts.get(artifactId));
         }
+        const uploaded = await this.#transfers.uploadBatch(files, pageId, selector, uploadOwner);
         this.#assertPageContext(pageId);
-        return this.#result(action, { transfers: uploaded });
+        return this.#result(action, { transfers: uploaded.map(publicTransfer) });
       }
       case "dialog": {
         const pageId = this.#unifiedPageId(input);

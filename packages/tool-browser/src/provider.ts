@@ -2547,6 +2547,11 @@ export class BrowserProvider {
     }
     try {
       assertUploadCurrent();
+      if (files.length > 1 && !await input.evaluate(element => element instanceof HTMLInputElement
+        && element.type === "file" && element.multiple)) {
+        throw new Error("The selected Browser file input does not accept multiple files.");
+      }
+      assertUploadCurrent();
       markDispatched?.();
       await input.setInputFiles(files);
       assertCurrent();

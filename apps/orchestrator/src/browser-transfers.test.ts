@@ -119,6 +119,9 @@ class MemoryTransferRepository implements BrowserTransferRepository {
   put(record: PersistedBrowserTransfer): void {
     this.values.set(record.id, structuredClone(record));
   }
+  putMany(records: readonly PersistedBrowserTransfer[]): void {
+    for (const record of records) this.put(record);
+  }
   delete(_browserProviderId: string, browserTransferId: string): void {
     this.values.delete(browserTransferId);
   }

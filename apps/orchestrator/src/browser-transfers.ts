@@ -83,7 +83,7 @@ export interface PersistedBrowserTransfer {
 
 export interface BrowserTransferRepository {
   list(browserProviderId: string): readonly PersistedBrowserTransfer[];
-  put(record: PersistedBrowserTransfer): void;
+  putMany(records: readonly PersistedBrowserTransfer[]): void;
   delete(browserProviderId: string, browserTransferId: string): void;
 }
 
@@ -181,7 +181,19 @@ export class BrowserTransferCoordinator {
     connection: BrowserTransferConnection,
     metadata: BrowserTransferMetadata = {}
   ): Promise<contract.BrowserTransfer> {
-    const record: TransferRecord = {
+    const [transfer] = await this.uploadBatch([blob], pageId, inputSelector, connection, metadata);
+    return transfer!;
+  }
+
+  async uploadBatch(
+    blobs: readonly BlobRef[],
+    pageId: string,
+    inputSelector: string,
+    connection: BrowserTransferConnection,
+    metadata: BrowserTransferMetadata = {}
+  ): Promise<readonly contract.BrowserTransfer[]> {
+    if (blobs.length === 0 || blobs.length > 16) throw new Error("A Browser upload requires between one and sixteen files.");
+    const records = blobs.map((blob): TransferRecord => ({
       id: randomUUID(),
       browserProviderId: this.#browserProviderId,
       pageId,
@@ -191,9 +203,9 @@ export class BrowserTransferCoordinator {
       generation: this.#provider.generation,
       state: contract.BrowserTransferState.PENDING,
       blob: { ...blob }
-    };
-    this.remember(record);
-    return this.queueUpload(() => this.performUpload(record, inputSelector, connection));
+    }));
+    this.remember(records);
+    return this.queueUpload(() => this.performUpload(records, inputSelector, connection));
   }
 
   /** Ingest a verified BrowserProvider staging path into durable artifacts. */
@@ -214,7 +226,7 @@ export class BrowserTransferCoordinator {
       state: contract.BrowserTransferState.RUNNING,
       startedAt: this.#now()
     };
-    this.remember(record);
+    this.remember([record]);
     const assertCurrent = () => {
       if (isTerminal(record.state) || record.generation !== this.#provider.generation) throw new BrowserGenerationFencedError();
     };
@@ -279,18 +291,18 @@ export class BrowserTransferCoordinator {
     if (!Number.isSafeInteger(minimumGeneration) || minimumGeneration < 0) {
       throw new RangeError("minimumGeneration must be a non-negative safe integer.");
     }
-    for (const record of this.#records.values()) {
-      if (record.generation >= minimumGeneration || isTerminal(record.state)) continue;
-      this.fail(record, generationFencedError(record.state === contract.BrowserTransferState.RUNNING));
-    }
+    const retired = [...this.#records.values()].filter(record => record.generation < minimumGeneration && !isTerminal(record.state));
+    this.failRecords(retired.filter(record => record.state === contract.BrowserTransferState.RUNNING), generationFencedError(true));
+    this.failRecords(retired.filter(record => record.state === contract.BrowserTransferState.PENDING), generationFencedError(false));
   }
 
   private async performUpload(
-    record: TransferRecord,
+    records: readonly TransferRecord[],
     inputSelector: string,
     connection: BrowserTransferConnection
-  ): Promise<contract.BrowserTransfer> {
-    if (isTerminal(record.state)) return this.present(record);
+  ): Promise<readonly contract.BrowserTransfer[]> {
+    const record = records[0]!;
+    if (isTerminal(record.state)) return records.map(member => this.present(member));
     let phase: "input_validation" | "blob_resolution" | "lease" | "browser_action" = "input_validation";
     let lease: BrowserLease | undefined;
     const assertCurrent = () => {
@@ -304,7 +316,7 @@ export class BrowserTransferCoordinator {
       validateConnection(connection);
       assertCurrent();
       phase = "blob_resolution";
-      const path = await this.#artifacts.resolveBlobPath(record.blob!);
+      const paths = await Promise.all(records.map(member => this.#artifacts.resolveBlobPath(member.blob!)));
       assertCurrent();
       let owner: BrowserTakeoverFence | BrowserLeaseFence;
       if (isOwnedTakeoverPage(connection.humanTakeover, record, connection)) owner = connection.humanTakeover;
@@ -315,34 +327,39 @@ export class BrowserTransferCoordinator {
         owner = lease;
       }
       phase = "browser_action";
-      await this.#provider.uploadFiles(record.pageId, owner, { type: "upload", selector: inputSelector, paths: [path] }, {
+      await this.#provider.uploadFiles(record.pageId, owner, { type: "upload", selector: inputSelector, paths }, {
         documentId: connection.documentId,
         assertCurrent,
         markDispatched: () => {
-          record.state = contract.BrowserTransferState.RUNNING;
-          record.startedAt = this.#now();
-          this.persist(record);
+          assertCurrent();
+          const startedAt = this.#now();
+          for (const member of records) {
+            member.state = contract.BrowserTransferState.RUNNING;
+            member.startedAt = startedAt;
+          }
+          this.persistRecords(records);
         }
       });
       assertCurrent();
-      record.state = contract.BrowserTransferState.COMPLETED;
-      record.completedAt = this.#now();
-      this.persist(record);
+      const completedAt = this.#now();
+      this.persistRecords(records.map(member => ({
+        ...member, state: contract.BrowserTransferState.COMPLETED, completedAt
+      })), records);
       this.pruneRetained();
     } catch (error) {
       if (!isTerminal(record.state)) {
         const dispatched = record.startedAt !== undefined;
         if (error instanceof BrowserGenerationFencedError) {
-          this.fail(record, generationFencedError(dispatched));
+          this.failRecords(records, generationFencedError(dispatched));
         } else if (error instanceof BrowserUploadAuthorityError) {
-          this.fail(record, {
+          this.failRecords(records, {
             code: "BROWSER_UPLOAD_AUTHORITY_RETIRED",
             phase: "authorization",
             message: "The Browser upload's original connection, task, or host policy is no longer active.",
             stateMayHaveChanged: dispatched
           });
         } else {
-          this.fail(record, uploadErrorForPhase(phase, dispatched));
+          this.failRecords(records, uploadErrorForPhase(phase, dispatched));
         }
       }
     } finally {
@@ -354,27 +371,35 @@ export class BrowserTransferCoordinator {
         }
       }
     }
-    return this.present(record);
+    return records.map(member => this.present(member));
   }
 
-  private queueUpload(task: () => Promise<contract.BrowserTransfer>): Promise<contract.BrowserTransfer> {
+  private queueUpload(task: () => Promise<readonly contract.BrowserTransfer[]>): Promise<readonly contract.BrowserTransfer[]> {
     const queued = this.#uploadTail.then(task, task);
     this.#uploadTail = queued.then(() => undefined, () => undefined);
     return queued;
   }
 
   private fail(record: TransferRecord, error: TransferError): void {
-    if (isTerminal(record.state)) return;
-    record.state = contract.BrowserTransferState.FAILED;
-    record.error = error;
-    record.completedAt = this.#now();
-    this.persist(record);
+    this.failRecords([record], error);
+  }
+
+  private failRecords(records: readonly TransferRecord[], error: TransferError): void {
+    const pending = records.filter(record => !isTerminal(record.state));
+    if (pending.length === 0) return;
+    const completedAt = this.#now();
+    for (const record of pending) {
+      record.state = contract.BrowserTransferState.FAILED;
+      record.error = error;
+      record.completedAt = completedAt;
+    }
+    this.persistRecords(pending);
     this.pruneRetained();
   }
 
-  private remember(record: TransferRecord): void {
-    this.#records.set(record.id, record);
-    this.persist(record);
+  private remember(records: readonly TransferRecord[]): void {
+    for (const record of records) this.#records.set(record.id, record);
+    this.persistRecords(records);
     this.pruneRetained();
   }
 
@@ -389,7 +414,12 @@ export class BrowserTransferCoordinator {
   }
 
   private persist(record: TransferRecord): void {
-    this.#repository?.put(persistedRecord(record));
+    this.persistRecords([record]);
+  }
+
+  private persistRecords(records: readonly TransferRecord[], adoptInto?: readonly TransferRecord[]): void {
+    this.#repository?.putMany(records.map(persistedRecord));
+    adoptInto?.forEach((record, index) => Object.assign(record, records[index]));
     try {
       this.#onActivityTransition();
     } catch {

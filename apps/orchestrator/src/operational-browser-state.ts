@@ -155,6 +155,12 @@ export class OperationalBrowserState implements BrowserTransferRepository {
     this.#store.setSetting(SCOPE, SCOPE_ID, transferKey(record.browserProviderId, record.id), record);
   }
 
+  putMany(records: readonly PersistedBrowserTransfer[]): void {
+    this.#store.transaction(() => {
+      for (const record of records) this.put(record);
+    });
+  }
+
   delete(browserProviderId: string, browserTransferId: string): void {
     if (!safeOpaqueId(browserProviderId) || !safeOpaqueId(browserTransferId)) return;
     this.#store.deleteSetting(SCOPE, SCOPE_ID, transferKey(browserProviderId, browserTransferId));
