@@ -48,7 +48,7 @@ function Workspace({ owner, ...props }: Props & { readonly owner: string }): JSX
   const [dragEdge, setDragEdge] = useState<InspectorEdge>();
   const drag = useRef<Drag | undefined>(undefined), alive = useRef(true), parking = useRef<HTMLDivElement>(null);
   const attemptedWindows = useRef(new Set<string>());
-  const pendingWindowKeys = useRef(new Set<string>());
+  const pendingWindowKeys = useRef(new Map<string, symbol>());
   const retainedSessions = useRef(new Map<string, string>());
   const pluginRequests = useRef(new Map<string, object>());
   const pendingPlacements = useRef(new Map<string, { readonly edge?: InspectorEdge; readonly windowId?: string }>());
@@ -132,6 +132,7 @@ function Workspace({ owner, ...props }: Props & { readonly owner: string }): JSX
   };
   const move = (key: string, edge: InspectorEdge, before?: string): void => {
     const tab = dock.tabs.get(key); if (tab === undefined) return;
+    pendingWindowKeys.current.delete(key);
     dock.windows.delete(key); setPluginMode(tab, "sidebar", edge);
     commit(value => {
       const group = orderedTabs(visibleTabs().filter(candidate => !dock.windows.has(candidate.key) && edgeOf(candidate) === edge && candidate.key !== key));
@@ -170,6 +171,7 @@ function Workspace({ owner, ...props }: Props & { readonly owner: string }): JSX
       if (taskId !== undefined) { target.sessionId = taskId; target.sessionOwner = source === undefined ? undefined : JSON.stringify([source.backendId, source.targetId, source.generation.toString()]); }
       rememberSource();
       for (const tab of tabs) {
+        pendingWindowKeys.current.delete(tab.key);
         dock.windows.set(tab.key, target.id);
         const oldIndex = target.order.indexOf(tab.key); if (oldIndex >= 0) target.order.splice(oldIndex, 1);
         const index = before === undefined ? -1 : target.order.indexOf(before); target.order.splice(index < 0 ? target.order.length : index, 0, tab.key);
@@ -178,15 +180,19 @@ function Workspace({ owner, ...props }: Props & { readonly owner: string }): JSX
       activate(tabs[0]!, target.id); refreshWindows(); return;
     }
     if (!canDetach || windowsRef.current.length + pendingWindowKeys.current.size >= 8 || tabs.some(tab => pendingWindowKeys.current.has(tab.key))) return;
-    for (const tab of tabs) pendingWindowKeys.current.add(tab.key);
-    const releasePending = (): void => { for (const tab of tabs) pendingWindowKeys.current.delete(tab.key); };
+    const request = Symbol();
+    for (const tab of tabs) pendingWindowKeys.current.set(tab.key, request);
+    const releasePending = (): void => {
+      for (const tab of tabs) if (pendingWindowKeys.current.get(tab.key) === request) pendingWindowKeys.current.delete(tab.key);
+    };
     const id = randomUuid().replaceAll("-", ""), child = openDetachedInspectorWindow(undefined, id);
     if (child === null) { releasePending(); return; }
     let host: DetachedInspectorHost;
     try { host = initializeDetachedInspectorHost(child, document, t("inspector.windowTitle")); }
     catch { releasePending(); child.close(); return; }
     void host.window.jokoInspectorDesktop!.window.identity().then(occurrence => {
-      if (!alive.current || !/^[0-9a-f-]{36}$/u.test(occurrence) || tabs.some(tab => dock.tabs.get(tab.key)?.owner !== tab.owner)) {
+      if (!alive.current || !/^[0-9a-f-]{36}$/u.test(occurrence) || tabs.some(tab =>
+        pendingWindowKeys.current.get(tab.key) !== request || dock.tabs.get(tab.key)?.owner !== tab.owner)) {
         void host.window.jokoInspectorDesktop?.window.close("passive").catch(() => undefined); return;
       }
       const entry: TabWindow = { id, host, occurrence, order: tabs.map(tab => tab.key), sessionId: taskId,
@@ -224,6 +230,7 @@ function Workspace({ owner, ...props }: Props & { readonly owner: string }): JSX
     if (requested === "reset") {
       const key = `plugin:${identity}`;
       guardedPlacement([key], () => {
+        pendingWindowKeys.current.delete(key);
         dock.windows.delete(key); attemptedWindows.current.add(identity);
         commit(value => { const groups = { ...value.groups }; delete groups[key];
           return { ...value, groups, plugins: { ...value.plugins, [identity]: { extensionId, mode: extension.mainView?.open ?? "page", edge: extension.mainView?.side ?? "right", open: old?.open === true } } }; });
@@ -252,6 +259,7 @@ function Workspace({ owner, ...props }: Props & { readonly owner: string }): JSX
       if (mode === "page" && existing !== undefined && !extension.mainView?.multiple && !await (closeGuards.current.get(identity)?.() ?? Promise.resolve(true))) return;
       if (mode === "page") {
         if (!await navigate({ kind: "extensionMainView", extensionId }) || !requestCurrent()) return;
+        if (existing !== undefined) pendingWindowKeys.current.delete(existing.key);
         commit(value => ({ ...value, plugins: { ...value.plugins, [identity]: { extensionId, mode, edge, open: extension.mainView?.multiple === true && old?.open === true } } })); return;
       }
       if (current.current.controller.state.route.kind === "extensionMainView" && current.current.controller.state.route.extensionId === extensionId && !extension.mainView?.multiple) {
