@@ -551,6 +551,34 @@ describe("ComputerRuntime update lifecycle", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
+  it("returns a recovered Windows driver update to both callers after the negative cache expires", async () => {
+    const runner = queuedRunner([result("driver 0.12.0"), result("driver 0.12.0")]);
+    const verified = updateFetch("0.13.0", "win32", "x64");
+    let release!: () => void;
+    const responseReady = new Promise<void>(resolve => { release = resolve; });
+    const fetchImpl = vi.fn<typeof fetch>(async (input, options) => { await responseReady; return verified(input, options); })
+      .mockResolvedValueOnce(new Response(null, { status: 503 }));
+    const runtime = new ComputerRuntime({ platform: "win32", architecture: "x64", runner });
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_900_000_000_000);
+    try {
+      await expect(runtime.checkForUpdate({ fetchImpl })).resolves.toMatchObject({ currentVersion: "0.12.0", updateAvailable: false });
+      await expect(runtime.checkForUpdate({ fetchImpl })).resolves.toMatchObject({ updateAvailable: false });
+      expect(fetchImpl).toHaveBeenCalledOnce();
+      now.mockReturnValue(1_900_000_000_000 + 600_001);
+      const adopted = vi.fn();
+      const first = runtime.checkForUpdate({ fetchImpl }).then(adopted);
+      const reopened = runtime.checkForUpdate({ fetchImpl });
+      await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+      expect(adopted).not.toHaveBeenCalled();
+      release();
+      const recovered = { currentVersion: "0.12.0", latestVersion: "0.13.0", updateAvailable: true, updating: false };
+      await expect(reopened).resolves.toEqual(recovered);
+      await first;
+      expect(adopted).toHaveBeenCalledExactlyOnceWith(recovered);
+      expect(fetchImpl).toHaveBeenCalledTimes(3);
+    } finally { release(); now.mockRestore(); }
+  });
+
   it("pins the reverified target through installation and publishes bounded progress phases", async () => {
     const runner = queuedRunner([
       result("driver 0.12.0"),
