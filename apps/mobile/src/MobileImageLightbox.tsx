@@ -175,6 +175,9 @@ export function MobileImageLightbox({
   const tapTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const dismissResetTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const dismissY = useRef(new Animated.Value(0)).current;
+  const dismissOpacity = useMemo(() => dismissY.interpolate({
+    inputRange: [-300, 0, 300], outputRange: [0.4, 1, 0.4], extrapolate: "clamp"
+  }), [dismissY]);
   const pageX = useRef(new Animated.Value(0)).current;
   const pageAnimationRef = useRef<{ readonly id: object; readonly timer: ReturnType<typeof setTimeout> } | undefined>(undefined);
   const saveControllerRef = useRef<AbortController | undefined>(undefined);
@@ -329,7 +332,7 @@ export function MobileImageLightbox({
         const centroid = mobileTouchCentroid(points.slice(0, 2));
         gestureRef.current = {
           mode: "transform",
-          startedAt: Date.now(),
+          startedAt: event.nativeEvent.timestamp,
           start: centroid,
           last: centroid,
           initialTransform: transformRef.current,
@@ -342,7 +345,7 @@ export function MobileImageLightbox({
       }
       const base: ActiveGesture = {
         mode: "pan",
-        startedAt: Date.now(),
+        startedAt: event.nativeEvent.timestamp,
         start: first,
         last: first,
         initialTransform: transformRef.current,
@@ -467,7 +470,7 @@ export function MobileImageLightbox({
         pageX.setValue(Math.max(-containerRef.current.width, Math.min(containerRef.current.width, gestureState.dx * (hasPage ? 1 : 0.25))));
       }
     },
-    onPanResponderRelease: (_event, gestureState) => {
+    onPanResponderRelease: (event, gestureState) => {
       if (loadOwnerRef.current !== loadKey) return;
       if (!canInteract()) { cancelGesture(); return; }
       const active = gestureRef.current;
@@ -544,7 +547,7 @@ export function MobileImageLightbox({
         activeGallery.onNavigate(nextPage);
         return;
       }
-      const now = Date.now();
+      const now = event.nativeEvent.timestamp;
       const distance = Math.max(active.maxDistance, Math.hypot(gestureState.dx, gestureState.dy));
       if (!mobileLightboxIsTap(active.startedAt, now, distance)) {
         lastTapRef.current = undefined;
@@ -841,9 +844,7 @@ export function MobileImageLightbox({
     onRequestClose={close} supportedOrientations={["portrait", "landscape"]}>
     {Platform.OS === "android" && <StatusBar hidden />}
     <View style={styles.root} onAccessibilityEscape={close}>
-      <Animated.View pointerEvents="none" style={[styles.backdrop, { opacity: dismissY.interpolate({
-        inputRange: [-300, 0, 300], outputRange: [0.4, 1, 0.4], extrapolate: "clamp"
-      }) }]} />
+      <Animated.View pointerEvents="none" style={[styles.backdrop, { opacity: dismissOpacity }]} />
       <View accessibilityRole="image" accessibilityLabel={mobileMessage(locale, "image.previewLabel", { name: fileName })}
         style={styles.canvas} onLayout={updateContainer} {...panResponder.panHandlers}>
         <Animated.View pointerEvents="none" style={[styles.pageStrip, { transform: [{ translateX: pageX }] }]}>
@@ -932,11 +933,10 @@ export function MobileImageLightbox({
         </View>}
         </Animated.View>
       </View>
-      <Animated.View testID="image-lightbox-chrome" pointerEvents={chromeHidden ? "none" : "box-none"}
+      <View testID="image-lightbox-chrome" pointerEvents={chromeHidden ? "none" : "box-none"}
         accessibilityElementsHidden={chromeHidden} importantForAccessibility={chromeHidden ? "no-hide-descendants" : "auto"}
-        style={[styles.chrome, { opacity: chromeHidden ? 0 : dismissY.interpolate({
-          inputRange: [-300, 0, 300], outputRange: [0.4, 1, 0.4], extrapolate: "clamp"
-        }) }]}>
+        style={[styles.chrome, { opacity: chromeHidden ? 0 : 1 }]}>
+      <Animated.View pointerEvents="box-none" style={[styles.chrome, { opacity: dismissOpacity }]}>
       <SafeAreaView pointerEvents="box-none" style={styles.chromeSafeArea} edges={["top", "right", "bottom", "left"]}>
       <View style={styles.header}>
         <ToolButton label={mobileMessage(locale, "image.close")} onPress={close} disabled={false} />
@@ -994,6 +994,7 @@ export function MobileImageLightbox({
       </View>
     </SafeAreaView>
       </Animated.View>
+      </View>
       {host}
     </View>
   </Modal>;

@@ -22,9 +22,11 @@ vi.mock("react-native", () => {
     children?: ReactNode; testID?: string; pointerEvents?: string; accessibilityElementsHidden?: boolean; importantForAccessibility?: string; style?: unknown;
   }) => createElement("div", { "data-testid": testID, "data-pointer-events": pointerEvents,
     "aria-hidden": accessibilityElementsHidden, "data-accessibility": importantForAccessibility, ...geometry(style) }, children);
-  return { View: ({ children, accessibilityRole, onLayout, style }: { children?: ReactNode; accessibilityRole?: string; onLayout?: (event: unknown) => void; style?: unknown }) => {
+  return { View: ({ accessibilityRole, onLayout, ...props }: Parameters<typeof box>[0] & {
+    accessibilityRole?: string; onLayout?: (event: unknown) => void;
+  }) => {
     if (accessibilityRole === "image") native.layout = onLayout;
-    return createElement("div", geometry(style), children);
+    return box(props);
   }, Text: ({ children }: { children?: ReactNode }) => createElement("span", {}, children),
     Modal: ({ children, visible }: { children?: ReactNode; visible: boolean }) => visible ? createElement("div", { role: "dialog" }, children) : null,
     ActivityIndicator: box, StatusBar: box, Platform: { OS: "android" },
@@ -101,9 +103,9 @@ async function load(page: MobileImageGalleryPageSession, isAnimated = page.expec
   await act(async () => native.images.get(page.previewUri)!.onLoad!({ cacheType: "none", source: { url: page.previewUri, width: 1, height: 1,
     mediaType: page.previewMediaType ?? page.sourceMediaType, isAnimated } } as ImageLoadEventData));
 }
-function touch(points = [{ x: 200, y: 150 }]): GestureResponderEvent {
+function touch(points = [{ x: 200, y: 150 }], timestamp = Date.now()): GestureResponderEvent {
   return { nativeEvent: { locationX: points[0]?.x ?? 200, locationY: points[0]?.y ?? 150,
-    touches: points.map((point) => ({ locationX: point.x, locationY: point.y })) } } as GestureResponderEvent;
+    timestamp, touches: points.map((point) => ({ locationX: point.x, locationY: point.y })) } } as GestureResponderEvent;
 }
 function motion(dx = 0, dy = 0, vy = 0): PanResponderGestureState {
   return { dx, dy, vy, vx: 0, numberActiveTouches: 1 } as PanResponderGestureState;
@@ -261,6 +263,29 @@ describe("lightbox dismissal and gesture ownership", () => {
     await drag(0, -121); expect(close).toHaveBeenCalledOnce();
     await render(session("image/png", false, "fast-page"));
     await drag(0, 20, 0.801); expect(close).toHaveBeenCalledTimes(2); expect(output).not.toHaveBeenCalled();
+  });
+
+  it("accepts the original contact duration when a short drag's rebound delays tap delivery", async () => {
+    vi.useFakeTimers();
+    const page = session("image/png", false);
+    await render(page); await load(page);
+    const chrome = () => host.querySelector('[data-testid="image-lightbox-chrome"]')!;
+    await drag(0, 90);
+    expect(native.spring).toHaveBeenCalledOnce();
+    await act(async () => vi.advanceTimersByTime(1_000));
+
+    const contactAt = Date.now();
+    await act(async () => native.gestures!.onPanResponderGrant!(touch(undefined, contactAt), motion()));
+    await act(async () => vi.advanceTimersByTime(700));
+    await act(async () => native.gestures!.onPanResponderRelease!(touch([], contactAt + 60), motion()));
+    await act(async () => vi.advanceTimersByTime(280));
+    expect(chrome().getAttribute("aria-hidden")).toBe("true");
+    expect(chrome().getAttribute("data-pointer-events")).toBe("none");
+
+    await tap(); await act(async () => vi.advanceTimersByTime(280));
+    expect(chrome().getAttribute("aria-hidden")).toBe("false");
+    expect(chrome().getAttribute("data-pointer-events")).toBe("box-none");
+    expect(close).not.toHaveBeenCalled();
   });
 
   it("retires pending taps and old callbacks on page, orientation, annotation, multi-touch, effects and background changes", async () => {
