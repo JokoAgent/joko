@@ -330,6 +330,49 @@ describe("AutomationSettings", () => {
     expect(controller.setAndroidAdbPath).toHaveBeenCalledWith();
   });
 
+  it("keeps recovery controls for a persisted ADB path that fails preparation", async () => {
+    const controller = controllerFixture();
+    const base = snapshot({ androidEnabled: true });
+    const missing = "/test-tools/missing/adb";
+    const error = "The configured ADB executable was not found.";
+    const pathInput = (card: ParentNode) => required(card.querySelector<HTMLInputElement>('input[aria-label="Custom ADB path"]'));
+    const healthy = await render(controller, base);
+    await act(async () => changeInput(pathInput(healthy), missing));
+    await act(async () => buttonWithText(healthy, "Save Path").click());
+    expect(controller.setAndroidAdbPath).toHaveBeenLastCalledWith(missing);
+
+    const failed: AppSnapshot = { ...base, settings: { ...base.settings, androidAutomation: {
+      ...base.settings.androidAutomation, platform: "linux", support: "temporarilyUnavailable", runtimeState: "error",
+      adbPathOverride: missing, adbAvailable: false, preparationReady: false, issue: "driverError",
+      preparationError: error, failureReason: error
+    } } };
+    const reopened = await render(controller, failed);
+    const card = required(reopened.querySelector('[data-automation-card="android"]'));
+    expect(card.querySelector('[role="status"]')?.textContent).toBe(`ADB preparation failed: ${error}`);
+    expect(pathInput(card).value).toBe(missing);
+    expect(pathInput(card).disabled).toBe(false);
+    expect(card.querySelector(".automation-android__device-trigger")).toBeNull();
+    const toggle = required(card.querySelector<HTMLButtonElement>('[data-automation-toggle="android"]'));
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    expect(toggle.disabled).toBe(false);
+
+    await act(async () => required(card.querySelector<HTMLButtonElement>(".automation-android__refresh")).click());
+    expect(controller.probeAndroidAutomation).toHaveBeenCalledWith(true);
+    await act(async () => changeInput(pathInput(card), "/test-tools/repaired/adb"));
+    await act(async () => buttonWithText(card, "Save Path").click());
+    expect(controller.setAndroidAdbPath).toHaveBeenLastCalledWith("/test-tools/repaired/adb");
+    await act(async () => buttonWithText(card, "Use Default").click());
+    expect(controller.setAndroidAdbPath).toHaveBeenLastCalledWith();
+    await act(async () => toggle.click());
+    expect(controller.updateAndroidAutomationSettings).toHaveBeenLastCalledWith(false);
+
+    const unsupported = await render(controller, { ...failed, settings: { ...failed.settings, androidAutomation: {
+      ...failed.settings.androidAutomation, support: "platformLimited"
+    } } });
+    expect(unsupported.querySelector('input[aria-label="Custom ADB path"]')).toBeNull();
+    expect(unsupported.querySelector<HTMLButtonElement>('[data-automation-toggle="android"]')?.disabled).toBe(true);
+  });
+
   it("keeps a manually observed disabled device picker usable", async () => {
     const controller = controllerFixture();
     const container = await render(controller, snapshot({ androidObserved: true }));

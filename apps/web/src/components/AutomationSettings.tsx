@@ -783,6 +783,9 @@ function AndroidAutomationCard({ controller, settings, onEnablePreparation, runA
   const [pathDraft, setPathDraft] = useState("");
   const [pathEdited, setPathEdited] = useState(false);
   const supported = settings.support === "supported";
+  const repairSavedPath = settings.support === "temporarilyUnavailable" && settings.issue === "driverError"
+    && settings.adbPathOverride !== "" && settings.preparationError !== "";
+  const configurable = supported || repairSavedPath;
   const busy = pending || settings.runtimeState === "checking" || settings.runtimeState === "preparing";
   const guide = androidConnectionGuideKind(settings);
   const deviceStatus = describeAndroidDeviceStatus(settings, t);
@@ -815,7 +818,7 @@ function AndroidAutomationCard({ controller, settings, onEnablePreparation, runA
 
   return (
     <div className="automation-card-stack" data-automation-card="android">
-      <article className={cx("automation-card", !supported && "automation-card--unavailable")}>
+      <article className={cx("automation-card", !configurable && "automation-card--unavailable")}>
         <header className="automation-card__header">
           <span className="automation-card__icon" aria-hidden="true"><Smartphone /></span>
           <span className="automation-card__heading">
@@ -824,7 +827,7 @@ function AndroidAutomationCard({ controller, settings, onEnablePreparation, runA
           </span>
           <AutomationSwitch
             checked={settings.enabled}
-            disabled={!supported || busy}
+            disabled={!configurable || busy || !supported && !settings.enabled}
             label={t("settings.automationAndroid")}
             marker="android"
             onChange={(enabled) => {
@@ -834,7 +837,7 @@ function AndroidAutomationCard({ controller, settings, onEnablePreparation, runA
           />
         </header>
 
-        {!supported ? (
+        {!configurable ? (
           <div className="automation-card__status automation-card__status--unavailable" role="status">
             <AlertTriangle aria-hidden="true" />
             <span>{t("settings.automationUnavailable")}</span>
@@ -844,10 +847,10 @@ function AndroidAutomationCard({ controller, settings, onEnablePreparation, runA
             <div className="automation-android__row automation-android__device-row">
               <span className="automation-android__copy">
                 <strong>{t("settings.automationAndroidDevice")}</strong>
-                <small>{deviceStatus}</small>
+                {supported && <small>{deviceStatus}</small>}
               </span>
               <div className="automation-android__actions">
-                <AndroidDevicePicker
+                {supported && <AndroidDevicePicker
                   settings={settings}
                   disabled={busy || (!settings.enabled && !settings.statusObserved)}
                   onSelect={(serial) => runAndroidAction(
@@ -855,7 +858,7 @@ function AndroidAutomationCard({ controller, settings, onEnablePreparation, runA
                     () => controller.selectAndroidAutomationDevice(serial)
                   )}
                   t={t}
-                />
+                />}
                 <Button
                   className="automation-android__refresh"
                   disabled={busy}
@@ -872,7 +875,7 @@ function AndroidAutomationCard({ controller, settings, onEnablePreparation, runA
             <div className="automation-android__row automation-android__adb-row">
               <span className="automation-android__copy">
                 <strong>{t("settings.automationAndroidAdb")}</strong>
-                <small>{androidAdbStatus(settings, t)}</small>
+                <small role={repairSavedPath ? "status" : undefined}>{androidAdbStatus(settings, t)}</small>
               </span>
               <div className="automation-android__path-actions">
                 <input
