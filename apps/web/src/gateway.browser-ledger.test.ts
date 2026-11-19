@@ -120,6 +120,36 @@ describe("Browser ledger gateway", () => {
       .rejects.toThrow("cyclic Browser transfer page token");
     gateway.disconnect();
   });
+
+  it("reads only completed manual downloads from the requested provider across closed pages", async () => {
+    const original = { browserTransferId: "original", browserProviderId: "browser-one", pageId: "closed-page",
+      direction: TransferDirection.DOWNLOAD, state: BrowserTransferState.COMPLETED,
+      blob: { blobId: "original-blob", fileName: "report.txt" } };
+    const unary = vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
+      if (method.localName === "getSnapshot") return response(method, create(GetSnapshotResponseSchema, {
+        snapshot: create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } })
+      }));
+      expect(method.localName).toBe("listBrowserTransfers");
+      expect(input).toMatchObject({ browserProviderId: "browser-one", pageId: "",
+        direction: TransferDirection.DOWNLOAD, state: BrowserTransferState.COMPLETED });
+      return response(method, create(ListBrowserTransfersResponseSchema, { transfers: [
+        original,
+        { ...original, browserTransferId: "other-provider", browserProviderId: "browser-two" },
+        { ...original, browserTransferId: "agent", toolCallId: "tool-call" },
+        { ...original, browserTransferId: "upload", direction: TransferDirection.UPLOAD },
+        { ...original, browserTransferId: "failed", state: BrowserTransferState.FAILED }
+      ] }));
+    });
+    const transport = { unary, stream: vi.fn(async (method: any) => response(method, idleStream(), true)) } as unknown as Transport;
+    const gateway = createOrchestratorGateway(
+      { id: "connection-downloads", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      "secret", {}, () => transport);
+    await gateway.connect();
+    await expect(gateway.listBrowserDownloads("browser-one")).resolves.toMatchObject([
+      { id: "original", pageId: "closed-page", blobId: "original-blob", fileName: "report.txt" }
+    ]);
+    gateway.disconnect();
+  });
 });
 
 function response(method: any, message: any, stream = false): any {

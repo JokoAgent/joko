@@ -4820,16 +4820,33 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async listBrowserTransfers(browserId: string, pageId: string): Promise<readonly BrowserTransferView[]> {
+    return this.readBrowserTransfers(browserId, pageId, false);
+  }
+
+  async listBrowserDownloads(browserId: string): Promise<readonly BrowserTransferView[]> {
+    return this.readBrowserTransfers(browserId, "", true);
+  }
+
+  private async readBrowserTransfers(browserId: string, pageId: string, completedDownloads: boolean): Promise<readonly BrowserTransferView[]> {
     const client = createClient(BrowserService, this.requireTransport());
     const values: BrowserTransferView[] = [];
     const consumedTokens = new Set<string>();
     let pageToken = "";
     for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
       const response = await client.listBrowserTransfers(
-        { browserProviderId: browserId, pageId, page: { pageSize: 500, pageToken } },
+        {
+          browserProviderId: browserId,
+          pageId,
+          ...(completedDownloads ? { direction: TransferDirection.DOWNLOAD, state: BrowserTransferState.COMPLETED } : {}),
+          page: { pageSize: 500, pageToken }
+        },
         this.#abort === undefined ? undefined : { signal: this.#abort.signal }
       );
-      values.push(...response.transfers.map(mapBrowserTransfer));
+      const transfers = response.transfers.map(mapBrowserTransfer);
+      values.push(...(completedDownloads ? transfers.filter(transfer =>
+        transfer.browserId === browserId && transfer.direction === "download" && transfer.state === "completed" &&
+        transfer.toolCallId === undefined && transfer.blobId !== undefined
+      ) : transfers));
       const nextPageToken = response.page?.nextPageToken ?? "";
       if (nextPageToken === "") return values;
       if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {

@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import { BrowserAutomationTarget, BrowserTakeoverActionMutationSchema, BrowserTakeoverMouseButton, OperationMutationSchema,
-  OperationState } from "@joko/contracts";
+  BrowserTransferState, OperationState, TransferDirection } from "@joko/contracts";
 import { OperationalBrowserState } from "@joko/orchestrator";
 import { chromium } from "playwright-core";
 import { expect, it } from "vitest";
@@ -38,8 +38,12 @@ browserIt("removes a closed native external tab from Owner recovery and preserve
     if (surviving === undefined) throw new Error("No surviving Browser takeover was returned.");
     const survivor = await provider.runHumanTakeoverOperation(surviving, async page => page);
     const url = "https://external-tab.example.test/closed";
+    const attachmentUrl = "https://external-tab.example.test/report.txt";
+    const attachmentText = "The original report from the closed Browser page.\n";
     await survivor.context().route(url, route => route.fulfill({ contentType: "text/html",
-      body: "<!doctype html><title>Tab to close</title><p>Ordinary external Browser tab.</p>" }));
+      body: '<!doctype html><title>Tab to close</title><a href="/report.txt">Get original report</a>' }));
+    await survivor.context().route(attachmentUrl, route => route.fulfill({ contentType: "text/plain",
+      headers: { "content-disposition": 'attachment; filename="report.txt"' }, body: attachmentText }));
     expect((await open(url)).state).toBe(OperationState.SUCCEEDED);
     const closing = provider.currentHumanTakeover();
     if (closing === undefined) throw new Error("No closing Browser takeover was returned.");
@@ -49,6 +53,14 @@ browserIt("removes a closed native external tab from Owner recovery and preserve
       expect.objectContaining({ pageId: surviving.pageId, sessionId, recoverable: false }),
       expect.objectContaining({ pageId: closing.pageId, sessionId, url, recoverable: false })
     ]));
+    const completedDownloads = (pageId = "") => owner.clients.browser.listBrowserTransfers({
+      browserProviderId: provider.id, pageId, direction: TransferDirection.DOWNLOAD, state: BrowserTransferState.COMPLETED
+    });
+    await page.getByRole("link", { name: "Get original report" }).click();
+    const received = await waitFor(() => completedDownloads(closing.pageId),
+      result => result.transfers.some(transfer => transfer.blob?.fileName === "report.txt"), "the original Browser download receipt");
+    const original = received.transfers.find(transfer => transfer.blob?.fileName === "report.txt");
+    if (!original?.blob) throw new Error("The original Browser transfer has no stored file.");
 
     await page.close();
     expect(survivor.isClosed()).toBe(false);
@@ -59,6 +71,12 @@ browserIt("removes a closed native external tab from Owner recovery and preserve
     const persisted = new OperationalBrowserState(fixture.application.store);
     expect(persisted.findRecoverablePage(provider.id, closing.pageId)).toBeUndefined();
     expect(persisted.findRecoverablePage(provider.id, surviving.pageId)).toBeDefined();
+    expect((await completedDownloads()).transfers).toEqual([original]);
+    const { ticket } = await owner.clients.artifact.getBlobDownloadTicket({ blobId: original.blob.blobId });
+    if (!ticket) throw new Error("The completed Browser download has no ticket after its source page closed.");
+    const loaded = await fetch(new URL(ticket.relativeEndpoint, fixture.baseUrl), { headers: { authorization: `Bearer ${owner.authKey}` } });
+    expect(loaded.ok).toBe(true);
+    expect(await loaded.text()).toBe(attachmentText);
 
     await provider.stop();
     expect((await list())?.pages).toEqual([expect.objectContaining({ pageId: surviving.pageId, sessionId, recoverable: true })]);
@@ -76,6 +94,9 @@ it.skipIf(!existsSync(sidebarExecutable))("adopts a native same-origin sidebar p
     const owner = await fixture.pair("Sidebar popup owner");
     const mutate = (payload: NonNullable<MessageInitShape<typeof OperationMutationSchema>["payload"]>) =>
       submit(owner.clients.operation, owner.connectionId, create(OperationMutationSchema, { payload }));
+    expect((await mutate({ case: "updateBrowserSettings", value: {
+      patch: { browserProviderId: provider.id, automationTarget: BrowserAutomationTarget.SIDEBAR }
+    } })).state).toBe(OperationState.SUCCEEDED);
     const sessionId = sessionIdFrom(await submit(owner.clients.operation, owner.connectionId, createSessionMutation({
       backendId: "pi", targetId: "workspace-real-pi", displayName: "Sidebar popup task", providerId: REAL_PI_PROVIDER_ID,
       modelId: REAL_PI_MODEL_ID, effortId: "off"

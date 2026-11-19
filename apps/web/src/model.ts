@@ -6542,6 +6542,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   updateBrowserCommentDesign(browserId: string, pageId: string, command: BrowserCommentDesignCommandView): Promise<readonly BrowserCommentPlacementView[]>;
   listBrowserActivity(browserId: string, pageId: string): Promise<readonly BrowserActivityView[]>;
   listBrowserTransfers(browserId: string, pageId: string): Promise<readonly BrowserTransferView[]>;
+  listBrowserDownloads(browserId: string): Promise<readonly BrowserTransferView[]>;
   uploadBrowserFile(browserId: string, pageId: string, documentId: string, file: File, inputHint?: string): Promise<void>;
   approveResource(resourceId: string, discoveredRevision: string): Promise<void>;
   discoverProjectResources(targetId: string): Promise<void>;

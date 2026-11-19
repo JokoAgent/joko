@@ -134,6 +134,55 @@ it("keeps the selected Browser page's ledger when a previous page finishes refre
   expect(downloadArtifact).not.toHaveBeenCalled();
 });
 
+it("offers the original completed download after closing its source page and reopening its URL", async () => {
+  const initial = snapshot();
+  const browser = initial.browsers[0]!;
+  const source = browser.pages[0]!;
+  const download: BrowserTransferView = {
+    id: "original-download", browserId: browser.id, pageId: source.id, direction: "download", state: "completed",
+    blobId: "original-blob", fileName: "report.txt", mediaType: "text/plain", byteSize: 12, startedAt: 0
+  };
+  const closeBrowserPage = vi.fn(async () => undefined);
+  const listBrowserDownloads = vi.fn(async () => [download]);
+  const downloadArtifact = vi.fn(async () => undefined);
+  const controller = {
+    state: { preferences: DEFAULT_UI_PREFERENCES, activeProfile: { id: "profile-1", serverId: "server-1" } },
+    readNewSessionDraft: vi.fn(async () => undefined),
+    getArtifactUrl: vi.fn(async () => "data:image/png;base64,iVBORw0KGgo="),
+    releaseArtifactUrl: vi.fn(),
+    listBrowserActivity: vi.fn(async () => []),
+    listBrowserTransfers: vi.fn(async (_browserId: string, pageId: string) => pageId === source.id ? [download] : []),
+    listBrowserDownloads, closeBrowserPage, downloadArtifact
+  } as unknown as AppController;
+  const host = document.body.appendChild(document.createElement("div"));
+  const root = createRoot(host);
+  roots.push(root);
+  const render = (current: BrowserView) => act(async () => root.render(<ToolsPage controller={controller}
+    snapshot={{ ...initial, browsers: [current] }} locale="en" t={key => key}
+    runAction={(_key, action) => { void action(); }} onOpenNavigation={() => undefined} />));
+
+  await render(browser);
+  expect(required(host.querySelector("section.browser-ledger")).textContent).toContain(download.fileName);
+  expect(listBrowserDownloads).not.toHaveBeenCalled();
+  await act(async () => required(host.querySelector<HTMLButtonElement>('[aria-label="browser.closePage"]')).click());
+  expect(closeBrowserPage).toHaveBeenCalledExactlyOnceWith(browser.id, source.id);
+  await render({ ...browser, pages: [], activePageId: undefined, takeover: undefined });
+  expect(host.querySelector("section.browser-ledger")).toBeNull();
+
+  const history = required(host.querySelector<HTMLDetailsElement>("details.browser-download-history"));
+  await act(async () => {
+    history.open = true;
+    history.dispatchEvent(new Event("toggle"));
+  });
+  expect(listBrowserDownloads).toHaveBeenCalledWith(browser.id);
+  expect(history.textContent).toContain(download.fileName);
+  const reopened = { ...source, id: "new-page-for-same-url" };
+  await render({ ...browser, pages: [reopened], activePageId: reopened.id, takeover: undefined });
+  expect(required(host.querySelector("section.browser-ledger")).textContent).toContain("browser.noTransfers");
+  await act(async () => buttonWithText(history, "common.download").click());
+  expect(downloadArtifact).toHaveBeenCalledExactlyOnceWith(download.blobId, download.fileName, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+});
+
 function snapshot(): AppSnapshot {
   const initial = emptySnapshot();
   const browser: BrowserView = {
