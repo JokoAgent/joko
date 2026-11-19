@@ -637,6 +637,43 @@ describe("CollaborationGoalManager", () => {
     });
   });
 
+  it.each([false, true])("rejects late work and archives the Goal with an original settled worker (released=%s)", async alreadyReleased => {
+    const fixture = await createFixture();
+    const goal = fixture.manager.createGoal({ operationId: "late-worker-goal", leadSessionId: fixture.leadSessionId,
+      expectedSessionGeneration: fixture.leadGeneration, title: "Finish before archiving", objective: "Retire the finished worker." }).goal;
+    const created = await fixture.manager.createWorker(workerInput(goal.id, goal.revision, fixture.leadSessionId, {
+      operationId: "late-worker-create", label: "Reviewer", role: "reviewer", assignment: "Complete the original work."
+    }));
+    const worker = await vi.waitFor(() => {
+      const current = fixture.store.getCollaborationWorker(created.worker.id);
+      expect(current).toMatchObject({ status: "completed", runtimeReleased: false });
+      return current;
+    });
+    const sessionId = worker.sessionId!;
+    const queue = fixture.store.listQueueItems({ sessionId });
+    const common = { goalId: goal.id, callerLeadSessionId: fixture.leadSessionId };
+    const completed = await fixture.manager.setGoalStatus({ ...common, operationId: "late-worker-complete-goal",
+      expectedRevision: fixture.store.getCollaborationGoal(goal.id).revision, status: "completed" });
+
+    await expect(fixture.manager.sendMessage({ ...common, operationId: "late-worker-send", workerId: worker.id,
+      expectedWorkerRevision: worker.revision, expectedSessionGeneration: worker.sessionGeneration!, message: "This old panel lost its authority." }))
+      .rejects.toThrow(/collaboration Goal dispatch/u);
+    expect(fixture.store.getCollaborationWorker(worker.id)).toMatchObject({ revision: worker.revision, status: "completed", runtimeReleased: false });
+    expect(fixture.store.findOperation("late-worker-send")).toBeUndefined();
+    expect(fixture.store.listQueueItems({ sessionId })).toEqual(queue);
+    if (alreadyReleased) {
+      const released = (await fixture.manager.releaseWorker({ workerId: worker.id, callerLeadSessionId: fixture.leadSessionId,
+        operationId: "late-worker-release", expectedRevision: worker.revision, expectedSessionGeneration: worker.sessionGeneration! })).worker;
+      fixture.store.updateCollaborationWorkerState({ workerId: worker.id, expectedRevision: released.revision,
+        status: "idle", runtimeReleased: true });
+    }
+    const archived = await fixture.manager.setGoalStatus({ ...common, operationId: "late-worker-archive-goal",
+      expectedRevision: completed.goal.revision, status: "archived" });
+    expect(archived.goal.status).toBe("archived");
+    expect(archived.workers[0]).toMatchObject({ id: worker.id, status: "archived", runtimeReleased: true, sessionId });
+    expect(fixture.host.isSessionActive(sessionId)).toBe(false);
+  });
+
   it("binds the original successfully created worker Session during a cold recovery", async () => {
     const fixture = await createFixture();
     const goal = fixture.manager.createGoal({ operationId: "worker-committed-session-goal", leadSessionId: fixture.leadSessionId,

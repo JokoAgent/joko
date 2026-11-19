@@ -10,6 +10,7 @@ import {
 } from "@joko/runtime-governance";
 import {
   AuthorizationError,
+  InvalidStateTransitionError,
   OperationInProgressError,
   RevisionConflictError,
   StoreError,
@@ -635,7 +636,7 @@ export class CollaborationGoalManager {
   }): Promise<{ readonly tree: CollaborationGoalTreeView; readonly worker: CollaborationWorkerRecord }> {
     return this.#withLock(input.workerId, async () => {
       this.#assertOpen();
-      const assertCurrent = (store: OperationalStore): void => {
+      const assertCurrent = (store: OperationalStore): boolean => {
         const worker = store.getCollaborationWorker(input.workerId);
         const goal = store.getCollaborationGoal(worker.goalId);
         if (goal.leadSessionId !== input.callerLeadSessionId) {
@@ -645,10 +646,13 @@ export class CollaborationGoalManager {
         if (goal.status === "archived") {
           throw new StoreError("An archived collaboration Goal cannot archive another worker.");
         }
-        if (!["completed", "failed", "stopped", "archived"].includes(worker.status)) {
+        const settledBeforeRelease = goal.status === "completed" && worker.status === "idle" && worker.runtimeReleased
+          && worker.sessionId !== undefined && worker.sessionGeneration !== undefined
+          && store.findLatestRunForSessionGeneration(worker.sessionId, worker.sessionGeneration)?.descriptor.state === "completed";
+        if (!settledBeforeRelease && !["completed", "failed", "stopped", "archived"].includes(worker.status)) {
           throw new StoreError("Only a terminal collaboration worker can be archived.");
         }
-        if (worker.sessionId === undefined) return;
+        if (worker.sessionId === undefined) return false;
         if (activeRunsFor(store, worker.sessionId).length > 0 || store.listQueueItems({
           sessionId: worker.sessionId,
           states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"]
@@ -658,6 +662,7 @@ export class CollaborationGoalManager {
         if (!worker.runtimeReleased && store.getSession(worker.sessionId).descriptor.binding.generation !== worker.sessionGeneration) {
           throw new StoreError("The collaboration worker Session generation changed before archive.");
         }
+        return settledBeforeRelease;
       };
       const claim = this.#store.claimDeferredEffectOperation<{ readonly workerId: string; readonly goalId: string }>({
         id: input.operationId,
@@ -677,11 +682,18 @@ export class CollaborationGoalManager {
           }
         }
         archived = this.#store.completeDeferredEffectOperation(input.operationId, claim.operation.bodyHash, store => {
-          assertCurrent(store);
-          const worker = store.updateCollaborationWorkerState({
+          const settledBeforeRelease = assertCurrent(store);
+          const expectedRevision = settledBeforeRelease ? store.updateCollaborationWorkerState({
             workerId: input.workerId,
             callerLeadSessionId: input.callerLeadSessionId,
             expectedRevision: input.expectedRevision,
+            status: "completed",
+            updatedAt: this.#now()
+          }).revision : input.expectedRevision;
+          const worker = store.updateCollaborationWorkerState({
+            workerId: input.workerId,
+            callerLeadSessionId: input.callerLeadSessionId,
+            expectedRevision,
             status: "archived",
             runtimeReleased: true,
             updatedAt: this.#now()
@@ -720,29 +732,18 @@ export class CollaborationGoalManager {
         this.#assertDispatchReplay(replay, input);
         return { tree: this.#tree(replay.goalId), dispatch: replay };
       }
-      let worker = this.#store.getCollaborationWorker(input.workerId);
+      const worker = this.#store.getCollaborationWorker(input.workerId);
       assertWorkerRevision(worker, input.expectedWorkerRevision);
       if (worker.goalId !== input.goalId || worker.sessionId === undefined) {
         throw new StoreError("The collaboration worker is not bound to the selected Goal.");
       }
+      const goal = this.#store.getCollaborationGoal(input.goalId);
+      if (goal.leadSessionId !== input.callerLeadSessionId) {
+        throw new AuthorizationError("Only the collaboration lead can send work to this worker.");
+      }
+      if (goal.status !== "active") throw new InvalidStateTransitionError("collaboration Goal dispatch", goal.status, "active");
       if (worker.runtimeReleased) throw new StoreError("Wake the collaboration worker before sending work.");
-      if (worker.status === "completed") {
-        worker = this.#store.updateCollaborationWorkerState({
-          workerId: worker.id,
-          callerLeadSessionId: input.callerLeadSessionId,
-          expectedRevision: worker.revision,
-          expectedSessionGeneration: input.expectedSessionGeneration,
-          status: "idle",
-          runtimeReleased: false,
-          error: null,
-          updatedAt: this.#now()
-        });
-      }
       const sessionId = worker.sessionId;
-      if (sessionId === undefined) {
-        throw new StoreError("The collaboration worker Session binding was lost before queue admission.");
-      }
-      const admittedWorker = worker;
       this.#assertWorkerAdmission?.(input.callerLeadSessionId);
       assertExtensionWorkerPlan(this.#store, input.callerLeadSessionId, { ...worker, existingWorkerId: worker.id, route: this.#store.getSession(sessionId).descriptor });
       const execution = this.#sessionHost.enqueueServiceInput({
@@ -754,12 +755,12 @@ export class CollaborationGoalManager {
         taskMessageOrigin: { senderSessionId: input.callerLeadSessionId, senderSessionTitle: this.#store.getSession(input.callerLeadSessionId).descriptor.title },
         onAdmitted: (store, result) => {
           this.#assertWorkerAdmission?.(input.callerLeadSessionId);
-          assertExtensionWorkerPlan(store, input.callerLeadSessionId, { ...admittedWorker, existingWorkerId: admittedWorker.id, route: store.getSession(sessionId).descriptor });
+          assertExtensionWorkerPlan(store, input.callerLeadSessionId, { ...worker, existingWorkerId: worker.id, route: store.getSession(sessionId).descriptor });
           const dispatch = store.createCollaborationDispatch({
             goalId: input.goalId,
             workerId: input.workerId,
             callerLeadSessionId: input.callerLeadSessionId,
-            expectedWorkerRevision: admittedWorker.revision,
+            expectedWorkerRevision: worker.revision,
             expectedSessionGeneration: input.expectedSessionGeneration,
             operationId: input.operationId,
             message: input.message,
