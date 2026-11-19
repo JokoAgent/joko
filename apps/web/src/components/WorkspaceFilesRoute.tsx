@@ -245,6 +245,10 @@ export function WorkspaceFilesRoute({
   const selectedPreview = selectedPreviewState?.preview ?? (selectedPath === undefined ? undefined : controller.peekWorkspaceFile?.(workspace.id, selectedPath));
   const selectedPathRef = useRef(selectedPath);
   selectedPathRef.current = selectedPath;
+  const fileRouteOwner = JSON.stringify([session.id, previewOwnerKey]);
+  const fileRouteOwnerRef = useRef(fileRouteOwner);
+  fileRouteOwnerRef.current = fileRouteOwner;
+  const fileNavigationRevision = useRef(0);
   const canWrite = backend.capabilities.get("workspace.files.write")?.supported === true;
   const canWatchFiles = backend.capabilities.get("workspace.files.watch")?.supported === true;
   const workdirSessions = useMemo(
@@ -411,6 +415,7 @@ export function WorkspaceFilesRoute({
       onError(t("workspace.invalidPath"));
       return;
     }
+    fileNavigationRevision.current += 1;
     if (canonical === undefined) workspaceSelectedFileStore.clear(workspace.id);
     else workspaceSelectedFileStore.set(workspace.id, canonical);
     controllerRef.current.navigate({
@@ -579,12 +584,16 @@ export function WorkspaceFilesRoute({
         await controllerRef.current.createWorkspaceEntry({ workspaceId, path, kind: "directory" });
       },
       rename: async ({ workspaceId, fromPath, toPath, kind, expectedRevision }) => {
+        const navigationRevision = fileNavigationRevision.current;
+        const originalSelection = selectedPathRef.current;
         if (!(await guardAffectedDocument("switch-file", fromPath, kind === "directory"))) return false;
         await controllerRef.current.moveWorkspaceEntry({ workspaceId, sourcePath: fromPath, destinationPath: toPath, expectedRevision });
         workspaceOpenTabsStore.renameTabPrefix(workspaceId, fromPath, toPath);
         workspaceSelectedFileStore.renamePrefix(workspaceId, fromPath, toPath);
-        if (selectedPath === fromPath || (kind === "directory" && selectedPath?.startsWith(`${fromPath}/`) === true)) {
-          const nextPath = selectedPath === fromPath ? toPath : `${toPath}/${selectedPath!.slice(fromPath.length + 1)}`;
+        if (rootRef.current === null || fileRouteOwnerRef.current !== fileRouteOwner
+          || fileNavigationRevision.current !== navigationRevision || selectedPathRef.current !== originalSelection) return;
+        if (originalSelection === fromPath || (kind === "directory" && originalSelection?.startsWith(`${fromPath}/`) === true)) {
+          const nextPath = originalSelection === fromPath ? toPath : `${toPath}/${originalSelection!.slice(fromPath.length + 1)}`;
           navigateFile(nextPath);
         }
       },
@@ -604,7 +613,7 @@ export function WorkspaceFilesRoute({
       },
       copyRelativePath
     };
-  }, [canWrite, guardAffectedDocument, navigateFile, selectedPath, t]);
+  }, [canWrite, fileRouteOwner, guardAffectedDocument, navigateFile, selectedPath, t]);
 
   const toggleRail = useCallback((): void => {
     const next = !railCollapsed;

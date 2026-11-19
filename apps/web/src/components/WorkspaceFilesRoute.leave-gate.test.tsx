@@ -9,6 +9,7 @@ import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { emptySnapshot, type BackendView, type SessionView, type TargetView, type WorkspaceView } from "../model.js";
 import { workspaceDocumentController } from "../workspace-document-controller.js";
 import { requestWorkspaceDocumentLeave } from "../workspace-document-lifecycle.js";
+import { workspaceOpenTabsStore } from "../workspace-open-tabs.js";
 import { WorkspaceFilesRoute } from "./WorkspaceFilesRoute.js";
 
 Reflect.set(globalThis, "IS_REACT_ACT_ENVIRONMENT", true);
@@ -191,10 +192,61 @@ describe("WorkspaceFilesRoute leave gate", () => {
       host.remove();
     }
   });
+
+  it("renames the original tab without replacing a later file selection", async () => {
+    vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+    const view = { ...workspace(), id: "rename-workspace" };
+    const first = { path: "original.txt", name: "original.txt", kind: "file" as const, revision: "original-revision" };
+    const second = { ...first, path: "other.txt", name: "other.txt", revision: "other-revision" };
+    const destinationPath = "renamed.txt";
+    const listWorkspaceEntries = vi.fn(async () => [first, second]);
+    let finishMove!: () => void;
+    const moveWorkspaceEntry = vi.fn<AppController["moveWorkspaceEntry"]>(() => new Promise(resolve => { finishMove = resolve; }));
+    const readWorkspaceFile = vi.fn<AppController["readWorkspaceFile"]>(async (_id, path) => ({
+      path, name: path, kind: "text", text: `Contents of ${path}`, revision: `${path}-revision`, truncated: false
+    }));
+    const connected = Object.assign(controller(), { listWorkspaceEntries, moveWorkspaceEntry, readWorkspaceFile });
+    const base = backend();
+    const capabilities = new Map(base.capabilities);
+    capabilities.set("workspace.files.write", { name: "workspace.files.write", supported: true, options: [] });
+    const writable = { ...base, capabilities };
+    const host = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(host);
+    try {
+      await act(async () => root.render(routeView(connected, writable, view, first.path)));
+      await act(async () => host.querySelector(`[data-relative-path="${first.path}"]`)!
+        .dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true })));
+      const rename = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+        .find(button => button.textContent === "workspace.rename")!;
+      await act(async () => rename.click());
+      const input = host.querySelector<HTMLInputElement>('input[aria-label="workspace.rename"]')!;
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, destinationPath);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      await act(async () => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
+      expect(moveWorkspaceEntry).toHaveBeenCalledExactlyOnceWith({ workspaceId: view.id, sourcePath: first.path,
+        destinationPath, expectedRevision: first.revision });
+
+      await act(async () => host.querySelector<HTMLButtonElement>(`[data-relative-path="${second.path}"]`)!.click());
+      expect(connected.navigate).toHaveBeenCalledExactlyOnceWith({ kind: "files", sessionId: "leave-task", file: second.path }, { replace: true });
+      await act(async () => root.render(routeView(connected, writable, view, second.path)));
+      expect(readWorkspaceFile).toHaveBeenLastCalledWith(view.id, second.path);
+
+      listWorkspaceEntries.mockResolvedValue([{ ...first, path: destinationPath, name: destinationPath }, second]);
+      await act(async () => finishMove());
+      expect(connected.navigate).toHaveBeenCalledTimes(1);
+      expect(workspaceOpenTabsStore.getTabs(view.id)).toEqual([destinationPath, second.path]);
+      expect(readWorkspaceFile).toHaveBeenLastCalledWith(view.id, second.path);
+    } finally {
+      await act(async () => root.unmount());
+      host.remove();
+    }
+  });
 });
 
-function routeView(controller: AppController, backendView = backend(), selectedWorkspace = workspace()) {
-  return <WorkspaceFilesRoute controller={controller} route={{ kind: "files", sessionId: "leave-task" }}
+function routeView(controller: AppController, backendView = backend(), selectedWorkspace = workspace(), file?: string) {
+  return <WorkspaceFilesRoute controller={controller} route={{ kind: "files", sessionId: "leave-task", ...(file === undefined ? {} : { file }) }}
     session={session()} target={target()} backend={backendView} workspace={selectedWorkspace} sessions={[session()]}
     chatPane={null} t={(key) => key} onError={vi.fn()} onArchiveSession={vi.fn()}
     navigation={{
