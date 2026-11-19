@@ -4845,10 +4845,20 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const scope = this.captureActionScope();
     const blob = await this.uploadAttachment(file, scope);
     scope.signal.throwIfAborted();
-    await this.submit({
+    const operation = await this.submit({
       case: "uploadBrowserFile",
       value: { browserProviderId: browserId, pageId, documentId, blob, inputHint }
     }, true, [], scope.signal);
+    const receipt = operation.result?.payload;
+    if (receipt?.case !== "browserTransfer" || receipt.value.browserProviderId !== browserId || receipt.value.pageId !== pageId
+      || receipt.value.direction !== TransferDirection.UPLOAD || receipt.value.blob?.blobId !== blob.blobId) {
+      throw new GatewayError("The Browser did not return a receipt for this file upload.");
+    }
+    if (receipt.value.state !== BrowserTransferState.COMPLETED) {
+      const error = receipt.value.error;
+      throw new GatewayError(error?.message || "The Browser did not confirm this file upload.",
+        error?.code ? { code: error.code } : {});
+    }
   }
 
   async captureBrowserScreenshot(browserId: string, pageId: string, fullPage: boolean): Promise<string> {
