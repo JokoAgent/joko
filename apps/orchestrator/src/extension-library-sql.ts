@@ -276,7 +276,10 @@ export class ExtensionLibrarySqlService {
     await this.#vault.assertWritable();
     await this.#vault.assertMutationAuthority("sqlite");
     const result = await this.#call<number>({ id: this.#requestId(), operation: "migrate", handleId, migrations });
-    await this.#vault.reconcileUsage();
+    // The worker committed the schema and its usage record. Refresh the parent
+    // cache on its next operation rather than writing a second usage record here.
+    this.#vault.invalidateUsage();
+    await this.#vault.assertCurrentRoot();
     return result;
   }
 

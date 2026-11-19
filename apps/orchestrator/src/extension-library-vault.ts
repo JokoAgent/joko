@@ -719,6 +719,10 @@ export class ExtensionLibraryVault {
     await this.#assertRootIdentity();
   }
 
+  invalidateUsage(): void {
+    this.#usage.needsReconcile = true;
+  }
+
   async allocateTemporaryPath(suffix: ".sqlite-backup" | ".stream"): Promise<string> {
     await this.#requireReady(true);
     const root = join(this.#hostRoot(), TEMP_DIRECTORY);

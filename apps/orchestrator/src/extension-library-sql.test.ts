@@ -151,6 +151,28 @@ describe("ExtensionLibrarySqlService", () => {
     await service.closeAll();
   });
 
+  it("returns the worker's committed migration without a second parent usage write", async () => {
+    const { service, root, vault } = await fixture();
+    const opened = await service.open({ path: "notes.sqlite", create: true });
+    await expect(service.migrate(opened.handleId, [
+      { version: 1, statements: ["CREATE TABLE notes(id INTEGER PRIMARY KEY, title TEXT NOT NULL)"] }
+    ])).resolves.toBe(1);
+    await vault.reconcileUsage();
+    const usagePath = join(root, ".joko-library", "usage.json");
+    const before = JSON.parse(await readFile(usagePath, "utf8")) as { readonly revision: string };
+    const parentUsage = vi.spyOn(vault, "reconcileUsage").mockRejectedValueOnce(Object.assign(new Error("Parent usage write unavailable."), { code: "EIO" }));
+    try {
+      await expect(service.migrate(opened.handleId, [
+        { version: 2, statements: ["CREATE TABLE tags(id INTEGER PRIMARY KEY, name TEXT NOT NULL)"] }
+      ])).resolves.toBe(2);
+      expect(parentUsage).not.toHaveBeenCalled();
+      const after = JSON.parse(await readFile(usagePath, "utf8")) as { readonly revision: string };
+      expect(BigInt(after.revision)).toBeGreaterThan(BigInt(before.revision));
+      await expect(service.userVersion(opened.handleId)).resolves.toBe(2);
+      await expect(service.execute(opened.handleId, "SELECT name FROM tags")).resolves.toMatchObject({ rows: [] });
+    } finally { parentUsage.mockRestore(); }
+  });
+
   it("rejects an older migration target while retaining the current version and existing data", async () => {
     const { service } = await fixture();
     const opened = await service.open({ path: "notes.sqlite", create: true });
