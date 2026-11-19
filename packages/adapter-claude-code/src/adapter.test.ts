@@ -193,7 +193,7 @@ describe("ClaudeCodeAdapter", () => {
     const binding = await adapter.createSession(createInput({ permissionMode: "bypassPermissions" }), { ...contextFor().context, nativeToolAuthorization: authority });
     const requestInteraction = vi.fn(async (): Promise<InteractionDecision> => {
       if (outcome === "revoked") current = false;
-      return { kind: "selected", value: outcome === "deny" ? "deny" : "allow_once" };
+      return { kind: "selected", value: outcome === "deny" ? "deny_once" : "allow_once" };
     });
     const source = { ...contextFor(binding, { operationId: "native-ask", requestInteraction }).context, nativeToolAuthorization: authority };
     try {
@@ -204,7 +204,7 @@ describe("ClaudeCodeAdapter", () => {
       await expect(hook(input, "read-ask", { signal: source.signal })).resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: outcome === "allow" ? "allow" : "deny" } });
       expect(requestInteraction).toHaveBeenCalledOnce();
       expect(requestInteraction).toHaveBeenCalledWith(expect.objectContaining({
-        summary: `Read file\n${input.tool_input.file_path}`
+        summary: `Read file\n${input.tool_input.file_path}`, choices: ["allow_once", "deny_once"]
       }), expect.objectContaining({ signal: expect.any(AbortSignal) }));
     } finally { await adapter.dispose(); }
   });
@@ -6953,7 +6953,7 @@ describe("ClaudeCodeAdapter", () => {
         interactions.push(interaction);
         if (interaction.kind === "permission") {
           return interaction.toolName === "Edit"
-            ? { kind: "selected", value: "deny" }
+            ? { kind: "selected", value: "deny_once" }
             : { kind: "selected", value: "allow_for_session" };
         }
         if (interaction.kind === "question") {
@@ -7063,7 +7063,7 @@ describe("ClaudeCodeAdapter", () => {
       "question",
       "plan_review"
     ]);
-    expect(interactions[0]).toMatchObject({ kind: "permission", risk: "high", toolName: "Bash",
+    expect(interactions[0]).toMatchObject({ kind: "permission", risk: "high", toolName: "Bash", choices: ["allow_once", "allow_for_session", "deny_once"],
       summary: `Run command\n${bash.command.replace(secret, "[REDACTED]")}\n\nWorking directory\n${bash.cwd}\n\nWrite the report.` });
     expect(interactions[1]).toMatchObject({ kind: "permission", risk: "medium", toolName: "Edit",
       summary: "Modify file\nsrc/main.ts\n\nUpdate the entry point." });

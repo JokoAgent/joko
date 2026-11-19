@@ -6163,7 +6163,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         const requestId = `native-policy-${randomUUID()}`, options = { signal, requestId, toolUseID: _toolUseId ?? input.tool_use_id };
         const answer = await this.#requestInteraction(runtime, turn, { id: interactionId(runtime, requestId), kind: "permission", title: "Allow native tool?",
           toolName: input.tool_name, summary: permissionSummary(input.tool_name, toolInput, options, this.#projection, input.cwd), risk: permissionRisk(input.tool_name),
-          choices: ["allow_once", "deny"] }, signal);
+          choices: ["allow_once", "deny_once"] }, signal);
         signal.throwIfAborted(); runtime.assertRuntimeCurrent(); authority.assertCurrent(result.authorizationRevision);
         context.assertExtraDirectoriesCurrent?.(directories);
         if (!this.#isTurnCurrent(runtime, turn) || JSON.stringify(input.tool_input) !== JSON.stringify(toolInput)) return denied("The native action changed while permission was pending.");
@@ -6270,7 +6270,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       toolName: this.#projection.identifier(toolName, "Tool"),
       summary: permissionSummary(toolName, input, options, this.#projection),
       risk: permissionRisk(toolName),
-      choices: ["allow_once", "allow_for_session", "deny"]
+      choices: ["allow_once", "allow_for_session", "deny_once"]
     };
     const decision = await this.#requestInteraction(runtime, turn, interaction, options.signal);
     try { turn.context.nativeToolAuthorization?.assertCurrent(authorizationRevision); } catch { return { behavior: "deny", message: "The originating delegated task authority changed while permission was pending." }; }

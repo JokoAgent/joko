@@ -29,7 +29,7 @@ import {
   type ClaudeSdkStoredSessionRuntime,
   type ClaudeSdkUserMessage
 } from "@joko/adapter-claude-code/testing";
-import { MessageRole, NativeCatalogImportPresentationSchema, NativeNavigationTargetSchema, NativeSessionPlacement, NativeSessionStartSchema, OperationMutationSchema, OperationState, RunState, type Event } from "@joko/contracts";
+import { InteractionState, MessageRole, NativeCatalogImportPresentationSchema, NativeNavigationTargetSchema, NativeSessionPlacement, NativeSessionStartSchema, OperationMutationSchema, OperationState, PermissionDecisionKind, RunState, type Event } from "@joko/contracts";
 import { expect, it, vi } from "vitest";
 import { createE2eClients } from "./connect-clients.js";
 import { OrchestratorE2eFixture, waitFor, type E2eClients } from "./fixture.js";
@@ -39,6 +39,7 @@ import {
   forkMutation,
   navigateMutation,
   queueRunIdFrom,
+  resolvePermissionMutation,
   sendInputMutation,
   sessionIdFrom,
   submit
@@ -830,6 +831,47 @@ it("resumes the original local Claude task before sending after its idle Query e
     expect(started.adapter.hasConfirmedIdleSessionExit(sessionId, originalBinding)).toBe(false);
   } finally {
     confirmOldProcessExit();
+    await fixture?.close({ removeRoot: false });
+    await rm(seed.root, { recursive: true, force: true, maxRetries: 5 });
+  }
+});
+
+it("applies a v1 owner denial to the original local Claude tool request", { timeout: 60_000 }, async () => {
+  const seed = await seedNativeHistory();
+  let fixture: OrchestratorE2eFixture | undefined;
+  let query: TextObservationQuery | undefined;
+  let canUseTool: ClaudeSdkQueryParams["options"]["canUseTool"] | undefined;
+  try {
+    ({ fixture } = await start(seed, params => {
+      canUseTool = params.options.canUseTool;
+      return query = new TextObservationQuery(params, seed.sourceId);
+    }));
+    const paired = await fixture.pair();
+    const sessionId = await attachSource(fixture, paired, seed.sourceId);
+    const generation = BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation);
+    const runId = queueRunIdFrom(await submit(paired.clients.operation, paired.connectionId,
+      sendInputMutation(sessionId, generation, "Request permission for the controlled operation.")));
+    await waitFor(async () => query?.receivedInputs.length, count => count === 1, "the original Claude input");
+    if (canUseTool === undefined) throw new Error("The controlled Claude Query did not expose its permission callback.");
+    const nativeDecision = canUseTool("Bash", { command: "pwd" }, {
+      requestId: "deny-native-request", toolUseID: "deny-native-tool", signal: new AbortController().signal
+    });
+    void nativeDecision.catch(() => undefined);
+    const pending = await waitFor(() => paired.clients.interaction.listInteractions({ sessionId, runId }),
+      result => result.interactions.some(item => item.state === InteractionState.PENDING), "the original Claude permission");
+    const request = pending.interactions.find(item => item.state === InteractionState.PENDING)!;
+    expect(request.request).toMatchObject({ case: "permission", value: { allowedDecisions: expect.arrayContaining([PermissionDecisionKind.DENY_ONCE]) } });
+    const resolution = await submit(paired.clients.operation, paired.connectionId, resolvePermissionMutation({
+      connectionId: paired.connectionId, interactionId: request.interactionId, generation: request.generation,
+      decision: PermissionDecisionKind.DENY_ONCE
+    }));
+    expect(resolution.state, resolution.error?.message).toBe(OperationState.SUCCEEDED);
+    await expect(nativeDecision).resolves.toMatchObject({ behavior: "deny", message: "The user denied this tool request." });
+    expect(fixture.application.store.getInteraction(request.interactionId)).toMatchObject({
+      runId, status: "resolved", decision: { kind: "selected", value: "deny_once" }
+    });
+    expect(query?.receivedInputs).toHaveLength(1);
+  } finally {
     await fixture?.close({ removeRoot: false });
     await rm(seed.root, { recursive: true, force: true, maxRetries: 5 });
   }
