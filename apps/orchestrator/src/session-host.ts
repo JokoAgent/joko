@@ -16059,6 +16059,20 @@ export class SessionHost {
       ...(binding === undefined ? {} : { binding }),
       ...(operationId === undefined ? {} : { operationId }),
       signal,
+      ...(runId !== undefined && attemptId !== undefined && runtimePolicy === undefined &&
+        target.remoteWorkspace === undefined && backend.adapterKind === "pi" ? {
+        canContinueManagedSubagentResult: (): boolean => {
+          const run = this.#store.findRun(runId)?.descriptor;
+          const item = this.#store.findQueueItemByRunId(sessionId, runId);
+          if (run?.source !== "user" || run.state !== "running" || item?.disposition !== "prompt" ||
+            item.body.messagingOrigin !== undefined) return false;
+          try { context.nativeToolAuthorization!.assertCurrent(); } catch { return false; }
+          return !this.#store.getSession(sessionId).descriptor.planMode &&
+            policySnapshotFor(this.#store, target).generation === context.policySnapshot?.generation &&
+            !this.#store.listQueueItems({ sessionId, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 2 })
+              .some(candidate => candidate.id !== item.id);
+        }
+      } : {}),
       ...(runId !== undefined && attemptId !== undefined && runtimePolicy === undefined
         && target.remoteWorkspace?.kind === "ssh" && backend.adapterKind === "codex"
         && this.#store.findRun(runId)?.descriptor.source === "user" ? {

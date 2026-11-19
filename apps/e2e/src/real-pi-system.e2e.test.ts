@@ -42,6 +42,7 @@ import {
   RunState,
   RuntimeCommandSource,
   SetResourceEnabledMutationSchema,
+  SetWorkspaceTrustMutationSchema,
   SessionSnapshotScopeSchema,
   SessionState,
   SnapshotScopeSchema,
@@ -182,6 +183,81 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     const ledger = await reconnected.backend.getUsageReport({ group: UsageReportGroup.MODEL, backendId: "pi", providerId, modelId, sessionId });
     expect(ledger.summary).toMatchObject({ estimated: true, usage: { costMicros: 60_000n, totalTokens: 4_000n } });
   });
+
+  it.each([false, true])("summarizes a native background result within the original Run unless new input is queued (%s)",
+    { timeout: 120_000 }, async (newerInput) => {
+      const original = "Begin the background-delivery fixture.", followUp = "Handle the newer user input.", childInput = "Use the isolated child marker.";
+      const childResult = "Isolated child observation 5419", summary = "Summary includes the child's observation.", launched = "Background work has started.";
+      let releaseChild!: () => void;
+      const childGate = new Promise<void>(resolve => { releaseChild = resolve; });
+      let childRequested = false, parentRequests = 0, summaryRequests = 0;
+      try {
+        fixture = await RealPiSystemFixture.start({ enableInternalServer: true, providerResponder: async ({ request }) => {
+          const messages = JSON.stringify(request.body["messages"] ?? []);
+          if (messages.includes(followUp)) return { kind: "text", text: "Processed the newer user input." };
+          if (messages.includes(original)) {
+            parentRequests += 1;
+            if (messages.includes(childResult)) {
+              summaryRequests += 1;
+              return { kind: "text", text: summary };
+            }
+            if (parentRequests === 1) return { kind: "tool", name: "subagent", arguments: {
+              agent: "scout", task: childInput, context: "fresh", background: true, timeoutSeconds: 45
+            } };
+            return { kind: "text", text: launched };
+          }
+          if (messages.includes(childInput)) {
+            childRequested = true;
+            await childGate;
+            return { kind: "text", text: childResult };
+          }
+          return { kind: "text", text: "Ready." };
+        } });
+        const { clients, connectionId } = await fixture.pair("Pi background delivery owner");
+        const trust = await submit(clients.operation, connectionId, create(OperationMutationSchema, {
+          payload: { case: "setWorkspaceTrust", value: create(SetWorkspaceTrustMutationSchema, {
+            workspaceId: "workspace-real-pi", trusted: true
+          }) }
+        }));
+        expect(trust.state).toBe(OperationState.SUCCEEDED);
+        const sessionId = sessionIdFrom(await submit(clients.operation, connectionId, createSessionMutation({
+          backendId: "pi", targetId: "workspace-real-pi", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID
+        })));
+        const generation = (await clients.session.getSession({ sessionId })).session!.nativeBinding!.runtimeGeneration;
+        const send = async (text: string) => queueRunIdFrom(await submit(clients.operation, connectionId,
+          sendInputMutation(sessionId, generation, text)));
+        const originalRunId = await send(original);
+        const waitForRun = (runId: string) => waitForRealSystem(() => clients.run.getRun({ runId }),
+          reply => reply.run?.state === RunState.SUCCEEDED, "the real Pi Run to complete", 30_000);
+        const assistantTexts = (runId: string) => fixture!.application.store.listEvents({ sessionId })
+          .flatMap(event => event.runId === runId && event.payload.type === "message_complete" && event.payload.role === "assistant"
+            ? event.payload.blocks.flatMap(block => block.kind === "text" ? [block.text] : []) : []);
+        await waitForRealSystem(async () => childRequested && assistantTexts(originalRunId).includes(launched),
+          ready => ready, "the native child request and the parent's initial reply", 30_000);
+        expect((await clients.run.getRun({ runId: originalRunId })).run?.state).toBe(RunState.RUNNING);
+
+        if (newerInput) {
+          const nextRunId = await send(followUp);
+          await waitForRun(originalRunId);
+          await waitForRun(nextRunId);
+          expect(assistantTexts(nextRunId)).toContain("Processed the newer user input.");
+          releaseChild();
+          await waitForRealSystem(async () => fixture!.application.store.listEvents({ sessionId }).some(event =>
+            event.payload.type === "subagent_run" && event.payload.run.state === "completed"), value => value,
+          "the retained native child to finish", 30_000);
+          expect(assistantTexts(originalRunId)).not.toContain(summary);
+          expect(summaryRequests).toBe(0);
+        } else {
+          releaseChild();
+          await waitForRun(originalRunId);
+          expect(assistantTexts(originalRunId)).toContain(summary);
+          expect(summaryRequests).toBe(1);
+          const { events } = await clients.session.listSessionTimeline({ sessionId });
+          expect(events.filter(event => event.payload?.kind.case === "messageCompleted" &&
+            event.payload.kind.value.role === MessageRole.USER)).toHaveLength(1);
+        }
+      } finally { releaseChild(); }
+    });
 
   it("forks a durable Pi user node off the active branch without moving the source leaf", { timeout: 120_000 }, async () => {
     fixture = await RealPiSystemFixture.start();

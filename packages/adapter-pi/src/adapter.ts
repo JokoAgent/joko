@@ -149,6 +149,7 @@ import type { PiManagedDurableStore, PiManagedDurableStoreRegistry } from "./man
 import { MANAGED_SUBAGENT_TOOL_DESCRIPTORS, provisionManagedSubagent } from "./managed-subagent.js";
 import {
   MANAGED_SUBAGENT_CONTROL_COMMAND_NAME,
+  MANAGED_SUBAGENT_DELIVERY_REQUEST,
   MANAGED_SUBAGENT_PRODUCT_SESSION_ENV,
   MANAGED_SUBAGENT_PROVIDER_CREDENTIAL_NAMES_ENV
 } from "./managed-subagent-source.js";
@@ -5854,6 +5855,20 @@ export class PiBackendAdapter implements
         runningExtensionCommand !== undefined && isExtensionUiRequest(event) ? runningExtensionCommand.context
           : lifecycle === undefined ? runtime.context : routeLifecycleEvent(lifecycle, event)
       );
+      if (isExtensionUiRequest(event) && event.method === "input" && rawEvent.title === MANAGED_SUBAGENT_DELIVERY_REQUEST) {
+        let allowed = false;
+        if (isCurrent() && runtime.managedSubagentToolsEnabled && lifecycle?.agentStarted === true &&
+          !lifecycle.settlementReceived && runningExtensionCommand === undefined &&
+          capturedEventContext.hostedExecution === undefined && !capturedEventContext.signal.aborted) {
+          try { allowed = capturedEventContext.canContinueManagedSubagentResult?.() === true; }
+          catch { /* A retired Run still settles normally. */ }
+        }
+        if (isCurrent() && !runtime.transport.closed && event.id.length > 0 && event.id.length <= 128) {
+          void runtime.transport.notify({ type: "extension_ui_response", id: event.id,
+            ...(allowed ? { value: "allowed" } : { cancelled: true as const }) }).catch(() => undefined);
+        }
+        return;
+      }
       if (isExtensionUiRequest(event) && readCommandGateExtensionRequest(rawEvent) !== undefined) {
         // A command finishing on this same transport can release the slot an
         // earlier request is waiting for. Keep both off the ordered event chain.
