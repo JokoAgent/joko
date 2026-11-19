@@ -4,12 +4,14 @@ import {
   applySessionProjectOverrides,
   reconcileSessionProjectOverrides,
   rollbackSessionProjectOverride,
+  sessionProjectDestinationCollapsePatch,
   sessionProjectMoveBlock,
   sessionProjectPlacement,
   sessionsInProject,
   type ProjectMoveSession,
   type SessionProjectNavigationPlacement
 } from "./session-project-navigation.js";
+import { sidebarOwnerLayoutFor, withSidebarOwnerLayout } from "./sidebar-layout.js";
 
 const base: ProjectMoveSession = {
   id: "session-a",
@@ -81,5 +83,17 @@ describe("Session project navigation", () => {
     });
     expect([...rolledBack.entries()]).toEqual([["session-b", { kind: "dialogue" }]]);
     expect(rollbackSessionProjectOverride(overrides, "session-a", { kind: "dialogue" })).toBe(overrides);
+  });
+
+  it("restores only the move destination after another project is expanded", () => {
+    const owner = "node-1";
+    const destination = { kind: "project", projectId: "destination" } as const;
+    const initial = withSidebarOwnerLayout({}, owner, { collapsedProjectIds: ["destination", "unrelated", "other"] });
+    const revealed = withSidebarOwnerLayout(initial, owner, layout => sessionProjectDestinationCollapsePatch(layout, destination, false));
+    expect(sidebarOwnerLayoutFor(revealed, owner).collapsedProjectIds).toEqual(["unrelated", "other"]);
+    const afterUnrelatedExpansion = withSidebarOwnerLayout(revealed, owner, { collapsedProjectIds: ["other"] });
+    const afterRejection = withSidebarOwnerLayout(afterUnrelatedExpansion, owner,
+      layout => sessionProjectDestinationCollapsePatch(layout, destination, true));
+    expect(sidebarOwnerLayoutFor(afterRejection, owner).collapsedProjectIds).toEqual(["other", "destination"]);
   });
 });

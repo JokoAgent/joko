@@ -126,6 +126,7 @@ import {
   reconcileSessionProjectOverrides,
   rollbackSessionProjectOverride,
   sameSessionProjectPlacement,
+  sessionProjectDestinationCollapsePatch,
   sessionProjectMoveBlock,
   type SessionProjectNavigationPlacement
 } from "./session-project-navigation.js";
@@ -2419,12 +2420,11 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       return;
     }
     const ownerLayout = sidebarOwnerLayoutFor(state.preferences.sidebarOwnerLayouts, placementOwnerId);
-    const previousLayout = placement.kind === "project"
-      ? { collapsedProjectIds: ownerLayout.collapsedProjectIds }
-      : { collapsedDialogue: ownerLayout.collapsedDialogue };
-    const revealPatch = placement.kind === "project"
-      ? { collapsedProjectIds: ownerLayout.collapsedProjectIds.filter((id) => id !== placement.projectId) }
-      : { collapsedDialogue: false };
+    const destinationWasCollapsed = placement.kind === "project"
+      ? ownerLayout.collapsedProjectIds.includes(placement.projectId) : ownerLayout.collapsedDialogue;
+    const setDestinationCollapsed = (collapsed: boolean) => controller.setSidebarOwnerLayout(
+      layout => sessionProjectDestinationCollapsePatch(layout, placement, collapsed)
+    );
     setActionError(undefined);
     setLayoutNotice(undefined);
     setSessionProjectOverrides((current) => new Map(current).set(session.id, placement));
@@ -2432,7 +2432,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     nextMoving.add(session.id);
     movingSessionProjectIdsRef.current = nextMoving;
     setMovingSessionProjectIds(nextMoving);
-    void controller.setSidebarOwnerLayout(revealPatch).catch(() => undefined);
+    if (destinationWasCollapsed) void setDestinationCollapsed(false).catch(() => undefined);
     void controller.moveSessionProject(
       session.id,
       placement.kind === "project" ? placement.projectId : undefined
@@ -2444,7 +2444,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       setSessionProjectOverrides((current) => {
         return rollbackSessionProjectOverride(current, session.id, placement);
       });
-      void controller.setSidebarOwnerLayout(previousLayout).catch(() => undefined);
+      if (destinationWasCollapsed) void setDestinationCollapsed(true).catch(() => undefined);
       setLayoutNotice(t("session.moveProjectFailed"));
       setActionError(messageOf(error, t("error.unexpected")));
     }).finally(() => {

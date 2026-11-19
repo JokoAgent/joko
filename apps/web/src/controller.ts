@@ -126,7 +126,7 @@ import {
   withSidebarDisplayPreferences,
   withSidebarOwnerLayout,
   type SidebarDisplayPreferences,
-  type SidebarOwnerLayout
+  type SidebarOwnerLayoutUpdate
 } from "./sidebar-layout.js";
 import {
   layoutResetPersistsSessionSplit,
@@ -345,7 +345,7 @@ export interface AppController extends OperationApi {
   openHttpLink(url: string, options?: HttpLinkOpenOptions & { readonly sessionId?: string }): Promise<void>;
   openWorkspaceHtml(sessionId: string, workspaceId: string, path: string, options?: HttpLinkOpenOptions): Promise<void>;
   setSidebarDisplayPreferences(patch: Partial<SidebarDisplayPreferences>): Promise<void>;
-  setSidebarOwnerLayout(patch: Partial<SidebarOwnerLayout>): Promise<void>;
+  setSidebarOwnerLayout(update: SidebarOwnerLayoutUpdate): Promise<void>;
   /** Set a binding, null to disable it, or undefined to restore its default. */
   setAppShortcutOverride(id: AppShortcutId, value: AppShortcutOverrideValue | undefined): Promise<void>;
   resetAppShortcutOverrides(): Promise<void>;
