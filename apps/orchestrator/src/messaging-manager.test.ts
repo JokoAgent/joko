@@ -44,7 +44,7 @@ import {
   type WeChatTransportOptions
 } from "@joko/messaging";
 import type { AdapterContext, BlobRef, DurableNativeDispatchPreparation, EventPayload, InteractionDecision, MessageBlock, NativeHistoryProjection, PromptInput } from "@joko/core";
-import { ContactStore, OperationalStore, PartnerStore } from "@joko/store";
+import { ContactStore, OperationalStore, PartnerStore, operationBodyHash } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -1401,7 +1401,246 @@ describe("MessagingManager", () => {
     expect(close).not.toHaveBeenCalled();
   });
 
-  it("runs WeChat commands through one peer's durable task and keeps the previous task on /new", async () => {
+  it("restarts the same WeChat peer task on its current route and retains durable work through rollback and replay", async () => {
+    const batch = weChatDirectBatch();
+    const base = batch.events[0]!;
+    if (base.kind !== "message") throw new Error("The WeChat fixture has no direct text message.");
+    const inputs = [
+      { id: "old", text: "Original WeChat prompt" },
+      { id: "failed-new", text: "/new" },
+      { id: "new", text: "/new" },
+      { id: "new", text: "/new" },
+      { id: "follow-up", text: "New WeChat prompt" },
+      { id: "unknown-new", text: "/new" },
+      { id: "blocked-new", text: "/new" }
+    ];
+    const gates = inputs.map(() => deliveryGate());
+    const transport = new FakeWeChatTransport({ ...batch, events: [], privateContexts: [] });
+    const poll = vi.spyOn(transport, "poll"), normalize = vi.spyOn(transport, "normalize");
+    inputs.forEach((input, index) => {
+      poll.mockImplementationOnce(async ({ signal }) => {
+        await gates[index]!.wait;
+        signal?.throwIfAborted();
+        return { updates: [{} as WeChatRawMessage], nextCursor: `wechat-new-${index}` };
+      });
+      normalize.mockImplementationOnce(() => ({
+        ...batch,
+        events: [{ ...base, messageId: input.id, text: input.text, providerRequestIds: [`wechat:new-${index}`],
+          address: { ...base.address, connectionId: transport.connectionId } }],
+        privateContexts: [{ messageId: input.id, providerConversationId: base.address.providerConversationId, contextToken: `private-new-${index}` }]
+      }));
+    });
+    const originalAdapter = new ControlledReplyAdapter();
+    const destinationAdapter = new ControlledReplyAdapter({
+      ...PI_LIKE_PROFILE, id: "wechat-default-backend",
+      capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "session.reset"
+        ? { ...capability, supported: false } : capability.key === "permission.modes"
+          ? { ...capability, options: PI_LIKE_PROFILE.permissionModes } : capability)
+    });
+    const fixture = await createFixture(undefined, () => [originalAdapter, destinationAdapter], undefined, undefined, undefined, undefined, () => transport);
+    cleanups.push(() => gates.forEach(gate => gate.release()));
+    const { store, host } = fixture;
+    fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const alternateRoot = join(fixture.root, "wechat-next-workspace");
+    await mkdir(alternateRoot);
+    await host.registerTarget({ id: "target-wechat-next", backendId: destinationAdapter.id, displayName: "Next WeChat workspace",
+      workspaceRoot: alternateRoot, managed: true, trusted: true });
+    const created = fixture.manager.createWeChatConnection();
+    const connection = await fixture.manager.commitWeChatAuthorization({
+      clientConnectionId: "desktop-one", connectionId: created.id, expectedRevision: created.revision,
+      expectedGeneration: created.generation, expectedCredentialReferenceId: null, expectedCredentialGeneration: null, expectedEnabled: false,
+      credentials: { token: "weChat-private-token", botId: "wx-bot", userId: "wx-account", baseUrl: "https://ilinkai.weixin.qq.com" }, enable: true
+    });
+    const requestFor = (id: string) => store.listMessagingInboundRequests({ connectionId: connection.id }).find(request => request.providerMessageId === id);
+    const notices = (index: number) => transport.sentText.filter(row => row.context?.contextToken === `private-new-${index}`).map(row => row.text);
+    const commandFor = (id: string) => store.listMessagingInteractions({ connectionId: connection.id, limit: 20 })
+      .find(interaction => interaction.providerMessageId === id);
+    const nativeCreate = vi.spyOn(destinationAdapter, "createSession");
+    gates[0]!.release();
+    await vi.waitFor(() => expect(originalAdapter.context).toBeDefined(), { timeout: 5_000 });
+    const conversation = store.listMessagingConversations({ connectionId: connection.id })[0]!;
+    const sessionId = conversation.sessionId!;
+    await originalAdapter.finish("Original WeChat answer");
+    await vi.waitFor(() => expect(requestFor("old")?.status).toBe("completed"), { timeout: 5_000 });
+    await vi.waitFor(() => expect(transport.sentText.some(row => row.text === "Original WeChat answer")).toBe(true), { timeout: 5_000 });
+    await vi.waitFor(() => host.assertSessionLifecycleIdle(sessionId));
+    const original = store.getSession(sessionId).descriptor;
+    const oldRun = requestFor("old")!.runId!;
+    const oldMessage = store.listEvents({ sessionId }).find(event => event.payload.type === "message_complete" && event.payload.role === "assistant")!;
+    const artifact = await fixture.artifacts.ingestBytes(pngBytes(), { fileName: "original.png", mimeType: "image/png", expiresAt: Date.now() + 60_000 });
+    store.transaction(() => store.adoptSessionArtifact({ blob: store.getArtifact(artifact.id).blob, sessionId, runId: oldRun }));
+    const queuedPayload = { format: 1, address: { ...base.address, connectionId: connection.id }, text: "Old pending reply" };
+    const queued = store.enqueueMessagingDelivery({ connectionId: connection.id, expectedChannelGeneration: connection.generation,
+      conversationId: conversation.id, dedupeKey: "old-context:pending", kind: "notice", partIndex: 0, partCount: 1,
+      payloadHash: operationBodyHash(queuedPayload), payload: queuedPayload,
+      availableAt: Date.now() + 60_000 });
+    const route = fixture.manager.putRoute({ connectionId: connection.id, targetId: "target-wechat-next", providerId: "vision", modelId: "multimodal",
+      effort: "high", fastMode: false, permissionMode: "auto", planMode: true });
+    const originalConversation = store.getMessagingConversation(conversation.id);
+    const enqueue = store.enqueueMessagingDelivery.bind(store);
+    const notice = vi.spyOn(store, "enqueueMessagingDelivery").mockImplementation(input => {
+      if (input.kind === "notice" && input.dedupeKey.startsWith("command:") && typeof input.payload === "object" && input.payload !== null
+        && "text" in input.payload && input.payload.text === "A new conversation is ready.") {
+        notice.mockRestore();
+        throw new Error("The command notice could not be committed.");
+      }
+      return enqueue(input);
+    });
+    gates[1]!.release();
+    await vi.waitFor(() => expect(notices(1)).toEqual(["The original WeChat task is still available."]), { timeout: 5_000 });
+    expect(commandFor("failed-new")?.status).toBe("failed");
+    expect(store.getSession(sessionId).descriptor).toEqual(original);
+    expect(store.getMessagingConversation(conversation.id)).toEqual(originalConversation);
+    expect(store.listEvents({ sessionId }).map(event => event.id)).toContain(oldMessage.id);
+    expect(store.getMessagingDelivery(queued.id).status).toBe("pending");
+    expect(store.findUnresolvedWeChatConversationRestart(sessionId)).toBeUndefined();
+    expect(nativeCreate).toHaveBeenCalledOnce();
+    gates[2]!.release();
+    await vi.waitFor(() => expect(commandFor("new")?.status).toBe("completed"), { timeout: 5_000 });
+    await vi.waitFor(() => expect(notices(2)).toEqual(["A new conversation is ready."]), { timeout: 5_000 });
+    const restarted = store.getSession(sessionId).descriptor;
+    expect(restarted).toMatchObject({ id: sessionId, targetId: route.targetId, backendId: destinationAdapter.id, providerId: "vision", modelId: "multimodal",
+      effort: "high", permissionMode: "auto", planMode: true, archived: false, binding: { generation: original.binding.generation + 1 } });
+    expect(restarted.binding.opaqueRef).not.toBe(original.binding.opaqueRef);
+    expect(store.getMessagingConversation(conversation.id)).toMatchObject({ sessionId, targetId: route.targetId, backendId: destinationAdapter.id,
+      sessionGeneration: restarted.binding.generation, routeScopeKey: route.scopeKey });
+    expect(store.listSessions({ includeArchived: true })).toHaveLength(1);
+    expect(store.listEvents({ sessionId }).map(event => event.id)).not.toContain(oldMessage.id);
+    expect(store.listEvents({ sessionId, includeTombstoned: true }).map(event => event.id)).toContain(oldMessage.id);
+    expect(store.listRuns({ sessionId }).map(run => run.descriptor.id)).toContain(oldRun);
+    expect(store.getArtifact(artifact.id)).toMatchObject({ sessionId, runId: oldRun });
+    expect(store.getMessagingDelivery(queued.id).status).toBe("cancelled");
+    expect(transport.sentText.some(row => row.text === "Old pending reply")).toBe(false);
+    expect(nativeCreate).toHaveBeenLastCalledWith(expect.objectContaining({ nativeStart: { kind: "new" },
+      target: expect.objectContaining({ id: route.targetId, workspaceRoot: alternateRoot }) }), expect.objectContaining({ sessionId, generation: restarted.binding.generation }));
+    gates[3]!.release();
+    await vi.waitFor(() => expect(store.getMessagingConnection(connection.id).cursor).toBe("wechat-new-3"));
+    expect(commandFor("new")?.status).toBe("completed");
+    expect(notices(2)).toHaveLength(1);
+    expect(notices(3)).toEqual([]);
+    expect(nativeCreate).toHaveBeenCalledTimes(2);
+    gates[4]!.release();
+    await vi.waitFor(() => expect(destinationAdapter.context?.sessionId).toBe(sessionId), { timeout: 5_000 });
+    expect(destinationAdapter.context?.target.workspaceRoot).toBe(alternateRoot);
+    await destinationAdapter.finish("New WeChat answer");
+    await vi.waitFor(() => expect(requestFor("follow-up")?.status).toBe("completed"), { timeout: 5_000 });
+    await vi.waitFor(() => host.assertSessionLifecycleIdle(sessionId));
+    nativeCreate.mockRejectedValueOnce(new Error("The native creation receipt was lost."));
+    gates[5]!.release();
+    await vi.waitFor(() => expect(commandFor("unknown-new")?.status).toBe("unknown"), { timeout: 5_000 });
+    const unknown = store.findUnresolvedWeChatConversationRestart(sessionId);
+    expect(unknown).toBeDefined();
+    expect(store.getOperation(unknown!)).toMatchObject({ status: "failed", error: { stateMayHaveChanged: true } });
+    gates[6]!.release();
+    await vi.waitFor(() => expect(commandFor("blocked-new")?.status).toBe("unknown"), { timeout: 5_000 });
+    expect(nativeCreate).toHaveBeenCalledTimes(3);
+    expect(store.getSession(sessionId).descriptor.binding).toEqual(restarted.binding);
+    expect(store.listSessions({ includeArchived: true })).toHaveLength(1);
+  }, 20_000);
+
+  it("retires a held WeChat reply when its original task adopts an independent native context", async () => {
+    const batch = weChatDirectBatch();
+    const transport = new FakeWeChatTransport({ ...batch, events: batch.events.slice(0, 1), privateContexts: batch.privateContexts.slice(0, 1) });
+    const adapter = new WeChatRestartAdapter({ ...PI_LIKE_PROFILE,
+      capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
+        ? { ...capability, options: PI_LIKE_PROFILE.permissionModes } : capability) });
+    const heldReply = deliveryGate();
+    let deliveryId: string | undefined;
+    const sendText = transport.sendTextPart.bind(transport);
+    vi.spyOn(transport, "sendTextPart").mockImplementation(async input => {
+      deliveryId = input.context?.clientId;
+      await heldReply.wait;
+      return sendText(input);
+    });
+    const fixture = await createFixture(undefined, () => adapter, undefined, undefined, undefined, undefined, () => transport);
+    cleanups.push(() => heldReply.release());
+    fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const created = fixture.manager.createWeChatConnection();
+    const connection = await fixture.manager.commitWeChatAuthorization({ clientConnectionId: "desktop-one", connectionId: created.id,
+      expectedRevision: created.revision, expectedGeneration: created.generation, expectedCredentialReferenceId: null,
+      expectedCredentialGeneration: null, expectedEnabled: false,
+      credentials: { token: "weChat-private-token", botId: "wx-bot", userId: "wx-account", baseUrl: "https://ilinkai.weixin.qq.com" }, enable: true });
+    await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    await adapter.finish("Late original WeChat answer");
+    await vi.waitFor(() => expect(deliveryId).toBeDefined());
+    const conversation = fixture.store.listMessagingConversations({ connectionId: connection.id })[0]!;
+    const original = fixture.store.getSession(conversation.sessionId!).descriptor;
+    await vi.waitFor(() => fixture.host.assertSessionLifecycleIdle(original.id));
+    await fixture.host.restartWeChatConversation({ operationId: "wechat-held-reply-restart", conversation,
+      route: fixture.store.resolveMessagingRoute(connection.id),
+      assertServiceScope: () => {
+        expect(fixture.store.getMessagingConnection(connection.id)).toMatchObject({ enabled: true, generation: connection.generation,
+          credentialReferenceId: connection.credentialReferenceId, credentialGeneration: connection.credentialGeneration });
+      }, onAdmitted: () => undefined });
+    const restarted = fixture.store.getSession(original.id).descriptor;
+    expect(restarted.binding).toMatchObject({ generation: original.binding.generation + 1 });
+    expect(restarted.binding.opaqueRef).not.toBe(original.binding.opaqueRef);
+    expect(restarted.binding.nativeSessionId).not.toBe(original.binding.nativeSessionId);
+    heldReply.release();
+    await vi.waitFor(() => expect(fixture.store.getMessagingDelivery(deliveryId!)).toMatchObject({ status: "failed", errorCode: "cancelled" }));
+    expect(transport.sentText).toEqual([]);
+    expect(fixture.store.getOperation("wechat-held-reply-restart").status).toBe("completed");
+    expect(fixture.store.listSessions({ includeArchived: true })).toHaveLength(1);
+  });
+
+  it.each(["route", "target", "reply-context", "connection"] as const)("retires a WeChat reset before native creation when its original %s changes", async change => {
+    const batch = weChatDirectBatch(), base = batch.events[0]!;
+    if (base.kind !== "message") throw new Error("The WeChat fixture has no direct text message.");
+    const transport = new FakeWeChatTransport({ ...batch,
+      events: [{ ...base, messageId: "scope-new", providerRequestIds: ["wechat:scope-new"], text: "/new" }],
+      privateContexts: [{ messageId: "scope-new", providerConversationId: base.address.providerConversationId, contextToken: "private-scope-new" }] });
+    const adapter = new FakeBackendAdapter({ ...PI_LIKE_PROFILE,
+      capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
+        ? { ...capability, options: PI_LIKE_PROFILE.permissionModes } : capability) });
+    const fixture = await createFixture(undefined, () => adapter, undefined, undefined, undefined, undefined, () => transport);
+    fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const nativeCreate = vi.spyOn(adapter, "createSession");
+    const close = adapter.closeSession.bind(adapter);
+    let original: ReturnType<OperationalStore["getSession"]> | undefined;
+    let operationId: string | undefined;
+    let revocation: Promise<unknown> | undefined;
+    vi.spyOn(adapter, "closeSession").mockImplementation(async (binding, context) => {
+      await close(binding, context);
+      original = fixture.store.getSession(context.sessionId);
+      const conversation = fixture.store.listMessagingConversations().find(candidate => candidate.sessionId === context.sessionId)!;
+      const connection = fixture.store.getMessagingConnection(conversation.connectionId);
+      const interaction = fixture.store.listMessagingInteractions({ connectionId: connection.id }).find(candidate => candidate.providerMessageId === "scope-new")!;
+      operationId = `messaging-new-session-${interaction.id}`;
+      if (change === "route") {
+        fixture.manager.putRoute({ connectionId: connection.id, targetId: "target-one", fastMode: false, permissionMode: "auto", planMode: false });
+      } else if (change === "target") {
+        const target = fixture.store.getTarget("target-one");
+        fixture.store.upsertTarget({ ...target.descriptor, trusted: false }, target.metadata);
+      } else if (change === "reply-context") {
+        const previous = fixture.store.getMessagingConversationContext(conversation.id);
+        const payload = { format: 1, command: "/status" };
+        const incoming = fixture.store.createMessagingInteraction({ connectionId: connection.id, expectedChannelGeneration: connection.generation,
+          conversationId: conversation.id, providerRequestId: "wechat:new-context", providerInteractionId: "command:new-context", providerMessageId: "new-context",
+          actionHash: operationBodyHash(payload), payload, expiresAt: Date.now() + 60_000 });
+        fixture.store.putMessagingConversationContext({ connectionId: connection.id, expectedChannelGeneration: connection.generation,
+          expectedMaterialGeneration: previous.materialGeneration, conversationId: conversation.id, expectedRevision: previous.revision,
+          sealed: previous.sealed, sourceInteractionId: incoming.id });
+      } else {
+        revocation = fixture.manager.setEnabled({ connectionId: connection.id, expectedRevision: connection.revision,
+          expectedGeneration: connection.generation, enabled: false }).catch(() => undefined);
+      }
+    });
+    const created = fixture.manager.createWeChatConnection();
+    await fixture.manager.commitWeChatAuthorization({ clientConnectionId: "desktop-one", connectionId: created.id, expectedRevision: created.revision,
+      expectedGeneration: created.generation, expectedCredentialReferenceId: null, expectedCredentialGeneration: null, expectedEnabled: false,
+      credentials: { token: "weChat-private-token", botId: "wx-bot", userId: "wx-account", baseUrl: "https://ilinkai.weixin.qq.com" }, enable: true });
+    await vi.waitFor(() => {
+      expect(operationId).toBeDefined();
+      expect(fixture.store.getOperation(operationId!)).toMatchObject({ status: "failed", error: { stateMayHaveChanged: false } });
+    }, { timeout: 5_000 });
+    expect(nativeCreate).toHaveBeenCalledOnce();
+    expect(fixture.store.getSession(original!.descriptor.id).descriptor.binding).toEqual(original!.descriptor.binding);
+    expect(fixture.store.listSessions({ includeArchived: true })).toHaveLength(1);
+    expect(transport.sentText.some(row => row.text === "A new conversation is ready.")).toBe(false);
+    await revocation;
+  });
+
+  it("runs WeChat commands through one peer's durable task and resets that task on /new", async () => {
     const commands = ["/new", "/permission auto", "/permission AcCePtEdItS", "/permission bypassPermissions", "/status", "/stop all"];
     const batch = weChatDirectBatch();
     const transport = new FakeWeChatTransport({
@@ -1419,7 +1658,7 @@ describe("MessagingManager", () => {
       }))
     });
     const permissionModes = ["ask", "acceptEdits", "auto", "bypassPermissions"] as const;
-    const adapter = new FakeBackendAdapter({
+    const adapter = new WeChatRestartAdapter({
       ...PI_LIKE_PROFILE,
       permissionModes,
       capabilities: [
@@ -1435,6 +1674,15 @@ describe("MessagingManager", () => {
     fixture.manager.putRoute({
       targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false
     });
+    let resetSource: ReturnType<OperationalStore["getSession"]> | undefined;
+    let resetResult: ReturnType<OperationalStore["getSession"]> | undefined;
+    const restart = fixture.host.restartWeChatConversation.bind(fixture.host);
+    const restarted = vi.spyOn(fixture.host, "restartWeChatConversation").mockImplementation(async input => {
+      resetSource = fixture.store.getSession(input.conversation.sessionId!);
+      await restart(input);
+      resetResult = fixture.store.getSession(input.conversation.sessionId!);
+    });
+    const resumed = vi.spyOn(adapter, "resumeSession");
     const created = fixture.manager.createWeChatConnection();
     const enabled = await fixture.manager.commitWeChatAuthorization({
       clientConnectionId: "desktop-one",
@@ -1457,9 +1705,15 @@ describe("MessagingManager", () => {
     const conversation = fixture.store.listMessagingConversations({ connectionId: enabled.id })[0]!;
     const taskIds = fixture.store.listSessions().map((session) => session.descriptor.id);
     expect(taskIds).toContain(conversation.sessionId);
-    expect(taskIds).toHaveLength(2);
+    expect(taskIds).toHaveLength(1);
     expect(fixture.store.getSession(conversation.sessionId!).descriptor.permissionMode).toBe("acceptEdits");
-    expect(fixture.store.getSession(taskIds.find((id) => id !== conversation.sessionId)!).descriptor.permissionMode).toBe("ask");
+    expect(restarted).toHaveBeenCalledOnce();
+    expect(resetResult!.descriptor).toMatchObject({ archived: false, binding: { generation: resetSource!.descriptor.binding.generation + 1 } });
+    expect(resetResult!.descriptor.binding.nativeSessionId).not.toBe(resetSource!.descriptor.binding.nativeSessionId);
+    const current = fixture.store.getSession(conversation.sessionId!).descriptor;
+    const laterResumes = resumed.mock.calls.filter(([, context]) => context.generation > resetResult!.descriptor.binding.generation);
+    expect(current).toMatchObject({ archived: false, binding: { nativeSessionId: resetResult!.descriptor.binding.nativeSessionId,
+      generation: laterResumes.at(-1)?.[1].generation ?? resetResult!.descriptor.binding.generation } });
     expect(transport.sentText.map((entry) => entry.text)).toEqual([
       expect.stringContaining("new conversation is ready"),
       expect.stringContaining("Permission changed to auto"),
@@ -2409,8 +2663,11 @@ describe("MessagingManager", () => {
     expect(transports.reduce((sum, transport) => sum + transport.attachmentAttempts, 0)).toBe(1);
   });
 
-  it("projects an open permission to a durable Telegram card and resolves its owner callback once", async () => {
-    const transport = new InteractiveTelegramTransport();
+  it.each([
+    ["allow_once", "Allowed once."],
+    ["deny_once", "Denied."]
+  ] as const)("records %s on the original Telegram permission card and resolves its owner callback once", async (decision, outcome) => {
+    const transport = new InteractiveTelegramTransport(decision);
     const adapter = new PermissionFakeAdapter();
     const fixture = await createFixture(() => transport, () => adapter);
     fixture.manager.putRoute({
@@ -2425,7 +2682,7 @@ describe("MessagingManager", () => {
     });
     await replaceCredential(fixture, created, "interaction", true);
 
-    await vi.waitFor(() => expect(adapter.decision).toEqual({ kind: "selected", value: "allow_once" }));
+    await vi.waitFor(() => expect(adapter.decision).toEqual({ kind: "selected", value: decision }));
     expect(transport.sentInteractionCards).toHaveLength(1);
     expect(transport.sentInteractionCards[0]).toMatchObject({
       text: expect.stringContaining("Run command"),
@@ -2441,7 +2698,7 @@ describe("MessagingManager", () => {
     const coreInteraction = fixture.store.getInteraction("permission-one");
     expect(coreInteraction).toMatchObject({
       status: "resolved",
-      decision: { kind: "selected", value: "allow_once" }
+      decision: { kind: "selected", value: decision }
     });
     expect(fixture.store.listMessagingDeliveries().find((delivery) => delivery.kind === "interaction"))
       .toMatchObject({ status: "sent", providerMessageId: "card-1" });
@@ -2450,10 +2707,82 @@ describe("MessagingManager", () => {
       expect.objectContaining({ status: "failed", providerInteractionId: "callback-two", outcomeCode: "stale_action" })
     ]));
     await vi.waitFor(() => expect(transport.clearedInteractionCards).toEqual([
-      { address: expect.objectContaining({ providerConversationId: "42" }), messageId: "card-1" }
+      { address: expect.objectContaining({ providerConversationId: "42" }), messageId: "card-1",
+        text: `${transport.sentInteractionCards[0]!.text}\n\n${outcome}` }
     ]));
     expect(fixture.store.listMessagingDeliveries().filter((delivery) => delivery.kind === "interaction"))
       .toHaveLength(2);
+  });
+
+  it("clears the original dismissed Telegram permission after restart behind a thousand newer deliveries", async () => {
+    const transport = new FakeTelegramTransport(directMessageBatch());
+    const reconnected = new FakeTelegramTransport({ events: [], groupObservations: [], ignored: [] });
+    const adapter = new PermissionFakeAdapter();
+    let currentTransport = transport;
+    const fixture = await createFixture(() => currentTransport, () => adapter);
+    fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const created = fixture.manager.createTelegramConnection({ ownerProviderUserId: "42",
+      configuration: { ...DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION, emojiReactions: "off" } });
+    const enabled = await replaceCredential(fixture, created, "old-permission", true);
+    const store = fixture.store;
+    const key = { connectionId: enabled.id, channelGeneration: enabled.generation };
+    const openCard = () => store.findMessagingDeliveryByDedupe({ ...key, dedupeKey: "interaction:permission-one:open" });
+    await vi.waitFor(() => expect(openCard()?.status).toBe("sent"));
+    const original = openCard()!;
+    const payload = { format: 1, address: transport.sentInteractionCards[0]!.address, text: "Previously sent notice" };
+    store.transaction(transaction => {
+      for (let index = 1; index <= 1_000; index += 1) {
+        const at = original.createdAt + index;
+        const delivery = transaction.enqueueMessagingDelivery({ connectionId: enabled.id, expectedChannelGeneration: enabled.generation,
+          conversationId: original.conversationId, dedupeKey: `newer-notice:${index}`, kind: "notice", partIndex: 0, partCount: 1,
+          payload, payloadHash: operationBodyHash(payload), availableAt: at, createdAt: at });
+        const claimToken = `fixture-sent-notice:${index}`;
+        const claimed = transaction.claimNextMessagingDelivery({ connectionId: enabled.id, expectedChannelGeneration: enabled.generation, claimToken, claimedAt: at });
+        if (claimed?.id !== delivery.id) throw new Error("Expected to claim the fixture's newer notice.");
+        transaction.settleMessagingDelivery({ deliveryId: claimed.id, expectedRevision: claimed.revision, claimToken,
+          status: "sent", providerMessageId: String(index + 100), settledAt: at });
+      }
+    });
+    expect(store.listMessagingDeliveries({ connectionId: enabled.id, statuses: ["sent"], limit: 1_000 }))
+      .not.toContainEqual(expect.objectContaining({ id: original.id }));
+
+    currentTransport = reconnected;
+    await fixture.restartManager(() => {
+      expect(store.recoverStartup("restart-old-telegram-permission").dismissedInteractionIds).toContain("permission-one");
+    });
+    await vi.waitFor(() => expect(store.findMessagingDeliveryByDedupe({ ...key, dedupeKey: "interaction:permission-one:close" }))
+      .toMatchObject({ status: "sent", providerMessageId: original.providerMessageId }));
+    expect(reconnected.clearedInteractionCards).toEqual([{ address: payload.address, messageId: original.providerMessageId }]);
+    expect(reconnected.sentInteractionCards).toEqual([]);
+    expect(store.getInteraction("permission-one")).toMatchObject({ status: "dismissed" });
+    expect(adapter.decision).toBeUndefined();
+  });
+
+  it("removes a dismissed Telegram permission keyboard when the owner clicks its original button", async () => {
+    let releaseCallback!: () => void;
+    const callback = new Promise<void>(resolve => { releaseCallback = resolve; });
+    const transport = new InteractiveTelegramTransport("allow_once", () => callback);
+    const adapter = new PermissionFakeAdapter();
+    const fixture = await createFixture(() => transport, () => adapter);
+    fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const created = fixture.manager.createTelegramConnection({ ownerProviderUserId: "42",
+      configuration: { ...DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION, emojiReactions: "off" } });
+    try {
+      const enabled = await replaceCredential(fixture, created, "dismissed-button", true);
+      const store = fixture.store;
+      const key = { connectionId: enabled.id, channelGeneration: enabled.generation };
+      await vi.waitFor(() => expect(store.findMessagingDeliveryByDedupe({ ...key, dedupeKey: "interaction:permission-one:open" })?.status).toBe("sent"));
+      const pending = store.getInteraction("permission-one");
+      store.dismissInteraction(pending.id, pending.generation, "The original permission is unavailable.", "retire-without-clear-receipt");
+      expect(store.findMessagingDeliveryByDedupe({ ...key, dedupeKey: "interaction:permission-one:close" })).toBeUndefined();
+      releaseCallback();
+      await vi.waitFor(() => expect(store.findMessagingDeliveryByDedupe({ ...key, dedupeKey: "interaction:permission-one:close" }))
+        .toMatchObject({ status: "sent", providerMessageId: "card-1" }));
+      expect(transport.clearedInteractionCards).toEqual([{ address: transport.sentInteractionCards[0]!.address, messageId: "card-1" }]);
+      expect(transport.interactionAnswers[0]).toEqual({ text: "This action is no longer available.", showAlert: true });
+      expect(store.getInteraction(pending.id)).toMatchObject({ status: "dismissed" });
+      expect(adapter.decision).toBeUndefined();
+    } finally { releaseCallback(); }
   });
 
   it("resolves a typed multi-field question from an exact Telegram reply without admitting another Queue turn", async () => {
@@ -3028,7 +3357,7 @@ class FakeTelegramTransport {
     readonly text: string;
     readonly buttons: readonly { readonly label: string; readonly actionValue: string }[];
   }> = [];
-  readonly clearedInteractionCards: Array<{ readonly address: MessagingAddress; readonly messageId: string }> = [];
+  readonly clearedInteractionCards: Array<{ readonly address: MessagingAddress; readonly messageId: string; readonly text?: string }> = [];
   readonly interactionAnswers: Array<{ readonly text: string; readonly showAlert: boolean }> = [];
   readonly typing: MessagingAddress[] = [];
   readonly reactions: Array<{ readonly messageId: string; readonly emoji: string | null }> = [];
@@ -3127,8 +3456,9 @@ class FakeTelegramTransport {
     return { providerMessageId: `card-${this.sentInteractionCards.length}`, address: input.address };
   }
 
-  async clearInteractionCard(input: { readonly address: MessagingAddress; readonly messageId: string }) {
-    this.clearedInteractionCards.push({ address: input.address, messageId: input.messageId });
+  async clearInteractionCard(input: { readonly address: MessagingAddress; readonly messageId: string; readonly text?: string }) {
+    this.clearedInteractionCards.push({ address: input.address, messageId: input.messageId,
+      ...(input.text === undefined ? {} : { text: input.text }) });
     return { providerMessageId: input.messageId, address: input.address };
   }
 
@@ -3763,7 +4093,9 @@ class FakeWeChatTransport {
     readonly address: MessagingAddress;
     readonly text: string;
     readonly context?: { readonly contextToken: string; readonly clientId: string };
+    readonly assertCurrent?: () => void;
   }) {
+    input.assertCurrent?.();
     this.sentText.push(input);
     this.onTextSent?.();
     return { providerMessageId: `wx-out-${this.sentText.length}`, address: input.address };
@@ -4398,7 +4730,7 @@ class InteractiveTelegramTransport extends FakeTelegramTransport {
   #releaseInteractionPoll: (() => void) | undefined;
   #releaseStalePoll: (() => void) | undefined;
 
-  constructor() {
+  constructor(private readonly decision: "allow_once" | "deny_once" = "allow_once", private readonly beforeCallback?: () => Promise<void>) {
     super(directMessageBatch());
   }
 
@@ -4419,6 +4751,8 @@ class InteractiveTelegramTransport extends FakeTelegramTransport {
           else input.signal?.addEventListener("abort", abort, { once: true });
         });
       }
+      await this.beforeCallback?.();
+      input.signal?.throwIfAborted();
       return { updates: [{ update_id: 10 }], nextCursor: "11" };
     }
     if (input.cursor === "11") {
@@ -4457,7 +4791,7 @@ class InteractiveTelegramTransport extends FakeTelegramTransport {
             isBot: false,
             isOwner: true
           },
-          actionValue: card.buttons[0]!.actionValue,
+          actionValue: card.buttons.find(button => button.label === this.decision)!.actionValue,
           occurredAt: Date.now()
         }],
         groupObservations: [],
@@ -4478,7 +4812,7 @@ class InteractiveTelegramTransport extends FakeTelegramTransport {
     return receipt;
   }
 
-  override async clearInteractionCard(input: { readonly address: MessagingAddress; readonly messageId: string }) {
+  override async clearInteractionCard(input: { readonly address: MessagingAddress; readonly messageId: string; readonly text?: string }) {
     const receipt = await super.clearInteractionCard(input);
     this.#releaseStalePoll?.();
     this.#releaseStalePoll = undefined;
@@ -4666,6 +5000,16 @@ class ControlledReplyAdapter extends FakeBackendAdapter {
   async finish(text: string): Promise<void> {
     await this.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text }] });
     await this.emit({ type: "done", outcome: "completed" });
+  }
+}
+
+class WeChatRestartAdapter extends ControlledReplyAdapter {
+  override async createSession(input: Parameters<FakeBackendAdapter["createSession"]>[0], context: AdapterContext) {
+    const binding = await super.createSession(input, context);
+    if (binding.nativeSessionId === undefined) throw new Error("The WeChat native fixture has no session identity.");
+    const independent = { ...binding, opaqueRef: `${binding.opaqueRef}/${binding.nativeSessionId}` };
+    await super.resumeSession(independent, context);
+    return independent;
   }
 }
 

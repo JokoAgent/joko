@@ -337,13 +337,19 @@ export class TelegramTransport {
   async clearInteractionCard(input: {
     readonly address: MessagingAddress;
     readonly messageId: string;
+    readonly text?: string;
     readonly signal?: AbortSignal;
   }): Promise<MessagingSendReceipt> {
     this.#assertAddress(input.address);
     const messageId = numericCoordinate(input.messageId, "message");
-    const edited = await this.#api.call<TelegramMessage | true>("editMessageReplyMarkup", {
+    if (input.text !== undefined && (input.text.trim() === "" || input.text.length > TELEGRAM_TEXT_LIMIT)) {
+      throw invalidInput("Telegram interaction edit text exceeds its single-message limit.");
+    }
+    const method = input.text === undefined ? "editMessageReplyMarkup" : "editMessageText";
+    const edited = await this.#api.call<TelegramMessage | true>(method, {
       chat_id: numericCoordinate(input.address.providerConversationId, "conversation"),
       message_id: messageId,
+      ...(input.text === undefined ? {} : { text: input.text }),
       reply_markup: { inline_keyboard: [] }
     }, { signal: input.signal, effect: "unknown" });
     if (edited !== true && (!isTelegramMessage(edited) || edited.message_id !== messageId)) {

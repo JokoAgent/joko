@@ -110,6 +110,8 @@ describe("DiscordTransport effects", () => {
       buttons: Array.from({ length: 6 }, (_, index) => ({ label: `Choice ${index + 1}`, actionValue: `choice_${index + 1}` }))
     });
     await transport.clearInteractionCard({ address, messageId: card.providerMessageId });
+    await expect(transport.clearInteractionCard({ address, messageId: card.providerMessageId, text: "Choose one\n\nDenied." }))
+      .resolves.toEqual({ providerMessageId: card.providerMessageId, address });
     await transport.sendTyping(address);
     await transport.setReaction({ address, messageId: MESSAGE_ID, emoji: "✅" });
     await transport.setReaction({ address, messageId: MESSAGE_ID, emoji: null });
@@ -141,6 +143,9 @@ describe("DiscordTransport effects", () => {
         })
       }),
       expect.objectContaining({ method: "PATCH", path: expect.stringContaining(`/channels/${DM_ID}/messages/`) }),
+      { method: "PATCH", path: `/api/v10/channels/${DM_ID}/messages/${card.providerMessageId}`, body: { components: [] } },
+      { method: "PATCH", path: `/api/v10/channels/${DM_ID}/messages/${card.providerMessageId}`,
+        body: { components: [], embeds: [{ description: "Choose one\n\nDenied." }], allowed_mentions: { parse: [] } } },
       { method: "PATCH", path: `/api/v10/channels/${DM_ID}/messages/${MESSAGE_ID}`, body: { content: "Updated @everyone", allowed_mentions: { parse: [] } } },
       { method: "DELETE", path: `/api/v10/channels/${DM_ID}/messages/${MESSAGE_ID}` },
       expect.objectContaining({ method: "POST", path: `/api/v10/channels/${DM_ID}/typing` }),
