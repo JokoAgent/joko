@@ -139,6 +139,30 @@ describe("ObjectiveManager", () => {
     } finally { await manager.close(); store.close(); }
   });
 
+  it.each(["refinement", "original"] as const)("completes the initial Claude Goal after the user selects %s", async choiceId => {
+    const fixture = createFixture();
+    const session = fixture.store.getSession(fixture.sessionId).descriptor;
+    const backend = fixture.store.getBackend(session.backendId).descriptor;
+    fixture.store.upsertBackend({ ...backend, adapterKind: "claude-agent-sdk-stdio" });
+    const originalText = "Improve the README", refinedText = "Document the CLI flags in README.md";
+    await fixture.manager.set({ operationId: "set-clarified-goal", sessionId: fixture.sessionId, text: originalText });
+    const pending = fixture.host.admissions[0]!;
+    makeRunning(fixture.store, pending);
+    const question = fixture.store.openInteraction({ sessionId: fixture.sessionId, runId: pending.runId, attemptId: pending.attemptId,
+      generation: session.binding.generation, traceId: "goal-clarification", payload: { id: "clarify-original-goal",
+        kind: "question", title: "Clarify the Goal", prompt: "Which goal should I complete?", fields: [{ id: "goal", label: "Goal",
+          required: true, kind: "single", allowOther: false, choices: [{ id: "original", label: originalText }, { id: "refinement", label: refinedText }] }] } });
+    fixture.store.resolveInteraction(question.id, question.generation,
+      { kind: "question", answers: { goal: { kind: "single", selection: { kind: "choice", choiceId } } } }, "answered-goal-clarification");
+    settleRun(fixture.store, pending, "completed", verdict("complete", "The README now documents the flags", refinedText));
+    await fixture.manager.onRunSettled({ sessionId: fixture.sessionId, runId: pending.runId, outcome: "completed" });
+    const text = choiceId === "refinement" ? refinedText : originalText;
+    expect(fixture.store.getObjective(fixture.sessionId)).toMatchObject({ status: "complete", text, turnsUsed: 1 });
+    expect(fixture.store.listEvents({ sessionId: fixture.sessionId }).some(({ payload }) => payload.type === "objective_lifecycle"
+      && payload.action === "completed" && payload.objectiveText === text)).toBe(true);
+    expect(fixture.host.admissions).toHaveLength(1);
+  });
+
   it("uses a new incarnation after clear so the old turn cannot replay or settle the rebuilt Objective", async () => {
     const fixture = createFixture();
     await fixture.manager.set(setInput("set-before-clear", fixture));

@@ -89,6 +89,7 @@ interface TurnEvidence {
   readonly assistantText: string;
   readonly sawToolUse: boolean;
   readonly tokens: number;
+  readonly resolvedInteractionIds: readonly string[];
 }
 
 /** Single-Session autonomous Objective owner. Collaboration Goals are not part of this lifecycle. */
@@ -604,7 +605,7 @@ export class ObjectiveManager {
     }
 
     const turnsUsed = current.turnsUsed + 1;
-    const evidence = readTurnEvidence(this.#store, current.sessionId, run);
+    const evidence = readTurnEvidence(this.#store, current.sessionId, run, current.pendingAttemptId);
     const tokensUsed = current.tokensUsed + evidence.tokens;
     const verdict = parseObjectiveVerdict(evidence.assistantText);
     let status: ObjectiveStatus = "active";
@@ -659,6 +660,8 @@ export class ObjectiveManager {
     }
 
     const refinedObjective = safeRefinedObjective(verdict?.refinedObjective);
+    const clarifiedCompletion = status === "complete" && turnsUsed === 1 && refinedObjective !== undefined
+      && matchesCompletedClaudeClarification(this.#store, current, evidence.resolvedInteractionIds, refinedObjective);
     let updated!: ObjectiveRecord;
     this.#store.transaction((store) => {
       updated = store.updateObjective({
@@ -672,7 +675,7 @@ export class ObjectiveManager {
         noProgressTurns,
         dispatchRejections,
         lastReason: reason === null ? null : safeObjectiveReason(reason, "objective turn settled"),
-        ...(status === "active" && refinedObjective !== undefined
+        ...((status === "active" || clarifiedCompletion) && refinedObjective !== undefined
           ? { text: refinedObjective }
           : {}),
         clearPending: true,
@@ -1089,7 +1092,7 @@ function terminalRunState(state: StoredRun["descriptor"]["state"]): boolean {
   return state === "completed" || state === "aborted" || state === "failed";
 }
 
-function readTurnEvidence(store: OperationalStore, sessionId: string, run: StoredRun): TurnEvidence {
+function readTurnEvidence(store: OperationalStore, sessionId: string, run: StoredRun, attemptId: string | undefined): TurnEvidence {
   const events: PersistedEvent[] = [];
   let beforeCursor: bigint | undefined;
   for (;;) {
@@ -1109,22 +1112,43 @@ function readTurnEvidence(store: OperationalStore, sessionId: string, run: Store
   }
   events.sort((left, right) => left.globalCursor < right.globalCursor ? -1 : left.globalCursor > right.globalCursor ? 1 : 0);
   const assistant: string[] = [];
+  const resolvedInteractionIds: string[] = [];
   let sawToolUse = false;
   for (const event of events) {
     if (event.payload.type === "message_complete" && event.payload.role === "assistant") {
       assistant.push(event.payload.blocks.flatMap((block) => block.kind === "text" ? [block.text] : []).join("\n"));
     } else if (event.payload.type === "tool_start") {
       sawToolUse = true;
+    } else if (event.payload.type === "interaction_resolved" && attemptId !== undefined && event.attemptId === attemptId) {
+      resolvedInteractionIds.push(event.payload.interactionId);
     }
   }
   return {
     assistantText: assistant.join("\n"),
     sawToolUse,
+    resolvedInteractionIds,
     // The Store accounts exact Run deltas across native requests and children.
     // Message usage is per-request on some engines and cumulative on others;
     // summing it or a Session snapshot would either lose work or count it twice.
     tokens: run.descriptor.usage?.totalTokens ?? 0
   };
+}
+
+function matchesCompletedClaudeClarification(store: OperationalStore, objective: ObjectiveRecord,
+  interactionIds: readonly string[], refinedObjective: string): boolean {
+  if (interactionIds.length !== 1) return false;
+  const session = store.getSession(objective.sessionId).descriptor;
+  if (session.remoteWorkspace !== undefined || store.getBackend(session.backendId).descriptor.adapterKind !== "claude-agent-sdk-stdio") return false;
+  const interaction = store.findInteraction(interactionIds[0]!);
+  if (interaction?.status !== "resolved" || interaction.sessionId !== objective.sessionId || interaction.runId !== objective.pendingRunId
+    || interaction.attemptId !== objective.pendingAttemptId || interaction.generation !== objective.sessionGeneration
+    || interaction.payload.kind !== "question" || interaction.payload.fields.length !== 1 || interaction.decision?.kind !== "question") return false;
+  const field = interaction.payload.fields[0]!;
+  const answer = interaction.decision.answers[field.id];
+  if (field.kind !== "single" || answer?.kind !== "single" || answer.selection.kind !== "choice") return false;
+  const chosenId = answer.selection.choiceId;
+  return field.choices.some(choice => choice.label === objective.text)
+    && field.choices.some(choice => choice.id === chosenId && choice.label === refinedObjective);
 }
 
 function budgetPreflight(objective: ObjectiveRecord): string | undefined {
