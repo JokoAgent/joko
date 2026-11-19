@@ -30,7 +30,8 @@ import { protoMobilePartnerAvatar, type MobilePartnerAvatarIdentity } from "./mo
 import { MobilePartnerCreationRejected, projectMobilePartnerCreationOptions, projectMobilePartnerCreationResult,
   type MobilePartnerCreationOptions, type MobilePartnerCreationDraft, type MobilePartnerCreationResult } from "./mobile-partner-creation";
 import { createConnectTransport, createConnectionFetch, rememberEndpointTrust, trustedEndpointPublicKey, type ExtensionLibraryFileMatch } from "@joko/connection-transport";
-import { assertTrustedEndpointServerId, endpointTransportForNewDevice, formatTrustedNodeInvitation, irohTransportForRecipient, isLoopbackEndpoint, normalizeEndpointPublicKey, pairingVerificationOrigin, requireIrohRelayInvitationRequest, trustedEndpointTransport, trustedEndpointTransportKind, type NewDeviceAuthorizationOptions, type NodePairingInvitation, type EndpointTransportKind } from "@joko/connection-transport/trust";
+import { allowsUnpinnedEndpoint, assertTrustedEndpointServerId, EndpointTrustError, endpointTransportForNewDevice, formatTrustedNodeInvitation, irohTransportForRecipient, isLoopbackEndpoint, normalizeEndpointPublicKey, pairingVerificationOrigin, requireIrohRelayInvitationRequest, trustedEndpointTransport, trustedEndpointTransportKind, type NewDeviceAuthorizationOptions, type NodePairingInvitation, type EndpointTransportKind } from "@joko/connection-transport/trust";
+import type { MobilePushRetirementRoute } from "./mobile-push-device-store";
 import { createPartnerImportApi, PartnerImportService, type PartnerImportApi,
   createPartnerAutonomyApi, type PartnerAutonomyApi } from "@joko/contracts";
 import { createPartnerHomeApi, PartnerHomeService, type PartnerHomeApi } from "@joko/contracts";
@@ -481,7 +482,7 @@ export interface MobileNetwork {
   getMobilePushCapability(origin: string, signal?: AbortSignal): Promise<MobilePushCapabilityResult>;
   registerMobilePush(credential: PairedCredential, input: MobilePushRegistrationInput,
     signal?: AbortSignal): Promise<MobilePushRegistrationResult>;
-  unregisterMobilePush(origin: string, ticket: MobilePushRevocationTicket, signal?: AbortSignal): Promise<void>;
+  unregisterMobilePush(origin: string, route: MobilePushRetirementRoute, ticket: MobilePushRevocationTicket, signal?: AbortSignal): Promise<void>;
   readSession(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<Snapshot>;
   readNativeSessionTree(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<NativeSessionTree>;
   previewTaskTagDeletion(credential: PairedCredential, taskTagId: string, signal?: AbortSignal): Promise<TaskTagDeletePreview>;
@@ -495,7 +496,7 @@ export interface MobileNetwork {
   readHistory(credential: PairedCredential, sessionId: string, before?: EventCursor, signal?: AbortSignal): Promise<{ events: Event[]; before?: EventCursor }>;
   readAround(credential: PairedCredential, sessionId: string, eventId: string, signal?: AbortSignal): Promise<Event[]>;
   searchSessionMessages(credential: PairedCredential, query: string, status: SessionMessageSearchSessionStatus, signal?: AbortSignal): Promise<readonly SessionMessageSearchMatch[]>;
-  streamOwner(credential: PairedCredential, after: EventCursor, signal: AbortSignal): AsyncIterable<Event>;
+  streamOwner(credential: PairedCredential, after: EventCursor, signal: AbortSignal, onReady?: () => void): AsyncIterable<Event>;
   streamTaskActivity?(credential: PairedCredential, viewedSessionIds: readonly string[], signal: AbortSignal): AsyncIterable<import('@joko/contracts').TaskActivityState>;
   listWorkspaceDirectory(credential: PairedCredential, workspaceId: string, parentPath: string, signal?: AbortSignal): Promise<WorkspaceDirectorySnapshot>;
   listWorkspaceChangeSets(credential: PairedCredential, workspaceId: string, sessionId: string, signal?: AbortSignal): Promise<readonly WorkspaceChangeSet[]>;
@@ -2778,10 +2779,21 @@ export const mobileNetwork: MobileNetwork = {
       ticket
     };
   },
-  async unregisterMobilePush(rawOrigin, rawTicket, signal) {
+  async unregisterMobilePush(rawOrigin, route, rawTicket, signal) {
     const origin = normalizeNodeOrigin(rawOrigin);
     const ticket = normalizedMobilePushTicket(rawTicket);
-    await createClient(ConnectionService, transport(origin)).unregisterMobilePush({
+    const endpointPublicKey = route.kind === "pinned" ? normalizeEndpointPublicKey(route.endpointPublicKey) : undefined;
+    const currentPin = trustedEndpointPublicKey(origin);
+    if (currentPin !== undefined && currentPin !== endpointPublicKey
+      || endpointPublicKey === undefined && !allowsUnpinnedEndpoint(origin)) throw new EndpointTrustError();
+    assertTrustedEndpointServerId(origin, ticket.serverId);
+    const endpointTransport = route.kind === "pinned" ? route.endpointTransport : undefined;
+    const client = createClient(ConnectionService, createConnectTransport({ baseUrl: origin, endpointPublicKey, endpointTransport,
+      transportKind: endpointTransport?.kind ?? "https", useBinaryFormat: true, isolateFailures: true }));
+    const identity = parseNodeIdentity((await client.getServerInfo({}, options(signal))).server);
+    if (identity.serverId !== ticket.serverId) throw new EndpointTrustError();
+    signal?.throwIfAborted();
+    await client.unregisterMobilePush({
       serverId: ticket.serverId,
       registrationId: ticket.registrationId,
       revocationSecret: ticket.secret
@@ -3444,12 +3456,13 @@ export const mobileNetwork: MobileNetwork = {
       .getVoiceInputSession({ voiceInputId }, options(signal));
     return projectMobileVoiceSession(response.session);
   },
-  async *streamOwner(credential, after, signal) {
+  async *streamOwner(credential, after, signal, onReady) {
     const client = createClient(EventService, credentialTransport(credential));
     for await (const response of client.streamEvents({
       scope: { kind: { case: "owner", value: {} } }, afterCursor: after
     }, { signal })) {
       if (response.event) yield response.event;
+      else onReady?.();
     }
   },
   streamTaskActivity(credential, viewedSessionIds, signal) {

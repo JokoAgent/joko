@@ -22,6 +22,7 @@ import {
   type MobileNativeIntentRuntime,
   type MobileNativeIntentSnapshot
 } from "./mobile-native-intent";
+import { parseMobileNotificationResponseIntent } from "./mobile-notification-intent";
 
 describe("mobile public native intents", () => {
   it("round-trips an exact public source without a local profile, address or credential", () => {
@@ -35,10 +36,14 @@ describe("mobile public native intents", () => {
     }
   });
 
-  it.each([false, true])("returns a source-bearing copied link from B to saved A (message=%s)", async message => {
+  it.each([
+    ["link", false], ["link", true], ["notification", false], ["notification", true]
+  ] as const)("returns a source-bearing %s from B to saved A (message=%s)", async (channel, message) => {
     const sources = [{ profileId: "local-A", serverId: "node-A" }, { profileId: "local-B", serverId: "node-B" }];
     const url = message ? buildMobileMessageDeepLink("task", "message", "event", "node-A") : buildMobileTaskDeepLink("task", "node-A");
-    const f = harness(url, snapshot({ status: "connected", activeProfileId: "local-B", savedProfileIds: sources.map(source => source.profileId),
+    const accepted = channel === "link" ? url : parseMobileNotificationResponseIntent({ notification: { request: { content: { data: { intent: url } } } } });
+    expect(accepted).toBe(url);
+    const f = harness(accepted!, snapshot({ status: "connected", activeProfileId: "local-B", savedProfileIds: sources.map(source => source.profileId),
       savedSources: sources, sessionIds: ["task"], selectedSessionId: "task", messages: [{ messageId: "wrong-B", eventId: "wrong-B" }] }));
     f.fake.onConnect = profileId => { f.fake.state = snapshot({ ...f.fake.state, activeProfileId: profileId,
       messages: [{ messageId: "message", eventId: "event" }] }); };

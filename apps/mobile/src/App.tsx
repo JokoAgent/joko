@@ -176,6 +176,7 @@ import {
 } from "./composer-layout";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import { mobileCodexReconnect, timelineRows, type TimelineRow } from "./timeline";
+import { mobileAttentionKey, mobileSessionAttention, mobileViewedSessionAttention, type MobileSessionAttention } from "./mobile-session-attention";
 import { MobileThinkingCard } from "./MobileThinkingCard";
 import { MobileWorkGroupCard } from "./MobileWorkGroupCard";
 import { MobilePlanCard } from "./MobilePlanCard";
@@ -1403,6 +1404,8 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   const copyInFlightRef = useRef(false);
   const mountedRef = useRef(true);
   const homeScopeKey = mobileHomeSourceKey(state);
+  const attentionOwnerKey = state.owner?.sessions.some(session => session.attention?.unread)
+    ? client.sessionAttentionOwnerKey() : undefined;
   const homeScopeRef = useRef(homeScopeKey);
   homeScopeRef.current = homeScopeKey;
   const [displaySource, setDisplaySource] = useState<string>();
@@ -1594,6 +1597,17 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     }
   };
   const togglePin = (session: Session): void => runMutation(() => client.setSessionPinned(session.sessionId, !session.pinned));
+  const markSessionRead = (session: Session): void => {
+    const expected = mobileSessionAttention(state.owner, session);
+    if (!expected || !attentionOwnerKey || !foreground || !mountedRef.current || AppState.currentState !== "active"
+      || homeScopeRef.current !== homeScopeKey || client.sessionAttentionOwnerKey() !== attentionOwnerKey) return;
+    setLocalError("");
+    void client.acknowledgeSessionAttention(attentionOwnerKey, session.sessionId, expected, { kind: "manual" }).catch(error => {
+      if (mountedRef.current && AppState.currentState === "active" && client.sessionAttentionOwnerKey() === attentionOwnerKey) {
+        setLocalError(errorText(error, locale));
+      }
+    });
+  };
   const toggleArchive = (session: Session): void => runMutation(() => session.archived
     ? client.setSessionArchived(session.sessionId, false)
     : archiveMobileSession(client, session.sessionId, locale, () => foreground && mountedRef.current && AppState.currentState === "active"));
@@ -1617,6 +1631,8 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     } else if (action === "rename") {
       setRenameDraft(session.displayName);
       setRenameSession(session);
+    } else if (action === "mark-read") {
+      markSessionRead(session);
     } else if (action === "tags") {
       setTaskTagSessionId(session.sessionId);
     } else if (action.startsWith("tag:")) {
@@ -1783,9 +1799,9 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
           && listScroll.pendingOffset === 0 && Number.isFinite(offset) && offset >= 0) scrollOffsets.set(scrollKey, offset);
       }}
       scrollEventThrottle={16}
-      ListHeaderComponent={projectView === undefined && onPartners && <MobileHomePartners roster={partnerRoster} groups={partnerGroupRoster} storage={mobilePlainStorage}
+      ListHeaderComponent={projectView === undefined && onPartners ? <MobileHomePartners roster={partnerRoster} groups={partnerGroupRoster} storage={mobilePlainStorage}
         active={foreground} visible={statusFilter !== "archived"} query={search} colors={colors} locale={locale}
-        canCreate={!!client.partnerCreationTransport()} onOpen={entry => navigate({ kind: "page", action: () => onPartners(entry) })} />}
+        canCreate={!!client.partnerCreationTransport()} onOpen={entry => navigate({ kind: "page", action: () => onPartners(entry) })} /> : undefined}
       renderSectionHeader={({ section }) => {
         if (section.kind === "search" || (section.kind === "project" && projectView !== undefined)) return null;
         if (section.kind !== "project") return <Text style={[styles.listSectionTitle, { color: colors.muted }]}>{section.title}</Text>;
@@ -1801,41 +1817,47 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
         ? "home.empty.offline" : state.status !== "connected" ? "home.empty.reconnect" : normalizedSearch
           ? "home.empty.search" : projectView === undefined && hasMobileHomeDisplayFilters(display) ? "home.empty.filters"
           : listStatusFilter === "archived" ? "home.empty.archived" : "home.empty.default")} colors={colors} />}
-      renderItem={({ item }) => <SwipeableSessionRow session={item.session} registry={swipeRegistry} colors={colors} locale={locale}
-        onTogglePin={togglePin} onArchive={toggleArchive} onShowOptions={openOptions}
-        disabled={state.status !== "connected"}>
-        <View style={[styles.row, { backgroundColor: colors.surface,
-          borderColor: item.session.sessionId === currentSessionId ? colors.accent : colors.border }]}>
-          <Pressable disabled={state.busy} accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.openTask", {
-            name: item.session.displayName || mobileMessage(locale, "home.untitled")
-          })}
-            accessibilityState={{ selected: item.session.sessionId === currentSessionId }}
-            onPress={() => {
-              if (swipeRegistry.closeOpenRow()) return;
-              const sessionId = item.session.sessionId;
-              const query = normalizedSearch.toLocaleLowerCase();
-              const matchesName = item.session.displayName.toLocaleLowerCase().includes(query) || item.navigationName.toLocaleLowerCase().includes(query);
-              const match = matchesName ? undefined : currentMessageMatches.get(sessionId);
-              navigate({ kind: "session", sessionId, ...(match?.eventId ? { searchMatch: match } : {}) });
-            }} style={styles.sessionRowBody}>
-            <View style={styles.fill}><View style={styles.statusTitle}>
-              <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{item.session.displayName
-                || mobileMessage(locale, "home.untitledTask")}</Text>
-              <MobileTaskTagDots tags={item.session.taskTags} locale={locale} dark={colors.dark} />
-              {item.session.pinned && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>{mobileMessage(locale, "common.pinned")}</Text>}
-            </View>
-              <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{item.navigationName} · {sessionState(item.session.state, locale)}</Text></View>
-          </Pressable>
-          <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.optionsFor", {
-            name: item.session.displayName || mobileMessage(locale, "home.untitledTask")
-          })}
-            accessibilityState={{ disabled: state.status !== "connected" && state.status !== "offline" }}
-            disabled={state.status !== "connected" && state.status !== "offline"}
-            onPress={() => { swipeRegistry.closeOpenRow(); openOptions(item.session); }} style={styles.rowOptions}>
-            <Text style={[styles.rowOptionsText, { color: colors.muted }]}>•••</Text>
-          </Pressable>
-        </View>
-      </SwipeableSessionRow>}
+      renderItem={({ item }) => {
+        const attention = mobileSessionAttention(state.owner, item.session);
+        return <SwipeableSessionRow session={item.session} registry={swipeRegistry} colors={colors} locale={locale}
+          onTogglePin={togglePin} onArchive={toggleArchive} onShowOptions={openOptions}
+          onMarkRead={attention !== undefined && attentionOwnerKey !== undefined ? markSessionRead : undefined}
+          disabled={state.status !== "connected"}>
+          <View style={[styles.row, { backgroundColor: colors.surface,
+            borderColor: item.session.sessionId === currentSessionId ? colors.accent : colors.border }]}>
+            <Pressable disabled={state.busy} accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.openTask", {
+              name: item.session.displayName || mobileMessage(locale, "home.untitled")
+            })}
+              accessibilityHint={attention === undefined ? undefined : mobileMessage(locale, "home.taskUnread")}
+              accessibilityState={{ selected: item.session.sessionId === currentSessionId }}
+              onPress={() => {
+                if (swipeRegistry.closeOpenRow()) return;
+                const sessionId = item.session.sessionId;
+                const query = normalizedSearch.toLocaleLowerCase();
+                const matchesName = item.session.displayName.toLocaleLowerCase().includes(query) || item.navigationName.toLocaleLowerCase().includes(query);
+                const match = matchesName ? undefined : currentMessageMatches.get(sessionId);
+                navigate({ kind: "session", sessionId, ...(match?.eventId ? { searchMatch: match } : {}) });
+              }} style={styles.sessionRowBody}>
+              <View style={styles.fill}><View style={styles.statusTitle}>
+                {attention !== undefined && <View accessible={false} style={[styles.taskUnreadDot, { backgroundColor: colors.accent }]} />}
+                <Text style={[styles.label, { color: colors.ink }]} numberOfLines={1}>{item.session.displayName
+                  || mobileMessage(locale, "home.untitledTask")}</Text>
+                <MobileTaskTagDots tags={item.session.taskTags} locale={locale} dark={colors.dark} />
+                {item.session.pinned && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>{mobileMessage(locale, "common.pinned")}</Text>}
+              </View>
+                <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{item.navigationName} · {sessionState(item.session.state, locale)}</Text></View>
+            </Pressable>
+            <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.optionsFor", {
+              name: item.session.displayName || mobileMessage(locale, "home.untitledTask")
+            })}
+              accessibilityState={{ disabled: state.status !== "connected" && state.status !== "offline" }}
+              disabled={state.status !== "connected" && state.status !== "offline"}
+              onPress={() => { swipeRegistry.closeOpenRow(); openOptions(item.session); }} style={styles.rowOptions}>
+              <Text style={[styles.rowOptionsText, { color: colors.muted }]}>•••</Text>
+            </Pressable>
+          </View>
+        </SwipeableSessionRow>;
+      }}
       refreshing={state.status === "connecting"} onRefresh={() => void client.refresh()}
       onScrollBeginDrag={() => { listScroll.pendingOffset = 0; swipeRegistry.closeOpenRow(); }}
       contentContainerStyle={styles.list} />
@@ -1857,6 +1879,9 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
             || mobileMessage(locale, "home.taskOptions")}</Text>
           <MenuRow label={mobileMessage(locale, "common.rename")} onPress={() => scheduleOption("rename")} colors={colors}
             disabled={state.status !== "connected"} />
+          {mobileSessionAttention(state.owner, optionsSession) !== undefined && <MenuRow
+            label={mobileMessage(locale, "home.markTaskRead")} onPress={() => scheduleOption("mark-read")} colors={colors}
+            disabled={attentionOwnerKey === undefined} />}
           <MobileTaskTagQuickChoices tags={state.owner?.taskTagCatalog?.taskTags ?? []} selected={optionsSession?.taskTags ?? []}
             locale={locale} colors={colors} disabled={state.status !== "connected"} onSelect={id => scheduleOption(`tag:${id}`)} />
           <MenuRow label={mobileMessage(locale, "taskTags.manage")} onPress={() => scheduleOption("tags")} colors={colors}
@@ -1906,7 +1931,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   </View>;
 }
 
-type SessionOption = "rename" | "copy-link" | "pin" | "archive" | "delete" | "tags" | `tag:${string}`;
+type SessionOption = "rename" | "mark-read" | "copy-link" | "pin" | "archive" | "delete" | "tags" | `tag:${string}`;
 
 function MobileHomeProjectHeading({ section, expanded, colors, locale, reorderable, reorder, onToggle, onStartDrag }: {
   readonly section: MobileHomeSection;
@@ -5272,6 +5297,41 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     }).filter((item) => state.status === "connected" || item.id === "copy-link" || item.id === "copy-text"
       || state.status === "offline" && (item.id === "add-to-composer" || item.id === 'reply'))
     : [];
+  const latestConversation = stableTimelineMessages.at(-1);
+  const canViewAttention = state.status === "connected" && state.selectedId !== undefined && headerSourceKey !== undefined
+    && headerRole.role === "ordinary" && partnerIdentity.ready && !partnerIdentity.partner && state.window === undefined
+    && !drawerOpen && !drawerMounted && !partnerSettingsVisible && !messageActionsVisible && !taskActionsVisible && !contextVisible
+    && !conversationShare.active && !searchVisible && !imageGallery.view && AppState.currentState === "active"
+    && latestConversation !== undefined && visibleTimelineRows?.has(latestConversation.id);
+  const viewedAttention = canViewAttention && state.selectedId !== undefined
+    ? mobileViewedSessionAttention(state.owner, state.detail, state.selectedId) : undefined;
+  const viewedAttentionOwner = viewedAttention === undefined ? undefined : client.sessionAttentionOwnerKey();
+  const viewedAttentionKey = viewedAttentionOwner && viewedAttention
+    ? JSON.stringify([viewedAttentionOwner, headerSourceKey, mobileAttentionKey(viewedAttention)]) : undefined;
+  const visibleAttentionRef = useRef<{
+    readonly key: string;
+    readonly owner: string;
+    readonly taskKey: string;
+    readonly sessionId: string;
+    readonly attention: MobileSessionAttention;
+  } | undefined>(undefined);
+  visibleAttentionRef.current = viewedAttentionKey && viewedAttentionOwner && viewedAttention && headerSourceKey && state.selectedId
+    ? { key: viewedAttentionKey, owner: viewedAttentionOwner, taskKey: headerSourceKey, sessionId: state.selectedId, attention: viewedAttention }
+    : undefined;
+  const confirmedAttentionRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (viewedAttentionKey === undefined || confirmedAttentionRef.current === viewedAttentionKey) return;
+    const abort = new AbortController();
+    const timer = setTimeout(() => {
+      const view = visibleAttentionRef.current;
+      if (!view || view.key !== viewedAttentionKey || !taskMountedRef.current || AppState.currentState !== "active") return;
+      void client.acknowledgeSessionAttention(view.owner, view.sessionId, view.attention,
+        { kind: "viewed", taskKey: view.taskKey, signal: abort.signal }).then(confirmed => {
+        if (confirmed && !abort.signal.aborted) confirmedAttentionRef.current = view.key;
+      }).catch(() => undefined);
+    }, 200);
+    return () => { clearTimeout(timer); abort.abort(); };
+  }, [client, viewedAttentionKey]);
   useMobileScreenshotSelection({ owner: client.conversationShareOwnerKey(), selectionActive: conversationShare.active,
     blocked: conversationShareDisabled || drawerOpen || messageActionsVisible || taskActionsVisible || interactionVisible || contextVisible
       || cloneVisible || forkEventId !== undefined || rewindEventId !== undefined || nativeTreeVisible || runtimeControlsVisible || searchVisible || sessionMentionsVisible || workspaceMentionsVisible || catalogMentionsVisible
@@ -9266,6 +9326,7 @@ const styles = StyleSheet.create({
   modeTabText: { fontSize: 14, fontWeight: "700" },
   sectionHeader: { minHeight: 44, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 12 },
   statusTitle: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 8 },
+  taskUnreadDot: { width: 7, height: 7, borderRadius: 4 },
   badge: { borderRadius: 999, overflow: "hidden", paddingHorizontal: 9, paddingVertical: 4, fontSize: 11, fontWeight: "700" },
   actionRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, paddingTop: 6 },
   button: { minHeight: 48, borderRadius: 12, alignItems: "center", justifyContent: "center", paddingHorizontal: 18, paddingVertical: 10 },

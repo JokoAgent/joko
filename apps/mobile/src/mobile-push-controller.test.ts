@@ -22,7 +22,8 @@ function authority(suffix = "1"): MobilePushAuthority {
     serverId: `server-${suffix}`,
     connectionId: `connection-${suffix}`,
     deviceId: `device-${suffix}`,
-    deviceRevision: 7n
+    deviceRevision: 7n,
+    endpointPublicKey: `ed25519:${suffix.repeat(64)}`
   };
 }
 
@@ -40,7 +41,7 @@ function clientFixture(initial = authority()) {
     void input;
     return { expiresAt: 30 * 24 * 60 * 60 * 1_000 };
   });
-  const unregisterMobilePush = vi.fn(async () => undefined);
+  const unregisterMobilePush = vi.fn<MobilePushClientPort["unregisterMobilePush"]>(async () => undefined);
   const getMobilePushCapability = vi.fn<MobilePushClientPort["getMobilePushCapability"]>(
     async () => ({ supported: true })
   );
@@ -53,6 +54,7 @@ function clientFixture(initial = authority()) {
     },
     mobilePushLifecycleScope: () => ({ ready: true, ...(activeProfileId === undefined ? {} : { activeProfileId }) }),
     mobilePushAuthority: () => current,
+    captureMobilePushRetirementRoute: (owner) => ({ kind: "pinned", endpointPublicKey: owner.endpointPublicKey! }),
     getMobilePushCapability,
     registerMobilePush,
     unregisterMobilePush
@@ -118,9 +120,11 @@ function notificationsFixture(initialPermission: typeof granted | typeof denied 
   };
 }
 
-function deviceStoreFixture(enabled = false) {
-  const plain = new Map<string, string>(enabled ? [[mobilePushDeviceStoreTesting.enabledKey, "1"]] : []);
-  const secure = new Map<string, string>();
+function deviceStoreFixture(
+  enabled = false,
+  plain = new Map<string, string>(enabled ? [[mobilePushDeviceStoreTesting.enabledKey, "1"]] : []),
+  secure = new Map<string, string>()
+) {
   const store = new MobilePushDeviceStore({
     getItem: async (key) => plain.get(key) ?? null,
     setItem: async (key, value) => { plain.set(key, value); }
@@ -136,10 +140,12 @@ function controllerFixture(options: {
   enabled?: boolean;
   permission?: typeof granted | typeof denied;
   platform?: string;
+  owner?: MobilePushAuthority;
+  persisted?: { plain: Map<string, string>; secure: Map<string, string> };
 } = {}) {
-  const client = clientFixture();
+  const client = clientFixture(options.owner);
   const notifications = notificationsFixture(options.permission);
-  const storage = deviceStoreFixture(options.enabled);
+  const storage = deviceStoreFixture(options.enabled, options.persisted?.plain, options.persisted?.secure);
   let sequence = 0;
   const controller = new MobilePushController({
     platform: options.platform ?? "ios",
@@ -187,8 +193,9 @@ describe("MobilePushController", () => {
 
     await fixture.controller.setEnabled(false);
     expect(fixture.client.unregisterMobilePush).toHaveBeenCalledWith(
-      "https://node-1.example.test",
-      { serverId: "server-1", registrationId: "registration-1", secret: "s".repeat(43) },
+      expect.objectContaining({ origin: "https://node-1.example.test",
+        serverId: "server-1", registrationId: "registration-1", secret: "s".repeat(43),
+        retirementRoute: { kind: "pinned", endpointPublicKey: authority().endpointPublicKey } }),
       expect.any(AbortSignal)
     );
     expect(fixture.storage.secure.get(mobilePushDeviceStoreTesting.registrationsKey)).toContain("\"registrations\":[]");
@@ -200,6 +207,36 @@ describe("MobilePushController", () => {
     expect(fixture.notifications.requestPermissionsAsync).not.toHaveBeenCalled();
     expect(fixture.client.registerMobilePush).toHaveBeenCalledTimes(1);
     expect(fixture.controller.snapshot.status).toBe("registered");
+  });
+
+  it.each(["foreground resume", "reconnect"] as const)("repairs a removed server registration after %s with its original ticket", async (entry) => {
+    const fixture = controllerFixture({ enabled: true });
+    let serverRegistration: string | undefined;
+    fixture.client.registerMobilePush.mockImplementation(async (_owner, { ticket }) => {
+      serverRegistration = ticket.registrationId;
+      return { expiresAt: 30 * 24 * 60 * 60 * 1_000 };
+    });
+    await fixture.controller.start(() => true);
+    const original = fixture.client.registerMobilePush.mock.calls[0]![1];
+    expect(serverRegistration).toBe(original.ticket.registrationId);
+    expect(fixture.storage.store.snapshot.registrations[0]?.confirmed).toBe(true);
+    serverRegistration = undefined;
+    if (entry === "foreground resume") {
+      fixture.controller.handleAppStateChange("background");
+      fixture.controller.handleAppStateChange("active");
+    } else {
+      fixture.client.setAuthority(undefined, "profile-1");
+      await fixture.controller.reconcile();
+      expect(fixture.controller.snapshot.status).toBe("waiting");
+      fixture.client.setAuthority(authority());
+    }
+    await fixture.controller.reconcile();
+    expect(fixture.client.registerMobilePush).toHaveBeenCalledTimes(2);
+    expect(fixture.client.registerMobilePush.mock.calls[1]?.[1]).toEqual(original);
+    expect(serverRegistration).toBe(original.ticket.registrationId);
+    expect(fixture.controller.snapshot.status).toBe("registered");
+    expect(fixture.client.unregisterMobilePush).not.toHaveBeenCalled();
+    fixture.controller.stop();
   });
 
   it("keeps a cold background start suspended until the first active state", async () => {
@@ -256,13 +293,33 @@ describe("MobilePushController", () => {
     fixture.client.unregisterMobilePush.mockResolvedValue(undefined);
     await fixture.controller.reconcile();
     expect(fixture.client.unregisterMobilePush).toHaveBeenLastCalledWith(
-      "https://node-1.example.test",
-      expect.objectContaining({ serverId: "server-1", registrationId: "registration-1" }),
+      expect.objectContaining({ origin: "https://node-1.example.test", serverId: "server-1", registrationId: "registration-1" }),
       expect.any(AbortSignal)
     );
     expect(fixture.client.registerMobilePush).toHaveBeenCalledTimes(2);
     expect(fixture.client.registerMobilePush.mock.calls[1]?.[0]).toMatchObject({ profileId: "profile-2" });
     expect(fixture.controller.snapshot.status).toBe("registered");
+  });
+
+  it("rehydrates a forgotten profile's retirement route before registering the next node", async () => {
+    const original = controllerFixture({ enabled: true });
+    await original.controller.start(() => true);
+    const [receipt] = original.storage.store.snapshot.registrations;
+    expect(receipt?.retirementRoute).toEqual({ kind: "pinned", endpointPublicKey: authority().endpointPublicKey });
+    original.client.unregisterMobilePush.mockRejectedValue(new Error("original node offline"));
+    original.client.setAuthority(undefined);
+    await original.controller.reconcile();
+    expect(original.controller.snapshot).toMatchObject({ status: "error", error: "retirement" });
+    expect(original.storage.store.snapshot.registrations).toEqual([receipt]);
+    original.controller.stop();
+
+    const next = controllerFixture({ owner: authority("2"), persisted: original.storage });
+    await next.controller.start(() => true);
+    expect(next.client.unregisterMobilePush).toHaveBeenCalledExactlyOnceWith(receipt, expect.any(AbortSignal));
+    expect(next.client.unregisterMobilePush.mock.invocationCallOrder[0]).toBeLessThan(next.client.registerMobilePush.mock.invocationCallOrder[0]!);
+    expect(next.storage.store.snapshot.registrations).toMatchObject([{ serverId: "server-2" }]);
+    expect(next.controller.snapshot.status).toBe("registered");
+    next.controller.stop();
   });
 
   it("re-registers a rotated APNs token with the same precommitted ticket", async () => {

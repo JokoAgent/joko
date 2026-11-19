@@ -1,4 +1,6 @@
-import { isEndpointTrustError, observeEndpointTrustFailure, rememberEndpointTrust, replaceEndpointTrust, trustedEndpointPublicKey, trustedEndpointTransportKind } from "@joko/connection-transport";
+import { allowsUnpinnedEndpoint, EndpointTrustError, isEndpointTrustError, observeEndpointTrustFailure, rememberEndpointTrust,
+  replaceEndpointTrust, trustedEndpointPublicKey, trustedEndpointTransport, trustedEndpointTransportKind } from "@joko/connection-transport";
+import type { MobilePushRetirementRoute, MobilePushStoredRegistration } from "./mobile-push-device-store";
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import { ExtensionPackageAction } from "@joko/contracts";
@@ -44,12 +46,12 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import {
   PartnerResumeEditor, PartnerImportEditor, PartnerImportReceipts, PartnerMemoryEditor, PartnerConnectionsEditor, PartnerSkillsEditor,
   PartnerGroupAttachmentSchema, PartnerGroupAttachmentCategory,
-  ArchiveSessionMutationSchema, BlobDisposition, BlobRefSchema, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
+  AcknowledgeSessionAttentionMutationSchema, ArchiveSessionMutationSchema, BlobDisposition, BlobRefSchema, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
   ConnectionState, CreateScheduleMutationSchema, CreateSessionMutationSchema, CloneSessionMutationSchema, ForkSessionMutationSchema, OpenSideChatMutationSchema, SessionDerivationKind,
   CreateTargetMutationSchema, TargetWorkspaceInputSchema,
   CreateTaskTagMutationSchema, UpdateTaskTagMutationSchema, ReorderTaskTagsMutationSchema, SetSessionTaskTagsMutationSchema, DeleteTaskTagMutationSchema,
   DeleteScheduleMutationSchema, DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, DismissInteractionMutationSchema,
-  EditQueueItemMutationSchema, EntityKind, EntityRefSchema, EventSchema, ExecuteUserShellMutationSchema, ExecuteWorkspaceRewindMutationSchema, InputContentSchema,
+  EditQueueItemMutationSchema, EntityKind, EntityRefSchema, EventCursorSchema, EventSchema, ExecuteUserShellMutationSchema, ExecuteWorkspaceRewindMutationSchema, InputContentSchema,
   LAN_DISCOVERY_PEER_TTL_MS,
   RemoteDesktopHostMuteRequestSchema,
   RemoteDesktopPrivacyScreenRequestSchema,
@@ -65,7 +67,7 @@ import {
   CloneProjectScheduleToUserMutationSchema, PromoteScheduleToProjectMutationSchema,
   ReconcileProjectAutomationsMutationSchema, RemoveProjectScheduleMutationSchema,
   AttemptState, ReviewAttachmentInputSchema, ReviewAttachmentKind, ReviewRunState, RunState, SendInputMutationSchema, SessionMessageSearchSessionStatus,
-  SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, SetScheduleEnabledMutationSchema, SetSessionModelMutationSchema,
+  SessionAttentionAcknowledgementIntent, SessionAttentionKind, SessionState, SetQueueInteractionLockMutationSchema, SetQueueItemEditLockMutationSchema, SetScheduleEnabledMutationSchema, SetSessionModelMutationSchema,
   SetSessionPermissionMutationSchema, SetSessionPlanModeMutationSchema, TargetState, capabilityNames,
   StartReviewMutationSchema, TriggerScheduleMutationSchema, UpdateScheduleMutationSchema,
   UpdateVoiceInputServiceSettingsMutationSchema, VoiceInputServiceSettingsPatchSchema,
@@ -77,6 +79,7 @@ import {
 import { mobileVoiceCredentialBindingChanged, type MobileVoiceSettingsTransport } from "./mobile-voice-service-settings";
 import { McpAppNativeOperation, McpAppOperation, McpAppNativeServiceOperateRequestSchema, McpAppServiceOperateRequestSchema } from "@joko/contracts";
 import { mobileDeviceNameSource, validMobileDeviceName, type MobileDeviceNameSourceProvider } from "./mobile-device-name";
+import { mobileAttentionKey, mobileSessionAttention, mobileViewedSessionAttention, type MobileSessionAttention } from "./mobile-session-attention";
 import { resolveMobileMessageForkSource, type MobileMessageForkSource } from "./mobile-message-fork";
 import {
   assertMobileWorkspaceRewindPreview, mobileMessageChangeSet, mobileMessageRewindIdle, mobileRewindCapability,
@@ -114,7 +117,7 @@ import {
   assertWorkspaceFilePreview,
   normalizeNodeOrigin,
   type MobileNetwork, type MobilePushCapabilityResult, type MobilePushRegistrationInput,
-  type MobilePushRegistrationResult, type MobilePushRevocationTicket, type NodeIdentity, type PairedCredential
+  type MobilePushRegistrationResult, type NodeIdentity, type PairedCredential
 } from "./network";
 import {
   assertMobileCanonicalPartnerSession, emptyMobilePartnerPrivateState,
@@ -592,11 +595,25 @@ export interface MobilePushAuthority {
   readonly connectionId: string;
   readonly deviceId: string;
   readonly deviceRevision: bigint;
+  readonly endpointPublicKey?: string;
 }
 
 export interface MobilePushLifecycleScope {
   readonly ready: boolean;
   readonly activeProfileId?: string;
+}
+
+function mobilePushRetirementRoute(
+  profile: Pick<PairedCredential, "origin" | "transportKind">,
+  endpointPublicKey: string | undefined
+): MobilePushRetirementRoute {
+  const transportKind = profile.transportKind ?? "https";
+  if (endpointPublicKey === undefined) {
+    if (transportKind !== "https" || !allowsUnpinnedEndpoint(profile.origin)) throw new EndpointTrustError();
+    return { kind: "direct" };
+  }
+  const endpointTransport = trustedEndpointTransport(profile.origin, endpointPublicKey, transportKind);
+  return { kind: "pinned", endpointPublicKey, ...(endpointTransport === undefined ? {} : { endpointTransport }) };
 }
 
 interface MobileFilesContext {
@@ -1023,6 +1040,7 @@ export class MobileClient {
   #allPending: PendingOperation[] = [];
   #listeners = new Set<(state: MobileState) => void>();
   #epoch = 0;
+  readonly #sessionAttentionFlights = new Set<string>();
   #abort?: AbortController;
   #timer?: ReturnType<typeof setTimeout>;
   #proofTimer?: ReturnType<typeof setTimeout>;
@@ -3873,16 +3891,25 @@ export class MobileClient {
       || connection.state !== ConnectionState.CONNECTED || device.kind !== DeviceKind.MOBILE || device.revoked
       || device.platform.trim().toLocaleLowerCase("en-US") !== "ios"
       || !device.connectionIds.includes(credential.connectionId) || revision < 1n) return undefined;
+    const endpointPublicKey = credential.endpointPublicKey ?? trustedEndpointPublicKey(credential.origin);
     return Object.freeze({
       key: [credential.profileId, credential.origin, credential.serverId, credential.connectionId,
-        credential.deviceId, revision.toString(10)].join("\u001f"),
+        credential.deviceId, revision.toString(10), this.#epoch, endpointPublicKey ?? "", credential.transportKind ?? "https",
+        credential.entryId ?? ""].join("\u001f"),
       profileId: credential.profileId,
       origin: credential.origin,
       serverId: credential.serverId,
       connectionId: credential.connectionId,
       deviceId: credential.deviceId,
-      deviceRevision: revision
+      deviceRevision: revision,
+      ...(endpointPublicKey === undefined ? {} : { endpointPublicKey })
     });
+  }
+
+  captureMobilePushRetirementRoute(authority: MobilePushAuthority): MobilePushRetirementRoute {
+    const current = this.mobilePushAuthority();
+    if (!current || current.key !== authority.key) throw new Error("The mobile push owner changed.");
+    return mobilePushRetirementRoute(this.#ready(), current.endpointPublicKey);
   }
 
   async getMobilePushCapability(
@@ -3914,12 +3941,25 @@ export class MobileClient {
     return result;
   }
 
-  unregisterMobilePush(
-    origin: string,
-    ticket: MobilePushRevocationTicket,
+  async unregisterMobilePush(
+    record: MobilePushStoredRegistration,
     signal?: AbortSignal
   ): Promise<void> {
-    return this.network.unregisterMobilePush(origin, ticket, signal);
+    let route = record.retirementRoute;
+    if (route === undefined) {
+      // A receipt saved before route capture can only use a still-saved,
+      // exact pinned profile. The origin alone cannot recover that trust.
+      const saved = this.#profiles.find(profile => profile.profileId === record.profileId && profile.origin === record.origin
+        && profile.serverId === record.serverId && profile.connectionId === record.connectionId && profile.deviceId === record.deviceId);
+      if (saved?.endpointPublicKey === undefined) throw new EndpointTrustError();
+      signal?.throwIfAborted();
+      await this.storage.loadEndpointTransport?.(saved);
+      if (!this.#profiles.includes(saved)) throw new EndpointTrustError();
+      route = mobilePushRetirementRoute(saved, saved.endpointPublicKey);
+    }
+    signal?.throwIfAborted();
+    return this.network.unregisterMobilePush(record.origin, route,
+      { serverId: record.serverId, registrationId: record.registrationId, secret: record.secret }, signal);
   }
 
   subscribe(listener: (state: MobileState) => void): () => void {
@@ -5167,15 +5207,12 @@ export class MobileClient {
           throw new Error(detail);
         }
         if (resolved) credential = { ...credential, entryId: profile.entryId, origin: profile.origin, transportKind: profile.transportKind };
-        const owner = await this.network.readOwner(credential, this.deviceNameSource(), controller.signal);
-        if (!this.#connectionAttemptCurrent(generation, controller)) return;
-        this.#assertOwner(credential, owner, node);
-        const selected = selection !== undefined && owner.snapshot.sessions.some((session) => session.sessionId === selection)
-          ? selection : undefined;
-        const detail = selected ? await this.network.readSession(credential, selected, controller.signal) : undefined;
-        if (!this.#connectionAttemptCurrent(generation, controller)) return;
+        const current = () => this.#connectionAttemptCurrent(generation, controller);
+        const projection = await this.#readAlignedConnectionProjection(credential, node, selection, controller.signal, current);
+        if (!projection || !current()) return;
+        const { owner, selected, detail } = projection;
         if (selected !== selection) await this.storage.saveSelection(profileId, selected);
-        if (caller?.aborted) return;
+        if (!current() || caller?.aborted) return;
         if (savedEntries && entryOwner) {
           const next = entryId ? { ...savedEntries, preferredId: entryId, backupIds: savedEntries.backupIds.filter(id => id !== entryId) } : savedEntries;
           await this.storage.writeConnectionEntries?.(profile, next);
@@ -5950,27 +5987,25 @@ export class MobileClient {
       return;
     }
     const epoch = this.#retire();
+    const signal = this.#abort!.signal;
+    const current = () => this.#current(epoch);
     this.#set({ status: "connecting", error: undefined });
     try {
       // This request MUST be anonymous and precede every credentialed reconnect.
       rememberEndpointTrust(credential);
-      const node = await this.network.inspect(credential.origin, this.#abort?.signal);
-      if (!this.#current(epoch)) return;
+      const node = await this.network.inspect(credential.origin, signal);
+      if (!current()) return;
       if (node.serverId !== credential.serverId) {
         await this.#identityConflict(epoch, credential.profileId,
           "The saved Joko node identity changed. Its credential was not read again; forget it or pair this node explicitly.");
         return;
       }
-      const owner = await this.network.readOwner(credential, this.deviceNameSource(), this.#abort?.signal);
-      if (!this.#current(epoch)) return;
-      this.#assertOwner(credential, owner, node);
       const selectedId = this.#state.selectedId;
-      const selected = selectedId !== undefined && owner.snapshot.sessions.some((session) => session.sessionId === selectedId)
-        ? selectedId : undefined;
-      const detail = selected ? await this.network.readSession(credential, selected, this.#abort?.signal) : undefined;
-      if (!this.#current(epoch)) return;
+      const projection = await this.#readAlignedConnectionProjection(credential, node, selectedId, signal, current);
+      if (!projection || !current()) return;
+      const { owner, selected, detail } = projection;
       if (selected !== selectedId) await this.storage.saveSelection(credential.profileId, selected);
-      if (!this.#current(epoch)) return;
+      if (!current()) return;
       const sameWindow = selected === selectedId && this.#taskGeneration() === owner.snapshot.generation;
       this.#lastAuthenticatedAt = this.now();
       this.#set({ node, origin: credential.origin, owner: owner.snapshot, detail, selectedId: selected,
@@ -6001,6 +6036,21 @@ export class MobileClient {
         this.#schedule();
       }
     }
+  }
+
+  async #readAlignedConnectionProjection(credential: PairedCredential, node: NodeIdentity, selection: string | undefined,
+    signal: AbortSignal, current: () => boolean) {
+    // A node can restart between the Owner and Session reads without changing its identity.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const owner = await this.network.readOwner(credential, this.deviceNameSource(), signal);
+      if (!current()) return;
+      this.#assertOwner(credential, owner, node);
+      const selected = owner.snapshot.sessions.some(session => session.sessionId === selection) ? selection : undefined;
+      const detail = selected ? await this.network.readSession(credential, selected, signal) : undefined;
+      if (!current()) return;
+      if (!detail || detail.generation === owner.snapshot.generation) return { owner, selected, detail };
+    }
+    throw new Error("The Joko service changed while reading the selected task. Reconnect to load its current history.");
   }
 
   #assertOwner(credential: PairedCredential, owner: Awaited<ReturnType<MobileNetwork["readOwner"]>>, node: NodeIdentity): void {
@@ -6128,8 +6178,8 @@ export class MobileClient {
     this.#streamGeneration = cursor.generation;
     this.#streamSequence = cursor.sequence;
     this.#set({ liveStatus: "verifying" });
-    // An idle stream cannot demonstrate incremental delivery on every native fetch.
-    // Until an event arrives, keep a bounded snapshot-polling fallback instead.
+    // A transport that buffers every frame cannot prove incremental delivery.
+    // Wait for decoded stream readiness or a valid event before switching to live updates.
     this.#proofTimer = setTimeout(() => {
       if (!this.#current(epoch) || this.#streamAbort !== controller || this.#state.liveStatus !== "verifying") return;
       controller.abort();
@@ -6141,9 +6191,16 @@ export class MobileClient {
   }
 
   async #consumeStream(epoch: number, credential: PairedCredential, after: EventCursor, controller: AbortController): Promise<void> {
+    const current = () => this.#current(epoch) && this.#streamAbort === controller && !controller.signal.aborted;
+    const accept = (): void => {
+      if (!current() || this.#state.liveStatus === "streaming") return;
+      if (this.#proofTimer !== undefined) clearTimeout(this.#proofTimer);
+      this.#proofTimer = undefined;
+      this.#set({ liveStatus: "streaming" });
+    };
     try {
-      for await (const event of this.network.streamOwner(credential, after, controller.signal)) {
-        if (!this.#current(epoch) || this.#streamAbort !== controller || controller.signal.aborted) return;
+      for await (const event of this.network.streamOwner(credential, after, controller.signal, accept)) {
+        if (!current()) return;
         const cursor = event.cursor;
         const payload = event.payload?.kind;
         if (payload?.case === "projectionInvalidated" && event.eventId && cursor?.opaqueToken
@@ -6176,9 +6233,7 @@ export class MobileClient {
         if (event.payload?.kind.case === "messageDeleted") {
           void this.#retireAcceptedTaskOutbox(credential, record => mobileTaskOutboxHistoryDeleted(record, event));
         }
-        if (this.#proofTimer !== undefined) clearTimeout(this.#proofTimer);
-        this.#proofTimer = undefined;
-        this.#set({ liveStatus: "streaming" });
+        accept();
         if (event.identity?.sessionId && event.identity.sessionId === this.#state.selectedId && !this.#state.window) {
           this.#set({ live: [...this.#state.live.filter((item) => item.eventId !== event.eventId), event].slice(-160) });
         }
@@ -15013,6 +15068,56 @@ export class MobileClient {
         this.#queueInteractionLease = undefined;
       }
       this.#releaseMutation(action);
+    }
+  }
+
+  sessionAttentionOwnerKey(): string | undefined {
+    const credential = this.#credential, owner = this.#state.owner;
+    if (!credential || !this.#current(this.#epoch) || this.#joinedTask || this.#state.status !== "connected"
+      || this.#state.activeProfileId !== credential.profileId || this.#state.origin !== credential.origin
+      || !this.#abort || this.#abort.signal.aborted || owner?.scope?.kind.case !== "owner"
+      || owner.server?.serverId !== credential.serverId) return undefined;
+    return JSON.stringify([credential.profileId, credential.connectionId, credential.serverId, credential.origin,
+      this.#epoch, owner.generation.toString()]);
+  }
+
+  async acknowledgeSessionAttention(ownerKey: string, sessionId: string, expected: MobileSessionAttention,
+    source: { readonly kind: "manual" } | { readonly kind: "viewed"; readonly taskKey: string; readonly signal: AbortSignal }): Promise<boolean> {
+    const credential = this.#credential, connectionSignal = this.#abort?.signal;
+    if (!credential || !connectionSignal || this.sessionAttentionOwnerKey() !== ownerKey) return false;
+    const signal = source.kind === "viewed" ? AbortSignal.any([connectionSignal, source.signal]) : connectionSignal;
+    const current = () => !signal.aborted && this.#credential === credential && this.sessionAttentionOwnerKey() === ownerKey
+      && (source.kind === "manual" || this.#state.selectedId === sessionId && this.taskHeaderSourceKey() === source.taskKey);
+    if (!current()) return false;
+    const owner = this.#state.owner;
+    const attention = source.kind === "manual"
+      ? mobileSessionAttention(owner, owner?.sessions.find(session => session.sessionId === sessionId))
+      : mobileViewedSessionAttention(owner, this.#state.detail, sessionId);
+    if (!attention || mobileAttentionKey(attention) !== mobileAttentionKey(expected)) return false;
+    const flight = JSON.stringify([ownerKey, sessionId, mobileAttentionKey(attention)]);
+    if (this.#sessionAttentionFlights.has(flight)) return false;
+    const intent = attention.kind === SessionAttentionKind.ERROR ? SessionAttentionAcknowledgementIntent.EXPLICIT
+      : SessionAttentionAcknowledgementIntent.VIEWED;
+    const operationId = this.newId();
+    const requested = create(AcknowledgeSessionAttentionMutationSchema, { sessionId, throughCursor: attention.cursor, intent });
+    const mutation = create(OperationMutationSchema, { payload: { case: "acknowledgeSessionAttention", value: requested } });
+    this.#sessionAttentionFlights.add(flight);
+    try {
+      const result = await this.network.submit(credential, operationId, mutation, signal);
+      if (!current()) return false;
+      const submitted = result.mutation?.payload;
+      const receipt = result.result?.payload;
+      const read = receipt?.case === "sessionAttention" ? receipt.value.readThroughCursor : undefined;
+      if (result.operationId !== operationId || result.connectionId !== credential.connectionId || result.state !== OperationState.SUCCEEDED
+        || submitted?.case !== "acknowledgeSessionAttention" || submitted.value.sessionId !== sessionId
+        || submitted.value.intent !== intent || !submitted.value.throughCursor
+        || !equals(EventCursorSchema, submitted.value.throughCursor, attention.cursor)
+        || read?.generation !== attention.cursor.generation || read.sequence < attention.cursor.sequence) {
+        throw new Error(result.error?.message || "The task read receipt could not be confirmed.");
+      }
+      return true;
+    } finally {
+      this.#sessionAttentionFlights.delete(flight);
     }
   }
 

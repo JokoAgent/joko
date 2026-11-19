@@ -1,3 +1,6 @@
+import { allowsUnpinnedEndpoint, assertHttpConnectOrigin, normalizeEndpointPublicKey,
+  normalizeEndpointTransport, type EndpointTransport } from "@joko/connection-transport";
+
 export interface MobilePushPlainStorage {
   getItem(key: string): Promise<string | null>;
   setItem(key: string, value: string): Promise<void>;
@@ -12,6 +15,12 @@ export interface MobilePushSecureStorage {
 export type MobilePushStoredEnvironment = "sandbox" | "production";
 export type MobilePushStoredLocale = "en" | "zh-CN" | "zh-TW" | "ja" | "ko";
 
+export type MobilePushRetirementRoute = { readonly kind: "direct" } | {
+  readonly kind: "pinned";
+  readonly endpointPublicKey: string;
+  readonly endpointTransport?: EndpointTransport;
+};
+
 export interface MobilePushStoredRegistration {
   readonly profileId: string;
   readonly origin: string;
@@ -25,6 +34,7 @@ export interface MobilePushStoredRegistration {
   readonly tokenDigest: string;
   readonly confirmed: boolean;
   readonly expiresAt: number;
+  readonly retirementRoute?: MobilePushRetirementRoute;
 }
 
 export interface MobilePushDeviceSnapshot {
@@ -128,7 +138,8 @@ function parseRegistrations(raw: string): MobilePushStoredRegistration[] {
 }
 
 function parseRegistration(value: unknown): MobilePushStoredRegistration {
-  if (!plainObject(value) || !exactKeys(value, RECORD_KEYS)) {
+  if (!plainObject(value) || !exactKeys(value, Object.hasOwn(value, "retirementRoute")
+    ? [...RECORD_KEYS, "retirementRoute"] : RECORD_KEYS)) {
     throw new Error("A saved notification registration is invalid.");
   }
   const profileId = identity(value.profileId);
@@ -160,8 +171,28 @@ function parseRegistration(value: unknown): MobilePushStoredRegistration {
     locale: value.locale,
     tokenDigest,
     confirmed: value.confirmed,
-    expiresAt
+    expiresAt,
+    ...(value.retirementRoute === undefined ? {} : { retirementRoute: parseRetirementRoute(value.retirementRoute, origin) })
   });
+}
+
+function parseRetirementRoute(value: unknown, origin: string): MobilePushRetirementRoute {
+  if (plainObject(value)) {
+    if (value.kind === "direct" && exactKeys(value, ["kind"]) && allowsUnpinnedEndpoint(origin)) {
+      return Object.freeze({ kind: "direct" });
+    }
+    if (value.kind === "pinned" && typeof value.endpointPublicKey === "string"
+      && exactKeys(value, value.endpointTransport === undefined
+        ? ["kind", "endpointPublicKey"] : ["kind", "endpointPublicKey", "endpointTransport"])) {
+      try {
+        const endpointPublicKey = normalizeEndpointPublicKey(value.endpointPublicKey);
+        const endpointTransport = value.endpointTransport === undefined ? undefined : normalizeEndpointTransport(value.endpointTransport);
+        if (endpointTransport?.kind === "http-connect") assertHttpConnectOrigin(endpointTransport, origin);
+        return Object.freeze({ kind: "pinned", endpointPublicKey, ...(endpointTransport === undefined ? {} : { endpointTransport }) });
+      } catch { /* Reject invalid protected route material below. */ }
+    }
+  }
+  throw new Error("A saved notification retirement route is invalid.");
 }
 
 function assertUniqueRegistrations(records: readonly MobilePushStoredRegistration[]): void {

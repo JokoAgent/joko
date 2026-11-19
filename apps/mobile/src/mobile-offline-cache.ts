@@ -266,7 +266,7 @@ export class MobileOfflineCache {
           const candidate = readManifest(priorRaw, profile);
           const priorOwner = readSnapshot(candidate.owner, "owner snapshot");
           assertOwnerSnapshot(profile, candidate.node, priorOwner);
-          prior = candidate;
+          if (priorOwner.generation === owner.generation) prior = candidate;
         } catch {
           prior = undefined;
         }
@@ -633,7 +633,7 @@ function assertOwnerSnapshot(profile: MobileConnectionProfile, node: NodeIdentit
 }
 
 function assertDetailSnapshot(owner: Snapshot, sessionId: string, detail: Snapshot): void {
-  if (!detail.snapshotId || detail.generation < 1n
+  if (!detail.snapshotId || detail.generation < 1n || detail.generation !== owner.generation
     || detail.scope?.kind.case !== "session" || detail.scope.kind.value.sessionId !== sessionId
     || detail.scope.kind.value.recentTimelineItems < 1
     || detail.server?.serverId !== owner.server?.serverId

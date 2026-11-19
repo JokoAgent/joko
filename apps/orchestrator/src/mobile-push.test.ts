@@ -22,6 +22,39 @@ afterEach(async () => {
 });
 
 describe("mobile push Orchestrator boundary", () => {
+  it("restores the original authorized registration after a terminal APNs rejection without replaying the failed notice", async () => {
+    const fixture = await createFixture();
+    const sends: MobilePushDeliveryInput[] = [];
+    const coordinator = new MobilePushCoordinator({ store: fixture.store, vault: fixture.vault, serverId: "server-1", now: () => 1_000,
+      provider: { send: async input => {
+        sends.push(input);
+        return sends.length === 1 ? { outcome: "invalid_registration", code: "APNS_TOKEN_TOPIC" }
+          : { outcome: "delivered", code: "APNS_200" };
+      } } });
+    cleanups.push(() => coordinator.close());
+    const registration = { connectionId: fixture.connection.id, deviceId: fixture.connection.deviceId,
+      expectedDeviceRevision: fixture.deviceRevision, environment: "apns_sandbox" as const, locale: "en" as const,
+      deviceToken: "retained-device-token", registrationId: "retained-registration", revocationSecret: "r".repeat(43) };
+    const complete = (id: string) => {
+      fixture.store.createRun({ id, sessionId: "session-1", source: "user", state: "running", createdAt: 1_000 });
+      fixture.store.updateRunState({ runId: id, state: "completed", traceId: id });
+    };
+    coordinator.register(registration);
+    coordinator.start();
+    complete("original-failed-notice");
+    await vi.waitFor(() => expect(fixture.store.findMobilePushRegistration(registration.registrationId)).toBeUndefined());
+    expect(fixture.store.listMobilePushDeliveries()).toHaveLength(0);
+
+    const restored = coordinator.register(registration);
+    expect(restored.registration.id).toBe(registration.registrationId);
+    expect(restored.revocationSecret).toBe(registration.revocationSecret);
+    expect(fixture.store.listMobilePushDeliveries()).toHaveLength(0);
+    complete("new-notice-after-repair");
+    await vi.waitFor(() => expect(fixture.store.listMobilePushDeliveries()[0]?.status).toBe("delivered"));
+    expect(sends).toHaveLength(2);
+    expect(sends[1]?.intent).toBe("joko://task/session-1?server=server-1");
+  });
+
   it("persists and deduplicates settled group steps through the original worker with a group intent", async () => {
     const fixture = await createFixture(), sends: MobilePushDeliveryInput[] = [];
     const coordinator = new MobilePushCoordinator({ store: fixture.store, vault: fixture.vault, serverId: "server-1", now: () => 1_000,
@@ -117,7 +150,7 @@ describe("mobile push Orchestrator boundary", () => {
       token: "raw-device-token-current",
       locale: "ja",
       kind: "done",
-      intent: "joko://task/session-1?message=assistant-message&event=assistant-message"
+      intent: "joko://task/session-1?message=assistant-message&event=assistant-message&server=server-1"
     });
     expect(JSON.stringify(sends[0])).not.toContain("Private task response content");
 
