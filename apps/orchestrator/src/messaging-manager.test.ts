@@ -2663,8 +2663,11 @@ describe("MessagingManager", () => {
     expect(transports.reduce((sum, transport) => sum + transport.attachmentAttempts, 0)).toBe(1);
   });
 
-  it("projects an open permission to a durable Telegram card and resolves its owner callback once", async () => {
-    const transport = new InteractiveTelegramTransport();
+  it.each([
+    ["allow_once", "Allowed once."],
+    ["deny_once", "Denied."]
+  ] as const)("records %s on the original Telegram permission card and resolves its owner callback once", async (decision, outcome) => {
+    const transport = new InteractiveTelegramTransport(decision);
     const adapter = new PermissionFakeAdapter();
     const fixture = await createFixture(() => transport, () => adapter);
     fixture.manager.putRoute({
@@ -2679,7 +2682,7 @@ describe("MessagingManager", () => {
     });
     await replaceCredential(fixture, created, "interaction", true);
 
-    await vi.waitFor(() => expect(adapter.decision).toEqual({ kind: "selected", value: "allow_once" }));
+    await vi.waitFor(() => expect(adapter.decision).toEqual({ kind: "selected", value: decision }));
     expect(transport.sentInteractionCards).toHaveLength(1);
     expect(transport.sentInteractionCards[0]).toMatchObject({
       text: expect.stringContaining("Run command"),
@@ -2695,7 +2698,7 @@ describe("MessagingManager", () => {
     const coreInteraction = fixture.store.getInteraction("permission-one");
     expect(coreInteraction).toMatchObject({
       status: "resolved",
-      decision: { kind: "selected", value: "allow_once" }
+      decision: { kind: "selected", value: decision }
     });
     expect(fixture.store.listMessagingDeliveries().find((delivery) => delivery.kind === "interaction"))
       .toMatchObject({ status: "sent", providerMessageId: "card-1" });
@@ -2704,7 +2707,8 @@ describe("MessagingManager", () => {
       expect.objectContaining({ status: "failed", providerInteractionId: "callback-two", outcomeCode: "stale_action" })
     ]));
     await vi.waitFor(() => expect(transport.clearedInteractionCards).toEqual([
-      { address: expect.objectContaining({ providerConversationId: "42" }), messageId: "card-1" }
+      { address: expect.objectContaining({ providerConversationId: "42" }), messageId: "card-1",
+        text: `${transport.sentInteractionCards[0]!.text}\n\n${outcome}` }
     ]));
     expect(fixture.store.listMessagingDeliveries().filter((delivery) => delivery.kind === "interaction"))
       .toHaveLength(2);
@@ -3282,7 +3286,7 @@ class FakeTelegramTransport {
     readonly text: string;
     readonly buttons: readonly { readonly label: string; readonly actionValue: string }[];
   }> = [];
-  readonly clearedInteractionCards: Array<{ readonly address: MessagingAddress; readonly messageId: string }> = [];
+  readonly clearedInteractionCards: Array<{ readonly address: MessagingAddress; readonly messageId: string; readonly text?: string }> = [];
   readonly interactionAnswers: Array<{ readonly text: string; readonly showAlert: boolean }> = [];
   readonly typing: MessagingAddress[] = [];
   readonly reactions: Array<{ readonly messageId: string; readonly emoji: string | null }> = [];
@@ -3381,8 +3385,9 @@ class FakeTelegramTransport {
     return { providerMessageId: `card-${this.sentInteractionCards.length}`, address: input.address };
   }
 
-  async clearInteractionCard(input: { readonly address: MessagingAddress; readonly messageId: string }) {
-    this.clearedInteractionCards.push({ address: input.address, messageId: input.messageId });
+  async clearInteractionCard(input: { readonly address: MessagingAddress; readonly messageId: string; readonly text?: string }) {
+    this.clearedInteractionCards.push({ address: input.address, messageId: input.messageId,
+      ...(input.text === undefined ? {} : { text: input.text }) });
     return { providerMessageId: input.messageId, address: input.address };
   }
 
@@ -4654,7 +4659,7 @@ class InteractiveTelegramTransport extends FakeTelegramTransport {
   #releaseInteractionPoll: (() => void) | undefined;
   #releaseStalePoll: (() => void) | undefined;
 
-  constructor() {
+  constructor(private readonly decision: "allow_once" | "deny_once" = "allow_once") {
     super(directMessageBatch());
   }
 
@@ -4713,7 +4718,7 @@ class InteractiveTelegramTransport extends FakeTelegramTransport {
             isBot: false,
             isOwner: true
           },
-          actionValue: card.buttons[0]!.actionValue,
+          actionValue: card.buttons.find(button => button.label === this.decision)!.actionValue,
           occurredAt: Date.now()
         }],
         groupObservations: [],
@@ -4734,7 +4739,7 @@ class InteractiveTelegramTransport extends FakeTelegramTransport {
     return receipt;
   }
 
-  override async clearInteractionCard(input: { readonly address: MessagingAddress; readonly messageId: string }) {
+  override async clearInteractionCard(input: { readonly address: MessagingAddress; readonly messageId: string; readonly text?: string }) {
     const receipt = await super.clearInteractionCard(input);
     this.#releaseStalePoll?.();
     this.#releaseStalePoll = undefined;

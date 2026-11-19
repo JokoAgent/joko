@@ -344,11 +344,19 @@ export class DiscordTransport {
   async clearInteractionCard(input: {
     readonly address: MessagingAddress;
     readonly messageId: string;
+    readonly text?: string;
     readonly signal?: AbortSignal;
   }): Promise<MessagingSendReceipt> {
     const channelId = this.#assertAddress(input.address);
     const messageId = discordSnowflake(input.messageId, "message identifier");
-    const edited = await this.#api.editMessage(channelId, messageId, { components: [] }, input.signal);
+    const text = input.text?.trim();
+    if (text !== undefined && (text.length < 1 || text.length > 4_096)) {
+      throw invalidInput("Discord interaction edit text exceeds its single-card limit.");
+    }
+    const edited = await this.#api.editMessage(channelId, messageId, {
+      components: [],
+      ...(text === undefined ? {} : { embeds: [{ description: text }], allowed_mentions: { parse: [] } })
+    }, input.signal);
     const receipt = receiptOf(edited, input.address);
     if (receipt.providerMessageId !== messageId) throw malformed("Discord edited a different interaction message.");
     return receipt;

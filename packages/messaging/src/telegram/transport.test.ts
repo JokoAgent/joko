@@ -180,6 +180,12 @@ describe("TelegramTransport", () => {
         reply_markup: { inline_keyboard: [] }
       }
     });
+    await expect(transport.clearInteractionCard({ address, messageId: "88", text: "Allow this tool?\n\nAllowed once." }))
+      .resolves.toEqual({ providerMessageId: "88", address });
+    expect(calls.at(-1)).toEqual({
+      method: "editMessageText",
+      body: { chat_id: -100, message_id: 88, text: "Allow this tool?\n\nAllowed once.", reply_markup: { inline_keyboard: [] } }
+    });
   });
 
   it("uploads one document or one native image album per externally uncertain effect", async () => {
