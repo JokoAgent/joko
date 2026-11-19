@@ -170,6 +170,20 @@ type JokoDesktopRevealArtifactSourceResult =
   | { readonly status: "revealed" | "cancelled" | "unknown" | "unavailable" }
   | { readonly status: "failed"; readonly reason: "capacity" | "reveal" };
 
+interface JokoDesktopWorkspaceFileSourceRequest {
+  readonly requestId: string;
+  readonly profileId: string;
+  readonly serverId: string;
+  readonly workspaceId: string;
+  readonly path: string;
+  readonly revision: string;
+  readonly action: "open" | "reveal";
+}
+
+interface JokoDesktopWorkspaceFileSourceResult {
+  readonly status: "opened" | "revealed" | "cancelled" | "unavailable" | "failed";
+}
+
 interface JokoDesktopAutoRelaunchSettings {
   readonly autoRelaunchOnIdle: boolean;
   readonly isCustomized: boolean;
@@ -237,6 +251,7 @@ type JokoDesktopCapability =
   | "files.draftThumbnail"
   | "files.openWith"
   | "files.revealSource"
+  | "files.openWorkspaceSource"
   | "hardware.dedicatedInput"
   | "hardware.nativeGamepad"
   | "app.info"
@@ -698,6 +713,8 @@ interface JokoDesktopApi {
     readonly artifactId: string;
   }): Promise<JokoDesktopRevealArtifactSourceResult>;
   cancelArtifactSourceReveal(requestId: string): Promise<void>;
+  openWorkspaceFileSource?(request: JokoDesktopWorkspaceFileSourceRequest): Promise<JokoDesktopWorkspaceFileSourceResult>;
+  cancelWorkspaceFileSource?(requestId: string): Promise<void>;
   readonly discovery: {
     scan(): Promise<readonly JokoDesktopDiscoveredNode[]>;
   };

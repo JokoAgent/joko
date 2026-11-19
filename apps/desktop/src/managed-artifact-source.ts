@@ -1,15 +1,13 @@
 import { createClient, type Interceptor, type Transport } from "@connectrpc/connect";
 import { createConnectTransport, normalizeEndpointPublicKey, requireEndpointTrust } from "@joko/connection-transport/node";
-import { ArtifactService, ConnectionService } from "@joko/contracts";
+import { ArtifactService, ConnectionService, WorkspaceService } from "@joko/contracts";
 import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
 import { isAbsolute, resolve } from "node:path";
 
 import type { DesktopManagedOrchestratorConnection } from "./channels.js";
 
-export interface ManagedArtifactSourceResolverOptions {
+interface ManagedFileSourceAuthority {
   readonly connection: DesktopManagedOrchestratorConnection;
-  readonly sessionId: string;
-  readonly artifactId: string;
   readonly signal: AbortSignal;
   readonly readAuthKey: (profileId: string) => Promise<string | undefined>;
   readonly readDesktopHostAuthKey: () => string;
@@ -21,8 +19,35 @@ export interface ManagedArtifactSourceResolverOptions {
   ) => Transport;
 }
 
+export interface ManagedArtifactSourceResolverOptions extends ManagedFileSourceAuthority {
+  readonly sessionId: string;
+  readonly artifactId: string;
+}
+
+export interface ManagedWorkspaceFileSourceResolverOptions extends ManagedFileSourceAuthority {
+  readonly workspaceId: string;
+  readonly path: string;
+  readonly revision: string;
+}
+
 /** Resolve a private path only after anonymous server identity and exact managed authority fences. */
 export async function resolveManagedArtifactSource(options: ManagedArtifactSourceResolverOptions): Promise<string> {
+  const response = await withManagedFileSourceAuthority(options, transport => createClient(ArtifactService, transport)
+    .resolveArtifactSource({ sessionId: options.sessionId, artifactId: options.artifactId }, { signal: options.signal }));
+  return exactAbsolutePath(response.absolutePath);
+}
+
+export async function resolveManagedWorkspaceFileSource(options: ManagedWorkspaceFileSourceResolverOptions):
+  Promise<{ readonly path: string; readonly metadataRevision: string }> {
+  const response = await withManagedFileSourceAuthority(options, transport => createClient(WorkspaceService, transport)
+    .resolveWorkspaceFileSource({ workspaceId: options.workspaceId, relativePath: options.path,
+      expectedRevision: { opaqueRevision: options.revision } }, { signal: options.signal }));
+  const metadataRevision = response.verifiedMetadataRevision?.opaqueRevision;
+  if (!metadataRevision?.startsWith("meta:") || metadataRevision.length > 320) throw unavailable();
+  return { path: exactAbsolutePath(response.absolutePath), metadataRevision };
+}
+
+async function withManagedFileSourceAuthority<T>(options: ManagedFileSourceAuthority, read: (transport: Transport) => Promise<T>): Promise<T> {
   const origin = new URL(options.connection.origin).origin;
   if (origin !== options.connection.origin || options.signal.aborted) throw unavailable();
   const endpointPublicKey = options.connection.endpointPublicKey === undefined ? requireEndpointTrust({ origin }) : normalizeEndpointPublicKey(options.connection.endpointPublicKey);
@@ -35,14 +60,14 @@ export async function resolveManagedArtifactSource(options: ManagedArtifactSourc
   const desktopHostAuthKey = options.readDesktopHostAuthKey();
   if (!validKey(authKey) || !validKey(desktopHostAuthKey) ||
     !await options.isAuthorityCurrent(options.connection)) throw unavailable();
-  const response = await createClient(
-    ArtifactService,
-    transportFactory(origin, authKey, desktopHostAuthKey)
-  ).resolveArtifactSource({ sessionId: options.sessionId, artifactId: options.artifactId }, { signal: options.signal });
-  if (!await options.isAuthorityCurrent(options.connection) || options.signal.aborted ||
-    !isAbsolute(response.absolutePath) || resolve(response.absolutePath) !== response.absolutePath ||
-    response.absolutePath.length > 32_768 || response.absolutePath.includes("\0")) throw unavailable();
-  return response.absolutePath;
+  const response = await read(transportFactory(origin, authKey, desktopHostAuthKey));
+  if (!await options.isAuthorityCurrent(options.connection) || options.signal.aborted) throw unavailable();
+  return response;
+}
+
+function exactAbsolutePath(path: string): string {
+  if (!isAbsolute(path) || resolve(path) !== path || path.length > 32_768 || path.includes("\0")) throw unavailable();
+  return path;
 }
 
 function createManagedArtifactSourceTransport(
@@ -74,5 +99,5 @@ function validKey(value: string | undefined): value is string {
 }
 
 function unavailable(): Error {
-  return new Error("Managed Artifact source authority is unavailable.");
+  return new Error("Managed file source authority is unavailable.");
 }

@@ -50,6 +50,12 @@ export function nativeArtifactSourceRevealAvailable(): boolean {
   return typeof window !== "undefined" && window.jokoDesktop?.capabilities.includes("files.revealSource") === true;
 }
 
+export function nativeWorkspaceFileSourceAvailable(desktop: Window["jokoDesktop"]): desktop is NonNullable<Window["jokoDesktop"]>
+  & Required<Pick<NonNullable<Window["jokoDesktop"]>, "openWorkspaceFileSource" | "cancelWorkspaceFileSource">> {
+  return desktop?.capabilities.includes("files.openWorkspaceSource") === true &&
+    typeof desktop.openWorkspaceFileSource === "function" && typeof desktop.cancelWorkspaceFileSource === "function";
+}
+
 /** Capture the trusted host before asynchronous retrieval, independently of the view Document. */
 export function captureNativeFileCopy(): Pick<NonNullable<Window["jokoDesktop"]>, "copyFile" | "cancelFileCopy"> | undefined {
   if (!nativeFileCopyAvailable()) return undefined;
@@ -252,6 +258,27 @@ export async function revealNativeArtifactSource(
       return await host.revealArtifactSource({ requestId, profileId, serverId, sessionId, artifactId });
     } catch {
       return { status: "unknown" };
+    }
+  } finally {
+    context.signal.removeEventListener("abort", cancel);
+  }
+}
+
+export async function openNativeWorkspaceFileSource(
+  input: Omit<JokoDesktopWorkspaceFileSourceRequest, "requestId">,
+  context: BrowserActionContext
+): Promise<void> {
+  assertBrowserActionCurrent(context);
+  const desktop = context.ownerDocument.defaultView?.jokoDesktop;
+  if (!nativeWorkspaceFileSourceAvailable(desktop)) throw new Error("Original Workspace PDF actions are unavailable.");
+  const requestId = nextNativeFileActionId(context.ownerDocument);
+  const cancel = (): void => { void desktop.cancelWorkspaceFileSource(requestId).catch(() => undefined); };
+  context.signal.addEventListener("abort", cancel, { once: true });
+  try {
+    assertBrowserActionCurrent(context);
+    const result = await desktop.openWorkspaceFileSource({ requestId, ...input });
+    if (result.status !== (input.action === "open" ? "opened" : "revealed")) {
+      throw new Error("The original Workspace PDF action failed.");
     }
   } finally {
     context.signal.removeEventListener("abort", cancel);

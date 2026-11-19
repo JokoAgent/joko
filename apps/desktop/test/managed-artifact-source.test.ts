@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import type { DesktopManagedOrchestratorConnection } from "../src/channels.js";
-import { resolveManagedArtifactSource } from "../src/managed-artifact-source.js";
+import { resolveManagedArtifactSource, resolveManagedWorkspaceFileSource } from "../src/managed-artifact-source.js";
 
 const CONNECTION: DesktopManagedOrchestratorConnection = {
   profileId: "managed-local",
@@ -98,9 +98,40 @@ describe("managed Artifact source resolver", () => {
   });
 });
 
+it("rechecks managed authority before returning the exact verified Workspace PDF source", async () => {
+  const calls: string[] = [];
+  const path = resolve("manual.pdf");
+  const factory = vi.fn(() => fakeTransport(CONNECTION.serverId, path, calls));
+  const options = {
+    connection: CONNECTION,
+    workspaceId: "workspace",
+    path: "docs/manual.pdf",
+    revision: "preview-revision",
+    signal: new AbortController().signal,
+    readAuthKey: async () => AUTH_KEY,
+    readDesktopHostAuthKey: () => HOST_KEY,
+    transportFactory: factory
+  };
+  await expect(resolveManagedWorkspaceFileSource({ ...options, isAuthorityCurrent: () => true }))
+    .resolves.toEqual({ path, metadataRevision: "meta:verified" });
+  expect(factory).toHaveBeenNthCalledWith(1, CONNECTION.origin, undefined, undefined);
+  expect(factory).toHaveBeenNthCalledWith(2, CONNECTION.origin, AUTH_KEY, HOST_KEY);
+  expect(calls).toEqual(["getServerInfo", "resolveWorkspaceFileSource:workspace:docs/manual.pdf:preview-revision"]);
+
+  const superseded = vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(true).mockReturnValueOnce(false);
+  await expect(resolveManagedWorkspaceFileSource({ ...options, isAuthorityCurrent: superseded })).rejects.toThrow("authority is unavailable");
+  expect(superseded).toHaveBeenCalledTimes(3);
+});
+
 function fakeTransport(serverId: string, absolutePath: string, calls: string[]): Transport {
   return {
     unary: vi.fn(async (method: any, _signal: AbortSignal, _timeoutMs: number | undefined, _header: Headers, input: any) => {
+      if (method.localName === "resolveWorkspaceFileSource") {
+        calls.push(`${method.localName}:${input.workspaceId}:${input.relativePath}:${input.expectedRevision?.opaqueRevision}`);
+        const message = { $typeName: "joko.v1.ResolveWorkspaceFileSourceResponse", absolutePath,
+          verifiedMetadataRevision: { $typeName: "joko.v1.FileRevision", opaqueRevision: "meta:verified" } };
+        return { stream: false, service: method.parent, method, header: new Headers(), trailer: new Headers(), message };
+      }
       if (method.localName === "getServerInfo") calls.push("getServerInfo");
       else calls.push(`${method.localName}:${input.sessionId}:${input.artifactId}`);
       const message = method.localName === "getServerInfo"

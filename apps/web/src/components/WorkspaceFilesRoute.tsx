@@ -946,6 +946,9 @@ export function WorkspaceFilesRoute({
                   loading={selectedPreviewState?.loading ?? selectedPath !== undefined}
                   error={selectedPreviewState?.error}
                   canWrite={canWrite && selectedPreviewState?.preview !== undefined && selectedPreviewState.cached !== true}
+                  canOpenLocalPdfSource={profile?.managedLocal === true && workspace.trusted &&
+                    workspace.remoteWorkspace === undefined && target.remoteWorkspace === undefined &&
+                    selectedPreviewState?.preview !== undefined && selectedPreviewState.cached !== true}
                   reconnectDraft={reconnectDraft}
                   search={route.search}
                   line={route.line}

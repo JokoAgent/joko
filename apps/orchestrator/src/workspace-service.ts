@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import type { Stats } from "node:fs";
 import { type FileHandle, lstat, mkdir, open, readdir, readFile, realpath, rename, rm, stat, unlink } from "node:fs/promises";
 import { dirname, extname, isAbsolute, relative, resolve, sep } from "node:path";
-import { reviewImageRasterMimeByExtension, workspaceEntryAbsentRevision } from "@joko/contracts";
+import { WORKSPACE_PDF_PREVIEW_MAXIMUM_BYTES, reviewImageRasterMimeByExtension, workspaceEntryAbsentRevision, workspaceFileMetadataRevision as metadataFileRevision } from "@joko/contracts";
 import { JokoError, type RemoteWorkspaceBinding } from "@joko/core";
 import { isWithin } from "@joko/core/policy";
 import createIgnore from "ignore";
@@ -32,7 +32,7 @@ import {
 
 export const WORKSPACE_TEXT_FILE_MAXIMUM_BYTES = 2 * 1024 * 1024;
 export const WORKSPACE_RASTER_PREVIEW_MAXIMUM_BYTES = 16 * 1024 * 1024;
-export const WORKSPACE_PDF_PREVIEW_MAXIMUM_BYTES = 32 * 1024 * 1024;
+export { WORKSPACE_PDF_PREVIEW_MAXIMUM_BYTES };
 export const WORKSPACE_MEDIA_PREVIEW_TOTAL_MAXIMUM_BYTES = 32 * 1024 * 1024;
 export const WORKSPACE_GIT_IMAGE_MAXIMUM_BYTES = 4 * 1024 * 1024;
 export const WORKSPACE_GIT_COMMIT_MESSAGE_MAXIMUM_BYTES = 64 * 1024;
@@ -703,6 +703,29 @@ export class WorkspaceService {
       assertCurrent(); currentSignal?.throwIfAborted();
       return result;
     } };
+  }
+
+  async resolveLocalPdfSource(workspaceId: string, path: string, expectedRevision: string, request: WorkspaceFileRequestAuthority):
+  Promise<{ readonly absolutePath: string; readonly metadataRevision: string }> {
+    request.assertCurrent();
+    const workspace = this.requireWorkspace(workspaceId);
+    if (workspace.remote !== undefined || !workspace.trusted || inferMediaType(path) !== "application/pdf") {
+      throw new WorkspaceFilePreviewError("The original file must be a PDF in a trusted local project.", "unsupported");
+    }
+    const preview = await this.preview(workspaceId, path, WORKSPACE_PDF_PREVIEW_MAXIMUM_BYTES, WORKSPACE_PDF_PREVIEW_MAXIMUM_BYTES, request);
+    if (preview.observedRevision === undefined || preview.entry.revision !== expectedRevision) {
+      throw new WorkspaceFilePreviewError("Workspace file revision changed before opening the original.", "stale");
+    }
+    if (preview.bytes?.toString("latin1", 0, 5) !== "%PDF-") {
+      throw new WorkspaceFilePreviewError("The original is not an available complete PDF preview.", "unsupported");
+    }
+    const original = await this.#resolveWorkspacePreviewFile(workspace, path);
+    const metadataRevision = metadataFileRevision(original.info);
+    request.assertCurrent();
+    if (this.requireWorkspace(workspaceId) !== workspace || metadataRevision !== preview.observedRevision) {
+      throw new WorkspaceFilePreviewError("Workspace file changed before opening the original.", "stale");
+    }
+    return { absolutePath: original.absolute, metadataRevision };
   }
 
   async preview(workspaceId: string, path: string, maximumBytes = 2 * 1024 * 1024, maximumFileBytes?: number,
@@ -3915,10 +3938,6 @@ function workspaceFileEntry(path: string, info: Stats, revision: string): Worksp
     revision,
     generated: isGeneratedPath(path)
   };
-}
-
-function metadataFileRevision(info: Stats): string {
-  return `meta:${info.dev}:${info.ino}:${info.mode}:${info.nlink}:${info.size}:${info.mtimeMs}:${info.ctimeMs}`;
 }
 
 function workspaceFileContentRevision(content: Uint8Array): string {

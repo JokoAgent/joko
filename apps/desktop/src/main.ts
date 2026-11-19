@@ -431,12 +431,13 @@ import {
   type DesktopOpenWithDocumentOwner
 } from "./desktop-open-with-document.js";
 import { NativeArtifactSourceRevealer } from "./native-artifact-source-revealer.js";
+import { NativeWorkspaceFileSource } from "./native-workspace-file-source.js";
 import { DesktopPersonalDevelopmentHost } from "./personal-development-native-host.js";
 import { DesktopInputHandoffHost } from "./input-handoff-native-host.js";
 import { DesktopVoiceConversationHost } from "./voice-conversation-host.js";
 import { DesktopPersonalDevelopmentVersions } from "./personal-development-native-versions.js";
 import { personalVersionProfileOverride } from "./personal-development-version-bootstrap.js";
-import { resolveManagedArtifactSource } from "./managed-artifact-source.js";
+import { resolveManagedArtifactSource, resolveManagedWorkspaceFileSource } from "./managed-artifact-source.js";
 import { bundledElectronUpdater, createElectronUpdateDriver } from "./electron-update-driver.js";
 import {
   createDesktopUpdateAutoRelaunchPolicy,
@@ -1011,6 +1012,7 @@ const MAXIMUM_NATIVE_FILE_BYTES = 256 * 1024 * 1024;
 let nativeFileClipboard: NativeFileClipboard | undefined;
 let nativeFileOpener: NativeFileOpener | undefined;
 let nativeArtifactSourceRevealer: NativeArtifactSourceRevealer | undefined;
+let nativeWorkspaceFileSource: NativeWorkspaceFileSource | undefined;
 let windowsOpenWithApps: WindowsOpenWithApps | undefined;
 const nativeFileActionScopes = new WeakMap<WebContents, NativeFileActionScope>();
 const portableSessionSave = new PortableSessionSave();
@@ -1103,6 +1105,7 @@ if (!app.requestSingleInstanceLock()) {
     nativeFileOpener?.cancelPending();
     windowsOpenWithApps?.cancelPending();
     nativeArtifactSourceRevealer?.cancelPending();
+    nativeWorkspaceFileSource?.cancelPending();
     mainWindowCloseController?.cancelPending();
     quitting = true;
     desktopRemoteDesktopViewerPrewarm.cancel();
@@ -1174,6 +1177,7 @@ if (!app.requestSingleInstanceLock()) {
     nativeFileOpener?.dispose();
     windowsOpenWithApps?.dispose();
     nativeArtifactSourceRevealer?.dispose();
+    nativeWorkspaceFileSource?.dispose();
     globalVoiceShortcutRecovery.dispose();
     unregisterGlobalVoiceShortcut();
     stopGlobalVoiceShortcutCapture();
@@ -9856,30 +9860,11 @@ function registerIpc(): void {
     assertTrustedIpcSender(event);
     if (parameters.length !== 1) throw new TypeError("Artifact source reveal requires one request object.");
     nativeArtifactSourceRevealer ??= new NativeArtifactSourceRevealer({
-      resolvePath: async (request, signal) => {
-        const runtime = managedOrchestratorRuntime;
-        const connection = managedOrchestratorConnection;
-        if (runtime === undefined || connection === undefined || managedOrchestratorStatus.state !== "ready" ||
-          request.profileId !== connection.profileId || request.serverId !== connection.serverId ||
-          !sameManagedOrchestratorConnection(runtime.connection, connection) ||
-          managedOrchestratorExitFence.shutdownStarted) {
-          throw new Error("Managed Artifact source authority is unavailable.");
-        }
-        return resolveManagedArtifactSource({
-          connection,
-          sessionId: request.sessionId,
-          artifactId: request.artifactId,
-          signal,
-          readAuthKey: readCredential,
-          readDesktopHostAuthKey: runtime.readDesktopHostAuthKey,
-          isAuthorityCurrent: (candidate) => managedOrchestratorStatus.state === "ready" &&
-            managedOrchestratorRuntime === runtime && managedOrchestratorConnection === connection &&
-            !managedOrchestratorExitFence.shutdownStarted &&
-            sameManagedOrchestratorConnection(managedOrchestratorStatus.connection, candidate) &&
-            sameManagedOrchestratorConnection(connection, candidate) &&
-            sameManagedOrchestratorConnection(runtime.connection, candidate)
-        });
-      },
+      resolvePath: async (request, signal) => resolveManagedArtifactSource({
+        ...managedNativeFileSourceAuthority(request.profileId, request.serverId, signal),
+        sessionId: request.sessionId,
+        artifactId: request.artifactId
+      }),
       revealPath: (path) => shell.showItemInFolder(path)
     });
     return nativeArtifactSourceRevealer.reveal(parameters[0], nativeFileActionScope(event));
@@ -9891,6 +9876,32 @@ function registerIpc(): void {
     }
     const scope = nativeFileActionScopes.get(event.sender);
     if (scope !== undefined) nativeArtifactSourceRevealer?.cancel(parameters[0], scope.id);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.openWorkspaceFileSource, (event, ...parameters: unknown[]) => {
+    const owner = assertFocusedTrustedIpcSender(event);
+    if (parameters.length !== 1) throw new TypeError("An original Workspace PDF action requires one request object.");
+    nativeWorkspaceFileSource ??= new NativeWorkspaceFileSource({
+      resolveSource: async (request, signal) => {
+        const authority = managedNativeFileSourceAuthority(request.profileId, request.serverId, signal);
+        const source = await resolveManagedWorkspaceFileSource({
+          ...authority,
+          workspaceId: request.workspaceId,
+          path: request.path,
+          revision: request.revision
+        });
+        return { ...source, isCurrent: () => authority.isAuthorityCurrent(authority.connection) };
+      },
+      openPath: (path) => shell.openPath(path)
+    });
+    return nativeWorkspaceFileSource.execute(parameters[0], nativeFileActionScope(event), () => !owner.isDestroyed() && owner.isFocused());
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.cancelWorkspaceFileSource, (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 1 || typeof parameters[0] !== "string") {
+      throw new TypeError("Workspace PDF action cancellation requires one identity.");
+    }
+    const scope = nativeFileActionScopes.get(event.sender);
+    if (scope !== undefined) nativeWorkspaceFileSource?.cancel(parameters[0], scope.id);
   });
   ipcMain.handle(DESKTOP_CHANNELS.discoveryScan, async (event) => {
     assertTrustedIpcSender(event);
@@ -11386,6 +11397,28 @@ function sameWindowsPath(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
 }
 
+function managedNativeFileSourceAuthority(profileId: string, serverId: string, signal: AbortSignal) {
+  const runtime = managedOrchestratorRuntime;
+  const connection = managedOrchestratorConnection;
+  if (runtime === undefined || connection === undefined || managedOrchestratorStatus.state !== "ready" ||
+    profileId !== connection.profileId || serverId !== connection.serverId ||
+    !sameManagedOrchestratorConnection(runtime.connection, connection) || managedOrchestratorExitFence.shutdownStarted) {
+    throw new Error("Managed file source authority is unavailable.");
+  }
+  return {
+    connection,
+    signal,
+    readAuthKey: readCredential,
+    readDesktopHostAuthKey: runtime.readDesktopHostAuthKey,
+    isAuthorityCurrent: (candidate: DesktopManagedOrchestratorConnection) => managedOrchestratorStatus.state === "ready" &&
+      managedOrchestratorRuntime === runtime && managedOrchestratorConnection === connection &&
+      !managedOrchestratorExitFence.shutdownStarted &&
+      sameManagedOrchestratorConnection(managedOrchestratorStatus.connection, candidate) &&
+      sameManagedOrchestratorConnection(connection, candidate) &&
+      sameManagedOrchestratorConnection(runtime.connection, candidate)
+  };
+}
+
 function nativeFileActionScope(event: IpcMainInvokeEvent): NativeFileActionScope {
   const contents = event.sender;
   const existing = nativeFileActionScopes.get(contents);
@@ -11402,6 +11435,7 @@ function nativeFileActionScope(event: IpcMainInvokeEvent): NativeFileActionScope
     nativeFileClipboard?.retireScope(scope.id);
     nativeFileOpener?.retireScope(scope.id);
     nativeArtifactSourceRevealer?.retireScope(scope.id);
+    nativeWorkspaceFileSource?.retireScope(scope.id);
     portableSessionSave.retire(scope);
     if (nativeFileActionScopes.get(contents) === scope) nativeFileActionScopes.delete(contents);
     contents.removeListener("did-start-navigation", navigate);

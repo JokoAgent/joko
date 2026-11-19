@@ -218,6 +218,7 @@ service WorkspaceService {
   // Lazy filename index (`rg --files --hidden`, 30k cap).
   rpc ListWorkspaceFiles(ListWorkspaceFilesRequest) returns (ListWorkspaceFilesResponse);
   rpc ReadWorkspaceFile(ReadWorkspaceFileRequest) returns (ReadWorkspaceFileResponse);
+  rpc ResolveWorkspaceFileSource(ResolveWorkspaceFileSourceRequest) returns (ResolveWorkspaceFileSourceResponse);
   rpc ReadWorkspaceHtmlSnapshot(ReadWorkspaceHtmlSnapshotRequest) returns (ReadWorkspaceHtmlSnapshotResponse);
   rpc WriteWorkspaceTextFile(WriteWorkspaceTextFileRequest) returns (WriteWorkspaceTextFileResponse);
   rpc SearchWorkspace(SearchWorkspaceRequest) returns (SearchWorkspaceResponse);
@@ -2010,6 +2011,18 @@ message ReadWorkspaceFileRequest {
 
 message ReadWorkspaceFileResponse {
   FilePreview preview = 1;
+}
+
+// Resolves the original local file for an explicit, authenticated Desktop gesture.
+message ResolveWorkspaceFileSourceRequest {
+  string workspace_id = 1;
+  string relative_path = 2;
+  FileRevision expected_revision = 3;
+}
+
+message ResolveWorkspaceFileSourceResponse {
+  string absolute_path = 1;
+  FileRevision verified_metadata_revision = 2;
 }
 
 message WriteWorkspaceTextFileRequest {

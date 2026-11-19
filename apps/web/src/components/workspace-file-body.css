@@ -388,5 +388,12 @@
 
 .workspace-file-body__file-icon svg { width: 32px; height: 32px; }
 .workspace-file-body--unsupported > div { display: grid; justify-items: center; gap: 6px; }
+.workspace-file-body--unsupported > .workspace-file-body__fallback-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
 .workspace-file-body--unsupported strong { font-size: var(--text-16); font-weight: 600; }
 .workspace-file-body--unsupported p { margin: 0; color: var(--text-faint); font-size: var(--text-13); }

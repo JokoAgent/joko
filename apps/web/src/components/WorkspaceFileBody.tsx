@@ -1,5 +1,6 @@
 import { ArtifactDownloadButton } from "./ArtifactDownloadButton.js";
-import { Download, File, FileCode2, FileImage, FileText, ImageOff, Maximize2 } from "lucide-react";
+import { WORKSPACE_PDF_PREVIEW_MAXIMUM_BYTES } from "@joko/contracts";
+import { Download, ExternalLink, File, FileCode2, FileImage, FileText, FolderOpen, ImageOff, Maximize2 } from "lucide-react";
 import {
   forwardRef,
   useCallback,
@@ -9,7 +10,8 @@ import {
   useMemo,
   useRef,
   useState,
-  type JSX
+  type JSX,
+  type ReactNode
 } from "react";
 
 import type { AppController } from "../controller.js";
@@ -19,6 +21,7 @@ import {
   type AppShortcutPlatform
 } from "../app-shortcuts.js";
 import { translate } from "../i18n.js";
+import { nativeWorkspaceFileSourceAvailable, openNativeWorkspaceFileSource } from "../native-file-actions.js";
 import type {
   ComposerFileSelectionQuoteDraft,
   ComposerSelectionQuoteDraft,
@@ -151,6 +154,7 @@ export interface WorkspaceFileBodyProps {
   readonly error?: string;
   /** Capability-driven workspace.files.write gate supplied by the route. */
   readonly canWrite: boolean;
+  readonly canOpenLocalPdfSource?: boolean;
   /** One-shot project-search command from the Files URL. */
   readonly search?: string | null;
   /** One-indexed line paired with the one-shot search command. */
@@ -193,6 +197,7 @@ const WorkspaceFileBodyContent = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
   loading = false,
   error,
   canWrite,
+  canOpenLocalPdfSource = false,
   search: jumpQuery,
   line: jumpLine,
   onSearchJumpConsumed,
@@ -689,7 +694,8 @@ const WorkspaceFileBodyContent = forwardRef<WorkspaceFileBodyHandle, WorkspaceFi
     return <AuthenticatedImagePreview key={imageOwnerKey} ownerKey={imageOwnerKey} controller={controller} preview={activePreview} labels={labels} onSendToChat={onImageToChat} className={className} />;
   }
   if (isPdfPath(path) || mediaType === "application/pdf") {
-    return <AuthenticatedPdfPreview controller={controller} preview={activePreview} labels={labels} className={className} />;
+    return <AuthenticatedPdfPreview controller={controller} workspaceId={workspaceId} preview={activePreview} labels={labels}
+      canOpenLocalPdfSource={canOpenLocalPdfSource} className={className} />;
   }
   if (isVideoPath(path) || mediaType.startsWith("video/")) {
     const ownerKey = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id, sessionId, workspaceId, path, activePreview.blobId]);
@@ -893,17 +899,20 @@ function AuthenticatedModelPreview({ controller, workspaceId, preview, labels, c
   </section>;
 }
 
-function AuthenticatedPdfPreview({ controller, preview, labels, className }: {
+function AuthenticatedPdfPreview({ controller, workspaceId, preview, labels, canOpenLocalPdfSource, className }: {
   readonly controller: WorkspaceFileBodyController;
+  readonly workspaceId: string;
   readonly preview: WorkspaceFilePreviewView;
   readonly labels: WorkspaceFileBodyLabels;
+  readonly canOpenLocalPdfSource: boolean;
   readonly className?: string;
 }): JSX.Element {
   const artifact = useAuthenticatedArtifactUrl(controller, preview.blobId);
   const scrollRoot = useRef<HTMLDivElement>(null);
   const [failedUrl, setFailedUrl] = useState<string>();
   if (artifact.status === "error" || (artifact.status === "ready" && failedUrl === artifact.url)) {
-    return <BinaryFilePlaceholder controller={controller} preview={preview} labels={labels} className={className} />;
+    return <BinaryFilePlaceholder controller={controller} preview={preview} labels={labels} className={className}
+      sourceActions={canOpenLocalPdfSource ? <LocalPdfSourceActions controller={controller} workspaceId={workspaceId} preview={preview} /> : undefined} />;
   }
   return <section className={cx("workspace-file-body workspace-file-body--pdf", className)} data-file-kind="pdf">
     <div ref={scrollRoot} className="workspace-file-body__pdf-stage">
@@ -923,18 +932,49 @@ function AuthenticatedPdfPreview({ controller, preview, labels, className }: {
   </section>;
 }
 
-function BinaryFilePlaceholder({ controller, preview, labels, className }: {
+function LocalPdfSourceActions({ controller, workspaceId, preview }: {
+  readonly controller: WorkspaceFileBodyController;
+  readonly workspaceId: string;
+  readonly preview: WorkspaceFilePreviewView;
+}): JSX.Element | null {
+  const { activeProfile, connectionGeneration, effectiveLocale } = controller.state;
+  if (!activeProfile?.managedLocal || preview.kind !== "blob" || !preview.revision || !isPdfPath(preview.path) ||
+    preview.byteSize === undefined || preview.byteSize > WORKSPACE_PDF_PREVIEW_MAXIMUM_BYTES ||
+    typeof window === "undefined" || !nativeWorkspaceFileSourceAvailable(window.jokoDesktop)) return null;
+  const source = { profileId: activeProfile.id, serverId: activeProfile.serverId, workspaceId, path: preview.path, revision: preview.revision };
+  const ownerKey = JSON.stringify([connectionGeneration, source]);
+  const openLabel = translate(effectiveLocale, "workspace.openPdfInSystem");
+  const revealLabel = translate(effectiveLocale, "workspace.openPdfContainingFolder");
+  return <>
+    <ArtifactDownloadButton ownerKey={ownerKey} connectionOwner={controller.getArtifactUrl} tone="secondary"
+      label={openLabel} errorLabel={translate(effectiveLocale, "media.fileOpenFailed")}
+      action={(context) => openNativeWorkspaceFileSource({ ...source, action: "open" }, context)}>
+      <ExternalLink aria-hidden="true" />{openLabel}
+    </ArtifactDownloadButton>
+    <ArtifactDownloadButton ownerKey={ownerKey} connectionOwner={controller.getArtifactUrl} tone="secondary"
+      label={revealLabel} errorLabel={translate(effectiveLocale, "media.sourceRevealFailed")}
+      action={(context) => openNativeWorkspaceFileSource({ ...source, action: "reveal" }, context)}>
+      <FolderOpen aria-hidden="true" />{revealLabel}
+    </ArtifactDownloadButton>
+  </>;
+}
+
+function BinaryFilePlaceholder({ controller, preview, labels, className, sourceActions }: {
   readonly controller: WorkspaceFileBodyController;
   readonly preview: WorkspaceFilePreviewView;
   readonly labels: WorkspaceFileBodyLabels;
   readonly className?: string;
+  readonly sourceActions?: ReactNode;
 }): JSX.Element {
   const iconKind = workspaceFilePlaceholderIconKind(preview.path);
   const Icon = iconKind === "markdown" ? FileText : iconKind === "code" ? FileCode2 : iconKind === "image" ? FileImage : File;
   return <section className={cx("workspace-file-body workspace-file-body--unsupported", className)} data-file-kind={preview.kind}>
     <span className="workspace-file-body__file-icon" aria-hidden="true"><Icon /></span>
     <div><strong>{preview.name}</strong><FileMeta preview={preview} locale={controller.state.effectiveLocale} includeName={false} fallbackType={labels.binary} /><p>{preview.summary || labels.unavailable}</p></div>
-    <DownloadAction controller={controller} preview={preview} labels={labels} />
+    <div className="workspace-file-body__fallback-actions">
+      <DownloadAction controller={controller} preview={preview} labels={labels} />
+      {sourceActions}
+    </div>
   </section>;
 }
 

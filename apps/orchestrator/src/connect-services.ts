@@ -3621,6 +3621,20 @@ export function createConnectServices(application: OrchestratorApplication, proj
       } catch (error) { owner.assertCurrent(); throw error; }
       finally { owner.dispose(); }
     },
+    resolveWorkspaceFileSource: async (request, context) => {
+      const connection = authenticate(context);
+      const hostAuthorization = context.requestHeader.get(DESKTOP_HOST_AUTHORIZATION_HEADER) ?? undefined;
+      requireDesktopHostAuthentication(dependencies, connection, hostAuthorization);
+      const revision = nonBlankRequest(request.expectedRevision?.opaqueRevision ?? "", "expected_revision");
+      const owner = captureWorkspaceFileRequest(dependencies.connections, connection, context.signal);
+      try {
+        const resolved = await dependencies.workspaceService.resolveLocalPdfSource(request.workspaceId, request.relativePath, revision, owner);
+        owner.assertCurrent();
+        requireDesktopHostAuthentication(dependencies, connection, hostAuthorization);
+        return { absolutePath: resolved.absolutePath, verifiedMetadataRevision: { opaqueRevision: resolved.metadataRevision } };
+      } catch (error) { owner.assertCurrent(); throw toConnectError(error); }
+      finally { owner.dispose(); }
+    },
     readWorkspaceHtmlSnapshot: async (request, context) => {
       const connection = authenticate(context);
       if (request.file === undefined) throw invalidArgument("An HTML workspace reference is required.");
