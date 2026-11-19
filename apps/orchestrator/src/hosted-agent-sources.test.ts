@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
-import { createClient, createRouterTransport } from "@connectrpc/connect";
+import { Code, createClient, createRouterTransport } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { createInProcessDevicePeerHarness, DEVICE_PEER_RUNTIME_EXECUTABLES, NodeDevicePeerAgentExecutor, type DevicePeerAgentOutcome, type InProcessDevicePeerHarness } from "@joko/device-peer";
 import { OperationalStore } from "@joko/store";
@@ -57,19 +57,30 @@ it("registers an untrusted Device project for a paired Source and runs only from
   store.setDeviceRemoteControlEnabled(target.deviceId, true);
   const opens: ReturnType<typeof decodeHostedAgentOpen>[] = [];
   const exchanges = new Map<string, HostedAgentExchange>();
+  let quotaReads = 0, holdQuota: Promise<void> | undefined;
   const virtualRoot = process.platform === "win32" ? "V:\\provider-private\\project" : "/provider-private/project";
   const native = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "recent.json"), nativeAgents: {
     invoke: async (method, bytes, signal) => {
       switch (method) {
         case contract.HostedAgentPeerMethod.GET_CATALOG:
           return toBinary(contract.GetHostedAgentCatalogResponseSchema, create(contract.GetHostedAgentCatalogResponseSchema, {
-            format: 1, remoteControlEnabled: true, backends: [{ backendId: "device-pi", nativeAdapterKind: "pi", instanceGeneration: 1n,
-              displayName: "Device Pi", version: "1", capabilities: ["input.text", "model.switch", "session.resume", "session.detach", "workspace.files"]
+            format: 1, remoteControlEnabled: true, backends: [{ backendId: "device-pi", nativeAdapterKind: "pi", instanceGeneration: 1n, nodeId: "provider-node",
+              displayName: "Device Pi", version: "1", capabilities: ["input.text", "model.switch", "session.resume", "session.detach", "workspace.files", "provider.account_usage"]
                 .map(name => ({ name, support: contract.CapabilitySupport.SUPPORTED })),
               providers: [{ providerId: "provider", displayName: "Provider", connected: true, remoteInvocationEnabled: true,
                 models: [{ backendId: "device-pi", key: { providerId: "provider", modelId: "model" }, displayName: "Model",
                   api: "openai-completions", contextWindowTokens: 32_768n, maximumOutputTokens: 1_024n, inputModalities: [contract.ModelInputModality.TEXT] }] }] }]
           }));
+        case contract.HostedAgentPeerMethod.GROUP_SCHEDULING_STATE: {
+          const request = fromBinary(contract.GetProviderSchedulingStateRequestSchema, bytes);
+          expect(request.key).toMatchObject({ backendId: "device-pi", providerId: "provider" });
+          quotaReads += 1;
+          await holdQuota;
+          return toBinary(contract.GetProviderSchedulingStateResponseSchema, create(contract.GetProviderSchedulingStateResponseSchema, {
+            accountUsage: { providerId: "provider", observedAt: { seconds: 100n, nanos: 0 },
+              buckets: [{ id: "model", primaryWindow: { usedPercent: 37, windowMinutes: 300 } }] }
+          }));
+        }
         case contract.HostedAgentPeerMethod.OPEN: {
           const request = fromBinary(contract.OpenHostedAgentRequestSchema, bytes);
           const opened = decodeHostedAgentOpen(request.openJson);
@@ -181,7 +192,11 @@ it("registers an untrusted Device project for a paired Source and runs only from
     const application = { config: { publicOrigin: "http://127.0.0.1", dataDirectory: root }, store, devicePeers: peers,
       sessionHost: host, workspaces, artifacts, artifactRepository, adapters: [host.currentAdapter(backend.id)!],
       connections: new ConnectionManager(store), hostedAgentSources: sources } as unknown as OrchestratorApplication;
-    const operations = createClient(contract.OperationService, createRouterTransport(router => registerConnectServices(router, application)));
+    const transport = createRouterTransport(router => registerConnectServices(router, application));
+    const operations = createClient(contract.OperationService, transport);
+    const providerClient = createClient(contract.BackendService, transport);
+    const usageRequest = { backendId: backend.id, providerId: "provider" };
+    const auth = { headers: { authorization: `Bearer ${authKey}` } };
     const submit = (operationId: string, payload: contract.OperationMutation["payload"], preconditions: contract.OperationMutation["preconditions"] = []) => operations.submitOperation({
       operationId, connectionId: controller.id, mutation: { payload, preconditions }
     }, { headers: { authorization: `Bearer ${authKey}` } });
@@ -219,6 +234,18 @@ it("registers an untrusted Device project for a paired Source and runs only from
     const sessionId = taskResult.value.sessionId;
     const before = store.getSession(sessionId).descriptor;
     expect(before.remoteWorkspace).toEqual(registered.remoteWorkspace);
+    const providerView = (await providerClient.getProvider(usageRequest, auth)).provider;
+    expect(providerView?.capabilities?.capabilities).toContainEqual(expect.objectContaining({
+      name: contract.capabilityNames.providerAccountUsage, support: contract.CapabilitySupport.SUPPORTED
+    }));
+    expect(providerView?.accountUsage).toBeUndefined();
+    expect(quotaReads).toBe(0);
+    await expect(providerClient.getProviderUsage(usageRequest)).rejects.toMatchObject({ code: Code.Unauthenticated });
+    expect(quotaReads).toBe(0);
+    await expect(providerClient.getProviderUsage(usageRequest, auth)).resolves.toMatchObject({
+      accountUsage: { providerId: "provider", buckets: [{ id: "model", primaryWindow: { usedPercent: 37, windowMinutes: 300 } }] }
+    });
+    expect(quotaReads).toBe(1);
     expect(opens).toHaveLength(1);
     expect(opens[0]).toMatchObject({ start: "create", sessionId, targetId, workspace: { contextFiles: [
       { path: "AGENTS.md", content: "Use the approved Device project." }
@@ -250,6 +277,15 @@ it("registers an untrusted Device project for a paired Source and runs only from
     expect(peers.listForCapabilities(controller, ["native_agents"]).map(device => device.targetDeviceId)).toEqual([provider.deviceId]);
     await expect(host.resume(sessionId)).rejects.toThrow();
     expect(opens).toHaveLength(2);
+    let releaseQuota!: () => void;
+    holdQuota = new Promise<void>(resolve => { releaseQuota = resolve; });
+    const lateQuota = providerClient.getProviderUsage(usageRequest, auth);
+    void lateQuota.catch(() => undefined);
+    try {
+      await vi.waitFor(() => expect(quotaReads).toBe(2));
+      store.setDeviceRemoteControlEnabled(provider.deviceId, false);
+    } finally { releaseQuota(); }
+    expect((await lateQuota).accountUsage).toBeUndefined();
     expect(processStarts).toEqual(Array<string>(4).fill(deviceRoot));
   } finally {
     await host.dispose(); await sources.close(); await peers.shutdown(); await workspaces.close(); store.close();

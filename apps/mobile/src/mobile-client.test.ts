@@ -53,7 +53,7 @@ import {
   ScheduleDeletionResultSchema, ScheduleRunCostAttribution, ScheduleRunHistorySchema, ScheduleRunOutcome, ScheduleRunPhase, ScheduleSchema,
   ScheduleSessionMode, ScheduleSource, ScheduleState, SchedulerRuntimeSnapshotSchema,
   SessionContextStateSchema, SessionDerivationKind, SessionDerivationOriginSchema, SessionMessageSearchSessionStatus, SessionSchema, SessionState, SnapshotSchema,
-  SessionWorktreeSchema, TargetState, TaskTagCatalogSchema, TaskTagColor, TaskTagDeletePreviewSchema, ToolCallOutputMode, WorkspaceKind, WorkspaceLocationSchema, capabilityNames, nativeSessionTreeWireFields
+  SessionWorktreeSchema, SnapshotInvalidationReason, TargetState, TaskTagCatalogSchema, TaskTagColor, TaskTagDeletePreviewSchema, ToolCallOutputMode, WorkspaceKind, WorkspaceLocationSchema, capabilityNames, nativeSessionTreeWireFields
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileClient, type MobileStorage, type PendingOperation } from "./mobile-client";
@@ -9401,6 +9401,47 @@ describe("mobile Home search and task mutations", () => {
     expect(app.state.owner?.sessions[0]?.archived).toBe(committed);
   });
 
+  it("keeps receiving its original deletion receipt when the Owner stream invalidates the task first", async () => {
+    const network = fakeNetwork();
+    let emit!: (event: Event) => void;
+    const stream = vi.fn<MobileNetwork["streamOwner"]>((_credential, _after, signal) => (async function* () {
+      const next = await new Promise<Event | undefined>(resolve => {
+        emit = resolve;
+        signal.addEventListener("abort", () => resolve(undefined), { once: true });
+      });
+      if (next && !signal.aborted) yield next;
+    })());
+    network.streamOwner = stream;
+    const saved = memoryStorage(credential);
+    const app = client(network, saved.storage);
+    await app.start();
+    const actualSubmit = network.submit;
+    let releaseReceipt!: () => void;
+    const transport = vi.fn<MobileNetwork["submit"]>(async (...args) => {
+      const committed = await actualSubmit(...args);
+      await new Promise<void>(resolve => { releaseReceipt = resolve; });
+      return committed;
+    });
+    network.submit = transport;
+    const deleting = app.deleteSession("session");
+    await vi.waitFor(() => expect(releaseReceipt).toBeTypeOf("function"));
+    const [, after, streamSignal] = stream.mock.calls[0]!;
+    expect(after).toBeDefined();
+    emit(create(EventSchema, { eventId: "owner-delete-invalidation", identity: { sessionId: "session" },
+      cursor: { opaqueToken: "cursor-after-delete", sequence: after!.sequence + 1n, generation: after!.generation },
+      payload: { kind: { case: "projectionInvalidated", value: {
+        scope: "owner", reason: SnapshotInvalidationReason.PROJECTION_REBUILT
+      } } } }));
+    await vi.waitFor(() => expect(streamSignal.aborted).toBe(true));
+    expect(transport.mock.calls[0]?.[3]?.aborted).toBe(false);
+    expect(app.state.selectedId).toBe("session");
+    vi.mocked(network.readOwner).mockRejectedValueOnce(new Error("post-receipt network loss"));
+    releaseReceipt();
+    await expect(deleting).resolves.toBe(true);
+    expect(app.state).toMatchObject({ status: "offline", selectedId: undefined, detail: undefined, pending: [] });
+    expect(app.state.owner?.sessions).toEqual([]);
+  });
+
   it("submits the current host task-tag operations and preserves exact deletion fences", async () => {
     const network = fakeNetwork();
     const saved = memoryStorage(credential);
@@ -12124,12 +12165,15 @@ describe("native current-task runtime controls", () => {
     expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({ payload: { case: "createSession", value: {
       backendId: "backend", targetId: "target", model: { model: { providerId: "beta", modelId: "b" }, effortId: "high", fastMode: true } } } });
   });
-  it("retires readonly account usage on background and never sends a model or user input mutation", async () => {
+  it.each([ModelSourceKind.LOCAL, ModelSourceKind.DEVICE])("reads and retires readonly account usage for task Source kind %s", async kind => {
     const network = fakeNetwork();
     const withQuota = (detail: boolean) => {
       const projection = runtimeControlProjection(runtimeSession, detail);
+      projection.models = projection.models.map(model => create(ModelDescriptorSchema, {
+        ...model, source: create(ModelSourceDescriptorSchema, { kind, nodeId: kind === ModelSourceKind.DEVICE ? "original-execution-node" : "local-node" })
+      }));
       if (!detail) projection.providers = projection.providers.map(provider => create(ProviderDescriptorSchema, {
-        ...provider, authenticationState: AuthenticationState.AUTHENTICATED,
+        ...provider, authenticationState: kind === ModelSourceKind.DEVICE ? AuthenticationState.NOT_REQUIRED : AuthenticationState.AUTHENTICATED,
         version: create(EntityVersionSchema, { generation: 0n, revision: create(RevisionSchema, { value: 1n }) }),
         capabilities: create(CapabilityManifestSchema, { schemaVersion: "joko.provider.v1", capabilities: [create(CapabilitySchema, { name: capabilityNames.providerAccountUsage, support: CapabilitySupport.SUPPORTED })] })
       }));
@@ -12142,17 +12186,23 @@ describe("native current-task runtime controls", () => {
       await new Promise<void>(resolve => { release = resolve; });
       return create(ProviderAccountUsageSnapshotSchema, { providerId, primaryWindow: { usedPercent: 70 } });
     });
+    vi.mocked(network.getProviderUsage).mockResolvedValueOnce(create(ProviderAccountUsageSnapshotSchema, {
+      providerId: "alpha", primaryWindow: { usedPercent: 37 }
+    }));
     const app = client(network, memoryStorage(credential).storage);
     await app.start();
     const transport = app.taskProviderUsageTransport();
     expect(transport).toBeDefined();
     await expect(transport!.read("foreign-backend", "alpha", new AbortController().signal)).rejects.toThrow(/unavailable/u);
+    await expect(transport!.read("backend", "alpha", new AbortController().signal)).resolves.toMatchObject({
+      providerId: "alpha", primaryWindow: { usedPercent: 37 }
+    });
     const reading = transport!.read("backend", "alpha", new AbortController().signal);
     app.setForeground(false);
     release();
     await expect(reading).rejects.toThrow(/owner changed/u);
     expect(app.taskProviderUsageTransport()).toBeUndefined();
-    expect(network.getProviderUsage).toHaveBeenCalledOnce();
+    expect(network.getProviderUsage).toHaveBeenCalledTimes(2);
     expect(network.submit).not.toHaveBeenCalled();
   });
 

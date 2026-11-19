@@ -458,7 +458,7 @@ import {
 import type { MobileFileShare, MobileFileShareProgress } from "./mobile-file-share";
 import { removeMobileOwnerTask, type MobileOfflineCache, type MobileOfflineCacheSnapshot } from "./mobile-offline-cache";
 import { historyInvalidated, mobileEventWithoutCursorTicket, mobilePiHistoryRetired, retainMobileHistoryPrefix } from "./mobile-history-continuity";
-import { SnapshotSchema } from "@joko/contracts";
+import { SnapshotInvalidationReason, SnapshotSchema } from "@joko/contracts";
 import { mobileProviderUsageIdentity, mobileProviderUsageSupported, type MobileProviderUsageTransport } from "./mobile-account-usage";
 import {
   canRestartMobileAutomationRun,
@@ -1057,6 +1057,7 @@ export class MobileClient {
   #lastAuthenticatedAt?: number;
   #durableSnapshotAt?: number;
   #mutationOwner?: symbol;
+  #sessionDeletion?: { readonly action: symbol; readonly epoch: number; readonly sessionId: string; refreshPending: boolean };
   #userShellFlight?: { readonly owner: symbol; readonly sessionId: string };
   #pendingWrite: Promise<void> = Promise.resolve();
   #preparingInteractionReceipts = new Set<PendingOperation>();
@@ -6144,16 +6145,21 @@ export class MobileClient {
       for await (const event of this.network.streamOwner(credential, after, controller.signal)) {
         if (!this.#current(epoch) || this.#streamAbort !== controller || controller.signal.aborted) return;
         const cursor = event.cursor;
-        const saving = this.#partnerProfileSave;
-        if (saving && saving.action === this.#mutationOwner && saving.epoch === epoch
-          && saving.credential === credential && event.eventId && cursor?.opaqueToken
-          && cursor.generation === this.#streamGeneration && cursor.sequence <= (this.#streamSequence ?? 0n) + 1n
-          && event.payload?.kind.case === "projectionInvalidated") {
-          // This write re-reads its original owner and canonical Session before committing UI state.
-          // Retiring the observer here would cancel the very update that invalidated the projection.
-          saving.refreshPending = true; controller.abort(); this.#streamAbort = undefined;
-          if (this.#proofTimer !== undefined) clearTimeout(this.#proofTimer); this.#proofTimer = undefined;
-          return;
+        const payload = event.payload?.kind;
+        if (payload?.case === "projectionInvalidated" && event.eventId && cursor?.opaqueToken
+          && cursor.generation === this.#streamGeneration && cursor.sequence <= (this.#streamSequence ?? 0n) + 1n) {
+          const saving = this.#partnerProfileSave;
+          const deletion = this.#sessionDeletion;
+          const owner = saving?.action === this.#mutationOwner && saving?.epoch === epoch && saving?.credential === credential ? saving
+            : deletion?.action === this.#mutationOwner && deletion?.epoch === epoch && deletion?.sessionId === event.identity?.sessionId
+              && payload.value.scope === "owner" && payload.value.reason === SnapshotInvalidationReason.PROJECTION_REBUILT ? deletion : undefined;
+          if (owner) {
+            // Restart the projection after the original write can adopt its receipt.
+            owner.refreshPending = true;
+            controller.abort(); this.#streamAbort = undefined;
+            if (this.#proofTimer !== undefined) clearTimeout(this.#proofTimer); this.#proofTimer = undefined;
+            return;
+          }
         }
         if (!event.eventId || !cursor || !cursor.opaqueToken || cursor.generation !== this.#streamGeneration
           || cursor.sequence > (this.#streamSequence ?? 0n) + 1n
@@ -15186,6 +15192,8 @@ export class MobileClient {
     const credential = this.#ready();
     const epoch = this.#epoch;
     const action = this.#claimMutation();
+    const deletion = kind === "delete" ? { sessionId, action, epoch, refreshPending: false } : undefined;
+    if (deletion) this.#sessionDeletion = deletion;
     try {
       const mutation = create(OperationMutationSchema, {
         preconditions: [create(OperationPreconditionSchema, {
@@ -15207,7 +15215,11 @@ export class MobileClient {
         }
       });
       return result.accepted;
-    } finally { this.#releaseMutation(action); }
+    } finally {
+      if (this.#sessionDeletion === deletion) this.#sessionDeletion = undefined;
+      this.#releaseMutation(action);
+      if (deletion?.refreshPending && this.#current(epoch) && this.#credential === credential) void this.refresh();
+    }
   }
 
   #claimMutation(allowUserShellInteraction = false): symbol {

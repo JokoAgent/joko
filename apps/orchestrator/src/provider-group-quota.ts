@@ -103,28 +103,23 @@ export interface ProviderGroupQuotaReaderOptions {
 /** Remote reads have one bounded wait and one shared in-flight request. A
  * received share never exposes another person's private subscription usage. */
 export class ProviderGroupQuotaReader {
-  readonly #cache = new Map<string, { at: number; value: ProviderAccountUsageSnapshot | undefined }>();
   readonly #pending = new Map<string, Promise<ProviderAccountUsageSnapshot | undefined>>();
   constructor(readonly options: ProviderGroupQuotaReaderOptions) {}
-  async read(member: ProviderGroupMember, modelId: string, signal: AbortSignal, fresh = false): Promise<ProviderGroupQuota> {
-    const now = this.options.now?.() ?? Date.now(); signal.throwIfAborted();
+  async read(member: ProviderGroupMember, modelId: string, signal: AbortSignal): Promise<ProviderGroupQuota> {
+    signal.throwIfAborted();
     if (member.kind === "share") return { limited: false };
-    const key = JSON.stringify([member.backendId, member.providerId]);
-    const cached = this.#cache.get(key);
-    if (!fresh && member.kind !== "local" && cached && now - cached.at < 15_000) return providerGroupQuota(cached.value, member.providerId, modelId, now);
+    // A peer catalog identifies the route, while its account may be replaced
+    // under that route. Share active reads only and obtain new completed data.
+    const key = JSON.stringify([member.kind, member.nodeId, member.nativeBackendId, member.backendId, member.providerId]);
     let pending = this.#pending.get(key);
     if (!pending) {
       const timeout = AbortSignal.timeout(1_500);
       pending = Promise.race([
         (member.kind === "local" ? this.options.readLocal : this.options.readRemote)(member, timeout),
         new Promise<undefined>(resolve => timeout.addEventListener("abort", () => resolve(undefined), { once: true }))
-      ]).catch(() => undefined).then(value => {
-        this.#cache.delete(key); this.#cache.set(key, { at: this.options.now?.() ?? Date.now(), value });
-        while (this.#cache.size > 512) this.#cache.delete(this.#cache.keys().next().value!); return value;
-      }).finally(() => { if (this.#pending.get(key) === pending) this.#pending.delete(key); });
+      ]).catch(() => undefined).finally(() => { if (this.#pending.get(key) === pending) this.#pending.delete(key); });
       this.#pending.set(key, pending);
     }
     const snapshot = await pending; signal.throwIfAborted(); return providerGroupQuota(snapshot, member.providerId, modelId, this.options.now?.() ?? Date.now());
   }
-  clear(): void { this.#cache.clear(); }
 }

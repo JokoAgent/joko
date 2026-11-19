@@ -68,7 +68,7 @@ export class ProviderGroupDirectory {
       }
     };
     try { assertCurrent(); } catch { return unavailable("authorization"); }
-    const quota = await this.options.quotas.read(member, model.modelId, signal, request.fresh);
+    const quota = await this.options.quotas.read(member, model.modelId, signal);
     assertCurrent();
     return { member, available: !quota.limited, reachable: true, model, quota, running: this.options.running(source),
       ...(quota.limited ? { reason: "quota" as const } : {}), assertCurrent };

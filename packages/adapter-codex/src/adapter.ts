@@ -290,6 +290,7 @@ export interface CodexNativeAccountOperations extends NativeAccountRateLimitRese
   captureHostedAuthentication(): Promise<CodexHostedAuthenticationAuthority>;
   readAccount(refreshToken?: boolean): Promise<CodexAccountSnapshot>;
   readAccountUsage(providerId: string, signal?: AbortSignal): Promise<CodexAccountUsageSnapshot>;
+  peekAccountUsage?(providerId: string): CodexAccountUsageSnapshot | undefined;
   listModels(): Promise<readonly ProviderModel[]>;
   beginLogin(input: CodexLoginInput): Promise<CodexLoginResult>;
   cancelLogin(loginId: string): Promise<void>;
@@ -648,6 +649,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   #smartRoutingHostFlight: Promise<number> | undefined;
   #account: CodexAccountSnapshot | undefined;
   #nativeAuthenticationEpoch = 0;
+  #accountUsageLoginEpoch = 0;
+  #accountUsageLoginRequests = 0;
+  #accountUsageRequest = 0;
+  #accountUsageSnapshot?: { readonly host: AppServerHost; readonly generation: number; readonly epoch: number;
+    readonly loginEpoch: number; readonly request: number; readonly value: CodexAccountUsageSnapshot };
   #hostedAuthenticationRefreshTail: Promise<void> = Promise.resolve();
   readonly #nativeTextFlights = new Set<AbortController>();
   #nativeAuthenticationRevoked = false;
@@ -2934,21 +2940,37 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       });
     }
     const generation = await this.#ensureLocalHostStarted();
-    const host = this.#host, epoch = this.#nativeAuthenticationEpoch;
+    const host = this.#host, epoch = this.#nativeAuthenticationEpoch, loginEpoch = this.#accountUsageLoginEpoch;
+    const request = ++this.#accountUsageRequest;
     const assertCurrent = () => {
       this.#assertOpen();
       signal?.throwIfAborted();
       if (host !== this.#host || !host.isActiveGeneration(generation) || epoch !== this.#nativeAuthenticationEpoch
+        || loginEpoch !== this.#accountUsageLoginEpoch || this.#accountUsageLoginRequests > 0
         || this.#nativeAuthenticationRevoked || this.#account?.authenticationState === "pending"
         || this.#account?.authenticationState === "signed_out") throw nativeAuthenticationObservationStale();
     };
     assertCurrent();
     const response = await host.request("account/rateLimits/read", undefined, { signal, beforeDispatch: assertCurrent });
     assertCurrent();
-    return {
+    const value = {
       providerId: this.#providerId,
       ...parseAccountRateLimits(response.value, this.#now())
     };
+    if (request > (this.#accountUsageSnapshot?.request ?? 0)) {
+      this.#accountUsageSnapshot = { host, generation, epoch, loginEpoch, request, value };
+    }
+    return value;
+  }
+
+  peekAccountUsage(providerId: string): CodexAccountUsageSnapshot | undefined {
+    const snapshot = this.#accountUsageSnapshot;
+    if (providerId !== this.#providerId || snapshot === undefined || snapshot.host !== this.#host
+      || !snapshot.host.isActiveGeneration(snapshot.generation) || snapshot.epoch !== this.#nativeAuthenticationEpoch
+      || snapshot.loginEpoch !== this.#accountUsageLoginEpoch || this.#nativeAuthenticationRevoked || this.#disposed
+      || this.#account === undefined || !codexAccountModelsAvailable(this.#account.authenticationState)) return undefined;
+    const age = this.#now() - snapshot.value.observedAt;
+    return age >= 0 && age <= 60_000 ? snapshot.value : undefined;
   }
 
   async readAccountRateLimitResets(input: NativeAccountRateLimitResetRead): Promise<NativeAccountRateLimitResetSnapshot> {
@@ -3084,12 +3106,15 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async beginLogin(input: CodexLoginInput): Promise<CodexLoginResult> {
     await this.#ensureLocalHostStarted();
     const authenticationEpoch = this.#nativeAuthenticationEpoch;
+    this.#accountUsageLoginEpoch += 1;
     const params: JsonObject = input.method === "api_key"
       ? { type: "apiKey", apiKey: input.apiKey }
       : input.method === "oauth_browser"
         ? { type: "chatgpt" }
         : { type: "chatgptDeviceCode" };
-    const response = await this.#host.request("account/login/start", params, { mutation: true });
+    this.#accountUsageLoginRequests += 1;
+    const response = await this.#host.request("account/login/start", params, { mutation: true })
+      .finally(() => { this.#accountUsageLoginRequests -= 1; });
     if (authenticationEpoch !== this.#nativeAuthenticationEpoch) throw nativeAuthenticationObservationStale();
     const record = objectValue(response.value, "account login result");
     const type = stringValue(record["type"], "account login type");

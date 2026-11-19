@@ -5,7 +5,8 @@ import { z } from "zod";
 import type { AdapterContext, BackendAdapter, BackendDescriptor, BlobRef, CreateNativeSessionInput, DurableNativeDispatchPreparation,
   BackgroundTaskOutputResult, NativeHistoryProjection, NativeNavigationTarget, NativeSessionBinding, NativeSessionDerivation, NativeSessionDerivationLifecycle, NativeSessionForkResult,
   NativeSessionNavigation, NativeSessionNavigationResult, NativeSessionState, PromptInput, ProviderModel, RuntimeCommand, RuntimeResource,
-  RuntimeToolCatalog, SessionTree, SubagentControlInput, TargetDescriptor, UserShellInput, UserShellResult, NativeTextInferenceInput } from "@joko/core";
+  RuntimeToolCatalog, SessionTree, SubagentControlInput, TargetDescriptor, UserShellInput, UserShellResult, NativeTextInferenceInput,
+  ProviderAccountUsageSnapshot } from "@joko/core";
 import type { HostedNativeCommand, HostedNativeOpen, HostedNativeDerivationLifecycle } from "./protocol.js";
 import type { BackgroundWorkflowReadInput } from "@joko/core";
 import { JokoError, toPublicError } from "@joko/core";
@@ -40,6 +41,7 @@ export interface HostedAgentSourceConnection {
 }
 export interface HostedAgentSourceAdapterOptions {
   readonly readWorkflowProgress?: (command: Extract<HostedNativeCommand, { kind: "workflow_progress" }>, input: BackgroundWorkflowReadInput) => Promise<BackgroundTaskOutputResult>;
+  readonly readAccountUsage?: (providerId: string, signal?: AbortSignal) => Promise<ProviderAccountUsageSnapshot>;
   readonly inferNativeText?: (input: NativeTextInferenceInput) => Promise<string>;
   readonly id: string;
   readonly source: HostedAgentDeviceSource;
@@ -86,6 +88,7 @@ interface ActiveSourceSession {
 export class HostedAgentSourceAdapter implements BackendAdapter {
   readonly id: string;
   readonly getBackgroundWorkflowProgress?: (input: BackgroundWorkflowReadInput) => Promise<BackgroundTaskOutputResult>;
+  readonly readAccountUsage?: HostedAgentSourceAdapterOptions["readAccountUsage"];
   readonly #options: HostedAgentSourceAdapterOptions;
   readonly #sessions = new Map<string, ActiveSourceSession>();
   readonly #opening = new Map<string, Promise<ActiveSourceSession>>();
@@ -95,6 +98,13 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     identity.parse(options.id); sourceSchema.parse(options.source);
     this.id = options.id; this.#options = { ...options, source: Object.freeze(sourceSchema.parse(options.source)) };
     if (options.readWorkflowProgress) this.getBackgroundWorkflowProgress = input => this.#readWorkflowProgress(input);
+    const readAccountUsage = options.readAccountUsage;
+    if (readAccountUsage) this.readAccountUsage = async (providerId, signal) => {
+      this.#assertOpen(); signal?.throwIfAborted();
+      const result = await readAccountUsage(providerId, signal);
+      this.#assertOpen(); signal?.throwIfAborted();
+      return result;
+    };
   }
   async describe(): Promise<BackendDescriptor> {
     this.#assertOpen(); const descriptor = await this.#options.describe();

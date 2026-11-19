@@ -316,7 +316,7 @@ import {
   toProtoWorkspace,
   toProtoWorkspaceLocation
 } from "./proto-mapper.js";
-import { ProtoMappingError } from "./proto-mapper.js";
+import { ProtoMappingError, type EventMappingContext } from "./proto-mapper.js";
 import { TIMED_EXTENSION_INTERACTION_EXPIRED_REASON } from "./interaction-expiry.js";
 import { BROWSER_TOOLS } from "./browser-tool-bridge.js";
 import type { OperationalBrowserState, RecoverableBrowserPageRecord } from "./operational-browser-state.js";
@@ -1997,6 +1997,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     },
     streamEvents: async function* (request, context) {
       const authenticated = authenticate(context);
+      const ownerCatalog = request.scope?.kind.case === undefined || request.scope.kind.case === "owner";
       const queue = new AsyncEventQueue(context.signal);
       const stopRevocation = dependencies.connections.onRevoked(authenticated.id, () => queue.close());
       const unsubscribe = dependencies.store.subscribe((item) => { queue.push(item); });
@@ -2015,7 +2016,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
             advanced = true;
             if (eventMatchesScope(item, request.scope, dependencies)) {
               dependencies.connections.fence(authenticated);
-              yield { event: eventWithServiceCursor(item, dependencies, generation) };
+              yield { event: eventWithServiceCursor(item, dependencies, generation, ownerCatalog) };
             }
           }
           if (!advanced) {
@@ -2036,7 +2037,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
           observed = item.globalCursor;
           if (!eventMatchesScope(item, request.scope, dependencies)) continue;
           dependencies.connections.fence(authenticated);
-          yield { event: eventWithServiceCursor(item, dependencies, generation) };
+          yield { event: eventWithServiceCursor(item, dependencies, generation, ownerCatalog) };
         }
       } finally {
         unsubscribe();
@@ -7880,10 +7881,21 @@ function validateStreamCursor(cursor: contract.EventCursor, generation: bigint, 
   return decoded.sequence;
 }
 
-export function eventWithServiceCursor(item: PersistedEvent, dependencies: ConnectServiceDependencies, generation: bigint): contract.Event {
-  const mapped = toProtoEvent(item, eventContext(item, dependencies));
+export function eventWithServiceCursor(item: PersistedEvent, dependencies: ConnectServiceDependencies, generation: bigint,
+  ownerCatalog = false): contract.Event {
+  const context = eventContext(item, dependencies);
+  const mapped = toProtoEvent(item, context);
+  const deleted = ownerCatalog && item.payload.type === "session_changed" && context.session?.descriptor.deletedAt !== undefined
+    ? context.session : undefined;
   return create(contract.EventSchema, {
     ...mapped,
+    ...(deleted === undefined ? {} : { payload: create(contract.EventPayloadSchema, { kind: {
+      case: "projectionInvalidated", value: create(contract.ProjectionInvalidatedEventSchema, {
+        reason: contract.SnapshotInvalidationReason.PROJECTION_REBUILT,
+        scope: "owner",
+        minimumRevision: toProtoRevision(deleted.revision)
+      })
+    } }) }),
     cursor: toProtoEventCursor(item.globalCursor, generation, item.emittedAt)
   });
 }
@@ -7891,7 +7903,7 @@ export function eventWithServiceCursor(item: PersistedEvent, dependencies: Conne
 function eventContext(
   item: PersistedEvent,
   dependencies: ConnectServiceDependencies
-): Parameters<typeof toProtoEvent>[1] {
+): EventMappingContext {
   if (item.payload.type === "device_changed") return {};
   const store = dependencies.store;
   let session: StoredSession | undefined;
@@ -9331,6 +9343,7 @@ interface BackendProviderAccountOperations {
     providerId: string,
     signal?: AbortSignal
   ): Promise<NativeProviderAccountUsageSnapshot>;
+  peekAccountUsage?(providerId: string): NativeProviderAccountUsageSnapshot | undefined;
   listModels?(): Promise<readonly ProviderModel[]>;
   beginLogin?(input: BackendProviderLoginInput): Promise<BackendProviderLoginResult>;
   cancelLogin?(loginId: string): Promise<void>;
@@ -9842,13 +9855,40 @@ async function backendProviderAccountUsageSnapshot(
   }
 }
 
+const backgroundNativeAccountUsage = new WeakMap<BackendAdapter, Map<string, { readonly startedAt: number; reading: boolean }>>();
+
+function peekBackendProviderAccountUsageSnapshot(
+  dependencies: ConnectServiceDependencies,
+  descriptor: BackendDescriptor,
+  providerId: string,
+  adapter: BackendAdapter & BackendProviderAccountOperations
+): contract.ProviderAccountUsageSnapshot | undefined {
+  const snapshot = adapter.peekAccountUsage?.(providerId);
+  if (snapshot?.providerId === providerId) return mapProviderAccountUsageSnapshot(snapshot);
+
+  const now = Date.now();
+  let reads = backgroundNativeAccountUsage.get(adapter);
+  if (reads === undefined) { reads = new Map(); backgroundNativeAccountUsage.set(adapter, reads); }
+  const previous = reads.get(providerId);
+  if (!previous?.reading && (previous === undefined || now - previous.startedAt >= 5_000)) {
+    const pending = { startedAt: now, reading: true };
+    reads.set(providerId, pending);
+    // The original RPC may finish before this service-owned observation.
+    // The Adapter and Host still fence the native account on completion.
+    void backendProviderAccountUsageSnapshot(dependencies, descriptor, providerId)
+      .catch(() => undefined).finally(() => { pending.reading = false; });
+  }
+  return undefined;
+}
+
 async function backendProviderDescriptorWithAccountUsage(
   dependencies: ConnectServiceDependencies,
   descriptor: BackendDescriptor,
   providerId: string,
   revision: bigint,
   provider: contract.ProviderDescriptor,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  fromSnapshot = false
 ): Promise<contract.ProviderDescriptor> {
   provider = configureProviderCredentialSurfaces(dependencies, descriptor, provider);
   if (dependencies.providerAccountResets && descriptor.capabilities.get("provider.account_resets")?.supported === true
@@ -9858,7 +9898,16 @@ async function backendProviderDescriptorWithAccountUsage(
           create(contract.CapabilitySchema, { name: "provider.account_resets", support: contract.CapabilitySupport.SUPPORTED, reason: "" })] })
     });
   if (!backendProviderAccountUsageAvailable(dependencies, descriptor, providerId)) return provider;
-  const accountUsage = await backendProviderAccountUsageSnapshot(dependencies, descriptor, providerId, signal);
+  let accountUsage: contract.ProviderAccountUsageSnapshot | undefined;
+  // Paired Device quota is read explicitly for the selected Provider. Catalog
+  // projection should not fan out to remote devices or cache their quotas.
+  if (descriptor.adapterKind !== "hosted") {
+    const adapter = fromSnapshot ? dependencies.adapters().find(candidate => candidate.id === descriptor.id) as
+      (BackendAdapter & BackendProviderAccountOperations) | undefined : undefined;
+    accountUsage = adapter?.peekAccountUsage !== undefined
+      ? peekBackendProviderAccountUsageSnapshot(dependencies, descriptor, providerId, adapter)
+      : await backendProviderAccountUsageSnapshot(dependencies, descriptor, providerId, signal);
+  }
   const capabilities = [
     ...(provider.capabilities?.capabilities ?? []).filter((capability) =>
       capability.name !== PROVIDER_ACCOUNT_USAGE_CAPABILITY),
@@ -14759,7 +14808,8 @@ async function enrichSnapshot(
       provider.providerId,
       record.revision,
       provider,
-      signal
+      signal,
+      true
     ));
   }));
   if (providerRecords !== undefined) {

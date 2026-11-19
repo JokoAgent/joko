@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import { Code, createClient, createRouterTransport } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
+import type { ProviderAccountUsageSnapshot } from "@joko/core";
 import { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -103,6 +104,50 @@ describe("Backend-native Provider account usage", () => {
     expect(unavailable?.accountUsage).toBeUndefined();
     expect(unavailable?.capabilities?.capabilities.some((capability: contract.Capability) =>
       capability.name === "provider.account_usage")).not.toBe(true);
+  });
+
+  it("returns the first paired task snapshot while native quota is pending, then adopts the exact finished observation", async () => {
+    const backendId = "backend-pending", providerId = "provider-owned";
+    const sample = accountUsageAdapter(backendId, providerId, "team", 63);
+    let release!: () => void;
+    const nativeReply = new Promise<void>(resolve => { release = resolve; });
+    let cached: ProviderAccountUsageSnapshot | undefined;
+    const readAccountUsage = vi.fn(async () => {
+      await nativeReply;
+      cached = await sample.readAccountUsage();
+      return cached;
+    });
+    const fixture = createFixture([nativeBackend(backendId, providerId)], [{ id: backendId, readAccountUsage,
+      peekAccountUsage: () => cached }]);
+    fixture.store.upsertTarget({ id: "project", backendId, displayName: "Project", workspaceRoot: fixture.directory,
+      managed: false, trusted: true });
+    fixture.store.createSession({ id: "task", backendId, targetId: "project", title: "Available before quota",
+      binding: { opaqueRef: "native/task", generation: 0 }, pinned: false, archived: false, permissionMode: "ask",
+      planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
+    const transport = createRouterTransport(router => registerConnectServices(router, fixture.application));
+    const client = createClient(contract.EventService, transport);
+    const read = (key: string) => client.getSnapshot({ scope: { kind: { case: "owner", value: {} } } }, { headers: { authorization: `Bearer ${key}` } });
+    const published = vi.fn();
+    const first = read(originalKey).then(value => { published(value); return value; });
+    try {
+      await vi.waitFor(() => expect(published).toHaveBeenCalledOnce());
+      expect(readAccountUsage).toHaveBeenCalledOnce();
+      const initial = (await first).snapshot;
+      expect(initial?.sessions).toMatchObject([{ sessionId: "task", displayName: "Available before quota" }]);
+      expect(initial?.providers[0]?.accountUsage).toBeUndefined();
+      expect(initial?.providers[0]?.capabilities?.capabilities).toContainEqual(expect.objectContaining({
+        name: "provider.account_usage", support: contract.CapabilitySupport.SUPPORTED
+      }));
+      const other = (await read(observerKey)).snapshot;
+      expect(other?.sessions).toMatchObject([{ sessionId: "task" }]);
+      expect(other?.providers[0]?.accountUsage).toBeUndefined();
+      expect(readAccountUsage).toHaveBeenCalledOnce();
+    } finally { release(); }
+
+    await vi.waitFor(() => expect(cached).toBeDefined());
+    const current = (await read(originalKey)).snapshot;
+    expect(current?.providers[0]?.accountUsage).toMatchObject({ providerId, planType: "team", primaryWindow: { usedPercent: 63 } });
+    expect(readAccountUsage).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -217,7 +262,8 @@ function accountUsageAdapter(
 
 function createFixture(
   backends: readonly ReturnType<typeof nativeBackend>[],
-  adapters: ReadonlyArray<{ readonly id: string; readonly readAccountUsage?: ReturnType<typeof vi.fn> }>
+  adapters: ReadonlyArray<{ readonly id: string; readonly readAccountUsage?: ReturnType<typeof vi.fn>;
+    readonly peekAccountUsage?: () => ProviderAccountUsageSnapshot | undefined }>
 ) {
   const directory = mkdtempSync(join(tmpdir(), "joko-native-account-usage-"));
   const store = new OperationalStore(join(directory, "orchestrator.db"));

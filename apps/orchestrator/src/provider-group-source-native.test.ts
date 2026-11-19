@@ -224,6 +224,8 @@ it("relays guest C through B to isolated A, offers one native handoff and contin
       captureNative: () => ({ client, assertCurrent: principal.assertCurrent, close: run => b.native.endpoint.closeProviderGrant("a".repeat(64), run) }) };
     const c = await f.node("C", sharing); await c.sources.refreshShared(new AbortController().signal);
     const sourceId = providerSharingBackendId(identity.joinId, "pi"); await c.host.registerTarget({ id: "shared-target", backendId: sourceId, displayName: "Original C", workspaceRoot: join(c.root, "workspace"), managed: false, trusted: true });
+    expect(c.store.getBackend(sourceId).descriptor.capabilities.get("provider.account_usage")).toMatchObject({ supported: false });
+    expect(c.host.currentAdapter(sourceId)).not.toHaveProperty("readAccountUsage", expect.any(Function));
     const sessionId = (await c.host.createSession({ operationId: "guest-create", connection: c.connection, targetId: "shared-target", title: "Original guest C", providerId: "provider", modelId: "model", permissionMode: "bypassPermissions", planMode: false, fastMode: false })).value.sessionId;
     const original = c.store.getSession(sessionId).descriptor.binding;
     expect(await c.groups.taskAccountUsage(sessionId, new AbortController().signal)).toBeUndefined();

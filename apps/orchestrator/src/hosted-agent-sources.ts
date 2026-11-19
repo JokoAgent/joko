@@ -6,7 +6,7 @@ import { fromJson, toJson, type JsonValue } from "@bufbuild/protobuf";
 import { createClient, Code, ConnectError } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { CAPABILITIES, JokoError, type AdapterContext, type BackendDescriptor, type Capability, type ProviderModel, type ToolCall, type NativeToolAuthorizationDecision,
-  type ApprovedSkillSeed, type NativeSkillPolicyResolver, type ArtifactMentionResolver } from "@joko/core";
+  type ApprovedSkillSeed, type NativeSkillPolicyResolver, type ArtifactMentionResolver, type ProviderAccountUsageSnapshot } from "@joko/core";
 import { HostedAgentSourceAdapter, HostedAgentConnectionPool, type HostedAgentDeviceSource } from "@joko/adapter-hosted";
 import { HostedAgentSettings } from "./hosted-agent-settings.js";
 import { NotFoundError, SessionRuntimeHandoffStore, TaskShareStore, type ConnectionRecord, type OperationalStore } from "@joko/store";
@@ -42,6 +42,7 @@ import { nativeTextInferenceImages, type BlobRef } from "@joko/core";
 import type { ProviderSharingDirectoryPort, ProviderSharingReceivedIdentity, ProviderSharingRecipient } from "./provider-sharing-ports.js";
 import { providerSharingBackendId } from "./provider-sharing-ports.js";
 import { createProviderGroupPeerTransport } from "./provider-group-peer.js";
+import { fromGroupAccountUsage } from "./provider-group-wire.js";
 import { createHostedAgentGuestPeerCapture } from "./hosted-agent-guest-peer-capture.js";
 import type { ProviderGroupGuestSwitch } from "./provider-group-guest-switch.js";
 import type { ProviderGroupStore } from "@joko/store";
@@ -137,6 +138,29 @@ export class HostedAgentSources {
     return { transport: createProviderGroupPeerTransport({ owner: this.#options.peers, authority }), assertCurrent: () => authority.assertCurrent(["native_agents"]),
       ownerNodeId: entry.catalog.nodeId, nativeBackendId: entry.record.source.backendId };
   }
+  async #readAccountUsage(entry: SourceEntry, generation: number, providerId: string, requestSignal?: AbortSignal): Promise<ProviderAccountUsageSnapshot> {
+    const catalog = entry.catalog;
+    const provider = catalog.providers.find(value => value.providerId === providerId);
+    const timeout = AbortSignal.timeout(5_000), signal = requestSignal === undefined ? timeout : AbortSignal.any([requestSignal, timeout]);
+    const assertCurrent = (): void => {
+      signal.throwIfAborted();
+      if (this.#closed || this.#entries.get(entry.id) !== entry || entry.catalog !== catalog || !entry.available
+        || entry.record.received || !entry.record.remoteControlEnabled || !provider?.connected || !provider.remoteInvocationEnabled
+        || !catalog.capabilities.some(capability => capability.name === contract.capabilityNames.providerAccountUsage
+          && capability.support === contract.CapabilitySupport.SUPPORTED)
+        || this.#options.store.getBackend(entry.id).descriptor.instanceGeneration !== generation) {
+        throw new Error("The original Device account usage route is unavailable.");
+      }
+    };
+    assertCurrent();
+    const captured = this.captureGroupPeer(entry.id);
+    const client = createClient(contract.ProviderGroupService, captured.transport);
+    const result = await client.getProviderSchedulingState({ key: { backendId: captured.nativeBackendId, providerId } }, { signal });
+    assertCurrent(); captured.assertCurrent();
+    const snapshot = fromGroupAccountUsage(result.accountUsage, { includeBuckets: true });
+    if (snapshot === undefined || snapshot.providerId !== providerId) throw new Error("The original Device account usage is unavailable.");
+    return snapshot;
+  }
   resolveGroupMember(nodeId: string, nativeBackendId: string, providerId: string): string | undefined {
     return [...this.#entries.values()].find(entry => entry.catalog.nodeId === nodeId && entry.record.source.backendId === nativeBackendId
       && !entry.record.received && entry.catalog.providers.some(provider => provider.providerId === providerId))?.id;
@@ -231,6 +255,7 @@ export class HostedAgentSources {
     const mcps = new Map<string, HostedAgentSourceMcp>(), mcpKey = (context: AdapterContext) => JSON.stringify([context.sessionId, context.generation, context.backendInstanceGeneration]);
     const snapshot = await this.#options.registry.add({ instanceId: entry.id, adapterKind: "hosted", displayName: entry.catalog.displayName,
       create: ({ generation }) => new HostedAgentSourceAdapter({ id: entry.id, source: entry.record.source, describe: () => this.#descriptor(entry),
+        ...(entry.record.received ? {} : { readAccountUsage: (providerId, signal) => this.#readAccountUsage(entry, generation, providerId, signal) }),
         ...(entry.catalog.nativeAdapterKind !== "claude-agent-sdk-stdio" ? {} : { readWorkflowProgress: async (
           command: Extract<HostedNativeCommand, { kind: "workflow_progress" }>, input: BackgroundWorkflowReadInput
         ): Promise<BackgroundTaskOutputResult> => {
@@ -438,7 +463,10 @@ export class HostedAgentSources {
   #descriptor(entry: SourceEntry): BackendDescriptor {
     const native = new Map(entry.catalog.capabilities.map(fromProtoCapability).map(capability => [capability.key, capability]));
     const capabilities = new Map<string, Capability>(CAPABILITIES.map(key => {
-      const capability = native.get(key), supported = FORWARDED.has(key) && capability?.supported === true;
+      const capability = native.get(key);
+      const allowed = FORWARDED.has(key) || key === contract.capabilityNames.providerAccountUsage
+        && !entry.record.received && entry.available && entry.record.remoteControlEnabled;
+      const supported = allowed && capability?.supported === true;
       if (!supported) return [key, { key, supported: false, reason: key === "session.fork" || key === "session.clone" ? "upstream_missing" : "not_implemented" }];
       return [key, key === "permission.modes" && !this.#options.reviewTool
         ? { ...capability!, options: (capability!.options ?? []).filter(mode => mode !== "auto") } : capability!];

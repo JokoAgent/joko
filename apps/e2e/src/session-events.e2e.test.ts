@@ -17,6 +17,7 @@ import {
   QueueDeliveryMode,
   RunState,
   SessionSnapshotScopeSchema,
+  SnapshotInvalidationReason,
   SnapshotScopeSchema,
   SubmitOperationRequestSchema,
   SubmitOperationResponseSchema,
@@ -671,9 +672,15 @@ describe("session host, durable events, and reconnect semantics", () => {
     }
     expect((await submit(first.clients.operation, first.connectionId, archiveMutation(earlier, false))).state)
       .toBe(OperationState.SUCCEEDED);
+    const beforeDeletion = (await first.clients.event.getSnapshot({})).snapshot!.resumeCursor!;
+    const deletionEvent = nextEvent(first.clients.event, { afterCursor: beforeDeletion });
     expect((await submit(second.clients.operation, second.connectionId, deleteMutation(removed))).state)
       .toBe(OperationState.SUCCEEDED);
     const original = fixture.application.store.getSessionSnapshot(removed);
+    expect(await deletionEvent).toMatchObject({ identity: { sessionId: removed }, payload: { kind: {
+      case: "projectionInvalidated", value: { reason: SnapshotInvalidationReason.PROJECTION_REBUILT,
+        scope: "owner", minimumRevision: { value: original.session.revision } }
+    } } });
     expect(original.session.descriptor.deletedAt).toBeDefined();
     const staleRestoreId = randomUUID();
     await expect(submit(first.clients.operation, first.connectionId, archiveMutation(removed, false), staleRestoreId))
