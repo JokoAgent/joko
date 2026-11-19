@@ -12352,10 +12352,14 @@ export class OperationalStore {
     });
   }
 
-  hasNativeCatalogRolloutHistory(sessionId: string): boolean {
+  hasNativeCatalogRolloutHistory(sessionId: string, options?: { readonly activeOnly: boolean }): boolean {
     this.assertOpen();
-    return this.database.prepare("SELECT 1 FROM events WHERE session_id = ? AND namespace = ? LIMIT 1")
-      .get(sessionId, CATALOG_ROLLOUT_HISTORY_NAMESPACE) !== undefined;
+    return this.database.prepare(`
+      SELECT 1 FROM events AS event
+      WHERE event.session_id = ? AND event.namespace = ? AND (? = 0 OR NOT EXISTS (
+        SELECT 1 FROM message_event_tombstones WHERE event_id = event.id
+      )) LIMIT 1
+    `).get(sessionId, CATALOG_ROLLOUT_HISTORY_NAMESPACE, options?.activeOnly === true ? 1 : 0) !== undefined;
   }
 
   appendNativeCatalogRolloutHistory(session: SessionDescriptor, operationId: string, messages: NativeSessionPreview["messages"]): void {

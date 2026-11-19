@@ -10,7 +10,7 @@ import { createCodexAdapter, AppServerHost, TransportFault } from "@joko/adapter
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
 import { CreateTargetMutationSchema, EntityKind, GetOperationRequestSchema, MessageRole, NativeCatalogImportPresentationSchema, NativeSessionPlacement, NativeSessionStartSchema,
   ObjectiveStatus, OperationMutationSchema, OperationState, RetryState, RunState, ScheduleRecurrenceSchema,
-  SubmitOperationRequestSchema, TargetWorkspaceInputSchema, ToolCallState, WorkspaceKind, type Event } from "@joko/contracts";
+  SetWorkspaceTrustMutationSchema, SubmitOperationRequestSchema, TargetWorkspaceInputSchema, ToolCallState, WorkspaceKind, type Event } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it, vi } from "vitest";
 
@@ -59,9 +59,13 @@ it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog t
       }) }
     }));
     if (project.result?.payload.case !== "target") throw new Error("The catalog project was not created.");
-    const targetId = project.result.payload.value.targetId;
+    const { targetId, workspaceId } = project.result.payload.value;
+    const trust = await submit(clients.operation, connectionId, create(OperationMutationSchema, {
+      payload: { case: "setWorkspaceTrust", value: create(SetWorkspaceTrustMutationSchema, { workspaceId, trusted: true }) }
+    }));
+    expect(trust.state).toBe(OperationState.SUCCEEDED);
     const store = fixture.application.store;
-    expect(store.getTarget(targetId).descriptor).toMatchObject({ managed: false, workspaceRoot: cwd });
+    expect(store.getTarget(targetId).descriptor).toMatchObject({ managed: false, trusted: true, workspaceRoot: cwd });
     const seeded = native.seedThread(cwd, [{ id: turnId, status: "completed", items: [
       { id: "original-user", type: "userMessage", content: [{ type: "text", text: question, text_elements: [] }] },
       { id: "original-assistant", type: "agentMessage", text: answer, phase: null, memoryCitation: null, delivery: null }
@@ -121,26 +125,29 @@ it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog t
     const snapshot = async () => (await clients.event.getSnapshot({
       scope: { kind: { case: "session", value: { sessionId, recentTimelineItems: 200 } } }
     })).snapshot!.timeline;
-    const completed = (events: readonly Event[]) => events.flatMap(({ payload }) =>
-      payload?.kind.case === "messageCompleted" ? [payload.kind.value] : []);
+    const messages = (events: readonly Event[]) => events.flatMap(({ payload }) => {
+      const kind = payload?.kind;
+      return kind?.case === "messageCompleted" || kind?.case === "messageStarted" && kind.value.role === MessageRole.USER ? [kind] : [];
+    });
     await expect(fixture.anonymous.session.listSessionTimeline({ sessionId })).rejects.toThrow();
-    const [first, second] = mode === "legacy" ? [await timeline(), await snapshot()] : [await snapshot(), await timeline()];
-    for (const visible of [first, second]) {
-      expect(completed(visible)).toMatchObject([{
-        role: MessageRole.USER, blocks: [{ content: { case: "text", value: question } }]
-      }, {
-        role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: answer } }]
-      }]);
-      expect(completed(visible).every(message => message.nativeIdentity === undefined)).toBe(true);
+    const readers = mode === "legacy" ? [timeline, snapshot] : [snapshot, timeline];
+    for (const read of readers) {
+      const visible = await read();
+      expect(failedStarts, `${read.name} must not start the cold executable`).toBe(startsBeforeReading);
+      expect(messages(visible)).toMatchObject([
+        { case: "messageStarted", value: { role: MessageRole.USER, userInputAccepted: false,
+          userInput: { parts: [{ content: { case: "text", value: question } }] } } },
+        { case: "messageCompleted", value: { role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: answer } }] } }
+      ]);
+      expect(messages(visible).every(message => message.value.nativeIdentity === undefined)).toBe(true);
     }
-    expect(failedStarts).toBe(startsBeforeReading);
     expect(await readFile(rollout, "utf8")).toBe(sourceBytes);
 
     executablePresent = true;
     await clients.session.listRuntimeCommands({ sessionId });
-    const canonical = completed(await timeline());
-    expect(canonical.map(message => message.nativeIdentity?.entryId)).toEqual(["original-user", "original-assistant"]);
-    expect(completed(await snapshot())).toEqual(canonical);
+    const canonical = messages(await timeline());
+    expect(canonical.map(message => message.value.nativeIdentity?.entryId)).toEqual(["original-user", "original-assistant"]);
+    expect(messages(await snapshot())).toEqual(canonical);
     expect(store.listEvents({ sessionId }).some(event => event.payload.type === "history_pruned")).toBe(true);
   } finally {
     await fixture?.close();
