@@ -143,6 +143,7 @@ export const DESKTOP_CHANNELS = {
   cancelFileCopy: "joko:files:copy-cancel",
   openFile: "joko:files:open",
   cancelFileOpen: "joko:files:open-cancel",
+  thumbnailDraftFile: "joko:files:draft-thumbnail",
   openWithCaptureDocument: "joko:files:open-with:document:capture",
   listOpenWithApps: "joko:files:open-with:list",
   retireOpenWithApps: "joko:files:open-with:retire",

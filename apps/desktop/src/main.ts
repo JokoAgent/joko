@@ -417,6 +417,8 @@ import {
 import { installSelectionContextMenu, setSelectionContextMenuLocale } from "./selection-context-menu.js";
 import { NativeFileClipboard, type NativeFileActionScope } from "./native-file-clipboard.js";
 import { NativeFileOpener } from "./native-file-opener.js";
+import { readNativeDraftFileThumbnail } from "./native-draft-file-thumbnail.js";
+import { NATIVE_DRAFT_THUMBNAIL_PNG_BYTES, NATIVE_DRAFT_THUMBNAIL_SIDE } from "@joko/contracts";
 import {
   decodeWindowsRegistryOutput,
   isLocalWindowsDrivePath,
@@ -9770,6 +9772,25 @@ function registerIpc(): void {
       openPath: (path) => shell.openPath(path)
     });
     return nativeFileOpener.open(parameters[0], nativeFileActionScope(event));
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.thumbnailDraftFile, (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 1 || (process.platform !== "win32" && process.platform !== "darwin")) return undefined;
+    const scope = nativeFileActionScope(event);
+    return readNativeDraftFileThumbnail(parameters[0], {
+      temporaryDirectory: app.getPath("temp"),
+      isCurrent: () => scope.isCurrent(),
+      render: async path => {
+        const side = NATIVE_DRAFT_THUMBNAIL_SIDE;
+        const image = await nativeImage.createThumbnailFromPath(path, { width: side, height: side });
+        if (image.isEmpty()) return undefined;
+        const { width, height } = image.getSize();
+        const scale = side / Math.max(width, height);
+        const pixels = scale >= 1 ? image : image.resize({ width: Math.max(1, Math.round(width * scale)), height: Math.max(1, Math.round(height * scale)) });
+        const png = pixels.toPNG();
+        return png.byteLength <= NATIVE_DRAFT_THUMBNAIL_PNG_BYTES ? `data:image/png;base64,${png.toString("base64")}` : undefined;
+      }
+    });
   });
   ipcMain.handle(DESKTOP_CHANNELS.listOpenWithApps, (event, ...parameters: unknown[]) => {
     if (parameters.length !== 1) throw new TypeError("Open-with application listing requires one request object.");

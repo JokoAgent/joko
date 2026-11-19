@@ -2937,6 +2937,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
             ownerKey={voiceDictionaryOwnerKey}
             attachments={attachments}
             removeDisabled={composerLocked}
+            documentPreviewEnabled={!guest && !partnerPresentation && (controller.state.taskSource?.kind ?? "own") === "own"}
             t={t}
             onRemove={(attachment) => {
               if (composerLocked) return;

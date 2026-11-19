@@ -104,6 +104,62 @@ describe("composer attachment tray", () => {
     expect(URL.createObjectURL).toHaveBeenCalledTimes(1);
   });
 
+  it("opens the original ordinary document in Desktop and leaves other files available to send", async () => {
+    const openFile = vi.fn<NonNullable<Window["jokoDesktop"]>["openFile"]>()
+      .mockResolvedValueOnce({ status: "opened" }).mockResolvedValueOnce({ status: "failed", reason: "open" });
+    vi.stubGlobal("jokoDesktop", { capabilities: ["files.open"], openFile, cancelFileOpen: vi.fn(async () => undefined) });
+    const pdf = new File(["pdf"], "report.pdf", { type: "application/pdf" });
+    const sheet = new File(["zip"], "sheet.xlsx", { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    Object.defineProperty(pdf, "arrayBuffer", { value: async () => Uint8Array.of(112, 100, 102).buffer });
+    Object.defineProperty(sheet, "arrayBuffer", { value: async () => Uint8Array.of(122, 105, 112).buffer });
+    const executable = new File(["exe"], "report.pdf.exe", { type: "application/pdf" });
+    const remove = vi.fn();
+    mount([{ id: "pdf", kind: "file", file: pdf }, { id: "sheet", kind: "file", file: sheet },
+      { id: "executable", kind: "file", file: executable }], remove, undefined, true);
+
+    expect([...document.querySelectorAll(".attachment-chip__type")].map(element => element.textContent)).toEqual(["PDF", "XLSX"]);
+    expect(document.querySelector('button[aria-label="Open with default app: report.pdf.exe"]')).toBeNull();
+    expect(document.querySelector('button[aria-label="Remove attachment: report.pdf.exe"]')).not.toBeNull();
+    await act(async () => document.querySelector<HTMLButtonElement>('button[aria-label="Open with default app: report.pdf"]')!.click());
+    expect(openFile).toHaveBeenCalledExactlyOnceWith({ requestId: expect.any(String),
+      file: { name: pdf.name, mediaType: pdf.type, bytes: Uint8Array.of(112, 100, 102) } });
+    expect(document.querySelector("[role=status]")?.textContent).toContain("File opened");
+    await act(async () => document.querySelector<HTMLButtonElement>('button[aria-label="Open with default app: sheet.xlsx"]')!.click());
+    expect(openFile).toHaveBeenCalledTimes(2);
+    expect(document.querySelectorAll("[role=status]")[1]?.textContent).toContain("Couldn't open the file");
+    expect(document.querySelector(".attachment-list")?.textContent).toContain(sheet.name);
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it("shows the document type without offering native open in a browser", () => {
+    mount([{ id: "pdf", kind: "file", file: new File(["pdf"], "report.pdf", { type: "application/pdf" }) }], vi.fn(), undefined, true);
+    expect(document.querySelector(".attachment-chip__type")?.textContent).toBe("PDF");
+    expect(document.querySelector("button.attachment-chip__content")).toBeNull();
+  });
+
+  it("shows a native thumbnail for the attached file and discards a retired rendition", async () => {
+    const thumbnail = "data:image/png;base64,dGVzdA==";
+    let resolvePdf!: (value: string) => void;
+    const thumbnailDraftFile = vi.fn(async ({ name }: { name: string }) => {
+      if (name === "original.pdf") return new Promise<string>(resolve => { resolvePdf = resolve; });
+      return thumbnail;
+    });
+    vi.stubGlobal("jokoDesktop", { capabilities: ["files.draftThumbnail"], thumbnailDraftFile });
+    const pdf = new File(["pdf"], "original.pdf", { type: "application/pdf" });
+    const replacement = new File(["doc"], "replacement.docx");
+    Object.defineProperty(pdf, "arrayBuffer", { value: async () => Uint8Array.of(1).buffer });
+    Object.defineProperty(replacement, "arrayBuffer", { value: async () => Uint8Array.of(2).buffer });
+    const root = mount([{ id: "same-slot", kind: "file", file: pdf }], vi.fn(), undefined, true);
+    await act(async () => {});
+    expect(thumbnailDraftFile).toHaveBeenCalledExactlyOnceWith({ name: pdf.name, bytes: Uint8Array.of(1) });
+    await act(async () => root.render(<ComposerAttachmentTray ownerKey="draft" attachments={[{ id: "same-slot", kind: "file", file: replacement }]}
+      t={t} onRemove={vi.fn()} documentPreviewEnabled />));
+    expect(thumbnailDraftFile).toHaveBeenLastCalledWith({ name: replacement.name, bytes: Uint8Array.of(2) });
+    expect(document.querySelector(".attachment-chip__thumbnail")?.getAttribute("src")).toBe(thumbnail);
+    await act(async () => resolvePdf("data:image/png;base64,b2xk"));
+    expect(document.querySelector(".attachment-chip__thumbnail")?.getAttribute("src")).toBe(thumbnail);
+  });
+
   it("does not offer an unsafe generic opener while keeping removal available", () => {
     const remove = vi.fn();
     mount([{ id: "binary", kind: "file", file: new File(["binary"], "bundle.zip", { type: "application/zip" }) }], remove);
@@ -115,10 +171,16 @@ describe("composer attachment tray", () => {
   });
 });
 
-function mount(attachments: readonly AttachmentDraft[], onRemove = vi.fn(), onSaveImageAnnotations?: Parameters<typeof ComposerAttachmentTray>[0]["onSaveImageAnnotations"]): Root {
+function mount(
+  attachments: readonly AttachmentDraft[],
+  onRemove = vi.fn(),
+  onSaveImageAnnotations?: Parameters<typeof ComposerAttachmentTray>[0]["onSaveImageAnnotations"],
+  documentPreviewEnabled = false
+): Root {
   const host = document.body.appendChild(document.createElement("div"));
   const root = createRoot(host);
   roots.push(root);
-  act(() => root.render(<ComposerAttachmentTray ownerKey="draft" attachments={attachments} t={t} onRemove={onRemove} onSaveImageAnnotations={onSaveImageAnnotations} />));
+  act(() => root.render(<ComposerAttachmentTray ownerKey="draft" attachments={attachments} t={t} onRemove={onRemove}
+    onSaveImageAnnotations={onSaveImageAnnotations} documentPreviewEnabled={documentPreviewEnabled} />));
   return root;
 }

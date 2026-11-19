@@ -245,6 +245,7 @@ const DESKTOP_CHANNELS = {
   cancelFileCopy: "joko:files:copy-cancel",
   openFile: "joko:files:open",
   cancelFileOpen: "joko:files:open-cancel",
+  thumbnailDraftFile: "joko:files:draft-thumbnail",
   openWithCaptureDocument: "joko:files:open-with:document:capture",
   listOpenWithApps: "joko:files:open-with:list",
   retireOpenWithApps: "joko:files:open-with:retire",
@@ -338,6 +339,7 @@ const desktopCapabilities = Object.freeze([
   "inspector.tabs",
   ...((process.platform === "win32" || process.platform === "darwin") ? ["files.copy" as const] : []),
   "files.open",
+  ...((process.platform === "win32" || process.platform === "darwin") ? ["files.draftThumbnail" as const] : []),
   ...(openWithDocumentOccurrence === undefined ? [] : ["files.openWith" as const]),
   "files.revealSource",
   "hardware.dedicatedInput",
@@ -1088,6 +1090,9 @@ const desktopApi = Object.freeze({
   openFile: (request: DesktopOpenFileRequest): Promise<DesktopOpenFileResult> => {
     if (typeof request !== "object" || request === null || Object.keys(request).sort().join(",") !== "file,requestId" || !isNativeFileActionRequestId(request.requestId) || !isDesktopSaveFileRequest(request.file)) return Promise.reject(new TypeError("The file open request is invalid."));
     return ipcRenderer.invoke(DESKTOP_CHANNELS.openFile, request).then(parseFileOpenResult);
+  },
+  thumbnailDraftFile: (file: { readonly name: string; readonly bytes: Uint8Array }): Promise<string | undefined> => {
+    return ipcRenderer.invoke(DESKTOP_CHANNELS.thumbnailDraftFile, file).then(value => typeof value === "string" ? value : undefined);
   },
   listOpenWithApps: (request: DesktopListOpenWithAppsRequest): Promise<DesktopListOpenWithAppsResult> => {
     if (openWithDocumentOccurrence === undefined) {
