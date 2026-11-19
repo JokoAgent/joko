@@ -48,7 +48,8 @@ describe("VoiceInputMediaSession", () => {
   it("does not append a buffered recorder chunk after the capture has failed", async () => {
     const api = voiceApi(); api.getVoiceInputCapabilities = vi.fn(async () => capability); api.startVoiceInput = vi.fn(async () => voiceSession());
     const track = new FakeTrack();
-    const media = new VoiceInputMediaSession({ ownerWindow: window, api, mediaDevices: { getUserMedia: vi.fn(async () => fakeStream(track)) }, mediaRecorder: FakeMediaRecorder as unknown as typeof MediaRecorder, preferences: { playInteractionSound: false } });
+    const onUpdate = vi.fn();
+    const media = new VoiceInputMediaSession({ ownerWindow: window, api, mediaDevices: { getUserMedia: vi.fn(async () => fakeStream(track)) }, mediaRecorder: FakeMediaRecorder as unknown as typeof MediaRecorder, preferences: { playInteractionSound: false }, onUpdate });
     await media.start();
     let finish!: (buffer: ArrayBuffer) => void;
     const arrayBuffer = vi.fn(async () => new Promise<ArrayBuffer>(resolve => { finish = resolve; }));
@@ -57,9 +58,11 @@ describe("VoiceInputMediaSession", () => {
     await vi.waitFor(() => expect(arrayBuffer).toHaveBeenCalledOnce());
     track.dispatchEvent(new Event("ended"));
     expect(media.currentState).toBe("error");
+    expect(onUpdate).toHaveBeenLastCalledWith(expect.objectContaining({ state: "error", error: expect.objectContaining({ code: "captureFailed", trackEnded: true }) }));
     finish(new Uint8Array([1, 2, 3]).buffer);
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(api.appendVoiceAudio).not.toHaveBeenCalled();
+    expect(api.cancelVoiceInput).toHaveBeenCalledExactlyOnceWith("voice-one");
     expect(track.stop).toHaveBeenCalledOnce();
   });
 

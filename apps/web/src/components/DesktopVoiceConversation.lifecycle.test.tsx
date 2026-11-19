@@ -171,6 +171,49 @@ it('ends the original playback lease when stopping while its speech request is i
   } finally { finish(); await view.dispose(); }
 });
 
+it('releases paused speech after the original microphone ends and keeps its draft for a new call', async () => {
+  vi.useFakeTimers();
+  const pcm = new Float32Array(1), scheduled = vi.fn();
+  const audio = { currentTime: 0, state: 'suspended', destination: {},
+    resume: vi.fn(async () => { audio.state = 'running'; }),
+    suspend: vi.fn(async () => { audio.state = 'suspended'; }),
+    close: vi.fn(async () => { audio.state = 'closed'; }),
+    createBuffer: () => ({ getChannelData: () => pcm }), createBufferSource: () => ({ connect: vi.fn(), start: scheduled }) };
+  vi.stubGlobal('AudioContext', function () { return audio; });
+  let reply: DesktopVoiceCallRecord | undefined;
+  const view = await mountCall(request => request.action === Action.SNAPSHOT && reply
+    && (request.callId === reply.callId || request.callId === '') ? Promise.resolve(reply) : undefined);
+  try {
+    vi.mocked(DesktopSpeechPlayer.prototype.play).mockRestore();
+    vi.mocked(DesktopSpeechPlayer.prototype.stop).mockRestore();
+    vi.mocked(DesktopSpeechPlayer.prototype.pause).mockRestore();
+    vi.mocked(DesktopSpeechPlayer.prototype.resume).mockRestore();
+    await view.start();
+    const original = view.call();
+    reply = create(DesktopVoiceCallRecordSchema, { ...original, turns: [{ id: 'ordinary-reply', role: 'assistant', text: 'Keep this answer.', complete: true }] });
+    await act(async () => { await vi.advanceTimersByTimeAsync(850); });
+    expect(scheduled).toHaveBeenCalledOnce();
+    expect(view.requests.filter(request => request.action === Action.READ_SPEECH)).toMatchObject([{ callId: original.callId }]);
+    await act(async () => { view.listener().options.onSpeech(); });
+    expect(audio.state).toBe('suspended');
+    await act(async () => { view.listener().options.onFailure('Keep my unfinished words.', true); });
+    expect(audio.close).toHaveBeenCalledOnce();
+    expect(view.requests.filter(request => request.action === Action.END)).toMatchObject([{ callId: original.callId }]);
+
+    const snapshots = view.requests.filter(request => request.action === Action.SNAPSHOT).length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_500); });
+    expect(view.requests.filter(request => request.action === Action.SNAPSHOT).length).toBeGreaterThan(snapshots);
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain('The microphone disconnected.');
+    expect(scheduled).toHaveBeenCalledOnce();
+    expect(view.requests.filter(request => request.action === Action.SUBMIT)).toEqual([]);
+    expect(view.onClose).not.toHaveBeenCalled();
+    await view.start();
+    expect(view.call().callId).not.toBe(original.callId);
+    expect(document.querySelector('[role="alert"]')).toBeNull();
+    expect(document.querySelector<HTMLTextAreaElement>('.desktop-voice-conversation__input textarea')?.value).toBe('Keep my unfinished words.');
+  } finally { await view.dispose(); vi.unstubAllGlobals(); }
+});
+
 async function mountCall(override?: (request: ControlDesktopVoiceConversationRequest) => Promise<DesktopVoiceCallRecord> | undefined, decision = 'continue') {
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   const before = Object.getOwnPropertyDescriptor(window, 'jokoDesktop');
@@ -194,6 +237,8 @@ async function mountCall(override?: (request: ControlDesktopVoiceConversationReq
     if (request.action === Action.END) active = undefined;
     return toBinary(ControlDesktopVoiceConversationResponseSchema, create(ControlDesktopVoiceConversationResponseSchema, {
       ...(request.action === Action.END ? {} : { call: responseCall }), accepted: true,
+      ...(request.action === Action.SPEAK ? { sampleRate: 24_000 } : {}),
+      ...(request.action === Action.READ_SPEECH ? { pcm: Uint8Array.of(0, 0), speechDone: true } : {}),
       exitDecision: request.action === Action.CLASSIFY_EXIT ? decision : '',
       models: [{ backendId: 'backend', providerId: 'provider', modelId: 'tts-1', displayName: 'Speech', providerName: 'Local fixture', protocol: 'openai', protocolLocked: true }],
       preference: { conversation: { backendId: 'backend', providerId: 'provider', modelId: 'tts-1', protocol: 'openai', voice: 'alloy' }, sentencePlayback: true }

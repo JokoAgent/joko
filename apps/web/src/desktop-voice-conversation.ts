@@ -83,7 +83,8 @@ export class ContinuousVoiceListener {
   #timer?: ReturnType<typeof setTimeout>;
   #draft = '';
   constructor(readonly options: { readonly api: OperationApi; readonly onSpeech: () => void;
-    readonly onText: (id: string, text: string) => void; readonly onState: (state: string) => void; readonly onFailure: (draft: string) => void;
+    readonly onText: (id: string, text: string) => void; readonly onState: (state: string) => void;
+    readonly onFailure: (draft: string, trackEnded?: true) => void;
     readonly onEmpty?: () => void; readonly onDraft?: (text: string) => void }) {}
   async start(): Promise<void> {
     this.stop(); const epoch = this.#epoch;
@@ -123,7 +124,13 @@ export class ContinuousVoiceListener {
           } else this.options.onEmpty?.();
           this.#media = undefined; void media.dispose();
           clearTimeout(this.#timer); this.#timer = setTimeout(() => this.#listen(epoch), 100);
-        } else if (update.state === 'error') this.#fail(epoch);
+        } else if (update.state === 'error') {
+          if (update.error?.trackEnded) {
+            // The failing media owner has released capture and will cancel its ASR session.
+            this.#media = undefined;
+            this.#fail(epoch, true);
+          } else this.#fail(epoch);
+        }
       } });
     this.#media = media;
     void media.start().then(() => {
@@ -131,7 +138,13 @@ export class ContinuousVoiceListener {
       this.#timer = setTimeout(() => { if (epoch === this.#epoch && this.#media === media) { finishing = true; void media.stop().catch(() => this.#fail(epoch)); } }, 30_000);
     }).catch(() => this.#fail(epoch));
   }
-  #fail(epoch: number): void { if (epoch !== this.#epoch) return; const draft = this.#draft; this.stop(); this.options.onFailure(draft); }
+  #fail(epoch: number, trackEnded?: true): void {
+    if (epoch !== this.#epoch) return;
+    const draft = this.#draft;
+    this.stop();
+    if (trackEnded) this.options.onFailure(draft, trackEnded);
+    else this.options.onFailure(draft);
+  }
   stop(): void { this.#epoch++; clearTimeout(this.#timer); this.#timer = undefined; const media = this.#media; this.#media = undefined; void media?.dispose(); }
   get draft(): string { return this.#draft; }
 }

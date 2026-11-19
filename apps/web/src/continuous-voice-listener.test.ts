@@ -39,6 +39,19 @@ it('returns the unfinished draft on capture failure without treating it as a fin
   listener.stop();
 });
 
+it('reports a disconnected microphone with the original unfinished transcript', async () => {
+  const { VoiceMediaError } = await vi.importActual<typeof import('./voice-input-media.js')>('./voice-input-media.js');
+  const onText = vi.fn(), onFailure = vi.fn(), listener = createListener({ onText, onFailure });
+  await listener.start();
+  const source = media.sessions[0]!;
+  source.options.onUpdate?.({ state: 'listening', session: voiceSession({ draft: { text: 'Original draft', source: 'partial' } }) });
+  source.options.onUpdate?.({ state: 'error', error: new VoiceMediaError('captureFailed', { trackEnded: true }) });
+  expect(onFailure).toHaveBeenCalledExactlyOnceWith('Original draft', true);
+  expect(onText).not.toHaveBeenCalled();
+  listener.stop();
+  expect(source.dispose).not.toHaveBeenCalled();
+});
+
 function createListener(callbacks: Partial<ConstructorParameters<typeof ContinuousVoiceListener>[0]>) {
   return new ContinuousVoiceListener({ api: { getVoiceInputCapabilities: async () => ({ support: 'supported', limits: { supportedMimeTypes: ['audio/pcm'] } }) } as unknown as OperationApi,
     onSpeech: vi.fn(), onText: vi.fn(), onState: vi.fn(), onFailure: vi.fn(), ...callbacks });
