@@ -628,6 +628,11 @@ interface MobileFilesContext {
   readonly authority: MobileWorkspaceAuthority;
   readonly key: string;
 }
+interface MobileFilesReconnectLocation {
+  readonly authorityKey: string;
+  readonly directory: string;
+  readonly textPage?: { readonly path: string; readonly sort: MobileFilesSortMode };
+}
 interface MobileFilesPreviewPagerLease {
   readonly context: MobileFilesContext; readonly epoch: number; readonly controller: AbortController;
   readonly window: { readonly kind: "workspace"; readonly parent: string; readonly revision: string } | { readonly kind: "generated"; readonly revision: string };
@@ -1100,6 +1105,7 @@ export class MobileClient {
   #filesSearchAbort?: AbortController;
   #filesPreviewAbort?: AbortController;
   #filesPreviewPager?: MobileFilesPreviewPagerLease;
+  #filesReconnectLocation?: MobileFilesReconnectLocation;
   #filesPagerOpeningAbort?: AbortController;
   #filesPagerNavigationAbort?: AbortController;
   #filesPagerReadActive = false;
@@ -4000,6 +4006,10 @@ export class MobileClient {
     }
     if (!next.window && next.windowHasNewer) next = { ...next, windowHasNewer: false };
     const nextAuthority = this.#filesAuthorityKey(next);
+    if (this.#filesReconnectLocation && (!next.files.open || next.activeProfileId !== this.#state.activeProfileId
+      || next.selectedId !== this.#state.selectedId || next.status === "connected" && nextAuthority !== this.#filesReconnectLocation.authorityKey)) {
+      this.#filesReconnectLocation = undefined;
+    }
     const nextPartnerAuthority = this.#partnerPrivateAuthorityKey(next);
     const sourceSessionChanged = this.#partnerPrivateSourceSessionId !== undefined
       && next.selectedId !== this.#partnerPrivateSourceSessionId;
@@ -6001,6 +6011,13 @@ export class MobileClient {
       if (this.#hasOfflineProjection()) await this.connectSaved(this.#activeProfileId!);
       return;
     }
+    const files = this.#state.files;
+    const authorityKey = this.filesAuthorityKey();
+    if (files.open && files.status === "ready" && authorityKey && files.authorityKey === authorityKey && files.location.kind === "workspace") {
+      const path = files.preview?.kind === "text" ? files.preview.workspaceEntry?.relativePath : undefined;
+      this.#filesReconnectLocation = { authorityKey, directory: files.location.path,
+        ...(path && workspaceParentPath(path) === files.location.path ? { textPage: { path, sort: files.previewPager?.sort ?? "name" } } : {}) };
+    }
     const epoch = this.#retire();
     const signal = this.#abort!.signal;
     const current = () => this.#current(epoch);
@@ -7534,7 +7551,21 @@ export class MobileClient {
   }
 
   async openFiles(): Promise<void> {
-    await this.#openFilesAt("");
+    const files = this.#state.files;
+    const authorityKey = this.filesAuthorityKey();
+    const resume = files.open && files.status === "offline" && this.#filesReconnectLocation?.authorityKey === authorityKey
+      ? this.#filesReconnectLocation : undefined;
+    this.#filesReconnectLocation = undefined;
+    const opening = this.#openFilesAt(resume?.directory ?? "");
+    const epoch = this.#filesEpoch;
+    await opening;
+    const page = resume?.textPage;
+    const current = this.#state.files;
+    if (!page || !authorityKey || !this.#currentFiles(epoch, authorityKey) || current.status !== "ready" || current.preview) return;
+    const entry = current.entries.find((item) => item.relativePath === page.path);
+    if (entry?.revision && entry.kind === FileKind.REGULAR && isTextFilePreviewMetadata(entry.mediaType, workspaceBasename(page.path))) {
+      await this.openFilesPreviewPager({ kind: "workspace-entry", entry }, page.sort);
+    }
   }
 
   async #openFilesAt(relativePath: string): Promise<void> {
@@ -7562,6 +7593,7 @@ export class MobileClient {
   }
 
   closeFiles(): void {
+    this.#filesReconnectLocation = undefined;
     this.#cancelFilesRequests();
     this.#set({ files: emptyMobileFilesState() });
   }
