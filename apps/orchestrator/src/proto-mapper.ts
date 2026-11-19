@@ -346,6 +346,7 @@ export interface EventMappingContext {
   readonly hideSideChatHistoryPrefix?: true;
   readonly sharedTaskAuthor?: import("@joko/store").SharedTaskAuthor;
   readonly learning?: import("@joko/core").PartnerLearningFeedback;
+  readonly partnerPackageOpening?: import("@joko/core").PartnerPackageOpeningMessage & { readonly starterAvailable: boolean };
   readonly queueItem?: QueueItemRecord;
   readonly queueControl?: QueueControlRecord;
   readonly interaction?: InteractionRecord;
@@ -3187,6 +3188,12 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
         partnerPrivateOrigin: payload.partnerPrivateOrigin === undefined ? undefined
           : message<contract.PartnerPrivateMessageOrigin>("joko.v1.PartnerPrivateMessageOrigin", payload.partnerPrivateOrigin),
         learning: context.learning === undefined ? undefined : toProtoLearningFeedback(context.learning),
+        partnerPackageOpening: context.partnerPackageOpening === undefined ? undefined
+          : message<contract.PartnerPackageOpening>("joko.v1.PartnerPackageOpening", {
+              greeting: context.partnerPackageOpening.greeting,
+              starterOptions: [...context.partnerPackageOpening.starterOptions],
+              starterAvailable: context.partnerPackageOpening.starterAvailable
+            }),
         ...toProtoMessageGenerationTiming(payload)
       }));
     }

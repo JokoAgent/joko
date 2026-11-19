@@ -284,7 +284,7 @@ import { PartnerTodoManager, PartnerTodoTools } from "./partner-todos.js";
 import { PartnerMessagingRuntime, PartnerMessagingTools } from './partner-messaging.js';
 import { PartnerRoutineTools } from "./partner-routine-tools.js";
 import { PartnerImportManager } from "./partner-import-manager.js";
-import { partnerPackageOpening } from "./partner-package-opening.js";
+import { partnerPackageOpening, partnerPackageStarterAvailable } from "./partner-package-opening.js";
 import { PartnerImportStorage } from "./partner-import-storage.js";
 import { PartnerImportRuntime } from "./partner-import-runtime.js";
 import { adoptPartnerImportSettings, createPartnerImportEffects, isSavedPackageMissingDefault, preparePartnerImportCreation } from "./partner-import-effects.js";
@@ -2908,20 +2908,21 @@ export async function createOrchestratorApplication(
         const welcomeEventId = `import-message-${createHash("sha256").update(JSON.stringify([result.canonicalSessionId, `package-welcome-${result.requestId}`])).digest("hex")}`;
         if (store.findEvent(welcomeEventId, { includeTombstoned: true })) return;
         if (result.checks.some(check => check.status === "needs-attention" && !check.entryId.startsWith("routine-") && check.message !== "MEMORY_DISABLED")) return;
-        if (store.listEvents({ sessionId: result.canonicalSessionId, limit: 1_000 }).some(event => event.payload.type === "message_complete" && event.payload.role === "user")) return;
         const current = () => {
           try {
             assertImportService();
             const profile = partners.getPartner(result.partnerId);
             return profile.lifecycle === "active" && profile.canonicalSessionId === result.canonicalSessionId
-              && !store.listEvents({ sessionId: result.canonicalSessionId!, limit: 1_000 }).some(event => event.payload.type === "message_complete" && event.payload.role === "user");
+              && partnerPackageStarterAvailable(store, result.canonicalSessionId!);
           } catch { return false; }
         };
         if (!current()) return;
         const opening = await partnerPackageOpening(nativePackage, auxiliaryText, current);
         if (!current()) return;
+        const fallback = [opening.greeting, ...opening.starterOptions.map(option => `• ${option}`)].join("\n\n");
         sessionHost.appendImportMessage(result.canonicalSessionId, `package-welcome-${result.requestId}`,
-          opening, () => { if (!current()) throw new Error("Partner opening owner changed."); });
+          fallback, () => { if (!current()) throw new Error("Partner opening owner changed."); },
+          opening.starterOptions.length ? opening : undefined);
         return;
       }
       sessionHost.appendImportMessage(result.canonicalSessionId, `import-saved-${result.requestId}`,

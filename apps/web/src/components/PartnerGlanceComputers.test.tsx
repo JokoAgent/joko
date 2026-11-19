@@ -2,9 +2,10 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { ListPartnerHomeTargetsResponseSchema, type ListPartnerHomeTargetsResponse, type PartnerHomeApi } from "@joko/contracts";
+import { ListPartnerHomeTargetsResponseSchema, ListPartnerTodosResponseSchema, PartnerGlanceTodos, PartnerTodoSchema,
+  type ListPartnerHomeTargetsResponse, type PartnerAutonomyApi, type PartnerHomeApi } from "@joko/contracts";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { PartnerGlanceComputers } from "./PartnerGlanceContents.js";
+import { PartnerGlanceComputers, PartnerGlanceContents } from "./PartnerGlanceContents.js";
 
 let root: Root | undefined;
 beforeEach(() => vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true));
@@ -34,4 +35,33 @@ it("aborts a delayed original catalog read when the glance closes", async () => 
   expect(signal?.aborted).toBe(true);
   await act(async () => { finish(create(ListPartnerHomeTargetsResponseSchema, { home: { deviceName: "Retired result" } })); });
   expect(host.textContent).not.toContain("Retired result");
+});
+
+it("returns keyboard focus to the same Todo row when its menu is dismissed", async () => {
+  const todos = ["First matter", "Second matter"].map((title, index) => create(PartnerTodoSchema, { id: `todo-${index}`, title, status: "open" }));
+  const updateTodo = vi.fn();
+  const api = { todos: vi.fn(async (_id: string, view: "open" | "done") => create(ListPartnerTodosResponseSchema, {
+    partnerRevision: { value: 1n }, items: view === "open" ? todos : [], total: view === "open" ? todos.length : 0
+  })), outputs: vi.fn(async () => []), updateTodo } as unknown as PartnerAutonomyApi;
+  const editor = new PartnerGlanceTodos(api, "partner");
+  const close = vi.fn();
+  const host = document.createElement("div"); document.body.append(host); root = createRoot(host);
+  try {
+    await act(async () => {
+      root!.render(<PartnerGlanceContents api={api} partnerId="partner" editor={editor} locale="en" enabled close={close} />);
+      editor.activate();
+    });
+    const row = [...host.querySelectorAll("button")].find(button => button.textContent === "Second matter")!;
+    row.focus();
+    for (const event of [{ key: "F10", shiftKey: true }, { key: "ContextMenu" }]) {
+      await act(async () => { row.dispatchEvent(new KeyboardEvent("keydown", { ...event, bubbles: true, cancelable: true })); });
+      const remove = host.querySelector<HTMLButtonElement>("[role=menuitem]")!;
+      expect(document.activeElement).toBe(remove);
+      await act(async () => { remove.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+      expect(host.querySelector("[role=menu]")).toBeNull();
+      expect(document.activeElement).toBe(row);
+    }
+    expect(close).not.toHaveBeenCalled();
+    expect(updateTodo).not.toHaveBeenCalled();
+  } finally { editor.dispose(); }
 });

@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { type Server } from "node:http";
 import { type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -22,7 +22,7 @@ import {
 } from "@joko/contracts";
 import { preparePortableSessionImport } from "@joko/orchestrator";
 import { _electron, type ElectronApplication, type Page, type Request } from "playwright-core";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { waitFor } from "./fixture.js";
 import { createE2eClients, type E2eClients } from "./connect-clients.js";
@@ -283,6 +283,7 @@ describe("packaged Desktop Pi compaction", () => {
   packagedIt("saves a real portable task only after the original Desktop window confirms a destination", { timeout: 150_000 }, async () => {
     fixture = await RealPiSystemFixture.start({ keepRoot: true });
     const manager = await fixture.pair("Packaged export manager");
+    expect((await manager.clients.partner.listPartners({})).partners).toHaveLength(0);
     const name = "Packaged portable task";
     const prompt = "Retain this turn in the portable task package.";
     const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId, createSessionMutation({
@@ -293,6 +294,37 @@ describe("packaged Desktop Pi compaction", () => {
     const runId = queueRunIdFrom(await submit(manager.clients.operation, manager.connectionId, sendInputMutation(sessionId, generation, prompt)));
     await waitFor(() => manager.clients.run.getRun({ runId }), ({ run }) => run?.state === RunState.SUCCEEDED, "packaged export source turn", 30_000);
 
+    const exportPath = "/joko.v1.PortableSessionService/ExportPortableSession";
+    const activityPath = "/joko.v1.TaskActivityService/WatchTaskActivity";
+    const pendingHttp = new Map<symbol, { method: string; path: string; sourcePort: number | undefined }>();
+    const activeTaskActivityRequests = () => [...pendingHttp.values()].filter(request => request.path === activityPath && request.method === "POST").length;
+    const exportHttp: Array<{ method: string; phase: string; status?: number }> = [];
+    const stopObserving = fixture.observePublicRequests((request, response) => {
+      const path = request.url?.split("?", 1)[0];
+      if (path === undefined || !/^\/joko\.v1\.[A-Za-z]+\/[A-Za-z]+$/u.test(path)) return;
+      const method = request.method ?? "";
+      const key = Symbol();
+      pendingHttp.set(key, { method, path, sourcePort: request.socket.remotePort });
+      if (path === exportPath) exportHttp.push({ method, phase: "received" });
+      response.once("finish", () => {
+        if (path === exportPath) exportHttp.push({ method, phase: "finished", status: response.statusCode });
+      });
+      response.once("close", () => pendingHttp.delete(key));
+    });
+    const host = fixture.application.sessionHost;
+    const originalExport = host.exportPortableSession.bind(host);
+    const exportStages: string[] = [];
+    const exportHandler = vi.spyOn(host, "exportPortableSession").mockImplementation(async (...args) => {
+      exportStages.push("started");
+      try {
+        const result = await originalExport(...args);
+        exportStages.push("built");
+        return result;
+      } catch (error) {
+        exportStages.push("rejected");
+        throw error;
+      }
+    });
     const main = await launchConnectedDesktop(fixture, "Packaged export Desktop");
     const application = desktop!;
     const taskRow = main.locator(`.sidebar [data-session-id="${sessionId}"]`).first();
@@ -300,6 +332,19 @@ describe("packaged Desktop Pi compaction", () => {
     await taskRow.click();
     await main.locator(timeline).getByText(prompt, { exact: true }).waitFor({ state: "visible" });
     const existingWindows = new Set(application.windows());
+    const partnerReads: Array<{ method: string; phase: string; status?: number }> = [];
+    const observePartnerRead = (request: Request, phase: string, status?: number): void => {
+      const method = /^\/joko\.v1\.PartnerService\/(ListPartners|GetPartnerTopic|ListPartnerSessions)$/u.exec(new URL(request.url()).pathname)?.[1];
+      if (method === undefined || partnerReads.length >= 40 || request.serviceWorker() !== null) return;
+      const owner = request.frame().page();
+      const url = URL.canParse(owner.url()) ? new URL(owner.url()) : undefined;
+      if (existingWindows.has(owner) || url?.searchParams.get("bootSession") !== sessionId) return;
+      partnerReads.push({ method, phase, ...(status === undefined ? {} : { status }) });
+    };
+    const context = main.context();
+    context.on("request", request => observePartnerRead(request, "request"));
+    context.on("requestfailed", request => observePartnerRead(request, "failed"));
+    context.on("response", response => observePartnerRead(response.request(), "response", response.status()));
     await taskRow.click({ button: "right" });
     await main.getByRole("menuitem", { name: "Open in new window", exact: true }).click({ noWaitAfter: true });
     const page = await waitFor(async () => application.windows().find((candidate) => {
@@ -308,16 +353,24 @@ describe("packaged Desktop Pi compaction", () => {
     }), (candidate) => candidate !== undefined, "the original packaged task window", 30_000);
     if (page === undefined) throw new Error("The separate task window did not use the selected task identity.");
     const pageErrors = observePageErrors(page);
-    const sent: Request[] = [];
+    const isExportRequest = (request: Request): boolean => new URL(request.url()).pathname === exportPath;
+    const exportRpc = { requests: 0, responses: [] as number[], transportFailures: [] as string[] };
     page.on("request", (request) => {
-      if (new URL(request.url()).pathname.endsWith("/ExportPortableSession")) sent.push(request);
+      if (isExportRequest(request)) exportRpc.requests += 1;
+    });
+    page.on("response", (response) => {
+      if (isExportRequest(response.request())) exportRpc.responses.push(response.status());
+    });
+    page.on("requestfailed", request => {
+      if (isExportRequest(request)) exportRpc.transportFailures.push(request.failure()?.errorText ?? "unknown");
     });
     const pane = page.locator(`.session-pane[data-input-session-id="${sessionId}"]`);
     try {
       await page.locator(timeline).getByText(prompt, { exact: true }).waitFor({ state: "visible", timeout: 30_000 });
-      await pane.getByLabel(`Actions for ${name}`, { exact: true }).click();
+      await pane.locator("summary").and(pane.getByLabel(`Actions for ${name}`, { exact: true })).click();
       await pane.getByRole("menuitem", { name: "Export task…", exact: true }).click();
     } catch (cause) {
+      const header = await pane.locator(".session-header").first().innerText({ timeout: 2_000 }).catch(() => undefined);
       const evidence = process.env.RUNNER_TEMP === undefined ? undefined
         : join(process.env.RUNNER_TEMP, "joko-web-evidence", "packaged-desktop", "portable-export");
       if (evidence !== undefined) {
@@ -325,45 +378,81 @@ describe("packaged Desktop Pi compaction", () => {
         await page.screenshot({ path: join(evidence, "task-window-failure.png"), timeout: 5_000,
           mask: [page.locator("input:visible, textarea:visible")] }).catch(() => undefined);
       }
-      throw new Error(`The original task window did not open its export options. ${JSON.stringify({ pageErrors })}`, { cause });
+      throw new Error(`The original task window did not open its export options. ${JSON.stringify({ header, partnerReads, pageErrors })}`, { cause });
     }
     const nativeWindow = await application.browserWindow(page);
     const windowId = await nativeWindow.evaluate(window => window.id);
     await nativeWindow.dispose();
     const target = resolve(profileDirectory!, "user-selected.jshare");
-    await application.evaluate(({ BrowserWindow, dialog }, { windowId, target }) => {
+    const picker = await application.evaluateHandle(({ BrowserWindow, dialog }, { windowId, target }) => {
       const owner = BrowserWindow.fromId(windowId);
+      if (owner === null) throw new Error("The original task window is unavailable to the save picker.");
       const original = dialog.showSaveDialog;
-      let cancelled = false;
+      const choices: Array<"cancelled" | "confirmed" | "wrong-window"> = [];
       dialog.showSaveDialog = async (actualOwner: unknown) => {
-        if (owner === null || actualOwner !== owner || owner.isDestroyed()) throw new Error("Save picker used a different Desktop window.");
-        if (!cancelled) {
-          cancelled = true;
+        if (actualOwner !== owner || owner.isDestroyed()) {
+          choices.push("wrong-window");
+          throw new Error("Save picker used a different Desktop window.");
+        }
+        if (choices.length === 0) {
+          choices.push("cancelled");
           return { canceled: true, filePath: "" };
         }
+        choices.push("confirmed");
         dialog.showSaveDialog = original;
         return { canceled: false, filePath: target };
       };
+      return choices;
     }, { windowId, target });
 
     const exportDialog = page.getByRole("alertdialog", { name: "Export task", exact: true });
     const exportButton = exportDialog.getByRole("button", { name: "Export", exact: true });
-    expect(sent).toHaveLength(0);
-    await exportButton.click();
-    await waitFor(() => exportButton.isEnabled(), Boolean, "cancelled task save returns to export options", 10_000);
-    expect(await exportDialog.getByRole("alert").count()).toBe(0);
-    expect(sent).toHaveLength(0);
-    await expect(readFile(target)).rejects.toMatchObject({ code: "ENOENT" });
+    const alert = exportDialog.getByRole("alert");
+    const banners = page.locator(".app-banners [role=status]");
+    const exported = banners.getByText(/^Task package exported/u);
+    try {
+      expect(exportRpc.requests).toBe(0);
+      await exportButton.click();
+      expect(await waitFor(() => picker.jsonValue(), choices => choices.length > 0, "original task save picker", 10_000))
+        .toEqual(["cancelled"]);
+      await waitFor(() => exportButton.isEnabled(), Boolean, "cancelled task save returns to export options", 10_000);
+      expect(await alert.count()).toBe(0);
+      expect(exportRpc.requests).toBe(0);
+      await expect(readFile(target)).rejects.toMatchObject({ code: "ENOENT" });
 
-    await exportButton.click();
-    await page.getByText("Task package exported.", { exact: true }).waitFor({ state: "visible", timeout: 30_000 });
-    expect(sent).toHaveLength(1);
-    const saved = preparePortableSessionImport(await readFile(target));
-    expect(saved.manifest).toMatchObject({ title: name, fidelity: "full" });
-    expect(saved.nativeSession?.bytes.byteLength).toBeGreaterThan(0);
-    expect(saved.projection.messages.find(message => message.role === "user")?.blocks)
-      .toContainEqual(expect.objectContaining({ type: "text", text: prompt }));
-    await page.close();
+      await exportButton.click();
+      await exported.or(alert).first().waitFor({ state: "visible", timeout: 30_000 });
+      expect(await picker.jsonValue()).toEqual(["cancelled", "confirmed"]);
+      expect(await alert.allTextContents()).toEqual([]);
+      expect(await exported.textContent()).toBe("Task package exported.");
+      expect(exportRpc.requests).toBe(1);
+      expect(exportRpc.responses).toEqual([200]);
+      expect(exportHttp.filter(exchange => exchange.method === "POST"))
+        .toEqual([{ method: "POST", phase: "received" }, { method: "POST", phase: "finished", status: 200 }]);
+      expect(exportStages).toEqual(["started", "built"]);
+      const saved = preparePortableSessionImport(await readFile(target));
+      expect(saved.manifest).toMatchObject({ title: name, fidelity: "full" });
+      expect(saved.nativeSession?.bytes.byteLength).toBeGreaterThan(0);
+      expect(saved.projection.messages.find(message => message.role === "user")?.blocks)
+        .toContainEqual(expect.objectContaining({ kind: "text", text: prompt }));
+      await waitFor(async () => activeTaskActivityRequests(), count => count === 2,
+        "one task activity subscription for each of the two open windows", 10_000);
+      await page.close();
+      await waitFor(async () => activeTaskActivityRequests(), count => count === 1,
+        "only the original main window keeps its task activity subscription", 10_000);
+    } catch (cause) {
+      const [choices, alerts, notices, bytes] = await Promise.all([
+        picker.jsonValue().catch(() => undefined), alert.allTextContents().catch(() => []),
+        banners.allTextContents().catch(() => []), stat(target).then(file => file.size, () => undefined)
+      ]);
+      throw new Error(`The original task window did not finish portable export. ${JSON.stringify({
+        choices, exportRpc, exportHttp, exportStages, pendingHttp: [...pendingHttp.values()], alerts, notices, bytes, pageErrors
+      })}`, { cause });
+    } finally {
+      await picker.dispose();
+      exportHandler.mockRestore();
+      stopObserving();
+    }
   });
 
   packagedIt("shows real manual outcomes, focus, route isolation and restart in the current Desktop artifact", { timeout: 180_000 }, async () => {

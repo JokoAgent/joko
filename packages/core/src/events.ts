@@ -176,6 +176,7 @@ export type EventPayload =
       readonly partnerPrivateOrigin?: PartnerPrivateMessageOrigin;
       readonly collaborationReportOrigin?: CollaborationReportOrigin;
       readonly taskMessageOrigin?: TaskMessageOrigin;
+      readonly partnerPackageOpening?: PartnerPackageOpeningMessage;
       /** Per-message provider accounting when authoritatively reported. */
       readonly usage?: UsageSnapshot;
       /** Native-observed replacement of the selected model, scoped to this assistant completion. */
@@ -424,6 +425,12 @@ export interface ReviewEvidenceProjection {
   };
   readonly targetKind: ReviewRunProjection["targetKind"];
   readonly capturedAt: UnixMillis;
+}
+
+/** Service-authored content attached to the original Partner package import completion. */
+export interface PartnerPackageOpeningMessage {
+  readonly greeting: string;
+  readonly starterOptions: readonly string[];
 }
 
 export type MessageBlock =

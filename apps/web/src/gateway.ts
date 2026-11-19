@@ -2536,9 +2536,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return false;
   }
 
-  async sendRichAnswer(sessionId: string, expectedGeneration: bigint, receiptKey: string, text: string, callerSignal?: AbortSignal): Promise<boolean> {
+  async sendRichAnswer(sessionId: string, expectedGeneration: bigint, receiptKey: string, text: string, callerSignal?: AbortSignal,
+    partnerStarterEventId?: string): Promise<boolean> {
     if (!text.trim() || text.length > 16_000 || !receiptKey || receiptKey.length > 8192 || expectedGeneration < 1n) {
       throw new GatewayError("A bounded answer and its original task generation are required.");
+    }
+    if (partnerStarterEventId !== undefined && (this.#taskSharing !== undefined || !/^import-message-[a-f0-9]{64}$/u.test(partnerStarterEventId))) {
+      throw new GatewayError("The Partner opening requires its original owned task.");
     }
     const scope = this.captureActionScope(callerSignal);
     const snapshotGeneration = this.#snapshot?.generation;
@@ -2554,7 +2558,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     };
     current();
     const client = createClient(OperationService, scope.transport);
-    const intent = ["rich-answer", this.#profile?.serverId, this.#profile?.id, this.#taskSharing?.scopeKey, sessionId, receiptKey, text];
+    const intent = ["rich-answer", this.#profile?.serverId, this.#profile?.id, this.#taskSharing?.scopeKey, sessionId, receiptKey, text,
+      ...(partnerStarterEventId === undefined ? [] : [partnerStarterEventId])];
     const confirmReceipt = async (operationId: string, operation: Operation) => {
       if (operation.operationId !== operationId || this.#taskSharing === undefined && operation.connectionId !== this.#profile?.id) {
         throw new GatewayError("The answer operation receipt does not match its owner.");
@@ -2586,6 +2591,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         current();
       }
       const operation = await this.submit({ case: "sendInput", value: { sessionId, deliveryMode: QueueDeliveryMode.PROMPT,
+        ...(partnerStarterEventId === undefined ? {} : { partnerStarterEventId }),
         input: { parts: [{ content: { case: "text", value: text } }] } } }, false,
       [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration }], scope.signal, undefined, operationId, true);
       await confirmReceipt(operationId, operation);
@@ -13841,6 +13847,12 @@ function reconcileCompletedAssistantMessage(
     throw new GatewayError("Orchestrator returned invalid model substitution metadata.");
   }
   const learning = projectPartnerLearningFeedback(completed.learning);
+  const opening = completed.partnerPackageOpening;
+  if (opening && (!/^import-message-[a-f0-9]{64}$/u.test(event.eventId) || messageId !== event.eventId
+    || !opening.greeting.trim() || opening.greeting.length > 12_000 || opening.starterOptions.length > 4
+    || opening.starterOptions.some(option => !option.trim() || option.length > 200))) {
+    throw new GatewayError("Orchestrator returned invalid Partner opening metadata.");
+  }
   const streamAttempt = completed.nativeIdentity === undefined && completed.blocks.some(block => block.content.case === "text")
     ? assistantStreamAttempt(event) : undefined;
   const streamOwner = thinkingStreamOwner(event);
@@ -13871,7 +13883,7 @@ function reconcileCompletedAssistantMessage(
       : []
   ));
   const firstTextIndex = completed.blocks.findIndex((block) => block.content.case === "text");
-  const finalText = completedMessageText(completed.blocks);
+  const finalText = opening?.greeting ?? completedMessageText(completed.blocks);
   const attachments = completedMessageAttachments(completed.blocks);
   const finalItems: Array<{ readonly contentIndex: number; readonly item: TimelineItemView }> = [];
   const projectedToolItems = new Map<string, { contentIndex: number; item: TimelineItemView }>();
@@ -13900,6 +13912,7 @@ function reconcileCompletedAssistantMessage(
           ...timelinePrivateMessageOrigin(completed.partnerPrivateOrigin),
           streaming: false,
           ...(learning === undefined ? {} : { learning }),
+          ...(opening === undefined ? {} : { partnerPackageOpening: { starterOptions: opening.starterOptions, starterAvailable: opening.starterAvailable } }),
           ...(attachments.length > 0 ? { attachments } : {}),
           ...(usage === undefined ? {} : { usage }),
           ...(turnUsage === undefined ? {} : { turnUsage }),

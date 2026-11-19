@@ -3,6 +3,7 @@ import { TaskActivityBanner, useTaskActivityView } from "./TaskActivity.js";
 import { taskSourceKey } from "../task-sharing.js";
 import { resolveModelSpeed } from "../model-speed.js";
 import { McpAppTimelineProvider } from "./McpAppCard.js";
+import { DesktopMessageReadAloudProvider } from "./DesktopMessageReadAloud.js";
 import { richMediaWorkspacePath, decodeModelSpeed } from "@joko/contracts";
 import { ExtensionCardTimelineProvider } from "./ExtensionCard.js";
 import { ExtensionMailReaderProvider } from "./ExtensionMailReader.js";
@@ -570,6 +571,11 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     && session.automationOrigin === undefined && (partnerConversation === undefined || partnerConversation.kind === "task");
   const canSendRichAnswer = canAddMessageReference && !session.archived && session.state !== "closed"
     && controller.state.connectionState === "connected" && artifactCatalogDocumentOwner !== undefined;
+  const canSendPartnerStarter = canSendRichAnswer && !guest && !sideChatRuntimeReadOnly && interaction === undefined
+    && controller.state.taskSource?.kind !== "joined"
+    && (partnerConversation === undefined || partnerConversation.confirmed && partnerConversation.editable)
+    && !queue.some(item => item.sessionId === session.id);
+  const partnerStarterAllowed = useRef(canSendPartnerStarter); partnerStarterAllowed.current = canSendPartnerStarter;
   const richAnswerSourceKey = taskSourceKey(controller.state.taskSource ?? { kind: "own" });
   const richAnswerSendOwnerKey = JSON.stringify([timelineResourceOwnerKey, richAnswerSourceKey, controller.state.activeProfile?.id,
     controller.state.activeProfile?.serverId, controller.state.activeProfile?.origin, controller.state.connectionGeneration,
@@ -595,11 +601,14 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       document?.defaultView?.removeEventListener("pageshow", restore);
     };
   }, [richAnswerSendScope]);
-  const sendRichAnswer = async (text: string, receiptKey: string): Promise<boolean> => {
+  const sendRichAnswer = async (text: string, receiptKey: string, partnerStarterEventId?: string): Promise<boolean> => {
     if (!canSendRichAnswer || richAnswerSendScopeRef.current !== richAnswerSendScope || richAnswerSendScope.abort.signal.aborted
       || paneRef.current?.ownerDocument !== artifactCatalogDocumentOwner?.document || paneRef.current?.ownerDocument.hidden
-      || !sessionRouteIsCurrent(controllerRef.current.state.route, session.id)) return false;
-    return controller.sendRichAnswer(session.id, session.generation, receiptKey, text, richAnswerSendScope.abort.signal);
+      || !sessionRouteIsCurrent(controllerRef.current.state.route, session.id)
+      || partnerStarterEventId !== undefined && !partnerStarterAllowed.current) return false;
+    return partnerStarterEventId === undefined
+      ? controller.sendRichAnswer(session.id, session.generation, receiptKey, text, richAnswerSendScope.abort.signal)
+      : controller.sendRichAnswer(session.id, session.generation, receiptKey, text, richAnswerSendScope.abort.signal, partnerStarterEventId);
   };
   const canForkMessage = !reviewReadOnly && !sideChatRuntimeReadOnly && canDeriveWorkspace
     && backend?.capabilities.get("session.fork")?.supported === true;
@@ -2396,6 +2405,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   );
 
   return (
+    <DesktopMessageReadAloudProvider controller={controller} session={session} items={visibleTimeline}
+      enabled={!guest && !reviewReadOnly && !sideChatRuntimeReadOnly && !session.archived}>
     <main ref={paneRef} className={cx("session-pane", presentation === "filesRail" && "session-pane--files-rail")} data-input-session-id={session.id} data-input-session-generation={session.generation.toString()} aria-label={session.name} onKeyDownCapture={(event) => {
       const modalOpen = document.body.classList.contains("modal-open");
       const retryEscapeInput: RetryEscapeInput = {
@@ -2594,6 +2605,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         viewportOwnerKey={JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.activeProfile?.origin, session.id, String(session.generation)])}
         answerStateOwnerKey={JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.activeProfile?.origin, richAnswerSourceKey, session.id, session.createdAt])}
         onSendRichAnswer={canSendRichAnswer ? sendRichAnswer : undefined}
+        onSendPartnerStarter={canSendPartnerStarter ? (text, eventId) => sendRichAnswer(text, eventId, eventId) : undefined}
         sessionId={session.id}
         sessionName={session.name}
         workspaceId={canOpenWorkspaceReferences && controller.state.connectionState === "connected" ? workspace?.id : undefined}
@@ -2878,6 +2890,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         {rewindPreview !== undefined && <div className="rewind-preview timeline-rewind-preview"><Pill tone={rewindPreview.safety === "blocked" ? "danger" : rewindPreview.safety === "requiresConfirmation" ? "warning" : "success"}>{rewindPreview.safety}</Pill><p>{t("workspace.restoreCount", { count: rewindPreview.inversePaths.length })}</p>{rewindPreview.conflicts.length > 0 && <section><strong>{t("workspace.conflicts")}</strong><ul>{rewindPreview.conflicts.map((value) => <li key={value}>{value}</li>)}</ul></section>}{rewindPreview.gaps.length > 0 && <section><strong>{t("workspace.captureGaps")}</strong><ul>{rewindPreview.gaps.map((value) => <li key={value}>{value}</li>)}</ul></section>}{rewindPreview.dialogueOnlyAvailable && <label className="rewind-dialogue-only"><CheckboxControl checked={dialogueOnlyRewind} onChange={(event) => setDialogueOnlyRewind(event.target.checked)} /><span>{t("workspace.dialogueOnly")}</span></label>}<div className="modal__actions"><Button onClick={() => setRewindPreview(undefined)}>{t("common.cancel")}</Button><Button tone={dialogueOnlyRewind ? "secondary" : "danger"} disabled={rewindPreview.safety === "blocked" && !dialogueOnlyRewind} onClick={() => { const preview = rewindPreview; setRewindPreview(undefined); runAction(`rewind:${preview.changeSetId}`, async () => { if (!preview.isCurrent()) throw new Error(t("timeline.rewindStale")); await preview.execute(preview.workspaceId, preview.id, preview.changeSetId, dialogueOnlyRewind); }); }}>{dialogueOnlyRewind ? t("workspace.rewindDialogue") : t("workspace.restoreFiles")}</Button></div></div>}
       </Modal>
     </main>
+    </DesktopMessageReadAloudProvider>
   );
 }
 

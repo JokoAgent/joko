@@ -136,6 +136,60 @@ async function invoke(handler: unknown, request: unknown, handlerContext: unknow
   return await result;
 }
 
+it("admits only an authored Partner starter for the original task's first input", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "joko-partner-opening-"));
+  const store = new OperationalStore(":memory:");
+  const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [] });
+  const host = new SessionHost(store, artifacts, []), connections = new ConnectionManager(store);
+  const token = "partner-opening-owner-key";
+  const owner = store.createConnection({ id: "partner-opening-owner", name: "Owner", authKeyDigest: digestAuthKey(token) });
+  store.upsertBackend({ id: "backend", adapterKind: "fixture", instanceGeneration: 1, displayName: "Backend", version: "0.1.0", health: "healthy",
+    installationState: "installed", authenticationState: "authenticated", capabilities: new Map([["input.text", { key: "input.text", supported: true }]]),
+    models: [], tools: [], diagnostics: [] });
+  store.upsertTarget({ id: "project", backendId: "backend", displayName: "Project", workspaceRoot: directory, managed: false, trusted: true });
+  for (const id of ["partner-task", "other-task"]) store.createSession({ id, backendId: "backend", targetId: "project", title: "Task",
+    binding: { opaqueRef: `native:${id}`, nativeSessionId: id, generation: 7 }, pinned: false, archived: false,
+    permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
+  const drain = vi.spyOn(host, "drainQueuedInput").mockImplementation(() => undefined);
+  let active = true;
+  const application = { ...stubApplication({ store, partners: { canonicalCaller: (sessionId: string) => active && sessionId === "partner-task" ? {} : undefined } }), connections, sessionHost: host };
+  const transport = createRouterTransport(router => registerConnectServices(router, application));
+  const operations = createClient(contract.OperationService, transport), sessions = createClient(contract.SessionService, transport);
+  const auth = { headers: { authorization: `Bearer ${token}` } };
+  const opening = { greeting: "Where should we start?", starterOptions: ["Review code", "Plan delivery"] };
+  const fallback = `${opening.greeting}\n\n• Review code\n\n• Plan delivery`;
+  const eventId = `import-message-${createHash("sha256").update(JSON.stringify(["partner-task", "package-welcome-test"])).digest("hex")}`;
+  const readOpening = async () => (await sessions.listSessionTimeline({ sessionId: "partner-task", aroundEventId: eventId, limit: 5 }, auth))
+    .events.find(event => event.eventId === eventId)?.payload?.kind;
+  const start = (operationId: string, text: string, sessionId = "partner-task") => ({ operationId, connectionId: owner.id,
+    mutation: create(contract.OperationMutationSchema, { preconditions: [{ entity: { kind: contract.EntityKind.SESSION, id: sessionId }, expectedGeneration: 7n }],
+      payload: { case: "sendInput", value: create(contract.SendInputMutationSchema, {
+        sessionId, deliveryMode: contract.QueueDeliveryMode.PROMPT, partnerStarterEventId: eventId,
+        input: create(contract.InputContentSchema, {
+          parts: [create(contract.InputPartSchema, { content: { case: "text", value: text } })]
+        })
+      }) } }) });
+  try {
+    host.appendImportMessage("partner-task", "package-welcome-test", fallback, () => undefined, opening);
+    expect(drain).not.toHaveBeenCalled();
+    expect(await readOpening()).toMatchObject({ case: "messageCompleted", value: { partnerPackageOpening: { ...opening, starterAvailable: true },
+      blocks: [{ content: { case: "text", value: fallback } }] } });
+    expect((await operations.submitOperation(start("wrong-option", "Write arbitrary text"), auth)).operation?.state).toBe(contract.OperationState.FAILED);
+    expect((await operations.submitOperation(start("wrong-task", "Review code", "other-task"), auth)).operation?.state).toBe(contract.OperationState.FAILED);
+    active = false;
+    expect((await operations.submitOperation(start("paused-partner", "Review code"), auth)).operation?.state).toBe(contract.OperationState.FAILED);
+    expect(store.countQueueItems()).toBe(0);
+    active = true;
+    const request = start("chosen-opening", "Review code"), receipt = await operations.submitOperation(request, auth);
+    expect(receipt.operation).toMatchObject({ state: contract.OperationState.SUCCEEDED, result: { payload: { case: "queueItem" } } });
+    expect(await operations.submitOperation(request, auth)).toEqual(receipt);
+    expect((await operations.submitOperation(start("second-opening", "Plan delivery"), auth)).operation?.state).toBe(contract.OperationState.FAILED);
+    expect(store.listQueueItems({ sessionId: "partner-task" })).toMatchObject([{ body: { text: "Review code" } }]);
+    expect(drain).toHaveBeenCalledExactlyOnceWith("partner-task");
+    expect(await readOpening()).toMatchObject({ case: "messageCompleted", value: { partnerPackageOpening: { starterAvailable: false } } });
+  } finally { drain.mockRestore(); await host.dispose(); store.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 it.each(["success", "target-changed", "binding-changed", "revoked"] as const)("finalizes only the exact resumed Session generation while retaining %s fences", async boundary => {
   const directory = mkdtempSync(join(tmpdir(), "joko-resume-generation-"));
   const store = new OperationalStore(":memory:");

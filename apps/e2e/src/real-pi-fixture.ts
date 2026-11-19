@@ -1,4 +1,4 @@
-import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
+import { createServer, type IncomingHttpHeaders, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -365,6 +365,11 @@ export class RealPiSystemFixture {
 
   clients(authKey: string): E2eClients {
     return createE2eClients(this.baseUrl, authKey, 60_000);
+  }
+
+  observePublicRequests(listener: (request: IncomingMessage, response: ServerResponse) => void): () => void {
+    this.#publicServer.server.prependListener("request", listener);
+    return () => this.#publicServer.server.removeListener("request", listener);
   }
 
   pairingCode(challengeId: string): string {

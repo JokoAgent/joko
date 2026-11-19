@@ -8,7 +8,8 @@ import { Button } from "./ui.js";
 export function PartnerGlanceContents({ api, partnerId, editor, locale, enabled, close }: { readonly api: PartnerAutonomyApi;
   readonly partnerId: string; readonly editor: PartnerGlanceTodos; readonly locale?: string; readonly enabled: boolean; readonly close: () => void }): JSX.Element {
   const m = partnerAutonomyMessages(locale), conversation = usePartnerConversation(), state = useSyncExternalStore(editor.subscribe, editor.snapshot);
-  const [all, setAll] = useState(false), [done, setDone] = useState(false), [menu, setMenu] = useState<PartnerTodo>();
+  const [all, setAll] = useState(false), [done, setDone] = useState(false);
+  const [menu, setMenu] = useState<{ readonly todoId: string; readonly origin: HTMLButtonElement }>();
   const [outputs, setOutputs] = useState<readonly PartnerTaskOutput[]>([]), [outputFailed, setOutputFailed] = useState(false), [outputRefresh, setOutputRefresh] = useState(0);
   const alive = useRef(true), outputFlight = useRef<AbortController | undefined>(undefined);
   useEffect(() => { alive.current = true; return () => { alive.current = false; outputFlight.current?.abort(); }; }, []);
@@ -30,11 +31,17 @@ export function PartnerGlanceContents({ api, partnerId, editor, locale, enabled,
   };
   const quote = (todo: PartnerTodo) => { conversation?.quoteTodo?.(todo); close(); };
   const row = (todo: PartnerTodo) => <li key={todo.id}><button type="button" aria-label={`${m.quote}: ${todo.title}`} onClick={() => quote(todo)}
-    onContextMenu={event => { event.preventDefault(); setMenu(todo); }} onKeyDown={event => {
-      if (event.key === "ContextMenu" || event.shiftKey && event.key === "F10") { event.preventDefault(); setMenu(todo); }
+    onContextMenu={event => { event.preventDefault(); setMenu({ todoId: todo.id, origin: event.currentTarget }); }} onKeyDown={event => {
+      if (event.key === "ContextMenu" || event.shiftKey && event.key === "F10") {
+        event.preventDefault(); setMenu({ todoId: todo.id, origin: event.currentTarget });
+      }
     }}><span>{partnerTodoDue(todo, state.now) && <span className="partner-todo-due" aria-label={locale === 'zh-CN' ? '已到期' : 'Due'} />}{todo.title}</span>
       <small>{[todo.progress, partnerTodoDate(todo, locale), todo.sources[0]?.label].filter(Boolean).join(" · ")}</small></button>
-    {menu?.id === todo.id && <div role="menu" onKeyDown={event => { if (event.key === "Escape") setMenu(undefined); }}>
+    {menu?.todoId === todo.id && <div role="menu" onKeyDown={event => {
+      if (event.key !== "Escape" || event.nativeEvent.isComposing) return;
+      event.preventDefault(); event.stopPropagation(); setMenu(undefined);
+      if (menu.origin.isConnected) menu.origin.focus();
+    }}>
       <button type="button" role="menuitem" autoFocus disabled={state.saving || state.pending} onClick={() => { setMenu(undefined); void editor.mutate(todo, "delete"); }}>{m.remove}</button>
     </div>}</li>;
   const files = outputs.filter(output => output.readiness === PartnerTaskOutputReadiness.READY).flatMap(output => output.files.map(file => ({ output, file })));

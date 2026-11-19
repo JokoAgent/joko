@@ -10,7 +10,7 @@ import type { SessionView } from '../model.js';
 import { ContinuousVoiceListener, DesktopSpeechPlayer, DesktopVoiceClient, spokenSentences, voiceExitIntent } from '../desktop-voice-conversation.js';
 import { currentVoiceQuestionTarget, type VoiceQuestionTarget } from '../voice-question-bridge.js';
 import { Button, CheckboxControl, IconButton, SelectControl } from './ui.js';
-import { usePartnerConversation } from './PartnerConversation.js';
+import { useDesktopMessageReadAloud, useDesktopPartnerVoiceTarget } from './DesktopMessageReadAloud.js';
 import './desktop-voice-conversation.css';
 
 const en = { title: 'Voice conversation', body: 'Talk in a separate call context. Work is handed to this task and follows its permissions.',
@@ -44,18 +44,21 @@ const key = (value: Pick<DesktopSpeechSelection, 'backendId' | 'providerId' | 'm
 export function DesktopVoiceConversationEntry({ controller, session, disabled }: {
   readonly controller: AppController; readonly session: SessionView; readonly disabled: boolean;
 }): JSX.Element | null {
-  const [open, setOpen] = useState(false);
-  const companion = usePartnerConversation();
+  const [openScope, setOpenScope] = useState<string>();
+  const target = useDesktopPartnerVoiceTarget(controller, session);
+  const setPanelOpen = useDesktopMessageReadAloud()?.setPanelOpen;
   const text = controller.state.effectiveLocale === 'zh-CN' ? zh : en;
-  const profile = controller.state.activeProfile, managed = controller.state.managedOrchestratorStatus;
-  const available = Boolean(window.jokoDesktop?.voiceConversation && profile?.managedLocal && managed?.state === 'ready'
-    && companion?.kind === 'partner' && companion.confirmed && companion.partner?.canonicalSessionId === session.id && companion.partner.lifecycle === 'active'
-    && session.remoteWorkspace === undefined && managed.connection.serverId === profile.serverId && controller.state.connectionState === 'connected');
-  const scope = `${profile?.serverId}:${session.id}:${session.generation}:${controller.state.connectionGeneration}`;
-  useEffect(() => setOpen(false), [scope, available]);
-  if (!available || !profile) return null;
-  return <><IconButton label={text.open} disabled={disabled} onClick={() => setOpen(true)}><Phone aria-hidden="true" /></IconButton>
-    {open && <DesktopVoiceConversationPanel key={scope} controller={controller} session={session} serverId={profile.serverId} onClose={() => setOpen(false)} />}</>;
+  const scope = target?.key;
+  const open = scope !== undefined && openScope === scope;
+  useEffect(() => setOpenScope(undefined), [scope]);
+  useLayoutEffect(() => {
+    if (!open || !setPanelOpen) return;
+    setPanelOpen(true);
+    return () => setPanelOpen(false);
+  }, [open, setPanelOpen]);
+  if (!target) return null;
+  return <><IconButton label={text.open} disabled={disabled} onClick={() => setOpenScope(target.key)}><Phone aria-hidden="true" /></IconButton>
+    {open && <DesktopVoiceConversationPanel key={scope} controller={controller} session={session} serverId={target.serverId} onClose={() => setOpenScope(undefined)} />}</>;
 }
 
 export function DesktopVoiceConversationPanel({ controller, session, serverId, onClose }: {

@@ -689,7 +689,7 @@ describe("session host, durable events, and reconnect semantics", () => {
       .rejects.toMatchObject({ code: Code.NotFound });
     const receipt = (await first.clients.operation.getOperation({ operationId: staleRestoreId })).operation;
     expect(receipt?.state).toBe(OperationState.FAILED);
-    expect(receipt?.result).toBeUndefined();
+    expect(receipt?.result?.payload).toMatchObject({ case: "acknowledgement", value: { accepted: false } });
     const retained = fixture.application.store.getSessionSnapshot(removed);
     expect(retained.session).toEqual(original.session);
     expect(retained.eventSequence).toBe(original.eventSequence);

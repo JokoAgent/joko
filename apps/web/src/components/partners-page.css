@@ -159,6 +159,8 @@
 .partner-message-content { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
 .timeline-shell--partner .message-actions { opacity: 1; }
 .partner-time-group { display: flex; justify-content: center; margin: 12px 0 18px; color: var(--text-faint); font-size: var(--text-10); }
+.partner-opening-options { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 12px; }
+.partner-opening-options .inline-error { flex-basis: 100%; margin: 0; }
 .partner-unread-divider { display: flex; align-items: center; gap: 12px; margin: 14px 0; color: var(--text-soft); font-size: var(--text-10); }
 .partner-unread-divider::before, .partner-unread-divider::after { content: ""; height: 1px; flex: 1; background: var(--line); }
 .partner-private-receipt { display: flex; justify-content: center; padding: 8px 0; }

@@ -12,10 +12,14 @@ it("uses only the auxiliary chain under one four-second deadline and validates a
     return { status: "ok" as const, text };
   });
   const auxiliary = { capture: () => ({}), run } as unknown as AuxiliaryTextRouting;
-  expect(await partnerPackageOpening(native, auxiliary, () => true)).toContain("• Plan delivery");
+  expect(await partnerPackageOpening(native, auxiliary, () => true)).toEqual({
+    greeting: "Hello. Where should we start?", starterOptions: native.opening.starterOptions
+  });
   expect(run).toHaveBeenCalledTimes(1);
 });
 it("keeps the full authored opening when auxiliary inference is unavailable", async () => {
   const auxiliary = { capture: () => ({}), run: async () => ({ status: "unavailable" }) } as unknown as AuxiliaryTextRouting;
-  expect(await partnerPackageOpening(native, auxiliary, () => true)).toBe("Hello. What should we review?\n\n• Review code\n\n• Check evidence\n\n• Plan delivery");
+  expect(await partnerPackageOpening(native, auxiliary, () => true)).toEqual({
+    greeting: native.opening.welcome, starterOptions: native.opening.starterOptions
+  });
 });

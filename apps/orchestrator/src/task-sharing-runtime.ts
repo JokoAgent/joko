@@ -72,6 +72,7 @@ export function createTaskSharingRuntime(
       const payload = mutation.payload;
       switch (payload.case) {
         case "sendInput": {
+          if (payload.value.partnerStarterEventId !== undefined) throw denied();
           const generation = mutation.preconditions.find(item => item.entity?.kind === contract.EntityKind.SESSION
             && item.entity.id === sessionId)?.expectedGeneration;
           if (!generation || generation < 1n || generation > BigInt(Number.MAX_SAFE_INTEGER)) throw new ConnectError("The source task generation is required.", Code.InvalidArgument);

@@ -17095,13 +17095,15 @@ export class SessionHost {
   }
 
   /** A safe service result is committed once and published by the Store's existing event stream. */
-  appendImportMessage(sessionId: string, requestId: string, content: string, assertCurrent: () => void): void {
+  appendImportMessage(sessionId: string, requestId: string, content: string, assertCurrent: () => void,
+    partnerPackageOpening?: import("@joko/core").PartnerPackageOpeningMessage): void {
     assertCurrent(); const session = this.#store.getSession(sessionId).descriptor;
     if (session.archived || session.deletedAt !== undefined) throw new StoreError("Import task is unavailable.");
     const digest = createHash("sha256").update(JSON.stringify([sessionId, requestId])).digest("hex");
     this.#store.appendEventIfAbsent({ id: `import-message-${digest}`, sessionId, backendId: session.backendId, targetId: session.targetId,
       generation: session.binding.generation, traceId: `import-message:${digest}`,
-      payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: content }] } }); assertCurrent();
+      payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: content }],
+        ...(partnerPackageOpening === undefined ? {} : { partnerPackageOpening }) } }); assertCurrent();
   }
 
   private requestInteraction(

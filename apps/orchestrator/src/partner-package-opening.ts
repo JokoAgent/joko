@@ -1,9 +1,11 @@
 import type { ImportSnapshot } from "@joko/agent-import";
+import type { PartnerPackageOpeningMessage } from "@joko/core";
+import type { OperationalStore, PersistedEvent } from "@joko/store";
 import type { AuxiliaryTextRouting } from "./auxiliary-text-routing.js";
 
 /** Only the auxiliary text route may rewrite an authored opening; it never starts the partner agent. */
 export async function partnerPackageOpening(native: NonNullable<ImportSnapshot["nativePackage"]>, auxiliary: AuxiliaryTextRouting,
-  stillCurrent: () => boolean): Promise<string> {
+  stillCurrent: () => boolean): Promise<PartnerPackageOpeningMessage> {
   const fallback = native.opening;
   let greeting = fallback.welcome; let options = fallback.starterOptions ?? [];
   try {
@@ -20,5 +22,18 @@ export async function partnerPackageOpening(native: NonNullable<ImportSnapshot["
       } });
     if (response.status === "ok") { const value = JSON.parse(response.text) as { greeting: string; options: string[] }; greeting = value.greeting; options = value.options; }
   } catch { /* The complete package-authored greeting is always available. */ }
-  return [greeting, ...options.map(option => `• ${option}`)].join("\n\n");
+  return { greeting, starterOptions: options.map(option => option.trim()) };
+}
+
+export function partnerPackageStarterAvailable(store: OperationalStore, sessionId: string): boolean {
+  const session = store.getSession(sessionId).descriptor;
+  return !session.archived && session.deletedAt === undefined
+    && store.countQueueItems({ sessionId, includeCleared: true }) === 0
+    && store.findLatestVisibleUserMessageAt(sessionId) === undefined && !store.hasSessionUserInputAfter(sessionId, 0n);
+}
+
+export function partnerPackageOpeningFromEvent(event: PersistedEvent | undefined): PartnerPackageOpeningMessage | undefined {
+  if (event?.payload.type !== "message_complete" || event.payload.role !== "assistant" || !event.payload.partnerPackageOpening) return undefined;
+  const identity = /^import-message-([a-f0-9]{64})$/u.exec(event.id)?.[1];
+  return identity && event.traceId === `import-message:${identity}` ? event.payload.partnerPackageOpening : undefined;
 }

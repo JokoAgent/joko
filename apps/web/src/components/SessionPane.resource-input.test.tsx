@@ -14,12 +14,14 @@ import { replaceComposerDocumentTextRange } from "./composer-inline-mention.js";
 import { createOrchestratorGateway } from "../gateway.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { GAMEPAD_SKILL_EVENT } from "../gamepad-client.js";
-import { emptySnapshot, type BackendView, type ComposerDraft, type SessionView } from "../model.js";
+import { emptySnapshot, type BackendView, type ComposerDraft, type PartnerProfileView, type SessionView, type TimelineItemView } from "../model.js";
 import { SessionPane } from "./SessionPane.js";
 
-const timelineHost = vi.hoisted(() => ({ send: undefined as undefined | ((text: string, key: string) => Promise<boolean>) }));
-vi.mock("./Timeline.js", () => ({ Timeline: (props: { onSendRichAnswer?: (text: string, key: string) => Promise<boolean> }) => {
-  timelineHost.send = props.onSendRichAnswer; return null;
+const timelineHost = vi.hoisted(() => ({ send: undefined as undefined | ((text: string, key: string) => Promise<boolean>),
+  starter: undefined as undefined | ((text: string, eventId: string) => Promise<boolean>) }));
+vi.mock("./Timeline.js", () => ({ Timeline: (props: { onSendRichAnswer?: (text: string, key: string) => Promise<boolean>;
+  onSendPartnerStarter?: (text: string, eventId: string) => Promise<boolean> }) => {
+  timelineHost.send = props.onSendRichAnswer; timelineHost.starter = props.onSendPartnerStarter; return null;
 } }));
 const editorState = vi.hoisted(() => ({ caret: 0 }));
 vi.mock("./composer-inline-mention.js", async importOriginal => ({
@@ -48,6 +50,23 @@ beforeEach(() => { editorState.caret = 0; vi.stubGlobal("IS_REACT_ACT_ENVIRONMEN
 afterEach(async () => { for (const root of roots.splice(0)) await act(async () => root.unmount()); for (const disconnect of disconnects.splice(0)) disconnect(); document.body.replaceChildren(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe("SessionPane loaded Skill input composition", () => {
+  it("sends a selected opening against the original task and completion event", async () => {
+    const eventId = `import-message-${"a".repeat(64)}`;
+    const partner: PartnerProfileView = { id: "partner", canonicalSessionId: "task", homeTargetId: "target", displayName: "Aster",
+      description: "", avatar: "orbit", revision: 1n, profileVersion: 1n, lifecycle: "active", initializationState: "ready",
+      invitationStage: "ready", identitySource: "Aster", templateId: "general", usesDirectoryDefaults: true,
+      capabilities: { modelChain: [], permissionMode: "ask", planMode: false }, createdAt: 1, updatedAt: 1,
+      activity: { partnerId: "partner", readThroughCursor: 0n, readUpdatedAt: 1, unreadReplyCount: 0, artifactCount: 0, activeDelegationCount: 0 } };
+    const view = await mount(false, { partner, timeline: [{ id: eventId, sourceEventId: eventId, kind: "assistant", sequence: 1n,
+      text: "What should we work on?", createdAt: 1, partnerPackageOpening: { starterOptions: ["Review code", "Plan delivery"], starterAvailable: true } }] });
+    const chosen = await vi.waitFor(() => required(timelineHost.starter));
+    expect(await chosen("Review code", eventId)).toBe(true);
+    expect(view.api.sendRichAnswer).toHaveBeenCalledExactlyOnceWith("task", 1n, eventId, "Review code", expect.any(AbortSignal), eventId);
+    await view.render(session(2n));
+    expect(await chosen("Plan delivery", eventId)).toBe(false);
+    expect(view.api.sendRichAnswer).toHaveBeenCalledOnce();
+  });
+
   it("preserves the composer and retires the original rich-answer sender when the task generation changes", async () => {
     const view = await mount(false, { initial: { text: "Unfinished draft", mentions: [], inlineMentionRanges: [], attachments: [], deliveryMode: "prompt" } });
     const send = required(timelineHost.send);
@@ -187,7 +206,8 @@ describe("SessionPane Skill command input", () => {
   });
 });
 
-async function mount(deferCatalog = false, options: { initial?: ComposerDraft; commands?: "resource" | "text"; deferSelection?: boolean; missingSelection?: boolean } = {}) {
+async function mount(deferCatalog = false, options: { initial?: ComposerDraft; commands?: "resource" | "text"; deferSelection?: boolean;
+  missingSelection?: boolean; partner?: PartnerProfileView; timeline?: readonly TimelineItemView[] } = {}) {
   const submissions: SubmitOperationRequest[] = [];
   const catalogRequests: { signal?: AbortSignal; finish: (generation: bigint) => void }[] = [];
   let currentSession = session(1n);
@@ -217,14 +237,18 @@ async function mount(deferCatalog = false, options: { initial?: ComposerDraft; c
     saveDraftIfRevision: vi.fn(async (_sessionId: string, draft: ComposerDraft, expected: number) => { if (expected !== draftRevision) return undefined; storedDraft = draft; return ++draftRevision; }),
     send: vi.fn((...args: Parameters<AppController["send"]>) => gateway.send(...args)), getVoiceInputCapabilities: vi.fn(async () => ({})), getObjective: vi.fn(async () => undefined), watchObjective: vi.fn(() => idleStream()),
     sendRichAnswer: vi.fn(async (..._args: Parameters<AppController["sendRichAnswer"]>) => true),
-    getPortableReplacementCleanup: vi.fn(async () => undefined), listPartners: vi.fn(async () => ({ partners: [], directory: { revision: 1n, activeCount: 0, archivedCount: 0, errorCount: 0, updatedAt: 0, templates: [], avatarPresets: [] } }))
+    getPortableReplacementCleanup: vi.fn(async () => undefined),
+    listPartners: vi.fn(async () => ({ partners: options.partner === undefined ? [] : [options.partner],
+      directory: { revision: 1n, activeCount: options.partner === undefined ? 0 : 1, archivedCount: 0, errorCount: 0, updatedAt: 0, templates: [], avatarPresets: [] } })),
+    listPartnerSessions: vi.fn(async () => options.partner === undefined ? [] : [{ partnerId: options.partner.id,
+      sessionId: "task", role: "canonical" as const, available: true, deleted: false, profileVersion: options.partner.profileVersion }])
   };
   const controller = api as unknown as AppController;
   const host = document.body.appendChild(document.createElement("div")); const root = createRoot(host); roots.push(root);
   const actions: Promise<unknown>[] = [];
   const render = async (nextSession = currentSession, nextBackend = backend(true)) => {
     currentSession = nextSession; api.state.snapshot = { ...emptySnapshot(), sessions: [nextSession], backends: [nextBackend] };
-    await act(async () => root.render(<SessionPane controller={controller} session={nextSession} backend={nextBackend} models={[]} timeline={[]} timelineHasEarlier={false} timelineHistoryLoading={false} onLoadEarlierTimeline={async () => undefined} extensionWidgets={[]} extensionStatuses={[]} queue={[]} extraDirectories={[]} resources={[]} commandRefreshSignal={[]} remainingInteractions={0} navigationOpen inspectorOpen t={key => key} runAction={(_key, action) => { actions.push(action().catch(() => undefined)); }} onOpenNavigation={() => undefined} onOpenInspector={() => undefined} onRename={() => undefined} onArchive={() => undefined} onDelete={() => undefined} />));
+    await act(async () => root.render(<SessionPane controller={controller} session={nextSession} backend={nextBackend} models={[]} timeline={options.timeline ?? []} timelineHasEarlier={false} timelineHistoryLoading={false} onLoadEarlierTimeline={async () => undefined} extensionWidgets={[]} extensionStatuses={[]} queue={[]} extraDirectories={[]} resources={[]} commandRefreshSignal={[]} remainingInteractions={0} navigationOpen inspectorOpen t={key => key} runAction={(_key, action) => { actions.push(action().catch(() => undefined)); }} onOpenNavigation={() => undefined} onOpenInspector={() => undefined} onRename={() => undefined} onArchive={() => undefined} onDelete={() => undefined} />));
   };
   await render();
   return { api, host, render, actions, submissions, catalogRequests, stored: () => storedDraft, send: () => required(host.querySelector<HTMLButtonElement>(".send-button")), text: () => required(host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Draft"]')).value };
