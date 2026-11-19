@@ -9405,6 +9405,8 @@ export class OperationalStore {
       const metadata = isRecord(target.metadata) ? target.metadata : {};
       const { pendingManagedWorkspaceTrash: pending, state, ...retained } = metadata;
       const operation = this.getOperation(intent.operationId);
+      const wasOutcomeUnknown = operation.status === "failed" && isRecord(operation.error)
+        && operation.error["code"] === "EFFECT_OUTCOME_UNKNOWN";
       const payload = isRecord(operation.body) && isRecord(operation.body["payload"]) ? operation.body["payload"] : undefined;
       const value = isRecord(payload?.["value"]) ? payload["value"] : undefined;
       if (target.revision !== input.targetRevision || metadata["deletedAt"] !== undefined || state !== "deleting"
@@ -9413,11 +9415,13 @@ export class OperationalStore {
         || operation.connectionId === undefined || operation.kind !== "deleteTarget" || operation.completionMode !== "external_effect"
         || operation.bodyHash !== intent.bodyHash || payload?.["case"] !== "deleteTarget" || value?.["targetId"] !== input.targetId
         || value?.["deleteManagedWorkspace"] !== true
-        || operation.status !== "started" && !(operation.status === "failed" && operation.error?.code === "EFFECT_OUTCOME_UNKNOWN")) {
+        || operation.status !== "started" && !wasOutcomeUnknown) {
         throw new StoreError("The managed workspace recovery does not own the original Target and Operation.");
       }
       const moved = input.outcome === "moved";
-      if (moved && this.listSessions({ targetId: input.targetId, includeArchived: true, includeDeleted: false, limit: 1 }).length > 0) {
+      if (moved && this.database.prepare(`
+        SELECT 1 FROM product_sessions WHERE target_id = ? AND deleted_at IS NULL LIMIT 1
+      `).get(input.targetId) !== undefined) {
         throw new StoreError("The managed workspace is still referenced by a product task.");
       }
       this.upsertTarget(target.descriptor, moved ? { ...retained, state: "archived", deletedAt: intent.startedAt,
