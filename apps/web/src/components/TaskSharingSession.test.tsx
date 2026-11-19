@@ -42,8 +42,13 @@ it("accepts an actual leave receipt kind through the contract API and clears the
   expect(f.leave).not.toHaveBeenCalled();
 });
 
-it("clears an unadmitted leave without resubmitting or navigating away", async () => {
-  const f = await mountPendingLeave(); f.receipt.mockRejectedValueOnce(new ConnectError("not admitted", Code.NotFound));
+it.each([false, true])("clears an unadmitted leave without resubmitting or navigating away (receipt: %s)", async typedReceipt => {
+  const f = await mountPendingLeave();
+  if (typedReceipt) {
+    f.receipt.mockResolvedValueOnce(create(GetTaskSharingActionReceiptResponseSchema, { receipt: {
+      operationId: "original-leave", kind: "task_share_leave", status: "failed", errorCode: "NOT_FOUND", joined: { joinId: "joined" }
+    } }));
+  } else f.receipt.mockRejectedValueOnce(new ConnectError("not admitted", Code.NotFound));
   await act(async () => f.host.querySelector<HTMLButtonElement>("[data-leave]")!.click());
   await act(async () => { document.querySelector<HTMLButtonElement>("[data-task-sharing-confirm]")!.click(); await f.pending(); });
   expect(f.finish).toHaveBeenCalledOnce();

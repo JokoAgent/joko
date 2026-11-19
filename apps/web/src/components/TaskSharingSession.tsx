@@ -186,7 +186,11 @@ export function TaskSharingSession({ controller: home, joinId, profileId, t, run
         if (receipt.kind !== "task_share_leave" || receipt.joined?.joinId !== joinId) throw new Error(t("taskSharing.unknown"));
         if (receipt.status === "failed") {
           await context.local.finishTaskSharingAction(context.leaveOwner, leaveOperation);
-          signal.throwIfAborted(); setLeaveOperation(undefined); throw new Error(receipt.errorCode || t("taskSharing.unavailable"));
+          signal.throwIfAborted(); setLeaveOperation(undefined);
+          if (receipt.errorCode === "NOT_FOUND") {
+            setLeave(false); setError(t("taskSharing.notAdmitted")); return;
+          }
+          throw new Error(receipt.errorCode || t("taskSharing.unavailable"));
         }
         if (receipt.status !== "applied") throw new Error(t("taskSharing.unknown"));
       } else {

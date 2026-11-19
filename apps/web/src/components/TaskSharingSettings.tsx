@@ -119,6 +119,7 @@ export function TaskSharingSettings({ controller, t, sessionId, initialInvitatio
           const result = await api.lookupAction(pending.operationId, signal);
           signal.throwIfAborted();
           if (result.status !== "applied" && result.status !== "failed") throw new Error(t("taskSharing.unknown"));
+          if (result.kind === "task_share_leave" && result.status === "failed" && result.errorCode === "NOT_FOUND") setNotice(t("taskSharing.notAdmitted"));
           if (result.kind === "task_share_invite" && result.status === "applied") setNotice(t("taskSharing.invitationLost"));
           if (result.failedShareIds.length > 0) setNotice(t("taskSharing.partial", { count: result.failedShareIds.length }));
         }

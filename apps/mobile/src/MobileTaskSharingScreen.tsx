@@ -65,6 +65,7 @@ export function MobileTaskSharingScreen({ client, state, colors, locale, foregro
   readonly leaveJoinId?: string; readonly onLeavePromptConsumed?: () => void;
 }) {
   const t = mobileTaskSharingCopy(locale), api = client.taskSharingApi();
+  const notAdmitted = locale.startsWith("zh") ? "节点未接纳此操作，可以重新操作。" : "The node did not accept this action. You can try again.";
   const ownerKey = client.taskSharingOwnerKey();
   const [catalog, setCatalog] = useState<ListTaskSharesResponse>();
   const [tab, setTab] = useState<"owned" | "joined">(leaveJoinId ? "joined" : "owned");
@@ -195,7 +196,8 @@ export function MobileTaskSharingScreen({ client, state, colors, locale, foregro
         readingReceipt = false;
         if (receipt.status === "applied" || receipt.status === "failed") {
           await retain(actionsRef.current.filter(item => item.operationId !== action.operationId));
-          setNotice(action.kind === "invite" && receipt.status === "applied" ? t.generated : receipt.status === "failed" ? t.failed : t.active);
+          if (action.kind === "leave" && receipt.status === "failed" && receipt.errorCode === "NOT_FOUND") setNotice(notAdmitted);
+          else setNotice(action.kind === "invite" && receipt.status === "applied" ? t.generated : receipt.status === "failed" ? t.failed : t.active);
         } else setError(t.unknown);
       }
       await refresh.current();
@@ -203,7 +205,7 @@ export function MobileTaskSharingScreen({ client, state, colors, locale, foregro
       if (!signal.aborted && currentOwner.current === ownerKey) {
         if (readingReceipt && failure instanceof ConnectError && failure.code === Code.NotFound) {
           await retain(actionsRef.current.filter(item => item.operationId !== action.operationId));
-          setNotice(locale.startsWith("zh") ? "节点未接纳此操作，可以重新操作。" : "The node did not accept this action. You can try again.");
+          setNotice(notAdmitted);
         } else setError(errorText(failure));
       }
     }
