@@ -1675,10 +1675,13 @@ export class ProviderCatalogManager {
         : undefined;
       const updates = new Map(discovered.map(model => [model.id, model]));
       const known = new Set(current.provider.models.map(model => model.id));
-      const additions = discovered.filter(model => {
+      const codexApiKeyResponses = current.kind === "api_key" && current.provider.api === "openai-responses"
+        && current.nativeCredentialReferenceId === undefined && Object.keys(current.credentialBindings).length > 0
+        && this.#store.findBackend(current.backendId)?.descriptor.adapterKind === "codex";
+      const additions = discovered.filter(model => !known.has(model.id)).map(model => {
         const managed = discoveredManagedModel(model, customPiApi);
-        return !known.has(model.id) && (isManagedChatModel(managed) || isManagedSpeechModel(managed));
-      });
+        return codexApiKeyResponses && model.cost !== undefined && isManagedChatModel(managed) ? { ...managed, cost: model.cost } : managed;
+      }).filter(model => isManagedChatModel(model) || isManagedSpeechModel(model));
       const updatedModelIds: string[] = [];
       const retained = current.provider.models.map(model => {
         const update = updates.get(model.id);
@@ -1701,7 +1704,7 @@ export class ProviderCatalogManager {
         provider: {
           ...current.provider,
           models: [
-            ...additions.map(model => discoveredManagedModel(model, customPiApi)),
+            ...additions,
             ...retained
           ]
         },

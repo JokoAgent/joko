@@ -539,6 +539,50 @@ describe("ProviderCatalogManager", () => {
     store.close();
   });
 
+  it("keeps the new official OpenRouter text quotes for the original Codex Provider across restart", async () => {
+    const { root, store, credentials } = await fixture();
+    const backendId = "custom-codex-instance", providerId = "custom-openrouter";
+    const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" });
+    providers.initialize();
+    store.upsertBackend({ id: backendId, adapterKind: "codex", instanceGeneration: 1, displayName: "Codex discovery", version: "fixture",
+      health: "healthy", installationState: "installed", authenticationState: "authenticated", capabilities: new Map(), models: [], tools: [], diagnostics: [] });
+    const ticket = credentials.createUploadTicket({ kind: "api_key" });
+    credentials.upload(ticket.credentialUploadTicketId, "owned-openrouter-fixture-key");
+    await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: "openrouter-fixture-key",
+      displayName: "Fixture key", kind: "api_key" });
+    const kept = { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 };
+    await providers.upsert({ backendId, credentialOrigin: "https://openrouter.ai", kind: "api_key", displayName: "Owned OpenRouter", enabled: true,
+      supportsLogin: false, supportsLogout: false, supportsRefresh: false, credentialBindings: { OPENROUTER_FIXTURE_KEY: "openrouter-fixture-key" },
+      modelsEndpoint: "https://openrouter.ai/api/v1/models", provider: { id: providerId, baseUrl: "https://openrouter.ai/api/v1", api: "openai-responses",
+        apiKeyEnv: "OPENROUTER_FIXTURE_KEY", models: [{ id: "kept", cost: kept }] } });
+    const architecture = { input_modalities: ["text"], output_modalities: ["text"] };
+    const pricing = { prompt: "0.00001", completion: "0.00002", input_cache_read: "0", input_cache_write: "0" };
+    const fetcher = vi.fn<typeof fetch>(async (input, init) => {
+      const endpoint = new URL(String(input));
+      expect(endpoint.origin).toBe("https://openrouter.ai");
+      expect(endpoint.pathname).toBe("/api/v1/models");
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer owned-openrouter-fixture-key");
+      return Response.json({ data: endpoint.search === "" ? [
+        { id: "kept", architecture, pricing }, { id: "priced", architecture, pricing },
+        { id: "free", architecture, pricing: { ...pricing, prompt: "0", completion: "0" } }
+      ] : [] });
+    });
+    try {
+      expect(await providers.discoverProviderModels(backendId, providerId, fetcher)).toMatchObject({ addedModelIds: ["priced", "free"], modelCount: 3 });
+      store.close();
+      const reopened = new OperationalStore(join(root, "orchestrator.db"));
+      try {
+        const catalog = new ProviderCatalogManager({ store: reopened, credentials, nativeBackendId: "pi" });
+        catalog.initialize();
+        expect(catalog.get(backendId, providerId).provider.models.map(({ id, cost }) => ({ id, cost }))).toEqual([
+          { id: "priced", cost: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0 } },
+          { id: "free", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+          { id: "kept", cost: kept }
+        ]);
+      } finally { reopened.close(); }
+    } finally { store.close(); }
+  });
+
   it("persists newly discovered capabilities through restart and the actual native generation without changing declared models", async () => {
     const { root, store, credentials } = await fixture();
     const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" }); providers.initialize();

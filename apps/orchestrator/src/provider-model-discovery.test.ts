@@ -9,6 +9,24 @@ import {
 } from "./provider-model-discovery.js";
 
 describe("Provider model discovery", () => {
+  it("accepts complete OpenRouter text token prices, including explicit zeros, from its official model catalogue", () => {
+    const architecture = { input_modalities: ["text"], output_modalities: ["text"] };
+    const pricing = { prompt: "0.00001", completion: "2e-5", input_cache_read: "0", input_cache_write: "0" };
+    const payload = { data: [
+      { id: "priced", architecture, pricing },
+      { id: "free", architecture, pricing: { ...pricing, prompt: "0", completion: "0" } },
+      { id: "invalid", architecture, pricing: { ...pricing, prompt: "-0.00001" } },
+      { id: "unquoted-cache", architecture, pricing: { prompt: "0", completion: "0" } },
+      { id: "speech", architecture: { ...architecture, output_modalities: ["speech"] }, pricing }
+    ] };
+    const rows = parseProviderModels(payload, "https://openrouter.ai/api/v1/models", true);
+    expect(rows.map(row => row.cost)).toEqual([
+      { input: 10, output: 20, cacheRead: 0, cacheWrite: 0 },
+      { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, undefined, undefined, undefined
+    ]);
+    expect(parseProviderModels(payload, "https://relay.example/api/v1/models", true).every(row => row.cost === undefined)).toBe(true);
+  });
+
   it("retains speech purpose, explicit withdrawals and source-specific modalities without guessing from generic audio or names", () => {
     const rows = parseProviderModels({ data: [
       { id: "manual-kind", mode: "audio_speech", modalities: { input: ["text"], output: [] } },
