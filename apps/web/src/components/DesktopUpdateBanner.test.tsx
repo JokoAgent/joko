@@ -55,7 +55,7 @@ describe("DesktopUpdateBanner relaunch fence", () => {
 
     await act(async () => probe.resolve(false));
     expect(desktop.relaunch).toHaveBeenCalledOnce();
-    expect(desktop.relaunch).toHaveBeenCalledWith({ allowBusy: false });
+    expect(desktop.relaunch).toHaveBeenCalledWith({ allowBusy: false, expectedVersion: "2.0.0" });
     expect(container.textContent).not.toContain("A task is still running");
   });
 
@@ -114,7 +114,7 @@ describe("DesktopUpdateBanner relaunch fence", () => {
     expect(desktop.relaunch).not.toHaveBeenCalled();
     expect(container.textContent).toContain("A task is still running");
     await act(async () => requireElement<HTMLButtonElement>(container, ".desktop-update-banner__pill").click());
-    expect(desktop.relaunch).toHaveBeenCalledWith({ allowBusy: true });
+    expect(desktop.relaunch).toHaveBeenCalledWith({ allowBusy: true, expectedVersion: "2.0.0" });
   });
 
   it("returns to the busy warning when main closes the safe-probe race", async () => {
@@ -123,7 +123,7 @@ describe("DesktopUpdateBanner relaunch fence", () => {
     const { container } = await renderBanner(false, async () => false);
 
     await act(async () => requireElement<HTMLButtonElement>(container, ".desktop-update-banner__pill").click());
-    expect(desktop.relaunch).toHaveBeenCalledWith({ allowBusy: false });
+    expect(desktop.relaunch).toHaveBeenCalledWith({ allowBusy: false, expectedVersion: "2.0.0" });
     expect(container.textContent).toContain("A task is still running");
     expect(container.textContent).not.toContain("could not relaunch");
   });
@@ -144,7 +144,7 @@ describe("DesktopUpdateBanner relaunch fence", () => {
 
     await act(async () => requireElement<HTMLButtonElement>(container, ".desktop-update-banner__pill").click());
     expect(probeRuntimeActivity).toHaveBeenCalledTimes(3);
-    expect(desktop.relaunch).toHaveBeenNthCalledWith(2, { allowBusy: false });
+    expect(desktop.relaunch).toHaveBeenNthCalledWith(2, { allowBusy: false, expectedVersion: "2.0.0" });
   });
 
   it("exposes a collapsed apply failure without changing the single-button rail and permits retry", async () => {
@@ -170,7 +170,7 @@ describe("DesktopUpdateBanner relaunch fence", () => {
     await act(async () => retry.click());
     expect(probeRuntimeActivity).toHaveBeenCalledTimes(3);
     expect(desktop.relaunch).toHaveBeenCalledTimes(2);
-    expect(desktop.relaunch).toHaveBeenNthCalledWith(2, { allowBusy: false });
+    expect(desktop.relaunch).toHaveBeenNthCalledWith(2, { allowBusy: false, expectedVersion: "2.0.0" });
     expect(container.querySelector(".desktop-update-banner--rail.is-error")).toBeNull();
   });
 

@@ -87,6 +87,7 @@ import type {
   DesktopUpdateAutoRelaunchSettings,
   DesktopUpdateCheckResult,
   DesktopUpdateChannelProbeResult,
+  DesktopUpdateChannelRelaunchRequest,
   DesktopUpdateChannelSettings,
   DesktopUpdateRelaunchRequest,
   DesktopUpdateRelaunchResult,
@@ -1280,7 +1281,7 @@ const desktopApi = Object.freeze({
       ipcRenderer.invoke(DESKTOP_CHANNELS.updateChannelSettingsReset).then(parseDesktopUpdateChannelSettings),
     probeBetaChannel: (): Promise<DesktopUpdateChannelProbeResult> =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.updateChannelProbeBeta).then(parseDesktopUpdateChannelProbeResult),
-    relaunchForChannelChange: (request: DesktopUpdateRelaunchRequest): Promise<DesktopUpdateRelaunchResult> =>
+    relaunchForChannelChange: (request: DesktopUpdateChannelRelaunchRequest): Promise<DesktopUpdateRelaunchResult> =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.updateChannelRelaunch, request).then(parseDesktopUpdateRelaunchResult),
     onChannelSettings: (listener: (settings: DesktopUpdateChannelSettings) => void): (() => void) => {
       if (typeof listener !== "function") throw new TypeError("Desktop update channel listener must be a function.");

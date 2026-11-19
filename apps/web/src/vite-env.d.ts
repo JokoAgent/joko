@@ -736,7 +736,7 @@ interface JokoDesktopApi {
   readonly updates: {
     getStatus(): Promise<JokoDesktopUpdateStatus>;
     check(): Promise<JokoDesktopUpdateCheckResult>;
-    relaunch(options: { readonly allowBusy: boolean }): Promise<JokoDesktopUpdateRelaunchResult>;
+    relaunch(options: { readonly allowBusy: boolean; readonly expectedVersion: string }): Promise<JokoDesktopUpdateRelaunchResult>;
     relaunchStartup(): Promise<JokoDesktopUpdateRelaunchResult>;
     retryStartup(): Promise<JokoDesktopUpdateCheckResult>;
     onStatus(listener: (status: JokoDesktopUpdateStatus) => void): () => void;

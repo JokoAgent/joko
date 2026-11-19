@@ -392,6 +392,25 @@ describe("desktop update service", () => {
     expect(service.getStatus()).toEqual({ status: "ready", version: "3.0.0" });
   });
 
+  it("declines the displayed version if a different verified installer has become ready", async () => {
+    const driver = fakeDriver();
+    vi.mocked(driver.checkForUpdates)
+      .mockResolvedValueOnce({ available: true, version: "2.0.0" })
+      .mockResolvedValueOnce({ available: true, version: "3.0.0" });
+    const prepareToApply = vi.fn(async () => undefined);
+    const service = createAvailableService(driver, prepareToApply);
+    await service.check();
+    await service.check();
+    expect(service.getStatus()).toEqual({ status: "ready", version: "3.0.0" });
+
+    await expect(service.relaunch("2.0.0")).resolves.toEqual({ accepted: false, reason: "not-ready" });
+    expect(prepareToApply).not.toHaveBeenCalled();
+    expect(driver.relaunchToInstall).not.toHaveBeenCalled();
+    await expect(service.relaunch("3.0.0")).resolves.toEqual({ accepted: true });
+    expect(prepareToApply).toHaveBeenCalledOnce();
+    expect(driver.relaunchToInstall).toHaveBeenCalledOnce();
+  });
+
   it("does not apply the old staged build while its replacement is downloading", async () => {
     const replacement = deferred<void>();
     const driver = fakeDriver();

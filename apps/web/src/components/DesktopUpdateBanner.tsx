@@ -81,6 +81,7 @@ export function DesktopUpdateBanner({ collapsed, probeRuntimeActivity, t }: Desk
   if (collapsed && dismiss.dismissed && dismiss.reason === "user") return null;
 
   const preparing = status.status === "superseding";
+  const displayedVersion = status.version;
 
   const canContinue = (epoch: number, version: string): boolean => mountedRef.current
     && actionEpochRef.current === epoch
@@ -90,7 +91,7 @@ export function DesktopUpdateBanner({ collapsed, probeRuntimeActivity, t }: Desk
 
   const relaunch = async (): Promise<void> => {
     const ready = statusRef.current;
-    if (actionInFlightRef.current || ready?.status !== "ready" || dismissRef.current.dismissed) return;
+    if (actionInFlightRef.current || ready?.status !== "ready" || ready.version !== displayedVersion || dismissRef.current.dismissed) return;
     const updates = desktopUpdateApi();
     if (updates === undefined) {
       setActionError("desktop.updateActionUnavailable");
@@ -102,7 +103,7 @@ export function DesktopUpdateBanner({ collapsed, probeRuntimeActivity, t }: Desk
     setActionError(undefined);
     try {
       if (!canContinue(epoch, version)) return;
-      const result = await updates.relaunch({ allowBusy: true });
+      const result = await updates.relaunch({ allowBusy: true, expectedVersion: version });
       if (canContinue(epoch, version) && !result.accepted) {
         if (result.reason === "busy") setConfirming(true);
         else setActionError(desktopUpdateRelaunchError(result.reason));
@@ -118,7 +119,7 @@ export function DesktopUpdateBanner({ collapsed, probeRuntimeActivity, t }: Desk
 
   const enterRelaunch = async (): Promise<void> => {
     const ready = statusRef.current;
-    if (actionInFlightRef.current || ready?.status !== "ready" || dismissRef.current.dismissed) return;
+    if (actionInFlightRef.current || ready?.status !== "ready" || ready.version !== displayedVersion || dismissRef.current.dismissed) return;
     const updates = desktopUpdateApi();
     if (updates === undefined) {
       setActionError("desktop.updateActionUnavailable");
@@ -142,7 +143,7 @@ export function DesktopUpdateBanner({ collapsed, probeRuntimeActivity, t }: Desk
       return;
     }
     try {
-      const result = await updates.relaunch({ allowBusy: false });
+      const result = await updates.relaunch({ allowBusy: false, expectedVersion: version });
       if (canContinue(epoch, version) && !result.accepted) {
         if (result.reason === "busy") setConfirming(true);
         else setActionError(desktopUpdateRelaunchError(result.reason));

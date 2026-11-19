@@ -69,6 +69,7 @@ import {
   type DesktopSaveFileRequest,
   type DesktopSessionDragPreviewRequest,
   type DesktopSessionWindowOwner,
+  type DesktopUpdateChannelRelaunchRequest,
   type DesktopUpdateRelaunchRequest,
   type DesktopUpdateRelaunchResult,
   type DesktopUpdateChannelSettings,
@@ -7818,7 +7819,7 @@ function ensureDesktopUpdateAutoRelaunchPolicy(): Promise<void> {
       probeActivity: probeCurrentManagedRuntimeActivity,
       readIdleTimeSeconds: () => powerMonitor.getSystemIdleTime(),
       readIdleState: () => powerMonitor.getSystemIdleState(10 * 60),
-      requestRelaunch: () => requestDesktopUpdateRelaunch(false, true),
+      requestRelaunch: () => requestDesktopUpdateRelaunch({ allowBusy: false, requireQuietActivity: true }),
       powerEvents: {
         on: (event, listener) => {
           if (event === "resume") return powerMonitor.on("resume", listener);
@@ -7844,15 +7845,17 @@ function ensureDesktopUpdateAutoRelaunchPolicy(): Promise<void> {
   return operation;
 }
 
-async function requestDesktopUpdateRelaunch(
-  allowBusy: boolean,
-  requireQuietActivity = false
-): Promise<DesktopUpdateRelaunchResult> {
+async function requestDesktopUpdateRelaunch({ allowBusy, expectedVersion, requireQuietActivity = false }: {
+  readonly allowBusy: boolean;
+  readonly expectedVersion?: string;
+  readonly requireQuietActivity?: boolean;
+}): Promise<DesktopUpdateRelaunchResult> {
   if (desktopUpdateStartupPhase !== undefined || desktopUpdateChannelChangePending ||
     desktopUpdateChannelRelaunch !== undefined || quitting) return { accepted: false, reason: "not-ready" };
   const service = requireDesktopUpdateService();
   const snapshot = service.getStatus();
-  if (snapshot.status !== "ready" || service.isRelaunching()) return { accepted: false, reason: "not-ready" };
+  if (snapshot.status !== "ready" || service.isRelaunching()
+    || expectedVersion !== undefined && snapshot.version !== expectedVersion) return { accepted: false, reason: "not-ready" };
   if (managedOrchestratorStatus.state !== "disabled" && managedOrchestratorStatus.state === "ready" &&
     managedOrchestratorRuntime === undefined && managedOrchestratorInitialization === undefined) {
     return { accepted: false, reason: "busy" };
@@ -7870,7 +7873,7 @@ async function requestDesktopUpdateRelaunch(
       return { accepted: false, reason: "not-ready" };
     }
   }
-  return service.relaunch();
+  return service.relaunch(snapshot.version);
 }
 
 async function requestDesktopStartupRelaunch(): Promise<DesktopUpdateRelaunchResult> {
@@ -10048,8 +10051,7 @@ function registerIpc(): void {
   ipcMain.handle(DESKTOP_CHANNELS.updateRelaunch, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
     if (parameters.length !== 1) throw new TypeError("Desktop update relaunch requires one policy object.");
-    const request = parseDesktopUpdateRelaunchRequest(parameters[0]);
-    return requestDesktopUpdateRelaunch(request.allowBusy);
+    return requestDesktopUpdateRelaunch(parseDesktopUpdateRelaunchRequest(parameters[0]));
   });
   ipcMain.handle(DESKTOP_CHANNELS.updateStartupRelaunch, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
@@ -10127,12 +10129,24 @@ function registerIpc(): void {
   ipcMain.handle(DESKTOP_CHANNELS.updateChannelRelaunch, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
     if (parameters.length !== 1) throw new TypeError("Desktop update channel relaunch requires one policy object.");
-    const request = parseDesktopUpdateRelaunchRequest(parameters[0]);
+    const request = parseDesktopUpdateChannelRelaunchRequest(parameters[0]);
     return requestDesktopUpdateChannelRelaunch(request.allowBusy);
   });
 }
 
 function parseDesktopUpdateRelaunchRequest(value: unknown): DesktopUpdateRelaunchRequest {
+  if (typeof value !== "object" || value === null || Array.isArray(value)
+    || Object.keys(value).sort().join(",") !== "allowBusy,expectedVersion") {
+    throw new TypeError("Desktop update relaunch requires the displayed version and busy policy.");
+  }
+  const { allowBusy, expectedVersion } = value as Record<string, unknown>;
+  if (typeof allowBusy !== "boolean" || typeof expectedVersion !== "string" || expectedVersion.length === 0 || expectedVersion.length > 128) {
+    throw new TypeError("Desktop update relaunch requires the displayed version and busy policy.");
+  }
+  return { allowBusy, expectedVersion };
+}
+
+function parseDesktopUpdateChannelRelaunchRequest(value: unknown): DesktopUpdateChannelRelaunchRequest {
   if (typeof value !== "object" || value === null || Array.isArray(value) ||
     Object.keys(value).join(",") !== "allowBusy" ||
     typeof (value as Record<string, unknown>)["allowBusy"] !== "boolean") {
