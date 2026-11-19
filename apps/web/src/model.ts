@@ -125,6 +125,7 @@ export interface TargetView {
   readonly pinned: boolean;
   readonly archived: boolean;
   readonly remoteWorkspace?: RemoteWorkspaceView;
+  readonly sshWorktreeDerivationAllowed?: boolean;
   readonly error?: string;
 }
 

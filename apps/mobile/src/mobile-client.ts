@@ -14477,8 +14477,11 @@ export class MobileClient {
       const matches = runtime.backend.capabilities?.capabilities.filter((capability) => capability.name === name) ?? [];
       return matches.length === 1 && matches[0]!.support === CapabilitySupport.SUPPORTED;
     };
+    const derivesWorkspace = supported("workspace.derive");
+    const sshCloneBlocked = capability === capabilityNames.sessionClone && derivesWorkspace
+      && runtime.session.location?.kind.case === "sshHost" && target.sshWorktreeDerivationAllowed === false;
     const canDerive = supported(capability)
-      && (capability === capabilityNames.sessionSideChat || !runtime.session.worktree || supported("workspace.derive"))
+      && !sshCloneBlocked && (capability === capabilityNames.sessionSideChat || !runtime.session.worktree || derivesWorkspace)
       && !this.#state.detail?.reviewRuns.some((review) => review.reviewerSessionId === runtime.session.sessionId)
       && !this.#state.pending.some((pending) => pending.sessionId === runtime.session.sessionId
         && (pending.kind.startsWith("session-") || pending.kind === "workspace-rewind"));

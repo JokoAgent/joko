@@ -363,6 +363,32 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
     const renamedClients = createE2eClients(running.baseUrl, paired.authKey);
     expect(await submit(renamedClients.operation, paired.connection.id, renamedClone, renamedCloneId)).toEqual(renamedResult);
     expect(remote.deriveCount).toBe(derivesBeforeRetry);
+
+    const currentStore = running.application.store;
+    const currentTarget = currentStore.getTarget(targetId);
+    expect((await renamedClients.target.getTarget({ targetId })).target?.sshWorktreeDerivationAllowed).toBe(true);
+    currentStore.upsertTarget({ ...currentTarget.descriptor, managed: false }, currentTarget.metadata);
+    expect((await renamedClients.target.getTarget({ targetId })).target?.sshWorktreeDerivationAllowed).toBe(false);
+    const ordinaryPrompt = "Continue in the ordinary SSH project";
+    const ordinaryTurn = await submit(renamedClients.operation, paired.connection.id,
+      sendInputMutation(sourceId, BigInt(currentStore.getSession(sourceId).descriptor.binding.generation), ordinaryPrompt));
+    expect(ordinaryTurn.state).toBe(OperationState.SUCCEEDED);
+    await waitFor(async () => currentStore.findQueueItemByRunId(sourceId, queueRunIdFrom(ordinaryTurn))?.state,
+      (state) => state === "completed", "ordinary SSH task completion", 10_000);
+    expect(remote.queryInputs.find(input => input.content === ordinaryPrompt)).toMatchObject({ sessionId: sourceNativeId, consumedInitCwd: REMOTE_ROOT });
+
+    const beforeRejectedClone = { checkoutCalls: remote.checkoutCalls.length, managerCalls: remote.managerCalls.length,
+      tasks: currentStore.listSessions({ includeArchived: true, includeDeleted: true }).length };
+    const rejected = await submit(renamedClients.operation, paired.connection.id, cloneMutation(sourceId, "Unavailable workspace Clone"));
+    expect(rejected).toMatchObject({ state: OperationState.FAILED, error: {
+      code: "SESSION_DERIVATION_WORKTREE_UNAVAILABLE", phase: "workspace", queueImpact: StateImpact.UNCHANGED,
+      nativeSessionImpact: StateImpact.UNCHANGED, workspaceImpact: StateImpact.UNCHANGED
+    } });
+    expect(rejected.error?.message).toContain("trusted managed project");
+    expect(remote.checkoutCalls).toHaveLength(beforeRejectedClone.checkoutCalls);
+    expect(remote.managerCalls.slice(beforeRejectedClone.managerCalls)).not.toContain("store.fork");
+    expect(currentStore.listSessions({ includeArchived: true, includeDeleted: true })).toHaveLength(beforeRejectedClone.tasks);
+    expect(currentStore.getSession(sourceId).descriptor.worktree).toBeUndefined();
   } finally {
     observeCleanup.mockRestore();
     await running?.close().catch(() => undefined);

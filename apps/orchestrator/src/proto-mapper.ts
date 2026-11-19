@@ -594,6 +594,7 @@ function publicBackendCapabilities(backend: BackendDescriptor): readonly Capabil
 
 export function toProtoTarget(record: StoredTarget): ProtoTarget {
   const metadata = objectValue(record.metadata);
+  const target = record.descriptor;
   return message<ProtoTarget>("joko.v1.Target", {
     targetId: record.descriptor.id,
     backendId: record.descriptor.backendId,
@@ -605,7 +606,8 @@ export function toProtoTarget(record: StoredTarget): ProtoTarget {
     lastActivityAt: toProtoTimestamp(record.updatedAt),
     version: toProtoEntityVersion(record.revision, 0, record.updatedAt),
     error: undefined,
-    location: toProtoWorkspaceLocation(record.descriptor.remoteWorkspace)
+    location: toProtoWorkspaceLocation(target.remoteWorkspace),
+    sshWorktreeDerivationAllowed: target.remoteWorkspace?.kind === "ssh" ? target.managed && target.trusted : undefined
   });
 }
 

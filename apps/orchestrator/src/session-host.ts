@@ -5705,6 +5705,18 @@ export class SessionHost {
       (store) => {
         const source = store.getSession(input.sourceSessionId);
         this.assertSessionDerivationSource(source, input.sideChat === true);
+        if (input.kind === "clone" && source.descriptor.remoteWorkspace?.kind === "ssh"
+          && store.getBackend(source.descriptor.backendId).descriptor.capabilities.get("workspace.derive")?.supported === true) {
+          const target = store.getTarget(source.descriptor.targetId).descriptor;
+          if (!target.managed || !target.trusted) throw new JokoError({
+            code: "SESSION_DERIVATION_WORKTREE_UNAVAILABLE",
+            message: "Cloning through an SSH Worktree requires a trusted managed project.",
+            phase: "workspace",
+            retryable: false,
+            stateMayHaveChanged: false,
+            recovery: "Use a trusted managed project for an isolated clone."
+          });
+        }
         if (input.expectedGeneration !== undefined && source.descriptor.binding.generation !== input.expectedGeneration) {
           throw new StoreError(input.sideChat ? "The Side Chat source generation changed." : "The message fork source generation changed.");
         }

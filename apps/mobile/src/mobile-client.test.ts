@@ -13126,11 +13126,13 @@ describe("native current-task cloning", () => {
           ...(sideChat ? [create(CapabilitySchema, { name: capabilityNames.sessionSideChat, support: CapabilitySupport.SUPPORTED })] : [])]
       }) }),
       reviews: [] as Snapshot["reviewRuns"],
+      target: undefined as Snapshot["targets"][number] | undefined,
       derived: undefined as Snapshot["sessions"][number] | undefined
     };
     const network = fakeNetwork();
     const projection = (detail: boolean) => create(SnapshotSchema, { ...runtimeControlProjection(state.session, detail),
       backends: [state.backend], reviewRuns: state.reviews,
+      ...(state.target === undefined ? {} : { targets: [state.target] }),
       ...(!detail && state.derived ? { sessions: [state.session, state.derived] } : {}) });
     network.readOwner = vi.fn(async () => ({ connection, device, snapshot: projection(false) }));
     network.readSession = vi.fn(async () => projection(true));
@@ -13309,6 +13311,25 @@ describe("native current-task cloning", () => {
     await app.refresh();
     expect(app.taskCloneControls()?.canClone).toBe(false);
     expect(f.network.submit).not.toHaveBeenCalled();
+  });
+
+  it("blocks a denied SSH Clone before dispatch and allows a current managed project", async () => {
+    const f = fixture();
+    const location = create(WorkspaceLocationSchema, { kind: { case: "sshHost",
+      value: { hostTargetId: "target", hostId: "ssh", workspaceRootDisplay: "/srv/project" } } });
+    f.state.session = create(SessionSchema, { ...runtimeSession, location });
+    f.state.backend.capabilities!.capabilities.push(create(CapabilitySchema, { name: "workspace.derive", support: CapabilitySupport.SUPPORTED }));
+    f.state.target = create(TargetSchema, { ...runtimeControlProjection().targets[0]!, location, sshWorktreeDerivationAllowed: false });
+    const app = client(f.network, memoryStorage(credential).storage);
+    await app.start();
+    const controls = app.taskCloneControls()!;
+    expect(controls.canClone).toBe(false);
+    await expect(app.cloneTask(controls.authorityKey, "Copy")).rejects.toThrow(/owner changed/u);
+    expect(f.network.submit).not.toHaveBeenCalled();
+
+    f.state.target = create(TargetSchema, { ...f.state.target, sshWorktreeDerivationAllowed: true });
+    await app.refresh();
+    expect(app.taskCloneControls()?.canClone).toBe(true);
   });
 
   it("retains unknown cloning across reconciliation and never dispatches a duplicate", async () => {

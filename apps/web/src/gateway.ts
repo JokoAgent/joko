@@ -13146,6 +13146,7 @@ function mapTargetView(target: Snapshot["targets"][number], workspaces: readonly
     pinned: target.pinned,
     archived: target.state === 2,
     ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }),
+    ...(target.sshWorktreeDerivationAllowed === undefined ? {} : { sshWorktreeDerivationAllowed: target.sshWorktreeDerivationAllowed }),
     ...(target.error?.message ? { error: presentJokoServiceTerminology(target.error.message) } : {})
   };
 }
