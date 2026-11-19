@@ -3,6 +3,8 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { createClient, createRouterTransport } from "@connectrpc/connect";
+import { CollaborationService, CollaborationWorkerStatus } from "@joko/contracts";
 import { DEFAULT_COLLABORATION_SETTINGS, WorkerHardLimitError } from "@joko/runtime-governance";
 import { OperationalStore, RevisionConflictError, operationBodyHash } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
@@ -10,7 +12,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
+import { createCollaborationConnectService } from "./collaboration-connect-service.js";
 import { CollaborationGoalManager } from "./collaboration-goal-manager.js";
+import { toProtoRevision } from "./proto-mapper.js";
 import { SessionHost } from "./session-host.js";
 import type { AdapterContext, PromptInput } from "@joko/core";
 import { mkdtempSync } from "./test-paths.js";
@@ -458,15 +462,69 @@ describe("CollaborationGoalManager", () => {
     })).worker;
     expect(worker).toMatchObject({ status: "stopped", runtimeReleased: true });
     advance("archive");
-    worker = fixture.manager.archiveWorker({
+    worker = (await fixture.manager.archiveWorker({
       operationId: "worker-archive",
       workerId: worker.id,
       callerLeadSessionId: fixture.leadSessionId,
       expectedRevision: worker.revision
-    }).worker;
+    })).worker;
     expect(worker.status).toBe("archived");
     expect(fixture.store.getSession(worker.sessionId!).descriptor.archived).toBe(true);
     advance("complete");
+  });
+
+  it("archives a completed worker through Connect only after its original runtime closes", async () => {
+    const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    const fixture = await createFixture(DEFAULT_COLLABORATION_SETTINGS, adapter);
+    const goal = fixture.manager.createGoal({
+      operationId: "archive-live-goal",
+      leadSessionId: fixture.leadSessionId,
+      expectedSessionGeneration: fixture.leadGeneration,
+      title: "Archive finished work",
+      objective: "Archive the original worker after it finishes."
+    }).goal;
+    const created = await fixture.manager.createWorker(workerInput(goal.id, goal.revision, fixture.leadSessionId, {
+      operationId: "archive-live-worker", label: "Verifier", role: "verification", assignment: "Verify the work and report."
+    }));
+    const sessionId = created.worker.sessionId!;
+    const worker = await vi.waitFor(() => {
+      const current = fixture.store.getCollaborationWorker(created.worker.id);
+      expect(current).toMatchObject({ status: "completed", runtimeReleased: false });
+      expect(fixture.store.listQueueItems({ sessionId, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"] })).toEqual([]);
+      expect(fixture.store.listRuns({ sessionId, activeOnly: true })).toEqual([]);
+      return current;
+    });
+    expect(fixture.host.isSessionActive(sessionId)).toBe(true);
+    const client = createClient(CollaborationService, createRouterTransport(router => {
+      router.service(CollaborationService, createCollaborationConnectService(fixture.manager, () => undefined));
+    }));
+    const request = { operationId: "archive-live-native", workerId: worker.id, callerLeadSessionId: fixture.leadSessionId,
+      expectedRevision: toProtoRevision(worker.revision) };
+    const close = vi.spyOn(adapter, "closeSession").mockRejectedValueOnce(new Error("Original runtime has not closed."));
+    await expect(client.archiveCollaborationWorker({ ...request, operationId: "archive-live-close-failed" })).rejects.toBeDefined();
+    expect(fixture.store.getOperation("archive-live-close-failed").status).toBe("failed");
+    expect(fixture.store.getCollaborationWorker(worker.id)).toMatchObject({ status: "completed", runtimeReleased: false });
+    expect(fixture.store.getSession(sessionId).descriptor.archived).toBe(false);
+    expect(fixture.host.isSessionActive(sessionId)).toBe(true);
+
+    let finishClose!: () => void;
+    const closing = new Promise<void>(resolve => { finishClose = resolve; });
+    close.mockImplementationOnce(() => closing);
+    const pending = client.archiveCollaborationWorker(request);
+    try {
+      await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(2));
+      expect(fixture.store.getOperation(request.operationId).status).toBe("started");
+      expect(fixture.store.getCollaborationWorker(worker.id)).toMatchObject({ status: "completed", runtimeReleased: false });
+      expect(fixture.store.getSession(sessionId).descriptor.archived).toBe(false);
+    } finally {
+      finishClose();
+    }
+    const archived = await pending;
+    expect(archived.worker).toMatchObject({ workerId: worker.id, status: CollaborationWorkerStatus.ARCHIVED, runtimeReleased: true });
+    expect(fixture.host.isSessionActive(sessionId)).toBe(false);
+    expect(fixture.store.getSession(sessionId).descriptor.archived).toBe(true);
+    await expect(client.archiveCollaborationWorker(request)).resolves.toEqual(archived);
+    expect(close).toHaveBeenCalledTimes(2);
   });
 
   it("stops a Goal by durably stopping and archiving every worker before committing the Goal terminal state", async () => {

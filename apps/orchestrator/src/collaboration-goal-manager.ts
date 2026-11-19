@@ -631,47 +631,77 @@ export class CollaborationGoalManager {
     readonly workerId: string;
     readonly callerLeadSessionId: string;
     readonly expectedRevision: bigint;
-  }): { readonly tree: CollaborationGoalTreeView; readonly worker: CollaborationWorkerRecord } {
-    this.#assertOpen();
-    const execution = this.#store.runOperation(
-      {
-        id: input.operationId,
-        kind: "archive_collaboration_worker",
-        body: { ...input, expectedRevision: input.expectedRevision.toString(10) }
-      },
-      (store) => {
-        const current = store.getCollaborationWorker(input.workerId);
-        const goal = store.getCollaborationGoal(current.goalId);
+  }): Promise<{ readonly tree: CollaborationGoalTreeView; readonly worker: CollaborationWorkerRecord }> {
+    return this.#withLock(input.workerId, async () => {
+      this.#assertOpen();
+      const assertCurrent = (store: OperationalStore): void => {
+        const worker = store.getCollaborationWorker(input.workerId);
+        const goal = store.getCollaborationGoal(worker.goalId);
+        if (goal.leadSessionId !== input.callerLeadSessionId) {
+          throw new AuthorizationError("Only the collaboration lead can archive a worker.");
+        }
+        assertWorkerRevision(worker, input.expectedRevision);
         if (goal.status === "archived") {
           throw new StoreError("An archived collaboration Goal cannot archive another worker.");
         }
-        const worker = store.updateCollaborationWorkerState({
-          workerId: input.workerId,
-          callerLeadSessionId: input.callerLeadSessionId,
-          expectedRevision: input.expectedRevision,
-          status: "archived",
-          runtimeReleased: true,
-          updatedAt: this.#now()
-        });
-        if (worker.sessionId !== undefined) {
-          const session = store.getSession(worker.sessionId);
-          if (!session.descriptor.archived) {
-            store.updateSession(
-              session.descriptor.id,
-              { archived: true },
-              session.revision,
-              this.#now()
-            );
+        if (!["completed", "failed", "stopped", "archived"].includes(worker.status)) {
+          throw new StoreError("Only a terminal collaboration worker can be archived.");
+        }
+        if (worker.sessionId === undefined) return;
+        if (activeRunsFor(store, worker.sessionId).length > 0 || store.listQueueItems({
+          sessionId: worker.sessionId,
+          states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"]
+        }).length > 0) {
+          throw new StoreError("A collaboration worker with active work cannot be archived.");
+        }
+        if (!worker.runtimeReleased && store.getSession(worker.sessionId).descriptor.binding.generation !== worker.sessionGeneration) {
+          throw new StoreError("The collaboration worker Session generation changed before archive.");
+        }
+      };
+      const claim = this.#store.claimDeferredEffectOperation<{ readonly workerId: string; readonly goalId: string }>({
+        id: input.operationId,
+        kind: "archive_collaboration_worker",
+        body: { ...input, expectedRevision: input.expectedRevision.toString(10) }
+      }, assertCurrent);
+      if (!claim.claimed) {
+        return { tree: this.#tree(claim.value.goalId), worker: this.#store.getCollaborationWorker(claim.value.workerId) };
+      }
+      const current = this.#store.getCollaborationWorker(input.workerId);
+      let archived: { readonly workerId: string; readonly goalId: string };
+      try {
+        if (!current.runtimeReleased && current.sessionId !== undefined) {
+          await this.#sessionHost.closeIfActive(current.sessionId);
+          if (this.#sessionHost.isSessionActive(current.sessionId)) {
+            throw new StoreError("The collaboration worker runtime is still active after closing.");
           }
         }
-        return { workerId: worker.id, goalId: worker.goalId };
+        archived = this.#store.completeDeferredEffectOperation(input.operationId, claim.operation.bodyHash, store => {
+          assertCurrent(store);
+          const worker = store.updateCollaborationWorkerState({
+            workerId: input.workerId,
+            callerLeadSessionId: input.callerLeadSessionId,
+            expectedRevision: input.expectedRevision,
+            status: "archived",
+            runtimeReleased: true,
+            updatedAt: this.#now()
+          });
+          if (worker.sessionId !== undefined) {
+            const session = store.getSession(worker.sessionId);
+            if (!session.descriptor.archived) {
+              store.updateSession(session.descriptor.id, { archived: true }, session.revision, this.#now());
+            }
+          }
+          return { workerId: worker.id, goalId: worker.goalId };
+        }).value;
+      } catch (error) {
+        this.#store.failEffectOperation(input.operationId, claim.operation.bodyHash, error);
+        throw error;
       }
-    );
-    const lease = this.#leases.get(execution.value.workerId);
-    if (lease !== undefined) this.#capacity.release(lease.leaseId);
-    this.#leases.delete(execution.value.workerId);
-    const worker = this.#store.getCollaborationWorker(execution.value.workerId);
-    return { tree: this.#tree(execution.value.goalId), worker };
+      const lease = this.#leases.get(archived.workerId);
+      if (lease !== undefined) this.#capacity.release(lease.leaseId);
+      this.#leases.delete(archived.workerId);
+      return { tree: this.#tree(archived.goalId), worker: this.#store.getCollaborationWorker(archived.workerId) };
+    });
   }
 
   async sendMessage(input: {
@@ -1055,7 +1085,7 @@ export class CollaborationGoalManager {
       }
       input.signal?.throwIfAborted();
       if (worker.status !== "archived") {
-        this.archiveWorker({
+        await this.archiveWorker({
           operationId: serviceOperationId(`${input.operationId}:${worker.id}`, "goal-archive-worker"),
           workerId: worker.id,
           callerLeadSessionId: input.callerLeadSessionId,

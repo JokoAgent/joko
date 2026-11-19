@@ -230,10 +230,10 @@ export function createCollaborationConnectService(
         });
       });
     },
-    archiveCollaborationWorker: (request, context) => {
+    archiveCollaborationWorker: async (request, context) => {
       authenticate(context);
-      return collaborationRpc(() => {
-        const result = owner().archiveWorker({
+      return collaborationRpc(async () => {
+        const result = await owner().archiveWorker({
           operationId: request.operationId,
           workerId: request.workerId,
           callerLeadSessionId: request.callerLeadSessionId,
