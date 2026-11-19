@@ -56,6 +56,8 @@ export interface MachineCacheView {
   readonly name: string;
   readonly origin: string;
   readonly updatedAt: number;
+  /** Durable owner stream position within one Orchestrator runtime. */
+  readonly cursor?: { readonly generation: string; readonly sequence: string };
   readonly sessions: readonly MachineSessionCacheView[];
 }
 
