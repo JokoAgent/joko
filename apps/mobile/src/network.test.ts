@@ -1,6 +1,6 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
-import { EventCursorSchema, GetProviderUsageRequestSchema, GetProviderUsageResponseSchema,
-  StreamEventsRequestSchema, StreamEventsResponseSchema } from "@joko/contracts";
+import { EventCursorSchema, GetProviderUsageRequestSchema, GetProviderUsageResponseSchema, JOKO_API_VERSION,
+  StreamEventsRequestSchema, StreamEventsResponseSchema, UnregisterMobilePushRequestSchema, UnregisterMobilePushResponseSchema } from "@joko/contracts";
 import { ListPartnerTaskOutputsRequestSchema, ListPartnerTaskOutputsResponseSchema,
   PartnerTaskOutputSourceKind, PartnerTaskOutputReadiness, PartnerTaskOutputFileStatus } from "@joko/contracts";
 import { createHash } from "node:crypto";
@@ -154,7 +154,7 @@ import { mobilePartnerProfileDraft } from "./mobile-partner-profile";
 import { profilePartner, profilePartnerWire } from "./test/mobile-partner-profile";
 import { creationSnapshot } from "./test/mobile-partner-creation";
 import { mobilePartnerCreationDraft, MobilePartnerCreationRejected } from "./mobile-partner-creation";
-import { rememberEndpointTrust, replaceEndpointTrust } from "@joko/connection-transport";
+import { rememberEndpointTrust, replaceEndpointTrust, trustedEndpointPublicKey } from "@joko/connection-transport";
 import { rememberEndpointTransport } from '@joko/connection-transport/trust';
 import { mobileNetworkFixtureEndpointPublicKey } from "./test/mobile-network-transport";
 
@@ -231,6 +231,56 @@ describe("Mobile account usage network", () => {
       const aborted = new AbortController(); aborted.abort();
       await expect(mobileNetwork.getProviderUsage!(credential, "backend", "provider", aborted.signal)).rejects.toThrow();
       expect(fetcher).toHaveBeenCalledTimes(2);
+    } finally { fetcher.mockRestore(); }
+  });
+});
+
+describe("Mobile push retirement network", () => {
+  it.each(["https://push-retire-cold.example", "http://192.168.50.44:4318"])(
+    "checks the original pinned %s identity before presenting its exact ticket", async origin => {
+      const ticket = { serverId: "original-node", registrationId: "original-registration", secret: "s".repeat(43) };
+      const route = { kind: "pinned", endpointPublicKey: mobileNetworkFixtureEndpointPublicKey } as const;
+      const requests: string[] = [];
+      let reportedServerId = "different-node";
+      const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+        const request = new Request(input, init);
+        const url = new URL(request.url);
+        expect(url.origin).toBe(origin);
+        expect(request.headers.has("authorization")).toBe(false);
+        requests.push(url.pathname);
+        const headers = { "content-type": "application/proto" };
+        if (url.pathname === "/joko.v1.ConnectionService/GetServerInfo") {
+          expect(new Uint8Array(await request.arrayBuffer())).toHaveLength(0);
+          return new Response(toBinary(GetServerInfoResponseSchema, create(GetServerInfoResponseSchema,
+            { server: { serverId: reportedServerId, apiVersion: JOKO_API_VERSION } })), { headers });
+        }
+        expect(url.pathname).toBe("/joko.v1.ConnectionService/UnregisterMobilePush");
+        expect(fromBinary(UnregisterMobilePushRequestSchema, new Uint8Array(await request.arrayBuffer()))).toMatchObject({
+          serverId: ticket.serverId, registrationId: ticket.registrationId, revocationSecret: ticket.secret
+        });
+        return new Response(toBinary(UnregisterMobilePushResponseSchema, create(UnregisterMobilePushResponseSchema)), { headers });
+      });
+      try {
+        expect(trustedEndpointPublicKey(origin)).toBeUndefined();
+        await expect(mobileNetwork.unregisterMobilePush(origin, route, ticket)).rejects.toThrow(/security check/u);
+        expect(requests).toEqual(["/joko.v1.ConnectionService/GetServerInfo"]);
+        reportedServerId = ticket.serverId;
+        await mobileNetwork.unregisterMobilePush(origin, route, ticket);
+        expect(requests.slice(1)).toEqual(["/joko.v1.ConnectionService/GetServerInfo", "/joko.v1.ConnectionService/UnregisterMobilePush"]);
+        expect(trustedEndpointPublicKey(origin)).toBeUndefined();
+      } finally { fetcher.mockRestore(); }
+    }
+  );
+
+  it("keeps a conflicting retained pin from reaching the transport", async () => {
+    const origin = "https://push-retire-conflict.example";
+    rememberEndpointTrust({ origin, endpointPublicKey: mobileNetworkFixtureEndpointPublicKey, serverId: "current-node" });
+    const fetcher = vi.spyOn(globalThis, "fetch");
+    try {
+      await expect(mobileNetwork.unregisterMobilePush(origin, { kind: "pinned", endpointPublicKey: `ed25519:${"f".repeat(64)}` },
+        { serverId: "previous-node", registrationId: "old-registration", secret: "s".repeat(43) })).rejects.toThrow(/security check/u);
+      expect(fetcher).not.toHaveBeenCalled();
+      expect(trustedEndpointPublicKey(origin)).toBe(mobileNetworkFixtureEndpointPublicKey);
     } finally { fetcher.mockRestore(); }
   });
 });

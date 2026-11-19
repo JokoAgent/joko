@@ -57,6 +57,8 @@ describe("MobilePushDeviceStore", () => {
       "not-json",
       JSON.stringify({ version: 2, registrations: [] }),
       JSON.stringify({ version: 1, registrations: [{ ...registration(), extra: true }] }),
+      JSON.stringify({ version: 1, registrations: [registration({ retirementRoute: { kind: "direct" } })] }),
+      JSON.stringify({ version: 1, registrations: [registration({ retirementRoute: { kind: "pinned", endpointPublicKey: "incomplete" } })] }),
       JSON.stringify({ version: 1, registrations: [{ ...registration(), origin: "https://user@node.example.test" }] })
     ]) {
       const plain = memoryStore({ [mobilePushDeviceStoreTesting.enabledKey]: "1" });
@@ -64,6 +66,20 @@ describe("MobilePushDeviceStore", () => {
       const store = new MobilePushDeviceStore(plain.driver, { isAvailable: async () => true, ...secure.driver });
       await expect(store.hydrate()).rejects.toThrow(/notification/u);
     }
+  });
+
+  it("rehydrates the pinned carrier only from protected notification records", async () => {
+    const plain = memoryStore();
+    const secure = memoryStore();
+    const driver = { isAvailable: async () => true, ...secure.driver };
+    const store = new MobilePushDeviceStore(plain.driver, driver);
+    const original = registration({ retirementRoute: { kind: "pinned", endpointPublicKey: `ed25519:${"f".repeat(64)}`,
+      endpointTransport: { kind: "http-connect", proxyOrigin: "https://selected-carrier.example.test", authority: "node.example.test:443" } } });
+    await store.hydrate();
+    await store.putRegistration(original);
+    expect([...plain.values.values()]).toEqual([]);
+    const fresh = new MobilePushDeviceStore(plain.driver, driver);
+    expect((await fresh.hydrate()).registrations).toEqual([original]);
   });
 
   it("durably replaces only the same profile and removes one exact ticket", async () => {

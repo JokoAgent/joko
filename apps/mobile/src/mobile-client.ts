@@ -1,4 +1,6 @@
-import { isEndpointTrustError, observeEndpointTrustFailure, rememberEndpointTrust, replaceEndpointTrust, trustedEndpointPublicKey, trustedEndpointTransportKind } from "@joko/connection-transport";
+import { allowsUnpinnedEndpoint, EndpointTrustError, isEndpointTrustError, observeEndpointTrustFailure, rememberEndpointTrust,
+  replaceEndpointTrust, trustedEndpointPublicKey, trustedEndpointTransport, trustedEndpointTransportKind } from "@joko/connection-transport";
+import type { MobilePushRetirementRoute, MobilePushStoredRegistration } from "./mobile-push-device-store";
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import { ExtensionPackageAction } from "@joko/contracts";
@@ -115,7 +117,7 @@ import {
   assertWorkspaceFilePreview,
   normalizeNodeOrigin,
   type MobileNetwork, type MobilePushCapabilityResult, type MobilePushRegistrationInput,
-  type MobilePushRegistrationResult, type MobilePushRevocationTicket, type NodeIdentity, type PairedCredential
+  type MobilePushRegistrationResult, type NodeIdentity, type PairedCredential
 } from "./network";
 import {
   assertMobileCanonicalPartnerSession, emptyMobilePartnerPrivateState,
@@ -593,11 +595,25 @@ export interface MobilePushAuthority {
   readonly connectionId: string;
   readonly deviceId: string;
   readonly deviceRevision: bigint;
+  readonly endpointPublicKey?: string;
 }
 
 export interface MobilePushLifecycleScope {
   readonly ready: boolean;
   readonly activeProfileId?: string;
+}
+
+function mobilePushRetirementRoute(
+  profile: Pick<PairedCredential, "origin" | "transportKind">,
+  endpointPublicKey: string | undefined
+): MobilePushRetirementRoute {
+  const transportKind = profile.transportKind ?? "https";
+  if (endpointPublicKey === undefined) {
+    if (transportKind !== "https" || !allowsUnpinnedEndpoint(profile.origin)) throw new EndpointTrustError();
+    return { kind: "direct" };
+  }
+  const endpointTransport = trustedEndpointTransport(profile.origin, endpointPublicKey, transportKind);
+  return { kind: "pinned", endpointPublicKey, ...(endpointTransport === undefined ? {} : { endpointTransport }) };
 }
 
 interface MobileFilesContext {
@@ -3875,16 +3891,25 @@ export class MobileClient {
       || connection.state !== ConnectionState.CONNECTED || device.kind !== DeviceKind.MOBILE || device.revoked
       || device.platform.trim().toLocaleLowerCase("en-US") !== "ios"
       || !device.connectionIds.includes(credential.connectionId) || revision < 1n) return undefined;
+    const endpointPublicKey = credential.endpointPublicKey ?? trustedEndpointPublicKey(credential.origin);
     return Object.freeze({
       key: [credential.profileId, credential.origin, credential.serverId, credential.connectionId,
-        credential.deviceId, revision.toString(10)].join("\u001f"),
+        credential.deviceId, revision.toString(10), this.#epoch, endpointPublicKey ?? "", credential.transportKind ?? "https",
+        credential.entryId ?? ""].join("\u001f"),
       profileId: credential.profileId,
       origin: credential.origin,
       serverId: credential.serverId,
       connectionId: credential.connectionId,
       deviceId: credential.deviceId,
-      deviceRevision: revision
+      deviceRevision: revision,
+      ...(endpointPublicKey === undefined ? {} : { endpointPublicKey })
     });
+  }
+
+  captureMobilePushRetirementRoute(authority: MobilePushAuthority): MobilePushRetirementRoute {
+    const current = this.mobilePushAuthority();
+    if (!current || current.key !== authority.key) throw new Error("The mobile push owner changed.");
+    return mobilePushRetirementRoute(this.#ready(), current.endpointPublicKey);
   }
 
   async getMobilePushCapability(
@@ -3916,12 +3941,25 @@ export class MobileClient {
     return result;
   }
 
-  unregisterMobilePush(
-    origin: string,
-    ticket: MobilePushRevocationTicket,
+  async unregisterMobilePush(
+    record: MobilePushStoredRegistration,
     signal?: AbortSignal
   ): Promise<void> {
-    return this.network.unregisterMobilePush(origin, ticket, signal);
+    let route = record.retirementRoute;
+    if (route === undefined) {
+      // A receipt saved before route capture can only use a still-saved,
+      // exact pinned profile. The origin alone cannot recover that trust.
+      const saved = this.#profiles.find(profile => profile.profileId === record.profileId && profile.origin === record.origin
+        && profile.serverId === record.serverId && profile.connectionId === record.connectionId && profile.deviceId === record.deviceId);
+      if (saved?.endpointPublicKey === undefined) throw new EndpointTrustError();
+      signal?.throwIfAborted();
+      await this.storage.loadEndpointTransport?.(saved);
+      if (!this.#profiles.includes(saved)) throw new EndpointTrustError();
+      route = mobilePushRetirementRoute(saved, saved.endpointPublicKey);
+    }
+    signal?.throwIfAborted();
+    return this.network.unregisterMobilePush(record.origin, route,
+      { serverId: record.serverId, registrationId: record.registrationId, secret: record.secret }, signal);
   }
 
   subscribe(listener: (state: MobileState) => void): () => void {

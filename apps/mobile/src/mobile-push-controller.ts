@@ -3,6 +3,7 @@ import type { MobilePushRevocationTicket } from "./network";
 import type { NativeNotificationsApi } from "./native-notifications.types";
 import {
   MobilePushDeviceStore,
+  type MobilePushRetirementRoute,
   type MobilePushStoredEnvironment,
   type MobilePushStoredLocale,
   type MobilePushStoredRegistration
@@ -43,6 +44,7 @@ export interface MobilePushClientPort {
   subscribe(listener: () => void): () => void;
   mobilePushLifecycleScope(): MobilePushLifecycleScope;
   mobilePushAuthority(): MobilePushAuthority | undefined;
+  captureMobilePushRetirementRoute(authority: MobilePushAuthority): MobilePushRetirementRoute;
   getMobilePushCapability(authority: MobilePushAuthority, signal?: AbortSignal): Promise<{
     readonly supported: boolean;
     readonly unavailableReasonCode?: string;
@@ -53,7 +55,7 @@ export interface MobilePushClientPort {
     readonly deviceToken: string;
     readonly ticket: MobilePushRevocationTicket;
   }, signal?: AbortSignal): Promise<{ readonly expiresAt: number }>;
-  unregisterMobilePush(origin: string, ticket: MobilePushRevocationTicket, signal?: AbortSignal): Promise<void>;
+  unregisterMobilePush(record: MobilePushStoredRegistration, signal?: AbortSignal): Promise<void>;
 }
 
 export interface MobilePushControllerOptions {
@@ -353,7 +355,8 @@ export class MobilePushController {
       if (!/^[0-9a-f]{64}$/u.test(tokenDigest)) throw new Error("The notification token digest is invalid.");
       let record = this.#deviceStore.snapshot.registrations.find((item) => recordMatchesAuthority(item, authority));
       // A live node can remove a confirmed registration after a terminal APNs response.
-      if (!this.#serverConfirmationRequired && record?.confirmed && record.environment === this.#environment && record.locale === this.#locale
+      if (!this.#serverConfirmationRequired && record?.confirmed && record.retirementRoute
+        && record.environment === this.#environment && record.locale === this.#locale
         && record.tokenDigest === tokenDigest && record.expiresAt > this.#now() + RENEWAL_WINDOW_MS) {
         this.#publish({ enabled: true, saving: this.#state.saving, status: "registered" });
         return;
@@ -383,6 +386,7 @@ export class MobilePushController {
         };
       }
       if (!current()) return;
+      record = { ...record, retirementRoute: this.#client.captureMobilePushRetirementRoute(authority) };
       await this.#deviceStore.putRegistration(record);
       if (!current()) return;
       const result = await this.#client.registerMobilePush(authority, {
@@ -410,7 +414,7 @@ export class MobilePushController {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), RETIRE_TIMEOUT_MS);
     try {
-      await this.#client.unregisterMobilePush(record.origin, ticketOf(record), controller.signal);
+      await this.#client.unregisterMobilePush(record, controller.signal);
       await this.#deviceStore.removeRegistration(record.serverId, record.registrationId);
       return true;
     } catch { return false; }
@@ -458,7 +462,9 @@ export class MobilePushController {
 function recordMatchesAuthority(record: MobilePushStoredRegistration, authority: MobilePushAuthority): boolean {
   return record.profileId === authority.profileId && record.origin === authority.origin
     && record.serverId === authority.serverId && record.connectionId === authority.connectionId
-    && record.deviceId === authority.deviceId;
+    && record.deviceId === authority.deviceId
+    && (record.retirementRoute === undefined
+      || (record.retirementRoute.kind === "pinned" ? record.retirementRoute.endpointPublicKey : undefined) === authority.endpointPublicKey);
 }
 
 function ticketOf(record: MobilePushStoredRegistration): MobilePushRevocationTicket {

@@ -5194,8 +5194,35 @@ describe("native mobile push authority", () => {
       ticket
     });
     await expect(late).rejects.toThrow(/owner changed/u);
-    await app.unregisterMobilePush(credential.origin, ticket);
-    expect(network.unregisterMobilePush).toHaveBeenCalledWith(credential.origin, ticket, undefined);
+  });
+
+  it("uses the precommitted pin after Forget and a cold client start without the original Auth Key", async () => {
+    const pinned = { ...credential, origin: "https://push-retirement.example.test", endpointPublicKey: `ed25519:${"c".repeat(64)}` };
+    const iosDevice = create(DeviceSchema, { ...device, platform: "ios" });
+    const iosSnapshot = create(SnapshotSchema, { ...snapshot, devices: [iosDevice] });
+    const network = fakeNetwork();
+    network.readOwner = vi.fn(async () => ({ connection, device: iosDevice, snapshot: iosSnapshot }));
+    network.readSession = vi.fn(async () => iosSnapshot);
+    const saved = memoryStorage(pinned);
+    const app = iosClient(network, saved.storage);
+    await app.start();
+    const owner = app.mobilePushAuthority()!;
+    const ticket = { serverId: owner.serverId, registrationId: "registration-1", secret: "s".repeat(43) };
+    const record = { ...ticket, origin: owner.origin, profileId: owner.profileId, connectionId: owner.connectionId, deviceId: owner.deviceId,
+      environment: "sandbox", locale: "en", tokenDigest: "a".repeat(64), confirmed: true, expiresAt: 100_000 } as const;
+    const retirementRoute = app.captureMobilePushRetirementRoute(owner);
+    expect(retirementRoute).toEqual({ kind: "pinned", endpointPublicKey: pinned.endpointPublicKey });
+    await app.forgetConnection(pinned.profileId);
+    expect(saved.key(pinned.profileId)).toBeUndefined();
+    expect(saved.profiles()).toEqual([]);
+
+    const fresh = iosClient(network, saved.storage);
+    await fresh.start();
+    expect(fresh.mobilePushAuthority()).toBeUndefined();
+    await expect(fresh.unregisterMobilePush(record)).rejects.toThrow(/security check/u);
+    expect(network.unregisterMobilePush).not.toHaveBeenCalled();
+    await fresh.unregisterMobilePush({ ...record, retirementRoute });
+    expect(network.unregisterMobilePush).toHaveBeenCalledExactlyOnceWith(pinned.origin, retirementRoute, ticket, undefined);
   });
 });
 
