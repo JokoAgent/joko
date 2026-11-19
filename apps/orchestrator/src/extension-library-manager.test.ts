@@ -27,7 +27,10 @@ const authority: ExtensionLibraryAuthority = {
   library: { schemaVersion: 1, extensionEntry: "extensions/canvas.ts" }
 };
 const cleanups: Array<() => Promise<void>> = [];
-const filesystem = vi.hoisted(() => ({ orphanMarkerTempPrefix: undefined as string | undefined }));
+const filesystem = vi.hoisted(() => ({
+  orphanMarkerTempPrefix: undefined as string | undefined,
+  bindingControlTempPrefix: undefined as string | undefined
+}));
 
 vi.mock("node:fs/promises", async importOriginal => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
@@ -40,6 +43,11 @@ vi.mock("node:fs/promises", async importOriginal => {
         filesystem.orphanMarkerTempPrefix = undefined;
         throw Object.assign(new Error("Injected Library orphan marker staging error"), { code: "EIO" });
       }
+      if (filesystem.bindingControlTempPrefix && typeof path === "string"
+        && path.startsWith(filesystem.bindingControlTempPrefix) && path.endsWith(".tmp") && flags === "wx") {
+        filesystem.bindingControlTempPrefix = undefined;
+        throw Object.assign(new Error("Injected Library binding control staging error"), { code: "EIO" });
+      }
       return Reflect.apply(actual.open, undefined, args);
     }
   };
@@ -47,6 +55,7 @@ vi.mock("node:fs/promises", async importOriginal => {
 
 afterEach(async () => {
   filesystem.orphanMarkerTempPrefix = undefined;
+  filesystem.bindingControlTempPrefix = undefined;
   while (cleanups.length > 0) await cleanups.pop()?.();
 });
 
@@ -374,6 +383,40 @@ describe("ExtensionLibraryManager", () => {
       .resolves.toMatchObject({ state: "ready", usage: { files: 0, bytes: 0 } });
     const reset = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-2", assertAuthorityCurrent: currentAuthority() });
     expect(reset.bindingGeneration).toBe(7n);
+  });
+
+  it("keeps the previous binding live and durable if recording a selected recovery location fails", async () => {
+    const { temporaryPath, manager } = await fixture();
+    const owner = { authority, connectionId: "original-owner", surfaceId: `extension_surface_${"9".repeat(32)}`,
+      surfaceExpiresAt: 8_640_000_000_000_000, assertAuthorityCurrent: currentAuthority() };
+    const opened = await manager.openSession(owner);
+    await manager.write(opened.sessionId, owner.connectionId, { path: "note.txt", bytes: Buffer.from("Original note") });
+    const original = await manager.relocate({ authority, destination: { kind: "custom", candidate: join(temporaryPath, "original") },
+      assertAuthorityCurrent: owner.assertAuthorityCurrent });
+    const candidate = join(temporaryPath, "recovery");
+    await mkdir(candidate);
+    await rename(original.location.path, join(candidate, EXTENSION_ID));
+    const control = join(temporaryPath, "owner", "library-state.json");
+    const previousControl = await readFile(control);
+    filesystem.bindingControlTempPrefix = `${control}.`;
+    const request = { authority, candidate, assertAuthorityCurrent: owner.assertAuthorityCurrent };
+
+    await expect(manager.rebind(request)).rejects.toThrow("Injected Library binding control staging error");
+    expect(await readFile(control)).toEqual(previousControl);
+    await expect(manager.overview(owner)).resolves.toMatchObject({ state: "unavailable", reason: "disk_missing" });
+    await expect(manager.openSession(owner)).rejects.toMatchObject({ code: "UNAVAILABLE" });
+    await manager.close();
+
+    const recovered = new ExtensionLibraryManager({ rootDirectory: join(temporaryPath, "owner"), freeBytes: async () => 64 * 1024 * 1024 * 1024 });
+    cleanups.push(() => recovered.close());
+    await recovered.initialize();
+    await expect(recovered.overview(owner)).resolves.toMatchObject({ state: "unavailable", reason: "disk_missing" });
+    await expect(recovered.rebind(request)).resolves.toMatchObject({ location: {
+      kind: "custom", path: join(candidate, EXTENSION_ID), generation: original.location.generation + 1n
+    } });
+    const rebound = await recovered.openSession(owner);
+    const source = await recovered.read(rebound.sessionId, owner.connectionId, { path: "note.txt" });
+    expect(Buffer.from(source.bytes).toString()).toBe("Original note");
   });
 
   it("replays a durable rollback after the active root moved but before the selected grace copy switched", async () => {
