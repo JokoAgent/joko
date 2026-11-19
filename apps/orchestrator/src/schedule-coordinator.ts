@@ -72,6 +72,8 @@ export interface ScheduleDispatchResult {
   readonly status: "queued" | "success" | "skipped" | "failed" | "aborted";
 }
 
+type LinkedScheduleOccurrence = { readonly runId: string; readonly sessionId?: string };
+
 const SCHEDULE_BUSY_WAIT_MS = 30 * 60_000;
 
 /** Durable peer caller for SessionHost. The deterministic operation ID is the distributed claim. */
@@ -204,7 +206,7 @@ export class ScheduleCoordinator {
           scheduleId: schedule.id, scheduleName: schedule.name, runId: run.id,
           source: prior?.source ?? "automatic", executionMode: "agent", scheduledAt: history.firedAt,
           phase: queued ? "queued" : "running", ...(queued ? { resumeQueued: true } : { resumeActive: true }),
-          abort: () => this.abortSchedule(schedule.id, [history])
+          abort: () => this.abortOccurrence(schedule.id, history)
         });
         this.#admittedRuns.add(run.id);
       }
@@ -247,7 +249,7 @@ export class ScheduleCoordinator {
       this.#recovery.begin({
         scheduleId: schedule.id, scheduleName: schedule.name, runId,
         source, executionMode: "agent", scheduledAt: history.firedAt,
-        phase: "queued", resumeQueued: true, abort: () => this.abortSchedule(schedule.id, [history])
+        phase: "queued", resumeQueued: true, abort: () => this.abortOccurrence(schedule.id, history)
       });
       this.#admittedRuns.add(runId);
     }
@@ -258,29 +260,33 @@ export class ScheduleCoordinator {
    * immediately; already-admitted product Runs are aborted through SessionHost. */
   async abortSchedule(
     scheduleId: string,
-    linkedOccurrences: readonly { readonly runId: string; readonly sessionId?: string }[] =
-      listAllScheduleRuns(this.#store, scheduleId),
+    linkedOccurrences: readonly LinkedScheduleOccurrence[] = listAllScheduleRuns(this.#store, scheduleId),
     invokingRunId?: string
   ): Promise<void> {
     for (const [controller, runId] of this.#activeOccurrences.get(scheduleId) ?? []) {
       if (runId !== invokingRunId) controller.abort();
     }
     for (const occurrence of linkedOccurrences) {
-      if (occurrence.sessionId === undefined || occurrence.runId === invokingRunId) continue;
-      const run = this.#store.findRun(occurrence.runId);
-      if (
-        run === undefined || run.descriptor.sessionId !== occurrence.sessionId ||
-        !activeScheduleRunState(run.descriptor.state)
-      ) continue;
-      const queueItem = this.#store.findQueueItemByRunId(occurrence.sessionId, occurrence.runId);
-      if (queueItem?.state === "accepted") {
-        this.#store.cancelQueueItem({
-          queueItemId: queueItem.id,
-          traceId: `schedule:${scheduleId}:cancelled`
-        });
-      } else {
-        await this.#host.abort(occurrence.sessionId, occurrence.runId).catch(() => undefined);
-      }
+      if (occurrence.runId !== invokingRunId) await this.abortAdmittedOccurrence(scheduleId, occurrence);
+    }
+  }
+
+  private async abortOccurrence(scheduleId: string, occurrence: LinkedScheduleOccurrence): Promise<void> {
+    for (const [controller, runId] of this.#activeOccurrences.get(scheduleId) ?? []) {
+      if (runId === occurrence.runId) controller.abort();
+    }
+    await this.abortAdmittedOccurrence(scheduleId, occurrence);
+  }
+
+  private async abortAdmittedOccurrence(scheduleId: string, occurrence: LinkedScheduleOccurrence): Promise<void> {
+    if (occurrence.sessionId === undefined) return;
+    const run = this.#store.findRun(occurrence.runId);
+    if (run === undefined || run.descriptor.sessionId !== occurrence.sessionId || !activeScheduleRunState(run.descriptor.state)) return;
+    const queueItem = this.#store.findQueueItemByRunId(occurrence.sessionId, occurrence.runId);
+    if (queueItem?.state === "accepted") {
+      this.#store.cancelQueueItem({ queueItemId: queueItem.id, traceId: `schedule:${scheduleId}:cancelled` });
+    } else {
+      await this.#host.abort(occurrence.sessionId, occurrence.runId).catch(() => undefined);
     }
   }
 
@@ -479,7 +485,7 @@ export class ScheduleCoordinator {
       abort: () => {
         controller.abort();
         const history = this.#store.findScheduleRunByRunId(runtimeRunId);
-        if (history !== undefined) return this.abortSchedule(schedule.id, [history]);
+        if (history !== undefined) return this.abortAdmittedOccurrence(schedule.id, history);
       }
     });
     let controllers = this.#activeOccurrences.get(schedule.id);
@@ -1131,10 +1137,10 @@ export class ScheduleCoordinator {
     // previous process disappeared. The runtime lease can be reclaimed, but
     // the independently progressing product Run must not be aborted.
     if (history !== undefined && !isRecoverableScheduleRuntimeStatus(history.status)) return;
-    await this.abortSchedule(occurrence.scheduleId, [{
+    await this.abortOccurrence(occurrence.scheduleId, {
       runId: occurrence.runId,
       ...(history?.sessionId === undefined ? {} : { sessionId: history.sessionId })
-    }]);
+    });
   }
 
   private recordForceReleasedOccurrence(

@@ -101,6 +101,8 @@ import {
   encodePortableSessionProjection
 } from "./portable-session-projection.js";
 import { ScheduleCoordinator } from "./schedule-coordinator.js";
+import { SchedulerOccurrenceRecovery } from "./scheduler-occurrence-recovery.js";
+import { SchedulerRuntimeState } from "./scheduler-runtime-state.js";
 import { ScheduleRunNotificationController } from "./schedule-run-notifications.js";
 import type { ScheduleScriptInput, ScheduleScriptCapabilityContext } from "./schedule-script-runner.js";
 import { SessionHost, type InteractionDecisionSubmission, type WorkspaceRunCapture, type PartnerLearningHostPort } from "./session-host.js";
@@ -11558,6 +11560,76 @@ describe("SessionHost", () => {
       status: "aborted",
       detail: { script: { status: "aborted" }, costAttribution: "zero" }
     });
+  });
+
+  it.skipIf(process.platform === "win32")("recovers an expired script lease without aborting a new manual script process", { timeout: 25_000 }, async () => {
+    const fixture = await createFixture();
+    const cwd = fixture.store.getTarget("target-one").descriptor.workspaceRoot;
+    const startedPath = join(cwd, "new-schedule-script-started"), releasePath = join(cwd, "allow-new-schedule-script-to-finish");
+    await writeFile(join(cwd, "lease-recovery.mjs"), `
+      import { existsSync, writeFileSync } from "node:fs";
+      import { createInterface } from "node:readline";
+      const lines = createInterface({ input: process.stdin });
+      lines.once("line", line => {
+        const frame = JSON.parse(line);
+        if (frame.type !== "start") throw new Error("Expected a Schedule start frame");
+        writeFileSync("new-schedule-script-started", frame.context.runId);
+        const gate = setInterval(() => {
+          if (!existsSync("allow-new-schedule-script-to-finish")) return;
+          clearInterval(gate);
+          process.stdout.write(JSON.stringify({ protocol: "joko-schedule-script/1", type: "complete", resultText: "Independent script finished" }) + "\\n");
+          lines.close();
+        }, 20);
+      });
+    `);
+    const schedule = seedScriptSchedule(fixture, "script-lease-recovery", {
+      executionSnapshot: { ...CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, scheduler: {
+        format: 1, silentWhenIdle: false, notify: { desktop: true }, executionMode: "script",
+        scriptConfig: { command: `${JSON.stringify(process.execPath)} lease-recovery.mjs`, capabilities: [], timeoutMs: 15_000 }
+      } }
+    });
+    let now = 1_000;
+    const oldRunId = "run-old-script-lease";
+    const oldRuntime = new SchedulerRuntimeState({ instanceId: "scheduler-before-restart", now: () => now });
+    const oldRecovery = new SchedulerOccurrenceRecovery(fixture.store, oldRuntime, {
+      now: () => now, heartbeatIntervalMs: 20, heartbeatLeaseMs: 400
+    });
+    oldRecovery.begin({ scheduleId: schedule.id, runId: oldRunId, source: "run-now", executionMode: "script",
+      scheduledAt: now, phase: "running", abort: () => undefined });
+    fixture.store.recordScheduleOccurrence({ scheduleId: schedule.id, runId: oldRunId, firedAt: now, status: "running",
+      detail: { script: { status: "running" }, cadence: { preserveNextRun: true }, costAttribution: "zero" } });
+    const oldLease = fixture.store.getScheduleRuntimeOccurrence(oldRunId);
+
+    now = 1_100;
+    const coordinator = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => now, tickMs: 60_000,
+      heartbeatIntervalMs: 20, heartbeatLeaseMs: 2_000, schedulerInstanceId: "scheduler-after-restart" });
+    coordinator.start();
+    const pending = coordinator.runNowWithResult(schedule.id, "separate-manual-script");
+    try {
+      await vi.waitFor(() => expect(existsSync(startedPath)).toBe(true), { timeout: 10_000 });
+      const newRunId = await readFile(startedPath, "utf8");
+      expect(newRunId).not.toBe(oldRunId);
+      const newLease = fixture.store.getScheduleRuntimeOccurrence(newRunId);
+      expect(newLease).toMatchObject({ ownerId: "scheduler-after-restart", phase: "running" });
+      expect(fixture.store.findScheduleRunByRunId(oldRunId)?.status).toBe("running");
+
+      now = oldLease.leaseExpiresAt + 1;
+      await vi.waitFor(() => expect(fixture.store.findScheduleRunByRunId(oldRunId)).toMatchObject({ status: "interrupted",
+        detail: { script: { status: "interrupted" }, runtimeRecovery: { reason: "stale_owner" } } }), { timeout: 3_000 });
+      expect(fixture.store.findScheduleRuntimeOccurrence(oldRunId)).toBeUndefined();
+      expect(fixture.store.getScheduleRuntimeOccurrence(newRunId)).toMatchObject({ ownerId: newLease.ownerId,
+        ownerGeneration: newLease.ownerGeneration, phase: "running" });
+      expect(fixture.store.findScheduleRunByRunId(newRunId)?.status).toBe("running");
+
+      await writeFile(releasePath, "finish\n");
+      await expect(pending).resolves.toMatchObject({ runId: newRunId, status: "success" });
+      expect(fixture.store.findScheduleRunByRunId(newRunId)).toMatchObject({ status: "success",
+        detail: { script: { status: "completed", resultText: "Independent script finished" } } });
+      expect(fixture.store.listSessions()).toHaveLength(0);
+    } finally {
+      coordinator.stop();
+      await pending.catch(() => undefined);
+    }
   });
 
   it("marks an orphaned running script as interrupted on restart instead of replaying its side effects", async () => {
