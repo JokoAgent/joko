@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { modelTokenPricesAt } from "@joko/core";
 import { describe, expect, it } from "vitest";
 import {
   piModelOutputTokenLimit,
@@ -127,6 +128,32 @@ describe("managed Pi catalog", () => {
       currencyCode: "USD"
     });
     expect(result.models.find((model) => model.modelId === "unknown")?.pricing).toBeUndefined();
+  });
+
+  it("projects the mainland Token Plan reference price on an independent managed Pi account", async () => {
+    const home = await mkdtemp(join(tmpdir(), "joko-pi-regional-price-"));
+    const model = { id: "mimo-v2.6-pro" };
+    const endpoint = "https://token-plan-cn.xiaomimimo.com/v1";
+    const common = { baseUrl: endpoint, api: "openai-completions" as const, models: [model] };
+    const projected = await provisionManagedCatalog(home, [
+      { ...common, id: "independent-cn", apiKeyEnv: "INDEPENDENT_CN_KEY" },
+      { ...common, id: "alternate-path", baseUrl: `${endpoint}/alternate`, apiKeyEnv: "ALTERNATE_PATH_KEY" },
+      { ...common, id: "different-protocol", api: "openai-responses", apiKeyEnv: "DIFFERENT_PROTOCOL_KEY" },
+      { ...common, id: "owner-price", apiKeyEnv: "OWNER_PRICE_KEY", models: [{ ...model, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] }
+    ]);
+    const find = (providerId: string) => projected.models.find(item => item.providerId === providerId)!;
+    const priced = find("independent-cn");
+    expect(priced).toMatchObject({ providerId: "independent-cn", modelId: model.id, pricing: { source: "providerReference", currencyCode: "CNY" } });
+    const prices = modelTokenPricesAt(priced, { at: Date.UTC(2026, 10, 19), inputTokens: 1000, fastMode: false });
+    expect(prices).toMatchObject({ currencyCode: "CNY", cost: { input: 3, output: 6 } });
+    expect(((prices?.cost.input ?? 0) * 1000 + (prices?.cost.output ?? 0) * 1000) / 1_000_000).toBe(0.009);
+    expect(find("alternate-path").pricing).toBeUndefined();
+    expect(find("different-protocol").pricing).toBeUndefined();
+    expect(find("owner-price")).toMatchObject({ cost: { input: 0, output: 0 }, pricing: { source: "upstream", currencyCode: "USD" } });
+
+    const native = JSON.parse(await readFile(join(home, "models.json"), "utf8"));
+    expect(native.providers["independent-cn"]).toMatchObject({ baseUrl: endpoint, apiKey: "$INDEPENDENT_CN_KEY", models: [{ id: model.id }] });
+    expect(native.providers["independent-cn"].models[0]).not.toHaveProperty("cost");
   });
 
   it("uses Pi's null thinking-map sentinel and environment-only override headers", async () => {
