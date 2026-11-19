@@ -16,6 +16,7 @@ interface Cache { readonly accessToken: string; readonly expiresAt: number | nul
 interface Source { readonly extension: ExtensionCatalogDescriptor; readonly network: ExtensionNetworkDeclaration; readonly secret: ExtensionNetworkSecret;
   readonly declaration: ExtensionOAuthDeclaration; readonly scope: string; readonly ownerKey: string }
 interface ConnectOptions { readonly signal: AbortSignal; readonly assertCurrent: () => void; readonly scopes?: readonly string[];
+  readonly onCommitted?: () => void;
   readonly authorize: (offer: ExtensionOAuthOffer, signal: AbortSignal) => Promise<ExtensionOAuthCallback> }
 interface Options {
   readonly store: OperationalStore; readonly vault: CredentialVault; readonly credentials: CredentialManager; readonly catalog: ExtensionCatalogManager;
@@ -182,6 +183,7 @@ export class ExtensionOAuthAccounts {
           this.options.catalog.updateNetworkConfiguration(capture.extensionId, current.extension.revision, () => this.#state.put(source.scope, { ...saved,
             accounts: existing ? saved.accounts.map(value => value.id === row.id ? row : value) : [...saved.accounts, row], defaultId: saved.defaultId ?? row.id })); installed = true;
           this.#cache.set(this.#cacheKey(current, row), { accessToken: tokens.accessToken, expiresAt: tokens.expiresAt });
+          options.onCommitted?.();
           if (existing?.refreshReference && existing.refreshReference !== reference) await this.#retire(existing.refreshReference);
           return this.get(capture.extensionId);
         } finally { if (freshReference) { this.#staged.delete(freshReference); if (!installed) await this.#retire(freshReference); } }

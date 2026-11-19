@@ -36,14 +36,14 @@ async function fixture() {
     resourceDetails: [{ kind: "extension", name: "Account fixture", entryPath: "extensions/main.js", runtime, compatibility: "supported", compatibilityIssues: [], detectedApis: [] }] } as unknown as PiResourceDescriptor;
   const entry = catalog.reconcile([resource], []).entries[0]!, codes = new Map<string, string>(), refreshIdentities = new Map<string, string>(), accessIdentities = new Map<string, string>();
   const requests: Array<{ url: string; form: URLSearchParams; headers: Headers }> = [];
-  let provider: ((form: URLSearchParams) => Promise<Response>) | undefined, identityAvailable = true;
+  let provider: ((form: URLSearchParams) => Promise<Response>) | undefined, identityAvailable = true, identityDisplayName: string | undefined;
   const bundle = (identity: string, refresh = true) => {
     const access = `access-private-fixture-${randomUUID()}`, token = `refresh-private-fixture-${randomUUID()}`; accessIdentities.set(access, identity); refreshIdentities.set(token, identity);
     return { access_token: access, ...(refresh ? { refresh_token: token } : {}), expires_in: 3600 };
   };
   const fetchImpl = (async (input, init) => {
     const url = String(input), form = new URLSearchParams(typeof init?.body === "string" ? init.body : ""), headers = new Headers(init?.headers); requests.push({ url, form, headers });
-    if (url.endsWith("/me")) { if (!identityAvailable) return new Response(null, { status: 503 }); const identity = accessIdentities.get(headers.get("authorization")?.replace("Bearer ", "") ?? ""); return new Response(JSON.stringify({ email: identity, team: "Team", name: identity })); }
+    if (url.endsWith("/me")) { if (!identityAvailable) return new Response(null, { status: 503 }); const identity = accessIdentities.get(headers.get("authorization")?.replace("Bearer ", "") ?? ""); return new Response(JSON.stringify({ email: identity, team: "Team", name: identityDisplayName ?? identity })); }
     if (provider) return provider(form);
     const identity = form.get("grant_type") === "authorization_code" ? codes.get(form.get("code") ?? "") : refreshIdentities.get(form.get("refresh_token") ?? "");
     return new Response(JSON.stringify(bundle(identity ?? "unknown@example.test")));
@@ -62,6 +62,7 @@ async function fixture() {
   };
   return { root, vault, entry, codes, requests, sleep, bundle, accessIdentities, refreshIdentities, capture, authorize, connect, update,
     provider: (next: typeof provider) => { provider = next; }, identityAvailable: (value: boolean) => { identityAvailable = value; },
+    identityDisplayName: (name: string) => { identityDisplayName = name; },
     get manager() { return manager; }, get credentials() { return credentials; }, get catalog() { return catalog; }, get store() { return store; },
     declaration: () => runtime.network!.secrets![0]!.oauth!, saved: () => new ExtensionOAuthAccountState({ store, vault }).get(extensionOAuthScope(entry.id, "account")),
     restart: async () => { await manager.dispose(); store.close(); store = new OperationalStore(databasePath); credentials = new CredentialManager({ vault, storagePath: credentialPath }); await credentials.initialize();
@@ -205,6 +206,50 @@ it("discards a late token response after its original controller connection is r
   await f.client.completeCallback({ flowId: flow!.flowId, credentialUploadTicketId: ticket!.ticketId }); await ready;
   f.revoke(); release(); await f.settings.dispose();
   expect(f.manager.get(f.entry.id).slots[0]!.accounts).toEqual([]); expect(f.credentials.list()).toEqual([]);
+});
+
+it("reports a committed protected reconnect while the replaced refresh credential is still retiring", async () => {
+  const f = await settingsFixture(), id = f.entry.id, identity = "same-account@example.test";
+  const original = (await f.connect(identity)).slots[0]!.accounts[0]!;
+  const firstAccess = await f.manager.fresh(id, "account", f.declaration(), original.id);
+  const oldReference = f.saved().accounts[0]!.refreshReference!;
+  f.identityDisplayName("Reconnected account");
+  let releaseRetirement!: () => void;
+  const retirementGate = new Promise<void>(resolve => { releaseRetirement = resolve; });
+  const retire = f.credentials.retireManagedCredential.bind(f.credentials);
+  const gatedRetirement = vi.spyOn(f.credentials, "retireManagedCredential").mockImplementation(async (...args) => {
+    if (args[0] === oldReference) await retirementGate;
+    return retire(...args);
+  });
+  try {
+    const { flow } = await f.start(), flowId = flow!.flowId;
+    let offer: NonNullable<typeof flow>["authorization"];
+    await vi.waitFor(async () => {
+      const current = (await f.client.getFlow({ flowId })).flow!;
+      expect(current.phase).toBe(Phase.AUTHORIZING);
+      offer = current.authorization;
+    });
+    const waiter = vi.fn();
+    void f.settings.waitForFlow(flowId, "controller").then(waiter, waiter);
+    const callback = await f.authorize(identity)(offer!), { ticket } = await f.client.beginCallback({ flowId });
+    f.credentials.upload(ticket!.ticketId, JSON.stringify(callback), "controller");
+    await f.client.completeCallback({ flowId, credentialUploadTicketId: ticket!.ticketId });
+    await vi.waitFor(() => expect(gatedRetirement.mock.calls.some(args => args[0] === oldReference)).toBe(true));
+
+    const stillPending = f.credentials.find(oldReference);
+    expect(stillPending).toBeDefined();
+    expect(f.saved().accounts).toEqual([expect.objectContaining({ id: original.id, refreshReference: expect.any(String) })]);
+    expect(f.saved().accounts[0]!.refreshReference).not.toBe(oldReference);
+    const cancelled = (await f.client.cancelFlow({ flowId })).flow!;
+    expect(cancelled).toMatchObject({ phase: Phase.COMPLETE, failure: Failure.UNSPECIFIED });
+    await vi.waitFor(() => expect(waiter).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ phase: Phase.COMPLETE })));
+    const state = (await f.client.get({ extensionId: id })).state!;
+    expect(state.slots[0]!.accounts).toMatchObject([{ accountId: original.id, label: "Team · Reconnected account", isDefault: true, expired: false }]);
+    const adopted = await f.manager.fresh(id, "account", f.declaration(), original.id);
+    expect(adopted).toMatchObject({ ok: true, accountId: original.id });
+    expect(adopted).not.toEqual(firstAccess);
+  } finally { releaseRetirement(); }
+  await vi.waitFor(() => expect(f.credentials.find(oldReference)).toBeUndefined());
 });
 
 it("injects the selected account, refreshes it once on 401 and keeps token bytes out of the plugin result", async () => {
