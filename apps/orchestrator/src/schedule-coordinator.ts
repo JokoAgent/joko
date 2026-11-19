@@ -670,6 +670,20 @@ export class ScheduleCoordinator {
     }
     if (schedule.sessionMode !== "fresh" && schedule.sessionId !== undefined) {
       const session = this.#store.findSession(schedule.sessionId);
+      if (options.source === "automatic" && schedule.enabled && schedule.kind === "interval"
+        && schedule.sessionMode === "bound" && extension.executionMode === "script"
+        && session?.descriptor.deletedAt !== undefined && session.descriptor.worktree === undefined
+        && session.descriptor.automationOrigin === undefined
+        && session.descriptor.backendId === schedule.backendId && session.descriptor.targetId === schedule.targetId) {
+        this.recordPreSessionOutcome({
+          schedule, operationId, runId, scheduledAt,
+          ...(schedule.nextRunAt === undefined ? {} : { nextRunAt: schedule.nextRunAt }),
+          pauseSchedule: true,
+          status: "skipped",
+          detail: { reason: "The task bound to this Schedule was deleted.", costAttribution: "zero" }
+        });
+        return { runId, status: "skipped" };
+      }
       if (session && session.descriptor.deletedAt === undefined
         && (session.descriptor.archived || session.descriptor.worktree?.state === "preserved")) {
         await this.#host.restoreScheduledTarget({ sessionId: session.descriptor.id, operationId: `${operationId}-restore`, assertCurrent: () => {
@@ -888,6 +902,7 @@ export class ScheduleCoordinator {
     readonly scheduledAt: number;
     readonly nextRunAt?: number;
     readonly intervalFromFinish?: boolean;
+    readonly pauseSchedule?: boolean;
     readonly status: "skipped" | "failed" | "aborted" | "interrupted";
     readonly detail: unknown;
   }): void {
@@ -901,11 +916,12 @@ export class ScheduleCoordinator {
           scheduleRevision: input.schedule.revision.toString(10),
           runId: input.runId,
           scheduledAt: input.scheduledAt,
-          status: input.status
+          status: input.status,
+          ...(input.pauseSchedule === true ? { pauseSchedule: true } : {})
         }
       },
       (store) => {
-        advanceScheduleWithoutSession(store, input.schedule, input.scheduledAt, input.nextRunAt, finishedAt, input.intervalFromFinish);
+        advanceScheduleWithoutSession(store, input.schedule, input.scheduledAt, input.nextRunAt, finishedAt, input);
         store.recordScheduleOccurrence({
           scheduleId: input.schedule.id,
           runId: input.runId,
@@ -1094,7 +1110,7 @@ export class ScheduleCoordinator {
         }
       },
       (store) => {
-        advanceScheduleWithoutSession(store, input.schedule, input.scheduledAt, input.nextRunAt, finishedAt, input.intervalFromFinish);
+        advanceScheduleWithoutSession(store, input.schedule, input.scheduledAt, input.nextRunAt, finishedAt, input);
         store.recordScheduleOccurrence({
           scheduleId: input.schedule.id,
           runId: input.runId,
@@ -1491,7 +1507,7 @@ function advanceScheduleWithoutSession(
   firedAt: number,
   nextRunAt: number | undefined,
   now: number,
-  intervalFromFinish = false
+  { intervalFromFinish = false, pauseSchedule = false }: { readonly intervalFromFinish?: boolean; readonly pauseSchedule?: boolean }
 ): void {
   if (store.findPendingScheduleDeletionCleanupForSchedule(schedule.id) !== undefined) return;
   const current = store.findSchedule(schedule.id);
@@ -1508,7 +1524,7 @@ function advanceScheduleWithoutSession(
     nextRunAt = nextScheduleOccurrenceOrUndefined({ ...current, anchorAt: now }, now);
   } else if (current.revision !== schedule.revision) return;
   store.upsertSchedule(copyScheduleForCoordinator(current, {
-    enabled: current.kind !== "one_shot" && current.enabled,
+    enabled: !pauseSchedule && current.kind !== "one_shot" && current.enabled,
     ...(nextRunAt === undefined ? {} : { nextRunAt }),
     lastRunAt: intervalFromFinish ? Math.max(current.lastRunAt ?? firedAt, firedAt) : firedAt,
     expectedRevision: current.revision,

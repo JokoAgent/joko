@@ -11420,6 +11420,57 @@ describe("SessionHost", () => {
     expect(f.store.getSession(next.sessionId!).descriptor).toMatchObject({ targetId: "target-two", title: "Edited", providerId: "vision", modelId: "multimodal", permissionMode: "auto", planMode: true });
   });
 
+  it("pauses a due interval script bound to a deleted ordinary task after restart", async () => {
+    const fixture = await createFixture();
+    const targetId = "script-user-project";
+    await fixture.host.registerTarget({ id: targetId, backendId: fixture.adapter.id, displayName: "Script project",
+      workspaceRoot: fixture.directory, managed: false, trusted: true });
+    const sessionId = (await fixture.host.createSession({ operationId: "create-deleted-script-task",
+      connection: fixture.connection, targetId, title: "Original task", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const dueAt = Date.now() + 120_000;
+    const schedule = seedScriptSchedule(fixture, "script-deleted-task", { targetId, sessionMode: "bound", sessionId,
+      kind: "interval", expression: "60000", anchorAt: dueAt, nextRunAt: dueAt });
+    const deletionId = "delete-bound-script-task";
+    fixture.store.prepareSessionLifecycleCleanup({ operationId: deletionId, sessionId, disposition: "delete" });
+    await fixture.host.prepareSessionLifecycleClose(sessionId, "delete");
+    await fixture.host.closeIfActive(sessionId);
+    fixture.store.advanceSessionLifecycleCleanup({ operationId: deletionId, phase: "close" });
+    fixture.store.finalizeSessionLifecycleCleanup({ operationId: deletionId });
+    const deletedAt = fixture.store.getSession(sessionId).descriptor.deletedAt;
+    expect(deletedAt).toBeDefined();
+    await fixture.host.dispose();
+    fixture.store.close();
+
+    const store = new OperationalStore(join(fixture.directory, "store.db"));
+    const artifacts = new ArtifactStore({ rootDirectory: join(fixture.directory, "artifacts"),
+      repository: new OperationalArtifactRepository(store), ingestRoots: [fixture.directory] });
+    const host = new SessionHost(store, artifacts, [new FakeBackendAdapter(PI_LIKE_PROFILE)]);
+    let now = dueAt - 1;
+    const executeScript = vi.fn(async () => ({ durationMs: 1, stderr: "", stderrTruncated: false }));
+    const coordinator = new ScheduleCoordinator(store, host, { now: () => now, tickMs: 60_000, executeScript });
+    try {
+      await artifacts.initialize();
+      await host.initialize();
+      coordinator.start();
+      await coordinator.tick();
+      expect(store.getSchedule(schedule.id)).toMatchObject({ enabled: true, sessionId, nextRunAt: dueAt });
+      expect(store.listScheduleRuns(schedule.id)).toEqual([]);
+      now = dueAt;
+      await coordinator.tick();
+      expect(store.getSchedule(schedule.id)).toMatchObject({ enabled: false, sessionId, nextRunAt: dueAt, lastRunAt: dueAt });
+      now += 120_000;
+      await coordinator.tick();
+      expect(executeScript).not.toHaveBeenCalled();
+      expect(store.getSession(sessionId).descriptor.deletedAt).toBe(deletedAt);
+      expect(store.listScheduleRuns(schedule.id)).toMatchObject([{ status: "skipped", firedAt: dueAt,
+        detail: { reason: "The task bound to this Schedule was deleted.", costAttribution: "zero" } }]);
+    } finally {
+      coordinator.stop();
+      await host.dispose();
+      store.close();
+    }
+  });
+
   it("dispatches bound scripts only to their existing task and keeps that task's own configuration", async () => {
     const f = await createFixture();
     const makeTask = (operationId: string) => f.host.createSession({ operationId, connection: f.connection, targetId: "target-one", title: "Existing task",
