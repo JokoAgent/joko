@@ -12,8 +12,10 @@ import type { MobileConnectionProfile } from "./connection-storage";
 import { projectPartnerDeletion, type PartnerDeletionView, type PartnerDeletionResult } from "@joko/contracts";
 import { projectPartnerRestart, type PartnerRestartView, type PartnerRestartResult } from "@joko/contracts";
 import { partnerSessionTaskAction, projectPartnerSessionTask, type PartnerSessionTaskView } from "@joko/contracts";
-import { base64Decode, base64Encode } from "@bufbuild/protobuf/wire";
+import { base64Decode, base64Encode, sizeDelimitedEncode } from "@bufbuild/protobuf/wire";
 import { create } from "@bufbuild/protobuf";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import { OperationMutationSchema } from "@joko/contracts";
 import { DevicePeerService, RemoteHostService, type RemoteHost } from "@joko/contracts";
 import { RemoteDesktopSystemActionKind, type RemoteDesktopSystemAction } from "@joko/contracts";
@@ -43,7 +45,7 @@ import { createPartnerConnectionsApi, type PartnerConnectionsApi } from "@joko/c
 import { createPartnerSkillsApi, type PartnerSkillsApi } from "@joko/contracts";
 import { createMobileInputHandoffApi, readMobileInputHandoffTasks, type MobileInputHandoffApi, type MobileInputHandoffScope, type MobileInputHandoffTask } from "./mobile-input-handoff";
 import {
-  ArtifactKind, ArtifactService, BackendService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, ImageThumbnailUnavailableReason,
+  ArtifactKind, ArtifactSchema, ArtifactService, BackendService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, ImageThumbnailUnavailableReason,
   MobilePushEnvironment as WireMobilePushEnvironment, MobilePushLocale as WireMobilePushLocale,
   MobilePushProvider, OperationService, OperationState, PartnerService, PartnerLifecycle, PermissionMode, RemoteDesktopService, ExtensionService,
   ExtensionLibraryLocationKind,
@@ -944,13 +946,17 @@ export async function collectArtifactPages(
 ): Promise<ArtifactCatalogSnapshot> {
   const pages = await collectStablePages(readPage, "Artifact catalog", (page) => page.artifacts);
   const ids = new Set<string>();
+  // The server revision fences pages within this read. Between reads, Files
+  // owns the ordered projection of this task's Artifacts.
+  const revision = sha256.create().update(new TextEncoder().encode(sessionId + "\u0000"));
   for (const artifact of pages.values) {
     if (!artifact.artifactId || artifact.sessionId !== sessionId || ids.has(artifact.artifactId)) {
       throw new Error("The Joko node returned an invalid Artifact catalog.");
     }
     ids.add(artifact.artifactId);
+    revision.update(sizeDelimitedEncode(ArtifactSchema, artifact, { writeUnknownFields: false }));
   }
-  return { artifacts: pages.values, revision: pages.revision };
+  return { artifacts: pages.values, revision: "sha256:" + bytesToHex(revision.digest()) };
 }
 
 export function assertSessionResourceCatalog(

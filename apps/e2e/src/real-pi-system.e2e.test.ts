@@ -67,6 +67,7 @@ import {
   pauseQueueMutation,
   queueItemFrom,
   queueRunIdFrom,
+  renameMutation,
   resolvePermissionMutation,
   restartBackendMutation,
   resumeQueueMutation,
@@ -473,6 +474,23 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     };
     const first = await turn("bash-output-A");
     await download(first.artifact);
+    const other = sessionIdFrom(await submit(clients.operation, paired.connectionId,
+      createSessionMutation({ backendId: "pi", targetId: target.descriptor.id, displayName: "Separate task",
+        providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, effortId: "off" })));
+    const phone = await fixture.pair("Mobile Generated catalog reader");
+    const { mobileNetwork } = await import(new URL("../../mobile/src/network.ts", import.meta.url).href);
+    const node = (await fixture.anonymous.connection.getServerInfo({})).server;
+    if (!node) throw new Error("The Generated catalog has no node identity.");
+    const credential = { profileId: "generated-catalog-mobile", displayName: "Mobile Generated catalog reader",
+      origin: fixture.baseUrl, serverId: node.serverId,
+      authKey: phone.authKey, connectionId: phone.connectionId, deviceId: phone.deviceId };
+    const readGenerated = () => mobileNetwork.listSessionArtifacts(credential, sessionId);
+    const originalCatalog = await readGenerated();
+    expect(originalCatalog.artifacts.map((artifact: { artifactId: string }) => artifact.artifactId)).toEqual([first.artifact.id]);
+    const beforeRename = (await clients.artifact.listArtifacts({ sessionId })).revision!.value;
+    expect((await submit(clients.operation, paired.connectionId, renameMutation(other, "Renamed from the other client"))).state).toBe(OperationState.SUCCEEDED);
+    expect((await clients.artifact.listArtifacts({ sessionId })).revision!.value).toBeGreaterThan(beforeRename);
+    expect(await readGenerated()).toEqual(originalCatalog);
     await expect(submit(clients.operation, paired.connectionId, create(OperationMutationSchema, {
       payload: { case: "deleteArtifact", value: { artifactId: "no-such-output" } }
     }))).rejects.toMatchObject({ code: Code.NotFound });
@@ -486,6 +504,9 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     expect(fixture.application.store.findArtifact(first.artifact.id)).toBeUndefined();
     expect(fixture.application.store.findArtifact(first.artifact.id, true)?.blob).toEqual(first.artifact);
     await expect(clients.artifact.getBlobDownloadTicket({ blobId: first.artifact.id })).rejects.toMatchObject({ code: Code.NotFound });
+    const emptyCatalog = await readGenerated();
+    expect(emptyCatalog.artifacts).toEqual([]);
+    expect(emptyCatalog.revision).not.toBe(originalCatalog.revision);
     const second = await turn("bash-output-B");
     expect(second.artifact.id).not.toBe(first.artifact.id);
     await download(second.artifact);

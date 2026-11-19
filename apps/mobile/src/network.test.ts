@@ -1972,9 +1972,19 @@ describe("mobile Workspace and Artifact paging", () => {
     const artifact = create(ArtifactSchema, {
       artifactId: "artifact-1", sessionId: "session", kind: ArtifactKind.FILE, title: "Export"
     });
-    await expect(collectArtifactPages("session", async () => ({
-      artifacts: [artifact], nextPageToken: "", totalSize: 1n, revision: "artifacts-1"
-    }))).resolves.toEqual({ artifacts: [artifact], revision: "artifacts-1" });
+    const page = { artifacts: [artifact], nextPageToken: "", totalSize: 1n, revision: "artifacts-1" };
+    const original = await collectArtifactPages("session", async () => page);
+    expect(original).toEqual({ artifacts: [artifact], revision: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u) });
+    await expect(collectArtifactPages("session", async () => ({ ...page, revision: "artifacts-2" }))).resolves.toEqual(original);
+    const changed = await collectArtifactPages("session", async () => ({
+      ...page, artifacts: [create(ArtifactSchema, { ...artifact, title: "Updated export" })]
+    }));
+    expect(changed.revision).not.toBe(original.revision);
+    await expect(collectArtifactPages("session", async token => token === "" ? {
+      ...page, nextPageToken: "second", totalSize: 2n
+    } : {
+      ...page, artifacts: [create(ArtifactSchema, { ...artifact, artifactId: "artifact-2" })], revision: "drift", totalSize: 2n
+    })).rejects.toThrow(/changed while paging/u);
     await expect(collectArtifactPages("other", async () => ({
       artifacts: [artifact], nextPageToken: "", totalSize: 1n, revision: "artifacts-1"
     }))).rejects.toThrow(/invalid Artifact catalog/);
