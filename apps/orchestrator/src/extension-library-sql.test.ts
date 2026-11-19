@@ -151,6 +151,27 @@ describe("ExtensionLibrarySqlService", () => {
     await service.closeAll();
   });
 
+  it("rejects an older migration target while retaining the current version and existing data", async () => {
+    const { service } = await fixture();
+    const opened = await service.open({ path: "notes.sqlite", create: true });
+    const versionOne = { version: 1, statements: ["CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT NOT NULL)"] };
+    const versionTwo = { version: 2, statements: ["ALTER TABLE notes ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"] };
+    const migrations = [versionOne, versionTwo];
+    await expect(service.migrate(opened.handleId, migrations)).resolves.toBe(2);
+    await service.execute(opened.handleId, "INSERT INTO notes(id, body, archived) VALUES (?, ?, ?)", [7, "kept", 1]);
+    await service.close(opened.handleId);
+
+    const reopened = await service.open({ path: "notes.sqlite" });
+    await expect(service.migrate(reopened.handleId, [versionOne])).rejects.toMatchObject({
+      code: "CONFLICT", message: "Library database is newer than the requested migration target."
+    });
+    await expect(service.migrate(reopened.handleId, migrations)).resolves.toBe(2);
+    await expect(service.userVersion(reopened.handleId)).resolves.toBe(2);
+    await expect(service.execute(reopened.handleId, "SELECT id, body, archived FROM notes")).resolves.toMatchObject({
+      rows: [{ id: 7n, body: "kept", archived: 1n }]
+    });
+  });
+
   it.runIf(process.platform === "win32")("keeps database and backup operations working beyond the legacy Windows path boundary", async () => {
     const { root, service } = await fixture(undefined, undefined, ["a".repeat(90), "b".repeat(90)]);
     expect(join(root, ".joko-library", "tmp", `${"c".repeat(36)}.sqlite-backup`).length).toBeGreaterThan(260);

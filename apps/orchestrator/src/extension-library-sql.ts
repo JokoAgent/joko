@@ -660,6 +660,9 @@ export class ExtensionLibrarySqlCore {
       }
       previousVersion = migration.version;
     }
+    if (previousVersion !== undefined && current > previousVersion) {
+      throw new ExtensionLibraryError("CONFLICT", "Library database is newer than the requested migration target.");
+    }
     const pending = migrations.filter((migration) => migration.version > current);
     let expected = current + 1;
     for (const migration of pending) {
