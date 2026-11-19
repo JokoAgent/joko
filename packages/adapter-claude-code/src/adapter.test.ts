@@ -276,6 +276,46 @@ describe("ClaudeCodeAdapter", () => {
     } finally { await adapter.dispose(); }
   });
 
+  test.each(["completed", "aborted", "completed-after-stop"] as const)("accepts a manual compact before turn init and settles its native outcome: %s", async (outcome) => {
+    const runtime = new FakeSdkRuntime({ autoAdmitTurns: false });
+    const adapter = adapterFor(runtime, { admissionTimeoutMs: 1_000 });
+    try {
+      const binding = await adapter.createSession(createInput(), contextFor().context);
+      const nativeId = binding.nativeSessionId!;
+      const query = runtime.queries[0]!;
+      const previous = contextFor(binding, { operationId: "prior-initialized-input" });
+      const initial = adapter.send(textPrompt("Build a little history first"), previous.context);
+      await eventually(() => query.receivedInputs.length === 1);
+      query.push(systemInit(nativeId));
+      await initial;
+      query.push(resultMessage(nativeId, { result: "Original answer", totalCostUsd: 0 }));
+      await eventually(() => previous.events.some((event) => event.type === "done"));
+
+      const compact = contextFor(binding, { operationId: "native-manual-compact" });
+      const accepted = adapter.send(textPrompt("/compact"), compact.context);
+      await eventually(() => query.receivedInputs.length === 2);
+      query.push({ type: "system", subtype: "status", status: "compacting", uuid: randomUUID(), session_id: nativeId });
+      // Keep the per-turn init unsent until the already-running native work is acknowledged.
+      await expect(accepted).resolves.toBeUndefined();
+      await eventually(() => compact.events.some((event) => event.type === "compaction" && event.state === "started"));
+      expect(query.receivedInputs[1]!.message.content).toBe("/compact");
+      if (outcome !== "completed") await adapter.abort(compact.context);
+      query.push(systemInit(nativeId));
+      if (outcome !== "aborted") {
+        query.push({ type: "system", subtype: "compact_boundary", session_id: nativeId, uuid: randomUUID(),
+          compact_metadata: { trigger: "manual", pre_tokens: 12_000, post_tokens: 2_000 } });
+      }
+      query.push(resultMessage(nativeId, { result: outcome === "aborted" ? "Compaction canceled." : "Compacted", totalCostUsd: 0 }));
+      await eventually(() => compact.events.some((event) => event.type === "done"));
+      expect(compact.events).toContainEqual({ type: "done", outcome: outcome === "aborted" ? "aborted" : "completed" });
+      const compactions = compact.events.filter((event) => event.type === "compaction");
+      expect(compactions.at(-1)).toMatchObject({ reason: "manual", state: outcome === "aborted" ? "aborted" : "completed" });
+      expect((await adapter.inspectSession(binding, compact.context)).compacting).toBe(false);
+      expect(query.closeCalls).toBe(0);
+      expect(query.interruptCalls).toBe(outcome === "completed" ? 0 : 1);
+    } finally { await adapter.dispose(); }
+  });
+
   test("retains native system failure and exhausted retry facts without exposing native error text", async () => {
     const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
     const adapter = adapterFor(runtime);

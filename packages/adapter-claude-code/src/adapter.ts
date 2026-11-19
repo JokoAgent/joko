@@ -434,6 +434,10 @@ interface ActiveTurn {
   readonly backendInstanceGeneration: number;
   readonly queryGeneration: number;
   readonly operationId: string;
+  readonly manualCompaction: boolean;
+  manualCompactionStarted?: true;
+  manualCompactionBoundary?: true;
+  manualCompactionCancellation?: true;
   mcpCallCancellation: AbortController;
   readonly mcpRootToolWaiters: Map<string, Deferred<void>>;
   readonly nativeMcpToolCalls: Map<string, { readonly name: string; readonly input: Readonly<Record<string, unknown>>;
@@ -2010,6 +2014,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       backendInstanceGeneration: this.#instanceGeneration,
       queryGeneration: runtime.queryGeneration,
       operationId,
+      manualCompaction: !runtime.remote && runtime.runtimePolicy === "standard" && typeof prepared.content === "string"
+        && /^\/compact(?:\s|$)/u.test(prepared.content),
       mcpCallCancellation: new AbortController(),
       mcpRootToolWaiters: new Map(),
       nativeMcpToolCalls: new Map(),
@@ -4494,11 +4500,21 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     turn: ActiveTurn | undefined,
     envelope: Readonly<Record<string, unknown>>
   ): Promise<void> {
+    const subtype = envelope["subtype"];
+    const manualStatusBeforeInit = turn?.manualCompaction === true && turn.inputConsumed && !turn.nativeIdentityConfirmed
+      && subtype === "status" && ((!turn.stopping && envelope["status"] === "compacting")
+        || (turn.manualCompactionStarted && envelope["status"] === null));
     if (!runtime.systemInitializationConfirmed || envelope["session_id"] !== runtime.nativeSessionId
-      || (turn !== undefined && (!turn.nativeIdentityConfirmed || turn.terminalClaimed || !this.#isTurnCurrent(runtime, turn)))) return;
+      || (turn !== undefined && ((!turn.nativeIdentityConfirmed && !manualStatusBeforeInit) || turn.terminalClaimed || !this.#isTurnCurrent(runtime, turn)))) return;
     const uuid = stringValue(envelope["uuid"]);
     if (uuid === undefined || !uuidPattern().test(uuid) || runtime.systemFrameUuids.has(uuid)) return;
-    const subtype = envelope["subtype"];
+    if (manualStatusBeforeInit && turn !== undefined && !turn.manualCompactionStarted) {
+      // The locked native command can start compaction before this input's init.
+      // Acknowledge that exact consumed input without relaxing subsequent frame identity checks.
+      turn.admission.resolve(undefined);
+      await turn.eventsReady.promise;
+      if (turn.terminalClaimed || !this.#isTurnCurrent(runtime, turn)) return;
+    }
     if (subtype === "api_retry") {
       if (turn === undefined) return;
       const attempt = nativeSystemInteger(envelope["attempt"], 0xffff_ffff);
@@ -4518,6 +4534,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       if (status !== "compacting" && status !== "requesting" && status !== null) return;
       addBoundedIdentity(runtime.systemFrameUuids, uuid);
       if (status === "compacting") {
+        if (turn?.manualCompaction) turn.manualCompactionStarted = true;
         if (runtime.nativeCompaction === undefined || runtime.nativeCompaction.completed) {
           runtime.nativeCompaction = { id: `claude-code.compaction:${uuid}`, completed: false, boundaryObserved: false };
           runtime.compactionContextTokens = undefined;
@@ -4551,6 +4568,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if ((trigger !== "auto" && trigger !== "manual") || tokensBefore === undefined
       || (metadata?.["post_tokens"] !== undefined && tokensAfter === undefined)) return;
     addBoundedIdentity(runtime.systemFrameUuids, uuid);
+    if (turn?.manualCompaction && trigger === "manual") turn.manualCompactionBoundary = true;
     if (runtime.nativeCompaction === undefined || runtime.nativeCompaction.boundaryObserved) {
       runtime.nativeCompaction = { id: `claude-code.compaction:${uuid}`, completed: false, boundaryObserved: false };
     }
@@ -4705,6 +4723,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       turn.nativeMcpToolCalls.get(nativeCallId)?.retainCompleteText === true
         ? Math.min(turn.context.artifactCapacityBytes, MAX_MCP_COMPLETE_TEXT_BYTES) : undefined);
     const nativeContent = record(envelope["message"])?.["content"];
+    const localOutput = Array.isArray(nativeContent) && nativeContent.length === 1 ? record(nativeContent[0]) : undefined;
+    const localText = typeof nativeContent === "string" ? nativeContent : localOutput?.["type"] === "text" ? localOutput["text"] : undefined;
+    if (turn.manualCompaction && localText === "<local-command-stdout>Compaction canceled.</local-command-stdout>") {
+      turn.manualCompactionCancellation = true;
+    }
     if (Array.isArray(nativeContent)) for (const raw of nativeContent) {
       const block = record(raw), id = stringValue(block?.["tool_use_id"]);
       if (block?.["type"] === "tool_result" && id) turn.nativeMcpToolCalls.delete(id);
@@ -4838,7 +4861,18 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
     await this.#projectPermissionDenials(runtime, turn, envelope["permission_denials"]);
     if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
-    const result = this.#projection.result(envelope, runtime.nativeUsage.observeResult(envelope), turn.assistantError);
+    const projected = this.#projection.result(envelope, runtime.nativeUsage.observeResult(envelope), turn.assistantError);
+    const nativeOutput = stringValue(envelope["result"])?.trim();
+    const stoppedManualCompaction = turn.manualCompaction && !turn.manualCompactionBoundary && turn.interruptConfirmation !== undefined
+      && (turn.manualCompactionCancellation || nativeOutput === "Compaction canceled."
+        || nativeOutput === "<local-command-stdout>Compaction canceled.</local-command-stdout>");
+    const result = stoppedManualCompaction && projected.outcome === "completed" ? { ...projected, outcome: "aborted" as const } : projected;
+    if (stoppedManualCompaction && runtime.compacting && runtime.nativeCompaction !== undefined) {
+      runtime.compacting = false;
+      runtime.nativeCompaction.completed = true;
+      await this.#emitNativeSystem(runtime, turn, { type: "compaction", compactionId: runtime.nativeCompaction.id,
+        state: "aborted", reason: "manual" });
+    }
     await this.#settleNativeRetry(runtime, turn,
       result.outcome === "completed" ? "succeeded" : result.outcome === "aborted" ? "aborted" : "exhausted");
     await this.#emit(runtime, turn, { type: "status", key: "claude-code.lifecycle" });
