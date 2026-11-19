@@ -43,6 +43,7 @@ import {
 
 const DEFAULT_MAXIMUM_SCREENSHOT_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAXIMUM_PDF_BYTES = 32 * 1024 * 1024;
+const DEFAULT_MAXIMUM_DOWNLOAD_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MAXIMUM_CONSOLE_MESSAGES = 200;
 const DEFAULT_MAXIMUM_HTTP_REQUEST_SUMMARIES = 200;
 const ABSOLUTE_MAXIMUM_CAPTURE_BYTES = 64 * 1024 * 1024;
@@ -479,6 +480,7 @@ export class BrowserProvider {
     readonly pageId: string;
   }>();
   readonly #profileDirectories: BrowserTargetProfileDirectories;
+  readonly #maximumDownloadBytes: number;
   readonly #maximumScreenshotBytes: number;
   readonly #maximumPdfBytes: number;
   readonly #maximumConsoleMessages: number;
@@ -517,6 +519,9 @@ export class BrowserProvider {
     const launchTargets = resolveBrowserLaunchTargets(options);
     this.#profileDirectories = launchTargets.profileDirectories;
     this.#targetMode = launchTargets.targetMode;
+    this.#maximumDownloadBytes = validateBoundedPositiveInteger(
+      options.maximumDownloadBytes ?? DEFAULT_MAXIMUM_DOWNLOAD_BYTES, "maximumDownloadBytes", Number.MAX_SAFE_INTEGER
+    );
     this.#maximumScreenshotBytes = validateBoundedPositiveInteger(
       options.maximumScreenshotBytes ?? DEFAULT_MAXIMUM_SCREENSHOT_BYTES,
       "maximumScreenshotBytes",
@@ -770,6 +775,9 @@ export class BrowserProvider {
       this.assertStartAuthority(options);
       if (lifecycleEpoch !== this.#lifecycleEpoch) throw new BrowserLeaseConflictError("Browser start was superseded by recovery.");
       await gate?.start();
+      if (this.#options.launchPersistentContext === undefined) {
+        await enforceBrowserDownloadLimit(context, this.#options.downloadDirectory, this.#maximumDownloadBytes);
+      }
       this.assertStartAuthority(options);
       if (lifecycleEpoch !== this.#lifecycleEpoch || (gate !== undefined && !gate.active)) throw new BrowserLeaseConflictError("Browser start was superseded or its request gate failed.");
       this.#generation += 1;
@@ -2261,28 +2269,32 @@ export class BrowserProvider {
   }
 
   private async handleDownload(pageId: string, generation: number, download: Download): Promise<void> {
-    if (generation !== this.#generation || this.#context === undefined) {
-      await download.cancel().catch(() => undefined);
-      return;
-    }
-    if (this.#options.canDownload?.() === false) {
-      await download.cancel().catch(() => undefined);
-      await this.emit({ at: Date.now(), type: "download", pageId, detail: "A browser download was blocked by host policy." });
-      return;
-    }
-    let staged: StagedBrowserDownload | undefined;
     const handler = this.#downloadHandler;
+    let staged: Awaited<ReturnType<typeof stageBrowserDownload>> | undefined;
     try {
-      staged = await stageBrowserDownload(download, this.#options.downloadDirectory, this.#options.maximumDownloadBytes);
+      if (generation !== this.#generation || this.#context === undefined) {
+        await download.cancel().catch(() => undefined);
+        return;
+      }
+      if (this.#options.canDownload?.() === false) {
+        await download.cancel().catch(() => undefined);
+        await this.emit({ at: Date.now(), type: "download", pageId, detail: "A browser download was blocked by host policy." });
+        return;
+      }
+      staged = await stageBrowserDownload(download, this.#options.downloadDirectory, this.#maximumDownloadBytes);
       if (generation !== this.#generation || this.#context === undefined) return;
       await handler?.(pageId, staged.verifiedLocalPath, staged.fileName);
       await this.emit({ at: Date.now(), type: "download", pageId, detail: "Browser download completed." });
     } catch {
-      await this.emit({ at: Date.now(), type: "download", pageId, detail: "A browser download failed validation or ingest." });
+      if (generation !== this.#generation || this.#context === undefined) return;
+      const failure = await download.failure().catch(() => undefined);
+      if (generation !== this.#generation || this.#context === undefined) return;
+      await this.emit({ at: Date.now(), type: "download", pageId, detail: failure === "canceled"
+        ? "A browser download was cancelled before ingest."
+        : "A browser download failed validation or ingest." });
     } finally {
-      if (staged !== undefined) {
-        await rm(staged.verifiedLocalPath, { force: true }).catch(() => undefined);
-      }
+      if (staged !== undefined) await rm(staged.verifiedLocalPath, { force: true }).catch(() => undefined);
+      await download.delete().catch(() => undefined);
     }
   }
 
@@ -4023,44 +4035,58 @@ export function sanitizeBrowserUrlForDisplay(value: string): string {
   return truncatePublicText(url.href, MAXIMUM_PUBLIC_URL_LENGTH);
 }
 
-export interface StagedBrowserDownload {
-  readonly verifiedLocalPath: string;
-  readonly fileName: string;
-  readonly byteLength: number;
+async function enforceBrowserDownloadLimit(context: BrowserContext, downloadDirectory: string, maximumBytes: number): Promise<void> {
+  const browser = context.browser();
+  if (browser === null) throw new Error("The Browser runtime cannot enforce download limits.");
+  const session = await browser.newBrowserCDPSession();
+  const cancelling = new Set<string>();
+  session.on("Browser.downloadProgress", ({ guid, state, totalBytes, receivedBytes }) => {
+    if (state !== "inProgress") {
+      cancelling.delete(guid);
+      return;
+    }
+    if (Math.max(totalBytes, receivedBytes) <= maximumBytes || cancelling.has(guid)) return;
+    cancelling.add(guid);
+    void session.send("Browser.cancelDownload", { guid }).catch(() => cancelling.delete(guid));
+  });
+  // Keep Playwright's GUID naming and observe progress for the same persistent context.
+  await session.send("Browser.setDownloadBehavior", { behavior: "allowAndName", downloadPath: downloadDirectory, eventsEnabled: true });
 }
 
-interface BrowserDownloadSource {
-  suggestedFilename(): string;
-  saveAs(path: string): Promise<void>;
-}
-
-/** Stages and validates a browser download without publishing its local path. */
+/** Checks Chromium's original before making the copy owned by the artifact ingest. */
 export async function stageBrowserDownload(
-  download: BrowserDownloadSource,
+  download: Pick<Download, "suggestedFilename" | "path" | "saveAs">,
   downloadDirectory: string,
-  maximumBytes = 256 * 1024 * 1024
-): Promise<StagedBrowserDownload> {
-  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1) throw new RangeError("maximumBytes must be a positive safe integer.");
-  await mkdir(downloadDirectory, { recursive: true });
+  maximumBytes: number
+): Promise<{ readonly verifiedLocalPath: string; readonly fileName: string }> {
+  const original = await download.path();
   const canonicalRoot = await realpath(downloadDirectory);
+  await validateBrowserDownloadFile(original, canonicalRoot, maximumBytes);
   const fileName = sanitizeBrowserFileName(download.suggestedFilename());
   const extension = extname(fileName).slice(0, 32);
-  const destination = resolve(canonicalRoot, `${randomUUID()}${extension}`);
-  if (!isWithin(destination, canonicalRoot)) throw new Error("Browser download staging path escaped its root.");
+  const destination = join(canonicalRoot, `${randomUUID()}${extension}`);
   try {
     await download.saveAs(destination);
-    const directInfo = await lstat(destination);
-    if (!directInfo.isFile() || directInfo.isSymbolicLink()) throw new Error("Browser download staging entry is not a regular file.");
-    if (directInfo.size > maximumBytes) throw new Error("Browser download exceeds the configured size limit.");
-    const canonical = await realpath(destination);
-    if (!isWithin(canonical, canonicalRoot)) throw new Error("Browser download staging path escaped its root.");
-    const canonicalInfo = await stat(canonical);
-    if (!canonicalInfo.isFile() || canonicalInfo.size !== directInfo.size) throw new Error("Browser download changed during validation.");
-    return { verifiedLocalPath: canonical, fileName, byteLength: canonicalInfo.size };
+    const verifiedLocalPath = await validateBrowserDownloadFile(destination, canonicalRoot, maximumBytes);
+    return { verifiedLocalPath, fileName };
   } catch (error) {
     await rm(destination, { force: true }).catch(() => undefined);
     throw error;
   }
+}
+
+async function validateBrowserDownloadFile(path: string, canonicalRoot: string, maximumBytes: number): Promise<string> {
+  const directInfo = await lstat(path, { bigint: true });
+  if (!directInfo.isFile()) throw new Error("Browser download staging entry is not a regular file.");
+  if (directInfo.size > BigInt(maximumBytes)) throw new Error("Browser download exceeds the configured size limit.");
+  const canonical = await realpath(path);
+  if (!isWithin(canonical, canonicalRoot)) throw new Error("Browser download staging path escaped its root.");
+  const canonicalInfo = await stat(canonical, { bigint: true });
+  if (!canonicalInfo.isFile() || canonicalInfo.size !== directInfo.size
+    || canonicalInfo.dev !== directInfo.dev || canonicalInfo.ino !== directInfo.ino) {
+    throw new Error("Browser download changed during validation.");
+  }
+  return canonical;
 }
 
 export function sanitizeBrowserFileName(value: string): string {
