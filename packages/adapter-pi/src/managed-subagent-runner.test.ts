@@ -102,7 +102,7 @@ describe("managed detached subagent runner", () => {
   });
 
   it("continues after its launcher exits, redacts inherited credentials, and publishes a stable native session", { timeout: 20_000 }, async () => {
-    const fixture = await createRunnerFixture({ settleDelayMs: 900 });
+    const fixture = await createRunnerFixture({ settleDelayMs: 900, transcriptEvidence: true });
     const launcherResult = await execFileAsync(process.execPath, [fixture.launcherPath], {
       windowsHide: true,
       timeout: 5_000,
@@ -130,14 +130,29 @@ describe("managed detached subagent runner", () => {
     expect(claimedConfig).not.toHaveProperty("initialMessage");
     expect(claimedConfig).not.toHaveProperty("profile");
     expect(claimedConfig).not.toHaveProperty("child");
+    const transcript = await readFile(join(fixture.runDirectory, "transcript.jsonl"), "utf8");
     const persisted = [
       claimedConfigText,
       await readFile(fixture.statusPath, "utf8"),
       await readFile(join(fixture.runDirectory, "result.json"), "utf8"),
-      await readFile(join(fixture.runDirectory, "transcript.jsonl"), "utf8")
+      transcript
     ].join("\n");
     expect(persisted).not.toContain(fixture.secret);
     expect(persisted).toContain("[REDACTED]");
+    expect(transcript).not.toContain("hidden-argument-value");
+    expect(transcript).not.toContain("private-tool-output");
+    expect(transcript).not.toContain("unpaired-tool-message");
+    const records = transcript.trim().split("\n").map(line => JSON.parse(line));
+    const read = records.filter(record => record.toolCallId === "original-read");
+    expect(read).toMatchObject([
+      { type: "tool_execution_start", args: { path: "safe.txt", password: "[REDACTED]" } },
+      { type: "tool_execution_update", content: "partial output" },
+      { type: "tool_execution_end", content: "read failed [REDACTED]", isError: true }
+    ]);
+    expect(records.find(record => record.toolCallId === "empty-result")?.content).toBe("");
+    expect(records.some(record => record.type === "message_start" || record.type === "message_update")).toBe(false);
+    expect(records.filter(record => record.type === "message_end"
+      && record.message.content[0]?.text === "same reply")).toHaveLength(2);
   });
 
   it("resumes the matching durable session from a prior run in the same product session", { timeout: 20_000 }, async () => {
@@ -1011,6 +1026,7 @@ async function createRunnerFixture(options: {
   readonly settleOnAbort?: boolean;
   readonly requestApproval?: true | string;
   readonly parallelCommandGate?: boolean;
+  readonly transcriptEvidence?: boolean;
   readonly nativeAuthRequired?: boolean;
   readonly providerId?: string;
   readonly refreshNativeAuth?: boolean;
@@ -1058,7 +1074,7 @@ async function createRunnerFixture(options: {
     writeFile(
       fakeChildPath,
       fakeChildSource(options.settleDelayMs, options.settleOnAbort ?? true, options.requestApproval,
-        options.refreshNativeAuth !== false, childTracePath, options.parallelCommandGate === true),
+        options.refreshNativeAuth !== false, childTracePath, options.parallelCommandGate === true, options.transcriptEvidence === true),
       { encoding: "utf8", mode: 0o600 }
     ),
     writeFile(childTracePath, "", { encoding: "utf8", mode: 0o600 }),
@@ -1280,7 +1296,8 @@ function fakeChildSource(
   requestApproval: true | string | undefined,
   refreshNativeAuth: boolean,
   childTracePath: string,
-  parallelCommandGate: boolean
+  parallelCommandGate: boolean,
+  transcriptEvidence: boolean
 ): string {
   const promptEffect = typeof requestApproval === "string"
     ? `send(${JSON.stringify({ type: "extension_ui_request", id: "fixture-approval", method: "input", title: requestApproval })});`
@@ -1328,6 +1345,20 @@ function commandGate(id, action, toolCallId) {
 }
 function complete(text) {
   const secret = process.env.JOKO_RUNNER_TEST_SECRET || "none";
+  if (${transcriptEvidence}) {
+    const savedReply = { role: "assistant", content: [{ type: "text", text: "same reply" }] };
+    send({ type: "message_start", message: { role: "assistant", content: [] } });
+    send({ type: "message_update", message: savedReply });
+    send({ type: "tool_execution_start", toolName: "read", toolCallId: "original-read", args: { path: "safe.txt", password: "hidden-argument-value" } });
+    send({ type: "tool_execution_update", toolName: "read", toolCallId: "original-read", partialResult: { content: [{ type: "text", text: "partial output" }] } });
+    send({ type: "tool_execution_end", toolName: "read", toolCallId: "original-read", result: { content: [{ type: "text", text: "read failed " + secret }] }, isError: true });
+    send({ type: "tool_execution_start", toolName: "mcp__joko_memory__memory_clear", toolCallId: "private-call", args: { path: "private-tool-output" } });
+    send({ type: "tool_execution_end", toolName: "mcp__joko_memory__memory_clear", toolCallId: "private-call", result: { content: [{ type: "text", text: "private-tool-output" }] } });
+    send({ type: "tool_execution_end", toolName: "bash", toolCallId: "empty-result", result: { content: [] } });
+    send({ type: "message_end", message: { role: "toolResult", content: [{ type: "text", text: "unpaired-tool-message" }] } });
+    send({ type: "message_end", message: savedReply });
+    send({ type: "message_end", message: savedReply });
+  }
   assistant = { role: "assistant", content: [{ type: "text", text: text + " " + secret + " " + nativeSecret + " " + refreshedNativeSecret }], stopReason: "stop" };
   send({ type: "message_end", message: assistant });
   send({ type: "agent_settled" });

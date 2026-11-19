@@ -50,6 +50,36 @@ describe("managed Subagent public observation", () => {
     await expect(assertManagedSubagentHostedToolScope(input)).rejects.toThrow();
   });
 
+  it("projects physical message lifecycle rows without changing their delivery positions", async () => {
+    const root = join(await mkdtemp(join(tmpdir(), "joko-subagent-observer-")), "subagent-runs");
+    const sessionId = `session-${randomUUID()}`, taskId = "delegated-conversation";
+    await physicalRun(root, sessionId, taskId, 1, 1, [
+      { type: "message_start", message: { role: "assistant", content: [] } },
+      { type: "message_update", message: { role: "assistant", content: [{ type: "text", text: "half reply" }] } },
+      { type: "tool_execution_end", toolName: "read", toolCallId: "original-read", content: "" },
+      { type: "message_end", message: { role: "toolResult", content: [{ type: "text", text: "tool-only text" }] } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "message_start" }] } }
+    ]);
+    const events: EventPayload[] = [];
+    const observer = new ManagedSubagentObserver({ root, context: context(sessionId, 1, events), intervalMs: 60_000 });
+    try {
+      await observer.refresh();
+      const entries = events.flatMap(event => event.type === "subagent_transcript" ? [event.entry] : []);
+      expect(entries).toMatchObject([
+        { sequence: 1, role: "system", systemEvent: { kind: "message-lifecycle" } },
+        { sequence: 2, role: "system", systemEvent: { kind: "message-lifecycle" } },
+        { sequence: 3, role: "tool", toolPhase: "end", toolCallId: "original-read", content: "" },
+        { sequence: 4, role: "system", systemEvent: { kind: "message-lifecycle" } },
+        { sequence: 5, role: "subagent", content: "message_start" }
+      ]);
+      expect(JSON.stringify(entries)).not.toContain("half reply");
+      expect(JSON.stringify(entries)).not.toContain("tool-only text");
+      const delivered = events.length;
+      await observer.refresh();
+      expect(events).toHaveLength(delivered);
+    } finally { observer.stop(); }
+  });
+
   it("emits a canonical run before a globally sequenced transcript and resumes without replay", async () => {
     const root = join(await mkdtemp(join(tmpdir(), "joko-subagent-observer-")), "subagent-runs");
     const sessionId = `session-${randomUUID()}`;
