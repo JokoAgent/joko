@@ -1032,6 +1032,7 @@ export function App() {
     setMenuOpen(false);
   };
   const handleComposerFocused = useCallback(() => setFocusTaskComposer(false), []);
+  const returnFromFiles = (): void => { setPage(client.state.selectedId ? "task" : "home"); };
   const focusHomeSearchMatch = (match?: MobileHomeSearchMatch, restoreReading = false): void => {
     const current = client.state;
     const focus = match !== undefined && AppState.currentState === "active"
@@ -1050,6 +1051,7 @@ export function App() {
         }
         if (page === "partner-identities" || page === "partner-network") { setPage("partner-directory"); return true; }
         if (page === "device") { setPage("devices"); return true; }
+        if (page === "files") { returnFromFiles(); return true; }
         if (["settings", "connections", "devices", "automations", "extensions", "partner-resources"].includes(page)) {
           setPage("home"); return true;
         }
@@ -1140,7 +1142,7 @@ export function App() {
                   messageFocus={nativeIntentMessageFocus?.homeSourceKey === undefined || nativeIntentMessageFocus.homeSourceKey === homeSourceKey
                     ? nativeIntentMessageFocus : undefined} /> :
                 page === "remote-desktop" && remoteDesktopEntry ? <View style={styles.fill} /> :
-                page === "files" ? <FilesScreen {...common} initialSource={filesInitialSource} onBack={() => setPage("task")}
+                page === "files" ? <FilesScreen {...common} initialSource={filesInitialSource} onBack={returnFromFiles}
                   onAdded={() => {
                     setFocusTaskComposer(true);
                     setPage("task");
