@@ -114,6 +114,16 @@ async function drag(dx: number, dy: number, vy = 0) {
 }
 
 describe("lightbox dismissal and gesture ownership", () => {
+  it("keeps the path action available when the selected original could not load", async () => {
+    const page = { ...session("image/png", false), sourceKind: "workspace" as const };
+    const gallery = { ...controls(page), error: "The image could not be loaded." };
+    await act(async () => root.render(createElement(MobileImageLightbox, { locale: "en", onClose: close, onSave: save, gallery })));
+    expect(host.textContent).toContain(gallery.error);
+    await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="Copy relative path"]')!.click());
+    expect(copySource).toHaveBeenCalledOnce();
+    expect(host.textContent).toContain("Copied.");
+  });
+
   it("copies the exact gallery source with visible feedback and aborts an unsettled copy when the page retires", async () => {
     const page = session("image/png", false); await render(page);
     await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="Copy relative path"]')!.click());

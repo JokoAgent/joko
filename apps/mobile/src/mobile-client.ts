@@ -7522,28 +7522,32 @@ export class MobileClient {
 
   prepareFilesImageGalleryPathCopy(
     galleryLeaseId: string,
-    loadId: string,
-    pageId: string
+    pageId: string,
+    selection: { readonly kind: "loaded"; readonly loadId: string }
+      | { readonly kind: "failed"; readonly pageIndex: number; readonly isCurrent: () => boolean }
   ): MobileFilesClipboardLease {
     const lease = this.#imageGallery;
     const loaded = lease?.loaded;
+    const page = selection.kind === "loaded" ? loaded?.page : lease?.pages[selection.pageIndex];
     const copyEpoch = this.#filesCopyEpoch;
-    if (!lease || lease.leaseId !== galleryLeaseId || lease.source.kind !== "files" || lease.operationInFlight
-      || !loaded || loaded.loadId !== loadId || loaded.page.pageId !== pageId || !this.imageGalleryCurrent(galleryLeaseId)) {
+    if (!lease || lease.leaseId !== galleryLeaseId || lease.source.kind !== "files" || !page || page.pageId !== pageId
+      || (selection.kind === "failed" && page.source.kind !== "workspace")) {
       throw new Error("The Files image gallery page is no longer current.");
     }
-    const source = loaded.page.source;
+    const source = page.source;
     const value = source.kind === "workspace"
       ? mobileFilesWorkspaceClipboardValue(source.relativePath)
       : source.kind === "artifact"
-        ? mobileFilesGeneratedClipboardValue(loaded.page.blob.fileName)
+        ? mobileFilesGeneratedClipboardValue(page.blob.fileName)
         : undefined;
     if (!value) throw new Error("The current gallery page does not belong to Files.");
     const assertCurrent = (signal?: AbortSignal): void => {
       signal?.throwIfAborted();
+      const sameSelection = selection.kind === "loaded"
+        ? lease.loaded === loaded && loaded?.loadId === selection.loadId
+        : lease.loaded === undefined && selection.isCurrent();
       if (this.#filesCopyEpoch !== copyEpoch || this.#imageGallery !== lease || lease.source.kind !== "files"
-        || lease.operationInFlight || lease.loaded !== loaded || loaded.loadId !== loadId
-        || loaded.page.pageId !== pageId || !this.imageGalleryCurrent(galleryLeaseId)) {
+        || lease.operationInFlight || !sameSelection || !this.imageGalleryCurrent(galleryLeaseId)) {
         throw new Error("The visible Files image changed before its path was copied.");
       }
     };

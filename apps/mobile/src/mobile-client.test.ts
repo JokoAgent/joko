@@ -16013,12 +16013,22 @@ describe("native current-task Files ownership", () => {
       sourceKind: "workspace", initialIndex: 0,
       pages: [{ title: "b.png" }, { title: "a.png" }, { title: "moving.gif" }]
     });
+    vi.mocked(network.downloadBlob).mockRejectedValueOnce(new Error("Image read temporarily unavailable"));
+    await expect(app.loadImageGalleryPage(descriptor.leaseId, descriptor.initialIndex)).rejects.toThrow("Image read temporarily unavailable");
+    let selectedFailedPage = true;
+    const failedPage = app.prepareFilesImageGalleryPathCopy(descriptor.leaseId, descriptor.pages[0]!.pageId, {
+      kind: "failed", pageIndex: 0, isCurrent: () => selectedFailedPage
+    });
+    expect(failedPage).toMatchObject({ text: "images/b.png", kind: "path" });
+    failedPage.assertCurrent();
+    selectedFailedPage = false;
+    expect(() => failedPage.assertCurrent()).toThrow(/visible Files image changed/u);
     const page = await app.loadImageGalleryPage(descriptor.leaseId, descriptor.initialIndex);
     expect(page).toMatchObject({
       pageIndex: 0, pageCount: 3, expectedWidthPixels: 3, expectedHeightPixels: 2,
       addable: true, annotatable: true
     });
-    const copiedPath = app.prepareFilesImageGalleryPathCopy(descriptor.leaseId, page.leaseId, page.pageId);
+    const copiedPath = app.prepareFilesImageGalleryPathCopy(descriptor.leaseId, page.pageId, { kind: "loaded", loadId: page.leaseId });
     expect(copiedPath).toMatchObject({ text: "images/b.png", kind: "path" }); copiedPath.assertCurrent();
     app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, {
       width: 3, height: 2, mediaType: "image/png", isAnimated: false
@@ -16110,7 +16120,7 @@ describe("native current-task Files ownership", () => {
     });
     const page = await app.loadImageGalleryPage(descriptor.leaseId, descriptor.initialIndex);
     expect(page).toMatchObject({ fileName: "two.png", pageIndex: 1, pageCount: 2 });
-    const copiedName = app.prepareFilesImageGalleryPathCopy(descriptor.leaseId, page.leaseId, page.pageId);
+    const copiedName = app.prepareFilesImageGalleryPathCopy(descriptor.leaseId, page.pageId, { kind: "loaded", loadId: page.leaseId });
     expect(copiedName).toMatchObject({ text: "two.png", kind: "file-name" }); copiedName.assertCurrent();
     const sorted = await app.openFilesImageGallery({ kind: "artifact", artifact: selected }, undefined, "mtime");
     expect(() => copiedName.assertCurrent()).toThrow(/visible Files image changed/u);
