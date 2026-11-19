@@ -1584,6 +1584,7 @@ export class PiBackendAdapter implements
       ...(skillCommandResource === undefined ? {} : { skillCommandResource })
     };
     let lifecycle: PiNativeLifecycle;
+    let inputHookBaseline: PiRpcState | undefined;
     if (input.disposition === "prompt") {
       if (runtime.lifecycle !== undefined) {
         throw piError(
@@ -1605,6 +1606,12 @@ export class PiBackendAdapter implements
             recovery: "Reload the session projection and wait for the native lifecycle to settle before retrying."
           }
         );
+      }
+      if (extensionCommand === undefined && this.#usesBundledCommand && context.target.remoteWorkspace === undefined
+        && state.isCompacting === false && state.pendingMessageCount === 0
+        && typeof state.sessionId === "string" && state.sessionId !== "" && Number.isSafeInteger(state.messageCount) && state.messageCount >= 0
+        && runtime.resources.some(resource => resource.kind === "extension" && resource.runtimePath !== undefined)) {
+        inputHookBaseline = state;
       }
       await this.#compactAtConfiguredThreshold(runtime, context);
       runtime.abortRequested = false;
@@ -1705,6 +1712,22 @@ export class PiBackendAdapter implements
         if (runtime.lifecycle === lifecycle) runtime.lifecycle = undefined;
         this.#publishExtensionCommandTerminal(runtime, context, extensionCommand, () => runtime.lifecycle === undefined);
       }
+    } else if (inputHookBaseline !== undefined && runtime.lifecycle === lifecycle && !lifecycle.agentStarted && !lifecycle.initialUserMessageSeen) {
+      // The bundled RPC resolves the prompt only after preflight. An ordinary
+      // prompt enters the Agent loop immediately; a handled input returns at
+      // that boundary. The ordered state reply and lifecycle observations must
+      // still refer to the same idle transcript before completing the input.
+      const state = await this.#requestState(runtime, context).catch(() => undefined);
+      if (state?.isStreaming === false && state.isCompacting === false && state.pendingMessageCount === 0
+        && state.sessionId === inputHookBaseline.sessionId && state.sessionFile === inputHookBaseline.sessionFile
+        && state.messageCount === inputHookBaseline.messageCount && runtime.lifecycle === lifecycle
+        && !lifecycle.agentStarted && !lifecycle.initialUserMessageSeen && !lifecycle.settlementReceived
+        && !runtime.abortRequested && !context.signal.aborted) {
+        runtime.lifecycle = undefined;
+        runtime.translator.setContext(runtime.context);
+        this.#publishExtensionTerminal(runtime, context, { namespace: "pi.extension_input", fields: {} },
+          () => runtime.lifecycle === undefined && !context.signal.aborted);
+      }
     }
   }
 
@@ -1713,6 +1736,15 @@ export class PiBackendAdapter implements
     context: AdapterContext,
     command: string,
     additionalFence: () => boolean = () => true
+  ): void {
+    this.#publishExtensionTerminal(runtime, context, { namespace: "pi.extension_command", fields: { command } }, additionalFence);
+  }
+
+  #publishExtensionTerminal(
+    runtime: PiRuntime,
+    context: AdapterContext,
+    metadata: import("@joko/core").AdapterEventMetadata,
+    additionalFence: () => boolean
   ): void {
     const runtimeGeneration = runtime.transport.generation;
     // A successful prompt response is Pi's acceptance boundary. Publish a
@@ -1726,10 +1758,7 @@ export class PiBackendAdapter implements
       ) return;
       void context.emit(
         { type: "done", outcome: "completed" },
-        {
-          namespace: "pi.extension_command",
-          fields: { command }
-        }
+        metadata
       ).catch(() => undefined);
     });
   }
