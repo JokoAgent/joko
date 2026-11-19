@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import { create, fromBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, type JsonObject } from "@bufbuild/protobuf";
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { createCodexAdapter, AppServerHost, TransportFault } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
@@ -726,7 +726,7 @@ it("rewinds the original Legacy Codex task through its completed native fork anc
     const store = fixture.application.store;
     const targetId = fixture.targetId(backendId);
     const cwd = store.getTarget(targetId).descriptor.workspaceRoot;
-    const completed = (id: string, user: string, assistant: string) => ({ id, status: "completed", items: [
+    const completed = (id: string, user: string, assistant: string): JsonObject => ({ id, status: "completed", items: [
       { type: "userMessage", id: `${id}-user`, content: [{ type: "text", text: user, text_elements: [] }] },
       { type: "agentMessage", id: `${id}-assistant`, text: assistant, phase: null, memoryCitation: null, delivery: null }
     ] });
