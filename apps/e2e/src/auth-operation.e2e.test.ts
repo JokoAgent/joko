@@ -20,6 +20,7 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OrchestratorE2eFixture } from "./fixture.js";
+import { RealPiSystemFixture } from "./real-pi-fixture.js";
 import {
   createSessionMutation,
   renameMutation,
@@ -135,14 +136,14 @@ describe("remote connection auth and durable operations", () => {
   });
 
   it("settles the original managed project removal across a cold start after its directory moved", async () => {
-    fixture = await OrchestratorE2eFixture.start();
-    const rootDirectory = fixture.rootDirectory;
+    let recoveryFixture = await RealPiSystemFixture.start();
+    const rootDirectory = recoveryFixture.rootDirectory;
     try {
-      const owner = await fixture.pair("Managed directory recovery owner");
+      const owner = await recoveryFixture.pair("Managed directory recovery owner");
       const { clients, connectionId } = owner;
-      const backendId = fixture.adapter().id, store = fixture.application.store;
+      const store = recoveryFixture.application.store;
       const created = await submit(clients.operation, connectionId, create(OperationMutationSchema, { payload: {
-        case: "createTarget", value: create(CreateTargetMutationSchema, { backendId, displayName: "Managed recovery project",
+        case: "createTarget", value: create(CreateTargetMutationSchema, { backendId: "pi", displayName: "Managed recovery project",
           workspace: create(TargetWorkspaceInputSchema, { kind: WorkspaceKind.MANAGED_DIALOGUE, createIfMissing: true }) })
       } }));
       if (created.result?.payload.case !== "target") throw new Error("The managed recovery project was not created.");
@@ -164,19 +165,21 @@ describe("remote connection auth and durable operations", () => {
       expect(await readFile(join(trashPath, "project.txt"), "utf8")).toBe("Original managed workspace bytes.");
       await expect(submit(clients.operation, connectionId, mutation)).rejects.toMatchObject({ code: Code.FailedPrecondition });
 
-      await fixture.close({ removeRoot: false });
-      fixture = await OrchestratorE2eFixture.start({ rootDirectory });
-      const reconnected = fixture.clients(owner.authKey);
+      await recoveryFixture.close({ removeRoot: false });
+      recoveryFixture = await RealPiSystemFixture.start({ rootDirectory });
+      const reconnected = recoveryFixture.clients(owner.authKey);
       const receipt = (await reconnected.operation.getOperation({ operationId })).operation;
-      expect(receipt).toMatchObject({ operationId, state: OperationState.SUCCEEDED, result: { payload: { case: "target", value: { targetId } } } });
-      expect(fixture.application.store.getTarget(targetId).metadata).toMatchObject({ state: "archived", managedWorkspaceTrashPath: trashPath, deletionOperationId: operationId });
-      expect(fixture.application.store.getTarget(targetId).metadata).not.toHaveProperty("pendingManagedWorkspaceTrash");
+      expect(receipt, receipt?.error?.message).toMatchObject({ operationId, state: OperationState.SUCCEEDED,
+        result: { payload: { case: "target", value: { targetId } } } });
+      const metadata = recoveryFixture.application.store.getTarget(targetId).metadata;
+      expect(metadata).toMatchObject({ state: "archived", managedWorkspaceTrashPath: trashPath, deletionOperationId: operationId });
+      expect(metadata).not.toHaveProperty("pendingManagedWorkspaceTrash");
       await expect(reconnected.workspace.getWorkspace({ workspaceId })).rejects.toMatchObject({ code: Code.NotFound });
       expect((await submit(reconnected.operation, connectionId, mutation, operationId)).state).toBe(OperationState.SUCCEEDED);
       expect(await readFile(join(trashPath, "project.txt"), "utf8")).toBe("Original managed workspace bytes.");
     } finally {
-      try { await fixture.close({ removeRoot: false }); }
-      finally { fixture = undefined; await rm(rootDirectory, { recursive: true, force: true, maxRetries: 3 }); }
+      try { await recoveryFixture.close({ removeRoot: false }); }
+      finally { await rm(rootDirectory, { recursive: true, force: true, maxRetries: 3 }); }
     }
   });
 
