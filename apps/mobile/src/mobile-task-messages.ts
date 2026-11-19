@@ -992,6 +992,7 @@ const mobileTaskMessageRows = [
   ["preview.pdfRenderedProgress", "Rendered {rendered} of {pages} pages", "已渲染 {rendered}/{pages} 页", "已算繪 {rendered}/{pages} 頁", "{pages} ページ中 {rendered} ページを描画済み", "{pages}페이지 중 {rendered}페이지 렌더링됨"],
   ["preview.pdfRenderedPage", "Rendered PDF page {page} of {pages}", "已渲染 PDF 第 {page}/{pages} 页", "已算繪 PDF 第 {page}/{pages} 頁", "PDF {pages} ページ中 {page} ページを描画済み", "PDF {pages}페이지 중 {page}페이지 렌더링됨"],
   ["preview.pdfPage", "PDF page {page} of {pages}", "PDF 第 {page}/{pages} 页", "PDF 第 {page}/{pages} 頁", "PDF {pages} ページ中 {page} ページ", "PDF {pages}페이지 중 {page}페이지"],
+  ["preview.pdfPageLink", "Go to PDF destination", "跳转到 PDF 页内目标", "跳轉到 PDF 頁內目標", "PDF の参照先に移動", "PDF 참조 위치로 이동"],
   ["preview.pdfPageError", "Page {page} could not be rendered.", "无法渲染第 {page} 页。", "無法算繪第 {page} 頁。", "{page} ページを描画できませんでした。", "{page}페이지를 렌더링할 수 없습니다."],
   ["preview.modelFailure", "The 3D preview process stopped repeatedly. Close the preview and try again.", "3D 预览进程多次停止。请关闭预览后重试。", "3D 預覽程序多次停止。請關閉預覽後重試。", "3D プレビュー処理が繰り返し停止しました。プレビューを閉じて再試行してください。", "3D 미리보기 프로세스가 반복해서 중지되었습니다. 미리보기를 닫고 다시 시도하세요."],
   ["preview.modelError", "3D model preview failed", "3D 模型预览失败", "3D 模型預覽失敗", "3D モデルプレビューに失敗しました", "3D 모델 미리보기 실패"],

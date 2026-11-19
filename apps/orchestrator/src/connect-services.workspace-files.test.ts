@@ -1,12 +1,18 @@
 import { createHash } from "node:crypto";
+import { rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
+import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
 import { operationBodyHash, type OperationRecord } from "@joko/store";
 import { describe, expect, it, vi } from "vitest";
 
 import type { OrchestratorApplication } from "./application.js";
 import { createConnectServices } from "./connect-services.js";
+import { mkdtemp } from "./test-paths.js";
+import { WorkspaceService } from "./workspace-service.js";
 
 const connection = {
   id: "connection-workspace-files",
@@ -17,14 +23,59 @@ const connection = {
   revision: 1n
 };
 
-function context(): never {
+function context(hostAuthorization?: string): never {
+  const headers = new Headers({ authorization: "Bearer workspace-files-test" });
+  if (hostAuthorization !== undefined) headers.set(DESKTOP_HOST_AUTHORIZATION_HEADER, hostAuthorization);
   return {
-    requestHeader: new Headers({ authorization: "Bearer workspace-files-test" }),
+    requestHeader: headers,
     signal: new AbortController().signal
   } as never;
 }
 
 describe("Connect formal Workspace Files contracts", () => {
+  it("resolves only the matching local Workspace PDF with current Desktop host authority", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-workspace-pdf-source-"));
+    const { signal } = new AbortController();
+    const hostAuthorization = "Bearer desktop-host-fixture";
+    let revokeDuringRead = false;
+    let hostCurrent = true;
+    const workspace = new WorkspaceService({ afterWorkspacePreviewRead: async () => {
+      if (revokeDuringRead) hostCurrent = false;
+    } });
+    try {
+      const registration = await workspace.register({ id: "workspace-files", root, displayName: "PDF project", trusted: true });
+      const relativePath = "manual.pdf";
+      const absolutePath = join(registration.root, relativePath);
+      await writeFile(absolutePath, "%PDF-1.7\n%%EOF\n");
+      const original = await workspace.preview(registration.id, relativePath);
+      const services = createConnectServices(application({
+        workspaces: workspace,
+        authenticateDesktopHost: (record, authorization) => {
+          if (record !== connection || authorization !== hostAuthorization || !hostCurrent) throw new Error("Desktop host authority unavailable.");
+        }
+      }));
+      const request = create(contract.ResolveWorkspaceFileSourceRequestSchema, {
+        workspaceId: registration.id, relativePath, expectedRevision: { opaqueRevision: original.entry.revision }
+      });
+      await expect(services.workspace.resolveWorkspaceFileSource(request, context())).rejects.toMatchObject({ code: Code.Unauthenticated });
+      await expect(services.workspace.resolveWorkspaceFileSource(request, context(hostAuthorization))).resolves.toEqual({
+        absolutePath, verifiedMetadataRevision: { opaqueRevision: original.observedRevision }
+      });
+      revokeDuringRead = true;
+      await expect(services.workspace.resolveWorkspaceFileSource(request, context(hostAuthorization))).rejects.toMatchObject({ code: Code.Unauthenticated });
+      revokeDuringRead = false;
+      hostCurrent = true;
+      await writeFile(absolutePath, "%PDF-1.7\n% updated file\n%%EOF\n");
+      await expect(services.workspace.resolveWorkspaceFileSource(request, context(hostAuthorization))).rejects.toMatchObject({ code: Code.Aborted });
+      await workspace.register({ ...registration, trusted: false });
+      await expect(workspace.resolveLocalPdfSource(registration.id, relativePath, original.entry.revision,
+        { signal, assertCurrent: () => signal.throwIfAborted() })).rejects.toMatchObject({ kind: "unsupported" });
+    } finally {
+      await workspace.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("streams only typed, capability-gated workspace-relative changes", async () => {
     const watchChanges = vi.fn(async function* () {
       yield {
@@ -685,7 +736,8 @@ function workspaceEntry(path: string, revision: string) {
 }
 
 function application(input: {
-  readonly workspaces: Record<string, unknown>;
+  readonly workspaces: Record<string, unknown> | WorkspaceService;
+  readonly authenticateDesktopHost?: (record: unknown, authorization: string | undefined) => void;
   readonly ingestBytes?: (bytes: Uint8Array, options?: object) => Promise<object>;
   readonly maximumBlobBytes?: number;
   readonly trace?: string[];
@@ -724,6 +776,7 @@ function application(input: {
     store,
     connections: {
       authenticate: () => connection,
+      authenticateDesktopHost: input.authenticateDesktopHost,
       onRevoked: () => () => undefined,
       fence: () => undefined
     },

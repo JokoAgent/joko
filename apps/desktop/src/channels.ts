@@ -150,6 +150,8 @@ export const DESKTOP_CHANNELS = {
   openFileWithApp: "joko:files:open-with:open",
   revealArtifactSource: "joko:files:reveal-artifact-source",
   cancelArtifactSourceReveal: "joko:files:reveal-artifact-source-cancel",
+  openWorkspaceFileSource: "joko:files:open-workspace-source",
+  cancelWorkspaceFileSource: "joko:files:open-workspace-source-cancel",
   credentialGet: "joko:credential:get",
   credentialSet: "joko:credential:set",
   credentialDelete: "joko:credential:delete",
@@ -941,6 +943,18 @@ export interface DesktopRevealArtifactSourceRequest {
 export type DesktopRevealArtifactSourceResult =
   | { readonly status: "revealed" | "cancelled" | "unknown" | "unavailable" }
   | { readonly status: "failed"; readonly reason: "capacity" | "reveal" };
+
+export interface DesktopWorkspaceFileSourceRequest {
+  readonly requestId: string;
+  readonly profileId: string;
+  readonly serverId: string;
+  readonly workspaceId: string;
+  readonly path: string;
+  readonly revision: string;
+  readonly action: "open" | "reveal";
+}
+
+export type DesktopWorkspaceFileSourceResult = { readonly status: "opened" | "revealed" | "cancelled" | "unavailable" | "failed" };
 
 export type DesktopMainWindowCloseBehavior = "tray" | "minimize" | "quit";
 

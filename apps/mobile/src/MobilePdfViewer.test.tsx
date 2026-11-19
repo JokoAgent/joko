@@ -167,6 +167,28 @@ describe("MobilePdfViewer", () => {
     expect(onStatusChange).not.toHaveBeenCalledWith(expect.objectContaining({ state: "complete" }));
   });
 
+  it("seeds a recovered view with the same private file's page and exact zoom mode", async () => {
+    root = createRoot(document.createElement("div"));
+    const render = (sha256Hex: string) => createElement(MobilePdfViewer, {
+      accent: "#3366ff", background: "#ffffff", border: "#dddddd", byteSize: 80,
+      fileName: "preview-pdf.pdf", ink: "#111111", instanceId: "pdf-view", locale: "en", muted: "#666666",
+      sha256Hex, surface: "#f5f5f5", title: "Proof", uri: "file:///cache/joko-pdf-preview/preview-pdf.pdf"
+    });
+    await act(async () => root!.render(render("a".repeat(64))));
+    const initial = bridge.props?.source;
+    await message({ type: "joko-pdf-viewer/position", instanceId: "pdf-view", page: 2, zoomPercent: 100, fitToWidth: false });
+    expect(bridge.props?.source).toBe(initial);
+    act(() => bridge.onResourcePressure());
+    expect(bridge.mounts).toBe(2);
+    expect(bridge.props?.source.html).toContain("var fit = false;");
+    expect(bridge.props?.source.html).toContain("currentPage = Math.min(2, pageCount);");
+
+    await act(async () => root!.render(render("b".repeat(64))));
+    expect(bridge.mounts).toBe(3);
+    expect(bridge.props?.source.html).toContain("var fit = true;");
+    expect(bridge.props?.source.html).toContain("currentPage = Math.min(1, pageCount);");
+  });
+
   it("disposes the exact renderer before replacing its owner presentation", () => {
     root = createRoot(document.createElement("div"));
     const render = (surface: string) => createElement(MobilePdfViewer, {

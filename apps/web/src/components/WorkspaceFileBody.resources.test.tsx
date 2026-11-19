@@ -26,6 +26,9 @@ vi.mock("./workspace-gltf-source.js", () => ({ materializeWorkspaceModelSource: 
   boundary.models.push(input);
   return new Promise(() => undefined);
 } }));
+vi.mock("./WorkspacePdfCanvas.js", () => ({ WorkspacePdfCanvas: ({ onError }: { readonly onError: () => void }) =>
+  <button type="button" data-pdf-renderer onClick={onError}>Fail PDF render</button>
+}));
 
 const roots: Root[] = [];
 beforeAll(() => { (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true; });
@@ -34,9 +37,37 @@ afterEach(async () => {
   for (const root of roots.splice(0)) await act(async () => root.unmount());
   document.body.replaceChildren();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("Workspace file resource ownership", () => {
+  it("offers the original file and folder after a managed local PDF render fails", async () => {
+    const openWorkspaceFileSource = vi.fn(async (request: JokoDesktopWorkspaceFileSourceRequest) =>
+      ({ status: request.action === "open" ? "opened" : "revealed" }));
+    vi.stubGlobal("jokoDesktop", { capabilities: ["files.openWorkspaceSource"], openWorkspaceFileSource,
+      cancelWorkspaceFileSource: vi.fn(async () => undefined) });
+    const owner = controller(async () => "blob:authorized-pdf");
+    const activeProfile = { ...owner.value.state.activeProfile!, managedLocal: true };
+    const managed = { ...owner.value, state: { ...owner.value.state, activeProfile, connectionGeneration: 1, effectiveLocale: "en" as const } };
+    const preview: WorkspaceFilePreviewView = { path: "docs/manual.pdf", name: "manual.pdf", kind: "blob", mediaType: "application/pdf",
+      blobId: "shared-blob", revision: "fixture-revision", byteSize: 128, truncated: false };
+    const mounted = await mount(managed, preview, false, true);
+    const button = (label: string) => [...mounted.container.querySelectorAll<HTMLButtonElement>("button")].find(node => node.textContent === label);
+    expect(button("Open in system")).toBeUndefined();
+    await act(async () => mounted.container.querySelector<HTMLButtonElement>("[data-pdf-renderer]")!.click());
+    await act(async () => button("Open in system")!.click());
+    await act(async () => button("Open containing folder")!.click());
+    const source = { profileId: "profile", serverId: "server", workspaceId: "workspace", path: preview.path, revision: preview.revision };
+    expect(openWorkspaceFileSource).toHaveBeenNthCalledWith(1, { ...source, requestId: expect.any(String), action: "open" });
+    expect(openWorkspaceFileSource).toHaveBeenNthCalledWith(2, { ...source, requestId: expect.any(String), action: "reveal" });
+    expect(button("Download file")).toBeDefined();
+
+    await mounted.render({ ...managed, state: { ...managed.state, activeProfile: { ...activeProfile, managedLocal: false } } });
+    expect(button("Open in system")).toBeUndefined();
+    expect(button("Open containing folder")).toBeUndefined();
+    expect(button("Download file")).toBeDefined();
+  });
+
   it("admits the mounted Markdown editor after layout replay while retiring the earlier generation", async () => {
     boundary.loadInLayout = true;
     const current = controller(async () => "blob:current-layout");
@@ -198,13 +229,13 @@ function controller(acquire: (blobId: string) => Promise<string>) {
   };
 }
 
-async function mount(initial: AppController, preview: WorkspaceFilePreviewView, strict = false) {
+async function mount(initial: AppController, preview: WorkspaceFilePreviewView, strict = false, canOpenLocalPdfSource = false) {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
   roots.push(root);
   const render = async (controller: AppController) => act(async () => {
-    const body = <WorkspaceFileBody controller={controller} sessionId="session" workspaceId="workspace" path={preview.path} preview={preview} canWrite={false} />;
+    const body = <WorkspaceFileBody controller={controller} sessionId="session" workspaceId="workspace" path={preview.path} preview={preview} canWrite={false} canOpenLocalPdfSource={canOpenLocalPdfSource} />;
     root.render(strict ? <StrictMode>{body}</StrictMode> : body);
   });
   await render(initial);

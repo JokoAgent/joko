@@ -32,7 +32,18 @@ export interface MobilePdfViewerAck {
   readonly index: number;
 }
 
-export type MobilePdfViewerMessage = MobilePdfViewerStatus | MobilePdfViewerAck;
+export interface MobilePdfReadingPosition {
+  readonly page: number;
+  readonly zoomPercent: number;
+  readonly fitToWidth: boolean;
+}
+
+interface MobilePdfViewerPosition extends MobilePdfReadingPosition {
+  readonly type: "joko-pdf-viewer/position";
+  readonly instanceId: string;
+}
+
+export type MobilePdfViewerMessage = MobilePdfViewerStatus | MobilePdfViewerAck | MobilePdfViewerPosition;
 
 export interface MobilePdfJsRuntimeBundle {
   readonly version: string;
@@ -95,6 +106,11 @@ export function parseMobilePdfViewerMessage(data: string, instanceId: string): M
       return { type: "joko-pdf-viewer/ack", instanceId: exactInstanceId,
         command: value["command"], index: value["index"] as number };
     }
+    if (value["type"] === "joko-pdf-viewer/position") {
+      const position = pdfReadingPosition(value["page"], value["zoomPercent"], value["fitToWidth"]);
+      return position && exactKeys(value, ["type", "instanceId", "page", "zoomPercent", "fitToWidth"])
+        ? { type: "joko-pdf-viewer/position", instanceId: exactInstanceId, ...position } : undefined;
+    }
     if (value["type"] !== "joko-pdf-viewer/status"
       || !exactKeys(value, ["type", "instanceId", "state", "pageCount", "currentPage", "renderedPages", "zoomPercent", "error"])
       || !pdfViewerState(value["state"]) || !safeCount(value["pageCount"], mobilePdfViewerLimits.maximumPageCount)
@@ -126,7 +142,8 @@ export function buildMobilePdfViewerHtml({
   ink,
   muted,
   accent,
-  border
+  border,
+  resumeAt
 }: {
   readonly instanceId: string;
   readonly locale: MobileSupportedLocale;
@@ -137,9 +154,12 @@ export function buildMobilePdfViewerHtml({
   readonly muted: string;
   readonly accent: string;
   readonly border: string;
+  readonly resumeAt?: MobilePdfReadingPosition;
 }, runtime: MobilePdfJsRuntimeBundle): string {
   const exactInstanceId = viewerInstanceId(instanceId);
   const exactTitle = boundedText(title, 512) || mobileMessage(locale, "preview.pdfTitle");
+  const initialPosition = pdfReadingPosition(resumeAt?.page, resumeAt?.zoomPercent, resumeAt?.fitToWidth)
+    ?? { page: 1, zoomPercent: 100, fitToWidth: true };
   assertRuntimeBundle(runtime);
   const cMaps = JSON.stringify(runtime.cMaps);
   const standardFonts = JSON.stringify(runtime.standardFonts);
@@ -155,6 +175,7 @@ export function buildMobilePdfViewerHtml({
     }),
     renderedPage: mobileMessage(locale, "preview.pdfRenderedPage", { page: "{page}", pages: "{pages}" }),
     page: mobileMessage(locale, "preview.pdfPage", { page: "{page}", pages: "{pages}" }),
+    pageLink: mobileMessage(locale, "preview.pdfPageLink"),
     pageError: mobileMessage(locale, "preview.pdfPageError", { page: "{page}" })
   };
   return `<!doctype html>
@@ -175,6 +196,8 @@ export function buildMobilePdfViewerHtml({
     #pages { align-items: center; display: flex; flex: 1 1 auto; flex-direction: column; gap: 16px; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 16px; }
     .page { align-items: center; background: ${cssColor(surface)}; border: 1px solid ${cssColor(border)}; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.12); display: flex; flex: 0 0 auto; justify-content: center; min-height: 320px; overflow: hidden; position: relative; width: min(100%, 760px); }
     .page-label { color: ${cssColor(muted)}; font-size: 13px; left: 12px; position: absolute; top: 10px; z-index: 1; }
+    .page-content { max-width: 100%; position: relative; }
+    button.page-link { background: transparent; border: 0; border-radius: 0; min-height: 0; min-width: 0; padding: 0; position: absolute; z-index: 2; }
     canvas { display: block; max-width: 100%; }
     .page-error { color: #b42318; max-width: 80%; text-align: center; }
   </style>
@@ -206,6 +229,7 @@ export function buildMobilePdfViewerHtml({
       var pdfDocument = null;
       var observer = null;
       var renderGeneration = 0;
+      var linkRequest = 0;
       var renderTasks = new Map();
       var rendered = new Map();
       var resident = [];
@@ -213,8 +237,9 @@ export function buildMobilePdfViewerHtml({
       var pageCount = 0;
       var currentPage = 0;
       var currentState = 'ready';
-      var zoom = 1;
-      var fit = true;
+      var zoom = ${initialPosition.zoomPercent / 100};
+      var fit = ${initialPosition.fitToWidth};
+      var lastPosition = '';
       var pages = document.getElementById('pages');
       var statusNode = document.getElementById('status');
       var MAX_BYTES = ${MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES};
@@ -244,9 +269,18 @@ export function buildMobilePdfViewerHtml({
           : state === 'error' ? cleanError(error)
           : text(labels.renderedProgress, { rendered: seen.size, pages: pageCount });
         statusNode.textContent = label;
+        var zoomPercent = Math.round(zoom * 100);
+        if (currentPage > 0 && state !== 'error') {
+          var position = String(currentPage) + ':' + String(zoomPercent) + ':' + String(fit);
+          if (position !== lastPosition) {
+            lastPosition = position;
+            post({ type: 'joko-pdf-viewer/position', instanceId: instanceId,
+              page: currentPage, zoomPercent: zoomPercent, fitToWidth: fit });
+          }
+        }
         post({ type: 'joko-pdf-viewer/status', instanceId: instanceId, state: state,
           pageCount: pageCount, currentPage: currentPage, renderedPages: seen.size,
-          zoomPercent: Math.round(zoom * 100),
+          zoomPercent: zoomPercent,
           error: state === 'error' ? cleanError(error) : null });
       }
       function ack(command, index) {
@@ -357,21 +391,34 @@ export function buildMobilePdfViewerHtml({
         var root = pages.getBoundingClientRect(); var rect = section.getBoundingClientRect();
         return rect.bottom >= root.top - root.height && rect.top <= root.bottom + root.height;
       }
-      function touchResident(pageNumber, section) {
+      function removePageContent(content) {
+        if (!content) return;
+        var canvas = content.querySelector('canvas');
+        if (canvas) { canvas.width = 1; canvas.height = 1; }
+        content.remove();
+      }
+      function touchResident(pageNumber) {
         resident = resident.filter(function (value) { return value !== pageNumber; }); resident.push(pageNumber);
         while (resident.length > MAX_RESIDENT) {
           var retired = resident.shift(); var retiredSection = document.getElementById('page-' + String(retired));
           if (!retiredSection || visible(retiredSection)) { if (retired !== undefined) resident.push(retired); break; }
-          var canvas = retiredSection.querySelector('canvas');
-          if (canvas) { canvas.width = 1; canvas.height = 1; canvas.remove(); }
+          removePageContent(retiredSection.querySelector('.page-content'));
           rendered.delete(retired);
         }
       }
-      async function renderPage(pageNumber) {
-        if (disposed || !pdfDocument || renderTasks.has(pageNumber) || rendered.get(pageNumber) === renderGeneration) return;
+      function renderPage(pageNumber) {
+        if (disposed || !pdfDocument) return;
+        var active = renderTasks.get(pageNumber);
+        if (active) return active.result;
+        if (rendered.has(pageNumber)) return rendered.get(pageNumber);
         var section = document.getElementById('page-' + String(pageNumber)); if (!section) return;
-        var generation = renderGeneration;
-        var holder = { cancel: function () {} }; renderTasks.set(pageNumber, holder);
+        var holder = { cancel: function () {}, result: undefined }; renderTasks.set(pageNumber, holder);
+        holder.result = drawPage(pageNumber, section, holder, renderGeneration).finally(function () {
+          if (renderTasks.get(pageNumber) === holder) renderTasks.delete(pageNumber);
+        });
+        return holder.result;
+      }
+      async function drawPage(pageNumber, section, holder, generation) {
         try {
           var page = await pdfDocument.getPage(pageNumber); if (disposed || generation !== renderGeneration) return;
           var base = page.getViewport({ scale: 1 });
@@ -382,25 +429,67 @@ export function buildMobilePdfViewerHtml({
           var pixelWidth = Math.ceil(viewport.width * dpr); var pixelHeight = Math.ceil(viewport.height * dpr);
           var safety = Math.min(1, 4096 / Math.max(pixelWidth, pixelHeight), Math.sqrt(16777216 / Math.max(1, pixelWidth * pixelHeight)));
           if (safety < 1) { scale *= safety; viewport = page.getViewport({ scale: scale }); pixelWidth = Math.ceil(viewport.width * dpr); pixelHeight = Math.ceil(viewport.height * dpr); }
-          var prior = section.querySelector('canvas'); if (prior) prior.remove();
+          removePageContent(section.querySelector('.page-content'));
           var error = section.querySelector('.page-error'); if (error) error.remove();
           var canvas = document.createElement('canvas'); canvas.width = pixelWidth; canvas.height = pixelHeight;
           canvas.style.width = String(Math.ceil(viewport.width)) + 'px'; canvas.style.height = String(Math.ceil(viewport.height)) + 'px';
           canvas.setAttribute('aria-label', text(labels.renderedPage, { page: pageNumber, pages: pageCount }));
-          section.style.height = String(Math.ceil(viewport.height)) + 'px'; section.appendChild(canvas);
+          var content = document.createElement('div'); content.className = 'page-content'; content.appendChild(canvas);
+          section.style.height = String(Math.ceil(viewport.height)) + 'px'; section.appendChild(content);
           var context = canvas.getContext('2d', { alpha: false }); if (!context) throw new Error('Canvas rendering is unavailable.');
           var task = page.render({ canvasContext: context, viewport: viewport, transform: dpr === 1 ? null : [dpr,0,0,dpr,0,0] });
           holder.cancel = function () { try { task.cancel(); } catch (_) {} };
           await task.promise; if (disposed || generation !== renderGeneration) return;
-          rendered.set(pageNumber, generation); seen.add(pageNumber); touchResident(pageNumber, section);
+          var drawing = { canvas: canvas, viewport: viewport, view: page.view };
+          rendered.set(pageNumber, drawing); seen.add(pageNumber); touchResident(pageNumber);
           emit(seen.size === pageCount ? 'complete' : 'rendering', null);
+          void renderPageLinks(page, content, viewport, generation).catch(function () {});
+          return drawing;
         } catch (error) {
           if (disposed || generation !== renderGeneration || (error && error.name === 'RenderingCancelledException')) return;
-          var priorCanvas = section.querySelector('canvas'); if (priorCanvas) priorCanvas.remove();
+          removePageContent(section.querySelector('.page-content'));
           var message = document.createElement('p'); message.className = 'page-error'; message.setAttribute('role','alert');
           message.textContent = text(labels.pageError, { page: pageNumber }); section.appendChild(message);
           emit('error', error);
-        } finally { renderTasks.delete(pageNumber); }
+        }
+      }
+      async function renderPageLinks(page, content, viewport, generation) {
+        var annotations = await page.getAnnotations({ intent: 'display' });
+        if (disposed || generation !== renderGeneration || !content.isConnected) return;
+        for (const annotation of annotations.slice(0, 256)) {
+          const dest = annotation.dest;
+          const ref = Array.isArray(dest) ? dest[0] : null;
+          if (annotation.annotationType !== window.pdfjsLib.AnnotationType.LINK || annotation.url || annotation.unsafeUrl
+            || !ref || !Number.isSafeInteger(ref.num) || ref.num < 1 || !Number.isSafeInteger(ref.gen) || ref.gen < 0
+            || dest.length !== 5 || dest[1]?.name !== 'XYZ' || !dest.slice(2).every(function (value) { return value === null || Number.isFinite(value); })
+            || !Array.isArray(annotation.rect) || annotation.rect.length !== 4 || !annotation.rect.every(Number.isFinite)) continue;
+          var rect = viewport.convertToViewportRectangle(annotation.rect);
+          var left = Math.max(0, Math.min(rect[0], rect[2])); var right = Math.min(viewport.width, Math.max(rect[0], rect[2]));
+          var top = Math.max(0, Math.min(rect[1], rect[3])); var bottom = Math.min(viewport.height, Math.max(rect[1], rect[3]));
+          if (!(right > left && bottom > top)) continue;
+          const link = document.createElement('button'); link.className = 'page-link'; link.type = 'button';
+          link.setAttribute('role', 'link'); link.setAttribute('aria-label', labels.pageLink);
+          link.style.left = String(100 * left / viewport.width) + '%'; link.style.width = String(100 * (right - left) / viewport.width) + '%';
+          link.style.top = String(100 * top / viewport.height) + '%'; link.style.height = String(100 * (bottom - top) / viewport.height) + '%';
+          link.addEventListener('click', function () { void followPageLink(ref, dest, link, generation).catch(function () {}); });
+          content.appendChild(link);
+        }
+      }
+      async function followPageLink(ref, dest, link, generation) {
+        if (disposed || generation !== renderGeneration || !link.isConnected) return;
+        var request = ++linkRequest;
+        function current() { return !disposed && generation === renderGeneration && request === linkRequest && link.isConnected; }
+        var index = await pdfDocument.getPageIndex(ref);
+        if (!current() || !Number.isSafeInteger(index) || index < 0 || index >= pageCount) return;
+        var target = await renderPage(index + 1);
+        if (!current() || !target || !target.canvas.isConnected) return;
+        var viewport = target.viewport;
+        var point = viewport.convertToViewportPoint(dest[2] ?? target.view[0], dest[3] ?? target.view[3]);
+        var rect = target.canvas.getBoundingClientRect(); var root = pages.getBoundingClientRect();
+        pages.scrollTo({ left: pages.scrollLeft + rect.left - root.left + Math.max(0, Math.min(viewport.width, point[0])) * rect.width / viewport.width,
+          top: pages.scrollTop + rect.top - root.top + Math.max(0, Math.min(viewport.height, point[1])) * rect.height / viewport.height });
+        currentPage = index + 1;
+        emit(currentState, null);
       }
       function renderVisiblePages() {
         if (disposed || !pdfDocument) return;
@@ -422,7 +511,7 @@ export function buildMobilePdfViewerHtml({
       function resetRenderedPages() {
         renderGeneration += 1; renderTasks.forEach(function (task) { task.cancel(); }); renderTasks.clear();
         rendered.clear(); seen.clear(); resident = [];
-        document.querySelectorAll('.page canvas').forEach(function (canvas) { canvas.width = 1; canvas.height = 1; canvas.remove(); });
+        document.querySelectorAll('.page-content').forEach(removePageContent);
         renderVisiblePages(); emit(seen.size === pageCount ? 'complete' : 'rendering', null);
       }
       async function openDocument(data) {
@@ -439,7 +528,10 @@ export function buildMobilePdfViewerHtml({
           section.dataset.page = String(pageNumber); section.setAttribute('aria-label', text(labels.page, { page: pageNumber, pages: pageCount }));
           var label = document.createElement('span'); label.className = 'page-label'; label.textContent = String(pageNumber) + ' / ' + String(pageCount); section.appendChild(label); fragment.appendChild(section);
         }
-        currentPage = 1; pages.replaceChildren(fragment); emit('document', null);
+        currentPage = Math.min(${initialPosition.page}, pageCount);
+        pages.replaceChildren(fragment);
+        if (currentPage > 1) document.getElementById('page-' + String(currentPage))?.scrollIntoView({ block: 'start' });
+        emit('document', null);
         if (typeof IntersectionObserver === 'function') {
           observer = new IntersectionObserver(function (entries) { entries.forEach(function (entry) { if (entry.isIntersecting) void renderPage(Number(entry.target.dataset.page)); }); },
             { root: pages, rootMargin: '100% 0px', threshold: 0.01 });
@@ -457,7 +549,8 @@ export function buildMobilePdfViewerHtml({
       async function dispose() {
         if (disposed) return; disposed = true; bytes = null; resourceCache = Object.create(null);
         if (observer) observer.disconnect(); observer = null; renderTasks.forEach(function (task) { task.cancel(); }); renderTasks.clear();
-        document.querySelectorAll('canvas').forEach(function (canvas) { canvas.width = 1; canvas.height = 1; });
+        document.querySelectorAll('.page-content').forEach(removePageContent);
+        rendered.clear();
         try { if (loadingTask) await loadingTask.destroy(); else if (pdfDocument) await pdfDocument.destroy(); } catch (_) {}
         loadingTask = null; pdfDocument = null; pages.replaceChildren();
       }
@@ -470,6 +563,7 @@ export function buildMobilePdfViewerHtml({
           if (command.command === 'zoom-in') { fit = false; zoom = Math.min(3, Math.round((zoom + 0.25) * 100) / 100); resetRenderedPages(); return; }
           if (command.command === 'page-previous' || command.command === 'page-next') {
             if (!pageCount) return;
+            linkRequest += 1;
             currentPage = Math.max(1, Math.min(pageCount,
               (currentPage || 1) + (command.command === 'page-next' ? 1 : -1)));
             document.getElementById('page-' + String(currentPage))?.scrollIntoView({ block: 'start' });
@@ -534,6 +628,13 @@ function safeCurrentPage(value: unknown, pageCount: number): value is number {
   return Number.isSafeInteger(value) && (pageCount === 0
     ? value === 0
     : (value as number) >= 1 && (value as number) <= pageCount);
+}
+
+function pdfReadingPosition(page: unknown, zoomPercent: unknown, fitToWidth: unknown): MobilePdfReadingPosition | undefined {
+  if (!safeCurrentPage(page, mobilePdfViewerLimits.maximumPageCount) || typeof zoomPercent !== "number" ||
+    !Number.isSafeInteger(zoomPercent) || zoomPercent < 50 || zoomPercent > 300 || zoomPercent % 25 !== 0 ||
+    typeof fitToWidth !== "boolean" || (fitToWidth && zoomPercent !== 100)) return undefined;
+  return { page, zoomPercent, fitToWidth };
 }
 
 function pdfAckCommand(value: unknown): value is MobilePdfViewerAck["command"] {

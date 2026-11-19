@@ -69,6 +69,8 @@ import type {
   DesktopOpenFileWithAppRequest,
   DesktopRevealArtifactSourceRequest,
   DesktopRevealArtifactSourceResult,
+  DesktopWorkspaceFileSourceRequest,
+  DesktopWorkspaceFileSourceResult,
   DesktopRuntimeProcessMonitorOpenResult,
   DesktopRuntimeProcessMonitorBackend,
   DesktopRuntimeProcessMonitorOwner,
@@ -253,6 +255,8 @@ const DESKTOP_CHANNELS = {
   openFileWithApp: "joko:files:open-with:open",
   revealArtifactSource: "joko:files:reveal-artifact-source",
   cancelArtifactSourceReveal: "joko:files:reveal-artifact-source-cancel",
+  openWorkspaceFileSource: "joko:files:open-workspace-source",
+  cancelWorkspaceFileSource: "joko:files:open-workspace-source-cancel",
   credentialGet: "joko:credential:get",
   credentialSet: "joko:credential:set",
   credentialDelete: "joko:credential:delete",
@@ -343,6 +347,7 @@ const desktopCapabilities = Object.freeze([
   ...((process.platform === "win32" || process.platform === "darwin") ? ["files.draftThumbnail" as const] : []),
   ...(openWithDocumentOccurrence === undefined ? [] : ["files.openWith" as const]),
   "files.revealSource",
+  "files.openWorkspaceSource",
   "hardware.dedicatedInput",
   ...(nativeGamepadDocumentOccurrence === undefined ? [] : ["hardware.nativeGamepad" as const]),
   "layout.reset",
@@ -1152,6 +1157,12 @@ const desktopApi = Object.freeze({
       return Promise.reject(new TypeError("The Artifact source reveal identity is invalid."));
     }
     return ipcRenderer.invoke(DESKTOP_CHANNELS.cancelArtifactSourceReveal, requestId).then(() => undefined);
+  },
+  openWorkspaceFileSource: (request: DesktopWorkspaceFileSourceRequest): Promise<DesktopWorkspaceFileSourceResult> =>
+    ipcRenderer.invoke(DESKTOP_CHANNELS.openWorkspaceFileSource, request).then(parseWorkspaceFileSourceResult),
+  cancelWorkspaceFileSource: (requestId: string): Promise<void> => {
+    if (!isNativeFileActionRequestId(requestId)) return Promise.reject(new TypeError("The Workspace PDF action identity is invalid."));
+    return ipcRenderer.invoke(DESKTOP_CHANNELS.cancelWorkspaceFileSource, requestId).then(() => undefined);
   },
   discovery: Object.freeze({
     scan: (): Promise<readonly DesktopDiscoveredNode[]> => ipcRenderer.invoke(DESKTOP_CHANNELS.discoveryScan)
@@ -2548,6 +2559,16 @@ function isDesktopRevealArtifactSourceRequest(value: unknown): value is DesktopR
 
 function isOpaqueFileActionIdentity(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/u.test(value);
+}
+
+function parseWorkspaceFileSourceResult(value: unknown): DesktopWorkspaceFileSourceResult {
+  if (typeof value === "object" && value !== null && !Array.isArray(value) && Object.keys(value).join() === "status") {
+    const { status } = value as Record<string, unknown>;
+    if (status === "opened" || status === "revealed" || status === "cancelled" || status === "unavailable" || status === "failed") {
+      return { status };
+    }
+  }
+  throw new TypeError("Invalid Workspace PDF action result.");
 }
 
 function parseArtifactSourceRevealResult(value: unknown): DesktopRevealArtifactSourceResult {
