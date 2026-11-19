@@ -21287,12 +21287,15 @@ async function dispatchMutation(
               ...(providerId === "" ? {} : { providerId }), automatic: payload.value.automatic
             });
           } else {
+            const assertRefreshCurrent = () => { dependencies.connections.fence(connection); };
+            assertRefreshCurrent();
             const entries = dependencies.providers!.listManaged(backendId).filter((entry) => providerId === "" || entry.provider.id === providerId);
             for (const entry of entries) {
               if (!dependencies.providers!.canDiscoverProviderModels(backendId, entry.provider.id)) continue;
-              try { await dependencies.providers!.discoverProviderModels(backendId, entry.provider.id); }
+              try { await dependencies.providers!.discoverProviderModels(backendId, entry.provider.id, undefined, assertRefreshCurrent); }
               catch (error) { if (!payload.value.automatic) throw error; }
             }
+            assertRefreshCurrent();
             await dependencies.refreshBackendDescriptor?.(backendId);
           }
           dependencies.messageSearch?.reconcileAvailability();

@@ -1649,7 +1649,8 @@ export class ProviderCatalogManager {
   async discoverProviderModels(
     backendId: string,
     providerId: string,
-    fetchImpl: typeof fetch = fetch
+    fetchImpl: typeof fetch = fetch,
+    assertAuthorityCurrent?: () => void
   ): Promise<ProviderModelDiscoveryResult> {
     this.#assertInitialized();
     const normalized = managedProviderKey(backendId, providerId);
@@ -1660,6 +1661,7 @@ export class ProviderCatalogManager {
     const spec = this.#modelDiscoverySpec(captured);
     const credentialGenerations = [...new Set(Object.values(captured.credentialBindings))]
       .map(reference => ({ reference, generation: this.#credentials.find(reference)?.generation }));
+    assertAuthorityCurrent?.();
     const discovered = await fetchProviderModels({ ...spec, includeNonChat: true }, fetchImpl);
     return this.#mutate(async () => {
       const current = this.#entries.get(normalized);
@@ -1712,6 +1714,7 @@ export class ProviderCatalogManager {
         updatedAt: this.#now()
       };
       validateProviderEntry(next);
+      assertAuthorityCurrent?.();
       this.#entries.set(normalized, next);
       await this.#bumpAndPersist(() => this.#entries.set(normalized, current));
       return {

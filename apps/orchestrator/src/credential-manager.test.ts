@@ -686,7 +686,7 @@ describe("ProviderCatalogManager", () => {
     } finally { store.close(); }
   });
 
-  it.each(["configuration", "credential"] as const)("rejects a late model refresh after the original %s changes", async change => {
+  it.each(["configuration", "credential", "connection"] as const)("rejects a late model refresh after the original %s changes", async change => {
     const { store, credentials } = await fixture();
     const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" }); providers.initialize();
     const saveKey = async (secret: string) => {
@@ -701,16 +701,19 @@ describe("ProviderCatalogManager", () => {
     let entered!: () => void;
     const started = new Promise<void>(resolve => { entered = resolve; });
     const held = new Promise<void>(resolve => { finish = resolve; });
-    const pending = providers.discoverProviderModels("pi", "catalog", (async () => { entered(); await held; return Response.json({ data: [{ id: "late-model" }] }); }) as typeof fetch);
+    let authorityCurrent = true;
+    const assertCurrent = () => { if (!authorityCurrent) throw new Error("Provider refresh connection changed."); };
+    const pending = providers.discoverProviderModels("pi", "catalog", (async () => { entered(); await held; return Response.json({ data: [{ id: "late-model" }] }); }) as typeof fetch, assertCurrent);
     try {
       await started;
       const original = providers.get("pi", "catalog");
       if (change === "credential") await saveKey("replacement-key-value");
+      else if (change === "connection") authorityCurrent = false;
       else await providers.upsertConfiguration({ providerId: "catalog", displayName: "Changed", kind: "custom_endpoint", enabled: true,
         expectedVersion: original.version, runtimes: [{ backendId: "pi", credentialOrigin: "https://catalog.example.test",
           credentialBindings: { CATALOG_KEY: "catalog-key" }, provider: original.provider }] });
       finish();
-      await expect(pending).rejects.toThrow(/changed during model catalog refresh/u);
+      await expect(pending).rejects.toThrow(change === "connection" ? "Provider refresh connection changed." : /changed during model catalog refresh/u);
       expect(providers.get("pi", "catalog").provider.models.map(model => model.id)).toEqual(["manual"]);
       const restored = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" }); restored.initialize();
       expect(restored.get("pi", "catalog").provider.models.map(model => model.id)).toEqual(["manual"]);
