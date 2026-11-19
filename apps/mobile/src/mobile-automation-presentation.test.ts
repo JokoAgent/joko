@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MOBILE_SUPPORTED_LOCALES } from "./mobile-locale-preference";
-import type { MobileAutomationRun, MobileAutomationSchedule } from "./mobile-automation";
+import type { MobileAutomationMoney, MobileAutomationRun, MobileAutomationSchedule } from "./mobile-automation";
 import {
   formatMobileAutomationCost,
   formatMobileAutomationDate,
@@ -106,7 +106,13 @@ describe("mobile Automation presentation", () => {
     expect(formatMobileAutomationDuration(250, "ja")).toBe("250 ミリ秒");
     expect(formatMobileAutomationDuration(65_400, "ko")).toBe("1분 5초");
     expect(formatMobileAutomationCost(run, "zh-CN")).toBe("成本 ≈1.25 USD · 混合");
-    const estimatedValue = { amountMicros: 30_000n, currencyCode: "USD", approximate: true };
+    const estimatedValue: MobileAutomationMoney = {
+      amountMicros: 30_000n,
+      currencyCode: "USD",
+      approximate: true,
+      kind: "value-estimate",
+      estimateReasons: []
+    };
     expect(formatMobileAutomationCost({ ...run, cost: undefined, estimatedValue }, "zh-CN")).toBe("估算价值 ≈0.03 USD · 混合");
     expect(formatMobileAutomationCost({ ...run, estimatedValue }, "en")).toBe("Cost ≈1.25 USD · Estimated value ≈0.03 USD · mixed");
     expect(formatMobileAutomationCost({ ...run, cost: undefined, zeroCost: true, costAttribution: "zero" }, "ja"))
