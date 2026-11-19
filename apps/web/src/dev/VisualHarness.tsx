@@ -1898,6 +1898,9 @@ export function VisualHarness(): JSX.Element {
       }],
       listBrowserTransfers: async () => [],
       listBrowserDownloads: async () => [],
+      cancelBrowserDownload: async (browserId: string, pageId: string, transferId: string) => {
+        record(`browser-cancel-download:${browserId}:${pageId}:${transferId}`);
+      },
       updateBrowserCommentDesign: async () => [],
       installComputerAutomation: async (): Promise<void> => {
         record("automation-computer:install");

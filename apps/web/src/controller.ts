@@ -4171,6 +4171,7 @@ export function useAppController(): AppController {
     ),
     focusBrowserPage: (browserId, pageId) => gateway().focusBrowserPage(browserId, pageId),
     closeBrowserPage: (browserId, pageId) => gateway().closeBrowserPage(browserId, pageId),
+    cancelBrowserDownload: (browserId, pageId, transferId) => gateway().cancelBrowserDownload(browserId, pageId, transferId),
     beginBrowserTakeover: (browserId, pageId) => gateway().beginBrowserTakeover(browserId, pageId),
     endBrowserTakeover: (browserId) => gateway().endBrowserTakeover(browserId),
     performBrowserTakeoverAction: (browserId, pageId, action) => gateway().performBrowserTakeoverAction(browserId, pageId, action),

@@ -2,7 +2,9 @@ import { createHash } from "node:crypto";
 
 import type {
   AdapterEventMetadata,
+  BlobRef,
   EventPayload,
+  NativeSessionBinding,
   NativeHistoryProjection as AdapterNativeHistoryProjection
 } from "@joko/core";
 import {
@@ -10,7 +12,9 @@ import {
   NATIVE_HISTORY_ASSISTANT_STREAM_FIELD,
   NATIVE_HISTORY_ASSISTANT_TOOL_RESULT_FIELD,
   NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD,
+  NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD,
   NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
+  NATIVE_HISTORY_USER_IMAGES_FIELD,
   isNativeNavigationTarget,
   nativeHistoryEventContext,
   withNativeHistoryEventContext
@@ -109,6 +113,71 @@ export function nativeHistoryReplayMetadata(
     observed.has(field) && Object.hasOwn(recorded.fields, field) && typeof recorded.fields[field] === typeof value
       ? recorded.fields[field]! : value
   ])) };
+}
+
+function observedCodexMarker(binding: NativeSessionBinding, marker: PersistedEvent | undefined): PersistedEvent | undefined {
+  if (marker?.payload.type !== "native_session_changed" || marker.payload.opaqueRef !== binding.opaqueRef
+    || marker.payload.nativeSessionId !== binding.nativeSessionId || marker.generation > binding.generation
+    || marker.metadata?.namespace !== "codex.native_history") return undefined;
+  return marker;
+}
+
+export function observedNativeUserImages(binding: NativeSessionBinding, candidate: PersistedEvent | undefined):
+  readonly (readonly [entryId: string, blockIndex: number, blob: BlobRef])[] {
+  const encoded = observedCodexMarker(binding, candidate)?.metadata?.fields[NATIVE_HISTORY_USER_IMAGES_FIELD];
+  const values = parseObservedEntries(encoded);
+  return values.filter((value): value is [string, number, BlobRef] => {
+    if (!Array.isArray(value) || value.length !== 3 || typeof value[0] !== "string" || value[0].length === 0
+      || !Number.isSafeInteger(value[1]) || value[1] < 0) return false;
+    const blob: unknown = value[2];
+    if (typeof blob !== "object" || blob === null) return false;
+    const record = blob as Record<string, unknown>;
+    return typeof record["id"] === "string" && record["id"].length > 0
+      && typeof record["sha256"] === "string" && /^[0-9a-f]{64}$/u.test(record["sha256"])
+      && typeof record["byteLength"] === "number" && Number.isSafeInteger(record["byteLength"]) && record["byteLength"] > 0
+      && record["mimeType"] === "image/png" && typeof record["fileName"] === "string";
+  });
+}
+
+function parseObservedEntries(encoded: string | number | boolean | undefined): readonly unknown[] {
+  if (typeof encoded !== "string") return [];
+  try {
+    const values: unknown = JSON.parse(encoded);
+    return Array.isArray(values) ? values : [];
+  } catch { return []; }
+}
+
+/** Present current native observations through the immutable original User Event. */
+export function withObservedNativeUserPresentation(event: PersistedEvent, binding: NativeSessionBinding | undefined,
+  findMarker: () => PersistedEvent | undefined): PersistedEvent {
+  const payload = event.payload;
+  if (payload.type !== "message_complete" || payload.role !== "user" || binding === undefined
+    || event.generation > binding.generation || event.metadata?.namespace !== "codex.native_history"
+    || event.metadata.fields["nativeHydration"] !== true) return event;
+  const identity = payload.nativeHistory?.identity;
+  if (identity === undefined) return event;
+  const marker = observedCodexMarker(binding, findMarker());
+  if (marker === undefined || marker.sessionId !== event.sessionId || marker.generation < event.generation
+    || marker.backendId !== event.backendId || marker.targetId !== event.targetId || marker.globalCursor < event.globalCursor
+    || event.metadata.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] !== nativeBindingFingerprint(binding.opaqueRef)) return event;
+  const rewindBefore = identity.rewindBefore === undefined && identity.parentEntryId !== undefined
+    && parseObservedEntries(marker.metadata?.fields[NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD]).some((anchor) =>
+      Array.isArray(anchor) && anchor.length === 2 && anchor[0] === identity.entryId && anchor[1] === identity.parentEntryId)
+    ? { kind: "native_entry" as const, entryId: identity.parentEntryId } : undefined;
+  const images = new Map<number, BlobRef>();
+  if (event.runId === undefined && payload.acceptedInput === undefined && payload.partnerPrivateOrigin === undefined) {
+    for (const [entryId, blockIndex, blob] of observedNativeUserImages(binding, marker)) {
+      if (entryId === identity.entryId) images.set(blockIndex, blob);
+    }
+  }
+  if (rewindBefore === undefined && images.size === 0) return event;
+  return { ...event, payload: { ...payload,
+    ...(rewindBefore === undefined ? {} : { nativeHistory: { ...payload.nativeHistory, identity: { ...identity, rewindBefore } } }),
+    ...(images.size === 0 ? {} : { blocks: payload.blocks.map((block, blockIndex) => {
+      const blob = images.get(blockIndex);
+      return blob !== undefined && block.kind === "text" && block.text === "[Image input]" ? { kind: "image" as const, blob } : block;
+    }) })
+  } };
 }
 
 export function observedClaudeAssistantInputEntry(

@@ -1,4 +1,6 @@
+import { once } from "node:events";
 import { existsSync } from "node:fs";
+import { createServer } from "node:http";
 import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import { BrowserAutomationTarget, BrowserTakeoverActionMutationSchema, BrowserTakeoverMouseButton, OperationMutationSchema,
@@ -86,6 +88,90 @@ browserIt("removes a closed native external tab from Owner recovery and preserve
 });
 
 const sidebarExecutable = executable ?? chromium.executablePath();
+it.skipIf(!existsSync(sidebarExecutable))("cancels exactly the Owner's in-flight native download before artifact ingest", { timeout: 75_000 }, async () => {
+  let disconnected = false;
+  const server = createServer((request, response) => {
+    if (request.url === "/") {
+      response.writeHead(200, { "Content-Type": "text/html" }).end('<a href="/report">Download report</a>');
+      return;
+    }
+    if (request.url !== "/report") {
+      response.writeHead(404).end();
+      return;
+    }
+    response.once("close", () => { disconnected = !response.writableEnded; });
+    response.writeHead(200, { "Content-Disposition": 'attachment; filename="slow-report.txt"',
+      "Content-Type": "application/octet-stream", "Content-Length": 128 * 1024 });
+    response.write(Buffer.alloc(32 * 1024, 0x4a));
+  });
+  let fixture: RealPiSystemFixture | undefined;
+  try {
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("The download server has no address.");
+    fixture = await RealPiSystemFixture.start({ externalBrowserExecutable: sidebarExecutable });
+    const provider = fixture.application.browser;
+    if (provider === undefined) throw new Error("The sidebar Browser Provider was not configured.");
+    const owner = await fixture.pair("Download Owner");
+    const other = await fixture.pair("Other Browser Device");
+    const mutate = (payload: NonNullable<MessageInitShape<typeof OperationMutationSchema>["payload"]>) =>
+      submit(owner.clients.operation, owner.connectionId, create(OperationMutationSchema, { payload }));
+    expect((await mutate({ case: "updateBrowserSettings", value: { patch: {
+      browserProviderId: provider.id, automationTarget: BrowserAutomationTarget.SIDEBAR
+    } } })).state).toBe(OperationState.SUCCEEDED);
+    const sessionId = sessionIdFrom(await submit(owner.clients.operation, owner.connectionId, createSessionMutation({
+      backendId: "pi", targetId: "workspace-real-pi", displayName: "Download task", providerId: REAL_PI_PROVIDER_ID,
+      modelId: REAL_PI_MODEL_ID, effortId: "off"
+    })));
+    expect((await mutate({ case: "openBrowserPage", value: {
+      browserProviderId: provider.id, sessionId, expectedGeneration: BigInt(provider.generation),
+      url: `http://127.0.0.1:${address.port}/`, presentationTarget: BrowserAutomationTarget.SIDEBAR
+    } })).state).toBe(OperationState.SUCCEEDED);
+    const source = provider.currentHumanTakeover();
+    if (source === undefined) throw new Error("The original Browser page has no active takeover.");
+    const page = await provider.runHumanTakeoverOperation(source, async original => original);
+    const link = page.getByRole("link", { name: "Download report" });
+    const [box, viewport] = [await link.boundingBox(), page.viewportSize()];
+    if (box === null || viewport === null) throw new Error("The original download link is not available.");
+    const fence = { browserProviderId: provider.id, pageId: source.pageId, takeoverId: source.takeoverId, generation: BigInt(source.generation) };
+    const artifactsBefore = fixture.application.store.listArtifacts({ limit: 100 });
+    expect((await mutate({ case: "browserTakeoverAction", value: { ...fence, action: { case: "mouseClick", value: {
+      normalizedX: (box.x + box.width / 2) / (viewport.width - 1),
+      normalizedY: (box.y + box.height / 2) / (viewport.height - 1), button: BrowserTakeoverMouseButton.PRIMARY
+    } } } })).state).toBe(OperationState.SUCCEEDED);
+    const read = async () => (await owner.clients.browser.listBrowserTransfers({ browserProviderId: provider.id,
+      pageId: source.pageId, direction: TransferDirection.DOWNLOAD })).transfers;
+    const running = (await waitFor(read, records => records.some(record => record.cancellable && record.fileName === "slow-report.txt"),
+      "the live Browser transfer before the HTTP response completes"))[0]!;
+    expect(running).toMatchObject({ fileName: "slow-report.txt", state: BrowserTransferState.RUNNING, cancellable: true });
+    expect(running.blob).toBeUndefined();
+    const cancel = create(OperationMutationSchema, { payload: { case: "cancelBrowserDownload",
+      value: { ...fence, browserTransferId: running.browserTransferId } } });
+    await expect(submit(other.clients.operation, other.connectionId, cancel)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    expect(disconnected).toBe(false);
+    expect(await read()).toEqual([running]);
+    const operationId = "cancel-original-browser-download";
+    const submitted = await submit(owner.clients.operation, owner.connectionId, cancel, operationId);
+    expect(submitted.state).toBe(OperationState.SUCCEEDED);
+    expect(await submit(owner.clients.operation, owner.connectionId, cancel, operationId))
+      .toMatchObject({ operationId, state: OperationState.SUCCEEDED, result: submitted.result });
+    await waitFor(async () => disconnected, value => value, "the original native HTTP connection to be cancelled");
+    const [cancelled] = await read();
+    expect(cancelled).toMatchObject({ browserTransferId: running.browserTransferId, fileName: running.fileName,
+      state: BrowserTransferState.CANCELLED, cancellable: false });
+    expect(cancelled?.blob).toBeUndefined();
+    expect(cancelled?.artifact).toBeUndefined();
+    expect(new OperationalBrowserState(fixture.application.store).list(provider.id)).toMatchObject([
+      { id: running.browserTransferId, fileName: running.fileName, state: BrowserTransferState.CANCELLED }
+    ]);
+    expect(fixture.application.store.listArtifacts({ limit: 100 })).toEqual(artifactsBefore);
+  } finally {
+    server.closeAllConnections();
+    await Promise.all([fixture?.close({ removeRoot: true }), new Promise<void>(resolve => server.close(() => resolve()))]);
+  }
+});
+
 it.skipIf(!existsSync(sidebarExecutable))("adopts a native same-origin sidebar popup for the exact task and lets its Owner focus it", { timeout: 75_000 }, async () => {
   const fixture = await RealPiSystemFixture.start({ externalBrowserExecutable: sidebarExecutable });
   try {

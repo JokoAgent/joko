@@ -72,6 +72,35 @@ async function publicationFixture() {
 }
 
 describe("ArtifactStore publication", () => {
+  it("retains both original Browser download names after two staged copies fail and the ledger is reopened", async () => {
+    const f = await publicationFixture();
+    const provider = { generation: 7, acquireAgentLease: vi.fn(), releaseAgentLease: vi.fn(), uploadFiles: vi.fn(), recover: vi.fn() };
+    const repository = new OperationalBrowserState(f.store);
+    const transfers = new BrowserTransferCoordinator({ artifacts: f.artifacts, provider, repository });
+    const names = ["first-report.txt", "second-report.txt"];
+    publicationFaults.copied = async () => { throw new Error("Fixture copy failure"); };
+    const original = [];
+    for (const fileName of names) {
+      const source = join(f.directory, fileName);
+      await writeFile(source, `Original bytes for ${fileName}`);
+      original.push(await transfers.ingestDownload({ pageId: "page-7-1", generation: provider.generation, fileName,
+        assertCurrent: () => undefined, stage: async () => source, cancel: async () => undefined }));
+    }
+    expect(original.map(record => record.fileName)).toEqual(names);
+    const reopened = new BrowserTransferCoordinator({ artifacts: f.artifacts, provider, repository: new OperationalBrowserState(f.store) });
+    for (const record of original) {
+      const receipt = reopened.get(record.browserTransferId);
+      expect(receipt).toEqual(record);
+      expect(receipt).toMatchObject({ fileName: record.fileName, state: BrowserTransferState.FAILED,
+        error: { code: "BROWSER_DOWNLOAD_INGEST_FAILED" } });
+      expect(receipt?.blob).toBeUndefined();
+      expect(receipt?.artifact).toBeUndefined();
+      expect(receipt?.cancellable).toBe(false);
+    }
+    expect(f.store.listArtifacts({ limit: 100 })).toEqual([]);
+    expect(await readdir(join(f.directory, "artifacts", "incoming"))).toEqual([]);
+  });
+
   it("keeps a Browser download fenced when restart happens after the original bytes are staged", async () => {
     const f = await publicationFixture();
     const source = join(f.directory, "browser-download");
@@ -85,7 +114,8 @@ describe("ArtifactStore publication", () => {
       async recover() { this.generation += 1; } };
     const repository = new OperationalBrowserState(f.store);
     const transfers = new BrowserTransferCoordinator({ artifacts: f.artifacts, provider, repository });
-    const ingesting = transfers.ingestDownload("page-7-1", source, "report.txt");
+    const ingesting = transfers.ingestDownload({ pageId: "page-7-1", generation: provider.generation, fileName: "report.txt",
+      assertCurrent: () => undefined, stage: async () => source, cancel: async () => undefined });
     try {
       await Promise.race([afterCopy, ingesting.then(() => { throw new Error("The Browser ingest did not reach the staged copy."); })]);
       const incoming = join(f.directory, "artifacts", "incoming");

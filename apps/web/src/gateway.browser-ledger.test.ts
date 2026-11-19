@@ -47,7 +47,9 @@ describe("Browser ledger gateway", () => {
                   browserProviderId: "browser-one",
                   pageId: "page-one",
                   direction: TransferDirection.DOWNLOAD,
-                  state: BrowserTransferState.COMPLETED
+                  state: BrowserTransferState.RUNNING,
+                  fileName: "original-report.pdf",
+                  cancellable: true
                 }],
                 page: { nextPageToken: "transfer-2", totalSize: 2n }
               }
@@ -77,7 +79,7 @@ describe("Browser ledger gateway", () => {
     await expect(gateway.listBrowserActivity("browser-one", "page-one"))
       .resolves.toMatchObject([{ id: "activity-new" }, { id: "activity-old" }]);
     await expect(gateway.listBrowserTransfers("browser-one", "page-one"))
-      .resolves.toMatchObject([{ id: "transfer-new" }, { id: "transfer-old" }]);
+      .resolves.toMatchObject([{ id: "transfer-new", fileName: "original-report.pdf", cancellable: true }, { id: "transfer-old" }]);
     expect(activityTokens).toEqual(["", "activity-2"]);
     expect(transferTokens).toEqual(["", "transfer-2"]);
     expect((transport.unary as any).mock.calls

@@ -252,6 +252,7 @@ message OperationMutation {
     UpdateModelFavoritesMutation update_model_favorites = 223;
     ConsumeProviderAccountResetMutation consume_provider_account_reset = 232;
     UpdateProviderAccountResetSettingsMutation update_provider_account_reset_settings = 233;
+    CancelBrowserDownloadMutation cancel_browser_download = 234;
   }
 }
 
@@ -1564,6 +1565,14 @@ message CloseBrowserPageMutation {
   string current_page_id = 3;
   string takeover_id = 4;
   uint64 generation = 5;
+}
+
+message CancelBrowserDownloadMutation {
+  string browser_provider_id = 1;
+  string page_id = 2;
+  string takeover_id = 3;
+  uint64 generation = 4;
+  string browser_transfer_id = 5;
 }
 
 message BeginBrowserTakeoverMutation {

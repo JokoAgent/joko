@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import { create, fromBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, type JsonObject } from "@bufbuild/protobuf";
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { createCodexAdapter, AppServerHost, TransportFault } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
@@ -16,14 +16,19 @@ import { expect, it, vi } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import {
-  abortRunMutation, createManualScheduleMutation, createSessionMutation, pauseQueueMutation, queueRunIdFrom, resumeQueueMutation,
+  abortRunMutation, createManualScheduleMutation, createSessionMutation, navigateMutation, pauseQueueMutation, queueRunIdFrom, resumeQueueMutation,
   retryRunMutation, runIdFrom, scheduleIdFrom, sendInputMutation, sessionIdFrom, submit, triggerScheduleMutation
 } from "./operations.js";
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
   ? it : it.skip;
 
-it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog task without a cold executable", async (mode) => {
+it.each([
+  { mode: "legacy", inlinePng: "none", name: "reads the original legacy Codex catalog task without a cold executable" },
+  { mode: "paginated", inlinePng: "none", name: "reads the original paginated Codex catalog task without a cold executable" },
+  { mode: "paginated", inlinePng: "fresh", name: "restores the original inline PNG in the formal Codex catalog task" },
+  { mode: "paginated", inlinePng: "existing", name: "restores the original inline PNG for an immutable pre-upgrade Codex User Event" }
+] as const)("$name", async ({ mode, inlinePng }) => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-offline-catalog-")));
   const profileDirectory = join(root, "codex-home");
   const backendId = "codex-offline-catalog";
@@ -31,6 +36,7 @@ it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog t
   const turnId = "original-completed-turn";
   const question = "Which deliverables did we finish?";
   const answer = "We finished the review and release notes.";
+  const originalPng = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAD0lEQVR4nGPQSDlxIkUDAAlTAqltBY9kAAAAAElFTkSuQmCC", "base64");
   const native = new FakeCodexAppServer();
   native.codexHome = profileDirectory;
   let executablePresent = true;
@@ -51,7 +57,7 @@ it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog t
     }] });
     const cwd = join(root, "user-project");
     await mkdir(cwd);
-    const { clients, connectionId } = await fixture.pair("Local catalog Owner");
+    const { clients, connectionId, authKey } = await fixture.pair("Local catalog Owner");
     const project = await submit(clients.operation, connectionId, create(OperationMutationSchema, {
       payload: { case: "createTarget", value: create(CreateTargetMutationSchema, {
         backendId, displayName: "Original catalog project",
@@ -66,8 +72,10 @@ it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog t
     expect(trust.state).toBe(OperationState.SUCCEEDED);
     const store = fixture.application.store;
     expect(store.getTarget(targetId).descriptor).toMatchObject({ managed: false, trusted: true, workspaceRoot: cwd });
+    const originalInput: Record<string, string | []>[] = [{ type: "text", text: question, text_elements: [] }];
+    if (inlinePng !== "none") originalInput.push({ type: "image", url: `data:image/png;base64,${originalPng.toString("base64")}` });
     const seeded = native.seedThread(cwd, [{ id: turnId, status: "completed", items: [
-      { id: "original-user", type: "userMessage", content: [{ type: "text", text: question, text_elements: [] }] },
+      { id: "original-user", type: "userMessage", content: originalInput },
       { id: "original-assistant", type: "agentMessage", text: answer, phase: null, memoryCitation: null, delivery: null }
     ] }]);
     native.threads.set(threadId, { ...native.threads.get(seeded)!, id: threadId });
@@ -83,7 +91,7 @@ it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog t
       }] } },
       ...(mode === "legacy" ? [event("user_message", { message: question }), event("agent_message", { message: answer })] : [
         event("item_completed", { thread_id: threadId, turn_id: turnId,
-          item: { type: "UserMessage", id: "original-user", content: [{ type: "text", text: question, text_elements: [] }] } }),
+          item: { type: "UserMessage", id: "original-user", content: originalInput } }),
         event("item_completed", { thread_id: threadId, turn_id: turnId,
           item: { type: "AgentMessage", id: "original-assistant", content: [{ type: "Text", text: answer }] } })
       ]),
@@ -134,7 +142,7 @@ it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog t
     for (const read of readers) {
       const visible = await read();
       expect(failedStarts, `${read.name} must not start the cold executable`).toBe(startsBeforeReading);
-      expect(messages(visible)).toMatchObject([
+      expect(messages(visible)).toMatchObject(inlinePng !== "none" ? [] : [
         { case: "messageStarted", value: { role: MessageRole.USER, userInputAccepted: false,
           userInput: { parts: [{ content: { case: "text", value: question } }] } } },
         { case: "messageCompleted", value: { role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: answer } }] } }
@@ -144,11 +152,56 @@ it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog t
     expect(await readFile(rollout, "utf8")).toBe(sourceBytes);
 
     executablePresent = true;
+    const rawUser = () => store.listEvents({ sessionId, messageCompleteOnly: true }).find((event) =>
+      event.payload.type === "message_complete" && event.payload.role === "user" && event.payload.nativeHistory?.identity?.entryId === "original-user");
+    let beforeRepair: ReturnType<typeof rawUser>;
+    if (inlinePng === "existing") {
+      const oldProjection = vi.spyOn(store, "findNativeCatalogCreation").mockReturnValue(undefined);
+      try {
+        await clients.session.listRuntimeCommands({ sessionId });
+        beforeRepair = rawUser();
+        expect(beforeRepair?.payload).toMatchObject({ blocks: [{ kind: "text", text: question }, { kind: "text", text: "[Image input]" }] });
+        expect(store.countArtifacts({ sessionId })).toBe(0);
+        await fixture.application.sessionHost.closeIfActive(sessionId);
+      } finally { oldProjection.mockRestore(); }
+    }
     await clients.session.listRuntimeCommands({ sessionId });
     const canonical = messages(await timeline());
     expect(canonical.map(message => message.value.nativeIdentity?.entryId)).toEqual(["original-user", "original-assistant"]);
     expect(messages(await snapshot())).toEqual(canonical);
-    expect(store.listEvents({ sessionId }).some(event => event.payload.type === "history_pruned")).toBe(true);
+    if (inlinePng === "none") {
+      expect(store.listEvents({ sessionId }).some(event => event.payload.type === "history_pruned")).toBe(true);
+      return;
+    }
+
+    const user = canonical[0];
+    if (user?.case !== "messageStarted") throw new Error("The original User Message is missing.");
+    const parts = user.value.userInput?.parts;
+    expect(parts?.map(part => part.content.case)).toEqual(["text", "image"]);
+    expect(parts?.[0]?.content).toEqual({ case: "text", value: question });
+    const image = parts?.[1]?.content;
+    if (image?.case !== "image" || image.value.blob === undefined) throw new Error("The original PNG is missing.");
+    const blob = image.value.blob;
+    expect(user.value.userInputAccepted).toBe(false);
+    expect(store.listQueueItems({ sessionId, includeCleared: true })).toEqual([]);
+    expect(store.listRuns({ sessionId })).toEqual([]);
+    expect(blob).toMatchObject({ mediaType: "image/png", byteSize: BigInt(originalPng.length),
+      sha256Hex: createHash("sha256").update(originalPng).digest("hex") });
+    expect(store.getArtifact(blob.blobId)).toMatchObject({ sessionId });
+    expect(rawUser()?.payload).toMatchObject({ blocks: [{ kind: "text", text: question }, { kind: "text", text: "[Image input]" }] });
+    if (beforeRepair !== undefined) expect(rawUser()).toEqual(beforeRepair);
+    const thumbnail = await clients.artifact.getImageThumbnail({ expectedSourceBlob: blob, maximumEdgePixels: 256 });
+    expect(thumbnail.sourceBlob).toEqual(blob);
+    expect(thumbnail.result).toMatchObject({ case: "thumbnail", value: { sourceWidthPixels: 2, sourceHeightPixels: 1 } });
+    const original = await clients.artifact.getBlobDownloadTicket({ blobId: blob.blobId });
+    const download = await fetch(`${fixture.baseUrl}${original.ticket!.relativeEndpoint}`, { headers: { authorization: `Bearer ${authKey}` } });
+    expect(download.status).toBe(200);
+    expect(Buffer.from(await download.arrayBuffer())).toEqual(originalPng);
+    await fixture.application.sessionHost.closeIfActive(sessionId);
+    await clients.session.listRuntimeCommands({ sessionId });
+    expect(messages(await timeline())).toEqual(canonical);
+    expect(store.countArtifacts({ sessionId })).toBe(1);
+    expect(await readFile(rollout, "utf8")).toBe(sourceBytes);
   } finally {
     await fixture?.close();
     await host.shutdown();
@@ -515,6 +568,83 @@ it("stops the original Codex Run before the first native turn write and leaves t
   }
 });
 
+it("keeps observed usage on the original Codex answer when a completed tool is the last interrupted item", async () => {
+  const backendId = "codex-interrupted-usage";
+  const native = new FakeCodexAppServer();
+  const host = new AppServerHost({ transportFactory: () => native.createTransport() });
+  let fixture: OrchestratorE2eFixture | undefined;
+  try {
+    fixture = await OrchestratorE2eFixture.start({ backendFactories: [{
+      instanceId: backendId, adapterKind: "codex", displayName: "Codex interrupted usage fixture",
+      create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host })
+    }] });
+    const { clients, connectionId, authKey } = await fixture.pair("Interrupted Codex usage owner");
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId,
+      createSessionMutation({ backendId, targetId: fixture.targetId(backendId) })));
+    const store = fixture.application.store;
+    const binding = store.getSession(sessionId).descriptor.binding;
+    const threadId = binding.nativeSessionId!;
+    const sent = await submit(clients.operation, connectionId,
+      sendInputMutation(sessionId, BigInt(binding.generation), "Check the working tree."));
+    const runId = queueRunIdFrom(sent);
+    await waitFor(async () => store.findQueueItemByRunId(sessionId, runId),
+      item => item?.state === "backend_accepted", "the accepted original Codex turn");
+    const thread = native.threads.get(threadId)!;
+    expect(thread.historyMode).toBe("paginated");
+    const turn = thread.turns[0]!;
+    const turnId = String(turn["id"]);
+    const assistant = { type: "agentMessage", id: "observed-codex-answer", text: "I have the first result.", phase: null };
+    const command = { type: "commandExecution", id: "observed-codex-command", command: "git status --short",
+      status: "completed", exitCode: 0, aggregatedOutput: "", durationMs: 1 };
+    const transport = native.transport!;
+    const report = (method: string, item: JsonObject) => transport.emitNotification(method, { threadId, turnId, item });
+    await report("item/started", { ...assistant, text: "" });
+    await transport.emitNotification("item/agentMessage/delta", { threadId, turnId, itemId: assistant.id, delta: assistant.text });
+    await report("item/completed", assistant);
+    await report("item/started", { ...command, status: "inProgress", exitCode: null });
+    await report("item/completed", command);
+    const originalItems = turn["items"];
+    expect(Array.isArray(originalItems)).toBe(true);
+    turn["items"] = [...(Array.isArray(originalItems) ? originalItems : []), assistant, command];
+    const sample = { totalTokens: 11, inputTokens: 8, outputTokens: 3, cachedInputTokens: 1, reasoningOutputTokens: 0 };
+    await transport.emitNotification("thread/tokenUsage/updated", {
+      threadId, turnId, tokenUsage: { total: sample, last: sample, modelContextWindow: 128_000 }
+    });
+    const originalUsage = (await waitFor(() => clients.run.getRun({ runId }),
+      ({ run }) => run?.usage?.usage?.totalTokens === 11n && run.usage.messageId === assistant.id,
+      "the exact usage on the original live answer")).run!.usage!;
+    const stop = await submit(clients.operation, connectionId, abortRunMutation(runId));
+    expect(stop.state, stop.error?.message).toBe(OperationState.SUCCEEDED);
+    expect(transport.requests.filter(request => request.method === "turn/interrupt").map(request => request.params))
+      .toEqual([{ threadId, turnId }]);
+    expect(turn["status"]).toBe("interrupted");
+    thread.status = { type: "idle" };
+    await transport.emitNotification("turn/completed", { threadId, turn });
+    const settled = (await waitFor(() => clients.run.getRun({ runId }),
+      ({ run }) => run?.state === RunState.ABORTED, "the original Codex interruption")).run!;
+    expect(settled.usage).toMatchObject({ usage: { totalTokens: 11n }, messageId: assistant.id });
+    expect(settled.usage!.completionEventId).not.toBe(originalUsage.completionEventId);
+
+    const reader = fixture.clients(authKey);
+    const scope = { kind: { case: "session" as const, value: { sessionId, recentTimelineItems: 200 } } };
+    const snapshot = (await reader.event.getSnapshot({ scope })).snapshot!;
+    expect(snapshot.runs.find(run => run.runId === runId)?.usage).toEqual(settled.usage);
+    for (const events of [snapshot.timeline, (await reader.session.listSessionTimeline({ sessionId })).events]) {
+      const assistantEvents = events.filter(event => event.payload?.kind.case === "messageCompleted"
+        && event.payload.kind.value.role === MessageRole.ASSISTANT);
+      expect(assistantEvents).toHaveLength(1);
+      expect(assistantEvents[0]).toMatchObject({ eventId: settled.usage!.completionEventId,
+        identity: { runId, operationId: sent.operationId }, payload: { kind: { value: {
+          nativeIdentity: { entryId: assistant.id }, messageId: assistant.id,
+          blocks: [{ content: { case: "text", value: assistant.text } }], turnUsage: settled.usage
+        } } } });
+    }
+  } finally {
+    await fixture?.close();
+    await host.shutdown();
+  }
+});
+
 it("holds the same Codex Objective when its interrupted native turn completes naturally", async () => {
   const backendId = "codex-objective-stop";
   const native = new FakeCodexAppServer();
@@ -653,6 +783,84 @@ it("honors a Codex schedule admitted before model disablement and rejects later 
     for (const run of history) expect(run).toMatchObject({ state: RunState.FAILED, error: { code: "TURN_OVERRIDE_MODEL_UNAVAILABLE" } });
     expect(turnStarts()).toHaveLength(1);
     expect(fixture.application.store.getSession(sessionId).descriptor.binding).toEqual(binding);
+  } finally {
+    await fixture?.close();
+    await host.shutdown();
+  }
+});
+
+it("rewinds the original Legacy Codex task through its completed native fork anchor", async () => {
+  const backendId = "codex-legacy-dialogue";
+  const native = new FakeCodexAppServer();
+  const host = new AppServerHost({ transportFactory: () => native.createTransport() });
+  let fixture: OrchestratorE2eFixture | undefined;
+  try {
+    fixture = await OrchestratorE2eFixture.start({ backendFactories: [{
+      instanceId: backendId, adapterKind: "codex", displayName: "Codex Legacy history",
+      create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host })
+    }] });
+    const { clients, connectionId } = await fixture.pair("Legacy task owner");
+    const store = fixture.application.store;
+    const targetId = fixture.targetId(backendId);
+    const cwd = store.getTarget(targetId).descriptor.workspaceRoot;
+    const completed = (id: string, user: string, assistant: string): JsonObject => ({ id, status: "completed", items: [
+      { type: "userMessage", id: `${id}-user`, content: [{ type: "text", text: user, text_elements: [] }] },
+      { type: "agentMessage", id: `${id}-assistant`, text: assistant, phase: null, memoryCitation: null, delivery: null }
+    ] });
+    const firstTurn = completed("original-turn-A", "Which checklist did we finish?", "The archive checklist.");
+    const laterTurn = completed("original-turn-U", "Can we draft another checklist?", "I can draft a new one.");
+    const threadId = native.seedThread(cwd, [firstTurn, laterTurn]);
+    native.threads.get(threadId)!.historyMode = "legacy";
+
+    const candidate = (await clients.session.discoverNativeSessions({ targetId })).sessions.find((session) => session.nativeSessionId === threadId);
+    if (candidate === undefined) throw new Error("The ordinary Legacy thread is missing from native discovery.");
+    const attach = createSessionMutation({ backendId, targetId, displayName: "Original Legacy task" });
+    if (attach.payload.case !== "createSession") throw new Error("Expected an attach mutation.");
+    attach.payload.value.nativeStart = create(NativeSessionStartSchema, { kind: {
+      case: "attach", value: { opaqueNativeReference: candidate.nativeReference }
+    } });
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId, attach));
+    await clients.session.listRuntimeCommands({ sessionId });
+    const binding = store.getSession(sessionId).descriptor.binding;
+    expect(binding.nativeSessionId).toBe(threadId);
+    const timeline = async () => (await clients.session.listSessionTimeline({ sessionId })).events;
+    const snapshot = async () => (await clients.event.getSnapshot({ scope: {
+      kind: { case: "session", value: { sessionId, recentTimelineItems: 200 } }
+    } })).snapshot!.timeline;
+    const userRows = (events: readonly Event[]) => events.flatMap((event) => {
+      const payload = event.payload?.kind;
+      return payload?.case === "messageStarted" && payload.value.role === MessageRole.USER ? [{ event, row: payload.value }] : [];
+    });
+    const rows = userRows(await timeline());
+    expect(rows.map(({ row }) => row.nativeIdentity?.entryId)).toEqual(["original-turn-A-user", "original-turn-U-user"]);
+    expect(rows[0]?.row.nativeIdentity?.rewindBefore).toBeUndefined();
+    const { event, row } = rows[1]!;
+    const boundary = row.nativeIdentity?.rewindBefore;
+    expect(boundary?.kind).toEqual({ case: "nativeEntryId", value: "original-turn-A-assistant" });
+    expect(userRows(await snapshot())[1]?.row.nativeIdentity?.rewindBefore).toEqual(boundary);
+    const recorded = store.findEvent(event.eventId);
+    expect(recorded?.payload).toMatchObject({ type: "message_complete", nativeHistory: { identity: { entryId: "original-turn-U-user" } } });
+    expect(recorded?.payload).not.toHaveProperty("nativeHistory.identity.rewindBefore");
+
+    const rewind = navigateMutation(sessionId, boundary!, BigInt(binding.generation));
+    if (rewind.payload.case !== "navigateSessionBranch") throw new Error("Expected a dialogue rewind.");
+    rewind.payload.value.sourceMessageId = row.messageId;
+    rewind.payload.value.sourceEventId = event.eventId;
+    const result = await submit(clients.operation, connectionId, rewind);
+    expect(result).toMatchObject({ state: OperationState.SUCCEEDED, result: { payload: { case: "acknowledgement" } } });
+    const replacement = store.getSession(sessionId).descriptor.binding;
+    expect(replacement.generation).toBe(binding.generation + 1);
+    expect(replacement.nativeSessionId).not.toBe(threadId);
+    expect(store.findNativeSessionDerivation(result.operationId)).toMatchObject({ sessionId, sourceBinding: binding, binding: replacement });
+    expect(native.threads.get(replacement.nativeSessionId!)?.turns).toEqual([firstTurn]);
+    expect(native.threads.get(threadId)?.turns).toEqual([firstTurn, laterTurn]);
+    expect(store.findEvent(event.eventId)).toEqual(recorded);
+    expect(native.transport!.requests.filter(({ method }) => method === "thread/fork").map(({ params }) => params))
+      .toEqual([expect.objectContaining({ threadId, lastTurnId: firstTurn.id, excludeTurns: true, cwd })]);
+    expect(native.transport!.requests.some(({ method }) => method === "thread/revert")).toBe(false);
+    expect(userRows(await timeline()).map(({ row: item }) => item.nativeIdentity?.entryId)).toEqual(["original-turn-A-user"]);
+    await clients.session.listRuntimeCommands({ sessionId });
+    expect(userRows(await snapshot()).map(({ row: item }) => item.nativeIdentity?.entryId)).toEqual(["original-turn-A-user"]);
   } finally {
     await fixture?.close();
     await host.shutdown();

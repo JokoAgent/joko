@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
-import { codexNativeDispatchFingerprint, projectCodexNativeHistory } from "./native-history.js";
+import { NATIVE_HISTORY_USER_IMAGES_FIELD } from "@joko/core";
+import { describe, expect, it, vi } from "vitest";
+import { codexNativeDispatchFingerprint, materializeCodexHistoryImages, projectCodexNativeHistory } from "./native-history.js";
 import type { JsonObject, NativeThread, NativeThreadItem } from "./protocol.js";
 import { CodexEventTranslator, createTranslatorState } from "./translator.js";
 
@@ -43,6 +44,39 @@ describe("Codex native history projection", () => {
     expect(codexNativeDispatchFingerprint(outgoing)).not.toBe(codexNativeDispatchFingerprint([{ ...outgoing[0]!, text: "Another input" }, outgoing[1]!]));
     expect(codexNativeDispatchFingerprint(outgoing)).not.toBe(codexNativeDispatchFingerprint([outgoing[0]!, { ...outgoing[1]!, url: "data:image/png;base64,AQ==" }]));
   });
+
+  it("offers only original inline PNGs from completed local Paginated User Messages to their owning Host", async () => {
+    const encoded = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAD0lEQVR4nGPQSDlxIkUDAAlTAqltBY9kAAAAAElFTkSuQmCC";
+    const inline = { type: "image", url: `data:image/png;base64,${encoded}` };
+    const thread: NativeThread = { id: "import-source", historyMode: "paginated", turns: [
+      { id: "original", status: "completed", items: [{ id: "original-user", type: "userMessage", content: [
+        { type: "text", text: "See this image." }, { type: "localImage", path: "/private/untouched.png" },
+        { type: "image", url: "https://example.invalid/untouched.png" }, inline,
+        { type: "image", url: "data:image/png;base64,AA==" }
+      ] }] },
+      { id: "unfinished", status: "inProgress", items: [{ id: "unfinished-user", type: "userMessage", content: [inline] }] }
+    ] };
+    const projection = projectCodexNativeHistory(thread, { maximumEvents: 10 });
+    const bytes = Buffer.from(encoded, "base64");
+    const blob = { id: "authorized-png", sha256: "a".repeat(64), byteLength: bytes.length, mimeType: "image/png", fileName: "original.png" };
+    const materializeNativeHistoryImage = vi.fn(async () => blob);
+    const target = { id: "local", backendId: "codex", displayName: "Local", workspaceRoot: "/project", managed: false, trusted: true };
+    const context = { target, artifactCapacityBytes: bytes.length, materializeNativeHistoryImage };
+    const observed = await materializeCodexHistoryImages(thread, projection, context, () => undefined);
+    expect(materializeNativeHistoryImage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      nativeEntryId: "original-user", blockIndex: 3, png: bytes
+    }));
+    expect(observed.events).toBe(projection.events);
+    expect(observed.activeEntryMetadata?.fields[NATIVE_HISTORY_USER_IMAGES_FIELD]).toBe(JSON.stringify([["original-user", 3, blob]]));
+    materializeNativeHistoryImage.mockClear();
+    await expect(materializeCodexHistoryImages(thread, projection, { ...context, artifactCapacityBytes: bytes.length - 1 }, () => undefined)).resolves.toBe(projection);
+    await expect(materializeCodexHistoryImages({ ...thread, historyMode: "legacy" }, projection, context, () => undefined)).resolves.toBe(projection);
+    await expect(materializeCodexHistoryImages(thread, projection, { ...context, target: { ...target,
+      remoteWorkspace: { kind: "ssh", hostId: "host", hostTargetId: "host-target", workspaceRoot: "/project" } }
+    }, () => undefined)).resolves.toBe(projection);
+    expect(materializeNativeHistoryImage).not.toHaveBeenCalled();
+  });
+
   it("projects native Skill input as a safe name without exposing its private mount or body", () => {
     const privatePath = "C:\\private-runtime\\approved-copy\\SKILL.md";
     const thread: NativeThread = { id: "skill-input", turns: [{ id: "turn", status: "completed", items: [{

@@ -704,6 +704,10 @@ export function validModelSubstitution(value: unknown): value is { readonly sele
 export const NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD = "nativeBindingFingerprint";
 /** Host-owned, internal marker metadata for native ancestors without an Event. */
 export const NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD = "nativeHistoryUnprojectedParents";
+/** Rewind anchors from the current complete Codex Legacy history observation. */
+export const NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD = "nativeHistoryLegacyRewindAnchors";
+/** Original inline images associated with immutable native user completions. */
+export const NATIVE_HISTORY_USER_IMAGES_FIELD = "nativeHistoryUserImages";
 
 export function nativeHistoryEventContext(payload: EventPayload): NativeHistoryEventContext | undefined {
   switch (payload.type) {

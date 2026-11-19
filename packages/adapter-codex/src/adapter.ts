@@ -94,7 +94,7 @@ import {
   type NativeThread,
   type NativeTurn
 } from "./protocol.js";
-import { codexNativeDispatchFingerprint, projectCodexNativeHistory } from "./native-history.js";
+import { codexLegacyRewindAnchor, codexNativeDispatchFingerprint, materializeCodexHistoryImages, projectCodexNativeHistory } from "./native-history.js";
 import { readCodexNativeSessionPreview } from "./native-session-preview.js";
 import { readCodexCatalogRolloutMessages } from "./catalog-rollout-history.js";
 import { codexAccountResetFacts } from "./account-rate-limit-resets.js";
@@ -1927,9 +1927,14 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     try {
       const history = await this.#readCompleteHistory(runtime, context);
       history.assertCurrent();
-      const projection = projectCodexNativeHistory(history.thread, { maximumEvents: this.#maximumHistoryEvents });
+      const projection = projectCodexNativeHistory(history.thread, {
+        maximumEvents: this.#maximumHistoryEvents,
+        legacyDialogueRewind: this.#supportsLegacyDialogueRewind(runtime)
+      });
       history.assertCurrent();
-      return projection;
+      return this.#hosted === undefined
+        ? await materializeCodexHistoryImages(history.thread, projection, context, history.assertCurrent)
+        : projection;
     } catch (error) {
       throw this.#requestFailure(error, "probe", "CODEX_NATIVE_HISTORY_UNAVAILABLE", false);
     }
@@ -2499,7 +2504,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#assertStandardRuntime(runtime, "fork the native thread");
     if (!derivation.completedSnapshot) assertRuntimeProductIdle(runtime);
     return {
-      binding: await this.#forkThread(runtime, context, derivation, entryId)
+      binding: (await this.#forkThread(runtime, context, derivation, entryId)).binding
     };
   }
 
@@ -2512,10 +2517,15 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const runtime = await this.#requireRuntime(context, "bound");
     this.#assertStandardRuntime(runtime, "clone the native thread");
     assertRuntimeProductIdle(runtime);
-    return this.#forkThread(runtime, context, derivation);
+    return (await this.#forkThread(runtime, context, derivation)).binding;
   }
 
-  override async navigateTree(target: NativeNavigationTarget, summarize: boolean, context: AdapterContext, customInstructions: string | undefined, _navigation: NativeSessionNavigation): Promise<NativeSessionNavigationResult> {
+  #supportsLegacyDialogueRewind(runtime: SessionRuntime): boolean {
+    return !runtime.remote && this.#hosted === undefined
+      && versionFromUserAgent(runtime.host.initializeResult?.userAgent) === AUDITED_APP_SERVER_VERSION;
+  }
+
+  override async navigateTree(target: NativeNavigationTarget, summarize: boolean, context: AdapterContext, customInstructions: string | undefined, navigation: NativeSessionNavigation): Promise<NativeSessionNavigationResult> {
     this.#assertOpen();
     this.#assertBackendContext(context);
     assertDispatchNotCancelled(context.signal);
@@ -2543,7 +2553,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       assertIdle();
       const history = await this.#readCompleteHistory(runtime, context);
       assertIdle();
-      assertRewindableHistory(history.thread);
+      const legacy = history.thread.historyMode === "legacy" && this.#supportsLegacyDialogueRewind(runtime);
+      if (!legacy) assertRewindableHistory(history.thread);
       for (const lineage of runtime.nativeTasks.mergeHistory(history.thread)) {
         await this.#host.registerDescendantThread(lineage.childThreadId, lineage.parentThreadId, hostGeneration);
         history.assertCurrent();
@@ -2559,6 +2570,20 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       const excluded = history.thread.turns[index + 1];
       const beforeDispatch = () => { assertIdle(); history.assertCurrent(); };
       beforeDispatch();
+      if (legacy) {
+        if (target.kind !== "native_entry" || codexLegacyRewindAnchor(history.thread, index + 1) !== target.entryId) {
+          throw rewindBoundaryUnavailable();
+        }
+        const fork = await this.#forkThread(runtime, context, {
+          sessionId: context.sessionId, target: context.target, recordBinding: navigation.recordBinding
+        }, undefined, {
+          expectedPrefix: history.thread.turns.slice(0, index + 1), assertCurrent: beforeDispatch
+        });
+        if (fork.confirmed === undefined) throw rewindUnknown();
+        return { kind: "replacement", binding: fork.binding, nativeHistory: projectCodexNativeHistory(fork.confirmed, {
+          maximumEvents: this.#maximumHistoryEvents, legacyDialogueRewind: true
+        }) };
+      }
       if (excluded === undefined) return { kind: "in_place" };
       const expectedPrefix = history.thread.turns.slice(0, index + 1).map(fullTurnSignature);
       let response;
@@ -5796,12 +5821,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     else waiter.reject(error);
   }
 
-  async #forkThread(runtime: SessionRuntime, context: AdapterContext, derivation: NativeSessionDerivation, nativeBoundaryId?: string): Promise<NativeSessionBinding> {
+  async #forkThread(runtime: SessionRuntime, context: AdapterContext, derivation: NativeSessionDerivation, nativeBoundaryId?: string,
+    replacement?: { readonly expectedPrefix: readonly NativeTurn[]; readonly assertCurrent: () => void }
+  ): Promise<{ readonly binding: NativeSessionBinding; readonly confirmed?: NativeThread }> {
     assertCodexDerivationTarget(context.target, derivation.target);
     await this.validateTarget(derivation.target);
     const hostGeneration = runtime.hostGeneration;
     const dispatchSignal = AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]);
-    const completedBoundary = nativeBoundaryId !== undefined && derivation.completedSnapshot
+    const completedBoundary = replacement !== undefined ? {
+      ...replacement, turnId: replacement.expectedPrefix.at(-1)!.id
+    } : nativeBoundaryId !== undefined && derivation.completedSnapshot
       ? await this.#completedSnapshotBoundary(runtime, context, nativeBoundaryId) : undefined;
     const boundary = completedBoundary ?? (nativeBoundaryId === undefined ? undefined
       : await this.#resolveForkTurnId(runtime, context, nativeBoundaryId));
@@ -5842,7 +5871,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }, { mutation: true, signal: dispatchSignal, beforeDispatch: assertForkDispatch });
     } catch (error) {
       throw this.#requestFailure(error, "dispatch", "CODEX_SESSION_FORK_FAILED",
-        error instanceof TransportFault ? error.stateMayHaveChanged : true);
+        error instanceof TransportFault ? error.stateMayHaveChanged : replacement === undefined || !(error instanceof RpcRemoteFault));
     }
     let threadId: string;
     try {
@@ -5860,7 +5889,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Refresh native Session discovery before explicitly retrying the fork."
       });
     }
-    const binding = bindingForThread(threadId, context.generation, profileKey);
+    const binding = bindingForThread(threadId, context.generation + (replacement === undefined ? 0 : 1), profileKey);
     try {
       derivation.recordBinding(binding);
       this.#assertRuntimeFence(runtime, context, response.hostGeneration);
@@ -5886,14 +5915,18 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         if (copied.thread.turns.length !== completedBoundary.expectedPrefix.length
           || copied.thread.turns.some((turn, index) => fullTurnSignature(turn) !== fullTurnSignature(completedBoundary.expectedPrefix[index]))) {
           throw adapterError({ code: "CODEX_COMPLETED_SNAPSHOT_MISMATCH", message: "The native child did not preserve the exact completed history prefix.",
-            phase: "dispatch", stateMayHaveChanged: true, recovery: "Reconcile the original native derivation before creating another Side Chat." });
+            phase: "dispatch", stateMayHaveChanged: true, recovery: replacement === undefined
+              ? "Reconcile the original native derivation before creating another Side Chat."
+              : "Reconcile the original native rewind before repeating the action." });
         }
+        return { binding, confirmed: copied.thread };
       }
-      return binding;
+      return { binding };
     } finally {
       await this.#host.releaseUnboundThread(threadId, response.hostGeneration).catch((error) => {
         throw this.#requestFailure(error, "shutdown", "CODEX_SESSION_FORK_DETACH_FAILED", true);
       });
+      replacement?.assertCurrent();
     }
   }
 

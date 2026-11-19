@@ -150,6 +150,7 @@ import {
 } from "./artifact-maintenance.js";
 import { NATIVE_PI_SETTINGS_DEFAULTS, type OrchestratorApplication, type SessionContextDefaultsResolver } from "./application.js";
 import { projectBackgroundTaskHistory } from "./background-task-history.js";
+import { withObservedNativeUserPresentation } from "./native-history.js";
 import {
   modelRoutingEnabled,
   readBackendModelAccess,
@@ -7935,7 +7936,8 @@ function validateStreamCursor(cursor: contract.EventCursor, generation: bigint, 
 export function eventWithServiceCursor(item: PersistedEvent, dependencies: ConnectServiceDependencies, generation: bigint,
   ownerCatalog = false): contract.Event {
   const context = eventContext(item, dependencies);
-  const mapped = toProtoEvent(item, context);
+  const mapped = toProtoEvent(withObservedNativeUserPresentation(item, context.session?.descriptor.binding,
+    () => dependencies.store.findLatestNativeSessionChange(item.sessionId)), context);
   const deleted = ownerCatalog && item.payload.type === "session_changed" && context.session?.descriptor.deletedAt !== undefined
     ? context.session : undefined;
   return create(contract.EventSchema, {
@@ -23112,6 +23114,27 @@ async function dispatchMutation(
           }
         }
       );
+    }
+    case "cancelBrowserDownload": {
+      const { browserProvider: provider, browserTransfers: transfers } = dependencies;
+      if (provider === undefined || transfers === undefined) {
+        return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Browser file transfer is not configured.");
+      }
+      const value = payload.value;
+      requireOpaqueTakeoverId(value.browserTransferId, "Browser transfer ID");
+      const current = requireOwnedBrowserPageFence(provider, connection.id, { ...value, currentPageId: value.pageId });
+      const owner = requireActiveBrowserPageAuthority(dependencies.browserState, provider.id, current.pageId, current.generation);
+      const assertCurrent = () => {
+        dependencies.connections.fence(connection);
+        provider.assertHumanTakeover(current);
+        requireActiveBrowserPageAuthority(dependencies.browserState, provider.id, current.pageId, current.generation, owner);
+      };
+      return ackOperation(dependencies, operationId, connection, mutation, payload.case, async () => {
+        await provider.runHumanTakeoverOperation(current, async () => {
+          const cancelled = await transfers.cancelDownload(value.browserTransferId, current.pageId, current.generation, assertCurrent);
+          if (!cancelled) throw new ConnectError("The Browser download can no longer be cancelled.", Code.FailedPrecondition);
+        }, assertCurrent);
+      }, assertCurrent);
     }
     case "beginBrowserTakeover": {
       if (dependencies.browserProvider === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Browser Provider is not configured.");

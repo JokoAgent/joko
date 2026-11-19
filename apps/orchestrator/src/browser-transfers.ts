@@ -3,12 +3,13 @@ import { randomUUID } from "node:crypto";
 import { create } from "@bufbuild/protobuf";
 import * as contract from "@joko/contracts";
 import type { BlobRef } from "@joko/core";
-import type { BrowserLease, BrowserLeaseFence, BrowserProvider, BrowserTakeoverFence } from "@joko/tool-browser";
+import { sanitizeBrowserFileName, type BrowserDownloadHandler, type BrowserDownloadSource, type BrowserLease,
+  type BrowserLeaseFence, type BrowserProvider, type BrowserTakeoverFence } from "@joko/tool-browser";
 
 import type { ArtifactStore } from "./artifact-store.js";
 import { toProtoTimestamp } from "./proto-mapper.js";
 
-export type BrowserTransferArtifactStore = Pick<ArtifactStore, "resolveBlobPath" | "ingestPath">;
+export type BrowserTransferArtifactStore = Pick<ArtifactStore, "resolveBlobFile" | "ingestPath">;
 
 export type BrowserTransferProvider = Pick<BrowserProvider, "generation" | "acquireAgentLease" | "releaseAgentLease" | "uploadFiles" | "recover">;
 
@@ -51,6 +52,7 @@ interface TransferRecord {
   readonly direction: contract.TransferDirection;
   readonly initiatedAt: number;
   readonly generation: number;
+  readonly fileName?: string;
   state: contract.BrowserTransferState;
   startedAt?: number;
   completedAt?: number;
@@ -73,6 +75,7 @@ export interface PersistedBrowserTransfer {
   readonly direction: contract.TransferDirection;
   readonly initiatedAt: number;
   readonly generation: number;
+  readonly fileName?: string;
   readonly state: contract.BrowserTransferState;
   readonly startedAt?: number;
   readonly completedAt?: number;
@@ -103,6 +106,11 @@ class BrowserGenerationFencedError extends Error {
 
 class BrowserUploadAuthorityError extends Error {}
 
+interface ActiveDownload {
+  readonly cancel: () => Promise<void>;
+  pendingCancellation?: Promise<void>;
+}
+
 /**
  * Owns process-local BrowserTransfer state while materialized blobs/artifacts
  * remain durable in ArtifactStore. Uploads are serialized around the provider's
@@ -119,6 +127,7 @@ export class BrowserTransferCoordinator {
   readonly #now: () => number;
   readonly #onActivityTransition: () => void;
   readonly #records = new Map<string, TransferRecord>();
+  readonly #activeDownloads = new Map<string, ActiveDownload>();
   #uploadTail: Promise<void> = Promise.resolve();
 
   constructor(options: BrowserTransferCoordinatorOptions) {
@@ -163,11 +172,11 @@ export class BrowserTransferCoordinator {
   }
 
   /** A BrowserProvider.onDownload-compatible hook. */
-  readonly onDownload = async (pageId: string, verifiedLocalPath: string, sanitizedFileName: string): Promise<void> => {
-    const transfer = await this.ingestDownload(pageId, verifiedLocalPath, sanitizedFileName);
-    if (transfer.state !== contract.BrowserTransferState.COMPLETED) {
-      throw new Error("Browser download artifact ingest failed.");
-    }
+  readonly onDownload: BrowserDownloadHandler = async download => {
+    const transfer = await this.ingestDownload(download);
+    if (transfer.state === contract.BrowserTransferState.CANCELLED) return "cancelled";
+    if (transfer.state === contract.BrowserTransferState.COMPLETED) return "completed";
+    throw new Error("Browser download artifact ingest failed.");
   };
 
   /**
@@ -208,13 +217,13 @@ export class BrowserTransferCoordinator {
     return this.queueUpload(() => this.performUpload(records, inputSelector, connection));
   }
 
-  /** Ingest a verified BrowserProvider staging path into durable artifacts. */
+  /** Record the original native download before waiting for its bytes. */
   async ingestDownload(
-    pageId: string,
-    verifiedLocalPath: string,
-    sanitizedFileName: string,
+    download: BrowserDownloadSource,
     metadata: BrowserTransferMetadata = {}
   ): Promise<contract.BrowserTransfer> {
+    const { pageId, fileName, generation } = download;
+    const displayName = isSanitizedDownloadName(fileName) ? fileName : undefined;
     const record: TransferRecord = {
       id: randomUUID(),
       browserProviderId: this.#browserProviderId,
@@ -222,18 +231,33 @@ export class BrowserTransferCoordinator {
       toolCallId: metadata.toolCallId ?? "",
       direction: contract.TransferDirection.DOWNLOAD,
       initiatedAt: this.#now(),
-      generation: this.#provider.generation,
+      generation,
+      ...(displayName === undefined ? {} : { fileName: displayName }),
       state: contract.BrowserTransferState.RUNNING,
       startedAt: this.#now()
     };
     this.remember([record]);
     const assertCurrent = () => {
       if (isTerminal(record.state) || record.generation !== this.#provider.generation) throw new BrowserGenerationFencedError();
+      download.assertCurrent();
     };
+    let phase: "download" | "artifact_ingest" = "download";
     try {
       validatePageId(pageId);
-      validateDownloadName(sanitizedFileName);
-      const artifact = await this.#artifacts.ingestPath(verifiedLocalPath, { fileName: sanitizedFileName, assertCurrent });
+      if (displayName === undefined) throw new Error("Browser download name was not sanitized.");
+      assertCurrent();
+      const active: ActiveDownload = { cancel: download.cancel };
+      this.#activeDownloads.set(record.id, active);
+      let verifiedLocalPath: string;
+      try {
+        verifiedLocalPath = await download.stage();
+      } finally {
+        this.#activeDownloads.delete(record.id);
+        if (active.pendingCancellation !== undefined) await active.pendingCancellation.catch(() => undefined);
+      }
+      assertCurrent();
+      phase = "artifact_ingest";
+      const artifact = await this.#artifacts.ingestPath(verifiedLocalPath, { fileName: displayName, assertCurrent });
       assertCurrent();
       record.artifact = publicArtifact(artifact);
       record.blob = publicBlob(artifact);
@@ -242,14 +266,44 @@ export class BrowserTransferCoordinator {
       this.persist(record);
       this.pruneRetained();
     } catch (error) {
-      this.fail(record, error instanceof BrowserGenerationFencedError ? generationFencedError(true) : {
+      this.fail(record, error instanceof BrowserGenerationFencedError ? generationFencedError(true) : phase === "download" ? {
+        code: "BROWSER_DOWNLOAD_FAILED",
+        phase,
+        message: "The Browser did not finish downloading this file.",
+        stateMayHaveChanged: false
+      } : {
         code: "BROWSER_DOWNLOAD_INGEST_FAILED",
-        phase: "artifact_ingest",
+        phase,
         message: "The browser download could not be validated and stored as an artifact.",
         stateMayHaveChanged: false
       });
     }
     return this.present(record);
+  }
+
+  async cancelDownload(transferId: string, pageId: string, generation: number, assertCurrent: () => void): Promise<boolean> {
+    const record = this.#records.get(transferId);
+    const active = this.#activeDownloads.get(transferId);
+    if (record === undefined || active === undefined || record.direction !== contract.TransferDirection.DOWNLOAD
+      || record.toolCallId !== "" || record.pageId !== pageId || record.generation !== generation
+      || generation !== this.#provider.generation || isTerminal(record.state)) return false;
+    assertCurrent();
+    const request = active.pendingCancellation ??= (async () => {
+      try {
+        await active.cancel();
+      } catch {
+        throw new Error("The Browser could not confirm download cancellation.");
+      }
+      if (isTerminal(record.state) || generation !== this.#provider.generation) return;
+      this.persistRecords([{ ...record, state: contract.BrowserTransferState.CANCELLED, completedAt: this.#now() }], [record]);
+      this.pruneRetained();
+    })();
+    try {
+      await request;
+    } finally {
+      if (active.pendingCancellation === request) delete active.pendingCancellation;
+    }
+    return record.state === contract.BrowserTransferState.CANCELLED;
   }
 
   get(browserTransferId: string): contract.BrowserTransfer | undefined {
@@ -316,7 +370,11 @@ export class BrowserTransferCoordinator {
       validateConnection(connection);
       assertCurrent();
       phase = "blob_resolution";
-      const paths = await Promise.all(records.map(member => this.#artifacts.resolveBlobPath(member.blob!)));
+      const files = await Promise.all(records.map(async member => {
+        const blob = member.blob!;
+        const file = await this.#artifacts.resolveBlobFile(blob);
+        return { ...file, sha256: blob.sha256, byteLength: blob.byteLength };
+      }));
       assertCurrent();
       let owner: BrowserTakeoverFence | BrowserLeaseFence;
       if (isOwnedTakeoverPage(connection.humanTakeover, record, connection)) owner = connection.humanTakeover;
@@ -327,15 +385,19 @@ export class BrowserTransferCoordinator {
         owner = lease;
       }
       phase = "browser_action";
-      await this.#provider.uploadFiles(record.pageId, owner, { type: "upload", selector: inputSelector, paths }, {
+      await this.#provider.uploadFiles(record.pageId, owner, {
+        type: "upload", selector: inputSelector, paths: files.map(file => file.path)
+      }, {
         documentId: connection.documentId,
+        fileIdentities: files,
         assertCurrent,
         markDispatched: () => {
           assertCurrent();
           const startedAt = this.#now();
-          for (const member of records) {
+          for (const [index, member] of records.entries()) {
             member.state = contract.BrowserTransferState.RUNNING;
             member.startedAt = startedAt;
+            member.blob = { ...member.blob!, fileName: files[index]!.fileName };
           }
           this.persistRecords(records);
         }
@@ -435,6 +497,9 @@ export class BrowserTransferCoordinator {
       toolCallId: record.toolCallId,
       direction: record.direction,
       state: record.state,
+      fileName: record.fileName ?? "",
+      cancellable: record.direction === contract.TransferDirection.DOWNLOAD && record.toolCallId === ""
+        && !isTerminal(record.state) && this.#activeDownloads.has(record.id),
       blob: record.blob === undefined ? undefined : protoBlob(record.blob, record.artifact, record.direction),
       artifact: record.artifact === undefined ? undefined : create(contract.ArtifactRefSchema, {
         artifactId: record.artifact.id,
@@ -495,6 +560,7 @@ function persistedRecord(record: TransferRecord): PersistedBrowserTransfer {
     initiatedAt: record.initiatedAt,
     generation: record.generation,
     state: record.state,
+    ...(record.fileName === undefined ? {} : { fileName: record.fileName }),
     ...(record.startedAt === undefined ? {} : { startedAt: record.startedAt }),
     ...(record.completedAt === undefined ? {} : { completedAt: record.completedAt }),
     ...(record.blob === undefined ? {} : { blob: publicBlob(record.blob) }),
@@ -541,6 +607,8 @@ function restoreRecord(value: PersistedBrowserTransfer, browserProviderId: strin
     initiatedAt: value.initiatedAt,
     generation: value.generation,
     state: value.state,
+    ...(value.direction === contract.TransferDirection.DOWNLOAD && isSanitizedDownloadName(value.fileName)
+      ? { fileName: value.fileName } : {}),
     ...(value.startedAt === undefined ? {} : { startedAt: value.startedAt }),
     ...(value.completedAt === undefined ? {} : { completedAt: value.completedAt }),
     ...(value.blob === undefined ? {} : { blob: publicBlob(value.blob) }),
@@ -562,16 +630,9 @@ function validateConnection(connection: BrowserTransferConnection): void {
   if (connection.documentId.trim() === "" || connection.documentId.length > 128) throw new Error("An original Browser document ID is required.");
 }
 
-function validateDownloadName(fileName: string): void {
-  if (
-    fileName.trim() === "" ||
-    fileName.length > 180 ||
-    fileName.includes("/") ||
-    fileName.includes("\\") ||
-    /[\u0000-\u001f]/u.test(fileName)
-  ) {
-    throw new Error("Browser download name was not sanitized.");
-  }
+function isSanitizedDownloadName(fileName: unknown): fileName is string {
+  return typeof fileName === "string" && fileName.length > 0 && fileName.length <= 180
+    && sanitizeBrowserFileName(fileName) === fileName;
 }
 
 function isTerminal(state: contract.BrowserTransferState): boolean {

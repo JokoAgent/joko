@@ -1,6 +1,6 @@
 import type { BlobRef } from "@joko/core";
 import * as contract from "@joko/contracts";
-import type { BrowserAction, BrowserLease, BrowserLeaseFence, BrowserTakeover } from "@joko/tool-browser";
+import type { BrowserAction, BrowserDownloadSource, BrowserLease, BrowserLeaseFence, BrowserTakeover } from "@joko/tool-browser";
 import { describe, expect, it, vi } from "vitest";
 
 import type { ArtifactRecord } from "./artifact-store.js";
@@ -22,15 +22,20 @@ const sourceBlob: BlobRef = {
 
 const uploadOwner = (id: string) => ({ id, documentId: "document-one", assertCurrent: () => undefined });
 
+function downloadSource(path: string, fileName: string): BrowserDownloadSource {
+  return { pageId: "page-download", generation: 7, fileName, assertCurrent: () => undefined,
+    stage: async () => path, cancel: async () => undefined };
+}
+
 class FakeArtifacts implements BrowserTransferArtifactStore {
   readonly calls: string[] = [];
   resolveFailure = false;
   ingestFailure = false;
 
-  async resolveBlobPath(blob: BlobRef): Promise<string> {
+  async resolveBlobFile(blob: BlobRef): Promise<{ path: string; fileName?: string }> {
     this.calls.push(`resolve:${blob.id}`);
     if (this.resolveFailure) throw new Error("D:\\private\\source is not approved");
-    return "D:\\artifacts\\verified-upload.txt";
+    return { path: "D:\\artifacts\\verified-upload.txt", fileName: blob.fileName };
   }
 
   async ingestPath(sourcePath: string, options?: { fileName?: string }): Promise<ArtifactRecord> {
@@ -311,11 +316,11 @@ describe("BrowserTransferCoordinator", () => {
   it("keeps a resolving upload fenced before the next Browser generation is published", async () => {
     const artifacts = new FakeArtifacts();
     const provider = new FakeProvider();
-    let finishResolve!: (path: string) => void;
+    let finishResolve!: (file: { path: string; fileName?: string }) => void;
     let finishRecovery!: () => void;
-    const path = new Promise<string>(resolve => { finishResolve = resolve; });
+    const path = new Promise<{ path: string; fileName?: string }>(resolve => { finishResolve = resolve; });
     const recovering = new Promise<void>(resolve => { finishRecovery = resolve; });
-    const resolvePath = vi.spyOn(artifacts, "resolveBlobPath").mockReturnValue(path);
+    const resolvePath = vi.spyOn(artifacts, "resolveBlobFile").mockReturnValue(path);
     const recoverProvider = provider.recover.bind(provider);
     vi.spyOn(provider, "recover").mockImplementation(async () => { await recovering; await recoverProvider(); });
     const transfers = new BrowserTransferCoordinator({ artifacts, provider });
@@ -328,12 +333,12 @@ describe("BrowserTransferCoordinator", () => {
       const retired = transfers.get(original.browserTransferId)!;
       expect(retired).toMatchObject({ state: contract.BrowserTransferState.FAILED, error: { code: "BROWSER_GENERATION_FENCED" } });
       expect(provider.generation).toBe(7);
-      finishResolve("D:\\artifacts\\verified-upload.txt");
+      finishResolve({ path: "D:\\artifacts\\verified-upload.txt", fileName: "original-upload.txt" });
       expect(await uploading).toEqual(retired);
       expect(provider.calls).toEqual([]);
       expect(provider.actions).toEqual([]);
     } finally {
-      finishResolve("D:\\artifacts\\verified-upload.txt");
+      finishResolve({ path: "D:\\artifacts\\verified-upload.txt", fileName: "original-upload.txt" });
       finishRecovery();
       await restarting;
     }
@@ -344,7 +349,7 @@ describe("BrowserTransferCoordinator", () => {
     const provider = new FakeProvider();
     const transfers = new BrowserTransferCoordinator({ artifacts, provider, now: () => 2_000 });
 
-    const transfer = await transfers.ingestDownload("page-download", "D:\\browser-private\\random.pdf", "report.pdf");
+    const transfer = await transfers.ingestDownload(downloadSource("D:\\browser-private\\random.pdf", "report.pdf"));
 
     expect(transfer.state).toBe(contract.BrowserTransferState.COMPLETED);
     expect(transfer.direction).toBe(contract.TransferDirection.DOWNLOAD);
@@ -360,12 +365,13 @@ describe("BrowserTransferCoordinator", () => {
     const provider = new FakeProvider();
     const transfers = new BrowserTransferCoordinator({ artifacts, provider });
 
-    const rejectedPath = await transfers.ingestDownload("page-download", "D:\\private\\secret.pdf", "report.pdf");
-    const rejectedName = await transfers.ingestDownload("page-download", "D:\\private\\secret.pdf", "../secret.pdf");
+    const rejectedPath = await transfers.ingestDownload(downloadSource("D:\\private\\secret.pdf", "report.pdf"));
+    const rejectedName = await transfers.ingestDownload(downloadSource("D:\\private\\secret.pdf", "../secret.pdf"));
 
     expect(rejectedPath.state).toBe(contract.BrowserTransferState.FAILED);
     expect(rejectedPath.error?.message).not.toContain("D:\\private");
     expect(rejectedName.state).toBe(contract.BrowserTransferState.FAILED);
+    expect(rejectedName.fileName).toBe("");
     expect(artifacts.calls).toHaveLength(1);
   });
 
@@ -374,7 +380,7 @@ describe("BrowserTransferCoordinator", () => {
     artifacts.ingestFailure = true;
     const transfers = new BrowserTransferCoordinator({ artifacts, provider: new FakeProvider() });
 
-    await expect(transfers.onDownload("page-download", "D:\\private\\secret.pdf", "report.pdf"))
+    await expect(transfers.onDownload(downloadSource("D:\\private\\secret.pdf", "report.pdf")))
       .rejects.toThrow("artifact ingest failed");
     expect(transfers.list({ state: contract.BrowserTransferState.FAILED })).toHaveLength(1);
   });

@@ -3099,6 +3099,7 @@ export interface BrowserTransferView {
   readonly toolCallId?: string;
   readonly direction: "upload" | "download" | "unknown";
   readonly state: "pending" | "running" | "completed" | "failed" | "cancelled";
+  readonly cancellable?: boolean;
   readonly blobId?: string;
   readonly artifactId?: string;
   readonly fileName: string;
@@ -6543,6 +6544,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   listBrowserActivity(browserId: string, pageId: string): Promise<readonly BrowserActivityView[]>;
   listBrowserTransfers(browserId: string, pageId: string): Promise<readonly BrowserTransferView[]>;
   listBrowserDownloads(browserId: string): Promise<readonly BrowserTransferView[]>;
+  cancelBrowserDownload(browserId: string, pageId: string, transferId: string): Promise<void>;
   uploadBrowserFile(browserId: string, pageId: string, documentId: string, file: File, inputHint?: string): Promise<void>;
   approveResource(resourceId: string, discoveredRevision: string): Promise<void>;
   discoverProjectResources(targetId: string): Promise<void>;
