@@ -58,6 +58,15 @@ export class ExtensionOAuthAccounts {
     const reference = this.#state.get(source.scope).clientReference;
     return extensionOAuthHash({ reference, generation: reference ? this.options.credentials.find(reference)?.generation : undefined });
   }
+  #builtinRefreshOwner(source: Source, reference: string | undefined): string | undefined {
+    if (reference === undefined || source.extension.owner.kind !== "resource" || source.declaration.clientId === undefined) return undefined;
+    const credential = this.options.credentials.find(reference);
+    if (credential?.kind !== "oauth") return undefined;
+    // The retained grant is usable only with its exact provider, network scope and Vault generation.
+    return extensionOAuthHash({ resourceId: source.extension.owner.resourceId, scope: source.scope,
+      declaration: source.declaration, inject: source.secret.inject, hosts: source.network.hosts,
+      reference, generation: credential.generation });
+  }
   #client(source: Source): ExtensionOAuthClient | undefined {
     const reference = this.#state.get(source.scope).clientReference;
     if (reference) {
@@ -175,9 +184,12 @@ export class ExtensionOAuthAccounts {
           if (tokens.refreshToken !== null) freshReference = await this.#newSecret(source.scope, "refresh", tokens.refreshToken);
           assertCurrent();
           const reference = freshReference ?? (existing?.expiredReason === "client_changed" ? undefined : existing?.refreshReference);
+          const ownerHash = reference === undefined || saved.clientReference ? undefined
+            : freshReference === undefined ? existing?.builtinRefreshOwnerHash : this.#builtinRefreshOwner(source, reference);
           const displayLabel = identity.displayLabel ?? existing?.displayLabel;
           const row: ExtensionOAuthAccountRow = { id: existing?.id ?? randomUUID(), revision: randomUUID(), status: "connected", createdAt: existing?.createdAt ?? Date.now(),
             builtinClientHash: extensionOAuthHash(source.declaration.clientId ?? null), authScopes: [...scopes], authFace: sameScopes(source.declaration.scopes, scopes) ? "full" : "subset",
+            ...(ownerHash === undefined ? {} : { builtinRefreshOwnerHash: ownerHash }),
             ...(identity.label ? { label: identity.label } : {}), ...(displayLabel ? { displayLabel } : {}), ...(reference ? { refreshReference: reference } : {}) };
           const current = this.#assert(capture, false);
           this.options.catalog.updateNetworkConfiguration(capture.extensionId, current.extension.revision, () => this.#state.put(source.scope, { ...saved,
@@ -223,10 +235,15 @@ export class ExtensionOAuthAccounts {
         const result = await refreshExtensionOAuth({ client, fetch: this.options.fetch, signal, assertCurrent }, used); assertCurrent();
         if (result.ok) return await this.#lock<ExtensionOAuthFreshResult>(source.scope, async () => {
           assertCurrent(); if (this.#refreshValue(row) !== used) return { ok: false, error: "AUTH_EXPIRED" };
-          if (result.tokens.refreshToken !== null && result.tokens.refreshToken !== used && !await this.options.credentials.compareAndSetManagedSecret({ credentialReferenceId: row.refreshReference!,
-            expectedSecret: used, secret: result.tokens.refreshToken, displayName: source.secret.label, kind: "oauth" })) return { ok: false, error: "AUTH_EXPIRED" };
+          const replacement = result.tokens.refreshToken;
+          const rotated = replacement !== null && replacement !== used;
+          if (rotated && !await this.options.credentials.compareAndSetManagedSecret({ credentialReferenceId: row.refreshReference!,
+            expectedSecret: used, secret: replacement, displayName: source.secret.label, kind: "oauth" })) return { ok: false, error: "AUTH_EXPIRED" };
           assertCurrent(); this.#cache.set(cacheKey, { accessToken: result.tokens.accessToken, expiresAt: result.tokens.expiresAt });
-          const saved = this.#state.get(source.scope); this.#state.put(source.scope, { ...saved, accounts: saved.accounts.map(value => value.id === row.id ? { ...value, status: "connected" } : value) });
+          const saved = this.#state.get(source.scope);
+          const ownerHash = rotated && !saved.clientReference ? this.#builtinRefreshOwner(source, row.refreshReference) : undefined;
+          this.#state.put(source.scope, { ...saved, accounts: saved.accounts.map(value => value.id === row.id ? { ...value,
+            status: "connected", ...(ownerHash === undefined ? {} : { builtinRefreshOwnerHash: ownerHash }) } : value) });
           this.#backfillIdentity(source, row, client, result.tokens.accessToken, [used, result.tokens.refreshToken]);
           return { ok: true, accessToken: result.tokens.accessToken, accountId: row.id };
         });
@@ -300,9 +317,19 @@ export class ExtensionOAuthAccounts {
     for (const { scope, saved } of this.#state.entries()) {
       const owner = active.get(scope); if (!owner) { this.#state.remove(scope); continue; }
       const source = this.#source(owner.extensionId, owner.key);
-      if (!saved.clientReference && saved.accounts.some(row => row.builtinClientHash !== extensionOAuthHash(source.declaration.clientId ?? null) && row.expiredReason !== "client_changed")) {
-        this.#state.put(scope, { ...saved, accounts: saved.accounts.map(row => row.builtinClientHash !== extensionOAuthHash(source.declaration.clientId ?? null) ? { ...row, status: "expired", expiredReason: "client_changed" } : row) });
-      }
+      if (saved.clientReference) continue;
+      const clientHash = extensionOAuthHash(source.declaration.clientId ?? null);
+      const accounts = saved.accounts.map((row): ExtensionOAuthAccountRow => {
+        if (row.builtinClientHash !== clientHash) return row.status === "connected"
+          ? { ...row, revision: randomUUID(), status: "expired", expiredReason: "client_changed" }
+          : row;
+        if (row.expiredReason !== "client_changed" || row.builtinRefreshOwnerHash === undefined
+          || this.#builtinRefreshOwner(source, row.refreshReference) !== row.builtinRefreshOwnerHash) return row;
+        const restored = { ...row, revision: randomUUID(), status: "connected" as const };
+        delete restored.expiredReason;
+        return restored;
+      });
+      if (accounts.some((row, index) => row !== saved.accounts[index])) this.#state.put(scope, { ...saved, accounts });
     }
     for (const key of this.#cache.keys()) { const parts = key.split(":"), owner = active.get(parts[0]!); if (!owner) this.#cache.delete(key);
       else { const source = this.#source(owner.extensionId, owner.key); if (source.ownerKey !== parts[3] || this.#clientKey(source) !== parts[4]) this.#cache.delete(key); } }

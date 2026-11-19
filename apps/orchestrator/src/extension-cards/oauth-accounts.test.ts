@@ -133,6 +133,46 @@ it("retires a changed builtin client without sending its old refresh token to th
   expect(f.manager.get(f.entry.id).slots[0]!.accounts[0]).toMatchObject({ status: "expired", clientChanged: true }); expect(f.requests).toHaveLength(0); expect(f.credentials.resolve(reference)).toBe(old);
 });
 
+it("recovers the original builtin grant only after the complete OAuth configuration is restored", async () => {
+  const f = await fixture();
+  const extensionId = f.entry.id;
+  const original = f.declaration();
+  const account = (await f.connect("one@example.test")).slots[0]!.accounts[0]!;
+  const originalReference = f.saved().accounts[0]!.refreshReference!;
+  const refreshToken = f.credentials.resolve(originalReference);
+  f.requests.length = 0;
+  f.update({ clientId: "different-builtin-client" });
+  await vi.waitFor(() => expect(f.saved().accounts[0]).toMatchObject({ id: account.id, expiredReason: "client_changed" }));
+  expect(await f.manager.fresh(extensionId, "account", f.declaration())).toEqual({ ok: false, error: "AUTH_EXPIRED" });
+
+  f.update({ ...original, tokenUrl: "https://auth.example.test/other-token" });
+  await f.restart();
+  expect(f.manager.get(extensionId).slots[0]!.accounts).toMatchObject([{ id: account.id, status: "expired", clientChanged: true }]);
+  expect(await f.manager.fresh(extensionId, "account", f.declaration())).toEqual({ ok: false, error: "AUTH_EXPIRED" });
+  expect(f.requests).toEqual([]);
+  expect(f.credentials.resolve(originalReference)).toBe(refreshToken);
+
+  f.update(original);
+  await vi.waitFor(() => expect(f.saved().accounts[0]).toMatchObject({ id: account.id, status: "connected", refreshReference: originalReference }));
+  await f.restart();
+  expect(f.manager.get(extensionId).slots[0]!.accounts).toMatchObject([{ id: account.id, status: "connected", isDefault: true, clientChanged: false }]);
+  const fetcher = vi.fn<typeof fetch>(async () => new Response("{}", { headers: { "content-type": "application/json" } }));
+  const network = new ExtensionNetwork({ fetch: fetcher,
+    resolveCredential: () => { throw new Error("OAuth must resolve its managed account"); },
+    redact: value => f.credentials.redactText(value), oauth: f.manager });
+  const declaration = parseExtensionNetwork({ hosts: ["auth.example.test", "api.example.test"], secrets: [{
+    key: "account", label: "Account", source: "oauth", oauth: f.declaration(), inject: { header: "Authorization", format: "Bearer {value}" }
+  }] });
+  const scope = { extensionId, authorityKey: "restored-runtime", declaration, readOnly: false, signal: new AbortController().signal, assertCurrent: () => {} };
+  expect(await network.request(scope, { url: "https://api.example.test/data" })).toMatchObject({ ok: true, status: 200 });
+  const refreshes = f.requests.filter(request => request.form.get("grant_type") === "refresh_token");
+  expect(refreshes).toHaveLength(1);
+  expect(refreshes[0]!.url).toBe(original.tokenUrl);
+  expect(refreshes[0]!.form.get("client_id")).toBe(original.clientId);
+  expect(refreshes[0]!.form.get("refresh_token")).toBe(refreshToken);
+  expect(fetcher).toHaveBeenCalledOnce();
+});
+
 it("rejects forged captures and late grants after the original caller is revoked", async () => {
   const f = await fixture(), capture = f.capture();
   await expect(f.manager.setClient({ ...capture }, { clientId: "other" }, () => {})).rejects.toThrow("INVALID_CONFIG");
