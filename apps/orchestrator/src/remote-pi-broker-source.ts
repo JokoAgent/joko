@@ -36,6 +36,7 @@ const MAX_NATIVE_AUTH_GENERATION_FENCES = 4096;
 const MAX_NATIVE_AUTH_RESERVATIONS = 4096;
 const NATIVE_AUTH_GENERATION_FENCE_IDLE_MS = 60_000;
 const MAX_LINUX_UNIX_SOCKET_PATH_BYTES = 107;
+const MAX_DARWIN_UNIX_SOCKET_PATH_BYTES = 103;
 const MAX_MANAGED_ARTIFACT_SNAPSHOTS = 4096;
 const MAX_MANAGED_ARTIFACT_SNAPSHOT_CHUNKS = 32 * 1024;
 const MANAGED_ARTIFACT_CHUNK_BYTES = 256 * 1024;
@@ -166,8 +167,8 @@ async function processMatches(lock, mode, root) {
   try { process.kill(lock.pid, 0); } catch (error) { return error?.code !== "ESRCH"; }
   const fingerprint = await processFingerprint(lock.pid);
   if (fingerprint === undefined) {
-    if (process.platform === "linux") {
-      const status = await linuxProcessStatus("/proc/" + lock.pid).catch(() => undefined);
+    if (process.platform === "linux" || process.platform === "darwin") {
+      const status = await posixProcessStatus(lock.pid).catch(() => undefined);
       if (status?.exited) return false;
     }
     // Without a trustworthy process-start identity, preserve the lock. PID
@@ -506,9 +507,98 @@ async function linuxProcessExecutable(path) {
   if (named?.dev === image.dev && named.ino === image.ino) return realpath(path);
   return link.slice(0, -deleted.length);
 }
+async function posixProcessStatus(pid) {
+  if (process.platform === "darwin") return (await darwinProcessObservation(pid, false))?.status;
+  return linuxProcessStatus("/proc/" + pid);
+}
+async function darwinProcessObservation(pid, includeArguments) {
+  if (!["arm64", "x64"].includes(process.arch) || !Number.isSafeInteger(pid) || pid < 1 || pid > 0x7fffffff) return undefined;
+  // Apple exposes the LP64 proc_bsdinfo and KERN_PROCARGS2 through libSystem.
+  // Use the system JavaScript bridge so the SSH node needs no compiler or add-on.
+  const procInfoSize = 136;
+  const maximumArguments = 256 * 1024 + 4;
+  const mib = Buffer.alloc(12);
+  mib.writeInt32LE(1, 0);  // CTL_KERN
+  mib.writeInt32LE(49, 4); // KERN_PROCARGS2
+  mib.writeInt32LE(pid, 8);
+  const size = Buffer.alloc(8);
+  size.writeBigUInt64LE(BigInt(maximumArguments));
+  try {
+    const { stdout } = await execFileAsync("/usr/bin/osascript", ["-l", "JavaScript", "-e", [
+      "ObjC.import('Foundation');",
+      "ObjC.bindFunction('proc_pidinfo', ['int', ['int', 'int', 'unsigned long long', 'void *', 'int']]);",
+      "ObjC.bindFunction('proc_pidpath', ['int', ['int', 'void *', 'unsigned int']]);",
+      "ObjC.bindFunction('sysctl', ['int', ['void *', 'unsigned int', 'void *', 'void *', 'void *', 'unsigned long']]);",
+      "function decode(input) { return $.NSMutableData.alloc.initWithBase64EncodedStringOptions(input, 0); }",
+      "function encode(data) { return ObjC.unwrap(data.base64EncodedStringWithOptions(0)); }",
+      "function run() {",
+      "  var pid = " + pid + ";",
+      "  function birth() {",
+      "    var data = $.NSMutableData.dataWithLength(" + procInfoSize + ");",
+      "    return $.proc_pidinfo(pid, 3, 1, data.mutableBytes, " + procInfoSize + ") === " + procInfoSize + " ? encode(data) : null;",
+      "  }",
+      "  var first = birth();",
+      "  if (!first || !" + includeArguments + ") return JSON.stringify([first]);",
+      "  var argv = $.NSMutableData.dataWithLength(" + maximumArguments + ");",
+      "  var length = decode('" + size.toString("base64") + "');",
+      "  var mib = decode('" + mib.toString("base64") + "');",
+      "  var path = $.NSMutableData.dataWithLength(4096);",
+      "  var hasArguments = $.sysctl(mib.bytes, 3, argv.mutableBytes, length.mutableBytes, null, 0) === 0;",
+      "  var hasPath = $.proc_pidpath(pid, path.mutableBytes, 4096) > 0;",
+      "  return JSON.stringify([first, birth(), hasArguments ? encode(length) : null, hasArguments ? encode(argv) : null, hasPath ? encode(path) : null]);",
+      "}"
+    ].join("\n")], { encoding: "utf8", timeout: 4_000, maxBuffer: 512 * 1024 });
+    const [first, last, count, encodedArguments, encodedPath] = JSON.parse(stdout);
+    const status = decodeDarwinProcessStatus(first, pid, procInfoSize);
+    if (status === undefined || !includeArguments || status.exited) return status === undefined ? undefined : { status };
+    const confirmed = decodeDarwinProcessStatus(last, pid, procInfoSize);
+    if (confirmed === undefined || confirmed.exited || confirmed.startTicks !== status.startTicks || confirmed.uid !== status.uid) return undefined;
+    if (typeof count !== "string" || typeof encodedArguments !== "string" || typeof encodedPath !== "string") return { status };
+    const lengthBytes = Buffer.from(count, "base64");
+    if (lengthBytes.byteLength !== 8) return { status };
+    const length = Number(lengthBytes.readBigUInt64LE());
+    if (!Number.isSafeInteger(length) || length < 8 || length > maximumArguments) return { status };
+    const content = Buffer.from(encodedArguments, "base64").subarray(0, length);
+    const argv = decodeDarwinArguments(content);
+    const path = Buffer.from(encodedPath, "base64");
+    const pathEnd = path.indexOf(0);
+    if (argv === undefined || pathEnd <= 0) return { status };
+    const executable = await realpath(path.toString("utf8", 0, pathEnd));
+    const fingerprint = { pid, startTicks: status.startTicks, uid: status.uid, args: argv.args, executable,
+      commandHash: digestBytes(argv.command), executableHash: digestBytes(Buffer.from(executable)) };
+    return { status, fingerprint, environment: argv.environment };
+  } catch {
+    return undefined;
+  }
+}
+function decodeDarwinProcessStatus(encoded, pid, expectedSize) {
+  if (typeof encoded !== "string") return undefined;
+  const data = Buffer.from(encoded, "base64");
+  if (data.length !== expectedSize || data.readUInt32LE(12) !== pid) return undefined;
+  const seconds = data.readBigUInt64LE(120), microseconds = data.readBigUInt64LE(128);
+  if (seconds === 0n || microseconds >= 1_000_000n) return undefined;
+  return { startTicks: (seconds * 1_000_000n + microseconds).toString(), uid: data.readUInt32LE(20), exited: data.readUInt32LE(4) === 5 };
+}
+function decodeDarwinArguments(content) {
+  if (content.byteLength < 8) return undefined;
+  const argc = content.readInt32LE();
+  let cursor = content.indexOf(0, 4) + 1;
+  if (argc < 1 || argc > MAX_ARGS + 1 || cursor <= 4) return undefined;
+  while (cursor < content.length && content[cursor] === 0) cursor++;
+  const commandStart = cursor;
+  const args = [];
+  for (let index = 0; index < argc; index++) {
+    const end = content.indexOf(0, cursor);
+    if (end < 0) return undefined;
+    args.push(content.toString("utf8", cursor, end));
+    cursor = end + 1;
+  }
+  return { args, command: content.subarray(commandStart, cursor), environment: content.subarray(cursor) };
+}
 async function processFingerprint(pid) {
   if (!Number.isSafeInteger(pid) || pid < 1) return undefined;
   if (process.platform === "win32") return windowsProcessFingerprint(pid);
+  if (process.platform === "darwin") return (await darwinProcessObservation(pid, true))?.fingerprint;
   if (process.platform !== "linux") return undefined;
   try {
     const proc = "/proc/" + pid;
@@ -539,15 +629,18 @@ async function processFingerprint(pid) {
 class ProcessIdentityUnconfirmed extends Error {}
 async function recordedProcessFingerprint(expected) {
   const observed = await processFingerprint(expected.pid);
-  if (process.platform !== "linux") return observed;
+  if (process.platform !== "linux" && process.platform !== "darwin") return observed;
   if (observed !== undefined) {
     if (observed.startTicks !== expected.startTicks || fingerprintsMatch(observed, expected)) return observed;
     throw new ProcessIdentityUnconfirmed("The recorded process is alive but its executable or command identity changed.");
   }
 
   try {
-    const status = await linuxProcessStatus("/proc/" + expected.pid);
-    if (status.exited || status.startTicks !== expected.startTicks) return undefined;
+    const status = await posixProcessStatus(expected.pid);
+    if (status?.exited || (status !== undefined && status.startTicks !== expected.startTicks)) return undefined;
+    if (status === undefined) {
+      try { process.kill(expected.pid, 0); } catch (error) { if (error?.code === "ESRCH") return undefined; }
+    }
   } catch (error) {
     if (error?.code === "ENOENT") {
       try { process.kill(expected.pid, 0); } catch (probeError) {
@@ -694,6 +787,16 @@ async function bootstrapChildMatches(fingerprint, record) {
   ) return false;
   try {
     if (process.platform === "win32") return true;
+    if (process.platform === "darwin") {
+      const { stdout } = await execFileAsync("/usr/sbin/lsof", ["-w", "-a", "-p", String(fingerprint.pid), "-d", "cwd", "-F0fn"],
+        { encoding: "utf8", timeout: 4_000, maxBuffer: 16 * 1024 });
+      const fields = stdout.split("\0").map((field) => field.replace(/^\n/, ""));
+      if (fields[0] !== "p" + fingerprint.pid || fields[1] !== "fcwd" || !fields[2]?.startsWith("n/")) return false;
+      const cwd = await realpath(fields[2].slice(1));
+      const current = await darwinProcessObservation(fingerprint.pid, true);
+      return fingerprintsMatch(current?.fingerprint, fingerprint) && digestBytes(Buffer.from(cwd)) === record.childCwdHash
+        && current.environment?.toString("utf8").split("\0").includes("JOKO_PI_SPAWN_IDENTITY=" + record.spawnIdentity) === true;
+    }
     const cwd = await realpath("/proc/" + fingerprint.pid + "/cwd");
     return digestBytes(Buffer.from(cwd)) === record.childCwdHash
       && await processHasSpawnIdentity(fingerprint.pid, record.spawnIdentity);
@@ -750,6 +853,11 @@ async function bootstrapChildProcess(record) {
 }
 async function processIdCandidates() {
   if (process.platform === "linux") return readdir("/proc");
+  if (process.platform === "darwin") {
+    const { stdout } = await execFileAsync("/bin/ps", ["-U", String(process.getuid()), "-o", "pid="],
+      { encoding: "utf8", timeout: 4_000, maxBuffer: 128 * 1024 });
+    return stdout.trim().split(/\s+/);
+  }
   if (process.platform !== "win32") return [];
   const powershell = await trustedWindowsPowerShell();
   if (powershell === undefined) return [];
@@ -978,6 +1086,7 @@ function unixSocketPath(parent, name) {
   }
   const path = join(parent, name);
   if (process.platform === "linux" && Buffer.byteLength(path) > MAX_LINUX_UNIX_SOCKET_PATH_BYTES) fail();
+  if (process.platform === "darwin" && Buffer.byteLength(path) > MAX_DARWIN_UNIX_SOCKET_PATH_BYTES) fail();
   return path;
 }
 function bootstrapRecord(value, expectedIdentity) {
@@ -4326,7 +4435,7 @@ async function runBootstrapReaper(root, expectedIdentity, expectedHash, expected
   if (!(await stopExactProcess(child, "SIGTERM"))) fail();
 }
 async function spawnOwner(root, request, rawRequest) {
-  if (!(["linux", "win32"].includes(process.platform))) fail();
+  if (!(["linux", "win32", "darwin"].includes(process.platform))) fail();
   const paths = sessionPaths(root, request.identity);
   await mkdir(paths.sessionRoot, { mode: 0o700 });
   await privateDirectory(paths.sessionRoot);

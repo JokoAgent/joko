@@ -138,7 +138,8 @@ interface BrokerFixture {
 }
 
 async function brokerFixture(source = REMOTE_PI_BROKER_SOURCE): Promise<BrokerFixture> {
-  const root = await mkdtemp(join(tmpdir(), "joko-broker-"));
+  const socketParent = process.platform === "darwin" ? await realpath("/tmp") : tmpdir();
+  const root = await mkdtemp(join(socketParent, "joko-broker-"));
   const managedRoot = join(root, ".joko", "pi-broker");
   const identity = digest("durable-broker-identity").slice(0, 32);
   const runtimeRoot = join(root, ".joko", "runtime", identity);
@@ -778,6 +779,16 @@ async function exactKill(pid: number, mode: "daemon" | "owner", sourcePath: stri
     await new Promise((resolveWait) => setTimeout(resolveWait, 250));
     return;
   }
+  if (process.platform === "darwin") {
+    const observation = spawnSync("/bin/ps", ["-ww", "-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 4_000 });
+    expect(observation.status).toBe(0);
+    expect(observation.stdout).toContain(` ${sourcePath} ${mode} `);
+    process.kill(pid, "SIGKILL");
+    await waitUntil(() => {
+      try { process.kill(pid, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+    });
+    return;
+  }
   const fields = (await readFile(`/proc/${pid}/cmdline`, "utf8")).split("\0");
   expect(fields).toContain(sourcePath);
   expect(fields).toContain(mode);
@@ -1346,7 +1357,48 @@ try {
     }
   }, 15_000);
 
-  it.runIf(process.platform === "linux" || process.platform === "win32")(
+  it.runIf(process.platform === "darwin")("proves the stock macOS process birth, unjoined argv and bootstrap identity", async () => {
+    const directory = await mkdtemp(join(await realpath("/tmp"), "joko-darwin-owner-"));
+    const harnessPath = join(directory, "process-identity.mjs");
+    const harness = REMOTE_PI_BROKER_SOURCE.replace("main().catch(() => process.exit(1));", String.raw`
+const executable = await realpath(process.execPath);
+const cwd = await realpath(dirname(process.argv[1]));
+const args = ["-e", "setInterval(() => {}, 1000)", "--", "two words", ""];
+const spawnIdentity = "a".repeat(64);
+const child = spawn(executable, args, { cwd, env: { JOKO_PI_SPAWN_IDENTITY: spawnIdentity }, stdio: "ignore" });
+const exited = new Promise((resolveExit, rejectExit) => {
+  child.once("exit", (_code, signal) => resolveExit(signal));
+  child.once("error", rejectExit);
+});
+try {
+  const fingerprint = await waitForFingerprint(child.pid);
+  const current = await recordedProcessFingerprint(fingerprint);
+  const childIdentity = { spawnIdentity, childCommandHash: fingerprint.commandHash, childExecutableHash: fingerprint.executableHash,
+    childCwdHash: digestBytes(Buffer.from(cwd)) };
+  const confirmed = await bootstrapChildMatches(fingerprint, childIdentity);
+  const wrongSpawn = await bootstrapChildMatches(fingerprint, { ...childIdentity, spawnIdentity: "b".repeat(64) });
+  const stopped = await stopExactProcess(fingerprint);
+  process.stdout.write(JSON.stringify({ exactArguments: exactProcessArguments(fingerprint.args, [executable, ...args]),
+    sameObservation: fingerprintsMatch(current, fingerprint), confirmed, wrongSpawn, stopped, signal: await exited }));
+} finally {
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+}
+`);
+    try {
+      expect(harness).not.toBe(REMOTE_PI_BROKER_SOURCE);
+      await writeFile(harnessPath, harness, { mode: 0o600 });
+      const result = spawnSync(process.execPath, [harnessPath], { encoding: "utf8", timeout: 24_000, maxBuffer: 16 * 1024 });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        exactArguments: true, sameObservation: true, confirmed: true, wrongSpawn: false, stopped: true, signal: "SIGTERM"
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it.runIf(["linux", "win32", "darwin"].includes(process.platform))(
     "keeps the exact child and replay alive across manager crash, then rotates relay authority",
     async () => {
       const fixture = await brokerFixture();
@@ -1441,7 +1493,7 @@ try {
         await rm(fixture.root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
       }
     },
-    process.platform === "win32" ? 120_000 : 30_000
+    process.platform === "linux" ? 30_000 : 120_000
   );
 
   it.runIf(process.platform === "linux" || process.platform === "win32")(
