@@ -11278,10 +11278,10 @@ export class SessionHost {
 
   private isOrdinaryLocalCodexSession(stored: StoredSession): boolean {
     return this.#store.getBackend(stored.descriptor.backendId).descriptor.adapterKind === "codex"
-      && this.isOrdinaryLocalPlanSession(stored);
+      && this.isOrdinaryLocalSession(stored);
   }
 
-  private isOrdinaryLocalPlanSession(stored: StoredSession): boolean {
+  private isOrdinaryLocalSession(stored: StoredSession): boolean {
     const session = stored.descriptor;
     return session.remoteWorkspace === undefined
       && this.#store.getTarget(session.targetId).descriptor.remoteWorkspace === undefined
@@ -11297,7 +11297,7 @@ export class SessionHost {
     const stored = this.#store.getSession(sessionId);
     const backend = this.#store.getBackend(stored.descriptor.backendId).descriptor.adapterKind;
     if (backend === "codex") return this.isLocalCodexPlanRun(stored, runId) ? backend : undefined;
-    if (backend !== "claude-agent-sdk-stdio" || !this.isOrdinaryLocalPlanSession(stored)) return undefined;
+    if (backend !== "claude-agent-sdk-stdio" || !this.isOrdinaryLocalSession(stored)) return undefined;
     const run = this.#store.findRun(runId)?.descriptor;
     const queue = this.#store.findQueueItemByRunId(sessionId, runId, { includeCleared: true });
     return run?.source === "user" && run.parentRunId === undefined && queue?.disposition === "prompt"
@@ -15202,8 +15202,8 @@ export class SessionHost {
           this.failQueueItemForAuthentication(pending, authenticationFailure);
           continue;
         }
-        const claimBackendInstanceGeneration = this.#store
-          .getBackend(claimSession.descriptor.backendId).descriptor.instanceGeneration;
+        const claimBackend = this.#store.getBackend(claimSession.descriptor.backendId).descriptor;
+        const claimBackendInstanceGeneration = claimBackend.instanceGeneration;
         if (pending.backendInstanceGeneration !== undefined && pending.backendInstanceGeneration !== claimBackendInstanceGeneration) {
           this.#failExpiredApplicationInput(pending, {
             code: "APPLICATION_INPUT_EXPIRED", message: "The original Backend instance is no longer available.",
@@ -15213,12 +15213,29 @@ export class SessionHost {
         }
         const scheduleGate = scheduled ? this.#scheduleDispatchGate : undefined;
         if (scheduleGate?.acquire(pending.runId) === false) return;
+        const candidate = pending;
         let claimedItem: ReturnType<OperationalStore["claimNextQueueItem"]>;
         try {
-          claimedItem = this.#store.claimNextQueueItem({
-            sessionId,
-            backendInstanceGeneration: claimBackendInstanceGeneration,
-            traceId: `dispatch:${pending.id}`
+          claimedItem = this.#store.transaction((store) => {
+            // Once its native predecessor finishes, a held follow-up can start a fresh turn.
+            if (!otherActive && !bypassesCompaction && claimBackend.adapterKind === "pi"
+              && candidate.disposition === "follow_up" && !candidate.editLocked && !store.getQueueControl(sessionId).interactionLocked
+              && candidate.body.text.trim() !== "" && !candidate.body.text.trimStart().startsWith("/")
+              && candidate.body.images.length === 0 && candidate.body.files.length === 0 && candidate.body.mentions.length === 0
+              && candidate.body.replyQuote === undefined && candidate.body.todoQuote === undefined
+              && !candidate.body.messageReferences?.length && !hasTurnOverrides(candidate.executionOverrides)
+              && claimSession.descriptor.worktree === undefined && this.isOrdinaryLocalSession(claimSession) && this.isOwnerRunInput(candidate)
+              && store.hasCompletedPromptAtQueueAdmission(candidate, claimSession.descriptor.binding.generation, claimBackendInstanceGeneration)) {
+              store.editQueueItem({
+                queueItemId: candidate.id, body: { ...candidate.body, disposition: "prompt" },
+                expectedRevision: candidate.revision, traceId: `dispatch:${candidate.id}:settled-follow-up`
+              });
+            }
+            return store.claimNextQueueItem({
+              sessionId,
+              backendInstanceGeneration: claimBackendInstanceGeneration,
+              traceId: `dispatch:${candidate.id}`
+            });
           });
         } catch (error) { scheduleGate?.release(pending.runId); throw error; }
         if (claimedItem === undefined) {

@@ -33,6 +33,7 @@ import {
   ProviderConfigurationSchema,
   ProviderKind,
   QueueDeliveryMode,
+  QueueItemState,
   ResourceAcquisitionSourceSchema,
   ResourceKind,
   ResourceScope,
@@ -61,8 +62,10 @@ import {
   compactMutation,
   createManualScheduleMutation,
   createSessionMutation,
+  editQueuedInputMutation,
   navigateMutation,
   pauseQueueMutation,
+  queueItemFrom,
   queueRunIdFrom,
   resolvePermissionMutation,
   restartBackendMutation,
@@ -70,6 +73,7 @@ import {
   scheduleIdFrom,
   sendInputMutation,
   sessionIdFrom,
+  setQueueItemEditLockMutation,
   submit,
   triggerScheduleMutation
 } from "./operations.js";
@@ -92,6 +96,66 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     releaseCompactionGate = undefined;
     await fixture?.close();
     fixture = undefined;
+  });
+
+  it("dispatches the saved Pi follow-up once after its original turn settles while paused", { timeout: 90_000 }, async () => {
+    const originalText = "Keep the original Pi turn open for this test.";
+    const queuedText = "Follow up after the original Pi turn.";
+    const savedText = "Send this edited text after the original Pi turn.";
+    let releaseOriginal!: () => void;
+    const originalGate = new Promise<void>((resolve) => { releaseOriginal = resolve; });
+    let savedRequests = 0;
+    try {
+      fixture = await RealPiSystemFixture.start({ providerResponder: async ({ request }) => {
+        const messages = JSON.stringify(request.body["messages"]);
+        if (messages.includes(savedText)) {
+          savedRequests += 1;
+          expect(messages).not.toContain(queuedText);
+          return { kind: "text", text: "Completed the saved follow-up." };
+        }
+        expect(messages).toContain(originalText);
+        await originalGate;
+        return { kind: "text", text: "Completed the original turn." };
+      } });
+      const { clients, connectionId } = await fixture.pair("Pi paused follow-up owner");
+      const mutate = async (mutation: Parameters<typeof submit>[2]) => {
+        const operation = await submit(clients.operation, connectionId, mutation);
+        expect(operation.state, operation.error?.message).toBe(OperationState.SUCCEEDED);
+        return operation;
+      };
+      const sessionId = sessionIdFrom(await mutate(createSessionMutation({
+        backendId: "pi", targetId: "workspace-real-pi", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID
+      })));
+      const generation = (await clients.session.getSession({ sessionId })).session!.nativeBinding!.runtimeGeneration;
+      const original = queueItemFrom(await mutate(sendInputMutation(sessionId, generation, originalText)));
+      const store = fixture.application.store;
+      await waitForRealSystem(async () => store.getQueueItem(original.queueItemId),
+        (item) => item.state === "backend_accepted", "original published Pi acceptance", 30_000);
+      const control = async () => (await clients.queue.getQueueControl({ sessionId })).queueControl!;
+      await mutate(pauseQueueMutation(await control()));
+      const queued = queueItemFrom(await mutate(sendInputMutation(sessionId, generation, queuedText, QueueDeliveryMode.FOLLOW_UP)));
+      const identity = store.getQueueItem(queued.queueItemId);
+      const lockToken = randomUUID();
+      await mutate(setQueueItemEditLockMutation(queued, lockToken, true));
+      await mutate(editQueuedInputMutation(queued, savedText, QueueDeliveryMode.FOLLOW_UP, lockToken));
+      await mutate(setQueueItemEditLockMutation(queued, lockToken, false));
+      releaseOriginal();
+      const waitForSuccess = (runId: string) => waitForRealSystem(() => clients.run.getRun({ runId }),
+        (reply) => reply.run?.state === RunState.SUCCEEDED, "published Pi Run success", 30_000);
+      await waitForSuccess(original.runId);
+      expect(savedRequests).toBe(0);
+      expect((await clients.queue.listQueueItems({ sessionId })).queueItems.find((item) => item.queueItemId === queued.queueItemId))
+        .toMatchObject({ state: QueueItemState.ACCEPTED, deliveryMode: QueueDeliveryMode.FOLLOW_UP, editLocked: false });
+      await mutate(resumeQueueMutation(await control()));
+      await waitForSuccess(queued.runId);
+      expect(savedRequests).toBe(1);
+      expect(store.getQueueItem(queued.queueItemId)).toMatchObject({
+        operationId: identity.operationId, runId: identity.runId, attemptId: identity.attemptId,
+        state: "completed", disposition: "prompt", body: { text: savedText }
+      });
+    } finally {
+      releaseOriginal();
+    }
   });
 
   it("binds a native Pi image turn and its usage to the original Run after a fresh timeline read", { timeout: 60_000 }, async () => {
