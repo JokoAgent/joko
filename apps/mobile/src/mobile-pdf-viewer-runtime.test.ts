@@ -13,7 +13,7 @@ afterEach(() => {
 });
 
 describe("offline mobile PDF viewer runtime", () => {
-  it("executes the exact chunk/SHA path before opening and rendering every declared page", async () => {
+  it.each([false, true])("opens exact verified bytes and renders the PDF at its selected reading position, resume=%s", async (resume) => {
     const posted: Record<string, unknown>[] = [];
     let captured: Uint8Array | undefined;
     const testWindow = window as unknown as Window & {
@@ -46,10 +46,18 @@ describe("offline mobile PDF viewer runtime", () => {
     };
     Object.defineProperty(window, "crypto", { configurable: true, value: {} });
     vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({} as CanvasRenderingContext2D);
+    const scrollToPage = vi.fn();
+    const findElement = document.getElementById.bind(document);
+    vi.spyOn(document, "getElementById").mockImplementation(id => {
+      const element = findElement(id);
+      if (id === "page-2" && element !== null) element.scrollIntoView = scrollToPage;
+      return element;
+    });
 
     const html = buildMobilePdfViewerHtml({ instanceId: "runtime-1", locale: "en", title: "Runtime proof",
       background: "#ffffff", surface: "#f5f5f5", ink: "#111111", muted: "#666666",
-      accent: "#3366ff", border: "#dddddd" }, runtimeBundle());
+      accent: "#3366ff", border: "#dddddd",
+      resumeAt: resume ? { page: 2, zoomPercent: 125, fitToWidth: false } : undefined }, runtimeBundle());
     document.documentElement.innerHTML = html;
     const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/gu)].map((match) => match[1]!);
     new Function(scripts[1]!)();
@@ -71,6 +79,9 @@ describe("offline mobile PDF viewer runtime", () => {
     await vi.waitFor(() => expect(posted).toContainEqual(expect.objectContaining({
       type: "joko-pdf-viewer/status", state: "complete", pageCount: 2, renderedPages: 2
     })));
+    expect(posted).toContainEqual({ type: "joko-pdf-viewer/position", instanceId: "runtime-1", page: resume ? 2 : 1,
+      zoomPercent: resume ? 125 : 100, fitToWidth: !resume });
+    expect(scrollToPage).toHaveBeenCalledTimes(resume ? 1 : 0);
     expect(captured).toEqual(bytes);
     expect(posted.some((message) => message["state"] === "error")).toBe(false);
     expect(document.querySelectorAll(".page")).toHaveLength(2);

@@ -17,6 +17,7 @@ import {
   buildMobilePdfViewerCommand,
   buildMobilePdfViewerHtml,
   parseMobilePdfViewerMessage,
+  type MobilePdfReadingPosition,
   type MobilePdfViewerStatus
 } from "./mobile-pdf-viewer";
 import { MobilePreviewControlBar, MobilePreviewControlButton } from "./MobilePreviewControls";
@@ -72,12 +73,9 @@ export function MobilePdfViewer({
   const transferRef = useRef<MobilePdfTransferSession | undefined>(undefined);
   const mountedRef = useRef(true);
   const statusRef = useRef(onStatusChange);
+  const readingPosition = useRef<{ readonly ownerKey: string; readonly position: MobilePdfReadingPosition } | undefined>(undefined);
   const [viewerStatus, setViewerStatus] = useState<MobilePdfViewerStatus>();
   statusRef.current = onStatusChange;
-
-  const html = useMemo(() => buildMobilePdfViewerHtml({
-    instanceId, locale, title, background, surface, ink, muted, accent, border
-  }, pdfJsRuntime), [accent, background, border, ink, instanceId, locale, muted, surface, title]);
 
   const publishStatus = useCallback((status: MobilePdfViewerStatus) => {
     if (!mountedRef.current) return;
@@ -112,12 +110,19 @@ export function MobilePdfViewer({
       ? "preview.resourcePressureUnavailable" : "preview.pdfFailure"));
   }, [emitFailure, locale]);
 
+  const ownerKey = [instanceId, uri, fileName, byteSize, sha256Hex, locale,
+    background, surface, ink, muted, accent, border, title].join("\u0000");
+  if (readingPosition.current?.ownerKey !== ownerKey) readingPosition.current = undefined;
   const resource = useMobilePreviewResourceLifecycle({
-    ownerKey: [instanceId, uri, fileName, byteSize, sha256Hex, locale,
-      background, surface, ink, muted, accent, border, title].join("\u0000"),
+    ownerKey,
     releaseRenderer: stopViewer,
     reportFailure: handleResourceFailure
   });
+  const source = useMemo(() => resource.rendererMounted ? ({ baseUrl: pdfViewerBaseUrl, html: buildMobilePdfViewerHtml({
+    instanceId, locale, title, background, surface, ink, muted, accent, border,
+    resumeAt: readingPosition.current?.position
+  }, pdfJsRuntime) }) : undefined, [accent, background, border, ink, instanceId, locale, muted, ownerKey,
+    resource.rendererGeneration, resource.rendererMounted, surface, title]);
 
   const startTransfer = useCallback((rendererToken: string) => {
     if (transferRef.current || !resource.ownsRenderer(rendererToken)) return;
@@ -155,6 +160,11 @@ export function MobilePdfViewer({
     if (!mountedRef.current || !resource.ownsRenderer(rendererToken)) return;
     const message = parseMobilePdfViewerMessage(event.nativeEvent.data, instanceId);
     if (!message) return;
+    if (message.type === "joko-pdf-viewer/position") {
+      readingPosition.current = { ownerKey, position: { page: message.page, zoomPercent: message.zoomPercent,
+        fitToWidth: message.fitToWidth } };
+      return;
+    }
     if (message.type === "joko-pdf-viewer/status") {
       publishStatus(message);
       if (message.state === "ready") {
@@ -170,7 +180,7 @@ export function MobilePdfViewer({
       if (transferRef.current !== transfer) return;
       emitFailure(error);
     });
-  }, [emitFailure, instanceId, publishStatus, resource, startTransfer]);
+  }, [emitFailure, instanceId, ownerKey, publishStatus, resource, startTransfer]);
 
   useEffect(() => {
     if (resource.phase !== "suspended" && resource.phase !== "recovering") return;
@@ -207,7 +217,7 @@ export function MobilePdfViewer({
         disabled={!controllable || (viewerStatus?.zoomPercent ?? 100) >= 300} ink={ink} label="+"
         onPress={() => sendControl("zoom-in")} surface={background} />
     </MobilePreviewControlBar>
-    {resource.rendererMounted ? <PdfWebView
+    {source !== undefined ? <PdfWebView
       key={`${instanceId}:${resource.rendererGeneration}`}
       ref={attachWebView}
       accessibilityLabel={mobileMessage(locale, "preview.pdfLabel", { title })}
@@ -232,7 +242,7 @@ export function MobilePdfViewer({
       scrollEnabled={false}
       setSupportMultipleWindows={false}
       sharedCookiesEnabled={false}
-      source={{ html, baseUrl: pdfViewerBaseUrl }}
+      source={source}
       style={{ backgroundColor: "transparent", flex: 1 }}
       thirdPartyCookiesEnabled={false}
     /> : <View accessible accessibilityRole="text" accessibilityLabel={releasedLabel}
