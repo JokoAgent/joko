@@ -1,8 +1,8 @@
 import { existsSync } from "node:fs";
 import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
-import { BrowserAutomationTarget, BrowserTakeoverMouseButton, OperationMutationSchema, OperationState,
-  type BrowserTakeoverActionMutation } from "@joko/contracts";
+import { BrowserAutomationTarget, BrowserTakeoverActionMutationSchema, BrowserTakeoverMouseButton, OperationMutationSchema,
+  OperationState } from "@joko/contracts";
 import { OperationalBrowserState } from "@joko/orchestrator";
 import { chromium } from "playwright-core";
 import { expect, it } from "vitest";
@@ -95,7 +95,7 @@ it.skipIf(!existsSync(sidebarExecutable))("adopts a native same-origin sidebar p
       <button onclick="window.open('${foreign}','other-help','popup')">Open other</button>` }));
     await opener.context().route(`${origin}/help`, (route) => route.fulfill({ contentType: "text/html", body: "<!doctype html><title>Task help</title><p>Help in the same task.</p>" }));
     await opener.context().route(foreign, (route) => route.fulfill({ contentType: "text/html", body: "<!doctype html><title>Different origin</title>" }));
-    const act = (action: BrowserTakeoverActionMutation["action"]) => mutate({ case: "browserTakeoverAction", value: {
+    const act = (action: MessageInitShape<typeof BrowserTakeoverActionMutationSchema>["action"]) => mutate({ case: "browserTakeoverAction", value: {
       browserProviderId: provider.id, takeoverId: source.takeoverId, pageId: source.pageId, generation: BigInt(source.generation), action
     } });
     expect((await act({ case: "navigate", value: { url: `${origin}/start` } })).state).toBe(OperationState.SUCCEEDED);

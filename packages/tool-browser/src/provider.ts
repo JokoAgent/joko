@@ -12,7 +12,7 @@ import {
   type Response
 } from "playwright-core";
 import { isWithin } from "@joko/core/policy";
-import { installHtmlSnapshot, validateHtmlSnapshot, type BrowserHtmlSnapshot } from "./html-preview.js";
+import { installHtmlSnapshot, isWorkspaceHtmlPreviewUrl, validateHtmlSnapshot, type BrowserHtmlSnapshot } from "./html-preview.js";
 import { BrowserProxyRequestGate, type BrowserProxyRequestGateHandle } from "./proxy-request-gate.js";
 import {
   browserProxyRouteKey, buildBrowserProxyLaunchArgs, parseBrowserProxyServer, publicBrowserProxyRoute,
