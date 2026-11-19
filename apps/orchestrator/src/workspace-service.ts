@@ -1498,7 +1498,7 @@ export class WorkspaceService {
       return this.#remoteInvoke(workspaceId, "gitDiff", [paths, options]);
     }
     await this.#gitMutationTail;
-    return this.#readGitDiff(workspaceId, paths, options);
+    return this.#readGitDiff(workspaceId, paths, { ...options, binaryPatch: true });
   }
 
   async gitReviewDiff(
@@ -1754,7 +1754,7 @@ export class WorkspaceService {
       }
       const layer = input.source === "staged" ? "index" : "workingTree";
       const ignoreWhitespace = input.target === "hunk" && input.ignoreWhitespace === true;
-      let raw = await this.#readLayerDiff(workspace, layer, uniquePaths(oldPath, path), ignoreWhitespace);
+      let raw = await this.#readLayerDiff(workspace, layer, uniquePaths(oldPath, path), { ignoreWhitespace, binaryPatch: true });
       if (raw === "" && input.target === "file") {
         await this.#applyUntrackedFileMutation(workspace, input.action, path);
         return (await this.#readGitDiff(workspaceId, [], {})).repositoryRevision;
@@ -2584,7 +2584,7 @@ export class WorkspaceService {
   async #readGitDiff(
     workspaceId: string,
     paths: readonly string[],
-    options: { readonly baseRevision?: string; readonly headRevision?: string; readonly ignoreWhitespace?: boolean }
+    options: { readonly baseRevision?: string; readonly headRevision?: string; readonly ignoreWhitespace?: boolean; readonly binaryPatch?: boolean }
   ): Promise<WorkspaceGitDiff> {
     const workspace = this.requireWorkspace(workspaceId);
     await this.#requireGitRoot(workspace);
@@ -2625,27 +2625,32 @@ export class WorkspaceService {
         mergeBaseRevision: mergeBaseOid
       };
     }
+    // Review and its write fence only need object IDs for binary changes.
     const [fullIndex, fullTrackedWorkingTree, fullUntrackedWorkingTree, status, headResult] = await Promise.all([
-      this.#readLayerDiff(workspace, "index", [], false),
-      this.#readLayerDiff(workspace, "workingTree", [], false),
+      this.#readLayerDiff(workspace, "index", []),
+      this.#readLayerDiff(workspace, "workingTree", []),
       this.#readUntrackedDiff(workspace, [], false),
       runProcess(this.#gitExecutable, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], workspace.root, 20_000, 16 * 1024 * 1024),
       runProcess(this.#gitExecutable, ["rev-parse", "--verify", "HEAD^{commit}"], workspace.root, 10_000, 1024 * 1024, new Set([0, 128]))
     ]);
-    const fullWorkingTree = `${fullTrackedWorkingTree}${fullUntrackedWorkingTree}`;
-    const index = canonicalPaths.length === 0 && options.ignoreWhitespace !== true
+    const useFullPaths = canonicalPaths.length === 0 && options.ignoreWhitespace !== true;
+    const useTrackedSummary = useFullPaths && options.binaryPatch !== true;
+    const index = useTrackedSummary
       ? fullIndex
-      : await this.#readLayerDiff(workspace, "index", canonicalPaths, options.ignoreWhitespace === true);
-    const workingTree = canonicalPaths.length === 0 && options.ignoreWhitespace !== true
-      ? fullWorkingTree
-      : `${await this.#readLayerDiff(workspace, "workingTree", canonicalPaths, options.ignoreWhitespace === true)}${await this.#readUntrackedDiff(workspace, canonicalPaths, options.ignoreWhitespace === true)}`;
+      : await this.#readLayerDiff(workspace, "index", canonicalPaths, options);
+    const trackedWorkingTree = useTrackedSummary
+      ? fullTrackedWorkingTree
+      : await this.#readLayerDiff(workspace, "workingTree", canonicalPaths, options);
+    const untrackedWorkingTree = useFullPaths
+      ? fullUntrackedWorkingTree
+      : await this.#readUntrackedDiff(workspace, canonicalPaths, options.ignoreWhitespace === true);
     const headRevision = headResult.stdout.trim();
     return {
       index,
-      workingTree,
+      workingTree: `${trackedWorkingTree}${untrackedWorkingTree}`,
       comparison: "",
       repositoryRevision: createHash("sha256")
-        .update(`worktree\0${headRevision}\0${status.stdout}\0${fullIndex}\0${fullWorkingTree}`)
+        .update(`worktree\0${headRevision}\0${status.stdout}\0${fullIndex}\0${fullTrackedWorkingTree}${fullUntrackedWorkingTree}`)
         .digest("hex"),
       ...(isImmutableGitObjectId(headRevision) ? { headRevision } : {})
     };
@@ -2655,15 +2660,15 @@ export class WorkspaceService {
     workspace: WorkspaceRegistration,
     source: Exclude<WorkspaceGitDiffSource, "comparison">,
     paths: readonly string[],
-    ignoreWhitespace: boolean
+    options: { readonly ignoreWhitespace?: boolean; readonly binaryPatch?: boolean } = {}
   ): Promise<string> {
     const args = [
       "diff",
-      ...(ignoreWhitespace ? ["--ignore-all-space"] : []),
+      ...(options.ignoreWhitespace === true ? ["--ignore-all-space"] : []),
       ...(source === "index" ? ["--cached"] : []),
       "--no-ext-diff",
       "--no-color",
-      "--binary",
+      options.binaryPatch === true ? "--binary" : "--full-index",
       "--find-renames",
       "--",
       ...paths.map(literalGitPathspec)

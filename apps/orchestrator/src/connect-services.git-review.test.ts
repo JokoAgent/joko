@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createCipheriv, createHash } from "node:crypto";
 import { rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -200,6 +200,66 @@ describe("Connect Git Review contracts", () => {
       await rm(root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it("acknowledges staging a binary file after the combined literal patches exceed the process read cap", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-connect-review-large-index-"));
+    const workspaces = new WorkspaceService();
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: root, windowsHide: true, maxBuffer: 48 * 1024 * 1024 });
+    const existing = ["b1.bin", "b2.bin"];
+    const added = "c.bin";
+    const paths = [...existing, added];
+    const mib = 1024 * 1024;
+    try {
+      git("init", "--quiet");
+      git("-c", "user.name=Review Test", "-c", "user.email=review@example.test", "commit", "--quiet", "--allow-empty", "-m", "base");
+      for (const [index, path] of paths.entries()) {
+        const cipher = createCipheriv("aes-256-ctr", Buffer.alloc(32), Buffer.alloc(16, index + 1));
+        const bytes = Buffer.concat([cipher.update(Buffer.alloc((path === added ? 9 : 10) * mib)), cipher.final()]);
+        bytes[0] = 0;
+        await writeFile(join(root, path), bytes);
+      }
+      git("add", "--", ...existing);
+      const patchBytesBefore = git("diff", "--binary", "--cached").byteLength;
+      expect(patchBytesBefore).toBeLessThan(32 * mib);
+      await workspaces.register({ id: "workspace-review", root, displayName: "Review", trusted: true });
+      const services = createConnectServices(application({ workspaces, capabilities: ["workspace.diff", "workspace.diff.sources", "workspace.diff.stage"] }));
+      const request = create(contract.GetWorkspaceDiffRequestSchema, {
+        workspaceId: "workspace-review", source: contract.GitDiffSource.UNSTAGED
+      });
+      const { diff } = await services.workspace.getWorkspaceDiff(request, context() as never);
+      if (diff === undefined) throw new Error("Review did not return an unstaged diff.");
+      expect(diff.files).toMatchObject([{ relativePath: added, binary: true, hunks: [] }]);
+
+      const result = await services.operation.submitOperation(create(contract.SubmitOperationRequestSchema, {
+        operationId: "stage-binary-with-large-index",
+        connectionId: connection.id,
+        mutation: create(contract.OperationMutationSchema, {
+          payload: { case: "applyWorkspaceDiffHunk", value: create(contract.ApplyWorkspaceDiffHunkMutationSchema, {
+            workspaceId: request.workspaceId, source: request.source,
+            action: contract.WorkspaceDiffAction.STAGE, target: contract.WorkspaceDiffTarget.FILE,
+            relativePath: added, expectedRepositoryRevision: diff.repositoryRevision
+          }) }
+        })
+      }), context() as never);
+      expect(result.operation?.result?.payload?.case).toBe("acknowledgement");
+      const patchBytesAfter = git("diff", "--binary", "--cached").byteLength;
+      expect(patchBytesAfter).toBeGreaterThan(32 * mib);
+      console.info(`Literal Git index patches grew from ${patchBytesBefore} to ${patchBytesAfter} bytes.`);
+      expect(git("rev-parse", `:${added}`).toString()).toBe(git("hash-object", "--no-filters", "--", added).toString());
+
+      const { diff: staged } = await services.workspace.getWorkspaceDiff(create(contract.GetWorkspaceDiffRequestSchema, {
+        workspaceId: request.workspaceId, source: contract.GitDiffSource.STAGED
+      }), context() as never);
+      expect(staged?.files).toMatchObject(paths.map(path => ({ relativePath: path, binary: true, hunks: [] })));
+      const { diff: unstaged } = await services.workspace.getWorkspaceDiff(request, context() as never);
+      expect(unstaged?.files).toEqual([]);
+      expect(staged?.repositoryRevision).toBe(unstaged?.repositoryRevision);
+      expect(staged?.repositoryRevision).not.toBe(diff.repositoryRevision);
+    } finally {
+      await workspaces.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 45_000);
 
   it("lists the conflicted file in a real combined diff without treating it as an ordinary hunk", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-connect-review-conflict-"));
