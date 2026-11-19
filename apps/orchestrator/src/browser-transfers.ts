@@ -5,13 +5,10 @@ import * as contract from "@joko/contracts";
 import type { BlobRef } from "@joko/core";
 import type { BrowserLease, BrowserLeaseFence, BrowserProvider, BrowserTakeoverFence } from "@joko/tool-browser";
 
-import type { ArtifactRecord } from "./artifact-store.js";
+import type { ArtifactStore } from "./artifact-store.js";
 import { toProtoTimestamp } from "./proto-mapper.js";
 
-export interface BrowserTransferArtifactStore {
-  resolveBlobPath(blob: BlobRef): Promise<string>;
-  ingestPath(sourcePath: string, options?: { fileName?: string; mimeType?: string; expiresAt?: number }): Promise<ArtifactRecord>;
-}
+export type BrowserTransferArtifactStore = Pick<ArtifactStore, "resolveBlobPath" | "ingestPath">;
 
 export type BrowserTransferProvider = Pick<BrowserProvider, "generation" | "acquireAgentLease" | "releaseAgentLease" | "uploadFiles" | "recover">;
 
@@ -218,18 +215,22 @@ export class BrowserTransferCoordinator {
       startedAt: this.#now()
     };
     this.remember(record);
+    const assertCurrent = () => {
+      if (isTerminal(record.state) || record.generation !== this.#provider.generation) throw new BrowserGenerationFencedError();
+    };
     try {
       validatePageId(pageId);
       validateDownloadName(sanitizedFileName);
-      const artifact = await this.#artifacts.ingestPath(verifiedLocalPath, { fileName: sanitizedFileName });
+      const artifact = await this.#artifacts.ingestPath(verifiedLocalPath, { fileName: sanitizedFileName, assertCurrent });
+      assertCurrent();
       record.artifact = publicArtifact(artifact);
       record.blob = publicBlob(artifact);
       record.state = contract.BrowserTransferState.COMPLETED;
       record.completedAt = this.#now();
       this.persist(record);
       this.pruneRetained();
-    } catch {
-      this.fail(record, {
+    } catch (error) {
+      this.fail(record, error instanceof BrowserGenerationFencedError ? generationFencedError(true) : {
         code: "BROWSER_DOWNLOAD_INGEST_FAILED",
         phase: "artifact_ingest",
         message: "The browser download could not be validated and stored as an artifact.",

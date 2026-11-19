@@ -305,6 +305,37 @@ describe("BrowserTransferCoordinator", () => {
     expect(provider.calls).toContain("release:lease-1:7");
   });
 
+  it("keeps a resolving upload fenced before the next Browser generation is published", async () => {
+    const artifacts = new FakeArtifacts();
+    const provider = new FakeProvider();
+    let finishResolve!: (path: string) => void;
+    let finishRecovery!: () => void;
+    const path = new Promise<string>(resolve => { finishResolve = resolve; });
+    const recovering = new Promise<void>(resolve => { finishRecovery = resolve; });
+    const resolvePath = vi.spyOn(artifacts, "resolveBlobPath").mockReturnValue(path);
+    const recoverProvider = provider.recover.bind(provider);
+    vi.spyOn(provider, "recover").mockImplementation(async () => { await recovering; await recoverProvider(); });
+    const transfers = new BrowserTransferCoordinator({ artifacts, provider });
+    const uploading = transfers.upload(sourceBlob, "page-1", "#one", uploadOwner("connection-1"));
+    await vi.waitFor(() => expect(resolvePath).toHaveBeenCalledOnce());
+    const original = transfers.list()[0]!;
+    expect(original.state).toBe(contract.BrowserTransferState.PENDING);
+    const restarting = transfers.recover();
+    try {
+      const retired = transfers.get(original.browserTransferId)!;
+      expect(retired).toMatchObject({ state: contract.BrowserTransferState.FAILED, error: { code: "BROWSER_GENERATION_FENCED" } });
+      expect(provider.generation).toBe(7);
+      finishResolve("D:\\artifacts\\verified-upload.txt");
+      expect(await uploading).toEqual(retired);
+      expect(provider.calls).toEqual([]);
+      expect(provider.actions).toEqual([]);
+    } finally {
+      finishResolve("D:\\artifacts\\verified-upload.txt");
+      finishRecovery();
+      await restarting;
+    }
+  });
+
   it("ingests downloads into a durable blob and artifact descriptor", async () => {
     const artifacts = new FakeArtifacts();
     const provider = new FakeProvider();

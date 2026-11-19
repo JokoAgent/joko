@@ -107,7 +107,9 @@ export class ArtifactStore {
     ]);
   }
 
-  async ingestPath(sourcePath: string, options?: { fileName?: string; mimeType?: string; expiresAt?: number }): Promise<ArtifactRecord> {
+  async ingestPath(sourcePath: string,
+    options?: { fileName?: string; mimeType?: string; expiresAt?: number; assertCurrent?: () => void }): Promise<ArtifactRecord> {
+    options?.assertCurrent?.();
     const source = await realpath(sourcePath);
     const roots = await Promise.all(this.#options.ingestRoots.map((root) => realpath(root)));
     if (!roots.some((root) => isWithin(source, root))) throw new Error("Artifact source is outside approved roots.");
@@ -116,12 +118,15 @@ export class ArtifactStore {
     if (sourceStat.size > this.#maximumBlobBytes) throw new Error("Artifact exceeds the configured size limit.");
     const temporaryPath = join(this.#options.rootDirectory, "incoming", randomUUID());
     try {
+      options?.assertCurrent?.();
       await copyFile(source, temporaryPath);
+      options?.assertCurrent?.();
       return await this.finalizeIncoming(temporaryPath, {
         expectedSize: sourceStat.size,
         fileName: options?.fileName ?? basename(source),
         mimeType: options?.mimeType ?? inferMediaType(source),
-        ...(options?.expiresAt === undefined ? {} : { expiresAt: options.expiresAt })
+        ...(options?.expiresAt === undefined ? {} : { expiresAt: options.expiresAt }),
+        ...(options?.assertCurrent === undefined ? {} : { assertCurrent: options.assertCurrent })
       });
     } catch (error) {
       await rm(temporaryPath, { force: true }).catch(() => undefined);
