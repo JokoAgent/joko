@@ -3971,6 +3971,7 @@ describe("Connect security and protocol audit", () => {
     const store = {
       findOperation: () => undefined,
       getTarget: () => existing,
+      listTargets: () => [existing],
       listSessions: () => [],
       upsertTarget
     };

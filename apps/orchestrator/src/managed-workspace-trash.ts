@@ -7,6 +7,7 @@ export interface ManagedWorkspaceTrashRequest {
   readonly workspaceRoot: string;
   readonly targetId: string;
   readonly operationId: string;
+  readonly assertMoveAllowed?: () => void;
 }
 
 export interface ManagedWorkspaceTrashResult {
@@ -41,7 +42,7 @@ export async function moveManagedWorkspaceToTrash(
   if (!isStrictDescendant(managedRoot, trashRoot)) {
     throw new Error("Managed workspace trash path escaped its configured root.");
   }
-  if (isSameOrDescendant(trashRoot, workspaceRoot)) {
+  if (managedWorkspaceContainsPath(trashRoot, workspaceRoot)) {
     throw new Error("A workspace already inside managed trash cannot be deleted again.");
   }
   await mkdir(trashRoot, { recursive: true, mode: 0o700 });
@@ -64,6 +65,7 @@ export async function moveManagedWorkspaceToTrash(
   }
 
   await assertCanonicalDirectory(workspaceRoot, "Managed workspace");
+  request.assertMoveAllowed?.();
   await rename(workspaceRoot, trashedPath);
   await assertCanonicalDirectory(trashedPath, "Trashed managed workspace");
   return { originalRoot: workspaceRoot, trashRoot, trashedPath };
@@ -107,7 +109,7 @@ function isStrictDescendant(root: string, candidate: string): boolean {
   return fragment !== "" && fragment !== ".." && !fragment.startsWith(`..\\`) && !fragment.startsWith("../") && !isAbsolute(fragment);
 }
 
-function isSameOrDescendant(root: string, candidate: string): boolean {
+export function managedWorkspaceContainsPath(root: string, candidate: string): boolean {
   return samePath(root, candidate) || isStrictDescendant(root, candidate);
 }
 

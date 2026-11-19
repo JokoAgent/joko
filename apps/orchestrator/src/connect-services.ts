@@ -440,7 +440,7 @@ import {
 } from "./workspace-service.js";
 import type { GitState, WorkspaceEntryListingPolicy, WorkspaceEntryRecord, WorkspaceFilePreview, WorkspaceGitCommitResult, WorkspaceGitImageSide, WorkspaceGitPushResult, WorkspaceGitReviewSource, WorkspaceRegistration, WorkspaceSearchResult, WorkspaceService as NativeWorkspaceService } from "./workspace-service.js";
 import type { WorkspaceFileChangeRecord, WorkspaceFileChangeScope } from "./workspace-change-stream.js";
-import { moveManagedWorkspaceToTrash } from "./managed-workspace-trash.js";
+import { managedWorkspaceContainsPath, moveManagedWorkspaceToTrash } from "./managed-workspace-trash.js";
 import type { DiscoveredNodeRecord } from "./lan-discovery.js";
 import type { MessageSearchEmbeddingCoordinator, MessageSearchSemanticMode } from "./message-search-embedding.js";
 import { LANGUAGE_TOOL_SETTING_KEY, languageToolsEnabled } from "./lsp-tool-bridge.js";
@@ -17340,11 +17340,20 @@ async function dispatchMutation(
         }
         const deletedAt = Date.now();
         let trashedPath: string | undefined;
+        const assertExclusiveWorkspace = (store: OperationalStore): void => {
+          const usedByAnotherProject = store.listTargets().some(target => target.descriptor.id !== existing.descriptor.id
+            && !isTargetDeleted(target) && target.descriptor.remoteWorkspace === undefined
+            && managedWorkspaceContainsPath(existing.descriptor.workspaceRoot, target.descriptor.workspaceRoot));
+          if (usedByAnotherProject) {
+            throw new ConnectError("Another project uses this directory. Keep the workspace when deleting this project.", Code.FailedPrecondition);
+          }
+        };
         const assertDeletionPrecondition = (store: OperationalStore): void => {
           const current = requireUndeletedTarget(store, existing.descriptor.id);
           if (current.revision !== existing.revision) {
             throw new RevisionConflictError("Target", current.descriptor.id, existing.revision, current.revision);
           }
+          if (payload.value.deleteManagedWorkspace && trashedPath === undefined) assertExclusiveWorkspace(store);
           const currentSessions = store.listSessions({
             targetId: existing.descriptor.id,
             includeArchived: true,
@@ -17370,7 +17379,8 @@ async function dispatchMutation(
                 managedRoot: resolve(dependencies.managedWorkspaceRoot!),
                 workspaceRoot: existing.descriptor.workspaceRoot,
                 targetId: existing.descriptor.id,
-                operationId
+                operationId,
+                assertMoveAllowed: () => assertExclusiveWorkspace(dependencies.store)
               });
               trashedPath = trashed.trashedPath;
               dependencies.workspaceService.unregister(workspaceId);
