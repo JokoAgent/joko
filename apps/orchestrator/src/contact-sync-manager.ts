@@ -123,6 +123,7 @@ export class ContactSyncManager {
   #configuration?: ContactSyncConfigurationRecord;
   #privateKey?: string;
   #transport?: ContactSyncTransportPort;
+  #transportStart?: { readonly promise: Promise<void>; readonly cancel: () => void };
   #abortController = new AbortController();
   #generation = 0;
   #activeSyncs = 0;
@@ -176,12 +177,6 @@ export class ContactSyncManager {
       this.#privateKey = privateKey;
       this.#initialized = true;
       this.#errorCode = undefined;
-      if (configuration.enabled) {
-        this.#store.readContactSyncState(configuration.nodeId);
-        await this.#startTransport();
-        this.#scheduleAutomaticSync(500);
-      }
-      this.#emitChanged();
     } catch (error) {
       this.#initialized = this.#configuration !== undefined;
       this.#errorCode = "identity_unavailable";
@@ -189,6 +184,9 @@ export class ContactSyncManager {
       this.#emitChanged();
       throw new ContactSyncManagerError("UNAVAILABLE", "Contacts sync identity is unavailable.", { cause: error });
     }
+    const configuration = this.#requireConfiguration();
+    if (configuration.enabled) await this.#startAutomaticSync(configuration, 500);
+    this.#emitChanged();
   }
 
   status(): ContactSyncStatus {
@@ -231,21 +229,14 @@ export class ContactSyncManager {
 
   async setEnabled(expectedRevision: bigint, enabled: boolean): Promise<ContactSyncStatus> {
     this.#assertReady();
-    this.#configuration = this.#store.setContactSyncEnabled(expectedRevision, enabled);
+    const configuration = this.#store.setContactSyncEnabled(expectedRevision, enabled);
+    this.#configuration = configuration;
     if (!enabled) {
       this.#revokeRuntimeAuthority();
-      this.#transport?.stop();
-      this.#transport = undefined;
+      this.#stopTransport();
       this.#errorCode = undefined;
     } else {
-      try {
-        this.#store.readContactSyncState(this.#configuration.nodeId);
-        await this.#startTransport();
-        this.#scheduleAutomaticSync(250);
-        this.#errorCode = undefined;
-      } catch (error) {
-        this.#setError(error);
-      }
+      await this.#startAutomaticSync(configuration, 250);
     }
     this.#emitChanged();
     return this.status();
@@ -291,16 +282,19 @@ export class ContactSyncManager {
     this.#assertReady();
     const configuration = this.#requireConfiguration();
     if (!configuration.enabled) throw new ContactSyncManagerError("DISABLED", "Contacts sync is disabled.");
-    if (this.#transport === undefined) {
+    const generation = this.#generation;
+    if (this.#transport === undefined || this.#transportStart !== undefined) {
       try {
         await this.#startTransport();
-        this.#errorCode = undefined;
-        this.#scheduleAutomaticSync(250);
       } catch (error) {
+        if (generation !== this.#generation) throw error;
         this.#setError(error);
         this.#emitChanged();
         throw new ContactSyncManagerError("UNAVAILABLE", "Contacts sync transport is unavailable.", { cause: error });
       }
+      this.#assertGeneration(generation);
+      this.#errorCode = undefined;
+      this.#scheduleAutomaticSync(250);
     }
     const online = new Set(this.#transport?.onlinePeerIds(this.#now()) ?? []);
     for (const peerId of this.#peerFullSyncAt.keys()) {
@@ -317,7 +311,6 @@ export class ContactSyncManager {
     if (peerIds.some((peerId) => !online.has(peerId))) {
       throw new ContactSyncManagerError("OFFLINE", "No granted Contacts sync peer is currently reachable.");
     }
-    const generation = this.#generation;
     this.#activeSyncs += 1;
     this.#emitChanged();
     try {
@@ -341,20 +334,40 @@ export class ContactSyncManager {
     if (this.#closed) return;
     this.#closed = true;
     this.#revokeRuntimeAuthority();
-    this.#transport?.stop();
-    this.#transport = undefined;
+    this.#stopTransport();
     this.#codec.close?.();
     this.#privateKey = undefined;
   }
 
+  async #startAutomaticSync(configuration: ContactSyncConfigurationRecord, delayMilliseconds: number): Promise<void> {
+    const current = () => !this.#closed && this.#configuration?.revision === configuration.revision;
+    try {
+      await this.#startTransport();
+      if (!current()) return;
+      this.#errorCode = undefined;
+      this.#scheduleAutomaticSync(delayMilliseconds);
+    } catch (error) {
+      if (!current()) return;
+      this.#setError(error);
+      this.#scheduleAutomaticSync(AUTOMATIC_SYNC_INTERVAL_MILLISECONDS);
+    }
+  }
+
   async #startTransport(): Promise<void> {
+    if (this.#transportStart !== undefined) return this.#transportStart.promise;
     if (this.#transport !== undefined) return;
+    this.#store.readContactSyncState(this.#requireConfiguration().nodeId);
+    const presenceChanged = (): void => {
+      if (this.#transport !== transport || this.#transportStart !== undefined) return;
+      this.#emitChanged();
+      this.#scheduleAutomaticSync(250);
+    };
     const transport = this.#transportFactory({
       purpose: "contacts",
       getSelf: () => {
         const configuration = this.#configuration;
         const privateKey = this.#privateKey;
-        return configuration?.enabled === true && privateKey !== undefined ? {
+        return this.#transport === transport && configuration?.enabled === true && privateKey !== undefined ? {
           nodeId: configuration.nodeId,
           displayName: this.#displayName,
           publicKey: configuration.publicKey,
@@ -364,27 +377,38 @@ export class ContactSyncManager {
       isPeerAllowed: (peerId, publicKey) => {
         const configuration = this.#configuration;
         const peer = this.#store.contactSyncPeer(peerId);
-        return configuration?.enabled === true && peer?.publicKey === publicKey;
+        return this.#transport === transport && configuration?.enabled === true && peer?.publicKey === publicKey;
       },
-      onCandidate: () => {
-        this.#emitChanged();
-        this.#scheduleAutomaticSync(250);
-      },
-      onPresenceChanged: () => {
-        this.#emitChanged();
-        this.#scheduleAutomaticSync(250);
-      },
+      onCandidate: presenceChanged,
+      onPresenceChanged: presenceChanged,
       onFrame: (sourceNodeId, frame, delivery) => this.#receiveFrame(sourceNodeId, frame, delivery),
       logger: this.#logger
     });
     this.#transport = transport;
-    try {
-      await transport.start();
-    } catch (error) {
-      if (this.#transport === transport) this.#transport = undefined;
-      transport.stop();
+    let cancel!: () => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      cancel = () => reject(new ContactSyncManagerError("CONFLICT", "Contacts sync transport was retired."));
+    });
+    const started = Promise.resolve().then(() => {
+      if (this.#transportStart?.promise === promise) return transport.start();
+    });
+    const promise: Promise<void> = Promise.race([started, cancelled]).catch((error: unknown) => {
+      if (this.#transportStart?.promise === promise) this.#stopTransport();
       throw error;
-    }
+    }).finally(() => {
+      if (this.#transportStart?.promise === promise) this.#transportStart = undefined;
+    });
+    this.#transportStart = { promise, cancel };
+    return promise;
+  }
+
+  #stopTransport(): void {
+    const transport = this.#transport;
+    const starting = this.#transportStart;
+    this.#transport = undefined;
+    this.#transportStart = undefined;
+    starting?.cancel();
+    transport?.stop();
   }
 
   async #sendState(peerId: string, requestReply: boolean, generation: number, calibrate = false): Promise<void> {
@@ -532,7 +556,7 @@ export class ContactSyncManager {
   }
 
   #scheduleAutomaticSync(delayMilliseconds: number): void {
-    if (this.#closed || this.#configuration?.enabled !== true || this.#transport === undefined || this.#automaticSyncRunning) return;
+    if (this.#closed || this.#configuration?.enabled !== true || this.#privateKey === undefined || this.#automaticSyncRunning) return;
     const dueAt = this.#now() + delayMilliseconds;
     // Presence is refreshed for every beacon. It must not debounce an already
     // scheduled grant or sync forever when heartbeats arrive more frequently.

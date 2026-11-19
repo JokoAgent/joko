@@ -16,7 +16,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ContactSyncWorkerCodec } from "./contact-sync-codec.js";
 import { generateNodeSyncIdentity, NodeSyncLanTransport, NodeSyncTcpTransport,
   type NodeSyncCipherChunkFrame, type NodeSyncDeliveryContext, type NodeSyncLanTransportOptions } from "@joko/node-sync";
-import { ContactSyncManager } from "./contact-sync-manager.js";
+import { ContactSyncManager, type ContactSyncManagerOptions } from "./contact-sync-manager.js";
 import {
   ContactSyncWireDecoder,
   encodeContactSyncMessageInProcess,
@@ -178,6 +178,72 @@ describe("Contacts sync node lifecycle", () => {
     expect(starts).toBe(2);
   });
 
+  it("recovers LAN sync automatically after startup with an enabled stored identity", async () => {
+    const peerId = "node-granted";
+    const peer = generateNodeSyncIdentity();
+    let networkReady = false;
+    const start = vi.fn(async () => {
+      if (!networkReady) throw Object.assign(new Error("Could not join multicast group"), { code: "EADDRNOTAVAIL" });
+    });
+    const stop = vi.fn();
+    const send = vi.fn(async () => true);
+    const { manager, store } = await enabledManagerFixture((options) => ({
+      start, stop, send,
+      candidates: () => [],
+      onlinePeerIds: () => options.isPeerAllowed(peerId, peer.publicKey) ? [peerId] : []
+    }));
+    store.grantContactSyncPeer({ peerId, displayName: "Granted computer", publicKey: peer.publicKey,
+      fingerprint: contactSyncPublicKeyFingerprint(peer.publicKey) });
+    const storedConfiguration = store.contactSyncConfiguration();
+
+    vi.useFakeTimers();
+    try {
+      await manager.initialize();
+      expect(manager.status()).toMatchObject({ available: true, enabled: true, phase: "error", errorCode: "sync_failed" });
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(start).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(start).toHaveBeenCalledTimes(2);
+      expect(stop).toHaveBeenCalledTimes(2);
+      expect(send).not.toHaveBeenCalled();
+
+      networkReady = true;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(start).toHaveBeenCalledTimes(3);
+      expect(send).toHaveBeenCalledOnce();
+      expect(store.contactSyncConfiguration()).toEqual(storedConfiguration);
+      expect(manager.status()).toMatchObject({ available: true, phase: "up_to_date", lastSyncPeerId: peerId, lastRoute: "lan" });
+      expect(manager.status().errorCode).toBeUndefined();
+    } finally { manager.close(); vi.useRealTimers(); }
+  });
+
+  it("shares a pending LAN retry and retires it when the owner disables sync", async () => {
+    let completeStart!: () => void;
+    const start = vi.fn<() => Promise<void>>()
+      .mockRejectedValueOnce(Object.assign(new Error("Could not bind discovery socket"), { code: "EADDRINUSE" }))
+      .mockImplementationOnce(() => new Promise<void>((resolve) => { completeStart = resolve; }));
+    const stop = vi.fn();
+    const send = vi.fn(async () => true);
+    const { manager } = await enabledManagerFixture(() => ({ start, stop, send, candidates: () => [], onlinePeerIds: () => [] }));
+
+    vi.useFakeTimers();
+    try {
+      await manager.initialize();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(start).toHaveBeenCalledTimes(2);
+      const retired = expect(manager.syncNow()).rejects.toMatchObject({ code: "CONFLICT" });
+      await manager.setEnabled(manager.status().configurationRevision, false);
+      await retired;
+      completeStart();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(start).toHaveBeenCalledTimes(2);
+      expect(stop).toHaveBeenCalledTimes(2);
+      expect(send).not.toHaveBeenCalled();
+      expect(manager.status()).toMatchObject({ available: true, enabled: false, phase: "off" });
+      expect(manager.status().errorCode).toBeUndefined();
+    } finally { manager.close(); vi.useRealTimers(); }
+  });
+
   it("does not postpone a granted peer's scheduled sync on each more frequent LAN beacon", async () => {
     const directory = mkdtempSync(join(tmpdir(), "joko-contact-sync-beacons-"));
     const store = new ContactStore(join(directory, "contacts.db"));
@@ -294,10 +360,16 @@ describe("Contacts sync node lifecycle", () => {
     });
     let receiver!: NodeSyncTcpTransport;
     let explicitSync = false;
+    let replyFailurePublished = false;
     const send = vi.fn<(nodeId: string, frame: NodeSyncCipherChunkFrame, delivery: NodeSyncDeliveryContext) => Promise<boolean>>();
     const candidate = { nodeId: callerId, displayName: "Caller", publicKey: identity.publicKey,
       fingerprint: contactSyncPublicKeyFingerprint(identity.publicKey), address: "127.0.0.1", port: 4318, seenAt: Date.now() };
-    const manager = new ContactSyncManager({ store, vault, nodeId: receiverId, displayName: "Receiver", codec: inProcessContactSyncCodec,
+    const manager: ContactSyncManager = new ContactSyncManager({ store, vault, nodeId: receiverId, displayName: "Receiver", codec: inProcessContactSyncCodec,
+      onChanged: () => {
+        const status = manager.status();
+        // A scheduled no-peer sync can clear the error before the next test poll.
+        replyFailurePublished ||= status.phase === "error" && status.errorCode === "sync_failed";
+      },
       transportFactory: (options) => {
         receiver = new NodeSyncTcpTransport({ ...options, listenHost: "127.0.0.1" });
         return { start: () => receiver.start(), stop: () => receiver.stop(), send,
@@ -322,8 +394,9 @@ describe("Contacts sync node lifecycle", () => {
       expect(store.getContact("contact-1").displayName).toBe("Ada");
       expect(send).toHaveBeenCalledOnce();
       expect(manager.status().phase).toBe("syncing");
+      expect(replyFailurePublished).toBe(false);
     } finally { failReply?.(false); }
-    await waitUntil(() => manager.status().errorCode === "sync_failed");
+    await waitUntil(() => replyFailurePublished);
 
     let releaseSend!: () => void;
     const pendingSend = new Promise<void>((resolve) => { releaseSend = resolve; });
@@ -371,7 +444,7 @@ describe("Contacts sync node lifecycle", () => {
       const status = manager.status();
       return { phase: status.phase, errorCode: status.errorCode, candidates: status.candidates.length,
         peers: status.peers.length, onlinePeers: status.onlinePeerCount, diagnostics,
-        multicastInterface: process.platform === "win32" ? "os-default" : "loopback" };
+        multicastInterface: "loopback" };
     });
     const created = first.store.createContact({
       expectedDirectoryRevision: first.store.directoryState().revision,
@@ -474,6 +547,25 @@ function multiChunkState() {
   }, "node-first").state;
 }
 
+async function enabledManagerFixture(transportFactory: NonNullable<ContactSyncManagerOptions["transportFactory"]>) {
+  const directory = mkdtempSync(join(tmpdir(), "joko-contact-sync-startup-"));
+  const store = new ContactStore(join(directory, "contacts.db"));
+  const vault = await CredentialVault.open(join(directory, "master.key"));
+  const options = { store, vault, nodeId: "node-startup", displayName: "Startup computer", codec: inProcessContactSyncCodec };
+  const original = new ContactSyncManager(options);
+  const manager = new ContactSyncManager({ ...options, transportFactory });
+  cleanups.push(() => {
+    manager.close();
+    original.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  await original.initialize();
+  store.setContactSyncEnabled(original.status().configurationRevision, true);
+  original.close();
+  return { manager, store };
+}
+
 async function managerFixture(name: string, multicastPort: number): Promise<{
   readonly manager: ContactSyncManager;
   readonly store: ContactStore;
@@ -495,9 +587,9 @@ async function managerFixture(name: string, multicastPort: number): Promise<{
     codec: inProcessContactSyncCodec,
     transportFactory: (options) => new NodeSyncLanTransport({
       ...options,
-      // Windows uses the same OS-selected interface as the production LAN chain;
-      // the Unix same-host fixtures use their configured loopback route.
-      ...(process.platform === "win32" ? {} : { multicastInterface: "127.0.0.1" }),
+      // Both nodes belong to this fixture. Use real multicast on the same
+      // loopback route as the Node Sync transport tests on every platform.
+      multicastInterface: "127.0.0.1",
       multicastPort,
       beaconIntervalMilliseconds: 150,
       endpointTtlMilliseconds: 2_000,
