@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import { PiSessionStore } from "./session-store.js";
 import { mkdtemp } from "./test-paths.js";
@@ -108,7 +109,9 @@ describe("PiSessionStore", () => {
     const path = join(store.sessionsRoot, "source.jsonl");
     await writeFile(path, [
       JSON.stringify({ type: "session", version: 3, id: "source-native", cwd: sourceWorkspace, parentSession: "C:/private/parent.jsonl" }),
-      JSON.stringify({ type: "message", id: "one", parentId: null, message: { role: "user", content: "hello" } })
+      JSON.stringify({ type: "message", id: "one", parentId: null, message: { role: "user", content: "hello" } }),
+      JSON.stringify({ type: "message", id: "two", parentId: "one", message: { role: "assistant", content: "hello" } }),
+      JSON.stringify({ type: "message", id: "three", parentId: "two", message: { role: "user", content: "hello" } })
     ].join("\n") + "\n");
 
     const exported = await store.exportPortableSession(path);
@@ -117,14 +120,30 @@ describe("PiSessionStore", () => {
     const imported = await store.importPortableSession(exported.bytes, {
       workspaceRoot: targetWorkspace,
       generation: 7,
-      nativeSessionId: "imported-native"
+      nativeSessionId: "imported-native",
+      activeEntryId: "one",
+      messageIdentities: [
+        { entryId: "one", role: "user" },
+        { entryId: "two", role: "user" },
+        { entryId: "three", role: "user" },
+        { entryId: "absent", role: "assistant" }
+      ]
     });
-    expect(imported).toMatchObject({ nativeSessionId: "imported-native", generation: 7 });
+    expect(imported).toMatchObject({ nativeSessionId: "imported-native", generation: 7,
+      confirmedMessageIdentities: [{ entryId: "one", role: "user" }, { entryId: "three", role: "user" }] });
     expect(imported.opaqueRef).not.toBe(path);
     const records = (await readFile(imported.opaqueRef, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
     expect(records[0]).toMatchObject({ type: "session", id: "imported-native", cwd: targetWorkspace });
     expect(records[0]).not.toHaveProperty("parentSession");
     expect(records[1]).toMatchObject({ type: "message", id: "one" });
+    const reopened = SessionManager.open(imported.opaqueRef);
+    expect(reopened.getBranch().filter(entry => entry.type === "message").map(entry => entry.id)).toEqual(["one"]);
+    expect(reopened.getEntry("three")).toMatchObject({ type: "message", parentId: "two" });
+    expect(reopened.getBranch().at(-1)).toMatchObject({ type: "custom", parentId: "one", customType: "joko.portable_position" });
+    const reset = await store.importPortableSession(exported.bytes, { workspaceRoot: targetWorkspace, generation: 8, activeEntryId: null });
+    expect(SessionManager.open(reset.opaqueRef).getBranch()).toMatchObject([{ type: "custom", parentId: null }]);
+    await expect(store.importPortableSession(exported.bytes, { workspaceRoot: targetWorkspace, generation: 8, activeEntryId: "absent" }))
+      .rejects.toMatchObject({ publicError: { code: "PI_SESSION_PORTABLE_POSITION_INVALID" } });
   });
 
   it("reads the exact stored transcript and distinguishes absence from invalid and unsafe persistence", async () => {

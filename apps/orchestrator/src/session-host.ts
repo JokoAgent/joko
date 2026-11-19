@@ -54,6 +54,7 @@ import type {
   PromptInput,
   ProviderModel,
   PublicError,
+  PortableNativeMessageIdentity,
   RunDescriptor,
   RuntimeCommand,
   RuntimeResource,
@@ -69,7 +70,7 @@ import type {
   UserShellResult,
   UsageSnapshot
 } from "@joko/core";
-import { JokoError, containsRecognizedCredential, decideToolCall, evaluateOrderedPolicyRules, policyRiskForToolRisk, nativeHistoryEventContext, redactSecrets, supportsNativeStartNavigation, toPublicError, validInlineTextRanges, validInputMentionRanges, type ToolRisk } from "@joko/core";
+import { JokoError, NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD, containsRecognizedCredential, decideToolCall, evaluateOrderedPolicyRules, policyRiskForToolRisk, nativeHistoryEventContext, redactSecrets, supportsNativeStartNavigation, toPublicError, validInlineTextRanges, validInputMentionRanges, type ToolRisk } from "@joko/core";
 import {
   AuthorizationError,
   ensureSideChatHistoryBoundary,
@@ -168,6 +169,7 @@ import {
   buildPortableSessionExport,
   adoptPortableSessionArtifacts,
   materializePortableSessionImport,
+  portableNativeMessageIdentities,
   preparePortableSessionImport,
   PORTABLE_IMPORT_DRAFT_TTL_MS,
   type PortableSessionExportBuild,
@@ -183,6 +185,7 @@ import {
   listAllQueueItems,
   listAllRuns,
   listAllVisibleSessionEvents,
+  visitActiveSessionTimelineEvents,
   visitVisibleSessionEvents
 } from "./operational-pagination.js";
 import {
@@ -222,6 +225,7 @@ const PROTECTED_MESSAGE_QUEUE_TTL_MS = 15 * 60_000;
 const MAXIMUM_PROTECTED_MESSAGE_QUEUE = 256;
 const PORTABLE_IMPORT_SOURCE_SETTING_KEY = "portable.import.source";
 const PORTABLE_IMPORT_ACTIVATION_SETTING_KEY = "portable.import.activation";
+const PORTABLE_NATIVE_SOURCE_MESSAGE_FIELD = "portableNativeSourceMessageEventId";
 const MAXIMUM_PORTABLE_IMPORT_DRAFTS = 128;
 const NATIVE_SESSION_CATALOG_TTL_MS = 30_000;
 const NATIVE_SESSION_CATALOG_SNAPSHOT_TTL_MS = 10 * 60_000;
@@ -8761,6 +8765,7 @@ export class SessionHost {
 
     const exportSourceFence = (source: StoredSession, target: StoredTarget, backendGeneration: number, readingDetached: boolean) => {
       const { backendId, id: sessionId, binding } = source.descriptor;
+      const nativeMarkerId = this.#store.findLatestNativeSessionChange(sessionId)?.id;
       return (): void => {
         this.#assertOpen();
         assertConnectionCurrent?.();
@@ -8771,6 +8776,7 @@ export class SessionHost {
         if (latest.descriptor.backendId !== backendId || latest.descriptor.targetId !== target.descriptor.id
           || latest.descriptor.archived !== source.descriptor.archived || latest.descriptor.deletedAt !== undefined
           || !sameNativeBinding(latest.descriptor.binding, binding) || latestTarget.revision !== target.revision
+          || this.#store.findLatestNativeSessionChange(sessionId)?.id !== nativeMarkerId
           || (readingDetached && !this.canReadStoredPortableSession(latest, latestTarget))
           || this.#store.findPendingSessionLifecycleCleanup(sessionId) !== undefined || this.#sessionLifecycleFences.has(sessionId)
           || this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined
@@ -8850,7 +8856,7 @@ export class SessionHost {
     assertCurrent();
     const events: PersistedEvent[] = [];
     let portableMessageCount = 0;
-    visitVisibleSessionEvents(this.#store, input.sessionId, (event) => {
+    visitActiveSessionTimelineEvents(this.#store, input.sessionId, (event) => {
       if (event.payload.type === "message_complete") {
         if (event.payload.automaticContinuation !== undefined || event.payload.objectiveContinuation !== undefined || event.payload.inputHandoffContinuation !== undefined) return;
         portableMessageCount += 1;
@@ -8902,6 +8908,11 @@ export class SessionHost {
       backendCapability: "managed-subagent-v1"
     } as const));
     const target = this.targetForSession(current);
+    const nativeMarker = this.#store.findLatestNativeSessionChange(input.sessionId)?.payload;
+    const nativeActiveEntryId = nativeMarker?.type === "native_session_changed"
+      && nativeMarker.opaqueRef === current.descriptor.binding.opaqueRef
+      && nativeMarker.nativeSessionId === current.descriptor.binding.nativeSessionId
+      ? (nativeMarker.leafId ?? null) : undefined;
     let built: PortableSessionExportBuild;
     try {
       built = await buildPortableSessionExport({
@@ -8910,7 +8921,11 @@ export class SessionHost {
         workspaceKind: target.managed ? "dialogue" : "project",
         backendCapability: "native-portable-session-v1",
         events,
-        ...(nativeSession === undefined ? {} : { nativeSession }),
+        ...(nativeSession === undefined ? {} : {
+          nativeSession,
+          nativeBindingFingerprint: nativeBindingFingerprint(current.descriptor.binding.opaqueRef),
+          ...(nativeActiveEntryId === undefined ? {} : { nativeActiveEntryId })
+        }),
         workers,
         workerDetail,
         ...(input.password === undefined ? {} : { password: input.password }),
@@ -12119,23 +12134,31 @@ export class SessionHost {
         backendInstanceGeneration,
         sessionWorktree
       );
-      createdBinding = prepared.nativeSession === undefined
-        ? await adapter.createSession({
-            target: runtimeTarget,
-            name: importTitle,
-            providerId,
-            modelId,
-            effort: input.effort,
-            fastMode: input.fastMode,
-            permissionMode: input.permissionMode,
-            nativeStart: { kind: "new" }
-          }, provisional)
-        : await adapter.importPortableNativeSession!({
-            target: runtimeTarget,
-            bytes: prepared.nativeSession.bytes,
-            generation: 1,
-            nativeSessionId: stableId("portable", input.operationId)
-          }, provisional.signal);
+      let confirmedMessageIdentities: readonly PortableNativeMessageIdentity[] | undefined;
+      if (prepared.nativeSession === undefined) {
+        createdBinding = await adapter.createSession({
+          target: runtimeTarget,
+          name: importTitle,
+          providerId,
+          modelId,
+          effort: input.effort,
+          fastMode: input.fastMode,
+          permissionMode: input.permissionMode,
+          nativeStart: { kind: "new" }
+        }, provisional);
+      } else {
+        const messageIdentities = portableNativeMessageIdentities(prepared);
+        const { confirmedMessageIdentities: confirmed, ...binding } = await adapter.importPortableNativeSession!({
+          target: runtimeTarget,
+          bytes: prepared.nativeSession.bytes,
+          generation: 1,
+          nativeSessionId: stableId("portable", input.operationId),
+          ...(messageIdentities.length === 0 ? {} : { messageIdentities }),
+          ...(prepared.nativeSession.activeEntryId === undefined ? {} : { activeEntryId: prepared.nativeSession.activeEntryId })
+        }, provisional.signal);
+        createdBinding = binding;
+        confirmedMessageIdentities = confirmed;
+      }
       createdLiveRuntime = prepared.nativeSession === undefined;
       cleanupContext = { ...provisional, binding: createdBinding };
       if (createdLiveRuntime && input.planMode) await adapter.setPlanMode(true, cleanupContext);
@@ -12154,7 +12177,7 @@ export class SessionHost {
           mimeType: stored.mimeType,
           ...(stored.fileName === undefined ? {} : { fileName: stored.fileName })
         };
-      });
+      }, confirmedMessageIdentities);
       if (operationBodyHash(portableImportOperationBody(input)) !== claim.operation.bodyHash) {
         throw new Error("Portable task import input changed during execution.");
       }
@@ -12264,6 +12287,8 @@ export class SessionHost {
               metadata: {
                 namespace: "joko.portable_import",
                 fields: { sourceSha256: input.package.sha256, messageIndex: index,
+                  ...(nativeHistoryEventContext(event.payload)?.identity === undefined ? {}
+                    : { [NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD]: true }),
                   [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: nativeBindingFingerprint(descriptor.binding.opaqueRef) }
               }
             });
@@ -17962,6 +17987,8 @@ export class SessionHost {
     const acceptedQueueInputs = new Map<string, QueueItemRecord>();
     const observedAutomaticCompactions = new Set<string>();
     const observedAssistantByEntry = new Map<string, PersistedEvent | null>();
+    const portableMessagesByEntry = new Map<string, PersistedEvent>();
+    const isPortableImport = store.findSetting("session", session.id, PORTABLE_IMPORT_SOURCE_SETTING_KEY) !== undefined;
     const nativeIdentityAdapter = adapter as BackendAdapter & {
       readonly nativeUserEntryIdForOperation?: (operationId: string) => string;
     };
@@ -17982,6 +18009,12 @@ export class SessionHost {
     }
     visitVisibleSessionEvents(store, session.id, (event) => {
       const privateEntryId = nativeHistoryEventContext(event.payload)?.identity?.entryId;
+      if (isPortableImport && privateEntryId !== undefined && event.payload.type === "message_complete"
+        && event.metadata?.namespace === "joko.portable_import"
+        && event.metadata.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === bindingFingerprint
+        && event.metadata.fields[NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD] === true) {
+        portableMessagesByEntry.set(privateEntryId, event);
+      }
       const observedAssistant = event.metadata?.fields[NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD];
       if (event.metadata?.namespace === "claude-code" && typeof observedAssistant === "string"
         && event.metadata.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === bindingFingerprint
@@ -18112,9 +18145,29 @@ export class SessionHost {
             ...(acceptedMetadata.taskMessageOrigin === undefined ? {} : { taskMessageOrigin: acceptedMetadata.taskMessageOrigin })
           });
       const privateOrigin = projectionEntryId === undefined ? undefined : privateMessageMetadata.get(projectionEntryId);
-      const payload = projectedPayload.type === "message_complete" && privateOrigin !== undefined
+      const nativePayload = projectedPayload.type === "message_complete" && privateOrigin !== undefined
         ? { ...projectedPayload, partnerPrivateOrigin: privateOrigin }
         : projectedPayload;
+      const nativeCompletion = nativePayload.type === "message_complete" && projection.metadata?.fields["nativeHydration"] === true
+        ? nativePayload : undefined;
+      const previousImport = isPortableImport && nativeCompletion !== undefined
+        ? store.findEvent(projection.id, { includeTombstoned: true }) : undefined;
+      const previousSourceId = previousImport?.metadata?.fields[PORTABLE_NATIVE_SOURCE_MESSAGE_FIELD];
+      const sourceMessage = typeof previousSourceId === "string"
+        ? store.findEvent(previousSourceId, { includeTombstoned: true })
+        : isPortableImport && nativeCompletion !== undefined && projectionEntryId !== undefined && previousImport === undefined
+          ? portableMessagesByEntry.get(projectionEntryId) : undefined;
+      let payload = nativePayload;
+      let packageMessageEventId: string | undefined;
+      if (projectionEntryId !== undefined && nativeCompletion?.nativeHistory?.identity?.entryId === projectionEntryId
+        && sourceMessage?.payload.type === "message_complete"
+        && sourceMessage.sessionId === session.id && sourceMessage.backendId === session.backendId && sourceMessage.targetId === session.targetId
+        && sourceMessage.payload.role === nativeCompletion.role && sourceMessage.payload.nativeHistory?.identity?.entryId === projectionEntryId
+        && sourceMessage.metadata?.namespace === "joko.portable_import"
+        && sourceMessage.metadata.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === bindingFingerprint) {
+        payload = { ...nativeCompletion, ...sourceMessage.payload, nativeHistory: nativeCompletion.nativeHistory };
+        packageMessageEventId = sourceMessage.id;
+      }
       const observedAssistant = projectionEntryId === undefined ? undefined : observedAssistantByEntry.get(projectionEntryId);
       if (projection.payload.type === "message_complete" && projection.payload.role === "assistant"
         && projection.metadata?.namespace === "claude-code.native_history" && privateOrigin === undefined) {
@@ -18133,6 +18186,8 @@ export class SessionHost {
           continue;
         }
       }
+      const metadata = projection.observedMetadataFields === undefined ? projection.metadata
+        : nativeHistoryReplayMetadata(projection, previousImport?.metadata ?? store.findEvent(projection.id)?.metadata);
       store.appendEventIfAbsent({
         id: projection.id,
         ...(projection.emittedAt === undefined ? {} : { emittedAt: projection.emittedAt }),
@@ -18151,8 +18206,9 @@ export class SessionHost {
         traceId: `native-history:${projection.id}`,
         payload,
         pi: projection.pi,
-        metadata: projection.observedMetadataFields === undefined ? projection.metadata
-          : nativeHistoryReplayMetadata(projection, store.findEvent(projection.id)?.metadata)
+        metadata: packageMessageEventId !== undefined && metadata !== undefined
+          ? { ...metadata, fields: { ...metadata.fields, [PORTABLE_NATIVE_SOURCE_MESSAGE_FIELD]: packageMessageEventId } }
+          : metadata
       });
     }
 

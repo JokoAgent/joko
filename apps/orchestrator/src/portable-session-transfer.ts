@@ -2,9 +2,11 @@ import { createHash } from "node:crypto";
 import { extname } from "node:path";
 
 import {
+  NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD,
   redactSecrets,
   type AudioArtifactMetadata,
   type BlobRef,
+  type PortableNativeMessageIdentity,
   type PortableNativeSession,
   type SubagentActivityEntry,
   type SubagentChildRun,
@@ -37,6 +39,7 @@ import {
 
 const DEFAULT_TRANSFER_LIMIT_BYTES = 256 * 1024 * 1024;
 export const PORTABLE_IMPORT_DRAFT_TTL_MS = 10 * 60 * 1_000;
+const PORTABLE_NATIVE_PROJECTION_PATH = "projection/native-history.json";
 const PORTABLE_WORKER_ACTIVITY_LIMIT = 512;
 const PORTABLE_WORKER_CHILD_LIMIT = 4_096;
 const WORKER_STATES = ["queued", "running", "completed", "failed", "stopped"] as const;
@@ -49,6 +52,13 @@ interface PortableCollaborationEntry {
   readonly format: 1;
   readonly workers: readonly PortableSessionWorker[];
   readonly detail: readonly unknown[];
+}
+
+interface PortableNativeMessageMap {
+  readonly format: 1;
+  readonly nativeSha256: string;
+  readonly messages: readonly { readonly sourceOrder: number; readonly entryId: string }[];
+  readonly activeEntryId?: string | null;
 }
 
 type ImportedPortableWorkerDetail = Pick<
@@ -69,7 +79,12 @@ export interface PortableMediaMap {
 export interface PreparedPortableSessionImport {
   readonly manifest: PortableSessionManifest;
   readonly projection: PortableSessionProjection;
-  readonly nativeSession?: { readonly bytes: Uint8Array; readonly nativeSessionId?: string };
+  readonly nativeSession?: {
+    readonly bytes: Uint8Array;
+    readonly nativeSessionId?: string;
+    readonly activeEntryId?: string | null;
+  };
+  readonly nativeMessageEntries?: ReadonlyMap<number, string>;
   readonly media: readonly { readonly sourceId: string; readonly blob: BlobRef; readonly bytes: Uint8Array }[];
   readonly collaboration?: ReadonlyMap<string, ImportedPortableWorkerDetail>;
 }
@@ -88,8 +103,10 @@ export interface BuildPortableSessionExportInput {
   readonly title: string;
   readonly workspaceKind: "dialogue" | "project";
   readonly backendCapability: string;
-  readonly events: readonly Pick<PersistedEvent, "emittedAt" | "payload">[];
+  readonly events: readonly Pick<PersistedEvent, "emittedAt" | "payload" | "metadata">[];
   readonly nativeSession?: PortableNativeSession;
+  readonly nativeBindingFingerprint?: string;
+  readonly nativeActiveEntryId?: string | null;
   readonly workers?: readonly PortableSessionWorker[];
   readonly workerDetail?: readonly unknown[];
   readonly password?: string;
@@ -188,6 +205,12 @@ export async function buildPortableSessionExport(
       bytes: input.nativeSession.bytes
     });
     nonMediaBytes += input.nativeSession.bytes.byteLength;
+    const nativeMessages = buildNativeMessageMap(input, projection);
+    if (nativeMessages !== undefined) {
+      const bytes = Buffer.from(JSON.stringify(nativeMessages), "utf8");
+      entries.push({ path: PORTABLE_NATIVE_PROJECTION_PATH, kind: "projection", mediaType: "application/json", bytes });
+      nonMediaBytes += bytes.byteLength;
+    }
   }
   if (mediaMapItems.length > 0) {
     const mediaMapBytes = Buffer.from(JSON.stringify({ format: 1, items: mediaMapItems } satisfies PortableMediaMap), "utf8");
@@ -303,11 +326,17 @@ export function preparePortableSessionImport(
   if (nativeEntry !== undefined && nativeEntry.kind !== "native_history") {
     throw new Error("Portable Session native history entry has the wrong kind.");
   }
+  const nativeProjection = byPath.get(PORTABLE_NATIVE_PROJECTION_PATH);
+  const native = nativeProjection === undefined ? undefined : parseNativeMessageMap(nativeProjection, nativeEntry, projection);
   const collaborationEntry = byPath.get("collaboration/workers.json");
   return {
     manifest: decoded.manifest,
     projection,
-    ...(nativeEntry === undefined ? {} : { nativeSession: { bytes: nativeEntry.bytes } }),
+    ...(nativeEntry === undefined ? {} : { nativeSession: {
+      bytes: nativeEntry.bytes,
+      ...(native?.activeEntryId === undefined ? {} : { activeEntryId: native.activeEntryId })
+    } }),
+    ...(native === undefined ? {} : { nativeMessageEntries: native.entries }),
     media,
     ...(collaborationEntry === undefined ? {} : { collaboration: parseCollaboration(collaborationEntry, decoded.manifest) })
   };
@@ -320,7 +349,8 @@ export async function materializePortableSessionImport(
     readonly fileName?: string;
     readonly mimeType: string;
     readonly sha256: string;
-  }) => Promise<BlobRef>
+  }) => Promise<BlobRef>,
+  confirmedMessageIdentities?: readonly PortableNativeMessageIdentity[]
 ): Promise<MaterializedPortableSessionImport> {
   // Validate every typed media claim before creating any receiving identities.
   const media = new Map(prepared.media.map((item) => [item.sourceId, item]));
@@ -353,14 +383,28 @@ export async function materializePortableSessionImport(
     replacements.set(item.sourceId, stored);
   }
   const projection = rebindPortableProjectionBlobs(prepared.projection, replacements);
+  const confirmedById = new Map(confirmedMessageIdentities?.map(identity => [identity.entryId, identity.role]));
+  const confirmedEntries = new Map<number, string>();
+  for (const message of projection.messages) {
+    const entryId = prepared.nativeMessageEntries?.get(message.sourceOrder);
+    if (entryId !== undefined && confirmedById.get(entryId) === message.role) confirmedEntries.set(message.sourceOrder, entryId);
+  }
   return {
     manifest: prepared.manifest,
     projection,
     blobs: [...replacements.values()],
-    events: portableProjectionEventPayloads(projection),
+    events: portableProjectionEventPayloads(projection, confirmedEntries),
     ...(prepared.nativeSession === undefined ? {} : { nativeSession: prepared.nativeSession }),
     ...(prepared.collaboration === undefined ? {} : { collaboration: prepared.collaboration })
   };
+}
+
+export function portableNativeMessageIdentities(prepared: PreparedPortableSessionImport): readonly PortableNativeMessageIdentity[] {
+  if (prepared.nativeMessageEntries === undefined) return [];
+  return prepared.projection.messages.flatMap(message => {
+    const entryId = prepared.nativeMessageEntries?.get(message.sourceOrder);
+    return entryId === undefined ? [] : [{ entryId, role: message.role }];
+  });
 }
 
 /** Called only inside the receiving Session's adoption transaction. */
@@ -411,6 +455,73 @@ function parseMediaMap(entry: PortableSessionPackage["entries"][number]): Portab
     throw new Error("Portable Session media map has unsupported fields.");
   }
   return { format: 1, items };
+}
+
+function buildNativeMessageMap(
+  input: BuildPortableSessionExportInput,
+  projection: PortableSessionProjection
+): PortableNativeMessageMap | undefined {
+  if (input.nativeSession === undefined || input.nativeBindingFingerprint === undefined) return undefined;
+  const byEntryId = new Map<string, number | undefined>();
+  for (const message of projection.messages) {
+    const source = input.events[message.sourceOrder];
+    if (source?.payload.type !== "message_complete"
+      || source.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] !== input.nativeBindingFingerprint) continue;
+    const entryId = portableNativeMessageIdentity(source.payload.nativeHistory?.identity?.entryId);
+    if (entryId !== undefined) byEntryId.set(entryId, byEntryId.has(entryId) ? undefined : message.sourceOrder);
+  }
+  const messages = [...byEntryId].flatMap(([entryId, sourceOrder]) => sourceOrder === undefined ? [] : [{ entryId, sourceOrder }]);
+  const activeEntryId = input.nativeActiveEntryId === null ? null : portableNativeMessageIdentity(input.nativeActiveEntryId);
+  return messages.length === 0 && activeEntryId === undefined ? undefined : {
+    format: 1, nativeSha256: sha256(input.nativeSession.bytes), messages,
+    ...(activeEntryId === undefined ? {} : { activeEntryId })
+  };
+}
+
+function parseNativeMessageMap(
+  entry: PortableSessionPackage["entries"][number],
+  nativeEntry: PortableSessionPackage["entries"][number] | undefined,
+  projection: PortableSessionProjection
+): { readonly entries: ReadonlyMap<number, string>; readonly activeEntryId?: string | null } {
+  if (nativeEntry === undefined || entry.kind !== "projection" || entry.mediaType !== "application/json") {
+    throw new Error("Portable Session native message map has no matching native history entry.");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(entry.bytes));
+  } catch {
+    throw new Error("Portable Session native message map is not valid UTF-8 JSON.");
+  }
+  if (!isRecord(value) || value["format"] !== 1 || value["nativeSha256"] !== sha256(nativeEntry.bytes)
+    || !Array.isArray(value["messages"]) || value["messages"].length > projection.messages.length
+    || Object.keys(value).some(key => !["format", "nativeSha256", "messages", "activeEntryId"].includes(key))) {
+    throw new Error("Portable Session native message map does not match its history.");
+  }
+  const rawPosition = value["activeEntryId"];
+  const activeEntryId = rawPosition === null ? null : portableNativeMessageIdentity(rawPosition);
+  if (rawPosition !== undefined && activeEntryId === undefined) {
+    throw new Error("Portable Session native history position is invalid.");
+  }
+  const orders = new Set(projection.messages.map(message => message.sourceOrder));
+  const seen = new Set<string>();
+  const entries = new Map<number, string>();
+  for (const item of value["messages"]) {
+    if (!isRecord(item)) throw new Error("Portable Session native message map contains an invalid message identity.");
+    const sourceOrder = item["sourceOrder"];
+    const id = portableNativeMessageIdentity(item["entryId"]);
+    if (typeof sourceOrder !== "number" || !orders.delete(sourceOrder) || id === undefined || seen.has(id)
+      || Object.keys(item).some(key => key !== "sourceOrder" && key !== "entryId")) {
+      throw new Error("Portable Session native message map contains an invalid message identity.");
+    }
+    seen.add(id);
+    entries.set(sourceOrder, id);
+  }
+  return { entries, ...(activeEntryId === undefined ? {} : { activeEntryId }) };
+}
+
+function portableNativeMessageIdentity(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 && value.length <= 4_096 && value === value.trim()
+    && !/[\u0000-\u001f\u007f]/u.test(value) && redactSecrets(value) === value ? value : undefined;
 }
 
 function parseCollaboration(
