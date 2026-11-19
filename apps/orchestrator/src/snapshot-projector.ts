@@ -19,7 +19,7 @@ import type {
   WorkspaceSnapshotScope
 } from "@joko/contracts";
 import { NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD, NATIVE_HISTORY_ASSISTANT_STREAM_FIELD,
-  NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD, nativeHistoryEventContext } from "@joko/core";
+  NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD, NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD, nativeHistoryEventContext } from "@joko/core";
 import {
   NotFoundError,
   isTargetDeleted,
@@ -957,10 +957,11 @@ export function activeNativeTimeline(
     }
   }
   const active = new Set<string>();
+  const unprojectedParents = unprojectedNativeParents(marker);
   let cursor = leafId;
   while (cursor !== undefined && !active.has(cursor)) {
     active.add(cursor);
-    cursor = parents.has(cursor) ? parents.get(cursor) : deletedParents?.get(cursor);
+    cursor = parents.get(cursor) ?? unprojectedParents.get(cursor) ?? (parents.has(cursor) ? undefined : deletedParents?.get(cursor));
   }
   return deduplicateNativeLive(projectedEvents.filter((event) => {
     if (event.payload.type === "partner_session_task_receipt" || retainedContext?.has(event.globalCursor)) return true;
@@ -984,6 +985,21 @@ export function activeNativeTimeline(
     ) return false;
     return true;
   }));
+}
+
+function unprojectedNativeParents(marker: PersistedEvent): ReadonlyMap<string, string> {
+  const parents = new Map<string, string>();
+  const encoded = marker.metadata?.fields[NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD];
+  if (marker.metadata?.namespace !== "pi.native_history" || typeof encoded !== "string") return parents;
+  let links: unknown;
+  try { links = JSON.parse(encoded); } catch { return parents; }
+  if (!Array.isArray(links)) return parents;
+  for (const link of links) {
+    if (Array.isArray(link) && typeof link[0] === "string" && typeof link[1] === "string") {
+      parents.set(link[0], link[1]);
+    }
+  }
+  return parents;
 }
 
 export function projectSnapshot(

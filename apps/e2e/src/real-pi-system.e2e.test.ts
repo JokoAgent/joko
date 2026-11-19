@@ -47,7 +47,8 @@ import {
   SessionState,
   SnapshotScopeSchema,
   StateImpact,
-  UsageReportGroup
+  UsageReportGroup,
+  type Event as ProtoEvent
 } from "@joko/contracts";
 import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD, type BlobRef } from "@joko/core";
 import { buildPortableSessionExport, preparePortableSessionImport } from "@joko/orchestrator";
@@ -189,8 +190,9 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
 
   it.each([false, true])("summarizes a native background result within the original Run unless new input is queued (%s)",
     { timeout: 120_000 }, async (newerInput) => {
-      const original = "Begin the background-delivery fixture.", followUp = "Handle the newer user input.", childInput = "Use the isolated child marker.";
+      const original = "Delegate the background-delivery fixture and summarize the result.", followUp = "Handle the newer user input.", childInput = "Use the isolated child marker.";
       const childResult = "Isolated child observation 5419", summary = "Summary includes the child's observation.", launched = "Background work has started.";
+      const callId = "deliver-original-background-child";
       let releaseChild!: () => void;
       const childGate = new Promise<void>(resolve => { releaseChild = resolve; });
       let childRequested = false, parentRequests = 0, summaryRequests = 0;
@@ -204,7 +206,7 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
               summaryRequests += 1;
               return { kind: "text", text: summary };
             }
-            if (parentRequests === 1) return { kind: "tool", name: "subagent", arguments: {
+            if (parentRequests === 1) return { kind: "tool", name: "subagent", callId, arguments: {
               agent: "scout", task: childInput, context: "fresh", background: true, timeoutSeconds: 45
             } };
             return { kind: "text", text: launched };
@@ -230,13 +232,29 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
         const send = async (text: string) => queueRunIdFrom(await submit(clients.operation, connectionId,
           sendInputMutation(sessionId, generation, text)));
         const originalRunId = await send(original);
+        const store = fixture.application.store;
         const waitForRun = (runId: string) => waitForRealSystem(() => clients.run.getRun({ runId }),
           reply => reply.run?.state === RunState.SUCCEEDED, "the real Pi Run to complete", 30_000);
-        const assistantTexts = (runId: string) => fixture!.application.store.listEvents({ sessionId })
+        const assistantTexts = (runId: string) => store.listEvents({ sessionId })
           .flatMap(event => event.runId === runId && event.payload.type === "message_complete" && event.payload.role === "assistant"
             ? event.payload.blocks.flatMap(block => block.kind === "text" ? [block.text] : []) : []);
-        await waitForRealSystem(async () => childRequested && assistantTexts(originalRunId).includes(launched),
-          ready => ready, "the native child request and the parent's initial reply", 30_000);
+        await waitForRealSystem(async () => {
+          const permission = store.listInteractions({ sessionId, runId: originalRunId, status: "open" })[0];
+          if (permission !== undefined) {
+            expect(permission.payload).toMatchObject({ kind: "permission", toolName: "subagent" });
+            const approved = await submit(clients.operation, connectionId, resolvePermissionMutation({
+              connectionId, interactionId: permission.id, generation: BigInt(permission.generation)
+            }), `pi-delivery-approve-${permission.id}`);
+            expect(approved.state, approved.error?.message).toBe(OperationState.SUCCEEDED);
+          }
+          const events = store.listEvents({ sessionId }).filter(event => event.runId === originalRunId);
+          const tool = events.find(event => event.payload.type === "tool_result" && event.payload.callId === callId)?.payload;
+          if (tool?.type === "tool_result") expect(tool.isError, tool.output.slice(0, 400)).toBe(false);
+          return childRequested && assistantTexts(originalRunId).includes(launched);
+        }, ready => ready, "the native child request and the parent's initial reply", 30_000).catch((error: unknown) => {
+          const run = store.getRun(originalRunId).descriptor;
+          throw new Error(`Pi delivery Run ${run.state}, parent requests ${parentRequests}, child requested ${childRequested}.`, { cause: error });
+        });
         expect((await clients.run.getRun({ runId: originalRunId })).run?.state).toBe(RunState.RUNNING);
 
         if (newerInput) {
@@ -255,9 +273,33 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
           await waitForRun(originalRunId);
           expect(assistantTexts(originalRunId)).toContain(summary);
           expect(summaryRequests).toBe(1);
-          const { events } = await clients.session.listSessionTimeline({ sessionId });
-          expect(events.filter(event => event.payload?.kind.case === "messageCompleted" &&
-            event.payload.kind.value.role === MessageRole.USER)).toHaveLength(1);
+          expect(store.listRuns({ sessionId }).map(run => run.descriptor.id)).toEqual([originalRunId]);
+          expect(store.listQueueItems({ sessionId }).map(item => item.runId)).toEqual([originalRunId]);
+          const acceptedUsers = (events: readonly ProtoEvent[]) => events.flatMap(({ payload }) => {
+            const kind = payload?.kind;
+            return kind?.case === "messageStarted" && kind.value.role === MessageRole.USER ? [kind.value] : [];
+          });
+          const userMessages = await waitForRealSystem(async () => {
+            const { events, nextBeforeCursor } = await clients.session.listSessionTimeline({ sessionId, limit: 500 });
+            expect(nextBeforeCursor, "the entire short fixture timeline fits on one page").toBeUndefined();
+            return acceptedUsers(events);
+          }, messages => messages.length > 0, "the original Pi input to appear in the settled timeline", 10_000).catch(error => {
+            const visible = new Set(store.listEvents({ sessionId, activeNativeTimeline: true }).map(event => event.id));
+            const storedUsers = store.listEvents({ sessionId, messageCompleteOnly: true, includeTombstoned: true }).flatMap(event => {
+              const payload = event.payload;
+              return payload.type === "message_complete" && payload.role === "user" ? [{
+                hasAcceptedInput: payload.acceptedInput !== undefined, nativeIdentity: payload.nativeHistory?.identity,
+                originalRun: event.runId === originalRunId, namespace: event.metadata?.namespace, visible: visible.has(event.id)
+              }] : [];
+            });
+            throw new Error(`The original Pi input is missing from the settled timeline. Stored user events: ${JSON.stringify(storedUsers)}.`, { cause: error });
+          });
+          expect(userMessages).toEqual([expect.objectContaining({ turnId: originalRunId, userInputAccepted: true,
+            userInput: expect.objectContaining({ parts: [expect.objectContaining({ content: { case: "text", value: original } })] }) })]);
+          const { snapshot } = await clients.event.getSnapshot({ scope: create(SnapshotScopeSchema, {
+            kind: { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId, recentTimelineItems: 200 }) }
+          }) });
+          expect(acceptedUsers(snapshot?.timeline ?? [])).toEqual(userMessages);
         }
       } finally { releaseChild(); }
     });

@@ -63,6 +63,7 @@ import {
   NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD,
   NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
   NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
+  NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD,
   nativeHistoryEventContext,
   redactSecrets
 } from "@joko/core";
@@ -14149,41 +14150,19 @@ export class OperationalStore {
   private refreshNativeHistoryActiveEntries(sessionId: string, database = this.database): void {
     database.prepare("DELETE FROM native_history_active_entries WHERE session_id = ?")
       .run(sessionId);
-    const marker = database.prepare(`
-      SELECT event_cursor, binding_fingerprint, leaf_id
-      FROM native_history_current_markers
-      WHERE session_id = ?
-    `).get(sessionId) as Row | undefined;
-    if (marker === undefined || marker["leaf_id"] === null) return;
-    const markerCursor = toBigInt(marker["event_cursor"]);
-    const bindingFingerprint = String(marker["binding_fingerprint"]);
-    const leafId = String(marker["leaf_id"]);
     database.prepare(`
       WITH RECURSIVE
-      ancestors(entry_id) AS (
-        VALUES (?)
-        UNION
-        SELECT canonical.parent_entry_id
-        FROM ancestors AS active
-        JOIN native_history_canonical_identities AS canonical
-          ON canonical.session_id = ?
-          AND canonical.binding_fingerprint = ?
-          AND canonical.entry_id = active.entry_id
-        WHERE canonical.parent_entry_id IS NOT NULL
-      )
+      native_history_position AS (
+        SELECT session_id, binding_fingerprint, event_cursor AS marker_cursor, native_opaque_ref, leaf_id
+        FROM native_history_current_markers WHERE session_id = ?
+      ),
+      ${nativeHistoryAncestorCtes()}
       INSERT INTO native_history_active_entries(
         session_id, marker_cursor, binding_fingerprint, entry_id
       )
-      SELECT ?, ?, ?, entry_id
-      FROM ancestors
-    `).run(
-      leafId,
-      sessionId,
-      bindingFingerprint,
-      sessionId,
-      asSqlInteger(markerCursor),
-      bindingFingerprint
-    );
+      SELECT position.session_id, position.marker_cursor, position.binding_fingerprint, active.entry_id
+      FROM active_native_ancestors AS active CROSS JOIN native_history_position AS position
+    `).run(sessionId);
   }
 
   private refreshNativeHistoryCanonicalIdentities(sessionId: string): void {
@@ -15114,17 +15093,10 @@ export class OperationalStore {
     const bindingPath = `$.${NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD}`;
     const replacesPath = `$.${NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD}`;
     const rows = this.database.prepare(`
-      WITH RECURSIVE snapshot_active_entries(entry_id) AS (
-        SELECT ? WHERE ? IS NOT NULL
-        UNION
-        SELECT canonical.parent_entry_id
-        FROM snapshot_active_entries AS active
-        JOIN native_history_canonical_identities AS canonical
-          ON canonical.session_id = ?
-          AND canonical.binding_fingerprint = ?
-          AND canonical.entry_id = active.entry_id
-        WHERE canonical.parent_entry_id IS NOT NULL
-      )
+      WITH RECURSIVE native_history_position(session_id, binding_fingerprint, marker_cursor, native_opaque_ref, leaf_id) AS (
+        VALUES (?, ?, ?, ?, ?)
+      ),
+      ${nativeHistoryAncestorCtes()}
       SELECT event.*
       FROM events AS event
       LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
@@ -15144,7 +15116,7 @@ export class OperationalStore {
             identity.entry_id IS NOT NULL
             AND identity.binding_fingerprint = ?
             AND (? IS NULL OR EXISTS (
-              SELECT 1 FROM snapshot_active_entries AS active
+              SELECT 1 FROM active_native_ancestors AS active
               WHERE active.entry_id = identity.entry_id
             ))
           )
@@ -15167,10 +15139,11 @@ export class OperationalStore {
       ORDER BY event.global_cursor DESC
       LIMIT ?
     `).all(
-      leafId ?? null,
-      leafId ?? null,
       sessionId,
       snapshot.historyBindingFingerprint,
+      markerCursor === undefined ? null : asSqlInteger(markerCursor),
+      source.descriptor.binding.opaqueRef,
+      leafId ?? null,
       sessionId,
       asSqlInteger(throughCursor),
       asSqlInteger(throughCursor),
@@ -20593,6 +20566,31 @@ function nativeBindingFingerprint(opaqueReference: string): string {
 
 function nativeBindingFingerprintIsValid(value: string): boolean {
   return /^sha256:[a-f0-9]{64}$/u.test(value);
+}
+
+function nativeHistoryAncestorCtes(): string {
+  const links = `json_extract(marker.metadata_json, '$.${NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD}')`;
+  return `
+    unprojected_native_parents AS MATERIALIZED (
+      SELECT json_extract(link.value, '$[0]') AS entry_id, json_extract(link.value, '$[1]') AS parent_entry_id
+      FROM native_history_position AS position
+      JOIN events AS marker ON marker.global_cursor = position.marker_cursor AND marker.session_id = position.session_id
+        AND marker.namespace = 'pi.native_history'
+        AND json_extract(marker.payload_json, '$.payload.type') = 'native_session_changed'
+        AND json_extract(marker.payload_json, '$.payload.opaqueRef') = position.native_opaque_ref
+        AND json_extract(marker.payload_json, '$.payload.leafId') = position.leaf_id
+      JOIN json_each(CASE WHEN json_valid(${links}) THEN ${links} END) AS link ON link.type = 'array'
+    ),
+    active_native_ancestors(entry_id) AS (
+      SELECT leaf_id FROM native_history_position WHERE leaf_id IS NOT NULL
+      UNION
+      SELECT COALESCE(canonical.parent_entry_id, unprojected.parent_entry_id)
+      FROM active_native_ancestors AS active CROSS JOIN native_history_position AS position
+      LEFT JOIN native_history_canonical_identities AS canonical ON canonical.session_id = position.session_id
+        AND canonical.binding_fingerprint = position.binding_fingerprint AND canonical.entry_id = active.entry_id
+      LEFT JOIN unprojected_native_parents AS unprojected ON unprojected.entry_id = active.entry_id
+      WHERE COALESCE(canonical.parent_entry_id, unprojected.parent_entry_id) IS NOT NULL
+    )`;
 }
 
 function nativeBindingReference(value: string): string {

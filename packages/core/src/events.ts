@@ -702,6 +702,8 @@ export function validModelSubstitution(value: unknown): value is { readonly sele
     && value.trim().length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/u.test(value));
 }
 export const NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD = "nativeBindingFingerprint";
+/** Host-owned, internal marker metadata for native ancestors without an Event. */
+export const NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD = "nativeHistoryUnprojectedParents";
 
 export function nativeHistoryEventContext(payload: EventPayload): NativeHistoryEventContext | undefined {
   switch (payload.type) {
