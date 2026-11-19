@@ -1,3 +1,4 @@
+import { queuePauseForStopReason } from "@joko/contracts";
 import type { ComposerSendShortcutPreference } from "../local-state.js";
 import type { AppController } from "../controller.js";
 import type { BackendView, QueueItemView } from "../model.js";
@@ -218,7 +219,7 @@ export async function pauseQueueThenAbort(
   hasPendingQueueItems: boolean,
   queueAlreadyPaused: boolean
 ): Promise<void> {
-  if (hasPendingQueueItems && !queueAlreadyPaused) await controller.pauseQueue(sessionId);
+  if (hasPendingQueueItems && !queueAlreadyPaused) await controller.pauseQueue(sessionId, queuePauseForStopReason);
   await controller.abort(runId);
 }
 

@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { taskMessageReferenceHref, validInputMessageReferences } from "@joko/contracts";
+import { queuePauseForStopReason, taskMessageReferenceHref, validInputMessageReferences } from "@joko/contracts";
 import { MAXIMUM_EDITABLE_PLAN_LENGTH, modelPricesWithOverride, NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD, NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
   parseNativeModelUsage, parseNativeUsageRequests, type ModelPriceOverride } from "@joko/core";
 import { DocumentPathError, type DocumentPathAuthorizer } from "@joko/tool-document";
@@ -4795,6 +4795,20 @@ export class SessionHost {
     const operation = this.#store.findOperation(item.operationId);
     return operation?.connectionId !== undefined && operation.status === "completed"
       && (operation.kind === "sendInput" || operation.kind === "send_input");
+  }
+
+  releaseEmptyQueueAfterOwnerStop(store: OperationalStore, withdrawn: QueueItemRecord, traceId: string): void {
+    const { sessionId } = withdrawn;
+    const control = store.getQueueControl(sessionId);
+    if (!control.paused || control.pauseReason !== queuePauseForStopReason || control.pausedAt === undefined
+      || withdrawn.createdAt > control.pausedAt || !this.isOwnerRunInput(withdrawn)) return;
+    const session = store.getSession(sessionId);
+    if (store.getBackend(session.descriptor.backendId).descriptor.adapterKind !== "pi"
+      || !this.isOrdinaryLocalSession(session) || session.descriptor.worktree !== undefined
+      || store.findCollaborationWorkerBySession(sessionId) !== undefined
+      || withdrawn.disposition !== "prompt" || store.getRun(withdrawn.runId).descriptor.source !== "user"
+      || store.listQueueItems({ sessionId, states: ["accepted", "dispatch_unknown"], limit: 1 }).length > 0) return;
+    store.setQueuePaused({ sessionId, paused: false, expectedRevision: control.revision, traceId });
   }
 
   async cancelBackgroundTask(sessionId: string, taskId: string, operationId?: string): Promise<void> {

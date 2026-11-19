@@ -33,6 +33,7 @@ import {
   ProviderConfigurationSchema,
   ProviderKind,
   QueueDeliveryMode,
+  QueueDispatchState,
   QueueItemState,
   ResourceAcquisitionSourceSchema,
   ResourceKind,
@@ -49,6 +50,7 @@ import {
   SnapshotScopeSchema,
   StateImpact,
   UsageReportGroup,
+  queuePauseForStopReason,
   type Event as ProtoEvent
 } from "@joko/contracts";
 import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD, type BlobRef } from "@joko/core";
@@ -59,6 +61,7 @@ import { createE2eClients } from "./connect-clients.js";
 import {
   abortRunMutation,
   archiveMutation,
+  cancelQueuedInputMutation,
   compactMutation,
   createManualScheduleMutation,
   createSessionMutation,
@@ -156,6 +159,68 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
       });
     } finally {
       releaseOriginal();
+    }
+  });
+
+  it("releases the Owner Stop hold when the last pending Pi input is withdrawn", { timeout: 90_000 }, async () => {
+    const firstText = "Hold the first Pi reply.";
+    const withdrawnText = "Withdraw this pending reply.";
+    const otherText = "Keep this pending until it too is withdrawn.";
+    const nextText = "Start the next ordinary Pi turn.";
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
+    try {
+      fixture = await RealPiSystemFixture.start({ providerResponder: async ({ request }) => {
+        const messages = JSON.stringify(request.body["messages"]);
+        if (messages.includes(nextText)) return { kind: "text", text: "The queue is active again." };
+        expect(messages).toContain(firstText);
+        await firstGate;
+        return { kind: "text", text: "The original turn has stopped." };
+      } });
+      const owner = await fixture.pair("Original Pi task Owner");
+      const phone = await fixture.pair("Mobile pending input");
+      const ownerMutation = (mutation: Parameters<typeof submit>[2]) => submit(owner.clients.operation, owner.connectionId, mutation);
+      const sessionId = sessionIdFrom(await ownerMutation(createSessionMutation({
+        backendId: "pi", targetId: "workspace-real-pi", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID
+      })));
+      const { store } = fixture.application;
+      const generation = BigInt(store.getSession(sessionId).descriptor.binding.generation);
+      const control = async () => (await owner.clients.queue.getQueueControl({ sessionId })).queueControl!;
+      const first = queueItemFrom(await ownerMutation(sendInputMutation(sessionId, generation, firstText)));
+      await waitForRealSystem(async () => store.getQueueItem(first.queueItemId), item => item.state === "backend_accepted",
+        "the original Pi turn is running", 15_000);
+      const enqueue = async (text: string) => queueItemFrom(await submit(phone.clients.operation, phone.connectionId,
+        sendInputMutation(sessionId, generation, text, QueueDeliveryMode.PROMPT)));
+      const withdraw = async (id: string) => {
+        const current = (await owner.clients.queue.listQueueItems({ sessionId })).queueItems.find(item => item.queueItemId === id);
+        if (!current) throw new Error("The original pending Pi input is missing.");
+        expect((await ownerMutation(cancelQueuedInputMutation(current))).state).toBe(OperationState.SUCCEEDED);
+        expect(store.getQueueItem(id).state).toBe("cancelled");
+      };
+      const pending = await enqueue(withdrawnText);
+      const other = await enqueue(otherText);
+      expect((await ownerMutation(pauseQueueMutation(await control(), queuePauseForStopReason))).state).toBe(OperationState.SUCCEEDED);
+      expect((await ownerMutation(abortRunMutation(first.runId))).state).toBe(OperationState.SUCCEEDED);
+      await waitForRealSystem(() => owner.clients.run.getRun({ runId: first.runId }), result => result.run?.state === RunState.ABORTED,
+        "the original Pi Stop", 15_000);
+      releaseFirst();
+      await withdraw(other.queueItemId);
+      expect(await control()).toMatchObject({ dispatchState: QueueDispatchState.PAUSED, queuedItemCount: 1n });
+      await withdraw(pending.queueItemId);
+      expect(await control()).toMatchObject({ dispatchState: QueueDispatchState.ACTIVE, queuedItemCount: 0n });
+      const next = queueItemFrom(await ownerMutation(sendInputMutation(sessionId, generation, nextText)));
+      await waitForRealSystem(() => owner.clients.run.getRun({ runId: next.runId }), result => result.run?.state === RunState.SUCCEEDED,
+        "the ordinary Pi turn after withdrawing the last input", 25_000);
+      const requests = fixture.providerRequests.map(request => JSON.stringify(request.body["messages"]));
+      expect(requests.filter(messages => messages.includes(nextText))).toHaveLength(1);
+      expect(requests.some(messages => messages.includes(withdrawnText) || messages.includes(otherText))).toBe(false);
+
+      expect((await ownerMutation(pauseQueueMutation(await control(), "Paused by user"))).state).toBe(OperationState.SUCCEEDED);
+      const manual = await enqueue("Withdraw this manually paused input.");
+      await withdraw(manual.queueItemId);
+      expect(await control()).toMatchObject({ dispatchState: QueueDispatchState.PAUSED, pauseReason: "Paused by user", queuedItemCount: 0n });
+    } finally {
+      releaseFirst();
     }
   });
 

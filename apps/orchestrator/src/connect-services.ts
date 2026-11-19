@@ -18876,11 +18876,13 @@ async function dispatchMutation(
         kind: payload.case,
         body: mutation,
         commit: (store) => {
-          store.cancelQueueItem({
+          const traceId = `operation:${operationId}`;
+          const withdrawn = store.cancelQueueItem({
             queueItemId: payload.value.queueItemId,
             connectionId: connection.id,
-            traceId: `operation:${operationId}`
+            traceId
           });
+          host.releaseEmptyQueueAfterOwnerStop(store, withdrawn, traceId);
           return { accepted: true, resultCase: "queueItem", entityId: payload.value.queueItemId } satisfies OperationOutcome;
         }
       });
