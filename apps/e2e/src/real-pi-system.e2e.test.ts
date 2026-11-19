@@ -178,8 +178,11 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     const { events } = await reconnected.session.listSessionTimeline({ sessionId });
     const completion = events.find(event => event.eventId === second.usage.completionEventId);
     expect(completion?.identity?.runId).toBe(second.runId);
-    expect(completion?.payload?.kind).toMatchObject({ case: "messageCompleted", value: { usageIsEstimate: true,
-      turnUsage: { estimated: true, usage: { costMicros: 30_000n } } } });
+    expect(completion?.payload?.kind).toMatchObject({ case: "messageCompleted", value: {
+      messageId: second.usage.messageId,
+      turnUsage: { messageId: second.usage.messageId, completionEventId: second.usage.completionEventId,
+        estimated: true, usage: { costMicros: 30_000n } }
+    } });
     const ledger = await reconnected.backend.getUsageReport({ group: UsageReportGroup.MODEL, backendId: "pi", providerId, modelId, sessionId });
     expect(ledger.summary).toMatchObject({ estimated: true, usage: { costMicros: 60_000n, totalTokens: 4_000n } });
   });
