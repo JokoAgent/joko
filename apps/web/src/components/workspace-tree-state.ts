@@ -451,7 +451,7 @@ function loadExpandedBag(storage: WorkspaceFilesStorage | undefined): PersistedE
   }
 }
 
-function canonicalWorkspaceId(value: unknown): string {
+export function canonicalWorkspaceId(value: unknown): string {
   if (
     typeof value !== "string"
     || value.length === 0

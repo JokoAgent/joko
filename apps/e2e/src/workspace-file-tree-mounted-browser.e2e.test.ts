@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { RunState, WorkspaceEntryListingPolicy } from "@joko/contracts";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
-import { chromium, type Browser } from "playwright-core";
+import { chromium, type Browser, type Page } from "playwright-core";
 import { expect, it } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
@@ -45,17 +45,9 @@ mountedIt("restores the Files visibility preference and keeps a sent file quote 
     expect((await list("src", current)).entries).toEqual([]);
     expect((await list("src", shown)).entries.map(entry => entry.relativePath)).toEqual(["src/bin"]);
 
-    const device = "Files tree Browser";
-    const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: device })).challenge!;
     browser = await chromium.launch({ executablePath: browserPath!, headless: true });
     const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
-    await page.goto(`${fixture.baseUrl}/#/files/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
-    await page.getByRole("button", { name: "Add Joko node", exact: true }).click();
-    await page.locator("details.device-authorization__manual > summary").click();
-    await page.getByLabel("Joko node address").fill(fixture.baseUrl);
-    await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
-    await page.getByLabel("Device name").fill(device);
-    await page.locator("form.pair-form button[type=submit]").click();
+    await pairFilesBrowser(page, fixture, sessionId, "Files tree Browser");
 
     const toggle = page.getByRole("button", { name: "Show ignored directories", exact: true });
     const row = (path: string) => page.locator(`[data-workspace-tree-row][data-relative-path="${path}"]`);
@@ -120,3 +112,59 @@ mountedIt("restores the Files visibility preference and keeps a sent file quote 
     await fixture?.close();
   }
 });
+
+mountedIt("sends a Files directory containing spaces as the original typed workspace reference", { timeout: 90_000 }, async () => {
+  const profile = { ...PI_LIKE_PROFILE, capabilities: [
+    ...PI_LIKE_PROFILE.capabilities.filter(capability => capability.key !== "input.mention"),
+    { key: "input.mention", supported: true, options: ["workspace_directory"] },
+    { key: "workspace.files", supported: true }
+  ] };
+  let fixture: OrchestratorE2eFixture | undefined;
+  let browser: Browser | undefined;
+  try {
+    fixture = await OrchestratorE2eFixture.start({ profiles: [profile], webDirectory });
+    await mkdir(join(fixture.workspaceDirectory, "design docs"));
+    const manager = await fixture.pair("Directory drop Owner");
+    const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId, createSessionMutation({
+      backendId: profile.id, targetId: fixture.targetId(profile.id), displayName: "Directory drop test"
+    })));
+    browser = await chromium.launch({ executablePath: browserPath!, headless: true });
+    const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
+    await pairFilesBrowser(page, fixture, sessionId, "Directory drop Browser");
+
+    const directory = page.locator('[data-workspace-tree-row][data-relative-path="design docs"]');
+    const pane = page.locator(".session-pane--files-rail");
+    const draft = pane.locator(".composer-rich-editor__content");
+    await directory.dragTo(draft);
+    const chip = draft.locator('[data-composer-mention="true"]');
+    await chip.waitFor();
+    const token = '@"design docs/"';
+    expect(await chip.getAttribute("data-serialized")).toBe(token);
+    const store = fixture.application.store;
+    const adapter = fixture.adapter(profile.id);
+    await pane.locator(".send-button").click();
+    const queued = await waitFor(async () => store.listQueueItems({ sessionId })[0], value => value !== undefined, "the typed directory input");
+    expect(queued?.body).toMatchObject({
+      text: token,
+      mentions: [{ kind: "workspace_directory", label: "design docs", reference: "design docs", workspaceId: "workspace-main" }],
+      mentionRanges: [{ start: 0, end: token.length, mentionIndex: 0 }]
+    });
+    expect(queued).toBeDefined();
+    await waitFor(() => manager.clients.run.getRun({ runId: queued!.runId }), value => value.run?.state === RunState.SUCCEEDED, "the typed directory input to settle");
+    expect(adapter.sendCalls[0]?.mentions).toMatchObject([{ kind: "workspace_directory", reference: "design docs", workspaceId: "workspace-main" }]);
+  } finally {
+    await browser?.close();
+    await fixture?.close();
+  }
+});
+
+async function pairFilesBrowser(page: Page, fixture: OrchestratorE2eFixture, sessionId: string, device: string): Promise<void> {
+  const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: device })).challenge!;
+  await page.goto(`${fixture.baseUrl}/#/files/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("button", { name: "Add Joko node", exact: true }).click();
+  await page.locator("details.device-authorization__manual > summary").click();
+  await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+  await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
+  await page.getByLabel("Device name").fill(device);
+  await page.locator("form.pair-form button[type=submit]").click();
+}

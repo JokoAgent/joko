@@ -29,7 +29,7 @@ import { usePartnerConversation } from "./PartnerConversation.js";
 import type { ArtifactReferenceCatalogItemView, AttachmentDraft, BackendView, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ComposerMessageMentionDraft, ComposerSelectionQuoteDraft, DeliveryMode, ExtraDirectoryView, QueueControlView, QueueItemView, RuntimeCommandView, SessionResourceView, SessionView, UsageTokensView, WorkspaceView } from "../model.js";
 import { browserCommentPreviewTag, removeBrowserCommentAndRepairChains } from "../browser-comment-draft.js";
 import { mergeRejectedComposerDraft } from "../composer-draft-recovery.js";
-import { appendQuoteToComposerDocument, appendTextToComposerDocument, composerDocumentEndsWithWhitespace, composerDocumentIsEmpty, composerDocumentKeepingQuotes, composerDocumentPlainText, composerDocumentQuotes, emptyComposerDocument, joinComposerDocuments, normalizeComposerDocument, plainTextToComposerDocument } from "../composer-quote-document.js";
+import { appendQuoteToComposerDocument, appendTextToComposerDocument, composerDirectoryReferencesAllowed, composerDocumentEndsWithWhitespace, composerDocumentIsEmpty, composerDocumentKeepingQuotes, composerDocumentPlainText, composerDocumentQuotes, emptyComposerDocument, joinComposerDocuments, normalizeComposerDocument, plainTextToComposerDocument } from "../composer-quote-document.js";
 import { advertisedQueueDeliveryModes } from "./backend-control-capabilities.js";
 import { upsertComposerMention } from "../message-reference.js";
 import { normalizeSelectionQuoteDrafts } from "../selection-quote.js";
@@ -284,6 +284,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   const selectionQuotes = useMemo(() => composerDocumentQuotes(editorDocument), [editorDocument]);
   const mentionCapability = backend?.capabilities.get("input.mention");
   const mentionPolicy = useMemo(() => resolveComposerMentionPolicy(mentionCapability), [mentionCapability]);
+  const directoryReferencesAllowed = composerDirectoryReferencesAllowed(editorDocument, mentionPolicy.directories, workspace?.id);
   const workspaceMentionsAvailable = mentionPolicy.files || mentionPolicy.directories;
   const canMention = workspaceMentionsAvailable || mentionPolicy.resources || mentionPolicy.artifacts || mentionPolicy.sessions;
 
@@ -594,8 +595,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     return () => { retire(); ownerWindow?.removeEventListener("pagehide", retire); ownerWindow?.removeEventListener("pageshow", activate); };
   }, [voiceDictionaryOwnerKey, controller.getArtifactUrl, voiceRoot]);
   useLayoutEffect(() => () => attachmentPicker.retire(), [attachmentPicker, sendOwner]);
-  const sendStateRef = useRef({ owner: sendOwner, readOnly, connected: controller.state.connectionState === "connected", learnSupported, goalSupported, supportedModes, attachmentPolicy, mentionPolicy, resources, route: sendRouteKey });
-  sendStateRef.current = { owner: sendOwner, readOnly, connected: controller.state.connectionState === "connected", learnSupported, goalSupported, supportedModes, attachmentPolicy, mentionPolicy, resources, route: sendRouteKey };
+  const sendStateRef = useRef({ owner: sendOwner, readOnly, connected: controller.state.connectionState === "connected", learnSupported, goalSupported, supportedModes, attachmentPolicy, mentionPolicy, resources, route: sendRouteKey, workspaceId: workspace?.id });
+  sendStateRef.current = { owner: sendOwner, readOnly, connected: controller.state.connectionState === "connected", learnSupported, goalSupported, supportedModes, attachmentPolicy, mentionPolicy, resources, route: sendRouteKey, workspaceId: workspace?.id };
   const resourceCommandStateRef = useRef({ owner: sendOwner, commands, locked: composerLocked, bashMode: effectiveBashMode });
   resourceCommandStateRef.current = { owner: sendOwner, commands, locked: composerLocked, bashMode: effectiveBashMode };
   const resourceCommandFlightRef = useRef<AbortController | undefined>(undefined);
@@ -608,7 +609,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   const sendDraftRef = useRef<(mode?: DeliveryMode, completedDocument?: JSONContent) => void>(() => undefined);
   const canFinishVoiceSend = !readOnly && controller.state.connectionState === "connected" && submissionKind === undefined && !effectiveBashMode && !modelRouteUnavailable && supportedModes.includes(deliveryMode)
     && attachmentsAllowed([...attachments, ...browserComments.map(item => item.screenshot)], attachmentPolicy)
-    && composerMentionsAllowed(composerMentionsFromRanges(mentions, inlineMentionRanges), mentionPolicy, resources);
+    && directoryReferencesAllowed && composerMentionsAllowed(composerMentionsFromRanges(mentions, inlineMentionRanges), mentionPolicy, resources);
   const finishVoiceAndSend = (event?: KeyboardEvent): void => {
     if (!canFinishVoiceSend || voiceSendFlight.current !== undefined) return;
     const intent = event === undefined ? null : resolveComposerEnterIntent({ key: event.key, shiftKey: event.shiftKey, ctrlKey: event.ctrlKey, metaKey: event.metaKey, altKey: event.altKey, isComposing: event.isComposing, repeat: event.repeat }, sendShortcut, { platform: composerPlatform, turnRunning });
@@ -1364,7 +1365,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   };
 
   const updateInternalDrop = (dataTransfer: DataTransfer, clientX: number, clientY: number): boolean => {
-    const state = classifyComposerInternalDrop(dataTransfer, workspace?.id);
+    const state = classifyComposerInternalDrop(dataTransfer, workspace?.id, mentionPolicy.directories);
     if (state.kind === "none") {
       richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
       return false;
@@ -1380,7 +1381,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   };
 
   const consumeInternalDrop = (dataTransfer: DataTransfer, clientX: number, clientY: number): boolean => {
-    const state = classifyComposerInternalDrop(dataTransfer, workspace?.id);
+    const state = classifyComposerInternalDrop(dataTransfer, workspace?.id, mentionPolicy.directories);
     if (state.kind === "none") {
       richEditorRef.current?.routeReferenceDrop({ kind: "cancel" });
       return false;
@@ -2029,7 +2030,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     const draftMedia = [...attachments, ...browserComments.map((item) => item.screenshot)];
     const sourceMentions = composerMentionsFromRanges(mentionsRef.current, inlineMentionRangesRef.current);
     const sourceMentionRanges = [...inlineMentionRangesRef.current];
-    if (modelRouteUnavailable || !(browserComments.length > 0 || canSend(draftText, attachments, mentions, composerDocumentQuotes(draftDocument), supportedModes, sourceDeliveryMode)) || !attachmentsAllowed(draftMedia, attachmentPolicy) || !composerMentionsAllowed(sourceMentions, mentionPolicy, resources)) return;
+    if (modelRouteUnavailable || !(browserComments.length > 0 || canSend(draftText, attachments, mentions, composerDocumentQuotes(draftDocument), supportedModes, sourceDeliveryMode)) || !attachmentsAllowed(draftMedia, attachmentPolicy) || !composerMentionsAllowed(sourceMentions, mentionPolicy, resources)
+      || !composerDirectoryReferencesAllowed(draftDocument, mentionPolicy.directories, workspace?.id)) return;
     const sourceSessionId = session.id;
     const owner = operationGuardRef.current.capture(sourceSessionId);
     if (quotaChoice === undefined && sourceDeliveryMode === "prompt" && !session.activeRunId && sourceController.readTaskProviderGroupRebalance) {
@@ -2189,7 +2191,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
       try {
         await clearSave;
         const current = sendStateRef.current;
-        if (sourceEpoch === undefined || sendEpochRef.current !== sourceEpoch || current.owner !== sourceSendOwner || current.readOnly || !current.connected || current.route !== sourceRoute || !current.supportedModes.includes(sourceDeliveryMode) || !attachmentsAllowed(draftMedia, current.attachmentPolicy) || !composerMentionsAllowed(sourceMentions, current.mentionPolicy, current.resources)) throw new Error(t("composer.inputUnavailable"));
+        if (sourceEpoch === undefined || sendEpochRef.current !== sourceEpoch || current.owner !== sourceSendOwner || current.readOnly || !current.connected || current.route !== sourceRoute || !current.supportedModes.includes(sourceDeliveryMode) || !attachmentsAllowed(draftMedia, current.attachmentPolicy) || !composerMentionsAllowed(sourceMentions, current.mentionPolicy, current.resources)
+          || !composerDirectoryReferencesAllowed(sourceEditorDocument, current.mentionPolicy.directories, current.workspaceId)) throw new Error(t("composer.inputUnavailable"));
         await sourceSend(sourceSessionId, {
           text: sourceText,
           ...(sourceReplyQuote ? { replyQuote: sourceReplyQuote } : {}),
@@ -2738,7 +2741,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     || browserComments.length > 0
     || canSend(text, attachments, mentions, selectionQuotes, supportedModes, deliveryMode))
     && attachmentsAllowed(draftMedia, attachmentPolicy)
-    && composerMentionsAllowed(composerMentionsFromRanges(mentions, inlineMentionRanges), mentionPolicy, resources);
+    && directoryReferencesAllowed && composerMentionsAllowed(composerMentionsFromRanges(mentions, inlineMentionRanges), mentionPolicy, resources);
   const mainSlotIsStop = canStop && !voiceActive && (!draftCanSend || submissionKind === "send");
   const showSecondaryStop = canStop && draftCanSend && submissionKind !== "send";
 
@@ -3156,7 +3159,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
               label={voiceActive ? t(heldVoice.sendTargetActive ? "voice.releaseToSend" : "voice.finishAndSend") : effectiveBashMode ? t("composer.shellEnter") : deliveryLabel(deliveryMode, t)}
               tip={voiceActive ? t(heldVoice.sendTargetActive ? "voice.releaseToSend" : "voice.finishAndSend") : effectiveBashMode ? `${t("composer.shellEnter")} (${shortcutLabel})` : `${deliveryLabel(deliveryMode, t)} (${shortcutLabel})`}
               disabled={voiceActive ? !canFinishVoiceSend : composerLocked || (effectiveBashMode ? !bashPermitted || (shellDraft?.command.length ?? 0) === 0 || attachments.length > 0 : !draftCanSend)}
-              disabledReason={composerLocked || !composerMentionsAllowed(composerMentionsFromRanges(mentions, inlineMentionRanges), mentionPolicy, resources)
+              disabledReason={composerLocked || !directoryReferencesAllowed || !composerMentionsAllowed(composerMentionsFromRanges(mentions, inlineMentionRanges), mentionPolicy, resources)
                 ? t("composer.inputUnavailable")
                 : effectiveBashMode && !bashPermitted
                   ? t("composer.shellUnavailable")

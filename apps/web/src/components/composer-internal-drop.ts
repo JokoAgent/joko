@@ -1,4 +1,5 @@
 import type { ComposerRouteReferenceAttrs } from "./ComposerRouteReferenceNode.js";
+import { serializeComposerMentionPath } from "../composer-mention-path.js";
 import {
   parseComposerRouteReference,
   type ComposerPasteSegment
@@ -39,9 +40,10 @@ export type ComposerInternalDropState =
  */
 export function resolveComposerInternalDrop(
   dataTransfer: ComposerInternalDropDataTransfer,
-  workspaceId: string | undefined
+  workspaceId: string | undefined,
+  directoryMentionsSupported = false
 ): ComposerInternalDropInsertion | undefined {
-  const state = classifyComposerInternalDrop(dataTransfer, workspaceId);
+  const state = classifyComposerInternalDrop(dataTransfer, workspaceId, directoryMentionsSupported);
   return state.kind === "ready" ? state.insertion : undefined;
 }
 
@@ -52,7 +54,8 @@ export function resolveComposerInternalDrop(
  */
 export function classifyComposerInternalDrop(
   dataTransfer: ComposerInternalDropDataTransfer,
-  workspaceId: string | undefined
+  workspaceId: string | undefined,
+  directoryMentionsSupported = false
 ): ComposerInternalDropState {
   const workspaceRaw = readDropData(dataTransfer, WORKSPACE_ENTRY_DRAG_MIME);
   const sessionRaw = readDropData(dataTransfer, SESSION_LINK_DRAG_MIME).trim();
@@ -63,6 +66,7 @@ export function classifyComposerInternalDrop(
   if (workspaceRaw !== "") {
     const workspace = decodeWorkspaceEntryDragPayload(workspaceRaw);
     if (workspace === undefined || workspaceId === undefined || workspace.workspaceId !== workspaceId) return { kind: "invalid" };
+    const directoryMention = workspace.kind === "directory" && directoryMentionsSupported;
     return {
       kind: "ready",
       insertion: {
@@ -70,8 +74,9 @@ export function classifyComposerInternalDrop(
         attrs: {
           kind: "path",
           display: workspace.path,
-          serialized: `@${workspace.path}`,
-          reference: workspace.path
+          serialized: directoryMention ? serializeComposerMentionPath(workspace.path, true) : `@${workspace.path}`,
+          reference: workspace.path,
+          ...(directoryMention ? { directoryWorkspaceId: workspace.workspaceId } : {})
         }
       }
     };

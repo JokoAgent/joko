@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { composerDirectoryReferencesAllowed, composerDocumentPlainText, normalizeComposerDocument, serializeComposerDocument } from "../composer-quote-document.js";
 import {
   SESSION_LINK_DRAG_MIME,
   classifyComposerInternalDrop,
@@ -33,6 +34,33 @@ describe("composer private drag payloads", () => {
       });
       expect(resolveComposerInternalDrop(transfer, "workspace-2")).toBeUndefined();
     }
+  });
+
+  it("retains only the exact same-workspace directory occurrence as a typed atom", () => {
+    const transfer = dataTransfer({
+      [WORKSPACE_ENTRY_DRAG_MIME]: encodeWorkspaceEntryDragPayload({
+        version: 1, workspaceId: "workspace-1", kind: "directory", path: "design docs", name: "design docs"
+      })
+    });
+    const insertion = resolveComposerInternalDrop(transfer, "workspace-1", true);
+    expect(insertion?.attrs).toMatchObject({ directoryWorkspaceId: "workspace-1", serialized: '@"design docs/"' });
+    expect(resolveComposerInternalDrop(transfer, "workspace-2", true)).toBeUndefined();
+    expect(resolveComposerInternalDrop(transfer, "workspace-1", false)?.attrs).not.toHaveProperty("directoryWorkspaceId");
+    const document = normalizeComposerDocument(JSON.parse(JSON.stringify({
+      type: "doc", content: [{ type: "paragraph", content: [
+        { type: "text", text: '  @"design docs/" ' },
+        { type: "composerRouteReference", attrs: insertion?.attrs }
+      ] }]
+    })));
+    const token = '@"design docs/"';
+    expect(composerDocumentPlainText(document)).toBe(`${token} ${token}`);
+    expect(serializeComposerDocument(document)).toMatchObject({
+      text: `${token} ${token}`,
+      directoryReferences: [{ path: "design docs", workspaceId: "workspace-1", start: token.length + 1, end: 2 * token.length + 1 }]
+    });
+    expect(composerDirectoryReferencesAllowed(document, true, "workspace-1")).toBe(true);
+    expect(composerDirectoryReferencesAllowed(document, true, "workspace-2")).toBe(false);
+    expect(composerDirectoryReferencesAllowed(document, false, "workspace-1")).toBe(false);
   });
 
   it("turns the sidebar task link into a resolvable session atom", () => {

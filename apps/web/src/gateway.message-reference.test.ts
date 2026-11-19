@@ -129,6 +129,31 @@ describe("structured message-reference gateway wiring", () => {
       text: "@report", attachments: [], deliveryMode: "prompt",
       mentions: [{ id: "artifact:report", kind: "artifact", sourceSessionId: "source-task", reference: "artifact-opaque", label: "report", token: "@report" }]
     }, { expectedGeneration: 1n })).rejects.toThrow("invalid mention occurrences");
+
+    const token = '@"design docs/"';
+    const prefix = `${token} @main.ts `;
+    const directory = { type: "composerRouteReference", attrs: {
+      kind: "path", display: "design docs", serialized: token, reference: "design docs", directoryWorkspaceId: "workspace"
+    } };
+    await gateway.send("session-current", {
+      text: `${prefix}${token} ${token}`, attachments: [], deliveryMode: "prompt",
+      editorDocument: { type: "doc", content: [{ type: "paragraph", content: [
+        { type: "text", text: prefix }, directory, { type: "text", text: " " }, directory
+      ] }] },
+      mentions: [{ id: "file", kind: "workspace", workspaceId: "workspace", reference: "src/main.ts", label: "main.ts", token: "@main.ts" }],
+      inlineMentionRanges: [{ mentionId: "file", from: token.length + 1, to: prefix.length - 1 }]
+    }, { expectedGeneration: 1n });
+    const dropped = payloads.at(-1)?.value.input;
+    expect(dropped.parts.map((part: any) => part.content)).toMatchObject([
+      { case: "text", value: `${prefix}${token} ${token}` },
+      { case: "workspaceMention", value: { workspaceId: "workspace", relativePath: "src/main.ts", directory: false } },
+      { case: "workspaceMention", value: { workspaceId: "workspace", relativePath: "design docs", directory: true } }
+    ]);
+    expect(dropped.mentionRanges).toMatchObject([
+      { start: token.length + 1, end: prefix.length - 1, mentionIndex: 0 },
+      { start: prefix.length, end: prefix.length + token.length, mentionIndex: 1 },
+      { start: prefix.length + token.length + 1, end: prefix.length + token.length * 2 + 1, mentionIndex: 1 }
+    ]);
     gateway.disconnect();
   });
 });

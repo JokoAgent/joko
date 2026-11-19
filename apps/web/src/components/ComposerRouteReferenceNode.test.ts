@@ -4,7 +4,7 @@ import Document from "@tiptap/extension-document";
 import Paragraph from "@tiptap/extension-paragraph";
 import Text from "@tiptap/extension-text";
 import { afterEach, describe, expect, it } from "vitest";
-import { composerDocumentIsEmpty, composerDocumentPlainText, normalizeComposerDocument } from "../composer-quote-document.js";
+import { composerDocumentIsEmpty, composerDocumentPlainText, normalizeComposerDocument, serializeComposerDocument } from "../composer-quote-document.js";
 import { ComposerRouteReferenceNode } from "./ComposerRouteReferenceNode.js";
 
 const editors: Editor[] = [];
@@ -45,5 +45,19 @@ describe("composer route reference atom", () => {
       type: "doc",
       content: [{ type: "paragraph", content: [{ type: "composerRouteReference", attrs: { kind: "unknown", display: "bad", serialized: "bad", reference: "bad" } }] }]
     })).toEqual({ type: "doc", content: [{ type: "paragraph" }] });
+  });
+
+  it("keeps directory ownership in the draft JSON and leaves only text semantics in copied HTML", () => {
+    const source = makeEditor();
+    const token = '@"design docs/"';
+    source.commands.insertContent({ type: "composerRouteReference", attrs: {
+      kind: "path", display: "design docs", serialized: token, reference: "design docs", directoryWorkspaceId: "workspace-owner"
+    } });
+    expect(serializeComposerDocument(source.getJSON()).directoryReferences).toEqual([
+      { start: 0, end: token.length, workspaceId: "workspace-owner", path: "design docs" }
+    ]);
+    const restored = makeEditor();
+    restored.commands.setContent(source.getHTML());
+    expect(serializeComposerDocument(restored.getJSON())).toEqual({ text: token, quotesEncoded: false });
   });
 });

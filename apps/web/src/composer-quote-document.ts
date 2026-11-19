@@ -3,6 +3,7 @@ import { validInputMessageReferences, type TaskMessageReferenceRange } from "@jo
 import type { ComposerInlineMentionRange, ComposerSelectionQuoteDraft } from "./model.js";
 import type { ComposerRouteReferenceAttrs } from "./components/ComposerRouteReferenceNode.js";
 import { normalizedListAttrs, promoteComposerMarkdownLists } from "./composer-list-document.js";
+import { serializeComposerMentionPath } from "./composer-mention-path.js";
 import {
   COMPOSER_LONG_PASTE_ATTRIBUTE_LIMIT,
   COMPOSER_PASTED_TEXT_NODE_TYPE,
@@ -17,6 +18,7 @@ import {
   type SelectionQuoteMessageSegment
 } from "./selection-quote.js";
 import { buildSentPastedTextMessageSegments, type SentPastedTextMessageSegment } from "./components/sent-pasted-text.js";
+import { canonicalWorkspaceId, canonicalWorkspaceRelativePath } from "./components/workspace-tree-state.js";
 
 export const COMPOSER_QUOTE_NODE_TYPE = "composerQuote";
 
@@ -27,6 +29,7 @@ export interface SerializedComposerDocument {
   readonly quotesEncoded: boolean;
   readonly pastedTextRanges?: readonly ComposerPastedTextRange[];
   readonly messageReferences?: readonly TaskMessageReferenceRange[];
+  readonly directoryReferences?: readonly ComposerDirectoryReferenceRange[];
   /** Occurrences projected into the final serialized text, preserving their identity. */
   readonly mentionRanges?: readonly { readonly mentionId: string; readonly start: number; readonly end: number }[];
 }
@@ -37,11 +40,19 @@ export interface ComposerPastedTextRange {
   readonly display: string;
 }
 
+interface ComposerDirectoryReferenceRange {
+  readonly start: number;
+  readonly end: number;
+  readonly workspaceId: string;
+  readonly path: string;
+}
+
 interface SerializedBlock {
   readonly kind: "text" | "quote";
   readonly text: string;
   readonly pastedTextRanges?: readonly ComposerPastedTextRange[];
   readonly messageReferences?: readonly TaskMessageReferenceRange[];
+  readonly directoryReferences?: readonly ComposerDirectoryReferenceRange[];
 }
 
 export function emptyComposerDocument(): JSONContent {
@@ -236,6 +247,7 @@ export function serializeComposerDocument(document: unknown, mentionRanges: read
   let serialized = "";
   const pastedTextRanges: ComposerPastedTextRange[] = [];
   const messageReferences: TaskMessageReferenceRange[] = [];
+  const directoryReferences: ComposerDirectoryReferenceRange[] = [];
   let previousKind: SerializedBlock["kind"] | undefined;
   let suppressNextSeparator = false;
   for (let index = 0; index < blocks.length; index += 1) {
@@ -272,6 +284,7 @@ export function serializeComposerDocument(document: unknown, mentionRanges: read
       });
     }
     messageReferences.push(...offsetComposerRanges(block.messageReferences ?? [], blockStart));
+    directoryReferences.push(...offsetComposerRanges(block.directoryReferences ?? [], blockStart));
     suppressNextSeparator = false;
     previousKind = block.kind;
   }
@@ -305,6 +318,7 @@ export function serializeComposerDocument(document: unknown, mentionRanges: read
     quotesEncoded: blocks.some((block) => block.kind === "quote"),
     ...(projectedRanges.length === 0 ? {} : { pastedTextRanges: projectedRanges }),
     ...(projectedMessageReferences.length === 0 ? {} : { messageReferences: projectedMessageReferences }),
+    ...(directoryReferences.length === 0 ? {} : { directoryReferences: offsetComposerRanges(directoryReferences, -leadingTrim) }),
     ...(projectedMentions.length === 0 ? {} : { mentionRanges: projectedMentions })
   };
 }
@@ -330,6 +344,15 @@ export function composerDocumentQuotes(document: unknown): readonly ComposerSele
     if (attrs !== undefined) result.push(attrs);
   });
   return result;
+}
+
+export function composerDirectoryReferencesAllowed(document: JSONContent, supported: boolean, workspaceId: string | undefined): boolean {
+  let allowed = true;
+  walkComposerNodes(document.content ?? [], (node) => {
+    const sourceWorkspaceId = node.type === COMPOSER_ROUTE_REFERENCE_NODE_TYPE ? node.attrs?.["directoryWorkspaceId"] : undefined;
+    if (sourceWorkspaceId != null && (!supported || sourceWorkspaceId !== workspaceId)) allowed = false;
+  });
+  return allowed;
 }
 
 export function composerDocumentIsEmpty(document: unknown): boolean {
@@ -393,6 +416,7 @@ function composerDocumentBlocks(document: JSONContent): readonly SerializedBlock
     let buffer = "";
     let bufferPastedTextRanges: ComposerPastedTextRange[] = [];
     let bufferMessageReferences: TaskMessageReferenceRange[] = [];
+    let bufferDirectoryReferences: ComposerDirectoryReferenceRange[] = [];
     let emittedInline = false;
     const flushText = (force = false): void => {
       if (!force && buffer === "") return;
@@ -400,11 +424,13 @@ function composerDocumentBlocks(document: JSONContent): readonly SerializedBlock
         kind: "text",
         text: buffer,
         pastedTextRanges: bufferPastedTextRanges,
-        messageReferences: bufferMessageReferences
+        messageReferences: bufferMessageReferences,
+        directoryReferences: bufferDirectoryReferences
       });
       buffer = "";
       bufferPastedTextRanges = [];
       bufferMessageReferences = [];
+      bufferDirectoryReferences = [];
       emittedInline = true;
     };
     for (const child of children) {
@@ -425,7 +451,7 @@ function composerDocumentBlocks(document: JSONContent): readonly SerializedBlock
         }
       }
       else if (child.type === COMPOSER_ROUTE_REFERENCE_NODE_TYPE) {
-        buffer += serializeRouteReference(child, buffer.length, bufferMessageReferences);
+        buffer += serializeRouteReference(child, buffer.length, bufferMessageReferences, bufferDirectoryReferences);
       }
     }
     flushText(!emittedInline);
@@ -437,12 +463,14 @@ interface InlineSerializedProjection {
   readonly text: string;
   readonly pastedTextRanges: readonly ComposerPastedTextRange[];
   readonly messageReferences: readonly TaskMessageReferenceRange[];
+  readonly directoryReferences: readonly ComposerDirectoryReferenceRange[];
 }
 
 function inlineNodesSerializedProjection(nodes: readonly JSONContent[], continuationIndent = ""): InlineSerializedProjection {
   let text = "";
   const pastedTextRanges: ComposerPastedTextRange[] = [];
   const messageReferences: TaskMessageReferenceRange[] = [];
+  const directoryReferences: ComposerDirectoryReferenceRange[] = [];
   for (const node of nodes) {
     if (node.type === "text") text += node.text ?? "";
     else if (node.type === "hardBreak") text += `\n${continuationIndent}`;
@@ -454,21 +482,30 @@ function inlineNodesSerializedProjection(nodes: readonly JSONContent[], continua
         pastedTextRanges.push({ start, end: text.length, display: attrs.display });
       }
     }
-    else if (node.type === COMPOSER_ROUTE_REFERENCE_NODE_TYPE) text += serializeRouteReference(node, text.length, messageReferences);
+    else if (node.type === COMPOSER_ROUTE_REFERENCE_NODE_TYPE) text += serializeRouteReference(node, text.length, messageReferences, directoryReferences);
     else if (node.type === COMPOSER_QUOTE_NODE_TYPE) {
       const quote = quoteAttrs(node.attrs);
       if (quote !== undefined) text += selectionQuoteModelText(quote);
     }
   }
-  return { text, pastedTextRanges, messageReferences };
+  return { text, pastedTextRanges, messageReferences, directoryReferences };
 }
 
-function serializeRouteReference(node: JSONContent, start: number, messageReferences: TaskMessageReferenceRange[]): string {
+function serializeRouteReference(
+  node: JSONContent,
+  start: number,
+  messageReferences: TaskMessageReferenceRange[],
+  directoryReferences: ComposerDirectoryReferenceRange[]
+): string {
   const attrs = routeReferenceAttrs(node.attrs);
   if (attrs === undefined) return "";
+  const end = start + attrs.serialized.length;
   if (attrs.sourceMessageId !== undefined && attrs.sourceEventId !== undefined) {
-    messageReferences.push({ start, end: start + attrs.serialized.length, sourceSessionId: attrs.reference,
+    messageReferences.push({ start, end, sourceSessionId: attrs.reference,
       messageId: attrs.sourceMessageId, eventId: attrs.sourceEventId });
+  }
+  if (attrs.directoryWorkspaceId !== undefined) {
+    directoryReferences.push({ start, end, workspaceId: attrs.directoryWorkspaceId, path: attrs.reference });
   }
   return attrs.serialized;
 }
@@ -494,7 +531,8 @@ function listSerializedProjection(list: JSONContent, indent = ""): InlineSeriali
     lines.push({
       text: `${prefix}${first.text}`,
       pastedTextRanges: offsetComposerRanges(first.pastedTextRanges, prefix.length),
-      messageReferences: offsetComposerRanges(first.messageReferences, prefix.length)
+      messageReferences: offsetComposerRanges(first.messageReferences, prefix.length),
+      directoryReferences: offsetComposerRanges(first.directoryReferences, prefix.length)
     });
     for (const child of blocks) {
       if (child === firstParagraph) continue;
@@ -505,7 +543,8 @@ function listSerializedProjection(list: JSONContent, indent = ""): InlineSeriali
         lines.push({
           text: `${continuationIndent}${continuation.text}`,
           pastedTextRanges: offsetComposerRanges(continuation.pastedTextRanges, continuationIndent.length),
-          messageReferences: offsetComposerRanges(continuation.messageReferences, continuationIndent.length)
+          messageReferences: offsetComposerRanges(continuation.messageReferences, continuationIndent.length),
+          directoryReferences: offsetComposerRanges(continuation.directoryReferences, continuationIndent.length)
         });
       }
     }
@@ -517,14 +556,16 @@ function joinSerializedLines(lines: readonly InlineSerializedProjection[]): Inli
   let text = "";
   const pastedTextRanges: ComposerPastedTextRange[] = [];
   const messageReferences: TaskMessageReferenceRange[] = [];
+  const directoryReferences: ComposerDirectoryReferenceRange[] = [];
   lines.forEach((line, index) => {
     if (index > 0) text += "\n";
     const lineStart = text.length;
     text += line.text;
     pastedTextRanges.push(...offsetComposerRanges(line.pastedTextRanges, lineStart));
     messageReferences.push(...offsetComposerRanges(line.messageReferences, lineStart));
+    directoryReferences.push(...offsetComposerRanges(line.directoryReferences, lineStart));
   });
-  return { text, pastedTextRanges, messageReferences };
+  return { text, pastedTextRanges, messageReferences, directoryReferences };
 }
 
 function normalizeListNode(node: Record<string, unknown>): JSONContent | undefined {
@@ -617,6 +658,7 @@ function routeReferenceAttrs(value: unknown): ComposerRouteReferenceAttrs | unde
   const semanticTextTruncated = attrs["semanticTextTruncated"];
   const sourceMessageId = attrs["sourceMessageId"];
   const sourceEventId = attrs["sourceEventId"];
+  let directoryWorkspaceId: string | undefined;
   if ((kind !== "session" && kind !== "project" && kind !== "path")
     || typeof display !== "string" || display.length === 0 || display.length > 500
     || typeof serialized !== "string" || serialized.length === 0 || serialized.length > 4_096
@@ -625,6 +667,15 @@ function routeReferenceAttrs(value: unknown): ComposerRouteReferenceAttrs | unde
     || (href !== undefined && href !== null && (typeof href !== "string" || href.length === 0 || href.length > 4_096))
     || (semanticText !== undefined && semanticText !== null && (typeof semanticText !== "string" || semanticText.length === 0 || semanticText.length > COMPOSER_MESSAGE_REFERENCE_TEXT_LIMIT))
     || (semanticTextTruncated !== undefined && semanticTextTruncated !== null && typeof semanticTextTruncated !== "boolean")) return undefined;
+  if (attrs["directoryWorkspaceId"] != null) {
+    if (kind !== "path" || href != null || semanticText != null) return undefined;
+    try {
+      directoryWorkspaceId = canonicalWorkspaceId(attrs["directoryWorkspaceId"]);
+      if (serialized !== serializeComposerMentionPath(canonicalWorkspaceRelativePath(reference), true)) return undefined;
+    } catch {
+      return undefined;
+    }
+  }
   let messageAnchor: Pick<ComposerRouteReferenceAttrs, "sourceMessageId" | "sourceEventId"> | undefined;
   if (sourceMessageId != null || sourceEventId != null) {
     if (kind !== "session" || typeof sourceMessageId !== "string" || typeof sourceEventId !== "string") return undefined;
@@ -640,6 +691,7 @@ function routeReferenceAttrs(value: unknown): ComposerRouteReferenceAttrs | unde
     ...(typeof href === "string" ? { href } : {}),
     ...(typeof semanticText === "string" ? { semanticText } : {}),
     ...(semanticTextTruncated === true ? { semanticTextTruncated: true } : {}),
+    ...(directoryWorkspaceId === undefined ? {} : { directoryWorkspaceId }),
     ...messageAnchor
   };
 }
