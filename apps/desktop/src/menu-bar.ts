@@ -187,7 +187,8 @@ export class DesktopMenuBar {
     if (message.type === "refresh" || message.type === "panel" && message.open) { this.#options.onAction({ type: "refresh" }); return; }
     const snapshot = this.#snapshot;
     if (!snapshot || snapshot.view.gate) return;
-    if (message.type === "open-session" && snapshot.view.tasks.some(task => task.sessionId === message.sessionId)) {
+    if (message.type === "open-session" && (snapshot.view.tasks.some(task => task.sessionId === message.sessionId)
+      || snapshot.view.activities?.some(activity => activity.sessionId === message.sessionId))) {
       this.#options.onOpenApp(); this.#options.onAction({ type: "open-session", id: message.sessionId });
     } else if (message.type === "open-provider-settings") {
       this.#options.onOpenApp(); this.#options.onAction({ type: "open-provider-settings" });

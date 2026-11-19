@@ -121,7 +121,7 @@ export interface DesktopUpdateService {
   readonly check: () => Promise<DesktopUpdateCheckResult>;
   /** Cold-start check pinned to the already fetched bounded manifest version. */
   readonly checkForExpectedVersion: (expectedVersion: string) => Promise<DesktopUpdateCheckResult>;
-  readonly relaunch: () => Promise<DesktopUpdateRelaunchResult>;
+  readonly relaunch: (expectedVersion?: string) => Promise<DesktopUpdateRelaunchResult>;
   readonly dispose: () => void;
 }
 
@@ -625,7 +625,10 @@ export function createDesktopUpdateService(options: DesktopUpdateServiceOptions)
     }
   };
 
-  const relaunch = (): Promise<DesktopUpdateRelaunchResult> => {
+  const relaunch = (expectedVersion?: string): Promise<DesktopUpdateRelaunchResult> => {
+    if (expectedVersion !== undefined && (currentStatus.status !== "ready" || currentStatus.version !== expectedVersion)) {
+      return Promise.resolve({ accepted: false, reason: "not-ready" });
+    }
     if (inFlightRelaunch !== undefined) return inFlightRelaunch;
     if (inFlightFeedChange !== undefined) return Promise.resolve({ accepted: false, reason: "not-ready" });
     const operation = performRelaunch().finally(() => {

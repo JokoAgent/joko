@@ -5,7 +5,8 @@ import { afterEach, expect, it, vi } from "vitest";
 import { capabilityNames, DEFAULT_MENUBAR_SETTINGS, type DesktopMenubarAction, type DesktopMenubarSnapshot, type MenubarSettings } from "@joko/contracts";
 import type { AppController, ControllerState } from "./controller.js";
 import { DEFAULT_UI_PREFERENCES } from "./local-state.js";
-import { emptySnapshot, type ConnectionProfile, type ProviderRuntimeView, type SessionView, type UsageHistorySummaryView, type UsageHistoryView } from "./model.js";
+import { emptySnapshot, type ConnectionProfile, type PartnerProfileView, type ProviderRuntimeView, type SessionAttentionView, type SessionView,
+  type UsageHistorySummaryView, type UsageHistoryView } from "./model.js";
 import { desktopMenuBarProviderRouteCurrent, desktopMenuBarRouteCurrent, desktopMenuBarSourceKey, desktopMenuBarSources, projectDesktopMenuBar,
   readDesktopMenuBarUsage, useDesktopMenuBar, type DesktopMenuBarSource, type DesktopMenuBarUsage } from "./desktop-menu-bar.js";
 
@@ -46,7 +47,7 @@ function state(sources = [source()]): ControllerState {
   const current = sources.find(source => source.epoch === undefined)!;
   return { ready: true, connectionState: "connected", connectionGeneration: current.connectionGeneration, profiles: sources.map(source => source.profile),
     activeProfile: current.profile, snapshot: current.snapshot, nativeTaskStatusLiveSources: sources.filter(source => source.epoch !== undefined).map(source => ({
-      profile: source.profile, snapshot: source.snapshot, epoch: source.epoch!, partners: [] })), machineCaches: [], machinePresenceByProfile: {},
+      profile: source.profile, snapshot: source.snapshot, epoch: source.epoch!, partners: source.partners ?? [] })), machineCaches: [], machinePresenceByProfile: {},
     discoveredNodes: [], discoveryState: "idle", managedOrchestratorStatus: undefined, automaticConnectionAvailable: false,
     route: { kind: "session" }, preferences: DEFAULT_UI_PREFERENCES, systemLocale: "en", effectiveLocale: "en", extensionNotifications: [] };
 }
@@ -88,13 +89,69 @@ it("maps actual Backend names, opaque node/task identities, quota and local/sele
   expect(Object.values(projected.view.details).every(detail => detail.action.kind === "open-app")).toBe(true);
   expect(projected.view.usage.scopes.local.daily.at(-1)?.money).toEqual([0, 2, 0]);
   expect(projected.view.usage.scopes.all.daily.at(-1)?.money).toEqual([2, 2, 0]);
-  expect(projected.routes.size).toBe(2);
+  expect(projected.view.activities).toHaveLength(2);
+  expect(projected.routes.size).toBe(4);
   const restarted = { ...first, snapshot: { ...first.snapshot, generation: 9n } };
   const next = await projectDesktopMenuBar({ sources: [restarted], readings: new Map(), settings: DEFAULT_MENUBAR_SETTINGS, locale: "en", now });
   expect(next.view.sources[0]?.id).toBe(projected.view.sources[0]?.id);
   expect(next.view.tasks[0]?.sessionId).not.toBe(projected.view.tasks.find(task => projected.routes.get(task.sessionId)?.source === first)?.sessionId);
   const local = await projectDesktopMenuBar({ sources, readings, settings: { ...DEFAULT_MENUBAR_SETTINGS, scope: "local" }, locale: "en", now });
   expect(local.view.tasks).toHaveLength(1); expect(local.view.sources).toHaveLength(1);
+});
+
+it("shows live and unread task activity independently of usage, with exact owner routes and private summaries", async () => {
+  const cursor = { generation: 2n, sequence: 10n, opaqueToken: "attention-cursor" };
+  const attention = (kind: SessionAttentionView["kind"], updatedAt: number, unread = true): SessionAttentionView => ({
+    kind, updatedAt, unread, subjectCursor: cursor, attentionCursor: cursor, readThroughCursor: { ...cursor, sequence: unread ? 9n : 10n }
+  });
+  const waiting: SessionView = { ...task, id: "question", name: "Original question task", state: "waiting" };
+  const permitted: SessionView = { ...task, id: "permission", name: "Approval task", state: "waiting" };
+  const completed: SessionView = { ...task, id: "done", name: "Original completed task", state: "idle", attention: attention("done", now - 5_000) };
+  const local = source();
+  const primary = { ...local, snapshot: { ...local.snapshot,
+    sessions: [task, waiting, permitted, completed,
+      { ...completed, id: "read", name: "Already read", attention: attention("done", now, false) },
+      { ...completed, id: "expired", name: "Expired", state: "error" as const, attention: attention("error", now - 4 * 60 * 60 * 1_000) },
+      { ...completed, id: "archived", name: "Archived", archived: true }],
+    interactions: [
+      { id: "original-question", sessionId: waiting.id, generation: waiting.generation, kind: "question" as const, createdAt: now,
+        title: "Choose a destination", message: "Original question summary", fields: [], options: [], planSteps: [] },
+      { id: "original-permission", sessionId: permitted.id, generation: permitted.generation, kind: "permission" as const, createdAt: now,
+        title: "Approve operation", message: "Original permission summary", fields: [], options: [], planSteps: [] }
+    ], timelineBySession: new Map([[completed.id, [{ id: "final", sequence: 1n, kind: "assistant" as const, createdAt: now - 5_000, text: "Original terminal summary" }]]])
+  } };
+  const partner: PartnerProfileView = { id: "partner", revision: 1n, profileVersion: 1n, displayName: "Remote partner", description: "", avatar: "leaf",
+    lifecycle: "active", initializationState: "ready", invitationStage: "ready", homeTargetId: "home", canonicalSessionId: task.id, templateId: "general",
+    identitySource: "private", capabilities: { modelChain: [], permissionMode: "ask", planMode: false }, usesDirectoryDefaults: true, createdAt: 1, updatedAt: now,
+    activity: { partnerId: "partner", unreadReplyCount: 1, latestReplyAt: now, latestReplyPreview: "Original partner reply", artifactCount: 0,
+      activeDelegationCount: 0, readThroughCursor: 0n, readUpdatedAt: now } };
+  const remote = source(true), paired = { ...remote, partners: [partner], snapshot: { ...remote.snapshot, sessions: [{ ...task, state: "idle" as const }] } };
+  const input = { sources: [primary, paired], readings: new Map(), settings: DEFAULT_MENUBAR_SETTINGS, locale: "en", now };
+  const result = await projectDesktopMenuBar(input);
+  expect(result.view.attentionCount).toBe(4);
+  expect(result.view.activities).toHaveLength(5);
+  expect(result.view.activities).toEqual(expect.arrayContaining([
+    expect.objectContaining({ phase: "interaction", preview: "Original question summary", attention: true }),
+    expect.objectContaining({ phase: "completed", preview: "Original terminal summary", attention: true }),
+    expect.objectContaining({ phase: "completed", preview: "Original partner reply", attention: true }),
+    expect.objectContaining({ phase: "running", attention: false })
+  ]));
+  expect(result.view.tasks.some(entry => entry.title === completed.name)).toBe(false);
+  const pairedRoute = result.routes.get(result.view.activities!.find(entry => entry.preview === "Original partner reply")!.sessionId)!;
+  expect(pairedRoute).toMatchObject({ sessionId: task.id, activity: true, partnerId: partner.id });
+  expect(desktopMenuBarRouteCurrent(pairedRoute, state([primary, paired]))).toBe(true);
+  expect(desktopMenuBarRouteCurrent(pairedRoute, state([primary, { ...paired, partners: [] }]))).toBe(false);
+  expect(desktopMenuBarRouteCurrent(pairedRoute, state([primary, { ...paired, epoch: 9 }]))).toBe(false);
+  const focused = await projectDesktopMenuBar({ ...input, visibleLocalSessionId: waiting.id });
+  expect(focused.view.attentionCount).toBe(3);
+  expect(focused.view.activities?.some(entry => entry.preview === "Original question summary")).toBe(false);
+  expect((await projectDesktopMenuBar({ ...input, visibleLocalSessionId: permitted.id })).view.attentionCount).toBe(4);
+  const privateView = (await projectDesktopMenuBar({ ...input, settings: { ...input.settings, privacy: true } })).view;
+  expect(privateView.activities?.every(entry => entry.title === "Private task" && entry.preview === entry.status)).toBe(true);
+  expect(JSON.stringify(privateView.activities)).not.toContain("Original");
+  const disconnected = await projectDesktopMenuBar({ ...input, sources: [] });
+  expect(disconnected.view.activities).toBeUndefined();
+  expect(disconnected.routes.size).toBe(0);
 });
 
 it("does not add different currencies and marks unavailable or stale evidence in both languages", async () => {

@@ -6,6 +6,7 @@ import {
 import { TRAY_MENU_CASES } from "./i18n/menu-corpus.js";
 
 import {
+  createWindowsTrayQuitAction,
   popUpDesktopTrayMenu,
   usesJavaScriptTrayMenuPopup,
   type DesktopTrayPopupMenu
@@ -27,6 +28,59 @@ function popupMenu() {
     }
   } satisfies DesktopTrayPopupMenu & { close(): void };
 }
+
+describe("Windows tray quit", () => {
+  it("leaves the committed local runtime running on cancel and admits an explicit confirmation", async () => {
+    const runtime = {};
+    const probeActivity = vi.fn(async () => ({ blocksShutdown: true }));
+    const confirmQuit = vi.fn<() => Promise<boolean>>().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    const quit = vi.fn();
+    const request = createWindowsTrayQuitAction({ getRuntime: () => runtime, isQuitting: () => false,
+      probeActivity, confirmQuit, quit });
+
+    await request();
+    expect(confirmQuit).toHaveBeenCalledOnce();
+    expect(quit).not.toHaveBeenCalled();
+    await request();
+    expect(quit).toHaveBeenCalledOnce();
+  });
+
+  it("quits directly when idle or without a local runtime", async () => {
+    let runtime: object | undefined = {};
+    const probeActivity = vi.fn(async () => ({ blocksShutdown: false }));
+    const confirmQuit = vi.fn(async () => false);
+    const quit = vi.fn();
+    const request = createWindowsTrayQuitAction({ getRuntime: () => runtime, isQuitting: () => false,
+      probeActivity, confirmQuit, quit });
+
+    await request();
+    runtime = undefined;
+    await request();
+    expect(probeActivity).toHaveBeenCalledOnce();
+    expect(confirmQuit).not.toHaveBeenCalled();
+    expect(quit).toHaveBeenCalledTimes(2);
+  });
+
+  it("requires confirmation if activity is unavailable and discards it after the runtime changes", async () => {
+    let runtime = {};
+    let answer!: (value: boolean) => void;
+    const confirmation = new Promise<boolean>(resolve => { answer = resolve; });
+    const probeActivity = vi.fn(async () => { throw new Error("runtime activity unavailable"); });
+    const confirmQuit = vi.fn(() => confirmation);
+    const quit = vi.fn();
+    const request = createWindowsTrayQuitAction({ getRuntime: () => runtime, isQuitting: () => false,
+      probeActivity, confirmQuit, quit });
+
+    const original = request();
+    await request();
+    await vi.waitFor(() => expect(confirmQuit).toHaveBeenCalledOnce());
+    runtime = {};
+    answer(true);
+    await original;
+    expect(probeActivity).toHaveBeenCalledOnce();
+    expect(quit).not.toHaveBeenCalled();
+  });
+});
 
 describe("Desktop tray menu", () => {
   it.each(TRAY_MENU_CASES)("localizes %s tray labels with managed runtime=%s", (locale, managesLocalOrchestrator, open, quit) => {

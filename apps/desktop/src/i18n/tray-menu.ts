@@ -3,6 +3,34 @@ export interface DesktopTrayMenuLabels {
   readonly quit: string;
 }
 
+export function resolveDesktopTrayQuitLabels(locale: string): {
+  readonly title: string;
+  readonly detail: string;
+  readonly cancel: string;
+  readonly quit: string;
+} {
+  const normalized = locale.trim().toLowerCase();
+  const labels = normalized === "zh" || normalized.startsWith("zh-cn") || normalized.startsWith("zh-hans")
+    ? {
+        title: "退出 Joko 和本地 Orchestrator？",
+        detail: "退出可能中断正在运行的本机任务。",
+        cancel: "取消",
+        quit: "退出"
+      }
+    : {
+        title: "Quit Joko and local Orchestrator?",
+        detail: "Quitting may interrupt tasks running on this computer.",
+        cancel: "Cancel",
+        quit: "Quit"
+      };
+  return normalized !== "en-xa" ? labels : {
+    title: pseudoLocalizeTrayLabel(labels.title),
+    detail: pseudoLocalizeTrayLabel(labels.detail),
+    cancel: pseudoLocalizeTrayLabel(labels.cancel),
+    quit: pseudoLocalizeTrayLabel(labels.quit)
+  };
+}
+
 export interface DesktopRemoteDesktopTrayLabels {
   readonly allow: string;
   readonly viewing: string;

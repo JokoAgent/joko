@@ -1,3 +1,4 @@
+import { setTimeout as delay } from "node:timers/promises";
 import { atomicWritePrivateFile, readPrivateFile } from "@joko/device-peer/private-files";
 
 export type DesktopWindowTheme = "dark" | "light" | "system";
@@ -22,7 +23,18 @@ export async function openDesktopWindowAppearance(path: string) {
       const write = writes.then(async () => {
         assertCurrent();
         if (preference === next) return;
-        await atomicWritePrivateFile(path, Buffer.from(`${next}\n`, "utf8"));
+        const bytes = Buffer.from(`${next}\n`, "utf8");
+        for (let attempt = 0; ; attempt += 1) {
+          try {
+            await atomicWritePrivateFile(path, bytes);
+            break;
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException | undefined)?.code;
+            if (process.platform !== "win32" || attempt >= 4 || !["EPERM", "EACCES", "EBUSY"].includes(code ?? "")) throw error;
+            await delay(20 * 2 ** attempt);
+            assertCurrent();
+          }
+        }
         preference = next;
       });
       writes = write.catch(() => undefined);

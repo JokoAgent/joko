@@ -603,8 +603,10 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
       render(); return;
     }
     if (url.hostname === "focus") {
+      const token = url.searchParams.get("token") ?? undefined;
+      if (token !== focusEntryToken(session)) return;
       playConfiguredSound("select");
-      options.onAction({ kind: "focus", sessionId, ...(session.remote || isTerminalPhase(session.phase) ? { entryToken: remoteEntryToken(session) } : {}) });
+      options.onAction({ kind: "focus", sessionId, ...(token === undefined ? {} : { entryToken: token }) });
       return;
     }
     if (url.hostname !== "permission" || session.permission === undefined) return;
@@ -912,7 +914,7 @@ export function renderNativeTaskStatusDocument(
       </div>`
     : `<div class="compact-row">
         ${phaseMark(current.phase)}
-        <a class="task-main" href="${focusUrl(current.sessionId)}"><strong>${escapeHtml(current.title || strings.untitled)}</strong><span>${escapeHtml(phaseLabel(current.phase, strings, current.interactionKind, current.inputHandoff))}</span></a>
+        <a class="task-main" href="${focusUrl(current)}"><strong>${escapeHtml(current.title || strings.untitled)}</strong><span>${escapeHtml(phaseLabel(current.phase, strings, current.interactionKind, current.inputHandoff))}</span></a>
         ${isTerminalPhase(current.phase) && multipleCompletions ? completionNavigation(current, strings) : ""}
         ${countBadge(surface.counts, strings)}
         <a class="icon-action" href="${ACTION_SCHEME}//toggle" aria-label="${escapeAttribute(strings.expand)}" title="${escapeAttribute(strings.expand)}">${nativeIcon("chevron-down")}</a>
@@ -969,10 +971,11 @@ function renderSessionRow(session: DesktopNativeTaskStatusSurface["sessions"][nu
   const companion = session.remote?.companion;
   const identity = companion ? `<span class="remote-companion" style="color:${companion.tint}" aria-hidden="true">${companion.artwork
     ? `<img src="${escapeAttribute(companion.artwork)}" alt="">` : escapeHtml(companion.glyph)}</span>` : "";
+  const focus = focusUrl(session);
   return `<article class="task-row task-row--${session.phase}">
     <div class="task-status">${phaseMark(session.phase)}<span>${escapeHtml(phaseLabel(session.phase, strings, session.interactionKind, session.inputHandoff))}</span></div>
-    <a class="task-copy" href="${focusUrl(session.sessionId)}"><strong>${identity}${escapeHtml(session.title || strings.untitled)}</strong>${session.detail ? `<p>${escapeHtml(session.detail)}</p>` : ""}</a>
-    <a class="focus-action" href="${focusUrl(session.sessionId)}">${escapeHtml(strings.focus)}</a>
+    <a class="task-copy" href="${focus}"><strong>${identity}${escapeHtml(session.title || strings.untitled)}</strong>${session.detail ? `<p>${escapeHtml(session.detail)}</p>` : ""}</a>
+    <a class="focus-action" href="${focus}">${escapeHtml(strings.focus)}</a>
     ${activity}
     ${actions}
     ${isTerminalPhase(session.phase) ? `<div class="permission-actions">
@@ -1216,8 +1219,15 @@ function isTerminalPhase(phase: DesktopNativeTaskStatusPhase): boolean {
   return phase === "completed" || phase === "error";
 }
 
-function focusUrl(sessionId: string): string {
-  return `${ACTION_SCHEME}//focus?${new URLSearchParams({ sessionId }).toString()}`;
+function focusEntryToken(session: DesktopNativeTaskStatusSurface["sessions"][number]): string | undefined {
+  return session.remote || isTerminalPhase(session.phase) ? remoteEntryToken(session) : undefined;
+}
+
+function focusUrl(session: DesktopNativeTaskStatusSurface["sessions"][number]): string {
+  const parameters = new URLSearchParams({ sessionId: session.sessionId });
+  const token = focusEntryToken(session);
+  if (token !== undefined) parameters.set("token", token);
+  return `${ACTION_SCHEME}//focus?${parameters}`;
 }
 
 function phaseMark(phase: DesktopNativeTaskStatusPhase): string {

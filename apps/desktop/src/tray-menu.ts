@@ -20,6 +20,36 @@ export interface DesktopTrayMenuPopupOptions<Menu extends DesktopTrayPopupMenu> 
   readonly onError: (error: unknown) => void;
 }
 
+export interface WindowsTrayQuitOptions<Runtime extends object> {
+  readonly getRuntime: () => Runtime | undefined;
+  readonly isQuitting: () => boolean;
+  readonly probeActivity: () => Promise<{ readonly blocksShutdown: boolean }>;
+  readonly confirmQuit: () => Promise<boolean>;
+  readonly quit: () => void;
+}
+
+export function createWindowsTrayQuitAction<Runtime extends object>(options: WindowsTrayQuitOptions<Runtime>) {
+  let pending = false;
+  return async (): Promise<void> => {
+    if (pending || options.isQuitting()) return;
+    const runtime = options.getRuntime();
+    if (runtime === undefined) {
+      options.quit();
+      return;
+    }
+
+    const isCurrent = (): boolean => !options.isQuitting() && options.getRuntime() === runtime;
+    pending = true;
+    try {
+      const activity = await options.probeActivity().catch(() => undefined);
+      if (!isCurrent()) return;
+      if (activity?.blocksShutdown !== false && !await options.confirmQuit()) return;
+      if (isCurrent()) options.quit();
+    } finally {
+      pending = false;
+    }
+  };
+}
 
 /**
  * Windows uses an explicit right-click popup so the application owns the

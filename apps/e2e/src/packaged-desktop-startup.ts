@@ -45,11 +45,13 @@ export function createPackagedDesktopStartupEvidence() {
         })).catch(() => undefined),
         new Promise<undefined>((resolveObservation) => { timer = setTimeout(() => resolveObservation(undefined), 1_000); })
       ]).finally(() => clearTimeout(timer));
+      const stages = progress.split(/\r?\n/u).filter(Boolean).map(line => line.split(" ", 1)[0]);
       return {
         launcherExitCode: application?.process().exitCode ?? null,
         launcherSignal: application?.process().signalCode ?? null,
         nativeState: nativeState ?? null,
-        stages: progress.split(/\r?\n/u).filter(Boolean).slice(0, 24).map((line) => line.split(" ", 1)[0])
+        stages: stages.slice(0, 24),
+        themeMirrorStages: stages.filter(stage => stage?.startsWith("window_theme_mirror_")).slice(-12)
       };
     },
     reset() { resultPath = undefined; }

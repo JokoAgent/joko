@@ -365,9 +365,13 @@ export interface DesktopUpdateChannelProbeResult {
   readonly available: boolean;
 }
 
-export interface DesktopUpdateRelaunchRequest {
+export interface DesktopUpdateChannelRelaunchRequest {
   /** True only after the trusted renderer presents and receives manual confirmation. */
   readonly allowBusy: boolean;
+}
+
+export interface DesktopUpdateRelaunchRequest extends DesktopUpdateChannelRelaunchRequest {
+  readonly expectedVersion: string;
 }
 
 export type DesktopUpdateRelaunchResult =

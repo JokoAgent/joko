@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { createInterface } from "node:readline";
 
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { create } from "@bufbuild/protobuf";
@@ -55,18 +56,43 @@ afterEach(async ({ task }) => {
   }
 }, 90_000);
 
-packagedIt("applies the saved dark backing when the Windows application starts cold", { timeout: 180_000 }, async () => {
+packagedIt("restores the saved dark backing and maximization when the Windows application starts cold", { timeout: 180_000 }, async () => {
   const first = await launchSettingsDesktop();
   const main = await first.application.firstWindow({ timeout: 60_000 });
   const chooseTheme = async (theme: "light" | "dark") => {
     const label = theme === "light" ? /^(?:Theme: Light|主题: 浅色)$/u : /^(?:Theme: Dark|主题: 深色)$/u;
     await main.getByRole("button", { name: label }).click({ timeout: 30_000 });
-    await waitFor(() => readFile(join(first.profilePath, "window-appearance.txt"), "utf8").catch(() => ""),
-      value => value.trim() === theme, "the saved Desktop theme mirror");
+    try {
+      await waitFor(() => readFile(join(first.profilePath, "window-appearance.txt"), "utf8").catch(() => ""),
+        value => value.trim() === theme, `the saved ${theme} Desktop theme mirror`);
+    } catch (error) {
+      const renderer = await main.evaluate(() => {
+        const toggle = document.querySelector<HTMLButtonElement>(".connection-theme-toggle");
+        return { mode: document.documentElement.dataset.theme, label: toggle?.getAttribute("aria-label"), disabled: toggle?.disabled };
+      }).catch(() => undefined);
+      console.error("Packaged settings: theme selection not mirrored.", JSON.stringify({ requested: theme, renderer }));
+      throw error;
+    }
   };
   await chooseTheme("light");
   await chooseTheme("dark");
+  const mainWindow = await first.application.browserWindow(main);
+  await mainWindow.evaluate(window => { window.maximize(); });
+  await waitFor(() => mainWindow.evaluate(window => window.isMaximized()), Boolean, "the original Windows maximization");
+  const missingDisplayX = await first.application.evaluate(({ screen }) =>
+    Math.max(...screen.getAllDisplays().map(({ bounds }) => bounds.x + bounds.width)) + 1_000);
   await closeDesktop();
+  const statePath = join(first.profilePath, "window-state.json");
+  const saved = JSON.parse(await readFile(statePath, "utf8")) as {
+    readonly x: number; readonly y: number; readonly width: number; readonly height: number;
+    readonly displayBounds: { readonly width: number; readonly height: number };
+    readonly isMaximized: boolean; readonly isFullScreen: boolean;
+  };
+  expect(saved).toMatchObject({ isMaximized: true, isFullScreen: false });
+  expect(saved.width).toBeGreaterThan(0);
+  expect(saved.height).toBeGreaterThan(0);
+  const unavailableDisplay = { ...saved.displayBounds, x: missingDisplayX, y: 0 };
+  await writeFile(statePath, JSON.stringify({ ...saved, x: missingDisplayX, y: 0, displayBounds: unavailableDisplay }));
   const reopened = await launchSettingsDesktop(first.profilePath);
   const receipt = await waitFor(async () => {
     try { return JSON.parse(await readFile(reopened.startupReceipt, "utf8")) as { readonly backgroundColor?: string }; }
@@ -74,11 +100,115 @@ packagedIt("applies the saved dark backing when the Windows application starts c
   }, value => value?.backgroundColor !== undefined, "the cold Windows window creation receipt");
   expect(receipt?.backgroundColor?.toLowerCase()).toBe("#0d0d0d");
   const page = await reopened.application.firstWindow({ timeout: 60_000 });
+  const reopenedWindow = await reopened.application.browserWindow(page);
+  const placement = await waitFor(() => reopenedWindow.evaluate(window => ({
+    maximized: window.isMaximized(), fullscreen: window.isFullScreen(), bounds: window.getBounds()
+  })), state => state.maximized, "the original Windows window maximized on the available display");
+  expect(placement.fullscreen).toBe(false);
+  expect(placement.bounds.x).toBeLessThan(missingDisplayX);
   expect(await page.evaluate(() => {
     const desktopWindow = (window as Window & { jokoDesktop?: { window?: { startupTheme?: string } } }).jokoDesktop?.window;
     return { theme: document.documentElement.dataset.theme, startup: desktopWindow?.startupTheme };
   })).toEqual({ theme: "dark", startup: "dark" });
+
+  const nativeWindowId = await reopenedWindow.evaluate(window => window.id);
+  if (desktopIdentity === undefined) throw new Error("The reopened Windows process has no ownership evidence.");
+  await restoreNativeWindowDuringDisplayChange(reopened.application, nativeWindowId, desktopIdentity.pid);
+  const recovery = () => reopenedWindow.evaluate(window => ({
+    maximized: window.isMaximized(),
+    events: (window as typeof window & { displayRecoveryEvents?: readonly string[] }).displayRecoveryEvents ?? []
+  }));
+  try {
+    await waitFor(recovery, value => value.maximized && value.events.join(",") === "display-change,unmaximize,maximize",
+      "same Windows window maximized after display metrics change");
+  } catch (error) {
+    console.error("Packaged settings: Windows display recovery events.", JSON.stringify(await recovery().catch(() => undefined)));
+    throw error;
+  }
+
+  const restore = page.getByRole("button", { name: /^(?:Maximize or restore|最大化或还原)$/u });
+  await restore.waitFor({ state: "visible" });
+  await reopened.application.evaluate(({ screen }) => { screen.emit("display-metrics-changed", {}, screen.getPrimaryDisplay(), ["bounds"]); });
+  await restore.click({ timeout: 2_000 });
+  await waitFor(() => reopenedWindow.evaluate(window => window.isMaximized()), maximized => !maximized, "user restored the Windows window");
+  const stayedRestored = await reopenedWindow.evaluate(async window => {
+    await new Promise(resolve => setTimeout(resolve, 700));
+    return !window.isMaximized();
+  });
+  expect(stayedRestored).toBe(true);
 });
+
+async function restoreNativeWindowDuringDisplayChange(application: ElectronApplication, windowId: number, expectedPid: number): Promise<void> {
+  const owner = await application.evaluate(({ BrowserWindow }, id) => {
+    const window = BrowserWindow.fromId(id);
+    if (window === null || !window.isVisible() || !window.isMaximized()) throw new Error("The original Windows window is unavailable.");
+    const handle = window.getNativeWindowHandle();
+    const hwnd = handle.length === 8 ? handle.readBigUInt64LE().toString() : handle.readUInt32LE().toString();
+    return { hwnd, pid: process.pid };
+  }, windowId);
+  if (owner.pid !== expectedPid || !/^[1-9][0-9]*$/u.test(owner.hwnd)) throw new Error("The Windows window owner changed.");
+  // Electron's unmaximize issues SC_RESTORE, which is the user-intent signal
+  // this regression needs to distinguish from a display-induced state change.
+  const script = `
+$ErrorActionPreference = 'Stop'
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class JokoDisplayTestWindow {
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+  [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hwnd);
+  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hwnd, int show);
+}
+'@
+$nativeWindow = [IntPtr]::new([int64]$env:JOKO_E2E_WINDOW_HANDLE)
+[Console]::Out.WriteLine('ready')
+[Console]::Out.Flush()
+if ([Console]::ReadLine() -ne 'restore') { throw 'Expected the owned display transition.' }
+[uint32]$windowOwner = 0
+if ([JokoDisplayTestWindow]::GetWindowThreadProcessId($nativeWindow, [ref]$windowOwner) -eq 0 -or
+    $windowOwner -ne [uint32]$env:JOKO_E2E_WINDOW_OWNER -or -not [JokoDisplayTestWindow]::IsZoomed($nativeWindow)) {
+  throw 'The maximized window no longer belongs to the original Desktop.'
+}
+if (-not [JokoDisplayTestWindow]::ShowWindowAsync($nativeWindow, 9)) { throw 'The native restore request was rejected.' }
+`;
+  let finish!: (result: { readonly error: Error | null; readonly diagnostic: string }) => void;
+  const exited = new Promise<{ readonly error: Error | null; readonly diagnostic: string }>(resolve => { finish = resolve; });
+  const helper = execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    windowsHide: true,
+    timeout: 15_000,
+    env: { ...process.env, JOKO_E2E_WINDOW_HANDLE: owner.hwnd, JOKO_E2E_WINDOW_OWNER: String(owner.pid) }
+  }, (error, _stdout, stderr) => finish({ error, diagnostic: stderr.trim() }));
+  if (helper.stdout === null || helper.stdin === null) {
+    helper.kill();
+    throw new Error("The Windows restore fixture has no standard streams.");
+  }
+  const lines = createInterface({ input: helper.stdout });
+  try {
+    await Promise.race([
+      new Promise<void>((resolve, reject) => lines.once("line", line => {
+        if (line === "ready") resolve();
+        else reject(new Error("Unexpected Windows restore readiness receipt."));
+      })),
+      exited.then(result => { throw new Error(result.diagnostic || "Windows restore exited before readiness.", { cause: result.error }); })
+    ]);
+    await application.evaluate(({ BrowserWindow, screen }, id) => {
+      const window = BrowserWindow.fromId(id);
+      if (window === null || !window.isVisible() || !window.isMaximized()) throw new Error("The original Windows window changed.");
+      const events: string[] = ["display-change"];
+      (window as typeof window & { displayRecoveryEvents: string[] }).displayRecoveryEvents = events;
+      window.once("unmaximize", () => events.push("unmaximize"));
+      window.once("maximize", () => events.push("maximize"));
+      screen.emit("display-metrics-changed", {}, screen.getPrimaryDisplay(), ["scaleFactor"]);
+    }, windowId);
+    helper.stdin.on("error", () => undefined);
+    helper.stdin.end("restore\n");
+    const result = await exited;
+    if (result.error !== null) throw new Error(result.diagnostic || "Windows native restore failed.", { cause: result.error });
+  } finally {
+    lines.close();
+    if (helper.exitCode === null && helper.signalCode === null) helper.kill();
+  }
+}
 
 packagedIt("converges conversation settings across real application windows and consumes fresh creation preferences", {
   timeout: 240_000

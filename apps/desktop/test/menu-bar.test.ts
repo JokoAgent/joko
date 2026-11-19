@@ -98,6 +98,28 @@ it("binds task intents to the latest presentation, ignores old revisions and ale
   await f.service.dispose();
 });
 
+it("forwards only activities published by the current menu view and clears them when privacy changes", async () => {
+  const f = fixture(); await f.service.initialize(); const helper = f.helpers[0]!;
+  helper.output({ type: "ready" });
+  const current = view();
+  current.activities = [{ sessionId: "bound-activity", title: "Task name", phase: "interaction", status: "Waiting", preview: "Question summary", attention: true, updatedAtMs: 1_000 }];
+  current.attentionCount = 1;
+  const snapshot = { ownerId: "document-one", revision: "1", view: current };
+  expect(() => f.service.publish({ ...snapshot, view: { ...current, activities: [...current.activities!, ...current.activities!] } })).toThrow();
+  expect(() => f.service.publish({ ...snapshot, view: { ...current, attentionCount: 0 } })).toThrow();
+  f.service.publish(snapshot);
+  expect(helper.updates.at(-1)?.view).toMatchObject({ attentionCount: 1, activities: current.activities });
+  helper.output({ type: "open-session", sessionId: "unpublished" });
+  helper.output({ type: "open-session", sessionId: "bound-activity" });
+  expect(f.actions).toEqual([{ type: "open-session", id: "bound-activity" }]);
+  helper.output({ type: "settings", patch: { privacy: true } });
+  await vi.waitFor(() => expect(helper.updates.at(-1)?.view).toMatchObject({ gate: "connection", settings: { privacy: true } }));
+  expect(helper.updates.at(-1)?.view?.activities).toBeUndefined();
+  helper.output({ type: "open-session", sessionId: "bound-activity" });
+  expect(f.options.onOpenApp).toHaveBeenCalledOnce();
+  await f.service.dispose();
+});
+
 it("stops across independent sleep/lock fences and resumes with a fresh connection gate", async () => {
   const f = fixture(); await f.service.initialize(); f.helpers[0]!.output({ type: "ready" }); f.publish(1);
   await f.service.suspend("system"); await f.service.suspend("lock"); f.publish(2);

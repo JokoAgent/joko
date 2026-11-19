@@ -887,9 +887,10 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     if (sessionId !== undefined) return sessionForTaskRoute(state, sessionId);
     return [...state.snapshot.sessions].filter((session) => !session.archived && !session.hidden).sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updatedAt - a.updatedAt)[0];
   }, [state]);
-  const filesChatScope = state.route.kind === "files" && activeSession !== undefined && state.activeProfile !== undefined
-    ? JSON.stringify([state.activeProfile.serverId, state.activeProfile.id, state.connectionGeneration,
+  const activeTaskPaneScope = activeSession !== undefined && state.activeProfile !== undefined
+    ? JSON.stringify([state.route.kind, state.activeProfile.serverId, state.activeProfile.id, state.connectionGeneration,
       state.snapshot.generation.toString(), activeSession.id, activeSession.generation.toString()]) : undefined;
+  const filesChatScope = state.route.kind === "files" ? activeTaskPaneScope : undefined;
   const visibleFilesChatRef = useRef<string | undefined>(undefined);
   const [visibleFilesChat, setVisibleFilesChat] = useState<string>();
   const onFilesChatVisibilityChange = useCallback((visible: boolean): void => {
@@ -899,6 +900,16 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     setVisibleFilesChat(visibleFilesChatRef.current);
   }, [filesChatScope]);
   const activeChatExposed = state.route.kind !== "files" || (filesChatScope !== undefined && visibleFilesChat === filesChatScope);
+  const [visibleSplitTasks, setVisibleSplitTasks] = useState<{ readonly scope: string; readonly sessionIds: readonly string[] }>();
+  const onSplitVisibleSessionIdsChange = useCallback((sessionIds: readonly string[] | undefined): void => {
+    if (activeTaskPaneScope === undefined) return;
+    setVisibleSplitTasks(current => {
+      if (sessionIds === undefined) return current?.scope === activeTaskPaneScope ? undefined : current;
+      if (current?.scope === activeTaskPaneScope && current.sessionIds.length === sessionIds.length
+        && current.sessionIds.every((id, index) => id === sessionIds[index])) return current;
+      return { scope: activeTaskPaneScope, sessionIds };
+    });
+  }, [activeTaskPaneScope]);
   const backgroundTaskRoute = state.route.kind === "session" && state.route.backgroundExtensionId !== undefined;
   const directedBackgroundTask = backgroundTaskRoute && activeSession?.hidden === true;
   const backgroundTaskPending = backgroundTaskRoute && state.route.kind === "session"
@@ -952,10 +963,10 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const nativeTaskStatusVisibleSessionIds = useMemo(() => {
     if (state.route.kind !== "session" && state.route.kind !== "files") return [];
     if (state.route.kind === "session" && sessionSplitLayout.root !== undefined && activeSession?.archived !== true && !directedBackgroundTask) {
-      return Object.freeze(sessionSplitPanes(sessionSplitLayout.root).map((pane) => pane.sessionId));
+      return visibleSplitTasks !== undefined && visibleSplitTasks.scope === activeTaskPaneScope ? visibleSplitTasks.sessionIds : [];
     }
     return Object.freeze(activeSession === undefined || !activeChatExposed ? [] : [activeSession.id]);
-  }, [activeChatExposed, activeSession, directedBackgroundTask, sessionSplitLayout.root, state.route.kind]);
+  }, [activeChatExposed, activeSession, activeTaskPaneScope, directedBackgroundTask, sessionSplitLayout.root, state.route.kind, visibleSplitTasks]);
   const sidebarSnapshot = useMemo(() => {
     const sessions = applySessionProjectOverrides(state.snapshot.sessions, sessionProjectOverrides);
     return sessions === state.snapshot.sessions ? state.snapshot : { ...state.snapshot, sessions };
@@ -1592,12 +1603,16 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       if (await navigateFromApplicationMenu({ kind: "settings" })) window.location.hash = "#/settings/taskStatus";
     },
     checkForUpdates: async () => {
-      const result = await window.jokoDesktop?.checkForUpdates();
-      if (result === undefined) return;
+      const desktop = window.jokoDesktop;
+      if (desktop === undefined) return;
+      const status = await desktop.updates?.getStatus().catch(() => undefined);
+      const notice: DesktopUpdateCheckNotice = status?.status === "downloading" && status.startup !== true
+        ? { key: "desktop.updateDownloadingTitle", values: { version: status.version } }
+        : desktopUpdateCheckNotice(await desktop.checkForUpdates());
       applicationMenuNoticeIdRef.current += 1;
       setApplicationMenuNotice({
         id: applicationMenuNoticeIdRef.current,
-        ...desktopUpdateCheckNotice(result)
+        ...notice
       });
     },
     setNavigationOpen: async (open) => setWindowNavigationOpen(open),
@@ -2724,6 +2739,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             renderPane={renderSessionSplitPane}
             onLayoutChange={commitSessionSplitLayout}
             onFocus={focusSplitSession}
+            onVisibleSessionIdsChange={onSplitVisibleSessionIdsChange}
             onPreviewFocus={setFocusedSplitSessionId}
             onClose={closeSessionSplitPane}
             onDropSession={(sessionId, anchorId, side) => { if (!directedBackgroundTask) addSessionToSplit(sessionId, anchorId, side); }}

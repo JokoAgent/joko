@@ -1115,6 +1115,12 @@ describe("Desktop system handoff App boundary", () => {
   });
 
   it("keeps a task notification pending across renderer recovery until its original timeline is mounted and ready", async () => {
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 600 : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("timeline") ? 720 : 0;
+    });
     const route = { kind: "session", sessionId: "task-b", profileId: "profile-a", serverId: "server-a" } as const;
     const task = session(route.sessionId);
     const starting = connectedState({ route: { kind: "settings" } });

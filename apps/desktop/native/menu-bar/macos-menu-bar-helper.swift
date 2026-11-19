@@ -99,6 +99,17 @@ struct MBTask: Decodable, Identifiable, Equatable {
   let meta: String
 }
 
+struct MBTaskActivity: Decodable, Identifiable, Equatable {
+  var id: String { sessionId }
+  let sessionId: String
+  let title: String
+  let phase: String
+  let status: String
+  let preview: String
+  let attention: Bool
+  let updatedAtMs: Double
+}
+
 struct MBModelUsage: Decodable, Equatable {
   let name: String
   let harness: String
@@ -146,6 +157,8 @@ struct MBView: Decodable, Equatable {
   let details: [String: MBDetail]
   let taskSummary: String
   let tasks: [MBTask]
+  let activities: [MBTaskActivity]?
+  let attentionCount: Int?
   let usage: MBUsage
   let manage: [MBManageRow]
   let settings: MBSettings
@@ -707,7 +720,10 @@ final class StatusController: NSObject, NSWindowDelegate {
   private func updateStatusTitle() {
     guard let button = statusItem.button else { return }
     let mode = store.view?.settings.statusText ?? "icon"
-    let text = (store.view?.statusTextByMode[mode] ?? nil) ?? ""
+    let configured = (store.view?.statusTextByMode[mode] ?? nil) ?? ""
+    let count = store.view?.gate == nil ? store.view?.attentionCount ?? 0 : 0
+    let badge = count > 99 ? "99+" : String(count)
+    let text = [count > 0 ? badge : "", configured].filter { !$0.isEmpty }.joined(separator: " · ")
     if text.isEmpty {
       button.attributedTitle = NSAttributedString(string: "")
       button.imagePosition = .imageOnly
@@ -722,7 +738,8 @@ final class StatusController: NSObject, NSWindowDelegate {
       )
     }
     if let view = store.view {
-      button.setAccessibilityLabel(text.isEmpty ? "Joko" : "Joko, \(text)")
+      let attention = count > 0 ? store.s("activityAttentionCount", ["n": String(count)]) : ""
+      button.setAccessibilityLabel(["Joko", attention, configured].filter { !$0.isEmpty }.joined(separator: ", "))
       button.toolTip = view.headlinePrimary
     }
   }
@@ -1575,6 +1592,7 @@ struct MainPage: View {
   @State private var topHeight: CGFloat = 0
   @State private var footHeight: CGFloat = 0
   @State private var viewportHeight: CGFloat = 0
+  @State private var activityFilter: TaskActivityFilter?
 
   var body: some View {
     VStack(spacing: 0) {
@@ -1650,6 +1668,11 @@ struct MainPage: View {
           .padding(.top, measured.isEmpty ? 12 : 4)
       }
 
+      if let activities = view.activities {
+        activitySection(activities)
+          .padding(EdgeInsets(top: 14, leading: 18, bottom: 0, trailing: 18))
+      }
+
       Caption(title: store.s("tasks"), detail: view.taskSummary) {
         TaskTotal(tasks: view.tasks, tokenUnit: store.s("tokenUnit"), showsTokens: store.narrowWidth >= 350, replayToken: store.fillToken)
       }
@@ -1662,6 +1685,56 @@ struct MainPage: View {
         .padding(EdgeInsets(top: 8, leading: 12, bottom: 12, trailing: 12))
     }
     .frame(width: store.narrowWidth, alignment: .leading)
+  }
+
+  private enum TaskActivityFilter: Hashable {
+    case unread, inProgress
+  }
+
+  private func activitySection(_ activities: [MBTaskActivity]) -> some View {
+    let filter = activityFilter ?? (activities.contains(where: \.attention) ? .unread : .inProgress)
+    let shown = activities.filter { filter == .unread ? $0.attention : !$0.attention }
+    return VStack(alignment: .leading, spacing: 5) {
+      Picker(store.s("activityFilter"), selection: Binding(get: { filter }, set: { activityFilter = $0 })) {
+        Text(store.s("activityUnread")).tag(TaskActivityFilter.unread)
+        Text(store.s("activityInProgress")).tag(TaskActivityFilter.inProgress)
+      }
+      .pickerStyle(.segmented)
+      .labelsHidden()
+      if shown.isEmpty {
+        Text(store.s(filter == .unread ? "activityNoUnread" : "activityNoInProgress"))
+          .font(.system(size: 11)).foregroundStyle(Palette.ink3)
+          .padding(.vertical, 5)
+      }
+      ForEach(shown) { activity in
+        Button {
+          controller.emitAndClose(["type": "open-session", "sessionId": activity.sessionId])
+        } label: {
+          HStack(alignment: .top, spacing: 8) {
+            Circle().fill(activity.phase == "error" ? Palette.error : activity.attention ? Palette.warn : Palette.fill)
+              .frame(width: 6, height: 6).padding(.top, 5).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+              Text(activity.title).font(.system(size: 12, weight: .semibold)).lineLimit(1)
+              HStack(spacing: 5) {
+                Text(activity.status)
+                if activity.updatedAtMs > 0 {
+                  Text(Date(timeIntervalSince1970: activity.updatedAtMs / 1000), style: .relative)
+                }
+              }
+              .font(.system(size: 10)).foregroundStyle(Palette.ink3).lineLimit(1)
+              if activity.preview != activity.status {
+                Text(activity.preview).font(.system(size: 11)).foregroundStyle(Palette.ink3).lineLimit(2)
+              }
+            }
+            Spacer(minLength: 0)
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+          .padding(.vertical, 4)
+          .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+      }
+    }
   }
 
   private var foot: some View {

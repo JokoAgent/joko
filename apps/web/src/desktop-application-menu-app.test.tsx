@@ -276,6 +276,45 @@ describe("Desktop application-menu App lifecycle", () => {
     Reflect.deleteProperty(window, "jokoDesktop");
   });
 
+  it("shows current download feedback and opens native Settings during a background download", async () => {
+    let menuListener: ((command: "open-settings" | "check-for-updates") => void) | undefined;
+    const status: JokoDesktopUpdateStatus = { status: "downloading", version: "0.1.121", progress: 12,
+      transferred: 12, total: 100, bytesPerSecond: 1 };
+    const getStatus = vi.fn(async () => status);
+    const checkForUpdates = vi.fn(async () => ({ status: "up-to-date" as const }));
+    Object.defineProperty(window, "jokoDesktop", { configurable: true, value: {
+      platform: "darwin",
+      capabilities: ["app.info", "appearance.zoom", "application.menu", "inspector.detach", "selection.quote.contextMenu"],
+      appInfo: { get: vi.fn() },
+      applicationMenu: { configure: vi.fn(async () => undefined), onCommand: vi.fn((listener: typeof menuListener) => {
+        menuListener = listener;
+        return vi.fn();
+      }) },
+      updates: { getStatus }, checkForUpdates,
+      selectionContextMenu: { setLocale: vi.fn(async () => undefined), onAddToChat: vi.fn() }
+    } as unknown as JokoDesktopApi });
+    const container = document.body.appendChild(document.createElement("div"));
+    const root = createRoot(container);
+    const controller = controllerWithState(true, DEFAULT_UI_PREFERENCES);
+    try {
+      await act(async () => { root.render(createElement(AppWithController, { controller })); });
+      expect(menuListener).toBeDefined();
+      await act(async () => {
+        menuListener?.("check-for-updates");
+        menuListener?.("open-settings");
+      });
+      expect(getStatus).toHaveBeenCalled();
+      expect(checkForUpdates).not.toHaveBeenCalled();
+      expect(controller.navigate).toHaveBeenCalledWith({ kind: "settings" });
+      expect(container.textContent).toContain("Downloading Joko 0.1.121");
+    } finally {
+      await act(async () => { root.unmount(); });
+      container.remove();
+      window.location.hash = "";
+      Reflect.deleteProperty(window, "jokoDesktop");
+    }
+  });
+
   it("drops Settings and Check for Updates menu commands while startup update owns interaction", async () => {
     let menuListener: ((command: "new-session" | "open-settings" | "check-for-updates") => void) | undefined;
     const checkForUpdates = vi.fn(async () => ({ status: "up-to-date" as const }));

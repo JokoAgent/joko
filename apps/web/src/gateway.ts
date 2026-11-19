@@ -1451,7 +1451,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       this.#sharedTaskReady = true;
       this.#callbacks.onState?.("connected");
       if (options?.snapshotOnly !== true) {
-        this.publishLiveSnapshot(true);
+        if (this.#taskSharing !== undefined) this.publishLiveSnapshot(true);
         if (!this.#taskSharing && this.#callbacks.onLiveSnapshot) this.#stopInputHandoffWatch = watchInputHandoffTasks({ transport, signal: abort.signal,
           isCurrent: () => this.#abort === abort && this.#transport === transport,
           ownerKey: () => `${this.#profile?.serverId}:${this.#snapshot?.generation}`,
