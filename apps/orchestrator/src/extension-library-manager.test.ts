@@ -70,6 +70,37 @@ function currentAuthority(expected = authority) {
 }
 
 describe("ExtensionLibraryManager", () => {
+  it.each([false, true])("recovers after a trash container was created before its manifest (has contents=%s)", async hasContents => {
+    const { manager, temporaryPath } = await fixture();
+    const secondAuthority = { ...authority, extensionId: `extension_${"d".repeat(32)}`, name: "Independent Library", resourceId: "second-library" };
+    const scope = (owner: ExtensionLibraryAuthority, digit: string) => ({ authority: owner, connectionId: "original-owner",
+      surfaceId: `extension_surface_${digit.repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, assertAuthorityCurrent: currentAuthority(owner) });
+    const first = scope(authority, "1"), second = scope(secondAuthority, "2");
+    const original = await manager.openSession(first), independent = await manager.openSession(second);
+    await manager.write(original.sessionId, first.connectionId, { path: "source.txt", bytes: Buffer.from("Original source") });
+    await manager.write(independent.sessionId, second.connectionId, { path: "other.txt", bytes: Buffer.from("Independent bytes") });
+    await manager.close();
+    const rootDirectory = join(temporaryPath, "owner");
+    const unfinished = join(rootDirectory, "trash", `library_trash_${"9".repeat(32)}`);
+    await mkdir(unfinished);
+    if (hasContents) await writeFile(join(unfinished, "owned-evidence"), "Keep these bytes");
+
+    const reopened = new ExtensionLibraryManager({ rootDirectory, freeBytes: async () => 64 * 1024 * 1024 * 1024 });
+    cleanups.push(() => reopened.close().catch(() => undefined));
+    await reopened.initialize();
+    if (hasContents) {
+      await expect(reopened.overview(second)).resolves.toMatchObject({ state: "unavailable", reason: "state_corrupt" });
+      await expect(readFile(join(unfinished, "owned-evidence"), "utf8")).resolves.toBe("Keep these bytes");
+      return;
+    }
+    expect(reopened.listTrash()).toEqual([]);
+    await expect(reopened.overview(second)).resolves.toMatchObject({ state: "ready" });
+    const firstOpen = await reopened.openSession(first), secondOpen = await reopened.openSession(second);
+    await expect(reopened.read(firstOpen.sessionId, first.connectionId, { path: "source.txt" })).resolves.toMatchObject({ bytes: Buffer.from("Original source") });
+    await expect(reopened.read(secondOpen.sessionId, second.connectionId, { path: "other.txt" })).resolves.toMatchObject({ bytes: Buffer.from("Independent bytes") });
+    await expect(readdir(unfinished)).resolves.toEqual([]);
+  });
+
   it("rejects a cursor after another authorized session removes its preceding entry", async () => {
     const { manager } = await fixture();
     const open = (connectionId: string, digit: string) => manager.openSession({ authority, connectionId,

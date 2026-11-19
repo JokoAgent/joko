@@ -1837,6 +1837,8 @@ export class ExtensionLibraryManager {
           (await readManagerRecord(join(container, TRASH_MANIFEST_FILE), 1024 * 1024)).toString("utf8")
         ));
       } catch (error) {
+        if (missing(error) && !this.#state.trash.some(record => record.trashId === entry.name)
+          && await isEmptyUnpublishedTrashContainer(container)) continue;
         this.#stateUnavailable = true;
         throw new ExtensionLibraryError("CORRUPT", "Extension Library trash manifest is corrupt.", { cause: error });
       }
@@ -2534,6 +2536,17 @@ async function readManagerRecord(path: string, maximumBytes = MANAGER_RECORD_MAX
     return bytes;
   } finally {
     await handle?.close().catch(() => undefined);
+  }
+}
+
+async function isEmptyUnpublishedTrashContainer(path: string): Promise<boolean> {
+  try {
+    const before = await lstat(path, { bigint: true });
+    if (!before.isDirectory() || before.isSymbolicLink() || (await readdir(path)).length !== 0) return false;
+    const after = await lstat(path, { bigint: true });
+    return sameManagerObject(before, after) && before.mtimeNs === after.mtimeNs && before.ctimeNs === after.ctimeNs;
+  } catch {
+    return false;
   }
 }
 
