@@ -1649,7 +1649,8 @@ export class ProviderCatalogManager {
   async discoverProviderModels(
     backendId: string,
     providerId: string,
-    fetchImpl: typeof fetch = fetch
+    fetchImpl: typeof fetch = fetch,
+    assertAuthorityCurrent?: () => void
   ): Promise<ProviderModelDiscoveryResult> {
     this.#assertInitialized();
     const normalized = managedProviderKey(backendId, providerId);
@@ -1660,6 +1661,7 @@ export class ProviderCatalogManager {
     const spec = this.#modelDiscoverySpec(captured);
     const credentialGenerations = [...new Set(Object.values(captured.credentialBindings))]
       .map(reference => ({ reference, generation: this.#credentials.find(reference)?.generation }));
+    assertAuthorityCurrent?.();
     const discovered = await fetchProviderModels({ ...spec, includeNonChat: true }, fetchImpl);
     return this.#mutate(async () => {
       const current = this.#entries.get(normalized);
@@ -1675,10 +1677,13 @@ export class ProviderCatalogManager {
         : undefined;
       const updates = new Map(discovered.map(model => [model.id, model]));
       const known = new Set(current.provider.models.map(model => model.id));
-      const additions = discovered.filter(model => {
+      const codexApiKeyResponses = current.kind === "api_key" && current.provider.api === "openai-responses"
+        && current.nativeCredentialReferenceId === undefined && Object.keys(current.credentialBindings).length > 0
+        && this.#store.findBackend(current.backendId)?.descriptor.adapterKind === "codex";
+      const additions = discovered.filter(model => !known.has(model.id)).map(model => {
         const managed = discoveredManagedModel(model, customPiApi);
-        return !known.has(model.id) && (isManagedChatModel(managed) || isManagedSpeechModel(managed));
-      });
+        return codexApiKeyResponses && model.cost !== undefined && isManagedChatModel(managed) ? { ...managed, cost: model.cost } : managed;
+      }).filter(model => isManagedChatModel(model) || isManagedSpeechModel(model));
       const updatedModelIds: string[] = [];
       const retained = current.provider.models.map(model => {
         const update = updates.get(model.id);
@@ -1701,7 +1706,7 @@ export class ProviderCatalogManager {
         provider: {
           ...current.provider,
           models: [
-            ...additions.map(model => discoveredManagedModel(model, customPiApi)),
+            ...additions,
             ...retained
           ]
         },
@@ -1709,6 +1714,7 @@ export class ProviderCatalogManager {
         updatedAt: this.#now()
       };
       validateProviderEntry(next);
+      assertAuthorityCurrent?.();
       this.#entries.set(normalized, next);
       await this.#bumpAndPersist(() => this.#entries.set(normalized, current));
       return {

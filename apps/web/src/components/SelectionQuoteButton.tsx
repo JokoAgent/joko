@@ -54,9 +54,9 @@ export const boundedTimelineSelectionText = boundedSelectionQuoteText;
 
 /**
  * Read the current selection from this component's own document and container.
- * Message floating discovery stays assistant-only; force=true additionally
- * admits user messages for the trusted Desktop context menu. File mode admits
- * a contained selection without pretending that it came from a chat message.
+ * Floating quotes can come from an assistant message or one rendered tool
+ * output. The trusted Desktop context menu also admits user messages. File
+ * mode uses the workspace host's own text and line information.
  */
 export function readSelectionInStream(
   sessionId: string,
@@ -99,6 +99,14 @@ export function readSelectionInStream(
       ...(metadata ?? {})
     }])[0];
   } else {
+    const toolStart = selectionNodeElement(range.startContainer)?.closest<HTMLElement>("[data-selection-quote-tool-output]");
+    const toolEnd = selectionNodeElement(range.endContainer)?.closest<HTMLElement>("[data-selection-quote-tool-output]");
+    if (toolStart || toolEnd) {
+      if (selection.rangeCount !== 1 || toolStart !== toolEnd || !container.contains(toolStart ?? null)) return undefined;
+      const toolOutputId = toolStart?.dataset.selectionQuoteToolOutput;
+      quote = normalizeSelectionQuoteDrafts([{ id: randomUuid(), kind: "tool", text, sessionId, toolOutputId }])[0];
+      return quote === undefined ? undefined : { quote, ...floatingAnchor };
+    }
     const start = selectionSourceElement(range.startContainer);
     const end = selectionSourceElement(range.endContainer);
     if (start === null || end !== start) return undefined;
@@ -238,8 +246,8 @@ export function SelectionQuoteButton({
       <button type="button" className="selection-quote-button" onMouseDown={(event) => event.preventDefault()} onClick={() => commit(onCommit)}>
         <MessageSquarePlus aria-hidden="true" /><span>{label}</span>
       </button>
-      {onAskSideChat !== undefined && <button type="button" className="selection-quote-button"
-        onMouseDown={(event) => event.preventDefault()} onClick={() => commit(onAskSideChat)}>
+      {onAskSideChat !== undefined && visibleAnchor.quote.kind !== "tool" && <button type="button" className="selection-quote-button"
+        onMouseDown={(event) => event.preventDefault()} onClick={() => commit(quote => { if (quote.kind !== "tool") onAskSideChat(quote); })}>
         <MessageSquarePlus aria-hidden="true" /><span>{sideChatLabel}</span></button>}
     </div>,
     ownerDocument.body

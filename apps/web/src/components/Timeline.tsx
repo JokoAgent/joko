@@ -2412,7 +2412,7 @@ export function ToolBlock({ item, locale, t, onArtifactUrl, onArtifactDownload }
       </summary>
       <div className="tool-block__detail">
         {tool.input !== "" && <section><div className="tool-block__payload-heading"><h4>{t("common.input")}</h4><ToolPayloadOpenButton label={`${t("timeline.toolPayloadOpen")} · ${t("common.input")}`} onClick={(trigger) => setPayloadPreview({ sectionId: "input", trigger })} /></div><WindowedText text={tool.input} label={`${tool.name} ${t("common.input")}`} /></section>}
-        {tool.output !== undefined && <section><div className="tool-block__payload-heading"><h4>{t("common.output")}</h4><ToolPayloadOpenButton label={`${t("timeline.toolPayloadOpen")} · ${t("common.output")}`} onClick={(trigger) => setPayloadPreview({ sectionId: "output", trigger })} /></div><WindowedText text={tool.output} label={`${tool.name} ${t("common.output")}`} /></section>}
+        {tool.output !== undefined && <section><div className="tool-block__payload-heading"><h4>{t("common.output")}</h4><ToolPayloadOpenButton label={`${t("timeline.toolPayloadOpen")} · ${t("common.output")}`} onClick={(trigger) => setPayloadPreview({ sectionId: "output", trigger })} /></div><WindowedText text={tool.output} label={`${tool.name} ${t("common.output")}`} quoteToolOutputId={item.kind === "toolResult" ? item.id : undefined} /></section>}
         {(item.attachments?.length ?? 0) > 0 && <div className="message-attachments" aria-label={t("timeline.attachments")}>{item.attachments?.map((attachment, index) => <MessageAttachment artifact={attachment} galleryId={timelineMessageAttachmentGalleryId(item.id, attachment.id, index)} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} key={`${attachment.id}:${index}`} />)}</div>}
       </div>
       {payloadPreview !== undefined && <ToolPayloadLightbox ownerKey={JSON.stringify([ownerKey, item.id, item.sourceEventId])} title={tool.name} sections={payloadSections} initialSectionId={payloadPreview.sectionId} returnFocus={payloadPreview.trigger} labels={{ close: t("common.close"), copy: t("timeline.toolPayloadCopy"), copyTitle: t("timeline.toolPayloadCopyTitle"), copied: t("timeline.toolPayloadCopied"), copyFailed: t("timeline.toolPayloadCopyFailed"), selectAll: t("timeline.toolPayloadSelectAll"), allFiles: t("timeline.toolPayloadAllFiles"), chooseFile: t("timeline.toolPayloadChooseFile") }} onClose={() => setPayloadPreview(undefined)} />}
@@ -2865,7 +2865,7 @@ function toolStateLabel(state: NonNullable<TimelineItemView["tool"]>["state"], t
   }
 }
 
-export function WindowedText({ text, label }: { readonly text: string; readonly label: string }): JSX.Element {
+export function WindowedText({ text, label, quoteToolOutputId }: { readonly text: string; readonly label: string; readonly quoteToolOutputId?: string }): JSX.Element {
   const scrollRef = useRef<HTMLDivElement>(null);
   const rows = useMemo(() => windowedTextRows(text), [text]);
   const virtualizer = useVirtualizer({
@@ -2874,9 +2874,9 @@ export function WindowedText({ text, label }: { readonly text: string; readonly 
     estimateSize: () => 18,
     overscan: 8
   });
-  if (text.length <= 16_384) return <pre>{text}</pre>;
+  if (text.length <= 16_384) return <pre data-selection-quote-tool-output={quoteToolOutputId}>{text}</pre>;
   return (
-    <div ref={scrollRef} className="windowed-output" role="region" aria-label={label} tabIndex={0}>
+    <div ref={scrollRef} className="windowed-output" role="region" aria-label={label} tabIndex={0} data-selection-quote-tool-output={quoteToolOutputId}>
       <div className="windowed-output__virtual" style={{ height: `${virtualizer.getTotalSize()}px` }}>
         {virtualizer.getVirtualItems().map((row) => <pre key={row.key} ref={virtualizer.measureElement} data-index={row.index} style={{ transform: `translateY(${row.start}px)` }}>{rows[row.index]}</pre>)}
       </div>

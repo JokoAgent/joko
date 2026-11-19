@@ -52,6 +52,41 @@ describe("Provider model refresh operation", () => {
     });
     expect(reconcileAvailability).toHaveBeenCalledTimes(2);
   });
+
+  it("uses the original connection fence when a managed catalog refresh adopts its response", async () => {
+    const refreshBackendDescriptor = vi.fn();
+    const entries = [{ backendId: "managed-backend", provider: { id: "provider-one" } }];
+    const store = { findOperation: () => undefined, getBackend: () => ({ descriptor: {
+      id: "managed-backend", capabilities: new Map([["provider.managed_catalog", { key: "provider.managed_catalog", supported: true }]])
+    } }) };
+    let current = true;
+    const fence = vi.fn((owner: typeof connection) => {
+      expect(owner).toBe(connection);
+      if (!current) throw new Error("Original connection is no longer current.");
+    });
+    let markStarted!: () => void, finish!: () => void;
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    const held = new Promise<void>(resolve => { finish = resolve; });
+    const adopted = vi.fn();
+    const discoverProviderModels = vi.fn(async (_backend: string, _provider: string, _fetch: unknown, assertCurrent: () => void) => {
+      assertCurrent(); markStarted(); await held;
+      assertCurrent(); adopted();
+    });
+    const services = createConnectServices(stubApplication({ store, sessionHost: immediateHost(store),
+      connections: { authenticate: () => connection, fence }, refreshBackendDescriptor,
+      providers: { nativeAuthenticationBackendId: "pi", list: () => entries, listManaged: () => entries,
+        canDiscoverProviderModels: () => true, discoverProviderModels }
+    }));
+    const refresh = submit(services.operation.submitOperation, "operation-retired-model-refresh", "provider-one", false);
+    const rejected = expect(refresh).rejects.toThrow("Original connection is no longer current.");
+    await started;
+    current = false;
+    finish();
+    await rejected;
+    expect(discoverProviderModels).toHaveBeenCalledTimes(1);
+    expect(adopted).not.toHaveBeenCalled();
+    expect(refreshBackendDescriptor).not.toHaveBeenCalled();
+  });
 });
 
 async function submit(handler: unknown, operationId: string, providerId: string, automatic: boolean): Promise<void> {

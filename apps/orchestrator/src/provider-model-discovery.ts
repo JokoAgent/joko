@@ -1,8 +1,11 @@
+import type { PiManagedModel } from "@joko/adapter-pi";
+
 export interface DiscoveredProviderModel {
   readonly id: string;
   readonly name: string;
   readonly contextWindow?: number;
   readonly metadata?: DiscoveredProviderModelMetadata;
+  readonly cost?: NonNullable<PiManagedModel["cost"]>;
 }
 
 export interface DiscoveredProviderModelMetadata {
@@ -71,6 +74,7 @@ export function parseProviderModels(value: unknown, sourceUrl?: string, includeN
   if (list === undefined) return [];
   const result: DiscoveredProviderModel[] = [];
   const seen = new Set<string>();
+  const openRouter = officialModelsEndpoint(sourceUrl, "https://openrouter.ai/api/v1/models");
   for (const item of list) {
     const record = isRecord(item) ? item : undefined;
     const google = typeof record?.["name"] === "string" && record["name"].startsWith("models/")
@@ -92,7 +96,7 @@ export function parseProviderModels(value: unknown, sourceUrl?: string, includeN
     const architecture = isRecord(record?.["architecture"]) ? record["architecture"] : {};
     const elevenLabsMode = record?.["model_id"] === id && typeof record?.["can_do_text_to_speech"] === "boolean"
       ? record["can_do_text_to_speech"] ? "audio_speech" : "other" : undefined;
-    const openRouterSpeech = officialModelsEndpoint(sourceUrl, "https://openrouter.ai/api/v1/models")
+    const openRouterSpeech = openRouter
       && Array.isArray(architecture["output_modalities"]) && architecture["output_modalities"].includes("speech");
     const mode = record?.["mode"] ?? info["mode"] ?? elevenLabsMode ?? (openRouterSpeech ? "audio_speech" : undefined);
     // Importing a media/embedding model as a chat route would make it appear usable in the task picker.
@@ -124,14 +128,35 @@ export function parseProviderModels(value: unknown, sourceUrl?: string, includeN
       ...(speechModalities === undefined ? {} : { outputModalities: speechModalities.map(value => value === "speech" ? "audio" : value) }),
       ...(name === undefined ? {} : { name })
     };
+    const cost = openRouter && !openRouterSpeech && (mode === undefined || mode === "chat") && metadata.outputModalities?.includes("text")
+      ? parseOpenRouterTokenQuote(record?.["pricing"]) : undefined;
     result.push({
       id,
       name: name ?? id,
       ...(typeof rawWindow === "number" ? { contextWindow: Math.floor(rawWindow) } : {}),
+      ...(cost === undefined ? {} : { cost }),
       ...(Object.keys(metadata).length ? { metadata } : {})
     });
   }
   return result;
+}
+
+function parseOpenRouterTokenQuote(value: unknown): DiscoveredProviderModel["cost"] {
+  if (!isRecord(value)) return undefined;
+  const input = openRouterPerMillion(value["prompt"]);
+  const output = openRouterPerMillion(value["completion"]);
+  const cacheRead = openRouterPerMillion(value["input_cache_read"]);
+  const cacheWrite = openRouterPerMillion(value["input_cache_write"]);
+  if (input === undefined || output === undefined || cacheRead === undefined || cacheWrite === undefined) return undefined;
+  return { input, output, cacheRead, cacheWrite };
+}
+
+function openRouterPerMillion(value: unknown): number | undefined {
+  const unitPrice = typeof value === "number" ? value : typeof value === "string" && value.length <= 64
+    && /^[0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?$/iu.test(value) ? Number(value) : NaN;
+  const price = unitPrice * 1_000_000;
+  if (price === 0 && typeof value === "string" && /[1-9]/u.test(value.split(/[eE]/u, 1)[0]!)) return undefined;
+  return price >= 0 && Number.isSafeInteger(Math.round(price * 1_000_000)) ? price : undefined;
 }
 
 function discoveredMetadata(record: Readonly<Record<string, unknown>>, info: Readonly<Record<string, unknown>>,

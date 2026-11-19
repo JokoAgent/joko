@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
+import { MobileSelectableMessageText, type MobileMessageQuoteAction } from "./MobileSelectableMessageText";
 import {
   AUTOMATION_USER_MESSAGE_COLLAPSED_LINES,
   AUTOMATION_USER_MESSAGE_VISUAL_LINE_THRESHOLD,
@@ -18,13 +19,14 @@ export interface MobileUserMessageContentProps {
   readonly selectable: boolean;
   readonly locale: MobileSupportedLocale;
   readonly colors: { readonly ink: string; readonly muted: string };
+  readonly quoteAction?: MobileMessageQuoteAction;
 }
 
 export function MobileUserMessageContent(props: MobileUserMessageContentProps) {
   return <UserMessageBody key={JSON.stringify([props.ownerKey, props.text, props.automation])} {...props} />;
 }
 
-function UserMessageBody({ text, automation, selectable, locale, colors }: MobileUserMessageContentProps) {
+function UserMessageBody({ text, automation, selectable, locale, colors, quoteAction }: MobileUserMessageContentProps) {
   const threshold = automation ? AUTOMATION_USER_MESSAGE_VISUAL_LINE_THRESHOLD : LONG_USER_MESSAGE_VISUAL_LINE_THRESHOLD;
   const collapsedLines = automation ? AUTOMATION_USER_MESSAGE_COLLAPSED_LINES : LONG_USER_MESSAGE_COLLAPSED_LINES;
   const measure = mayExceedVisualLineThreshold(text, threshold);
@@ -38,8 +40,10 @@ function UserMessageBody({ text, automation, selectable, locale, colors }: Mobil
   // Once adopted, a smaller layout cannot oscillate the bubble between expanded and collapsed.
   const collapsible = measure && (latched || resolved);
   return <View style={styles.body}>
-    <Text testID="message.userBody" selectable={selectable} numberOfLines={collapsible && !expanded ? collapsedLines : undefined}
-      style={[styles.text, { color: colors.ink }]}>{text}</Text>
+    {quoteAction !== undefined && selectable && (!collapsible || expanded)
+      ? <MobileSelectableMessageText testID="message.userBody" text={text} ink={colors.ink} lineHeight={22} action={quoteAction} />
+      : <Text testID="message.userBody" selectable={selectable} numberOfLines={collapsible && !expanded ? collapsedLines : undefined}
+        style={[styles.text, { color: colors.ink }]}>{text}</Text>}
     {measure && <View pointerEvents="none" accessible={false} accessibilityElementsHidden
       importantForAccessibility="no-hide-descendants" style={styles.measure}>
       <Text testID="message.userMeasure" numberOfLines={threshold + 1}

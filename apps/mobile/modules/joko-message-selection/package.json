@@ -1,0 +1,9 @@
+{
+  "name": "@joko/mobile-message-selection",
+  "version": "0.1.0",
+  "description": "Native edit-menu actions for selectable Joko message text.",
+  "private": true,
+  "peerDependencies": {
+    "expo": "*"
+  }
+}

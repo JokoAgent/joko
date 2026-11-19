@@ -538,6 +538,50 @@ describe("ProviderCatalogManager", () => {
     store.close();
   });
 
+  it("keeps the new official OpenRouter text quotes for the original Codex Provider across restart", async () => {
+    const { root, store, credentials } = await fixture();
+    const backendId = "custom-codex-instance", providerId = "custom-openrouter";
+    const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" });
+    providers.initialize();
+    store.upsertBackend({ id: backendId, adapterKind: "codex", instanceGeneration: 1, displayName: "Codex discovery", version: "fixture",
+      health: "healthy", installationState: "installed", authenticationState: "authenticated", capabilities: new Map(), models: [], tools: [], diagnostics: [] });
+    const ticket = credentials.createUploadTicket({ kind: "api_key" });
+    credentials.upload(ticket.credentialUploadTicketId, "owned-openrouter-fixture-key");
+    await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: "openrouter-fixture-key",
+      displayName: "Fixture key", kind: "api_key" });
+    const kept = { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 };
+    await providers.upsert({ backendId, credentialOrigin: "https://openrouter.ai", kind: "api_key", displayName: "Owned OpenRouter", enabled: true,
+      supportsLogin: false, supportsLogout: false, supportsRefresh: false, credentialBindings: { OPENROUTER_FIXTURE_KEY: "openrouter-fixture-key" },
+      modelsEndpoint: "https://openrouter.ai/api/v1/models", provider: { id: providerId, baseUrl: "https://openrouter.ai/api/v1", api: "openai-responses",
+        apiKeyEnv: "OPENROUTER_FIXTURE_KEY", models: [{ id: "kept", cost: kept }] } });
+    const architecture = { input_modalities: ["text"], output_modalities: ["text"] };
+    const pricing = { prompt: "0.00001", completion: "0.00002", input_cache_read: "0", input_cache_write: "0" };
+    const fetcher = vi.fn<typeof fetch>(async (input, init) => {
+      const endpoint = new URL(String(input));
+      expect(endpoint.origin).toBe("https://openrouter.ai");
+      expect(endpoint.pathname).toBe("/api/v1/models");
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer owned-openrouter-fixture-key");
+      return Response.json({ data: endpoint.search === "" ? [
+        { id: "kept", architecture, pricing }, { id: "priced", architecture, pricing },
+        { id: "free", architecture, pricing: { ...pricing, prompt: "0", completion: "0" } }
+      ] : [] });
+    });
+    try {
+      expect(await providers.discoverProviderModels(backendId, providerId, fetcher)).toMatchObject({ addedModelIds: ["priced", "free"], modelCount: 3 });
+      store.close();
+      const reopened = new OperationalStore(join(root, "orchestrator.db"));
+      try {
+        const catalog = new ProviderCatalogManager({ store: reopened, credentials, nativeBackendId: "pi" });
+        catalog.initialize();
+        expect(catalog.get(backendId, providerId).provider.models.map(({ id, cost }) => ({ id, cost }))).toEqual([
+          { id: "priced", cost: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0 } },
+          { id: "free", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+          { id: "kept", cost: kept }
+        ]);
+      } finally { reopened.close(); }
+    } finally { store.close(); }
+  });
+
   it("persists newly discovered capabilities through restart and the actual native generation without changing declared models", async () => {
     const { root, store, credentials } = await fixture();
     const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" }); providers.initialize();
@@ -641,7 +685,7 @@ describe("ProviderCatalogManager", () => {
     } finally { store.close(); }
   });
 
-  it.each(["configuration", "credential"] as const)("rejects a late model refresh after the original %s changes", async change => {
+  it.each(["configuration", "credential", "connection"] as const)("rejects a late model refresh after the original %s changes", async change => {
     const { store, credentials } = await fixture();
     const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" }); providers.initialize();
     const saveKey = async (secret: string) => {
@@ -656,16 +700,19 @@ describe("ProviderCatalogManager", () => {
     let entered!: () => void;
     const started = new Promise<void>(resolve => { entered = resolve; });
     const held = new Promise<void>(resolve => { finish = resolve; });
-    const pending = providers.discoverProviderModels("pi", "catalog", (async () => { entered(); await held; return Response.json({ data: [{ id: "late-model" }] }); }) as typeof fetch);
+    let authorityCurrent = true;
+    const assertCurrent = () => { if (!authorityCurrent) throw new Error("Provider refresh connection changed."); };
+    const pending = providers.discoverProviderModels("pi", "catalog", (async () => { entered(); await held; return Response.json({ data: [{ id: "late-model" }] }); }) as typeof fetch, assertCurrent);
     try {
       await started;
       const original = providers.get("pi", "catalog");
       if (change === "credential") await saveKey("replacement-key-value");
+      else if (change === "connection") authorityCurrent = false;
       else await providers.upsertConfiguration({ providerId: "catalog", displayName: "Changed", kind: "custom_endpoint", enabled: true,
         expectedVersion: original.version, runtimes: [{ backendId: "pi", credentialOrigin: "https://catalog.example.test",
           credentialBindings: { CATALOG_KEY: "catalog-key" }, provider: original.provider }] });
       finish();
-      await expect(pending).rejects.toThrow(/changed during model catalog refresh/u);
+      await expect(pending).rejects.toThrow(change === "connection" ? "Provider refresh connection changed." : /changed during model catalog refresh/u);
       expect(providers.get("pi", "catalog").provider.models.map(model => model.id)).toEqual(["manual"]);
       const restored = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" }); restored.initialize();
       expect(restored.get("pi", "catalog").provider.models.map(model => model.id)).toEqual(["manual"]);

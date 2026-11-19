@@ -5828,10 +5828,16 @@ export interface ComposerFileSelectionQuoteDraft extends ComposerSelectionQuoteB
   readonly endLine?: number;
 }
 
+export interface ComposerToolSelectionQuoteDraft extends ComposerSelectionQuoteBaseDraft {
+  readonly kind: "tool";
+  readonly toolOutputId: string;
+}
+
 /** A selected-text quote kept structured until send time. */
 export type ComposerSelectionQuoteDraft =
   | ComposerMessageSelectionQuoteDraft
-  | ComposerFileSelectionQuoteDraft;
+  | ComposerFileSelectionQuoteDraft
+  | ComposerToolSelectionQuoteDraft;
 
 /** Client-owned recovery for one original Side Chat operation. */
 export interface PendingSideChatDraft {

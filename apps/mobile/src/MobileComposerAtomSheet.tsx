@@ -66,7 +66,7 @@ export function MobileComposerAtomSheet({
         </Text>}
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}>
           {atom.kind === "quote" || atom.kind === "file-quote"
-            ? <Text selectable accessibilityLabel={mobileMessage(locale, "atom.quotedText")}
+            ? <Text selectable accessibilityLabel={mobileMessage(locale, atom.kind === "quote" && atom.sourceRole === "user" ? "atom.quotedUserText" : "atom.quotedText")}
                 style={[styles.readText, { color: colors.ink, backgroundColor: colors.background, borderColor: colors.border }]}>{atom.text}</Text>
             : atom.kind === "pasted-text"
               ? <TextInput accessibilityLabel={mobileMessage(locale, "atom.pastedText")} multiline value={pasteText} editable={!busy}

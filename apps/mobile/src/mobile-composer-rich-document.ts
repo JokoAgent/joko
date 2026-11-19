@@ -358,7 +358,7 @@ export function mobileComposerRichAtomLabel(
   locale: MobileSupportedLocale
 ): string {
   if (atom.kind === "file-quote") return mobileMessage(locale, "files.preview.fileQuote");
-  if (atom.kind === "quote") return mobileMessage(locale, "composer.rich.quote");
+  if (atom.kind === "quote") return mobileMessage(locale, atom.sourceRole === "user" ? "composer.rich.userQuote" : "composer.rich.quote");
   if (atom.kind === "route-reference") return atom.displayText;
   let lines = atom.text.length === 0 ? 0 : 1;
   for (let index = 0; index < atom.text.length; index += 1) {
