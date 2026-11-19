@@ -1,4 +1,4 @@
-import { InteractionKind, InteractionState, MessageRole, readDocumentOutput, RetryState, RunState, ToolCallState, type Event, type PartnerPrivateMessageOrigin, type PlanReviewDecisionKind,
+import { InteractionKind, InteractionState, MessageRole, readDocumentOutput, readPiGeneratedImages, RetryState, RunState, ToolCallState, type Event, type PartnerPrivateMessageOrigin, type PlanReviewDecisionKind,
   type Run, type RunUsageSummary, type TaskMessageOrigin, type ToolCall } from "@joko/contracts";
 import { projectPartnerLearningFeedback, type PartnerLearningFeedbackView } from "@joko/contracts";
 import { projectPartnerSessionTaskReceipt, type PartnerSessionTaskReceiptView } from "@joko/contracts";
@@ -456,10 +456,39 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
     }
   }
   const toolMediaEvents = mobileTimelineToolMediaEvents(ordered);
+  const assistantImageKeys = new Set<string>();
+  for (const row of byId.values()) {
+    if (row.kind !== "assistant" || !row.images?.length) continue;
+    const source = unique.get(row.eventId);
+    const scope = source && assistantStreamAttempt(source);
+    if (!source || !scope) continue;
+    for (const page of mobileTimelineGalleryPages(source)) {
+      if (row.images.some(image => image.pageId === page.pageId)) {
+        assistantImageKeys.add(JSON.stringify([scope, page.blob.blobId, page.sha256Hex]));
+      }
+    }
+  }
   const toolBlobs = new Set<string>();
   for (const [scopeKey, mediaEvents] of toolMediaEvents) {
     const row = byId.get(scopeKey);
-    if (row?.tool) byId.set(scopeKey, { ...row, ...timelineMedia(mediaEvents) });
+    if (row?.tool) {
+      const media = timelineMedia(mediaEvents);
+      // A terminal result replaces the earlier tool media in this tool's projection.
+      const terminal = mediaEvents.length === 1 ? mediaEvents[0] : undefined;
+      const generated = terminal ? readPiGeneratedImages(terminal) : [];
+      if (terminal && generated.length > 0) {
+        const generatedIds = new Set(generated.map(blob => blob.blobId));
+        const pages = mobileTimelineGalleryPages(terminal).filter(page => generatedIds.has(page.blob.blobId));
+        const moved = new Set(pages.map(page => page.pageId));
+        byId.set(scopeKey, { ...row, ...media, images: media.images?.filter(image => !moved.has(image.pageId)) });
+        const scope = assistantStreamAttempt(terminal);
+        const visible = pages.filter(page => !assistantImageKeys.has(JSON.stringify([scope, page.blob.blobId, page.sha256Hex])));
+        if (visible.length > 0) byId.set(terminal.eventId, {
+          id: terminal.eventId, label: "Image", text: "", sequence: terminal.cursor!.sequence,
+          eventId: terminal.eventId, kind: "activity", completed: true, images: visible.map(mobileImageGalleryPageSummary)
+        });
+      } else byId.set(scopeKey, { ...row, ...media });
+    }
     for (const mediaEvent of mediaEvents) for (const content of mobileTimelineContent(mediaEvent)) {
       const call = mediaEvent.payload?.kind;
       const runId = call?.case === "toolCallStarted" || call?.case === "toolCallUpdated" || call?.case === "toolCallCompleted"

@@ -65,6 +65,8 @@ import {
   projectSnapshotEvent,
   requiresEventSnapshotResync
 } from "./gateway.js";
+import { collectTimelineGalleryImages } from "./components/timeline-image-gallery.js";
+import { projectTimelineRenderItems } from "./components/timeline-render-items.js";
 import {
   createSidebarDoneAttentionVisibilityState,
   reconcileSidebarDoneAttentionVisibility,
@@ -74,6 +76,41 @@ import {
 import { Code, ConnectError } from "@connectrpc/connect";
 
 const serviceNodeLocation = { kind: { case: "serviceNode" as const, value: {} } } as const;
+
+it("shows a successful Pi generation beside collapsed work and yields to the same image in the assistant body", () => {
+  const serviceGeneration = 9n;
+  let raw = create(SnapshotSchema, { generation: serviceGeneration });
+  let snapshot = mapSnapshot(raw);
+  const identity = { backendId: "pi", targetId: "target", sessionId: "task", runId: "run", attemptId: "attempt", generation: 1n };
+  const image = { altText: "Generated sample", blob: {
+    blobId: "generated-blob", fileName: "generated.png", mediaType: "image/png", byteSize: 68n, sha256Hex: "a".repeat(64)
+  } };
+  const normalImage = { ...image, blob: { ...image.blob, blobId: "screenshot-blob", fileName: "screenshot.png" } };
+  const apply = (event: Event) => { ({ rawSnapshot: raw, snapshot } = projectSnapshotEvent(raw, snapshot, event)); };
+  const tool = (sequence: bigint, toolId: string, state: ToolCallState, output: typeof image) => create(EventSchema, {
+    eventId: `completion-${sequence}`, identity, cursor: { generation: serviceGeneration, sequence }, payload: { kind: {
+      case: "toolCallCompleted", value: { toolCall: { toolCallId: `call-${sequence}`, toolId, state,
+        sessionId: "task", runId: "run", attemptId: "attempt", result: { parts: [{ content: { case: "image", value: output } }] } }
+      }
+    } }
+  });
+  apply(tool(1n, "screenshot", ToolCallState.SUCCEEDED, normalImage));
+  apply(tool(2n, "image_generate", ToolCallState.SUCCEEDED, image));
+  const items = () => snapshot.timelineBySession.get("task") ?? [];
+  expect(projectTimelineRenderItems(items())).toMatchObject([
+    { type: "work", defaultCollapsed: true, children: [
+      { id: "call-1", attachments: [{ blobId: "screenshot-blob" }] }, { id: "call-2", attachments: [] }
+    ] },
+    { type: "item", item: { kind: "image", sourceEventId: "completion-2", artifact: { blobId: "generated-blob" } } }
+  ]);
+  expect(collectTimelineGalleryImages(items()).filter(entry => entry.blobId === image.blob.blobId)).toHaveLength(1);
+  apply(create(EventSchema, { eventId: "assistant", identity, cursor: { generation: serviceGeneration, sequence: 3n }, payload: { kind: {
+    case: "messageCompleted", value: { messageId: "reply", role: MessageRole.ASSISTANT, blocks: [{ content: { case: "image", value: image } }] }
+  } } }));
+  expect(items().filter(item => item.kind === "image")).toEqual([]);
+  expect(items().find(item => item.id === "reply")?.attachments).toMatchObject([{ blobId: "generated-blob" }]);
+  expect(collectTimelineGalleryImages(items()).filter(entry => entry.blobId === image.blob.blobId)).toHaveLength(1);
+});
 
 describe("independent thinking completion", () => {
   const scoped = (sequence: bigint, kind: any, scope = {}) => create(EventSchema, { eventId: `thinking-${sequence}`,

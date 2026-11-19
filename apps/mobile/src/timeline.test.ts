@@ -701,6 +701,33 @@ describe("canonical Timeline tool media", () => {
     expect(timelineRows([producedImageEvent(animation)])[0]).toMatchObject({ images: [{ title: "animation", mediaType: "image/gif" }] });
     expect(timelineRows([producedImageEvent(animation)])[0]?.artifacts).toBeUndefined();
   });
+
+  it("shows completed Pi generations outside work, with the original tool gallery occurrence", () => {
+    const identity = create(EventIdentitySchema, { sessionId: "session", backendId: "pi", targetId: "workspace", runId: "run", attemptId: "attempt", generation: 4n });
+    const complete = (state: ToolCallState, toolId = "image_generate") => {
+      const event = toolMediaEvent({ ...imageMessage(2, "generated"), identity });
+      if (event.payload?.kind.case !== "toolCallCompleted" || !event.payload.kind.value.toolCall) throw new Error("fixture");
+      Object.assign(event.payload.kind.value.toolCall, { toolId, state, attemptId: identity.attemptId });
+      return event;
+    };
+    const success = complete(ToolCallState.SUCCEEDED);
+    const start = toolMediaEvent({ ...imageMessage(1, "pending"), identity }, "toolCallStarted");
+    if (start.payload?.kind.case !== "toolCallStarted" || !start.payload.kind.value.toolCall) throw new Error("fixture");
+    Object.assign(start.payload.kind.value.toolCall, { toolId: "image_generate", attemptId: identity.attemptId });
+    const rows = timelineRows([start, success]);
+    const items = mobileWorkItems(rows, false);
+    expect(isWorkGroup(items[0]!)).toBe(true);
+    expect(items[1]).toMatchObject({ kind: "activity", eventId: success.eventId, images: [{ title: "generated", sourceEventId: success.eventId }] });
+    expect(rows.find(row => row.kind === "tool")?.images).toEqual([]);
+    for (const ordinary of [complete(ToolCallState.FAILED), complete(ToolCallState.SUCCEEDED, "screenshot")]) {
+      expect(timelineRows([ordinary])).toMatchObject([{ kind: "tool", images: [{ title: "generated" }] }]);
+    }
+    const assistant = { ...imageMessage(3, "generated"), identity };
+    const repeated = timelineRows([success, assistant]);
+    expect(repeated.map(row => ({ kind: row.kind, count: row.images?.length ?? 0 }))).toEqual([
+      { kind: "tool", count: 0 }, { kind: "assistant", count: 1 }
+    ]);
+  });
 });
 
 describe("mobile accepted-input send identity", () => {
