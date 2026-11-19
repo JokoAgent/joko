@@ -4,7 +4,7 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { CapabilitySupport, PermissionMode, ProviderApiCompatibility, ProviderConfigurationField, WorkspaceLocationSchema, capabilityNames } from "@joko/contracts";
 import { AuthenticationState, BackgroundTaskState, CompactionState, ContextRebuildReason, EventSchema, InlineTextRangeSchema, InputContentSchema, InputMentionRangeSchema, InstallationState, InteractionState, MessageInputDelivery, ModelPriceSource, QueueSourceKind, ResourceUsageActivity, ReviewFreshnessState, RetryState, RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleRunPhase, ScheduleSessionMode, ToolCallOutputMode } from "@joko/contracts";
 import type { EventPayload, PiEventMetadata, PromptInput, ProviderModel, RunUsageSummary, SubagentRunDetail, SubagentTranscriptEntry } from "@joko/core";
-import { OperationConflictError, type ArtifactRecord, type InteractionRecord, type PersistedEvent, type QueueItemRecord, type ScheduleRecord, type ScheduleRunRecord, type StoredAttempt, type StoredBackend, type StoredRun, type StoredSession } from "@joko/store";
+import { OperationConflictError, type ArtifactRecord, type InteractionRecord, type PersistedEvent, type PersistedSessionEvent, type QueueItemRecord, type ScheduleRecord, type ScheduleRunRecord, type StoredAttempt, type StoredBackend, type StoredRun, type StoredSession } from "@joko/store";
 
 import {
   ProtoMappingError,
@@ -1674,7 +1674,7 @@ describe("proto mapper", () => {
     const audioMetadata = { kind: "music" as const, title: "A title", description: "Piano", durationSeconds: 12,
       artwork: { blob: { id: "cover", sha256: "b".repeat(64), byteLength: 99, mimeType: "image/png" }, width: 2, height: 2, alt: "Independent cover" } };
     const artifact = { kind: "artifact" as const, blob, label: "Track", audioMetadata };
-    const payloads: Exclude<EventPayload, { type: "device_changed" }>[] = [
+    const payloads: PersistedSessionEvent["payload"][] = [
       { type: "artifact", artifact: blob, purpose: "audio", audioMetadata },
       { type: "message_complete", role: "assistant", blocks: [artifact] },
       { type: "tool_result", callId: "tracks", name: "tracks", output: "Published", parts: [{ kind: "text", text: "Published" }, artifact], isError: false }

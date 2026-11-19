@@ -11851,7 +11851,7 @@ describe("SessionHost", () => {
   });
 
   it("attributes non-subscription exact and delegated usage as actual Schedule cost", async () => {
-    const usageMoneyKind = vi.fn((_backendId: string, _providerId: string, _modelId: string) => "actual-cost" as const);
+    const usageMoneyKind = vi.fn((_backendId: string, _providerId: string) => "actual-cost" as const);
     const fixture = await createFixture(new ScheduleUsageFakeAdapter(), {
       usageMoneyKind
     });
@@ -11894,7 +11894,7 @@ describe("SessionHost", () => {
         }
       }
     });
-    expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "test", "text");
+    expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "test");
   });
 
   it("keeps token-priced metered usage in actual cost when the runtime reports no cost", async () => {
@@ -12033,7 +12033,7 @@ describe("SessionHost", () => {
   });
 
   it("fails closed to reference value when the exact Backend has no billing provenance", async () => {
-    const usageMoneyKind = vi.fn((_backendId: string, _providerId: string, _modelId: string) => "reference-value" as const);
+    const usageMoneyKind = vi.fn((_backendId: string, _providerId: string) => "reference-value" as const);
     const fixture = await createFixture(new ScheduleUsageFakeAdapter(), {
       usageMoneyKind
     });
@@ -12075,7 +12075,7 @@ describe("SessionHost", () => {
       }
     });
     expect(detail).not.toHaveProperty("costMoney");
-    expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "test", "text");
+    expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "test");
     expect(fixture.store.listUsageLedger({ ownerId: "orchestrator" })).toEqual(
       expect.arrayContaining([expect.objectContaining({
         backendId: fixture.adapter.id,
