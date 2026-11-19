@@ -109,6 +109,27 @@ packagedIt("restores the saved dark backing and maximization when the Windows ap
     const desktopWindow = (window as Window & { jokoDesktop?: { window?: { startupTheme?: string } } }).jokoDesktop?.window;
     return { theme: document.documentElement.dataset.theme, startup: desktopWindow?.startupTheme };
   })).toEqual({ theme: "dark", startup: "dark" });
+
+  const nativeWindowId = await reopenedWindow.evaluate(window => window.id);
+  expect(await reopened.application.evaluate(({ BrowserWindow, screen }, windowId) => {
+    const window = BrowserWindow.fromId(windowId);
+    if (window === null || !window.isVisible() || !window.isMaximized()) return false;
+    screen.emit("display-metrics-changed", {}, screen.getPrimaryDisplay(), ["scaleFactor"]);
+    window.unmaximize();
+    return !window.isMaximized();
+  }, nativeWindowId)).toBe(true);
+  await waitFor(() => reopenedWindow.evaluate(window => window.isMaximized()), Boolean, "same Windows window maximized after display metrics change");
+
+  const restore = page.getByRole("button", { name: /^(?:Maximize or restore|最大化或还原)$/u });
+  await restore.waitFor({ state: "visible" });
+  await reopened.application.evaluate(({ screen }) => { screen.emit("display-metrics-changed", {}, screen.getPrimaryDisplay(), ["bounds"]); });
+  await restore.click({ timeout: 2_000 });
+  await waitFor(() => reopenedWindow.evaluate(window => window.isMaximized()), maximized => !maximized, "user restored the Windows window");
+  const stayedRestored = await reopenedWindow.evaluate(async window => {
+    await new Promise(resolve => setTimeout(resolve, 700));
+    return !window.isMaximized();
+  });
+  expect(stayedRestored).toBe(true);
 });
 
 packagedIt("converges conversation settings across real application windows and consumes fresh creation preferences", {

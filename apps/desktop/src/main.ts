@@ -476,6 +476,7 @@ import {
   showWindowFromTray,
   type DesktopMainWindowCloseController
 } from "./window-lifecycle.js";
+import { installWindowsMainWindowMaximizeRecovery } from "./window-maximize-recovery.js";
 import {
   loadDesktopWindowWithRecovery,
   recoverDesktopWindowAfterFailure,
@@ -686,6 +687,7 @@ const nativeTaskStatusSupported = isNativeTaskStatusAvailable({
 const desktopAttentionBadgeSupported = process.platform === "darwin" || process.platform === "win32"
   || process.platform === "linux";
 let mainWindow: BrowserWindow | undefined;
+let noteMainWindowRestore: (() => void) | undefined;
 const desktopRemoteDesktopViewerPrewarm = new DesktopRemoteDesktopViewerPrewarmScheduler<BrowserWindow>({
   isCurrent: (window) => window === mainWindow && !quitting,
   prewarm: () => desktopRemoteDesktopViewers.prewarm()
@@ -1370,6 +1372,7 @@ function createWindow(): void {
       resetGlobalVoicePresentation();
       destroyInspectorWindow();
       mainWindow = undefined;
+      noteMainWindowRestore = undefined;
     }
   });
   mainWindowContentsByWindow.set(window, windowContents);
@@ -1441,6 +1444,7 @@ function createWindow(): void {
   const restoreMaximized = savedMaximized && !mainWindowState.isMaximized;
   mainWindowState.manage(window);
   if (restoreMaximized && !window.isMaximized() && !window.isFullScreen()) window.maximize();
+  if (process.platform === "win32") noteMainWindowRestore = installWindowsMainWindowMaximizeRecovery(window, screen);
   window.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
     if (isDesktopMainDocumentReplacementNavigation(isMainFrame, isInPlace)) {
       // An attempted navigation is not proof that a replacement Document
@@ -9107,7 +9111,10 @@ function registerIpc(): void {
   });
   ipcMain.handle(DESKTOP_CHANNELS.windowToggleMaximize, (event) => {
     const window = assertTrustedWindowControlSender(event);
-    if (window.isMaximized()) window.unmaximize(); else window.maximize();
+    if (window.isMaximized()) {
+      if (window === mainWindow) noteMainWindowRestore?.();
+      window.unmaximize();
+    } else window.maximize();
     return window.isMaximized();
   });
   ipcMain.handle(DESKTOP_CHANNELS.windowToggleFullscreen, (event, ...parameters: unknown[]) => {
