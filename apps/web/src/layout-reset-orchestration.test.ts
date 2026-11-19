@@ -41,4 +41,16 @@ describe("window layout reset orchestration", () => {
     expect(resetClient).toHaveBeenCalledTimes(2);
     expect(resetNative).toHaveBeenCalledOnce();
   });
+
+  it("waits for the Inspector disposition after resetting native geometry", async () => {
+    const inspector = Promise.withResolvers<"inspector-retained">();
+    const resetNative = vi.fn(async () => undefined);
+    const result = vi.fn();
+    const pending = resetWindowLayout({ resetClient: () => inspector.promise, resetNative }).then(result);
+    await vi.waitFor(() => expect(resetNative).toHaveBeenCalledOnce());
+    expect(result).not.toHaveBeenCalled();
+    inspector.resolve("inspector-retained");
+    await pending;
+    expect(result).toHaveBeenCalledExactlyOnceWith("inspector-retained");
+  });
 });

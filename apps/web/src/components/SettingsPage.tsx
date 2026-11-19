@@ -647,11 +647,14 @@ export function AppearanceSettings({ controller, locale, theme, onSuccess, onOpe
           : {})
       });
       if (failure !== undefined) {
-        setLayoutResetError(t(failure === "native"
-          ? "settings.layoutResetNativeFailed"
-          : failure === "client"
-            ? "settings.layoutResetClientFailed"
-            : "settings.layoutResetFailed"));
+        const message = {
+          native: "settings.layoutResetNativeFailed",
+          client: "settings.layoutResetClientFailed",
+          "client-and-native": "settings.layoutResetFailed",
+          "inspector-retained": "settings.layoutResetInspectorRetained",
+          "inspector-retained-and-native": "settings.layoutResetInspectorAndNative"
+        } as const;
+        setLayoutResetError(t(message[failure]));
         return;
       }
       onSuccess(t("settings.layoutResetSuccess"));

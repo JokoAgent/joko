@@ -133,6 +133,7 @@ import {
   publishClientLayoutResetOccurrence,
   resetClientLayout
 } from "./client-layout-reset.js";
+import type { ClientLayoutResetResult } from "./layout-reset-orchestration.js";
 import {
   machineCacheCanReplace,
   machineCacheFromSnapshot,
@@ -352,7 +353,7 @@ export interface AppController extends OperationApi {
   setNavigationOpen(open: boolean): Promise<void>;
   setNavigationLayout(layout: NavigationLayout): Promise<void>;
   synchronizeLayoutReset(): void;
-  resetLayoutPreferences(): Promise<void>;
+  resetLayoutPreferences(): Promise<ClientLayoutResetResult>;
   dismissExtensionNotification(eventId: string): void;
   readDraft(sessionId: string): Promise<ComposerDraft | undefined>;
   saveDraft(sessionId: string, draft: ComposerDraft): Promise<void>;
@@ -3974,7 +3975,7 @@ export function useAppController(): AppController {
     }),
     synchronizeLayoutReset: () => {
       const ownerId = state.activeProfile?.serverId;
-      resetClientLayout(ownerId, layoutResetPersistsSessionSplit(window.location.search));
+      void resetClientLayout(ownerId, layoutResetPersistsSessionSplit(window.location.search)).catch(() => undefined);
       const next = {
         ...preferencesRef.current,
         inspectorOpen: DEFAULT_UI_PREFERENCES.inspectorOpen,
@@ -3987,16 +3988,19 @@ export function useAppController(): AppController {
     },
     resetLayoutPreferences: async () => {
       const ownerId = state.activeProfile?.serverId;
-      resetClientLayout(ownerId, layoutResetPersistsSessionSplit(window.location.search));
-      await updatePreferences({
-        inspectorOpen: DEFAULT_UI_PREFERENCES.inspectorOpen,
-        navigationOpen: DEFAULT_UI_PREFERENCES.navigationOpen,
-        navigationMode: DEFAULT_UI_PREFERENCES.navigationMode,
-        navigationWidth: DEFAULT_UI_PREFERENCES.navigationWidth
-      });
+      const [inspectorReset] = await Promise.all([
+        resetClientLayout(ownerId, layoutResetPersistsSessionSplit(window.location.search)),
+        updatePreferences({
+          inspectorOpen: DEFAULT_UI_PREFERENCES.inspectorOpen,
+          navigationOpen: DEFAULT_UI_PREFERENCES.navigationOpen,
+          navigationMode: DEFAULT_UI_PREFERENCES.navigationMode,
+          navigationWidth: DEFAULT_UI_PREFERENCES.navigationWidth
+        })
+      ]);
       if (window.jokoDesktop?.capabilities.includes("layout.reset") !== true) {
         publishClientLayoutResetOccurrence();
       }
+      return inspectorReset ? undefined : "inspector-retained";
     },
     dismissExtensionNotification: (eventId) => setState((current) => ({
       ...current,

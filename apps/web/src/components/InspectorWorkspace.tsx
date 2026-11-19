@@ -14,7 +14,7 @@ import { isExtensionApplicationWindow, openExtensionWindowFallback } from "../ex
 import type { AppShortcutOverrides } from "../app-shortcuts.js";
 import { isSessionApplicationWindow } from "../session-window-navigation.js";
 import { randomUuid } from "../web-crypto.js";
-import { CLIENT_LAYOUT_RESET_EVENT } from "../client-layout-reset.js";
+import { CLIENT_LAYOUT_RESET_EVENT, type ClientLayoutResetDetail } from "../client-layout-reset.js";
 import { installCurrentWindowActivationClickGuard } from "../window-activation-click.js";
 import { useAppShortcut } from "../use-app-shortcut.js";
 import type { ExtensionCatalogEntryView } from "../model.js";
@@ -206,14 +206,13 @@ function Workspace({ owner, ...props }: Props & { readonly owner: string }): JSX
       activate(tabs[0]!, id); refreshWindows();
     }).catch(() => { void host.window.jokoInspectorDesktop?.window.close("passive").catch(() => undefined); }).finally(releasePending);
   };
-  const guardedPlacement = (keys: readonly string[], action: () => void): void => {
+  const guardedPlacement = async (keys: readonly string[], action: () => void): Promise<boolean> => {
     const captured = keys.flatMap(key => { const tab = dock.tabs.get(key); return tab ? [tab] : []; });
     const guards = captured.flatMap(tab => closeGuards.current.get(tab.pluginIdentity ?? tab.key) ?? []);
-    if (!guards.length) { action(); return; }
-    void (async () => {
-      for (const guard of guards) if (!await guard()) return;
-      if (alive.current && captured.every(tab => dock.tabs.get(tab.key)?.owner === tab.owner)) action();
-    })();
+    for (const guard of guards) if (!await guard().catch(() => false)) return false;
+    if (!alive.current || captured.some(tab => dock.tabs.get(tab.key)?.owner !== tab.owner)) return false;
+    action();
+    return true;
   };
   const handlePlugin = (extensionId: string, requested?: InspectorOpenMode | "reset"): void => {
     const extension = current.current.snapshot.extensions.find(candidate => candidate.id === extensionId && extensionMainViewReady(candidate));
@@ -289,15 +288,19 @@ function Workspace({ owner, ...props }: Props & { readonly owner: string }): JSX
       acknowledgeInspectorExtensionRequest(event.detail.id);
       handlePlugin(event.detail.extensionId, event.detail.mode);
     };
-    const reset = (): void => guardedPlacement([...dock.windows.keys()], () => {
-      setDefaultSide("right");
-      for (const identity of Object.keys(preferencesRef.current.plugins)) attemptedWindows.current.add(identity);
-      commit(value => ({ ...value, groups: {}, plugins: Object.fromEntries(Object.entries(value.plugins).map(([identity, placement]) => {
-        const extension = plugin(identity);
-        return [identity, { ...placement, mode: extension?.mainView?.open ?? "page", edge: extension?.mainView?.side ?? "right" }];
-      })) }));
-      for (const entry of [...windowsRef.current]) returnWindow(entry);
-    });
+    const reset = (event: Event): void => {
+      const result = guardedPlacement([...dock.windows.keys()], () => {
+        setDefaultSide("right");
+        pendingWindowKeys.current.clear();
+        for (const identity of Object.keys(preferencesRef.current.plugins)) attemptedWindows.current.add(identity);
+        commit(value => ({ ...value, groups: {}, plugins: Object.fromEntries(Object.entries(value.plugins).map(([identity, placement]) => {
+          const extension = plugin(identity);
+          return [identity, { ...placement, mode: extension?.mainView?.open ?? "page", edge: extension?.mainView?.side ?? "right" }];
+        })) }));
+        for (const entry of [...windowsRef.current]) returnWindow(entry);
+      });
+      if (event instanceof CustomEvent) (event.detail as ClientLayoutResetDetail | undefined)?.waitUntil?.(result);
+    };
     window.addEventListener("storage", changed); window.addEventListener(INSPECTOR_EXTENSION_OPEN_EVENT, openPlugin); window.addEventListener(CLIENT_LAYOUT_RESET_EVENT, reset);
     drainInspectorExtensionRequests(owner, handlePlugin);
     return () => { window.removeEventListener("storage", changed); window.removeEventListener(INSPECTOR_EXTENSION_OPEN_EVENT, openPlugin); window.removeEventListener(CLIENT_LAYOUT_RESET_EVENT, reset); };

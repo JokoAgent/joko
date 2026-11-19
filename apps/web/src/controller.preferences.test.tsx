@@ -1394,7 +1394,7 @@ it("publishes a client layout-reset occurrence only after durable Web reset succ
   await act(async () => { root?.render(<Probe />); });
   await vi.waitFor(() => expect(controller?.state.ready).toBe(true));
 
-  let reset!: Promise<void>;
+  let reset!: ReturnType<AppController["resetLayoutPreferences"]>;
   await act(async () => {
     reset = controller!.resetLayoutPreferences();
     await Promise.resolve();

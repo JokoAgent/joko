@@ -80,6 +80,7 @@ export function ExtensionMainViewPage({
   const libraryVideo = useRef<((path: string, maximumBytes: number, signal: AbortSignal) => Promise<Blob>) | undefined>(undefined);
   const bridgeEpoch = useRef(0);
   const closeGuard = useRef<() => Promise<boolean>>(async () => true);
+  const closeRegistration = useRef(registerCloseGuard); closeRegistration.current = registerCloseGuard;
   const settingsApi = useRef<ExtensionSettingsApi | undefined>(undefined);
   const settingsSurfaceClosers = useRef(new WeakMap<ExtensionMainViewSurfaceView, (surfaceId: string) => Promise<boolean>>());
   const settingsLibrary = useRef(onOpenLibrary); settingsLibrary.current = onOpenLibrary;
@@ -269,10 +270,10 @@ export function ExtensionMainViewPage({
     const expected = state.surface.id;
     const bridge = bindExtensionViewClose(frame, () => surfaceRef.current?.id === expected && frameRef.current === frame && frame.isConnected);
     closeGuard.current = bridge.close;
-    const unregister = registerCloseGuard?.(bridge.close);
+    const unregister = closeRegistration.current?.(bridge.close);
     const unregisterPage = embedded || settings ? undefined : registerExtensionPageClose(controller.state.activeProfile, extensionId, bridge.close);
     return () => { if (closeGuard.current === bridge.close) closeGuard.current = async () => true; unregister?.(); unregisterPage?.(); bridge.dispose(); };
-  }, [state, frameRevision, ownerDocument, registerCloseGuard, embedded, extensionId, controller, settings]);
+  }, [state, frameRevision, ownerDocument, embedded, extensionId, controller, settings]);
 
   useEffect(() => {
     if (settings || state.phase !== "ready" || state.extension.library === undefined || surfaceUrl === undefined) return undefined;

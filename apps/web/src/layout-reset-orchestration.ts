@@ -1,7 +1,9 @@
-export type WindowLayoutResetFailure = "client" | "native" | "client-and-native";
+export type ClientLayoutResetResult = "inspector-retained" | void;
+
+export type WindowLayoutResetFailure = "client" | "native" | "client-and-native" | "inspector-retained" | "inspector-retained-and-native";
 
 export interface WindowLayoutResetActions {
-  readonly resetClient: () => Promise<void>;
+  readonly resetClient: () => Promise<ClientLayoutResetResult>;
   readonly resetNative?: () => Promise<void>;
 }
 
@@ -14,10 +16,10 @@ export async function resetWindowLayout(
     ? undefined
     : Promise.resolve().then(actions.resetNative);
   const [clientResult, nativeResult] = await Promise.all([
-    client.then(() => true, () => false),
+    client.then((result) => result ?? "done", () => "failed" as const),
     native?.then(() => true, () => false) ?? Promise.resolve(true)
   ]);
-  if (clientResult && nativeResult) return undefined;
-  if (!clientResult && !nativeResult) return "client-and-native";
-  return clientResult ? "native" : "client";
+  if (clientResult === "inspector-retained") return nativeResult ? "inspector-retained" : "inspector-retained-and-native";
+  if (clientResult === "failed") return nativeResult ? "client" : "client-and-native";
+  return nativeResult ? undefined : "native";
 }
