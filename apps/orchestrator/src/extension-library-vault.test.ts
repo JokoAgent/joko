@@ -53,6 +53,22 @@ async function fixture(options: { readonly freeBytes?: number; readonly limits?:
 }
 
 describe("ExtensionLibraryVault", () => {
+  it("requires the verified file identity for SQLite backup publication and cleanup", async () => {
+    const { vault } = await fixture();
+    await vault.open();
+    const verifiedPath = await vault.allocateTemporaryPath(".sqlite-backup");
+    const unrelatedPath = await vault.allocateTemporaryPath(".sqlite-backup");
+    await writeFile(verifiedPath, "verified");
+    await writeFile(unrelatedPath, "separate");
+    const verification = await lstat(verifiedPath, { bigint: true });
+
+    await expect(vault.commitSqliteBackup(unrelatedPath, "backup.sqlite", verification)).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(vault.discardTemporaryPath(unrelatedPath, ".sqlite-backup", verification)).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(vault.stat("backup.sqlite")).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(await readFile(verifiedPath, "utf8")).toBe("verified");
+    expect(await readFile(unrelatedPath, "utf8")).toBe("separate");
+  });
+
   it("preserves a concurrent destination at the native no-overwrite move boundary", async () => {
     const { root, vault } = await fixture();
     await vault.open();

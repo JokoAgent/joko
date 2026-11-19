@@ -751,9 +751,18 @@ export class ExtensionLibrarySqlCore {
       if (!missing(error)) throw error;
     }
     const temporary = await this.#vault.allocateTemporaryPath(".sqlite-backup");
+    let reserved: BigIntStats | undefined;
     try {
+      const reservation = await open(temporary, "wx", 0o600);
+      try { reserved = await reservation.stat({ bigint: true }); }
+      finally { await reservation.close(); }
+      await assertDatabaseIdentity(temporary, reserved);
       await backup(entry.database, sqliteFilesystemPath(temporary), { rate: 4_096 });
       await this.#assertDatabaseCurrent(entry, false);
+      const verified = await databaseIdentity(temporary);
+      if (!sameDatabaseObject(reserved, verified)) {
+        throw new ExtensionLibraryError("CONFLICT", "Library database backup does not match its reserved file.");
+      }
       const verification = new DatabaseSync(sqliteFilesystemPath(temporary), { readOnly: true, allowExtension: false, readBigInts: true });
       let userVersion: number;
       try {
@@ -765,7 +774,7 @@ export class ExtensionLibrarySqlCore {
           absolutePath: temporary,
           readonly: true,
           gate,
-          identity: await databaseIdentity(temporary),
+          identity: verified,
           database: verification
         };
         this.#assertQuickCheck(verificationEntry);
@@ -773,12 +782,12 @@ export class ExtensionLibrarySqlCore {
       } finally {
         verification.close();
       }
-      await this.#vault.commitSqliteBackup(temporary, targetPath);
+      await this.#vault.commitSqliteBackup(temporary, targetPath, verified);
       return { path: targetPath, userVersion };
     } catch (error) {
       throw sqlFailure(error);
     } finally {
-      await this.#vault.discardTemporaryPath(temporary, ".sqlite-backup").catch(() => undefined);
+      if (reserved !== undefined) await this.#vault.discardTemporaryPath(temporary, ".sqlite-backup", reserved).catch(() => undefined);
     }
   }
 

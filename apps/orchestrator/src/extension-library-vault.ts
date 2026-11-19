@@ -763,25 +763,25 @@ export class ExtensionLibraryVault {
     });
   }
 
-  async commitSqliteBackup(temporaryPath: string, path: string): Promise<ExtensionLibraryWriteResult> {
+  async commitSqliteBackup(temporaryPath: string, path: string, verified: BigIntStats): Promise<ExtensionLibraryWriteResult> {
     await this.#requireReady(true);
     const relativePath = validateExtensionLibraryPath(path, this.#limits);
     if (!relativePath.toLowerCase().endsWith(".sqlite")) {
       throw new ExtensionLibraryError("PATH_INVALID", "Library database backup path must end in .sqlite.");
     }
     const temporary = this.#assertOwnedTemporaryPath(temporaryPath, ".sqlite-backup");
-    const before = await regularFileSnapshot(temporary);
-    if (before.size > BigInt(this.#limits.maximumStreamBytes)) {
+    await assertPathSnapshot(temporary, verified);
+    if (verified.size > BigInt(this.#limits.maximumStreamBytes)) {
       throw new ExtensionLibraryError("TOO_LARGE", "Library database backup exceeds the 8 GiB boundary.");
     }
-    const bytes = safeNumber(before.size);
-    const digest = await hashOpenFile(temporary, before);
+    const bytes = safeNumber(verified.size);
+    const digest = await hashOpenFile(temporary, verified);
     return this.#commitVerifiedStagedWrite({
       temporary,
       path: relativePath,
       bytes,
       sha256: digest,
-      before,
+      before: verified,
       ifNotExists: true
     });
   }
