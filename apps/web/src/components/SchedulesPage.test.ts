@@ -121,6 +121,22 @@ describe("Schedule editor execution defaults", () => {
     expect(scheduleDraft(undefined, [blockedTarget, target], [session()], [globallyAvailableModel], backends).targetId).toBe(target.id);
   });
 
+  it("retains the original bound task and its model default after a handoff", () => {
+    const adoptedModel = { ...globallyAvailableModel, backendId: "paired-pi" };
+    const adopted = { ...session(adoptedModel), backendId: adoptedModel.backendId };
+    const existing: ScheduleView = {
+      id: "original-plan", name: "Original plan", backendId: target.backendId, targetId: target.id,
+      source: "user", sessionMode: "bound", sessionId: adopted.id, enabled: true, kind: "once",
+      expression: "2099-01-01T10:00:00.000Z", timezone: "UTC", inputText: "Run the task", executionMode: "agent",
+      useWorktree: false, refreshWorktreeRemote: false, permissionMode: "ask", planMode: false, extraDirectoryIds: [],
+      silentWhenIdle: false, notifyDesktop: true, overlapPolicy: "queue", misfirePolicy: "runOnce", unreadRunCount: 0, history: []
+    };
+
+    const draft = scheduleDraft(existing, [target], [adopted], [globallyAvailableModel, adoptedModel]);
+    expect(draft).toMatchObject({ backendId: target.backendId, targetId: target.id, sessionId: adopted.id, providerId: "", modelId: "", fastMode: false });
+    expect(draft.effort).toBeUndefined();
+  });
+
   it("edits a one-shot wall clock in the schedule's IANA timezone", () => {
     const existing: ScheduleView = {
       id: "schedule-zone",

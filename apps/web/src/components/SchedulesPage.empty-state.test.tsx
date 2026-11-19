@@ -91,6 +91,32 @@ describe("SchedulesPage empty states", () => {
 });
 
 describe("SchedulesPage unread history", () => {
+  it("loads the bound Automation's successful history when its task is unavailable", async () => {
+    const schedule: ScheduleView = {
+      ...pausedSchedule(), id: "bound-manual", name: "Retained Automation", enabled: true,
+      sessionMode: "bound", sessionId: "deleted-task", executionMode: "agent", script: undefined
+    };
+    const listScheduleRunHistory = vi.fn<AppController["listScheduleRunHistory"]>(async () => ({
+      history: [{ id: "7", runId: "original-run", sessionId: "deleted-task", state: "completed", scheduledAt: 1,
+        triggeredAt: 1, finishedAt: 3, zeroCost: true, costAttribution: "zero" }], totalSize: 1
+    }));
+    const runSchedule = vi.fn<AppController["runSchedule"]>(async () => { throw new Error("Deleted task dispatched"); });
+    const container = await renderSchedules([schedule], [], { listScheduleRunHistory, runSchedule });
+
+    expect(listScheduleRunHistory).toHaveBeenCalledExactlyOnceWith(schedule.id, "", 20);
+    expect(container.querySelector(".schedule-detail__header h2")?.textContent).toBe(schedule.name);
+    const card = container.querySelector(".schedule-history-card");
+    expect(card?.textContent).toContain("scheduler.runCompleted");
+    expect(card?.textContent).toContain("scheduler.runTaskUnavailable");
+    expect(card?.querySelector('[aria-label="scheduler.openRunTask"]')).toBeNull();
+    const row = container.querySelector<HTMLButtonElement>(`button[aria-label="scheduler.runNow · ${schedule.name}"]`);
+    const detail = buttonsWithText(container, "scheduler.runNow")[0];
+    expect(row?.disabled).toBe(true);
+    expect(detail?.disabled).toBe(true);
+    await act(async () => { row?.click(); detail?.click(); });
+    expect(runSchedule).not.toHaveBeenCalled();
+  });
+
   it("acknowledges scheduled task attention using its current receipt before marking history read", async () => {
     const subjectCursor = { sequence: 10n, generation: 1n, opaqueToken: "subject" };
     const errorCursor = { ...subjectCursor, sequence: 13n, opaqueToken: "error-acknowledgement" };
@@ -131,7 +157,8 @@ describe("SchedulesPage unread history", () => {
 });
 
 async function renderSchedules(schedules: readonly ScheduleView[], sessions: readonly SessionView[] = [],
-  historyActions?: Pick<AppController, "acknowledgeSessionError" | "acknowledgeSessionAttention" | "markAllScheduleRunsRead" | "refresh">,
+  historyActions?: Partial<Pick<AppController, "acknowledgeSessionError" | "acknowledgeSessionAttention" | "markAllScheduleRunsRead"
+    | "refresh" | "listScheduleRunHistory" | "runSchedule">>,
   editor?: { readonly targets: readonly TargetView[]; readonly saveSchedule: AppController["saveSchedule"] }
 ): Promise<HTMLDivElement> {
   const targets = editor?.targets ?? [];

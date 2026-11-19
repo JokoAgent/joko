@@ -7,6 +7,7 @@ import { Code, createClient, createRouterTransport } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { createInProcessDevicePeerHarness, DEVICE_PEER_RUNTIME_EXECUTABLES, NodeDevicePeerAgentExecutor, type DevicePeerAgentOutcome, type InProcessDevicePeerHarness } from "@joko/device-peer";
 import { OperationalStore } from "@joko/store";
+import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { expect, it, vi } from "vitest";
 import type { OrchestratorApplication } from "./application.js";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
@@ -21,10 +22,11 @@ import { decodeHostedAgentOpen, decodeHostedAgentInvocation, decodeHostedAgentRe
 import { toProtoBackend, toProtoCapability } from "./proto-mapper.js";
 import { RemoteExecutionRouter } from "./remote-execution-router.js";
 import { RemoteWorkspaceService } from "./remote-workspace-service.js";
+import { ScheduleCoordinator } from "./schedule-coordinator.js";
 import { SessionHost } from "./session-host.js";
 import { WorkspaceService } from "./workspace-service.js";
 
-it("registers an untrusted Device project for a paired Source and runs only from the approved Device root", { timeout: 30_000 }, async () => {
+it("preserves a paired Source's remote project authority and follows an adopted task for its saved Automation", { timeout: 40_000 }, async () => {
   const temporaryRoot = await realpath(tmpdir());
   const root = await realpath(await mkdtemp(join(temporaryRoot, "joko-source-device-project-")));
   const projectPath = join(root, "device-project");
@@ -43,9 +45,13 @@ it("registers an untrusted Device project for a paired Source and runs only from
   const artifacts = new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: artifactRepository, ingestRoots: [root] });
   const captureBeforeRun = vi.fn(async () => {}), captureAfterRun = vi.fn(async () => {});
   const host = new SessionHost(store, artifacts, [], { workspaceCapture: { captureBeforeRun, captureAfterRun } });
-  const sources = new HostedAgentSources({ store, peers, host, remoteExecution, registry: new BackendInstanceRegistry(store),
+  const registry = new BackendInstanceRegistry(store);
+  const sources = new HostedAgentSources({ store, peers, host, remoteExecution, registry,
     temporaryRoot: join(root, "incoming"), readPolicy: () => ({ revision: "device-project", permissionMode: "ask", planMode: false,
       approvedRoots: [], confirmCredentials: true }), readBlob: async () => { throw new Error("Unexpected Blob read."); } });
+  let scheduleClock = Date.now();
+  const scheduler = new ScheduleCoordinator(store, host, { now: () => scheduleClock,
+    isPairedPiBackend: backendId => sources.isReadyPairedPiBackend(backendId) });
   const authKey = "source-device-project-fixture";
   const controller = store.createConnection({ id: "source-controller", deviceId: "source-device", name: "Source", authKeyDigest: digestAuthKey(authKey),
     device: { defaultName: "Source", kind: "web", platform: "web" } });
@@ -56,6 +62,7 @@ it("registers an untrusted Device project for a paired Source and runs only from
   store.setDeviceRemoteControlEnabled(provider.deviceId, true);
   store.setDeviceRemoteControlEnabled(target.deviceId, true);
   const opens: ReturnType<typeof decodeHostedAgentOpen>[] = [];
+  const adoptedTaskPrompts: string[] = [];
   const exchanges = new Map<string, HostedAgentExchange>();
   let quotaReads = 0, holdQuota: Promise<void> | undefined;
   const virtualRoot = process.platform === "win32" ? "V:\\provider-private\\project" : "/provider-private/project";
@@ -65,8 +72,11 @@ it("registers an untrusted Device project for a paired Source and runs only from
         case contract.HostedAgentPeerMethod.GET_CATALOG:
           return toBinary(contract.GetHostedAgentCatalogResponseSchema, create(contract.GetHostedAgentCatalogResponseSchema, {
             format: 1, remoteControlEnabled: true, backends: [{ backendId: "device-pi", nativeAdapterKind: "pi", instanceGeneration: 1n, nodeId: "provider-node",
-              displayName: "Device Pi", version: "1", capabilities: ["input.text", "model.switch", "session.resume", "session.detach", "workspace.files", "provider.account_usage"]
-                .map(name => ({ name, support: contract.CapabilitySupport.SUPPORTED })),
+              displayName: "Device Pi", version: "1", capabilities: [
+                ...["input.text", "model.switch", "session.resume", "session.detach", "workspace.files", "provider.account_usage"]
+                  .map(name => ({ name, support: contract.CapabilitySupport.SUPPORTED })),
+                toProtoCapability({ key: "permission.modes", supported: true, options: ["ask"] })
+              ],
               providers: [{ providerId: "provider", displayName: "Provider", connected: true, remoteInvocationEnabled: true,
                 models: [{ backendId: "device-pi", key: { providerId: "provider", modelId: "model" }, displayName: "Model",
                   api: "openai-completions", contextWindowTokens: 32_768n, maximumOutputTokens: 1_024n, inputModalities: [contract.ModelInputModality.TEXT] }] }] }]
@@ -102,13 +112,20 @@ it("registers an untrusted Device project for a paired Source and runs only from
           if (command.kind === "send") {
             expect(command.durableFence).toBe(true);
             await exchange.nativeDispatch(request.callId, { inputFingerprint: createHash("sha256").update(command.input.text).digest("hex"), nativeHistory: history }, signal);
-            const callId = "read-device-proof";
-            await exchange.tool({ format: 1, callId, requestId: `${callId}:1`, operation: "tool.begin",
-              payload: { name: "read", input: { path: "proof.txt" } } }, signal, request.callId);
-            const file = await exchange.tool({ format: 1, callId, requestId: `${callId}:2`, operation: "fs.read",
-              payload: { path: "proof.txt" } }, signal, request.callId);
-            if (typeof file.data !== "string") throw new Error("The Device file read did not return bytes.");
-            exchange.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: Buffer.from(file.data, "base64").toString("utf8") }] }, undefined, request.callId);
+            let answer: string;
+            if (opened.targetId === "automation-project") {
+              adoptedTaskPrompts.push(command.input.text);
+              answer = "Ran on the original paired Pi";
+            } else {
+              const callId = "read-device-proof";
+              await exchange.tool({ format: 1, callId, requestId: `${callId}:1`, operation: "tool.begin",
+                payload: { name: "read", input: { path: "proof.txt" } } }, signal, request.callId);
+              const file = await exchange.tool({ format: 1, callId, requestId: `${callId}:2`, operation: "fs.read",
+                payload: { path: "proof.txt" } }, signal, request.callId);
+              if (typeof file.data !== "string") throw new Error("The Device file read did not return bytes.");
+              answer = Buffer.from(file.data, "base64").toString("utf8");
+            }
+            exchange.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: answer }] }, undefined, request.callId);
             exchange.emit({ type: "done", outcome: "completed" }, undefined, request.callId);
             result = null;
           } else if (command.kind === "state" || command.kind === "set_model" || command.kind === "history") {
@@ -191,7 +208,7 @@ it("registers an untrusted Device project for a paired Source and runs only from
     const backend = store.listBackends()[0]!.descriptor;
     const application = { config: { publicOrigin: "http://127.0.0.1", dataDirectory: root }, store, devicePeers: peers,
       sessionHost: host, workspaces, artifacts, artifactRepository, adapters: [host.currentAdapter(backend.id)!],
-      connections: new ConnectionManager(store), hostedAgentSources: sources } as unknown as OrchestratorApplication;
+      connections: new ConnectionManager(store), hostedAgentSources: sources, scheduler } as unknown as OrchestratorApplication;
     const transport = createRouterTransport(router => registerConnectServices(router, application));
     const operations = createClient(contract.OperationService, transport);
     const providerClient = createClient(contract.BackendService, transport);
@@ -277,6 +294,80 @@ it("registers an untrusted Device project for a paired Source and runs only from
     expect(peers.listForCapabilities(controller, ["native_agents"]).map(device => device.targetDeviceId)).toEqual([provider.deviceId]);
     await expect(host.resume(sessionId)).rejects.toThrow();
     expect(opens).toHaveLength(2);
+
+    // The Automation belongs to a local project and an ordinary task, with no explicit route.
+    const localAdapter = new FakeBackendAdapter({ ...PI_LIKE_PROFILE, id: "automation-local-pi" });
+    const local = await registry.add({ instanceId: localAdapter.id, adapterKind: "pi",
+      displayName: "Local Pi", create: () => localAdapter });
+    host.installBackendInstance(localAdapter, local.descriptor);
+    const localProjectPath = join(root, "automation-local-workspace");
+    await mkdir(localProjectPath);
+    const { root: localProject } = await workspaces.register({ id: "automation-project", root: localProjectPath,
+      displayName: "Original local project", trusted: true });
+    await host.registerTarget({ id: "automation-project", backendId: localAdapter.id,
+      displayName: "Original local project", workspaceRoot: localProject, managed: false, trusted: true });
+    const createdLocal = await submit("automation-task-create", { case: "createSession", value: create(contract.CreateSessionMutationSchema, {
+      targetId: "automation-project", backendId: localAdapter.id, displayName: "Original Automation task",
+      model: { model: { providerId: "test", modelId: "text" } }, permissionMode: contract.PermissionMode.ASK
+    }) });
+    const localTaskResult = createdLocal.operation?.result?.payload;
+    if (localTaskResult?.case !== "session") throw new Error("The local task was not created.");
+    const originalSessionId = localTaskResult.value.sessionId;
+    const sendOrdinary = async (operationId: string, text: string) => {
+      const reply = await submit(operationId, { case: "sendInput", value: create(contract.SendInputMutationSchema, {
+        sessionId: originalSessionId, deliveryMode: contract.QueueDeliveryMode.PROMPT,
+        input: { parts: [{ content: { case: "text", value: text } }] }
+      }) }, [create(contract.OperationPreconditionSchema, {
+        entity: { kind: contract.EntityKind.SESSION, id: originalSessionId },
+        expectedGeneration: BigInt(store.getSession(originalSessionId).descriptor.binding.generation)
+      })]);
+      const accepted = reply.operation?.result?.payload;
+      if (accepted?.case !== "queueItem") throw new Error("The original ordinary input was not accepted.");
+      await vi.waitFor(() => expect(store.getRun(accepted.value.runId).descriptor.state).toBe("completed"), { timeout: 10_000 });
+    };
+    await sendOrdinary("automation-local-turn", "First ordinary input on A");
+    const dueAt = Date.now() + 60_000;
+    const automation = create(contract.ScheduleInputSchema, {
+      displayName: "Original plan", sessionMode: contract.ScheduleSessionMode.BOUND,
+      sessionId: originalSessionId, targetId: "automation-project", backendId: localAdapter.id,
+      recurrence: { kind: { case: "oneShot", value: { triggerAt: {
+        seconds: BigInt(Math.floor(dueAt / 1_000)), nanos: (dueAt % 1_000) * 1_000_000
+      } } } }, timeZone: "UTC", enabled: true,
+      input: { parts: [{ content: { case: "text", value: "Run the saved Automation on B" } }] },
+      execution: { permissionMode: contract.PermissionMode.ASK },
+      overlapPolicy: contract.ScheduleOverlapPolicy.QUEUE, misfirePolicy: contract.ScheduleMisfirePolicy.RUN_ONCE
+    });
+    const saved = await submit("automation-save", { case: "createSchedule", value: create(contract.CreateScheduleMutationSchema, { schedule: automation }) });
+    const savedPlan = saved.operation?.result?.payload;
+    if (savedPlan?.case !== "schedule") throw new Error("The original Automation was not saved.");
+    const scheduleId = savedPlan.value.scheduleId;
+    const selected = await submit("automation-device-select", { case: "setSessionRuntime", value: create(contract.SetSessionRuntimeMutationSchema, {
+      sessionId: originalSessionId, expectedRuntimeGeneration: BigInt(host.getSessionRuntimeControl(originalSessionId).generation),
+      backendId: backend.id, providerId: "provider", modelId: "model"
+    }) });
+    expect(selected.operation?.state).toBe(contract.OperationState.SUCCEEDED);
+    await sendOrdinary("automation-device-turn", "Adopt the same task on B");
+    expect(store.getSession(originalSessionId).descriptor).toMatchObject({ backendId: backend.id, targetId: "automation-project" });
+    expect(host.scheduledExecutionTarget(originalSessionId)).toMatchObject({ id: "automation-project", workspaceRoot: localProject });
+    expect(store.getSchedule(scheduleId)).toMatchObject({ backendId: localAdapter.id, sessionId: originalSessionId, nextRunAt: dueAt });
+    const renamed = await submit("automation-rename", { case: "updateSchedule", value: create(contract.UpdateScheduleMutationSchema, {
+      scheduleId, schedule: { ...automation, displayName: "Renamed original plan" }
+    }) });
+    expect(renamed.operation?.state, renamed.operation?.error?.message).toBe(contract.OperationState.SUCCEEDED);
+    const historyClient = createClient(contract.SchedulerService, transport);
+    expect((await historyClient.listScheduleRunHistory({ scheduleId }, auth)).history).toEqual([]);
+    scheduleClock = dueAt;
+    await scheduler.tick();
+    await vi.waitFor(async () => {
+      const { history } = await historyClient.listScheduleRunHistory({ scheduleId }, auth);
+      expect(history).toEqual([expect.objectContaining({ state: contract.RunState.SUCCEEDED, sessionId: originalSessionId })]);
+      expect(store.getRun(history[0]!.runId).descriptor).toMatchObject({ sessionId: originalSessionId, source: "schedule" });
+    }, { timeout: 10_000 });
+    await scheduler.tick();
+    expect(adoptedTaskPrompts).toEqual([expect.stringContaining("Adopt the same task on B"), "Run the saved Automation on B"]);
+    expect(opens.filter(item => item.sessionId === originalSessionId)).toEqual([expect.objectContaining({ targetId: "automation-project" })]);
+    expect(store.getSchedule(scheduleId)).toMatchObject({ enabled: false, name: "Renamed original plan", lastRunAt: dueAt });
+
     let releaseQuota!: () => void;
     holdQuota = new Promise<void>(resolve => { releaseQuota = resolve; });
     const lateQuota = providerClient.getProviderUsage(usageRequest, auth);
@@ -288,7 +379,7 @@ it("registers an untrusted Device project for a paired Source and runs only from
     expect((await lateQuota).accountUsage).toBeUndefined();
     expect(processStarts).toEqual(Array<string>(4).fill(deviceRoot));
   } finally {
-    await host.dispose(); await sources.close(); await peers.shutdown(); await workspaces.close(); store.close();
+    scheduler.stop(); await host.dispose(); await sources.close(); await peers.shutdown(); await workspaces.close(); store.close();
     if (!root.startsWith(temporaryRoot + sep)) throw new Error("Unsafe test cleanup.");
     await rm(root, { recursive: true, force: true, maxRetries: 3 });
   }

@@ -87,6 +87,9 @@ import { ModelWorkingContextCoordinator } from "./model-working-context.js";
 import { SessionContextBudgetCoordinator } from "./session-context-budget.js";
 import { ArtifactStore } from "./artifact-store.js";
 import { BackendInstanceRegistry } from "./backend-instance-registry.js";
+import { ConnectionManager } from "./connection-manager.js";
+import { CredentialVault } from "./credential-vault.js";
+import { MobilePushCoordinator, type MobilePushDeliveryInput } from "./mobile-push.js";
 import { ObjectiveManager } from "./objective-manager.js";
 import {
   createPortableSessionManifest,
@@ -98,6 +101,9 @@ import {
   encodePortableSessionProjection
 } from "./portable-session-projection.js";
 import { ScheduleCoordinator } from "./schedule-coordinator.js";
+import { SchedulerOccurrenceRecovery } from "./scheduler-occurrence-recovery.js";
+import { SchedulerRuntimeState } from "./scheduler-runtime-state.js";
+import { ScheduleRunNotificationController } from "./schedule-run-notifications.js";
 import type { ScheduleScriptInput, ScheduleScriptCapabilityContext } from "./schedule-script-runner.js";
 import { SessionHost, type InteractionDecisionSubmission, type WorkspaceRunCapture, type PartnerLearningHostPort } from "./session-host.js";
 import type { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
@@ -10033,6 +10039,72 @@ describe("SessionHost", () => {
     } });
   });
 
+  it("delivers an explicitly requested successful Schedule notice without publishing ordinary task attention", async () => {
+    let notifications!: ScheduleRunNotificationController;
+    let connections!: ConnectionManager;
+    class ScheduleAdapter extends FakeBackendAdapter {
+      override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+        if (input.text !== "default silence") notifications.notify({ sessionId: context.sessionId, targetId: context.target.id });
+        return super.send(input, context);
+      }
+    }
+    const fixture = await createFixture(new ScheduleAdapter(PI_LIKE_PROFILE), {
+      createScheduleRunNotifications: store => {
+        connections = new ConnectionManager(store);
+        notifications = new ScheduleRunNotificationController(store, sessionId => !connections.taskActivity.hasRemoteTaskView(sessionId));
+        return notifications;
+      }
+    });
+    const { store, host } = fixture;
+    const phone = store.createConnection({ id: "schedule-notice-phone", name: "Phone", authKeyDigest: "schedule-notice-digest",
+      device: { defaultName: "Phone", kind: "mobile", platform: "ios", appVersion: "1.0.0" } });
+    const sent: MobilePushDeliveryInput[] = [];
+    const push = new MobilePushCoordinator({ store, serverId: "schedule-notice-node", vault: await CredentialVault.open(join(fixture.directory, "push.key")),
+      provider: { send: async input => { sent.push(input); return { outcome: "delivered", code: "APNS_200" }; } } });
+    cleanups.push(() => push.close());
+    push.register({ connectionId: phone.id, deviceId: phone.deviceId, expectedDeviceRevision: store.getDevice(phone.deviceId).revision,
+      environment: "apns_sandbox", locale: "en", deviceToken: "schedule-test-device", registrationId: "schedule-test-registration", revocationSecret: "s".repeat(43) });
+    push.start();
+    const sessionId = (await host.createSession({ operationId: "create-schedule-notice-task", connection: fixture.connection, targetId: "target-one",
+      title: "Scheduled task", permissionMode: "ask", planMode: false, fastMode: false })).value.sessionId;
+    const run = async (text: string, desktop = true) => {
+      const id = text.replaceAll(" ", "-");
+      const schedule = store.upsertSchedule({ id: `notification-${id}`, backendId: fixture.adapter.id, targetId: "target-one", sessionMode: "bound", sessionId,
+        name: text, kind: "manual", timezone: "UTC", enabled: true,
+        prompt: { text, images: [], files: [], mentions: [], disposition: "prompt" },
+        executionSnapshot: { ...CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT,
+          scheduler: { ...CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT.scheduler, silentWhenIdle: true, notify: { desktop } } },
+        overlapPolicy: "queue", misfirePolicy: "run_once" });
+      const admitted = host.enqueueScheduledInput({ operationId: `send-${id}`, schedule, sessionId, scheduledAt: Date.now() }).value;
+      await eventually(() => store.getRun(admitted.runId).descriptor.state === "completed"
+        && store.getQueueItem(admitted.queueItemId).state === "completed");
+      expect(store.findSessionAttention(sessionId)?.kind).not.toBe("done");
+      return admitted.runId;
+    };
+    const silent = await run("default silence");
+    expect(store.findScheduleRunByRunId(silent)?.readAt).toEqual(expect.any(Number));
+    expect(store.listMobilePushDeliveries()).toEqual([]);
+    const explicit = await run("private scheduled reply");
+    await eventually(() => store.listMobilePushDeliveries()[0]?.status === "delivered");
+    expect(store.findScheduleRunByRunId(explicit)?.readAt).toBeUndefined();
+    const reply = store.listEvents({ sessionId }).find(event => event.runId === explicit && event.payload.type === "message_complete" && event.payload.role === "assistant");
+    expect(reply).toBeDefined();
+    expect(store.listMobilePushDeliveries()).toEqual([expect.objectContaining({ sessionId, kind: "done", messageEventId: reply!.id })]);
+    expect(sent[0]).toMatchObject({ kind: "done", intent: expect.stringContaining(`joko://task/${encodeURIComponent(sessionId)}?message=`) });
+    expect(JSON.stringify(sent[0])).not.toContain("private scheduled reply");
+    store.updateRunState({ runId: explicit, state: "completed", traceId: "repeat-mobile-schedule-settlement", suppressTerminalAttention: true, notifyScheduleRunMobile: true });
+
+    await run("delivery disabled", false);
+    const release = connections.taskActivity.open(phone, [sessionId]);
+    try {
+      expect(connections.taskActivity.hasRemoteTaskView(sessionId)).toBe(true);
+      await run("already being read");
+    } finally { release(); }
+    expect(connections.taskActivity.hasRemoteTaskView(sessionId)).toBe(false);
+    expect(store.listMobilePushDeliveries()).toHaveLength(1);
+    expect(sent).toHaveLength(1);
+  });
+
   it("clears a legacy consumed one-shot at scheduler startup only while its admission still owns the revision", async () => {
     const fixture = await createFixture();
     const sessionId = (await fixture.host.createSession({
@@ -11389,6 +11461,76 @@ describe("SessionHost", () => {
     });
   });
 
+  it.skipIf(process.platform === "win32")("recovers an expired script lease without aborting a new manual script process", { timeout: 25_000 }, async () => {
+    const fixture = await createFixture();
+    const cwd = fixture.store.getTarget("target-one").descriptor.workspaceRoot;
+    const startedPath = join(cwd, "new-schedule-script-started"), releasePath = join(cwd, "allow-new-schedule-script-to-finish");
+    await writeFile(join(cwd, "lease-recovery.mjs"), `
+      import { existsSync, writeFileSync } from "node:fs";
+      import { createInterface } from "node:readline";
+      const lines = createInterface({ input: process.stdin });
+      lines.once("line", line => {
+        const frame = JSON.parse(line);
+        if (frame.type !== "start") throw new Error("Expected a Schedule start frame");
+        writeFileSync("new-schedule-script-started", frame.context.runId);
+        const gate = setInterval(() => {
+          if (!existsSync("allow-new-schedule-script-to-finish")) return;
+          clearInterval(gate);
+          process.stdout.write(JSON.stringify({ protocol: "joko-schedule-script/1", type: "complete", resultText: "Independent script finished" }) + "\\n");
+          lines.close();
+        }, 20);
+      });
+    `);
+    const schedule = seedScriptSchedule(fixture, "script-lease-recovery", {
+      executionSnapshot: { ...CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, scheduler: {
+        format: 1, silentWhenIdle: false, notify: { desktop: true }, executionMode: "script",
+        scriptConfig: { command: `${JSON.stringify(process.execPath)} lease-recovery.mjs`, capabilities: [], timeoutMs: 15_000 }
+      } }
+    });
+    let now = 1_000;
+    const oldRunId = "run-old-script-lease";
+    const oldRuntime = new SchedulerRuntimeState({ instanceId: "scheduler-before-restart", now: () => now });
+    const oldRecovery = new SchedulerOccurrenceRecovery(fixture.store, oldRuntime, {
+      now: () => now, heartbeatIntervalMs: 20, heartbeatLeaseMs: 400
+    });
+    oldRecovery.begin({ scheduleId: schedule.id, runId: oldRunId, source: "run-now", executionMode: "script",
+      scheduledAt: now, phase: "running", abort: () => undefined });
+    fixture.store.recordScheduleOccurrence({ scheduleId: schedule.id, runId: oldRunId, firedAt: now, status: "running",
+      detail: { script: { status: "running" }, cadence: { preserveNextRun: true }, costAttribution: "zero" } });
+    const oldLease = fixture.store.getScheduleRuntimeOccurrence(oldRunId);
+
+    now = 1_100;
+    const coordinator = new ScheduleCoordinator(fixture.store, fixture.host, { now: () => now, tickMs: 60_000,
+      heartbeatIntervalMs: 20, heartbeatLeaseMs: 2_000, schedulerInstanceId: "scheduler-after-restart" });
+    coordinator.start();
+    const pending = coordinator.runNowWithResult(schedule.id, "separate-manual-script");
+    try {
+      await vi.waitFor(() => expect(existsSync(startedPath)).toBe(true), { timeout: 10_000 });
+      const newRunId = await readFile(startedPath, "utf8");
+      expect(newRunId).not.toBe(oldRunId);
+      const newLease = fixture.store.getScheduleRuntimeOccurrence(newRunId);
+      expect(newLease).toMatchObject({ ownerId: "scheduler-after-restart", phase: "running" });
+      expect(fixture.store.findScheduleRunByRunId(oldRunId)?.status).toBe("running");
+
+      now = oldLease.leaseExpiresAt + 1;
+      await vi.waitFor(() => expect(fixture.store.findScheduleRunByRunId(oldRunId)).toMatchObject({ status: "interrupted",
+        detail: { script: { status: "interrupted" }, runtimeRecovery: { reason: "stale_owner" } } }), { timeout: 3_000 });
+      expect(fixture.store.findScheduleRuntimeOccurrence(oldRunId)).toBeUndefined();
+      expect(fixture.store.getScheduleRuntimeOccurrence(newRunId)).toMatchObject({ ownerId: newLease.ownerId,
+        ownerGeneration: newLease.ownerGeneration, phase: "running" });
+      expect(fixture.store.findScheduleRunByRunId(newRunId)?.status).toBe("running");
+
+      await writeFile(releasePath, "finish\n");
+      await expect(pending).resolves.toMatchObject({ runId: newRunId, status: "success" });
+      expect(fixture.store.findScheduleRunByRunId(newRunId)).toMatchObject({ status: "success",
+        detail: { script: { status: "completed", resultText: "Independent script finished" } } });
+      expect(fixture.store.listSessions()).toHaveLength(0);
+    } finally {
+      coordinator.stop();
+      await pending.catch(() => undefined);
+    }
+  });
+
   it("marks an orphaned running script as interrupted on restart instead of replaying its side effects", async () => {
     const fixture = await createFixture();
     fixture.store.upsertSchedule({
@@ -11515,7 +11657,7 @@ describe("SessionHost", () => {
   });
 
   it("attributes non-subscription exact and delegated usage as actual Schedule cost", async () => {
-    const usageMoneyKind = vi.fn((_backendId: string, _providerId: string) => "actual-cost" as const);
+    const usageMoneyKind = vi.fn((_backendId: string, _providerId: string, _modelId: string) => "actual-cost" as const);
     const fixture = await createFixture(new ScheduleUsageFakeAdapter(), {
       usageMoneyKind
     });
@@ -11558,7 +11700,7 @@ describe("SessionHost", () => {
         }
       }
     });
-    expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "test");
+    expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "test", "text");
   });
 
   it("keeps token-priced metered usage in actual cost when the runtime reports no cost", async () => {
@@ -11606,6 +11748,46 @@ describe("SessionHost", () => {
       ?.costMoney?.amount ?? 0)).toBeGreaterThan(4.9);
     expect(detail).not.toHaveProperty("estimatedValueMoney");
   });
+
+  it.each([{ name: "the owner's reference rates", reportedCost: 0 }, { name: "a reported amount", reportedCost: 0.075 }])(
+    "uses the correct Schedule column for Codex Responses usage from $name", async ({ reportedCost }) => {
+      const adapter = new TokenPricedScheduleUsageFakeAdapter("codex-schedule-usage-fixture");
+      const describe = adapter.describe.bind(adapter);
+      vi.spyOn(adapter, "describe").mockImplementation(async () => {
+        const descriptor = await describe();
+        return { ...descriptor, adapterKind: "codex", models: descriptor.models.map(model => model.modelId === "text"
+          ? { ...model, api: "openai-responses" } : model) };
+      });
+      vi.spyOn(adapter, "send").mockImplementation(async (_input, context) => {
+        await context.emit({ type: "usage", usage: { ...tokenPricedUsage(), inputTokens: 1000, outputTokens: 1000, totalTokens: 2000, cost: reportedCost } });
+        await context.emit({ type: "done", outcome: "completed" });
+      });
+      const fixture = await createFixture(adapter, { usageMoneyKind: () => "actual-cost" });
+      fixture.store.upsertModelPriceOverride({ ownerId: "orchestrator", backendId: adapter.id, providerId: "test", modelId: "text",
+        values: { currencyCode: "USD", input: 10, output: 20 } });
+      const sessionId = (await fixture.host.createSession({ operationId: "create-bound-priced-task", connection: fixture.connection,
+        targetId: "target-one", title: "Original bound task", providerId: "test", modelId: "text", effort: "off",
+        fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+      const schedule = fixture.store.upsertSchedule({ id: "prices-bound-codex", backendId: adapter.id, targetId: "target-one", sessionMode: "bound", sessionId,
+        name: "Codex usage", kind: "manual", timezone: "UTC", enabled: true, overlapPolicy: "queue", misfirePolicy: "run_once",
+        prompt: { text: "Record one turn", images: [], files: [], mentions: [], disposition: "prompt" },
+        executionSnapshot: { ...CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, providerId: "test", modelId: "text", permissionMode: "ask", planMode: false } });
+      const coordinator = new ScheduleCoordinator(fixture.store, fixture.host);
+      cleanups.push(() => coordinator.stop());
+      const dispatched = await coordinator.runNowWithResult(schedule.id, "bound-priced-run");
+      await eventually(() => fixture.store.getRun(dispatched.runId).descriptor.state === "completed");
+      expect(dispatched.sessionId).toBe(sessionId);
+      const run = fixture.store.findScheduleRunByRunId(dispatched.runId);
+      if (reportedCost > 0) {
+        expect(run?.detail).toMatchObject({ costMoney: { amount: reportedCost, currency: "USD", kind: "actual-cost", approximate: false } });
+        expect(run?.detail).not.toHaveProperty("estimatedValueMoney");
+      } else {
+        expect(run?.detail).toMatchObject({ estimatedValueMoney: {
+          amount: 0.03, currency: "USD", kind: "value-estimate", approximate: true, estimateReasons: ["reference-price"]
+        } });
+        expect(run?.detail).not.toHaveProperty("costMoney");
+      }
+    });
 
   it("attributes subscription Pi usage as value estimate without inventing actual spend", async () => {
     const fixture = await createFixture(new ScheduleUsageFakeAdapter(), {
@@ -11657,7 +11839,7 @@ describe("SessionHost", () => {
   });
 
   it("fails closed to reference value when the exact Backend has no billing provenance", async () => {
-    const usageMoneyKind = vi.fn((_backendId: string, _providerId: string) => "reference-value" as const);
+    const usageMoneyKind = vi.fn((_backendId: string, _providerId: string, _modelId: string) => "reference-value" as const);
     const fixture = await createFixture(new ScheduleUsageFakeAdapter(), {
       usageMoneyKind
     });
@@ -11699,7 +11881,7 @@ describe("SessionHost", () => {
       }
     });
     expect(detail).not.toHaveProperty("costMoney");
-    expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "test");
+    expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "test", "text");
     expect(fixture.store.listUsageLedger({ ownerId: "orchestrator" })).toEqual(
       expect.arrayContaining([expect.objectContaining({
         backendId: fixture.adapter.id,
@@ -18370,6 +18552,7 @@ async function createFixture(
     readonly prepareManagedProviderRuntime?: (context: AdapterContext) => Promise<void>;
     readonly resolveModelWorkingContext?: (target: { readonly backendId: string; readonly providerId: string; readonly modelId: string; readonly sessionId?: string }) => number | undefined;
     readonly resolveMcpAppModelContext?: (sessionId: string) => Promise<import("./mcp-apps/host.js").McpAppModelContext>;
+    readonly createScheduleRunNotifications?: (store: OperationalStore) => ScheduleRunNotificationController;
     readonly onBackendMayBeIdle?: (backendId: string) => void;
     readonly onServiceRunSettled?: (input: {
       readonly sessionId: string;
@@ -18392,8 +18575,11 @@ async function createFixture(
   const repository = new OperationalArtifactRepository(store);
   const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"), repository, ingestRoots: [directory] });
   await artifacts.initialize();
-  const { additionalAdapters = [], ...sessionHostOptions } = hostOptions;
-  const host = new SessionHost(store, artifacts, [adapter, ...additionalAdapters], sessionHostOptions);
+  const { additionalAdapters = [], createScheduleRunNotifications, ...sessionHostOptions } = hostOptions;
+  const host = new SessionHost(store, artifacts, [adapter, ...additionalAdapters], {
+    ...sessionHostOptions,
+    ...(createScheduleRunNotifications === undefined ? {} : { scheduleRunNotifications: createScheduleRunNotifications(store) })
+  });
   await host.initialize();
   await host.registerTarget({
     id: "target-one",

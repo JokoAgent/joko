@@ -177,6 +177,8 @@ const rows = [
   ["automation.duration.days", "{count} days", "{count} 天", "{count} 天", "{count} 日", "{count}일"],
   ["automation.run.unread", "Unread", "未读", "未讀", "未読", "읽지 않음"],
   ["automation.cost.value", "{value} · {attribution}", "{value} · {attribution}", "{value} · {attribution}", "{value} · {attribution}", "{value} · {attribution}"],
+  ["automation.cost.actual", "Cost {value}", "成本 {value}", "成本 {value}", "費用 {value}", "비용 {value}"],
+  ["automation.cost.estimatedValue", "Estimated value {value}", "估算价值 {value}", "估算價值 {value}", "推定価値 {value}", "추정 가치 {value}"],
   ["automation.cost.zero", "Zero token cost", "零 token 成本", "零 token 成本", "トークン費用なし", "토큰 비용 없음"],
   ["automation.cost.label", "Cost {attribution}", "成本：{attribution}", "成本：{attribution}", "費用：{attribution}", "비용: {attribution}"],
   ["automation.cost.attribution.exact", "exact", "精确", "精確", "確定", "정확"],

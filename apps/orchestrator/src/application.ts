@@ -1310,7 +1310,8 @@ export async function createOrchestratorApplication(
         return adapter === undefined ? [] : [adapter];
       }) })
   });
-  const scheduleRunNotifications = new ScheduleRunNotificationController(store);
+  const scheduleRunNotifications = new ScheduleRunNotificationController(store, sessionId =>
+    partnerStore.getSessionLink(sessionId) === undefined && !connections.taskActivity.hasRemoteTaskView(sessionId));
   let schedulerForBridgeTools: ScheduleCoordinator | undefined;
   const unregisterSchedulerBridgeTools = mcpRouter.registerBridgeToolProvider(
     new SchedulerToolBridgeProvider({
@@ -2788,7 +2789,8 @@ export async function createOrchestratorApplication(
     onActivityTransition: runtimeActivity.markBlockingActivity
   });
   const scheduler = new ScheduleCoordinator(store, sessionHost, {
-    onActivityTransition: runtimeActivity.markBlockingActivity
+    onActivityTransition: runtimeActivity.markBlockingActivity,
+    isPairedPiBackend: (backendId) => hostedAgentSources?.isReadyPairedPiBackend(backendId) === true
   });
   schedulerForBridgeTools = scheduler;
   partnerRoutines = new PartnerRoutineManager({ partners, store, scheduler,

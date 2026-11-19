@@ -298,6 +298,12 @@ export function mobileAutomationExtraDirectoryOptions(
     .sort((left, right) => compareText(left.path, right.path) || compareText(left.id, right.id));
 }
 
+function savedBoundTaskDefault(schedule: MobileAutomationSchedule | undefined): schedule is MobileAutomationSchedule & { readonly sessionId: string } {
+  return schedule?.source === "dialogue" && schedule.recurrence === "once" && schedule.sessionMode === "bound"
+    && schedule.sessionId !== undefined && schedule.executionMode === "agent" && schedule.model === undefined
+    && !schedule.useWorktree && schedule.preRunHook === undefined && schedule.extraDirectoryIds.length === 0;
+}
+
 export function createMobileAutomationDraft(
   owner: Snapshot | undefined,
   schedule?: MobileAutomationSchedule,
@@ -338,7 +344,7 @@ export function createMobileAutomationDraft(
     scriptDispatchSessions: schedule?.script?.dispatchSessions ?? false,
     ...(schedule?.executionMode === "script" ? {} : schedule?.model !== undefined
       ? { model: { ...schedule.model, ...(schedule.model.effortId === undefined ? {} : { effortId: schedule.model.effortId }) } }
-      : defaultModel === undefined ? {} : { model: defaultModel }),
+      : defaultModel === undefined || savedBoundTaskDefault(schedule) ? {} : { model: defaultModel }),
     permissionMode: schedule?.permissionMode ?? (defaultPermission && permissions.includes(defaultPermission)
       ? defaultPermission : permissions[0] ?? "ask"),
     planMode: schedule?.executionMode === "script" ? false : schedule?.planMode ?? (execution?.canSetPlanMode && backendSettings.length === 1
@@ -418,7 +424,11 @@ export function buildMobileAutomationScheduleInput(
   if (draft.recurrence === "manual") {
     recurrence = { kind: { case: "manual", value: {} } } as ScheduleInput["recurrence"];
   } else if (draft.recurrence === "once") {
-    const epoch = mobileScheduleEpochFromLocalDateTime(draft.expression, timeZone);
+    const savedEpoch = existing?.recurrence === "once" && existing.timeZone === timeZone
+      ? Date.parse(existing.recurrenceExpression) : undefined;
+    const unchanged = savedEpoch !== undefined && Number.isFinite(savedEpoch)
+      && draft.expression.trim() === mobileScheduleLocalDateTimeFromEpoch(savedEpoch, timeZone);
+    const epoch = unchanged ? savedEpoch : mobileScheduleEpochFromLocalDateTime(draft.expression, timeZone);
     if (epoch === undefined) throw new Error("Enter a valid one-shot time in the selected time zone.");
     if (draft.enabled && epoch <= now) throw new Error("An enabled one-shot Automation must run in the future.");
     recurrence = { kind: { case: "oneShot", value: { triggerAt: timestamp(epoch) } } } as ScheduleInput["recurrence"];
@@ -446,8 +456,13 @@ export function buildMobileAutomationScheduleInput(
   let boundSession: Session | undefined;
   if (draft.sessionMode === "bound") {
     boundSession = unique(owner.sessions, (candidate) => candidate.sessionId === draft.sessionId);
+    const followsOriginalTask = savedBoundTaskDefault(existing) && existing.sessionId === draft.sessionId
+      && existing.targetId === target.targetId && existing.backendId === target.backendId && targetOption.projectAutomationEligible
+      && draft.recurrence === "once" && !scriptMode && draft.model === undefined && !draft.useWorktree
+      && draft.preRunHook === undefined && draft.extraDirectoryIds.length === 0 && boundSession?.worktree === undefined
+      && boundSession?.automationOrigin === undefined;
     if (!boundSession || !activeSession(boundSession) || boundSession.targetId !== target.targetId
-      || boundSession.backendId !== target.backendId || !positiveRevision(boundSession.version?.revision)) {
+      || (boundSession.backendId !== target.backendId && !followsOriginalTask) || !positiveRevision(boundSession.version?.revision)) {
       throw new Error("Choose a current active task from the selected project.");
     }
   } else if (draft.sessionMode === "fresh" && draft.sessionId !== "") {

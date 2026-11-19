@@ -122,10 +122,10 @@ function fixture(localMember = false, readRemote: ProviderGroupQuotaReaderOption
     revoke: () => { live = false; }, closeUnknown: (value: boolean) => { closeUnknown = value; }, completePoll: (error?: Error) => completePoll(error) };
 }
 
-it("selects the newly authorized device account for the next ordinary task using the same route", async () => {
+it.each(["model", "codex"])("selects the newly authorized device account for the next ordinary task using the same route and %s bucket", async bucketId => {
   let usedPercent = 100;
   const replies = vi.fn(() => ({ activeTurns: 0, accountUsage: toGroupAccountUsage({ providerId: "provider", observedAt: Date.now(),
-    buckets: [{ id: "codex", primaryWindow: { usedPercent, windowMinutes: 300, resetAt: Date.now() + 60_000 } }] }) }));
+    buckets: [{ id: bucketId, primaryWindow: { usedPercent, windowMinutes: 300, resetAt: Date.now() + 60_000 } }] }) }));
   const client = createClient(ProviderGroupRpc, createRouterTransport(router => router.service(ProviderGroupRpc, {
     getProviderSchedulingState: request => {
       expect(request.key).toMatchObject({ backendId: "native-remote", providerId: "provider" });
@@ -134,7 +134,7 @@ it("selects the newly authorized device account for the next ordinary task using
   })));
   const f = fixture(false, async (member, signal) => fromGroupAccountUsage((await client.getProviderSchedulingState({
     key: { backendId: member.nativeBackendId, providerId: member.providerId }
-  }, { signal })).accountUsage));
+  }, { signal })).accountUsage, { includeBuckets: true }));
   const service = new ProviderGroupService({ router: f.router, sessions: { read: () => undefined,
     handoff: async () => { throw new Error("First selection must not hand off a previous task."); },
     continue: async () => { throw new Error("First selection must not continue a previous task."); }, status() {} } });

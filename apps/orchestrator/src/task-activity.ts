@@ -52,6 +52,16 @@ export class TaskActivityRegistry {
     this.#refresh(); return release;
   }
   snapshot(): TaskActivitySnapshot { this.#refresh(); return this.#snapshot; }
+  hasRemoteTaskView(sessionId: string): boolean {
+    for (const view of this.#views.values()) {
+      if (!view.sessions.has(sessionId)) continue;
+      try {
+        this.#authority.current(view.authority);
+        if (!this.#authority.local(view.authority)) return true;
+      } catch { /* A retired authority has no active view. */ }
+    }
+    return false;
+  }
   subscribe(listener: () => void): () => void {
     this.#listeners.add(listener);
     this.#detachStore ??= this.#store.subscribe(event => {

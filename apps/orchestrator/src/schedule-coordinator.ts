@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 
 import { manualScheduleDispatchOperationId, scheduleRunIdFromDigest } from "@joko/contracts";
-import { redactSecrets, type PermissionMode, type SessionDescriptor } from "@joko/core";
+import { redactSecrets, type NativeSubscriptionAuthority, type PermissionMode, type SessionDescriptor } from "@joko/core";
 import type {
   OperationalStore,
   ScheduleDeletionCleanupRecord,
@@ -11,7 +11,9 @@ import type {
 } from "@joko/store";
 
 import {
+  boundOneShotScheduleProvider,
   scheduleExtensionSnapshot,
+  scheduleNativeSubscriptionKey,
   scheduleWorktreeConfiguration,
   type ScheduleWorktreeConfiguration
 } from "./schedule-extensions.js";
@@ -46,6 +48,7 @@ export interface ScheduleCoordinatorOptions {
   readonly tickMs?: number;
   readonly misfireGraceMs?: number;
   readonly now?: () => number;
+  readonly isPairedPiBackend?: (backendId: string) => boolean;
   /** Content-free transition hook for destructive-action quiet-period fencing. */
   readonly onActivityTransition?: () => void;
   readonly executePreRunHook?: (input: SchedulePreRunHookInput) => Promise<SchedulePreRunHookResult>;
@@ -70,6 +73,8 @@ export interface ScheduleDispatchResult {
   readonly status: "queued" | "success" | "skipped" | "failed" | "aborted";
 }
 
+type LinkedScheduleOccurrence = { readonly runId: string; readonly sessionId?: string };
+
 const SCHEDULE_BUSY_WAIT_MS = 30 * 60_000;
 
 /** Durable peer caller for SessionHost. The deterministic operation ID is the distributed claim. */
@@ -79,6 +84,7 @@ export class ScheduleCoordinator {
   readonly #tickMs: number;
   readonly #misfireGraceMs: number;
   readonly #now: () => number;
+  readonly #isPairedPiBackend: (backendId: string) => boolean;
   readonly #onActivityTransition: () => void;
   readonly #executePreRunHook: (input: SchedulePreRunHookInput) => Promise<SchedulePreRunHookResult>;
   readonly #validatePreRunHookBinding: typeof validateScheduleHookScriptBinding;
@@ -108,6 +114,7 @@ export class ScheduleCoordinator {
     this.#tickMs = options.tickMs ?? 1_000;
     this.#misfireGraceMs = options.misfireGraceMs ?? 5 * 60_000;
     this.#now = options.now ?? Date.now;
+    this.#isPairedPiBackend = options.isPairedPiBackend ?? (() => false);
     this.#onActivityTransition = options.onActivityTransition ?? (() => undefined);
     this.#executePreRunHook = options.executePreRunHook ?? executeSchedulePreRunHook;
     this.#validatePreRunHookBinding = options.validatePreRunHookBinding ?? validateScheduleHookScriptBinding;
@@ -202,7 +209,7 @@ export class ScheduleCoordinator {
           scheduleId: schedule.id, scheduleName: schedule.name, runId: run.id,
           source: prior?.source ?? "automatic", executionMode: "agent", scheduledAt: history.firedAt,
           phase: queued ? "queued" : "running", ...(queued ? { resumeQueued: true } : { resumeActive: true }),
-          abort: () => this.abortSchedule(schedule.id, [history])
+          abort: () => this.abortOccurrence(schedule.id, history)
         });
         this.#admittedRuns.add(run.id);
       }
@@ -245,7 +252,7 @@ export class ScheduleCoordinator {
       this.#recovery.begin({
         scheduleId: schedule.id, scheduleName: schedule.name, runId,
         source, executionMode: "agent", scheduledAt: history.firedAt,
-        phase: "queued", resumeQueued: true, abort: () => this.abortSchedule(schedule.id, [history])
+        phase: "queued", resumeQueued: true, abort: () => this.abortOccurrence(schedule.id, history)
       });
       this.#admittedRuns.add(runId);
     }
@@ -256,29 +263,33 @@ export class ScheduleCoordinator {
    * immediately; already-admitted product Runs are aborted through SessionHost. */
   async abortSchedule(
     scheduleId: string,
-    linkedOccurrences: readonly { readonly runId: string; readonly sessionId?: string }[] =
-      listAllScheduleRuns(this.#store, scheduleId),
+    linkedOccurrences: readonly LinkedScheduleOccurrence[] = listAllScheduleRuns(this.#store, scheduleId),
     invokingRunId?: string
   ): Promise<void> {
     for (const [controller, runId] of this.#activeOccurrences.get(scheduleId) ?? []) {
       if (runId !== invokingRunId) controller.abort();
     }
     for (const occurrence of linkedOccurrences) {
-      if (occurrence.sessionId === undefined || occurrence.runId === invokingRunId) continue;
-      const run = this.#store.findRun(occurrence.runId);
-      if (
-        run === undefined || run.descriptor.sessionId !== occurrence.sessionId ||
-        !activeScheduleRunState(run.descriptor.state)
-      ) continue;
-      const queueItem = this.#store.findQueueItemByRunId(occurrence.sessionId, occurrence.runId);
-      if (queueItem?.state === "accepted") {
-        this.#store.cancelQueueItem({
-          queueItemId: queueItem.id,
-          traceId: `schedule:${scheduleId}:cancelled`
-        });
-      } else {
-        await this.#host.abort(occurrence.sessionId, occurrence.runId).catch(() => undefined);
-      }
+      if (occurrence.runId !== invokingRunId) await this.abortAdmittedOccurrence(scheduleId, occurrence);
+    }
+  }
+
+  private async abortOccurrence(scheduleId: string, occurrence: LinkedScheduleOccurrence): Promise<void> {
+    for (const [controller, runId] of this.#activeOccurrences.get(scheduleId) ?? []) {
+      if (runId === occurrence.runId) controller.abort();
+    }
+    await this.abortAdmittedOccurrence(scheduleId, occurrence);
+  }
+
+  private async abortAdmittedOccurrence(scheduleId: string, occurrence: LinkedScheduleOccurrence): Promise<void> {
+    if (occurrence.sessionId === undefined) return;
+    const run = this.#store.findRun(occurrence.runId);
+    if (run === undefined || run.descriptor.sessionId !== occurrence.sessionId || !activeScheduleRunState(run.descriptor.state)) return;
+    const queueItem = this.#store.findQueueItemByRunId(occurrence.sessionId, occurrence.runId);
+    if (queueItem?.state === "accepted") {
+      this.#store.cancelQueueItem({ queueItemId: queueItem.id, traceId: `schedule:${scheduleId}:cancelled` });
+    } else {
+      await this.#host.abort(occurrence.sessionId, occurrence.runId).catch(() => undefined);
     }
   }
 
@@ -365,6 +376,7 @@ export class ScheduleCoordinator {
       this.wakeQueuedRuns();
       void this.#host.reconcileScheduledWorktrees?.();
       const dueAt = this.#now(), dueSchedules: ScheduleRecord[] = [];
+      this.expireSchedulesAt(dueAt);
       // Capture every page before dispatch can advance or disable a due row.
       // Active occurrences can occupy the first page while later rows need slots.
       for (let offset = 0; ; offset += 100) {
@@ -477,7 +489,7 @@ export class ScheduleCoordinator {
       abort: () => {
         controller.abort();
         const history = this.#store.findScheduleRunByRunId(runtimeRunId);
-        if (history !== undefined) return this.abortSchedule(schedule.id, [history]);
+        if (history !== undefined) return this.abortAdmittedOccurrence(schedule.id, history);
       }
     });
     let controllers = this.#activeOccurrences.get(schedule.id);
@@ -632,6 +644,28 @@ export class ScheduleCoordinator {
       return { runId, status: "skipped" };
     }
 
+    let subscription: NativeSubscriptionAuthority | undefined;
+    if (boundOneShotScheduleProvider(schedule) !== undefined) {
+      let accountMatches = false;
+      try {
+        const savedKey = scheduleNativeSubscriptionKey(schedule.executionSnapshot);
+        subscription = await this.#host.captureScheduleSubscription(schedule, signal);
+        subscription?.assertCurrent();
+        accountMatches = subscription?.accountKey === savedKey;
+      } catch { /* The account must still be provable before this occurrence starts. */ }
+      if (this.#recovery.wasForceReleased(runId)) return { runId, status: "failed" };
+      if (signal.aborted || this.#deletionFences.has(schedule.id) || options.canDispatch?.() === false
+        || this.#store.findSchedule(schedule.id)?.revision !== schedule.revision) return { runId, status: "aborted" };
+      if (!accountMatches) {
+        this.recordPreSessionOutcome({ schedule, operationId, runId, scheduledAt,
+          ...(nextRunAt === undefined ? {} : { nextRunAt }), status: "failed", detail: {
+            reason: "The original Schedule subscription account is unavailable or has changed. Open the Schedule and save it with the intended account.",
+            costAttribution: "zero"
+          } });
+        return { runId, status: "failed" };
+      }
+    }
+
     if (extension.executionMode === "script" && this.#store.getTarget(schedule.targetId).descriptor.remoteWorkspace !== undefined) {
       this.recordPreSessionOutcome({ schedule, operationId, runId, scheduledAt,
         ...(nextRunAt === undefined ? {} : { nextRunAt }), status: "failed",
@@ -644,6 +678,7 @@ export class ScheduleCoordinator {
         && (session.descriptor.archived || session.descriptor.worktree?.state === "preserved")) {
         await this.#host.restoreScheduledTarget({ sessionId: session.descriptor.id, operationId: `${operationId}-restore`, assertCurrent: () => {
           signal.throwIfAborted();
+          subscription?.assertCurrent();
           const current = this.#store.findSchedule(schedule.id);
           if (!current || current.revision !== schedule.revision || current.sessionId !== session.descriptor.id
             || this.#deletionFences.has(schedule.id) || this.#recovery.wasForceReleased(runId) || options.canDispatch?.() === false) {
@@ -654,7 +689,7 @@ export class ScheduleCoordinator {
     }
     const preRunRevision = schedule.revision;
     this.#recovery.transition(runId, "running", { executionMode: extension.executionMode });
-    const preRun = await this.evaluatePreRunHook(schedule, runId, scheduledAt, extension.preRunHook, signal);
+    const preRun = await this.evaluatePreRunHook(schedule, runId, scheduledAt, extension.preRunHook, signal, subscription?.assertCurrent);
     if (this.#recovery.wasForceReleased(runId)) return { runId, status: "failed" };
     if (preRun !== undefined) {
       const current = this.#store.findSchedule(schedule.id);
@@ -749,6 +784,14 @@ export class ScheduleCoordinator {
       return { runId, sessionId, status: "aborted" };
     }
 
+    const currentSession = this.#store.getSession(sessionId).descriptor;
+    const boundBackendId = currentSession.backendId === schedule.backendId ? undefined : currentSession.backendId;
+    if (boundBackendId !== undefined && (!this.#store.scheduleMatchesSession(schedule, currentSession) || !this.#isPairedPiBackend(boundBackendId))) {
+      this.recordPreSessionOutcome({ schedule, operationId, runId, scheduledAt,
+        ...(nextRunAt === undefined ? {} : { nextRunAt }), status: "failed",
+        detail: { reason: "The adopted task Backend is no longer available as a paired Pi route.", costAttribution: "zero" } });
+      return { runId, status: "failed" };
+    }
     const busy = this.#store.listRuns({ sessionId, activeOnly: true }).length > 0;
     const alreadyQueued = this.#store.listQueuedScheduleRuns().some((run) =>
       run.scheduleId === schedule.id && run.sessionId === sessionId);
@@ -772,6 +815,7 @@ export class ScheduleCoordinator {
       schedule,
       sessionId,
       scheduledAt,
+      ...(boundBackendId === undefined ? {} : { boundBackendId }),
       // The admitted Run consumes a one-shot, even when Run Now fired it early.
       ...(schedule.kind === "one_shot" || nextRunAt === undefined ? {} : { nextRunAt })
     }); } catch (error) { this.#admittedRuns.delete(runId); throw error; }
@@ -783,7 +827,8 @@ export class ScheduleCoordinator {
     runId: string,
     scheduledAt: number,
     hook: ReturnType<typeof scheduleExtensionSnapshot>["preRunHook"],
-    signal: AbortSignal
+    signal: AbortSignal,
+    assertAccountCurrent?: () => void
   ): Promise<{ readonly result: SchedulePreRunHookResult; readonly detail: Readonly<Record<string, unknown>> } | undefined> {
     if (hook === undefined) return undefined;
     const capturedTarget = this.#store.getTarget(schedule.targetId);
@@ -793,6 +838,7 @@ export class ScheduleCoordinator {
       ? this.#host.scheduledExecutionTarget(schedule.sessionId!) : capturedTarget.descriptor;
     const assertCurrent = () => {
       signal.throwIfAborted();
+      assertAccountCurrent?.();
       if (schedule.sessionMode === "bound" || schedule.sessionMode === "persistent" && schedule.sessionId !== undefined
         && this.#store.findSession(schedule.sessionId)?.descriptor.deletedAt === undefined) this.requireUsableSession(schedule, schedule.sessionId);
       const current = this.#store.getTarget(schedule.targetId);
@@ -1104,10 +1150,10 @@ export class ScheduleCoordinator {
     // previous process disappeared. The runtime lease can be reclaimed, but
     // the independently progressing product Run must not be aborted.
     if (history !== undefined && !isRecoverableScheduleRuntimeStatus(history.status)) return;
-    await this.abortSchedule(occurrence.scheduleId, [{
+    await this.abortOccurrence(occurrence.scheduleId, {
       runId: occurrence.runId,
       ...(history?.sessionId === undefined ? {} : { sessionId: history.sessionId })
-    }]);
+    });
   }
 
   private recordForceReleasedOccurrence(
@@ -1208,9 +1254,23 @@ export class ScheduleCoordinator {
     }
   }
 
+  private expireSchedulesAt(at: number): void {
+    let afterId = "";
+    while (true) {
+      const expired = this.#store.listExpiredEnabledSchedules(at, afterId);
+      for (const schedule of expired) {
+        // Let an occurrence already admitted before the cutoff settle under its own revision.
+        if ((this.#activeOccurrences.get(schedule.id)?.size ?? 0) === 0) this.expireSchedule(schedule, at);
+        afterId = schedule.id;
+      }
+      if (expired.length < 100) return;
+    }
+  }
+
   private expireSchedule(schedule: ScheduleRecord, now: number): void {
-    const current = this.#store.getSchedule(schedule.id);
-    if (!current.enabled) return;
+    const current = this.#store.findSchedule(schedule.id);
+    if (!current?.enabled || current.revision !== schedule.revision || this.#deletionFences.has(schedule.id)
+      || this.#store.findPendingScheduleDeletionCleanupForSchedule(schedule.id) !== undefined) return;
     this.#store.upsertSchedule(copyScheduleForCoordinator(current, {
       enabled: false,
       expectedRevision: current.revision,
@@ -1318,10 +1378,7 @@ export class ScheduleCoordinator {
     if (session.descriptor.deletedAt !== undefined || session.descriptor.archived) {
       throw new Error("The task bound to this Schedule is archived or deleted.");
     }
-    if (
-      session.descriptor.backendId !== schedule.backendId ||
-      session.descriptor.targetId !== schedule.targetId
-    ) {
+    if (!this.#store.scheduleMatchesSession(schedule, session.descriptor)) {
       throw new Error("The task bound to this Schedule no longer matches its routing.");
     }
     return sessionId;

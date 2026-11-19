@@ -372,6 +372,7 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
                     const selected = schedule.id === selectedId;
                     const status = scheduleDisplayStatus(schedule);
                     const runPending = pendingRunNowIds.has(schedule.id);
+                    const boundTaskUnavailable = schedule.sessionMode === "bound" && !sessions.some((session) => session.id === schedule.sessionId);
                     const runtimeStatus = scheduleRuntimeStatus(runtime, schedule.id);
                     return <div id={`schedule-row-${schedule.id}`} role="listitem" className={`schedule-master__row${selected ? " is-selected" : ""}${status === "paused" ? " is-paused" : ""}`} key={schedule.id}>
                       <button type="button" className="schedule-master__row-main" aria-current={selected ? "true" : undefined} onClick={() => selectSchedule(schedule)} onDoubleClick={() => setEditor(schedule)}>
@@ -379,7 +380,7 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
                         <span><span className="schedule-master__row-title"><strong>{schedule.name}</strong>{schedule.unreadRunCount > 0 && <span className="schedule-run-unread-count" aria-label={t("scheduler.unreadRunCount", { count: schedule.unreadRunCount })}>{schedule.unreadRunCount}</span>}{schedule.source === "project" && <span className="schedule-source-chip" title={t("scheduler.projectSourceTooltip", { path: schedule.projectConfigPath ?? ".joko/automations/schedules.json" })}><FolderGit2 aria-hidden="true" />{t("scheduler.projectSource")}</span>}</span><small>{runtimeStatus !== undefined ? scheduleRuntimeLabel(runtimeStatus, runtime, t) : runPending ? t("scheduler.runtimeLoading") : status === "expired" ? t("scheduler.once") : schedule.nextRunAt === undefined ? scheduleKind(schedule.kind, t) : t("scheduler.nextRunRelative", { time: formatRelativeTime(schedule.nextRunAt, locale) })}</small></span>
                       </button>
                       <div className="schedule-master__row-actions">
-                        <IconButton disabled={runPending} label={`${t("scheduler.runNow")} · ${schedule.name}`} onClick={() => runScheduleOnce(schedule.id)}><Play aria-hidden="true" /></IconButton>
+                        <IconButton disabled={runPending || boundTaskUnavailable} disabledReason={boundTaskUnavailable ? t("scheduler.runTaskUnavailable") : undefined} label={`${t("scheduler.runNow")} · ${schedule.name}`} onClick={() => runScheduleOnce(schedule.id)}><Play aria-hidden="true" /></IconButton>
                         <ScheduleRowMenu
                           schedule={schedule}
                           expired={status === "expired"}
@@ -587,6 +588,7 @@ function ScheduleDetail({ controller, schedule, sessions, session, target, runti
   const recentHistoryRef = useRef(schedule.history);
   recentHistoryRef.current = schedule.history;
   const displayStatus = scheduleDisplayStatus(schedule);
+  const boundTaskUnavailable = schedule.sessionMode === "bound" && session === undefined;
   const historyEntries = useMemo(
     () => groupScheduleHistoryRuns(history, schedule.sessionMode === "persistent" || schedule.sessionMode === "bound"),
     [history, schedule.sessionMode]
@@ -713,8 +715,8 @@ function ScheduleDetail({ controller, schedule, sessions, session, target, runti
   return (
     <article className="schedule-detail">
       <header className="schedule-detail__header">
-        <div><h2>{schedule.name}</h2><p>{target?.workspaceName ?? target?.name ?? schedule.targetId} · {session?.name ?? scheduleSessionModeLabel(schedule.sessionMode, t)}</p></div>
-        <div className="schedule-detail__actions"><Button tone="primary" disabled={runPending} onClick={onRun}><Play aria-hidden="true" />{t("scheduler.runNow")}</Button><Button onClick={onEdit}><Pencil aria-hidden="true" />{t("scheduler.edit")}</Button><Button disabled={displayStatus === "expired"} onClick={onToggle}>{schedule.enabled ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}{schedule.enabled ? t("common.disable") : t("common.enable")}</Button><Button tone="ghost" className="danger-text" onClick={onDelete}><Trash2 aria-hidden="true" />{t("common.delete")}</Button></div>
+        <div><h2>{schedule.name}</h2><p>{target?.workspaceName ?? target?.name ?? schedule.targetId} · {boundTaskUnavailable ? t("scheduler.runTaskUnavailable") : session?.name ?? scheduleSessionModeLabel(schedule.sessionMode, t)}</p></div>
+        <div className="schedule-detail__actions"><Button tone="primary" disabled={runPending || boundTaskUnavailable} onClick={onRun}><Play aria-hidden="true" />{t("scheduler.runNow")}</Button><Button onClick={onEdit}><Pencil aria-hidden="true" />{t("scheduler.edit")}</Button><Button disabled={displayStatus === "expired"} onClick={onToggle}>{schedule.enabled ? <Pause aria-hidden="true" /> : <Play aria-hidden="true" />}{schedule.enabled ? t("common.disable") : t("common.enable")}</Button><Button tone="ghost" className="danger-text" onClick={onDelete}><Trash2 aria-hidden="true" />{t("common.delete")}</Button></div>
       </header>
       <dl className="schedule-facts">
         {runtimeStatus !== undefined && <div><dt>{t("scheduler.runtimeStatus")}</dt><dd><Pill tone={runtimeStatus.kind === "capacity" ? "warning" : "success"}>{scheduleRuntimeLabel(runtimeStatus, runtime, t)}</Pill></dd></div>}
@@ -991,6 +993,11 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
         })}><option value="fresh">{t("scheduler.sessionFresh")}</option>{draft.executionMode === "agent" && <option value="persistent">{t("scheduler.sessionPersistent")}</option>}{!projectOwned && <option value="bound">{t("scheduler.sessionBound")}</option>}</SelectControl></label>
         {draft.sessionMode === "bound" && <label className="field"><span>{t("scheduler.session")}</span><SelectControl required value={draft.sessionId} onChange={(event) => {
           const session = sessions.find((candidate) => candidate.id === event.target.value);
+          if (savedBoundTaskDefault(schedule) && session && session.id === schedule.sessionId && session.backendId !== schedule.backendId) {
+            setDraft((current) => ({ ...current, sessionId: session.id, backendId: schedule.backendId,
+              providerId: "", modelId: "", effort: undefined, fastMode: false }));
+            return;
+          }
           setDraft((current) => ({ ...current, sessionId: event.target.value, backendId: session?.backendId ?? current.backendId, providerId: session?.model?.providerId ?? "", modelId: session?.model?.modelId ?? "", effort: session?.effort, fastMode: session?.fastMode ?? false, permissionMode: session?.permissionMode ?? current.permissionMode, planMode: session?.planMode ?? current.planMode }));
         }}><option value="">—</option>{matchingSessions.map((session) => <option value={session.id} key={session.id}>{session.name}</option>)}</SelectControl></label>}
         <label className="field"><span>{t("scheduler.recurrence")}</span><SelectControl value={draft.kind} onChange={(event) => {
@@ -1091,11 +1098,18 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
   </Modal>;
 }
 
+function savedBoundTaskDefault(schedule: ScheduleView | undefined): schedule is ScheduleView & { readonly sessionId: string } {
+  return schedule?.source === "user" && schedule.kind === "once" && schedule.sessionMode === "bound"
+    && schedule.sessionId !== undefined && schedule.executionMode === "agent" && schedule.model === undefined
+    && !schedule.useWorktree && schedule.preRunHook === undefined && schedule.extraDirectoryIds.length === 0;
+}
+
 export function scheduleDraft(schedule: ScheduleView | undefined, targets: readonly TargetView[], sessions: readonly SessionView[], models: readonly ModelView[], backends: readonly BackendView[] = []): ScheduleDraft {
   const availableTarget = targets.find((candidate) => !candidate.archived && (backends.length === 0 || scheduleTargetAvailable(candidate, backends)));
   const target = targets.find((candidate) => candidate.id === schedule?.targetId) ?? availableTarget;
   const session = sessions.find((candidate) => candidate.id === schedule?.sessionId) ?? sessions.find((candidate) => candidate.targetId === target?.id);
-  const model = schedule?.model ?? session?.model;
+  const followTask = savedBoundTaskDefault(schedule);
+  const model = followTask ? undefined : schedule?.model ?? session?.model;
   const backendId = schedule?.backendId ?? target?.backendId ?? session?.backendId ?? "";
   const descriptor = models.find((candidate) => candidate.backendId === backendId && candidate.providerId === model?.providerId && candidate.modelId === model?.modelId);
   const timezone = schedule?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
@@ -1119,8 +1133,8 @@ export function scheduleDraft(schedule: ScheduleView | undefined, targets: reado
     scriptDispatchSessions: schedule?.script?.capabilities.includes("sessions.dispatch") ?? false,
     providerId: model?.providerId ?? "",
     modelId: model?.modelId ?? "",
-    effort: schedule?.model?.effort ?? session?.effort ?? descriptor?.efforts[0],
-    fastMode: schedule?.model?.fastMode ?? session?.fastMode ?? false,
+    effort: followTask ? undefined : schedule?.model?.effort ?? session?.effort ?? descriptor?.efforts[0],
+    fastMode: followTask ? false : schedule?.model?.fastMode ?? session?.fastMode ?? false,
     permissionMode: schedule?.permissionMode ?? session?.permissionMode ?? "ask",
     planMode: schedule?.planMode ?? session?.planMode ?? false,
     useWorktree: schedule?.useWorktree ?? false,

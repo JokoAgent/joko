@@ -16,9 +16,11 @@ import {
   OperationMutationSchema,
   OperationPreconditionSchema,
   OperationState,
+  PermissionMode,
   PromoteScheduleToProjectMutationSchema,
   ReconcileProjectAutomationsMutationSchema,
   RemoveProjectScheduleMutationSchema,
+  ScheduleExecutionSnapshotSchema,
   ScheduleGeneratedSessionDisposition,
   ScheduleInputSchema,
   ScheduleMisfirePolicy,
@@ -36,7 +38,7 @@ import {
   type Target
 } from "@joko/contracts";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import {
@@ -182,6 +184,60 @@ describe("Mobile Automation product chain", () => {
     );
     expect(reread.state).toBe(ScheduleState.DISABLED);
     expect(reread.version?.revision?.value).toBeGreaterThan(current.version!.revision!.value);
+  });
+
+  it("clears a recurring Automation at its cutoff before its first due occurrence", async () => {
+    const realNow = Date.now;
+    const cutoff = Date.UTC(2027, 0, 1);
+    const next = Date.UTC(2027, 0, 2);
+    let offset = Date.UTC(2026, 11, 31, 12) - realNow();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + offset);
+    try {
+      const host = fixture = await OrchestratorE2eFixture.start();
+      const owner = await host.pair("Automation cutoff owner");
+      const at = (milliseconds: number) => create(TimestampSchema, { seconds: BigInt(milliseconds / 1000) });
+      const recurrence = create(ScheduleRecurrenceSchema, { kind: { case: "cron", value: { expression: "0 0 2 1 *" } } });
+      const createSchedule = async (name: string, expires: boolean) => resultSchedule(await submit(
+        owner.clients.operation, owner.connectionId, create(OperationMutationSchema, {
+          payload: { case: "createSchedule", value: create(CreateScheduleMutationSchema, {
+            schedule: create(ScheduleInputSchema, {
+              displayName: name, backendId: host.adapter().id, targetId: host.targetId(), sessionMode: ScheduleSessionMode.FRESH,
+              recurrence, timeZone: "UTC", input: textInput(name), enabled: true,
+              overlapPolicy: ScheduleOverlapPolicy.QUEUE, misfirePolicy: ScheduleMisfirePolicy.RUN_ONCE,
+              execution: create(ScheduleExecutionSnapshotSchema, {
+                permissionMode: PermissionMode.ASK,
+                ...(expires ? { expireAt: at(cutoff) } : {})
+              })
+            })
+          }) }
+        })
+      ));
+      const original = await createSchedule("Expired Automation must not run", true);
+      const other = await createSchedule("Unexpired Automation runs normally", false);
+      const read = async (scheduleId: string) => required((await owner.clients.scheduler.getSchedule({ scheduleId })).schedule, "Automation detail");
+      expect(await read(original.scheduleId)).toMatchObject({ state: ScheduleState.ENABLED, nextTriggerAt: at(next) });
+
+      offset = cutoff - realNow();
+      await host.application.scheduler.tick();
+      const expired = await read(original.scheduleId);
+      expect(expired.state).toBe(ScheduleState.DISABLED);
+      expect(expired.nextTriggerAt).toBeUndefined();
+      expect(expired.execution?.expireAt).toMatchObject(at(cutoff));
+      expect(host.application.store.getSchedule(original.scheduleId)).toMatchObject({ enabled: false });
+      expect(host.application.store.getSchedule(original.scheduleId).nextRunAt).toBeUndefined();
+      const catalog = await owner.clients.scheduler.listSchedules({});
+      const listed = required(catalog.schedules.find((entry) => entry.scheduleId === original.scheduleId), "expired Automation in catalog");
+      expect(listed.state).toBe(ScheduleState.DISABLED);
+      expect(listed.nextTriggerAt).toBeUndefined();
+      expect(await read(other.scheduleId)).toMatchObject({ state: ScheduleState.ENABLED, nextTriggerAt: at(next) });
+
+      offset = next - realNow();
+      await host.application.scheduler.tick();
+      await waitFor(() => owner.clients.scheduler.listScheduleRunHistory({ scheduleId: other.scheduleId }),
+        (response) => response.history[0]?.outcome === ScheduleRunOutcome.SUCCEEDED, "unexpired Automation to trigger");
+      expect((await owner.clients.scheduler.listScheduleRunHistory({ scheduleId: original.scheduleId })).history).toEqual([]);
+      expect(host.adapter().sendCalls.map((call) => call.text)).toEqual(["Unexpired Automation runs normally"]);
+    } finally { clock.mockRestore(); }
   });
 
   it("consumes a future one-shot when the Owner uses Run Now", async () => {

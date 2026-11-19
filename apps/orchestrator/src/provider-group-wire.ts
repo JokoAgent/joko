@@ -59,13 +59,22 @@ export function toGroupAccountUsage(value: ProviderAccountUsageSnapshot): contra
     modelWindows: value.modelWindows?.map(scoped => ({ ...scoped, window: window(scoped.window) })), resetCredits: value.resetCredits === undefined ? undefined : { ...value.resetCredits,
       earliestExpiryAt: value.resetCredits.earliestExpiryAt === undefined ? undefined : toProtoTimestamp(value.resetCredits.earliestExpiryAt) } });
 }
-export function fromGroupAccountUsage(value: contract.ProviderAccountUsageSnapshot | undefined): ProviderAccountUsageSnapshot | undefined {
+export function fromGroupAccountUsage(
+  value: contract.ProviderAccountUsageSnapshot | undefined,
+  options?: { readonly includeBuckets?: boolean }
+): ProviderAccountUsageSnapshot | undefined {
   const observedAt = fromProtoTimestamp(value?.observedAt); if (!value || observedAt === undefined) return undefined;
   const window = (value: contract.ProviderAccountUsageWindow | undefined): ProviderAccountUsageWindow | undefined => value === undefined ? undefined : { usedPercent: value.usedPercent,
     ...(value.windowMinutes === undefined ? {} : { windowMinutes: value.windowMinutes }), ...(value.severity === undefined ? {} : { severity: value.severity }),
     ...(value.resetAt === undefined ? {} : { resetAt: fromProtoTimestamp(value.resetAt)! }) };
   return { providerId: value.providerId, observedAt, ...(value.primaryWindow ? { primaryWindow: window(value.primaryWindow)! } : {}), ...(value.secondaryWindow ? { secondaryWindow: window(value.secondaryWindow)! } : {}),
     ...(value.limitReached === undefined ? {} : { limitReached: value.limitReached }),
+    ...(options?.includeBuckets && value.buckets.length > 0 ? { buckets: value.buckets.map(bucket => ({
+      id: bucket.id, ...(bucket.displayName === undefined ? {} : { displayName: bucket.displayName }),
+      ...(bucket.primaryWindow ? { primaryWindow: window(bucket.primaryWindow)! } : {}),
+      ...(bucket.secondaryWindow ? { secondaryWindow: window(bucket.secondaryWindow)! } : {}),
+      ...(bucket.limitReached === undefined ? {} : { limitReached: bucket.limitReached })
+    })) } : {}),
     modelWindows: value.modelWindows.flatMap(scoped => scoped.window ? [{ displayName: scoped.displayName, ...(scoped.modelId === undefined ? {} : { modelId: scoped.modelId }), window: window(scoped.window)! }] : []) };
 }
 export function exactNumber(value: bigint): number { const result = Number(value); if (!Number.isSafeInteger(result) || result < 0) throw new Error("Provider group number exceeds exact capacity."); return result; }

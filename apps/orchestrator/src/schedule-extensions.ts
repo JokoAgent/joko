@@ -1,4 +1,19 @@
+import type { ScheduleRecord } from "@joko/store";
 import type { ScheduleScriptCapability } from "./schedule-script-runner.js";
+
+export function boundOneShotScheduleProvider(schedule: Pick<ScheduleRecord, "kind" | "sessionMode" | "sessionId" | "executionSnapshot">): string | undefined {
+  if (schedule.kind !== "one_shot" || schedule.sessionMode !== "bound" || schedule.sessionId === undefined
+    || !isRecord(schedule.executionSnapshot) || scheduleExtensionSnapshot(schedule.executionSnapshot).executionMode !== "agent") return undefined;
+  const providerId = schedule.executionSnapshot["providerId"];
+  return typeof providerId === "string" && providerId.length > 0 ? providerId : undefined;
+}
+
+export function scheduleNativeSubscriptionKey(snapshot: unknown): string | undefined {
+  if (!isRecord(snapshot) || snapshot["nativeSubscriptionAccountKey"] === undefined) return undefined;
+  const key = snapshot["nativeSubscriptionAccountKey"];
+  if (typeof key !== "string" || !/^[a-f0-9]{64}$/u.test(key)) throw new Error("The saved Schedule account identity is invalid.");
+  return key;
+}
 
 export interface SchedulePreRunHookConfiguration {
   readonly command: string;

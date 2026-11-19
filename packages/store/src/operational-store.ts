@@ -9837,6 +9837,10 @@ export class OperationalStore {
       if (input.suppressTerminalAttention === true && input.state !== "completed") {
         throw new StoreError("Only successful terminal Run attention can be suppressed.");
       }
+      if (input.notifyScheduleRunMobile === true && (current.descriptor.source !== "schedule" || input.state !== "completed"
+        || input.suppressTerminalAttention !== true || input.markScheduleRunRead === true)) {
+        throw new StoreError("A Mobile Schedule notice requires an unread successful Scheduler Run.");
+      }
       if (input.holdTerminalAttention === true && input.state !== "failed") throw new StoreError("Only a failed Run recovery may hold terminal attention.");
       if (
         input.markScheduleRunRead === true
@@ -9940,6 +9944,15 @@ export class OperationalStore {
             `${input.traceId}:attention-suppressed`,
             input.operationId
           );
+          if (input.notifyScheduleRunMobile === true && !session.descriptor.archived && session.descriptor.deletedAt === undefined
+            && session.descriptor.remoteWorkspace === undefined && this.findScheduleRunByRunId(input.runId)?.sessionId === session.descriptor.id) {
+            const target = this.getTarget(session.descriptor.targetId).descriptor;
+            if (target.trusted && target.remoteWorkspace === undefined) {
+              this.enqueueMobilePushDeliveries(session, {
+                kind: "done", subjectCursor: sourceEvent.globalCursor, subjectGeneration: sourceEvent.generation
+              }, sourceEvent.emittedAt, input.runId);
+            }
+          }
         } else {
           this.recordTerminalSessionAttention(
             session,
@@ -15060,13 +15073,15 @@ export class OperationalStore {
    * surrounding Store transaction commits. */
   private enqueueMobilePushDeliveries(
     session: StoredSession,
-    attention: SessionAttentionRecord,
-    at: number
+    attention: Pick<SessionAttentionRecord, "kind" | "subjectCursor" | "subjectGeneration">,
+    at: number,
+    runId?: string
   ): void {
     if (session.descriptor.hidden || this.suppressSessionNotifications?.(session.descriptor.id) === true) return;
     const message = this.latestMobilePushMessageOrigin(
       session.descriptor.id,
-      attention.subjectCursor
+      attention.subjectCursor,
+      runId
     );
     const registrations = this.database.prepare(`
       SELECT registration.id
@@ -15109,7 +15124,8 @@ export class OperationalStore {
 
   private latestMobilePushMessageOrigin(
     sessionId: string,
-    throughCursor: bigint
+    throughCursor: bigint,
+    runId: string | undefined
   ): { readonly messageId: string; readonly eventId: string } | undefined {
     const nativeVisibility = this.nativeMessageSearchVisibility(
       { kind: "session", id: sessionId },
@@ -15122,6 +15138,7 @@ export class OperationalStore {
       LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
       WHERE event.session_id = ?
         AND event.global_cursor <= ?
+        AND (? IS NULL OR event.run_id = ?)
         AND tombstone.event_id IS NULL
         AND json_extract(event.payload_json, '$.payload.type') = 'message_complete'
         AND json_extract(event.payload_json, '$.payload.role') = 'assistant'
@@ -15134,7 +15151,9 @@ export class OperationalStore {
     `).get(
       ...nativeVisibility.params,
       sessionId,
-      asSqlInteger(throughCursor)
+      asSqlInteger(throughCursor),
+      runId ?? null,
+      runId ?? null
     ) as Row | undefined;
     if (row === undefined) return undefined;
     const event = eventFromRow(row);
@@ -15605,6 +15624,30 @@ export class OperationalStore {
     });
   }
 
+  /** A saved task-default Schedule belongs to its original project while
+   * an admitted native handoff can change that same task's execution Backend. */
+  scheduleMatchesSession(
+    schedule: Pick<ScheduleRecord, "id" | "backendId" | "targetId" | "sessionMode" | "sessionId" | "kind" | "executionSnapshot">,
+    session: SessionDescriptor
+  ): boolean {
+    if (session.targetId !== schedule.targetId || (schedule.sessionId !== undefined && session.id !== schedule.sessionId)) return false;
+    if (session.backendId === schedule.backendId) return true;
+    if (schedule.sessionId !== session.id || !isTaskDefaultOneShotSchedule(schedule)) return false;
+    const saved = this.findSchedule(schedule.id);
+    if (saved === undefined || saved.sessionId !== session.id || saved.targetId !== schedule.targetId
+      || saved.backendId !== schedule.backendId || !isTaskDefaultOneShotSchedule(saved)) return false;
+    const target = this.getTarget(schedule.targetId).descriptor;
+    if (!target.trusted || target.managed || target.backendId !== schedule.backendId || target.remoteWorkspace !== undefined
+      || session.remoteWorkspace !== undefined || session.worktree !== undefined || session.hidden === true
+      || session.automationOrigin !== undefined || session.derivationOrigin?.sideChat === true
+      || this.getBackend(schedule.backendId).descriptor.adapterKind !== "pi"
+      || this.getBackend(session.backendId).descriptor.adapterKind !== "hosted") return false;
+    const handoff = new SessionRuntimeHandoffStore(this).read(session.id);
+    return handoff?.parked.some(row => row.backendId === schedule.backendId && row.binding.generation < session.binding.generation) === true
+      && this.findSessionRuntimePolicy(session.id) === undefined
+      && !new TaskShareStore(this).list().some(share => share.sessionId === session.id && share.status === "active");
+  }
+
   upsertSchedule(input: UpsertScheduleInput): ScheduleRecord {
     return this.write(() => {
       if (this.findPendingScheduleDeletionCleanupForSchedule(input.id) !== undefined) {
@@ -15616,10 +15659,7 @@ export class OperationalStore {
       }
       if (input.sessionId !== undefined) {
         const session = this.getSession(input.sessionId);
-        if (
-          session.descriptor.backendId !== input.backendId ||
-          session.descriptor.targetId !== input.targetId
-        ) {
+        if (!this.scheduleMatchesSession(input, session.descriptor)) {
           throw new StoreError("Schedule session does not match its backend and target.");
         }
       }
@@ -15814,6 +15854,17 @@ export class OperationalStore {
     `).all(at, normalizeLimit(limit, 100), normalizeOffset(offset)) as Row[]).map(scheduleFromRow);
   }
 
+  listExpiredEnabledSchedules(at: number, afterId = "", limit = 100): ScheduleRecord[] {
+    this.assertOpen();
+    return (this.database.prepare(`
+      SELECT * FROM schedules
+      WHERE enabled = 1 AND id > ? AND json_extract(execution_snapshot_json, '$.scheduler.format') = 1
+        AND json_type(execution_snapshot_json, '$.scheduler.expireAt') = 'integer'
+        AND json_extract(execution_snapshot_json, '$.scheduler.expireAt') BETWEEN 0 AND ?
+      ORDER BY id LIMIT ?
+    `).all(afterId, at, normalizeLimit(limit, 100)) as Row[]).map(scheduleFromRow);
+  }
+
   /** Repair the retained future time only while the successful Agent admission
    * transaction still owns the Schedule revision. Edits and pauses own a new revision. */
   reconcileConsumedOneShotSchedules(): void {
@@ -15886,12 +15937,16 @@ export class OperationalStore {
       const schedule = this.getSchedule(scheduleId);
       const run = this.getRun(runId);
       const session = this.getSession(run.descriptor.sessionId);
-      if (
-        (schedule.sessionId !== undefined && schedule.sessionId !== session.descriptor.id) ||
-        schedule.targetId !== session.descriptor.targetId ||
-        schedule.backendId !== session.descriptor.backendId
-      ) {
-        throw new StoreError("Schedule run does not match the schedule routing.");
+      if (!this.scheduleMatchesSession(schedule, session.descriptor)) {
+        const previous = this.findScheduleRunByRunId(runId);
+        const item = this.findQueueItemByRunId(session.descriptor.id, runId, { includeCleared: true });
+        const admission = item === undefined ? undefined : this.findOperation(item.operationId);
+        if (previous?.scheduleId !== scheduleId || previous.sessionId !== session.descriptor.id
+          || admission?.kind !== "schedule_dispatch" || !isRecord(admission.body)
+          || admission.body["scheduleId"] !== scheduleId || admission.body["sessionId"] !== session.descriptor.id
+          || typeof admission.body["boundBackendId"] !== "string") {
+          throw new StoreError("Schedule run does not match the schedule routing.");
+        }
       }
       return this.upsertScheduleRunHistory({
         schedule,
@@ -22598,6 +22653,18 @@ function interactionFromRow(row: Row): InteractionRecord {
     ...optionalNumber("resolvedAt", row["resolved_at"]),
     revision: toBigInt(row["revision"])
   };
+}
+
+function isTaskDefaultOneShotSchedule(schedule: Pick<ScheduleRecord, "kind" | "sessionMode" | "executionSnapshot">): boolean {
+  const snapshot = schedule.executionSnapshot;
+  if (schedule.kind !== "one_shot" || schedule.sessionMode !== "bound" || !isRecord(snapshot)) return false;
+  const scheduler = snapshot["scheduler"];
+  return isRecord(scheduler) && scheduler["format"] === 1 && scheduler["executionMode"] === "agent"
+    && scheduler["scriptConfig"] === undefined && scheduler["preRunHook"] === undefined
+    && ["providerId", "modelId", "effort", "fastMode", "nativeSubscriptionAccountKey", "partnerRoutine", "projectAutomation", "worktreeSourceRef"]
+      .every(key => snapshot[key] === undefined)
+    && snapshot["useWorktree"] !== true && snapshot["refreshWorktreeRemote"] !== true
+    && (snapshot["extraDirectoryIds"] === undefined || Array.isArray(snapshot["extraDirectoryIds"]) && snapshot["extraDirectoryIds"].length === 0);
 }
 
 function scheduleFromRow(row: Row): ScheduleRecord {

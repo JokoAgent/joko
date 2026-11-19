@@ -39,6 +39,7 @@ import type {
   AcceptedNativeTurnOutcome,
   NativeSessionState,
   NativeSessionStart,
+  NativeSubscriptionAuthority,
   MessageAutomationOrigin,
   MessageBlock,
   MessageInputDelivery,
@@ -106,6 +107,7 @@ import type { PendingRuntimeHandoff, RuntimeHandoffSource } from "@joko/store";
 import type { ImportProbeAction } from "@joko/agent-import";
 import { assertPersonalDevelopmentInput, PERSONAL_DEVELOPMENT_PURPOSE_KEY, readPersonalDevelopmentPurpose } from "./personal-development-purpose.js";
 import { buildSessionHandoffText, sessionHandoffMessages } from "./session-handoff-text.js";
+import { boundOneShotScheduleProvider, scheduleNativeSubscriptionKey } from "./schedule-extensions.js";
 import type { ProviderGroupRuntime } from "./provider-group-runtime.js";
 import type { ProviderGroupSessionPort, ProviderGroupRecoveryLease, ProviderGroupRecoveryHandoff } from "./provider-group-service.js";
 import type { ProviderGroupAssignment } from "./provider-group-router.js";
@@ -3778,18 +3780,54 @@ export class SessionHost {
     return execution;
   }
 
+  async captureScheduleSubscription(
+    schedule: Pick<ScheduleRecord, "backendId" | "targetId" | "kind" | "sessionMode" | "sessionId" | "executionSnapshot">,
+    signal?: AbortSignal
+  ): Promise<NativeSubscriptionAuthority | undefined> {
+    const providerId = boundOneShotScheduleProvider(schedule);
+    if (providerId === undefined || this.#store.getTarget(schedule.targetId).descriptor.remoteWorkspace !== undefined) return undefined;
+    const adapter = this.#adapters.get(schedule.backendId);
+    const authority = await adapter?.captureNativeSubscriptionAuthority?.(providerId, signal).catch(() => { throw scheduledSubscriptionChanged(); });
+    if (authority === undefined) return undefined;
+    const assertCurrent = () => {
+      if (this.#adapters.get(schedule.backendId) !== adapter) throw scheduledSubscriptionChanged();
+      this.assertProviderAuthenticationAvailable(schedule.backendId, providerId);
+      authority.assertCurrent();
+    };
+    assertCurrent();
+    return { accountKey: authority.accountKey, assertCurrent };
+  }
+
   enqueueScheduledInput(input: {
     readonly operationId: string;
     readonly schedule: ScheduleRecord;
     readonly sessionId: string;
     readonly scheduledAt: number;
+    readonly boundBackendId?: string;
     readonly nextRunAt?: number;
   }): OperationExecution<EnqueueResult> {
     const sessionId = input.sessionId;
-    this.assertBackendAdmissionOpen(this.#store.getSession(sessionId).descriptor.backendId);
+    const session = this.#store.getSession(sessionId).descriptor;
+    this.assertBackendAdmissionOpen(session.backendId);
     this.assertSessionNotPendingScheduleDeletion(sessionId);
     this.assertMessageDeletionAdmission(sessionId);
-    const overrides = scheduleTurnOverrides(input.schedule.executionSnapshot);
+    const savedOverrides = scheduleTurnOverrides(input.schedule.executionSnapshot);
+    let overrides = savedOverrides;
+    if (input.boundBackendId !== undefined) {
+      if (session.backendId !== input.boundBackendId || !this.#store.scheduleMatchesSession(input.schedule, session)
+        || session.providerId === undefined || session.modelId === undefined) {
+        throw new StoreError("The Schedule lost its adopted task Backend before admission.");
+      }
+      overrides = {
+        ...savedOverrides,
+        providerId: session.providerId,
+        modelId: session.modelId,
+        ...(session.effort === undefined ? {} : { effort: session.effort }),
+        fastMode: session.fastMode,
+        permissionMode: savedOverrides?.permissionMode ?? session.permissionMode,
+        planMode: savedOverrides?.planMode ?? session.planMode
+      };
+    }
     let acceptedPrompt = input.schedule.prompt;
     let validationCause: unknown;
     let validationFailure: PublicError | undefined;
@@ -3819,7 +3857,8 @@ export class SessionHost {
       sessionId,
       scheduledAt: input.scheduledAt,
       prompt: acceptedPrompt,
-      executionSnapshot: input.schedule.executionSnapshot
+      executionSnapshot: input.schedule.executionSnapshot,
+      ...(input.boundBackendId === undefined ? {} : { boundBackendId: input.boundBackendId })
     };
     const execution = this.#store.runOperation(
       { id: input.operationId, kind: "schedule_dispatch", body },
@@ -14983,6 +15022,18 @@ export class SessionHost {
         )) return;
         if (!bypassesCompaction && this.compactionBlocksDispatch(sessionId)) return;
         const claimSession = this.#store.getSession(sessionId);
+        const scheduled = this.#store.getRun(pending.runId).descriptor.source === "schedule";
+        const scheduleAdmission = scheduled ? this.#store.findOperation(pending.operationId) : undefined;
+        if (scheduleAdmission?.kind === "schedule_dispatch" && isRecord(scheduleAdmission.body)
+          && typeof scheduleAdmission.body["boundBackendId"] === "string"
+          && scheduleAdmission.body["boundBackendId"] !== claimSession.descriptor.backendId) {
+          this.#failExpiredApplicationInput(pending, {
+            code: "SCHEDULE_EXECUTION_SNAPSHOT_FAILED", message: "The task changed Backend after the Schedule triggered.",
+            phase: "schedule", retryable: false, stateMayHaveChanged: false,
+            recovery: "Open the Schedule and trigger it again for the current task Backend."
+          });
+          continue;
+        }
         if (this.#backendDispatchBlocked(claimSession.descriptor.backendId)) return;
         if (this.localCodexPlanReviewBlocksDispatch(claimSession)) return;
         const authenticationFailure = this.queueProviderAuthenticationFailure(pending, claimSession);
@@ -14999,8 +15050,7 @@ export class SessionHost {
           });
           continue;
         }
-        const scheduleGate = this.#store.getRun(pending.runId).descriptor.source === "schedule"
-          ? this.#scheduleDispatchGate : undefined;
+        const scheduleGate = scheduled ? this.#scheduleDispatchGate : undefined;
         if (scheduleGate?.acquire(pending.runId) === false) return;
         let claimedItem: ReturnType<OperationalStore["claimNextQueueItem"]>;
         try {
@@ -15315,10 +15365,20 @@ export class SessionHost {
             this.#providerGroups?.service.turnStarted(sessionId);
               this.#providerGroups?.reporter.leasesChanged();
           }
+          const scheduleAdmission = run.descriptor.source === "schedule" ? this.#store.findOperation(item.operationId) : undefined;
+          const scheduleAccountKey = scheduleAdmission?.kind === "schedule_dispatch" && isRecord(scheduleAdmission.body)
+            ? scheduleNativeSubscriptionKey(scheduleAdmission.body["executionSnapshot"]) : undefined;
           const send = () => {
             telegramHistory?.assertCurrent();
             if (!reviewReadOnly && sending.adapter.sendWithDurableNativeDispatchFence !== undefined) {
-              return sending.adapter.sendWithDurableNativeDispatchFence(dispatchBody, sendContext, (preparation) => {
+              return sending.adapter.sendWithDurableNativeDispatchFence(dispatchBody, sendContext, async (preparation) => {
+                if (scheduleAccountKey !== undefined) {
+                  const providerId = item.executionOverrides?.providerId;
+                  const authority = providerId === undefined ? undefined : await sending.adapter.captureNativeSubscriptionAuthority?.(providerId, sendContext.signal)
+                    .catch(() => undefined);
+                  if (authority?.accountKey !== scheduleAccountKey) throw scheduledSubscriptionChanged();
+                  authority.assertCurrent();
+                }
                 telegramHistory?.assertCurrent();
                 this.assertDispatchAdmissionOwner(
                   item,
@@ -15342,6 +15402,7 @@ export class SessionHost {
                 );
               });
             }
+            if (scheduleAccountKey !== undefined) throw scheduledSubscriptionChanged();
             return sending.adapter.send(dispatchBody, sendContext);
           };
           if (telegramHistory === undefined) await send();
@@ -17080,6 +17141,7 @@ export class SessionHost {
         ...(scheduleAttention?.suppressAttention === true ? { suppressTerminalAttention: true } : {}),
         ...(groupRecovery ? { holdTerminalAttention: true } : {}),
         ...(scheduleAttention?.markHistoryRead === true ? { markScheduleRunRead: true } : {}),
+        ...(scheduleAttention?.notifyMobile === true ? { notifyScheduleRunMobile: true } : {}),
         traceId: `settled:${run.descriptor.id}`
       };
       const settleInput = (store: OperationalStore): void => {
@@ -17429,7 +17491,10 @@ export class SessionHost {
       currencyCode
     });
     if (scheduleUsage !== undefined && result.changed) {
-      const valueEstimate = usageMoneyKind !== "actual-cost";
+      const userPricedCodexUsage = backend.adapterKind === "codex" && model?.api === "openai-responses"
+        && reportedCostMicros === undefined && result.estimated && priceOverride?.values.input !== undefined
+        && priceOverride.values.output !== undefined;
+      const valueEstimate = usageMoneyKind !== "actual-cost" || userPricedCodexUsage;
       const approximate = valueEstimate || result.estimated;
       const estimateReasons = valueEstimate || result.estimated
         ? usageMoneyKind === "subscription-value"
@@ -17824,6 +17889,7 @@ export class SessionHost {
           ...(error === undefined ? {} : { error }),
           ...(scheduleAttention?.suppressAttention === true ? { suppressTerminalAttention: true } : {}),
           ...(scheduleAttention?.markHistoryRead === true ? { markScheduleRunRead: true } : {}),
+          ...(scheduleAttention?.notifyMobile === true ? { notifyScheduleRunMobile: true } : {}),
           traceId: `native-recovery:${recovered.baseline.runId}:${state}`,
           operationId: recovered.baseline.operationId
         });
@@ -20786,6 +20852,11 @@ function providerAuthenticationRequiredFailure(): PublicError {
 
 function providerAuthenticationRequiredError(): JokoError {
   return new JokoError(providerAuthenticationRequiredFailure());
+}
+
+function scheduledSubscriptionChanged(): JokoError {
+  return new JokoError({ code: "SCHEDULE_ACCOUNT_CHANGED", message: "The original Schedule subscription account is unavailable or has changed.",
+    phase: "schedule", retryable: false, stateMayHaveChanged: false, recovery: "Open the Schedule and save it with the intended account." });
 }
 
 function backendAuthenticationRequiredFailure(backend: BackendDescriptor): PublicError {

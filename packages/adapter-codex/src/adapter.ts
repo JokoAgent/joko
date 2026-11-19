@@ -63,6 +63,7 @@ import {
   type NativeHistoryProjection,
   type NativeNavigationTarget,
   type NativeSessionState,
+  type NativeSubscriptionAuthority,
   type PermissionMode,
   type PromptInput,
   type ProviderModel,
@@ -2840,6 +2841,28 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       } });
   }
 
+  async captureNativeSubscriptionAuthority(providerId: string, signal?: AbortSignal): Promise<NativeSubscriptionAuthority | undefined> {
+    if (this.#hosted !== undefined || providerId !== this.#providerId) return undefined;
+    this.#assertOpen();
+    signal?.throwIfAborted();
+    const epoch = this.#nativeAuthenticationEpoch, loginEpoch = this.#accountUsageLoginEpoch;
+    const generation = await this.#ensureLocalHostStarted(), host = this.#host;
+    const assertCurrent = () => {
+      this.#assertOpen();
+      signal?.throwIfAborted();
+      this.#assertNativeAuthenticationAdmission(epoch);
+      if (host !== this.#host || !host.isActiveGeneration(generation) || loginEpoch !== this.#accountUsageLoginEpoch
+        || this.#accountUsageLoginRequests > 0 || this.#account?.authenticationState === "pending") throw nativeAuthenticationObservationStale();
+    };
+    assertCurrent();
+    const home = host.initializeResult?.codexHome;
+    if (!home) throw new Error("The native account profile is unavailable.");
+    const environment = this.#ownedHostOptions?.transport?.env ?? process.env;
+    const account = await readCodexOwnedAuthentication(home, environment["OPENAI_API_KEY"] ?? environment["CODEX_API_KEY"]);
+    assertCurrent();
+    return account.kind === "chatgpt" ? { accountKey: codexSubscriptionAccountKey(this.id, providerId, account.principal), assertCurrent } : undefined;
+  }
+
   async inferNativeText(input: NativeTextInferenceInput): Promise<string> {
     this.#assertOpen();
     this.#hosted?.assertModel(input.providerId, input.modelId);
@@ -3056,7 +3079,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const readAccount = async () => {
       assertCurrent(); const account = await readCodexOwnedAuthentication(home, environmentApiKey); assertCurrent();
       if (account.kind !== "chatgpt") throw new Error("The account reset requires the original subscription account.");
-      const accountKey = createHash("sha256").update(JSON.stringify([this.id, this.#providerId, account.principal])).digest("hex");
+      const accountKey = codexSubscriptionAccountKey(this.id, this.#providerId, account.principal);
       if (originalKey !== undefined && originalKey !== accountKey) throw new Error("The original reset account changed.");
       originalKey = accountKey; return { accountKey, accountLabel: `…${account.tokens.chatgptAccountId.slice(-6)}` };
     };
@@ -7920,6 +7943,10 @@ function accountSnapshot(account: JsonValue | undefined, requiresAuthentication:
     loginMethods: CODEX_LOGIN_METHODS,
     ...(isJsonObject(account) && typeof account["type"] === "string" ? { authMode: account["type"] } : {})
   };
+}
+
+function codexSubscriptionAccountKey(backendId: string, providerId: string, principal: string): string {
+  return createHash("sha256").update(JSON.stringify([backendId, providerId, principal])).digest("hex");
 }
 
 function codexAccountModelsAvailable(state: BackendDescriptor["authenticationState"]): boolean {
