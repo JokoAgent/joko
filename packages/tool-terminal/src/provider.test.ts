@@ -288,6 +288,39 @@ describe("TerminalProvider", () => {
     } finally { restored.dispose(); await fixture.dispose(); }
   });
 
+  test.each([undefined, 0])("keeps the normal scrolling margins across RESET for cursor %s", async afterSequence => {
+    const fixture = await setup({ maximumOutputFrames: 2 });
+    const options = { cols: 20, rows: 6, allowProposedApi: true, logLevel: "off" as const };
+    const restored = new Terminal(options), current = new Terminal(options);
+    const visibleRows = (terminal: Terminal) => Array.from({ length: 5 }, (_, index) =>
+      terminal.buffer.normal.getLine(terminal.buffer.normal.baseY + index)!.translateToString(true));
+    try {
+      const descriptor = await fixture.provider.create({ ...fixture.scope, id: "scroll-region", cols: options.cols, rows: options.rows });
+      const reference = ref(fixture.scope, descriptor), pty = fixture.ptys[0]!;
+      pty.output("\x1b[2;");
+      pty.output("4r\x1b[1;1HA\x1b[2;1HB\x1b[3;1HC\x1b[4;1HD");
+      pty.output("\x1b[5;1HE");
+      const stream = fixture.provider.stream({ ...reference, appearance: appearance(), ...(afterSequence === undefined ? {} : { afterSequence }) });
+      try {
+        const checkpoint = (await stream.next()).value;
+        if (!checkpoint || checkpoint.kind !== "reset") throw new Error("The view did not receive a RESET checkpoint.");
+        await parsed(restored, checkpoint.serialized);
+        expect(visibleRows(restored)).toEqual(["A", "B", "C", "D", "E"]);
+        expect([restored.buffer.normal.cursorX, restored.buffer.normal.cursorY]).toEqual([1, 4]);
+        pty.output("\x1b[4;1H\x1bDZ");
+        const delta = (await stream.next()).value;
+        if (!delta || delta.kind !== "output") throw new Error("The view did not receive the next PTY output.");
+        expect(delta.generation).toBe(descriptor.generation);
+        await parsed(restored, delta.data);
+        await parsed(current, (await fixture.provider.snapshot(reference)).serialized);
+        expect(visibleRows(current)).toEqual(["A", "C", "D", "Z", "E"]);
+        expect(visibleRows(restored)).toEqual(visibleRows(current));
+        expect(pty.writes).toEqual([]);
+        expect(pty.killCalls).toBe(0);
+      } finally { await stream.return!(); }
+    } finally { current.dispose(); restored.dispose(); await fixture.dispose(); }
+  });
+
   test("retains five thousand history lines across reattachment while evicting older output", async () => {
     const fixture = await setup();
     const restored = new Terminal({ cols: 40, rows: 10, scrollback: 5_000, allowProposedApi: true, logLevel: "off" });

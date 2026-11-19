@@ -98,6 +98,7 @@ interface TerminalRecord {
   readonly serializer: SerializeAddon;
   readonly colors: TerminalColorState;
   readonly framer: TerminalOutputFramer;
+  readonly normalScrollRegion: { top: number; bottom: number };
   readonly lifetime: AbortController;
   readonly subscriptions: { dispose(): void }[];
   readonly wake: Set<() => void>;
@@ -375,7 +376,8 @@ export class TerminalProvider {
       await old.queue;
       await this.#stopProcess(old);
       signal.throwIfAborted();
-      const checkpoint = this.#serialize(old);
+      // Keep the former display, but let the new shell start with default margins.
+      const checkpoint = this.#serialize(old, false);
       const runtime = await this.#runtime(old.scope, signal);
       const shell = old.scope.remoteWorkspace === undefined ? old.shell : await this.#selectShell(runtime, old.shell.id, signal);
       const directory = await abortable(runtime.canonicalDirectory(old.scope.workspaceRoot, scopePaths(old.scope).relative(old.scope.workspaceRoot, old.descriptor.cwd)), signal);
@@ -478,13 +480,33 @@ export class TerminalProvider {
     const exited = new Promise<void>((done) => { notifyExit = done; });
     const record: TerminalRecord = {
       scope: { ...scope }, createKey, shell: { ...shell, args: [...shell.args] }, pty, screen, serializer, colors,
-      framer: new TerminalOutputFramer(), lifetime: new AbortController(), subscriptions: [], wake: new Set(), frames: [],
+      framer: new TerminalOutputFramer(), normalScrollRegion: { top: 1, bottom: rows },
+      lifetime: new AbortController(), subscriptions: [], wake: new Set(), frames: [],
       views: new Map(), defaultViewId: undefined, controlViewId: undefined, appearanceRevision: 1, viewOrder: 0,
       descriptor: { id, sessionId: scope.sessionId, targetId: scope.targetId, generation: ++this.#generation, status: "running", exitConfirmed: false, shellId: shell.id, shellLabel: shell.label, cwd, cols, rows,
         ...(pty.pid === undefined ? {} : { pid: pty.pid }), createdAt: timestamp, updatedAt: timestamp },
       queue: Promise.resolve(), sequence: 0, retainedBytes: 0, pendingBytes: 0, bytesSinceCapacityCheck: 0,
       acceptingInput: true, outputPaused: false, processExited: false, processExitConfirmed: false, failurePending: false, exited, notifyExit, removed: false, restarting: false, streams: 0
     };
+    const region = record.normalScrollRegion;
+    const resetRegion = () => { region.top = 1; region.bottom = screen.rows; };
+    record.subscriptions.push(
+      screen.parser.registerCsiHandler({ final: "r" }, params => {
+        if (screen.buffer.active.type === "normal") {
+          const [first, last] = params.filter((value): value is number => typeof value === "number");
+          const top = first || 1;
+          const bottom = !last || last > screen.rows ? screen.rows : last;
+          if (bottom > top) { region.top = top; region.bottom = bottom; }
+        }
+        return false;
+      }),
+      screen.parser.registerCsiHandler({ intermediates: "!", final: "p" }, () => {
+        if (screen.buffer.active.type === "normal") resetRegion();
+        return false;
+      }),
+      screen.parser.registerEscHandler({ final: "c" }, () => { resetRegion(); return false; }),
+      screen.onResize(resetRegion)
+    );
     for (const identifier of TERMINAL_COLOR_OSC_IDENTIFIERS) record.subscriptions.push(screen.parser.registerOscHandler(identifier, (data) => {
       const result = colors.consumeOsc(identifier, data);
       if (result.replies.length > 0) this.#protocol(record, result.replies.join(""));
@@ -627,8 +649,18 @@ export class TerminalProvider {
     return { terminal: { ...record.descriptor }, sequence: record.sequence, serialized: this.#serialize(record), activeColorOverrides: record.colors.replayColors(), appearanceRevision: record.appearanceRevision };
   }
 
-  #serialize(record: TerminalRecord): string {
-    const serialized = record.colors.replayColors() + record.serializer.serialize({ scrollback: this.#scrollbackLines });
+  #serialize(record: TerminalRecord, restoreScrollRegion = true): string {
+    let serialized = record.colors.replayColors() + record.serializer.serialize({ scrollback: this.#scrollbackLines });
+    const { screen, normalScrollRegion: { top, bottom } } = record;
+    const cursor = screen.buffer.active;
+    if (restoreScrollRegion && cursor.type === "normal" && (top !== 1 || bottom !== screen.rows) && cursor.cursorX < screen.cols) {
+      const row = cursor.cursorY + 1;
+      const origin = screen.modes.originMode;
+      if (!origin || (row >= top && row <= bottom)) {
+        // Set margins after drawing the buffer. DECSTBM homes the cursor, so restore it in the active origin mode.
+        serialized += `\x1b[${top};${bottom}r\x1b[${origin ? row - top + 1 : row};${cursor.cursorX + 1}H`;
+      }
+    }
     if (Buffer.byteLength(serialized) > TERMINAL_LIMITS.maximumSnapshotBytes) {
       throw new TerminalError("OUTPUT_LIMIT", "The terminal screen exceeds the bounded snapshot limit.");
     }
