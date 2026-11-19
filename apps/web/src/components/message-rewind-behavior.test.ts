@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { CapabilityView, TargetView, TimelineItemView, WorkspaceChangeSetView } from "../model.js";
-import { canEditVisibleUserMessage, changeSetForMessageRound, lastVisibleUserMessage, messageDialogueRewindTarget, messageRoundRunId, sessionCapabilitySupportsTarget } from "./message-rewind-behavior.js";
+import { canEditVisibleUserMessage, changeSetForMessageRound, isPersistedStopEditSource, lastVisibleUserMessage, messageDialogueRewindTarget, messageRoundRunId, sessionCapabilitySupportsTarget } from "./message-rewind-behavior.js";
 
 describe("message rewind boundaries", () => {
   it("applies only the advertised start scope and rejects unknown or incomplete scope authority", () => {
@@ -44,6 +44,18 @@ describe("message rewind boundaries", () => {
     expect(messageDialogueRewindTarget(last!)).toEqual({ kind: "native_entry", entryId: "parent-2" });
     expect(canEditVisibleUserMessage({ ...last!, attachments: [{ id: "a", blobId: "b", sourceRevealAvailable: false, title: "x", kind: "file", fileName: "x", mediaType: "text/plain", byteSize: 1 }] })).toBe(true);
     expect(canEditVisibleUserMessage({ ...last!, text: "", attachments: [{ id: "a", blobId: "b", sourceRevealAvailable: false, title: "x", kind: "file", fileName: "x", mediaType: "text/plain", byteSize: 1 }] })).toBe(false);
+  });
+
+  it("retains a stop edit only for the newer native projection of its exact accepted input", () => {
+    const live: TimelineItemView = { ...message("entry", "user", "parent"), nativeEntryId: "entry", sourceEventId: "live-event",
+      userInputAccepted: true, runId: "stopped-run", inputOperationId: "stopped-input", completionCursor: 17n };
+    const persisted = { ...live, sourceEventId: `native-event-${"a".repeat(64)}`, completionCursor: 24n };
+    expect(isPersistedStopEditSource(live, persisted)).toBe(true);
+    for (const change of [
+      { sourceEventId: "other-live-event" }, { completionCursor: 16n }, { userInputAccepted: undefined },
+      { nativeEntryId: "other-entry" }, { runId: "other-run" }, { inputOperationId: "other-input" }, { text: "Different text" },
+      { nativeParentEntryId: "other-parent" }, { nativeRewindBefore: { kind: "native_entry" as const, entryId: "other-boundary" } }
+    ]) expect(isPersistedStopEditSource(live, { ...persisted, ...change })).toBe(false);
   });
 
   it("maps the following round to its captured change set without crossing the next user", () => {

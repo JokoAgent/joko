@@ -240,16 +240,31 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
     const cancelled = await submit(manager.clients.operation, manager.connectionId, cancelQueuedInputMutation(pendingResult.value));
     expect(cancelled.state).toBe(OperationState.SUCCEEDED);
 
+    const finalStopGate = new Promise<void>(resolve => { releaseStop = resolve; });
+    abort.mockImplementationOnce(async (...args) => {
+      await finalStopGate;
+      return originalAbort(...args);
+    });
     await runningRow.hover();
     await stopAndEdit.click();
-    await runningRow.locator("textarea").waitFor({ state: "visible" });
+    const finalEdit = "This draft stays through native history synchronization.";
+    await runningRow.locator("textarea").fill(finalEdit);
+    expect(await sendEdit.isDisabled()).toBe(true);
+    await waitFor(() => Promise.resolve(abort.mock.calls.length), count => count === 2, "the second stop for editing");
+    releaseStop!();
     await waitFor(() => manager.clients.run.getRun({ runId: runningRunId }), response => response.run?.state === RunState.ABORTED,
       "the original Run stopped for editing", 15_000);
     expect(abort).toHaveBeenCalledTimes(2);
     expect(abort.mock.calls[1]).toEqual([sessionId, runningRunId, expect.any(Function), expect.objectContaining({
       messageEdit: { ...runningSource, attemptId: activeAttemptId }
     })]);
-    await waitFor(() => sendEdit.isEnabled(), enabled => enabled, "the edit can be confirmed after the original Run stops");
+    const settledEditSource = store.findVisibleSessionMessageOrigin({ sessionId, role: "user", includeRetainedContext: false });
+    if (evidenceDirectory !== undefined) await writeFile(join(evidenceDirectory, "stop-editor-sources.json"),
+      JSON.stringify({ runningSource, settledEditSource, runningRunId, activeAttemptId }));
+    expect(settledEditSource?.messageId).toBe(runningSource.messageId);
+    await waitFor(async () => await sendEdit.count() === 1 && await sendEdit.isEnabled(), enabled => enabled,
+      "the edit can be confirmed after the original Run stops");
+    expect(await runningRow.locator("textarea").inputValue()).toBe(finalEdit);
     await capture("running-input-stopped-for-edit.png");
     const requestsAfterStop = fixture.providerRequests.length;
     await cancelEdit.click();
@@ -265,7 +280,7 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
       nativeBranchUnchangedAfterRejection: true, nativeNavigationRequests: navigation.mock.calls.length,
       editOperationId: navigation.mock.calls[2]![5].operationId,
       editOperationState: store.getOperation(navigation.mock.calls[2]![5].operationId).status,
-      runningSource, runningRunId, activeAttemptId, pendingRunId, rejectedAttemptOperationId: rejected.operationId,
+      runningSource, settledEditSource, runningRunId, activeAttemptId, pendingRunId, rejectedAttemptOperationId: rejected.operationId,
       confirmDisabledDuringStop: true, pendingInputPreserved: true, originalRunStopped: true
     }, null, 2));
     navigation.mockRestore();
