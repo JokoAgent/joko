@@ -14295,10 +14295,12 @@ describe("native current-task Files ownership", () => {
       revision: path === "src" ? currentFile.revision!.opaqueRevision : "root" }));
     const read = vi.mocked(network.readWorkspaceFile).mockImplementation(async () => create(FilePreviewSchema, { entry: currentFile,
       content: { case: "text", value: { utf8Text: currentText, startByte: 0n, endByte: currentFile.revision!.byteSize, totalLines: 1 } } }));
-    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles();
+    let nextId = 0;
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, () => `files-preview-${++nextId}`);
+    await app.start(); await app.openFiles();
     await app.openFilesDirectory("src");
     await app.openFilesPreviewPager({ kind: "workspace-entry", entry: first }, "mtime");
-    const before = app.state.files.previewPager;
+    const before = app.state.files.previewPager!;
     expect(app.state.files.preview).toMatchObject({ kind: "text", text: "original" });
     const reconnect = async () => {
       let inspect!: (identity: NodeIdentity) => void;
@@ -14315,7 +14317,8 @@ describe("native current-task Files ownership", () => {
     expect(app.state.files.location).toEqual({ kind: "workspace", path: "src" });
     expect(app.state.files.preview).toMatchObject({ kind: "text", workspacePath: second.relativePath, text: "updated" });
     expect(app.state.files.previewPager).toMatchObject({ sort: "mtime", index: 0 });
-    expect(app.state.files.previewPager?.id).not.toBe(before?.id);
+    expect(app.state.files.previewPager?.id).not.toBe(before.id);
+    await expect(app.selectFilesPreviewPage(before.id, before.pages[before.index]!.key)).rejects.toThrow(/window was retired/u);
     expect(read.mock.calls.map(([, , path, revision]) => [path, revision])).toEqual([
       [first.relativePath, first.revision], [second.relativePath, second.revision]
     ]);
