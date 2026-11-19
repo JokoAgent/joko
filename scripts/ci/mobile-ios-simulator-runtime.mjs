@@ -470,6 +470,7 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
   const names = ["01-connection-page", "02-saved-nodes", "03-nearby", sdkRuntime === 'http-connect-native' ? "04-webrtc-unavailable" : "04-webrtc-mode", "04-invalid-address", "05-local-identity-error",
     "06-inspection-pending", "07-cancelled-draft-retained", "08-returned-address-draft", "09-dark-theme", "10-light-theme",
     ...(sdkRuntime === 'http-connect-native' ? ['11-http-connect-invitation'] : [])];
+  const progressNames = new Set([...names, "04-https-selected", "04-address-tapped", "04-address-typing", "04-address-typed", "04-address-value-observed"]);
   // A loopback-only Connect error endpoint exercises the real native transport.
   // It never supplies a node identity, challenge, credential or successful pair.
   let requests = 0, unexpectedRequests = 0, screenshotCount = 0;
@@ -481,7 +482,7 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
       response.end(JSON.stringify({ identityRequests: requests })); return;
     }
     const checkpoint = request.url?.startsWith("/ci-probe-progress/") ? request.url.slice("/ci-probe-progress/".length) : undefined;
-    if (request.method === "POST" && testStartedAt !== undefined && names.includes(checkpoint)) {
+    if (request.method === "POST" && testStartedAt !== undefined && progressNames.has(checkpoint)) {
       request.resume();
       if (!progress.some(item => item.attempt === testAttempt && item.checkpoint === checkpoint)) {
         progress.push({ attempt: testAttempt, checkpoint, elapsedMs: Date.now() - testStartedAt });

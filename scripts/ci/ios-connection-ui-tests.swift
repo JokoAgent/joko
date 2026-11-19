@@ -82,10 +82,14 @@ final class JokoConnectionUITests: XCTestCase {
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
-        if reportProgress, let probe = ProcessInfo.processInfo.environment["JOKO_CI_PROBE_PORT"],
+        if reportProgress { reportCheckpoint(name) }
+    }
+
+    private func reportCheckpoint(_ name: String) {
+        if let probe = ProcessInfo.processInfo.environment["JOKO_CI_PROBE_PORT"],
            let url = URL(string: "http://127.0.0.1:\(probe)/ci-probe-progress/\(name)") {
-            // xcodebuild may buffer its test output until completion. Report only
-            // the fixed checkpoint name after the genuine screenshot is attached.
+            // xcodebuild may buffer its test output until completion. Report
+            // only fixed checkpoint names to the owned loopback observer.
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
             request.timeoutInterval = 2
@@ -236,8 +240,10 @@ final class JokoConnectionUITests: XCTestCase {
         }
     }
 
-    private func replace(_ field: XCUIElement, with text: String, knownPublicInvitation: Bool = false) {
+    private func replace(_ field: XCUIElement, with text: String, knownPublicInvitation: Bool = false,
+                         traceFirstAddressEntry: Bool = false) {
         tap(field)
+        if traceFirstAddressEntry { reportCheckpoint("04-address-tapped") }
         // The exact QuickPath checks and final value receipt share the
         // existing 10s value-gate budget; do not replay keyboard input.
         let initialGuideCheck = Date()
@@ -268,7 +274,9 @@ final class JokoConnectionUITests: XCTestCase {
             XCTAssertEqual(clearedResult, .completed,
                            "The native address field must be empty before replacement.")
         }
+        if traceFirstAddressEntry { reportCheckpoint("04-address-typing") }
         field.typeText(text)
+        if traceFirstAddressEntry { reportCheckpoint("04-address-typed") }
         let valueDeadline = Date().addingTimeInterval(max(0, 10 - initialGuideElapsed))
         dismissQuickPathIfPresent(until: valueDeadline)
         // The native guide can appear after typing has returned. Observe it
@@ -353,8 +361,10 @@ final class JokoConnectionUITests: XCTestCase {
         tap(https)
         wait(https, "value == '1'")
         XCTAssertEqual(https.value as? String, "1")
+        reportCheckpoint("04-https-selected")
         let inspect = button("Check node identity")
-        replace(address, with: "not-an-address")
+        replace(address, with: "not-an-address", traceFirstAddressEntry: true)
+        reportCheckpoint("04-address-value-observed")
         wait(inspect, "enabled == false")
         XCTAssertTrue(button("Request pairing").exists)
         XCTAssertTrue(button("Pair this device").exists)
