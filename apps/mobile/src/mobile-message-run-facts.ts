@@ -19,10 +19,11 @@ export function mobileMessageRunFacts(row: TimelineRow, locale: MobileSupportedL
   const tokens = new Intl.NumberFormat(locale, { notation: "compact", maximumFractionDigits: 1 }).format(usage.totalTokens);
   const tokensLabel = mobileMessage(locale, tokensIncomplete ? "task.messageTokensPartial" : "task.messageTokens", { tokens });
   const tokensDescription = tokensIncomplete ? mobileMessage(locale, "task.messageTokensPartialDescription", { tokens }) : undefined;
-  if (usage.costMicros > 0n && usage.costMicros <= BigInt(Number.MAX_SAFE_INTEGER) && /^[A-Z]{3}$/u.test(usage.currencyCode)) {
+  if ((usage.costMicros > 0n || row.usageCostComplete === true)
+    && usage.costMicros <= BigInt(Number.MAX_SAFE_INTEGER) && /^[A-Z]{3}$/u.test(usage.currencyCode)) {
     const amount = Number(usage.costMicros) / 1_000_000;
     const formatter = new Intl.NumberFormat(locale, { style: "currency", currency: usage.currencyCode, maximumFractionDigits: 2 });
-    const cost = amount < 0.01 ? `<${formatter.format(0.01)}` : formatter.format(amount);
+    const cost = amount > 0 && amount < 0.01 ? `<${formatter.format(0.01)}` : formatter.format(amount);
     const usageDescription = mobileMessage(locale, row.usageIsEstimate
         ? incomplete ? "task.messageValueEstimatePartial" : "task.messageValueEstimate"
         : incomplete ? "task.messageCostPartial" : "task.messageCost", { cost });
