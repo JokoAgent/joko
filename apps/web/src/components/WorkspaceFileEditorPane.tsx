@@ -1,4 +1,4 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { AlertTriangle, RotateCcw, Save, Table2 } from "lucide-react";
 
@@ -13,6 +13,7 @@ import {
   reconcileWorkspaceExternalFileUpdate,
   workspaceFileEditorDirty,
   type WorkspaceFileEditorBaseline,
+  type WorkspaceFileReconnectDraft,
   type WorkspaceFileSaveDraft
 } from "./workspace-file-editor.js";
 import {
@@ -92,6 +93,7 @@ export interface WorkspaceFileEditorPaneProps {
   /** Reports the current LF editor buffer, including accepted external reloads. */
   readonly onTextChange?: (text: string, dirty: boolean) => void;
   readonly onExternalConflict?: () => void;
+  readonly reconnectDraft?: WorkspaceFileReconnectDraft;
   readonly selectionQuoteSessionId?: string;
   readonly selectionQuoteLabel?: string;
   readonly onSelectionQuote?: (quote: ComposerFileSelectionQuoteDraft) => void;
@@ -123,13 +125,15 @@ export const WorkspaceFileEditorPane = forwardRef<WorkspaceFileEditorPaneHandle,
   onDirtyChange,
   onTextChange,
   onExternalConflict,
+  reconnectDraft,
   selectionQuoteSessionId,
   selectionQuoteLabel,
   onSelectionQuote,
   documentGuard
 }, forwardedRef) {
-  const [baseline, setBaseline] = useState<WorkspaceFileEditorBaseline>(file);
-  const [editorText, setEditorText] = useState(() => normalizeWorkspaceEditorText(file.text));
+  const recovered = reconnectDraft?.current?.baseline.path === file.path ? reconnectDraft.current : undefined;
+  const [baseline, setBaseline] = useState<WorkspaceFileEditorBaseline>(() => recovered?.baseline ?? file);
+  const [editorText, setEditorText] = useState(() => recovered?.editorText ?? normalizeWorkspaceEditorText(file.text));
   const [incomingConflict, setIncomingConflict] = useState<WorkspaceFileEditorBaseline>();
   const [conflictDismissed, setConflictDismissed] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -146,6 +150,9 @@ export const WorkspaceFileEditorPane = forwardRef<WorkspaceFileEditorPaneHandle,
   editorTextRef.current = editorText;
 
   const dirty = workspaceFileEditorDirty(baseline, editorText);
+  useLayoutEffect(() => {
+    if (reconnectDraft) reconnectDraft.current = dirty ? { baseline, editorText } : undefined;
+  }, [baseline, dirty, editorText, reconnectDraft]);
   useEffect(() => onDirtyChange?.(dirty), [dirty, onDirtyChange]);
 
   useEffect(() => {

@@ -134,6 +134,7 @@ import {
   resetClientLayout
 } from "./client-layout-reset.js";
 import {
+  machineCacheCanReplace,
   machineCacheFromSnapshot,
   normalizeMachineSelection,
   navigationProjectSessionIds,
@@ -4727,6 +4728,7 @@ export function useAppController(): AppController {
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {
+  if (!machineCacheCanReplace(caches.find(candidate => candidate.profileId === cache.profileId), cache)) return caches;
   return [...caches.filter((candidate) => candidate.profileId !== cache.profileId), cache];
 }
 

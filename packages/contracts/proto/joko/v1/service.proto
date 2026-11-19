@@ -1970,6 +1970,8 @@ enum WorkspaceEntryListingPolicy {
   // Files tree: show real project entries regardless of VCS ignores,
   // while retaining the fixed cache/.meta exclusions and path safety rules.
   WORKSPACE_ENTRY_LISTING_POLICY_DOCUMENT_TREE = 2;
+  // Local Files tree with dependency and build directories visible on demand.
+  WORKSPACE_ENTRY_LISTING_POLICY_DOCUMENT_TREE_SHOW_IGNORED = 3;
 }
 
 message ListWorkspaceEntriesRequest {

@@ -16,6 +16,7 @@ import { MobileFileHtmlPreview, type MobileFileHtmlClient } from "./MobileFileHt
 type TextPreview = Extract<MobileFilePreview, { kind: "text" }>;
 type ResourceClient = Pick<MobileClient, "filesMarkdownResourceOwnerKey" | "prepareFilesMarkdownResources" | "assertMarkdownResourcesCurrent" | "releaseMarkdownResources" | "subscribe"> & MobileFileHtmlClient;
 interface Props { readonly preview: TextPreview; readonly locale: MobileSupportedLocale; readonly colors: MobileMarkdownColors; readonly client?: ResourceClient;
+  readonly workspaceHtmlNavigation?: boolean;
   readonly actions?: { readonly busy: boolean; quote(text: string): void; copySource(): void; cancel(): void };
   readonly onViewChange?: (view: "rendered" | "source") => void }
 
@@ -24,7 +25,7 @@ export function MobileFileTextPreview(props: Props) {
   return <FileTextPage key={JSON.stringify([p.sourceLabel, p.fileName, p.revisionKey, p.focusLine, p.focusColumn, p.startByte.toString(), p.text])} {...props} />;
 }
 
-function FileTextPage({ preview, locale, colors, client, onViewChange, actions }: Props) {
+function FileTextPage({ preview, locale, colors, client, onViewChange, actions, workspaceHtmlNavigation }: Props) {
   const markdown = /\.(?:md|mdx|markdown)$/iu.test(preview.fileName ?? preview.workspaceEntry?.relativePath ?? preview.sourceLabel)
     || /^text\/(?:markdown|x-markdown)(?:;|$)/iu.test(preview.mediaType);
   const html = /\.html?$/iu.test(preview.fileName ?? preview.workspaceEntry?.relativePath ?? preview.sourceLabel) || /^text\/html(?:;|$)/iu.test(preview.mediaType);
@@ -71,7 +72,8 @@ function FileTextPage({ preview, locale, colors, client, onViewChange, actions }
       </Pressable>
     </View>}
     {view === "rendered" && lines.length === 0 && <Text style={[styles.notice, { color: colors.muted }]}>{mobileMessage(locale, "preview.emptyFile")}</Text>}
-    {view === "rendered" && html ? <MobileFileHtmlPreview preview={preview} locale={locale} colors={colors} client={client} /> : view === "rendered" ? <FileMarkdownReader preview={preview} text={visibleSource.normalizedText} locale={locale} colors={colors} client={client}
+    {view === "rendered" && html ? <MobileFileHtmlPreview preview={preview} locale={locale} colors={colors} client={client}
+      workspaceNavigation={workspaceHtmlNavigation} actionsDisabled={actions?.busy} /> : view === "rendered" ? <FileMarkdownReader preview={preview} text={visibleSource.normalizedText} locale={locale} colors={colors} client={client}
       actions={actions}
       focusLine={focusIndex === undefined ? undefined : preview.focusLine} /> : lines.length === 0 ? <Text style={[styles.notice, { color: colors.muted }]}>
         {mobileMessage(locale, "preview.emptyFile")}</Text> : <FlatList ref={list} data={lines} initialNumToRender={40} maxToRenderPerBatch={40} windowSize={9}

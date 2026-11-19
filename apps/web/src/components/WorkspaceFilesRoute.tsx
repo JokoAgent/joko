@@ -46,6 +46,7 @@ import type { Translator } from "./types.js";
 import { InteractionPromptSlot } from "./InteractionPortal.js";
 import { SidebarFrame, type SidebarFrameProps } from "./SidebarFrame.js";
 import { WorkspaceFileBody } from "./WorkspaceFileBody.js";
+import type { WorkspaceFileReconnectDraft } from "./workspace-file-editor.js";
 import { WorkspaceFileTabsBar } from "./WorkspaceFileTabsBar.js";
 import {
   WorkspaceFilesSidebar,
@@ -66,7 +67,7 @@ import { WorkspaceSessionTabsBar, type WorkspaceSessionCreateOption } from "./Wo
 import { Button, IconButton, Modal, Spinner, StatusDot, cx } from "./ui.js";
 import "./workspace-files-route.css";
 
-const DOCUMENT_TREE_LISTING = { policy: "documentTree", includeHidden: true } as const;
+const WORKSPACE_SHOW_IGNORED_DIRECTORIES_KEY = "joko:workspace-files:show-ignored-directories:v1";
 const WORKSPACE_CHAT_OVERLAY_FOCUSABLE = "button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [contenteditable='true'], [tabindex]:not([tabindex='-1'])";
 export const WORKSPACE_FILES_COMPACT_MAX_WIDTH = 980;
 export const WORKSPACE_FILES_COMPACT_MEDIA_QUERY = `(max-width: ${WORKSPACE_FILES_COMPACT_MAX_WIDTH}px)`;
@@ -88,6 +89,7 @@ export interface WorkspaceFilesRouteProps {
   readonly target: TargetView;
   readonly backend: BackendView;
   readonly workspace: WorkspaceView;
+  readonly reconnectDraft?: WorkspaceFileReconnectDraft;
   readonly sessions: readonly SessionView[];
   readonly banners?: ReactNode;
   readonly chatPane: ReactNode;
@@ -149,6 +151,7 @@ interface FilePreviewState {
 export function WorkspaceFilesRoute({
   controller,
   route,
+  reconnectDraft,
   session,
   target,
   backend,
@@ -177,6 +180,19 @@ export function WorkspaceFilesRoute({
   const [leavePrompt, setLeavePrompt] = useState<LeavePromptState | undefined>(undefined);
   const [previewState, setPreviewState] = useState<FilePreviewState>({ loading: false });
   const [previewRefreshSequence, setPreviewRefreshSequence] = useState(0);
+  const [showIgnoredDirectories, setShowIgnoredDirectories] = useState(readShowIgnoredDirectories);
+  const canShowIgnoredDirectories = workspace.remoteWorkspace === undefined && target.remoteWorkspace === undefined;
+  const showIgnored = canShowIgnoredDirectories && showIgnoredDirectories;
+  useEffect(() => {
+    const ownerWindow = rootRef.current?.ownerDocument.defaultView;
+    const onStorage = (event: StorageEvent): void => {
+      if (event.key === null || event.key === WORKSPACE_SHOW_IGNORED_DIRECTORIES_KEY) {
+        setShowIgnoredDirectories(readShowIgnoredDirectories());
+      }
+    };
+    ownerWindow?.addEventListener("storage", onStorage);
+    return () => ownerWindow?.removeEventListener("storage", onStorage);
+  }, []);
   const [compactLayout, setCompactLayout] = useState(() => browserMatches(WORKSPACE_FILES_COMPACT_MEDIA_QUERY));
   const [railWidth, setRailWidth] = useState(() => readWorkspaceChatRailWidth(browserStorage()));
   const railWidthRef = useRef(railWidth);
@@ -229,6 +245,10 @@ export function WorkspaceFilesRoute({
   const selectedPreview = selectedPreviewState?.preview ?? (selectedPath === undefined ? undefined : controller.peekWorkspaceFile?.(workspace.id, selectedPath));
   const selectedPathRef = useRef(selectedPath);
   selectedPathRef.current = selectedPath;
+  const fileRouteOwner = JSON.stringify([session.id, previewOwnerKey]);
+  const fileRouteOwnerRef = useRef(fileRouteOwner);
+  fileRouteOwnerRef.current = fileRouteOwner;
+  const fileNavigationRevision = useRef(0);
   const canWrite = backend.capabilities.get("workspace.files.write")?.supported === true;
   const canWatchFiles = backend.capabilities.get("workspace.files.watch")?.supported === true;
   const workdirSessions = useMemo(
@@ -395,6 +415,7 @@ export function WorkspaceFilesRoute({
       onError(t("workspace.invalidPath"));
       return;
     }
+    fileNavigationRevision.current += 1;
     if (canonical === undefined) workspaceSelectedFileStore.clear(workspace.id);
     else workspaceSelectedFileStore.set(workspace.id, canonical);
     controllerRef.current.navigate({
@@ -509,9 +530,12 @@ export function WorkspaceFilesRoute({
     const parent = canonicalWorkspaceRelativePath(parentPath, true);
     return normalizeWorkspaceDirectoryEntries(
       parent,
-      (await controllerRef.current.listWorkspaceEntries(workspaceId, parent, DOCUMENT_TREE_LISTING)).map(mapWorkspaceEntry)
+      (await controllerRef.current.listWorkspaceEntries(workspaceId, parent, {
+        policy: showIgnored ? "documentTreeShowIgnored" : "documentTree",
+        includeHidden: true
+      })).map(mapWorkspaceEntry)
     );
-  }, [workspace.id]);
+  }, [showIgnored, workspace.id]);
 
   const loadFileIndex = useCallback(async (
     { workspaceId }: { readonly workspaceId: string },
@@ -560,12 +584,16 @@ export function WorkspaceFilesRoute({
         await controllerRef.current.createWorkspaceEntry({ workspaceId, path, kind: "directory" });
       },
       rename: async ({ workspaceId, fromPath, toPath, kind, expectedRevision }) => {
+        const navigationRevision = fileNavigationRevision.current;
+        const originalSelection = selectedPathRef.current;
         if (!(await guardAffectedDocument("switch-file", fromPath, kind === "directory"))) return false;
         await controllerRef.current.moveWorkspaceEntry({ workspaceId, sourcePath: fromPath, destinationPath: toPath, expectedRevision });
         workspaceOpenTabsStore.renameTabPrefix(workspaceId, fromPath, toPath);
         workspaceSelectedFileStore.renamePrefix(workspaceId, fromPath, toPath);
-        if (selectedPath === fromPath || (kind === "directory" && selectedPath?.startsWith(`${fromPath}/`) === true)) {
-          const nextPath = selectedPath === fromPath ? toPath : `${toPath}/${selectedPath!.slice(fromPath.length + 1)}`;
+        if (rootRef.current === null || fileRouteOwnerRef.current !== fileRouteOwner
+          || fileNavigationRevision.current !== navigationRevision || selectedPathRef.current !== originalSelection) return;
+        if (originalSelection === fromPath || (kind === "directory" && originalSelection?.startsWith(`${fromPath}/`) === true)) {
+          const nextPath = originalSelection === fromPath ? toPath : `${toPath}/${originalSelection!.slice(fromPath.length + 1)}`;
           navigateFile(nextPath);
         }
       },
@@ -585,7 +613,7 @@ export function WorkspaceFilesRoute({
       },
       copyRelativePath
     };
-  }, [canWrite, guardAffectedDocument, navigateFile, selectedPath, t]);
+  }, [canWrite, fileRouteOwner, guardAffectedDocument, navigateFile, selectedPath, t]);
 
   const toggleRail = useCallback((): void => {
     const next = !railCollapsed;
@@ -832,6 +860,11 @@ export function WorkspaceFilesRoute({
           activeTargetId={target.id}
           projectOptions={projectOptions}
           labels={workspaceSidebarLabels(t)}
+          ignoredDirectories={canShowIgnoredDirectories ? { shown: showIgnored, onToggle: () => {
+            const next = !showIgnored;
+            setShowIgnoredDirectories(next);
+            writeStorage(WORKSPACE_SHOW_IGNORED_DIRECTORIES_KEY, String(next));
+          } } : undefined}
           documentActions={documentActions}
           loadDirectory={loadDirectory}
           loadFileIndex={loadFileIndex}
@@ -922,6 +955,7 @@ export function WorkspaceFilesRoute({
                   loading={selectedPreviewState?.loading ?? selectedPath !== undefined}
                   error={selectedPreviewState?.error}
                   canWrite={canWrite && selectedPreviewState?.preview !== undefined && selectedPreviewState.cached !== true}
+                  reconnectDraft={reconnectDraft}
                   search={route.search}
                   line={route.line}
                   onSearchJumpConsumed={() => navigateFile(selectedPath)}
@@ -1143,6 +1177,11 @@ function browserStorage(): Storage | undefined {
   }
 }
 
+function readShowIgnoredDirectories(): boolean {
+  try { return browserStorage()?.getItem(WORKSPACE_SHOW_IGNORED_DIRECTORIES_KEY) === "true"; }
+  catch { return false; }
+}
+
 function browserMatches(query: string): boolean {
   try {
     return typeof window !== "undefined" && window.matchMedia?.(query).matches === true;
@@ -1216,6 +1255,7 @@ function workspaceSidebarLabels(t: Translator) {
     exitSearch: t("workspace.exitSearch"),
     collapseAll: t("workspace.collapseFolders"),
     refresh: t("workspace.refreshFiles"),
+    showIgnoredDirectories: t("workspace.showIgnoredDirectories"),
     filterPlaceholder: t("workspace.filterFiles"),
     clearFilter: t("workspace.clearFileFilter"),
     loadingTree: t("workspace.loadingFiles"),

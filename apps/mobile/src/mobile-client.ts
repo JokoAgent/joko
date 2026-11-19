@@ -94,7 +94,7 @@ import { buildMobileMessageDeepLink, buildMobileTaskDeepLink, parseMobileNativeI
 import { awaitMobileMarkdownResourceRead, MobileMarkdownResourceReader, type MobileMarkdownResourceContext, type MobileMarkdownResourceDescriptor } from "./mobile-markdown-resources";
 import { mobileFileTextSource, normalizeMobileFileText } from "./mobile-file-text-source";
 import { MobileFileHtmlReader, type MobileFileHtmlContext, type MobileFileHtmlDescriptor } from "./mobile-file-html-reader";
-import { mobileFileHtmlComplete } from "./mobile-file-html";
+import { isMobileHtmlDocumentPath, mobileFileHtmlComplete } from "./mobile-file-html";
 import { HtmlResourceBudgetError } from "./mobile-file-html-resources";
 import { mobileGeneratedPreviewPages, mobileWorkspacePreviewPages, type MobileFilesPreviewPage, type MobileFilesPreviewPager } from "./mobile-files-preview-pager";
 import { MobileTimelineImageReader, type MobileTimelineImageContext, type MobileTimelineImagePreview } from "./mobile-timeline-images";
@@ -621,6 +621,11 @@ interface MobileFilesContext {
   readonly authority: MobileWorkspaceAuthority;
   readonly key: string;
 }
+interface MobileFilesReconnectLocation {
+  readonly authorityKey: string;
+  readonly directory: string;
+  readonly textPage?: { readonly path: string; readonly sort: MobileFilesSortMode };
+}
 interface MobileFilesPreviewPagerLease {
   readonly context: MobileFilesContext; readonly epoch: number; readonly controller: AbortController;
   readonly window: { readonly kind: "workspace"; readonly parent: string; readonly revision: string } | { readonly kind: "generated"; readonly revision: string };
@@ -1092,6 +1097,7 @@ export class MobileClient {
   #filesSearchAbort?: AbortController;
   #filesPreviewAbort?: AbortController;
   #filesPreviewPager?: MobileFilesPreviewPagerLease;
+  #filesReconnectLocation?: MobileFilesReconnectLocation;
   #filesPagerOpeningAbort?: AbortController;
   #filesPagerNavigationAbort?: AbortController;
   #filesPagerReadActive = false;
@@ -1115,6 +1121,8 @@ export class MobileClient {
   #conversationShare?: MobileConversationShareLease;
   #markdownResources = new MobileMarkdownResourceReader();
   #fileHtmlResources = new MobileFileHtmlReader();
+  #filesHtmlDocument?: { readonly id: string; readonly preview: Extract<MobileFilePreview, { kind: "text" }>;
+    readonly path: string; readonly controller: AbortController };
   #timelineImages = new MobileTimelineImageReader();
   #galleryBlobRead: ReturnType<MobileNetwork["downloadBlob"]> | undefined;
   #filesThumbnails: MobileFilesThumbnailReader;
@@ -3990,6 +3998,10 @@ export class MobileClient {
     }
     if (!next.window && next.windowHasNewer) next = { ...next, windowHasNewer: false };
     const nextAuthority = this.#filesAuthorityKey(next);
+    if (this.#filesReconnectLocation && (!next.files.open || next.activeProfileId !== this.#state.activeProfileId
+      || next.selectedId !== this.#state.selectedId || next.status === "connected" && nextAuthority !== this.#filesReconnectLocation.authorityKey)) {
+      this.#filesReconnectLocation = undefined;
+    }
     const nextPartnerAuthority = this.#partnerPrivateAuthorityKey(next);
     const sourceSessionChanged = this.#partnerPrivateSourceSessionId !== undefined
       && next.selectedId !== this.#partnerPrivateSourceSessionId;
@@ -4064,6 +4076,10 @@ export class MobileClient {
       this.#state = { ...next, files: { ...next.files, preview: undefined, previewPager: undefined } };
     }
     this.#markdownResources.retireStale();
+    const htmlDocument = this.#filesHtmlDocument;
+    if (htmlDocument && !this.filesHtmlResourceOwnerKey(htmlDocument.preview)) {
+      this.releaseFilesHtmlResources(htmlDocument.id);
+    }
     this.#fileHtmlResources.retireStale();
     this.#timelineImages.retainOwner(this.#taskAuthorityKey(true));
     this.#timelineImages.retireStale();
@@ -4117,6 +4133,7 @@ export class MobileClient {
     this.#retireImageGallery();
     if (this.#conversationShare) this.releaseConversationShare(this.#conversationShare.leaseId);
     this.#markdownResources.releaseAll();
+    if (this.#filesHtmlDocument) this.releaseFilesHtmlResources(this.#filesHtmlDocument.id);
     this.#fileHtmlResources.releaseAll();
     this.#timelineImages.releaseAll();
     this.#filesThumbnails.releaseAll();
@@ -5986,6 +6003,13 @@ export class MobileClient {
       if (this.#hasOfflineProjection()) await this.connectSaved(this.#activeProfileId!);
       return;
     }
+    const files = this.#state.files;
+    const authorityKey = this.filesAuthorityKey();
+    if (files.open && files.status === "ready" && authorityKey && files.authorityKey === authorityKey && files.location.kind === "workspace") {
+      const path = files.preview?.kind === "text" ? files.preview.workspaceEntry?.relativePath : undefined;
+      this.#filesReconnectLocation = { authorityKey, directory: files.location.path,
+        ...(path && workspaceParentPath(path) === files.location.path ? { textPage: { path, sort: files.previewPager?.sort ?? "name" } } : {}) };
+    }
     const epoch = this.#retire();
     const signal = this.#abort!.signal;
     const current = () => this.#current(epoch);
@@ -7489,28 +7513,32 @@ export class MobileClient {
 
   prepareFilesImageGalleryPathCopy(
     galleryLeaseId: string,
-    loadId: string,
-    pageId: string
+    pageId: string,
+    selection: { readonly kind: "loaded"; readonly loadId: string }
+      | { readonly kind: "failed"; readonly pageIndex: number; readonly isCurrent: () => boolean }
   ): MobileFilesClipboardLease {
     const lease = this.#imageGallery;
     const loaded = lease?.loaded;
+    const page = selection.kind === "loaded" ? loaded?.page : lease?.pages[selection.pageIndex];
     const copyEpoch = this.#filesCopyEpoch;
-    if (!lease || lease.leaseId !== galleryLeaseId || lease.source.kind !== "files" || lease.operationInFlight
-      || !loaded || loaded.loadId !== loadId || loaded.page.pageId !== pageId || !this.imageGalleryCurrent(galleryLeaseId)) {
+    if (!lease || lease.leaseId !== galleryLeaseId || lease.source.kind !== "files" || !page || page.pageId !== pageId
+      || (selection.kind === "failed" && page.source.kind !== "workspace")) {
       throw new Error("The Files image gallery page is no longer current.");
     }
-    const source = loaded.page.source;
+    const source = page.source;
     const value = source.kind === "workspace"
       ? mobileFilesWorkspaceClipboardValue(source.relativePath)
       : source.kind === "artifact"
-        ? mobileFilesGeneratedClipboardValue(loaded.page.blob.fileName)
+        ? mobileFilesGeneratedClipboardValue(page.blob.fileName)
         : undefined;
     if (!value) throw new Error("The current gallery page does not belong to Files.");
     const assertCurrent = (signal?: AbortSignal): void => {
       signal?.throwIfAborted();
+      const sameSelection = selection.kind === "loaded"
+        ? lease.loaded === loaded && loaded?.loadId === selection.loadId
+        : lease.loaded === undefined && selection.isCurrent();
       if (this.#filesCopyEpoch !== copyEpoch || this.#imageGallery !== lease || lease.source.kind !== "files"
-        || lease.operationInFlight || lease.loaded !== loaded || loaded.loadId !== loadId
-        || loaded.page.pageId !== pageId || !this.imageGalleryCurrent(galleryLeaseId)) {
+        || lease.operationInFlight || !sameSelection || !this.imageGalleryCurrent(galleryLeaseId)) {
         throw new Error("The visible Files image changed before its path was copied.");
       }
     };
@@ -7519,7 +7547,21 @@ export class MobileClient {
   }
 
   async openFiles(): Promise<void> {
-    await this.#openFilesAt("");
+    const files = this.#state.files;
+    const authorityKey = this.filesAuthorityKey();
+    const resume = files.open && files.status === "offline" && this.#filesReconnectLocation?.authorityKey === authorityKey
+      ? this.#filesReconnectLocation : undefined;
+    this.#filesReconnectLocation = undefined;
+    const opening = this.#openFilesAt(resume?.directory ?? "");
+    const epoch = this.#filesEpoch;
+    await opening;
+    const page = resume?.textPage;
+    const current = this.#state.files;
+    if (!page || !authorityKey || !this.#currentFiles(epoch, authorityKey) || current.status !== "ready" || current.preview) return;
+    const entry = current.entries.find((item) => item.relativePath === page.path);
+    if (entry?.revision && entry.kind === FileKind.REGULAR && isTextFilePreviewMetadata(entry.mediaType, workspaceBasename(page.path))) {
+      await this.openFilesPreviewPager({ kind: "workspace-entry", entry }, page.sort);
+    }
   }
 
   async #openFilesAt(relativePath: string): Promise<void> {
@@ -7547,6 +7589,7 @@ export class MobileClient {
   }
 
   closeFiles(): void {
+    this.#filesReconnectLocation = undefined;
     this.#cancelFilesRequests();
     this.#set({ files: emptyMobileFilesState() });
   }
@@ -7828,6 +7871,14 @@ export class MobileClient {
       clearTimeout(deadline); lease.controller.signal.removeEventListener("abort", abort);
       if (this.#filesPagerNavigationAbort === controller) this.#filesPagerNavigationAbort = undefined;
     }
+  }
+
+  async retryFilesTextPreview(preview: Extract<MobileFilePreview, { kind: "error" }>): Promise<void> {
+    const pager = this.#state.files.previewPager;
+    const page = pager?.pages[pager.index];
+    if (this.#state.files.preview !== preview || !pager || page?.kind !== "workspace"
+      || page.entry.relativePath !== preview.workspacePath || !isTextFilePreviewMetadata(page.mediaType, page.title)) return;
+    await this.selectFilesPreviewPage(pager.id, page.key);
   }
 
   #filesPreviewPagerCurrent(lease: MobileFilesPreviewPagerLease): boolean {
@@ -8893,76 +8944,126 @@ export class MobileClient {
       && !this.#imageGallery ? JSON.stringify([owner, this.#filesEpoch, preview.sourceLabel, preview.revisionKey]) : undefined;
   }
 
-  async prepareFilesHtmlResources(preview: Extract<MobileFilePreview, { kind: "text" }>, signal: AbortSignal): Promise<MobileFileHtmlDescriptor> {
+  async prepareFilesHtmlResources(preview: Extract<MobileFilePreview, { kind: "text" }>, signal: AbortSignal,
+    documentPath?: string): Promise<MobileFileHtmlDescriptor> {
     const credential = this.#ready(); const ownerKey = this.filesHtmlResourceOwnerKey(preview);
     if (!ownerKey || !mobileFileHtmlComplete(preview)) throw new Error("The HTML page has no current complete file source.");
+    const root = preview.workspaceEntry;
+    const id = this.newId();
+    const navigation = documentPath === undefined ? undefined : { id, preview, path: documentPath, controller: new AbortController() };
+    if (navigation) {
+      if (this.#state.files.preview !== preview || !root || !isMobileHtmlDocumentPath(root.relativePath, navigation.path)) {
+        throw new Error("Select an HTML document in the current Workspace preview directory.");
+      }
+      if (this.#filesHtmlDocument) this.releaseFilesHtmlResources(this.#filesHtmlDocument.id);
+      this.#filesHtmlDocument = navigation;
+    }
     const assertCurrent = (currentSignal?: AbortSignal): void => {
       currentSignal?.throwIfAborted();
-      if (this.#disposed || this.#credential !== credential || this.filesHtmlResourceOwnerKey(preview) !== ownerKey) {
+      if (this.#disposed || this.#credential !== credential || this.filesHtmlResourceOwnerKey(preview) !== ownerKey
+        || navigation && this.#filesHtmlDocument !== navigation) {
         throw new Error("The HTML file source changed.");
       }
     };
-    const entry = preview.workspaceEntry; let context: MobileFileHtmlContext = { assertCurrent };
-    if (entry) {
-      const files = this.#filesContext();
-      if (!entry.revision || entry.kind !== FileKind.REGULAR || entry.workspaceId !== files.authority.workspace.workspaceId
-        || entry.relativePath !== preview.sourceLabel || workspaceEntryRevisionKey(entry.revision) !== preview.revisionKey) {
-        throw new Error("The HTML page has no canonical Workspace source.");
-      }
-      const revalidateEntry = async (currentSignal: AbortSignal): Promise<void> => {
-        assertCurrent(currentSignal);
-        const directory = await this.network.listWorkspaceDirectory(credential, entry.workspaceId, workspaceParentPath(entry.relativePath), currentSignal);
-        assertCurrent(currentSignal);
-        const matches = directory.entries.filter((candidate) => candidate.relativePath === entry.relativePath);
-        const fresh = matches.length === 1 ? matches[0] : undefined;
-        if (!directory.revision || !fresh?.revision || fresh.kind !== FileKind.REGULAR || fresh.workspaceId !== entry.workspaceId
-          || normalizeMediaType(fresh.mediaType) !== normalizeMediaType(entry.mediaType) || fresh.revision.byteSize !== entry.revision!.byteSize
-          || !workspaceComposerRevisionMatches(fresh.revision, entry.revision!)) throw new Error("The authenticated HTML file changed.");
-      };
-      let snapshotRevision = "";
-      const revalidateSource = async (currentSignal: AbortSignal): Promise<void> => {
-        await revalidateEntry(currentSignal);
-        const snapshot = await this.network.readWorkspaceHtmlSnapshot(credential, files.authority.sessionId,
-          { workspaceId: entry.workspaceId, relativePath: entry.relativePath, expectedRevision: snapshotRevision }, currentSignal);
-        assertCurrent(currentSignal);
-        if (snapshot.file.workspaceId !== entry.workspaceId || snapshot.file.relativePath !== entry.relativePath
-          || !/^workspace-html:[0-9a-f]{64}$/u.test(snapshot.file.expectedRevision)
-          || snapshotRevision !== "" && snapshot.file.expectedRevision !== snapshotRevision || snapshot.html !== preview.text) {
-          throw new Error("The authenticated HTML snapshot changed.");
-        }
-        snapshotRevision = snapshot.file.expectedRevision;
-      };
-      context = { baseDirectory: workspaceParentPath(entry.relativePath), assertCurrent, revalidateSource,
-        readResource: async (target, maximumBytes, currentSignal) => {
-          await revalidateEntry(currentSignal);
-          const path = canonicalWorkspacePath(target.relativePath); const parent = workspaceParentPath(path);
-          const base = workspaceParentPath(entry.relativePath);
-          if (base && !path.startsWith(base + "/")) throw new Error("The HTML resource left its parent directory.");
-          const directory = await this.network.listWorkspaceDirectory(credential, entry.workspaceId, parent, currentSignal);
-          assertCurrent(currentSignal);
-          const matches = directory.entries.filter((candidate) => candidate.relativePath === path);
-          const resource = matches.length === 1 ? matches[0] : undefined;
-          if (!directory.revision || !resource?.revision || resource.kind !== FileKind.REGULAR || resource.workspaceId !== entry.workspaceId) {
-            throw new Error("The HTML resource has no current canonical file.");
-          }
-          if (resource.revision.byteSize < 0n || resource.revision.byteSize > BigInt(maximumBytes)) {
-            throw new HtmlResourceBudgetError("The HTML resource exceeded its byte budget.");
-          }
-          const materialized = await this.network.materializeWorkspaceFileBlob(credential, entry.workspaceId, path, resource.revision, currentSignal);
-          assertCurrent(currentSignal);
-          const blob = workspaceComposerBlob(entry.workspaceId, resource, { $typeName: "joko.v1.FilePreview", entry: materialized.entry,
-            content: { case: "blob", value: materialized.blob }, truncated: false });
-          if (!blob || blob.byteSize !== resource.revision.byteSize || blob.byteSize > BigInt(maximumBytes)) throw new Error("The HTML resource Blob changed.");
-          const downloaded = await this.network.downloadBlob(credential, blob, currentSignal); assertCurrent(currentSignal);
-          await revalidateEntry(currentSignal);
-          return { blob, ...downloaded };
-        } };
+    const readSignal = navigation ? AbortSignal.any([signal, navigation.controller.signal, AbortSignal.timeout(15_000)]) : signal;
+    try {
+      const document = root ? await this.#prepareWorkspaceHtmlDocument(preview, root, navigation?.path, credential, assertCurrent, readSignal)
+        : { html: preview.text, context: { assertCurrent } };
+      assertCurrent(readSignal);
+      return await this.#fileHtmlResources.prepare(id, document.html, document.context, readSignal);
+    } catch (error) {
+      this.releaseFilesHtmlResources(id);
+      throw error;
     }
-    return this.#fileHtmlResources.prepare(this.newId(), preview.text, context, signal);
+  }
+
+  async #prepareWorkspaceHtmlDocument(preview: Extract<MobileFilePreview, { kind: "text" }>, root: WorkspaceEntry, documentPath: string | undefined,
+    credential: PairedCredential, assertCurrent: (signal?: AbortSignal) => void, signal: AbortSignal): Promise<{ html: string; context: MobileFileHtmlContext }> {
+    const files = this.#filesContext();
+    if (!root.revision || root.kind !== FileKind.REGULAR || root.workspaceId !== files.authority.workspace.workspaceId
+      || root.relativePath !== preview.sourceLabel || workspaceEntryRevisionKey(root.revision) !== preview.revisionKey) {
+      throw new Error("The HTML page has no canonical Workspace source.");
+    }
+    const workspaceId = root.workspaceId;
+    const readEntry = async (path: string, currentSignal: AbortSignal) => {
+      assertCurrent(currentSignal);
+      const directory = await awaitMobileMarkdownResourceRead(this.network.listWorkspaceDirectory(credential, workspaceId,
+        workspaceParentPath(path), currentSignal), currentSignal);
+      assertCurrent(currentSignal);
+      const matches = directory.entries.filter((candidate) => candidate.relativePath === path);
+      const fresh = matches.length === 1 ? matches[0] : undefined;
+      if (!directory.revision || !fresh?.revision || fresh.kind !== FileKind.REGULAR || fresh.workspaceId !== workspaceId) {
+        throw new Error("The authenticated HTML file is unavailable.");
+      }
+      return { entry: fresh, revision: fresh.revision };
+    };
+    const { entry, revision } = documentPath === undefined ? { entry: root, revision: root.revision } : await readEntry(documentPath, signal);
+    const relativePath = entry.relativePath;
+    const base = workspaceParentPath(relativePath);
+    const revalidateEntry = async (currentSignal: AbortSignal): Promise<void> => {
+      const fresh = await readEntry(relativePath, currentSignal);
+      if (normalizeMediaType(fresh.entry.mediaType) !== normalizeMediaType(entry.mediaType) || fresh.revision.byteSize !== revision.byteSize
+        || !workspaceComposerRevisionMatches(fresh.revision, revision)) throw new Error("The authenticated HTML file changed.");
+    };
+    let snapshotRevision = "";
+    const readSnapshot = async (currentSignal: AbortSignal): Promise<string> => {
+      assertCurrent(currentSignal);
+      const snapshot = await awaitMobileMarkdownResourceRead(this.network.readWorkspaceHtmlSnapshot(credential, files.authority.sessionId,
+        { workspaceId, relativePath, expectedRevision: snapshotRevision }, currentSignal), currentSignal);
+      assertCurrent(currentSignal);
+      if (snapshot.file.workspaceId !== workspaceId || snapshot.file.relativePath !== relativePath
+        || !/^workspace-html:[0-9a-f]{64}$/u.test(snapshot.file.expectedRevision)
+        || snapshotRevision !== "" && snapshot.file.expectedRevision !== snapshotRevision) {
+        throw new Error("The authenticated HTML snapshot changed.");
+      }
+      snapshotRevision = snapshot.file.expectedRevision;
+      return snapshot.html;
+    };
+    let html = preview.text;
+    if (documentPath !== undefined) {
+      if (normalizeMediaType(entry.mediaType) !== "text/html" || revision.byteSize < 0n || revision.byteSize > 2_097_152n) {
+        throw new Error("HTML previews require a complete file of at most 2 MiB.");
+      }
+      html = await readSnapshot(signal);
+      const bytes = new TextEncoder().encode(html);
+      if (BigInt(bytes.byteLength) !== revision.byteSize || revision.sha256Hex && bytesToHex(sha256(bytes)) !== revision.sha256Hex) {
+        throw new Error("The authenticated HTML snapshot did not match the selected file.");
+      }
+      await revalidateEntry(signal);
+    }
+    const revalidateSource = async (currentSignal: AbortSignal): Promise<void> => {
+      await revalidateEntry(currentSignal);
+      if (await readSnapshot(currentSignal) !== html) throw new Error("The authenticated HTML snapshot changed.");
+    };
+    return { html, context: { baseDirectory: base, assertCurrent, revalidateSource,
+      readResource: async (target, maximumBytes, currentSignal) => {
+        await revalidateEntry(currentSignal);
+        const path = canonicalWorkspacePath(target.relativePath);
+        if (base && !path.startsWith(base + "/")) throw new Error("The HTML resource left its parent directory.");
+        const { entry: resource, revision: resourceRevision } = await readEntry(path, currentSignal);
+        if (resourceRevision.byteSize < 0n || resourceRevision.byteSize > BigInt(maximumBytes)) {
+          throw new HtmlResourceBudgetError("The HTML resource exceeded its byte budget.");
+        }
+        const materialized = await this.network.materializeWorkspaceFileBlob(credential, workspaceId, path, resourceRevision, currentSignal);
+        assertCurrent(currentSignal);
+        const blob = workspaceComposerBlob(workspaceId, resource, { $typeName: "joko.v1.FilePreview", entry: materialized.entry,
+          content: { case: "blob", value: materialized.blob }, truncated: false });
+        if (!blob || blob.byteSize !== resourceRevision.byteSize || blob.byteSize > BigInt(maximumBytes)) throw new Error("The HTML resource Blob changed.");
+        const downloaded = await this.network.downloadBlob(credential, blob, currentSignal);
+        assertCurrent(currentSignal);
+        await revalidateEntry(currentSignal);
+        return { blob, ...downloaded };
+      } } };
   }
 
   assertFilesHtmlResourcesCurrent(leaseId: string): void { this.#fileHtmlResources.assertCurrent(leaseId); }
-  releaseFilesHtmlResources(leaseId: string): void { this.#fileHtmlResources.release(leaseId); }
+  releaseFilesHtmlResources(leaseId: string): void {
+    this.#fileHtmlResources.release(leaseId);
+    if (this.#filesHtmlDocument?.id === leaseId) {
+      this.#filesHtmlDocument.controller.abort();
+      this.#filesHtmlDocument = undefined;
+    }
+  }
 
   timelineImagePreviewOwnerKey(): string | undefined { return this.#taskAuthorityKey(true); }
 
@@ -17219,7 +17320,9 @@ export class MobileClient {
 
   #scheduleFilesRefresh(context: MobileFilesContext, epoch: number, signal: AbortSignal, change: WorkspaceFileChange): void {
     const path = this.#state.files.preview?.workspacePath;
-    if (path !== undefined && workspaceWatchChangeAffectsPath(change, path)) this.closeFilesPreview();
+    const html = this.#filesHtmlDocument;
+    if (path !== undefined && workspaceWatchChangeAffectsPath(change, path)
+      || html && html.preview === this.#state.files.preview && workspaceWatchChangeAffectsPath(change, html.path)) this.closeFilesPreview();
     if (signal.aborted || !this.#currentFiles(epoch, context.key) || this.#credential !== context.credential) return;
     if (this.#filesRefreshTimer !== undefined) clearTimeout(this.#filesRefreshTimer);
     this.#filesRefreshTimer = setTimeout(() => {

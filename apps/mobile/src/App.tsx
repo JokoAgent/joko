@@ -303,6 +303,7 @@ import { useMobileHomeProjectReorder } from "./use-mobile-home-project-reorder";
 import { mobilePartnerRosterSourceKey } from "./mobile-partner-roster";
 import {
   artifactTitle,
+  isTextFilePreviewMetadata,
   workspaceBasename,
   workspaceSearchEntryRevision,
   type MobileFilePreview,
@@ -571,8 +572,12 @@ function useMobileImageGallery(
     if (!current?.session || current.busy || current.failed) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
     await client.shareImageGalleryPageOriginal(current.descriptor.leaseId, current.session.leaseId, signal, onDispatch);
   }, [presenter, locale]);
+  const isCurrentFailedPage = (pageKey: string): boolean => {
+    const current = presenter.snapshot;
+    return current?.pageKey === pageKey && current.failed && !current.busy;
+  };
   return { view, open, close: presenter.close, navigate: presenter.navigate, retry: presenter.retry,
-    nativeFailed: presenter.nativeFailed, previewFailed: presenter.previewFailed, decoded, addOriginal, shareOriginal, save };
+    nativeFailed: presenter.nativeFailed, previewFailed: presenter.previewFailed, decoded, addOriginal, shareOriginal, save, isCurrentFailedPage };
 }
 
 async function performMobileImageOutput(
@@ -8252,6 +8257,8 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
   const files = state.files;
   const currentPreviewSource = files.previewPager?.pages[files.previewPager.index]?.source ?? previewSource;
   const currentPreviewPage = files.previewPager?.pages[files.previewPager.index];
+  const failedTextPreview = files.preview?.kind === "error" && currentPreviewPage?.kind === "workspace"
+    && isTextFilePreviewMetadata(currentPreviewPage.mediaType, currentPreviewPage.title) ? files.preview : undefined;
   const initialPagerSource = useRef<MobileFilesComposerSource | undefined>(undefined);
   const searching = query.trim().length > 0;
   const imageGallery = useMobileImageGallery(locale, () => {
@@ -8521,7 +8528,8 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
           } else openResult(source.result);
         }} />}
     </View>
-    <FilePreviewModal colors={colors} preview={files.preview} source={currentPreviewSource} pager={files.previewPager}
+    <FilePreviewModal colors={colors} preview={files.preview} source={currentPreviewSource} pager={files.previewPager} workspaceHtmlNavigation
+      onRetry={failedTextPreview ? () => run(() => client.retryFilesTextPreview(failedTextPreview)) : undefined}
       onQuoted={() => { setPreviewSource(undefined); client.closeFiles(); onAdded(); }}
       onNavigate={(id, key) => run(() => client.selectFilesPreviewPage(id, key))} busy={handoffBusy} locale={locale}
       sharing={fileShareBusy} shareProgress={fileShareProgress}
@@ -8550,14 +8558,18 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
         ...(imageGallery.view.failed ? { error: mobileMessage(locale, "image.previewFailed") } : {}),
         onRetry: imageGallery.retry, onNativeFailed: imageGallery.nativeFailed, onPreviewFailed: imageGallery.previewFailed,
         onNavigate: imageGallery.navigate,
-        ...(imageGallery.view.session ? {
+        ...(imageGallery.view.session || (imageGallery.view.failed && imageGallery.view.descriptor.sourceKind === "workspace") ? {
           copySourceLabel: mobileMessage(locale, imageGallery.view.descriptor.sourceKind === "workspace"
             ? "files.presentation.copyPath" : "files.presentation.copyName"),
           onCopySource: async (signal: AbortSignal): Promise<string> => {
-            const view = imageGallery.view; const session = view?.session;
-            if (!view || !session || view.busy || view.failed) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+            const view = imageGallery.view;
+            if (!view || view.busy) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+            const page = view.descriptor.pages[view.pageIndex];
+            if (!page) throw new Error(mobileMessage(locale, "task.error.galleryClosed"));
+            const selection = view.session && !view.failed ? { kind: "loaded" as const, loadId: view.session.leaseId }
+              : { kind: "failed" as const, pageIndex: view.pageIndex, isCurrent: () => imageGallery.isCurrentFailedPage(view.pageKey) };
             const result = await copyFilesValue(() => client.prepareFilesImageGalleryPathCopy(
-              view.descriptor.leaseId, session.leaseId, session.pageId
+              view.descriptor.leaseId, page.pageId, selection
             ), signal, true);
             signal.throwIfAborted();
             if (result !== "copied") throw new Error(mobileMessage(locale,
@@ -8618,11 +8630,12 @@ function FileSearchResultRow({ result, colors, locale, disabled, shareDisabled, 
 
 function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sharing = false, shareProgress, backLabel,
   backAccessibilityLabel, loadingLabel, locale, copying = false, copyLabel, copyStatus, onCopy,
-  onAdd, onOpenImage, onShare, onClose, onQuoted }: {
+  onAdd, onOpenImage, onShare, onClose, onQuoted, onRetry, workspaceHtmlNavigation }: {
   colors: Colors;
   preview: MobileFilePreview | undefined;
   source?: MobileFilesComposerSource;
   pager?: FilesPreviewPager;
+  workspaceHtmlNavigation?: boolean;
   onNavigate?: (pagerId: string, pageKey: string) => void;
   busy: boolean;
   sharing?: boolean;
@@ -8638,6 +8651,7 @@ function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sh
   onAdd?: (source: MobileFilesComposerSource) => void;
   onOpenImage?: (source: MobileFilesComposerSource) => void;
   onShare?: () => void;
+  onRetry?: () => void;
   onClose: () => void;
   onQuoted?: () => void;
 }) {
@@ -8804,12 +8818,15 @@ function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sh
             />
           </View>
           : preview.kind === "text" ? <MobileFileTextPreview key={preview.revisionKey + "/" + preview.focusLine + "/" + preview.focusColumn}
-            preview={preview} locale={locale} colors={colors} client={client} onViewChange={onTextViewChange} actions={{ ...textActions, busy: blocked || !textActions.available }} />
+            preview={preview} locale={locale} colors={colors} client={client} onViewChange={onTextViewChange}
+            workspaceHtmlNavigation={workspaceHtmlNavigation} actions={{ ...textActions, busy: blocked || !textActions.available }} />
           : <View style={styles.previewMessage}>
             <Text accessibilityRole="alert" style={[styles.label, { color: preview.kind === "error" ? colors.negative : colors.ink }]}>
               {mobileMessage(locale, preview.kind === "error" ? "preview.unavailable" : "preview.noInApp")}
             </Text>
             <Text selectable style={[styles.description, { color: colors.muted }]}>{preview.reason}</Text>
+            {preview.kind === "error" && onRetry && <Action label={mobileMessage(locale, "common.retry")} colors={colors}
+              disabled={blocked} onPress={onRetry} />}
           </View>}
         </MobileFilesPreviewPager>
       </>}

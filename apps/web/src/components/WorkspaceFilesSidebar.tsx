@@ -25,6 +25,7 @@ import {
   ChevronRight,
   ChevronsDownUp,
   Clipboard,
+  Eye,
   File,
   FileCode2,
   FileImage,
@@ -151,6 +152,7 @@ export interface WorkspaceFilesSidebarLabels {
   readonly exitSearch: string;
   readonly collapseAll: string;
   readonly refresh: string;
+  readonly showIgnoredDirectories: string;
   readonly filterPlaceholder: string;
   readonly clearFilter: string;
   readonly loadingTree: string;
@@ -204,6 +206,7 @@ export interface WorkspaceFilesSidebarProps {
   readonly searchFocusToken?: number;
   readonly allowEntryDrag?: boolean;
   readonly documentActions?: WorkspaceFilesDocumentActions;
+  readonly ignoredDirectories?: { readonly shown: boolean; readonly onToggle: () => void };
   readonly loadDirectory: (input: { readonly workspaceId: string; readonly parentPath: string }) => Promise<readonly WorkspaceFilesEntryView[]>;
   readonly loadFileIndex?: (input: { readonly workspaceId: string }, signal: AbortSignal) => Promise<WorkspaceFilesFileIndexPage>;
   readonly searchWorkspace: (input: WorkspaceFilesSearchRequest, signal: AbortSignal) => AsyncIterable<WorkspaceFilesSearchEvent>;
@@ -310,6 +313,7 @@ const DEFAULT_LABELS: WorkspaceFilesSidebarLabels = {
   search: "Search files",
   exitSearch: "Exit search",
   collapseAll: "Collapse all folders",
+  showIgnoredDirectories: "Show ignored directories",
   refresh: "Refresh files",
   filterPlaceholder: "Filter files",
   clearFilter: "Clear file filter",
@@ -362,6 +366,7 @@ const WorkspaceFilesSidebarBody = forwardRef<WorkspaceFilesSidebarHandle, Worksp
   searchFocusToken,
   allowEntryDrag = true,
   documentActions,
+  ignoredDirectories,
   loadDirectory,
   loadFileIndex,
   searchWorkspace,
@@ -715,6 +720,7 @@ const WorkspaceFilesSidebarBody = forwardRef<WorkspaceFilesSidebarHandle, Worksp
       <div className="workspace-files-sidebar__actions">
         {mode === "search" ? <IconButton label={labels.exitSearch} onClick={closeSearch}><X aria-hidden="true" /></IconButton> : <>
           <IconButton buttonRef={searchButtonRef} label={labels.search} onClick={openSearch}><Search aria-hidden="true" /></IconButton>
+          {ignoredDirectories !== undefined && <IconButton label={labels.showIgnoredDirectories} aria-pressed={ignoredDirectories.shown} onClick={ignoredDirectories.onToggle}><Eye aria-hidden="true" /></IconButton>}
           <IconButton label={labels.collapseAll} onClick={tree.collapseAll}><ChevronsDownUp aria-hidden="true" /></IconButton>
           <IconButton label={labels.refresh} onClick={() => { void tree.refresh(); fileIndex.refresh(); }}><RefreshCw aria-hidden="true" /></IconButton>
         </>}
@@ -946,11 +952,14 @@ function useWorkspaceDirectoryTree(input: {
     }
   }, [input.loadDirectory, input.workspaceId, replaceDirectories]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     generationRef.current += 1;
     revealTokenRef.current += 1;
     requestTokens.current.clear();
     inflightRequests.current.clear();
+    pendingEventParents.current.clear();
+    clearTimeout(eventRefreshTimer.current);
+    eventRefreshTimer.current = undefined;
     const seeded = initialDirectoryState(input.initialDirectories);
     directoriesRef.current = seeded;
     setDirectories(seeded);

@@ -8,6 +8,11 @@ export interface WorkspaceFileEditorBaseline {
   readonly revision: string;
 }
 
+/** In-memory buffer owned by the current Files route across a connection rebuild. */
+export interface WorkspaceFileReconnectDraft {
+  current: { readonly baseline: WorkspaceFileEditorBaseline; readonly editorText: string } | undefined;
+}
+
 export interface WorkspaceFileSaveDraft {
   readonly path: string;
   readonly text: string;

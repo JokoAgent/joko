@@ -16738,6 +16738,7 @@ function protoWorkspaceEntryListingPolicy(
   policy: WorkspaceEntryListingOptionsView["policy"]
 ): WorkspaceEntryListingPolicy {
   if (policy === "documentTree") return WorkspaceEntryListingPolicy.DOCUMENT_TREE;
+  if (policy === "documentTreeShowIgnored") return WorkspaceEntryListingPolicy.DOCUMENT_TREE_SHOW_IGNORED;
   if (policy === "default") return WorkspaceEntryListingPolicy.DEFAULT;
   return WorkspaceEntryListingPolicy.UNSPECIFIED;
 }

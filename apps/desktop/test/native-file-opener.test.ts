@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { nativeFileActionRequestId } from "@joko/contracts";
@@ -14,6 +14,11 @@ import {
   parseDesktopOpenFileRequest
 } from "../src/native-file-opener.js";
 import { mkdtemp } from "./test-paths.js";
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const fs = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...fs, realpath: vi.fn(fs.realpath) };
+});
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -101,6 +106,46 @@ describe("native file open ownership", () => {
     await expect(queued).resolves.toEqual({ status: "cancelled" });
     expect(openPath).toHaveBeenCalledOnce();
     owner.dispose();
+  });
+
+  it("honors the scope cancellation received during final file verification", async () => {
+    const directory = await root();
+    const openPath = vi.fn(async () => "");
+    const owner = new NativeFileOpener({ directory, openPath });
+    const { requestId, file } = input("cancel-before-dispatch.pdf");
+    const request = { requestId, file: { ...file, mediaType: "application/pdf" } };
+    const caller = scope();
+    const reachedFinalVerification = deferred<void>();
+    const finishVerification = deferred<void>();
+    const fs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    let fileVerifications = 0;
+    vi.mocked(realpath).mockImplementation(async (path, options) => {
+      const resolved = await fs.realpath(path, options);
+      if (typeof path === "string" && basename(path) === request.file.name && ++fileVerifications === 2) {
+        reachedFinalVerification.resolve();
+        await finishVerification.promise;
+      }
+      return resolved;
+    });
+
+    try {
+      const pending = owner.open(request, caller);
+      await Promise.race([
+        reachedFinalVerification.promise,
+        pending.then(() => { throw new Error("The request completed before final verification."); })
+      ]);
+      expect((await manifest(directory)).entries).toMatchObject([{ state: "retained" }]);
+      owner.cancel(request.requestId, caller.id);
+      finishVerification.resolve();
+      await expect(pending).resolves.toEqual({ status: "cancelled" });
+      expect(openPath).not.toHaveBeenCalled();
+      expect((await manifest(directory)).entries).toEqual([]);
+      expect(await readdir(directory)).toEqual(["files.json"]);
+    } finally {
+      finishVerification.resolve();
+      vi.mocked(realpath).mockImplementation(fs.realpath);
+      owner.dispose();
+    }
   });
 
   it("adopts one exact list/app selection before materialization and binds it into request replay", async () => {

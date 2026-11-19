@@ -5,7 +5,7 @@ import { builtinSkillIntentForText } from "./builtin-skill-intent.js";
 import { normalizeBrowserCommentStyleChanges, normalizeBrowserCommentTarget, sanitizeBrowserCommentPageUrl } from "./browser-comment-draft.js";
 import { normalizeExtensionRecommendation, sameExtensionRecommendation } from "./extension-suggestion-handoff.js";
 import { normalizeRecentProjects, publishRecentProjectsChange, withRecentProject, withoutRecentProject, type RecentProject } from "./recent-projects.js";
-import { normalizeMachineCache, normalizeMachineSelection, type MachineSelection } from "./machine-federation.js";
+import { machineCacheCanReplace, normalizeMachineCache, normalizeMachineSelection, type MachineSelection } from "./machine-federation.js";
 import {
   isNavigationMode,
   NAVIGATION_DEFAULT_WIDTH,
@@ -726,7 +726,11 @@ export class LocalState {
   async saveMachineCache(cache: MachineCacheView): Promise<void> {
     const normalized = normalizeMachineCache(cache);
     if (normalized === undefined) throw new Error("The machine cache is invalid.");
-    await this.put(MACHINE_CACHE_STORE, normalized.profileId, normalized);
+    const transaction = this.#database.transaction(MACHINE_CACHE_STORE, "readwrite");
+    const rows = transaction.objectStore(MACHINE_CACHE_STORE);
+    const current = normalizeMachineCache(await requestResult(rows.get(normalized.profileId)));
+    if (machineCacheCanReplace(current, normalized)) rows.put(normalized, normalized.profileId);
+    await transactionDone(transaction);
   }
 
   async deleteMachineCache(profileId: string): Promise<void> {

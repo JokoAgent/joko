@@ -14209,6 +14209,76 @@ describe("native current-task Files ownership", () => {
     expect(app.state.files.preview).toBeUndefined(); expect(app.state.files.previewPager).toBeUndefined();
   });
 
+  it("retries the original failed Workspace text preview in place and ignores a retired retry", async () => {
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    const entry = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "notes.txt", displayName: "notes.txt",
+      mediaType: "text/plain", kind: FileKind.REGULAR, revision: { opaqueRevision: "notes-r1", byteSize: 5n } });
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [entry], revision: "readable-directory" });
+    const read = vi.mocked(network.readWorkspaceFile).mockRejectedValueOnce(new ConnectError("Temporary text read failure", Code.Unavailable))
+      .mockResolvedValue(create(FilePreviewSchema, { entry,
+        content: { case: "text", value: { utf8Text: "notes", startByte: 0n, endByte: 5n, totalLines: 1 } } }));
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles();
+    await app.openFilesPreviewPager({ kind: "workspace-entry", entry });
+    const pager = app.state.files.previewPager;
+    const failed = app.state.files.preview; if (failed?.kind !== "error") throw new Error("The first text read should fail.");
+    expect(failed.reason).toContain("Temporary text read failure");
+    await app.retryFilesTextPreview(failed);
+    expect(app.state.files.previewPager?.id).toBe(pager?.id);
+    expect(app.state.files.preview).toMatchObject({ kind: "text", workspacePath: entry.relativePath, text: "notes" });
+    expect(read.mock.calls.map(([, workspaceId, path, revision]) => [workspaceId, path, revision]))
+      .toEqual([["workspace", entry.relativePath, entry.revision], ["workspace", entry.relativePath, entry.revision]]);
+    app.closeFilesPreview();
+    await app.retryFilesTextPreview(failed);
+    expect(app.state.files.preview).toBeUndefined(); expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("reopens the same directory and fresh text page after a Mobile network-path reconnect", async () => {
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    const file = (suffix: string, text: string) => create(WorkspaceEntrySchema, { workspaceId: "workspace",
+      relativePath: "src/notes.txt", displayName: "notes.txt", kind: FileKind.REGULAR, mediaType: "text/plain",
+      revision: { opaqueRevision: suffix, byteSize: BigInt(text.length) } });
+    const first = file("notes-r1", "original"), second = file("notes-r2", "updated");
+    let currentFile = first, currentText = "original";
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspaceId, path) => ({
+      entries: path === "src" ? [currentFile] : [sourceDirectory],
+      revision: path === "src" ? currentFile.revision!.opaqueRevision : "root" }));
+    const read = vi.mocked(network.readWorkspaceFile).mockImplementation(async () => create(FilePreviewSchema, { entry: currentFile,
+      content: { case: "text", value: { utf8Text: currentText, startByte: 0n, endByte: currentFile.revision!.byteSize, totalLines: 1 } } }));
+    let nextId = 0;
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, () => `files-preview-${++nextId}`);
+    await app.start(); await app.openFiles();
+    await app.openFilesDirectory("src");
+    await app.openFilesPreviewPager({ kind: "workspace-entry", entry: first }, "mtime");
+    const before = app.state.files.previewPager!;
+    expect(app.state.files.preview).toMatchObject({ kind: "text", text: "original" });
+    const reconnect = async () => {
+      let inspect!: (identity: NodeIdentity) => void;
+      vi.mocked(network.inspect).mockImplementationOnce(() => new Promise((resolve) => { inspect = resolve; }));
+      app.notifyNetworkChanged();
+      await vi.waitFor(() => expect(inspect).toBeTypeOf("function"));
+      expect(app.state.files.preview).toBeUndefined();
+      return () => inspect(node);
+    };
+    const finish = await reconnect();
+    currentFile = second; currentText = "updated"; finish();
+    await vi.waitFor(() => expect(app.state.status).toBe("connected"));
+    await app.openFiles();
+    expect(app.state.files.location).toEqual({ kind: "workspace", path: "src" });
+    expect(app.state.files.preview).toMatchObject({ kind: "text", workspacePath: second.relativePath, text: "updated" });
+    expect(app.state.files.previewPager).toMatchObject({ sort: "mtime", index: 0 });
+    expect(app.state.files.previewPager?.id).not.toBe(before.id);
+    await expect(app.selectFilesPreviewPage(before.id, before.pages[before.index]!.key)).rejects.toThrow(/window was retired/u);
+    expect(read.mock.calls.map(([, , path, revision]) => [path, revision])).toEqual([
+      [first.relativePath, first.revision], [second.relativePath, second.revision]
+    ]);
+    const finishAfterClose = await reconnect(); app.closeFiles(); finishAfterClose();
+    await vi.waitFor(() => expect(app.state.status).toBe("connected"));
+    await app.openFiles();
+    expect(app.state.files.location).toEqual({ kind: "workspace", path: "" });
+    expect(app.state.files.preview).toBeUndefined(); expect(read).toHaveBeenCalledTimes(2);
+    app.closeFiles();
+  });
+
   it("keeps canceled raw pager reads occupied, switches only the selected page and rejects a late old preview", async () => {
     const entries = ["alpha", "beta", "gamma"].map((name) => create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: name + ".txt",
       displayName: name + ".txt", kind: FileKind.REGULAR, mediaType: "text/plain", revision: { opaqueRevision: name + "-r1", byteSize: BigInt(name.length) } }));
@@ -14434,6 +14504,47 @@ describe("native current-task Files ownership", () => {
     await expect(app.prepareFilesHtmlResources(preview, new AbortController().signal)).rejects.toThrow(/snapshot changed/u);
     app.closeFilesPreview(); expect(() => app.assertFilesHtmlResourcesCurrent(descriptor.leaseId)).toThrow(/released/u);
     expect(app.filesHtmlResourceOwnerKey(preview)).toBeUndefined(); expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("reads each requested HTML page through the original Workspace and retires its pending document on close", async () => {
+    const originalHtml = '<a href="./details.html">Details</a>';
+    const childHtml = "<h1>Current details</h1>";
+    const file = (path: string, text: string) => {
+      const bytes = new TextEncoder().encode(text);
+      return create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: path, kind: FileKind.REGULAR, mediaType: "text/html",
+        revision: { opaqueRevision: `sha256:${sha256Hex(bytes)}:${bytes.length}`, byteSize: BigInt(bytes.length), sha256Hex: sha256Hex(bytes) } });
+    };
+    const original = file("docs/index.html", originalHtml);
+    const child = file("docs/details.html", childHtml);
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    vi.mocked(network.listWorkspaceDirectory).mockImplementation(async (_credential, _workspaceId, parent) => ({
+      entries: parent === "docs" ? [original, child] : [sourceDirectory], revision: "directory-" + parent }));
+    vi.mocked(network.readWorkspaceFile).mockResolvedValue(create(FilePreviewSchema, { entry: original,
+      content: { case: "text", value: { utf8Text: originalHtml, startByte: 0n, endByte: original.revision!.byteSize, totalLines: 1 } } }));
+    const childSnapshot = { html: childHtml, file: { $typeName: "joko.v1.WorkspaceHtmlReference" as const,
+      workspaceId: "workspace", relativePath: child.relativePath, expectedRevision: "workspace-html:" + "a".repeat(64) } };
+    const snapshot = vi.mocked(network.readWorkspaceHtmlSnapshot).mockResolvedValue(childSnapshot);
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start(); await app.openFiles(); await app.openFilesDirectory("docs");
+    await app.previewWorkspaceEntry(app.state.files.entries.find((entry) => entry.relativePath === original.relativePath)!);
+    const preview = app.state.files.preview; if (preview?.kind !== "text") throw new Error("HTML fixture missing");
+    const load = (path: string) => app.prepareFilesHtmlResources(preview, new AbortController().signal, path);
+    await expect(load("other/private.html")).rejects.toThrow(/current Workspace preview directory/u);
+    expect(snapshot).not.toHaveBeenCalled();
+    const page = await load(child.relativePath);
+    expect(page.html).toBe(childHtml); expect(app.state.files.preview).toBe(preview);
+    expect(snapshot).toHaveBeenCalledExactlyOnceWith(credential, handoffSnapshot.sessions[0]!.sessionId,
+      { workspaceId: "workspace", relativePath: child.relativePath, expectedRevision: "" }, expect.any(AbortSignal));
+    expect(() => app.assertFilesHtmlResourcesCurrent(page.leaseId)).not.toThrow();
+    app.releaseFilesHtmlResources(page.leaseId);
+    snapshot.mockResolvedValueOnce({ ...childSnapshot, html: "Unmatched document bytes" });
+    await expect(load(child.relativePath)).rejects.toThrow(/did not match the selected file/u);
+    let finish!: (value: typeof childSnapshot) => void;
+    snapshot.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const late = expect(load(child.relativePath)).rejects.toThrow(/source changed|cancelled|aborted/iu);
+    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+    app.closeFilesPreview(); finish(childSnapshot); await late;
+    expect(app.state.files.preview).toBeUndefined(); expect(network.submit).not.toHaveBeenCalled();
   });
 
   it("freezes conversation images from authenticated canonical sources and rejects deletion before sharing", async () => {
@@ -15805,12 +15916,22 @@ describe("native current-task Files ownership", () => {
       sourceKind: "workspace", initialIndex: 0,
       pages: [{ title: "b.png" }, { title: "a.png" }, { title: "moving.gif" }]
     });
+    vi.mocked(network.downloadBlob).mockRejectedValueOnce(new Error("Image read temporarily unavailable"));
+    await expect(app.loadImageGalleryPage(descriptor.leaseId, descriptor.initialIndex)).rejects.toThrow("Image read temporarily unavailable");
+    let selectedFailedPage = true;
+    const failedPage = app.prepareFilesImageGalleryPathCopy(descriptor.leaseId, descriptor.pages[0]!.pageId, {
+      kind: "failed", pageIndex: 0, isCurrent: () => selectedFailedPage
+    });
+    expect(failedPage).toMatchObject({ text: "images/b.png", kind: "path" });
+    failedPage.assertCurrent();
+    selectedFailedPage = false;
+    expect(() => failedPage.assertCurrent()).toThrow(/visible Files image changed/u);
     const page = await app.loadImageGalleryPage(descriptor.leaseId, descriptor.initialIndex);
     expect(page).toMatchObject({
       pageIndex: 0, pageCount: 3, expectedWidthPixels: 3, expectedHeightPixels: 2,
       addable: true, annotatable: true
     });
-    const copiedPath = app.prepareFilesImageGalleryPathCopy(descriptor.leaseId, page.leaseId, page.pageId);
+    const copiedPath = app.prepareFilesImageGalleryPathCopy(descriptor.leaseId, page.pageId, { kind: "loaded", loadId: page.leaseId });
     expect(copiedPath).toMatchObject({ text: "images/b.png", kind: "path" }); copiedPath.assertCurrent();
     app.confirmImageGalleryPageDecoded(descriptor.leaseId, page.leaseId, page.pageId, {
       width: 3, height: 2, mediaType: "image/png", isAnimated: false
@@ -15902,7 +16023,7 @@ describe("native current-task Files ownership", () => {
     });
     const page = await app.loadImageGalleryPage(descriptor.leaseId, descriptor.initialIndex);
     expect(page).toMatchObject({ fileName: "two.png", pageIndex: 1, pageCount: 2 });
-    const copiedName = app.prepareFilesImageGalleryPathCopy(descriptor.leaseId, page.leaseId, page.pageId);
+    const copiedName = app.prepareFilesImageGalleryPathCopy(descriptor.leaseId, page.pageId, { kind: "loaded", loadId: page.leaseId });
     expect(copiedName).toMatchObject({ text: "two.png", kind: "file-name" }); copiedName.assertCurrent();
     const sorted = await app.openFilesImageGallery({ kind: "artifact", artifact: selected }, undefined, "mtime");
     expect(() => copiedName.assertCurrent()).toThrow(/visible Files image changed/u);
@@ -17172,6 +17293,33 @@ describe("native current-task Files ownership", () => {
     await vi.advanceTimersByTimeAsync(400);
     expect(app.state.files.entries).toEqual([fresh]);
     expect(watch).toHaveBeenCalledTimes(2);
+  });
+
+  it("starts the same Workspace watch when Files refresh recovers its initial index failure", async () => {
+    const network = fakeNetwork(); configureFiles(network);
+    vi.mocked(network.listWorkspaceFileIndex).mockRejectedValueOnce(new ConnectError("Index temporarily unavailable", Code.Unavailable));
+    let publish!: () => void;
+    const watch = vi.mocked(network.watchWorkspace).mockImplementation(async function* (_credential, _workspace, signal) {
+      await new Promise<void>((resolve) => { publish = resolve; });
+      if (signal.aborted) return;
+      yield create(WorkspaceFileChangeSchema, { workspaceId: "workspace", kind: WorkspaceFileChangeKind.MODIFIED,
+        relativePath: readme.relativePath, sequence: 1n, streamRevision: "watch-1" });
+      await new Promise<void>((resolve) => {
+        if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+    });
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles();
+    try {
+      expect(app.state.files).toMatchObject({ status: "error", watchStatus: "idle" });
+      expect(watch).not.toHaveBeenCalled();
+      await app.refreshFiles();
+      expect(app.state.files).toMatchObject({ status: "ready", watchStatus: "watching" });
+      expect(watch).toHaveBeenCalledExactlyOnceWith(credential, "workspace", expect.any(AbortSignal));
+      const entries = [sourceDirectory, readme, create(WorkspaceEntrySchema, { ...readme, relativePath: "later.txt" })];
+      vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries, revision: "directory-after-watch" });
+      publish();
+      await vi.waitFor(() => expect(app.state.files.entries).toEqual(entries));
+    } finally { app.closeFiles(); }
   });
 
   it("cancels a scheduled Files watch retry when the user leaves and creates a fresh watch on reopen", async () => {

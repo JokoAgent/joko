@@ -68,12 +68,16 @@ export function toggleMachineProfile(
 export function machineCacheFromSnapshot(profile: ConnectionProfile, snapshot: AppSnapshot, now = Date.now()): MachineCacheView {
   const targets = new Map(snapshot.targets.map((target) => [target.id, target] as const));
   const interactions = new Map(snapshot.interactions.map((interaction) => [interaction.sessionId, interaction.kind] as const));
+  const cursor = snapshot.generation > 0n && snapshot.cursor >= 0n
+    ? { generation: snapshot.generation.toString(), sequence: snapshot.cursor.toString() }
+    : undefined;
   return {
     profileId: profile.id,
     serverId: profile.serverId,
     name: boundedText(profile.name, MAX_NAME_LENGTH) || boundedText(snapshot.server.name, MAX_NAME_LENGTH) || profile.id,
     origin: profile.origin,
     updatedAt: now,
+    ...(cursor === undefined ? {} : { cursor }),
     sessions: [...snapshot.sessions]
       .filter((session) => !session.hidden && !session.derivationOrigin?.sideChat && safeIdentifier(session.id))
       .sort((left, right) => right.updatedAt - left.updatedAt || left.id.localeCompare(right.id))
@@ -113,12 +117,14 @@ export function machineCacheFromSnapshot(profile: ConnectionProfile, snapshot: A
 export function normalizeMachineCache(value: unknown): MachineCacheView | undefined {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
-  if (Object.keys(record).sort().join(",") !== "name,origin,profileId,serverId,sessions,updatedAt" ||
+  if (Object.keys(record).some(key => !["name", "origin", "profileId", "serverId", "sessions", "updatedAt", "cursor"].includes(key)) ||
     !safeIdentifier(record["profileId"]) || !safeIdentifier(record["serverId"]) ||
     typeof record["origin"] !== "string" || record["origin"].length > 2_048 || !Array.isArray(record["sessions"])) return undefined;
   if (typeof record["updatedAt"] !== "number" || !Number.isSafeInteger(record["updatedAt"]) || record["updatedAt"] < 0) return undefined;
   const name = boundedText(record["name"], MAX_NAME_LENGTH);
   if (name === "" || name !== record["name"]) return undefined;
+  const cursor = normalizeMachineCacheCursor(record["cursor"]);
+  if (record["cursor"] !== undefined && cursor === undefined) return undefined;
   const rawSessions = record["sessions"];
   if (rawSessions.length > MAX_CACHED_SESSIONS) return undefined;
   const sessions: MachineSessionCacheView[] = [];
@@ -133,8 +139,27 @@ export function normalizeMachineCache(value: unknown): MachineCacheView | undefi
     name,
     origin: record["origin"],
     updatedAt: record["updatedAt"],
+    ...(cursor === undefined ? {} : { cursor }),
     sessions
   };
+}
+
+function normalizeMachineCacheCursor(value: unknown): MachineCacheView["cursor"] {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const { generation, sequence } = record;
+  const unsigned = /^(?:0|[1-9][0-9]{0,19})$/u;
+  if (Object.keys(record).sort().join(",") !== "generation,sequence" || typeof generation !== "string"
+    || !unsigned.test(generation) || generation === "0" || typeof sequence !== "string" || !unsigned.test(sequence)
+    || BigInt(generation) > 0xffff_ffff_ffff_ffffn || BigInt(sequence) > 0xffff_ffff_ffff_ffffn) return undefined;
+  return { generation, sequence };
+}
+
+export function machineCacheCanReplace(current: MachineCacheView | undefined, incoming: MachineCacheView): boolean {
+  if (current?.cursor === undefined || current.profileId !== incoming.profileId
+    || current.serverId !== incoming.serverId || current.origin !== incoming.origin) return true;
+  if (incoming.cursor === undefined) return false;
+  return current.cursor.generation !== incoming.cursor.generation || BigInt(incoming.cursor.sequence) >= BigInt(current.cursor.sequence);
 }
 
 export function selectedRemoteMachineCaches(

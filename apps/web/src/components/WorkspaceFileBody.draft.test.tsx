@@ -7,6 +7,7 @@ import type { AppController } from "../controller.js";
 import type { WorkspaceFilePreviewView } from "../model.js";
 import { workspaceDocumentController } from "../workspace-document-controller.js";
 import { WorkspaceFileBody } from "./WorkspaceFileBody.js";
+import type { WorkspaceFileReconnectDraft } from "./workspace-file-editor.js";
 
 vi.mock("./WorkspaceTextEditor.js", async () => {
   const { forwardRef } = await import("react");
@@ -18,6 +19,50 @@ vi.mock("./WorkspaceTextEditor.js", async () => {
       return <textarea ref={ref} value={value} readOnly={onChange === undefined} onChange={event => onChange?.(event.target.value)} />;
     })
   };
+});
+
+it("restores the original draft and disk baseline after the Files editor remounts", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const identity = { sessionId: "reconnect-task", workspaceId: "reconnect-workspace", path: "notes.txt" };
+  const write = vi.fn<AppController["writeWorkspaceTextFile"]>(async () => ({ path: identity.path, name: identity.path, revision: "saved" }));
+  const controller = {
+    state: { effectiveLocale: "en", preferences: {} },
+    writeWorkspaceTextFile: write, getArtifactUrl: vi.fn(), releaseArtifactUrl: vi.fn()
+  } as unknown as AppController;
+  const reconnectDraft: WorkspaceFileReconnectDraft = { current: undefined };
+  const host = document.body.appendChild(document.createElement("div"));
+  const root = createRoot(host);
+  const original: WorkspaceFilePreviewView = { path: identity.path, name: identity.path, kind: "text", text: "Original text", revision: "before", truncated: false };
+  const render = (preview: WorkspaceFilePreviewView) => act(async () => root.render(
+    <WorkspaceFileBody {...identity} controller={controller} preview={preview} canWrite reconnectDraft={reconnectDraft}
+      labels={{ overwriteDisk: "Overwrite confirmed disk" }} />
+  ));
+  try {
+    await render(original);
+    const before = host.querySelector("textarea")!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(before, "Unsaved edits");
+      before.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => root.render(<div role="status">Connecting…</div>));
+    expect(host.querySelector("textarea")).toBeNull();
+    expect(reconnectDraft.current).toMatchObject({ editorText: "Unsaved edits", baseline: { revision: "before" } });
+    await render({ ...original, revision: "after", text: "Changed on disk" });
+    const after = host.querySelector("textarea")!;
+    expect(after).not.toBe(before);
+    expect(after.value).toBe("Unsaved edits");
+    expect(write).not.toHaveBeenCalled();
+    const overwrite = [...host.querySelectorAll("button")].find(button => button.textContent === "Overwrite confirmed disk")!;
+    await act(async () => overwrite.click());
+    expect(write).toHaveBeenCalledExactlyOnceWith(identity.workspaceId, {
+      path: identity.path, text: "Unsaved edits", expectedRevision: "after"
+    });
+    expect(reconnectDraft.current).toBeUndefined();
+  } finally {
+    await act(async () => root.unmount());
+    host.remove();
+    vi.unstubAllGlobals();
+  }
 });
 
 it("keeps the same dirty document through a truncated refresh and waits for an explicit conflict decision", async () => {

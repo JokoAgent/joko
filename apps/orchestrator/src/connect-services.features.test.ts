@@ -4784,7 +4784,7 @@ describe("Connect typed feature boundaries", () => {
     }
   });
 
-  it("previews an integrity-checked inverse diff and executes dialogue-only rewind without restoring files", async () => {
+  it.each(["project", "worktree"] as const)("previews the inverse diff and executes dialogue-only rewind in the %s without restoring files", async (scope) => {
     const directory = mkdtempSync(join(tmpdir(), "joko-connect-dialogue-rewind-"));
     cleanupPaths.push(directory);
     const snapshotPath = join(directory, "after.txt");
@@ -4793,7 +4793,7 @@ describe("Connect typed feature boundaries", () => {
     const changeSet = {
       id: "change-set-dialogue",
       baselineId: "baseline-dialogue",
-      workspaceId: "workspace-dialogue",
+      workspaceId: scope === "worktree" ? "workspace-dialogue-worktree" : "workspace-dialogue",
       workspaceRoot: directory,
       sessionId: "session-dialogue",
       runId: "run-dialogue",
@@ -4824,25 +4824,28 @@ describe("Connect typed feature boundaries", () => {
     const navigateTree = vi.fn(completedNavigation);
     const consumeDialogueOnlyRewind = vi.fn(async () => changeSet);
     const applyRewind = vi.fn(async () => changeSet);
+    const session = {
+      descriptor: {
+        id: "session-dialogue",
+        backendId: "pi",
+        targetId: "target-dialogue",
+        title: "Dialogue",
+        binding: { opaqueRef: "pi://dialogue", generation: 1 },
+        pinned: false,
+        archived: false,
+        permissionMode: "ask",
+        planMode: false,
+        fastMode: false,
+        createdAt: 1,
+        updatedAt: 1,
+        ...(scope === "worktree" ? { worktree: { workspaceId: changeSet.workspaceId } } : {})
+      },
+      revision: 1n
+    };
     const store = {
       findOperation: () => undefined,
-      listSessions: () => [{
-        descriptor: {
-          id: "session-dialogue",
-          backendId: "pi",
-          targetId: "target-dialogue",
-          title: "Dialogue",
-          binding: { opaqueRef: "pi://dialogue", generation: 1 },
-          pinned: false,
-          archived: false,
-          permissionMode: "ask",
-          planMode: false,
-          fastMode: false,
-          createdAt: 1,
-          updatedAt: 1
-        },
-        revision: 1n
-      }],
+      getSession: () => session,
+      listSessions: () => [session],
       getBackend: () => ({ descriptor: { capabilities: new Map([["session.rewind", { key: "session.rewind", supported: true }]]) } }),
       getTarget: () => ({ descriptor: { id: "target-dialogue" }, metadata: { workspaceId: "workspace-dialogue" } })
     };
@@ -4896,7 +4899,7 @@ describe("Connect typed feature boundaries", () => {
     expect(applyRewind).not.toHaveBeenCalled();
     expect(operation.operation?.result?.payload).toMatchObject({
       case: "workspaceRewind",
-      value: { dialogueRewound: true, filesRewound: false, restoredPaths: [] }
+      value: { workspaceId: changeSet.workspaceId, dialogueRewound: true, filesRewound: false, restoredPaths: [] }
     });
   });
 

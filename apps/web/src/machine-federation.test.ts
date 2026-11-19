@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { routeFromHash, sessionRouteHash } from "./controller.js";
 import {
+  machineCacheCanReplace,
   machineCacheFromSnapshot,
   normalizeMachineCache,
   normalizeMachineSelection,
@@ -192,6 +193,27 @@ describe("machine federation cache", () => {
     expect(normalizeMachineCache({ ...cache, sessions: [{ ...rawSessions[0], lastActivityAt: undefined }] })).toBeUndefined();
     expect(normalizeMachineCache({ ...cache, sessions: [{ ...rawSessions[0], taskTags: [{ id: "work", name: "Work", color: "unknown", nameCustomized: false }] }] })).toBeUndefined();
     expect(normalizeMachineCache({ profileId: "bad\nid", origin: "https://example.test", updatedAt: 0, sessions: [] })).toBeUndefined();
+  });
+
+  it("keeps a newer Owner directory when another window persists a late archive snapshot", () => {
+    const profile = profiles[1]!;
+    const base = machineCacheFromSnapshot(profile, { ...emptySnapshot(), generation: 100n, cursor: 42n }, 60);
+    const stale = {
+      ...base, updatedAt: 100,
+      cursor: { generation: "100", sequence: "41" },
+      sessions: [{ id: "deleted-after-archive", name: "Archived task", state: "idle" as const,
+        pinned: false, archived: true, lastActivityAt: 40, taskTags: [] }]
+    };
+    expect(normalizeMachineCache(base)).toEqual(base);
+    expect(base.cursor).toEqual({ generation: "100", sequence: "42" });
+    expect(machineCacheCanReplace(base, stale)).toBe(false);
+    expect(machineCacheCanReplace(stale, base)).toBe(true);
+    const { cursor: _cursor, ...existingWithoutCursor } = stale;
+    expect(normalizeMachineCache(existingWithoutCursor)).toEqual(existingWithoutCursor);
+    expect(machineCacheCanReplace(base, existingWithoutCursor)).toBe(false);
+    expect(machineCacheCanReplace(existingWithoutCursor, base)).toBe(true);
+    expect(machineCacheCanReplace(base, { ...stale, cursor: { generation: "101", sequence: "1" } })).toBe(true);
+    expect(normalizeMachineCache({ ...base, cursor: { generation: "100", sequence: "042" } })).toBeUndefined();
   });
 
   it("sorts selected remote shards stably while retaining an offline cache", () => {

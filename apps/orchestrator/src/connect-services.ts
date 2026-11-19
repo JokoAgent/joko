@@ -506,6 +506,7 @@ import {
   type VoiceInputSettingsController
 } from "./voice-input-settings.js";
 import { createWorktreeConnectService } from "./worktree-connect-service.js";
+import { workspaceIdFor } from "./workspace-run-capture.js";
 import { installSessionCodeHostContextRuntime } from "./session-code-host-context.js";
 import type { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
 import { readPersonalDevelopmentPurpose } from "./personal-development-purpose.js";
@@ -8677,6 +8678,7 @@ function nativeWorkspaceEntryListingPolicy(
     policy === contract.WorkspaceEntryListingPolicy.DEFAULT
   ) return "default";
   if (policy === contract.WorkspaceEntryListingPolicy.DOCUMENT_TREE) return "document_tree";
+  if (policy === contract.WorkspaceEntryListingPolicy.DOCUMENT_TREE_SHOW_IGNORED) return "document_tree_show_ignored";
   throw invalidArgument("listing_policy is unsupported");
 }
 
@@ -19706,7 +19708,7 @@ async function dispatchMutation(
               : dependencies.store.getTarget(currentSession.descriptor.targetId);
             const currentWorkspaceId = currentTarget === undefined
               ? undefined
-              : stringValue(asRecord(currentTarget.metadata)["workspaceId"]) ?? currentTarget.descriptor.id;
+              : workspaceIdFor(dependencies.store, currentTarget.descriptor, currentChangeSet.sessionId);
             if (currentSession === undefined || currentWorkspaceId !== currentChangeSet.workspaceId) {
               throw new ConnectError("The task owning this dialogue rewind is unavailable or moved.", Code.FailedPrecondition);
             }
