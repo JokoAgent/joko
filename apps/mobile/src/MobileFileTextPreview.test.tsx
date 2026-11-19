@@ -16,13 +16,13 @@ import type { MobileFilePreview } from "./workspace-files";
 
 const native = vi.hoisted(() => ({
   scrollToIndex: vi.fn(), scrollToOffset: vi.fn(), inject: vi.fn(), openURL: vi.fn(async (_url: string) => undefined), canOpenURL: vi.fn(async () => true),
-  currentState: "active", appListeners: new Set<(value: string) => void>(), pressureListeners: new Set<() => void>(),
+  platform: "android", currentState: "active", appListeners: new Set<(value: string) => void>(), pressureListeners: new Set<() => void>(),
   layout: undefined as ((event: { nativeEvent: { lines: { text: string; y: number }[] } }) => void) | undefined,
   web: undefined as { source: { html: string; uri?: string }; originWhitelist: readonly string[]; onLoad?(): void; onLoadEnd?(): void;
     menuItems?: readonly { key: string; label: string }[];
     onMessage?(event: { nativeEvent: { data: string } }): void;
     onCustomMenuSelection?(event: { nativeEvent: { key: string; label: string; selectedText: string } }): void;
-    onRenderProcessGone?(): void; onShouldStartLoadWithRequest(request: { url: string }): boolean } | undefined,
+    onContentProcessDidTerminate?(): void; onRenderProcessGone?(): void; onShouldStartLoadWithRequest(request: { url: string }): boolean } | undefined,
   list: undefined as { data: readonly string[]; onScrollToIndexFailed(info: { averageItemLength: number; index: number }): void } | undefined,
   address: undefined as { value: string; accessibilityLabel: string; onChangeText(value: string): void; onSubmitEditing(): void } | undefined
 }));
@@ -57,7 +57,8 @@ vi.mock("react-native", () => {
       useImperativeHandle(ref, () => ({ blur: vi.fn() })); native.address = props;
       return createElement("input", { "aria-label": props.accessibilityLabel, readOnly: true, value: props.value });
     }),
-    Linking: { openURL: native.openURL, canOpenURL: native.canOpenURL }, Platform: { select: (options: { android: string }) => options.android },
+    Linking: { openURL: native.openURL, canOpenURL: native.canOpenURL },
+    Platform: { get OS() { return native.platform; }, select: (options: { android: string }) => options.android },
     StyleSheet: { create: (value: unknown) => value },
     AppState: { get currentState() { return native.currentState; }, addEventListener: (_type: string, listener: (state: string) => void) => {
       native.appListeners.add(listener); return { remove: () => native.appListeners.delete(listener) };
@@ -70,7 +71,42 @@ const base = { kind: "text" as const, title: "Source", sourceLabel: "source.txt"
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 
 describe("native file reading", () => {
-  beforeEach(() => { native.currentState = "active"; native.scrollToIndex.mockClear(); native.inject.mockClear(); native.openURL.mockClear(); });
+  beforeEach(() => { native.platform = "android"; native.currentState = "active"; native.scrollToIndex.mockClear(); native.inject.mockClear(); native.openURL.mockClear(); });
+
+  it("preserves the ready iPhone Markdown reader across inactive and recovers an actual process loss", async () => {
+    native.platform = "ios";
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    const preview = { ...base, fileName: "README.md", text: "# Heading\n\n" + "Read this paragraph.\n\n".repeat(80) };
+    const transition = async (state: string) => act(async () => {
+      native.currentState = state;
+      native.appListeners.forEach((listener) => listener(state));
+    });
+    try {
+      await act(async () => { root.render(createElement(MobileFileTextPreview, { preview, colors, locale: "en" })); });
+      await act(async () => { native.web!.onLoad!(); });
+      const reader = container.querySelector("[data-document]")!;
+      const source = native.web!.source;
+      reader.scrollTop = 480;
+      await transition("inactive");
+      expect(container.querySelector("[data-document]")).toBe(reader);
+      expect(native.web!.onShouldStartLoadWithRequest({ url: "https://example.test/read" })).toBe(false);
+      expect(native.openURL).not.toHaveBeenCalled();
+      await transition("active");
+      expect(container.querySelector("[data-document]")).toBe(reader);
+      expect(native.web!.source).toBe(source);
+      expect(reader.scrollTop).toBe(480);
+
+      await transition("inactive");
+      await act(async () => { native.web!.onContentProcessDidTerminate!(); });
+      expect(container.querySelector("[data-document]")).toBeNull();
+      await transition("active");
+      expect(container.querySelector("[data-document]")).not.toBeNull();
+      expect(container.querySelector("[data-document]")).not.toBe(reader);
+    } finally {
+      await act(async () => { root.unmount(); });
+    }
+  });
   it("quotes from the native Markdown selection menu, copies exact source and rejects the retired rendered menu", async () => {
     const container = document.createElement("div"); const root = createRoot(container);
     const preview = { ...base, fileName: "README.md", text: "\uFEFF# Heading\r\n\r\n**[Selected 😀 text](https://example.test/read)**" };

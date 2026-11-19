@@ -27,11 +27,12 @@ const evidenceSteps = {
   "tap-conversation-share-row": { action: "gesture", assertions: ["select-from-message-menu", "body-tap-deselects", "body-tap-reselects", "cancel-restores-task"] },
   "quote-selected-message-text": { action: "gesture", assertions: ["system-selection-menu-action", "exact-user-and-assistant-text-in-draft", "no-dispatch-from-quoting"] },
   "open-image-gallery": { action: "resource-navigation", assertions: ["gallery-visible", "image-decoded", "gallery-retained-across-observations"] },
+  "toggle-image-chrome": { action: "gesture", assertions: ["one-to-one-tap-hides-controls", "same-image-remains-visible", "second-tap-restores-controls"] },
   "zoom-image-gallery": { action: "gesture", assertions: ["double-tap-zoom", "zoomed-tap-keeps-gallery-open"] },
-  "short-image-drag": { action: "gesture", assertions: ["zoom-reset", "short-drag-keeps-gallery-open"] },
-  "tap-dismiss-image": { action: "gesture", assertions: ["tap-restores-task", "reopened-image-decoded"] },
+  "short-image-drag": { action: "gesture", assertions: ["zoom-reset", "short-drag-keeps-gallery-open", "restored-canvas-accepts-both-taps"] },
   "vertical-dismiss-image": { action: "gesture", assertions: ["gesture-canvas-sized", "vertical-dismiss-restores-task"] },
   "close-image-gallery": { action: "resource-navigation", assertions: ["reopened-image-decoded", "close-restores-task"] },
+  "system-back-from-image-gallery": { action: "navigation", assertions: ["reopened-image-decoded", "system-back-restores-same-task"] },
   "open-canonical-file": { action: "resource-navigation", assertions: ["canonical-file-contents", "canonical-line-focus"] },
   "copy-file-source": { action: "clipboard", assertions: ["copy-source-completed"] },
   "force-stop-and-reconnect": { action: "lifecycle", assertions: ["application-process-stopped", "application-restarted", "restored-task-title", "persisted-task-input"] },
@@ -42,8 +43,9 @@ const evidenceSteps = {
 } as const;
 type EvidenceStepName = keyof typeof evidenceSteps;
 type EvidenceAction = "tap" | "text-entry" | "launch" | "double-tap" | "swipe" | "force-stop" | "install" | "system-back";
-type EvidenceScreenshot = "header" | "actions" | "timeline" | "gallery" | "gallery-zoomed" | "gallery-drag-reset"
-  | "gallery-dismissed" | "resource-links" | "file-opened" | "file" | "restored"
+type EvidenceScreenshot = "header" | "actions" | "timeline" | "gallery" | "gallery-zoomed" | "gallery-drag-reset" | "gallery-chrome-hidden"
+  | "gallery-chrome-after-drag-hidden" | "gallery-chrome-error" | "gallery-chrome-after-drag-error"
+  | "gallery-dismissed" | "gallery-system-back" | "resource-links" | "file-opened" | "file" | "restored"
   | "gallery-error" | "restored-error" | "file-error" | "resource-candidate" | "resource-error"
   | "connection-add" | "connection-error" | "connection-identity-error" | "actions-scrolled" | "share-selection" | "share-selection-error"
   | "native-user-quote-menu" | "native-assistant-quote-menu"
@@ -441,6 +443,9 @@ async function runNativeScenario(): Promise<void> {
   "native gallery retained across scheduled observations", 22_000);
   await screenshot("gallery");
   await completeStep();
+  await beginStep("toggle-image-chrome");
+  await toggleImageChrome("gallery-chrome-hidden", "gallery-chrome-error");
+  await completeStep();
   await beginStep("zoom-image-gallery");
   const densityMatch = (await adb("shell", "wm", "density")).match(/(?:Physical|Override) density: (\d+)/gu)?.at(-1)?.match(/(\d+)/u);
   if (!densityMatch) throw new Error("The isolated native display density was unavailable.");
@@ -465,15 +470,10 @@ async function runNativeScenario(): Promise<void> {
   await waitFor(nodes, (items) => Date.now() - shortDragAt >= 1_000
     && items.some((node) => node.contentDescription === "Copy image" && node.enabled), "short native vertical drag returns to the gallery", 5_000);
   await screenshot("gallery-drag-reset");
-  await completeStep();
-  await beginStep("tap-dismiss-image");
-  await interaction("tap", () => adb("shell", "input", "tap", String(x), String(y)));
-  await waitNode((node) => node.text === taskName, "task restored after a native gallery tap");
-  await tap("Workspace image", true);
-  await waitNode((node) => node.contentDescription === "Copy image" && node.enabled, "reopened native gallery decode readiness");
+  await toggleImageChrome("gallery-chrome-after-drag-hidden", "gallery-chrome-after-drag-error");
   await completeStep();
   await beginStep("vertical-dismiss-image");
-  const verticalCanvas = await waitNode((node) => node.contentDescription === "Image preview pixel.png", "reopened native gesture canvas");
+  const verticalCanvas = await waitNode((node) => node.contentDescription === "Image preview pixel.png", "native gesture canvas with controls restored");
   const distance = Math.round(160 * pixelsPerPoint);
   expect(verticalCanvas.bounds.y2 - verticalCanvas.bounds.y1).toBeGreaterThan(distance + 20);
   const startY = Math.round(Math.min((verticalCanvas.bounds.y1 + verticalCanvas.bounds.y2) / 2, verticalCanvas.bounds.y2 - distance - 10));
@@ -487,6 +487,13 @@ async function runNativeScenario(): Promise<void> {
   await tap("Close");
   await waitNode((node) => node.text === taskName, "task restored after closing the gallery");
   await screenshot("resource-links");
+  await completeStep();
+  await beginStep("system-back-from-image-gallery");
+  await tap("Workspace image", true);
+  await waitNode((node) => node.contentDescription === "Copy image" && node.enabled, "gallery decoded before Android Back");
+  await interaction("system-back", () => adb("shell", "input", "keyevent", "KEYCODE_BACK"));
+  await waitNode((node) => node.text === taskName, "the original task after Android Back from the gallery");
+  await screenshot("gallery-system-back");
   await completeStep();
   await beginStep("open-canonical-file");
   await tap("README.md:2:4", true, true);
@@ -716,6 +723,30 @@ async function tapSystemMessageQuote(name: "native-user-quote-menu" | "native-as
       screenshot: frame.file, sha256: frame.sha256, point: action }));
     await adb("shell", "input", "tap", String(action.x), String(action.y));
   });
+}
+
+async function toggleImageChrome(hidden: EvidenceScreenshot, failed: EvidenceScreenshot): Promise<void> {
+  const isCanvas = (node: AndroidUiNode) => node.contentDescription === "Image preview pixel.png";
+  const canvas = await waitNode(isCanvas, "the original decoded canvas at 1×");
+  const x = String(Math.round((canvas.bounds.x1 + canvas.bounds.x2) / 2));
+  const y = String(Math.round((canvas.bounds.y1 + canvas.bounds.y2) / 2));
+  // A stationary contact models a short finger tap with distinct native down and up events.
+  const tapCanvas = () => interaction("tap", () => adb("shell", "input", "swipe", x, y, x, y, "60"));
+  try {
+    await tapCanvas();
+    await waitFor(nodes, (items) => items.some(isCanvas)
+      && !items.some((node) => node.contentDescription === "Copy image" || node.contentDescription === "Close"),
+    "the same native image with its controls hidden", 10_000);
+    await screenshot(hidden);
+    await tapCanvas();
+    await waitFor(nodes, (items) => items.some(isCanvas)
+      && items.some((node) => node.text?.includes("1.0") === true)
+      && items.some((node) => node.contentDescription === "Copy image" && node.enabled),
+    "the same native image at 1.0 with its controls restored", 10_000);
+  } catch (error) {
+    await screenshot(failed).catch(() => undefined);
+    throw error;
+  }
 }
 
 function elapsed(): number { return Math.round(performance.now() - evidenceStarted); }

@@ -373,9 +373,9 @@ describe("mobile release artifact configuration", () => {
       .toContain('NODE_ENV: "production"');
   });
 
-  it("builds patched image modules from source instead of unpatched precompiled binaries", () => {
+  it("builds patched native modules from source instead of unpatched precompiled binaries", () => {
     const pkg = JSON.parse(readFileSync(resolve(mobileDirectory, "package.json"), "utf8"));
-    expect(pkg.expo.autolinking.android.buildFromSource).toEqual(["expo-image"]);
+    expect(pkg.expo.autolinking.android.buildFromSource).toEqual(["expo-file-system", "expo-image"]);
     expect(pkg.expo.autolinking.ios.buildFromSource).toEqual(["expo-image-manipulator"]);
     expect(pkg.expo.autolinking.android.exclude).toEqual(["expo-notifications", "react-native-screens"]);
   });

@@ -83,6 +83,8 @@ describe("mounted Extension Library main-view bridge", () => {
 
     await page.setViewportSize({ width: 390, height: 844 });
     await frameElement.waitFor({ state: "visible" });
+    const closeNavigation = page.getByLabel("Task navigation").getByRole("button", { name: "Close navigation", exact: true });
+    if (await closeNavigation.isVisible()) await closeNavigation.click();
     const narrowRead = await result.evaluate(async () => {
       const library = (window as unknown as Window & {
         readonly joko: {

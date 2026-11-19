@@ -121,7 +121,9 @@ export class MobileImageOutput {
           await this.driver.shareImage(file, output.mediaType);
         }
       } finally {
-        if (!retainForShare) await this.driver.removeTemporary(file);
+        // The native save has its own outcome. Cache maintenance can retry a
+        // failed removal without inviting the user to publish the image again.
+        if (!retainForShare) await this.driver.removeTemporary(file).catch(() => undefined);
       }
     } finally {
       this.inFlight = false;

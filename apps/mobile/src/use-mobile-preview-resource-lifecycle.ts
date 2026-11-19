@@ -25,11 +25,13 @@ export interface MobilePreviewResourceBinding {
 export function useMobilePreviewResourceLifecycle({
   ownerKey,
   releaseRenderer,
-  reportFailure
+  reportFailure,
+  retainReadyRendererOnInactive = false
 }: {
   readonly ownerKey: string;
   readonly releaseRenderer: () => void;
   readonly reportFailure: (failure: MobilePreviewResourceFailure) => void;
+  readonly retainReadyRendererOnInactive?: boolean;
 }): MobilePreviewResourceBinding {
   const supported = mobileResourcePressureSupported();
   const initialForeground = AppState.currentState === "active";
@@ -38,6 +40,7 @@ export function useMobilePreviewResourceLifecycle({
   const foregroundRef = useRef(initialForeground);
   const generationRef = useRef(0);
   const rendererMountedRef = useRef(supported && initialForeground);
+  const rendererReadyRef = useRef(false);
   const phaseRef = useRef<MobilePreviewResourcePhase>(supported
     ? initialForeground ? "active" : "suspended"
     : "failed");
@@ -53,6 +56,7 @@ export function useMobilePreviewResourceLifecycle({
     lifecycleRef.current.reset(foregroundRef.current);
     if (!supported) lifecycleRef.current.onUnavailable();
     rendererMountedRef.current = supported && foregroundRef.current;
+    rendererReadyRef.current = false;
     phaseRef.current = supported
       ? foregroundRef.current ? "active" : "suspended"
       : "failed";
@@ -77,6 +81,7 @@ export function useMobilePreviewResourceLifecycle({
     generationRef.current += 1;
     tokenRef.current = rendererToken(ownerRef.current, generationRef.current);
     rendererMountedRef.current = false;
+    rendererReadyRef.current = false;
     releaseRenderer();
   }, [releaseRenderer]);
 
@@ -108,6 +113,11 @@ export function useMobilePreviewResourceLifecycle({
       const foreground = state === "active";
       foregroundRef.current = foreground;
       if (!foreground) {
+        if (state === "inactive" && retainReadyRendererOnInactive && rendererMountedRef.current && rendererReadyRef.current) {
+          phaseRef.current = "suspended";
+          refresh();
+          return;
+        }
         lifecycleRef.current.onNotForeground();
         retireRenderer();
         phaseRef.current = "suspended";
@@ -116,6 +126,10 @@ export function useMobilePreviewResourceLifecycle({
       }
       const decision = lifecycleRef.current.onForeground();
       if (decision) applyRecovery(decision);
+      else if (rendererMountedRef.current && phaseRef.current === "suspended") {
+        phaseRef.current = "active";
+        refresh();
+      }
     });
     const pressureSubscription = subscribeMobileResourcePressure(() => {
       retireRenderer();
@@ -131,25 +145,27 @@ export function useMobilePreviewResourceLifecycle({
       appStateSubscription.remove();
       pressureSubscription?.remove();
     };
-  }, [applyRecovery, fail, refresh, releaseRenderer, retireRenderer, supported]);
+  }, [applyRecovery, fail, refresh, releaseRenderer, retainReadyRendererOnInactive, retireRenderer, supported]);
 
-  const ownsRenderer = useCallback((token: string): boolean => token === tokenRef.current
-    && rendererMountedRef.current && foregroundRef.current && phaseRef.current !== "failed", []);
+  const holdsRenderer = useCallback((token: string): boolean => aliveRef.current && token === tokenRef.current
+    && rendererMountedRef.current && phaseRef.current !== "failed", []);
+  const ownsRenderer = useCallback((token: string): boolean => foregroundRef.current && holdsRenderer(token), [holdsRenderer]);
 
   const onRendererReady = useCallback((token: string) => {
     if (!ownsRenderer(token)) return;
     lifecycleRef.current.onRendererReady();
+    rendererReadyRef.current = true;
     phaseRef.current = "active";
     failureReportedRef.current = undefined;
     refresh();
   }, [ownsRenderer, refresh]);
 
   const onRendererProcessLost = useCallback((token: string): boolean => {
-    if (!ownsRenderer(token)) return true;
+    if (!holdsRenderer(token)) return true;
     retireRenderer();
     applyRecovery(lifecycleRef.current.onProcessLost(foregroundRef.current));
     return true;
-  }, [applyRecovery, ownsRenderer, retireRenderer]);
+  }, [applyRecovery, holdsRenderer, retireRenderer]);
 
   return {
     phase: phaseRef.current,

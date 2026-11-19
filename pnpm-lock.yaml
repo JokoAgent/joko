@@ -33,6 +33,7 @@ overrides:
 
 patchedDependencies:
   '@modelcontextprotocol/ext-apps@1.7.5': 879f4f19f91ff762306d33ebf4974ab86cbe86b5fdcc542d54959fff3977cc76
+  expo-file-system@57.0.6: b88dabc3fd863664607536b5436e378b94f763d13ca692953bd974b2d91d2eef
   expo-image-manipulator@57.0.14: b915dc53eb3865a506a79d570a57400e9fc5c334fcd01936c1de12c92c8d3c50
   expo-image@57.0.3: 1bf15c6ffcc41b386bf5ef471bd7952141a01d05cc647d7dc8fe1f904db6ef9c
   node-pty@1.1.0: 71094ec4b6fc187c311576d26f24fa7dac0507816dcf94e5e9ac00913c6992c3
@@ -317,7 +318,7 @@ importers:
         version: 57.0.2(expo@57.0.17)
       expo-file-system:
         specifier: 57.0.6
-        version: 57.0.6(expo@57.0.17)(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10))
+        version: 57.0.6(patch_hash=b88dabc3fd863664607536b5436e378b94f763d13ca692953bd974b2d91d2eef)(expo@57.0.17)(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10))
       expo-glass-effect:
         specifier: 57.0.1
         version: 57.0.1(expo@57.0.17)(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10))(react@19.2.3)
@@ -14385,7 +14386,7 @@ snapshots:
 
   expo-eas-client@57.0.4: {}
 
-  expo-file-system@57.0.6(expo@57.0.17)(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10)):
+  expo-file-system@57.0.6(patch_hash=b88dabc3fd863664607536b5436e378b94f763d13ca692953bd974b2d91d2eef)(expo@57.0.17)(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10)):
     dependencies:
       expo: 57.0.17(@babel/core@7.29.7(supports-color@8.1.1))(@expo/dom-webview@57.0.1)(bufferutil@4.1.0)(react-dom@19.2.3(react@19.2.3))(react-native-webview@13.16.1(patch_hash=b66100b45acea6a0de3b5f5670e05c8ef47a3688e4e3a4da135f7b30295fa05f)(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10))(react@19.2.3))(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10))(react@19.2.3)(supports-color@8.1.1)(typescript@5.9.3)(utf-8-validate@5.0.10)
       react-native: 0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10)
@@ -14556,7 +14557,7 @@ snapshots:
       babel-preset-expo: 57.0.11(@babel/core@7.29.7(supports-color@8.1.1))(@babel/runtime@7.29.7)(expo@57.0.17)(react-refresh@0.14.2)(supports-color@8.1.1)
       expo-asset: 57.0.16(expo@57.0.17)(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10))(react@19.2.3)(supports-color@8.1.1)(typescript@5.9.3)
       expo-constants: 57.0.15(expo@57.0.17)(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10))(supports-color@8.1.1)
-      expo-file-system: 57.0.6(expo@57.0.17)(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10))
+      expo-file-system: 57.0.6(patch_hash=b88dabc3fd863664607536b5436e378b94f763d13ca692953bd974b2d91d2eef)(expo@57.0.17)(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10))
       expo-font: 57.0.3(expo@57.0.17)(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@types/react@19.2.2)(bufferutil@4.1.0)(react@19.2.3)(supports-color@8.1.1)(utf-8-validate@5.0.10))(react@19.2.3)
       expo-keep-awake: 57.0.1(expo@57.0.17)(react@19.2.3)
       expo-modules-autolinking: 57.0.12(supports-color@8.1.1)(typescript@5.9.3)

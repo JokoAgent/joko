@@ -107,7 +107,8 @@ it("keeps the selected Browser page's ledger when a previous page finishes refre
   const controller = {
     state: { preferences: DEFAULT_UI_PREFERENCES, activeProfile: { id: "profile-1", serverId: "server-1" } },
     readNewSessionDraft: vi.fn(async () => undefined), getArtifactUrl: vi.fn(async () => "data:image/png;base64,iVBORw0KGgo="),
-    releaseArtifactUrl: vi.fn(), listBrowserTransfers, listBrowserActivity, focusBrowserPage, downloadArtifact
+    releaseArtifactUrl: vi.fn(), updateBrowserCommentDesign: vi.fn(async () => []),
+    listBrowserTransfers, listBrowserActivity, focusBrowserPage, downloadArtifact
   } as unknown as AppController;
   const host = document.body.appendChild(document.createElement("div"));
   const root = createRoot(host);
@@ -150,6 +151,7 @@ it("offers the original completed download after closing its source page and reo
     readNewSessionDraft: vi.fn(async () => undefined),
     getArtifactUrl: vi.fn(async () => "data:image/png;base64,iVBORw0KGgo="),
     releaseArtifactUrl: vi.fn(),
+    updateBrowserCommentDesign: vi.fn(async () => []),
     listBrowserActivity: vi.fn(async () => []),
     listBrowserTransfers: vi.fn(async (_browserId: string, pageId: string) => pageId === source.id ? [download] : []),
     listBrowserDownloads, closeBrowserPage, downloadArtifact
