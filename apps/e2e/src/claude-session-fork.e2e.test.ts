@@ -38,6 +38,7 @@ import {
   deleteMutation,
   forkMutation,
   navigateMutation,
+  queueRunIdFrom,
   sendInputMutation,
   sessionIdFrom,
   submit
@@ -765,6 +766,75 @@ function createNativeTarget(entryId: string) {
   return create(NativeNavigationTargetSchema, { kind: { case: "nativeEntryId", value: entryId } });
 }
 
+it("resumes the original local Claude task before sending after its idle Query exits", { timeout: 60_000 }, async () => {
+  const seed = await seedNativeHistory();
+  const queries: TextObservationQuery[] = [];
+  const resumes: Array<string | undefined> = [];
+  let fixture: OrchestratorE2eFixture | undefined;
+  let confirmOldProcessExit!: () => void;
+  const processExit = new Promise<void>(resolve => { confirmOldProcessExit = resolve; });
+  try {
+    const started = await start(seed, (params) => {
+      const query = new TextObservationQuery(params, seed.sourceId);
+      queries.push(query);
+      resumes.push(params.options.resume);
+      return query;
+    });
+    fixture = started.fixture;
+    const paired = await fixture.pair();
+    const sessionId = await attachSource(fixture, paired, seed.sourceId);
+    const store = fixture.application.store;
+    const originalBinding = store.getSession(sessionId).descriptor.binding;
+    let parentUuid = seed.messageIds.at(-1);
+    const complete = async (query: TextObservationQuery, text: string, runId: string) => {
+      const input = await waitFor(async () => query.receivedInputs[0], input => input !== undefined, "the original input in the requested Query");
+      if (input === undefined) throw new Error("The controlled Query did not receive the accepted input.");
+      const entryId = randomUUID();
+      const reply = { id: `msg_${entryId}`, role: "assistant", content: [{ type: "text", text }], stop_reason: "end_turn" };
+      const frame = (value: Record<string, unknown>) => JSON.stringify({ sessionId: seed.sourceId, cwd: seed.workspace,
+        timestamp: new Date().toISOString(), ...value });
+      const records = [frame({ type: "user", uuid: input.uuid, parentUuid, message: input.message }),
+        frame({ type: "assistant", uuid: entryId, parentUuid: input.uuid, message: reply })];
+      parentUuid = entryId;
+      await Promise.all([seed.sourcePath, join(seed.profile, "projects", claudeProjectKey(seed.workspace), `${seed.sourceId}.jsonl`)]
+        .map(path => appendFile(path, records.join("\n") + "\n", "utf8")));
+      query.publishText(entryId, reply);
+      query.finish(input.uuid, text);
+      await waitFor(() => paired.clients.run.getRun({ runId }), ({ run }) => run?.state === RunState.SUCCEEDED, "the confirmed original Run settlement");
+      await waitFor(async () => store.findQueueItemByRunId(sessionId, runId), item => item?.state === "completed", "the original Queue settlement");
+    };
+
+    const send = (text: string) => submit(paired.clients.operation, paired.connectionId,
+      sendInputMutation(sessionId, BigInt(originalBinding.generation), text));
+    const firstRunId = queueRunIdFrom(await send("First ordinary Claude input"));
+    await complete(queries[0]!, "First completed reply", firstRunId);
+    const retire = vi.spyOn(started.runtime, "retireQuery").mockImplementationOnce(async () => processExit);
+    queries[0]!.exitIdleStream();
+    await waitFor(async () => retire.mock.calls.length, count => count === 1, "retirement of the exact original Query");
+    expect(retire.mock.calls[0]?.[0]).toBe(queries[0]);
+    expect(started.adapter.hasConfirmedIdleSessionExit(sessionId, originalBinding)).toBe(false);
+    expect(queries).toHaveLength(1);
+    confirmOldProcessExit();
+    await waitFor(async () => started.adapter.hasConfirmedIdleSessionExit(sessionId, originalBinding), Boolean, "the confirmed idle Query exit");
+    expect(store.getSession(sessionId).descriptor.binding).toEqual(originalBinding);
+
+    const secondRunId = queueRunIdFrom(await send("Next ordinary Claude input"));
+    const nextQuery = await waitFor(async () => queries[1], query => query !== undefined, "the replacement Query for the same native Session");
+    if (nextQuery === undefined) throw new Error("The original native task was not resumed.");
+    await complete(nextQuery, "Second completed reply", secondRunId);
+    expect(resumes).toEqual([seed.sourceId, seed.sourceId]);
+    expect(queries.map(query => query.receivedInputs.length)).toEqual([1, 1]);
+    expect(store.getSession(sessionId).descriptor.binding).toEqual({ ...originalBinding, generation: originalBinding.generation + 1 });
+    const next = store.findQueueItemByRunId(sessionId, secondRunId)!;
+    expect(store.getAttempt(next.attemptId!).descriptor.generation).toBe(originalBinding.generation + 1);
+    expect(started.adapter.hasConfirmedIdleSessionExit(sessionId, originalBinding)).toBe(false);
+  } finally {
+    confirmOldProcessExit();
+    await fixture?.close({ removeRoot: false });
+    await rm(seed.root, { recursive: true, force: true, maxRetries: 5 });
+  }
+});
+
 it.each(["original frame", "different frame", "missing frame"] as const)(
   "projects ordinary Claude text and its accounting after reading a %s from the published SDK", { timeout: 60_000 },
   async (persisted) => {
@@ -881,13 +951,15 @@ async function seedNativeHistory(workspaceName = "workspace") {
 
 async function start(seed: Awaited<ReturnType<typeof seedNativeHistory>>, createQuery?: (params: ClaudeSdkQueryParams) => ClaudeSdkQuery) {
   const runtime = new LocalSessionRuntime(seed.profile, createQuery);
+  let adapter: ClaudeCodeAdapter | undefined;
   const fixture = await OrchestratorE2eFixture.start({
     rootDirectory: seed.root, profiles: [],
     backendFactories: [{ instanceId: backendId, adapterKind: "claude-agent-sdk-stdio", displayName: "Local Claude fixture",
-      create: ({ generation }) => new ClaudeCodeAdapter({ instanceGeneration: generation, runtime, environment: { CLAUDE_CONFIG_DIR: seed.profile },
-        initializationTimeoutMs: 5_000, teardownTimeoutMs: 100 }) }]
+      create: ({ generation }) => { return adapter = new ClaudeCodeAdapter({ instanceGeneration: generation, runtime,
+        environment: { CLAUDE_CONFIG_DIR: seed.profile }, initializationTimeoutMs: 5_000, teardownTimeoutMs: 100 }); } }]
   });
-  return { fixture, runtime };
+  if (adapter === undefined) throw new Error("The Claude fixture Adapter did not start.");
+  return { fixture, runtime, adapter };
 }
 
 async function startStored(
@@ -1505,7 +1577,7 @@ class LocalSessionRuntime implements ClaudeSdkRuntime {
   async query(params: ClaudeSdkQueryParams): Promise<ClaudeSdkQuery> {
     return this.createQuery?.(params) ?? new IdleQuery();
   }
-  async retireQuery(): Promise<void> { throw new Error("This Session fixture does not perform live Query replacement."); }
+  async retireQuery(_query: ClaudeSdkQuery): Promise<void> { throw new Error("This Session fixture does not perform live Query replacement."); }
   async getSessionInfo(sessionId: string, options: { dir: string; signal?: AbortSignal }) {
     if (this.#failNextDerivedRead && this.created.includes(sessionId)) { this.#failNextDerivedRead = false; return undefined; }
     const lookup = () => this.#owner.run({ kind: "getSessionInfo", sessionId, options: { dir: options.dir } }, { signal: options.signal }) as Promise<ClaudeSdkSessionInfo | undefined>;
@@ -1606,6 +1678,10 @@ class TextObservationQuery extends IdleQuery {
 
   finish(userId: string, result: string): void {
     this.#output.push({ ...controlledClaudeResult(this.nativeId, userId), result });
+  }
+
+  exitIdleStream(): void {
+    this.#output.fail(new Error("The fixture Claude Query exited while idle."));
   }
 
   override close(): void {

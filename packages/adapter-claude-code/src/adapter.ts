@@ -723,6 +723,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   readonly #accountUsage: ClaudeAccountUsageCache;
   readonly #privateManagedWorktreePaths = new Set<string>();
   readonly #sessions = new Map<string, NativeRuntime>();
+  readonly #idleSessionExits = new Map<string, NativeSessionBinding>();
   readonly #nativeTextFlights = new Set<AbortController>();
   readonly #workingContextRecoveries = new Map<string, { readonly runtime: NativeRuntime; readonly providerId: string; readonly modelId: string }>();
   readonly #models = new Map<string, ClaudeSdkModelInfo>();
@@ -1509,6 +1510,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     return nativeState(runtime);
   }
 
+  hasConfirmedIdleSessionExit(sessionId: string, binding: NativeSessionBinding): boolean {
+    const exited = this.#idleSessionExits.get(sessionId);
+    return exited !== undefined && !this.#sessions.has(sessionId) && exited.opaqueRef === binding.opaqueRef
+      && exited.nativeSessionId === binding.nativeSessionId && exited.generation === binding.generation;
+  }
+
   override async inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
     await this.validateTarget(context.target);
     this.#assertBindingContext(binding, context);
@@ -1713,7 +1720,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     await this.validateTarget(context.target);
     this.#assertBindingContext(binding, context);
     const runtime = this.#sessions.get(context.sessionId);
-    if (runtime === undefined) return;
+    if (runtime === undefined) {
+      if (this.hasConfirmedIdleSessionExit(context.sessionId, binding)) this.#idleSessionExits.delete(context.sessionId);
+      return;
+    }
     if (runtime.closed && !runtime.retirementConfirmed) {
       this.#assertRetirementContext(runtime, context, binding);
       await this.#retireRuntime(runtime);
@@ -3565,6 +3575,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       return;
     }
     this.#disposed = true;
+    this.#idleSessionExits.clear();
     try {
       await this.#oauthAccount?.dispose();
     } catch (error) {
@@ -3618,6 +3629,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     try { this.#managedProviders?.dispose(); }
     catch (error) { failures.push(error); }
     this.#disposed = true;
+    this.#idleSessionExits.clear();
     try {
       await this.#oauthAccount?.dispose();
     } catch (error) {
@@ -3902,6 +3914,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         modelUsageObserver: new NativeModelUsageObserver()
       };
       this.#sessions.set(context.sessionId, runtime);
+      this.#idleSessionExits.delete(context.sessionId);
       builtinInitializationCurrent = () => runtime?.initialization?.plugins_applied === true;
     } finally {
       startedQuery.releaseAuthorization();
@@ -5069,6 +5082,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
 
   async #handleStreamFailure(runtime: NativeRuntime, cause?: unknown): Promise<void> {
     const turn = runtime.activeTurn;
+    const idleLocalExit = turn === undefined && runtime.initialization !== undefined
+      && !runtime.remote && runtime.runtimePolicy === "standard" && runtime.baseContext.hostedExecution === undefined
+      && runtime.inputPreparation === undefined && runtime.pendingControl === undefined && !runtime.compacting;
     let pendingAdmissionFailure: unknown;
     const publicError: PublicError = cause instanceof JokoError
       ? cause.publicError
@@ -5127,7 +5143,16 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     } catch {
       // The runtime fence and teardown remain authoritative if Host emission fails.
     } finally {
-      await this.#retireRuntime(runtime, false, publicError, undefined, pendingAdmissionFailure);
+      if (idleLocalExit) runtime.requiresConfirmedRetirement = true;
+      try { await this.#retireRuntime(runtime, false, publicError, undefined, pendingAdmissionFailure); }
+      catch (error) {
+        if (!idleLocalExit) throw error;
+        // Failed process confirmation leaves the exact old runtime fenced for explicit retirement.
+      }
+      if (idleLocalExit && !this.#disposed && runtime.retirementConfirmed && runtime.processRetirementConfirmed
+        && !this.#sessions.has(runtime.productSessionId)) {
+        this.#idleSessionExits.set(runtime.productSessionId, runtime.binding);
+      }
     }
   }
 

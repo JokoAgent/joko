@@ -13946,19 +13946,26 @@ export class SessionHost {
     };
     const active = this.#active.get(sessionId);
     if (active !== undefined) {
-      if (active.appendSystemPromptDigest === this.serviceRuntimeDigest(this.#store.getSession(sessionId).descriptor)
+      const stored = this.#store.getSession(sessionId).descriptor;
+      const idleExit = active.adapter.hasConfirmedIdleSessionExit?.(sessionId, stored.binding) === true;
+      if ((!idleExit && active.appendSystemPromptDigest === this.serviceRuntimeDigest(stored))
         || !this.canRefreshPrivatePromptAtBoundary(sessionId)) {
         active.lastActivityAt = this.#monotonicNow();
         return active;
       }
-      const task = this.refreshPrivatePromptRuntime(sessionId, active)
-        .then(() => this.activateOnce(sessionId, allowance, providerAuthenticationRouteId))
-        .finally(() => {
-          this.#activating.delete(sessionId);
-          this.tryApplyProviderAuthenticationRuntimeInvalidation(sessionId);
-        });
-      this.#activating.set(sessionId, task);
-      return task;
+      if (idleExit) {
+        this.deleteActiveSession(sessionId, active);
+        this.#releaseSessionTools(sessionId);
+      } else {
+        const task = this.refreshPrivatePromptRuntime(sessionId, active)
+          .then(() => this.activateOnce(sessionId, allowance, providerAuthenticationRouteId))
+          .finally(() => {
+            this.#activating.delete(sessionId);
+            this.tryApplyProviderAuthenticationRuntimeInvalidation(sessionId);
+          });
+        this.#activating.set(sessionId, task);
+        return task;
+      }
     }
     const task = this.activateOnce(sessionId, allowance, providerAuthenticationRouteId).finally(() => {
       this.#activating.delete(sessionId);
