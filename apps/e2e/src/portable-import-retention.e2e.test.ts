@@ -136,10 +136,12 @@ it("restores portable worker results and activity on a separate node without gra
       backendId: receiver.adapter().id, targetId, sessionId, operationId: commit.operationId
     });
     await expect(client.listSubagentTranscript({ sessionId, subagentRunId }, auth)).rejects.toMatchObject({ code: Code.Unimplemented });
-    await expect(submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
+    const control = await submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
       payload: { case: "controlSubagent",
         value: create(ControlSubagentMutationSchema, { sessionId, subagentRunId, action: SubagentControlAction.STOP }) }
-    }))).resolves.toMatchObject({ state: OperationState.FAILED, error: { code: "SUBAGENT_ACTION_UNAVAILABLE" } });
+    }));
+    expect(control, control.error?.message).toMatchObject({ state: OperationState.FAILED,
+      error: { code: "SUBAGENT_ACTION_UNAVAILABLE", stateMayHaveChanged: false } });
     expect(nativeControls).toBe(0);
     await expect(paired.clients.portableSession.commitPortableSessionImport(commit))
       .resolves.toMatchObject({ replayed: true, result: { sessionId, workerCount: 1n } });

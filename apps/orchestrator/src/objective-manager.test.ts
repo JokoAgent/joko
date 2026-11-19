@@ -103,6 +103,66 @@ describe("ObjectiveManager", () => {
       && event.payload.objectiveText === "Replacement objective")).toBe(true);
   });
 
+  it("resumes a paused Goal as dispatch unknown after restart until its original attempt settles", async () => {
+    const fixture = createFixture();
+    const active = await fixture.manager.set(setInput("set-before-objective-restart", fixture));
+    const original = fixture.host.admissions[0]!;
+    makeRunning(fixture.store, original);
+    const paused = await fixture.manager.pause({ operationId: "pause-original-goal", sessionId: fixture.sessionId,
+      expectedRevision: active.revision, expectedOwnerGeneration: active.ownerGeneration });
+    expect(paused).toMatchObject({ status: "paused", pendingRunId: original.runId });
+    expect(fixture.store.getQueueItem(original.queueItemId).state).toBe("backend_accepted");
+    await fixture.manager.close();
+    fixture.store.close();
+
+    const store = new OperationalStore(fixture.databasePath);
+    const host = new FakeObjectiveHost(store);
+    const manager = new ObjectiveManager({ store, sessionHost: host });
+    try {
+      store.recoverStartup();
+      await manager.initialize();
+      expect(store.getRun(original.runId).descriptor.state).toBe("dispatch_unknown");
+      const resume = { operationId: "resume-original-goal", sessionId: fixture.sessionId,
+        expectedRevision: paused.revision, expectedOwnerGeneration: paused.ownerGeneration };
+      const resumed = await manager.resume(resume);
+      expect(resumed).toMatchObject({ status: "dispatch_unknown", text: active.text, pendingRunId: original.runId,
+        pendingAttemptId: original.attemptId, pendingQueueItemId: original.queueItemId, pendingOwnerGeneration: active.ownerGeneration });
+      expect(await manager.resume(resume)).toEqual(resumed);
+      expect(host.admissions).toEqual([]);
+      expect(store.getQueueItem(original.queueItemId).state).toBe("dispatch_unknown");
+
+      settleRun(store, original, "completed", verdict("continue", "The original attempt settled"));
+      await manager.onRunSettled({ sessionId: fixture.sessionId, runId: original.runId, outcome: "completed" });
+      await vi.waitFor(() => expect(host.admissions).toHaveLength(1));
+      expect(store.getObjective(fixture.sessionId)).toMatchObject({ status: "active", text: active.text, pendingRunId: host.admissions[0]!.runId });
+      expect(host.admissions[0]!.runId).not.toBe(original.runId);
+    } finally { await manager.close(); store.close(); }
+  });
+
+  it.each(["refinement", "original"] as const)("completes the initial Claude Goal after the user selects %s", async choiceId => {
+    const fixture = createFixture();
+    const session = fixture.store.getSession(fixture.sessionId).descriptor;
+    const backend = fixture.store.getBackend(session.backendId).descriptor;
+    fixture.store.upsertBackend({ ...backend, adapterKind: "claude-agent-sdk-stdio" });
+    const originalText = "Improve the README", refinedText = "Document the CLI flags in README.md";
+    await fixture.manager.set({ operationId: "set-clarified-goal", sessionId: fixture.sessionId, text: originalText });
+    const pending = fixture.host.admissions[0]!;
+    makeRunning(fixture.store, pending);
+    const question = fixture.store.openInteraction({ sessionId: fixture.sessionId, runId: pending.runId, attemptId: pending.attemptId,
+      generation: session.binding.generation, traceId: "goal-clarification", payload: { id: "clarify-original-goal",
+        kind: "question", title: "Clarify the Goal", prompt: "Which goal should I complete?", fields: [{ id: "goal", label: "Goal",
+          required: true, kind: "single", allowOther: false, choices: [{ id: "original", label: originalText }, { id: "refinement", label: refinedText }] }] } });
+    fixture.store.resolveInteraction(question.id, question.generation,
+      { kind: "question", answers: { goal: { kind: "single", selection: { kind: "choice", choiceId } } } }, "answered-goal-clarification");
+    settleRun(fixture.store, pending, "completed", verdict("complete", "The README now documents the flags", refinedText));
+    await fixture.manager.onRunSettled({ sessionId: fixture.sessionId, runId: pending.runId, outcome: "completed" });
+    const text = choiceId === "refinement" ? refinedText : originalText;
+    expect(fixture.store.getObjective(fixture.sessionId)).toMatchObject({ status: "complete", text, turnsUsed: 1 });
+    expect(fixture.store.listEvents({ sessionId: fixture.sessionId }).some(({ payload }) => payload.type === "objective_lifecycle"
+      && payload.action === "completed" && payload.objectiveText === text)).toBe(true);
+    expect(fixture.host.admissions).toHaveLength(1);
+  });
+
   it("uses a new incarnation after clear so the old turn cannot replay or settle the rebuilt Objective", async () => {
     const fixture = createFixture();
     await fixture.manager.set(setInput("set-before-clear", fixture));
@@ -396,6 +456,31 @@ describe("ObjectiveManager", () => {
     }
   });
 
+  it("resumes the current Pi Goal after a budget edit during the original capacity wait", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+    const fixture = createFixture();
+    await fixture.manager.set({ ...setInput("set-capacity-wait-edit", fixture), maximumTurns: 5 });
+    const pending = fixture.host.admissions[0]!;
+    failRun(fixture.store, pending, overloadError());
+    await fixture.manager.onRunSettled({ sessionId: fixture.sessionId, runId: pending.runId, outcome: "failed" });
+    const interrupted = fixture.store.getObjective(fixture.sessionId);
+    expect(interrupted).toMatchObject({ status: "usage_limited", usageResetAt: Date.now() + 60_000, maximumTurns: 5 });
+    await vi.advanceTimersByTimeAsync(20_000);
+    const edited = await fixture.manager.update({ operationId: "extend-waiting-budget", sessionId: fixture.sessionId,
+      expectedRevision: interrupted.revision, expectedOwnerGeneration: interrupted.ownerGeneration, maximumTurns: 8 });
+    expect(edited).toMatchObject({ status: "usage_limited", usageResetAt: interrupted.usageResetAt, maximumTurns: 8, text: interrupted.text });
+    expect(edited.ownerGeneration).toBeGreaterThan(interrupted.ownerGeneration);
+    await vi.advanceTimersByTimeAsync(39_999);
+    expect(fixture.host.admissions).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fixture.host.admissions).toHaveLength(2);
+    expect(fixture.store.getObjective(fixture.sessionId)).toMatchObject({ status: "active", maximumTurns: 8,
+      pendingRunId: fixture.host.admissions[1]!.runId, lastReason: "upstream capacity wait ended; resuming objective" });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fixture.host.admissions).toHaveLength(2);
+  });
+
   it.each([
     { info: "usageLimitExceeded", status: "usage_limited" },
     { info: { httpConnectionFailed: { httpStatusCode: 429 } }, status: "usage_limited" },
@@ -494,7 +579,7 @@ interface FixtureOptions { readonly now?: () => number }
 
 function createFixture(options: FixtureOptions = {}) {
   const directory = mkdtempSync(join(tmpdir(), "joko-objective-"));
-  const store = new OperationalStore(join(directory, "operational.db"));
+  const databasePath = join(directory, "operational.db"), store = new OperationalStore(databasePath);
   store.upsertBackend({
     id: "backend-one",
     displayName: "Backend",
@@ -542,7 +627,7 @@ function createFixture(options: FixtureOptions = {}) {
     store.close();
     rmSync(directory, { recursive: true, force: true });
   });
-  return { store, host, manager, managers, sessionId };
+  return { store, host, manager, managers, sessionId, databasePath };
 }
 
 class FakeObjectiveHost {

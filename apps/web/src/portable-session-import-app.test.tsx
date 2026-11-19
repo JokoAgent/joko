@@ -78,7 +78,8 @@ it.each([
   const button = (label: string) => [...document.querySelectorAll("button")].find(node => node.textContent?.trim() === label);
   await act(async () => { button("Export fixture task")!.click(); });
   await act(async () => { button("Export")!.click(); });
-  expect(exportPortableSession).toHaveBeenCalledExactlyOnceWith(task.id, { excludeMedia: false }, expect.anything());
+  expect(exportPortableSession).toHaveBeenCalledExactlyOnceWith(task, { excludeMedia: false },
+    expect.objectContaining({ ownerDocument: document, signal: expect.any(AbortSignal) }));
   expect(container.querySelector(".offline-banner > span")?.textContent).toBe(expectedNotice);
   expect(document.querySelector(".portable-session-dialog--export") !== null).toBe(result.status === "cancelled");
 });

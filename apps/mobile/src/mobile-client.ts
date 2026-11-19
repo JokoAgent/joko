@@ -4,6 +4,7 @@ import type { MobilePushRetirementRoute, MobilePushStoredRegistration } from "./
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import { ExtensionPackageAction } from "@joko/contracts";
+import { COLLABORATION_WORKER_HARD_LIMIT_CODE, ErrorInfoSchema } from "@joko/contracts";
 import { projectProviderGroupRebalance, type ProviderGroupRebalanceSuggestion } from "@joko/contracts";
 import { assertMobileExtensionPackagePreview, type MobileExtensionPackagePreview } from "./mobile-extension-packages";
 import { executeExtensionSettingsCall, ExtensionSettingsRejected, type ExtensionLibraryFileMatch } from "@joko/connection-transport";
@@ -13981,7 +13982,9 @@ export class MobileClient {
       const rest = this.#state.pending.filter(value => value.operationId !== requestId);
       if (await this.#persistPending(rest, epoch)) this.#set({ pending: rest }); return result;
     } catch (error) {
-      if (!dispatched && this.#current(epoch)) {
+      const capacityRejected = kind === "collaboration-create" && error instanceof ConnectError && error.code === Code.ResourceExhausted
+        && error.findDetails(ErrorInfoSchema).some(detail => detail.code === COLLABORATION_WORKER_HARD_LIMIT_CODE);
+      if ((!dispatched || capacityRejected) && this.#current(epoch)) {
         const rest = this.#state.pending.filter(value => value.operationId !== requestId);
         if (await this.#persistPending(rest, epoch)) this.#set({ pending: rest });
       }

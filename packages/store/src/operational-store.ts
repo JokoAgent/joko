@@ -440,6 +440,10 @@ const MESSAGE_SEARCH_VECTOR_POOL_MAX = 1_000;
 const MAX_MESSAGE_SEARCH_FILTER_VALUES = 1_000;
 
 /** Exact AES-GCM associated reference shared with the Orchestrator vault. */
+export function collaborationWorkerSessionOperationId(workerCreateOperationId: string): string {
+  return `session:${createHash("sha256").update(workerCreateOperationId).digest("hex")}`;
+}
+
 export function messagingConversationContextAad(
   input: MessagingConversationContextAadInput
 ): string {
@@ -14649,7 +14653,7 @@ export class OperationalStore {
         }
       }
       const effectRows = this.database.prepare(`
-        SELECT operation.id FROM operations AS operation
+        SELECT operation.id, operation.kind FROM operations AS operation
         WHERE operation.status = 'started' AND operation.completion_mode = 'external_effect'
           AND operation.kind NOT IN ('consumeProviderAccountReset', 'automaticProviderAccountReset')
           AND NOT EXISTS (
@@ -14670,6 +14674,7 @@ export class OperationalStore {
       const effectError = effectOutcomeUnknownError();
       for (const row of effectRows) {
         const operationId = stringValue(row["id"]);
+        if (row["kind"] === "create_collaboration_worker" && this.hasCommittedCollaborationWorkerSession(operationId)) continue;
         this.database.prepare(`
           UPDATE operations
           SET status = 'failed', error_json = ?, updated_at = ?, revision = ?
@@ -14727,6 +14732,19 @@ export class OperationalStore {
         events: [...this.currentFrame().events]
       };
     });
+  }
+
+  private hasCommittedCollaborationWorkerSession(operationId: string): boolean {
+    const worker = this.findCollaborationWorkerByCreateOperation(operationId);
+    if (worker?.status !== "provisioning" || worker.sessionId !== undefined) return false;
+    const child = this.findOperation<{ readonly sessionId: string }>(collaborationWorkerSessionOperationId(operationId));
+    if (child?.kind !== "create_collaboration_worker_session" || child.status !== "completed"
+      || child.connectionId !== undefined || typeof child.response?.sessionId !== "string") return false;
+    const session = this.findSession(child.response.sessionId)?.descriptor;
+    // The collaboration owner will replay the committed child and bind its
+    // original Session in the same transaction as the parent's receipt.
+    return session !== undefined && !session.archived && session.deletedAt === undefined
+      && session.targetId === worker.targetId && session.backendId === worker.backendId;
   }
 
   private recoverCompletedClaudeInput(item: QueueItemRecord, traceId: string): boolean {

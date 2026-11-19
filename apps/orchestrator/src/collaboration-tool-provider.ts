@@ -610,7 +610,7 @@ export class CollaborationToolBridgeProvider implements BridgeToolProvider {
       assertKeys(input, ["worker_id", "expected_revision"]);
       const workerId = requiredId(input, "worker_id");
       this.#ownedWorker(lead, workerId);
-      return publicWorkerResult(this.#manager.archiveWorker({
+      return publicWorkerResult(await this.#manager.archiveWorker({
         operationId: operationId(context, name),
         workerId,
         callerLeadSessionId: lead.session.id,

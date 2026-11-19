@@ -18803,6 +18803,13 @@ export class SessionHost {
       "The delegated run is not present in this task's durable history.",
       "Refresh delegated runs before retrying the action."
     );
+    if (projection.event.metadata?.namespace === "joko.portable_import" && projection.run.readOnly) {
+      throw subagentControlError(
+        "SUBAGENT_ACTION_UNAVAILABLE",
+        "The imported delegated run is read-only.",
+        "Use the task that owns the original delegated run for controls."
+      );
+    }
     if (projection.event.generation !== stored.descriptor.binding.generation) {
       throw new StaleGenerationError(
         stored.descriptor.binding.generation,

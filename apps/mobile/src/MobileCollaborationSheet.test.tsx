@@ -42,10 +42,11 @@ describe("mobile collaboration native form controller", () => {
     expect(value.enable).toHaveBeenLastCalledWith({ role: "developer", targetId: "target", initialTask: "", permissionMode: PermissionMode.BYPASS_PERMISSIONS }, expect.any(AbortSignal));
     expect(value.enable).toHaveBeenCalledTimes(2);
   });
-  it("shows the worker status/capacity, opens the exact completed worker, and confirms long-press archive", async () => {
+  it.each([0, 20])("shows worker capacity with idle release %i, opens the original worker, and confirms archive", async idleRelease => {
     const tree = create(CollaborationGoalTreeSchema, { goal: { goalId: "goal", status: CollaborationGoalStatus.ACTIVE }, workers: [{ workerId: "worker", sessionId: "worker-task", label: "reviewer", role: "reviewer", status: CollaborationWorkerStatus.COMPLETED }] });
-    const view: MobileCollaborationView = { role: "lead", tree, settings: { $typeName: "joko.v1.CollaborationSettings", workerSoftLimit: 4, workerHardLimit: 12, workerIdleReleaseMinutes: 20, customized: false } };
+    const view: MobileCollaborationView = { role: "lead", tree, settings: { $typeName: "joko.v1.CollaborationSettings", workerSoftLimit: 4, workerHardLimit: 12, workerIdleReleaseMinutes: idleRelease, customized: false } };
     const value = api(view); await render(value); expect(host.textContent).toContain("hard limit 12");
+    expect(host.textContent).toContain(idleRelease === 0 ? "idle release off" : "idle release 20 min");
     await press("reviewer · Complete"); expect(value.openWorker).toHaveBeenCalledWith(view, tree.workers[0], expect.any(AbortSignal));
     await press("Archive worker · reviewer"); expect(value.archive).not.toHaveBeenCalled(); await press("Confirm");
     expect(value.archive).toHaveBeenCalledWith(view, tree.workers[0], expect.any(AbortSignal));

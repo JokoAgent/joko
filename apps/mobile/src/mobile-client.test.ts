@@ -4,7 +4,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { ModelSourceKind, ModelSourceDescriptorSchema, TaskShareRuntimeControlSchema, QuestionRequestSchema, MessageBlockSchema } from "@joko/contracts";
 import { RemoteHostSchema } from "@joko/contracts";
-import { CollaborationGoalTreeSchema, CollaborationGoalStatus, CollaborationSessionRole, CollaborationWorkerStatus } from "@joko/contracts";
+import { COLLABORATION_WORKER_HARD_LIMIT_CODE, CollaborationGoalTreeSchema, CollaborationGoalStatus, CollaborationSessionRole, CollaborationWorkerStatus, ErrorInfoSchema } from "@joko/contracts";
 import { SuggestSessionTitleResponseSchema, SessionTitleSuggestionStatus } from "@joko/contracts";
 import type { MobileCollaborationRpc } from "./mobile-collaboration";
 import { BackgroundTaskSchema, SubagentRunSchema, SubagentRunDetailSchema, SubagentTranscriptEntrySchema } from "@joko/contracts";
@@ -7846,6 +7846,52 @@ describe("native mobile connection and operation ownership", () => {
     }
     expect(drafts.newTask.readSync({ profileId: credential.profileId })).toBeNull();
     await expect(app.create("target", "Task", plainTextMobileComposerDraft("input"), undefined, { ...form, sourceScope: "retired" })).rejects.toThrow("Confirm");
+  });
+
+  it.each([true, false])("settles only a confirmed worker capacity rejection (detail=%s)", async confirmed => {
+    const owner = clone(SnapshotSchema, snapshot);
+    owner.scope = create(SnapshotScopeSchema, { kind: { case: "owner", value: create(OwnerSnapshotScopeSchema, {}) } });
+    const network = projectedNetwork(owner), drafts = memoryDraftStores(), storage = memoryStorage(credential).storage;
+    const tree = create(CollaborationGoalTreeSchema, { goal: { goalId: "full-goal", leadId: "lead", leadSessionId: "session",
+      status: CollaborationGoalStatus.ACTIVE, revision: { value: 1n }, createdAt: { seconds: 1_792_000_000n } } });
+    const created = clone(CollaborationGoalTreeSchema, tree);
+    created.workers.push(create(CollaborationGoalTreeSchema, { workers: [{ workerId: "created-after-capacity", label: "reviewer",
+      route: { targetId: "target", backendId: "backend", permissionMode: PermissionMode.ASK }, status: CollaborationWorkerStatus.IDLE }] }).workers[0]!);
+    const details = confirmed ? [{ desc: ErrorInfoSchema, value: create(ErrorInfoSchema, { code: COLLABORATION_WORKER_HARD_LIMIT_CODE }) }] : undefined;
+    const createWorker = vi.fn<MobileCollaborationRpc["createWorker"]>()
+      .mockRejectedValueOnce(new ConnectError("Worker capacity is occupied.", Code.ResourceExhausted, undefined, details))
+      .mockResolvedValue(created);
+    network.collaborationRpc = vi.fn((_credential, _id, _generation, assert) => ({ list: async (signal: AbortSignal) => {
+      assert(signal); return [{ $typeName: "joko.v1.CollaborationGoalAccess", goal: tree.goal, role: CollaborationSessionRole.LEAD }];
+    }, get: async () => tree, createWorker } as unknown as MobileCollaborationRpc));
+    network.getServiceOperation = vi.fn(async () => undefined);
+    let sequence = 0;
+    const newId = () => `capacity-request-${++sequence}`;
+    const app = client(network, storage, undefined, undefined, newId, undefined, drafts);
+    await app.start(); await app.select("session");
+    const signal = new AbortController().signal, api = app.taskCollaborationApi()!;
+    const form = { role: "reviewer", targetId: "target", initialTask: "", permissionMode: PermissionMode.ASK };
+    await expect(api.create(await api.load(signal), form, signal)).rejects.toMatchObject({ code: Code.ResourceExhausted });
+    expect(await api.restore(signal)).toEqual(form);
+    if (confirmed) expect(app.state.pending).toEqual([]);
+    else expect(app.state.pending).toMatchObject([{ kind: "collaboration-create", state: "unknown", sessionId: "session" }]);
+    app.dispose();
+
+    const restarted = client(network, storage, undefined, undefined, newId, undefined, drafts);
+    await restarted.start(); await restarted.select("session");
+    const recovered = restarted.taskCollaborationApi()!;
+    if (confirmed) {
+      expect(restarted.state.pending).toEqual([]);
+      await expect(recovered.create(await recovered.load(signal), form, signal)).resolves.toMatchObject({
+        tree: { workers: [{ workerId: "created-after-capacity" }] }
+      });
+      expect(createWorker).toHaveBeenCalledTimes(2);
+      expect(createWorker.mock.calls[0]?.[3]).not.toBe(createWorker.mock.calls[1]?.[3]);
+      expect(await recovered.restore(signal)).toBeUndefined();
+    } else {
+      await expect(recovered.create(await recovered.load(signal), form, signal)).rejects.toThrow("Check the current collaboration operation");
+      expect(createWorker).toHaveBeenCalledOnce();
+    }
   });
 
   it("denies worker escalation, archives only self with original lead authority, and retires collaboration reads", async () => {

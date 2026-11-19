@@ -230,10 +230,10 @@ export function createCollaborationConnectService(
         });
       });
     },
-    archiveCollaborationWorker: (request, context) => {
+    archiveCollaborationWorker: async (request, context) => {
       authenticate(context);
-      return collaborationRpc(() => {
-        const result = owner().archiveWorker({
+      return collaborationRpc(async () => {
+        const result = await owner().archiveWorker({
           operationId: request.operationId,
           workerId: request.workerId,
           callerLeadSessionId: request.callerLeadSessionId,
@@ -556,7 +556,10 @@ function collaborationRpc<T>(effect: () => T | Promise<T>): T | Promise<T> {
 function collaborationConnectError(error: unknown): unknown {
   if (error instanceof ConnectError) return error;
   if (error instanceof WorkerHardLimitError) {
-    return new ConnectError(error.message, Code.ResourceExhausted);
+    return new ConnectError(error.message, Code.ResourceExhausted, undefined, [{
+      desc: contract.ErrorInfoSchema,
+      value: create(contract.ErrorInfoSchema, { code: contract.COLLABORATION_WORKER_HARD_LIMIT_CODE })
+    }]);
   }
   if (error instanceof CollaborationGoalManagerError) {
     return new ConnectError(

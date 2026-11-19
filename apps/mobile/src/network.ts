@@ -2067,7 +2067,7 @@ export const mobileNetwork: MobileNetwork = {
     signal?.throwIfAborted();
     if (!value || !value.version?.revision || value.version.revision.value < 1n || !Number.isInteger(value.workerSoftLimit)
       || !Number.isInteger(value.workerHardLimit) || value.workerSoftLimit < 1 || value.workerHardLimit < value.workerSoftLimit
-      || value.workerHardLimit > 128 || !Number.isInteger(value.workerIdleReleaseMinutes) || value.workerIdleReleaseMinutes < 1) {
+      || value.workerHardLimit > 128 || !Number.isInteger(value.workerIdleReleaseMinutes) || value.workerIdleReleaseMinutes < 0) {
       throw new Error("The collaboration capacity settings are unavailable.");
     }
     return value;
