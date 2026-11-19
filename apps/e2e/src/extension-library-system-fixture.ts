@@ -319,7 +319,7 @@ async function writeLibraryPackageCatalog(catalogDirectory: string): Promise<voi
     writeFile(join(viewDirectory, "index.html"), [
       "<!doctype html>",
       "<html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
-      "<title>Library chain</title><link rel=\"stylesheet\" href=\"style.css\"><script defer src=\"app.js\"></script></head>",
+      "<title>Library chain</title><link rel=\"StyleSheet\" href=\"style.css\"><script defer src=\"app.js\"></script></head>",
       "<body><main><h1>Extension Library bridge</h1><output id=\"bridge-result\">starting</output></main></body></html>"
     ].join("\n"), "utf8"),
     writeFile(join(viewDirectory, "style.css"), [

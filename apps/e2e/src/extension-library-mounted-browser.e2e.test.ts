@@ -62,6 +62,7 @@ describe("mounted Extension Library main-view bridge", () => {
     const result = frame.locator("#bridge-result");
     const expectedResult = `bridge-ready:mounted-bridge:chromium:${extension.extensionId}`;
     await waitFor(() => result.textContent(), (value) => value === expectedResult, "the mounted Library bridge", 20_000);
+    expect(await result.evaluate(element => getComputedStyle(element).paddingTop)).toBe("12px");
     expect(await frame.locator("html").getAttribute("data-bridge-ready")).toBe("true");
     expect(await frame.locator("html").evaluate(() => ({ origin: window.origin, secure: window.isSecureContext })))
       .toEqual({ origin: "null", secure: true });

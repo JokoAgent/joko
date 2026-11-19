@@ -78,7 +78,7 @@ function installExtensionResources(sourceSet: typeof extensionSourceSet): void {
   const originalSet = Element.prototype.setAttribute, originalGet = Element.prototype.getAttribute;
   const watched = (element: Element, name: string): boolean => name === "src" && ["IMG", "AUDIO", "VIDEO", "SOURCE", "INPUT", "SCRIPT"].includes(element.tagName)
     || name === "poster" && element.tagName === "VIDEO" || name === "srcset" && ["IMG", "SOURCE"].includes(element.tagName)
-    || name === "href" && element.tagName === "LINK" && ["", "stylesheet"].includes(originalGet.call(element, "rel") ?? "");
+    || name === "href" && element.tagName === "LINK" && ["", "stylesheet"].includes(originalGet.call(element, "rel")?.toLowerCase() ?? "");
   const code = (kind: "script" | "module" | "style" | "style-text", url: URL, text?: string): Promise<string> => new Promise((finish, reject) => request(kind, url, result => {
     if (!result.ok || typeof result.dataUrl !== "string" || !/^data:(?:text\/(?:javascript|css)|application\/javascript)(?:;[^,]*)?;base64,/iu.test(result.dataUrl)) reject(new Error("Surface code is unavailable."));
     else finish(result.dataUrl);
