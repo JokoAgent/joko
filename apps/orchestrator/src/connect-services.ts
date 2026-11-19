@@ -1926,6 +1926,9 @@ export function createConnectServices(application: OrchestratorApplication, proj
       const scope = request.scope ?? create(contract.SnapshotScopeSchema, {
         kind: { case: "owner", value: create(contract.OwnerSnapshotScopeSchema, {}) }
       });
+      if (scope.kind.case === "session" && scope.kind.value.recentTimelineItems > 0 && scope.kind.value.sessionId.trim() !== "") {
+        await dependencies.sessionHost.hydrateBoundNativeCatalogHistory(scope.kind.value.sessionId, authenticated, signal);
+      }
       const projected = projectStoreSnapshot(dependencies.store, scope, {
         server: serverInfo(dependencies, now()),
         now,
@@ -2976,14 +2979,16 @@ export function createConnectServices(application: OrchestratorApplication, proj
       const result = paginate(values, request.page);
       return { backgroundTasks: result.values, page: result.page };
     },
-    listSessionTimeline: (request, context) => {
-      authenticate(context);
+    listSessionTimeline: (request, context) => readAuthorized(context, async (authenticated, signal) => {
       const aroundEventId = request.aroundEventId.trim();
       if (aroundEventId !== "" && request.beforeCursor !== undefined) {
         throw invalidArgument("around_event_id and before_cursor are mutually exclusive");
       }
       if (request.aroundEventId !== "" && aroundEventId === "") {
         throw invalidArgument("around_event_id must not be blank");
+      }
+      if (aroundEventId === "" && request.beforeCursor === undefined && request.sessionId.trim() !== "") {
+        await dependencies.sessionHost.hydrateBoundNativeCatalogHistory(request.sessionId, authenticated, signal);
       }
       const before = request.beforeCursor === undefined
         ? undefined
@@ -3011,7 +3016,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
           ? toProtoEventCursor(selected[0].globalCursor, generation, now())
           : undefined
       };
-    },
+    }),
     searchSessionMessages: async (request, context) => {
       authenticate(context);
       const scope = request.scope.case === "sessionId"
@@ -9902,10 +9907,12 @@ function peekBackendProviderAccountUsageSnapshot(
   dependencies: ConnectServiceDependencies,
   descriptor: BackendDescriptor,
   providerId: string,
-  adapter: BackendAdapter & BackendProviderAccountOperations
+  adapter: BackendAdapter & BackendProviderAccountOperations,
+  refreshIfMissing: boolean
 ): contract.ProviderAccountUsageSnapshot | undefined {
   const snapshot = adapter.peekAccountUsage?.(providerId);
   if (snapshot?.providerId === providerId) return mapProviderAccountUsageSnapshot(snapshot);
+  if (!refreshIfMissing) return undefined;
 
   const now = Date.now();
   let reads = backgroundNativeAccountUsage.get(adapter);
@@ -9929,7 +9936,7 @@ async function backendProviderDescriptorWithAccountUsage(
   revision: bigint,
   provider: contract.ProviderDescriptor,
   signal?: AbortSignal,
-  fromSnapshot = false
+  snapshotUsage?: "refresh-in-background" | "cached-only"
 ): Promise<contract.ProviderDescriptor> {
   provider = configureProviderCredentialSurfaces(dependencies, descriptor, provider);
   if (dependencies.providerAccountResets && descriptor.capabilities.get("provider.account_resets")?.supported === true
@@ -9943,11 +9950,13 @@ async function backendProviderDescriptorWithAccountUsage(
   // Paired Device quota is read explicitly for the selected Provider. Catalog
   // projection should not fan out to remote devices or cache their quotas.
   if (descriptor.adapterKind !== "hosted") {
-    const adapter = fromSnapshot ? dependencies.adapters().find(candidate => candidate.id === descriptor.id) as
-      (BackendAdapter & BackendProviderAccountOperations) | undefined : undefined;
-    accountUsage = adapter?.peekAccountUsage !== undefined
-      ? peekBackendProviderAccountUsageSnapshot(dependencies, descriptor, providerId, adapter)
-      : await backendProviderAccountUsageSnapshot(dependencies, descriptor, providerId, signal);
+    const adapter = snapshotUsage === undefined ? undefined : dependencies.adapters().find(candidate => candidate.id === descriptor.id) as
+      (BackendAdapter & BackendProviderAccountOperations) | undefined;
+    if (adapter?.peekAccountUsage !== undefined) {
+      accountUsage = peekBackendProviderAccountUsageSnapshot(dependencies, descriptor, providerId, adapter, snapshotUsage === "refresh-in-background");
+    } else if (snapshotUsage !== "cached-only") {
+      accountUsage = await backendProviderAccountUsageSnapshot(dependencies, descriptor, providerId, signal);
+    }
   }
   const capabilities = [
     ...(provider.capabilities?.capabilities ?? []).filter((capability) =>
@@ -14850,6 +14859,10 @@ async function enrichSnapshot(
     providerDescriptorKey(provider.backendId, provider.providerId),
     provider
   ] as const));
+  // Opening imported Codex history from disk can succeed while its executable is unavailable.
+  const readingCatalogHistory = scope.kind.case === "session" && projected.backends.some(backend =>
+    backendRecords.get(backend.backendId)?.descriptor.adapterKind === "codex")
+    && dependencies.store.hasNativeCatalogRolloutHistory(scope.kind.value.sessionId, { activeOnly: true });
   await Promise.all([...authoritativeProviderMap].map(async ([key, provider]) => {
     const record = backendRecords.get(provider.backendId);
     if (record === undefined || managedProviderCatalogApplies(dependencies, provider.backendId, provider.providerId)) return;
@@ -14860,7 +14873,7 @@ async function enrichSnapshot(
       record.revision,
       provider,
       signal,
-      true
+      readingCatalogHistory && record.descriptor.adapterKind === "codex" ? "cached-only" : "refresh-in-background"
     ));
   }));
   if (providerRecords !== undefined) {

@@ -673,6 +673,12 @@ export interface BackendAdapter {
   scanNativeSessionPreviewCatalog?(projectDirectories: readonly string[]): Promise<NativeSessionCatalogResult>;
   /** Only accepts the exact entry obtained from this Adapter's own scan. Never starts a runtime. */
   readNativeSessionPreview?(entry: NativeSessionCatalogEntry): Promise<NativeSessionPreview>;
+  /** Short textual display history for a confirmed local catalog binding. No runtime or navigation is acquired. */
+  readBoundNativeCatalogHistory?(input: {
+    readonly binding: NativeSessionBinding;
+    readonly target: TargetDescriptor;
+    readonly signal: AbortSignal;
+  }): Promise<NativeSessionPreview["messages"] | undefined>;
   /** Convert an entry returned by the Adapter's catalog into a dormant binding without starting a runtime. */
   bindCatalogSession?(
     entry: NativeSessionCatalogEntry,

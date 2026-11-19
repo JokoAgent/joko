@@ -39,6 +39,7 @@ import type {
   RunState,
   RunUsageSummary,
   NativeSessionBinding,
+  NativeSessionPreview,
   SessionAttentionKind,
   SessionDescriptor,
   SessionReferenceSnapshot,
@@ -459,6 +460,7 @@ const MESSAGE_SEARCH_RRF_K = 60;
 const STORE_SCAN_PAGE_SIZE = 100_000;
 const NATIVE_BLANK_RECOVERY_SETTING_KEY = "runtime.native_blank_recovery";
 const MESSAGE_REWIND_CONTINUATION_SETTING_KEY = "runtime.message_rewind_continuation";
+const CATALOG_ROLLOUT_HISTORY_NAMESPACE = "codex.catalog_rollout_history";
 const RETAINED_CONTEXT_EVENTS_KEY = "runtime.retained_context_events";
 export const EXTENSION_USAGE_SETTINGS_PREFIX = "extension-usage.v1:";
 const EXTENSION_USAGE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
@@ -7751,6 +7753,15 @@ export class OperationalStore {
       : row["kind"] === "create_collaboration_worker_session" ? "collaboration" : row["kind"] === "create_messaging_session" ? "messaging" : "learning";
   }
 
+  findNativeCatalogCreation(sessionId: string): OperationRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`SELECT * FROM operations
+      WHERE kind = 'create_session' AND status = 'completed'
+        AND json_type(body_json, '$.catalogImport') = 'object' AND json_extract(response_json, '$.sessionId') = ?
+      ORDER BY created_at, id LIMIT 1`).get(nonBlank(sessionId, "Session ID")) as Row | undefined;
+    return row === undefined ? undefined : operationFromRow(row);
+  }
+
   listSessions(options: { readonly targetId?: string; readonly includeArchived?: boolean; readonly includeDeleted?: boolean; readonly excludeHidden?: boolean } = {}): StoredSession[] {
     this.assertOpen();
     const clauses: string[] = [];
@@ -11604,18 +11615,8 @@ export class OperationalStore {
         ) VALUES (?, ?, ?, ?, ?)
       `);
       for (const candidate of rows) {
-        const cursor = toBigInt(candidate.row!["global_cursor"]);
         insertTombstone.run(candidate.eventId, sessionId, operationId, at, revision);
-        this.database.prepare("DELETE FROM message_search_fts WHERE rowid = ?")
-          .run(asSqlInteger(cursor));
-        if (this.messageVectorAvailable) {
-          this.database.prepare(`UPDATE ${MESSAGE_SEARCH_VECTOR_TABLE} SET live = 0 WHERE rowid = ?`)
-            .run(asSqlInteger(cursor));
-        }
-        this.database.prepare("DELETE FROM message_embedding_records WHERE event_cursor = ?")
-          .run(asSqlInteger(cursor));
-        this.database.prepare("DELETE FROM message_embedding_jobs WHERE event_cursor = ?")
-          .run(asSqlInteger(cursor));
+        this.removeMessageSearchEntry(toBigInt(candidate.row!["global_cursor"]));
       }
       this.refreshNativeHistoryCanonicalIdentities(sessionId);
       this.refreshNativeHistoryActiveEntries(sessionId);
@@ -12304,6 +12305,70 @@ export class OperationalStore {
         payload: { type: "history_pruned", activeContextReset: input.activeContextReset }
       });
     });
+  }
+
+  hasNativeCatalogRolloutHistory(sessionId: string, options?: { readonly activeOnly: boolean }): boolean {
+    this.assertOpen();
+    return this.database.prepare(`
+      SELECT 1 FROM events AS event
+      WHERE event.session_id = ? AND event.namespace = ? AND (? = 0 OR NOT EXISTS (
+        SELECT 1 FROM message_event_tombstones WHERE event_id = event.id
+      )) LIMIT 1
+    `).get(sessionId, CATALOG_ROLLOUT_HISTORY_NAMESPACE, options?.activeOnly === true ? 1 : 0) !== undefined;
+  }
+
+  appendNativeCatalogRolloutHistory(session: SessionDescriptor, operationId: string, messages: NativeSessionPreview["messages"]): void {
+    this.write(() => {
+      if (this.hasNativeCatalogRolloutHistory(session.id)) return;
+      const fingerprint = nativeBindingFingerprint(session.binding.opaqueRef);
+      for (const [index, message] of messages.entries()) {
+        this.appendEvent({
+          sessionId: session.id,
+          targetId: session.targetId,
+          backendId: session.backendId,
+          operationId,
+          generation: session.binding.generation,
+          emittedAt: message.at,
+          traceId: `catalog-rollout:${operationId}:${index}`,
+          payload: { type: "message_complete", role: message.role, blocks: [{ kind: "text", text: message.text }] },
+          metadata: { namespace: CATALOG_ROLLOUT_HISTORY_NAMESPACE, fields: { [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: fingerprint } }
+        });
+      }
+    });
+  }
+
+  /** Replace the display-only rollout projection in the same transaction as canonical history. */
+  retireNativeCatalogRolloutHistory(sessionId: string, operationId: string): void {
+    this.assertOpen();
+    const rows = this.database.prepare(`
+      SELECT event.id, event.global_cursor FROM events AS event
+      LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
+      WHERE event.session_id = ? AND event.namespace = ? AND tombstone.event_id IS NULL
+    `).all(sessionId, CATALOG_ROLLOUT_HISTORY_NAMESPACE) as Row[];
+    if (rows.length === 0) return;
+    this.runOperation({ id: operationId, kind: "retire_native_catalog_rollout_history", body: { sessionId } }, () => {
+      const at = this.now();
+      const revision = asSqlInteger(this.requireActiveRevision());
+      const insert = this.database.prepare(`INSERT INTO message_event_tombstones(
+        event_id, session_id, deletion_operation_id, deleted_at, revision
+      ) VALUES (?, ?, ?, ?, ?)`);
+      for (const row of rows) {
+        insert.run(String(row["id"]), sessionId, operationId, at, revision);
+        this.removeMessageSearchEntry(toBigInt(row["global_cursor"]));
+      }
+      this.publishHistoryPruned({ sessionId, activeContextReset: false, operationId, prunedAt: at });
+      return { sessionId };
+    });
+  }
+
+  private removeMessageSearchEntry(cursor: bigint): void {
+    const id = asSqlInteger(cursor);
+    this.database.prepare("DELETE FROM message_search_fts WHERE rowid = ?").run(id);
+    if (this.messageVectorAvailable) {
+      this.database.prepare(`UPDATE ${MESSAGE_SEARCH_VECTOR_TABLE} SET live = 0 WHERE rowid = ?`).run(id);
+    }
+    this.database.prepare("DELETE FROM message_embedding_records WHERE event_cursor = ?").run(id);
+    this.database.prepare("DELETE FROM message_embedding_jobs WHERE event_cursor = ?").run(id);
   }
 
   listEvents(query: EventQuery = {}): PersistedEvent[] {

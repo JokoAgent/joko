@@ -662,7 +662,7 @@ export class ManagedProviderProxy {
       const base = new URL(baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`);
       const endpoint = selected.route?.requestPath === undefined
         ? new URL(path.slice(1), base)
-        : new URL(`${selected.route.requestPath.replace(/\/$/u, "")}${suffix}`, base.origin);
+        : new URL(suffix === "" ? selected.route.requestPath : `${selected.route.requestPath.replace(/\/$/u, "")}${suffix}`, base.origin);
       if (endpoint.origin !== base.origin) throw unavailable();
       const headers = new Headers({ "content-type": "application/json", accept: "text/event-stream, application/json" });
       for (const name of [
@@ -772,7 +772,8 @@ export class ManagedProviderProxy {
       const base = new URL(route.baseUrl.endsWith("/") ? route.baseUrl : `${route.baseUrl}/`);
       const endpoint = route.requestPath === undefined
         ? new URL(match![2]!.slice(1), base)
-        : new URL(`${route.requestPath.replace(/\/$/u, "")}${suffix}`, base.origin);
+        : new URL(route.api === "openai-responses" && suffix === ""
+          ? route.requestPath : `${route.requestPath.replace(/\/$/u, "")}${suffix}`, base.origin);
       if (endpoint.origin !== base.origin) throw unavailable();
       const headers = new Headers({ "content-type": "application/json", accept: "text/event-stream, application/json" });
       for (const name of ["anthropic-version", "anthropic-beta", "openai-beta", "x-codex-turn-metadata", "session_id"]) {

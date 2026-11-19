@@ -1,8 +1,9 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { LocalCodexRuntime } from "./local-codex-runtime.js";
+import { LOCAL_CODEX_RUNTIME_ASSETS, LOCAL_CODEX_RUNTIME_VERSION, LocalCodexRuntime } from "./local-codex-runtime.js";
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -36,6 +37,48 @@ describe("local complete runtime provisioning", () => {
     expect(events.at(-1)?.runtime).toMatchObject({ state: "failed", failureCode: "install_failed" });
     expect(await readFile(join(root, "current.json"), "utf8")).toBe(previous);
     expect((await readdir(root)).filter(name => name.startsWith(".stage-"))).toEqual([]);
+  });
+
+  it.skipIf(process.platform === "win32")("keeps the installed identity on a failed probe and after each explicit repair fails", async () => {
+    const root = await directory();
+    const platform = "linux-x64";
+    const asset = LOCAL_CODEX_RUNTIME_ASSETS[platform]!;
+    const installedVersion = LOCAL_CODEX_RUNTIME_VERSION;
+    const packageName = `${installedVersion}-${platform}-00000000-0000-4000-8000-000000000001`;
+    const packageRoot = join(root, packageName);
+    for (const path of ["bin", "codex-path", "codex-resources"]) await mkdir(join(packageRoot, path), { recursive: true });
+    const files = {
+      "bin/codex": `#!/bin/sh\nprintf 'codex-cli ${installedVersion}\\n'\n`,
+      "bin/codex-code-mode-host": "host",
+      "codex-package.json": JSON.stringify({ layoutVersion: 1, version: installedVersion, target: asset.target,
+        variant: "codex", entrypoint: asset.entrypoint, resourcesDir: "codex-resources", pathDir: "codex-path" }),
+      "codex-path/rg": "rg"
+    };
+    for (const [path, content] of Object.entries(files)) await writeFile(join(packageRoot, path), content, { mode: 0o644 });
+    await writeFile(join(packageRoot, ".joko-package.json"), JSON.stringify(Object.entries(files).map(([path, content]) => ({
+      path, size: Buffer.byteLength(content), sha256: createHash("sha256").update(content).digest("hex")
+    }))));
+    const receipt = JSON.stringify({ version: installedVersion, platform, archiveSha256: asset.sha256, directory: packageName });
+    await writeFile(join(root, "current.json"), receipt);
+
+    const download = vi.fn(async () => new Response("wrong archive"));
+    const adopt = vi.fn();
+    const runtime = owner(root, download, { platform: "linux", adopt });
+    await expect(runtime.probe("native-backend")).resolves.toMatchObject({ state: "failed", failureCode: "probe_failed", installedVersion });
+    await chmod(join(packageRoot, asset.entrypoint), 0o755);
+    let latest = await runtime.probe("native-backend");
+    expect(latest).toMatchObject({ state: "ready", installedVersion });
+
+    for (const requestId of ["repair", "retry"]) {
+      const events = [];
+      for await (const event of runtime.install({ requestId, backendId: "native-backend", expectedGeneration: 7,
+        repair: latest.installedVersion !== undefined })) events.push(event);
+      latest = events.at(-1)!.runtime;
+      expect(latest).toMatchObject({ state: "failed", failureCode: "install_failed", installedVersion });
+    }
+    expect(download).toHaveBeenCalledTimes(2);
+    expect(adopt).not.toHaveBeenCalled();
+    expect(await readFile(join(root, "current.json"), "utf8")).toBe(receipt);
   });
 
   it("keeps service installation alive when an observer leaves, while explicit cancellation stops its exact request", async () => {

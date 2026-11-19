@@ -81,7 +81,7 @@ export interface TranslatorState {
   activeTurnId?: string;
   activePlan?: { readonly turnId: string; readonly input: string };
   nativeReconnect?: { readonly turnId: string; readonly attempt: number; readonly maxAttempts: number };
-  usage?: UsageSnapshot;
+  usage?: { readonly snapshot: UsageSnapshot; readonly threadId?: string; readonly turnId?: string };
   observedFastMode?: boolean | "ultrafast";
   readonly itemNames: Map<string, string>;
   readonly samplingItems: Map<string, string>;
@@ -499,8 +499,13 @@ export class CodexEventTranslator {
           ? [...finishCodexReconnectForOutput(state, params), ...events] : events;
       }
       case "thread/tokenUsage/updated": {
-        const usage = usageFromNotification(params, state.observedFastMode);
-        state.usage = usage;
+        const record = objectValue(params, "token usage");
+        const usage = usageFromNotification(record, state.observedFastMode);
+        state.usage = {
+          snapshot: usage,
+          threadId: typeof record["threadId"] === "string" ? record["threadId"] : undefined,
+          turnId: typeof record["turnId"] === "string" ? record["turnId"] : undefined
+        };
         return [{ type: "usage", usage }];
       }
       case "thread/name/updated":
@@ -565,12 +570,15 @@ export class CodexEventTranslator {
         const record = objectValue(params, "completed item");
         if (record["threadId"] === state.threadId && state.samplingItems.get(item.id) === record["turnId"]) state.samplingItems.delete(item.id);
         const text = typeof item["text"] === "string" ? safeText(item["text"], 1024 * 1024) : "";
+        const observed = state.usage;
+        const usage = observed?.threadId !== undefined && observed.turnId !== undefined
+          && observed.threadId === record["threadId"] && observed.turnId === record["turnId"] ? observed.snapshot : undefined;
         return [{
           type: "message_complete",
           role: "assistant",
           blocks: [{ kind: "text", text }],
           nativeHistory: { identity: { entryId: item.id } },
-          ...(state.usage === undefined ? {} : { usage: state.usage })
+          ...(usage === undefined ? {} : { usage })
         }];
       }
       case "commandExecution": {
@@ -855,8 +863,7 @@ function toolResult(item: NativeThreadItem, state: TranslatorState, output: stri
   };
 }
 
-function usageFromNotification(params: JsonValue, observedFastMode: boolean | "ultrafast" | undefined): UsageSnapshot {
-  const record = objectValue(params, "token usage");
+function usageFromNotification(record: JsonObject, observedFastMode: boolean | "ultrafast" | undefined): UsageSnapshot {
   const tokenUsage = objectValue(record["tokenUsage"], "thread token usage");
   const last = objectValue(tokenUsage["last"], "last token usage");
   const total = objectValue(tokenUsage["total"], "total token usage");

@@ -109,7 +109,7 @@ export class LocalCodexRuntime {
       await probeCodexRuntimeVersion(published.executable);
       return this.#snapshot("ready", undefined, LOCAL_CODEX_RUNTIME_VERSION);
     } catch {
-      return { ...this.#snapshot("failed"), failureCode: "probe_failed" };
+      return { ...this.#snapshot("failed", undefined, LOCAL_CODEX_RUNTIME_VERSION), failureCode: "probe_failed" };
     }
   }
 
@@ -159,12 +159,14 @@ export class LocalCodexRuntime {
     const signal = flight.controller.signal;
     let stage: string | undefined;
     let previous: string | undefined;
+    let installedVersion: string | undefined;
     let published = false;
     try {
       signal.throwIfAborted();
       flight.assertAuthority();
       await this.#prepareRoot();
       const current = await this.#readPublished();
+      installedVersion = current === undefined ? undefined : LOCAL_CODEX_RUNTIME_VERSION;
       if (!flight.input.repair && current !== undefined) {
         await probeCodexRuntimeVersion(current.executable, signal);
       } else {
@@ -211,7 +213,8 @@ export class LocalCodexRuntime {
           return;
         }
       }
-      this.#emit(flight, { ...this.#snapshot(signal.aborted ? "cancelled" : "failed"), failureCode: signal.aborted ? "cancelled" : "install_failed" });
+      this.#emit(flight, { ...this.#snapshot(signal.aborted ? "cancelled" : "failed", undefined, installedVersion),
+        failureCode: signal.aborted ? "cancelled" : "install_failed" });
     } finally {
       if (stage !== undefined) await this.#removeStage(stage).catch(() => undefined);
       flight.terminal = true;

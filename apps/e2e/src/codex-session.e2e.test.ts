@@ -1,14 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { create, fromBinary } from "@bufbuild/protobuf";
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { createCodexAdapter, AppServerHost, TransportFault } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
-import { EntityKind, GetOperationRequestSchema, ObjectiveStatus, OperationMutationSchema, OperationState, RetryState, RunState, ScheduleRecurrenceSchema,
-  SubmitOperationRequestSchema, ToolCallState } from "@joko/contracts";
+import { CreateTargetMutationSchema, EntityKind, GetOperationRequestSchema, MessageRole, NativeCatalogImportPresentationSchema, NativeSessionPlacement, NativeSessionStartSchema,
+  ObjectiveStatus, OperationMutationSchema, OperationState, RetryState, RunState, ScheduleRecurrenceSchema,
+  SetWorkspaceTrustMutationSchema, SubmitOperationRequestSchema, TargetWorkspaceInputSchema, ToolCallState, WorkspaceKind, type Event } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it, vi } from "vitest";
 
@@ -20,6 +22,139 @@ import {
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
   ? it : it.skip;
+
+it.each(["legacy", "paginated"] as const)("reads the original %s Codex catalog task without a cold executable", async (mode) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-offline-catalog-")));
+  const profileDirectory = join(root, "codex-home");
+  const backendId = "codex-offline-catalog";
+  const threadId = randomUUID();
+  const turnId = "original-completed-turn";
+  const question = "Which deliverables did we finish?";
+  const answer = "We finished the review and release notes.";
+  const native = new FakeCodexAppServer();
+  native.codexHome = profileDirectory;
+  let executablePresent = true;
+  let failedStarts = 0;
+  const host = new AppServerHost({ transportFactory: () => {
+    if (executablePresent) return native.createTransport();
+    failedStarts += 1;
+    throw new TransportFault("spawn_failed", "The original configured Codex executable is unavailable.");
+  } });
+  let fixture: OrchestratorE2eFixture | undefined;
+  try {
+    const sessions = join(profileDirectory, "sessions");
+    await mkdir(sessions, { recursive: true });
+    fixture = await OrchestratorE2eFixture.start({ rootDirectory: root, backendFactories: [{
+      instanceId: backendId, adapterKind: "codex", displayName: "Codex catalog history fixture",
+      create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host,
+        profileDirectory, catalogProfileDirectories: [profileDirectory] })
+    }] });
+    const cwd = join(root, "user-project");
+    await mkdir(cwd);
+    const { clients, connectionId } = await fixture.pair("Local catalog Owner");
+    const project = await submit(clients.operation, connectionId, create(OperationMutationSchema, {
+      payload: { case: "createTarget", value: create(CreateTargetMutationSchema, {
+        backendId, displayName: "Original catalog project",
+        workspace: create(TargetWorkspaceInputSchema, { kind: WorkspaceKind.USER_PROJECT, serverPath: cwd })
+      }) }
+    }));
+    if (project.result?.payload.case !== "target") throw new Error("The catalog project was not created.");
+    const { targetId, workspaceId } = project.result.payload.value;
+    const trust = await submit(clients.operation, connectionId, create(OperationMutationSchema, {
+      payload: { case: "setWorkspaceTrust", value: create(SetWorkspaceTrustMutationSchema, { workspaceId, trusted: true }) }
+    }));
+    expect(trust.state).toBe(OperationState.SUCCEEDED);
+    const store = fixture.application.store;
+    expect(store.getTarget(targetId).descriptor).toMatchObject({ managed: false, trusted: true, workspaceRoot: cwd });
+    const seeded = native.seedThread(cwd, [{ id: turnId, status: "completed", items: [
+      { id: "original-user", type: "userMessage", content: [{ type: "text", text: question, text_elements: [] }] },
+      { id: "original-assistant", type: "agentMessage", text: answer, phase: null, memoryCitation: null, delivery: null }
+    ] }]);
+    native.threads.set(threadId, { ...native.threads.get(seeded)!, id: threadId });
+    native.threads.delete(seeded);
+
+    const at = new Date("2026-02-05T08:30:00Z");
+    const event = (type: string, fields: Record<string, unknown> = {}) => ({ type: "event_msg", payload: { type, ...fields } });
+    const records = [
+      { type: "session_meta", payload: { id: threadId, cwd, source: "cli", history_mode: mode } },
+      event("task_started", { turn_id: turnId }),
+      { type: "response_item", payload: { type: "message", role: "user", content: [{
+        type: "input_text", text: "<environment_context>Private runtime settings</environment_context>"
+      }] } },
+      ...(mode === "legacy" ? [event("user_message", { message: question }), event("agent_message", { message: answer })] : [
+        event("item_completed", { thread_id: threadId, turn_id: turnId,
+          item: { type: "UserMessage", id: "original-user", content: [{ type: "text", text: question, text_elements: [] }] } }),
+        event("item_completed", { thread_id: threadId, turn_id: turnId,
+          item: { type: "AgentMessage", id: "original-assistant", content: [{ type: "Text", text: answer }] } })
+      ]),
+      event("task_complete", { turn_id: turnId })
+    ];
+    const rollout = join(sessions, `rollout-2026-02-05T08-30-00-${threadId}.jsonl`);
+    const sourceBytes = records.map((record, index) => JSON.stringify({ ...record,
+      timestamp: new Date(at.getTime() + index * 1_000).toISOString() })).join("\n") + "\n";
+    await writeFile(rollout, sourceBytes);
+    const database = new DatabaseSync(join(profileDirectory, "state_5.sqlite"));
+    try {
+      database.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, rollout_path TEXT, title TEXT, source TEXT, created_at INTEGER, updated_at INTEGER, archived INTEGER)");
+      database.prepare("INSERT INTO threads VALUES (?, ?, ?, ?, 'cli', ?, ?, 0)")
+        .run(threadId, cwd, rollout, "Original catalog history", at.getTime() / 1_000, at.getTime() / 1_000 + 5);
+    } finally { database.close(); }
+
+    const catalog = await clients.session.scanNativeSessionCatalog({ backendId, force: true });
+    const entry = catalog.entries.find(candidate => candidate.nativeSessionId === threadId);
+    if (entry === undefined) throw new Error("The original local Codex catalog entry is missing.");
+    expect(entry.projectTargetId).toBe(targetId);
+    const mutation = createSessionMutation({ backendId, targetId, displayName: "Original catalog history" });
+    if (mutation.payload.case !== "createSession") throw new Error("Expected a catalog import mutation.");
+    mutation.payload.value.initialPlacement = NativeSessionPlacement.PROJECT;
+    mutation.payload.value.nativeStart = create(NativeSessionStartSchema, { kind: {
+      case: "attach", value: { opaqueNativeReference: entry.nativeReference }
+    } });
+    mutation.payload.value.catalogImport = create(NativeCatalogImportPresentationSchema, {
+      projectId: targetId, snapshotToken: catalog.snapshotToken, createdAt: entry.createdAt, modifiedAt: entry.modifiedAt
+    });
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId, mutation));
+    expect(store.listEvents({ sessionId, messageCompleteOnly: true })).toEqual([]);
+
+    executablePresent = false;
+    await native.transport!.exit(false);
+    await expect(clients.session.listRuntimeCommands({ sessionId })).rejects.toThrow();
+    const startsBeforeReading = failedStarts;
+    expect(startsBeforeReading).toBeGreaterThan(0);
+    const timeline = async () => (await clients.session.listSessionTimeline({ sessionId })).events;
+    const snapshot = async () => (await clients.event.getSnapshot({
+      scope: { kind: { case: "session", value: { sessionId, recentTimelineItems: 200 } } }
+    })).snapshot!.timeline;
+    const messages = (events: readonly Event[]) => events.flatMap(({ payload }) => {
+      const kind = payload?.kind;
+      return kind?.case === "messageCompleted" || kind?.case === "messageStarted" && kind.value.role === MessageRole.USER ? [kind] : [];
+    });
+    await expect(fixture.anonymous.session.listSessionTimeline({ sessionId })).rejects.toThrow();
+    const readers = mode === "legacy" ? [timeline, snapshot] : [snapshot, timeline];
+    for (const read of readers) {
+      const visible = await read();
+      expect(failedStarts, `${read.name} must not start the cold executable`).toBe(startsBeforeReading);
+      expect(messages(visible)).toMatchObject([
+        { case: "messageStarted", value: { role: MessageRole.USER, userInputAccepted: false,
+          userInput: { parts: [{ content: { case: "text", value: question } }] } } },
+        { case: "messageCompleted", value: { role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: answer } }] } }
+      ]);
+      expect(messages(visible).every(message => message.value.nativeIdentity === undefined)).toBe(true);
+    }
+    expect(await readFile(rollout, "utf8")).toBe(sourceBytes);
+
+    executablePresent = true;
+    await clients.session.listRuntimeCommands({ sessionId });
+    const canonical = messages(await timeline());
+    expect(canonical.map(message => message.value.nativeIdentity?.entryId)).toEqual(["original-user", "original-assistant"]);
+    expect(messages(await snapshot())).toEqual(canonical);
+    expect(store.listEvents({ sessionId }).some(event => event.payload.type === "history_pruned")).toBe(true);
+  } finally {
+    await fixture?.close();
+    await host.shutdown();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 it("keeps one-shot native Codex schedules on the saved account through refresh, logout and replacement", async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-scheduled-account-"));
@@ -628,6 +763,71 @@ it("keeps a Codex thread and durable Queue on the production HTTP/SQLite/Connect
       (value) => value.run?.state === RunState.SUCCEEDED, "independent Backend completion");
     expect(fixture.application.store.listEvents({ sessionId: piSessionId }).some((event) =>
       event.payload.type === "message_complete" && event.payload.role === "assistant")).toBe(true);
+  } finally {
+    await fixture?.close();
+    await host.shutdown();
+  }
+});
+
+it("keeps previous Codex usage off current commentary through a fresh task read during tool execution", async () => {
+  const backendId = "codex-running-usage";
+  const native = new FakeCodexAppServer();
+  const host = new AppServerHost({ transportFactory: () => native.createTransport() });
+  let fixture: OrchestratorE2eFixture | undefined;
+  try {
+    const service = fixture = await OrchestratorE2eFixture.start({ backendFactories: [{ instanceId: backendId, adapterKind: "codex",
+      displayName: "Codex running usage fixture", create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host }) }] });
+    const { authKey, clients, connectionId } = await service.pair("Codex usage Owner");
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId,
+      createSessionMutation({ backendId, targetId: service.targetId(backendId) })));
+    const store = service.application.store;
+    const binding = store.getSession(sessionId).descriptor.binding;
+    const threadId = binding.nativeSessionId;
+    if (threadId === undefined) throw new Error("The task has no native Codex thread.");
+
+    const send = async (text: string) => {
+      const admitted = await submit(clients.operation, connectionId, sendInputMutation(sessionId, BigInt(binding.generation), text));
+      const runId = queueRunIdFrom(admitted);
+      await waitFor(async () => store.listQueueItems({ sessionId }), items => items.some(item => item.runId === runId && item.state === "backend_accepted"),
+        "the native acknowledgement for the original Run");
+      const turnId = native.threads.get(threadId)?.turns.at(-1)?.["id"];
+      if (typeof turnId !== "string") throw new Error("No native turn for the accepted Run.");
+      return { runId, turnId };
+    };
+    const first = await send("Finish the first turn");
+    await native.completeTurn(threadId, "First answer.");
+    await waitFor(() => clients.run.getRun({ runId: first.runId }), ({ run }) => run?.state === RunState.SUCCEEDED, "first Codex Run to settle");
+    expect(store.listEvents({ sessionId }).some(event => event.runId === first.runId && event.payload.type === "usage"
+      && event.payload.usage.totalTokens === 10)).toBe(true);
+
+    const current = await send("Check the workspace next");
+    expect(current.turnId).not.toBe(first.turnId);
+    const commentary = { type: "agentMessage", id: "current-commentary", text: "I will check the workspace.",
+      phase: "commentary", memoryCitation: null, delivery: null };
+    const command = { type: "commandExecution", id: "current-command", command: "git status --short", status: "inProgress" };
+    await native.transport!.emitNotification("item/completed", { threadId, turnId: current.turnId, item: commentary });
+    await native.transport!.emitNotification("item/started", { threadId, turnId: current.turnId, item: command });
+    const restored = service.clients(authKey);
+    expect((await restored.event.getSnapshot({})).snapshot?.runs.find(run => run.runId === current.runId)?.state).toBe(RunState.RUNNING);
+    expect((await restored.tool.getToolCall({ toolCallId: command.id })).toolCall).toMatchObject({ runId: current.runId, state: ToolCallState.RUNNING });
+    const scoped = (await restored.event.getSnapshot({
+      scope: { kind: { case: "session", value: { sessionId, recentTimelineItems: 240 } } }
+    })).snapshot!.timeline;
+    const history = (await restored.session.listSessionTimeline({ sessionId, limit: 240 })).events;
+    for (const events of [scoped, history]) {
+      const same = events.filter(event => event.payload?.kind.case === "messageCompleted" && event.payload.kind.value.messageId === commentary.id);
+      expect(same).toHaveLength(1);
+      expect(same[0]?.identity?.runId).toBe(current.runId);
+      const completed = same[0]?.payload?.kind;
+      if (completed?.case !== "messageCompleted") throw new Error("Original Codex commentary is missing.");
+      expect(completed.value.blocks).toMatchObject([{ content: { case: "text", value: commentary.text } }]);
+      expect(completed.value.usage).toBeUndefined();
+      expect(completed.value.turnUsage).toBeUndefined();
+    }
+    expect(store.listEvents({ sessionId }).some(event => event.runId === current.runId && event.payload.type === "usage")).toBe(false);
+    await native.transport!.emitNotification("item/completed", { threadId, turnId: current.turnId, item: { ...command, status: "completed" } });
+    await native.completeTurn(threadId, "Workspace checked.");
+    await waitFor(() => restored.run.getRun({ runId: current.runId }), ({ run }) => run?.state === RunState.SUCCEEDED, "current Codex Run to settle");
   } finally {
     await fixture?.close();
     await host.shutdown();

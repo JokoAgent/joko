@@ -136,6 +136,35 @@ export async function scanCodexSessionCatalog(
   return { summaries: summaries.slice(0, maximumTotalEntries), rejectedCount };
 }
 
+/** Read one already-adopted identity from its active profile, outside catalog pagination. */
+export async function readCodexCatalogHistorySource(
+  activeProfileDirectory: string,
+  profileKey: string,
+  nativeSessionId: string
+): Promise<{ readonly source: CodexCatalogSource; readonly workingDirectory: string } | undefined> {
+  const [profile] = await configuredProfiles([], activeProfileDirectory);
+  if (profile?.key !== profileKey) return undefined;
+  const path = await newestStateDatabase(profile.directory);
+  if (path === undefined) return undefined;
+  if (servicePathIdentity(await realpath(path)) !== servicePathIdentity(path)) return undefined;
+  let database: DatabaseSync | undefined;
+  try {
+    database = new DatabaseSync(path, { readOnly: true });
+    database.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+    database.exec("PRAGMA query_only = ON");
+    const row = database.prepare('SELECT * FROM "threads" WHERE "id" = ? LIMIT 1').get(nativeSessionId) as SqliteRow | undefined;
+    const workingDirectory = normalizeWorkingDirectory(boundedString(row?.["cwd"], 32_768));
+    if (row === undefined || workingDirectory === undefined) return undefined;
+    const entry = await stateRowSummary(profile, path, row);
+    if (entry !== undefined && entry !== "rejected" && entry.nativeSessionId === nativeSessionId && entry.source.rollout !== undefined) {
+      return { source: entry.source, workingDirectory };
+    }
+  } finally {
+    database?.close();
+  }
+  return undefined;
+}
+
 async function scanProfileCatalog(
   profile: CatalogProfile,
   maximumEntries: number
