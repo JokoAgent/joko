@@ -121,6 +121,7 @@ import {
   BrowserTakeoverConflictError,
   BrowserTakeoverInputError,
   BrowserTakeoverRateLimitError,
+  MAXIMUM_TAKEOVER_NAVIGATION_URL_LENGTH,
   sameTakeoverFence,
   workspaceHtmlPreviewUrl,
   isWorkspaceHtmlPreviewUrl,
@@ -2095,16 +2096,18 @@ export function createConnectServices(application: OrchestratorApplication, proj
         throw invalidArgument("mutation.payload is required");
       }
       const publicMutation = publicOperationMutation(request.mutation);
-      const privateBody = browserKeyboardOperationBody(request.mutation, publicMutation, request.operationId,
+      const privateBody = privateBrowserOperationBody(request.mutation, publicMutation, request.operationId,
         context.requestHeader.get("authorization") ?? undefined);
       const existing = dependencies.store.findOperation(request.operationId);
       if (existing !== undefined) {
         if (existing.connectionId !== authenticated.id) {
           throw new AuthorizationError("The operation belongs to a different connection.");
         }
-        // Historical operations used the original body hash. Replay that exact
-        // identity in memory while projecting only the public keyboard action.
-        const presentedBody = privateBody !== undefined && Object.hasOwn(asRecord(existing.body), "browserKeyboardFingerprint")
+        // Legacy operations use their original hash. New private fields stay
+        // bound to the exact input without adding it to the public receipt.
+        const existingBody = asRecord(existing.body);
+        const presentedBody = privateBody !== undefined && (Object.hasOwn(existingBody, "browserKeyboardFingerprint")
+          || Object.hasOwn(existingBody, "browserNavigationFingerprint"))
           ? privateBody : durableOperationBody(authenticated, request.mutation);
         const presentedHash = operationBodyHash(presentedBody);
         if (existing.bodyHash !== presentedHash) {
@@ -6896,6 +6899,11 @@ function publicOperationMutation(mutation: contract.OperationMutation): contract
       value: { ...payload.value, action: { case: action.case, value: { ...action.value, text: "" } } } } };
     if (action.case === "keyPress" && action.value.character !== "") return { ...mutation, payload: { case: payload.case,
       value: { ...payload.value, action: { case: action.case, value: { ...action.value, character: "" } } } } };
+    if (action.case === "navigate") {
+      const index = browserTakeoverFragmentIndex(action.value.url);
+      if (index >= 0) return { ...mutation, payload: { case: payload.case, value: { ...payload.value,
+        action: { case: action.case, value: { ...action.value, url: action.value.url.slice(0, index) } } } } };
+    }
   }
   if (payload.case !== "upsertMcpServer") return mutation;
   const server = payload.value.server;
@@ -6922,10 +6930,25 @@ function publicQuestionAnswer(answer: contract.QuestionAnswer): contract.Questio
   return answer;
 }
 
-function browserKeyboardOperationBody(mutation: contract.OperationMutation, projection: contract.OperationMutation,
+function browserTakeoverFragmentIndex(url: string): number {
+  const index = url.indexOf("#");
+  return index >= 0 && index < url.length - 1 ? index : -1;
+}
+
+function privateBrowserOperationBody(mutation: contract.OperationMutation, projection: contract.OperationMutation,
   operationId: string, authorization: string | undefined): unknown {
   if (mutation.payload.case !== "browserTakeoverAction") return undefined;
   const action = mutation.payload.value.action;
+  if (action.case === "navigate") {
+    const index = browserTakeoverFragmentIndex(action.value.url);
+    if (index < 0) return undefined;
+    if (action.value.url.length > MAXIMUM_TAKEOVER_NAVIGATION_URL_LENGTH) throw invalidArgument("Browser takeover navigation URL is invalid.");
+    const bearer = parseBearer(authorization);
+    if (bearer === undefined) throw new ConnectError("Browser navigation requires an authenticated Connection.", Code.Unauthenticated);
+    const browserNavigationFingerprint = createHmac("sha256", bearer)
+      .update(JSON.stringify(["joko.browser-takeover.anchor.v1", operationId, action.value.url.slice(index + 1)])).digest("hex");
+    return { ...projection, browserNavigationFingerprint };
+  }
   const value = action.case === "textInput" ? action.value.text
     : action.case === "keyPress" && action.value.character !== "" ? action.value.character : undefined;
   if (value === undefined) return undefined;
@@ -16080,7 +16103,8 @@ function requireSameBrowserPageOwner(
 
 function durableBrowserPageProjection(page: NativeBrowserPage): { readonly url: string; readonly title: string } | undefined {
   try {
-    const url = validateTakeoverNavigationUrl(page.url);
+    const validated = validateTakeoverNavigationUrl(page.url), fragment = browserTakeoverFragmentIndex(validated);
+    const url = fragment < 0 ? validated : validated.slice(0, fragment);
     return { url, title: isWorkspaceHtmlPreviewUrl(url) ? "HTML preview" : page.title };
   } catch { return undefined; }
 }
@@ -23521,7 +23545,21 @@ async function dispatchMutation(
           assertPageCurrent();
         },
         effect: async () => {
-          await dependencies.browserProvider!.performHumanTakeoverAction(current, input, assertEffectCurrent);
+          await dependencies.browserProvider!.performHumanTakeoverAction(current, input, assertEffectCurrent, (popup) => {
+            const projection = durableBrowserPageProjection(popup);
+            if (projection === undefined) return;
+            requireBrowserState(dependencies.browserState).recordHumanPage({
+              browserProviderId: current.providerId,
+              pageId: popup.id,
+              generation: current.generation,
+              sessionId: pageOwner.sessionId,
+              targetId: pageOwner.targetId,
+              bindingGeneration: pageOwner.bindingGeneration,
+              url: projection.url,
+              title: projection.title,
+              updatedAt: (dependencies.now ?? Date.now)()
+            }, { active: false });
+          });
           updatedPage = (await dependencies.browserProvider!.listPages()).find((page) => page.id === current.pageId);
           assertEffectCurrent();
         },

@@ -155,6 +155,12 @@ export class OperationalBrowserState implements BrowserTransferRepository {
     this.#store.setSetting(SCOPE, SCOPE_ID, transferKey(record.browserProviderId, record.id), record);
   }
 
+  putMany(records: readonly PersistedBrowserTransfer[]): void {
+    this.#store.transaction(() => {
+      for (const record of records) this.put(record);
+    });
+  }
+
   delete(browserProviderId: string, browserTransferId: string): void {
     if (!safeOpaqueId(browserProviderId) || !safeOpaqueId(browserTransferId)) return;
     this.#store.deleteSetting(SCOPE, SCOPE_ID, transferKey(browserProviderId, browserTransferId));
@@ -350,8 +356,9 @@ export class OperationalBrowserState implements BrowserTransferRepository {
     if (existing !== undefined && !samePageOwner(existing, parsed)) {
       throw new BrowserSessionAuthorityError("Browser page identity is already owned by another authority.");
     }
-    this.#pageCatalog = catalogWithOpenPage(this.#pageCatalog, parsed, options);
-    this.persistPageCatalog();
+    const next = catalogWithOpenPage(this.#pageCatalog, parsed, options);
+    this.#store.setSetting<StoredPageCatalog>(SCOPE, SCOPE_ID, PAGE_CATALOG_KEY, next);
+    this.#pageCatalog = next;
   }
 
   closeHumanPage(browserProviderId: string, pageId: string, generation: number, nextActivePageId?: string): void {

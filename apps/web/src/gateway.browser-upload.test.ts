@@ -3,6 +3,7 @@ import type { Transport } from "@connectrpc/connect";
 import {
   BeginBlobUploadResponseSchema,
   BlobDisposition,
+  BrowserTransferState,
   CompleteBlobUploadResponseSchema,
   GetSnapshotResponseSchema,
   OperationState,
@@ -16,7 +17,7 @@ import { createOrchestratorGateway } from "./gateway.js";
 describe("browser file upload gateway", () => {
   afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
-  it("commits the Blob before submitting the durable page upload mutation", async () => {
+  it.each([false, true])("commits the Blob before submitting the upload and reports the inner failure (%s)", async failTransfer => {
     const calls: string[] = [];
     const submitted: any[] = [];
     const fetch = vi.fn(async () => {
@@ -68,7 +69,14 @@ describe("browser file upload gateway", () => {
           calls.push("submit");
           submitted.push(input.mutation.payload);
           return response(method, create(SubmitOperationResponseSchema, {
-            operation: { operationId: input.operationId, state: OperationState.SUCCEEDED }
+            operation: { operationId: input.operationId, state: OperationState.SUCCEEDED, result: {
+              payload: { case: "browserTransfer", value: {
+                browserTransferId: "transfer-1", browserProviderId: "browser-1", pageId: "page-1",
+                direction: TransferDirection.UPLOAD, blob: { blobId: "blob-1" },
+                state: failTransfer ? BrowserTransferState.FAILED : BrowserTransferState.COMPLETED,
+                ...(failTransfer ? { error: { code: "BROWSER_LEASE_UNAVAILABLE", message: "The Browser is in use. Try the upload again." } } : {})
+              } }
+            } }
           }));
         }
         throw new Error(`Unexpected RPC ${method.localName}`);
@@ -83,7 +91,11 @@ describe("browser file upload gateway", () => {
     );
     await gateway.connect();
 
-    await gateway.uploadBrowserFile("browser-1", "page-1", "original-document", new File(["hello"], "proof.txt", { type: "text/plain" }));
+    const upload = gateway.uploadBrowserFile("browser-1", "page-1", "original-document", new File(["hello"], "proof.txt", { type: "text/plain" }));
+    if (failTransfer) await expect(upload).rejects.toMatchObject({
+      code: "BROWSER_LEASE_UNAVAILABLE", message: "The Browser is in use. Try the upload again."
+    });
+    else await expect(upload).resolves.toBeUndefined();
 
     expect(calls).toEqual(["begin", "put", "complete", "submit"]);
     expect(fetch).toHaveBeenCalledWith("http://127.0.0.1:4318/v1/blob-uploads/ticket-1", expect.objectContaining({

@@ -4793,16 +4793,33 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async listBrowserTransfers(browserId: string, pageId: string): Promise<readonly BrowserTransferView[]> {
+    return this.readBrowserTransfers(browserId, pageId, false);
+  }
+
+  async listBrowserDownloads(browserId: string): Promise<readonly BrowserTransferView[]> {
+    return this.readBrowserTransfers(browserId, "", true);
+  }
+
+  private async readBrowserTransfers(browserId: string, pageId: string, completedDownloads: boolean): Promise<readonly BrowserTransferView[]> {
     const client = createClient(BrowserService, this.requireTransport());
     const values: BrowserTransferView[] = [];
     const consumedTokens = new Set<string>();
     let pageToken = "";
     for (let pageIndex = 0; pageIndex < MAX_COMPLETE_MESSAGE_SEARCH_PAGES; pageIndex += 1) {
       const response = await client.listBrowserTransfers(
-        { browserProviderId: browserId, pageId, page: { pageSize: 500, pageToken } },
+        {
+          browserProviderId: browserId,
+          pageId,
+          ...(completedDownloads ? { direction: TransferDirection.DOWNLOAD, state: BrowserTransferState.COMPLETED } : {}),
+          page: { pageSize: 500, pageToken }
+        },
         this.#abort === undefined ? undefined : { signal: this.#abort.signal }
       );
-      values.push(...response.transfers.map(mapBrowserTransfer));
+      const transfers = response.transfers.map(mapBrowserTransfer);
+      values.push(...(completedDownloads ? transfers.filter(transfer =>
+        transfer.browserId === browserId && transfer.direction === "download" && transfer.state === "completed" &&
+        transfer.toolCallId === undefined && transfer.blobId !== undefined
+      ) : transfers));
       const nextPageToken = response.page?.nextPageToken ?? "";
       if (nextPageToken === "") return values;
       if (nextPageToken === pageToken || consumedTokens.has(nextPageToken)) {
@@ -4818,10 +4835,20 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const scope = this.captureActionScope();
     const blob = await this.uploadAttachment(file, scope);
     scope.signal.throwIfAborted();
-    await this.submit({
+    const operation = await this.submit({
       case: "uploadBrowserFile",
       value: { browserProviderId: browserId, pageId, documentId, blob, inputHint }
     }, true, [], scope.signal);
+    const receipt = operation.result?.payload;
+    if (receipt?.case !== "browserTransfer" || receipt.value.browserProviderId !== browserId || receipt.value.pageId !== pageId
+      || receipt.value.direction !== TransferDirection.UPLOAD || receipt.value.blob?.blobId !== blob.blobId) {
+      throw new GatewayError("The Browser did not return a receipt for this file upload.");
+    }
+    if (receipt.value.state !== BrowserTransferState.COMPLETED) {
+      const error = receipt.value.error;
+      throw new GatewayError(error?.message || "The Browser did not confirm this file upload.",
+        error?.code ? { code: error.code } : {});
+    }
   }
 
   async captureBrowserScreenshot(browserId: string, pageId: string, fullPage: boolean): Promise<string> {
@@ -25338,12 +25365,22 @@ function durableBrowserTakeoverUrl(value: string): string {
   if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username !== "" || url.password !== "") {
     throw new GatewayError("Only credential-free HTTP(S) browser navigation is allowed.");
   }
-  if (url.hash !== "" || [...url.searchParams].some(([name, item]) =>
+  if (!isBrowserDocumentAnchor(url.hash) || [...url.searchParams].some(([name, item]) =>
     /(?:^|[_-])(?:access|auth|bearer|code|credential|jwt|key|password|secret|session|signature|token)(?:$|[_-])/iu.test(name)
     || (item.length >= 32 && /^[A-Za-z0-9._~+/=-]+$/u.test(item)))) {
     throw new GatewayError("Credential-shaped URL material cannot enter durable Browser operations.");
   }
   return url.href;
+}
+
+function isBrowserDocumentAnchor(hash: string): boolean {
+  if (!hash) return true;
+  let anchor: string;
+  try { anchor = decodeURIComponent(hash.slice(1)); }
+  catch { return false; }
+  return /^[\p{L}][\p{L}\p{N}_-]{0,63}$/u.test(anchor)
+    && !/(?:^|[_-])(?:access|auth|bearer|code|credential|jwt|key|password|secret|session|signature|token)(?:$|[_-])/iu.test(anchor)
+    && !/^[A-Za-z0-9]{32,}$/u.test(anchor);
 }
 
 function browserActivityKind(value: BrowserActivityKind): BrowserActivityView["kind"] {

@@ -201,8 +201,10 @@ class FakePage extends EventEmitter {
 
   async goto(url: string): Promise<null> {
     this.#humanInputs.push({ type: "navigate", url });
+    const sameDocument = url.includes("#") && url.split("#", 1)[0] === this.#url.split("#", 1)[0];
     this.#url = url;
-    this.emit("domcontentloaded");
+    if (sameDocument) this.navigateWithinDocument();
+    else this.emit("domcontentloaded");
     return null;
   }
 
@@ -885,6 +887,8 @@ describe("BrowserProvider human takeover fences", () => {
       await value.provider.performHumanTakeoverAction(takeover, { type: "keyPress", key: "c", modifiers: ["Control", "Shift"] });
       await value.provider.performHumanTakeoverAction(takeover, { type: "textInput", text: "remote text" });
       await value.provider.performHumanTakeoverAction(takeover, { type: "navigate", url: "https://openai.com/" });
+      await value.provider.performHumanTakeoverAction(takeover, { type: "navigate", url: "https://openai.com/#install" });
+      expect((await value.provider.listPages())[0]).toMatchObject({ url: "https://openai.com/", state: "ready" });
       await value.provider.performHumanTakeoverAction(takeover, { type: "navigationCommand", command: "back" });
       await value.provider.performHumanTakeoverAction(takeover, { type: "navigationCommand", command: "forward" });
       await value.provider.performHumanTakeoverAction(takeover, { type: "navigationCommand", command: "reload" });
@@ -901,6 +905,7 @@ describe("BrowserProvider human takeover fences", () => {
         { type: "key", key: "Control+Shift+c" },
         { type: "text", text: "remote text" },
         { type: "navigate", url: "https://openai.com/" },
+        { type: "navigate", url: "https://openai.com/#install" },
         { type: "navigation", command: "back" },
         { type: "navigation", command: "forward" },
         { type: "navigation", command: "reload" },

@@ -238,6 +238,7 @@ function BrowserToolCard({ source, allowUploads, selected, captured, sessions, c
   readonly onStoreCapture: (browserId: string, pageId: string, blobId: string) => void;
 }): JSX.Element {
   const browser = withLiveBrowserTakeover(source, useLiveBrowserTakeover(source.takeover));
+  const profile = controller.state.activeProfile;
   const page = browser.pages.find((candidate) => candidate.id === selected?.pageId && browser.id === selected.browserId)
     ?? browser.pages.find((candidate) => candidate.id === browser.activePageId)
     ?? browser.pages[0];
@@ -252,7 +253,10 @@ function BrowserToolCard({ source, allowUploads, selected, captured, sessions, c
           onStoreCapture(browserId, pageId, blobId);
         }} />}
       </div>
-      {page !== undefined && <BrowserLedger controller={controller} browser={browser} page={page} locale={locale} t={t} runAction={runAction} />}
+      {page !== undefined && <BrowserLedger key={JSON.stringify([browser.id, browser.generation.toString(), page.id])}
+        controller={controller} browser={browser} page={page} locale={locale} t={t} />}
+      <BrowserDownloadHistory key={JSON.stringify([profile?.id, profile?.origin, profile?.serverId, profile?.endpointPublicKey, controller.state.connectionGeneration])}
+        controller={controller} browser={browser} locale={locale} t={t} />
       <footer><Button onClick={() => runAction(`browser-restart:${browser.id}`, () => controller.restartBrowser(browser.id))}><RefreshCcw aria-hidden="true" />{t("browser.recover")}</Button>{browser.takeover?.state === "active" && browser.takeover.connectionId === controller.state.activeProfile?.id && <Button tone="primary" onClick={() => runAction(`browser-release:${browser.id}`, () => controller.endBrowserTakeover(browser.id))}>{t("browser.release")}</Button>}</footer>
     </article>;
 }
@@ -858,7 +862,7 @@ function RemoteBrowserCanvas({ browserId, blobId, page, enabled, commentMode, co
   </section>;
 }
 
-function BrowserLedger({ controller, browser, page, locale, t, runAction }: { readonly controller: AppController; readonly browser: BrowserView; readonly page: BrowserPageView; readonly locale: string; readonly t: Translator; readonly runAction: RunAction }): JSX.Element {
+function BrowserLedger({ controller, browser, page, locale, t }: { readonly controller: AppController; readonly browser: BrowserView; readonly page: BrowserPageView; readonly locale: string; readonly t: Translator }): JSX.Element {
   const [activity, setActivity] = useState<readonly BrowserActivityView[]>([]);
   const [transfers, setTransfers] = useState<readonly BrowserTransferView[]>([]);
   const [loading, setLoading] = useState(true);
@@ -890,10 +894,68 @@ function BrowserLedger({ controller, browser, page, locale, t, runAction }: { re
     <header><div><h3>{t("browser.durableActivity")}</h3><p>{t("browser.durableActivityBody")}</p></div><Button tone="ghost" disabled={loading} onClick={() => { setLoading(true); void load(); }}><RefreshCcw className={loading ? "spin" : undefined} aria-hidden="true" />{t("common.refresh")}</Button></header>
     {error !== undefined && <p className="browser-ledger__error" role="alert"><AlertTriangle aria-hidden="true" />{error}</p>}
     <div className="browser-ledger__columns">
-      <section><h4>{t("browser.transfers")}</h4>{transfers.length === 0 ? <p className="muted">{loading ? t("common.loading") : t("browser.noTransfers")}</p> : <div className="browser-ledger__list">{transfers.map((transfer) => <article key={transfer.id}><span className="browser-ledger__icon">{transfer.direction === "upload" ? <Upload aria-hidden="true" /> : <Download aria-hidden="true" />}</span><span><strong>{transfer.fileName}</strong><small>{t(`browser.direction.${transfer.direction}`)} · {formatBytes(transfer.byteSize)} · {formatRelativeTime(transfer.completedAt ?? transfer.startedAt, locale)}</small>{transfer.error !== undefined && <small className="danger-text">{transfer.error}</small>}</span><Pill tone={transfer.state === "completed" ? "success" : transfer.state === "failed" ? "danger" : transfer.state === "running" ? "accent" : "neutral"}>{transfer.state}</Pill>{transfer.direction === "download" && transfer.state === "completed" && transfer.blobId !== undefined && <ArtifactDownloadButton tone="ghost" ownerKey={JSON.stringify([browser.id, page.id, transfer.id, transfer.blobId])} connectionOwner={controller.downloadArtifact} label={t("common.download")} errorLabel={t("workspace.downloadUnavailable")} action={(context) => controller.downloadArtifact(transfer.blobId as string, transfer.fileName, context)} />}</article>)}</div>}</section>
+      <section><h4>{t("browser.transfers")}</h4>{transfers.length === 0 ? <p className="muted">{loading ? t("common.loading") : t("browser.noTransfers")}</p>
+        : <BrowserTransferList transfers={transfers} controller={controller} locale={locale} t={t} />}</section>
       <section><h4>{t("browser.activityLog")}</h4>{activity.length === 0 ? <p className="muted">{loading ? t("common.loading") : t("browser.noDurableActivity")}</p> : <div className="browser-ledger__list">{activity.map((item) => <article key={item.id}><span className="browser-ledger__icon"><Globe2 aria-hidden="true" /></span><span><strong>{t(`browser.activity.${item.kind}`)}</strong><small>{item.description || formatRelativeTime(item.occurredAt, locale)}</small>{item.description && <small>{formatRelativeTime(item.occurredAt, locale)}</small>}</span></article>)}</div>}</section>
     </div>
   </section>;
+}
+
+function BrowserDownloadHistory({ controller, browser, locale, t }: {
+  readonly controller: AppController; readonly browser: BrowserView; readonly locale: string; readonly t: Translator;
+}): JSX.Element {
+  const [open, setOpen] = useState(false);
+  const [transfers, setTransfers] = useState<readonly BrowserTransferView[]>();
+  const [error, setError] = useState<string>();
+  const controllerRef = useRef(controller);
+  controllerRef.current = controller;
+  useEffect(() => {
+    if (!open) return;
+    let active = true;
+    let loading = false;
+    const refresh = async () => {
+      if (loading) return;
+      loading = true;
+      try {
+        const result = await controllerRef.current.listBrowserDownloads(browser.id);
+        if (active) { setTransfers(result); setError(undefined); }
+      } catch (cause) {
+        if (active) {
+          setTransfers(undefined);
+          setError(cause instanceof Error ? cause.message : t("browser.downloadHistoryFailed"));
+        }
+      } finally { loading = false; }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 4_000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [browser.id, open, t]);
+  const openPageIds = new Set(browser.pages.map(page => page.id));
+  const downloads = transfers?.filter(transfer => !openPageIds.has(transfer.pageId));
+  return <details className="browser-ledger browser-download-history" onToggle={event => setOpen(event.currentTarget.open)}>
+    <summary>{t("browser.downloadHistory")}</summary>
+    {open && (error !== undefined ? <p className="browser-ledger__error" role="alert"><AlertTriangle aria-hidden="true" />{error}</p>
+      : downloads === undefined || downloads.length === 0 ? <p className="muted">{t(downloads === undefined ? "common.loading" : "browser.noPastDownloads")}</p>
+      : <BrowserTransferList transfers={downloads} controller={controller} locale={locale} t={t} />)}
+  </details>;
+}
+
+function BrowserTransferList({ transfers, controller, locale, t }: {
+  readonly transfers: readonly BrowserTransferView[]; readonly controller: AppController; readonly locale: string; readonly t: Translator;
+}): JSX.Element {
+  return <div className="browser-ledger__list">{transfers.map(transfer => {
+    const { blobId, direction, fileName, state } = transfer;
+    return <article key={transfer.id}>
+      <span className="browser-ledger__icon">{direction === "upload" ? <Upload aria-hidden="true" /> : <Download aria-hidden="true" />}</span>
+      <span><strong>{fileName}</strong><small>{t(`browser.direction.${direction}`)} · {formatBytes(transfer.byteSize)} · {formatRelativeTime(transfer.completedAt ?? transfer.startedAt, locale)}</small>
+        {transfer.error !== undefined && <small className="danger-text">{transfer.error}</small>}</span>
+      <Pill tone={state === "completed" ? "success" : state === "failed" ? "danger" : state === "running" ? "accent" : "neutral"}>{state}</Pill>
+      {direction === "download" && state === "completed" && blobId !== undefined && <ArtifactDownloadButton tone="ghost"
+        ownerKey={JSON.stringify([transfer.browserId, transfer.pageId, transfer.id, blobId])} connectionOwner={controller.downloadArtifact}
+        label={t("common.download")} errorLabel={t("workspace.downloadUnavailable")}
+        action={context => controller.downloadArtifact(blobId, fileName, context)} />}
+    </article>;
+  })}</div>;
 }
 
 function ResourcesTools({ controller, backends, targets, resources, t, runAction, onRemove }: { readonly controller: AppController; readonly backends: AppSnapshot["backends"]; readonly targets: AppSnapshot["targets"]; readonly resources: readonly ResourceView[]; readonly t: Translator; readonly runAction: RunAction; readonly onRemove: (resource: ResourceView) => void }): JSX.Element {

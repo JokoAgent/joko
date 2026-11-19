@@ -117,6 +117,8 @@ mountedIt("reads Markdown, code and plain attachments from the task and pending 
     await capture("narrow-dark-code");
     await page.keyboard.press("Escape");
     await dialog.waitFor({ state: "detached" });
+    const navigationScrim = page.locator("button.panel-scrim--navigation");
+    if (await navigationScrim.isVisible()) await navigationScrim.click();
     if (await closeDetails.isVisible()) await closeDetails.click();
     const closeNavigation = page.getByLabel("Task navigation").getByRole("button", { name: "Close navigation", exact: true });
     if (await closeNavigation.isVisible()) await closeNavigation.click();

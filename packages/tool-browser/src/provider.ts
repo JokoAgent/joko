@@ -12,7 +12,7 @@ import {
   type Response
 } from "playwright-core";
 import { isWithin } from "@joko/core/policy";
-import { installHtmlSnapshot, validateHtmlSnapshot, type BrowserHtmlSnapshot } from "./html-preview.js";
+import { installHtmlSnapshot, isWorkspaceHtmlPreviewUrl, validateHtmlSnapshot, type BrowserHtmlSnapshot } from "./html-preview.js";
 import { BrowserProxyRequestGate, type BrowserProxyRequestGateHandle } from "./proxy-request-gate.js";
 import {
   browserProxyRouteKey, buildBrowserProxyLaunchArgs, parseBrowserProxyServer, publicBrowserProxyRoute,
@@ -43,6 +43,7 @@ import {
 
 const DEFAULT_MAXIMUM_SCREENSHOT_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAXIMUM_PDF_BYTES = 32 * 1024 * 1024;
+const DEFAULT_MAXIMUM_DOWNLOAD_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MAXIMUM_CONSOLE_MESSAGES = 200;
 const DEFAULT_MAXIMUM_HTTP_REQUEST_SUMMARIES = 200;
 const ABSOLUTE_MAXIMUM_CAPTURE_BYTES = 64 * 1024 * 1024;
@@ -300,6 +301,21 @@ export interface BrowserDialogSnapshot {
   readonly defaultValue: string;
 }
 
+export interface BrowserClickReceipt {
+  readonly page: BrowserPageState;
+  readonly dialog?: BrowserDialogSnapshot;
+}
+
+interface PendingBrowserClickDialog {
+  readonly page: Page;
+  readonly before: BrowserPageState;
+  readonly id: string;
+  readonly completion: Promise<void>;
+  readonly release: () => void;
+  readonly retire: () => void;
+  responding: boolean;
+}
+
 export type BrowserExtractField = string | {
   readonly selector?: string;
   readonly attr?: string;
@@ -479,6 +495,7 @@ export class BrowserProvider {
     readonly pageId: string;
   }>();
   readonly #profileDirectories: BrowserTargetProfileDirectories;
+  readonly #maximumDownloadBytes: number;
   readonly #maximumScreenshotBytes: number;
   readonly #maximumPdfBytes: number;
   readonly #maximumConsoleMessages: number;
@@ -490,6 +507,13 @@ export class BrowserProvider {
   readonly #pageStates = new WeakMap<Page, BrowserPageState["state"]>();
   readonly #requestedPageCloses = new WeakSet<Page>();
   readonly #externalPageCloses = new Set<Promise<void>>();
+  readonly #humanPopupSources = new WeakMap<Page, {
+    readonly documentId: string;
+    readonly origin: string;
+    readonly assertCurrent: () => void;
+    readonly adopt: (page: BrowserPageState) => void;
+  }>();
+  readonly #adoptedSidebarPopups = new WeakSet<Page>();
   readonly #pageDocuments = new WeakMap<Page, string>();
   readonly #consoleMessages = new WeakMap<Page, BrowserConsoleMessageSnapshot[]>();
   readonly #httpRequestSummaries = new WeakMap<Page, BrowserHttpRequestSummary[]>();
@@ -501,6 +525,8 @@ export class BrowserProvider {
   #nextConsoleMessageSequence = 1;
   #nextHttpRequestSequence = 1;
   #nextDialogId = 1;
+  #watchClickDialog?: (page: Page, id: string, dialog: Dialog) => void;
+  #pendingClickDialog?: PendingBrowserClickDialog;
   #lifecycleTail: Promise<void> = Promise.resolve();
   #lifecycleEpoch = 0;
   #recoveryInFlight: Promise<void> | undefined;
@@ -517,6 +543,9 @@ export class BrowserProvider {
     const launchTargets = resolveBrowserLaunchTargets(options);
     this.#profileDirectories = launchTargets.profileDirectories;
     this.#targetMode = launchTargets.targetMode;
+    this.#maximumDownloadBytes = validateBoundedPositiveInteger(
+      options.maximumDownloadBytes ?? DEFAULT_MAXIMUM_DOWNLOAD_BYTES, "maximumDownloadBytes", Number.MAX_SAFE_INTEGER
+    );
     this.#maximumScreenshotBytes = validateBoundedPositiveInteger(
       options.maximumScreenshotBytes ?? DEFAULT_MAXIMUM_SCREENSHOT_BYTES,
       "maximumScreenshotBytes",
@@ -770,6 +799,9 @@ export class BrowserProvider {
       this.assertStartAuthority(options);
       if (lifecycleEpoch !== this.#lifecycleEpoch) throw new BrowserLeaseConflictError("Browser start was superseded by recovery.");
       await gate?.start();
+      if (this.#options.launchPersistentContext === undefined) {
+        await enforceBrowserDownloadLimit(context, this.#options.downloadDirectory, this.#maximumDownloadBytes);
+      }
       this.assertStartAuthority(options);
       if (lifecycleEpoch !== this.#lifecycleEpoch || (gate !== undefined && !gate.active)) throw new BrowserLeaseConflictError("Browser start was superseded or its request gate failed.");
       this.#generation += 1;
@@ -834,6 +866,9 @@ export class BrowserProvider {
       const originalPage = this.requireRequestedTakeoverPage(requested);
       if (this.#leases.current() !== undefined) {
         throw new BrowserTakeoverConflictError("Browser Provider has an active agent control lease.");
+      }
+      if (this.#pendingClickDialog !== undefined) {
+        throw new BrowserTakeoverConflictError("Resolve the outstanding Browser confirmation before taking control.");
       }
       if (this.#takeovers.current() !== undefined) {
         throw new BrowserTakeoverConflictError("Browser Provider already has an active human takeover.");
@@ -1421,7 +1456,12 @@ export class BrowserProvider {
   }
 
   /** Executes one bounded remote-human input under the exact active fence. */
-  performHumanTakeoverAction(fence: BrowserTakeoverFence, input: BrowserTakeoverInput, assertCurrent?: () => void): Promise<void> {
+  performHumanTakeoverAction(
+    fence: BrowserTakeoverFence,
+    input: BrowserTakeoverInput,
+    assertCurrent?: () => void,
+    adoptPopup?: (page: BrowserPageState) => void
+  ): Promise<void> {
     let action: BrowserTakeoverInput;
     try {
       validateTakeoverInput(input);
@@ -1441,6 +1481,20 @@ export class BrowserProvider {
         }
         const x = action.normalizedX * Math.max(0, viewport.width - 1);
         const y = action.normalizedY * Math.max(0, viewport.height - 1);
+        const openerUrl = page.url();
+        const documentId = this.documentIdForPage(page);
+        if (adoptPopup && this.#targetMode === "sidebar" && action.button === "primary" && documentId !== undefined
+          && openerUrl !== "about:blank" && !isWorkspaceHtmlPreviewUrl(openerUrl)) {
+          this.#humanPopupSources.set(page, {
+            documentId,
+            origin: new URL(validateWebUrl(openerUrl)).origin,
+            assertCurrent: () => {
+              this.assertHumanTakeover(fence);
+              assertCurrent?.();
+            },
+            adopt: adoptPopup
+          });
+        }
         await page.mouse.click(x, y, { button: mapMouseButton(action.button), clickCount: action.clickCount ?? 1 });
         break;
       }
@@ -1485,7 +1539,7 @@ export class BrowserProvider {
         break;
       case "navigate":
         this.#pageStates.set(page, "loading");
-        await page.goto(validateTakeoverNavigationUrl(action.url), { waitUntil: "commit" });
+        if (await page.goto(validateTakeoverNavigationUrl(action.url), { waitUntil: "commit" }) === null) this.#pageStates.set(page, "ready");
         break;
       case "navigationCommand":
         switch (action.command) {
@@ -1512,6 +1566,9 @@ export class BrowserProvider {
         if (navigation && !page.isClosed()) this.#pageStates.set(page, "ready");
         if (action.type === "textInput" || action.type === "keyPress" && /^[a-z0-9]$/u.test(action.key)) {
           throw new BrowserTakeoverConflictError("Browser could not confirm the keyboard input.");
+        }
+        if (action.type === "navigate" && action.url.includes("#")) {
+          throw new BrowserTakeoverConflictError("Browser could not confirm navigation to the document anchor.");
         }
         throw error;
       }
@@ -1637,11 +1694,7 @@ export class BrowserProvider {
         await page.goto(safeAction.url, { waitUntil: "domcontentloaded" });
         break;
       case "click":
-        await page.locator(safeAction.selector).click({
-          button: safeAction.button,
-          ...(safeAction.doubleClick === true ? { clickCount: 2 } : {}),
-          ...(safeAction.modifiers === undefined ? {} : { modifiers: [...safeAction.modifiers] })
-        });
+        await clickBrowserLocator(page, safeAction);
         break;
       case "doubleClick":
         await page.locator(safeAction.selector).dblclick();
@@ -1726,19 +1779,74 @@ export class BrowserProvider {
     });
   }
 
+  /** Yield the agent request while its native click is blocked by a page dialog. */
+  clickWithDialog(
+    pageId: string,
+    lease: BrowserLeaseFence,
+    action: Extract<BrowserAction, { type: "click" }>,
+    signal?: AbortSignal
+  ): Promise<BrowserClickReceipt> {
+    const fence = copyAgentFence(lease), safePageId = validatePublicPageId(pageId);
+    const safeAction = validateAndCopyBrowserAction(action);
+    if (safeAction.type !== "click") throw new TypeError("A Browser click action is required.");
+    return this.withAgentControl(fence, async () => {
+      const page = this.requirePageNow(safePageId);
+      assertBrowserPageContentReadable(page);
+      if (this.#dialogs.get(page)?.size) throw new Error("Resolve the pending Browser dialog before clicking.");
+      const before = await this.pageState(page);
+      const generationSignal = this.#generationAbort.signal;
+      generationSignal.throwIfAborted();
+      signal?.throwIfAborted();
+      const deadline = Date.now() + MAXIMUM_WAIT_MILLISECONDS;
+      let watch!: (page: Page, id: string, dialog: Dialog) => void;
+      const observed = new Promise<{ readonly id: string; readonly dialog: Dialog }>((resolve) => {
+        watch = (source, id, dialog) => { if (source === page) resolve({ id, dialog }); };
+      });
+      this.#watchClickDialog = watch;
+      const completion = clickBrowserLocator(page, safeAction).then(async () => {
+        if (!generationSignal.aborted) await this.emit({ at: Date.now(), type: "action", pageId: safePageId, detail: "click" });
+      });
+      let pending: { readonly id: string; readonly dialog: Dialog } | undefined;
+      try { pending = await Promise.race([observed, completion.then(() => undefined)]); }
+      finally { if (this.#watchClickDialog === watch) this.#watchClickDialog = undefined; }
+      if (pending === undefined) return { page: await this.pageState(page) };
+      const { id, dialog } = pending;
+      let timer: ReturnType<typeof setTimeout>;
+      const release = () => {
+        clearTimeout(timer);
+        generationSignal.removeEventListener("abort", retire);
+        signal?.removeEventListener("abort", retire);
+        if (this.#pendingClickDialog === blocker) this.#pendingClickDialog = undefined;
+      };
+      const retire = () => {
+        if (blocker.responding || this.#pendingClickDialog !== blocker) return;
+        blocker.responding = true;
+        this.#dialogs.get(page)?.delete(id);
+        void dialog.dismiss().catch(() => undefined).then(() => completion.catch(() => undefined)).finally(release);
+      };
+      const blocker: PendingBrowserClickDialog = { page, before, id, completion, release, retire, responding: false };
+      this.#pendingClickDialog = blocker;
+      timer = setTimeout(retire, Math.max(0, deadline - Date.now()));
+      timer.unref();
+      generationSignal.addEventListener("abort", retire, { once: true });
+      signal?.addEventListener("abort", retire, { once: true });
+      void completion.catch(retire);
+      if (generationSignal.aborted || signal?.aborted) {
+        retire();
+        generationSignal.throwIfAborted();
+        signal?.throwIfAborted();
+      }
+      return { page: before, dialog: browserDialogSnapshot(safePageId, id, dialog) };
+    });
+  }
+
   listDialogs(pageId: string, lease: BrowserLeaseFence): Promise<readonly BrowserDialogSnapshot[]> {
     const fence = copyAgentFence(lease);
     const safePageId = validatePublicPageId(pageId);
     return this.withAgentControl(fence, async () => {
       const page = this.requirePageNow(safePageId);
-      return [...(this.#dialogs.get(page)?.entries() ?? [])].map(([id, dialog]) => ({
-        id,
-        pageId: safePageId,
-        type: sanitizeDiagnosticLabel(dialog.type(), "dialog"),
-        message: sanitizeConsoleMessageText(dialog.message()),
-        defaultValue: sanitizeConsoleMessageText(dialog.defaultValue())
-      }));
-    });
+      return [...(this.#dialogs.get(page)?.entries() ?? [])].map(([id, dialog]) => browserDialogSnapshot(safePageId, id, dialog));
+    }, true);
   }
 
   handleDialog(
@@ -1760,10 +1868,29 @@ export class BrowserProvider {
         : validateBoundedString(input.dialogId, "Browser dialog ID", 256);
       const dialog = id === undefined ? undefined : dialogs?.get(id);
       if (dialog === undefined || id === undefined) throw new Error("Browser dialog does not exist or is no longer pending.");
-      if (input.accept) await dialog.accept(promptText);
-      else await dialog.dismiss();
+      const blocked = this.#pendingClickDialog;
+      if (blocked !== undefined) {
+        if (blocked.page !== page || blocked.id !== id || blocked.responding || input.dialogId !== id) {
+          throw new Error("Respond to the exact pending Browser dialog ID.");
+        }
+        blocked.responding = true;
+      }
+      try {
+        if (input.accept) await dialog.accept(promptText);
+        else await dialog.dismiss();
+      } catch (error) {
+        if (blocked !== undefined) {
+          blocked.responding = false;
+          blocked.retire();
+        }
+        throw error;
+      }
       dialogs?.delete(id);
-    });
+      if (blocked !== undefined) {
+        try { await blocked.completion; }
+        finally { blocked.release(); }
+      }
+    }, true);
   }
 
   /** Captures image bytes only; no page metadata or local path is returned. */
@@ -2144,6 +2271,7 @@ export class BrowserProvider {
     };
     page.on("framenavigated", (frame) => {
       if (frame !== page.mainFrame()) return;
+      this.#humanPopupSources.delete(page);
       const documentId = randomUUID();
       this.#pageDocuments.set(page, documentId);
       this.#pageStates.set(page, "loading");
@@ -2186,9 +2314,30 @@ export class BrowserProvider {
     page.on("dialog", (dialog) => {
       const id = `dialog-${this.#nextDialogId++}`;
       this.#dialogs.get(page)?.set(id, dialog);
+      this.#watchClickDialog?.(page, id, dialog);
     });
+    page.on("popup", (popup) => void this.adoptHumanPopup(page, popup).catch(() => undefined));
     page.on("download", (download) => void this.handleDownload(pageId, generation, download).catch(() => undefined));
     void this.emit({ at: Date.now(), type: "page", pageId, detail: "Page opened." });
+  }
+
+  private async adoptHumanPopup(opener: Page, popup: Page): Promise<void> {
+    const source = this.#humanPopupSources.get(opener);
+    if (source === undefined || this.#context !== opener.context() || opener.context() !== popup.context()
+      || this.documentIdForPage(opener) !== source.documentId) return;
+    this.#humanPopupSources.delete(opener);
+    source.assertCurrent();
+    if (popup.url() === "about:blank") {
+      await popup.waitForURL((url) => url.href !== "about:blank", { waitUntil: "commit", timeout: 5_000 });
+    }
+    const documentId = this.documentIdForPage(popup), url = popup.url();
+    if (documentId === undefined || isWorkspaceHtmlPreviewUrl(url) || new URL(validateWebUrl(url)).origin !== source.origin) return;
+    const projection = await withTimeout(this.pageState(popup), 2_000, "The Browser popup did not become readable.");
+    if (projection.documentId !== documentId || this.documentIdForPage(popup) !== documentId
+      || this.documentIdForPage(opener) !== source.documentId) return;
+    source.assertCurrent();
+    source.adopt(projection);
+    this.#adoptedSidebarPopups.add(popup);
   }
 
   private async closeOwnedPage(page: Page): Promise<void> {
@@ -2199,7 +2348,7 @@ export class BrowserProvider {
 
   private observeExternalPageClose(page: Page, pageId: string, generation: number): void {
     const notify = this.#options.onExternalPageClosed;
-    if (notify === undefined || this.#targetMode !== "external" || generation !== this.#generation
+    if (notify === undefined || (this.#targetMode !== "external" && !this.#adoptedSidebarPopups.has(page)) || generation !== this.#generation
       || this.#context === undefined || page.context() !== this.#context) return;
     const context = this.#context;
     const survivor = context.pages().find(candidate => candidate !== page && !candidate.isClosed()
@@ -2258,28 +2407,32 @@ export class BrowserProvider {
   }
 
   private async handleDownload(pageId: string, generation: number, download: Download): Promise<void> {
-    if (generation !== this.#generation || this.#context === undefined) {
-      await download.cancel().catch(() => undefined);
-      return;
-    }
-    if (this.#options.canDownload?.() === false) {
-      await download.cancel().catch(() => undefined);
-      await this.emit({ at: Date.now(), type: "download", pageId, detail: "A browser download was blocked by host policy." });
-      return;
-    }
-    let staged: StagedBrowserDownload | undefined;
     const handler = this.#downloadHandler;
+    let staged: Awaited<ReturnType<typeof stageBrowserDownload>> | undefined;
     try {
-      staged = await stageBrowserDownload(download, this.#options.downloadDirectory, this.#options.maximumDownloadBytes);
+      if (generation !== this.#generation || this.#context === undefined) {
+        await download.cancel().catch(() => undefined);
+        return;
+      }
+      if (this.#options.canDownload?.() === false) {
+        await download.cancel().catch(() => undefined);
+        await this.emit({ at: Date.now(), type: "download", pageId, detail: "A browser download was blocked by host policy." });
+        return;
+      }
+      staged = await stageBrowserDownload(download, this.#options.downloadDirectory, this.#maximumDownloadBytes);
       if (generation !== this.#generation || this.#context === undefined) return;
       await handler?.(pageId, staged.verifiedLocalPath, staged.fileName);
       await this.emit({ at: Date.now(), type: "download", pageId, detail: "Browser download completed." });
     } catch {
-      await this.emit({ at: Date.now(), type: "download", pageId, detail: "A browser download failed validation or ingest." });
+      if (generation !== this.#generation || this.#context === undefined) return;
+      const failure = await download.failure().catch(() => undefined);
+      if (generation !== this.#generation || this.#context === undefined) return;
+      await this.emit({ at: Date.now(), type: "download", pageId, detail: failure === "canceled"
+        ? "A browser download was cancelled before ingest."
+        : "A browser download failed validation or ingest." });
     } finally {
-      if (staged !== undefined) {
-        await rm(staged.verifiedLocalPath, { force: true }).catch(() => undefined);
-      }
+      if (staged !== undefined) await rm(staged.verifiedLocalPath, { force: true }).catch(() => undefined);
+      await download.delete().catch(() => undefined);
     }
   }
 
@@ -2305,12 +2458,15 @@ export class BrowserProvider {
     return this.requirePageNow(request.pageId);
   }
 
-  private withAgentControl<T>(fence: BrowserLeaseFence, operation: () => Promise<T>): Promise<T> {
+  private withAgentControl<T>(fence: BrowserLeaseFence, operation: () => Promise<T>, resolvesDialogs = false): Promise<T> {
     return this.queueLifecycle(async () => {
       if (fence.providerId !== this.id || fence.generation !== this.#generation || this.#takeovers.current() !== undefined) {
         throw new BrowserLeaseConflictError("Browser agent lease is missing, expired, or fenced.");
       }
       this.#leases.assert(fence);
+      if (!resolvesDialogs && this.#pendingClickDialog !== undefined) {
+        throw new Error("A Browser confirmation is pending. Use the dialog action first.");
+      }
       const result = await raceAgainstAbort(operation(), this.#generationAbort.signal);
       this.#leases.assert(fence);
       if (this.#takeovers.current() !== undefined) {
@@ -2342,6 +2498,7 @@ export class BrowserProvider {
   }
 
   private async pageState(page: Page): Promise<BrowserPageState> {
+    if (this.#pendingClickDialog?.page === page && !page.isClosed()) return this.#pendingClickDialog.before;
     const navigation = await browserNavigationAvailability(page);
     const documentId = this.documentIdForPage(page);
     const currentUrl = page.url();
@@ -2389,6 +2546,11 @@ export class BrowserProvider {
       throw new BrowserTakeoverConflictError("The Browser file input is no longer available in the original document.");
     }
     try {
+      assertUploadCurrent();
+      if (files.length > 1 && !await input.evaluate(element => element instanceof HTMLInputElement
+        && element.type === "file" && element.multiple)) {
+        throw new Error("The selected Browser file input does not accept multiple files.");
+      }
       assertUploadCurrent();
       markDispatched?.();
       await input.setInputFiles(files);
@@ -2721,6 +2883,24 @@ function assertBrowserPageContentReadable(page: Page): void {
   if (!browserPageContentIsReadable(page.url())) {
     throw new Error("Browser page content is available only for HTTP(S) pages or a blank page.");
   }
+}
+
+function clickBrowserLocator(page: Page, action: Extract<BrowserAction, { type: "click" }>): Promise<void> {
+  return page.locator(action.selector).click({
+    button: action.button,
+    ...(action.doubleClick === true ? { clickCount: 2 } : {}),
+    ...(action.modifiers === undefined ? {} : { modifiers: [...action.modifiers] })
+  });
+}
+
+function browserDialogSnapshot(pageId: string, id: string, dialog: Dialog): BrowserDialogSnapshot {
+  return {
+    id,
+    pageId,
+    type: sanitizeDiagnosticLabel(dialog.type(), "dialog"),
+    message: sanitizeConsoleMessageText(dialog.message()),
+    defaultValue: sanitizeConsoleMessageText(dialog.defaultValue())
+  };
 }
 
 function browserPageContentIsReadable(value: string): boolean {
@@ -4020,44 +4200,58 @@ export function sanitizeBrowserUrlForDisplay(value: string): string {
   return truncatePublicText(url.href, MAXIMUM_PUBLIC_URL_LENGTH);
 }
 
-export interface StagedBrowserDownload {
-  readonly verifiedLocalPath: string;
-  readonly fileName: string;
-  readonly byteLength: number;
+async function enforceBrowserDownloadLimit(context: BrowserContext, downloadDirectory: string, maximumBytes: number): Promise<void> {
+  const browser = context.browser();
+  if (browser === null) throw new Error("The Browser runtime cannot enforce download limits.");
+  const session = await browser.newBrowserCDPSession();
+  const cancelling = new Set<string>();
+  session.on("Browser.downloadProgress", ({ guid, state, totalBytes, receivedBytes }) => {
+    if (state !== "inProgress") {
+      cancelling.delete(guid);
+      return;
+    }
+    if (Math.max(totalBytes, receivedBytes) <= maximumBytes || cancelling.has(guid)) return;
+    cancelling.add(guid);
+    void session.send("Browser.cancelDownload", { guid }).catch(() => cancelling.delete(guid));
+  });
+  // Keep Playwright's GUID naming and observe progress for the same persistent context.
+  await session.send("Browser.setDownloadBehavior", { behavior: "allowAndName", downloadPath: downloadDirectory, eventsEnabled: true });
 }
 
-interface BrowserDownloadSource {
-  suggestedFilename(): string;
-  saveAs(path: string): Promise<void>;
-}
-
-/** Stages and validates a browser download without publishing its local path. */
+/** Checks Chromium's original before making the copy owned by the artifact ingest. */
 export async function stageBrowserDownload(
-  download: BrowserDownloadSource,
+  download: Pick<Download, "suggestedFilename" | "path" | "saveAs">,
   downloadDirectory: string,
-  maximumBytes = 256 * 1024 * 1024
-): Promise<StagedBrowserDownload> {
-  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1) throw new RangeError("maximumBytes must be a positive safe integer.");
-  await mkdir(downloadDirectory, { recursive: true });
+  maximumBytes: number
+): Promise<{ readonly verifiedLocalPath: string; readonly fileName: string }> {
+  const original = await download.path();
   const canonicalRoot = await realpath(downloadDirectory);
+  await validateBrowserDownloadFile(original, canonicalRoot, maximumBytes);
   const fileName = sanitizeBrowserFileName(download.suggestedFilename());
   const extension = extname(fileName).slice(0, 32);
-  const destination = resolve(canonicalRoot, `${randomUUID()}${extension}`);
-  if (!isWithin(destination, canonicalRoot)) throw new Error("Browser download staging path escaped its root.");
+  const destination = join(canonicalRoot, `${randomUUID()}${extension}`);
   try {
     await download.saveAs(destination);
-    const directInfo = await lstat(destination);
-    if (!directInfo.isFile() || directInfo.isSymbolicLink()) throw new Error("Browser download staging entry is not a regular file.");
-    if (directInfo.size > maximumBytes) throw new Error("Browser download exceeds the configured size limit.");
-    const canonical = await realpath(destination);
-    if (!isWithin(canonical, canonicalRoot)) throw new Error("Browser download staging path escaped its root.");
-    const canonicalInfo = await stat(canonical);
-    if (!canonicalInfo.isFile() || canonicalInfo.size !== directInfo.size) throw new Error("Browser download changed during validation.");
-    return { verifiedLocalPath: canonical, fileName, byteLength: canonicalInfo.size };
+    const verifiedLocalPath = await validateBrowserDownloadFile(destination, canonicalRoot, maximumBytes);
+    return { verifiedLocalPath, fileName };
   } catch (error) {
     await rm(destination, { force: true }).catch(() => undefined);
     throw error;
   }
+}
+
+async function validateBrowserDownloadFile(path: string, canonicalRoot: string, maximumBytes: number): Promise<string> {
+  const directInfo = await lstat(path, { bigint: true });
+  if (!directInfo.isFile()) throw new Error("Browser download staging entry is not a regular file.");
+  if (directInfo.size > BigInt(maximumBytes)) throw new Error("Browser download exceeds the configured size limit.");
+  const canonical = await realpath(path);
+  if (!isWithin(canonical, canonicalRoot)) throw new Error("Browser download staging path escaped its root.");
+  const canonicalInfo = await stat(canonical, { bigint: true });
+  if (!canonicalInfo.isFile() || canonicalInfo.size !== directInfo.size
+    || canonicalInfo.dev !== directInfo.dev || canonicalInfo.ino !== directInfo.ino) {
+    throw new Error("Browser download changed during validation.");
+  }
+  return canonical;
 }
 
 export function sanitizeBrowserFileName(value: string): string {

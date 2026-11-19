@@ -58,8 +58,15 @@ mountedIt("inserts distinct whole-message references at the caret and delivers o
     const draft = pane.locator(".composer-rich-editor__content");
     const tail = `after ${plain.href}`;
     await draft.fill(`Before ${tail}`);
-    await draft.press(process.platform === "darwin" ? "Meta+ArrowUp" : "Control+Home");
-    for (let index = 0; index < "Before ".length; index += 1) await draft.press("ArrowRight");
+    await draft.focus();
+    const caretOffset = await draft.evaluate((editor, prefix) => {
+      const first = editor.querySelector("p")?.firstChild;
+      const selection = editor.ownerDocument.getSelection();
+      if (first?.nodeType !== Node.TEXT_NODE || !first.textContent?.startsWith(prefix) || selection === null) return -1;
+      selection.collapse(first, prefix.length);
+      return selection.anchorNode === first && selection.isCollapsed ? selection.anchorOffset : -1;
+    }, "Before ");
+    expect(caretOffset).toBe("Before ".length);
     const addMessage = async (body: string) => {
       const row = pane.locator("article.message-assistant").filter({ hasText: body });
       await row.hover();

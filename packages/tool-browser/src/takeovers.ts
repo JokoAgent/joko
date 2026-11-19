@@ -197,12 +197,23 @@ export function validateTakeoverNavigationUrl(value: string): string {
   if (url.username !== "" || url.password !== "") {
     throw new BrowserTakeoverInputError("Credentials must not be embedded in browser URLs.");
   }
-  if (url.hash !== "" || [...url.searchParams].some(([name, item]) =>
+  if (!isBrowserDocumentAnchor(url.hash) || [...url.searchParams].some(([name, item]) =>
     /(?:^|[_-])(?:access|auth|bearer|code|credential|jwt|key|password|secret|session|signature|token)(?:$|[_-])/iu.test(name)
     || (item.length >= 32 && /^[A-Za-z0-9._~+/=-]+$/u.test(item)))) {
     throw new BrowserTakeoverInputError("Credential-shaped URL material cannot enter durable Browser operations.");
   }
   return url.href;
+}
+
+/** Takeover admits ordinary element anchors, while credential fragments stay outside the input surface. */
+function isBrowserDocumentAnchor(hash: string): boolean {
+  if (!hash) return true;
+  let anchor: string;
+  try { anchor = decodeURIComponent(hash.slice(1)); }
+  catch { return false; }
+  return /^[\p{L}][\p{L}\p{N}_-]{0,63}$/u.test(anchor)
+    && !/(?:^|[_-])(?:access|auth|bearer|code|credential|jwt|key|password|secret|session|signature|token)(?:$|[_-])/iu.test(anchor)
+    && !/^[A-Za-z0-9]{32,}$/u.test(anchor);
 }
 
 function validateNormalizedCoordinate(value: number, axis: string): void {

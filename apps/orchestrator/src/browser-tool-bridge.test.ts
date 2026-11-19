@@ -145,8 +145,10 @@ function fixture(
       sha256Hex: artifact.sha256
     }
   }));
+  const uploadBatch = vi.fn(async () => [await upload()]);
   const transfers = {
     upload,
+    uploadBatch,
     list: vi.fn(() => []),
     fenceBeforeGeneration: vi.fn()
   } as unknown as BrowserTransferCoordinator;
@@ -177,7 +179,8 @@ function fixture(
     readHttpRequestSummaries,
     get,
     ingestBytes,
-    upload
+    upload,
+    uploadBatch
   };
 }
 
@@ -614,7 +617,7 @@ describe("BrowserToolBridgeProvider", () => {
   });
 
   it("dispatches the unified lifecycle, tab, read, interaction, network, and resource action surface", async () => {
-    const { bridge, browser, actions, get, upload, ingestBytes } = fixture();
+    const { bridge, browser, actions, get, uploadBatch, ingestBytes } = fixture();
 
     for (const action of ["doctor", "status", "profiles", "tabs"] as const) {
       const result = await bridge.callTool("browser", { action, profile: "external" });
@@ -678,7 +681,7 @@ describe("BrowserToolBridgeProvider", () => {
       { type: "select", selector: "#choices", values: ["one", "two"] }
     ]));
     expect(get).toHaveBeenCalledWith("artifact-1");
-    expect(upload).toHaveBeenCalled();
+    expect(uploadBatch).toHaveBeenCalledOnce();
     expect(ingestBytes).toHaveBeenCalled();
     expect(browser.handleDialog).toHaveBeenCalledWith("page-1", expect.anything(), {
       dialogId: "dialog-1", accept: true, promptText: undefined

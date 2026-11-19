@@ -4075,6 +4075,8 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .browser-ledger__icon { display: grid; place-items: center; width: 28px; height: 28px; flex: none; border-radius: 8px; color: var(--blue); background: var(--blue-soft); }
 .browser-ledger__icon svg, .browser-ledger__error svg { width: 16px; height: 16px; }
 .browser-ledger__error { display: flex; align-items: center; gap: 8px; margin: 0; padding: 9px 10px; border-radius: 8px; background: var(--red-soft); color: var(--red); }
+.browser-download-history > summary { cursor: pointer; font-weight: 600; }
+.browser-download-history[open] > summary { margin-bottom: 12px; }
 @media (max-width: 760px) { .browser-ledger__columns { grid-template-columns: 1fr; } }
 .route-loading { display: grid; place-items: center; align-content: center; gap: 10px; min-height: 40vh; color: var(--text-soft); }
 .projects-toolbar { display: flex; justify-content: flex-end; padding: 0 24px 14px; }

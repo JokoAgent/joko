@@ -1890,6 +1890,7 @@ export function VisualHarness(): JSX.Element {
         occurredAt: FIXED_NOW - 2_000
       }],
       listBrowserTransfers: async () => [],
+      listBrowserDownloads: async () => [],
       updateBrowserCommentDesign: async () => [],
       installComputerAutomation: async (): Promise<void> => {
         record("automation-computer:install");

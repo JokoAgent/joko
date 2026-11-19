@@ -5,13 +5,17 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import { BrowserTransferState } from "@joko/contracts";
 import { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
+import { BrowserTransferCoordinator } from "./browser-transfers.js";
+import { OperationalBrowserState } from "./operational-browser-state.js";
 
 const publicationFaults = vi.hoisted(() => ({
+  copied: undefined as (() => Promise<void>) | undefined,
   rename: undefined as ((source: string, destination: string) => Error | undefined) | undefined,
   opened: undefined as ((path: string) => Promise<void>) | undefined
 }));
@@ -19,6 +23,10 @@ const publicationFaults = vi.hoisted(() => ({
 vi.mock("node:fs/promises", async importOriginal => {
   const fs = await importOriginal<typeof import("node:fs/promises")>();
   return { ...fs,
+    copyFile: async (...args: Parameters<typeof fs.copyFile>) => {
+      await fs.copyFile(...args);
+      await publicationFaults.copied?.();
+    },
     rename: async (...args: Parameters<typeof fs.rename>) => {
       const error = publicationFaults.rename?.(String(args[0]), String(args[1]));
       if (error !== undefined) throw error;
@@ -41,6 +49,7 @@ const cleanupPaths: string[] = [];
 const publicationStores: OperationalStore[] = [];
 
 afterEach(async () => {
+  publicationFaults.copied = undefined;
   publicationFaults.rename = undefined;
   publicationFaults.opened = undefined;
   for (const store of publicationStores.splice(0).reverse()) store.close();
@@ -63,6 +72,45 @@ async function publicationFixture() {
 }
 
 describe("ArtifactStore publication", () => {
+  it("keeps a Browser download fenced when restart happens after the original bytes are staged", async () => {
+    const f = await publicationFixture();
+    const source = join(f.directory, "browser-download");
+    await writeFile(source, f.data);
+    let finishCopy!: () => void;
+    let copied!: () => void;
+    const afterCopy = new Promise<void>(resolve => { copied = resolve; });
+    const copyGate = new Promise<void>(resolve => { finishCopy = resolve; });
+    publicationFaults.copied = () => { copied(); return copyGate; };
+    const provider = { generation: 7, acquireAgentLease: vi.fn(), releaseAgentLease: vi.fn(), uploadFiles: vi.fn(),
+      async recover() { this.generation += 1; } };
+    const repository = new OperationalBrowserState(f.store);
+    const transfers = new BrowserTransferCoordinator({ artifacts: f.artifacts, provider, repository });
+    const ingesting = transfers.ingestDownload("page-7-1", source, "report.txt");
+    try {
+      await Promise.race([afterCopy, ingesting.then(() => { throw new Error("The Browser ingest did not reach the staged copy."); })]);
+      const incoming = join(f.directory, "artifacts", "incoming");
+      const staged = await readdir(incoming);
+      expect(staged).toHaveLength(1);
+      expect(await readFile(join(incoming, staged[0]!))).toEqual(f.data);
+      const original = transfers.list()[0]!;
+      expect(original.state).toBe(BrowserTransferState.RUNNING);
+      await transfers.recover();
+      const retired = transfers.get(original.browserTransferId)!;
+      expect(retired).toMatchObject({ state: BrowserTransferState.FAILED, error: { code: "BROWSER_GENERATION_FENCED" } });
+      finishCopy();
+      expect(await ingesting).toEqual(retired);
+      expect(transfers.list({ pageId: "page-7-1" })).toEqual([retired]);
+      expect(repository.list("browser")).toMatchObject([{ id: original.browserTransferId, state: BrowserTransferState.FAILED }]);
+      expect(retired.blob).toBeUndefined();
+      expect(retired.artifact).toBeUndefined();
+      expect(f.store.listArtifacts({ limit: 100 })).toEqual([]);
+      expect(await readdir(incoming)).toEqual([]);
+    } finally {
+      finishCopy();
+      await ingesting;
+    }
+  });
+
   it("authenticates an existing Blob after a failed rename and reuses its permanent identity", async () => {
     const f = await publicationFixture();
     await writeFile(f.storagePath, f.data);

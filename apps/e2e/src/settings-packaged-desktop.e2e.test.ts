@@ -12,7 +12,7 @@ import { WorkspaceTextFileWriteError } from "@joko/orchestrator";
 import { _electron, type ElectronApplication, type Locator, type Page } from "playwright-core";
 import { afterEach, expect, it, vi } from "vitest";
 
-import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
+import { OrchestratorE2eFixture, PromptRecordingFakeAdapter, waitFor } from "./fixture.js";
 import { archiveMutation, createSessionMutation, deleteMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 import { createPackagedDesktopStartupEvidence, readLaunchedWindowsDesktopProcess, type OwnedWindowsDesktopProcess } from "./packaged-desktop-startup.js";
 
@@ -217,7 +217,7 @@ packagedIt("converges conversation settings across real application windows and 
     ...PI_LIKE_PROFILE.capabilities,
     { key: capabilityNames.workspaceFiles, supported: true as const }
   ] };
-  fixture = await OrchestratorE2eFixture.start({ profiles: [profile] });
+  fixture = await OrchestratorE2eFixture.start({ profiles: [profile], createAdapter: input => new PromptRecordingFakeAdapter(input) });
   const activeFixture = fixture;
   const projectDirectory = join(activeFixture.rootDirectory, "settings-project");
   await mkdir(projectDirectory);

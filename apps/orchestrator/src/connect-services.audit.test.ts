@@ -5344,7 +5344,7 @@ describe("Connect security and protocol audit", () => {
     expect(admittedFence).toThrow(ConnectionAuthenticationError);
   });
 
-  it("keeps Browser keyboard values private across durable replay, Get, List and Watch", async () => {
+  it("keeps Browser keyboard values and document anchors private across durable replay, Get, List and Watch", async () => {
     const directory = mkdtempSync(join(tmpdir(), "joko-browser-private-input-"));
     const store = new OperationalStore(":memory:");
     cleanups.push(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
@@ -5372,6 +5372,9 @@ describe("Connect security and protocol audit", () => {
     const password = "K7!m2.zW8qD4";
     const text = (value: string) => mutation({ case: "textInput", value: create(contract.BrowserTakeoverTextInputSchema, { text: value }) });
     const request = { operationId: "browser-private-input", connectionId: owner.id, mutation: text(password) };
+    const base = "https://example.test/help", navigate = (anchor: string) => mutation({ case: "navigate",
+      value: create(contract.BrowserTakeoverNavigateSchema, { url: `${base}#${anchor}` }) });
+    const anchored = { operationId: "browser-document-anchor", connectionId: owner.id, mutation: navigate("install") };
     try {
       const client = makeClient();
       const accepted = await client.submitOperation(request, auth(original));
@@ -5379,7 +5382,13 @@ describe("Connect security and protocol audit", () => {
       const key = await client.submitOperation({ operationId: "browser-private-character", connectionId: owner.id,
         mutation: mutation({ case: "keyPress", value: create(contract.BrowserTakeoverKeyPressSchema, { character: "q" }) }) }, auth(original));
       expect(key.operation?.mutation?.payload).toMatchObject({ value: { action: { case: "keyPress", value: { character: "" } } } });
-      expect(perform.mock.calls.map((call) => call[1])).toEqual([{ type: "textInput", text: password }, { type: "keyPress", key: "q", modifiers: [] }]);
+      const navigation = await client.submitOperation(anchored, auth(original));
+      expect(navigation.operation?.mutation?.payload).toMatchObject({ value: { action: { case: "navigate", value: { url: base } } } });
+      expect(perform.mock.calls.map((call) => call[1])).toEqual([{ type: "textInput", text: password }, { type: "keyPress", key: "q", modifiers: [] },
+        { type: "navigate", url: `${base}#install` }]);
+      expect(store.getOperation(anchored.operationId).body).toMatchObject({ browserNavigationFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        payload: { value: { action: { case: "navigate", value: { url: base } } } } });
+      expect(JSON.stringify(store.getOperation(anchored.operationId).body)).not.toContain("#install");
       const durable = JSON.stringify(store.getOperation(request.operationId).body);
       expect(durable).toContain("browserKeyboardFingerprint");
       expect(durable).not.toContain(password);
@@ -5394,16 +5403,22 @@ describe("Connect security and protocol audit", () => {
         .rejects.toMatchObject({ code: Code.AlreadyExists });
       await expect(cold.submitOperation({ ...request, operationId: "legacy-browser-input" }, auth(original)))
         .resolves.toMatchObject({ operation: { operationId: "legacy-browser-input" } });
-      expect(perform).toHaveBeenCalledTimes(2);
+      await expect(cold.submitOperation(anchored, auth(original))).resolves.toMatchObject({ operation: { operationId: anchored.operationId } });
+      await expect(cold.submitOperation({ ...anchored, mutation: navigate("usage") }, auth(original))).rejects.toMatchObject({ code: Code.AlreadyExists });
+      expect(perform).toHaveBeenCalledTimes(3);
 
       const operations = (await client.listOperations({}, auth(observer))).operations;
       const retained = (await cold.getOperation({ operationId: "legacy-browser-input" }, auth(observer))).operation!;
+      const retainedAnchor = (await cold.getOperation({ operationId: anchored.operationId }, auth(observer))).operation!;
       for await (const update of cold.watchOperation({ operationId: request.operationId }, auth(observer))) operations.push(update.operation!);
+      for await (const update of cold.watchOperation({ operationId: anchored.operationId }, auth(observer))) operations.push(update.operation!);
       expect(operations.length).toBeGreaterThan(3);
-      for (const operation of [...operations, retained]) {
+      for (const operation of [...operations, retained, retainedAnchor]) {
         const bytes = Buffer.from(toBinary(contract.OperationSchema, operation));
         expect(bytes.includes(Buffer.from(password))).toBe(false);
         expect(bytes.includes(Buffer.from("browserKeyboardFingerprint"))).toBe(false);
+        expect(bytes.includes(Buffer.from("#install"))).toBe(false);
+        expect(bytes.includes(Buffer.from("browserNavigationFingerprint"))).toBe(false);
       }
     } finally { await host.dispose(); }
   });

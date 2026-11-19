@@ -81,6 +81,8 @@ describe("Browser takeover bounded chrome input", () => {
     })).not.toThrow();
     expect(() => validateTakeoverInput({ type: "navigationCommand", command: "forward" })).not.toThrow();
     expect(validateTakeoverNavigationUrl("https://example.test/path?q=short")).toBe("https://example.test/path?q=short");
+    expect(validateTakeoverNavigationUrl("https://example.test/path#install")).toBe("https://example.test/path#install");
+    expect(validateTakeoverNavigationUrl("https://example.test/path#安装")).toBe("https://example.test/path#%E5%AE%89%E8%A3%85");
     expect(validateTakeoverNavigationUrl("about:blank")).toBe("about:blank");
   });
 

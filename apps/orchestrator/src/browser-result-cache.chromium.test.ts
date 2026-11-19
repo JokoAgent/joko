@@ -3,10 +3,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chromium } from "playwright-core";
 import { BrowserProvider } from "@joko/tool-browser";
+import { BrowserTransferState, TransferDirection } from "@joko/contracts";
+import { OperationalStore } from "@joko/store";
 import { expect, it } from "vitest";
 import { BrowserToolBridgeProvider } from "./browser-tool-bridge.js";
-import type { ArtifactStore } from "./artifact-store.js";
-import type { BrowserTransferCoordinator } from "./browser-transfers.js";
+import { ArtifactStore } from "./artifact-store.js";
+import { OperationalArtifactRepository } from "./artifact-repository.js";
+import { BrowserTransferCoordinator } from "./browser-transfers.js";
+import { OperationalBrowserState } from "./operational-browser-state.js";
 
 it.skipIf(!process.env.JOKO_BROWSER_EXECUTABLE)("reads a real page's complete large extract in segments without re-extracting or dispatching an action", async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-browser-results-"));
@@ -26,4 +30,57 @@ it.skipIf(!process.env.JOKO_BROWSER_EXECUTABLE)("reads a real page's complete la
     expect(JSON.parse(output).data.records.map((row: { title: string }) => row.title)).toEqual(titles);
     expect(context.pages().filter(page => page.url() === "https://results.example.test/")).toHaveLength(1);
   } finally { await provider.stop().catch(() => undefined); await native.close(); await rm(root, { recursive: true, force: true }); }
+}, 30_000);
+
+it.skipIf(!process.env.JOKO_BROWSER_EXECUTABLE)("sets both requested Browser upload files on the same native FileList", async () => {
+  const root = await mkdtemp(join(tmpdir(), "joko-browser-upload-files-"));
+  const native = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+  const context = await native.newContext();
+  const url = "https://upload.example.test/";
+  await context.route(url, route => route.fulfill({ contentType: "text/html",
+    body: '<input id="files" type="file" multiple><input id="single" type="file">' }));
+  const provider = new BrowserProvider({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!,
+    profileDirectories: { sidebar: join(root, "sidebar"), external: join(root, "external") },
+    targetMode: "sidebar", downloadDirectory: join(root, "downloads"), uploadRoots: [root], launchPersistentContext: async () => context });
+  const store = new OperationalStore(join(root, "orchestrator.db"));
+  const artifacts = new ArtifactStore({ rootDirectory: join(root, "artifacts"),
+    repository: new OperationalArtifactRepository(store), ingestRoots: [root] });
+  const repository = new OperationalBrowserState(store);
+  const transfers = new BrowserTransferCoordinator({ artifacts, provider, repository });
+  const bridge = new BrowserToolBridgeProvider({ browser: provider, transfers, artifacts });
+  try {
+    await artifacts.initialize();
+    await provider.start();
+    const lease = provider.acquireAgentLease("prepare-file-inputs");
+    const page = await provider.createPage(lease, url);
+    await provider.releaseAgentLease(lease);
+    const original = context.pages().find(candidate => candidate.url() === url)!;
+    await original.locator("#files").evaluate((element: HTMLElement) => {
+      element.addEventListener("change", () => {
+        element.dataset.changeCount = String(Number(element.dataset.changeCount ?? "0") + 1);
+      });
+    });
+    const first = await artifacts.ingestBytes(Buffer.from("Invoice body"), { fileName: "invoice.txt", mimeType: "text/plain" });
+    const second = await artifacts.ingestBytes(Buffer.from("Second file body"), { fileName: "details.txt", mimeType: "text/plain" });
+    const call = async (selector: string) => bridge.callTool("browser", {
+      action: "upload", targetId: page.id, selector, paths: [first.id, second.id]
+    });
+    const result = await call("#files");
+    expect(result.isError).toBe(false);
+    const actual = await original.locator("#files").evaluate(async (input: HTMLInputElement) => ({
+      changes: input.dataset.changeCount, contents: await Promise.all(Array.from(input.files ?? [], file => file.text()))
+    }));
+    expect(actual).toEqual({ changes: "1", contents: ["Invoice body", "Second file body"] });
+    const completed = transfers.list({ pageId: page.id, direction: TransferDirection.UPLOAD, state: BrowserTransferState.COMPLETED });
+    expect(completed.map(item => item.blob?.blobId).sort()).toEqual([first.id, second.id].sort());
+    expect(completed[0]?.completedAt).toEqual(completed[1]?.completedAt);
+    await call("#single");
+    expect(await original.locator("#single").evaluate((input: HTMLInputElement) => input.files?.length)).toBe(0);
+    expect(repository.list("browser").filter(item => item.state === BrowserTransferState.FAILED)).toHaveLength(2);
+  } finally {
+    await provider.stop().catch(() => undefined);
+    await native.close();
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
 }, 30_000);
