@@ -8,6 +8,7 @@ import { restoreMissingWorktreeBranch, runGit } from "./git.js";
 import { cleanCapturedIgnoredIncludes, copyWorktreeIncludeFiles, readWorktreeIncludeMatcher } from "./include-files.js";
 import { cancelWorktreeSourceUses, withWorktreeSourceLock } from "./source-use.js";
 import { deferRecycle, newRecyclePolicy, recycleFailureReason } from "./recycle-policy.js";
+import { captureWorktreeRemovalEvidence, removeCoveredWorktreeFiles } from "./removal-evidence.js";
 import {
   DEFAULT_WORKTREE_OPERATION_TIMEOUT_MS,
   WorktreeOperationControl,
@@ -28,6 +29,7 @@ import {
   pathInside,
   samePath,
   validateOrdinaryDirectory,
+  WORKTREE_STATE_SIZE_ERROR,
   WorktreeStateStore,
   type ManagedWorktreeEntry
 } from "./state.js";
@@ -782,6 +784,10 @@ export class EphemeralWorktreeService {
       : await this.#snapshotForDeletion(current, control);
     current = store.get(entry.id) ?? current;
     if (!(await pathExists(current.path))) {
+      if (current.checkoutRemoval !== undefined) {
+        current = { ...current, checkoutRemoval: undefined, updatedAt: this.#now() };
+        await store.set(current, control);
+      }
       if (retainForRestore) {
         if (current.archiveSnapshot === undefined) {
           throw new WorktreeServiceError(
@@ -814,6 +820,18 @@ export class EphemeralWorktreeService {
     }
     const attached = await attachedWorktreeBranch(current.path, control);
     if (attached !== current.branch) {
+      if (this.#recycle && attached === undefined && current.checkoutRemoval !== undefined &&
+        await worktreeHeadCommit(current.path, control) === undefined) {
+        // A detached or explicitly locked registered checkout still belongs to Git.
+        const listing = await runGit(["worktree", "list", "--porcelain", "-z"], current.repositoryRoot, control);
+        const registered = listing.stdout.split("\0").some(field => field.startsWith("worktree ") &&
+          samePath(field.slice(9), current.path));
+        if (!registered) {
+          await this.#assertRecordedBranchTip(current, control);
+          await removeCoveredWorktreeFiles(current.path, current.checkoutRemoval, control, assertCanRecycle);
+          return this.#releaseLockedEntry(current, retainForRestore, control, assertCanRecycle);
+        }
+      }
       await store.set(preservedEntry(current, this.#now()), control);
       return Object.freeze({
         status: "preserved",
@@ -856,10 +874,22 @@ export class EphemeralWorktreeService {
     if (snapshotSha === undefined && current.archiveSnapshot === undefined) {
       current = await this.#recordCleanArchive(current, control);
     }
+    const checkoutRemoval = this.#recycle ? await captureWorktreeRemovalEvidence(current.path, control) : undefined;
+    if (checkoutRemoval !== undefined && !(await isWorktreeCompletelyClean(current.path, control))) {
+      throw new WorktreeServiceError("SESSION_CONFLICT", "The checkout changed before removal.");
+    }
     await this.#assertRecordedBranchTip(current, control);
     await assertCanRecycle();
-    const preserved = preservedEntry(current, this.#now());
-    await store.set(preserved, control);
+    let preserved = preservedEntry({ ...current, checkoutRemoval }, this.#now());
+    try {
+      await store.set(preserved, control);
+    } catch (error) {
+      if (checkoutRemoval === undefined || !isWorktreeServiceError(error) || error.code !== "STATE_CORRUPT" ||
+        error.message !== WORKTREE_STATE_SIZE_ERROR) throw error;
+      // Git's normal clean removal remains available when recovery evidence would exceed the state limit.
+      preserved = { ...preserved, checkoutRemoval: undefined };
+      await store.set(preserved, control);
+    }
     const result = await this.#destroyEntry(preserved, control, true, true);
     if (retainForRestore) {
       return Object.freeze({
@@ -1035,6 +1065,11 @@ export class EphemeralWorktreeService {
       const attached = await attachedWorktreeBranch(current.path, control);
       if (attached !== current.branch) {
         throw new WorktreeServiceError("SESSION_CONFLICT", "The restored Session worktree branch does not match its owner record.");
+      }
+      if (current.checkoutRemoval !== undefined) {
+        current = { ...current, checkoutRemoval: undefined, updatedAt: this.#now() };
+        recoveryRecord = current;
+        await store.set(current, control);
       }
       if (branchWasMissing && await worktreeHeadCommit(current.path, control) !== current.archiveSnapshot?.branchHeadSha) {
         throw new WorktreeServiceError("SESSION_CONFLICT", "The restored Session worktree does not use the archived commit.");
@@ -1546,6 +1581,7 @@ export class EphemeralWorktreeService {
       archiveSnapshot: { kind: "clean" as const, branchHeadSha },
       pendingOwnerRefTransition: undefined,
       checkoutCleanup: undefined,
+      checkoutRemoval: undefined,
       deletionTransfer: undefined,
       updatedAt: this.#now()
     };
@@ -1577,6 +1613,7 @@ export class EphemeralWorktreeService {
         ...(previousSha === undefined ? {} : { previousSha })
       },
       checkoutCleanup: undefined,
+      checkoutRemoval: undefined,
       deletionTransfer: undefined,
       updatedAt: this.#now()
     };
@@ -1823,7 +1860,12 @@ export class EphemeralWorktreeService {
       }
       if (repositoryAvailable) {
         try {
-          if (safeRemoval) await this.#assertRecordedBranchTip(destroying, control);
+          if (safeRemoval) {
+            await this.#assertRecordedBranchTip(destroying, control);
+            if (await attachedWorktreeBranch(destroying.path, control) !== destroying.branch) {
+              throw new WorktreeServiceError("SESSION_CONFLICT", "The worktree branch changed before removal.");
+            }
+          }
           await runGit(
             safeRemoval
               ? ["worktree", "remove", destroying.path]
@@ -1866,7 +1908,7 @@ export class EphemeralWorktreeService {
     // checkout must never force-delete the branch, even when it still matches
     // its source exactly; a later user action may merge or cherry-pick it.
     if (retainForRestore) {
-      await store.set(preservedEntry(destroying, this.#now()), control);
+      await store.set(preservedEntry({ ...destroying, checkoutRemoval: undefined }, this.#now()), control);
     } else {
       await store.delete(destroying.id, control);
       await this.#removeEmptyRepositoryDirectory(destroying);

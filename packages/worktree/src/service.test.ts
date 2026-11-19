@@ -11,7 +11,7 @@ import {
   unlink,
   writeFile
 } from "node:fs/promises";
-import { join, relative, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 
 import { afterEach, describe, expect, test } from "vitest";
@@ -183,6 +183,51 @@ describe("EphemeralWorktreeService", () => {
     expect(unwrap(await restarted.retryRecycle(pending, async () => true))).toMatchObject({ pathRemoved: true, reason: "restorable" });
     expect(restarted.listRecycleStatus()).toEqual([]);
     restarted.dispose();
+  });
+
+  test("resumes partial Git removal from the original archive and preserves late files", { timeout: 40_000 }, async () => {
+    const fixture = await createRepositoryFixture();
+    const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot, recycle: true });
+    unwrap(await service.initialize());
+    const sessionId = "partial-recycle";
+    const checkout = unwrap(await service.acquire({ sessionId, cwd: fixture.repositoryRoot }));
+    const path = checkout.lease.path;
+    const tracked = join(path, "tracked.txt");
+    await writeFile(tracked, "original staged edit\n");
+    await git(path, ["add", "tracked.txt"]);
+    const metadata = await realpath(await git(path, ["rev-parse", "--absolute-git-dir"]));
+    const metadataRoot = await realpath(join(fixture.repositoryRoot, ".git", "worktrees"));
+    const metadataRelative = relative(metadataRoot, metadata);
+    if (!metadataRelative || isAbsolute(metadataRelative) || metadataRelative === ".." || metadataRelative.startsWith(`..${sep}`)) {
+      throw new Error("The test worktree metadata escaped its fixture.");
+    }
+    await git(fixture.repositoryRoot, ["worktree", "lock", path]);
+    expectFailure(await service.release(sessionId, { retainForRestore: true }), "SESSION_CONFLICT");
+    const pending = service.listRecycleStatus()[0]!;
+    service.dispose();
+
+    // Model Git retiring its private registration while an ordinary file survives removal.
+    await unlink(join(path, ".git"));
+    await rm(metadata, { recursive: true });
+    const late = join(path, "late.txt");
+    await writeFile(late, "created after archive\n", { flag: "wx" });
+
+    const reopened = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot, recycle: true });
+    try {
+      unwrap(await reopened.initialize({ deferRecycle: true, preserveSessionIds: [sessionId] }));
+      expectFailure(await reopened.retryRecycle(pending, async () => true), "SESSION_CONFLICT");
+      expect((await readFile(tracked, "utf8")).trim()).toBe("initial");
+      expect((await readFile(late, "utf8")).trim()).toBe("created after archive");
+
+      await unlink(late);
+      expect(unwrap(await reopened.retryRecycle(pending, async () => true)))
+        .toMatchObject({ status: "preserved", reason: "restorable", pathRemoved: true, branchPreserved: true });
+      await expect(lstat(path)).rejects.toMatchObject({ code: "ENOENT" });
+      const restored = unwrap(await reopened.acquire({ sessionId, cwd: fixture.repositoryRoot }));
+      expect(restored.lease.branch).toBe(checkout.lease.branch);
+      expect((await readFile(tracked, "utf8")).trim()).toBe("original staged edit");
+      expect(await git(path, ["diff", "--cached", "--name-only"])).toContain("tracked.txt");
+    } finally { reopened.dispose(); }
   });
 
   test("cancels a project source borrower before recycling and releases only after its writer retires", { timeout: 30_000 }, async () => {

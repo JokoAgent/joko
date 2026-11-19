@@ -5,10 +5,12 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { WorktreeServiceError, type WorktreeErrorCode } from "./errors.js";
 import { WorktreeOperationControl } from "./operation.js";
+import { validateWorktreeRemovalEvidence, type WorktreeRemovalEvidence } from "./removal-evidence.js";
 import type { WorktreeRecyclePolicy, WorktreeSourceResolution } from "./types.js";
 
 const STATE_FILE_NAME = "state.json";
 const MAXIMUM_STATE_BYTES = 10 * 1024 * 1024;
+export const WORKTREE_STATE_SIZE_ERROR = "The worktree state exceeds its safe limit.";
 const ENTRY_ID_PATTERN = /^[a-f0-9]{24}$/u;
 const REPOSITORY_ID_PATTERN = /^repo-[a-f0-9]{20}$/u;
 const SLOT_ID_PATTERN = /^wt-[a-f0-9]{24}$/u;
@@ -57,6 +59,8 @@ export interface ManagedWorktreeEntry {
   readonly pendingOwnerRefTransition?: ManagedWorktreeOwnerRefTransition;
   /** Exact owner snapshot protecting a destructive reset/clean phase. */
   readonly checkoutCleanup?: ManagedWorktreeCheckoutCleanup;
+  /** Original clean checkout identity retained until Git finishes removing its path. */
+  readonly checkoutRemoval?: WorktreeRemovalEvidence;
   /** State-first transfer of a deleted worktree snapshot into the user's stash.
    * The exact object, never its subject or position, authorizes ref retirement. */
   readonly deletionTransfer?: ManagedWorktreeDeletionTransfer;
@@ -156,7 +160,7 @@ export class WorktreeStateStore {
     const state: PersistedWorktreeState = { format: 1, entries: [...next.values()].sort((left, right) => left.createdAt - right.createdAt) };
     const serialized = `${JSON.stringify(state)}\n`;
     if (Buffer.byteLength(serialized, "utf8") > MAXIMUM_STATE_BYTES) {
-      throw new WorktreeServiceError("STATE_CORRUPT", "The worktree state exceeds its safe limit.");
+      throw new WorktreeServiceError("STATE_CORRUPT", WORKTREE_STATE_SIZE_ERROR);
     }
     const temporary = join(this.root, `.state-${randomUUID()}.tmp`);
     let renamed = false;
@@ -292,6 +296,7 @@ function validateEntry(value: unknown): ManagedWorktreeEntry {
   const archiveSnapshot = validateArchiveSnapshot(value["archiveSnapshot"]);
   const pendingOwnerRefTransition = validateOwnerRefTransition(value["pendingOwnerRefTransition"]);
   const checkoutCleanup = validateCheckoutCleanup(value["checkoutCleanup"]);
+  const checkoutRemoval = validateWorktreeRemovalEvidence(value["checkoutRemoval"]);
   const deletionTransfer = validateDeletionTransfer(value["deletionTransfer"]);
   const recycle = validateRecyclePolicy(value["recycle"]);
   if (pendingOwnerRefTransition !== undefined
@@ -306,12 +311,15 @@ function validateEntry(value: unknown): ManagedWorktreeEntry {
     && (archiveSnapshot?.kind !== "dirty" || archiveSnapshot.sha !== checkoutCleanup.sha)) {
     throw new WorktreeServiceError("STATE_CORRUPT", "A checkout cleanup does not match its dirty archive identity.");
   }
-  if ([pendingOwnerRefTransition, checkoutCleanup, deletionTransfer]
+  if ([pendingOwnerRefTransition, checkoutCleanup, checkoutRemoval, deletionTransfer]
     .filter((candidate) => candidate !== undefined).length > 1) {
     throw new WorktreeServiceError("STATE_CORRUPT", "A worktree has conflicting durable transition phases.");
   }
   if (status === "preserved" && archiveSnapshot === undefined) {
     throw new WorktreeServiceError("STATE_CORRUPT", "A preserved worktree has no clean-or-dirty archive identity.");
+  }
+  if (checkoutRemoval !== undefined && (archiveSnapshot === undefined || (status !== "preserved" && status !== "destroying"))) {
+    throw new WorktreeServiceError("STATE_CORRUPT", "The pending checkout removal has no durable archive identity.");
   }
   if ((status === "restoring" || status === "restored") && archiveSnapshot?.kind !== "dirty") {
     throw new WorktreeServiceError("STATE_CORRUPT", "A restoring worktree has no dirty archive identity.");
@@ -333,6 +341,7 @@ function validateEntry(value: unknown): ManagedWorktreeEntry {
     ...(archiveSnapshot === undefined ? {} : { archiveSnapshot }),
     ...(pendingOwnerRefTransition === undefined ? {} : { pendingOwnerRefTransition }),
     ...(checkoutCleanup === undefined ? {} : { checkoutCleanup }),
+    ...(checkoutRemoval === undefined ? {} : { checkoutRemoval }),
     ...(deletionTransfer === undefined ? {} : { deletionTransfer }),
     ...(recycle === undefined ? {} : { recycle }),
     createdAt: createdAt as number,
