@@ -304,6 +304,7 @@ import { useMobileHomeProjectReorder } from "./use-mobile-home-project-reorder";
 import { mobilePartnerRosterSourceKey } from "./mobile-partner-roster";
 import {
   artifactTitle,
+  isTextFilePreviewMetadata,
   workspaceBasename,
   workspaceSearchEntryRevision,
   type MobileFilePreview,
@@ -8348,6 +8349,8 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
   const files = state.files;
   const currentPreviewSource = files.previewPager?.pages[files.previewPager.index]?.source ?? previewSource;
   const currentPreviewPage = files.previewPager?.pages[files.previewPager.index];
+  const failedTextPreview = files.preview?.kind === "error" && currentPreviewPage?.kind === "workspace"
+    && isTextFilePreviewMetadata(currentPreviewPage.mediaType, currentPreviewPage.title) ? files.preview : undefined;
   const initialPagerSource = useRef<MobileFilesComposerSource | undefined>(undefined);
   const searching = query.trim().length > 0;
   const imageGallery = useMobileImageGallery(locale, () => {
@@ -8622,6 +8625,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
         }} />}
     </View>
     <FilePreviewModal colors={colors} preview={files.preview} source={currentPreviewSource} pager={files.previewPager} workspaceHtmlNavigation
+      onRetry={failedTextPreview ? () => run(() => client.retryFilesTextPreview(failedTextPreview)) : undefined}
       onQuoted={() => { setPreviewSource(undefined); client.closeFiles(); onAdded(); }}
       onNavigate={(id, key) => run(() => client.selectFilesPreviewPage(id, key))} busy={handoffBusy} locale={locale}
       sharing={fileShareBusy} shareProgress={fileShareProgress}
@@ -8718,7 +8722,7 @@ function FileSearchResultRow({ result, colors, locale, disabled, shareDisabled, 
 
 function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sharing = false, shareProgress, backLabel,
   backAccessibilityLabel, loadingLabel, locale, copying = false, copyLabel, copyStatus, onCopy,
-  onAdd, onOpenImage, onShare, onClose, onQuoted, workspaceHtmlNavigation }: {
+  onAdd, onOpenImage, onShare, onClose, onQuoted, onRetry, workspaceHtmlNavigation }: {
   colors: Colors;
   preview: MobileFilePreview | undefined;
   source?: MobileFilesComposerSource;
@@ -8739,6 +8743,7 @@ function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sh
   onAdd?: (source: MobileFilesComposerSource) => void;
   onOpenImage?: (source: MobileFilesComposerSource) => void;
   onShare?: () => void;
+  onRetry?: () => void;
   onClose: () => void;
   onQuoted?: () => void;
 }) {
@@ -8912,6 +8917,8 @@ function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sh
               {mobileMessage(locale, preview.kind === "error" ? "preview.unavailable" : "preview.noInApp")}
             </Text>
             <Text selectable style={[styles.description, { color: colors.muted }]}>{preview.reason}</Text>
+            {preview.kind === "error" && onRetry && <Action label={mobileMessage(locale, "common.retry")} colors={colors}
+              disabled={blocked} onPress={onRetry} />}
           </View>}
         </MobileFilesPreviewPager>
       </>}

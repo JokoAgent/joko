@@ -7845,6 +7845,14 @@ export class MobileClient {
     }
   }
 
+  async retryFilesTextPreview(preview: Extract<MobileFilePreview, { kind: "error" }>): Promise<void> {
+    const pager = this.#state.files.previewPager;
+    const page = pager?.pages[pager.index];
+    if (this.#state.files.preview !== preview || !pager || page?.kind !== "workspace"
+      || page.entry.relativePath !== preview.workspacePath || !isTextFilePreviewMetadata(page.mediaType, page.title)) return;
+    await this.selectFilesPreviewPage(pager.id, page.key);
+  }
+
   #filesPreviewPagerCurrent(lease: MobileFilesPreviewPagerLease): boolean {
     const files = this.#state.files;
     return this.#filesPreviewPager === lease && !lease.controller.signal.aborted && this.#credential === lease.context.credential

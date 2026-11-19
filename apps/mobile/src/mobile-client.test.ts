@@ -14260,6 +14260,29 @@ describe("native current-task Files ownership", () => {
     expect(app.state.files.preview).toBeUndefined(); expect(app.state.files.previewPager).toBeUndefined();
   });
 
+  it("retries the original failed Workspace text preview in place and ignores a retired retry", async () => {
+    const network = fakeNetwork(); configureFiles(network, handoffSnapshot);
+    const entry = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "notes.txt", displayName: "notes.txt",
+      mediaType: "text/plain", kind: FileKind.REGULAR, revision: { opaqueRevision: "notes-r1", byteSize: 5n } });
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({ entries: [entry], revision: "readable-directory" });
+    const read = vi.mocked(network.readWorkspaceFile).mockRejectedValueOnce(new ConnectError("Temporary text read failure", Code.Unavailable))
+      .mockResolvedValue(create(FilePreviewSchema, { entry,
+        content: { case: "text", value: { utf8Text: "notes", startByte: 0n, endByte: 5n, totalLines: 1 } } }));
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.openFiles();
+    await app.openFilesPreviewPager({ kind: "workspace-entry", entry });
+    const pager = app.state.files.previewPager;
+    const failed = app.state.files.preview; if (failed?.kind !== "error") throw new Error("The first text read should fail.");
+    expect(failed.reason).toContain("Temporary text read failure");
+    await app.retryFilesTextPreview(failed);
+    expect(app.state.files.previewPager?.id).toBe(pager?.id);
+    expect(app.state.files.preview).toMatchObject({ kind: "text", workspacePath: entry.relativePath, text: "notes" });
+    expect(read.mock.calls.map(([, workspaceId, path, revision]) => [workspaceId, path, revision]))
+      .toEqual([["workspace", entry.relativePath, entry.revision], ["workspace", entry.relativePath, entry.revision]]);
+    app.closeFilesPreview();
+    await app.retryFilesTextPreview(failed);
+    expect(app.state.files.preview).toBeUndefined(); expect(read).toHaveBeenCalledTimes(2);
+  });
+
   it("keeps canceled raw pager reads occupied, switches only the selected page and rejects a late old preview", async () => {
     const entries = ["alpha", "beta", "gamma"].map((name) => create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: name + ".txt",
       displayName: name + ".txt", kind: FileKind.REGULAR, mediaType: "text/plain", revision: { opaqueRevision: name + "-r1", byteSize: BigInt(name.length) } }));
