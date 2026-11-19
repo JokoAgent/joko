@@ -72,7 +72,11 @@ mountedIt("adds, replaces, and clears queued attachments in place before dispatc
         const browser = await editButton.evaluateAll(nodes => nodes.map(node => ({ disabled: (node as HTMLButtonElement).disabled,
           reason: node.closest(".tip-anchor--disabled")?.getAttribute("aria-label") })));
         const leaseOps = fixture!.application.store.listOperations({ limit: 24 }).filter(operation => operation.kind === "setQueueItemEditLock")
-          .map(({ status, error }) => ({ status, code: error?.code, message: error?.message }));
+          .map(({ status, error }) => {
+            const details = error !== null && typeof error === "object" ? error : {};
+            return { status, code: "code" in details && typeof details.code === "string" ? details.code : undefined,
+              message: "message" in details && typeof details.message === "string" ? details.message : undefined };
+          });
         return { publicItem: item === undefined ? undefined : { editLocked: item.editLocked, state: item.state }, browser, leaseOps };
       }, value => value.publicItem?.editLocked === false && value.browser[0]?.disabled === false, "the original queued input to be editable again");
       await editButton.click();
