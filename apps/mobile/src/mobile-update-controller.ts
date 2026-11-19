@@ -444,21 +444,14 @@ export class MobileUpdateController {
     if (!this.#canCheckBundle()) return "skipped";
     const configuration = this.#configuration!;
     const platform = this.#platform as "android" | "ios";
-    if (!isMobileUpdateVersion(this.#runtime.info.appVersion)
-      || !validRuntimeVersion(this.#runtime.info.runtimeVersion)) {
-      throw new Error("The installed mobile version cannot be verified.");
-    }
+    const installed = this.#installedBundleIdentity();
     const value = await this.#requestBundleRelease(
       configuration.releaseFeedUrl!, platform, this.#state.channel, generation
     );
     if (generation !== this.#generation) return "skipped";
     if (value === null) return "none";
     const release = parseMobileUpdateRelease(value);
-    const evaluation = evaluateMobileBundleUpdate({
-      currentVersion: this.#runtime.info.appVersion,
-      currentRuntimeVersion: this.#runtime.info.runtimeVersion,
-      release
-    });
+    const evaluation = evaluateMobileBundleUpdate({ ...installed, release });
     if (!evaluation.needsUpdate || !evaluation.target) return "none";
     if (evaluation.forced) {
       this.#enterForced(evaluation.target);
@@ -480,8 +473,7 @@ export class MobileUpdateController {
     const generation = this.#generation;
     this.#patch({ forcedChecking: true, forcedCheckFailed: false, actionError: undefined });
     try {
-      if (!isMobileUpdateVersion(this.#runtime.info.appVersion)
-        || !validRuntimeVersion(this.#runtime.info.runtimeVersion)) throw new Error("version-unavailable");
+      const installed = this.#installedBundleIdentity();
       const value = await this.#requestBundleRelease(
         this.#configuration!.releaseFeedUrl!,
         this.#platform as "android" | "ios",
@@ -495,11 +487,7 @@ export class MobileUpdateController {
       }
       const release = parseMobileUpdateRelease(value);
       if (compareReleaseVersions(release.version, held.version) < 0) throw new Error("stale-release");
-      const evaluation = evaluateMobileBundleUpdate({
-        currentVersion: this.#runtime.info.appVersion,
-        currentRuntimeVersion: this.#runtime.info.runtimeVersion,
-        release
-      });
+      const evaluation = evaluateMobileBundleUpdate({ ...installed, release });
       if (evaluation.forced && evaluation.target) {
         this.#enterForced(evaluation.target, expectedRevision);
         return;
@@ -513,6 +501,16 @@ export class MobileUpdateController {
     } finally {
       if (generation === this.#generation) this.#patch({ forcedChecking: false });
     }
+  }
+
+  #installedBundleIdentity(): { readonly currentVersion: string; readonly currentRuntimeVersion: string | undefined } {
+    const { appVersion, runtimeVersion } = this.#runtime.info;
+    // The disabled OTA runtime may omit its identity while the native app version is available.
+    const runtimeRequired = this.#configuration?.otaEnabled === true || runtimeVersion !== undefined;
+    if (!isMobileUpdateVersion(appVersion) || runtimeRequired && !validRuntimeVersion(runtimeVersion)) {
+      throw new Error("The installed mobile version cannot be verified.");
+    }
+    return { currentVersion: appVersion, currentRuntimeVersion: runtimeVersion };
   }
 
   #enterForced(target: MobileUpdateRelease, expectedRevision?: number): void {
