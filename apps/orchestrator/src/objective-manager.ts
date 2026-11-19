@@ -347,19 +347,20 @@ export class ObjectiveManager {
           }
           assertObjectiveSessionEligible(store, input.sessionId);
           clearObjectiveProviderLimit(store, input.sessionId);
+          const pending = inspectPending(store, current);
           const updated = store.updateObjective({
             sessionId: input.sessionId,
             expectedRevision: current.revision,
             expectedOwnerGeneration: current.ownerGeneration,
-            status: "active",
+            status: pending.unknown ? "dispatch_unknown" : "active",
             usageResetAt: null,
             noProgressTurns: 0,
             dispatchRejections: 0,
-            lastReason: null,
+            lastReason: pending.unknown ? "objective dispatch outcome is unknown" : null,
             advanceOwnerGeneration: true,
             updatedAt: this.#now()
           });
-          appendObjectiveLifecycle(store, updated, "resumed", this.#now(), updated.lastReason);
+          appendObjectiveLifecycle(store, updated, pending.unknown ? "dispatch_unknown" : "resumed", this.#now(), updated.lastReason);
           return { sessionId: input.sessionId };
         }
       );

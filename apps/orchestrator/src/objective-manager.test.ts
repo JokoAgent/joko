@@ -103,6 +103,42 @@ describe("ObjectiveManager", () => {
       && event.payload.objectiveText === "Replacement objective")).toBe(true);
   });
 
+  it("resumes a paused Goal as dispatch unknown after restart until its original attempt settles", async () => {
+    const fixture = createFixture();
+    const active = await fixture.manager.set(setInput("set-before-objective-restart", fixture));
+    const original = fixture.host.admissions[0]!;
+    makeRunning(fixture.store, original);
+    const paused = await fixture.manager.pause({ operationId: "pause-original-goal", sessionId: fixture.sessionId,
+      expectedRevision: active.revision, expectedOwnerGeneration: active.ownerGeneration });
+    expect(paused).toMatchObject({ status: "paused", pendingRunId: original.runId });
+    expect(fixture.store.getQueueItem(original.queueItemId).state).toBe("backend_accepted");
+    await fixture.manager.close();
+    fixture.store.close();
+
+    const store = new OperationalStore(fixture.databasePath);
+    const host = new FakeObjectiveHost(store);
+    const manager = new ObjectiveManager({ store, sessionHost: host });
+    try {
+      store.recoverStartup();
+      await manager.initialize();
+      expect(store.getRun(original.runId).descriptor.state).toBe("dispatch_unknown");
+      const resume = { operationId: "resume-original-goal", sessionId: fixture.sessionId,
+        expectedRevision: paused.revision, expectedOwnerGeneration: paused.ownerGeneration };
+      const resumed = await manager.resume(resume);
+      expect(resumed).toMatchObject({ status: "dispatch_unknown", text: active.text, pendingRunId: original.runId,
+        pendingAttemptId: original.attemptId, pendingQueueItemId: original.queueItemId, pendingOwnerGeneration: active.ownerGeneration });
+      expect(await manager.resume(resume)).toEqual(resumed);
+      expect(host.admissions).toEqual([]);
+      expect(store.getQueueItem(original.queueItemId).state).toBe("dispatch_unknown");
+
+      settleRun(store, original, "completed", verdict("continue", "The original attempt settled"));
+      await manager.onRunSettled({ sessionId: fixture.sessionId, runId: original.runId, outcome: "completed" });
+      await vi.waitFor(() => expect(host.admissions).toHaveLength(1));
+      expect(store.getObjective(fixture.sessionId)).toMatchObject({ status: "active", text: active.text, pendingRunId: host.admissions[0]!.runId });
+      expect(host.admissions[0]!.runId).not.toBe(original.runId);
+    } finally { await manager.close(); store.close(); }
+  });
+
   it("uses a new incarnation after clear so the old turn cannot replay or settle the rebuilt Objective", async () => {
     const fixture = createFixture();
     await fixture.manager.set(setInput("set-before-clear", fixture));
@@ -494,7 +530,7 @@ interface FixtureOptions { readonly now?: () => number }
 
 function createFixture(options: FixtureOptions = {}) {
   const directory = mkdtempSync(join(tmpdir(), "joko-objective-"));
-  const store = new OperationalStore(join(directory, "operational.db"));
+  const databasePath = join(directory, "operational.db"), store = new OperationalStore(databasePath);
   store.upsertBackend({
     id: "backend-one",
     displayName: "Backend",
@@ -542,7 +578,7 @@ function createFixture(options: FixtureOptions = {}) {
     store.close();
     rmSync(directory, { recursive: true, force: true });
   });
-  return { store, host, manager, managers, sessionId };
+  return { store, host, manager, managers, sessionId, databasePath };
 }
 
 class FakeObjectiveHost {
