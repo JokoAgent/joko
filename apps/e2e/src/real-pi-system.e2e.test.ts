@@ -149,11 +149,13 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     expect(storedKey.state).toBe(OperationState.SUCCEEDED);
     const provider = create(ProviderConfigurationSchema, { providerId, kind: ProviderKind.API_KEY, enabled: true, displayName: "Custom fixture Provider",
       version: { revision: { value: 0n } }, runtimes: [{ backendId: "pi", endpoint, credentialOrigin: new URL(endpoint).origin,
-        apiCompatibility: ProviderApiCompatibility.OPENAI_CHAT_COMPLETIONS, credentialReferenceId, apiKeyEnvironment: "JOKO_PI_PRICE_FIXTURE_KEY",
+        apiCompatibility: ProviderApiCompatibility.OPENAI_COMPLETIONS, credentialReferenceId, apiKeyEnvironment: "JOKO_PI_PRICE_FIXTURE_KEY",
         authHeader: true, models: [{ modelId, displayName: "Locally priced model", contextWindowTokens: 32_000n, maximumOutputTokens: 4_096n,
           inputCostMicrosPerMillion: 10_000_000n, outputCostMicrosPerMillion: 20_000_000n }] }] });
     const configured = await submit(clients.operation, connectionId, create(OperationMutationSchema, { payload: { case: "upsertProvider", value: { provider } } }));
     expect(configured.state).toBe(OperationState.SUCCEEDED);
+    expect(providers.get("pi", providerId).provider.models.find(model => model.id === modelId)?.cost)
+      .toMatchObject({ input: 10, output: 20 });
     const sessionId = sessionIdFrom(await submit(clients.operation, connectionId, createSessionMutation({
       backendId: "pi", targetId: "workspace-real-pi", providerId, modelId
     })));

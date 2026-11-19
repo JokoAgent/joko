@@ -14,6 +14,19 @@ afterEach(() => {
 });
 
 describe("durable usage ledger", () => {
+  it("counts the first derived amount after an empty cursor and then only its increment", () => {
+    const fixture = createFixture();
+    const measuredAt = Date.UTC(2026, 7, 23);
+    expect(fixture.store.recordUsageObservation(observation({ measuredAt })).changed).toBe(false);
+    const first = observation({ measuredAt: measuredAt + 1, inputTokens: 1_000, outputTokens: 1_000, totalTokens: 2_000,
+      reportedCostMicros: 30_000, reportedCostEstimated: true });
+    expect(fixture.store.recordUsageObservation(first)).toMatchObject({ totalTokens: 2_000, costMicros: 30_000, costComplete: true, estimated: true });
+    fixture.reopen();
+    const second = { ...first, measuredAt: measuredAt + 2, inputTokens: 2_000, outputTokens: 2_000, totalTokens: 4_000, reportedCostMicros: 60_000 };
+    expect(fixture.store.recordUsageObservation(second)).toMatchObject({ totalTokens: 2_000, costMicros: 30_000, costComplete: true, estimated: true });
+    expect(fixture.store.summarizeUsageLedger({ ownerId: "owner-a" })).toMatchObject({ totalTokens: 4_000, costMicros: 60_000, estimated: true });
+  });
+
   it("prices only new one-hour and short cache writes when their cumulative mix changes across restart", () => {
     const fixture = createFixture();
     const rates = { cacheWriteMicrosPerMillion: 5_000_000, cacheWrite1hMicrosPerMillion: 8_000_000 };
