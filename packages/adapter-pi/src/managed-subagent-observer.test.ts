@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -25,6 +25,16 @@ import {
 } from "./policy-decision-bridge.js";
 import { mkdtemp } from "./test-paths.js";
 
+const reads = vi.hoisted(() => ({ afterRead: undefined as ((path: unknown) => Promise<void>) | undefined }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, readFile: async (...args: Parameters<typeof actual.readFile>) => {
+    const value = await actual.readFile(...args);
+    await reads.afterRead?.(args[0]);
+    return value;
+  } };
+});
+
 describe("managed Subagent public observation", () => {
   it("fences hosted child tools to the exact live claimed runner and separates reserved registration from effects", async () => {
     const root = join(await mkdtemp(join(tmpdir(), "joko-hosted-child-scope-")), "subagent-runs"), sessionId = "hosted-child-session", taskId = "original-parent:step-1";
@@ -48,6 +58,37 @@ describe("managed Subagent public observation", () => {
     await rm(join(directory, "runner.claim.json"));
     await expect(assertManagedSubagentHostedToolScope({ ...input, reserved: true })).resolves.toMatchObject({ taskId });
     await expect(assertManagedSubagentHostedToolScope(input)).rejects.toThrow();
+  });
+
+  it("reads a new heartbeat when the current runner publishes its status during a hosted tool check", async () => {
+    const root = join(await mkdtemp(join(tmpdir(), "joko-hosted-child-heartbeat-")), "subagent-runs");
+    const productSessionId = "hosted-live-heartbeat", taskId = "original-parent:step-1";
+    const run = await physicalRun(root, productSessionId, taskId, 1, 1, [], undefined, "running");
+    const directory = join(root, managedSubagentSessionKey(productSessionId), run.runId);
+    const config = JSON.parse(await readFile(join(directory, "config.json"), "utf8"));
+    const path = join(directory, "status.json");
+    const status = JSON.parse(await readFile(path, "utf8"));
+    const scope = { taskId, runId: run.runId, launchToken: config.launchToken, runnerInstanceId: config.runnerInstanceId, nativeSessionId: config.nativeSessionId };
+    const input = { root, productSessionId, productGeneration: 1, scope };
+    const replaceOnRead = (next: Record<string, unknown>) => {
+      let attempts = 0;
+      reads.afterRead = async (file) => {
+        if (file !== path || ++attempts !== 1) return;
+        const replacement = join(directory, "status.next.json");
+        await writeFile(replacement, JSON.stringify(next));
+        await rename(replacement, path);
+      };
+      return () => attempts;
+    };
+    try {
+      await writeFile(path, JSON.stringify({ ...status, heartbeatAt: Date.now() - 60_000, durationMs: 0 }));
+      const runningReads = replaceOnRead({ ...status, heartbeatAt: Date.now(), durationMs: 12345 });
+      await expect(assertManagedSubagentHostedToolScope(input)).resolves.toMatchObject({ taskId });
+      expect(runningReads()).toBe(2);
+      const terminalReads = replaceOnRead({ ...status, state: "completed", heartbeatAt: Date.now(), endedAt: Date.now() });
+      await expect(assertManagedSubagentHostedToolScope(input)).rejects.toThrow(/no longer current/u);
+      expect(terminalReads()).toBe(2);
+    } finally { reads.afterRead = undefined; }
   });
 
   it("projects physical message lifecycle rows without changing their delivery positions", async () => {

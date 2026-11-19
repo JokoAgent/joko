@@ -789,6 +789,10 @@ export default function (pi) {
 
   it("resumes one stable JSONL after rotating Agent Home and loads explicit resources", { timeout: 30_000 }, async () => {
     const server = await startOpenAiCompatibleServer();
+    let providerRequests = 0;
+    server.prependListener("request", (request) => {
+      if (request.method === "POST" && request.url === "/v1/chat/completions") providerRequests += 1;
+    });
     const address = server.address() as AddressInfo;
     const firstAgentHome = await mkdtemp(join(tmpdir(), "joko-real-pi-generation-one-"));
     const secondAgentHome = await mkdtemp(join(tmpdir(), "joko-real-pi-generation-two-"));
@@ -809,6 +813,7 @@ export default function (pi) {
           "    description: 'Managed generation smoke command',",
           "    handler: async () => undefined",
           "  });",
+          "  pi.on('input', async event => event.text === 'handled by the native input hook' ? { action: 'handled' } : undefined);",
           "}",
           ""
         ].join("\n")
@@ -917,8 +922,20 @@ export default function (pi) {
       ]));
       await adapter.send({ text: "/managed-smoke", images: [], files: [], mentions: [], disposition: "prompt" }, secondContext);
       await eventSink.waitForDone(3);
-      await adapter.send({ text: "second", images: [], files: [], mentions: [], disposition: "prompt" }, secondContext);
+      const eventStart = eventSink.events.length;
+      const requestsBeforeInputHook = providerRequests;
+      const nativeState = await adapter.getState(secondContext);
+      await adapter.send({ text: "handled by the native input hook", images: [], files: [], mentions: [], disposition: "prompt" }, secondContext);
       await eventSink.waitForDone(4);
+      expect(eventSink.events.slice(eventStart).filter(event => event.type === "done" || event.type === "message_complete"))
+        .toEqual([{ type: "done", outcome: "completed" }]);
+      expect(providerRequests).toBe(requestsBeforeInputHook);
+      await expect(adapter.getState(secondContext)).resolves.toMatchObject({
+        sessionFile: nativeState.sessionFile, messageCount: nativeState.messageCount, isStreaming: false
+      });
+      await adapter.send({ text: "second", images: [], files: [], mentions: [], disposition: "prompt" }, secondContext);
+      await eventSink.waitForDone(5);
+      expect(providerRequests).toBe(requestsBeforeInputHook + 1);
       expect(eventSink.text).toContain("real-pi-smoke");
     } finally {
       await adapter.dispose().catch(() => undefined);

@@ -1,5 +1,6 @@
 import { create, fromBinary } from "@bufbuild/protobuf";
-import { EntityKind, OperationMutationSchema, OperationState, RunState, SnapshotScopeSchema, SubmitOperationRequestSchema } from "@joko/contracts";
+import { EntityKind, OperationMutationSchema, OperationState, PromptRecommendationSettingsPatchSchema, RunState, SnapshotScopeSchema,
+  SubmitOperationRequestSchema, UpdatePromptRecommendationSettingsMutationSchema } from "@joko/contracts";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { chromium, type Browser, type Page } from "playwright-core";
@@ -34,6 +35,13 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
         return { kind: "text", text: `Message navigation answer ${requestNumber}` };
       } });
     const manager = await fixture.pair("Message navigation manager");
+    const preferences = await submit(manager.clients.operation, manager.connectionId, create(OperationMutationSchema, {
+      payload: { case: "updatePromptRecommendationSettings", value: create(UpdatePromptRecommendationSettingsMutationSchema, {
+        patch: create(PromptRecommendationSettingsPatchSchema, { enabled: false })
+      }) }
+    }));
+    expect(preferences.state).toBe(OperationState.SUCCEEDED);
+    expect(fixture.application.promptPrediction?.state().enabled).toBe(false);
     const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId, createSessionMutation({
       backendId: "pi", targetId: "workspace-real-pi", displayName: "Original message navigation", providerId: REAL_PI_PROVIDER_ID,
       modelId: REAL_PI_MODEL_ID, effortId: "off"
@@ -178,6 +186,7 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
     expect(store.getSession(sessionId).descriptor.binding).toEqual(binding);
     const historyMarkers = () => store.listEvents({ sessionId }).filter(event => event.payload.type === "native_session_changed").map(event => event.id);
     const markersAfterNewTurn = historyMarkers(), requestsAfterNewTurn = fixture.providerRequests.length;
+    expect(requestsAfterNewTurn - requestsBeforeNewTurn).toBe(1);
     await row(newerSource.messageId).waitFor({ state: "visible", timeout: 30_000 });
     expect(await delayedRow.locator("textarea").isDisabled()).toBe(true);
     const requestsBeforeRelease = fixture.providerRequests.length;

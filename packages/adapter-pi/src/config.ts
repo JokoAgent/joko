@@ -3,6 +3,7 @@ import { chmod, lstat, mkdir, realpath, rename, unlink, writeFile } from "node:f
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { PermissionMode, PolicySubjectKind, ProviderModel } from "@joko/core";
 import { piError } from "./errors.js";
+import { createPiModelCatalogAdditions } from "./model-catalog-additions.js";
 import { isManagedChatModel, isManagedSpeechModel } from "./model-purpose.js";
 
 export type PiSupportedApi =
@@ -323,7 +324,15 @@ export async function provisionManagedCatalog(
       modelOverrides: materializeModelOverrides(provider.modelOverrides, secretEnvironmentNames)
     });
 
-    for (const model of chatModels) coreModels.push(piProviderModel(provider, model));
+    for (const model of chatModels) {
+      const projected = piProviderModel(provider, model);
+      const reference = provider.id !== "xiaomi-token-plan-cn" && provider.apiKeyEnv !== undefined && provider.keyless !== true
+        && model.cost === undefined && model.id === "mimo-v2.6-pro" && projected.api === "openai-completions"
+        ? createPiModelCatalogAdditions().referenceCatalogMetadata({ id: model.id, provider: "xiaomi-token-plan-cn", baseUrl: provider.baseUrl })
+        : undefined;
+      coreModels.push(reference?.cost === undefined || reference.pricing === undefined
+        ? projected : { ...projected, cost: reference.cost, pricing: reference.pricing });
+    }
   }
 
   const managedSettings = compactObject({

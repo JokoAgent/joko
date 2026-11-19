@@ -1273,7 +1273,7 @@ async function readPhysicalRun(
   const [config, owner, status, claim] = await Promise.all([
     readBoundedJson(join(directory, "config.json"), MAX_JSON_BYTES),
     readBoundedJson(join(directory, "owner.json"), MAX_JSON_BYTES),
-    readBoundedJson(join(directory, "status.json"), MAX_JSON_BYTES),
+    readCurrentRunnerStatus(join(directory, "status.json")),
     readBoundedJson(join(directory, "runner.claim.json"), 64 * 1024).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return undefined;
       throw error;
@@ -2030,6 +2030,20 @@ async function decisionOrCancellation(
   });
 }
 
+class ManagedSubagentArtifactChangedError extends Error {
+  constructor() { super("managed Subagent artifact changed while being read"); }
+}
+
+async function readCurrentRunnerStatus(path: string): Promise<unknown> {
+  try { return await readBoundedJson(path, MAX_JSON_BYTES); }
+  catch (error) {
+    // The live runner can atomically publish a heartbeat during the read.
+    // Read the new status once and validate its owner and state as usual.
+    if (!(error instanceof ManagedSubagentArtifactChangedError)) throw error;
+    return readBoundedJson(path, MAX_JSON_BYTES);
+  }
+}
+
 async function readBoundedJson(path: string, maximumBytes: number): Promise<unknown> {
   const before = await lstat(path);
   if (!before.isFile() || before.isSymbolicLink() || before.size > maximumBytes || !samePath(await realpath(path), path)) {
@@ -2038,7 +2052,7 @@ async function readBoundedJson(path: string, maximumBytes: number): Promise<unkn
   const bytes = await readFile(path);
   const after = await stat(path);
   if (!after.isFile() || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
-    throw new Error("managed Subagent artifact changed while being read");
+    throw new ManagedSubagentArtifactChangedError();
   }
   return JSON.parse(bytes.toString("utf8"));
 }
