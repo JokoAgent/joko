@@ -78,9 +78,21 @@ mountedIt("restores the Files visibility preference and keeps a sent file quote 
     expect(await document.getByText(body, { exact: true }).isVisible()).toBe(true);
 
     const editor = document.locator(".cm-content");
-    await editor.click();
-    await editor.press("ControlOrMeta+a");
-    await editor.dispatchEvent("mouseup", { bubbles: true });
+    const line = editor.locator(".cm-line").filter({ hasText: body });
+    await line.scrollIntoViewIfNeeded();
+    const selection = await line.evaluate(element => {
+      const range = element.ownerDocument.createRange();
+      range.selectNodeContents(element);
+      const [first, ...rest] = Array.from(range.getClientRects()).filter(rect => rect.width > 0);
+      if (first === undefined) throw new Error("The workspace file has no rendered text range.");
+      const last = rest.at(-1) ?? first;
+      return { left: first.left + 0.5, top: first.top + first.height / 2, right: last.right - 0.5, bottom: last.top + last.height / 2 };
+    });
+    await page.mouse.move(selection.left, selection.top);
+    await page.mouse.down();
+    await page.mouse.move(selection.right, selection.bottom, { steps: 12 });
+    await page.mouse.up();
+    expect(await page.evaluate(() => window.getSelection()?.toString())).toBe(body);
     await page.locator(".selection-quote-actions").getByRole("button", { name: "Add to chat", exact: true }).click();
     const filesPane = page.locator(".session-pane--files-rail");
     await filesPane.locator(".composer-rich-editor__content [data-selection-quote-chip]").getByText(body, { exact: true }).waitFor();
