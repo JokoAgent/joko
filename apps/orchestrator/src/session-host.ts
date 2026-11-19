@@ -18207,7 +18207,7 @@ export class SessionHost {
         const sourceId = existing?.metadata?.fields[NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD];
         const source = typeof sourceId === "string" ? store.findEvent(sourceId, { includeTombstoned: true })
           : existing === undefined ? observedAssistant : undefined;
-        const inputEntryId = source === undefined ? undefined : observedClaudeAssistantInputEntry(projection, source, claudeEntries);
+        const inputEntryId = source ? observedClaudeAssistantInputEntry(projection, source, claudeEntries) : undefined;
         const adoption = source && source.backendId === session.backendId && source.targetId === session.targetId
           && source.runId !== undefined && store.findRun(source.runId)?.descriptor.source === "user"
           ? adoptObservedNativeAssistant(projection, source, inputEntryId === undefined ? undefined : acceptedQueueInputs.get(inputEntryId), bindingFingerprint)
