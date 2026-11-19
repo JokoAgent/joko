@@ -282,7 +282,13 @@ export class ExtensionOAuthAccounts {
     this.#connecting.add(task); void task.finally(() => this.#connecting.delete(task));
   }
   #markExpired(source: Source, row: ExtensionOAuthAccountRow): void {
-    const saved = this.#state.get(source.scope); this.#state.put(source.scope, { ...saved, accounts: saved.accounts.map(value => value.id === row.id && value.revision === row.revision ? { ...value, status: "expired" } : value) });
+    const saved = this.#state.get(source.scope);
+    const current = saved.accounts.find(value => value.id === row.id && value.revision === row.revision);
+    if (current?.status !== "connected") return;
+    this.options.store.transaction(() => {
+      this.#state.put(source.scope, { ...saved, accounts: saved.accounts.map(value => value === current ? { ...value, status: "expired" } : value) });
+      this.options.store.recordExtensionOAuthChange();
+    });
   }
   async reportInsufficientScopes(capture: ExtensionOAuthCapture, scopes: readonly string[]): Promise<boolean> {
     const source = this.#assert(capture, false);

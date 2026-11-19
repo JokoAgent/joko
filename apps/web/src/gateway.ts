@@ -13,7 +13,9 @@ import { builtinSkillIntentForText, resolveBuiltinSkillDraft } from "./builtin-s
 import { CONTACTS_TOOL_POLICY_ID } from "./contacts-draft.js";
 import { projectProviderGroupRebalance } from "@joko/contracts";
 import { McpAppService, McpAppServiceOperateRequestSchema, McpAppServiceOperateResponseSchema } from "@joko/contracts";
-import { EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER, ExtensionCardService, ExtensionNetworkService, ExtensionOAuthService, ExtensionTaskService, ExtensionOAuthServiceGetFlowRequestSchema, ExtensionOAuthServiceGetFlowResponseSchema, ExtensionAuthorizationPhase } from "@joko/contracts";
+import { EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER, EXTENSION_OAUTH_INVALIDATION_SCOPE, ExtensionCardService, ExtensionNetworkService, ExtensionOAuthService,
+  ExtensionTaskService, ExtensionOAuthServiceGetFlowRequestSchema, ExtensionOAuthServiceGetFlowResponseSchema, ExtensionAuthorizationPhase,
+  SnapshotInvalidationReason } from "@joko/contracts";
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
 import type { McpAppApi } from "./model.js";
 import type { ExtensionProjectView, ExtensionProjectStateView } from "./model.js";
@@ -11755,7 +11757,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           const changedGuestBinding = sharedTask && !duplicate && kind?.case === "sessionChanged" && kind.value.session !== undefined
             && kind.value.session.sessionId === this.#rawSnapshot?.sessions[0]?.sessionId
             && kind.value.session.nativeBinding?.runtimeGeneration !== this.#rawSnapshot?.sessions[0]?.nativeBinding?.runtimeGeneration;
-          const invalidated = kind?.case === "projectionInvalidated" || changedGuestBinding;
+          const invalidated = (kind?.case === "projectionInvalidated" && !isExtensionOAuthInvalidation(event)) || changedGuestBinding;
           const matchedDeletion = this.messageDeletionFromEvent(event);
           const deletionApplied = matchedDeletion?.deletion.applied === "receipt";
           if (matchedDeletion !== undefined) {
@@ -12385,6 +12387,12 @@ export interface EventProjectionResult {
   readonly refresh: "none" | "batched" | "authoritative";
 }
 
+function isExtensionOAuthInvalidation(event: Event): boolean {
+  const kind = event.payload?.kind;
+  return kind?.case === "projectionInvalidated" && kind.value.scope === EXTENSION_OAUTH_INVALIDATION_SCOPE
+    && kind.value.reason === SnapshotInvalidationReason.PROJECTION_REBUILT;
+}
+
 /**
  * Applies one already continuity-checked event to the client projection.
  * Entity events contain complete replacements, while token/tool/status events
@@ -12412,6 +12420,8 @@ export function projectSnapshotEvent(
   const kind = event.payload?.kind;
 
   if (kind?.case === "projectionInvalidated") {
+    if (isExtensionOAuthInvalidation(event)) return { rawSnapshot: raw, snapshot: cursor === undefined ? projected
+      : { ...projected, extensionOAuthRevision: cursor.sequence }, refresh: "none" };
     return { ...retireTimelineHistory(raw, projected, undefined, cursor?.sequence), refresh: "authoritative" };
   }
   if (kind?.case === undefined) {
@@ -14455,6 +14465,7 @@ export function mapSnapshot(
     resources: snapshot.resources.filter((resource) => resource.state !== ResourceState.REMOVED).map(mapResource),
     extensions: snapshot.extensionCatalog?.entries.map(mapExtensionCatalogEntry) ?? [],
     extensionCatalogRevision: snapshot.extensionCatalog?.revision?.value ?? 0n,
+    extensionOAuthRevision: snapshot.resumeCursor?.sequence ?? 0n,
     extensionCatalogRecovered: snapshot.extensionCatalog?.recoveredFromCorruption ?? false,
     commands: snapshot.runtimeCommands.filter((command) => command.loaded).map(mapRuntimeCommand),
     remoteConnections: snapshot.connections.map(mapRemoteConnection),

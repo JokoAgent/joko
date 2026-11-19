@@ -6,10 +6,12 @@ import { afterEach, expect, it, vi } from "vitest";
 import { OperationalStore } from "@joko/store";
 import { createClient, createRouterTransport } from "@connectrpc/connect";
 import { toJsonString } from "@bufbuild/protobuf";
-import { ExtensionOAuthService, ExtensionOAuthStateSchema, ExtensionAuthorizationPhase as Phase, ExtensionAuthorizationFailure as Failure } from "@joko/contracts";
+import { EXTENSION_OAUTH_INVALIDATION_SCOPE, ExtensionOAuthService, ExtensionOAuthStateSchema,
+  ExtensionAuthorizationPhase as Phase, ExtensionAuthorizationFailure as Failure, SnapshotInvalidationReason } from "@joko/contracts";
 import { CredentialManager } from "../credential-manager.js";
 import { CredentialVault } from "../credential-vault.js";
 import { ExtensionCatalogManager } from "../extension-catalog.js";
+import { toProtoEvent } from "../proto-mapper.js";
 import type { PiResourceDescriptor } from "../resource-manager.js";
 import { parseExtensionRuntime } from "../extension-surface-manifest.js";
 import { ExtensionOAuthAccounts } from "./oauth-accounts.js";
@@ -109,10 +111,18 @@ it("coalesces refreshes, persists rotated tokens and rechecks a concurrent rotat
 
 it("marks a confirmed invalid grant expired without exposing provider text or deleting another account", async () => {
   const f = await fixture(); await f.connect("one@example.test"); const state = await f.connect("two@example.test");
+  const extension = f.catalog.get(f.entry.id), runtimeIdentity = f.manager.identity(extension.id, "account");
   const first = state.slots[0]!.accounts[0]!, secondReference = f.saved().accounts[1]!.refreshReference!, preserved = f.credentials.resolve(secondReference);
   f.manager.invalidate(f.entry.id, "account", first.id); f.provider(async () => new Response('{"error":"invalid_grant","error_description":"provider-private-text"}', { status: 400 }));
   expect(await f.manager.fresh(f.entry.id, "account", f.declaration(), first.id)).toEqual({ ok: false, error: "AUTH_EXPIRED" });
   expect(f.manager.get(f.entry.id).slots[0]!.accounts[0]!.status).toBe("expired"); expect(f.credentials.resolve(secondReference)).toBe(preserved);
+  expect(f.catalog.get(extension.id).revision).toBe(extension.revision);
+  expect(f.manager.identity(extension.id, "account")).toBe(runtimeIdentity);
+  expect(await f.manager.fresh(extension.id, "account", f.declaration(), first.id)).toEqual({ ok: false, error: "AUTH_EXPIRED" });
+  const events = f.store.listEvents({}).filter(event => event.payload.type === "extension_oauth_changed");
+  expect(events).toMatchObject([{ sessionId: "", backendId: "", payload: { type: "extension_oauth_changed" } }]);
+  expect(toProtoEvent(events[0]!).payload?.kind).toMatchObject({ case: "projectionInvalidated",
+    value: { scope: EXTENSION_OAUTH_INVALIDATION_SCOPE, reason: SnapshotInvalidationReason.PROJECTION_REBUILT } });
 });
 
 it("tracks new full scopes and real evidence while preserving intentionally reduced authorization", async () => {

@@ -3061,6 +3061,10 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
       return protoPayload("deviceChanged", message<contract.DeviceChangedEvent>("joko.v1.DeviceChangedEvent", {
         device: toProtoDeviceContent(payload.device)
       }));
+    case "extension_oauth_changed":
+      return protoPayload("projectionInvalidated", message<contract.ProjectionInvalidatedEvent>("joko.v1.ProjectionInvalidatedEvent", {
+        reason: contract.SnapshotInvalidationReason.PROJECTION_REBUILT, scope: contract.EXTENSION_OAUTH_INVALIDATION_SCOPE
+      }));
     case "run_state": {
       if (context.run === undefined) throw missingPayload("event.context.run");
       if (context.target === undefined) throw missingPayload("event.context.target");

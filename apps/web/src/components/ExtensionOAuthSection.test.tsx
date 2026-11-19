@@ -3,7 +3,7 @@ import { StrictMode } from "react";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { ExtensionOAuthStateSchema, ExtensionOAuthServiceGetResponseSchema } from "@joko/contracts";
+import { ExtensionOAuthAccountSchema, ExtensionOAuthStateSchema, ExtensionOAuthServiceGetResponseSchema } from "@joko/contracts";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import type { ExtensionCatalogEntryView, ExtensionOAuthApi } from "../model.js";
@@ -19,11 +19,33 @@ async function render(patch: Partial<ExtensionOAuthApi> = {}) {
   const current = state(), api: ExtensionOAuthApi = { canAuthorize: true, get: async () => create(ExtensionOAuthServiceGetResponseSchema, { state: current }), change: vi.fn(), saveClient: vi.fn(), authorize: vi.fn(), ...patch };
   const container = document.createElement("div"); document.body.append(container); const root = createRoot(container); roots.push(root);
   const controller = { extensionOAuthApi: () => api } as unknown as AppController, onChanged = vi.fn(async () => {});
-  await act(async () => root.render(<StrictMode><ExtensionOAuthSection controller={controller} extension={{ id: "extension-one", revision: 1n } as ExtensionCatalogEntryView} disabled={false} t={(key, values) => translate("en", key, values)} onChanged={onChanged} /></StrictMode>));
-  return { container, root, onChanged };
+  const extension = { id: "extension-one", revision: 1n } as ExtensionCatalogEntryView;
+  const renderRevision = (oauthRevision: bigint) => act(async () => root.render(<StrictMode><ExtensionOAuthSection controller={controller} extension={extension}
+    oauthRevision={oauthRevision} disabled={false} t={(key, values) => translate("en", key, values)} onChanged={onChanged} /></StrictMode>));
+  await renderRevision(0n);
+  return { container, root, onChanged, renderRevision };
 }
 function button(container: ParentNode, label: string) { const found = [...container.querySelectorAll("button")].find(button => button.textContent === label); if (!found) throw new Error("Missing button"); return found; }
 function input(container: ParentNode, index: number, value: string) { const field = container.querySelectorAll(".extension-network__form input")[index]!; Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(field, value); field.dispatchEvent(new Event("input", { bubbles: true })); }
+
+it("shows the original account's expiry while its settings stay mounted", async () => {
+  let expired = false;
+  const get = vi.fn<ExtensionOAuthApi["get"]>(async () => {
+    const accountState = state();
+    accountState.slots[0]!.accounts = [create(ExtensionOAuthAccountSchema, { accountId: "original-account", label: "Original account", isDefault: true, expired })];
+    return create(ExtensionOAuthServiceGetResponseSchema, { state: accountState });
+  });
+  const { container, renderRevision, onChanged } = await render({ get });
+  const originalRow = container.querySelector(".extension-network__row");
+  expect(originalRow?.textContent).toContain(translate("en", "extensions.oauth.connected"));
+  const reads = get.mock.calls.length;
+  expired = true;
+  await renderRevision(1n);
+  expect(container.querySelector(".extension-network__row")).toBe(originalRow);
+  expect(originalRow?.textContent).toContain(translate("en", "extensions.oauth.expired"));
+  expect(get).toHaveBeenCalledTimes(reads + 1);
+  expect(onChanged).not.toHaveBeenCalled();
+});
 
 it("retains failed client configuration without replaying it and clears private input after an explicit successful save", async () => {
   let fail = true;

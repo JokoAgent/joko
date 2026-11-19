@@ -157,6 +157,8 @@ export type EventPayload =
   | { readonly type: "run_state"; readonly state: RunState; readonly error?: PublicError; readonly usage?: RunUsageSummary }
   /** Store-owned observation; never emitted by a Session adapter. */
   | { readonly type: "device_changed"; readonly device: DeviceContentProjection }
+  /** Content-free owner notification after plugin OAuth settings change. */
+  | { readonly type: "extension_oauth_changed" }
   /** Content-free signal that the durable Session projection changed. */
   | { readonly type: "session_changed" }
   /** Immutable owner catalog snapshot after a committed label mutation. */

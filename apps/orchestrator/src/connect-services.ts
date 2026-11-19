@@ -7940,7 +7940,7 @@ function eventContext(
   item: PersistedEvent,
   dependencies: ConnectServiceDependencies
 ): EventMappingContext {
-  if (item.payload.type === "device_changed") return {};
+  if (item.payload.type === "device_changed" || item.payload.type === "extension_oauth_changed") return {};
   const store = dependencies.store;
   let session: StoredSession | undefined;
   let target: StoredTarget | undefined;
@@ -8000,8 +8000,8 @@ function eventContext(
 }
 
 function eventMatchesScope(item: PersistedEvent, scope: contract.SnapshotScope | undefined, dependencies: ConnectServiceDependencies): boolean {
-  if (item.payload.type === "device_changed") return scope?.kind.case === undefined || scope.kind.case === "owner";
-  if (item.payload.type === "task_tag_catalog_changed") return scope?.kind.case === undefined || scope.kind.case === "owner";
+  if (item.payload.type === "device_changed" || item.payload.type === "task_tag_catalog_changed"
+    || item.payload.type === "extension_oauth_changed") return scope?.kind.case === undefined || scope.kind.case === "owner";
   if (scope?.kind.case !== "session" && dependencies.partnerGroupRuntime?.isGroupSession(item.sessionId) === true) return false;
   switch (scope?.kind.case) {
     case undefined:
