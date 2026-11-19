@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { ExtensionLibraryCallResultSchema, ExtensionLibrarySessionSchema, ExtensionLibraryStreamResultSchema } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -188,6 +189,28 @@ describe("Mobile Library wire and authority", () => {
     finish(session);
     await vi.waitFor(() => expect(active.transport.closeLibrary).toHaveBeenCalledWith(session));
     expect(active.replies).toEqual([]);
+  });
+
+  it("returns the definite no-overwrite rejection and keeps the current Library session usable", async () => {
+    const active = harness();
+    vi.mocked(active.transport.callLibrary).mockRejectedValueOnce(new ConnectError("Library file already exists.", Code.AlreadyExists));
+    const write = { kind: "write", path: "already.txt", content: Uint8Array.of(1), ifNotExists: true };
+    active.send("already-exists", write);
+    await vi.waitFor(() => expect(active.replies[0]?.response).toMatchObject({
+      id: "already-exists", ok: false, error: { code: "ALREADY_EXISTS" }
+    }));
+    active.send("status-after-conflict", { kind: "status" });
+    active.send("read-original", { kind: "read", path: "already.txt" });
+    await vi.waitFor(() => expect(active.replies).toHaveLength(3));
+    expect(active.replies.slice(1).map(({ response }) => response)).toMatchObject([
+      { id: "status-after-conflict", ok: true, result: { state: "ready" } },
+      { id: "read-original", ok: true, result: { path: "already.txt", content: Uint8Array.of(0, 128, 255) } }
+    ]);
+    expect(active.transport.openLibrary).toHaveBeenCalledOnce();
+    expect(active.transport.callLibrary).toHaveBeenCalledTimes(2);
+    expect(active.transport.callLibrary).toHaveBeenNthCalledWith(1, extension, surface, session, write, expect.any(AbortSignal));
+    expect(active.transport.callLibrary).toHaveBeenLastCalledWith(extension, surface, session, { kind: "read", path: "already.txt" }, expect.any(AbortSignal));
+    expect(active.transport.closeLibrary).not.toHaveBeenCalled();
   });
 
   it("reports lost responses once, closes the lease, and fences queued or later writes", async () => {

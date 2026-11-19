@@ -74,6 +74,14 @@ describe("production Extension Library chain", () => {
       value: { path: "notes/owner.txt", content: text, ifNotExists: true }
     });
     expect(written.result).toMatchObject({ case: "write", value: { path: "notes/owner.txt", bytes: BigInt(text.byteLength) } });
+    await expect(libraryCall(paired.clients.extension, sessionId, {
+      case: "write",
+      value: { path: "notes/owner.txt", content: new TextEncoder().encode("replacement"), ifNotExists: true }
+    })).rejects.toMatchObject({ code: Code.AlreadyExists });
+    const original = await libraryCall(paired.clients.extension, sessionId, {
+      case: "read", value: { path: "notes/owner.txt" }
+    });
+    expect(original.result).toMatchObject({ case: "read", value: { path: "notes/owner.txt", content: text } });
 
     const streamed = new TextEncoder().encode("streamed payload");
     const begun = await libraryCall(paired.clients.extension, sessionId, {

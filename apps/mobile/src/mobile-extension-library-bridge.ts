@@ -1,4 +1,5 @@
 import { base64Decode, base64Encode } from "@bufbuild/protobuf/wire";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { readExtensionLibraryVideo } from "@joko/connection-transport";
 import {
   allowMobileExtensionMainViewNavigation,
@@ -123,7 +124,12 @@ export class MobileExtensionLibraryBridge {
     });
     void Promise.race([work, timeout, cancelled]).then((result) => {
       this.#respond(request.id, { ok: true, result });
-    }, () => {
+    }, (error: unknown) => {
+      if (dispatched && !abort.signal.aborted && error instanceof ConnectError && error.code === Code.AlreadyExists
+        && request.command.kind === "call" && request.command.call.kind === "write" && request.command.call.ifNotExists === true) {
+        this.#respond(request.id, { ok: false, error: { code: "ALREADY_EXISTS", message: "Extension Library target already exists." } });
+        return;
+      }
       if (dispatched) {
         this.#faulted = true;
         this.#retireSession();
