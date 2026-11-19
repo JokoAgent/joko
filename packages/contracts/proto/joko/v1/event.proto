@@ -416,6 +416,15 @@ message MessageCompletedEvent {
   // Joined from the exact durable Run summary; per-message generation usage stays separate.
   RunUsageSummary turn_usage = 14;
   SharedTaskAuthor shared_task_author = 15;
+  // The service-authored opening for a newly imported Partner package.
+  PartnerPackageOpening partner_package_opening = 16;
+}
+
+message PartnerPackageOpening {
+  string greeting = 1;
+  repeated string starter_options = 2;
+  // The original task still accepts its first user input.
+  bool starter_available = 3;
 }
 
 message ModelSubstitution {

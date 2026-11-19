@@ -883,6 +883,8 @@ message SendInputMutation {
   // For an explicit edit and resend, rewind this original latest user message
   // before admitting the replacement prompt under the same Operation.
   MessageEdit message_edit = 6;
+  // An explicit selection from this task's service-authored Partner opening.
+  optional string partner_starter_event_id = 7;
 
   message MessageEdit {
     string source_message_id = 1;

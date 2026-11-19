@@ -178,6 +178,7 @@ const TimelinePartnerDelegationContext = createContext<PartnerDelegationCardActi
 
 interface TimelinePersonalizationContextValue {
   readonly onSendRichAnswer?: (text: string, receiptKey: string) => Promise<boolean>;
+  readonly onSendPartnerStarter?: (text: string, eventId: string) => Promise<boolean>;
   readonly ownerKey: string;
   readonly answerStateOwnerKey?: string;
   readonly locale?: string;
@@ -249,8 +250,9 @@ interface TimelineMessageEditDraft {
   readonly draft: UserMessageEditDraft;
 }
 
-export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSendRichAnswer, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, unloadedGapBefore, historyLoading, historyError, historyOwnerKey, historyDeletion, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onAskSideChat, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, messageEdit, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange, onRootChange }: {
+export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSendRichAnswer, onSendPartnerStarter, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, unloadedGapBefore, historyLoading, historyError, historyOwnerKey, historyDeletion, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onAskSideChat, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, messageEdit, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange, onRootChange }: {
   readonly onSendRichAnswer?: (text: string, receiptKey: string) => Promise<boolean>;
+  readonly onSendPartnerStarter?: (text: string, eventId: string) => Promise<boolean>;
   readonly ownerKey: string;
   readonly viewportOwnerKey: string;
   readonly answerStateOwnerKey?: string;
@@ -453,6 +455,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     ownerKey,
     answerStateOwnerKey,
     onSendRichAnswer,
+    onSendPartnerStarter: items.some(item => item.kind === "user") ? undefined : onSendPartnerStarter,
     locale,
     streamFadeEnabled,
     reducedMotion,
@@ -464,7 +467,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     ...(onOpenWorkspaceHtml === undefined ? {} : { onOpenWorkspaceHtml }),
     ...(onLoadWorkspaceAsset === undefined ? {} : { onLoadWorkspaceAsset }),
     ...(onWorkspaceImageToComposer === undefined ? {} : { onWorkspaceImageToComposer })
-  }), [items, onLoadWorkspaceAsset, mailLinkContext, onOpenWorkspaceHtml, onWorkspaceImageToComposer, onReadArtifact, workspaceId, ownerKey, answerStateOwnerKey, onSendRichAnswer, locale, reducedMotion, sessionId, streamFadeEnabled]);
+  }), [items, onLoadWorkspaceAsset, mailLinkContext, onOpenWorkspaceHtml, onWorkspaceImageToComposer, onReadArtifact, workspaceId, ownerKey, answerStateOwnerKey, onSendRichAnswer, onSendPartnerStarter, locale, reducedMotion, sessionId, streamFadeEnabled]);
   const subagentContext = useMemo<TimelineSubagentContextValue>(() => ({
     runs: subagentRuns ?? new Map(),
     details: subagentRunDetails ?? new Map(),
@@ -1634,7 +1637,8 @@ function TimelineBlock({ sessionId, sessionName, item, planAnimated = false, ret
   switch (item.kind) {
     case "user": return <MessageBlock sessionId={sessionId} sessionName={sessionName} item={item} role="user" locale={locale} reducedMotion={reducedMotion} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} onAddMessageToComposer={onAddMessageToComposer} onForkMessage={onForkMessage} forking={forkingMessageId === item.id} shareSelection={shareSelection} onStartShareSelection={onStartShareSelection} onToggleShareMessage={onToggleShareMessage} editDraft={editDraft} editable={messageEdit?.messageId === item.id} stopRunningToEdit={messageEdit?.stopRunning}
       editBlockedReason={messageEdit?.blockedReason ?? (editDraft !== undefined && messageEdit?.messageId !== item.id ? t("timeline.editStale") : undefined)} onEdit={onEditMessage} onCancelEdit={onCancelEditMessage} onSubmitEdit={onSubmitEdit} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} showActions={showMessageActions} />;
-    case "assistant": return <MessageBlock sessionId={sessionId} sessionName={sessionName} item={item} role="assistant" locale={locale} reducedMotion={reducedMotion} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} onAddMessageToComposer={onAddMessageToComposer} onForkMessage={onForkMessage} forking={forkingMessageId === item.id} shareSelection={shareSelection} onStartShareSelection={onStartShareSelection} onToggleShareMessage={onToggleShareMessage} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} showActions={showMessageActions} />;
+    case "assistant": return <><MessageBlock sessionId={sessionId} sessionName={sessionName} item={item} role="assistant" locale={locale} reducedMotion={reducedMotion} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} onAddMessageToComposer={onAddMessageToComposer} onForkMessage={onForkMessage} forking={forkingMessageId === item.id} shareSelection={shareSelection} onStartShareSelection={onStartShareSelection} onToggleShareMessage={onToggleShareMessage} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} showActions={showMessageActions} />
+      {shareSelection === undefined && item.partnerPackageOpening !== undefined && <PartnerPackageStarters key={item.sourceEventId} item={item} t={t} />}</>;
     case "thinking": return <ThinkingBlock item={item} locale={locale} t={t} />;
     case "tool": return <ToolBlock item={item} locale={locale} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} />;
     case "toolResult": return <ToolBlock item={item} locale={locale} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} />;
@@ -1679,6 +1683,28 @@ const REVIEW_FAILURE_KEY: Record<NonNullable<NonNullable<TimelineItemView["revie
   "artifact-unavailable": "review.failure.artifactUnavailable",
   "provider-failed": "review.failure.providerFailed"
 };
+
+function PartnerPackageStarters({ item, t }: { readonly item: TimelineItemView; readonly t: Translator }): JSX.Element | null {
+  const { onSendPartnerStarter } = useContext(TimelinePersonalizationContext);
+  const searchOnly = useContext(TimelineSearchOnly);
+  const [state, setState] = useState<"ready" | "sending" | "sent" | "failed">("ready");
+  const sending = useRef(false);
+  const opening = item.partnerPackageOpening, eventId = item.sourceEventId;
+  if (searchOnly || !opening?.starterAvailable || !eventId || !onSendPartnerStarter || state === "sent") return null;
+  const choose = async (text: string) => {
+    if (sending.current) return;
+    sending.current = true;
+    setState("sending");
+    try { setState(await onSendPartnerStarter(text, eventId) ? "sent" : "failed"); }
+    catch { setState("failed"); }
+    finally { sending.current = false; }
+  };
+  return <div className="partner-opening-options" role="group" aria-label={t("partners.openingStarterOptions")} aria-busy={state === "sending"}>
+    {opening.starterOptions.map((option, index) => <Button key={index} type="button" disabled={state === "sending"}
+      onClick={() => void choose(option)}>{option}</Button>)}
+    {state === "failed" && <p className="inline-error" role="alert">{t("partners.openingStarterFailed")}</p>}
+  </div>;
+}
 
 export function ReviewCard({ item, t, onReobserveReview }: { readonly item: TimelineItemView; readonly t: Translator; readonly onReobserveReview?: (reviewRunId: string) => Promise<void> }): JSX.Element {
   const [reobserving, setReobserving] = useState(false);

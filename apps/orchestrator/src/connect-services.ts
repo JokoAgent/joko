@@ -45,7 +45,7 @@ import { workspaceMediaTypeForPath as mediaTypeForPath } from "./workspace-file-
 import { listProjectDirectories } from "./project-directory-browser.js";
 import type { ExtensionProjectPolicies, ExtensionProject } from "./extension-project-policy.js";
 import { inspectRemoteHostDirectory, validateRemoteHostDirectoryPath } from "./remote-host-directory-browser.js";
-import { fromBinary, toBinary } from "@bufbuild/protobuf";
+import { equals, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError, type ConnectRouter, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
 import { issueAuthorizedIrohRelayInvitation } from "./linkspan-iroh-lease.js";
 import {
@@ -488,6 +488,7 @@ import { PartnerMemoryManager } from "./partner-memory.js";
 import { createPartnerRoutineConnectService } from "./partner-routine-connect-service.js";
 import { createPartnerGroupConnectService } from "./partner-group-connect-service.js";
 import { createPartnerImportConnectService } from "./partner-import-connect-service.js";
+import { partnerPackageOpeningFromEvent, partnerPackageStarterAvailable } from "./partner-package-opening.js";
 import { createPartnerHomeConnectService } from "./partner-home-connect-service.js";
 import { isPartnerRoutineSchedule } from "./partner-routine-schedule.js";
 import { createCollaborationConnectService } from "./collaboration-connect-service.js";
@@ -554,6 +555,7 @@ export interface ConnectServiceDependencies {
   readonly sessionHost: SessionHost;
   readonly sessionWorktrees?: SessionWorktreeCoordinator;
   readonly isPartnerCanonicalTask?: (sessionId: string) => boolean;
+  readonly isPartnerStarterTaskActive?: (sessionId: string) => boolean;
   readonly personalDevelopment?: () => OrchestratorApplication["personalDevelopmentCoordinator"];
   readonly assertPersonalDevelopmentLocalConnection?: (connection: ConnectionRecord) => void;
   readonly runtimeActivity?: RuntimeActivityTracker;
@@ -1367,6 +1369,10 @@ export function createConnectServices(application: OrchestratorApplication, proj
     sessionHost: application.sessionHost,
     sessionWorktrees: application.sessionWorktrees,
     isPartnerCanonicalTask: sessionId => application.partners?.isCanonicalTask(sessionId) === true,
+    isPartnerStarterTaskActive: sessionId => {
+      try { return application.partners?.canonicalCaller(sessionId) !== undefined; }
+      catch { return false; }
+    },
     personalDevelopment: () => application.personalDevelopmentCoordinator,
     assertPersonalDevelopmentLocalConnection: connection => {
       if (application.personalDevelopmentNativeBroker === undefined) throw new ConnectError("Personal development is unavailable.", Code.Unavailable);
@@ -7963,6 +7969,7 @@ function eventContext(
         runtimeModel: dependencies.sessionHost.getSessionRuntimeControl(session.descriptor.id).effective
       })
     : undefined;
+  const opening = partnerPackageOpeningFromEvent(item);
   return {
     ...(session?.descriptor.derivationOrigin?.sideChat === true && !sideChatHistoryEventVisible(session.descriptor, item,
       readSideChatHistoryBoundary(store, session.descriptor)) ? { hideSideChatHistoryPrefix: true as const } : {}),
@@ -7970,6 +7977,10 @@ function eventContext(
     ...(item.payload.type !== "message_complete" || item.payload.role !== "assistant" ? {} : {
       learning: store.getPartnerLearningFeedback(item.id)
     }),
+    ...(opening === undefined ? {} : { partnerPackageOpening: { ...opening, starterAvailable:
+      session?.descriptor.binding.generation === item.generation
+      && dependencies.isPartnerStarterTaskActive?.(item.sessionId) === true
+      && partnerPackageStarterAvailable(store, item.sessionId) } }),
     ...(session === undefined ? {} : { session }),
     ...(target === undefined ? {} : { target }),
     ...(run === undefined ? {} : { run, attempts: store.listAttempts(run.descriptor.id) }),
@@ -18340,6 +18351,14 @@ async function dispatchMutation(
       const disposition = deliveryMode(payload.value.deliveryMode);
       const prompt = fromProtoInputContent(payload.value.input, disposition);
       const overrides = coreTurnOverrides(payload.value.overrides);
+      const starterEventId = payload.value.partnerStarterEventId === undefined ? undefined
+        : strictDerivationIdentity(payload.value.partnerStarterEventId, "send_input.partner_starter_event_id");
+      if (starterEventId !== undefined && (disposition !== "prompt" || payload.value.messageEdit !== undefined
+        || payload.value.providerGroupRebalance !== undefined || payload.value.overrides !== undefined
+        || payload.value.input === undefined || !equals(contract.InputContentSchema, payload.value.input, create(contract.InputContentSchema,
+          { parts: [{ content: { case: "text", value: prompt.text } }] })))) {
+        throw invalidArgument("Select one exact plain-text option from the original Partner opening.");
+      }
       const finish = (execution: OperationExecution<OperationOutcome>) => {
         if (!execution.replayed && execution.value.accepted) {
           host.drainQueuedInput(payload.value.sessionId);
@@ -18367,6 +18386,7 @@ async function dispatchMutation(
       }
       const needsWorkspaceRestore = dependencies.store.getSession(payload.value.sessionId).descriptor.archived
         && dependencies.store.getSession(payload.value.sessionId).descriptor.worktree?.state === "preserved";
+      if (starterEventId !== undefined && needsWorkspaceRestore) throw new ConnectError("The original Partner opening is no longer available.", Code.FailedPrecondition);
       const execution = await host.mutate({
         operationId,
         connection,
@@ -18383,6 +18403,16 @@ async function dispatchMutation(
           }
         } : {}),
         commit: (store) => {
+          if (starterEventId !== undefined) {
+            const event = store.findEvent(starterEventId);
+            const opening = partnerPackageOpeningFromEvent(event);
+            if (!event || !opening?.starterOptions.includes(prompt.text) || event.sessionId !== payload.value.sessionId
+              || event.generation !== Number(generation) || dependencies.isPartnerStarterTaskActive?.(event.sessionId) !== true
+              || !partnerPackageStarterAvailable(store, event.sessionId)) {
+              throw new JokoError({ code: "PARTNER_STARTER_UNAVAILABLE", message: "The original Partner opening is no longer available.",
+                phase: "admission", retryable: false, stateMayHaveChanged: false, recovery: "Refresh the original task to see its current input options." });
+            }
+          }
           const queued = host.commitQueuedInput(store, {
             operationId,
             sessionId: payload.value.sessionId,

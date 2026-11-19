@@ -690,6 +690,38 @@ describe("Timeline viewport journeys", () => {
   });
 });
 
+it("sends a Partner opening option only on a click and hides starters after admission or user input", async () => {
+  extent = 160;
+  const eventId = `import-message-${"a".repeat(64)}`;
+  const opening: TimelineItemView = { ...item(eventId, 1, "assistant"), sourceEventId: eventId, text: "Where should we start?",
+    partnerPackageOpening: { starterOptions: ["Review code", "Plan delivery"], starterAvailable: true } };
+  let settle!: (sent: boolean) => void;
+  const send = vi.fn<NonNullable<TimelineProps["onSendPartnerStarter"]>>(async () => true)
+    .mockImplementationOnce(() => new Promise(resolve => { settle = resolve; }));
+  const buttons = () => Array.from(host.querySelectorAll<HTMLButtonElement>(".partner-opening-options button"));
+  await render({ sessionActive: false, items: [opening] });
+  await flushFrames();
+  expect(buttons()).toHaveLength(0);
+  await render({ onSendPartnerStarter: send });
+  expect(buttons().map(button => button.textContent)).toEqual(["Review code", "Plan delivery"]);
+  expect(send).not.toHaveBeenCalled();
+  await act(async () => { buttons()[0]!.click(); buttons()[1]!.click(); });
+  expect(send).toHaveBeenCalledExactlyOnceWith("Review code", eventId);
+  expect(buttons().every(button => button.disabled)).toBe(true);
+  await act(async () => settle(false));
+  expect(host.querySelector(".partner-opening-options [role=alert]")?.textContent).toBe("partners.openingStarterFailed");
+  await act(async () => buttons()[1]!.click());
+  expect(send).toHaveBeenLastCalledWith("Plan delivery", eventId);
+  expect(buttons()).toHaveLength(0);
+
+  const next = { ...opening, id: "another-opening", sourceEventId: `import-message-${"b".repeat(64)}` };
+  await render({ items: [next, item("already-sent", 2, "user")] });
+  expect(buttons()).toHaveLength(0);
+  await render({ items: [{ ...next, partnerPackageOpening: { ...opening.partnerPackageOpening!, starterAvailable: false } }] });
+  expect(buttons()).toHaveLength(0);
+  expect(send).toHaveBeenCalledTimes(2);
+});
+
 async function render(update: Partial<TimelineProps> = {}): Promise<void> {
   props = { ...props, ...update };
   await act(async () => root.render(<Timeline {...props} />));

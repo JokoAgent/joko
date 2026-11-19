@@ -17,9 +17,11 @@ import { GAMEPAD_SKILL_EVENT } from "../gamepad-client.js";
 import { emptySnapshot, type BackendView, type ComposerDraft, type SessionView } from "../model.js";
 import { SessionPane } from "./SessionPane.js";
 
-const timelineHost = vi.hoisted(() => ({ send: undefined as undefined | ((text: string, key: string) => Promise<boolean>) }));
-vi.mock("./Timeline.js", () => ({ Timeline: (props: { onSendRichAnswer?: (text: string, key: string) => Promise<boolean> }) => {
-  timelineHost.send = props.onSendRichAnswer; return null;
+const timelineHost = vi.hoisted(() => ({ send: undefined as undefined | ((text: string, key: string) => Promise<boolean>),
+  starter: undefined as undefined | ((text: string, eventId: string) => Promise<boolean>) }));
+vi.mock("./Timeline.js", () => ({ Timeline: (props: { onSendRichAnswer?: (text: string, key: string) => Promise<boolean>;
+  onSendPartnerStarter?: (text: string, eventId: string) => Promise<boolean> }) => {
+  timelineHost.send = props.onSendRichAnswer; timelineHost.starter = props.onSendPartnerStarter; return null;
 } }));
 const editorState = vi.hoisted(() => ({ caret: 0 }));
 vi.mock("./composer-inline-mention.js", async importOriginal => ({
@@ -48,6 +50,16 @@ beforeEach(() => { editorState.caret = 0; vi.stubGlobal("IS_REACT_ACT_ENVIRONMEN
 afterEach(async () => { for (const root of roots.splice(0)) await act(async () => root.unmount()); for (const disconnect of disconnects.splice(0)) disconnect(); document.body.replaceChildren(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe("SessionPane loaded Skill input composition", () => {
+  it("sends a selected opening against the original task and completion event", async () => {
+    const view = await mount();
+    const chosen = required(timelineHost.starter), eventId = `import-message-${"a".repeat(64)}`;
+    expect(await chosen("Review code", eventId)).toBe(true);
+    expect(view.api.sendRichAnswer).toHaveBeenCalledExactlyOnceWith("task", 1n, eventId, "Review code", expect.any(AbortSignal), eventId);
+    await view.render(session(2n));
+    expect(await chosen("Plan delivery", eventId)).toBe(false);
+    expect(view.api.sendRichAnswer).toHaveBeenCalledOnce();
+  });
+
   it("preserves the composer and retires the original rich-answer sender when the task generation changes", async () => {
     const view = await mount(false, { initial: { text: "Unfinished draft", mentions: [], inlineMentionRanges: [], attachments: [], deliveryMode: "prompt" } });
     const send = required(timelineHost.send);

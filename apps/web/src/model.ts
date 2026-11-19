@@ -1632,6 +1632,7 @@ export interface TimelineItemView {
   readonly personalDevelopmentReport?: PersonalDevelopmentDoctorRun;
   readonly personalDevelopmentTask?: PersonalDevelopmentTask;
   readonly learning?: PartnerLearningFeedbackView;
+  readonly partnerPackageOpening?: { readonly starterOptions: readonly string[]; readonly starterAvailable: boolean };
   readonly id: string;
   /** Owning completed/streaming message when one message projects multiple blocks. */
   readonly messageId?: string;
@@ -6371,7 +6372,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
     readonly messageEdit?: MessageEditRequest & { readonly assertCurrent: () => void };
   }): Promise<void>;
   confirmMessageEdit(sessionId: string, expectedGeneration: bigint, edit: MessageEditRequest): Promise<boolean>;
-  sendRichAnswer(sessionId: string, expectedGeneration: bigint, receiptKey: string, text: string, signal?: AbortSignal): Promise<boolean>;
+  sendRichAnswer(sessionId: string, expectedGeneration: bigint, receiptKey: string, text: string, signal?: AbortSignal, partnerStarterEventId?: string): Promise<boolean>;
   startReview(sourceSessionId: string, focus: string, attachments: readonly AttachmentDraft[]): Promise<string>;
   reobserveReview(reviewRunId: string): Promise<void>;
   abort(runId: string, messageEdit?: { readonly sessionId: string; readonly expectedGeneration: bigint;
