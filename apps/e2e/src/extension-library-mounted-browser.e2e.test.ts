@@ -90,6 +90,32 @@ describe("mounted Extension Library main-view bridge", () => {
       .toBeLessThanOrEqual(1);
     expect(browserErrors).toEqual([]);
 
+    let resumeImageResponse!: () => void;
+    const imageResponseGate = new Promise<void>(resolve => { resumeImageResponse = resolve; });
+    const imageUrl = "**/preview.png";
+    await page.route(imageUrl, async route => {
+      await imageResponseGate;
+      await route.continue();
+    });
+    const preview = frame.locator("#preview-image");
+    try {
+      const [imageRequest] = await Promise.all([
+        page.waitForRequest(imageUrl, { timeout: 10_000 }),
+        frame.getByRole("button", { name: "Show preview" }).click()
+      ]);
+      expect(imageRequest.method()).toBe("GET");
+      await frame.getByRole("button", { name: "Clear preview" }).click();
+      expect(await preview.evaluate(element => element.hasAttribute("src"))).toBe(false);
+      resumeImageResponse();
+      await waitFor(() => preview.getAttribute("data-resource-received"), value => value === "true",
+        "the successful delayed image response", 10_000);
+      expect(await preview.getAttribute("src")).toBeNull();
+      expect(await preview.evaluate(element => element.hasAttribute("src"))).toBe(false);
+    } finally {
+      resumeImageResponse();
+      await page.unroute(imageUrl);
+    }
+
     const video = await result.evaluate(async () => {
       const element = document.createElement("video");
       element.preload = "none";

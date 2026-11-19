@@ -76,6 +76,7 @@ function installExtensionResources(sourceSet: typeof extensionSourceSet): void {
   };
   addEventListener("message", receive); if (native) document.addEventListener("message", receive as EventListener);
   const originalSet = Element.prototype.setAttribute, originalGet = Element.prototype.getAttribute;
+  const originalRemove = Element.prototype.removeAttribute;
   const watched = (element: Element, name: string): boolean => name === "src" && ["IMG", "AUDIO", "VIDEO", "SOURCE", "INPUT", "SCRIPT"].includes(element.tagName)
     || name === "poster" && element.tagName === "VIDEO" || name === "srcset" && ["IMG", "SOURCE"].includes(element.tagName)
     || name === "href" && element.tagName === "LINK" && ["", "stylesheet"].includes(originalGet.call(element, "rel")?.toLowerCase() ?? "");
@@ -91,11 +92,13 @@ function installExtensionResources(sourceSet: typeof extensionSourceSet): void {
     if (loading === undefined) { loading = code("module", url).then(dataUrl => import(dataUrl + url.hash)); imported.set(url.href, loading); }
     return loading;
   });
+  const releaseObjectUrls = (values: Set<string> | undefined): void => {
+    for (const value of values ?? []) { URL.revokeObjectURL(value); urls.delete(value); }
+  };
   const set = (element: Element, name: string, raw: string, apply: (value: string) => void): void => {
     let entries = sources.get(element); if (entries === undefined) { entries = new Map(); sources.set(element, entries); }
     const previous = entries.get(name), entry = { raw, revision: (previous?.revision ?? 0) + 1, objectUrls: previous?.objectUrls, applied: previous?.applied };
     const created = new Set<string>();
-    const release = (values: Set<string> | undefined) => { for (const value of values ?? []) { URL.revokeObjectURL(value); urls.delete(value); } };
     entries.set(name, entry);
     const current = () => sources.get(element)?.get(name) === entry;
     const kind = element.tagName === "SCRIPT" ? originalGet.call(element, "type") === "module" ? "module" : "script" : element.tagName === "LINK" ? "style" : "media";
@@ -114,11 +117,11 @@ function installExtensionResources(sourceSet: typeof extensionSourceSet): void {
     };
     const task = name === "srcset" ? Promise.all(sourceSet(raw).map(async candidate => `${await one(candidate.url)}${candidate.descriptor ? " " + candidate.descriptor : ""}`)).then(values => values.join(", ")) : one(raw);
     void task.then(value => {
-      if (!current()) { release(created); return; }
-      release(entry.objectUrls); entry.objectUrls = created;
+      if (!current()) { releaseObjectUrls(created); return; }
+      releaseObjectUrls(entry.objectUrls); entry.objectUrls = created;
       entry.applied = value;
-      if (value === "") element.removeAttribute(name); else apply(value);
-    }, () => { release(created); if (current()) element.dispatchEvent(new Event("error")); });
+      if (value === "") originalRemove.call(element, name); else apply(value);
+    }, () => { releaseObjectUrls(created); if (current()) element.dispatchEvent(new Event("error")); });
   };
   Element.prototype.setAttribute = function(name, value) {
     const key = name.toLowerCase();
@@ -128,6 +131,16 @@ function installExtensionResources(sourceSet: typeof extensionSourceSet): void {
     }
     if (!watched(this, key)) return originalSet.call(this, name, value);
     set(this, key, String(value), result => originalSet.call(this, name, result));
+  };
+  Element.prototype.removeAttribute = function(name) {
+    const key = String(name).toLowerCase();
+    const entries = sources.get(this);
+    const source = entries?.get(key);
+    if (source !== undefined) {
+      entries?.delete(key);
+      releaseObjectUrls(source.objectUrls);
+    }
+    return originalRemove.call(this, name);
   };
   Element.prototype.getAttribute = function(name) { return sources.get(this)?.get(name.toLowerCase())?.raw ?? originalGet.call(this, name); };
   for (const [prototype, names] of [[HTMLImageElement.prototype, ["src", "srcset"]], [HTMLMediaElement.prototype, ["src"]],

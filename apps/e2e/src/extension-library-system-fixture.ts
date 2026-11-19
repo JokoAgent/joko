@@ -320,7 +320,9 @@ async function writeLibraryPackageCatalog(catalogDirectory: string): Promise<voi
       "<!doctype html>",
       "<html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
       "<title>Library chain</title><link rel=\"StyleSheet\" href=\"style.css\"><script defer src=\"app.js\"></script></head>",
-      "<body><main><h1>Extension Library bridge</h1><output id=\"bridge-result\">starting</output></main></body></html>"
+      "<body><main><h1>Extension Library bridge</h1><output id=\"bridge-result\">starting</output>",
+      "<button id=\"preview-load\">Show preview</button><button id=\"preview-clear\">Clear preview</button><img id=\"preview-image\" alt=\"Preview\">",
+      "</main></body></html>"
     ].join("\n"), "utf8"),
     writeFile(join(viewDirectory, "style.css"), [
       ":root { color-scheme: light dark; font-family: system-ui, sans-serif; }",
@@ -330,12 +332,23 @@ async function writeLibraryPackageCatalog(catalogDirectory: string): Promise<voi
       "h1 { margin: 0 0 12px; font-size: clamp(18px, 4vw, 28px); }",
       "output { display: block; border: 1px solid GrayText; border-radius: 10px; padding: 12px; }"
     ].join("\n"), "utf8"),
-    writeFile(join(viewDirectory, "app.js"), MAIN_VIEW_SCRIPT, "utf8")
+    writeFile(join(viewDirectory, "app.js"), MAIN_VIEW_SCRIPT, "utf8"),
+    writeFile(join(viewDirectory, "preview.png"), Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"))
   ]);
 }
 
 const MAIN_VIEW_SCRIPT = `
 const output = document.querySelector("#bridge-result");
+const preview = document.querySelector("#preview-image");
+document.querySelector("#preview-load").addEventListener("click", () => { preview.src = "./preview.png"; });
+document.querySelector("#preview-clear").addEventListener("click", () => { preview.removeAttribute("src"); });
+window.addEventListener("message", (event) => {
+  if (event.source === parent && event.data?.type === "joko:extension-resource-result"
+      && event.data.ok && event.data.blob?.type === "image/png") {
+    setTimeout(() => { preview.dataset.resourceReceived = "true"; }, 0);
+  }
+});
 const call = async (operation) => {
   const response = await window.joko.library(operation);
   if (response.ok !== true) throw new Error(response.errorCode + ":" + response.message);
