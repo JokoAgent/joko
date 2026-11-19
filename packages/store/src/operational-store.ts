@@ -10539,6 +10539,19 @@ export class OperationalStore {
       .map((row) => queueControlFromRow(row, at));
   }
 
+  /** How long a persisted lock can still hold the accepted queue head. */
+  queueDispatchLockDelay(sessionId: string): number | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT MAX(COALESCE(control.interaction_lock_expires_at, 0), COALESCE(q.edit_lock_expires_at, 0)) AS expires_at
+      FROM queue_items q JOIN queue_controls control ON control.session_id = q.session_id
+      WHERE q.session_id = ? AND q.state = 'accepted' AND control.paused = 0
+      ORDER BY q.position, q.created_at, q.id LIMIT 1
+    `).get(sessionId) as Row | undefined;
+    const expiresAt = optionalNumber("expiresAt", row?.["expires_at"]).expiresAt;
+    return expiresAt === undefined || expiresAt === 0 ? undefined : Math.max(0, expiresAt - this.now());
+  }
+
   setQueuePaused(input: {
     readonly sessionId: string;
     readonly paused: boolean;

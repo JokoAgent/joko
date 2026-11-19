@@ -1002,6 +1002,7 @@ export class SessionHost {
   }>();
   readonly #draining = new Set<string>();
   readonly #drainSettlements = new Map<string, Promise<void>>();
+  readonly #queueLockWakeups = new Map<string, ReturnType<typeof setTimeout>>();
   readonly #pendingInteractions = new Map<string, PendingInteraction>();
   readonly #applicationQueueGuards = new Map<string, McpAppMessageGuard>();
   readonly #protectedMessagingPrompts = new Map<string, { readonly prompt: PromptInput; readonly expiry: ReturnType<typeof setTimeout> }>();
@@ -3974,6 +3975,25 @@ export class SessionHost {
     this.#restoreProviderGroupRecoveries(sessionId);
     if (this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined) return;
     void this.drain(sessionId);
+  }
+
+  /** An accepted queue head can survive the service that originally armed its lock timer. */
+  private scheduleQueueLockWakeup(sessionId: string): void {
+    if (this.#queueLockWakeups.has(sessionId)) return;
+    const delay = this.#store.queueDispatchLockDelay(sessionId);
+    if (delay === undefined) return;
+    const timer = setTimeout(() => {
+      this.#queueLockWakeups.delete(sessionId);
+      if (this.#disposed) return;
+      try {
+        this.#store.expireQueueLocks({ sessionId });
+        this.requestQueueDrain(sessionId);
+      } catch (error) {
+        this.recordFailure("queue_lock_expiry", error);
+      }
+    }, Math.min(delay, 2_147_483_647));
+    timer.unref();
+    this.#queueLockWakeups.set(sessionId, timer);
   }
 
   /** The scheduler owns global slots; the Session dispatcher owns the final claim. */
@@ -11837,6 +11857,8 @@ export class SessionHost {
   async dispose(): Promise<void> {
     if (this.#disposed) return;
     this.#disposed = true;
+    for (const timer of this.#queueLockWakeups.values()) clearTimeout(timer);
+    this.#queueLockWakeups.clear();
     this.#prewarmer.dispose();
     for (const wait of this.#providerGroupWaits.values()) clearTimeout(wait.timer);
     this.#providerGroupWaits.clear();
@@ -15173,9 +15195,11 @@ export class SessionHost {
             traceId: `dispatch:${pending.id}`
           });
         } catch (error) { scheduleGate?.release(pending.runId); throw error; }
-        // A concurrent pause may land between the control read and durable
-        // claim. The resume path owns the next wake-up, so never busy-poll.
-        if (claimedItem === undefined) { scheduleGate?.release(pending.runId); return; }
+        if (claimedItem === undefined) {
+          scheduleGate?.release(pending.runId);
+          this.scheduleQueueLockWakeup(sessionId);
+          return;
+        }
         const dispatchPreparation = this.beginDispatchPreparation(sessionId, claimedItem.id);
         let item = claimedItem;
         const run = this.#store.getRun(item.runId);
