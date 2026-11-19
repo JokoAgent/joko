@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { backup, DatabaseSync } from "node:sqlite";
 
-import { createClient, createRouterTransport } from "@connectrpc/connect";
-import { CollaborationService, CollaborationWorkerStatus } from "@joko/contracts";
+import { Code, ConnectError, createClient, createRouterTransport } from "@connectrpc/connect";
+import { COLLABORATION_WORKER_HARD_LIMIT_CODE, CollaborationService, CollaborationWorkerStatus, ErrorInfoSchema, PermissionMode } from "@joko/contracts";
 import { DEFAULT_COLLABORATION_SETTINGS, WorkerHardLimitError } from "@joko/runtime-governance";
 import { OperationalStore, RevisionConflictError, collaborationWorkerSessionOperationId, operationBodyHash } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
@@ -163,6 +163,15 @@ describe("CollaborationGoalManager", () => {
       fixture.leadSessionId,
       { operationId: "worker-hard-limit-second", label: "Two", role: "builder", assignment: "Build two." }
     ))).rejects.toBeInstanceOf(WorkerHardLimitError);
+    const client = createClient(CollaborationService, createRouterTransport(router => {
+      router.service(CollaborationService, createCollaborationConnectService(fixture.manager, () => undefined));
+    }));
+    const rejected = await client.createCollaborationWorker({ operationId: "worker-hard-limit-connect", goalId: goal.id,
+      callerLeadSessionId: fixture.leadSessionId, expectedGoalRevision: toProtoRevision(currentGoal.revision),
+      targetId: "target-one", label: "Three", role: "builder", permissionMode: PermissionMode.ASK }).catch(ConnectError.from);
+    expect(rejected).toMatchObject({ code: Code.ResourceExhausted });
+    expect(ConnectError.from(rejected).findDetails(ErrorInfoSchema)).toMatchObject([{ code: COLLABORATION_WORKER_HARD_LIMIT_CODE }]);
+    expect(fixture.store.findOperation("worker-hard-limit-connect")).toBeUndefined();
     expect(fixture.store.listSessions({ includeArchived: true, includeDeleted: true })).toHaveLength(sessionCount);
     expect(fixture.store.findOperation("worker-hard-limit-second")).toBeUndefined();
 
