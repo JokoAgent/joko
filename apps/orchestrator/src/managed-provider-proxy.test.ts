@@ -14,7 +14,8 @@ import { mkdtemp } from "./test-paths.js";
 async function fixture(
   nativeResponses = false,
   protocol: "openai-responses" | "openai-completions" | "anthropic-messages" = "openai-responses",
-  providerId = "provider"
+  providerId = "provider",
+  configuredPath?: string
 ) {
   const directory = await mkdtemp(join(tmpdir(), "joko-provider-proxy-"));
   const store = new OperationalStore(join(directory, "store.db"));
@@ -46,6 +47,9 @@ async function fixture(
     received.push({ path: request.url!, model: body.model, authorization: request.headers.authorization });
     forwardedProxyTokens.push(request.headers["x-joko-provider-proxy-token"] as string | undefined);
     forwardedFedrampHeaders.push(request.headers["x-openai-fedramp"] as string | undefined);
+    if (configuredPath !== undefined && request.url !== configuredPath && request.url !== `${configuredPath.replace(/\/$/u, "")}/compact`) {
+      response.writeHead(404); response.end(); return;
+    }
     if (reject) { response.writeHead(302, { location: "https://external.invalid/", "content-type": "text/plain" }); response.end("upstream-private-detail"); return; }
     response.writeHead(200, { "content-type": fixtureResponseContentType });
     if (nativeResponses) {
@@ -120,8 +124,8 @@ async function fixture(
   await proxy.start();
   const port = proxy.createRuntime({ backendId: "runtime", generation: 3, support: { protocols: [protocol], fields: [] }, assertCurrent: () => { if (!ownerCurrent) throw new Error("Runtime changed"); } });
   const owner = { backendId: "runtime", backendInstanceGeneration: 3, targetId: "target", sessionId: "session", sessionGeneration: 4, providerId, modelId: "model" };
-  const requestPath = protocol === "anthropic-messages" ? "/custom/messages"
-    : protocol === "openai-completions" ? "/custom/chat/completions" : "/custom/responses";
+  const requestPath = configuredPath ?? (protocol === "anthropic-messages" ? "/custom/messages"
+    : protocol === "openai-completions" ? "/custom/chat/completions" : "/custom/responses");
   const catalogModels = [
     { id: "model", input: ["text"] as const, contextWindow: 64_000, maxTokens: 4_000 },
     { id: "child-model", input: ["text"] as const, contextWindow: 128_000, maxTokens: 8_000 }
@@ -186,6 +190,25 @@ function responsesEvents(body: string): Record<string, unknown>[] {
 }
 
 describe("Managed Provider native proxy", () => {
+  it("sends the exact saved Responses path and appends a distinct compact suffix", async () => {
+    const f = await fixture(false, "openai-responses", "provider", "/tenant/responses/");
+    try {
+      const binding = await f.port.prepare(f.owner);
+      const lease = await binding.activate({ operationId: "exact-responses-path", signal: new AbortController().signal, assertCurrent: () => undefined });
+      try {
+        for (const path of ["/responses", "/responses/compact"]) {
+          const response = await fetch(`${binding.baseUrl}${path}`, {
+            method: "POST", headers: { authorization: `Bearer ${f.token}`, "content-type": "application/json" },
+            body: JSON.stringify({ model: "model", input: "Test the saved route." })
+          });
+          expect(response.status).toBe(200);
+          await response.text();
+        }
+        expect(f.received.map(record => record.path)).toEqual(["/tenant/responses/", "/tenant/responses/compact"]);
+      } finally { lease.release(); binding.dispose(); }
+    } finally { await f.dispose(); }
+  });
+
   it("translates tool calls, usage, and tool history over the configured Codex Chat path", async () => {
     const f = await fixture(false, "openai-completions");
     try {
