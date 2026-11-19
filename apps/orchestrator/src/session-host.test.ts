@@ -19,6 +19,10 @@ import * as contract from "@joko/contracts";
 import { answerDeliveryPrompt } from "./answer-delivery-prompt.js";
 import {
   JokoError,
+  NATIVE_HISTORY_ASSISTANT_STREAM_FIELD,
+  NATIVE_HISTORY_ASSISTANT_TOOL_RESULT_FIELD,
+  NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
+  NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
   type AdapterContext,
   type ApprovedDirectory,
   type BackendAdapter,
@@ -6438,6 +6442,83 @@ describe("SessionHost", () => {
       expect(event.payload.blocks).toEqual([{ kind: "text", text: prompt.text }]);
       expect(event.payload.acceptedInput).toEqual(prompt);
     }
+  });
+
+  it("adopts both ordinary Claude replies around one tool into the native timeline in order", async () => {
+    const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    const [inputId, beforeId, toolId, resultId, afterId] = [randomUUID(), randomUUID(), randomUUID(), randomUUID(), randomUUID()];
+    const streamId = (index: number) => `claude-block-${inputId}-${index}-0`;
+    const name = "mcp__joko_0123456789abcdef01234567__read_report";
+    const toolStart = { type: "tool_start", callId: "read-report", name, input: "{}" } as const;
+    const toolResult = { type: "tool_result", callId: toolStart.callId, name, output: "The report is ready.", isError: false } as const;
+    const before = "I will check the report and compare its values. ".repeat(13).trimEnd();
+    const after = "The report confirms that the sample count is correct. ".repeat(12).trimEnd();
+    const usage = { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 15, cost: 0 };
+    const prose = (text: string) => ({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text }] } as const);
+    const native = (nativeEntryId: string, projectionKind: string, payload: EventPayload, nativeParentEntryId?: string) => ({
+      ...fakeHistoryEvent(nativeEntryId, projectionKind, payload), nativeParentEntryId,
+      metadata: { namespace: "claude-code.native_history", fields: { nativeHydration: true } }
+    });
+    let history: NativeHistoryProjection = { events: [] };
+    Object.assign(adapter, {
+      nativeUserEntryIdForOperation: () => inputId,
+      getNativeHistoryProjection: async () => history,
+      send: async (input: PromptInput, context: AdapterContext) => {
+        const emitProse = async (entryId: string, index: number, text: string, result?: string) => {
+          await context.emit({ type: "text_delta", blockId: streamId(index), delta: text }, { namespace: "claude-code", fields: {} });
+          await context.emit({ ...prose(text), nativeHistory: {}, ...(result === undefined ? {} : { usage }) }, {
+            namespace: "claude-code", fields: { [NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD]: entryId,
+              [NATIVE_HISTORY_ASSISTANT_STREAM_FIELD]: streamId(index),
+              ...(result === undefined ? {} : { [NATIVE_HISTORY_ASSISTANT_TOOL_RESULT_FIELD]: result }) }
+          });
+        };
+        await emitProse(beforeId, 1, before);
+        await context.emit({ ...toolStart, nativeHistory: { identity: { entryId: toolId, parentEntryId: beforeId } } },
+          { namespace: "claude-code", fields: { [NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD]: true } });
+        await context.emit({ ...toolResult, nativeHistory: { identity: { entryId: resultId, parentEntryId: toolId } } },
+          { namespace: "claude-code", fields: { [NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD]: true } });
+        await emitProse(afterId, 2, after, resultId);
+        history = { events: [
+          native(inputId, "message_user", { type: "message_complete", role: "user", blocks: [{ kind: "text", text: input.text }] }),
+          native(beforeId, "message_assistant", prose(before), inputId),
+          native(toolId, "tool_start", toolStart, beforeId),
+          native(toolId, "message_assistant", { type: "message_complete", role: "assistant", blocks: [{ kind: "tool_call", callId: toolStart.callId, name, input: "{}" }] }, beforeId),
+          native(resultId, "tool_result", toolResult, toolId),
+          native(afterId, "message_assistant", prose(after), resultId)
+        ], activeEntryId: afterId, activeLineage: [{ entryId: inputId }, { entryId: beforeId, parentEntryId: inputId },
+          { entryId: toolId, parentEntryId: beforeId }, { entryId: resultId, parentEntryId: toolId }, { entryId: afterId, parentEntryId: resultId }] };
+        await context.emit({ type: "done", outcome: "completed" });
+      }
+    });
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: "create-ordinary-claude-tool-history", connection: fixture.connection,
+      targetId: "target-one", title: "Report", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const operationId = "ordinary-claude-tool-history";
+    const queued = fixture.host.enqueueInput({ operationId, connection: fixture.connection, sessionId,
+      prompt: { text: "Read the report.", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
+    const verify = () => {
+      const raw = fixture.store.listEvents({ sessionId, limit: 1_000 });
+      const throughSnapshot = activeNativeTimeline(raw);
+      const throughTimeline = fixture.store.listEvents({ sessionId, activeNativeTimeline: true, limit: 1_000 });
+      for (const events of [throughSnapshot, throughTimeline]) {
+        expect(events.some(event => event.payload.type === "text_delta" && event.payload.blockId.startsWith("claude-block-"))).toBe(false);
+        const relevant = events.filter(({ payload }) => payload.type === "tool_start" || payload.type === "tool_result"
+          || payload.type === "message_complete" && payload.role === "assistant" && payload.blocks[0]?.kind === "text");
+        expect(relevant).toMatchObject([
+          { runId: queued.value.runId, operationId, payload: { ...prose(before), nativeHistory: { identity: { entryId: beforeId } } } },
+          { payload: { ...toolStart, nativeHistory: { identity: { entryId: toolId } } } },
+          { payload: { ...toolResult, nativeHistory: { identity: { entryId: resultId } } } },
+          { runId: queued.value.runId, operationId, payload: { ...prose(after), usage, nativeHistory: { identity: { entryId: afterId } } } }
+        ]);
+        expect(relevant[0]?.payload).not.toHaveProperty("usage");
+      }
+      return throughTimeline.map(event => event.id);
+    };
+    const ids = verify();
+    await fixture.host.detach(sessionId);
+    await fixture.host.resume(sessionId);
+    expect(verify().filter(id => id.startsWith("native-event-"))).toEqual(ids.filter(id => id.startsWith("native-event-")));
   });
 
   it("binds a normally settled native suffix to its exact shared input and retains attribution after Store restart", async () => {

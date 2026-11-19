@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   JokoError,
+  NATIVE_HISTORY_ASSISTANT_STREAM_FIELD,
+  NATIVE_HISTORY_ASSISTANT_TOOL_RESULT_FIELD,
+  NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
+  NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
   type AdapterContext,
   type PartnerLearningTurnSource,
   type CreateNativeSessionInput,
@@ -663,6 +667,89 @@ describe("ClaudeCodeAdapter", () => {
     await expect(invoke()).rejects.toThrow("active root tool owner");
     await adapter.dispose();
     expect(released).toBe(true);
+  });
+
+  test("completes ordinary Claude prose on each side of one approved MCP call", async () => {
+    const sdk = new FakeSdkRuntime();
+    const tool = { serverId: "audit", name: "read_report", description: "Read report", requiresNativeRoot: true,
+      inputSchema: { type: "object" } } as const;
+    const inline = [{ type: "text", text: "The report is ready." }];
+    const call = vi.fn<ClaudeMcpRuntimeLease["call"]>(async () => ({ content: inline, isError: false }));
+    const adapter = adapterFor(sdk, { mcpBridge: { open: () => ({
+      tools: [tool], assertCurrent: () => undefined, release: () => undefined, call
+    }) } });
+    try {
+      const binding = await adapter.createSession(createInput(), contextFor().context);
+      const sessionId = binding.nativeSessionId!;
+      const source = contextFor(binding, { operationId: "ordinary-claude-prose-around-tool" });
+      const emit = vi.fn(source.context.emit);
+      await adapter.send(textPrompt("Read the report."), { ...source.context, emit });
+      const query = sdk.queries[1]!;
+      const before = "I will check the report and compare its values. ".repeat(13).trimEnd();
+      const after = "The report confirms that the sample count is correct. ".repeat(12).trimEnd();
+      const [beforeId, toolId, resultId, afterId] = [randomUUID(), randomUUID(), randomUUID(), randomUUID()];
+      const first = assistantMessage(sessionId, beforeId, [{ type: "text", text: before }]);
+      const second = assistantMessage(sessionId, afterId, [{ type: "text", text: after }]);
+      const toolUseId = "audit-read-report-call";
+      const toolName = `mcp__joko_${createHash("sha256").update(tool.serverId).digest("hex").slice(0, 24)}__${tool.name}`;
+      const toolFrame = assistantMessage(sessionId, toolId, [{ type: "tool_use", id: toolUseId, name: toolName, input: {} }]);
+      const resultFrame = userToolResult(sessionId, resultId, toolUseId, inline, false);
+      const pushText = (frame: typeof first, prose: string) => {
+        query.push(streamEvent(sessionId, { type: "message_start", message: { id: frame.message.id } }));
+        query.push(streamEvent(sessionId, { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
+        query.push(streamEvent(sessionId, { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: prose } }));
+        query.push(frame);
+        query.push(streamEvent(sessionId, { type: "content_block_stop", index: 0 }));
+      };
+
+      pushText(first, before);
+      query.push({ ...toolFrame, message: { ...toolFrame.message, id: first.message.id } });
+      query.push(streamEvent(sessionId, { type: "message_stop" }));
+      await expect(query.params.options.mcpTools![0]!.call({}, { toolUseId, signal: new AbortController().signal }))
+        .resolves.toMatchObject({ content: inline });
+      await eventually(() => source.events.some(event => event.type === "tool_start"));
+      expect(call).toHaveBeenCalledOnce();
+      const rows = () => source.events.filter(event => event.type === "message_complete" || event.type === "tool_start" || event.type === "tool_result");
+      expect(rows()).toMatchObject([
+        { type: "message_complete", blocks: [{ kind: "text", text: before }] },
+        { type: "tool_start", callId: toolUseId, nativeHistory: { identity: { entryId: toolId, parentEntryId: beforeId } } }
+      ]);
+      query.push(resultFrame);
+      pushText(second, after);
+      query.push(streamEvent(sessionId, { type: "message_stop" }));
+      query.push(resultMessage(sessionId, { result: after, totalCostUsd: 0 }));
+      await eventually(() => source.events.some(event => event.type === "done"));
+
+      expect(rows()).toMatchObject([
+        { type: "message_complete", blocks: [{ kind: "text", text: before }] },
+        { type: "tool_start", callId: toolUseId, name: toolName },
+        { type: "tool_result", callId: toolUseId, output: inline[0]!.text, nativeHistory: { identity: { entryId: resultId, parentEntryId: toolId } } },
+        { type: "message_complete", blocks: [{ kind: "text", text: after }], usage: { inputTokens: 10, outputTokens: 5 } }
+      ]);
+      const assistant = emit.mock.calls.filter(([event]) => event.type === "message_complete");
+      expect(assistant[0]?.[0]).not.toHaveProperty("usage");
+      expect(assistant.map(([, metadata]) => metadata?.fields)).toMatchObject([
+        { [NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD]: beforeId, [NATIVE_HISTORY_ASSISTANT_STREAM_FIELD]: expect.stringMatching(/-1-0$/u) },
+        { [NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD]: afterId, [NATIVE_HISTORY_ASSISTANT_STREAM_FIELD]: expect.stringMatching(/-2-0$/u),
+          [NATIVE_HISTORY_ASSISTANT_TOOL_RESULT_FIELD]: resultId }
+      ]);
+      expect(emit.mock.calls.filter(([event]) => event.type === "tool_start" || event.type === "tool_result")
+        .map(([, metadata]) => metadata?.fields[NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD])).toEqual([true, true]);
+      expect(source.events.filter(event => event.type === "usage")).toHaveLength(1);
+      expect(source.events.at(-1)).toEqual({ type: "done", outcome: "completed" });
+
+      const inputId = adapter.nativeUserEntryIdForOperation(source.context.operationId!);
+      sdk.messages.set(sessionId, [historyMessage("user", inputId, sessionId, { role: "user", content: "Read the report." }),
+        historyMessage("assistant", beforeId, sessionId, first.message), historyMessage("assistant", toolId, sessionId, toolFrame.message),
+        historyMessage("user", resultId, sessionId, resultFrame.message), historyMessage("assistant", afterId, sessionId, second.message)]);
+      const history = await adapter.getNativeHistoryProjection(source.context);
+      expect(history.activeLineage).toEqual([
+        { entryId: inputId }, { entryId: beforeId, parentEntryId: inputId }, { entryId: toolId, parentEntryId: beforeId },
+        { entryId: resultId, parentEntryId: toolId }, { entryId: afterId, parentEntryId: resultId }
+      ]);
+    } finally {
+      await adapter.dispose();
+    }
   });
 
   test.each(["complete", "bridge preview", "storage failure"] as const)("preserves the local root MCP result with %s", async (scenario) => {

@@ -8,6 +8,7 @@ import type {
 import {
   NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD,
   NATIVE_HISTORY_ASSISTANT_STREAM_FIELD,
+  NATIVE_HISTORY_ASSISTANT_TOOL_RESULT_FIELD,
   NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD,
   NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
   isNativeNavigationTarget,
@@ -108,6 +109,28 @@ export function nativeHistoryReplayMetadata(
     observed.has(field) && Object.hasOwn(recorded.fields, field) && typeof recorded.fields[field] === typeof value
       ? recorded.fields[field]! : value
   ])) };
+}
+
+export function observedClaudeAssistantInputEntry(
+  projection: NativeHistoryEventProjection,
+  source: PersistedEvent,
+  earlierEntries: ReadonlyMap<string, EventPayload>
+): string | undefined {
+  const parentId = nativeHistoryEventContext(projection.payload)?.identity?.parentEntryId;
+  const observedResult = source.metadata?.fields[NATIVE_HISTORY_ASSISTANT_TOOL_RESULT_FIELD];
+  if (observedResult === undefined) return parentId;
+  if (parentId === undefined || parentId !== observedResult) return undefined;
+  const result = earlierEntries.get(parentId);
+  if (result?.type !== "tool_result" || result.isError) return undefined;
+  const callEntryId = result.nativeHistory?.identity?.parentEntryId;
+  const call = callEntryId === undefined ? undefined : earlierEntries.get(callEntryId);
+  if (call?.type !== "message_complete" || call.role !== "assistant" || call.blocks.length !== 1
+    || call.blocks[0]?.kind !== "tool_call" || call.blocks[0].callId !== result.callId || call.blocks[0].name !== result.name) return undefined;
+  const precedingTextId = call.nativeHistory?.identity?.parentEntryId;
+  const precedingText = precedingTextId === undefined ? undefined : earlierEntries.get(precedingTextId);
+  return precedingText?.type === "message_complete" && precedingText.role === "assistant"
+    && precedingText.blocks.length === 1 && precedingText.blocks[0]?.kind === "text"
+    ? precedingText.nativeHistory?.identity?.parentEntryId : undefined;
 }
 
 /** Carry the live Run facts only when the SDK frame and its original input both

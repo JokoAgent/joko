@@ -23,6 +23,41 @@ function completed(blocks: any[], role = MessageRole.ASSISTANT) {
     } } }
   });
 }
+it.each([false, true])("keeps completed Claude prose around its only tool row (native reload=%s)", hydrated => {
+  const identity = { sessionId: "session", backendId: "claude", targetId: "workspace", generation: 5n, runId: "run", attemptId: "attempt" };
+  const toolName = "mcp__joko_0123456789abcdef01234567__read_report";
+  const before = "The first part describes the report request. ".repeat(13).trimEnd();
+  const after = "The last part confirms the report result. ".repeat(15).trimEnd();
+  const messageId = (part: number) => hydrated ? `native-text-${part}` : `claude-block-${part}-0`;
+  const prose = (part: number, sequence: bigint, value: string) => create(EventSchema, {
+    eventId: `event-${sequence}`, identity, cursor: { generation: 7n, sequence }, payload: { kind: {
+      case: "messageCompleted", value: { messageId: hydrated ? messageId(part) : `done-${part}`, role: MessageRole.ASSISTANT,
+        nativeIdentity: hydrated ? { entryId: messageId(part) } : undefined, blocks: [{ content: { case: "text", value } }] }
+    } }
+  });
+  const liveText = (part: number, sequence: bigint, delta: string) => create(EventSchema, {
+    eventId: `event-${sequence}`, identity, cursor: { generation: 7n, sequence },
+    payload: { kind: { case: "textDelta", value: { messageId: messageId(part), delta } } }
+  });
+  const toolIdentity = hydrated ? { ...identity, runId: "", attemptId: "" } : identity;
+  const toolCall = { toolCallId: "tool-call", toolId: toolName, sessionId: toolIdentity.sessionId, runId: toolIdentity.runId, attemptId: toolIdentity.attemptId };
+  const started = create(EventSchema, { eventId: "event-3", identity: toolIdentity, cursor: { generation: 7n, sequence: 3n },
+    payload: { kind: { case: "toolCallStarted", value: { toolCall: { ...toolCall, state: ToolCallState.RUNNING } } } } });
+  const nativeToolCompletion = create(EventSchema, { eventId: "event-4", identity: toolIdentity, cursor: { generation: 7n, sequence: 4n },
+    payload: { kind: { case: "messageCompleted", value: { messageId: "native-tool", nativeIdentity: { entryId: "native-tool" },
+      role: MessageRole.ASSISTANT, blocks: [{ content: { case: "toolCall", value: { callId: toolCall.toolCallId, name: toolName } } }] } } } });
+  const result = create(EventSchema, { eventId: "event-5", identity: toolIdentity, cursor: { generation: 7n, sequence: 5n },
+    payload: { kind: { case: "toolCallCompleted", value: { toolCall: { ...toolCall, state: ToolCallState.SUCCEEDED,
+      result: { parts: [{ content: { case: "text", value: "Read one report." } }] } } } } } });
+  const events = [liveText(1, 1n, before.slice(0, 40)), prose(1, 2n, before), started,
+    ...(hydrated ? [nativeToolCompletion] : []), result, liveText(2, 6n, after.slice(0, 40)), prose(2, 7n, after)];
+  expect(timelineRows(events)).toMatchObject([
+    { kind: "assistant", text: before, completed: true },
+    { kind: "tool", text: toolName, completed: true, tool: { output: "Read one report.", state: "succeeded" } },
+    { kind: "assistant", text: after, completed: true }
+  ]);
+  if (hydrated) expect(timelineRows([nativeToolCompletion])).toMatchObject([{ text: "[Tool call]" }]);
+});
 it("keeps Codex reconnect progress in the current attempt and out of message history", () => {
   const retry = (sequence: bigint, status: RetryState, attemptNumber: number, generation = 5n, cursorGeneration = 9n) => create(EventSchema, {
     eventId: `retry-${sequence}`, identity: { sessionId: "session", runId: "run", attemptId: "attempt", generation },

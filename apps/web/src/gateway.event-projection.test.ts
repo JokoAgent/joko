@@ -1700,6 +1700,44 @@ describe("incremental event projection", () => {
       })]);
   });
 
+  it("keeps Claude completions on the original sides of the intermediate tool", () => {
+    let raw = create(SnapshotSchema, { generation: 7n, resumeCursor: { generation: 7n, sequence: 0n } });
+    let snapshot = mapSnapshot(raw);
+    let sequence = 0n;
+    const identity = { sessionId: "session", backendId: "claude", targetId: "workspace", generation: 5n, runId: "run", attemptId: "attempt" };
+    const apply = (payload: NonNullable<Event["payload"]>["kind"]) => {
+      sequence += 1n;
+      const event = create(EventSchema, { eventId: `event-${sequence}`, identity, cursor: { generation: 7n, sequence }, payload: { kind: payload } });
+      const next = projectSnapshotEvent(raw, snapshot, event);
+      raw = next.rawSnapshot;
+      snapshot = next.snapshot;
+    };
+    const first = "The first part describes the report request. ".repeat(13).trimEnd();
+    const last = "The last part confirms the report result. ".repeat(15).trimEnd();
+    const toolCall = { toolCallId: "tool-call", toolId: "mcp__joko_0123456789abcdef01234567__read_report", sessionId: identity.sessionId,
+      runId: identity.runId, attemptId: identity.attemptId };
+    const finishText = (part: number, text: string) => {
+      apply(create(EventPayloadSchema, { kind: { case: "messageCompleted", value: { messageId: `done-${part}`,
+        role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: text } }] } } }).kind);
+    };
+    apply(create(EventPayloadSchema, { kind: { case: "textDelta", value: { messageId: "claude-block-1-0", delta: first.slice(0, 40) } } }).kind);
+    finishText(1, first);
+    apply(create(EventPayloadSchema, { kind: { case: "toolCallStarted", value: { toolCall: { ...toolCall, state: ToolCallState.RUNNING } } } }).kind);
+    expect(snapshot.timelineBySession.get(identity.sessionId)).toMatchObject([
+      { kind: "assistant", id: "done-1", streaming: false, text: first }, { kind: "tool", id: toolCall.toolCallId }
+    ]);
+    apply(create(EventPayloadSchema, { kind: { case: "toolCallCompleted", value: { toolCall: { ...toolCall, state: ToolCallState.SUCCEEDED,
+      result: { parts: [{ content: { case: "text", value: "Read one report." } }] } } } } }).kind);
+    apply(create(EventPayloadSchema, { kind: { case: "textDelta", value: { messageId: "claude-block-2-0", delta: last.slice(0, 40) } } }).kind);
+    finishText(2, last);
+    expect(snapshot.timelineBySession.get(identity.sessionId)).toMatchObject([
+      { kind: "assistant", id: "done-1", streaming: false, text: first },
+      { kind: "toolResult", id: toolCall.toolCallId, tool: { output: "Read one report.", state: "succeeded" } },
+      { kind: "assistant", id: "done-2", streaming: false, text: last }
+    ]);
+    expect(mapSnapshot(raw).timelineBySession.get(identity.sessionId)).toEqual(snapshot.timelineBySession.get(identity.sessionId));
+  });
+
   it("reconciles indexed deltas against authoritative completion blocks without duplicates", () => {
     let raw = create(SnapshotSchema, {
       generation: 1n,

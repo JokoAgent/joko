@@ -18,6 +18,8 @@ import {
   JokoError,
   NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
   NATIVE_HISTORY_ASSISTANT_STREAM_FIELD,
+  NATIVE_HISTORY_ASSISTANT_TOOL_RESULT_FIELD,
+  NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
   snapshotNativeSkills,
   nativeTextInferenceImages,
   type ApprovedSkillResolver,
@@ -453,6 +455,13 @@ interface ActiveTurn {
   readonly stream: PartialMessageBuffer;
   textStream?: { readonly blockId: string; readonly messageId: string } | null;
   textAssistant?: { readonly entryId: string; readonly messageId: string } | null;
+  proseBeforeTool?: {
+    readonly entryId: string;
+    readonly messageId: string;
+    readonly callId: string;
+    readonly toolEntryId: string;
+    resultEntryId?: string;
+  };
   readonly steers: Map<string, SteerAdmission>;
   stopping: boolean;
   interruptConfirmation?: Deferred<void>;
@@ -4560,6 +4569,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const envelope = record(message);
     if (stringValue(envelope?.["parent_tool_use_id"]) !== null && envelope?.["parent_tool_use_id"] !== null) return;
     if (record(envelope?.["event"])?.["type"] === "message_start") {
+      if (turn.proseBeforeTool !== undefined) turn.textStream = undefined;
       await this.#settleNativeRetry(runtime, turn, "succeeded");
     }
     this.#observeParentStream(turn, envelope);
@@ -4602,12 +4612,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     // Exact SDK identities attest calls privately. Display redaction can alter
     // both tool names and call IDs and must never decide native authority.
     const nativeContent = nativeMessage?.["content"];
-    turn.textAssistant = turn.textAssistant === undefined && uuid !== undefined && uuidPattern().test(uuid)
-      && nativeMessageId !== undefined && error === undefined && typeof envelope["parent_agent_id"] !== "string"
-      && Array.isArray(nativeContent) && nativeContent.length === 1 && record(nativeContent[0])?.["type"] === "text"
-      && projected.blocks.length === 1 && projected.blocks[0]?.kind === "text" && projected.blocks[0].text.trim() !== ""
-      ? { entryId: uuid.toLowerCase(), messageId: nativeMessageId }
-      : null;
+    const entryId = uuid !== undefined && uuidPattern().test(uuid) && error === undefined
+      && typeof envelope["parent_agent_id"] !== "string" ? uuid.toLowerCase() : undefined;
+    const nativeBlock = Array.isArray(nativeContent) && nativeContent.length === 1 ? record(nativeContent[0]) : undefined;
     if (runtime.mcpLease && Array.isArray(nativeContent)) for (const raw of nativeContent) {
       const block = record(raw), id = stringValue(block?.["id"]), name = stringValue(block?.["name"]), input = record(block?.["input"]);
       if (block?.["type"] !== "tool_use" || !id || !name || !input || id.length > 512 || turn.nativeMcpToolCalls.has(id)
@@ -4615,6 +4622,31 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       if (turn.nativeMcpToolCalls.size >= MAX_PENDING_INTERACTIONS) throw nativeEventLimit();
       turn.nativeMcpToolCalls.set(id, { name, input: structuredClone(input), claimed: false });
       turn.mcpRootToolWaiters.get(id)?.resolve(undefined);
+    }
+    const first = turn.blocks[0];
+    const textAssistant = turn.textAssistant;
+    const textStream = turn.textStream;
+    const toolCall = projected.toolCalls.length === 1 ? projected.toolCalls[0] : undefined;
+    if (this.#canObserveOrdinaryProse(runtime, turn) && turn.proseBeforeTool === undefined && !turn.stopping
+      && turn.assistantError === undefined && turn.parentStreamMessages === 1 && turn.blocks.length === 2 && first?.kind === "text"
+      && textAssistant && textStream && textAssistant.messageId === textStream.messageId && textAssistant.messageId === nativeMessageId
+      && entryId !== undefined && entryId !== textAssistant.entryId && nativeBlock?.["type"] === "tool_use" && toolCall !== undefined
+      && nativeBlock["id"] === toolCall.callId && nativeBlock["name"] === toolCall.name && turn.nativeMcpToolCalls.has(toolCall.callId)
+      && !turn.seenToolStarts.has(toolCall.callId)) {
+      // The SDK delivers the standalone text and tool frames in order inside
+      // one API message. Finish the text before publishing its following tool.
+      if (!await this.#emit(runtime, turn, { type: "message_complete", role: "assistant", blocks: [first], nativeHistory: {} },
+        turn.context, {
+          [NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD]: textAssistant.entryId,
+          [NATIVE_HISTORY_ASSISTANT_STREAM_FIELD]: textStream.blockId
+        })) return;
+      turn.proseBeforeTool = { ...textAssistant, callId: toolCall.callId, toolEntryId: entryId };
+      turn.textAssistant = undefined;
+    } else {
+      turn.textAssistant = textAssistant === undefined && entryId !== undefined && nativeMessageId !== undefined
+        && nativeBlock?.["type"] === "text" && projected.blocks.length === 1
+        && projected.blocks[0]?.kind === "text" && projected.blocks[0].text.trim() !== ""
+        ? { entryId, messageId: nativeMessageId } : null;
     }
     for (const tool of projected.toolCalls) {
       if (runtime.toolNames.size >= MAX_SESSION_TOOL_NAMES && !runtime.toolNames.has(tool.callId)) {
@@ -4629,12 +4661,15 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       }
       if (turn.seenToolStarts.has(tool.callId)) continue;
       addBoundedIdentity(turn.seenToolStarts, tool.callId);
+      const boundary = turn.proseBeforeTool;
+      const observed = boundary !== undefined && boundary.callId === tool.callId && boundary.toolEntryId === entryId;
       await this.#emit(runtime, turn, {
         type: "tool_start",
         callId: tool.callId,
         name: tool.name,
-        input: tool.input
-      });
+        input: tool.input,
+        ...(observed ? { nativeHistory: { identity: { entryId: boundary.toolEntryId, parentEntryId: boundary.entryId } } } : {})
+      }, turn.context, observed ? { [NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD]: true } : undefined);
     }
   }
 
@@ -4652,6 +4687,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       const block = record(raw), id = stringValue(block?.["tool_use_id"]);
       if (block?.["type"] === "tool_result" && id) turn.nativeMcpToolCalls.delete(id);
     }
+    const boundary = turn.proseBeforeTool;
+    const nativeBlock = Array.isArray(nativeContent) && nativeContent.length === 1 ? record(nativeContent[0]) : undefined;
+    const nativeOutput = nativeBlock?.["content"];
+    const inlinePart = Array.isArray(nativeOutput) && nativeOutput.length === 1 ? record(nativeOutput[0]) : undefined;
+    const inlineText = typeof nativeOutput === "string" ? nativeOutput : inlinePart?.["type"] === "text" ? inlinePart["text"] : undefined;
+    const resultEntryId = uuid !== undefined && uuidPattern().test(uuid) && typeof envelope["parent_agent_id"] !== "string"
+      ? uuid.toLowerCase() : undefined;
     for (const result of projected.toolResults) {
       if (runtime.nativeTaskProjectionEnabled) runtime.nativeTasks.completeToolScope(result.callId);
       if (turn.seenToolResults.has(result.callId)) continue;
@@ -4659,14 +4701,18 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       appendTurnBlocks(turn, [result.block]);
       const completeText = result.readCompleteText?.();
       const artifact = completeText === undefined ? undefined : await this.#storeCompleteMcpToolOutput(runtime, turn, completeText);
+      const observed = boundary !== undefined && boundary.callId === result.callId && nativeBlock?.["tool_use_id"] === result.callId
+        && resultEntryId !== undefined && !result.isError && result.output.trim() !== "" && result.output === inlineText && artifact === undefined;
+      if (observed) boundary.resultEntryId = resultEntryId;
       await this.#emit(runtime, turn, {
         type: "tool_result",
         callId: result.callId,
         name: runtime.toolNames.get(result.callId) ?? "Tool",
         output: result.output,
         isError: result.isError,
-        ...(artifact === undefined ? {} : { artifact })
-      });
+        ...(artifact === undefined ? {} : { artifact }),
+        ...(observed ? { nativeHistory: { identity: { entryId: resultEntryId, parentEntryId: boundary.toolEntryId } } } : {})
+      }, turn.context, observed ? { [NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD]: true } : undefined);
     }
   }
 
@@ -4723,13 +4769,23 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     );
     const seconds = finite(envelope["elapsed_time_seconds"]);
     if (seconds === undefined) return;
+    const boundary = turn.proseBeforeTool;
+    const observed = boundary !== undefined && envelope["parent_tool_use_id"] === null
+      && envelope["tool_use_id"] === boundary.callId;
     await this.#emit(runtime, turn, {
       type: "tool_update",
       callId,
       name,
       outputMode: "replace",
-      output: `Running for ${Math.max(0, Math.floor(seconds))} seconds.`
-    });
+      output: `Running for ${Math.max(0, Math.floor(seconds))} seconds.`,
+      ...(observed ? { nativeHistory: { identity: { entryId: boundary.toolEntryId, parentEntryId: boundary.entryId } } } : {})
+    }, turn.context, observed ? { [NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD]: true } : undefined);
+  }
+
+  #canObserveOrdinaryProse(runtime: NativeRuntime, turn: ActiveTurn): boolean {
+    return runtime.runtimePolicy === "standard" && !runtime.remote && turn.context.hostedExecution === undefined
+      && turn.partnerLearningTurn === undefined && !turn.nativeContinuationSegment && !turn.childOutputObserved
+      && turn.steers.size === 0 && turn.pendingContinuationTaskIds.size === 0 && this.#rootWakeTaskIds(runtime).length === 0;
   }
 
   async #handleResult(
@@ -4803,23 +4859,27 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       selectedModelId: this.#projection.text(observedSubstitution.selectedModelId),
       actualModelId: this.#projection.text(observedSubstitution.actualModelId)
     };
-    // One fully observed parent frame and one stream block can be confirmed by
-    // their SDK identities when Host next reads the persisted native Session.
     const textStream = turn.textStream;
-    const textObservation = result.outcome === "completed" && result.error === undefined
-      && runtime.runtimePolicy === "standard" && !runtime.remote && turn.context.hostedExecution === undefined
-      && turn.partnerLearningTurn === undefined && !turn.nativeContinuationSegment && !turn.childOutputObserved
-      && turn.steers.size === 0 && turn.pendingContinuationTaskIds.size === 0 && this.#rootWakeTaskIds(runtime).length === 0
-      && turn.parentStreamMessages === 1 && turn.parentStreamSegment === undefined
-      && turn.blocks.length === 1 && turn.blocks[0]?.kind === "text"
-      && turn.textAssistant && textStream && textStream.messageId === turn.textAssistant.messageId
+    const boundary = turn.proseBeforeTool;
+    const ordinaryText = result.outcome === "completed" && result.error === undefined && this.#canObserveOrdinaryProse(runtime, turn)
+      && turn.parentStreamSegment === undefined && turn.textAssistant && textStream
+      && textStream.messageId === turn.textAssistant.messageId;
+    const [, call, receipt, afterTool] = turn.blocks;
+    const ordinaryToolReply = ordinaryText && boundary?.resultEntryId !== undefined && turn.parentStreamMessages === 2
+      && turn.blocks.length === 4 && call?.kind === "tool_call" && call.callId === boundary.callId
+      && receipt?.kind === "tool_result" && receipt.callId === boundary.callId && afterTool?.kind === "text"
+      && textStream?.messageId !== boundary.messageId;
+    const blocks = turn.blocks.slice(ordinaryToolReply ? 3 : boundary === undefined ? 0 : 1);
+    // The Host confirms the exact SDK entry before adopting either live row.
+    const textObservation = ordinaryText && turn.textAssistant && textStream && (ordinaryToolReply
+      || (boundary === undefined && turn.parentStreamMessages === 1 && blocks.length === 1 && blocks[0]?.kind === "text"))
       ? { entryId: turn.textAssistant.entryId, blockId: textStream.blockId }
       : undefined;
-    if (turn.blocks.length > 0) {
+    if (blocks.length > 0) {
       await this.#emit(runtime, turn, {
         type: "message_complete",
         role: "assistant",
-        blocks: [...turn.blocks],
+        blocks,
         usage: generation.usage,
         ...(textObservation === undefined ? {} : { nativeHistory: {} }),
         ...(modelSubstitution === undefined ? {} : { modelSubstitution }),
@@ -4829,7 +4889,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         })
       }, turn.context, textObservation === undefined ? undefined : {
         [NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD]: textObservation.entryId,
-        [NATIVE_HISTORY_ASSISTANT_STREAM_FIELD]: textObservation.blockId
+        [NATIVE_HISTORY_ASSISTANT_STREAM_FIELD]: textObservation.blockId,
+        ...(ordinaryToolReply && boundary?.resultEntryId !== undefined
+          ? { [NATIVE_HISTORY_ASSISTANT_TOOL_RESULT_FIELD]: boundary.resultEntryId } : {})
       });
       if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
     }
@@ -4896,6 +4958,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     }
     turn.blocks.splice(0);
     turn.stream.reset();
+    turn.textStream = undefined;
+    turn.textAssistant = undefined;
+    turn.proseBeforeTool = undefined;
     turn.assistantError = undefined;
     turn.childOutputObserved = false;
     turn.parentAssistantMessages = 0;
