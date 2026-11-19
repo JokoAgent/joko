@@ -11087,7 +11087,9 @@ export class OperationalStore {
         && (payload.role !== "assistant" || !validModelSubstitution(payload.modelSubstitution))) {
         throw new StoreError("A model substitution requires an exact assistant completion and bounded model identities.");
       }
-      if (payload.type === "device_changed") throw new StoreError("Device content cannot use Session routing.");
+      if (payload.type === "device_changed" || payload.type === "extension_oauth_changed") {
+        throw new StoreError("Owner events cannot use Session routing.");
+      }
       if (payload.type === "resource_usage" && (
         input.runId === undefined || payload.runtimeGeneration !== input.generation
       )) {
