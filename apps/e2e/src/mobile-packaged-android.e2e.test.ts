@@ -170,7 +170,8 @@ afterEach(async () => {
 }, 90_000);
 
 nativeIt("pairs with a trusted node key, sends through native rich input, opens canonical resources, and resumes without resending", {
-  timeout: 480_000
+  // Leave time for the final website request, render, and diagnostic deadlines after the device workflow.
+  timeout: 600_000
 }, async () => {
   if (!serial || !/^emulator-\d+$/u.test(serial) || !avd?.startsWith("joko-")
     || !adbExecutable || !isAbsolute(adbExecutable) || !apkPath || !isAbsolute(apkPath)) {
@@ -595,12 +596,14 @@ async function runNativeScenario(): Promise<void> {
   await completeStep();
 
   await beginStep("open-isolated-html-website");
-  const siteRequests: boolean[] = [];
   const websiteEvidence = { addressEntered: false, requestCount: 0, requestsWithCredentials: 0 };
   evidence!.website = websiteEvidence;
   const site = createServer((request, response) => {
     if (request.url !== "/viewer") { response.writeHead(404).end(); return; }
-    siteRequests.push(request.headers.authorization !== undefined || request.headers.cookie !== undefined);
+    websiteEvidence.requestCount += 1;
+    if (request.headers.authorization !== undefined || request.headers.cookie !== undefined) {
+      websiteEvidence.requestsWithCredentials += 1;
+    }
     response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }).end(
       '<meta name="viewport" content="width=device-width"><h1>Isolated website fixture</h1>');
   });
@@ -631,7 +634,7 @@ async function runNativeScenario(): Promise<void> {
         throw new Error(`Native HTML address entry did not settle. Address field: ${JSON.stringify(observed.find(isAddressField)?.text ?? null)}`, { cause: error });
       }
     });
-    expect(siteRequests).toEqual([]);
+    expect(websiteEvidence.requestCount).toBe(0);
     try {
       await interaction("tap", async () => {
         const open = await waitFor(async () => {
@@ -644,9 +647,9 @@ async function runNativeScenario(): Promise<void> {
         }, (node) => node !== undefined, "Open in the native HTML address row", 15_000);
         await tapNode(open!);
       });
-      await waitFor(async () => siteRequests.length, (count) => count > 0, "request to the isolated website fixture", 25_000);
+      await waitFor(async () => websiteEvidence.requestCount, (count) => count > 0, "request to the isolated website fixture", 25_000);
       await waitNode((node) => node.text === "Isolated website fixture" || node.contentDescription === "Isolated website fixture", "isolated website rendered in the native app");
-      expect(siteRequests.every((credentialSent) => !credentialSent)).toBe(true);
+      expect(websiteEvidence.requestsWithCredentials).toBe(0);
       await screenshot("html-website");
       await tap("Previous page");
       await waitAddress(detailsAddress);
@@ -656,11 +659,9 @@ async function runNativeScenario(): Promise<void> {
       const observed = await nodes(Date.now() + 5_000).catch(() => []);
       const messages = observed.flatMap(node => [node.text, node.contentDescription]).filter(value =>
         value === "Enter a valid web address without credentials." || value === "Could not load this website. Refresh or return to the file.");
-      throw new Error(`Native HTML website step failed after ${siteRequests.length} fixture requests. Address: ${JSON.stringify(observed.find(isAddressField)?.text ?? null)}. UI messages: ${JSON.stringify(messages)}`, { cause: error });
+      throw new Error(`Native HTML website step failed after ${websiteEvidence.requestCount} fixture requests. Address: ${JSON.stringify(observed.find(isAddressField)?.text ?? null)}. UI messages: ${JSON.stringify(messages)}`, { cause: error });
     }
   } finally {
-    websiteEvidence.requestCount = siteRequests.length;
-    websiteEvidence.requestsWithCredentials = siteRequests.filter(Boolean).length;
     try { if (siteReverse !== undefined) await adb("reverse", "--remove", siteReverse); }
     finally { site.closeAllConnections(); await new Promise<void>((resolve) => site.close(() => resolve())); }
   }

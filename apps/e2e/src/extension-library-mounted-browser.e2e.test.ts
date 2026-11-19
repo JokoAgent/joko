@@ -30,7 +30,9 @@ describe("mounted Extension Library main-view bridge", () => {
   mountedIt("runs the injected file and SQLite bridge in wide and narrow Chromium viewports", async () => {
     const executablePath = requiredEnvironment("JOKO_BROWSER_EXECUTABLE");
     const webDirectory = resolve(requiredEnvironment("JOKO_MOUNTED_WEB_DIR"));
-    fixture = await ExtensionLibrarySystemFixture.start({ webDirectory });
+    let holdPreview: ((method: string) => Promise<void>) | undefined;
+    fixture = await ExtensionLibrarySystemFixture.start({ webDirectory,
+      beforePreviewImage: async method => { await holdPreview?.(method); } });
     const manager = await fixture.pair("Mounted Library manager");
     const extension = await installLibraryExtension(fixture, manager);
     await writeLibraryVideo(manager, extension);
@@ -109,18 +111,17 @@ describe("mounted Extension Library main-view bridge", () => {
 
     let resumeImageResponse!: () => void;
     const imageResponseGate = new Promise<void>(resolve => { resumeImageResponse = resolve; });
-    const imageUrl = "**/preview.png";
-    await page.route(imageUrl, async route => {
+    let requestedMethod: string | undefined;
+    holdPreview = async method => {
+      requestedMethod = method;
       await imageResponseGate;
-      await route.continue();
-    });
+    };
     const preview = frame.locator("#preview-image");
     try {
-      const [imageRequest] = await Promise.all([
-        page.waitForRequest(imageUrl, { timeout: 10_000 }),
-        frame.getByRole("button", { name: "Show preview" }).click()
-      ]);
-      expect(imageRequest.method()).toBe("GET");
+      await frame.getByRole("button", { name: "Show preview" }).click();
+      const method = await waitFor(async () => requestedMethod, value => value !== undefined,
+        "the server-side preview request", 10_000);
+      expect(method).toBe("GET");
       await frame.getByRole("button", { name: "Clear preview" }).click();
       expect(await preview.evaluate(element => element.hasAttribute("src"))).toBe(false);
       resumeImageResponse();
@@ -130,7 +131,7 @@ describe("mounted Extension Library main-view bridge", () => {
       expect(await preview.evaluate(element => element.hasAttribute("src"))).toBe(false);
     } finally {
       resumeImageResponse();
-      await page.unroute(imageUrl);
+      holdPreview = undefined;
     }
 
     const video = await result.evaluate(async () => {
