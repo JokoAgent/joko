@@ -327,6 +327,7 @@ function providerWith(options: {
     killServer: vi.fn(async () => undefined),
     connect: vi.fn(async (endpoint) => ({ endpoint, output: "connected" })),
     disconnect: vi.fn(async (endpoint) => ({ endpoint, output: "disconnected" })),
+    readScreenSize: vi.fn(async () => (options.snapshot ?? snapshot()).screen),
     snapshot: vi.fn(async () => options.snapshot ?? snapshot()),
     tap: vi.fn(async () => undefined),
     swipe: vi.fn(async () => undefined),
