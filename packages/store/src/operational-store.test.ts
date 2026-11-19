@@ -3320,6 +3320,59 @@ describe("OperationalStore", () => {
     expect(reopened.recoverStartup("recover-again").recoveredQueueItemIds).toEqual([]);
   });
 
+  it.each(["after Done", "after Run and Attempt settlement", "a different Operation"] as const)(
+    "recovers the original Claude input on restart with %s", (interruption) => {
+      const fixture = createFixture("claude-code");
+      const store = fixture.store;
+      const session = store.getSession("session-1").descriptor;
+      const connection = store.createConnection({ id: "claude-owner", name: "Claude Owner", authKeyDigest: "claude-owner-digest" });
+      const operationId = "send-claude-input";
+      store.createAttempt({ id: "attempt-1", runId: "run-1", ordinal: 1, generation: session.binding.generation, startedAt: 3 });
+      store.runAuthorizedOperation(connection.id, connection.authKeyDigest, {
+        id: operationId, kind: "sendInput", body: { payload: { case: "sendInput", value: { sessionId: session.id } } }
+      }, (transaction) => {
+        transaction.enqueueQueueItem({ id: "queue-1", sessionId: session.id, runId: "run-1", attemptId: "attempt-1",
+          operationId, disposition: "prompt", body: fixture.prompt });
+        return { accepted: true, resultCase: "queueItem", entityId: "queue-1" };
+      });
+      store.claimNextQueueItem({ sessionId: session.id, backendInstanceGeneration: 0, traceId: "dispatch" });
+      store.updateRunState({ runId: "run-1", state: "running", activeAttemptId: "attempt-1", traceId: "running", startedAt: 4 });
+      store.updateQueueState({ queueItemId: "queue-1", state: "backend_accepted", attemptId: "attempt-1", traceId: "accepted", at: 5 });
+      const doneOperation = interruption === "a different Operation" ? "different-input" : operationId;
+      if (doneOperation !== operationId) store.runOperation({ id: doneOperation, kind: "fixture", body: {} }, () => ({}));
+      const done = store.appendEvent({ sessionId: session.id, backendId: session.backendId, targetId: session.targetId,
+        runId: "run-1", attemptId: "attempt-1", operationId: doneOperation, generation: session.binding.generation,
+        traceId: "sdk-result", emittedAt: 20, payload: { type: "done", outcome: "completed" } });
+      if (interruption === "after Run and Attempt settlement") {
+        store.updateRunState({ runId: "run-1", state: "completed", traceId: "settled", endedAt: 21 });
+        store.finishAttempt("attempt-1", undefined, 22);
+      }
+
+      const filePath = store.filePath;
+      store.close();
+      const reopened = new OperationalStore(filePath);
+      fixture.replaceStore(reopened);
+      const recovery = reopened.recoverStartup("recover-claude");
+      expect(recovery.recoveredQueueItemIds).toEqual(["queue-1"]);
+      expect(recovery.affectedRunIds).toEqual(["run-1"]);
+      expect(reopened.findEvent(done.id)?.payload).toEqual({ type: "done", outcome: "completed" });
+      if (interruption === "a different Operation") {
+        expect(reopened.getQueueItem("queue-1").state).toBe("dispatch_unknown");
+        expect(reopened.getRun("run-1").descriptor.state).toBe("dispatch_unknown");
+      } else {
+        const earlierSettlement = interruption === "after Run and Attempt settlement";
+        expect(reopened.getQueueItem("queue-1")).toMatchObject({ state: "completed", attemptId: "attempt-1", operationId,
+          completedAt: earlierSettlement ? 21 : 20 });
+        expect(reopened.getRun("run-1").descriptor).toMatchObject({ state: "completed", activeAttemptId: "attempt-1",
+          endedAt: earlierSettlement ? 21 : 20 });
+        expect(reopened.getAttempt("attempt-1").descriptor).toMatchObject({ endedAt: earlierSettlement ? 22 : 20 });
+        expect(reopened.getAttempt("attempt-1").descriptor.error).toBeUndefined();
+        expect(recovery.events.filter(event => event.payload.type === "run_state")).toHaveLength(earlierSettlement ? 0 : 1);
+      }
+      expect(reopened.recoverStartup("recover-again").recoveredQueueItemIds).toEqual([]);
+    }
+  );
+
   it("dismisses an open interaction after restart instead of accepting a response without a Backend waiter", () => {
     const fixture = createFixture();
     const session = fixture.store.getSession("session-1");
@@ -6176,7 +6229,7 @@ function prepareLearningFixture() {
         blocks: [{ kind: "text", text: "Original assistant reply." }] } }) };
 }
 
-function createFixture(): {
+function createFixture(adapterKind = "fixture"): {
   store: OperationalStore;
   replaceStore: (replacement: OperationalStore) => void;
   prompt: {
@@ -6193,7 +6246,7 @@ function createFixture(): {
     displayName: "Pi",
     version: "latest-installed",
     health: "healthy",
-    adapterKind: "fixture",
+    adapterKind,
     instanceGeneration: 0,
     installationState: "installed",
     authenticationState: "not_required",
