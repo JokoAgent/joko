@@ -13,14 +13,18 @@ describe("appearance preferences", () => {
     expect(normalizeAppearancePreferences({
       uiFamily: "  Inter  ",
       codeFamily: 42,
+      terminalFamily: "  Terminal Mono  ",
       uiSize: 99,
       codeSize: 9.6,
+      terminalSize: 18.2,
       windowZoom: 1.26
     })).toEqual({
       uiFamily: "Inter",
       codeFamily: "",
+      terminalFamily: "Terminal Mono",
       uiSize: 24,
       codeSize: 10,
+      terminalSize: 18,
       windowZoom: 1.3
     });
     expect(normalizeAppearancePreferences(null)).toEqual(DEFAULT_APPEARANCE_PREFERENCES);
@@ -39,5 +43,7 @@ describe("appearance preferences", () => {
     expect(setProperty).toHaveBeenCalledWith("--app-code-font-size", "14px");
     expect(removeProperty).toHaveBeenCalledWith("--app-font-ui");
     expect(removeProperty).toHaveBeenCalledWith("--app-font-code");
+    expect(removeProperty).toHaveBeenCalledWith("--app-font-terminal");
+    expect(removeProperty).toHaveBeenCalledWith("--app-terminal-font-size");
   });
 });

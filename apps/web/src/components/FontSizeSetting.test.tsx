@@ -128,6 +128,21 @@ describe("FontSizeSetting", () => {
     expect(container.querySelector('[role="alert"]')).toBeNull();
   });
 
+  it("restores an inherited size when the saved override equals the current inherited value", async () => {
+    const save = vi.fn(async (_size: number) => undefined);
+    const restore = vi.fn(async () => undefined);
+    const onSuccess = vi.fn();
+    const container = await renderSetting(<FontSizeSetting label="Terminal font size" description="" value={18}
+      min={10} max={24} defaultValue={18} normalize={Math.round} onChange={save}
+      resetOverride={{ customized: true, restore }} onSuccess={onSuccess} t={t} />);
+    const reset = required(container.querySelector<HTMLButtonElement>('button[aria-label="Reset"]'));
+    expect(reset.disabled).toBe(false);
+    await act(async () => reset.click());
+    expect(restore).toHaveBeenCalledOnce();
+    expect(save).not.toHaveBeenCalled();
+    expect(onSuccess).toHaveBeenCalledExactlyOnceWith("Restored default settings");
+  });
+
   it("retires late feedback across action replacement and unmount without cancelling mutations", async () => {
     const stale = deferred<void>();
     const afterUnmount = deferred<void>();

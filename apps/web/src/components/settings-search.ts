@@ -61,6 +61,7 @@ export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
   ...group("general", "settings.appearance", [
     "settings.appearance", "settings.theme", "settings.locale", "settings.appearance.fonts",
     "settings.appearance.uiFamily", "settings.appearance.uiSize", "settings.appearance.codeFamily", "settings.appearance.codeSize",
+    "settings.appearance.terminalFamily", "settings.appearance.terminalSize",
     "settings.layoutResetTitle"
   ], { subsection: "appearance", aliases: ["appearance", "theme", "font", "language", "外观", "主题", "字体", "语言"] }),
   ...group("general", "settings.appearance", ["settings.wallpaper.title"], { subsection: "appearance", capability: "appearance.wallpaper" }),

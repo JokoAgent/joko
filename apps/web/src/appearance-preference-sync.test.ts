@@ -42,7 +42,7 @@ it("broadcasts only a content-free current-v1 invalidation and ignores malformed
   sender.close();
 });
 
-it("projects only the six shared appearance fields", () => {
+it("adopts shared appearance and preserves each window's other preferences", () => {
   const current = {
     ...DEFAULT_UI_PREFERENCES,
     theme: "light" as const,
@@ -54,8 +54,10 @@ it("projects only the six shared appearance fields", () => {
     ...DEFAULT_UI_PREFERENCES,
     uiFamily: "Inter",
     codeFamily: "Mono",
+    terminalFamily: "Terminal Mono",
     uiSize: 18,
     codeSize: 16,
+    terminalSize: 18,
     theme: "dark" as const,
     locale: "en" as const,
     composerSendShortcut: "enter" as const,
@@ -67,8 +69,10 @@ it("projects only the six shared appearance fields", () => {
     theme: "dark",
     uiFamily: "Inter",
     codeFamily: "Mono",
+    terminalFamily: "Terminal Mono",
     uiSize: 18,
     codeSize: 16,
+    terminalSize: 18,
     windowZoom: 2,
     locale: "zh-CN",
     composerSendShortcut: "modifier-enter"

@@ -29,8 +29,10 @@ export function sameAppearanceProjection(left: UiPreferences, right: UiPreferenc
   return left.theme === right.theme
     && left.uiFamily === right.uiFamily
     && left.codeFamily === right.codeFamily
+    && left.terminalFamily === right.terminalFamily
     && left.uiSize === right.uiSize
     && left.codeSize === right.codeSize
+    && left.terminalSize === right.terminalSize
     && left.windowZoom === right.windowZoom;
 }
 
@@ -41,8 +43,10 @@ export function withAppearanceProjection(current: UiPreferences, source: UiPrefe
     theme: source.theme,
     uiFamily: source.uiFamily,
     codeFamily: source.codeFamily,
+    terminalFamily: source.terminalFamily,
     uiSize: source.uiSize,
     codeSize: source.codeSize,
+    terminalSize: source.terminalSize,
     windowZoom: source.windowZoom
   };
 }

@@ -3,6 +3,7 @@ import { act } from "react";
 import { createPortal } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
+import { applyAppearanceTypography, DEFAULT_APPEARANCE_PREFERENCES } from "../appearance-settings.js";
 import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
 import type { TerminalAppearanceView, TerminalCapabilitiesView, TerminalUpdateView, TerminalView } from "../model.js";
@@ -42,6 +43,62 @@ afterEach(async () => {
 const capabilities: TerminalCapabilitiesView = { support: "supported", shells: [{ id: "shell", label: "Shell" }], defaultShellId: "shell", maximumTerminals: 16, maximumInputBytes: 5, maximumColumns: 500, maximumRows: 200 };
 const initial: TerminalView = { id: "terminal-one", sessionId: "session-one", targetId: "target-one", generation: 1n, status: "running", exitConfirmed: false, shellId: "shell", shellLabel: "Shell", cwd: "/workspace", columns: 80, rows: 24, createdAt: 1, updatedAt: 1 };
 const t = (key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate("en", key, values);
+
+it("fits the open terminal in the new typeface after it loads", async () => {
+  vi.stubGlobal("ResizeObserver", class { observe() {} disconnect() {} });
+  vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(700);
+  vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(400);
+  const rootElement = document.documentElement;
+  const priorStyle = rootElement.getAttribute("style");
+  const computedStyle = document.createElement("div").style;
+  vi.spyOn(window, "getComputedStyle").mockImplementation(() => {
+    computedStyle.fontFamily = rootElement.style.getPropertyValue("--app-font-terminal").split(",")[0] || "monospace";
+    computedStyle.fontSize = rootElement.style.getPropertyValue("--app-terminal-font-size") || "14px";
+    return computedStyle;
+  });
+  let releaseFont!: () => void;
+  const load = vi.fn((_font: string) => new Promise<FontFace[]>((resolve) => { releaseFont = () => resolve([]); }));
+  const priorFonts = Object.getOwnPropertyDescriptor(document, "fonts");
+  Object.defineProperty(document, "fonts", { configurable: true, value: {
+    ready: Promise.resolve(), check: (font: string) => !font.includes("Fixture Mono"), load
+  } });
+  const watchTerminal = vi.fn<AppController["watchTerminal"]>(async (_session, _terminal, _generation, _appearance, update, _after, signal) => {
+    await update({ kind: "reset", terminal: initial, appearanceRevision: 1n, activeColorOverrides: "", sequence: 1n, data: "Original screen" });
+    if (signal === undefined || signal.aborted) return;
+    await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+  });
+  const controller = {
+    state: { connectionState: "connected" }, watchTerminal, getTerminal: vi.fn(async () => initial),
+    updateTerminalAppearance: vi.fn<AppController["updateTerminalAppearance"]>(async (_session, _terminal, _generation, appearance) => ({
+      accepted: true, acceptedViewRevision: appearance.viewRevision, appearanceRevision: 1n, ownsDefaults: false
+    }))
+  } as unknown as AppController;
+  try {
+    root = createRoot(document.body.appendChild(document.createElement("div")));
+    await act(async () => root!.render(<InteractiveTerminalPanel active controller={controller} sessionId={initial.sessionId}
+      terminalId={initial.id} capabilities={capabilities} t={t} onState={vi.fn()} />));
+    await vi.waitFor(() => expect(mocks.fit).toHaveBeenCalled());
+    const terminal = mocks.terminals[0];
+    const fits = mocks.fit.mock.calls.length;
+    expect(terminal.options).toMatchObject({ fontFamily: "monospace", fontSize: 14 });
+
+    await act(async () => applyAppearanceTypography({ ...DEFAULT_APPEARANCE_PREFERENCES,
+      terminalFamily: '"Fixture Mono"', terminalSize: 18
+    }, [rootElement]));
+    await vi.waitFor(() => expect(load).toHaveBeenCalledExactlyOnceWith('18px "Fixture Mono"'));
+    expect(terminal.options).toMatchObject({ fontFamily: "monospace", fontSize: 14 });
+    await act(async () => releaseFont());
+    await vi.waitFor(() => expect(terminal.options).toMatchObject({ fontFamily: '"Fixture Mono"', fontSize: 18 }));
+    expect(mocks.fit.mock.calls.length).toBeGreaterThan(fits);
+    expect(watchTerminal).toHaveBeenCalledOnce();
+    expect(terminal.write).toHaveBeenCalledWith("Original screen", expect.any(Function));
+    expect(terminal.dispose).not.toHaveBeenCalled();
+  } finally {
+    if (priorFonts === undefined) Reflect.deleteProperty(document, "fonts");
+    else Object.defineProperty(document, "fonts", priorFonts);
+    if (priorStyle === null) rootElement.removeAttribute("style"); else rootElement.setAttribute("style", priorStyle);
+  }
+});
 
 it("waits for the live appearance acknowledgement, replays current overrides after queued theme changes and retires old connections", async () => {
   vi.stubGlobal("ResizeObserver", class { observe = vi.fn(); disconnect = vi.fn(); });

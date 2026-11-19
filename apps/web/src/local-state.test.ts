@@ -19,8 +19,10 @@ describe("durable UI preferences", () => {
       ...DEFAULT_UI_PREFERENCES,
       uiFamily: '"HarmonyOS Sans SC"',
       codeFamily: '"JetBrains Mono Variable", "JetBrains Mono"',
+      terminalFamily: '"Consolas"',
       uiSize: 18,
       codeSize: 24,
+      terminalSize: 18,
       windowZoom: 0.7,
       navigationMode: "rail" as const,
       navigationOpen: true,
@@ -56,6 +58,11 @@ describe("durable UI preferences", () => {
       }
     };
     expect(normalizeUiPreferences(current)).toEqual(current);
+  });
+
+  it("keeps existing code and interface preferences with the terminal following code by default", () => {
+    expect(normalizeUiPreferences({ codeFamily: "Consolas", codeSize: 20, locale: "zh-CN" }))
+      .toMatchObject({ codeFamily: "Consolas", codeSize: 20, locale: "zh-CN", terminalFamily: "", terminalSize: null });
   });
 
   it("rehydrates sparse non-default overrides without discarding them", () => {

@@ -1,8 +1,10 @@
 export interface AppearancePreferences {
   readonly uiFamily: string;
   readonly codeFamily: string;
+  readonly terminalFamily: string;
   readonly uiSize: number;
   readonly codeSize: number;
+  readonly terminalSize: number | null;
   readonly windowZoom: number;
 }
 
@@ -11,8 +13,10 @@ export type WindowZoomIntent = "increase" | "decrease" | "reset";
 export const DEFAULT_APPEARANCE_PREFERENCES: AppearancePreferences = {
   uiFamily: "",
   codeFamily: "",
+  terminalFamily: "",
   uiSize: 14,
   codeSize: 14,
+  terminalSize: null,
   windowZoom: 1
 };
 
@@ -56,8 +60,10 @@ export function normalizeAppearancePreferences(value: unknown): AppearancePrefer
   return {
     uiFamily: normalizeFontFamily(record["uiFamily"]),
     codeFamily: normalizeFontFamily(record["codeFamily"]),
+    terminalFamily: normalizeFontFamily(record["terminalFamily"]),
     uiSize: typeof record["uiSize"] === "number" ? clampUiSize(record["uiSize"]) : DEFAULT_APPEARANCE_PREFERENCES.uiSize,
     codeSize: typeof record["codeSize"] === "number" ? clampCodeSize(record["codeSize"]) : DEFAULT_APPEARANCE_PREFERENCES.codeSize,
+    terminalSize: typeof record["terminalSize"] === "number" ? clampCodeSize(record["terminalSize"]) : null,
     windowZoom: typeof record["windowZoom"] === "number" ? clampWindowZoom(record["windowZoom"]) : DEFAULT_APPEARANCE_PREFERENCES.windowZoom
   };
 }
@@ -65,14 +71,17 @@ export function normalizeAppearancePreferences(value: unknown): AppearancePrefer
 export function appearanceStyleProperties(settings: AppearancePreferences): Readonly<Record<string, string | undefined>> {
   const uiFamily = normalizeFontFamily(settings.uiFamily);
   const codeFamily = normalizeFontFamily(settings.codeFamily);
+  const terminalFamily = normalizeFontFamily(settings.terminalFamily);
   const uiSize = clampUiSize(settings.uiSize);
   const codeSize = clampCodeSize(settings.codeSize);
   const scale = uiSize / DEFAULT_APPEARANCE_PREFERENCES.uiSize;
   const properties: Record<string, string | undefined> = {
     "--app-font-ui": uiFamily ? `${uiFamily}, var(--app-font-ui-default)` : undefined,
     "--app-font-code": codeFamily ? `${codeFamily}, var(--app-font-code-default)` : undefined,
+    "--app-font-terminal": terminalFamily ? `${terminalFamily}, var(--font-mono)` : undefined,
     "--app-ui-font-size": `${uiSize}px`,
-    "--app-code-font-size": `${codeSize}px`
+    "--app-code-font-size": `${codeSize}px`,
+    "--app-terminal-font-size": settings.terminalSize === null ? undefined : `${clampCodeSize(settings.terminalSize)}px`
   };
   for (const size of UI_TEXT_TOKEN_SIZES) properties[`--text-${size}`] = `${Math.round(size * scale)}px`;
   return properties;

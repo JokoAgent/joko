@@ -149,6 +149,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
       });
     });
     let frame: number | undefined;
+    let fontLoad: { readonly font: string; settled: boolean } | undefined;
     let resizeChain = Promise.resolve();
     const fitTerminal = (): void => {
       if (frame !== undefined) return;
@@ -156,8 +157,24 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
         frame = undefined;
         if (!alive || restoringScreenRef.current || !latest.current.active || slot.clientWidth <= 0 || slot.clientHeight <= 0) return;
         const style = ownerWindow.getComputedStyle(slot);
-        terminal.options.fontFamily = style.fontFamily;
-        terminal.options.fontSize = Number.parseFloat(style.fontSize) || 14;
+        const family = style.fontFamily;
+        const size = Number.parseFloat(style.fontSize) || 14;
+        const fonts = slot.ownerDocument.fonts;
+        const font = `${size}px ${family}`;
+        if (family && fonts !== undefined && !fonts.check(font)) {
+          if (fontLoad?.font !== font) {
+            const load = { font, settled: false };
+            fontLoad = load;
+            const settle = (): void => {
+              load.settled = true;
+              if (alive && fontLoad === load) fitTerminal();
+            };
+            void fonts.load(font).then(settle, settle);
+          }
+          if (!fontLoad.settled) return;
+        }
+        terminal.options.fontFamily = family;
+        terminal.options.fontSize = size;
         fit.fit();
         const columns = Math.max(2, Math.min(terminal.cols, latest.current.capabilities.maximumColumns));
         const rows = Math.max(1, Math.min(terminal.rows, latest.current.capabilities.maximumRows));
