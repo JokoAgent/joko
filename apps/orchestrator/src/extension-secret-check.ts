@@ -22,8 +22,9 @@ export async function checkExtensionSecretCandidate(input: {
   readonly declaration: ExtensionNetworkDeclaration; readonly secret: ExtensionNetworkSecret; readonly value: string;
   readonly fetch: typeof fetch; readonly signal: AbortSignal; readonly assertCurrent: () => void;
 }): Promise<{ readonly valid: boolean; readonly expiresAt?: number }> {
-  const { secret, value } = input;
-  if (!secret.check || secret.source === "oauth" || !value || Buffer.byteLength(value) > MAXIMUM_BYTES || /[\r\n]/u.test(value)) {
+  const { secret } = input;
+  const value = input.value.trim();
+  if (!secret.check || secret.source === "oauth" || !value || Buffer.byteLength(input.value) > MAXIMUM_BYTES || /[\r\n]/u.test(value)) {
     throw new Error("The credential candidate cannot be checked.");
   }
   const signal = AbortSignal.any([input.signal, AbortSignal.timeout(15_000)]);
