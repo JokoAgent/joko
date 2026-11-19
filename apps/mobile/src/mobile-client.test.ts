@@ -12698,9 +12698,11 @@ describe("native current-task cloning", () => {
     f.network.readOwner = vi.fn(async () => ({ connection, device, snapshot: create(SnapshotSchema, {
       ...runtimeControlProjection(f.state.session, false), sessions, backends: [f.state.backend]
     }) }));
-    f.network.readSession = vi.fn(async (_credential, id) => create(SnapshotSchema, {
+    f.network.readSession = vi.fn<MobileNetwork["readSession"]>(async (_credential, id) => create(SnapshotSchema, {
       ...runtimeControlProjection(sessions.find(item => item.sessionId === id), true), backends: [f.state.backend],
-      scope: { kind: { case: "session", value: { sessionId: id } } }
+      scope: create(SnapshotScopeSchema, {
+        kind: { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId: id, recentTimelineItems: 120 }) }
+      })
     }));
     const app = client(f.network, memoryStorage(credential).storage);
     await app.start();

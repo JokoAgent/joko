@@ -45,18 +45,20 @@ export interface MobileMessageReferenceLease {
   readonly messageId: string;
   readonly eventId: string;
   readonly text: string;
+  readonly includeBody: boolean;
   readonly draft: MobileComposerDraft;
   readonly selection: MobileComposerSelection;
 }
 
 export function captureMobileMessageReference(input: { readonly ownerKey: string; readonly draftOwnerKey: string;
   readonly sessionId: string; readonly row: TimelineRow; readonly draft: MobileComposerDraft;
-  readonly selection: MobileComposerSelection; readonly locale: MobileSupportedLocale }): MobileMessageReferenceLease | undefined {
+  readonly selection: MobileComposerSelection; readonly locale: MobileSupportedLocale; readonly includeBody?: boolean }): MobileMessageReferenceLease | undefined {
   const row = input.row;
   if (!input.ownerKey || !input.draftOwnerKey || !input.sessionId || !row.completed || row.optimistic || row.internalInput
     || row.kind === "user" && row.partnerPrivateOrigin || row.kind !== "user" && row.kind !== "assistant") return undefined;
   return { ownerKey: input.ownerKey, draftOwnerKey: input.draftOwnerKey, sessionId: input.sessionId,
     messageId: row.id, eventId: row.eventId, text: buildMobileMessageCopyText(row, input.locale), draft: input.draft,
+    includeBody: input.includeBody !== false && Boolean((row.copySource?.body ?? row.sourceText ?? row.text).trim()),
     selection: { ...input.selection } };
 }
 
@@ -72,7 +74,7 @@ export function commitMobileMessageReference(input: { readonly lease: MobileMess
     throw new Error("The source message or composer changed. Open the message actions again.");
   }
   return insertMobileMessageReference(input.draft, lease.selection,
-    { sessionId: lease.sessionId, messageId: lease.messageId, eventId: lease.eventId, text: lease.text }, input.atomId);
+    { sessionId: lease.sessionId, messageId: lease.messageId, eventId: lease.eventId, text: lease.text, includeBody: lease.includeBody }, input.atomId);
 }
 
 function sideChatQuoteText(row: TimelineRow, locale: MobileSupportedLocale): string | undefined {

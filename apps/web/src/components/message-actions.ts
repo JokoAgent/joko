@@ -1,5 +1,8 @@
 import type { ComposerMessageMentionDraft, TimelineItemView } from "../model.js";
 import { isInternalContinuationTimelineItem } from "../runtime-recovery.js";
+import { isTaskMessageReferenceAnchor, taskMessageReferenceHref } from "@joko/contracts";
+import type { ComposerRouteReferenceAttrs } from "./ComposerRouteReferenceNode.js";
+import { summarizeComposerMessageReference } from "./composer-route-reference-resolution.js";
 
 export interface MessageForkTarget {
   readonly entryId: string;
@@ -112,6 +115,17 @@ export function createMessageComposerMention(
     role: item.kind,
     ...(item.sourceEventId === undefined ? {} : { sourceEventId: item.sourceEventId })
   };
+}
+
+export function wholeMessageComposerReference(mention: ComposerMessageMentionDraft, item: TimelineItemView): ComposerRouteReferenceAttrs | undefined {
+  if (mention.sourceEventId === undefined || item.streaming === true || item.text === undefined) return undefined;
+  const display = summarizeComposerMessageReference(item.text);
+  if (display === "") return undefined;
+  const anchor = { sourceSessionId: mention.sessionId, messageId: mention.reference, eventId: mention.sourceEventId };
+  if (!isTaskMessageReferenceAnchor(anchor)) return undefined;
+  const href = taskMessageReferenceHref(anchor);
+  return { kind: "session", display, href, serialized: href, reference: mention.sessionId,
+    sourceMessageId: mention.reference, sourceEventId: mention.sourceEventId };
 }
 
 /** Expose assistant actions only on the final assistant message in a turn. */

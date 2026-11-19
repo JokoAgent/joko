@@ -234,6 +234,7 @@ type JokoDesktopNativeTaskStatusAction =
 type JokoDesktopCapability =
   | "files.copy"
   | "files.open"
+  | "files.draftThumbnail"
   | "files.openWith"
   | "files.revealSource"
   | "hardware.dedicatedInput"
@@ -679,6 +680,7 @@ interface JokoDesktopApi {
   copyFile(request: { readonly requestId: string; readonly file: JokoDesktopFile }): Promise<JokoDesktopCopyFileResult>;
   cancelFileCopy(requestId: string): Promise<void>;
   openFile(request: { readonly requestId: string; readonly file: JokoDesktopFile }): Promise<JokoDesktopOpenFileResult>;
+  thumbnailDraftFile?(file: { readonly name: string; readonly bytes: Uint8Array }): Promise<string | undefined>;
   cancelFileOpen(requestId: string): Promise<void>;
   listOpenWithApps(request: { readonly listOccurrence: string; readonly name: string }): Promise<JokoDesktopListOpenWithAppsResult>;
   retireOpenWithApps(listOccurrence: string): Promise<void>;

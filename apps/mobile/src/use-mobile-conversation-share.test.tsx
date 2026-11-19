@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { act, createElement, useMemo, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
+import type { GestureResponderEvent } from "react-native";
 import { describe, expect, it, vi } from "vitest";
 import { useMobileConversationShare } from "./use-mobile-conversation-share";
 import { MobileConversationShareBar } from "./MobileConversationShareBar";
@@ -37,8 +38,10 @@ function fixture(exportPng: (signal: AbortSignal) => Promise<Uint8Array>, native
     const handle = useMemo(() => ({ exportPng }), []);
     return createElement("div", { ref: (node) => attach(node ? handle : null) });
   }
+  let currentShare: ReturnType<typeof useMobileConversationShare>;
   function Screen() {
     const share = useMobileConversationShare({ client: api, rows, locale: "en", onNativeActivityChange: vi.fn(), output });
+    currentShare = share;
     return createElement("div", {}, createElement("button", { onClick: () => share.enter("a") }, "Select"),
       createElement("button", { onClick: () => share.enterVisible("owner", ["a", "b"]) }, "Screenshot"),
       share.active && createElement(MobileConversationShareBar, { count: share.selectedIds.length, allSelected: share.allSelected, busy: share.busy,
@@ -51,10 +54,50 @@ function fixture(exportPng: (signal: AbortSignal) => Promise<Uint8Array>, native
     const button = Array.from(container.querySelectorAll("button")).find((node) => node.textContent === label);
     expect(button).toBeDefined(); await act(async () => { button!.click(); });
   };
-  return { api, output, container, root, Screen, click };
+  return { api, output, container, root, Screen, click, share: () => currentShare };
 }
 
 describe("conversation sharing interaction", () => {
+  it("toggles a short row tap once while retiring scrolls, holds and cancelled gestures", async () => {
+    const f = fixture(vi.fn(async () => png));
+    const touch = (pageX: number, pageY: number, count = 1) => ({ nativeEvent: { pageX, pageY, touches: Array(count).fill({}) } }) as unknown as GestureResponderEvent;
+    const now = vi.spyOn(Date, "now").mockReturnValue(10_000);
+    try {
+      await act(async () => f.root.render(createElement(f.Screen)));
+      expect(f.share().rowTouchHandlers(rows[1]!)).toBeUndefined();
+      await f.click("Select");
+      const row = f.share().rowTouchHandlers(rows[1]!)!;
+      expect(row.onStartShouldSetResponder!(touch(40, 80))).toBe(true);
+      expect(row.onStartShouldSetResponder!(touch(40, 80, 2))).toBe(false);
+      await act(async () => {
+        row.onResponderGrant!(touch(40, 80));
+        row.onResponderRelease!(touch(42, 82, 0));
+      });
+      expect(f.share().selectedIds).toEqual(["a", "b"]);
+      await act(async () => {
+        row.onResponderGrant!(touch(40, 80));
+        row.onResponderMove!(touch(40, 103));
+        row.onResponderRelease!(touch(40, 81, 0));
+        row.onResponderGrant!(touch(40, 80));
+        now.mockReturnValue(10_500);
+        row.onResponderRelease!(touch(40, 80, 0));
+        row.onResponderGrant!(touch(40, 80));
+        row.onResponderTerminate!(touch(40, 80));
+        row.onResponderRelease!(touch(40, 80, 0));
+      });
+      expect(f.share().selectedIds).toEqual(["a", "b"]);
+      await act(async () => row.onResponderGrant!(touch(40, 80)));
+      await f.click("Cancel");
+      await f.click("Select");
+      await act(async () => row.onResponderRelease!(touch(40, 80, 0)));
+      expect(f.share().selectedIds).toEqual(["a"]);
+      expect(f.api.prepareConversationShare).not.toHaveBeenCalled();
+    } finally {
+      now.mockRestore();
+      await act(async () => f.root.unmount());
+    }
+  });
+
   it("a screenshot enters the visible selection with a hint and generates nothing until Share", async () => {
     const capture = vi.fn(async () => png); const f = fixture(capture);
     await act(async () => f.root.render(createElement(f.Screen)));

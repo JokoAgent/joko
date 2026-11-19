@@ -38,7 +38,7 @@ export function resolveMobileMessageForkSource(events: readonly Event[], session
   try {
     const draft = message.role !== MessageRole.USER ? undefined
       : started?.userInputAccepted && started.userInput
-        ? restoreMobileComposerInput(started.userInput, { sessionId, messageId: message.messageId, eventId: start!.eventId })
+        ? restoreMobileComposerInput(started.userInput, { sessionId, messageId: message.messageId, eventId: start!.eventId }, false)
         : plainTextMobileComposerDraft(payload.case === "messageCompleted"
           ? payload.value.blocks.flatMap((block) => block.content.case === "text" ? [block.content.value] : []).join("\n") : "");
     return { eventId, messageId: message.messageId, nativeEntryId, restoreInput: message.role === MessageRole.USER,

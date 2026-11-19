@@ -396,7 +396,8 @@ function insertComposerRouteReference(
 ): boolean {
   if (view.isDestroyed) return false;
   const routeType = view.state.schema.nodes[ComposerRouteReferenceNode.name];
-  const position = replaceSelection
+  const insertWholeMessage = replaceSelection && insertion.attrs.sourceEventId !== undefined;
+  const position = replaceSelection && !insertWholeMessage
     ? view.state.selection.from
     : composerRouteReferenceInsertionPosition(view.state, requestedPosition);
   if (routeType === undefined || position === undefined) {
@@ -406,7 +407,14 @@ function insertComposerRouteReference(
   try {
     const node = routeType.create(insertion.attrs);
     const transaction = skipComposerListNormalization(view.state.tr);
-    if (replaceSelection) {
+    if (insertWholeMessage) {
+      const { nodeBefore, nodeAfter } = transaction.doc.resolve(position);
+      const leadingSpace = nodeBefore?.isText === true && !/\s$/u.test(nodeBefore.text ?? "");
+      const trailingSpace = nodeAfter === null || nodeAfter.isText && !/^\s/u.test(nodeAfter.text ?? "");
+      const space = view.state.schema.text(" ");
+      transaction.insert(position, [...(leadingSpace ? [space] : []), node, ...(trailingSpace ? [space] : [])]);
+      transaction.setSelection(Selection.near(transaction.doc.resolve(position + node.nodeSize + Number(leadingSpace) + Number(trailingSpace)), 1));
+    } else if (replaceSelection) {
       transaction.replaceSelectionWith(node);
     } else {
       transaction.insert(position, node);

@@ -7,12 +7,17 @@ import {
   InlineTextRangeSchema,
   InputContentSchema,
   InputMentionRangeSchema,
+  InputMessageReferenceSchema,
   InputPartSchema,
   ResourceMentionSchema,
   SessionMentionSchema,
   WorkspaceLineRangeSchema,
   WorkspaceMentionSchema,
-  type InputContent
+  isTaskMessageReferenceAnchor,
+  taskMessageReferenceHref,
+  validInputMessageReferences,
+  type InputContent,
+  type TaskMessageReferenceRange
 } from "@joko/contracts";
 import {
   cloneMobileComposerAttachment,
@@ -135,6 +140,7 @@ export interface MobileComposerSessionRouteReferenceAtom extends MobileComposerR
   readonly sessionId: string;
   readonly messageId?: string;
   readonly eventId?: string;
+  readonly referenceMessage?: true;
 }
 
 export interface MobileComposerProjectRouteReferenceAtom extends MobileComposerRouteReferenceAtomBase {
@@ -809,20 +815,24 @@ export function updateMobileRouteReferenceAtom(
   }));
 }
 
-/** Insert an exact current-task message link with its bounded visible summary. */
+/** Insert the exact message anchor with its bounded visible summary. */
 export function insertMobileMessageReference(
   draft: MobileComposerDraft,
   selection: MobileComposerSelection,
-  source: { readonly sessionId: string; readonly messageId: string; readonly eventId: string; readonly text: string },
+  source: { readonly sessionId: string; readonly messageId: string; readonly eventId: string; readonly text: string; readonly includeBody: boolean },
   atomId: string
 ): MobileComposerEditResult {
-  const href = `#/tasks/${encodeURIComponent(source.sessionId)}?message=${encodeURIComponent(source.messageId)}&event=${encodeURIComponent(source.eventId)}`;
+  const anchor = { sourceSessionId: source.sessionId, messageId: source.messageId, eventId: source.eventId };
+  if (!isTaskMessageReferenceAnchor(anchor)) throw new Error("The current message reference is invalid.");
+  const href = taskMessageReferenceHref(anchor);
   const result = insertMobileRouteReferencePaste(draft, selection, [{ kind: "route-reference", routeKind: "session",
     href, label: null, sessionId: source.sessionId, messageId: source.messageId, eventId: source.eventId }], () => atomId);
   const atom = result.draft.atoms.find(candidate => candidate.atomId === atomId);
-  if (atom?.kind !== "route-reference") throw new Error("The current message reference could not be inserted.");
-  const label = sanitizeMobileComposerReferenceLabel(source.text.slice(0, mobileComposerMessageReferenceTextMaximumCharacters));
-  return updateMobileRouteReferenceAtom(result.draft, atom, label) ?? result;
+  if (atom?.kind !== "route-reference" || atom.routeKind !== "session") throw new Error("The current message reference could not be inserted.");
+  const label = sanitizeMobileComposerReferenceLabel(summarizeMobileComposerMessageReference(source.text.slice(0, mobileComposerMessageReferenceTextMaximumCharacters)));
+  const updated = replaceMobileComposerAtom(result.draft, atom, normalizeRouteReferenceAtom({ ...atom, displayText: label || atom.displayText,
+    ...(source.includeBody ? { referenceMessage: true as const } : {}) }));
+  return { ...result, draft: updated.draft };
 }
 
 export function insertMobilePastedText(
@@ -1044,38 +1054,48 @@ export function mobileComposerInput(draft: MobileComposerDraft): InputContent {
   if (exact.attachments.some((attachment) => attachment.state !== "uploaded")) {
     throw new Error("Finish uploading every attachment before sending.");
   }
+  const mentionRanges = exact.mentions.map((mention, mentionIndex) => ({
+    start: projectComposerOffset(mention.start, exact.atoms),
+    end: projectComposerOffset(mention.end, exact.atoms),
+    mentionIndex
+  }));
+  if (!validInputMessageReferences(serialized.text, serialized.messageReferences, [...mentionRanges, ...serialized.pastedTextRanges])) {
+    throw new Error("The task input has invalid whole-message reference occurrences.");
+  }
   return create(InputContentSchema, {
     parts: mobileComposerInputParts(exact, serialized),
     ...(exact.replyQuote ? { replyQuote: { ...exact.replyQuote, generation: BigInt(exact.replyQuote.generation) } } : {}),
     ...(exact.todoQuote ? { todoQuote: { ...exact.todoQuote, revision: BigInt(exact.todoQuote.revision) } } : {}),
     quotesEncoded: exact.atoms.some(isMobileComposerQuoteAtom),
     pastedTextRanges: serialized.pastedTextRanges.map((range) => create(InlineTextRangeSchema, range)),
-    mentionRanges: exact.mentions.map((mention, mentionIndex) => create(InputMentionRangeSchema, {
-      start: projectComposerOffset(mention.start, exact.atoms),
-      end: projectComposerOffset(mention.end, exact.atoms),
-      mentionIndex
-    }))
+    messageReferences: serialized.messageReferences.map((range) => create(InputMessageReferenceSchema, range)),
+    mentionRanges: mentionRanges.map((range) => create(InputMentionRangeSchema, range))
   });
 }
 
 /** Restore accepted input semantics; historical attachment bytes require a new explicit selection. */
 export function restoreMobileComposerInput(input: InputContent, source: {
   readonly sessionId: string; readonly messageId: string; readonly eventId: string;
-}): MobileComposerDraft {
+}, restoreMessageReferences = true): MobileComposerDraft {
   const wireText = input.parts.flatMap((part) => part.content.case === "text" ? [part.content.value] : []).join("");
   if (wireText.length > maximumSerializedCharacters || input.parts.length > 1_024) {
     throw new Error("The historical task input exceeds the composer limit.");
   }
   const parts = input.parts.flatMap((part) => part.content.case === "sessionMention" || part.content.case === "workspaceMention"
     || part.content.case === "resourceMention" || part.content.case === "artifactMention" ? [part.content] : []);
-  if (!validMentionRanges(wireText, parts.length, input.mentionRanges, input.pastedTextRanges)) {
+  const messageReferences = input.messageReferences ?? [];
+  if (!validMentionRanges(wireText, parts.length, input.mentionRanges, input.pastedTextRanges)
+    || !validInputMessageReferences(wireText, messageReferences, [...input.mentionRanges, ...input.pastedTextRanges])
+    || messageReferences.some(reference => reference.sourceSessionId !== source.sessionId)) {
     throw new Error("The historical task input has invalid reference or paste ranges.");
   }
   type Segment = { start: number; end: number; kind: "mention"; index: number }
+    | (TaskMessageReferenceRange & { readonly kind: "message-reference" })
     | { start: number; end: number; kind: "paste" | "quote"; text: string; sourcePath?: string };
   const segments: Segment[] = [
     ...input.mentionRanges.map((range): Segment => ({ start: range.start, end: range.end, kind: "mention", index: range.mentionIndex })),
-    ...input.pastedTextRanges.map((range): Segment => ({ start: range.start, end: range.end, kind: "paste", text: wireText.slice(range.start, range.end) }))
+    ...input.pastedTextRanges.map((range): Segment => ({ start: range.start, end: range.end, kind: "paste", text: wireText.slice(range.start, range.end) })),
+    ...(restoreMessageReferences ? messageReferences.map((range): Segment => ({ ...range, kind: "message-reference" })) : [])
   ];
   if (input.quotesEncoded) {
     let cursor = 0;
@@ -1134,6 +1154,13 @@ export function restoreMobileComposerInput(input: InputContent, source: {
       text += mobileComposerMentionToken(seed);
       mentions.push({ ...seed, mentionId: `restored-mention-${segment.index}`, start, end: text.length } as MobileComposerMention);
       restored.add(segment.index);
+    } else if (segment.kind === "message-reference") {
+      const { sourceSessionId, messageId, eventId } = segment;
+      const href = taskMessageReferenceHref(segment);
+      text += href;
+      atoms.push({ kind: "route-reference", routeKind: "session", atomId: `restored-message-${atoms.length}`,
+        href, serialized: href, sessionId: sourceSessionId, messageId, eventId, referenceMessage: true,
+        displayText: sanitizeMobileComposerReferenceLabel(messageId) || sanitizeMobileComposerReferenceLabel(href), start, end: text.length });
     } else {
       const seed = segment.kind === "quote" ? segment.sourcePath
         ? { kind: "file-quote" as const, text: segment.text, sourceSessionId: source.sessionId, sourcePath: segment.sourcePath }
@@ -1422,6 +1449,12 @@ function normalizeRouteReferenceAtom(
   if (anchored && atom.serialized !== parsed.href) {
     throw new Error("A Joko message link must retain its exact deep-link wire text.");
   }
+  const referenceMessage = atom.routeKind === "session" && atom.referenceMessage === true;
+  if (referenceMessage && (parsed.routeKind !== "session" || parsed.messageId === undefined || parsed.eventId === undefined
+    || !validInputMessageReferences(atom.serialized, [{ start: 0, end: atom.serialized.length,
+      sourceSessionId: parsed.sessionId, messageId: parsed.messageId, eventId: parsed.eventId }]))) {
+    throw new Error("The whole-message reference must retain its exact original anchor.");
+  }
   return parsed.routeKind === "session"
     ? {
         kind: "route-reference",
@@ -1431,6 +1464,7 @@ function normalizeRouteReferenceAtom(
         sessionId: parsed.sessionId,
         ...(parsed.messageId === undefined ? {} : { messageId: parsed.messageId }),
         ...(parsed.eventId === undefined ? {} : { eventId: parsed.eventId }),
+        ...(referenceMessage ? { referenceMessage: true as const } : {}),
         displayText
       }
     : {
@@ -1461,6 +1495,7 @@ interface MobileSerializedComposerText {
   readonly text: string;
   readonly pastedTextRanges: readonly { readonly start: number; readonly end: number; readonly display: string }[];
   readonly atomTextRanges: readonly { readonly atomId: string; readonly start: number; readonly end: number }[];
+  readonly messageReferences: readonly TaskMessageReferenceRange[];
 }
 
 function serializeMobileComposerText(draft: MobileComposerDraft): MobileSerializedComposerText {
@@ -1468,6 +1503,7 @@ function serializeMobileComposerText(draft: MobileComposerDraft): MobileSerializ
   let cursor = 0;
   const pastedTextRanges: { start: number; end: number; display: string }[] = [];
   const atomTextRanges: { atomId: string; start: number; end: number }[] = [];
+  const messageReferences: TaskMessageReferenceRange[] = [];
   for (const atom of draft.atoms) {
     text += draft.text.slice(cursor, atom.start);
     const atomStart = text.length;
@@ -1479,6 +1515,9 @@ function serializeMobileComposerText(draft: MobileComposerDraft): MobileSerializ
       pastedTextRanges.push({ start, end: text.length, display: mobileComposerAtomLabel(atom) });
     } else {
       text += atom.serialized;
+      if (atom.routeKind === "session" && atom.referenceMessage === true && atom.messageId !== undefined && atom.eventId !== undefined) {
+        messageReferences.push({ start: atomStart, end: text.length, sourceSessionId: atom.sessionId, messageId: atom.messageId, eventId: atom.eventId });
+      }
     }
     atomTextRanges.push({ atomId: atom.atomId, start: atomStart, end: text.length });
     cursor = atom.end;
@@ -1487,7 +1526,7 @@ function serializeMobileComposerText(draft: MobileComposerDraft): MobileSerializ
   if (text.length > maximumSerializedCharacters) {
     throw new Error(`A task message can contain at most ${maximumSerializedCharacters.toLocaleString("en-US")} serialized characters.`);
   }
-  return { text, pastedTextRanges, atomTextRanges };
+  return { text, pastedTextRanges, atomTextRanges, messageReferences };
 }
 
 function mobileComposerInputParts(
@@ -1824,7 +1863,7 @@ function sameComposerAtomAuthority(left: MobileComposerAtom, right: MobileCompos
     || left.displayText !== right.displayText) return false;
   return left.routeKind === "session" && right.routeKind === "session"
     ? left.href === right.href && left.sessionId === right.sessionId && left.messageId === right.messageId
-      && left.eventId === right.eventId
+      && left.eventId === right.eventId && left.referenceMessage === right.referenceMessage
     : left.routeKind === "project" && right.routeKind === "project"
       ? left.href === right.href && left.projectId === right.projectId
       : left.routeKind === "path" && right.routeKind === "path"

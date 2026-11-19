@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ForwardRefExoticComponent,
@@ -62,6 +63,13 @@ export function MobileMediaPlayer({
   const webViewRef = useRef<MobileMediaWebViewHandle | null>(null);
   const mountedRef = useRef(true);
   const statusRef = useRef(onStatusChange);
+  const mediaOwnerKey = JSON.stringify([instanceId, uri, kind, mediaType, networkSource]);
+  const positionRef = useRef<{ ownerKey: string; currentTime: number | null; duration: number | null }>({
+    ownerKey: mediaOwnerKey, currentTime: null, duration: null
+  });
+  if (positionRef.current.ownerKey !== mediaOwnerKey) {
+    positionRef.current = { ownerKey: mediaOwnerKey, currentTime: null, duration: null };
+  }
   const [playerStatus, setPlayerStatus] = useState<MobileMediaPlayerStatus>();
   statusRef.current = onStatusChange;
 
@@ -117,9 +125,12 @@ export function MobileMediaPlayer({
     if (!mountedRef.current || !resource.ownsRenderer(resource.rendererToken)) return;
     const status = parseMobileMediaPlayerStatus(event.nativeEvent.data, instanceId);
     if (!status) return;
+    if (positionRef.current.ownerKey === mediaOwnerKey && status.currentTime !== null) {
+      positionRef.current = { ownerKey: mediaOwnerKey, currentTime: status.currentTime, duration: status.duration };
+    }
     if (status.state === "ready") resource.onRendererReady(resource.rendererToken);
     publishStatus(status);
-  }, [instanceId, publishStatus, resource]);
+  }, [instanceId, mediaOwnerKey, publishStatus, resource]);
 
   useEffect(() => {
     if (resource.phase !== "suspended" && resource.phase !== "recovering") return;
@@ -127,8 +138,8 @@ export function MobileMediaPlayer({
       type: "joko-media-player/status",
       instanceId,
       state: resource.phase,
-      currentTime: null,
-      duration: null,
+      currentTime: positionRef.current.currentTime,
+      duration: positionRef.current.duration,
       error: null
     });
   }, [instanceId, publishStatus, resource.phase]);
@@ -145,6 +156,14 @@ export function MobileMediaPlayer({
   const accessibilityValue = mediaAccessibilityValue(playerStatus);
   const releasedLabel = mobileMessage(locale, resource.phase === "recovering"
     ? "preview.status.mediaRecovering" : "preview.status.mediaSuspended");
+  // Capture the position only when creating a renderer; status updates must not reload its HTML.
+  const source = useMemo(() => resource.rendererMounted ? ({
+    html: buildMobileMediaPlayerHtml({
+      instanceId, kind, locale, mediaType, title, uri, background, surface, ink, networkSource,
+      initialTime: positionRef.current.currentTime ?? 0
+    }),
+    baseUrl
+  }) : undefined, [background, baseUrl, ink, instanceId, kind, locale, mediaType, networkSource, resource.rendererGeneration, resource.rendererMounted, surface, title, uri]);
 
   return <View style={style}>
     <MobilePreviewControlBar accessibilityLabel={mobileMessage(locale, "preview.mediaControls")}
@@ -188,21 +207,7 @@ export function MobileMediaPlayer({
       scrollEnabled={false}
       setSupportMultipleWindows={false}
       sharedCookiesEnabled={false}
-      source={{
-        html: buildMobileMediaPlayerHtml({
-          instanceId,
-          kind,
-          locale,
-          mediaType,
-          title,
-          uri,
-          background,
-          surface,
-          ink,
-          networkSource
-        }),
-        baseUrl
-      }}
+      source={source}
       style={{ backgroundColor: "transparent", flex: 1 }}
       thirdPartyCookiesEnabled={false}
     /> : <View accessible accessibilityRole="text" accessibilityLabel={releasedLabel}

@@ -2838,6 +2838,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
               ownerKey={voiceOwnerKey}
               attachments={attachments}
               removeDisabled={submitting}
+              documentPreviewEnabled={contactsDraft === undefined}
               t={t}
               onRemove={(attachment) => {
                 if (submitting) return;

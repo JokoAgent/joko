@@ -50,6 +50,7 @@ import { ProviderAccountBalance } from "./ProviderAccountBalance.js";
 import { ProviderAccountResets } from "./ProviderAccountResets.js";
 import { SessionContextBudget } from "./SessionContextBudget.js";
 import { ComposerRichTextEditor, type ComposerRichTextEditorHandle } from "./ComposerRichTextEditor.js";
+import type { ComposerRouteReferenceAttrs } from "./ComposerRouteReferenceNode.js";
 import { ComposerPastedTextDialog, type ComposerPastedTextDialogTarget } from "./ComposerPastedTextDialog.js";
 import { objectiveDialogRequestMatchesOwner, type ObjectiveDialogHandoffRequest } from "./ObjectiveIndicator.js";
 import { countComposerPasteLines } from "./composer-paste-pipeline.js";
@@ -135,7 +136,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   readonly messageHistory: readonly ComposerHistoryEntry[];
   readonly controls?: ReactNode;
   readonly runningStatus?: ReactNode;
-  readonly messageMentionInsertion?: { readonly id: number; readonly sessionId: string; readonly mention: ComposerMessageMentionDraft };
+  readonly messageMentionInsertion?: { readonly id: number; readonly sessionId: string; readonly mention: ComposerMessageMentionDraft; readonly inline?: ComposerRouteReferenceAttrs };
   readonly selectionQuoteInsertion?: { readonly id: number; readonly sessionId: string; readonly quotes: readonly ComposerSelectionQuoteDraft[] };
   readonly attachmentInsertion?: { readonly id: number; readonly sessionId: string; readonly file: File };
   readonly rewindDraftRef?: RefObject<PrepareRewindDraft | null>;
@@ -834,6 +835,13 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
       appliedMessageMentionInsertionRef.current === messageMentionInsertion.id
     ) return;
     appliedMessageMentionInsertionRef.current = messageMentionInsertion.id;
+    if (messageMentionInsertion.inline !== undefined) {
+      if (richEditorRef.current?.insertRouteReference({ source: "session", attrs: messageMentionInsertion.inline })) {
+        closePalette();
+        setBashMode(false);
+      } else setAttachmentError(t("timeline.referenceUnavailable"));
+      return;
+    }
     markDraftEdited(session.id);
     editorRevisionRef.current += 1;
     resetHistoryNavigation();
@@ -2917,6 +2925,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
             ownerKey={voiceDictionaryOwnerKey}
             attachments={attachments}
             removeDisabled={composerLocked}
+            documentPreviewEnabled={!guest && !partnerPresentation && (controller.state.taskSource?.kind ?? "own") === "own"}
             t={t}
             onRemove={(attachment) => {
               if (composerLocked) return;

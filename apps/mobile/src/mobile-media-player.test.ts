@@ -52,6 +52,9 @@ describe("mobile media player protocol and HTML", () => {
     expect(() => buildMobileMediaPlayerHtml({ ...base, uri: "https://node.example/blob" })).toThrow(/URI/u);
     expect(() => buildMobileMediaPlayerHtml({ ...base, kind: "video", uri: "file:///cache/voice.mp3" }))
       .toThrow(/kind/u);
+    for (const initialTime of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => buildMobileMediaPlayerHtml({ ...base, uri: "file:///cache/voice.mp3", initialTime })).toThrow(/initial time/u);
+    }
   });
 
   it("uses strict instance-bound commands and status messages", () => {

@@ -15,6 +15,7 @@ export * from "./extension-library-clipboard.js";
 export * from "./partner-session-tasks.js";
 export * from "./session-handoff-messages.js";
 export * from "./question-references.js";
+export * from "./message-reference.js";
 export * from "./extension-targets.js";
 /** Host-only opt-in for renewing an existing visible main-view surface. */
 export const EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER = "x-joko-extension-main-view-keepalive";

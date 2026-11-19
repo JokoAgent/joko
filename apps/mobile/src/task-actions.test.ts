@@ -24,7 +24,7 @@ import {
   queueMove
 } from "./task-actions";
 import type { TimelineRow } from "./timeline";
-import { mobileComposerInput, plainTextMobileComposerDraft } from "./mobile-composer-document";
+import { mobileComposerInput, plainTextMobileComposerDraft, restoreMobileComposerInput } from "./mobile-composer-document";
 
 describe("mobile message action sheet", () => {
   const row: TimelineRow = {
@@ -108,7 +108,14 @@ describe("mobile message action sheet", () => {
     expect(result.draft.atoms[0]).toMatchObject({ kind: "route-reference", routeKind: "session", sessionId: "task",
       messageId: row.id, eventId: row.eventId, displayText: expect.stringContaining("A message ＠mention") });
     expect(result.draft.atoms[0]!.kind === "route-reference" && result.draft.atoms[0]!.displayText.length).toBeLessThanOrEqual(240);
-    expect(mobileComposerInput(result.draft).parts).toMatchObject([{ content: { case: "text", value: result.draft.text } }]);
+    const accepted = mobileComposerInput(result.draft);
+    expect(accepted.parts).toMatchObject([{ content: { case: "text", value: result.draft.text } }]);
+    expect(accepted.messageReferences).toMatchObject([{ start: 7, end: result.draft.text.length - "after".length,
+      sourceSessionId: "task", messageId: row.id, eventId: row.eventId }]);
+    const acceptedSource = { sessionId: "task", messageId: "accepted", eventId: "accepted-event" };
+    expect(mobileComposerInput(restoreMobileComposerInput(accepted, acceptedSource)).messageReferences).toEqual(accepted.messageReferences);
+    expect(mobileComposerInput(restoreMobileComposerInput(accepted, acceptedSource, false)).messageReferences).toEqual([]);
+    expect(mobileComposerInput(plainTextMobileComposerDraft(result.draft.text)).messageReferences).toEqual([]);
     for (const changed of [{ ownerKey: "other-node/task/occurrence" }, { ownerKey: "node/task/new-occurrence" },
       { draftOwnerKey: "other-profile/task" }, { sessionId: "other-task" }, { draft: plainTextMobileComposerDraft(draft.text) },
       { row: { ...message, eventId: "new-event" } }, { row: { ...message, text: "changed message" } }, { row: { ...message, completed: false } }]) {

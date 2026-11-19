@@ -57,7 +57,8 @@ export function buildMobileMediaPlayerHtml({
   background,
   surface,
   ink,
-  networkSource = false
+  networkSource = false,
+  initialTime = 0
 }: {
   readonly instanceId: string;
   readonly kind: MobileMediaPreviewKind;
@@ -69,9 +70,11 @@ export function buildMobileMediaPlayerHtml({
   readonly surface: string;
   readonly ink: string;
   readonly networkSource?: boolean;
+  readonly initialTime?: number;
 }): string {
   const exactInstanceId = playerInstanceId(instanceId);
   const exactMediaType = normalizeMediaType(mediaType);
+  if (!Number.isFinite(initialTime) || initialTime < 0) throw new Error("The media player initial time is invalid.");
   if (!(networkSource && !exactMediaType) && mobileMediaPreviewKind(exactMediaType) !== kind) throw new Error("The media player kind does not match its media type.");
   if (typeof uri !== "string" || (networkSource ? !richMediaNetworkUrl(uri) : !uri.startsWith("file://")) || uri.length > 4_096
     || /[\u0000-\u001f\u007f]/u.test(uri)) throw new Error("The media player URI is invalid.");
@@ -105,6 +108,7 @@ export function buildMobileMediaPlayerHtml({
       var errorLabel = ${JSON.stringify(errorLabel)};
       var media = document.querySelector(${JSON.stringify(tag)});
       var lastTimeUpdate = 0;
+      var initialTime = ${JSON.stringify(initialTime)};
       function finite(value) { return Number.isFinite(value) && value >= 0 ? value : null; }
       function cleanError(value) {
         var text = typeof value === 'string' ? value.replace(/[\\u0000-\\u001f\\u007f]/g, ' ').trim() : '';
@@ -155,7 +159,15 @@ export function buildMobileMediaPlayerHtml({
       if (!media || !window.ReactNativeWebView || typeof window.ReactNativeWebView.postMessage !== 'function') return;
       window.addEventListener('message', handleCommand);
       document.addEventListener('message', handleCommand);
-      media.addEventListener('loadedmetadata', function () { emit('ready', null, true); });
+      media.addEventListener('loadedmetadata', function () {
+        if (initialTime > 0) {
+          var position = Number.isFinite(media.duration) && media.duration >= 0
+            ? Math.min(initialTime, media.duration) : initialTime;
+          try { media.currentTime = position; } catch (_) {}
+          initialTime = 0;
+        }
+        emit('ready', null, true);
+      });
       media.addEventListener('play', function () { emit('playing', null, true); });
       media.addEventListener('timeupdate', function () { emit(media.paused ? 'paused' : 'playing', null, false); });
       media.addEventListener('pause', function () { emit(media.ended ? 'ended' : 'paused', null, true); });

@@ -207,8 +207,8 @@ describe("WorkspaceImageLightbox gallery surface", () => {
     wheel(overlay, { deltaX: 20, time: 1 });
     expect(wrap.style.transform).toContain("translate(70px, 60px)");
     expect(wrap.querySelector("path")).toBeNull();
-    const copy = document.querySelector<HTMLButtonElement>('button[aria-label="Copy"]')!;
-    expect(space(copy, "keydown").defaultPrevented).toBe(false);
+    const discard = document.querySelector<HTMLButtonElement>('button[aria-label="Discard"]')!;
+    expect(space(discard, "keydown").defaultPrevented).toBe(false);
     expect(wrap.classList.contains("is-space-panning")).toBe(false);
     space(overlay, "keydown");
     act(() => window.dispatchEvent(new Event("blur")));
