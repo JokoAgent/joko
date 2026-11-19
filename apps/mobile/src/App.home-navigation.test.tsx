@@ -47,6 +47,8 @@ const homeConnectionId = "home-connection";
 const select = vi.fn(async (_sessionId?: string) => {});
 const around = vi.fn<MobileClient["around"]>(async () => {});
 const latest = vi.fn();
+const taskReadingPosition = vi.fn<MobileClient["taskReadingPosition"]>();
+const restoreTaskReadingPosition = vi.fn<MobileClient["restoreTaskReadingPosition"]>();
 let linkListener: ((event: { readonly url: string }) => void) | undefined;
 const searchHome = vi.fn(async () => {});
 const scrollToIndex = vi.fn();
@@ -141,7 +143,8 @@ let learningPartner: typeof profilePartner | undefined;
 let collaborationApi: import("./mobile-collaboration").MobileCollaborationApi | undefined;
 let learningProfileProps: ComponentProps<typeof import("./MobilePartnerProfileSheet").MobilePartnerProfileSheet> | undefined;
 const client = new Proxy({
-  get state() { return state; }, select, around, latest, searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, reconcile, dismissUnconfirmed, refresh,
+  get state() { return state; }, select, around, latest, taskReadingPosition, restoreTaskReadingPosition,
+  searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, reconcile, dismissUnconfirmed, refresh,
   partnerRosterSources: () => empty,
   taskQueueItems: () => empty, taskInteractions: () => empty, taskTimelineRows: () => empty,
   subscribe: () => () => {}, taskForeground: () => true, taskQueueCapabilities: () => ({}), taskPendingImagePasteCount: () => 0,
@@ -372,6 +375,8 @@ beforeEach(async () => {
   select.mockImplementation(async sessionId => { state = { ...state, selectedId: sessionId }; });
   around.mockReset();
   latest.mockClear();
+  taskReadingPosition.mockReset();
+  restoreTaskReadingPosition.mockReset();
   homeHeaderBounds.clear();
   acknowledgeSessionAttention.mockClear();
   showTaskTimelineRows = undefined;
@@ -1187,6 +1192,32 @@ describe("actual Home navigation hosts", () => {
 });
 
 describe("actual Task Home navigation composition", () => {
+  it("restores the original visible message offset on a normal Home reopen without highlighting it", async () => {
+    const readingPosition = { sessionId: "current", messageId: "read-message", eventId: "read-event", viewOffset: -31 };
+    const reply = create(EventSchema, { eventId: readingPosition.eventId, identity: { sessionId: "current", runId: "read-run" },
+      cursor: { generation: 1n, sequence: 10n }, payload: { kind: { case: "messageCompleted", value: {
+        messageId: readingPosition.messageId, role: MessageRole.ASSISTANT,
+        blocks: [{ content: { case: "text", value: "Original reading message" } }]
+      } } } });
+    state = { ...state, detail: create(SnapshotSchema, { ...state.detail!, timeline: [reply] }), saved: [{
+      profileId: "profile", origin: "http://localhost:4318", serverId: "node", connectionId: homeConnectionId,
+      deviceId: "phone", displayName: "Node", credentialState: "available", automatic: false, pendingOperations: []
+    }] };
+    taskReadingPosition.mockReturnValueOnce(undefined).mockReturnValueOnce(readingPosition);
+    restoreTaskReadingPosition.mockResolvedValue(true);
+    await act(async () => root.render(createElement(App)));
+    await press("Open task Alpha");
+    expect(host.querySelector('[data-testid="task-header"]')).not.toBeNull();
+    expect(restoreTaskReadingPosition).not.toHaveBeenCalled();
+    await press("Task back");
+    expect(host.querySelector('[data-testid="home-list"]')).not.toBeNull();
+    await press("Open task Alpha");
+    await act(async () => { vi.advanceTimersToNextFrame(); });
+    expect(restoreTaskReadingPosition).toHaveBeenCalledExactlyOnceWith(readingPosition, expect.any(AbortSignal));
+    expect(scrollToIndex).toHaveBeenCalledExactlyOnceWith({ index: 0, animated: false, viewPosition: 0, viewOffset: -31 });
+    expect(Array.from(host.querySelectorAll('[aria-live="polite"]')).some(row => row.textContent?.includes("Original reading message"))).toBe(false);
+  });
+
   it("applies only the adopted Android preference to native controls and releases the override for System", async () => {
     themeSnapshot = { preference: "system", status: "loading", saving: false };
     await act(async () => root.render(createElement(App)));

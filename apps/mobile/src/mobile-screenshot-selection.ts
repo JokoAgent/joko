@@ -69,9 +69,9 @@ export async function readMobileScreenshotVisibleMessages(
 ): Promise<readonly string[]> {
   if (!viewport || signal.aborted) return [];
   const entries = [...messages];
-  const frame = await measureMobileScreenshotFrame(viewport, signal);
+  const frame = await measureMobileWindowFrame(viewport, signal);
   if (!frame) return [];
-  const measured = await Promise.all(entries.map(async ([id, view]) => ({ id, frame: await measureMobileScreenshotFrame(view, signal) })));
+  const measured = await Promise.all(entries.map(async ([id, view]) => ({ id, frame: await measureMobileWindowFrame(view, signal) })));
   if (signal.aborted) return [];
   return measured.filter((item): item is { id: string; frame: MobileScreenshotFrame } => {
     if (!item.frame) return false;
@@ -81,7 +81,7 @@ export async function readMobileScreenshotVisibleMessages(
   }).sort((left, right) => left.frame.y - right.frame.y).map((item) => item.id);
 }
 
-function measureMobileScreenshotFrame(view: MobileScreenshotMeasurable, signal: AbortSignal): Promise<MobileScreenshotFrame | undefined> {
+export function measureMobileWindowFrame(view: MobileScreenshotMeasurable, signal: AbortSignal): Promise<MobileScreenshotFrame | undefined> {
   if (signal.aborted) return Promise.resolve(undefined);
   return new Promise((resolve) => {
     let completed = false;
