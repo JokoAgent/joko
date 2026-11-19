@@ -8722,10 +8722,16 @@ describe("native mobile connection and operation ownership", () => {
 
   it.each([false, true])("restores the ordinary task reading position on reselection (older page=%s)", async older => {
     const network = fakeNetwork();
-    const reply = (id: string, sequence: bigint) => create(EventSchema, { ...event(`event-${id}`, sequence), payload: {
-      kind: { case: "messageCompleted", value: { messageId: id, role: MessageRole.ASSISTANT,
-        blocks: [{ content: { case: "text", value: id } }] } }
-    } });
+    const reply = (id: string, sequence: bigint) => create(EventSchema, {
+      ...event(`event-${id}`, sequence),
+      payload: create(EventPayloadSchema, {
+        kind: { case: "messageCompleted", value: create(MessageCompletedEventSchema, {
+          messageId: id,
+          role: MessageRole.ASSISTANT,
+          blocks: [create(MessageBlockSchema, { content: { case: "text", value: id } })]
+        }) }
+      })
+    });
     const previous = reply("previous", 2n), recent = reply("recent", 10n);
     const owner = runtimeControlProjection();
     const detail = create(SnapshotSchema, { ...runtimeControlProjection(runtimeSession, true), timeline: [recent] });
