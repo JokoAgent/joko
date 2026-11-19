@@ -76,6 +76,29 @@ it("clears a confirmed busy receipt and permits a new explicit attempt", async (
   expect(f.start.mock.calls[1]?.[0].operationId).not.toBe(f.start.mock.calls[0]?.[0].operationId);
   expect(f.updated).toHaveBeenCalledOnce();
 });
+it("keeps the fetch's missing-remote result across local-only refreshes for the same upstream", async () => {
+  const f = fixture(), local = { ...status, remote: "origin", remoteBranch: "main" };
+  f.read.mockResolvedValue(local);
+  f.start.mockImplementation(async ({ operationId }) => ({ operationId, pending: false, unknown: false, updated: 0,
+    status: { ...local, blocked: "missing-remote" } }));
+  await f.show(); await f.click("Update selected branch");
+  const alert = () => document.querySelector('[role="alert"]')?.textContent;
+  expect(f.read).toHaveBeenCalledTimes(2);
+  expect(alert()).toBe("The configured remote branch is unavailable.");
+  expect(f.button("Update selected branch").disabled).toBe(true);
+  expect(f.button("Create task").disabled).toBe(false);
+  expect(localStorage.length).toBe(0);
+  f.read.mockResolvedValue({ ...local, dirtyFiles: 5, revision: "b".repeat(64) });
+  await f.click("Refresh branch status");
+  expect(document.body.textContent).toContain("Local changes 5");
+  expect(alert()).toBe("The configured remote branch is unavailable.");
+  expect(f.button("Update selected branch").disabled).toBe(true);
+  f.read.mockResolvedValue({ ...local, remoteBranch: "new-upstream", revision: "c".repeat(64) });
+  await f.click("Refresh branch status");
+  expect(alert()).toBeUndefined();
+  expect(f.button("Update selected branch").disabled).toBe(false);
+  expect(f.start).toHaveBeenCalledOnce();
+});
 it("keeps a blocked branch and unavailable receipt storage from admitting an update", async () => {
   const f = fixture(); f.read.mockResolvedValue({ ...status, blocked: "diverged" }); await f.show();
   expect(f.button("Update selected branch").disabled).toBe(true); expect(document.body.textContent).toContain("histories have diverged");

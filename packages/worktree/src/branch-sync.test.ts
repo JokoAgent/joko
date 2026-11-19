@@ -108,7 +108,10 @@ it("updates another worktree in place, blocks ignored-file collisions, and rejec
     await expect(readWorktreeBranchStatus(f.local, sourceRef)).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
   }
   await git(f.local, "config", "branch.work.remote", "origin"); await git(f.local, "config", "branch.work.merge", "refs/heads/deleted");
+  await git(f.local, "update-ref", "refs/remotes/origin/deleted", f.original);
   expect(await f.sync("refs/heads/work")).toMatchObject({ updated: 0, status: { blocked: "missing-remote" } });
+  expect((await readWorktreeBranchStatus(f.local, "refs/heads/work")).blocked).toBeUndefined();
+  expect(await git(f.local, "rev-parse", "refs/remotes/origin/deleted")).toBe(f.original);
 });
 it("fences revocation and a changed remote configuration after the fetch before any local branch write", { timeout: 40_000 }, async () => {
   const f = await fixture(), next = await f.advance(); let revoked = false;

@@ -77,9 +77,14 @@ export function WorktreeBranchSync({ api, ownerKey, targetId, sourceRef, disable
     } catch { setStorageError(true); }
     return () => abort.abort();
   }, [ownerKey, targetId, sourceRef]);
+  // Local tracking refs can outlive the remote branch. A local status read
+  // cannot supersede the fetch result for the same upstream.
+  const missingRemote = receipt?.status?.blocked === "missing-remote" ? receipt.status : undefined;
+  const blocked = status?.blocked ?? (status && missingRemote && status.remote === missingRemote.remote
+    && status.remoteBranch === missingRemote.remoteBranch ? "missing-remote" : undefined);
   const sync = async () => {
     const signal = lifetime.current?.signal;
-    if (!signal || signal.aborted || !status || status.blocked || journal || flight.current || disabled) return;
+    if (!signal || signal.aborted || !status || blocked || journal || flight.current || disabled) return;
     const original: Journal = { format: 1, operationId: randomUuid(), expectedRevision: status.revision };
     try { window.localStorage.setItem(storageKey, JSON.stringify(original));
       if (window.localStorage.getItem(storageKey) !== JSON.stringify(original)) throw new Error("Receipt was not retained");
@@ -103,7 +108,7 @@ export function WorktreeBranchSync({ api, ownerKey, targetId, sourceRef, disable
   const pending = journal !== undefined && receipt?.unknown !== true;
   return <div className="worktree-branch-sync" aria-busy={loading || pending}>
     <div className="worktree-branch-sync__actions">
-      <Button disabled={disabled || loading || !status || !!status.blocked || !!journal || storageError} onClick={() => void sync()}>
+      <Button disabled={disabled || loading || !status || !!blocked || !!journal || storageError} onClick={() => void sync()}>
         {pending && <Spinner />}{t(pending ? "worktree.branch.syncing" : "worktree.branch.sync")}
       </Button>
       <Button disabled={disabled || loading || pending} onClick={() => {
@@ -118,7 +123,7 @@ export function WorktreeBranchSync({ api, ownerKey, targetId, sourceRef, disable
       }}>{t("worktree.branch.refresh")}</Button>
     </div>
     {status && <p className="muted" role="status">{t("worktree.branch.counts", { ahead: status.ahead, behind: status.behind, dirty: status.dirtyFiles })}</p>}
-    {status?.blocked && <p className="inline-error" role="alert">{t(`worktree.branch.${status.blocked}`)}</p>}
+    {blocked && <p className="inline-error" role="alert">{t(`worktree.branch.${blocked}`)}</p>}
     {receipt && !receipt.pending && !receipt.unknown && !receipt.status?.blocked && !receipt.errorCode && <p role="status">{t("worktree.branch.updated", { count: receipt.updated })}</p>}
     {receipt?.errorCode === "busy" && <p className="inline-error" role="alert">{t("worktree.branch.busy")}</p>}
     {(receipt?.unknown || journal && error) && <p role="alert">{t("worktree.branch.unknown")}</p>}
