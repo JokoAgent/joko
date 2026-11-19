@@ -2,7 +2,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ArrowLeft, ExternalLink, Menu, RefreshCcw } from "lucide-react";
 import { createConnectionFetch, ExtensionSettingsRejected, extensionSettingsReadOnly, readExtensionLibraryVideo } from "@joko/connection-transport";
-import { parseExtensionSettingsBridgeRequest, type ExtensionSettingsDirectoryChoice } from "@joko/contracts";
+import { EXTENSION_LIBRARY_FILE_NOT_FOUND, ErrorInfoSchema, parseExtensionSettingsBridgeRequest, type ExtensionSettingsDirectoryChoice } from "@joko/contracts";
 import { ExtensionSettingsDirectoryDialog } from "./ExtensionSettingsDirectoryDialog.js";
 import { sameExtensionSettingsOperation, type PendingExtensionSettingsOperation } from "../extension-settings-operation.js";
 import { mountIsolatedSurface } from "../isolated-surface.js";
@@ -322,7 +322,9 @@ export function ExtensionMainViewPage({
         return await (source === undefined ? controller.callExtensionLibrary(session.id, call, abort.signal)
           : controller.callExtensionLibrary(session.id, call, abort.signal, source));
       } catch (error) {
-        if (libraryRef.current?.session.id === session.id) {
+        const missingFile = call.kind === "read" && error instanceof ConnectError && error.code === Code.NotFound
+          && error.findDetails(ErrorInfoSchema).some(detail => detail.code === EXTENSION_LIBRARY_FILE_NOT_FOUND);
+        if (!missingFile && libraryRef.current?.session.id === session.id) {
           libraryRef.current = undefined;
           void controller.closeExtensionLibrary(session.id).catch(() => undefined);
         }

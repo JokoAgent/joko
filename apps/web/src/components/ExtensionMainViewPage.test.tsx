@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 
 import { Code, ConnectError } from "@connectrpc/connect";
-import type { ExtensionSettingsCall, ExtensionSettingsHost } from "@joko/contracts";
+import { create } from "@bufbuild/protobuf";
+import { EXTENSION_LIBRARY_FILE_NOT_FOUND, ErrorInfoSchema, type ExtensionSettingsCall, type ExtensionSettingsHost } from "@joko/contracts";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -431,6 +432,45 @@ describe("Extension main view", () => {
       }
     });
     expect(JSON.stringify(postedResponse(postMessage, "limited-1"))).not.toContain("private");
+  });
+
+  it("keeps a Library write stream after a missing file and retires a missing session", async () => {
+    const extension = { ...readyExtension(EXTENSION_A, "Review"), library: { schemaVersion: 1 as const } };
+    const expiresAt = Date.now() + 60_000;
+    const surface = { ...mainViewSurface(extension), expiresAt }, session = { ...librarySession(extension.id), expiresAt };
+    const openExtensionLibrary = vi.fn(async () => session), closeExtensionLibrary = vi.fn(async () => true);
+    const streamId = "library-stream-original";
+    const callExtensionLibrary = vi.fn(async (_sessionId: string, call: ExtensionLibraryCallView) => {
+      switch (call.kind) {
+        case "writeBegin": return { kind: "stream" as const, streamId, receivedBytes: 0n, nextSequence: 0, aborted: false };
+        case "writeChunk": return { kind: "stream" as const, streamId, receivedBytes: BigInt(call.sequence + 1), nextSequence: call.sequence + 1, aborted: false };
+        case "writeCommit": return { kind: "write" as const, path: "notes/new.txt", bytes: 2n, sha256: "a".repeat(64) };
+        case "read": throw new ConnectError("Library read was unavailable.", Code.NotFound, undefined, call.path === "notes/missing.txt"
+          ? [{ desc: ErrorInfoSchema, value: create(ErrorInfoSchema, { code: EXTENSION_LIBRARY_FILE_NOT_FOUND }) }] : undefined);
+        default: throw new Error("Unexpected Library command.");
+      }
+    });
+    const controller = controllerFor({ getExtension: vi.fn(async () => catalog(extension)),
+      openExtensionMainView: vi.fn(async () => surface), getExtensionMainViewSurface: vi.fn(async () => surface), closeExtensionMainView: vi.fn(async () => true),
+      openExtensionLibrary, closeExtensionLibrary, callExtensionLibrary });
+    const rendered = await renderMainView(controller, EXTENSION_A);
+    const frame = required(rendered.container.querySelector<HTMLIFrameElement>("iframe"));
+    const post = vi.spyOn(required(frame.contentWindow), "postMessage").mockImplementation(() => undefined);
+    dispatchBridge(frame, "begin", { kind: "writeBegin", path: "notes/new.txt", totalBytes: 2n }); await settle();
+    dispatchBridge(frame, "first", { kind: "writeChunk", streamId, sequence: 0, content: Uint8Array.of(1) }); await settle();
+    expect(postedResponse(post, "first")).toMatchObject({ ok: true, result: { streamId, receivedBytes: 1n, nextSequence: 1 } });
+    dispatchBridge(frame, "missing-file", { kind: "read", path: "notes/missing.txt" }); await settle();
+    expect(postedResponse(post, "missing-file")).toMatchObject({ ok: false, error: { code: "NOT_FOUND" } });
+    dispatchBridge(frame, "second", { kind: "writeChunk", streamId, sequence: 1, content: Uint8Array.of(2) }); await settle();
+    dispatchBridge(frame, "commit", { kind: "writeCommit", streamId }); await settle();
+    expect(postedResponse(post, "second")).toMatchObject({ ok: true, result: { streamId, receivedBytes: 2n } });
+    expect(postedResponse(post, "commit")).toMatchObject({ ok: true, result: { bytes: 2n } });
+    expect(openExtensionLibrary).toHaveBeenCalledOnce();
+    expect(callExtensionLibrary.mock.calls.map(([sessionId]) => sessionId)).toEqual(Array<string>(5).fill(session.id));
+    expect(closeExtensionLibrary).not.toHaveBeenCalled();
+    dispatchBridge(frame, "missing-session", { kind: "read", path: "notes/new.txt" }); await settle();
+    expect(postedResponse(post, "missing-session")).toMatchObject({ ok: false, error: { code: "NOT_FOUND" } });
+    expect(closeExtensionLibrary).toHaveBeenCalledExactlyOnceWith(session.id);
   });
 
   it("keeps reveal, save, and PNG clipboard gestures in the trusted parent and returns no host path", async () => {

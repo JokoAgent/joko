@@ -69,6 +69,10 @@ export class ExtensionLibraryError extends Error {
   }
 }
 
+export class ExtensionLibraryFileNotFoundError extends ExtensionLibraryError {
+  constructor(message = "Library file was not found.") { super("NOT_FOUND", message); }
+}
+
 export class ExtensionLibraryOrphanMarkerWriteError extends Error {
   constructor(cause: unknown) {
     super("Extension Library orphan marker could not be staged.", { cause });
@@ -375,9 +379,12 @@ export class ExtensionLibraryVault {
   async read(input: { readonly path: string; readonly offset?: number; readonly length?: number; readonly sourceTag?: string }): Promise<ExtensionLibraryReadResult> {
     await this.#requireReady(false);
     const relativePath = validateExtensionLibraryPath(input.path, this.#limits);
-    const target = await this.#resolveExisting(relativePath, "file");
+    const target = await this.#resolveExisting(relativePath, "file").catch((error: unknown) => {
+      if (error instanceof ExtensionLibraryError && error.code === "NOT_FOUND") throw new ExtensionLibraryFileNotFoundError(error.message);
+      throw error;
+    });
     const before = await lstat(target, { bigint: true });
-    if (!before.isFile() || before.isSymbolicLink()) throw new ExtensionLibraryError("NOT_FOUND", "Library file was not found.");
+    if (!before.isFile() || before.isSymbolicLink()) throw new ExtensionLibraryFileNotFoundError();
     const offset = input.offset ?? 0;
     if (!Number.isSafeInteger(offset) || offset < 0 || offset > Number(before.size)) {
       throw new ExtensionLibraryError("PATH_INVALID", "Library read offset is invalid.");

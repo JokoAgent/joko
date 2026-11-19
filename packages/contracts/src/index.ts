@@ -21,6 +21,7 @@ export * from "./extension-targets.js";
 export const EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER = "x-joko-extension-main-view-keepalive";
 /** Owner event scope for re-reading plugin OAuth settings. */
 export const EXTENSION_OAUTH_INVALIDATION_SCOPE = "extension-oauth";
+export const EXTENSION_LIBRARY_FILE_NOT_FOUND = "EXTENSION_LIBRARY_FILE_NOT_FOUND";
 export * from "./remote-model-access.js";
 export * from "./provider-sharing-insights.js";
 export * from "./gen/joko/v1/extension_sync_pb.js";

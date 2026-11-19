@@ -212,6 +212,7 @@ import {
 } from "./extension-library-manager.js";
 import {
   ExtensionLibraryError,
+  ExtensionLibraryFileNotFoundError,
   type ExtensionLibraryEntry,
   type ExtensionLibraryWriteResult
 } from "./extension-library-vault.js";
@@ -12946,7 +12947,10 @@ async function extensionLibraryEffect<T>(action: () => T | Promise<T>): Promise<
               : error.code === "READ_ONLY" || error.code === "UNAVAILABLE" || error.code === "CORRUPT" || error.code === "SQL_FAILED"
                 ? Code.FailedPrecondition
                 : Code.Internal;
-    throw new ConnectError(redactSecrets(error.message), code);
+    const details = error instanceof ExtensionLibraryFileNotFoundError
+      ? [{ desc: contract.ErrorInfoSchema, value: create(contract.ErrorInfoSchema, { code: contract.EXTENSION_LIBRARY_FILE_NOT_FOUND }) }]
+      : undefined;
+    throw new ConnectError(redactSecrets(error.message), code, undefined, details);
   }
 }
 

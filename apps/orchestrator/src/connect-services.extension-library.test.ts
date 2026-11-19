@@ -196,6 +196,30 @@ describe("Connect Extension Library boundary", () => {
     expect(read.result.value.path).toBe("notes/hello.txt");
 
     const client = createClient(contract.ExtensionService, createRouterTransport(router => router.service(contract.ExtensionService, services.extension)));
+    const call = (operation: contract.ExtensionLibraryCall["operation"]) => client.callExtensionLibrary({ sessionId: sessionId!, call: { operation } }, {
+      headers: { authorization: "Bearer extension-library-test" }
+    });
+    const upload = (await call({ case: "writeBegin", value: create(contract.ExtensionLibraryWriteBeginOperationSchema, {
+      path: "notes/chunks.txt", totalBytes: 4n
+    }) })).result?.result;
+    if (upload?.case !== "stream") throw new Error("Expected an open Library write stream.");
+    const streamId = upload.value.streamId;
+    const chunk = (sequence: number, text: string) => call({ case: "writeChunk", value: create(contract.ExtensionLibraryWriteChunkOperationSchema, {
+      streamId, sequence, content: new TextEncoder().encode(text)
+    }) });
+    expect((await chunk(0, "ab")).result?.result).toMatchObject({ case: "stream", value: { streamId, nextSequence: 1, receivedBytes: 2n } });
+    const missingFile = await call({ case: "read", value: create(contract.ExtensionLibraryReadOperationSchema, { path: "notes/missing.txt" }) }).catch(ConnectError.from);
+    expect(missingFile).toMatchObject({ code: Code.NotFound });
+    expect(ConnectError.from(missingFile).findDetails(contract.ErrorInfoSchema)).toMatchObject([{ code: contract.EXTENSION_LIBRARY_FILE_NOT_FOUND }]);
+    expect((await chunk(1, "cd")).result?.result).toMatchObject({ case: "stream", value: { streamId, receivedBytes: 4n } });
+    expect((await call({ case: "writeCommit", value: create(contract.ExtensionLibraryWriteCommitOperationSchema, { streamId }) })).result?.result)
+      .toMatchObject({ case: "write", value: { path: "notes/chunks.txt", bytes: 4n } });
+    const missingSession = await client.callExtensionLibrary({ sessionId: `library_session_${"0".repeat(32)}`, call: { operation: {
+      case: "read", value: create(contract.ExtensionLibraryReadOperationSchema, { path: "notes/hello.txt" })
+    } } }, { headers: { authorization: "Bearer extension-library-test" } }).catch(ConnectError.from);
+    expect(missingSession).toMatchObject({ code: Code.NotFound });
+    expect(ConnectError.from(missingSession).findDetails(contract.ErrorInfoSchema)).toEqual([]);
+
     const path = "notes/hello.txt";
     const callExact = (operation: contract.ExtensionLibraryCall["operation"], match: string, onHeader?: (headers: Headers) => void) =>
       client.callExtensionLibrary({ sessionId: sessionId!, call: { operation } }, {
