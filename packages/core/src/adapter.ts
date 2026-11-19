@@ -669,6 +669,8 @@ export interface BackendAdapter {
   ): Promise<"present" | "absent" | "unknown">;
   createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding>;
   resumeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState>;
+  /** An idle local runtime actually exited, so the same durable binding can be resumed before dispatch. */
+  hasConfirmedIdleSessionExit?(sessionId: SessionId, binding: NativeSessionBinding): boolean;
   inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState>;
   /**
    * Side-effect-free check of one exact old native binding before reconciling an

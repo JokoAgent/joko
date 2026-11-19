@@ -267,6 +267,18 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
       }
       case "messageCompleted": {
         const message = kind.value;
+        const nativeTool = message.role === MessageRole.ASSISTANT && message.nativeIdentity !== undefined
+          && message.blocks.length === 1 && message.blocks[0]?.content.case === "toolCall" ? message.blocks[0].content.value : undefined;
+        if (nativeTool !== undefined && /^mcp__joko_[a-f0-9]{24}__/u.test(nativeTool.name)
+          && (toolStarts.get(nativeTool.callId) ?? []).some(start => {
+            const startPayload = start.payload?.kind;
+            const startIdentity = start.identity;
+            return startPayload?.case === "toolCallStarted" && startPayload.value.toolCall?.toolId === nativeTool.name
+              && startIdentity?.sessionId === event.identity?.sessionId && startIdentity?.backendId === event.identity?.backendId
+              && startIdentity?.targetId === event.identity?.targetId && startIdentity?.generation === event.identity?.generation
+              && startIdentity?.runId === event.identity?.runId && startIdentity?.attemptId === event.identity?.attemptId
+              && start.cursor?.generation === event.cursor?.generation && byId.has(mobileToolCallScopeKey(start) ?? "");
+          })) break;
         const previous = byId.get(message.messageId);
         const attempt = message.role === MessageRole.ASSISTANT && message.nativeIdentity === undefined
           && message.blocks.some(block => block.content.case === "text") ? assistantStreamAttempt(event) : undefined;

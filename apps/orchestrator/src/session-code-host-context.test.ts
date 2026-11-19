@@ -24,6 +24,30 @@ afterEach(() => {
 });
 
 describe("Session code-host context", () => {
+  it("reads each committed history batch once and publishes the final references", async () => {
+    const { store } = createFixture("Ordinary task");
+    const sessionId = "session-1";
+    const runtime = new SessionCodeHostContextRuntime({ store });
+    runtime.install();
+    const reads = vi.spyOn(store, "listEvents");
+    const appendMessage = (index: number, text: string) => store.appendEvent({
+      backendId: "backend-1", targetId: "target-1", sessionId, generation: 0, traceId: `history-${index}`,
+      payload: { type: "message_complete", role: "user", blocks: [{ kind: "text", text }] }
+    });
+    const references = () => readSessionCodeHostProjection(store, sessionId)?.references.map(entry => entry.reference.number);
+    store.transaction(() => {
+      for (let index = 0; index < 32; index++) appendMessage(index, "An original historical message.");
+      appendMessage(32, "Review https://github.com/acme/widgets/pull/42");
+    });
+    runtime.refreshSessionInBackground(sessionId);
+    await vi.waitFor(() => expect(references()).toEqual([42]));
+    expect(reads.mock.calls.filter(([query]) => query?.messageHttpsOnly)).toHaveLength(1);
+
+    appendMessage(33, "Then review https://github.com/acme/widgets/pull/43");
+    await vi.waitFor(() => expect(references()).toEqual([43, 42]));
+    expect(reads.mock.calls.filter(([query]) => query?.messageHttpsOnly)).toHaveLength(2);
+  });
+
   it("extracts task/message references, binds them to the Session owner, and persists provider projections", async () => {
     const fixture = createFixture("Track https://code.example/acme/widgets/pull/42");
     const provider: CodeHostProvider = {

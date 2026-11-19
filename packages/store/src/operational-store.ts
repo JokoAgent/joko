@@ -14533,6 +14533,7 @@ export class OperationalStore {
       `).all() as Row[];
       const queueIds: string[] = [];
       const runIds = new Set<string>();
+      const confirmedRunIds = new Set<string>();
       const effectOperationIds: string[] = [];
       const recoveredReviewRuns: ReviewRunRecord[] = [];
       const dismissedInteractionIds: string[] = [];
@@ -14546,6 +14547,11 @@ export class OperationalStore {
       for (const row of rows) {
         const id = stringValue(row["id"]);
         const item = this.getQueueItem(id);
+        queueIds.push(id);
+        if (this.recoverCompletedClaudeInput(item, traceId)) {
+          confirmedRunIds.add(item.runId);
+          continue;
+        }
         this.updateQueueState({
           queueItemId: id,
           state: "dispatch_unknown",
@@ -14554,7 +14560,6 @@ export class OperationalStore {
           at,
           traceId
         });
-        queueIds.push(id);
         runIds.add(item.runId);
       }
       const runRows = this.database.prepare(`
@@ -14655,7 +14660,7 @@ export class OperationalStore {
       }
       return {
         recoveredQueueItemIds: queueIds,
-        affectedRunIds: [...runIds],
+        affectedRunIds: [...confirmedRunIds, ...runIds],
         recoveredEffectOperationIds: effectOperationIds,
         recoveredReviewRuns,
         dismissedInteractionIds,
@@ -14663,6 +14668,48 @@ export class OperationalStore {
         events: [...this.currentFrame().events]
       };
     });
+  }
+
+  private recoverCompletedClaudeInput(item: QueueItemRecord, traceId: string): boolean {
+    if (item.state !== "backend_accepted" || item.attemptId === undefined || item.disposition !== "prompt"
+      || item.executionOverrides !== undefined || item.body.messagingOrigin !== undefined
+      || item.body.automaticContinuation !== undefined || item.body.objectiveContinuation !== undefined
+      || item.body.inputHandoffContinuation !== undefined) return false;
+    const session = this.getSession(item.sessionId).descriptor;
+    if (session.remoteWorkspace !== undefined || session.hidden || session.deletedAt !== undefined
+      || this.getBackend(session.backendId).descriptor.adapterKind !== "claude-agent-sdk-stdio") return false;
+    const run = this.getRun(item.runId).descriptor;
+    if (run.source !== "user" || run.parentRunId !== undefined || run.sessionId !== session.id || run.activeAttemptId !== item.attemptId
+      || run.state !== "completed" && (run.state === "dispatch_unknown" || !RUN_TRANSITIONS[run.state].has("completed"))) return false;
+    const attempt = this.getAttempt(item.attemptId).descriptor;
+    if (attempt.runId !== run.id || attempt.generation !== session.binding.generation || attempt.error !== undefined
+      || item.backendInstanceGeneration === undefined || attempt.backendInstanceGeneration !== item.backendInstanceGeneration) return false;
+    const operation = this.findOperation<{ readonly accepted: boolean; readonly resultCase?: string; readonly entityId?: string }>(item.operationId);
+    if (operation?.kind !== "sendInput" || operation.status !== "completed" || operation.connectionId === undefined
+      || operation.response?.accepted !== true || operation.response.resultCase !== "queueItem" || operation.response.entityId !== item.id) return false;
+    const payload = isRecord(operation.body) ? operation.body["payload"] : undefined;
+    const input = isRecord(payload) && payload["case"] === "sendInput" ? payload["value"] : undefined;
+    if (!isRecord(input) || input["sessionId"] !== session.id || input["messageEdit"] !== undefined
+      || input["partnerStarterEventId"] !== undefined) return false;
+    const otherInput = this.database.prepare(`SELECT 1 FROM queue_items
+      WHERE run_id = ? AND id <> ? AND state IN ('dispatching', 'backend_accepted', 'dispatch_unknown') LIMIT 1`)
+      .get(run.id, item.id);
+    if (otherInput !== undefined) return false;
+    const done = this.database.prepare(`
+      SELECT event.emitted_at, json_extract(event.payload_json, '$.payload.outcome') AS outcome
+      FROM events AS event
+      LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
+      WHERE event.session_id = ? AND event.backend_id = ? AND event.target_id = ?
+        AND event.run_id = ? AND event.attempt_id = ? AND event.operation_id = ? AND event.generation = ?
+        AND tombstone.event_id IS NULL AND json_extract(event.payload_json, '$.payload.type') = 'done'
+      ORDER BY event.global_cursor DESC LIMIT 1
+    `).get(session.id, session.backendId, session.targetId, run.id, attempt.id, operation.id, attempt.generation) as Row | undefined;
+    if (done?.["outcome"] !== "completed") return false;
+    const endedAt = run.endedAt ?? Math.max(numberValue(done["emitted_at"]), run.startedAt ?? 0, attempt.startedAt);
+    this.updateRunState({ runId: run.id, state: "completed", activeAttemptId: attempt.id, operationId: operation.id, traceId, endedAt });
+    if (attempt.endedAt === undefined) this.finishAttempt(attempt.id, undefined, endedAt);
+    this.updateQueueState({ queueItemId: item.id, state: "completed", traceId, at: endedAt });
+    return true;
   }
 
   private appendQueueControlEvent(

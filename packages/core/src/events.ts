@@ -682,6 +682,7 @@ export const NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD = "nativeHistoryReplacesTra
 export const NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD = "nativeHistoryObservedAssistantEntryId";
 export const NATIVE_HISTORY_ASSISTANT_STREAM_FIELD = "nativeHistoryAssistantStreamId";
 export const NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD = "nativeHistoryAssistantSourceEventId";
+export const NATIVE_HISTORY_ASSISTANT_TOOL_RESULT_FIELD = "nativeHistoryAssistantToolResultEntryId";
 export function validModelSubstitution(value: unknown): value is { readonly selectedModelId: string; readonly actualModelId: string } {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const fields = value as Record<string, unknown>;

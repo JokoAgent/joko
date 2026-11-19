@@ -142,6 +142,10 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
     await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
     await page.setViewportSize({ width: 430, height: 900 });
     await closeCompactNavigationDrawer(page);
+    const closeDetails = page.locator(".inspector-dock-group[data-edge]")
+      .getByRole("button", { name: "Close details", exact: true }).first();
+    if (await closeDetails.isVisible()) await closeDetails.click();
+    await closeDetails.waitFor({ state: "hidden" });
     const rewindRow = row(rewindSource.messageId);
     await rewindRow.hover(); await rewindRow.locator(".message-action-menu > summary").click();
     await rewindRow.getByRole("menuitem", { name: "Rewind from here", exact: true }).click();

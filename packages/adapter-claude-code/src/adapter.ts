@@ -14,9 +14,12 @@ import {
   CAPABILITIES,
   CapabilityDrivenBackendAdapter,
   HOST_COMPOSED_CAPABILITIES,
+  isProductSlashCommand,
   JokoError,
   NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
   NATIVE_HISTORY_ASSISTANT_STREAM_FIELD,
+  NATIVE_HISTORY_ASSISTANT_TOOL_RESULT_FIELD,
+  NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
   snapshotNativeSkills,
   nativeTextInferenceImages,
   type ApprovedSkillResolver,
@@ -84,7 +87,7 @@ import { ClaudeAccountUsageCache, parseClaudeAccountUsage } from "./account-usag
 import type { ClaudeManagedChildWorkspace, ClaudeManagedChildWorkspaceFactory } from "./managed-child-workspace.js";
 import { claudeCodeError } from "./errors.js";
 import type { ClaudeMcpBridgePort, ClaudeMcpCallResult, ClaudeMcpRuntimeLease, ClaudeMcpTool } from "./mcp-bridge.js";
-import { SessionSdkFailure } from "./session-sdk-owner.js";
+import { SESSION_SDK_MAXIMUM_RESULT_BYTES, SessionSdkFailure } from "./session-sdk-owner.js";
 import { readRegisteredBackgroundTaskOutput } from "./background-task-output.js";
 import { readBackgroundWorkflowProgress } from "./workflow-progress.js";
 import type { ClaudeFreshContextBindingLookup, ClaudeFreshContextIdentity, ClaudeFreshContextSnapshot } from "./fresh-context-owner.js";
@@ -175,6 +178,8 @@ const DEFAULT_NATIVE_CONTINUATION_GRACE_MS = 60_000;
 const DEFAULT_MAXIMUM_DISCOVERED_SESSIONS = 200;
 const DEFAULT_MAXIMUM_CATALOG_SESSIONS = 1_000;
 const MAX_NATIVE_HISTORY_MESSAGES = 10_000;
+const NATIVE_HISTORY_PAGE_LIMIT = MAX_NATIVE_HISTORY_MESSAGES + 1;
+const NATIVE_HISTORY_CONTINUATION_TIMEOUT_MS = 30_000;
 const MAX_PROMPT_BYTES = 1024 * 1024;
 const MAX_MANAGED_AGENT_RESULT_BYTES = 64 * 1024;
 const MAX_MCP_COMPLETE_TEXT_BYTES = 2 * 1024 * 1024;
@@ -450,6 +455,13 @@ interface ActiveTurn {
   readonly stream: PartialMessageBuffer;
   textStream?: { readonly blockId: string; readonly messageId: string } | null;
   textAssistant?: { readonly entryId: string; readonly messageId: string } | null;
+  proseBeforeTool?: {
+    readonly entryId: string;
+    readonly messageId: string;
+    readonly callId: string;
+    readonly toolEntryId: string;
+    resultEntryId?: string;
+  };
   readonly steers: Map<string, SteerAdmission>;
   stopping: boolean;
   interruptConfirmation?: Deferred<void>;
@@ -711,6 +723,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   readonly #accountUsage: ClaudeAccountUsageCache;
   readonly #privateManagedWorktreePaths = new Set<string>();
   readonly #sessions = new Map<string, NativeRuntime>();
+  readonly #idleSessionExits = new Map<string, NativeSessionBinding>();
   readonly #nativeTextFlights = new Set<AbortController>();
   readonly #workingContextRecoveries = new Map<string, { readonly runtime: NativeRuntime; readonly providerId: string; readonly modelId: string }>();
   readonly #models = new Map<string, ClaudeSdkModelInfo>();
@@ -1497,6 +1510,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     return nativeState(runtime);
   }
 
+  hasConfirmedIdleSessionExit(sessionId: string, binding: NativeSessionBinding): boolean {
+    const exited = this.#idleSessionExits.get(sessionId);
+    return exited !== undefined && !this.#sessions.has(sessionId) && exited.opaqueRef === binding.opaqueRef
+      && exited.nativeSessionId === binding.nativeSessionId && exited.generation === binding.generation;
+  }
+
   override async inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
     await this.validateTarget(context.target);
     this.#assertBindingContext(binding, context);
@@ -1632,37 +1651,34 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       assertSessionInfoIdentity(info, nativeSessionId);
     }
 
-    let messages: readonly ClaudeSdkSessionMessage[];
-    try {
-      runtime.assertRuntimeCurrent();
-      messages = runtime.storedSessionAccess === undefined
-        ? await runtime.sdkRuntime.getSessionMessages(nativeSessionId, {
-            dir: runtime.runtimeWorkspaceRoot,
-            limit: MAX_NATIVE_HISTORY_MESSAGES + 1,
-            offset: 0,
-            includeSystemMessages: true
-          })
-        : await runtime.sdkRuntime.storedSessions!.getSessionMessages(nativeSessionId, {
-            dir: runtime.runtimeWorkspaceRoot,
-            limit: MAX_NATIVE_HISTORY_MESSAGES + 1,
-            offset: 0,
-            includeSystemMessages: true,
-            access: runtime.storedSessionAccess
-          });
-      runtime.assertRuntimeCurrent();
-    } catch {
-      throw claudeCodeError(
-        "NATIVE_HISTORY_READ_FAILED",
-        "The native Session history could not be read.",
-        "session_history",
-        {
-          retryable: true,
-          stateMayHaveChanged: false,
-          recovery: "Verify native Session storage and retry history synchronization."
-        }
-      );
+    const readPage = async (offset: number, signal?: AbortSignal): Promise<readonly ClaudeSdkSessionMessage[]> => {
+      const options = {
+        dir: runtime.runtimeWorkspaceRoot, limit: NATIVE_HISTORY_PAGE_LIMIT, offset, includeSystemMessages: true as const,
+        ...(signal === undefined ? {} : { signal })
+      };
+      let page: readonly ClaudeSdkSessionMessage[];
+      try {
+        runtime.assertRuntimeCurrent();
+        page = runtime.storedSessionAccess === undefined
+          ? await runtime.sdkRuntime.getSessionMessages(nativeSessionId, options)
+          : await runtime.sdkRuntime.storedSessions!.getSessionMessages(nativeSessionId, { ...options, access: runtime.storedSessionAccess });
+        runtime.assertRuntimeCurrent();
+      } catch {
+        throw nativeHistoryReadFailed("The native Session history could not be read.");
+      }
+      this.#assertCurrent(runtime, context, binding);
+      if (!Array.isArray(page)) throw invalidNativeHistory();
+      if (page.length > NATIVE_HISTORY_PAGE_LIMIT) throw nativeHistoryLimitExceeded();
+      return page;
+    };
+    const first = await readPage(0);
+    const extended = first.length === NATIVE_HISTORY_PAGE_LIMIT && !runtime.remote && runtime.storedSessionAccess === undefined;
+    let messages = first;
+    if (extended) {
+      const deadline = AbortSignal.timeout(NATIVE_HISTORY_CONTINUATION_TIMEOUT_MS);
+      const signal = context.signal === undefined ? deadline : AbortSignal.any([context.signal, deadline]);
+      messages = await completeLocalNativeHistory(first, offset => readPage(offset, signal));
     }
-    this.#assertCurrent(runtime, context, binding);
     const confirmedInfo = await this.#sessionInfo(
       nativeSessionId,
       context.target,
@@ -1677,18 +1693,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     } else {
       assertSessionInfoIdentity(confirmedInfo, nativeSessionId);
     }
-    if (!Array.isArray(messages)) throw invalidNativeHistory();
-    if (messages.length > MAX_NATIVE_HISTORY_MESSAGES) {
-      throw claudeCodeError(
-        "NATIVE_HISTORY_LIMIT_EXCEEDED",
-        "The native Session history exceeds the bounded projection limit.",
-        "session_history",
-        {
-          stateMayHaveChanged: false,
-          recovery: "Start a new native Session before importing additional history."
-        }
-      );
+    if (extended && (!Number.isFinite(info.lastModified) || info.lastModified !== confirmedInfo.lastModified)) {
+      throw nativeHistoryReadFailed("The native Session history changed during synchronization.");
     }
+    if (!extended && messages.length > MAX_NATIVE_HISTORY_MESSAGES) throw nativeHistoryLimitExceeded();
     try {
       return projectNativeHistory(messages, nativeSessionId, this.#projection, this.#supportsFreshContext(context.target));
     } catch (error) {
@@ -1712,7 +1720,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     await this.validateTarget(context.target);
     this.#assertBindingContext(binding, context);
     const runtime = this.#sessions.get(context.sessionId);
-    if (runtime === undefined) return;
+    if (runtime === undefined) {
+      if (this.hasConfirmedIdleSessionExit(context.sessionId, binding)) this.#idleSessionExits.delete(context.sessionId);
+      return;
+    }
     if (runtime.closed && !runtime.retirementConfirmed) {
       this.#assertRetirementContext(runtime, context, binding);
       await this.#retireRuntime(runtime);
@@ -1848,11 +1859,31 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     await snapshot.assertFilesCurrent(context.signal);
     this.#assertCurrent(runtime, context, runtime.binding);
     const resources = await this.getResources(context);
-    return snapshot.skills.filter(mount => !mount.discovery && mount.seed.resource.trustedBuiltin
-      && resources.some(resource => resource.id === mount.seed.resource.id && resource.revision === mount.seed.resource.revision)).map(mount => ({
-      name: mount.seed.resource.name, description: "Create or update a Joko plugin using the shipped authoring instructions.", source: "skill" as const,
-      inputMode: "resource_mention" as const, loaded: true, resourceId: mount.seed.resource.id, builtinSkill: mount.seed.resource.trustedBuiltin!
-    }));
+    this.#assertCurrent(runtime, context, runtime.binding);
+    snapshot.assertCurrent();
+    const names = new Map<string, number>();
+    for (const { seed, discovery } of snapshot.skills) {
+      if (discovery) continue;
+      const name = seed.resource.name.toLowerCase();
+      names.set(name, (names.get(name) ?? 0) + 1);
+    }
+    const loadedById = new Map(resources.map(resource => [resource.id, resource]));
+    const commands: RuntimeCommand[] = [];
+    for (const { seed, discovery } of snapshot.skills) {
+      const { id, name, revision, resourceVersion, trustedBuiltin } = seed.resource;
+      const loaded = loadedById.get(id);
+      if (discovery || loaded?.kind !== "skill" || loaded.revision !== revision) continue;
+      const command = { name, source: "skill" as const, inputMode: "resource_mention" as const, loaded: true, resourceId: id };
+      if (trustedBuiltin !== undefined) {
+        commands.push({ ...command, description: "Create or update a Joko plugin using the shipped authoring instructions.", builtinSkill: trustedBuiltin });
+      } else if (!snapshot.restrictImplicit && context.target.trusted && loaded.resourceVersion === resourceVersion
+        && snapshot.skillOverrides[name] !== "off" && names.get(name.toLowerCase()) === 1
+        && name.length <= 256 && /^[^\s/\\\u0000-\u001f\u007f]+$/u.test(name) && !isProductSlashCommand(name)) {
+        // The palette selects the approved Resource through the existing input path.
+        commands.push({ ...command, description: "" });
+      }
+    }
+    return commands;
   }
 
   override send(input: PromptInput, context: AdapterContext): Promise<void> {
@@ -3544,6 +3575,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       return;
     }
     this.#disposed = true;
+    this.#idleSessionExits.clear();
     try {
       await this.#oauthAccount?.dispose();
     } catch (error) {
@@ -3597,6 +3629,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     try { this.#managedProviders?.dispose(); }
     catch (error) { failures.push(error); }
     this.#disposed = true;
+    this.#idleSessionExits.clear();
     try {
       await this.#oauthAccount?.dispose();
     } catch (error) {
@@ -3881,6 +3914,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         modelUsageObserver: new NativeModelUsageObserver()
       };
       this.#sessions.set(context.sessionId, runtime);
+      this.#idleSessionExits.delete(context.sessionId);
       builtinInitializationCurrent = () => runtime?.initialization?.plugins_applied === true;
     } finally {
       startedQuery.releaseAuthorization();
@@ -4546,6 +4580,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const envelope = record(message);
     if (stringValue(envelope?.["parent_tool_use_id"]) !== null && envelope?.["parent_tool_use_id"] !== null) return;
     if (record(envelope?.["event"])?.["type"] === "message_start") {
+      if (turn.proseBeforeTool !== undefined) turn.textStream = undefined;
       await this.#settleNativeRetry(runtime, turn, "succeeded");
     }
     this.#observeParentStream(turn, envelope);
@@ -4585,12 +4620,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     // Exact SDK identities attest calls privately. Display redaction can alter
     // both tool names and call IDs and must never decide native authority.
     const nativeContent = nativeMessage?.["content"];
-    turn.textAssistant = turn.textAssistant === undefined && uuid !== undefined && uuidPattern().test(uuid)
-      && nativeMessageId !== undefined && error === undefined && typeof envelope["parent_agent_id"] !== "string"
-      && Array.isArray(nativeContent) && nativeContent.length === 1 && record(nativeContent[0])?.["type"] === "text"
-      && projected.blocks.length === 1 && projected.blocks[0]?.kind === "text" && projected.blocks[0].text.trim() !== ""
-      ? { entryId: uuid.toLowerCase(), messageId: nativeMessageId }
-      : null;
+    const entryId = uuid !== undefined && uuidPattern().test(uuid) && error === undefined
+      && typeof envelope["parent_agent_id"] !== "string" ? uuid.toLowerCase() : undefined;
+    const nativeBlock = Array.isArray(nativeContent) && nativeContent.length === 1 ? record(nativeContent[0]) : undefined;
     if (runtime.mcpLease && Array.isArray(nativeContent)) for (const raw of nativeContent) {
       const block = record(raw), id = stringValue(block?.["id"]), name = stringValue(block?.["name"]), input = record(block?.["input"]);
       if (block?.["type"] !== "tool_use" || !id || !name || !input || id.length > 512 || turn.nativeMcpToolCalls.has(id)
@@ -4598,6 +4630,31 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       if (turn.nativeMcpToolCalls.size >= MAX_PENDING_INTERACTIONS) throw nativeEventLimit();
       turn.nativeMcpToolCalls.set(id, { name, input: structuredClone(input), claimed: false });
       turn.mcpRootToolWaiters.get(id)?.resolve(undefined);
+    }
+    const first = turn.blocks[0];
+    const textAssistant = turn.textAssistant;
+    const textStream = turn.textStream;
+    const toolCall = projected.toolCalls.length === 1 ? projected.toolCalls[0] : undefined;
+    if (this.#canObserveOrdinaryProse(runtime, turn) && turn.proseBeforeTool === undefined && !turn.stopping
+      && turn.assistantError === undefined && turn.parentStreamMessages === 1 && turn.blocks.length === 2 && first?.kind === "text"
+      && textAssistant && textStream && textAssistant.messageId === textStream.messageId && textAssistant.messageId === nativeMessageId
+      && entryId !== undefined && entryId !== textAssistant.entryId && nativeBlock?.["type"] === "tool_use" && toolCall !== undefined
+      && nativeBlock["id"] === toolCall.callId && nativeBlock["name"] === toolCall.name && turn.nativeMcpToolCalls.has(toolCall.callId)
+      && !turn.seenToolStarts.has(toolCall.callId)) {
+      // The SDK delivers the standalone text and tool frames in order inside
+      // one API message. Finish the text before publishing its following tool.
+      if (!await this.#emit(runtime, turn, { type: "message_complete", role: "assistant", blocks: [first], nativeHistory: {} },
+        turn.context, {
+          [NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD]: textAssistant.entryId,
+          [NATIVE_HISTORY_ASSISTANT_STREAM_FIELD]: textStream.blockId
+        })) return;
+      turn.proseBeforeTool = { ...textAssistant, callId: toolCall.callId, toolEntryId: entryId };
+      turn.textAssistant = undefined;
+    } else {
+      turn.textAssistant = textAssistant === undefined && entryId !== undefined && nativeMessageId !== undefined
+        && nativeBlock?.["type"] === "text" && projected.blocks.length === 1
+        && projected.blocks[0]?.kind === "text" && projected.blocks[0].text.trim() !== ""
+        ? { entryId, messageId: nativeMessageId } : null;
     }
     for (const tool of projected.toolCalls) {
       if (runtime.toolNames.size >= MAX_SESSION_TOOL_NAMES && !runtime.toolNames.has(tool.callId)) {
@@ -4612,12 +4669,15 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       }
       if (turn.seenToolStarts.has(tool.callId)) continue;
       addBoundedIdentity(turn.seenToolStarts, tool.callId);
+      const boundary = turn.proseBeforeTool;
+      const observed = boundary !== undefined && boundary.callId === tool.callId && boundary.toolEntryId === entryId;
       await this.#emit(runtime, turn, {
         type: "tool_start",
         callId: tool.callId,
         name: tool.name,
-        input: tool.input
-      });
+        input: tool.input,
+        ...(observed ? { nativeHistory: { identity: { entryId: boundary.toolEntryId, parentEntryId: boundary.entryId } } } : {})
+      }, turn.context, observed ? { [NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD]: true } : undefined);
     }
   }
 
@@ -4635,6 +4695,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       const block = record(raw), id = stringValue(block?.["tool_use_id"]);
       if (block?.["type"] === "tool_result" && id) turn.nativeMcpToolCalls.delete(id);
     }
+    const boundary = turn.proseBeforeTool;
+    const nativeBlock = Array.isArray(nativeContent) && nativeContent.length === 1 ? record(nativeContent[0]) : undefined;
+    const nativeOutput = nativeBlock?.["content"];
+    const inlinePart = Array.isArray(nativeOutput) && nativeOutput.length === 1 ? record(nativeOutput[0]) : undefined;
+    const inlineText = typeof nativeOutput === "string" ? nativeOutput : inlinePart?.["type"] === "text" ? inlinePart["text"] : undefined;
+    const resultEntryId = uuid !== undefined && uuidPattern().test(uuid) && typeof envelope["parent_agent_id"] !== "string"
+      ? uuid.toLowerCase() : undefined;
     for (const result of projected.toolResults) {
       if (runtime.nativeTaskProjectionEnabled) runtime.nativeTasks.completeToolScope(result.callId);
       if (turn.seenToolResults.has(result.callId)) continue;
@@ -4642,14 +4709,18 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       appendTurnBlocks(turn, [result.block]);
       const completeText = result.readCompleteText?.();
       const artifact = completeText === undefined ? undefined : await this.#storeCompleteMcpToolOutput(runtime, turn, completeText);
+      const observed = boundary !== undefined && boundary.callId === result.callId && nativeBlock?.["tool_use_id"] === result.callId
+        && resultEntryId !== undefined && !result.isError && result.output.trim() !== "" && result.output === inlineText && artifact === undefined;
+      if (observed) boundary.resultEntryId = resultEntryId;
       await this.#emit(runtime, turn, {
         type: "tool_result",
         callId: result.callId,
         name: runtime.toolNames.get(result.callId) ?? "Tool",
         output: result.output,
         isError: result.isError,
-        ...(artifact === undefined ? {} : { artifact })
-      });
+        ...(artifact === undefined ? {} : { artifact }),
+        ...(observed ? { nativeHistory: { identity: { entryId: resultEntryId, parentEntryId: boundary.toolEntryId } } } : {})
+      }, turn.context, observed ? { [NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD]: true } : undefined);
     }
   }
 
@@ -4706,13 +4777,23 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     );
     const seconds = finite(envelope["elapsed_time_seconds"]);
     if (seconds === undefined) return;
+    const boundary = turn.proseBeforeTool;
+    const observed = boundary !== undefined && envelope["parent_tool_use_id"] === null
+      && envelope["tool_use_id"] === boundary.callId;
     await this.#emit(runtime, turn, {
       type: "tool_update",
       callId,
       name,
       outputMode: "replace",
-      output: `Running for ${Math.max(0, Math.floor(seconds))} seconds.`
-    });
+      output: `Running for ${Math.max(0, Math.floor(seconds))} seconds.`,
+      ...(observed ? { nativeHistory: { identity: { entryId: boundary.toolEntryId, parentEntryId: boundary.entryId } } } : {})
+    }, turn.context, observed ? { [NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD]: true } : undefined);
+  }
+
+  #canObserveOrdinaryProse(runtime: NativeRuntime, turn: ActiveTurn): boolean {
+    return runtime.runtimePolicy === "standard" && !runtime.remote && turn.context.hostedExecution === undefined
+      && turn.partnerLearningTurn === undefined && !turn.nativeContinuationSegment && !turn.childOutputObserved
+      && turn.steers.size === 0 && turn.pendingContinuationTaskIds.size === 0 && this.#rootWakeTaskIds(runtime).length === 0;
   }
 
   async #handleResult(
@@ -4786,23 +4867,27 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       selectedModelId: this.#projection.text(observedSubstitution.selectedModelId),
       actualModelId: this.#projection.text(observedSubstitution.actualModelId)
     };
-    // One fully observed parent frame and one stream block can be confirmed by
-    // their SDK identities when Host next reads the persisted native Session.
     const textStream = turn.textStream;
-    const textObservation = result.outcome === "completed" && result.error === undefined
-      && runtime.runtimePolicy === "standard" && !runtime.remote && turn.context.hostedExecution === undefined
-      && turn.partnerLearningTurn === undefined && !turn.nativeContinuationSegment && !turn.childOutputObserved
-      && turn.steers.size === 0 && turn.pendingContinuationTaskIds.size === 0 && this.#rootWakeTaskIds(runtime).length === 0
-      && turn.parentStreamMessages === 1 && turn.parentStreamSegment === undefined
-      && turn.blocks.length === 1 && turn.blocks[0]?.kind === "text"
-      && turn.textAssistant && textStream && textStream.messageId === turn.textAssistant.messageId
+    const boundary = turn.proseBeforeTool;
+    const ordinaryText = result.outcome === "completed" && result.error === undefined && this.#canObserveOrdinaryProse(runtime, turn)
+      && turn.parentStreamSegment === undefined && turn.textAssistant && textStream
+      && textStream.messageId === turn.textAssistant.messageId;
+    const [, call, receipt, afterTool] = turn.blocks;
+    const ordinaryToolReply = ordinaryText && boundary?.resultEntryId !== undefined && turn.parentStreamMessages === 2
+      && turn.blocks.length === 4 && call?.kind === "tool_call" && call.callId === boundary.callId
+      && receipt?.kind === "tool_result" && receipt.callId === boundary.callId && afterTool?.kind === "text"
+      && textStream?.messageId !== boundary.messageId;
+    const blocks = turn.blocks.slice(ordinaryToolReply ? 3 : boundary === undefined ? 0 : 1);
+    // The Host confirms the exact SDK entry before adopting either live row.
+    const textObservation = ordinaryText && turn.textAssistant && textStream && (ordinaryToolReply
+      || (boundary === undefined && turn.parentStreamMessages === 1 && blocks.length === 1 && blocks[0]?.kind === "text"))
       ? { entryId: turn.textAssistant.entryId, blockId: textStream.blockId }
       : undefined;
-    if (turn.blocks.length > 0) {
+    if (blocks.length > 0) {
       await this.#emit(runtime, turn, {
         type: "message_complete",
         role: "assistant",
-        blocks: [...turn.blocks],
+        blocks,
         usage: generation.usage,
         ...(textObservation === undefined ? {} : { nativeHistory: {} }),
         ...(modelSubstitution === undefined ? {} : { modelSubstitution }),
@@ -4812,7 +4897,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         })
       }, turn.context, textObservation === undefined ? undefined : {
         [NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD]: textObservation.entryId,
-        [NATIVE_HISTORY_ASSISTANT_STREAM_FIELD]: textObservation.blockId
+        [NATIVE_HISTORY_ASSISTANT_STREAM_FIELD]: textObservation.blockId,
+        ...(ordinaryToolReply && boundary?.resultEntryId !== undefined
+          ? { [NATIVE_HISTORY_ASSISTANT_TOOL_RESULT_FIELD]: boundary.resultEntryId } : {})
       });
       if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
     }
@@ -4879,6 +4966,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     }
     turn.blocks.splice(0);
     turn.stream.reset();
+    turn.textStream = undefined;
+    turn.textAssistant = undefined;
+    turn.proseBeforeTool = undefined;
     turn.assistantError = undefined;
     turn.childOutputObserved = false;
     turn.parentAssistantMessages = 0;
@@ -4987,6 +5077,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
 
   async #handleStreamFailure(runtime: NativeRuntime, cause?: unknown): Promise<void> {
     const turn = runtime.activeTurn;
+    const idleLocalExit = turn === undefined && runtime.initialization !== undefined
+      && !runtime.remote && runtime.runtimePolicy === "standard" && runtime.baseContext.hostedExecution === undefined
+      && runtime.inputPreparation === undefined && runtime.pendingControl === undefined && !runtime.compacting;
     let pendingAdmissionFailure: unknown;
     const publicError: PublicError = cause instanceof JokoError
       ? cause.publicError
@@ -5045,7 +5138,16 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     } catch {
       // The runtime fence and teardown remain authoritative if Host emission fails.
     } finally {
-      await this.#retireRuntime(runtime, false, publicError, undefined, pendingAdmissionFailure);
+      if (idleLocalExit) runtime.requiresConfirmedRetirement = true;
+      try { await this.#retireRuntime(runtime, false, publicError, undefined, pendingAdmissionFailure); }
+      catch (error) {
+        if (!idleLocalExit) throw error;
+        // Failed process confirmation leaves the exact old runtime fenced for explicit retirement.
+      }
+      if (idleLocalExit && !this.#disposed && runtime.retirementConfirmed && runtime.processRetirementConfirmed
+        && !this.#sessions.has(runtime.productSessionId)) {
+        this.#idleSessionExits.set(runtime.productSessionId, runtime.binding);
+      }
     }
   }
 
@@ -6056,7 +6158,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         const requestId = `native-policy-${randomUUID()}`, options = { signal, requestId, toolUseID: _toolUseId ?? input.tool_use_id };
         const answer = await this.#requestInteraction(runtime, turn, { id: interactionId(runtime, requestId), kind: "permission", title: "Allow native tool?",
           toolName: input.tool_name, summary: permissionSummary(input.tool_name, toolInput, options, this.#projection, input.cwd), risk: permissionRisk(input.tool_name),
-          choices: ["allow_once", "deny"] }, signal);
+          choices: ["allow_once", "deny_once"] }, signal);
         signal.throwIfAborted(); runtime.assertRuntimeCurrent(); authority.assertCurrent(result.authorizationRevision);
         context.assertExtraDirectoriesCurrent?.(directories);
         if (!this.#isTurnCurrent(runtime, turn) || JSON.stringify(input.tool_input) !== JSON.stringify(toolInput)) return denied("The native action changed while permission was pending.");
@@ -6163,7 +6265,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       toolName: this.#projection.identifier(toolName, "Tool"),
       summary: permissionSummary(toolName, input, options, this.#projection),
       risk: permissionRisk(toolName),
-      choices: ["allow_once", "allow_for_session", "deny"]
+      choices: ["allow_once", "allow_for_session", "deny_once"]
     };
     const decision = await this.#requestInteraction(runtime, turn, interaction, options.signal);
     try { turn.context.nativeToolAuthorization?.assertCurrent(authorizationRevision); } catch { return { behavior: "deny", message: "The originating delegated task authority changed while permission was pending." }; }
@@ -7586,6 +7688,41 @@ interface HistoryEntryProjection {
   readonly kind: string;
   readonly contentIndex: number;
   readonly payload: EventPayload;
+}
+
+async function completeLocalNativeHistory(
+  first: readonly ClaudeSdkSessionMessage[],
+  readPage: (offset: number) => Promise<readonly ClaudeSdkSessionMessage[]>
+): Promise<readonly ClaudeSdkSessionMessage[]> {
+  const messages = [...first];
+  let bytes = Buffer.byteLength(JSON.stringify(first), "utf8");
+  if (bytes > SESSION_SDK_MAXIMUM_RESULT_BYTES) throw nativeHistoryLimitExceeded();
+  for (;;) {
+    // Repeat the page boundary to detect shifting offsets before combining histories.
+    const page = await readPage(messages.length - 1);
+    if (page.length === 0 || JSON.stringify(page[0]) !== JSON.stringify(messages.at(-1))) {
+      throw nativeHistoryReadFailed("The native Session history changed during synchronization.");
+    }
+    const tail = page.slice(1);
+    if (tail.length > 0) {
+      bytes += Buffer.byteLength(JSON.stringify(tail), "utf8") - 1;
+      if (bytes > SESSION_SDK_MAXIMUM_RESULT_BYTES) throw nativeHistoryLimitExceeded();
+      messages.push(...tail);
+    }
+    if (page.length < NATIVE_HISTORY_PAGE_LIMIT) return messages;
+  }
+}
+
+function nativeHistoryReadFailed(message: string): JokoError {
+  return claudeCodeError("NATIVE_HISTORY_READ_FAILED", message, "session_history", {
+    retryable: true, stateMayHaveChanged: false, recovery: "Verify native Session storage and retry history synchronization."
+  });
+}
+
+function nativeHistoryLimitExceeded(): JokoError {
+  return claudeCodeError("NATIVE_HISTORY_LIMIT_EXCEEDED", "The native Session history exceeds the bounded projection limit.", "session_history", {
+    stateMayHaveChanged: false, recovery: "Start a new native Session before importing additional history."
+  });
 }
 
 function projectNativeHistory(

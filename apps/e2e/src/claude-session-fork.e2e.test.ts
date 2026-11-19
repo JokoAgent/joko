@@ -29,7 +29,7 @@ import {
   type ClaudeSdkStoredSessionRuntime,
   type ClaudeSdkUserMessage
 } from "@joko/adapter-claude-code/testing";
-import { MessageRole, NativeNavigationTargetSchema, NativeSessionStartSchema, OperationMutationSchema, OperationState, RunState, type Event } from "@joko/contracts";
+import { InteractionState, MessageRole, NativeCatalogImportPresentationSchema, NativeNavigationTargetSchema, NativeSessionPlacement, NativeSessionStartSchema, OperationMutationSchema, OperationState, PermissionDecisionKind, RunState, type Event } from "@joko/contracts";
 import { expect, it, vi } from "vitest";
 import { createE2eClients } from "./connect-clients.js";
 import { OrchestratorE2eFixture, waitFor, type E2eClients } from "./fixture.js";
@@ -38,6 +38,8 @@ import {
   deleteMutation,
   forkMutation,
   navigateMutation,
+  queueRunIdFrom,
+  resolvePermissionMutation,
   sendInputMutation,
   sessionIdFrom,
   submit
@@ -57,6 +59,155 @@ const sdkTransport = vi.hoisted(() => ({
 }));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", () => sdkTransport);
+
+it("hydrates all 10,001 messages of an ordinary Claude catalog import on first activation", { timeout: 180_000 }, async () => {
+  const beganAt = performance.now();
+  const checkpoint = (stage: string, counts?: { readonly offset?: number; readonly messages?: number; readonly commands?: number; readonly referenceScans?: number }): void => {
+    console.info("Claude long history", JSON.stringify({ stage, elapsedMs: Math.round(performance.now() - beganAt), ...counts }));
+  };
+  const seed = await seedNativeHistory("external-claude-project");
+  let fixture: OrchestratorE2eFixture | undefined;
+  let stopObserving: (() => void) | undefined;
+  let restoreCommandObservers: (() => void) | undefined;
+  try {
+    const messageIds = [...seed.messageIds, ...Array.from({ length: 10_001 - seed.messageIds.length }, () => randomUUID())];
+    const tail = messageIds.slice(seed.messageIds.length).map((uuid, offset) => {
+      const index = seed.messageIds.length + offset;
+      const type = index % 2 === 0 ? "user" : "assistant";
+      const text = `Local history message ${index}`;
+      return JSON.stringify({
+        type, uuid, parentUuid: messageIds[index - 1], sessionId: seed.sourceId, cwd: seed.workspace,
+        timestamp: new Date(index).toISOString(), message: type === "user" ? { role: type, content: text }
+          : { role: type, id: `msg_local_history_${index}`, content: [{ type: "text", text }] }
+      });
+    }).join("\n") + "\n";
+    expect(Buffer.byteLength(seed.transcript + tail, "utf8")).toBeLessThan(5 * 1024 * 1024);
+    await Promise.all([seed.sourcePath, join(seed.profile, "projects", claudeProjectKey(seed.workspace), `${seed.sourceId}.jsonl`)]
+      .map(path => appendFile(path, tail, "utf8")));
+    checkpoint("transcript-written", { messages: messageIds.length });
+
+    const resumes: Array<string | undefined> = [];
+    const started = await start(seed, (params) => {
+      resumes.push(params.options.resume);
+      return new IdleQuery();
+    });
+    fixture = started.fixture;
+    checkpoint("orchestrator-ready");
+    const targetId = "external-claude-project";
+    await fixture.application.workspaces.register({ id: targetId, root: seed.workspace,
+      displayName: "External Claude project", trusted: true });
+    await fixture.application.sessionHost.registerTarget({ id: targetId, backendId, displayName: "External Claude project",
+      workspaceRoot: seed.workspace, managed: false, trusted: true }, { workspaceId: targetId });
+    const paired = await fixture.pair();
+    const clients = createE2eClients(fixture.baseUrl, paired.authKey, 120_000);
+    checkpoint("catalog-scan-requested");
+    const catalog = await clients.session.scanNativeSessionCatalog({ backendId, force: true });
+    const entry = catalog.entries.find(candidate => candidate.nativeSessionId === seed.sourceId);
+    if (entry === undefined) throw new Error("The original local Claude task was not found in the catalog.");
+    expect(entry).toMatchObject({ targetId, projectTargetId: targetId });
+    checkpoint("catalog-entry-confirmed");
+    const mutation = createSessionMutation({ backendId, targetId, displayName: "Long local Claude history" });
+    if (mutation.payload.case !== "createSession") throw new Error("Invalid catalog import fixture mutation.");
+    mutation.payload.value.initialPlacement = NativeSessionPlacement.PROJECT;
+    mutation.payload.value.nativeStart = create(NativeSessionStartSchema, { kind: {
+      case: "attach", value: { opaqueNativeReference: entry.nativeReference }
+    } });
+    mutation.payload.value.catalogImport = create(NativeCatalogImportPresentationSchema, {
+      projectId: targetId, snapshotToken: catalog.snapshotToken, createdAt: entry.createdAt, modifiedAt: entry.modifiedAt
+    });
+    checkpoint("catalog-import-requested");
+    const sessionId = sessionIdFrom(await submit(clients.operation, paired.connectionId, mutation));
+    checkpoint("catalog-imported");
+    expect(historyMessages(await timeline(clients, sessionId))).toEqual([]);
+    expect(resumes).toEqual([]);
+    checkpoint("unactivated-timeline-empty");
+
+    let committedMessages = 0;
+    let committedHistory = false, referenceScans = 0;
+    stopObserving = fixture.application.store.subscribe(event => {
+      if (event.sessionId !== sessionId || event.metadata?.fields["nativeHydration"] !== true) return;
+      if (event.payload.type === "message_complete") {
+        committedMessages += 1;
+        if (committedMessages === 1) checkpoint("first-message-committed", { messages: committedMessages });
+      }
+      if (event.payload.type === "native_session_changed") {
+        committedHistory = true;
+        checkpoint("native-leaf-committed", { messages: committedMessages });
+        setImmediate(() => checkpoint("event-loop-after-native-commit")).unref();
+      }
+    });
+    const readNativePage = started.runtime.getSessionMessages.bind(started.runtime);
+    const read = vi.spyOn(started.runtime, "getSessionMessages").mockImplementation(async (id, options) => {
+      checkpoint("native-page-requested", { offset: options.offset });
+      const messages = await readNativePage(id, options);
+      checkpoint("native-page-read", { offset: options.offset, messages: messages.length });
+      return messages;
+    });
+    const adapterCommands = ClaudeCodeAdapter.prototype.getCommands;
+    const adapterObserver = vi.spyOn(ClaudeCodeAdapter.prototype, "getCommands").mockImplementation(async function (this: ClaudeCodeAdapter, context) {
+      if (context.sessionId !== sessionId) return adapterCommands.call(this, context);
+      checkpoint("adapter-command-read-requested");
+      const commands = await adapterCommands.call(this, context);
+      checkpoint("adapter-command-read-confirmed", { commands: commands.length });
+      return commands;
+    });
+    const host = fixture.application.sessionHost;
+    const store = fixture.application.store;
+    const listEvents = store.listEvents.bind(store);
+    const referenceObserver = vi.spyOn(store, "listEvents").mockImplementation(query => {
+      if (committedHistory && query?.sessionId === sessionId && query.messageHttpsOnly) referenceScans += 1;
+      return listEvents(query);
+    });
+    const hostCommands = host.getCommands.bind(host);
+    const hostObserver = vi.spyOn(host, "getCommands").mockImplementation(async (id) => {
+      if (id !== sessionId) return hostCommands(id);
+      checkpoint("host-command-read-requested");
+      try {
+        const commands = await hostCommands(id);
+        checkpoint("host-command-read-confirmed", { commands: commands.length });
+        return commands;
+      } catch (error) {
+        checkpoint("host-command-read-rejected");
+        throw error;
+      }
+    });
+    restoreCommandObservers = () => { hostObserver.mockRestore(); adapterObserver.mockRestore(); referenceObserver.mockRestore(); };
+    checkpoint("activation-requested");
+    await clients.session.listRuntimeCommands({ sessionId });
+    checkpoint("activation-confirmed", { messages: committedMessages, referenceScans });
+    expect(resumes).toEqual([seed.sourceId]);
+    expect(committedMessages).toBe(messageIds.length);
+    expect(referenceScans).toBeGreaterThan(0);
+    expect(referenceScans).toBeLessThanOrEqual(4);
+    expect(read.mock.calls.map(([id, options]) => [id, options.offset, options.limit])).toEqual([
+      [seed.sourceId, 0, 10_001], [seed.sourceId, 10_000, 10_001]
+    ]);
+    const latest = await clients.session.listSessionTimeline({ sessionId, limit: 24 });
+    const latestNativeId = messageIds.at(-1)!;
+    const newest = nativeUserMessage(latest.events, latestNativeId);
+    expect(newest.message).toMatchObject({ messageId: latestNativeId,
+      userInput: { parts: [{ content: { case: "text", value: "Local history message 10000" } }] } });
+    expect(nativeUserMessage(await timeline(clients, sessionId), latestNativeId).eventId).toBe(newest.eventId);
+    expect(messageAnchor(latest.events, messageIds.at(-2)!).eventId).not.toBe(newest.eventId);
+    expect(latest.nextBeforeCursor).toBeDefined();
+    const earlier = await clients.session.listSessionTimeline({ sessionId, beforeCursor: latest.nextBeforeCursor, limit: 24 });
+    expect(historyMessages(earlier.events).length).toBeGreaterThan(0);
+    expect(earlier.events.every(event => !latest.events.some(newer => newer.eventId === event.eventId))).toBe(true);
+    const initial = fixture.application.store.listEvents({ sessionId, limit: 80 }).find(event =>
+      event.payload.type === "message_complete" && event.payload.nativeHistory?.identity?.entryId === seed.messageIds[0]);
+    if (initial === undefined) throw new Error("The original first message was not written to the Store.");
+    const oldest = await clients.session.listSessionTimeline({ sessionId, aroundEventId: initial.id, limit: 12 });
+    const first = nativeUserMessage(oldest.events, seed.messageIds[0]!);
+    expect(first.eventId).toBe(initial.id);
+    expect(first.message.userInput?.parts.map(part => part.content)).toEqual([{ case: "text", value: "first question" }]);
+    checkpoint("timeline-confirmed");
+  } finally {
+    stopObserving?.();
+    restoreCommandObservers?.();
+    await fixture?.close({ removeRoot: false });
+    await rm(seed.root, { recursive: true, force: true });
+  }
+});
 
 it("keeps a standard local Claude Store fork bound across adoption, restart, refork, delete, and cleanup crash recovery", { timeout: 300_000 }, async () => {
   const seed = await seedNativeHistory();
@@ -616,6 +767,116 @@ function createNativeTarget(entryId: string) {
   return create(NativeNavigationTargetSchema, { kind: { case: "nativeEntryId", value: entryId } });
 }
 
+it("resumes the original local Claude task before sending after its idle Query exits", { timeout: 60_000 }, async () => {
+  const seed = await seedNativeHistory();
+  const queries: TextObservationQuery[] = [];
+  const resumes: Array<string | undefined> = [];
+  let fixture: OrchestratorE2eFixture | undefined;
+  let confirmOldProcessExit!: () => void;
+  const processExit = new Promise<void>(resolve => { confirmOldProcessExit = resolve; });
+  try {
+    const started = await start(seed, (params) => {
+      const query = new TextObservationQuery(params, seed.sourceId);
+      queries.push(query);
+      resumes.push(params.options.resume);
+      return query;
+    });
+    fixture = started.fixture;
+    const paired = await fixture.pair();
+    const sessionId = await attachSource(fixture, paired, seed.sourceId);
+    const store = fixture.application.store;
+    const originalBinding = store.getSession(sessionId).descriptor.binding;
+    let parentUuid = seed.messageIds.at(-1);
+    const complete = async (query: TextObservationQuery, text: string, runId: string) => {
+      const input = await waitFor(async () => query.receivedInputs[0], input => input !== undefined, "the original input in the requested Query");
+      if (input === undefined) throw new Error("The controlled Query did not receive the accepted input.");
+      const entryId = randomUUID();
+      const reply = { id: `msg_${entryId}`, role: "assistant", content: [{ type: "text", text }], stop_reason: "end_turn" };
+      const frame = (value: Record<string, unknown>) => JSON.stringify({ sessionId: seed.sourceId, cwd: seed.workspace,
+        timestamp: new Date().toISOString(), ...value });
+      const records = [frame({ type: "user", uuid: input.uuid, parentUuid, message: input.message }),
+        frame({ type: "assistant", uuid: entryId, parentUuid: input.uuid, message: reply })];
+      parentUuid = entryId;
+      await Promise.all([seed.sourcePath, join(seed.profile, "projects", claudeProjectKey(seed.workspace), `${seed.sourceId}.jsonl`)]
+        .map(path => appendFile(path, records.join("\n") + "\n", "utf8")));
+      query.publishText(entryId, reply);
+      query.finish(input.uuid, text);
+      await waitFor(() => paired.clients.run.getRun({ runId }), ({ run }) => run?.state === RunState.SUCCEEDED, "the confirmed original Run settlement");
+      await waitFor(async () => store.findQueueItemByRunId(sessionId, runId), item => item?.state === "completed", "the original Queue settlement");
+    };
+
+    const send = (text: string) => submit(paired.clients.operation, paired.connectionId,
+      sendInputMutation(sessionId, BigInt(originalBinding.generation), text));
+    const firstRunId = queueRunIdFrom(await send("First ordinary Claude input"));
+    await complete(queries[0]!, "First completed reply", firstRunId);
+    const retire = vi.spyOn(started.runtime, "retireQuery").mockImplementationOnce(async () => processExit);
+    queries[0]!.exitIdleStream();
+    await waitFor(async () => retire.mock.calls.length, count => count === 1, "retirement of the exact original Query");
+    expect(retire.mock.calls[0]?.[0]).toBe(queries[0]);
+    expect(started.adapter.hasConfirmedIdleSessionExit(sessionId, originalBinding)).toBe(false);
+    expect(queries).toHaveLength(1);
+    confirmOldProcessExit();
+    await waitFor(async () => started.adapter.hasConfirmedIdleSessionExit(sessionId, originalBinding), Boolean, "the confirmed idle Query exit");
+    expect(store.getSession(sessionId).descriptor.binding).toEqual(originalBinding);
+
+    const secondRunId = queueRunIdFrom(await send("Next ordinary Claude input"));
+    const nextQuery = await waitFor(async () => queries[1], query => query !== undefined, "the replacement Query for the same native Session");
+    if (nextQuery === undefined) throw new Error("The original native task was not resumed.");
+    await complete(nextQuery, "Second completed reply", secondRunId);
+    expect(resumes).toEqual([seed.sourceId, seed.sourceId]);
+    expect(queries.map(query => query.receivedInputs.length)).toEqual([1, 1]);
+    expect(store.getSession(sessionId).descriptor.binding).toEqual({ ...originalBinding, generation: originalBinding.generation + 1 });
+    const next = store.findQueueItemByRunId(sessionId, secondRunId)!;
+    expect(store.getAttempt(next.attemptId!).descriptor.generation).toBe(originalBinding.generation + 1);
+    expect(started.adapter.hasConfirmedIdleSessionExit(sessionId, originalBinding)).toBe(false);
+  } finally {
+    confirmOldProcessExit();
+    await fixture?.close({ removeRoot: false });
+    await rm(seed.root, { recursive: true, force: true, maxRetries: 5 });
+  }
+});
+
+it("applies a v1 owner denial to the original local Claude tool request", { timeout: 60_000 }, async () => {
+  const seed = await seedNativeHistory();
+  let fixture: OrchestratorE2eFixture | undefined;
+  let query: TextObservationQuery | undefined;
+  let canUseTool: ClaudeSdkQueryParams["options"]["canUseTool"] | undefined;
+  try {
+    ({ fixture } = await start(seed, params => {
+      canUseTool = params.options.canUseTool;
+      return query = new TextObservationQuery(params, seed.sourceId);
+    }));
+    const paired = await fixture.pair();
+    const sessionId = await attachSource(fixture, paired, seed.sourceId);
+    const generation = BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation);
+    const runId = queueRunIdFrom(await submit(paired.clients.operation, paired.connectionId,
+      sendInputMutation(sessionId, generation, "Request permission for the controlled operation.")));
+    await waitFor(async () => query?.receivedInputs.length, count => count === 1, "the original Claude input");
+    if (canUseTool === undefined) throw new Error("The controlled Claude Query did not expose its permission callback.");
+    const nativeDecision = canUseTool("Bash", { command: "pwd" }, {
+      requestId: "deny-native-request", toolUseID: "deny-native-tool", signal: new AbortController().signal
+    });
+    void nativeDecision.catch(() => undefined);
+    const pending = await waitFor(() => paired.clients.interaction.listInteractions({ sessionId, runId }),
+      result => result.interactions.some(item => item.state === InteractionState.PENDING), "the original Claude permission");
+    const request = pending.interactions.find(item => item.state === InteractionState.PENDING)!;
+    expect(request.request).toMatchObject({ case: "permission", value: { allowedDecisions: expect.arrayContaining([PermissionDecisionKind.DENY_ONCE]) } });
+    const resolution = await submit(paired.clients.operation, paired.connectionId, resolvePermissionMutation({
+      connectionId: paired.connectionId, interactionId: request.interactionId, generation: request.generation,
+      decision: PermissionDecisionKind.DENY_ONCE
+    }));
+    expect(resolution.state, resolution.error?.message).toBe(OperationState.SUCCEEDED);
+    await expect(nativeDecision).resolves.toMatchObject({ behavior: "deny", message: "The user denied this tool request." });
+    expect(fixture.application.store.getInteraction(request.interactionId)).toMatchObject({
+      runId, status: "resolved", decision: { kind: "selected", value: "deny_once" }
+    });
+    expect(query?.receivedInputs).toHaveLength(1);
+  } finally {
+    await fixture?.close({ removeRoot: false });
+    await rm(seed.root, { recursive: true, force: true, maxRetries: 5 });
+  }
+});
+
 it.each(["original frame", "different frame", "missing frame"] as const)(
   "projects ordinary Claude text and its accounting after reading a %s from the published SDK", { timeout: 60_000 },
   async (persisted) => {
@@ -698,9 +959,9 @@ it.each(["original frame", "different frame", "missing frame"] as const)(
   }
 );
 
-async function seedNativeHistory() {
+async function seedNativeHistory(workspaceName = "workspace") {
   const root = await mkdtemp(join(tmpdir(), "joko-claude-fork-chain-"));
-  const workspace = join(root, "workspace");
+  const workspace = join(root, workspaceName);
   const profile = join(root, "native-profile");
   const project = join(profile, "projects", storageName);
   const defaultProject = join(profile, "projects", claudeProjectKey(workspace));
@@ -732,13 +993,15 @@ async function seedNativeHistory() {
 
 async function start(seed: Awaited<ReturnType<typeof seedNativeHistory>>, createQuery?: (params: ClaudeSdkQueryParams) => ClaudeSdkQuery) {
   const runtime = new LocalSessionRuntime(seed.profile, createQuery);
+  let adapter: ClaudeCodeAdapter | undefined;
   const fixture = await OrchestratorE2eFixture.start({
     rootDirectory: seed.root, profiles: [],
     backendFactories: [{ instanceId: backendId, adapterKind: "claude-agent-sdk-stdio", displayName: "Local Claude fixture",
-      create: ({ generation }) => new ClaudeCodeAdapter({ instanceGeneration: generation, runtime, environment: {},
-        initializationTimeoutMs: 5_000, teardownTimeoutMs: 100 }) }]
+      create: ({ generation }) => { return adapter = new ClaudeCodeAdapter({ instanceGeneration: generation, runtime,
+        environment: { CLAUDE_CONFIG_DIR: seed.profile }, initializationTimeoutMs: 5_000, teardownTimeoutMs: 100 }); } }]
   });
-  return { fixture, runtime };
+  if (adapter === undefined) throw new Error("The Claude fixture Adapter did not start.");
+  return { fixture, runtime, adapter };
 }
 
 async function startStored(
@@ -872,6 +1135,16 @@ function messageAnchor(events: readonly Event[], nativeId: string) {
   const event = events.find((event) => event.payload?.kind.case === "messageCompleted" && event.payload.kind.value.nativeIdentity?.entryId === nativeId);
   if (event?.payload?.kind.case !== "messageCompleted") throw new Error("The persisted native message is absent from the HTTP timeline.");
   return { eventId: event.eventId, messageId: event.payload.kind.value.messageId };
+}
+
+function nativeUserMessage(events: readonly Event[], nativeId: string) {
+  for (const event of events) {
+    const kind = event.payload?.kind;
+    if (kind?.case === "messageStarted" && kind.value.role === MessageRole.USER && kind.value.nativeIdentity?.entryId === nativeId) {
+      return { eventId: event.eventId, message: kind.value };
+    }
+  }
+  throw new Error("The persisted native user message is absent from the HTTP timeline.");
 }
 
 function claudeProjectKey(workspace: string): string {
@@ -1331,6 +1604,7 @@ class LocalSessionRuntime implements ClaudeSdkRuntime {
   readonly deletes: string[] = [];
   readonly cleanupObservations: Array<{ readonly stage: "lookup" | "delete"; readonly elapsedMs: number; readonly outcome: string }> = [];
   readonly #owner: SessionSdkOwner;
+  readonly #queries = new WeakSet<ClaudeSdkQuery>();
   onReceipt?: (id: string) => void;
   failure?: "unobserved" | "validation" | "cleanup-unknown";
   #failNextDerivedRead = false;
@@ -1344,9 +1618,14 @@ class LocalSessionRuntime implements ClaudeSdkRuntime {
 
   async probe() { return { installed: true, packageVersion: this.packageVersion, cliVersion: CLAUDE_AGENT_SDK_CLI_VERSION, initialization }; }
   async query(params: ClaudeSdkQueryParams): Promise<ClaudeSdkQuery> {
-    return this.createQuery?.(params) ?? new IdleQuery();
+    const query = this.createQuery?.(params) ?? new IdleQuery();
+    this.#queries.add(query);
+    return query;
   }
-  async retireQuery(): Promise<void> { throw new Error("This Session fixture does not perform live Query replacement."); }
+  async retireQuery(query: ClaudeSdkQuery): Promise<void> {
+    if (!this.#queries.has(query)) throw new Error("The Claude Query belongs to another fixture runtime.");
+    query.close();
+  }
   async getSessionInfo(sessionId: string, options: { dir: string; signal?: AbortSignal }) {
     if (this.#failNextDerivedRead && this.created.includes(sessionId)) { this.#failNextDerivedRead = false; return undefined; }
     const lookup = () => this.#owner.run({ kind: "getSessionInfo", sessionId, options: { dir: options.dir } }, { signal: options.signal }) as Promise<ClaudeSdkSessionInfo | undefined>;
@@ -1447,6 +1726,10 @@ class TextObservationQuery extends IdleQuery {
 
   finish(userId: string, result: string): void {
     this.#output.push({ ...controlledClaudeResult(this.nativeId, userId), result });
+  }
+
+  exitIdleStream(): void {
+    this.#output.fail(new Error("The fixture Claude Query exited while idle."));
   }
 
   override close(): void {

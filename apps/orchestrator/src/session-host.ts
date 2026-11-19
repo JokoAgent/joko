@@ -128,6 +128,7 @@ import {
   deterministicNativeEventId,
   NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD,
   nativeHistoryReplayMetadata,
+  observedClaudeAssistantInputEntry,
   projectNativeHistory
 } from "./native-history.js";
 import {
@@ -13779,19 +13780,26 @@ export class SessionHost {
     };
     const active = this.#active.get(sessionId);
     if (active !== undefined) {
-      if (active.appendSystemPromptDigest === this.serviceRuntimeDigest(this.#store.getSession(sessionId).descriptor)
+      const stored = this.#store.getSession(sessionId).descriptor;
+      const idleExit = active.adapter.hasConfirmedIdleSessionExit?.(sessionId, stored.binding) === true;
+      if ((!idleExit && active.appendSystemPromptDigest === this.serviceRuntimeDigest(stored))
         || !this.canRefreshPrivatePromptAtBoundary(sessionId)) {
         active.lastActivityAt = this.#monotonicNow();
         return active;
       }
-      const task = this.refreshPrivatePromptRuntime(sessionId, active)
-        .then(() => this.activateOnce(sessionId, allowance, providerAuthenticationRouteId))
-        .finally(() => {
-          this.#activating.delete(sessionId);
-          this.tryApplyProviderAuthenticationRuntimeInvalidation(sessionId);
-        });
-      this.#activating.set(sessionId, task);
-      return task;
+      if (idleExit) {
+        this.deleteActiveSession(sessionId, active);
+        this.#releaseSessionTools(sessionId);
+      } else {
+        const task = this.refreshPrivatePromptRuntime(sessionId, active)
+          .then(() => this.activateOnce(sessionId, allowance, providerAuthenticationRouteId))
+          .finally(() => {
+            this.#activating.delete(sessionId);
+            this.tryApplyProviderAuthenticationRuntimeInvalidation(sessionId);
+          });
+        this.#activating.set(sessionId, task);
+        return task;
+      }
     }
     const task = this.activateOnce(sessionId, allowance, providerAuthenticationRouteId).finally(() => {
       this.#activating.delete(sessionId);
@@ -17963,6 +17971,7 @@ export class SessionHost {
     });
     const inheritedSideChatEntries = ensureSideChatHistoryBoundary(store, session, history);
     const projections = projectNativeHistory(session.id, session.binding.opaqueRef, history);
+    const claudeEntries = new Map<string, EventPayload>();
     for (const incomingProjection of projections) {
       if (inheritedSideChatEntries?.has(nativeHistoryEventContext(incomingProjection.payload)?.identity?.entryId ?? "")) continue;
       const projection = incomingProjection.payload.type !== "message_complete" ? incomingProjection : (() => {
@@ -17970,6 +17979,10 @@ export class SessionHost {
         return { ...incomingProjection, payload };
       })();
       const projectionEntryId = nativeHistoryEventContext(projection.payload)?.identity?.entryId;
+      if (projectionEntryId !== undefined && projection.metadata?.namespace === "claude-code.native_history"
+        && (projection.payload.type === "tool_result" || (projection.payload.type === "message_complete" && projection.payload.role === "assistant"))) {
+        claudeEntries.set(projectionEntryId, projection.payload);
+      }
       // A live automatic lifecycle has a more precise reason and stable
       // compaction ID than the persisted native summary. Only an exact entry
       // identity permits omitting its otherwise duplicate hydration card.
@@ -18041,10 +18054,10 @@ export class SessionHost {
         const sourceId = existing?.metadata?.fields[NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD];
         const source = typeof sourceId === "string" ? store.findEvent(sourceId, { includeTombstoned: true })
           : existing === undefined ? observedAssistant : undefined;
-        const parentId = projection.payload.nativeHistory?.identity?.parentEntryId;
+        const inputEntryId = source ? observedClaudeAssistantInputEntry(projection, source, claudeEntries) : undefined;
         const adoption = source && source.backendId === session.backendId && source.targetId === session.targetId
           && source.runId !== undefined && store.findRun(source.runId)?.descriptor.source === "user"
-          ? adoptObservedNativeAssistant(projection, source, parentId === undefined ? undefined : acceptedQueueInputs.get(parentId), bindingFingerprint)
+          ? adoptObservedNativeAssistant(projection, source, inputEntryId === undefined ? undefined : acceptedQueueInputs.get(inputEntryId), bindingFingerprint)
           : undefined;
         if (adoption !== undefined) {
           store.appendEventIfAbsent({ id: projection.id, backendId: session.backendId, targetId: session.targetId,
