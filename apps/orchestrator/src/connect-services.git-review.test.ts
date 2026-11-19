@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { rm, writeFile } from "node:fs/promises";
+import { createCipheriv, createHash } from "node:crypto";
+import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
@@ -151,6 +151,166 @@ describe("Connect Git Review contracts", () => {
     } finally {
       await workspaces.close();
       await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("stages the visible and hidden whitespace changes when Review stages the entire file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-connect-review-whitespace-"));
+    const workspaces = new WorkspaceService();
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: root, windowsHide: true, encoding: "utf8" });
+    const path = "notes.txt";
+    const middle = Array.from({ length: 50 }, (_, index) => `stable line ${index + 1}`).join("\n");
+    const before = `state: old\n${middle}\n  indented\n`;
+    const after = `state: current\n${middle}\n    indented\n`;
+    try {
+      git("init", "--quiet");
+      git("config", "core.autocrlf", "false");
+      git("config", "diff.context", "3");
+      await writeFile(join(root, path), before);
+      git("add", "--", path);
+      git("-c", "user.name=Review Test", "-c", "user.email=review@example.test", "commit", "--quiet", "-m", "base");
+      await writeFile(join(root, path), after);
+      await workspaces.register({ id: "workspace-review", root, displayName: "Review", trusted: true });
+      const services = createConnectServices(application({ workspaces, capabilities: ["workspace.diff", "workspace.diff.sources", "workspace.diff.stage"] }));
+      const request = create(contract.GetWorkspaceDiffRequestSchema, {
+        workspaceId: "workspace-review", source: contract.GitDiffSource.UNSTAGED, ignoreWhitespace: true
+      });
+      const { diff } = await services.workspace.getWorkspaceDiff(request, context() as never);
+      const file = diff?.files[0];
+      if (diff === undefined || file === undefined) throw new Error("The filtered change is missing from Review.");
+      expect(file.relativePath).toBe(path);
+      expect(file.hunks).toHaveLength(1);
+
+      const result = await services.operation.submitOperation(create(contract.SubmitOperationRequestSchema, {
+        operationId: "stage-complete-file",
+        connectionId: connection.id,
+        mutation: create(contract.OperationMutationSchema, {
+          payload: { case: "applyWorkspaceDiffHunk", value: create(contract.ApplyWorkspaceDiffHunkMutationSchema, {
+            workspaceId: request.workspaceId, source: request.source, ignoreWhitespace: true,
+            action: contract.WorkspaceDiffAction.STAGE, target: contract.WorkspaceDiffTarget.FILE,
+            relativePath: file.relativePath, expectedRepositoryRevision: diff.repositoryRevision
+          }) }
+        })
+      }), context() as never);
+      expect(result.operation?.result?.payload?.case).toBe("acknowledgement");
+      expect(git("show", `:${path}`)).toBe(after);
+      expect(git("diff", "--", path)).toBe("");
+    } finally {
+      await workspaces.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("acknowledges staging a binary file after the combined literal patches exceed the process read cap", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-connect-review-large-index-"));
+    const workspaces = new WorkspaceService();
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: root, windowsHide: true, maxBuffer: 48 * 1024 * 1024 });
+    const existing = ["b1.bin", "b2.bin"];
+    const added = "c.bin";
+    const paths = [...existing, added];
+    const mib = 1024 * 1024;
+    try {
+      git("init", "--quiet");
+      git("-c", "user.name=Review Test", "-c", "user.email=review@example.test", "commit", "--quiet", "--allow-empty", "-m", "base");
+      for (const [index, path] of paths.entries()) {
+        const cipher = createCipheriv("aes-256-ctr", Buffer.alloc(32), Buffer.alloc(16, index + 1));
+        const bytes = Buffer.concat([cipher.update(Buffer.alloc((path === added ? 9 : 10) * mib)), cipher.final()]);
+        bytes[0] = 0;
+        await writeFile(join(root, path), bytes);
+      }
+      git("add", "--", ...existing);
+      const patchBytesBefore = git("diff", "--binary", "--cached").byteLength;
+      expect(patchBytesBefore).toBeLessThan(32 * mib);
+      await workspaces.register({ id: "workspace-review", root, displayName: "Review", trusted: true });
+      const services = createConnectServices(application({ workspaces, capabilities: ["workspace.diff", "workspace.diff.sources", "workspace.diff.stage"] }));
+      const request = create(contract.GetWorkspaceDiffRequestSchema, {
+        workspaceId: "workspace-review", source: contract.GitDiffSource.UNSTAGED
+      });
+      const { diff } = await services.workspace.getWorkspaceDiff(request, context() as never);
+      if (diff === undefined) throw new Error("Review did not return an unstaged diff.");
+      expect(diff.files).toMatchObject([{ relativePath: added, binary: true, hunks: [] }]);
+
+      const result = await services.operation.submitOperation(create(contract.SubmitOperationRequestSchema, {
+        operationId: "stage-binary-with-large-index",
+        connectionId: connection.id,
+        mutation: create(contract.OperationMutationSchema, {
+          payload: { case: "applyWorkspaceDiffHunk", value: create(contract.ApplyWorkspaceDiffHunkMutationSchema, {
+            workspaceId: request.workspaceId, source: request.source,
+            action: contract.WorkspaceDiffAction.STAGE, target: contract.WorkspaceDiffTarget.FILE,
+            relativePath: added, expectedRepositoryRevision: diff.repositoryRevision
+          }) }
+        })
+      }), context() as never);
+      expect(result.operation?.result?.payload?.case).toBe("acknowledgement");
+      const patchBytesAfter = git("diff", "--binary", "--cached").byteLength;
+      expect(patchBytesAfter).toBeGreaterThan(32 * mib);
+      console.info(`Literal Git index patches grew from ${patchBytesBefore} to ${patchBytesAfter} bytes.`);
+      expect(git("rev-parse", `:${added}`).toString()).toBe(git("hash-object", "--no-filters", "--", added).toString());
+
+      const { diff: staged } = await services.workspace.getWorkspaceDiff(create(contract.GetWorkspaceDiffRequestSchema, {
+        workspaceId: request.workspaceId, source: contract.GitDiffSource.STAGED
+      }), context() as never);
+      expect(staged?.files).toMatchObject(paths.map(path => ({ relativePath: path, binary: true, hunks: [] })));
+      const { diff: unstaged } = await services.workspace.getWorkspaceDiff(request, context() as never);
+      expect(unstaged?.files).toEqual([]);
+      expect(staged?.repositoryRevision).toBe(unstaged?.repositoryRevision);
+      expect(staged?.repositoryRevision).not.toBe(diff.repositoryRevision);
+    } finally {
+      await workspaces.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
+  it.skipIf(process.platform === "win32")("stages a local symbolic link as an index entry without staging its target", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-connect-review-symlink-"));
+    const root = join(directory, "repository");
+    const workspaces = new WorkspaceService();
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: root, windowsHide: true, encoding: "utf8" });
+    const path = "guide-link.txt";
+    const outside = "sibling-link.txt";
+    try {
+      await mkdir(root);
+      git("init", "--quiet");
+      git("config", "core.symlinks", "true");
+      await writeFile(join(root, "guide.txt"), "Original guide contents.\n");
+      git("add", "--", "guide.txt");
+      git("-c", "user.name=Review Test", "-c", "user.email=review@example.test", "commit", "--quiet", "-m", "base");
+      await writeFile(join(directory, "sibling.txt"), "Another workspace.\n");
+      await symlink("guide.txt", join(root, path));
+      await symlink("../sibling.txt", join(root, outside));
+      await workspaces.register({ id: "workspace-review", root, displayName: "Review", trusted: true });
+      const services = createConnectServices(application({ workspaces, capabilities: [
+        "workspace.diff", "workspace.diff.sources", "workspace.diff.stage", "workspace.diff.revert"
+      ] }));
+      const request = create(contract.GetWorkspaceDiffRequestSchema, {
+        workspaceId: "workspace-review", source: contract.GitDiffSource.UNSTAGED
+      });
+      const { diff } = await services.workspace.getWorkspaceDiff(request, context() as never);
+      if (diff === undefined) throw new Error("Review did not return an unstaged diff.");
+      expect(diff.files).toMatchObject([path, outside].map(relativePath => ({ relativePath, binary: true, hunks: [] })));
+
+      const mutate = (relativePath: string, action: contract.WorkspaceDiffAction) => services.operation.submitOperation(
+        create(contract.SubmitOperationRequestSchema, {
+          operationId: `symlink-review-${action}-${relativePath}`,
+          connectionId: connection.id,
+          mutation: create(contract.OperationMutationSchema, {
+            payload: { case: "applyWorkspaceDiffHunk", value: create(contract.ApplyWorkspaceDiffHunkMutationSchema, {
+              workspaceId: request.workspaceId, source: request.source, action, target: contract.WorkspaceDiffTarget.FILE,
+              relativePath, expectedRepositoryRevision: diff.repositoryRevision, confirmRevert: true
+            }) }
+          })
+        }), context() as never);
+      await expect(mutate(outside, contract.WorkspaceDiffAction.STAGE)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+      await expect(mutate(path, contract.WorkspaceDiffAction.REVERT)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+      const result = await mutate(path, contract.WorkspaceDiffAction.STAGE);
+      expect(result.operation?.result?.payload?.case).toBe("acknowledgement");
+      expect(git("ls-files", "--stage", "--", path)).toMatch(/^120000 [a-f0-9]{40,64} 0\tguide-link\.txt\n$/u);
+      expect(git("show", `:${path}`)).toBe("guide.txt");
+      expect(git("diff", "--cached", "--name-only", "-z")).toBe(`${path}\0`);
+      expect(git("status", "--porcelain=v1", "-z", "--", outside)).toBe(`?? ${outside}\0`);
+    } finally {
+      await workspaces.close();
+      await rm(directory, { recursive: true, force: true });
     }
   }, 30_000);
 
