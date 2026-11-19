@@ -1622,6 +1622,7 @@ class LocalSessionRuntime implements ClaudeSdkRuntime {
   readonly deletes: string[] = [];
   readonly cleanupObservations: Array<{ readonly stage: "lookup" | "delete"; readonly elapsedMs: number; readonly outcome: string }> = [];
   readonly #owner: SessionSdkOwner;
+  readonly #queries = new WeakSet<ClaudeSdkQuery>();
   onReceipt?: (id: string) => void;
   failure?: "unobserved" | "validation" | "cleanup-unknown";
   #failNextDerivedRead = false;
@@ -1635,9 +1636,14 @@ class LocalSessionRuntime implements ClaudeSdkRuntime {
 
   async probe() { return { installed: true, packageVersion: this.packageVersion, cliVersion: CLAUDE_AGENT_SDK_CLI_VERSION, initialization }; }
   async query(params: ClaudeSdkQueryParams): Promise<ClaudeSdkQuery> {
-    return this.createQuery?.(params) ?? new IdleQuery();
+    const query = this.createQuery?.(params) ?? new IdleQuery();
+    this.#queries.add(query);
+    return query;
   }
-  async retireQuery(_query: ClaudeSdkQuery): Promise<void> { throw new Error("This Session fixture does not perform live Query replacement."); }
+  async retireQuery(query: ClaudeSdkQuery): Promise<void> {
+    if (!this.#queries.has(query)) throw new Error("The Claude Query belongs to another fixture runtime.");
+    query.close();
+  }
   async getSessionInfo(sessionId: string, options: { dir: string; signal?: AbortSignal }) {
     if (this.#failNextDerivedRead && this.created.includes(sessionId)) { this.#failNextDerivedRead = false; return undefined; }
     const lookup = () => this.#owner.run({ kind: "getSessionInfo", sessionId, options: { dir: options.dir } }, { signal: options.signal }) as Promise<ClaudeSdkSessionInfo | undefined>;
