@@ -4,6 +4,7 @@ package joko.v1;
 
 import "google/protobuf/duration.proto";
 import "joko/v1/common.proto";
+import "joko/v1/workspace.proto";
 
 enum CapabilitySupport {
   CAPABILITY_SUPPORT_UNSPECIFIED = 0;
@@ -115,6 +116,7 @@ message WorkspaceCapabilityOptions {
   bool turn_change_sets = 5;
   bool rewind_preview = 6;
   bool extra_directories = 7;
+  repeated ExtraDirectoryAccess extra_directory_access = 8;
 }
 
 message InteractionCapabilityOptions {

@@ -116,6 +116,8 @@ import {
   BrowserTransferState,
   CapabilitySupport,
   capabilityNames,
+  extraDirectoryAccessMode,
+  supportedExtraDirectoryAccessModes,
   CodeHostPullRequestState,
   ComputerAutomationPermissionKind,
   ComputerAutomationRuntimeState,
@@ -437,6 +439,7 @@ import {
   type Artifact,
   type BackgroundTask as ProtoBackgroundTask,
   type BackendDescriptor,
+  type CapabilityOptions,
   type BrowserActivity,
   type BrowserCommentPlacement as ProtoBrowserCommentPlacement,
   type BrowserCommentTarget as ProtoBrowserCommentTarget,
@@ -15196,7 +15199,9 @@ function mapBackend(backend: BackendDescriptor): BackendView {
       name: capability.name,
       supported: capability.support === CapabilitySupport.SUPPORTED,
       ...(capability.reason.length > 0 ? { reason: capability.reason } : {}),
-      options: capabilityOptions(capability.options),
+      options: capability.options === undefined && capability.name === capabilityNames.workspaceExtraDirs
+        ? supportedExtraDirectoryAccessModes({ supported: capability.support === CapabilitySupport.SUPPORTED })
+        : capabilityOptions(capability.options),
       ...(capability.options?.kind.case === "input" && capability.options.kind.value.maximumBytes > 0n ? { maximumBytes: numberValue(capability.options.kind.value.maximumBytes) } : {}),
       ...(capability.options?.kind.case === "input" && capability.options.kind.value.maximumItems > 0 ? { maximumItems: capability.options.kind.value.maximumItems } : {})
     }] as const))
@@ -22487,16 +22492,17 @@ function inputAttachments(input: any): readonly ArtifactView[] {
   });
 }
 
-function capabilityOptions(options: any): readonly string[] {
+function capabilityOptions(options: CapabilityOptions | undefined): readonly string[] {
   if (options?.kind?.case === "session") return options.kind.value.serviceNodeOnly === true ? ["service_node_only"] : [];
   if (options?.kind?.case === "model") return [...(options.kind.value.effortIds ?? [])];
   if (options?.kind?.case === "input") return [...(options.kind.value.mediaTypes ?? [])];
   if (options?.kind?.case === "permission") {
-    const modes = (options.kind.value.modes ?? []).map((mode: ProtoPermissionMode) => uiPermission(mode));
+    const modes: string[] = (options.kind.value.modes ?? []).map((mode: ProtoPermissionMode) => uiPermission(mode));
     if (options.kind.value.supportsPlanMode === true) modes.push("planMode");
     return modes;
   }
   if (options?.kind?.case === "runtime") return [...(options.kind.value.resourceKinds ?? [])];
+  if (options?.kind?.case === "workspace") return options.kind.value.extraDirectoryAccess.flatMap(value => extraDirectoryAccessMode(value) ?? []);
   return [];
 }
 

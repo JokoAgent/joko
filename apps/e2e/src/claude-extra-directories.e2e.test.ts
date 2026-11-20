@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { create } from "@bufbuild/protobuf";
 import { ClaudeCodeAdapter } from "@joko/adapter-claude-code";
-import { ExtraDirectoryAccess, OperationMutationSchema, OperationState, StateImpact } from "@joko/contracts";
+import { capabilityNames, ExtraDirectoryAccess, OperationMutationSchema, OperationState, PerTurnOverridesSchema, StateImpact } from "@joko/contracts";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { ControlledClaudeRuntime } from "./controlled-claude-runtime.js";
@@ -112,6 +112,53 @@ it("reports an unknown native update while refreshing the other materialized Cla
   await waitFor(async () => store.getRun(runId).descriptor.state, state => state === "completed", "the unaffected completion");
 }, 30_000);
 
+it("rejects a new read-only approval and keeps an existing record out of the Claude runtime", async () => {
+  const setup = await directoryFixture();
+  const { paired, runtime, store, host, targetId, firstPath, secondPath } = setup;
+  const { backend } = await paired.clients.backend.getBackend({ backendId: BACKEND_ID });
+  expect(backend?.capabilities?.capabilities.find(capability => capability.name === capabilityNames.workspaceExtraDirs))
+    .toMatchObject({ options: { kind: { case: "workspace", value: {
+      extraDirectories: true, extraDirectoryAccess: [ExtraDirectoryAccess.READ_WRITE]
+    } } } });
+  await expect(setup.add(secondPath, ExtraDirectoryAccess.READ_ONLY)).resolves.toMatchObject({
+    state: OperationState.FAILED, error: { code: "UNSUPPORTED_CAPABILITY" }
+  });
+  expect(host.extraDirectories.listForTarget(targetId).map(directory => directory.path)).toEqual([firstPath]);
+  expect(runtime.queries).toHaveLength(0);
+
+  // Insert the approval shape formerly accepted by the service before opening a native task.
+  const retained = await host.extraDirectories.add({ workspaceId: "workspace-main", serverPath: secondPath, access: "read_only" });
+  const sessionId = await setup.createSession("Task with an older approval");
+  const binding = store.getSession(sessionId).descriptor.binding;
+  const query = runtime.queries.find(candidate => candidate.params.options.sessionId === binding.nativeSessionId)!;
+  expect(query.params.options.additionalDirectories).toEqual([firstPath]);
+  const settings = vi.spyOn(query, "applyFlagSettings");
+  const closed = vi.spyOn(query, "close");
+  await expect(setup.add(secondPath, ExtraDirectoryAccess.READ_ONLY)).resolves.toMatchObject({ state: OperationState.FAILED });
+  const input = sendInputMutation(sessionId, BigInt(binding.generation), "Use only the previously approved read-only directory");
+  if (input.payload.case !== "sendInput") throw new Error("Expected the normal input mutation.");
+  input.payload.value.overrides = create(PerTurnOverridesSchema, { extraDirectoryIds: [retained.id] });
+  await expect(submit(paired.clients.operation, paired.connectionId, input)).resolves.toMatchObject({
+    state: OperationState.FAILED, error: { code: "TURN_OVERRIDE_EXTRA_DIRECTORY_ACCESS_UNSUPPORTED" }
+  });
+  expect(store.listQueueItems({ sessionId })).toEqual([]);
+  expect(host.extraDirectories.get(retained.id).access).toBe("read_only");
+  expect(query.receivedInputs).toEqual([]);
+  expect(settings).not.toHaveBeenCalled();
+  expect(closed).not.toHaveBeenCalled();
+
+  const runId = await setup.send(sessionId, "Use the supported directory in this same task");
+  await waitFor(async () => store.getRun(runId).descriptor.state, state => state === "running", "the original task's supported turn");
+  await expect(setup.add(secondPath, ExtraDirectoryAccess.READ_ONLY)).resolves.toMatchObject({ state: OperationState.FAILED });
+  query.complete("The original task keeps working.");
+  await waitFor(async () => store.getRun(runId).descriptor.state, state => state === "completed", "the successful supported turn");
+  expect(query.receivedInputs).toHaveLength(1);
+  expect(settings).not.toHaveBeenCalled();
+  expect(closed).not.toHaveBeenCalled();
+  await expect(setup.remove(retained.id)).resolves.toMatchObject({ state: OperationState.SUCCEEDED });
+  expect(host.extraDirectories.listForTarget(targetId).map(directory => directory.path)).toEqual([firstPath]);
+}, 30_000);
+
 async function directoryFixture() {
   const runtime = new ControlledClaudeRuntime();
   fixture = await OrchestratorE2eFixture.start({ profiles: [], backendFactories: [{ instanceId: BACKEND_ID,
@@ -127,14 +174,14 @@ async function directoryFixture() {
     return realpath(path);
   }));
   const firstPath = paths[0]!, secondPath = paths[1]!;
-  const add = (serverPath: string) => submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
-    payload: { case: "addExtraDirectory", value: { workspaceId: "workspace-main", serverPath, access: ExtraDirectoryAccess.READ_WRITE } }
+  const add = (serverPath: string, access = ExtraDirectoryAccess.READ_WRITE) => submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
+    payload: { case: "addExtraDirectory", value: { workspaceId: "workspace-main", serverPath, access } }
   }));
   const remove = (extraDirectoryId: string) => submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
     payload: { case: "removeExtraDirectory", value: { extraDirectoryId } }
   }));
   expect((await add(firstPath)).state).toBe(OperationState.SUCCEEDED);
-  return { runtime, store, host, targetId, firstPath, secondPath, add, remove,
+  return { paired, runtime, store, host, targetId, firstPath, secondPath, add, remove,
     createSession: async (displayName: string) => sessionIdFrom(await submit(paired.clients.operation, paired.connectionId,
       createSessionMutation({ backendId: BACKEND_ID, targetId, displayName }))),
     send: async (sessionId: string, text: string) => queueRunIdFrom(await submit(paired.clients.operation, paired.connectionId,

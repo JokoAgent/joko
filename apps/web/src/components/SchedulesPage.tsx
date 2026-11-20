@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { resolveModelSpeed } from "../model-speed.js";
+import { extraDirectoryAccessChoices } from "../extra-directory-access.js";
 import type { JSX, KeyboardEvent } from "react";
 import { ArrowUpToLine, CalendarClock, Check, CheckCircle2, ChevronDown, ChevronRight, CirclePlus, Clock3, Copy, FolderGit2, FolderMinus, GitBranch, History, Menu, MoreHorizontal, Pause, Pencil, Play, RefreshCw, Trash2, TriangleAlert } from "lucide-react";
 import type { AppController } from "../controller.js";
@@ -887,8 +888,9 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
       !draft.enabled || (worktreeEligible && !worktreeLoading && worktreeError === undefined)
     )
   );
-  const selectableExtraDirectories = extraDirectories.filter((directory) => directory.workspaceId === selectedTarget?.workspaceId && directory.trusted);
-  const extraDirectoriesSupported = backend?.capabilities.get("workspace.extra_dirs")?.supported === true;
+  const directoryAccess = extraDirectoryAccessChoices(backend);
+  const editableExtraDirectories = extraDirectories.filter(directory => directory.workspaceId === selectedTarget?.workspaceId && directory.trusted
+    && (directoryAccess.includes(directory.access) || draft.extraDirectoryIds.includes(directory.id)));
   const validScriptTimeout = draft.scriptTimeoutMs === undefined || (Number.isSafeInteger(draft.scriptTimeoutMs) && draft.scriptTimeoutMs > 0);
   const timezoneValid = isValidScheduleTimeZone(draft.timezone);
   const timezoneInvalid = draft.timezone.trim().length > 0 && !timezoneValid;
@@ -1090,7 +1092,7 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
       </div>
       <ScheduleHookEditor controller={controller} scheduleId={schedule?.targetId === draft.targetId && schedule.backendId === draft.backendId ? schedule.id : undefined} draft={draft} open={open} saving={saving} t={t}
         onChange={hook => setDraft(current => ({ ...current, preRunHook: hook }))} onBusyChange={setHookBusy} onValidityChange={setHookValid} />
-      {draft.executionMode === "agent" && extraDirectoriesSupported && selectableExtraDirectories.length > 0 && <div className="schedule-editor__directories"><strong>{t("projects.extraDirectories")}</strong>{selectableExtraDirectories.map((directory) => <label key={directory.id}><CheckboxControl checked={draft.extraDirectoryIds.includes(directory.id)} onChange={(event) => setDraft((current) => ({ ...current, extraDirectoryIds: event.target.checked ? [...new Set([...current.extraDirectoryIds, directory.id])] : current.extraDirectoryIds.filter((id) => id !== directory.id) }))} /><span>{directory.serverPath}<small>{directory.access === "readWrite" ? t("projects.readWrite") : t("projects.readOnly")}</small></span></label>)}</div>}
+      {draft.executionMode === "agent" && editableExtraDirectories.length > 0 && <div className="schedule-editor__directories"><strong>{t("projects.extraDirectories")}</strong>{editableExtraDirectories.map((directory) => <label key={directory.id}><CheckboxControl checked={draft.extraDirectoryIds.includes(directory.id)} onChange={(event) => setDraft((current) => ({ ...current, extraDirectoryIds: event.target.checked ? [...new Set([...current.extraDirectoryIds, directory.id])] : current.extraDirectoryIds.filter((id) => id !== directory.id) }))} /><span>{directory.serverPath}<small>{directoryAccess.includes(directory.access) ? t(directory.access === "readWrite" ? "projects.readWrite" : "projects.readOnly") : t("projects.directoryAccessUnavailable")}</small></span></label>)}</div>}
       </fieldset>
       {saveError !== undefined && <p className="inline-error" role="alert">{saveError}</p>}
       <div className="modal__actions"><Button disabled={saving || hookBusy} onClick={onClose}>{t("common.cancel")}</Button><Button type="submit" tone="primary" disabled={!valid || saving || hookBusy || !hookValid}>{saving ? t("common.loading") : schedule === undefined ? t("scheduler.new") : t("scheduler.saveChanges")}</Button></div>

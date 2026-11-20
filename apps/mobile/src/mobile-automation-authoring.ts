@@ -2,6 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import { encodeModelSpeed } from "@joko/contracts";
 import {
   BackendHealth,
+  capabilityNames,
   ExtraDirectoryAccess,
   PermissionMode,
   ScheduleExecutionMode,
@@ -278,12 +279,19 @@ export function mobileAutomationPermissionOptions(
 
 export function mobileAutomationExtraDirectoryOptions(
   owner: Snapshot | undefined,
-  targetId: string
+  targetId: string,
+  retainedDirectoryIds: readonly string[] = []
 ): readonly MobileAutomationExtraDirectoryOption[] {
   const target = owner?.targets.find((candidate) => candidate.targetId === targetId);
   const execution = resolveMobileNewTaskExecutionAuthority(owner, target?.backendId);
-  if (!owner || !target || !execution?.supportsExtraDirectories) return [];
+  if (!owner || !target || !execution) return [];
+  const options = execution.backend.capabilities?.capabilities.find(
+    capability => capability.name === capabilityNames.workspaceExtraDirs
+  )?.options;
+  const declaredAccess = options?.kind.case === "workspace" ? options.kind.value.extraDirectoryAccess : undefined;
   return owner.extraDirectories.filter((directory) => directory.workspaceId === target.workspaceId && directory.trusted)
+    .filter(directory => retainedDirectoryIds.includes(directory.extraDirectoryId)
+      || execution.supportsExtraDirectories && (declaredAccess === undefined || declaredAccess.includes(directory.access)))
     .filter((directory, index, values) => strictIdentity(directory.extraDirectoryId)
       && values.findIndex((candidate) => candidate.extraDirectoryId === directory.extraDirectoryId) === index)
     .flatMap<MobileAutomationExtraDirectoryOption>((directory) => directory.access === ExtraDirectoryAccess.READ_ONLY ? [{
@@ -516,7 +524,7 @@ export function buildMobileAutomationScheduleInput(
   const extraDirectoryIds = [...draft.extraDirectoryIds];
   if (new Set(extraDirectoryIds).size !== extraDirectoryIds.length
     || extraDirectoryIds.some((id) => !extraDirectoryOptions.some((option) => option.id === id))) {
-    throw new Error("One or more extra directories are no longer trusted for this project.");
+    throw new Error("One or more extra directories are no longer available for this project and Backend.");
   }
   if (draft.useWorktree) {
     if (scriptMode || draft.sessionMode !== "fresh" || targetOption.workspaceKind !== "project"

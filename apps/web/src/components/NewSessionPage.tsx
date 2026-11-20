@@ -1,5 +1,6 @@
 import type { JSONContent } from "@tiptap/core";
 import { resolveModelSpeed } from "../model-speed.js";
+import { extraDirectoryAccessChoices } from "../extra-directory-access.js";
 import { WorktreeBranchSync } from "./WorktreeBranchSync.js";
 import { ProvisionalDraftTask } from "../provisional-draft-task.js";
 import { previewProvisionalTask } from "../provisional-draft-preview.js";
@@ -840,8 +841,10 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const commandOptions = { learnSupported: learnCommandSupported, goalSupported: goalCommandSupported, personalDevelopmentSupported } as const;
   const commandItems = composerCommandItems(availableGlobalCommands, commandOptions);
   const commandCatalogKey = commandItems.map((item) => `${item.id}\u0000${item.value}\u0000${item.meta}`).join("\u0001");
-  const selectableExtraDirectories = snapshot.extraDirectories.filter((directory) => directory.workspaceId === usableWorkspace?.id && directory.trusted);
-  const canSelectExtraDirectories = usableWorkspace !== undefined && backend?.capabilities.get("workspace.extra_dirs")?.supported === true;
+  const directoryAccess = extraDirectoryAccessChoices(backend);
+  const selectableExtraDirectories = snapshot.extraDirectories.filter(directory => directory.workspaceId === usableWorkspace?.id
+    && directory.trusted && directoryAccess.includes(directory.access));
+  const canSelectExtraDirectories = usableWorkspace !== undefined && directoryAccess.length > 0;
   const canUseAddMenu = goalCommandSupported || attachmentPolicy.images || attachmentPolicy.files || canMention || commandItems.length > 0
     || canSelectExtraDirectories && selectableExtraDirectories.length > 0;
   const worktreeApplicable = selected !== undefined && startKind === "fresh"
@@ -1259,8 +1262,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       setWorktreeSourceRef(restored.worktree?.sourceRef);
       setRefreshWorktreeRemote(restored.worktree?.refreshRemote ?? false);
       const restoredExtraDirectories = selection.kind === "target"
-        && backend.capabilities.get("workspace.extra_dirs")?.supported === true
-        ? snapshot.extraDirectories.filter((directory) => directory.workspaceId === selected?.workspaceId && directory.trusted)
+        ? snapshot.extraDirectories.filter(directory => directory.workspaceId === selected?.workspaceId
+          && directory.trusted && directoryAccess.includes(directory.access))
         : [];
       setExtraDirectoryIds((restored.extraDirectoryIds ?? []).filter((id) =>
         restoredExtraDirectories.some((directory) => directory.id === id)
