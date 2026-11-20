@@ -481,6 +481,149 @@ export class WorkspaceGitReviewError extends Error {
   }
 }
 
+export type ReviewGitRunner = (args: readonly string[], timeoutMs: number, maximumBytes: number, accepted?: Set<number>) => Promise<ProcessResult>;
+
+async function readGitConfigValue(git: ReviewGitRunner, key: string): Promise<string | undefined> {
+  const result = await git(["config", "--get", key], 10_000, 1024 * 1024, new Set([0, 1]));
+  return result.exitCode === 0 && result.stdout.trim() !== "" ? result.stdout.trim() : undefined;
+}
+
+export async function readConfiguredGitUpstream(git: ReviewGitRunner, branch: string): Promise<{ readonly remote: string; readonly remoteRef: string } | undefined> {
+  const [remote, mergeRef] = await Promise.all([
+    readGitConfigValue(git, `branch.${branch}.remote`),
+    readGitConfigValue(git, `branch.${branch}.merge`)
+  ]);
+  if (remote === undefined || mergeRef === undefined) return undefined;
+  return { remote, remoteRef: mergeRef.startsWith("refs/heads/") ? mergeRef : `refs/heads/${mergeRef}` };
+}
+
+export async function recordReviewPushUpstream(git: ReviewGitRunner, branch: string, head: string, remote: string, remoteRef: string): Promise<void> {
+  try {
+    const current = await git(["rev-parse", "--verify", `refs/heads/${branch}`],
+      10_000, 1024 * 1024, new Set([0, 1, 128]));
+    if (current.exitCode !== 0 || current.stdout.trim() !== head || await readConfiguredGitUpstream(git, branch) !== undefined) return;
+
+    // Pushing an object ID has no local branch for Git's --set-upstream.
+    // The push already succeeded, so local tracking is a follow-up effect.
+    const remoteKey = `branch.${branch}.remote`;
+    const mergeKey = `branch.${branch}.merge`;
+    const previous = await git(["config", "--local", "--get", remoteKey],
+      10_000, 1024 * 1024, new Set([0, 1]));
+    await git(["config", "--local", "--replace-all", remoteKey, remote], 10_000, 1024 * 1024);
+    try {
+      await git(["config", "--local", "--replace-all", mergeKey, remoteRef],
+        10_000, 1024 * 1024);
+    } catch {
+      if (await readGitConfigValue(git, mergeKey) === remoteRef || await readGitConfigValue(git, remoteKey) !== remote) return;
+      const restore = previous.exitCode === 0 ? ["--replace-all", remoteKey, previous.stdout.trim()] : ["--unset-all", remoteKey];
+      await git(["config", "--local", ...restore], 10_000, 1024 * 1024);
+      return;
+    }
+    const rebase = await readGitConfigValue(git, "branch.autoSetupRebase");
+    if (rebase === "remote" || rebase === "always") await git(["config", "--local", "--replace-all", `branch.${branch}.rebase`, "true"], 10_000, 1024 * 1024);
+  } catch { /* The confirmed remote push receipt is authoritative. */ }
+}
+
+export async function readDefaultGitPushTarget(git: ReviewGitRunner): Promise<WorkspaceGitPushTarget | undefined> {
+  const branchResult = await git(["symbolic-ref", "--quiet", "--short", "HEAD"], 10_000, 1024 * 1024, new Set([0, 1, 128]));
+  const branch = branchResult.stdout.trim();
+  if (branchResult.exitCode !== 0 || branch === "") return undefined;
+  const [upstream, branchPushRemote, defaultRemote, remotesResult] = await Promise.all([
+    readConfiguredGitUpstream(git, branch),
+    readGitConfigValue(git, `branch.${branch}.pushRemote`),
+    readGitConfigValue(git, "remote.pushDefault"),
+    git(["remote"], 10_000, 1024 * 1024)
+  ]);
+  const remote = upstream?.remote ?? branchPushRemote ?? defaultRemote ?? "origin";
+  const remotes = remotesResult.stdout.split(/\r?\n/u).map((value) => value.trim());
+  if (remote === "." || !remotes.includes(remote)) return undefined;
+  try {
+    validateGitRemoteName(remote);
+    const remoteRef = await validateGitRemoteRef(git, upstream?.remoteRef ?? `refs/heads/${branch}`);
+    return { remote, remoteRef, hasUpstream: upstream !== undefined };
+  } catch (error) {
+    if (error instanceof WorkspaceGitReviewError && error.kind === "invalid") return undefined;
+    throw error;
+  }
+}
+
+export async function validateGitRemoteRef(git: ReviewGitRunner, value: string): Promise<string> {
+  if (
+    !value.startsWith("refs/heads/") ||
+    value.length > 300 ||
+    !isSafeGitRevision(value, false)
+  ) {
+    throw new WorkspaceGitReviewError("A fully qualified branch destination is required.", "invalid");
+  }
+  const checked = await git(["check-ref-format", value],
+    10_000,
+    1024 * 1024,
+    new Set([0, 1, 128])
+  );
+  if (checked.exitCode !== 0) throw new WorkspaceGitReviewError("The push destination ref is invalid.", "invalid");
+  return value;
+}
+
+export async function readRemoteReviewRefOid(git: ReviewGitRunner, remote: string, remoteRef: string): Promise<string> {
+  const result = await git(["ls-remote", "--refs", remote, remoteRef],
+    120_000,
+    2 * 1024 * 1024,
+    new Set([0, 2, 128])
+  );
+  if (result.exitCode !== 0) throw new WorkspaceGitReviewError("The remote branch could not be read.", "apply_failed");
+  const records = result.stdout.trim().split(/\r?\n/u).filter(Boolean);
+  if (records.length !== 1) throw new WorkspaceGitReviewError("The remote branch is unavailable.", "invalid");
+  const [oid, ref] = records[0]!.split(/\s+/u);
+  if (!isImmutableGitObjectId(oid ?? "") || ref !== remoteRef) {
+    throw new WorkspaceGitReviewError("The remote branch identity is invalid.", "unsupported");
+  }
+  return oid!;
+}
+
+export async function readRemoteReviewAheadBehind(
+  git: ReviewGitRunner,
+  remote: string,
+  remoteRef: string,
+  headRevision: string,
+  expectedRemoteOid: string,
+  updateTracking = true
+): Promise<{ readonly ahead: number; readonly behind: number }> {
+  const present = await git(["cat-file", "-e", `${expectedRemoteOid}^{commit}`],
+    10_000,
+    1024 * 1024,
+    new Set([0, 1, 128])
+  );
+  if (present.exitCode !== 0) {
+    const fetchScope = updateTracking ? [] : ["--refmap=", "--no-recurse-submodules", "--no-prune", "--no-prune-tags"];
+    const fetched = await git(["fetch", "--no-tags", "--quiet", ...fetchScope, remote, remoteRef],
+      120_000,
+      4 * 1024 * 1024,
+      new Set([0, 1, 128])
+    );
+    if (fetched.exitCode !== 0) throw new WorkspaceGitReviewError("The remote branch could not be refreshed.", "apply_failed");
+    const fetchedOid = await git(["rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+      10_000,
+      1024 * 1024,
+      new Set([0, 128])
+    );
+    if (fetchedOid.stdout.trim() !== expectedRemoteOid) {
+      throw new WorkspaceGitReviewError("The remote branch changed while it was being refreshed.", "lease_expired");
+    }
+  }
+  const counts = await git(["rev-list", "--left-right", "--count", `${headRevision}...${expectedRemoteOid}`],
+    20_000,
+    1024 * 1024
+  );
+  const match = /^(\d+)\s+(\d+)$/u.exec(counts.stdout.trim());
+  if (match === null) throw new WorkspaceGitReviewError("The remote branch relationship is unavailable.", "unsupported");
+  const ahead = Number(match[1]);
+  const behind = Number(match[2]);
+  if (!Number.isSafeInteger(ahead) || !Number.isSafeInteger(behind)) {
+    throw new WorkspaceGitReviewError("The remote branch relationship is invalid.", "unsupported");
+  }
+  return { ahead, behind };
+}
+
 export class WorkspaceService {
   readonly #workspaces = new Map<string, WorkspaceRegistration>();
   readonly #changeStream: WorkspaceChangeStream;
@@ -1511,7 +1654,7 @@ export class WorkspaceService {
     await this.#gitMutationTail;
     const current = await this.#readGitReviewDiff(workspaceId, input);
     this.#assertReviewFence(current, input.expectedRepositoryRevision, input.expectedMergeBaseRevision, false);
-    const pushTarget = await this.#readDefaultGitPushTarget(this.requireWorkspace(workspaceId));
+    const pushTarget = await readDefaultGitPushTarget(this.#runReviewGit(this.requireWorkspace(workspaceId)));
     return { ...current, ...(pushTarget === undefined ? {} : { pushTarget }) };
   }
 
@@ -1841,8 +1984,9 @@ export class WorkspaceService {
       const workspace = this.requireWorkspace(workspaceId);
       await this.#requireGitRoot(workspace);
       await this.#assertGitReviewWriteAllowed(workspace);
+      const git = this.#runReviewGit(workspace);
       const remote = validateGitRemoteName(input.remote);
-      const remoteRef = await this.#validateGitRemoteRef(workspace, input.remoteRef);
+      const remoteRef = await validateGitRemoteRef(git, input.remoteRef);
       if (input.expectedRepositoryRevision.trim() === "" || !isImmutableGitObjectId(input.expectedHeadRevision)) {
         throw new WorkspaceGitReviewError("Repository and HEAD revision fences are required.", "invalid");
       }
@@ -1858,11 +2002,11 @@ export class WorkspaceService {
         if (!isImmutableGitObjectId(expectedRemoteOid)) {
           throw new WorkspaceGitReviewError("An immutable remote lease revision is required.", "invalid");
         }
-        const remoteOid = await this.#readRemoteRefOid(workspace, remote, remoteRef);
+        const remoteOid = await readRemoteReviewRefOid(git, remote, remoteRef);
         if (remoteOid !== expectedRemoteOid) {
           throw new WorkspaceGitReviewError("The remote branch changed after confirmation; refresh and retry.", "lease_expired");
         }
-        const counts = await this.#readRemoteAheadBehind(workspace, remote, remoteRef, headRevision, remoteOid);
+        const counts = await readRemoteReviewAheadBehind(git, remote, remoteRef, headRevision, remoteOid);
         if (counts.ahead === 0) {
           throw new WorkspaceGitReviewError("The local branch has no new commits to push.", "invalid");
         }
@@ -1890,7 +2034,7 @@ export class WorkspaceService {
         if ((input.expectedRemoteOid ?? "").trim() !== "") {
           throw new WorkspaceGitReviewError("A remote lease revision is only valid with force-with-lease confirmation.", "invalid");
         }
-        const setUpstream = await this.#readConfiguredGitUpstream(workspace, branch) === undefined;
+        const setUpstream = await readConfiguredGitUpstream(git, branch) === undefined;
         const pushed = await runProcess(
           this.#gitExecutable,
           ["push", "--porcelain", remote, `${headRevision}:${remoteRef}`],
@@ -1903,8 +2047,8 @@ export class WorkspaceService {
           if (!isNonFastForwardRejection(pushed)) {
             throw new WorkspaceGitReviewError("Git push failed.", "apply_failed");
           }
-          const remoteOid = await this.#readRemoteRefOid(workspace, remote, remoteRef);
-          const counts = await this.#readRemoteAheadBehind(workspace, remote, remoteRef, headRevision, remoteOid);
+          const remoteOid = await readRemoteReviewRefOid(git, remote, remoteRef);
+          const counts = await readRemoteReviewAheadBehind(git, remote, remoteRef, headRevision, remoteOid);
           if (counts.ahead === 0) {
             throw new WorkspaceGitReviewError("The local branch has no new commits to push.", "invalid");
           }
@@ -1919,7 +2063,7 @@ export class WorkspaceService {
             behind: Math.max(counts.behind, 1)
           };
         }
-        if (setUpstream) await this.#recordReviewPushUpstream(workspace, branch, headRevision, remote, remoteRef);
+        if (setUpstream) await recordReviewPushUpstream(git, branch, headRevision, remote, remoteRef);
       }
       const after = await this.#readGitDiff(workspaceId, [], {});
       return { kind: "pushed", repositoryRevision: after.repositoryRevision, headRevision, remote, remoteRef };
@@ -2167,69 +2311,9 @@ export class WorkspaceService {
     return branch;
   }
 
-  async #readGitConfigValue(workspace: WorkspaceRegistration, key: string): Promise<string | undefined> {
-    const result = await runProcess(this.#gitExecutable, ["config", "--get", key], workspace.root, 10_000, 1024 * 1024, new Set([0, 1]));
-    return result.exitCode === 0 && result.stdout.trim() !== "" ? result.stdout.trim() : undefined;
-  }
-
-  async #readConfiguredGitUpstream(workspace: WorkspaceRegistration, branch: string): Promise<{ readonly remote: string; readonly remoteRef: string } | undefined> {
-    const [remote, mergeRef] = await Promise.all([
-      this.#readGitConfigValue(workspace, `branch.${branch}.remote`),
-      this.#readGitConfigValue(workspace, `branch.${branch}.merge`)
-    ]);
-    if (remote === undefined || mergeRef === undefined) return undefined;
-    return { remote, remoteRef: mergeRef.startsWith("refs/heads/") ? mergeRef : `refs/heads/${mergeRef}` };
-  }
-
-  async #recordReviewPushUpstream(workspace: WorkspaceRegistration, branch: string, head: string, remote: string, remoteRef: string): Promise<void> {
-    try {
-      const current = await runProcess(this.#gitExecutable, ["rev-parse", "--verify", `refs/heads/${branch}`], workspace.root,
-        10_000, 1024 * 1024, new Set([0, 1, 128]));
-      if (current.exitCode !== 0 || current.stdout.trim() !== head || await this.#readConfiguredGitUpstream(workspace, branch) !== undefined) return;
-
-      // Pushing an object ID has no local branch for Git's --set-upstream.
-      // The push already succeeded, so local tracking is a follow-up effect.
-      const remoteKey = `branch.${branch}.remote`;
-      const mergeKey = `branch.${branch}.merge`;
-      const previous = await runProcess(this.#gitExecutable, ["config", "--local", "--get", remoteKey], workspace.root,
-        10_000, 1024 * 1024, new Set([0, 1]));
-      await runProcess(this.#gitExecutable, ["config", "--local", "--replace-all", remoteKey, remote], workspace.root, 10_000, 1024 * 1024);
-      try {
-        await runProcess(this.#gitExecutable, ["config", "--local", "--replace-all", mergeKey, remoteRef],
-          workspace.root, 10_000, 1024 * 1024);
-      } catch {
-        if (await this.#readGitConfigValue(workspace, mergeKey) === remoteRef || await this.#readGitConfigValue(workspace, remoteKey) !== remote) return;
-        const restore = previous.exitCode === 0 ? ["--replace-all", remoteKey, previous.stdout.trim()] : ["--unset-all", remoteKey];
-        await runProcess(this.#gitExecutable, ["config", "--local", ...restore], workspace.root, 10_000, 1024 * 1024);
-        return;
-      }
-      const rebase = await this.#readGitConfigValue(workspace, "branch.autoSetupRebase");
-      if (rebase === "remote" || rebase === "always") await runProcess(this.#gitExecutable,
-        ["config", "--local", "--replace-all", `branch.${branch}.rebase`, "true"], workspace.root, 10_000, 1024 * 1024);
-    } catch { /* The confirmed remote push receipt is authoritative. */ }
-  }
-
-  async #readDefaultGitPushTarget(workspace: WorkspaceRegistration): Promise<WorkspaceGitPushTarget | undefined> {
-    const branchResult = await runProcess(this.#gitExecutable, ["symbolic-ref", "--quiet", "--short", "HEAD"], workspace.root, 10_000, 1024 * 1024, new Set([0, 1, 128]));
-    const branch = branchResult.stdout.trim();
-    if (branchResult.exitCode !== 0 || branch === "") return undefined;
-    const [upstream, branchPushRemote, defaultRemote, remotesResult] = await Promise.all([
-      this.#readConfiguredGitUpstream(workspace, branch),
-      this.#readGitConfigValue(workspace, `branch.${branch}.pushRemote`),
-      this.#readGitConfigValue(workspace, "remote.pushDefault"),
-      runProcess(this.#gitExecutable, ["remote"], workspace.root, 10_000, 1024 * 1024)
-    ]);
-    const remote = upstream?.remote ?? branchPushRemote ?? defaultRemote ?? "origin";
-    const remotes = remotesResult.stdout.split(/\r?\n/u).map((value) => value.trim());
-    if (remote === "." || !remotes.includes(remote)) return undefined;
-    try {
-      validateGitRemoteName(remote);
-      const remoteRef = await this.#validateGitRemoteRef(workspace, upstream?.remoteRef ?? `refs/heads/${branch}`);
-      return { remote, remoteRef, hasUpstream: upstream !== undefined };
-    } catch (error) {
-      if (error instanceof WorkspaceGitReviewError && error.kind === "invalid") return undefined;
-      throw error;
-    }
+  #runReviewGit(workspace: WorkspaceRegistration): ReviewGitRunner {
+    return (args, timeoutMs, maximumBytes, accepted) =>
+      runProcess(this.#gitExecutable, args, workspace.root, timeoutMs, maximumBytes, accepted);
   }
 
   /** Reads the three object identities for a clean, initialized staged submodule update. */
@@ -2491,26 +2575,6 @@ export class WorkspaceService {
     }
   }
 
-  async #validateGitRemoteRef(workspace: WorkspaceRegistration, value: string): Promise<string> {
-    if (
-      !value.startsWith("refs/heads/") ||
-      value.length > 300 ||
-      !isSafeGitRevision(value, false)
-    ) {
-      throw new WorkspaceGitReviewError("A fully qualified branch destination is required.", "invalid");
-    }
-    const checked = await runProcess(
-      this.#gitExecutable,
-      ["check-ref-format", value],
-      workspace.root,
-      10_000,
-      1024 * 1024,
-      new Set([0, 1, 128])
-    );
-    if (checked.exitCode !== 0) throw new WorkspaceGitReviewError("The push destination ref is invalid.", "invalid");
-    return value;
-  }
-
   async #assertPushRemoteIsCredentialSafe(workspace: WorkspaceRegistration, remote: string): Promise<void> {
     const remotes = await runProcess(this.#gitExecutable, ["remote"], workspace.root, 10_000, 1024 * 1024);
     if (!remotes.stdout.split(/\r?\n/u).map((value) => value.trim()).includes(remote)) {
@@ -2531,79 +2595,6 @@ export class WorkspaceService {
     if (values.some(gitRemoteUrlContainsCredentials)) {
       throw new WorkspaceGitReviewError("Credential-bearing remote URLs are not supported by Review push.", "unsupported");
     }
-  }
-
-  async #readRemoteRefOid(workspace: WorkspaceRegistration, remote: string, remoteRef: string): Promise<string> {
-    const result = await runProcess(
-      this.#gitExecutable,
-      ["ls-remote", "--refs", remote, remoteRef],
-      workspace.root,
-      120_000,
-      2 * 1024 * 1024,
-      new Set([0, 2, 128])
-    );
-    if (result.exitCode !== 0) throw new WorkspaceGitReviewError("The remote branch could not be read.", "apply_failed");
-    const records = result.stdout.trim().split(/\r?\n/u).filter(Boolean);
-    if (records.length !== 1) throw new WorkspaceGitReviewError("The remote branch is unavailable.", "invalid");
-    const [oid, ref] = records[0]!.split(/\s+/u);
-    if (!isImmutableGitObjectId(oid ?? "") || ref !== remoteRef) {
-      throw new WorkspaceGitReviewError("The remote branch identity is invalid.", "unsupported");
-    }
-    return oid!;
-  }
-
-  async #readRemoteAheadBehind(
-    workspace: WorkspaceRegistration,
-    remote: string,
-    remoteRef: string,
-    headRevision: string,
-    expectedRemoteOid: string
-  ): Promise<{ readonly ahead: number; readonly behind: number }> {
-    const present = await runProcess(
-      this.#gitExecutable,
-      ["cat-file", "-e", `${expectedRemoteOid}^{commit}`],
-      workspace.root,
-      10_000,
-      1024 * 1024,
-      new Set([0, 1, 128])
-    );
-    if (present.exitCode !== 0) {
-      const fetched = await runProcess(
-        this.#gitExecutable,
-        ["fetch", "--no-tags", "--quiet", remote, remoteRef],
-        workspace.root,
-        120_000,
-        4 * 1024 * 1024,
-        new Set([0, 1, 128])
-      );
-      if (fetched.exitCode !== 0) throw new WorkspaceGitReviewError("The remote branch could not be refreshed.", "apply_failed");
-      const fetchedOid = await runProcess(
-        this.#gitExecutable,
-        ["rev-parse", "--verify", "FETCH_HEAD^{commit}"],
-        workspace.root,
-        10_000,
-        1024 * 1024,
-        new Set([0, 128])
-      );
-      if (fetchedOid.stdout.trim() !== expectedRemoteOid) {
-        throw new WorkspaceGitReviewError("The remote branch changed while it was being refreshed.", "lease_expired");
-      }
-    }
-    const counts = await runProcess(
-      this.#gitExecutable,
-      ["rev-list", "--left-right", "--count", `${headRevision}...${expectedRemoteOid}`],
-      workspace.root,
-      20_000,
-      1024 * 1024
-    );
-    const match = /^(\d+)\s+(\d+)$/u.exec(counts.stdout.trim());
-    if (match === null) throw new WorkspaceGitReviewError("The remote branch relationship is unavailable.", "unsupported");
-    const ahead = Number(match[1]);
-    const behind = Number(match[2]);
-    if (!Number.isSafeInteger(ahead) || !Number.isSafeInteger(behind)) {
-      throw new WorkspaceGitReviewError("The remote branch relationship is invalid.", "unsupported");
-    }
-    return { ahead, behind };
   }
 
   async #readGitDiff(
@@ -4341,7 +4332,7 @@ function validateGitCommitMessage(value: string): string {
   return value;
 }
 
-function validateGitRemoteName(value: string): string {
+export function validateGitRemoteName(value: string): string {
   if (
     value === "." ||
     value === ".." ||

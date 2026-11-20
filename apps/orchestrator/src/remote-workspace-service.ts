@@ -27,13 +27,20 @@ import {
   WorkspaceTextFileWriteError,
   fileHash,
   gitRemoteUrlContainsCredentials,
-  isSafeGitRevision,
   isUnmergedGitStatus,
+  readConfiguredGitUpstream,
+  readDefaultGitPushTarget,
+  readRemoteReviewAheadBehind,
+  readRemoteReviewRefOid,
+  recordReviewPushUpstream,
   selectDiffFilePatch,
   selectDiffHunkPatch,
+  validateGitRemoteName,
+  validateGitRemoteRef,
   workspacePreviewRegistrationIdentity,
   type GitState,
   type RemoteWorkspaceDelegate,
+  type ReviewGitRunner,
   type WorkspaceEntryListingOptions,
   type WorkspaceEntryMutationResult,
   type WorkspaceEntryRecord,
@@ -778,10 +785,14 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     input: WorkspaceGitReviewDiffInput
   ): Promise<WorkspaceGitDiff> {
     const processes = transports.processes;
-    const current = await this.#gitDiff(registration, transports, input.paths, { ignoreWhitespace: input.ignoreWhitespace });
-    if (input.expectedRepositoryRevision !== undefined && input.expectedRepositoryRevision !== current.repositoryRevision) {
+    const diff = await this.#gitDiff(registration, transports, input.paths, { ignoreWhitespace: input.ignoreWhitespace });
+    if (input.expectedRepositoryRevision !== undefined && input.expectedRepositoryRevision !== diff.repositoryRevision) {
       throw new WorkspaceGitReviewError("Remote Review is stale.", "stale");
     }
+    const pushTarget = registration.remote?.binding.kind === "ssh"
+      ? await readDefaultGitPushTarget(remoteReviewGit(registration, transports))
+      : undefined;
+    const current = pushTarget === undefined ? diff : { ...diff, pushTarget };
     if (input.source === "unstaged") return { ...current, index: "", comparison: "" };
     if (input.source === "staged") return { ...current, workingTree: "", comparison: "" };
     const source = input.sourceRevision;
@@ -1018,31 +1029,82 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     input: RemoteGitPushInput
   ): Promise<WorkspaceGitPushResult> {
     const processes = transports.processes;
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(input.remote)) throw new WorkspaceGitReviewError("Remote name is invalid.", "invalid");
-    if (!input.remoteRef.startsWith("refs/heads/") || input.remoteRef.length > 300 || !isSafeGitRevision(input.remoteRef, false)) {
-      throw new WorkspaceGitReviewError("A fully qualified branch destination is required.", "invalid");
-    }
-    const checked = await runRemote(processes, "git", ["check-ref-format", input.remoteRef], registration.root, 10_000,
-      1024 * 1024, undefined, new Set([0, 1, 128]));
-    if (checked.exitCode !== 0) throw new WorkspaceGitReviewError("The push destination ref is invalid.", "invalid");
+    const ssh = registration.remote?.binding.kind === "ssh";
+    const git = remoteReviewGit(registration, transports);
+    const { remote, remoteRef } = input;
+    if (ssh) validateGitRemoteName(remote);
+    else if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(remote)) throw new WorkspaceGitReviewError("Remote name is invalid.", "invalid");
+    await validateGitRemoteRef(git, remoteRef);
     const before = await repositoryRevision(processes, registration.root);
-    const head = (await runRemote(processes, "git", ["rev-parse", "HEAD"], registration.root, 20_000, 1024 * 1024)).stdout.trim();
+    const head = (await git(["rev-parse", "HEAD"], 20_000, 1024 * 1024)).stdout.trim();
     if (before !== input.expectedRepositoryRevision || head !== input.expectedHeadRevision) throw new WorkspaceGitReviewError("Remote branch is stale.", "stale");
-    const destinations = (await runRemote(processes, "git", ["remote", "get-url", "--push", "--all", input.remote],
-      registration.root, 20_000, 2 * 1024 * 1024)).stdout.split(/\r?\n/u).map(value => value.trim()).filter(Boolean);
-    if (destinations.length === 0) throw new WorkspaceGitReviewError("The selected push remote has no destination.", "invalid");
-    if (destinations.some(gitRemoteUrlContainsCredentials)) {
-      throw new WorkspaceGitReviewError("Credential-bearing remote URLs are not supported by Review push.", "unsupported");
+    const destinations = await readReviewRemoteDestinations(git, remote, true);
+    const force = input.confirmForceWithLease === true;
+    const expectedRemoteOid = input.expectedRemoteOid ?? "";
+    if (force && !immutableRevision(expectedRemoteOid)) throw new WorkspaceGitReviewError("Remote lease is invalid.", "invalid");
+    if (ssh && !force && expectedRemoteOid !== "") {
+      throw new WorkspaceGitReviewError("A remote lease revision is only valid with force-with-lease confirmation.", "invalid");
     }
-    const args = ["push"];
-    if (input.confirmForceWithLease === true) {
-      if (!immutableRevision(input.expectedRemoteOid ?? "")) throw new WorkspaceGitReviewError("Remote lease is invalid.", "invalid");
-      args.push(`--force-with-lease=${input.remoteRef}:${input.expectedRemoteOid}`);
+
+    let branch: string | undefined;
+    let setUpstream = false;
+    const readLease = async (expected?: string): Promise<{ readonly remoteOid: string; readonly ahead: number; readonly behind: number }> => {
+      if (destinations.length !== 1) throw new WorkspaceGitReviewError("Review needs one push destination for force-with-lease.", "unsupported");
+      await readReviewRemoteDestinations(git, remote, false);
+      let remoteOid: string;
+      try { remoteOid = await readRemoteReviewRefOid(git, remote, remoteRef); }
+      catch (error) {
+        if (expected !== undefined && error instanceof WorkspaceGitReviewError && error.kind === "invalid") {
+          throw new WorkspaceGitReviewError("The remote branch changed after confirmation; refresh and retry.", "lease_expired");
+        }
+        throw error;
+      }
+      if (expected !== undefined && expected !== remoteOid) {
+        throw new WorkspaceGitReviewError("The remote branch changed after confirmation; refresh and retry.", "lease_expired");
+      }
+      const counts = await readRemoteReviewAheadBehind(git, remote, remoteRef, head, remoteOid, false);
+      if (counts.ahead === 0) throw new WorkspaceGitReviewError("The local branch has no new commits to push.", "invalid");
+      return { remoteOid, ahead: counts.ahead, behind: Math.max(counts.behind, 1) };
+    };
+    if (ssh) {
+      const currentBranch = await git(["symbolic-ref", "--quiet", "--short", "HEAD"], 10_000, 1024 * 1024, new Set([0, 1, 128]));
+      branch = currentBranch.stdout.trim();
+      if (currentBranch.exitCode !== 0 || branch === "") {
+        throw new WorkspaceGitReviewError("Review push requires a current local branch.", "unsupported");
+      }
+      if (force) await readLease(expectedRemoteOid);
+      else setUpstream = await readConfiguredGitUpstream(git, branch) === undefined;
+      const currentDestinations = await readReviewRemoteDestinations(git, remote, true);
+      if (currentDestinations.length !== destinations.length || currentDestinations.some((destination, index) => destination !== destinations[index])) {
+        throw new WorkspaceGitReviewError("The configured push destination changed; refresh and retry.", "stale");
+      }
+      if (await repositoryRevision(processes, registration.root) !== before) {
+        throw new WorkspaceGitReviewError("Remote branch is stale.", "stale");
+      }
     }
-    args.push(input.remote, `${head}:${input.remoteRef}`);
-    await requireRemoteGitRoot(registration, transports);
-    await runRemote(processes, "git", args, registration.root, 120_000, 4 * 1024 * 1024);
-    return { kind: "pushed", repositoryRevision: await repositoryRevision(processes, registration.root), headRevision: head, remote: input.remote, remoteRef: input.remoteRef };
+
+    const args = ["push", ...(ssh ? ["--porcelain", "--no-follow-tags"] : [])];
+    if (force) args.push(`--force-with-lease=${remoteRef}:${expectedRemoteOid}`);
+    const result = await git([...args, remote, `${head}:${remoteRef}`], 120_000, 4 * 1024 * 1024,
+      ssh ? new Set([0, 1, 128]) : undefined);
+    if (result.exitCode !== 0) {
+      const reason = result.stdout.split(/\r?\n/u).map(line => line.split("\t")).find(
+        ([flag, refspec]) => flag === "!" && refspec?.split(":").at(-1) === remoteRef
+      )?.[2];
+      if (force && reason === "[rejected] (stale info)") {
+        throw new WorkspaceGitReviewError("The remote branch changed after confirmation; refresh and retry.", "lease_expired");
+      }
+      if (force || (reason !== "[rejected] (fetch first)" && reason !== "[rejected] (non-fast-forward)")) {
+        throw new WorkspaceGitReviewError("Git push failed.", "apply_failed");
+      }
+      const lease = await readLease();
+      if (await repositoryRevision(processes, registration.root) !== before) {
+        throw new WorkspaceGitReviewError("Remote branch is stale.", "stale");
+      }
+      return { kind: "needs_force", repositoryRevision: before, headRevision: head, remote, remoteRef, ...lease };
+    }
+    if (branch !== undefined && setUpstream) await recordReviewPushUpstream(git, branch, head, remote, remoteRef);
+    return { kind: "pushed", repositoryRevision: await repositoryRevision(processes, registration.root), headRevision: head, remote, remoteRef };
   }
 
   #require(id: string): WorkspaceRegistration {
@@ -1334,6 +1396,24 @@ interface RemoteProcessResult {
   readonly stdoutBytes: Buffer;
   readonly stderr: string;
   readonly exitCode: number;
+}
+
+function remoteReviewGit(registration: WorkspaceRegistration, transports: RemoteTransports): ReviewGitRunner {
+  return async (args, timeoutMs, maximumBytes, accepted) => {
+    const writesConfig = args[0] === "config" && args[1] === "--local" && args[2] !== "--get";
+    if (args[0] === "push" || args[0] === "fetch" || writesConfig) await requireRemoteGitRoot(registration, transports);
+    return runRemote(transports.processes, "git", args, registration.root, timeoutMs, maximumBytes, undefined, accepted);
+  };
+}
+
+async function readReviewRemoteDestinations(git: ReviewGitRunner, remote: string, push: boolean): Promise<readonly string[]> {
+  const result = await git(["remote", "get-url", ...(push ? ["--push"] : []), "--all", remote], 20_000, 2 * 1024 * 1024);
+  const destinations = result.stdout.split(/\r?\n/u).map(value => value.trim()).filter(Boolean);
+  if (destinations.length === 0) throw new WorkspaceGitReviewError("The selected remote has no destination.", "invalid");
+  if (destinations.some(gitRemoteUrlContainsCredentials)) {
+    throw new WorkspaceGitReviewError("Credential-bearing remote URLs are not supported by Review push.", "unsupported");
+  }
+  return destinations;
 }
 
 async function runRemote(
