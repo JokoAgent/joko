@@ -95,7 +95,9 @@ mountedIt("restores the Files visibility preference and keeps a sent file quote 
     expect(await page.evaluate(() => window.getSelection()?.toString())).toBe(body);
     await page.locator(".selection-quote-actions").getByRole("button", { name: "Add to chat", exact: true }).click();
     const filesPane = page.locator(".session-pane--files-rail");
-    await filesPane.locator(".composer-rich-editor__content [data-selection-quote-chip]").getByText(body, { exact: true }).waitFor();
+    const quote = filesPane.locator(".composer-rich-editor__content [data-selection-quote-chip]")
+      .and(filesPane.getByLabel(`note.txt:L1: ${body}`, { exact: true }));
+    await quote.waitFor({ state: "visible" });
     const store = fixture.application.store;
     await filesPane.locator(".send-button").click();
     const accepted = await waitFor(async () => store.listQueueItems({ sessionId })[0], value => value !== undefined, "the original file quote");
