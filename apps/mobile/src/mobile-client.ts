@@ -72,7 +72,7 @@ import {
   SetSessionPermissionMutationSchema, SetSessionPlanModeMutationSchema, TargetState, capabilityNames,
   StartReviewMutationSchema, TriggerScheduleMutationSchema, UpdateScheduleMutationSchema,
   UpdateVoiceInputServiceSettingsMutationSchema, VoiceInputServiceSettingsPatchSchema,
-  FileKind, ImageRefSchema, ResourceKind, RuntimeCommandInputMode, WorkspaceFileChangeKind, WorkspaceKind,
+  FileKind, ImageRefSchema, ResourceKind, RuntimeCommandInputMode, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceKind,
   type Artifact, type BackendDescriptor, type BlobRef, type Device, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
   type Operation, type OperationMutation, type QueueControl, type QueueItem, type Schedule, type Session, type Snapshot, type Target, type TaskTagDeletePreview,
   type WorkspaceEntry, type WorkspaceFileChange, type WorkspaceSearchMatch
@@ -206,6 +206,7 @@ import {
   workspaceSearchEntryRevision,
   type MobileFileSearchResult,
   type MobileFilePreview,
+  type MobileFilesComposerInput,
   type MobileFilesComposerResult,
   type MobileFilesComposerSource,
   type MobileFilesSearchMode,
@@ -8646,7 +8647,7 @@ export class MobileClient {
   }
 
   async addFilesItemToComposer(
-    source: MobileFilesComposerSource,
+    source: MobileFilesComposerInput,
     signal?: AbortSignal
   ): Promise<MobileFilesComposerResult> {
     signal?.throwIfAborted();
@@ -16952,13 +16953,18 @@ export class MobileClient {
     epoch: number,
     taskAuthorityKey: string,
     identity: MobileComposerDraftIdentity,
-    source: MobileFilesComposerSource,
+    source: MobileFilesComposerInput,
     attachmentOwnerKey: string | undefined,
     workspaceOwnerKey: string | undefined,
     catalogOwnerKey: string | undefined,
     signal?: AbortSignal
   ): void {
     signal?.throwIfAborted();
+    const files = this.#state.files;
+    const sourceCurrent = source.kind === "current-directory"
+      ? files.location === source.location && source.location.path !== "" && files.status === "ready" && !files.preview
+        && files.authorityKey === source.authorityKey && source.revision !== "" && files.directoryRevision === source.revision
+      : filesComposerSourceIsCurrent(files, source);
     if (!this.#currentFiles(epoch, context.key)
       || this.#taskAuthorityKey() !== taskAuthorityKey
       || this.#state.activeProfileId !== identity.profileId
@@ -16966,7 +16972,7 @@ export class MobileClient {
       || this.taskAttachmentControls()?.surfaceOwnerKey !== attachmentOwnerKey
       || this.taskWorkspaceMentionControls()?.surfaceOwnerKey !== workspaceOwnerKey
       || this.taskCatalogMentionControls()?.surfaceOwnerKey !== catalogOwnerKey
-      || !filesComposerSourceIsCurrent(this.#state.files, source)) {
+      || !sourceCurrent) {
       throw new Error("Files-to-composer authority changed before the item could be added. The original draft was retained.");
     }
   }
@@ -16976,7 +16982,7 @@ export class MobileClient {
     epoch: number,
     taskAuthorityKey: string,
     identity: MobileComposerDraftIdentity,
-    source: MobileFilesComposerSource,
+    source: MobileFilesComposerInput,
     draft: MobileComposerDraft,
     attachmentControls: MobileAttachmentControls | undefined,
     workspaceControls: MobileWorkspaceMentionControls | undefined,
@@ -16993,7 +16999,13 @@ export class MobileClient {
       context, epoch, taskAuthorityKey, identity, source,
       attachmentOwnerKey, workspaceOwnerKey, catalogOwnerKey, signal
     );
-    const entry = await this.#resolveFilesComposerWorkspaceEntry(context, source, signal);
+    const entry = source.kind === "current-directory"
+      ? create(WorkspaceEntrySchema, {
+          workspaceId: context.authority.workspace.workspaceId,
+          relativePath: source.location.path,
+          kind: FileKind.DIRECTORY
+        })
+      : await this.#resolveFilesComposerWorkspaceEntry(context, source, signal);
     assertCurrent();
     const path = canonicalWorkspacePath(entry.relativePath);
     if (entry.workspaceId !== context.authority.workspace.workspaceId
@@ -17001,7 +17013,7 @@ export class MobileClient {
       throw new Error("The selected Workspace item is outside the current Files owner.");
     }
 
-    if (entry.kind === FileKind.REGULAR && entry.revision && attachmentControls && this.attachmentFiles
+    if (source.kind !== "current-directory" && entry.kind === FileKind.REGULAR && entry.revision && attachmentControls && this.attachmentFiles
       && filesAttachmentMetadata(
         entry.displayName || workspaceBasename(path),
         entry.mediaType,
@@ -17060,6 +17072,9 @@ export class MobileClient {
     if (!workspaceControls) {
       throw new Error("This Backend cannot add the selected Workspace item as an attachment or typed reference.");
     }
+    if (entry.kind === FileKind.DIRECTORY && !workspaceControls.policy.directories) {
+      throw new Error("This Backend no longer supports Workspace directory references.");
+    }
     const candidate = await this.#validateFilesWorkspaceReference(
       context,
       workspaceControls,
@@ -17081,7 +17096,7 @@ export class MobileClient {
     epoch: number,
     taskAuthorityKey: string,
     identity: MobileComposerDraftIdentity,
-    source: MobileFilesComposerSource,
+    source: MobileFilesComposerInput,
     artifact: Artifact,
     draft: MobileComposerDraft,
     attachmentControls: MobileAttachmentControls | undefined,
@@ -18596,7 +18611,7 @@ function mobileStateTimelineEvents(state: MobileState): readonly Event[] {
   return state.window ?? [...state.older, ...(state.detail?.timeline ?? []), ...state.live];
 }
 
-function filesComposerArtifact(source: MobileFilesComposerSource): Artifact | undefined {
+function filesComposerArtifact(source: MobileFilesComposerInput): Artifact | undefined {
   if (source.kind === "artifact") return source.artifact;
   return source.kind === "search-result" && source.result.kind === "artifact"
     ? source.result.artifact

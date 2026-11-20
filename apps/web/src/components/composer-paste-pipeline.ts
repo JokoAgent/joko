@@ -126,6 +126,13 @@ export function composerPathRelativeToWorkingDirectory(candidate: string, workin
   return candidate.slice(base.length + 1).replace(/\\/gu, "/");
 }
 
+export function standaloneComposerWorkspacePath(text: string, workingDirectory: string): string | undefined {
+  const base = workingDirectory.trim().replace(/[\\/]+$/u, "");
+  const candidate = text.replace(/[\\/]+$/u, "");
+  if (base === "" || !pathWithinWorkingDirectory(candidate, base)) return undefined;
+  return composerPathRelativeToWorkingDirectory(candidate, base);
+}
+
 export function sanitizeComposerReferenceLabel(value: string): string {
   return value
     .replace(/\\([\[\]])/gu, "$1")

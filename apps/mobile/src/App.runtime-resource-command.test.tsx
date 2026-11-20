@@ -2,9 +2,9 @@
 import { act, createElement, forwardRef, useImperativeHandle, useRef, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { AuthenticationState, CapabilitySupport, EventCursorSchema, EventIdentitySchema, EventPayloadSchema, EventSchema, InteractionKind, InteractionSchema, InteractionState, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
+import { AuthenticationState, CapabilitySupport, EventCursorSchema, EventIdentitySchema, EventPayloadSchema, EventSchema, FileKind, FileRevisionSchema, InteractionKind, InteractionSchema, InteractionState, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
   MessageRole, ModelKeySchema, ModelSelectionSchema, ModelSourceKind, NativeMessageIdentitySchema, NativeSessionBindingSchema, PartnerSessionTaskStatus, PiMessageLifecycleKind, PlanReviewDecisionKind, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
-  QueueDeliveryMode, RetryState, RunState, RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema, capabilityNames } from "@joko/contracts";
+  QueueDeliveryMode, RetryState, RunState, RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema, WorkspaceEntrySchema, capabilityNames } from "@joko/contracts";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { mobileComposerInput, plainTextMobileComposerDraft, replaceMobileComposerRange, type MobileComposerDraft } from "./mobile-composer-document";
@@ -29,6 +29,8 @@ import type { MobileProviderUsageTransport } from "./mobile-account-usage";
 import { MobileInteractionDraftStore, mobileInteractionDraftIdentity } from "./interaction-draft-store";
 import { pendingMobileInteractions } from "./mobile-interactions";
 import type { MobileInteractionSheet } from "./MobileInteractionSheet";
+import { MobileFilesPreferenceStore } from "./mobile-files-preferences";
+import { emptyMobileFilesState, type MobileFilePreview, type MobileFilesComposerSource } from "./workspace-files";
 
 type TimelineVisibility = (event: { viewableItems: { item: unknown; isViewable: boolean }[] }) => void;
 type TimelineScrollFailure = (event: { index: number; averageItemLength: number }) => void;
@@ -81,6 +83,7 @@ let taskRole: "ordinary" | "lead" | "worker" | undefined = "ordinary";
 let root: Root;
 let host: HTMLDivElement;
 let TaskScreen: typeof import("./App").TaskScreen;
+let FilesScreen: typeof import("./App").FilesScreen;
 const identity = { profileId: "profile", sessionId: "session" };
 const values = new Map<string, string>();
 const drafts = new MobileComposerDraftStore({
@@ -109,6 +112,7 @@ let stopControl: { authorityKey: string; pending: boolean } | undefined;
 const loadEarlier = vi.fn(async () => undefined);
 const loadNewer = vi.fn(async (_signal: AbortSignal) => {});
 const retryOutbox = vi.fn(async (_id: string) => undefined);
+const shareFilesItem = vi.fn<MobileClient["shareFilesItem"]>();
 let retainedOutbox: readonly MobileTaskOutboxRecord[] = [];
 let retainedDraftEditable = false;
 const returnToLatest = vi.fn(() => {
@@ -142,6 +146,10 @@ const client = new Proxy({
   taskQueueItems: () => empty, taskRetryableQueueItems: () => empty, taskQueueCapabilities: () => ({}),
   taskOutboxItems: () => retainedOutbox, retryTaskOutbox: retryOutbox,
   canEditRetainedTaskDraft: () => retainedDraftEditable,
+  filesAuthorityKey: () => renderedState.files?.authorityKey,
+  openFilesPreviewPager: async () => undefined,
+  searchFiles: async () => undefined,
+  shareFilesItem,
   taskStopControl: () => stopControl, stopTaskTurn,
   taskInteractions: () => pendingMobileInteractions(renderedState.detail, renderedState.selectedId), subscribe: () => () => {},
   taskPendingImagePasteCount: () => 0, taskForeground: () => true,
@@ -171,7 +179,9 @@ beforeAll(async () => {
   vi.stubGlobal("__DEV__", false);
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.doMock("react-native", () => ({
-    View: surface, Text: surface, ScrollView: surface, SectionList: surface, Image: surface, ActivityIndicator: surface,
+    View: surface, ScrollView: surface, SectionList: surface, Image: surface, ActivityIndicator: surface,
+    Text: ({ children, accessibilityRole, accessibilityLiveRegion }: { children?: ReactNode; accessibilityRole?: string; accessibilityLiveRegion?: "polite" | "assertive" }) =>
+      createElement("div", { role: accessibilityRole === "alert" ? "alert" : undefined, "aria-live": accessibilityLiveRegion }, children),
     FlatList: forwardRef(({ data, renderItem, ListFooterComponent, onViewableItemsChanged, ...scrollHandlers }: { data?: readonly unknown[];
       ListFooterComponent?: ReactNode;
       renderItem?: (value: { item: unknown; index: number }) => ReactNode; onViewableItemsChanged?: TimelineVisibility } & TimelineScrollHandlers, ref) => {
@@ -180,7 +190,7 @@ beforeAll(async () => {
       if (onViewableItemsChanged) timelineList = { data: data ?? [], instance, onViewableItemsChanged, ...scrollHandlers };
       return createElement("div", null, data?.map((item, index) => createElement("div", { key: index }, renderItem?.({ item, index }))), ListFooterComponent);
     }), TextInput: forwardRef(() => null),
-    Modal: ({ visible, children }: { visible?: boolean; children?: ReactNode }) => visible ? createElement("div", null, children) : null,
+    Modal: ({ visible, children }: { visible?: boolean; children?: ReactNode }) => visible ? createElement("div", { "data-native-modal": true }, children) : null,
     Pressable: ({ children, onPress, disabled, accessibilityLabel }: { children?: ReactNode | ((value: { pressed: boolean }) => ReactNode); onPress?: () => void; disabled?: boolean; accessibilityLabel?: string }) => createElement("button", { onClick: onPress, disabled, "aria-label": accessibilityLabel }, typeof children === "function" ? children({ pressed: false }) : children),
     StyleSheet: { create: (value: unknown) => value, hairlineWidth: 1 }, Platform: { OS: "android", select: (value: Record<string, unknown>) => value.android ?? value.default },
     AppState: nativeAppState, BackHandler: { addEventListener: () => ({ remove() {} }) },
@@ -212,13 +222,16 @@ beforeAll(async () => {
   vi.doMock("expo", () => ({ requireOptionalNativeModule: () => null }));
   vi.doMock("./mobile-client", () => ({ MobileClient: class { constructor() { return client; } } }));
   vi.doMock("./storage", () => new Proxy({ mobileComposerDrafts: drafts, mobileInteractionDrafts: interactionDrafts,
+    mobileFilesPreferences: new MobileFilesPreferenceStore(drafts.driver),
     mobileLocalePreferences: { snapshot: { effectiveLocale: "en" } },
     mobileReplyQuotePreferences: { snapshot: { ready: true, visible: true, saving: false, failed: false }, subscribe: () => () => {}, hydrate: async () => {} } }, {
     get: (object, key) => key in object ? object[key as keyof typeof object] : {},
     has: () => true,
     getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: {} })
   }));
-  const nativeModules = ["network", "native-lan-discovery", "native-notifications", "mobile-media-preview", "mobile-pdf-preview", "mobile-model-preview", "mobile-file-share", "mobile-files-thumbnail-cache", "mobile-incoming-share"];
+  vi.doMock("./network", () => ({ mobileNetwork: {}, MOBILE_FILE_SHARE_MAXIMUM_BYTES: 256 * 1024 * 1024,
+    MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES: 32 * 1024 * 1024, assertWorkspaceFilePreview() {} }));
+  const nativeModules = ["native-lan-discovery", "native-notifications", "mobile-media-preview", "mobile-pdf-preview", "mobile-model-preview", "mobile-file-share", "mobile-files-thumbnail-cache", "mobile-incoming-share"];
   for (const name of nativeModules) vi.doMock(`./${name}`, () => new Proxy({}, { get: () => ({}), has: () => true, getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: {} }) }));
   vi.doMock("./mobile-push-controller", () => ({ MobilePushController: class {} }));
   vi.doMock("./mobile-voice-dictionary-readonly-controller", () => ({ MobileVoiceDictionaryReadOnlyController: class {} }));
@@ -270,7 +283,7 @@ beforeAll(async () => {
   vi.doMock("./use-mobile-hidden-history", () => ({ useMobileHiddenHistory: () => false }));
   vi.doMock("./use-mobile-conversation-share", () => ({ useMobileConversationShare: () => ({ active: false, busy: false, selectedIds: [], enterVisible() {}, rowTouchHandlers() {} }) }));
   vi.doMock("./use-mobile-screenshot-selection", () => ({ useMobileScreenshotSelection() {} }));
-  ({ TaskScreen } = await import("./App"));
+  ({ FilesScreen, TaskScreen } = await import("./App"));
   ({ MobileMcpAppViewsProvider } = await import("./MobileMcpAppViews"));
 });
 beforeEach(async () => {
@@ -285,6 +298,7 @@ beforeEach(async () => {
   loadNewer.mockReset().mockResolvedValue(undefined);
   retainedOutbox = []; retryOutbox.mockClear();
   retainedDraftEditable = false;
+  shareFilesItem.mockReset().mockResolvedValue(undefined);
   taskMessageActions = undefined;
   writeClipboard.mockClear();
   nativeAppState.currentState = "active";
@@ -327,6 +341,42 @@ it("preserves edits to the retained task draft while the same node reconnects", 
   retainedDraftEditable = false;
   await act(async () => root.render(taskScreen()));
   expect(input.editable).toBe(false);
+});
+
+it("shows the original file share failure in the open preview and retires it when the source changes", async () => {
+  const source: MobileFilesComposerSource = { kind: "workspace-entry", entry: create(WorkspaceEntrySchema, {
+    workspaceId: "workspace", relativePath: "notes.txt", displayName: "notes.txt", kind: FileKind.REGULAR,
+    revision: create(FileRevisionSchema, { opaqueRevision: "one", byteSize: 7n })
+  }) };
+  const preview: MobileFilePreview = {
+    kind: "text", title: "notes.txt", sourceLabel: "notes.txt", workspacePath: "notes.txt", mediaType: "text/plain",
+    byteSize: 7n, revisionKey: "one", text: "example", languageId: "text", startByte: 0n, endByte: 7n,
+    totalLines: 1, truncated: false
+  };
+  renderedState = { ...state, files: { ...emptyMobileFilesState(), open: true, status: "ready", authorityKey: "workspace-owner", preview } };
+  const renderFiles = () => act(async () => root.render(createElement(FilesScreen, {
+    colors, state: renderedState, locale: "en", initialSource: source, onBack() {}, onAdded() {}
+  })));
+  await renderFiles();
+  const modal = host.querySelector<HTMLElement>("[data-native-modal]")!;
+  const share = modal.querySelector<HTMLButtonElement>(`button[aria-label="${mobileMessage("en", "preview.shareTitle", { title: "notes.txt" })}"]`)!;
+  shareFilesItem.mockRejectedValueOnce(new Error("Could not fetch the current source file"));
+  await act(async () => share.click());
+  expect(modal.querySelector('[role="alert"][aria-live="polite"]')?.textContent).toBe("Could not fetch the current source file");
+  expect(host.textContent?.match(/Could not fetch the current source file/gu)).toHaveLength(1);
+  expect(share.disabled).toBe(false);
+
+  await act(async () => share.click());
+  expect(modal.textContent).not.toContain("Could not fetch the current source file");
+  expect(shareFilesItem.mock.calls.map(([input]) => input)).toEqual([source, source]);
+
+  let rejectShare!: (error: Error) => void;
+  shareFilesItem.mockImplementationOnce(() => new Promise((_, reject) => { rejectShare = reject; }));
+  await act(async () => share.click());
+  renderedState = { ...renderedState, files: { ...renderedState.files, preview: { ...preview, revisionKey: "two" } } };
+  await renderFiles();
+  await act(async () => rejectShare(new Error("Previous file revision could not be shared")));
+  expect(host.textContent).not.toContain("Previous file revision could not be shared");
 });
 
 it("offers the original retained input retry in the latest timeline only after non-admission was confirmed", async () => {

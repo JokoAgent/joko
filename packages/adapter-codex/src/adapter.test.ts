@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -1299,7 +1299,6 @@ describe("CodexBackendAdapter", () => {
     const setup = await createSetup();
     const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 }));
     for (const mention of [
-      { kind: "workspace_directory", label: "source", reference: "src" },
       {
         kind: "resource",
         label: "Skill",
@@ -1320,6 +1319,24 @@ describe("CodexBackendAdapter", () => {
         .rejects.toMatchObject({ publicError: { code: "CODEX_MENTION_KIND_UNSUPPORTED", stateMayHaveChanged: false } });
     }
     expect(setup.fake.transport?.requests.filter((request) => request.method === "turn/start")).toEqual([]);
+  });
+
+  it("rechecks the selected local directory after persisting the native dispatch fence", async () => {
+    const setup = await createSetup();
+    const selected = join(setup.target.workspaceRoot, "docs");
+    await mkdir(selected);
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 }));
+    const owner = context(setup.target, [], { binding, backendInstanceGeneration: 7, operationId: "retired-directory" });
+    const input = { ...prompt("Summarize @docs/."), mentions: [{ kind: "workspace_directory" as const, label: "docs", reference: "docs" }] };
+    const persist = vi.fn(async () => {
+      await rename(selected, join(setup.target.workspaceRoot, "original-docs"));
+      await writeFile(selected, "A regular file at the selected directory's old path.");
+    });
+    await expect(setup.adapter.sendWithDurableNativeDispatchFence(input, owner, persist)).rejects.toMatchObject({
+      publicError: { code: "CODEX_WORKSPACE_DIRECTORY_UNAVAILABLE", stateMayHaveChanged: false }
+    });
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(setup.fake.transport?.requests.filter(request => request.method === "turn/start")).toEqual([]);
   });
 
   it("resolves a canonical Artifact through its service authority and rechecks it at native dispatch", async () => {
@@ -1345,7 +1362,7 @@ describe("CodexBackendAdapter", () => {
     const descriptor = await setup.adapter.describe();
     expect(descriptor.capabilities.get("input.mention")).toMatchObject({
       supported: true,
-      options: ["workspace_file", "artifact"]
+      options: ["workspace_file", "workspace_directory_local", "artifact"]
     });
     const binding = await setup.adapter.createSession(
       sessionInput(setup.target),
@@ -1453,7 +1470,7 @@ describe("CodexBackendAdapter", () => {
     });
     expect(descriptor.models).toHaveLength(1);
     expect(descriptor.capabilities.size).toBe(CAPABILITIES.length);
-    expect(descriptor.capabilities.get("input.mention")).toMatchObject({ supported: true, options: ["workspace_file"] });
+    expect(descriptor.capabilities.get("input.mention")).toMatchObject({ supported: true, options: ["workspace_file", "workspace_directory_local"] });
     expect(descriptor.capabilities.get("session.catalog")?.supported).toBe(true);
     expect(descriptor.capabilities.get("turn.steer")?.supported).toBe(true);
     expect(descriptor.capabilities.get("model.effort")?.supported).toBe(true);

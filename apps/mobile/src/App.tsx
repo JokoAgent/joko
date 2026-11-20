@@ -308,6 +308,7 @@ import {
   workspaceBasename,
   workspaceSearchEntryRevision,
   type MobileFilePreview,
+  type MobileFilesComposerInput,
   type MobileFileSearchResult,
   type MobileFilesComposerSource,
   type MobileFilesSearchMode
@@ -8358,7 +8359,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
 const filesClipboard = new MobileFilesClipboard((text) => Clipboard.setStringAsync(text));
 const filesClipboardMessages = { copied: "files.presentation.copied", failed: "files.presentation.copyFailed", unknown: "files.presentation.copyUnknown", busy: "files.presentation.copyBusy" } as const;
 
-function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: ScreenProps & {
+export function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: ScreenProps & {
   onBack: () => void; onAdded: () => void; initialSource?: MobileFilesComposerSource;
 }) {
   const [query, setQuery] = useState("");
@@ -8369,6 +8370,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
   const [handoffBusy, setHandoffBusy] = useState(false);
   const [fileShareBusy, setFileShareBusy] = useState(false);
   const [fileShareProgress, setFileShareProgress] = useState<MobileFileShareProgress>();
+  const [previewShareError, setPreviewShareError] = useState<{ readonly owner: string; readonly message: string }>();
   const [galleryOpening, setGalleryOpening] = useState(false);
   const [clipboardBusy, setClipboardBusy] = useState(false);
   const [clipboardNotice, setClipboardNotice] = useState<Exclude<MobileFilesClipboardResult, "retired">>();
@@ -8380,8 +8382,16 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
   const authorityKey = client.filesAuthorityKey();
   const connected = state.status === "connected" && authorityKey !== undefined;
   const files = state.files;
+  const canAddDirectory = client.taskWorkspaceMentionControls()?.policy.directories === true;
+  const currentDirectoryInput: MobileFilesComposerInput | undefined = canAddDirectory && authorityKey && files.directoryRevision
+    && files.location.kind === "workspace" && files.location.path !== ""
+    ? { kind: "current-directory", location: files.location, authorityKey, revision: files.directoryRevision }
+    : undefined;
   const currentPreviewSource = files.previewPager?.pages[files.previewPager.index]?.source ?? previewSource;
   const currentPreviewPage = files.previewPager?.pages[files.previewPager.index];
+  const previewShareOwner = files.preview && JSON.stringify([
+    authorityKey, files.previewPager?.id, currentPreviewPage?.key, files.preview.sourceLabel, files.preview.revisionKey
+  ]);
   const failedTextPreview = files.preview?.kind === "error" && currentPreviewPage?.kind === "workspace"
     && isTextFilePreviewMetadata(currentPreviewPage.mediaType, currentPreviewPage.title) ? files.preview : undefined;
   const initialPagerSource = useRef<MobileFilesComposerSource | undefined>(undefined);
@@ -8508,7 +8518,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
       .catch((error) => setLocalError(errorText(error)))
       .finally(() => setGalleryOpening(false));
   };
-  const addToComposer = (source: MobileFilesComposerSource): void => {
+  const addToComposer = (source: MobileFilesComposerInput): void => {
     if (handoffRef.current || galleryOpening || imageGallery.view) return;
     const controller = new AbortController();
     handoffRef.current = controller;
@@ -8530,7 +8540,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
       setLocalError(errorText(error));
     });
   };
-  const shareFile = (source: MobileFilesComposerSource): void => {
+  const shareFile = (source: MobileFilesComposerSource, previewOwner?: string): void => {
     if (handoffRef.current || fileShareRef.current || galleryOpening || imageGallery.view) return;
     const controller = new AbortController();
     fileShareRef.current = controller;
@@ -8538,14 +8548,18 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
     setFileShareProgress(undefined);
     setImageOutputNotice("");
     setLocalError("");
+    setPreviewShareError(undefined);
     void client.shareFilesItem(source, (progress) => {
       if (filesMountedRef.current && fileShareRef.current === controller) setFileShareProgress(progress);
     }, controller.signal).catch((error) => {
       if (!controller.signal.aborted && filesMountedRef.current && fileShareRef.current === controller) {
-        setLocalError(errorText(error));
+        const message = errorText(error);
+        if (previewOwner === undefined) setLocalError(message);
+        else setPreviewShareError({ owner: previewOwner, message });
       }
     }).finally(() => {
-      if (fileShareRef.current === controller) fileShareRef.current = undefined;
+      if (fileShareRef.current !== controller) return;
+      fileShareRef.current = undefined;
       if (filesMountedRef.current) {
         setFileShareBusy(false);
         setFileShareProgress(undefined);
@@ -8640,6 +8654,8 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
         onCopy={copyPath} onCopyDirectory={() => copyPath()}
         disabled={!connected || filesBusy} preferencesDisabled={!preferenceScope || filesBusy} onPreferences={setFilesPreferences}
         onDirectory={(path) => run(() => client.openFilesDirectory(path))} onAdd={addToComposer} onShare={shareFile}
+        canAddDirectory={canAddDirectory}
+        onAddCurrentDirectory={currentDirectoryInput === undefined ? undefined : () => addToComposer(currentDirectoryInput)}
         canShare={(source) => source.kind === "artifact" ? shareableBlobSize(source.artifact.blob?.byteSize)
           : source.kind === "workspace-entry" && source.entry.kind === FileKind.REGULAR && shareableBlobSize(source.entry.revision?.byteSize)}
         onOpen={(source) => {
@@ -8658,6 +8674,7 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
       onQuoted={() => { setPreviewSource(undefined); client.closeFiles(); onAdded(); }}
       onNavigate={(id, key) => run(() => client.selectFilesPreviewPage(id, key))} busy={handoffBusy} locale={locale}
       sharing={fileShareBusy} shareProgress={fileShareProgress}
+      shareError={previewShareError && previewShareError.owner === previewShareOwner ? previewShareError.message : undefined}
       copying={clipboardBusy}
       copyLabel={currentPreviewPage ? mobileMessage(locale, currentPreviewPage.kind === "workspace"
         ? "files.presentation.copyPath" : "files.presentation.copyName") : undefined}
@@ -8667,9 +8684,10 @@ function FilesScreen({ colors, state, locale, onBack, onAdded, initialSource }: 
         ? () => { void copyFilesValue(() => client.prepareFilesPreviewPathCopy(files, files.previewPager!.id, currentPreviewPage.key)); }
         : undefined}
       onShare={currentPreviewSource && shareableMobileFilesSource(currentPreviewSource)
-        ? () => shareFile(currentPreviewSource) : undefined}
+        ? () => shareFile(currentPreviewSource, previewShareOwner) : undefined}
       onAdd={addToComposer} onOpenImage={openGallery} onClose={() => {
         setPreviewSource(undefined);
+        setPreviewShareError(undefined);
         client.closeFilesPreview();
       }} />
     {imageGallery.view && <MobileImageLightbox key={imageGallery.view.descriptor.leaseId}
@@ -8753,7 +8771,7 @@ function FileSearchResultRow({ result, colors, locale, disabled, shareDisabled, 
   </View>;
 }
 
-function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sharing = false, shareProgress, backLabel,
+function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sharing = false, shareProgress, shareError, backLabel,
   backAccessibilityLabel, loadingLabel, locale, copying = false, copyLabel, copyStatus, onCopy,
   onAdd, onOpenImage, onShare, onClose, onQuoted, onRetry, workspaceHtmlNavigation }: {
   colors: Colors;
@@ -8766,6 +8784,7 @@ function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sh
   sharing?: boolean;
   copying?: boolean;
   shareProgress?: MobileFileShareProgress;
+  shareError?: string;
   copyLabel?: string;
   copyStatus?: string;
   onCopy?: () => void;
@@ -8842,6 +8861,8 @@ function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sh
           <ActivityIndicator color={colors.accent} />
           <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(shareProgress, locale)}</Text>
         </View>}
+        {shareError && <Text accessibilityRole="alert" accessibilityLiveRegion="polite"
+          style={[styles.warning, { color: colors.negative }]}>{shareError}</Text>}
         {(textActions.error || textActions.copyResult || textActions.busy) && <Text accessibilityRole={textActions.error ? "alert" : "text"} accessibilityLiveRegion="polite"
           style={[styles.caption, { padding: 12, color: textActions.error ? colors.negative : colors.muted }]}>{textActions.error || mobileMessage(locale,
             textActions.busy ? textActions.quoting ? "preview.adding" : "files.presentation.copying" : textActions.copyResult === "copied" ? "files.presentation.copied"

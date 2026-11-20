@@ -77,6 +77,7 @@ import {
   DEFAULT_AGENT_RESOURCE_SETTINGS,
   DEFAULT_COLLABORATION_SETTINGS,
   applyNewProcessPriority,
+  prepareWorkspaceDirectoryReference,
   toolchainThreadEnvironment,
   validateAgentResourceSettings,
   validateCollaborationSettings,
@@ -1346,10 +1347,10 @@ export class PiBackendAdapter implements
     context: AdapterContext
   ): Promise<PromptInput["disposition"] | undefined> {
     if (context.runtimePolicy === "review_read_only") return undefined;
-    if (!input.text.trimStart().startsWith("/")) return undefined;
+    if (!input.text.trimStart().startsWith("/") || input.mentions.some(mention => mention.kind === "workspace_directory")) return undefined;
     const runtime = this.#runtime(context);
     const options = runtime.generationLease.generation.options;
-    const composedMessage = await this.#composePrompt(input, context, options);
+    const { message: composedMessage } = await this.#composePrompt(input, context, options);
     if (!composedMessage.trimStart().startsWith("/")) return undefined;
     const commandCatalog = await this.#readCommandCatalog(runtime, context)
       .catch(() => EMPTY_PI_COMMAND_CATALOG);
@@ -1402,11 +1403,13 @@ export class PiBackendAdapter implements
     onVisionStart: () => void,
     persistFence?: (preparation: DurableNativeDispatchPreparation) => Promise<void>
   ): Promise<void> {
+    const directoriesAllowed = context.target.trusted && context.target.remoteWorkspace === undefined
+      && context.hostedExecution === undefined && context.runtimePolicy !== "review_read_only";
     if (input.mentions.some((mention) =>
-      (mention.kind !== "workspace_file" && mention.kind !== "resource")
-      || mention.kind === "workspace_file" && mention.lineRange !== undefined)) {
-      throw piError("PI_MENTION_KIND_UNSUPPORTED", "This native input supports regular workspace files and loaded task resources", "dispatch", {
-        recovery: "Choose a regular workspace file or a resource from this task's current loaded catalog."
+      mention.kind !== "resource" && !((mention.kind === "workspace_file"
+        || mention.kind === "workspace_directory" && directoriesAllowed) && mention.lineRange === undefined))) {
+      throw piError("PI_MENTION_KIND_UNSUPPORTED", "This native input does not support the selected reference in this workspace", "dispatch", {
+        recovery: "Choose a supported reference from the current workspace or task resource catalog."
       });
     }
     const attached = this.#runtimes.get(context.sessionId);
@@ -1457,7 +1460,7 @@ export class PiBackendAdapter implements
       images: input.images.slice(0, input.images.length - transient.images.length),
       files: input.files.slice(0, input.files.length - transient.files.length)
     };
-    const unbridgedMessage = await this.#composePrompt(durableInput, context, options);
+    const { message: unbridgedMessage, assertDirectoriesCurrent } = await this.#composePrompt(durableInput, context, options);
     const composedMessage = bridged === undefined
       ? unbridgedMessage
       : appendVisionBridgeDescriptions(unbridgedMessage, transient === undefined
@@ -1509,6 +1512,7 @@ export class PiBackendAdapter implements
       const runningExtensionCommand: PiRunningExtensionCommand = { context, command: extensionCommand };
       runtime.runningExtensionCommand = runningExtensionCommand;
       try {
+        assertDirectoriesCurrent();
         await requestPiPromptAcceptance(
           runtime,
           { type: "prompt", message, images },
@@ -1546,6 +1550,7 @@ export class PiBackendAdapter implements
       try {
         // Pi's prompt() dispatches catalogued extension commands before its
         // streaming guard. steer/follow_up explicitly reject those commands.
+        assertDirectoriesCurrent();
         await requestPiPromptAcceptance(
           runtime,
           { type: "prompt", message, images },
@@ -1676,6 +1681,7 @@ export class PiBackendAdapter implements
           if (runtime.abortRequested || runtime.lifecycle !== lifecycle || lifecycle.settlementReceived) {
             throw inactiveContinuationError(input.disposition as "steer" | "follow_up");
           }
+          assertDirectoriesCurrent();
           lifecycle.participants.push(participant);
           if (command.type === "steer") lifecycle.pendingSteering.push(participant);
           else lifecycle.pendingFollowUps.push(participant);
@@ -1690,6 +1696,7 @@ export class PiBackendAdapter implements
         try {
           if (transientPath !== undefined) await atomicWriteFile(transientPath, JSON.stringify(transientPrompt));
           context.signal.throwIfAborted();
+          assertDirectoriesCurrent();
           commandSent = true;
           return await requestPiPromptAcceptance(runtime, command, context.signal);
         } finally {
@@ -6912,7 +6919,10 @@ export class PiBackendAdapter implements
     return images;
   }
 
-  async #composePrompt(input: PromptInput, context: AdapterContext, options: PiAdapterOptions): Promise<string> {
+  async #composePrompt(input: PromptInput, context: AdapterContext, options: PiAdapterOptions): Promise<{
+    readonly message: string;
+    readonly assertDirectoriesCurrent: () => void;
+  }> {
     const sections: string[] = [];
     const resourceBlocks = await this.#resolveResourceMentionBlocks(input, context, options);
     const projected = projectResourceMentionText(input, resourceBlocks);
@@ -6921,14 +6931,28 @@ export class PiBackendAdapter implements
     for (const file of input.files) {
       attachments.push(`- file: ${await this.#resolvePromptFile(file, context, options)}`);
     }
+    const directoryProofs: Array<() => void> = [];
     for (const mention of input.mentions) {
       if (mention.kind === "resource") continue;
-      attachments.push(`- ${mention.kind}: ${mention.label} -> ${mention.reference}`);
+      if (mention.kind !== "workspace_directory") {
+        attachments.push(`- ${mention.kind}: ${mention.label} -> ${mention.reference}`);
+        continue;
+      }
+      const unavailable = () => piError("PI_WORKSPACE_DIRECTORY_UNAVAILABLE",
+        "The selected workspace directory is unavailable or changed while input was prepared", "dispatch", {
+          retryable: true, recovery: "Choose the directory again from the current Workspace."
+        });
+      const directory = await prepareWorkspaceDirectoryReference(context.target.workspaceRoot, mention.reference).catch(() => { throw unavailable(); });
+      directoryProofs.push(() => {
+        try { directory.assertCurrent(); }
+        catch { throw unavailable(); }
+      });
+      attachments.push(`- workspace_directory: ${JSON.stringify({ name: mention.label, path: directory.path })}`);
     }
     if (attachments.length > 0) sections.push(`[Joko resolved resources]\n${attachments.join("\n")}`);
     sections.push(...projected.supplemental);
     if (sections.length === 0 && input.images.length === 0) throw piError("PI_PROMPT_EMPTY", "Pi prompt has no text, image, file, or mention content", "dispatch");
-    return sections.join("\n\n");
+    return { message: sections.join("\n\n"), assertDirectoriesCurrent: () => { for (const assertCurrent of directoryProofs) assertCurrent(); } };
   }
 
   async #promptFileSection(files: PromptInput["files"], context: AdapterContext, options: PiAdapterOptions): Promise<string> {
@@ -7193,7 +7217,7 @@ export class PiBackendAdapter implements
             ...(key === "session.rewind_to_start" && this.#options.remoteNavigationOwner === undefined
               ? { options: [SESSION_REWIND_SERVICE_NODE_ONLY_OPTION] } : {}),
             ...(key === "input.image" ? { options: NATIVE_PROMPT_IMAGE_MEDIA_TYPES } : {}),
-            ...(key === "input.mention" ? { options: ["workspace_file", "resource"] } : {}),
+            ...(key === "input.mention" ? { options: ["workspace_file", "workspace_directory_local", "resource"] } : {}),
             ...(key === "runtime.resources" ? { options: ["extension", "skill", "prompt", "package"] } : {}),
             ...(key === "permission.modes" ? { options: ["ask", "auto", "bypassPermissions"] } : {})
           }];

@@ -13,6 +13,8 @@ import type { EditorView } from "@tiptap/pm/view";
 import { forwardRef, useEffect, useImperativeHandle, useRef, type JSX } from "react";
 import { composerDocumentIsEmpty, normalizeComposerDocument } from "../composer-quote-document.js";
 import { composerDocumentContainsList } from "../composer-list-document.js";
+import { serializeComposerMentionPath } from "../composer-mention-path.js";
+import type { WorkspaceEntryView } from "../model.js";
 import { clipboardAttachmentFiles } from "./composer-clipboard.js";
 import { ComposerQuoteNode } from "./ComposerQuoteNode.js";
 import {
@@ -28,6 +30,7 @@ import {
   htmlCarriesComposerAtomMarkup,
   isComposerLongPaste,
   segmentComposerPaste,
+  standaloneComposerWorkspacePath,
   type ComposerPasteSegment
 } from "./composer-paste-pipeline.js";
 import { ComposerRouteReferenceNode, type ComposerRouteReferenceAttrs } from "./ComposerRouteReferenceNode.js";
@@ -39,6 +42,7 @@ import {
 } from "./composer-route-reference-resolution.js";
 import { hasComposerInternalDrop, type ComposerInternalDropInsertion } from "./composer-internal-drop.js";
 import { resolveComposerBlankFocusIntent } from "./composer-blank-focus.js";
+import { canonicalWorkspaceRelativePath } from "./workspace-tree-state.js";
 import {
   ComposerBulletList,
   ComposerListItem,
@@ -70,6 +74,11 @@ interface ComposerListNormalizationFence {
   historySuppressed: boolean;
 }
 
+interface ComposerDirectoryPaste {
+  readonly workspaceId: string;
+  readonly listEntries: (parent: string) => Promise<readonly WorkspaceEntryView[]>;
+}
+
 export type ComposerRouteReferenceDropAction =
   | { readonly kind: "start" }
   | { readonly kind: "move"; readonly clientX: number; readonly clientY: number }
@@ -97,16 +106,17 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
   readonly onPastedTextOpen: (target: { readonly nodePosition: number; readonly text: string }) => void;
   readonly workingDirectory?: string;
   readonly knownWorkspacePaths?: readonly string[];
+  readonly directoryPaste?: ComposerDirectoryPaste;
   readonly resolveRouteReference?: ComposerRouteReferenceResolver;
-}>(function ComposerRichTextEditor({ document, editable, disabled, placeholder, onDocumentChange, onKeyDown, onClipboardFiles, pastedTextLabel, onPastedTextOpen, workingDirectory, knownWorkspacePaths = [], resolveRouteReference }, forwardedRef): JSX.Element {
-  const pasteRuntimeRef = useRef({ editable, disabled, onClipboardFiles, pastedTextLabel, workingDirectory, knownWorkspacePaths, resolveRouteReference });
+}>(function ComposerRichTextEditor({ document, editable, disabled, placeholder, onDocumentChange, onKeyDown, onClipboardFiles, pastedTextLabel, onPastedTextOpen, workingDirectory, knownWorkspacePaths = [], directoryPaste, resolveRouteReference }, forwardedRef): JSX.Element {
+  const pasteRuntimeRef = useRef({ editable, disabled, onClipboardFiles, pastedTextLabel, workingDirectory, knownWorkspacePaths, directoryPaste, resolveRouteReference });
   const pendingMentionTransactionsRef = useRef<readonly Transaction[]>([]);
   const listNormalizationFenceRef = useRef<ComposerListNormalizationFence>({
     compositionRepairGeneration: 0,
     historyMicrotaskGeneration: 0,
     historySuppressed: false
   });
-  pasteRuntimeRef.current = { editable, disabled, onClipboardFiles, pastedTextLabel, workingDirectory, knownWorkspacePaths, resolveRouteReference };
+  pasteRuntimeRef.current = { editable, disabled, onClipboardFiles, pastedTextLabel, workingDirectory, knownWorkspacePaths, directoryPaste, resolveRouteReference };
   const editor = useEditor({
     immediatelyRender: false,
     shouldRerenderOnTransaction: false,
@@ -179,6 +189,15 @@ export const ComposerRichTextEditor = forwardRef<ComposerRichTextEditorHandle, {
           });
           if (node === undefined) return false;
           view.dispatch(skipComposerListNormalization(view.state.tr.replaceSelectionWith(node)).scrollIntoView());
+          return true;
+        }
+        if (runtime.directoryPaste && runtime.workingDirectory
+          && insertWorkspaceDirectoryPaste(view, text, runtime.workingDirectory, runtime.directoryPaste, runtime.knownWorkspacePaths, () => {
+            const current = pasteRuntimeRef.current;
+            return current.directoryPaste === runtime.directoryPaste && current.workingDirectory === runtime.workingDirectory
+              && current.editable && !current.disabled;
+          })) {
+          event.preventDefault();
           return true;
         }
         const segments = segmentComposerPaste(text, { workingDirectory: runtime.workingDirectory });
@@ -453,6 +472,36 @@ function suppressComposerListNormalizationThroughOwnerMicrotask(
 
 function setEditorEmptyAttribute(element: HTMLElement, document: JSONContent): void {
   element.dataset["empty"] = composerDocumentIsEmpty(document) ? "true" : "false";
+}
+
+function insertWorkspaceDirectoryPaste(view: EditorView, text: string, root: string, workspace: ComposerDirectoryPaste,
+  knownPaths: readonly string[], isCurrent: () => boolean): boolean {
+  const candidate = standaloneComposerWorkspacePath(text, root);
+  if (candidate === undefined) return false;
+  let path: string;
+  try { path = canonicalWorkspaceRelativePath(candidate); }
+  catch { return false; }
+  const type = view.state.schema.nodes[ComposerRouteReferenceNode.name];
+  if (type === undefined || path.length > 500 || text.length > 4_096) return false;
+  const known = knownPaths.includes(path);
+  const attrs = { kind: "path", display: path, serialized: known ? `@${path}` : text, reference: path } as const;
+  const occurrence = type.create(attrs);
+  view.dispatch(skipComposerListNormalization(view.state.tr.replaceSelectionWith(occurrence)).scrollIntoView());
+
+  const parent = path.slice(0, Math.max(0, path.lastIndexOf("/")));
+  void workspace.listEntries(parent).then(entries => entries.some(entry => entry.path === path && entry.kind === "directory"), () => false)
+    .then(directory => {
+      if (view.isDestroyed || !isCurrent() || !directory && known) return;
+      const { doc, tr, schema } = view.state;
+      doc.descendants((node, position) => {
+        if (node !== occurrence) return;
+        if (directory) tr.setNodeMarkup(position, undefined, { ...attrs,
+          serialized: serializeComposerMentionPath(path, true), directoryWorkspaceId: workspace.workspaceId });
+        else tr.replaceWith(position, position + node.nodeSize, schema.text(text));
+      });
+      if (tr.docChanged) view.dispatch(skipComposerListNormalization(tr.setMeta("addToHistory", false)));
+    });
+  return true;
 }
 
 function composerPasteNodes(

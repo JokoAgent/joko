@@ -310,7 +310,7 @@ describe("new-task native draft recovery", () => {
         ["model.switch", { name: "model.switch", supported: true, options: [] }],
         ["input.image", { name: "input.image", supported: true, options: [], maximumItems: 4 }],
         ["input.file", { name: "input.file", supported: true, options: [], maximumItems: 4 }],
-        ["workspace.extra_dirs", { name: "workspace.extra_dirs", supported: true, options: [] }]
+        ["workspace.extra_dirs", { name: "workspace.extra_dirs", supported: true, options: ["read_only"] }]
       ]) })),
       models: [model],
       extraDirectories: [{ id: "extra-1", workspaceId: "workspace-1", serverPath: "/extra", access: "readOnly", trusted: true }]

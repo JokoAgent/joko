@@ -17044,6 +17044,47 @@ describe("native current-task Files ownership", () => {
     expect(network.submit).not.toHaveBeenCalled();
   });
 
+  it("adds the displayed current directory to the same draft and retires a late result after returning to the same path", async () => {
+    const network = fakeNetwork();
+    configureFiles(network, handoffSnapshot);
+    const drafts = memoryDraftStores();
+    const identity = { profileId: credential.profileId, sessionId: "session" };
+    drafts.composer.save(identity, plainTextMobileComposerDraft("Original draft"));
+    await drafts.composer.flush(identity);
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined,
+      fixedIds("current-directory-mention"), undefined, drafts);
+    await app.start();
+    await app.openFiles();
+    await app.openFilesDirectory("src");
+    const currentDirectory = () => {
+      const { location, authorityKey, directoryRevision } = app.state.files;
+      if (location.kind !== "workspace" || !authorityKey || !directoryRevision) throw new Error("No current Workspace directory.");
+      return { kind: "current-directory", location, authorityKey, revision: directoryRevision } as const;
+    };
+    await expect(app.addFilesItemToComposer(currentDirectory())).resolves.toBe("reference");
+    const saved = await drafts.composer.read(identity);
+    expect(saved?.text).toContain("Original draft");
+    expect(saved?.mentions).toEqual([expect.objectContaining({ kind: "workspace", relativePath: "src", directory: true, workspaceId: "workspace" })]);
+
+    const parentRead = vi.mocked(network.listWorkspaceDirectory);
+    let finishRead!: () => void;
+    parentRead.mockImplementationOnce(async (_credential, _workspace, path) => {
+      expect(path).toBe("");
+      await new Promise<void>(resolve => { finishRead = resolve; });
+      return { entries: [sourceDirectory, readme], revision: "directory:root" };
+    });
+    const retired = app.addFilesItemToComposer(currentDirectory());
+    const rejection = expect(retired).rejects.toThrow(/authority/u);
+    await vi.waitFor(() => expect(finishRead).toBeTypeOf("function"));
+    await app.openFilesDirectory("");
+    await app.openFilesDirectory("src");
+    finishRead();
+    await rejection;
+    expect(await drafts.composer.read(identity)).toEqual(saved);
+    expect(network.downloadBlob).not.toHaveBeenCalled();
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
   it("falls back to validated Workspace and Artifact mentions without auto-sending", async () => {
     const network = fakeNetwork();
     configureFiles(network, handoffSnapshot);

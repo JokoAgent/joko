@@ -284,7 +284,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   const rejectedFirstInputRecovery = controller.state.rejectedFirstInputRecovery;
   const selectionQuotes = useMemo(() => composerDocumentQuotes(editorDocument), [editorDocument]);
   const mentionCapability = backend?.capabilities.get("input.mention");
-  const mentionPolicy = useMemo(() => resolveComposerMentionPolicy(mentionCapability), [mentionCapability]);
+  const trustedLocalWorkspace = workspace?.trusted === true && workspace.remoteWorkspace === undefined && session.remoteWorkspace === undefined;
+  const mentionPolicy = useMemo(() => resolveComposerMentionPolicy(mentionCapability, trustedLocalWorkspace), [mentionCapability, trustedLocalWorkspace]);
   const directoryReferencesAllowed = composerDirectoryReferencesAllowed(editorDocument, mentionPolicy.directories, workspace?.id);
   const workspaceMentionsAvailable = mentionPolicy.files || mentionPolicy.directories;
   const canMention = workspaceMentionsAvailable || mentionPolicy.resources || mentionPolicy.artifacts || mentionPolicy.sessions;
@@ -2631,6 +2632,12 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
         ...workspaceEntryPaths(workspace.entries),
         ...(matchingWorkspaceMentionIndex?.paths ?? [])
       ])], [matchingWorkspaceMentionIndex?.paths, workspace]);
+  const directoryPasteWorkspaceId = trustedLocalWorkspace && mentionPolicy.directories
+    && mentionCapability?.options.includes("workspace_directory_local") ? workspace?.id : undefined;
+  const directoryPaste = useMemo(() => directoryPasteWorkspaceId === undefined ? undefined : {
+    workspaceId: directoryPasteWorkspaceId,
+    listEntries: (parent: string) => controllerRef.current.listWorkspaceEntries(directoryPasteWorkspaceId, parent, { includeHidden: true })
+  }, [directoryPasteWorkspaceId, sendOwner, workspace?.serverPath]);
   const mentionProviderState = useMemo<ComposerMentionProviderState>(
     () => matchingWorkspaceMentionIndex?.status === "loading"
       ? {
@@ -3033,6 +3040,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
             onPastedTextOpen={setPastedTextTarget}
             workingDirectory={workspace?.serverPath}
             knownWorkspacePaths={knownWorkspacePaths}
+            directoryPaste={directoryPaste}
             resolveRouteReference={(target) => resolveComposerRouteReferenceFromRuntime(controllerRef.current, target, t("session.unnamed"))}
           />
         </PromptRecommendationEditorFrame>

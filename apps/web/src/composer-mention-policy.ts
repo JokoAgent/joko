@@ -10,11 +10,11 @@ export interface ComposerMentionPolicy {
 }
 
 /** Every structured mention kind requires an explicit option in the current profile. */
-export function resolveComposerMentionPolicy(capability: CapabilityView | undefined): ComposerMentionPolicy {
+export function resolveComposerMentionPolicy(capability: CapabilityView | undefined, trustedLocalWorkspace = false): ComposerMentionPolicy {
   const allows = (option: string): boolean => capability?.supported === true && capability.options.includes(option);
   return {
     files: allows("workspace_file"),
-    directories: allows("workspace_directory"),
+    directories: allows("workspace_directory") || trustedLocalWorkspace && allows("workspace_directory_local"),
     lineRanges: allows("workspace_file") && allows("workspace_line_range"),
     resources: allows("resource"),
     artifacts: allows("artifact"),
