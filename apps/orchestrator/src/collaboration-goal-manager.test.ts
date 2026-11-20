@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { backup, DatabaseSync } from "node:sqlite";
+import { DatabaseSync } from "node:sqlite";
 
 import { Code, ConnectError, createClient, createRouterTransport } from "@connectrpc/connect";
 import { COLLABORATION_WORKER_HARD_LIMIT_CODE, CollaborationService, CollaborationWorkerStatus, ErrorInfoSchema, PermissionMode } from "@joko/contracts";
@@ -692,7 +692,7 @@ describe("CollaborationGoalManager", () => {
       expect(fixture.store.getOperation(sessionOperationId)).toMatchObject({ status: "completed", response: result.value });
       expect(fixture.store.findCollaborationWorkerByCreateOperation(input.operationId)).toMatchObject({ status: "provisioning" });
       const source = new DatabaseSync(fixture.store.filePath, { readOnly: true });
-      try { await backup(source, coldPath); }
+      try { source.prepare("VACUUM INTO ?").run(coldPath); }
       finally { source.close(); }
       return result;
     });

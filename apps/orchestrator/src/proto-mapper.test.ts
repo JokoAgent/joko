@@ -388,7 +388,10 @@ describe("proto mapper", () => {
     const publicCapability = toProtoCapability(scoped);
     expect(publicCapability.options?.kind).toMatchObject({ case: "session", value: { serviceNodeOnly: true } });
     expect(fromProtoCapability(publicCapability)).toEqual(scoped);
-    expect(toProtoCapability({ key: "context.compact", supported: true }).options).toBeUndefined();
+    const unscoped = { key: "context.compact", supported: true };
+    const publicUnscoped = toProtoCapability(unscoped);
+    expect(publicUnscoped.options?.kind).toMatchObject({ case: "context", value: { manual: true } });
+    expect(fromProtoCapability(publicUnscoped)).toEqual(unscoped);
   });
 
   it("preserves exact runtime resource kinds in the public Backend capability manifest", () => {

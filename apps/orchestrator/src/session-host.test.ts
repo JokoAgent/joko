@@ -11894,7 +11894,8 @@ describe("SessionHost", () => {
         }
       }
     });
-    expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "test");
+    expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "test", "text");
+    expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "vision", "multimodal");
   });
 
   it("keeps token-priced metered usage in actual cost when the runtime reports no cost", async () => {
@@ -11958,7 +11959,7 @@ describe("SessionHost", () => {
       });
       const fixture = await createFixture(adapter, { usageMoneyKind: () => "actual-cost" });
       fixture.store.upsertModelPriceOverride({ ownerId: "orchestrator", backendId: adapter.id, providerId: "test", modelId: "text",
-        values: { currencyCode: "USD", input: 10, output: 20 } });
+        values: { currencyCode: "USD", input: 10, output: 20, cacheRead: null, cacheWrite: null } });
       const sessionId = (await fixture.host.createSession({ operationId: "create-bound-priced-task", connection: fixture.connection,
         targetId: "target-one", title: "Original bound task", providerId: "test", modelId: "text", effort: "off",
         fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
@@ -12075,7 +12076,7 @@ describe("SessionHost", () => {
       }
     });
     expect(detail).not.toHaveProperty("costMoney");
-    expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "test");
+    expect(usageMoneyKind).toHaveBeenCalledWith(fixture.adapter.id, "test", "text");
     expect(fixture.store.listUsageLedger({ ownerId: "orchestrator" })).toEqual(
       expect.arrayContaining([expect.objectContaining({
         backendId: fixture.adapter.id,

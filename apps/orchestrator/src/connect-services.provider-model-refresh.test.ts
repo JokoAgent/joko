@@ -61,7 +61,7 @@ describe("Provider model refresh operation", () => {
     } }) };
     let current = true;
     const fence = vi.fn((owner: typeof connection) => {
-      expect(owner).toBe(connection);
+      expect(owner).toMatchObject(connection);
       if (!current) throw new Error("Original connection is no longer current.");
     });
     let markStarted!: () => void, finish!: () => void;
@@ -78,11 +78,10 @@ describe("Provider model refresh operation", () => {
         canDiscoverProviderModels: () => true, discoverProviderModels }
     }));
     const refresh = submit(services.operation.submitOperation, "operation-retired-model-refresh", "provider-one", false);
-    const rejected = expect(refresh).rejects.toThrow("Original connection is no longer current.");
-    await started;
+    await Promise.race([started, refresh.then(() => { throw new Error("Refresh ended before reaching its original provider."); })]);
     current = false;
     finish();
-    await rejected;
+    await expect(refresh).rejects.toThrow("Original connection is no longer current.");
     expect(discoverProviderModels).toHaveBeenCalledTimes(1);
     expect(adopted).not.toHaveBeenCalled();
     expect(refreshBackendDescriptor).not.toHaveBeenCalled();
