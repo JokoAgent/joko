@@ -11,6 +11,7 @@ import type { OrchestratorApplication } from "./application.js";
 import { isLoopbackHost, isPrivateLanHost, readTls } from "./config.js";
 import { registerConnectServices } from "./connect-services.js";
 import { registerHostedAgentDesktopService } from "./hosted-agent-desktop-service.js";
+import { registerLocalAgentServices, type LocalAgentApplications } from "./local-agent-service.js";
 import { registerInputHandoffNativeHost } from "./input-handoff/native-host.js";
 import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
 import { EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER, PORTABLE_SESSION_LIMIT_BYTES_HEADER, PORTABLE_SESSION_MEDIA_BYTES_HEADER, SessionService } from "@joko/contracts";
@@ -48,6 +49,7 @@ export const ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY = [
 export async function createPublicServer(application: OrchestratorApplication, options: {
   /** An unadvertised, process-owned loopback bridge for verified Linkspan requests. */
   readonly secureBridge?: boolean;
+  readonly localAgentApplications?: LocalAgentApplications;
 } = {}): Promise<FastifyInstance> {
   const tls = options.secureBridge ? undefined : readTls(application.config);
   const server = Fastify({
@@ -325,6 +327,7 @@ export async function createPublicServer(application: OrchestratorApplication, o
     ...(application.providerGroups ? { groupOptions: application.providerGroups.connectOptions(() => { throw new Error("A current Device route is required."); }) } : {})
   });
   if (application.nativeInputHandoff) await registerInputHandoffNativeHost(server, application.nativeInputHandoff);
+  if (options.localAgentApplications) await registerLocalAgentServices(server, options.localAgentApplications, options.secureBridge === true);
   // Idle projections must not hold the graceful request drain open.
   server.addHook("preClose", async () => { projectionShutdown.abort(); });
   await server.register(fastifyConnectPlugin, {

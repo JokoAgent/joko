@@ -28,6 +28,7 @@ import { withOfflineLinkspanContext } from "./linkspan-offline-context.js";
 import { issuePrivateIrohRelayInvitation } from "./linkspan-iroh-lease.js";
 import { recoverOfflineEndpointIdentity } from "./linkspan-recovery.js";
 import { createHostedAgentPeerPort } from "./hosted-agent-peer-port.js";
+import { LocalAgentApplications } from "./local-agent-service.js";
 import { withProviderGroupPeerPort } from "./provider-group-peer.js";
 import { OrchestratorServiceLifecycle, OrchestratorStartupInterruptedError } from "./service-lifecycle.js";
 import {
@@ -144,7 +145,11 @@ async function main(): Promise<void> {
 
   let startupError: unknown;
   try {
-    const server = lifecycle.registerPublicServer(await createPublicServer(application));
+    const localAgentApplications = desktopHostedPersistent && application.hostedAgents
+      ? new LocalAgentApplications({ store: application.store, connections: application.connections, runtime: application.hostedAgents })
+      : undefined;
+    if (localAgentApplications) application.registerServiceCleanup?.(() => localAgentApplications.close());
+    const server = lifecycle.registerPublicServer(await createPublicServer(application, { localAgentApplications }));
     lifecycle.assertStartupActive();
     const internalServer = lifecycle.registerInternalServer(await createInternalServer(application));
     lifecycle.assertStartupActive();
@@ -155,7 +160,7 @@ async function main(): Promise<void> {
     lifecycle.assertStartupActive();
     await server.listen({ host: config.host, port: config.port });
     lifecycle.assertStartupActive();
-    const bridge = lifecycle.registerTransport(await createPublicServer(application, { secureBridge: true }));
+    const bridge = lifecycle.registerTransport(await createPublicServer(application, { secureBridge: true, localAgentApplications }));
     const bridgeOrigin = await bridge.listen({ host: "127.0.0.1", port: 0 });
     lifecycle.assertStartupActive();
     lifecycle.registerTransport(createLinkspanIngress(application, { backendOrigin: bridgeOrigin, server: server.server }));

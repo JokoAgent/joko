@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "joko/v1/hosted_agent.proto";
+
+// Loopback access for an independently approved application. Application
+// credentials never authenticate Device or Hosted Agent management services.
+service LocalAgentService {
+  rpc RequestLocalAgentAccess(RequestLocalAgentAccessRequest) returns (RequestLocalAgentAccessResponse);
+  rpc ReadLocalAgentAccess(ReadLocalAgentAccessRequest) returns (ReadLocalAgentAccessResponse);
+  rpc CancelLocalAgentAccess(CancelLocalAgentAccessRequest) returns (CancelLocalAgentAccessResponse);
+  rpc ListLocalAgentModels(ListLocalAgentModelsRequest) returns (ListLocalAgentModelsResponse);
+  rpc OpenLocalAgent(OpenLocalAgentRequest) returns (OpenLocalAgentResponse);
+  rpc CallLocalAgent(CallLocalAgentRequest) returns (CallLocalAgentResponse);
+  rpc PollLocalAgents(PollLocalAgentsRequest) returns (PollLocalAgentsResponse);
+  rpc ReplyLocalAgent(ReplyLocalAgentRequest) returns (ReplyLocalAgentResponse);
+  rpc ReadLocalAgentArtifact(ReadLocalAgentArtifactRequest) returns (ReadLocalAgentArtifactResponse);
+  rpc CloseLocalAgent(CloseLocalAgentRequest) returns (CloseLocalAgentResponse);
+}
+
+// Managed Desktop Main submits the original local approval or revocation.
+service DesktopLocalAgentService {
+  rpc ListDesktopLocalAgents(ListDesktopLocalAgentsRequest) returns (ListDesktopLocalAgentsResponse);
+  rpc DecideDesktopLocalAgentAccess(DecideDesktopLocalAgentAccessRequest) returns (DecideDesktopLocalAgentAccessResponse);
+  rpc RevokeDesktopLocalAgentAccess(RevokeDesktopLocalAgentAccessRequest) returns (RevokeDesktopLocalAgentAccessResponse);
+}
+
+message LocalAgentApplication {
+  string client_id = 1;
+  string display_name = 2;
+}
+
+enum LocalAgentAccessState {
+  LOCAL_AGENT_ACCESS_STATE_UNSPECIFIED = 0;
+  LOCAL_AGENT_ACCESS_STATE_PENDING = 1;
+  LOCAL_AGENT_ACCESS_STATE_APPROVED = 2;
+  LOCAL_AGENT_ACCESS_STATE_DENIED = 3;
+}
+
+message RequestLocalAgentAccessRequest { LocalAgentApplication application = 1; }
+message RequestLocalAgentAccessResponse {
+  string request_id = 1;
+  string claim = 2;
+  uint64 expires_at_unix_ms = 3;
+}
+message ReadLocalAgentAccessRequest {
+  string request_id = 1;
+  string claim = 2;
+}
+message ReadLocalAgentAccessResponse {
+  LocalAgentAccessState state = 1;
+  string grant_id = 2;
+  string token = 3;
+}
+message CancelLocalAgentAccessRequest {
+  string request_id = 1;
+  string claim = 2;
+}
+message CancelLocalAgentAccessResponse {}
+
+message DesktopLocalAgentAccessRequest {
+  string request_id = 1;
+  LocalAgentApplication application = 2;
+  uint64 expires_at_unix_ms = 3;
+}
+message DesktopLocalAgentGrant {
+  string grant_id = 1;
+  LocalAgentApplication application = 2;
+  uint64 granted_at_unix_ms = 3;
+  bool retired = 4;
+}
+message ListDesktopLocalAgentsRequest {}
+message ListDesktopLocalAgentsResponse {
+  repeated DesktopLocalAgentAccessRequest requests = 1;
+  repeated DesktopLocalAgentGrant grants = 2;
+}
+message DecideDesktopLocalAgentAccessRequest {
+  string request_id = 1;
+  bool allow = 2;
+}
+message DecideDesktopLocalAgentAccessResponse {}
+message RevokeDesktopLocalAgentAccessRequest { string grant_id = 1; }
+message RevokeDesktopLocalAgentAccessResponse {}
+
+message ListLocalAgentModelsRequest {}
+message ListLocalAgentModelsResponse { repeated HostedAgentBackendCatalog backends = 1; }
+message OpenLocalAgentRequest { OpenHostedAgentRequest open = 1; }
+message OpenLocalAgentResponse { OpenHostedAgentResponse result = 1; }
+message CallLocalAgentRequest { CallHostedAgentRequest call = 1; }
+message CallLocalAgentResponse { CallHostedAgentResponse result = 1; }
+message PollLocalAgentsRequest { PollHostedAgentsRequest poll = 1; }
+message PollLocalAgentsResponse { PollHostedAgentsResponse result = 1; }
+message ReplyLocalAgentRequest { ReplyHostedAgentRequest reply = 1; }
+message ReplyLocalAgentResponse { ReplyHostedAgentResponse result = 1; }
+message ReadLocalAgentArtifactRequest { ReadHostedAgentArtifactRequest read = 1; }
+message ReadLocalAgentArtifactResponse { ReadHostedAgentArtifactResponse result = 1; }
+message CloseLocalAgentRequest { CloseHostedAgentRequest close = 1; }
+message CloseLocalAgentResponse { CloseHostedAgentResponse result = 1; }

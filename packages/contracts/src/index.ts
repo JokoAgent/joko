@@ -37,6 +37,7 @@ export * from "./gen/joko/v1/device_authorization_pb.js";
 export * from "./gen/joko/v1/contact_pb.js";
 export * from "./gen/joko/v1/device_peer_pb.js";
 export * from "./gen/joko/v1/hosted_agent_pb.js";
+export * from "./gen/joko/v1/local_agent_pb.js";
 export * from "./gen/joko/v1/event_pb.js";
 export * from "./gen/joko/v1/extension_pb.js";
 export * from "./gen/joko/v1/interaction_pb.js";

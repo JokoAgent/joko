@@ -263,7 +263,9 @@ import { DesktopWallpaperStore } from "./wallpaper-store.js";
 import { registerDesktopLoginItemIpc } from "./login-item.js";
 import { DesktopMenuBar, createMenuBarSettingsStore, registerMenuBarIpc } from "./menu-bar.js";
 import { verifyMenuBarHelper } from "./menu-bar-native-host.js";
-import { isMenubarSupportedPlatform } from "@joko/contracts";
+import { DesktopLocalAgentService, isMenubarSupportedPlatform } from "@joko/contracts";
+import { createClient, type Client } from "@connectrpc/connect";
+import { withManagedDesktopHostAuthority } from "./managed-desktop-host-authority.js";
 import { DESKTOP_WALLPAPER_SCHEME, createDesktopWallpaperProtocolHandler } from "./wallpaper-protocol.js";
 import { DesktopMcpAppHost, MCP_APP_CAPTURE, MCP_APP_SCHEME } from "./mcp-app-host.js";
 import { DesktopExtensionOAuthHost } from "./extension-oauth-host.js";
@@ -8668,6 +8670,41 @@ function registerIpc(): void {
   desktopLinkspan.register();
   desktopMcpApps.register();
   desktopExtensionOAuth.register();
+  ipcMain.handle(DESKTOP_CHANNELS.localAgentsList, (event, occurrence: unknown) =>
+    withLocalDesktopAgentManagement(event, occurrence, async (rpc, signal, origin) =>
+      ({ origin, applications: await rpc.listDesktopLocalAgents({}, { signal }) })));
+  ipcMain.handle(DESKTOP_CHANNELS.localAgentsReview, (event, occurrence: unknown, requestId: unknown) => {
+    if (typeof requestId !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(requestId)) throw new TypeError("The local application request ID is invalid.");
+    const owner = assertFocusedTrustedIpcSender(event);
+    return withLocalDesktopAgentManagement(event, occurrence, async (rpc, signal, _origin, assertCurrent) => {
+      const snapshot = await rpc.listDesktopLocalAgents({}, { signal });
+      const request = snapshot.requests.find(candidate => candidate.requestId === requestId);
+      if (!request?.application) throw new Error("The local application request has ended.");
+      assertCurrent();
+      assertFocusedTrustedIpcSender(event);
+      const remaining = Number(request.expiresAtUnixMs) - Date.now();
+      if (remaining <= 0) throw new Error("The local application request has expired.");
+      const chinese = applicationMenuLocale === "zh-CN";
+      const choice = await dialog.showMessageBox(owner, {
+        type: "question",
+        message: chinese ? "允许此本机应用使用 Joko Agent？" : "Allow this local application to use Joko Agent?",
+        detail: `${request.application.displayName}\n${request.application.clientId}\n\n${chinese
+          ? "此应用可在独立的任务中使用本机模型及供应商配额。"
+          : "This application can use this computer's models and provider quota in isolated tasks."}`,
+        buttons: chinese ? ["取消", "拒绝", "允许"] : ["Cancel", "Deny", "Allow"],
+        defaultId: 0, cancelId: 0, signal: AbortSignal.any([signal, AbortSignal.timeout(remaining)])
+      });
+      assertCurrent();
+      if (choice.response === 1 || choice.response === 2) await rpc.decideDesktopLocalAgentAccess({ requestId, allow: choice.response === 2 }, { signal });
+    });
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.localAgentsRevoke, (event, occurrence: unknown, grantId: unknown) => {
+    if (typeof grantId !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(grantId)) throw new TypeError("The local application grant ID is invalid.");
+    assertFocusedTrustedIpcSender(event);
+    return withLocalDesktopAgentManagement(event, occurrence, async (rpc, signal) => {
+      await rpc.revokeDesktopLocalAgentAccess({ grantId }, { signal });
+    });
+  });
   ipcMain.handle(DESKTOP_CHANNELS.codeHostLoginStatus, (event, occurrence: unknown, value: unknown) => {
     const document = assertCurrentMainApplicationDocumentSender(event, occurrence);
     return desktopCodeHostLogin.status(document, parseDesktopCodeHostLoginScope(value), () => {
@@ -11533,6 +11570,42 @@ function managedDesktopHostAuthority(profileId: string, serverId: string, signal
       sameManagedOrchestratorConnection(connection, candidate) &&
       sameManagedOrchestratorConnection(runtime.connection, candidate)
   };
+}
+
+async function withLocalDesktopAgentManagement<T>(event: IpcMainInvokeEvent, occurrence: unknown,
+  action: (rpc: Client<typeof DesktopLocalAgentService>, signal: AbortSignal, origin: string, assertCurrent: () => void) => Promise<T>): Promise<T> {
+  const assertDocument = () => { assertCurrentMainApplicationDocumentSender(event, occurrence); };
+  assertDocument();
+  const status = managedOrchestratorStatus;
+  if (status.state !== "ready") throw new Error("The local Joko node is unavailable.");
+  const captured = status.connection;
+  const lifetime = new AbortController();
+  const authority = managedDesktopHostAuthority(captured.profileId, captured.serverId, lifetime.signal);
+  const assertCurrent = () => {
+    lifetime.signal.throwIfAborted();
+    assertDocument();
+    if (!authority.isAuthorityCurrent(captured)) throw new Error("The local Joko node changed.");
+  };
+  const contents = event.sender;
+  const abort = () => lifetime.abort();
+  const navigate = (_event: unknown, _url: string, inPlace: boolean, mainFrame: boolean) => {
+    if (mainFrame && !inPlace) abort();
+  };
+  contents.on("did-start-navigation", navigate);
+  contents.once("destroyed", abort);
+  contents.once("render-process-gone", abort);
+  try {
+    return await withManagedDesktopHostAuthority(authority, async transport => {
+      assertCurrent();
+      const result = await action(createClient(DesktopLocalAgentService, transport), lifetime.signal, captured.origin, assertCurrent);
+      assertCurrent();
+      return result;
+    });
+  } finally {
+    contents.removeListener("did-start-navigation", navigate);
+    contents.removeListener("destroyed", abort);
+    contents.removeListener("render-process-gone", abort);
+  }
 }
 
 function nativeFileActionScope(event: IpcMainInvokeEvent): NativeFileActionScope {
