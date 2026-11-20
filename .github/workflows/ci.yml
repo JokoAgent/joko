@@ -402,6 +402,24 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+      - name: Verify Agent import on published local Codex
+        id: codex_partner_import
+        if: ${{ !cancelled() && steps.codex_native.outcome == 'success' && steps.codex_sandbox.outcome == 'success' }}
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          test -n "$JOKO_CODEX_HOSTED_TEST_BINARY"
+          pnpm --filter @joko/e2e exec vitest run src/partner-import.e2e.test.ts -t 'published Codex' 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/codex-partner-import.log"
+
+      - name: Upload the published Codex Agent import result
+        if: ${{ always() && (steps.codex_partner_import.outcome == 'success' || steps.codex_partner_import.outcome == 'failure') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-codex-partner-import-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/codex-partner-import.log
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Check Windows SSH key permissions
         id: ssh_key_permissions
         if: ${{ matrix.workload == 'product' && (inputs.scope == 'windows-native' || inputs.scope == 'desktop-product') && !cancelled() && steps.source_check.outcome == 'success' && runner.os == 'Windows' }}

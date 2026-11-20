@@ -283,6 +283,7 @@ import { PartnerTodoManager, PartnerTodoTools } from "./partner-todos.js";
 import { PartnerMessagingRuntime, PartnerMessagingTools } from './partner-messaging.js';
 import { PartnerRoutineTools } from "./partner-routine-tools.js";
 import { PartnerImportManager } from "./partner-import-manager.js";
+import { PartnerImportCommandTools } from "./partner-import-command-tools.js";
 import { partnerPackageOpening, partnerPackageStarterAvailable } from "./partner-package-opening.js";
 import { PartnerImportStorage } from "./partner-import-storage.js";
 import { PartnerImportRuntime } from "./partner-import-runtime.js";
@@ -2938,6 +2939,9 @@ export async function createOrchestratorApplication(
     groupHomeTarget: privateHomeTarget, isGroupSession: sessionId => partnerStore.getSessionLink(sessionId)?.role === "group" });
   startupPartnerImports = partnerImports; startupPartnerImportRuntime = partnerImportRuntime;
   const unregisterPartnerImportTools = mcpRouter.registerBridgeToolProvider(partnerImportRuntime);
+  const unregisterPartnerImportCommand = mcpRouter.registerBridgeToolProvider(new PartnerImportCommandTools({
+    store, profiles: partnerStore, partners, imports: partnerImports, host: sessionHost
+  }));
   partnerRoutines.setImportedRuntime(partnerImportRuntime);
   partnerConnections = new PartnerConnectionsManager(partners, partnerStore, store, partnerConnectionPreferences, mcpRouter,
     (sessionId, targetId, id) => toolPolicies.enabledForSession(sessionId, targetId, id), piResources,
@@ -3947,6 +3951,7 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterPartnerSessionTaskTools());
         await attempt(() => partnerImportRuntime.close());
         await attempt(() => unregisterPartnerImportTools());
+        await attempt(() => unregisterPartnerImportCommand());
         await attempt(() => unregisterPartnerSkillTools());
         await attempt(() => unregisterPartnerCapabilityTools());
         await attempt(() => unregisterPartnerProfileTools());

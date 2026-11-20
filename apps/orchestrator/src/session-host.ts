@@ -11313,7 +11313,7 @@ export class SessionHost {
     const pending = this.#pendingInteractions.get(id);
     if (pending?.approval !== undefined) {
       if (pending.approval.connectionId !== connectionId) {
-        throw new AuthorizationError("This approval belongs to the Desktop connection that started the task.");
+        throw new AuthorizationError("This approval belongs to the connection that started the task.");
       }
       pending.approval.assertCurrent();
     }
@@ -17001,11 +17001,26 @@ export class SessionHost {
     return this.#authorizeMcpTool(sessionId, serverId, toolName, args, signal, true);
   }
 
-  async requestSystemContactsApproval(request: {
+  requestSystemContactsApproval(request: {
     readonly queueId: string;
     readonly connectionId: string;
     readonly generation: number;
     readonly action: "import" | "export";
+    readonly summary: string;
+    readonly assertCurrent: () => void;
+  }, signal?: AbortSignal): Promise<boolean> {
+    return this.requestOwnerToolApproval({ ...request, tool: "macOS Contacts",
+      title: request.action === "import" ? "Read from macOS Contacts?" : "Write to macOS Contacts?",
+      summary: redactSecrets(request.summary).slice(0, 2_000), id: `system-contacts-permission-${randomUUID()}` }, signal);
+  }
+
+  async requestOwnerToolApproval(request: {
+    readonly id: string;
+    readonly queueId: string;
+    readonly connectionId: string;
+    readonly generation: number;
+    readonly title: string;
+    readonly tool: string;
     readonly summary: string;
     readonly assertCurrent: () => void;
   }, signal?: AbortSignal): Promise<boolean> {
@@ -17015,9 +17030,8 @@ export class SessionHost {
     const deadline = AbortSignal.timeout(120_000);
     const approvalSignal = signal === undefined ? deadline : AbortSignal.any([signal, deadline]);
     const answer = await this.requestInteraction(queue.sessionId, request.generation, queue.backendInstanceGeneration, {
-      id: `system-contacts-permission-${randomUUID()}`, kind: "permission", risk: "medium",
-      title: request.action === "import" ? "Read from macOS Contacts?" : "Write to macOS Contacts?",
-      toolName: "macOS Contacts", summary: redactSecrets(request.summary).slice(0, 2_000),
+      id: request.id, kind: "permission", risk: "medium", title: request.title,
+      toolName: request.tool, summary: request.summary,
       choices: ["allow_once", "deny_once"]
     }, queue.runId, queue.attemptId, queue.operationId, approvalSignal, {
       connectionId: request.connectionId, assertCurrent: request.assertCurrent

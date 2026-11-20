@@ -6,7 +6,7 @@ import {
   deserializeImportSnapshotAsync, discoverImportSources, inspectImportSource, previewImportRedactions, fingerprint,
   reserveSnapshotItems, retainedImportRedactions, selectedImportRedactions, serializeImportSnapshotAsync, emptyImportedEnvironment, importSubmissionFingerprint,
   transferPartnerImport, validateImportRequestIdentity, validateImportSelection, importFailureCode, changeSourceAutomationState,
-  type AgentImportPreview, type AgentImportResult, type AgentImportSelection, type AgentImportSource,
+  type AgentImportEntry, type AgentImportPreview, type AgentImportResult, type AgentImportSelection, type AgentImportSource,
   type ImportItem, type ImportReceipt, type ImportSnapshot, type ImportSource, type TransferDeps,
 } from "@joko/agent-import";
 import { PartnerStoreError, type PartnerProfileRecord } from "@joko/store";
@@ -21,6 +21,11 @@ import { localizedPartnerPackageEntry, type PartnerPackageEntry, type PartnerPac
 export interface PartnerImportController {
   readonly ownerKey: string;
   assertCurrent(): void;
+}
+export interface PartnerImportReview {
+  readonly name: string;
+  readonly sourceName: string;
+  readonly entries: readonly Pick<AgentImportEntry, "id" | "name">[];
 }
 export interface PartnerImportEffectContext {
   readonly snapshot: ImportSnapshot;
@@ -211,7 +216,8 @@ export class PartnerImportManager {
   entryNames(requestId: string): Readonly<Record<string, string>> { this.#assert(); return this.options.storage.readReceipt(requestId)?.entryNames ?? {}; }
 
   /** The accepted job uses service/Partner fences; closing a transport does not cancel saved work. */
-  async start(selection: AgentImportSelection, scope: PartnerImportController): Promise<AgentImportResult> {
+  async start(selection: AgentImportSelection, scope: PartnerImportController,
+    approve?: (review: PartnerImportReview) => Promise<void>): Promise<AgentImportResult> {
     const assertController = this.#controller(scope); assertController();
     const submissionHash = importSubmissionFingerprint(selection);
     const prior = this.options.storage.readReceipt(selection.requestId);
@@ -228,7 +234,15 @@ export class PartnerImportManager {
       snapshot = this.#owned(this.#previews, selection.previewId, scope.ownerKey);
       creationJson = this.options.prepareCreation({ ...selection, name: createEnvironmentRedactor(snapshot.publicationRedactions ?? previewImportRedactions(snapshot.items))(selection.name) }, snapshot.nativePackage !== undefined);
     }
-    validateImportSelection(selection, snapshot); await validateImportRequestIdentity(snapshot, selection, prior); assertController();
+    const selected = validateImportSelection(selection, snapshot);
+    await validateImportRequestIdentity(snapshot, selection, prior); assertController();
+    if (approve !== undefined && prior === undefined && !this.#jobs.has(selection.requestId)) {
+      const redact = createEnvironmentRedactor(snapshot.publicationRedactions ?? previewImportRedactions(snapshot.items));
+      await approve({ name: redact(selection.name), sourceName: redact(snapshot.source.name),
+        entries: selected.map(({ view }) => ({ id: view.id, name: redact(view.name) })) });
+      assertController();
+      if (this.#owned(this.#previews, selection.previewId, scope.ownerKey) !== snapshot) throw new AgentImportError("SELECTION_CHANGED");
+    }
     const result = await this.#dispatch(snapshot, selection, creationJson); assertController(); return this.#present(result);
   }
 

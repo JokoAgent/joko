@@ -6,14 +6,197 @@ import { basename, dirname, join, sep } from "node:path";
 import { Code } from "@connectrpc/connect";
 import { afterEach, expect, it, vi } from "vitest";
 import { createPartnerImportApi, importSelectionInput, PartnerImportCategory, PartnerImportCheckStatus, PartnerImportStatus, PartnerInitializationErrorCode,
-  PartnerInitializationState, PermissionMode, RoutineRunStatus } from "@joko/contracts";
+  PartnerInitializationState, OperationState, PermissionDecisionKind, PermissionMode, RoutineRunStatus } from "@joko/contracts";
 import { RealPiSystemFixture, REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID } from "./real-pi-fixture.js";
 import { waitFor } from "./fixture.js";
-import { queueRunIdFrom, sendInputMutation, submit } from "./operations.js";
+import { createSessionMutation, queueRunIdFrom, resolvePermissionMutation, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 import { installLocalSkill } from "./skill-system-fixture.js";
 
 let fixture: RealPiSystemFixture | undefined;
 afterEach(async () => { await fixture?.close({ removeRoot: true }); fixture = undefined; });
+
+const verifiedCodex = process.env.GITHUB_ACTIONS === "true" ? process.env.JOKO_CODEX_HOSTED_TEST_BINARY : undefined;
+const claudeFixtureModel = "claude-sonnet-4-6";
+
+it.each([
+  { backendId: "pi", native: "published Pi" },
+  { backendId: "claude-code", native: "bundled Claude SDK" }
+] as const)("imports selected local Agent entries from the $native tool with the original Owner's approval and durable receipt",
+  { timeout: 100_000 }, async ({ backendId }) => exerciseAgentImport(backendId));
+
+it.skipIf(verifiedCodex === undefined)("imports selected local Agent entries from the published Codex tool with the original Owner's approval and durable receipt",
+  { timeout: 120_000 }, async () => exerciseAgentImport("codex"));
+
+async function exerciseAgentImport(backendId: "pi" | "claude-code" | "codex"): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), "joko-command-import-"));
+  const source = join(root, ".hermes");
+  const secret = "fixture-command-import-secret-abcdef012345";
+  await mkdir(join(source, "memories"), { recursive: true });
+  await writeFile(join(source, "config.yaml"), "name: Local analyst\n");
+  await writeFile(join(source, ".env"), `ACCESS_TOKEN=${secret}\n`);
+  await writeFile(join(source, "SOUL.md"), `Source identity ${secret}\nPRIVATE_IDENTITY_MARKER`);
+  await writeFile(join(source, "memories", "notes.md"), "UNSELECTED_MEMORY_MARKER");
+  const claude = backendId === "claude-code";
+  const codex = backendId === "codex";
+  const modelId = claude ? claudeFixtureModel : REAL_PI_MODEL_ID;
+  const serverId = "joko_partner_import";
+  const mcpName = claude ? `joko_${createHash("sha256").update(serverId).digest("hex").slice(0, 24)}` : serverId;
+  const toolName = `mcp__${mcpName}__import_agent`;
+  let toolArguments: Readonly<Record<string, unknown>> | undefined;
+  let catalogToolName: string | undefined;
+  let searchedForCodexTool = false;
+  fixture = await RealPiSystemFixture.start({ rootDirectory: root, enableInternalServer: true,
+    ...(claude ? { providerApi: "anthropic-messages" as const } : {}),
+    ...(codex ? { codexExecutable: verifiedCodex! } : {}),
+    agentImportSources: { home: root, environment: {} }, providerResponder: ({ request }) => {
+      const messages = request.body["messages"] as readonly { role: string }[];
+      if (toolArguments === undefined) return { kind: "text", text: "The local import tool returned." };
+      type ImportSchema = { properties?: { operation?: { enum: string[] } } };
+      let requestedToolName = toolName;
+      if (codex) {
+        const tools = request.body["tools"] as readonly { function?: { name: string; parameters?: ImportSchema } }[];
+        const advertised = tools?.find(item => item.function?.name.endsWith("__import_agent"))?.function;
+        if (!advertised && !searchedForCodexTool && tools?.some(item => item.function?.name === "tool_search")) {
+          searchedForCodexTool = true;
+          return { kind: "tool", name: "tool_search", arguments: { query: "import_agent: import a local Hermes or OpenClaw agent as a Partner", limit: 5 } };
+        }
+        expect(advertised?.parameters?.properties?.operation?.enum).toEqual(["sources", "preview", "start", "status"]);
+        requestedToolName = catalogToolName = advertised!.name;
+      }
+      if (claude) {
+        const definitions = request.body["tools"] as readonly { name: string; input_schema?: ImportSchema }[];
+        const tool = definitions?.find(definition => definition.name === toolName);
+        expect(tool?.input_schema?.properties?.operation?.enum).toEqual(["sources", "preview", "start", "status"]);
+        catalogToolName = toolName;
+      }
+      if (backendId === "pi" && messages.at(-1)?.role === "tool") return { kind: "text", text: "The local import tool returned." };
+      const args = toolArguments;
+      toolArguments = undefined;
+      return { kind: "tool", name: requestedToolName, arguments: args };
+    } });
+  const { store, providers, refreshBackendDescriptor } = fixture.application;
+  if (backendId !== "pi") {
+    const provider = providers!.resolveInferenceRoute("pi", REAL_PI_PROVIDER_ID, REAL_PI_MODEL_ID);
+    expect(provider?.baseUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+(?:\/v1)?$/u);
+    await providers!.upsert({
+      backendId, credentialOrigin: "",
+      provider: { id: REAL_PI_PROVIDER_ID, baseUrl: provider!.baseUrl, api: claude ? "anthropic-messages" : "openai-completions", keyless: true,
+        models: [{ id: modelId, name: "Local import fixture model", contextWindow: 64_000, maxTokens: 4_096 }] },
+      displayName: "Local import fixture", kind: "local_keyless", credentialBindings: {},
+      enabled: true, supportsLogin: false, supportsLogout: false, supportsRefresh: false
+    });
+    await refreshBackendDescriptor(backendId);
+    expect(providers!.resolveInferenceRoute(backendId, REAL_PI_PROVIDER_ID, modelId)).toMatchObject({
+      modelId, api: claude ? "anthropic-messages" : "openai-completions", baseUrl: provider!.baseUrl
+    });
+  }
+  const owner = await fixture.pair("Original import Owner");
+  const other = await fixture.pair("Other paired controller");
+  const { clients, connectionId } = owner;
+  const directory = (await clients.partner.getPartnerDirectory({})).directory!;
+  await clients.partner.updatePartnerDefaults({ expectedDirectoryRevision: directory.revision, capabilities: {
+    modelChain: [{ backendId: "pi", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, fastMode: false }],
+    permissionMode: PermissionMode.BYPASS_PERMISSIONS, planMode: false
+  } });
+  const targetId = backendId === "pi" ? "workspace-real-pi" : "workspace-real-pi:" + backendId;
+  const target = store.getTarget(targetId);
+  store.upsertTarget({ ...target.descriptor, trusted: true }, target.metadata);
+  const createTask = async () => {
+    const created = await submit(clients.operation, connectionId, createSessionMutation({ targetId, backendId,
+      providerId: REAL_PI_PROVIDER_ID, modelId, permissionMode: PermissionMode.BYPASS_PERMISSIONS }));
+    expect(created.state, JSON.stringify({ backendId, modelId, error: created.error?.code,
+      message: created.error?.message, phase: created.error?.phase, mayHaveChanged: created.error?.stateMayHaveChanged,
+      loopbackRequests: fixture!.providerRequests.length })).toBe(OperationState.SUCCEEDED);
+    return sessionIdFrom(created);
+  };
+  const sessionId = await createTask(), otherSessionId = await createTask();
+  const invoke = async (args: Readonly<Record<string, unknown>>, taskId = sessionId) => {
+    toolArguments = args;
+    searchedForCodexTool = false;
+    const generation = BigInt(store.getSession(taskId).descriptor.binding.generation);
+    const accepted = await submit(clients.operation, connectionId, sendInputMutation(taskId, generation, `Use the local import tool to ${args.operation}.`));
+    const runId = queueRunIdFrom(accepted);
+    const result = async () => {
+      const read = () => store.getRun(runId).descriptor.state;
+      expect(await waitFor(async () => read(), state => state === "completed" || state === "failed", "the original import tool turn", 25_000)).toBe("completed");
+      const event = store.listEvents({ sessionId: taskId }).find(item => item.runId === runId && item.payload.type === "tool_result"
+        && (codex ? /^joko_[^/]+\/import_agent$/u.test(item.payload.name) : item.payload.name === toolName));
+      if (event?.payload.type !== "tool_result") throw new Error(`${backendId} did not receive the import tool result from its native turn.`);
+      if (codex) {
+        const response = JSON.parse(event.payload.output) as { content?: readonly { type: string; text?: string }[] };
+        const output = response.content?.find(part => part.type === "text")?.text;
+        if (output === undefined) throw new Error("Codex did not return the original MCP text result.");
+        return { ...event.payload, output };
+      }
+      return event.payload;
+    };
+    return { runId, result };
+  };
+  const call = async <T>(args: Readonly<Record<string, unknown>>): Promise<T> => {
+    const result = await (await invoke(args)).result();
+    expect(result.isError, result.output).toBe(false);
+    return JSON.parse(result.output) as T;
+  };
+  const [listed] = await call<Array<{ id: string; kind: string; name: string }>>({ operation: "sources" });
+  expect(listed).toMatchObject({ kind: "hermes", name: "Local analyst" });
+  const crossPreview = await (await invoke({ operation: "preview", sourceId: listed!.id }, otherSessionId)).result();
+  expect(crossPreview).toMatchObject({ isError: true, output: expect.stringContaining("PREVIEW_EXPIRED") });
+  const preview = await call<{ id: string; requestId: string; entries: Array<{ id: string; index: number; category: string }> }>({ operation: "preview", sourceId: listed!.id });
+  expect(JSON.stringify(preview)).not.toMatch(/PRIVATE_IDENTITY_MARKER|UNSELECTED_MEMORY_MARKER|avatarImageBase64/u);
+  const identity = preview.entries.find(entry => entry.category === "personality")!;
+  const selection = { previewId: preview.id, requestId: preview.requestId, name: "Selected local analyst",
+    entryRanges: [[identity.index, identity.index]], takeover: false };
+
+  const start = async () => {
+    const started = await invoke({ operation: "start", selection });
+    const open = () => store.listInteractions({ sessionId, runId: started.runId, status: "open" });
+    const [confirmation] = await waitFor(async () => open(), rows => rows.length === 1, "the original import selection approval", 10_000);
+    expect(confirmation?.payload).toMatchObject({ kind: "permission", title: "Import the selected entries?",
+      summary: expect.stringContaining(`(${identity.id})`) });
+    expect(JSON.stringify(confirmation?.payload)).not.toContain(secret);
+    const answer = (device: typeof owner, decision: PermissionDecisionKind) => submit(device.clients.operation, device.connectionId,
+      resolvePermissionMutation({ connectionId: device.connectionId, interactionId: confirmation!.id,
+        generation: BigInt(confirmation!.generation), decision }));
+    return { answer, opened: open, result: started.result };
+  };
+  const denied = await start();
+  let denial: Awaited<ReturnType<typeof denied.answer>> | undefined;
+  let deniedResult: Awaited<ReturnType<typeof denied.result>> | undefined;
+  try {
+    await expect(denied.answer(other, PermissionDecisionKind.ALLOW_ONCE)).rejects.toMatchObject({
+      code: Code.Unauthenticated, rawMessage: "This approval belongs to the connection that started the task."
+    });
+    expect(denied.opened()).toHaveLength(1);
+  } finally {
+    if (denied.opened().length === 1) {
+      denial = await denied.answer(owner, PermissionDecisionKind.DENY_ONCE);
+      deniedResult = await denied.result();
+    }
+  }
+  expect(denial?.state).toBe(OperationState.SUCCEEDED);
+  expect(deniedResult).toMatchObject({ isError: true, output: expect.stringContaining("IMPORT_SELECTION_DENIED") });
+  expect((await clients.partnerImport.getPartnerImportStatus({ requestId: preview.requestId })).result).toBeUndefined();
+
+  const approved = await start();
+  expect((await approved.answer(owner, PermissionDecisionKind.ALLOW_ONCE)).state).toBe(OperationState.SUCCEEDED);
+  expect(await approved.result()).toMatchObject({ isError: false });
+  const read = () => clients.partnerImport.getPartnerImportStatus({ requestId: preview.requestId });
+  const saved = (await waitFor(read, value => value.result?.status === PartnerImportStatus.COMPLETE, "the same durable import receipt", 30_000)).result!;
+  expect(saved).toMatchObject({ saved: true, savedEntryIds: [identity.id] });
+  expect((await clients.partner.getPartner({ partnerId: saved.partnerId })).partner).toMatchObject({ displayName: selection.name });
+
+  // Retire the original preview and recover the accepted job through its original receipt.
+  await call({ operation: "preview", sourceId: listed!.id });
+  expect(await call({ operation: "status", requestId: preview.requestId })).toMatchObject({ partnerId: saved.partnerId, status: "complete" });
+  expect(await call({ operation: "start", selection })).toMatchObject({ partnerId: saved.partnerId, status: "complete" });
+  const wrongTask = await (await invoke({ operation: "status", requestId: preview.requestId }, otherSessionId)).result();
+  expect(wrongTask).toMatchObject({ isError: true, output: expect.stringContaining("IMPORT_RECEIPT_MISSING") });
+  const requests = JSON.stringify(fixture.providerRequests.map(({ body }) => body));
+  if (backendId !== "pi") expect(catalogToolName).toBeDefined();
+  expect(requests).toContain(catalogToolName ?? toolName);
+  expect(requests).not.toContain(secret);
+}
+
 it("imports into the production HTTP/SQLite/published runtime, uses its full redacted resources and routines without a UI and restores the same task after restart", async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-real-pi-system-e2e-")); const native = join(root, ".hermes");
   await mkdir(join(native, "skills", "reports"), { recursive: true }); await mkdir(join(native, "memories")); await mkdir(join(native, "cron"));

@@ -52,6 +52,7 @@ export type RealPiProviderResponder = (input: {
 
 export interface RealPiSystemFixtureOptions {
   readonly agentImportSources?: OrchestratorApplicationDependencies["agentImportSources"];
+  readonly codexExecutable?: string;
   readonly artifactClock?: () => number;
   readonly rootDirectory?: string;
   readonly keepRoot?: boolean;
@@ -214,6 +215,7 @@ export class RealPiSystemFixture {
         internalOrigin: `http://127.0.0.1:${internalPort}`,
         dataDirectory,
         databasePath: join(dataDirectory, "orchestrator.db"),
+        ...(options.codexExecutable === undefined ? {} : { codexExecutable: options.codexExecutable }),
         allowInsecureLoopback: true,
         allowInsecureLan: false,
         lanDiscoveryEnabled: false,
@@ -408,6 +410,11 @@ export async function startLocalProvider(
 ): Promise<Server> {
   const overflowRequests = new Set(overflowRequestNumbers);
   const server = createServer((request, response) => {
+    if (request.method === "POST" && api === "anthropic-messages" && request.url?.split("?")[0] === "/v1/messages/count_tokens") {
+      request.resume();
+      response.writeHead(200, { "content-type": "application/json" }).end('{"input_tokens":7}');
+      return;
+    }
     if (request.method !== "POST" || (api === "anthropic-messages"
       ? request.url?.split("?")[0] !== "/v1/messages" : request.url !== "/v1/chat/completions")) {
       response.writeHead(404).end();
@@ -479,7 +486,8 @@ export async function startLocalProvider(
       if (api === "anthropic-messages") {
         response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" });
         const emit = (type: string, fields: Record<string, unknown>) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`);
-        emit("message_start", { message: { id, type: "message", role: "assistant", model: REAL_PI_MODEL_ID, content: [], stop_reason: null,
+        const model = typeof body["model"] === "string" ? body["model"] : REAL_PI_MODEL_ID;
+        emit("message_start", { message: { id, type: "message", role: "assistant", model, content: [], stop_reason: null,
           stop_sequence: null, usage: { input_tokens: usage.promptTokens, output_tokens: 0 } } });
         let index = 0;
         if (reply.thinking !== undefined) {
