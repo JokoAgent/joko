@@ -155,9 +155,11 @@ describe("ObjectiveManager", () => {
     settleRun(fixture.store, pending, "completed", verdict("complete", "The README now documents the flags", refinedText));
     await fixture.manager.onRunSettled({ sessionId: fixture.sessionId, runId: pending.runId, outcome: "completed" });
     const text = choiceId === "refinement" ? refinedText : originalText;
-    expect(fixture.store.getObjective(fixture.sessionId)).toMatchObject({ status: "complete", text, turnsUsed: 1 });
-    expect(fixture.store.listEvents({ sessionId: fixture.sessionId }).some(({ payload }) => payload.type === "objective_lifecycle"
-      && payload.action === "completed" && payload.objectiveText === text)).toBe(true);
+    const objective = fixture.store.getObjective(fixture.sessionId);
+    expect(objective).toMatchObject({ status: "complete", text, turnsUsed: 1 });
+    const completions = fixture.store.listEvents({ sessionId: fixture.sessionId }).filter(({ payload }) =>
+      payload.type === "objective_lifecycle" && payload.action === "completed");
+    expect(completions).toMatchObject([{ payload: { status: "complete", ownerGeneration: objective.ownerGeneration, turnsUsed: 1 } }]);
     expect(fixture.host.admissions).toHaveLength(1);
   });
 

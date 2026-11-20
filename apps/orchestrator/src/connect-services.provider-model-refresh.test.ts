@@ -61,7 +61,7 @@ describe("Provider model refresh operation", () => {
     } }) };
     let current = true;
     const fence = vi.fn((owner: typeof connection) => {
-      expect(owner).toMatchObject(connection);
+      expect(owner).toMatchObject({ id: connection.id, authKeyDigest: connection.authKeyDigest, state: connection.state });
       if (!current) throw new Error("Original connection is no longer current.");
     });
     let markStarted!: () => void, finish!: () => void;

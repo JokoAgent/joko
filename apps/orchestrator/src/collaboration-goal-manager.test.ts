@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 
 import { Code, ConnectError, createClient, createRouterTransport } from "@connectrpc/connect";
 import { COLLABORATION_WORKER_HARD_LIMIT_CODE, CollaborationService, CollaborationWorkerStatus, ErrorInfoSchema, PermissionMode } from "@joko/contracts";
@@ -683,7 +682,7 @@ describe("CollaborationGoalManager", () => {
     });
     const sessionOperationId = collaborationWorkerSessionOperationId(input.operationId);
     const directory = dirname(fixture.store.filePath);
-    const coldPath = join(directory, "cold-worker-committed.db");
+    const coldPath = `${fixture.store.filePath}.history-maintenance.work`;
     const createService = fixture.host.createServiceSession.bind(fixture.host);
     vi.spyOn(fixture.host, "createServiceSession").mockImplementationOnce(async request => {
       const result = await createService(request);
@@ -691,9 +690,8 @@ describe("CollaborationGoalManager", () => {
       expect(fixture.store.getOperation(input.operationId).status).toBe("started");
       expect(fixture.store.getOperation(sessionOperationId)).toMatchObject({ status: "completed", response: result.value });
       expect(fixture.store.findCollaborationWorkerByCreateOperation(input.operationId)).toMatchObject({ status: "provisioning" });
-      const source = new DatabaseSync(fixture.store.filePath, { readOnly: true });
-      try { source.prepare("VACUUM INTO ?").run(coldPath); }
-      finally { source.close(); }
+      const revision = fixture.store.health().revision;
+      await expect(fixture.store.createHistoryMaintenanceCopy({ workingPath: coldPath, expectedRevision: revision })).resolves.toBe(true);
       return result;
     });
     const original = await fixture.manager.createWorker(input);
