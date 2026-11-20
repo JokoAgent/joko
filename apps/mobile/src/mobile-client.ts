@@ -581,6 +581,8 @@ export interface MobileTaskSendObserver {
   /** Caller-owned durable Operation identity, allocated before dispatch. */
   readonly operationId?: string;
   readonly deliveryMode?: QueueDeliveryMode;
+  /** A separate text action leaves the composer's retained input intact. */
+  readonly keepComposerDraft?: boolean;
   /** Presentation of the original input, before any disk/upload wait. */
   readonly onProgress?: (progress: import("./mobile-pending-send").MobilePendingSendProgress) => void;
   /** Presentation-only guard for the exact accepted input's own projection refresh. */
@@ -11345,8 +11347,11 @@ export class MobileClient {
   }
 
   async send(draft: MobileComposerDraft, observer: MobileTaskSendObserver = {}): Promise<boolean> {
+    if (observer.keepComposerDraft && draft.attachments.length > 0) throw new Error("A separate text action cannot attach composer files.");
     if (!this.#joinedTask && this.#taskOutbox && (this.#state.status === "offline"
-      || this.taskOutboxItems().some(record => record.state !== "accepted"))) return this.#enqueueTaskOutbox(draft, observer);
+      || this.taskOutboxItems().some(record => record.state !== "accepted"))) {
+      return observer.keepComposerDraft ? false : this.#enqueueTaskOutbox(draft, observer);
+    }
     const exactDraft = normalizeMobileComposerDraft(draft);
     const sentAt = this.now();
     const sessionId = this.#state.selectedId;
@@ -11401,8 +11406,10 @@ export class MobileClient {
     if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
     observer.onProgress?.({ phase: "preparing", input: sendDraft, sentAt });
     const draftIdentity = { profileId: this.taskDraftProfileId()!, sessionId };
-    this.composerDrafts.save(draftIdentity, sendDraft);
-    await this.composerDrafts.flush(draftIdentity);
+    if (!observer.keepComposerDraft) {
+      this.composerDrafts.save(draftIdentity, sendDraft);
+      await this.composerDrafts.flush(draftIdentity);
+    }
     if (!isCurrent()) return false;
     const providerGroupRebalance = await this.#confirmTaskProviderRebalance(session, observer, signal, isCurrent);
     if (!isCurrent()) return false;
@@ -11524,7 +11531,7 @@ export class MobileClient {
       }), { kind: "send", sessionId }, false, observer.operationId, true, true,
         { signal, isCurrent: connectionCurrent, beforeDispatch: isCurrent, beforeRefresh: observeAcceptedRefresh });
       const accepted = receipt.accepted;
-      if (accepted) {
+      if (accepted && !observer.keepComposerDraft) {
         try {
           if (await this.composerDrafts.clearIfEqual(draftIdentity, sendDraft)) {
             await this.#removeCommittedAnnotationSources(draftIdentity.profileId, sendDraft.attachments);

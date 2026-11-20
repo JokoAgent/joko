@@ -1,6 +1,7 @@
 import { redactSecrets, type PartnerWorkbenchJudgment } from "@joko/core";
 import type { OperationalStore } from "@joko/store";
 import type { PartnerManager } from "./partner-manager.js";
+import type { PartnerAutonomyManager } from "./partner-autonomy.js";
 import { PartnerWorkbenchError, type PartnerWorkbenchManager, type PartnerWorkbenchOwner } from "./partner-workbench-manager.js";
 import type { BridgeToolCallContext, BridgeToolProvider, McpCallResult, McpToolDescriptor } from "./mcp-router.js";
 
@@ -24,10 +25,13 @@ export class PartnerWorkbenchToolProvider implements BridgeToolProvider {
     tool("set_workbench", "Save a judgment for one scoped task or a new item:<identity> note. Unfinished and idea judgments require a concise next step; judgments do not change runtime state.", schema(JUDGMENT, ["task_id", "project", "title", "verdict"])),
     tool("set_many_workbench", "Save one to 30 workbench judgments, with an explicit per-item result. Each uses the same current project authority.", schema({ items: { type: "array", minItems: 1, maxItems: 30, items: schema(JUDGMENT, ["task_id", "project", "title", "verdict"]) } }, ["items"])),
     tool("continue_workbench", "Continue one handed-over task through its actual Queue. Adopt one exact native candidate when supported, otherwise create one owned background task from bounded source evidence. Unconfirmed effects must be inspected, not blindly repeated.", schema({ task_id: ID, message: { type: "string", maxLength: 12_000 } }, ["task_id"])),
+    tool("set_workbench_task_responsibility", "Follow the exact local task selected by the owner, or release your existing responsibility. This changes future observation only.",
+      schema({ task_id: ID, responsible: { type: "boolean" } }, ["task_id", "responsible"]), true),
     tool("add_workbench_project", "Accept one existing absolute or ~/ project directory into this partner's workbench and runtime file scope under the current Agent permission policy.", schema({ path: PATH }, ["path"]), true),
     tool("remove_workbench_project", "Withdraw one workbench project grant. Its files, tasks, histories and saved judgments are preserved.", schema({ path: PATH }, ["path"]), true)
   ] satisfies readonly McpToolDescriptor[];
-  constructor(readonly options: { readonly store: OperationalStore; readonly partners: PartnerManager; readonly workbench: PartnerWorkbenchManager }) {}
+  constructor(readonly options: { readonly store: OperationalStore; readonly partners: PartnerManager; readonly workbench: PartnerWorkbenchManager;
+    readonly autonomy?: () => PartnerAutonomyManager }) {}
 
   includeForTarget(targetId: string): boolean {
     const partner = this.options.partners.partnerForHomeTarget(targetId);
@@ -37,7 +41,7 @@ export class PartnerWorkbenchToolProvider implements BridgeToolProvider {
   async callTool(name: string, input: Readonly<Record<string, unknown>>, signal: AbortSignal | undefined, context: BridgeToolCallContext): Promise<McpCallResult> {
     signal?.throwIfAborted();
     try {
-      const access = name === "get_workbench" ? "overview" : "canonical";
+      const access = name === "get_workbench" || name === "set_workbench_task_responsibility" && input["responsible"] === false ? "overview" : "canonical";
       const owner = this.#caller(context, access);
       const active = this.options.workbench;
       let result: unknown;
@@ -77,6 +81,11 @@ export class PartnerWorkbenchToolProvider implements BridgeToolProvider {
       } else if (name === "continue_workbench") {
         keys(input, ["task_id", "message"]);
         result = await active.continueTask(owner, text(input, "task_id", 256), input["message"] === undefined ? "" : text(input, "message", 12_000, true), `partner-workbench:${effect(context)}`);
+      } else if (name === "set_workbench_task_responsibility") {
+        keys(input, ["task_id", "responsible"]);
+        const autonomy = this.options.autonomy?.(), responsible = input["responsible"];
+        if (!autonomy || typeof responsible !== "boolean") throw invalid("Task responsibility is unavailable or invalid.");
+        result = autonomy.setResponsibility(owner.partnerId, text(input, "task_id", 256), responsible, `partner-responsibility:${effect(context)}`, context, signal);
       } else if (name === "add_workbench_project" || name === "remove_workbench_project") {
         keys(input, ["path"]);
         effect(context);

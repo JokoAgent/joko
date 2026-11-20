@@ -5231,8 +5231,12 @@ export class PiBackendAdapter implements
     const targetResources = profile.runtimePolicy === "review_read_only" || hosted ? undefined : context.target.trusted
       ? await options.resolveTargetResources?.(context)
       : undefined;
-    const nativeSkillsEnabled = !hosted && profile.runtimePolicy !== "review_read_only" && context.target.trusted
-      && context.target.remoteWorkspace === undefined && options.resolveNativeSkills !== undefined;
+    const canLoadNativeSkills = !hosted && profile.runtimePolicy !== "review_read_only" && context.target.trusted
+      && options.resolveNativeSkills !== undefined;
+    const peerSkillPolicy = canLoadNativeSkills && context.target.remoteWorkspace?.kind === "device_peer"
+      ? await options.resolveNativeSkillPolicy?.(context) : undefined;
+    const explicitPeerSkills = peerSkillPolicy?.mode === "explicit";
+    const nativeSkillsEnabled = canLoadNativeSkills && (context.target.remoteWorkspace === undefined || explicitPeerSkills);
     let mergedResources = mergeManagedResourceSnapshots(managedResources, targetResources);
     if (profile.runtimePolicy !== "review_read_only" && !hosted) {
       const excluded = await options.resolveProjectExtensionExclusions?.(context);
@@ -5266,9 +5270,14 @@ export class PiBackendAdapter implements
         recovery: "Retry after the trusted project resources stop changing or reject the unsafe resource."
       });
     });
-    const nativeSkillPolicy = nativeSkillsEnabled ? await options.resolveNativeSkillPolicy?.(context) : undefined;
-    const nativeSkills = nativeSkillsEnabled ? await snapshotNativeSkills(await options.resolveNativeSkills!(context, context.signal),
-      context.signal, join(runtimeDirectory, "resources", "native"), nativeSkillPolicy) : undefined;
+    const nativeSkillPolicy = explicitPeerSkills ? peerSkillPolicy
+      : nativeSkillsEnabled ? await options.resolveNativeSkillPolicy?.(context) : undefined;
+    const nativeSkillSeeds = nativeSkillsEnabled ? await options.resolveNativeSkills!(context, context.signal) : undefined;
+    // Each peer mount is transferred as one complete approved directory. A
+    // derived compact catalog would contain controller-local absolute paths.
+    const nativeSkills = nativeSkillSeeds === undefined ? undefined : await snapshotNativeSkills(
+      explicitPeerSkills ? nativeSkillSeeds.map(({ resource, sourcePath, assertCurrent }) => ({ resource, sourcePath, assertCurrent })) : nativeSkillSeeds,
+      context.signal, join(runtimeDirectory, "resources", "native"), nativeSkillPolicy);
 
     const compactionMemoryEnabled = !hosted && options.isCompactionMemoryEnabled?.(context) === true;
     const mcpBridge = profile.runtimePolicy === "review_read_only"
@@ -5493,7 +5502,12 @@ export class PiBackendAdapter implements
         agentHome: preparedAgentHome.path, environment: env });
       if (remoteHome?.discardNativeAuth) preparedAgentHome = { path: preparedAgentHome.path, redactValues: [] };
       if (hosted) assertHostedExecution(hosted);
-      assertStartupCurrent?.();
+      const assertLaunchCurrent = explicitPeerSkills ? () => {
+        assertStartupCurrent?.();
+        context.signal.throwIfAborted();
+        nativeSkills!.assertCurrent();
+      } : assertStartupCurrent;
+      assertLaunchCurrent?.();
       const process = await this.#processFactory({
         command: configuredBundle === undefined ? this.#command : globalThis.process.execPath,
         args,
@@ -5502,7 +5516,7 @@ export class PiBackendAdapter implements
         ...(context.target.remoteWorkspace === undefined
           ? {}
           : { remoteWorkspace: context.target.remoteWorkspace }),
-        ...(assertStartupCurrent === undefined ? {} : { assertStartupCurrent })
+        ...(assertLaunchCurrent === undefined ? {} : { assertStartupCurrent: assertLaunchCurrent })
       });
       if (context.target.remoteWorkspace === undefined && process.pid !== undefined) {
         const result = await (options.applyProcessPriority ?? applyNewProcessPriority)(

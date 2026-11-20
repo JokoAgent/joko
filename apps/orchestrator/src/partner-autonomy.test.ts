@@ -15,6 +15,7 @@ import { PartnerRoutineManager } from "./partner-routine-manager.js";
 import { PartnerSessionTaskManager } from "./partner-session-tasks.js";
 import { canSendFollowUpTaskMessage, PartnerAutonomyManager, dueEvent, followUpId } from "./partner-autonomy.js";
 import { PartnerTodoManager, PartnerTodoTools } from "./partner-todos.js";
+import type { BridgeToolCallContext } from "./mcp-router.js";
 import { SessionHelperToolBridgeProvider } from "./session-helper-tool-provider.js";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -53,10 +54,101 @@ async function fixture(permissionMode: "ask" | "bypassPermissions" = "ask") {
   const update = (operationId: string, choice: Parameters<PartnerAutonomyManager["update"]>[0]["choice"]) => autonomy.update({ operationId, connection,
     expectedRevision: autonomy.settings().revision, choice, assertCurrent: () => undefined });
   cleanups.push(async () => { autonomy.stop(); await routines.stop(); await scheduler.stop(); await tasks.close(); await host.dispose(); profiles.close(); store.close(); await rm(directory, { recursive: true, force: true }); });
-  return { store, profiles, partners, partner, adapter, routines, tasks, autonomy, host, connection, task, update, session, tick: (amount: number) => { now += amount; } };
+  return { directory, store, profiles, partners, partner, adapter, routines, tasks, autonomy, host, connection, task, update, session, tick: (amount: number) => { now += amount; } };
 }
 
 describe("Partner task observation", () => {
+  it("takes over and releases only the tasks selected by the original owner without writing to their queues", async () => {
+    const f = await fixture();
+    const ordinary = f.task("ordinary-owner-task"), other = f.task("other-owner-task");
+    const first = f.task("first-created-task"), second = f.task("second-created-task");
+    for (const task of [first, second]) f.store.setSetting("service", "partner.workbench.background", task.id,
+      { version: 1, sessionId: task.id, partnerId: f.partner.id, status: "running" });
+    expect(f.autonomy.glance(f.partner.id).rows.map(row => row.sessionId).sort()).toEqual([first.id, second.id]);
+    const before = f.autonomy.glance(f.partner.id).snapshotToken;
+    vi.spyOn(f.adapter, "send").mockResolvedValue(undefined);
+    const admitted = f.host.enqueueInput({ operationId: "owner-responsibility-input", connection: f.connection, sessionId: f.session.id,
+      prompt: { text: `Follow ${ordinary.id}. Release ${first.id}.`, disposition: "prompt", mentions: [], files: [], images: [] } }).value;
+    const original = await vi.waitFor(() => {
+      const item = f.store.getQueueItem(admitted.queueItemId);
+      expect(item.state).toBe("backend_accepted");
+      return item;
+    });
+    const context: BridgeToolCallContext = { sessionId: f.session.id, targetId: f.session.targetId, generation: f.session.binding.generation,
+      localProductScope: true, inputQueueItem: { id: original.id, runId: original.runId, attemptId: original.attemptId! } };
+    const set = (taskId: string, responsible: boolean, request: string, scope = context) =>
+      f.autonomy.setResponsibility(f.partner.id, taskId, responsible, request, scope);
+    expect(() => set(other.id, true, "owner-other-task")).toThrow(/owner must select/u);
+    expect(() => set(ordinary.id, true, "wrong-scope", { ...context, inputQueueItem: undefined })).toThrow(/turn changed/u);
+    expect(set(ordinary.id, true, "owner-takes-ordinary")).toEqual({ taskId: ordinary.id, responsible: true });
+    expect(set(first.id, false, "owner-releases-first")).toEqual({ taskId: first.id, responsible: false });
+    expect(set(first.id, false, "owner-releases-first")).toEqual({ taskId: first.id, responsible: false });
+    expect(() => f.autonomy.glance(f.partner.id, before)).toThrow(/expired/u);
+    const readStore = new OperationalStore(join(f.directory, "operations.db"));
+    try {
+      const restored = new PartnerAutonomyManager({ ...f.autonomy.options, store: readStore });
+      const rows = restored.glance(f.partner.id).rows;
+      expect(rows.map(row => row.sessionId).sort()).toEqual([ordinary.id, second.id]);
+      expect(rows.find(row => row.sessionId === ordinary.id)).toMatchObject({ followerPartnerId: f.partner.id, responsiblePartnerId: f.partner.id });
+      expect(rows.find(row => row.sessionId === ordinary.id)?.creatorPartnerId).toBeUndefined();
+    } finally { readStore.close(); }
+    expect(f.store.findSetting("service", "partner.workbench.background", first.id)?.value).toMatchObject({ partnerId: f.partner.id, sessionId: first.id });
+    for (const task of [ordinary, other, first, second]) {
+      expect(f.store.getRun(`run:${task.id}`).descriptor.state).toBe("running");
+      expect(f.store.listQueueItems({ sessionId: task.id })).toEqual([]);
+    }
+  });
+
+  it("runs the opt-in daily todo check in a private routine lane and keeps its builtin instructions fixed", async () => {
+    const f = await fixture();
+    await f.autonomy.start();
+    expect(f.routines.list(f.partner.id).some(row => row.builtin === "todo-check")).toBe(false);
+    const enable = () => f.routines.enableDailyTodoCheck(f.partner.id, f.partners.getPartner(f.partner.id).revision, () => undefined);
+    const active = await enable();
+    expect(active).toMatchObject({ builtinVersion: 1, enabled: true, silentWhenIdle: true,
+      triggers: [{ kind: "cron", expression: "0 9 * * 1-5", timezone: expect.any(String) }] });
+    await expect(f.routines.save({ partnerId: f.partner.id, partnerRevision: f.partner.revision, routineId: active.id,
+      revision: active.revision, definition: { ...active, prompt: "Replace the fixed daily check." } })).rejects.toThrow(/cannot be edited/u);
+    const next = f.routines.nextRunAt(f.partner.id, active.id);
+    expect(typeof next).toBe("number");
+    const ledger = new PartnerTodoManager(f.store, f.profiles, f.partners);
+    const tools = new PartnerTodoTools(ledger, () => f.routines);
+    const discovery = { key: "mail:proposal-review", origin: "discovered", title: "Review the proposal",
+      outcome: "Decide whether to approve it", sources: [{ kind: "mail", id: "fixture-message", label: "Proposal email" }] };
+    let call: BridgeToolCallContext | undefined;
+    let results: boolean[] | undefined;
+    const nativeSend = vi.spyOn(f.adapter, "send").mockImplementation(async (_prompt, scope) => {
+      const item = f.store.getQueueItem(scope.inputQueueItemId!);
+      call = { sessionId: scope.sessionId, targetId: scope.target.id, generation: scope.generation, effectIdentity: "a".repeat(64),
+        inputQueueItem: { id: item.id, runId: item.runId, attemptId: scope.inputAttemptId! } };
+      const refused = await tools.callTool("todo_update", { ...discovery, operation: "restore" }, undefined, call);
+      const saved = await tools.callTool("todo_update", discovery, undefined, call);
+      results = [refused.isError, saved.isError];
+      await scope.emit({ type: "done", outcome: "completed" });
+    });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(next! + 1);
+    try {
+      await f.routines.engine.tick();
+      await vi.waitFor(() => expect(f.routines.history(f.partner.id, active.id, 0).runs[0]?.status).toBe("success"), { timeout: 10_000 });
+      const occurrence = f.routines.history(f.partner.id, active.id, 0).runs[0]!;
+      expect(occurrence).toMatchObject({ triggerIds: ["weekday-morning"] });
+      expect(occurrence.sessionId).not.toBe(f.session.id);
+      expect(f.partners.listSessions(f.partner.id).find(row => row.link.sessionId === occurrence.sessionId)?.link.role).toBe("routine");
+      expect(nativeSend.mock.calls[0]?.[0].text).toContain("schedule_notify_current_run");
+      expect(results).toEqual([true, false]);
+      expect(ledger.list(f.partner.id, "open").items).toEqual([expect.objectContaining({ ...discovery, sources: [expect.objectContaining(discovery.sources[0]!)] })]);
+      expect((await tools.callTool("todo_update", discovery, undefined, call!)).isError).toBe(true);
+    } finally { clock.mockRestore(); }
+    await f.routines.save({ partnerId: f.partner.id, partnerRevision: f.partners.getPartner(f.partner.id).revision, routineId: active.id,
+      revision: active.revision, definition: { ...active, enabled: false } });
+    await f.autonomy.sweep();
+    expect(f.routines.list(f.partner.id).filter(row => row.builtin === "todo-check")).toEqual([
+      expect.objectContaining({ id: active.id, enabled: false })
+    ]);
+    expect(f.routines.nextRunAt(f.partner.id, active.id)).toBeUndefined();
+    expect(await enable()).toMatchObject({ id: active.id, enabled: false });
+  }, 20_000);
+
   it("keeps all-task observation off until an explicit setting, replays its original save, and pages every row", async () => {
     const f = await fixture(); for (let index = 0; index < 55; index++) f.task(`task-${index}`);
     expect(f.autonomy.settings()).toMatchObject({ customized: false }); expect(f.autonomy.observe()).toEqual([]);
@@ -170,7 +262,7 @@ describe("Partner affair owner and durable UI operations", () => {
     expect((await tools.callTool("todo_list", { view: "open", order: "unknown" }, undefined, context)).isError).toBe(true);
   });
   it("lets a live independent routine list its own Todo items without writing them", async () => {
-    const f = await fixture(), todos = new PartnerTodoManager(f.store, f.profiles, f.partners), tools = new PartnerTodoTools(todos);
+    const f = await fixture(), todos = new PartnerTodoManager(f.store, f.profiles, f.partners), tools = new PartnerTodoTools(todos, () => f.routines);
     const input = { key: "owner:routine-review", title: "Review the report", outcome: "A reviewed report", origin: "assigned" } as const;
     const item = todos.patch(f.partner.id, input, "create-routine-review-todo", () => undefined);
     const routine = await f.partners.ensureRoutineSession({ partnerId: f.partner.id, key: "routine:todo-review", title: "Review Todo", assertCurrent: () => undefined });

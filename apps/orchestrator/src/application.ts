@@ -285,6 +285,7 @@ import { PartnerTodoManager, PartnerTodoTools } from "./partner-todos.js";
 import { PartnerMessagingRuntime, PartnerMessagingTools } from './partner-messaging.js';
 import { PartnerRoutineTools } from "./partner-routine-tools.js";
 import { PartnerImportManager } from "./partner-import-manager.js";
+import { PartnerImportCommandTools } from "./partner-import-command-tools.js";
 import { partnerPackageOpening, partnerPackageStarterAvailable } from "./partner-package-opening.js";
 import { PartnerImportStorage } from "./partner-import-storage.js";
 import { PartnerImportRuntime } from "./partner-import-runtime.js";
@@ -2520,9 +2521,10 @@ export async function createOrchestratorApplication(
   const unregisterPartnerTools = mcpRouter.registerBridgeToolProvider(
     new PartnerToolBridgeProvider({ store, partners })
   );
-  const unregisterPartnerWorkbenchTools = mcpRouter.registerBridgeToolProvider(new PartnerWorkbenchToolProvider({ store, partners, workbench: partnerWorkbenches }));
+  const unregisterPartnerWorkbenchTools = mcpRouter.registerBridgeToolProvider(new PartnerWorkbenchToolProvider({ store, partners, workbench: partnerWorkbenches,
+    autonomy: () => partnerAutonomy }));
   partnerTodos = new PartnerTodoManager(store, partnerStore, partners, Date.now, () => partnerHomeRuntime);
-  const unregisterPartnerTodoTools = mcpRouter.registerBridgeToolProvider(new PartnerTodoTools(partnerTodos));
+  const unregisterPartnerTodoTools = mcpRouter.registerBridgeToolProvider(new PartnerTodoTools(partnerTodos, () => partnerRoutines));
   const unregisterPartnerMessagingTools = ['telegram', 'discord', 'dingtalk', 'feishu', 'lark', 'wecom', 'wechat', 'slack']
     .map(channel => mcpRouter.registerBridgeToolProvider(new PartnerMessagingTools(partnerMessaging!, channel)));
   let backendLifecycleTail: Promise<void> = Promise.resolve();
@@ -2943,6 +2945,9 @@ export async function createOrchestratorApplication(
     groupHomeTarget: privateHomeTarget, isGroupSession: sessionId => partnerStore.getSessionLink(sessionId)?.role === "group" });
   startupPartnerImports = partnerImports; startupPartnerImportRuntime = partnerImportRuntime;
   const unregisterPartnerImportTools = mcpRouter.registerBridgeToolProvider(partnerImportRuntime);
+  const unregisterPartnerImportCommand = mcpRouter.registerBridgeToolProvider(new PartnerImportCommandTools({
+    store, profiles: partnerStore, partners, imports: partnerImports, host: sessionHost
+  }));
   partnerRoutines.setImportedRuntime(partnerImportRuntime);
   partnerConnections = new PartnerConnectionsManager(partners, partnerStore, store, partnerConnectionPreferences, mcpRouter,
     (sessionId, targetId, id) => toolPolicies.enabledForSession(sessionId, targetId, id), piResources,
@@ -3953,6 +3958,7 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterPartnerSessionTaskTools());
         await attempt(() => partnerImportRuntime.close());
         await attempt(() => unregisterPartnerImportTools());
+        await attempt(() => unregisterPartnerImportCommand());
         await attempt(() => unregisterPartnerSkillTools());
         await attempt(() => unregisterPartnerCapabilityTools());
         await attempt(() => unregisterPartnerProfileTools());

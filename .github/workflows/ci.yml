@@ -107,10 +107,10 @@ jobs:
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
         shell: bash
         run: pnpm --filter @joko/remote-ssh exec vitest run src/remote-git-checkout.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/remote-checkout.log"
-      - name: Check the configured published Pi launcher and SSH provision
+      - name: Check the published Pi launcher and paired Skill staging
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' && runner.os == 'Linux' }}
         shell: bash
-        run: pnpm --filter @joko/adapter-pi exec vitest run src/adapter.test.ts -t 'keeps the configured npm symlink for the local probe and stages its published bundle for SSH' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/pi-launcher.log"
+        run: pnpm --filter @joko/adapter-pi exec vitest run src/adapter.test.ts -t 'keeps the configured npm symlink for the local probe and stages its published bundle for SSH|stages only selected Skills and their assets for an explicit paired Partner Home' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/pi-launcher.log"
       - name: Check actual remote Review and workspace search
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' && runner.os == 'Linux' }}
         working-directory: apps/orchestrator
@@ -413,6 +413,24 @@ jobs:
         with:
           name: ci-codex-native-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
           path: ${{ runner.temp }}/joko-ci-logs/codex-native-*
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Verify Agent import on published Codex and bundled Claude
+        id: codex_partner_import
+        if: ${{ !cancelled() && steps.codex_native.outcome == 'success' && steps.codex_sandbox.outcome == 'success' }}
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          test -n "$JOKO_CODEX_HOSTED_TEST_BINARY"
+          pnpm --filter @joko/e2e exec vitest run src/partner-import.e2e.test.ts -t 'published Codex|bundled Claude SDK' 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/codex-partner-import.log"
+
+      - name: Upload the published Codex and bundled Claude Agent import results
+        if: ${{ always() && (steps.codex_partner_import.outcome == 'success' || steps.codex_partner_import.outcome == 'failure') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-codex-partner-import-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/codex-partner-import.log
           if-no-files-found: error
           retention-days: 3
 

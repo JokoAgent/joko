@@ -8,11 +8,12 @@ import type { MobilePartnersColors } from "./MobilePartnersScreen";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 
 /** Native counterpart of the final computer / affairs / outputs glance entry. */
-export function MobilePartnerGlanceSheet({ api, homeApi, partnerId, name, visible, engaged, colors, locale, onClose, onQuote, onOpenTask, onHomeSettings }: {
+export function MobilePartnerGlanceSheet({ api, homeApi, partnerId, name, visible, engaged, colors, locale, onClose, onQuote, onOpenTask, onHomeSettings, onCheck }: {
   readonly api: PartnerAutonomyApi; readonly partnerId: string; readonly name: string; readonly visible: boolean; readonly engaged: boolean;
   readonly homeApi?: PartnerHomeApi;
   readonly colors: MobilePartnersColors; readonly locale: MobileSupportedLocale; readonly onClose: () => void;
   readonly onQuote: (todo: PartnerTodo) => void; readonly onOpenTask: (sessionId: string) => void; readonly onHomeSettings: () => void;
+  readonly onCheck?: () => Promise<boolean>;
 }) {
   const m = partnerAutonomyMessages(locale), editor = useMemo(() => new PartnerGlanceTodos(api, partnerId, "newest"), [api, partnerId]);
   const state = useSyncExternalStore(editor.subscribe, editor.snapshot), alive = useRef(true), flights = useRef(new Set<AbortController>()), askEpoch = useRef(0);
@@ -20,6 +21,7 @@ export function MobilePartnerGlanceSheet({ api, homeApi, partnerId, name, visibl
   const [all, setAll] = useState(false), [showDone, setShowDone] = useState(false), [outputs, setOutputs] = useState<readonly PartnerTaskOutput[]>([]);
   const [outputFailed, setOutputFailed] = useState(false), [refresh, setRefresh] = useState(0);
   const [home, setHome] = useState<ListPartnerHomeTargetsResponse>(), [homeFailed, setHomeFailed] = useState(false);
+  const [checking, setChecking] = useState(false), [checkFailed, setCheckFailed] = useState(false);
   const attempt = useRef<{ readonly id: string; readonly revision: bigint; readonly choice: PartnerAutonomySettingChoice } | undefined>(undefined);
   const pending = useRef<(() => void) | undefined>(undefined), current = useRef({ visible, api, onQuote, onOpenTask, onHomeSettings });
   current.current = { visible, api, onQuote, onOpenTask, onHomeSettings };
@@ -110,8 +112,24 @@ export function MobilePartnerGlanceSheet({ api, homeApi, partnerId, name, visibl
           {home?.home ? <View><Text style={{ color: colors.ink }}>{home.home.deviceName}</Text><Text style={{ color: colors.muted }}>{m.here} · {home.home.available ? m.online : m.offline}</Text></View> : <Text style={{ color: colors.muted }}>{homeApi ? m.loading : m.here}</Text>}
           {homeFailed && <Text accessibilityRole="alert" style={{ color: colors.negative }}>{m.computersFailed}</Text>}{homeFailed && action(m.refresh, () => setRefresh(value => value + 1))}
           {home?.home?.available && action(partnerHomeMessages(locale).change, () => afterClose(() => current.current.onHomeSettings()))}
-          {(state.openTotal > 0 || state.doneTotal > 0 || state.failed || state.deleted || !state.loaded) && <View style={styles.section}>
+          {(onCheck || state.dailyCheck || state.dailyCheckFailed || state.openTotal > 0 || state.doneTotal > 0 || state.failed || state.deleted || !state.loaded) && <View style={styles.section}>
             <Text accessibilityRole="header" style={{ color: colors.muted }}>{m.todos}</Text>
+            {onCheck && action(m.checkNow, () => {
+              setChecking(true); setCheckFailed(false);
+              void onCheck().then(accepted => {
+                if (!alive.current || !current.current.visible || current.current.api !== api) return;
+                if (accepted) onClose(); else setCheckFailed(true);
+              }).catch(() => { if (alive.current && current.current.visible && current.current.api === api) setCheckFailed(true); })
+                .finally(() => { if (alive.current) setChecking(false); });
+            }, checking)}
+            {checkFailed && <Text accessibilityRole="alert" style={{ color: colors.negative }}>{m.checkFailed}</Text>}
+            {state.dailyCheck && <View style={styles.invitation}>
+              <Switch accessibilityLabel={m.dailyCheck} disabled={!state.dailyCheck.writable || state.dailyCheckSaving || state.dailyCheckFailed}
+                value={state.dailyCheck.enabled} onValueChange={value => void editor.setDailyCheck(value)} />
+              <Text style={{ color: colors.ink, flex: 1 }}>{m.dailyCheck}</Text>
+            </View>}
+            {state.dailyCheckFailed && <><Text accessibilityRole="alert" style={{ color: colors.negative }}>{m.dailyCheckFailed}</Text>
+              {action(m.refresh, () => void editor.refreshDailyCheck())}</>}
             {state.failed && <Text accessibilityRole="alert" style={{ color: colors.negative }}>{state.pending ? m.saveUnknown : m.failed}</Text>}
             {state.failed && action(state.pending ? m.retrySave : m.refresh, () => state.pending ? void editor.mutate() : void editor.refresh(), state.saving)}
             {(all ? state.open : state.open.slice(0, 5)).map(todoRow)}{state.open.length > 5 && action(`${m.more} (${state.openTotal})`, () => setAll(value => !value))}

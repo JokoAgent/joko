@@ -11,6 +11,7 @@ export function PartnerGlanceContents({ api, partnerId, editor, locale, enabled,
   const [all, setAll] = useState(false), [done, setDone] = useState(false);
   const [menu, setMenu] = useState<{ readonly todoId: string; readonly origin: HTMLButtonElement }>();
   const [outputs, setOutputs] = useState<readonly PartnerTaskOutput[]>([]), [outputFailed, setOutputFailed] = useState(false), [outputRefresh, setOutputRefresh] = useState(0);
+  const [checking, setChecking] = useState(false), [checkFailed, setCheckFailed] = useState(false);
   const alive = useRef(true), outputFlight = useRef<AbortController | undefined>(undefined);
   useEffect(() => { alive.current = true; return () => { alive.current = false; outputFlight.current?.abort(); }; }, []);
   useEffect(() => {
@@ -48,7 +49,18 @@ export function PartnerGlanceContents({ api, partnerId, editor, locale, enabled,
   return <>
     {conversation?.homeApi && conversation.openHomeSettings ? <PartnerGlanceComputers key={`${conversation.homeApi.ownerKey}:${partnerId}`} api={conversation.homeApi} partnerId={partnerId} locale={locale} enabled={enabled}
       onSelect={destination => { close(); conversation.openHomeSettings?.(destination); }} /> : <section><h3>{m.computers}</h3><span>{conversation?.homeLabel || m.here}</span></section>}
-    {(state.openTotal > 0 || state.doneTotal > 0 || state.failed || state.deleted || !state.loaded) && <section><h3>{m.todos}</h3>
+    {(conversation?.checkTodosNow || state.dailyCheck || state.dailyCheckFailed || state.openTotal > 0 || state.doneTotal > 0 || state.failed || state.deleted || !state.loaded) && <section><h3>{m.todos}</h3>
+      {conversation?.checkTodosNow && <Button disabled={checking} onClick={() => {
+        setChecking(true); setCheckFailed(false);
+        void conversation.checkTodosNow!().then(() => { if (alive.current) close(); })
+          .catch(() => { if (alive.current) setCheckFailed(true); })
+          .finally(() => { if (alive.current) setChecking(false); });
+      }}>{m.checkNow}</Button>}
+      {checkFailed && <p role="alert">{m.checkFailed}</p>}
+      {state.dailyCheck && <Button role="switch" aria-checked={state.dailyCheck.enabled}
+        disabled={!state.dailyCheck.writable || state.dailyCheckSaving || state.dailyCheckFailed}
+        onClick={() => void editor.setDailyCheck(state.dailyCheck?.enabled !== true)}>{m.dailyCheck}</Button>}
+      {state.dailyCheckFailed && <><p role="alert">{m.dailyCheckFailed}</p><Button onClick={() => void editor.refreshDailyCheck()}>{m.refresh}</Button></>}
       {state.failed && <p role="alert">{state.pending ? m.saveUnknown : m.failed}</p>}
       {state.failed && <Button disabled={state.saving} onClick={() => state.pending ? void editor.mutate() : void editor.refresh()}>{state.pending ? m.retrySave : m.refresh}</Button>}
       {!state.loaded && <p>{m.loading}</p>}<ul>{(all ? state.open : state.open.slice(0, 5)).map(row)}</ul>

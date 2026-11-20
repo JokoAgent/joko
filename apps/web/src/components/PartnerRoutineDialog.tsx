@@ -74,7 +74,7 @@ function RoutineContent({ editor, connected, m, onClose, ownerDocument, locale, 
         <Button disabled={!editor.dirty || !validRoutineDraft(draft)} onClick={() => void editor.save()}>{m.save}</Button>
         {editor.dirty && <Button onClick={() => setConfirm({ body: m.discardBody, action: () => editor.discard() })}>{m.discard}</Button>}
       </fieldset>}
-      {draft && <fieldset disabled={locked || !!state.pendingId} className="partner-capabilities">
+      {draft && state.selected?.builtin !== "todo-check" && <fieldset disabled={locked || !!state.pendingId} className="partner-capabilities">
         <legend>{locale === "zh-CN" ? "执行方式" : "Execution"}</legend>
         <RoutineExecutionFields draft={draft} models={state.catalog?.models ?? []} locale={locale} onChange={patch => editor.edit(patch)} />
         {state.selected?.builtin && <><Button disabled={!editor.dirty || !validRoutineDraft(draft)} onClick={() => void editor.save()}>{m.save}</Button>

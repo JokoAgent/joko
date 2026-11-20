@@ -151,6 +151,7 @@ export class PartnerConnectionsManager {
     const profile = this.profiles.listPartners().find(item => item.homeTargetId === homeTargetId && item.lifecycle !== "deleted");
     if (!profile) return undefined;
     const target = this.store.getTarget(context.target.id), backend = this.store.getBackend(context.target.backendId).descriptor;
+    const allowed = this.targetSkillReferences(homeTargetId)!;
     const assertCurrent = () => {
       const current = this.profiles.getPartner(profile.id);
       // Host owns new/replacement Session binding admission. Before native
@@ -166,9 +167,15 @@ export class PartnerConnectionsManager {
         || this.store.getTarget(context.target.id).revision !== target.revision || !target.descriptor.trusted
         || backend.instanceGeneration !== context.backendInstanceGeneration
         || this.store.getBackend(backend.id).descriptor.instanceGeneration !== backend.instanceGeneration) throw new Error("The private skill runtime owner changed.");
+      if (context.target.remoteWorkspace?.kind === "device_peer") {
+        const currentSkills = this.targetSkillReferences(homeTargetId);
+        if (currentSkills === undefined || currentSkills.size !== allowed.size || [...allowed].some(id => !currentSkills.has(id))) {
+          throw new Error("The paired Partner Skill selection changed.");
+        }
+      }
     };
     assertCurrent();
-    const allowed = this.targetSkillReferences(homeTargetId)!, overrides = new Map<string, "on" | "off">();
+    const overrides = new Map<string, "on" | "off">();
     const metadata = this.skillMetadata && profile.initializationState === "ready" ? await this.skillMetadata(profile.id, context.signal, context.target.backendId) : [];
     assertCurrent();
     for (const item of metadata) if (item.nativeName) overrides.set(item.nativeName,

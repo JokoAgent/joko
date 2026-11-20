@@ -26,6 +26,15 @@ export function createPartnerRoutineConnectService(manager: PartnerRoutineManage
     }),
     savePartnerRoutine: (request, context) => invoke(context, async () => {
       if (!request.definition || request.intent.case === undefined) throw new ConnectError("Definition and intent are required.", Code.InvalidArgument);
+      if (request.intent.case === "creationRequestId" && request.intent.value === contract.PARTNER_TODO_CHECK_CREATION_REQUEST_ID) {
+        const definition = request.definition;
+        if (!definition.enabled || definition.name || definition.prompt || definition.triggers.length || definition.silentWhenIdle
+          || definition.sessionMode !== contract.RoutineSessionMode.UNSPECIFIED || definition.modelOverride || definition.preRunHook || request.expectedRevision) {
+          throw new ConnectError("The daily todo check uses its fixed definition.", Code.InvalidArgument);
+        }
+        const routine = await owner().enableDailyTodoCheck(request.partnerId, fromProtoRevision(request.expectedPartnerRevision), () => authenticate(context));
+        return create(contract.SavePartnerRoutineResponseSchema, { routine: toProtoRoutine(routine) });
+      }
       const routine = await owner().save({ partnerId: request.partnerId,
         partnerRevision: fromProtoRevision(request.expectedPartnerRevision), definition: fromProtoDefinition(request.definition),
         ...(request.intent.case === "creationRequestId" ? { requestId: request.intent.value }

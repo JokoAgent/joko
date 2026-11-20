@@ -195,10 +195,11 @@ export class RoutineEngine {
   }
 
   /** Host realignment preserves a pause already committed by the owner. */
-  async ensureBuiltin(partnerId: string, raw: RoutineInput, id: string, builtinVersion: number): Promise<Routine | null> {
+  async ensureBuiltin(partnerId: string, raw: RoutineInput, id: string, builtinVersion: number,
+    builtin: NonNullable<Routine["builtin"]> = "follow-up", assertCurrent?: () => void): Promise<Routine | null> {
     if (!/^[a-zA-Z0-9_-]{16,128}$/.test(id) || !Number.isSafeInteger(builtinVersion) || builtinVersion < 1) throw new Error("Invalid built-in routine identity");
     if (this.blockedPartners.has(partnerId)) return null;
-    return this.writeRoutine(partnerId, raw, { id, builtin: "follow-up", builtinVersion });
+    return this.writeRoutine(partnerId, raw, { id, builtin, builtinVersion, assertCurrent });
   }
 
   isRetired(id: string): boolean { return this.state.retiredRoutineIds.includes(id); }
@@ -215,7 +216,7 @@ export class RoutineEngine {
     });
   }
 
-  private async writeRoutine(partnerId: string, raw: RoutineInput, options: { id?: string; expectedRevision?: number; creationId?: string; authority?: object; assertCurrent?: () => void; builtin?: "follow-up"; builtinVersion?: number }): Promise<Routine> {
+  private async writeRoutine(partnerId: string, raw: RoutineInput, options: { id?: string; expectedRevision?: number; creationId?: string; authority?: object; assertCurrent?: () => void; builtin?: Routine["builtin"]; builtinVersion?: number }): Promise<Routine> {
     const { expectedRevision, creationId } = options;
     const id = options.id ?? creationId;
     const parsed = parseRoutineInput(raw);
@@ -231,12 +232,16 @@ export class RoutineEngine {
           )
         : undefined;
       const input = options.builtin && existing ? { ...parsed, enabled: existing.enabled,
-        sessionMode: existing.sessionMode, modelOverride: existing.modelOverride } : parsed;
+        ...(options.builtin === "follow-up" ? { sessionMode: existing.sessionMode, modelOverride: existing.modelOverride } : {}) } : parsed;
       if (id && !existing && !creationId && !options.builtin) throw new Error("Routine not found");
       if ((creationId || options.builtin) && state.routines.some(row => row.id === id && row.partnerId !== partnerId)) throw new Error("Routine creation ID already used");
-      if (existing?.builtin && !options.builtin
-        && JSON.stringify(parseRoutineInput({ ...existing, enabled: input.enabled, sessionMode: input.sessionMode, modelOverride: input.modelOverride })) !== JSON.stringify(input)) {
-        throw new Error("Built-in routine instructions and triggers cannot be edited.");
+      if (existing?.builtin && !options.builtin) {
+        const follow = existing.builtin === "follow-up";
+        const expected = parseRoutineInput({ ...existing, enabled: input.enabled,
+          sessionMode: follow ? input.sessionMode : existing.sessionMode ?? "persistent",
+          modelOverride: follow ? input.modelOverride : existing.modelOverride ?? null });
+        const proposed = follow ? input : parseRoutineInput({ ...input, sessionMode: input.sessionMode ?? "persistent", modelOverride: input.modelOverride ?? null });
+        if (JSON.stringify(expected) !== JSON.stringify(proposed)) throw new Error("Built-in routine instructions and triggers cannot be edited.");
       }
       const builtin = options.builtin ?? existing?.builtin, builtinVersion = options.builtinVersion ?? existing?.builtinVersion;
       if (creationId && existing && JSON.stringify(parseRoutineInput(existing)) !== JSON.stringify(input)) throw new Error("Routine already created; refresh before editing");
