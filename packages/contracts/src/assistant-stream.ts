@@ -1,5 +1,12 @@
 import type { Event } from "./gen/joko/v1/event_pb.js";
 
+export function codexRetryProgressKind(code: string | undefined): "reconnect" | "capacity" | "rate-limit" | undefined {
+  if (code === "CODEX_NATIVE_RECONNECT") return "reconnect";
+  if (code === "CODEX_CAPACITY_BACKOFF") return "capacity";
+  if (code === "CODEX_RATE_LIMIT_BACKOFF") return "rate-limit";
+  return undefined;
+}
+
 /** A terminal status identifies a received Codex item, not a completed native entry. */
 export function codexSamplingInterruptedMessageId(status: { readonly statusId: string; readonly terminal: boolean }): string | undefined {
   const prefix = "codex_sampling_interrupted:";

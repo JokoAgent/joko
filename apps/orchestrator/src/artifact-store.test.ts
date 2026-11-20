@@ -72,31 +72,33 @@ async function publicationFixture(now = Date.now) {
 }
 
 describe("ArtifactStore publication", () => {
-  it("presents an immutable PDF through a durable native suffix until its last storage reference expires", async () => {
+  it.each([
+    ["PDF", "application/pdf", ".pdf", Buffer.from("%PDF-1.7\nA fixed PDF attachment byte fixture\n%%EOF\n")],
+    ["GIF", "image/gif", ".gif", Buffer.from("47494638396101000100800000000000ffffff21f904000a0000002c000000000100010000020244010021f904000a0000002c00000000010001000002024c01003b", "hex")]
+  ] as const)("presents an immutable %s through a durable native suffix until its last storage reference expires", async (_label, mimeType, suffix, bytes) => {
     let now = 1_000;
     const f = await publicationFixture(() => now);
-    const bytes = Buffer.from("%PDF-1.7\nA fixed PDF attachment byte fixture\n%%EOF\n");
-    const uploaded = await f.artifacts.ingestBytes(bytes, { fileName: "report.pdf", mimeType: "application/pdf", expiresAt: 2_000 });
+    const uploaded = await f.artifacts.ingestBytes(bytes, { fileName: `fixture${suffix}`, mimeType, expiresAt: 2_000 });
     const shared = await f.artifacts.ingestBytes(bytes, { fileName: "retained.bin", mimeType: "application/octet-stream", expiresAt: 3_000 });
     const original = await f.artifacts.resolveBlobPath(uploaded);
-    expect(await f.artifacts.resolveClaudeInputFile(shared)).toBe(original);
-    const paths = await Promise.all([f.artifacts.resolveClaudeInputFile(uploaded), f.artifacts.resolveClaudeInputFile(uploaded)]);
-    const nativePdf = `${await realpath(original)}.pdf`;
-    expect(paths).toEqual([nativePdf, nativePdf]);
-    expect(await readFile(nativePdf)).toEqual(bytes);
+    expect(await f.artifacts.resolveNativeInputFile(shared, mimeType)).toBe(original);
+    const paths = await Promise.all([f.artifacts.resolveNativeInputFile(uploaded, mimeType), f.artifacts.resolveNativeInputFile(uploaded, mimeType)]);
+    const nativeFile = `${await realpath(original)}${suffix}`;
+    expect(paths).toEqual([nativeFile, nativeFile]);
+    expect(await readFile(nativeFile)).toEqual(bytes);
     expect(await readFile(original)).toEqual(bytes);
     expect(await f.artifacts.resolveBlobPath(uploaded)).toBe(original);
     expect(await readdir(join(f.directory, "artifacts", "incoming"))).toEqual([]);
 
-    await writeFile(nativePdf, Buffer.alloc(bytes.length));
-    await expect(f.artifacts.resolveClaudeInputFile(uploaded)).rejects.toThrow(/content changed/u);
-    await writeFile(nativePdf, bytes);
+    await writeFile(nativeFile, Buffer.alloc(bytes.length));
+    await expect(f.artifacts.resolveNativeInputFile(uploaded, mimeType)).rejects.toThrow(/content changed/u);
+    await writeFile(nativeFile, bytes);
     now = 2_500;
     expect(await f.artifacts.garbageCollect()).toBe(0);
-    expect(await readFile(nativePdf)).toEqual(bytes);
+    expect(await readFile(nativeFile)).toEqual(bytes);
     now = 3_500;
     expect(await f.artifacts.garbageCollect()).toBe(1);
-    await expect(readFile(nativePdf)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(nativeFile)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(readFile(original)).rejects.toMatchObject({ code: "ENOENT" });
   });
 

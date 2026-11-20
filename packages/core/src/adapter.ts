@@ -88,7 +88,7 @@ export interface AdapterContext {
   /** Private authority for one user-owned dispatch. A Backend may recover a
    * deterministic optional-field rejection only before producing output or
    * running tools. Recheck after learning and immediately before replay. */
-  readonly rejectedRequestRecovery?: { readonly assertCurrent: () => void };
+  readonly rejectedRequestRecovery?: { readonly assertCurrent: () => void; readonly codexTurnBackoff?: true };
   /** Private immutable creation snapshot used only to restore native runtime launch state. */
   readonly appendSystemPrompt?: string;
   /** Host-owned immutable isolation policy. Backends must fail closed on unknown values. */

@@ -269,6 +269,15 @@ export async function translatePromptInput(
         recovery: "Use PNG, JPEG, WebP, or GIF."
       });
     }
+    if (mimeType.toLowerCase() === "image/gif" && context.target.remoteWorkspace === undefined
+      && context.hostedExecution === undefined && context.runtimePolicy !== "review_read_only" && resolvers.resolveFile !== undefined) {
+      // The native image preparation retains the first frame. Keep the
+      // original GIF available as an ordinary attachment in the same turn.
+      const path = await resolveManagedFile(image.blob, context, resolvers);
+      await verifyFileContent(path, image.blob, context.signal);
+      mentionFileProofs.push(signal => verifyFileContent(path, image.blob, signal));
+      textParts.push(`Attached file: ${JSON.stringify({ name: image.blob.fileName ?? basename(path), path })}`);
+    }
     result.push({
       type: "image",
       url: `data:${mimeType};base64,${Buffer.from(resolved.data).toString("base64")}`

@@ -1339,6 +1339,26 @@ describe("CodexBackendAdapter", () => {
     expect(setup.fake.transport?.requests.filter(request => request.method === "turn/start")).toEqual([]);
   });
 
+  it("carries the full original two-frame GIF as a file alongside its native image preview", async () => {
+    const data = Buffer.from("47494638396101000100800000000000ffffff21f904000a0000002c000000000100010000020244010021f904000a0000002c00000000010001000002024c01003b", "hex");
+    const blob = { id: "animated-artifact", fileName: "original.gif", mimeType: "image/gif", byteLength: data.length,
+      sha256: createHash("sha256").update(data).digest("hex") };
+    let path = "";
+    const resolveFile = vi.fn(async () => path);
+    const { adapter, target, fake } = await createSetup(7, { readBlob: async () => ({ data, mimeType: blob.mimeType }), resolveFile });
+    path = join(target.workspaceRoot, "original.gif");
+    await writeFile(path, data);
+    const binding = await adapter.createSession(sessionInput(target), context(target, [], { backendInstanceGeneration: 7 }));
+    await adapter.send({ ...prompt("Read the second frame."), images: [{ blob }] }, context(target, [], {
+      binding, backendInstanceGeneration: 7, operationId: "full-gif-original"
+    }));
+    expect(resolveFile).toHaveBeenCalledExactlyOnceWith(blob, expect.objectContaining({ binding }));
+    expect(fake.transport?.requests.filter(request => request.method === "turn/start")).toMatchObject([{ params: { input: [
+      { type: "text", text: `Read the second frame.\n\nAttached file: ${JSON.stringify({ name: "original.gif", path })}` },
+      { type: "image", url: `data:image/gif;base64,${data.toString("base64")}` }
+    ] } }]);
+  });
+
   it("resolves a canonical Artifact through its service authority and rechecks it at native dispatch", async () => {
     const bytes = Buffer.from("canonical artifact", "utf8");
     const sourceSessionId = "session-artifact-source";

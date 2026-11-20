@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type { JSX } from "react";
+import { codexRetryProgressKind } from "@joko/contracts";
 import { LoaderCircle } from "lucide-react";
 import { timelineErrorCopy } from "../timeline-error-copy.js";
 import type { ActiveRetryProjection } from "./retry-status-behavior.js";
@@ -11,7 +12,7 @@ export function RetryStatusIndicator({ retry, t }: {
   readonly t: Translator;
 }): JSX.Element | null {
   if (retry.source === "auto" ? !hasVisibleAutoRetryNotice(retry)
-    : retry.source !== "summarization" && retry.error?.code !== "CODEX_NATIVE_RECONNECT") return null;
+    : retry.source !== "summarization" && !codexRetryProgressKind(retry.error?.code)) return null;
   return <VisibleRetryStatusIndicator retry={retry} t={t} />;
 }
 
@@ -40,8 +41,10 @@ function VisibleRetryStatusIndicator({ retry, t }: {
       ? t(cancellable ? "retryStatus.countdownUnknownMax" : "retryStatus.countdownUnknownMaxNoCancel", { attempt: retry.attemptNumber, seconds })
       : t(cancellable ? "retryStatus.countdown" : "retryStatus.countdownNoCancel", { attempt: retry.attemptNumber, maxAttempts: retry.maxAttempts, seconds });
   }, [cancellable, retry.attemptNumber, retry.maxAttempts, seconds, t]);
-  const friendly = retry.error === undefined || retry.error.code === "CODEX_NATIVE_RECONNECT"
-    ? undefined : timelineErrorCopy(retry.error.code);
+  const code = retry.error?.code;
+  const kind = codexRetryProgressKind(code);
+  const friendly = code === undefined || kind === "reconnect" ? undefined
+    : timelineErrorCopy(kind === "capacity" ? "UPSTREAM_OVERLOADED" : kind === "rate-limit" ? "RATE_LIMITED" : code);
   const message = `${friendly === undefined ? "" : t(friendly.messageKey)} ${progress}`.trim();
 
   return (

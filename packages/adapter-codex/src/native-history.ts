@@ -19,6 +19,7 @@ import {
 } from "./protocol.js";
 import { mcpToolCallErrorMessage, mcpToolCallFailed, safeIdentifier, safeJson, safePath, safeText, toolIdentity } from "./translator.js";
 import { CODEX_FILE_CHANGE_FALLBACK, projectCodexFileChanges } from "./file-change.js";
+import { codexRejectedTurnKind, isRejectedTurnRetryClientId, nextRejectedTurnRetryClientId } from "./rejected-turn-retry.js";
 import {
   extractAliveYieldCellsFromCodexItem,
   extractSettledYieldCellIdsFromCodexItem,
@@ -51,9 +52,14 @@ export function projectCodexNativeHistory(
   const intermediateYieldTurnIds = intermediateYieldTurns(thread);
   let parentEntryId: string | undefined;
 
-  for (const turn of thread.turns) {
+  for (const [turnIndex, turn] of thread.turns.entries()) {
     assertHistoryIdentity(turn.id);
-    const intermediateYieldTurn = intermediateYieldTurnIds.has(turn.id);
+    const previousInput = turn.items[0];
+    const nextInput = thread.turns[turnIndex + 1]?.items[0];
+    const retried = turn.status === "failed" && codexRejectedTurnKind(turn.error) !== undefined
+      && turn.items.every(item => item.type === "userMessage") && previousInput?.type === "userMessage" && nextInput?.type === "userMessage"
+      && nextRejectedTurnRetryClientId(previousInput["clientId"], nextInput["clientId"]);
+    const intermediate = intermediateYieldTurnIds.has(turn.id) || retried;
     if (turn.items.length === 0) {
       appendLineage(turn.id);
       appendEvents(
@@ -61,7 +67,7 @@ export function projectCodexNativeHistory(
         parentEntryId,
         turn,
         "turn",
-        intermediateYieldTurn ? [] : [turnStatusProjection(turn)]
+        intermediate ? [] : [turnStatusProjection(turn)]
       );
       parentEntryId = turn.id;
       continue;
@@ -69,8 +75,8 @@ export function projectCodexNativeHistory(
     for (const [index, item] of turn.items.entries()) {
       assertHistoryIdentity(item.id);
       appendLineage(item.id);
-      const projections = [...projectItem(item, turn, !intermediateYieldTurn)];
-      if (index === turn.items.length - 1 && !intermediateYieldTurn) {
+      const projections = [...projectItem(item, turn, !intermediate)];
+      if (index === turn.items.length - 1 && !intermediate) {
         projections.push(turnStatusProjection(turn));
       }
       appendEvents(item.id, parentEntryId, turn, item.type, projections);
@@ -190,7 +196,7 @@ function projectItem(
 ): readonly ItemProjection[] {
   switch (item.type) {
     case "userMessage": {
-      if (isYieldContinuationClientId(item["clientId"])) return [];
+      if (isYieldContinuationClientId(item["clientId"]) || isRejectedTurnRetryClientId(item["clientId"])) return [];
       const blocks = userMessageBlocks(item);
       return [{
         kind: "message_user",

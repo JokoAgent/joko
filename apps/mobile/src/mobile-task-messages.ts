@@ -279,6 +279,8 @@ const mobileTaskMessageRows = [
   ["task.files", "Files", "文件", "檔案", "ファイル", "파일"],
   ["task.live", "Live events", "实时事件", "即時事件", "ライブイベント", "실시간 이벤트"],
   ["task.codexReconnecting", "Codex is reconnecting ({attempt}/{maxAttempts})…", "Codex 正在重连（{attempt}/{maxAttempts}）…", "Codex 正在重新連線（{attempt}/{maxAttempts}）…", "Codex が再接続しています（{attempt}/{maxAttempts}）…", "Codex 재연결 중 ({attempt}/{maxAttempts})…"],
+  ["task.codexCapacityBackoff", "Codex is busy. Retrying ({attempt}/{maxAttempts})…", "Codex 繁忙，正在重试（{attempt}/{maxAttempts}）…", "Codex 忙碌，正在重試（{attempt}/{maxAttempts}）…", "Codex が混雑しています。再試行中（{attempt}/{maxAttempts}）…", "Codex가 사용량이 많아 다시 시도 중입니다 ({attempt}/{maxAttempts})…"],
+  ["task.codexRateLimitBackoff", "Codex is rate limited. Retrying ({attempt}/{maxAttempts})…", "Codex 请求频率受限，正在重试（{attempt}/{maxAttempts}）…", "Codex 請求頻率受限，正在重試（{attempt}/{maxAttempts}）…", "Codex のレート制限に達しました。再試行中（{attempt}/{maxAttempts}）…", "Codex 요청이 제한되어 다시 시도 중입니다 ({attempt}/{maxAttempts})…"],
   ["task.checkingLive", "Checking live updates…", "正在检查实时更新…", "正在檢查即時更新…", "ライブ更新を確認中…", "실시간 업데이트 확인 중…"],
   ["task.polling", "Snapshot updates · live stream unavailable", "快照更新 · 实时流不可用", "快照更新 · 即時串流無法使用", "スナップショット更新 · ライブストリームは利用不可", "스냅샷 업데이트 · 실시간 스트림 사용 불가"],
   ["task.updatesPaused", "Updates paused", "更新已暂停", "更新已暫停", "更新を一時停止中", "업데이트 일시 중지"],

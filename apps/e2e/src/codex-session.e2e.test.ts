@@ -25,6 +25,96 @@ import {
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
   ? it : it.skip;
 
+it.each([
+  { scenario: "retries an initial capacity rejection", errorInfo: "serverOverloaded", code: "CODEX_CAPACITY_BACKOFF", maxAttempts: 4, result: "retry" },
+  { scenario: "retries an exhausted generic HTTP 429", errorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 429 } },
+    code: "CODEX_RATE_LIMIT_BACKOFF", maxAttempts: 2, result: "retry" },
+  { scenario: "stops the original Run during capacity backoff", errorInfo: "serverOverloaded", code: "CODEX_CAPACITY_BACKOFF", maxAttempts: 4, result: "stop" },
+  { scenario: "does not replay after assistant output", errorInfo: "serverOverloaded", code: "CODEX_CAPACITY_BACKOFF", maxAttempts: 4, result: "fail" },
+  { scenario: "does not replay an account quota rejection", errorInfo: "usageLimitExceeded", code: "CODEX_CAPACITY_BACKOFF", maxAttempts: 4, result: "fail" }
+])("$scenario on the same ordinary Codex thread", { timeout: 40_000 }, async ({ errorInfo, code, maxAttempts, result }) => {
+  const backendId = "local-codex-rejected-turn";
+  const native = new FakeCodexAppServer();
+  const host = new AppServerHost({ transportFactory: () => native.createTransport() });
+  const fixture = await OrchestratorE2eFixture.start({ backendFactories: [{ instanceId: backendId, adapterKind: "codex", displayName: "Codex backoff fixture",
+    create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host }) }] });
+  try {
+    const { clients, connectionId } = await fixture.pair("Ordinary Codex owner");
+    const mutate = (mutation: Parameters<typeof submit>[2]) => submit(clients.operation, connectionId, mutation);
+    const sessionId = sessionIdFrom(await mutate(createSessionMutation({ backendId, targetId: fixture.targetId(backendId) })));
+    const { store } = fixture.application;
+    const binding = store.getSession(sessionId).descriptor.binding;
+    const threadId = binding.nativeSessionId!;
+    const text = "Keep this exact ordinary input in its original task.";
+    const original = await mutate(sendInputMutation(sessionId, BigInt(binding.generation), text));
+    const runId = queueRunIdFrom(original), queueId = queueItemIdFrom(original);
+    const read = () => clients.run.getRun({ runId });
+    const active = await waitFor(read, value => value.run?.state === RunState.RUNNING, "the first native turn to be accepted");
+    const attemptId = active.run!.activeAttemptId;
+    const thread = native.threads.get(threadId)!;
+    const first = thread.turns.at(-1)!;
+    const nativeError = { codexErrorInfo: errorInfo, message: "Controlled native rejection." };
+    const transport = native.transport!;
+    if (result === "fail" && errorInfo === "serverOverloaded") {
+      await transport.emitNotification("item/agentMessage/delta", { threadId, turnId: first["id"]!, itemId: "original-assistant", delta: "Partial output." });
+    }
+    await transport.emitNotification("error", { threadId, turnId: first["id"]!, willRetry: false, error: nativeError });
+    first["status"] = "failed";
+    first["error"] = nativeError;
+    thread.status = { type: "idle" };
+    await transport.emitNotification("turn/completed", { threadId, turn: first });
+    const starts = () => transport.requests.filter(request => request.method === "turn/start");
+    const timeline = async () => (await clients.session.listSessionTimeline({ sessionId, limit: 200 })).events;
+    if (result === "fail") {
+      await waitFor(read, value => value.run?.state === RunState.FAILED, "the original unsafe or ineligible input to fail");
+      expect((await timeline()).some(event => event.payload?.kind.case === "retryChanged")).toBe(false);
+      expect(starts()).toHaveLength(1);
+    } else {
+      const waiting = await waitFor(read, value => value.run?.state === RunState.RETRYING, "same Run in native backoff");
+      expect(waiting.run).toMatchObject({ runId, activeAttemptId: attemptId, attempts: [expect.any(Object)] });
+      expect(waiting.run?.error).toBeUndefined();
+      expect((await timeline()).find(event => event.payload?.kind.case === "retryChanged")).toMatchObject({
+        identity: { runId, attemptId, generation: BigInt(binding.generation) }, payload: { kind: { case: "retryChanged", value: {
+          state: RetryState.WAITING, attemptNumber: 1, maxAttempts, retryAt: expect.any(Object), error: { code }
+        } } }
+      });
+      if (result === "stop") {
+        expect((await mutate(abortRunMutation(runId))).state).toBe(OperationState.SUCCEEDED);
+        await waitFor(read, value => value.run?.state === RunState.ABORTED, "the original Run to stop during backoff");
+        await new Promise(resolve => setTimeout(resolve, 2_600));
+        expect(starts()).toHaveLength(1);
+      } else {
+        await waitFor(async () => starts().length, count => count === 2, "the exact frozen retry request", 21_000);
+        await waitFor(read, value => value.run?.state === RunState.RUNNING, "the accepted retry under the original Attempt");
+        const [before, after] = starts().map(request => request.params as JsonObject);
+        expect(after).toEqual({ ...before, clientUserMessageId: expect.stringMatching(/^joko-internal-retry:v1:[a-f0-9]{64}:1$/u) });
+        expect(thread.turns.at(-1)?.["id"]).not.toBe(first["id"]);
+        await native.completeTurn(threadId, "The original request succeeded.");
+        await waitFor(read, value => value.run?.state === RunState.SUCCEEDED, "the original Run's completed response");
+        const events = await timeline();
+        expect(events.some(event => event.payload?.kind.case === "terminalError")).toBe(false);
+        const originalUser = (first["items"] as JsonObject[])[0];
+        expect(events.filter(event => event.payload?.kind.case === "messageStarted"
+          && event.payload.kind.value.role === MessageRole.USER)).toMatchObject([{ payload: { kind: { value: {
+            nativeIdentity: { entryId: originalUser?.["id"] }, userInput: { parts: [{ content: { case: "text", value: text } }] }
+          } } } }]);
+        expect(events.filter(event => event.payload?.kind.case === "messageCompleted"
+          && event.payload.kind.value.role === MessageRole.ASSISTANT)).toMatchObject([{ payload: { kind: { value: {
+            blocks: [{ content: { case: "text", value: "The original request succeeded." } }]
+          } } } }]);
+        expect(store.listEvents({ sessionId, activeNativeTimeline: true }).some(event =>
+          event.payload.type === "status" && event.payload.key === "native_turn_failed")).toBe(false);
+      }
+    }
+    expect(store.getSession(sessionId).descriptor.binding).toEqual(binding);
+    expect(store.listRuns({ sessionId }).map(run => run.descriptor.id)).toEqual([runId]);
+    expect(store.listQueueItems({ sessionId }).map(queue => ({ id: queue.id, attemptId: queue.attemptId }))).toEqual([{ id: queueId, attemptId }]);
+  } finally {
+    await fixture.close();
+    await host.shutdown();
+  }
+});
+
 mountedIt("steers an existing paused input and a new composer input only into the original Codex turn", { timeout: 110_000 }, async () => {
   const backendId = "local-codex-steer";
   const native = new FakeCodexAppServer();

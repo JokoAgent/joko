@@ -3,7 +3,7 @@ import { InteractionKind, InteractionState, MessageRole, readDocumentOutput, rea
 import { projectPartnerLearningFeedback, type PartnerLearningFeedbackView } from "@joko/contracts";
 import { projectPartnerSessionTaskReceipt, type PartnerSessionTaskReceiptView } from "@joko/contracts";
 import { assistantStreamAttempt, codexSamplingInterruptedMessageId, isAssistantStreamBlock } from "@joko/contracts";
-import type { RetryChangedEvent } from "@joko/contracts";
+import { codexRetryProgressKind, type RetryChangedEvent } from "@joko/contracts";
 import { mobileInputSummary, mobileVisibleSelectionQuoteText } from "./mobile-composer-document";
 import { normalizeMobileReplyQuote, type MobilePartnerReplyQuote, normalizeMobileTodoQuote, type MobilePartnerTodoQuote } from './mobile-composer-document';
 import { mobileTimelineContent, mobileTimelineContentSourceKey, mobileTimelineToolMediaEvents } from "./mobile-timeline-content";
@@ -118,7 +118,7 @@ const FORBIDDEN_INLINE = /[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u
 const FORBIDDEN_MULTILINE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 
 export function mobileCodexReconnect(events: readonly Event[], sessionId: string | undefined, nativeGeneration: bigint | undefined,
-  cursorGeneration: bigint | undefined, runs: readonly Run[]): { attempt: number; maxAttempts: number } | undefined {
+  cursorGeneration: bigint | undefined, runs: readonly Run[]): { attempt: number; maxAttempts: number; backoff?: "capacity" | "rate-limit" } | undefined {
   if (!sessionId || nativeGeneration === undefined || cursorGeneration === undefined) return undefined;
   const currentRuns = new Map(runs.filter(run => run.sessionId === sessionId).map(run => [run.runId, run]));
   const latestRetry = new Map<string, { retry: RetryChangedEvent; sequence: bigint }>();
@@ -139,14 +139,14 @@ export function mobileCodexReconnect(events: readonly Event[], sessionId: string
     const scope = assistantStreamAttempt(event);
     if (!scope) continue;
     if (kind.case === "retryChanged") {
-      if (kind.value.error?.code === "CODEX_NATIVE_RECONNECT" && kind.value.runId === identity.runId
+      if (codexRetryProgressKind(kind.value.error?.code) && kind.value.runId === identity.runId
         && kind.value.attemptId === identity.attemptId && cursor.sequence > (latestRetry.get(scope)?.sequence ?? -1n)) {
         latestRetry.set(scope, { retry: kind.value, sequence: cursor.sequence });
       }
     } else if (cursor.sequence > (terminal.get(scope) ?? -1n)) terminal.set(scope, cursor.sequence);
   }
   let newest = -1n;
-  let progress: { attempt: number; maxAttempts: number } | undefined;
+  let progress: ReturnType<typeof mobileCodexReconnect>;
   for (const [scope, { retry, sequence }] of latestRetry) {
     if (sequence <= newest || sequence <= (terminal.get(scope) ?? -1n)) continue;
     const { runId, attemptId, state, attemptNumber, maxAttempts } = retry;
@@ -154,7 +154,8 @@ export function mobileCodexReconnect(events: readonly Event[], sessionId: string
     if (state === RetryState.WAITING && attemptNumber > 0 && maxAttempts !== undefined && maxAttempts >= attemptNumber
       && run?.activeAttemptId === attemptId && [RunState.RUNNING, RunState.WAITING, RunState.RETRYING].includes(run.state)) {
       newest = sequence;
-      progress = { attempt: attemptNumber, maxAttempts };
+      const kind = codexRetryProgressKind(retry.error?.code);
+      progress = { attempt: attemptNumber, maxAttempts, ...(kind === "capacity" || kind === "rate-limit" ? { backoff: kind } : {}) };
     }
   }
   return progress;
@@ -172,7 +173,7 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
     const kind = event.payload?.kind;
     const sequence = event.cursor?.sequence ?? 0n;
     if (!kind?.case) continue;
-    if (kind.case === "retryChanged" && kind.value.error?.code === "CODEX_NATIVE_RECONNECT") continue;
+    if (kind.case === "retryChanged" && codexRetryProgressKind(kind.value.error?.code)) continue;
     switch (kind.case) {
       case "partnerSessionTaskReceipt": {
         const receipt = projectPartnerSessionTaskReceipt(kind.value);

@@ -87,7 +87,7 @@ export class ArtifactStore {
   readonly #ticketTtlMs: number;
   readonly #now: () => number;
   readonly #permanentIngests = new Map<string, Promise<void>>();
-  readonly #nativePdfPublications = new Map<string, Promise<string>>();
+  readonly #nativeInputPublications = new Map<string, Promise<string>>();
   readonly #dispatchInputArtifacts = new AsyncLocalStorage<ActiveDispatchInputArtifacts>();
 
   constructor(options: ArtifactStoreOptions) {
@@ -320,28 +320,29 @@ export class ArtifactStore {
     return (await this.resolveBlobFile(blob)).path;
   }
 
-  /** Claude's native Read tool selects the PDF representation by path suffix. */
-  async resolveClaudeInputFile(blob: BlobRef): Promise<string> {
-    if (blob.mimeType.toLowerCase() !== "application/pdf" || this.dispatchInputArtifact(blob.id) !== undefined) {
+  /** Some native inputs need the original registered bytes behind a format-specific path. */
+  async resolveNativeInputFile(blob: BlobRef, format: keyof typeof nativeInputSuffixes): Promise<string> {
+    if (blob.mimeType.toLowerCase() !== format || this.dispatchInputArtifact(blob.id) !== undefined) {
       return this.resolveBlobPath(blob);
     }
     const artifact = await this.requireArtifact(blob.id);
     assertBlobIdentity(blob, artifact);
-    const operation = this.#nativePdfPublications.get(artifact.storagePath) ?? this.prepareNativePdfPath(artifact);
-    this.#nativePdfPublications.set(artifact.storagePath, operation);
+    const suffix = nativeInputSuffixes[format];
+    const key = `${artifact.storagePath}${suffix}`;
+    const operation = this.#nativeInputPublications.get(key) ?? this.prepareNativeInputPath(artifact, suffix);
+    this.#nativeInputPublications.set(key, operation);
     try {
       const path = await operation;
       assertBlobIdentity(blob, await this.requireArtifact(blob.id));
       return path;
     } finally {
-      if (this.#nativePdfPublications.get(artifact.storagePath) === operation) this.#nativePdfPublications.delete(artifact.storagePath);
+      if (this.#nativeInputPublications.get(key) === operation) this.#nativeInputPublications.delete(key);
     }
   }
 
-  private async prepareNativePdfPath(artifact: ArtifactRecord): Promise<string> {
+  private async prepareNativeInputPath(artifact: ArtifactRecord, suffix: NativeInputSuffix): Promise<string> {
     const original = await this.verifyStoragePath(artifact);
-    const storagePath = `${original.canonical}.pdf`;
-    const pdf = { ...artifact, storagePath };
+    const storagePath = `${original.canonical}${suffix}`;
     const existing = await lstat(storagePath).catch(ignoreMissingArtifactFile);
     if (existing === undefined) {
       const temporary = join(this.#options.rootDirectory, "incoming", randomUUID());
@@ -351,7 +352,7 @@ export class ArtifactStore {
         const current = await this.verifyStoragePath(artifact);
         if (copied.sha256 !== artifact.sha256 || copied.byteLength !== artifact.byteLength
           || current.canonical !== original.canonical || !sameFileIdentity(current.info, original.info)) {
-          throw new Error("The PDF attachment changed while its native path was prepared.");
+          throw new Error("The attachment changed while its native path was prepared.");
         }
         try { await rename(temporary, storagePath); }
         catch (error) {
@@ -360,7 +361,7 @@ export class ArtifactStore {
         }
       } finally { await rm(temporary, { force: true }); }
     }
-    await this.verifyPublishedContent(pdf, ".pdf");
+    await this.verifyPublishedContent({ ...artifact, storagePath }, suffix);
     return storagePath;
   }
 
@@ -471,13 +472,16 @@ export class ArtifactStore {
     const records = await this.#options.repository.deleteExpiredArtifacts(this.#now());
     const failures: unknown[] = [];
     let collected = 0;
+    const suffixes = Object.values(nativeInputSuffixes);
     for (const record of records) {
       try {
-        await this.#nativePdfPublications.get(record.storagePath)?.catch(() => undefined);
+        await Promise.all(suffixes.map(suffix => this.#nativeInputPublications.get(`${record.storagePath}${suffix}`)?.catch(() => undefined)));
         const verified = await this.verifyStoragePath(record).catch(ignoreMissingArtifactFile);
         if (await this.#options.repository.hasLiveStorageReference(record.storagePath)) continue;
-        const pdf = await this.verifyStoragePath({ ...record, storagePath: `${record.storagePath}.pdf` }, ".pdf").catch(ignoreMissingArtifactFile);
-        if (pdf !== undefined) await unlink(pdf.canonical).catch(ignoreMissingArtifactFile);
+        for (const suffix of suffixes) {
+          const native = await this.verifyStoragePath({ ...record, storagePath: `${record.storagePath}${suffix}` }, suffix).catch(ignoreMissingArtifactFile);
+          if (native !== undefined) await unlink(native.canonical).catch(ignoreMissingArtifactFile);
+        }
         if (verified === undefined) continue;
         const removed = await unlink(record.storagePath).then(() => true, ignoreMissingArtifactFile);
         if (removed) collected += 1;
@@ -620,7 +624,7 @@ export class ArtifactStore {
     } };
   }
 
-  private async verifyPublishedContent(artifact: Pick<ArtifactRecord, "storagePath" | "sha256" | "byteLength">, suffix: "" | ".pdf" = ""): Promise<void> {
+  private async verifyPublishedContent(artifact: Pick<ArtifactRecord, "storagePath" | "sha256" | "byteLength">, suffix: "" | NativeInputSuffix = ""): Promise<void> {
     const before = await this.verifyStoragePath(artifact, suffix);
     const handle = await open(before.canonical, "r");
     try {
@@ -640,7 +644,7 @@ export class ArtifactStore {
     }
   }
 
-  private async verifyStoragePath(artifact: Pick<ArtifactRecord, "storagePath" | "sha256">, suffix: "" | ".pdf" = ""): Promise<{
+  private async verifyStoragePath(artifact: Pick<ArtifactRecord, "storagePath" | "sha256">, suffix: "" | NativeInputSuffix = ""): Promise<{
     readonly canonical: string;
     readonly info: Awaited<ReturnType<typeof lstat>>;
   }> {
@@ -667,6 +671,9 @@ export class ArtifactStore {
     return { canonical, info };
   }
 }
+
+const nativeInputSuffixes = { "application/pdf": ".pdf", "image/gif": ".gif" } as const;
+type NativeInputSuffix = (typeof nativeInputSuffixes)[keyof typeof nativeInputSuffixes];
 
 function ignoreMissingArtifactFile(error: unknown): undefined {
   if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") throw error;
