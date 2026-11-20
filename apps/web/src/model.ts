@@ -2102,6 +2102,7 @@ export interface QueueItemView {
   /** Non-text attachments retained by the queue item. */
   readonly attachments?: readonly QueueInputAttachmentView[];
   readonly state: "accepted" | "dispatching" | "acceptedByBackend" | "dispatchUnknown" | "completed" | "cancelled" | "failed";
+  readonly retryRunId?: string;
   readonly editLocked: boolean;
   readonly ordinal: number;
   readonly createdAt: number;
@@ -6385,7 +6386,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   abort(runId: string, messageEdit?: { readonly sessionId: string; readonly expectedGeneration: bigint;
     readonly attemptId: string; readonly messageId: string; readonly eventId: string }): Promise<void>;
   abortRetry(runId: string): Promise<void>;
-  retry(runId: string): Promise<void>;
+  retry(runId: string, queueItem?: QueueItemView): Promise<void>;
   resetSession(sessionId: string): Promise<void>;
   deleteSessionMessage(sessionId: string, eventId: string, expectedGeneration?: bigint): Promise<void>;
   renameSession(sessionId: string, name: string): Promise<void>;

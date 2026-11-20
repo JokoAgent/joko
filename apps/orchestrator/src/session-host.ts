@@ -3367,6 +3367,30 @@ export class SessionHost {
     return execution;
   }
 
+  canRetryFailedQueueInput(item: QueueItemRecord): boolean {
+    if (item.state !== "failed" || item.disposition !== "prompt" || item.backendAcceptedAt !== undefined
+      || item.error?.retryable !== true || item.error.stateMayHaveChanged !== false) return false;
+
+    const run = this.#store.findRun(item.runId)?.descriptor;
+    if (run?.sessionId !== item.sessionId || run.source !== "user" || run.parentRunId !== undefined
+      || run.state !== "failed" || run.error?.retryable !== true || run.error.stateMayHaveChanged !== false
+      || !this.isOwnerRunInput(item)) return false;
+
+    if (this.#store.findRunByParentId(run.id) !== undefined) return false;
+
+    const stored = this.#store.getSession(item.sessionId);
+    const session = stored.descriptor;
+    const target = this.#store.getTarget(session.targetId).descriptor;
+    const remote = session.remoteWorkspace;
+    return target.trusted && (remote === undefined || remote.kind === "ssh")
+      && sameRemoteWorkspaceBinding(remote, target.remoteWorkspace)
+      && this.#store.getBackend(session.backendId).descriptor.adapterKind === "codex"
+      && this.isOrdinarySession(stored) && !this.isReviewReadOnlySession(item.sessionId)
+      && this.#store.findObjective(item.sessionId) === undefined && !this.#providerGroupApplies(item)
+      && this.#store.findSetting("session", item.sessionId, `mcp_app_queue:${item.id}`) === undefined
+      && this.#store.findSetting("session", item.sessionId, `extension_card_queue:${item.id}`) === undefined;
+  }
+
   manualRetryPrompt(run: RunDescriptor, source: QueueItemRecord): PromptInput {
     const stored = this.#store.getSession(run.sessionId);
     if (run.source !== "user" || source.disposition !== "prompt" || source.body.messagingOrigin !== undefined
@@ -11342,7 +11366,12 @@ export class SessionHost {
     const session = stored.descriptor;
     return session.remoteWorkspace === undefined
       && this.#store.getTarget(session.targetId).descriptor.remoteWorkspace === undefined
-      && session.automationOrigin === undefined && session.derivationOrigin?.sideChat !== true
+      && this.isOrdinarySession(stored);
+  }
+
+  private isOrdinarySession(stored: StoredSession): boolean {
+    const session = stored.descriptor;
+    return session.automationOrigin === undefined && session.derivationOrigin?.sideChat !== true
       && !session.hidden && !session.archived && session.deletedAt === undefined
       && this.#store.sessionCreationServiceKind(session.id) === undefined
       && this.#partnerSessionPolicy(session.id) === undefined

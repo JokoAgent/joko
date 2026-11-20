@@ -1945,6 +1945,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
         timelinePageSize: 200,
         hideSessionFromCatalog: sessionId => dependencies.partnerGroupRuntime?.isGroupSession(sessionId) === true,
         hideTargetFromCatalog: targetId => dependencies.partnerGroupRuntime?.isGroupTarget(targetId) === true,
+        canRetryFailedQueueInput: item => dependencies.sessionHost.canRetryFailedQueueInput?.(item) === true,
         resolveSessionContextDefaults: dependencies.resolveSessionContextDefaults,
         resolveSideChatSourceAllowed: sessionId => dependencies.sessionHost.sideChatSourceAllowed(sessionId),
         resolveSessionRuntimeModel: ({ sessionId }) =>
@@ -3440,7 +3441,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
         offset: window.offset
       };
       const values = dependencies.store.listQueueItems(query)
-        .map((item, index) => mapQueueItem(dependencies.store, item, BigInt(window.offset + index), dependencies.taskShares));
+        .map((item, index) => mapQueueItem(dependencies.store, item, BigInt(window.offset + index), dependencies.taskShares,
+          dependencies.sessionHost.canRetryFailedQueueInput?.(item) === true));
       const result = storePage(values, dependencies.store.countQueueItems(query), window);
       return { queueItems: result.values, page: result.page };
     },
@@ -8009,7 +8011,9 @@ function eventContext(
     ...(session === undefined ? {} : { session }),
     ...(target === undefined ? {} : { target }),
     ...(run === undefined ? {} : { run, attempts: store.listAttempts(run.descriptor.id) }),
-    ...(queueItem === undefined ? {} : { queueItem }),
+    ...(queueItem === undefined ? {} : { queueItem,
+      retryQueueInputBeforeDispatch: item.payload.type === "queue_update"
+        && dependencies.sessionHost.canRetryFailedQueueInput?.(queueItem) === true }),
     ...(queueControl === undefined ? {} : { queueControl }),
     ...(interaction === undefined ? {} : { interaction }),
     ...(artifact === undefined ? {} : { artifact }),
@@ -8174,13 +8178,15 @@ export function mapRun(store: OperationalStore, record: StoredRun): contract.Run
   });
 }
 
-export function mapQueueItem(store: OperationalStore, item: QueueItemRecord, ordinal: bigint, taskShares?: TaskShareStore): contract.QueueItem {
+export function mapQueueItem(store: OperationalStore, item: QueueItemRecord, ordinal: bigint, taskShares?: TaskShareStore,
+  retryBeforeDispatch = false): contract.QueueItem {
   const session = store.getSession(item.sessionId);
   const run = store.getRun(item.runId);
   return toProtoQueueItem(item, {
     backendId: session.descriptor.backendId,
     targetId: session.descriptor.targetId,
     source: run.descriptor.source,
+    retryBeforeDispatch,
     sharedTaskAuthor: taskShares?.getAuthorForOperation(item.operationId),
     ...(run.descriptor.parentRunId === undefined ? {} : { parentRunId: run.descriptor.parentRunId }),
     generation: session.descriptor.binding.generation
@@ -18706,6 +18712,7 @@ async function dispatchMutation(
     }
     case "retryRun": {
       const run = dependencies.store.getRun(payload.value.runId);
+      const queuePrecondition = mutation.preconditions.find(condition => condition.entity?.kind === contract.EntityKind.QUEUE_ITEM);
       if (dependencies.store.findMessagingInboundRequestByRunId(run.descriptor.id)?.protectedContent === true) {
         return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Send a new message from Telegram to repeat this protected input.");
       }
@@ -18721,6 +18728,10 @@ async function dispatchMutation(
       }
       const previous = dependencies.store.findQueueItemByRunId(run.descriptor.sessionId, run.descriptor.id);
       if (previous === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "The original durable queue input is unavailable.");
+      if (queuePrecondition !== undefined && (queuePrecondition.entity?.id !== previous.id
+        || queuePrecondition.expectedRevision === undefined || queuePrecondition.expectedGeneration < 1n)) {
+        throw invalidArgument("retry_run requires the original queued input's revision and generation");
+      }
       if (dependencies.store.findRunByParentId(run.descriptor.id) !== undefined) {
         return unsupportedOperation(
           dependencies,
@@ -18750,12 +18761,20 @@ async function dispatchMutation(
         kind: payload.case,
         body: mutation,
         precondition: assertRetryable,
+        // The nested admission can advance the Session generation as it wakes the runtime.
+        preconditionScope: queuePrecondition === undefined ? "claim-and-commit" : "claim",
         commit: () => ({ accepted: true, resultCase: "run", entityId: runId } satisfies OperationOutcome),
         effect: async () => {
           const store = dependencies.store;
           const current = assertRetryable(store);
           const source = store.findQueueItemByRunId(current.sessionId, current.id);
           if (source?.id !== previous.id) throw new StoreError("The original durable queue input is unavailable.");
+          if (queuePrecondition !== undefined) {
+            validatePreconditions(store, mutation);
+            if (!host.canRetryFailedQueueInput(source)) {
+              throw new StoreError("The original queued input is no longer eligible for a retry before dispatch.");
+            }
+          }
           const nested = dependencies.sessionHost.enqueueInput({
             operationId: nestedId,
             connection,

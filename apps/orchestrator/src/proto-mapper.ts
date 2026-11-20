@@ -350,6 +350,7 @@ export interface EventMappingContext {
   readonly learning?: import("@joko/core").PartnerLearningFeedback;
   readonly partnerPackageOpening?: import("@joko/core").PartnerPackageOpeningMessage & { readonly starterAvailable: boolean };
   readonly queueItem?: QueueItemRecord;
+  readonly retryQueueInputBeforeDispatch?: boolean;
   readonly queueControl?: QueueControlRecord;
   readonly interaction?: InteractionRecord;
   readonly artifact?: ArtifactRecord;
@@ -1111,6 +1112,7 @@ export function toProtoQueueItem(
     readonly parentRunId?: string;
     readonly generation: number;
     readonly sharedTaskAuthor?: import("@joko/store").SharedTaskAuthor;
+    readonly retryBeforeDispatch?: boolean;
   },
   ordinal = 0n
 ): ProtoQueueItem {
@@ -1138,6 +1140,7 @@ export function toProtoQueueItem(
       ? undefined
       : unsignedBigInt(item.backendInstanceGeneration, "queue_item.backend_instance_generation"),
     editLocked: item.editLocked,
+    retryBeforeDispatch: routing.retryBeforeDispatch ?? false,
     sharedTaskAuthor: routing.sharedTaskAuthor === undefined ? undefined : toProtoSharedTaskAuthor(routing.sharedTaskAuthor)
   });
 }
@@ -3320,6 +3323,7 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
           backendId: event.backendId,
           targetId: event.targetId,
           source: context.run.descriptor.source,
+          retryBeforeDispatch: context.retryQueueInputBeforeDispatch ?? false,
           ...(context.run.descriptor.parentRunId === undefined
             ? {}
             : { parentRunId: context.run.descriptor.parentRunId }),

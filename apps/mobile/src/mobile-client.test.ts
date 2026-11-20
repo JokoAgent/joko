@@ -11512,6 +11512,47 @@ describe("native current-task message and Queue actions", () => {
     });
   });
 
+  it("reconciles the exact known queue retry without resending it after an unknown receipt", async () => {
+    const generation = queueSnapshot.sessions[0]!.nativeBinding!.runtimeGeneration;
+    const failed = create(QueueItemSchema, { ...queueTwo, runId: "original-run", state: QueueItemState.FAILED, retryBeforeDispatch: true,
+      version: { ...queueTwo.version!, generation } });
+    const unknown = create(QueueItemSchema, { ...failed, queueItemId: "unknown-queue", runId: "unknown-run", state: QueueItemState.DISPATCH_UNKNOWN });
+    const before = create(SnapshotSchema, { ...queueSnapshot, queueItems: [queueOne, failed, unknown] });
+    const network = projectedNetwork(before);
+    const saved = memoryStorage(credential);
+    vi.mocked(network.submit).mockRejectedValueOnce(new Error("The original retry response was lost."));
+    const app = client(network, saved.storage, undefined, undefined, ids());
+    await app.start();
+
+    expect(app.taskQueueItems().map(item => item.queueItemId)).toEqual([queueOne.queueItemId]);
+    expect(app.taskRetryableQueueItems().map(item => item.queueItemId)).toEqual([failed.queueItemId]);
+    await expect(app.retryQueueItem(unknown)).rejects.toThrow(/no longer available/u);
+    await expect(app.retryQueueItem(failed)).resolves.toBe(false);
+    expect(network.submit).toHaveBeenCalledOnce();
+    const [, operationId, mutation] = vi.mocked(network.submit).mock.calls[0]!;
+    expect(mutation).toMatchObject({ preconditions: [{ entity: { kind: EntityKind.QUEUE_ITEM, id: failed.queueItemId },
+      expectedRevision: failed.version!.revision, expectedGeneration: generation }],
+      payload: { case: "retryRun", value: { runId: failed.runId } } });
+    expect(saved.pending()).toMatchObject([{ operationId, kind: "queue-retry", queueItemId: failed.queueItemId, runId: failed.runId, state: "unknown" }]);
+    await expect(app.retryQueueItem(failed)).rejects.toThrow(/a previous change/iu);
+
+    const receipt = (retryOfRunId: string) => create(OperationSchema, { operationId, connectionId: credential.connectionId,
+      state: OperationState.SUCCEEDED, mutation, result: { payload: { case: "run", value: { runId: "continuation",
+        retryOfRunId, sessionId: failed.sessionId } } } });
+    vi.mocked(network.getOperation).mockResolvedValueOnce(receipt("wrong-run"));
+    await app.reconcile();
+    expect(saved.pending()).toHaveLength(1);
+    const after = create(SnapshotSchema, { ...before, queueItems: [queueOne, { ...failed, retryBeforeDispatch: false }, unknown] });
+    vi.mocked(network.readSession).mockResolvedValue(after);
+    vi.mocked(network.readOwner).mockResolvedValue({ connection, device, snapshot: after });
+    vi.mocked(network.getOperation).mockResolvedValueOnce(receipt(failed.runId));
+    await app.reconcile();
+    expect(saved.pending()).toEqual([]);
+    expect(app.taskRetryableQueueItems()).toEqual([]);
+    expect(network.submit).toHaveBeenCalledOnce();
+    await app.dispose();
+  });
+
   it("locks, replaces, and unlocks one Queue item while revoking covered reference authority", async () => {
     const network = projectedNetwork(queueSnapshot);
     const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids());

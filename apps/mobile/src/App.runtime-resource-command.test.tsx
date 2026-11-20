@@ -135,7 +135,7 @@ const client = new Proxy({
   taskRuntimeCommandControls: () => current ? runtime : undefined,
   listTaskRuntimeCommands: vi.fn(async () => catalog),
   resolveTaskRuntimeCommandResource: resolveResource,
-  taskQueueItems: () => empty, taskQueueCapabilities: () => ({}),
+  taskQueueItems: () => empty, taskRetryableQueueItems: () => empty, taskQueueCapabilities: () => ({}),
   taskStopControl: () => stopControl, stopTaskTurn,
   taskInteractions: () => pendingMobileInteractions(renderedState.detail, renderedState.selectedId), subscribe: () => () => {},
   taskPendingImagePasteCount: () => 0, taskForeground: () => true,

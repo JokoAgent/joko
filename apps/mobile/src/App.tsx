@@ -4542,6 +4542,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   }, [messageFocusIndex, messageFocusKey, onReadingPositionHandled, readingFocus, readingFocusOwner]);
   const unknown = state.pending.some((item) => item.kind === "send" && item.sessionId === state.selectedId && item.state === "unknown");
   const queueItems = client.taskQueueItems();
+  const retryableQueueItems = workerReadOnly ? [] : client.taskRetryableQueueItems();
   const sharedQueueResume = state.taskSource?.kind === "joined" ? client.taskSharedQueueResumeControl() : undefined;
   const composerAvailable = state.status === "connected" || client.canQueueTaskInput?.() === true;
   const advertisedQueueCapabilities = client.taskQueueCapabilities();
@@ -4686,7 +4687,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     || runtimeControls.canSetEffort || runtimeControls.canSetFastMode
     || runtimeControls.canSetPermission || runtimeControls.canSetPlanMode);
   const queueMutationPending = state.pending.some((item) => item.sessionId === state.selectedId
-    && ["queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder"].includes(item.kind));
+    && ["queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder", "queue-retry"].includes(item.kind));
   const conversationShare = useMobileConversationShare({ client, rows: partnerRows ?? rows, locale,
     onNativeActivityChange: (active) => { attachmentNativeActivityRef.current = active; } });
   const timelineFollowSource = activeMessageFocus === undefined && state.window === undefined && !conversationShare.active ? sendFollowSource : undefined;
@@ -7715,7 +7716,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         </View>)}
       </ScrollView>
     </View>}
-    {(queueItems.length > 0 || sharedQueueResume !== undefined) && <View ref={queueViewportRef} collapsable={false} style={styles.queueRegion}
+    {(queueItems.length > 0 || retryableQueueItems.length > 0 || sharedQueueResume !== undefined) && <View ref={queueViewportRef} collapsable={false} style={styles.queueRegion}
       onLayout={() => setImageViewportPulse(value => value + 1)}>
       <View style={sharedQueueResume === undefined ? undefined : styles.actionRow}>
         <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "task.queue")}</Text>
@@ -7762,6 +7763,13 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           </View>
         </View>;
       })}
+      {retryableQueueItems.map(item => <View key={item.queueItemId} style={[styles.queueCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+        <Text style={[styles.caption, { color: colors.negative }]}>{queueState(item.state, locale)}</Text>
+        <Text selectable style={[styles.body, { color: colors.ink }]}>{queueItemSummary(item, locale)}</Text>
+        <View style={styles.queueActions}><Action label={mobileMessage(locale, "common.retry")} colors={colors} compact
+          disabled={state.busy || voice.busy || queueMutationPending || interactions.length > 0 || queueEdit !== undefined}
+          onPress={() => mutateQueue(() => client.retryQueueItem(item))} /></View>
+      </View>)}
       </ScrollView>
     </View>}
     {state.pending.filter((item) => item.sessionId === state.selectedId).map((item) => <View key={item.operationId} style={styles.pending}>
