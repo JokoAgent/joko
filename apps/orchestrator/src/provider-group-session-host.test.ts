@@ -17,6 +17,7 @@ import { createClient, createRouterTransport } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { createProviderGroupConnectService } from "./provider-group-connect-service.js";
 import { ProviderGroupRemoteRouter } from "./provider-group-remote.js";
+import { toProtoQueueItem } from "./proto-mapper.js";
 import { mkdtemp } from "./test-paths.js";
 
 const cleanups: (() => Promise<void>)[] = [];
@@ -75,8 +76,15 @@ it("durably wakes the same undispatched input after a quota reset and a real Sto
   quotaBoundary(f, resetAt); const send = vi.spyOn(f.first, "send"), queued = f.send(sessionId, "quota-wait-original");
   await until(() => f.store.findSetting("session", sessionId, `provider.group-error:${queued.runId}`)?.value !== undefined);
   expect(f.store.getQueueItem(queued.queueItemId).state).toBe("accepted"); expect(send).not.toHaveBeenCalled();
+  const wire = (store: OperationalStore) => toProtoQueueItem(store.getQueueItem(queued.queueItemId), {
+    backendId: f.first.id, targetId: "target", source: "user", generation: store.getSession(sessionId).descriptor.binding.generation
+  });
+  expect(contract.queueQuotaRetryAt(wire(f.store))).toBe(resetAt);
+  expect(f.store.listEvents({ sessionId }).some(event => event.payload.type === "queue_update"
+    && event.payload.itemId === queued.queueItemId && event.traceId.endsWith(`:quota:${resetAt}`))).toBe(true);
   const restored = await reopenGroupHost(f, resetAt), resumedSend = vi.spyOn(restored.first, "send");
   expect(restored.store.getSetting("session", sessionId, `provider.group-error:${queued.runId}`).value).toMatchObject({ kind: "queue-head", queueItemId: queued.queueItemId, operationId: "quota-wait-original", resumeAt: resetAt });
+  expect(contract.queueQuotaRetryAt(wire(restored.store))).toBe(resetAt);
   expect(resumedSend).not.toHaveBeenCalled();
   const clock = vi.spyOn(Date, "now").mockReturnValue(resetAt + 1);
   try {
@@ -84,6 +92,7 @@ it("durably wakes the same undispatched input after a quota reset and a real Sto
     restored.host.requestQueueDrain(sessionId); expect(resumedSend).toHaveBeenCalledOnce();
     expect(restored.store.listRuns({ sessionId })).toHaveLength(1); expect(restored.store.getOperation("quota-wait-original").status).toBe("completed");
     expect(restored.store.findSetting("session", sessionId, `provider.group-error:${queued.runId}`)).toBeUndefined();
+    expect(contract.queueQuotaRetryAt(wire(restored.store))).toBeUndefined();
   } finally { clock.mockRestore(); }
 });
 
@@ -120,6 +129,7 @@ it.each(["reorder", "withdraw"] as const)("retires the quota wait when the owner
   await until(() => f.store.getQueueItem(second.queueItemId).state === "completed");
   expect(Date.now()).toBeLessThan(resetAt);
   expect(f.store.findSetting("session", sessionId, key)).toBeUndefined();
+  expect(f.store.getQueueItem(first.queueItemId).error?.retryAt).toBeUndefined();
   expect(secondSend.mock.calls[0]?.[0].text).toContain("new-queue-head");
   if (action === "withdraw") expect(f.store.getQueueItem(first.queueItemId).state).toBe("cancelled");
 });

@@ -10202,6 +10202,25 @@ export class OperationalStore {
     return numberValue(row["count"]);
   }
 
+  setQueueQuotaWait(queueItemId: string, retryAt?: number): void {
+    this.write(() => {
+      const item = this.getQueueItem(queueItemId);
+      if (item.state !== "accepted" || item.error?.retryAt === retryAt) return;
+      if (retryAt !== undefined && (!Number.isSafeInteger(retryAt) || retryAt <= 0)) throw new StoreError("Invalid queue quota retry time.");
+      const error: QueueItemRecord["error"] = retryAt === undefined ? undefined : {
+        code: "PROVIDER_GROUP_UNAVAILABLE", message: "This queued input is waiting for Provider quota.",
+        phase: "dispatch", retryable: false, stateMayHaveChanged: false,
+        recovery: "Wait for automatic dispatch or remove this input.", retryAt
+      };
+      const session = this.getSession(item.sessionId);
+      this.database.prepare("UPDATE queue_items SET error_json = ?, updated_at = ?, revision = ? WHERE id = ?")
+        .run(error === undefined ? null : serializeJson(error), this.now(), asSqlInteger(this.requireActiveRevision()), item.id);
+      const attempt = item.attemptId === undefined ? undefined : this.getAttempt(item.attemptId).descriptor;
+      this.appendQueueEvent(this.getQueueItem(item.id), session, `queue:${item.id}:quota:${retryAt ?? "cleared"}`,
+        attempt?.generation === session.descriptor.binding.generation ? undefined : null);
+    });
+  }
+
   findAcceptedNativeSteer(sessionId: string, manualPauseOnly: boolean): QueueItemRecord | undefined {
     this.assertOpen();
     const row = this.database.prepare(`
@@ -21814,7 +21833,7 @@ function queueItemFromRow(row: Row, at: number): QueueItemRecord {
     ...optionalNumber("dispatchedAt", row["dispatched_at"]),
     ...optionalNumber("backendAcceptedAt", row["backend_accepted_at"]),
     ...optionalNumber("completedAt", row["completed_at"]),
-    ...optionalJson<PublicError, "error">("error", row["error_json"]),
+    ...optionalJson<NonNullable<QueueItemRecord["error"]>, "error">("error", row["error_json"]),
     editLocked: editLockExpiresAt !== undefined && editLockExpiresAt > at,
     revision: toBigInt(row["revision"])
   };

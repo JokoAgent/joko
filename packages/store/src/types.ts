@@ -1309,7 +1309,7 @@ export interface QueueItemRecord extends QueueItemDescriptor {
   readonly executionOverrides?: TurnExecutionOverrides;
   readonly updatedAt: UnixMillis;
   readonly completedAt?: UnixMillis;
-  readonly error?: PublicError;
+  readonly error?: PublicError & { readonly retryAt?: UnixMillis };
   readonly editLocked: boolean;
   readonly revision: bigint;
 }

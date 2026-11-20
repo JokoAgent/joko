@@ -2103,6 +2103,7 @@ export interface QueueItemView {
   readonly attachments?: readonly QueueInputAttachmentView[];
   readonly state: "accepted" | "dispatching" | "acceptedByBackend" | "dispatchUnknown" | "completed" | "cancelled" | "failed";
   readonly retryRunId?: string;
+  readonly quotaRetryAt?: number;
   readonly editLocked: boolean;
   readonly ordinal: number;
   readonly createdAt: number;

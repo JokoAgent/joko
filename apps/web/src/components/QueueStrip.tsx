@@ -7,7 +7,7 @@ import { equalQueueItemTextEdit, insertQueueDirectory, queueItemEditProjection, 
 import { randomUuid } from "../web-crypto.js";
 import { composerQueueWindow, resolveQueueReorderShortcut, type ComposerAttachmentPolicy } from "./composer-behavior.js";
 import type { RunAction, Translator } from "./types.js";
-import { Button, IconButton, Pill, cx, formatBytes } from "./ui.js";
+import { Button, IconButton, Pill, cx, formatBytes, formatDateTime } from "./ui.js";
 import { QueueLockLease } from "./queue-lock-lease.js";
 import { QueueInputPreview } from "./QueueInputPreview.js";
 import { canEditSharedQueueItem } from "../task-sharing.js";
@@ -535,6 +535,9 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, s
               {item.source !== "user" && <Pill tone="neutral">{queueSourceLabel(item.source, t)}</Pill>}
               {editLocked && <Pill tone="warning">{t("queue.editLocked")}</Pill>}
               <QueueInputPreview {...item} t={t} />
+              {item.quotaRetryAt !== undefined && <Pill tone="warning">{t("queue.quotaWait", {
+                time: formatDateTime(item.quotaRetryAt, controller.state.effectiveLocale)
+              })}</Pill>}
               {retryRunId !== undefined && <><Pill tone="warning">{t("timeline.failed")}</Pill>
                 <div className="queue-strip__actions"><Button disabled={pending} onClick={() => {
                   const attempt = trackItemAction(item.id, `retry-queue:${item.id}`, () => controller.retry(retryRunId, item));

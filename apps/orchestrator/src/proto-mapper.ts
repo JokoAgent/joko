@@ -1116,6 +1116,14 @@ export function toProtoQueueItem(
   },
   ordinal = BigInt(item.position)
 ): ProtoQueueItem {
+  const queueError = optionalError(item.error);
+  if (item.state === "accepted" && queueError !== undefined && item.error?.retryAt !== undefined) {
+    queueError.severity = ErrorSeverity.WAITING;
+    queueError.recoveryActions = [message<RecoveryAction>("joko.v1.RecoveryAction", {
+      kind: RecoveryActionKind.WAIT, label: item.error.recovery,
+      retryAfter: toProtoDuration(Math.max(0, item.error.retryAt - item.updatedAt))
+    })];
+  }
   return message<ProtoQueueItem>("joko.v1.QueueItem", {
     queueItemId: item.id,
     backendId: routing.backendId,
@@ -1134,7 +1142,7 @@ export function toProtoQueueItem(
     acceptedAt: toProtoTimestamp(item.createdAt),
     dispatchedAt: optionalTimestamp(item.dispatchedAt),
     version: toProtoEntityVersion(item.revision, routing.generation, item.updatedAt),
-    error: optionalError(item.error),
+    error: queueError,
     input: toProtoInputContent(item.body),
     backendInstanceGeneration: item.backendInstanceGeneration === undefined
       ? undefined

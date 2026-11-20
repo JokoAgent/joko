@@ -21,7 +21,7 @@ import Constants from "expo-constants";
 import { randomUUID } from "expo-crypto";
 import * as Clipboard from "expo-clipboard";
 import {
-  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, InteractionState, ModelSourceKind, QueueItemState, QueueSourceKind, RuntimeCommandInputMode, SessionState, TargetState, WorkspaceKind, capabilityNames, partnerResumeMessages,
+  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, InteractionState, ModelSourceKind, QueueItemState, QueueSourceKind, RuntimeCommandInputMode, SessionState, TargetState, WorkspaceKind, capabilityNames, partnerResumeMessages, queueQuotaRetryAt,
   partnerSessionTaskMessages, partnerSessionTaskReceiptLabel,
   type QueueItem, type Session
 } from "@joko/contracts";
@@ -7752,8 +7752,12 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         const editing = queueEdit?.lease.queueItemId === item.queueItemId;
         const disabled = state.busy || voice.busy || state.status !== "connected" || queueMutationPending || interactions.length > 0 || (!!queueEdit && !editing);
         const editableText = queueItemText(item.input);
+        const quotaRetryAt = queueQuotaRetryAt(item);
         return <View key={item.queueItemId} style={[styles.queueCard, { backgroundColor: colors.surface, borderColor: editing ? colors.accent : colors.border }]}>
           <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "task.queued")} {index + 1} · {queueState(item.state, locale)}{item.editLocked && !editing ? mobileMessage(locale, "task.editingElsewhere") : ""}</Text>
+          {quotaRetryAt !== undefined && <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "task.queueQuotaWait", {
+            time: new Date(quotaRetryAt).toLocaleString(locale)
+          })}</Text>}
           {item.sharedTaskAuthor?.displayName && <Text style={[styles.caption, { color: colors.muted }]}>{item.sharedTaskAuthor.displayName}</Text>}
           <Text selectable style={[styles.body, { color: colors.ink }]}>{queueItemSummary(item, locale)}</Text>
           <View style={styles.actionRow}>{client.taskQueueImagePages(item.queueItemId).map((image, imageIndex, images) =>

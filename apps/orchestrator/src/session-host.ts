@@ -7055,7 +7055,8 @@ export class SessionHost {
       this.#cancelProviderGroupWait(sessionId);
       for (const setting of this.#store.listSettingsByKeyPrefix("session", sessionId, "provider.group-error:")) {
         const held = this.#heldProviderGroupRecovery(sessionId, setting.key.slice("provider.group-error:".length));
-        this.#store.deleteSetting("session", sessionId, setting.key);
+        if (held?.kind === "queue-head") this.#writeQueuedProviderGroupWait(held);
+        else this.#store.deleteSetting("session", sessionId, setting.key);
         if (held?.kind === "active-turn" && this.#store.getRun(held.runId).descriptor.state === "failed") {
           this.#publishHeldProviderGroupError(sessionId, held.runId, held.payload.error);
           if (this.#store.findQueueItemByRunId(sessionId, held.runId, { includeCleared: true })?.body.messagingOrigin) void this.notifyServiceRunSettled(sessionId, held.runId, "aborted");
@@ -7184,6 +7185,14 @@ export class SessionHost {
   #cancelProviderGroupWait(sessionId: string): void {
     const wait = this.#providerGroupWaits.get(sessionId); if (wait) clearTimeout(wait.timer); this.#providerGroupWaits.delete(sessionId);
   }
+  #writeQueuedProviderGroupWait(original: HeldProviderGroupRecovery, next?: HeldProviderGroupRecovery): void {
+    const key = `provider.group-error:${original.runId}`;
+    this.#store.transaction(store => {
+      if (next === undefined) store.deleteSetting("session", original.sessionId, key);
+      else store.setSetting("session", original.sessionId, key, next);
+      store.setQueueQuotaWait(original.queueItemId, next?.resumeAt);
+    });
+  }
   #scheduleProviderGroupWait(record: HeldProviderGroupRecovery): void {
     if (record.resumeAt === undefined || this.#disposed) return;
     this.#cancelProviderGroupWait(record.sessionId);
@@ -7223,7 +7232,8 @@ export class SessionHost {
         const run = this.#store.getRun(runId).descriptor, queue = this.#store.getQueueItem(held.queueItemId);
         const continuation = this.providerGroupContinuation(queue);
         if (continuation.claimed || run.state === "completed" || run.state === "aborted" || !this.#providerGroupRecoverySourceCurrent(held)) {
-          this.#store.deleteSetting("session", sessionId, setting.key);
+          if (held.kind === "queue-head") this.#writeQueuedProviderGroupWait(held);
+          else this.#store.deleteSetting("session", sessionId, setting.key);
           if (this.#providerGroupWaits.get(sessionId)?.runId === runId) this.#cancelProviderGroupWait(sessionId);
           if (held.kind === "queue-head") {
             this.#providerGroups.service.router.clearTurn(sessionId);
@@ -7240,9 +7250,13 @@ export class SessionHost {
           || this.#store.getAttempt(held.attemptId).descriptor.endedAt === undefined
           || nativeDispatchRecoveryJournal(this.#store.findSetting("session", sessionId, SESSION_NATIVE_DISPATCH_RECOVERY_SETTING_KEY)?.value)?.entries.some(entry => entry.runId === runId))) continue;
         if (held.kind === "queue-head" && (run.state !== "queued" || queue.state !== "accepted")) continue;
-        if (held.resumeAt !== undefined && held.resumeAt > Date.now()) { this.#scheduleProviderGroupWait(held); continue; }
+        if (held.resumeAt !== undefined && held.resumeAt > Date.now()) {
+          if (held.kind === "queue-head") this.#store.setQueueQuotaWait(held.queueItemId, held.resumeAt);
+          this.#scheduleProviderGroupWait(held);
+          continue;
+        }
         if (held.kind === "queue-head") {
-          this.#store.setSetting("session", sessionId, setting.key, { ...held, resumeAt: undefined }); this.#cancelProviderGroupWait(sessionId);
+          this.#writeQueuedProviderGroupWait(held, { ...held, resumeAt: undefined }); this.#cancelProviderGroupWait(sessionId);
           this.#providerGroups.service.router.clearTurn(sessionId); void this.drain(sessionId);
         } else if (!(held.handoff || held.guestHandoff) || !["effect", "unknown"].includes(this.#runtimeHandoffs.read(sessionId)?.pending?.phase ?? "")) {
           void this.#recoverProviderGroup(sessionId, runId, held.payload.error);
@@ -15346,7 +15360,7 @@ export class SessionHost {
             });
             const held = this.#heldProviderGroupRecovery(sessionId, pending.runId);
             if (held?.kind === "queue-head" && held.queueItemId === pending.id) {
-              this.#store.deleteSetting("session", sessionId, `provider.group-error:${pending.runId}`); this.#cancelProviderGroupWait(sessionId);
+              this.#writeQueuedProviderGroupWait(held); this.#cancelProviderGroupWait(sessionId);
             }
           }
           catch (error) {
@@ -15362,7 +15376,7 @@ export class SessionHost {
                   stateMayHaveChanged: false, recovery: "Keep this queued input or explicitly cancel it." } }, "queue-head");
               if (captured && captured.attempts < 32 && this.#providerGroupRecoverySourceCurrent(captured)) {
                 const wait = { ...captured, resumeAt: Math.ceil(error.retryAt), attempts: captured.attempts + 1 };
-                this.#store.setSetting("session", sessionId, `provider.group-error:${pending.runId}`, wait); this.#scheduleProviderGroupWait(wait);
+                this.#writeQueuedProviderGroupWait(captured, wait); this.#scheduleProviderGroupWait(wait);
               }
             }
             this.providerGroupSessionPort().status(sessionId, "unavailable");

@@ -294,6 +294,7 @@ import {
   QueueDispatchState,
   QueueEdge,
   QueueItemState,
+  queueQuotaRetryAt,
   QueueSourceKind,
   QueueTextEditSpliceSchema,
   ResourceAcquisitionSourceSchema,
@@ -16382,6 +16383,7 @@ function mapQueueItem(item: QueueItem): QueueItemView {
   const pastedTextRanges = messageInputPastedTextRanges(item.input, text);
   const mentionRanges = messageInputMentionRanges(item.input, text, inputMentions.length, pastedTextRanges);
   const attachments = messageInputAttachments(item.input);
+  const quotaRetryAt = queueQuotaRetryAt(item);
   return {
     id: item.queueItemId,
     ...(item.sharedTaskAuthor === undefined ? {} : { sharedTaskAuthor: item.sharedTaskAuthor }),
@@ -16399,6 +16401,7 @@ function mapQueueItem(item: QueueItem): QueueItemView {
     ...(mentionRanges.length === 0 ? {} : { mentionRanges }),
     ...(attachments.length === 0 ? {} : { attachments }),
     state: queueState(item.state),
+    ...(quotaRetryAt === undefined ? {} : { quotaRetryAt }),
     ...(item.retryBeforeDispatch && item.state === QueueItemState.FAILED && item.runId ? { retryRunId: item.runId } : {}),
     editLocked: item.editLocked,
     ordinal: numberValue(item.ordinal),
