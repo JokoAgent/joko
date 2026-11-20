@@ -2067,7 +2067,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     assertDispatchReady();
     await runtime.nativeSkills?.assertFilesCurrent(dispatchSignal);
     assertDispatchReady();
-    runtime.context = context;
+    // Steering has its own Queue receipt. Native events still belong to the turn it steers.
+    if (input.disposition !== "steer") runtime.context = context;
     if (runtime.runtimePolicy === "review_read_only" && (
       input.disposition !== "prompt"
       || input.files.length !== 0
