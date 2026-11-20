@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { capabilityNames, queuePauseForStopReason, supportedExtraDirectoryAccessModes, taskMessageReferenceHref, validInputMessageReferences } from "@joko/contracts";
+import { capabilityNames, codexRetryProgressKind, queuePauseForStopReason, supportedExtraDirectoryAccessModes, taskMessageReferenceHref, validInputMessageReferences } from "@joko/contracts";
 import { MAXIMUM_EDITABLE_PLAN_LENGTH, modelPricesWithOverride, NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD, NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
   parseNativeModelUsage, parseNativeUsageRequests, type ModelPriceOverride } from "@joko/core";
 import { DocumentPathError, type DocumentPathAuthorizer } from "@joko/tool-document";
@@ -15652,7 +15652,9 @@ export class SessionHost {
             && target.remoteWorkspace === undefined && item.body.disposition === "prompt"
             && item.body.automaticContinuation === undefined && item.body.objectiveContinuation === undefined) {
             const admittedGeneration = stored.descriptor.binding.generation;
-            baseContext = { ...baseContext, rejectedRequestRecovery: { assertCurrent: () => {
+            const codexTurnBackoff = tracksNativeTurnDispatch && this.isOrdinaryLocalCodexSession(stored) && this.isOwnerRunInput(item)
+              && this.#providerGroups?.service.router.store.binding(sessionId) === undefined;
+            baseContext = { ...baseContext, rejectedRequestRecovery: { ...(codexTurnBackoff ? { codexTurnBackoff: true } : {}), assertCurrent: () => {
               const current = this.#store.getQueueItem(item.id);
               const currentSession = this.#store.getSession(sessionId);
               const currentRun = this.#store.getRun(item.runId).descriptor;
@@ -15663,6 +15665,8 @@ export class SessionHost {
               if (this.#disposed || this.#active.get(sessionId) !== active
                 || (this.#backgroundTasks.get(sessionId)?.size ?? 0) > 0 || this.#userShells.has(sessionId)
                 || currentSession.descriptor.binding.generation !== admittedGeneration
+                || codexTurnBackoff && (!this.isOrdinaryLocalCodexSession(currentSession)
+                  || this.#providerGroups?.service.router.store.binding(sessionId) !== undefined)
                 || current.backendInstanceGeneration !== active.backendInstanceGeneration
                 || this.#store.getBackend(target.backendId).descriptor.instanceGeneration !== active.backendInstanceGeneration
                 || !["dispatching", "backend_accepted"].includes(current.state)
@@ -15670,7 +15674,7 @@ export class SessionHost {
                 || attempt?.runId !== item.runId || attempt.generation !== admittedGeneration
                 || attempt.backendInstanceGeneration !== active.backendInstanceGeneration || attempt.endedAt !== undefined
                 || currentRun.activeAttemptId !== attemptId || !["queued", "running", "waiting", "retrying"].includes(currentRun.state)) {
-                throw new StoreError("The originating user request no longer owns optional-field recovery.");
+                throw new StoreError("The originating user request no longer owns request recovery.");
               }
             } } };
           }
@@ -16682,8 +16686,8 @@ export class SessionHost {
             if (current.descriptor.state === "running" || current.descriptor.state === "waiting") {
               this.#store.updateRunState({ runId, state: "retrying", traceId: `retry:${runId}`, operationId });
             }
-          } else if (payload.type === "retry" && payload.state === "succeeded" && payload.error?.code === "CODEX_NATIVE_RECONNECT"
-            && metadata?.namespace === "codex.app_server"
+          } else if (payload.type === "retry" && payload.state === "succeeded" && codexRetryProgressKind(payload.error?.code)
+            && (metadata?.namespace === "codex.app_server" || metadata?.namespace === "codex.rejected_turn_retry")
             && runId !== undefined) {
             const current = this.#store.getRun(runId).descriptor;
             if (current.state === "retrying" && current.activeAttemptId === attemptId) {

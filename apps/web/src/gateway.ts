@@ -2,7 +2,7 @@ import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/p
 import { materializeImageAttachment } from "./image-attachment.js";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import type { ProviderAccountResetApi } from "@joko/contracts";
-import { assistantStreamAttempt, codexSamplingInterruptedMessageId, isAssistantStreamBlock, thinkingStreamOwner } from "@joko/contracts";
+import { assistantStreamAttempt, codexRetryProgressKind, codexSamplingInterruptedMessageId, isAssistantStreamBlock, thinkingStreamOwner } from "@joko/contracts";
 import { createProviderAccountResetApi, currentQueueRetryInput, executeExtensionSettingsCall, ExtensionSettingsRejected } from "@joko/connection-transport";
 import { isModelVisible, modelPreferenceOwnerId, readModelPickerOwnerPreferences } from "./model-picker-preferences.js";
 import { providerModelInheritedField, protoProviderModelInheritedField } from "./provider-model-inheritance.js";
@@ -12769,12 +12769,12 @@ export function projectSnapshotEvent(
       const retry = kind.value;
       const run = raw.runs.find((candidate) => candidate.runId === retry.runId);
       if (run !== undefined) {
-        const nativeReconnect = retry.error?.code === "CODEX_NATIVE_RECONNECT";
-        if (nativeReconnect && (!retry.attemptId || retry.attemptId !== run.activeAttemptId
+        const codexProgress = codexRetryProgressKind(retry.error?.code);
+        if (codexProgress && (!retry.attemptId || retry.attemptId !== run.activeAttemptId
           || event.identity?.runId !== run.runId || event.identity.sessionId !== run.sessionId || event.identity.attemptId !== retry.attemptId
           || event.identity.generation !== run.version?.generation
           || ![RunState.RUNNING, RunState.WAITING, RunState.RETRYING].includes(run.state))) break;
-        const state = retry.state === RetryState.EXHAUSTED && !nativeReconnect
+        const state = retry.state === RetryState.EXHAUSTED && !codexProgress
           ? RunState.FAILED
           : retry.state === RetryState.SUCCEEDED
             ? RunState.RUNNING
@@ -12782,7 +12782,7 @@ export function projectSnapshotEvent(
               ? RunState.RETRYING
               : run.state;
         const { error: _previousRetryError, ...runWithoutRetryError } = run;
-        const updated = nativeReconnect ? { ...run, state }
+        const updated = codexProgress ? { ...run, state }
           : { ...runWithoutRetryError, state, ...(retry.error === undefined ? {} : { error: retry.error }) };
         raw = { ...raw, runs: upsertBy(raw.runs, updated, (value) => value.runId) };
         projected = remapSessionProjection(raw, projected, run.sessionId);
@@ -13709,11 +13709,11 @@ function projectTimelineEvent(
     case "retryChanged": {
       const maxAttempts = kind.value.maxAttempts;
       const code = kind.value.error?.code;
-      const nativeReconnect = code === "CODEX_NATIVE_RECONNECT";
-      if (nativeReconnect && (!kind.value.runId || !kind.value.attemptId || event.identity?.runId !== kind.value.runId
+      const codexProgress = codexRetryProgressKind(code);
+      if (codexProgress && (!kind.value.runId || !kind.value.attemptId || event.identity?.runId !== kind.value.runId
         || event.identity.attemptId !== kind.value.attemptId)) break;
       const source = code === "PI_SUMMARIZATION_RETRY" ? "summarization"
-        : kind.value.state === RetryState.WAITING && code !== "CLAUDE_CODE_API_RETRY" && !nativeReconnect ? "auto" : "unknown";
+        : kind.value.state === RetryState.WAITING && code !== "CLAUDE_CODE_API_RETRY" && !codexProgress ? "auto" : "unknown";
       replaceOrAppend({
         id: event.eventId,
         ...(kind.value.runId || event.identity?.runId ? { runId: kind.value.runId || event.identity?.runId } : {}),
@@ -13725,7 +13725,7 @@ function projectTimelineEvent(
         retry: {
           state: retryTimelineState(kind.value.state),
           source,
-          ...(nativeReconnect && event.identity !== undefined ? { attemptId: kind.value.attemptId, generation: event.identity.generation } : {}),
+          ...(codexProgress && event.identity !== undefined ? { attemptId: kind.value.attemptId, generation: event.identity.generation } : {}),
           attemptNumber: kind.value.attemptNumber,
           ...(maxAttempts === undefined || maxAttempts <= 0 ? {} : { maxAttempts }),
           ...(kind.value.retryAt === undefined ? {} : { retryAt: timestampMs(kind.value.retryAt) }),

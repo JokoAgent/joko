@@ -1,3 +1,4 @@
+import { codexRetryProgressKind } from "@joko/contracts";
 import type { ErrorView, SessionView, TimelineItemView } from "../model.js";
 import { isInternalFailedRunDone } from "./error-tail-behavior.js";
 
@@ -39,7 +40,7 @@ export function resolveRetryStopAction(retry: RetryEscapeContext["retry"], capab
     if (capabilities.canAbortRetry) return "abortRetry";
   }
   if (capabilities.canAbortRun && retry?.source === "unknown"
-    && (retry.error?.code === "CLAUDE_CODE_API_RETRY" || retry.error?.code === "CODEX_NATIVE_RECONNECT")) return "abort";
+    && (retry.error?.code === "CLAUDE_CODE_API_RETRY" || codexRetryProgressKind(retry.error?.code))) return "abort";
   return undefined;
 }
 
@@ -77,7 +78,7 @@ export function resolveActiveRetry(
   let latest: TimelineItemView | undefined;
   for (const item of items) {
     if (item.runId !== session.activeRunId || item.retry === undefined) continue;
-    if (item.retry.error?.code === "CODEX_NATIVE_RECONNECT" && (!item.retry.attemptId
+    if (codexRetryProgressKind(item.retry.error?.code) && (!item.retry.attemptId
       || item.retry.attemptId !== session.activeAttemptId || item.retry.generation !== session.generation)) continue;
     if (
       latest === undefined ||

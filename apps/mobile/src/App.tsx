@@ -7517,7 +7517,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       </ScrollView>}
     </View>}
     <Text accessibilityLiveRegion="polite" style={[styles.caption, styles.queue, { color: colors.muted }]}>
-      {codexReconnect ? mobileMessage(locale, "task.codexReconnecting", codexReconnect)
+      {codexReconnect ? mobileMessage(locale, codexReconnect.backoff === "capacity" ? "task.codexCapacityBackoff"
+        : codexReconnect.backoff === "rate-limit" ? "task.codexRateLimitBackoff" : "task.codexReconnecting", codexReconnect)
         : mobileMessage(locale, state.liveStatus === "streaming" ? "task.live"
           : state.liveStatus === "verifying" ? "task.checkingLive"
             : state.liveStatus === "polling" ? "task.polling" : "task.updatesPaused")}

@@ -67,12 +67,15 @@ import {
   type NativeSubscriptionAuthority,
   type PermissionMode,
   type PromptInput,
+  type PublicError,
   type ProviderModel,
   type RuntimeProcessUsageSnapshot,
   type TargetDescriptor
 } from "@joko/core";
 import { AppServerHost, type AppServerHostOptions, type HostSubscription } from "./host.js";
-import { adapterError, isAmbiguousDispatchFailure, RpcRemoteFault, TransportFault } from "./errors.js";
+import { adapterError, isAmbiguousDispatchFailure, publicNativeTurnError, RpcRemoteFault, TransportFault } from "./errors.js";
+import { codexRejectedTurnBackoff, codexRejectedTurnKind, isRejectedTurnRetryClientId,
+  rejectedTurnRetryClientId, type CodexRejectedTurnKind } from "./rejected-turn-retry.js";
 import {
   isJsonObject,
   objectValue,
@@ -83,6 +86,7 @@ import {
   parseThreadList,
   parseThreadResult,
   parseTurnList,
+  parseTurn,
   parseTurnStart,
   parseTurnSteer,
   ProtocolShapeError,
@@ -373,6 +377,7 @@ interface SessionRuntime {
   readonly planContextByTurn: Map<string, AdapterContext>;
   readonly nativeFileChanges: Map<string, { readonly review: JsonValue | undefined; readonly approval: string | undefined }>;
   readonly yieldedExecCellsByTurnId: Map<string, Map<string, YieldedExecCell[]>>;
+  rejectedTurnRetry?: RejectedTurnRetry;
   yieldContinuation?: YieldContinuationClaim;
   yieldContinuationStartFlight?: Promise<void>;
   yieldTerminalOwner?: YieldContinuationClaim;
@@ -389,6 +394,22 @@ interface SessionRuntime {
   disconnectTerminalEmitted: boolean;
   compaction?: CompactionWaiter;
   rewindUnknown: boolean;
+}
+
+interface RejectedTurnRetry {
+  readonly context: AdapterContext;
+  readonly request: JsonObject;
+  readonly hostGeneration: number;
+  turnId?: string;
+  failure?: CodexRejectedTurnKind;
+  kind?: CodexRejectedTurnKind;
+  attempts: number;
+  unsafe: boolean;
+  startingNativeTurn: boolean;
+  confirmed?: boolean;
+  stopRequested?: boolean;
+  wait?: AbortController;
+  start?: Promise<void>;
 }
 
 interface YieldContinuationClaim {
@@ -1972,6 +1993,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (yieldDispatch === undefined && isYieldContinuationClientId(context.operationId)) {
       throw reservedYieldContinuationClientId();
     }
+    if (isRejectedTurnRetryClientId(context.operationId)) throw adapterError({
+      code: "CODEX_RESERVED_RETRY_ID", message: "The input identity belongs to native retry handling.", phase: "dispatch",
+      recovery: "Submit a new input through the ordinary task queue."
+    });
     if (context.target.remoteWorkspace !== undefined
       && (input.images.length !== 0 || input.files.length !== 0
         || input.mentions.some(mention => mention.kind !== "resource"))) {
@@ -1993,6 +2018,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       || runtime.yieldContinuationStartFlight !== undefined)) {
       throw yieldContinuationBusy();
     }
+    if (input.disposition !== "steer" && runtime.rejectedTurnRetry !== undefined) assertRuntimeProductIdle(runtime);
     if (yieldDispatch === undefined) runtime.yieldTerminalOwner = undefined;
     if (yieldDispatch !== undefined && (runtime.yieldContinuation !== yieldDispatch.claim
       || yieldDispatch.claim.state !== "starting")) {
@@ -2104,8 +2130,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
     if (pendingTurnStart !== undefined) runtime.pendingTurnStart = pendingTurnStart;
     let acceptedResponseShapePending = false;
+    let rejectedTurnRetry: RejectedTurnRetry | undefined;
     try {
       if (input.disposition === "steer") {
+        if (runtime.rejectedTurnRetry) runtime.rejectedTurnRetry.unsafe = true;
         const response = await runtime.host.request("turn/steer", {
           threadId: runtime.threadId,
           clientUserMessageId,
@@ -2123,7 +2151,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }
       await this.#activateManagedOperation(runtime, context);
       assertNativeDispatchReady();
-      const response = await runtime.host.request("turn/start", {
+      const turnStartRequest: JsonObject = {
         threadId: runtime.threadId,
         clientUserMessageId,
         input: [...nativeInput.input],
@@ -2151,7 +2179,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
                     }
                   })
             })
-      }, {
+      };
+      if (context.rejectedRequestRecovery?.codexTurnBackoff === true && yieldDispatch === undefined
+        && !runtime.remote && runtime.runtimePolicy === "standard" && !runtime.planMode && runtime.managedRoute === undefined
+        && runtime.smartRoute === undefined && !input.text.trimStart().startsWith("/")
+        && input.mentions.length === 0 && input.files.length === 0 && input.images.length === 0
+        && nativeInput.input.length === 1 && nativeInput.input[0]?.type === "text") {
+        rejectedTurnRetry = { context, request: structuredClone(turnStartRequest), hostGeneration, attempts: 0, unsafe: false, startingNativeTurn: false };
+        runtime.rejectedTurnRetry = rejectedTurnRetry;
+      }
+      const response = await runtime.host.request("turn/start", turnStartRequest, {
         mutation: true,
         signal: dispatchSignal,
         ...(yieldDispatch === undefined && context.onNativeTurnDispatch !== undefined
@@ -2161,6 +2198,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         beforeDispatch: () => {
           durableHistory?.assertCurrent();
           assertNativeDispatchReady();
+          if (rejectedTurnRetry) rejectedTurnRetry.startingNativeTurn = true;
           if (yieldDispatch !== undefined) yieldDispatch.claim.dispatchStarted = true;
         }
       });
@@ -2188,11 +2226,20 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       } else if (!runtime.state.terminalTurnIds.has(startedTurn.id)) {
         throw new ProtocolShapeError("turn start result conflicts with the active turn");
       }
+      if (rejectedTurnRetry && runtime.rejectedTurnRetry === rejectedTurnRetry && !runtime.state.terminalTurnIds.has(startedTurn.id)) {
+        rejectedTurnRetry.turnId = startedTurn.id;
+        rejectedTurnRetry.startingNativeTurn = false;
+        rejectedTurnRetry.confirmed = true;
+      }
       bindPlanTurnIntent(runtime, startedTurn.id, collaborationMode?.mode === "plan", context);
       if (yieldDispatch !== undefined) bindYieldContinuationTurn(runtime, yieldDispatch.claim, startedTurn.id);
       if (collaborationMode?.mode === "default") runtime.defaultCollaborationMarkerPending = false;
       acceptedResponseShapePending = false;
     } catch (error) {
+      if (rejectedTurnRetry && runtime.rejectedTurnRetry === rejectedTurnRetry) {
+        rejectedTurnRetry.wait?.abort();
+        runtime.rejectedTurnRetry = undefined;
+      }
       if (yieldDispatch !== undefined && yieldDispatch.claim.state !== "cancelled"
         && (runtime.yieldContinuation !== yieldDispatch.claim
           || yieldDispatch.claim.attemptsStarted !== yieldDispatch.attempt
@@ -2257,6 +2304,22 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }
     };
     assertControl();
+    const rejected = runtime.rejectedTurnRetry;
+    if (rejected) {
+      rejected.unsafe = true;
+      rejected.stopRequested = true;
+      if (rejected.wait) {
+        rejected.wait.abort();
+        runtime.rejectedTurnRetry = undefined;
+        await rejected.context.emit({ type: "done", outcome: "aborted" });
+        return;
+      }
+      if (rejected.start) {
+        await rejected.start;
+        if (runtime.rejectedTurnRetry !== rejected) return;
+        assertControl();
+      }
+    }
     if (yieldClaim !== undefined) {
       yieldClaim.stopRequested = true;
       let yieldTurnId = yieldClaim.continuationTurnId;
@@ -4271,6 +4334,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const cancel = (): void => abort.abort();
     pending = { threadId, abort, cancel, release };
     if (runtime === undefined) throw mcpCallStale(false);
+    if (runtime.rejectedTurnRetry && runtime.rejectedTurnRetry.turnId === originalTurnId) runtime.rejectedTurnRetry.unsafe = true;
     runtime.pendingMcpCalls.add(pending);
     runtime.dispatchLifetime.signal.addEventListener("abort", cancel, { once: true });
     try {
@@ -4848,6 +4912,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           }
           if (this.#handleRetiredYieldNotification(runtime, method, params, input.hostGeneration)) return;
           if (!this.#acceptTurnNotification(runtime, method, params)) return;
+          const backoff = this.#observeRejectedTurn(runtime, method, params);
+          if (backoff === "hold-error") return;
           if (method === "item/started" && isJsonObject(params) && isJsonObject(params["item"]) && params["item"]["type"] === "fileChange"
             && typeof params["item"]["id"] === "string" && typeof params["turnId"] === "string") {
             const changes = params["item"]["changes"];
@@ -4881,6 +4947,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
                   && runtime.pendingTurnStart === undefined && runtime.yieldContinuation === undefined
                   && runtime.activeTurnContext?.inputAttemptId !== undefined && runtime.activeTurnContext.onNativeTurnDispatch !== undefined
               });
+            if (backoff && translatedEvents.some(event => event.type === "done" && event.outcome === "failed")
+              && await this.#queueRejectedTurnRetry(runtime, backoff)) return;
             const yieldResolution = method === "turn/completed"
               ? resolveYieldTurnCompletion(runtime, params, translatedEvents, completedPlan)
               : undefined;
@@ -4990,6 +5058,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             && turnId !== undefined
             && runtime.nativeTasks.ownsActiveTurn(requestThreadId, turnId);
           if (!rootRequest && !descendantRequest) return undefined;
+          const rejected = runtime.rejectedTurnRetry;
+          if (rootRequest && rejected && rejected.turnId === turnId) rejected.unsafe = true;
           if (runtime.runtimePolicy === "review_read_only") {
             const response = method === "item/tool/call"
               ? await executeReviewDynamicTool(runtime.targetWorkspaceRoot, params, runtime.activeTurnContext ?? runtime.context)
@@ -5074,6 +5144,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             ? runtime.yieldTerminalOwner === undefined && (runtimeHasProductWork(runtime) || pendingTurnStart !== undefined)
             : claimYieldProductTerminal(runtime, activeYieldClaim);
           runtime.dispatchLifetime.abort();
+          runtime.rejectedTurnRetry = undefined;
           this.#cancelYieldContinuation(runtime);
           runtime.managedRoute?.dispose();
           runtime.managedRoute = undefined;
@@ -5238,7 +5309,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       claim.state = "settled";
       await this.#emitYieldContinuationFailure(runtime, "start_failed", hostGeneration);
       if (retireUnknownStart) {
-        await this.#retireUnknownYieldStart(runtime, hostGeneration);
+        await this.#retireUnknownTurnStart(runtime, hostGeneration);
         return;
       }
       this.#maybeReleaseManagedOperation(runtime);
@@ -5289,7 +5360,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     });
   }
 
-  async #retireUnknownYieldStart(runtime: SessionRuntime, hostGeneration: number): Promise<void> {
+  async #retireUnknownTurnStart(runtime: SessionRuntime, hostGeneration: number): Promise<void> {
     if (!this.#matchesCallbackFence(runtime, hostGeneration)) return;
     runtime.dispatchLifetime.abort();
     runtime.closed = true;
@@ -5321,7 +5392,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         });
       }
     } finally {
-      await this.#retireUnknownYieldStart(runtime, hostGeneration);
+      await this.#retireUnknownTurnStart(runtime, hostGeneration);
     }
     return failure;
   }
@@ -5495,6 +5566,149 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         && !runtime.state.terminalTurnIds.has(turnId);
     }
     return true;
+  }
+
+  #observeRejectedTurn(runtime: SessionRuntime, method: string, params: JsonValue):
+    "hold-error" | { retry: RejectedTurnRetry; kind: CodexRejectedTurnKind; error: PublicError; maxAttempts: number; delayMs: number } | undefined {
+    const retry = runtime.rejectedTurnRetry;
+    if (!retry || !isJsonObject(params) || params["threadId"] !== runtime.threadId) return undefined;
+    const turnId = turnIdFromParams(params);
+    if (!turnId) return undefined;
+    if (method === "turn/started" && retry.startingNativeTurn && retry.turnId === undefined) retry.turnId = turnId;
+    if (method === "error" && runtime.state.terminalTurnIds.has(turnId) && codexRejectedTurnKind(params["error"])) return "hold-error";
+    if (retry.turnId !== turnId) return undefined;
+    if (method === "error" && params["willRetry"] === false) {
+      const kind = codexRejectedTurnKind(params["error"]);
+      if (kind && retry.confirmed && !retry.unsafe && (retry.kind === undefined || retry.kind === kind)) {
+        retry.failure = kind;
+        return "hold-error";
+      }
+      retry.unsafe = true;
+    }
+    if (method === "turn/completed") {
+      if (!retry.failure || retry.unsafe || turnId !== runtime.state.activeTurnId) {
+        runtime.rejectedTurnRetry = undefined;
+        return undefined;
+      }
+      const turn = parseTurn(params["turn"]);
+      const kind = codexRejectedTurnKind(turn.error);
+      const backoff = kind === undefined ? undefined : codexRejectedTurnBackoff(kind, retry.attempts + 1);
+      if (turn.status === "failed" && kind && retry.failure === kind
+        && turn.items.every(item => item.type === "userMessage") && !runtime.nativeTasks.hasActiveTasks()
+        && runtime.yieldContinuation === undefined && backoff) {
+        return { retry, kind, error: publicNativeTurnError(turn.error), ...backoff };
+      }
+      runtime.rejectedTurnRetry = undefined;
+    } else if (method === "turn/plan/updated" || method.startsWith("item/")
+      && (!(method === "item/started" || method === "item/completed") || !isJsonObject(params["item"]) || params["item"]["type"] !== "userMessage")) {
+      retry.unsafe = true;
+    }
+    return undefined;
+  }
+
+  async #queueRejectedTurnRetry(runtime: SessionRuntime, confirmed: {
+    retry: RejectedTurnRetry; kind: CodexRejectedTurnKind; error: PublicError; maxAttempts: number; delayMs: number;
+  }): Promise<boolean> {
+    const { retry, kind, error, maxAttempts, delayMs } = confirmed;
+    if (runtime.rejectedTurnRetry !== retry || retry.unsafe || !this.#isRuntimeCurrent(runtime, retry.hostGeneration)) {
+      if (runtime.rejectedTurnRetry === retry) runtime.rejectedTurnRetry = undefined;
+      return false;
+    }
+    try { retry.context.rejectedRequestRecovery!.assertCurrent(); }
+    catch { runtime.rejectedTurnRetry = undefined; return false; }
+    const attempt = ++retry.attempts;
+    const notice = { ...error, code: kind === "capacity" ? "CODEX_CAPACITY_BACKOFF" : "CODEX_RATE_LIMIT_BACKOFF" };
+    const wait = new AbortController();
+    const signal = AbortSignal.any([wait.signal, retry.context.signal, runtime.dispatchLifetime.signal]);
+    retry.kind = kind;
+    retry.failure = undefined;
+    retry.turnId = undefined;
+    retry.startingNativeTurn = false;
+    retry.confirmed = false;
+    retry.wait = wait;
+    const previousStart = retry.start;
+    try {
+      await retry.context.emit({ type: "retry", state: "waiting", attempt, maxAttempts, delayMs, error: notice }, {
+        namespace: "codex.rejected_turn_retry", fields: { kind }
+      });
+    } catch {
+      if (runtime.rejectedTurnRetry === retry) runtime.rejectedTurnRetry = undefined;
+      return false;
+    }
+    void (async () => {
+      await delay(delayMs, undefined, { signal });
+      await previousStart;
+      if (runtime.rejectedTurnRetry !== retry || retry.wait !== wait || signal.aborted) return;
+      retry.wait = undefined;
+      const start = this.#startRejectedTurnRetry(runtime, retry, { attempt, maxAttempts, error, notice });
+      retry.start = start;
+      try { await start; }
+      finally { if (retry.start === start) retry.start = undefined; }
+    })().catch(() => { if (runtime.rejectedTurnRetry === retry && retry.wait === wait) runtime.rejectedTurnRetry = undefined; });
+    return true;
+  }
+
+  async #startRejectedTurnRetry(runtime: SessionRuntime, retry: RejectedTurnRetry, input: {
+    attempt: number; maxAttempts: number; error: PublicError; notice: PublicError;
+  }): Promise<void> {
+    const { context, hostGeneration } = retry;
+    const { attempt, maxAttempts, error, notice } = input;
+    const signal = AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]);
+    const clientUserMessageId = rejectedTurnRetryClientId(context.operationId!, attempt);
+    const current = () => runtime.rejectedTurnRetry === retry && this.#isRuntimeCurrent(runtime, hostGeneration);
+    const assertReady = () => {
+      signal.throwIfAborted();
+      this.#assertRuntimeDispatchFence(runtime, context, hostGeneration);
+      context.rejectedRequestRecovery!.assertCurrent();
+      if (!current() || retry.unsafe || runtime.pendingTurnStart || runtime.state.activeTurnId !== undefined) {
+        throw new Error("The original Codex input can no longer retry.");
+      }
+    };
+    let turn: NativeTurn | undefined;
+    let acceptedReply = false;
+    let unknown = false;
+    try {
+      assertReady();
+      await context.emit({ type: "retry", state: "started", attempt, maxAttempts, error: notice }, { namespace: "codex.rejected_turn_retry", fields: {} });
+      const response = await runtime.host.request("turn/start", { ...retry.request, clientUserMessageId }, {
+        mutation: true, signal, beforeDispatch: () => { assertReady(); retry.startingNativeTurn = true; }
+      });
+      this.#assertRuntimeFence(runtime, context, response.hostGeneration);
+      acceptedReply = true;
+      turn = parseTurnStart(response.value);
+      if (current() && runtime.state.activeTurnId !== undefined && runtime.state.activeTurnId !== turn.id) {
+        turn = undefined;
+        throw new ProtocolShapeError("retry turn conflicts with the active turn");
+      }
+    } catch (failure) {
+      if (!current()) return;
+      if (isAmbiguousDispatchFailure(failure) || acceptedReply && failure instanceof ProtocolShapeError) {
+        turn = await this.#reconcileClientMessage(runtime, context, clientUserMessageId);
+        unknown = turn === undefined;
+      }
+    }
+    if (!current() || retry.wait) return;
+    if (turn?.status === "inProgress" && !runtime.state.terminalTurnIds.has(turn.id)) {
+      retry.turnId = turn.id;
+      retry.startingNativeTurn = false;
+      retry.confirmed = true;
+      runtime.state.activeTurnId = turn.id;
+      runtime.context = runtime.activeTurnContext = context;
+      await context.emit({ type: "retry", state: "succeeded", attempt, maxAttempts, error: notice }, { namespace: "codex.rejected_turn_retry", fields: {} });
+      return;
+    }
+    runtime.rejectedTurnRetry = undefined;
+    const outcome = turn?.status === "completed" ? "completed"
+      : turn?.status === "interrupted" || !turn && retry.stopRequested && !unknown ? "aborted" : "failed";
+    try {
+      if (outcome === "failed") await context.emit({ type: "error", terminal: true, error: unknown ? {
+        code: "CODEX_DISPATCH_UNKNOWN", message: "The new Codex turn's delivery could not be confirmed.", phase: "dispatch",
+        retryable: false, stateMayHaveChanged: true, recovery: "Inspect the native thread before sending another input."
+      } : turn?.error ? publicNativeTurnError(turn.error) : error });
+      await context.emit({ type: "done", outcome });
+    } finally {
+      if (unknown) await this.#retireUnknownTurnStart(runtime, hostGeneration);
+    }
   }
 
   #resolvePendingServerRequest(runtime: SessionRuntime, params: JsonValue): void {
@@ -8909,6 +9123,7 @@ async function observeDisconnectedTurn(
 
 function runtimeHasProductWork(runtime: SessionRuntime): boolean {
   return runtime.state.activeTurnId !== undefined
+    || runtime.rejectedTurnRetry !== undefined
     || runtime.yieldContinuation !== undefined
     || runtime.yieldContinuationStartFlight !== undefined;
 }
