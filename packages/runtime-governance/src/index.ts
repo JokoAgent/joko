@@ -5,3 +5,4 @@ export * from "./process-owner.js";
 export * from "./settings.js";
 export * from "./worker-capacity.js";
 export * from "./native-transcript-window.js";
+export * from "./workspace-directory-reference.js";

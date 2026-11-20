@@ -8117,6 +8117,7 @@ export class SessionHost {
     this.assertPartnerPolicyReady(sessionId);
     const stored = this.#store.getSession(sessionId);
     const capabilities = this.#store.getBackend(stored.descriptor.backendId).descriptor.capabilities;
+    const mentionOptions = capabilities.get("input.mention")?.options ?? [];
     const required = new Set<string>();
     if (prompt.text.trim() !== "") required.add("input.text");
     if (prompt.images.length > 0) required.add("input.image");
@@ -8142,9 +8143,14 @@ export class SessionHost {
       }
       const options = mention.kind === "workspace_file" && mention.lineRange !== undefined
         ? ["workspace_file", "workspace_line_range"] : [mention.kind];
-      const option = options.find((value) => capabilities.get("input.mention")?.options?.includes(value) !== true);
+      const option = options.find(value => !mentionOptions.includes(value));
       if (option !== undefined) {
-        throw inputCapabilityError("INPUT_CAPABILITY_UNAVAILABLE", `The selected Backend does not support ${option} mentions.`);
+        const localDirectory = option === "workspace_directory" && mentionOptions.includes("workspace_directory_local")
+          && stored.descriptor.remoteWorkspace === undefined && !this.isReviewReadOnlySession(sessionId);
+        const target = localDirectory ? this.#store.getTarget(stored.descriptor.targetId).descriptor : undefined;
+        if (target?.trusted !== true || target.remoteWorkspace !== undefined) {
+          throw inputCapabilityError("INPUT_CAPABILITY_UNAVAILABLE", `The selected Backend does not support ${option} mentions in this Workspace.`);
+        }
       }
       if (mention.kind === "resource") this.assertCurrentResourceMention(sessionId, mention);
     }

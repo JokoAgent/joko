@@ -1,13 +1,17 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { RunState, WorkspaceEntryListingPolicy } from "@joko/contracts";
+import { create } from "@bufbuild/protobuf";
+import { AppServerHost, createCodexAdapter } from "@joko/adapter-codex";
+import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
+import { OperationMutationSchema, OperationState, RunState, WorkspaceEntryListingPolicy } from "@joko/contracts";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { expect, it } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
+import { REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID, RealPiSystemFixture } from "./real-pi-fixture.js";
 
 const browserPath = process.env.JOKO_BROWSER_EXECUTABLE?.trim();
 const webDirectory = process.env.JOKO_MOUNTED_WEB_DIR?.trim();
@@ -172,9 +176,91 @@ mountedIt("sends a Files directory containing spaces as the original typed works
   }
 });
 
-async function pairFilesBrowser(page: Page, fixture: OrchestratorE2eFixture, sessionId: string, device: string): Promise<void> {
+mountedIt("pastes an absolute local directory into Codex as a typed input and sends its native path", { timeout: 90_000 }, async () => {
+  const backendId = "codex-directory-paste";
+  const native = new FakeCodexAppServer();
+  const host = new AppServerHost({ transportFactory: () => native.createTransport() });
+  let fixture: OrchestratorE2eFixture | undefined;
+  let browser: Browser | undefined;
+  try {
+    fixture = await OrchestratorE2eFixture.start({ webDirectory, distinctBackendWorkspaceIds: true, backendFactories: [{ instanceId: backendId, adapterKind: "codex",
+      displayName: "Local Codex directory fixture", create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host }) }] });
+    const path = join(fixture.workspaceDirectory, "design docs");
+    await mkdir(path);
+    const manager = await fixture.pair("Codex directory Owner");
+    const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId, createSessionMutation({
+      backendId, targetId: fixture.targetId(backendId), displayName: "Codex directory paste"
+    })));
+    browser = await chromium.launch({ executablePath: browserPath!, headless: true });
+    const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: fixture.baseUrl });
+    await pairFilesBrowser(page, fixture, sessionId, "Codex directory Browser", "tasks");
+    const pane = page.locator(`.session-pane[data-input-session-id="${sessionId}"]`);
+    const draft = pane.locator(".composer-rich-editor__content");
+    await draft.waitFor({ state: "visible" });
+    await page.evaluate(value => navigator.clipboard.writeText(value), path);
+    await draft.press("ControlOrMeta+V");
+    const token = '@"design docs/"';
+    const chip = draft.locator('[data-composer-mention="true"]');
+    await waitFor(() => chip.getAttribute("data-serialized"), value => value === token, "the typed directory from the clipboard");
+    const message = " Summarize the selected directory.";
+    await draft.press("End");
+    await page.keyboard.insertText(message);
+    await pane.locator(".send-button").click();
+    const store = fixture.application.store;
+    const queued = await waitFor(async () => store.listQueueItems({ sessionId })[0], item => item?.state === "backend_accepted", "the Codex directory dispatch");
+    expect(queued?.body).toMatchObject({ text: token + message,
+      mentions: [{ kind: "workspace_directory", reference: "design docs", workspaceId: fixture.targetId(backendId) }],
+      mentionRanges: [{ start: 0, end: token.length, mentionIndex: 0 }] });
+    expect(native.transport!.requests.filter(request => request.method === "turn/start")).toMatchObject([{ params: { input: [
+      { type: "text", text: `${token}${message}\n\nWorkspace directory reference: ${JSON.stringify({ name: "design docs", path })}` }
+    ] } }]);
+    await native.completeTurn(store.getSession(sessionId).descriptor.binding.nativeSessionId!);
+  } finally { await browser?.close(); await fixture?.close(); await host.shutdown(); }
+});
+
+mountedIt("drags a Files directory into published Pi and submits its original typed native path", { timeout: 90_000 }, async () => {
+  let fixture: RealPiSystemFixture | undefined;
+  let browser: Browser | undefined;
+  try {
+    const system = fixture = await RealPiSystemFixture.start({ webDirectory });
+    const targetId = "workspace-real-pi";
+    await mkdir(join(system.workspaceDirectory, "design docs"));
+    const manager = await system.pair("Pi directory Owner");
+    expect((await submit(manager.clients.operation, manager.connectionId, create(OperationMutationSchema, {
+      payload: { case: "setWorkspaceTrust", value: { workspaceId: targetId, trusted: true } }
+    }))).state).toBe(OperationState.SUCCEEDED);
+    const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId, createSessionMutation({
+      backendId: "pi", targetId, providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, displayName: "Pi directory drop"
+    })));
+    browser = await chromium.launch({ executablePath: browserPath!, headless: true });
+    const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
+    await pairFilesBrowser(page, system, sessionId, "Pi directory Browser");
+    const directory = page.locator('[data-workspace-tree-row][data-relative-path="design docs"]');
+    const pane = page.locator(".session-pane--files-rail");
+    const draft = pane.locator(".composer-rich-editor__content");
+    await directory.dragTo(draft);
+    const token = '@"design docs/"';
+    const chip = draft.locator('[data-composer-mention="true"]');
+    expect(await chip.getAttribute("data-serialized")).toBe(token);
+    await pane.locator(".send-button").click();
+    const queued = await waitFor(async () => system.application.store.listQueueItems({ sessionId })[0], value => value !== undefined, "the Pi directory input");
+    expect(queued?.body).toMatchObject({ text: token, mentions: [{ kind: "workspace_directory", reference: "design docs", workspaceId: targetId }],
+      mentionRanges: [{ start: 0, end: token.length, mentionIndex: 0 }] });
+    await waitFor(() => manager.clients.run.getRun({ runId: queued!.runId }), value => value.run?.state === RunState.SUCCEEDED, "the Pi directory Run", 45_000);
+    expect(system.providerRequests).toHaveLength(1);
+    const messages = system.providerRequests[0]?.body["messages"] as { role: string; content: string | { text: string }[] }[];
+    const message = messages.find(item => item.role === "user")?.content;
+    const nativeText = Array.isArray(message) ? message.map(part => part.text).join("\n") : message;
+    expect(nativeText).toContain(token);
+    expect(nativeText).toContain(`- workspace_directory: ${JSON.stringify({ name: "design docs", path: join(system.workspaceDirectory, "design docs") })}`);
+  } finally { await browser?.close(); await fixture?.close(); }
+});
+
+async function pairFilesBrowser(page: Page, fixture: Pick<OrchestratorE2eFixture, "anonymous" | "baseUrl" | "pairingCode">,
+  sessionId: string, device: string, route: "files" | "tasks" = "files"): Promise<void> {
   const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: device })).challenge!;
-  await page.goto(`${fixture.baseUrl}/#/files/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
+  await page.goto(`${fixture.baseUrl}/#/${route}/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
   await page.getByRole("button", { name: "Add Joko node", exact: true }).click();
   await page.locator("details.device-authorization__manual > summary").click();
   await page.getByLabel("Joko node address").fill(fixture.baseUrl);

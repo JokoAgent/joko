@@ -15,6 +15,7 @@ import {
   type PromptInput,
   type UsageSnapshot
 } from "@joko/core";
+import { prepareWorkspaceDirectoryReference } from "@joko/runtime-governance";
 import { adapterError, nativeTurnErrorTag, publicNativeTurnError } from "./errors.js";
 import {
   commandApprovalAvailability,
@@ -110,6 +111,9 @@ export async function translatePromptInput(
 ): Promise<PreparedCodexPrompt> {
   for (const mention of input.mentions) {
     if (mention.kind === "workspace_file" && mention.lineRange === undefined) continue;
+    if (mention.kind === "workspace_directory" && mention.lineRange === undefined && context.target.trusted
+      && context.target.remoteWorkspace === undefined && context.hostedExecution === undefined
+      && context.runtimePolicy !== "review_read_only") continue;
     if (mention.kind === "resource" && resolvers.resolveSkillMention !== undefined
       && context.assertResourceMentionCurrent !== undefined) continue;
     if (mention.kind === "artifact") {
@@ -285,6 +289,18 @@ export async function translatePromptInput(
     if (mention.kind === "workspace_file") {
       const path = await resolveWorkspacePath(context.target.workspaceRoot, mention.reference);
       textParts.push(`Workspace file reference: ${JSON.stringify({ name: mention.label, path })}`);
+      continue;
+    }
+    if (mention.kind === "workspace_directory") {
+      const unavailable = () => adapterError({ code: "CODEX_WORKSPACE_DIRECTORY_UNAVAILABLE",
+        message: "The selected workspace directory is unavailable or changed while input was prepared.",
+        phase: "dispatch", retryable: true, recovery: "Choose the directory again from the current Workspace." });
+      const directory = await prepareWorkspaceDirectoryReference(context.target.workspaceRoot, mention.reference).catch(() => { throw unavailable(); });
+      mentionAuthorities.push(() => {
+        try { directory.assertCurrent(); }
+        catch { throw unavailable(); }
+      });
+      textParts.push(`Workspace directory reference: ${JSON.stringify({ name: mention.label, path: directory.path })}`);
       continue;
     }
     if (mention.kind === "resource") {

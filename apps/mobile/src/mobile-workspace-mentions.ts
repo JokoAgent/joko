@@ -5,6 +5,7 @@ import {
   capabilityNames,
   type BackendDescriptor,
   type Snapshot,
+  type WorkspaceDescriptor,
   type WorkspaceEntry
 } from "@joko/contracts";
 import {
@@ -47,7 +48,7 @@ export function createMobileNewTaskWorkspaceMentionControls(
   if (!target || target.state !== TargetState.ACTIVE || !target.workspaceId) return undefined;
   const backend = unique(owner.backends, (item) => item.backendId === target.backendId);
   const workspace = unique(owner.workspaces, (item) => item.workspaceId === target.workspaceId);
-  const policy = mobileWorkspaceMentionPolicy(backend);
+  const policy = mobileWorkspaceMentionPolicy(backend, workspace);
   if (!backend || !workspace || workspace.targetId !== target.targetId || !policy) return undefined;
   return {
     authorityKey,
@@ -121,14 +122,14 @@ export function createMobileWorkspaceMentionControls(
     || entityKey(ownerTarget.version) !== entityKey(detailTarget.version)
     || !ownerTarget.workspaceId || ownerTarget.workspaceId !== detailTarget.workspaceId) return undefined;
 
-  const ownerPolicy = mobileWorkspaceMentionPolicy(ownerBackend);
-  const detailPolicy = mobileWorkspaceMentionPolicy(detailBackend);
-  if (!ownerPolicy || !detailPolicy || !samePolicy(ownerPolicy, detailPolicy)) return undefined;
   const ownerWorkspace = unique(owner.workspaces, (item) => item.workspaceId === ownerTarget.workspaceId);
   const detailWorkspace = unique(detail.workspaces, (item) => item.workspaceId === ownerTarget.workspaceId);
   if (!ownerWorkspace || !detailWorkspace || ownerWorkspace.targetId !== ownerTarget.targetId
     || detailWorkspace.targetId !== detailTarget.targetId
     || entityKey(ownerWorkspace.version) !== entityKey(detailWorkspace.version)) return undefined;
+  const ownerPolicy = mobileWorkspaceMentionPolicy(ownerBackend, ownerWorkspace);
+  const detailPolicy = mobileWorkspaceMentionPolicy(detailBackend, detailWorkspace);
+  if (!ownerPolicy || !detailPolicy || !samePolicy(ownerPolicy, detailPolicy)) return undefined;
 
   const surfaceOwnerKey = [
     authorityKey,
@@ -153,7 +154,8 @@ export function createMobileWorkspaceMentionControls(
 }
 
 export function mobileWorkspaceMentionPolicy(
-  backend: BackendDescriptor | undefined
+  backend: BackendDescriptor | undefined,
+  workspace?: WorkspaceDescriptor
 ): MobileWorkspaceMentionPolicy | undefined {
   const capabilities = backend?.capabilities?.capabilities.filter((item) => item.name === capabilityNames.inputMention) ?? [];
   if (capabilities.length !== 1 || capabilities[0]!.support !== CapabilitySupport.SUPPORTED) return undefined;
@@ -163,7 +165,8 @@ export function mobileWorkspaceMentionPolicy(
   if (options.length === 0 || new Set(options).size !== options.length) return undefined;
   const policy = {
     files: options.includes("workspace_file"),
-    directories: options.includes("workspace_directory"),
+    directories: options.includes("workspace_directory") || options.includes("workspace_directory_local")
+      && workspace?.trusted === true && workspace.location?.kind.case === "serviceNode",
     lineRanges: options.includes("workspace_file") && options.includes("workspace_line_range")
   };
   return policy.files || policy.directories ? policy : undefined;

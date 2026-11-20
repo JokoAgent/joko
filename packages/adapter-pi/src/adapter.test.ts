@@ -928,7 +928,6 @@ describe("PiBackendAdapter", () => {
       const target: TargetDescriptor = { id: "target-start", backendId: adapter.id, displayName: "Start", workspaceRoot: directory, managed: false, trusted: true };
       await expect(adapter.navigateTree({ kind: "session_start" }, false, makeContext(target, []), undefined, navigationAuthority)).rejects.toMatchObject({ publicError: { code: "PI_RUNTIME_NOT_ACTIVE" } });
       for (const mention of [
-        { kind: "workspace_directory", label: "source", reference: "src" },
         { kind: "artifact", label: "Export", reference: "artifact-one", sourceSessionId: "source-task" },
         { kind: "workspace_file", label: "lines", reference: "src/main.ts", lineRange: { startLine: 1, endLine: 2 } }
       ] as const) {
@@ -2358,7 +2357,7 @@ describe("PiBackendAdapter", () => {
       options: ["ask", "auto", "bypassPermissions"]
     });
     expect(descriptor.capabilities.get("background.tasks")).toMatchObject({ supported: true });
-    expect(descriptor.capabilities.get("input.mention")).toMatchObject({ supported: true, options: ["workspace_file", "resource"] });
+    expect(descriptor.capabilities.get("input.mention")).toMatchObject({ supported: true, options: ["workspace_file", "workspace_directory_local", "resource"] });
     expect(descriptor.capabilities.get("runtime.resources")).toMatchObject({
       supported: true,
       options: ["extension", "skill", "prompt", "package"]

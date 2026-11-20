@@ -762,7 +762,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     [backend, selectedModel?.supportsImages]
   );
   const mentionCapability = backend?.capabilities.get("input.mention");
-  const mentionPolicy = useMemo(() => resolveComposerMentionPolicy(mentionCapability), [mentionCapability]);
+  const trustedLocalWorkspace = usableWorkspace?.trusted === true && usableWorkspace.remoteWorkspace === undefined;
+  const mentionPolicy = useMemo(() => resolveComposerMentionPolicy(mentionCapability, trustedLocalWorkspace), [mentionCapability, trustedLocalWorkspace]);
   const mentionPolicyRef = useRef(mentionPolicy); mentionPolicyRef.current = mentionPolicy;
   // A new task has no live runtime resource or Artifact inventory, but it can quote an existing task.
   const canMention = mentionPolicy.files || mentionPolicy.directories || mentionPolicy.sessions;
@@ -822,6 +823,12 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         ...workspaceEntryPaths(usableWorkspace.entries),
         ...(matchingWorkspaceMentionIndex?.paths ?? [])
       ])], [matchingWorkspaceMentionIndex?.paths, usableWorkspace]);
+  const directoryPasteWorkspaceId = trustedLocalWorkspace && mentionPolicy.directories
+    && mentionCapability?.options.includes("workspace_directory_local") ? usableWorkspace?.id : undefined;
+  const directoryPaste = useMemo(() => directoryPasteWorkspaceId === undefined ? undefined : {
+    workspaceId: directoryPasteWorkspaceId,
+    listEntries: (parent: string) => controllerRef.current.listWorkspaceEntries(directoryPasteWorkspaceId, parent, { includeHidden: true })
+  }, [directoryPasteWorkspaceId, preparationOwner, selectionKey, snapshot.generation, usableWorkspace?.serverPath]);
   const globalCommands = snapshot.commands.filter((command) => command.sessionId === undefined);
   const availableGlobalCommands = backend?.capabilities.get("runtime.commands")?.supported === true
     ? globalCommands
@@ -2879,6 +2886,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
               onPastedTextOpen={setPastedTextTarget}
               workingDirectory={usableWorkspace?.serverPath}
               knownWorkspacePaths={knownWorkspacePaths}
+              directoryPaste={directoryPaste}
               resolveRouteReference={(target) => resolveComposerRouteReferenceFromRuntime(controller, target, t("session.unnamed"))}
             />
             {voice.draftError !== undefined && <p className="composer__error" role="alert">{voice.draftError}</p>}

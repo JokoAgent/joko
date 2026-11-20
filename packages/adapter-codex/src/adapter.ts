@@ -6427,7 +6427,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         ...(key === "runtime.resources" && available ? { options: ["skill"] } : {}),
         ...(key === "input.image" && available ? { options: NATIVE_PROMPT_IMAGE_MEDIA_TYPES } : {}),
         ...(key === "input.mention" && available
-          ? { options: ["workspace_file", ...(this.#resolvers.resolveArtifactMention === undefined ? [] : ["artifact"]),
+          ? { options: ["workspace_file", "workspace_directory_local", ...(this.#resolvers.resolveArtifactMention === undefined ? [] : ["artifact"]),
               ...(this.#resolveNativeSkills === undefined ? [] : ["resource"])] }
           : {}),
         ...(key === "provider.login" && this.#account?.supportsLogin === true
