@@ -91,6 +91,18 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
       challengeId: challenge.id, code: challenge.code, connectionName: "Remote Claude client"
     });
     const clients = createE2eClients(running.baseUrl, paired.authKey);
+    const renameProject = async (client: E2eClients, displayName: string) => {
+      const store = running!.application.store;
+      const current = store.getTarget(targetId);
+      const operation = await submit(client.operation, paired.connection.id, create(OperationMutationSchema, {
+        preconditions: [{ entity: { kind: EntityKind.TARGET, id: targetId }, expectedRevision: { value: current.revision } }],
+        payload: { case: "updateTarget", value: { targetId, displayName } }
+      }));
+      expect(operation.state).toBe(OperationState.SUCCEEDED);
+      const renamed = store.getTarget(targetId);
+      expect(renamed.descriptor.displayName).toBe(displayName);
+      expect(renamed.revision).toBeGreaterThan(current.revision);
+    };
     const createSource = createSessionMutation({ backendId: BACKEND_ID, targetId,
       providerId: "keyless-fixture", modelId: "fixture-model", effortId: "low" });
     const created = await submit(clients.operation, paired.connection.id, createSource);
@@ -167,13 +179,40 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
     });
     expect(application.store.getSession(sourceId).descriptor.worktree).toBeUndefined();
 
+    const beforeRename = application.store.getTarget(targetId);
+    expect(derived.worktree.remote?.targetRevision).toBe(beforeRename.revision.toString());
+    for (const displayName of ["Renamed remote project", "Final remote project name"]) {
+      await renameProject(clients, displayName);
+      expect(application.store.getSession(derivedId).descriptor.worktree).toEqual(derived.worktree);
+    }
+
     await running.close();
     running = await start(config, remote);
     const restarted = running.application;
     const restartedClients = createE2eClients(running.baseUrl, paired.authKey);
-    expect(restarted.store.getSession(derivedId).descriptor.worktree).toEqual(derived.worktree);
+    const reopened = restarted.store.getSession(derivedId).descriptor;
+    expect(reopened.worktree).toEqual(derived.worktree);
+    expect(reopened.binding.nativeSessionId).toBe(derivedNativeId);
     expect(remote.deriveCount).toBe(1);
     expect(remote.activePaths()).toEqual([derived.worktree.path]);
+    await expect(restartedClients.worktree.getSessionWorktreeRemovalPreview({ sessionId: derivedId }))
+      .resolves.toMatchObject({ sessionId: derivedId, hasWorktree: true });
+    const { session: currentSession } = await restartedClients.session.getSession({ sessionId: derivedId });
+    const currentGeneration = currentSession?.version?.generation;
+    if (currentGeneration === undefined) throw new Error("The reopened task did not expose its current generation.");
+    expect(currentGeneration).toBeGreaterThan(BigInt(derived.binding.generation));
+    const renamedPrompt = "Continue in the original checkout after the project rename.";
+    const afterRename = await submit(restartedClients.operation, paired.connection.id,
+      sendInputMutation(derivedId, currentGeneration, renamedPrompt));
+    expect(afterRename.state).toBe(OperationState.SUCCEEDED);
+    await waitFor(async () => restarted.store.findQueueItemByRunId(derivedId, queueRunIdFrom(afterRename))?.state,
+      state => state === "completed", "the original SSH Worktree turn after a cold project rename", 10_000);
+    expect(remote.queryInputs.find(item => item.content === renamedPrompt)).toMatchObject({
+      sessionId: derivedNativeId, consumedInitCwd: derived.worktree.path
+    });
+    expect(restarted.store.getSession(derivedId).descriptor.worktree).toEqual(derived.worktree);
+    expect(remote.deriveCount).toBe(1);
+
     const restoredTimeline = await timeline(restartedClients, derivedId);
     const restoredAssistant = restoredTimeline.find((item) => item.payload?.kind.case === "messageCompleted"
       && item.payload.kind.value.nativeIdentity?.entryId !== sourceAssistantId
@@ -320,14 +359,7 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
     expect(remote.activePaths()).toEqual([]);
     const beforeRenamedClone = remote.managerCalls.length;
     remote.interruptNextCheckoutRelease = true;
-    remote.beforeCheckoutDeriveReply = async () => {
-      const current = running!.application.store.getTarget(targetId);
-      const renamed = await submit(finalClients.operation, paired.connection.id, create(OperationMutationSchema, {
-        preconditions: [{ entity: { kind: EntityKind.TARGET, id: targetId }, expectedRevision: { value: current.revision } }],
-        payload: { case: "updateTarget", value: { targetId, displayName: "Renamed during original Clone" } }
-      }));
-      expect(renamed.state).toBe(OperationState.SUCCEEDED);
-    };
+    remote.beforeCheckoutDeriveReply = () => renameProject(finalClients, "Renamed during original Clone");
     const renamedCloneId = randomUUID(), renamedClone = cloneMutation(sourceId, "Clone interrupted by project rename");
     const renamedResult = await submit(finalClients.operation, paired.connection.id, renamedClone, renamedCloneId);
     expect(renamedResult).toMatchObject({ state: OperationState.FAILED, error: {
@@ -389,6 +421,21 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
     expect(remote.managerCalls.slice(beforeRejectedClone.managerCalls)).not.toContain("store.fork");
     expect(currentStore.listSessions({ includeArchived: true, includeDeleted: true })).toHaveLength(beforeRejectedClone.tasks);
     expect(currentStore.getSession(sourceId).descriptor.worktree).toBeUndefined();
+
+    currentStore.upsertTarget(currentTarget.descriptor, currentTarget.metadata);
+    const separate = await submit(renamedClients.operation, paired.connection.id, cloneMutation(sourceId, "Lease before trust changes"));
+    expect(separate.state).toBe(OperationState.SUCCEEDED);
+    const separateId = sessionIdFrom(separate);
+    const preview = () => renamedClients.worktree.getSessionWorktreeRemovalPreview({ sessionId: separateId });
+    await renameProject(renamedClients, "Display rename before revocation");
+    await expect(preview()).resolves.toMatchObject({ sessionId: separateId, hasWorktree: true });
+    const beforeTrustChange = currentStore.getTarget(targetId);
+    currentStore.upsertTarget({ ...beforeTrustChange.descriptor, trusted: false }, beforeTrustChange.metadata);
+    currentStore.upsertTarget(beforeTrustChange.descriptor, beforeTrustChange.metadata);
+    await renameProject(renamedClients, "Display rename after trust was restored");
+    const checkoutCount = remote.checkoutCalls.length;
+    await expect(preview()).rejects.toThrow();
+    expect(remote.checkoutCalls).toHaveLength(checkoutCount);
   } finally {
     observeCleanup.mockRestore();
     await running?.close().catch(() => undefined);

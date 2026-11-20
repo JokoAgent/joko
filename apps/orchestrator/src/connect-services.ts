@@ -512,6 +512,7 @@ import { createWorktreeConnectService } from "./worktree-connect-service.js";
 import { workspaceIdFor } from "./workspace-run-capture.js";
 import { installSessionCodeHostContextRuntime } from "./session-code-host-context.js";
 import type { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
+import { recordSshWorktreeDisplayRename } from "./ssh-worktree-rename-authority.js";
 import { readPersonalDevelopmentPurpose } from "./personal-development-purpose.js";
 import { RuntimeProcessControl } from "./runtime-process-control.js";
 import {
@@ -17282,21 +17283,25 @@ async function dispatchMutation(
         if (payload.value.displayName !== undefined) {
           descriptor = { ...descriptor, displayName: payload.value.displayName };
         }
-        const displayNameOnly = existing.descriptor.remoteWorkspace?.kind === "ssh"
-          && dependencies.store.getBackend(existing.descriptor.backendId).descriptor.adapterKind === "codex"
+        const sshNameOnly = existing.descriptor.remoteWorkspace?.kind === "ssh"
           && payload.value.location === undefined && payload.value.pinned === undefined
           && descriptor.displayName !== existing.descriptor.displayName;
+        const renameBackend = sshNameOnly ? dependencies.store.getBackend(existing.descriptor.backendId).descriptor.adapterKind : undefined;
+        const displayNameOnly = renameBackend === "codex";
         const execution = await host.mutate({
           operationId,
           connection,
           kind: payload.case,
           body: mutation,
           commit: (store) => {
-            requireUndeletedTarget(store, descriptor.id);
-            store.upsertTarget(descriptor, {
+            const previous = requireUndeletedTarget(store, descriptor.id);
+            const updated = store.upsertTarget(descriptor, {
               ...metadata,
               ...(payload.value.pinned === undefined ? {} : { pinned: payload.value.pinned })
             });
+            if (renameBackend === "claude-agent-sdk-stdio" && previous.revision === existing.revision) {
+              recordSshWorktreeDisplayRename(store, previous, updated);
+            }
             return { accepted: true, resultCase: "target", entityId: descriptor.id } satisfies OperationOutcome;
           },
           afterCommit: ({ replayed }) => {

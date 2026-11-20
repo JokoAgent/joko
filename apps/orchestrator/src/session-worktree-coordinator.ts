@@ -21,6 +21,7 @@ import {
 } from "@joko/worktree";
 
 import type { WorkspaceService } from "./workspace-service.js";
+import { matchesRemoteWorktreeTargetRevision } from "./ssh-worktree-rename-authority.js";
 import {
   remoteBindingFromLease,
   remoteLeaseFromBinding,
@@ -411,7 +412,7 @@ export class SessionWorktreeCoordinator {
     }
     const target = this.#store.getTarget(plan.authority.targetId);
     assertCurrent?.();
-    await this.#registerRemoteWorkspace(target, binding, `${target.descriptor.displayName} · ${binding.branch}`);
+    await this.#registerRemoteWorkspace(target, plan.sessionId, binding, `${target.descriptor.displayName} · ${binding.branch}`);
     try { assertCurrent?.(); }
     catch (error) { this.#workspaces.unregister(binding.workspaceId); throw error; }
     this.#activeBindings.set(plan.sessionId, binding);
@@ -465,12 +466,15 @@ export class SessionWorktreeCoordinator {
       || !this.#hasDurableRemoteBinding(sessionId, expectedBinding)) {
       throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     }
-    await this.#requireRemoteOwner().assertExact(sessionId, expectedBinding);
-    if (options?.register === false) return expectedBinding.path;
     const target = this.#store.getTarget(expectedBinding.remote.targetId);
+    await this.#requireRemoteOwner().assertExact(sessionId, expectedBinding);
+    if (expectedBinding.remote.binding.kind === "ssh" && this.#store.getTarget(target.descriptor.id).revision !== target.revision) {
+      throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
+    }
+    if (options?.register === false) return expectedBinding.path;
     if (!this.#workspaces.listRegistrations().some((registration) =>
       registration.id === expectedBinding.workspaceId)) {
-      await this.#registerRemoteWorkspace(target, expectedBinding, `${target.descriptor.displayName} · ${expectedBinding.branch}`);
+      await this.#registerRemoteWorkspace(target, sessionId, expectedBinding, `${target.descriptor.displayName} · ${expectedBinding.branch}`);
     }
     this.#activeBindings.set(sessionId, expectedBinding);
     return expectedBinding.path;
@@ -1100,7 +1104,7 @@ export class SessionWorktreeCoordinator {
   async #registerWorkspace(session: StoredSession, binding: SessionWorktreeBinding): Promise<void> {
     const target = this.#store.getTarget(session.descriptor.targetId);
     if (binding.remote !== undefined) {
-      await this.#registerRemoteWorkspace(target, binding, `${session.descriptor.title} · ${binding.branch}`);
+      await this.#registerRemoteWorkspace(target, session.descriptor.id, binding, `${session.descriptor.title} · ${binding.branch}`);
       return;
     }
     await this.#workspaces.register({
@@ -1111,10 +1115,10 @@ export class SessionWorktreeCoordinator {
     });
   }
 
-  async #registerRemoteWorkspace(target: StoredTarget, binding: SessionWorktreeBinding, displayName: string): Promise<void> {
+  async #registerRemoteWorkspace(target: StoredTarget, sessionId: string, binding: SessionWorktreeBinding, displayName: string): Promise<void> {
     const remote = target.descriptor.remoteWorkspace;
     if (remote === undefined || binding.remote === undefined || binding.remote.targetId !== target.descriptor.id
-      || binding.remote.targetRevision !== target.revision.toString()
+      || !matchesRemoteWorktreeTargetRevision(this.#store, target, sessionId, binding)
       || !sameRemoteWorkspace(binding.remote.binding, remote)
       || binding.state !== "active") {
       throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");

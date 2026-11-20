@@ -35,9 +35,11 @@ describe("remote Claude installation", () => {
       const lease: RemoteGitCheckoutLease = { id: plan.leaseId, sessionId: plan.sessionId, path: plan.path, repositoryRoot: plan.repositoryRoot,
         branch: plan.branch, source: { ref: plan.sourceRef, commit: plan.sourceCommit, strategy: "explicit", refreshed: false }, acquiredAt: 1, remote: plan.remote };
       store.upsertTarget({ ...target.descriptor, displayName: "Renamed" });
-      processes.enqueue(ready, ready);
+      const beforeStaleRequests = processes.requests.length;
+      processes.enqueue(ready);
       await expect(owner.derive(plan)).rejects.toMatchObject({ code: "AUTHORITY_CHANGED" });
       await expect(owner.assertExact(plan.sessionId, remoteBindingFromLease(plan.workspaceId, lease))).rejects.toMatchObject({ code: "AUTHORITY_CHANGED" });
+      expect(processes.requests).toHaveLength(beforeStaleRequests + 1);
       expect(processes.inputs.some(input => input.includes('"operation":"derive"') || input.includes('"operation":"assert"'))).toBe(false);
       const assertClaim = () => undefined;
       processes.enqueue(ready, { stdout: JSON.stringify({ format: 1, status: operation === "inspect" ? "active" : "released", lease }), exitCode: 0 });
