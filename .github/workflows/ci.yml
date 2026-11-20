@@ -792,6 +792,15 @@ jobs:
           pnpm --filter @joko/desktop exec vitest run test/packaged-smoke-task.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/packaged-smoke-task.log"
           pnpm --filter @joko/desktop exec node scripts/smoke-packaged.mjs --provider-smoke-classifier-test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/provider-smoke-classifier.log"
 
+      - name: Verify focused trackpad delivery to the actual isolated Electron frame
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os == 'Linux' }}
+        timeout-minutes: 3
+        shell: bash
+        env:
+          XDG_SESSION_TYPE: x11
+          WAYLAND_DISPLAY: ""
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" bash scripts/ci/run-linux-gui.sh pnpm --filter @joko/desktop exec electron --no-sandbox scripts/check-native-trackpad-embedding.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-trackpad-embedding.log"
+
       - name: Package the current platform Desktop application
         id: desktop_package
         if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_runtime.outcome == 'success' }}

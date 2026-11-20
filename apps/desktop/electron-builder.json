@@ -234,6 +234,13 @@
     "sign": "scripts/sign-mac-native-credentials.cjs",
     "entitlements": "resources/desktop.entitlements.plist",
     "binaries": ["Contents/Resources/native-remote-desktop/joko-macos-remote-credentials"],
+    "extraResources": [
+      {
+        "from": "dist/native-trackpad",
+        "to": "native-trackpad",
+        "filter": ["manifest.json", "joko-macos-trackpad.node"]
+      }
+    ],
     "extendInfo": {
       "NSMicrophoneUsageDescription": "Joko uses the microphone only while you choose to dictate into the composer.",
       "NSAudioCaptureUsageDescription": "Joko shares computer audio only when you enable audio in Remote Desktop.",

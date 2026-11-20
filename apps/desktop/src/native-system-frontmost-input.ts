@@ -1,21 +1,12 @@
-import { createHash } from "node:crypto";
-import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
-import { createRequire } from "node:module";
-import { resolve } from "node:path";
 import type { NativeSystemFrontmostInputHelper } from "./dedicated-hardware-action/system-frontmost-input.js";
+import { loadHashedNativeHelper, nativeHelperRecord as record, type NativeHelperModuleOptions } from "./native-helper-module.js";
 
-const require = createRequire(import.meta.url);
 const WINDOWS_HELPER = "joko-windows-frontmost-input.node";
 const MACOS_HELPER = "joko-macos-frontmost-input.node";
 const LINUX_HELPER = "joko-linux-frontmost-input.node";
 const MAX_HELPER_BYTES = 2 * 1024 * 1024;
 
-export interface NativeSystemFrontmostInputOptions {
-  readonly directory: string;
-  readonly platform: NodeJS.Platform;
-  readonly architecture: string;
-  readonly loadNative?: (path: string) => unknown;
-}
+export type NativeSystemFrontmostInputOptions = NativeHelperModuleOptions;
 
 /** Loads the current artifact once; sampling and fixed effects never start another process. */
 export function loadNativeSystemFrontmostInput(
@@ -25,22 +16,7 @@ export function loadNativeSystemFrontmostInput(
     : options.platform === "darwin" ? MACOS_HELPER : options.platform === "linux" ? LINUX_HELPER : undefined;
   if (helper === undefined) return undefined;
   try {
-    const directory = resolve(options.directory);
-    const root = lstatSync(directory);
-    if (!root.isDirectory() || root.isSymbolicLink() || realpathSync(directory) !== directory) return undefined;
-    const entries = readdirSync(directory).sort();
-    if (entries.length !== 2 || entries[0] !== helper || entries[1] !== "manifest.json") return undefined;
-    const manifestPath = resolve(directory, "manifest.json");
-    if (!regularFile(manifestPath, 4_096)) return undefined;
-    const manifest: unknown = JSON.parse(readFileSync(manifestPath, "utf8"));
-    if (!record(manifest) || Object.keys(manifest).sort().join(",") !== "architecture,helper,platform,protocolVersion,sha256"
-      || manifest.platform !== options.platform || manifest.architecture !== options.architecture
-      || manifest.protocolVersion !== 1 || manifest.helper !== helper
-      || typeof manifest.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.sha256)) return undefined;
-    const helperPath = resolve(directory, helper);
-    if (!regularFile(helperPath, MAX_HELPER_BYTES)) return undefined;
-    if (createHash("sha256").update(readFileSync(helperPath)).digest("hex") !== manifest.sha256) return undefined;
-    const native = (options.loadNative ?? require)(helperPath);
+    const native = loadHashedNativeHelper(options, helper, MAX_HELPER_BYTES);
     if (!record(native) || Object.keys(native).sort().join(",") !== "captureTarget,postPaste,postReturn,postScroll,protocolVersion"
       || native.protocolVersion !== 1 || typeof native.captureTarget !== "function"
       || typeof native.postReturn !== "function" || typeof native.postPaste !== "function"
@@ -69,14 +45,4 @@ export function loadNativeSystemFrontmostInput(
   } catch {
     return undefined;
   }
-}
-
-function regularFile(path: string, maximumBytes: number): boolean {
-  const info = lstatSync(path);
-  return info.isFile() && !info.isSymbolicLink() && info.size > 0 && info.size <= maximumBytes
-    && realpathSync(path) === path;
-}
-
-function record(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

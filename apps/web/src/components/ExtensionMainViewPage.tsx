@@ -653,6 +653,7 @@ export function ExtensionMainViewPage({
           ref={frameRef}
           key={`${state.surface.id}:${frameRevision}`}
           className="extension-main-view-page__frame"
+          data-joko-extension-surface=""
           title={title}
           sandbox="allow-scripts"
           referrerPolicy="no-referrer"

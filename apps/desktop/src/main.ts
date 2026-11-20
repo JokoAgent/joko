@@ -204,6 +204,7 @@ import {
 } from "./dedicated-hardware-action/system-frontmost-input.js";
 import { SystemFrontmostVoiceController } from "./dedicated-hardware-action/system-frontmost-voice.js";
 import { loadNativeSystemFrontmostInput } from "./native-system-frontmost-input.js";
+import { configureNativeTrackpadInput, installNativeTrackpad } from "./native-trackpad.js";
 import {
   createNativeGamepadRuntime,
   resolveNativeGamepadDirectory,
@@ -522,6 +523,8 @@ import {
 } from "./security.js";
 import { createDesktopEndpointRuntimePreparation, installDesktopEndpointRuntimes } from './connection-transport.js';
 import { DesktopLinkspanHost, DESKTOP_LINKSPAN_CAPTURE } from './linkspan-host.js';
+
+configureNativeTrackpadInput(app.commandLine);
 
 // fileURLToPath(new URL(".", ...)) retains a trailing separator. Normalize it
 // once here so the managed-runtime resolver's absolute/canonical input fence
@@ -1414,6 +1417,7 @@ function createWindow(): void {
   mainWindowContentsByWindow.set(window, windowContents);
   const attentionSourceId = windowContents.id;
   mainWindow = window;
+  bindNativeTrackpadForApplicationWindow(window);
   if (externalPackagedE2e && packagedSmokeResultPath !== undefined) {
     windowContents.once("did-start-loading", () => recordPackagedSmokeProgress("main_window_load_started"));
     windowContents.once("did-navigate", () => recordPackagedSmokeProgress("main_window_navigation_committed"));
@@ -5762,6 +5766,7 @@ async function openSessionApplicationWindow(
     containDroppedWindow();
     if (dropWorkArea !== undefined) window.on("resize", containDroppedWindow);
     sessionWindows.register(window, owner);
+    bindNativeTrackpadForApplicationWindow(window);
     installDesktopNativeTaskStatusVisibilityLifecycle(window);
     window.webContents.setZoomFactor(currentWindowZoomFactor);
     let sessionUiLoadRecovery: Promise<void> | undefined;
@@ -5929,6 +5934,7 @@ async function openExtensionApplicationWindow(
   extensionWindowStates.set(key, state);
   state.manage(window);
   windowContents.setZoomFactor(currentWindowZoomFactor);
+  bindNativeTrackpadForApplicationWindow(window);
 
   let extensionUiLoadRecovery: Promise<void> | undefined;
   const beginExtensionUiLoadRecovery = (initialFailure?: unknown): void => {
@@ -6903,6 +6909,11 @@ function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: Brows
   inspectorWindows.set(childWindow, entry);
   syncFirstInspectorWindow();
   childWindow.webContents.setZoomFactor(currentWindowZoomFactor);
+  bindNativeTrackpadForApplicationWindow(childWindow, {
+    bootstrapBaseUrl: () => owner.webContents.getURL(),
+    isCurrent: () => !owner.isDestroyed() && !entry.closing && lifecycle.owns(owner, childWindow)
+      && childWindow.webContents.getURL() === INSPECTOR_WINDOW_URL && trustedApplicationWindowForContents(owner.webContents) === owner
+  });
 
   installSelectionContextMenu(childWindow, {
     platform: process.platform,
@@ -11591,6 +11602,18 @@ function trustedApplicationWindowForContents(contents: WebContents): BrowserWind
 function isTrustedApplicationContents(contents: WebContents): boolean {
   const owner = trustedApplicationWindowForContents(contents);
   return owner !== undefined && isAllowedMainFrameNavigation(contents.getURL(), navigationPolicy);
+}
+
+function bindNativeTrackpadForApplicationWindow(window: BrowserWindow, portal?: {
+  readonly bootstrapBaseUrl: () => string;
+  readonly isCurrent: () => boolean;
+}): void {
+  const contents = window.webContents;
+  installNativeTrackpad(window, {
+    directory: resolve(app.isPackaged ? process.resourcesPath : sourceDirectory, "native-trackpad"),
+    ...(portal === undefined ? {} : { bootstrapBaseUrl: portal.bootstrapBaseUrl }),
+    isCurrent: () => !quitting && (portal?.isCurrent() ?? trustedApplicationWindowForContents(contents) === window)
+  });
 }
 
 function isTrustedClipboardWriteContents(contents: WebContents): boolean {
