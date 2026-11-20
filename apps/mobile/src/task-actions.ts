@@ -208,32 +208,104 @@ export function queueItemHasStructuredInput(input: InputContent | undefined): bo
   return input !== undefined && (input.quotesEncoded
     || input.pastedTextRanges.length > 0
     || input.mentionRanges.length > 0
+    || input.messageReferences.length > 0
     || input.parts.some((part) => part.content.case !== "text"));
+}
+
+export const maximumMobileQueueTextEditSplices = 4_096;
+
+/** Verify the native selection against both snapshots before retaining any range. */
+export function mobileQueueTextSplice(previous: string, next: string, selection: MobileComposerSelection): QueueTextEditSplice | undefined {
+  if (previous === next) return undefined;
+  const verified = (start: number, end: number): QueueTextEditSplice | undefined => {
+    const nextEnd = next.length - (previous.length - end);
+    if (start < 0 || end < start || end > previous.length || nextEnd < start
+      || !utf16Boundary(previous, start) || !utf16Boundary(previous, end)
+      || !utf16Boundary(next, start) || !utf16Boundary(next, nextEnd)
+      || previous.slice(0, start) !== next.slice(0, start) || previous.slice(end) !== next.slice(nextEnd)) return undefined;
+    return create(QueueTextEditSpliceSchema, { start, end, replacementText: next.slice(start, nextEnd) });
+  };
+  const exact = verified(selection.start, selection.end);
+  if (exact !== undefined) return exact;
+  const removed = previous.length - next.length;
+  if (removed > 0 && selection.start === selection.end) {
+    const backward = verified(selection.start - removed, selection.end);
+    const forward = verified(selection.start, selection.end + removed);
+    if (backward && !forward) return backward;
+    if (forward && !backward) return forward;
+  }
+  return create(QueueTextEditSpliceSchema, { start: 0, end: previous.length, replacementText: next });
 }
 
 export function editQueueItemText(
   input: InputContent | undefined,
   replacementText: string,
-  directories: readonly MobileComposerWorkspaceMention[] = []
+  directories: readonly MobileComposerWorkspaceMention[] = [],
+  edits: readonly QueueTextEditSplice[] = []
 ): { readonly input: InputContent; readonly textSplices: readonly QueueTextEditSplice[] } | undefined {
   const originalText = queueItemWireText(input);
   const visibleText = queueItemText(input);
   if (input === undefined || originalText === undefined || visibleText === undefined || !replacementText.trim()) return undefined;
-  if (replacementText === visibleText && directories.length === 0) return undefined;
+  if (replacementText === visibleText && directories.length === 0 && edits.length === 0) return undefined;
+  const full = create(QueueTextEditSpliceSchema, { start: 0, end: originalText.length, replacementText });
+  const textSplices = originalText === visibleText && edits.length > 0 && edits.length <= maximumMobileQueueTextEditSplices
+    && replayQueueEdits(originalText, edits) === replacementText
+    ? edits : [full];
+  const mentionRanges = retainedQueueRanges(input.mentionRanges, textSplices);
+  const originallyRanged = new Set(input.mentionRanges.map(range => range.mentionIndex));
+  const surviving = new Set(mentionRanges.map(range => range.mentionIndex));
+  const indexMap = new Map<number, number>();
+  const originalMentions = input.parts.filter(part => part.content.case !== "text");
+  const mentions = originalMentions.filter((_part, index) => {
+    if (originallyRanged.has(index) && !surviving.has(index)) return false;
+    indexMap.set(index, indexMap.size);
+    return true;
+  });
   const ordered = [...directories].sort((left, right) => left.start - right.start);
-  const parts = [create(InputPartSchema, { content: { case: "text", value: replacementText } }),
+  const parts = [create(InputPartSchema, { content: { case: "text", value: replacementText } }), ...mentions,
     ...ordered.map(directory => create(InputPartSchema, { content: { case: "workspaceMention", value: {
       workspaceId: directory.workspaceId, relativePath: directory.relativePath, displayText: directory.displayText, directory: true
     } } }))];
+  const ranges = [
+    ...mentionRanges.map(range => create(InputMentionRangeSchema, { ...range, mentionIndex: indexMap.get(range.mentionIndex)! })),
+    ...ordered.map(({ start, end }, index) => create(InputMentionRangeSchema, { start, end, mentionIndex: mentions.length + index }))
+  ].sort((left, right) => left.start - right.start);
   return {
-    input: create(InputContentSchema, { parts, mentionRanges: ordered.map(({ start, end }, mentionIndex) => create(InputMentionRangeSchema, { start, end, mentionIndex })),
+    input: create(InputContentSchema, { parts, mentionRanges: ranges,
+      pastedTextRanges: retainedQueueRanges(input.pastedTextRanges, textSplices),
+      messageReferences: retainedQueueRanges(input.messageReferences, textSplices),
       ...(input.replyQuote ? { replyQuote: input.replyQuote } : {}), ...(input.todoQuote ? { todoQuote: input.todoQuote } : {}) }),
-    textSplices: [create(QueueTextEditSpliceSchema, {
-      start: 0,
-      end: originalText.length,
-      replacementText
-    })]
+    textSplices
   };
+}
+
+function replayQueueEdits(original: string, edits: readonly QueueTextEditSplice[]): string | undefined {
+  let current = original, replayBytes = 0, replacementBytes = 0;
+  const encoder = new TextEncoder();
+  for (const { start, end, replacementText } of edits) {
+    if (start < 0 || end < start || end > current.length || !utf16Boundary(current, start) || !utf16Boundary(current, end)
+      || start === end && replacementText.length === 0) return undefined;
+    replacementBytes += encoder.encode(replacementText).length;
+    replayBytes += encoder.encode(current).length;
+    if (replacementBytes > 4 * 1024 * 1024 || replayBytes + replacementBytes > 64 * 1024 * 1024) return undefined;
+    current = current.slice(0, start) + replacementText + current.slice(end);
+  }
+  return current;
+}
+
+export function retainedQueueRanges<T extends { readonly start: number; readonly end: number }>(ranges: readonly T[], edits: readonly QueueTextEditSplice[]): T[] {
+  return edits.reduce<T[]>((current, { start, end, replacementText }) => {
+    const delta = replacementText.length - (end - start);
+    return current.flatMap(range => {
+      if (range.end <= start) return [range];
+      return range.start >= end ? [{ ...range, start: range.start + delta, end: range.end + delta }] : [];
+    });
+  }, [...ranges]);
+}
+
+function utf16Boundary(text: string, offset: number): boolean {
+  return Number.isSafeInteger(offset) && !(text.charCodeAt(offset - 1) >= 0xD800 && text.charCodeAt(offset - 1) <= 0xDBFF
+    && text.charCodeAt(offset) >= 0xDC00 && text.charCodeAt(offset) <= 0xDFFF);
 }
 
 export type MobileQueueMove =

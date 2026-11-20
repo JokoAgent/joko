@@ -6,6 +6,7 @@ import {
   InputPartSchema,
   QueueItemSchema,
   QueueItemState,
+  QueueTextEditSpliceSchema,
   capabilityNames
 } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
@@ -19,12 +20,14 @@ import {
   createMobileSideChatMessageDraft,
   editQueueItemText,
   mobileQueueCapabilities,
+  mobileQueueTextSplice,
   queueItemHasStructuredInput,
   queueItemText,
-  queueMove
+  queueMove,
+  retainedQueueRanges
 } from "./task-actions";
 import type { TimelineRow } from "./timeline";
-import { mobileComposerInput, plainTextMobileComposerDraft, restoreMobileComposerInput } from "./mobile-composer-document";
+import { insertMobileWorkspaceMention, mobileComposerInput, plainTextMobileComposerDraft, restoreMobileComposerInput } from "./mobile-composer-document";
 
 describe("mobile message action sheet", () => {
   const row: TimelineRow = {
@@ -152,7 +155,8 @@ describe("mobile accepted Queue actions", () => {
       parts: [
         create(InputPartSchema, { content: { case: "text", value: `text-${id}` } }),
         create(InputPartSchema, { content: { case: "sessionMention", value: { sessionId: "other", displayText: "Other task" } } })
-      ]
+      ],
+      mentionRanges: [{ start: 0, end: `text-${id}`.length, mentionIndex: 0 }]
     })
   });
 
@@ -193,6 +197,45 @@ describe("mobile accepted Queue actions", () => {
     ]);
     expect(edit?.input.mentionRanges).toMatchObject([{ start: 7, end: 14, mentionIndex: 0 }]);
     expect(edit?.textSplices).toMatchObject([{ start: 0, end: 6, replacementText: text }]);
+  });
+
+  it("keeps exact reference spans through verified edits and discards covered ones even when restored as plain text", () => {
+    const initial = create(InputContentSchema, {
+      parts: [{ content: { case: "text", value: "@docs/ then @notes/" } },
+        { content: { case: "workspaceMention", value: { workspaceId: "workspace", relativePath: "docs", directory: true } } },
+        { content: { case: "workspaceMention", value: { workspaceId: "workspace", relativePath: "notes", directory: true } } }],
+      mentionRanges: [{ start: 0, end: 6, mentionIndex: 0 }, { start: 12, end: 19, mentionIndex: 1 }]
+    });
+    const original = "@docs/ then @notes/";
+    const appended = original + ".";
+    const removed = appended.slice(6);
+    const splices = [
+      mobileQueueTextSplice(original, appended, { start: original.length, end: original.length })!,
+      mobileQueueTextSplice(appended, removed, { start: 0, end: 6 })!,
+      mobileQueueTextSplice(removed, appended, { start: 0, end: 0 })!
+    ];
+    expect(editQueueItemText(initial, appended, [], splices.slice(0, 1))?.input.mentionRanges).toEqual(initial.mentionRanges);
+    const edited = editQueueItemText(initial, appended, [], splices)!;
+    expect(edited.input.parts[1]?.content).toMatchObject({ case: "workspaceMention", value: { relativePath: "notes", directory: true } });
+    expect(edited.input.mentionRanges).toMatchObject([{ start: 12, end: 19, mentionIndex: 0 }]);
+    expect(mobileQueueTextSplice("😀!", "!", { start: 2, end: 2 })).toMatchObject({ start: 0, end: 2, replacementText: "" });
+    expect(mobileQueueTextSplice("abc", "xy", { start: 2, end: 2 })).toMatchObject({ start: 0, end: 3, replacementText: "xy" });
+
+    const selected = insertMobileWorkspaceMention(plainTextMobileComposerDraft(original), { start: 0, end: 6 },
+      { workspaceId: "workspace", relativePath: "docs", displayText: "docs", directory: true }, "selected-docs");
+    expect(selected.draft.text).toBe(original);
+    expect(selected.replacedRange).toEqual({ start: 0, end: 6 });
+    const explicit = create(QueueTextEditSpliceSchema, { ...selected.replacedRange, replacementText: original.slice(0, 6) });
+    const directories = selected.draft.mentions.flatMap(mention => mention.kind === "workspace" ? [mention] : []);
+    expect(editQueueItemText(initial, original, directories, [explicit])?.input.mentionRanges).toMatchObject([
+      { start: 0, end: 6, mentionIndex: 1 }, { start: 12, end: 19, mentionIndex: 0 }
+    ]);
+    const changedText = original.replace("docs", "dust");
+    const changed = mobileQueueTextSplice(original, changedText, { start: 1, end: 5 })!;
+    expect(retainedQueueRanges(directories, [changed])).toEqual([]);
+    expect(editQueueItemText(initial, changedText, [], [changed])?.input.mentionRanges).toMatchObject([
+      { start: 12, end: 19, mentionIndex: 0 }
+    ]);
   });
 
   it("opens quote-bearing Queue input markerless and replaces the exact raw body only after a real edit", () => {

@@ -548,7 +548,7 @@ export function insertMobileWorkspaceMention(
     readonly lineRange?: MobileWorkspaceLineRange;
   },
   mentionId: string
-): MobileComposerEditResult {
+): MobileComposerEditResult & { readonly replacedRange: MobileComposerSelection } {
   const current = normalizeMobileComposerDraft(draft);
   assertIdentity(mentionId, "reference occurrence");
   const range = expandedAtomicRange(current, normalizeSelection(selection, current.text));
@@ -564,7 +564,7 @@ export function insertMobileWorkspaceMention(
     end: 0
   };
   const normalized = normalizeWorkspaceMention(mention, normalizeDisplayText(mention.displayText));
-  return insertMobileComposerMention(current, range, { ...normalized, mentionId, start: 0, end: 0 });
+  return { ...insertMobileComposerMention(current, range, { ...normalized, mentionId, start: 0, end: 0 }), replacedRange: range };
 }
 
 export function insertMobileResourceMention(
