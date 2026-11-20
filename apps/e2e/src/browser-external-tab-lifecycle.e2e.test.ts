@@ -179,12 +179,24 @@ it.skipIf(!existsSync(sidebarExecutable) || !mountedWebDirectory)(
       const upload = async (name: string) => {
         const picker = page.waitForEvent("filechooser");
         await page.getByRole("button", { name: "Upload file", exact: true }).click();
+        const submitted = page.waitForResponse(response => {
+          if (!response.url().endsWith("/joko.v1.OperationService/SubmitOperation")) return false;
+          const body = response.request().postDataBuffer();
+          const payload = body === null ? undefined : fromBinary(SubmitOperationRequestSchema, body).mutation?.payload;
+          return payload?.case === "uploadBrowserFile" && payload.value.blob?.fileName === name;
+        });
         await (await picker).setFiles({ name, mimeType: "text/plain", buffer: bytes });
-        return waitFor(async () => (await owner.clients.browser.listBrowserTransfers({
+        const response = await submitted;
+        if (!response.ok()) throw new Error(`Browser upload ${response.status()} ${await response.text()}`);
+        const operation = fromBinary(SubmitOperationResponseSchema, await response.body()).operation;
+        expect(operation?.state, operation?.error?.message).toBe(OperationState.SUCCEEDED);
+        const receipt = operation?.result?.payload;
+        if (receipt?.case !== "browserTransfer") throw new Error("The Browser upload did not return a transfer receipt.");
+        const { transfers } = await owner.clients.browser.listBrowserTransfers({
           browserProviderId: provider.id, pageId: initial.pageId, direction: TransferDirection.UPLOAD
-        })).transfers.find(transfer => transfer.fileName === name),
-        transfer => transfer?.state === BrowserTransferState.COMPLETED || transfer?.state === BrowserTransferState.FAILED,
-        `the Browser transfer for ${name}`, 20_000);
+        });
+        expect(transfers.find(transfer => transfer.browserTransferId === receipt.value.browserTransferId)).toEqual(receipt.value);
+        return receipt.value;
       };
       const inputFiles = () => native.locator("input[type=file]").evaluateAll(async elements => Promise.all(
         elements.map(async element => Promise.all(Array.from((element as HTMLInputElement).files ?? [], async file =>
