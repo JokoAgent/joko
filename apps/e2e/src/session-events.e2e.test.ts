@@ -1305,12 +1305,15 @@ describe("session host, durable events, and reconnect semantics", () => {
     const before = [first.queueItemId, second.queueItemId, third.queueItemId];
     await waitFor(order, value => value.join() === before.join(), "the initial mounted queue order");
     expect(await page.locator(`[data-queue-item-id="${active.queueItemId}"]`).count()).toBe(1);
-    let snapshots = 0;
-    page.on("request", request => { if (request.url().endsWith("/joko.v1.EventService/GetSnapshot")) snapshots += 1; });
-
     const control = (await manager.clients.queue.getQueueControl({ sessionId })).queueControl!;
     const lock = randomUUID();
     expect((await submit(operation, manager.connectionId, setQueueInteractionLockMutation(control, lock, true))).state).toBe(OperationState.SUCCEEDED);
+    const held = page.getByText("Queue in use", { exact: true });
+    await held.waitFor({ state: "visible" });
+    expect(await order()).toEqual(before);
+    let snapshots = 0;
+    page.on("request", request => { if (request.url().endsWith("/joko.v1.EventService/GetSnapshot")) snapshots += 1; });
+
     const reorder = reorderQueuedInputBeforeMutation(second, third.queueItemId, lock);
     if (reorder.payload.case !== "reorderQueueItem") throw new Error("Expected a queue reorder.");
     reorder.payload.value.placement!.anchor = { case: "afterQueueItemId", value: third.queueItemId };
@@ -1318,6 +1321,7 @@ describe("session host, durable events, and reconnect semantics", () => {
     expect((await submit(operation, manager.connectionId, setQueueInteractionLockMutation(control, lock, false))).state).toBe(OperationState.SUCCEEDED);
     const after = [first.queueItemId, third.queueItemId, second.queueItemId];
     await waitFor(order, value => value.join() === after.join(), "the reordered queue on the observing Web client");
+    await held.waitFor({ state: "hidden" });
     expect(snapshots).toBe(0);
     expect(await page.locator(`[data-queue-item-id="${active.queueItemId}"]`).count()).toBe(1);
     expect(store.getRun(active.runId).descriptor.state).toBe("running");
