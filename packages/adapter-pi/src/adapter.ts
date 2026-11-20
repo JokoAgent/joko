@@ -5,7 +5,6 @@ import { type BigIntStats } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, rmdir, stat, unlink, writeFile, type FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix as posixPath, relative, resolve, sep, win32 as win32Path } from "node:path";
-import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
@@ -194,6 +193,7 @@ import {
   type PiCacheRoute
 } from "./request-option-compatibility.js";
 import { provisionManagedRequestOptionRecovery } from "./request-option-recovery.js";
+import { PUBLISHED_PI_LOCAL_CLI, resolvePublishedPiBundleRoot } from "./published-cli.js";
 import {
   createDefaultManagedProcessSupervisor,
   type ManagedProcessSupervisor
@@ -221,7 +221,6 @@ const PI_LONG_RUNNING_RPC_TIMEOUT_MS = 10 * 60_000;
  * for the same bounded interval and refresh it only on native Bash progress. */
 const PI_USER_SHELL_RPC_TIMEOUT_MS = 30 * 60_000;
 const MAXIMUM_REFERENCED_RESOURCE_TEXT_BYTES = 256 * 1024;
-const BUNDLED_PI_CLI = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
 const EXTERNAL_SESSION_REFERENCE_PREFIX = "pi-external-session:";
 const RESET_CONTEXT_RECEIPT_VERSION = 1;
 const MAXIMUM_RESET_CONTEXT_RECEIPT_BYTES = 64 * 1024;
@@ -890,7 +889,7 @@ export class PiBackendAdapter implements
     };
     this.#command = options.command ?? process.execPath;
     this.#commandArgs = options.command === undefined
-      ? [BUNDLED_PI_CLI, ...(options.commandArgs ?? [])]
+      ? [PUBLISHED_PI_LOCAL_CLI, ...(options.commandArgs ?? [])]
       : options.commandArgs ?? [];
     this.#processFactory = options.processFactory ?? spawnPiProcess;
     this.#usesDefaultProcessFactory = options.processFactory === undefined;
@@ -5128,7 +5127,8 @@ export class PiBackendAdapter implements
     const releaseUnpublished = (): void => {
       this.#releaseManagedGenerationLease(generationLease);
     };
-    const { catalog, bridgePath, subagentPath, silentEncryptedRetryPath, requestOptionRecoveryPath, managedResources } = await this.#initialize(managedGeneration).catch((error) => {
+    const { catalog, bridgePath: generationBridgePath, subagentPath: generationSubagentPath, silentEncryptedRetryPath,
+      requestOptionRecoveryPath, managedResources } = await this.#initialize(managedGeneration).catch((error) => {
       releaseUnpublished();
       throw error;
     });
@@ -5170,6 +5170,16 @@ export class PiBackendAdapter implements
     const runtimeRoot = join(agentHome, "runtime");
     const runtimeAgentHomePath = join(runtimeDirectory, "agent-home");
     await this.#prepareRuntimeDirectory(agentHome, runtimeDirectory);
+    const sshLaunch = context.target.remoteWorkspace?.kind === "ssh";
+    const configuredBundle = sshLaunch && this.#command !== process.execPath
+      ? await resolvePublishedPiBundleRoot(this.#command) : undefined;
+    const stagedPublishedPi = sshLaunch && (this.#command === "pi" || configuredBundle !== undefined || this.#command === process.execPath
+      && this.#commandArgs[0] === PUBLISHED_PI_LOCAL_CLI);
+    // The default SSH runtime owns its policy bridge and relative support files as one tree.
+    const [bridgePath, subagentPath] = await Promise.all([
+      stagedPublishedPi ? provisionManagedBridge(runtimeDirectory) : generationBridgePath,
+      stagedPublishedPi && managedSubagentToolsEnabled ? provisionManagedSubagent(runtimeDirectory) : generationSubagentPath
+    ]);
     const sessionKey = stableSessionKey(context.sessionId);
     const spawnIdentity = stableSpawnIdentity(agentHome, this.#sessionStore.sessionsRoot, sessionKey, context.generation);
     const ownerPath = join(runtimeDirectory, RUNTIME_OWNER_FILE);
@@ -5282,6 +5292,7 @@ export class PiBackendAdapter implements
     }
 
     const args = [
+      ...(configuredBundle === undefined ? [] : [join(configuredBundle, "dist", "bundle", "cli.js")]),
       ...this.#commandArgs,
       "--mode",
       "rpc",
@@ -5477,7 +5488,7 @@ export class PiBackendAdapter implements
       if (hosted) assertHostedExecution(hosted);
       assertStartupCurrent?.();
       const process = await this.#processFactory({
-        command: this.#command,
+        command: configuredBundle === undefined ? this.#command : globalThis.process.execPath,
         args,
         cwd: runtimeWorkspaceRoot(context.target),
         env: remoteHome?.environment ?? env,

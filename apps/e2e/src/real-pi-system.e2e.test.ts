@@ -44,6 +44,7 @@ import {
   RunState,
   RuntimeCommandSource,
   SetResourceEnabledMutationSchema,
+  SetSkillEnabledMutationSchema,
   SetWorkspaceTrustMutationSchema,
   SessionSnapshotScopeSchema,
   SessionState,
@@ -1347,6 +1348,54 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     expect(serializedUsage).not.toContain("SKILL.md");
     expect(serializedUsage).not.toContain(installed.sourceDirectory);
     expect(serializedUsage).not.toContain(fixture.rootDirectory);
+  });
+
+  it("resumes the same idle Pi task with the new resource catalog after disabling a Skill", { timeout: 90_000 }, async () => {
+    const running = await RealPiSystemFixture.start();
+    fixture = running;
+    const paired = await running.pair("Idle Pi Skill refresh");
+    const { clients, connectionId } = paired;
+    const { skill } = await installLocalSkill(running, paired, "idle-runtime-skill");
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId, createSessionMutation({
+      backendId: "pi", targetId: "workspace-real-pi", displayName: "Keep the original native task",
+      providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, effortId: "off"
+    })));
+    const { store } = running.application;
+    const before = store.getSession(sessionId).descriptor.binding;
+    const backendInstance = store.getBackend("pi").descriptor.instanceGeneration;
+    expect((await clients.session.listRuntimeCommands({ sessionId })).commands)
+      .toContainEqual(expect.objectContaining({ resourceId: skill.skillId, loaded: true }));
+
+    const send = async (text: string) => {
+      const original = store.getSession(sessionId).descriptor.binding;
+      const selection = await submit(clients.operation, connectionId, sendInputMutation(sessionId, BigInt(original.generation), text));
+      const runId = queueRunIdFrom(selection);
+      const { run } = await waitForRealSystem(() => clients.run.getRun({ runId }),
+        result => result.run?.state === RunState.SUCCEEDED || result.run?.state === RunState.FAILED,
+        "a terminal native Pi prompt after the resource change", 30_000);
+      expect(run, run?.error?.message).toMatchObject({ sessionId, state: RunState.SUCCEEDED });
+    };
+    await send("Remember this first plain prompt in the original task.");
+    const current = (await clients.skill.listSkills({ query: skill.name, page: { pageSize: 20 } }))
+      .skills.find(item => item.skillId === skill.skillId);
+    expect(current?.enabled).toBe(true);
+    const disabled = await submit(clients.operation, connectionId, create(OperationMutationSchema, { payload: {
+      case: "setSkillEnabled", value: create(SetSkillEnabledMutationSchema, { skillId: skill.skillId,
+        expectedResourceRevision: current?.entityVersion?.revision, enabled: false })
+    } }));
+    expect(disabled).toMatchObject({ state: OperationState.SUCCEEDED, result: { payload: { case: "skill", value: { skill: { enabled: false } } } } });
+    expect(store.getSession(sessionId).descriptor.binding).toEqual(before);
+
+    await send("Send this next plain prompt through the updated runtime.");
+    const after = store.getSession(sessionId).descriptor.binding;
+    expect(after).toMatchObject({ opaqueRef: before.opaqueRef, nativeSessionId: before.nativeSessionId });
+    expect(after.generation).toBeGreaterThan(before.generation);
+    expect(store.getBackend("pi").descriptor.instanceGeneration).toBe(backendInstance);
+    expect((await clients.session.listRuntimeCommands({ sessionId })).commands.some(item => item.resourceId === skill.skillId)).toBe(false);
+    expect(running.providerRequests).toHaveLength(2);
+    const secondRequest = JSON.stringify(running.providerRequests[1]?.body);
+    expect(secondRequest).toContain("Remember this first plain prompt in the original task.");
+    expect(secondRequest).toContain("Send this next plain prompt through the updated runtime.");
   });
 
   it("restarts the installed Pi runtime and resumes the same native Session context", { timeout: 90_000 }, async () => {

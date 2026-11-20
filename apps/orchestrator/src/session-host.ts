@@ -14051,9 +14051,16 @@ export class SessionHost {
     };
     const active = this.#active.get(sessionId);
     if (active !== undefined) {
-      const stored = this.#store.getSession(sessionId).descriptor;
-      const idleExit = active.adapter.hasConfirmedIdleSessionExit?.(sessionId, stored.binding) === true;
-      if ((!idleExit && active.appendSystemPromptDigest === this.serviceRuntimeDigest(stored))
+      const stored = this.#store.getSession(sessionId);
+      const { descriptor } = stored;
+      const idleExit = active.adapter.hasConfirmedIdleSessionExit?.(sessionId, descriptor.binding) === true;
+      // Pi pins resources to the native runtime. Adopt a published catalog by
+      // resuming the same native Session once this runtime can be retired safely.
+      const refreshResources = active.resourceCatalogEpoch !== this.backendResourceCatalogEpoch(descriptor.backendId)
+        && (this.#backendResourceCatalogFences.get(descriptor.backendId)?.size ?? 0) === 0
+        && this.#store.getBackend(descriptor.backendId).descriptor.adapterKind === "pi"
+        && this.isOrdinaryLocalSession(stored);
+      if ((!idleExit && !refreshResources && active.appendSystemPromptDigest === this.serviceRuntimeDigest(descriptor))
         || !this.canRefreshPrivatePromptAtBoundary(sessionId)) {
         active.lastActivityAt = this.#monotonicNow();
         return active;
@@ -14062,7 +14069,7 @@ export class SessionHost {
         this.deleteActiveSession(sessionId, active);
         this.#releaseSessionTools(sessionId);
       } else {
-        const task = this.refreshPrivatePromptRuntime(sessionId, active)
+        const task = this.retireRuntimeForRefresh(sessionId, active)
           .then(() => this.activateOnce(sessionId, allowance, providerAuthenticationRouteId))
           .finally(() => {
             this.#activating.delete(sessionId);
@@ -14099,12 +14106,12 @@ export class SessionHost {
     return liveRuns.length === 0 && !this.#draining.has(sessionId);
   }
 
-  private async refreshPrivatePromptRuntime(sessionId: string, active: ActiveSession): Promise<void> {
+  private async retireRuntimeForRefresh(sessionId: string, active: ActiveSession): Promise<void> {
     this.clearRunSilenceWatchdog(sessionId);
     const stored = this.#store.getSession(sessionId);
     await active.adapter.closeSession(stored.descriptor.binding, this.contextFor(stored));
     if (this.#active.get(sessionId) !== active) {
-      throw new StoreError("The native runtime changed while its private prompt was being refreshed.");
+      throw new StoreError("The native runtime changed during its refresh.");
     }
     this.deleteActiveSession(sessionId, active);
     this.#nativeCompactions.delete(sessionId);
