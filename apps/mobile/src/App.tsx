@@ -1227,6 +1227,7 @@ export function App() {
                   onThemeChange={(preference) => mobileThemePreferences.setPreference(preference)}
                   onLocaleChange={(preference) => mobileLocalePreferences.setPreference(preference)}
                   onPushEnabledChange={(enabled) => mobilePush.setEnabled(enabled)}
+                  onPushPreviewEnabledChange={(enabled) => mobilePush.setPreviewEnabled(enabled)}
                   onDiagnosticsEnabledChange={(enabled) => mobileDiagnostics.setEnabled(enabled)}
                   onDiagnosticsClear={() => mobileDiagnostics.clear()}
                   onDiagnosticsExport={() => mobileDiagnostics.export({

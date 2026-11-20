@@ -34,6 +34,7 @@ export type MobilePushControllerError = "storage" | "token" | "sync" | "retireme
 
 export interface MobilePushControllerState {
   readonly enabled: boolean;
+  readonly previewEnabled?: boolean;
   readonly saving: boolean;
   readonly status: MobilePushControllerStatus;
   readonly error?: MobilePushControllerError;
@@ -54,6 +55,7 @@ export interface MobilePushClientPort {
     readonly locale: MobilePushStoredLocale;
     readonly deviceToken: string;
     readonly ticket: MobilePushRevocationTicket;
+    readonly previewEnabled?: boolean;
   }, signal?: AbortSignal): Promise<{ readonly expiresAt: number }>;
   unregisterMobilePush(record: MobilePushStoredRegistration, signal?: AbortSignal): Promise<void>;
 }
@@ -90,6 +92,7 @@ export class MobilePushController {
   readonly #revocationSecret: () => string | Promise<string>;
   #activeController: AbortController | undefined;
   #enabled = false;
+  #previewEnabled = false;
   #foreground = true;
   #interactive = true;
   #generation = 0;
@@ -166,6 +169,7 @@ export class MobilePushController {
       if (!this.#started) return;
       this.#hydrated = true;
       this.#enabled = snapshot.enabled;
+      this.#previewEnabled = snapshot.previewEnabled;
       this.#publish({
         enabled: this.#enabled,
         saving: false,
@@ -272,6 +276,27 @@ export class MobilePushController {
     return this.#enqueue(() => this.#reconcileNow());
   }
 
+  setPreviewEnabled(enabled: boolean): Promise<void> {
+    return this.#enqueue(async () => {
+      if (this.#platform !== "ios" || !this.#hydrated || !this.#enabled) {
+        throw new Error("Notification previews require enabled iOS task notifications.");
+      }
+      this.#publish({ ...this.#state, saving: true, error: undefined });
+      try {
+        if (this.#previewEnabled !== enabled) {
+          await this.#deviceStore.setPreviewEnabled(enabled);
+          this.#previewEnabled = enabled;
+        }
+        await this.#reconcileNow();
+      } catch (error) {
+        this.#publish({ ...this.#state, status: "error", error: "storage" });
+        throw error;
+      } finally {
+        this.#publish({ ...this.#state, saving: false });
+      }
+    });
+  }
+
   #handleClientChange(): void {
     const scope = this.#client.mobilePushLifecycleScope();
     const authority = this.#client.mobilePushAuthority();
@@ -357,6 +382,7 @@ export class MobilePushController {
       // A live node can remove a confirmed registration after a terminal APNs response.
       if (!this.#serverConfirmationRequired && record?.confirmed && record.retirementRoute
         && record.environment === this.#environment && record.locale === this.#locale
+        && (record.previewEnabled === true) === this.#previewEnabled
         && record.tokenDigest === tokenDigest && record.expiresAt > this.#now() + RENEWAL_WINDOW_MS) {
         this.#publish({ enabled: true, saving: this.#state.saving, status: "registered" });
         return;
@@ -386,13 +412,14 @@ export class MobilePushController {
         };
       }
       if (!current()) return;
-      record = { ...record, retirementRoute: this.#client.captureMobilePushRetirementRoute(authority) };
+      record = { ...record, previewEnabled: this.#previewEnabled, retirementRoute: this.#client.captureMobilePushRetirementRoute(authority) };
       await this.#deviceStore.putRegistration(record);
       if (!current()) return;
       const result = await this.#client.registerMobilePush(authority, {
         environment: this.#environment,
         locale: this.#locale,
         deviceToken: token,
+        previewEnabled: this.#previewEnabled,
         ticket: ticketOf(record)
       }, controller.signal);
       if (!current()) return;
@@ -454,7 +481,7 @@ export class MobilePushController {
   }
 
   #publish(next: MobilePushControllerState): void {
-    this.#state = Object.freeze(next);
+    this.#state = this.#platform === "ios" ? Object.freeze({ ...next, previewEnabled: this.#previewEnabled }) : Object.freeze(next);
     for (const listener of this.#listeners) listener();
   }
 }

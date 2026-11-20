@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 
+import { redactSecrets } from "@joko/core";
+import { TaskShareStore } from "@joko/store";
 import type {
+  ClaimedMobilePushDelivery,
   MobilePushEnvironment,
   MobilePushLocale,
   MobilePushRegistrationRecord,
@@ -22,6 +25,7 @@ export interface MobilePushDeliveryInput {
   readonly kind: "done" | "awaiting" | "error";
   readonly intent: string;
   readonly title?: string;
+  readonly body?: string;
   readonly collapseId?: string;
 }
 
@@ -42,6 +46,7 @@ export interface MobilePushCoordinatorOptions {
   readonly serverId: string;
   readonly provider?: MobilePushProviderPort;
   readonly now?: () => number;
+  readonly redactText?: (value: string) => string;
 }
 
 export interface RegisterMobilePushInput {
@@ -53,16 +58,19 @@ export interface RegisterMobilePushInput {
   readonly deviceToken: string;
   readonly registrationId: string;
   readonly revocationSecret: string;
+  readonly previewEnabled?: boolean;
 }
 
 export interface RegisteredMobilePush {
   readonly registration: MobilePushRegistrationRecord;
   readonly revocationSecret: string;
+  readonly previewEnabled: boolean;
 }
 
 export class MobilePushCoordinator {
   readonly #now: () => number;
   readonly #provider: MobilePushProviderPort | undefined;
+  readonly #redactText: (value: string) => string;
   readonly #serverId: string;
   readonly #store: OperationalStore;
   readonly #vault: CredentialVault;
@@ -79,6 +87,7 @@ export class MobilePushCoordinator {
     this.#vault = options.vault;
     this.#serverId = boundedIdentity(options.serverId, "Mobile push Server ID");
     this.#provider = options.provider;
+    this.#redactText = value => redactSecrets(options.redactText?.(value) ?? value);
     this.#now = options.now ?? Date.now;
   }
 
@@ -107,6 +116,7 @@ export class MobilePushCoordinator {
       expectedDeviceRevision: input.expectedDeviceRevision,
       environment: input.environment,
       locale: input.locale,
+      previewEnabled: input.previewEnabled === true,
       tokenDigest: privateDigest(token),
       sealedToken: this.#vault.seal(
         token,
@@ -121,7 +131,7 @@ export class MobilePushCoordinator {
       now
     });
     this.wake();
-    return { registration, revocationSecret };
+    return { registration, revocationSecret, previewEnabled: this.#store.mobilePushPreviewEnabled(registration) };
   }
 
   unregisterAuthenticated(registrationId: string, connectionId: string): void {
@@ -201,6 +211,7 @@ export class MobilePushCoordinator {
         );
         const collapseId = claimed.delivery.kind === "done" && claimed.delivery.groupId === undefined
           ? createHash("sha256").update(JSON.stringify([this.#serverId, claimed.delivery.sessionId]), "utf8").digest("hex").slice(0, 32) : undefined;
+        const preview = this.completionPreview(claimed);
         result = await this.#provider!.send({
           environment: claimed.registration.environment,
           token,
@@ -208,6 +219,7 @@ export class MobilePushCoordinator {
           kind: claimed.delivery.kind,
           ...(collapseId === undefined ? {} : { collapseId }),
           ...(claimed.delivery.groupTitle === undefined ? {} : { title: claimed.delivery.groupTitle }),
+          ...preview,
           intent: claimed.delivery.groupId === undefined ? mobilePushIntent(
             this.#serverId,
             claimed.delivery.sessionId,
@@ -256,6 +268,36 @@ export class MobilePushCoordinator {
     }
   }
 
+  private completionPreview({ delivery, registration }: ClaimedMobilePushDelivery): { title: string; body: string } | undefined {
+    if (delivery.kind !== "done" || delivery.groupId !== undefined || delivery.messageEventId === undefined) return undefined;
+    try {
+      if (!this.#store.mobilePushPreviewEnabled(registration)) return undefined;
+      const session = this.#store.findSession(delivery.sessionId)?.descriptor;
+      const attention = this.#store.findSessionAttention(delivery.sessionId);
+      if (!session || session.hidden || session.archived || session.deletedAt !== undefined || session.automationOrigin
+        || session.binding.generation !== delivery.subjectGeneration || attention?.kind !== "done" || !attention.unread
+        || attention.subjectCursor !== delivery.subjectCursor || attention.subjectGeneration !== delivery.subjectGeneration
+        || this.#store.listRuns({ sessionId: session.id, states: ["running", "waiting", "retrying", "dispatch_unknown"], limit: 1 }).length > 0
+        || new TaskShareStore(this.#store).list().some(share => share.sessionId === session.id && share.status === "active")) return undefined;
+      const event = this.#store.findEvent(delivery.messageEventId);
+      if (!event || event.sessionId !== session.id || event.generation !== delivery.subjectGeneration
+        || event.globalCursor > delivery.subjectCursor || event.runId === undefined || event.attemptId === undefined) return undefined;
+      const run = this.#store.findRun(event.runId)?.descriptor;
+      const payload = event.payload;
+      if (run?.sessionId !== session.id || run.source !== "user" || run.parentRunId !== undefined
+        || run.state !== "completed" || run.activeAttemptId !== event.attemptId
+        || payload.type !== "message_complete" || payload.role !== "assistant" || payload.automationOrigin
+        || payload.partnerPrivateOrigin || payload.collaborationReportOrigin || payload.taskMessageOrigin
+        || payload.automaticContinuation || payload.objectiveContinuation || payload.inputHandoffContinuation) return undefined;
+      const title = compactPreviewText(this.#redactText(session.title), 72);
+      const body = compactPreviewText(this.#redactText(payload.blocks.flatMap(block => block.kind === "text" ? [block.text] : []).join(" ")), 160);
+      return title && body ? { title, body } : undefined;
+    } catch {
+      // A notification with an unavailable or unverified preview can still deliver its status.
+      return undefined;
+    }
+  }
+
   private armNext(): void {
     if (this.#closed || this.#provider === undefined || this.#running) return;
     const next = this.#store.nextMobilePushDeliveryAt();
@@ -300,6 +342,17 @@ function normalizedDeviceToken(value: string): string {
     throw new MobilePushInputError();
   }
   return normalized;
+}
+
+function compactPreviewText(value: string, maximum: number): string {
+  const plain = value.replace(/[\s\p{Cc}]+/gu, " ").trim();
+  if (plain.length <= maximum) return plain;
+  let preview = "";
+  for (const character of plain) {
+    if (preview.length + character.length >= maximum) return preview.trimEnd() + "…";
+    preview += character;
+  }
+  return preview;
 }
 
 function normalizedRevocationSecret(value: string): string {

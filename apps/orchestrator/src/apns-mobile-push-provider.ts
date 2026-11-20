@@ -143,9 +143,10 @@ export class ApnsMobilePushProvider implements MobilePushProviderPort {
 }
 
 export function buildApnsMobilePushPayload(input: MobilePushDeliveryInput): Buffer {
+  const status = localizedAttentionTitle(input.locale, input.kind);
   return Buffer.from(JSON.stringify({
     aps: {
-      alert: { title: input.title ?? localizedAttentionTitle(input.locale, input.kind), ...(input.title === undefined ? {} : { body: localizedAttentionTitle(input.locale, input.kind) }) },
+      alert: { title: input.title ?? status, ...(input.title === undefined ? {} : { body: input.body ?? status }) },
       ...(input.collapseId === undefined ? {} : { "thread-id": input.collapseId })
     },
     intent: input.intent

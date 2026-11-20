@@ -43,7 +43,7 @@ describe("MobilePushDeviceStore", () => {
       isAvailable: async () => true,
       ...secure.driver
     });
-    expect(await store.hydrate()).toEqual({ enabled: false, registrations: [] });
+    expect(await store.hydrate()).toEqual({ enabled: false, previewEnabled: false, registrations: [] });
     await store.setEnabled(true);
     await store.putRegistration(registration());
     expect(plain.values.get(mobilePushDeviceStoreTesting.enabledKey)).toBe("1");
@@ -57,6 +57,7 @@ describe("MobilePushDeviceStore", () => {
       "not-json",
       JSON.stringify({ version: 2, registrations: [] }),
       JSON.stringify({ version: 1, registrations: [{ ...registration(), extra: true }] }),
+      JSON.stringify({ version: 1, registrations: [{ ...registration(), previewEnabled: "true" }] }),
       JSON.stringify({ version: 1, registrations: [registration({ retirementRoute: { kind: "direct" } })] }),
       JSON.stringify({ version: 1, registrations: [registration({ retirementRoute: { kind: "pinned", endpointPublicKey: "incomplete" } })] }),
       JSON.stringify({ version: 1, registrations: [{ ...registration(), origin: "https://user@node.example.test" }] })

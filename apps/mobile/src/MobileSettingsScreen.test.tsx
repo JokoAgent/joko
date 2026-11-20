@@ -307,6 +307,7 @@ function mount(options: {
   const onThemeChange = vi.fn(async () => undefined);
   const onLocaleChange = vi.fn(async () => undefined);
   const onPushEnabledChange = vi.fn(async (_enabled: boolean) => undefined);
+  const onPushPreviewEnabledChange = vi.fn(async (_enabled: boolean) => undefined);
   const onDiagnosticsEnabledChange = vi.fn(async (_enabled: boolean) => undefined);
   const onDiagnosticsClear = vi.fn(async () => undefined);
   const onDiagnosticsExport = vi.fn(async () => undefined);
@@ -345,6 +346,7 @@ function mount(options: {
     onThemeChange,
     onLocaleChange,
     onPushEnabledChange,
+    onPushPreviewEnabledChange,
     onDiagnosticsEnabledChange,
     onDiagnosticsClear,
     onDiagnosticsExport,
@@ -370,6 +372,7 @@ function mount(options: {
     onThemeChange,
     onLocaleChange,
     onPushEnabledChange,
+    onPushPreviewEnabledChange,
     onDiagnosticsEnabledChange,
     onDiagnosticsClear,
     onDiagnosticsExport,
@@ -420,6 +423,21 @@ function deferred<T>() {
 }
 
 describe("MobileSettingsScreen", () => {
+  it("offers reply previews only on the supported task notification settings", async () => {
+    const view = mount({ push: { status: "disabled", enabled: false, saving: false } });
+    const preview = () => view.container.querySelector<HTMLInputElement>('input[aria-label="Show reply previews"]');
+    expect(preview()?.disabled).toBe(true);
+    view.rerender({ push: { status: "registered", enabled: true, previewEnabled: false, saving: false } });
+    expect(preview()?.checked).toBe(false);
+    await act(async () => preview()?.click());
+    expect(view.onPushPreviewEnabledChange).toHaveBeenCalledExactlyOnceWith(true);
+    view.rerender({ push: { status: "registered", enabled: true, previewEnabled: true, saving: true } });
+    expect(preview()?.checked).toBe(true);
+    expect(preview()?.disabled).toBe(true);
+    view.rerender({ push: readyPush });
+    expect(preview()).toBeNull();
+  });
+
   it('manages server access natively and requires confirmation before stopping', async () => {
     const container = document.createElement('div'); root = createRoot(container);
     const entry = create(ServerAccessEntrySchema, { entryId: 'home', name: 'Home relay', provider: 'iroh', mode: 'relay', revision: 'r1', source: 'gui', state: 'active', enabled: true, configuredSecrets: ['servicesApiSecret'] });

@@ -6,6 +6,7 @@ import * as contract from "@joko/contracts";
 import { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { buildApnsMobilePushPayload } from "./apns-mobile-push-provider.js";
 import type { OrchestratorApplication } from "./application.js";
 import { createConnectServices } from "./connect-services.js";
 import { CredentialVault } from "./credential-vault.js";
@@ -22,6 +23,63 @@ afterEach(async () => {
 });
 
 describe("mobile push Orchestrator boundary", () => {
+  it("sends only an opted-in current completion preview for the exact registration", async () => {
+    const fixture = await createFixture();
+    const { store } = fixture;
+    const sends: MobilePushDeliveryInput[] = [];
+    const secret = "fixture-private-preview-key";
+    const coordinator = new MobilePushCoordinator({ store, vault: fixture.vault, serverId: "server-1", now: () => 1_000,
+      redactText: value => value.replaceAll(secret, "[REDACTED]"),
+      provider: { send: async input => { sends.push(input); return { outcome: "delivered", code: "APNS_200" }; } } });
+    cleanups.push(() => coordinator.close());
+    const registration = { connectionId: fixture.connection.id, deviceId: fixture.connection.deviceId, expectedDeviceRevision: fixture.deviceRevision,
+      environment: "apns_sandbox" as const, locale: "en" as const, deviceToken: "preview-phone", registrationId: "preview-registration", revocationSecret: "a".repeat(43) };
+    const other = store.createConnection({ id: "other-ios", name: "Other phone", authKeyDigest: "other-digest",
+      device: { defaultName: "Other phone", kind: "mobile", platform: "ios", appVersion: "1.0.0" } });
+    coordinator.register({ ...registration, previewEnabled: true });
+    coordinator.register({ ...registration, connectionId: other.id, deviceId: other.deviceId,
+      expectedDeviceRevision: store.getDevice(other.deviceId).revision, deviceToken: "status-phone", registrationId: "status-registration",
+      revocationSecret: "b".repeat(43) });
+    const complete = (runId: string, text: string) => store.transaction(transaction => {
+      const attemptId = runId + "-attempt";
+      transaction.createRun({ id: runId, sessionId: "session-1", source: "user", state: "running", createdAt: 1_000 });
+      transaction.createAttempt({ id: attemptId, runId, ordinal: 1, generation: 0, startedAt: 1_000 });
+      transaction.appendEvent({ id: runId + "-message", backendId: "pi", targetId: "target-1", sessionId: "session-1",
+        runId, attemptId, generation: 0, traceId: runId,
+        payload: { type: "message_complete", role: "assistant", blocks: [
+          { kind: "thinking", text: "Internal thought", redacted: true },
+          { kind: "text", text }
+        ] } });
+      transaction.finishAttempt(attemptId);
+      transaction.updateRunState({ runId, state: "completed", traceId: runId });
+    });
+    const delivered = (count: number) => vi.waitFor(() => {
+      expect(store.listMobilePushDeliveries().filter(item => item.status === "delivered")).toHaveLength(count);
+    });
+    coordinator.start();
+    complete("first", "Final reply\n\nwith " + secret);
+    await delivered(2);
+    const firstPreview = sends.find(input => input.token === "preview-phone")!;
+    expect(JSON.parse(buildApnsMobilePushPayload(firstPreview).toString("utf8"))).toMatchObject({
+      aps: { alert: { title: "Session", body: "Final reply with [REDACTED]" } },
+      intent: "joko://task/session-1?message=first-message&event=first-message&server=server-1"
+    });
+    expect(sends.find(input => input.token === "status-phone")?.body).toBeUndefined();
+    expect(JSON.stringify(sends)).not.toContain(secret);
+    expect(JSON.stringify(sends)).not.toContain("Internal thought");
+
+    complete("before-revocation", "This reply was queued before the preview setting changed.");
+    coordinator.register({ ...registration, previewEnabled: false });
+    await delivered(4);
+    expect(sends.slice(2).every(input => input.title === undefined && input.body === undefined)).toBe(true);
+
+    coordinator.register({ ...registration, previewEnabled: true });
+    complete("before-new-turn", "This reply was superseded.");
+    store.createRun({ id: "active-new-turn", sessionId: "session-1", source: "user", state: "running", createdAt: 1_000 });
+    await delivered(6);
+    expect(sends.slice(4).every(input => input.title === undefined && input.body === undefined)).toBe(true);
+  });
+
   it("groups ordinary completions only when their source node and task match", async () => {
     const deliver = async (serverId: string): Promise<readonly MobilePushDeliveryInput[]> => {
       const fixture = await createFixture();
@@ -238,18 +296,19 @@ describe("mobile push Orchestrator boundary", () => {
     )).rejects.toThrow(/authenticated Connection/u);
     const registered = await invoke<contract.RegisterMobilePushResponse>(
       services.connection.registerMobilePush,
-      registrationRequest({
+      { ...registrationRequest({
         connectionId: fixture.connection.id,
         deviceId: fixture.connection.deviceId,
         expectedDeviceRevision: fixture.deviceRevision
-      }),
+      }), previewEnabled: true },
       "Bearer valid"
     );
     expect(registered.registration).toMatchObject({
       registrationId: "registration-service",
       connectionId: fixture.connection.id,
       deviceId: fixture.connection.deviceId,
-      provider: contract.MobilePushProvider.APNS
+      provider: contract.MobilePushProvider.APNS,
+      previewEnabled: true
     });
     expect(registered.revocationTicket).toMatchObject({
       serverId: "server-1",

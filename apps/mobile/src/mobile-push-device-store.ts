@@ -34,15 +34,18 @@ export interface MobilePushStoredRegistration {
   readonly tokenDigest: string;
   readonly confirmed: boolean;
   readonly expiresAt: number;
+  readonly previewEnabled?: boolean;
   readonly retirementRoute?: MobilePushRetirementRoute;
 }
 
 export interface MobilePushDeviceSnapshot {
   readonly enabled: boolean;
+  readonly previewEnabled: boolean;
   readonly registrations: readonly MobilePushStoredRegistration[];
 }
 
 const ENABLED_KEY = "joko.mobile.push.enabled.v1";
+const PREVIEW_KEY = "joko.mobile.push.preview.v1";
 const REGISTRATIONS_KEY = "joko.mobile.push.registrations.v1";
 const MAXIMUM_REGISTRATIONS = 32;
 const RECORD_KEYS = Object.freeze([
@@ -54,6 +57,7 @@ const RECORD_KEYS = Object.freeze([
  * device storage, while every exact revocation ticket stays in SecureStore. */
 export class MobilePushDeviceStore {
   #enabled = false;
+  #previewEnabled = false;
   #hydrated = false;
   #registrations: MobilePushStoredRegistration[] = [];
 
@@ -64,21 +68,26 @@ export class MobilePushDeviceStore {
 
   get snapshot(): MobilePushDeviceSnapshot {
     if (!this.#hydrated) throw new Error("Mobile push device state has not been loaded.");
-    return Object.freeze({ enabled: this.#enabled, registrations: Object.freeze([...this.#registrations]) });
+    return Object.freeze({ enabled: this.#enabled, previewEnabled: this.#previewEnabled, registrations: Object.freeze([...this.#registrations]) });
   }
 
   async hydrate(): Promise<MobilePushDeviceSnapshot> {
-    const [enabledRaw, secureAvailable] = await Promise.all([
+    const [enabledRaw, previewRaw, secureAvailable] = await Promise.all([
       this.plain.getItem(ENABLED_KEY),
+      this.plain.getItem(PREVIEW_KEY),
       this.secure.isAvailable()
     ]);
     if (enabledRaw !== null && enabledRaw !== "0" && enabledRaw !== "1") {
       throw new Error("The saved notification preference is invalid.");
     }
+    if (previewRaw !== null && previewRaw !== "0" && previewRaw !== "1") {
+      throw new Error("The saved notification preview preference is invalid.");
+    }
     if (!secureAvailable) throw new Error("Secure notification registration storage is unavailable.");
     const registrationsRaw = await this.secure.getItem(REGISTRATIONS_KEY);
     const registrations = registrationsRaw === null ? [] : parseRegistrations(registrationsRaw);
     this.#enabled = enabledRaw === "1";
+    this.#previewEnabled = previewRaw === "1";
     this.#registrations = registrations;
     this.#hydrated = true;
     return this.snapshot;
@@ -88,6 +97,12 @@ export class MobilePushDeviceStore {
     this.#assertHydrated();
     await this.plain.setItem(ENABLED_KEY, enabled ? "1" : "0");
     this.#enabled = enabled;
+  }
+
+  async setPreviewEnabled(enabled: boolean): Promise<void> {
+    this.#assertHydrated();
+    await this.plain.setItem(PREVIEW_KEY, enabled ? "1" : "0");
+    this.#previewEnabled = enabled;
   }
 
   async putRegistration(record: MobilePushStoredRegistration): Promise<void> {
@@ -138,8 +153,10 @@ function parseRegistrations(raw: string): MobilePushStoredRegistration[] {
 }
 
 function parseRegistration(value: unknown): MobilePushStoredRegistration {
-  if (!plainObject(value) || !exactKeys(value, Object.hasOwn(value, "retirementRoute")
-    ? [...RECORD_KEYS, "retirementRoute"] : RECORD_KEYS)) {
+  if (!plainObject(value) || !exactKeys(value, [
+    ...RECORD_KEYS,
+    ...["retirementRoute", "previewEnabled"].filter(key => Object.hasOwn(value, key))
+  ]) || (Object.hasOwn(value, "previewEnabled") && typeof value.previewEnabled !== "boolean")) {
     throw new Error("A saved notification registration is invalid.");
   }
   const profileId = identity(value.profileId);
@@ -172,6 +189,7 @@ function parseRegistration(value: unknown): MobilePushStoredRegistration {
     tokenDigest,
     confirmed: value.confirmed,
     expiresAt,
+    ...(typeof value.previewEnabled === "boolean" ? { previewEnabled: value.previewEnabled } : {}),
     ...(value.retirementRoute === undefined ? {} : { retirementRoute: parseRetirementRoute(value.retirementRoute, origin) })
   });
 }

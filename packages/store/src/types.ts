@@ -205,6 +205,7 @@ export interface PutMobilePushRegistrationInput {
   readonly expectedDeviceRevision: bigint;
   readonly environment: MobilePushEnvironment;
   readonly locale: MobilePushLocale;
+  readonly previewEnabled?: boolean;
   readonly tokenDigest: string;
   readonly sealedToken: SealedMobilePushCredential;
   readonly revocationSecretDigest: string;
