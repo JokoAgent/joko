@@ -655,7 +655,7 @@ interface NativeRuntime {
   compacting: boolean;
   nativeCompaction?: { readonly id: string; completed: boolean; boundaryObserved: boolean };
   explicitCompaction?: ExplicitClaudeCompaction;
-  compactionContextTokens?: number;
+  contextTokens?: number;
   steerEnabled: boolean;
   inputPreparation?: AbortController;
   pendingControl?: symbol;
@@ -4630,7 +4630,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         if (turn?.manualCompaction) turn.manualCompactionStarted = true;
         if (runtime.nativeCompaction === undefined || runtime.nativeCompaction.completed) {
           runtime.nativeCompaction = { id: `claude-code.compaction:${uuid}`, completed: false, boundaryObserved: false };
-          runtime.compactionContextTokens = undefined;
+          runtime.contextTokens = undefined;
           runtime.compacting = true;
           await this.#emitNativeSystem(runtime, turn, { type: "compaction", compactionId: runtime.nativeCompaction.id,
             state: "started", reason: "native" });
@@ -4669,7 +4669,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     runtime.nativeCompaction.completed = true;
     runtime.nativeCompaction.boundaryObserved = true;
     runtime.compacting = false;
-    runtime.compactionContextTokens = tokensAfter;
+    runtime.contextTokens = tokensAfter;
     if (runtime.lastUsage !== undefined) {
       const { contextTokens: _previousContextTokens, ...usage } = runtime.lastUsage;
       runtime.lastUsage = { ...usage, ...(tokensAfter === undefined ? {} : { contextTokens: tokensAfter }) };
@@ -4737,6 +4737,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (error !== undefined) turn.assistantError = error;
     const nativeMessage = record(envelope["message"]);
     const nativeMessageId = stringValue(nativeMessage?.["id"]);
+    if (!runtime.remote && runtime.runtimePolicy === "standard" && error === undefined
+      && nativeMessageId !== undefined && typeof envelope["parent_agent_id"] !== "string") {
+      const contextTokens = nativeAssistantContextTokens(nativeMessage?.["usage"]);
+      if (contextTokens !== undefined) runtime.contextTokens = contextTokens;
+    }
     if (nativeMessageId !== undefined && !turn.seenParentMessageIds.has(nativeMessageId)) {
       addBoundedIdentity(turn.seenParentMessageIds, nativeMessageId);
       turn.parentAssistantMessages += 1;
@@ -4988,9 +4993,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const observedUsage = appliedContextWindow === undefined || result.usage === undefined
       ? result.usage
       : { ...result.usage, contextWindow: appliedContextWindow };
-    const usage = observedUsage === undefined || runtime.compactionContextTokens === undefined
+    const usage = observedUsage === undefined || runtime.contextTokens === undefined
       ? observedUsage
-      : { ...observedUsage, contextTokens: runtime.compactionContextTokens };
+      : { ...observedUsage, contextTokens: runtime.contextTokens };
     if (runtime.compacting) {
       if (usage !== undefined) await this.#emit(runtime, turn, { type: "usage", usage });
       throw nativeCompactionOutcomeUnknown();
@@ -8310,6 +8315,17 @@ function nativeState(runtime: NativeRuntime): NativeSessionState {
 
 function nativeSystemInteger(value: unknown, maximum = Number.MAX_SAFE_INTEGER): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= maximum ? value : undefined;
+}
+
+function nativeAssistantContextTokens(value: unknown): number | undefined {
+  const usage = record(value);
+  if (usage === undefined) return undefined;
+  const input = nativeSystemInteger(usage["input_tokens"]);
+  const cacheRead = nativeSystemInteger(usage["cache_read_input_tokens"] ?? 0);
+  const cacheWrite = nativeSystemInteger(usage["cache_creation_input_tokens"] ?? 0);
+  if (input === undefined || cacheRead === undefined || cacheWrite === undefined) return undefined;
+  const total = input + cacheRead + cacheWrite;
+  return total > 0 ? nativeSystemInteger(total) : undefined;
 }
 
 function bindingFor(nativeSessionId: string, generation: number): NativeSessionBinding {

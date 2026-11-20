@@ -273,6 +273,22 @@ describe("ClaudeCodeAdapter", () => {
       expect(active.events.filter(event => event.type === "done")).toEqual([{ type: "done", outcome: "completed" }]);
       expect(active.events.find(event => event.type === "usage")).toMatchObject({ usage: { contextTokens: 3000 } });
       expect(query.receivedInputs).toHaveLength(1);
+
+      const continued = contextFor(binding, { operationId: "after-native-compaction" });
+      await adapter.send(textPrompt("A normal turn on the same query"), continued.context);
+      const assistant = assistantMessage(binding.nativeSessionId!, randomUUID(), [{ type: "text", text: "New context reading" }]);
+      query.push({ ...assistant, message: { ...assistant.message, usage: {
+        input_tokens: 17, output_tokens: 8, cache_read_input_tokens: 23, cache_creation_input_tokens: 31
+      } } });
+      const terminal = resultMessage(binding.nativeSessionId!, { result: "Done again", totalCostUsd: 0.07 });
+      query.push({ ...terminal, modelUsage: { "model-a": { ...terminal.modelUsage["model-a"],
+        inputTokens: 27, outputTokens: 13, cacheReadInputTokens: 25, cacheCreationInputTokens: 32
+      } } });
+      await eventually(() => continued.events.some(event => event.type === "done"));
+      expect(continued.events.find(event => event.type === "usage")).toMatchObject({ usage: { contextTokens: 71, cost: 0.07 } });
+      expect((await adapter.inspectSession(binding, continued.context)).usage).toMatchObject({ contextTokens: 71, cost: 0.07 });
+      expect(runtime.queries).toEqual([query]);
+      expect(query.receivedInputs).toHaveLength(2);
     } finally { await adapter.dispose(); }
   });
 
