@@ -50,7 +50,8 @@ function AudioPreviewContent({ src, ownerKey, name, description, metadata, label
   const [failed, setFailed] = useState(false);
   const [duration, setDuration] = useState<number>();
   const [copyState, setCopyState] = useState<CopyState>("idle");
-  const copyText = metadata?.kind === "sound_effect" ? "" : (metadata?.description ?? description)?.trim() ?? "";
+  const soundEffect = metadata?.kind === "sound_effect";
+  const copyText = soundEffect ? "" : (metadata?.description ?? description)?.trim() ?? "";
   const title = metadata?.title.trim() || name;
   const descriptionRef = useRef(copyText);
   descriptionRef.current = copyText;
@@ -140,9 +141,9 @@ function AudioPreviewContent({ src, ownerKey, name, description, metadata, label
     }
   };
 
-  return <div {...(loading && !failed ? { [RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE]: "" } : {})} className="audio-preview">
+  return <div {...(loading && !failed ? { [RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE]: "" } : {})} className={soundEffect ? "audio-preview audio-preview--effect" : "audio-preview"}>
     <div className="audio-preview__heading">
-      <AudioArtwork ownerKey={ownerKey} artwork={metadata?.kind === "sound_effect" ? undefined : metadata?.artwork} />
+      {!soundEffect && <AudioArtwork ownerKey={ownerKey} artwork={metadata?.artwork} />}
       <div className="audio-preview__details">
         <strong className="audio-preview__title" title={title}>{title}</strong>
         {copyText !== "" && <p className="audio-preview__description" title={copyText}>{copyText}</p>}

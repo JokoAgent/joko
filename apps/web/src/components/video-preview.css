@@ -1,6 +1,11 @@
 .video-preview { width: 100%; height: 100%; min-width: 0; min-height: 0; }
 .video-preview__open { display: grid; place-items: center; position: relative; width: 100%; height: 100%; min-height: 120px; border: 0; border-radius: 10px; padding: 0; overflow: hidden; background: var(--surface-sunken); cursor: pointer; }
 .video-preview__open > video { display: block; width: 100%; height: 100%; max-height: 420px; object-fit: contain; pointer-events: none; }
+.video-preview__inline { position: relative; border-radius: 10px; overflow: hidden; background: var(--surface-sunken); }
+.video-preview__inline > video { display: block; width: 100%; min-height: 120px; max-height: 420px; object-fit: contain; }
+.video-preview__inline > .video-preview__loading { pointer-events: none; }
+.video-preview__open.video-preview__open--inline { display: inline-grid; width: 32px; height: 32px; min-height: 0; margin-top: 4px; background: transparent; }
+.video-preview__open--inline:hover { background: var(--surface-hover); }
 .video-preview__play { position: absolute; display: grid; place-items: center; width: 52px; height: 52px; border: 1px solid var(--line-strong); border-radius: 50%; background: color-mix(in srgb, var(--surface-raised) 88%, transparent); color: var(--text); box-shadow: var(--shadow-sm); transition: background 150ms ease, transform 150ms ease; }
 .video-preview__play > svg { width: 24px; height: 24px; fill: currentColor; }
 .video-preview__open:hover .video-preview__play { background: var(--surface-hover); transform: scale(1.05); }

@@ -78,6 +78,15 @@ mountedIt("recovers the same mounted video after URL, cover and player failures 
     await page.keyboard.press("Enter");
     await readyVideo(message.locator("video"));
     expect(tickets).toBe(2);
+    const inlinePlayer = message.locator("video");
+    expect(await inlinePlayer.evaluate(element => {
+      const video = element as HTMLVideoElement;
+      return { controls: video.controls, loop: video.loop, autoplay: video.autoplay };
+    })).toEqual({ controls: true, loop: false, autoplay: false });
+    await inlinePlayer.evaluate(element => (element as HTMLVideoElement).play());
+    await waitFor(() => inlinePlayer.evaluate(element => (element as HTMLVideoElement).ended),
+      ended => ended, "the original video finish in the conversation", 10_000);
+    expect(await page.getByRole("dialog").count()).toBe(0);
     await page.evaluate(() => window.dispatchEvent(new Event("online")));
     await readyVideo(artifact.locator("video"));
     expect(tickets).toBe(2);
@@ -93,6 +102,7 @@ mountedIt("recovers the same mounted video after URL, cover and player failures 
     const player = page.getByRole("dialog").locator("video");
     await readyVideo(player);
     expect(await player.evaluate(video => (video as HTMLVideoElement).controls)).toBe(true);
+    expect(await player.evaluate(video => (video as HTMLVideoElement).loop)).toBe(false);
     await failVideo(player);
     await message.getByRole("button", { name: "Retry", exact: true }).waitFor({ state: "visible" });
     expect(await page.getByRole("dialog").count()).toBe(0);

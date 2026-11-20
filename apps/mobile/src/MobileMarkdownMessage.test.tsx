@@ -18,6 +18,7 @@ const { copy, openUrl, appStateListeners, pressureListeners, nativeImages, scrol
   ) => beforeDispatch())
 }));
 vi.mock("expo-clipboard", () => ({ setStringAsync: copy }));
+vi.mock("expo-video", () => ({ VideoView: () => null, useVideoPlayer: vi.fn() }));
 vi.mock("lucide-react-native", () => ({ Mail: () => null, CalendarDays: () => null, Folder: () => null,
   ChartColumn: () => null, Check: () => null, Info: () => null, Clock: () => null, MapPin: () => null,
   Coffee: () => null, Image: () => null, Users: () => null, Star: () => null }));
