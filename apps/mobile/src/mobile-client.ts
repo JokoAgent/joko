@@ -11474,6 +11474,13 @@ export class MobileClient {
       && this.#taskAuthorityKey(true) !== undefined;
   }
 
+  canEditRetainedTaskDraft(): boolean {
+    if (this.#joinedTask || this.#state.status !== "connecting" || !this.#credential) return false;
+    const session = this.#selectedSession();
+    return session !== undefined && !session.archived && session.state !== SessionState.CLOSED
+      && this.#taskAuthorityKey(true) !== undefined;
+  }
+
   async #confirmTaskProviderRebalance(session: Session, observer: MobileTaskSendObserver, signal: AbortSignal | undefined, current: () => boolean) {
     if (this.#joinedTask || this.#state.status !== "connected" || !this.network.getTaskProviderGroupRebalance || !this.#credential || !signal) return undefined;
     let suggestion: ProviderGroupRebalanceSuggestion | undefined;

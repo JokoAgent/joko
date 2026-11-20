@@ -110,6 +110,7 @@ const loadEarlier = vi.fn(async () => undefined);
 const loadNewer = vi.fn(async (_signal: AbortSignal) => {});
 const retryOutbox = vi.fn(async (_id: string) => undefined);
 let retainedOutbox: readonly MobileTaskOutboxRecord[] = [];
+let retainedDraftEditable = false;
 const returnToLatest = vi.fn(() => {
   renderedState = { ...renderedState, window: undefined, windowHasNewer: false, before: undefined, historyEnd: false };
 });
@@ -140,6 +141,7 @@ const client = new Proxy({
   resolveTaskRuntimeCommandResource: resolveResource,
   taskQueueItems: () => empty, taskRetryableQueueItems: () => empty, taskQueueCapabilities: () => ({}),
   taskOutboxItems: () => retainedOutbox, retryTaskOutbox: retryOutbox,
+  canEditRetainedTaskDraft: () => retainedDraftEditable,
   taskStopControl: () => stopControl, stopTaskTurn,
   taskInteractions: () => pendingMobileInteractions(renderedState.detail, renderedState.selectedId), subscribe: () => () => {},
   taskPendingImagePasteCount: () => 0, taskForeground: () => true,
@@ -282,6 +284,7 @@ beforeEach(async () => {
   loadEarlier.mockReset().mockResolvedValue(undefined);
   loadNewer.mockReset().mockResolvedValue(undefined);
   retainedOutbox = []; retryOutbox.mockClear();
+  retainedDraftEditable = false;
   taskMessageActions = undefined;
   writeClipboard.mockClear();
   nativeAppState.currentState = "active";
@@ -308,6 +311,23 @@ async function render(assertPalette = true): Promise<void> {
   await act(async () => {});
   if (assertPalette) { expect(input.editable).toBe(true); expect(input.selection).toEqual({ start: 3, end: 3 }); expect(palette.visible).toBe(true); expect(palette.checkingDraft).toBe(false); }
 }
+
+it("preserves edits to the retained task draft while the same node reconnects", async () => {
+  retainedDraftEditable = true;
+  renderedState = { ...state, status: "connecting" };
+  await act(async () => root.render(taskScreen()));
+  expect(input.editable).toBe(true);
+  const original = input.draft;
+  const text = "Keep the draft edited during reconnect";
+  await act(async () => input.onEdit(replaceMobileComposerRange(original, { start: 0, end: original.text.length }, text), original));
+  expect(input.draft.text).toBe(text);
+  const sendButton = [...host.querySelectorAll("button")].find(button => button.getAttribute("aria-label") === mobileMessage("en", "composer.send"));
+  expect(sendButton?.disabled).toBe(true);
+  expect(send).not.toHaveBeenCalled();
+  retainedDraftEditable = false;
+  await act(async () => root.render(taskScreen()));
+  expect(input.editable).toBe(false);
+});
 
 it("offers the original retained input retry in the latest timeline only after non-admission was confirmed", async () => {
   sendFollowSourceKey = "owned-task";
@@ -362,7 +382,7 @@ it.each(["", "Unsent follow-up"])("mounts the current ordinary stop and keeps an
 
 it("shows Codex reconnect counts on the current Mobile task and clears them when the same Run resumes", async () => {
   const running = create(SnapshotSchema, { generation: 14n,
-    sessions: [{ ...session, state: SessionState.RUNNING, nativeBinding: { runtimeGeneration: 7n } }],
+    sessions: [{ ...session, state: SessionState.RUNNING, nativeBinding: create(NativeSessionBindingSchema, { runtimeGeneration: 7n }) }],
     runs: [{ runId: "run", sessionId: "session", activeAttemptId: "attempt", state: RunState.RETRYING }] });
   const retry = (sequence: bigint, status: RetryState, attemptNumber: number) => create(EventSchema, {
     eventId: `codex-reconnect-${sequence}`, identity: { sessionId: "session", runId: "run", attemptId: "attempt", generation: 7n },

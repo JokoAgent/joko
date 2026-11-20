@@ -5342,9 +5342,11 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     requestId: randomUUID
   });
   useMobileVoicePermissionSettings(voice.error, locale);
-  const composerPasteEditable = composerAvailable && composerOwnerReady && queueEdit === undefined && !state.busy
+  const composerEditOwnerReady = composerOwnerReady && queueEdit === undefined
     && !composerOperationPending && !conversationShare.active
     && !voice.busy && !attachmentBusy;
+  const composerPasteEditable = composerAvailable && !state.busy && composerEditOwnerReady;
+  const retainedComposerEditable = state.status === "connecting" && composerEditOwnerReady && client.canEditRetainedTaskDraft?.() === true;
   composerPasteEditableRef.current = composerPasteEditable;
   const nativeQuoteReady = composerPasteEditable && state.status === "connected"
     && state.taskSource?.kind !== "joined" && headerRole.role === "ordinary" && !partnerIdentity.partner
@@ -7991,13 +7993,14 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
             ref={composerInputRef} accessibilityLabel={mobileMessage(locale, "composer.taskMessage")}
             commandPaletteOpen={runtimeCommandPaletteVisible}
             draft={composerOwnerReady ? draft : emptyMobileComposerDraft()}
-            editable={composerPasteEditable} height={composerHeight.visibleHeight} locale={locale}
+            editable={composerPasteEditable || retainedComposerEditable} height={composerHeight.visibleHeight} locale={locale}
             maxHeight={composerBounds.maximumHeight} ownerKey={`task\u001f${draftIdentityKey ?? "none"}`}
             placeholder={partnerRead.partner?.lifecycle === "paused" ? partnerResumeMessages(locale).paused : mobileMessage(locale, composerOwnerReady ? "composer.placeholder" : "composer.restoring")}
             selection={composerOwnerReady ? composerSelection : { start: 0, end: 0 }} theme={composerTheme}
             onEdit={(result, sourceDraft) => {
               const identity = draftIdentityRef.current;
-              if (!identity || queueEditRef.current || !composerPasteEditableRef.current
+              if (!identity || queueEditRef.current || (!composerPasteEditableRef.current
+                && !(retainedComposerEditable && client.canEditRetainedTaskDraft?.()))
                 || composerDraftRef.current !== sourceDraft) {
                 setLocalError(mobileMessage(locale, "composer.returnActive"));
                 return;
