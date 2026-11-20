@@ -32,7 +32,8 @@ describe("mobile push durable boundary", () => {
     store.enqueueInputHandoffPush({ sessionId: "session-1", sourceCursor: second.globalCursor });
     store.cancelInputHandoffPushes({ instanceId: "host-one", requestId: "request-one" });
     expect(store.listMobilePushDeliveries().find(value => value.subjectCursor === second.globalCursor)?.status).toBe("pending");
-    expect(store.finishMobilePushDelivery({ deliveryId: claimed.delivery.id, claimToken: claimed.delivery.claimToken!, outcome: "retry",
+    expect(store.finishMobilePushDelivery({ deliveryId: claimed.delivery.id, claimToken: claimed.delivery.claimToken!,
+      registrationRevision: claimed.registration.revision, outcome: "retry",
       outcomeCode: "apns_503", retryAt: 2_000, now: 1_400 })).toMatchObject({ status: "failed", outcomeCode: "INPUT_HANDOFF_CLOSED" });
     store.cancelInputHandoffPushes({ instanceId: "host-two", exceptInstance: true });
     expect(store.claimNextMobilePushDelivery(2_100)).toBeUndefined();
@@ -55,7 +56,8 @@ describe("mobile push durable boundary", () => {
     store.updateSession("session-1", { hidden: false }); done("visible-done", 1200);
     const claimed = store.claimNextMobilePushDelivery(1300)!; expect(claimed).toBeDefined();
     store.updateSession("session-1", { hidden: true });
-    expect(store.finishMobilePushDelivery({ deliveryId: claimed.delivery.id, claimToken: claimed.delivery.claimToken!, outcome: "retry", outcomeCode: "apns_503", retryAt: 2000, now: 1400 }))
+    expect(store.finishMobilePushDelivery({ deliveryId: claimed.delivery.id, claimToken: claimed.delivery.claimToken!,
+      registrationRevision: claimed.registration.revision, outcome: "retry", outcomeCode: "apns_503", retryAt: 2000, now: 1400 }))
       .toMatchObject({ status: "failed", outcomeCode: "TASK_HIDDEN" });
     store.updateSession("session-1", { hidden: false }); expect(store.claimNextMobilePushDelivery(2000)).toBeUndefined();
   });
@@ -72,7 +74,8 @@ describe("mobile push durable boundary", () => {
     done("pending-backoff", 1_100);
     const pending = store.claimNextMobilePushDelivery(1_200)!;
     const retry = (claim: NonNullable<ReturnType<OperationalStore["claimNextMobilePushDelivery"]>>, now: number) => store.finishMobilePushDelivery({
-      deliveryId: claim.delivery.id, claimToken: claim.delivery.claimToken!, outcome: "retry", outcomeCode: "APNS_5XX", retryAt: 4_000, now
+      deliveryId: claim.delivery.id, claimToken: claim.delivery.claimToken!, registrationRevision: claim.registration.revision,
+      outcome: "retry", outcomeCode: "APNS_5XX", retryAt: 4_000, now
     });
     expect(retry(pending, 1_210)).toMatchObject({ status: "pending" });
     done("still-dispatching", 1_300);
@@ -199,6 +202,7 @@ describe("mobile push durable boundary", () => {
     expect(store.finishMobilePushDelivery({
       deliveryId: claimed!.delivery.id,
       claimToken: claimed!.delivery.claimToken!,
+      registrationRevision: claimed!.registration.revision,
       outcome: "retry",
       outcomeCode: "apns_503",
       retryAt: 2_000,
@@ -208,6 +212,7 @@ describe("mobile push durable boundary", () => {
     expect(store.finishMobilePushDelivery({
       deliveryId: retried!.delivery.id,
       claimToken: retried!.delivery.claimToken!,
+      registrationRevision: retried!.registration.revision,
       outcome: "delivered",
       outcomeCode: "apns_200",
       now: 2_100

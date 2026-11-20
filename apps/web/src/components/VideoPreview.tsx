@@ -1,4 +1,4 @@
-import { Play, VideoOff, X } from "lucide-react";
+import { Maximize2, Play, VideoOff, X } from "lucide-react";
 import { useCallback, useLayoutEffect, useRef, useState, type JSX, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 
@@ -20,6 +20,7 @@ export interface VideoPreviewProps {
   readonly src: string;
   readonly ownerKey: string;
   readonly labels: VideoPreviewLabels;
+  readonly inlineControls?: boolean;
   readonly pauseWhenHidden?: boolean;
   readonly onError?: () => void;
   readonly actions?: ReactNode;
@@ -30,7 +31,7 @@ export function VideoPreview(props: VideoPreviewProps): JSX.Element {
   return <VideoPreviewContent key={`${props.ownerKey}\u0000${props.src}`} {...props} />;
 }
 
-function VideoPreviewContent({ src, labels, pauseWhenHidden = false, onError, actions }: VideoPreviewProps): JSX.Element {
+function VideoPreviewContent({ src, labels, inlineControls = false, pauseWhenHidden = false, onError, actions }: VideoPreviewProps): JSX.Element {
   const coverRef = useRef<HTMLVideoElement>(null);
   const [trigger, setTrigger] = useState<HTMLButtonElement>();
   const [loaded, setLoaded] = useState(false);
@@ -46,33 +47,53 @@ function VideoPreviewContent({ src, labels, pauseWhenHidden = false, onError, ac
 
   useLayoutEffect(() => {
     const cover = coverRef.current;
-    if (cover !== null && cover.getAttribute("src") !== src) cover.setAttribute("src", src);
-    return () => releaseVideoSource(cover);
-  }, [src]);
+    if (cover === null) return;
+    if (cover.getAttribute("src") !== src) cover.setAttribute("src", src);
+    const owner = cover.ownerDocument;
+    const releasePlayback = inlineControls ? registerExclusiveMediaPlayback(cover) : undefined;
+    const onHidden = (): void => { if (owner.hidden) cover.pause(); };
+    if (inlineControls && pauseWhenHidden) owner.addEventListener("visibilitychange", onHidden);
+    return () => {
+      owner.removeEventListener("visibilitychange", onHidden);
+      releasePlayback?.();
+      releaseVideoSource(cover);
+    };
+  }, [inlineControls, pauseWhenHidden, src]);
+
+  const openVideo = (target: HTMLButtonElement): void => {
+    const document = target.ownerDocument;
+    if (document.body.classList.contains("modal-open") || document.querySelector('[aria-modal="true"]') !== null) return;
+    if (inlineControls) coverRef.current?.pause();
+    setTrigger(target);
+  };
 
   return <div {...(!loaded && !failed ? { [RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE]: "" } : {})} className="video-preview">
-    {failed ? <div className="video-preview__unavailable" role="alert"><VideoOff aria-hidden="true" /><span>{labels.unavailable}</span></div> : <button
+    {failed ? <div className="video-preview__unavailable" role="alert"><VideoOff aria-hidden="true" /><span>{labels.unavailable}</span></div> : inlineControls ? <>
+      <div className="video-preview__inline">
+        <video ref={coverRef} src={src} controls playsInline preload="metadata" aria-label={labels.player} onLoadedMetadata={() => setLoaded(true)} onError={fail} />
+        {!loaded && <span className="video-preview__loading"><Spinner label={labels.loading} /></span>}
+      </div>
+      <button type="button" className="video-preview__open video-preview__open--inline icon-button" aria-label={labels.open} title={labels.open}
+        onClick={event => openVideo(event.currentTarget)}><Maximize2 aria-hidden="true" /></button>
+    </> : <button
       type="button"
       className="video-preview__open"
       aria-label={labels.open}
-      onClick={(event) => {
-        const document = event.currentTarget.ownerDocument;
-        if (document.body.classList.contains("modal-open") || document.querySelector('[aria-modal="true"]') !== null) return;
-        setTrigger(event.currentTarget);
-      }}
+      onClick={event => openVideo(event.currentTarget)}
     >
       <video ref={coverRef} src={src} muted playsInline preload="metadata" aria-hidden="true" onLoadedMetadata={() => setLoaded(true)} onError={fail} />
       <span className="video-preview__play" aria-hidden="true"><Play /></span>
       {!loaded && <span className="video-preview__loading"><Spinner label={labels.loading} /></span>}
     </button>}
     {trigger === undefined && actions}
-    {trigger !== undefined && <VideoLightbox src={src} labels={labels} pauseWhenHidden={pauseWhenHidden} trigger={trigger} onClose={() => setTrigger(undefined)} onError={fail} actions={actions} />}
+    {trigger !== undefined && <VideoLightbox src={src} labels={labels} loop={!inlineControls} pauseWhenHidden={pauseWhenHidden} trigger={trigger} onClose={() => setTrigger(undefined)} onError={fail} actions={actions} />}
   </div>;
 }
 
-function VideoLightbox({ src, labels, pauseWhenHidden, trigger, onClose, onError, actions }: {
+function VideoLightbox({ src, labels, loop, pauseWhenHidden, trigger, onClose, onError, actions }: {
   readonly src: string;
   readonly labels: VideoPreviewLabels;
+  readonly loop: boolean;
   readonly pauseWhenHidden: boolean;
   readonly trigger: HTMLButtonElement;
   readonly onClose: () => void;
@@ -165,7 +186,7 @@ function VideoLightbox({ src, labels, pauseWhenHidden, trigger, onClose, onError
         src={src}
         controls
         autoPlay
-        loop
+        loop={loop}
         playsInline
         preload="auto"
         tabIndex={0}

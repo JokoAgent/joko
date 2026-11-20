@@ -169,8 +169,17 @@ export interface RevokedDeviceResult {
   readonly connections: readonly ConnectionRecord[];
 }
 
-export type MobilePushEnvironment = "apns_sandbox" | "apns_production";
+export type MobilePushProvider = "apns" | "fcm";
+export type MobilePushEnvironment = "apns_sandbox" | "apns_production" | "fcm";
 export type MobilePushLocale = "en" | "zh-CN" | "zh-TW" | "ja" | "ko";
+
+export function mobilePushProviderForEnvironment(environment: MobilePushEnvironment): MobilePushProvider {
+  return environment === "fcm" ? "fcm" : "apns";
+}
+
+export function mobilePushPlatform(provider: MobilePushProvider): "android" | "ios" {
+  return provider === "fcm" ? "android" : "ios";
+}
 
 /** Ciphertext-only representation accepted by Store. Raw device tokens and
  * scoped revocation secrets stay behind the Orchestrator credential vault. */
@@ -185,7 +194,7 @@ export interface MobilePushRegistrationRecord {
   readonly id: string;
   readonly connectionId: string;
   readonly deviceId: string;
-  readonly provider: "apns";
+  readonly provider: MobilePushProvider;
   readonly environment: MobilePushEnvironment;
   readonly locale: MobilePushLocale;
   readonly tokenDigest: string;

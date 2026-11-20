@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { ConfigContext } from "expo/config";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import mobileExpoConfig, {
+  JOKO_ANDROID_GOOGLE_SERVICES_FILE_ENV,
   JOKO_MOBILE_BETA_ENV,
   JOKO_MOBILE_OTA_ENV,
   JOKO_MOBILE_UPDATE_FEED_ENV,
@@ -30,6 +31,21 @@ describe("mobile update build configuration", () => {
     expect(mobileExpoConfig(context).android?.permissions).toEqual([
       "android.permission.INTERNET", "android.permission.REQUEST_INSTALL_PACKAGES"
     ]);
+  });
+
+  it("requests Android notification permission only in a Firebase-configured build", () => {
+    const permission = "android.permission.POST_NOTIFICATIONS";
+    const context = { config: { name: "Joko", slug: "joko", android: { blockedPermissions: [permission] } } } as ConfigContext;
+    vi.stubEnv(JOKO_ANDROID_GOOGLE_SERVICES_FILE_ENV, "");
+    const unconfigured = mobileExpoConfig(context);
+    expect(unconfigured.android?.blockedPermissions).toContain(permission);
+    expect(unconfigured.extra?.jokoAndroidPushConfigured).toBe(false);
+    vi.stubEnv(JOKO_ANDROID_GOOGLE_SERVICES_FILE_ENV, "./owned-fixture-google-services.json");
+    const configured = mobileExpoConfig(context);
+    expect(configured.android).toMatchObject({ googleServicesFile: "./owned-fixture-google-services.json" });
+    expect(configured.android?.blockedPermissions).not.toContain(permission);
+    expect(configured.android?.permissions).toContain(permission);
+    expect(configured.extra?.jokoAndroidPushConfigured).toBe(true);
   });
   it("accepts only the closed Joko HTTPS authority and device-local beta flag", () => {
     expect(resolveMobileUpdateBuildConfiguration({
@@ -66,6 +82,7 @@ describe("mobile update build configuration", () => {
     expect(config.updates).not.toHaveProperty("disableAntiBrickingMeasures");
     expect(config.extra).toEqual({
       retained: true,
+      jokoAndroidPushConfigured: false,
       jokoMobileUpdate: { version: 1, releaseFeedUrl: "", otaEnabled: false, betaEnabled: false }
     });
   });

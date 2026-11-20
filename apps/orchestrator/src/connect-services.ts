@@ -92,6 +92,7 @@ import {
   MESSAGE_SEARCH_EMBEDDING_MODEL_ID,
   deviceContentProjection,
   isTargetDeleted,
+  mobilePushProviderForEnvironment,
   normalizeDeviceName,
   operationBodyHash
 } from "@joko/store";
@@ -103,6 +104,7 @@ import type {
   ExtensionUsageSubject,
   InteractionRecord,
   ManagedTargetTrashIntent,
+  MobilePushProvider,
   MobilePushRegistrationRecord,
   OperationExecution,
   OperationRecord,
@@ -182,6 +184,7 @@ import {
   MobilePushInputError,
   MobilePushTicketError,
   MobilePushUnavailableError,
+  mobilePushUnconfiguredReason,
   type MobilePushCoordinator
 } from "./mobile-push.js";
 import type {
@@ -1835,15 +1838,17 @@ export function createConnectServices(application: OrchestratorApplication, proj
       const device = dependencies.store.getDevice(request.deviceId);
       return { device: deviceFromRecord(device, dependencies.store.listDeviceConnections(device.id), now()) };
     },
-    getMobilePushCapability: () => {
-      const capability = dependencies.mobilePush?.capability() ?? {
+    getMobilePushCapability: (request) => {
+      const requested = request.provider ?? contract.MobilePushProvider.UNSPECIFIED;
+      const provider = requested === contract.MobilePushProvider.UNSPECIFIED ? "apns" : nativeMobilePushProvider(requested);
+      const capability = dependencies.mobilePush?.capability(provider) ?? {
         supported: false,
-        unavailableReasonCode: "APNS_NOT_CONFIGURED"
+        unavailableReasonCode: mobilePushUnconfiguredReason(provider)
       };
       return {
         capability: create(contract.MobilePushCapabilitySchema, {
           supported: capability.supported,
-          provider: contract.MobilePushProvider.APNS,
+          provider: wireMobilePushProvider(provider),
           unavailableReasonCode: capability.unavailableReasonCode ?? ""
         })
       };
@@ -1856,16 +1861,18 @@ export function createConnectServices(application: OrchestratorApplication, proj
           Code.PermissionDenied
         );
       }
-      if (request.provider !== contract.MobilePushProvider.APNS) {
-        throw invalidArgument("provider must be APNs");
+      const provider = nativeMobilePushProvider(request.provider);
+      const environment = nativeMobilePushEnvironment(request.environment);
+      if (provider !== mobilePushProviderForEnvironment(environment)) {
+        throw invalidArgument("The mobile push environment does not match its provider.");
       }
       const coordinator = dependencies.mobilePush;
-      if (coordinator === undefined) throw new MobilePushUnavailableError("APNS_NOT_CONFIGURED");
+      if (coordinator === undefined) throw new MobilePushUnavailableError(mobilePushUnconfiguredReason(provider));
       const registered = coordinator.register({
         connectionId: connection.id,
         deviceId: connection.deviceId,
         expectedDeviceRevision: request.expectedDeviceRevision,
-        environment: nativeMobilePushEnvironment(request.environment),
+        environment,
         locale: nativeMobilePushLocale(request.locale),
         deviceToken: request.deviceToken,
         registrationId: request.registrationId,
@@ -7699,12 +7706,25 @@ function deviceFromRecord(
   return toProtoDeviceContent(deviceContentProjection(record, connections, observedAt));
 }
 
+function nativeMobilePushProvider(value: contract.MobilePushProvider): MobilePushProvider {
+  switch (value) {
+    case contract.MobilePushProvider.APNS: return "apns";
+    case contract.MobilePushProvider.FCM: return "fcm";
+    default: throw invalidArgument("provider is required");
+  }
+}
+
+function wireMobilePushProvider(value: MobilePushProvider): contract.MobilePushProvider {
+  return value === "fcm" ? contract.MobilePushProvider.FCM : contract.MobilePushProvider.APNS;
+}
+
 function nativeMobilePushEnvironment(
   value: contract.MobilePushEnvironment
 ): MobilePushRegistrationRecord["environment"] {
   switch (value) {
     case contract.MobilePushEnvironment.APNS_SANDBOX: return "apns_sandbox";
     case contract.MobilePushEnvironment.APNS_PRODUCTION: return "apns_production";
+    case contract.MobilePushEnvironment.FCM: return "fcm";
     default: throw invalidArgument("environment is required");
   }
 }
@@ -7727,10 +7747,10 @@ function toProtoMobilePushRegistration(
     registrationId: record.id,
     connectionId: record.connectionId,
     deviceId: record.deviceId,
-    provider: contract.MobilePushProvider.APNS,
-    environment: record.environment === "apns_sandbox"
-      ? contract.MobilePushEnvironment.APNS_SANDBOX
-      : contract.MobilePushEnvironment.APNS_PRODUCTION,
+    provider: wireMobilePushProvider(record.provider),
+    environment: record.environment === "fcm" ? contract.MobilePushEnvironment.FCM
+      : record.environment === "apns_sandbox" ? contract.MobilePushEnvironment.APNS_SANDBOX
+        : contract.MobilePushEnvironment.APNS_PRODUCTION,
     locale: record.locale === "en"
       ? contract.MobilePushLocale.EN
       : record.locale === "zh-CN"

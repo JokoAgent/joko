@@ -76,8 +76,10 @@ describe("Timeline artifact media", () => {
     expect(container.querySelector(".message-attachment--media audio")).not.toBeNull();
     expect(container.querySelector(".audio-preview__description")?.textContent).toBe("Actual recorded sound");
     const video = required(container.querySelector<HTMLVideoElement>(".artifact-block__media video"));
-    expect(video.controls).toBe(false);
+    expect(video.controls).toBe(true);
     expect(video.playsInline).toBe(true);
+    expect(video.loop).toBe(false);
+    expect(video.autoplay).toBe(false);
     const downloadButtons = [...container.querySelectorAll<HTMLButtonElement>('button[aria-label^="timeline.downloadArtifact"]')];
     expect(downloadButtons).toHaveLength(2);
     await act(async () => downloadButtons[0]?.click());

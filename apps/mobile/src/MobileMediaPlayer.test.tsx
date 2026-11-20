@@ -8,6 +8,13 @@ import { buildMobileMediaPlayerHtml, type MobileMediaPlayerStatus } from "./mobi
 
 const { JSDOM } = createRequire(import.meta.url)("jsdom");
 
+const video = vi.hoisted(() => ({
+  players: [] as {
+    status: string; currentTime: number; duration: number; loop: boolean; playing: boolean;
+    pause: ReturnType<typeof vi.fn>; listeners: Map<string, (event: unknown) => void>;
+  }[]
+}));
+
 const bridge = vi.hoisted(() => ({
   appState: "active",
   mounts: 0,
@@ -27,6 +34,7 @@ const bridge = vi.hoisted(() => ({
 vi.mock("react-native", async () => {
   const { createElement } = await import("react");
   return {
+    Platform: { OS: "ios" },
     AppState: {
       get currentState() { return bridge.appState; },
       addEventListener: (_type: string, listener: (state: string) => void) => {
@@ -40,6 +48,24 @@ vi.mock("react-native", async () => {
     StyleSheet: { create: (value: unknown) => value },
     Text: "span",
     View: "div"
+  };
+});
+
+vi.mock("expo-video", async () => {
+  const { createElement, useState } = await import("react");
+  return {
+    useVideoPlayer: (_source: string, setup: (player: (typeof video.players)[number]) => void) => useState(() => {
+      const listeners = new Map<string, (event: unknown) => void>();
+      const player = { status: "loading", currentTime: 0, duration: 10, loop: true, playing: false, pause: vi.fn(), listeners,
+        addListener: (name: string, listener: (event: unknown) => void) => {
+          listeners.set(name, listener);
+          return { remove: () => { listeners.delete(name); } };
+        } };
+      setup(player);
+      video.players.push(player);
+      return player;
+    })[0],
+    VideoView: ({ nativeControls }: { nativeControls: boolean }) => createElement("video", { controls: nativeControls })
   };
 });
 
@@ -81,6 +107,7 @@ afterEach(() => {
   bridge.stopLoading.mockReset();
   bridge.onAppStateChange = () => undefined;
   bridge.onResourcePressure = () => undefined;
+  video.players.length = 0;
 });
 
 describe("MobileMediaPlayer", () => {
@@ -168,7 +195,8 @@ describe("MobileMediaPlayer", () => {
       onStatusChange,
       surface: "#111111",
       title: "Demo",
-      uri: "file:///cache/preview-lease-1.mp4"
+      uri: "https://media.example.test/preview-lease-1.mp4",
+      networkSource: true
     })));
 
     expect(bridge.mounts).toBe(1);
@@ -208,6 +236,39 @@ describe("MobileMediaPlayer", () => {
     expect(bridge.mounts).toBe(3);
     act(() => { bridge.props?.onRenderProcessGone(); });
     expect(onStatusChange).toHaveBeenLastCalledWith(expect.objectContaining({ state: "error" }));
+  });
+
+  it("plays a verified local file through native controls, restores its position and falls back after a native error", () => {
+    const onStatusChange = vi.fn();
+    const container = document.createElement("div");
+    root = createRoot(container);
+    act(() => root!.render(createElement(MobileMediaPlayer, {
+      background: "#000000", border: "#333333", ink: "#ffffff", instanceId: "local-video", kind: "video",
+      locale: "en", mediaType: "video/mp4", onStatusChange, surface: "#111111", title: "Local video",
+      uri: "file:///cache/local-video.mp4"
+    })));
+    expect(container.querySelector("video")?.controls).toBe(true);
+    expect(bridge.mounts).toBe(0);
+    const first = video.players[0]!;
+    expect(first.loop).toBe(false);
+    act(() => first.listeners.get("statusChange")?.({ status: "readyToPlay" }));
+    first.currentTime = 4;
+    act(() => first.listeners.get("timeUpdate")?.({ currentTime: 4 }));
+    const retired = first.listeners.get("statusChange")!;
+    act(() => { bridge.appState = "background"; bridge.onAppStateChange("background"); });
+    expect(first.pause).toHaveBeenCalled();
+    expect(first.listeners.size).toBe(0);
+    act(() => { bridge.appState = "active"; bridge.onAppStateChange("active"); });
+    const current = video.players[1]!;
+    act(() => current.listeners.get("statusChange")?.({ status: "readyToPlay" }));
+    expect(current.currentTime).toBe(4);
+    act(() => retired({ status: "error" }));
+    expect(bridge.mounts).toBe(0);
+    act(() => current.listeners.get("statusChange")?.({ status: "error" }));
+    expect(current.pause).toHaveBeenCalled();
+    expect(container.querySelector("video")).toBeNull();
+    expect(bridge.mounts).toBe(1);
+    expect(bridge.props?.source.html).toContain("file:///cache/local-video.mp4");
   });
 
   it("releases on native pressure and rejects status from the retired renderer generation", () => {

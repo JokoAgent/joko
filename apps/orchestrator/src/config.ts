@@ -44,12 +44,13 @@ export interface OrchestratorConfig {
   };
   readonly pdfRendererHost?: { readonly executablePath: string; readonly appPath?: string };
   readonly mobilePush?: {
-    readonly apns: {
+    readonly apns?: {
       readonly teamId: string;
       readonly keyId: string;
       readonly privateKeyPath: string;
       readonly topic: string;
     };
+    readonly fcm?: { readonly serviceAccountPath: string };
   };
   /** Deployment-owned HTTPS endpoint and private bearer file, never public settings. */
   readonly remoteDesktopIce?: { readonly url: string; readonly tokenPath: string };
@@ -146,7 +147,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Orches
   if (personalDevelopmentCommandHostPath !== undefined && !isAbsolute(personalDevelopmentCommandHostPath)) {
     throw new Error("JOKO_PERSONAL_DEVELOPMENT_COMMAND_HOST must be absolute.");
   }
-  const mobilePush = readMobilePushConfig(environment);
+  const mobilePush = readMobilePushConfig(environment, workspaceRoot);
   const remoteDesktopIce = readRemoteDesktopIceConfig(environment, workspaceRoot);
   const remoteDesktopTurn = readRemoteDesktopTurnConfig(environment, workspaceRoot);
   if (remoteDesktopIce !== undefined && remoteDesktopTurn !== undefined) {
@@ -350,7 +351,18 @@ function readRemoteDesktopTurnConfig(environment: NodeJS.ProcessEnv, workspaceRo
     ...(urls === undefined ? {} : { urls }) };
 }
 
-function readMobilePushConfig(environment: NodeJS.ProcessEnv): OrchestratorConfig["mobilePush"] {
+function readMobilePushConfig(environment: NodeJS.ProcessEnv, workspaceRoot: string): OrchestratorConfig["mobilePush"] {
+  const fcmFile = environment.JOKO_FCM_SERVICE_ACCOUNT_FILE?.trim();
+  let fcm: { serviceAccountPath: string } | undefined;
+  if (fcmFile) {
+    const fail = (): never => { throw new Error("JOKO_FCM_SERVICE_ACCOUNT_FILE must refer to a private service account JSON file outside workspace and source roots."); };
+    if (!isAbsolute(fcmFile)) return fail();
+    const path = canonicalizePotentialPath(fcmFile);
+    if ([workspaceRoot, ...jokoSourceRoots()].some(root => isWithin(canonicalizePotentialPath(root), path))) return fail();
+    const info = lstatSync(path, { throwIfNoEntry: false });
+    if (!info?.isFile() || info.size === 0 || info.size > 32_768 || (process.platform !== "win32" && (info.mode & 0o077) !== 0)) return fail();
+    fcm = { serviceAccountPath: path };
+  }
   const values = {
     teamId: environment.JOKO_APNS_TEAM_ID?.trim(),
     keyId: environment.JOKO_APNS_KEY_ID?.trim(),
@@ -358,7 +370,7 @@ function readMobilePushConfig(environment: NodeJS.ProcessEnv): OrchestratorConfi
     topic: environment.JOKO_APNS_TOPIC?.trim()
   };
   const configured = Object.values(values).filter((value) => value !== undefined && value !== "");
-  if (configured.length === 0) return undefined;
+  if (configured.length === 0) return fcm === undefined ? undefined : { fcm };
   if (configured.length !== Object.keys(values).length) {
     throw new Error("JOKO_APNS_TEAM_ID, JOKO_APNS_KEY_ID, JOKO_APNS_PRIVATE_KEY, and JOKO_APNS_TOPIC must be configured together.");
   }
@@ -376,7 +388,8 @@ function readMobilePushConfig(environment: NodeJS.ProcessEnv): OrchestratorConfi
       keyId: values.keyId!,
       privateKeyPath,
       topic: values.topic!
-    }
+    },
+    ...(fcm === undefined ? {} : { fcm })
   };
 }
 

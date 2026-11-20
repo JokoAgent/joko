@@ -177,7 +177,7 @@ export interface NodeIdentity {
   readonly pairingEnabled: boolean;
 }
 
-export type MobilePushEnvironment = "sandbox" | "production";
+export type MobilePushEnvironment = "sandbox" | "production" | "fcm";
 export type MobilePushLocale = "en" | "zh-CN" | "zh-TW" | "ja" | "ko";
 
 export interface MobilePushRevocationTicket {
@@ -482,7 +482,7 @@ export interface MobileNetwork {
   getPartnerPrivateThread(credential: PairedCredential, partnerId: string, threadId: string, signal?: AbortSignal): Promise<MobilePrivateDetail>;
   markPartnerPrivateThreadRead(credential: PairedCredential, partnerId: string, threadId: string,
     throughSequence: number, maximumSequence: number, signal?: AbortSignal): Promise<MobilePrivateReadState>;
-  getMobilePushCapability(origin: string, signal?: AbortSignal): Promise<MobilePushCapabilityResult>;
+  getMobilePushCapability(origin: string, signal?: AbortSignal, platform?: "ios" | "android"): Promise<MobilePushCapabilityResult>;
   registerMobilePush(credential: PairedCredential, input: MobilePushRegistrationInput,
     signal?: AbortSignal): Promise<MobilePushRegistrationResult>;
   unregisterMobilePush(origin: string, route: MobilePushRetirementRoute, ticket: MobilePushRevocationTicket, signal?: AbortSignal): Promise<void>;
@@ -1483,6 +1483,7 @@ function normalizedMobilePushTicket(ticket: MobilePushRevocationTicket): MobileP
 }
 
 function wireMobilePushEnvironment(value: MobilePushEnvironment): WireMobilePushEnvironment {
+  if (value === "fcm") return WireMobilePushEnvironment.FCM;
   return value === "sandbox" ? WireMobilePushEnvironment.APNS_SANDBOX : WireMobilePushEnvironment.APNS_PRODUCTION;
 }
 
@@ -2730,11 +2731,12 @@ export const mobileNetwork: MobileNetwork = {
       .markPartnerPrivateThreadRead({ partnerId, threadId, throughSequence: BigInt(throughSequence) }, options(signal));
     return projectMobilePrivateReadResponse(partnerId, threadId, response, throughSequence, maximumSequence);
   },
-  async getMobilePushCapability(rawOrigin, signal) {
+  async getMobilePushCapability(rawOrigin, signal, platform = "ios") {
     const origin = normalizeNodeOrigin(rawOrigin);
+    const provider = platform === "android" ? MobilePushProvider.FCM : MobilePushProvider.APNS;
     const capability = (await createClient(ConnectionService, transport(origin))
-      .getMobilePushCapability({}, options(signal))).capability;
-    if (!capability || capability.provider !== MobilePushProvider.APNS) {
+      .getMobilePushCapability({ provider }, options(signal))).capability;
+    if (!capability || capability.provider !== provider) {
       throw new Error("The Joko node returned an invalid mobile push capability.");
     }
     const reason = capability.unavailableReasonCode;
@@ -2751,13 +2753,14 @@ export const mobileNetwork: MobileNetwork = {
     const ticket = normalizedMobilePushTicket(input.ticket);
     if (ticket.serverId !== credential.serverId) throw new Error("The mobile push ticket belongs to another Joko node.");
     const environment = wireMobilePushEnvironment(input.environment);
+    const provider = input.environment === "fcm" ? MobilePushProvider.FCM : MobilePushProvider.APNS;
     const locale = wireMobilePushLocale(input.locale);
     const previewEnabled = input.previewEnabled === true;
     const response = await createClient(ConnectionService, credentialTransport(credential)).registerMobilePush({
       connectionId: credential.connectionId,
       deviceId: credential.deviceId,
       expectedDeviceRevision: input.expectedDeviceRevision,
-      provider: MobilePushProvider.APNS,
+      provider,
       environment,
       locale,
       deviceToken: normalizedMobilePushToken(input.deviceToken),
@@ -2772,7 +2775,7 @@ export const mobileNetwork: MobileNetwork = {
     if (!registration || !returnedTicket || expiresAt === undefined || expiresAt < 1 || revision < 1n
       || registration.registrationId !== ticket.registrationId
       || registration.connectionId !== credential.connectionId || registration.deviceId !== credential.deviceId
-      || registration.provider !== MobilePushProvider.APNS || registration.environment !== environment
+      || registration.provider !== provider || registration.environment !== environment
       || registration.locale !== locale || registration.previewEnabled !== previewEnabled || returnedTicket.serverId !== ticket.serverId
       || returnedTicket.registrationId !== ticket.registrationId || returnedTicket.secret !== ticket.secret) {
       throw new Error("The Joko node returned an invalid mobile push registration.");

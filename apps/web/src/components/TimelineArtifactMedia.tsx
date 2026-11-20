@@ -107,7 +107,7 @@ function TimelineArtifactMediaContent({ artifact, loadUrl, t, className, kind, s
           metadata={artifact.audioMetadata}
           labels={{ player: playerLabel, loading: t("timeline.mediaLoading"), unavailable: t("timeline.mediaUnavailable"), copyDescription: t("media.copyDescription"), copying: t("media.copyingDescription"), copied: t("media.descriptionCopied"), copyFailed: t("media.descriptionCopyFailed") }}
         />
-        : <VideoPreview key={attempt} src={urlState.url} ownerKey={sourceKey} pauseWhenHidden labels={{ open: t("media.openVideo", { name: artifact.title || artifact.fileName }), player: playerLabel, loading: t("timeline.mediaLoading"), unavailable: t("timeline.mediaUnavailable"), close: t("common.close"), playBlocked: t("media.playBlocked") }} onError={failMedia} actions={<NativeArtifactFileActionsMenu actions={fileActions} artifact={artifact} ownerKey={sourceKey} t={t} />} />}
+        : <VideoPreview key={attempt} src={urlState.url} ownerKey={sourceKey} inlineControls pauseWhenHidden labels={{ open: t("media.expandVideo", { name: artifact.title || artifact.fileName }), player: playerLabel, loading: t("timeline.mediaLoading"), unavailable: t("timeline.mediaUnavailable"), close: t("common.close"), playBlocked: t("media.playBlocked") }} onError={failMedia} actions={<NativeArtifactFileActionsMenu actions={fileActions} artifact={artifact} ownerKey={sourceKey} t={t} />} />}
     </>}
   </div>;
 }

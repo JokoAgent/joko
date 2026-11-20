@@ -73,7 +73,7 @@ function clientFixture(initial = authority()) {
   };
 }
 
-function notificationsFixture(initialPermission: typeof granted | typeof denied = granted) {
+function notificationsFixture(initialPermission: typeof granted | typeof denied = granted, platform = "ios") {
   let permission: typeof granted | typeof denied = initialPermission;
   let responseListener: ((response: never) => void) | undefined;
   let tokenListener: ((token: never) => void) | undefined;
@@ -85,7 +85,7 @@ function notificationsFixture(initialPermission: typeof granted | typeof denied 
     return permission;
   });
   const getPermissionsAsync = vi.fn(async () => permission);
-  const getDevicePushTokenAsync = vi.fn(async () => ({ type: "ios", data: nativeToken }));
+  const getDevicePushTokenAsync = vi.fn(async () => ({ type: platform, data: nativeToken }));
   const clearLastNotificationResponseAsync = vi.fn(async () => undefined);
   const getLastNotificationResponseAsync = vi.fn(async () => lastResponse);
   const api = {
@@ -116,7 +116,7 @@ function notificationsFixture(initialPermission: typeof granted | typeof denied 
     emitResponse(value: unknown) { responseListener?.(value as never); },
     emitToken() {
       nativeToken = "rotated-native-token";
-      tokenListener?.({ type: "ios", data: nativeToken } as never);
+      tokenListener?.({ type: platform, data: nativeToken } as never);
     }
   };
 }
@@ -141,16 +141,18 @@ function controllerFixture(options: {
   enabled?: boolean;
   permission?: typeof granted | typeof denied;
   platform?: string;
+  prepareAndroidChannel?: (locale: string) => Promise<void>;
   owner?: MobilePushAuthority;
   persisted?: { plain: Map<string, string>; secure: Map<string, string> };
 } = {}) {
   const client = clientFixture(options.owner);
-  const notifications = notificationsFixture(options.permission);
+  const notifications = notificationsFixture(options.permission, options.platform);
   const storage = deviceStoreFixture(options.enabled, options.persisted?.plain, options.persisted?.secure);
   let sequence = 0;
   const controller = new MobilePushController({
     platform: options.platform ?? "ios",
-    environment: "sandbox",
+    environment: options.platform === "android" ? "fcm" : "sandbox",
+    ...(options.prepareAndroidChannel === undefined ? {} : { prepareAndroidChannel: options.prepareAndroidChannel }),
     locale: "en",
     client: client.client,
     deviceStore: storage.store,
@@ -378,11 +380,30 @@ describe("MobilePushController", () => {
     });
   });
 
-  it("keeps Android explicitly unsupported without loading the native API", async () => {
+  it("holds native permission and registration when the Android build lacks Firebase configuration", async () => {
     const fixture = controllerFixture({ platform: "android" });
     await fixture.controller.start(() => true);
     expect(fixture.controller.snapshot).toEqual({ enabled: false, saving: false, status: "unsupported-platform" });
     expect(fixture.notifications.getPermissionsAsync).not.toHaveBeenCalled();
     expect(fixture.client.getMobilePushCapability).not.toHaveBeenCalled();
+  });
+
+  it("registers the Android token after permission and routes a native push tap for the original task", async () => {
+    const prepareAndroidChannel = vi.fn(async (_locale: string) => undefined);
+    const fixture = controllerFixture({ platform: "android", permission: denied, prepareAndroidChannel });
+    const offer = vi.fn(() => true);
+    await fixture.controller.start(offer);
+    expect(prepareAndroidChannel).not.toHaveBeenCalled();
+    await fixture.controller.setEnabled(true);
+    expect(prepareAndroidChannel.mock.invocationCallOrder[0]).toBeLessThan(fixture.notifications.requestPermissionsAsync.mock.invocationCallOrder[0]!);
+    expect(fixture.client.registerMobilePush).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      environment: "fcm", deviceToken: "private-native-token"
+    }), expect.any(AbortSignal));
+    const intent = "joko://task/original-fcm-task?server=server-1";
+    fixture.notifications.emitResponse({ notification: { request: { identifier: "fcm-original",
+      trigger: { type: "push", remoteMessage: { data: { intent } } } } } });
+    expect(offer).toHaveBeenCalledExactlyOnceWith(intent);
+    await fixture.controller.setEnabled(false);
+    expect(fixture.client.unregisterMobilePush).toHaveBeenCalledWith(expect.objectContaining({ environment: "fcm" }), expect.any(AbortSignal));
   });
 });

@@ -3,6 +3,8 @@ import type { ConfigContext, ExpoConfig } from "expo/config";
 export const JOKO_MOBILE_UPDATE_FEED_ENV = "JOKO_MOBILE_UPDATE_FEED_URL";
 export const JOKO_MOBILE_OTA_ENV = "JOKO_MOBILE_OTA_URL";
 export const JOKO_MOBILE_BETA_ENV = "JOKO_MOBILE_BETA_UPDATES";
+export const JOKO_ANDROID_GOOGLE_SERVICES_FILE_ENV = "JOKO_ANDROID_GOOGLE_SERVICES_FILE";
+const notificationPermission = "android.permission.POST_NOTIFICATIONS";
 
 export interface MobileUpdateBuildConfiguration {
   readonly releaseFeedUrl: string | null;
@@ -28,6 +30,7 @@ export function resolveMobileUpdateBuildConfiguration(
 
 export default function mobileExpoConfig({ config }: ConfigContext): ExpoConfig {
   const update = resolveMobileUpdateBuildConfiguration(process.env);
+  const googleServicesFile = process.env[JOKO_ANDROID_GOOGLE_SERVICES_FILE_ENV]?.trim() || config.android?.googleServicesFile;
   const name = config.name ?? "Joko";
   const slug = config.slug ?? "joko";
   return {
@@ -36,9 +39,15 @@ export default function mobileExpoConfig({ config }: ConfigContext): ExpoConfig 
     slug,
     android: {
       ...config.android,
+      ...(googleServicesFile === undefined ? {} : { googleServicesFile }),
+      blockedPermissions: [...new Set([
+        ...(config.android?.blockedPermissions ?? []).filter(permission => permission !== notificationPermission),
+        ...(googleServicesFile ? [] : [notificationPermission])
+      ])],
       permissions: [...new Set([
-        ...(config.android?.permissions ?? []),
-        ...(update.releaseFeedUrl === null ? [] : ["android.permission.REQUEST_INSTALL_PACKAGES"])
+        ...(config.android?.permissions ?? []).filter(permission => permission !== notificationPermission),
+        ...(update.releaseFeedUrl === null ? [] : ["android.permission.REQUEST_INSTALL_PACKAGES"]),
+        ...(googleServicesFile ? [notificationPermission] : [])
       ])]
     },
     runtimeVersion: { policy: "fingerprint" },
@@ -51,6 +60,7 @@ export default function mobileExpoConfig({ config }: ConfigContext): ExpoConfig 
     },
     extra: {
       ...config.extra,
+      jokoAndroidPushConfigured: Boolean(googleServicesFile),
       jokoMobileUpdate: {
         version: 1,
         releaseFeedUrl: update.releaseFeedUrl ?? "",

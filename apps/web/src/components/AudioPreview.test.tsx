@@ -90,6 +90,8 @@ describe("AudioPreview", () => {
     expect(audio.getAttribute("src")).toBe(initial.src);
     await render("a", "sound_effect");
     expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelector(".audio-preview__art")).toBeNull();
+    expect(container.querySelector(".audio-preview--effect audio")).not.toBeNull();
     expect(container.querySelector("p")).toBeNull();
     expect(container.querySelector("button")).toBeNull();
     expect(gateway.acquire).toHaveBeenCalledTimes(4);
