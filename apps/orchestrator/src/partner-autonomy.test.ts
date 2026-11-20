@@ -54,10 +54,51 @@ async function fixture(permissionMode: "ask" | "bypassPermissions" = "ask") {
   const update = (operationId: string, choice: Parameters<PartnerAutonomyManager["update"]>[0]["choice"]) => autonomy.update({ operationId, connection,
     expectedRevision: autonomy.settings().revision, choice, assertCurrent: () => undefined });
   cleanups.push(async () => { autonomy.stop(); await routines.stop(); await scheduler.stop(); await tasks.close(); await host.dispose(); profiles.close(); store.close(); await rm(directory, { recursive: true, force: true }); });
-  return { store, profiles, partners, partner, adapter, routines, tasks, autonomy, host, connection, task, update, session, tick: (amount: number) => { now += amount; } };
+  return { directory, store, profiles, partners, partner, adapter, routines, tasks, autonomy, host, connection, task, update, session, tick: (amount: number) => { now += amount; } };
 }
 
 describe("Partner task observation", () => {
+  it("takes over and releases only the tasks selected by the original owner without writing to their queues", async () => {
+    const f = await fixture();
+    const ordinary = f.task("ordinary-owner-task"), other = f.task("other-owner-task");
+    const first = f.task("first-created-task"), second = f.task("second-created-task");
+    for (const task of [first, second]) f.store.setSetting("service", "partner.workbench.background", task.id,
+      { version: 1, sessionId: task.id, partnerId: f.partner.id, status: "running" });
+    expect(f.autonomy.glance(f.partner.id).rows.map(row => row.sessionId).sort()).toEqual([first.id, second.id]);
+    const before = f.autonomy.glance(f.partner.id).snapshotToken;
+    vi.spyOn(f.adapter, "send").mockResolvedValue(undefined);
+    const admitted = f.host.enqueueInput({ operationId: "owner-responsibility-input", connection: f.connection, sessionId: f.session.id,
+      prompt: { text: `Follow ${ordinary.id}. Release ${first.id}.`, disposition: "prompt", mentions: [], files: [], images: [] } }).value;
+    const original = await vi.waitFor(() => {
+      const item = f.store.getQueueItem(admitted.queueItemId);
+      expect(item.state).toBe("backend_accepted");
+      return item;
+    });
+    const context: BridgeToolCallContext = { sessionId: f.session.id, targetId: f.session.targetId, generation: f.session.binding.generation,
+      localProductScope: true, inputQueueItem: { id: original.id, runId: original.runId, attemptId: original.attemptId! } };
+    const set = (taskId: string, responsible: boolean, request: string, scope = context) =>
+      f.autonomy.setResponsibility(f.partner.id, taskId, responsible, request, scope);
+    expect(() => set(other.id, true, "owner-other-task")).toThrow(/owner must select/u);
+    expect(() => set(ordinary.id, true, "wrong-scope", { ...context, inputQueueItem: undefined })).toThrow(/turn changed/u);
+    expect(set(ordinary.id, true, "owner-takes-ordinary")).toEqual({ taskId: ordinary.id, responsible: true });
+    expect(set(first.id, false, "owner-releases-first")).toEqual({ taskId: first.id, responsible: false });
+    expect(set(first.id, false, "owner-releases-first")).toEqual({ taskId: first.id, responsible: false });
+    expect(() => f.autonomy.glance(f.partner.id, before)).toThrow(/expired/u);
+    const readStore = new OperationalStore(join(f.directory, "operations.db"));
+    try {
+      const restored = new PartnerAutonomyManager({ ...f.autonomy.options, store: readStore });
+      const rows = restored.glance(f.partner.id).rows;
+      expect(rows.map(row => row.sessionId).sort()).toEqual([ordinary.id, second.id]);
+      expect(rows.find(row => row.sessionId === ordinary.id)).toMatchObject({ followerPartnerId: f.partner.id, responsiblePartnerId: f.partner.id });
+      expect(rows.find(row => row.sessionId === ordinary.id)?.creatorPartnerId).toBeUndefined();
+    } finally { readStore.close(); }
+    expect(f.store.findSetting("service", "partner.workbench.background", first.id)?.value).toMatchObject({ partnerId: f.partner.id, sessionId: first.id });
+    for (const task of [ordinary, other, first, second]) {
+      expect(f.store.getRun(`run:${task.id}`).descriptor.state).toBe("running");
+      expect(f.store.listQueueItems({ sessionId: task.id })).toEqual([]);
+    }
+  });
+
   it("runs the opt-in daily todo check in a private routine lane and keeps its builtin instructions fixed", async () => {
     const f = await fixture();
     await f.autonomy.start();

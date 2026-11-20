@@ -2514,7 +2514,8 @@ export async function createOrchestratorApplication(
   const unregisterPartnerTools = mcpRouter.registerBridgeToolProvider(
     new PartnerToolBridgeProvider({ store, partners })
   );
-  const unregisterPartnerWorkbenchTools = mcpRouter.registerBridgeToolProvider(new PartnerWorkbenchToolProvider({ store, partners, workbench: partnerWorkbenches }));
+  const unregisterPartnerWorkbenchTools = mcpRouter.registerBridgeToolProvider(new PartnerWorkbenchToolProvider({ store, partners, workbench: partnerWorkbenches,
+    autonomy: () => partnerAutonomy }));
   partnerTodos = new PartnerTodoManager(store, partnerStore, partners, Date.now, () => partnerHomeRuntime);
   const unregisterPartnerTodoTools = mcpRouter.registerBridgeToolProvider(new PartnerTodoTools(partnerTodos, () => partnerRoutines));
   const unregisterPartnerMessagingTools = ['telegram', 'discord', 'dingtalk', 'feishu', 'lark', 'wecom', 'wechat', 'slack']

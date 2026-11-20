@@ -4,12 +4,16 @@ import { TaskShareStore, type ConnectionRecord, type OperationalStore, type Part
 import type { PartnerManager } from "./partner-manager.js";
 import type { PartnerRoutineManager } from "./partner-routine-manager.js";
 import type { PartnerSessionTaskManager } from "./partner-session-tasks.js";
+import type { BridgeToolCallContext } from "./mcp-router.js";
+import { ownerAuthoredPromptText } from "./native-owner-intent.js";
 // Runtime facts, consent, event admission and native execution retain their original owners.
 export const PARTNER_HOST_SOURCE = "host:sessions";
 const TYPES = ["stuck", "waiting", "errored", "usage-limit", "finished", "sweep"] as const;
 type EventType = typeof TYPES[number];
 const DAY = 24 * 60 * 60_000, FALLBACK = 2 * 60 * 60_000;
 const SETTINGS_SCOPE = "partner.autonomy.v1", SETTINGS_KEY = "settings";
+const RESPONSIBILITY_PREFIX = "responsibility.";
+const MAX_RESPONSIBILITIES = 10_000;
 const FOLLOW_UP_VERSION = 1;
 const TODO_CHECK_VERSION = 1;
 export interface PartnerAutonomySettings {
@@ -23,6 +27,7 @@ export interface PartnerObservedTask {
   readonly sessionId: string; readonly generation: number; readonly targetId: string; readonly title: string;
   readonly phase: PartnerObservedPhase; readonly phaseSince: number; readonly startedAt?: number;
   readonly question?: string; readonly interactionId?: string; readonly creatorPartnerId?: string; readonly followerPartnerId?: string;
+  readonly responsiblePartnerId?: string;
   readonly canonicalPartnerId?: string; readonly runId: string; readonly lastActivityAt: number; readonly toolInFlight: boolean;
   readonly source: RunDescriptor["source"]; readonly shared: boolean; readonly readOnly: boolean;
   readonly deviceId?: string; readonly deviceName?: string; readonly online: boolean;
@@ -31,6 +36,11 @@ interface GlanceSnapshot {
   readonly partnerId: string; readonly partnerRevision: bigint; readonly allTasks: boolean;
   readonly rows: readonly PartnerObservedTask[]; readonly waitingCount: number; readonly workingCount: number;
   readonly doneToday: number; readonly observedAt: number; readonly settingsRevision: number;
+}
+interface TaskResponsibility {
+  readonly version: 1;
+  readonly adoptedBy?: string;
+  readonly released: readonly string[];
 }
 export interface PartnerFollowUpRuntime {
   prepare(routine: Routine, run: RoutineRun): { readonly events: RoutineRun["events"]; readonly context: string; readonly assertCurrent: () => void } | undefined;
@@ -144,11 +154,85 @@ export class PartnerAutonomyManager implements PartnerFollowUpRuntime {
     }
     return creators;
   }
+  setResponsibility(partnerId: string, taskId: string, responsible: boolean, operationId: string, context: BridgeToolCallContext, signal?: AbortSignal) {
+    if (!id(taskId)) throw new Error("The original task ID is invalid.");
+    const { store, partners, profiles } = this.options;
+    const assertCurrent = () => {
+      signal?.throwIfAborted(); context.assertCurrent?.();
+      const profile = this.#partner(partnerId, true);
+      const caller = store.getSession(context.sessionId).descriptor;
+      if (!context.localProductScope || caller.targetId !== context.targetId || caller.targetId !== profile.homeTargetId
+        || caller.binding.generation !== context.generation || partners.runtimeCaller(caller.id).id !== partnerId) {
+        throw new Error("The original Partner authority changed.");
+      }
+      const runOwner = context.inputQueueItem;
+      const queue = runOwner && store.findQueueItemByRunId(caller.id, runOwner.runId);
+      const run = runOwner && store.findRun(runOwner.runId)?.descriptor;
+      const attempt = runOwner && store.getAttempt(runOwner.attemptId).descriptor;
+      if (!runOwner || !run || queue?.id !== runOwner.id || queue.attemptId !== runOwner.attemptId
+        || !["dispatching", "backend_accepted"].includes(queue.state) || !["running", "queued", "waiting", "retrying"].includes(run.state)
+        || run.activeAttemptId !== runOwner.attemptId || attempt?.runId !== run.id || attempt.endedAt !== undefined
+        || attempt.generation !== context.generation || attempt.backendInstanceGeneration !== store.getBackend(caller.backendId).descriptor.instanceGeneration) {
+        throw new Error("The original Partner turn changed.");
+      }
+      if (responsible || caller.id === profile.canonicalSessionId) {
+        const operation = queue && store.findOperation(queue.operationId);
+        if (caller.id !== profile.canonicalSessionId || run.source !== "user" || run.parentRunId !== undefined
+          || queue.body.messagingOrigin || queue.body.automaticContinuation || queue.body.objectiveContinuation || queue.body.inputHandoffContinuation
+          || !operation?.connectionId || store.getConnection(operation.connectionId).state !== "active" || operation.status !== "completed"
+          || (operation.kind !== "sendInput" && operation.kind !== "send_input") || new TaskShareStore(store).getAuthorForOperation(queue.operationId)
+          || !(ownerAuthoredPromptText(queue.body).match(/[A-Za-z0-9][A-Za-z0-9._:-]{0,255}/gu)?.some(word => word === taskId || word.replace(/[.:]+$/u, "") === taskId)
+            || queue.body.mentions.some(mention => mention.kind === "session" && mention.reference === taskId))) {
+          throw new Error("The owner must select this task in the current Partner message.");
+        }
+      } else if (run.source !== "schedule") {
+        throw new Error("The routine can release responsibility during its own scheduled run.");
+      }
+    };
+    assertCurrent();
+    const result = store.runOperation({ id: operationId, kind: "partner_task_responsibility", body: { partnerId, taskId, responsible } }, () => {
+      assertCurrent();
+      const task = store.getSession(taskId).descriptor, target = store.getTarget(task.targetId);
+      const link = profiles.getSessionLink(taskId);
+      if (task.archived || task.deletedAt !== undefined || task.hidden || task.remoteWorkspace || !target.descriptor.trusted || target.descriptor.remoteWorkspace
+        || task.automationOrigin || task.derivationOrigin?.sideChat || store.findSessionRuntimePolicy(taskId) || store.findCollaborationWorkerBySession(taskId)
+        || new TaskShareStore(store).list().some(share => share.sessionId === taskId && share.status === "active")) {
+        throw new Error("The task cannot be followed from this Partner.");
+      }
+      const key = `${RESPONSIBILITY_PREFIX}${taskId}`;
+      const stored = store.findSetting("service", SETTINGS_SCOPE, key);
+      const record: TaskResponsibility | null = stored === undefined ? { version: 1, released: [] } : taskResponsibility(stored.value);
+      if (!record) throw new Error("The task's responsibility record is unavailable.");
+      const creator = this.#creators().get(taskId);
+      const assigned = responsiblePartner(record, creator);
+      if (responsible) {
+        if (assigned && assigned !== partnerId || link && (link.role !== "delegation" || creator !== partnerId)
+          || !store.listRuns({ sessionId: taskId, activeOnly: true, limit: 1 }).length) throw new Error("This task is not available to take over.");
+      } else if (assigned !== partnerId && creator !== partnerId && !record.released.includes(partnerId)) {
+        throw new Error("This Partner does not follow the selected task.");
+      }
+      const released = new Set(record.released);
+      if (responsible) released.delete(partnerId); else released.add(partnerId);
+      const adoptedBy = responsible ? partnerId : record.adoptedBy === partnerId ? undefined : record.adoptedBy;
+      if (stored === undefined && store.listSettingsByKeyPrefix("service", SETTINGS_SCOPE, RESPONSIBILITY_PREFIX).length >= MAX_RESPONSIBILITIES) {
+        throw new Error("The task responsibility store is full.");
+      }
+      store.setSetting("service", SETTINGS_SCOPE, key, { version: 1, released: [...released], ...(adoptedBy === undefined ? {} : { adoptedBy }) } satisfies TaskResponsibility);
+      return { taskId, responsible };
+    });
+    this.#snapshots.clear(); this.refresh();
+    return result.value;
+  }
   observe(): readonly PartnerObservedTask[] {
     const settings = this.settings(), scheduler = this.#scheduler(settings), creators = this.#creators();
+    const responsibilities = new Map(this.options.store.listSettingsByKeyPrefix("service", SETTINGS_SCOPE, RESPONSIBILITY_PREFIX)
+      .map(item => [item.key.slice(RESPONSIBILITY_PREFIX.length), taskResponsibility(item.value)]));
     const canonical = new Map(this.options.partners.listPartners().flatMap(profile => profile.canonicalSessionId ? [[profile.canonicalSessionId, profile.id] as const] : []));
     const sessions = scheduler ? this.options.store.listSessions({ excludeHidden: true }).map(row => row.descriptor)
-      : [...creators.keys()].flatMap(sessionId => { try { return [this.options.store.getSession(sessionId).descriptor]; } catch { return []; } });
+      : [...new Set([...creators.keys(), ...responsibilities.keys()])].flatMap(sessionId => {
+        if (!responsiblePartner(responsibilities.get(sessionId), creators.get(sessionId))) return [];
+        try { return [this.options.store.getSession(sessionId).descriptor]; } catch { return []; }
+      });
     const shared = new Set(new TaskShareStore(this.options.store).list().filter(item => item.status === "active").map(item => item.sessionId));
     return sessions.flatMap(session => {
       const link = this.options.profiles.getSessionLink(session.id);
@@ -169,17 +253,18 @@ export class PartnerAutonomyManager implements PartnerFollowUpRuntime {
         else if (event.payload.type === "tool_result") toolCalls.delete(event.payload.callId);
       }
       const creatorPartnerId = creators.get(session.id), canonicalPartnerId = canonical.get(session.id), remote = session.remoteWorkspace;
+      const responsibility = responsibilities.get(session.id), responsiblePartnerId = responsiblePartner(responsibility, creatorPartnerId);
       const phaseSince = interaction?.createdAt ?? run.endedAt ?? run.startedAt ?? run.createdAt;
       if (phase === "finished" && this.#now() - phaseSince > 15 * 60_000) return [];
-      const isShared = shared.has(session.id), follower = remote || isShared ? undefined : this.#follower(creatorPartnerId, settings);
-      const followerPartnerId = follower === canonicalPartnerId ? undefined : follower;
+      const isShared = shared.has(session.id), follower = remote || isShared || responsibility === null ? undefined : this.#follower(responsiblePartnerId, settings);
+      const followerPartnerId = follower === canonicalPartnerId || follower && responsibility?.released.includes(follower) ? undefined : follower;
       const question = interaction?.payload.kind === "question" ? compact(interaction.payload.prompt, 140)
         : interaction?.payload.kind === "permission" ? compact(interaction.payload.title, 140)
           : phase === "errored" ? compact(run.error?.message ?? "Task execution outcome is unavailable.", 140) : undefined;
       return [{ sessionId: session.id, generation: session.binding.generation, targetId: session.targetId, title: session.title,
         phase, phaseSince,
         ...(run.startedAt === undefined ? {} : { startedAt: run.startedAt }), ...(question ? { question } : {}),
-        ...(interaction ? { interactionId: interaction.id } : {}), ...(creatorPartnerId ? { creatorPartnerId } : {}),
+        ...(interaction ? { interactionId: interaction.id } : {}), ...(creatorPartnerId ? { creatorPartnerId } : {}), ...(responsiblePartnerId ? { responsiblePartnerId } : {}),
         ...(canonicalPartnerId ? { canonicalPartnerId } : {}), ...(followerPartnerId ? { followerPartnerId } : {}),
         runId: run.id, source: run.source, shared: isShared, readOnly: remote !== undefined,
         lastActivityAt: Math.max(run.startedAt ?? run.createdAt, ...events.map(event => event.emittedAt)),
@@ -195,7 +280,7 @@ export class PartnerAutonomyManager implements PartnerFollowUpRuntime {
     if (!Number.isSafeInteger(offset) || offset < 0 || !token && offset !== 0) throw new Error("The task observation offset is invalid.");
     if (!snapshot) {
       const allTasks = this.#scheduler(settings) === partnerId;
-      const observed = this.observe().filter(row => row.canonicalPartnerId !== partnerId && (allTasks || row.creatorPartnerId === partnerId));
+      const observed = this.observe().filter(row => row.canonicalPartnerId !== partnerId && (allTasks || row.responsiblePartnerId === partnerId));
       const rows = observed.filter(row => row.phase !== "finished").sort((a, b) => Number(working(a)) - Number(working(b))
         || (working(a) ? b.phaseSince - a.phaseSince : a.phaseSince - b.phaseSince) || a.sessionId.localeCompare(b.sessionId));
       snapshot = { partnerId, partnerRevision: partner.revision, allTasks, rows, waitingCount: rows.filter(row => !working(row)).length,
@@ -318,6 +403,18 @@ function todoCheckInput(): RoutineInput {
     triggers: [{ id: "weekday-morning", kind: "cron", expression: "0 9 * * 1-5",
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC" }]
   };
+}
+
+function taskResponsibility(value: unknown): TaskResponsibility | null {
+  const record = value as Partial<TaskResponsibility> | undefined;
+  if (record?.version !== 1 || !Array.isArray(record.released) || !record.released.every(id)
+    || record.adoptedBy !== undefined && !id(record.adoptedBy)) return null;
+  return { version: 1, released: record.released, ...(record.adoptedBy === undefined ? {} : { adoptedBy: record.adoptedBy }) };
+}
+
+function responsiblePartner(record: TaskResponsibility | null | undefined, creator: string | undefined): string | undefined {
+  if (record === null) return undefined;
+  return record?.adoptedBy ?? (creator && !record?.released.includes(creator) ? creator : undefined);
 }
 
 function followUpInput(partnerId: string): RoutineInput {
