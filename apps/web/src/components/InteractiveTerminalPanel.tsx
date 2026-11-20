@@ -11,7 +11,7 @@ import { randomUuid } from "../web-crypto.js";
 import { Button, Pill } from "./ui.js";
 import type { Translator } from "./types.js";
 
-export function InteractiveTerminalPanel({ controller, sessionId, terminalId, active, capabilities, t, onState }: {
+export function InteractiveTerminalPanel({ controller, sessionId, terminalId, active, capabilities, t, onState, viewDocument }: {
   readonly controller: AppController;
   readonly sessionId: string;
   readonly terminalId: string;
@@ -19,6 +19,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
   readonly capabilities: TerminalCapabilitiesView;
   readonly t: Translator;
   readonly onState: (terminal: TerminalView) => void;
+  readonly viewDocument?: Document;
 }) {
   const slotRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | undefined>(undefined);
@@ -244,7 +245,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
       terminalRef.current = undefined;
       fitRef.current = () => undefined;
     };
-  }, [scope, connectionOwner]);
+  }, [scope, connectionOwner, viewDocument]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
@@ -446,13 +447,13 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
       ownerWindow.removeEventListener("pageshow", pageshow);
       if (retry !== undefined) ownerWindow.clearTimeout(retry);
     };
-  }, [connected, revision, scope, connectionOwner]);
+  }, [connected, revision, scope, connectionOwner, viewDocument]);
 
   useEffect(() => {
     if (!active) return;
     fitRef.current();
     terminalRef.current?.focus();
-  }, [active, scope]);
+  }, [active, scope, viewDocument]);
 
   const reconnect = (): void => {
     focusAfterConnectRef.current ??= { scope, element: slotRef.current?.ownerDocument.activeElement ?? null };
