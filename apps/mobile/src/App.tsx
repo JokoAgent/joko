@@ -1839,7 +1839,8 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
           disabled={state.status !== "connected"}>
           <View style={[styles.row, { backgroundColor: colors.surface,
             borderColor: item.session.sessionId === currentSessionId ? colors.accent : colors.border }]}>
-            <Pressable disabled={state.busy} accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.openTask", {
+            <Pressable disabled={state.busy && client.canOpenCachedTaskWhileConnecting?.(item.session.sessionId) !== true}
+              accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.openTask", {
               name: item.session.displayName || mobileMessage(locale, "home.untitled")
             })}
               accessibilityHint={attention === undefined ? undefined : mobileMessage(locale, "home.taskUnread")}

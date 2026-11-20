@@ -1097,6 +1097,11 @@ export class MobileClient {
   #catalogAbort?: AbortController;
   #connectionAttemptEpoch = 0;
   #connectionAttemptAbort?: AbortController;
+  #connectingTaskCache?: {
+    readonly controller: AbortController;
+    readonly profile: MobileConnectionProfile;
+    choice?: { readonly sessionId: string | undefined; readonly read: Promise<MobileOfflineCacheSnapshot | undefined> };
+  };
   #discoveryExpiryTimer?: ReturnType<typeof setTimeout>;
   #homeSearchEpoch = 0;
   #homeSearchAbort?: AbortController;
@@ -5172,7 +5177,10 @@ export class MobileClient {
           try {
             cached = await this.offlineCache.load(profile, selection, cacheRead.signal);
             if (!this.#connectionAttemptCurrent(generation, controller)) return;
-            if (cached) this.#showOfflineProjection(profile, cached, selection, "connecting");
+            if (cached) {
+              this.#connectingTaskCache = { controller, profile };
+              this.#showOfflineProjection(profile, cached, selection, "connecting");
+            }
           } catch (error) {
             if (!this.#connectionAttemptCurrent(generation, controller)) return;
             if (!cacheRead.signal.aborted) cacheLoadWarning = message(error);
@@ -5234,10 +5242,12 @@ export class MobileClient {
         }
         if (resolved) credential = { ...credential, entryId: profile.entryId, origin: profile.origin, transportKind: profile.transportKind };
         const current = () => this.#connectionAttemptCurrent(generation, controller);
-        const projection = await this.#readAlignedConnectionProjection(credential, node, selection, controller.signal, current);
+        const cachedChoice = () => this.#connectingTaskCache?.controller === controller ? this.#connectingTaskCache.choice : undefined;
+        let choice = cachedChoice();
+        const chosenSession = () => choice === undefined ? selection : choice.sessionId;
+        let projection = await this.#readAlignedConnectionProjection(credential, node, chosenSession(), controller.signal, current);
         if (!projection || !current()) return;
-        const { owner, selected, detail } = projection;
-        if (selected !== selection) await this.storage.saveSelection(profileId, selected);
+        if (choice === undefined && projection.selected !== selection) await this.storage.saveSelection(profileId, projection.selected);
         if (!current() || caller?.aborted) return;
         if (savedEntries && entryOwner) {
           const next = entryId ? { ...savedEntries, preferredId: entryId, backupIds: savedEntries.backupIds.filter(id => id !== entryId) } : savedEntries;
@@ -5261,8 +5271,24 @@ export class MobileClient {
           }
         }
         preferenceError = [preferenceError, cacheLoadWarning].filter(Boolean).join(" ") || undefined;
+        for (;;) {
+          const latest = cachedChoice();
+          if (latest !== choice) {
+            choice = latest;
+            projection = await this.#readAlignedConnectionProjection(credential, node, chosenSession(), controller.signal, current);
+            if (!projection || !current()) return;
+          }
+          if (choice !== undefined) {
+            try { await this.storage.saveSelection(profileId, projection.selected); }
+            catch (error) {
+              preferenceError = [preferenceError, message(error)].filter(Boolean).join(" ");
+            }
+          }
+          if (!current() || caller?.aborted) return;
+          if (cachedChoice() === choice) break;
+        }
         entryAttempt.signal.removeEventListener('abort', cancelEntryAttempt);
-        await this.#adoptConnection(generation, controller, credential, node, owner, selected, detail, preferenceError);
+        await this.#adoptConnection(generation, controller, credential, node, projection.owner, projection.selected, projection.detail, preferenceError);
       } catch (error) {
         if (!this.#connectionAttemptCurrent(generation, controller)) {
           if (controller.signal.aborted) return;
@@ -5283,9 +5309,23 @@ export class MobileClient {
           this.#failConnectionAttempt(generation, controller, detail, {
             saved: this.#savedViews(profileId, "identity-conflict", detail)
           });
-        } else if (cached && offlineEligible
-          && this.#adoptOfflineFallback(generation, controller, profile, cached, selection, message(error), credential)) {
-          return;
+        } else if (cached && offlineEligible) {
+          const source = this.#connectingTaskCache?.controller === controller ? this.#connectingTaskCache : undefined;
+          let fallback = cached, selected = selection;
+          let detail = message(error);
+          while (source?.choice !== undefined) {
+            const choice = source.choice;
+            const opened = await choice.read;
+            if (!this.#connectionAttemptCurrent(generation, controller)) return;
+            if (source.choice !== choice) continue;
+            selected = choice.sessionId;
+            fallback = opened ?? { owner: cached.owner, node: cached.node, cachedAt: cached.cachedAt, warning: cached.warning };
+            try { await this.storage.saveSelection(profileId, selected); }
+            catch (failure) { detail = [message(error), message(failure)].join(" "); }
+            if (!this.#connectionAttemptCurrent(generation, controller)) return;
+            if (source.choice === choice) break;
+          }
+          if (this.#adoptOfflineFallback(generation, controller, profile, fallback, selected, detail, credential)) return;
         } else if (this.#state.saved.find((item) => item.profileId === profileId)?.credentialState === "checking") {
           this.#dropOfflineProjection(profileId);
           const detail = [message(error), cacheLoadWarning].filter(Boolean).join(" ");
@@ -5294,7 +5334,10 @@ export class MobileClient {
           });
         }
         throw error;
-      } finally { entryAttempt.signal.removeEventListener('abort', cancelEntryAttempt); }
+      } finally {
+        if (this.#connectingTaskCache?.controller === controller) this.#connectingTaskCache = undefined;
+        entryAttempt.signal.removeEventListener('abort', cancelEntryAttempt);
+      }
     } catch (error) {
       if (!preflight) throw error;
       if (entryAttempt.signal.aborted || this.#entryAttempt !== entryAttempt || !this.#current(originalEpoch)) return;
@@ -6437,8 +6480,32 @@ export class MobileClient {
     await write;
   }
 
+  canOpenCachedTaskWhileConnecting(sessionId: string | undefined): boolean {
+    const source = this.#connectingTaskCache;
+    return this.#foreground && !this.#disposed && this.#state.status === "connecting" && !this.#joinedTask && !!this.offlineCache
+      && source !== undefined && source.controller === this.#connectionAttemptAbort && !source.controller.signal.aborted
+      && this.#hasOfflineProjection(source.profile.profileId) && (sessionId === undefined
+        || this.#state.owner!.sessions.some(session => session.sessionId === sessionId));
+  }
+
   async select(sessionId?: string, signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
+    if (signal === undefined && this.canOpenCachedTaskWhileConnecting(sessionId)) {
+      const source = this.#connectingTaskCache!;
+      const read = sessionId === undefined ? Promise.resolve(undefined)
+        : this.offlineCache!.load(source.profile, sessionId,
+          AbortSignal.any([source.controller.signal, AbortSignal.timeout(savedHomeCacheReadBudgetMs)])).catch(() => undefined);
+      const choice = { sessionId, read };
+      source.choice = choice;
+      this.#set({ taskSource: { kind: "own" }, selectedId: sessionId, detail: undefined, older: [], window: undefined, live: [],
+        historyBusy: false, historyEnd: false, before: undefined, error: undefined });
+      const cached = await read;
+      if (source.choice === choice && this.#connectingTaskCache === source && this.canOpenCachedTaskWhileConnecting(sessionId)) {
+        this.#set({ detail: cached?.detail, offlineSnapshotAt: cached?.detailCachedAt ?? this.#state.offlineSnapshotAt,
+          error: sessionId !== undefined && !cached?.detail ? "This task has no saved offline messages. Reconnect to load it." : undefined });
+      }
+      return;
+    }
     const previousEpoch = this.#epoch;
     if (sessionId !== undefined && !this.#state.owner?.sessions.some((session) => session.sessionId === sessionId)) {
       throw new Error("Select a task from the current Joko node.");
