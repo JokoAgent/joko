@@ -1116,6 +1116,14 @@ export function toProtoQueueItem(
   },
   ordinal = BigInt(item.position)
 ): ProtoQueueItem {
+  const queueError = optionalError(item.error);
+  if (item.state === "accepted" && queueError !== undefined && item.error?.retryAt !== undefined) {
+    queueError.severity = ErrorSeverity.WAITING;
+    queueError.recoveryActions = [message<RecoveryAction>("joko.v1.RecoveryAction", {
+      kind: RecoveryActionKind.WAIT, label: item.error.recovery,
+      retryAfter: toProtoDuration(Math.max(0, item.error.retryAt - item.updatedAt))
+    })];
+  }
   return message<ProtoQueueItem>("joko.v1.QueueItem", {
     queueItemId: item.id,
     backendId: routing.backendId,
@@ -1134,7 +1142,7 @@ export function toProtoQueueItem(
     acceptedAt: toProtoTimestamp(item.createdAt),
     dispatchedAt: optionalTimestamp(item.dispatchedAt),
     version: toProtoEntityVersion(item.revision, routing.generation, item.updatedAt),
-    error: optionalError(item.error),
+    error: queueError,
     input: toProtoInputContent(item.body),
     backendInstanceGeneration: item.backendInstanceGeneration === undefined
       ? undefined
@@ -4901,6 +4909,17 @@ function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | u
         serviceNodeOnly: capability.options?.includes(SESSION_REWIND_SERVICE_NODE_ONLY_OPTION) === true
       }
     };
+  } else if (capability.key === contract.capabilityNames.turnSteer && capability.options?.includes("same_turn")) {
+    kind = {
+      case: "turn",
+      value: {
+        $typeName: "joko.v1.TurnCapabilityOptions",
+        sameTurn: true,
+        acceptsImages: capability.options.includes("images"),
+        acceptsFiles: capability.options.includes("files"),
+        deliveryModes: [contract.QueueDeliveryMode.STEER]
+      }
+    };
   } else if (capability.key.startsWith("model.")) {
     kind = {
       case: "model",
@@ -4993,6 +5012,11 @@ function fromProtoCapabilityOptions(options: CapabilityOptions | undefined): rea
   if (options === undefined) return [];
   switch (options.kind.case) {
     case "session": return options.kind.value.serviceNodeOnly ? [SESSION_REWIND_SERVICE_NODE_ONLY_OPTION] : [];
+    case "turn": return [
+      ...(options.kind.value.sameTurn ? ["same_turn"] : []),
+      ...(options.kind.value.acceptsImages ? ["images"] : []),
+      ...(options.kind.value.acceptsFiles ? ["files"] : [])
+    ];
     case "model": return options.kind.value.effortIds;
     case "input": return options.kind.value.mediaTypes;
     case "permission": return options.kind.value.modes.map(fromProtoPermissionMode);

@@ -2103,6 +2103,7 @@ export interface QueueItemView {
   readonly attachments?: readonly QueueInputAttachmentView[];
   readonly state: "accepted" | "dispatching" | "acceptedByBackend" | "dispatchUnknown" | "completed" | "cancelled" | "failed";
   readonly retryRunId?: string;
+  readonly quotaRetryAt?: number;
   readonly editLocked: boolean;
   readonly ordinal: number;
   readonly createdAt: number;
@@ -2118,6 +2119,7 @@ export interface QueueItemTextEditView {
   readonly text: string;
   readonly mentionRanges: readonly TimelineInputMentionRangeView[];
   readonly pastedTextRanges: readonly TimelineInlineTextRangeView[];
+  readonly addedDirectories?: readonly { readonly workspaceId: string; readonly path: string; readonly start: number; readonly end: number }[];
   /** Ordered UTF-16 edits from the durable Queue text to this projection. */
   readonly textSplices: readonly QueueTextEditSpliceView[];
 }
@@ -6376,6 +6378,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   getVoiceInputSession(voiceInputId: string, signal?: AbortSignal): Promise<VoiceInputSessionView>;
   send(sessionId: string, draft: ComposerDraft, admission: {
     readonly expectedGeneration: bigint;
+    readonly expectedSteerRunId?: string | null;
     readonly providerGroupRebalance?: { readonly suggestionKey: string; readonly remember: boolean };
     readonly messageEdit?: MessageEditRequest & { readonly assertCurrent: () => void };
   }): Promise<void>;
@@ -6530,7 +6533,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   setQueueInteractionLock(sessionId: string, lockToken: string, locked: boolean): Promise<void>;
   editQueueItem(queueItemId: string, edit: QueueItemTextEditView, mode: DeliveryMode, lockToken: string, attachments?: QueueItemAttachmentEditView): Promise<void>;
   reorderQueueItem(queueItemId: string, placement: "first" | "last" | "before" | "after", anchorQueueItemId?: string, interactionLockToken?: string): Promise<void>;
-  steerQueueItemNow(queueItemId: string, lockToken: string): Promise<void>;
+  captureNativeSteerRunId(sessionId: string): string | null | undefined;
+  steerQueueItemNow(queueItemId: string, lockToken: string, expectedSteerRunId?: string | null): Promise<void>;
   pauseQueue(sessionId: string, reason?: string): Promise<void>;
   resumeQueue(sessionId: string): Promise<void>;
   restartBrowser(browserId: string): Promise<void>;

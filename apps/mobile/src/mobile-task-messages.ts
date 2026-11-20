@@ -314,6 +314,8 @@ const mobileTaskMessageRows = [
   ["task.queueFallback", "[Queued input]", "[队列输入]", "[佇列輸入]", "[キュー入力]", "[대기열 입력]"],
   ["task.editingElsewhere", " · Editing elsewhere", " · 正在其他位置编辑", " · 正在其他位置編輯", " · 別の場所で編集中", " · 다른 곳에서 편집 중"],
   ["task.moveUp", "Move up", "上移", "上移", "上へ移動", "위로 이동"],
+  ["task.steerQueuedInput", "Steer current turn", "插话到当前回合", "插話到目前回合", "現在のターンに追加", "현재 턴에 추가"],
+  ["task.queueQuotaWait", "Waiting for Provider quota until {time}", "等待 Provider 额度恢复于 {time}", "等待 Provider 額度恢復於 {time}", "Provider の利用枠が回復する {time} まで待機", "{time}까지 Provider 할당량 대기"],
   ["task.moveDown", "Move down", "下移", "下移", "下へ移動", "아래로 이동"],
   ["task.operationUnknown", "Operation result unknown", "操作结果未知", "操作結果未知", "操作結果は不明", "작업 결과 알 수 없음"],
   ["task.awaitingResult", "Awaiting durable result", "正在等待持久结果", "正在等待持久結果", "永続的な結果を待機中", "영구 결과 대기 중"],

@@ -2031,6 +2031,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     const sourceRoute = sendRouteKey;
     const sourceEpoch = sendEpochRef.current;
     const sourceDeliveryMode = modeOverride ?? deliveryMode;
+    const expectedSteerRunId = sourceDeliveryMode === "steer" ? sourceController.captureNativeSteerRunId?.(session.id) : undefined;
     const draftMedia = [...attachments, ...browserComments.map((item) => item.screenshot)];
     const sourceMentions = composerMentionsFromRanges(mentionsRef.current, inlineMentionRangesRef.current);
     const sourceMentionRanges = [...inlineMentionRangesRef.current];
@@ -2209,7 +2210,9 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
           inlineMentionRanges: sourceMentionRanges,
           deliveryMode: sourceDeliveryMode,
           ...(sourceExtraDirectoryIds === undefined ? {} : { extraDirectoryIds: sourceExtraDirectoryIds })
-        }, { expectedGeneration: sourceGeneration, ...(quotaChoice ? { providerGroupRebalance: quotaChoice } : {}) });
+        }, { expectedGeneration: sourceGeneration,
+          ...(expectedSteerRunId === undefined ? {} : { expectedSteerRunId }),
+          ...(quotaChoice ? { providerGroupRebalance: quotaChoice } : {}) });
         if (sourceReplyQuote) clearSentReplyQuote?.(sourceReplyQuote);
         if (sourceTodoQuote) clearSentTodoQuote?.(sourceTodoQuote);
         partnerConversation?.userSent?.();
@@ -2873,6 +2876,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
       >
       {showQueue && <QueueStrip sessionId={session.id} items={sessionQueue} control={queueControl} supportedDispositions={queueDispositions}
         steerSupported={supportedModes.includes("steer")} attachmentPolicy={attachmentPolicy} controller={controller} runAction={runAction} t={t}
+        directoryWorkspace={trustedLocalWorkspace && partnerConversation === undefined && session.automationOrigin === undefined
+          && session.derivationOrigin?.sideChat !== true && mentionCapability?.options.includes("workspace_directory_queue_edit") ? workspace : undefined}
         expanded={queueExpanded} onExpandedChange={(expanded) => setQueueExpandedSessionId(expanded ? session.id : undefined)} actionsRef={queueActionsRef} />}
       <div
         className={cx("composer", dragging && "is-dragging", effectiveBashMode && "composer--bash")}

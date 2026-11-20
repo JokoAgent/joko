@@ -1,3 +1,6 @@
+import { ErrorSeverity, RecoveryActionKind } from "./gen/joko/v1/common_pb.js";
+import { QueueItemState, type QueueItem } from "./gen/joko/v1/runtime_pb.js";
+
 /** Standard capability identifiers shared by public contracts and capability-driven clients. */
 export const capabilityNames = {
   sessionDiscovery: "session.discovery",
@@ -120,4 +123,14 @@ export function reviewImageMimeType(path: string): string | undefined {
   const name = normalized.slice(normalized.lastIndexOf("/") + 1);
   const dot = name.lastIndexOf(".");
   return dot < 0 ? undefined : reviewImageRasterMimeByExtension.get(name.slice(dot).toLowerCase());
+}
+
+/** Queue wait durations are measured from the version timestamp of the same item. */
+export function queueQuotaRetryAt(item: QueueItem): number | undefined {
+  const stamp = item.version?.updatedAt;
+  if (item.state !== QueueItemState.ACCEPTED || item.error?.severity !== ErrorSeverity.WAITING || stamp === undefined) return undefined;
+  const delay = item.error.recoveryActions.find(action => action.kind === RecoveryActionKind.WAIT)?.retryAfter;
+  if (delay === undefined || delay.seconds < 0n || delay.nanos < 0 || delay.nanos >= 1_000_000_000) return undefined;
+  const at = Number(stamp.seconds + delay.seconds) * 1_000 + (stamp.nanos + delay.nanos) / 1_000_000;
+  return Number.isSafeInteger(at) && at > 0 && at <= 8_640_000_000_000_000 ? at : undefined;
 }

@@ -48,7 +48,7 @@ import {
   VoiceInputSaucSettingsSchema, VoiceInputSaucMode, VoiceInputSaucAuthentication,
   QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind, ResourceKind, ResourceState,
   ReviewRunSchema, ReviewRunState, RuntimeCommandSchema, RuntimeCommandInputMode, RuntimeCommandSource, SessionResourceSchema,
-  RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleMisfirePolicy, ScheduleOverlapPolicy,
+  RunSchema, RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleMisfirePolicy, ScheduleOverlapPolicy,
   ScheduleGeneratedSessionDisposition,
   ScheduleDeletionResultSchema, ScheduleRunCostAttribution, ScheduleRunHistorySchema, ScheduleRunOutcome, ScheduleRunPhase, ScheduleSchema,
   ScheduleSessionMode, ScheduleSource, ScheduleState, SchedulerRuntimeSnapshotSchema,
@@ -11568,6 +11568,49 @@ describe("native current-task message and Queue actions", () => {
     expect(app.taskRetryableQueueItems()).toEqual([]);
     expect(network.submit).toHaveBeenCalledOnce();
     await app.dispose();
+  });
+
+  it("sends the original ordinary queue item to the selected active turn", async () => {
+    const runId = "original-active-run";
+    const backend = queueSnapshot.backends[0]!;
+    const steer = create(CapabilitySchema, {
+      name: capabilityNames.turnSteer, support: CapabilitySupport.SUPPORTED,
+      options: create(CapabilityOptionsSchema, { kind: { case: "turn", value: {
+        sameTurn: true, deliveryModes: [QueueDeliveryMode.STEER]
+      } } })
+    });
+    const current = create(SnapshotSchema, {
+      ...queueSnapshot,
+      backends: [create(BackendDescriptorSchema, { ...backend, capabilities: create(CapabilityManifestSchema, {
+        ...backend.capabilities!, capabilities: [...backend.capabilities!.capabilities, steer]
+      }) })],
+      sessions: [create(SessionSchema, { ...queueSnapshot.sessions[0]!, state: SessionState.RUNNING,
+        location: create(WorkspaceLocationSchema, { kind: { case: "serviceNode", value: {} } }) })],
+      queueItems: [...queueSnapshot.queueItems, { ...queueTwo, queueItemId: "active-queue", runId, state: QueueItemState.BACKEND_ACCEPTED }],
+      runs: [create(RunSchema, { runId, sessionId: "session", backendId: "backend", targetId: "target", state: RunState.RUNNING,
+        sourceQueueItemId: "active-queue" })]
+    });
+    const network = projectedNetwork(current);
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids());
+    try {
+      await app.start();
+      expect(app.taskQueueSteerRunId()).toBe(runId);
+      await expect(app.steerQueueItemNow(queueOne.queueItemId, "retired")).rejects.toThrow(/original turn/u);
+      expect(network.submit).not.toHaveBeenCalled();
+      await expect(app.steerQueueItemNow(queueOne.queueItemId, runId)).resolves.toBe(true);
+      const mutations = vi.mocked(network.submit).mock.calls.map(call => call[2]);
+      expect(mutations.map(operation => operation.payload.case)).toEqual(["setQueueItemEditLock", "editQueueItem", "setQueueItemEditLock"]);
+      expect(mutations[1]).toMatchObject({
+        preconditions: [
+          { entity: { kind: EntityKind.QUEUE_ITEM, id: queueOne.queueItemId }, expectedRevision: queueOne.version!.revision },
+          { entity: { kind: EntityKind.RUN, id: runId } }
+        ],
+        payload: { case: "editQueueItem", value: { queueItemId: queueOne.queueItemId,
+          deliveryMode: QueueDeliveryMode.STEER, input: queueOne.input, textSplices: [] } }
+      });
+    } finally {
+      await app.dispose();
+    }
   });
 
   it("locks, replaces, and unlocks one Queue item while revoking covered reference authority", async () => {

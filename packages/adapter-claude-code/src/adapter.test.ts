@@ -3134,7 +3134,7 @@ describe("ClaudeCodeAdapter", () => {
       const descriptor = await adapter.describe();
       expect(descriptor.capabilities.get("input.image")?.supported).toBe(true);
       expect(descriptor.capabilities.get("input.file")?.supported).toBe(true);
-      expect(descriptor.capabilities.get("input.mention")).toMatchObject({ supported: true, options: ["workspace_file", "workspace_directory", "workspace_line_range", "artifact"] });
+      expect(descriptor.capabilities.get("input.mention")).toMatchObject({ supported: true, options: ["workspace_file", "workspace_directory", "workspace_directory_queue_edit", "workspace_line_range", "artifact"] });
       const binding = await adapter.createSession(createInput({ target: workspaceTarget }), contextFor(undefined, { target: workspaceTarget }).context);
       const active = contextFor(binding, { target: workspaceTarget, operationId: "mixed-input" });
       await adapter.send({

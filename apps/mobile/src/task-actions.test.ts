@@ -183,6 +183,18 @@ describe("mobile accepted Queue actions", () => {
     }))).toBe(false);
   });
 
+  it("saves the newly selected Workspace directory as a typed Queue edit", () => {
+    const original = item("a", 1n).input;
+    const text = "Review @notes/ for decisions.";
+    const edit = editQueueItemText(original, text, [{ kind: "workspace", mentionId: "selected-notes", workspaceId: "workspace-one",
+      relativePath: "notes", displayText: "notes", directory: true, start: 7, end: 14 }]);
+    expect(edit?.input.parts.map(part => part.content)).toMatchObject([
+      { case: "text", value: text }, { case: "workspaceMention", value: { workspaceId: "workspace-one", relativePath: "notes", directory: true } }
+    ]);
+    expect(edit?.input.mentionRanges).toMatchObject([{ start: 7, end: 14, mentionIndex: 0 }]);
+    expect(edit?.textSplices).toMatchObject([{ start: 0, end: 6, replacementText: text }]);
+  });
+
   it("opens quote-bearing Queue input markerless and replaces the exact raw body only after a real edit", () => {
     const raw = "> <!-- joko-selection-quote -->\n> quoted\n\nKeep this";
     const structured = create(InputContentSchema, {

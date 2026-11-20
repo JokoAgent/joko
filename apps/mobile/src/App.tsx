@@ -21,7 +21,7 @@ import Constants from "expo-constants";
 import { randomUUID } from "expo-crypto";
 import * as Clipboard from "expo-clipboard";
 import {
-  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, InteractionState, ModelSourceKind, QueueItemState, RuntimeCommandInputMode, SessionState, TargetState, WorkspaceKind, capabilityNames, partnerResumeMessages,
+  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, InteractionState, ModelSourceKind, QueueItemState, QueueSourceKind, RuntimeCommandInputMode, SessionState, TargetState, WorkspaceKind, capabilityNames, partnerResumeMessages, queueQuotaRetryAt,
   partnerSessionTaskMessages, partnerSessionTaskReceiptLabel,
   type QueueItem, type Session
 } from "@joko/contracts";
@@ -4545,6 +4545,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   }, [messageFocusIndex, messageFocusKey, onReadingPositionHandled, readingFocus, readingFocusOwner]);
   const unknown = state.pending.some((item) => item.kind === "send" && item.sessionId === state.selectedId && item.state === "unknown");
   const queueItems = client.taskQueueItems();
+  const queueSteerRunId = client.taskQueueSteerRunId();
   const retryableQueueItems = workerReadOnly ? [] : client.taskRetryableQueueItems();
   const sharedQueueResume = state.taskSource?.kind === "joined" ? client.taskSharedQueueResumeControl() : undefined;
   const composerAvailable = state.status === "connected" || client.canQueueTaskInput?.() === true;
@@ -4615,6 +4616,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const sessionMentionOwnerRef = useRef(sessionMentionControls?.surfaceOwnerKey);
   const workspaceMentionControls = state.status === "connected" ? client.taskWorkspaceMentionControls() : undefined;
   const workspaceMentionOwnerRef = useRef(workspaceMentionControls?.surfaceOwnerKey);
+  const queueDirectoryControls = queueEdit && workspaceMentionControls?.policy.queueDirectories === true ? {
+    ...workspaceMentionControls, policy: { files: false, directories: true, lineRanges: false, queueDirectories: true as const }
+  } : undefined;
   const catalogMentionControls = state.status === "connected" ? client.taskCatalogMentionControls() : undefined;
   const catalogMentionOwnerRef = useRef(catalogMentionControls?.surfaceOwnerKey);
   const appCommandControls = state.status === "connected" ? client.taskAppCommandControls() : undefined;
@@ -6122,10 +6126,12 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     candidate: MobileWorkspaceMentionCandidate,
     lineRange?: MobileWorkspaceLineRange
   ): Promise<void> => {
-    const controls = workspaceMentionControls;
+    const queueOwner = queueEditRef.current;
+    const controls = queueOwner === undefined ? workspaceMentionControls : queueDirectoryControls;
     const identity = draftIdentityRef.current;
     if (!controls || controls.surfaceOwnerKey !== surfaceOwnerKey
-      || workspaceMentionOwnerRef.current !== surfaceOwnerKey || queueEditRef.current || !identity) {
+      || workspaceMentionOwnerRef.current !== surfaceOwnerKey || !identity
+      || queueOwner !== undefined && (!candidate.directory || lineRange !== undefined)) {
       setWorkspaceMentionsVisible(false);
       throw new Error(mobileMessage(locale, "task.error.workspaceReferenceChanged"));
     }
@@ -6135,7 +6141,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     const current = await client.validateTaskWorkspaceMentionCandidate(surfaceOwnerKey, candidate);
     const latestControls = client.taskWorkspaceMentionControls();
     if (!latestControls || latestControls.surfaceOwnerKey !== surfaceOwnerKey
-      || workspaceMentionOwnerRef.current !== surfaceOwnerKey || queueEditRef.current
+      || workspaceMentionOwnerRef.current !== surfaceOwnerKey || queueEditRef.current !== queueOwner
+      || queueOwner !== undefined && latestControls.policy.queueDirectories !== true
       || !draftIdentityRef.current
       || mobileComposerDraftIdentityKey(draftIdentityRef.current) !== mobileComposerDraftIdentityKey(identity)) {
       setWorkspaceMentionsVisible(false);
@@ -6147,7 +6154,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     }, randomUUID());
     setDraft(result.draft);
     setComposerSelection(result.selection);
-    mobileComposerDrafts.save(identity, result.draft);
+    if (queueOwner === undefined) mobileComposerDrafts.save(identity, result.draft);
     setWorkspaceMentionsVisible(false);
     setTimeout(() => composerInputRef.current?.focus(), 0);
   };
@@ -6775,6 +6782,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const cancelQueueEdit = (): void => {
     const active = queueEditRef.current;
     if (!active) return;
+    setWorkspaceMentionsVisible(false);
     setLocalError("");
     void client.cancelQueueEdit(active.lease).then(() => {
       if (!taskMountedRef.current || queueEditRef.current !== active) return;
@@ -6973,7 +6981,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         }
         return;
       }
-      if (!await client.saveQueueEdit(active.lease, draft.text, deliveryMode === QueueDeliveryMode.STEER ? deliveryMode : undefined)) return;
+      const directories = draft.mentions.flatMap(mention => mention.kind === "workspace" && mention.directory ? [mention] : []);
+      if (!await client.saveQueueEdit(active.lease, draft.text, deliveryMode === QueueDeliveryMode.STEER ? deliveryMode : undefined, directories)) return;
       if (queueEditRef.current !== active) return;
       queueEditRef.current = undefined;
       setQueueEdit(undefined);
@@ -7744,8 +7753,12 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         const editing = queueEdit?.lease.queueItemId === item.queueItemId;
         const disabled = state.busy || voice.busy || state.status !== "connected" || queueMutationPending || interactions.length > 0 || (!!queueEdit && !editing);
         const editableText = queueItemText(item.input);
+        const quotaRetryAt = queueQuotaRetryAt(item);
         return <View key={item.queueItemId} style={[styles.queueCard, { backgroundColor: colors.surface, borderColor: editing ? colors.accent : colors.border }]}>
           <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "task.queued")} {index + 1} · {queueState(item.state, locale)}{item.editLocked && !editing ? mobileMessage(locale, "task.editingElsewhere") : ""}</Text>
+          {quotaRetryAt !== undefined && <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "task.queueQuotaWait", {
+            time: new Date(quotaRetryAt).toLocaleString(locale)
+          })}</Text>}
           {item.sharedTaskAuthor?.displayName && <Text style={[styles.caption, { color: colors.muted }]}>{item.sharedTaskAuthor.displayName}</Text>}
           <Text selectable style={[styles.body, { color: colors.ink }]}>{queueItemSummary(item, locale)}</Text>
           <View style={styles.actionRow}>{client.taskQueueImagePages(item.queueItemId).map((image, imageIndex, images) =>
@@ -7758,6 +7771,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
                   .catch(failure => setLocalError(errorText(failure)));
               }} />)}</View>
           <View style={styles.queueActions}>
+            {queueCapabilities.edit && queueSteerRunId !== undefined && item.sourceKind === QueueSourceKind.UI && item.sharedTaskAuthor === undefined
+              && <Action label={mobileMessage(locale, "task.steerQueuedInput")} colors={colors} compact
+                disabled={disabled || editing || item.editLocked}
+                onPress={() => mutateQueue(() => client.steerQueueItemNow(item.queueItemId, queueSteerRunId))} />}
             {queueCapabilities.edit && client.taskQueueItemOwned(item) && <Action label={editing ? mobileMessage(locale, "composer.editing") : mobileMessage(locale, "common.edit")} colors={colors} compact
               disabled={disabled || editing || item.editLocked || editableText === undefined}
               onPress={() => void beginQueueEdit(item)} />}
@@ -7807,6 +7824,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           ? mobileMessage(locale, "composer.editingStructured")
           : mobileMessage(locale, "composer.editing")}
       </Text>
+      {queueDirectoryControls && <Action label={mobileMessage(locale, "composer.referenceWorkspace")} colors={colors} compact
+        disabled={state.status !== "connected" || state.busy} onPress={() => { Keyboard.dismiss(); setWorkspaceMentionsVisible(true); }} />}
       <Action label={mobileMessage(locale, "composer.cancelEdit")} colors={colors} compact disabled={state.status !== "connected" || state.busy}
         onPress={cancelQueueEdit} />
     </View>}
@@ -8328,8 +8347,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     <MobileSessionMentionSheet visible={sessionMentionsVisible && sessionMentionControls !== undefined} locale={locale}
       controls={sessionMentionControls} busy={state.busy} error={sessionMentionError} colors={colors}
       onClose={() => { setSessionMentionsVisible(false); setSessionMentionError(""); }} onSelect={insertSessionMention} />
-    <MobileWorkspaceMentionSheet visible={workspaceMentionsVisible && workspaceMentionControls !== undefined} locale={locale}
-      controls={workspaceMentionControls} busy={state.busy} colors={colors}
+    <MobileWorkspaceMentionSheet visible={workspaceMentionsVisible && (queueEdit ? queueDirectoryControls : workspaceMentionControls) !== undefined} locale={locale}
+      controls={queueEdit ? queueDirectoryControls : workspaceMentionControls} busy={state.busy} colors={colors}
       onClose={() => setWorkspaceMentionsVisible(false)}
       onLoadDirectory={(surfaceOwnerKey, parentPath, signal) => client.listTaskWorkspaceMentionDirectory(surfaceOwnerKey, parentPath, signal)}
       onLoadFileIndex={(surfaceOwnerKey, signal) => client.listTaskWorkspaceMentionFileIndex(surfaceOwnerKey, signal)}

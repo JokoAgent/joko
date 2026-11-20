@@ -18516,10 +18516,15 @@ async function dispatchMutation(
                 phase: "admission", retryable: false, stateMayHaveChanged: false, recovery: "Refresh the original task to see its current input options." });
             }
           }
+          const selectedRun = mutation.preconditions.find(condition => condition.entity?.kind === contract.EntityKind.RUN)?.entity?.id;
+          const boundPrompt = host.pinLocalCodexSteer(payload.value.sessionId, prompt, selectedRun, false);
+          if (boundPrompt.nativeSteerTarget !== undefined && overrides !== undefined) {
+            throw invalidArgument("A same-turn steer keeps the original turn's execution settings.");
+          }
           const queued = host.commitQueuedInput(store, {
             operationId,
             sessionId: payload.value.sessionId,
-            prompt,
+            prompt: boundPrompt,
             restoreArchived: true,
             ...(payload.value.providerGroupRebalance === undefined ? {} : { providerGroupRebalance: payload.value.providerGroupRebalance }),
             ...(overrides === undefined ? {} : { overrides })
@@ -18912,6 +18917,7 @@ async function dispatchMutation(
           return { accepted: true, resultCase: "queueItem", entityId: payload.value.queueItemId } satisfies OperationOutcome;
         }
       });
+      if (!execution.replayed) host.requestQueueDrain(current.sessionId);
       return presented(execution);
     }
     case "editQueueItem": {
@@ -18949,14 +18955,21 @@ async function dispatchMutation(
           if (durableRun.source !== "user" || durableRun.parentRunId !== undefined) {
             throw new StoreError("Only user-created queued input can be edited.");
           }
-          const prompt = dependencies.sessionHost.canonicalQueueItemEdit(durableCurrent, {
+          const canonical = dependencies.sessionHost.canonicalQueueItemEdit(durableCurrent, {
             ...publicPrompt,
             disposition: requestedDisposition ?? durableCurrent.disposition
           }, payload.value.textSplices.map((splice) => ({
             start: splice.start,
             end: splice.end,
             replacementText: splice.replacementText
-          })), attachmentEditGeneration);
+          })), attachmentEditGeneration, true);
+          const selectedRun = mutation.preconditions.find(condition => condition.entity?.kind === contract.EntityKind.RUN)?.entity?.id;
+          const prompt = requestedDisposition === "steer"
+            ? host.pinLocalCodexSteer(durableCurrent.sessionId, canonical, selectedRun, true)
+            : canonical;
+          if (prompt.nativeSteerTarget !== undefined && durableCurrent.executionOverrides !== undefined) {
+            throw invalidArgument("A same-turn steer keeps the original turn's execution settings.");
+          }
           dependencies.sessionHost.assertInputCapabilities(durableCurrent.sessionId, prompt);
           const updated = store.editQueueItem({
             queueItemId: durableCurrent.id,
@@ -18981,6 +18994,7 @@ async function dispatchMutation(
       return presented(execution);
     }
     case "reorderQueueItem": {
+      const queue = dependencies.store.getQueueItem(payload.value.queueItemId);
       requireEntityVersionPrecondition(
         mutation,
         contract.EntityKind.QUEUE_ITEM,
@@ -19014,6 +19028,7 @@ async function dispatchMutation(
           return { accepted: true, resultCase: "queueItem", entityId: payload.value.queueItemId } satisfies OperationOutcome;
         }
       });
+      if (!execution.replayed && !dependencies.store.getQueueControl(queue.sessionId).interactionLocked) host.requestQueueDrain(queue.sessionId);
       return presented(execution);
     }
     case "pauseQueue": {

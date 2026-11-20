@@ -294,6 +294,7 @@ import {
   QueueDispatchState,
   QueueEdge,
   QueueItemState,
+  queueQuotaRetryAt,
   QueueSourceKind,
   QueueTextEditSpliceSchema,
   ResourceAcquisitionSourceSchema,
@@ -2360,6 +2361,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   async send(sessionId: string, draft: ComposerDraft, admission: Parameters<OperationApi["send"]>[2]): Promise<void> {
     const scope = this.captureActionScope();
     const expectedGeneration = admission.expectedGeneration;
+    const steerRunId = draft.deliveryMode === "steer"
+      ? admission.expectedSteerRunId === undefined ? this.captureNativeSteerRunId(sessionId) : admission.expectedSteerRunId
+      : undefined;
+    if (steerRunId === null) throw new GatewayError("The original turn selected for steering is no longer active.");
     const edit = admission.messageEdit;
     if (expectedGeneration < 1n || expectedGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new GatewayError("Input requires the source task generation.");
@@ -2511,6 +2516,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       }
     };
     const preconditions: MutationPrecondition[] = [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration }];
+    if (steerRunId !== undefined) preconditions.push({ entity: { kind: EntityKind.RUN, id: steerRunId } });
     if (edit === undefined) {
       await this.submit(payload, false, preconditions, scope.signal);
       return;
@@ -4519,6 +4525,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const originalInput = requiredQueueInput(existing);
     const original = mapQueueItem(existing);
     const editorSource = queueItemEditProjection(original);
+    if (this.#taskSharing !== undefined && (edit.addedDirectories?.length ?? 0) > 0) {
+      throw new GatewayError("Changing workspace references in a queued input requires its task owner.");
+    }
     const sameEdit = equalQueueItemTextEdit(edit, editorSource);
     if (sameEdit && mode === original.mode && attachments === undefined) return;
     let input = sameEdit
@@ -4579,9 +4588,29 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     );
   }
 
-  async steerQueueItemNow(queueItemId: string, lockToken: string): Promise<void> {
+  captureNativeSteerRunId(sessionId: string): string | null | undefined {
+    if (this.#taskSharing !== undefined) return undefined;
+    const snapshot = this.#rawSnapshot;
+    const session = snapshot?.sessions.find(item => item.sessionId === sessionId);
+    if (snapshot === undefined || session?.location?.kind.case !== "serviceNode" || session.archived
+      || session.automationOrigin !== undefined || session.derivationOrigin?.sideChat === true) return undefined;
+    const backend = snapshot.backends.find(item => item.backendId === session.backendId);
+    const steer = backend?.capabilities?.capabilities.find(item => item.name === capabilityNames.turnSteer);
+    if (steer?.support !== CapabilitySupport.SUPPORTED || steer.options?.kind.case !== "turn"
+      || !steer.options.kind.value.sameTurn) return undefined;
+    const runs = snapshot.runs.filter(run => run.sessionId === sessionId && run.state === RunState.RUNNING
+      && snapshot.queueItems.some(item => item.sessionId === sessionId && item.runId === run.runId
+        && item.state === QueueItemState.BACKEND_ACCEPTED && item.deliveryMode === QueueDeliveryMode.PROMPT));
+    return runs.length === 1 ? runs[0]!.runId : null;
+  }
+
+  async steerQueueItemNow(queueItemId: string, lockToken: string, expectedSteerRunId?: string | null): Promise<void> {
     const existing = this.#rawSnapshot?.queueItems.find((item) => item.queueItemId === queueItemId);
     if (existing === undefined) throw new GatewayError("This queued input is no longer available.");
+    const steerRunId = expectedSteerRunId === undefined ? this.captureNativeSteerRunId(existing.sessionId) : expectedSteerRunId;
+    if (steerRunId === null) throw new GatewayError("The original turn selected for steering is no longer active.");
+    const preconditions: MutationPrecondition[] = [queueItemPrecondition(existing)];
+    if (steerRunId !== undefined) preconditions.push({ entity: { kind: EntityKind.RUN, id: steerRunId } });
     await this.submit({
       case: "editQueueItem",
       value: {
@@ -4590,7 +4619,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         deliveryMode: QueueDeliveryMode.STEER,
         lockToken
       }
-    }, true, [queueItemPrecondition(existing)]);
+    }, true, preconditions);
   }
 
   async pauseQueue(sessionId: string, reason = "Paused by user"): Promise<void> {
@@ -16354,6 +16383,7 @@ function mapQueueItem(item: QueueItem): QueueItemView {
   const pastedTextRanges = messageInputPastedTextRanges(item.input, text);
   const mentionRanges = messageInputMentionRanges(item.input, text, inputMentions.length, pastedTextRanges);
   const attachments = messageInputAttachments(item.input);
+  const quotaRetryAt = queueQuotaRetryAt(item);
   return {
     id: item.queueItemId,
     ...(item.sharedTaskAuthor === undefined ? {} : { sharedTaskAuthor: item.sharedTaskAuthor }),
@@ -16371,6 +16401,7 @@ function mapQueueItem(item: QueueItem): QueueItemView {
     ...(mentionRanges.length === 0 ? {} : { mentionRanges }),
     ...(attachments.length === 0 ? {} : { attachments }),
     state: queueState(item.state),
+    ...(quotaRetryAt === undefined ? {} : { quotaRetryAt }),
     ...(item.retryBeforeDispatch && item.state === QueueItemState.FAILED && item.runId ? { retryRunId: item.runId } : {}),
     editLocked: item.editLocked,
     ordinal: numberValue(item.ordinal),
@@ -22262,19 +22293,23 @@ function editedQueueInput(original: InputContent, edit: QueueItemTextEditView): 
   }
   const parts: InputContent["parts"] = [
     ...(edit.text.length === 0 ? [] : [create(InputPartSchema, { content: { case: "text", value: edit.text } })]),
-    ...retainedParts
+    ...retainedParts,
+    ...(edit.addedDirectories ?? []).map(directory => create(InputPartSchema, { content: { case: "workspaceMention", value: {
+      workspaceId: directory.workspaceId, relativePath: directory.path, displayText: directory.path, directory: true
+    } } }))
   ];
+  const ranges = [
+    ...mentionRanges.map(range => ({ start: range.start, end: range.end, mentionIndex: retainedMentionIndices.get(range.mentionIndex)! })),
+    ...(edit.addedDirectories ?? []).map((directory, index) => ({ start: directory.start, end: directory.end, mentionIndex: retainedMentionIndices.size + index }))
+  ].sort((left, right) => left.start - right.start);
+  messageInputMentionRanges({ mentionRanges: ranges }, edit.text, retainedMentionIndices.size + (edit.addedDirectories?.length ?? 0), pastedTextRanges);
   return create(InputContentSchema, {
     parts,
     ...(original.replyQuote ? { replyQuote: original.replyQuote } : {}),
     ...(original.todoQuote ? { todoQuote: original.todoQuote } : {}),
     quotesEncoded: false,
     pastedTextRanges: pastedTextRanges.map((range) => create(InlineTextRangeSchema, range)),
-    mentionRanges: mentionRanges.map((range) => create(InputMentionRangeSchema, {
-      start: range.start,
-      end: range.end,
-      mentionIndex: retainedMentionIndices.get(range.mentionIndex)!
-    }))
+    mentionRanges: ranges.map(range => create(InputMentionRangeSchema, range))
   });
 }
 

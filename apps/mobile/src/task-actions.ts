@@ -2,6 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import {
   CapabilitySupport,
   InputContentSchema,
+  InputMentionRangeSchema,
   InputPartSchema,
   QueueItemState,
   QueueTextEditSpliceSchema,
@@ -15,7 +16,7 @@ import {
 import type { TimelineRow } from "./timeline";
 import { appendMobileSelectionQuote, emptyMobileComposerDraft, insertMobileMessageReference,
   mobileSelectionQuoteMaximumCharacters, mobileVisibleSelectionQuoteText,
-  type MobileComposerDraft, type MobileComposerEditResult, type MobileComposerSelection } from "./mobile-composer-document";
+  type MobileComposerDraft, type MobileComposerEditResult, type MobileComposerSelection, type MobileComposerWorkspaceMention } from "./mobile-composer-document";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import { mobileSideChatCopy } from "./mobile-side-chat";
@@ -212,15 +213,21 @@ export function queueItemHasStructuredInput(input: InputContent | undefined): bo
 
 export function editQueueItemText(
   input: InputContent | undefined,
-  replacementText: string
+  replacementText: string,
+  directories: readonly MobileComposerWorkspaceMention[] = []
 ): { readonly input: InputContent; readonly textSplices: readonly QueueTextEditSplice[] } | undefined {
   const originalText = queueItemWireText(input);
   const visibleText = queueItemText(input);
   if (input === undefined || originalText === undefined || visibleText === undefined || !replacementText.trim()) return undefined;
-  if (replacementText === visibleText) return undefined;
-  const parts = [create(InputPartSchema, { content: { case: "text", value: replacementText } })];
+  if (replacementText === visibleText && directories.length === 0) return undefined;
+  const ordered = [...directories].sort((left, right) => left.start - right.start);
+  const parts = [create(InputPartSchema, { content: { case: "text", value: replacementText } }),
+    ...ordered.map(directory => create(InputPartSchema, { content: { case: "workspaceMention", value: {
+      workspaceId: directory.workspaceId, relativePath: directory.relativePath, displayText: directory.displayText, directory: true
+    } } }))];
   return {
-    input: create(InputContentSchema, { parts, ...(input.replyQuote ? { replyQuote: input.replyQuote } : {}), ...(input.todoQuote ? { todoQuote: input.todoQuote } : {}) }),
+    input: create(InputContentSchema, { parts, mentionRanges: ordered.map(({ start, end }, mentionIndex) => create(InputMentionRangeSchema, { start, end, mentionIndex })),
+      ...(input.replyQuote ? { replyQuote: input.replyQuote } : {}), ...(input.todoQuote ? { todoQuote: input.todoQuote } : {}) }),
     textSplices: [create(QueueTextEditSpliceSchema, {
       start: 0,
       end: originalText.length,

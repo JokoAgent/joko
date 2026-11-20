@@ -113,7 +113,7 @@ import { boundOneShotScheduleProvider, scheduleNativeSubscriptionKey } from "./s
 import type { ProviderGroupRuntime } from "./provider-group-runtime.js";
 import type { ProviderGroupSessionPort, ProviderGroupRecoveryLease, ProviderGroupRecoveryHandoff } from "./provider-group-service.js";
 import type { ProviderGroupAssignment } from "./provider-group-router.js";
-import { ProviderGroupUnavailableError, providerGroupFailureSignals } from "./provider-group-failure-policy.js";
+import { PROVIDER_GROUP_SUPERSEDED_ERROR, ProviderGroupUnavailableError, providerGroupFailureSignals } from "./provider-group-failure-policy.js";
 import type { InputHandoffTaskScope } from "./input-handoff/coordinator.js";
 import { operationBodyHash } from "@joko/store";
 import type { ArtifactStore } from "./artifact-store.js";
@@ -3614,6 +3614,64 @@ export class SessionHost {
     this.wakeBackendQueues(backendId);
   }
 
+  /** Called by the ordinary Owner queue mutations, before admission or an edit commits. */
+  pinLocalCodexSteer(sessionId: string, prompt: PromptInput, expectedRunId: string | undefined, allowManualPause: boolean): PromptInput {
+    if (prompt.disposition !== "steer") return prompt;
+    const session = this.#store.getSession(sessionId);
+    if (!this.isOrdinaryLocalCodexSession(session)) return prompt;
+    if (expectedRunId === undefined && prompt.nativeSteerTarget !== undefined) return prompt;
+    const runs = expectedRunId === undefined
+      ? listAllRuns(this.#store, { sessionId, activeOnly: true })
+      : [this.#store.getRun(expectedRunId)];
+    for (const { descriptor } of runs) {
+      const target = this.captureLocalCodexSteer(session, descriptor);
+      if (target !== undefined) return { ...prompt, nativeSteerTarget: { ...target, allowManualPause } };
+    }
+    throw inactiveCodexSteerTarget();
+  }
+
+  private captureLocalCodexSteer(session: StoredSession, run: RunDescriptor): Omit<NonNullable<PromptInput["nativeSteerTarget"]>, "allowManualPause"> | undefined {
+    const { id, backendId, binding } = session.descriptor;
+    if (run.sessionId !== id || run.state !== "running" || run.source !== "user"
+      || run.parentRunId !== undefined || run.activeAttemptId === undefined) return undefined;
+    const original = this.#store.findQueueItemByRunId(id, run.id);
+    const active = this.#active.get(id);
+    if (original === undefined || original.state !== "backend_accepted" || original.disposition !== "prompt"
+      || original.attemptId !== run.activeAttemptId || active === undefined || !this.isOwnerRunInput(original)
+      || original.backendInstanceGeneration !== active.backendInstanceGeneration
+      || this.#store.getBackend(backendId).descriptor.instanceGeneration !== active.backendInstanceGeneration) return undefined;
+    const attempt = this.#store.getAttempt(run.activeAttemptId).descriptor;
+    if (attempt.endedAt !== undefined || attempt.generation !== binding.generation) return undefined;
+    const owner = { queueItemId: original.id, attemptId: attempt.id, generation: attempt.generation };
+    const nativeTurnId = active.adapter.captureSteerTurnId?.(id, owner);
+    return nativeTurnId === undefined ? undefined : { ...owner, runId: run.id, nativeTurnId };
+  }
+
+  private isLocalCodexSteerCurrent(sessionId: string, target: NonNullable<PromptInput["nativeSteerTarget"]>): boolean {
+    const session = this.#store.getSession(sessionId);
+    const run = this.#store.findRun(target.runId)?.descriptor;
+    const live = run === undefined || !this.isOrdinaryLocalCodexSession(session) ? undefined : this.captureLocalCodexSteer(session, run);
+    return live !== undefined && live.queueItemId === target.queueItemId && live.attemptId === target.attemptId
+      && live.generation === target.generation && live.nativeTurnId === target.nativeTurnId;
+  }
+
+  private failRetiredLocalCodexSteer(item: QueueItemRecord): void {
+    this.#store.transaction(store => {
+      const current = store.getQueueItem(item.id);
+      if (current.revision !== item.revision || current.state !== "accepted") return;
+      const attempt = current.attemptId === undefined ? undefined : store.getAttempt(current.attemptId).descriptor;
+      const currentGeneration = store.getSession(item.sessionId).descriptor.binding.generation;
+      const retired = attempt !== undefined && attempt.generation !== currentGeneration;
+      const error = inactiveCodexSteerTarget().publicError;
+      const traceId = `dispatch:${item.id}:original-steer-retired`;
+      store.updateQueueState({ queueItemId: item.id, state: "failed", error, traceId,
+        ...(retired ? { projectionAttemptId: null } : {}) });
+      store.updateRunState({ runId: item.runId, state: "failed", error, traceId, operationId: item.operationId,
+        ...(attempt === undefined || retired ? {} : { activeAttemptId: attempt.id }) });
+      if (attempt !== undefined) store.finishAttempt(attempt.id, error);
+    });
+  }
+
   /** Called inside the caller's authorized Store transaction; no adapter effects run here. */
   canShareSession(sessionId: string): boolean {
     this.#assertOpen();
@@ -6987,7 +7045,8 @@ export class SessionHost {
       this.#cancelProviderGroupWait(sessionId);
       for (const setting of this.#store.listSettingsByKeyPrefix("session", sessionId, "provider.group-error:")) {
         const held = this.#heldProviderGroupRecovery(sessionId, setting.key.slice("provider.group-error:".length));
-        this.#store.deleteSetting("session", sessionId, setting.key);
+        if (held?.kind === "queue-head") this.#writeQueuedProviderGroupWait(held);
+        else this.#store.deleteSetting("session", sessionId, setting.key);
         if (held?.kind === "active-turn" && this.#store.getRun(held.runId).descriptor.state === "failed") {
           this.#publishHeldProviderGroupError(sessionId, held.runId, held.payload.error);
           if (this.#store.findQueueItemByRunId(sessionId, held.runId, { includeCleared: true })?.body.messagingOrigin) void this.notifyServiceRunSettled(sessionId, held.runId, "aborted");
@@ -7098,6 +7157,9 @@ export class SessionHost {
         || queue.operationId !== record.operationId || queue.attemptId !== record.attemptId || attempt.runId !== record.runId || attempt.generation !== record.generation
         || this.#store.findOperation(record.operationId)?.status !== "completed"
         || this.#store.findPendingSessionLifecycleCleanup(record.sessionId) || this.#store.findPendingScheduleDeletionCleanupForSession(record.sessionId)) return false;
+      if (record.kind === "queue-head" && (queue.state !== "accepted"
+        || this.#store.getRun(record.runId).descriptor.state !== "queued"
+        || this.#store.listQueueItems({ sessionId: record.sessionId, states: ["accepted"], limit: 1 })[0]?.id !== queue.id)) return false;
       if (session.backendId === record.backendId && session.binding.generation === record.generation && privatePromptDigest(session.binding.opaqueRef) === record.nativeFingerprint
         && providerGroupRuntimeProfileFingerprint(profile) === record.profileFingerprint) return true;
       const native = this.#runtimeHandoffs.read(record.sessionId), handoff = record.handoff ?? record.guestHandoff;
@@ -7112,6 +7174,14 @@ export class SessionHost {
   }
   #cancelProviderGroupWait(sessionId: string): void {
     const wait = this.#providerGroupWaits.get(sessionId); if (wait) clearTimeout(wait.timer); this.#providerGroupWaits.delete(sessionId);
+  }
+  #writeQueuedProviderGroupWait(original: HeldProviderGroupRecovery, next?: HeldProviderGroupRecovery): void {
+    const key = `provider.group-error:${original.runId}`;
+    this.#store.transaction(store => {
+      if (next === undefined) store.deleteSetting("session", original.sessionId, key);
+      else store.setSetting("session", original.sessionId, key, next);
+      store.setQueueQuotaWait(original.queueItemId, next?.resumeAt);
+    });
   }
   #scheduleProviderGroupWait(record: HeldProviderGroupRecovery): void {
     if (record.resumeAt === undefined || this.#disposed) return;
@@ -7152,7 +7222,13 @@ export class SessionHost {
         const run = this.#store.getRun(runId).descriptor, queue = this.#store.getQueueItem(held.queueItemId);
         const continuation = this.providerGroupContinuation(queue);
         if (continuation.claimed || run.state === "completed" || run.state === "aborted" || !this.#providerGroupRecoverySourceCurrent(held)) {
-          this.#store.deleteSetting("session", sessionId, setting.key); this.#cancelProviderGroupWait(sessionId);
+          if (held.kind === "queue-head") this.#writeQueuedProviderGroupWait(held);
+          else this.#store.deleteSetting("session", sessionId, setting.key);
+          if (this.#providerGroupWaits.get(sessionId)?.runId === runId) this.#cancelProviderGroupWait(sessionId);
+          if (held.kind === "queue-head") {
+            this.#providerGroups.service.router.clearTurn(sessionId);
+            this.providerGroupSessionPort().status(sessionId, "idle");
+          }
           if (continuation.child === undefined && run.state === "failed") this.#publishHeldProviderGroupError(sessionId, runId, held.payload.error);
           if (queue.body.messagingOrigin && run.state !== "completed") void this.notifyServiceRunSettled(sessionId, runId, run.state === "aborted" ? "aborted" : "failed");
           void this.drain(sessionId); continue;
@@ -7164,9 +7240,13 @@ export class SessionHost {
           || this.#store.getAttempt(held.attemptId).descriptor.endedAt === undefined
           || nativeDispatchRecoveryJournal(this.#store.findSetting("session", sessionId, SESSION_NATIVE_DISPATCH_RECOVERY_SETTING_KEY)?.value)?.entries.some(entry => entry.runId === runId))) continue;
         if (held.kind === "queue-head" && (run.state !== "queued" || queue.state !== "accepted")) continue;
-        if (held.resumeAt !== undefined && held.resumeAt > Date.now()) { this.#scheduleProviderGroupWait(held); continue; }
+        if (held.resumeAt !== undefined && held.resumeAt > Date.now()) {
+          if (held.kind === "queue-head") this.#store.setQueueQuotaWait(held.queueItemId, held.resumeAt);
+          this.#scheduleProviderGroupWait(held);
+          continue;
+        }
         if (held.kind === "queue-head") {
-          this.#store.setSetting("session", sessionId, setting.key, { ...held, resumeAt: undefined }); this.#cancelProviderGroupWait(sessionId);
+          this.#writeQueuedProviderGroupWait(held, { ...held, resumeAt: undefined }); this.#cancelProviderGroupWait(sessionId);
           this.#providerGroups.service.router.clearTurn(sessionId); void this.drain(sessionId);
         } else if (!(held.handoff || held.guestHandoff) || !["effect", "unknown"].includes(this.#runtimeHandoffs.read(sessionId)?.pending?.phase ?? "")) {
           void this.#recoverProviderGroup(sessionId, runId, held.payload.error);
@@ -7912,7 +7992,8 @@ export class SessionHost {
     current: QueueItemRecord,
     proposed: PromptInput,
     textSplices: readonly { readonly start: number; readonly end: number; readonly replacementText: string }[],
-    attachmentEditGeneration?: bigint
+    attachmentEditGeneration?: bigint,
+    allowNewDirectories = false
   ): PromptInput {
     assertPromptInlineTextRanges(current.body);
     assertPromptInlineTextRanges(proposed);
@@ -7952,8 +8033,10 @@ export class SessionHost {
     const attachments = sameQueuePublicAttachments(current.body, proposed)
       ? { images: current.body.images, files: current.body.files }
       : this.canonicalQueueAttachmentEdit(current, proposed, attachmentEditGeneration);
+    const { nativeSteerTarget, ...currentBody } = current.body;
+    const steer = proposed.disposition === "steer" && nativeSteerTarget !== undefined ? { nativeSteerTarget } : {};
     if (textSplices.length === 0 && sameQueuePublicText(current.body, proposed)) {
-      return { ...current.body, ...attachments, disposition: proposed.disposition };
+      return { ...currentBody, ...attachments, ...steer, disposition: proposed.disposition };
     }
     if (proposed.quotesEncoded === true) {
       throw inputCapabilityError(
@@ -7972,19 +8055,21 @@ export class SessionHost {
       !originallyInlineMentionIndexes.has(mentionIndex) || survivingInlineMentionIndexes.has(mentionIndex)
         ? [mentionIndex]
         : []);
-    const mentions = retainedMentionIndexes.map((mentionIndex) => current.body.mentions[mentionIndex]!);
+    const retainedMentions = retainedMentionIndexes.map((mentionIndex) => current.body.mentions[mentionIndex]!);
     const proposedMentionIndexes = new Map(
       retainedMentionIndexes.map((mentionIndex, proposedMentionIndex) => [mentionIndex, proposedMentionIndex] as const)
     );
-    const mentionRanges = replayed.mentionRanges.map((range) => ({
+    const retainedRanges = replayed.mentionRanges.map((range) => ({
       start: range.start,
       end: range.end,
       mentionIndex: proposedMentionIndexes.get(range.mentionIndex)!
     }));
+    const mentionRanges = proposed.mentionRanges ?? [];
+    const newMentions = proposed.mentions.slice(retainedMentions.length);
     if (
       proposed.text !== replayed.text
-      || !sameQueueArray(proposed.mentions, mentions, sameQueueMention)
-      || !sameQueueArray(proposed.mentionRanges ?? [], mentionRanges, (left, right) =>
+      || !sameQueueArray(proposed.mentions.slice(0, retainedMentions.length), retainedMentions, sameQueueMention)
+      || !sameQueueArray(mentionRanges.filter(range => range.mentionIndex < retainedMentions.length), retainedRanges, (left, right) =>
         left.start === right.start && left.end === right.end && left.mentionIndex === right.mentionIndex)
       || !sameQueueArray(proposed.pastedTextRanges ?? [], replayed.pastedTextRanges, (left, right) =>
         left.start === right.start && left.end === right.end && left.display === right.display)
@@ -7996,11 +8081,33 @@ export class SessionHost {
         "Queued input text and reference ranges do not match the replayed edit receipts."
       );
     }
+    if (newMentions.length > 0) {
+      const stored = this.#store.getSession(current.sessionId);
+      const target = this.#store.getTarget(stored.descriptor.targetId).descriptor;
+      const options = this.#store.getBackend(stored.descriptor.backendId).descriptor.capabilities.get("input.mention")?.options;
+      const workspaceId = this.inputWorkspaceId(current.sessionId);
+      if (!allowNewDirectories || !this.isOrdinaryLocalSession(stored) || !target.trusted || !this.isOwnerRunInput(current)
+        || options?.includes("workspace_directory_queue_edit") !== true
+        || !newMentions.every((mention, index) => {
+          if (mention.kind !== "workspace_directory" || mention.workspaceId !== workspaceId
+            || Buffer.byteLength(mention.reference, "utf8") > 4_096 || /[\\:*?"<>|\u0000-\u001f\u007f]/u.test(mention.reference)
+            || mention.reference.split("/").some(part => part === "" || part === "." || part === ".." || part.endsWith(".") || part.endsWith(" "))) return false;
+          const token = /\s/u.test(mention.reference) ? `@"${mention.reference}/"` : `@${mention.reference}/`;
+          const occurrences = mentionRanges.filter(range => range.mentionIndex === retainedMentions.length + index);
+          if (occurrences.length !== 1) return false;
+          const displayed = replayed.text.slice(occurrences[0]!.start, occurrences[0]!.end);
+          return displayed === token || mention.label.length > 0 && mention.label.length <= 256
+            && !/[\u0000-\u001f\u007f]/u.test(mention.label) && displayed === `@${mention.label}/`;
+        })) {
+        throw inputCapabilityError("INPUT_QUEUE_EDIT_REFERENCE_INVALID", "Queued input text and reference ranges do not match the replayed edit receipts.");
+      }
+    }
+    const mentions = [...retainedMentions, ...newMentions];
 
     const snapshotsByMentionIndex = new Map(
       currentSessionSnapshots.map((snapshot) => [snapshot.mentionIndex, snapshot] as const)
     );
-    const sessionReferenceSnapshots = mentions.flatMap((mention, mentionIndex) => {
+    const sessionReferenceSnapshots = retainedMentions.flatMap((mention, mentionIndex) => {
       if (mention.kind !== "session") return [];
       const originalMentionIndex = retainedMentionIndexes[mentionIndex]!;
       const snapshot = snapshotsByMentionIndex.get(originalMentionIndex);
@@ -8015,7 +8122,7 @@ export class SessionHost {
     const artifactSnapshotsByMentionIndex = new Map(
       currentArtifactSnapshots.map((snapshot) => [snapshot.mentionIndex, snapshot] as const)
     );
-    const artifactReferenceSnapshots = mentions.flatMap((mention, mentionIndex) => {
+    const artifactReferenceSnapshots = retainedMentions.flatMap((mention, mentionIndex) => {
       if (mention.kind !== "artifact" || mention.sourceSessionId === current.sessionId) return [];
       const originalMentionIndex = retainedMentionIndexes[mentionIndex]!;
       const snapshot = artifactSnapshotsByMentionIndex.get(originalMentionIndex);
@@ -8033,6 +8140,7 @@ export class SessionHost {
       artifactReferenceSnapshots: _untrustedArtifactSnapshots,
       automaticContinuation: _untrustedContinuation,
       objectiveContinuation: _untrustedObjectiveContinuation,
+      nativeSteerTarget: _untrustedNativeSteerTarget,
       inputHandoffContinuation: _untrustedInputHandoffContinuation,
       quotesEncoded: _untrustedQuotesEncoded,
       pastedTextRanges: _untrustedPastedTextRanges,
@@ -8047,6 +8155,7 @@ export class SessionHost {
       ...publicProposal,
       text: replayed.text,
       ...attachments,
+      ...steer,
       ...(current.body.replyQuote ? { replyQuote: current.body.replyQuote } : {}),
       ...(current.body.todoQuote ? { todoQuote: current.body.todoQuote } : {}),
       ...(current.body.messagingOrigin ? { messagingOrigin: current.body.messagingOrigin } : {}),
@@ -15147,6 +15256,13 @@ export class SessionHost {
     });
   }
 
+  private nextQueueItemForDispatch(sessionId: string): QueueItemRecord | undefined {
+    const control = this.#store.getQueueControl(sessionId);
+    if (control.paused && (control.pausedByConnectionId === undefined || control.resumeOnUserInput)) return undefined;
+    return this.#store.findAcceptedNativeSteer(sessionId, control.paused)
+      ?? (control.paused ? undefined : this.#store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0]);
+  }
+
   private async drain(sessionId: string): Promise<void> {
     // This synchronous prelude also runs when an older dispatcher still owns
     // the per-Session settlement. Newly committed work must become a durable
@@ -15198,12 +15314,12 @@ export class SessionHost {
           || this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined
           || this.#backendDispatchBlocked(this.#store.getSession(sessionId).descriptor.backendId)
         ) return;
-        // claimNextQueueItem intentionally returns undefined while paused. Exit
-        // instead of polling a durable control state in a synchronous loop;
-        // resumeQueue explicitly wakes this session after its commit.
-        if (this.#store.getQueueControl(sessionId).paused) return;
-        let pending = this.#store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0];
+        let pending = this.nextQueueItemForDispatch(sessionId);
         if (pending === undefined) return;
+        if (pending.body.nativeSteerTarget !== undefined && !this.isLocalCodexSteerCurrent(sessionId, pending.body.nativeSteerTarget)) {
+          this.failRetiredLocalCodexSteer(pending);
+          continue;
+        }
         if (this.localCodexPlanReviewBlocksDispatch(this.#store.getSession(sessionId))) return;
         if (this.#store.findMessagingInboundRequestByRunId(pending.runId)?.protectedContent === true
           && !this.#protectedMessagingPrompts.has(pending.id)) {
@@ -15216,16 +15332,30 @@ export class SessionHost {
           this.#failExpiredApplicationInput(pending);
           continue;
         }
-        if (this.#providerGroupApplies(pending)) {
+        if (pending.body.nativeSteerTarget === undefined && this.#providerGroupApplies(pending)) {
           if (listAllRuns(this.#store, { sessionId, activeOnly: true }).some(run => run.descriptor.id !== pending!.runId && run.descriptor.state !== "queued")) return;
+          const candidate = pending;
+          const queueIsCurrent = () => {
+            const control = this.#store.getQueueControl(sessionId);
+            if (control.paused || control.interactionLocked) return false;
+            const head = this.#store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0];
+            return head?.id === candidate.id && head.runId === candidate.runId && head.operationId === candidate.operationId && !head.editLocked;
+          };
+          if (!queueIsCurrent()) { this.scheduleQueueLockWakeup(sessionId); return; }
           try {
-            await this.#providerGroups!.service.beforeSend(sessionId, new AbortController().signal, pending.id);
+            await this.#providerGroups!.service.beforeSend(sessionId, new AbortController().signal, pending.id, () => {
+              if (!queueIsCurrent()) throw new Error(PROVIDER_GROUP_SUPERSEDED_ERROR);
+            });
             const held = this.#heldProviderGroupRecovery(sessionId, pending.runId);
             if (held?.kind === "queue-head" && held.queueItemId === pending.id) {
-              this.#store.deleteSetting("session", sessionId, `provider.group-error:${pending.runId}`); this.#cancelProviderGroupWait(sessionId);
+              this.#writeQueuedProviderGroupWait(held); this.#cancelProviderGroupWait(sessionId);
             }
           }
           catch (error) {
+            if (error instanceof Error && error.message === PROVIDER_GROUP_SUPERSEDED_ERROR && !queueIsCurrent()) {
+              this.#providerGroups!.service.router.clearTurn(sessionId);
+              continue;
+            }
             if (error instanceof ProviderGroupUnavailableError && error.retryAt !== undefined && error.retryAt > Date.now()
               && error.retryAt <= Date.now() + 8 * 24 * 60 * 60_000) {
               const previous = this.#heldProviderGroupRecovery(sessionId, pending.runId);
@@ -15234,14 +15364,14 @@ export class SessionHost {
                   stateMayHaveChanged: false, recovery: "Keep this queued input or explicitly cancel it." } }, "queue-head");
               if (captured && captured.attempts < 32 && this.#providerGroupRecoverySourceCurrent(captured)) {
                 const wait = { ...captured, resumeAt: Math.ceil(error.retryAt), attempts: captured.attempts + 1 };
-                this.#store.setSetting("session", sessionId, `provider.group-error:${pending.runId}`, wait); this.#scheduleProviderGroupWait(wait);
+                this.#writeQueuedProviderGroupWait(captured, wait); this.#scheduleProviderGroupWait(wait);
               }
             }
             this.providerGroupSessionPort().status(sessionId, "unavailable");
             this.recordFailure("provider_group_before_send", error); return;
           }
-          if (this.#store.getQueueControl(sessionId).paused) return;
-          pending = this.#store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0]; if (!pending) return;
+          pending = this.nextQueueItemForDispatch(sessionId); if (!pending) return;
+          if (pending.id !== candidate.id) continue;
         }
         // Authentication is an admission fence, not a turn-serialization
         // concern. Fail a newly durable item before any context rebuild,
@@ -15286,9 +15416,14 @@ export class SessionHost {
         // Inspection yields to queue control, cancellation, reordering, and
         // native events. Re-read every durable precondition, then perform the
         // final barrier check and claim synchronously so they cannot race.
-        if (this.#store.getQueueControl(sessionId).paused || this.restoringTurnOverrides(sessionId)) return;
-        pending = this.#store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0];
+        if (this.restoringTurnOverrides(sessionId)) return;
+        pending = this.nextQueueItemForDispatch(sessionId);
         if (pending === undefined) return;
+        const nativeSteer = pending.body.nativeSteerTarget;
+        if (nativeSteer !== undefined && !this.isLocalCodexSteerCurrent(sessionId, nativeSteer)) {
+          this.failRetiredLocalCodexSteer(pending);
+          continue;
+        }
         // Classification/reordering awaited Backend state. Never let its
         // bypass authorization transfer to a different item that was moved or
         // cancelled concurrently; restart the decision against durable truth.
@@ -15356,6 +15491,7 @@ export class SessionHost {
             return store.claimNextQueueItem({
               sessionId,
               backendInstanceGeneration: claimBackendInstanceGeneration,
+              ...(nativeSteer === undefined ? {} : { nativeSteerQueueItemId: candidate.id }),
               traceId: `dispatch:${candidate.id}`
             });
           });
@@ -15378,7 +15514,7 @@ export class SessionHost {
         try {
           let active: ActiveSession | undefined;
           try {
-            active = await this.activate(
+            active = nativeSteer !== undefined ? this.#active.get(sessionId) : await this.activate(
               sessionId,
               this.effectiveQueueProviderId(item, this.#store.getSession(sessionId))
             );
@@ -15399,6 +15535,7 @@ export class SessionHost {
             }
           }
           dispatchPreparation.cancellation.signal.throwIfAborted();
+          if (nativeSteer !== undefined && !this.isLocalCodexSteerCurrent(sessionId, nativeSteer)) throw inactiveCodexSteerTarget();
           if (active === undefined) throw new Error("Session activation returned no active runtime.");
           this.assertQueueProviderAuthentication(item, this.#store.getSession(sessionId));
           if (
@@ -15449,7 +15586,7 @@ export class SessionHost {
           this.assertQueueProviderAuthentication(item, stored);
           const target = this.targetForSession(stored);
           // The local scanner cannot attest to paths on a Source's Device.
-          if (this.#workspaceCapture !== undefined && !reviewReadOnly && !this.isSourceDeviceTarget(target)) {
+          if (this.#workspaceCapture !== undefined && !reviewReadOnly && nativeSteer === undefined && !this.isSourceDeviceTarget(target)) {
             let navigationAnchor: import("@joko/core").NativeNavigationAnchor | undefined;
             if (active.adapter.getNativeHistoryProjection !== undefined) {
               const captureLease = this.beginActiveBackendSideEffect(sessionId, active);
@@ -15660,7 +15797,7 @@ export class SessionHost {
           sending.documentPathDispatch = this.#captureDocumentPathDispatch(item, sending, stored, sendContext);
           const pendingAcceptance: PendingDispatchAcceptance = {};
           this.#pendingDispatchAcceptances.set(run.descriptor.id, pendingAcceptance);
-          if (!reviewReadOnly) {
+          if (!reviewReadOnly && nativeSteer === undefined) {
             const profile = this.getSessionRuntimeControl(sessionId).effective;
             if (profile) this.#captureProviderGroupUsage(run.descriptor.id, sessionId, item.executionOverrides?.providerId && item.executionOverrides.modelId
               ? { ...profile, providerId: item.executionOverrides.providerId, modelId: item.executionOverrides.modelId } : profile);
@@ -15672,6 +15809,7 @@ export class SessionHost {
             ? scheduleNativeSubscriptionKey(scheduleAdmission.body["executionSnapshot"]) : undefined;
           const send = () => {
             telegramHistory?.assertCurrent();
+            if (nativeSteer !== undefined && !this.isLocalCodexSteerCurrent(sessionId, nativeSteer)) throw inactiveCodexSteerTarget();
             if (!reviewReadOnly && sending.adapter.sendWithDurableNativeDispatchFence !== undefined) {
               return sending.adapter.sendWithDurableNativeDispatchFence(dispatchBody, sendContext, async (preparation) => {
                 if (scheduleAccountKey !== undefined) {
@@ -15748,6 +15886,16 @@ export class SessionHost {
                 resources: dispatchResources,
                 mentions: dispatchBody.mentions
               });
+            }
+            if (nativeSteer !== undefined) {
+              // The steer acknowledged delivery into an existing turn. Only
+              // that turn's original Run owns any later native completion.
+              const traceId = `dispatch:${item.id}:steered`;
+              store.updateQueueState({ queueItemId: item.id, state: "completed", attemptId, traceId });
+              store.updateRunState({ runId: run.descriptor.id, state: "completed", activeAttemptId: attemptId,
+                endedAt: Date.now(), traceId, operationId: item.operationId, suppressTerminalAttention: true });
+              if (attemptId !== undefined) store.finishAttempt(attemptId);
+              removeNativeDispatchRecoveryEntry(store, sessionId, run.descriptor.id);
             }
           });
           appContext?.consume();
@@ -15840,8 +15988,10 @@ export class SessionHost {
               : "Start a new review after checking provider and artifact availability."
           } : adapterFailure;
           const uncertain = failure.stateMayHaveChanged;
-          this.#providerGroups?.service.turnSettled(sessionId, false);
-          this.#providerGroups?.reporter.leasesChanged();
+          if (nativeSteer === undefined) {
+            this.#providerGroups?.service.turnSettled(sessionId, false);
+            this.#providerGroups?.reporter.leasesChanged();
+          }
           if (dispatchPreparation.phase === "sending" && item.disposition === "steer"
             && error instanceof JokoError && failure.code === "PI_STEER_REQUIRES_ACTIVE_RUN" && !uncertain
             && this.#extensionTargetSteerFallback !== undefined
@@ -21312,6 +21462,14 @@ export function withSessionReferenceCapability(descriptor: BackendDescriptor): B
     ...descriptor,
     capabilities: new Map(descriptor.capabilities).set("input.mention", { ...mention, options })
   };
+}
+
+function inactiveCodexSteerTarget(): JokoError {
+  return new JokoError({
+    code: "CODEX_ACTIVE_TURN_REQUIRED", message: "The original Codex turn selected for steering is no longer active.",
+    phase: "dispatch", retryable: false, stateMayHaveChanged: false,
+    recovery: "Select the current turn or send the input as a new prompt."
+  });
 }
 
 function inputCapabilityError(code: string, message: string): JokoError {

@@ -62,7 +62,7 @@ import {
   DeleteScheduleRunMutationSchema, LogoutConnectionMutationSchema, MarkAllScheduleRunsReadMutationSchema,
   MarkScheduleRunReadMutationSchema, MarkScheduleRunsReadMutationSchema, NavigateSessionBranchMutationSchema,
   OperationPreconditionSchema, OperationState, OperationMutationSchema, PerTurnOverridesSchema, RewindSafety,
-  MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueDispatchState, QueueItemState, RenameSessionMutationSchema, TaskTagColor,
+  MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueDispatchState, QueueItemState, QueueSourceKind, RenameSessionMutationSchema, TaskTagColor,
   ReorderQueueItemMutationSchema, ResetSessionMutationSchema, ResolveInteractionMutationSchema, RestartScheduleRunMutationSchema, RetryRunMutationSchema,
   DeviceSchema, RenameDeviceMutationSchema, ResetDeviceNameMutationSchema, RevisionSchema, RevokeDeviceMutationSchema,
   CloneProjectScheduleToUserMutationSchema, PromoteScheduleToProjectMutationSchema,
@@ -264,6 +264,7 @@ import {
   mobileComposerDraftsEqual,
   mobileComposerInput,
   normalizeMobileComposerDraft,
+  type MobileComposerWorkspaceMention,
   plainTextMobileComposerDraft,
   recoverMobileComposerDraft,
   type MobileComposerDraft
@@ -12312,6 +12313,24 @@ export class MobileClient {
     return !this.#joinedTask || mobileSharedTaskAuthorMatches(this.#joinedTask.source, item.sharedTaskAuthor);
   }
 
+  taskQueueSteerRunId(): string | undefined {
+    const session = this.#selectedSession();
+    const detail = this.#state.detail;
+    if (this.#joinedTask || !this.#taskAuthorityKey() || !session || !detail || session.archived
+      || session.location?.kind.case !== "serviceNode" || session.automationOrigin !== undefined
+      || session.derivationOrigin?.sideChat === true) return undefined;
+    const backend = this.#selectedBackend(session);
+    const steer = backend?.capabilities?.capabilities.find(item => item.name === capabilityNames.turnSteer);
+    if (!mobileQueueCapabilities(backend).edit || steer?.support !== CapabilitySupport.SUPPORTED
+      || steer.options?.kind.case !== "turn" || !steer.options.kind.value.sameTurn) return undefined;
+    const run = uniqueValue(detail.runs, candidate => candidate.sessionId === session.sessionId
+      && candidate.state === RunState.RUNNING
+      && detail.queueItems.some(item => item.sessionId === session.sessionId && item.runId === candidate.runId
+        && item.state === QueueItemState.BACKEND_ACCEPTED && item.deliveryMode === QueueDeliveryMode.PROMPT
+        && item.sourceKind === QueueSourceKind.UI && item.sharedTaskAuthor === undefined));
+    return run?.runId;
+  }
+
   taskRuntimeControls(): MobileRuntimeControls | undefined {
     if (this.#joinedTask) return resolveMobileSharedRuntimeControls(this.#state.detail, this.#taskAuthorityKey());
     const credential = this.#credential;
@@ -15260,28 +15279,57 @@ export class MobileClient {
     } finally { this.#releaseMutation(action); }
   }
 
-  async saveQueueEdit(lease: MobileQueueEditLease, text: string, deliveryMode?: QueueDeliveryMode): Promise<boolean> {
+  async saveQueueEdit(lease: MobileQueueEditLease, text: string, deliveryMode?: QueueDeliveryMode,
+    directories: readonly MobileComposerWorkspaceMention[] = []): Promise<boolean> {
     this.#assertQueueEditLease(lease);
     const { item, capabilities } = this.#queueItemContext(lease.queueItemId);
     if (!capabilities.edit) throw new Error("This Backend no longer supports editing queued input.");
-    if (queueItemText(item.input) === text && (deliveryMode === undefined || deliveryMode === item.deliveryMode)) {
+    if (directories.length > 0) {
+      const controls = this.taskWorkspaceMentionControls();
+      if (controls?.policy.queueDirectories !== true || directories.some(directory => !directory.directory
+        || directory.lineRange !== undefined || directory.workspaceId !== controls.workspaceId)) {
+        throw new Error("The original queued input no longer supports edits to Workspace directories.");
+      }
+    }
+    if (directories.length === 0 && queueItemText(item.input) === text && (deliveryMode === undefined || deliveryMode === item.deliveryMode)) {
       await this.cancelQueueEdit(lease);
       return true;
     }
-    const edit = editQueueItemText(item.input, text);
+    const edit = editQueueItemText(item.input, text, directories);
     if (!edit) throw new Error("Use non-empty text that the current queued-input editor can represent.");
+    return this.#submitQueueEdit(lease, item, create(EditQueueItemMutationSchema, {
+      queueItemId: item.queueItemId, input: edit.input, deliveryMode: deliveryMode ?? item.deliveryMode,
+      lockToken: lease.lockToken, textSplices: [...edit.textSplices]
+    }));
+  }
+
+  async steerQueueItemNow(queueItemId: string, expectedRunId: string): Promise<boolean> {
+    if (this.taskQueueSteerRunId() !== expectedRunId) throw new Error("The original turn is no longer available for steering.");
+    const lease = await this.beginQueueEdit(queueItemId);
+    try {
+      this.#assertQueueEditLease(lease);
+      const { item } = this.#queueItemContext(queueItemId);
+      if (!item.input || item.sourceKind !== QueueSourceKind.UI || item.sharedTaskAuthor !== undefined
+        || this.taskQueueSteerRunId() !== expectedRunId) throw new Error("The original turn or queued input is no longer available.");
+      return await this.#submitQueueEdit(lease, item, create(EditQueueItemMutationSchema, {
+        queueItemId, input: item.input, deliveryMode: QueueDeliveryMode.STEER, lockToken: lease.lockToken
+      }), expectedRunId);
+    } finally {
+      await this.cancelQueueEdit(lease).catch(() => {
+        if (this.#queueEditLease === lease) this.#releaseQueueEditLeaseDetached(lease);
+      });
+    }
+  }
+
+  async #submitQueueEdit(lease: MobileQueueEditLease, item: QueueItem, edit: import("@joko/contracts").EditQueueItemMutation,
+    expectedRunId?: string): Promise<boolean> {
     const action = this.#claimMutation();
     let result: TrackedMutationResult | undefined;
     try {
       result = await this.#submitTerminal(create(OperationMutationSchema, {
-        preconditions: [this.#queueItemPrecondition(item)],
-        payload: { case: "editQueueItem", value: create(EditQueueItemMutationSchema, {
-          queueItemId: item.queueItemId,
-          input: edit.input,
-          deliveryMode: deliveryMode ?? item.deliveryMode,
-          lockToken: lease.lockToken,
-          textSplices: [...edit.textSplices]
-        }) }
+        preconditions: [this.#queueItemPrecondition(item),
+          ...(expectedRunId === undefined ? [] : [{ entity: { kind: EntityKind.RUN, id: expectedRunId } }])],
+        payload: { case: "editQueueItem", value: edit }
       }), { kind: "queue-edit", sessionId: lease.sessionId, queueItemId: lease.queueItemId });
       if (result.definitive) await this.#releaseQueueEditLease(lease).catch(() => {
         if (this.#queueEditLease === lease) this.#releaseQueueEditLeaseDetached(lease);

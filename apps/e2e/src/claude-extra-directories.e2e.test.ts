@@ -1,9 +1,10 @@
 import { mkdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { create } from "@bufbuild/protobuf";
+import { create, fromBinary } from "@bufbuild/protobuf";
 import { ClaudeCodeAdapter } from "@joko/adapter-claude-code";
-import { capabilityNames, EntityKind, ExtraDirectoryAccess, InputPartSchema, OperationMutationSchema, OperationPreconditionSchema, OperationState, PerTurnOverridesSchema, QueueItemState, StateImpact } from "@joko/contracts";
+import { capabilityNames, EntityKind, ExtraDirectoryAccess, InputMentionRangeSchema, InputPartSchema, ListWorkspaceEntriesRequestSchema, ListWorkspaceEntriesResponseSchema, OperationMutationSchema, OperationPreconditionSchema, OperationState, PerTurnOverridesSchema, QueueItemState, StateImpact, WorkspaceEntryKind } from "@joko/contracts";
+import { chromium } from "playwright-core";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { ControlledClaudeRuntime } from "./controlled-claude-runtime.js";
@@ -11,6 +12,7 @@ import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import { createSessionMutation, queueItemIdFrom, queueRunIdFrom, retryRunMutation, runIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 
 const BACKEND_ID = "claude-directory-product";
+const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim() ? it : it.skip;
 let fixture: OrchestratorE2eFixture | undefined;
 
 afterEach(async () => {
@@ -236,9 +238,85 @@ it.each(["missing before preparation", "replaced during the native history read"
     await waitFor(async () => store.getRun(continuation).descriptor.state, state => state === "completed", "directory retry completion");
   }, 30_000);
 
-async function directoryFixture() {
+mountedIt("replaces the selected directory of an existing queued Claude input from its mounted editor", { timeout: 90_000 }, async () => {
+  const setup = await directoryFixture(process.env.JOKO_MOUNTED_WEB_DIR);
+  const system = fixture!;
+  const { runtime, store, paired } = setup;
+  await Promise.all(["docs", "notes"].map(path => mkdir(join(system.workspaceDirectory, path))));
+  const sessionId = await setup.createSession("Queued directory edit");
+  const activeRun = await setup.send(sessionId, "Finish the current work first.");
+  await waitFor(async () => store.getRun(activeRun).descriptor.state, value => value === "running", "the active original Claude turn");
+  const initial = sendInputMutation(sessionId, BigInt(store.getSession(sessionId).descriptor.binding.generation), "Review @docs/ for decisions.");
+  if (initial.payload.case !== "sendInput") throw new Error("Expected the original queued input.");
+  initial.payload.value.input!.parts.push(create(InputPartSchema, { content: { case: "workspaceMention", value: {
+    workspaceId: "workspace-main", relativePath: "docs", displayText: "docs", directory: true
+  } } }));
+  initial.payload.value.input!.mentionRanges.push(create(InputMentionRangeSchema, { start: 7, end: 13, mentionIndex: 0 }));
+  const submitted = await submit(paired.clients.operation, paired.connectionId, initial);
+  expect(submitted.state).toBe(OperationState.SUCCEEDED);
+  const queuedId = queueItemIdFrom(submitted);
+  const original = store.getQueueItem(queuedId);
+  expect(original.state).toBe("accepted");
+
+  const browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+  try {
+    const device = "Queued directory Browser";
+    const challenge = (await system.anonymous.connection.beginPairing({ deviceDisplayName: device })).challenge!;
+    const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: system.baseUrl });
+    await page.goto(`${system.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
+    await page.getByRole("button", { name: "Add Joko node", exact: true }).click();
+    await page.locator('details.device-authorization__manual > summary').click();
+    await page.getByLabel("Joko node address").fill(system.baseUrl);
+    await page.getByLabel("Pairing code").fill(system.pairingCode(challenge.challengeId));
+    await page.getByLabel("Device name").fill(device);
+    await page.locator("form.pair-form button[type=submit]").click();
+
+    const row = page.locator(`[data-queue-item-id="${queuedId}"]`);
+    await row.getByRole("button", { name: "Edit queued input", exact: true }).click();
+    const editor = row.getByRole("textbox", { name: "Queued input text" });
+    const save = row.getByRole("button", { name: "Save", exact: true });
+    await waitFor(() => save.isEnabled(), value => value, "the saved edit lease before pasting");
+    await editor.focus();
+    await editor.evaluate(element => (element as HTMLTextAreaElement).setSelectionRange(7, 13));
+    const newPath = join(system.workspaceDirectory, "notes");
+    await page.evaluate(value => navigator.clipboard.writeText(value), newPath);
+    const listed = page.waitForResponse(response => {
+      if (!response.url().endsWith("/joko.v1.WorkspaceService/ListWorkspaceEntries")) return false;
+      const body = response.request().postDataBuffer();
+      if (body === null) return false;
+      const request = fromBinary(ListWorkspaceEntriesRequestSchema, body);
+      return request.workspaceId === "workspace-main" && request.parentRelativePath === "" && request.includeHidden;
+    }, { timeout: 10_000 });
+    await editor.press("ControlOrMeta+V");
+    const listing = await listed;
+    expect(listing.ok()).toBe(true);
+    expect(fromBinary(ListWorkspaceEntriesResponseSchema, await listing.body()).entries).toContainEqual(expect.objectContaining({
+      relativePath: "notes", kind: WorkspaceEntryKind.DIRECTORY
+    }));
+    const updatedText = "Review @notes/ for decisions.";
+    await waitFor(() => editor.inputValue(), value => value === updatedText, "the selected replacement directory in the original editor");
+    await save.click();
+    const edited = await waitFor(async () => store.getQueueItem(queuedId), item => item.body.text === updatedText && !item.editLocked,
+      "the original queued input to save and unlock");
+    expect(edited).toMatchObject({ id: original.id, runId: original.runId, position: original.position, state: "accepted",
+      body: { text: updatedText, mentions: [{ kind: "workspace_directory", workspaceId: "workspace-main", reference: "notes", label: "notes" }],
+        mentionRanges: [{ start: 7, end: 14, mentionIndex: 0 }] } });
+    expect(edited.body.mentions).toHaveLength(1);
+    const query = runtime.queries[0]!;
+    expect(query.receivedInputs).toHaveLength(1);
+    query.complete("The original turn is finished.");
+    await waitFor(async () => store.getQueueItem(queuedId).state, value => value === "backend_accepted", "the edited input's native handoff");
+    expect(query.receivedInputs).toHaveLength(2);
+    expect(query.receivedInputs[1]?.message.content).toBe(`${updatedText}\n\nWorkspace directory reference: ${JSON.stringify({ name: "notes", path: newPath })}`);
+    query.complete("The notes directory was selected.");
+    await waitFor(async () => store.getRun(original.runId).descriptor.state, value => value === "completed", "the edited original Run to settle");
+  } finally { await browser.close(); }
+});
+
+async function directoryFixture(webDirectory?: string) {
   const runtime = new ControlledClaudeRuntime();
-  fixture = await OrchestratorE2eFixture.start({ profiles: [], backendFactories: [{ instanceId: BACKEND_ID,
+  fixture = await OrchestratorE2eFixture.start({ profiles: [], webDirectory, backendFactories: [{ instanceId: BACKEND_ID,
     adapterKind: "claude-agent-sdk-stdio", displayName: "Claude directory product fixture", create: ({ generation }) =>
       new ClaudeCodeAdapter({ id: BACKEND_ID, instanceGeneration: generation, runtime, environment: {},
         initializationTimeoutMs: 500, admissionTimeoutMs: 500, teardownTimeoutMs: 100 }) }] });

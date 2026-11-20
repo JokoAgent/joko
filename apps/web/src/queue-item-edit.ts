@@ -1,13 +1,12 @@
 import type {
   QueueItemTextEditView,
-  QueueItemView,
-  TimelineInlineTextRangeView,
-  TimelineInputMentionRangeView
+  QueueItemView
 } from "./model.js";
 import {
   SELECTION_QUOTE_BLOCK_MARKER_LINE,
   visibleSelectionQuoteMessageText
 } from "./selection-quote.js";
+import { serializeComposerMentionPath } from "./composer-mention-path.js";
 
 /**
  * Build the plain queue editor projection from the canonical queued input.
@@ -77,12 +76,23 @@ export function remapQueueItemTextEdit(
     text: nextText,
     mentionRanges: remapRanges(previous.mentionRanges, editStart, previousEnd, delta),
     pastedTextRanges: remapRanges(previous.pastedTextRanges, editStart, previousEnd, delta),
+    ...(previous.addedDirectories === undefined ? {} : { addedDirectories: remapRanges(previous.addedDirectories, editStart, previousEnd, delta) }),
     textSplices: [...previous.textSplices, {
       start: editStart,
       end: previousEnd,
       replacementText: nextText.slice(editStart, nextEnd)
     }]
   };
+}
+
+export function insertQueueDirectory(edit: QueueItemTextEditView, workspaceId: string, path: string, start: number, end: number): QueueItemTextEditView {
+  const token = serializeComposerMentionPath(path, true);
+  const before = edit.text.slice(0, start), after = edit.text.slice(end);
+  const prefix = /\S$/u.test(before) ? " " : "", suffix = /^\S/u.test(after) ? " " : "";
+  const updated = remapQueueItemTextEdit(edit, `${before}${prefix}${token}${suffix}${after}`,
+    { selectionStart: start, selectionEnd: end, inputType: "insertReplacementText" });
+  return { ...updated, addedDirectories: [...(updated.addedDirectories ?? []), { workspaceId, path,
+    start: start + prefix.length, end: start + prefix.length + token.length }] };
 }
 
 export interface QueueItemTextEditTransaction {
@@ -93,6 +103,12 @@ export interface QueueItemTextEditTransaction {
 
 export function equalQueueItemTextEdit(left: QueueItemTextEditView, right: QueueItemTextEditView): boolean {
   return left.text === right.text
+    && (left.addedDirectories?.length ?? 0) === (right.addedDirectories?.length ?? 0)
+    && (left.addedDirectories ?? []).every((directory, index) => {
+      const other = right.addedDirectories?.[index];
+      return other !== undefined && directory.workspaceId === other.workspaceId && directory.path === other.path
+        && directory.start === other.start && directory.end === other.end;
+    })
     && left.mentionRanges.length === right.mentionRanges.length
     && left.mentionRanges.every((range, index) => {
       const other = right.mentionRanges[index];
@@ -127,7 +143,7 @@ function unownedTextEdit(previous: QueueItemTextEditView, text: string): QueueIt
   };
 }
 
-function remapRanges<T extends TimelineInputMentionRangeView | TimelineInlineTextRangeView>(
+function remapRanges<T extends { readonly start: number; readonly end: number }>(
   ranges: readonly T[],
   editStart: number,
   previousEditEnd: number,

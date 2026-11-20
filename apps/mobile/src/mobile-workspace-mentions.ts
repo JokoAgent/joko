@@ -25,6 +25,7 @@ export interface MobileWorkspaceMentionPolicy {
   readonly files: boolean;
   readonly directories: boolean;
   readonly lineRanges: boolean;
+  readonly queueDirectories?: true;
 }
 
 export interface MobileWorkspaceMentionControls {
@@ -60,6 +61,7 @@ export function createMobileNewTaskWorkspaceMentionControls(
       workspace.displayName,
       policy.files ? "file" : "",
       policy.directories ? "directory" : "",
+      policy.queueDirectories ? "queue-directory" : "",
       policy.lineRanges ? "lines" : ""
     ].join("\u001f"),
     targetId: target.targetId,
@@ -139,6 +141,7 @@ export function createMobileWorkspaceMentionControls(
     ownerWorkspace.displayName,
     ownerPolicy.files ? "file" : "",
     ownerPolicy.directories ? "directory" : "",
+    ownerPolicy.queueDirectories ? "queue-directory" : "",
     ownerPolicy.lineRanges ? "lines" : ""
   ].join("\u001f");
   return {
@@ -163,11 +166,12 @@ export function mobileWorkspaceMentionPolicy(
     ? capabilities[0]!.options.kind.value.mediaTypes
     : [];
   if (options.length === 0 || new Set(options).size !== options.length) return undefined;
+  const trustedLocal = workspace?.trusted === true && workspace.location?.kind.case === "serviceNode";
   const policy = {
     files: options.includes("workspace_file"),
-    directories: options.includes("workspace_directory") || options.includes("workspace_directory_local")
-      && workspace?.trusted === true && workspace.location?.kind.case === "serviceNode",
-    lineRanges: options.includes("workspace_file") && options.includes("workspace_line_range")
+    directories: options.includes("workspace_directory") || options.includes("workspace_directory_local") && trustedLocal,
+    lineRanges: options.includes("workspace_file") && options.includes("workspace_line_range"),
+    ...(trustedLocal && options.includes("workspace_directory_queue_edit") ? { queueDirectories: true as const } : {})
   };
   return policy.files || policy.directories ? policy : undefined;
 }
@@ -317,7 +321,8 @@ function entityKey(version: {
 }
 
 function samePolicy(left: MobileWorkspaceMentionPolicy, right: MobileWorkspaceMentionPolicy): boolean {
-  return left.files === right.files && left.directories === right.directories && left.lineRanges === right.lineRanges;
+  return left.files === right.files && left.directories === right.directories && left.lineRanges === right.lineRanges
+    && left.queueDirectories === right.queueDirectories;
 }
 
 export const mobileWorkspaceMentionTesting = {

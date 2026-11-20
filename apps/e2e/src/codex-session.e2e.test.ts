@@ -9,7 +9,7 @@ import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { createCodexAdapter, AppServerHost, TransportFault } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
 import { CreateTargetMutationSchema, EntityKind, GetOperationRequestSchema, GetSnapshotRequestSchema, GetSnapshotResponseSchema, MessageRole, NativeCatalogImportPresentationSchema, NativeSessionPlacement, NativeSessionStartSchema,
-  ObjectiveStatus, OperationMutationSchema, OperationPreconditionSchema, OperationState, QueueItemState, RetryState, RunState, ScheduleRecurrenceSchema,
+  ObjectiveStatus, OperationMutationSchema, OperationPreconditionSchema, OperationState, QueueDeliveryMode, QueueItemState, RetryState, RunState, ScheduleRecurrenceSchema,
   SetWorkspaceTrustMutationSchema, SubmitOperationRequestSchema, SubmitOperationResponseSchema, TargetWorkspaceInputSchema, ToolCallState, WorkspaceKind, type Event } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
 import { JokoError } from "@joko/core";
@@ -19,11 +19,112 @@ import { createE2eClients } from "./connect-clients.js";
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import {
   abortRunMutation, createManualScheduleMutation, createSessionMutation, navigateMutation, pauseQueueMutation, queueItemIdFrom, queueRunIdFrom, resumeQueueMutation,
-  retryRunMutation, runIdFrom, scheduleIdFrom, sendInputMutation, sessionIdFrom, submit, triggerScheduleMutation
+  retryRunMutation, runIdFrom, scheduleIdFrom, sendInputMutation, sessionIdFrom, setQueueInteractionLockMutation, submit, triggerScheduleMutation
 } from "./operations.js";
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
   ? it : it.skip;
+
+mountedIt("steers an existing paused input and a new composer input only into the original Codex turn", { timeout: 110_000 }, async () => {
+  const backendId = "local-codex-steer";
+  const native = new FakeCodexAppServer();
+  const host = new AppServerHost({ transportFactory: () => native.createTransport() });
+  const fixture = await OrchestratorE2eFixture.start({ webDirectory: process.env.JOKO_MOUNTED_WEB_DIR!, backendFactories: [{
+    instanceId: backendId, adapterKind: "codex", displayName: "Codex same-turn fixture",
+    create: ({ generation }) => createCodexAdapter({ id: backendId, instanceGeneration: generation, host })
+  }] });
+  let browser: Browser | undefined;
+  try {
+    const { clients, connectionId } = await fixture.pair("Queue owner");
+    const mutate = (mutation: Parameters<typeof submit>[2]) => submit(clients.operation, connectionId, mutation);
+    const sessionId = sessionIdFrom(await mutate(createSessionMutation({ backendId, targetId: fixture.targetId(backendId),
+      displayName: "Original Codex turn" })));
+    const { store } = fixture.application;
+    const generation = () => BigInt(store.getSession(sessionId).descriptor.binding.generation);
+    const send = (text: string) => mutate(sendInputMutation(sessionId, generation(), text));
+    const active = queueRunIdFrom(await send("Hold the original native turn."));
+    await waitFor(async () => store.getRun(active).descriptor.state, state => state === "running", "the original running turn");
+    const nativeId = store.getSession(sessionId).descriptor.binding.nativeSessionId!;
+    const turnId = native.threads.get(nativeId)?.turns.at(-1)?.["id"];
+    expect(typeof turnId).toBe("string");
+    const first = queueItemIdFrom(await send("Wait in the ordinary queue."));
+    const second = queueItemIdFrom(await send("Steer this existing queued item."));
+    const original = store.getQueueItem(second);
+
+    const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Browser queue owner" })).challenge!;
+    browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
+    await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
+    await page.locator(".connection-tabs > button").nth(2).click();
+    await page.locator("details.device-authorization__manual > summary").click();
+    await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+    await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
+    await page.getByLabel("Device name").fill("Browser queue owner");
+    await page.locator("form.pair-form button[type=submit]").click();
+    const pane = page.locator(`.session-pane[data-input-session-id="${sessionId}"]`);
+    await pane.getByRole("button", { name: "Pause queue", exact: true }).click();
+    const resume = pane.getByRole("button", { name: "Resume queue", exact: true });
+    await resume.waitFor();
+    const steerRequest = (kind: "editQueueItem" | "sendInput") => page.waitForRequest(request => {
+      const body = request.postDataBuffer();
+      if (!request.url().endsWith("/joko.v1.OperationService/SubmitOperation") || body === null) return false;
+      const mutation = fromBinary(SubmitOperationRequestSchema, body).mutation;
+      return mutation?.payload.case === kind && mutation.payload.value.deliveryMode === QueueDeliveryMode.STEER;
+    }).then(request => fromBinary(SubmitOperationRequestSchema, request.postDataBuffer()!).mutation!);
+    const editing = steerRequest("editQueueItem");
+    await pane.locator(`[data-queue-item-id="${second}"]`)
+      .getByRole("button", { name: "Move first and steer now", exact: true }).click();
+    expect((await editing).preconditions).toContainEqual(expect.objectContaining({
+      entity: expect.objectContaining({ kind: EntityKind.RUN, id: active })
+    }));
+    await waitFor(async () => store.getQueueItem(second).state, state => state === "completed", "the existing item to steer and retire");
+    const requests = () => native.transport?.requests.filter(request => request.method === "turn/start" || request.method === "turn/steer") ?? [];
+    expect(requests()).toMatchObject([
+      { method: "turn/start" },
+      { method: "turn/steer", params: { threadId: nativeId, expectedTurnId: turnId, clientUserMessageId: original.operationId,
+        input: [{ type: "text", text: "Steer this existing queued item." }] } }
+    ]);
+    expect(store.getQueueItem(second)).toMatchObject({ id: second, runId: original.runId });
+    expect(store.getQueueItem(first).state).toBe("accepted");
+    expect(store.getQueueControl(sessionId).paused).toBe(true);
+
+    await resume.click();
+    await waitFor(async () => store.getQueueControl(sessionId).paused, paused => !paused, "the explicit queue resume");
+    await pane.locator(".composer-rich-editor__content").fill("Steer this new input before the ordinary queue.");
+    await pane.getByRole("radio", { name: "Steer current run", exact: true }).click();
+    const sending = steerRequest("sendInput");
+    await pane.locator(".send-button").click();
+    expect((await sending).preconditions).toContainEqual(expect.objectContaining({
+      entity: expect.objectContaining({ kind: EntityKind.RUN, id: active })
+    }));
+    await waitFor(async () => requests().length, count => count === 3, "the new steer on the same native turn");
+    expect(requests().at(-1)).toMatchObject({ method: "turn/steer", params: { threadId: nativeId, expectedTurnId: turnId,
+      input: [{ type: "text", text: "Steer this new input before the ordinary queue." }] } });
+    expect(store.getQueueItem(first).state).toBe("accepted");
+    expect(store.getRun(active).descriptor.state).toBe("running");
+
+    const control = (await clients.queue.getQueueControl({ sessionId })).queueControl!;
+    const lockToken = randomUUID();
+    expect((await mutate(setQueueInteractionLockMutation(control, lockToken, true))).state).toBe(OperationState.SUCCEEDED);
+    const stale = sendInputMutation(sessionId, generation(), "Do not redirect this input to the next turn.", QueueDeliveryMode.STEER);
+    stale.preconditions.push(create(OperationPreconditionSchema, { entity: { kind: EntityKind.RUN, id: active } }));
+    const staleId = queueItemIdFrom(await mutate(stale));
+    expect(store.getQueueItem(staleId).state).toBe("accepted");
+    await native.completeTurn(nativeId, "The original turn completed.");
+    await waitFor(async () => store.getRun(active).descriptor.state, state => state === "completed", "the original turn's completion");
+    expect((await mutate(setQueueInteractionLockMutation(control, lockToken, false))).state).toBe(OperationState.SUCCEEDED);
+    await waitFor(async () => store.getQueueItem(first).state, state => state === "backend_accepted", "the first ordinary item to start the next turn");
+    expect(store.getQueueItem(staleId)).toMatchObject({ state: "failed", error: { code: "CODEX_ACTIVE_TURN_REQUIRED", stateMayHaveChanged: false } });
+    expect(requests()).toHaveLength(4);
+    expect(requests()[3]).toMatchObject({ method: "turn/start", params: {
+      input: [{ type: "text", text: "Wait in the ordinary queue." }]
+    } });
+    await native.completeTurn(nativeId, "The ordinary queued turn completed.");
+  } finally {
+    await browser?.close().catch(() => undefined);
+    await fixture.close();
+  }
+});
 
 it.each([
   { mode: "legacy", inlinePng: "none", name: "reads the original legacy Codex catalog task without a cold executable" },
