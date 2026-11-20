@@ -35,9 +35,11 @@ import {
 } from "@joko/adapter-pi";
 import {
   createAuthenticatedCodeHostProvider,
+  createGhCliTokenSource,
   createPublicCodeHostProvider,
   type CodeHostProvider,
-  type CodeHostSessionAuthorizationPort
+  type CodeHostSessionAuthorizationPort,
+  type GhCliTokenSource
 } from "@joko/code-host";
 import {
   HOST_COMPOSED_CAPABILITIES,
@@ -436,14 +438,15 @@ function availableManagedProviderIds(
 /** Compose production code-host capabilities without exposing host IDs to shared runtime code. */
 export function composeCodeHostProviders(
   providers: readonly CodeHostProvider[] | undefined,
-  authorization?: CodeHostSessionAuthorizationPort
+  authorization?: CodeHostSessionAuthorizationPort,
+  credentialSource?: GhCliTokenSource
 ): readonly CodeHostProvider[] {
   if (providers !== undefined) return providers;
   const publicProvider = createPublicCodeHostProvider();
   return authorization === undefined
     ? Object.freeze([publicProvider])
     : Object.freeze([
-      createAuthenticatedCodeHostProvider({ authorization }),
+      createAuthenticatedCodeHostProvider({ authorization, ...(credentialSource === undefined ? {} : { credentialSource }) }),
       publicProvider
     ]);
 }
@@ -615,6 +618,7 @@ export interface OrchestratorApplication {
   readonly sessionNavigation?: SessionNavigationCoordinator;
   /** Capability-owned code-host adapters; each resolves its own credential reference. */
   readonly codeHostProviders?: readonly CodeHostProvider[];
+  readonly codeHostCredentials?: GhCliTokenSource;
   /** Publishes a fresh immutable generation for new runtimes without interrupting active ones. */
   readonly refreshPiGeneration?: () => Promise<void>;
   /** Adapter-composition policy used only as a fallback when live native state omits context defaults. */
@@ -667,6 +671,7 @@ export interface OrchestratorApplicationDependencies {
   readonly remoteDesktopIceConfiguration?: RemoteDesktopIceConfigurationProvider;
   /** Optional secure provider composition. Raw credentials never cross this port. */
   readonly codeHostProviders?: readonly CodeHostProvider[];
+  readonly codeHostCredentials?: GhCliTokenSource;
   /** Test-only transport seam; production uses the host fetch implementation. */
   readonly providerAccountUsageFetch?: typeof fetch;
   readonly providerAccountBalanceFetch?: typeof fetch;
@@ -812,9 +817,11 @@ export async function createOrchestratorApplication(
     unavailableReason: (backendId, providerId, modelId) => modelSourceFavoriteUnavailableReason(
       { store, hostedAgentSources, providerGroups }, backendId, providerId, modelId)
   });
+  const codeHostCredentials = dependencies.codeHostCredentials ?? (dependencies.codeHostProviders === undefined ? createGhCliTokenSource() : undefined);
   const codeHostProviders = composeCodeHostProviders(
     dependencies.codeHostProviders,
-    new OperationalCodeHostSessionAuthorization(store)
+    new OperationalCodeHostSessionAuthorization(store),
+    codeHostCredentials
   );
   const runtimeActivity = createRuntimeActivityTracker(store);
   const runtimeGovernance = new RuntimeGovernanceSettingsRepository({ store });
@@ -3908,6 +3915,7 @@ export async function createOrchestratorApplication(
     modelFavorites,
     sessionNavigation,
     codeHostProviders,
+    ...(codeHostCredentials === undefined ? {} : { codeHostCredentials }),
     refreshPiGeneration,
     resolveSessionContextDefaults,
     piSettingsDefaults: {

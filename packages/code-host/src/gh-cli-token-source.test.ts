@@ -1,10 +1,43 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
-import { GhCliTokenSource, type GhCliCommand } from "./index.js";
+import { GhCliCommandError, GhCliTokenSource, loginWithGh, type GhCliCommand } from "./index.js";
 
 const bytes = (value: string): Uint8Array => new TextEncoder().encode(value);
 
 describe("host CLI credential source", () => {
+  it("classifies only confirmed absence as sign-in required and rechecks before launching the CLI", async () => {
+    const loginCommand = vi.fn(async () => undefined);
+    const command = vi.fn<GhCliCommand>().mockRejectedValueOnce(new GhCliCommandError("notSignedIn"))
+      .mockRejectedValueOnce(new GhCliCommandError("unavailable"));
+    const source = new GhCliTokenSource({ command, loginCommand });
+    await expect(source.isSignInRequired()).resolves.toBe(true);
+    await expect(source.readCredential()).resolves.toBeUndefined();
+    await expect(source.signIn(new AbortController().signal, () => undefined, () => undefined)).rejects.toThrow("sign-in is unavailable");
+    expect(loginCommand).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(process.platform === "win32")("reads only the official one-time code line from the non-interactive CLI pipe", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-gh-pipe-"));
+    const executable = join(root, "gh");
+    try {
+      await writeFile(executable, `#!/bin/sh
+[ "$*" = "auth login --hostname github.com --web --skip-ssh-key" ] || exit 4
+[ -z "$GH_TOKEN" ] && [ -z "$GITHUB_TOKEN" ] && [ "$GH_PROMPT_DISABLED" = "1" ] || exit 5
+printf '! First copy your one-time code: NEVR-READ\\n'
+printf '! First copy your one-time c' >&2
+printf 'ode: AB12-CD34\\nOpen this URL to continue in your web browser: https://example.invalid\\n' >&2
+`, { mode: 0o700 });
+      const code = vi.fn();
+      await loginWithGh(executable, new AbortController().signal, code);
+      expect(code).toHaveBeenCalledExactlyOnceWith("AB12-CD34");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("uses fixed arguments, platform candidates, bounded execution, and a positive cache", async () => {
     const command = vi.fn<GhCliCommand>(async () => bytes("gho_memory_only\n"));
     const source = new GhCliTokenSource({

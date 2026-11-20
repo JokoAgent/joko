@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { DESKTOP_CHANNELS, isDesktopSessionWindowContext, type DesktopSessionWindowContext } from "../src/channels.js";
 import { buildTaskShareInvitation, type DesktopRemoteDesktopApi } from "@joko/contracts";
 import { compiledPreloadSource } from "./support/preload-source.js";
+import { parseDesktopCodeHostLoginScope } from "../src/desktop-code-host-login.js";
 import { parseDesktopNativeTaskStatusSnapshot, parseDesktopNativeTaskStatusVisibleSessionIds } from "../src/native-task-status.js";
 
 describe("native task-status contract across the actual preload and Main parser", () => {
@@ -76,6 +77,26 @@ describe("native task-status contract across the actual preload and Main parser"
     }
     expect(f.invoke).not.toHaveBeenCalled();
   });
+});
+
+it("binds GitHub sign-in IPC to the captured main document and original task generation", async () => {
+  const f = loadPreload("main-document");
+  const api = f.exposed["codeHostLogin"] as {
+    status(scope: unknown): Promise<unknown>; start(scope: unknown): Promise<unknown>; cancel(scope: unknown): Promise<void>;
+  };
+  const scope = { profileId: "profile", serverId: "server", scopeId: "occurrence", sessionId: "task", targetId: "target",
+    generation: 9007199254740993n, referenceKey: "github.com/acme/widgets#42" };
+  f.invoke.mockImplementation(async (_channel: string, document: unknown, value: unknown) => {
+    expect(document).toBe("main-document");
+    expect(parseDesktopCodeHostLoginScope(value)).toEqual(scope);
+  });
+  await api.status(scope);
+  await api.start(scope);
+  await api.cancel(scope);
+  expect(f.invoke.mock.calls.map(([channel]) => channel)).toEqual([
+    DESKTOP_CHANNELS.codeHostLoginStatus, DESKTOP_CHANNELS.codeHostLoginStart, DESKTOP_CHANNELS.codeHostLoginCancel
+  ]);
+  expect(loadPreload("").exposed["codeHostLogin"]).toBeUndefined();
 });
 
 it("sends the complete plugin window owner through the real preload and rejects unscoped or extra fields", async () => {

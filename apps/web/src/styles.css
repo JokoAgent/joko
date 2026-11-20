@@ -1074,6 +1074,7 @@ button.code-host-pull-request-summary:focus-visible { outline: 2px solid var(--a
 .code-host-pull-request-summary > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .code-host-pull-request-summary__reviews { display: inline-flex; align-items: center; gap: 2px; padding-left: 1px; font-variant-numeric: tabular-nums; }
 .code-host-pull-request-summary__reviews > svg { width: 11px; height: 11px; }
+.code-host-sign-in-code { display: block; margin-block: 12px; font-size: 1.35rem; letter-spacing: .08em; user-select: all; }
 .session-row__code-host { min-width: 14px; height: 16px; position: relative; display: inline-flex; flex: 0 0 auto; align-items: center; gap: 2px; color: var(--text-soft); font-size: var(--text-9); font-weight: 650; white-space: nowrap; }
 .session-row__code-host > svg { width: 13px; height: 13px; flex: 0 0 auto; }
 .session-row__code-host-number { max-width: 30px; overflow: hidden; text-overflow: ellipsis; }

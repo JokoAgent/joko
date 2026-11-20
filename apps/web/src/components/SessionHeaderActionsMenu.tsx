@@ -26,7 +26,7 @@ import type { SessionView, TargetView, TaskTagView } from "../model.js";
 import type { SessionProjectNavigationPlacement } from "../session-project-navigation.js";
 import type { Translator } from "./types.js";
 import { TipSummary } from "./ui.js";
-import { CodeHostPullRequestSummary } from "./CodeHostPullRequestSummary.js";
+import { CodeHostTaskPullRequest, type CodeHostLoginOwner } from "./CodeHostPullRequestLogin.js";
 import { TaskTagDot, taskTagDisplayName } from "./TaskTags.js";
 
 export interface SessionHeaderActionsMenuProps {
@@ -59,6 +59,7 @@ export interface SessionHeaderActionsMenuProps {
   readonly onSplitSession?: (side: "right" | "bottom") => void;
   readonly onOpenSessionWindow?: () => void;
   readonly onOpenCodeHostPullRequest?: (url: string) => void;
+  readonly codeHostLoginOwner?: CodeHostLoginOwner;
 }
 
 export function SessionHeaderActionsMenu({
@@ -90,7 +91,8 @@ export function SessionHeaderActionsMenu({
   onLearnFromSession,
   onSplitSession,
   onOpenSessionWindow,
-  onOpenCodeHostPullRequest
+  onOpenCodeHostPullRequest,
+  codeHostLoginOwner
 }: SessionHeaderActionsMenuProps): JSX.Element {
   const detailsRef = useRef<HTMLDetailsElement>(null);
   const menuId = useId();
@@ -176,7 +178,7 @@ export function SessionHeaderActionsMenu({
     items[nextIndex]?.focus({ preventScroll: true });
   };
 
-  return <><CodeHostPullRequestSummary pullRequests={session.codeHostPullRequests} t={t} onOpen={onOpenCodeHostPullRequest} /><details
+  return <><CodeHostTaskPullRequest pullRequests={session.codeHostPullRequests} t={t} onOpen={onOpenCodeHostPullRequest} owner={codeHostLoginOwner} /><details
     ref={detailsRef}
     className="header-menu session-header-menu"
     onToggle={(event) => {

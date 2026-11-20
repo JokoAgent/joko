@@ -15,6 +15,23 @@ interface JokoDesktopAppInfo {
   readonly persistentCredentialStorage: boolean;
 }
 
+type JokoDesktopCodeHostLoginScope = Pick<import("@joko/contracts").SessionCodeHostLoginScope,
+  "sessionId" | "targetId" | "generation" | "referenceKey"> & {
+    readonly profileId: string;
+    readonly serverId: string;
+    readonly scopeId: string;
+  };
+
+type JokoDesktopCodeHostLoginState =
+  | { readonly phase: "unavailable" | "ready" | "starting" | "connected" | "failed" }
+  | { readonly phase: "authorizing"; readonly code: string };
+
+interface JokoDesktopCodeHostLogin {
+  status(scope: JokoDesktopCodeHostLoginScope): Promise<JokoDesktopCodeHostLoginState>;
+  start(scope: JokoDesktopCodeHostLoginScope): Promise<JokoDesktopCodeHostLoginState>;
+  cancel(scope: JokoDesktopCodeHostLoginScope): Promise<void>;
+}
+
 interface JokoDesktopAttentionKey {
   readonly ownerId: string;
   readonly sessionId: string;
@@ -478,6 +495,7 @@ type DesktopRuntimeProcessMonitorResponse = {
 };
 
 interface JokoDesktopApi {
+  readonly codeHostLogin?: JokoDesktopCodeHostLogin;
   readonly voiceConversation?: { control(serverId: string, bytes: Uint8Array): Promise<Uint8Array> };
   readonly linkspan?: { request(kind: 'iroh' | 'tailcat' | 'http-connect', message: import('@jokoagent/linkspan-core/stream').StreamBridgeRequest): Promise<{ readonly success: true; readonly value?: unknown } | { readonly success: false; readonly code: import('@jokoagent/linkspan-core').LinkspanErrorCode }> };
   readonly menuBar?: {

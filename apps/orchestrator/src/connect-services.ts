@@ -514,6 +514,7 @@ import {
 import { createWorktreeConnectService } from "./worktree-connect-service.js";
 import { workspaceIdFor } from "./workspace-run-capture.js";
 import { installSessionCodeHostContextRuntime } from "./session-code-host-context.js";
+import { SessionCodeHostLogin } from "./session-code-host-login.js";
 import type { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
 import { recordSshWorktreeDisplayRename } from "./ssh-worktree-rename-authority.js";
 import { readPersonalDevelopmentPurpose } from "./personal-development-purpose.js";
@@ -1517,6 +1518,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     providers: application.codeHostProviders ?? [],
     now
   });
+  const sessionCodeHostLogin = new SessionCodeHostLogin(dependencies.store, sessionCodeHostContext, application.codeHostCredentials);
   if (typeof (application.store as Partial<OperationalStore>).listTargets === "function") {
     void Promise.all([
       recoverPendingSessionLifecycleCleanups(dependencies),
@@ -1541,6 +1543,22 @@ export function createConnectServices(application: OrchestratorApplication, proj
   const extensionSurfaceRevocations = new Map<string, () => void>();
 
   const authenticate = (context: HandlerContext): ConnectionRecord => requireAuthentication(dependencies, context);
+  const codeHostLoginOwner = (scope: contract.SessionCodeHostLoginScope | undefined, context: HandlerContext) => {
+    const connection = authenticate(context);
+    const authorization = context.requestHeader.get(DESKTOP_HOST_AUTHORIZATION_HEADER) ?? undefined;
+    if (scope === undefined || scope.sessionId.length > 256 || scope.targetId.length > 256 || scope.referenceKey.length > 256) {
+      throw invalidArgument("A task and pull request are required for GitHub sign-in.");
+    }
+    const assertCurrent = (): void => {
+      requireDesktopHostAuthentication(dependencies, connection, authorization);
+      if (context.signal.aborted || projectionShutdownSignal?.aborted) throw new ConnectError("GitHub sign-in was cancelled.", Code.Canceled);
+      if (!dependencies.sessionHost.canSignInToSessionCodeHost(scope.sessionId, scope.targetId, scope.generation)) {
+        throw new ConnectError("The original local task is unavailable.", Code.FailedPrecondition);
+      }
+    };
+    assertCurrent();
+    return { connection, scope, assertCurrent };
+  };
   const readAuthorized = async <T>(
     context: HandlerContext,
     read: (connection: ConnectionRecord, signal: AbortSignal) => Promise<T>
@@ -2815,6 +2833,20 @@ export function createConnectServices(application: OrchestratorApplication, proj
       );
       return { session: mapSession(dependencies, stored),
         ...(generation === undefined ? {} : { messageRewindContinuationGeneration: BigInt(generation) }) };
+    },
+    getSessionCodeHostLogin: async (request, context) => {
+      const { scope, assertCurrent } = codeHostLoginOwner(request.scope, context);
+      return { signInRequired: await sessionCodeHostLogin.requiresSignIn(scope, assertCurrent) };
+    },
+    startSessionCodeHostLogin: async function* (request, context) {
+      const { connection, scope, assertCurrent } = codeHostLoginOwner(request.scope, context);
+      const owner = captureConnectionRevocation(dependencies.connections, connection);
+      const signal = AbortSignal.any([context.signal, owner.signal, ...(projectionShutdownSignal === undefined ? [] : [projectionShutdownSignal])]);
+      try {
+        yield* sessionCodeHostLogin.start(scope, assertCurrent, signal);
+      } finally {
+        owner.dispose();
+      }
     },
     listTaskTags: (_request, context) => {
       authenticate(context);

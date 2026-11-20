@@ -439,6 +439,7 @@ import { DesktopVoiceConversationHost } from "./voice-conversation-host.js";
 import { DesktopPersonalDevelopmentVersions } from "./personal-development-native-versions.js";
 import { personalVersionProfileOverride } from "./personal-development-version-bootstrap.js";
 import { resolveManagedArtifactSource, resolveManagedWorkspaceFileSource } from "./managed-artifact-source.js";
+import { DesktopCodeHostLogin, parseDesktopCodeHostLoginScope } from "./desktop-code-host-login.js";
 import { bundledElectronUpdater, createElectronUpdateDriver } from "./electron-update-driver.js";
 import {
   createDesktopUpdateAutoRelaunchPolicy,
@@ -922,6 +923,7 @@ let activeDiscoveryScan: Promise<readonly DesktopDiscoveredNode[]> | undefined;
 let activeDiscoveryAbort: AbortController | undefined;
 let managedOrchestratorRuntime: ManagedOrchestratorRuntime | undefined;
 let managedOrchestratorConnection: DesktopManagedOrchestratorConnection | undefined;
+const desktopCodeHostLogin = new DesktopCodeHostLogin((scope, signal) => managedDesktopHostAuthority(scope.profileId, scope.serverId, signal));
 let managedOrchestratorRecoveryTarget: DesktopManagedOrchestratorConnection | undefined;
 let managedOrchestratorExplicitlyLoggedOut = false;
 let managedOrchestratorStatus: DesktopManagedOrchestratorStatus = process.env["JOKO_DESKTOP_MANAGED_ORCHESTRATOR"] === "0"
@@ -1121,6 +1123,7 @@ if (!app.requestSingleInstanceLock()) {
   recordPackagedSmokeProgress("single_instance_acquired");
   desktopOpenIntentIngress.activateSingleInstance(process.argv);
   app.on("before-quit", (event) => {
+    desktopCodeHostLogin.retire();
     desktopPersonalDevelopmentHost?.close();
     desktopInputHandoffHost?.close();
     desktopVoiceConversationHost?.close();
@@ -6724,6 +6727,7 @@ function captureMainWindowDocument(contents: WebContents, claim: string): string
   const capture = mainWindowDocuments.capture(contents, claim);
   if (capture.created) {
     if (capture.retired !== undefined) {
+      desktopCodeHostLogin.retire(capture.retired.occurrence);
       desktopNotifications.retireOwner(capture.retired.endpoint, capture.retired.occurrence);
       releaseDesktopAttentionSource(capture.retired.endpoint.id);
     }
@@ -6756,6 +6760,7 @@ function retireMainWindowDocument(window: BrowserWindow, contents: WebContents, 
   const retired = mainWindowDocuments.retire(contents);
   recordPackagedSmokeNativeCleanup("main_document_authority_retire_completed");
   if (retired !== undefined) {
+    desktopCodeHostLogin.retire(retired.occurrence);
     recordPackagedSmokeNativeCleanup("main_document_notifications_retire_started");
     desktopNotifications.retireOwner(retired.endpoint, retired.occurrence);
     recordPackagedSmokeNativeCleanup("main_document_notifications_retire_completed");
@@ -8639,6 +8644,23 @@ function registerIpc(): void {
   desktopLinkspan.register();
   desktopMcpApps.register();
   desktopExtensionOAuth.register();
+  ipcMain.handle(DESKTOP_CHANNELS.codeHostLoginStatus, (event, occurrence: unknown, value: unknown) => {
+    const document = assertCurrentMainApplicationDocumentSender(event, occurrence);
+    return desktopCodeHostLogin.status(document, parseDesktopCodeHostLoginScope(value), () => {
+      assertCurrentMainApplicationDocumentSender(event, document);
+    });
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.codeHostLoginStart, (event, occurrence: unknown, value: unknown) => {
+    assertFocusedTrustedIpcSender(event);
+    const document = assertCurrentMainApplicationDocumentSender(event, occurrence);
+    return desktopCodeHostLogin.start(document, parseDesktopCodeHostLoginScope(value), () => {
+      assertCurrentMainApplicationDocumentSender(event, document);
+    });
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.codeHostLoginCancel, (event, occurrence: unknown, value: unknown) => {
+    const document = assertCurrentMainApplicationDocumentSender(event, occurrence);
+    desktopCodeHostLogin.cancel(document, parseDesktopCodeHostLoginScope(value));
+  });
   ipcMain.handle("joko:voice-conversation:control", async (event, occurrence: unknown, serverId: unknown, bytes: unknown) => {
     assertTrustedIpcSender(event);
     if (typeof occurrence !== "string" || !mainWindowDocuments.isCurrent(event.sender, occurrence)
@@ -9905,7 +9927,7 @@ function registerIpc(): void {
     if (parameters.length !== 1) throw new TypeError("Artifact source reveal requires one request object.");
     nativeArtifactSourceRevealer ??= new NativeArtifactSourceRevealer({
       resolvePath: async (request, signal) => resolveManagedArtifactSource({
-        ...managedNativeFileSourceAuthority(request.profileId, request.serverId, signal),
+        ...managedDesktopHostAuthority(request.profileId, request.serverId, signal),
         sessionId: request.sessionId,
         artifactId: request.artifactId
       }),
@@ -9926,7 +9948,7 @@ function registerIpc(): void {
     if (parameters.length !== 1) throw new TypeError("An original Workspace PDF action requires one request object.");
     nativeWorkspaceFileSource ??= new NativeWorkspaceFileSource({
       resolveSource: async (request, signal) => {
-        const authority = managedNativeFileSourceAuthority(request.profileId, request.serverId, signal);
+        const authority = managedDesktopHostAuthority(request.profileId, request.serverId, signal);
         const source = await resolveManagedWorkspaceFileSource({
           ...authority,
           workspaceId: request.workspaceId,
@@ -11452,13 +11474,13 @@ function sameWindowsPath(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
 }
 
-function managedNativeFileSourceAuthority(profileId: string, serverId: string, signal: AbortSignal) {
+function managedDesktopHostAuthority(profileId: string, serverId: string, signal: AbortSignal) {
   const runtime = managedOrchestratorRuntime;
   const connection = managedOrchestratorConnection;
   if (runtime === undefined || connection === undefined || managedOrchestratorStatus.state !== "ready" ||
     profileId !== connection.profileId || serverId !== connection.serverId ||
     !sameManagedOrchestratorConnection(runtime.connection, connection) || managedOrchestratorExitFence.shutdownStarted) {
-    throw new Error("Managed file source authority is unavailable.");
+    throw new Error("Managed Desktop host authority is unavailable.");
   }
   return {
     connection,

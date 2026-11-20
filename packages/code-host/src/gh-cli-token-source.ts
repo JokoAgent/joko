@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 
 const POSITIVE_CACHE_TTL_MS = 5 * 60_000;
@@ -6,6 +6,7 @@ const NEGATIVE_CACHE_TTL_MS = 30_000;
 const COMMAND_TIMEOUT_MS = 3_000;
 const MAXIMUM_COMMAND_OUTPUT_BYTES = 16 * 1024;
 const MAXIMUM_TOKEN_LENGTH = 8 * 1024;
+const LOGIN_TIMEOUT_MS = 15 * 60_000;
 
 const GH_BINARY_CANDIDATES: Readonly<Record<string, readonly string[]>> = Object.freeze({
   darwin: Object.freeze(["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]),
@@ -33,8 +34,22 @@ export type GhCliCommand = (
   options: GhCliCommandOptions
 ) => Promise<Uint8Array>;
 
+export type GhCliLoginCommand = (file: string, signal: AbortSignal, onDeviceCode: (code: string) => void) => Promise<void>;
+
+export class GhCliCommandError extends Error {
+  constructor(readonly reason: "notSignedIn" | "unavailable") {
+    super("The GitHub CLI credential command did not return a credential.");
+  }
+}
+
+type GhCliCredentialState =
+  | { readonly kind: "credential"; readonly credential: GhCliCredentialLease }
+  | { readonly kind: "notSignedIn"; readonly binary: string }
+  | { readonly kind: "unavailable" };
+
 export interface GhCliTokenSourceOptions {
   readonly command?: GhCliCommand;
+  readonly loginCommand?: GhCliLoginCommand;
   readonly exists?: (path: string) => boolean;
   readonly platform?: NodeJS.Platform;
   readonly now?: () => number;
@@ -45,17 +60,19 @@ export interface GhCliTokenSourceOptions {
 /** Bounded, memory-only reader for the CLI's github.com login credential. */
 export class GhCliTokenSource {
   readonly #command: GhCliCommand;
+  readonly #loginCommand: GhCliLoginCommand;
   readonly #exists: (path: string) => boolean;
   readonly #platform: NodeJS.Platform;
   readonly #now: () => number;
   readonly #positiveCacheTtlMs: number;
   readonly #negativeCacheTtlMs: number;
   #generation = 0;
-  #cache: { readonly credential?: GhCliCredentialLease; readonly expiresAt: number } | undefined;
-  #inflight: Promise<GhCliCredentialLease | undefined> | undefined;
+  #cache: { readonly state: GhCliCredentialState; readonly expiresAt: number } | undefined;
+  #inflight: Promise<GhCliCredentialState> | undefined;
 
   constructor(options: GhCliTokenSourceOptions = {}) {
     this.#command = options.command ?? runGhCliCommand;
+    this.#loginCommand = options.loginCommand ?? loginWithGh;
     this.#exists = options.exists ?? existsSync;
     this.#platform = options.platform ?? process.platform;
     this.#now = options.now ?? Date.now;
@@ -70,8 +87,41 @@ export class GhCliTokenSource {
   }
 
   async readCredential(): Promise<GhCliCredentialLease | undefined> {
+    const state = await this.#readState();
+    return state.kind === "credential" && this.isCurrent(state.credential) ? state.credential : undefined;
+  }
+
+  async isSignInRequired(): Promise<boolean> {
+    const state = await this.#readState();
+    return state.kind === "notSignedIn" && this.#cache?.state === state;
+  }
+
+  async signIn(signal: AbortSignal, assertCurrent: () => void, onDeviceCode: (code: string) => void): Promise<void> {
+    assertCurrent();
+    signal.throwIfAborted();
+    this.invalidate();
+    const state = await this.#readState();
+    assertCurrent();
+    signal.throwIfAborted();
+    if (state.kind === "credential") return;
+    if (state.kind !== "notSignedIn" || this.#cache?.state !== state) throw new Error("GitHub CLI sign-in is unavailable.");
+    try {
+      await this.#loginCommand(state.binary, signal, onDeviceCode);
+    } finally {
+      // A cancelled process can have just finished saving its credential.
+      this.invalidate();
+    }
+    assertCurrent();
+    signal.throwIfAborted();
+    const credential = await this.readCredential();
+    assertCurrent();
+    signal.throwIfAborted();
+    if (credential === undefined || !this.isCurrent(credential)) throw new Error("GitHub CLI sign-in could not be confirmed.");
+  }
+
+  async #readState(): Promise<GhCliCredentialState> {
     if (this.#cache !== undefined && this.#cache.expiresAt > this.#now()) {
-      return this.#cache.credential;
+      return this.#cache.state;
     }
     if (this.#inflight !== undefined) return this.#inflight;
     const request = this.#readUncached().finally(() => {
@@ -82,40 +132,40 @@ export class GhCliTokenSource {
   }
 
   isCurrent(credential: GhCliCredentialLease): boolean {
-    return this.#cache?.credential === credential
+    return this.#cache?.state.kind === "credential" && this.#cache.state.credential === credential
       && credential.generation === this.#generation;
   }
 
   invalidate(): void {
     this.#generation += 1;
     this.#cache = undefined;
+    this.#inflight = undefined;
   }
 
-  async #readUncached(): Promise<GhCliCredentialLease | undefined> {
+  async #readUncached(): Promise<GhCliCredentialState> {
     const startingGeneration = this.#generation;
-    let token: string | undefined;
+    let state: GhCliCredentialState = { kind: "unavailable" };
     try {
-      const output = await this.#command(
-        resolveGhBinary(this.#platform, this.#exists),
-        Object.freeze(["auth", "token", "--hostname", "github.com"]),
-        { timeoutMs: COMMAND_TIMEOUT_MS, maximumOutputBytes: MAXIMUM_COMMAND_OUTPUT_BYTES }
-      );
-      token = parseTokenOutput(output);
+      const binary = resolveGhBinary(this.#platform, this.#exists);
+      try {
+        const output = await this.#command(binary, ["auth", "token", "--hostname", "github.com"], {
+          timeoutMs: COMMAND_TIMEOUT_MS, maximumOutputBytes: MAXIMUM_COMMAND_OUTPUT_BYTES
+        });
+        const token = parseTokenOutput(output);
+        if (token !== undefined) state = { kind: "credential", credential: Object.freeze({ token, generation: startingGeneration + 1 }) };
+      } catch (error) {
+        if (error instanceof GhCliCommandError && error.reason === "notSignedIn") state = { kind: "notSignedIn", binary };
+      }
     } catch {
-      token = undefined;
+      // An inaccessible executable or environment cannot establish sign-in eligibility.
     }
-    if (this.#generation !== startingGeneration) return undefined;
+    if (this.#generation !== startingGeneration) return { kind: "unavailable" };
     this.#generation += 1;
-    const credential = token === undefined
-      ? undefined
-      : Object.freeze({ token, generation: this.#generation });
     this.#cache = {
-      ...(credential === undefined ? {} : { credential }),
-      expiresAt: this.#now() + (credential === undefined
-        ? this.#negativeCacheTtlMs
-        : this.#positiveCacheTtlMs)
+      state,
+      expiresAt: this.#now() + (state.kind === "credential" ? this.#positiveCacheTtlMs : this.#negativeCacheTtlMs)
     };
-    return credential;
+    return state;
   }
 }
 
@@ -163,9 +213,11 @@ async function runGhCliCommand(
       windowsHide: true,
       encoding: "buffer",
       env: ghCliEnvironment(process.env)
-    }, (error, stdout) => {
+    }, (error, stdout, stderr) => {
       if (error !== null) {
-        reject(new Error("The code-host credential command is unavailable."));
+        const notSignedIn = typeof error.code === "number" && !error.killed && !error.signal
+          && /^(?:gh: )?no oauth token found for github\.com$/u.test(stderr.toString().trim());
+        reject(new GhCliCommandError(notSignedIn ? "notSignedIn" : "unavailable"));
         return;
       }
       const bytes = typeof stdout === "string" ? Buffer.from(stdout, "utf8") : stdout;
@@ -175,6 +227,41 @@ async function runGhCliCommand(
       }
       resolve(new Uint8Array(bytes));
     });
+  });
+}
+
+/** The non-interactive CLI owns OAuth and credential storage. Only its device code crosses the pipe boundary. */
+export function loginWithGh(file: string, signal: AbortSignal, onDeviceCode: (code: string) => void): Promise<void> {
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const child = spawn(file, ["auth", "login", "--hostname", "github.com", "--web", "--skip-ssh-key"], {
+      stdio: ["ignore", "ignore", "pipe"],
+      windowsHide: true,
+      env: { ...ghCliEnvironment(process.env), GH_PROMPT_DISABLED: "1", NO_COLOR: "1" }
+    });
+    const stop = () => { child.kill("SIGKILL"); };
+    let failed = false;
+    let sawCode = false;
+    let output = "";
+    const timer = setTimeout(() => { failed = true; stop(); }, LOGIN_TIMEOUT_MS);
+    signal.addEventListener("abort", stop, { once: true });
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (sawCode || failed || signal.aborted) return;
+      output = (output + chunk.toString("utf8")).slice(-8192);
+      const code = /(?:^|\n)[^\r\n]*First copy your one-time code: ([A-Z0-9]{4}-[A-Z0-9]{4})(?=\r?\n)/u.exec(output)?.[1];
+      if (code === undefined) return;
+      sawCode = true;
+      output = "";
+      onDeviceCode(code);
+    });
+    child.once("error", () => { failed = true; });
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", stop);
+      if (failed || signal.aborted || code !== 0 || !sawCode) reject(new Error("GitHub CLI sign-in did not complete."));
+      else resolve();
+    });
+    if (signal.aborted) stop();
   });
 }
 

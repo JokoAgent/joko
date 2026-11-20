@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/code_host.proto.
  */
 export const file_joko_v1_code_host: GenFile = /*@__PURE__*/
-  fileDesc("Chdqb2tvL3YxL2NvZGVfaG9zdC5wcm90bxIHam9rby52MSKXAQocQ29kZUhvc3RQdWxsUmVxdWVzdFJlZmVyZW5jZRIVCg1yZWZlcmVuY2Vfa2V5GAEgASgJEgwKBGhvc3QYAiABKAkSGAoQcmVwb3NpdG9yeV9vd25lchgDIAEoCRIXCg9yZXBvc2l0b3J5X25hbWUYBCABKAkSDgoGbnVtYmVyGAUgASgEEg8KB3dlYl91cmwYBiABKAki0QIKHUNvZGVIb3N0UHVsbFJlcXVlc3RQcm9qZWN0aW9uEjgKCXJlZmVyZW5jZRgBIAEoCzIlLmpva28udjEuQ29kZUhvc3RQdWxsUmVxdWVzdFJlZmVyZW5jZRIwCgVzdGF0ZRgCIAEoDjIhLmpva28udjEuQ29kZUhvc3RQdWxsUmVxdWVzdFN0YXRlEg0KBWRyYWZ0GAMgASgIEi8KC29ic2VydmVkX2F0GAQgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIQCghvYnNlcnZlZBgFIAEoCBINCgV0aXRsZRgGIAEoCRITCgtoZWFkX2JyYW5jaBgHIAEoCRIrCh51bnJlc29sdmVkX3Jldmlld190aHJlYWRfY291bnQYCCABKA1IAIgBAUIhCh9fdW5yZXNvbHZlZF9yZXZpZXdfdGhyZWFkX2NvdW50KsEBChhDb2RlSG9zdFB1bGxSZXF1ZXN0U3RhdGUSLAooQ09ERV9IT1NUX1BVTExfUkVRVUVTVF9TVEFURV9VTlNQRUNJRklFRBAAEiUKIUNPREVfSE9TVF9QVUxMX1JFUVVFU1RfU1RBVEVfT1BFThABEicKI0NPREVfSE9TVF9QVUxMX1JFUVVFU1RfU1RBVEVfQ0xPU0VEEAISJwojQ09ERV9IT1NUX1BVTExfUkVRVUVTVF9TVEFURV9NRVJHRUQQA2IGcHJvdG8z", [file_google_protobuf_timestamp]);
+  fileDesc("Chdqb2tvL3YxL2NvZGVfaG9zdC5wcm90bxIHam9rby52MSKXAQocQ29kZUhvc3RQdWxsUmVxdWVzdFJlZmVyZW5jZRIVCg1yZWZlcmVuY2Vfa2V5GAEgASgJEgwKBGhvc3QYAiABKAkSGAoQcmVwb3NpdG9yeV9vd25lchgDIAEoCRIXCg9yZXBvc2l0b3J5X25hbWUYBCABKAkSDgoGbnVtYmVyGAUgASgEEg8KB3dlYl91cmwYBiABKAki0QIKHUNvZGVIb3N0UHVsbFJlcXVlc3RQcm9qZWN0aW9uEjgKCXJlZmVyZW5jZRgBIAEoCzIlLmpva28udjEuQ29kZUhvc3RQdWxsUmVxdWVzdFJlZmVyZW5jZRIwCgVzdGF0ZRgCIAEoDjIhLmpva28udjEuQ29kZUhvc3RQdWxsUmVxdWVzdFN0YXRlEg0KBWRyYWZ0GAMgASgIEi8KC29ic2VydmVkX2F0GAQgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIQCghvYnNlcnZlZBgFIAEoCBINCgV0aXRsZRgGIAEoCRITCgtoZWFkX2JyYW5jaBgHIAEoCRIrCh51bnJlc29sdmVkX3Jldmlld190aHJlYWRfY291bnQYCCABKA1IAIgBAUIhCh9fdW5yZXNvbHZlZF9yZXZpZXdfdGhyZWFkX2NvdW50Im0KGVNlc3Npb25Db2RlSG9zdExvZ2luU2NvcGUSEgoKc2Vzc2lvbl9pZBgBIAEoCRIRCgl0YXJnZXRfaWQYAiABKAkSEgoKZ2VuZXJhdGlvbhgDIAEoBBIVCg1yZWZlcmVuY2Vfa2V5GAQgASgJIlMKHkdldFNlc3Npb25Db2RlSG9zdExvZ2luUmVxdWVzdBIxCgVzY29wZRgBIAEoCzIiLmpva28udjEuU2Vzc2lvbkNvZGVIb3N0TG9naW5TY29wZSI7Ch9HZXRTZXNzaW9uQ29kZUhvc3RMb2dpblJlc3BvbnNlEhgKEHNpZ25faW5fcmVxdWlyZWQYASABKAgiVQogU3RhcnRTZXNzaW9uQ29kZUhvc3RMb2dpblJlcXVlc3QSMQoFc2NvcGUYASABKAsyIi5qb2tvLnYxLlNlc3Npb25Db2RlSG9zdExvZ2luU2NvcGUiWQohU3RhcnRTZXNzaW9uQ29kZUhvc3RMb2dpblJlc3BvbnNlEhUKC2RldmljZV9jb2RlGAEgASgJSAASEwoJY29ubmVjdGVkGAIgASgISABCCAoGdXBkYXRlKsEBChhDb2RlSG9zdFB1bGxSZXF1ZXN0U3RhdGUSLAooQ09ERV9IT1NUX1BVTExfUkVRVUVTVF9TVEFURV9VTlNQRUNJRklFRBAAEiUKIUNPREVfSE9TVF9QVUxMX1JFUVVFU1RfU1RBVEVfT1BFThABEicKI0NPREVfSE9TVF9QVUxMX1JFUVVFU1RfU1RBVEVfQ0xPU0VEEAISJwojQ09ERV9IT1NUX1BVTExfUkVRVUVTVF9TVEFURV9NRVJHRUQQA2IGcHJvdG8z", [file_google_protobuf_timestamp]);
 
 /**
  * Credential-free identity extracted from bounded, user-visible task context.
@@ -112,6 +112,122 @@ export type CodeHostPullRequestProjection = Message<"joko.v1.CodeHostPullRequest
  */
 export const CodeHostPullRequestProjectionSchema: GenMessage<CodeHostPullRequestProjection> = /*@__PURE__*/
   messageDesc(file_joko_v1_code_host, 1);
+
+/**
+ * Only the local Desktop host may use this scope to inspect or start sign-in.
+ *
+ * @generated from message joko.v1.SessionCodeHostLoginScope
+ */
+export type SessionCodeHostLoginScope = Message<"joko.v1.SessionCodeHostLoginScope"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+
+  /**
+   * @generated from field: string target_id = 2;
+   */
+  targetId: string;
+
+  /**
+   * @generated from field: uint64 generation = 3;
+   */
+  generation: bigint;
+
+  /**
+   * @generated from field: string reference_key = 4;
+   */
+  referenceKey: string;
+};
+
+/**
+ * Describes the message joko.v1.SessionCodeHostLoginScope.
+ * Use `create(SessionCodeHostLoginScopeSchema)` to create a new message.
+ */
+export const SessionCodeHostLoginScopeSchema: GenMessage<SessionCodeHostLoginScope> = /*@__PURE__*/
+  messageDesc(file_joko_v1_code_host, 2);
+
+/**
+ * @generated from message joko.v1.GetSessionCodeHostLoginRequest
+ */
+export type GetSessionCodeHostLoginRequest = Message<"joko.v1.GetSessionCodeHostLoginRequest"> & {
+  /**
+   * @generated from field: joko.v1.SessionCodeHostLoginScope scope = 1;
+   */
+  scope?: SessionCodeHostLoginScope | undefined;
+};
+
+/**
+ * Describes the message joko.v1.GetSessionCodeHostLoginRequest.
+ * Use `create(GetSessionCodeHostLoginRequestSchema)` to create a new message.
+ */
+export const GetSessionCodeHostLoginRequestSchema: GenMessage<GetSessionCodeHostLoginRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_code_host, 3);
+
+/**
+ * @generated from message joko.v1.GetSessionCodeHostLoginResponse
+ */
+export type GetSessionCodeHostLoginResponse = Message<"joko.v1.GetSessionCodeHostLoginResponse"> & {
+  /**
+   * @generated from field: bool sign_in_required = 1;
+   */
+  signInRequired: boolean;
+};
+
+/**
+ * Describes the message joko.v1.GetSessionCodeHostLoginResponse.
+ * Use `create(GetSessionCodeHostLoginResponseSchema)` to create a new message.
+ */
+export const GetSessionCodeHostLoginResponseSchema: GenMessage<GetSessionCodeHostLoginResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_code_host, 4);
+
+/**
+ * @generated from message joko.v1.StartSessionCodeHostLoginRequest
+ */
+export type StartSessionCodeHostLoginRequest = Message<"joko.v1.StartSessionCodeHostLoginRequest"> & {
+  /**
+   * @generated from field: joko.v1.SessionCodeHostLoginScope scope = 1;
+   */
+  scope?: SessionCodeHostLoginScope | undefined;
+};
+
+/**
+ * Describes the message joko.v1.StartSessionCodeHostLoginRequest.
+ * Use `create(StartSessionCodeHostLoginRequestSchema)` to create a new message.
+ */
+export const StartSessionCodeHostLoginRequestSchema: GenMessage<StartSessionCodeHostLoginRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_code_host, 5);
+
+/**
+ * The device code is live only for this stream and is never written to task history.
+ *
+ * @generated from message joko.v1.StartSessionCodeHostLoginResponse
+ */
+export type StartSessionCodeHostLoginResponse = Message<"joko.v1.StartSessionCodeHostLoginResponse"> & {
+  /**
+   * @generated from oneof joko.v1.StartSessionCodeHostLoginResponse.update
+   */
+  update: {
+    /**
+     * @generated from field: string device_code = 1;
+     */
+    value: string;
+    case: "deviceCode";
+  } | {
+    /**
+     * @generated from field: bool connected = 2;
+     */
+    value: boolean;
+    case: "connected";
+  } | { case: undefined; value?: undefined };
+};
+
+/**
+ * Describes the message joko.v1.StartSessionCodeHostLoginResponse.
+ * Use `create(StartSessionCodeHostLoginResponseSchema)` to create a new message.
+ */
+export const StartSessionCodeHostLoginResponseSchema: GenMessage<StartSessionCodeHostLoginResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_code_host, 6);
 
 /**
  * @generated from enum joko.v1.CodeHostPullRequestState
