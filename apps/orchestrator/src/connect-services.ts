@@ -18916,6 +18916,7 @@ async function dispatchMutation(
           return { accepted: true, resultCase: "queueItem", entityId: payload.value.queueItemId } satisfies OperationOutcome;
         }
       });
+      if (!execution.replayed) host.requestQueueDrain(current.sessionId);
       return presented(execution);
     }
     case "editQueueItem": {
@@ -18992,6 +18993,7 @@ async function dispatchMutation(
       return presented(execution);
     }
     case "reorderQueueItem": {
+      const queue = dependencies.store.getQueueItem(payload.value.queueItemId);
       requireEntityVersionPrecondition(
         mutation,
         contract.EntityKind.QUEUE_ITEM,
@@ -19025,6 +19027,7 @@ async function dispatchMutation(
           return { accepted: true, resultCase: "queueItem", entityId: payload.value.queueItemId } satisfies OperationOutcome;
         }
       });
+      if (!execution.replayed && !dependencies.store.getQueueControl(queue.sessionId).interactionLocked) host.requestQueueDrain(queue.sessionId);
       return presented(execution);
     }
     case "pauseQueue": {

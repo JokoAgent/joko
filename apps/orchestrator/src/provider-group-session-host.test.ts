@@ -87,6 +87,77 @@ it("durably wakes the same undispatched input after a quota reset and a real Sto
   } finally { clock.mockRestore(); }
 });
 
+it.each(["reorder", "withdraw"] as const)("retires the quota wait when the owner changes its queue head by %s", async action => {
+  const f = await fixture();
+  f.groups.store.update(f.key, { strategy: "ordered", autoSwitch: true, members: f.members }, 0n);
+  const sessionId = (await f.create("quota-owner-change")).value.sessionId;
+  const resetAt = Date.now() + 60_000;
+  let secondAvailable = false;
+  vi.spyOn(f.groups.directory, "read").mockImplementation(async member => {
+    const limited = member.backendId === f.first.id;
+    const model = f.registry.get(member.backendId).descriptor.models.find(model => model.providerId === member.providerId)!;
+    return { member, available: !limited && secondAvailable, reachable: limited || secondAvailable, model, running: 0,
+      assertCurrent: () => {}, quota: { limited, ...(limited ? { resetAt } : {}) },
+      ...(limited ? { reason: "quota" as const } : !secondAvailable ? { reason: "offline" as const } : {}) };
+  });
+  const first = f.send(sessionId, "waiting-first"), second = f.send(sessionId, "new-queue-head");
+  const firstSend = vi.spyOn(f.first, "send"), secondSend = vi.spyOn(f.second, "send");
+  const key = `provider.group-error:${first.runId}`;
+  await until(() => (f.store.findSetting("session", sessionId, key)?.value as { resumeAt?: number } | undefined)?.resumeAt === resetAt);
+  expect(f.store.getQueueItem(second.queueItemId).state).toBe("accepted");
+  expect(firstSend).not.toHaveBeenCalled();
+  expect(secondSend).not.toHaveBeenCalled();
+  secondAvailable = true;
+  if (action === "withdraw") f.store.cancelQueueItem({ queueItemId: first.queueItemId, connectionId: f.connection.id, traceId: "withdraw-old-head" });
+  else {
+    const lock = { sessionId, connectionId: f.connection.id, lockToken: "head-reorder", ttlMs: 5000 };
+    f.store.setQueueInteractionLock({ ...lock, locked: true, traceId: "lock-reorder" });
+    f.store.reorderQueueItem({ queueItemId: second.queueItemId, placement: { beforeQueueItemId: first.queueItemId },
+      connectionId: f.connection.id, lockToken: lock.lockToken, traceId: "move-new-head" });
+    f.store.setQueueInteractionLock({ ...lock, locked: false, traceId: "unlock-reorder" });
+  }
+  f.host.requestQueueDrain(sessionId);
+  await until(() => f.store.getQueueItem(second.queueItemId).state === "completed");
+  expect(Date.now()).toBeLessThan(resetAt);
+  expect(f.store.findSetting("session", sessionId, key)).toBeUndefined();
+  expect(secondSend.mock.calls[0]?.[0].text).toContain("new-queue-head");
+  if (action === "withdraw") expect(f.store.getQueueItem(first.queueItemId).state).toBe("cancelled");
+});
+
+it("discards a healthy Provider candidate read after the original accepted input is withdrawn", async () => {
+  const f = await fixture();
+  f.groups.store.update(f.key, { strategy: "ordered", autoSwitch: true, members: f.members }, 0n);
+  const sessionId = (await f.create("withdraw-inflight-provider-preflight")).value.sessionId;
+  const originalBinding = f.store.getSession(sessionId).descriptor.binding;
+  const originalMember = f.groups.store.binding(sessionId)?.memberKey;
+  let finishRead!: () => void;
+  const pendingRead = new Promise<void>(resolve => { finishRead = resolve; });
+  let readingCandidate = false;
+  vi.spyOn(f.groups.directory, "read").mockImplementation(async member => {
+    const limited = member.backendId === f.first.id;
+    if (!limited) { readingCandidate = true; await pendingRead; }
+    const model = f.registry.get(member.backendId).descriptor.models.find(model => model.providerId === member.providerId)!;
+    return { member, available: !limited, reachable: true, model, running: 0, assertCurrent: () => {}, quota: { limited },
+      ...(limited ? { reason: "quota" as const } : {}) };
+  });
+  const preflight = vi.spyOn(f.groups.service, "beforeSend");
+  const createSecond = vi.spyOn(f.second, "createSession"), originalSend = vi.spyOn(f.first, "send");
+  const input = f.send(sessionId, "original-withdrawn-input");
+  try {
+    await until(() => readingCandidate);
+    f.store.cancelQueueItem({ queueItemId: input.queueItemId, connectionId: f.connection.id, traceId: "withdraw-inflight-head" });
+    f.host.requestQueueDrain(sessionId);
+    finishRead();
+    await expect(preflight.mock.results[0]?.value).rejects.toThrow(/superseded/iu);
+    expect(f.store.getQueueItem(input.queueItemId).state).toBe("cancelled");
+    expect(f.store.getSession(sessionId).descriptor.binding).toEqual(originalBinding);
+    expect(f.groups.store.binding(sessionId)?.memberKey).toBe(originalMember);
+    expect(createSecond).not.toHaveBeenCalled();
+    expect(originalSend).not.toHaveBeenCalled();
+    expect(new SessionRuntimeHandoffStore(f.store).read(sessionId)?.pending).toBeUndefined();
+  } finally { finishRead(); }
+});
+
 it("restores a positively settled failed turn once without replaying completed assistant work", async () => {
   const f = await fixture(); f.groups.store.update(f.key, { strategy: "ordered", autoSwitch: true, members: f.members }, 0n);
   const sessionId = (await f.create("quota-failed-source")).value.sessionId, resetAt = Date.now() + 60_000;

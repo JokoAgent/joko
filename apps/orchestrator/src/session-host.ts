@@ -113,7 +113,7 @@ import { boundOneShotScheduleProvider, scheduleNativeSubscriptionKey } from "./s
 import type { ProviderGroupRuntime } from "./provider-group-runtime.js";
 import type { ProviderGroupSessionPort, ProviderGroupRecoveryLease, ProviderGroupRecoveryHandoff } from "./provider-group-service.js";
 import type { ProviderGroupAssignment } from "./provider-group-router.js";
-import { ProviderGroupUnavailableError, providerGroupFailureSignals } from "./provider-group-failure-policy.js";
+import { PROVIDER_GROUP_SUPERSEDED_ERROR, ProviderGroupUnavailableError, providerGroupFailureSignals } from "./provider-group-failure-policy.js";
 import type { InputHandoffTaskScope } from "./input-handoff/coordinator.js";
 import { operationBodyHash } from "@joko/store";
 import type { ArtifactStore } from "./artifact-store.js";
@@ -7166,6 +7166,9 @@ export class SessionHost {
         || queue.operationId !== record.operationId || queue.attemptId !== record.attemptId || attempt.runId !== record.runId || attempt.generation !== record.generation
         || this.#store.findOperation(record.operationId)?.status !== "completed"
         || this.#store.findPendingSessionLifecycleCleanup(record.sessionId) || this.#store.findPendingScheduleDeletionCleanupForSession(record.sessionId)) return false;
+      if (record.kind === "queue-head" && (queue.state !== "accepted"
+        || this.#store.getRun(record.runId).descriptor.state !== "queued"
+        || this.#store.listQueueItems({ sessionId: record.sessionId, states: ["accepted"], limit: 1 })[0]?.id !== queue.id)) return false;
       if (session.backendId === record.backendId && session.binding.generation === record.generation && privatePromptDigest(session.binding.opaqueRef) === record.nativeFingerprint
         && providerGroupRuntimeProfileFingerprint(profile) === record.profileFingerprint) return true;
       const native = this.#runtimeHandoffs.read(record.sessionId), handoff = record.handoff ?? record.guestHandoff;
@@ -7220,7 +7223,12 @@ export class SessionHost {
         const run = this.#store.getRun(runId).descriptor, queue = this.#store.getQueueItem(held.queueItemId);
         const continuation = this.providerGroupContinuation(queue);
         if (continuation.claimed || run.state === "completed" || run.state === "aborted" || !this.#providerGroupRecoverySourceCurrent(held)) {
-          this.#store.deleteSetting("session", sessionId, setting.key); this.#cancelProviderGroupWait(sessionId);
+          this.#store.deleteSetting("session", sessionId, setting.key);
+          if (this.#providerGroupWaits.get(sessionId)?.runId === runId) this.#cancelProviderGroupWait(sessionId);
+          if (held.kind === "queue-head") {
+            this.#providerGroups.service.router.clearTurn(sessionId);
+            this.providerGroupSessionPort().status(sessionId, "idle");
+          }
           if (continuation.child === undefined && run.state === "failed") this.#publishHeldProviderGroupError(sessionId, runId, held.payload.error);
           if (queue.body.messagingOrigin && run.state !== "completed") void this.notifyServiceRunSettled(sessionId, runId, run.state === "aborted" ? "aborted" : "failed");
           void this.drain(sessionId); continue;
@@ -15324,14 +15332,28 @@ export class SessionHost {
         }
         if (pending.body.nativeSteerTarget === undefined && this.#providerGroupApplies(pending)) {
           if (listAllRuns(this.#store, { sessionId, activeOnly: true }).some(run => run.descriptor.id !== pending!.runId && run.descriptor.state !== "queued")) return;
+          const candidate = pending;
+          const queueIsCurrent = () => {
+            const control = this.#store.getQueueControl(sessionId);
+            if (control.paused || control.interactionLocked) return false;
+            const head = this.#store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0];
+            return head?.id === candidate.id && head.runId === candidate.runId && head.operationId === candidate.operationId && !head.editLocked;
+          };
+          if (!queueIsCurrent()) { this.scheduleQueueLockWakeup(sessionId); return; }
           try {
-            await this.#providerGroups!.service.beforeSend(sessionId, new AbortController().signal, pending.id);
+            await this.#providerGroups!.service.beforeSend(sessionId, new AbortController().signal, pending.id, () => {
+              if (!queueIsCurrent()) throw new Error(PROVIDER_GROUP_SUPERSEDED_ERROR);
+            });
             const held = this.#heldProviderGroupRecovery(sessionId, pending.runId);
             if (held?.kind === "queue-head" && held.queueItemId === pending.id) {
               this.#store.deleteSetting("session", sessionId, `provider.group-error:${pending.runId}`); this.#cancelProviderGroupWait(sessionId);
             }
           }
           catch (error) {
+            if (error instanceof Error && error.message === PROVIDER_GROUP_SUPERSEDED_ERROR && !queueIsCurrent()) {
+              this.#providerGroups!.service.router.clearTurn(sessionId);
+              continue;
+            }
             if (error instanceof ProviderGroupUnavailableError && error.retryAt !== undefined && error.retryAt > Date.now()
               && error.retryAt <= Date.now() + 8 * 24 * 60 * 60_000) {
               const previous = this.#heldProviderGroupRecovery(sessionId, pending.runId);
@@ -15347,6 +15369,7 @@ export class SessionHost {
             this.recordFailure("provider_group_before_send", error); return;
           }
           pending = this.nextQueueItemForDispatch(sessionId); if (!pending) return;
+          if (pending.id !== candidate.id) continue;
         }
         // Authentication is an admission fence, not a turn-serialization
         // concern. Fail a newly durable item before any context rebuild,

@@ -153,7 +153,7 @@ export class ProviderGroupService {
     return this.router.pick({ sessionId, group, profile, agentKind: session.agentKind, modelId: profile.modelId, ownTask: true,
       ...(session.logicalModelId === undefined ? {} : { logicalModelId: session.logicalModelId }), fresh: true }, this.#signal(signal));
   }
-  beforeSend(sessionId: string, signal: AbortSignal, queueItemId?: string): Promise<void> {
+  beforeSend(sessionId: string, signal: AbortSignal, queueItemId?: string, assertQueueCurrent?: () => void): Promise<void> {
     return this.#serialize(sessionId, async () => {
       const session = this.options.sessions.read(sessionId); if (!session?.eligible) return;
       if (session.dispatchUnknown) throw unknownEffect();
@@ -161,19 +161,27 @@ export class ProviderGroupService {
       if (queueItemId && (priorChoice?.phase === "started" || priorChoice?.phase === "restoring")) {
         await this.#rebalanceBeforeSend(sessionId, queueItemId, this.#signal(signal)); return;
       }
+      const assertGroupCurrent = this.#current(sessionId);
+      const current = () => {
+        assertGroupCurrent();
+        assertQueueCurrent?.();
+      };
+      current();
       const existing = this.router.store.binding(sessionId);
       if (existing) await this.router.prepare(existing.group, this.#signal(signal));
+      current();
       const binding = this.router.store.binding(sessionId);
       if (!binding) {
         // Explicitly released tasks are not implicitly adopted on a later send.
         if (this.router.store.bindingRecord(sessionId)?.released) return;
         const prepared = await this.assignBeforeStart(session, signal); if (!prepared) return;
-        try { await this.#adopt(sessionId, prepared, true, this.#current(sessionId), signal); } finally { prepared.release(); }
+        try { await this.#adopt(sessionId, prepared, true, current, signal); } finally { prepared.release(); }
         return;
       }
       const group = this.snapshot(binding.group); if (!group.config) return;
       const member = group.config.members.find(member => member.key === binding.memberKey); if (!member) return;
       const request = this.#request(session, true), status = await this.router.readMember(binding.group, member, request, this.#signal(signal));
+      current();
       const cooling = this.router.store.cooling(binding.group, this.router.now()).some(row => row.memberKey === member.key && (row.modelId === undefined || row.modelId === status.model?.modelId));
       if (status.available && !cooling) {
         status.assertCurrent();
@@ -185,7 +193,6 @@ export class ProviderGroupService {
           && (row.modelId === undefined || row.modelId === status.model?.modelId)).map(row => row.until);
         throw new ProviderGroupUnavailableError(status.quota.limited ? status.quota.resetAt : quotaCooling.length ? Math.max(...quotaCooling) : undefined);
       }
-      const current = this.#current(sessionId);
       if (!status.reachable && await this.#recoverConnection(sessionId, binding.group, member, session, "check", current, this.#signal(signal))) return;
       this.router.markTried(sessionId, member.key);
       await this.#switchCandidates(session, binding.group, current, true, this.#signal(signal));
@@ -399,17 +406,26 @@ export class ProviderGroupService {
       let assignment: ProviderGroupAssignment;
       try { assignment = await this.router.pick({ ...session, group, modelId: session.profile.modelId, ownTask: true, fresh: true }, signal); }
       catch (error) {
+        current();
         if (!(error instanceof ProviderGroupUnavailableError)) throw error;
         for (const pending of unreachable.splice(0)) {
           if (!await this.#recoverConnection(session.sessionId, group, pending.member, session, "lost", current, signal)) continue;
           try { await this.#adopt(session.sessionId, pending, beforeSend, current, signal, recovery); return; }
-          catch (targetError) { current(); if (decideProviderGroupFailure(providerGroupFailureSignals(targetError), "target").action !== "switch") throw targetError; }
+          catch (targetError) {
+            const signals = providerGroupFailureSignals(targetError);
+            if (signals.stateMayHaveChanged) throw targetError;
+            current();
+            if (decideProviderGroupFailure(signals, "target").action !== "switch") throw targetError;
+          }
         }
         throw error;
       }
       try { current(); await this.#adopt(session.sessionId, assignment, beforeSend, current, signal, recovery); return; }
       catch (error) {
-        current(); const signals = providerGroupFailureSignals(error), decision = decideProviderGroupFailure(signals, "target");
+        const signals = providerGroupFailureSignals(error);
+        if (signals.stateMayHaveChanged) throw error;
+        current();
+        const decision = decideProviderGroupFailure(signals, "target");
         this.options.log?.(describeProviderGroupFailure(signals, decision));
         if (decision.action !== "switch") throw error;
         if (decision.connection) unreachable.push(assignment);
