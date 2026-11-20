@@ -50,7 +50,7 @@ type EvidenceScreenshot = "header" | "actions" | "timeline" | "gallery" | "galle
   | "connection-add" | "connection-error" | "connection-identity-error" | "actions-scrolled" | "share-selection" | "share-selection-error"
   | "native-user-quote-menu" | "native-assistant-quote-menu"
   | "native-user-message-quote" | "native-assistant-message-quote" | "native-message-quote-error" | "html-guide" | "html-website"
-  | "html-guide-refresh-error" | "html-website-address-error" | "html-website-render-error";
+  | "html-guide-returned" | "html-guide-refresh-error" | "html-website-address-error" | "html-website-render-error";
 type EvidenceResult = "running" | "passed" | "failed";
 type EvidenceStep = {
   name: EvidenceStepName;
@@ -560,7 +560,7 @@ async function runNativeScenario(): Promise<void> {
     value === "" ? "cleared HTML address field" : "HTML display path " + value);
   const chapter = "Workspace guide chapter";
   const refreshedChapter = "Refreshed Workspace guide chapter";
-  const waitChapter = (text = chapter) => waitNode((node) => node.text === text || node.contentDescription === text, "rendered " + text);
+  const waitChapter = () => waitNode((node) => node.text === chapter || node.contentDescription === chapter, "rendered " + chapter);
   await waitAddress(detailsAddress);
   await waitChapter();
   await tap("Previous page");
@@ -585,14 +585,13 @@ async function runNativeScenario(): Promise<void> {
       await tapNode(refresh!);
     });
     await waitAddress(detailsAddress);
-    await waitChapter(refreshedChapter);
+    await assertAndroidWebViewHeading(refreshedChapter, "html-guide");
   } catch (error) {
     await screenshot("html-guide-refresh-error").catch(() => undefined);
     const observed = await nodes(Date.now() + 5_000).catch(() => []);
     throw new Error("The refreshed Workspace document did not render. Native nodes: " + JSON.stringify(observed.slice(0, 80)
       .map(node => ({ text: node.text?.slice(0, 180), label: node.contentDescription?.slice(0, 160), bounds: node.bounds }))), { cause: error });
   }
-  await screenshot("html-guide");
   await completeStep();
 
   await beginStep("open-isolated-html-website");
@@ -648,12 +647,11 @@ async function runNativeScenario(): Promise<void> {
         await tapNode(open!);
       });
       await waitFor(async () => websiteEvidence.requestCount, (count) => count > 0, "request to the isolated website fixture", 25_000);
-      await waitNode((node) => node.text === "Isolated website fixture" || node.contentDescription === "Isolated website fixture", "isolated website rendered in the native app");
+      await assertAndroidWebViewHeading("Isolated website fixture", "html-website");
       expect(websiteEvidence.requestsWithCredentials).toBe(0);
-      await screenshot("html-website");
       await tap("Previous page");
       await waitAddress(detailsAddress);
-      await waitChapter(refreshedChapter);
+      await assertAndroidWebViewHeading(refreshedChapter, "html-guide-returned");
     } catch (error) {
       await screenshot("html-website-render-error").catch(() => undefined);
       const observed = await nodes(Date.now() + 5_000).catch(() => []);
@@ -666,6 +664,20 @@ async function runNativeScenario(): Promise<void> {
     finally { site.closeAllConnections(); await new Promise<void>((resolve) => site.close(() => resolve())); }
   }
   await completeStep();
+}
+
+async function assertAndroidWebViewHeading(heading: string, name: EvidenceScreenshot): Promise<void> {
+  try {
+    await waitNode((node) => node.text === heading || node.contentDescription === heading, "rendered " + heading);
+  } catch (cause) {
+    // This WebView can paint its document while UiAutomation only reports the native toolbar.
+    const frame = await screenshot(name);
+    const rendered = (await readAndroidScreenshotText(frame.file)).toLowerCase().replace(/\s+/gu, " ");
+    if (!rendered.includes(heading.toLowerCase())) throw cause;
+    console.log(JSON.stringify({ phase: activeStep?.name, observation: "screenshot-ocr", screenshot: frame.file, sha256: frame.sha256 }));
+    return;
+  }
+  await screenshot(name);
 }
 
 async function assertRestoredMarkdown(): Promise<void> {
