@@ -66,11 +66,14 @@ const PI_RELEASE_STARTUP_MEMBERS: Readonly<Record<string, readonly string[]>> = 
   theme: ["dark.json", "light.json"]
 };
 const PI_PUBLISHED_ENTRY = `node_modules/${PUBLISHED_PI_PACKAGE_NAME}/joko-rpc-launch.mjs`;
+const PI_MANAGED_BRIDGE_PACKAGES = {
+  "@earendil-works/pi-ai": ["package.json", "dist/api/simple-options.js", "dist/utils/estimate.js", "README.md"]
+} as const;
 const PI_PUBLISHED_SSH_FILES = {
   [PUBLISHED_PI_PACKAGE_NAME]: ["package.json", "dist/bundle", "dist/modes/interactive/theme", "dist/modes/interactive/assets",
     "dist/core/export-html", "docs", "examples", "README.md", "CHANGELOG.md"],
   "@earendil-works/chord": ["package.json", "dist/context", "README.md"],
-  "@earendil-works/pi-ai": ["package.json", "dist/api/simple-options.js", "dist/utils/estimate.js", "README.md"],
+  ...PI_MANAGED_BRIDGE_PACKAGES,
   jiti: ["package.json", "lib", "dist", "LICENSE"],
   typebox: ["package.json", "build", "license"],
   undici: ["package.json", "index.js", "index-fetch.js", "lib", "LICENSE"],
@@ -731,7 +734,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
       const standaloneRelease = binding.kind === "ssh" && basename(spec.command) === "pi"
         && (await lstat(spec.command)).size > MAXIMUM_SYNC_FILE_BYTES;
       commandSnapshot = standaloneRelease
-        ? await snapshotLocalCompatibilityAsset(dirname(resolve(spec.command)), "pi_release")
+        ? await snapshotStandaloneSshPi(dirname(resolve(spec.command)))
         : await snapshotAsset(spec.command);
       compatibilityAssets.push({
         role: "command",
@@ -3457,12 +3460,42 @@ function compatibilityAssetRole(
 }
 
 async function snapshotPublishedSshPi(root: string): Promise<LocalAssetSnapshot> {
-  const packageModulesRoot = dirname(dirname(root));
-  const entries: LocalAssetSnapshotEntry[] = [{ path: "", kind: "directory", mode: 0o700 }];
-  const directories = new Set<string>();
   // Keep the bundle's external imports and the managed bridge's published
   // option resolver alongside the bundle, using the installed dependency bytes.
-  for (const [name, members] of Object.entries(PI_PUBLISHED_SSH_FILES)) {
+  const packages = await snapshotPublishedPiPackages(root, PI_PUBLISHED_SSH_FILES);
+  return createLocalAssetSnapshot([
+    { path: "", kind: "directory", mode: 0o700 },
+    ...packages,
+    { path: PI_PUBLISHED_ENTRY, kind: "file", mode: 0o600, content: Buffer.from(PI_PUBLISHED_LAUNCHER) }
+  ]);
+}
+
+async function snapshotStandaloneSshPi(root: string): Promise<LocalAssetSnapshot> {
+  const release = await snapshotLocalCompatibilityAsset(root, "pi_release");
+  const manifest = release.entries.find(entry => entry.path === "package.json")?.content;
+  if (manifest === undefined || manifest.byteLength > 64 * 1024) {
+    throw new Error("Remote Pi release manifest is unavailable.");
+  }
+  const candidate: unknown = JSON.parse(manifest.toString("utf8"));
+  const installed: unknown = JSON.parse(await readFile(join(PUBLISHED_PI_PACKAGE_ROOT, "package.json"), "utf8"));
+  if (!isPlainRecord(candidate) || !isPlainRecord(installed) || candidate["name"] !== PUBLISHED_PI_PACKAGE_NAME
+    || typeof installed["version"] !== "string" || candidate["version"] !== installed["version"]) {
+    throw new Error("Remote Pi release does not match the managed bridge's published runtime dependencies.");
+  }
+  // The standalone binary bundles its extension loader. The bridge imports
+  // this matching published option helper from the staged release root.
+  const packages = await snapshotPublishedPiPackages(PUBLISHED_PI_PACKAGE_ROOT, PI_MANAGED_BRIDGE_PACKAGES);
+  return createLocalAssetSnapshot([...release.entries, ...packages]);
+}
+
+async function snapshotPublishedPiPackages(
+  root: string,
+  packages: Readonly<Record<string, readonly string[]>>
+): Promise<readonly LocalAssetSnapshotEntry[]> {
+  const packageModulesRoot = dirname(dirname(root));
+  const entries: LocalAssetSnapshotEntry[] = [];
+  const directories = new Set<string>();
+  for (const [name, members] of Object.entries(packages)) {
     const packageRoot = name === PUBLISHED_PI_PACKAGE_NAME ? root
       : await realpath(join(root, "node_modules", name)).catch((error: NodeJS.ErrnoException) => {
           if (error.code !== "ENOENT") throw error;
@@ -3483,8 +3516,7 @@ async function snapshotPublishedSshPi(root: string): Promise<LocalAssetSnapshot>
       })));
     }
   }
-  entries.push({ path: PI_PUBLISHED_ENTRY, kind: "file", mode: 0o600, content: Buffer.from(PI_PUBLISHED_LAUNCHER) });
-  return createLocalAssetSnapshot(entries);
+  return entries;
 }
 
 async function snapshotLocalCompatibilityAsset(root: string, kind?: "pi_release" | "published_package"): Promise<LocalAssetSnapshot> {

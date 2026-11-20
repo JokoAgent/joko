@@ -47,6 +47,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { closeSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createBashTool, createPowerShellTool, createLocalBashOperations, getPackageDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import * as piSdk from "@earendil-works/pi-coding-agent";
@@ -683,14 +684,21 @@ function mcpBusinessFailure(content: unknown, details: unknown): string {
     .trim();
 }
 
-export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void> {
-  // Resolve the public helper with ESM conditions from the active published
-  // runtime, using its own extension loader dependency.
-  const runtimePackage = resolve(getPackageDir(), "package.json");
+function resolvePublishedOptionHelper(): string {
+  const runtimeRoot = resolve(getPackageDir());
+  if (typeof process.versions.bun === "string" && dirname(process.execPath) === runtimeRoot) {
+    // The standalone launch stages this published helper beside the executable.
+    // Bun's compiled package resolver does not see the runtime's extra packages.
+    return pathToFileURL(resolve(runtimeRoot, "node_modules", "@earendil-works", "pi-ai", "dist", "api", "simple-options.js")).href;
+  }
+  const runtimePackage = resolve(runtimeRoot, "package.json");
   const nativeRequire = createRequire(runtimePackage);
   const { createJiti } = nativeRequire("jiti");
-  const runtimeResolver = createJiti(runtimePackage);
-  const { buildBaseOptions } = await import(runtimeResolver.esmResolve("@earendil-works/pi-ai/api/simple-options"));
+  return createJiti(runtimePackage).esmResolve("@earendil-works/pi-ai/api/simple-options");
+}
+
+export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void> {
+  const { buildBaseOptions } = await import(resolvePublishedOptionHelper());
   const modelCatalog = createPiModelCatalogAdditions({ buildBaseOptions, clampThinkingLevel });
   const nativeModels = await ModelRuntime.create({
     modelsPath: null, allowModelNetwork: false, refreshOnCreate: false,

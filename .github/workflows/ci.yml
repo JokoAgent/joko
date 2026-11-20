@@ -111,6 +111,20 @@ jobs:
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' && runner.os == 'Linux' }}
         shell: bash
         run: pnpm --filter @joko/adapter-pi exec vitest run src/adapter.test.ts -t 'keeps the configured npm symlink for the local probe and stages its published bundle for SSH|stages only selected Skills and their assets for an explicit paired Partner Home' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/pi-launcher.log"
+      - name: Check the published Linux Pi executable staged for SSH
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' && runner.os == 'Linux' }}
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          pi_release_dir="$(mktemp -d "$RUNNER_TEMP/published-pi.XXXXXX")"
+          pi_archive="$pi_release_dir/pi-linux-x64.tar.gz"
+          curl --fail --location --retry 2 'https://github.com/earendil-works/pi/releases/download/v0.85.1/pi-linux-x64.tar.gz' --output "$pi_archive"
+          printf '%s  %s\n' 494e498f47d74d21f40b3386f6a5e921a3d49531a169cab55bbdaca0ea1fe25a "$pi_archive" | sha256sum --check
+          tar -tzf "$pi_archive" | tee "$RUNNER_TEMP/orchestrator-regressions/pi-standalone-members.log"
+          tar --extract --gzip --file "$pi_archive" --directory "$pi_release_dir" --no-same-owner
+          export JOKO_PI_STANDALONE_TEST_EXECUTABLE="$pi_release_dir/pi/pi"
+          test "$("$JOKO_PI_STANDALONE_TEST_EXECUTABLE" --version)" = '0.85.1'
+          pnpm --filter @joko/orchestrator exec vitest run src/remote-pi-process.test.ts -t 'starts the published standalone archive SSH Pi RPC' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/pi-standalone-rpc.log"
       - name: Check actual remote Review and workspace search
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' && runner.os == 'Linux' }}
         working-directory: apps/orchestrator
