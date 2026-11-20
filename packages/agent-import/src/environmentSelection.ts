@@ -105,7 +105,8 @@ function importRedactions(items: ImportItem[], env: Record<string, string>): Rec
     contentRedactions: { ...Object.fromEntries(commandEnvironments.flatMap(environment => Object.entries(environmentRedactions(environment)))
       .map(([name, value], index) => [`command_${index}_${name}`, value])), ...literalMasks },
     mcp: items.flatMap(item => item.mcp ? [resolve(item.mcp) as NonNullable<typeof item.mcp>] : []),
-    credentials: items.flatMap(item => item.credential ? [{ id: item.view.id, ...item.credential, value: resolve(item.credential.value) }] : []),
+    credentials: items.flatMap(item => item.credential && item.view.category !== 'bots'
+      ? [{ id: item.view.id, ...item.credential, value: resolve(item.credential.value) }] : []),
   });
 }
 

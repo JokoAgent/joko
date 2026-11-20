@@ -3,10 +3,10 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import {
   AgentImportError, changeSourceAutomationState, createEnvironmentRedactor, createImportSourceReader,
-  fingerprint, importDelivery, memoryFileContent, projectImportedSkill, resolveImportReferences,
+  fingerprint, importDelivery, memoryFileContent, object, projectImportedSkill, resolveImportReferences, takeOverImportedBot,
   retainedImportRedactions, selectedImportEnvironment, sniffImportedMediaMime, validateImportSelection, readOpenClawCronDatabase,
   verifyImportedAutomation, writeImportFiles, readImportTree, createImportBudget,
-  type AgentImportSelection, type ImportedEnvironment, type ImportedRoutineInput, type ImportItem, type ImportVerificationDeps,
+  type AgentImportSelection, type ImportedBotProgress, type ImportedEnvironment, type ImportedRoutineInput, type ImportItem, type ImportVerificationDeps,
 } from "@joko/agent-import";
 import { decodePartnerAvatar, normalizedPartnerName, type PartnerCapabilitiesRecord, type PartnerProfileRecord, type OperationalStore } from "@joko/store";
 import type { ArtifactStore } from "./artifact-store.js";
@@ -17,6 +17,7 @@ import { parseRoutineInput } from "./partner-routine-definition.js";
 import type { PartnerImportEffectContext } from "./partner-import-manager.js";
 import type { PartnerImportStorage } from "./partner-import-storage.js";
 import type { PiResourceManager } from "./resource-manager.js";
+import type { PartnerMessagingRuntime } from "./partner-messaging.js";
 
 interface CreationDraft { version: 1; directoryRevision: string; capabilities: PartnerCapabilitiesRecord; }
 export const importedPartnerId = (requestId: string): string => `agent_import_${fingerprint(requestId).slice(0, 32)}`;
@@ -72,6 +73,7 @@ export async function adoptPartnerImportSettings(partners: PartnerManager, store
 export async function createPartnerImportEffects(options: {
   partners: PartnerManager; routines: PartnerRoutineManager; storage: PartnerImportStorage; store: OperationalStore;
   memory: MakerMemoryController; resources: PiResourceManager; artifacts: ArtifactStore;
+  partnerMessaging?: Pick<PartnerMessagingRuntime, "importedBotTarget">;
   verification: ImportVerificationDeps; home: string; environment: NodeJS.ProcessEnv;
 }, context: PartnerImportEffectContext) {
   const { partners, routines, storage, store } = options;
@@ -374,6 +376,21 @@ export async function createPartnerImportEffects(options: {
       assertPartner(partnerId); return routine.id;
     },
     verifyAutomation: (partnerId: string, item: ImportItem) => verifyImportedAutomation(partnerId, item, () => { assertPartner(partnerId); }, options.verification, selected, snapshot.source.root),
+    async takeOverBot(partnerId: string, item: ImportItem, progress: ImportedBotProgress | undefined,
+      save: (progress: ImportedBotProgress | undefined) => Promise<void>) {
+      const bot = item.bot;
+      const token = object(item.credential?.value).token;
+      if (selection.takeoverBots !== true || !bot || typeof token !== "string" || !options.partnerMessaging) {
+        return "IMPORT_IM_BOT_CONNECT_FAILED";
+      }
+      const current = () => { assertPartner(partnerId); };
+      current();
+      const target = options.partnerMessaging.importedBotTarget({ requestId: selection.requestId, entryId: item.view.id,
+        partnerId, channel: bot.channel, ownerProviderUserId: bot.ownerProviderUserId, token, assertCurrent: current });
+      return await takeOverImportedBot({ source: snapshot.source, item, target, progress, save, assertOwner: current,
+        readers: { home: options.home, env: options.environment, assertOwner: current, parseRoutineInput,
+          readCronDatabase: input => readOpenClawCronDatabase(input, current) } });
+    },
     pauseSource: (item: ImportItem, source: typeof snapshot, resumeInterrupted: boolean) => changeSourceAutomationState(source.source, item, false,
       { home: options.home, env: options.environment, assertOwner: () => { assertPartner(importedPartnerId(selection.requestId)); }, parseRoutineInput,
         readCronDatabase: input => readOpenClawCronDatabase(input, () => { assertPartner(importedPartnerId(selection.requestId)); }) },

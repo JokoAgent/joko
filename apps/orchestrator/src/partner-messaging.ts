@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type { ImportedBotTarget } from '@joko/agent-import';
 import type { PromptInput, SessionDescriptor } from '@joko/core';
 import type { MessagingInboundEvent, MessagingInboundMessage } from '@joko/messaging';
 import { StoreError, NotFoundError, type ConnectionRecord, type MessagingConnectionRecord, type MessagingConversationRecord,
@@ -96,6 +97,73 @@ export class PartnerMessagingRuntime {
       store.setSetting('service', SCOPE, `binding:${input.connectionId}`, next);
       return next;
     });
+  }
+
+  /** A durable import grants one disabled connection the exact ready Partner destination. */
+  importedBotTarget(input: { readonly requestId: string; readonly entryId: string; readonly partnerId: string;
+    readonly channel: 'telegram' | 'discord'; readonly ownerProviderUserId: string; readonly token: string; readonly assertCurrent: () => void }): ImportedBotTarget {
+    const messaging = this.options.messaging;
+    const connectionId = 'import_bot_' + createHash('sha256').update(JSON.stringify([input.requestId, input.entryId])).digest('hex').slice(0, 40);
+    let connection: MessagingConnectionRecord | undefined;
+    let bindingRevision: number | undefined;
+    const assertPartner = () => {
+      input.assertCurrent();
+      const partner = this.options.partners.getPartner(input.partnerId);
+      if (partner.lifecycle !== 'active' || partner.initializationState !== 'ready' || !partner.canonicalSessionId || partner.pauseCleanupPending) {
+        throw new StoreError('The selected Partner is no longer ready.');
+      }
+      this.options.partners.canonicalCaller(partner.canonicalSessionId);
+    };
+    const prepare = () => messaging.prepareImportedBot({ ...input, connectionId, assertCurrent: assertPartner });
+    const assertBinding = () => {
+      assertPartner();
+      const binding = this.binding(connectionId);
+      if (binding.partnerId !== input.partnerId || binding.revision !== bindingRevision) throw new StoreError('The imported bot destination changed.');
+    };
+    return {
+      preflight: async () => {
+        connection = await prepare();
+        assertPartner();
+        if (connection === undefined) return 'occupied';
+        let binding = this.binding(connectionId);
+        if (binding.partnerId !== input.partnerId) {
+          if (binding.revision !== 0 || connection.enabled) return 'occupied';
+          this.options.store.transaction(store => {
+            assertPartner();
+            const current = store.getMessagingConnection(connectionId);
+            if (current.revision !== connection?.revision || current.enabled || this.binding(connectionId).revision !== 0) {
+              throw new StoreError('The imported Messaging connection changed.');
+            }
+            store.setSetting('service', SCOPE, `binding:${connectionId}`, { version: 1, revision: 1, partnerId: input.partnerId } satisfies BindingValue);
+          });
+          binding = this.binding(connectionId);
+        }
+        bindingRevision = binding.revision;
+        if (connection.enabled) return 'enabled';
+        const probe = await messaging.testConnection(connectionId);
+        assertBinding();
+        return probe.ok ? 'available' : 'failed';
+      },
+      connect: async () => {
+        assertBinding();
+        if (!connection) return 'failed';
+        connection = await messaging.changeImportedBotConnection(connection, true, assertBinding);
+        return await messaging.observeImportedBotConnection(connection, assertBinding);
+      },
+      stop: async () => {
+        try {
+          assertPartner();
+          if (!this.options.store.findMessagingConnection(connectionId)) return true;
+          connection ??= await prepare();
+          if (!connection) return false;
+          const binding = this.binding(connectionId);
+          if (binding.partnerId !== input.partnerId) return false;
+          bindingRevision ??= binding.revision;
+          connection = await messaging.changeImportedBotConnection(connection, false, assertBinding);
+          return !connection.enabled;
+        } catch { assertPartner(); return false; }
+      }
+    };
   }
 
   #destination(conversation: MessagingConversationRecord) {

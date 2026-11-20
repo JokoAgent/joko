@@ -423,6 +423,8 @@ interface ActiveWorker {
   readonly generation: number;
   readonly controller: AbortController;
   readonly task: Promise<void>;
+  pollConfirmed?: boolean;
+  stopOnInitialConflict?: boolean;
   transport?: MessagingTransportPort;
   registeredTelegramSpeakers?: Set<string>;
   telegramGroupMedia?: Map<string, TelegramGroupMedia>;
@@ -753,7 +755,9 @@ export class MessagingManager {
           conversationId: conversation.id, expectedRevision: conversation.revision, retiredAt: this.#now() });
         return stopped;
       });
-      this.#restartWorker(connectionId); return updated;
+      this.#restartWorker(connectionId);
+      if (connectionId.startsWith("import_bot_")) await this.#waitForImportedBotStop(connectionId);
+      return updated;
     });
   }
 
@@ -847,6 +851,88 @@ export class MessagingManager {
       configuration,
       ownerProviderUserId: discordUserId(input.ownerProviderUserId)
     });
+  }
+
+  /** The import receipt names one disabled destination before it touches the source gateway. */
+  prepareImportedBot(input: { readonly connectionId: string; readonly channel: "telegram" | "discord";
+    readonly ownerProviderUserId: string; readonly token: string; readonly assertCurrent: () => void }): Promise<MessagingConnectionRecord | undefined> {
+    return this.#mutate(async () => {
+      input.assertCurrent();
+      if (!/^import_bot_[a-f0-9]{40}$/u.test(input.connectionId)) throw invalid("Invalid imported Messaging connection.");
+      const owner = input.channel === "telegram" ? telegramUserId(input.ownerProviderUserId) : discordUserId(input.ownerProviderUserId);
+      let connection = this.#store.findMessagingConnection(input.connectionId);
+      if (connection && (connection.channel !== input.channel || connection.ownerProviderUserId !== owner)) return undefined;
+      for (const existing of this.#store.listMessagingConnections()) {
+        if (existing.channel !== input.channel || existing.credentialReferenceId === undefined) continue;
+        if (this.#credentials.find(existing.credentialReferenceId) === undefined) continue;
+        const sameCredential = this.#credentials.resolve(existing.credentialReferenceId) === input.token;
+        if (existing.id === input.connectionId ? !sameCredential : sameCredential) return undefined;
+      }
+      connection ??= this.#store.createMessagingConnection({ id: input.connectionId, channel: input.channel, ownerProviderUserId: owner,
+        configuration: input.channel === "telegram" ? DEFAULT_TELEGRAM_MESSAGING_CONFIGURATION : DEFAULT_DISCORD_MESSAGING_CONFIGURATION });
+      if (connection.credentialReferenceId !== undefined) return connection;
+      const ticket = this.#credentials.createUploadTicket({ maximumBytes: CREDENTIAL_MAXIMUM_BYTES, kind: "api_key",
+        connectionId: connection.id, servicePurpose: credentialPurpose(connection) });
+      this.#credentials.upload(ticket.credentialUploadTicketId, input.token, connection.id);
+      try {
+        const credential = await this.#credentials.commitNewManagedUpload({
+          credentialUploadTicketId: ticket.credentialUploadTicketId, displayName: credentialDisplayName(connection.channel), kind: "api_key",
+          connectionId: connection.id, servicePurpose: credentialPurpose(connection),
+          onReserved: reference => this.#appendCredentialJournal(reference)
+        });
+        input.assertCurrent();
+        return this.#store.replaceMessagingCredential({ connectionId: connection.id, expectedRevision: connection.revision,
+          expectedGeneration: connection.generation, credentialReferenceId: credential.credentialReferenceId,
+          credentialGeneration: credential.generation, ownerProviderUserId: owner, enable: false, updatedAt: this.#now() });
+      } finally { await this.#cleanupCredentials(); }
+    });
+  }
+
+  changeImportedBotConnection(connection: MessagingConnectionRecord, enabled: boolean, assertCurrent: () => void): Promise<MessagingConnectionRecord> {
+    return this.#mutate(async () => {
+      assertCurrent();
+      const current = this.#store.getMessagingConnection(connection.id);
+      if (!/^import_bot_[a-f0-9]{40}$/u.test(current.id) || current.generation !== connection.generation
+        || current.credentialReferenceId !== connection.credentialReferenceId || current.credentialGeneration !== connection.credentialGeneration
+        || current.channel !== connection.channel || current.ownerProviderUserId !== connection.ownerProviderUserId) {
+        throw invalid("The imported Messaging connection changed.");
+      }
+      let updated = current;
+      if (current.enabled !== enabled) {
+        updated = this.#store.setMessagingConnectionEnabled({ connectionId: current.id, expectedRevision: current.revision,
+          expectedGeneration: current.generation, enabled, updatedAt: this.#now() });
+        this.#restartWorker(current.id, enabled);
+      }
+      if (!enabled) await this.#waitForImportedBotStop(current.id);
+      assertCurrent();
+      return updated;
+    });
+  }
+
+  async #waitForImportedBotStop(connectionId: string): Promise<void> {
+    const retirement = this.#workerRetirements.get(connectionId);
+    if (retirement === undefined) return;
+    const timer = new AbortController();
+    try {
+      const stopped = await Promise.race([retirement.then(() => true), abortableDelay(5_000, timer.signal).then(() => false)]);
+      if (!stopped) throw invalid("The imported Messaging connection has not stopped.");
+    } finally { timer.abort(); }
+  }
+
+  async observeImportedBotConnection(connection: MessagingConnectionRecord, assertCurrent: () => void): Promise<"connected" | "failed" | "unknown"> {
+    const stopAt = Date.now() + 60_000;
+    do {
+      assertCurrent();
+      const current = this.#store.findMessagingConnection(connection.id);
+      if (current?.generation !== connection.generation || !current.enabled) return "unknown";
+      const worker = this.#workers.get(connection.id);
+      if (worker?.generation === current.generation) {
+        if (worker.pollConfirmed === true && current.runtimeStatus === "connected") return "connected";
+        if (worker.pollConfirmed !== true) worker.stopOnInitialConflict = true;
+      } else if (!this.#workerRetirements.has(connection.id)) return "failed";
+      await abortableDelay(250, worker?.controller.signal ?? AbortSignal.timeout(1_000)).catch(() => undefined);
+    } while (Date.now() < stopAt);
+    return "unknown";
   }
 
   createSlackConnection(input: {
@@ -1580,7 +1666,7 @@ export class MessagingManager {
     await Promise.allSettled(this.#deliveryFlights.values());
   }
 
-  #startWorker(connectionId: string): void {
+  #startWorker(connectionId: string, stopOnInitialConflict = false): void {
     if (this.#closed) return;
     const connection = this.#store.getMessagingConnection(connectionId);
     if (!connection.enabled) return;
@@ -1588,7 +1674,8 @@ export class MessagingManager {
     const worker: ActiveWorker = {
       generation: connection.generation,
       controller,
-      task: Promise.resolve()
+      task: Promise.resolve(),
+      stopOnInitialConflict
     };
     const task = this.#runConnection(connection.id, connection.generation, controller.signal)
       .catch((error: unknown) => this.#recordFailure("WORKER_FAILED", connection.id, error))
@@ -1599,7 +1686,7 @@ export class MessagingManager {
     this.#workers.set(connection.id, worker);
   }
 
-  #restartWorker(connectionId: string): void {
+  #restartWorker(connectionId: string, stopOnInitialConflict = false): void {
     const previous = this.#workers.get(connectionId);
     previous?.controller.abort();
     this.#workers.delete(connectionId);
@@ -1610,10 +1697,10 @@ export class MessagingManager {
       clearTimeout(state.timer);
       this.#slackPresence.delete(requestId);
     }
-    if (connection.channel === "wechat") {
+    const priorRetirement = this.#workerRetirements.get(connectionId);
+    if (connection.channel === "wechat" || (connectionId.startsWith("import_bot_") && (previous !== undefined || priorRetirement !== undefined))) {
       // The provider's best-effort stop call belongs to the old transport.
       // Do not let its late close stop a newly authenticated generation.
-      const priorRetirement = this.#workerRetirements.get(connectionId);
       const retirement = (priorRetirement ?? Promise.resolve())
         .then(async () => { await previous?.task; })
         .catch(() => undefined);
@@ -1623,11 +1710,11 @@ export class MessagingManager {
         this.#workerRetirements.delete(connectionId);
         if (this.#closed || this.#workers.has(connectionId)) return;
         const latest = this.#store.findMessagingConnection(connectionId);
-        if (latest?.enabled) this.#startWorker(connectionId);
+        if (latest?.enabled) this.#startWorker(connectionId, stopOnInitialConflict);
       });
       return;
     }
-    if (connection.enabled) this.#startWorker(connection.id);
+    if (connection.enabled) this.#startWorker(connection.id, stopOnInitialConflict);
   }
 
   async #runConnection(connectionId: string, generation: number, signal: AbortSignal): Promise<void> {
@@ -1663,12 +1750,18 @@ export class MessagingManager {
       } catch (error) {
         if (signal.aborted || this.#closed || isCancelled(error)) return;
         const retry = this.#runtimeFailure(connectionId, generation, error);
+        const worker = this.#workers.get(connectionId);
+        if (worker?.generation === generation && worker.stopOnInitialConflict
+          && error instanceof MessagingTransportError && error.code === "conflict") return;
         if (!retry) return;
         attempt += 1;
         await abortableDelay(retryDelay(error, attempt, this.#retryDelayMs, current.channel), signal).catch(() => undefined);
       } finally {
         const worker = this.#workers.get(connectionId);
-        if (worker?.generation === generation) worker.transport = undefined;
+        if (worker?.generation === generation) {
+          worker.transport = undefined;
+          worker.pollConfirmed = false;
+        }
         await transport?.close?.().catch(() => undefined);
       }
     }
@@ -1769,6 +1862,11 @@ export class MessagingManager {
         }
         if (transport.channel === "telegram") store.clearMessagingPollBatch(latest.id, latest.generation);
       });
+      const worker = this.#workers.get(latest.id);
+      if (worker?.generation === latest.generation) {
+        worker.pollConfirmed = true;
+        worker.stopOnInitialConflict = false;
+      }
       await this.#drainDeliveries(transport, signal);
     }
   }

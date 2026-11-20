@@ -42,6 +42,7 @@ export class PartnerImportCommandTools implements BridgeToolProvider {
         entryRanges: { type: "array", description: "Zero-based inclusive ranges from the preview, instead of entryIds.",
           items: { type: "array", items: { type: "integer", minimum: 0 }, minItems: 2, maxItems: 2 } },
         takeover: { type: "boolean", description: "Request explicit approval to take over selected source automations." },
+        takeoverBots: { type: "boolean", description: "Request approval to move the selected messaging bots from their source to this Partner." },
         deferSetup: { type: "boolean", default: true }
       } }
     } }
@@ -147,7 +148,8 @@ export class PartnerImportCommandTools implements BridgeToolProvider {
           const selection = importSelection(input.selection, scope.receiptPrefix);
           return success(await imports.start(selection, scope, async review => {
             if (!await this.options.host.requestOwnerToolApproval({ ...scope, id: `partner-import-permission-${randomUUID()}`,
-              tool: "Partner import", title: selection.takeover ? "Import the selected entries and take over source schedules?" : "Import the selected entries?",
+              tool: "Partner import", title: selection.takeoverBots ? "Import the selected entries and move the selected messaging bots?"
+                : selection.takeover ? "Import the selected entries and take over source schedules?" : "Import the selected entries?",
               summary: reviewSummary(review, selection) }, signal)) throw new AgentImportError("IMPORT_SELECTION_DENIED");
           }));
         }
@@ -180,6 +182,7 @@ function importSelection(value: unknown, prefix: string): AgentImportSelection {
   const previewId = requireUuid(input.previewId);
   const requestId = receiptId(input.requestId, prefix);
   if (requestId !== prefix + previewId || typeof input.name !== "string" || typeof input.takeover !== "boolean"
+    || input.takeoverBots !== undefined && typeof input.takeoverBots !== "boolean"
     || input.deferSetup !== undefined && typeof input.deferSetup !== "boolean") throw new AgentImportError("INVALID_SELECTION");
   const entryIds = input.entryIds ?? [];
   if (!Array.isArray(entryIds) || !entryIds.every((id): id is string => typeof id === "string")) throw new AgentImportError("INVALID_SELECTION");
@@ -191,7 +194,7 @@ function importSelection(value: unknown, prefix: string): AgentImportSelection {
   });
   if (entryIds.length === 0 && !entryRanges?.length) throw new AgentImportError("INVALID_SELECTION");
   return { previewId, requestId, name: input.name, entryIds, ...(entryRanges === undefined ? {} : { entryRanges }),
-    takeover: input.takeover, deferSetup: input.deferSetup ?? true };
+    takeover: input.takeover, ...(input.takeoverBots === true ? { takeoverBots: true } : {}), deferSetup: input.deferSetup ?? true };
 }
 
 function previewPage(preview: AgentImportPreview, offset: number, requestId: string) {
@@ -206,7 +209,9 @@ function reviewSummary(review: PartnerImportReview, selection: AgentImportSelect
   const label = (value: string) => redactSecrets(value).replace(/[\s\p{Cc}\p{Cf}]+/gu, " ").trim();
   const entries = review.entries.map(entry => `• ${label(entry.name)} (${label(entry.id)})`).join("\n");
   const setup = selection.deferSetup ? "Save first and configure later." : "Configure and verify after saving.";
-  const summary = [`${label(review.name)} from ${label(review.sourceName)}`, setup, `Selected entries (${review.entries.length})`, entries].join("\n");
+  const summary = [`${label(review.name)} from ${label(review.sourceName)}`, setup,
+    ...(selection.takeoverBots ? ["Joko will stop the selected original bots before connecting them to the Partner."] : []),
+    `Selected entries (${review.entries.length})`, entries].join("\n");
   if (summary.length > 32_000) throw new AgentImportError("IMPORT_SELECTION_REVIEW_TOO_LARGE");
   return summary;
 }

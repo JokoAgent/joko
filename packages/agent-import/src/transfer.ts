@@ -6,6 +6,7 @@ import { AgentImportError, importFailureCode, object, type ImportItem, type Impo
 import { normalizeImportSkill, readImportSkillTree } from './skills.js';
 import { memoryFileContent } from './memoryFiles.js';
 import { resolveImportEnvironmentDependencies, selectedImportEnvironment } from './environmentSelection.js';
+import type { ImportedBotProgress } from './bot-takeover.js';
 
 export interface ImportReceipt {
   version: 1;
@@ -24,6 +25,7 @@ export interface ImportReceipt {
   cancelled: boolean;
   nativePackage?: ImportSnapshot["nativePackage"];
   routines: Record<string, { id: string; phase: 'created' | 'verified' | 'pausing-source' | 'source-paused' | 'complete'; sourceRestored?: boolean }>;
+  bots?: Record<string, ImportedBotProgress>;
 }
 
 export interface TransferDeps {
@@ -45,6 +47,8 @@ export interface TransferDeps {
   pauseSource(item: ImportItem, snapshot: ImportSnapshot, resumeInterruptedPause: boolean): Promise<void>;
   resumeSource(item: ImportItem, snapshot: ImportSnapshot): Promise<void>;
   enableRoutine(partnerId: string, routineId: string, item: ImportItem): Promise<void>;
+  takeOverBot?(partnerId: string, item: ImportItem, progress: ImportedBotProgress | undefined,
+    save: (progress: ImportedBotProgress | undefined) => Promise<void>): Promise<string | undefined>;
 }
 
 /** Recovered subtree documents have stable bounded memory identities. */
@@ -54,6 +58,7 @@ function recoveredDocumentId(id: string): string {
 
 function validateSelectionShape(value: AgentImportSelection): void {
   if (!value || typeof value.previewId !== 'string' || !value.previewId || value.previewId.length > 200 || typeof value.requestId !== 'string' || !/^[A-Za-z0-9_-]{16,100}$/.test(value.requestId) || typeof value.name !== 'string' || !value.name.trim() || value.name.length > 200 || typeof value.takeover !== 'boolean' || typeof value.deferSetup !== 'boolean'
+    || value.takeoverBots !== undefined && typeof value.takeoverBots !== 'boolean'
     || !Array.isArray(value.entryIds) || value.entryIds.some(id => typeof id !== 'string') || new Set(value.entryIds).size !== value.entryIds.length
     || value.avatarImageBase64 !== undefined && (typeof value.avatarImageBase64 !== 'string' || !value.avatarImageBase64.length || value.avatarImageBase64.length > 2_000_000))
     throw new AgentImportError('INVALID_SELECTION');
@@ -70,7 +75,8 @@ function validateSelectionShape(value: AgentImportSelection): void {
 /** Safe intent binding remains available after private checkpoints have been removed. */
 export function importSubmissionFingerprint(value: AgentImportSelection): string {
   validateSelectionShape(value);
-  return fingerprint([value.requestId, value.previewId, value.name, value.avatarImageBase64, [...value.entryIds].toSorted(), value.entryRanges, value.takeover, value.deferSetup]);
+  return fingerprint([value.requestId, value.previewId, value.name, value.avatarImageBase64, [...value.entryIds].toSorted(), value.entryRanges,
+    value.takeover, value.deferSetup, ...(value.takeoverBots ? ['takeover-bots'] : [])]);
 }
 
 export function validateImportSelection(value: AgentImportSelection, snapshot: ImportSnapshot): ImportItem[] {
@@ -88,6 +94,7 @@ export function validateImportSelection(value: AgentImportSelection, snapshot: I
   if (ranges) for (const [first, last] of ranges) for (let index = first; index <= last; index++) remaining.add(index);
   const items = snapshot.items.filter(item => ranges ? item.sourceIndex !== undefined && remaining.delete(item.sourceIndex) : selected.has(item.view.id));
   if (items.length !== count || remaining.size) throw new AgentImportError('SELECTION_CHANGED');
+  if (items.some(item => item.view.category === 'bots') && value.takeoverBots !== true) throw new AgentImportError('IMPORT_IM_BOT_APPROVAL_REQUIRED');
   selectedImportEnvironment(items);
   return resolveImportEnvironmentDependencies(items);
 }
@@ -96,7 +103,8 @@ export function validateImportSelection(value: AgentImportSelection, snapshot: I
 export async function validateImportRequestIdentity(snapshot: ImportSnapshot, selection: AgentImportSelection, existing: ImportReceipt | undefined): Promise<string> {
   const items = validateImportSelection(selection, snapshot);
   const selectionHash = fingerprint([selection.name, selection.avatarImageBase64, items.map(item => item.view.id).toSorted(),
-    selection.takeover, snapshot.source.kind, snapshot.source.agentId, snapshot.source.root, selection.deferSetup]);
+    selection.takeover, snapshot.source.kind, snapshot.source.agentId, snapshot.source.root, selection.deferSetup,
+    ...(selection.takeoverBots ? ['takeover-bots'] : [])]);
   if (existing && (existing.selectionHash !== selectionHash || existing.submissionHash !== importSubmissionFingerprint(selection) || existing.deferSetup !== selection.deferSetup))
     throw new AgentImportError('REQUEST_ALREADY_USED');
   return selectionHash;
@@ -240,7 +248,7 @@ export async function transferPartnerImport(snapshot: ImportSnapshot, selection:
   receipt.partnerCreated = true;
   await save();
   // Retry only selected resources; saved batches skip completed idempotent copies.
-  for (const item of items.filter(item => item.view.category !== 'automations' && item.view.category !== 'connections')) {
+  for (const item of items.filter(item => item.view.category !== 'automations' && item.view.category !== 'connections' && item.view.category !== 'bots')) {
     if (copied.has(item.view.id)) continue;
     deps.assertOwner();
     try {
@@ -348,9 +356,39 @@ export async function transferPartnerImport(snapshot: ImportSnapshot, selection:
       await save();
     }
   }
+  for (const item of items.filter(item => item.view.category === 'bots')) {
+    const id = item.view.id;
+    const previous = receipt.bots?.[id];
+    if (previous?.phase === 'connected') { check(id, 'taken-over'); continue; }
+    const issue = item.view.issues?.[0];
+    if (issue !== undefined) { check(id, 'needs-attention', issue); continue; }
+    if (sessionId === undefined || !deps.takeOverBot) {
+      check(id, 'needs-attention', 'IMPORT_PARTNER_SETUP_REQUIRED');
+      continue;
+    }
+    if (previous === undefined && (reconcileOnly || selection.deferSetup && !resumeSetup)) {
+      if (!needsAttention(id)) check(id, 'needs-attention', 'IMPORT_SETUP_DEFERRED');
+      continue;
+    }
+    try {
+      const failure = await deps.takeOverBot(partnerId, item, previous, async progress => {
+        if (progress === undefined) {
+          if (receipt.bots !== undefined) delete receipt.bots[id];
+        } else (receipt.bots ??= {})[id] = progress;
+        await save();
+      });
+      deps.assertOwner();
+      check(id, failure === undefined ? 'taken-over' : 'needs-attention', failure);
+    } catch (error) {
+      deps.assertOwner();
+      check(id, 'needs-attention', importFailureCode(error));
+    }
+    await save();
+  }
   receipt.result.savedEntryIds = [...new Set([...receipt.copied,
     ...items.filter(item => item.view.category === 'connections' && receipt.environmentSaved).map(item => item.view.id),
     ...Object.keys(receipt.routines),
+    ...Object.entries(receipt.bots ?? {}).flatMap(([id, bot]) => bot.phase === 'connected' ? [id] : []),
   ])];
   receipt.result.saved = true;
   receipt.result.status = Object.values(receipt.routines).some(item => item.phase === 'pausing-source' || item.phase === 'source-paused') ? 'running'

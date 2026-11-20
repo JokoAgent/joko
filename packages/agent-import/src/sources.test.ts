@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
-import { createImportSourceReader, discoverImportSources, inspectImportSource, type SourceReaderDeps } from "./sources.js";
+import { createImportSourceReader, discoverImportSources, inspectImportSource, readImportSourceBot, type SourceReaderDeps } from "./sources.js";
 import { readOpenClawCronDatabase } from "./nativeCron.js";
 import { previewImportRedactions } from "./environmentSelection.js";
 import { redactEnvironmentValues } from "./process.js";
@@ -72,6 +72,43 @@ describe("installed source capture", () => {
       db.exec("DROP TABLE cron_jobs");
       await expect(inspectImportSource(sources[0]!, deps)).rejects.toMatchObject({ code: "SOURCE_DATABASE_UNAVAILABLE" });
     } finally { db.close(); }
+  });
+  it("offers only an owned OpenClaw Discord route and revalidates the original credential and Owner", async () => {
+    const home = await fixture();
+    const root = join(home, ".openclaw");
+    await mkdir(root);
+    const file = join(root, "openclaw.json");
+    const config = {
+      agents: { list: [{ id: "main", default: true }, { id: "worker" }] },
+      channels: { discord: { token: "owned-inherited-discord-token", defaultAccount: "blue", accounts: {
+        blue: { enabled: true, allowFrom: ["10000000000000001", "10000000000000002"] },
+        shared: { token: "owned-shared-discord-token", allowFrom: ["10000000000000003"] },
+        other: { token: "owned-other-discord-token", allowFrom: ["10000000000000004"] }
+      } } },
+      bindings: [
+        { agentId: "main", match: { channel: "discord", accountId: "blue" } },
+        { agentId: "main", match: { channel: "discord", accountId: "shared" } },
+        { agentId: "worker", match: { channel: "discord", accountId: "shared", peer: { kind: "direct", id: "10000000000000005" } } },
+        { agentId: "worker", match: { channel: "discord", accountId: "other" } }
+      ]
+    };
+    await writeFile(file, JSON.stringify(config));
+    const deps = reader(home);
+    const source = (await discoverImportSources(deps)).find(candidate => candidate.agentId === "main")!;
+    const snapshot = await inspectImportSource(source, deps);
+    const bots = snapshot.items.filter(item => item.view.category === "bots");
+    expect(bots.map(item => item.view.name)).toEqual(["Discord · blue", "Discord · blue", "Discord · shared"]);
+    expect(bots[0]?.view).toMatchObject({ description: "10000000000000001", selected: false, exclusiveWith: [bots[1]?.view.id] });
+    expect(bots[1]?.view).toMatchObject({ description: "10000000000000002", selected: false, exclusiveWith: [bots[0]?.view.id] });
+    expect(bots[2]?.view.issues).toEqual(["IMPORT_IM_BOT_SHARED_ROUTE"]);
+    expect(JSON.stringify(bots.map(item => item.view))).not.toContain("owned-inherited-discord-token");
+    const selection = bots[0]!.bot!;
+    expect(await readImportSourceBot(source, selection, deps)).toMatchObject({
+      channel: "discord", account: "blue", token: "owned-inherited-discord-token", enabledPath: ["channels", "discord", "accounts", "blue", "enabled"]
+    });
+    config.channels.discord.accounts.blue.allowFrom.shift();
+    await writeFile(file, JSON.stringify(config));
+    await expect(readImportSourceBot(source, selection, deps)).rejects.toMatchObject({ code: "IMPORT_IM_BOT_SOURCE_CHANGED" });
   });
   it("rejects recursive configuration includes and retires an interrupted metadata read under its original owner", async () => {
     const home = await fixture(); const root = join(home, ".hermes"); await mkdir(root);

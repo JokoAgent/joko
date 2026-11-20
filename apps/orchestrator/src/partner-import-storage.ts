@@ -153,7 +153,7 @@ function strings(value: unknown): value is string[] { return Array.isArray(value
 export function validateImportReceipt(value: unknown): asserts value is ImportReceipt {
   if (record(value) && value.nativePackage !== undefined) validateNativePartnerPackage(value.nativePackage);
   const required = ["version", "selectionHash", "submissionHash", "deferSetup", "result", "entryNames", "copied", "environmentSaved", "checkpointSaved", "checkpointCleared", "partnerCreated", "cancelled", "routines"];
-  if (!record(value) || !fields(value, required, ["creationRejected", "nativePackage"]) || value.version !== 1 || typeof value.selectionHash !== "string" || !/^[a-f0-9]{64}$/.test(value.selectionHash)
+  if (!record(value) || !fields(value, required, ["creationRejected", "nativePackage", "bots"]) || value.version !== 1 || typeof value.selectionHash !== "string" || !/^[a-f0-9]{64}$/.test(value.selectionHash)
     || typeof value.submissionHash !== "string" || !/^[a-f0-9]{64}$/.test(value.submissionHash)
     || ["deferSetup", "environmentSaved", "checkpointSaved", "checkpointCleared", "partnerCreated", "cancelled"].some(key => typeof value[key] !== "boolean")
     || value.creationRejected !== undefined && value.creationRejected !== "IMPORT_NAME_EXISTS"
@@ -167,6 +167,12 @@ export function validateImportReceipt(value: unknown): asserts value is ImportRe
       || check.message !== undefined && (typeof check.message !== "string" || !/^[A-Z][A-Z_]+$/.test(check.message))
       || check.progress !== undefined && (!record(check.progress) || !fields(check.progress, ["saved", "total"])
         || !Number.isSafeInteger(check.progress.saved) || !Number.isSafeInteger(check.progress.total) || Number(check.progress.saved) < 0 || Number(check.progress.total) < Number(check.progress.saved)))
+    || value.bots !== undefined && (!record(value.bots) || Object.entries(value.bots).some(([id, bot]) =>
+      !/^bot-(telegram|discord)-[a-f0-9]{20}$/u.test(id) || !record(bot) || !fields(bot, ["phase"], ["original", "changed", "restarted"])
+      || !["stopping", "stopped", "connecting", "restoring", "connected"].includes(String(bot.phase))
+      || bot.original !== undefined && typeof bot.original !== "boolean" && bot.original !== "on" && bot.original !== "off"
+        && bot.original !== "true" && bot.original !== "false"
+      || bot.changed !== undefined && typeof bot.changed !== "boolean" || bot.restarted !== undefined && typeof bot.restarted !== "boolean"))
     || !record(value.routines) || Object.values(value.routines).some(routine => !record(routine) || !fields(routine, ["id", "phase"], ["sourceRestored"])
       || typeof routine.id !== "string" || !["created", "verified", "pausing-source", "source-paused", "complete"].includes(String(routine.phase))
       || routine.sourceRestored !== undefined && typeof routine.sourceRestored !== "boolean")) throw new AgentImportError("IMPORT_RECEIPT_INVALID");

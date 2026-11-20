@@ -15,6 +15,7 @@ enum PartnerImportCategory {
   PARTNER_IMPORT_CATEGORY_SKILLS = 3;
   PARTNER_IMPORT_CATEGORY_CONNECTIONS = 4;
   PARTNER_IMPORT_CATEGORY_AUTOMATIONS = 5;
+  PARTNER_IMPORT_CATEGORY_BOTS = 6;
 }
 enum PartnerImportStatus {
   PARTNER_IMPORT_STATUS_UNSPECIFIED = 0;
@@ -66,6 +67,7 @@ message PartnerImportSelection {
   repeated PartnerImportEntryRange entry_ranges = 6;
   bool takeover = 7;
   bool defer_setup = 8;
+  bool takeover_bots = 9;
 }
 message PartnerImportProgress { uint32 saved = 1; uint32 total = 2; }
 message PartnerImportCheck {

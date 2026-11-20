@@ -152,6 +152,155 @@ function scalarEnv(value: unknown): Record<string, string> {
     /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(entry[0]) && !['__proto__', 'prototype', 'constructor'].includes(entry[0]) && typeof entry[1] === 'string'));
 }
 
+type BotChannel = "telegram" | "discord";
+interface NativeBot {
+  readonly channel: BotChannel;
+  readonly account: string;
+  readonly token: string;
+  readonly owners: readonly string[];
+  readonly enabledPath: readonly string[];
+  readonly enabled: boolean;
+  readonly switchValue: unknown;
+  readonly shared: boolean;
+  readonly selectedAgent: boolean;
+}
+
+function botEntries(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : typeof value === "string" ? value.split(/[,\s]+/u) : [];
+}
+
+function botOwners(channel: BotChannel, entries: readonly unknown[]): string[] {
+  const pattern = channel === "telegram" ? /^[1-9]\d{0,19}$/u : /^[1-9]\d{16,19}$/u;
+  const prefix = channel === "telegram" ? /^(telegram|tg):/iu : /^(discord|user):/iu;
+  const owners = entries.flatMap(entry => {
+    const text = typeof entry === "number" && Number.isSafeInteger(entry) ? String(entry) : string(entry);
+    const id = text.trim().replace(prefix, "");
+    return pattern.test(id) ? [id] : [];
+  });
+  return [...new Set(owners)].sort();
+}
+
+function enabledBotValue(value: unknown): boolean { return value !== false && value !== "false" && value !== "off"; }
+
+function resolvedBotToken(value: unknown, env: Record<string, string>): string {
+  const reference = object(value);
+  const input = reference.source === "env" && typeof reference.id === "string"
+    ? Object.hasOwn(env, reference.id) ? env[reference.id] : undefined
+    : resolveImportReferences(value, env, true);
+  const token = string(input).trim();
+  return token.length <= 512 && !/\s|\p{Cc}|\$\{/u.test(token) ? token : "";
+}
+
+async function nativeBots(source: ImportSource, values: Record<string, unknown>, env: Record<string, string>,
+  deps: SourceReaderDeps, budget: ImportReadBudget, readText = optionalText): Promise<NativeBot[]> {
+  const bots: NativeBot[] = [];
+  if (source.kind === "package") return bots;
+  if (source.kind === "openclaw" && object(values.gateway).mode === "remote") return bots;
+  for (const channel of ["telegram", "discord"] as const) {
+    const variable = channel.toUpperCase();
+    if (source.kind === "hermes") {
+      const platform = object(object(values.platforms)[channel]);
+      const extra = object(platform.extra);
+      const token = resolvedBotToken(env[`${variable}_BOT_TOKEN`] ?? platform.token, env);
+      if (!token) continue;
+      const allowed = botOwners(channel, botEntries(env[`${variable}_ALLOWED_USERS`]));
+      const home = channel === "telegram"
+        ? botOwners(channel, [env.TELEGRAM_HOME_CHANNEL ?? object(platform.home_channel).chat_id ?? platform.home_channel]) : [];
+      const admins = channel === "telegram" ? botOwners(channel, [...botEntries(extra.group_allow_admin_from), ...botEntries(extra.admins)]) : [];
+      const owners = home.length && (allowed.includes(home[0]!) || allowed.length === 0)
+        ? home : allowed.length ? allowed : admins;
+      bots.push({ channel, account: "default", token, owners, enabledPath: ["platforms", channel, "enabled"],
+        switchValue: platform.enabled, enabled: enabledBotValue(platform.enabled), shared: false, selectedAgent: true });
+      continue;
+    }
+
+    const platform = object(object(values.channels)[channel]);
+    const accounts = object(platform.accounts);
+    const configuredAccounts = Object.keys(accounts);
+    const fallbackAccount = string(platform.defaultAccount) || "default";
+    const agents = agentRows(values);
+    const defaultAgent = string((agents.find(agent => agent.default === true) ?? agents[0])?.id) || "main";
+    for (const account of configuredAccounts.length ? configuredAccounts : ["default"]) {
+      if (!/^[A-Za-z0-9_-]{1,64}$/u.test(account)) continue;
+      const own = object(accounts[account]);
+      const merged = { ...platform, ...own };
+      const bindings = botEntries(values.bindings).map(object).filter(binding => {
+        const match = object(binding.match);
+        return (binding.type ?? "route") === "route" && string(match.channel).toLowerCase() === channel
+          && (match.accountId === "*" || (match.accountId === undefined ? account === fallbackAccount : match.accountId === account));
+      });
+      const fullAccount = bindings.filter(binding => Object.keys(object(binding.match)).every(key => key === "channel" || key === "accountId"));
+      const route = fullAccount.find(binding => object(binding.match).accountId !== "*") ?? fullAccount[0];
+      const agent = string(route?.agentId) || defaultAgent;
+      const groupRoutes = Object.values(object(merged.groups)).flatMap(group =>
+        [object(group).agentId, ...Object.values(object(object(group).topics)).map(topic => object(topic).agentId)]);
+      const shared = bindings.some(binding => string(binding.agentId) !== agent) || groupRoutes.some(id => typeof id === "string" && id !== agent);
+
+      let token = channel === "discord" ? resolvedBotToken(merged.token, env) : "";
+      if (channel === "telegram") {
+        for (const settings of [own, platform]) {
+          const tokenFile = string(settings.tokenFile).trim();
+          if (tokenFile) {
+            const file = sourcePath(deps.home, tokenFile, source.root);
+            token = resolvedBotToken(await readText(path.dirname(file), file, budget), env);
+          }
+          if (!token) token = resolvedBotToken(settings.botToken, env);
+          if (token) break;
+        }
+      }
+      if (!token && account === fallbackAccount) token = resolvedBotToken(env[`${variable}_BOT_TOKEN`], env);
+      if (!token) continue;
+      const commandOwners = botOwners(channel, botEntries(object(values.commands).ownerAllowFrom)
+        .filter(entry => typeof entry === "string" && entry.toLowerCase().startsWith(`${channel}:`)));
+      const allowed = channel === "telegram" ? merged.allowFrom
+        : [own.allowFrom, object(own.dm).allowFrom, platform.allowFrom, object(platform.dm).allowFrom].find(value => value !== undefined);
+      const owners = commandOwners.length ? commandOwners : botOwners(channel, botEntries(allowed));
+      const enabledPath = configuredAccounts.length
+        ? ["channels", channel, "accounts", account, "enabled"] : ["channels", channel, "enabled"];
+      bots.push({ channel, account, token, owners, enabledPath, enabled: enabledBotValue(platform.enabled) && enabledBotValue(own.enabled),
+        switchValue: configuredAccounts.length ? own.enabled : platform.enabled, shared, selectedAgent: agent === source.agentId });
+    }
+  }
+  return bots.filter(bot => bot.selectedAgent).map(bot => ({ ...bot,
+    shared: bot.shared || bots.some(other => other !== bot && other.channel === bot.channel && other.token === bot.token) }));
+}
+
+function botFingerprint(source: ImportSource, bot: NativeBot): string {
+  return fingerprint([source.kind, source.agentId, source.configFile, bot.channel, bot.account, bot.token, bot.owners, bot.enabledPath, bot.shared]);
+}
+
+function appendNativeBotEntries(source: ImportSource, items: ImportItem[], bots: readonly NativeBot[]): void {
+  for (const bot of bots) {
+    const name = `${bot.channel === "telegram" ? "Telegram" : "Discord"} · ${bot.account}`;
+    const ids = bot.owners.map(owner => entryId(`bot-${bot.channel}`, `${bot.account}:${owner}`));
+    const blockingIssue = bot.shared ? "IMPORT_IM_BOT_SHARED_ROUTE"
+      : bot.owners.length === 0 || bot.owners.length > 5 ? "IMPORT_IM_BOT_OWNER_MISSING" : undefined;
+    if (blockingIssue !== undefined) {
+      items.push({ view: { id: entryId(`bot-${bot.channel}`, bot.account), category: "bots", name, selected: false,
+        enabled: bot.enabled, issues: [blockingIssue] }, credential: { format: bot.channel, value: { token: bot.token } } });
+      continue;
+    }
+    bot.owners.forEach((owner, index) => {
+      const id = ids[index]!;
+      items.push({ view: { id, category: "bots", name, description: owner, selected: false, enabled: bot.enabled,
+        exclusiveWith: ids.filter(candidate => candidate !== id) }, credential: { format: bot.channel, value: { token: bot.token } },
+        bot: { channel: bot.channel, account: bot.account, ownerProviderUserId: owner, sourceFingerprint: botFingerprint(source, bot) } });
+    });
+  }
+}
+
+export async function readImportSourceBot(source: ImportSource, selection: NonNullable<ImportItem["bot"]>, deps: SourceReaderDeps) {
+  const budget = createImportBudget(4 * 1024 * 1024, deps.assertOwner);
+  const values = await config(path.dirname(source.configFile), source.configFile, budget);
+  const dotenv = parseEnv(await optionalText(source.root, path.join(source.root, ".env"), budget) ?? "");
+  const env = { ...dotenv, ...scalarEnv(values.env), ...scalarEnv(object(values.env).vars) };
+  const bot = (await nativeBots(source, values, env, deps, budget)).find(candidate => candidate.channel === selection.channel && candidate.account === selection.account);
+  deps.assertOwner();
+  if (!bot || bot.shared || !bot.owners.includes(selection.ownerProviderUserId)
+    || botFingerprint(source, bot) !== selection.sourceFingerprint) throw new AgentImportError("IMPORT_IM_BOT_SOURCE_CHANGED");
+  return bot;
+}
+
 function openClawDiscordRedactions(source: ImportSource, values: Record<string, unknown>, env: Record<string, string>): Record<string, string> {
   if (source.kind !== 'openclaw') return {};
   const discord = object(object(values.channels).discord);
@@ -213,6 +362,7 @@ async function connections(items: ImportItem[], source: ImportSource, values: Re
     }
     if (token) items.push({ view: { id: entryId('telegram', account), name: `Telegram · ${account}`, category: 'connections', selected: true, dependsOn: references.map(key => entryId('env', key)) }, envDependencies: { names: references, entries: [] }, credential: { format: 'telegram', value: { token, account } } });
   }
+  appendNativeBotEntries(source, items, await nativeBots(source, values, env, deps, budget, readText));
   // Keep native auth metadata without exposing its contents or inventing a refresh protocol.
   // API keys have a direct environment equivalent; provider OAuth needs its native refresh adapter.
   const authFiles = source.kind === 'hermes' ? ['auth.json'] : [`agents/${source.agentId}/agent/auth-profiles.json`];

@@ -7,7 +7,8 @@ import { AvatarPicker } from "./PartnerAvatarPicker.js";
 import { Button, Modal, Spinner } from "./ui.js";
 import "./partner-import.css";
 
-const categories = [PartnerImportCategory.PERSONALITY, PartnerImportCategory.MEMORY, PartnerImportCategory.SKILLS, PartnerImportCategory.CONNECTIONS, PartnerImportCategory.AUTOMATIONS];
+const categories = [PartnerImportCategory.PERSONALITY, PartnerImportCategory.MEMORY, PartnerImportCategory.SKILLS,
+  PartnerImportCategory.CONNECTIONS, PartnerImportCategory.AUTOMATIONS, PartnerImportCategory.BOTS];
 export function PartnerImportDialog({ controller, ownerKey, foreground, t, onClose, onCreated }: {
   readonly controller: AppController; readonly ownerKey: string; readonly foreground: boolean; readonly t: Translator;
   readonly onClose: () => void; readonly onCreated: (result: PartnerImportResult) => void;
@@ -34,6 +35,7 @@ export function PartnerImportDialog({ controller, ownerKey, foreground, t, onClo
   };
   useEffect(() => { if (foreground && result?.saved && result.canonicalSessionId && !incomplete && !state.busy && result.status !== PartnerImportStatus.RUNNING) void open(); }, [result, state.busy, foreground, incomplete]);
   const entries = state.preview?.entries ?? [];
+  const botsSelected = entries.some(entry => entry.category === PartnerImportCategory.BOTS && state.selected.has(entry.id));
   const categoryEntries = entries.filter(entry => entry.category === state.category);
   const filtered = categoryEntries.filter(entry => `${entry.name} ${entry.description ?? ""}`.toLocaleLowerCase().includes(state.query.toLocaleLowerCase()));
   const locked = editor.locked || preparing || !foreground;
@@ -83,7 +85,10 @@ export function PartnerImportDialog({ controller, ownerKey, foreground, t, onClo
         })}</div>
         {entries.some(entry => entry.category === PartnerImportCategory.AUTOMATIONS && state.selected.has(entry.id)) && <label>
           <input type="checkbox" checked={state.takeover} disabled={locked} onChange={event => editor.edit({ takeover: event.target.checked })} />{m.takeover}</label>}
-        <p>{m.deferred}</p><Button tone="primary" disabled={locked || !state.name.trim()} onClick={() => void editor.start()}>{m.submit}</Button>
+        {botsSelected && <label><input type="checkbox" checked={state.takeoverBots} disabled={locked}
+          onChange={event => editor.edit({ takeoverBots: event.target.checked })} />{m.takeoverBots}</label>}
+        <p>{m.deferred}</p><Button tone="primary" disabled={locked || !state.name.trim() || botsSelected && !state.takeoverBots}
+          onClick={() => void editor.start()}>{m.submit}</Button>
       </>}
     <Button disabled={preparing} onClick={onClose}>{m.close}</Button>
   </Modal>;

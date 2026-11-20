@@ -2946,7 +2946,7 @@ export async function createOrchestratorApplication(
     runPass: (id, action) => partners.runImportManagement(id, action),
     assertServiceOwner: assertImportService, effects: context => createPartnerImportEffects({ partners, routines: partnerRoutines!,
       storage: partnerImportStorage, store, memory: makerMemory, resources: piResources, artifacts,
-      verification: partnerImportRuntime.verification, ...agentImportSources }, context),
+      partnerMessaging: partnerMessaging!, verification: partnerImportRuntime.verification, ...agentImportSources }, context),
     onSaved: async (result, nativePackage) => {
       if (!result.saved || !result.canonicalSessionId) return;
       if (nativePackage) {

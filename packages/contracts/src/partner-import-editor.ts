@@ -39,13 +39,13 @@ export class PartnerImportReceipts {
 export interface PartnerImportEditorState {
   readonly sources?: readonly PartnerImportSource[]; readonly preview?: PartnerImportPreview;
   readonly selected: ReadonlySet<string>; readonly name: string; readonly avatarImageBase64?: string;
-  readonly takeover: boolean; readonly busy: boolean; readonly hydrated: boolean; readonly pendingId?: string;
+  readonly takeover: boolean; readonly takeoverBots: boolean; readonly busy: boolean; readonly hydrated: boolean; readonly pendingId?: string;
   readonly result?: PartnerImportResult; readonly absent: boolean; readonly error?: string;
   readonly category?: PartnerImportCategory; readonly query: string; readonly page: number; readonly detailPage: number;
 }
 /** All clients use this exact same intent, recovery and selection state machine. */
 export class PartnerImportEditor {
-  #state: PartnerImportEditorState = { selected: new Set(), name: "", takeover: true, busy: false, hydrated: false, absent: false, query: "", page: 0, detailPage: 0 };
+  #state: PartnerImportEditorState = { selected: new Set(), name: "", takeover: true, takeoverBots: false, busy: false, hydrated: false, absent: false, query: "", page: 0, detailPage: 0 };
   #listeners = new Set<() => void>(); #request?: AbortController; #disposed = false;
   #intent?: ReturnType<typeof importSelectionInput>;
   constructor(readonly api: PartnerImportApi, private readonly receipts: PartnerImportReceipts) {}
@@ -88,22 +88,27 @@ export class PartnerImportEditor {
     await this.#perform(async signal => {
       const preview = await this.api.preview(sourceId, signal); this.#current(signal);
       this.#set({ preview, name: preview.name, avatarImageBase64: preview.avatarImageBase64,
-        selected: defaultImportSelection(preview.entries), category: undefined, query: "", page: 0, result: undefined });
+        selected: defaultImportSelection(preview.entries), takeoverBots: false, category: undefined, query: "", page: 0, result: undefined });
     });
   }
-  edit(patch: Partial<Pick<PartnerImportEditorState, "name" | "avatarImageBase64" | "takeover">>): void { if (!this.locked) this.#set(patch); }
+  edit(patch: Partial<Pick<PartnerImportEditorState, "name" | "avatarImageBase64" | "takeover" | "takeoverBots">>): void { if (!this.locked) this.#set(patch); }
   select(ids: readonly string[], enabled: boolean): void {
     if (this.locked || !this.state.preview) return;
-    this.#set({ selected: toggleImportEntries(this.state.preview.entries, this.state.selected, ids, enabled) });
+    const selected = toggleImportEntries(this.state.preview.entries, this.state.selected, ids, enabled);
+    const botsChanged = this.state.preview.entries.some(entry => entry.category === PartnerImportCategory.BOTS
+      && selected.has(entry.id) !== this.state.selected.has(entry.id));
+    this.#set({ selected, ...(botsChanged ? { takeoverBots: false } : {}) });
   }
   filter(category?: PartnerImportCategory, query = ""): void { this.#set({ category, query, page: 0 }); }
   page(page: number, details = false): void { if (Number.isSafeInteger(page) && page >= 0) this.#set(details ? { detailPage: page } : { page }); }
   async start(): Promise<void> {
     if (!this.state.preview || this.state.busy || !this.state.hydrated) return;
+    const botsSelected = this.state.preview.entries.some(entry => entry.category === PartnerImportCategory.BOTS && this.state.selected.has(entry.id));
+    if (botsSelected && !this.state.takeoverBots) return;
     await this.#perform(async signal => {
       this.#intent ??= importSelectionInput(this.state.preview!, this.state.selected, {
         requestId: this.api.newRequestId(), name: this.state.name.trim(), avatarImageBase64: this.state.avatarImageBase64,
-        takeover: this.state.takeover, deferSetup: true });
+        takeover: this.state.takeover, takeoverBots: botsSelected, deferSetup: true });
       const requestId = this.#intent.requestId;
       this.#set({ pendingId: requestId, absent: false });
       try { await this.receipts.claim(requestId); } catch (error) {

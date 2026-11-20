@@ -45,13 +45,13 @@ export async function deserializeImportSnapshotAsync(text: string, assertOwner: 
     const decoded = Buffer.from(input.data, "base64"); if (decoded.toString("base64") !== input.data) fail(); return decoded;
   };
   const ids = new Set<string>(); const indexes = new Set<number>();
-  const itemFields = ["sourceIndex", "files", "sourceDirectory", "sourceAlias", "sourceFile", "documents", "filesComplete", "captureIssue", "text", "role", "env", "envDependencies", "mcp", "credential", "asset", "automation"];
+  const itemFields = ["sourceIndex", "files", "sourceDirectory", "sourceAlias", "sourceFile", "documents", "filesComplete", "captureIssue", "text", "role", "env", "envDependencies", "mcp", "credential", "bot", "asset", "automation"];
   for (const input of value.items) {
     assertOwner();
     if (!record(input) || !fields(input, ["view", "sourceIndex"], itemFields) || !record(input.view)
       || !fields(input.view, ["id", "category", "name", "selected"], ["description", "enabled", "dependsOn", "exclusiveWith", "issues"])
       || typeof input.view.id !== "string" || ids.has(input.view.id) || typeof input.view.name !== "string" || typeof input.view.selected !== "boolean"
-      || !["personality", "memory", "skills", "connections", "automations"].includes(String(input.view.category))
+      || !["personality", "memory", "skills", "connections", "automations", "bots"].includes(String(input.view.category))
       || !Number.isSafeInteger(input.sourceIndex) || Number(input.sourceIndex) < 0 || indexes.has(Number(input.sourceIndex))) fail();
     ids.add(input.view.id); indexes.add(Number(input.sourceIndex));
     if (input.sourceFile !== undefined && (!record(input.sourceFile) || !fields(input.sourceFile, ["root", "file", "kind"], ["logicalPrefix", "sharedDocumentRoots"])
@@ -72,6 +72,16 @@ export async function deserializeImportSnapshotAsync(text: string, assertOwner: 
       || !fields(input.automation, ["sourceId", "input", "original", "fingerprint", "deliveries"])
       || typeof input.automation.sourceId !== "string" || !record(input.automation.input) || !record(input.automation.original)
       || typeof input.automation.fingerprint !== "string" || !Array.isArray(input.automation.deliveries))) fail();
+    if (input.bot !== undefined && (input.view.category !== "bots" || !record(input.bot)
+      || !fields(input.bot, ["channel", "account", "ownerProviderUserId", "sourceFingerprint"])
+      || (input.bot.channel !== "telegram" && input.bot.channel !== "discord")
+      || typeof input.bot.account !== "string" || !/^[A-Za-z0-9_-]{1,64}$/u.test(input.bot.account)
+      || typeof input.bot.ownerProviderUserId !== "string" || !/^[1-9]\d{0,19}$/u.test(input.bot.ownerProviderUserId)
+      || typeof input.bot.sourceFingerprint !== "string" || !/^[a-f0-9]{64}$/u.test(input.bot.sourceFingerprint)
+      || !record(input.credential) || input.credential.format !== input.bot.channel || !record(input.credential.value)
+      || !fields(input.credential.value, ["token"]) || typeof input.credential.value.token !== "string"
+      || input.credential.value.token.length === 0 || input.credential.value.token.length > 512
+      || /\s|\p{Cc}/u.test(input.credential.value.token))) fail();
     await new Promise<void>(resolve => setImmediate(resolve));
   }
   const { version: _version, ...snapshot } = value;

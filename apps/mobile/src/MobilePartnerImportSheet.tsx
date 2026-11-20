@@ -8,7 +8,8 @@ import { MobilePartnerPhotoPicker } from "./MobilePartnerPhotoPicker";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
 
-const categories = [PartnerImportCategory.PERSONALITY, PartnerImportCategory.MEMORY, PartnerImportCategory.SKILLS, PartnerImportCategory.CONNECTIONS, PartnerImportCategory.AUTOMATIONS];
+const categories = [PartnerImportCategory.PERSONALITY, PartnerImportCategory.MEMORY, PartnerImportCategory.SKILLS,
+  PartnerImportCategory.CONNECTIONS, PartnerImportCategory.AUTOMATIONS, PartnerImportCategory.BOTS];
 export function MobilePartnerImportSheet({ editor, colors, locale, onClose, onSaved }: {
   readonly editor: PartnerImportEditor; readonly colors: MobilePartnersColors; readonly locale: MobileSupportedLocale;
   readonly onClose: () => void; readonly onSaved: (result: PartnerImportResult) => void;
@@ -30,6 +31,7 @@ export function MobilePartnerImportSheet({ editor, colors, locale, onClose, onSa
   };
   useEffect(() => { if (!visible && Platform.OS !== "ios") dismiss(); }, [visible]);
   const result = state.result; const saved = new Set(result?.savedEntryIds); const entries = state.preview?.entries ?? [];
+  const botsSelected = entries.some(entry => entry.category === PartnerImportCategory.BOTS && state.selected.has(entry.id));
   const incomplete = state.preview ? [...state.selected].some(id => !saved.has(id)) : result?.checks.some(check => check.status === PartnerImportCheckStatus.NEEDS_ATTENTION && !saved.has(check.entryId) && check.entryId !== "import");
   const opened = useRef<string | undefined>(undefined);
   const open = async () => {
@@ -103,7 +105,10 @@ export function MobilePartnerImportSheet({ editor, colors, locale, onClose, onSa
             })}
             {entries.some(entry => entry.category === PartnerImportCategory.AUTOMATIONS && state.selected.has(entry.id)) && <View style={styles.row}>
               <View style={styles.grow}>{body(m.takeover)}</View><Switch accessibilityLabel={m.takeover} value={state.takeover} disabled={locked} onValueChange={takeover => editor.edit({ takeover })} /></View>}
-            {body(m.deferred)}{action(m.submit, () => void editor.start(), locked || !state.name.trim())}
+            {botsSelected && <View style={styles.row}><View style={styles.grow}>{body(m.takeoverBots)}</View>
+              <Switch accessibilityLabel={m.takeoverBots} value={state.takeoverBots} disabled={locked}
+                onValueChange={takeoverBots => editor.edit({ takeoverBots })} /></View>}
+            {body(m.deferred)}{action(m.submit, () => void editor.start(), locked || !state.name.trim() || botsSelected && !state.takeoverBots)}
           </>}
         </ScrollView>
       </MobileKeyboardAvoidingView>
