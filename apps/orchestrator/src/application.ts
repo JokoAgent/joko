@@ -2115,6 +2115,15 @@ export async function createOrchestratorApplication(
     },
     resolveServiceRuntimeConfiguration: session => {
       const connections = partnerConnections?.runtimeIdentity(session), skills = partnerSkills?.runtimeIdentity(session);
+      if (session.backendId === piBackendId && session.remoteWorkspace === undefined) {
+        const partner = partnerStore.findPartnerByHomeTarget(session.targetId);
+        if (partner?.canonicalSessionId === session.id && partner.lifecycle === "active" && partner.initializationState === "ready") {
+          const target = store.getTarget(session.targetId).descriptor;
+          const memory = target.trusted && target.remoteWorkspace === undefined ? makerMemory.runtimePrompt(target.id) : undefined;
+          // Pi reads this index only at startup. Let the Host adopt changes at its existing idle boundary.
+          if (memory !== undefined) return JSON.stringify([connections ?? null, skills ?? null, createHash("sha256").update(memory).digest("hex")]);
+        }
+      }
       return connections === undefined && skills === undefined ? undefined : JSON.stringify([connections ?? null, skills ?? null]);
     },
     backendDispatchBlocked: (backendId) => deferredBackendRestarts?.blocksDispatch(backendId) === true,

@@ -2,10 +2,11 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
-import { PartnerDraftSchema, PartnerLifecycle, PermissionMode, RoutineRunStatus } from "@joko/contracts";
+import { PartnerDraftSchema, PartnerLifecycle, PermissionMode, RoutineRunStatus, RunState } from "@joko/contracts";
 import { afterEach, expect, it } from "vitest";
-import { RealPiSystemFixture, REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID } from "./real-pi-fixture.js";
+import { RealPiSystemFixture, REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID, type CapturedProviderRequest } from "./real-pi-fixture.js";
 import { waitFor } from "./fixture.js";
+import { queueRunIdFrom, sendInputMutation, submit } from "./operations.js";
 
 let fixture: RealPiSystemFixture | undefined;
 afterEach(async () => { await fixture?.close({ removeRoot: true }); fixture = undefined; });
@@ -56,3 +57,84 @@ it("reopens a paused Partner through authenticated HTTP, retains its files and m
   expect(await readFile(join(root, "data", "partner-routines", "routines.json"), "utf8")).not.toContain(paired.authKey);
   expect(fixture.providerRequests).toHaveLength(0);
 }, 120000);
+
+it("drops a deleted Partner memory from the next published Pi request and keeps the original native history", async () => {
+  const system = fixture = await RealPiSystemFixture.start({ enableInternalServer: true, holdProviderResponses: true });
+  const { store, sessionHost } = system.application;
+  const { clients, connectionId } = await system.pair("Partner memory manager");
+  const directory = await clients.partner.getPartnerDirectory({});
+  const { partner } = await clients.partner.createPartner({
+    requestId: "memory-startup-partner", expectedDirectoryRevision: directory.directory!.revision,
+    draft: create(PartnerDraftSchema, {
+      displayName: "Memory reviewer", avatar: { value: { case: "presetId", value: "orbit" } },
+      identitySource: "You review work in this home.", templateId: "general", usesDirectoryDefaults: false,
+      capabilities: { modelChain: [{ backendId: "pi", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, fastMode: false }],
+        permissionMode: PermissionMode.AUTO, planMode: false }
+    })
+  });
+  const sessionId = partner!.canonicalSessionId!;
+  const targetId = partner!.homeTargetId;
+  const obsolete = store.putMakerMemoryEntry({ targetId, kind: "project", slug: "retired-index-entry",
+    title: "ObsoleteCartographer", description: "The retired index description.", body: "The retired private body." });
+  const retained = store.putMakerMemoryEntry({ targetId, kind: "user", slug: "retained-index-entry",
+    title: "RetainedIllustrator", description: "The retained index description.", body: "The retained private body." });
+
+  // Seed the index before the first observed native startup.
+  await sessionHost.closeIfActive(sessionId);
+  const binding = () => store.getSession(sessionId).descriptor.binding;
+  const send = async (prompt: string) => queueRunIdFrom(await submit(clients.operation, connectionId,
+    sendInputMutation(sessionId, BigInt(binding().generation), prompt)));
+  const awaitRun = async (runId: string) => {
+    const response = await waitFor(() => clients.run.getRun({ runId }), ({ run }) =>
+      run?.state === RunState.SUCCEEDED || run?.state === RunState.FAILED || run?.state === RunState.ABORTED,
+    "the published Pi Run", 45_000);
+    expect(response.run?.state).toBe(RunState.SUCCEEDED);
+  };
+  const messagesFrom = (request: CapturedProviderRequest) =>
+    (request.body["messages"] ?? []) as { role: string; content: string | { text?: string }[] }[];
+  const systemPrompt = (request: CapturedProviderRequest) => JSON.stringify(messagesFrom(request).filter(message => message.role === "system"));
+
+  const originalInput = "Return the initial answer for this conversation without using tools.";
+  const originalRun = await send(originalInput);
+  await waitFor(async () => system.providerRequests.length, count => count === 1, "the initial Pi request", 45_000);
+  const originalBinding = binding();
+  const originalPrompt = systemPrompt(system.providerRequests[0]!);
+  expect(originalPrompt).toContain(obsolete.title);
+  expect(originalPrompt).toContain(obsolete.description);
+  expect(originalPrompt).toContain(retained.title);
+  expect(originalPrompt).not.toContain(obsolete.body);
+
+  const beforeDeletion = await clients.partner.listPartnerMemories({ partnerId: partner!.partnerId, query: obsolete.title });
+  const entry = beforeDeletion.groups.flatMap(group => group.entries).find(item => item.entryId === obsolete.id)!;
+  const backendRevision = store.getBackend("pi").revision;
+  expect(await clients.partner.deletePartnerMemory({ partnerId: partner!.partnerId,
+    expectedPartnerRevision: beforeDeletion.owner!.revision, expectedRevision: entry.revision, entryId: entry.entryId }))
+    .toMatchObject({ entryId: obsolete.id });
+  const afterDeletion = await clients.partner.listPartnerMemories({ partnerId: partner!.partnerId, query: obsolete.title });
+  expect(afterDeletion.groups.flatMap(group => group.entries)).toEqual([]);
+  await waitFor(async () => store.getBackend("pi").revision, revision => revision > backendRevision,
+    "the deferred Pi settings publication", 30_000);
+  expect(binding()).toEqual(originalBinding);
+  expect(system.providerRequests).toHaveLength(1);
+  expect((await clients.run.getRun({ runId: originalRun })).run?.state).toBe(RunState.RUNNING);
+
+  system.releaseProviderResponses();
+  await awaitRun(originalRun);
+  const nextInput = "Continue this same conversation with a short answer.";
+  await awaitRun(await send(nextInput));
+  const nextNativeRequests = system.providerRequests.filter(request => {
+    const input = messagesFrom(request).findLast(message => message.role === "user")?.content;
+    return (Array.isArray(input) ? input.map(part => part.text).join("") : input) === nextInput;
+  });
+  expect(nextNativeRequests).toHaveLength(1);
+  const resumed = nextNativeRequests[0]!;
+  const nextPrompt = systemPrompt(resumed);
+  expect(nextPrompt).not.toContain(obsolete.title);
+  expect(nextPrompt).not.toContain(obsolete.description);
+  expect(nextPrompt).toContain(retained.title);
+  expect(nextPrompt).toContain(retained.description);
+  expect(JSON.stringify(messagesFrom(resumed))).toContain(originalInput);
+  expect(JSON.stringify(messagesFrom(resumed))).toContain(nextInput);
+  expect(binding()).toMatchObject({ generation: originalBinding.generation + 1, nativeSessionId: originalBinding.nativeSessionId,
+    opaqueRef: originalBinding.opaqueRef });
+}, 120_000);
