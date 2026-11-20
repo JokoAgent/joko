@@ -1942,7 +1942,9 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
     {item.modelSubstitution && <p className="muted" role="note">{t("timeline.modelSubstitution", {
       selected: item.modelSubstitution.selectedModelId, actual: item.modelSubstitution.actualModelId
     })}</p>}
-    <div className="markdown message-assistant__body" data-selection-quote-body={quoteBody}><StreamingMarkdown text={displayText} streaming={item.streaming === true} streamFadeKey={`${sessionId}:${item.id}`} t={t} />{item.streaming && <span className={cx("streaming-cursor", reducedMotion && "streaming-cursor--reduced-motion")} aria-label={t("timeline.streaming")} />}</div>
+    {item.assistantPresentationCard !== undefined && !searchOnly
+      ? <ExtensionCard card={item.assistantPresentationCard} t={t} readOnly />
+      : <div className="markdown message-assistant__body" data-selection-quote-body={quoteBody}><StreamingMarkdown text={displayText} streaming={item.streaming === true} streamFadeKey={`${sessionId}:${item.id}`} t={t} />{item.streaming && <span className={cx("streaming-cursor", reducedMotion && "streaming-cursor--reduced-motion")} aria-label={t("timeline.streaming")} />}</div>}
     {item.samplingInterrupted && <p className="message-assistant__sampling-interrupted muted" role="note">{t("timeline.samplingInterrupted")}</p>}
     {attachments}
     {partnerConversation?.confirmed && partner !== undefined && !item.streaming && displayText.trim()

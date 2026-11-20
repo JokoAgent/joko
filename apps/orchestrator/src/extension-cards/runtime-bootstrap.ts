@@ -8,10 +8,14 @@ export const EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE = String.raw`(capabilities)
     if (serialized === undefined) throw new Error("Invalid extension message.");
     return transport(JSON.parse(serialized));
   };
-  const handlers = new Map(), listeners = [], calls = new Map();
+  const handlers = new Map(), listeners = [], calls = new Map(), hooks = new Map();
   Object.defineProperty(window, "joko", { value: Object.freeze({
     send: payload => request(payload),
     onHostMessage: listener => { if (typeof listener !== "function" || listeners.length >= 64) throw new Error("Invalid event listener."); listeners.push(listener); },
+    ...(capabilities.messageHooks?.length ? { messages: Object.freeze({ register: (name, handler) => {
+      if (!capabilities.messageHooks.includes(name) || typeof handler !== "function" || hooks.has(name)) throw new Error("Invalid message hook.");
+      hooks.set(name, handler);
+    } }) } : {}),
     tools: Object.freeze({ register: (name, handler) => { if (typeof name !== "string" || typeof handler !== "function" || handlers.has(name) || handlers.size >= 64) throw new Error("Invalid tool handler."); handlers.set(name, handler); } }),
     card: Object.freeze({ update: payload => request({ ...payload, type: "card-update", version: 1 }) }),
     ...(capabilities.taskView ? { taskView: (payload = {}) => request({ type: "task-view-request", payload }) } : {}),
@@ -53,6 +57,23 @@ export const EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE = String.raw`(capabilities)
       // Acknowledge synchronous capture; provider writes and send countdowns
       // outlive this delivery and retain their own original Connection guard.
       for (const listener of listeners) { try { void Promise.resolve(listener(event)).catch(() => undefined); } catch {} }
+    },
+    async message({ callId, type, ...input }) {
+      const handler = hooks.get(type);
+      if (!handler) return { action: "allow" };
+      const controller = new AbortController();
+      calls.set(callId, controller);
+      try {
+        const verdict = await handler({ ...input, signal: controller.signal });
+        if (!verdict || typeof verdict !== "object") return { action: "allow" };
+        if (verdict.action === "block") return { action: "block", reason: typeof verdict.reason === "string" ? verdict.reason.slice(0, 512) : undefined };
+        if (verdict.action === "rewrite" && typeof verdict.text === "string") return { action: "rewrite", text: verdict.text.slice(0, 16_000) };
+        if (verdict.action === "render" && typeof verdict.html === "string" && verdict.html.length <= 128 * 1024) {
+          return { action: "render", html: verdict.html, height: typeof verdict.height === "number" ? verdict.height : undefined };
+        }
+        return { action: "allow" };
+      }
+      finally { calls.delete(callId); }
     },
     cancel(id) { calls.get(id)?.abort(); }
   };

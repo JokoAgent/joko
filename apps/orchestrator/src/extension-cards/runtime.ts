@@ -1,14 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
-import type { ExtensionUsageSubject, OperationalStore } from "@joko/store";
+import type { ExtensionUsageSubject, OperationalStore, PersistedEvent } from "@joko/store";
 import type { ExtensionCatalogManager } from "../extension-catalog.js";
 import type { PiResourceManager } from "../resource-manager.js";
 import type { ExtensionMainViewAuthority, ExtensionMainViewManager, ExtensionMainViewSurface } from "../extension-main-view-manager.js";
 import type { BridgeToolProvider, BridgeToolCallContext, BridgeToolCallResult } from "../mcp-router.js";
-import type { ExtensionRuntimeDescriptor } from "../extension-surface-manifest.js";
+import type { ExtensionMessageHook, ExtensionMessageTopic, ExtensionRuntimeDescriptor } from "../extension-surface-manifest.js";
 import type { ExtensionCardAuthority, ExtensionCardAction, ExtensionCardsManager } from "./manager.js";
 import type { ExtensionCardScope } from "./service.js";
 import { withExtensionCardToken } from "./service.js";
+import { EXTENSION_CARD_HEIGHT_DEFAULT, EXTENSION_CARD_HEIGHT_MAX, EXTENSION_CARD_HEIGHT_MIN } from "./protocol.js";
+import { sanitizeExtensionCardHtml } from "./sanitizer.js";
 import { MAIL_COMPOSE_RUNTIME_SOURCE } from "./mail-runtime-source.js";
 import type { CredentialVault, EncryptedCredential } from "../credential-vault.js";
 import { ExtensionNetwork } from "./network.js";
@@ -33,6 +35,11 @@ interface Authority extends ExtensionCardAuthority {
   readonly surface: ExtensionMainViewAuthority;
   readonly installationKey: string;
   readonly taskViewInstallation?: string;
+  readonly approvedAt: number;
+}
+interface SubscriptionQueue {
+  readonly items: { readonly event: SubscriptionEvent; readonly assertCurrent: () => void }[];
+  dropped: number;
 }
 interface Instance {
   readonly authority: Authority; readonly connectionId: string; readonly abort: AbortController;
@@ -41,12 +48,39 @@ interface Instance {
   readonly calls: Set<string>; pending: number;
   readonly taskViewGestures: Map<string, { connectionId: string; observedAt: number; sourceSessionId: string; assertCurrent: () => void }>;
   readonly callGuards: Map<string, { signal: AbortSignal; assertCurrent: () => void; usage?: { nonce: string; record: () => void } }>;
+  messageHookFailures: number;
+  messageHooksPending: number;
+  readonly subscriptions: SubscriptionQueue;
+  publishingSubscriptions: boolean;
 }
+
+type SessionSubscription = "did-session-created" | "did-session-archived" | "did-session-switched";
+type SubscriptionEvent = {
+  readonly type: "event";
+  readonly name: SessionSubscription | "did-turn-start" | "did-turn-end";
+  readonly sessionId: string;
+  readonly backendId: string;
+  readonly runId?: string;
+  readonly modelId?: string;
+  readonly state?: string;
+  readonly durationMs?: number;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+};
+
+export type ExtensionMessageVerdict =
+  | { readonly action: "allow" }
+  | { readonly action: "block"; readonly extensionName: string; readonly reason?: string }
+  | { readonly action: "rewrite"; readonly text: string; readonly assertAuthorized: () => void }
+  | { readonly action: "render"; readonly extensionId: string; readonly extensionName: string; readonly text: string;
+      readonly html: string; readonly height: number; readonly assertAuthorized: () => void };
 interface Options {
   readonly catalog: Pick<ExtensionCatalogManager, "get" | "snapshot" | "onAuthorityChanged">;
   readonly resources: Pick<PiResourceManager, "get">;
   readonly store: OperationalStore; readonly vault: CredentialVault;
   readonly projects?: Pick<ExtensionProjectPolicies, "enabledForTarget" | "assertEnabledForSession">;
+  readonly subscriptionTarget?: (sessionId: string, generation: bigint, archived?: boolean) => string | undefined;
+  readonly subscriptionRun?: (sessionId: string, runId: string) => { readonly modelId?: string; readonly assertCurrent: () => void } | undefined;
   readonly surfaces: ExtensionMainViewManager; readonly cards: ExtensionCardsManager;
   readonly taskViews?: ExtensionTaskViewDispatcher;
   readonly registerProvider: (provider: BridgeToolProvider) => () => void;
@@ -74,9 +108,13 @@ interface Options {
  * No plugin page is given a Node global, ordinary Connection bearer or UI bridge. */
 export class ExtensionCardRuntime {
   readonly #instances = new Map<string, Instance>();
+  readonly #pendingSubscriptions = new Map<string, { readonly authorityKey: string; readonly queue: SubscriptionQueue }>();
   #browser?: Browser; #browserOpening?: Promise<Browser>; #stopped = true; #generation = 0;
   #desktopLocale?: { readonly value: string; readonly sequence: bigint };
   #tail = Promise.resolve(); #unsubscribe?: () => void; #timer?: NodeJS.Timeout;
+  #stopSubscriptionEvents?: () => void;
+  readonly #observedTurns = new Set<string>();
+  readonly #assistantHooks = new Set<string>();
   readonly #network: ExtensionNetwork | undefined;
   readonly #files = new ExtensionFileDeposits();
   constructor(private readonly options: Options) {
@@ -171,7 +209,7 @@ export class ExtensionCardRuntime {
       oauth: runtime.network?.secrets?.filter(secret => secret.source === "oauth").map(secret => this.options.oauth?.identity(id, secret.key) ?? null) });
     const installationKey = JSON.stringify({ ...surface, backendRevision: surface.backendRevision.toString(), resourceRevision: surface.resourceRevision.toString() });
     const taskViewInstallation = extensionTaskViewInstallation(extension);
-    return { key, installationKey, name: extension.name, runtime, surface,
+    return { key, installationKey, name: extension.name, runtime, surface, approvedAt: resource.approvedAt ?? 0,
       ...(taskViewInstallation === undefined ? {} : { taskViewInstallation }) };
   }
   #assert(instance: Instance): void {
@@ -187,12 +225,14 @@ export class ExtensionCardRuntime {
       for (const id of ids) { const instance = this.#instances.get(id); if (instance) this.#retire(instance); }
       void this.#reconcile();
     });
+    this.#stopSubscriptionEvents = this.options.store.subscribe(event => this.#observeRun(event));
     this.#timer = setInterval(() => { void this.#reconcile(); }, 15_000); this.#timer.unref();
     await this.#reconcile();
   }
   #retire(instance: Instance): void {
     if (!instance.current) return;
     instance.current = false; instance.abort.abort(); instance.unregister(); instance.tickets.clear(); instance.taskViewGestures.clear();
+    instance.subscriptions.items.length = 0;
     this.options.deviceSync?.invalidatePlugin(instance.authority.surface.extensionId);
     this.options.cards.revoke(instance.authority.surface.extensionId);
   }
@@ -210,9 +250,13 @@ export class ExtensionCardRuntime {
       }
       for (const [id, authority] of desired) {
         if (this.#stopped || this.#instances.has(id) || this.#instances.size >= 64) continue;
+        const pending = this.#pendingSubscriptions.get(id);
+        const subscriptions = pending?.authorityKey === authority.key ? pending.queue : { items: [], dropped: 0 };
+        if (pending?.authorityKey === authority.key) this.#pendingSubscriptions.delete(id);
         const instance: Instance = { authority, connectionId: `extension_runtime_${randomUUID().replaceAll("-", "")}`, current: true,
           abort: new AbortController(), unregister: () => {}, tickets: new Map(), calls: new Set(), callGuards: new Map(),
-          taskViewGestures: new Map(), pending: 0 };
+          taskViewGestures: new Map(), pending: 0, messageHookFailures: 0, messageHooksPending: 0,
+          subscriptions, publishingSubscriptions: false };
         this.#instances.set(id, instance);
         const providerId = `${id}-runtime`, generation = ++this.#generation;
         const provider: BridgeToolProvider = { id: providerId, generation,
@@ -224,7 +268,8 @@ export class ExtensionCardRuntime {
           callTool: (name, args, signal, context) => this.#call(instance, name, args, signal, context) };
         try {
           if (provider.tools.length) instance.unregister = this.options.registerProvider(provider);
-          if (authority.runtime.tasks || authority.runtime.text || authority.runtime.deviceSync
+          if (subscriptions.items.length) void this.#drainSubscriptions(instance);
+          if (authority.runtime.tasks || authority.runtime.text || authority.runtime.deviceSync || authority.runtime.subscribe?.hooks.length
             || provider.tools.length === 0 && authority.taskViewInstallation !== undefined) await this.#ensure(instance);
         }
         catch { this.#retire(instance); this.#instances.delete(id); }
@@ -303,7 +348,7 @@ export class ExtensionCardRuntime {
       try { usage.record(); } catch { /* Usage storage does not own the dispatch outcome. */ }
       return true;
     });
-    await page.addInitScript({ content: `(${EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE})(${JSON.stringify({ agent: instance.authority.runtime.agent === true, network: instance.authority.runtime.network !== undefined, tasks: !!instance.authority.runtime.tasks, targets: instance.authority.runtime.targets === true, text: !!instance.authority.runtime.text, deviceSync: instance.authority.runtime.deviceSync === true, taskView: instance.authority.taskViewInstallation !== undefined })})` });
+    await page.addInitScript({ content: `(${EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE})(${JSON.stringify({ agent: instance.authority.runtime.agent === true, network: instance.authority.runtime.network !== undefined, tasks: !!instance.authority.runtime.tasks, targets: instance.authority.runtime.targets === true, text: !!instance.authority.runtime.text, deviceSync: instance.authority.runtime.deviceSync === true, taskView: instance.authority.taskViewInstallation !== undefined, messageHooks: instance.authority.runtime.subscribe?.hooks ?? [] })})` });
     if (instance.authority.runtime.mail) await page.addInitScript({ content: `${MAIL_COMPOSE_RUNTIME_SOURCE}\nObject.defineProperty(window, "jokoMail", { value: jokoMail, writable: false, configurable: false });` });
     await page.goto(url.href, { waitUntil: "load", timeout: 15_000 }); this.#assert(instance);
     return page;
@@ -573,6 +618,274 @@ export class ExtensionCardRuntime {
     await page.evaluate(payload => (window as unknown as { __jokoRuntime: { event(payload: unknown): void } }).__jokoRuntime.event(payload), event);
     current(); return true;
   }
+
+  publishSessionLifecycle(name: SessionSubscription, sessionId: string, assertCaller: () => void): void {
+    try {
+      const session = this.options.store.findSession(sessionId)?.descriptor;
+      if (session === undefined) return;
+      this.#publishSubscription("session", { type: "event", name, sessionId, backendId: session.backendId },
+        session.targetId, session.binding.generation, assertCaller);
+    } catch { /* Subscription delivery does not own the session operation. */ }
+  }
+
+  #hasSubscription(topic: ExtensionMessageTopic): boolean {
+    return !this.#stopped && this.options.catalog.snapshot().entries.some(extension => extension.runtime?.subscribe?.topics.includes(topic));
+  }
+
+  #observeRun(event: PersistedEvent): void {
+    if (event.payload.type !== "run_state" || event.runId === undefined || event.traceId === `run-usage:${event.runId}`) return;
+    const { state } = event.payload;
+    const started = state === "running";
+    const ended = state === "completed" || state === "aborted" || state === "failed" || state === "dispatch_unknown";
+    if (!started && !ended) return;
+    const key = JSON.stringify([event.sessionId, event.generation, event.runId]);
+    const observed = ended && this.#observedTurns.delete(key);
+    const screenReply = state === "completed" && this.hasMessageHook("will-assistant-message", event.targetId);
+    if (ended && !observed && !screenReply) return;
+    if (started && (this.#observedTurns.has(key) || !this.#hasSubscription("turn") || this.#observedTurns.size >= 4_096)) return;
+    const { store, subscriptionTarget } = this.options;
+    if (subscriptionTarget?.(event.sessionId, BigInt(event.generation)) !== event.targetId) return;
+    const run = store.findRun(event.runId)?.descriptor;
+    if (run?.source !== "user" || run.parentRunId !== undefined) return;
+    const source = this.options.subscriptionRun?.(event.sessionId, run.id);
+    if (source === undefined) return;
+    const { modelId, assertCurrent } = source;
+    if (screenReply) void this.#presentAssistantReply(event.sessionId, run.id, event.generation, assertCurrent).catch(() => undefined);
+    if (!started && !observed) return;
+    if (started) this.#observedTurns.add(key);
+    const usage = ended ? run.usage : undefined;
+    this.#publishSubscription("turn", {
+      type: "event", name: started ? "did-turn-start" : "did-turn-end", sessionId: event.sessionId, backendId: event.backendId, runId: run.id,
+      ...(modelId === undefined ? {} : { modelId }),
+      ...(ended ? { state, ...(run.startedAt === undefined ? {} : { durationMs: Math.max(0, (run.endedAt ?? event.emittedAt) - run.startedAt) }) } : {}),
+      ...(usage?.tokensComplete === true ? { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens } : {})
+    }, event.targetId, event.generation, assertCurrent);
+  }
+
+  async #presentAssistantReply(sessionId: string, runId: string, generation: number, assertRun: () => void): Promise<void> {
+    const { store } = this.options;
+    const completion = store.findCompletedAssistantReply(runId);
+    if (completion?.payload.type !== "message_complete" || completion.sessionId !== sessionId
+      || completion.generation !== generation || this.#assistantHooks.size >= 128 || this.#assistantHooks.has(completion.id)) return;
+    const text = completion.payload.blocks.flatMap(block => block.kind === "text" ? [block.text] : []).join("\n\n");
+    const assertCurrent = () => {
+      assertRun();
+      if (this.#stopped || store.findCompletedAssistantReply(runId)?.id !== completion.id) {
+        throw new Error("The original assistant completion changed.");
+      }
+    };
+    this.#assistantHooks.add(completion.id);
+    try {
+      const verdict = await this.screenMessage({ type: "will-assistant-message", sessionId, text, assertCurrent });
+      if (verdict.action !== "rewrite" && verdict.action !== "render") return;
+      store.recordAssistantMessagePresentation({ completionEventId: completion.id, text: verdict.text,
+        assertCurrent: () => { assertCurrent(); verdict.assertAuthorized(); },
+        ...(verdict.action === "render" ? { card: {
+          id: `assistant-presentation:${completion.id}`, sessionId, extensionId: verdict.extensionId, extensionName: verdict.extensionName,
+          toolUseId: "", html: verdict.html, text: verdict.text, height: verdict.height, updatedAt: Date.now()
+        } } : {}) });
+    } finally {
+      this.#assistantHooks.delete(completion.id);
+    }
+  }
+
+  #publishSubscription(topic: ExtensionMessageTopic, event: SubscriptionEvent, targetId: string, generation: number, assertCaller: () => void): void {
+    const archived = event.name === "did-session-archived";
+    if (this.#stopped || this.options.subscriptionTarget?.(event.sessionId, BigInt(generation), archived) !== targetId) return;
+    for (const extension of this.options.catalog.snapshot().entries) {
+      if (!extension.runtime?.subscribe?.topics.includes(topic)) continue;
+      let authority: Authority;
+      try { authority = this.#capture(extension.id); } catch { continue; }
+      const assertCurrent = () => {
+        assertCaller();
+        if (this.#stopped || this.#capture(extension.id).key !== authority.key
+          || this.options.subscriptionTarget?.(event.sessionId, BigInt(generation), archived) !== targetId
+          || this.options.projects?.enabledForTarget(extension.id, targetId) === false) {
+          throw new Error("The subscribed task changed.");
+        }
+      };
+      try { assertCurrent(); } catch { continue; }
+      const instance = this.#currentInstance(authority);
+      const queue = instance?.subscriptions ?? this.#queueBeforeRuntimeStarts(authority);
+      if (queue === undefined) continue;
+      if (queue.items.length === 100) {
+        queue.items.shift();
+        queue.dropped++;
+      }
+      queue.items.push({ event, assertCurrent });
+      if (instance && !instance.publishingSubscriptions) void this.#drainSubscriptions(instance);
+    }
+  }
+
+  #queueBeforeRuntimeStarts(authority: Authority): SubscriptionQueue | undefined {
+    const id = authority.surface.extensionId;
+    const queueing = this.#pendingSubscriptions.get(id);
+    if (queueing?.authorityKey === authority.key) return queueing.queue;
+    if (queueing === undefined && this.#pendingSubscriptions.size >= 64) return;
+    const pending = { authorityKey: authority.key, queue: { items: [], dropped: 0 } };
+    this.#pendingSubscriptions.set(id, pending);
+    void this.#reconcile().then(() => {
+      if (this.#pendingSubscriptions.get(id) === pending) this.#pendingSubscriptions.delete(id);
+    });
+    return pending.queue;
+  }
+
+  async #drainSubscriptions(instance: Instance): Promise<void> {
+    instance.publishingSubscriptions = true;
+    const queue = instance.subscriptions;
+    try {
+      for (let item = queue.items.shift(); instance.current && item !== undefined; item = queue.items.shift()) {
+        try {
+          item.assertCurrent();
+          const page = await this.#ensure(instance);
+          this.#assert(instance);
+          item.assertCurrent();
+          const dropped = queue.dropped;
+          await page.evaluate(payload => (window as unknown as { __jokoRuntime: { event(payload: unknown): void } }).__jokoRuntime.event(payload),
+            dropped > 0 ? { ...item.event, dropped } : item.event);
+          queue.dropped -= dropped;
+        } catch { /* The transient observer does not own the turn or session. */ }
+      }
+    } finally {
+      instance.publishingSubscriptions = false;
+    }
+  }
+
+  hasMessageHook(type: ExtensionMessageHook, targetId: string): boolean {
+    return this.#messageHookAuthorities(type, targetId).length > 0;
+  }
+
+  #messageHookAuthorities(type: ExtensionMessageHook, targetId: string): Authority[] {
+    if (this.#stopped) return [];
+    const authorities: Authority[] = [];
+    for (const extension of this.options.catalog.snapshot().entries) {
+      if (!extension.runtime?.subscribe?.hooks.includes(type)) continue;
+      try {
+        const authority = this.#capture(extension.id);
+        if (this.options.projects?.enabledForTarget(extension.id, targetId) === false) continue;
+        if ((this.#currentInstance(authority)?.messageHookFailures ?? 0) < 3) authorities.push(authority);
+      } catch { /* The installation or project has no current executable authority. */ }
+    }
+    return authorities;
+  }
+
+  #currentInstance(authority: Authority): Instance | undefined {
+    const instance = this.#instances.get(authority.surface.extensionId);
+    return instance?.current && instance.authority.key === authority.key ? instance : undefined;
+  }
+
+  async #prepareMessageHook(authority: Authority, deadline: AbortSignal): Promise<Instance | undefined> {
+    const installed = this.#currentInstance(authority);
+    if (installed !== undefined || deadline.aborted) return installed;
+    let stopWaiting: () => void = () => {};
+    const expired = new Promise<void>(resolve => { stopWaiting = resolve; });
+    deadline.addEventListener("abort", stopWaiting, { once: true });
+    try {
+      // A Backend refresh can retire the old sandbox before the next periodic reconciliation.
+      await Promise.race([this.#reconcile(), expired]);
+      return deadline.aborted ? undefined : this.#currentInstance(authority);
+    } finally {
+      deadline.removeEventListener("abort", stopWaiting);
+    }
+  }
+
+  async screenMessage(input: { readonly type: ExtensionMessageHook; readonly sessionId: string; readonly text: string;
+    readonly assertCurrent: () => void }): Promise<ExtensionMessageVerdict> {
+    input.assertCurrent();
+    const text = this.options.redact(input.text);
+    if (text !== input.text || !text.trim()) return { action: "allow" };
+    const targetId = this.options.store.getSession(input.sessionId).descriptor.targetId;
+    const installations = this.#messageHookAuthorities(input.type, targetId).sort((left, right) =>
+      left.approvedAt - right.approvedAt || left.surface.extensionId.localeCompare(right.surface.extensionId, "en"));
+    let currentText = text;
+    let rendered: Omit<Extract<ExtensionMessageVerdict, { action: "render" }>, "text" | "assertAuthorized"> | undefined;
+    let renderAuthority: (() => void) | undefined;
+    const rewrites: (() => void)[] = [];
+    for (const authority of installations) {
+      input.assertCurrent();
+      const deadline = AbortSignal.timeout(input.type === "will-user-message" ? 3_000 : 5 * 60_000);
+      const instance = await this.#prepareMessageHook(authority, deadline);
+      if (instance === undefined || deadline.aborted || instance.messageHookFailures >= 3 || instance.messageHooksPending >= 8) continue;
+      const guard = () => {
+        this.#assert(instance);
+        this.options.projects?.assertEnabledForSession(instance.authority.surface.extensionId, input.sessionId);
+      };
+      try { guard(); } catch { continue; }
+      instance.messageHooksPending++;
+      let page: Page | undefined;
+      const callId = randomUUID();
+      const signal = AbortSignal.any([deadline, instance.abort.signal]);
+      let rejectWait: () => void = () => {};
+      const interrupted = new Promise<never>((_, reject) => {
+        rejectWait = () => reject(new Error("The original extension message hook expired."));
+        signal.addEventListener("abort", rejectWait, { once: true });
+      });
+      try {
+        const value = await Promise.race([interrupted, (async () => {
+          page = await this.#ensure(instance);
+          guard();
+          input.assertCurrent();
+          signal.throwIfAborted();
+          return page.evaluate(payload => (window as unknown as { __jokoRuntime: { message: (input: unknown) => Promise<unknown> } })
+            .__jokoRuntime.message(payload), { callId, type: input.type, sessionId: input.sessionId, text: currentText });
+        })()]);
+        guard();
+        input.assertCurrent();
+        const verdict = value !== null && typeof value === "object" && !Array.isArray(value)
+          ? value as Readonly<Record<string, unknown>> : undefined;
+        if (verdict === undefined) continue;
+        instance.messageHookFailures = 0;
+        if (input.type === "will-user-message" && verdict["action"] === "block") {
+          const reason = typeof verdict["reason"] === "string" ? this.options.redact(verdict["reason"].slice(0, 512)).trim() : "";
+          return { action: "block", extensionName: instance.authority.name, ...(reason === "" ? {} : { reason }) };
+        }
+        const updated = typeof verdict["text"] === "string" ? verdict["text"].slice(0, 16_000) : "";
+        if (verdict["action"] === "rewrite" && updated.trim() && updated !== currentText && this.options.redact(updated) === updated) {
+          currentText = updated;
+          rewrites.push(guard);
+        } else if (verdict["action"] === "render" && input.type === "will-assistant-message" && typeof verdict["html"] === "string") {
+          const safe = sanitizeExtensionCardHtml(verdict["html"]);
+          if (safe.ok && this.options.redact(safe.html) === safe.html) {
+            const height = typeof verdict["height"] === "number" && Number.isFinite(verdict["height"])
+              ? Math.round(verdict["height"]) : EXTENSION_CARD_HEIGHT_DEFAULT;
+            rendered = { action: "render", extensionId: instance.authority.surface.extensionId, extensionName: instance.authority.name,
+              html: safe.html, height: Math.min(EXTENSION_CARD_HEIGHT_MAX, Math.max(EXTENSION_CARD_HEIGHT_MIN, height)) };
+            renderAuthority = guard;
+          }
+        }
+      } catch {
+        input.assertCurrent();
+        try { guard(); } catch { continue; }
+        instance.messageHookFailures++;
+        if (instance.messageHookFailures === 3) this.#notifyMessageHookDisabled(instance, input.sessionId);
+      } finally {
+        signal.removeEventListener("abort", rejectWait);
+        instance.messageHooksPending--;
+        if (signal.aborted) void page?.evaluate(id => (window as unknown as { __jokoRuntime: { cancel(id: string): void } })
+          .__jokoRuntime.cancel(id), callId).catch(() => undefined);
+      }
+    }
+    input.assertCurrent();
+    const assertAuthorized = () => {
+      for (const guard of rewrites) guard();
+      renderAuthority?.();
+    };
+    try { assertAuthorized(); } catch { return { action: "allow" }; }
+    if (rendered !== undefined) return { ...rendered, text: currentText.slice(0, 16_000), assertAuthorized };
+    return currentText === text ? { action: "allow" } : { action: "rewrite", text: currentText, assertAuthorized };
+  }
+
+  #notifyMessageHookDisabled(instance: Instance, sessionId: string): void {
+    try {
+      const session = this.options.store.getSession(sessionId).descriptor;
+      const name = this.options.redact(instance.authority.name);
+      this.options.store.appendEvent({ backendId: session.backendId, targetId: session.targetId, sessionId,
+        generation: session.binding.generation, traceId: "extension-message-hook-disabled",
+        payload: { type: "extension_ui_effect", effect: "notification", notificationKind: "warning",
+          text: this.#contextLocale() === "zh-CN" ? `插件「${name}」连续三次未能处理消息。重新启用插件后可恢复。`
+            : `The ${name} extension failed to process three successive messages. Enable the extension again to resume.` } });
+    } catch { /* The original message can still proceed. */ }
+  }
   notifyRoutingChanged(authority: ExtensionMainViewAuthority, assertCaller: () => void): void {
     const instance = this.#instances.get(authority.extensionId);
     if (!instance?.page || instance.page.isClosed()) return;
@@ -601,6 +914,8 @@ export class ExtensionCardRuntime {
   }
   async stop(): Promise<void> {
     this.#stopped = true; clearInterval(this.#timer); this.#unsubscribe?.();
+    this.#stopSubscriptionEvents?.(); this.#observedTurns.clear();
+    this.#pendingSubscriptions.clear();
     this.options.deviceSync?.setActive(false);
     for (const instance of this.#instances.values()) this.#retire(instance);
     await this.#tail;

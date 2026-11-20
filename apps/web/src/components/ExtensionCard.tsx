@@ -36,9 +36,10 @@ export function ExtensionCardTimelineProvider({ controller, readOnly = false, ca
   }), [ownerKey, restricted]);
   return <Context.Provider value={actions}>{children}</Context.Provider>;
 }
-export function ExtensionCard({ card, t }: { readonly card: Card; readonly t: Translator }) {
-  const actions = useContext(Context), api = useMemo(() => actions.bind?.(), [actions]);
-  return <CardBody key={`${actions.ownerKey}:${card.cardId}:${actions.readOnly}:${Boolean(api)}`} card={card} actions={actions} api={api} t={t} />;
+export function ExtensionCard({ card, t, readOnly = false }: { readonly card: Card; readonly t: Translator; readonly readOnly?: boolean }) {
+  const actions = useContext(Context), api = useMemo(() => readOnly ? undefined : actions.bind?.(), [actions, readOnly]);
+  return <CardBody key={`${actions.ownerKey}:${card.cardId}:${actions.readOnly || readOnly}:${Boolean(api)}`}
+    card={card} actions={readOnly ? { ...actions, readOnly: true } : actions} api={api} t={t} />;
 }
 function CardBody({ card, actions, api, t }: { card: Card; actions: Actions; api: ExtensionCardApi | undefined; t: Translator }) {
   const root = useRef<HTMLElement>(null), lifetime = useRef(new AbortController()), tail = useRef(Promise.resolve(true));

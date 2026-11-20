@@ -7271,6 +7271,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           <Text style={[styles.caption, { color: colors.muted }]}>{item.replyQuote.role === 'assistant' ? partnerIdentity.partner.displayName : locale === 'zh-CN' ? '你' : 'You'}</Text>
           <Text style={[styles.body, { color: colors.ink }]}>{replyQuoteText || (locale === 'zh-CN' ? '仅附件消息' : 'Attachment-only message')}</Text>
         </Pressable>}
+        {item.assistantPresentationCard && <MobileExtensionCard card={item.assistantPresentationCard} colors={colors} locale={locale}
+          enabled={false} readOnly />}
         {item.collaboration ? <MobileCollaborationMessageCard message={item.collaboration} blockKey={item.id} ownerKey={blockOwnerKey}
           colors={colors} locale={locale} enabled={state.status === "connected" || state.status === "offline"}
           canOpen={state.status === "connected" && !!collaborationApi && !state.busy && !voice.busy && !attachmentBusy && !navigationBusy}

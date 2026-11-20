@@ -42,6 +42,7 @@ export interface TimelineRow {
   readonly todoQuote?: MobilePartnerTodoQuote;
   readonly mcpApp?: import("@joko/contracts").McpAppCard;
   readonly extensionCard?: import("@joko/contracts").ExtensionCard;
+  readonly assistantPresentationCard?: import("@joko/contracts").ExtensionCard;
   readonly partnerTaskReceipt?: PartnerSessionTaskReceiptView;
   readonly learning?: PartnerLearningFeedbackView;
   readonly assistantBodyPresent?: boolean;
@@ -357,6 +358,25 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
         const learning = projectPartnerLearningFeedback(changed.feedback);
         if (learning && (previous.learning?.revision ?? 0n) >= learning.revision) break;
         byId.set(previous.id, { ...previous, learning });
+        break;
+      }
+      case "assistantMessagePresentationChanged": {
+        const update = kind.value, previous = byId.get(update.messageId);
+        if (!previous || previous.kind !== "assistant" || !previous.completed || previous.eventId !== update.completionEventId
+          || !update.text.trim() || update.card !== undefined && update.card.sessionId !== event.identity?.sessionId) break;
+        const completion = unique.get(update.completionEventId);
+        if (!completion || completion.identity?.sessionId !== event.identity?.sessionId
+          || completion.cursor?.generation !== event.cursor?.generation) break;
+        let replaceText = update.card === undefined;
+        const parts = previous.messageParts?.flatMap<MobileTimelineMessagePart>(part => {
+          if (part.kind !== "text") return [part];
+          if (!replaceText) return [];
+          replaceText = false;
+          return [{ ...part, text: update.text }];
+        });
+        byId.set(previous.id, { ...previous, text: update.text,
+          ...(update.card === undefined ? {} : { assistantPresentationCard: update.card }),
+          ...(parts === undefined && update.card === undefined ? {} : { messageParts: parts ?? [] }) });
         break;
       }
       case "runtimeHandoff":

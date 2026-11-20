@@ -1630,6 +1630,7 @@ export interface TimelineItemView {
   readonly replyQuote?: PartnerReplyQuoteView;
   readonly todoQuote?: { readonly partnerId: string; readonly todoId: string; readonly revision: bigint; readonly title: string };
   readonly extensionCard?: import("@joko/contracts").ExtensionCard;
+  readonly assistantPresentationCard?: import("@joko/contracts").ExtensionCard;
   readonly mcpApp?: import("@joko/contracts").McpAppCard;
   readonly partnerTaskReceipt?: import("@joko/contracts").PartnerSessionTaskReceiptView;
   readonly personalDevelopmentReport?: PersonalDevelopmentDoctorRun;

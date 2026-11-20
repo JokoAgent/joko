@@ -586,6 +586,7 @@ export interface OrchestratorApplication {
   readonly desktopExtensionContext?: Pick<ExtensionCardRuntime, "desktopHostLocale" | "setDesktopHostLocale">;
   readonly extensionDirectoryPicker?: ExtensionDirectoryPicker;
   readonly extensionCards?: ExtensionCardsManager;
+  readonly extensionMessageHooks?: Pick<ExtensionCardRuntime, "hasMessageHook" | "screenMessage" | "publishSessionLifecycle">;
   readonly extensionNetwork?: ExtensionNetworkSettings;
   readonly extensionOAuth?: ExtensionOAuthSettings;
   readonly extensionTasks?: ExtensionTasks;
@@ -2853,6 +2854,7 @@ export async function createOrchestratorApplication(
         return installationKey === undefined ? undefined : { installationKey, revision: extension.revision };
       } catch { return undefined; }
     },
+    observeFocus: (sessionId, assertCurrent) => extensionCardRuntime?.publishSessionLifecycle("did-session-switched", sessionId, assertCurrent),
     taskAvailable: (extensionId, sessionId) => {
       try {
         return localExtensionTaskViewSession(store, sessionId) !== undefined
@@ -2875,6 +2877,8 @@ export async function createOrchestratorApplication(
     authority: id => extensionCardRuntime?.authority(id), locale: () => persistedLocale(store),
     continueTask: (scope, text, guard) => sessionHost.enqueueExtensionCardMessage(scope.sessionId, scope.extensionId, text, guard) });
   extensionCardRuntime = new ExtensionCardRuntime({ catalog: extensionCatalog, resources: piResources, store, projects: extensionProjects,
+    subscriptionTarget: (...args) => sessionHost.extensionMessageHookTarget(...args),
+    subscriptionRun: (...args) => sessionHost.extensionSubscriptionRun(...args),
     taskViews: extensionTaskViews,
     deviceSync: extensionDeviceSync,
     vault: credentialVault, surfaces: extensionMainViews, cards: extensionCards, tasks: extensionTasks, targets: extensionTargets, text: { oneshot: (...args) => extensionText!.oneshot(...args) }, media: extensionCardMedia, oauthCards: extensionOAuthCards, workspaces, extraDirectories: sessionHost.extraDirectories, remoteFiles: (binding, signal) => remoteExecution.files(binding, signal), connections: extensionConnections, oauth: extensionOAuthAccounts,
@@ -3880,6 +3884,7 @@ export async function createOrchestratorApplication(
     ...(dependencies.desktopManagedExtensionContext ? { desktopExtensionContext: extensionCardRuntime } : {}),
     extensionDirectoryPicker,
     extensionCards,
+    extensionMessageHooks: extensionCardRuntime,
     extensionNetwork,
     extensionOAuth,
     extensionTasks,

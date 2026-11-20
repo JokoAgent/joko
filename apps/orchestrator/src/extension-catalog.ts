@@ -803,6 +803,14 @@ function runtimePermissions(runtime: ExtensionRuntimeDescriptor | undefined): re
     ...(runtime.tasks ? [{ id: "runtime-managed-tasks", label: "Managed tasks", description: "Creates and controls its own ordinary tasks using your selected model and task permissions.", required: true }] : []),
     ...(runtime.targets ? [{ id: "runtime-targets", label: "Deliver to projects, tasks and partners", description: "Lists local target names and sends plugin text or images to a selected target. This does not grant access to its message history.", required: true }] : []),
     ...(runtime.deviceSync ? [{ id: "runtime-device-sync", label: "Encrypted plugin data exchange", description: "Exchanges bounded plugin data with the same approved plugin on authorized Desktop devices. It cannot read their files or task history.", required: true }] : []),
+    ...(runtime.subscribe?.topics.includes("turn")
+      ? [{ id: "runtime-turn-events", label: "Turn activity", description: "Observes when turns start and end in eligible local tasks.", required: true }] : []),
+    ...(runtime.subscribe?.topics.includes("session")
+      ? [{ id: "runtime-session-events", label: "Task activity", description: "Observes creation, archiving and selection of eligible local tasks.", required: true }] : []),
+    ...(runtime.subscribe?.hooks.includes("will-user-message")
+      ? [{ id: "runtime-user-message-hook", label: "Review outgoing task messages", description: "Reads the text you are about to send in eligible local tasks and may block or rewrite it.", required: true }] : []),
+    ...(runtime.subscribe?.hooks.includes("will-assistant-message")
+      ? [{ id: "runtime-assistant-message-hook", label: "Customize completed replies", description: "Reads completed reply text in eligible local tasks and may change how it is presented.", required: true }] : []),
     ...(runtime.pick ? [{ id: "runtime-pick", label: "Choose directories", description: "Requests a trusted host directory chooser. Only a bounded read deposit for your explicit selection reaches this plugin; it receives no absolute path or general filesystem access.", required: true }] : []),
     ...(runtime.image ? [{ id: "runtime-image-models", label: "Image generation models", description: "Reads the available image generation model names, provider identities and default selection.", required: true }] : []),
     ...(runtime.tasks?.hidden ? [{ id: "runtime-hidden-tasks", label: "Background tasks", description: "May hide its own tasks from normal lists, search and notifications. You can open or reveal them in plugin details.", required: true }] : []),
