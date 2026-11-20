@@ -76,11 +76,36 @@ const PI_PUBLISHED_SSH_FILES = {
   undici: ["package.json", "index.js", "index-fetch.js", "lib", "LICENSE"],
   "@silvia-odwyer/photon-node": ["package.json", "photon_rs.js", "photon_rs_bg.js", "photon_rs_bg.wasm", "LICENSE.md"]
 } as const;
-const PI_PUBLISHED_LAUNCHER = `// Retain the OS argv that the broker uses to identify and retire this process.
+const PI_PUBLISHED_TITLE_SETUP = `// Retain the OS argv that the broker uses to identify and retire this process.
 const initialTitle = process.title;
 delete process.title;
 Object.defineProperty(process, "title", { value: initialTitle, writable: true, configurable: true });
-await import("./dist/bundle/cli.js");
+`;
+const PI_PUBLISHED_LAUNCHER = `${PI_PUBLISHED_TITLE_SETUP}await import("./dist/bundle/cli.js");\n`;
+const REMOTE_PI_PATH_PROBE = String.raw`
+import { constants } from "node:fs";
+import { access, lstat, readFile, realpath } from "node:fs/promises";
+import { delimiter, dirname, isAbsolute, join } from "node:path";
+if (process.platform !== "linux") process.exit(1);
+for (const directory of (process.env.PATH ?? "").split(delimiter).slice(0, 128)) {
+  if (!isAbsolute(directory)) continue;
+  const candidate = join(directory, "pi");
+  try { await access(candidate, constants.X_OK); }
+  catch (error) { if (["ENOENT", "ENOTDIR", "EACCES"].includes(error?.code)) continue; throw error; }
+  const entry = await realpath(candidate);
+  if (!(await lstat(entry)).isFile()) continue;
+  const packageRoot = dirname(dirname(dirname(entry)));
+  if (!entry.endsWith("/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js")) process.exit(1);
+  const manifest = join(packageRoot, "package.json");
+  const info = await lstat(manifest);
+  if (!info.isFile() || info.size > 65536) process.exit(1);
+  const value = JSON.parse(await readFile(manifest, "utf8"));
+  if (value.name !== "@earendil-works/pi-coding-agent" || value.version !== process.argv[1] || value.bin?.pi !== "dist/bundle/cli.js") process.exit(1);
+  process.stdout.write(JSON.stringify(entry));
+  process.exitCode = 0;
+  break;
+}
+if (process.exitCode === undefined) process.exitCode = 1;
 `;
 const MAXIMUM_BROKER_BOOTSTRAP_BYTES = 1024 * 1024;
 const MAXIMUM_AUTHORITY_BYTES = 64 * 1024;
@@ -569,6 +594,8 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     };
 
     const rewrittenArgs = [...spec.args];
+    const remotePathPiEntry = binding.kind === "ssh" && spec.command === "pi"
+      ? await resolveRemotePathPi(startupAuthority, controlCwd) : undefined;
     const publishedSshPiRoot = binding.kind === "ssh" && spec.command === process.execPath
       ? spec.args[0] === PUBLISHED_PI_LOCAL_CLI ? PUBLISHED_PI_PACKAGE_ROOT : await resolvePublishedPiBundleRoot(spec.args[0])
       : undefined;
@@ -669,6 +696,15 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
       rewrittenArgs[index] = remoteAsset;
     }
 
+    if (remotePathPiEntry !== undefined) {
+      const source = `import { pathToFileURL } from "node:url";\n${PI_PUBLISHED_TITLE_SETUP}await import(pathToFileURL(${JSON.stringify(remotePathPiEntry)}).href);\n`;
+      const snapshot = createLocalAssetSnapshot([{ path: "", kind: "file", mode: 0o600, content: Buffer.from(source) }]);
+      const remote = targetPaths.join(remoteRuntime, "assets", `${snapshot.digest}-pi-path.mjs`);
+      stagingPlans.push({ local: localRuntime, remote, snapshot });
+      rewrittenArgs.unshift(remote);
+      compatibilityAssets.push({ role: "entrypoint", name: "pi-path", digest: snapshot.digest });
+    }
+
     const localAgentHome = spec.env["PI_CODING_AGENT_DIR"];
     if (localAgentHome !== undefined) {
       const normalizedAgentHome = resolve(localAgentHome);
@@ -709,7 +745,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
       throw new Error("Remote Pi managed runner source is unavailable.");
     }
     const trustedRunnerDigest = trustedRunnerScriptSha256 ?? "0".repeat(64);
-    const command = publishedSshPiRoot !== undefined ? "node" : remoteCommand(
+    const command = publishedSshPiRoot !== undefined || remotePathPiEntry !== undefined ? "node" : remoteCommand(
       spec.command,
       rewrittenArgs,
       remoteRuntime,
@@ -1744,6 +1780,29 @@ async function waitForRemoteProcessExit(
     processHandle.once("exit", onExit);
     processHandle.once("error", onError);
   });
+}
+
+async function resolveRemotePathPi(authority: RemoteWorkspaceAuthority, cwd: string): Promise<string> {
+  const manifest: unknown = JSON.parse(await readFile(join(PUBLISHED_PI_PACKAGE_ROOT, "package.json"), "utf8"));
+  if (!isPlainRecord(manifest) || typeof manifest["version"] !== "string") {
+    throw new Error("The published Pi version is unavailable.");
+  }
+  authority.assertCurrent();
+  const probe = await authority.processes.open({ executable: "node",
+    args: ["--input-type=module", "--eval", REMOTE_PI_PATH_PROBE, "--", manifest["version"]], cwd, env: {} });
+  const completion = waitForRemoteProcessExit(probe, BROKER_KILL_TIMEOUT_MS);
+  const output = readBoundedRemoteControlOutput(probe, BROKER_KILL_TIMEOUT_MS);
+  probe.stderr.resume();
+  probe.stdin.end();
+  const [exit, bytes] = await Promise.all([completion, output]);
+  authority.assertCurrent();
+  if (exit.code !== 0) throw new Error("The SSH account's pi command does not resolve to a compatible published npm launcher.");
+  const entry = exactBoundedText(JSON.parse(bytes.toString("utf8")), 4_096, "remote Pi entrypoint");
+  if (!remotePath.isAbsolute(entry) || remotePath.normalize(entry) !== entry || /[\r\n]/u.test(entry)
+    || !entry.endsWith(`/node_modules/${PUBLISHED_PI_PACKAGE_NAME}/dist/bundle/cli.js`)) {
+    throw new Error("The SSH account returned an invalid published Pi entrypoint.");
+  }
+  return entry;
 }
 
 async function readBoundedRemoteControlOutput(

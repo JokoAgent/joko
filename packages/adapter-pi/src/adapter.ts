@@ -5173,7 +5173,7 @@ export class PiBackendAdapter implements
     const sshLaunch = context.target.remoteWorkspace?.kind === "ssh";
     const configuredBundle = sshLaunch && this.#command !== process.execPath
       ? await resolvePublishedPiBundleRoot(this.#command) : undefined;
-    const stagedPublishedPi = sshLaunch && (configuredBundle !== undefined || this.#command === process.execPath
+    const stagedPublishedPi = sshLaunch && (this.#command === "pi" || configuredBundle !== undefined || this.#command === process.execPath
       && this.#commandArgs[0] === PUBLISHED_PI_LOCAL_CLI);
     // The default SSH runtime owns its policy bridge and relative support files as one tree.
     const [bridgePath, subagentPath] = await Promise.all([
@@ -5488,7 +5488,7 @@ export class PiBackendAdapter implements
       if (hosted) assertHostedExecution(hosted);
       assertStartupCurrent?.();
       const process = await this.#processFactory({
-        command: configuredBundle === undefined ? this.#command : process.execPath,
+        command: configuredBundle === undefined ? this.#command : globalThis.process.execPath,
         args,
         cwd: runtimeWorkspaceRoot(context.target),
         env: remoteHome?.environment ?? env,

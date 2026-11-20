@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { EventEmitter, once } from "node:events";
-import { link, mkdir, open, readFile, readdir, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, open, readFile, readdir, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { dirname, join, posix as remotePath, win32, type PlatformPath } from "node:path";
@@ -727,7 +727,7 @@ describe("RemotePiProcessFactory", () => {
     await terminal;
   });
 
-  it.runIf(process.platform === "linux").each(["default", "npm bin"] as const)("starts the published %s SSH Pi RPC without changing owned argv", async entry => {
+  it.runIf(process.platform === "linux").each(["default", "npm bin", "target PATH"] as const)("starts the published %s SSH Pi RPC without changing owned argv", async entry => {
     const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-published-"));
     temporaryDirectories.push(fixture);
     const runtime = join(fixture, "runtime"), sessions = join(fixture, "sessions"), staged = join(fixture, "staged");
@@ -746,23 +746,37 @@ describe("RemotePiProcessFactory", () => {
     await files.mkdir("/workspace", { recursive: true });
     await files.mkdir("/home/maker", { recursive: true });
     const bridge = new ManualRemoteProcess();
+    const publishedCli = entry === "default" ? PUBLISHED_PI_LOCAL_CLI : join(PUBLISHED_PI_PACKAGE_ROOT, "dist", "bundle", "cli.js");
+    const targetPath = join(fixture, "target-bin");
+    if (entry === "target PATH") {
+      await mkdir(targetPath);
+      await symlink(publishedCli, join(targetPath, "pi"));
+    }
+    let probes = 0;
     const lease: RemoteSshTransportLease = {
       capabilities: { commandExecution: true, processStreaming: true, fileTransfer: true, tcpForwarding: false, interactiveTerminal: false },
-      files, processes: { open: async () => bridge }
+      files, processes: { open: async request => {
+        if (request.args[0] !== "--input-type=module") return bridge;
+        probes++;
+        expect(request).toMatchObject({ executable: "node", cwd: "/home/maker", env: {} });
+        return spawn(process.execPath, request.args, { cwd: fixture, env: { PATH: targetPath }, stdio: ["pipe", "pipe", "pipe"] });
+      } }
     };
     const registry = { transports: async () => ({ host: {}, lease }) } as unknown as RemoteHostRegistry;
-    const publishedCli = entry === "default" ? PUBLISHED_PI_LOCAL_CLI : join(PUBLISHED_PI_PACKAGE_ROOT, "dist", "bundle", "cli.js");
     const args = ["--mode", "rpc", "--no-session", "--no-extensions", "--offline", "--extension"];
     const mapped = await remoteFactory(registry, join(fixture, "authority")).create({
-      command: process.execPath, args: [publishedCli, ...args, extensionPath], cwd: "/workspace", remoteWorkspace: TEST_REMOTE_WORKSPACE,
+      command: entry === "target PATH" ? "pi" : process.execPath,
+      args: [...(entry === "target PATH" ? [] : [publishedCli]), ...args, extensionPath], cwd: "/workspace", remoteWorkspace: TEST_REMOTE_WORKSPACE,
       env: { JOKO_PI_TARGET_ID: "target-a", JOKO_PI_SPAWN_IDENTITY: "a".repeat(64), JOKO_PI_REMOTE_RECOVERY_IDENTITY: "b".repeat(64),
         JOKO_PI_GENERATION: "1", JOKO_PI_MCP_TOKEN: "bridge-token-a", JOKO_PI_CONTROL_FILE: control, PI_CODING_AGENT_SESSION_DIR: sessions }
     });
     try {
       const bootstrap = JSON.parse(bridge.input[0]!.toString("utf8")) as { executable: string; args: string[] };
+      expect(probes).toBe(entry === "target PATH" ? 1 : 0);
       expect(bootstrap.executable).toBe("node");
       expect(bootstrap.args.slice(1, -1)).toEqual(args);
-      expect(bootstrap.args[0]).toMatch(/\/assets\/[a-f0-9]{64}-pi-runtime\/node_modules\/@earendil-works\/pi-coding-agent\/joko-rpc-launch\.mjs$/u);
+      expect(bootstrap.args[0]).toMatch(entry === "target PATH" ? /\/assets\/[a-f0-9]{64}-pi-path\.mjs$/u
+        : /\/assets\/[a-f0-9]{64}-pi-runtime\/node_modules\/@earendil-works\/pi-coding-agent\/joko-rpc-launch\.mjs$/u);
       expect(bootstrap.args.at(-1)).toMatch(/\/managed\/joko-managed-bridge\.ts$/u);
       const localStagedPath = (remote: string) => join(staged, ...remote.split("/").slice(6));
       const launcher = localStagedPath(bootstrap.args[0]!);
