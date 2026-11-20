@@ -42,6 +42,7 @@ interface Props {
   readonly ownerKey: string;
   readonly selectable?: boolean;
   readonly quoteAction?: MobileMessageQuoteAction;
+  readonly codeQuoteAction?: MobileMessageQuoteAction;
   readonly resourceClient?: MobileMarkdownResourceClient;
   readonly resourceOwnerKey?: string;
   readonly messageId?: string;
@@ -87,7 +88,7 @@ export const MobileMarkdownMessage = memo(function MobileMarkdownMessage(props: 
 });
 
 const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ text, colors, locale, ownerKey, selectable = true,
-  preparedResources: resources, onOpenImage, onOpenPath, retryPath, onAnnotateDiagram }: Props & {
+  codeQuoteAction, preparedResources: resources, onOpenImage, onOpenPath, retryPath, onAnnotateDiagram }: Props & {
     readonly preparedResources?: MobileMarkdownResourceDescriptor;
     readonly retryPath?: (key: string) => void;
   }) {
@@ -212,16 +213,18 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
   </View>;
   const block = (value: MobileMarkdownBlock) => {
     if (value.type === "code") {
-      const runs = mobileCodeHighlight(value.text, value.language);
+      const codeQuote = selectable ? codeQuoteAction : undefined;
+      const runs = codeQuote === undefined ? mobileCodeHighlight(value.text, value.language) : [];
       return <View key={value.key} style={[styles.frame, { borderColor: colors.border, backgroundColor: colors.background }]}>
         {toolbar(copySources.get(value.key)!, value.language ?? mobileMessage(locale, "markdown.code"))}
         <ScrollView horizontal nestedScrollEnabled contentContainerStyle={styles.codeContent}>
-          <Text selectable={selectable} style={[styles.code, { color: colors.ink }]}>
+          {codeQuote !== undefined ? <MobileSelectableMessageText text={value.text} ink={colors.ink} lineHeight={20} action={codeQuote} />
+            : <Text selectable={selectable} style={[styles.code, { color: colors.ink }]}>
             {runs.map((run, index) => <Text key={index} style={run.kind ? {
               color: /comment|meta/u.test(run.kind) ? colors.muted : /keyword|number|literal/u.test(run.kind) ? colors.accent : colors.ink,
               ...(/keyword/u.test(run.kind) ? { fontWeight: "600" as const } : {})
             } : undefined}>{run.text}</Text>)}
-          </Text>
+          </Text>}
         </ScrollView>
       </View>;
     }

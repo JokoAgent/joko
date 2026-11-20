@@ -2,10 +2,15 @@
 import { act, createElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import type { MobileMessageQuoteAction } from "./MobileSelectableMessageText";
 
 vi.mock("./MobileSelectableMessageText", () => ({ MobileSelectableMessageText: () => null }));
 
-const native = vi.hoisted(() => ({ measure: undefined as undefined | ((event: { nativeEvent: { lines: unknown[] } }) => void) }));
+const native = vi.hoisted(() => ({ measure: undefined as undefined | ((event: { nativeEvent: { lines: unknown[] } }) => void),
+  codeQuote: undefined as MobileMessageQuoteAction | undefined }));
+vi.mock("./MobileMarkdownMessage", () => ({ MobileMarkdownMessage: ({ text, codeQuoteAction }: {
+  text: string; codeQuoteAction?: MobileMessageQuoteAction;
+}) => { native.codeQuote = codeQuoteAction; return createElement("div", { "data-code": true }, text); } }));
 vi.mock("react-native", () => ({
   StyleSheet: { create: (value: unknown) => value },
   View: ({ children, accessibilityElementsHidden, pointerEvents, importantForAccessibility }: {
@@ -27,11 +32,11 @@ let host: HTMLDivElement;
 let root: Root;
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
-  host = document.body.appendChild(document.createElement("div")); root = createRoot(host); native.measure = undefined;
+  host = document.body.appendChild(document.createElement("div")); root = createRoot(host); native.measure = undefined; native.codeQuote = undefined;
 });
 afterEach(() => { act(() => root.unmount()); host.remove(); Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT"); });
 const props: MobileUserMessageContentProps = { ownerKey: "task/message", text: "Visible source ".repeat(15), automation: false,
-  selectable: true, locale: "en", colors: { ink: "#111", muted: "#666" } };
+  selectable: true, formatExpandedCode: true, locale: "en", colors: { background: "#fafafa", surface: "#fff", ink: "#111", muted: "#666", border: "#ccc", accent: "#f90", negative: "#c33" } };
 function render(patch: Partial<MobileUserMessageContentProps> = {}) { act(() => root.render(createElement(MobileUserMessageContent, { ...props, ...patch }))); }
 const body = () => host.querySelector('[data-testid="message.userBody"]')!;
 const toggle = () => host.querySelector<HTMLElement>('[data-testid="message.userCollapse"]');
@@ -64,4 +69,25 @@ it("uses the scheduler threshold and retires old native callbacks and expansion 
   expect(body().getAttribute("data-lines")).toBeNull(); expect(toggle()).toBeNull();
   render({ text: "Changed input ".repeat(10), automation: true });
   expect(body().getAttribute("data-lines")).toBe("3");
+});
+
+it("expands the exact complete fenced code and keeps its quote offsets in the original user message", () => {
+  const onQuote = vi.fn(), prefix = "Original note with 🚀\n\n";
+  const program = Array.from({ length: 20 }, (_, index) => `const line${index} = '<&>';`).join("\n");
+  const fence = "```ts\n" + program + "\n```\n";
+  render({ text: prefix + fence + "\nFinal note", quoteAction: { source: "original-message", label: "Quote selection", onQuote } });
+  const block = () => host.querySelector("[data-code]");
+  expect(block()).toBeNull();
+  act(() => toggle()!.click());
+  expect(block()?.textContent).toBe(fence);
+  native.codeQuote?.onQuote({ start: 0, end: 5 });
+  const first = prefix.length + "```ts\n".length;
+  expect(onQuote).toHaveBeenCalledExactlyOnceWith({ start: first, end: first + 5 });
+  act(() => toggle()!.click());
+  expect(block()).toBeNull();
+
+  render({ text: prefix + "```ts\n" + program });
+  act(() => toggle()!.click());
+  expect(block()).toBeNull();
+  expect(body().textContent).toBe(prefix + "```ts\n" + program);
 });

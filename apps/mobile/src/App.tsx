@@ -7303,7 +7303,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
           onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} onRetryPath={retryMarkdownPath} onAnnotateDiagram={annotateDiagram} />
           : item.kind === "user" ? <MobileUserMessageContent ownerKey={`${blockOwnerKey}/${item.id}`} text={item.text}
-            quoteAction={quoteAction}
+            quoteAction={quoteAction} formatExpandedCode={!item.optimistic}
             automation={item.automationOrigin !== undefined} selectable={!item.optimistic} colors={colors} locale={locale} />
           : item.planReview ? <View style={styles.field}>
             <Text style={[styles.label, { color: colors.ink }]}>{mobilePlanDecisionLabel(item.planReview.decision, locale)}</Text>
