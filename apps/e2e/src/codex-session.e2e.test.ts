@@ -1560,8 +1560,8 @@ mountedIt.each(["lost receipt", "late receipt"] as const)(
         await openTask(childId);
       }
       const editor = task(childId).locator("[data-composer-editor='true'] .composer-rich-editor__content");
-      await editor.getByText(prompt, { exact: true }).waitFor({ state: "visible" });
-      expect(await editor.innerText()).toBe(prompt);
+      await waitFor(() => editor.evaluateAll(elements => elements.length === 1 ? (elements[0] as HTMLElement).innerText : undefined),
+        text => text === prompt, "the exact Composer draft in the original child task", 20_000);
       expect(submitted).toEqual([childOperation!.operationId]);
       expect(inspected.every(id => id === childOperation!.operationId)).toBe(true);
       expect(store.listSessions().filter(({ descriptor }) => descriptor.derivationOrigin?.sourceEventId === origin.eventId)).toHaveLength(1);
