@@ -1,5 +1,7 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from '@bufbuild/protobuf';
-import { DesktopVoiceConversationAction, ControlDesktopVoiceConversationRequestSchema, ControlDesktopVoiceConversationResponseSchema } from '@joko/contracts';
+import { DesktopSpeechEncoding, DesktopVoiceConversationAction, MAXIMUM_ENCODED_SPEECH_BYTES,
+  ControlDesktopVoiceConversationRequestSchema, ControlDesktopVoiceConversationResponseSchema,
+  type ControlDesktopVoiceConversationResponse } from '@joko/contracts';
 import type { OperationApi } from './model.js';
 import { VoiceInputMediaSession } from './voice-input-media.js';
 import { WebAudioVoicePcmCapture } from './voice-input-pcm.js';
@@ -23,8 +25,7 @@ export class DesktopVoiceClient {
   activate(): void { this.#live = true; this.#epoch++; }
 }
 
-/** Sequential PCM playback with a two-second scheduling budget. Cancellation
- * closes the actual AudioContext and retires every late read and scheduled node. */
+/** Stream PCM with a short scheduling budget and decode bounded MP3 once complete. */
 export class DesktopSpeechPlayer {
   #epoch = 0;
   #context?: AudioContext;
@@ -35,17 +36,28 @@ export class DesktopSpeechPlayer {
     try { opened = await client.control(DesktopVoiceConversationAction.SPEAK, { callId, speechRequestId: requestId, text }); }
     catch (error) { if (epoch !== this.#epoch) return; throw error; }
     if (epoch !== this.#epoch) return;
-    if (opened.sampleRate !== 24_000) throw new Error('Unsupported speech format.');
+    const encoded = opened.speechEncoding === DesktopSpeechEncoding.MP3;
+    if (!encoded && (opened.speechEncoding !== DesktopSpeechEncoding.UNSPECIFIED || opened.sampleRate !== 24_000)) {
+      throw new Error('Unsupported speech format.');
+    }
     const context = new AudioContext({ latencyHint: 'interactive' }); this.#context = context;
-    if (!this.#paused) await context.resume(); else await context.suspend();
     let nextAt = context.currentTime, carry: number | undefined;
     const current = () => epoch === this.#epoch && this.#context === context;
+    const read = () => client.control(DesktopVoiceConversationAction.READ_SPEECH,
+      { callId, speechRequestId: requestId, operationId: crypto.randomUUID() });
     try {
+      if (!this.#paused) await context.resume(); else await context.suspend();
+      if (encoded) {
+        await playMp3(context, read, current);
+        return;
+      }
       for (;;) {
         if (!current()) return;
-        const reply = await client.control(DesktopVoiceConversationAction.READ_SPEECH,
-          { callId, speechRequestId: requestId, operationId: crypto.randomUUID() });
+        const reply = await read();
         if (!current()) return;
+        if (reply.speechEncoding !== DesktopSpeechEncoding.UNSPECIFIED || reply.encodedSpeech.byteLength !== 0) {
+          throw new Error('Unsupported speech format.');
+        }
         const raw = reply.pcm, bytes = carry === undefined ? raw : new Uint8Array([carry, ...raw]); carry = undefined;
         if (bytes.byteLength % 2) carry = bytes[bytes.byteLength - 1];
         const even = bytes.byteLength - bytes.byteLength % 2;
@@ -73,6 +85,44 @@ export class DesktopSpeechPlayer {
   pause(): void { this.#paused = true; if (this.#context && this.#context.state !== 'closed') void this.#context.suspend().catch(() => undefined); }
   resume(): void { this.#paused = false; if (this.#context && this.#context.state !== 'closed') void this.#context.resume().catch(() => undefined); }
   stop(): void { this.#epoch++; this.#paused = false; const context = this.#context; this.#context = undefined; if (context && context.state !== 'closed') void context.close().catch(() => undefined); }
+}
+
+async function playMp3(context: AudioContext, read: () => Promise<ControlDesktopVoiceConversationResponse>,
+  current: () => boolean): Promise<void> {
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (current()) {
+    const next = await read();
+    if (!current()) return;
+    if (next.speechEncoding !== DesktopSpeechEncoding.MP3 || next.pcm.byteLength !== 0) {
+      throw new Error('Unsupported speech format.');
+    }
+    total += next.encodedSpeech.byteLength;
+    if (total > MAXIMUM_ENCODED_SPEECH_BYTES) throw new Error('Encoded speech exceeds the playback limit.');
+    if (next.encodedSpeech.byteLength !== 0) chunks.push(next.encodedSpeech);
+    if (next.speechDone) break;
+  }
+  if (!current()) return;
+  if (total === 0) throw new Error('Encoded speech is empty.');
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  chunks.length = 0;
+  const buffer = await context.decodeAudioData(bytes.buffer);
+  if (!current()) return;
+  if (!Number.isFinite(buffer.duration) || buffer.duration <= 0 || buffer.duration > 600
+    || (buffer.numberOfChannels !== 1 && buffer.numberOfChannels !== 2)) {
+    throw new Error('Decoded speech is outside the playback limits.');
+  }
+  const source = context.createBufferSource();
+  source.buffer = buffer;
+  source.connect(context.destination);
+  const start = context.currentTime;
+  source.start(start);
+  while (current() && context.currentTime < start + buffer.duration) await pause(40);
 }
 
 /** Reuses the selected ASR, its bounded PCM capture and exact native session

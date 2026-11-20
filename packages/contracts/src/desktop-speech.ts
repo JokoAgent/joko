@@ -2,6 +2,7 @@ import { create } from '@bufbuild/protobuf';
 import { DesktopSpeechSelectionSchema, type DesktopSpeechModel, type DesktopSpeechSelection } from './gen/joko/v1/desktop_voice_conversation_pb.js';
 
 /** Local Desktop voice UI contract. No credentials, raw paths or remote invoke access. */
+export const MAXIMUM_ENCODED_SPEECH_BYTES = 8 * 1024 * 1024;
 export const SPEECH_PROTOCOLS = [
   'openai',
   'elevenlabs',

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { MAXIMUM_ENCODED_SPEECH_BYTES } from '@joko/contracts';
 import { SpeechSynthesisSession } from './speech.js';
 import type { SpeechSpeedRange } from './protocol.js';
 
@@ -6,12 +7,13 @@ const make = (
   fetcher: typeof fetch = vi.fn(
     async () => new Response(new Uint8Array([1, 2]), { headers: { 'Content-Type': 'audio/pcm' } }),
   ),
+  baseUrl = 'https://gateway.test/prefix/v1/',
 ) => {
   const assertCurrent = vi.fn();
   const diagnostic = vi.fn();
   const speech = new SpeechSynthesisSession({
     connection: () => ({
-      baseUrl: 'https://gateway.test/prefix/v1/',
+      baseUrl,
       protocol: 'openai' as const,
       headers: { authorization: 'Bearer test-key' },
     }),
@@ -22,6 +24,26 @@ const make = (
   return { speech, fetcher, assertCurrent, diagnostic };
 };
 const input = { requestId: 'one', modelId: 'speech-model', voice: 'alloy', text: 'hello' };
+
+it('rejects a wrong MIME type and stops an OpenRouter MP3 stream above the encoded byte limit', async () => {
+  const cancel = vi.fn();
+  const oversized = new ReadableStream<Uint8Array>({ start(controller) {
+    controller.enqueue(new Uint8Array(MAXIMUM_ENCODED_SPEECH_BYTES + 1));
+  }, cancel });
+  const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(
+    new Response(new Uint8Array([1, 2]), { headers: { 'content-type': 'audio/pcm' } })
+  ).mockResolvedValueOnce(new Response(oversized, { headers: { 'content-type': 'audio/mpeg' } }));
+  const { speech, diagnostic } = make(fetcher, 'https://openrouter.ai/api/v1');
+  const selected = { ...input, modelId: 'minimax/speech-2.8-hd' };
+  try {
+    await expect(speech.start(selected)).rejects.toThrow('format');
+    await expect(speech.start({ ...selected, requestId: 'encoded' })).resolves.toEqual({ encoding: 'mp3' });
+    await expect(speech.read('encoded')).rejects.toThrow('format');
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(diagnostic.mock.calls.map(([event]) => event.stage)).not.toContain('complete');
+  } finally { speech.cancel(); }
+});
 
 it.each([
   [null, 2, false],
