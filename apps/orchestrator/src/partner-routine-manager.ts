@@ -10,6 +10,7 @@ import { defaultScheduleExtensionSnapshot, withScheduleExtensionSnapshot } from 
 import { executeSchedulePreRunHook, schedulePreRunFailureSummary } from "./schedule-pre-run-hook.js";
 import type { PartnerFollowUpRuntime } from "./partner-autonomy.js";
 import type { BridgeToolCallContext } from "./mcp-router.js";
+import type { NightlyLearningOwner, PartnerNightlyLearning } from "./partner-nightly-learning.js";
 
 export class PartnerRoutineError extends Error {
   constructor(readonly code: "invalid" | "changed" | "unavailable", message: string) { super(message); this.name = "PartnerRoutineError"; }
@@ -24,6 +25,19 @@ export interface PartnerImportedRoutineRuntime {
   finish(routine: Routine, sessionId: string, runId: string, text: string, direct: boolean, signal: AbortSignal, assertOwner: () => void): Promise<boolean>;
 }
 
+export type NightlyFrequency = "daily" | "weekly";
+export type NightlyAction = { readonly kind: "schedule"; readonly enabled: boolean; readonly frequency: NightlyFrequency }
+  | { readonly kind: "run"; readonly requestId: string }
+  | { readonly kind: "change"; readonly runId: string; readonly changeId: string; readonly redo: boolean }
+  | { readonly kind: "candidate"; readonly candidateId: string; readonly promote: boolean };
+
+const nightlyCron = { daily: "30 3 * * *", weekly: "30 3 * * 1" } as const;
+const defaultTimezone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+const nighttimeDefinition = (frequency: NightlyFrequency, timezone: string, enabled: boolean): RoutineInput => ({
+  name: "Nightly learning", prompt: "Review recent conversations and organize personal memories and Skills.", enabled,
+  silentWhenIdle: true, triggers: [{ id: "nightly", kind: "cron", expression: nightlyCron[frequency], timezone }]
+});
+
 /** Definitions/trigger receipts remain independent of their internal Scheduler execution records. */
 export class PartnerRoutineManager {
   readonly engine: RoutineEngine;
@@ -32,6 +46,7 @@ export class PartnerRoutineManager {
   #started = false;
   #imports: PartnerImportedRoutineRuntime | undefined;
   #followUp: PartnerFollowUpRuntime | undefined;
+  #nightly: PartnerNightlyLearning | undefined;
   readonly #activationAuthorities = new WeakSet<object>();
   constructor(private readonly options: {
     readonly partners: PartnerManager;
@@ -59,6 +74,10 @@ export class PartnerRoutineManager {
   setFollowUpRuntime(runtime: PartnerFollowUpRuntime): void {
     if (this.#started || this.#followUp) throw new Error("Follow-up observation is already configured."); this.#followUp = runtime;
   }
+  setNightlyLearning(runtime: PartnerNightlyLearning): void {
+    if (this.#started || this.#nightly) throw new Error("Nightly learning is already configured");
+    this.#nightly = runtime;
+  }
   /** The import Owner reaches this port only after verification and a durably confirmed native pause. */
   async activateImported(input: { partnerId: string; partnerRevision: bigint; routineId: string; revision: number; definition: RoutineInput }): Promise<Routine> {
     return this.options.partners.runOwnedManagement(input.partnerId, input.partnerRevision, async () => {
@@ -84,6 +103,10 @@ export class PartnerRoutineManager {
     }
     await this.engine.start(states);
     this.#started = true;
+    if (this.#nightly) for (const partner of this.options.partners.listPartners("active")) {
+      if (partner.initializationState !== "ready") continue;
+      await this.ensureNightlyLearning(partner.id).catch(() => undefined);
+    }
     this.#timer = setInterval(() => { if (this.#ticking) return; this.#ticking = true;
       void this.engine.tick().catch(() => undefined).finally(() => { this.#ticking = false; }); }, 1000);
     this.#timer.unref();
@@ -92,10 +115,65 @@ export class PartnerRoutineManager {
   async lifecycle(partnerId: string, state: "active" | "paused" | "archived" | "deleted"): Promise<void> {
     if (!this.#started) return;
     if (state === "deleted") await this.deletePartner(partnerId);
-    else if (state === "active") await this.resumePartner(partnerId);
+    else if (state === "active") { await this.resumePartner(partnerId); await this.ensureNightlyLearning(partnerId).catch(() => undefined); }
     else await this.suspendPartner(partnerId);
   }
-  list(partnerId: string): readonly Routine[] { this.#owner(partnerId, false); return this.engine.list(partnerId).filter(routine => !isDormantTodoCheck(routine)); }
+  list(partnerId: string): readonly Routine[] { this.#owner(partnerId, false); return this.engine.list(partnerId).filter(routine => routine.builtin !== "nightly-learning" && !isDormantTodoCheck(routine)); }
+
+  async ensureNightlyLearning(partnerId: string, assertCaller?: () => void): Promise<Routine | undefined> {
+    if (!this.#started || !this.#nightly) return undefined;
+    const existing = this.#nightlyRoutine(partnerId);
+    if (existing) return existing;
+    const owner = this.#nightlyOwner(partnerId, true, undefined, assertCaller);
+    return await this.engine.ensureBuiltin(partnerId, nighttimeDefinition("daily", defaultTimezone(), true),
+      this.creationId(partnerId, "builtin:nightly-learning"), 1, "nightly-learning", owner.assertCurrent) ?? undefined;
+  }
+
+  nightlyLearning(partnerId: string) {
+    if (!this.#nightly) throw new PartnerRoutineError("unavailable", "Nightly learning is unavailable.");
+    const { partner } = this.#owner(partnerId, false);
+    const owner = this.#nightlyOwner(partnerId, false);
+    const routine = this.#nightlyRoutine(partnerId);
+    const trigger = routine?.triggers.find(item => item.kind === "cron");
+    const frequency: NightlyFrequency = trigger?.expression === nightlyCron.weekly ? "weekly" : "daily";
+    const review = this.#nightly.read(partnerId, owner.targetId);
+    return { partnerId, partnerRevision: owner.partnerRevision, scheduleRevision: BigInt(routine?.revision ?? 0), enabled: routine?.enabled ?? true, frequency,
+      timezone: trigger?.timezone ?? defaultTimezone(), writable: partner.lifecycle === "active" && !partner.pauseCleanupPending,
+      ...review, running: review.running || !!routine && this.#nightlyRunPending(routine.id) };
+  }
+
+  async updateNightlyLearning(partnerId: string, revision: bigint, stateRevision: bigint, scheduleRevision: bigint, action: NightlyAction,
+    signal: AbortSignal, assertCaller: () => void): Promise<void> {
+    const runtime = this.#nightly;
+    if (!runtime) throw new PartnerRoutineError("unavailable", "Nightly learning is unavailable.");
+    const check = () => { signal.throwIfAborted(); assertCaller(); };
+    await this.options.partners.runOwnedManagement(partnerId, revision, async () => {
+      const owner = this.#nightlyOwner(partnerId, true, revision, check);
+      const current = runtime.read(partnerId, owner.targetId);
+      const existing = this.#nightlyRoutine(partnerId);
+      const requestId = action.kind === "run" ? this.creationId(partnerId, `nightly:${action.requestId}`) : undefined;
+      if (requestId && existing && this.engine.history(existing.id).some(run => run.id === requestId)) return;
+      if (current.revision !== stateRevision) throw new PartnerRoutineError("changed", "Nightly learning changed. Refresh before retrying.");
+      if (BigInt(existing?.revision ?? 0) !== scheduleRevision) throw new PartnerRoutineError("changed", "The Nightly learning schedule changed.");
+      const routine = await this.ensureNightlyLearning(partnerId, check);
+      if (!routine) throw new PartnerRoutineError("unavailable", "Nightly learning is unavailable.");
+      owner.assertCurrent();
+      if (action.kind === "schedule") {
+        const trigger = routine.triggers.find(item => item.kind === "cron");
+        await this.engine.configureNightlyLearning(partnerId, nighttimeDefinition(action.frequency, trigger?.timezone ?? defaultTimezone(), action.enabled),
+          routine.id, routine.revision, owner.assertCurrent);
+        return;
+      }
+      if (current.running || runtime.read(partnerId, owner.targetId).running || this.#nightlyRunPending(routine.id)) throw new PartnerRoutineError("changed", "Wait for the current review to finish.");
+      if (action.kind === "run") {
+        if (!/^[A-Za-z0-9_-]{16,100}$/u.test(action.requestId)) throw new PartnerRoutineError("invalid", "A stable run request is required.");
+        await this.engine.runNow(partnerId, routine.id, routine.revision, requestId, owner.assertCurrent, "nightly-learning");
+        return;
+      }
+      if (action.kind === "change") await runtime.decideChange(owner, action.runId, action.changeId, action.redo, signal);
+      else await runtime.decideCandidate(owner, action.candidateId, action.promote, signal);
+    });
+  }
   nextRunAt(partnerId: string, routineId: string): number | undefined {
     this.#owner(partnerId, false);
     if (!this.engine.list(partnerId).some((routine) => routine.id === routineId)) return undefined;
@@ -241,10 +319,35 @@ export class PartnerRoutineManager {
     await this.suspendPartner(partnerId);
     for (const routine of this.engine.list(partnerId)) await this.#cleanBacking(routine.id, true);
     await this.engine.removePartner(partnerId);
+    this.#nightly?.retire(partnerId);
+  }
+  #nightlyRoutine(partnerId: string): Routine | undefined {
+    return this.engine.list(partnerId).find(item => item.builtin === "nightly-learning");
+  }
+  #nightlyRunPending(routineId: string): boolean {
+    return this.engine.history(routineId).some(run => run.status === "running" || run.status === "queued");
+  }
+  #nightlyOwner(partnerId: string, writable: boolean, expectedRevision?: bigint, assertCaller?: () => void): NightlyLearningOwner {
+    const { partner, session } = this.#owner(partnerId, writable, expectedRevision);
+    const target = this.options.store.getTarget(partner.homeTargetId);
+    const assertCurrent = () => {
+      assertCaller?.();
+      const current = this.#owner(partnerId, writable, partner.revision);
+      const nextTarget = this.options.store.getTarget(current.partner.homeTargetId);
+      if (!nextTarget.descriptor.trusted || target.descriptor.id !== nextTarget.descriptor.id
+        || target.revision !== nextTarget.revision || current.session.id !== session.id || current.session.binding.opaqueRef !== session.binding.opaqueRef
+        || current.session.remoteWorkspace !== undefined || nextTarget.descriptor.remoteWorkspace !== undefined
+        || this.options.partners.isHomeChanging(partnerId) || writable && current.partner.pauseCleanupPending
+        || this.options.partners.listPendingRestarts().some(item => item.partnerId === partnerId)) {
+        throw new PartnerRoutineError("unavailable", "The original local Partner home is unavailable.");
+      }
+    };
+    assertCurrent();
+    return { partnerId, targetId: target.descriptor.id, partnerRevision: partner.revision, assertCurrent };
   }
   #routine(partnerId: string, routineId: string): Routine {
     const routine = this.engine.list(partnerId).find(item => item.id === routineId);
-    if (!routine) throw new PartnerRoutineError("unavailable", "Routine is unavailable for this partner.");
+    if (!routine || routine.builtin === "nightly-learning") throw new PartnerRoutineError("unavailable", "Routine is unavailable for this partner.");
     return routine;
   }
   #owner(partnerId: string, writable: boolean, expectedRevision?: bigint) {
@@ -268,6 +371,14 @@ export class PartnerRoutineManager {
   async #execute(routine: Routine, run: RoutineRun, signal: AbortSignal, canDispatch: () => boolean) {
     if (this.options.partners.isHomeChanging(routine.partnerId)) return { deferred: true };
     if (this.options.partners.getPartner(routine.partnerId).lifecycle === "paused") return { deferred: true };
+    if (routine.builtin === "nightly-learning") {
+      if (!this.#nightly || !routine.enabled && !run.triggerIds.includes("manual")) return { skipped: true };
+      const owner = this.#nightlyOwner(routine.partnerId, true, undefined, () => {
+        signal.throwIfAborted();
+        if (!canDispatch()) throw new Error("The Nightly learning occurrence was retired.");
+      });
+      return this.#nightly.run(owner, run, signal);
+    }
     const { partner, session: canonical } = this.#owner(routine.partnerId, true);
     let session = canonical;
     const followUp = routine.builtin === "follow-up" ? this.#followUp?.prepare(routine, run) : undefined;

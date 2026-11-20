@@ -9,6 +9,7 @@ import { type PartnerResumeEditor, PartnerMemoryEditor, type PartnerMemoryApi, t
 import { create } from "@bufbuild/protobuf";
 import { PartnerConnectionsEditor, type PartnerConnectionsApi, type ConnectionsDetail } from "@joko/contracts";
 import { PartnerSkillsEditor, type PartnerSkillsApi, type PersonalSkillDetail } from "@joko/contracts";
+import { GetPartnerNightlyLearningResponseSchema, NightlyLearningFrequency, PartnerNightlyLearningEditor, type PartnerNightlyLearningApi } from "@joko/contracts";
 import type { MobilePartnerTaskOutput, MobilePartnerTaskOutputs } from "./mobile-partner-task-outputs";
 import { mobileMessage } from "./mobile-messages";
 
@@ -130,6 +131,26 @@ async function drawOutputs(active: MobilePartnerProfileTransport, options: Parti
   await act(async () => root.render(createElement(MobilePartnerProfileSheet, { visible: true, partner: profilePartner,
     transport: active, colors, locale: "en", onClose: close, onSaved: saved, ...options })));
 }
+
+it("owns the nightly learning sheet through the exact Mobile Partner profile", async () => {
+  const active = transport();
+  const nightly = create(GetPartnerNightlyLearningResponseSchema, { partnerId: profilePartner.partnerId,
+    partnerRevision: { value: profilePartner.revision }, stateRevision: { value: 2n }, scheduleRevision: { value: 3n },
+    schedule: { enabled: true, frequency: NightlyLearningFrequency.DAILY }, timezone: "Europe/Berlin", writable: true, memoryEnabled: true });
+  const update = vi.fn<PartnerNightlyLearningApi["update"]>(async (current, action) =>
+    action.case === "schedule" ? { ...current, schedule: action.value } : current);
+  const factory = vi.fn(() => new PartnerNightlyLearningEditor({ partnerId: profilePartner.partnerId, ownerKey: active.ownerKey,
+    newRequestId: () => "mobile-nightly-request", read: async () => nightly, update }));
+  await drawOutputs(active, { nightlyFactory: factory });
+  await press("Nightly learning");
+  expect(factory).toHaveBeenCalledExactlyOnceWith(profilePartner, active.ownerKey);
+  await press("Mondays");
+  expect(update).toHaveBeenCalledExactlyOnceWith(nightly,
+    expect.objectContaining({ case: "schedule", value: expect.objectContaining({ enabled: true, frequency: NightlyLearningFrequency.WEEKLY }) }), expect.any(AbortSignal));
+  await drawOutputs(transport("replacement"), { nightlyFactory: factory });
+  expect(container.querySelector('button[aria-label="Review now"]')).toBeNull();
+  expect(update).toHaveBeenCalledOnce();
+});
 
 describe("Mobile Partner outputs", () => {
   it.each(["android", "ios"])("submits full access only after current explicit risk confirmation on %s", async platform => {

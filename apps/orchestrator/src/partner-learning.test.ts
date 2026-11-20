@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PartnerLearningTurnSource, PromptInput } from "@joko/core";
-import { OperationalStore, PartnerStore } from "@joko/store";
+import { OperationalStore, PartnerRoutineStore, PartnerStore } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
@@ -13,6 +13,8 @@ import { MakerMemoryBridgeProvider, MakerMemoryController } from "./maker-memory
 import { PartnerLearningManager } from "./partner-learning.js";
 import { hasPartnerLearningEvidence, parsePartnerLearningReviewPlan, partnerLearningSnapshotBudget } from "./partner-learning-plan.js";
 import { PartnerManager } from "./partner-manager.js";
+import { PartnerNightlyLearning } from "./partner-nightly-learning.js";
+import { PartnerRoutineManager, type NightlyAction } from "./partner-routine-manager.js";
 import { PartnerSkillsManager, PartnerSkillsToolProvider } from "./partner-skills.js";
 import { PiResourceManager } from "./resource-manager.js";
 import { SessionHost } from "./session-host.js";
@@ -248,6 +250,84 @@ describe("Partner learning save and successful reply", () => {
   });
 });
 
+it("runs the host's Nightly timer, preserves an observation, and reverses the exact Memory and Skill effects", async () => {
+  const f = await fixture();
+  const { id: partnerId } = f.partner, targetId = f.session.targetId;
+  const first = f.memory.write(targetId, { kind: "user", name: "review", title: "Review checklist", description: "Original description", body: "Use the old checklist." });
+  const duplicate = f.memory.write(targetId, { kind: "user", name: "duplicate", title: "Duplicate", description: "Overlapping preference", body: "Keep a second checklist." });
+  const savedSkill = await f.skills.saveForCaller(f.caller, { slug: "older-workflow", name: "Older workflow", description: "Superseded", body: "An earlier method." });
+  const skillId = savedSkill.skill.summary!.id;
+  const empty = { memories: [], skills: [], observations: [], promotions: [] };
+  const infer = vi.fn(async (_owner: AuxiliaryTextPlan, _input: AuxiliaryTextRunOptions): Promise<AuxiliaryTextRunResult> => ({
+    status: "ok", text: JSON.stringify({ ...empty,
+      memories: [{ action: "merge", id: first.id, sources: [duplicate.id], title: "Review checklist", description: "Combined preference",
+        body: "Review the whole report with the original checklist.", reason: "The two records describe the same review." }],
+      skills: [{ action: "disable", slug: "older-workflow", reason: "The retained method uses the current template." }],
+      observations: [skillProposal("candidate-report")]
+    })
+  }));
+  const runtime = () => new PartnerNightlyLearning({ ...f.options, learning: f.learning, auxiliary: { capture: f.options.auxiliary.capture, run: infer } });
+  let now = Date.UTC(2026, 10, 1);
+  const storage = new PartnerRoutineStore(join(f.directory, "nightly-routines"));
+  const scheduler = { runNowWithResult: vi.fn(async () => { throw new Error("A Nightly review cannot dispatch a task."); }), abortSchedule: vi.fn(async () => {}) };
+  const open = async () => {
+    const manager = new PartnerRoutineManager({ partners: f.partners, store: f.store, scheduler, storage, now: () => now });
+    manager.setNightlyLearning(runtime());
+    await manager.start();
+    return manager;
+  };
+  let manager = await open();
+  cleanups.push(() => manager.stop());
+  const current = () => manager.nightlyLearning(partnerId);
+  const action = async (value: NightlyAction) => {
+    const view = current();
+    await manager.updateNightlyLearning(partnerId, view.partnerRevision, view.revision, view.scheduleRevision, value,
+      new AbortController().signal, () => undefined);
+  };
+  expect(current()).toMatchObject({ enabled: true, frequency: "daily", pending: 0 });
+  const rule = manager.engine.list(partnerId).find(item => item.builtin === "nightly-learning")!;
+  expect(manager.list(partnerId).some(item => item.id === rule.id)).toBe(false);
+  now = manager.engine.nextRunAt(rule.id)!;
+  await manager.engine.tick();
+  await vi.waitFor(() => expect(current().history[0]?.status).toBe("skipped"));
+  expect(infer).not.toHaveBeenCalled();
+  const reply = f.reply("nightly-owned-reply"); f.finish(reply.id); await f.learning.drain();
+  expect(current().pending).toBe(1);
+  await action({ kind: "schedule", enabled: false, frequency: "weekly" });
+  expect(current()).toMatchObject({ enabled: false, frequency: "weekly" });
+  await action({ kind: "run", requestId: "original-manual-nightly" });
+  await vi.waitFor(() => expect(current().history[0]?.status).toBe("success"));
+  const run = current().history[0]!;
+  expect(run.conversations).toBe(1);
+  expect(current().pending).toBe(0);
+  expect(infer).toHaveBeenCalledOnce();
+  const planInput = JSON.parse(infer.mock.calls[0]![1].user);
+  expect(planInput.messages).toContainEqual(expect.objectContaining({ id: "accepted-user", role: "user", text: userText }));
+  expect(f.memory.list(targetId).map(entry => entry.id)).toEqual([first.id]);
+  expect(f.resources.get(skillId)?.enabled).toBe(false);
+  expect(run.changes.map(change => change.action)).toEqual(["updated", "removed", "disabled"]);
+  expect(current().candidates).toHaveLength(1);
+  expect(await f.skills.list(f.partner.id)).toMatchObject({ skills: [{ id: skillId, enabled: false }] });
+  const exact = current();
+  await manager.stop(); manager = await open();
+  expect(current()).toEqual(exact);
+  await action({ kind: "run", requestId: "original-manual-nightly" });
+  expect(infer).toHaveBeenCalledOnce();
+  await action({ kind: "change", runId: run.id, changeId: run.changes[1]!.id, redo: false });
+  expect(f.store.findMakerMemoryEntry(targetId, "user", "duplicate")?.id).toBe(duplicate.id);
+  await action({ kind: "change", runId: run.id, changeId: run.changes[1]!.id, redo: true });
+  expect(f.store.findMakerMemoryEntry(targetId, "user", "duplicate")).toBeUndefined();
+  await action({ kind: "change", runId: run.id, changeId: run.changes[2]!.id, redo: false });
+  expect(f.resources.get(skillId)?.enabled).toBe(true);
+  f.memory.write(targetId, { kind: "user", name: "review", title: "Owner edit", description: "Independent newer version", body: "The owner changed this afterwards.", mode: "update" });
+  await expect(action({ kind: "change", runId: run.id, changeId: run.changes[0]!.id, redo: false })).rejects.toThrow("edited later");
+  expect(f.memory.list(targetId)[0]?.title).toBe("Owner edit");
+  await action({ kind: "candidate", candidateId: current().candidates[0]!.id, promote: true });
+  expect(current().candidates).toEqual([]);
+  expect((await f.skills.list(f.partner.id)).skills.find(skill => skill.slug === "candidate-report")?.enabled).toBe(true);
+  expect(scheduler.runNowWithResult).not.toHaveBeenCalled();
+}, 15_000);
+
 async function fixture(input: { readonly topic?: boolean; readonly channel?: boolean; readonly owner?: boolean; readonly text?: string } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "joko-partner-learning-"));
   const store = new OperationalStore(join(directory, "operational.db")), profiles = new PartnerStore(join(directory, "partners.db"));
@@ -307,6 +387,6 @@ async function fixture(input: { readonly topic?: boolean; readonly channel?: boo
     activeAttemptId: source.sourceAttemptId, traceId: "learning-run-done" }); learning.sealed(source.occurrenceId, completionEventId);
     learning.settled(source.occurrenceId, completionEventId, "completed"); };
   cleanups.push(async () => { learning.dispose(); await learning.drain(); memory.dispose(); await host.dispose(); profiles.close(); store.close(); rmSync(directory, { recursive: true, force: true }); });
-  return { store, profiles, partners, partner, session, resources, memory, skills, refresh, infer, options, learning, source, append, reply, finish,
+  return { directory, store, profiles, partners, partner, session, resources, memory, skills, refresh, infer, options, learning, source, append, reply, finish,
     caller: { sessionId: session.id, targetId: session.targetId, generation: session.binding.generation } };
 }

@@ -11160,6 +11160,28 @@ export class OperationalStore {
     });
   }
 
+  listPartnerNightlyTurns(partnerId: string, targetId: string, after: bigint, limit: number):
+    readonly { readonly cursor: bigint; readonly turn: PartnerLearningTurnRecord }[] {
+    this.assertOpen();
+    const query = this.database.prepare(`SELECT t.*, e.global_cursor AS completion_cursor
+      FROM partner_learning_turns t JOIN events e ON e.id = t.completion_event_id JOIN runs r ON r.id = t.source_run_id
+      WHERE t.partner_id = ? AND e.target_id = ? AND t.review_claimed_at IS NOT NULL AND e.global_cursor > ?
+        AND r.source = 'user' AND r.state = 'completed'
+      ORDER BY e.global_cursor LIMIT ?`);
+    query.setReadBigInts(true);
+    return (query.all(partnerId, targetId, asSqlInteger(after), Math.min(100, Math.max(1, limit))) as Row[])
+      .map(row => ({ cursor: toBigInt(row["completion_cursor"]), turn: this.learningTurnFromRow(row) }));
+  }
+
+  countPartnerNightlyTurns(partnerId: string, targetId: string, after: bigint): number {
+    this.assertOpen();
+    const row = this.database.prepare(`SELECT count(*) AS total
+      FROM partner_learning_turns t JOIN events e ON e.id = t.completion_event_id JOIN runs r ON r.id = t.source_run_id
+      WHERE t.partner_id = ? AND e.target_id = ? AND t.review_claimed_at IS NOT NULL AND e.global_cursor > ?
+        AND r.source = 'user' AND r.state = 'completed'`).get(partnerId, targetId, asSqlInteger(after)) as Row;
+    return Math.min(Number(row["total"]), 0xffff_ffff);
+  }
+
   getPartnerLearningFeedback(completionEventId: string): PartnerLearningFeedback | undefined {
     this.assertOpen();
     const rows = this.database.prepare("SELECT * FROM partner_learning_turns WHERE completion_event_id = ? AND accepted_at IS NOT NULL ORDER BY occurrence_id")

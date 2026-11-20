@@ -29,6 +29,8 @@ export interface PartnerLearningSkillSnapshot {
   readonly bodies: readonly PartnerLearningSkillBody[];
 }
 
+type NightlySkillContent = Pick<PartnerLearningSkillBody, "title" | "description" | "body" | "enabled">;
+
 type PersonalSkill = ReturnType<PiResourceManager["listPartnerSkills"]>[number];
 const fail = (message: string, code = Code.FailedPrecondition): never => { throw new ConnectError(message, code); };
 const preview = (text: string, length: number) => text.slice(0, length).replace(/[\uD800-\uDBFF]$/u, "");
@@ -187,6 +189,61 @@ export class PartnerSkillsManager {
       ...(input.prior === undefined ? {} : { id: input.prior.id, expectedRevision: input.prior.revision,
         expectedContentRevision: input.prior.contentRevision }) }, signal, assertCaller, learningSave);
   }
+
+  async readNightlySkill(partnerId: string, slug: string, signal: AbortSignal, assertCaller: () => void): Promise<PartnerLearningSkillBody | undefined> {
+    const scope = this.#capture(partnerId, undefined, false, signal, assertCaller);
+    const item = this.resources.listPartnerSkills(partnerId, scope.owner.homeTargetId).find(entry => entry.slug === slug);
+    if (!item) return undefined;
+    const file = await this.#file(item, signal);
+    scope.assertCurrent();
+    return { id: item.resource.id, slug, title: file.name, description: file.description, body: file.body,
+      enabled: item.resource.enabled, revision: item.resource.versionNumber, contentRevision: item.resource.discoveredRevision };
+  }
+
+  async applyNightlySkill(partnerId: string, expectedPartnerRevision: bigint, slug: string, prior: PartnerLearningSkillBody | undefined,
+    desired: NightlySkillContent | undefined, signal: AbortSignal, assertCaller: () => void,
+    record: (store: OperationalStore, current: PartnerLearningSkillBody | undefined) => void): Promise<void> {
+    const scope = this.#capture(partnerId, expectedPartnerRevision, true, signal, assertCaller);
+    const readCurrent = () => this.resources.listPartnerSkills(partnerId, scope.owner.homeTargetId).find(entry => entry.slug === slug);
+    const item = readCurrent();
+    if (prior ? item?.resource.id !== prior.id || item.resource.versionNumber !== prior.revision
+      || item.resource.discoveredRevision !== prior.contentRevision : item !== undefined) return fail("Skill changed. Refresh before saving.", Code.Aborted);
+    if (desired && (!prior || prior.title !== desired.title || prior.description !== desired.description || prior.body !== desired.body)) {
+      if (!desired.enabled || prior?.enabled === false) return fail("A disabled skill cannot be rewritten.");
+      const save = { recordSaved: (store: OperationalStore) => {
+        const current = readCurrent()!;
+        record(store, { ...desired, id: current.resource.id, slug, revision: current.resource.versionNumber,
+          contentRevision: current.resource.discoveredRevision });
+      } };
+      await this.saveLearningProposal(partnerId, { ...desired, slug, expectedPartnerRevision, ...(prior ? { prior } : {}) }, signal, scope.assertCurrent, save);
+    } else if (item && prior && !desired) {
+      await this.remove(create(contract.DeletePartnerSkillRequestSchema, { partnerId, skillId: item.resource.id,
+        expectedPartnerRevision: toProtoRevision(expectedPartnerRevision), expectedRevision: toProtoRevision(prior.revision),
+        expectedContentRevision: prior.contentRevision }), signal, scope.assertCurrent, store => record(store, undefined));
+    } else if (item && prior && desired && prior.enabled !== desired.enabled) {
+      const lease = this.mutations.acquire([skillResourceMutationKey(item.resource.id)]);
+      if (!lease) return fail("Skill is being changed.", Code.Aborted);
+      let prepared: PreparedPiResourceMutation<PiResourceDescriptor> | undefined;
+      try {
+        const opened = await this.resources.acquireSkillContent({ resourceId: item.resource.id, expectedResourceVersion: prior.revision });
+        try { if (opened.dirty) return fail("Skill files changed. Refresh before saving.", Code.Aborted); }
+        finally { await opened.release(); }
+        scope.assertCurrent(); lease.assertActive();
+        prepared = await this.resources.prepareSetEnabled(item.resource.id, desired.enabled);
+        scope.assertCurrent(); lease.assertActive();
+        await this.resources.completePreparedMutation(prepared, finalize => this.store.transaction(store => {
+          scope.assertCurrent(); finalize(store);
+          const current = readCurrent()!;
+          record(store, { ...prior, enabled: desired.enabled, revision: current.resource.versionNumber,
+            contentRevision: current.resource.discoveredRevision });
+        }));
+        prepared = undefined;
+      } finally {
+        try { if (prepared) await this.resources.discardPreparedMutation(prepared); } finally { lease.release(); }
+      }
+    } else return fail("Skill content already matches the requested change.", Code.Aborted);
+    this.requestRefresh?.(scope.owner.canonicalSessionId);
+  }
   async #write(partnerId: string, input: { readonly id?: string; readonly slug: string; readonly name: string; readonly description: string;
     readonly body: string; readonly expectedPartnerRevision?: bigint; readonly expectedRevision?: bigint; readonly expectedContentRevision?: string;
     readonly expectAbsent?: boolean; readonly requireEnabled?: boolean; readonly deferRefresh?: boolean },
@@ -246,8 +303,9 @@ export class PartnerSkillsManager {
       description: request.description, body: request.body, expectedPartnerRevision: fromProtoRevision(request.expectedPartnerRevision, "expected_partner_revision"),
       expectedRevision: fromProtoRevision(request.expectedRevision, "expected_revision"), expectedContentRevision: request.expectedContentRevision }, signal);
   }
-  async remove(request: contract.DeletePartnerSkillRequest, signal?: AbortSignal) {
-    const scope = this.#capture(request.partnerId, fromProtoRevision(request.expectedPartnerRevision, "expected_partner_revision"), true, signal);
+  async remove(request: contract.DeletePartnerSkillRequest, signal?: AbortSignal, assertCaller?: () => void,
+    record?: (store: OperationalStore) => void) {
+    const scope = this.#capture(request.partnerId, fromProtoRevision(request.expectedPartnerRevision, "expected_partner_revision"), true, signal, assertCaller);
     const item = this.#item(scope.owner, request.skillId);
     if (item.resource.versionNumber !== fromProtoRevision(request.expectedRevision, "expected_revision")
       || item.resource.discoveredRevision !== request.expectedContentRevision) return fail("Skill changed. Refresh before deleting.", Code.Aborted);
@@ -261,7 +319,9 @@ export class PartnerSkillsManager {
       prepared = await this.resources.prepareRemoveSkillContent({ resourceId: item.resource.id, expectedResourceVersion: item.resource.versionNumber,
         expectedObservedRevision: item.resource.discoveredRevision, recoveryDestination: recovery });
       scope.assertCurrent(); mutationLease.assertActive();
-      await this.resources.completePreparedMutation(prepared, finalize => this.store.transaction(store => { scope.assertCurrent(); finalize(store); }));
+      await this.resources.completePreparedMutation(prepared, finalize => this.store.transaction(store => {
+        scope.assertCurrent(); finalize(store); record?.(store);
+      }));
       prepared = undefined; scope.assertCurrent(); this.requestRefresh?.(scope.owner.canonicalSessionId);
       return { owner: scope.owner, skillId: item.resource.id };
     } finally {

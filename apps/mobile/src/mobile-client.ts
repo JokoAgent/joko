@@ -45,7 +45,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { Code, ConnectError } from "@connectrpc/connect";
 import {
-  PartnerResumeEditor, PartnerImportEditor, PartnerImportReceipts, PartnerMemoryEditor, PartnerConnectionsEditor, PartnerSkillsEditor,
+  PartnerResumeEditor, PartnerImportEditor, PartnerImportReceipts, PartnerMemoryEditor, PartnerConnectionsEditor, PartnerSkillsEditor, PartnerNightlyLearningEditor,
   PartnerGroupAttachmentSchema, PartnerGroupAttachmentCategory,
   AcknowledgeSessionAttentionMutationSchema, ArchiveSessionMutationSchema, BlobDisposition, BlobRefSchema, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
   ConnectionState, CreateScheduleMutationSchema, CreateSessionMutationSchema, CloneSessionMutationSchema, ForkSessionMutationSchema, OpenSideChatMutationSchema, SessionDerivationKind,
@@ -2317,6 +2317,17 @@ export class MobileClient {
         || !this.#partnerProfileOwnerMatches(conversationOwnerKey)) throw new Error("Partner skills owner changed.");
     });
     return new PartnerSkillsEditor(api, { partnerId: partner.partnerId, homeTargetId: partner.homeTargetId, canonicalSessionId: partner.canonicalSessionId });
+  }
+
+  partnerNightlyLearningEditor(partner: MobilePartnerDirectoryProfile, ownerKey: string): PartnerNightlyLearningEditor | undefined {
+    const context = this.#partnerPrivateContext();
+    if (!context || !this.network.partnerAutonomyApi || !partner.canonicalSessionId || !this.#partnerProfileOwnerMatches(ownerKey)) return undefined;
+    const api = this.network.partnerAutonomyApi(context.credential, ownerKey, this.newId, signal => {
+      signal.throwIfAborted();
+      if (this.#credential !== context.credential || this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey
+        || !this.#partnerProfileOwnerMatches(ownerKey)) throw new Error("Nightly learning owner changed.");
+    }).nightlyLearning?.(partner.partnerId);
+    return api ? new PartnerNightlyLearningEditor(api) : undefined;
   }
 
   partnerConnectionsEditor(partner: MobilePartnerDirectoryProfile, conversationOwnerKey?: string): import("@joko/contracts").PartnerConnectionsEditor | undefined {

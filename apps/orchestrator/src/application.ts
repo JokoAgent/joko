@@ -282,6 +282,7 @@ import { PartnerSessionTaskGroupPublisher } from "./partner-session-task-group-p
 import { PartnerSessionTaskTools } from "./partner-session-task-tools.js";
 import { PartnerRoutineStore } from "@joko/store";
 import { PartnerRoutineManager } from "./partner-routine-manager.js";
+import { PartnerNightlyLearning } from "./partner-nightly-learning.js";
 import { canSendFollowUpTaskMessage, PartnerAutonomyManager } from "./partner-autonomy.js";
 import { PartnerTodoManager, PartnerTodoTools } from "./partner-todos.js";
 import { PartnerMessagingRuntime, PartnerMessagingTools } from './partner-messaging.js';
@@ -2441,7 +2442,10 @@ export async function createOrchestratorApplication(
     sessionHost,
     workspaceService: workspaces,
     homesRoot: join(config.dataDirectory, "partner-homes"),
-    onReady: async partnerId => { await partnerImports?.activatePackage(partnerId); },
+    onReady: async partnerId => {
+      await partnerImports?.activatePackage(partnerId);
+      await partnerRoutines?.ensureNightlyLearning(partnerId).catch(() => undefined);
+    },
     isSavedPackageMissingDefault: (profile, assertCurrent) => isSavedPackageMissingDefault(profile, partnerImportStorage, assertCurrent),
     routineModel: (partnerId, key) => partnerRoutines?.engine.list(partnerId).find(routine =>
       key === `routine:${routine.id}` || key.startsWith(`routine:${routine.id}:`))?.modelOverride ?? undefined,
@@ -3015,6 +3019,8 @@ export async function createOrchestratorApplication(
   partnerLearning = new PartnerLearningManager({ store, profiles: partnerStore, partners, memory: makerMemory,
     assertMessagingSource: item => partnerMessaging!.assertQueueCurrent(item),
     skills: partnerSkills, auxiliary: auxiliaryText });
+  partnerRoutines.setNightlyLearning(new PartnerNightlyLearning({ store, memory: makerMemory, skills: partnerSkills,
+    learning: partnerLearning, auxiliary: auxiliaryText }));
   const unregisterPartnerSkillTools = mcpRouter.registerBridgeToolProvider(new PartnerSkillsToolProvider(partnerSkills));
   const unregisterPartnerCapabilityTools = mcpRouter.registerBridgeToolProvider(new PartnerCapabilityTools(partnerConnections,
     sessionId => sessionHost.requestServiceRuntimeRefresh(sessionId)));

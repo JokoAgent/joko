@@ -4,7 +4,7 @@ import * as contract from "@joko/contracts";
 import type { Routine, RoutineInput, RoutineRun, RoutineSource, RoutineTrigger } from "@joko/core";
 import { fromProtoRevision, fromProtoTimestamp, toProtoRevision, toProtoTimestamp } from "./proto-mapper.js";
 import { parseRoutineInput } from "./partner-routine-definition.js";
-import { PartnerRoutineError, type PartnerRoutineManager } from "./partner-routine-manager.js";
+import { PartnerRoutineError, type NightlyAction, type PartnerRoutineManager } from "./partner-routine-manager.js";
 
 export function createPartnerRoutineConnectService(manager: PartnerRoutineManager | undefined,
   authenticate: (context: HandlerContext) => unknown): ServiceImpl<typeof contract.PartnerRoutineService> {
@@ -64,8 +64,51 @@ export function createPartnerRoutineConnectService(manager: PartnerRoutineManage
       const result = await owner().retireCreation(request.partnerId, request.requestId);
       return create(contract.RetirePartnerRoutineCreationResponseSchema, { retired: result.retired,
         ...(result.routine ? { routine: toProtoRoutine(result.routine) } : {}) });
+    }),
+    getPartnerNightlyLearning: (request, context) => invoke(context, () => toProtoNightly(owner().nightlyLearning(request.partnerId))),
+    updatePartnerNightlyLearning: (request, context) => invoke(context, async () => {
+      await owner().updateNightlyLearning(request.partnerId, fromProtoRevision(request.expectedPartnerRevision),
+        fromProtoRevision(request.expectedStateRevision), fromProtoRevision(request.expectedScheduleRevision),
+        fromProtoNightlyAction(request.action), context.signal, () => authenticate(context));
+      return create(contract.UpdatePartnerNightlyLearningResponseSchema, { state: toProtoNightly(owner().nightlyLearning(request.partnerId)) });
     })
   };
+}
+
+function fromProtoNightlyAction(value: contract.UpdatePartnerNightlyLearningRequest["action"]): NightlyAction {
+  switch (value.case) {
+    case "schedule": {
+      const { enabled, frequency } = value.value;
+      if (frequency !== contract.NightlyLearningFrequency.DAILY && frequency !== contract.NightlyLearningFrequency.WEEKLY) break;
+      return { kind: "schedule", enabled, frequency: frequency === contract.NightlyLearningFrequency.DAILY ? "daily" : "weekly" };
+    }
+    case "runRequestId": return { kind: "run", requestId: value.value };
+    case "change": return { kind: "change", runId: nightlyIdentity(value.value.runId), changeId: nightlyIdentity(value.value.changeId), redo: value.value.redo };
+    case "candidate": return { kind: "candidate", candidateId: nightlyIdentity(value.value.candidateId), promote: value.value.promote };
+  }
+  throw new ConnectError("A valid Nightly learning action is required.", Code.InvalidArgument);
+}
+
+function nightlyIdentity(id: string): string {
+  if (!/^[A-Za-z0-9_-]{16,128}$/u.test(id)) throw new ConnectError("Nightly learning identity is invalid.", Code.InvalidArgument);
+  return id;
+}
+
+function toProtoNightly(value: ReturnType<PartnerRoutineManager["nightlyLearning"]>): contract.GetPartnerNightlyLearningResponse {
+  const actions = { created: contract.NightlyLearningChangeAction.CREATED, updated: contract.NightlyLearningChangeAction.UPDATED,
+    removed: contract.NightlyLearningChangeAction.REMOVED, disabled: contract.NightlyLearningChangeAction.DISABLED };
+  return create(contract.GetPartnerNightlyLearningResponseSchema, {
+    partnerId: value.partnerId, partnerRevision: toProtoRevision(value.partnerRevision), stateRevision: toProtoRevision(value.revision),
+    scheduleRevision: toProtoRevision(value.scheduleRevision),
+    schedule: { enabled: value.enabled, frequency: value.frequency === "weekly" ? contract.NightlyLearningFrequency.WEEKLY : contract.NightlyLearningFrequency.DAILY },
+    timezone: value.timezone, writable: value.writable, running: value.running,
+    pendingConversations: value.pending, memoryEnabled: value.memoryEnabled,
+    candidates: value.candidates.map(candidate => ({ ...candidate, firstSeenAt: toProtoTimestamp(candidate.firstSeenAt) })),
+    history: value.history.map(run => ({ id: run.id, startedAt: toProtoTimestamp(run.startedAt), status: runStatus(run.status),
+      manual: run.manual, conversationCount: run.conversations, changes: run.changes.map(change => ({ ...change,
+        kind: change.kind === "memory" ? contract.NightlyLearningChangeKind.MEMORY : contract.NightlyLearningChangeKind.SKILL,
+        action: actions[change.action] })) }))
+  });
 }
 function numberRevision(value: contract.Revision | undefined): number {
   const revision = fromProtoRevision(value);
