@@ -14,6 +14,7 @@ export * from "./managed-subagent-source.js";
 export * from "./model-catalog-additions.js";
 export * from "./model-purpose.js";
 export * from "./protocol.js";
+export * from "./published-cli.js";
 export * from "./resources.js";
 export * from "./runtime-process.js";
 export * from "./runtime-tool-catalog.js";

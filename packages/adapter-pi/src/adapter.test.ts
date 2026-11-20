@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { access, mkdir, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, open, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
@@ -13,11 +13,12 @@ import { appendVisionBridgeDescriptions, createPiAdapter, escapePiComposerSlashC
 import { COMMAND_GATE_REQUEST_PREFIX } from "./command-gate-bridge.js";
 import { managedSubagentSessionKey } from "./durable-subagent-runs.js";
 import type { PiManagedDurableStore } from "./managed-durable-store.js";
+import { PUBLISHED_PI_PACKAGE_ROOT } from "./published-cli.js";
 import {
   PI_RUNTIME_TOOL_CATALOG_CHUNK_BYTES,
   PI_RUNTIME_TOOL_CATALOG_STATUS_KEY
 } from "./runtime-tool-catalog.js";
-import type { PiProcessHandle, PiProcessSpec } from "./transport.js";
+import { spawnPiProcess, type PiProcessHandle, type PiProcessSpec } from "./transport.js";
 import { encodePolicyDecisionRequest } from "./policy-decision-bridge.js";
 import { PARTNER_LEARNING_REQUEST_PREFIX, PARTNER_LEARNING_REPLY_STATUS_KEY } from "./partner-learning-bridge.js";
 import { mkdtemp } from "./test-paths.js";
@@ -8169,6 +8170,31 @@ describe("managed resource precedence", () => {
       expect(valuesForArgument(specs[3]!.args, "--extension").some(entry => entry.endsWith("a.ts"))).toBe(true);
     } finally { await adapter.dispose(); }
   });
+
+  it.runIf(process.platform === "linux")("keeps the configured npm symlink for the local probe and stages its published bundle for SSH", async () => {
+    const home = await mkdtemp(join(tmpdir(), "joko-pi-published-bin-"));
+    const publishedCli = join(PUBLISHED_PI_PACKAGE_ROOT, "dist", "bundle", "cli.js");
+    const configured = join(home, "pi");
+    await symlink(publishedCli, configured);
+    const processFactory = vi.fn((spec: PiProcessSpec) => spec.remoteWorkspace === undefined
+      ? spawnPiProcess(spec) : new ScriptedPiProcess(spec) as unknown as PiProcessHandle);
+    const adapter = createPiAdapter({ agentHome: home, sessionRoot: home, command: configured, processFactory,
+      validateRemoteWorkspace: async () => undefined, includeManagedSubagentTools: () => false });
+    const target: TargetDescriptor = { id: "published-bin-ssh", backendId: "pi", displayName: "Published Pi SSH", workspaceRoot: home,
+      managed: true, trusted: true, remoteWorkspace: { kind: "ssh", hostTargetId: "test-host", hostId: "host", workspaceRoot: "/workspace" } };
+    try {
+      const binding = await adapter.createSession({ target, fastMode: false, permissionMode: "ask" }, makeContext(target, []));
+      expect(binding.nativeSessionId).toBeDefined();
+      const specs = processFactory.mock.calls.map(([value]) => value);
+      expect(specs.find(value => value.remoteWorkspace === undefined)?.command).toBe(configured);
+      const remote = specs.find(value => value.remoteWorkspace !== undefined)!;
+      expect(remote).toMatchObject({ command: process.execPath, cwd: "/workspace" });
+      expect(remote.args[0]).toBe(publishedCli);
+      const remoteBridge = managedBridgePath(remote);
+      expect(dirname(dirname(remoteBridge))).toBe(dirname(remote.env.JOKO_PI_CONTROL_FILE!));
+      await expect(access(join(dirname(remoteBridge), "joko-managed-model-catalog.mjs"))).resolves.toBeUndefined();
+    } finally { await adapter.dispose(); await rm(home, { recursive: true, force: true, maxRetries: 3 }); }
+  }, 30_000);
 
   it("does not trust a custom executable with a semantic version and an invalid RPC state", async () => {
     const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-custom-compatibility-home-"));

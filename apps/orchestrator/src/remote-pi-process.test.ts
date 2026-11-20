@@ -7,12 +7,13 @@ import { tmpdir } from "node:os";
 import { dirname, join, posix as remotePath, win32, type PlatformPath } from "node:path";
 import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
-import { fileURLToPath } from "node:url";
 
 import {
   createPiAdapter,
   MANAGED_SUBAGENT_NODE_ENV,
   MANAGED_SUBAGENT_RUNNER_FILE_NAME,
+  PUBLISHED_PI_LOCAL_CLI,
+  PUBLISHED_PI_PACKAGE_ROOT,
   type PiProcessHandle,
   type PiProcessSpec
 } from "@joko/adapter-pi";
@@ -726,7 +727,7 @@ describe("RemotePiProcessFactory", () => {
     await terminal;
   });
 
-  it.runIf(process.platform === "linux")("starts the published default SSH Pi RPC from the staged package without changing owned argv", async () => {
+  it.runIf(process.platform === "linux").each(["default", "npm bin"] as const)("starts the published %s SSH Pi RPC without changing owned argv", async entry => {
     const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-published-"));
     temporaryDirectories.push(fixture);
     const runtime = join(fixture, "runtime"), sessions = join(fixture, "sessions"), staged = join(fixture, "staged");
@@ -750,7 +751,7 @@ describe("RemotePiProcessFactory", () => {
       files, processes: { open: async () => bridge }
     };
     const registry = { transports: async () => ({ host: {}, lease }) } as unknown as RemoteHostRegistry;
-    const publishedCli = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
+    const publishedCli = entry === "default" ? PUBLISHED_PI_LOCAL_CLI : join(PUBLISHED_PI_PACKAGE_ROOT, "dist", "bundle", "cli.js");
     const args = ["--mode", "rpc", "--no-session", "--no-extensions", "--offline", "--extension"];
     const mapped = await remoteFactory(registry, join(fixture, "authority")).create({
       command: process.execPath, args: [publishedCli, ...args, extensionPath], cwd: "/workspace", remoteWorkspace: TEST_REMOTE_WORKSPACE,

@@ -17,17 +17,20 @@ import {
 import { basename, dirname, isAbsolute, join, posix as remotePath, relative, resolve, sep, win32, type PlatformPath } from "node:path";
 import { PassThrough, Transform, type Readable, type TransformCallback, type Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
-import { fileURLToPath } from "node:url";
 
 import {
   MANAGED_SUBAGENT_NODE_ENV,
   MANAGED_SUBAGENT_POLICY_APPROVAL_LIMITS,
   MANAGED_SUBAGENT_PRODUCT_SESSION_ENV,
   MANAGED_SUBAGENT_RUNNER_FILE_NAME,
+  PUBLISHED_PI_LOCAL_CLI,
+  PUBLISHED_PI_PACKAGE_NAME,
+  PUBLISHED_PI_PACKAGE_ROOT,
   type PiManagedDurableRunSnapshot,
   type PiManagedDurableStore,
   type PiManagedDurableStoreRegistry,
   type PiRemoteNavigationOwner,
+  resolvePublishedPiBundleRoot,
   spawnPiProcess,
   type PiProcessFactory,
   type PiProcessHandle,
@@ -62,11 +65,9 @@ const PI_RELEASE_STARTUP_MEMBERS: Readonly<Record<string, readonly string[]>> = 
   "": ["package.json", "pi", "theme"],
   theme: ["dark.json", "light.json"]
 };
-const PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
-const PI_PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.resolve(PI_PACKAGE_NAME))));
-const PI_PUBLISHED_ENTRY = `node_modules/${PI_PACKAGE_NAME}/joko-rpc-launch.mjs`;
+const PI_PUBLISHED_ENTRY = `node_modules/${PUBLISHED_PI_PACKAGE_NAME}/joko-rpc-launch.mjs`;
 const PI_PUBLISHED_SSH_FILES = {
-  [PI_PACKAGE_NAME]: ["package.json", "dist/bundle", "dist/modes/interactive/theme", "dist/modes/interactive/assets",
+  [PUBLISHED_PI_PACKAGE_NAME]: ["package.json", "dist/bundle", "dist/modes/interactive/theme", "dist/modes/interactive/assets",
     "dist/core/export-html", "docs", "examples", "README.md", "CHANGELOG.md"],
   "@earendil-works/chord": ["package.json", "dist/context", "README.md"],
   "@earendil-works/pi-ai": ["package.json", "dist/api/simple-options.js", "dist/utils/estimate.js", "README.md"],
@@ -568,8 +569,9 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     };
 
     const rewrittenArgs = [...spec.args];
-    const usesPublishedSshPi = binding.kind === "ssh" && spec.command === process.execPath
-      && spec.args[0] === join(PI_PACKAGE_ROOT, "dist", "cli.js");
+    const publishedSshPiRoot = binding.kind === "ssh" && spec.command === process.execPath
+      ? spec.args[0] === PUBLISHED_PI_LOCAL_CLI ? PUBLISHED_PI_PACKAGE_ROOT : await resolvePublishedPiBundleRoot(spec.args[0])
+      : undefined;
     const compatibilityAssets: RemoteCompatibilityAsset[] = [];
     let trustedRunnerScriptSha256: string | undefined;
     let recordedManagedSupport = false;
@@ -577,10 +579,10 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     for (let index = 0; index < rewrittenArgs.length; index += 1) {
       const value = rewrittenArgs[index];
       if (value === undefined || !isAbsolute(value)) continue;
-      if (index === 0 && usesPublishedSshPi) {
-        const snapshot = await snapshotPublishedSshPi();
+      if (index === 0 && publishedSshPiRoot !== undefined) {
+        const snapshot = await snapshotPublishedSshPi(publishedSshPiRoot);
         const destination = targetPaths.join(remoteRuntime, "assets", `${snapshot.digest}-pi-runtime`);
-        stagingPlans.push({ local: PI_PACKAGE_ROOT, remote: destination, snapshot });
+        stagingPlans.push({ local: publishedSshPiRoot, remote: destination, snapshot });
         rewrittenArgs[index] = targetPaths.join(destination, ...PI_PUBLISHED_ENTRY.split("/"));
         compatibilityAssets.push({ role: "entrypoint", name: "pi-runtime", digest: snapshot.digest });
         continue;
@@ -689,7 +691,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     }
 
     let commandSnapshot: LocalAssetSnapshot | undefined;
-    if (!usesPublishedSshPi && isAbsolute(spec.command) && !/^(?:node|electron)(?:\.exe)?$/iu.test(basename(spec.command))) {
+    if (publishedSshPiRoot === undefined && isAbsolute(spec.command) && !/^(?:node|electron)(?:\.exe)?$/iu.test(basename(spec.command))) {
       const standaloneRelease = binding.kind === "ssh" && basename(spec.command) === "pi"
         && (await lstat(spec.command)).size > MAXIMUM_SYNC_FILE_BYTES;
       commandSnapshot = standaloneRelease
@@ -707,7 +709,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
       throw new Error("Remote Pi managed runner source is unavailable.");
     }
     const trustedRunnerDigest = trustedRunnerScriptSha256 ?? "0".repeat(64);
-    const command = usesPublishedSshPi ? "node" : remoteCommand(
+    const command = publishedSshPiRoot !== undefined ? "node" : remoteCommand(
       spec.command,
       rewrittenArgs,
       remoteRuntime,
@@ -3395,14 +3397,18 @@ function compatibilityAssetRole(
   return undefined;
 }
 
-async function snapshotPublishedSshPi(): Promise<LocalAssetSnapshot> {
-  const packageModulesRoot = dirname(dirname(PI_PACKAGE_ROOT));
+async function snapshotPublishedSshPi(root: string): Promise<LocalAssetSnapshot> {
+  const packageModulesRoot = dirname(dirname(root));
   const entries: LocalAssetSnapshotEntry[] = [{ path: "", kind: "directory", mode: 0o700 }];
   const directories = new Set<string>();
   // Keep the bundle's external imports and the managed bridge's published
   // option resolver alongside the bundle, using the installed dependency bytes.
   for (const [name, members] of Object.entries(PI_PUBLISHED_SSH_FILES)) {
-    const packageRoot = name === PI_PACKAGE_NAME ? PI_PACKAGE_ROOT : await realpath(join(packageModulesRoot, name));
+    const packageRoot = name === PUBLISHED_PI_PACKAGE_NAME ? root
+      : await realpath(join(root, "node_modules", name)).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error;
+          return realpath(join(packageModulesRoot, name));
+        });
     for (const member of members) {
       const destination = `node_modules/${name}/${member}`;
       let parent = "";

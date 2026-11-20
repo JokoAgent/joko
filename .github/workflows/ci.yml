@@ -96,6 +96,10 @@ jobs:
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
         shell: bash
         run: pnpm --filter @joko/remote-ssh exec vitest run src/remote-git-checkout.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/remote-checkout.log"
+      - name: Check the configured published Pi launcher and SSH provision
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' && runner.os == 'Linux' }}
+        shell: bash
+        run: pnpm --filter @joko/adapter-pi exec vitest run src/adapter.test.ts -t 'keeps the configured npm symlink for the local probe and stages its published bundle for SSH' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/pi-launcher.log"
       - name: Check the reproduced service boundaries and recovery failures
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
         working-directory: apps/orchestrator
