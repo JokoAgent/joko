@@ -15,6 +15,7 @@ export interface UsageLimitRecoveryHint {
 export interface UsageLimitScheduleIntent extends UsageLimitRecoveryHint {
   readonly requestId: string;
   readonly sessionId: string;
+  readonly owner?: { readonly serverId: string; readonly profileId: string; readonly connectionGeneration: number | undefined };
 }
 
 let pendingIntent: UsageLimitScheduleIntent | undefined;
@@ -71,13 +72,15 @@ export function usageLimitRecoveryHint(
 
 export function stageUsageLimitScheduleIntent(
   sessionId: string,
-  hint: UsageLimitRecoveryHint
+  hint: UsageLimitRecoveryHint,
+  owner?: UsageLimitScheduleIntent["owner"]
 ): UsageLimitScheduleIntent {
   intentSequence += 1;
   pendingIntent = {
     ...hint,
     requestId: `${sessionId}:${Date.now()}:${intentSequence}`,
-    sessionId
+    sessionId,
+    ...(owner === undefined ? {} : { owner })
   };
   return pendingIntent;
 }

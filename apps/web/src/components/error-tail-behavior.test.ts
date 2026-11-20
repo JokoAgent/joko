@@ -1,6 +1,6 @@
 import type { QueueItemView, SessionAttentionView, TimelineItemView } from "../model.js";
 import { describe, expect, it } from "vitest";
-import { ErrorTailLocalProjectionStore, errorTailLocalKey, explicitErrorAttentionCursor, findDurableErrorTail, hasErrorTailQueueContinuation, resolveErrorTail } from "./error-tail-behavior.js";
+import { ErrorTailLocalProjectionStore, errorTailLocalKey, explicitErrorAttentionCursor, findDurableErrorTail, findFailedInputUsageLimit, hasErrorTailQueueContinuation, resolveErrorTail } from "./error-tail-behavior.js";
 
 describe("durable error-tail projection", () => {
   it("selects only the highest-sequence durable error at the current tail", () => {
@@ -43,6 +43,20 @@ describe("durable error-tail projection", () => {
       queueContinuation: false
     });
     expect(resolveErrorTail("session-a", [error], [], true, "none")).toMatchObject({ bannerVisible: false, hideFromTimeline: true });
+  });
+
+  it("retains recovery for the last failed user's original quota input after late history and workspace events", () => {
+    const error = item("quota-error", 15n, "error");
+    const failed: TimelineItemView = { ...error, runId: "run-1", runTerminal: "failed",
+      error: { ...error.error!, code: "PI_PROVIDER_RESPONSE_FAILED", message: "429 Rate limit exceeded" },
+      failedInput: { backendId: "pi", targetId: "target-a", runId: "run-1", queueItemId: "queue-original", operationId: "op-original" } };
+    const queue = [{ ...queueItem("failed", 100), id: "queue-original" }];
+    const timeline = [failed, item("diff", 20n, "diff"), { ...item("original-user", 22n, "user"), runId: "run-1" }];
+    expect(findFailedInputUsageLimit("session-a", timeline, queue)).toEqual({ item: failed, hint: { resetAtMs: null } });
+    expect(findFailedInputUsageLimit("session-a", timeline, [])).toBeUndefined();
+    expect(findFailedInputUsageLimit("session-a", timeline, [...queue, queueItem("accepted", 203)])).toBeUndefined();
+    expect(findFailedInputUsageLimit("session-a", [...timeline, { ...item("new-user", 23n, "user"), runId: "run-2" }], queue)).toBeUndefined();
+    expect(findFailedInputUsageLimit("session-a", [...timeline, { ...item("another-completion", 24n, "status"), runTerminal: "completed" }], queue)).toBeUndefined();
   });
 
   it("suppresses duplicate activation while a queue continuation is pending", () => {

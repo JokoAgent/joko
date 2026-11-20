@@ -1,4 +1,5 @@
 import type { QueueItemView, SessionAttentionView, TimelineHistoryCursorView, TimelineItemView } from "../model.js";
+import { usageLimitRecoveryHint, type UsageLimitRecoveryHint } from "../usage-limit-recovery.js";
 
 export type ErrorTailLocalDisposition = "none" | "inFlight" | "handled" | "dismissed";
 
@@ -52,6 +53,29 @@ export function hasErrorTailQueueContinuation(
     item.sessionId === sessionId
     && CONTINUATION_QUEUE_STATES.has(item.state)
   );
+}
+
+/** A cold reopen may put the original error in history while its failed input
+ * still owns recovery. Only a current, durably failed user input qualifies. */
+export function findFailedInputUsageLimit(
+  sessionId: string,
+  items: readonly TimelineItemView[],
+  queue: readonly QueueItemView[]
+): { readonly item: TimelineItemView; readonly hint: UsageLimitRecoveryHint } | undefined {
+  if (hasErrorTailQueueContinuation(queue, sessionId)) return undefined;
+  let terminal: TimelineItemView | undefined;
+  for (const item of items) {
+    if (item.runTerminal === undefined || isInternalFailedRunDone(item)) continue;
+    if (terminal === undefined || item.sequence >= terminal.sequence) terminal = item;
+  }
+  if (terminal?.kind !== "error" || terminal.runTerminal !== "failed" || terminal.error === undefined) return undefined;
+  const { runId, sequence, failedInput } = terminal;
+  if (failedInput === undefined || failedInput.runId !== runId || terminal.error.runId !== runId) return undefined;
+  if (!queue.some(item => item.sessionId === sessionId && item.id === failedInput.queueItemId
+    && item.source === "user" && item.state === "failed")) return undefined;
+  if (items.some(item => item.kind === "user" && item.sequence > sequence && item.runId !== runId)) return undefined;
+  const hint = usageLimitRecoveryHint(terminal.error);
+  return hint === null ? undefined : { item: terminal, hint };
 }
 
 /**

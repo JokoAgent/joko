@@ -42,6 +42,7 @@ describe("Workspace Review file list", () => {
   });
 
   it("releases both image acquisitions each time the virtualized Review row leaves the view", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const height = vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (this: HTMLElement) {
       return this.classList.contains("workspace-diff-preview") ? 180 : 45;
     });
@@ -62,7 +63,12 @@ describe("Workspace Review file list", () => {
       await render("revision-1");
       expect(container.querySelectorAll(".review-image-preview img")).toHaveLength(2);
       const list = container.querySelector<HTMLElement>('[data-virtualized-file-list="true"]')!;
-      const scroll = (top: number) => act(async () => { list.scrollTop = top; list.dispatchEvent(new Event("scroll")); });
+      const scroll = (top: number) => act(async () => {
+        list.scrollTop = top;
+        list.dispatchEvent(new Event("scroll"));
+        // Run the virtualizer's scroll-end notification while its view still owns the DOM.
+        await vi.runOnlyPendingTimersAsync();
+      });
       await scroll(45 * 70);
       expect(container.querySelector(".review-image-preview")).toBeNull();
       expect(acquire.mock.results).toHaveLength(2);
@@ -75,6 +81,7 @@ describe("Workspace Review file list", () => {
       for (const entry of acquire.mock.results) expect(entry.value.release).toHaveBeenCalledOnce();
     } finally {
       height.mockRestore();
+      vi.useRealTimers();
     }
   });
 

@@ -494,6 +494,7 @@ interface TurnOverrideLease {
   readonly permissionModeChanged: boolean;
   readonly planModeChanged: boolean;
   readonly extraDirectoriesChanged: boolean;
+  restoring: boolean;
 }
 
 interface RuntimeProfileChanges {
@@ -8645,7 +8646,8 @@ export class SessionHost {
       fastModeChanged,
       permissionModeChanged,
       planModeChanged,
-      extraDirectoriesChanged
+      extraDirectoriesChanged,
+      restoring: false
     };
     try {
       if (fastModeChanged && overrides.fastMode === false) {
@@ -8698,7 +8700,7 @@ export class SessionHost {
 
   private async restoreTurnOverrideLease(runId: string): Promise<void> {
     const lease = this.#turnOverrideLeases.get(runId);
-    if (lease === undefined) return;
+    if (lease === undefined || lease.restoring) return;
     if (this.#disposed) {
       this.#turnOverrideLeases.delete(runId);
       return;
@@ -8731,20 +8733,23 @@ export class SessionHost {
       }
       throw error;
     }
-    this.#turnOverrideLeases.delete(runId);
-    this.#dismissPendingInteractions(
-      new Set([lease.sessionId]),
-      "Per-turn execution policy lease ended while the interaction was pending."
-    );
-    const context = this.contextFor(
-      sideEffect.stored,
-      runId,
-      undefined,
-      undefined,
-      undefined,
-      sideEffect.backendInstanceGeneration
-    );
+    // The Run may already be terminal while restoring the native model or
+    // replacing its process. Keep dispatch fenced until that effect settles.
+    lease.restoring = true;
+    let context = sideEffect.context;
     try {
+      this.#dismissPendingInteractions(
+        new Set([lease.sessionId]),
+        "Per-turn execution policy lease ended while the interaction was pending."
+      );
+      context = this.contextFor(
+        sideEffect.stored,
+        runId,
+        undefined,
+        undefined,
+        undefined,
+        sideEffect.backendInstanceGeneration
+      );
       await this.restoreRuntimeConfiguration(lease, active, context);
       if (!this.#disposed) this.assertActiveBackendSideEffectLease(sideEffect);
     } catch (error) {
@@ -8755,8 +8760,16 @@ export class SessionHost {
       this.deleteActiveSession(lease.sessionId, active);
       this.recordFailure("turn_override_restore", error);
     } finally {
+      if (this.#turnOverrideLeases.get(runId) === lease) this.#turnOverrideLeases.delete(runId);
       sideEffect.release();
     }
+  }
+
+  private restoringTurnOverrides(sessionId: string): boolean {
+    for (const lease of this.#turnOverrideLeases.values()) {
+      if (lease.sessionId === sessionId && lease.restoring) return true;
+    }
+    return false;
   }
 
   private async restoreRuntimeConfiguration(
@@ -15131,6 +15144,7 @@ export class SessionHost {
       || this.#runSilenceRecoveries.has(sessionId)
       || this.#runtimeRestartFences.has(sessionId)
       || this.#extensionPermissionUpdates.has(sessionId)
+      || this.restoringTurnOverrides(sessionId)
       || this.#disposed
       || this.#partnerSessionRestarting(sessionId)
       || this.#partnerSessionPaused(sessionId)
@@ -15158,6 +15172,7 @@ export class SessionHost {
           || this.#hasHeldProviderGroupRecovery(sessionId)
           || this.#runSilenceRecoveries.has(sessionId)
           || this.#runtimeRestartFences.has(sessionId)
+          || this.restoringTurnOverrides(sessionId)
           || this.#partnerSessionRestarting(sessionId)
           || this.#partnerSessionPaused(sessionId)
           || this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined
@@ -15236,6 +15251,7 @@ export class SessionHost {
           attemptId: stableId("attempt", `${pending.operationId}:context-rebuild-generation:${rebuiltGeneration}`),
           generation: rebuiltGeneration
         });
+        if (this.restoringTurnOverrides(sessionId)) return;
         const compactionDecision = await this.compactionDispatchDecision(sessionId);
         if (this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined) return;
         if (compactionDecision.kind === "blocked") return;
@@ -15250,7 +15266,7 @@ export class SessionHost {
         // Inspection yields to queue control, cancellation, reordering, and
         // native events. Re-read every durable precondition, then perform the
         // final barrier check and claim synchronously so they cannot race.
-        if (this.#store.getQueueControl(sessionId).paused) return;
+        if (this.#store.getQueueControl(sessionId).paused || this.restoringTurnOverrides(sessionId)) return;
         pending = this.#store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0];
         if (pending === undefined) return;
         // Classification/reordering awaited Backend state. Never let its
