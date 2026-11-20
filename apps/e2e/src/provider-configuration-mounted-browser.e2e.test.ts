@@ -201,14 +201,41 @@ describe("mounted Provider configuration", () => {
     expect(secondErrors.filter((error) => !error.includes("409 (Conflict)"))).toEqual([]);
 
     await first.locator(".provider-master-row", { hasText: "Mounted Route" }).dblclick();
-    await first.locator(".provider-editor-modal").getByRole("button", { name: "Copy to other runtimes" }).click();
+    editor = first.locator(".provider-editor-modal");
+    await editor.getByRole("tab", { name: "Alpha runtime" }).click();
+    await editor.getByRole("button", { name: "Add model", exact: true }).click();
+    const video = editor.locator(".provider-model-card").last();
+    await video.getByLabel("Model ID").fill("original-video-model");
+    await video.getByLabel("Display name").fill("Original video model");
+    await video.getByText("Advanced model options", { exact: true }).click();
+    const purposeLabel = "Video generation (xAI compatible)";
+    await video.getByRole("combobox", { name: "Model purpose" }).click();
+    await first.getByRole("option", { name: purposeLabel, exact: true }).click();
+    expect(await video.getByLabel("Context window tokens").count()).toBe(0);
+    await editor.getByRole("button", { name: "Save", exact: true }).click();
+    await editor.waitFor({ state: "hidden", timeout: 20_000 });
+    const withVideo = await read();
+    const savedVideo = withVideo.runtimes.find((runtime) => runtime.backendId === alphaId)?.models
+      .find((model) => model.modelId === "original-video-model");
+    expect(savedVideo?.mode).toBe("xai_video");
+    expect(fixture.application.providers!.resolveInferenceRoute(alphaId, "mounted-route", "original-video-model")).toBeUndefined();
+    expect(fixture.application.providers!.resolveInferenceRoute(alphaId, "mounted-route", "original-video-model", { purpose: "xai_video" }))
+      .toMatchObject({ modelId: "original-video-model", baseUrl: alpha.endpoint });
+
+    await first.locator(".provider-master-row", { hasText: "Mounted Route" }).dblclick();
+    editor = first.locator(".provider-editor-modal");
+    await editor.getByRole("tab", { name: "Alpha runtime" }).click();
+    const reopenedVideo = editor.locator(".provider-model-card", { hasText: "Original video model" });
+    await reopenedVideo.getByText("Advanced model options", { exact: true }).click();
+    expect(await reopenedVideo.getByRole("combobox", { name: "Model purpose" }).textContent()).toContain(purposeLabel);
+    await editor.getByRole("button", { name: "Copy to other runtimes" }).click();
     await first.locator(".provider-transfer-modal").waitFor({ state: "visible" });
     const webConnection = fixture.application.store.listConnections().find((item) => item.id !== inspector.connectionId);
     if (webConnection === undefined) throw new Error("Mounted Provider connection was not recorded.");
     fixture.application.connections.revoke(webConnection.id);
     await first.locator(".connection-card").waitFor({ state: "visible", timeout: 20_000 });
     expect(await first.locator(".provider-transfer-modal").count()).toBe(0);
-    expect((await read()).version?.revision?.value).toBe(copied.version?.revision?.value);
+    expect((await read()).version?.revision?.value).toBe(withVideo.version?.revision?.value);
   });
 });
 
