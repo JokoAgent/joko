@@ -23803,7 +23803,7 @@ async function dispatchMutation(
           const transfer = await dependencies.blobTransfers.beginUpload({ expectedSize: snapshot.screenshot.byteLength, maximumSize: snapshot.screenshot.byteLength, mimeType: "image/png", fileName: `${payload.value.pageId}.png` });
           const endpoint = transfer.relativeEndpoint.split("/");
           const secret = decodeURIComponent(endpoint.at(-1) ?? "");
-          artifact = await dependencies.blobTransfers.acceptUpload(transfer.ticketId, secret, Readable.from(snapshot.screenshot));
+          artifact = await dependencies.blobTransfers.acceptUpload(transfer.ticketId, secret, Readable.from([snapshot.screenshot]));
           requireActiveBrowserPageAuthority(
             dependencies.browserState,
             provider.id,

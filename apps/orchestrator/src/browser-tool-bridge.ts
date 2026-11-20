@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
+import { BrowserTransferState, type BrowserTransfer } from "@joko/contracts";
 import {
   BrowserPageGuardError,
   sanitizeBrowserFileName,
@@ -35,7 +36,7 @@ import { BUILTIN_BROWSER_RECIPES, BUILTIN_BROWSER_SITE_GUIDES } from "./browser-
 import { BROWSER_RECIPE_AUTHOR_RULES, BROWSER_WORKFLOW_RULES } from "./browser-rules.js";
 import { hasSecretPages, isSecretPage } from "./input-handoff/secretTaint.js";
 import type { BrowserTransferConnection, BrowserTransferCoordinator } from "./browser-transfers.js";
-import type { BridgeToolCallContext, BridgeToolProvider, McpCallResult, McpToolDescriptor } from "./mcp-router.js";
+import type { BridgeToolCallContext, BridgeToolCallResult, BridgeToolProvider, McpCallResult, McpToolDescriptor } from "./mcp-router.js";
 import type {
   BrowserBridgeEffectAuthority,
   OperationalBrowserState,
@@ -514,7 +515,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     signal?: AbortSignal,
     context?: BridgeToolCallContext,
     directoryPages?: ReadonlySet<string>
-  ): Promise<McpCallResult> {
+  ): Promise<BridgeToolCallResult> {
     const task = this.#tail.then(
       () => this.#executeWithContext(name, arguments_, signal, context, directoryPages),
       () => this.#executeWithContext(name, arguments_, signal, context, directoryPages)
@@ -529,7 +530,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     signal: AbortSignal | undefined,
     context: BridgeToolCallContext | undefined,
     directoryPages?: ReadonlySet<string>
-  ): Promise<McpCallResult> {
+  ): Promise<BridgeToolCallResult> {
     this.#activeContext = context;
     this.#activePageIds = new Set<string>();
     this.#remoteResultActive = false;
@@ -555,7 +556,8 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         const source: BrowserResultSource = { owner: this.#resultOwner(), epoch: this.#syncResultEpoch(), pages: [...this.#activePageIds] };
         const bounded = boundedBrowserResult({ ok: true, action: payload["action"], data: payload["data"] }, result.content.filter(item => !(isRecord(item) && item["type"] === "text")),
           this.#remoteResultActive ? undefined : { cache: this.#results, source });
-        return name === "call_tool" ? { content: bounded.content, isError: bounded.isError } : bounded;
+        const projected = name === "call_tool" ? { content: bounded.content, isError: bounded.isError } : bounded;
+        return result.hostArtifacts === undefined ? projected : { ...projected, hostArtifacts: result.hostArtifacts };
       }
       return result;
     } catch (error) {
@@ -574,7 +576,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     input: Readonly<Record<string, unknown>>,
     signal: AbortSignal | undefined,
     directoryPages?: ReadonlySet<string>
-  ): Promise<McpCallResult> {
+  ): Promise<BridgeToolCallResult> {
     signal?.throwIfAborted();
     assertKnownArguments(name, input);
     switch (name) {
@@ -615,8 +617,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           }, true);
         }
         try {
-          const result = await this.#execute("browser", args, signal);
-          return { content: result.content, isError: result.isError, structuredContent: result.structuredContent };
+          return await this.#execute("browser", args, signal);
         } catch (error) {
           return publicTextResult({
             ok: false,
@@ -631,7 +632,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         }
       }
       case "browser":
-        return this.#executeUnified(input, signal, directoryPages);
+        return this.#executeUnified(input, signal, directoryPages, true);
       case "list_pages":
         return this.#withLease(async () => textResult({ pages: (await this.#listVisiblePages()).map(publicPage) }));
       case "open_page": {
@@ -824,8 +825,9 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
   async #executeUnified(
     input: Readonly<Record<string, unknown>>,
     signal: AbortSignal | undefined,
-    directoryPages?: ReadonlySet<string>
-  ): Promise<McpCallResult> {
+    directoryPages?: ReadonlySet<string>,
+    captureClickDownloads = false
+  ): Promise<BridgeToolCallResult> {
     signal?.throwIfAborted();
     const action = requiredEnum(input, "action", unifiedActions);
     if (input["deferValidation"] !== undefined && action !== "saveRecipe") throw new Error("deferValidation is only accepted by saveRecipe.");
@@ -1040,7 +1042,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         }, () => responds || this.#browser.targetMode !== "sidebar");
       }
       case "act":
-        return this.#executeUnifiedAct(input, signal);
+        return this.#executeUnifiedAct(input, signal, captureClickDownloads);
       case "requests": {
         const pageId = this.#unifiedPageId(input);
         return this.#withPageReadLease(pageId, async (lease) => this.#result(action, {
@@ -1091,14 +1093,15 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
 
   async #executeUnifiedAct(
     input: Readonly<Record<string, unknown>>,
-    signal: AbortSignal | undefined
-  ): Promise<McpCallResult> {
+    signal: AbortSignal | undefined,
+    captureClickDownloads: boolean
+  ): Promise<BridgeToolCallResult> {
     const request = requiredRecord(input, "request");
     const kind = requiredEnum(request, "kind", actKinds);
     const pageId = request["targetId"] === undefined
       ? this.#unifiedPageId(input)
       : this.#browser.resolvePageId(requiredString(request, "targetId", 512));
-    this.#assertPageContext(pageId);
+    const pageAuthority = this.#assertPageContext(pageId);
     const target = unifiedElementTarget(request);
     switch (kind) {
       case "click": {
@@ -1114,14 +1117,55 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           ...(modifiers === undefined ? {} : { modifiers })
         };
         if (this.#browser.targetMode !== "sidebar") return this.#unifiedActResult("act", { targetId: pageId }, click);
-        const receipt = await this.#withLease((lease) => this.#browser.clickWithDialog(pageId, lease, click, signal),
-          (result) => result.dialog === undefined);
-        return this.#result("act", {
+        const state = this.#state;
+        const context = this.#activeContext;
+        const inputQueue = context?.inputQueueItem;
+        const assertInvocation = context?.assertCurrent;
+        const collect = captureClickDownloads && state !== undefined && pageAuthority !== undefined
+          && context?.localProductScope === true && inputQueue !== undefined && assertInvocation !== undefined
+          && !isSecretPage(pageAuthority.url) && state.supportsClickDownloads(context.sessionId);
+        const transferIds: string[] = [];
+        const rememberDownload = (transfer: BrowserTransfer) => {
+          const blob = transfer.blob;
+          if (transfer.state === BrowserTransferState.COMPLETED && blob !== undefined
+            && blob.byteSize > 0n && blob.byteSize <= BigInt(this.#artifacts.maximumBlobBytes)
+            && Buffer.byteLength(blob.fileName, "utf8") <= 512 && !/[\u0000-\u001f\u007f]/u.test(blob.fileName)) {
+            transferIds.push(transfer.browserTransferId);
+          }
+        };
+        const { receipt, downloads } = await this.#withLease(async (lease) => {
+          const receipt = await this.#browser.clickWithDialog(pageId, lease, click, signal,
+            collect ? download => this.#transfers.onDownload(download, rememberDownload) : undefined);
+          if (!collect || transferIds.length === 0 || receipt.dialog !== undefined) return { receipt, downloads: [] };
+          const downloads = state.attachClickDownloads({
+            browserProviderId: this.#browser.id,
+            pageId,
+            browserGeneration: lease.generation,
+            sessionId: context.sessionId,
+            targetId: context.targetId,
+            bindingGeneration: context.generation
+          }, inputQueue, transferIds, () => {
+            signal?.throwIfAborted();
+            assertInvocation();
+            if (this.#browser.generation !== lease.generation || isSecretPage(receipt.page.url)) {
+              throw new Error("The originating Browser download scope was retired.");
+            }
+          });
+          return { receipt, downloads };
+        }, (result) => result.receipt.dialog === undefined);
+        const result = this.#result("act", {
           page: publicPage(receipt.page),
+          ...(receipt.downloadsPending === true ? { downloadsPending: true } : {}),
+          ...(downloads.length === 0 ? {} : { downloads: downloads.map(({ transferId, blob }) => ({
+            transferId, state: "completed", ...blob
+          })) }),
           ...(receipt.dialog === undefined ? {} : { barrier: {
             kind: "page-dialog", dialogId: receipt.dialog.id, dialog: receipt.dialog
           } })
         });
+        return downloads.length === 0 ? result : { ...result, hostArtifacts: downloads.map(({ blob }) => ({
+          blob, label: blob.fileName ?? "Browser download"
+        })) };
       }
       case "clickCoords":
         return this.#unifiedActResult("act", { targetId: pageId }, {
@@ -1559,7 +1603,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     this.#knowledgeVersion = layer.catalogVersion;
   }
 
-  async #observeBrowserFlow(name: string, input: Readonly<Record<string, unknown>>, result: McpCallResult, signal?: AbortSignal): Promise<McpCallResult> {
+  async #observeBrowserFlow(name: string, input: Readonly<Record<string, unknown>>, result: BridgeToolCallResult, signal?: AbortSignal): Promise<BridgeToolCallResult> {
     try {
       const args = name === "browser" ? input : name === "call_tool" && input["name"] === "browser" ? optionalRecord(input, "args") : undefined;
       if (!args || args["target"] === "node" && args["node"] !== this.#localNodeId) return result;
@@ -1613,7 +1657,10 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           }
         }
       }
-      if (extras && data && typeof action === "string") return this.#mixedResult(action, { ...data, ...extras }, result.content.filter(item => !isRecord(item) || item["type"] !== "text"));
+      if (extras && data && typeof action === "string") return {
+        ...result,
+        ...this.#mixedResult(action, { ...data, ...extras }, result.content.filter(item => !isRecord(item) || item["type"] !== "text"))
+      };
     } catch { this.#recipeTasks.get(this.#resultOwner())?.recorder.clear(); /* Advisory learning never changes a completed action's outcome. */ }
     return result;
   }

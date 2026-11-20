@@ -149,6 +149,8 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
     await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
     await page.getByLabel("Device name").fill("Quota recovery browser");
     await page.locator("form.pair-form button[type=submit]").click();
+    const pane = page.locator(`.session-pane[data-input-session-id='${sessionId}']`);
+    await pane.waitFor({ state: "visible" });
 
     const trigger = resetAt + 60_000;
     const schedules = [
@@ -158,7 +160,18 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
     for (const [index, schedule] of schedules.entries()) {
       checkpoint(`opening the recovery editor for ${schedule.providerId}`);
       const banner = page.getByTestId("error-tail-banner");
-      await banner.getByRole("button", { name: "Continue after reset", exact: true }).click();
+      try {
+        await banner.getByRole("button", { name: "Continue after reset", exact: true }).click();
+      } catch (error) {
+        const events = fixture.application.store.listEvents({ sessionId }).slice(-12).map(event => ({
+          runId: event.runId,
+          type: event.payload.type,
+          ...(event.payload.type === "error" ? { error: event.payload.error } : {})
+        }));
+        const visibleText = (await pane.textContent().catch(() => null))?.slice(-2_000);
+        console.info("Quota recovery fixture cold presentation", JSON.stringify({ events, visibleText }));
+        throw error;
+      }
       const editor = page.getByRole("dialog", { name: "Create schedule", exact: true });
       const triggerAt = editor.getByLabel("Trigger at", { exact: true });
       const picker = editor.locator(".schedule-editor__model-picker");

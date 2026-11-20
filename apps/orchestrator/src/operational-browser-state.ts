@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 
+import { BrowserTransferState, TransferDirection } from "@joko/contracts";
 import { redactSecrets, type BlobRef } from "@joko/core";
 import type { OperationalStore, SettingRecord } from "@joko/store";
 import {
@@ -264,6 +265,60 @@ export class OperationalBrowserState implements BrowserTransferRepository {
       throw new BrowserSessionAuthorityError();
     }
     return page;
+  }
+
+  supportsClickDownloads(sessionId: string): boolean {
+    const session = this.#store.getSession(sessionId).descriptor;
+    return session.remoteWorkspace === undefined && this.#store.getBackend(session.backendId).descriptor.adapterKind === "pi";
+  }
+
+  attachClickDownloads(authority: BrowserPageAuthority,
+    input: { readonly id: string; readonly runId: string; readonly attemptId: string },
+    transferIds: readonly string[], assertCurrent: () => void
+  ): readonly { readonly transferId: string; readonly blob: BlobRef }[] {
+    return this.#store.transaction(store => {
+      assertCurrent();
+      this.assertPageAuthority(authority);
+      const queue = store.getQueueItem(input.id);
+      const run = store.getRun(input.runId).descriptor;
+      if (queue.sessionId !== authority.sessionId || queue.runId !== input.runId || queue.attemptId !== input.attemptId
+        || (queue.state !== "dispatching" && queue.state !== "backend_accepted")
+        || run.sessionId !== authority.sessionId || !["queued", "running", "waiting", "retrying"].includes(run.state)) {
+        throw new BrowserSessionAuthorityError("The originating Browser download Run is no longer active.");
+      }
+      return transferIds.flatMap(transferId => {
+        if (!safeOpaqueId(transferId)) throw new BrowserSessionAuthorityError();
+        const setting = store.findSetting(SCOPE, SCOPE_ID, transferKey(authority.browserProviderId, transferId));
+        const transfer = setting === undefined ? undefined : parseTransferSetting(setting);
+        if (transfer === undefined || transfer.id !== transferId
+          || transfer.browserProviderId !== authority.browserProviderId || transfer.pageId !== authority.pageId
+          || transfer.generation !== authority.browserGeneration || transfer.direction !== TransferDirection.DOWNLOAD
+          || transfer.state !== BrowserTransferState.COMPLETED || transfer.blob === undefined) {
+          throw new BrowserSessionAuthorityError("The original Browser download receipt is unavailable.");
+        }
+        const original = store.getArtifact(transfer.blob.id);
+        const blob = original.blob;
+        if (original.sessionId !== undefined || original.runId !== undefined
+          || blob.sha256 !== transfer.blob.sha256 || blob.byteLength !== transfer.blob.byteLength
+          || blob.mimeType !== transfer.blob.mimeType || blob.fileName !== transfer.blob.fileName) {
+          throw new BrowserSessionAuthorityError("The original Browser download artifact is unavailable.");
+        }
+        const id = createHash("sha256").update(JSON.stringify([authority.sessionId, input.runId, transferId])).digest("hex");
+        // The page receipt keeps its original artifact. The Run retains a
+        // separate reference to the same immutable bytes under its own scope.
+        const artifact = store.putArtifact({
+          ...blob,
+          id: `browser-download-${id}`,
+          storageKey: original.storageKey,
+          sessionId: authority.sessionId,
+          runId: input.runId,
+          traceId: `browser-download:${transferId}`,
+          purpose: "browser_download",
+          createdAt: original.createdAt
+        });
+        return artifact.deletedAt === undefined ? [{ transferId, blob: artifact.blob }] : [];
+      });
+    });
   }
 
   claimBrowserPageOpen<T>(authority: BrowserBridgeEffectAuthority): BrowserPageOpenClaim<T> {
