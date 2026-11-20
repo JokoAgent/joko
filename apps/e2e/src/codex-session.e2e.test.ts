@@ -8,9 +8,9 @@ import { create, fromBinary, type JsonObject } from "@bufbuild/protobuf";
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { createCodexAdapter, AppServerHost, TransportFault } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
-import { CreateTargetMutationSchema, EntityKind, GetOperationRequestSchema, MessageRole, NativeCatalogImportPresentationSchema, NativeSessionPlacement, NativeSessionStartSchema,
+import { CreateTargetMutationSchema, EntityKind, GetOperationRequestSchema, GetSnapshotRequestSchema, GetSnapshotResponseSchema, MessageRole, NativeCatalogImportPresentationSchema, NativeSessionPlacement, NativeSessionStartSchema,
   ObjectiveStatus, OperationMutationSchema, OperationPreconditionSchema, OperationState, QueueItemState, RetryState, RunState, ScheduleRecurrenceSchema,
-  SetWorkspaceTrustMutationSchema, SubmitOperationRequestSchema, TargetWorkspaceInputSchema, ToolCallState, WorkspaceKind, type Event } from "@joko/contracts";
+  SetWorkspaceTrustMutationSchema, SubmitOperationRequestSchema, SubmitOperationResponseSchema, TargetWorkspaceInputSchema, ToolCallState, WorkspaceKind, type Event } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
 import { JokoError } from "@joko/core";
 import { expect, it, vi } from "vitest";
@@ -1344,6 +1344,7 @@ mountedIt("retries the exact known pre-dispatch SSH Codex input after opening th
     return OrchestratorE2eFixture.start({ rootDirectory: root, webDirectory: resolve(process.env.JOKO_MOUNTED_WEB_DIR!),
       backendFactories: [{ instanceId: backendId, adapterKind: "codex", displayName: "SSH Codex queue fixture", create: ({ generation }) => {
         const adapter = createCodexAdapter({ id: backendId, instanceGeneration: generation, host: local,
+          resolveNativeSkills: async () => [],
           remoteRuntimes: { resolve: async () => ({ host: remote, workspaceRoot: remoteRoot, profileKey: "a".repeat(64),
             executionDomain: "ssh-codex-queue-retry-fixture", assertCurrent: () => undefined }), shutdown: () => remote.shutdown() } });
         const getResources = adapter.getResources.bind(adapter);
@@ -1364,13 +1365,18 @@ mountedIt("retries the exact known pre-dispatch SSH Codex input after opening th
       workspaceRoot: fixture.workspaceDirectory, trusted: true, managed: false,
       remoteWorkspace: { kind: "ssh", hostTargetId: targetId, hostId: "queue-retry-ssh-host", workspaceRoot: remoteRoot } });
     const { clients, authKey, connectionId } = await fixture.pair("SSH queue Owner");
-    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId,
-      createSessionMutation({ backendId, targetId, displayName: "Original SSH queue task" })));
+    const nativeId = native.seedThread(remoteRoot);
+    const candidate = (await clients.session.discoverNativeSessions({ targetId })).sessions.find(session => session.nativeSessionId === nativeId);
+    if (candidate === undefined) throw new Error("The original SSH Codex thread is missing from native discovery.");
+    const attach = createSessionMutation({ backendId, targetId, displayName: "Original SSH queue task" });
+    if (attach.payload.case !== "createSession") throw new Error("Expected an SSH attach mutation.");
+    attach.payload.value.nativeStart = create(NativeSessionStartSchema, { kind: {
+      case: "attach", value: { opaqueNativeReference: candidate.nativeReference }
+    } });
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId, attach));
     const input = (text: string) => sendInputMutation(sessionId,
       BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), text);
-    const session = fixture.application.store.getSession(sessionId).descriptor;
-    const nativeId = session.binding.nativeSessionId;
-    if (!nativeId) throw new Error("The original SSH Codex task has no native thread.");
+    expect(fixture.application.store.getSession(sessionId).descriptor.binding.nativeSessionId).toBe(nativeId);
     const nativeTurns = () => native.threads.get(nativeId)!.turns;
     const send = (text: string) => submit(clients.operation, connectionId, input(text));
     const first = await send("Finish the original active turn");
@@ -1417,7 +1423,37 @@ mountedIt("retries the exact known pre-dispatch SSH Codex input after opening th
     const row = page.locator(`[data-queue-item-id="${pendingId}"]`);
     await row.getByText(pendingText, { exact: true }).waitFor({ state: "visible" });
     const retry = row.getByRole("button", { name: "Retry", exact: true });
-    await retry.click();
+    const refresh = page.waitForResponse(response => {
+      if (!response.url().endsWith("/joko.v1.EventService/GetSnapshot")) return false;
+      const bytes = response.request().postDataBuffer();
+      if (bytes === null) return false;
+      const scope = fromBinary(GetSnapshotRequestSchema, bytes).scope?.kind;
+      return scope?.case === "session" && scope.value.sessionId === sessionId && scope.value.recentTimelineItems === 0;
+    }, { timeout: 10_000 }).then(async response => response.ok()
+      ? fromBinary(GetSnapshotResponseSchema, await response.body()).snapshot : undefined).catch(() => undefined);
+    const [response] = await Promise.all([page.waitForResponse(response => {
+      if (!response.url().endsWith("/joko.v1.OperationService/SubmitOperation")) return false;
+      const bytes = response.request().postDataBuffer();
+      if (bytes === null) return false;
+      const payload = fromBinary(SubmitOperationRequestSchema, bytes).mutation?.payload;
+      return payload?.case === "retryRun" && payload.value.runId === pendingRunId;
+    }, { timeout: 10_000 }), retry.click()]).catch(async cause => {
+      const feedback = await page.locator(".app-banners").allTextContents();
+      const checked = await refresh;
+      const observed = checked?.queueItems.find(item => item.queueItemId === pendingId);
+      const observedGeneration = checked?.sessions.find(item => item.sessionId === sessionId)?.nativeBinding?.runtimeGeneration;
+      throw new Error(`The cold queue Retry did not submit its original Run. Browser feedback: ${feedback.join(" ")} `
+        + `(original queue version ${original.version?.generation}, fetched queue version ${observed?.version?.generation}, `
+        + `fetched Session version ${observedGeneration}, retryable ${observed?.retryBeforeDispatch})`, { cause });
+    });
+    expect(response.ok(), response.ok() ? undefined : await response.text()).toBe(true);
+    const submitted = fromBinary(SubmitOperationRequestSchema, response.request().postDataBuffer()!);
+    const checked = (await refresh)?.queueItems.find(item => item.queueItemId === pendingId);
+    expect(checked?.retryBeforeDispatch).toBe(true);
+    expect(submitted.mutation?.preconditions).toMatchObject([{ entity: { kind: EntityKind.QUEUE_ITEM, id: pendingId },
+      expectedRevision: original.version!.revision, expectedGeneration: checked?.version?.generation }]);
+    const receipt = fromBinary(SubmitOperationResponseSchema, await response.body()).operation;
+    expect(receipt).toMatchObject({ state: OperationState.SUCCEEDED, result: { payload: { case: "run" } } });
     const child = await waitFor(async () => fixture!.application.store.findRunByParentId(pendingRunId)?.descriptor,
       run => run?.state === "running", "the one continuation of the original failed Run");
     expect(child).toMatchObject({ sessionId, parentRunId: pendingRunId });
