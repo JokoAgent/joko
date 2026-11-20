@@ -132,6 +132,64 @@ it.skipIf(process.platform === "win32")("rejects a tag on the SSH branch push en
   } finally { await f.close(); }
 });
 
+it.skipIf(process.platform === "win32")("publishes a first SSH Review upstream and confirms only the observed remote commit after rejection", { timeout: 30_000 }, async () => {
+  let advanceBeforePush: (() => Promise<void>) | undefined;
+  const f = await fixture({ ssh: true, beforeProcess: async request => {
+    if (request.args[0] === "push") await advanceBeforePush?.();
+  } });
+  const remote = "team/upstream", remoteRef = "refs/heads/review/topic";
+  try {
+    await f.git("init", "--bare", "--quiet", f.outside);
+    await f.git("remote", "add", remote, f.outside);
+    await f.git("config", "branch.main.pushRemote", remote);
+    await f.git("commit", "--allow-empty", "-m", "base");
+    const review = () => f.workspaces.gitReviewDiff("workspace", { source: "unstaged" });
+    const first = await review();
+    expect(first.pushTarget).toEqual({ remote, remoteRef: "refs/heads/main", hasUpstream: false });
+    const push = (fence: { repositoryRevision: string; headRevision?: string }, expectedRemoteOid?: string) =>
+      f.workspaces.pushGitReview("workspace", { remote, remoteRef, expectedRepositoryRevision: fence.repositoryRevision,
+        expectedHeadRevision: fence.headRevision!, ...(expectedRemoteOid === undefined ? {} : { confirmForceWithLease: true, expectedRemoteOid }) });
+    await expect(push(first)).resolves.toMatchObject({ kind: "pushed", headRevision: first.headRevision });
+    expect(await f.git("config", "--get", "branch.main.remote")).toBe(remote);
+    expect(await f.git("config", "--get", "branch.main.merge")).toBe(remoteRef);
+    expect((await review()).pushTarget).toEqual({ remote, remoteRef, hasUpstream: true });
+
+    const publisher = join(f.root, "..", "publisher");
+    await f.git("clone", "--quiet", "--branch", "review/topic", f.outside, publisher);
+    const publishGit = async (...args: string[]) => (await execFileAsync("git", args, { cwd: publisher, encoding: "utf8", windowsHide: true })).stdout.trim();
+    const publish = async (message: string) => {
+      await publishGit("-c", "user.name=Publisher", "-c", "user.email=publisher@example.invalid", "commit", "--allow-empty", "-m", message);
+      await publishGit("push", "origin", `HEAD:${remoteRef}`);
+      return publishGit("rev-parse", "HEAD");
+    };
+    const upstream = await publish("upstream changes");
+    await f.git("commit", "--allow-empty", "-m", "reviewed changes");
+    const reviewed = await review(), local = reviewed.headRevision;
+    const readPublished = () => f.git("--git-dir", f.outside, "rev-parse", remoteRef);
+    const lease = await push(reviewed);
+    expect(lease).toEqual({ kind: "needs_force", remote, remoteRef, remoteOid: upstream, ahead: 1, behind: 1,
+      repositoryRevision: reviewed.repositoryRevision, headRevision: local });
+    expect(await readPublished()).toBe(upstream);
+    expect((await review()).repositoryRevision).toBe(reviewed.repositoryRevision);
+
+    let newer: string | undefined;
+    advanceBeforePush = async () => { newer = await publish("upstream changes during confirmation"); };
+    await expect(push(lease, upstream)).rejects.toMatchObject({ kind: "lease_expired" });
+    advanceBeforePush = undefined;
+    expect(newer).toBeDefined();
+    expect(await readPublished()).toBe(newer);
+
+    const refreshed = await push(await review());
+    expect(refreshed).toMatchObject({ kind: "needs_force", remoteOid: newer, ahead: 1, behind: 2 });
+    await expect(push(refreshed, newer)).resolves.toMatchObject({ kind: "pushed", headRevision: local });
+    expect(await readPublished()).toBe(local);
+    expect(f.requests.filter(request => request.args[0] === "push" && request.args.some(arg => arg.startsWith("--force")))
+      .map(request => request.args.find(arg => arg.startsWith("--force")))).toEqual([
+      `--force-with-lease=${remoteRef}:${upstream}`, `--force-with-lease=${remoteRef}:${newer}`
+    ]);
+  } finally { await f.close(); }
+});
+
 it.skipIf(process.platform === "win32")("keeps an independent paused SSH merge from Review Commit", { timeout: 30_000 }, async () => {
   const f = await fixture({ ssh: true });
   try {
