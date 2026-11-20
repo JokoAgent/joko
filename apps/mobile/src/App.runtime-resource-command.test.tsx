@@ -4,13 +4,14 @@ import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { AuthenticationState, CapabilitySupport, EventCursorSchema, EventIdentitySchema, EventPayloadSchema, EventSchema, InteractionKind, InteractionSchema, InteractionState, McpAppNativeOperation, McpAppNativeServiceOperateResponseSchema, McpAppOperation, McpAppServiceOperateResponseSchema,
   MessageRole, ModelKeySchema, ModelSelectionSchema, ModelSourceKind, NativeMessageIdentitySchema, NativeSessionBindingSchema, PartnerSessionTaskStatus, PiMessageLifecycleKind, PlanReviewDecisionKind, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, QueueItemSchema, QueueItemState,
-  RetryState, RunState, RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema, capabilityNames } from "@joko/contracts";
+  QueueDeliveryMode, RetryState, RunState, RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema, capabilityNames } from "@joko/contracts";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { mobileComposerInput, plainTextMobileComposerDraft, replaceMobileComposerRange, type MobileComposerDraft } from "./mobile-composer-document";
 import type { MobileComposerRichInput } from "./MobileComposerRichInput";
 import type { MobileRuntimeCommandPalette } from "./MobileRuntimeCommandPalette";
 import type { MobileClient, MobileState, MobileTaskSendObserver } from "./mobile-client";
+import type { MobileTaskOutboxRecord } from "./mobile-task-outbox";
 import { mobileMessage } from "./mobile-messages";
 import type { MobilePartnerDirectoryProfile } from "./mobile-partner-directory";
 import type { MobileObjectiveApi } from "./mobile-objective";
@@ -107,6 +108,8 @@ const stopTaskTurn = vi.fn(async (_authorityKey: string, _current: () => boolean
 let stopControl: { authorityKey: string; pending: boolean } | undefined;
 const loadEarlier = vi.fn(async () => undefined);
 const loadNewer = vi.fn(async (_signal: AbortSignal) => {});
+const retryOutbox = vi.fn(async (_id: string) => undefined);
+let retainedOutbox: readonly MobileTaskOutboxRecord[] = [];
 const returnToLatest = vi.fn(() => {
   renderedState = { ...renderedState, window: undefined, windowHasNewer: false, before: undefined, historyEnd: false };
 });
@@ -136,6 +139,7 @@ const client = new Proxy({
   listTaskRuntimeCommands: vi.fn(async () => catalog),
   resolveTaskRuntimeCommandResource: resolveResource,
   taskQueueItems: () => empty, taskRetryableQueueItems: () => empty, taskQueueCapabilities: () => ({}),
+  taskOutboxItems: () => retainedOutbox, retryTaskOutbox: retryOutbox,
   taskStopControl: () => stopControl, stopTaskTurn,
   taskInteractions: () => pendingMobileInteractions(renderedState.detail, renderedState.selectedId), subscribe: () => () => {},
   taskPendingImagePasteCount: () => 0, taskForeground: () => true,
@@ -277,6 +281,7 @@ beforeEach(async () => {
   returnToLatest.mockClear();
   loadEarlier.mockReset().mockResolvedValue(undefined);
   loadNewer.mockReset().mockResolvedValue(undefined);
+  retainedOutbox = []; retryOutbox.mockClear();
   taskMessageActions = undefined;
   writeClipboard.mockClear();
   nativeAppState.currentState = "active";
@@ -303,6 +308,30 @@ async function render(assertPalette = true): Promise<void> {
   await act(async () => {});
   if (assertPalette) { expect(input.editable).toBe(true); expect(input.selection).toEqual({ start: 3, end: 3 }); expect(palette.visible).toBe(true); expect(palette.checkingDraft).toBe(false); }
 }
+
+it("offers the original retained input retry in the latest timeline only after non-admission was confirmed", async () => {
+  sendFollowSourceKey = "owned-task";
+  const original: MobileTaskOutboxRecord = { id: "source-input", operationId: "original-offline-operation",
+    owner: { profileId: "profile", origin: "https://owned.invalid", serverId: "server", connectionId: "connection", deviceId: "device" },
+    sessionId: "session", backendId: "backend", targetId: "target", runtimeGeneration: "7", createdAt: 1000,
+    deliveryMode: QueueDeliveryMode.PROMPT, permissionMode: PermissionMode.ASK, planMode: false,
+    input: plainTextMobileComposerDraft("Original retained input"), storageIds: [], state: "confirming", attempted: true };
+  retainedOutbox = [original];
+  await act(async () => root.render(taskScreen()));
+  const button = (key: "common.retry" | "receipt.check") => [...host.querySelectorAll("button")]
+    .find(item => item.getAttribute("aria-label") === mobileMessage("en", key));
+  expect(button("receipt.check")).toBeDefined();
+  expect(button("common.retry")).toBeUndefined();
+
+  retainedOutbox = [{ ...original, state: "failed", failureKind: "not-admitted" }];
+  await act(async () => root.render(taskScreen()));
+  expect(button("receipt.check")).toBeDefined();
+  const retry = button("common.retry")!;
+  expect(retry.disabled).toBe(false);
+  await act(async () => retry.click());
+  expect(retryOutbox).toHaveBeenCalledExactlyOnceWith(original.id);
+  expect(send).not.toHaveBeenCalled();
+});
 
 it.each(["", "Unsent follow-up"])("mounts the current ordinary stop and keeps any composer draft (%s)", async text => {
   sendFollowSourceKey = "owned-task";
