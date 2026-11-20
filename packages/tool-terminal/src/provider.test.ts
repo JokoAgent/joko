@@ -288,6 +288,59 @@ describe("TerminalProvider", () => {
     } finally { restored.dispose(); await fixture.dispose(); }
   });
 
+  test("restores OSC 8 targets across wrapped history, alternate screen and the next PTY output", async () => {
+    const fixture = await setup();
+    const options = { cols: 12, rows: 4, scrollback: 5000, allowProposedApi: true, logLevel: "off" as const };
+    const restored = new Terminal(options);
+    const docs = "https://example.test/docs?q=one;two";
+    const help = "http://example.test/help";
+    const text = "Docs abcdef你 and more";
+    const open = (uri: string) => `\x1b]8;;${uri}\x1b\\`;
+    const close = "\x1b]8;;\x1b\\";
+    const links = (restored as unknown as { _core: { _oscLinkService: {
+      getLinkData(id: number): { uri: string } | undefined;
+    } } })._core._oscLinkService;
+    const linkedText = (buffer: Terminal["buffer"]["active"], uri: string) => {
+      let value = "";
+      for (let row = 0; row < buffer.length; row++) {
+        const line = buffer.getLine(row)!;
+        for (let column = 0; column < line.length; column++) {
+          const cell = line.getCell(column) as ReturnType<typeof buffer.getNullCell> & {
+            hasExtendedAttrs(): number; extended?: { urlId: number };
+          };
+          const id = cell.hasExtendedAttrs() ? cell.extended?.urlId ?? 0 : 0;
+          if (cell.getWidth() > 0 && links.getLinkData(id)?.uri === uri) value += cell.getChars();
+        }
+      }
+      return value;
+    };
+    try {
+      const descriptor = await fixture.provider.create({ ...fixture.scope, id: "linked-history", cols: options.cols, rows: options.rows });
+      const reference = ref(fixture.scope, descriptor), pty = fixture.ptys[0]!;
+      pty.output(open(docs) + text + close + " plain\r\n1\r\n2\r\n3\r\n4\r\n5");
+      pty.output("\x1b[?1049h\x1b[H" + open(help) + "Help");
+      const stream = fixture.provider.stream({ ...reference, appearance: appearance() });
+      try {
+        const checkpoint = (await stream.next()).value;
+        if (!checkpoint || checkpoint.kind !== "reset") throw new Error("The reopened view did not receive a RESET checkpoint.");
+        await parsed(restored, checkpoint.serialized);
+        expect(restored.buffer.active.type).toBe("alternate");
+        expect(restored.buffer.normal.baseY).toBeGreaterThan(0);
+        expect(restored.buffer.normal.getLine(1)?.isWrapped).toBe(true);
+        expect(linkedText(restored.buffer.normal, docs)).toBe(text);
+        expect(linkedText(restored.buffer.alternate, help)).toBe("Help");
+
+        pty.output(" desk" + close + " text");
+        const delta = (await stream.next()).value;
+        if (!delta || delta.kind !== "output") throw new Error("The reopened view did not receive the next PTY output.");
+        await parsed(restored, delta.data);
+        expect(linkedText(restored.buffer.alternate, help)).toBe("Help desk");
+        expect(linkedText(restored.buffer.normal, docs)).toBe(text);
+        expect(pty.killCalls).toBe(0);
+      } finally { await stream.return!(); }
+    } finally { restored.dispose(); await fixture.dispose(); }
+  });
+
   test.each([undefined, 0])("keeps the normal scrolling margins across RESET for cursor %s", async afterSequence => {
     const fixture = await setup({ maximumOutputFrames: 2 });
     const options = { cols: 20, rows: 6, allowProposedApi: true, logLevel: "off" as const };

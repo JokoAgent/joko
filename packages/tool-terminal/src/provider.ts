@@ -8,6 +8,7 @@ import { spawnTerminalHost } from "./host-pty.js";
 import { TerminalOutputFramer, terminalDisplayOutput } from "./output-framer.js";
 import { discoverTerminalShells, terminalEnvironment } from "./shells.js";
 import { TERMINAL_COLOR_OSC_IDENTIFIERS, TerminalColorState, copyTerminalPalette } from "./terminal-color-state.js";
+import { serializeTerminalScreen } from "./terminal-snapshot-links.js";
 import {
   TerminalError,
   type TerminalPalette,
@@ -650,7 +651,7 @@ export class TerminalProvider {
   }
 
   #serialize(record: TerminalRecord, restoreScrollRegion = true): string {
-    let serialized = record.colors.replayColors() + record.serializer.serialize({ scrollback: this.#scrollbackLines });
+    let serialized = record.colors.replayColors() + serializeTerminalScreen(record.screen, record.serializer, this.#scrollbackLines, restoreScrollRegion);
     const { screen, normalScrollRegion: { top, bottom } } = record;
     const cursor = screen.buffer.active;
     if (restoreScrollRegion && cursor.type === "normal" && (top !== 1 || bottom !== screen.rows) && cursor.cursorX < screen.cols) {
