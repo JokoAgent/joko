@@ -1,10 +1,11 @@
 import { createPrivateKey, createSign, type KeyObject } from "node:crypto";
 import { connect, type ClientHttp2Session, type ClientHttp2Stream, type IncomingHttpHeaders } from "node:http2";
 
-import type {
-  MobilePushDeliveryInput,
-  MobilePushDeliveryResult,
-  MobilePushProviderPort
+import {
+  mobilePushAttentionTitle,
+  type MobilePushDeliveryInput,
+  type MobilePushDeliveryResult,
+  type MobilePushProviderPort
 } from "./mobile-push.js";
 
 const APNS_REQUEST_TIMEOUT_MS = 10_000;
@@ -39,8 +40,11 @@ export class ApnsMobilePushProvider implements MobilePushProviderPort {
     if (this.#key.asymmetricKeyType !== "ec") throw new Error("The APNs private key must be an EC key.");
   }
 
-  async send(input: MobilePushDeliveryInput, signal: AbortSignal): Promise<MobilePushDeliveryResult> {
+  async send(input: MobilePushDeliveryInput, signal: AbortSignal, isCurrent?: () => boolean): Promise<MobilePushDeliveryResult> {
     if (signal.aborted) return { outcome: "unknown", code: "APNS_ABORTED_UNKNOWN" };
+    if (input.environment === "fcm" || isCurrent?.() === false) {
+      return { outcome: "failed", code: "PUSH_AUTHORITY_CHANGED" };
+    }
     if (input.collapseId !== undefined && !/^[0-9a-f]{32}$/u.test(input.collapseId)) {
       return { outcome: "failed", code: "APNS_COLLAPSE_ID_INVALID" };
     }
@@ -143,7 +147,7 @@ export class ApnsMobilePushProvider implements MobilePushProviderPort {
 }
 
 export function buildApnsMobilePushPayload(input: MobilePushDeliveryInput): Buffer {
-  const status = localizedAttentionTitle(input.locale, input.kind);
+  const status = mobilePushAttentionTitle(input);
   return Buffer.from(JSON.stringify({
     aps: {
       alert: { title: input.title ?? status, ...(input.title === undefined ? {} : { body: input.body ?? status }) },
@@ -151,23 +155,6 @@ export function buildApnsMobilePushPayload(input: MobilePushDeliveryInput): Buff
     },
     intent: input.intent
   }), "utf8");
-}
-
-function localizedAttentionTitle(
-  locale: MobilePushDeliveryInput["locale"],
-  kind: MobilePushDeliveryInput["kind"]
-): string {
-  const titles: Readonly<Record<MobilePushDeliveryInput["locale"], Readonly<Record<
-    MobilePushDeliveryInput["kind"],
-    string
-  >>>> = {
-    en: { done: "Task finished", awaiting: "Task needs your reply", error: "Task needs attention" },
-    "zh-CN": { done: "任务已完成", awaiting: "任务需要你的回复", error: "任务需要处理" },
-    "zh-TW": { done: "任務已完成", awaiting: "任務需要你的回覆", error: "任務需要處理" },
-    ja: { done: "タスクが完了しました", awaiting: "タスクに返信が必要です", error: "タスクの確認が必要です" },
-    ko: { done: "작업이 완료되었습니다", awaiting: "작업에 답변이 필요합니다", error: "작업을 확인해야 합니다" }
-  };
-  return titles[locale][kind];
 }
 
 export function classifyApnsResponse(status: number, reason: string | undefined): MobilePushDeliveryResult {

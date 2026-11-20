@@ -10,8 +10,8 @@ const en = {
   "settings.notifications.syncing": "Registering this phone…",
   "settings.notifications.registered": "On · registered for the current Joko node",
   "settings.notifications.permissionDenied": "System notification permission is not granted.",
-  "settings.notifications.unsupportedPlatform": "Task notifications are not supported on Android in this release.",
-  "settings.notifications.unsupportedNode": "The current Joko node has no APNs provider configured.",
+  "settings.notifications.unsupportedPlatform": "This Android build needs Firebase configuration for task notifications.",
+  "settings.notifications.unsupportedNode": "The current Joko node needs a push provider for this phone.",
   "settings.notifications.error": "Notification registration could not be synchronized. Joko will retry on reconnect or foreground.",
   "settings.notifications.retirement": "A previous registration is still pending removal. Joko will retry before registering another profile."
 } as const;
@@ -30,8 +30,8 @@ export const mobilePushMessages = {
     "settings.notifications.syncing": "正在注册这部手机…",
     "settings.notifications.registered": "已开启 · 已为当前 Joko 节点注册",
     "settings.notifications.permissionDenied": "尚未授予系统通知权限。",
-    "settings.notifications.unsupportedPlatform": "此版本暂不支持 Android 任务通知。",
-    "settings.notifications.unsupportedNode": "当前 Joko 节点尚未配置 APNs 提供方。",
+    "settings.notifications.unsupportedPlatform": "此 Android 安装包需要 Firebase 配置才能接收任务通知。",
+    "settings.notifications.unsupportedNode": "当前 Joko 节点需要为这部手机配置推送提供方。",
     "settings.notifications.error": "无法同步通知注册；Joko 会在重连或回到前台时重试。",
     "settings.notifications.retirement": "上一项注册仍待移除；移除前不会为其他配置注册，Joko 会继续重试。"
   },
@@ -47,8 +47,8 @@ export const mobilePushMessages = {
     "settings.notifications.syncing": "正在註冊這部手機…",
     "settings.notifications.registered": "已開啟 · 已為目前的 Joko 節點註冊",
     "settings.notifications.permissionDenied": "尚未授予系統通知權限。",
-    "settings.notifications.unsupportedPlatform": "此版本暫不支援 Android 任務通知。",
-    "settings.notifications.unsupportedNode": "目前的 Joko 節點尚未設定 APNs 提供者。",
+    "settings.notifications.unsupportedPlatform": "此 Android 安裝版本需要 Firebase 設定才能接收任務通知。",
+    "settings.notifications.unsupportedNode": "目前的 Joko 節點需要為這部手機設定推播提供者。",
     "settings.notifications.error": "無法同步通知註冊；Joko 會在重新連線或回到前景時重試。",
     "settings.notifications.retirement": "上一項註冊仍待移除；移除前不會為其他設定檔註冊，Joko 會繼續重試。"
   },
@@ -64,8 +64,8 @@ export const mobilePushMessages = {
     "settings.notifications.syncing": "この端末を登録中…",
     "settings.notifications.registered": "オン · 現在の Joko ノードに登録済み",
     "settings.notifications.permissionDenied": "システムの通知権限が許可されていません。",
-    "settings.notifications.unsupportedPlatform": "このリリースでは Android のタスク通知に対応していません。",
-    "settings.notifications.unsupportedNode": "現在の Joko ノードには APNs プロバイダーが設定されていません。",
+    "settings.notifications.unsupportedPlatform": "この Android ビルドでタスク通知を受け取るには Firebase の設定が必要です。",
+    "settings.notifications.unsupportedNode": "現在の Joko ノードにこの端末用のプッシュプロバイダーを設定してください。",
     "settings.notifications.error": "通知登録を同期できませんでした。再接続時またはフォアグラウンド復帰時に再試行します。",
     "settings.notifications.retirement": "以前の登録の削除が保留中です。削除されるまで別のプロファイルは登録せず、再試行します。"
   },
@@ -81,8 +81,8 @@ export const mobilePushMessages = {
     "settings.notifications.syncing": "이 휴대전화 등록 중…",
     "settings.notifications.registered": "켜짐 · 현재 Joko 노드에 등록됨",
     "settings.notifications.permissionDenied": "시스템 알림 권한이 허용되지 않았습니다.",
-    "settings.notifications.unsupportedPlatform": "이 릴리스에서는 Android 작업 알림을 지원하지 않습니다.",
-    "settings.notifications.unsupportedNode": "현재 Joko 노드에 APNs 공급자가 설정되지 않았습니다.",
+    "settings.notifications.unsupportedPlatform": "이 Android 빌드에서 작업 알림을 받으려면 Firebase 구성이 필요합니다.",
+    "settings.notifications.unsupportedNode": "현재 Joko 노드에 이 휴대전화의 푸시 공급자를 설정해야 합니다.",
     "settings.notifications.error": "알림 등록을 동기화하지 못했습니다. 다시 연결하거나 전경으로 돌아오면 재시도합니다.",
     "settings.notifications.retirement": "이전 등록 삭제가 보류 중입니다. 삭제 전에는 다른 프로필을 등록하지 않고 계속 재시도합니다."
   }

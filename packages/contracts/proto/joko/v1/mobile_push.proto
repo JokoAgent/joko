@@ -11,12 +11,14 @@ import "joko/v1/common.proto";
 enum MobilePushProvider {
   MOBILE_PUSH_PROVIDER_UNSPECIFIED = 0;
   MOBILE_PUSH_PROVIDER_APNS = 1;
+  MOBILE_PUSH_PROVIDER_FCM = 2;
 }
 
 enum MobilePushEnvironment {
   MOBILE_PUSH_ENVIRONMENT_UNSPECIFIED = 0;
   MOBILE_PUSH_ENVIRONMENT_APNS_SANDBOX = 1;
   MOBILE_PUSH_ENVIRONMENT_APNS_PRODUCTION = 2;
+  MOBILE_PUSH_ENVIRONMENT_FCM = 3;
 }
 
 enum MobilePushLocale {
@@ -57,7 +59,10 @@ message MobilePushRevocationTicket {
   string secret = 3;
 }
 
-message GetMobilePushCapabilityRequest {}
+message GetMobilePushCapabilityRequest {
+  // Unspecified selects APNs for existing iOS callers.
+  MobilePushProvider provider = 1;
+}
 
 message GetMobilePushCapabilityResponse {
   MobilePushCapability capability = 1;

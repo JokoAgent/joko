@@ -1,3 +1,4 @@
+import { generateKeyPairSync, verify } from "node:crypto";
 import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -10,6 +11,7 @@ import { buildApnsMobilePushPayload } from "./apns-mobile-push-provider.js";
 import type { OrchestratorApplication } from "./application.js";
 import { createConnectServices } from "./connect-services.js";
 import { CredentialVault } from "./credential-vault.js";
+import { FcmMobilePushProvider } from "./fcm-mobile-push-provider.js";
 import {
   MobilePushCoordinator,
   type MobilePushDeliveryInput,
@@ -23,6 +25,76 @@ afterEach(async () => {
 });
 
 describe("mobile push Orchestrator boundary", () => {
+  it("dispatches Android task attention through FCM and keeps a newer authorized registration after a late receipt", async () => {
+    const fixture = await createFixture();
+    const { store } = fixture;
+    const android = store.createConnection({ id: "android-connection", name: "Android phone", authKeyDigest: "android-digest",
+      device: { defaultName: "Android phone", kind: "mobile", platform: "android", appVersion: "1.0.0" } });
+    const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const oauth = "https://oauth2.googleapis.com/token";
+    const project = "owned-fixture-project";
+    const sends: unknown[] = [];
+    let resolveFirst!: (response: Response) => void;
+    const firstReply = new Promise<Response>(resolve => { resolveFirst = resolve; });
+    const transport: typeof fetch = async (url, options) => {
+      expect(options?.redirect).toBe("error");
+      if (String(url) === oauth) {
+        expect(options?.body).toBeInstanceOf(URLSearchParams);
+        const assertion = (options!.body as URLSearchParams).get("assertion")!;
+        const [header, claims, signature] = assertion.split(".") as [string, string, string];
+        expect(verify("RSA-SHA256", Buffer.from(`${header}.${claims}`), publicKey, Buffer.from(signature, "base64url"))).toBe(true);
+        expect(JSON.parse(Buffer.from(claims, "base64url").toString("utf8"))).toMatchObject({
+          aud: oauth, scope: "https://www.googleapis.com/auth/firebase.messaging"
+        });
+        return Response.json({ access_token: "owned-access-token", token_type: "Bearer", expires_in: 3600 });
+      }
+      expect(url).toBe(`https://fcm.googleapis.com/v1/projects/${project}/messages:send`);
+      expect(new Headers(options?.headers).get("authorization")).toBe("Bearer owned-access-token");
+      sends.push(JSON.parse(String(options?.body)));
+      return sends.length === 1 ? firstReply : Response.json({ name: `projects/${project}/messages/fixture-accepted` });
+    };
+    const fcmProvider = new FcmMobilePushProvider(JSON.stringify({
+      type: "service_account", project_id: project, client_email: "fixture@owned-fixture-project.iam.gserviceaccount.com",
+      private_key_id: "f".repeat(40), private_key: privateKey.export({ type: "pkcs8", format: "pem" })
+    }), { fetch: transport, now: () => 1_000 });
+    const coordinator = new MobilePushCoordinator({ store, vault: fixture.vault, serverId: "server-1", now: () => 1_000, fcmProvider });
+    cleanups.push(() => coordinator.close());
+    const services = createConnectServices(stubApplication(store, { authenticate: () => android }, coordinator));
+    const rpc = services.connection;
+    const provider = contract.MobilePushProvider.FCM;
+    expect(await invoke(rpc.getMobilePushCapability, { provider }, undefined)).toMatchObject({ capability: { supported: true, provider } });
+    const registration = {
+      ...registrationRequest({ connectionId: android.id, deviceId: android.deviceId, expectedDeviceRevision: store.getDevice(android.deviceId).revision }),
+      provider, environment: contract.MobilePushEnvironment.FCM, previewEnabled: true
+    };
+    const register = (deviceToken: string) => invoke(rpc.registerMobilePush, { ...registration, deviceToken }, "Bearer fixture");
+    expect(await register("first-android-token")).toMatchObject({ registration: { provider, previewEnabled: false } });
+    const complete = (id: string) => {
+      store.createRun({ id, sessionId: "session-1", source: "user", state: "running", createdAt: 1_000 });
+      store.updateRunState({ runId: id, state: "completed", traceId: id });
+    };
+    coordinator.start();
+    complete("initial-fcm-task");
+    try {
+      await vi.waitFor(() => expect(sends).toHaveLength(1));
+      expect(sends[0]).toMatchObject({ message: { token: "first-android-token", notification: { title: "Task finished" },
+        data: { intent: "joko://task/session-1?server=server-1" }, android: { notification: { channel_id: "joko-task-attention" } } } });
+      expect(await register("rotated-android-token")).toMatchObject({ registration: { provider } });
+    } finally {
+      resolveFirst(Response.json({ error: { code: 404, status: "NOT_FOUND",
+        details: [{ "@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError", errorCode: "UNREGISTERED" }] } }, { status: 404 }));
+    }
+    await vi.waitFor(() => expect(store.listMobilePushDeliveries()).toContainEqual(expect.objectContaining({
+      status: "unknown", outcomeCode: "REGISTRATION_CHANGED"
+    })));
+    complete("later-fcm-task");
+    await vi.waitFor(() => expect(store.listMobilePushDeliveries()).toContainEqual(expect.objectContaining({
+      status: "delivered", outcomeCode: "FCM_ACCEPTED"
+    })));
+    expect(sends).toHaveLength(2);
+    expect(sends[1]).toMatchObject({ message: { token: "rotated-android-token" } });
+  });
+
   it("sends only an opted-in current completion preview for the exact registration", async () => {
     const fixture = await createFixture();
     const { store } = fixture;

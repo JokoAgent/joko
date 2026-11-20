@@ -1,6 +1,4 @@
-/** The exact expo-notifications surface used by Joko. Keeping it type-only
- * lets the Android platform replacement compile without importing the native
- * notification module at runtime. */
+/** The shared native notification surface used by the device controller. */
 export type NativeNotificationsApi = Pick<
   typeof import("expo-notifications"),
   | "setNotificationHandler"

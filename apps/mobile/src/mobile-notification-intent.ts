@@ -2,8 +2,7 @@ import { parseMobileNativeIntent } from "./mobile-native-intent";
 
 const RESPONSE_IDENTITY_MAXIMUM_CHARACTERS = 256;
 
-/** APNs payloads are untrusted. Only public portable task or group URLs emitted
- * by the Joko node is allowed back into the existing native-intent pipeline. */
+/** Only public portable task or group URLs enter the native-intent pipeline. */
 export function parseMobileNotificationResponseIntent(response: unknown): string | undefined {
   if (!plainObject(response)) return undefined;
   const notification = response.notification;
@@ -12,10 +11,10 @@ export function parseMobileNotificationResponseIntent(response: unknown): string
   const contentIntent = plainObject(request.content)
     ? notificationPayloadIntent(request.content.data)
     : undefined;
-  const triggerIntent = plainObject(request.trigger)
-    ? notificationPayloadIntent(request.trigger.payload)
-    : undefined;
-  return contentIntent ?? triggerIntent;
+  const trigger = request.trigger;
+  if (contentIntent !== undefined || !plainObject(trigger)) return contentIntent;
+  const remoteMessage = trigger.type === "push" && plainObject(trigger.remoteMessage) ? trigger.remoteMessage : undefined;
+  return notificationPayloadIntent(trigger.payload) ?? notificationPayloadIntent(remoteMessage?.data);
 }
 
 export function mobileNotificationResponseKey(response: unknown, intent: string): string {

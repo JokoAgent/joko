@@ -3903,7 +3903,7 @@ export class MobileClient {
     const credential = this.#credential;
     const node = this.#state.node;
     const owner = this.#state.owner;
-    if (!this.#foreground || this.platform !== "ios" || this.#state.status !== "connected" || !credential || !node || !owner
+    if (!this.#foreground || (this.platform !== "ios" && this.platform !== "android") || this.#state.status !== "connected" || !credential || !node || !owner
       || this.#activeProfileId !== credential.profileId || this.#state.activeProfileId !== credential.profileId
       || this.#state.origin !== credential.origin || node.serverId !== credential.serverId
       || owner.server?.serverId !== credential.serverId || owner.server.apiVersion !== node.apiVersion) return undefined;
@@ -3915,7 +3915,7 @@ export class MobileClient {
     const revision = device.version?.revision?.value ?? 0n;
     if (connection.connectionProfileId !== credential.profileId || connection.deviceId !== credential.deviceId
       || connection.state !== ConnectionState.CONNECTED || device.kind !== DeviceKind.MOBILE || device.revoked
-      || device.platform.trim().toLocaleLowerCase("en-US") !== "ios"
+      || device.platform.trim().toLocaleLowerCase("en-US") !== this.platform
       || !device.connectionIds.includes(credential.connectionId) || revision < 1n) return undefined;
     const endpointPublicKey = credential.endpointPublicKey ?? trustedEndpointPublicKey(credential.origin);
     return Object.freeze({
@@ -3943,7 +3943,9 @@ export class MobileClient {
     signal?: AbortSignal
   ): Promise<MobilePushCapabilityResult> {
     if (this.mobilePushAuthority()?.key !== authority.key) throw new Error("The mobile push owner changed.");
-    const result = await this.network.getMobilePushCapability(authority.origin, signal);
+    const result = this.platform === "android"
+      ? await this.network.getMobilePushCapability(authority.origin, signal, "android")
+      : await this.network.getMobilePushCapability(authority.origin, signal);
     if (this.mobilePushAuthority()?.key !== authority.key) throw new Error("The mobile push owner changed.");
     return result;
   }
@@ -3955,6 +3957,7 @@ export class MobileClient {
   ): Promise<MobilePushRegistrationResult> {
     const current = this.mobilePushAuthority();
     if (current?.key !== authority.key) throw new Error("The mobile push owner changed.");
+    if ((this.platform === "android") !== (input.environment === "fcm")) throw new Error("The mobile push provider does not match this phone.");
     const credential = this.#ready();
     if (credential.profileId !== authority.profileId || credential.origin !== authority.origin
       || credential.serverId !== authority.serverId || credential.connectionId !== authority.connectionId

@@ -7,7 +7,7 @@
   "expo": {
     "autolinking": {
       "android": {
-        "exclude": ["expo-notifications", "react-native-screens"],
+        "exclude": ["react-native-screens"],
         "buildFromSource": ["expo-file-system", "expo-image"]
       },
       "ios": {

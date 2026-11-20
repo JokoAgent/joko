@@ -201,10 +201,10 @@ CREATE TABLE mobile_push_registrations (
         ),
         connection_id TEXT NOT NULL UNIQUE REFERENCES connections(id) ON DELETE CASCADE,
         device_id TEXT NOT NULL UNIQUE REFERENCES devices(id) ON DELETE CASCADE,
-        provider TEXT NOT NULL CHECK (provider = 'apns'),
-        environment TEXT NOT NULL CHECK (environment IN ('apns_sandbox', 'apns_production')),
+        provider TEXT NOT NULL,
+        environment TEXT NOT NULL,
         locale TEXT NOT NULL CHECK (locale IN ('en', 'zh-CN', 'zh-TW', 'ja', 'ko')),
-        token_digest TEXT NOT NULL UNIQUE CHECK (
+        token_digest TEXT NOT NULL CHECK (
           token_digest GLOB 'sha256:*' AND length(token_digest) = 71
         ),
         token_nonce TEXT NOT NULL CHECK (length(token_nonce) BETWEEN 16 AND 64),
@@ -221,7 +221,10 @@ CREATE TABLE mobile_push_registrations (
         expires_at INTEGER NOT NULL CHECK (expires_at >= 0),
         created_at INTEGER NOT NULL CHECK (created_at >= 0),
         updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
-        revision INTEGER NOT NULL CHECK (revision >= 1)
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        UNIQUE(provider, token_digest),
+        CHECK ((provider = 'apns' AND environment IN ('apns_sandbox', 'apns_production'))
+          OR (provider = 'fcm' AND environment = 'fcm'))
       ) STRICT;
 
 CREATE TABLE mobile_push_deliveries (

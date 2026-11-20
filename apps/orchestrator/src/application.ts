@@ -149,6 +149,7 @@ import { McpAppsManager } from "./mcp-apps/manager.js";
 import { McpAppSurfaces } from "./mcp-apps/surface.js";
 import { TaskSharingHome } from "./task-sharing-home.js";
 import { ApnsMobilePushProvider } from "./apns-mobile-push-provider.js";
+import { FcmMobilePushProvider } from "./fcm-mobile-push-provider.js";
 import {
   MobilePushCoordinator,
   type MobilePushProviderPort
@@ -919,14 +920,20 @@ export async function createOrchestratorApplication(
     }
   });
   await contactSync.initialize().catch(() => undefined);
-  const mobilePushProvider = dependencies.mobilePushProvider ?? (config.mobilePush === undefined
+  const apns = config.mobilePush?.apns;
+  const fcm = config.mobilePush?.fcm;
+  const mobilePushProvider = dependencies.mobilePushProvider ?? (apns === undefined
     ? undefined
     : new ApnsMobilePushProvider({
-        teamId: config.mobilePush.apns.teamId,
-        keyId: config.mobilePush.apns.keyId,
-        privateKeyPem: await readFile(config.mobilePush.apns.privateKeyPath, "utf8"),
-        topic: config.mobilePush.apns.topic
+        teamId: apns.teamId,
+        keyId: apns.keyId,
+        privateKeyPem: await readFile(apns.privateKeyPath, "utf8"),
+        topic: apns.topic
       }));
+  const fcmProvider = fcm === undefined ? undefined
+    : new FcmMobilePushProvider(await readFile(fcm.serviceAccountPath, "utf8").catch(() => {
+      throw new Error("The configured FCM service account is unreadable.");
+    }));
   const credentials = new CredentialManager({
     vault: credentialVault,
     storagePath: join(config.dataDirectory, "credentials", "records.json")
@@ -937,7 +944,8 @@ export async function createOrchestratorApplication(
     vault: credentialVault,
     serverId,
     redactText: value => credentials.redactText(value),
-    ...(mobilePushProvider === undefined ? {} : { provider: mobilePushProvider })
+    ...(mobilePushProvider === undefined ? {} : { provider: mobilePushProvider }),
+    ...(fcmProvider === undefined ? {} : { fcmProvider })
   });
   const serverAccess = new ServerAccessManager({ config, serverId, store, credentials, connections });
   reserveLinkspanTurnCredentials(store, credentials);

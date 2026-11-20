@@ -103,7 +103,8 @@ import {
   mobileVoicePreferences,
   mobileUpdates
 } from "./storage";
-import nativeNotifications from "./native-notifications";
+import nativeNotifications, { prepareAndroidTaskNotificationChannel } from "./native-notifications";
+import { mobilePushMessages } from "./mobile-push-messages";
 import { useMobileHomeViewPreference } from "./mobile-home-view-preference";
 import { MobilePushController } from "./mobile-push-controller";
 import {
@@ -438,7 +439,10 @@ const partnerGroupRoster = new MobilePartnerGroupRoster(mobilePlainStorage,
   (profileId, signal, sourceKey) => client.partnerGroupRosterSourceTransport(profileId, signal, sourceKey));
 const mobilePush = new MobilePushController({
   platform: Platform.OS,
-  environment: __DEV__ ? "sandbox" : "production",
+  environment: Platform.OS === "android" ? "fcm" : __DEV__ ? "sandbox" : "production",
+  ...(Platform.OS === "android" && Constants.expoConfig?.extra?.["jokoAndroidPushConfigured"] === true
+    ? { prepareAndroidChannel: (locale) => prepareAndroidTaskNotificationChannel(mobilePushMessages[locale]["settings.notifications.title"]) }
+    : {}),
   locale: mobileLocalePreferences.snapshot.effectiveLocale,
   client,
   deviceStore: mobilePushDeviceStore,

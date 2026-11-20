@@ -12,7 +12,7 @@ export interface MobilePushSecureStorage {
   setItem(key: string, value: string): Promise<void>;
 }
 
-export type MobilePushStoredEnvironment = "sandbox" | "production";
+export type MobilePushStoredEnvironment = "sandbox" | "production" | "fcm";
 export type MobilePushStoredLocale = "en" | "zh-CN" | "zh-TW" | "ja" | "ko";
 
 export type MobilePushRetirementRoute = { readonly kind: "direct" } | {
@@ -170,7 +170,7 @@ function parseRegistration(value: unknown): MobilePushStoredRegistration {
   const expiresAt = typeof value.expiresAt === "number" ? value.expiresAt : -1;
   if (!profileId || !serverId || !connectionId || !deviceId || !registrationId || !origin
     || !/^[A-Za-z0-9_-]{43}$/u.test(secret) || !/^[0-9a-f]{64}$/u.test(tokenDigest)
-    || !(value.environment === "sandbox" || value.environment === "production")
+    || !(value.environment === "sandbox" || value.environment === "production" || value.environment === "fcm")
     || !(value.locale === "en" || value.locale === "zh-CN" || value.locale === "zh-TW"
       || value.locale === "ja" || value.locale === "ko")
     || typeof value.confirmed !== "boolean" || !Number.isSafeInteger(expiresAt) || expiresAt < 0) {

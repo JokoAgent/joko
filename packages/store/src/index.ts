@@ -2,6 +2,7 @@ export * from "./errors.js";
 export * from "./side-chat-history.js";
 export * from "./device-authorization-store.js";
 export * from "./task-share-store.js";
+export { mobilePushPlatform, mobilePushProviderForEnvironment } from "./types.js";
 export * from "./hosted-agent-store.js";
 export * from "./session-runtime-handoff-store.js";
 export type { PartnerLearningTurnRecord } from "./partner-learning-shape.js";

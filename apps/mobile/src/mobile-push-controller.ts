@@ -67,6 +67,7 @@ export interface MobilePushControllerOptions {
   readonly client: MobilePushClientPort;
   readonly deviceStore: MobilePushDeviceStore;
   readonly notifications: NativeNotificationsApi;
+  readonly prepareAndroidChannel?: (locale: MobilePushStoredLocale) => Promise<void>;
   readonly digest: (value: string) => Promise<string>;
   readonly registrationId: () => string | Promise<string>;
   readonly revocationSecret: () => string | Promise<string>;
@@ -88,6 +89,8 @@ export class MobilePushController {
   readonly #notifications: NativeNotificationsApi;
   readonly #now: () => number;
   readonly #platform: string;
+  readonly #prepareAndroidChannel: MobilePushControllerOptions["prepareAndroidChannel"];
+  readonly #supported: boolean;
   readonly #registrationId: () => string | Promise<string>;
   readonly #revocationSecret: () => string | Promise<string>;
   #activeController: AbortController | undefined;
@@ -113,6 +116,9 @@ export class MobilePushController {
   constructor(options: MobilePushControllerOptions) {
     this.#platform = options.platform;
     this.#environment = options.environment;
+    this.#prepareAndroidChannel = options.prepareAndroidChannel;
+    this.#supported = (options.platform === "ios" && options.environment !== "fcm")
+      || (options.platform === "android" && options.environment === "fcm" && options.prepareAndroidChannel !== undefined);
     this.#locale = options.locale;
     this.#client = options.client;
     this.#deviceStore = options.deviceStore;
@@ -124,7 +130,7 @@ export class MobilePushController {
     this.#state = Object.freeze({
       enabled: false,
       saving: false,
-      status: this.#platform === "ios" ? "loading" : "unsupported-platform"
+      status: this.#supported ? "loading" : "unsupported-platform"
     });
   }
 
@@ -144,7 +150,7 @@ export class MobilePushController {
     this.#foreground = foreground;
     this.#interactive = foreground;
     this.#generation += 1;
-    if (this.#platform !== "ios") {
+    if (!this.#supported) {
       this.#publish({ enabled: false, saving: false, status: "unsupported-platform" });
       return;
     }
@@ -169,7 +175,7 @@ export class MobilePushController {
       if (!this.#started) return;
       this.#hydrated = true;
       this.#enabled = snapshot.enabled;
-      this.#previewEnabled = snapshot.previewEnabled;
+      this.#previewEnabled = this.#platform === "ios" && snapshot.previewEnabled;
       this.#publish({
         enabled: this.#enabled,
         saving: false,
@@ -234,8 +240,8 @@ export class MobilePushController {
 
   setEnabled(enabled: boolean): Promise<void> {
     return this.#enqueue(async () => {
-      if (this.#platform !== "ios" || !this.#hydrated) {
-        if (this.#platform !== "ios") {
+      if (!this.#supported || !this.#hydrated) {
+        if (!this.#supported) {
           this.#publish({ enabled: false, saving: false, status: "unsupported-platform" });
           return;
         }
@@ -247,6 +253,7 @@ export class MobilePushController {
       }
       this.#publish({ ...this.#state, saving: true, error: undefined });
       if (enabled) {
+        await this.#prepareAndroidChannel?.(this.#locale);
         let permission = await this.#notifications.getPermissionsAsync();
         if (!permission.granted) permission = await this.#notifications.requestPermissionsAsync();
         if (!permission.granted) {
@@ -311,7 +318,7 @@ export class MobilePushController {
   }
 
   async #reconcileNow(): Promise<void> {
-    if (!this.#started || !this.#foreground || !this.#hydrated || this.#platform !== "ios") return;
+    if (!this.#started || !this.#foreground || !this.#hydrated || !this.#supported) return;
     const scope = this.#client.mobilePushLifecycleScope();
     if (!scope.ready) {
       this.#publish({ enabled: this.#enabled, saving: this.#state.saving, status: this.#enabled ? "waiting" : "disabled" });
@@ -362,6 +369,8 @@ export class MobilePushController {
         this.#publish({ enabled: true, saving: this.#state.saving, status: "unsupported-node" });
         return;
       }
+      await this.#prepareAndroidChannel?.(this.#locale);
+      if (!current()) return;
       const permission = await this.#notifications.getPermissionsAsync();
       if (!current()) return;
       if (!permission.granted) {
@@ -370,7 +379,7 @@ export class MobilePushController {
       }
       const nativeToken = await this.#notifications.getDevicePushTokenAsync();
       if (!current()) return;
-      const token = normalizedToken(nativeToken.data);
+      const token = nativeToken.type === this.#platform ? normalizedToken(nativeToken.data) : undefined;
       if (!token) {
         this.#publish({ enabled: true, saving: this.#state.saving, status: "error", error: "token" });
         return;
@@ -379,7 +388,7 @@ export class MobilePushController {
       if (!current()) return;
       if (!/^[0-9a-f]{64}$/u.test(tokenDigest)) throw new Error("The notification token digest is invalid.");
       let record = this.#deviceStore.snapshot.registrations.find((item) => recordMatchesAuthority(item, authority));
-      // A live node can remove a confirmed registration after a terminal APNs response.
+      // A live node can remove a confirmed registration after a terminal provider response.
       if (!this.#serverConfirmationRequired && record?.confirmed && record.retirementRoute
         && record.environment === this.#environment && record.locale === this.#locale
         && (record.previewEnabled === true) === this.#previewEnabled
@@ -467,7 +476,7 @@ export class MobilePushController {
   }
 
   async #readLastResponse(): Promise<void> {
-    if (!this.#started || !this.#interactive || this.#platform !== "ios") return;
+    if (!this.#started || !this.#interactive || !this.#supported) return;
     try {
       const response = await this.#notifications.getLastNotificationResponseAsync();
       if (response) this.#consumeResponse(response);

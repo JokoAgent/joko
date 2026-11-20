@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
 
 import { redactSecrets } from "@joko/core";
-import { TaskShareStore } from "@joko/store";
+import { mobilePushProviderForEnvironment, TaskShareStore } from "@joko/store";
 import type {
   ClaimedMobilePushDelivery,
   MobilePushEnvironment,
   MobilePushLocale,
+  MobilePushProvider,
   MobilePushRegistrationRecord,
   OperationalStore
 } from "@joko/store";
@@ -37,7 +38,7 @@ export type MobilePushDeliveryResult =
 /** Provider credentials stay inside this node-owned port. Neither callers nor
  * durable product data can inspect or select them. */
 export interface MobilePushProviderPort {
-  send(input: MobilePushDeliveryInput, signal: AbortSignal): Promise<MobilePushDeliveryResult>;
+  send(input: MobilePushDeliveryInput, signal: AbortSignal, isCurrent?: () => boolean): Promise<MobilePushDeliveryResult>;
 }
 
 export interface MobilePushCoordinatorOptions {
@@ -45,6 +46,7 @@ export interface MobilePushCoordinatorOptions {
   readonly vault: CredentialVault;
   readonly serverId: string;
   readonly provider?: MobilePushProviderPort;
+  readonly fcmProvider?: MobilePushProviderPort;
   readonly now?: () => number;
   readonly redactText?: (value: string) => string;
 }
@@ -69,7 +71,8 @@ export interface RegisteredMobilePush {
 
 export class MobilePushCoordinator {
   readonly #now: () => number;
-  readonly #provider: MobilePushProviderPort | undefined;
+  readonly #providers: Readonly<Partial<Record<MobilePushProvider, MobilePushProviderPort>>>;
+  readonly #configuredProviders: readonly MobilePushProvider[];
   readonly #redactText: (value: string) => string;
   readonly #serverId: string;
   readonly #store: OperationalStore;
@@ -86,21 +89,26 @@ export class MobilePushCoordinator {
     this.#store = options.store;
     this.#vault = options.vault;
     this.#serverId = boundedIdentity(options.serverId, "Mobile push Server ID");
-    this.#provider = options.provider;
+    this.#providers = {
+      ...(options.provider === undefined ? {} : { apns: options.provider }),
+      ...(options.fcmProvider === undefined ? {} : { fcm: options.fcmProvider })
+    };
+    this.#configuredProviders = Object.keys(this.#providers) as MobilePushProvider[];
     this.#redactText = value => redactSecrets(options.redactText?.(value) ?? value);
     this.#now = options.now ?? Date.now;
   }
 
   get serverId(): string { return this.#serverId; }
 
-  capability(): { readonly supported: boolean; readonly unavailableReasonCode?: string } {
-    return this.#provider === undefined
-      ? { supported: false, unavailableReasonCode: "APNS_NOT_CONFIGURED" }
+  capability(provider: MobilePushProvider = "apns"): { readonly supported: boolean; readonly unavailableReasonCode?: string } {
+    return this.#providers[provider] === undefined
+      ? { supported: false, unavailableReasonCode: mobilePushUnconfiguredReason(provider) }
       : { supported: true };
   }
 
   register(input: RegisterMobilePushInput): RegisteredMobilePush {
-    if (this.#provider === undefined) throw new MobilePushUnavailableError("APNS_NOT_CONFIGURED");
+    const provider = mobilePushProviderForEnvironment(input.environment);
+    if (this.#providers[provider] === undefined) throw new MobilePushUnavailableError(mobilePushUnconfiguredReason(provider));
     const token = normalizedDeviceToken(input.deviceToken);
     const existing = this.#store.findMobilePushRegistrationForConnection(input.connectionId);
     const registrationId = boundedIdentity(input.registrationId, "Mobile push registration ID");
@@ -116,7 +124,7 @@ export class MobilePushCoordinator {
       expectedDeviceRevision: input.expectedDeviceRevision,
       environment: input.environment,
       locale: input.locale,
-      previewEnabled: input.previewEnabled === true,
+      previewEnabled: provider === "apns" && input.previewEnabled === true,
       tokenDigest: privateDigest(token),
       sealedToken: this.#vault.seal(
         token,
@@ -155,7 +163,7 @@ export class MobilePushCoordinator {
   start(): void {
     if (this.#started || this.#closed) return;
     this.#started = true;
-    if (this.#provider === undefined) return;
+    if (this.#configuredProviders.length === 0) return;
     this.#store.recoverInterruptedMobilePushDeliveries(this.#now());
     this.#unsubscribe = this.#store.subscribe((event) => {
       if ((event.payload.type === "session_attention" && event.payload.unread)
@@ -166,7 +174,7 @@ export class MobilePushCoordinator {
   }
 
   wake(): void {
-    if (!this.#started || this.#closed || this.#provider === undefined || this.#running) return;
+    if (!this.#started || this.#closed || this.#configuredProviders.length === 0 || this.#running) return;
     if (this.#timer !== undefined) {
       clearTimeout(this.#timer);
       this.#timer = undefined;
@@ -201,8 +209,13 @@ export class MobilePushCoordinator {
 
   private async drain(signal: AbortSignal): Promise<void> {
     for (;;) {
-      const claimed = this.#store.claimNextMobilePushDelivery(this.#now());
+      const claimed = this.#store.claimNextMobilePushDelivery(this.#now(), this.#configuredProviders);
       if (claimed === undefined) return;
+      const completion = {
+        deliveryId: claimed.delivery.id,
+        claimToken: claimed.delivery.claimToken!,
+        registrationRevision: claimed.registration.revision
+      };
       let result: MobilePushDeliveryResult;
       try {
         const token = this.#vault.open(
@@ -212,7 +225,7 @@ export class MobilePushCoordinator {
         const collapseId = claimed.delivery.kind === "done" && claimed.delivery.groupId === undefined
           ? createHash("sha256").update(JSON.stringify([this.#serverId, claimed.delivery.sessionId]), "utf8").digest("hex").slice(0, 32) : undefined;
         const preview = this.completionPreview(claimed);
-        result = await this.#provider!.send({
+        result = await this.#providers[claimed.registration.provider]!.send({
           environment: claimed.registration.environment,
           token,
           locale: claimed.registration.locale,
@@ -226,7 +239,7 @@ export class MobilePushCoordinator {
             claimed.delivery.messageId,
             claimed.delivery.messageEventId
           ) : `joko://partner-group/${encodeURIComponent(boundedIdentity(claimed.delivery.groupId, "Push group ID"))}`
-        }, signal);
+        }, signal, () => !signal.aborted && this.#store.mobilePushDeliveryIsCurrent(claimed, this.#now()));
       } catch (error) {
         result = signal.aborted || abortError(error)
           ? { outcome: "unknown", code: "DISPATCH_ABORTED_UNKNOWN" }
@@ -235,8 +248,7 @@ export class MobilePushCoordinator {
       if (result.outcome === "retry") {
         if (claimed.delivery.attempts >= MOBILE_PUSH_RETRY_LIMIT) {
           this.#store.finishMobilePushDelivery({
-            deliveryId: claimed.delivery.id,
-            claimToken: claimed.delivery.claimToken!,
+            ...completion,
             outcome: "failed",
             outcomeCode: "RETRY_LIMIT",
             now: this.#now()
@@ -249,8 +261,7 @@ export class MobilePushCoordinator {
         );
         const completedAt = this.#now();
         this.#store.finishMobilePushDelivery({
-          deliveryId: claimed.delivery.id,
-          claimToken: claimed.delivery.claimToken!,
+          ...completion,
           outcome: "retry",
           outcomeCode: result.code,
           retryAt: completedAt + retryAfterMs,
@@ -259,8 +270,7 @@ export class MobilePushCoordinator {
         continue;
       }
       this.#store.finishMobilePushDelivery({
-        deliveryId: claimed.delivery.id,
-        claimToken: claimed.delivery.claimToken!,
+        ...completion,
         outcome: result.outcome,
         outcomeCode: result.code,
         now: this.#now()
@@ -299,8 +309,8 @@ export class MobilePushCoordinator {
   }
 
   private armNext(): void {
-    if (this.#closed || this.#provider === undefined || this.#running) return;
-    const next = this.#store.nextMobilePushDeliveryAt();
+    if (this.#closed || this.#configuredProviders.length === 0 || this.#running) return;
+    const next = this.#store.nextMobilePushDeliveryAt(this.#configuredProviders);
     if (next === undefined) return;
     const delay = Math.min(Math.max(0, next - this.#now()), MOBILE_PUSH_TIMER_MAXIMUM_MS);
     this.#timer = setTimeout(() => {
@@ -309,6 +319,22 @@ export class MobilePushCoordinator {
     }, delay);
     this.#timer.unref?.();
   }
+}
+
+export function mobilePushUnconfiguredReason(provider: MobilePushProvider): string {
+  return provider === "fcm" ? "FCM_NOT_CONFIGURED" : "APNS_NOT_CONFIGURED";
+}
+
+const attentionTitles = {
+  en: { done: "Task finished", awaiting: "Task needs your reply", error: "Task needs attention" },
+  "zh-CN": { done: "任务已完成", awaiting: "任务需要你的回复", error: "任务需要处理" },
+  "zh-TW": { done: "任務已完成", awaiting: "任務需要你的回覆", error: "任務需要處理" },
+  ja: { done: "タスクが完了しました", awaiting: "タスクに返信が必要です", error: "タスクの確認が必要です" },
+  ko: { done: "작업이 완료되었습니다", awaiting: "작업에 답변이 필요합니다", error: "작업을 확인해야 합니다" }
+} satisfies Readonly<Record<MobilePushLocale, Readonly<Record<MobilePushDeliveryInput["kind"], string>>>>;
+
+export function mobilePushAttentionTitle(input: Pick<MobilePushDeliveryInput, "locale" | "kind">): string {
+  return attentionTitles[input.locale][input.kind];
 }
 
 export class MobilePushUnavailableError extends Error {

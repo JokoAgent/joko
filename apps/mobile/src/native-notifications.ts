@@ -2,8 +2,14 @@ import * as Notifications from "expo-notifications";
 
 import type { NativeNotificationsApi } from "./native-notifications.types";
 
-/** iOS uses the real native module. Metro resolves the `.android.ts` sibling
- * instead on Android, where the first-release product has no push provider. */
 const nativeNotifications: NativeNotificationsApi = Notifications;
+
+export async function prepareAndroidTaskNotificationChannel(name: string): Promise<void> {
+  await Notifications.setNotificationChannelAsync("joko-task-attention", {
+    name,
+    importance: Notifications.AndroidImportance.DEFAULT,
+    lockscreenVisibility: Notifications.AndroidNotificationVisibility.PRIVATE
+  });
+}
 
 export default nativeNotifications;
