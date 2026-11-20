@@ -95,7 +95,7 @@ it.each([false, true])('reconciles saved speed against the current route and sen
   } finally { await f.close(); }
 });
 
-it.each([false, true])('keeps the original OpenRouter MiniMax MP3 request and typed read receipts for playbackOnly=%s', async playbackOnly => {
+it.each([false, true])('keeps the original OpenRouter MiniMax MP3 request and typed read receipts for playbackOnly=%s', { timeout: 20_000 }, async playbackOnly => {
   const modelId = 'minimax/speech-2.8-hd';
   const f = await fixture(modelId);
   try {

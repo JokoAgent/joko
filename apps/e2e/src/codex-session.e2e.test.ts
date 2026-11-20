@@ -9,7 +9,7 @@ import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { createCodexAdapter, AppServerHost, TransportFault } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
 import { CreateTargetMutationSchema, EntityKind, GetOperationRequestSchema, MessageRole, NativeCatalogImportPresentationSchema, NativeSessionPlacement, NativeSessionStartSchema,
-  ObjectiveStatus, OperationMutationSchema, OperationState, QueueItemState, RetryState, RunState, ScheduleRecurrenceSchema,
+  ObjectiveStatus, OperationMutationSchema, OperationPreconditionSchema, OperationState, QueueItemState, RetryState, RunState, ScheduleRecurrenceSchema,
   SetWorkspaceTrustMutationSchema, SubmitOperationRequestSchema, TargetWorkspaceInputSchema, ToolCallState, WorkspaceKind, type Event } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
 import { JokoError } from "@joko/core";
@@ -1400,10 +1400,9 @@ mountedIt("retries the exact known pre-dispatch SSH Codex input after opening th
     const list = async () => (await cold.queue.listQueueItems({ sessionId })).queueItems;
     const original = (await list()).find(item => item.queueItemId === pendingId)!;
     expect(original).toMatchObject({ state: QueueItemState.FAILED, runId: pendingRunId, retryBeforeDispatch: true });
-    const exactRetry = () => create(OperationMutationSchema, {
-      ...retryRunMutation(pendingRunId), preconditions: [{ entity: { kind: EntityKind.QUEUE_ITEM, id: pendingId },
-        expectedRevision: original.version!.revision!, expectedGeneration: original.version!.generation }]
-    });
+    const exactRetry = retryRunMutation(pendingRunId);
+    exactRetry.preconditions.push(create(OperationPreconditionSchema, { entity: { kind: EntityKind.QUEUE_ITEM, id: pendingId },
+      expectedRevision: original.version!.revision!, expectedGeneration: original.version!.generation }));
 
     const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "SSH queue Browser" })).challenge!;
     browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
@@ -1426,7 +1425,7 @@ mountedIt("retries the exact known pre-dispatch SSH Codex input after opening th
     expect(nativeTurns().at(-1)).toMatchObject({ items: [{ type: "userMessage", content: [{ type: "text", text: pendingText }] }] });
     expect((await list()).find(item => item.queueItemId === pendingId)?.retryBeforeDispatch).toBe(false);
     await retry.waitFor({ state: "hidden" });
-    const duplicate = await submit(cold.operation, connectionId, exactRetry());
+    const duplicate = await submit(cold.operation, connectionId, exactRetry);
     expect(duplicate.state).toBe(OperationState.FAILED);
     expect(nativeTurns()).toHaveLength(2);
     await native.completeTurn(nativeId);
