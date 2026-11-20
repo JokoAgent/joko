@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdtemp, open, readFile, realpath, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { isAbsolute, join, normalize, posix as remotePath, relative, resolve, sep, win32 as win32Path } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, posix as remotePath, relative, resolve, sep, win32 as win32Path } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
   createChildRuntimeEnvironment,
@@ -201,6 +201,7 @@ const ISOLATED_REVIEW_CLI_VERSION = [2, 1, 292] as const;
 const NATIVE_TASK_CLI_VERSION = [2, 1, 292] as const;
 const SUBAGENT_DEFAULT_MODEL_CLI_VERSION = [2, 1, 292] as const;
 const STEER_CLI_VERSION = [2, 1, 292] as const;
+const READ_ONLY_EXTRA_DIRECTORY_CLI_VERSION = [2, 1, 292] as const;
 const MAX_TURN_INPUTS = 64;
 const REVIEW_READ_TOOLS = ["Read", "Glob", "Grep"] as const;
 const REVIEW_DISALLOWED_TOOLS = [
@@ -988,6 +989,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         supportsIsolatedReview(this.#lastCliVersion),
         supportsNativeTaskProjection(this.#lastCliVersion),
         supportsSteer(this.#lastCliVersion),
+        supportsReadOnlyExtraDirectories(this.#lastCliVersion),
         supportsSubagentDefaultModel(this.#lastCliVersion),
         this.#resolveSubagentModel !== undefined,
         this.#resolveNativeMemoryEnabled !== undefined,
@@ -3581,7 +3583,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       runtime.pendingAdditionalDirectories = validated;
       return;
     }
-    const paths = validated.map((directory) => directory.path);
+    const paths = nativeWritableDirectoryPaths(validated);
     const pending = runtime.pendingAdditionalDirectories;
     await this.#runIdleControl(runtime, context, "extra_directories", async (acknowledge) => {
       context.assertExtraDirectoriesCurrent?.(validated);
@@ -4207,7 +4209,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         prompt: gate,
         options: {
           abortController,
-          additionalDirectories: context.hostedExecution ? [] : launch.additionalDirectories.map((directory) => directory.path),
+          additionalDirectories: context.hostedExecution ? [] : nativeWritableDirectoryPaths(launch.additionalDirectories),
           allowDangerouslySkipPermissions: launch.runtimePolicy === "standard",
           ...(launch.runtimePolicy === "review_read_only" ? { agents: {} } : {}),
           canUseTool,
@@ -4399,6 +4401,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       runtime.assertRuntimeCurrent();
       assertSessionTarget(observedCwd, runtime.runtimeWorkspaceRoot, runtime.remote);
       this.#lastCliVersion = this.#projection.text(cliVersion, 128);
+      if (runtime.additionalDirectories.some(directory => directory.access === "read_only")
+        && !supportsReadOnlyExtraDirectories(this.#lastCliVersion)) throw readOnlyExtraDirectoryUnavailable(true);
       if (runtime.subagentModel !== undefined && !supportsSubagentDefaultModel(this.#lastCliVersion)) {
         throw subagentDefaultModelUnavailable(true);
       }
@@ -5750,7 +5754,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         prompt: gate,
         options: {
           abortController: child.grant.cancellation,
-          additionalDirectories: turn.context.hostedExecution ? [] : additionalDirectories.map((directory) => directory.path),
+          additionalDirectories: turn.context.hostedExecution ? [] : nativeWritableDirectoryPaths(additionalDirectories),
           allowDangerouslySkipPermissions: true,
           ...(child.input.subagent_type === undefined ? {} : { agent: child.input.subagent_type }),
           canUseTool: (toolName, input, options) => this.#canUseTool(runtime, toolName, input, {
@@ -5759,7 +5763,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
             requestId: managedChildNativeIdentity(child.rawTaskId, "permission", options.requestId),
             agentID: options.agentID ?? child.rawTaskId
           }),
-          hooks: { PreToolUse: [{ hooks: [(input, toolUseId, options) => this.#nativeToolAuthorizationHook(runtime, input, toolUseId, options.signal, additionalDirectories)] }] },
+          hooks: { PreToolUse: [{ hooks: [(input, toolUseId, options) =>
+            this.#nativeToolAuthorizationHook(runtime, input, toolUseId, options.signal, additionalDirectories, cwd)] }] },
           cwd,
           env: {
             ...this.#environment,
@@ -6266,9 +6271,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   }
 
   async #nativeToolAuthorizationHook(runtime: NativeRuntime, input: ClaudeSdkHookInput, _toolUseId: string | undefined, signal: AbortSignal,
-    directories = runtime.additionalDirectories): Promise<ClaudeSdkHookOutput> {
+    directories = runtime.additionalDirectories, cwd = runtime.runtimeWorkspaceRoot): Promise<ClaudeSdkHookOutput> {
     if (input.hook_event_name !== "PreToolUse") return { continue: true };
-    const context = runtime.activeTurn?.context ?? runtime.baseContext, authority = context.nativeToolAuthorization;
+    const originatingTurn = runtime.activeTurn;
+    const context = originatingTurn?.context ?? runtime.baseContext, authority = context.nativeToolAuthorization;
     const denied = (reason: string): ClaudeSdkHookOutput => ({ continue: true, hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } });
     try {
       signal.throwIfAborted(); runtime.assertRuntimeCurrent();
@@ -6282,36 +6288,53 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         const review = await persistentSideChatReadDecision(runtime.baseContext, runtime.target.workspaceRoot, input.tool_name, toolInput);
         if (review.behavior === "deny") return denied(review.message);
       }
+      const directoryDecision = async (authorizationRevision?: string) => {
+        const scope = runtime.runtimePolicy === "standard" && !runtime.remote && !context.hostedExecution
+          ? await readOnlyExtraDirectoryToolDecision(cwd, directories, input.tool_name, toolInput) : undefined;
+        signal.throwIfAborted();
+        runtime.assertRuntimeCurrent();
+        context.assertExtraDirectoriesCurrent?.(directories);
+        authority?.assertCurrent(authorizationRevision);
+        if (JSON.stringify(input.tool_input) !== JSON.stringify(toolInput)
+          || (scope?.behavior === "allow" && (originatingTurn === undefined || !this.#isTurnCurrent(runtime, originatingTurn)))) {
+          return { behavior: "deny" as const, message: "The native action changed while its authorization was being reviewed." };
+        }
+        return scope;
+      };
+      const useDirectoryPermission = (scope: ClaudePermissionResult | undefined): ClaudeSdkHookOutput =>
+        scope?.behavior === "deny" ? denied(scope.message) : scope === undefined ? { continue: true }
+          : { continue: true, hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow",
+            updatedInput: scope.updatedInput, permissionDecisionReason: "The exact file is covered by an approved read-only directory." } };
       signal.throwIfAborted(); runtime.assertRuntimeCurrent();
       if (JSON.stringify(input.tool_input) !== JSON.stringify(toolInput)) return denied("The native action changed while its authorization was being reviewed.");
-      if (!authority) return { continue: true };
+      if (!authority) return useDirectoryPermission(await directoryDecision());
       authority.assertCurrent();
       const managedMcp = runtime.mcpLease?.tools.find(tool => input.tool_name === `mcp__${claudeMcpServerName(tool.serverId)}__${tool.name}`);
       const result = await authority.review({ toolName: managedMcp ? `mcp__${managedMcp.serverId}__${managedMcp.name}` : input.tool_name, input: toolInput, signal });
-      signal.throwIfAborted(); runtime.assertRuntimeCurrent(); authority.assertCurrent(result.authorizationRevision);
-      context.assertExtraDirectoriesCurrent?.(directories);
-      if (JSON.stringify(input.tool_input) !== JSON.stringify(toolInput)) return denied("The native action changed while its authorization was being reviewed.");
       if (result.verdict === "block") return denied(result.reason ?? "The current delegated task authorization denied this action.");
-      if (result.verdict === "default") return { continue: true };
+      const scope = await directoryDecision(result.authorizationRevision);
+      if (scope?.behavior === "deny") return denied(scope.message);
+      if (result.verdict === "default") return result.unavailable ? { continue: true } : useDirectoryPermission(scope);
       if (result.verdict === "ask") {
         // The service MCP facade evaluates the actual catalog identity again
         // immediately before execution and owns its one permission prompt.
         if (managedMcp) return { continue: true };
-        const turn = runtime.activeTurn;
+        const turn = originatingTurn;
         if (!turn || !this.#isTurnCurrent(runtime, turn)) return denied("The native operation has no active owner permission channel.");
         const requestId = `native-policy-${randomUUID()}`, options = { signal, requestId, toolUseID: _toolUseId ?? input.tool_use_id };
         const answer = await this.#requestInteraction(runtime, turn, { id: interactionId(runtime, requestId), kind: "permission", title: "Allow native tool?",
           toolName: input.tool_name, summary: permissionSummary(input.tool_name, toolInput, options, this.#projection, input.cwd), risk: permissionRisk(input.tool_name),
           choices: ["allow_once", "deny_once"] }, signal);
-        signal.throwIfAborted(); runtime.assertRuntimeCurrent(); authority.assertCurrent(result.authorizationRevision);
-        context.assertExtraDirectoriesCurrent?.(directories);
-        if (!this.#isTurnCurrent(runtime, turn) || JSON.stringify(input.tool_input) !== JSON.stringify(toolInput)) return denied("The native action changed while permission was pending.");
         if (permissionSelection(answer) !== "allow_once") return denied("The owner denied this native operation.");
-        return { continue: true, hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: toolInput,
+        const currentScope = await directoryDecision(result.authorizationRevision);
+        if (currentScope?.behavior === "deny") return denied(currentScope.message);
+        if (!this.#isTurnCurrent(runtime, turn)) return denied("The native action changed while permission was pending.");
+        return { continue: true, hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: currentScope?.updatedInput ?? toolInput,
           permissionDecisionReason: "The owner approved this exact native operation once." } };
       }
       return { continue: true, hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: result.verdict,
-        permissionDecisionReason: result.reason ?? "Host-verified delegated task scope.", ...(result.verdict === "allow" ? { updatedInput: toolInput } : {}) } };
+        permissionDecisionReason: result.reason ?? "Host-verified delegated task scope.",
+        ...(result.verdict === "allow" ? { updatedInput: scope?.updatedInput ?? toolInput } : {}) } };
     } catch { return denied("The originating delegated task authority changed before native execution."); }
   }
 
@@ -7197,15 +7220,19 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         { recovery: "Remove additional directories from this remote Session and retry." }
       );
     }
+    if (directories.some(directory => directory.access === "read_only")) {
+      if (this.#lastCliVersion === undefined) await this.describe();
+      if (!supportsReadOnlyExtraDirectories(this.#lastCliVersion)) throw readOnlyExtraDirectoryUnavailable();
+    }
     const seen = new Set<string>();
     const validated: ApprovedDirectory[] = [];
     for (const directory of directories) {
-      if (directory.access !== "read_write") {
+      if (directory.access !== "read_write" && directory.access !== "read_only") {
         throw claudeCodeError(
           "EXTRA_DIRECTORY_ACCESS_UNSUPPORTED",
-          "Claude Code cannot enforce a read-only additional directory through this protocol.",
+          "Claude Code does not support this additional-directory access level.",
           "extra_directories",
-          { recovery: "Approve only read-write additional directories for this Backend." }
+          { recovery: "Choose a supported access level for this Backend." }
         );
       }
       await validateCanonicalDirectory(directory.path, "Additional directory");
@@ -7739,6 +7766,73 @@ function supportsSteer(cliVersion: string | undefined): boolean {
   return exactCliVersion(cliVersion, STEER_CLI_VERSION);
 }
 
+function supportsReadOnlyExtraDirectories(cliVersion: string | undefined): boolean {
+  return exactCliVersion(cliVersion, READ_ONLY_EXTRA_DIRECTORY_CLI_VERSION);
+}
+
+function readOnlyExtraDirectoryUnavailable(stateMayHaveChanged = false): JokoError {
+  return claudeCodeError("EXTRA_DIRECTORY_ACCESS_UNSUPPORTED",
+    "This Claude Code runtime cannot apply approved read-only directories.", "extra_directories", {
+      stateMayHaveChanged,
+      recovery: "Use the supported Claude Code runtime or remove the read-only directory from the task selection."
+    });
+}
+
+function nativeWritableDirectoryPaths(directories: readonly ApprovedDirectory[]): string[] {
+  return directories.filter(directory => directory.access === "read_write").map(directory => directory.path);
+}
+
+async function readOnlyExtraDirectoryToolDecision(
+  cwd: string,
+  directories: readonly ApprovedDirectory[],
+  toolName: string,
+  input: Readonly<Record<string, unknown>>
+): Promise<ClaudePermissionResult | undefined> {
+  const read = toolName === "Read";
+  const write = ["Write", "Edit", "MultiEdit", "NotebookEdit"].includes(toolName);
+  if ((!read && !write) || !directories.some(directory => directory.access === "read_only")) return undefined;
+  const key = toolName === "NotebookEdit" ? "notebook_path" : "file_path";
+  const path = input[key];
+  if (typeof path !== "string" || path.length === 0 || path.length > 4_096 || path.includes("\0")) return undefined;
+  const requested = resolve(cwd, path);
+  const readOnly = directories.filter(directory => directory.access === "read_only").map(directory => directory.path);
+  if (read) {
+    const grant = readOnly.find(root => managedPathWithin(requested, [root], false));
+    if (grant === undefined) return undefined;
+    const canonical = await realpath(requested).catch(() => undefined);
+    if (canonical === undefined || !managedPathWithin(canonical, [grant], false)
+      || reviewPathSegmentsAreSensitive(relative(grant, canonical).split(/[\\/]/gu))
+      || !(await lstat(canonical).catch(() => undefined))?.isFile()) {
+      return { behavior: "deny", message: "The requested file could not be proven within the approved read-only directory." };
+    }
+    return { behavior: "allow", updatedInput: { ...input, [key]: canonical } };
+  }
+
+  const canonical = await nativePathWithExistingAncestor(requested);
+  if (!managedPathWithin(requested, readOnly, false)
+    && (canonical === undefined || !managedPathWithin(canonical, readOnly, false))) return undefined;
+  // An extra read approval does not revoke a separately approved writable root.
+  const writable = [cwd, ...nativeWritableDirectoryPaths(directories)];
+  if (canonical !== undefined && writable.some(root =>
+    managedPathWithin(requested, [root], false) && managedPathWithin(canonical, [root], false))) return undefined;
+  return { behavior: "deny", message: "The requested file is covered only by a read-only directory approval." };
+}
+
+async function nativePathWithExistingAncestor(path: string): Promise<string | undefined> {
+  const suffix: string[] = [];
+  let current = path;
+  for (;;) {
+    try { return join(await realpath(current), ...suffix); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+      const parent = dirname(current);
+      if (parent === current) return undefined;
+      suffix.unshift(basename(current));
+      current = parent;
+    }
+  }
+}
+
 function supportsSubagentDefaultModel(cliVersion: string | undefined): boolean {
   return exactCliVersion(cliVersion, SUBAGENT_DEFAULT_MODEL_CLI_VERSION);
 }
@@ -8124,6 +8218,7 @@ function capabilityManifest(
   isolatedReviewSupported: boolean,
   nativeTasksSupported: boolean,
   steerSupported: boolean,
+  readOnlyExtraDirectoriesSupported: boolean,
   subagentDefaultModelSupported: boolean,
   subagentDefaultModelConfigured: boolean,
   nativeMemoryConfigured: boolean,
@@ -8212,7 +8307,7 @@ function capabilityManifest(
       : key === "input.image" && available
         ? NATIVE_PROMPT_IMAGE_MEDIA_TYPES
       : key === "workspace.extra_dirs"
-        ? ["read_write"]
+        ? readOnlyExtraDirectoriesSupported ? ["read_only", "read_write"] : ["read_write"]
         : key === "input.mention"
           ? [
               "workspace_file",

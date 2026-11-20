@@ -1,4 +1,4 @@
-import { mkdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, realpath, rename, symlink, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { create, fromBinary } from "@bufbuild/protobuf";
@@ -114,8 +114,8 @@ it("reports an unknown native update while refreshing the other materialized Cla
   await waitFor(async () => store.getRun(runId).descriptor.state, state => state === "completed", "the unaffected completion");
 }, 30_000);
 
-it("rejects a new read-only approval and keeps an existing record out of the Claude runtime", async () => {
-  const setup = await directoryFixture();
+it("rejects a new read-only approval and keeps an existing record out of an unsupported Claude runtime", async () => {
+  const setup = await directoryFixture(undefined, "2.1.291");
   const { paired, runtime, store, host, targetId, firstPath, secondPath } = setup;
   const { backend } = await paired.clients.backend.getBackend({ backendId: BACKEND_ID });
   expect(backend?.capabilities?.capabilities.find(capability => capability.name === capabilityNames.workspaceExtraDirs))
@@ -159,6 +159,56 @@ it("rejects a new read-only approval and keeps an existing record out of the Cla
   expect(closed).not.toHaveBeenCalled();
   await expect(setup.remove(retained.id)).resolves.toMatchObject({ state: OperationState.SUCCEEDED });
   expect(host.extraDirectories.listForTarget(targetId).map(directory => directory.path)).toEqual([firstPath]);
+}, 30_000);
+
+it("keeps a local Claude read-only directory out of native write roots and retires its approval immediately", async () => {
+  const setup = await directoryFixture();
+  const { paired, runtime, store, host, targetId, firstPath, secondPath } = setup;
+  const { backend } = await paired.clients.backend.getBackend({ backendId: BACKEND_ID });
+  expect(backend?.capabilities?.capabilities.find(capability => capability.name === capabilityNames.workspaceExtraDirs))
+    .toMatchObject({ options: { kind: { case: "workspace", value: {
+      extraDirectories: true, extraDirectoryAccess: [ExtraDirectoryAccess.READ_ONLY, ExtraDirectoryAccess.READ_WRITE]
+    } } } });
+  await expect(setup.add(secondPath, ExtraDirectoryAccess.READ_ONLY)).resolves.toMatchObject({ state: OperationState.SUCCEEDED });
+  const approval = host.extraDirectories.listForTarget(targetId).find(directory => directory.path === secondPath)!;
+  expect(approval.access).toBe("read_only");
+  const file = join(secondPath, "reference.txt");
+  await writeFile(file, "Approved reference");
+  await symlink(firstPath, join(secondPath, "other"), "junction");
+  await writeFile(join(firstPath, "separate.txt"), "Independently writable");
+
+  const sessionId = await setup.createSession("Read an approved reference");
+  const binding = store.getSession(sessionId).descriptor.binding;
+  const query = runtime.queries.find(candidate => candidate.params.options.sessionId === binding.nativeSessionId)!;
+  expect(query.params.options.additionalDirectories).toEqual([firstPath]);
+  const runId = await setup.send(sessionId, "Read the approved file");
+  await waitFor(async () => store.getRun(runId).descriptor.state, state => state === "running", "the read-only approval turn");
+  const hook = query.params.options.hooks!.PreToolUse![0]!.hooks[0]!;
+  const check = (tool_name: string, tool_input: Record<string, unknown>) => hook({
+    hook_event_name: "PreToolUse", session_id: binding.nativeSessionId!, transcript_path: "unused",
+    cwd: query.params.options.cwd, tool_name, tool_use_id: "approved-directory-check", tool_input
+  }, "approved-directory-check", { signal: new AbortController().signal });
+
+  await expect(check("Read", { file_path: file })).resolves.toMatchObject({
+    hookSpecificOutput: { permissionDecision: "allow", updatedInput: { file_path: file } }
+  });
+  await expect(check("Read", { file_path: join(secondPath, "other", "separate.txt") })).resolves.toMatchObject({
+    hookSpecificOutput: { permissionDecision: "deny" }
+  });
+  await expect(check("Write", { file_path: file, content: "Updated" })).resolves.toMatchObject({
+    hookSpecificOutput: { permissionDecision: "deny" }
+  });
+  await expect(check("Write", { file_path: join(secondPath, "new", "draft.txt"), content: "New draft" })).resolves.toMatchObject({
+    hookSpecificOutput: { permissionDecision: "deny" }
+  });
+  await expect(check("Write", { file_path: join(firstPath, "separate.txt"), content: "Normal edit" })).resolves.toEqual({ continue: true });
+  await expect(check("Bash", { command: "pwd" })).resolves.toEqual({ continue: true });
+  await expect(setup.remove(approval.id)).resolves.toMatchObject({
+    state: OperationState.FAILED, error: { code: "EXTRA_DIRECTORY_RUNTIME_REFRESH_FAILED" }
+  });
+  expect(host.extraDirectories.listForTarget(targetId)).toHaveLength(1);
+  expect(host.isSessionActive(sessionId)).toBe(false);
+  await expect(check("Read", { file_path: file })).resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
 }, 30_000);
 
 it.each(["missing before preparation", "replaced during the native history read"] as const)(
@@ -314,8 +364,12 @@ mountedIt("replaces the selected directory of an existing queued Claude input fr
   } finally { await browser.close(); }
 });
 
-async function directoryFixture(webDirectory?: string) {
+async function directoryFixture(webDirectory?: string, cliVersion?: string) {
   const runtime = new ControlledClaudeRuntime();
+  if (cliVersion !== undefined) {
+    const probe = runtime.probe.bind(runtime);
+    vi.spyOn(runtime, "probe").mockImplementation(async input => ({ ...await probe(input), cliVersion }));
+  }
   fixture = await OrchestratorE2eFixture.start({ profiles: [], webDirectory, backendFactories: [{ instanceId: BACKEND_ID,
     adapterKind: "claude-agent-sdk-stdio", displayName: "Claude directory product fixture", create: ({ generation }) =>
       new ClaudeCodeAdapter({ id: BACKEND_ID, instanceGeneration: generation, runtime, environment: {},
