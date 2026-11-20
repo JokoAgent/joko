@@ -3664,6 +3664,8 @@ export class SessionHost {
     const runId = stableId("run", input.operationId);
     const attemptId = stableId("attempt", input.operationId);
     const queueItemId = stableId("queue", input.operationId);
+    const retrySource = input.parentRunId === undefined ? undefined : store.findQueueItemByRunId(input.sessionId, input.parentRunId);
+    const consumedQueueRetryId = retrySource && this.canRetryFailedQueueInput(retrySource) ? retrySource.id : undefined;
     if (input.providerGroupRebalance) {
       if (!this.#providerGroups || (input.source ?? "user") !== "user" || acceptedPrompt.disposition !== "prompt" || hasTurnRouteOverrides(input.overrides)) {
         throw new StoreError("Quota balancing requires this ordinary owner's original prompt.");
@@ -3682,6 +3684,7 @@ export class SessionHost {
       ...(input.overrides === undefined ? {} : { executionOverrides: input.overrides }),
       createdAt: now
     });
+    if (consumedQueueRetryId !== undefined) store.recordQueueRetryAdmission(consumedQueueRetryId, runId, `operation:${input.operationId}:source-retry`);
     const result = { sessionId: input.sessionId, runId, attemptId, queueItemId };
     if ((input.source ?? "user") === "user") {
       store.deleteSetting("service", input.sessionId, PROVISIONAL_SESSION_KEY);

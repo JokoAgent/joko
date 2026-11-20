@@ -1451,6 +1451,7 @@ mountedIt("retries the exact known pre-dispatch SSH Codex input after opening th
     expect(submitted.mutation?.preconditions).toMatchObject([{ entity: { kind: EntityKind.QUEUE_ITEM, id: pendingId },
       expectedRevision: { value: original.version!.revision!.value }, expectedGeneration: checked?.version?.generation }]);
     const receipt = fromBinary(SubmitOperationResponseSchema, await response.body()).operation;
+    expect(receipt?.state, receipt?.error?.message).toBe(OperationState.SUCCEEDED);
     expect(receipt).toMatchObject({ state: OperationState.SUCCEEDED, result: { payload: { case: "run" } } });
     const child = await waitFor(async () => fixture!.application.store.findRunByParentId(pendingRunId)?.descriptor,
       run => run?.state === "running", "the one continuation of the original failed Run");
@@ -1459,6 +1460,7 @@ mountedIt("retries the exact known pre-dispatch SSH Codex input after opening th
     expect(nativeTurns().at(-1)).toMatchObject({ items: [{ type: "userMessage", content: [{ type: "text", text: pendingText }] }] });
     const consumedSource = (await list()).find(item => item.queueItemId === pendingId)!;
     expect(consumedSource.retryBeforeDispatch).toBe(false);
+    expect(consumedSource.version!.revision!.value).toBeGreaterThan(original.version!.revision!.value);
     await retry.waitFor({ state: "hidden" });
     const duplicateRetry = retryRunMutation(pendingRunId);
     duplicateRetry.preconditions.push(create(OperationPreconditionSchema, { entity: { kind: EntityKind.QUEUE_ITEM, id: pendingId },
@@ -1469,10 +1471,12 @@ mountedIt("retries the exact known pre-dispatch SSH Codex input after opening th
     await native.completeTurn(nativeId);
     await waitFor(async () => fixture!.application.store.getRun(child!.id).descriptor.state, state => state === "completed", "the retried input completion");
 
+    native.dropNextTurnClientId = true;
     native.timeoutNextTurnStart = true;
     const unknown = await submit(cold.operation, connectionId, input("Preserve the unknown native acknowledgment"));
     const unknownId = queueItemIdFrom(unknown);
     await waitFor(async () => queueState(unknownId), state => state === "dispatch_unknown", "the original unknown dispatch");
+    expect(nativeTurns()).toHaveLength(3);
     const uncertain = (await list()).find(item => item.queueItemId === unknownId);
     expect(uncertain).toMatchObject({ state: QueueItemState.DISPATCH_UNKNOWN, retryBeforeDispatch: false });
     await page.locator(`[data-queue-item-id="${unknownId}"]`).waitFor({ state: "visible" });

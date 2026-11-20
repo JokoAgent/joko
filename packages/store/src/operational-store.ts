@@ -10147,6 +10147,22 @@ export class OperationalStore {
     return queueItemFromRow(row, this.now());
   }
 
+  /** Publish the original failed row when its durable continuation consumes retry eligibility. */
+  recordQueueRetryAdmission(sourceQueueItemId: string, continuationRunId: string, traceId: string): void {
+    this.write(() => {
+      const source = this.getQueueItem(sourceQueueItemId);
+      const continuation = this.getRun(continuationRunId).descriptor;
+      if (source.state !== "failed" || continuation.sessionId !== source.sessionId || continuation.parentRunId !== source.runId) {
+        throw new StoreError("The continuation does not belong to the original failed queue item.");
+      }
+      this.database.prepare("UPDATE queue_items SET revision = ? WHERE id = ?")
+        .run(asSqlInteger(this.requireActiveRevision()), source.id);
+      // This publishes the current queue view of a historical Run. Its
+      // original Attempt may belong to the previous native generation.
+      this.appendQueueEvent(this.getQueueItem(source.id), this.getSession(source.sessionId), traceId, null);
+    });
+  }
+
   findQueueItemByRunId(
     sessionId: string,
     runId: string,
@@ -15181,16 +15197,15 @@ export class OperationalStore {
     item: QueueItemRecord,
     session: StoredSession,
     traceId: string,
-    projectionAttemptId?: string
+    projectionAttemptId?: string | null
   ): PersistedEvent {
+    const attemptId = projectionAttemptId === undefined ? item.attemptId : projectionAttemptId;
     return this.appendEvent({
       backendId: session.descriptor.backendId,
       targetId: session.descriptor.targetId,
       sessionId: session.descriptor.id,
       runId: item.runId,
-      ...(projectionAttemptId === undefined && item.attemptId === undefined
-        ? {}
-        : { attemptId: projectionAttemptId ?? item.attemptId }),
+      ...(attemptId == null ? {} : { attemptId }),
       operationId: item.operationId,
       generation: session.descriptor.binding.generation,
       traceId,
