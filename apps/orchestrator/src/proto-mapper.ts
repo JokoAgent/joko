@@ -1112,7 +1112,7 @@ export function toProtoQueueItem(
     readonly sharedTaskAuthor?: import("@joko/store").SharedTaskAuthor;
     readonly retryBeforeDispatch?: boolean;
   },
-  ordinal = 0n
+  ordinal = BigInt(item.position)
 ): ProtoQueueItem {
   return message<ProtoQueueItem>("joko.v1.QueueItem", {
     queueItemId: item.id,

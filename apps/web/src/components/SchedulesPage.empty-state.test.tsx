@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
+import { Suspense, act, use, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -56,6 +56,28 @@ describe("SchedulesPage empty states", () => {
     expect(form?.querySelector<HTMLSelectElement>('select')?.value).not.toBeUndefined();
     expect([...form?.querySelectorAll<HTMLInputElement>('input[type="datetime-local"]') ?? []]
       .some((input) => input.value.length > 0)).toBe(true);
+  });
+
+  it("keeps the recovery intent when the first render of Schedules suspends before commit", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    function PendingLayout() { use(gate); return null; }
+    stageUsageLimitScheduleIntent("session-missing", { resetAtMs: Date.now() + 3_600_000 });
+    await renderSchedules([], [], undefined, undefined, page => (
+      <Suspense fallback={<span>Loading route</span>}>{page}<PendingLayout /></Suspense>
+    ));
+    expect(document.body.textContent).toContain("Loading route");
+    expect(document.querySelector(".schedule-editor")).toBeNull();
+    await act(async () => release());
+    expect(document.querySelector<HTMLTextAreaElement>(".schedule-editor textarea")?.value).toBe("scheduler.usageLimitRecoveryPrompt");
+  });
+
+  it("retires a recovery intent whose source connection has changed", async () => {
+    stageUsageLimitScheduleIntent("session-missing", { resetAtMs: Date.now() + 3_600_000 }, {
+      serverId: "original-node", profileId: "original-profile", connectionGeneration: 1
+    });
+    await renderSchedules([]);
+    expect(document.querySelector(".schedule-editor")).toBeNull();
   });
 
   it("can save the later repeated recovery time after the first occurrence has passed", async () => {
@@ -159,7 +181,8 @@ describe("SchedulesPage unread history", () => {
 async function renderSchedules(schedules: readonly ScheduleView[], sessions: readonly SessionView[] = [],
   historyActions?: Partial<Pick<AppController, "acknowledgeSessionError" | "acknowledgeSessionAttention" | "markAllScheduleRunsRead"
     | "refresh" | "listScheduleRunHistory" | "runSchedule">>,
-  editor?: { readonly targets: readonly TargetView[]; readonly saveSchedule: AppController["saveSchedule"] }
+  editor?: { readonly targets: readonly TargetView[]; readonly saveSchedule: AppController["saveSchedule"] },
+  wrap?: (page: ReactNode) => ReactNode
 ): Promise<HTMLDivElement> {
   const targets = editor?.targets ?? [];
   const snapshot = { ...emptySnapshot(), revision: 1n, schedules, sessions, targets };
@@ -180,7 +203,7 @@ async function renderSchedules(schedules: readonly ScheduleView[], sessions: rea
   document.body.append(container);
   const root = createRoot(container);
   roots.push(root);
-  await act(async () => root.render(<SchedulesPage
+  const page = <SchedulesPage
     controller={controller}
     schedules={schedules}
     sessions={sessions}
@@ -193,7 +216,8 @@ async function renderSchedules(schedules: readonly ScheduleView[], sessions: rea
     runAction={(_key, action) => { void action(); }}
     onOpenNavigation={vi.fn()}
     prepareSessionRemoval={async (sessions) => ({ clean: sessions.length, dirty: 0, unknown: 0 })}
-  />));
+  />;
+  await act(async () => root.render(wrap?.(page) ?? page));
   return container;
 }
 

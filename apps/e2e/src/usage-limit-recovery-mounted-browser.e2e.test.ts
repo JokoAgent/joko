@@ -1,8 +1,8 @@
-import { create } from "@bufbuild/protobuf";
+import { create, fromBinary } from "@bufbuild/protobuf";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ModelSelectionSchema, PerTurnOverridesSchema, RunState } from "@joko/contracts";
+import { GetOperationRequestSchema, ModelSelectionSchema, PerTurnOverridesSchema, RunState } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it, vi } from "vitest";
 
@@ -29,6 +29,9 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
   let releaseRestoredModel!: () => void;
   const restoreGate = new Promise<void>(resolve => { releaseRestoredModel = resolve; });
   let restoringModel = false;
+  let releaseScheduledRestore!: () => void;
+  const scheduledRestoreGate = new Promise<void>(resolve => { releaseScheduledRestore = resolve; });
+  let restoringScheduleRun: string | undefined;
   const checkpoint = (phase: string) => { console.info(`Quota recovery fixture ${phase}`); };
   try {
     const configureDefaultProvider = async (host: RealPiSystemFixture) => {
@@ -135,6 +138,7 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
     const cold = (await service.operation.getOperation({ operationId: admitted.operationId })).operation;
     expect(cold?.mutation?.payload).toMatchObject({ case: "sendInput", value: { overrides: { model } } });
     expect(cold?.result?.payload).toMatchObject({ case: "queueItem", value: { queueItemId, runId } });
+    expect(fixture.application.store.getQueueItem(queueItemId).state).toBe("failed");
 
     checkpoint("pairing the mounted browser");
     const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Quota recovery browser" })).challenge!;
@@ -157,23 +161,35 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
       { name: "Continue with failed Provider", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, triggerAt: trigger },
       { name: "Continue with chosen Provider", providerId: defaultProviderId, modelId: defaultModelId, triggerAt: trigger + 60_000 }
     ];
+    const recoveryReads: number[] = [];
+    page.on("response", response => {
+      if (!response.url().endsWith("/joko.v1.OperationService/GetOperation")) return;
+      const body = response.request().postDataBuffer();
+      if (body !== null && fromBinary(GetOperationRequestSchema, body).operationId === admitted.operationId) recoveryReads.push(response.status());
+    });
     for (const [index, schedule] of schedules.entries()) {
       checkpoint(`opening the recovery editor for ${schedule.providerId}`);
-      const banner = page.getByTestId("error-tail-banner");
+      const editor = page.getByRole("dialog", { name: "Create schedule", exact: true });
+      const triggerAt = editor.getByLabel("Trigger at", { exact: true });
+      const before = { hash: new URL(page.url()).hash, generation: fixture.application.store.getSession(sessionId).descriptor.binding.generation,
+        receiptReads: recoveryReads.length };
       try {
-        await banner.getByRole("button", { name: "Continue after reset", exact: true }).click();
+        await pane.getByRole("button", { name: "Continue after reset", exact: true }).click();
+        await triggerAt.waitFor({ state: "visible" });
       } catch (error) {
-        const events = fixture.application.store.listEvents({ sessionId }).slice(-12).map(event => ({
+        const events = fixture.application.store.listEvents({ sessionId }).slice(-30).map(event => ({
           runId: event.runId,
           type: event.payload.type,
           ...(event.payload.type === "error" ? { error: event.payload.error } : {})
         }));
         const visibleText = (await pane.textContent().catch(() => null))?.slice(-2_000);
-        console.info("Quota recovery fixture cold presentation", JSON.stringify({ events, visibleText }));
+        const attention = fixture.application.store.findSessionAttention(sessionId);
+        const after = { hash: new URL(page.url()).hash, generation: fixture.application.store.getSession(sessionId).descriptor.binding.generation,
+          receiptStatusCodes: recoveryReads.slice(before.receiptReads), editorPresent: await editor.count() > 0 };
+        console.info("Quota recovery fixture cold presentation", JSON.stringify({ before, after, events, attention, visibleText },
+          (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value));
         throw error;
       }
-      const editor = page.getByRole("dialog", { name: "Create schedule", exact: true });
-      const triggerAt = editor.getByLabel("Trigger at", { exact: true });
       const picker = editor.locator(".schedule-editor__model-picker");
       expect(await triggerAt.inputValue()).toBe(new Date(trigger).toISOString().slice(0, 16));
       expect(await picker.innerText()).toContain("Joko real Pi E2E model");
@@ -190,23 +206,57 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
       if (index + 1 < schedules.length) {
         checkpoint("reopening the task from the saved node");
         await page.goto(taskUrl, { waitUntil: "domcontentloaded" });
-        await page.getByRole("button", { name: "Saved nodes", exact: true }).click();
-        await page.locator(".connection-card .profile-card").filter({ hasText: fixture.baseUrl })
-          .getByRole("button", { name: "Connect", exact: true }).click();
+        await page.reload({ waitUntil: "domcontentloaded" });
+        const savedNodes = page.getByRole("button", { name: "Saved nodes", exact: true });
+        await pane.or(savedNodes).first().waitFor({ state: "visible" });
+        if (await savedNodes.isVisible()) {
+          await savedNodes.click();
+          await page.locator(".connection-card .profile-card").filter({ hasText: fixture.baseUrl })
+            .getByRole("button", { name: "Connect", exact: true }).click();
+        }
+        await pane.waitFor({ state: "visible" });
       }
     }
 
-    for (const schedule of schedules) {
+    const restartedStore = fixture.application.store;
+    await fixture.application.sessionHost.invokeBackendAdapter("pi", adapter => {
+      const setModel = adapter.setModel.bind(adapter);
+      vi.spyOn(adapter, "setModel").mockImplementation(async (providerId, modelId, context) => {
+        if (restoringScheduleRun === undefined && context.sessionId === sessionId
+          && providerId === defaultProviderId && modelId === defaultModelId) {
+          const [source] = restartedStore.listRuns({ sessionId, source: "schedule", states: ["completed"], limit: 1 });
+          if (source !== undefined) {
+            restoringScheduleRun = source.descriptor.id;
+            await scheduledRestoreGate;
+          }
+        }
+        return setModel(providerId, modelId, context);
+      });
+    });
+
+    for (const [index, schedule] of schedules.entries()) {
       checkpoint(`waiting for the occurrence on ${schedule.providerId}`);
       const saved = (await service.scheduler.listSchedules({ sessionId })).schedules.find(value => value.displayName === schedule.name)!;
       expect(saved.execution?.model?.model).toMatchObject({ providerId: schedule.providerId, modelId: schedule.modelId });
       expect(saved.nextTriggerAt?.seconds).toBe(BigInt(schedule.triggerAt / 1_000));
       clockOffset = schedule.triggerAt - realNow();
+      if (index === 1) {
+        const waiting = await waitFor(() => service.scheduler.listScheduleRunHistory({ scheduleId: saved.scheduleId }),
+          result => result.history.length === 1, "the second saved occurrence while the original model is being restored");
+        const waitingItem = restartedStore.findQueueItemByRunId(sessionId, waiting.history[0]!.runId);
+        expect(waitingItem?.state).toBe("accepted");
+        expect(fixture.providerRequests.map(({ body }) => body["model"])).toEqual([REAL_PI_MODEL_ID]);
+        releaseScheduledRestore();
+      }
       const history = await waitFor(() => service.scheduler.listScheduleRunHistory({ scheduleId: saved.scheduleId }),
-        result => result.history[0]?.state === RunState.SUCCEEDED, "the saved recovery occurrence");
+        result => result.history[0]?.state === RunState.SUCCEEDED || result.history[0]?.state === RunState.FAILED,
+        "the saved recovery occurrence");
       expect(history.history).toHaveLength(1);
-      const item = fixture.application.store.findQueueItemByRunId(sessionId, history.history[0]!.runId);
+      expect(history.history[0]).toMatchObject({ state: RunState.SUCCEEDED });
+      const item = restartedStore.findQueueItemByRunId(sessionId, history.history[0]!.runId);
       expect(item?.executionOverrides).toMatchObject({ providerId: schedule.providerId, modelId: schedule.modelId });
+      if (index === 0) await waitFor(async () => restoringScheduleRun,
+        observed => observed === history.history[0]!.runId, "restoration of the first scheduled model");
     }
     expect(fixture.providerRequests.map(({ body }) => body["model"])).toEqual([REAL_PI_MODEL_ID, defaultModelId]);
   } catch (error) {
@@ -214,6 +264,7 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
     throw error;
   } finally {
     releaseRestoredModel();
+    releaseScheduledRestore();
     checkpoint("closing the browser and service");
     clock.mockRestore();
     await browser?.close();

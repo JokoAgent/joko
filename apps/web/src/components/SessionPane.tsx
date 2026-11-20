@@ -12,6 +12,7 @@ import type { JSX } from "react";
 import {
   AlertTriangle,
   Bot,
+  CalendarClock,
   CircleStop,
   Copy,
   Gauge,
@@ -57,7 +58,7 @@ import { RecoveryActionSingleFlight, executableRecoveryActions, nextPermissionMo
 import { SessionScopedRequestGuard, type SessionScopedRequest } from "./compact-request-behavior.js";
 import { hasContextToCompact, resolveActiveCompaction } from "./compaction-status-behavior.js";
 import { hasPendingComposerQueueItems, pauseQueueThenAbort, pauseQueueThenAbortRetry, resolveComposerAttachmentPolicy } from "./composer-behavior.js";
-import { ErrorTailLocalProjectionStore, explicitErrorAttentionCursor, resolveErrorTail } from "./error-tail-behavior.js";
+import { ErrorTailLocalProjectionStore, explicitErrorAttentionCursor, findFailedInputUsageLimit, resolveErrorTail } from "./error-tail-behavior.js";
 import { hidesFromTimelineHistory, resolveActiveRetry, resolveRetryEscapeIntent, resolveRetryStopAction, type RetryEscapeInput, type RetryEscapeTarget } from "./retry-status-behavior.js";
 import { projectRuntimeRecoveryTimeline } from "../runtime-recovery.js";
 import { timelineHistoryOwnerKey } from "../timeline-history-cache.js";
@@ -961,6 +962,12 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const errorTailUsageLimitRecovery = errorTailProjection?.bannerVisible === true && errorTailProjection.item.error !== undefined
     ? usageLimitRecoveryHint(errorTailProjection.item.error)
     : null;
+  const historyUsageLimitRecovery = !guest && !reviewReadOnly && !running && !session.archived && errorTailUsageLimitRecovery === null
+    ? findFailedInputUsageLimit(session.id, recoveryPresentationTimeline, queue)
+    : undefined;
+  const usageLimitSource = errorTailUsageLimitRecovery === null ? historyUsageLimitRecovery?.item : errorTailProjection?.item;
+  const usageLimitSourceRef = useRef(usageLimitSource);
+  usageLimitSourceRef.current = usageLimitSource;
   const stopAllBackgroundTasks = (): void => {
     if (!canStopBackgroundTasks || backgroundStopping || backgroundTaskIds.length === 0) return;
     const taskIds = [...backgroundTaskIds];
@@ -1366,13 +1373,14 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     });
   };
 
-  const scheduleUsageLimitRecovery = (hint: UsageLimitRecoveryHint): void => {
-    const tail = errorTailProjection;
-    if (tail?.bannerVisible !== true || guest || reviewReadOnly) return;
-    const error = tail.item.error;
+  const scheduleUsageLimitRecovery = (item: TimelineItemView, hint: UsageLimitRecoveryHint): void => {
+    if (usageLimitSourceRef.current?.id !== item.id || guest || reviewReadOnly) return;
+    const error = item.error;
     if (error === undefined) return;
     const openDraft = (selection: FailedInputModel | undefined): void => {
       const current = controllerRef.current;
+      const profile = current.state.activeProfile;
+      if (profile === undefined || current.state.connectionState !== "connected") return;
       const useTaskModel = selection?.kind === "inherited";
       const model = selection?.kind === "override" ? selection.model : undefined;
       const providerId = model?.providerId ?? (useTaskModel ? session.model?.providerId : undefined);
@@ -1381,22 +1389,23 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       const accountReset = useTaskModel && providerGroupUsage !== undefined ? providerGroupUsage.resetAt
         : providerAccountUsageResetAt(current.state.snapshot.providers, providerId, now, { backendId: session.backendId, modelId });
       const recovery = usageLimitRecoveryHint(error, now, accountReset) ?? hint;
-      stageUsageLimitScheduleIntent(session.id, { ...recovery, model: useTaskModel ? undefined : model ?? null });
+      stageUsageLimitScheduleIntent(session.id, { ...recovery, model: useTaskModel ? undefined : model ?? null }, {
+        serverId: profile.serverId, profileId: profile.id, connectionGeneration: current.state.connectionGeneration
+      });
       current.navigate({ kind: "schedules" });
       void current.setNavigationOpen(true);
     };
-    const input = tail.item.failedInput;
+    const input = item.failedInput;
     const read = controller.readFailedInputModel;
     if (input === undefined || read === undefined) {
-      openDraft(tail.item.runId === undefined || providerGroupUsage !== undefined ? { kind: "inherited" } : undefined);
+      openDraft(item.runId === undefined || providerGroupUsage !== undefined ? { kind: "inherited" } : undefined);
       return;
     }
     const source = beginDerivedTaskAction(capturePaneMessageAction(true));
     if (!source.isCurrent()) return;
     runAction(`schedule-recovery:${input.runId}`, async () => {
       const selection = await read(session.id, session.generation, input).catch(() => undefined);
-      const latest = errorTailRef.current;
-      if (!source.isCurrent() || latest?.bannerVisible !== true || latest.localKey !== tail.localKey) return;
+      if (!source.isCurrent() || usageLimitSourceRef.current?.id !== item.id) return;
       openDraft(selection);
     });
   };
@@ -2744,9 +2753,14 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         actionFailure={errorTailActionFailure?.localKey === errorTailProjection.localKey ? errorTailActionFailure.message : undefined}
         t={t}
         onAction={handleErrorTailAction}
-        onScheduleUsageRecovery={guest || reviewReadOnly ? undefined : scheduleUsageLimitRecovery}
+        onScheduleUsageRecovery={guest || reviewReadOnly ? undefined : hint => scheduleUsageLimitRecovery(errorTailProjection.item, hint)}
         onDismiss={canAcknowledgeSessionAttention ? handleErrorTailDismiss : undefined}
       />}
+      {historyUsageLimitRecovery !== undefined && <div className="error-tail-region">
+        <Button tone="ghost" onClick={() => scheduleUsageLimitRecovery(historyUsageLimitRecovery.item, historyUsageLimitRecovery.hint)}>
+          <CalendarClock aria-hidden="true" />{t("errorTail.scheduleAfterReset")}
+        </Button>
+      </div>}
       {currentCompactFeedback !== undefined && !(currentCompactFeedback.phase === "busy" && activeCompaction !== undefined) && <CompactActionFeedback
         feedback={currentCompactFeedback}
         t={t}

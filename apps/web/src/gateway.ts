@@ -3,7 +3,7 @@ import { materializeImageAttachment } from "./image-attachment.js";
 import { encodeModelSpeed, decodeModelSpeed } from "@joko/contracts";
 import type { ProviderAccountResetApi } from "@joko/contracts";
 import { assistantStreamAttempt, codexSamplingInterruptedMessageId, isAssistantStreamBlock, thinkingStreamOwner } from "@joko/contracts";
-import { createProviderAccountResetApi, executeExtensionSettingsCall, ExtensionSettingsRejected } from "@joko/connection-transport";
+import { createProviderAccountResetApi, currentQueueRetryInput, executeExtensionSettingsCall, ExtensionSettingsRejected } from "@joko/connection-transport";
 import { isModelVisible, modelPreferenceOwnerId, readModelPickerOwnerPreferences } from "./model-picker-preferences.js";
 import { providerModelInheritedField, protoProviderModelInheritedField } from "./provider-model-inheritance.js";
 import { extensionSettingsOperationReceipt, extensionSettingsProfileKey, pendingExtensionSettingsOperation,
@@ -2679,17 +2679,30 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async retry(runId: string, queueItem?: QueueItemView): Promise<void> {
-    const preconditions: MutationPrecondition[] = [];
-    if (queueItem !== undefined) {
-      const current = this.#rawSnapshot?.queueItems.find(item => item.queueItemId === queueItem.id);
-      if (this.#taskSharing !== undefined || !current?.retryBeforeDispatch || current.runId !== runId
-        || current.sessionId !== queueItem.sessionId || current.version?.revision?.value !== queueItem.revision
-        || current.version?.generation !== queueItem.generation) {
-        throw new GatewayError("This failed queued input is no longer available to retry.");
-      }
-      preconditions.push(queueItemPrecondition(current));
+    const payload = { case: "retryRun", value: { runId } } as const;
+    if (queueItem === undefined) {
+      await this.submit(payload, true);
+      return;
     }
-    await this.submit({ case: "retryRun", value: { runId } }, true, preconditions);
+    const before = this.#rawSnapshot;
+    const item = before?.queueItems.find(item => item.queueItemId === queueItem.id);
+    if (this.#taskSharing !== undefined || !before || !item?.retryBeforeDispatch || item.runId !== runId
+      || item.sessionId !== queueItem.sessionId || item.version?.revision?.value !== queueItem.revision
+      || item.version?.generation !== queueItem.generation) {
+      throw new GatewayError("This failed queued input is no longer available to retry.");
+    }
+    const scope = this.captureActionScope();
+    const { snapshot } = await createClient(EventService, scope.transport).getSnapshot({
+      scope: { kind: { case: "session", value: { sessionId: item.sessionId, recentTimelineItems: 0 } } }
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const latest = this.#rawSnapshot;
+    const current = snapshot && currentQueueRetryInput(before, item, snapshot);
+    if (!current || this.#transport !== scope.transport || !latest
+      || !currentQueueRetryInput(before, item, latest, { allowStaleQueueProjection: true })) {
+      throw new GatewayError("This failed queued input is no longer available to retry.");
+    }
+    await this.submit(payload, true, [queueItemPrecondition(current)], scope.signal);
   }
 
   async resetSession(sessionId: string): Promise<void> {

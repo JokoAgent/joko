@@ -7146,8 +7146,13 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       const record = item.pendingSend.outboxId ? localOutbox.find(record => record.id === item.pendingSend!.outboxId) : undefined;
       return <MobilePendingSendBubble progress={item.pendingSend} colors={colors} locale={locale} files={mobileAttachmentFiles} profileId={state.activeProfileId}>
         {record && record.state !== "accepted" ? <View style={styles.queueActions}>
-          {record.state === "confirming" || record.attempted && record.failureKind !== "rejected" ? <Action label={mobileMessage(locale, "receipt.check")} colors={colors} compact
-            disabled={state.status !== "connected" || state.busy} onPress={() => void (record.state === "confirming" ? client.reconcile() : client.checkTaskOutbox(record.id)).catch(error => setLocalError(errorText(error)))} /> : <>
+          {record.state === "confirming" || record.attempted && record.failureKind !== "rejected" ? <>
+            <Action label={mobileMessage(locale, "receipt.check")} colors={colors} compact
+              disabled={state.status !== "connected" || state.busy} onPress={() => void (record.state === "confirming" ? client.reconcile() : client.checkTaskOutbox(record.id)).catch(error => setLocalError(errorText(error)))} />
+            {record.state === "failed" && record.failureKind === "not-admitted" && <Action label={mobileMessage(locale, "common.retry")} colors={colors} compact
+              disabled={state.status !== "connected" || state.busy || voice.busy || attachmentBusy || queueEdit !== undefined}
+              onPress={() => void client.retryTaskOutbox(record.id).catch(error => setLocalError(errorText(error)))} />}
+          </> : <>
             {record.state === "failed" && <Action label={mobileMessage(locale, "common.retry")} colors={colors} compact disabled={state.busy || voice.busy || attachmentBusy || queueEdit !== undefined}
               onPress={() => void client.retryTaskOutbox(record.id).catch(error => setLocalError(errorText(error)))} />}
             {(record.state === "queued" || record.state === "failed") && <Action label={mobileMessage(locale, "common.edit")} colors={colors} compact disabled={state.busy || voice.busy || attachmentBusy || queueEdit !== undefined}

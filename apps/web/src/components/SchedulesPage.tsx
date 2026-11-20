@@ -66,17 +66,24 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
   const [deleteScheduleOperationError, setDeleteScheduleOperationError] = useState<string>();
   const [deleteSchedulePending, setDeleteSchedulePending] = useState(false);
   const deleteSchedulePreviewRequestRef = useRef(0);
-  const [usageRecoveryDraft, setUsageRecoveryDraft] = useState<ScheduleDraft | undefined>(() => {
+  const [usageRecoveryDraft, setUsageRecoveryDraft] = useState<ScheduleDraft>();
+  const [editor, setEditor] = useState<ScheduleView | "new">();
+  const profile = controller.state.activeProfile;
+  const connectionGeneration = controller.state.connectionGeneration;
+  const connectionState = controller.state.connectionState;
+  useLayoutEffect(() => {
+    // A speculative render of the lazy schedules route can be abandoned.
+    // Consume the one-shot intent only after the destination has committed.
     const intent = consumeUsageLimitScheduleIntent();
-    if (intent === undefined) return undefined;
-    return buildUsageLimitScheduleDraft(
-      scheduleDraft(undefined, targets, sessions, models, backends),
-      intent,
-      sessions.find((session) => session.id === intent.sessionId),
-      { name: t("scheduler.usageLimitRecoveryName"), prompt: t("scheduler.usageLimitRecoveryPrompt") }
-    );
-  });
-  const [editor, setEditor] = useState<ScheduleView | "new" | undefined>(() => usageRecoveryDraft === undefined ? undefined : "new");
+    if (intent === undefined) return;
+    const session = sessions.find(candidate => candidate.id === intent.sessionId);
+    if (intent.owner !== undefined && (connectionState !== "connected" || profile?.id !== intent.owner.profileId
+      || profile.serverId !== intent.owner.serverId || connectionGeneration !== intent.owner.connectionGeneration
+      || session === undefined || session.archived || session.state === "closed")) return;
+    setUsageRecoveryDraft(buildUsageLimitScheduleDraft(scheduleDraft(undefined, targets, sessions, models, backends),
+      intent, session, { name: t("scheduler.usageLimitRecoveryName"), prompt: t("scheduler.usageLimitRecoveryPrompt") }));
+    setEditor("new");
+  }, [backends, connectionGeneration, connectionState, models, profile?.id, profile?.serverId, sessions, t, targets]);
   const [selectedId, setSelectedId] = useState<string>();
   const [statusFilter, setStatusFilter] = useState<ScheduleStatusFilter>(() => readScheduleStatusFilter());
   const [collapsedGroups, setCollapsedGroups] = useState<ReadonlySet<string>>(() => readCollapsedGroups());

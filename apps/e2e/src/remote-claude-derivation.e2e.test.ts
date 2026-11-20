@@ -392,11 +392,11 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
     expect(running.application.store.listSessions({ includeArchived: true, includeDeleted: true })
       .some(session => session.descriptor.id === renamedPlan.sessionId)).toBe(false);
     expect(remote.messages(sourceNativeId)).toEqual(sourceHistory);
-    const renamedClients = createE2eClients(running.baseUrl, paired.authKey);
+    let renamedClients = createE2eClients(running.baseUrl, paired.authKey);
     expect(await submit(renamedClients.operation, paired.connection.id, renamedClone, renamedCloneId)).toEqual(renamedResult);
     expect(remote.deriveCount).toBe(derivesBeforeRetry);
 
-    const currentStore = running.application.store;
+    let currentStore = running.application.store;
     const currentTarget = currentStore.getTarget(targetId);
     expect((await renamedClients.target.getTarget({ targetId })).target?.sshWorktreeDerivationAllowed).toBe(true);
     currentStore.upsertTarget({ ...currentTarget.descriptor, managed: false }, currentTarget.metadata);
@@ -423,8 +423,16 @@ it("keeps a remote Claude checkout and stored fork exact through dispatch, resta
     expect(currentStore.getSession(sourceId).descriptor.worktree).toBeUndefined();
 
     currentStore.upsertTarget(currentTarget.descriptor, currentTarget.metadata);
+    // The fixture bypassed live Target admission to toggle the managed classification.
+    // Reopen the original native binding against the restored Target before testing trust changes.
+    await running.close(); running = await start(config, remote);
+    currentStore = running.application.store;
+    renamedClients = createE2eClients(running.baseUrl, paired.authKey);
+    expect((await renamedClients.target.getTarget({ targetId })).target?.sshWorktreeDerivationAllowed).toBe(true);
+    expect(currentStore.getSession(sourceId).descriptor.binding.nativeSessionId).toBe(sourceNativeId);
     const separate = await submit(renamedClients.operation, paired.connection.id, cloneMutation(sourceId, "Lease before trust changes"));
-    expect(separate.state).toBe(OperationState.SUCCEEDED);
+    expect(separate.state, JSON.stringify({ error: separate.error?.message, code: separate.error?.code,
+      manager: remote.managerCalls.slice(-12), checkout: remote.checkoutCalls.slice(-12) })).toBe(OperationState.SUCCEEDED);
     const separateId = sessionIdFrom(separate);
     const preview = () => renamedClients.worktree.getSessionWorktreeRemovalPreview({ sessionId: separateId });
     await renameProject(renamedClients, "Display rename before revocation");

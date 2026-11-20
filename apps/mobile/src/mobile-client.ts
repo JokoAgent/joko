@@ -7,7 +7,7 @@ import { ExtensionPackageAction } from "@joko/contracts";
 import { COLLABORATION_WORKER_HARD_LIMIT_CODE, ErrorInfoSchema } from "@joko/contracts";
 import { projectProviderGroupRebalance, type ProviderGroupRebalanceSuggestion } from "@joko/contracts";
 import { assertMobileExtensionPackagePreview, type MobileExtensionPackagePreview } from "./mobile-extension-packages";
-import { executeExtensionSettingsCall, ExtensionSettingsRejected, type ExtensionLibraryFileMatch } from "@joko/connection-transport";
+import { currentQueueRetryInput, executeExtensionSettingsCall, ExtensionSettingsRejected, type ExtensionLibraryFileMatch } from "@joko/connection-transport";
 import type { SessionArchivePreview } from "@joko/contracts";
 import { InteractionSchema, splitQuestionReferences } from "@joko/contracts";
 import { clipBareHttpAutolinkText } from "./mobile-markdown-url-boundary";
@@ -15089,26 +15089,33 @@ export class MobileClient {
   }
 
   async retryQueueItem(source: QueueItem): Promise<boolean> {
-    const current = () => this.taskRetryableQueueItems().find(item => item.queueItemId === source.queueItemId
+    const before = this.#state.detail;
+    const original = this.taskRetryableQueueItems().find(item => item.queueItemId === source.queueItemId
       && item.runId === source.runId && item.sessionId === source.sessionId
       && item.version?.generation === source.version?.generation
       && item.version?.revision?.value === source.version?.revision?.value);
-    const item = current();
-    if (!item) throw new Error("This failed queued input is no longer available to retry.");
-    this.#assertNoPendingQueueMutation(item.sessionId, item.queueItemId);
+    if (!before || !original) throw new Error("This failed queued input is no longer available to retry.");
+    this.#assertNoPendingQueueMutation(original.sessionId, original.queueItemId);
     const credential = this.#ready(), epoch = this.#epoch;
-    const precondition = this.#queueItemPrecondition(item);
+    const signal = this.#abort!.signal;
     const action = this.#claimMutation();
     try {
+      const snapshot = await this.network.readSession(credential, original.sessionId, signal);
+      const item = currentQueueRetryInput(before, original, snapshot);
+      const isCurrent = () => this.#current(epoch) && this.#credential === credential;
+      const beforeDispatch = () => {
+        const detail = this.#state.detail;
+        return isCurrent() && this.#state.selectedId === original.sessionId && this.#taskAuthorityKey() !== undefined
+          && detail !== undefined && currentQueueRetryInput(before, original, detail, { allowStaleQueueProjection: true }) !== undefined;
+      };
+      if (!item || !beforeDispatch()) throw new Error("This failed queued input is no longer available to retry.");
+      const precondition = this.#queueItemPrecondition(item);
       const result = await this.#submitTerminal(create(OperationMutationSchema, {
         preconditions: [precondition],
         payload: { case: "retryRun", value: create(RetryRunMutationSchema, { runId: item.runId }) }
       }), { kind: "queue-retry", sessionId: item.sessionId, queueItemId: item.queueItemId, runId: item.runId,
         sourceGeneration: precondition.expectedGeneration.toString() }, undefined, true, true, {
-        signal: this.#abort!.signal,
-        isCurrent: () => this.#current(epoch) && this.#credential === credential,
-        beforeDispatch: () => current() !== undefined,
-        retireUndispatched: true
+        signal, isCurrent, beforeDispatch, retireUndispatched: true
       });
       return result.accepted && result.definitive;
     } finally { this.#releaseMutation(action); }
