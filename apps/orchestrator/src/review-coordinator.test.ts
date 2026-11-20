@@ -320,7 +320,7 @@ describe("ReviewCoordinator", () => {
 
   it.each([
     [{ state: "completed", visibleResult: "" }, "no-visible-result"],
-    [{ state: "aborted" }, "cancelled-before-start"],
+    [{ state: "aborted" }, "reviewer-closed"],
     [{ state: "closed" }, "reviewer-closed"],
     [{ state: "failed" }, "provider-failed"]
   ] as const)("maps runtime outcome %j to %s", async (outcome, failureCode) => {
@@ -335,6 +335,9 @@ describe("ReviewCoordinator", () => {
     expect(fixture.store.getOperation("start-review-op").status).toBe("completed");
     await coordinator.waitForFinalizations();
     expect(fixture.store.getReviewRun(result.reviewRunId)).toMatchObject({ state: "failed", failureCode });
+    expect(fixture.store.listEvents({ sessionId: "source" }).filter(event => event.payload.type === "review_run_changed"
+      && event.payload.reviewRun.id === result.reviewRunId && event.payload.reviewRun.state === "failed"))
+      .toMatchObject([{ payload: { reviewRun: { failureCode } } }]);
   });
 
   it("returns the durable running card at Backend acceptance without waiting for reviewer terminal output", async () => {

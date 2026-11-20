@@ -467,8 +467,7 @@ export class ReviewCoordinator {
       const current = this.#store.getReviewRun(input.reviewRunId);
       if (current.state !== "running") return;
       if (outcome.state !== "completed") {
-        const failure = outcome.state === "aborted" ? "cancelled-before-start"
-          : outcome.state === "closed" ? "reviewer-closed" : "provider-failed";
+        const failure = outcome.state === "aborted" || outcome.state === "closed" ? "reviewer-closed" : "provider-failed";
         this.#fail(current, input.fencingToken, failure, input.operationId);
         return;
       }
