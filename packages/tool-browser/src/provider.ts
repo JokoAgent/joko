@@ -2673,6 +2673,10 @@ export class BrowserProvider {
       () => undefined
     );
     try {
+      // Playwright sends the chooser subscription asynchronously. Give the
+      // renderer a round trip before dispatching the original trusted click.
+      await page.evaluate(() => document.readyState);
+      assertClickCurrent();
       await click();
       const input = await chooser;
       assertClickCurrent();
