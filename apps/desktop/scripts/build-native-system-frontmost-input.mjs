@@ -30,6 +30,7 @@ const architectures = Object.freeze({
 const headerNames = new Set([
   "node_api.h", "node_api_types.h", "js_native_api.h", "js_native_api_types.h"
 ]);
+const trackpadArtifact = nativeArtifacts.SIMPLE_NATIVE_ARTIFACTS.trackpad;
 
 mkdirSync(outputRoot, { recursive: true });
 for (const name of Object.values(helperNames)) {
@@ -74,7 +75,15 @@ if (process.platform === "win32" || process.platform === "darwin" || process.pla
     cacheVerifiedBytes(join(includeRoot, name), bytes, digest(bytes));
   }
   if (process.platform === "win32") buildWindows(architecture, includeRoot, join(cacheRoot, "node.lib"));
-  else if (process.platform === "darwin") buildMac(architecture, includeRoot);
+  else if (process.platform === "darwin") {
+    buildMac(architecture, includeRoot);
+    buildMacTrackpad(process.arch, includeRoot, join(desktopRoot, "dist", trackpadArtifact.directory));
+    if (process.argv[2] === "--check-trackpad-architectures") {
+      const checkRoot = process.argv[3];
+      if (!checkRoot || !isAbsolute(checkRoot)) throw new Error("The trackpad check output must use an absolute directory.");
+      for (const target of ["x64", "arm64"]) buildMacTrackpad(target, includeRoot, join(checkRoot, target));
+    }
+  }
   else buildLinux(architecture, includeRoot);
   writeManifest(helperName, digest(readFileSync(output)));
 }
@@ -212,6 +221,25 @@ function buildMac(architecture, includeRoot) {
       "-lproc", "-o", temporary], undefined, 60_000);
     if (!existsSync(temporary)) throw new Error("The macOS system frontmost native build produced no helper.");
     renameSync(temporary, output);
+  } finally {
+    if (existsSync(temporary)) rmSync(temporary);
+  }
+}
+
+function buildMacTrackpad(architecture, includeRoot, directory) {
+  const helper = trackpadArtifact.helpers.darwin;
+  const destination = join(directory, helper);
+  const temporary = join(directory, "joko-macos-trackpad.build.node");
+  mkdirSync(directory, { recursive: true });
+  try {
+    run("xcrun", ["--sdk", "macosx", "clang++", "-std=c++17", "-O2", "-fobjc-arc",
+      "-bundle", "-undefined", "dynamic_lookup", "-arch", architecture === "x64" ? "x86_64" : architecture,
+      "-DNAPI_VERSION=8", `-I${includeRoot}`, join(desktopRoot, "native", "trackpad", "macos-trackpad.mm"),
+      "-framework", "AppKit", "-o", temporary], undefined, 60_000);
+    renameSync(temporary, destination);
+    writeFileSync(join(directory, "manifest.json"), `${JSON.stringify({
+      architecture, helper, platform: "darwin", protocolVersion: 1, sha256: digest(readFileSync(destination))
+    }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   } finally {
     if (existsSync(temporary)) rmSync(temporary);
   }

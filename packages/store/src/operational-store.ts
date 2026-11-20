@@ -11206,7 +11206,40 @@ export class OperationalStore {
         type: "partner_learning_changed", completionEventId, messageId: turn.messageId!, feedback } });
   }
 
+  findCompletedAssistantReply(runId: string): PersistedEvent | undefined {
+    const run = this.findRun(runId)?.descriptor;
+    return run?.source === "user" && run.state === "completed" ? this.latestRunUsageCompletion(run.id) : undefined;
+  }
+
+  recordAssistantMessagePresentation(input: {
+    readonly completionEventId: string;
+    readonly text: string;
+    readonly card?: import("@joko/core").ExtensionCardProjection;
+    readonly assertCurrent: () => void;
+  }): void {
+    this.write(() => {
+      input.assertCurrent();
+      const source = this.findEvent(input.completionEventId);
+      if (source === undefined || source.payload.type !== "message_complete" || source.payload.role !== "assistant"
+        || source.runId === undefined || this.findCompletedAssistantReply(source.runId)?.id !== source.id
+        || input.text.trim() === "" || input.text.length > 16_000
+        || input.card !== undefined && (input.card.sessionId !== source.sessionId || input.card.text !== input.text)) {
+        throw new StoreError("The assistant completion is unavailable for extension presentation.");
+      }
+      const id = `assistant-presentation:${source.id}`;
+      if (this.findEvent(id, { includeTombstoned: true }) !== undefined) return;
+      this.appendSessionEvent({ id, sessionId: source.sessionId, backendId: source.backendId, targetId: source.targetId,
+        generation: source.generation, runId: source.runId, traceId: id,
+        payload: { type: "assistant_message_presentation_changed", completionEventId: source.id,
+          messageId: source.payload.nativeHistory?.identity?.entryId ?? source.id, text: input.text,
+          ...(input.card === undefined ? {} : { card: input.card }) } });
+    });
+  }
+
   appendEvent(input: AppendEventInput): PersistedEvent {
+    if (input.payload.type === "assistant_message_presentation_changed") {
+      throw new StoreError("Assistant presentation requires the extension host owner.");
+    }
     if (input.payload.type === "partner_learning_changed") {
       throw new StoreError("Learning feedback is owned by the Store, not Session adapters.");
     }

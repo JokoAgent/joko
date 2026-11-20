@@ -101,7 +101,16 @@ message EventPayload {
     McpAppChangedEvent mcp_app_changed = 79;
     ExtensionCardChangedEvent extension_card_changed = 80;
     PartnerSessionTaskReceiptEvent partner_session_task_receipt = 81;
+    AssistantMessagePresentationChangedEvent assistant_message_presentation_changed = 82;
   }
+}
+
+// Owner-authorized presentation of one committed assistant completion.
+message AssistantMessagePresentationChangedEvent {
+  string completion_event_id = 1;
+  string message_id = 2;
+  string text = 3;
+  ExtensionCard card = 4;
 }
 
 // Owner-visible receipt in the original requesting Session's timeline.

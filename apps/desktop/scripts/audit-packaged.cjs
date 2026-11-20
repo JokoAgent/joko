@@ -143,6 +143,9 @@ module.exports = async function auditPackaged(context) {
   await auditNativeHardware(resolve(resourcesRoot, "native-hardware"), context.electronPlatformName, targetArch);
   await auditNativeGamepad(resolve(resourcesRoot, "native-gamepad"), context.electronPlatformName, targetArch);
   await auditNativeMenuBar(resolve(resourcesRoot, "native-menu-bar"), context.electronPlatformName, targetArch);
+  if (context.electronPlatformName === "darwin") {
+    await auditNativeTrackpad(resolve(resourcesRoot, SIMPLE_NATIVE_ARTIFACTS.trackpad.directory), "darwin", targetArch);
+  }
 
   const applicationEntries = await readdir(applicationRoot, { withFileTypes: true });
   const unexpectedApplicationRoot = applicationEntries.find((entry) =>
@@ -334,6 +337,7 @@ module.exports.auditNativeSystemFrontmostInput = auditNativeSystemFrontmostInput
 module.exports.auditNativeHardware = auditNativeHardware;
 module.exports.auditNativeGamepad = auditNativeGamepad;
 module.exports.auditNativeMenuBar = auditNativeMenuBar;
+module.exports.auditNativeTrackpad = auditNativeTrackpad;
 module.exports.auditDesktopLinkspanRuntime = auditDesktopLinkspanRuntime;
 module.exports.createDedicatedHardwareSdkDirectoryIntegrity = createDedicatedHardwareSdkDirectoryIntegrity;
 module.exports.createDedicatedHardwareSdkManifestIntegrity = createDedicatedHardwareSdkManifestIntegrity;
@@ -883,6 +887,10 @@ async function auditNativeGamepad(root, platform, targetArch) {
 
 async function auditNativeMenuBar(root, platform, targetArch) {
   return auditNativeMacHelper(root, platform, targetArch, SIMPLE_NATIVE_ARTIFACTS.menuBar, "native menu bar");
+}
+
+async function auditNativeTrackpad(root, platform, targetArch) {
+  return auditNativeMacHelper(root, platform, targetArch, SIMPLE_NATIVE_ARTIFACTS.trackpad, "native trackpad");
 }
 
 async function auditNativeMacHelper(root, platform, targetArch, artifact, label) {

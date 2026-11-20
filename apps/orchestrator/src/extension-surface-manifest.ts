@@ -48,6 +48,17 @@ export interface ExtensionRoutineEventsDescriptor {
   readonly events: readonly { readonly type: string; readonly name: string; readonly fields: readonly string[] }[];
 }
 
+const MESSAGE_SUBSCRIPTION_TOPICS = ["turn", "session"] as const;
+const MESSAGE_SUBSCRIPTION_HOOKS = ["will-user-message", "will-assistant-message"] as const;
+
+export type ExtensionMessageTopic = typeof MESSAGE_SUBSCRIPTION_TOPICS[number];
+export type ExtensionMessageHook = typeof MESSAGE_SUBSCRIPTION_HOOKS[number];
+
+export interface ExtensionMessageSubscription {
+  readonly topics: readonly ExtensionMessageTopic[];
+  readonly hooks: readonly ExtensionMessageHook[];
+}
+
 export type ExtensionRecommendationLocale = "en" | "zh-CN";
 
 export interface ExtensionRecommendationTranslation {
@@ -190,10 +201,11 @@ export function parseExtensionSurfaceManifest(
 
 export function parseExtensionRuntime(value: unknown, taskViewAvailable = false): ExtensionRuntimeDescriptor {
   const raw = requirePlainObject(value, "Extension runtime");
-  requireExactKeys(raw, ["html", "tools", "card", "mail", "mailReader", "agent", "network", "tasks", "targets", "text", "showTaskPreferences", "deviceSync", "pick", "image"], ["html", "tools"], "Extension runtime");
+  requireExactKeys(raw, ["html", "tools", "card", "mail", "mailReader", "agent", "network", "tasks", "targets", "text", "showTaskPreferences", "deviceSync", "pick", "image", "subscribe"], ["html", "tools"], "Extension runtime");
   const html = requirePortablePath(raw.html, "Extension runtime HTML");
   if (extname(html) !== ".html" || posix.dirname(html) === ".") throw new Error("Extension runtime HTML must be in a self-contained directory.");
-  if (!Array.isArray(raw.tools) || raw.tools.length > 64 || raw.tools.length === 0 && !taskViewAvailable && raw.tasks === undefined && raw.text === undefined && raw.deviceSync === undefined && raw.pick === undefined && raw.image === undefined) throw new Error("Extension runtime must declare a tool or a supported capability.");
+  const subscribe = raw.subscribe === undefined ? undefined : parseMessageSubscription(raw.subscribe);
+  if (!Array.isArray(raw.tools) || raw.tools.length > 64 || raw.tools.length === 0 && !taskViewAvailable && raw.tasks === undefined && raw.text === undefined && raw.deviceSync === undefined && raw.pick === undefined && raw.image === undefined && subscribe === undefined) throw new Error("Extension runtime must declare a tool or a supported capability.");
   const tools = raw.tools.map(item => {
     const tool = requirePlainObject(item, "Extension tool");
     requireExactKeys(tool, ["name", "description", "inputSchema", "readOnly"], ["name", "description", "inputSchema"], "Extension tool");
@@ -243,7 +255,25 @@ export function parseExtensionRuntime(value: unknown, taskViewAvailable = false)
     ...(raw.pick === true ? { pick: true } : {}),
     ...(raw.image === undefined ? {} : { image: ["generate"] as const }),
     ...(raw.targets === true ? { targets: true } : {}),
+    ...(subscribe === undefined ? {} : { subscribe }),
     ...(tasks ? { tasks } : {}), ...(text ? { text } : {}), ...(typeof raw.showTaskPreferences === "boolean" ? { showTaskPreferences: raw.showTaskPreferences } : {}) };
+}
+
+function parseMessageSubscription(value: unknown): ExtensionMessageSubscription {
+  const raw = requirePlainObject(value, "Extension message subscription");
+  requireExactKeys(raw, ["topics", "hooks"], [], "Extension message subscription");
+  const topics = subscriptionNames(raw.topics, MESSAGE_SUBSCRIPTION_TOPICS);
+  const hooks = subscriptionNames(raw.hooks, MESSAGE_SUBSCRIPTION_HOOKS);
+  if (topics.length === 0 && hooks.length === 0) throw new Error("Extension subscription must declare a topic or hook.");
+  return { topics, hooks };
+}
+
+function subscriptionNames<Name extends string>(value: unknown, allowed: readonly Name[]): readonly Name[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > allowed.length) throw new Error("Extension subscription names are invalid.");
+  const selected = allowed.filter(name => value.includes(name));
+  if (selected.length !== value.length) throw new Error("Extension subscription names must be supported and unique.");
+  return selected;
 }
 
 /** Flat plugin event declarations. */
@@ -454,6 +484,7 @@ export interface ExtensionRuntimeDescriptor {
   readonly mailReader?: MailReaderDeclaration;
   readonly agent?: true;
   readonly deviceSync?: true;
+  readonly subscribe?: ExtensionMessageSubscription;
   readonly pick?: true;
   readonly image?: readonly ["generate"];
   readonly targets?: true;

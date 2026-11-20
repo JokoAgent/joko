@@ -3053,11 +3053,12 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
     }
     case "extension_card_changed":
       return protoPayload("extensionCardChanged", message<contract.ExtensionCardChangedEvent>("joko.v1.ExtensionCardChangedEvent", {
-        card: message<contract.ExtensionCard>("joko.v1.ExtensionCard", {
-          cardId: payload.card.id, sessionId: payload.card.sessionId, extensionId: payload.card.extensionId,
-          extensionName: payload.card.extensionName, toolUseId: payload.card.toolUseId, html: payload.card.html,
-          text: payload.card.text, height: payload.card.height, updatedAt: toProtoTimestamp(payload.card.updatedAt)
-        })
+        card: toProtoExtensionCard(payload.card)
+      }));
+    case "assistant_message_presentation_changed":
+      return protoPayload("assistantMessagePresentationChanged", message<contract.AssistantMessagePresentationChangedEvent>("joko.v1.AssistantMessagePresentationChangedEvent", {
+        completionEventId: payload.completionEventId, messageId: payload.messageId, text: payload.text,
+        card: payload.card === undefined ? undefined : toProtoExtensionCard(payload.card)
       }));
     case "mcp_app_changed":
       return protoPayload("mcpAppChanged", message<contract.McpAppChangedEvent>("joko.v1.McpAppChangedEvent", {
@@ -3584,6 +3585,13 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
   }
 }
 
+function toProtoExtensionCard(card: import("@joko/core").ExtensionCardProjection): contract.ExtensionCard {
+  return message<contract.ExtensionCard>("joko.v1.ExtensionCard", {
+    cardId: card.id, sessionId: card.sessionId, extensionId: card.extensionId, extensionName: card.extensionName,
+    toolUseId: card.toolUseId, html: card.html, text: card.text, height: card.height, updatedAt: toProtoTimestamp(card.updatedAt)
+  });
+}
+
 function fromProtoEventPayload(
   payload: ProtoEventPayload,
   sessionId: string,
@@ -3596,6 +3604,8 @@ function fromProtoEventPayload(
       throw new ProtoMappingError("invalid_argument", "event.payload.partner_session_task_receipt", "Partner task receipts are service-owned and cannot be imported as Session events.");
     case "extensionCardChanged":
       throw new ProtoMappingError("invalid_argument", "event.payload.extension_card_changed", "Extension cards are service-owned and cannot be imported as Session events.");
+    case "assistantMessagePresentationChanged":
+      throw new ProtoMappingError("invalid_argument", "event.payload.assistant_message_presentation_changed", "Assistant presentation requires the extension host owner.");
     case "mcpAppChanged":
       throw new ProtoMappingError("invalid_argument", "event.payload.mcp_app_changed", "MCP App cards are service-owned and cannot be imported as Session events.");
     case "partnerLearningChanged":

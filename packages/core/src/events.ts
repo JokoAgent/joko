@@ -154,6 +154,8 @@ export type EventPayload =
   /** Store-owned metadata for one existing assistant completion, never a new message. */
   | { readonly type: "partner_learning_changed"; readonly completionEventId: string; readonly messageId: string;
       readonly feedback: import("./partner-learning.js").PartnerLearningFeedback }
+  | { readonly type: "assistant_message_presentation_changed"; readonly completionEventId: string; readonly messageId: string;
+      readonly text: string; readonly card?: ExtensionCardProjection }
   | { readonly type: "run_state"; readonly state: RunState; readonly error?: PublicError; readonly usage?: RunUsageSummary }
   /** Store-owned observation; never emitted by a Session adapter. */
   | { readonly type: "device_changed"; readonly device: DeviceContentProjection }

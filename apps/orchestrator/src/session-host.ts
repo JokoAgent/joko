@@ -3689,6 +3689,35 @@ export class SessionHost {
       && BigInt(stored.descriptor.binding.generation) === generation && this.isOrdinaryLocalSession(stored);
   }
 
+  extensionMessageHookTarget(sessionId: string, generation: bigint, archived = false): string | undefined {
+    this.#assertOpen();
+    const stored = this.#store.findSession(sessionId);
+    if (stored === undefined || BigInt(stored.descriptor.binding.generation) !== generation || stored.descriptor.archived !== archived
+      || !this.isOrdinaryLocalSession(stored, archived)
+      || this.#store.findPendingSessionLifecycleCleanup(sessionId) !== undefined
+      || readPersonalDevelopmentPurpose(this.#store, sessionId) !== undefined) return undefined;
+    const target = this.#store.getTarget(stored.descriptor.targetId).descriptor;
+    return target.trusted && this.#store.getBackend(stored.descriptor.backendId).descriptor.adapterKind !== "hosted" ? target.id : undefined;
+  }
+
+  extensionSubscriptionRun(sessionId: string, runId: string): { readonly modelId?: string; readonly assertCurrent: () => void } | undefined {
+    const queue = this.#store.findQueueItemByRunId(sessionId, runId, { includeCleared: true });
+    if (queue === undefined || !this.isOwnerRunInput(queue)) return undefined;
+    const operation = this.#store.getOperation(queue.operationId);
+    const owner = this.#store.getConnection(operation.connectionId!);
+    const session = this.#store.getSession(sessionId).descriptor;
+    const assertCurrent = () => {
+      this.#store.authorizeConnection(owner.id, owner.authKeyDigest);
+      const current = this.#store.getQueueItem(queue.id);
+      if (this.extensionMessageHookTarget(sessionId, BigInt(session.binding.generation)) !== session.targetId
+        || current.runId !== runId || current.operationId !== queue.operationId || current.bodyHash !== queue.bodyHash
+        || !this.isOwnerRunInput(current)) throw new StoreError("The original task message changed.");
+    };
+    try { assertCurrent(); } catch { return undefined; }
+    const modelId = queue.executionOverrides?.modelId ?? session.modelId;
+    return { ...(modelId === undefined ? {} : { modelId }), assertCurrent };
+  }
+
   /** Called inside the caller's authorized Store transaction; no adapter effects run here. */
   assertArchivedSessionSendRestorable(sessionId: string): void {
     const session = this.#store.getSession(sessionId).descriptor;
@@ -11514,17 +11543,17 @@ export class SessionHost {
       && this.isOrdinaryLocalSession(stored);
   }
 
-  private isOrdinaryLocalSession(stored: StoredSession): boolean {
+  private isOrdinaryLocalSession(stored: StoredSession, allowArchived = false): boolean {
     const session = stored.descriptor;
     return session.remoteWorkspace === undefined
       && this.#store.getTarget(session.targetId).descriptor.remoteWorkspace === undefined
-      && this.isOrdinarySession(stored);
+      && this.isOrdinarySession(stored, allowArchived);
   }
 
-  private isOrdinarySession(stored: StoredSession): boolean {
+  private isOrdinarySession(stored: StoredSession, allowArchived = false): boolean {
     const session = stored.descriptor;
     return session.automationOrigin === undefined && session.derivationOrigin?.sideChat !== true
-      && !session.hidden && !session.archived && session.deletedAt === undefined
+      && !session.hidden && (allowArchived || !session.archived) && session.deletedAt === undefined
       && this.#store.sessionCreationServiceKind(session.id) === undefined
       && this.#partnerSessionPolicy(session.id) === undefined
       && this.#store.findSessionRuntimePolicy(session.id) === undefined;

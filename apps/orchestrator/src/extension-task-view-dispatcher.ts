@@ -50,6 +50,7 @@ export type ExtensionTaskViewResult = { readonly ok: true; readonly sessionId: s
 interface Options {
   readonly authority: (extensionId: string) => { readonly installationKey: string; readonly revision: bigint } | undefined;
   readonly taskAvailable: (extensionId: string, sessionId: string) => boolean;
+  readonly observeFocus?: (sessionId: string, assertCurrent: () => void) => void;
   readonly now?: () => number;
 }
 
@@ -66,7 +67,15 @@ export class ExtensionTaskViewDispatcher {
     viewer.assertCurrent();
     if (!viewer.connectionId || viewer.focusedSessionId !== undefined && !taskId(viewer.focusedSessionId)) throw new Error("Invalid task-view viewer context.");
     if (this.#viewers.size >= 128) throw new Error("Task-view viewer capacity reached.");
+    const alreadyFocused = [...this.#viewers.values()].some(current => {
+      if (current.connectionId !== viewer.connectionId || current.focusedSessionId !== viewer.focusedSessionId) return false;
+      try { current.assertCurrent(); return true; } catch { return false; }
+    });
     const key = Symbol(); this.#viewers.set(key, viewer);
+    if (!alreadyFocused && viewer.focusedSessionId !== undefined) this.options.observeFocus?.(viewer.focusedSessionId, () => {
+      viewer.assertCurrent();
+      if (this.#viewers.get(key) !== viewer) throw new Error("The original foreground task changed.");
+    });
     return () => { this.#viewers.delete(key); };
   }
 

@@ -13121,6 +13121,7 @@ export function projectSnapshotEvent(
     case "statusStream":
     case "messageCompleted":
     case "partnerLearningChanged":
+    case "assistantMessagePresentationChanged":
     case "partnerSessionTaskReceipt":
     case "mcpAppChanged":
     case "extensionCardChanged":
@@ -13265,6 +13266,7 @@ function isTimelineEvent(kind: NonNullable<NonNullable<Event["payload"]>["kind"]
     || kind === "statusStream"
     || kind === "messageCompleted"
     || kind === "partnerLearningChanged"
+    || kind === "assistantMessagePresentationChanged"
     || kind === "partnerSessionTaskReceipt"
     || kind === "mcpAppChanged"
     || kind === "extensionCardChanged"
@@ -13532,6 +13534,15 @@ function projectTimelineEvent(
         items[index] = { ...item, learning };
         changed = true;
       }
+      break;
+    }
+    case "assistantMessagePresentationChanged": {
+      const update = kind.value;
+      const index = items.findIndex(item => item.kind === "assistant" && item.streaming !== true
+        && item.sourceEventId === update.completionEventId && (item.messageId ?? item.id) === update.messageId);
+      const item = items[index];
+      changed = item !== undefined && update.text.trim() !== "" && (update.card === undefined || update.card.sessionId === sessionId);
+      if (item !== undefined && changed) items[index] = { ...item, text: update.text, assistantPresentationCard: update.card };
       break;
     }
     case "toolCallStarted":

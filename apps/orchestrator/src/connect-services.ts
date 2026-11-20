@@ -562,6 +562,7 @@ export interface ConnectServiceDependencies {
   ) => void;
   readonly runtimeProcesses: RuntimeProcessControl;
   readonly sessionHost: SessionHost;
+  readonly extensionMessageHooks?: OrchestratorApplication["extensionMessageHooks"];
   readonly sessionWorktrees?: SessionWorktreeCoordinator;
   readonly isPartnerCanonicalTask?: (sessionId: string) => boolean;
   readonly isPartnerStarterTaskActive?: (sessionId: string) => boolean;
@@ -1377,6 +1378,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
       (backendId, effect) => application.sessionHost.invokeBackendAdapter(backendId, effect)
     ),
     sessionHost: application.sessionHost,
+    ...(application.extensionMessageHooks === undefined ? {} : { extensionMessageHooks: application.extensionMessageHooks }),
     sessionWorktrees: application.sessionWorktrees,
     isPartnerCanonicalTask: sessionId => application.partners?.isCanonicalTask(sessionId) === true,
     isPartnerStarterTaskActive: sessionId => {
@@ -17705,6 +17707,9 @@ async function dispatchMutation(
             if (nested.value.sessionId !== sessionId) throw new Error("CreateSession derive returned a non-deterministic Session ID.");
           }
         });
+        if (!execution.replayed && execution.value.accepted) {
+          dependencies.extensionMessageHooks?.publishSessionLifecycle("did-session-created", sessionId, () => dependencies.connections.fence(connection));
+        }
         return presented(execution);
       }
       const execution = await host.mutate({
@@ -17765,6 +17770,9 @@ async function dispatchMutation(
           if (nested.value.sessionId !== sessionId) throw new Error("CreateSession returned a non-deterministic Session ID.");
         }
       });
+      if (!execution.replayed && execution.value.accepted && reuseProvisionalSessionId === undefined) {
+        dependencies.extensionMessageHooks?.publishSessionLifecycle("did-session-created", sessionId, () => dependencies.connections.fence(connection));
+      }
       return presented(execution);
       });
     }
@@ -18054,6 +18062,9 @@ async function dispatchMutation(
           preserveClaimOnEffectFailure: () =>
             dependencies.store.findSessionLifecycleCleanup(operationId)?.state === "pending"
         });
+        if (!execution.replayed && execution.value.accepted && !existing.descriptor.archived) {
+          dependencies.extensionMessageHooks?.publishSessionLifecycle("did-session-archived", payload.value.sessionId, () => dependencies.connections.fence(connection));
+        }
         return presented(execution);
       } catch (error) {
         if (dependencies.store.findSessionLifecycleCleanup(operationId)?.state === "pending") {
@@ -18529,6 +18540,9 @@ async function dispatchMutation(
       }
       const disposition = deliveryMode(payload.value.deliveryMode);
       const prompt = fromProtoInputContent(payload.value.input, disposition);
+      let effectivePrompt = prompt;
+      let assertRewriteAuthorized: (() => void) | undefined;
+      let assertHookSourceCurrent: (() => void) | undefined;
       const overrides = coreTurnOverrides(payload.value.overrides);
       const starterEventId = payload.value.partnerStarterEventId === undefined ? undefined
         : strictDerivationIdentity(payload.value.partnerStarterEventId, "send_input.partner_starter_event_id");
@@ -18542,7 +18556,7 @@ async function dispatchMutation(
       const finish = (execution: OperationExecution<OperationOutcome>) => {
         if (!execution.replayed && execution.value.accepted) {
           host.drainQueuedInput(payload.value.sessionId);
-          dependencies.sessionNavigation?.observeAcceptedPrompt(payload.value.sessionId, prompt);
+          dependencies.sessionNavigation?.observeAcceptedPrompt(payload.value.sessionId, effectivePrompt);
         }
         return presented(execution);
       };
@@ -18564,9 +18578,36 @@ async function dispatchMutation(
           protocol: { kind: "connect", body: mutation, precondition: store => validatePreconditions(store, mutation) }
         }));
       }
-      const needsWorkspaceRestore = dependencies.store.getSession(payload.value.sessionId).descriptor.archived
-        && dependencies.store.getSession(payload.value.sessionId).descriptor.worktree?.state === "preserved";
+      const sendingSession = dependencies.store.getSession(payload.value.sessionId).descriptor;
+      const needsWorkspaceRestore = sendingSession.archived && sendingSession.worktree?.state === "preserved";
       if (starterEventId !== undefined && needsWorkspaceRestore) throw new ConnectError("The original Partner opening is no longer available.", Code.FailedPrecondition);
+      const messageHooks = dependencies.extensionMessageHooks;
+      const sessionId = payload.value.sessionId;
+      const hookTarget = messageHooks !== undefined && starterEventId === undefined && prompt.text.trim() !== ""
+        ? host.extensionMessageHookTarget(sessionId, generation, sendingSession.archived) : undefined;
+      const screen = messageHooks !== undefined && hookTarget !== undefined && messageHooks.hasMessageHook("will-user-message", hookTarget)
+        ? async () => {
+          const assertCurrent = () => {
+            dependencies.connections.fence(connection);
+            validatePreconditions(dependencies.store, mutation);
+            if (host.extensionMessageHookTarget(sessionId, generation, sendingSession.archived) !== hookTarget) {
+              throw new StoreError("The original task can no longer share this message with an extension.");
+            }
+          };
+          const verdict = await messageHooks.screenMessage({ type: "will-user-message", sessionId, text: prompt.text, assertCurrent });
+          assertCurrent();
+          assertHookSourceCurrent = assertCurrent;
+          if (verdict.action === "block") {
+            throw new JokoError({ code: "EXTENSION_MESSAGE_BLOCKED", phase: "admission", retryable: false, stateMayHaveChanged: false,
+              message: verdict.reason === undefined ? `${verdict.extensionName} blocked this message.`
+                : `${verdict.extensionName} blocked this message. ${verdict.reason}`,
+              recovery: "Edit the draft or change the extension's settings before sending again." });
+          }
+          if (verdict.action === "rewrite") {
+            effectivePrompt = rewriteExtensionMessageInput(prompt, verdict.text);
+            if (effectivePrompt !== prompt) assertRewriteAuthorized = verdict.assertAuthorized;
+          }
+        } : undefined;
       const execution = await host.mutate({
         operationId,
         connection,
@@ -18575,14 +18616,17 @@ async function dispatchMutation(
         ...(needsWorkspaceRestore ? {
           precondition: () => host.assertArchivedSessionSendRestorable(payload.value.sessionId),
           effect: async () => {
+            await screen?.();
             host.assertArchivedSessionSendRestorable(payload.value.sessionId);
             if (dependencies.sessionWorktrees === undefined) throw new ConnectError("Isolated workspace lifecycle is unavailable.", Code.FailedPrecondition);
             await dependencies.sessionWorktrees.restore(payload.value.sessionId, {
               assertCurrent: () => { dependencies.connections.fence(connection); }
             });
           }
-        } : {}),
+        } : screen === undefined ? {} : { effect: screen }),
         commit: (store) => {
+          assertHookSourceCurrent?.();
+          try { assertRewriteAuthorized?.(); } catch { effectivePrompt = prompt; }
           if (starterEventId !== undefined) {
             const event = store.findEvent(starterEventId);
             const opening = partnerPackageOpeningFromEvent(event);
@@ -18594,7 +18638,7 @@ async function dispatchMutation(
             }
           }
           const selectedRun = mutation.preconditions.find(condition => condition.entity?.kind === contract.EntityKind.RUN)?.entity?.id;
-          const boundPrompt = host.pinLocalCodexSteer(payload.value.sessionId, prompt, selectedRun, false);
+          const boundPrompt = host.pinLocalCodexSteer(payload.value.sessionId, effectivePrompt, selectedRun, false);
           if (boundPrompt.nativeSteerTarget !== undefined && overrides !== undefined) {
             throw invalidArgument("A same-turn steer keeps the original turn's execution settings.");
           }
@@ -25306,6 +25350,23 @@ function protoPermission(value: string | undefined): contract.PermissionMode {
   if (value === "auto") return contract.PermissionMode.AUTO;
   if (value === "bypassPermissions") return contract.PermissionMode.BYPASS_PERMISSIONS;
   return contract.PermissionMode.ASK;
+}
+
+function rewriteExtensionMessageInput(prompt: PromptInput, text: string): PromptInput {
+  if (text === prompt.text) return prompt;
+  if (!prompt.quotesEncoded && !prompt.pastedTextRanges?.length && !prompt.mentionRanges?.length && !prompt.messageReferences?.length) {
+    return { ...prompt, text };
+  }
+  // Structured spans keep their original text and authority. A unique surrounding edit can move them together.
+  const offset = text.indexOf(prompt.text);
+  if (offset < 0 || text.lastIndexOf(prompt.text) !== offset) return prompt;
+  if (prompt.quotesEncoded && (offset !== 0 || text.slice(prompt.text.length).includes("<!-- joko-selection-quote -->"))) return prompt;
+  const move = <Range extends { readonly start: number; readonly end: number }>(range: Range): Range =>
+    ({ ...range, start: range.start + offset, end: range.end + offset });
+  return { ...prompt, text,
+    ...(prompt.pastedTextRanges === undefined ? {} : { pastedTextRanges: prompt.pastedTextRanges.map(move) }),
+    ...(prompt.mentionRanges === undefined ? {} : { mentionRanges: prompt.mentionRanges.map(move) }),
+    ...(prompt.messageReferences === undefined ? {} : { messageReferences: prompt.messageReferences.map(move) }) };
 }
 
 function deliveryMode(value: contract.QueueDeliveryMode): PromptInput["disposition"] {

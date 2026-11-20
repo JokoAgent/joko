@@ -57,6 +57,17 @@ describe("Extension surface manifest", () => {
       expect(() => parseExtensionSurfaceManifest(manifest(invalid), entries, files)).toThrow();
     }
   });
+  it("admits only the declared turn and task topics and the two resident message hooks", () => {
+    const manifest = (subscribe: unknown) => ({ joko: { extensionSurfaces: { schemaVersion: 1, extensions: [{
+      entry: entries[0], runtime: { html: "ui/review/index.html", tools: [], subscribe }
+    }] } } });
+    const subscribe = { topics: ["turn", "session"], hooks: ["will-user-message", "will-assistant-message"] };
+    expect(parseExtensionSurfaceManifest(manifest(subscribe), entries, files)[0]?.runtime?.subscribe).toEqual(subscribe);
+    for (const invalid of [{}, { topics: ["message"] }, { topics: ["turn", "turn"] },
+      { hooks: ["will-tool-call"] }, { hooks: "will-user-message" }, { hooks: ["will-user-message"], payload: "all" }]) {
+      expect(() => parseExtensionSurfaceManifest(manifest(invalid), entries, files)).toThrow();
+    }
+  });
   it("admits task/text runtimes without tools and treats preferences visibility as presentation only", () => {
     const manifest = (runtime: unknown) => ({ joko: { extensionSurfaces: { schemaVersion: 1, extensions: [{ entry: entries[0], runtime }] } } });
     const runtime = { html: "ui/review/index.html", tools: [], card: {}, tasks: { hidden: true }, text: { oneshot: true }, showTaskPreferences: false };
