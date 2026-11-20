@@ -308,6 +308,7 @@ import {
   workspaceBasename,
   workspaceSearchEntryRevision,
   type MobileFilePreview,
+  type MobileFilesComposerInput,
   type MobileFileSearchResult,
   type MobileFilesComposerSource,
   type MobileFilesSearchMode
@@ -8380,6 +8381,11 @@ export function FilesScreen({ colors, state, locale, onBack, onAdded, initialSou
   const authorityKey = client.filesAuthorityKey();
   const connected = state.status === "connected" && authorityKey !== undefined;
   const files = state.files;
+  const canAddDirectory = client.taskWorkspaceMentionControls()?.policy.directories === true;
+  const currentDirectoryInput: MobileFilesComposerInput | undefined = canAddDirectory && authorityKey && files.directoryRevision
+    && files.location.kind === "workspace" && files.location.path !== ""
+    ? { kind: "current-directory", location: files.location, authorityKey, revision: files.directoryRevision }
+    : undefined;
   const currentPreviewSource = files.previewPager?.pages[files.previewPager.index]?.source ?? previewSource;
   const currentPreviewPage = files.previewPager?.pages[files.previewPager.index];
   const previewShareOwner = files.preview && JSON.stringify([
@@ -8511,7 +8517,7 @@ export function FilesScreen({ colors, state, locale, onBack, onAdded, initialSou
       .catch((error) => setLocalError(errorText(error)))
       .finally(() => setGalleryOpening(false));
   };
-  const addToComposer = (source: MobileFilesComposerSource): void => {
+  const addToComposer = (source: MobileFilesComposerInput): void => {
     if (handoffRef.current || galleryOpening || imageGallery.view) return;
     const controller = new AbortController();
     handoffRef.current = controller;
@@ -8647,6 +8653,8 @@ export function FilesScreen({ colors, state, locale, onBack, onAdded, initialSou
         onCopy={copyPath} onCopyDirectory={() => copyPath()}
         disabled={!connected || filesBusy} preferencesDisabled={!preferenceScope || filesBusy} onPreferences={setFilesPreferences}
         onDirectory={(path) => run(() => client.openFilesDirectory(path))} onAdd={addToComposer} onShare={shareFile}
+        canAddDirectory={canAddDirectory}
+        onAddCurrentDirectory={currentDirectoryInput === undefined ? undefined : () => addToComposer(currentDirectoryInput)}
         canShare={(source) => source.kind === "artifact" ? shareableBlobSize(source.artifact.blob?.byteSize)
           : source.kind === "workspace-entry" && source.entry.kind === FileKind.REGULAR && shareableBlobSize(source.entry.revision?.byteSize)}
         onOpen={(source) => {

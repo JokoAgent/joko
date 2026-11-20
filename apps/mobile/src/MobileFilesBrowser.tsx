@@ -12,11 +12,12 @@ import { MobileFileThumbnail } from "./MobileFileThumbnail";
 import type { MobileFilesThumbnailAccess } from "./mobile-files-thumbnails";
 
 export function MobileFilesBrowser({ files, preferences, colors, locale, disabled, preferencesDisabled, onPreferences,
-  onOpen, onAdd, onShare, canShare, onDirectory, onCopy, onCopyDirectory, thumbnailClient }: {
+  onOpen, onAdd, canAddDirectory, onAddCurrentDirectory, onShare, canShare, onDirectory, onCopy, onCopyDirectory, thumbnailClient }: {
   readonly files: MobileFilesState; readonly preferences: MobileFilesPreferences; readonly colors: MobileFilesToolbarColors;
   readonly locale: MobileSupportedLocale; readonly disabled: boolean; readonly preferencesDisabled: boolean;
   readonly onPreferences: (preferences: MobileFilesPreferences) => void;
   readonly onOpen: (source: MobileFilesComposerSource) => void; readonly onAdd: (source: MobileFilesComposerSource) => void;
+  readonly canAddDirectory: boolean; readonly onAddCurrentDirectory?: () => void;
   readonly onShare: (source: MobileFilesComposerSource) => void; readonly canShare: (source: MobileFilesComposerSource) => boolean;
   readonly onDirectory: (path: string) => void;
   readonly onCopy: (source: MobileFilesComposerSource) => void; readonly onCopyDirectory: () => void;
@@ -68,7 +69,8 @@ export function MobileFilesBrowser({ files, preferences, colors, locale, disable
         ListEmptyComponent={<Text style={[styles.empty, { color: colors.muted }]}>{mobileMessage(locale, generated ? "files.generatedEmpty" : "files.directoryEmpty")}</Text>}
         renderItem={({ item }) => <FileItem item={item} grid={columns > 1} width={cellWidth} colors={colors} locale={locale} disabled={disabled}
           thumbnailClient={thumbnailClient} thumbnailOwner={files.authorityKey} thumbnailScope={thumbnailScope} thumbnailEnabled={files.open && files.status === "ready" && !files.preview && !disabled}
-          shareDisabled={!canShare(item.source)} onOpen={() => onOpen(item.source)} onAdd={() => onAdd(item.source)} onShare={() => onShare(item.source)}
+          shareDisabled={!canShare(item.source)} onOpen={() => onOpen(item.source)}
+          onAdd={item.directory && !canAddDirectory ? undefined : () => onAdd(item.source)} onShare={() => onShare(item.source)}
           onContext={() => { if (!disabled) { setOptionsOpen(false); setContextItem(item); } }} />} />
     </View>
     <Modal visible={optionsOpen} transparent animationType="fade" onRequestClose={() => setOptionsOpen(false)}>
@@ -91,6 +93,10 @@ export function MobileFilesBrowser({ files, preferences, colors, locale, disable
                 onPress={() => { setOptionsOpen(false); onCopyDirectory(); }} style={[styles.option, (disabled || !files.directoryRevision || files.status !== "ready") && styles.disabled]}>
                 <Text style={[styles.optionText, { color: colors.ink }]}>{mobileMessage(locale, "files.presentation.copyPath")}</Text>
               </Pressable>
+              {path !== "" && canAddDirectory && onAddCurrentDirectory &&
+                <ContextAction label={mobileMessage(locale, "files.addDirectory", { name: currentLabel })} colors={colors}
+                  disabled={disabled || !files.directoryRevision || files.status !== "ready"}
+                  onPress={() => { setOptionsOpen(false); onAddCurrentDirectory(); }} />}
             </View>}
             <View accessibilityRole="radiogroup" accessibilityLabel={mobileMessage(locale, "files.presentation.view")}>
               <Text style={[styles.optionSection, { color: colors.muted }]}>{mobileMessage(locale, "files.presentation.view")}</Text>
@@ -119,8 +125,9 @@ export function MobileFilesBrowser({ files, preferences, colors, locale, disable
           {!currentItem.directory && <ContextAction label={mobileMessage(locale, mobileImageGalleryMediaType(currentItem.mediaType) ? "files.openGalleryFor"
             : currentItem.source.kind === "artifact" ? "files.previewGenerated" : "files.previewFile", { name: currentItem.label })} colors={colors} disabled={disabled}
             onPress={() => { setContextItem(undefined); onOpen(currentItem.source); }} />}
-          <ContextAction label={mobileMessage(locale, currentItem.source.kind === "artifact" ? "files.addGenerated" : currentItem.directory ? "files.addDirectory" : "files.addFile",
-            { name: currentItem.label })} colors={colors} disabled={disabled} onPress={() => { setContextItem(undefined); onAdd(currentItem.source); }} />
+          {(!currentItem.directory || canAddDirectory) &&
+            <ContextAction label={mobileMessage(locale, currentItem.source.kind === "artifact" ? "files.addGenerated" : currentItem.directory ? "files.addDirectory" : "files.addFile",
+              { name: currentItem.label })} colors={colors} disabled={disabled} onPress={() => { setContextItem(undefined); onAdd(currentItem.source); }} />}
           {(currentItem.source.kind === "workspace-entry" || (currentItem.source.kind === "artifact" && currentItem.source.artifact.blob?.fileName))
             && <ContextAction label={mobileMessage(locale, currentItem.source.kind === "artifact" ? "files.presentation.copyName" : "files.presentation.copyPath")}
               colors={colors} disabled={disabled || files.status !== "ready"} onPress={() => { setContextItem(undefined); onCopy(currentItem.source); }} />}
@@ -136,7 +143,7 @@ function FileItem({ item, grid, width, colors, locale, disabled, shareDisabled, 
   thumbnailClient, thumbnailOwner, thumbnailScope, thumbnailEnabled }: {
   readonly item: MobileFilesDisplayItem; readonly grid: boolean; readonly width: number; readonly colors: MobileFilesToolbarColors;
   readonly locale: MobileSupportedLocale; readonly disabled: boolean; readonly shareDisabled: boolean;
-  readonly onOpen: () => void; readonly onAdd: () => void; readonly onShare: () => void;
+  readonly onOpen: () => void; readonly onAdd?: () => void; readonly onShare: () => void;
   readonly onContext: () => void;
   readonly thumbnailClient?: MobileFilesThumbnailAccess; readonly thumbnailOwner?: string; readonly thumbnailScope: string; readonly thumbnailEnabled: boolean;
 }) {
@@ -158,10 +165,10 @@ function FileItem({ item, grid, width, colors, locale, disabled, shareDisabled, 
       {!grid && <Text style={{ color: colors.muted }}>›</Text>}
     </Pressable>
     <View style={[styles.actions, grid && styles.gridActions]}>
-      <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, artifact ? "files.addGenerated" : item.directory ? "files.addDirectory" : "files.addFile", { name: item.label })}
+      {onAdd && <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, artifact ? "files.addGenerated" : item.directory ? "files.addDirectory" : "files.addFile", { name: item.label })}
         accessibilityState={{ disabled }} disabled={disabled} onPress={onAdd} style={[styles.action, { borderColor: colors.border }, disabled && styles.disabled]}>
         <Text style={[styles.actionText, { color: colors.ink }]}>{mobileMessage(locale, "common.add")}</Text>
-      </Pressable>
+      </Pressable>}
       <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, artifact ? "files.shareGenerated" : "files.shareFile", { name: item.label })}
         accessibilityState={{ disabled: disabled || shareDisabled }} disabled={disabled || shareDisabled} onPress={onShare} style={[styles.action, { borderColor: colors.border }, (disabled || shareDisabled) && styles.disabled]}>
         <Text style={[styles.actionText, { color: colors.ink }]}>{mobileMessage(locale, "common.share")}</Text>

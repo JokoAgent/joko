@@ -44,6 +44,7 @@ function render(overrides: Partial<Props> = {}): Props {
   const props: Props = { files: fixture(), preferences: { view: "grid", sort: "name" }, locale: "en", colors: {
     surface: "#fff", ink: "#111", muted: "#666", border: "#ccc", accent: "#fa0", brandBackground: "#fff0dd" }, disabled: false, preferencesDisabled: false,
   onPreferences: vi.fn(), onOpen: vi.fn(), onAdd: vi.fn(), onShare: vi.fn(), onDirectory: vi.fn(), onCopy: vi.fn(), onCopyDirectory: vi.fn(),
+  canAddDirectory: true, onAddCurrentDirectory: vi.fn(),
   canShare: (source) => source.kind === "workspace-entry" && source.entry.kind === FileKind.REGULAR, ...overrides };
   act(() => root!.render(createElement(MobileFilesBrowser, props))); return props;
 }
@@ -83,6 +84,24 @@ describe("mounted native Files browse controls", () => {
     props = render({ ...props, preferences: { view: "list", sort: "size" } }); expect(container.querySelector("[data-columns]")?.getAttribute("data-columns")).toBe("1");
     expect(openLabels()).toEqual(["Open image gallery for picture10.png", "Open image gallery for picture2.png"]);
     click("Folder options for images"); expect(button("Open directory images").disabled).toBe(true); click("Open directory src"); expect(props.onDirectory).toHaveBeenCalledWith("src");
+  });
+  it("offers the current folder and its child only for tasks with directory references", () => {
+    const props = render();
+    click("Folder options for images"); click("Add directory images to composer");
+    expect(props.onAddCurrentDirectory).toHaveBeenCalledOnce();
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+    click("Add directory docs to composer");
+    expect(props.onAdd).toHaveBeenCalledWith({ kind: "workspace-entry", entry: props.files.entries[2] });
+
+    render({ ...props, canAddDirectory: false });
+    expect(container.querySelector('[aria-label="Add directory docs to composer"]')).toBeNull();
+    click("File options for docs");
+    expect(container.querySelector('[role="dialog"]')?.querySelector('[aria-label="Add directory docs to composer"]')).toBeNull();
+    click("Copy relative path");
+    click("Folder options for images");
+    expect(container.querySelector('[aria-label="Add directory images to composer"]')).toBeNull();
+    click("Open directory src");
+    expect(props.onDirectory).toHaveBeenCalledWith("src");
   });
   it("keeps options localized in five languages, handles Generated empty state and forbids actions on disabled sources", () => {
     const props = render({ disabled: true, preferencesDisabled: true });

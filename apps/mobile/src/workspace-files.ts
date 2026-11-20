@@ -41,6 +41,13 @@ export type MobileFilesComposerSource =
   | { readonly kind: "search-result"; readonly result: MobileFileSearchResult }
   | { readonly kind: "artifact"; readonly artifact: Artifact };
 
+export type MobileFilesComposerInput = MobileFilesComposerSource | {
+  readonly kind: "current-directory";
+  readonly location: Extract<MobileFilesLocation, { readonly kind: "workspace" }>;
+  readonly authorityKey: string;
+  readonly revision: string;
+};
+
 export type MobileFilesComposerResult = "attachment" | "reference";
 
 interface MobilePreviewBase {
