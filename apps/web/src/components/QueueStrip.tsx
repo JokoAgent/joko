@@ -2,8 +2,8 @@ import type { JSX, Ref } from "react";
 import { useEffect, useId, useImperativeHandle, useLayoutEffect, useRef, useState } from "react";
 import { AlertTriangle, Clock3, GripVertical, Paperclip, Pause, Pencil, Play, X, Zap } from "lucide-react";
 import type { AppController } from "../controller.js";
-import type { AttachmentDraft, DeliveryMode, QueueControlView, QueueInputAttachmentView, QueueItemAttachmentEditView, QueueItemTextEditView, QueueItemView } from "../model.js";
-import { equalQueueItemTextEdit, queueItemEditProjection, remapQueueItemTextEdit, type QueueItemTextEditTransaction } from "../queue-item-edit.js";
+import type { AttachmentDraft, DeliveryMode, QueueControlView, QueueInputAttachmentView, QueueItemAttachmentEditView, QueueItemTextEditView, QueueItemView, WorkspaceView } from "../model.js";
+import { equalQueueItemTextEdit, insertQueueDirectory, queueItemEditProjection, remapQueueItemTextEdit, type QueueItemTextEditTransaction } from "../queue-item-edit.js";
 import { randomUuid } from "../web-crypto.js";
 import { composerQueueWindow, resolveQueueReorderShortcut, type ComposerAttachmentPolicy } from "./composer-behavior.js";
 import type { RunAction, Translator } from "./types.js";
@@ -11,6 +11,9 @@ import { Button, IconButton, Pill, cx, formatBytes } from "./ui.js";
 import { QueueLockLease } from "./queue-lock-lease.js";
 import { QueueInputPreview } from "./QueueInputPreview.js";
 import { canEditSharedQueueItem } from "../task-sharing.js";
+import { classifyComposerInternalDrop } from "./composer-internal-drop.js";
+import { standaloneComposerWorkspacePath } from "./composer-paste-pipeline.js";
+import { canonicalWorkspaceRelativePath, WORKSPACE_ENTRY_DRAG_MIME } from "./workspace-tree-state.js";
 
 interface QueueEditLock {
   readonly queueItemId: string;
@@ -25,7 +28,7 @@ interface QueueAttachmentDraft extends QueueItemAttachmentEditView {
 
 export interface QueueStripActions { steerSole(): boolean }
 
-export function QueueStrip({ sessionId, items, control, supportedDispositions, steerSupported, attachmentPolicy, controller, runAction, t, expanded, onExpandedChange, actionsRef }: { readonly sessionId: string; readonly items: readonly QueueItemView[]; readonly control?: QueueControlView; readonly supportedDispositions: readonly DeliveryMode[]; readonly steerSupported: boolean; readonly attachmentPolicy?: ComposerAttachmentPolicy; readonly controller: AppController; readonly runAction: RunAction; readonly t: Translator; readonly expanded: boolean; readonly onExpandedChange: (expanded: boolean) => void; readonly actionsRef?: Ref<QueueStripActions> }): JSX.Element {
+export function QueueStrip({ sessionId, items, control, supportedDispositions, steerSupported, attachmentPolicy, directoryWorkspace, controller, runAction, t, expanded, onExpandedChange, actionsRef }: { readonly sessionId: string; readonly items: readonly QueueItemView[]; readonly control?: QueueControlView; readonly supportedDispositions: readonly DeliveryMode[]; readonly steerSupported: boolean; readonly attachmentPolicy?: ComposerAttachmentPolicy; readonly directoryWorkspace?: WorkspaceView; readonly controller: AppController; readonly runAction: RunAction; readonly t: Translator; readonly expanded: boolean; readonly onExpandedChange: (expanded: boolean) => void; readonly actionsRef?: Ref<QueueStripActions> }): JSX.Element {
   const [editingId, setEditingId] = useState<string>();
   const [editingDraft, setEditingDraft] = useState<QueueItemTextEditView>(() => ({
     text: "",
@@ -50,6 +53,8 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, s
   const editLockRef = useRef<QueueEditLock | undefined>(undefined);
   const editTransactionRef = useRef<QueueItemTextEditTransaction | undefined>(undefined);
   const editorRef = useRef<HTMLTextAreaElement | null>(null);
+  const directoryWorkspaceRef = useRef(directoryWorkspace);
+  directoryWorkspaceRef.current = directoryWorkspace;
   const dragLockRef = useRef<{
     readonly token: string;
     readonly promise: Promise<void>;
@@ -586,7 +591,43 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, s
                 </>}
                 {attachmentError && <p role="alert">{attachmentError}</p>}
               </div>}
-              <textarea ref={editorRef} rows={2} autoFocus value={editingDraft.text} disabled={pending || interactionLocked} onChange={() => undefined} aria-label={t("queue.editText")} onKeyDown={(event) => {
+              <textarea ref={editorRef} rows={2} autoFocus value={editingDraft.text} disabled={pending || interactionLocked} onChange={() => undefined} aria-label={t("queue.editText")}
+                onDragOver={(event) => {
+                  if (editUnavailable || guest || !directoryWorkspace || !event.dataTransfer.types.includes(WORKSPACE_ENTRY_DRAG_MIME)) return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  event.dataTransfer.dropEffect = "copy";
+                }} onDrop={(event) => {
+                  if (editUnavailable || guest || !directoryWorkspace || editLockRef.current?.queueItemId !== item.id) return;
+                  const source = classifyComposerInternalDrop(event.dataTransfer, directoryWorkspace.id, true);
+                  if (source.kind !== "ready" || source.insertion.attrs.directoryWorkspaceId !== directoryWorkspace.id) return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  const { selectionStart, selectionEnd } = event.currentTarget;
+                  setEditingDraft(current => insertQueueDirectory(current, directoryWorkspace.id, source.insertion.attrs.reference, selectionStart, selectionEnd));
+                }} onPaste={(event) => {
+                  const lease = editLockRef.current;
+                  if (editUnavailable || guest || !directoryWorkspace || lease?.queueItemId !== item.id) return;
+                  const text = event.clipboardData.getData("text/plain");
+                  const candidate = standaloneComposerWorkspacePath(text, directoryWorkspace.serverPath);
+                  if (candidate === undefined) return;
+                  let path: string;
+                  try { path = canonicalWorkspaceRelativePath(candidate); } catch { return; }
+                  const editor = event.currentTarget;
+                  const { selectionStart: start, selectionEnd: end, value } = editor;
+                  const plain = `${value.slice(0, start)}${text}${value.slice(end)}`;
+                  event.preventDefault();
+                  setEditingDraft(current => remapQueueItemTextEdit(current, plain, { selectionStart: start, selectionEnd: end, inputType: "insertFromPaste" }));
+                  const parent = path.slice(0, Math.max(0, path.lastIndexOf("/")));
+                  void controller.listWorkspaceEntries(directoryWorkspace.id, parent, { includeHidden: true }).then(entries => {
+                    const workspace = directoryWorkspaceRef.current;
+                    if (editLockRef.current !== lease || lease.abort.signal.aborted || editorRef.current !== editor
+                      || workspace?.id !== directoryWorkspace.id || workspace.serverPath !== directoryWorkspace.serverPath
+                      || !entries.some(entry => entry.path === path && entry.kind === "directory")) return;
+                    setEditingDraft(current => current.text === plain
+                      ? insertQueueDirectory(current, directoryWorkspace.id, path, start, start + text.length) : current);
+                  }).catch(() => undefined);
+                }} onKeyDown={(event) => {
               if (event.repeat || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229 || pending || interactionLocked) return;
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();

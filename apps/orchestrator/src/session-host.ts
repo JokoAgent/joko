@@ -7922,7 +7922,8 @@ export class SessionHost {
     current: QueueItemRecord,
     proposed: PromptInput,
     textSplices: readonly { readonly start: number; readonly end: number; readonly replacementText: string }[],
-    attachmentEditGeneration?: bigint
+    attachmentEditGeneration?: bigint,
+    allowNewDirectories = false
   ): PromptInput {
     assertPromptInlineTextRanges(current.body);
     assertPromptInlineTextRanges(proposed);
@@ -7982,19 +7983,21 @@ export class SessionHost {
       !originallyInlineMentionIndexes.has(mentionIndex) || survivingInlineMentionIndexes.has(mentionIndex)
         ? [mentionIndex]
         : []);
-    const mentions = retainedMentionIndexes.map((mentionIndex) => current.body.mentions[mentionIndex]!);
+    const retainedMentions = retainedMentionIndexes.map((mentionIndex) => current.body.mentions[mentionIndex]!);
     const proposedMentionIndexes = new Map(
       retainedMentionIndexes.map((mentionIndex, proposedMentionIndex) => [mentionIndex, proposedMentionIndex] as const)
     );
-    const mentionRanges = replayed.mentionRanges.map((range) => ({
+    const retainedRanges = replayed.mentionRanges.map((range) => ({
       start: range.start,
       end: range.end,
       mentionIndex: proposedMentionIndexes.get(range.mentionIndex)!
     }));
+    const mentionRanges = proposed.mentionRanges ?? [];
+    const newMentions = proposed.mentions.slice(retainedMentions.length);
     if (
       proposed.text !== replayed.text
-      || !sameQueueArray(proposed.mentions, mentions, sameQueueMention)
-      || !sameQueueArray(proposed.mentionRanges ?? [], mentionRanges, (left, right) =>
+      || !sameQueueArray(proposed.mentions.slice(0, retainedMentions.length), retainedMentions, sameQueueMention)
+      || !sameQueueArray(mentionRanges.filter(range => range.mentionIndex < retainedMentions.length), retainedRanges, (left, right) =>
         left.start === right.start && left.end === right.end && left.mentionIndex === right.mentionIndex)
       || !sameQueueArray(proposed.pastedTextRanges ?? [], replayed.pastedTextRanges, (left, right) =>
         left.start === right.start && left.end === right.end && left.display === right.display)
@@ -8006,11 +8009,33 @@ export class SessionHost {
         "Queued input text and reference ranges do not match the replayed edit receipts."
       );
     }
+    if (newMentions.length > 0) {
+      const stored = this.#store.getSession(current.sessionId);
+      const target = this.#store.getTarget(stored.descriptor.targetId).descriptor;
+      const options = this.#store.getBackend(stored.descriptor.backendId).descriptor.capabilities.get("input.mention")?.options;
+      const workspaceId = this.inputWorkspaceId(current.sessionId);
+      if (!allowNewDirectories || !this.isOrdinaryLocalSession(stored) || !target.trusted || !this.isOwnerRunInput(current)
+        || options?.includes("workspace_directory_queue_edit") !== true
+        || !newMentions.every((mention, index) => {
+          if (mention.kind !== "workspace_directory" || mention.workspaceId !== workspaceId
+            || Buffer.byteLength(mention.reference, "utf8") > 4_096 || /[\\:*?"<>|\u0000-\u001f\u007f]/u.test(mention.reference)
+            || mention.reference.split("/").some(part => part === "" || part === "." || part === ".." || part.endsWith(".") || part.endsWith(" "))) return false;
+          const token = /\s/u.test(mention.reference) ? `@"${mention.reference}/"` : `@${mention.reference}/`;
+          const occurrences = mentionRanges.filter(range => range.mentionIndex === retainedMentions.length + index);
+          if (occurrences.length !== 1) return false;
+          const displayed = replayed.text.slice(occurrences[0]!.start, occurrences[0]!.end);
+          return displayed === token || mention.label.length > 0 && mention.label.length <= 256
+            && !/[\u0000-\u001f\u007f]/u.test(mention.label) && displayed === `@${mention.label}/`;
+        })) {
+        throw inputCapabilityError("INPUT_QUEUE_EDIT_REFERENCE_INVALID", "Queued input text and reference ranges do not match the replayed edit receipts.");
+      }
+    }
+    const mentions = [...retainedMentions, ...newMentions];
 
     const snapshotsByMentionIndex = new Map(
       currentSessionSnapshots.map((snapshot) => [snapshot.mentionIndex, snapshot] as const)
     );
-    const sessionReferenceSnapshots = mentions.flatMap((mention, mentionIndex) => {
+    const sessionReferenceSnapshots = retainedMentions.flatMap((mention, mentionIndex) => {
       if (mention.kind !== "session") return [];
       const originalMentionIndex = retainedMentionIndexes[mentionIndex]!;
       const snapshot = snapshotsByMentionIndex.get(originalMentionIndex);
@@ -8025,7 +8050,7 @@ export class SessionHost {
     const artifactSnapshotsByMentionIndex = new Map(
       currentArtifactSnapshots.map((snapshot) => [snapshot.mentionIndex, snapshot] as const)
     );
-    const artifactReferenceSnapshots = mentions.flatMap((mention, mentionIndex) => {
+    const artifactReferenceSnapshots = retainedMentions.flatMap((mention, mentionIndex) => {
       if (mention.kind !== "artifact" || mention.sourceSessionId === current.sessionId) return [];
       const originalMentionIndex = retainedMentionIndexes[mentionIndex]!;
       const snapshot = artifactSnapshotsByMentionIndex.get(originalMentionIndex);

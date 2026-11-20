@@ -2118,6 +2118,7 @@ export interface QueueItemTextEditView {
   readonly text: string;
   readonly mentionRanges: readonly TimelineInputMentionRangeView[];
   readonly pastedTextRanges: readonly TimelineInlineTextRangeView[];
+  readonly addedDirectories?: readonly { readonly workspaceId: string; readonly path: string; readonly start: number; readonly end: number }[];
   /** Ordered UTF-16 edits from the durable Queue text to this projection. */
   readonly textSplices: readonly QueueTextEditSpliceView[];
 }

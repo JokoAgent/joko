@@ -264,6 +264,7 @@ import {
   mobileComposerDraftsEqual,
   mobileComposerInput,
   normalizeMobileComposerDraft,
+  type MobileComposerWorkspaceMention,
   plainTextMobileComposerDraft,
   recoverMobileComposerDraft,
   type MobileComposerDraft
@@ -15260,15 +15261,23 @@ export class MobileClient {
     } finally { this.#releaseMutation(action); }
   }
 
-  async saveQueueEdit(lease: MobileQueueEditLease, text: string, deliveryMode?: QueueDeliveryMode): Promise<boolean> {
+  async saveQueueEdit(lease: MobileQueueEditLease, text: string, deliveryMode?: QueueDeliveryMode,
+    directories: readonly MobileComposerWorkspaceMention[] = []): Promise<boolean> {
     this.#assertQueueEditLease(lease);
     const { item, capabilities } = this.#queueItemContext(lease.queueItemId);
     if (!capabilities.edit) throw new Error("This Backend no longer supports editing queued input.");
-    if (queueItemText(item.input) === text && (deliveryMode === undefined || deliveryMode === item.deliveryMode)) {
+    if (directories.length > 0) {
+      const controls = this.taskWorkspaceMentionControls();
+      if (controls?.policy.queueDirectories !== true || directories.some(directory => !directory.directory
+        || directory.lineRange !== undefined || directory.workspaceId !== controls.workspaceId)) {
+        throw new Error("The original queued input no longer supports edits to Workspace directories.");
+      }
+    }
+    if (directories.length === 0 && queueItemText(item.input) === text && (deliveryMode === undefined || deliveryMode === item.deliveryMode)) {
       await this.cancelQueueEdit(lease);
       return true;
     }
-    const edit = editQueueItemText(item.input, text);
+    const edit = editQueueItemText(item.input, text, directories);
     if (!edit) throw new Error("Use non-empty text that the current queued-input editor can represent.");
     const action = this.#claimMutation();
     let result: TrackedMutationResult | undefined;

@@ -4519,6 +4519,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const originalInput = requiredQueueInput(existing);
     const original = mapQueueItem(existing);
     const editorSource = queueItemEditProjection(original);
+    if (this.#taskSharing !== undefined && (edit.addedDirectories?.length ?? 0) > 0) {
+      throw new GatewayError("Changing workspace references in a queued input requires its task owner.");
+    }
     const sameEdit = equalQueueItemTextEdit(edit, editorSource);
     if (sameEdit && mode === original.mode && attachments === undefined) return;
     let input = sameEdit
@@ -22262,19 +22265,23 @@ function editedQueueInput(original: InputContent, edit: QueueItemTextEditView): 
   }
   const parts: InputContent["parts"] = [
     ...(edit.text.length === 0 ? [] : [create(InputPartSchema, { content: { case: "text", value: edit.text } })]),
-    ...retainedParts
+    ...retainedParts,
+    ...(edit.addedDirectories ?? []).map(directory => create(InputPartSchema, { content: { case: "workspaceMention", value: {
+      workspaceId: directory.workspaceId, relativePath: directory.path, displayText: directory.path, directory: true
+    } } }))
   ];
+  const ranges = [
+    ...mentionRanges.map(range => ({ start: range.start, end: range.end, mentionIndex: retainedMentionIndices.get(range.mentionIndex)! })),
+    ...(edit.addedDirectories ?? []).map((directory, index) => ({ start: directory.start, end: directory.end, mentionIndex: retainedMentionIndices.size + index }))
+  ].sort((left, right) => left.start - right.start);
+  messageInputMentionRanges({ mentionRanges: ranges }, edit.text, retainedMentionIndices.size + (edit.addedDirectories?.length ?? 0), pastedTextRanges);
   return create(InputContentSchema, {
     parts,
     ...(original.replyQuote ? { replyQuote: original.replyQuote } : {}),
     ...(original.todoQuote ? { todoQuote: original.todoQuote } : {}),
     quotesEncoded: false,
     pastedTextRanges: pastedTextRanges.map((range) => create(InlineTextRangeSchema, range)),
-    mentionRanges: mentionRanges.map((range) => create(InputMentionRangeSchema, {
-      start: range.start,
-      end: range.end,
-      mentionIndex: retainedMentionIndices.get(range.mentionIndex)!
-    }))
+    mentionRanges: ranges.map(range => create(InputMentionRangeSchema, range))
   });
 }
 

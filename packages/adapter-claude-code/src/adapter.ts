@@ -8217,6 +8217,7 @@ function capabilityManifest(
           ? [
               "workspace_file",
               "workspace_directory",
+              "workspace_directory_queue_edit",
               "workspace_line_range",
               ...(inputResolvers.resolveArtifactMention === undefined ? [] : ["artifact"]),
               ...(textResourcesSupported ? ["resource"] : [])

@@ -2873,6 +2873,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
       >
       {showQueue && <QueueStrip sessionId={session.id} items={sessionQueue} control={queueControl} supportedDispositions={queueDispositions}
         steerSupported={supportedModes.includes("steer")} attachmentPolicy={attachmentPolicy} controller={controller} runAction={runAction} t={t}
+        directoryWorkspace={trustedLocalWorkspace && partnerConversation === undefined && session.automationOrigin === undefined
+          && session.derivationOrigin?.sideChat !== true && mentionCapability?.options.includes("workspace_directory_queue_edit") ? workspace : undefined}
         expanded={queueExpanded} onExpandedChange={(expanded) => setQueueExpandedSessionId(expanded ? session.id : undefined)} actionsRef={queueActionsRef} />}
       <div
         className={cx("composer", dragging && "is-dragging", effectiveBashMode && "composer--bash")}

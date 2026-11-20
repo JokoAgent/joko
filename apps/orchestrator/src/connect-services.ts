@@ -18955,7 +18955,7 @@ async function dispatchMutation(
             start: splice.start,
             end: splice.end,
             replacementText: splice.replacementText
-          })), attachmentEditGeneration);
+          })), attachmentEditGeneration, true);
           dependencies.sessionHost.assertInputCapabilities(durableCurrent.sessionId, prompt);
           const updated = store.editQueueItem({
             queueItemId: durableCurrent.id,
