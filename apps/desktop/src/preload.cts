@@ -1,6 +1,8 @@
 import type { DesktopRemoteDesktopViewerOwner, MenubarState, MenubarSettings, DesktopMenubarSnapshot, DesktopMenubarAction } from "@joko/contracts";
 import type {
   DesktopAppInfo,
+  DesktopCodeHostLoginScope,
+  DesktopCodeHostLoginState,
   DesktopAttentionKey,
   DesktopApplicationMenuCommand,
   DesktopApplicationMenuConfigurationPatch,
@@ -104,6 +106,9 @@ const nativeTaskStatusContract = require("./native-task-status-contract.js") as 
 // Electron's restricted CommonJS loader and cannot require the ESM channels
 // module. The `satisfies` check makes channel drift a compile-time failure.
 const DESKTOP_CHANNELS = {
+  codeHostLoginStatus: "joko:code-host-login:status",
+  codeHostLoginStart: "joko:code-host-login:start",
+  codeHostLoginCancel: "joko:code-host-login:cancel",
   windowMinimize: "joko:window:minimize",
   windowToggleMaximize: "joko:window:toggle-maximize",
   windowToggleFullscreen: "joko:window:toggle-fullscreen",
@@ -380,6 +385,14 @@ const startupTheme = process.platform === "win32" && (themeArgument === "light" 
   ? themeArgument : undefined;
 
 const desktopApi = Object.freeze({
+  ...(mainDocumentOccurrence === undefined ? {} : { codeHostLogin: Object.freeze({
+    status: (scope: DesktopCodeHostLoginScope): Promise<DesktopCodeHostLoginState> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.codeHostLoginStatus, mainDocumentOccurrence, scope),
+    start: (scope: DesktopCodeHostLoginScope): Promise<DesktopCodeHostLoginState> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.codeHostLoginStart, mainDocumentOccurrence, scope),
+    cancel: (scope: DesktopCodeHostLoginScope): Promise<void> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.codeHostLoginCancel, mainDocumentOccurrence, scope).then(() => undefined)
+  }) }),
   ...(mainDocumentOccurrence === undefined ? {} : { voiceConversation: Object.freeze({
     control: (serverId: string, bytes: Uint8Array): Promise<Uint8Array> => {
       if (typeof serverId !== "string" || !(bytes instanceof Uint8Array) || bytes.byteLength > 128 * 1024) return Promise.reject(new Error("Invalid voice request."));

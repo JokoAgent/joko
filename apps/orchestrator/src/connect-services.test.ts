@@ -2,13 +2,17 @@ import { Code, createClient, createRouterTransport, type ConnectRouter } from "@
 import * as contract from "@joko/contracts";
 import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
 import { create } from "@bufbuild/protobuf";
+import { createAuthenticatedCodeHostProvider, createPublicCodeHostProvider, GhCliCommandError, GhCliTokenSource } from "@joko/code-host";
 import type { PartnerLearningFeedback } from "@joko/core";
 import { OperationalStore, type PersistedEvent } from "@joko/store";
 import { describe, expect, it, vi } from "vitest";
 
 import type { OrchestratorApplication } from "./application.js";
+import type { ArtifactStore } from "./artifact-store.js";
 import { createConnectServices, registerConnectServices } from "./connect-services.js";
 import { ConnectionManager } from "./connection-manager.js";
+import { OperationalCodeHostSessionAuthorization } from "./session-code-host-context.js";
+import { SessionHost } from "./session-host.js";
 
 function stubApplication(overrides: Record<string, unknown> = {}): OrchestratorApplication {
   return {
@@ -29,6 +33,92 @@ function stubApplication(overrides: Record<string, unknown> = {}): OrchestratorA
 }
 
 describe("Connect service composition", () => {
+  it("signs in only for a local Desktop's unobserved PR and rechecks the original reference after sign-in", async () => {
+    const store = new OperationalStore(":memory:");
+    const sessionHost = new SessionHost(store, {} as ArtifactStore, []);
+    const requestAbort = new AbortController();
+    try {
+      store.upsertBackend({ id: "pi", displayName: "Pi", version: "1", health: "healthy", adapterKind: "pi",
+        instanceGeneration: 0, installationState: "installed", authenticationState: "authenticated", capabilities: new Map(), models: [], tools: [], diagnostics: [] });
+      store.upsertTarget({ id: "local", backendId: "pi", displayName: "Local", workspaceRoot: process.cwd(), managed: false, trusted: true });
+      store.createSession({ id: "task", backendId: "pi", targetId: "local", title: [42, 43, 44].map(number => `https://github.com/acme/widgets/pull/${number}`).join(" "),
+        binding: { opaqueRef: "native/task", generation: 0 }, pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false,
+        createdAt: 1, updatedAt: 1 });
+      const connections = new ConnectionManager(store);
+      const hostKey = Buffer.alloc(32, 14).toString("base64url");
+      const desktop = connections.issueTrustedDesktopConnection({ desktopInstanceId: "4e56f4d8-c6ee-4a17-9a89-56e059b7e592",
+        desktopDeviceId: "d6a365ef-ef33-4fb7-a0f1-a02eb57fef75", defaultDeviceName: "Desktop", platform: "linux", appVersion: "0.1.0", desktopHostAuthKey: hostKey });
+      connections.confirmTrustedDesktopConnection(desktop.connection.id, desktop.authKey);
+      const authorization = `Bearer ${desktop.authKey}`;
+      const headers = { authorization, [DESKTOP_HOST_AUTHORIZATION_HEADER]: `Bearer ${hostKey}` };
+
+      let signedIn = false;
+      let finishLogin: () => void = () => { throw new Error("The device code was not issued."); };
+      const loginCommand = vi.fn(async (_file: string, signal: AbortSignal, onDeviceCode: (code: string) => void) => {
+        await new Promise<void>((resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+          finishLogin = () => { signedIn = true; resolve(); };
+          onDeviceCode("AB12-CD34");
+        });
+      });
+      const credentials = new GhCliTokenSource({ loginCommand, command: async () => {
+        if (!signedIn) throw new GhCliCommandError("notSignedIn");
+        return new TextEncoder().encode("gho_test_fixture\n");
+      } });
+      const reads: Array<{ path: string; authenticated: boolean }> = [];
+      const fetch: typeof globalThis.fetch = async (input, init) => {
+        const path = new URL(String(input)).pathname;
+        const authenticated = new Headers(init?.headers).get("authorization") === "Bearer gho_test_fixture";
+        reads.push({ path, authenticated });
+        if (path === "/graphql") return new Response(null, { status: 503 });
+        if (path.endsWith("/44")) return new Response(null, { status: 503 });
+        if (path.endsWith("/42") && !authenticated) return new Response(null, { status: 404 });
+        return Response.json({ state: "open", draft: false, merged: authenticated, merged_at: null, title: "Original pull request", head: { ref: "topic" } });
+      };
+      const codeHostProviders = [createAuthenticatedCodeHostProvider({ authorization: new OperationalCodeHostSessionAuthorization(store),
+        credentialSource: credentials, fetch }), createPublicCodeHostProvider({ fetch })];
+      const application = stubApplication({ store, sessionHost, connections, codeHostProviders, codeHostCredentials: credentials });
+      const client = createClient(contract.SessionService, createRouterTransport(router => registerConnectServices(router, application)));
+      const scope = (number: number) => ({ sessionId: "task", targetId: "local", generation: 0n, referenceKey: `github.com/acme/widgets#${number}` });
+      await expect(client.getSessionCodeHostLogin({ scope: scope(42) }, { headers: { authorization } })).rejects.toMatchObject({ code: Code.Unauthenticated });
+      await expect(client.getSessionCodeHostLogin({ scope: { ...scope(42), generation: 1n } }, { headers })).rejects.toMatchObject({ code: Code.FailedPrecondition });
+      await expect(client.getSessionCodeHostLogin({ scope: scope(42) }, { headers })).resolves.toMatchObject({ signInRequired: true });
+      for (const number of [43, 44, 45]) {
+        await expect(client.getSessionCodeHostLogin({ scope: scope(number) }, { headers })).resolves.toMatchObject({ signInRequired: false });
+      }
+      expect(loginCommand).not.toHaveBeenCalled();
+      const aborted = new AbortController();
+      const first = client.startSessionCodeHostLogin({ scope: scope(42) }, {
+        headers, signal: AbortSignal.any([aborted.signal, requestAbort.signal])
+      })[Symbol.asyncIterator]();
+      expect((await first.next()).value?.update).toEqual({ case: "deviceCode", value: "AB12-CD34" });
+      aborted.abort();
+      await first.next().catch(() => undefined);
+      await first.return?.();
+      expect(loginCommand.mock.calls[0]?.[1].aborted).toBe(true);
+
+      const retry = client.startSessionCodeHostLogin({ scope: scope(42) }, { headers, signal: requestAbort.signal })[Symbol.asyncIterator]();
+      expect((await retry.next()).value?.update).toEqual({ case: "deviceCode", value: "AB12-CD34" });
+      finishLogin();
+      expect((await retry.next()).value?.update).toEqual({ case: "connected", value: true });
+      expect((await retry.next()).done).toBe(true);
+      expect(loginCommand).toHaveBeenCalledTimes(2);
+      expect(reads.filter(read => read.path.endsWith("/42"))).toEqual([
+        { path: "/repos/acme/widgets/pulls/42", authenticated: false }, { path: "/repos/acme/widgets/pulls/42", authenticated: true }
+      ]);
+      expect(reads.filter(read => read.path.endsWith("/43"))).toHaveLength(1);
+      const result = await client.getSession({ sessionId: "task" }, { headers: { authorization } });
+      expect(result.session?.codeHostPullRequests.find(entry => entry.reference?.number === 42n)).toMatchObject({
+        observed: true, state: contract.CodeHostPullRequestState.MERGED, title: "Original pull request"
+      });
+      expect(JSON.stringify(store.findSetting("session", "task", "codeHost.pullRequests.v1")?.value)).not.toMatch(/AB12-CD34|gho_test_fixture/u);
+    } finally {
+      requestAbort.abort();
+      await sessionHost.dispose();
+      store.close();
+    }
+  });
+
   it("accepts a plugin host locale only from the current committed native Desktop", async () => {
     const store = new OperationalStore(":memory:");
     try {

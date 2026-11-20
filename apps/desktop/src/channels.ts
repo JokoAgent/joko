@@ -5,6 +5,9 @@ export const DESKTOP_CHANNELS = {
   windowSetZoomFactor: "joko:window:set-zoom-factor",
   windowMirrorTheme: "joko:window:mirror-theme",
   windowClose: "joko:window:close",
+  codeHostLoginStatus: "joko:code-host-login:status",
+  codeHostLoginStart: "joko:code-host-login:start",
+  codeHostLoginCancel: "joko:code-host-login:cancel",
   sessionWindowOpen: "joko:session-window:open",
   sessionWindowGetOwner: "joko:session-window:owner:get",
   extensionWindowOpen: "joko:extension-window:open",
@@ -208,6 +211,20 @@ export type {
 } from "@joko/contracts";
 
 export const DESKTOP_PAGE_SEARCH_MAX_TEXT_LENGTH = 4_096;
+
+export interface DesktopCodeHostLoginScope {
+  readonly profileId: string;
+  readonly serverId: string;
+  readonly scopeId: string;
+  readonly sessionId: string;
+  readonly targetId: string;
+  readonly generation: bigint;
+  readonly referenceKey: string;
+}
+
+export type DesktopCodeHostLoginState =
+  | { readonly phase: "unavailable" | "ready" | "starting" | "connected" | "failed" }
+  | { readonly phase: "authorizing"; readonly code: string };
 
 export interface DesktopPageSearchRequest {
   readonly text: string;

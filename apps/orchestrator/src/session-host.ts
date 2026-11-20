@@ -3682,6 +3682,13 @@ export class SessionHost {
     return !session.archived && session.deletedAt === undefined && !this.isReviewReadOnlySession(sessionId);
   }
 
+  canSignInToSessionCodeHost(sessionId: string, targetId: string, generation: bigint): boolean {
+    this.#assertOpen();
+    const stored = this.#store.findSession(sessionId);
+    return stored !== undefined && stored.descriptor.targetId === targetId
+      && BigInt(stored.descriptor.binding.generation) === generation && this.isOrdinaryLocalSession(stored);
+  }
+
   /** Called inside the caller's authorized Store transaction; no adapter effects run here. */
   assertArchivedSessionSendRestorable(sessionId: string): void {
     const session = this.#store.getSession(sessionId).descriptor;

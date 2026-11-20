@@ -14,11 +14,13 @@ import { Tip } from "./ui.js";
 export function CodeHostPullRequestSummary({
   pullRequests,
   t,
-  onOpen
+  onOpen,
+  onSignIn
 }: {
   readonly pullRequests?: readonly CodeHostPullRequestView[];
   readonly t: Translator;
   readonly onOpen?: (url: string) => void;
+  readonly onSignIn?: () => void;
 }): JSX.Element | null {
   if (pullRequests === undefined || pullRequests.length === 0) return null;
   const first = pullRequests[0]!;
@@ -26,7 +28,8 @@ export function CodeHostPullRequestSummary({
   const visible = pullRequests.length === 1
     ? label
     : t("codeHost.pullRequestCount", { label, count: pullRequests.length - 1 });
-  const tooltip = codeHostPullRequestTooltip(pullRequests, t);
+  const statusTooltip = codeHostPullRequestTooltip(pullRequests, t);
+  const tooltip = onSignIn === undefined ? statusTooltip : `${statusTooltip}\n${t("codeHost.signInReason")}`;
   const state = codeHostPullRequestDisplayState(first);
   const StateIcon = codeHostPullRequestStateIcon(state);
   const reviewCount = (state === "open" || state === "draft")
@@ -40,18 +43,19 @@ export function CodeHostPullRequestSummary({
       <span>{reviewCount > 99 ? "99+" : reviewCount}</span>
     </span>}
   </>;
-  const summary = onOpen === undefined
+  const summary = onOpen === undefined && onSignIn === undefined
     ? <span className="code-host-pull-request-summary" data-state={state} aria-label={tooltip}>{content}</span>
     : <button
         type="button"
         className="code-host-pull-request-summary"
         data-state={state}
-        aria-label={`${t("codeHost.openPullRequest", {
+        aria-label={onSignIn === undefined ? `${t("codeHost.openPullRequest", {
           repository: `${first.repositoryOwner}/${first.repositoryName}`,
           number: first.number,
           state: codeHostPullRequestStateLabel(first, t)
-        })}${reviewCount > 0 ? ` · ${t("codeHost.unresolvedReviewThreads", { count: reviewCount })}` : ""}`}
-        onClick={() => onOpen(first.webUrl)}
+        })}${reviewCount > 0 ? ` · ${t("codeHost.unresolvedReviewThreads", { count: reviewCount })}` : ""}`
+          : t("codeHost.signInForPullRequest", { number: first.number })}
+        onClick={onSignIn ?? (() => onOpen?.(first.webUrl))}
       >{content}</button>;
   return <Tip text={tooltip} preformatted>{summary}</Tip>;
 }

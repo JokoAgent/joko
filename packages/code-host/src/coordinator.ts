@@ -34,6 +34,11 @@ export interface CodeHostProjectionRefreshResult {
   readonly changed: boolean;
 }
 
+export interface CodeHostNegativeObservation {
+  readonly referenceKey: string;
+  readonly notFoundUntil: number;
+}
+
 interface ProviderFallback {
   readonly cooldowns: ReadonlyMap<CodeHostProvider, number>;
   readonly preferred: readonly CodeHostProvider[];
@@ -74,11 +79,12 @@ export class CodeHostProjectionCoordinator {
   refreshSession(
     sessionOwnerId: string,
     references: readonly CodeHostPullRequestReference[],
-    assertCurrent?: (reference?: CodeHostPullRequestReference) => void
+    assertCurrent?: (reference?: CodeHostPullRequestReference) => void,
+    recheckAfterSignIn?: CodeHostNegativeObservation
   ): Promise<CodeHostProjectionRefreshResult> {
     const pending = this.sessionInflight.get(sessionOwnerId);
     if (pending !== undefined) return pending;
-    const request = this.refreshSessionUnshared(sessionOwnerId, references, assertCurrent).finally(() => {
+    const request = this.refreshSessionUnshared(sessionOwnerId, references, assertCurrent, recheckAfterSignIn).finally(() => {
       if (this.sessionInflight.get(sessionOwnerId) === request) this.sessionInflight.delete(sessionOwnerId);
     });
     this.sessionInflight.set(sessionOwnerId, request);
@@ -88,7 +94,8 @@ export class CodeHostProjectionCoordinator {
   private async refreshSessionUnshared(
     sessionOwnerId: string,
     references: readonly CodeHostPullRequestReference[],
-    assertCurrent?: (reference?: CodeHostPullRequestReference) => void
+    assertCurrent: ((reference?: CodeHostPullRequestReference) => void) | undefined,
+    recheckAfterSignIn: CodeHostNegativeObservation | undefined
   ): Promise<CodeHostProjectionRefreshResult> {
     assertCurrent?.();
     const before = this.repository.read(sessionOwnerId);
@@ -109,7 +116,9 @@ export class CodeHostProjectionCoordinator {
     for (const entry of current.references) {
       const assertReferenceCurrent = assertCurrent === undefined ? undefined : () => assertCurrent(entry.reference);
       assertReferenceCurrent?.();
-      const refreshed = await this.refreshReference(sessionOwnerId, entry, assertReferenceCurrent);
+      const recheck = recheckAfterSignIn?.referenceKey === entry.reference.key && entry.projection === undefined
+        && entry.notFoundUntil === recheckAfterSignIn.notFoundUntil;
+      const refreshed = await this.refreshReference(sessionOwnerId, entry, assertReferenceCurrent, recheck);
       assertReferenceCurrent?.();
       if (refreshed === entry) continue;
       current = {
@@ -125,11 +134,12 @@ export class CodeHostProjectionCoordinator {
   private async refreshReference(
     sessionOwnerId: string,
     entry: CodeHostSessionReferenceProjection,
-    assertCurrent?: () => void
+    assertCurrent: (() => void) | undefined,
+    recheck: boolean
   ): Promise<CodeHostSessionReferenceProjection> {
     const observedAt = this.now();
     const cached = (entry.freshUntil ?? 0) > observedAt
-      || (entry.notFoundUntil ?? 0) > observedAt
+      || (!recheck && (entry.notFoundUntil ?? 0) > observedAt)
       || (entry.retryAfterUntil ?? 0) > observedAt;
     const fallback = this.fallbacks?.get(entry);
     if (cached && !fallback?.preferred.length) return entry;

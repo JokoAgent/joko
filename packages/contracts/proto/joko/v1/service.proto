@@ -5,6 +5,7 @@ package joko.v1;
 import "google/protobuf/timestamp.proto";
 import "joko/v1/app_default_model.proto";
 import "joko/v1/capability.proto";
+import "joko/v1/code_host.proto";
 import "joko/v1/common.proto";
 import "joko/v1/connection_entry.proto";
 import "joko/v1/device_authorization.proto";
@@ -137,6 +138,9 @@ service TargetService {
 service SessionService {
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  // Private to the managed Desktop host. Closing the sign-in stream cancels it.
+  rpc GetSessionCodeHostLogin(GetSessionCodeHostLoginRequest) returns (GetSessionCodeHostLoginResponse);
+  rpc StartSessionCodeHostLogin(StartSessionCodeHostLoginRequest) returns (stream StartSessionCodeHostLoginResponse);
   rpc GetSessionRuntimeControl(GetSessionRuntimeControlRequest) returns (GetSessionRuntimeControlResponse);
   rpc ListTaskTags(ListTaskTagsRequest) returns (ListTaskTagsResponse);
   rpc GetSessionTaskTags(GetSessionTaskTagsRequest) returns (GetSessionTaskTagsResponse);

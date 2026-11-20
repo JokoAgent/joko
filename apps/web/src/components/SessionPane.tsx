@@ -556,6 +556,12 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     : session.usage;
   const canAcknowledgeSessionAttention = backend?.capabilities.get("session.attention")?.supported === true;
   const displayBranch = codeHostDisplayBranch(workspace, session.codeHostPullRequests);
+  const codeHostProfile = controller.state.activeProfile;
+  const canSignInToCodeHost = !guest && !reviewReadOnly && !session.archived && !session.hidden
+    && session.remoteWorkspace === undefined && target?.remoteWorkspace === undefined
+    && session.derivationOrigin?.sideChat !== true && session.automationOrigin === undefined && partnerConversation === undefined
+    && controller.state.connectionState === "connected" && codeHostProfile?.managedLocal === true
+    && sessionRouteIsCurrent(controller.state.route, session.id);
   const canExport = !reviewReadOnly && !sideChatRuntimeReadOnly && backend?.capabilities.get("session.export")?.supported === true;
   const derivesWorkspace = backend?.capabilities.get("workspace.derive")?.supported === true;
   const canDeriveWorkspace = session.worktree === undefined || derivesWorkspace;
@@ -2552,6 +2558,10 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
             onSelectSideChat={(childId) => onSideChatOpened === undefined
               ? controller.navigate({ kind: "session", sessionId: childId }) : onSideChatOpened(session.id, childId)}
             onOpenSessionWindow={onOpenSessionWindow}
+            codeHostLoginOwner={canSignInToCodeHost ? {
+              profileId: codeHostProfile.id, serverId: codeHostProfile.serverId, connectionGeneration: controller.state.connectionGeneration,
+              sessionId: session.id, targetId: session.targetId, generation: session.generation
+            } : undefined}
             onOpenCodeHostPullRequest={(url) => runAction(
               `open-code-host-pull-request:${session.id}`,
               () => openCodeHostPullRequestExternal(controller, session.id, url)

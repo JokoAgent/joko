@@ -13,7 +13,7 @@ import { registerConnectServices } from "./connect-services.js";
 import { registerHostedAgentDesktopService } from "./hosted-agent-desktop-service.js";
 import { registerInputHandoffNativeHost } from "./input-handoff/native-host.js";
 import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
-import { EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER, PORTABLE_SESSION_LIMIT_BYTES_HEADER, PORTABLE_SESSION_MEDIA_BYTES_HEADER } from "@joko/contracts";
+import { EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER, PORTABLE_SESSION_LIMIT_BYTES_HEADER, PORTABLE_SESSION_MEDIA_BYTES_HEADER, SessionService } from "@joko/contracts";
 import { ConnectionAuthenticationError } from "./connection-manager.js";
 import { ExtensionMainViewError, surfaceHeaders } from "./extension-main-view-manager.js";
 import { ISOLATED_EXTENSION_CSP } from "./extension-main-view-document.js";
@@ -22,6 +22,10 @@ import { registerLinkspanWebRtcSignaling } from "./linkspan-webrtc-server.js";
 import type { NativeAuthRunnerProof, RemoteNativeAuthRunnerAttestation } from "./native-auth-recovery.js";
 
 export const JOKO_DESKTOP_APP_ORIGIN = "joko://app";
+const localCodeHostLoginRoutes = new Set([
+  `/${SessionService.typeName}/${SessionService.method.getSessionCodeHostLogin.name}`,
+  `/${SessionService.typeName}/${SessionService.method.startSessionCodeHostLogin.name}`
+]);
 export const ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
   "base-uri 'none'",
@@ -86,6 +90,9 @@ export async function createPublicServer(application: OrchestratorApplication, o
   if (options.secureBridge) registerLinkspanWebRtcSignaling(server, application);
   server.addHook("onRequest", async (request, reply) => {
     const remote = normalizeSocketAddress(request.ip);
+    if ((options.secureBridge || !isLoopbackHost(remote)) && localCodeHostLoginRoutes.has(request.routeOptions.url ?? "")) {
+      return reply.code(404).send({ error: "GitHub sign-in is only available to the local Desktop host." });
+    }
     const metadata = ["/healthz", "/joko.v1.ConnectionService/GetServerInfo", "/joko.v1.ConnectionService/ListDiscoveredNodes"].includes(request.url);
     const webAsset = ["GET", "HEAD"].includes(request.method) && (request.url === "/" || request.url.startsWith("/assets/")
       || ["/favicon.svg", "/favicon.ico", "/manifest.webmanifest", "/isolated-surface.html", "/isolated-surface.js"].includes(request.url));

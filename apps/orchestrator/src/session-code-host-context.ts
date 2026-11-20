@@ -3,6 +3,7 @@ import {
   extractCodeHostPullRequestReferences,
   materializeCodeHostSessionProjection,
   type CodeHostPullRequestReference,
+  type CodeHostNegativeObservation,
   type CodeHostProjectionRepository,
   type CodeHostProvider,
   type CodeHostSessionAuthorization,
@@ -103,6 +104,7 @@ export class OperationalCodeHostSessionAuthorization implements CodeHostSessionA
 export class SessionCodeHostContextRuntime {
   private readonly store: OperationalStore;
   private readonly coordinator: CodeHostProjectionCoordinator;
+  private readonly authorization: OperationalCodeHostSessionAuthorization;
   private readonly refreshes = new Map<string, SessionCodeHostRefresh>();
   private readonly pendingBackgroundSessions = new Set<string>();
   private backgroundRefreshScheduled = false;
@@ -114,6 +116,7 @@ export class SessionCodeHostContextRuntime {
     readonly now?: () => number;
   }) {
     this.store = options.store;
+    this.authorization = new OperationalCodeHostSessionAuthorization(this.store);
     this.coordinator = new CodeHostProjectionCoordinator({
       repository: new OperationalCodeHostProjectionRepository(options.store),
       providers: options.providers ?? [],
@@ -130,8 +133,31 @@ export class SessionCodeHostContextRuntime {
     });
   }
 
-  async refreshSession(sessionId: string): Promise<CodeHostSessionProjection | undefined> {
+  isReferenceCurrent(sessionId: string, reference: CodeHostPullRequestReference): boolean {
+    return this.authorization.authorize(sessionId, reference) !== undefined;
+  }
+
+  refreshAfterSignIn(sessionId: string, referenceKey: string, assertCurrent: () => void): Promise<void> {
+    return this.refreshAndPublish(sessionId, { referenceKey, assertCurrent });
+  }
+
+  async refreshSession(sessionId: string, signIn?: {
+    readonly referenceKey: string;
+    readonly assertCurrent: () => void;
+  }): Promise<CodeHostSessionProjection | undefined> {
     if (!storeSupportsCodeHostProjection(this.store)) return undefined;
+    let recheck: CodeHostNegativeObservation | undefined;
+    if (signIn !== undefined) {
+      for (let pending = this.refreshes.get(sessionId); pending !== undefined; pending = this.refreshes.get(sessionId)) {
+        await pending.result.catch(() => undefined);
+        signIn.assertCurrent();
+      }
+      signIn.assertCurrent();
+      const entry = readSessionCodeHostReferences(this.store, sessionId).find(item => item.reference.key === signIn.referenceKey);
+      if (entry?.notFoundUntil !== undefined && entry.projection === undefined) {
+        recheck = { referenceKey: signIn.referenceKey, notFoundUntil: entry.notFoundUntil };
+      }
+    }
     let session: StoredSession;
     try {
       session = this.store.getSession(sessionId);
@@ -152,10 +178,12 @@ export class SessionCodeHostContextRuntime {
         for (;;) {
           const current = flight.references;
           const refreshed = await this.coordinator.refreshSession(sessionId, current, (reference) => {
+            signIn?.assertCurrent();
             if (flight.references !== current && (reference === undefined || !flight.references.some(candidate => sameReference(candidate, reference)))) {
               throw new Error("The Session pull request references changed.");
             }
-          }).catch((error: unknown) => {
+          }, recheck).catch((error: unknown) => {
+            signIn?.assertCurrent();
             if (flight.references === current) throw error;
             return undefined;
           });
@@ -196,7 +224,8 @@ export class SessionCodeHostContextRuntime {
         while (cursor < unique.length) {
           const index = cursor++;
           const sessionId = unique[index];
-          if (sessionId !== undefined) await this.refreshAndPublish(sessionId);
+          // Provider faults retain the prior snapshot and never enter event text.
+          if (sessionId !== undefined) await this.refreshAndPublish(sessionId).catch(() => undefined);
         }
       });
       void Promise.all(workers);
@@ -207,25 +236,25 @@ export class SessionCodeHostContextRuntime {
     this.refreshSessionsInBackground([sessionId]);
   }
 
-  private async refreshAndPublish(sessionId: string): Promise<void> {
+  private async refreshAndPublish(sessionId: string, signIn?: {
+    readonly referenceKey: string;
+    readonly assertCurrent: () => void;
+  }): Promise<void> {
     if (!storeSupportsCodeHostProjection(this.store)) return;
-    try {
-      const before = readSessionCodeHostProjection(this.store, sessionId);
-      const after = await this.refreshSession(sessionId);
-      if (after === undefined || samePublishedCodeHostProjection(before, after)) return;
-      if ((before?.references.length ?? 0) === 0 && after.references.length === 0) return;
-      const session = this.store.getSession(sessionId);
-      this.store.appendEvent({
-        backendId: session.descriptor.backendId,
-        targetId: session.descriptor.targetId,
-        sessionId,
-        generation: session.descriptor.binding.generation,
-        traceId: "session-code-host-projection",
-        payload: { type: "session_changed" }
-      });
-    } catch {
-      // Provider faults retain the prior snapshot and never enter diagnostics or event text.
-    }
+    const before = readSessionCodeHostProjection(this.store, sessionId);
+    const after = await this.refreshSession(sessionId, signIn);
+    signIn?.assertCurrent();
+    if (after === undefined || samePublishedCodeHostProjection(before, after)) return;
+    if ((before?.references.length ?? 0) === 0 && after.references.length === 0) return;
+    const session = this.store.getSession(sessionId);
+    this.store.appendEvent({
+      backendId: session.descriptor.backendId,
+      targetId: session.descriptor.targetId,
+      sessionId,
+      generation: session.descriptor.binding.generation,
+      traceId: "session-code-host-projection",
+      payload: { type: "session_changed" }
+    });
   }
 }
 

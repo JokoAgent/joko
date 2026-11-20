@@ -33,3 +33,31 @@ message CodeHostPullRequestProjection {
   string head_branch = 7;
   optional uint32 unresolved_review_thread_count = 8;
 }
+
+// Only the local Desktop host may use this scope to inspect or start sign-in.
+message SessionCodeHostLoginScope {
+  string session_id = 1;
+  string target_id = 2;
+  uint64 generation = 3;
+  string reference_key = 4;
+}
+
+message GetSessionCodeHostLoginRequest {
+  SessionCodeHostLoginScope scope = 1;
+}
+
+message GetSessionCodeHostLoginResponse {
+  bool sign_in_required = 1;
+}
+
+message StartSessionCodeHostLoginRequest {
+  SessionCodeHostLoginScope scope = 1;
+}
+
+// The device code is live only for this stream and is never written to task history.
+message StartSessionCodeHostLoginResponse {
+  oneof update {
+    string device_code = 1;
+    bool connected = 2;
+  }
+}
