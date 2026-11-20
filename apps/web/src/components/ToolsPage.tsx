@@ -1278,6 +1278,7 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
       {!detailLoading && detailError === undefined && selectedDetail !== undefined && <ExtensionDetail
         controller={controller}
         extension={selectedDetail}
+        oauthRevision={snapshot.extensionOAuthRevision ?? 0n}
         projectSelected={projectScope.project !== undefined}
         projectReady={projectScope.ready}
         projectEnabled={selectedDetail.enabled && !projectScope.state?.disabledExtensionIds.includes(selectedDetail.id)}
@@ -1469,9 +1470,10 @@ function ExtensionSuggestionContinuation({ state, busy, canAct, t, onRetry, onCa
   </section>;
 }
 
-function ExtensionDetail({ controller, extension, projectSelected, projectReady, projectEnabled, projectSupported, locale, busy, t, runAction, onEnabledChange, onSidebarChange, onRefreshUsage, onClearUsage, onSetup, onNetworkChanged, onUse, onPackage, onExport, onRemove, onOpenMainView, onOpenWindow }: {
+function ExtensionDetail({ controller, extension, oauthRevision, projectSelected, projectReady, projectEnabled, projectSupported, locale, busy, t, runAction, onEnabledChange, onSidebarChange, onRefreshUsage, onClearUsage, onSetup, onNetworkChanged, onUse, onPackage, onExport, onRemove, onOpenMainView, onOpenWindow }: {
   readonly controller: AppController;
   readonly extension: ExtensionCatalogEntryView;
+  readonly oauthRevision: bigint;
   readonly projectSelected: boolean;
   readonly projectReady: boolean;
   readonly projectEnabled: boolean;
@@ -1506,7 +1508,7 @@ function ExtensionDetail({ controller, extension, projectSelected, projectReady,
     {extensionMainViewReady(extension) && <div className="extension-main-view-actions"><Button tone="ghost" disabled={busy} onClick={() => openInspectorExtension(extension.id, "sidebar", inspectorLayoutOwner(controller.state.activeProfile))}>{t("inspector.plugin.sidebar")}</Button><Button tone="ghost" disabled={busy} onClick={() => openInspectorExtension(extension.id, "reset", inspectorLayoutOwner(controller.state.activeProfile))}>{t("inspector.plugin.reset")}</Button></div>}
     {extension.library !== undefined && <ExtensionLibrarySection controller={controller} extension={extension} locale={locale} disabled={busy} t={t} />}
     {extension.owner.kind === "resource" && extension.installed && <ExtensionNetworkSection controller={controller} extension={extension} disabled={busy} t={t} onChanged={onNetworkChanged} />}
-    {extension.owner.kind === "resource" && extension.installed && <ExtensionOAuthSection controller={controller} extension={extension} disabled={busy} t={t} onChanged={onNetworkChanged} />}
+    {extension.owner.kind === "resource" && extension.installed && <ExtensionOAuthSection controller={controller} extension={extension} oauthRevision={oauthRevision} disabled={busy} t={t} onChanged={onNetworkChanged} />}
     {extension.owner.kind === "resource" && extension.installed && <ExtensionTasksSection key={JSON.stringify([extension.id, controller.state.activeProfile?.id, controller.state.activeProfile?.serverId,
       controller.state.connectionGeneration, controller.state.connectionState])} controller={controller} extension={extension} disabled={busy} t={t} runAction={runAction} />}
     {sourceOwned ? <section className="extension-source-available"><FolderPlus aria-hidden="true" /><div><strong>{t("extensions.sourceAvailable")}</strong><p>{t("extensions.sourceAvailableBody")}</p></div><Button tone="primary" disabled={busy} onClick={onPackage}><Download aria-hidden="true" />{t("extensions.package.install")}</Button></section> : <section className="extension-detail__settings" aria-label={t("extensions.configuration") }>

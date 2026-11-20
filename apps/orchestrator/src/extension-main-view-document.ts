@@ -116,7 +116,7 @@ export async function isolatedExtensionDocument(input: {
       const output = await compile(assetPath(src.value, input.entry)); src.value = output.script;
       element.attrs = element.attrs.filter(attribute => !["integrity", "crossorigin"].includes(attribute.name));
       if (output.css !== undefined) append(`<link rel="stylesheet" href="${output.css}">`);
-    } else if (element.tagName === "link" && href !== undefined && attr("rel")?.value === "stylesheet") {
+    } else if (element.tagName === "link" && href !== undefined && attr("rel")?.value.toLowerCase() === "stylesheet") {
       const path = assetPath(href.value, input.entry);
       element.attrs.push({ name: "data-joko-style-base", value: (input.resourceRoot ?? "") + path });
       href.value = (await compile(path)).script;

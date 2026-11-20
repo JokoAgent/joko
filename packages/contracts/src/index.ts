@@ -12,6 +12,7 @@ export * from "./task-link-source.js";
 export * from "./remote-desktop-system-action.js";
 export * from "./remote-desktop-clipboard-version.js";
 export * from "./extension-library-clipboard.js";
+export * from "./extension-library-sql.js";
 export * from "./partner-session-tasks.js";
 export * from "./session-handoff-messages.js";
 export * from "./question-references.js";
@@ -19,6 +20,9 @@ export * from "./message-reference.js";
 export * from "./extension-targets.js";
 /** Host-only opt-in for renewing an existing visible main-view surface. */
 export const EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER = "x-joko-extension-main-view-keepalive";
+/** Owner event scope for re-reading plugin OAuth settings. */
+export const EXTENSION_OAUTH_INVALIDATION_SCOPE = "extension-oauth";
+export const EXTENSION_LIBRARY_FILE_NOT_FOUND = "EXTENSION_LIBRARY_FILE_NOT_FOUND";
 export * from "./remote-model-access.js";
 export * from "./provider-sharing-insights.js";
 export * from "./gen/joko/v1/extension_sync_pb.js";

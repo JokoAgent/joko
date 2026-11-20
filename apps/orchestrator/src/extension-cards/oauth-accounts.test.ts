@@ -6,10 +6,12 @@ import { afterEach, expect, it, vi } from "vitest";
 import { OperationalStore } from "@joko/store";
 import { createClient, createRouterTransport } from "@connectrpc/connect";
 import { toJsonString } from "@bufbuild/protobuf";
-import { ExtensionOAuthService, ExtensionOAuthStateSchema, ExtensionAuthorizationPhase as Phase, ExtensionAuthorizationFailure as Failure } from "@joko/contracts";
+import { EXTENSION_OAUTH_INVALIDATION_SCOPE, ExtensionOAuthService, ExtensionOAuthStateSchema,
+  ExtensionAuthorizationPhase as Phase, ExtensionAuthorizationFailure as Failure, SnapshotInvalidationReason } from "@joko/contracts";
 import { CredentialManager } from "../credential-manager.js";
 import { CredentialVault } from "../credential-vault.js";
 import { ExtensionCatalogManager } from "../extension-catalog.js";
+import { toProtoEvent } from "../proto-mapper.js";
 import type { PiResourceDescriptor } from "../resource-manager.js";
 import { parseExtensionRuntime } from "../extension-surface-manifest.js";
 import { ExtensionOAuthAccounts } from "./oauth-accounts.js";
@@ -36,14 +38,14 @@ async function fixture() {
     resourceDetails: [{ kind: "extension", name: "Account fixture", entryPath: "extensions/main.js", runtime, compatibility: "supported", compatibilityIssues: [], detectedApis: [] }] } as unknown as PiResourceDescriptor;
   const entry = catalog.reconcile([resource], []).entries[0]!, codes = new Map<string, string>(), refreshIdentities = new Map<string, string>(), accessIdentities = new Map<string, string>();
   const requests: Array<{ url: string; form: URLSearchParams; headers: Headers }> = [];
-  let provider: ((form: URLSearchParams) => Promise<Response>) | undefined, identityAvailable = true;
+  let provider: ((form: URLSearchParams) => Promise<Response>) | undefined, identityAvailable = true, identityDisplayName: string | undefined;
   const bundle = (identity: string, refresh = true) => {
     const access = `access-private-fixture-${randomUUID()}`, token = `refresh-private-fixture-${randomUUID()}`; accessIdentities.set(access, identity); refreshIdentities.set(token, identity);
     return { access_token: access, ...(refresh ? { refresh_token: token } : {}), expires_in: 3600 };
   };
   const fetchImpl = (async (input, init) => {
     const url = String(input), form = new URLSearchParams(typeof init?.body === "string" ? init.body : ""), headers = new Headers(init?.headers); requests.push({ url, form, headers });
-    if (url.endsWith("/me")) { if (!identityAvailable) return new Response(null, { status: 503 }); const identity = accessIdentities.get(headers.get("authorization")?.replace("Bearer ", "") ?? ""); return new Response(JSON.stringify({ email: identity, team: "Team", name: identity })); }
+    if (url.endsWith("/me")) { if (!identityAvailable) return new Response(null, { status: 503 }); const identity = accessIdentities.get(headers.get("authorization")?.replace("Bearer ", "") ?? ""); return new Response(JSON.stringify({ email: identity, team: "Team", name: identityDisplayName ?? identity })); }
     if (provider) return provider(form);
     const identity = form.get("grant_type") === "authorization_code" ? codes.get(form.get("code") ?? "") : refreshIdentities.get(form.get("refresh_token") ?? "");
     return new Response(JSON.stringify(bundle(identity ?? "unknown@example.test")));
@@ -62,6 +64,7 @@ async function fixture() {
   };
   return { root, vault, entry, codes, requests, sleep, bundle, accessIdentities, refreshIdentities, capture, authorize, connect, update,
     provider: (next: typeof provider) => { provider = next; }, identityAvailable: (value: boolean) => { identityAvailable = value; },
+    identityDisplayName: (name: string) => { identityDisplayName = name; },
     get manager() { return manager; }, get credentials() { return credentials; }, get catalog() { return catalog; }, get store() { return store; },
     declaration: () => runtime.network!.secrets![0]!.oauth!, saved: () => new ExtensionOAuthAccountState({ store, vault }).get(extensionOAuthScope(entry.id, "account")),
     restart: async () => { await manager.dispose(); store.close(); store = new OperationalStore(databasePath); credentials = new CredentialManager({ vault, storagePath: credentialPath }); await credentials.initialize();
@@ -108,10 +111,22 @@ it("coalesces refreshes, persists rotated tokens and rechecks a concurrent rotat
 
 it("marks a confirmed invalid grant expired without exposing provider text or deleting another account", async () => {
   const f = await fixture(); await f.connect("one@example.test"); const state = await f.connect("two@example.test");
+  const extension = f.catalog.get(f.entry.id), runtimeIdentity = f.manager.identity(extension.id, "account");
   const first = state.slots[0]!.accounts[0]!, secondReference = f.saved().accounts[1]!.refreshReference!, preserved = f.credentials.resolve(secondReference);
   f.manager.invalidate(f.entry.id, "account", first.id); f.provider(async () => new Response('{"error":"invalid_grant","error_description":"provider-private-text"}', { status: 400 }));
   expect(await f.manager.fresh(f.entry.id, "account", f.declaration(), first.id)).toEqual({ ok: false, error: "AUTH_EXPIRED" });
   expect(f.manager.get(f.entry.id).slots[0]!.accounts[0]!.status).toBe("expired"); expect(f.credentials.resolve(secondReference)).toBe(preserved);
+  expect(f.catalog.get(extension.id).revision).toBe(extension.revision);
+  expect(f.manager.identity(extension.id, "account")).toBe(runtimeIdentity);
+  expect(await f.manager.fresh(extension.id, "account", f.declaration(), first.id)).toEqual({ ok: false, error: "AUTH_EXPIRED" });
+  const events = f.store.listEvents({}).filter(event => event.payload.type === "extension_oauth_changed");
+  expect(events).toMatchObject([{ sessionId: "", backendId: "", payload: { type: "extension_oauth_changed" } }]);
+  expect(toProtoEvent(events[0]!).payload?.kind).toMatchObject({ case: "projectionInvalidated",
+    value: { scope: EXTENSION_OAUTH_INVALIDATION_SCOPE, reason: SnapshotInvalidationReason.PROJECTION_REBUILT } });
+  await f.restart();
+  expect(f.manager.get(f.entry.id).slots[0]!.accounts[0]).toMatchObject({ id: first.id, status: "expired" });
+  expect(f.credentials.resolve(secondReference)).toBe(preserved);
+  expect(f.store.listEvents({}).filter(event => event.payload.type === "extension_oauth_changed")).toEqual(events);
 });
 
 it("tracks new full scopes and real evidence while preserving intentionally reduced authorization", async () => {
@@ -130,6 +145,46 @@ it("retires a changed builtin client without sending its old refresh token to th
   f.update({ clientId: "different-builtin-client" }); f.requests.length = 0;
   expect(await f.manager.fresh(f.entry.id, "account", f.declaration())).toEqual({ ok: false, error: "AUTH_EXPIRED" });
   expect(f.manager.get(f.entry.id).slots[0]!.accounts[0]).toMatchObject({ status: "expired", clientChanged: true }); expect(f.requests).toHaveLength(0); expect(f.credentials.resolve(reference)).toBe(old);
+});
+
+it("recovers the original builtin grant only after the complete OAuth configuration is restored", async () => {
+  const f = await fixture();
+  const extensionId = f.entry.id;
+  const original = f.declaration();
+  const account = (await f.connect("one@example.test")).slots[0]!.accounts[0]!;
+  const originalReference = f.saved().accounts[0]!.refreshReference!;
+  const refreshToken = f.credentials.resolve(originalReference);
+  f.requests.length = 0;
+  f.update({ clientId: "different-builtin-client" });
+  await vi.waitFor(() => expect(f.saved().accounts[0]).toMatchObject({ id: account.id, expiredReason: "client_changed" }));
+  expect(await f.manager.fresh(extensionId, "account", f.declaration())).toEqual({ ok: false, error: "AUTH_EXPIRED" });
+
+  f.update({ ...original, tokenUrl: "https://auth.example.test/other-token" });
+  await f.restart();
+  expect(f.manager.get(extensionId).slots[0]!.accounts).toMatchObject([{ id: account.id, status: "expired", clientChanged: true }]);
+  expect(await f.manager.fresh(extensionId, "account", f.declaration())).toEqual({ ok: false, error: "AUTH_EXPIRED" });
+  expect(f.requests).toEqual([]);
+  expect(f.credentials.resolve(originalReference)).toBe(refreshToken);
+
+  f.update(original);
+  await vi.waitFor(() => expect(f.saved().accounts[0]).toMatchObject({ id: account.id, status: "connected", refreshReference: originalReference }));
+  await f.restart();
+  expect(f.manager.get(extensionId).slots[0]!.accounts).toMatchObject([{ id: account.id, status: "connected", isDefault: true, clientChanged: false }]);
+  const fetcher = vi.fn<typeof fetch>(async () => new Response("{}", { headers: { "content-type": "application/json" } }));
+  const network = new ExtensionNetwork({ fetch: fetcher,
+    resolveCredential: () => { throw new Error("OAuth must resolve its managed account"); },
+    redact: value => f.credentials.redactText(value), oauth: f.manager });
+  const declaration = parseExtensionNetwork({ hosts: ["auth.example.test", "api.example.test"], secrets: [{
+    key: "account", label: "Account", source: "oauth", oauth: f.declaration(), inject: { header: "Authorization", format: "Bearer {value}" }
+  }] });
+  const scope = { extensionId, authorityKey: "restored-runtime", declaration, readOnly: false, signal: new AbortController().signal, assertCurrent: () => {} };
+  expect(await network.request(scope, { url: "https://api.example.test/data" })).toMatchObject({ ok: true, status: 200 });
+  const refreshes = f.requests.filter(request => request.form.get("grant_type") === "refresh_token");
+  expect(refreshes).toHaveLength(1);
+  expect(refreshes[0]!.url).toBe(original.tokenUrl);
+  expect(refreshes[0]!.form.get("client_id")).toBe(original.clientId);
+  expect(refreshes[0]!.form.get("refresh_token")).toBe(refreshToken);
+  expect(fetcher).toHaveBeenCalledOnce();
 });
 
 it("rejects forged captures and late grants after the original caller is revoked", async () => {
@@ -205,6 +260,50 @@ it("discards a late token response after its original controller connection is r
   await f.client.completeCallback({ flowId: flow!.flowId, credentialUploadTicketId: ticket!.ticketId }); await ready;
   f.revoke(); release(); await f.settings.dispose();
   expect(f.manager.get(f.entry.id).slots[0]!.accounts).toEqual([]); expect(f.credentials.list()).toEqual([]);
+});
+
+it("reports a committed protected reconnect while the replaced refresh credential is still retiring", async () => {
+  const f = await settingsFixture(), id = f.entry.id, identity = "same-account@example.test";
+  const original = (await f.connect(identity)).slots[0]!.accounts[0]!;
+  const firstAccess = await f.manager.fresh(id, "account", f.declaration(), original.id);
+  const oldReference = f.saved().accounts[0]!.refreshReference!;
+  f.identityDisplayName("Reconnected account");
+  let releaseRetirement!: () => void;
+  const retirementGate = new Promise<void>(resolve => { releaseRetirement = resolve; });
+  const retire = f.credentials.retireManagedCredential.bind(f.credentials);
+  const gatedRetirement = vi.spyOn(f.credentials, "retireManagedCredential").mockImplementation(async (...args) => {
+    if (args[0] === oldReference) await retirementGate;
+    return retire(...args);
+  });
+  try {
+    const { flow } = await f.start(), flowId = flow!.flowId;
+    let offer: NonNullable<typeof flow>["authorization"];
+    await vi.waitFor(async () => {
+      const current = (await f.client.getFlow({ flowId })).flow!;
+      expect(current.phase).toBe(Phase.AUTHORIZING);
+      offer = current.authorization;
+    });
+    const waiter = vi.fn();
+    void f.settings.waitForFlow(flowId, "controller").then(waiter, waiter);
+    const callback = await f.authorize(identity)(offer!), { ticket } = await f.client.beginCallback({ flowId });
+    f.credentials.upload(ticket!.ticketId, JSON.stringify(callback), "controller");
+    await f.client.completeCallback({ flowId, credentialUploadTicketId: ticket!.ticketId });
+    await vi.waitFor(() => expect(gatedRetirement.mock.calls.some(args => args[0] === oldReference)).toBe(true));
+
+    const stillPending = f.credentials.find(oldReference);
+    expect(stillPending).toBeDefined();
+    expect(f.saved().accounts).toEqual([expect.objectContaining({ id: original.id, refreshReference: expect.any(String) })]);
+    expect(f.saved().accounts[0]!.refreshReference).not.toBe(oldReference);
+    const cancelled = (await f.client.cancelFlow({ flowId })).flow!;
+    expect(cancelled).toMatchObject({ phase: Phase.COMPLETE, failure: Failure.UNSPECIFIED });
+    await vi.waitFor(() => expect(waiter).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ phase: Phase.COMPLETE })));
+    const state = (await f.client.get({ extensionId: id })).state!;
+    expect(state.slots[0]!.accounts).toMatchObject([{ accountId: original.id, label: "Team · Reconnected account", isDefault: true, expired: false }]);
+    const adopted = await f.manager.fresh(id, "account", f.declaration(), original.id);
+    expect(adopted).toMatchObject({ ok: true, accountId: original.id });
+    expect(adopted).not.toEqual(firstAccess);
+  } finally { releaseRetirement(); }
+  await vi.waitFor(() => expect(f.credentials.find(oldReference)).toBeUndefined());
 });
 
 it("injects the selected account, refreshes it once on 401 and keeps token bytes out of the plugin result", async () => {

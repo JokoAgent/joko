@@ -5,7 +5,7 @@ import type { CredentialVault, EncryptedCredential } from "../credential-vault.j
 export interface ExtensionOAuthAccountRow {
   readonly id: string; readonly revision: string; readonly label?: string; readonly displayLabel?: string;
   readonly status: "connected" | "expired"; readonly expiredReason?: "client_changed"; readonly createdAt: number;
-  readonly builtinClientHash: string; readonly refreshReference?: string;
+  readonly builtinClientHash: string; readonly builtinRefreshOwnerHash?: string; readonly refreshReference?: string;
   readonly authScopes: readonly string[]; readonly authFace: "full" | "subset"; readonly insufficientScopes?: readonly string[];
 }
 export interface ExtensionOAuthSaved {
@@ -34,6 +34,7 @@ export class ExtensionOAuthAccountState {
     if (!HASH_RE.test(scope) || value?.version !== 1 || !Array.isArray(value.accounts) || value.accounts.length > 8 || !reference(value.clientReference, "client")
       || value.accounts.some(row => !row || !UUID_RE.test(row.id) || !UUID_RE.test(row.revision) || !labelValid(row.label) || !labelValid(row.displayLabel)
         || !["connected", "expired"].includes(row.status) || row.expiredReason !== undefined && row.expiredReason !== "client_changed" || !HASH_RE.test(row.builtinClientHash)
+        || row.builtinRefreshOwnerHash !== undefined && (typeof row.builtinRefreshOwnerHash !== "string" || !HASH_RE.test(row.builtinRefreshOwnerHash))
         || !Number.isSafeInteger(row.createdAt) || row.createdAt < 0 || !reference(row.refreshReference, "refresh") || !scopesValid(row.authScopes)
         || !["full", "subset"].includes(row.authFace) || row.insufficientScopes !== undefined && !scopesValid(row.insufficientScopes))
       || new Set(value.accounts.map(row => row.id)).size !== value.accounts.length

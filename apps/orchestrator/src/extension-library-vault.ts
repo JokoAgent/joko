@@ -69,6 +69,10 @@ export class ExtensionLibraryError extends Error {
   }
 }
 
+export class ExtensionLibraryFileNotFoundError extends ExtensionLibraryError {
+  constructor(message = "Library file was not found.") { super("NOT_FOUND", message); }
+}
+
 export class ExtensionLibraryOrphanMarkerWriteError extends Error {
   constructor(cause: unknown) {
     super("Extension Library orphan marker could not be staged.", { cause });
@@ -375,9 +379,12 @@ export class ExtensionLibraryVault {
   async read(input: { readonly path: string; readonly offset?: number; readonly length?: number; readonly sourceTag?: string }): Promise<ExtensionLibraryReadResult> {
     await this.#requireReady(false);
     const relativePath = validateExtensionLibraryPath(input.path, this.#limits);
-    const target = await this.#resolveExisting(relativePath, "file");
+    const target = await this.#resolveExisting(relativePath, "file").catch((error: unknown) => {
+      if (error instanceof ExtensionLibraryError && error.code === "NOT_FOUND") throw new ExtensionLibraryFileNotFoundError(error.message);
+      throw error;
+    });
     const before = await lstat(target, { bigint: true });
-    if (!before.isFile() || before.isSymbolicLink()) throw new ExtensionLibraryError("NOT_FOUND", "Library file was not found.");
+    if (!before.isFile() || before.isSymbolicLink()) throw new ExtensionLibraryFileNotFoundError();
     const offset = input.offset ?? 0;
     if (!Number.isSafeInteger(offset) || offset < 0 || offset > Number(before.size)) {
       throw new ExtensionLibraryError("PATH_INVALID", "Library read offset is invalid.");
@@ -712,6 +719,10 @@ export class ExtensionLibraryVault {
     await this.#assertRootIdentity();
   }
 
+  invalidateUsage(): void {
+    this.#usage.needsReconcile = true;
+  }
+
   async allocateTemporaryPath(suffix: ".sqlite-backup" | ".stream"): Promise<string> {
     await this.#requireReady(true);
     const root = join(this.#hostRoot(), TEMP_DIRECTORY);
@@ -752,25 +763,25 @@ export class ExtensionLibraryVault {
     });
   }
 
-  async commitSqliteBackup(temporaryPath: string, path: string): Promise<ExtensionLibraryWriteResult> {
+  async commitSqliteBackup(temporaryPath: string, path: string, verified: BigIntStats): Promise<ExtensionLibraryWriteResult> {
     await this.#requireReady(true);
     const relativePath = validateExtensionLibraryPath(path, this.#limits);
     if (!relativePath.toLowerCase().endsWith(".sqlite")) {
       throw new ExtensionLibraryError("PATH_INVALID", "Library database backup path must end in .sqlite.");
     }
     const temporary = this.#assertOwnedTemporaryPath(temporaryPath, ".sqlite-backup");
-    const before = await regularFileSnapshot(temporary);
-    if (before.size > BigInt(this.#limits.maximumStreamBytes)) {
+    await assertPathSnapshot(temporary, verified);
+    if (verified.size > BigInt(this.#limits.maximumStreamBytes)) {
       throw new ExtensionLibraryError("TOO_LARGE", "Library database backup exceeds the 8 GiB boundary.");
     }
-    const bytes = safeNumber(before.size);
-    const digest = await hashOpenFile(temporary, before);
+    const bytes = safeNumber(verified.size);
+    const digest = await hashOpenFile(temporary, verified);
     return this.#commitVerifiedStagedWrite({
       temporary,
       path: relativePath,
       bytes,
       sha256: digest,
-      before,
+      before: verified,
       ifNotExists: true
     });
   }

@@ -211,6 +211,7 @@ import {
 } from "./extension-library-manager.js";
 import {
   ExtensionLibraryError,
+  ExtensionLibraryFileNotFoundError,
   type ExtensionLibraryEntry,
   type ExtensionLibraryWriteResult
 } from "./extension-library-vault.js";
@@ -7905,7 +7906,7 @@ function eventContext(
   item: PersistedEvent,
   dependencies: ConnectServiceDependencies
 ): EventMappingContext {
-  if (item.payload.type === "device_changed") return {};
+  if (item.payload.type === "device_changed" || item.payload.type === "extension_oauth_changed") return {};
   const store = dependencies.store;
   let session: StoredSession | undefined;
   let target: StoredTarget | undefined;
@@ -7960,8 +7961,8 @@ function eventContext(
 }
 
 function eventMatchesScope(item: PersistedEvent, scope: contract.SnapshotScope | undefined, dependencies: ConnectServiceDependencies): boolean {
-  if (item.payload.type === "device_changed") return scope?.kind.case === undefined || scope.kind.case === "owner";
-  if (item.payload.type === "task_tag_catalog_changed") return scope?.kind.case === undefined || scope.kind.case === "owner";
+  if (item.payload.type === "device_changed" || item.payload.type === "task_tag_catalog_changed"
+    || item.payload.type === "extension_oauth_changed") return scope?.kind.case === undefined || scope.kind.case === "owner";
   if (scope?.kind.case !== "session" && dependencies.partnerGroupRuntime?.isGroupSession(item.sessionId) === true) return false;
   switch (scope?.kind.case) {
     case undefined:
@@ -12905,7 +12906,10 @@ async function extensionLibraryEffect<T>(action: () => T | Promise<T>): Promise<
               : error.code === "READ_ONLY" || error.code === "UNAVAILABLE" || error.code === "CORRUPT" || error.code === "SQL_FAILED"
                 ? Code.FailedPrecondition
                 : Code.Internal;
-    throw new ConnectError(redactSecrets(error.message), code);
+    const details = error instanceof ExtensionLibraryFileNotFoundError
+      ? [{ desc: contract.ErrorInfoSchema, value: create(contract.ErrorInfoSchema, { code: contract.EXTENSION_LIBRARY_FILE_NOT_FOUND }) }]
+      : undefined;
+    throw new ConnectError(redactSecrets(error.message), code, undefined, details);
   }
 }
 
@@ -13159,14 +13163,14 @@ async function dispatchExtensionLibraryCall(
         connectionId,
         operation.value.handleId,
         statement.sql,
-        statement.parameters.map(nativeExtensionLibrarySqlValue)
+        nativeExtensionLibrarySqlParameters(statement)
       );
       return librarySqlCallResult(value);
     }
     case "sqlBatch": {
       const values = await manager.databaseBatch(sessionId, connectionId, operation.value.handleId, operation.value.statements.map((statement) => ({
         sql: statement.sql,
-        parameters: statement.parameters.map(nativeExtensionLibrarySqlValue)
+        parameters: nativeExtensionLibrarySqlParameters(statement)
       })));
       return create(contract.ExtensionLibraryCallResultSchema, {
         result: { case: "sqlBatch", value: create(contract.ExtensionLibrarySqlBatchResultSchema, {
@@ -13207,6 +13211,13 @@ async function dispatchExtensionLibraryCall(
 function requiredLibrarySqlStatement(value: contract.ExtensionLibrarySqlStatement | undefined): contract.ExtensionLibrarySqlStatement {
   if (value === undefined) throw invalidArgument("sql statement is required");
   return value;
+}
+
+function nativeExtensionLibrarySqlParameters(statement: contract.ExtensionLibrarySqlStatement): import("./extension-library-sql.js").ExtensionLibrarySqlParameters {
+  const named = Object.entries(statement.namedParameters);
+  if (named.length === 0) return statement.parameters.map(nativeExtensionLibrarySqlValue);
+  if (statement.parameters.length > 0) throw invalidArgument("A SQL statement must choose named or positional parameters.");
+  return Object.fromEntries(named.map(([name, value]) => [name, nativeExtensionLibrarySqlValue(value)] as const));
 }
 
 function nativeExtensionLibrarySqlValue(value: contract.ExtensionLibrarySqlValue): import("./extension-library-sql.js").ExtensionLibrarySqlValue {

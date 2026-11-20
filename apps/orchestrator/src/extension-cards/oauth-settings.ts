@@ -12,7 +12,7 @@ type Owner = ExtensionOAuthOwner;
 interface Input { readonly capture: ExtensionOAuthCapture; readonly connectionId: string; readonly expiresAt: number }
 interface Flow {
   readonly id: string; readonly capture: ExtensionOAuthCapture; readonly owner: Owner; readonly abort: AbortController;
-  readonly expiresAt: number; readonly unsubscribe: () => void;
+  readonly expiresAt: number; readonly unsubscribe: () => void; readonly committed: Promise<void>;
   phase: Phase; failure: Failure; offer?: ExtensionOAuthOffer; callback?: (value: ExtensionOAuthCallback) => void;
   inputTicket?: string; settledAt?: number; task: Promise<void>;
 }
@@ -65,10 +65,13 @@ export class ExtensionOAuthSettings {
     const capture = this.#capture(extensionId, key, revision); owner.assertCurrent();
     if (this.#flows.size >= 64) throw new ExtensionOAuthError("INVALID_CONFIG");
     const id = randomUUID(), abort = new AbortController();
+    let publishCommit!: () => void;
+    const committed = new Promise<void>(resolve => { publishCommit = resolve; });
     const flow: Flow = { id, capture, owner, abort, expiresAt: Date.now() + 300_000, phase: Phase.PREPARING, failure: Failure.UNSPECIFIED,
-      unsubscribe: owner.onRevoked(() => this.#cancel(flow, Failure.CANCELLED)), task: Promise.resolve() };
+      unsubscribe: owner.onRevoked(() => this.#cancel(flow, Failure.CANCELLED)), committed, task: Promise.resolve() };
     this.#flows.set(id, flow);
     flow.task = this.options.accounts.connect(capture, { signal: abort.signal, assertCurrent: () => this.#assertFlow(flow), ...(scopes.length ? { scopes } : {}),
+      onCommitted: () => { flow.phase = Phase.COMPLETE; flow.failure = Failure.UNSPECIFIED; publishCommit(); },
       authorize: async (offer, signal) => {
         this.#assertFlow(flow); flow.offer = offer; flow.phase = Phase.AUTHORIZING;
         return await new Promise<ExtensionOAuthCallback>((resolve, reject) => {
@@ -78,12 +81,15 @@ export class ExtensionOAuthSettings {
           if (signal.aborted) stop();
         });
       }
-    }).then(() => { this.#assertFlow(flow); flow.phase = Phase.COMPLETE; }, error => {
+    }).catch(error => {
+      if (flow.phase === Phase.COMPLETE) return;
       flow.phase = Phase.FAILED; if (flow.failure === Failure.UNSPECIFIED) flow.failure = failure(error);
     }).finally(() => { flow.settledAt = Date.now(); delete flow.offer; delete flow.callback; flow.unsubscribe(); this.#retireCallback(flow); });
     // A late caller revocation cannot turn a fulfilled authorization into an
     // unhandled promise rejection or leave a controller callback waiting.
-    flow.task = flow.task.catch(() => { flow.phase = Phase.FAILED; flow.failure = Failure.CANCELLED; });
+    flow.task = flow.task.catch(() => {
+      if (flow.phase !== Phase.COMPLETE) { flow.phase = Phase.FAILED; flow.failure = Failure.CANCELLED; }
+    });
     return this.#view(flow);
   }
   #assertFlow(flow: Flow): void {
@@ -98,7 +104,7 @@ export class ExtensionOAuthSettings {
     return flow;
   }
   getFlow(id: string, connectionId: string) { return this.#view(this.#owned(id, connectionId)); }
-  async waitForFlow(id: string, connectionId: string) { const flow = this.#owned(id, connectionId); await flow.task; return this.#view(this.#owned(id, connectionId)); }
+  async waitForFlow(id: string, connectionId: string) { const flow = this.#owned(id, connectionId); await Promise.race([flow.committed, flow.task]); return this.#view(this.#owned(id, connectionId)); }
   beginCallback(id: string, connectionId: string) {
     const flow = this.#owned(id, connectionId);
     if (flow.phase !== Phase.AUTHORIZING || !flow.offer || !flow.callback || flow.inputTicket) throw new ExtensionOAuthError("INVALID_CONFIG");
@@ -129,6 +135,7 @@ export class ExtensionOAuthSettings {
     delete flow.inputTicket;
   }
   #cancel(flow: Flow, code: Failure) {
+    if (!active(flow)) return;
     flow.phase = Phase.FAILED; flow.failure = code; delete flow.offer; delete flow.callback;
     flow.abort.abort(); this.#retireCallback(flow);
   }

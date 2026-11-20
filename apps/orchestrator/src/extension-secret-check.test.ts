@@ -51,6 +51,21 @@ it("uses a formatted JSON object in the declared candidate check", async () => {
   }));
 });
 
+it("checks a pasted candidate after trimming outer whitespace and rejects multiline candidates", async () => {
+  const network = declaration(), secret = { ...network.secrets![0]!, exchange: undefined };
+  const fetcher = vi.fn<typeof fetch>(async () => Response.json({ result: { active: true } }));
+  const check = (value: string) => checkExtensionSecretCandidate({ declaration: network, secret, value, fetch: fetcher,
+    signal: new AbortController().signal, assertCurrent: () => undefined });
+
+  await expect(check("fixture-candidate\r\n")).resolves.toEqual({ valid: true });
+  expect(fetcher).toHaveBeenCalledExactlyOnceWith(new URL("https://api.example.com/check"), expect.objectContaining({
+    body: '{"candidate":"fixture-candidate"}', headers: { "content-type": "application/json", Authorization: "Bearer fixture-candidate" }
+  }));
+  fetcher.mockClear();
+  await expect(check("fixture\nsecond-line")).rejects.toThrow("The credential candidate cannot be checked.");
+  expect(fetcher).not.toHaveBeenCalled();
+});
+
 it("discards a definite upstream failure body before reporting a failed candidate check", async () => {
   const network = declaration(), secret = { ...network.secrets![0]!, exchange: undefined };
   const cancelled = vi.fn();

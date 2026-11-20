@@ -1,6 +1,6 @@
 import { create } from "@bufbuild/protobuf";
 import {
-  ExtensionLibraryCallSchema, ExtensionLibraryEntryKind as ProtoExtensionLibraryEntryKind,
+  EXTENSION_LIBRARY_SQL_MAXIMUM_BATCH_STATEMENTS, ExtensionLibraryCallSchema, ExtensionLibraryEntryKind as ProtoExtensionLibraryEntryKind,
   type ExtensionLibraryCallResult as ProtoExtensionLibraryCallResult,
   type ExtensionLibraryEntry as ProtoExtensionLibraryEntry,
   type ExtensionLibrarySqlResult as ProtoExtensionLibrarySqlResult,
@@ -220,7 +220,8 @@ function parseCall(value: Record<string, unknown>): MobileExtensionLibraryCall |
     }
     case "sqlBatch": {
       if (!exact(value, ["kind", "handleId", "statements"]) || !safeId(value.handleId)
-        || !Array.isArray(value.statements) || value.statements.length === 0 || value.statements.length > 100) return undefined;
+        || !Array.isArray(value.statements) || value.statements.length === 0
+        || value.statements.length > EXTENSION_LIBRARY_SQL_MAXIMUM_BATCH_STATEMENTS) return undefined;
       const statements = value.statements.map(parseStatement);
       return statements.some((statement) => statement === undefined)
         ? undefined

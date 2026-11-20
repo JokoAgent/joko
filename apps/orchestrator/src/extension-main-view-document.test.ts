@@ -8,8 +8,8 @@ const input = (html: string, assets: Record<string, string | Buffer>) => ({ html
     return { body: Buffer.from(assets[path]!), mimeType: path.endsWith(".svg") ? "image/svg+xml" : "text/plain" };
   }), assertCurrent: vi.fn(async () => {}) });
 
-it("materializes modules, nested CSS and images without a network or filesystem resolver", async () => {
-  const f = input('<html><head><script type="module" src="app.js"></script><link rel="stylesheet" href="main.css"></head><body style="background:url(./icon.svg)"><img src="icon.svg" srcset="icon.svg 1x, icon.svg 2x"></body></html>', {
+it.each(["stylesheet", "StyleSheet"])("materializes modules, nested CSS (%s) and images through the scoped reader", async (rel) => {
+  const f = input(`<html><head><script type="module" src="app.js"></script><link rel="${rel}" href="main.css"></head><body style="background:url(./icon.svg)"><img src="icon.svg" srcset="icon.svg 1x, icon.svg 2x"></body></html>`, {
     "app.js": "import { value } from './nested/value.js'; document.body.dataset.answer = value; const image = new URL('./icon.svg', import.meta.url);",
     "nested/value.js": "export const value = 'complete-module-graph';",
     "main.css": "@import './nested/colors.css';body{background:url('./icon.svg')}",

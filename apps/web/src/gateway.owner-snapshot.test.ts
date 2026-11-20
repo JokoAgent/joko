@@ -1,7 +1,7 @@
 import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import {
-  EventPayloadSchema, EventSchema, ExtensionTaskServiceListBackgroundTasksResponseSchema, GetSnapshotResponseSchema, MessageRole, SessionState, SnapshotSchema,
+  EXTENSION_OAUTH_INVALIDATION_SCOPE, EventPayloadSchema, EventSchema, ExtensionTaskServiceListBackgroundTasksResponseSchema, GetSnapshotResponseSchema, MessageRole, SessionState, SnapshotInvalidationReason, SnapshotSchema,
   StreamEventsResponseSchema, type Event, type Snapshot
 } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
@@ -129,6 +129,23 @@ describe("owner snapshot Timeline retention", () => {
       await vi.waitFor(() => expect(harness.reads()).toBeGreaterThan(reads));
       expect(harness.latest().timelineBySession.has("session-one")).toBe(false);
       expect(harness.latest().timelineHistoryRevisionBySession.get("session-one")).toBeGreaterThan(0n);
+    } finally { harness.gateway.disconnect(); }
+  });
+
+  it("updates mounted OAuth settings through a contiguous event without retiring loaded task history", async () => {
+    const harness = ownerHarness();
+    await harness.gateway.connect();
+    try {
+      await harness.emit(answer("answer-one", "Retained answer."));
+      const before = harness.latest(), reads = harness.reads();
+      await harness.emit({ case: "projectionInvalidated", value: {
+        scope: EXTENSION_OAUTH_INVALIDATION_SCOPE, reason: SnapshotInvalidationReason.PROJECTION_REBUILT
+      } });
+      const after = harness.latest();
+      expect(after.extensionOAuthRevision).toBe(after.cursor);
+      expect(after.extensionOAuthRevision).toBeGreaterThan(before.extensionOAuthRevision ?? 0n);
+      expect(after.timelineBySession.get("session-one")).toBe(before.timelineBySession.get("session-one"));
+      expect(harness.reads()).toBe(reads);
     } finally { harness.gateway.disconnect(); }
   });
 });

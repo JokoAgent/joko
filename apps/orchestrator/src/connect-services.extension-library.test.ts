@@ -196,6 +196,30 @@ describe("Connect Extension Library boundary", () => {
     expect(read.result.value.path).toBe("notes/hello.txt");
 
     const client = createClient(contract.ExtensionService, createRouterTransport(router => router.service(contract.ExtensionService, services.extension)));
+    const call = (operation: contract.ExtensionLibraryCall["operation"]) => client.callExtensionLibrary({ sessionId: sessionId!, call: { operation } }, {
+      headers: { authorization: "Bearer extension-library-test" }
+    });
+    const upload = (await call({ case: "writeBegin", value: create(contract.ExtensionLibraryWriteBeginOperationSchema, {
+      path: "notes/chunks.txt", totalBytes: 4n
+    }) })).result?.result;
+    if (upload?.case !== "stream") throw new Error("Expected an open Library write stream.");
+    const streamId = upload.value.streamId;
+    const chunk = (sequence: number, text: string) => call({ case: "writeChunk", value: create(contract.ExtensionLibraryWriteChunkOperationSchema, {
+      streamId, sequence, content: new TextEncoder().encode(text)
+    }) });
+    expect((await chunk(0, "ab")).result?.result).toMatchObject({ case: "stream", value: { streamId, nextSequence: 1, receivedBytes: 2n } });
+    const missingFile = await call({ case: "read", value: create(contract.ExtensionLibraryReadOperationSchema, { path: "notes/missing.txt" }) }).catch(ConnectError.from);
+    expect(missingFile).toMatchObject({ code: Code.NotFound });
+    expect(ConnectError.from(missingFile).findDetails(contract.ErrorInfoSchema)).toMatchObject([{ code: contract.EXTENSION_LIBRARY_FILE_NOT_FOUND }]);
+    expect((await chunk(1, "cd")).result?.result).toMatchObject({ case: "stream", value: { streamId, receivedBytes: 4n } });
+    expect((await call({ case: "writeCommit", value: create(contract.ExtensionLibraryWriteCommitOperationSchema, { streamId }) })).result?.result)
+      .toMatchObject({ case: "write", value: { path: "notes/chunks.txt", bytes: 4n } });
+    const missingSession = await client.callExtensionLibrary({ sessionId: `library_session_${"0".repeat(32)}`, call: { operation: {
+      case: "read", value: create(contract.ExtensionLibraryReadOperationSchema, { path: "notes/hello.txt" })
+    } } }, { headers: { authorization: "Bearer extension-library-test" } }).catch(ConnectError.from);
+    expect(missingSession).toMatchObject({ code: Code.NotFound });
+    expect(ConnectError.from(missingSession).findDetails(contract.ErrorInfoSchema)).toEqual([]);
+
     const path = "notes/hello.txt";
     const callExact = (operation: contract.ExtensionLibraryCall["operation"], match: string, onHeader?: (headers: Headers) => void) =>
       client.callExtensionLibrary({ sessionId: sessionId!, call: { operation } }, {
@@ -273,6 +297,23 @@ describe("Connect Extension Library boundary", () => {
         ] }]
       }
     });
+
+    const namedId = create(contract.ExtensionLibrarySqlValueSchema, { value: { case: "numberValue", value: 7 } });
+    const namedTitle = create(contract.ExtensionLibrarySqlValueSchema, { value: { case: "textValue", value: "seventh" } });
+    await expect(call({ case: "sqlExecute", value: create(contract.ExtensionLibrarySqlExecuteOperationSchema, {
+      handleId, statement: { sql: "INSERT INTO cards(id, title) VALUES (:id, :title)", namedParameters: { id: namedId, title: namedTitle } }
+    }) })).resolves.toMatchObject({ result: { result: { case: "sqlResult", value: { changes: "1" } } } });
+    const namedStatement = { sql: "SELECT title FROM cards WHERE id = :id", namedParameters: { id: namedId } };
+    const namedRow = { cells: [{ name: "title", value: { value: { case: "textValue", value: "seventh" } } }] };
+    await expect(call({ case: "sqlExecute", value: create(contract.ExtensionLibrarySqlExecuteOperationSchema, {
+      handleId, statement: namedStatement
+    }) })).resolves.toMatchObject({ result: { result: { case: "sqlResult", value: { rows: [namedRow] } } } });
+    await expect(call({ case: "sqlBatch", value: create(contract.ExtensionLibrarySqlBatchOperationSchema, {
+      handleId, statements: [namedStatement, { sql: "SELECT title FROM cards WHERE id = ?", parameters: [namedId] }]
+    }) })).resolves.toMatchObject({ result: { result: { case: "sqlBatch", value: { results: [{ rows: [namedRow] }, { rows: [namedRow] }] } } } });
+    await expect(call({ case: "sqlExecute", value: create(contract.ExtensionLibrarySqlExecuteOperationSchema, {
+      handleId, statement: { ...namedStatement, parameters: [namedId] }
+    }) })).rejects.toMatchObject({ code: Code.InvalidArgument });
 
     await expect(libraryCall(services.extension.callExtensionLibrary, sessionId!, {
       case: "read",

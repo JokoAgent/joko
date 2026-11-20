@@ -4,6 +4,7 @@ import { constants, type BigIntStats } from "node:fs";
 import { lstat, open, unlink, type FileHandle } from "node:fs/promises";
 import { toNamespacedPath } from "node:path";
 import { backup, constants as sqliteConstants, DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
+import { EXTENSION_LIBRARY_SQL_MAXIMUM_BATCH_STATEMENTS } from "@joko/contracts";
 
 import {
   ExtensionLibraryError,
@@ -24,12 +25,21 @@ export const EXTENSION_LIBRARY_SQL_LIMITS: ExtensionLibrarySqlLimits = Object.fr
   maximumRows: 2_000,
   maximumResultBytes: 16 * 1024 * 1024,
   maximumParameters: 256,
-  maximumBatchStatements: 100,
+  maximumBatchStatements: EXTENSION_LIBRARY_SQL_MAXIMUM_BATCH_STATEMENTS,
   maximumSqlCharacters: 128 * 1024
 });
+const MAXIMUM_MIGRATION_STATEMENTS = 100;
 
 export type ExtensionLibrarySqlValue = null | number | bigint | string | Uint8Array;
 export type ExtensionLibrarySqlRow = Readonly<Record<string, ExtensionLibrarySqlValue>>;
+export type ExtensionLibrarySqlParameters = readonly ExtensionLibrarySqlValue[] | Readonly<Record<string, ExtensionLibrarySqlValue>>;
+
+export interface ExtensionLibrarySqlStatement {
+  readonly sql: string;
+  readonly parameters?: ExtensionLibrarySqlParameters;
+}
+
+type SqliteBindings = { readonly positional: readonly SQLInputValue[] } | { readonly named: Record<string, SQLInputValue> };
 
 export interface ExtensionLibrarySqlResult {
   readonly rows: readonly ExtensionLibrarySqlRow[];
@@ -73,8 +83,8 @@ export type ExtensionLibrarySqlWorkerRequest =
   | { readonly id: number; readonly operation: "open"; readonly input: { readonly path: string; readonly create?: boolean; readonly readonly?: boolean } }
   | { readonly id: number; readonly operation: "close" | "check" | "userVersion"; readonly handleId: string }
   | { readonly id: number; readonly operation: "closeAll" }
-  | { readonly id: number; readonly operation: "execute"; readonly handleId: string; readonly sql: string; readonly parameters: readonly ExtensionLibrarySqlValue[] }
-  | { readonly id: number; readonly operation: "batch"; readonly handleId: string; readonly statements: readonly { readonly sql: string; readonly parameters?: readonly ExtensionLibrarySqlValue[] }[] }
+  | { readonly id: number; readonly operation: "execute"; readonly handleId: string; readonly sql: string; readonly parameters: ExtensionLibrarySqlParameters }
+  | { readonly id: number; readonly operation: "batch"; readonly handleId: string; readonly statements: readonly ExtensionLibrarySqlStatement[] }
   | { readonly id: number; readonly operation: "migrate"; readonly handleId: string; readonly migrations: readonly ExtensionLibrarySqlMigration[] }
   | { readonly id: number; readonly operation: "backup"; readonly handleId: string; readonly targetPath: string };
 
@@ -231,7 +241,7 @@ export class ExtensionLibrarySqlService {
   async execute(
     handleId: string,
     sql: string,
-    parameters: readonly ExtensionLibrarySqlValue[] = []
+    parameters: ExtensionLibrarySqlParameters = []
   ): Promise<ExtensionLibrarySqlResult> {
     const validated = validateSql(sql, this.#limits);
     validateParameters(parameters, this.#limits);
@@ -248,7 +258,7 @@ export class ExtensionLibrarySqlService {
 
   async batch(
     handleId: string,
-    statements: readonly { readonly sql: string; readonly parameters?: readonly ExtensionLibrarySqlValue[] }[]
+    statements: readonly ExtensionLibrarySqlStatement[]
   ): Promise<readonly ExtensionLibrarySqlResult[]> {
     validateStatementBatch(statements, this.#limits);
     const mutates = statements.some((statement) => validateSql(statement.sql, this.#limits).mutates);
@@ -268,7 +278,10 @@ export class ExtensionLibrarySqlService {
     await this.#vault.assertWritable();
     await this.#vault.assertMutationAuthority("sqlite");
     const result = await this.#call<number>({ id: this.#requestId(), operation: "migrate", handleId, migrations });
-    await this.#vault.reconcileUsage();
+    // The worker committed the schema and its usage record. Refresh the parent
+    // cache on its next operation rather than writing a second usage record here.
+    this.#vault.invalidateUsage();
+    await this.#vault.assertCurrentRoot();
     return result;
   }
 
@@ -575,7 +588,7 @@ export class ExtensionLibrarySqlCore {
   async execute(
     handleId: string,
     sql: string,
-    parameters: readonly ExtensionLibrarySqlValue[] = []
+    parameters: ExtensionLibrarySqlParameters = []
   ): Promise<ExtensionLibrarySqlResult> {
     const entry = this.#handle(handleId);
     const validated = validateSql(sql, this.#limits);
@@ -604,7 +617,7 @@ export class ExtensionLibrarySqlCore {
 
   async batch(
     handleId: string,
-    statements: readonly { readonly sql: string; readonly parameters?: readonly ExtensionLibrarySqlValue[] }[]
+    statements: readonly ExtensionLibrarySqlStatement[]
   ): Promise<readonly ExtensionLibrarySqlResult[]> {
     const entry = this.#handle(handleId);
     if (statements.length === 0 || statements.length > this.#limits.maximumBatchStatements) {
@@ -635,7 +648,8 @@ export class ExtensionLibrarySqlCore {
   async migrate(handleId: string, migrations: readonly ExtensionLibrarySqlMigration[]): Promise<number> {
     const entry = this.#handle(handleId);
     if (entry.readonly) throw new ExtensionLibraryError("READ_ONLY", "Library database handle is read-only.");
-    if (!Array.isArray(migrations) || migrations.length === 0 || migrations.length > this.#limits.maximumBatchStatements) {
+    const maximumStatements = Math.min(this.#limits.maximumBatchStatements, MAXIMUM_MIGRATION_STATEMENTS);
+    if (!Array.isArray(migrations) || migrations.length === 0 || migrations.length > maximumStatements) {
       throw new ExtensionLibraryError("TOO_LARGE", "Library database migration count is outside the supported boundary.");
     }
     if ([...this.#handles.values()].some((candidate) => candidate.handleId !== handleId && candidate.absolutePath === entry.absolutePath)) {
@@ -651,7 +665,7 @@ export class ExtensionLibrarySqlCore {
         throw new ExtensionLibraryError("CONFLICT", "Library database migrations must be non-empty and contiguous.");
       }
       statementCount += migration.statements.length;
-      if (statementCount > this.#limits.maximumBatchStatements) {
+      if (statementCount > maximumStatements) {
         throw new ExtensionLibraryError("TOO_LARGE", "Library database migration statement count exceeded the supported boundary.");
       }
       for (const sql of migration.statements) {
@@ -659,6 +673,9 @@ export class ExtensionLibrarySqlCore {
         if (!statement.mutates) throw new ExtensionLibraryError("SQL_REJECTED", "Library database migrations may only contain mutations.");
       }
       previousVersion = migration.version;
+    }
+    if (previousVersion !== undefined && current > previousVersion) {
+      throw new ExtensionLibraryError("CONFLICT", "Library database is newer than the requested migration target.");
     }
     const pending = migrations.filter((migration) => migration.version > current);
     let expected = current + 1;
@@ -679,7 +696,7 @@ export class ExtensionLibrarySqlCore {
       this.#begin(entry, true);
       try {
         for (const migration of pending) {
-          for (const sql of migration.statements) this.#executePrepared(entry, sql, []);
+          for (const sql of migration.statements) this.#executePrepared(entry, sql, { positional: [] });
           this.#internal(entry, () => entry.database.exec(`PRAGMA user_version = ${migration.version}`));
         }
         this.#assertQuickCheck(entry);
@@ -737,9 +754,18 @@ export class ExtensionLibrarySqlCore {
       if (!missing(error)) throw error;
     }
     const temporary = await this.#vault.allocateTemporaryPath(".sqlite-backup");
+    let reserved: BigIntStats | undefined;
     try {
+      const reservation = await open(temporary, "wx", 0o600);
+      try { reserved = await reservation.stat({ bigint: true }); }
+      finally { await reservation.close(); }
+      await assertDatabaseIdentity(temporary, reserved);
       await backup(entry.database, sqliteFilesystemPath(temporary), { rate: 4_096 });
       await this.#assertDatabaseCurrent(entry, false);
+      const verified = await databaseIdentity(temporary);
+      if (!sameDatabaseObject(reserved, verified)) {
+        throw new ExtensionLibraryError("CONFLICT", "Library database backup does not match its reserved file.");
+      }
       const verification = new DatabaseSync(sqliteFilesystemPath(temporary), { readOnly: true, allowExtension: false, readBigInts: true });
       let userVersion: number;
       try {
@@ -751,7 +777,7 @@ export class ExtensionLibrarySqlCore {
           absolutePath: temporary,
           readonly: true,
           gate,
-          identity: await databaseIdentity(temporary),
+          identity: verified,
           database: verification
         };
         this.#assertQuickCheck(verificationEntry);
@@ -759,12 +785,12 @@ export class ExtensionLibrarySqlCore {
       } finally {
         verification.close();
       }
-      await this.#vault.commitSqliteBackup(temporary, targetPath);
+      await this.#vault.commitSqliteBackup(temporary, targetPath, verified);
       return { path: targetPath, userVersion };
     } catch (error) {
       throw sqlFailure(error);
     } finally {
-      await this.#vault.discardTemporaryPath(temporary, ".sqlite-backup").catch(() => undefined);
+      if (reserved !== undefined) await this.#vault.discardTemporaryPath(temporary, ".sqlite-backup", reserved).catch(() => undefined);
     }
   }
 
@@ -839,12 +865,13 @@ export class ExtensionLibrarySqlCore {
     }
   }
 
-  #executePrepared(entry: OpenDatabase, sql: string, parameters: readonly SQLInputValue[]): ExtensionLibrarySqlResult {
+  #executePrepared(entry: OpenDatabase, sql: string, parameters: SqliteBindings): ExtensionLibrarySqlResult {
     try {
       const statement = entry.database.prepare(sql);
       statement.setReadBigInts(true);
+      if ("named" in parameters) statement.setAllowBareNamedParameters(true);
       if (statement.columns().length === 0) {
-        const result = statement.run(...parameters);
+        const result = "named" in parameters ? statement.run(parameters.named) : statement.run(...parameters.positional);
         return {
           rows: [],
           changes: BigInt(result.changes),
@@ -853,7 +880,8 @@ export class ExtensionLibrarySqlCore {
       }
       const rows: ExtensionLibrarySqlRow[] = [];
       let bytes = 0;
-      for (const raw of statement.iterate(...parameters)) {
+      const results = "named" in parameters ? statement.iterate(parameters.named) : statement.iterate(...parameters.positional);
+      for (const raw of results) {
         if (rows.length >= this.#limits.maximumRows) {
           throw new ExtensionLibraryError("RESULT_LIMIT", "Library SQL result exceeded the row limit.");
         }
@@ -924,7 +952,7 @@ export function validateExtensionLibrarySql(sql: string): { readonly keyword: st
 }
 
 function validateStatementBatch(
-  statements: readonly { readonly sql: string; readonly parameters?: readonly ExtensionLibrarySqlValue[] }[],
+  statements: readonly ExtensionLibrarySqlStatement[],
   limits: ExtensionLibrarySqlLimits
 ): void {
   if (!Array.isArray(statements) || statements.length === 0 || statements.length > limits.maximumBatchStatements) {
@@ -943,7 +971,8 @@ function validateMigrationShape(
   migrations: readonly ExtensionLibrarySqlMigration[],
   limits: ExtensionLibrarySqlLimits
 ): void {
-  if (!Array.isArray(migrations) || migrations.length === 0 || migrations.length > limits.maximumBatchStatements) {
+  const maximumStatements = Math.min(limits.maximumBatchStatements, MAXIMUM_MIGRATION_STATEMENTS);
+  if (!Array.isArray(migrations) || migrations.length === 0 || migrations.length > maximumStatements) {
     throw new ExtensionLibraryError("TOO_LARGE", "Library database migration count is outside the supported boundary.");
   }
   let previousVersion: number | undefined;
@@ -955,7 +984,7 @@ function validateMigrationShape(
       throw new ExtensionLibraryError("CONFLICT", "Library database migrations must be non-empty and contiguous.");
     }
     statementCount += migration.statements.length;
-    if (statementCount > limits.maximumBatchStatements) {
+    if (statementCount > maximumStatements) {
       throw new ExtensionLibraryError("TOO_LARGE", "Library database migration statement count exceeded the supported boundary.");
     }
     for (const sql of migration.statements) {
@@ -1046,14 +1075,11 @@ function validateSql(sql: string, limits: ExtensionLibrarySqlLimits): ValidatedS
 }
 
 function validateParameters(
-  parameters: readonly ExtensionLibrarySqlValue[],
+  parameters: ExtensionLibrarySqlParameters,
   limits: ExtensionLibrarySqlLimits
-): readonly SQLInputValue[] {
-  if (!Array.isArray(parameters) || parameters.length > limits.maximumParameters) {
-    throw new ExtensionLibraryError("TOO_LARGE", "Library SQL parameter count exceeded the supported boundary.");
-  }
+): SqliteBindings {
   let bytes = 0;
-  return parameters.map((value) => {
+  const bind = (value: unknown): SQLInputValue => {
     if (value === null) return null;
     if (typeof value === "number") {
       if (!Number.isFinite(value)) throw new ExtensionLibraryError("SQL_REJECTED", "Library SQL numeric parameters must be finite.");
@@ -1080,7 +1106,31 @@ function validateParameters(
       return Buffer.from(value);
     }
     throw new ExtensionLibraryError("SQL_REJECTED", "Library SQL parameter type is not supported.");
-  });
+  };
+  if (Array.isArray(parameters)) {
+    assertParameterCount(parameters.length, limits);
+    return { positional: parameters.map(bind) };
+  }
+  const prototype = parameters !== null && typeof parameters === "object" ? Object.getPrototypeOf(parameters) : undefined;
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new ExtensionLibraryError("SQL_REJECTED", "Library SQL parameters must be an array or a named binding object.");
+  }
+  const entries = Object.entries(parameters);
+  assertParameterCount(entries.length, limits);
+  return { named: Object.fromEntries(entries.map(([name, value]) => {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name)) {
+      throw new ExtensionLibraryError("SQL_REJECTED", "Library SQL named parameters must use bare identifiers.");
+    }
+    bytes += name.length;
+    assertParameterBytes(bytes, limits);
+    return [name, bind(value)] as const;
+  })) };
+}
+
+function assertParameterCount(count: number, limits: ExtensionLibrarySqlLimits): void {
+  if (count > limits.maximumParameters) {
+    throw new ExtensionLibraryError("TOO_LARGE", "Library SQL parameter count exceeded the supported boundary.");
+  }
 }
 
 function assertParameterBytes(bytes: number, limits: ExtensionLibrarySqlLimits): void {

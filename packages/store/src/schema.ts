@@ -19,6 +19,7 @@ const DURABLE_JSON_SHAPE_BASELINE = [
   "interaction-question-decision:text|single(choice|other)|multiple(choiceIds+optionalOtherText)|boolean",
   "resource-usage-event:exact-v1",
   "device-content-event:owner-routing-null+exact-default/manual/effective-projection-v1",
+  "extension-oauth-change-event:owner-routing-null+content-free-v1",
   "native-derivation-remote-worktree-plan:exact-v1",
   "native-derivation-worktree:optional-remote-owner-exact-v1",
   "task-tag-catalog-event:exact-v1",
@@ -296,10 +297,12 @@ CREATE TABLE events (
         UNIQUE(session_id, session_sequence),
         CHECK (
           (backend_id IS NOT NULL AND target_id IS NOT NULL AND session_id IS NOT NULL
-            AND json_extract(payload_json, '$.payload.type') IS NOT 'device_changed')
+            AND json_extract(payload_json, '$.payload.type') IS NOT 'device_changed'
+            AND json_extract(payload_json, '$.payload.type') IS NOT 'extension_oauth_changed')
           OR
           (backend_id IS NULL AND target_id IS NULL AND session_id IS NULL
-            AND json_extract(payload_json, '$.payload.type') IS 'device_changed'
+            AND (json_extract(payload_json, '$.payload.type') IS 'device_changed'
+              OR json_extract(payload_json, '$.payload.type') IS 'extension_oauth_changed')
             AND run_id IS NULL AND attempt_id IS NULL AND operation_id IS NULL
             AND generation = 0 AND namespace IS NULL AND metadata_json IS NULL)
         )

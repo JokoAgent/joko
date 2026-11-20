@@ -319,8 +319,10 @@ async function writeLibraryPackageCatalog(catalogDirectory: string): Promise<voi
     writeFile(join(viewDirectory, "index.html"), [
       "<!doctype html>",
       "<html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
-      "<title>Library chain</title><link rel=\"stylesheet\" href=\"style.css\"><script defer src=\"app.js\"></script></head>",
-      "<body><main><h1>Extension Library bridge</h1><output id=\"bridge-result\">starting</output></main></body></html>"
+      "<title>Library chain</title><link rel=\"StyleSheet\" href=\"style.css\"><script defer src=\"app.js\"></script></head>",
+      "<body><main><h1>Extension Library bridge</h1><output id=\"bridge-result\">starting</output>",
+      "<button id=\"preview-load\">Show preview</button><button id=\"preview-clear\">Clear preview</button><img id=\"preview-image\" alt=\"Preview\">",
+      "</main></body></html>"
     ].join("\n"), "utf8"),
     writeFile(join(viewDirectory, "style.css"), [
       ":root { color-scheme: light dark; font-family: system-ui, sans-serif; }",
@@ -330,15 +332,26 @@ async function writeLibraryPackageCatalog(catalogDirectory: string): Promise<voi
       "h1 { margin: 0 0 12px; font-size: clamp(18px, 4vw, 28px); }",
       "output { display: block; border: 1px solid GrayText; border-radius: 10px; padding: 12px; }"
     ].join("\n"), "utf8"),
-    writeFile(join(viewDirectory, "app.js"), MAIN_VIEW_SCRIPT, "utf8")
+    writeFile(join(viewDirectory, "app.js"), MAIN_VIEW_SCRIPT, "utf8"),
+    writeFile(join(viewDirectory, "preview.png"), Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"))
   ]);
 }
 
 const MAIN_VIEW_SCRIPT = `
 const output = document.querySelector("#bridge-result");
+const preview = document.querySelector("#preview-image");
+document.querySelector("#preview-load").addEventListener("click", () => { preview.src = "./preview.png"; });
+document.querySelector("#preview-clear").addEventListener("click", () => { preview.removeAttribute("src"); });
+window.addEventListener("message", (event) => {
+  if (event.source === parent && event.data?.type === "joko:extension-resource-result"
+      && event.data.ok && event.data.blob?.type === "image/png") {
+    setTimeout(() => { preview.dataset.resourceReceived = "true"; }, 0);
+  }
+});
 const call = async (operation) => {
   const response = await window.joko.library(operation);
-  if (response.ok !== true) throw new Error(response.errorCode + ":" + response.message);
+  if (response.ok !== true) throw new Error(operation.kind + ":" + response.errorCode + ":" + response.message);
   return response;
 };
 const run = async () => {
@@ -347,8 +360,21 @@ const run = async () => {
   const opened = await call({ kind: "open" });
   await call({ kind: "write", path: "bridge/result.txt", content: new TextEncoder().encode("mounted-bridge"), ifNotExists: false });
   const read = await call({ kind: "read", path: "bridge/result.txt" });
-  const database = await call({ kind: "sqlOpen", path: "bridge.sqlite", create: true, readOnly: false });
+  let database = await call({ kind: "sqlOpen", path: "bridge.sqlite", create: true, readOnly: false });
   await call({ kind: "sqlMigrate", handleId: database.handleId, migrations: [{ version: 1, statements: ["CREATE TABLE checks(id INTEGER PRIMARY KEY, value TEXT NOT NULL)"] }] });
+  const execute = (sql) => call({ kind: "sqlExecute", handleId: database.handleId, statement: { sql } });
+  await execute("CREATE TABLE IF NOT EXISTS batch_checks(id INTEGER PRIMARY KEY)");
+  await execute("DELETE FROM batch_checks");
+  const insert = id => ({ sql: "INSERT INTO batch_checks(id) VALUES (?)", parameters: [{ kind: "integer", value: id }] });
+  const batch = statements => ({ kind: "sqlBatch", handleId: database.handleId, statements });
+  await call(batch(Array.from({ length: 101 }, (_, index) => insert(index + 1))));
+  const rejected = await window.joko.library(batch([...Array.from({ length: 100 }, (_, index) => insert(index + 102)), insert(101)]));
+  if (rejected.ok !== false || rejected.errorCode !== "UNAVAILABLE") throw new Error("SQLite did not reject the duplicate ID: " + rejected.errorCode);
+  // The bridge retires the session on a failed SQL call. Reopen the same
+  // SQLite file to verify the original transaction from a fresh handle.
+  database = await call({ kind: "sqlOpen", path: "bridge.sqlite", create: false, readOnly: false });
+  const count = await execute("SELECT count(*) AS total FROM batch_checks");
+  if (String(count.value.rows[0].cells[0].value.value) !== "101") throw new Error("the batch did not commit and roll back atomically");
   await call({ kind: "sqlExecute", handleId: database.handleId, statement: { sql: "INSERT OR REPLACE INTO checks(id, value) VALUES(1, ?)", parameters: [{ kind: "text", value: "chromium" }] } });
   const selected = await call({ kind: "sqlExecute", handleId: database.handleId, statement: { sql: "SELECT value FROM checks WHERE id = 1" } });
   await call({ kind: "sqlClose", handleId: database.handleId });

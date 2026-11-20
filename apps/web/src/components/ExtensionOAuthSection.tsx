@@ -6,8 +6,9 @@ import type { Translator } from "./types.js";
 import { Button, CheckboxControl, Pill } from "./ui.js";
 import "./extension-network.css";
 
-export function ExtensionOAuthSection({ controller, extension, disabled, t, onChanged }: {
-  readonly controller: AppController; readonly extension: ExtensionCatalogEntryView; readonly disabled: boolean; readonly t: Translator; readonly onChanged: () => Promise<void>;
+export function ExtensionOAuthSection({ controller, extension, oauthRevision, disabled, t, onChanged }: {
+  readonly controller: AppController; readonly extension: ExtensionCatalogEntryView; readonly oauthRevision: bigint;
+  readonly disabled: boolean; readonly t: Translator; readonly onChanged: () => Promise<void>;
 }): JSX.Element | null {
   const [state, setState] = useState<ExtensionOAuthState>(), [error, setError] = useState(false), [refresh, setRefresh] = useState(0);
   const [mutationError, setMutationError] = useState(false);
@@ -25,7 +26,7 @@ export function ExtensionOAuthSection({ controller, extension, disabled, t, onCh
     void api.get({ extensionId: extension.id }, { signal }).then(result => { if (!signal.aborted) { setState(result.state); setError(false); } })
       .catch(() => { if (!signal.aborted) setError(true); });
     return () => abort.abort();
-  }, [controller, extension.id, extension.revision, lifetime, refresh]);
+  }, [controller, extension.id, extension.revision, oauthRevision, lifetime, refresh]);
   const selected = state?.extensionId === extension.id ? state : undefined;
   const run = async (authorize: boolean, work: (api: ExtensionOAuthApi, state: ExtensionOAuthState, signal: AbortSignal) => Promise<ExtensionOAuthState>) => {
     if (disabled || lifetime.busy || !selected) return false;

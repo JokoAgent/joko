@@ -20,7 +20,8 @@ import {
   type ExtensionLibrarySqlHandle,
   type ExtensionLibrarySqlMigration,
   type ExtensionLibrarySqlResult,
-  type ExtensionLibrarySqlValue
+  type ExtensionLibrarySqlParameters,
+  type ExtensionLibrarySqlStatement
 } from "./extension-library-sql.js";
 import {
   assertExtensionLibraryRootIdentity,
@@ -799,11 +800,11 @@ export class ExtensionLibraryManager {
     return this.#withSession(sessionId, connectionId, input.readonly !== true, (session) => session.sql.open(input));
   }
 
-  async databaseExecute(sessionId: string, connectionId: string, handleId: string, sql: string, parameters: readonly ExtensionLibrarySqlValue[] = []): Promise<ExtensionLibrarySqlResult> {
+  async databaseExecute(sessionId: string, connectionId: string, handleId: string, sql: string, parameters: ExtensionLibrarySqlParameters = []): Promise<ExtensionLibrarySqlResult> {
     return this.#withSession(sessionId, connectionId, false, (session) => session.sql.execute(handleId, sql, parameters));
   }
 
-  async databaseBatch(sessionId: string, connectionId: string, handleId: string, statements: readonly { readonly sql: string; readonly parameters?: readonly ExtensionLibrarySqlValue[] }[]): Promise<readonly ExtensionLibrarySqlResult[]> {
+  async databaseBatch(sessionId: string, connectionId: string, handleId: string, statements: readonly ExtensionLibrarySqlStatement[]): Promise<readonly ExtensionLibrarySqlResult[]> {
     return this.#withSession(sessionId, connectionId, false, (session) => session.sql.batch(handleId, statements));
   }
 
@@ -1074,12 +1075,21 @@ export class ExtensionLibraryManager {
         identity: await captureExtensionLibraryRootIdentity(validation.libraryRoot),
         updatedAt: this.#now()
       };
-      this.#state = reviseState(this.#state, {
+      const nextState = reviseState(this.#state, {
         generations: replaceGeneration(this.#state.generations, binding.extensionId, binding.generation),
         bindings: replaceBinding(this.#state.bindings, binding)
       });
-      await this.#persistState();
-      await vault.clearOrphaned();
+      await input.assertAuthorityCurrent();
+      try {
+        await this.#persistState(nextState, () => { this.#state = nextState; });
+      } catch (error) {
+        if (this.#state === nextState) {
+          this.#stateUnavailable = true;
+          throw new ExtensionLibraryError("UNAVAILABLE", "Library binding durability could not be confirmed.", { cause: error });
+        }
+        throw error;
+      }
+      await this.#updateOrphanMarker("clear", () => vault.clearOrphaned());
       return { location: { kind: "custom", path: binding.root, generation: BigInt(binding.generation) }, warnings: validation.warnings };
     });
   }
@@ -1792,7 +1802,7 @@ export class ExtensionLibraryManager {
     return data.length === 0 && trash.length === 0;
   }
 
-  async #persistState(): Promise<void> {
+  async #persistState(state = this.#state, onPublished?: () => void): Promise<void> {
     const control = this.#controlPath();
     const previous = this.#previousControlPath();
     try {
@@ -1802,7 +1812,7 @@ export class ExtensionLibraryManager {
     } catch (error) {
       if (!missing(error) && !(error instanceof ExtensionLibraryError) && !(error instanceof SyntaxError)) throw error;
     }
-    await atomicJson(control, this.#state);
+    await atomicJson(control, state, undefined, onPublished);
   }
 
   async #preserveUnavailableControl(): Promise<void> {
@@ -1837,6 +1847,8 @@ export class ExtensionLibraryManager {
           (await readManagerRecord(join(container, TRASH_MANIFEST_FILE), 1024 * 1024)).toString("utf8")
         ));
       } catch (error) {
+        if (missing(error) && !this.#state.trash.some(record => record.trashId === entry.name)
+          && await isEmptyUnpublishedTrashContainer(container)) continue;
         this.#stateUnavailable = true;
         throw new ExtensionLibraryError("CORRUPT", "Extension Library trash manifest is corrupt.", { cause: error });
       }
@@ -2470,11 +2482,11 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-async function atomicJson(path: string, value: unknown, beforePublish?: () => void): Promise<void> {
-  await atomicBytes(path, Buffer.from(`${JSON.stringify(value)}\n`, "utf8"), beforePublish);
+async function atomicJson(path: string, value: unknown, beforePublish?: () => void, onPublished?: () => void): Promise<void> {
+  await atomicBytes(path, Buffer.from(`${JSON.stringify(value)}\n`, "utf8"), beforePublish, onPublished);
 }
 
-async function atomicBytes(path: string, bytes: Uint8Array, beforePublish?: () => void): Promise<void> {
+async function atomicBytes(path: string, bytes: Uint8Array, beforePublish?: () => void, onPublished?: () => void): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const temporary = `${path}.${randomUUID()}.tmp`;
   let handle: FileHandle | undefined;
@@ -2486,6 +2498,7 @@ async function atomicBytes(path: string, bytes: Uint8Array, beforePublish?: () =
     handle = undefined;
     beforePublish?.();
     await rename(temporary, path);
+    onPublished?.();
     await syncDirectory(dirname(path));
   } finally {
     await handle?.close().catch(() => undefined);
@@ -2534,6 +2547,17 @@ async function readManagerRecord(path: string, maximumBytes = MANAGER_RECORD_MAX
     return bytes;
   } finally {
     await handle?.close().catch(() => undefined);
+  }
+}
+
+async function isEmptyUnpublishedTrashContainer(path: string): Promise<boolean> {
+  try {
+    const before = await lstat(path, { bigint: true });
+    if (!before.isDirectory() || before.isSymbolicLink() || (await readdir(path)).length !== 0) return false;
+    const after = await lstat(path, { bigint: true });
+    return sameManagerObject(before, after) && before.mtimeNs === after.mtimeNs && before.ctimeNs === after.ctimeNs;
+  } catch {
+    return false;
   }
 }
 

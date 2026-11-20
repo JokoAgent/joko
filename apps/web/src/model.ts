@@ -4543,6 +4543,7 @@ export type ExtensionLibrarySqlValueView =
 export interface ExtensionLibrarySqlStatementView {
   readonly sql: string;
   readonly parameters?: readonly ExtensionLibrarySqlValueView[];
+  readonly namedParameters?: Readonly<Record<string, ExtensionLibrarySqlValueView>>;
 }
 
 export type ExtensionLibraryCallView =
@@ -5410,6 +5411,7 @@ export interface AppSnapshot {
   readonly resources: readonly ResourceView[];
   readonly extensions: readonly ExtensionCatalogEntryView[];
   readonly extensionCatalogRevision: bigint;
+  readonly extensionOAuthRevision?: bigint;
   readonly extensionCatalogRecovered: boolean;
   readonly commands: readonly RuntimeCommandView[];
   readonly remoteConnections: readonly RemoteConnectionView[];

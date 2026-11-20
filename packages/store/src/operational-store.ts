@@ -3013,13 +3013,21 @@ export class OperationalStore {
   }
 
   private appendDeviceContentEvent(device: DeviceRecord): void {
-    const revision = this.requireActiveRevision();
     const emittedAt = this.now();
+    this.appendOwnerEvent(`device-content:${device.id}`, emittedAt, { type: "device_changed",
+      device: deviceContentProjection(device, this.listDeviceConnections(device.id), emittedAt) });
+  }
+
+  recordExtensionOAuthChange(): void {
+    this.write(() => this.appendOwnerEvent("extension-oauth-changed", this.now(), { type: "extension_oauth_changed" }));
+  }
+
+  private appendOwnerEvent(traceId: string, emittedAt: number,
+    event: Extract<EventPayload, { readonly type: "device_changed" | "extension_oauth_changed" }>): void {
+    const revision = this.requireActiveRevision();
     const id = this.idFactory();
-    const traceId = `device-content:${device.id}`;
-    const payloadJson = serializeJson({ payload: { type: "device_changed",
-      device: deviceContentProjection(device, this.listDeviceConnections(device.id), emittedAt) } });
-    const payload = parseDeviceContentEvent(parseJson<{ payload: unknown }>(payloadJson).payload);
+    const payloadJson = serializeJson({ payload: event });
+    const payload = event.type === "device_changed" ? parseDeviceContentEvent(parseJson<{ payload: unknown }>(payloadJson).payload) : event;
     const inserted = this.database.prepare(`
       INSERT INTO events(id, revision, session_sequence, emitted_at, backend_id, target_id, session_id,
         generation, trace_id, payload_json)
@@ -11004,6 +11012,9 @@ export class OperationalStore {
     return this.write(() => {
       if (input.payload.type === "device_changed") {
         throw new StoreError("Device content observations are owned by the Store, not Session adapters.");
+      }
+      if (input.payload.type === "extension_oauth_changed") {
+        throw new StoreError("Plugin OAuth settings events require the service owner.");
       }
       const session = this.getSession(input.sessionId);
       if (
@@ -22579,15 +22590,19 @@ function eventFromRow(row: Row): PersistedEvent {
   )) {
     throw new StoreError("Stored message Run usage does not match its exact completion identity.");
   }
-  if (payload.type === "device_changed") {
+  if (payload.type === "device_changed" || payload.type === "extension_oauth_changed") {
     if (row["backend_id"] !== null || row["target_id"] !== null || row["session_id"] !== null
       || row["run_id"] !== null || row["attempt_id"] !== null || row["operation_id"] !== null
       || row["generation"] !== 0 || row["namespace"] !== null || row["metadata_json"] !== null
-      || stored.pi !== undefined) throw new StoreError("Stored Device event routing is invalid.");
+      || stored.pi !== undefined) throw new StoreError(payload.type === "device_changed"
+      ? "Stored Device event routing is invalid." : "Stored OAuth event routing is invalid.");
+    if (payload.type === "extension_oauth_changed" && Object.keys(payload).length !== 1) {
+      throw new StoreError("Stored OAuth event payload is invalid.");
+    }
     return { id: stringValue(row["id"]), globalCursor: toBigInt(row["global_cursor"]),
       sequence: toBigInt(row["session_sequence"]), revision: toBigInt(row["revision"]),
       emittedAt: numberValue(row["emitted_at"]), backendId: "", targetId: "", sessionId: "", generation: 0,
-      traceId: stringValue(row["trace_id"]), payload: parseDeviceContentEvent(stored.payload) };
+      traceId: stringValue(row["trace_id"]), payload: payload.type === "device_changed" ? parseDeviceContentEvent(stored.payload) : payload };
   }
   return {
     id: stringValue(row["id"]),

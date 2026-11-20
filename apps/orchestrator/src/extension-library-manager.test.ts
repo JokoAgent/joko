@@ -27,7 +27,10 @@ const authority: ExtensionLibraryAuthority = {
   library: { schemaVersion: 1, extensionEntry: "extensions/canvas.ts" }
 };
 const cleanups: Array<() => Promise<void>> = [];
-const filesystem = vi.hoisted(() => ({ orphanMarkerTempPrefix: undefined as string | undefined }));
+const filesystem = vi.hoisted(() => ({
+  orphanMarkerTempPrefix: undefined as string | undefined,
+  bindingControlTempPrefix: undefined as string | undefined
+}));
 
 vi.mock("node:fs/promises", async importOriginal => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
@@ -40,6 +43,11 @@ vi.mock("node:fs/promises", async importOriginal => {
         filesystem.orphanMarkerTempPrefix = undefined;
         throw Object.assign(new Error("Injected Library orphan marker staging error"), { code: "EIO" });
       }
+      if (filesystem.bindingControlTempPrefix && typeof path === "string"
+        && path.startsWith(filesystem.bindingControlTempPrefix) && path.endsWith(".tmp") && flags === "wx") {
+        filesystem.bindingControlTempPrefix = undefined;
+        throw Object.assign(new Error("Injected Library binding control staging error"), { code: "EIO" });
+      }
       return Reflect.apply(actual.open, undefined, args);
     }
   };
@@ -47,6 +55,7 @@ vi.mock("node:fs/promises", async importOriginal => {
 
 afterEach(async () => {
   filesystem.orphanMarkerTempPrefix = undefined;
+  filesystem.bindingControlTempPrefix = undefined;
   while (cleanups.length > 0) await cleanups.pop()?.();
 });
 
@@ -70,6 +79,37 @@ function currentAuthority(expected = authority) {
 }
 
 describe("ExtensionLibraryManager", () => {
+  it.each([false, true])("recovers after a trash container was created before its manifest (has contents=%s)", async hasContents => {
+    const { manager, temporaryPath } = await fixture();
+    const secondAuthority = { ...authority, extensionId: `extension_${"d".repeat(32)}`, name: "Independent Library", resourceId: "second-library" };
+    const scope = (owner: ExtensionLibraryAuthority, digit: string) => ({ authority: owner, connectionId: "original-owner",
+      surfaceId: `extension_surface_${digit.repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, assertAuthorityCurrent: currentAuthority(owner) });
+    const first = scope(authority, "1"), second = scope(secondAuthority, "2");
+    const original = await manager.openSession(first), independent = await manager.openSession(second);
+    await manager.write(original.sessionId, first.connectionId, { path: "source.txt", bytes: Buffer.from("Original source") });
+    await manager.write(independent.sessionId, second.connectionId, { path: "other.txt", bytes: Buffer.from("Independent bytes") });
+    await manager.close();
+    const rootDirectory = join(temporaryPath, "owner");
+    const unfinished = join(rootDirectory, "trash", `library_trash_${"9".repeat(32)}`);
+    await mkdir(unfinished);
+    if (hasContents) await writeFile(join(unfinished, "owned-evidence"), "Keep these bytes");
+
+    const reopened = new ExtensionLibraryManager({ rootDirectory, freeBytes: async () => 64 * 1024 * 1024 * 1024 });
+    cleanups.push(() => reopened.close().catch(() => undefined));
+    await reopened.initialize();
+    if (hasContents) {
+      await expect(reopened.overview(second)).resolves.toMatchObject({ state: "unavailable", reason: "state_corrupt" });
+      await expect(readFile(join(unfinished, "owned-evidence"), "utf8")).resolves.toBe("Keep these bytes");
+      return;
+    }
+    expect(reopened.listTrash()).toEqual([]);
+    await expect(reopened.overview(second)).resolves.toMatchObject({ state: "ready" });
+    const firstOpen = await reopened.openSession(first), secondOpen = await reopened.openSession(second);
+    await expect(reopened.read(firstOpen.sessionId, first.connectionId, { path: "source.txt" })).resolves.toMatchObject({ bytes: Buffer.from("Original source") });
+    await expect(reopened.read(secondOpen.sessionId, second.connectionId, { path: "other.txt" })).resolves.toMatchObject({ bytes: Buffer.from("Independent bytes") });
+    await expect(readdir(unfinished)).resolves.toEqual([]);
+  });
+
   it("rejects a cursor after another authorized session removes its preceding entry", async () => {
     const { manager } = await fixture();
     const open = (connectionId: string, digit: string) => manager.openSession({ authority, connectionId,
@@ -343,6 +383,40 @@ describe("ExtensionLibraryManager", () => {
       .resolves.toMatchObject({ state: "ready", usage: { files: 0, bytes: 0 } });
     const reset = await manager.openSession({ surfaceId: `extension_surface_${"0".repeat(32)}`, surfaceExpiresAt: 8_640_000_000_000_000, authority, connectionId: "web-2", assertAuthorityCurrent: currentAuthority() });
     expect(reset.bindingGeneration).toBe(7n);
+  });
+
+  it("keeps the previous binding live and durable if recording a selected recovery location fails", async () => {
+    const { temporaryPath, manager } = await fixture();
+    const owner = { authority, connectionId: "original-owner", surfaceId: `extension_surface_${"9".repeat(32)}`,
+      surfaceExpiresAt: 8_640_000_000_000_000, assertAuthorityCurrent: currentAuthority() };
+    const opened = await manager.openSession(owner);
+    await manager.write(opened.sessionId, owner.connectionId, { path: "note.txt", bytes: Buffer.from("Original note") });
+    const original = await manager.relocate({ authority, destination: { kind: "custom", candidate: join(temporaryPath, "original") },
+      assertAuthorityCurrent: owner.assertAuthorityCurrent });
+    const candidate = join(temporaryPath, "recovery");
+    await mkdir(candidate);
+    await rename(original.location.path, join(candidate, EXTENSION_ID));
+    const control = join(temporaryPath, "owner", "library-state.json");
+    const previousControl = await readFile(control);
+    filesystem.bindingControlTempPrefix = `${control}.`;
+    const request = { authority, candidate, assertAuthorityCurrent: owner.assertAuthorityCurrent };
+
+    await expect(manager.rebind(request)).rejects.toThrow("Injected Library binding control staging error");
+    expect(await readFile(control)).toEqual(previousControl);
+    await expect(manager.overview(owner)).resolves.toMatchObject({ state: "unavailable", reason: "disk_missing" });
+    await expect(manager.openSession(owner)).rejects.toMatchObject({ code: "UNAVAILABLE" });
+    await manager.close();
+
+    const recovered = new ExtensionLibraryManager({ rootDirectory: join(temporaryPath, "owner"), freeBytes: async () => 64 * 1024 * 1024 * 1024 });
+    cleanups.push(() => recovered.close());
+    await recovered.initialize();
+    await expect(recovered.overview(owner)).resolves.toMatchObject({ state: "unavailable", reason: "disk_missing" });
+    await expect(recovered.rebind(request)).resolves.toMatchObject({ location: {
+      kind: "custom", path: join(candidate, EXTENSION_ID), generation: original.location.generation + 1n
+    } });
+    const rebound = await recovered.openSession(owner);
+    const source = await recovered.read(rebound.sessionId, owner.connectionId, { path: "note.txt" });
+    expect(Buffer.from(source.bytes).toString()).toBe("Original note");
   });
 
   it("replays a durable rollback after the active root moved but before the selected grace copy switched", async () => {
