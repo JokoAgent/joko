@@ -3,7 +3,9 @@ export {
   DEFAULT_MANAGED_BASH_TIMEOUT_SECONDS,
   MANAGED_BRIDGE_SOURCE,
   MAXIMUM_MANAGED_BASH_TIMEOUT_SECONDS,
-  normalizeManagedBashTimeout
+  normalizeManagedBashTimeout,
+  provisionManagedBridge
 } from "./bridge.js";
+export { assertManagedBridgeHandshake } from "./compatibility-probe.js";
 export { parsePermissionInput } from "./interactions.js";
 export type { PiProcessFactory, PiProcessHandle, PiProcessSpec } from "./transport.js";

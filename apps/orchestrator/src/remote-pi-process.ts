@@ -17,6 +17,7 @@ import {
 import { basename, dirname, isAbsolute, join, posix as remotePath, relative, resolve, sep, win32, type PlatformPath } from "node:path";
 import { PassThrough, Transform, type Readable, type TransformCallback, type Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
+import { fileURLToPath } from "node:url";
 
 import {
   MANAGED_SUBAGENT_NODE_ENV,
@@ -61,6 +62,25 @@ const PI_RELEASE_STARTUP_MEMBERS: Readonly<Record<string, readonly string[]>> = 
   "": ["package.json", "pi", "theme"],
   theme: ["dark.json", "light.json"]
 };
+const PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
+const PI_PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.resolve(PI_PACKAGE_NAME))));
+const PI_PUBLISHED_ENTRY = `node_modules/${PI_PACKAGE_NAME}/joko-rpc-launch.mjs`;
+const PI_PUBLISHED_SSH_FILES = {
+  [PI_PACKAGE_NAME]: ["package.json", "dist/bundle", "dist/modes/interactive/theme", "dist/modes/interactive/assets",
+    "dist/core/export-html", "docs", "examples", "README.md", "CHANGELOG.md"],
+  "@earendil-works/chord": ["package.json", "dist/context", "README.md"],
+  "@earendil-works/pi-ai": ["package.json", "dist/api/simple-options.js", "dist/utils/estimate.js", "README.md"],
+  jiti: ["package.json", "lib", "dist", "LICENSE"],
+  typebox: ["package.json", "build", "license"],
+  undici: ["package.json", "index.js", "index-fetch.js", "lib", "LICENSE"],
+  "@silvia-odwyer/photon-node": ["package.json", "photon_rs.js", "photon_rs_bg.js", "photon_rs_bg.wasm", "LICENSE.md"]
+} as const;
+const PI_PUBLISHED_LAUNCHER = `// Retain the OS argv that the broker uses to identify and retire this process.
+const initialTitle = process.title;
+delete process.title;
+Object.defineProperty(process, "title", { value: initialTitle, writable: true, configurable: true });
+await import("./dist/bundle/cli.js");
+`;
 const MAXIMUM_BROKER_BOOTSTRAP_BYTES = 1024 * 1024;
 const MAXIMUM_AUTHORITY_BYTES = 64 * 1024;
 const AUTHORITY_CONTROL_TIMEOUT_MS = 10_000;
@@ -548,6 +568,8 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     };
 
     const rewrittenArgs = [...spec.args];
+    const usesPublishedSshPi = binding.kind === "ssh" && spec.command === process.execPath
+      && spec.args[0] === join(PI_PACKAGE_ROOT, "dist", "cli.js");
     const compatibilityAssets: RemoteCompatibilityAsset[] = [];
     let trustedRunnerScriptSha256: string | undefined;
     let recordedManagedSupport = false;
@@ -555,6 +577,14 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     for (let index = 0; index < rewrittenArgs.length; index += 1) {
       const value = rewrittenArgs[index];
       if (value === undefined || !isAbsolute(value)) continue;
+      if (index === 0 && usesPublishedSshPi) {
+        const snapshot = await snapshotPublishedSshPi();
+        const destination = targetPaths.join(remoteRuntime, "assets", `${snapshot.digest}-pi-runtime`);
+        stagingPlans.push({ local: PI_PACKAGE_ROOT, remote: destination, snapshot });
+        rewrittenArgs[index] = targetPaths.join(destination, ...PI_PUBLISHED_ENTRY.split("/"));
+        compatibilityAssets.push({ role: "entrypoint", name: "pi-runtime", digest: snapshot.digest });
+        continue;
+      }
       const role = compatibilityAssetRole(spec.command, spec.args, index);
       const isSessionSelector = spec.args[index - 1] === "--session";
       const isSessionDirectory = spec.args[index - 1] === "--session-dir"
@@ -659,7 +689,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
     }
 
     let commandSnapshot: LocalAssetSnapshot | undefined;
-    if (isAbsolute(spec.command) && !/^(?:node|electron)(?:\.exe)?$/iu.test(basename(spec.command))) {
+    if (!usesPublishedSshPi && isAbsolute(spec.command) && !/^(?:node|electron)(?:\.exe)?$/iu.test(basename(spec.command))) {
       const standaloneRelease = binding.kind === "ssh" && basename(spec.command) === "pi"
         && (await lstat(spec.command)).size > MAXIMUM_SYNC_FILE_BYTES;
       commandSnapshot = standaloneRelease
@@ -677,7 +707,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
       throw new Error("Remote Pi managed runner source is unavailable.");
     }
     const trustedRunnerDigest = trustedRunnerScriptSha256 ?? "0".repeat(64);
-    const command = remoteCommand(
+    const command = usesPublishedSshPi ? "node" : remoteCommand(
       spec.command,
       rewrittenArgs,
       remoteRuntime,
@@ -3365,7 +3395,34 @@ function compatibilityAssetRole(
   return undefined;
 }
 
-async function snapshotLocalCompatibilityAsset(root: string, kind?: "pi_release"): Promise<LocalAssetSnapshot> {
+async function snapshotPublishedSshPi(): Promise<LocalAssetSnapshot> {
+  const packageModulesRoot = dirname(dirname(PI_PACKAGE_ROOT));
+  const entries: LocalAssetSnapshotEntry[] = [{ path: "", kind: "directory", mode: 0o700 }];
+  const directories = new Set<string>();
+  // Keep the bundle's external imports and the managed bridge's published
+  // option resolver alongside the bundle, using the installed dependency bytes.
+  for (const [name, members] of Object.entries(PI_PUBLISHED_SSH_FILES)) {
+    const packageRoot = name === PI_PACKAGE_NAME ? PI_PACKAGE_ROOT : await realpath(join(packageModulesRoot, name));
+    for (const member of members) {
+      const destination = `node_modules/${name}/${member}`;
+      let parent = "";
+      for (const part of destination.split("/").slice(0, -1)) {
+        parent = parent === "" ? part : `${parent}/${part}`;
+        if (directories.has(parent)) continue;
+        directories.add(parent);
+        entries.push({ path: parent, kind: "directory", mode: 0o700 });
+      }
+      const snapshot = await snapshotLocalCompatibilityAsset(join(packageRoot, member), "published_package");
+      entries.push(...snapshot.entries.map(entry => ({
+        ...entry, path: entry.path === "" ? destination : `${destination}/${entry.path}`
+      })));
+    }
+  }
+  entries.push({ path: PI_PUBLISHED_ENTRY, kind: "file", mode: 0o600, content: Buffer.from(PI_PUBLISHED_LAUNCHER) });
+  return createLocalAssetSnapshot(entries);
+}
+
+async function snapshotLocalCompatibilityAsset(root: string, kind?: "pi_release" | "published_package"): Promise<LocalAssetSnapshot> {
   const entries: LocalAssetSnapshotEntry[] = [];
   const budget = { files: 0, bytes: 0 };
   const visit = async (path: string, relativePath: string, depth: number): Promise<void> => {
@@ -3383,6 +3440,7 @@ async function snapshotLocalCompatibilityAsset(root: string, kind?: "pi_release"
       const names = releaseMembers ?? (await readdir(path)).sort((left, right) => left.localeCompare(right));
       for (const name of names) {
         if (!/^[^/\\\0]+$/u.test(name)) throw new Error("Remote Pi compatibility asset name is invalid.");
+        if (kind === "published_package" && /(?:\.d\.[cm]?ts|\.map)$/u.test(name)) continue;
         await visit(resolve(path, name), relativePath === "" ? name : `${relativePath}/${name}`, depth + 1);
       }
       const after = await lstat(path);
@@ -3403,8 +3461,9 @@ async function snapshotLocalCompatibilityAsset(root: string, kind?: "pi_release"
     const handle = await open(path, fsConstants.O_RDONLY | noFollow);
     try {
       const opened = await handle.stat();
-      if (!opened.isFile() || opened.nlink !== 1) {
-        throw new Error("Remote Pi compatibility asset is not a single-link regular file.");
+      // A pinned pnpm package can share hardlinked bytes with its content store.
+      if (!opened.isFile() || (kind !== "published_package" && opened.nlink !== 1)) {
+        throw new Error("Remote Pi compatibility asset has an unsafe file type or link count.");
       }
       assertStableResourceFile(info, opened);
       const content = Buffer.allocUnsafe(opened.size);

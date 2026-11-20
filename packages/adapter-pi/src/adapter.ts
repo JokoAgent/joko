@@ -5128,7 +5128,8 @@ export class PiBackendAdapter implements
     const releaseUnpublished = (): void => {
       this.#releaseManagedGenerationLease(generationLease);
     };
-    const { catalog, bridgePath, subagentPath, silentEncryptedRetryPath, requestOptionRecoveryPath, managedResources } = await this.#initialize(managedGeneration).catch((error) => {
+    const { catalog, bridgePath: generationBridgePath, subagentPath: generationSubagentPath, silentEncryptedRetryPath,
+      requestOptionRecoveryPath, managedResources } = await this.#initialize(managedGeneration).catch((error) => {
       releaseUnpublished();
       throw error;
     });
@@ -5170,6 +5171,13 @@ export class PiBackendAdapter implements
     const runtimeRoot = join(agentHome, "runtime");
     const runtimeAgentHomePath = join(runtimeDirectory, "agent-home");
     await this.#prepareRuntimeDirectory(agentHome, runtimeDirectory);
+    const stagedPublishedPi = context.target.remoteWorkspace?.kind === "ssh" && this.#command === process.execPath
+      && this.#commandArgs[0] === BUNDLED_PI_CLI;
+    // The default SSH runtime owns its policy bridge and relative support files as one tree.
+    const [bridgePath, subagentPath] = await Promise.all([
+      stagedPublishedPi ? provisionManagedBridge(runtimeDirectory) : generationBridgePath,
+      stagedPublishedPi && managedSubagentToolsEnabled ? provisionManagedSubagent(runtimeDirectory) : generationSubagentPath
+    ]);
     const sessionKey = stableSessionKey(context.sessionId);
     const spawnIdentity = stableSpawnIdentity(agentHome, this.#sessionStore.sessionsRoot, sessionKey, context.generation);
     const ownerPath = join(runtimeDirectory, RUNTIME_OWNER_FILE);

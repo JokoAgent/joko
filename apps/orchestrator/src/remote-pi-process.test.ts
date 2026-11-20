@@ -1,10 +1,13 @@
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import { EventEmitter, once } from "node:events";
 import { link, mkdir, open, readFile, readdir, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
-import { join, posix as remotePath, win32, type PlatformPath } from "node:path";
+import { dirname, join, posix as remotePath, win32, type PlatformPath } from "node:path";
+import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
+import { fileURLToPath } from "node:url";
 
 import {
   createPiAdapter,
@@ -13,6 +16,7 @@ import {
   type PiProcessHandle,
   type PiProcessSpec
 } from "@joko/adapter-pi";
+import { assertManagedBridgeHandshake, provisionManagedBridge } from "@joko/adapter-pi/testing";
 import type { AdapterContext, NativeSessionDerivationLifecycle, RemoteWorkspaceBinding } from "@joko/core";
 import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
 import type {
@@ -721,6 +725,88 @@ describe("RemotePiProcessFactory", () => {
     bridge.complete(0);
     await terminal;
   });
+
+  it.runIf(process.platform === "linux")("starts the published default SSH Pi RPC from the staged package without changing owned argv", async () => {
+    const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-published-"));
+    temporaryDirectories.push(fixture);
+    const runtime = join(fixture, "runtime"), sessions = join(fixture, "sessions"), staged = join(fixture, "staged");
+    await Promise.all([mkdir(runtime), mkdir(sessions)]);
+    const control = join(runtime, "control.json");
+    const extensionPath = await provisionManagedBridge(runtime);
+    await writeFile(control, JSON.stringify({ generation: 1, policyGeneration: 0, permissionMode: "ask",
+      planMode: false, fastMode: false, approvedRoots: [], runtimePolicy: "standard" }));
+    const files = new PiMemoryRemoteFiles(async request => {
+      const member = request.path.match(/^\/home\/maker\/\.joko\/runtime\/[^/]+\/(.+)$/u)?.[1];
+      if (member === undefined) return;
+      const destination = join(staged, ...member.split("/"));
+      await mkdir(dirname(destination), { recursive: true });
+      await writeFile(destination, request.content);
+    });
+    await files.mkdir("/workspace", { recursive: true });
+    await files.mkdir("/home/maker", { recursive: true });
+    const bridge = new ManualRemoteProcess();
+    const lease: RemoteSshTransportLease = {
+      capabilities: { commandExecution: true, processStreaming: true, fileTransfer: true, tcpForwarding: false, interactiveTerminal: false },
+      files, processes: { open: async () => bridge }
+    };
+    const registry = { transports: async () => ({ host: {}, lease }) } as unknown as RemoteHostRegistry;
+    const publishedCli = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
+    const args = ["--mode", "rpc", "--no-session", "--no-extensions", "--offline", "--extension"];
+    const mapped = await remoteFactory(registry, join(fixture, "authority")).create({
+      command: process.execPath, args: [publishedCli, ...args, extensionPath], cwd: "/workspace", remoteWorkspace: TEST_REMOTE_WORKSPACE,
+      env: { JOKO_PI_TARGET_ID: "target-a", JOKO_PI_SPAWN_IDENTITY: "a".repeat(64), JOKO_PI_REMOTE_RECOVERY_IDENTITY: "b".repeat(64),
+        JOKO_PI_GENERATION: "1", JOKO_PI_MCP_TOKEN: "bridge-token-a", JOKO_PI_CONTROL_FILE: control, PI_CODING_AGENT_SESSION_DIR: sessions }
+    });
+    try {
+      const bootstrap = JSON.parse(bridge.input[0]!.toString("utf8")) as { executable: string; args: string[] };
+      expect(bootstrap.executable).toBe("node");
+      expect(bootstrap.args.slice(1, -1)).toEqual(args);
+      expect(bootstrap.args[0]).toMatch(/\/assets\/[a-f0-9]{64}-pi-runtime\/node_modules\/@earendil-works\/pi-coding-agent\/joko-rpc-launch\.mjs$/u);
+      expect(bootstrap.args.at(-1)).toMatch(/\/managed\/joko-managed-bridge\.ts$/u);
+      const localStagedPath = (remote: string) => join(staged, ...remote.split("/").slice(6));
+      const launcher = localStagedPath(bootstrap.args[0]!);
+      const stagedExtension = localStagedPath(bootstrap.args.at(-1)!);
+      const launchArgs = [launcher, ...args, stagedExtension];
+      const child = spawn(process.execPath, launchArgs, {
+        cwd: fixture, env: { HOME: fixture, PI_CODING_AGENT_DIR: join(fixture, "agent-home"),
+          PI_SKIP_VERSION_CHECK: "1", JOKO_PI_GENERATION: "1", JOKO_PI_CONTROL_FILE: join(staged, "control.json") },
+        stdio: ["pipe", "pipe", "pipe"]
+      });
+      const closed = once(child, "close");
+      child.stdin.on("error", () => undefined);
+      let diagnostics = "";
+      child.stderr.setEncoding("utf8").on("data", (chunk: string) => { diagnostics = (diagnostics + chunk).slice(-2_048); });
+      const lines = createInterface({ input: child.stdout });
+      const watchdog = setTimeout(() => child.kill(), 10_000);
+      try {
+        child.stdin.write('{"id":"staged-pi-commands","type":"get_commands"}\n{"id":"staged-pi-state","type":"get_state"}\n');
+        const responses = new Map<string, { id: string; data?: unknown }>();
+        for await (const line of lines) {
+          const received = JSON.parse(line) as { id?: string; data?: unknown };
+          if (typeof received.id === "string" && received.id.startsWith("staged-pi-")) {
+            responses.set(received.id, { ...received, id: received.id });
+            if (responses.size === 2) break;
+          }
+        }
+        expect(responses.get("staged-pi-state"), diagnostics).toMatchObject({ type: "response", command: "get_state", success: true });
+        const commands = responses.get("staged-pi-commands");
+        expect(commands, diagnostics).toMatchObject({ type: "response", command: "get_commands", success: true });
+        expect(() => assertManagedBridgeHandshake(commands?.data, stagedExtension), diagnostics).not.toThrow();
+        expect((await readFile(`/proc/${child.pid}/cmdline`, "utf8")).split("\0")).toEqual([process.execPath, ...launchArgs, ""]);
+      } finally {
+        clearTimeout(watchdog);
+        lines.close();
+        child.stdin.end();
+        child.kill();
+        await closed;
+      }
+    } finally {
+      const terminal = new Promise<void>(resolveExit => mapped.once("exit", () => resolveExit()));
+      bridge.stdout.write(testFrame(4, 1, terminalContent(0, null)));
+      bridge.complete(0);
+      await terminal;
+    }
+  }, 30_000);
 
   it("stages a release-sized Linux Pi executable with its RPC startup files before opening the SSH broker", async () => {
     const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-release-"));
