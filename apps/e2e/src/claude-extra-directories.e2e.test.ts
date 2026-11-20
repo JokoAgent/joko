@@ -174,14 +174,26 @@ it.each(["missing before preparation", "replaced during the native history read"
     const docs = join(fixture!.workspaceDirectory, "docs");
     const preserved = join(fixture!.workspaceDirectory, "original-docs");
     await mkdir(docs);
+    let replacedDuringHistory = false;
     if (failure === "missing before preparation") {
       await rename(docs, preserved);
     } else {
-      const readHistory = runtime.getSessionMessages.bind(runtime);
-      vi.spyOn(runtime, "getSessionMessages").mockImplementationOnce(async (...args) => {
-        await rename(docs, preserved);
-        await writeFile(docs, "A replacement regular file");
-        return await readHistory(...args);
+      const sendWithFence = ClaudeCodeAdapter.prototype.sendWithDurableNativeDispatchFence;
+      vi.spyOn(ClaudeCodeAdapter.prototype, "sendWithDurableNativeDispatchFence").mockImplementation(function (this: ClaudeCodeAdapter, input, context, persistFence) {
+        return sendWithFence.call(this, input, context, async preparation => {
+          await persistFence(preparation);
+          if (replacedDuringHistory || context.sessionId !== sessionId
+            || !input.mentions.some(mention => mention.kind === "workspace_directory" && mention.reference === "docs")) return;
+          // The actual dispatch baseline now exists. Change the directory in
+          // the next SDK read that confirms it, after input preparation.
+          const readHistory = runtime.getSessionMessages.bind(runtime);
+          vi.spyOn(runtime, "getSessionMessages").mockImplementationOnce(async (...args) => {
+            await rename(docs, preserved);
+            await writeFile(docs, "A replacement regular file");
+            replacedDuringHistory = true;
+            return readHistory(...args);
+          });
+        });
       });
     }
     const mutation = sendInputMutation(sessionId, BigInt(binding.generation), "Inspect the selected docs directory");
@@ -199,7 +211,10 @@ it.each(["missing before preparation", "replaced during the native history read"
     expect(store.getQueueItem(queueItemId).error).toMatchObject({ stateMayHaveChanged: false });
     expect(query.receivedInputs).toHaveLength(1);
 
-    if (failure === "replaced during the native history read") await unlink(docs);
+    if (failure === "replaced during the native history read") {
+      expect(replacedDuringHistory).toBe(true);
+      await unlink(docs);
+    }
     await rename(preserved, docs);
     const retry = retryRunMutation(runId);
     retry.preconditions.push(create(OperationPreconditionSchema, {
