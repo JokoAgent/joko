@@ -123,6 +123,10 @@ it("marks a confirmed invalid grant expired without exposing provider text or de
   expect(events).toMatchObject([{ sessionId: "", backendId: "", payload: { type: "extension_oauth_changed" } }]);
   expect(toProtoEvent(events[0]!).payload?.kind).toMatchObject({ case: "projectionInvalidated",
     value: { scope: EXTENSION_OAUTH_INVALIDATION_SCOPE, reason: SnapshotInvalidationReason.PROJECTION_REBUILT } });
+  await f.restart();
+  expect(f.manager.get(f.entry.id).slots[0]!.accounts[0]).toMatchObject({ id: first.id, status: "expired" });
+  expect(f.credentials.resolve(secondReference)).toBe(preserved);
+  expect(f.store.listEvents({}).filter(event => event.payload.type === "extension_oauth_changed")).toEqual(events);
 });
 
 it("tracks new full scopes and real evidence while preserving intentionally reduced authorization", async () => {
