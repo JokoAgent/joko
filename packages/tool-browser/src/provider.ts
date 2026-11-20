@@ -8,6 +8,7 @@ import {
   type BrowserContext,
   type Dialog,
   type Download,
+  type ElementHandle,
   type Locator,
   type Page,
   type Response
@@ -536,6 +537,11 @@ export class BrowserProvider {
   }>();
   readonly #adoptedSidebarPopups = new WeakSet<Page>();
   readonly #pageDocuments = new WeakMap<Page, string>();
+  readonly #humanFileChoices = new WeakMap<Page, {
+    readonly takeover: BrowserTakeoverFence;
+    readonly documentId: string;
+    readonly input: ElementHandle | undefined;
+  }>();
   readonly #consoleMessages = new WeakMap<Page, BrowserConsoleMessageSnapshot[]>();
   readonly #httpRequestSummaries = new WeakMap<Page, BrowserHttpRequestSummary[]>();
   readonly #dialogs = new WeakMap<Page, Map<string, Dialog>>();
@@ -1326,8 +1332,10 @@ export class BrowserProvider {
     validateTakeoverFence(expected);
     return this.queueLifecycle(async () => {
       const current = this.assertHumanTakeover(expected);
-      await this.resetHumanCommentDesigns(this.requirePageNow(current.pageId));
+      const page = this.requirePageNow(current.pageId);
+      await this.resetHumanCommentDesigns(page);
       this.#takeovers.end(expected);
+      this.releaseHumanFileChoice(page);
       this.#takeoverRateWindow = undefined;
       await this.emit({
         at: Date.now(),
@@ -1521,7 +1529,12 @@ export class BrowserProvider {
             adopt: adoptPopup
           });
         }
-        await page.mouse.click(x, y, { button: mapMouseButton(action.button), clickCount: action.clickCount ?? 1 });
+        const click = () => page.mouse.click(x, y, { button: mapMouseButton(action.button), clickCount: action.clickCount ?? 1 });
+        if (this.#targetMode === "sidebar" && action.button === "primary" && documentId !== undefined) {
+          await this.clickHumanPage(page, fence, documentId, x, y, click, assertCurrent);
+        } else {
+          await click();
+        }
         break;
       }
       case "mouseMove": {
@@ -1628,10 +1641,26 @@ export class BrowserProvider {
     if ("takeoverId" in owner) {
       const takeover = copyTakeoverFence(owner);
       if (takeover.pageId !== safePageId) throw new BrowserTakeoverConflictError("Browser upload belongs to a different page.");
-      await this.runHumanTakeoverOperation(takeover, (page) => this.setFileInput(page, selector, paths, guard.documentId, () => {
-        this.assertHumanTakeover(takeover);
-        guard.assertCurrent();
-      }, guard.markDispatched, guard.fileIdentities), guard.assertCurrent);
+      await this.runHumanTakeoverOperation(takeover, async (page) => {
+        const choice = selector === "input[type=file]" ? this.#humanFileChoices.get(page) : undefined;
+        let input: ElementHandle | undefined;
+        if (choice !== undefined) {
+          if (sameTakeoverFence(choice.takeover, takeover)) {
+            if (choice.documentId !== guard.documentId || choice.input === undefined) {
+              this.releaseHumanFileChoice(page);
+              throw new BrowserTakeoverConflictError("The selected Browser file input is no longer available.");
+            }
+            input = choice.input;
+            this.#humanFileChoices.delete(page);
+          } else {
+            this.releaseHumanFileChoice(page);
+          }
+        }
+        await this.setFileInput(page, selector, paths, guard.documentId, () => {
+          this.assertHumanTakeover(takeover);
+          guard.assertCurrent();
+        }, guard.markDispatched, guard.fileIdentities, input);
+      }, guard.assertCurrent);
       return;
     }
     const lease = copyAgentFence(owner);
@@ -2312,6 +2341,7 @@ export class BrowserProvider {
     page.on("crash", () => {
       this.#pageStates.set(page, "crashed");
       fenceTakeover();
+      this.releaseHumanFileChoice(page);
       this.releasePageUploadSelections(page);
       void this.emit({ at: Date.now(), type: "crashed", pageId, detail: "Page crashed." });
     });
@@ -2319,6 +2349,7 @@ export class BrowserProvider {
       const crashed = this.#pageStates.get(page) === "crashed";
       this.#pageStates.set(page, "closed");
       fenceTakeover();
+      this.releaseHumanFileChoice(page);
       this.releasePageUploadSelections(page);
       if (!crashed && !this.#requestedPageCloses.has(page)) this.observeExternalPageClose(page, pageId, generation);
     });
@@ -2336,6 +2367,7 @@ export class BrowserProvider {
     page.on("framenavigated", (frame) => {
       if (frame !== page.mainFrame()) return;
       this.#humanPopupSources.delete(page);
+      this.releaseHumanFileChoice(page);
       const documentId = randomUUID();
       this.#pageDocuments.set(page, documentId);
       this.#pageStates.set(page, "loading");
@@ -2607,6 +2639,56 @@ export class BrowserProvider {
     return this.#pageDocuments.get(page);
   }
 
+  private async clickHumanPage(
+    page: Page,
+    fence: BrowserTakeoverFence,
+    documentId: string,
+    x: number,
+    y: number,
+    click: () => Promise<void>,
+    assertCurrent?: () => void
+  ): Promise<void> {
+    this.releaseHumanFileChoice(page);
+    // Await the native chooser only for a click on a file input or its label.
+    const targetsFileInput = this.#options.canUpload?.() !== false && await page.evaluate(({ x, y }) => {
+      const hit = document.elementFromPoint(x, y);
+      const field = hit instanceof HTMLInputElement ? hit : hit?.closest("label")?.control;
+      return field instanceof HTMLInputElement && field.type === "file" && !field.matches(":disabled");
+    }, { x, y });
+    const takeover = copyTakeoverFence(fence);
+    const assertClickCurrent = () => {
+      this.assertHumanTakeover(takeover);
+      assertCurrent?.();
+      if (this.documentIdForPage(page) !== documentId) {
+        throw new BrowserTakeoverConflictError("The original Browser click document is no longer current.");
+      }
+    };
+    assertClickCurrent();
+    if (targetsFileInput !== true) {
+      await click();
+      return;
+    }
+    const chooser = page.waitForEvent("filechooser", { timeout: 5_000 }).then(
+      result => result.element(),
+      () => undefined
+    );
+    try {
+      await click();
+      const input = await chooser;
+      assertClickCurrent();
+      this.#humanFileChoices.set(page, { takeover, documentId, input });
+    } catch (error) {
+      void chooser.then(input => input?.dispose()).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private releaseHumanFileChoice(page: Page): void {
+    const choice = this.#humanFileChoices.get(page);
+    this.#humanFileChoices.delete(page);
+    void choice?.input?.dispose().catch(() => undefined);
+  }
+
   private async setFileInput(
     page: Page,
     selector: string,
@@ -2614,7 +2696,8 @@ export class BrowserProvider {
     documentId: string | undefined,
     assertCurrent: () => void,
     markDispatched?: () => void,
-    fileIdentities?: readonly BrowserUploadFileIdentity[]
+    fileIdentities?: readonly BrowserUploadFileIdentity[],
+    selectedInput?: ElementHandle
   ): Promise<void> {
     const assertUploadCurrent = () => {
       assertCurrent();
@@ -2623,19 +2706,19 @@ export class BrowserProvider {
       }
       if (this.#options.canUpload?.() === false) throw new Error("Browser uploads are disabled by the active host policy.");
     };
-    assertUploadCurrent();
-    const files = await Promise.all(paths.map((path) => this.safeUploadPath(path)));
-    assertUploadCurrent();
-    // Wait for the input before dispatch, then use its exact DOM handle across navigation.
-    const input = await page.locator(selector).elementHandle();
-    if (input === null) {
-      assertUploadCurrent();
-      throw new BrowserTakeoverConflictError("The Browser file input is no longer available in the original document.");
-    }
+    let input: ElementHandle | null | undefined = selectedInput;
     let selection: Awaited<ReturnType<typeof stageBrowserUploadSelection>> | undefined;
     let retained = false;
     try {
       assertUploadCurrent();
+      const files = await Promise.all(paths.map((path) => this.safeUploadPath(path)));
+      assertUploadCurrent();
+      // Keep the original DOM handle through staging and dispatch.
+      input ??= await page.locator(selector).elementHandle();
+      assertUploadCurrent();
+      if (input === null) {
+        throw new BrowserTakeoverConflictError("The Browser file input is no longer available in the original document.");
+      }
       if (files.length > 1 && !await input.evaluate(element => element instanceof HTMLInputElement
         && element.type === "file" && element.multiple)) {
         throw new Error("The selected Browser file input does not accept multiple files.");
@@ -2643,6 +2726,12 @@ export class BrowserProvider {
       if (fileIdentities !== undefined) {
         const root = await this.prepareUploadRoot(this.#profileDirectories[this.#targetMode]);
         selection = await stageBrowserUploadSelection(root, files, fileIdentities, assertUploadCurrent);
+      }
+      if (selectedInput !== undefined && (
+        await selectedInput.ownerFrame() !== page.mainFrame() || !await selectedInput.evaluate(element =>
+          element.isConnected && element instanceof HTMLInputElement && element.type === "file" && !element.matches(":disabled"))
+      )) {
+        throw new BrowserTakeoverConflictError("The selected Browser file input is no longer available.");
       }
       assertUploadCurrent();
       markDispatched?.();
@@ -2655,7 +2744,7 @@ export class BrowserProvider {
       await input.setInputFiles(selection === undefined ? files : [...selection.files]);
       assertCurrent();
     } finally {
-      await input.dispose().catch(() => undefined);
+      await input?.dispose().catch(() => undefined);
       if (selection !== undefined && !retained) await removeBrowserUploadSelection(selection.directory).catch(() => undefined);
     }
   }

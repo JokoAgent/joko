@@ -5621,7 +5621,7 @@ describe("Connect security and protocol audit", () => {
   });
 
   it("honors full-page capture and projects the generation-fenced durable screenshot", async () => {
-    const screenshot = Buffer.from("png-image");
+    const screenshot = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]);
     const snapshot = vi.fn(async (
       _pageId: string,
       _lease: Readonly<Record<string, unknown>>,
@@ -5708,7 +5708,12 @@ describe("Connect security and protocol audit", () => {
       browserState,
       blobTransfers: {
         beginUpload: async () => ({ ticketId: "ticket", relativeEndpoint: "/v1/blobs/upload/ticket/secret" }),
-        acceptUpload: async () => durable.blob
+        acceptUpload: async (_ticketId: string, _secret: string, source: AsyncIterable<Uint8Array>) => {
+          const chunks: Uint8Array[] = [];
+          for await (const chunk of source) { expect(chunk).toBeInstanceOf(Uint8Array); chunks.push(chunk); }
+          expect(Buffer.concat(chunks)).toEqual(Buffer.from(screenshot));
+          return durable.blob;
+        }
       },
       now: () => 20,
       connections: { authenticate: () => ({ id: "connection", authKeyDigest: "digest", state: "active" }) }

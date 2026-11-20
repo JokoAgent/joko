@@ -2,10 +2,11 @@ import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
 import { createServer, type ServerResponse } from "node:http";
-import { create, type MessageInitShape } from "@bufbuild/protobuf";
+import { create, fromBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import { BrowserAutomationTarget, BrowserTakeoverActionMutationSchema, BrowserTakeoverMouseButton, OperationMutationSchema,
-  BrowserTransferState, OperationState, PermissionMode, RunState, TransferDirection } from "@joko/contracts";
+  BrowserTransferState, OperationState, PermissionMode, RunState, SubmitOperationRequestSchema, SubmitOperationResponseSchema,
+  TransferDirection } from "@joko/contracts";
 import { OperationalBrowserState } from "@joko/orchestrator";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it } from "vitest";
@@ -90,6 +91,125 @@ browserIt("removes a closed native external tab from Owner recovery and preserve
 
 const sidebarExecutable = executable ?? chromium.executablePath();
 const mountedWebDirectory = process.env.JOKO_MOUNTED_WEB_DIR?.trim();
+
+it.skipIf(!existsSync(sidebarExecutable) || !mountedWebDirectory)(
+  "uploads from the mounted Browser canvas to the chosen second native file input",
+  { timeout: 120_000 }, async () => {
+    const fixture = await RealPiSystemFixture.start({ externalBrowserExecutable: sidebarExecutable, webDirectory: mountedWebDirectory! });
+    let client: Browser | undefined;
+    try {
+      const provider = fixture.application.browser;
+      if (provider === undefined) throw new Error("The sidebar Browser Provider was not configured.");
+      const owner = await fixture.pair("Browser upload setup");
+      const targetId = "workspace-real-pi";
+      const mutate = (payload: NonNullable<MessageInitShape<typeof OperationMutationSchema>["payload"]>) =>
+        submit(owner.clients.operation, owner.connectionId, create(OperationMutationSchema, { payload }));
+      expect((await mutate({ case: "setWorkspaceTrust", value: { workspaceId: targetId, trusted: true } })).state)
+        .toBe(OperationState.SUCCEEDED);
+      expect((await mutate({ case: "updateBrowserSettings", value: { patch: {
+        browserProviderId: provider.id, automationTarget: BrowserAutomationTarget.SIDEBAR, targetId, enabled: true, allowUploads: true
+      } } })).state).toBe(OperationState.SUCCEEDED);
+      const sessionId = sessionIdFrom(await submit(owner.clients.operation, owner.connectionId, createSessionMutation({
+        backendId: "pi", targetId, displayName: "Browser upload task", providerId: REAL_PI_PROVIDER_ID,
+        modelId: REAL_PI_MODEL_ID, effortId: "off"
+      })));
+      expect((await mutate({ case: "openBrowserPage", value: {
+        browserProviderId: provider.id, sessionId, expectedGeneration: BigInt(provider.generation),
+        url: "about:blank", presentationTarget: BrowserAutomationTarget.SIDEBAR
+      } })).state).toBe(OperationState.SUCCEEDED);
+      const initial = provider.currentHumanTakeover();
+      if (initial === undefined) throw new Error("The original Browser page has no setup takeover.");
+      const native = await provider.runHumanTakeoverOperation(initial, async page => page);
+      const url = "https://browser-upload.example.test/";
+      await native.route(url, route => route.fulfill({ contentType: "text/html", body: `<!doctype html>
+        <title>Browser upload fixture</title>
+        <style>label { display: block; margin: 22px } input { display: block; width: 300px }</style>
+        <label>First document<input id="first" type="file"></label>
+        <label>Second document<input id="second" type="file"></label>` }));
+      await native.goto(url);
+      expect((await mutate({ case: "endBrowserTakeover", value: { takeoverId: initial.takeoverId } })).state)
+        .toBe(OperationState.SUCCEEDED);
+
+      const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Browser upload client" })).challenge!;
+      client = await chromium.launch({ executablePath: sidebarExecutable, headless: true });
+      const page = await client.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
+      await page.goto(`${fixture.baseUrl}/#/tools`, { waitUntil: "domcontentloaded" });
+      await page.locator(".connection-tabs > button").nth(2).click();
+      await page.locator("details.device-authorization__manual > summary").click();
+      await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+      await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
+      await page.getByLabel("Device name").fill("Browser upload client");
+      await page.locator("form.pair-form button[type=submit]").click();
+      await page.getByRole("button", { name: "Take over", exact: true }).click();
+      await page.getByText("Remote control active", { exact: true }).waitFor({ state: "visible" });
+      const capture = page.waitForResponse(response => {
+        if (!response.url().endsWith("/joko.v1.OperationService/SubmitOperation")) return false;
+        const body = response.request().postDataBuffer();
+        return body !== null && fromBinary(SubmitOperationRequestSchema, body).mutation?.payload.case === "captureBrowserScreenshot";
+      });
+      await page.getByRole("button", { name: "Capture", exact: true }).click();
+      const captured = fromBinary(SubmitOperationResponseSchema, await (await capture).body()).operation;
+      expect(captured?.state, captured?.error?.message).toBe(OperationState.SUCCEEDED);
+
+      const canvas = page.getByRole("img", { name: /^Interactive remote browser screenshot:/u });
+      const viewport = native.viewportSize();
+      if (viewport === null) throw new Error("The native Browser viewport is unavailable.");
+      await waitFor(() => canvas.evaluate(element => (element as HTMLCanvasElement).width),
+        width => width === viewport.width, "the loaded Browser canvas");
+      const selectSecond = async () => {
+        const field = await native.locator("#second").boundingBox();
+        const surface = await canvas.boundingBox();
+        if (field === null || surface === null) throw new Error("The second Browser file field is unavailable.");
+        const clicked = page.waitForResponse(response => {
+          if (!response.url().endsWith("/joko.v1.OperationService/SubmitOperation")) return false;
+          const body = response.request().postDataBuffer();
+          const payload = body === null ? undefined : fromBinary(SubmitOperationRequestSchema, body).mutation?.payload;
+          return payload?.case === "browserTakeoverAction" && payload.value.action.case === "mouseClick";
+        });
+        await canvas.click({ position: {
+          x: (field.x + 24) / (viewport.width - 1) * surface.width,
+          y: (field.y + field.height / 2) / (viewport.height - 1) * surface.height
+        } });
+        const result = await clicked;
+        expect(result.ok()).toBe(true);
+        expect(fromBinary(SubmitOperationResponseSchema, await result.body()).operation?.state).toBe(OperationState.SUCCEEDED);
+        await page.locator(".remote-browser.is-enabled[aria-busy=false]").waitFor({ state: "visible" });
+      };
+      const bytes = Buffer.from("Original file contents for the second field.\n");
+      const upload = async (name: string) => {
+        const picker = page.waitForEvent("filechooser");
+        await page.getByRole("button", { name: "Upload file", exact: true }).click();
+        await (await picker).setFiles({ name, mimeType: "text/plain", buffer: bytes });
+        return waitFor(async () => (await owner.clients.browser.listBrowserTransfers({
+          browserProviderId: provider.id, pageId: initial.pageId, direction: TransferDirection.UPLOAD
+        })).transfers.find(transfer => transfer.fileName === name),
+        transfer => transfer?.state === BrowserTransferState.COMPLETED || transfer?.state === BrowserTransferState.FAILED,
+        `the Browser transfer for ${name}`, 20_000);
+      };
+      const inputFiles = () => native.locator("input[type=file]").evaluateAll(async elements => Promise.all(
+        elements.map(async element => Promise.all(Array.from((element as HTMLInputElement).files ?? [], async file =>
+          ({ name: file.name, text: await file.text() }))))
+      ));
+
+      await selectSecond();
+      expect(await upload("second.txt")).toMatchObject({ state: BrowserTransferState.COMPLETED,
+        blob: { fileName: "second.txt", sha256Hex: createHash("sha256").update(bytes).digest("hex") } });
+      expect(await inputFiles()).toEqual([[], [{ name: "second.txt", text: bytes.toString() }]]);
+
+      await selectSecond();
+      await native.locator("#second").evaluate(element => {
+        const replacement = document.createElement("input");
+        replacement.id = "second";
+        replacement.type = "file";
+        element.replaceWith(replacement);
+      });
+      expect(await upload("stale.txt")).toMatchObject({ state: BrowserTransferState.FAILED });
+      expect(await inputFiles()).toEqual([[], []]);
+    } finally {
+      await client?.close().catch(() => undefined);
+      await fixture.close({ removeRoot: true });
+    }
+  });
 
 it.skipIf(!existsSync(sidebarExecutable) || !mountedWebDirectory)(
   "returns a one-time native Browser POST download to the original Pi tool and Run after switching tasks",
