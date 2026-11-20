@@ -37,7 +37,7 @@ import {
   WorkspaceSearchMatchSchema, WorkspaceChangeSetSchema, WorkspaceRewindPreviewSchema, WorkspaceRewindResultSchema, RewindSafety, FileChangeKind,
   JOKO_API_VERSION, NativeEntryKind, NativeSessionBindingSchema, NativeSessionTreeNodeSchema, NativeSessionTreeSchema, OperationSchema,
   ListPartnerSessionsResponseSchema, PartnerSessionRole, PARTNER_TODO_CHECK_PROMPT,
-  InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk,
+  InputCapabilityOptionsSchema, InputContentSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk,
   CustomToolPermissionSubjectSchema, PermissionRequestSchema, PermissionSubjectSchema, PlanReviewDecisionKind, ImageThumbnailSchema,
   EventCursorSchema, EventIdentitySchema, EventSchema, ImageRefSchema, MessageCompletedEventSchema, MessageDeletedEventSchema, MessageInputDelivery, MessageRole, MessageStartedEventSchema,
   ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
@@ -11736,7 +11736,7 @@ describe("native current-task message and Queue actions", () => {
       runs: [create(RunSchema, {
         runId: "active-run", sessionId: "session", backendId: "backend", targetId: "target", state: RunState.RUNNING
       })],
-      queueItems: [queueTwo, create(QueueItemSchema, { ...queueOne, input: {
+      queueItems: [queueTwo, create(QueueItemSchema, { ...queueOne, input: create(InputContentSchema, {
         parts: [
           { content: { case: "text", value: originalText } },
           { content: { case: "workspaceMention", value: {
@@ -11744,7 +11744,7 @@ describe("native current-task message and Queue actions", () => {
           } } }
         ],
         mentionRanges: [{ start: 8, end: 14, mentionIndex: 0 }]
-      } })]
+      }) })]
     });
     const network = projectedNetwork(current);
     vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({
