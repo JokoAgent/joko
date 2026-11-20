@@ -352,9 +352,9 @@ jobs:
         shell: bash
         run: node scripts/ci/prepare-codex-native.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/codex-native-prepare.log"
 
-      - name: Prepare Ubuntu user namespaces for native Codex filesystem tests
+      - name: Prepare Ubuntu user namespaces for native Backend tests
         id: codex_sandbox
-        if: ${{ !cancelled() && steps.codex_native.outcome == 'success' && runner.os == 'Linux' }}
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.source_check.outcome == 'success' && (steps.codex_native.outcome == 'success' || startsWith(matrix.workload, 'e2e-')) }}
         timeout-minutes: 5
         shell: bash
         run: |
@@ -493,7 +493,7 @@ jobs:
       - name: Run Connect end-to-end tests and Browser chains (Linux)
         id: workspace_e2e_linux
         timeout-minutes: 35
-        if: ${{ startsWith(matrix.workload, 'e2e-') && !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ startsWith(matrix.workload, 'e2e-') && !cancelled() && steps.dependencies.outcome == 'success' && steps.codex_sandbox.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/e2e test --shard=${{ matrix.workload == 'e2e-1' && '1/4' || matrix.workload == 'e2e-2' && '2/4' || matrix.workload == 'e2e-3' && '3/4' || '4/4' }} 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-e2e.log"
         env:

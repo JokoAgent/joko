@@ -42,7 +42,7 @@ function loadPreload() {
       if (specifier !== "electron") throw new Error(`Unexpected preload dependency: ${specifier}`);
       return electron;
     },
-    process: { platform: "win32" }, crypto: { randomUUID: () => "00000000-0000-4000-8000-000000000001" },
+    process: { platform: "win32", argv: [] }, crypto: { randomUUID: () => "00000000-0000-4000-8000-000000000001" },
     console, Object, Promise, Set, Map, WeakMap, BigInt, Number, String, Boolean, TypeError, RangeError, RegExp,
     URL, URLSearchParams, TextEncoder, Uint8Array, ArrayBuffer, structuredClone
   });
