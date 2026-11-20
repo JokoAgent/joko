@@ -37,11 +37,13 @@ export type VoiceMediaErrorCode =
 
 export class VoiceMediaError extends Error {
   readonly code: VoiceMediaErrorCode;
+  readonly trackEnded: boolean;
 
-  constructor(code: VoiceMediaErrorCode, options: { readonly cause?: unknown } = {}) {
+  constructor(code: VoiceMediaErrorCode, options: { readonly cause?: unknown; readonly trackEnded?: boolean } = {}) {
     super(VOICE_MEDIA_ERROR_MESSAGES[code], options);
     this.name = "VoiceMediaError";
     this.code = code;
+    this.trackEnded = options.trackEnded === true;
   }
 }
 
@@ -350,7 +352,7 @@ export class VoiceInputMediaSession {
 
   private watchTracks(stream: MediaStream): void {
     for (const track of stream.getAudioTracks()) {
-      const onEnded = (): void => { void this.fail(new VoiceMediaError("captureFailed")); };
+      const onEnded = (): void => { void this.fail(new VoiceMediaError("captureFailed", { trackEnded: true })); };
       track.addEventListener("ended", onEnded);
       this.trackCleanup.push(() => track.removeEventListener("ended", onEnded));
     }

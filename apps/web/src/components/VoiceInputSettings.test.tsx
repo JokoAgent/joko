@@ -516,7 +516,7 @@ describe("VoiceInputSettings", () => {
     expect(replacement.addVoiceInputDictionaryTerms).not.toHaveBeenCalled();
   });
 
-  it("does not accept recording keys until Desktop has suspended the active global binding", async () => {
+  it("records Ctrl+1 after suspension without treating its hidden default as an explicit binding", async () => {
     let releaseSuspension: (() => void) | undefined;
     const configure = vi.fn((patch: { readonly shortcutRecording?: boolean }) => (
       patch.shortcutRecording === true
@@ -552,12 +552,12 @@ describe("VoiceInputSettings", () => {
     await act(async () => releaseSuspension?.());
     await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", {
       bubbles: true,
-      code: "KeyN",
-      key: "n",
-      altKey: true,
-      shiftKey: true
+      code: "Digit1",
+      key: "1",
+      ctrlKey: true
     })));
-    await vi.waitFor(() => expect(setShortcut).toHaveBeenCalledWith(expect.objectContaining({ code: "KeyN" })));
+    await vi.waitFor(() => expect(readVoiceInputPreferences().shortcut).toMatchObject({ code: "Digit1", ctrl: true }));
+    expect(setShortcut).toHaveBeenCalledWith(expect.objectContaining({ code: "Digit1", ctrl: true }));
   });
 
   it("rejects a Voice Input shortcut already owned by Composer without changing the binding", async () => {

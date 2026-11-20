@@ -5,12 +5,22 @@ import { ConnectionService, DesktopVoiceConversationService, DesktopVoiceConvers
 import { DESKTOP_HOST_AUTHORIZATION_HEADER } from '@joko/contracts/desktop-bootstrap';
 import type { DesktopManagedOrchestratorConnection } from './channels.js';
 
+interface WindowVoiceLease {
+  readonly serverId: string;
+  readonly sessionId: string;
+  readonly sessionGeneration: bigint;
+  readonly callId: string;
+  readonly operationId: string;
+  readonly playbackOnly: boolean;
+  pending: boolean;
+}
+
 /** Only Main obtains the domain-separated bootstrap key. The top-level UI
  * exchanges generated message bytes; neither host nor Connection secrets cross IPC. */
 export class DesktopVoiceConversationHost {
   #connection?: DesktopManagedOrchestratorConnection;
   #lifetime = new AbortController();
-  readonly #windows = new Map<string, { readonly serverId: string; readonly sessionId: string; readonly sessionGeneration: bigint; readonly callId: string }>();
+  readonly #windows = new Map<string, WindowVoiceLease>();
   constructor(readonly options: { readonly readAuthKey: (profileId: string) => Promise<string | undefined>;
     readonly readHostKey: (profileId: string) => Promise<string | undefined>;
     readonly dictationActive?: () => boolean;
@@ -25,7 +35,10 @@ export class DesktopVoiceConversationHost {
   retireWindow(windowId: string): void {
     const original = this.#windows.get(windowId); this.#windows.delete(windowId);
     if (!original) return;
-    const request = create(ControlDesktopVoiceConversationRequestSchema, { ...original, action: DesktopVoiceConversationAction.END });
+    const { sessionId, sessionGeneration, callId, operationId, playbackOnly } = original;
+    const request = create(ControlDesktopVoiceConversationRequestSchema, {
+      sessionId, sessionGeneration, callId, operationId, playbackOnly, action: DesktopVoiceConversationAction.END
+    });
     void this.request(original.serverId, windowId, toBinary(ControlDesktopVoiceConversationRequestSchema, request), () => {}).catch(() => undefined);
   }
   async request(serverId: string, windowId: string, bytes: Uint8Array, assertDocument: () => void): Promise<Uint8Array> {
@@ -37,25 +50,43 @@ export class DesktopVoiceConversationHost {
     };
     await assertCurrent();
     const request = fromBinary(ControlDesktopVoiceConversationRequestSchema, bytes); request.windowId = windowId;
-    if (request.action === DesktopVoiceConversationAction.START && this.options.dictationActive?.()) throw new Error('Dictation already owns audio.');
-    if (request.action === DesktopVoiceConversationAction.START) this.#windows.set(windowId, { serverId, sessionId: request.sessionId, sessionGeneration: request.sessionGeneration, callId: request.callId });
-    const endpointPublicKey = connection.endpointPublicKey === undefined ? requireEndpointTrust({ origin: connection.origin }) : normalizeEndpointPublicKey(connection.endpointPublicKey);
-    const publicTransport = createConnectTransport({ baseUrl: connection.origin, endpointPublicKey, httpVersion: '1.1', defaultTimeoutMs: 5_000 });
-    const identity = await createClient(ConnectionService, publicTransport).getServerInfo({}, { signal }); await assertCurrent();
-    if (identity.server?.serverId !== serverId) throw new EndpointTrustError('Local voice node identity changed.');
-    const auth = await this.options.readAuthKey(connection.profileId), host = await this.options.readHostKey(connection.profileId); await assertCurrent();
-    if (!auth || !host) throw new Error('Local voice host authorization is unavailable.');
-    const authorize: Interceptor = next => async input => {
-      await assertCurrent(); input.header.set('authorization', `Bearer ${auth}`); input.header.set(DESKTOP_HOST_AUTHORIZATION_HEADER, `Bearer ${host}`);
-      return next(input);
-    };
-    const client = createClient(DesktopVoiceConversationService, createConnectTransport({ baseUrl: connection.origin, endpointPublicKey,
-      httpVersion: '1.1', defaultTimeoutMs: 65_000, interceptors: [authorize] }));
-    const response = await client.controlDesktopVoiceConversation(request, { signal }); await assertCurrent();
-    if (request.action === DesktopVoiceConversationAction.START && response.call?.callId === request.callId) this.#windows.set(windowId,
-      { serverId, sessionId: request.sessionId, sessionGeneration: request.sessionGeneration, callId: request.callId });
-    if (request.action === DesktopVoiceConversationAction.SNAPSHOT && !response.call) this.#windows.delete(windowId);
-    if (request.action === DesktopVoiceConversationAction.END && this.#windows.get(windowId)?.callId === request.callId) this.#windows.delete(windowId);
-    return toBinary(ControlDesktopVoiceConversationResponseSchema, response);
+    const previous = this.#windows.get(windowId);
+    const previousWasPending = previous?.pending === true;
+    let starting: WindowVoiceLease | undefined;
+    if (request.action === DesktopVoiceConversationAction.START) {
+      if (this.options.dictationActive?.()) throw new Error('Dictation already owns audio.');
+      starting = { serverId, sessionId: request.sessionId, sessionGeneration: request.sessionGeneration, callId: request.callId,
+        operationId: request.operationId, playbackOnly: request.playbackOnly, pending: true };
+      this.#windows.set(windowId, starting);
+    }
+    let offered = false;
+    try {
+      const endpointPublicKey = connection.endpointPublicKey === undefined ? requireEndpointTrust({ origin: connection.origin }) : normalizeEndpointPublicKey(connection.endpointPublicKey);
+      const publicTransport = createConnectTransport({ baseUrl: connection.origin, endpointPublicKey, httpVersion: '1.1', defaultTimeoutMs: 5_000 });
+      const identity = await createClient(ConnectionService, publicTransport).getServerInfo({}, { signal }); await assertCurrent();
+      if (identity.server?.serverId !== serverId) throw new EndpointTrustError('Local voice node identity changed.');
+      const auth = await this.options.readAuthKey(connection.profileId), host = await this.options.readHostKey(connection.profileId); await assertCurrent();
+      if (!auth || !host) throw new Error('Local voice host authorization is unavailable.');
+      const authorize: Interceptor = next => async input => {
+        await assertCurrent(); input.header.set('authorization', `Bearer ${auth}`); input.header.set(DESKTOP_HOST_AUTHORIZATION_HEADER, `Bearer ${host}`);
+        offered = true;
+        return next(input);
+      };
+      const client = createClient(DesktopVoiceConversationService, createConnectTransport({ baseUrl: connection.origin, endpointPublicKey,
+        httpVersion: '1.1', defaultTimeoutMs: 65_000, interceptors: [authorize] }));
+      const response = await client.controlDesktopVoiceConversation(request, { signal }); await assertCurrent();
+      if (previous && this.#windows.get(windowId) === previous && request.sessionId === previous.sessionId
+        && request.sessionGeneration === previous.sessionGeneration) {
+        if (request.action === DesktopVoiceConversationAction.SNAPSHOT && !response.call && !previousWasPending
+          && (!request.callId || request.callId === previous.callId)) this.#windows.delete(windowId);
+        if (request.action === DesktopVoiceConversationAction.END && previous.callId === request.callId) this.#windows.delete(windowId);
+      }
+      return toBinary(ControlDesktopVoiceConversationResponseSchema, response);
+    } finally {
+      if (starting) {
+        starting.pending = false;
+        if (!offered && this.#windows.get(windowId) === starting) this.#windows.delete(windowId);
+      }
+    }
   }
 }

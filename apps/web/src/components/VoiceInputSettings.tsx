@@ -1462,6 +1462,7 @@ function voiceShortcutConflict(
   platform: ReturnType<typeof currentAppShortcutPlatform>
 ): AppShortcutId | null {
   for (const definition of APP_SHORTCUT_DEFINITION_LIST) {
+    if (definition.yieldsToUserBindings === true && overrides[definition.id] === undefined) continue;
     if (effectiveAppShortcutCombos(definition.id, overrides, platform).some((candidate) => appShortcutCombosEqual(candidate, combo))) {
       return definition.id;
     }

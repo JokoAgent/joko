@@ -24,6 +24,8 @@ const en = { title: 'Voice conversation', body: 'Talk in a separate call context
   text: 'Message in this call', send: 'Send to call', handoff: 'Send as task work', work: 'Task work',
   sentence: 'Read replies sentence by sentence', preview: 'Preview voice', previewText: 'Hello. This is your selected voice.',
   stop: 'Stop playback', read: 'Read aloud', readText: 'Text to read aloud', history: 'Recent calls', retry: 'Retry',
+  readFailed: 'Read aloud failed. Check the selected voice and try again.',
+  microphoneLost: 'The microphone disconnected. Start a new call to continue.', unsentMessage: 'Unsent message',
   loading: 'Loading', noCalls: 'No calls yet', truncated: 'The voice list is limited. You can enter an exact ID.',
   voicesUnavailable: 'Account voices could not be loaded. Public reference voices remain available.',
   ready: 'Ready', close: 'Close', missing: 'Saved model is currently unavailable', inherited: 'Use conversation voice',
@@ -35,6 +37,8 @@ const zh: typeof en = { title: '持续语音', body: '在独立通话上下文�
   choose: '选择模型', save: '保存语音设置', reset: '重置语音设置', saved: '已保存语音设置', start: '开始通话', end: '结束通话', mute: '关闭麦克风', unmute: '恢复收听', interrupt: '打断回复',
   listening: '正在收听', starting: '正在启动麦克风', submitting: '正在完成转写', thinking: '等待回复', text: '通话内文字', send: '发送到通话', handoff: '作为任务工作发送', work: '任务工作',
   sentence: '逐句朗读回复', preview: '试听音色', previewText: '你好，这是你选择的音色。', stop: '停止朗读', read: '朗读', readText: '要朗读的文字', history: '最近通话', retry: '重试', loading: '加载中', noCalls: '暂无通话',
+  readFailed: '朗读失败。请检查所选音色，再试一次。',
+  microphoneLost: '麦克风已断开。请重新开始通话。', unsentMessage: '尚未发送的消息',
   truncated: '音色列表已达到上限，仍可输入准确 ID。', voicesUnavailable: '未能读取账号音色，仍可选择公开参考音色。', ready: '就绪', close: '关闭', missing: '已保存的模型当前不可用', inherited: '使用通话音色',
   speaker: '助手', user: '你', failed: '失败，请明确重试', accepted: '任务已接纳', completed: '任务已完成', sending: '正在发送', paused: '任务需要你的处理。完成原提问或批准后，再恢复收听。', microphone: '麦克风', none: '尚未选择', cancelled: '通话已结束', details: '查看通话', returned: '任务结果', countdown: '通话将在以下秒数后结束', continueCall: '继续聊', questionDraft: '尚未提交的问题答案', retryQuestion: '用于原问题', questionHint: '可口述当前提问卡的选项；自由回答和多选请明确说“确认”。', waiting: '正在等待任务接纳后结束通话' };
 const protocols = ['openai', 'elevenlabs', 'minimax', 'qwen-tts', 'dashscope-tts'] as const;
@@ -68,6 +72,8 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
   const host = window.jokoDesktop!.voiceConversation!;
   const client = useMemo(() => new DesktopVoiceClient(host, serverId, session.id, session.generation), [host, serverId, session.id, session.generation]);
   const [value, setValue] = useState<ControlDesktopVoiceConversationResponse>(), [error, setError] = useState(false), [busy, setBusy] = useState(false), [notice, setNotice] = useState('');
+  const [playbackFailed, setPlaybackFailed] = useState(false);
+  const [microphoneLost, setMicrophoneLost] = useState(false);
   const [conversation, setConversation] = useState<DesktopSpeechSelection>(), [playback, setPlayback] = useState<DesktopSpeechSelection>();
   const [sentence, setSentence] = useState(true), [settings, setSettings] = useState(false), [message, setMessage] = useState(''), [reading, setReading] = useState('');
   const [mic, setMic] = useState(false), [micState, setMicState] = useState(''), [speaking, setSpeaking] = useState(false);
@@ -80,7 +86,9 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
   const questionRef = useRef(question); questionRef.current = question;
   const blocked = interactions.some(row => row.kind !== 'question')
     || controller.state.snapshot?.queueControls.some(row => row.sessionId === session.id && row.state === 'paused') || false;
-  const current = useRef<{ live: boolean; callId?: string; kind?: string; polling: boolean; starting?: boolean; ending?: boolean; readId: number }>({ live: true, polling: false, readId: 0 });
+  const current = useRef<{ live: boolean; callId?: string; kind?: string; polling: boolean; starting?: boolean; ending?: boolean; readId: number;
+    retiredMicrophoneCallId?: string;
+    pendingPlayback?: { readonly callId: string; readonly operationId: string } }>({ live: true, polling: false, readId: 0 });
   const blockedNow = useRef(blocked), startGeneration = useRef(0);
   useLayoutEffect(() => {
     blockedNow.current = blocked;
@@ -107,20 +115,24 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
     try {
       const result = await client.control(Action.SNAPSHOT, { callId: owner.callId ?? '' });
       if (current.current !== owner || !owner.live || owner.starting || owner.readId !== readId) return;
-      setValue(result); setError(false);
-      if (result.call?.endedAtMs === undefined && result.call) { owner.callId = result.call.callId; owner.kind = result.call.kind; }
-      if (!result.call && owner.callId) { listener.current?.stop(); player.stop(); owner.callId = undefined; setMic(false); }
+      if (result.call && result.call.callId === owner.retiredMicrophoneCallId && result.call.endedAtMs === undefined) return;
+      const call = result.call?.kind === 'playback' && result.call.callId !== owner.callId ? undefined : result.call;
+      setValue({ ...result, call }); setError(false);
+      if (call?.endedAtMs === undefined && call) { owner.callId = call.callId; owner.kind = call.kind; }
+      if (!call && owner.callId) { listener.current?.stop(); player.stop(); owner.callId = undefined; owner.kind = undefined; setMic(false); }
     } catch { if (owner.live) setError(true); }
     finally { owner.polling = false; }
   }, [client, player]);
   const stop = useCallback(async () => {
-    const owner = current.current, id = owner.callId;
+    const owner = current.current, pending = owner.pendingPlayback;
+    const id = owner.callId ?? pending?.callId;
     startGeneration.current++;
     owner.readId++; owner.ending = true;
     speechGeneration.current++; semanticVersion.current++; exit.current = undefined; idleSince.current = undefined; setCountdown(undefined);
     listener.current?.stop(); player.stop(); setMic(false); setSpeaking(false);
-    owner.callId = undefined; owner.kind = undefined;
-    try { if (id) await client.control(Action.END, { callId: id }).catch(() => undefined); }
+    owner.callId = undefined; owner.kind = undefined; owner.pendingPlayback = undefined;
+    try { if (id) await client.control(Action.END, { callId: id,
+      ...(pending?.callId === id ? { playbackOnly: true, operationId: pending.operationId } : {}) }).catch(() => undefined); }
     finally { owner.ending = false; }
   }, [client, player]);
   useEffect(() => {
@@ -149,11 +161,12 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
     finally { if (current.current.live) { setBusy(false); void read(); } }
   };
   const interrupt = useCallback((notify = true): Promise<unknown> => {
+    if (notify && current.current.kind === 'playback') return stop().then(read);
     speechGeneration.current++; semanticVersion.current++; exit.current = undefined; idleSince.current = undefined; setCountdown(undefined);
     for (const turn of latestValue.current?.call?.turns ?? []) if (turn.role === 'assistant') spoken.current.add(turn.id);
     const id = current.current.callId; player.stop(); setSpeaking(false);
     return id && notify ? client.control(Action.INTERRUPT, { callId: id }).catch(() => { if (current.current.live) setError(true); }) : Promise.resolve();
-  }, [client, player]);
+  }, [client, player, read, stop]);
   useEffect(() => {
     if (!blocked) return;
     const unfinished = listener.current?.draft;
@@ -268,17 +281,23 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
             else setCountdown(undefined);
           } else if (decision.exitDecision === 'exit') beginExit('semantic');
         }).catch(() => { if (current.current.callId === callId && version === semanticVersion.current) { setCountdown(undefined); setError(true); } });
-      }, onState: state => { if (state === 'listening') hasSpeechSession.current = true; setMicState(state); }, onFailure: partial => {
+      }, onState: state => { if (state === 'listening') hasSpeechSession.current = true; setMicState(state); }, onFailure: (partial, trackEnded) => {
         if (capturedQuestion.current?.pending && partial.trim()) { retainedQuestion.current = capturedQuestion.current.target; setQuestionDraft(partial); }
         else if (partial.trim()) setMessage(partial);
-        speechCandidate.current = false; capturedQuestion.current = undefined; setDraft(''); setMic(false); setError(true);
+        speechCandidate.current = false; capturedQuestion.current = undefined; setDraft(''); setMic(false);
+        const owner = current.current;
+        if (trackEnded && owner.live && owner.callId) {
+          owner.retiredMicrophoneCallId = owner.callId;
+          setMicrophoneLost(true);
+          void stop().then(read);
+        } else setError(true);
       } });
     listener.current = next; setMic(true);
     try { await next.start(); } catch { next.stop(); if (current.current.live) { setMic(false); setError(true); } }
   };
   const start = async (playbackOnly: boolean, chosen: DesktopSpeechSelection | undefined): Promise<boolean> => {
     chosen = reconcileDesktopSpeechSelection(chosen, value?.models ?? []);
-    if (blockedNow.current) return false;
+    if (blockedNow.current || current.current.ending) return false;
     if (!chosen) { setSettings(true); return false; }
     const owner = current.current;
     const stopping = owner.callId ? stop() : undefined;
@@ -287,18 +306,28 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
     await stopping;
     if (!canStart()) return false;
     const callId = crypto.randomUUID(), operationId = `voice-start-${callId}`;
+    const retire = () => client.control(Action.END, { callId, ...(playbackOnly ? { playbackOnly: true, operationId } : {}) }).catch(() => undefined);
     owner.starting = true;
+    if (playbackOnly) owner.pendingPlayback = { callId, operationId };
     try {
       const result = await client.control(Action.START, { callId, operationId, selection: chosen, playbackOnly });
       if (!canStart()) {
-        await client.control(Action.END, { callId }).catch(() => undefined);
+        if (!playbackOnly || owner.pendingPlayback?.callId === callId) await retire();
         return false;
       }
+      if (!result.call || result.call.callId !== callId || result.call.endedAtMs !== undefined) throw new Error('The voice call did not start.');
       owner.callId = callId; owner.kind = playbackOnly ? 'playback' : 'conversation';
       setValue(result); spoken.current.clear(); speechRequestIds.current.clear();
-      if (!playbackOnly) await startMic();
+      if (!playbackOnly) { setMicrophoneLost(false); await startMic(); }
       return true;
-    } finally { owner.starting = false; }
+    } catch (error) {
+      if (playbackOnly && owner.pendingPlayback?.callId === callId) await retire();
+      if (canStart()) throw error;
+      return false;
+    } finally {
+      if (owner.pendingPlayback?.callId === callId) owner.pendingPlayback = undefined;
+      owner.starting = false;
+    }
   };
   const save = (reset: boolean) => void action(async () => {
     if (!saveRequest.current) saveRequest.current = { operationId: crypto.randomUUID(), preference: create(DesktopVoiceConversationPreferenceSchema, {
@@ -312,9 +341,15 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
   const playText = (body: string, selected = playback ?? conversation) => void action(async () => {
     if (blocked) return;
     if (!body.trim() || !selected) { setSettings(true); return; }
-    if (current.current.callId && current.current.kind === 'conversation') { await interrupt(); await say(body); return; }
-    if (!await start(true, selected)) return;
-    try { await say(body); } finally { await stop(); }
+    const owner = current.current;
+    setPlaybackFailed(false);
+    try {
+      if (owner.callId && owner.kind === 'conversation') { await interrupt(); await say(body); return; }
+      if (!await start(true, selected)) return;
+      try { await say(body); } finally { await stop(); }
+    } catch {
+      if (current.current === owner && owner.live) setPlaybackFailed(true);
+    }
   });
   const send = (forceHandoff: boolean) => void action(async () => {
     if (!current.current.callId || !message.trim()) return;
@@ -351,6 +386,8 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
       <Button onClick={cancelExit}>{text.continueCall}</Button></div>}
     {blocked && <p role="status">{text.paused}</p>}
     {error && <p role="alert">{text.unavailable}<Button disabled={busy} onClick={() => { void read(); }}>{text.retry}</Button></p>}
+    {microphoneLost && <p role="alert">{text.microphoneLost}</p>}
+    {playbackFailed && <p role="alert">{text.readFailed}</p>}
     {settings && <div className="desktop-voice-conversation__settings">
       {!value?.models.length && <p>{text.empty}</p>}
       <SpeechChoice title={text.conversation} value={conversation} models={value?.models ?? []} client={client} disabled={busy || blocked} language={controller.state.effectiveLocale}
@@ -380,6 +417,7 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
       <label>{text.text}<textarea value={message} maxLength={32_000} onChange={event => setMessage(event.target.value)} /></label>
       <div className="desktop-voice-conversation__actions"><Button type="submit" disabled={busy || !message.trim()}>{text.send}</Button><Button disabled={busy || !message.trim()} onClick={() => send(true)}>{text.handoff}</Button></div>
     </form>}
+    {!active && microphoneLost && message && <label>{text.unsentMessage}<textarea readOnly value={message} /></label>}
     {!active && <form onSubmit={event => { event.preventDefault(); playText(reading); }} className="desktop-voice-conversation__input">
       <label>{text.readText}<textarea value={reading} maxLength={32_000} onChange={event => setReading(event.target.value)} /></label>
       <Button type="submit" disabled={busy || !reading.trim()}>{text.read}</Button>

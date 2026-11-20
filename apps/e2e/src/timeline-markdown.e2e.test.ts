@@ -101,7 +101,10 @@ describe("mounted Timeline Markdown documents", () => {
     await page.getByRole("menuitem", { name: "New terminal", exact: true }).click();
     const terminal = page.locator(".interactive-terminal .xterm");
     const row = terminal.locator(".xterm-rows > div").filter({ hasText: terminalText });
-    await row.dblclick({ position: { x: 18, y: 8 } });
+    await row.scrollIntoViewIfNeeded();
+    const bounds = await row.boundingBox();
+    if (bounds === null) throw new Error("The original terminal text has no visible row.");
+    await page.mouse.dblclick(bounds.x + 18, bounds.y + bounds.height / 2);
     await terminal.locator(".xterm-selection > div").first().waitFor({ state: "visible" });
     const input = terminal.locator("textarea.xterm-helper-textarea");
     expect(await input.evaluate(element => element === document.activeElement)).toBe(true);

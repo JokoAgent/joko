@@ -8,7 +8,7 @@ import { NotFoundError } from '@joko/store';
 import type { SessionHost } from '../session-host.js';
 import { VoiceCallContext, type VoiceCallRecord } from './call-context.js';
 import { SpeechModelCatalog, type SpeechSelection } from './models.js';
-import { SpeechSynthesisSession } from './speech.js';
+import { SpeechSynthesisSession, type SpeechStartResult } from './speech.js';
 import { loadSpeechVoices } from './voices.js';
 import { classifyVoiceExit } from './semantic-exit.js';
 
@@ -23,12 +23,12 @@ interface Call {
   readonly authority: DesktopVoiceAuthority; readonly speech: SpeechSynthesisSession;
   readonly assertCurrent: () => void; readonly speechIds: Map<string, string>;
   readonly dispatches: Map<string, { runId: string; queueItemId: string; cursor: bigint; text: string }>;
-  readonly reads: Map<string, { pcm: Uint8Array; done: boolean }>;
+  readonly reads: Map<string, contract.ControlDesktopVoiceConversationResponse>;
   readonly readIds: Set<string>;
   readonly inputs: Map<string, string>;
   readonly exitJudgments: Map<string, { readonly text: string; readonly result: Promise<string> }>;
   readonly inferExit: (text: string) => Promise<string>;
-  speechId?: string; speechReadId?: string; touchedAt: number;
+  speechId?: string; speechReadId?: string; speechStart?: Promise<SpeechStartResult>; touchedAt: number;
 }
 /** One local Desktop call lease. Model context has no tools. Transcripts are
  * durable product records; only explicitly handed off utterances enter Queue. */
@@ -97,6 +97,12 @@ export class DesktopVoiceConversationManager {
     }
     if (action === contract.DesktopVoiceConversationAction.START) {
       const callId = identity(request.callId, 64), chosen = selection(request.selection);
+      if (request.playbackOnly) {
+        const retirement = this.options.store.findOperation(playbackRetirementId(owner, session.id, generation, callId, identity(request.operationId)));
+        if (retirement?.status === 'completed' && retirement.kind === 'desktop_voice_retire_playback_start') {
+          throw new ConnectError('This playback was closed before it started.', Code.FailedPrecondition);
+        }
+      }
       const previous = this.#call;
       if (previous?.id === callId) {
         if (previous.owner !== owner || previous.sessionId !== session.id || previous.generation !== generation || previous.operationId !== request.operationId
@@ -122,7 +128,7 @@ export class DesktopVoiceConversationManager {
       };
       const context: VoiceCallContext = new VoiceCallContext({ callId, identity: `${companion.identity}\n${session.appendSystemPrompt ?? ''}`.slice(0, 32_000), reference: this.#reference(session.id),
         generate: async (user, system, signal) => {
-          assertCurrent(); call.speech.cancel(); call.speechId = undefined;
+          assertCurrent(); retireSpeech(call);
           const result = await this.options.infer(session.backendId, { providerId: providerId!, modelId: modelId!, backendInstanceGeneration: backend.instanceGeneration,
             system, user, signal, timeoutMs: 60_000, maxTokens: 4096, assertCurrent,
             assertModelAllowed: (provider, model) => { assertCurrent(); if (provider !== providerId || model !== modelId) throw unavailable(); } });
@@ -165,7 +171,23 @@ export class DesktopVoiceConversationManager {
       this.#call = call; assertCurrent(); return this.#snapshot(session.id, generation, call);
     }
     const call = this.#call;
-    if (!call || call.owner !== owner || call.id !== request.callId || call.sessionId !== session.id || call.generation !== generation) throw unavailable();
+    const ownerMatches = call !== undefined && call.owner === owner && call.id === request.callId && call.sessionId === session.id && call.generation === generation;
+    const pendingPlaybackEnd = action === contract.DesktopVoiceConversationAction.END && request.playbackOnly && request.operationId !== '';
+    if (pendingPlaybackEnd) {
+      const callId = identity(request.callId, 64), startOperationId = identity(request.operationId);
+      if (call && ownerMatches) {
+        if (call.kind !== 'playback' || call.operationId !== startOperationId) throw invalid();
+      } else {
+        // END can win while the original authenticated START is still in transit.
+        const id = playbackRetirementId(owner, session.id, generation, callId, startOperationId);
+        this.options.store.runAuthorizedOperation(authority.connection.id, authority.connection.authKeyDigest,
+          { id, kind: 'desktop_voice_retire_playback_start', body: { windowId: request.windowId, sessionId: session.id, generation, callId, startOperationId } }, () => {
+            authority.assertCurrent(); return true;
+          });
+        return this.#snapshot(session.id, generation);
+      }
+    }
+    if (!call || !ownerMatches) throw unavailable();
     call.assertCurrent(); call.touchedAt = this.#now();
     switch (action) {
       case contract.DesktopVoiceConversationAction.CLASSIFY_EXIT: {
@@ -191,13 +213,13 @@ export class DesktopVoiceConversationManager {
         this.options.store.runAuthorizedOperation(authority.connection.id, authority.connection.authKeyDigest,
           { id: request.inputId, kind: 'desktop_voice_turn', body: { callId: call.id, sessionId: session.id, generation, text: request.text, forceHandoff: request.forceHandoff } }, () => true);
         call.inputs.set(request.inputId, request.text);
-        call.speech.cancel(); call.speechId = undefined; call.context.interrupt();
+        retireSpeech(call); call.context.interrupt();
         void call.context.submit(request.inputId, request.text, request.forceHandoff).catch(() => undefined);
         return this.#snapshot(session.id, generation, call);
       case contract.DesktopVoiceConversationAction.PROMOTE:
         await call.context.promote(identity(request.inputId, 128)); call.assertCurrent(); return this.#snapshot(session.id, generation, call);
       case contract.DesktopVoiceConversationAction.INTERRUPT:
-        call.speech.cancel(); call.speechId = undefined; call.context.interrupt(); return this.#snapshot(session.id, generation, call);
+        retireSpeech(call); call.context.interrupt(); return this.#snapshot(session.id, generation, call);
       case contract.DesktopVoiceConversationAction.END:
         this.#end(call); return this.#snapshot(session.id, generation);
       case contract.DesktopVoiceConversationAction.SPEAK: {
@@ -205,33 +227,46 @@ export class DesktopVoiceConversationManager {
         const previous = call.speechIds.get(id);
         if (previous && previous !== digest) throw new ConnectError('The original speech input changed.', Code.AlreadyExists);
         // A result-unknown billable request is never reissued with the same id.
-        if (previous) {
-          if (call.speechId !== id) throw new ConnectError('The original speech request ended or has an unknown outcome.', Code.FailedPrecondition);
-          return create(contract.ControlDesktopVoiceConversationResponseSchema, { accepted: true, sampleRate: 24_000 });
+        if (previous !== undefined && (call.speechId !== id || call.speechStart === undefined)) {
+          throw new ConnectError('The original speech request ended or has an unknown outcome.', Code.FailedPrecondition);
         }
-        if (call.speechIds.size >= 2000) throw unavailable();
-        this.options.store.runAuthorizedOperation(authority.connection.id, authority.connection.authKeyDigest,
-          { id, kind: 'desktop_voice_speak', body: { callId: call.id, sessionId: session.id, generation, digest } }, () => true);
-        call.speechIds.set(id, digest); call.speechId = id; call.reads.clear(); call.readIds.clear();
-        try {
-          await call.speech.start({ requestId: id, modelId: call.selection.modelId, voice: call.selection.voice, text,
+        if (previous === undefined) {
+          if (call.speechIds.size >= 2000) throw unavailable();
+          this.options.store.runAuthorizedOperation(authority.connection.id, authority.connection.authKeyDigest,
+            { id, kind: 'desktop_voice_speak', body: { callId: call.id, sessionId: session.id, generation, digest } }, () => true);
+          call.speechIds.set(id, digest); call.speechId = id; call.reads.clear(); call.readIds.clear();
+          call.speechStart = call.speech.start({ requestId: id, modelId: call.selection.modelId, voice: call.selection.voice, text,
             ...(call.selection.speed === undefined ? {} : { speed: call.selection.speed }) });
-        } catch (error) { if (call.speechId === id) call.speechId = undefined; throw error; }
-        call.assertCurrent(); return create(contract.ControlDesktopVoiceConversationResponseSchema, { accepted: true, sampleRate: 24_000 });
+        }
+        try {
+          const started = await call.speechStart!;
+          call.assertCurrent();
+          if (call.speechId !== id) throw unavailable();
+          return create(contract.ControlDesktopVoiceConversationResponseSchema, { accepted: true,
+            ...('encoding' in started ? { speechEncoding: contract.DesktopSpeechEncoding.MP3 } : { sampleRate: started.sampleRate }) });
+        } catch (error) {
+          if (call.speechId === id) retireSpeech(call);
+          throw error;
+        }
       }
       case contract.DesktopVoiceConversationAction.READ_SPEECH: {
         const speechId = identity(request.speechRequestId, 128), readId = identity(request.operationId);
         if (call.speechId !== speechId) throw unavailable();
         const previous = call.reads.get(readId);
-        if (previous) return create(contract.ControlDesktopVoiceConversationResponseSchema, { pcm: previous.pcm, speechDone: previous.done, sampleRate: 24_000 });
+        if (previous) return previous;
         if (call.speechReadId || call.readIds.has(readId) || call.readIds.size >= 20_000) throw unavailable();
         call.readIds.add(readId);
         call.speechReadId = readId;
         try {
           const result = await call.speech.read(speechId); call.assertCurrent();
-          // Only the latest PCM reply is retained for exact read retries.
-          call.reads.clear(); call.reads.set(readId, { pcm: new Uint8Array(result.pcm), done: result.done });
-          return create(contract.ControlDesktopVoiceConversationResponseSchema, { pcm: new Uint8Array(result.pcm), speechDone: result.done, sampleRate: 24_000 });
+          if (call.speechId !== speechId) throw unavailable();
+          const response = create(contract.ControlDesktopVoiceConversationResponseSchema, { speechDone: result.done,
+            ...(result.encodedSpeech === undefined ? { pcm: new Uint8Array(result.pcm), sampleRate: 24_000 } : {
+              speechEncoding: contract.DesktopSpeechEncoding.MP3, encodedSpeech: new Uint8Array(result.encodedSpeech)
+            }) });
+          // Only the latest reply is retained for an exact read retry.
+          call.reads.clear(); call.reads.set(readId, response);
+          return response;
         } finally { if (call.speechReadId === readId) call.speechReadId = undefined; }
       }
       default: throw invalid();
@@ -277,7 +312,7 @@ export class DesktopVoiceConversationManager {
   }
   #end(call: Call): void {
     if (this.#call !== call) return;
-    this.#call = undefined; call.speech.cancel(); call.context.end();
+    this.#call = undefined; retireSpeech(call); call.context.end();
     this.#save({ format: 1, sessionId: call.sessionId, generation: call.generation, kind: call.kind, record: call.context.record });
   }
   #save(saved: SavedCall): void {
@@ -287,6 +322,16 @@ export class DesktopVoiceConversationManager {
     this.options.store.setSetting('session', saved.sessionId, `${CALL_SCOPE}${saved.record.callId}`, saved);
   }
   #now(): number { return this.options.now?.() ?? Date.now(); }
+}
+function retireSpeech(call: Call): void {
+  call.speech.cancel();
+  call.speechId = undefined;
+  call.speechStart = undefined;
+  call.reads.clear();
+  call.readIds.clear();
+}
+function playbackRetirementId(owner: string, sessionId: string, generation: number, callId: string, startOperationId: string): string {
+  return 'voice-retire-' + createHash('sha256').update(JSON.stringify([owner, sessionId, generation, callId, startOperationId])).digest('hex');
 }
 function selection(value: contract.DesktopSpeechSelection | undefined): SpeechSelection {
   if (!value) throw invalid();

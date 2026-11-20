@@ -1786,29 +1786,31 @@ export class SessionHost {
     sessionId: string,
     connection: Pick<ConnectionRecord, "id" | "authKeyDigest">,
     signal: AbortSignal
-  ): Promise<void> {
+  ): Promise<boolean> {
     signal.throwIfAborted();
-    if (this.#disposed) return;
+    if (this.#disposed) return false;
     const session = this.#store.findSession(sessionId)?.descriptor;
-    if (session === undefined || session.deletedAt !== undefined || session.hidden || session.remoteWorkspace !== undefined) return;
+    if (session === undefined || session.deletedAt !== undefined || session.hidden || session.remoteWorkspace !== undefined) return false;
     const adapter = this.#adapters.get(session.backendId);
-    if (adapter?.readBoundNativeCatalogHistory === undefined || this.#store.findLatestNativeSessionChange(sessionId) !== undefined
-      || this.#store.hasNativeCatalogRolloutHistory(sessionId)) return;
+    if (adapter?.readBoundNativeCatalogHistory === undefined || this.#store.findLatestNativeSessionChange(sessionId) !== undefined) return false;
     const catalogOperationId = this.nativeCatalogAttachmentOperationId(session);
-    if (catalogOperationId === undefined) return;
+    if (catalogOperationId === undefined) return false;
     const target = this.#store.getTarget(session.targetId);
     if (isTargetDeleted(target) || !target.descriptor.trusted || target.descriptor.remoteWorkspace !== undefined
-      || target.descriptor.backendId !== session.backendId) return;
+      || target.descriptor.backendId !== session.backendId) return false;
+    // This is a cold catalog read even when the rollout cannot be projected,
+    // for example when its original inputs include an inline image.
+    if (this.#store.hasNativeCatalogRolloutHistory(sessionId)) return true;
     const adapterGeneration = this.requireAdapterGeneration(session.backendId, adapter);
     let messages: NativeSessionPreview["messages"] | undefined;
     try {
       messages = await adapter.readBoundNativeCatalogHistory({ binding: session.binding, target: target.descriptor, signal });
     } catch {
       signal.throwIfAborted();
-      return;
+      return true;
     }
     signal.throwIfAborted();
-    if (messages === undefined || messages.length === 0 || this.#disposed) return;
+    if (messages === undefined || messages.length === 0 || this.#disposed) return true;
     this.#store.transaction((store) => {
       store.authorizeConnection(connection.id, connection.authKeyDigest);
       const current = store.findSession(session.id)?.descriptor;
@@ -1822,6 +1824,7 @@ export class SessionHost {
       // resume can advance the execution generation without changing it.
       store.appendNativeCatalogRolloutHistory(current, catalogOperationId, messages);
     });
+    return true;
   }
 
   async scanNativeSessionCatalog(backendId: string, force = false): Promise<NativeSessionCatalogResult> {

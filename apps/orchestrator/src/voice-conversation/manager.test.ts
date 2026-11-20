@@ -18,7 +18,7 @@ import { createDesktopVoiceConversationService } from './connect-service.js';
 import { DesktopVoiceConversationManager } from './manager.js';
 import { SpeechModelCatalog } from './models.js';
 
-async function fixture() {
+async function fixture(speechModelId?: string) {
   const root = await mkdtemp(join(tmpdir(), 'joko-voice-call-')), store = new OperationalStore(':memory:'), connections = new ConnectionManager(store);
   const desktop = connections.issueTrustedDesktopConnection({ desktopInstanceId: randomUUID(), desktopDeviceId: randomUUID(), defaultDeviceName: 'Desktop',
     platform: process.platform, appVersion: '0.1.0', desktopHostAuthKey: 'h'.repeat(43) });
@@ -32,7 +32,7 @@ async function fixture() {
   const sessionId = (await host.createSession({ operationId: 'create-call-task', connection: desktop.connection, targetId: 'workspace', title: 'Call task',
     providerId: model.providerId, modelId: model.modelId, permissionMode: 'ask', planMode: false, fastMode: false })).value.sessionId;
   let credentialGeneration = 'original', enabled = true, speechBaseUrl = 'https://provider.test/prefix/v1';
-  const reference = { backendId: adapter.id, providerId: model.providerId, modelId: model.modelId };
+  const reference = { backendId: adapter.id, providerId: model.providerId, modelId: speechModelId ?? model.modelId };
   const routes: ModelRouteCatalog = { list: () => enabled ? [{ ...reference, credentialRoute: true, supportsImages: false }] : [],
     resolve: value => enabled && value.backendId === reference.backendId && value.providerId === reference.providerId && value.modelId === reference.modelId ? { ...reference, generationId: credentialGeneration,
       api: 'openai-completions', baseUrl: speechBaseUrl, authorization: 'Bearer private-speech-key', headers: {}, supportsImages: false } : undefined };
@@ -79,7 +79,9 @@ it.each([false, true])('reconciles saved speed against the current route and sen
       selection: snapshot.preference!.conversation, playbackOnly });
     await f.control(contract.DesktopVoiceConversationAction.SPEAK, { callId: 'route-default', speechRequestId: 'route-speech', text: 'Use the provider default.' });
     expect(String(f.fetcher.mock.calls[0]![0])).toBe('https://openrouter.ai/api/v1/audio/speech');
-    expect(JSON.parse(String(f.fetcher.mock.calls[0]![1]?.body))).not.toHaveProperty('speed');
+    const routerBody = JSON.parse(String(f.fetcher.mock.calls[0]![1]?.body));
+    expect(routerBody).toHaveProperty('response_format', 'pcm');
+    expect(routerBody).not.toHaveProperty('speed');
     await f.control(contract.DesktopVoiceConversationAction.END, { callId: 'route-default' });
     f.speechRoute('https://provider.test/prefix/v1');
     const restored = await f.control(contract.DesktopVoiceConversationAction.SNAPSHOT);
@@ -90,6 +92,54 @@ it.each([false, true])('reconciles saved speed against the current route and sen
     await f.control(contract.DesktopVoiceConversationAction.SPEAK, { callId: 'direct-speed', speechRequestId: 'direct-speech', text: 'Use the explicit direct speed.' });
     expect(JSON.parse(String(f.fetcher.mock.calls[1]![1]?.body))).toHaveProperty('speed', 2.5);
     expect(f.store.listQueueItems({ sessionId: f.base.sessionId })).toEqual([]);
+  } finally { await f.close(); }
+});
+
+it.each([false, true])('keeps the original OpenRouter MiniMax MP3 request and typed read receipts for playbackOnly=%s', async playbackOnly => {
+  const modelId = 'minimax/speech-2.8-hd';
+  const f = await fixture(modelId);
+  try {
+    f.speechRoute('https://openrouter.ai/api/');
+    const snapshot = await f.control(contract.DesktopVoiceConversationAction.SNAPSHOT);
+    expect(snapshot.models).toMatchObject([{ modelId, protocol: 'openai', protocolLocked: true }]);
+    const voice = 'male-qn-qingse';
+    const callId = 'mp3-call';
+    await f.control(contract.DesktopVoiceConversationAction.START, { callId, operationId: 'mp3-call-start', playbackOnly,
+      selection: { ...f.speech, voice } });
+
+    const pcmChunkLimit = 1_048_576;
+    const original = new Uint8Array(pcmChunkLimit + 7).fill(0xee);
+    original.set([0xff, 0xfb, 0x90, 0xc0], 0);
+    original.set([2, 13, 37, 5, 7, 11, 19], pcmChunkLimit);
+    let releaseHeaders!: (response: Response) => void;
+    f.fetcher.mockImplementationOnce(() => new Promise(resolve => { releaseHeaders = resolve; }));
+    const speechRequestId = 'original-mp3', text = 'Read these exact words.';
+    const speak = () => f.control(contract.DesktopVoiceConversationAction.SPEAK, { callId, speechRequestId, text });
+    const pending = speak();
+    await vi.waitFor(() => expect(f.fetcher).toHaveBeenCalledOnce());
+    const repeated = speak();
+    releaseHeaders(new Response(original, { headers: { 'content-type': 'audio/mpeg' } }));
+    const [opened, recovered] = await Promise.all([pending, repeated]);
+    expect(opened).toMatchObject({ accepted: true, speechEncoding: contract.DesktopSpeechEncoding.MP3, sampleRate: 0 });
+    expect(recovered).toEqual(opened);
+    expect(f.fetcher).toHaveBeenCalledOnce();
+    expect(String(f.fetcher.mock.calls[0]![0])).toBe('https://openrouter.ai/api/v1/audio/speech');
+    expect(JSON.parse(String(f.fetcher.mock.calls[0]![1]?.body))).toEqual({ model: modelId, voice, input: text, response_format: 'mp3' });
+
+    const read = (operationId: string) => f.control(contract.DesktopVoiceConversationAction.READ_SPEECH, { callId, speechRequestId, operationId });
+    const first = await read('mp3-read-first');
+    expect(first).toMatchObject({ speechEncoding: contract.DesktopSpeechEncoding.MP3, speechDone: false, sampleRate: 0 });
+    expect(first.pcm).toHaveLength(0);
+    expect(first.encodedSpeech).toHaveLength(pcmChunkLimit);
+    expect(await read('mp3-read-first')).toEqual(first);
+    const second = await read('mp3-read-second');
+    expect(Buffer.concat([first.encodedSpeech, second.encodedSpeech])).toEqual(Buffer.from(original));
+    expect(await read('mp3-read-done')).toMatchObject({ speechEncoding: contract.DesktopSpeechEncoding.MP3, speechDone: true,
+      encodedSpeech: new Uint8Array(0) });
+    await f.control(contract.DesktopVoiceConversationAction.INTERRUPT, { callId });
+    await expect(read('mp3-retired-read')).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    await expect(speak()).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    expect(f.fetcher).toHaveBeenCalledOnce();
   } finally { await f.close(); }
 });
 
@@ -157,6 +207,42 @@ it('fences competing windows, freezes exact credentials, and never repeats an un
     expect(f.fetcher).toHaveBeenCalledOnce();
     f.restart();
     expect((await f.control(contract.DesktopVoiceConversationAction.SNAPSHOT)).history[0]?.endedAtMs).toBeTypeOf('bigint');
+  } finally { await f.close(); }
+});
+
+it('rejects the first delayed speech request after its exact playback lease ends', async () => {
+  const f = await fixture();
+  const Action = contract.DesktopVoiceConversationAction;
+  try {
+    const playback = await f.start('original-playback', true);
+    expect(playback.call).toMatchObject({ callId: 'original-playback', kind: 'playback' });
+    const delayedSpeech = { callId: 'original-playback', speechRequestId: 'delayed-playback-speech', text: 'Speak only if the original lease remains current.' };
+    await f.control(Action.END, { callId: delayedSpeech.callId });
+    await f.start('replacement-playback', true);
+    await expect(f.control(Action.SPEAK, delayedSpeech)).rejects.toBeDefined();
+    expect(f.store.findOperation(delayedSpeech.speechRequestId)).toBeUndefined();
+    expect(f.fetcher).not.toHaveBeenCalled();
+    expect((await f.control(Action.SNAPSHOT)).call).toMatchObject({ callId: 'replacement-playback', kind: 'playback' });
+  } finally { await f.close(); }
+});
+
+it('accepts retirement before Start only for its exact pending playback owner', async () => {
+  const f = await fixture();
+  const Action = contract.DesktopVoiceConversationAction;
+  try {
+    const original = { callId: 'pending-read', operationId: 'original-playback-start', playbackOnly: true };
+    await f.control(Action.END, original);
+    await f.control(Action.END, original);
+    await expect(f.control(Action.START, { ...original, selection: f.speech })).rejects.toMatchObject({
+      code: Code.FailedPrecondition, message: expect.stringContaining('closed before it started')
+    });
+    expect(f.store.findOperation(original.operationId)).toBeUndefined();
+    expect((await f.control(Action.SNAPSHOT)).call).toBeUndefined();
+    expect(f.fetcher).not.toHaveBeenCalled();
+    const other = await f.control(Action.START, { ...original, windowId: 'desktop-window-two', selection: f.speech });
+    expect(other.call).toMatchObject({ callId: original.callId, kind: 'playback' });
+    await f.control(Action.END, original);
+    expect((await f.control(Action.SNAPSHOT, { windowId: 'desktop-window-two' })).call?.callId).toBe(original.callId);
   } finally { await f.close(); }
 });
 

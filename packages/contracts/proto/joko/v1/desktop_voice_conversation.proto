@@ -104,6 +104,11 @@ message ControlDesktopVoiceConversationRequest {
   string speech_request_id = 12;
   bool playback_only = 13;
 }
+enum DesktopSpeechEncoding {
+  DESKTOP_SPEECH_ENCODING_UNSPECIFIED = 0;
+  DESKTOP_SPEECH_ENCODING_MP3 = 1;
+}
+
 message ControlDesktopVoiceConversationResponse {
   DesktopVoiceConversationPreference preference = 1;
   repeated DesktopSpeechModel models = 2;
@@ -115,4 +120,8 @@ message ControlDesktopVoiceConversationResponse {
   uint32 sample_rate = 8;
   bool accepted = 9;
   string exit_decision = 10;
+  // Unspecified retains the existing 24 kHz PCM response.
+  DesktopSpeechEncoding speech_encoding = 11;
+  // One bounded byte chunk of the original encoded speech. Decode after speech_done.
+  bytes encoded_speech = 12;
 }
