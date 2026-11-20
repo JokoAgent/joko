@@ -127,11 +127,18 @@ it("carries Host-owned Session fences through a public Queue edit and fences ste
     return { ...proposed, sessionReferenceSnapshots: current.body.sessionReferenceSnapshots };
   });
   const assertInputCapabilities = vi.fn();
+  const pinLocalCodexSteer = vi.fn((
+    _sessionId: string,
+    prompt: QueueItemRecord["body"],
+    _expectedRunId: string | undefined,
+    _allowManualPause: boolean
+  ) => prompt);
   const sessionHost = {
     getSessionRuntimeControl: () => ({ effective: undefined }),
     recordUserSessionRuntimeSelection: () => 0,
     canonicalQueueItemEdit,
     assertInputCapabilities,
+    pinLocalCodexSteer,
     mutate: async (input: {
       readonly operationId: string;
       readonly kind: string;
@@ -199,6 +206,10 @@ it("carries Host-owned Session fences through a public Queue edit and fences ste
 
   expect(response.operation?.state).toBe(contract.OperationState.SUCCEEDED);
   expect(canonicalQueueItemEdit).toHaveBeenCalledOnce();
+  expect(pinLocalCodexSteer).toHaveBeenCalledExactlyOnceWith(durable.sessionId, expect.objectContaining({
+    disposition: "steer",
+    sessionReferenceSnapshots: [sessionReferenceSnapshot]
+  }), undefined, true);
   expect(assertInputCapabilities).toHaveBeenCalledWith(durable.sessionId, expect.objectContaining({
     text: "Review @Same",
     disposition: "steer",
