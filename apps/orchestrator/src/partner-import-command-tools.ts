@@ -7,8 +7,8 @@ import type { PartnerImportController, PartnerImportManager, PartnerImportReview
 import type { PartnerManager } from "./partner-manager.js";
 import type { SessionHost } from "./session-host.js";
 
-const providerId = "joko_partner_import";
-const toolName = "import_agent";
+export const PARTNER_IMPORT_COMMAND_SERVER = "joko_partner_import";
+export const PARTNER_IMPORT_COMMAND_TOOL = "import_agent";
 const pageSize = 20;
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/u;
 const localBackends = new Set(["pi", "codex", "claude-agent-sdk-stdio"]);
@@ -22,11 +22,11 @@ interface ImportCommandScope extends PartnerImportController {
 
 /** Exposes the same local import transaction to the original task's Owner. */
 export class PartnerImportCommandTools implements BridgeToolProvider {
-  readonly id = providerId;
+  readonly id = PARTNER_IMPORT_COMMAND_SERVER;
   readonly generation = 1;
   readonly available = true;
   readonly tools: readonly McpToolDescriptor[] = [{
-    name: toolName, serverId: providerId,
+    name: PARTNER_IMPORT_COMMAND_TOOL, serverId: PARTNER_IMPORT_COMMAND_SERVER,
     description: "Import a local Hermes or OpenClaw agent as a Partner. List sources, preview selectable entries and request approval from the Owner for the exact selection. Preview returns a requestId for start and status. After a lost reply, check the same requestId. Source credentials stay on the host.",
     // Start obtains the exact selection approval inside this tool on all Backends.
     requiresPermission: false,
@@ -115,14 +115,15 @@ export class PartnerImportCommandTools implements BridgeToolProvider {
     };
     assertCurrent();
     // A receipt stays with the same Connection and task across transport loss. A preview also belongs to its binding.
-    const key = createHmac("sha256", connection.authKeyDigest).update(JSON.stringify([providerId, connection.id, context.sessionId])).digest("hex").slice(0, 32);
+    const key = createHmac("sha256", connection.authKeyDigest)
+      .update(JSON.stringify([PARTNER_IMPORT_COMMAND_SERVER, connection.id, context.sessionId])).digest("hex").slice(0, 32);
     return { ownerKey: `${key}:${context.generation}`, receiptPrefix: `import_${key}_`, queueId: original.id, connectionId: connection.id,
       generation: context.generation, assertCurrent };
   }
 
   async callTool(name: string, input: Readonly<Record<string, unknown>>, signal: AbortSignal | undefined, context: BridgeToolCallContext): Promise<BridgeToolCallResult> {
     try {
-      if (name !== toolName) throw new AgentImportError("INVALID_SELECTION");
+      if (name !== PARTNER_IMPORT_COMMAND_TOOL) throw new AgentImportError("INVALID_SELECTION");
       const scope = this.#scope(context, input.operation === "start", signal);
       const { imports } = this.options;
       const success = (value: unknown) => {

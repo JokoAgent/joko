@@ -6,6 +6,7 @@ import { CreateTaskResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
 import type { McpRouter } from "./mcp-router.js";
 import { createMcpModelProxy } from "./mcp-apps/server-proxy.js";
+import { PARTNER_IMPORT_COMMAND_SERVER, PARTNER_IMPORT_COMMAND_TOOL } from "./partner-import-command-tools.js";
 
 const GRANT_TTL_MS = 60_000;
 
@@ -64,7 +65,9 @@ export function createClaudeMcpBridge(options: {
           description: tool.description,
           inputSchema: tool.inputSchema,
           ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
-          ...(tool.requiresNativeRoot ? { requiresNativeRoot: true as const } : {})
+          ...(tool.requiresNativeRoot ? { requiresNativeRoot: true as const } : {}),
+          ...(!tool.requiresPermission && tool.serverId === PARTNER_IMPORT_COMMAND_SERVER && tool.name === PARTNER_IMPORT_COMMAND_TOOL
+            ? { approvalInHost: true as const } : {})
         })),
         models: snapshot.modelServerIds.map(serverId => ({ serverId, connect: async (transport, callNative) => {
           assertCurrent();

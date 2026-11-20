@@ -10,6 +10,7 @@ export interface ClaudeMcpTool {
   readonly inputSchema: Readonly<Record<string, unknown>>;
   readonly outputSchema?: Readonly<Record<string, unknown>>;
   readonly requiresNativeRoot?: true;
+  readonly approvalInHost?: true;
 }
 
 export interface ClaudeMcpCallResult {

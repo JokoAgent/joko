@@ -4,16 +4,21 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, sep } from "node:path";
 import { Code } from "@connectrpc/connect";
+import { create } from "@bufbuild/protobuf";
 import { afterEach, expect, it, vi } from "vitest";
 import { createPartnerImportApi, importSelectionInput, PartnerImportCategory, PartnerImportCheckStatus, PartnerImportStatus, PartnerInitializationErrorCode,
-  PartnerInitializationState, OperationState, PermissionDecisionKind, PermissionMode, RoutineRunStatus } from "@joko/contracts";
+  PartnerInitializationState, OperationMutationSchema, OperationState, PermissionDecisionKind, PermissionMode,
+  ProviderApiCompatibility, ProviderConfigurationSchema, ProviderKind, RoutineRunStatus } from "@joko/contracts";
 import { RealPiSystemFixture, REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID } from "./real-pi-fixture.js";
 import { waitFor } from "./fixture.js";
-import { createSessionMutation, queueRunIdFrom, resolvePermissionMutation, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
+import { createSessionMutation, queueItemIdFrom, queueRunIdFrom, resolvePermissionMutation, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 import { installLocalSkill } from "./skill-system-fixture.js";
 
 let fixture: RealPiSystemFixture | undefined;
-afterEach(async () => { await fixture?.close({ removeRoot: true }); fixture = undefined; });
+afterEach(async () => {
+  try { await fixture?.close({ removeRoot: true }); }
+  finally { fixture = undefined; vi.unstubAllEnvs(); }
+});
 
 const verifiedCodex = process.env.GITHUB_ACTIONS === "true" ? process.env.JOKO_CODEX_HOSTED_TEST_BINARY : undefined;
 const claudeFixtureModel = "claude-sonnet-4-6";
@@ -38,7 +43,13 @@ async function exerciseAgentImport(backendId: "pi" | "claude-code" | "codex"): P
   await writeFile(join(source, "memories", "notes.md"), "UNSELECTED_MEMORY_MARKER");
   const claude = backendId === "claude-code";
   const codex = backendId === "codex";
+  if (claude || codex) {
+    const profile = join(root, claude ? "claude-config" : "codex-home");
+    await mkdir(profile);
+    vi.stubEnv(claude ? "CLAUDE_CONFIG_DIR" : "CODEX_HOME", profile);
+  }
   const modelId = claude ? claudeFixtureModel : REAL_PI_MODEL_ID;
+  const providerId = backendId === "pi" ? REAL_PI_PROVIDER_ID : "fixture-native-import";
   const serverId = "joko_partner_import";
   const mcpName = claude ? `joko_${createHash("sha256").update(serverId).digest("hex").slice(0, 24)}` : serverId;
   const toolName = `mcp__${mcpName}__import_agent`;
@@ -74,36 +85,39 @@ async function exerciseAgentImport(backendId: "pi" | "claude-code" | "codex"): P
       toolArguments = undefined;
       return { kind: "tool", name: requestedToolName, arguments: args };
     } });
-  const { store, providers, refreshBackendDescriptor } = fixture.application;
-  if (backendId !== "pi") {
-    const provider = providers!.resolveInferenceRoute("pi", REAL_PI_PROVIDER_ID, REAL_PI_MODEL_ID);
-    expect(provider?.baseUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+(?:\/v1)?$/u);
-    await providers!.upsert({
-      backendId, credentialOrigin: "",
-      provider: { id: REAL_PI_PROVIDER_ID, baseUrl: provider!.baseUrl, api: claude ? "anthropic-messages" : "openai-completions", keyless: true,
-        models: [{ id: modelId, name: "Local import fixture model", contextWindow: 64_000, maxTokens: 4_096 }] },
-      displayName: "Local import fixture", kind: "local_keyless", credentialBindings: {},
-      enabled: true, supportsLogin: false, supportsLogout: false, supportsRefresh: false
-    });
-    await refreshBackendDescriptor(backendId);
-    expect(providers!.resolveInferenceRoute(backendId, REAL_PI_PROVIDER_ID, modelId)).toMatchObject({
-      modelId, api: claude ? "anthropic-messages" : "openai-completions", baseUrl: provider!.baseUrl
-    });
-  }
+  const { store, providers } = fixture.application;
   const owner = await fixture.pair("Original import Owner");
   const other = await fixture.pair("Other paired controller");
   const { clients, connectionId } = owner;
+  if (backendId !== "pi") {
+    const provider = providers!.resolveInferenceRoute("pi", REAL_PI_PROVIDER_ID, REAL_PI_MODEL_ID);
+    expect(provider?.baseUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+(?:\/v1)?$/u);
+    const configuration = create(ProviderConfigurationSchema, {
+      providerId, version: { revision: { value: 0n } }, displayName: "Local import fixture", kind: ProviderKind.LOCAL_KEYLESS, enabled: true,
+      runtimes: [{ backendId, endpoint: provider!.baseUrl, keyless: true,
+        apiCompatibility: claude ? ProviderApiCompatibility.ANTHROPIC_MESSAGES : ProviderApiCompatibility.OPENAI_COMPLETIONS,
+        models: [{ modelId, displayName: "Local import fixture model",
+          ...(claude ? { contextWindowTokens: 64_000n, maximumOutputTokens: 4_096n } : {}) }] }]
+    });
+    const configured = await submit(clients.operation, connectionId, create(OperationMutationSchema, {
+      payload: { case: "upsertProvider", value: { provider: configuration } }
+    }));
+    expect(configured.state, configured.error?.message).toBe(OperationState.SUCCEEDED);
+    expect(providers!.resolveInferenceRoute(backendId, providerId, modelId)).toMatchObject({
+      modelId, api: claude ? "anthropic-messages" : "openai-completions", baseUrl: provider!.baseUrl
+    });
+  }
   const directory = (await clients.partner.getPartnerDirectory({})).directory!;
   await clients.partner.updatePartnerDefaults({ expectedDirectoryRevision: directory.revision, capabilities: {
     modelChain: [{ backendId: "pi", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, fastMode: false }],
-    permissionMode: PermissionMode.BYPASS_PERMISSIONS, planMode: false
+    permissionMode: PermissionMode.ASK, planMode: false
   } });
   const targetId = backendId === "pi" ? "workspace-real-pi" : "workspace-real-pi:" + backendId;
   const target = store.getTarget(targetId);
   store.upsertTarget({ ...target.descriptor, trusted: true }, target.metadata);
   const createTask = async () => {
     const created = await submit(clients.operation, connectionId, createSessionMutation({ targetId, backendId,
-      providerId: REAL_PI_PROVIDER_ID, modelId, permissionMode: PermissionMode.BYPASS_PERMISSIONS,
+      providerId, modelId, permissionMode: backendId === "pi" ? PermissionMode.BYPASS_PERMISSIONS : PermissionMode.ASK,
       // The selected managed Claude and Codex models advertise no reasoning levels.
       effortId: backendId === "pi" ? "off" : "" }));
     expect(created.state, JSON.stringify({ backendId, modelId, error: created.error?.code,
@@ -115,16 +129,46 @@ async function exerciseAgentImport(backendId: "pi" | "claude-code" | "codex"): P
   const invoke = async (args: Readonly<Record<string, unknown>>, taskId = sessionId) => {
     toolArguments = args;
     searchedForCodexTool = false;
+    const providerStart = fixture!.providerRequests.length;
     const generation = BigInt(store.getSession(taskId).descriptor.binding.generation);
     const accepted = await submit(clients.operation, connectionId, sendInputMutation(taskId, generation, `Use the local import tool to ${args.operation}.`));
     const runId = queueRunIdFrom(accepted);
     const result = async () => {
-      const read = () => store.getRun(runId).descriptor.state;
-      expect(await waitFor(async () => read(), state => state === "completed" || state === "failed", "the original import tool turn", 25_000)).toBe("completed");
+      const read = async () => store.getRun(runId).descriptor;
+      const diagnostics = () => {
+        const run = store.getRun(runId).descriptor;
+        const queue = store.getQueueItem(queueItemIdFrom(accepted));
+        return JSON.stringify({ backendId, runState: run.state, runError: run.error?.code, queueState: queue.state,
+          queueError: queue.error?.code, queueErrorPhase: queue.error?.phase, stateMayHaveChanged: queue.error?.stateMayHaveChanged,
+          dispatchRecorded: queue.dispatchedAt !== undefined, backendAccepted: queue.backendAcceptedAt !== undefined,
+          attempts: store.listAttempts(runId).map(({ descriptor }) => ({ generation: descriptor.generation,
+            ended: descriptor.endedAt !== undefined, error: descriptor.error?.code, phase: descriptor.error?.phase })),
+          interactions: store.listInteractions({ sessionId: taskId, runId, status: "open" }).map(({ payload }) => ({
+            kind: payload.kind,
+            ...(payload.kind === "permission" ? { title: payload.title, tool: payload.toolName } : {})
+          })),
+          events: store.listEvents({ sessionId: taskId }).filter(item => item.runId === runId).map(item => item.payload.type),
+          provider: fixture!.providerRequests.slice(providerStart).map(({ body, url }) => {
+            const tools = Array.isArray(body["tools"]) ? body["tools"] as readonly { name?: string; function?: { name?: string } }[] : [];
+            const names = tools.map(tool => tool.function?.name ?? tool.name);
+            return { path: url.split("?")[0], tools: tools.length, namespaced: tools.some(tool => tool.function !== undefined),
+              exposesImport: names.some(name => name?.endsWith("__import_agent")), exposesToolSearch: names.includes("tool_search"),
+              messageCount: Array.isArray(body["messages"]) ? body["messages"].length : undefined,
+              inputCount: Array.isArray(body["input"]) ? body["input"].length : undefined };
+          }) });
+      };
+      const terminal = await waitFor(read, ({ state }) => state === "completed" || state === "failed" || state === "dispatch_unknown",
+        "the original import tool turn", 25_000).catch(error => {
+        throw new Error(`The native import turn did not settle. ${diagnostics()}`, { cause: error });
+      });
+      if (terminal.state !== "completed") throw new Error(`The native import turn did not complete. ${diagnostics()}`);
       const event = store.listEvents({ sessionId: taskId }).find(item => item.runId === runId && item.payload.type === "tool_result"
         && (codex ? /^joko_[^/]+\/import_agent$/u.test(item.payload.name) : item.payload.name === toolName));
-      if (event?.payload.type !== "tool_result") throw new Error(`${backendId} did not receive the import tool result from its native turn.`);
+      if (event?.payload.type !== "tool_result") throw new Error(`The native import result is absent. ${diagnostics()}`);
       if (codex) {
+        if (event.payload.isError && !event.payload.output.startsWith("{")) {
+          return event.payload;
+        }
         const response = JSON.parse(event.payload.output) as { content?: readonly { type: string; text?: string }[] };
         const output = response.content?.find(part => part.type === "text")?.text;
         if (output === undefined) throw new Error("Codex did not return the original MCP text result.");
@@ -183,7 +227,18 @@ async function exerciseAgentImport(backendId: "pi" | "claude-code" | "codex"): P
   expect((await approved.answer(owner, PermissionDecisionKind.ALLOW_ONCE)).state).toBe(OperationState.SUCCEEDED);
   expect(await approved.result()).toMatchObject({ isError: false });
   const read = () => clients.partnerImport.getPartnerImportStatus({ requestId: preview.requestId });
-  const saved = (await waitFor(read, value => value.result?.status === PartnerImportStatus.COMPLETE, "the same durable import receipt", 30_000)).result!;
+  const saved = (await waitFor(read, value => value.result !== undefined && value.result.status !== PartnerImportStatus.RUNNING,
+    "the same durable import receipt", 30_000)).result!;
+  const imported = fixture.application.partners?.listPartners().find(profile => profile.id === saved.partnerId);
+  const canonicalFailures = store.listOperations({ status: "failed", limit: 100 })
+    .filter(operation => operation.id.startsWith(`partner-session:${saved.partnerId}:`))
+    .map(operation => {
+      const error = operation.error as { code?: unknown; phase?: unknown } | undefined;
+      return { code: error?.code, phase: error?.phase };
+    });
+  expect(saved.status, JSON.stringify({ checks: saved.checks.map(check => check.message),
+    phase: imported?.initializationState, error: imported?.initializationErrorCode, canonicalFailures,
+    hasNativeTask: imported?.canonicalSessionId !== undefined })).toBe(PartnerImportStatus.COMPLETE);
   expect(saved).toMatchObject({ saved: true, savedEntryIds: [identity.id] });
   expect((await clients.partner.getPartner({ partnerId: saved.partnerId })).partner).toMatchObject({ displayName: selection.name });
 

@@ -2730,15 +2730,28 @@ export async function createOrchestratorApplication(
     return true;
   };
   const refreshBackendDescriptor = async (backendId: string): Promise<void> => {
-    if (await applyDesiredSubagentSmartRouting(backendId)) return;
-    await runBackendLifecycle(async () => {
-      await backendInstances.refresh(backendId);
-    });
-    // External account changes are first observed by Adapter.describe() during
-    // the refresh above. Reinspect afterwards so a login/logout that changes
-    // the native Sol/Terra catalog cannot leave the current smart generation
-    // running with the catalog prepared for the previous account state.
-    await applyDesiredSubagentSmartRouting(backendId);
+    try {
+      if (await applyDesiredSubagentSmartRouting(backendId)) return;
+      await runBackendLifecycle(async () => {
+        await backendInstances.refresh(backendId);
+      });
+      // A native account change discovered in describe() can change the smart routing catalog.
+      await applyDesiredSubagentSmartRouting(backendId);
+    } finally {
+      // Managed Provider writes across Backends advance the same persisted
+      // credential generation that a new Pi runtime must prove at startup.
+      const pi = backendInstances.adapter(piBackendId);
+      if (!closed && backendId !== piBackendId && pi instanceof PiBackendAdapter
+        && pi.providerCatalogGeneration !== providers.generation) {
+        try { await refreshPiGenerationImpl(); }
+        catch {
+          if (!closed) store.appendDiagnostic({ severity: "warning", component: "provider",
+            code: "PI_PROVIDER_CATALOG_REFRESH_FAILED",
+            message: "The current Pi runtime could not adopt the saved Provider catalog.",
+            details: { backendId } });
+        }
+      }
+    }
   };
   const projectBackendProviderAuthentication = (
     backendId: string,
