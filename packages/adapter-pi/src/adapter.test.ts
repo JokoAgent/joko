@@ -866,6 +866,59 @@ describe("PiBackendAdapter", () => {
     expect(validateRemoteWorkspace).toHaveBeenCalledTimes(1);
     await adapter.dispose();
   });
+  it("stages only selected Skills and their assets for an explicit paired Partner Home", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-pi-peer-partner-skills-"));
+    const workspace = join(directory, "workspace");
+    const allowed = join(directory, "allowed"), ambient = join(directory, "ambient");
+    await Promise.all([mkdir(workspace), mkdir(allowed), mkdir(ambient)]);
+    const sourceText = "---\nname: allowed\ndescription: Selected partner resource\n---\nUse its original relative asset.\n";
+    const asset = "The selected resource's intact asset.";
+    await Promise.all([writeFile(join(allowed, "SKILL.md"), sourceText), writeFile(join(allowed, "asset.txt"), asset),
+      writeFile(join(ambient, "SKILL.md"), "---\nname: ambient\ndescription: Unselected global resource\n---\nKeep this on its original node.\n")]);
+    const revision = `sha256:${createHash("sha256").update(`D\0\0F\0asset.txt\0${Buffer.byteLength(asset)}\0`).update(asset)
+      .update(`F\0SKILL.md\0${Buffer.byteLength(sourceText)}\0`).update(sourceText).digest("hex")}`;
+    let policyCurrent = true;
+    const launches: Array<{ readonly spec: PiProcessSpec; readonly mounts: readonly string[] }> = [];
+    const adapter = createPiAdapter({ agentHome: join(directory, "agent"), sessionRoot: join(directory, "sessions"),
+      versionProbe: async () => "pi 99.99.99-peer-partner-test", validateRemoteWorkspace: async () => undefined,
+      includeManagedSubagentTools: () => false,
+      managedResources: { extensions: [], skills: [ambient], prompts: [], packages: [],
+        resources: [{ id: "unselected", name: "ambient", kind: "skill", state: "approved", source: "managed", runtimePath: ambient }] },
+      resolveNativeSkillPolicy: ({ target }) => target.id === "partner" ? { mode: "explicit", assertCurrent: () => {
+        if (!policyCurrent) throw new Error("Original Partner Skill selection retired.");
+      } } : undefined,
+      resolveNativeSkills: async () => [{ sourcePath: allowed, resource: { id: "selected", name: "allowed", kind: "skill", state: "approved",
+        source: "managed", revision, resourceVersion: 1n }, assertCurrent: () => undefined }],
+      processFactory: async spec => {
+        spec.assertStartupCurrent?.();
+        const paths = spec.args.flatMap((value, index) => value === "--skill" ? [spec.args[index + 1]!] : []);
+        const mounts = await Promise.all(paths.map(path => readFile(join(path, "SKILL.md"), "utf8")));
+        if (mounts.includes(sourceText)) await expect(readFile(join(paths[0]!, "asset.txt"), "utf8")).resolves.toBe(asset);
+        launches.push({ spec, mounts });
+        return new ScriptedPiProcess(spec) as unknown as PiProcessHandle;
+      }
+    });
+    const partner: TargetDescriptor = { id: "partner", backendId: "pi", displayName: "Paired Partner", workspaceRoot: workspace,
+      trusted: true, managed: true, remoteWorkspace: { kind: "device_peer", controllerDeviceId: "controller", targetDeviceId: "peer",
+        workspaceRoot: "/home/agent/partner" } };
+    try {
+      const context = makeContext(partner, []);
+      const binding = await adapter.createSession({ target: partner, fastMode: false, permissionMode: "ask" }, context);
+      expect(launches[0]?.mounts).toEqual([sourceText]);
+      expect(launches[0]?.spec.args).toContain("--no-skills");
+      expect(launches[0]?.spec.assertStartupCurrent).toBeTypeOf("function");
+      policyCurrent = false;
+      expect(() => launches[0]!.spec.assertStartupCurrent!()).toThrow("Original Partner Skill selection retired.");
+      policyCurrent = true;
+      await adapter.closeSession(binding, { ...context, binding });
+
+      const ordinary = { ...partner, id: "ordinary" };
+      const ordinaryContext = { ...makeContext(ordinary, []), sessionId: "ordinary-peer-session" };
+      const ordinaryBinding = await adapter.createSession({ target: ordinary, fastMode: false, permissionMode: "ask" }, ordinaryContext);
+      expect(launches[1]?.mounts).toEqual([expect.stringContaining("Keep this on its original node.")]);
+      await adapter.closeSession(ordinaryBinding, { ...ordinaryContext, binding: ordinaryBinding });
+    } finally { policyCurrent = true; await adapter.dispose(); await rm(directory, { recursive: true, force: true }); }
+  });
   it("rejects start navigation without an active owner and structured workspace references without spawning a runtime", async () => {
     const directory = await mkdtemp(join(tmpdir(), "joko-pi-start-boundary-"));
     const processFactory = vi.fn((): PiProcessHandle => { throw new Error("No native runtime should start"); });
