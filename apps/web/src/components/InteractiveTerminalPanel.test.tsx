@@ -188,6 +188,19 @@ it("waits for the live appearance acknowledgement, replays current overrides aft
   await act(async () => terminal.input("\x1b[O"));
   expect(api.writeTerminal).toHaveBeenCalledTimes(2);
   terminal.modes.sendFocusMode = false;
+  await act(async () => watches[0]!.update({ kind: "output", sequence: 3n, appearanceRevision: 100n, data: "" }));
+  let confirmFocus!: () => void;
+  updateAppearance.mockImplementationOnce(async (_session, _id, _generation, appearance, _claim, expected) => new Promise((resolve) => {
+    confirmFocus = () => resolve({ accepted: true, acceptedViewRevision: appearance.viewRevision, appearanceRevision: expected + 1n, ownsDefaults: true });
+  }));
+  await act(async () => terminal.focus());
+  expect(updateAppearance).toHaveBeenLastCalledWith("session-one", "terminal-one", 1n, expect.anything(), true, 100n, expect.any(AbortSignal));
+  expect(terminal.options.disableStdin).toBe(false);
+  await act(async () => terminal.input("x"));
+  expect(api.writeTerminal).toHaveBeenCalledTimes(2);
+  await act(async () => confirmFocus());
+  expect(api.writeTerminal).toHaveBeenCalledTimes(3);
+  expect(api.writeTerminal).toHaveBeenLastCalledWith("session-one", "terminal-one", 1n, watches[0]!.appearance.viewId, 3n, "x", expect.any(AbortSignal));
   let rejectOld!: (reason: Error) => void;
   updateAppearance.mockImplementationOnce(async () => new Promise((_, reject) => { rejectOld = reject; }));
   color = "#abcdef";

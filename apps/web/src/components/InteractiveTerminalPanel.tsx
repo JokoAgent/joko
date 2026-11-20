@@ -316,7 +316,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
       let viewRevision = 1n;
       let appearanceRevision = 0n;
       let appearanceChain = Promise.resolve();
-      let appearancePending = 0;
+      let backgroundAppearancePending = 0;
       let appearanceFailed = false;
       let confirmed: { readonly revision: bigint; readonly palette: string; readonly ownsDefaults: boolean } | undefined;
       const viewId = randomUuid();
@@ -333,8 +333,11 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
         if (cursorRef.current?.generation !== value.generation) cursorRef.current = undefined;
         const synchronize = (claim: boolean): Promise<void> => {
           const claimSignal = claim ? AbortSignal.any([signal, focusLifetime.signal]) : signal;
-          appearancePending += 1;
-          if (current() && registered) terminal.options.disableStdin = true;
+          // Input waits for the focus claim in onData, so the emulator can keep receiving keystrokes.
+          if (!claim) {
+            backgroundAppearancePending += 1;
+            if (current() && registered) terminal.options.disableStdin = true;
+          }
           const task = appearanceChain.then(async () => {
             if (!current() || !registered || claimSignal.aborted) throw new DOMException("Terminal view retired.", "AbortError");
             if (latest.current.capabilities.support === "disabledByPolicy") throw new DOMException("Terminal view is read-only.", "AbortError");
@@ -371,8 +374,8 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
             terminal.options.disableStdin = true;
             setError(failure instanceof Error ? failure.message : latest.current.t("terminal.disconnected"));
           }).finally(() => {
-            appearancePending -= 1;
-            if (current() && registered && !appearanceFailed && appearancePending === 0 && descriptorRef.current?.status === "running" && !writerRef.current.blocked && latest.current.capabilities.support !== "disabledByPolicy") terminal.options.disableStdin = false;
+            if (!claim) backgroundAppearancePending -= 1;
+            if (current() && registered && connectionRef.current === "ready" && !appearanceFailed && backgroundAppearancePending === 0 && descriptorRef.current?.status === "running" && !writerRef.current.blocked && latest.current.capabilities.support !== "disabledByPolicy") terminal.options.disableStdin = false;
           });
           return task;
         };
@@ -416,7 +419,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
           failures = 0;
           setConnection("ready");
           connectionRef.current = "ready";
-          terminal.options.disableStdin = descriptorRef.current?.status !== "running" || writerRef.current.blocked || appearanceFailed || appearancePending > 0 || latest.current.capabilities.support === "disabledByPolicy";
+          terminal.options.disableStdin = descriptorRef.current?.status !== "running" || writerRef.current.blocked || appearanceFailed || backgroundAppearancePending > 0 || latest.current.capabilities.support === "disabledByPolicy";
           if (!writerRef.current.blocked && !appearanceFailed) setError(undefined);
           fitRef.current();
           restoreRequestedFocus();
