@@ -534,6 +534,9 @@ export function createTaskSharingHomeRemote(origin: string, endpointPublicKey: s
   } };
 }
 function digest(value: string | Uint8Array): string { return createHash("sha256").update(value).digest("hex"); }
-function safeCode(error: unknown): string { return error instanceof ConnectError ? Code[error.code].toUpperCase() : "UNAVAILABLE"; }
+function safeCode(error: unknown): string {
+  const code = error instanceof ConnectError ? Code[error.code] : undefined;
+  return code?.replace(/([a-z])([A-Z])/g, "$1_$2").toUpperCase() ?? "UNAVAILABLE";
+}
 function unavailable(): ConnectError { return new ConnectError("The shared task is temporarily unavailable. Check the original receipt before retrying.", Code.Unavailable); }
 function isMissing(error: unknown): boolean { return error instanceof Error && "code" in error && error.code === "ENOENT"; }
