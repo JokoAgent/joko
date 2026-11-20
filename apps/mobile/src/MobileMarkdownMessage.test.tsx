@@ -432,4 +432,34 @@ describe("native message Markdown", () => {
     expect(container.textContent).toContain("Source copied.");
     await act(async () => { root.unmount(); });
   });
+
+  it.each(["settled", "late"] as const)("retires the %s copy receipt when the same streaming code block changes", async (timing) => {
+    const container = document.createElement("div"), root = createRoot(container);
+    const colors = { surface: "#fff", background: "#fafafa", ink: "#111", muted: "#666", border: "#ccc", accent: "#f90", negative: "#c33" };
+    const original = "const started = 1;", updated = original + "\nconst continued = 2;";
+    const render = (source: string, suffix = "") => act(async () => root.render(<MobileMarkdownMessage
+      text={"```ts\n" + source + "\n```" + suffix} colors={colors} locale="en" ownerKey="same-streaming-message" streaming />));
+    const button = () => container.querySelector<HTMLButtonElement>('button[aria-label="Copy source"]')!;
+    const copied = () => container.textContent?.includes("Source copied.");
+    let finish: (() => void) | undefined;
+    copy.mockClear();
+    if (timing === "late") copy.mockImplementationOnce(() => new Promise(resolve => { finish = () => resolve(undefined); }));
+    try {
+      await render(original);
+      await act(async () => button().click());
+      expect(copy).toHaveBeenNthCalledWith(1, original);
+      expect(copied()).toBe(timing === "settled");
+      await render(original, "\n\nUnrelated continuation.");
+      expect(copied()).toBe(timing === "settled");
+      await render(updated);
+      await act(async () => finish?.());
+      expect(copied()).toBe(false);
+      await act(async () => button().click());
+      expect(copy).toHaveBeenNthCalledWith(2, updated);
+      expect(copied()).toBe(true);
+    } finally {
+      finish?.();
+      await act(async () => root.unmount());
+    }
+  });
 });

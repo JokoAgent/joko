@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useMobileMailLink } from "./MobileExtensionMailReader";
 import { AppState, Linking, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, View, useWindowDimensions } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
@@ -55,6 +55,13 @@ interface Props {
   readonly onAnnotateDiagram?: (image: MobileImageOutputSource) => void;
 }
 
+interface MarkdownCopySource {
+  readonly ownerKey: string;
+  readonly key: string;
+  readonly type: "code" | "math" | "mermaid";
+  readonly text: string;
+}
+
 export const MobileMarkdownMessage = memo(function MobileMarkdownMessage(props: Props) {
   const { messageId, resourceClient, resourceOwnerKey, onRetryPath } = props;
   const resourceText = props.resourceText ?? props.text;
@@ -97,7 +104,18 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
   const groups = useMemo(() => groupMobileMarkdownSelectableBlocks(parsed.blocks, {
     maxTextRunBlocks: 48, maxTextRunUtf16Length: 12_000, maxTextRunInlineFragments: 512, rendersInlineImage
   }), [parsed, rendersInlineImage]);
-  const [notice, setNotice] = useState("");
+  const [notice, setNotice] = useState<string | { readonly source: MarkdownCopySource; readonly copied: boolean }>("");
+  const committedCopySources = useRef(new Map<string, MarkdownCopySource>());
+  const copySources = new Map<string, MarkdownCopySource>();
+  for (const block of parsed.blocks) {
+    if (block.type !== "code" && block.type !== "math" && block.type !== "mermaid") continue;
+    const source = committedCopySources.current.get(block.key);
+    copySources.set(block.key, source?.ownerKey === ownerKey && source.type === block.type && source.text === block.text
+      ? source : { ownerKey, key: block.key, type: block.type, text: block.text });
+  }
+  useLayoutEffect(() => { committedCopySources.current = copySources; });
+  const noticeText = typeof notice === "string" ? notice : copySources.get(notice.source.key) === notice.source
+    ? mobileMessage(locale, notice.copied ? "markdown.copied" : "markdown.copyFailed") : "";
   const [copying, setCopying] = useState(false);
   const [expanded, setExpanded] = useState<Extract<MobileMarkdownBlock, { type: "math" | "mermaid" }>>();
   const [viewDiagramSource, setViewDiagramSource] = useState(false);
@@ -132,16 +150,16 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
     const frame = requestAnimationFrame(deliverDiagram);
     return () => cancelAnimationFrame(frame);
   }, [expanded, deliverDiagram]);
-  const copy = async (source: string): Promise<void> => {
-    if (copyPending.current || AppState.currentState !== "active") return;
-    const owner = ownerKey;
+  const copy = async (source: MarkdownCopySource): Promise<void> => {
+    const current = (): boolean => mounted.current && committedCopySources.current.get(source.key) === source;
+    if (!current() || copyPending.current || AppState.currentState !== "active") return;
     copyPending.current = true;
     setCopying(true);
     try {
-      await setStringAsync(source);
-      if (mounted.current && currentOwner.current === owner) setNotice(mobileMessage(locale, "markdown.copied"));
+      await setStringAsync(source.text);
+      if (current()) setNotice({ source, copied: true });
     } catch {
-      if (mounted.current && currentOwner.current === owner) setNotice(mobileMessage(locale, "markdown.copyFailed"));
+      if (current()) setNotice({ source, copied: false });
     } finally {
       copyPending.current = false;
       if (mounted.current) setCopying(false);
@@ -183,7 +201,7 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
         inline.type === "image" && { color: colors.muted }
       ]}>{value}</Text>;
   });
-  const toolbar = (source: string, kind: string, onExpand?: () => void) => <View style={styles.toolbar}>
+  const toolbar = (source: MarkdownCopySource, kind: string, onExpand?: () => void) => <View style={styles.toolbar}>
     <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{kind}</Text>
     {onExpand && <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "markdown.expand")}
       onPress={onExpand} style={styles.action}><Text style={{ color: colors.accent }}>{mobileMessage(locale, "markdown.expand")}</Text></Pressable>}
@@ -196,7 +214,7 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
     if (value.type === "code") {
       const runs = mobileCodeHighlight(value.text, value.language);
       return <View key={value.key} style={[styles.frame, { borderColor: colors.border, backgroundColor: colors.background }]}>
-        {toolbar(value.text, value.language ?? mobileMessage(locale, "markdown.code"))}
+        {toolbar(copySources.get(value.key)!, value.language ?? mobileMessage(locale, "markdown.code"))}
         <ScrollView horizontal nestedScrollEnabled contentContainerStyle={styles.codeContent}>
           <Text selectable={selectable} style={[styles.code, { color: colors.ink }]}>
             {runs.map((run, index) => <Text key={index} style={run.kind ? {
@@ -209,7 +227,7 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
     }
     if (value.type === "math" || value.type === "mermaid") return <View key={value.key}
       style={[styles.frame, { borderColor: colors.border, backgroundColor: colors.surface }]}>
-      {toolbar(value.text, mobileMessage(locale, value.type === "math" ? "markdown.math" : "markdown.diagram"), () => {
+      {toolbar(copySources.get(value.key)!, mobileMessage(locale, value.type === "math" ? "markdown.math" : "markdown.diagram"), () => {
         diagramScope.current?.abort();
         diagramScope.current = value.type === "mermaid" ? new AbortController() : undefined;
         setViewDiagramSource(false);
@@ -260,7 +278,7 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
         </Text>
       </Text>)}
     </Text>)}
-    {notice && <Text accessibilityLiveRegion="polite" style={[styles.caption, { color: colors.muted }]}>{notice}</Text>}
+    {noticeText && <Text accessibilityLiveRegion="polite" style={[styles.caption, { color: colors.muted }]}>{noticeText}</Text>}
     <Modal visible={expanded !== undefined} animationType="fade"
       supportedOrientations={["portrait", "landscape"]} onRequestClose={closeExpanded} onDismiss={deliverDiagram}>
       <SafeAreaView style={[styles.fill, { backgroundColor: colors.surface }]}>
