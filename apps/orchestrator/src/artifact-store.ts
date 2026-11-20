@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
+import { constants, createReadStream, createWriteStream } from "node:fs";
 import { copyFile, type FileHandle, lstat, mkdir, open, realpath, rename, rm, stat, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -87,6 +87,7 @@ export class ArtifactStore {
   readonly #ticketTtlMs: number;
   readonly #now: () => number;
   readonly #permanentIngests = new Map<string, Promise<void>>();
+  readonly #nativePdfPublications = new Map<string, Promise<string>>();
   readonly #dispatchInputArtifacts = new AsyncLocalStorage<ActiveDispatchInputArtifacts>();
 
   constructor(options: ArtifactStoreOptions) {
@@ -319,6 +320,50 @@ export class ArtifactStore {
     return (await this.resolveBlobFile(blob)).path;
   }
 
+  /** Claude's native Read tool selects the PDF representation by path suffix. */
+  async resolveClaudeInputFile(blob: BlobRef): Promise<string> {
+    if (blob.mimeType.toLowerCase() !== "application/pdf" || this.dispatchInputArtifact(blob.id) !== undefined) {
+      return this.resolveBlobPath(blob);
+    }
+    const artifact = await this.requireArtifact(blob.id);
+    assertBlobIdentity(blob, artifact);
+    const operation = this.#nativePdfPublications.get(artifact.storagePath) ?? this.prepareNativePdfPath(artifact);
+    this.#nativePdfPublications.set(artifact.storagePath, operation);
+    try {
+      const path = await operation;
+      assertBlobIdentity(blob, await this.requireArtifact(blob.id));
+      return path;
+    } finally {
+      if (this.#nativePdfPublications.get(artifact.storagePath) === operation) this.#nativePdfPublications.delete(artifact.storagePath);
+    }
+  }
+
+  private async prepareNativePdfPath(artifact: ArtifactRecord): Promise<string> {
+    const original = await this.verifyStoragePath(artifact);
+    const storagePath = `${original.canonical}.pdf`;
+    const pdf = { ...artifact, storagePath };
+    const existing = await lstat(storagePath).catch(ignoreMissingArtifactFile);
+    if (existing === undefined) {
+      const temporary = join(this.#options.rootDirectory, "incoming", randomUUID());
+      try {
+        await copyFile(original.canonical, temporary, constants.COPYFILE_EXCL);
+        const copied = await hashFile(temporary, artifact.byteLength);
+        const current = await this.verifyStoragePath(artifact);
+        if (copied.sha256 !== artifact.sha256 || copied.byteLength !== artifact.byteLength
+          || current.canonical !== original.canonical || !sameFileIdentity(current.info, original.info)) {
+          throw new Error("The PDF attachment changed while its native path was prepared.");
+        }
+        try { await rename(temporary, storagePath); }
+        catch (error) {
+          // A concurrent reader can publish the same immutable representation.
+          if (await lstat(storagePath).catch(ignoreMissingArtifactFile) === undefined) throw error;
+        }
+      } finally { await rm(temporary, { force: true }); }
+    }
+    await this.verifyPublishedContent(pdf, ".pdf");
+    return storagePath;
+  }
+
   /** The stored name and verified local file come from the same registered Blob. */
   async resolveBlobFile(blob: BlobRef): Promise<{ readonly path: string; readonly fileName?: string }> {
     const dispatch = this.dispatchInputArtifact(blob.id);
@@ -428,9 +473,12 @@ export class ArtifactStore {
     let collected = 0;
     for (const record of records) {
       try {
+        await this.#nativePdfPublications.get(record.storagePath)?.catch(() => undefined);
         const verified = await this.verifyStoragePath(record).catch(ignoreMissingArtifactFile);
-        if (verified === undefined) continue;
         if (await this.#options.repository.hasLiveStorageReference(record.storagePath)) continue;
+        const pdf = await this.verifyStoragePath({ ...record, storagePath: `${record.storagePath}.pdf` }, ".pdf").catch(ignoreMissingArtifactFile);
+        if (pdf !== undefined) await unlink(pdf.canonical).catch(ignoreMissingArtifactFile);
+        if (verified === undefined) continue;
         const removed = await unlink(record.storagePath).then(() => true, ignoreMissingArtifactFile);
         if (removed) collected += 1;
       } catch (error) {
@@ -572,8 +620,8 @@ export class ArtifactStore {
     } };
   }
 
-  private async verifyPublishedContent(artifact: Pick<ArtifactRecord, "storagePath" | "sha256" | "byteLength">): Promise<void> {
-    const before = await this.verifyStoragePath(artifact);
+  private async verifyPublishedContent(artifact: Pick<ArtifactRecord, "storagePath" | "sha256" | "byteLength">, suffix: "" | ".pdf" = ""): Promise<void> {
+    const before = await this.verifyStoragePath(artifact, suffix);
     const handle = await open(before.canonical, "r");
     try {
       const opened = await handle.stat();
@@ -582,7 +630,7 @@ export class ArtifactStore {
       }
       const actual = await hashFile(handle, this.#maximumBlobBytes);
       const afterHandle = await handle.stat();
-      const after = await this.verifyStoragePath(artifact);
+      const after = await this.verifyStoragePath(artifact, suffix);
       if (after.canonical !== before.canonical || !sameFileIdentity(opened, afterHandle) || !sameFileIdentity(opened, after.info)
         || actual.byteLength !== artifact.byteLength || actual.sha256 !== artifact.sha256) {
         throw new Error("Artifact content changed during publication verification.");
@@ -592,7 +640,7 @@ export class ArtifactStore {
     }
   }
 
-  private async verifyStoragePath(artifact: Pick<ArtifactRecord, "storagePath" | "sha256">): Promise<{
+  private async verifyStoragePath(artifact: Pick<ArtifactRecord, "storagePath" | "sha256">, suffix: "" | ".pdf" = ""): Promise<{
     readonly canonical: string;
     readonly info: Awaited<ReturnType<typeof lstat>>;
   }> {
@@ -607,7 +655,7 @@ export class ArtifactStore {
       canonicalRoot,
       artifact.sha256.slice(0, 2),
       artifact.sha256.slice(2, 4),
-      artifact.sha256
+      `${artifact.sha256}${suffix}`
     );
     if (resolve(canonical) !== expectedCanonical) {
       throw new Error("Artifact storage path does not match its content-addressed identity.");

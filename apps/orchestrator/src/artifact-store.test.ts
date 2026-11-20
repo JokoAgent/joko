@@ -56,13 +56,13 @@ afterEach(async () => {
   for (const path of cleanupPaths.splice(0).reverse()) await rm(path, { recursive: true, force: true });
 });
 
-async function publicationFixture() {
+async function publicationFixture(now = Date.now) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), "joko-artifact-publication-")));
   cleanupPaths.push(directory);
   const store = new OperationalStore(join(directory, "orchestrator.db"));
   publicationStores.push(store);
   const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"),
-    repository: new OperationalArtifactRepository(store), ingestRoots: [directory] });
+    repository: new OperationalArtifactRepository(store), ingestRoots: [directory], now });
   await artifacts.initialize();
   const data = Buffer.from("An immutable published Artifact.");
   const sha256 = createHash("sha256").update(data).digest("hex");
@@ -72,6 +72,34 @@ async function publicationFixture() {
 }
 
 describe("ArtifactStore publication", () => {
+  it("presents an immutable PDF through a durable native suffix until its last storage reference expires", async () => {
+    let now = 1_000;
+    const f = await publicationFixture(() => now);
+    const bytes = Buffer.from("%PDF-1.7\nA fixed PDF attachment byte fixture\n%%EOF\n");
+    const uploaded = await f.artifacts.ingestBytes(bytes, { fileName: "report.pdf", mimeType: "application/pdf", expiresAt: 2_000 });
+    const shared = await f.artifacts.ingestBytes(bytes, { fileName: "retained.bin", mimeType: "application/octet-stream", expiresAt: 3_000 });
+    const original = await f.artifacts.resolveBlobPath(uploaded);
+    expect(await f.artifacts.resolveClaudeInputFile(shared)).toBe(original);
+    const paths = await Promise.all([f.artifacts.resolveClaudeInputFile(uploaded), f.artifacts.resolveClaudeInputFile(uploaded)]);
+    const nativePdf = `${await realpath(original)}.pdf`;
+    expect(paths).toEqual([nativePdf, nativePdf]);
+    expect(await readFile(nativePdf)).toEqual(bytes);
+    expect(await readFile(original)).toEqual(bytes);
+    expect(await f.artifacts.resolveBlobPath(uploaded)).toBe(original);
+    expect(await readdir(join(f.directory, "artifacts", "incoming"))).toEqual([]);
+
+    await writeFile(nativePdf, Buffer.alloc(bytes.length));
+    await expect(f.artifacts.resolveClaudeInputFile(uploaded)).rejects.toThrow(/content changed/u);
+    await writeFile(nativePdf, bytes);
+    now = 2_500;
+    expect(await f.artifacts.garbageCollect()).toBe(0);
+    expect(await readFile(nativePdf)).toEqual(bytes);
+    now = 3_500;
+    expect(await f.artifacts.garbageCollect()).toBe(1);
+    await expect(readFile(nativePdf)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(original)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("retains both original Browser download names after two staged copies fail and the ledger is reopened", async () => {
     const f = await publicationFixture();
     const provider = { generation: 7, acquireAgentLease: vi.fn(), releaseAgentLease: vi.fn(), uploadFiles: vi.fn(), recover: vi.fn() };
