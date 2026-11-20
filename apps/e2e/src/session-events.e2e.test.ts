@@ -1300,9 +1300,11 @@ describe("session host, durable events, and reconnect semantics", () => {
     await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
     await page.getByLabel("Device name").fill("Queue observer");
     await page.locator("form.pair-form button[type=submit]").click();
-    const order = () => page.locator("[data-queue-item-id]").evaluateAll(rows => rows.map(row => row.getAttribute("data-queue-item-id")));
+    const order = async () => (await page.locator("[data-queue-item-id]").evaluateAll(
+      rows => rows.map(row => row.getAttribute("data-queue-item-id")))).filter(id => id !== active.queueItemId);
     const before = [first.queueItemId, second.queueItemId, third.queueItemId];
     await waitFor(order, value => value.join() === before.join(), "the initial mounted queue order");
+    expect(await page.locator(`[data-queue-item-id="${active.queueItemId}"]`).count()).toBe(1);
     let snapshots = 0;
     page.on("request", request => { if (request.url().endsWith("/joko.v1.EventService/GetSnapshot")) snapshots += 1; });
 
@@ -1317,6 +1319,7 @@ describe("session host, durable events, and reconnect semantics", () => {
     const after = [first.queueItemId, third.queueItemId, second.queueItemId];
     await waitFor(order, value => value.join() === after.join(), "the reordered queue on the observing Web client");
     expect(snapshots).toBe(0);
+    expect(await page.locator(`[data-queue-item-id="${active.queueItemId}"]`).count()).toBe(1);
     expect(store.getRun(active.runId).descriptor.state).toBe("running");
     expect(store.listQueueItems({ sessionId, states: ["accepted"] }).map(item => item.id)).toEqual(after);
   });

@@ -1,8 +1,8 @@
-import { create } from "@bufbuild/protobuf";
+import { create, fromBinary } from "@bufbuild/protobuf";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ModelSelectionSchema, PerTurnOverridesSchema, RunState } from "@joko/contracts";
+import { GetOperationRequestSchema, ModelSelectionSchema, PerTurnOverridesSchema, RunState } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it, vi } from "vitest";
 
@@ -161,10 +161,21 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
       { name: "Continue with failed Provider", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, triggerAt: trigger },
       { name: "Continue with chosen Provider", providerId: defaultProviderId, modelId: defaultModelId, triggerAt: trigger + 60_000 }
     ];
+    const recoveryReads: number[] = [];
+    page.on("response", response => {
+      if (!response.url().endsWith("/joko.v1.OperationService/GetOperation")) return;
+      const body = response.request().postDataBuffer();
+      if (body !== null && fromBinary(GetOperationRequestSchema, body).operationId === admitted.operationId) recoveryReads.push(response.status());
+    });
     for (const [index, schedule] of schedules.entries()) {
       checkpoint(`opening the recovery editor for ${schedule.providerId}`);
+      const editor = page.getByRole("dialog", { name: "Create schedule", exact: true });
+      const triggerAt = editor.getByLabel("Trigger at", { exact: true });
+      const before = { hash: new URL(page.url()).hash, generation: fixture.application.store.getSession(sessionId).descriptor.binding.generation,
+        receiptReads: recoveryReads.length };
       try {
         await pane.getByRole("button", { name: "Continue after reset", exact: true }).click();
+        await triggerAt.waitFor({ state: "visible" });
       } catch (error) {
         const events = fixture.application.store.listEvents({ sessionId }).slice(-30).map(event => ({
           runId: event.runId,
@@ -173,12 +184,12 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
         }));
         const visibleText = (await pane.textContent().catch(() => null))?.slice(-2_000);
         const attention = fixture.application.store.findSessionAttention(sessionId);
-        console.info("Quota recovery fixture cold presentation", JSON.stringify({ events, attention, visibleText },
+        const after = { hash: new URL(page.url()).hash, generation: fixture.application.store.getSession(sessionId).descriptor.binding.generation,
+          receiptStatusCodes: recoveryReads.slice(before.receiptReads), editorPresent: await editor.count() > 0 };
+        console.info("Quota recovery fixture cold presentation", JSON.stringify({ before, after, events, attention, visibleText },
           (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value));
         throw error;
       }
-      const editor = page.getByRole("dialog", { name: "Create schedule", exact: true });
-      const triggerAt = editor.getByLabel("Trigger at", { exact: true });
       const picker = editor.locator(".schedule-editor__model-picker");
       expect(await triggerAt.inputValue()).toBe(new Date(trigger).toISOString().slice(0, 16));
       expect(await picker.innerText()).toContain("Joko real Pi E2E model");

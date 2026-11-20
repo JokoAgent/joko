@@ -1406,9 +1406,6 @@ mountedIt("retries the exact known pre-dispatch SSH Codex input after opening th
     const list = async () => (await cold.queue.listQueueItems({ sessionId })).queueItems;
     const original = (await list()).find(item => item.queueItemId === pendingId)!;
     expect(original).toMatchObject({ state: QueueItemState.FAILED, runId: pendingRunId, retryBeforeDispatch: true });
-    const exactRetry = retryRunMutation(pendingRunId);
-    exactRetry.preconditions.push(create(OperationPreconditionSchema, { entity: { kind: EntityKind.QUEUE_ITEM, id: pendingId },
-      expectedRevision: original.version!.revision!, expectedGeneration: original.version!.generation }));
 
     const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "SSH queue Browser" })).challenge!;
     browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
@@ -1450,8 +1447,9 @@ mountedIt("retries the exact known pre-dispatch SSH Codex input after opening th
     const submitted = fromBinary(SubmitOperationRequestSchema, response.request().postDataBuffer()!);
     const checked = (await refresh)?.queueItems.find(item => item.queueItemId === pendingId);
     expect(checked?.retryBeforeDispatch).toBe(true);
+    expect(checked?.version?.revision?.value).toBe(original.version!.revision!.value);
     expect(submitted.mutation?.preconditions).toMatchObject([{ entity: { kind: EntityKind.QUEUE_ITEM, id: pendingId },
-      expectedRevision: original.version!.revision, expectedGeneration: checked?.version?.generation }]);
+      expectedRevision: { value: original.version!.revision!.value }, expectedGeneration: checked?.version?.generation }]);
     const receipt = fromBinary(SubmitOperationResponseSchema, await response.body()).operation;
     expect(receipt).toMatchObject({ state: OperationState.SUCCEEDED, result: { payload: { case: "run" } } });
     const child = await waitFor(async () => fixture!.application.store.findRunByParentId(pendingRunId)?.descriptor,
@@ -1459,9 +1457,13 @@ mountedIt("retries the exact known pre-dispatch SSH Codex input after opening th
     expect(child).toMatchObject({ sessionId, parentRunId: pendingRunId });
     expect(nativeTurns()).toHaveLength(2);
     expect(nativeTurns().at(-1)).toMatchObject({ items: [{ type: "userMessage", content: [{ type: "text", text: pendingText }] }] });
-    expect((await list()).find(item => item.queueItemId === pendingId)?.retryBeforeDispatch).toBe(false);
+    const consumedSource = (await list()).find(item => item.queueItemId === pendingId)!;
+    expect(consumedSource.retryBeforeDispatch).toBe(false);
     await retry.waitFor({ state: "hidden" });
-    const duplicate = await submit(cold.operation, connectionId, exactRetry);
+    const duplicateRetry = retryRunMutation(pendingRunId);
+    duplicateRetry.preconditions.push(create(OperationPreconditionSchema, { entity: { kind: EntityKind.QUEUE_ITEM, id: pendingId },
+      expectedRevision: consumedSource.version!.revision!, expectedGeneration: consumedSource.version!.generation }));
+    const duplicate = await submit(cold.operation, connectionId, duplicateRetry);
     expect(duplicate.state).toBe(OperationState.FAILED);
     expect(nativeTurns()).toHaveLength(2);
     await native.completeTurn(nativeId);
