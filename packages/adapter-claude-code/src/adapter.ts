@@ -3226,9 +3226,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       retired = true;
       if (forceWorkingContext) this.#workingContextRecoveries.set(context.sessionId, { runtime, providerId, modelId });
       await this.#retireRuntime(runtime);
-      if (!runtime.remote && runtime.storedSessionAccess === undefined && runtime.freshContext === undefined) {
+      if (!runtime.processRetirementConfirmed) {
         await waitFor(runtime.sdkRuntime.retireQuery(runtime.query, this.#teardownTimeoutMs), this.#teardownTimeoutMs,
           context.signal, () => managedRouteUnavailable(true));
+        runtime.processRetirementConfirmed = true;
       }
       let restartFresh = false;
       if (confirmFreshAfterRetirement) {
@@ -3287,9 +3288,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         || previous.target.workspaceRoot !== context.target.workspaceRoot) throw continuityGap();
       previous.assertRuntimeCurrent();
       await this.#retireRuntime(previous);
-      if (!previous.remote && previous.storedSessionAccess === undefined && previous.freshContext === undefined) {
+      if (!previous.processRetirementConfirmed) {
         await waitFor(previous.sdkRuntime.retireQuery(previous.query, this.#teardownTimeoutMs), this.#teardownTimeoutMs,
           context.signal, () => managedRouteUnavailable(true));
+        previous.processRetirementConfirmed = true;
       }
       const info = await this.#sessionInfo(previous.nativeSessionId, previous.target, context.signal, targetRuntimeOf(previous), previous.storedSessionAccess);
       if (info === undefined && (!previous.freshSessionCanRestart || await this.#sessionHasHistory(previous, context.signal))) throw continuityGap();
@@ -3358,9 +3360,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       }
       retired = true;
       await this.#retireRuntime(runtime);
-      if (!runtime.remote && runtime.storedSessionAccess === undefined && runtime.freshContext === undefined) {
+      if (!runtime.processRetirementConfirmed) {
         await waitFor(runtime.sdkRuntime.retireQuery(runtime.query, this.#teardownTimeoutMs), this.#teardownTimeoutMs,
           context.signal, () => mcpBindUnknown());
+        runtime.processRetirementConfirmed = true;
       }
       let fresh = false;
       if (confirmFresh) {

@@ -1534,6 +1534,18 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const nativeSkills = preparedSkills.nativeSkills;
     if (mustReloadConfiguration) {
       try {
+        if (current?.mcpPending === true && !inspection.scope.remote && current.host === inspection.scope.host
+          && current.threadId === threadId && current.hostGeneration === inspection.hostGeneration) {
+          // Keep the loaded, paginated thread until its native history is durable.
+          const persisted = await inspection.scope.host.request("thread/read", { threadId, includeTurns: true }, {
+            mutation: true, signal: context.signal, beforeDispatch: () => {
+              context.signal.throwIfAborted();
+              inspection.scope.assertCurrent();
+            }
+          });
+          if (persisted.hostGeneration !== inspection.hostGeneration) throw remoteRuntimeStale();
+          await assertNativeThreadTarget(parseThreadResult(persisted.value), threadId, inspection.workspaceRoot, "provision");
+        }
         if (current !== undefined) await this.#releaseRuntimeSubscription(current, false);
         await inspection.scope.host.releaseUnboundThread(threadId, inspection.hostGeneration);
         inspection.scope.assertCurrent();

@@ -726,9 +726,13 @@ export class ManagedProviderProxy {
       await this.#handleSmart(request, response, smartState, smartMatch![2]!);
       return;
     }
-    const match = /^\/managed\/([a-f0-9-]{36})(\/[^?#]*)$/u.exec(request.url ?? "");
+    const match = /^\/managed\/([a-f0-9-]{36})(\/[^?#]*)(\?beta=true)?$/u.exec(request.url ?? "");
     const state = match === null ? undefined : this.#bindings.get(match[1]!);
-    if (request.method !== "POST" || state === undefined || !authorized(request, state.runtime.token)) return fail(response, 403);
+    // Claude probes this optional endpoint before authenticating its Messages requests.
+    if (request.method === "GET" && match?.[2] === "/api/hello"
+      && state?.runtime.clientProtocol === "anthropic-messages") return fail(response, 404);
+    if (request.method !== "POST" || state === undefined || !authorized(request, state.runtime.token)
+      || (match![3] !== undefined && state.runtime.clientProtocol !== "anthropic-messages")) return fail(response, 403);
     const operation = state.active;
     if (operation === undefined || request.headers["content-encoding"] !== undefined) return fail(response, 409);
     const suffix = requestSuffix(state.runtime.clientProtocol ?? state.protocol, match![2]!);
@@ -780,11 +784,14 @@ export class ManagedProviderProxy {
         return;
       }
       const base = new URL(route.baseUrl.endsWith("/") ? route.baseUrl : `${route.baseUrl}/`);
+      const relativePath = route.api === "anthropic-messages" && base.pathname.endsWith("/v1/")
+        ? match![2]!.slice("/v1/".length) : match![2]!.slice(1);
       const endpoint = route.requestPath === undefined
-        ? new URL(match![2]!.slice(1), base)
+        ? new URL(relativePath, base)
         : new URL(route.api === "openai-responses" && suffix === ""
           ? route.requestPath : `${route.requestPath.replace(/\/$/u, "")}${suffix}`, base.origin);
       if (endpoint.origin !== base.origin) throw unavailable();
+      if (match![3] !== undefined && route.api === "anthropic-messages") endpoint.search = match![3]!;
       const headers = new Headers({ "content-type": "application/json", accept: "text/event-stream, application/json" });
       for (const name of ["anthropic-version", "anthropic-beta", "openai-beta", "x-codex-turn-metadata", "session_id"]) {
         const value = request.headers[name]; if (typeof value === "string") headers.set(name, value);
