@@ -1,5 +1,5 @@
 import { downloadArtifactUrl } from "../artifact-download.js";
-import { Clipboard, FileText, Folder, FolderKanban, Globe2, Link2, MessageSquare, PanelRight } from "lucide-react";
+import { Clipboard, Download, FileText, Folder, FolderKanban, Globe2, Link2, MessageSquare, PanelRight } from "lucide-react";
 import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { JSX, MouseEvent, ReactNode } from "react";
 import { createPortal } from "react-dom";
@@ -7,8 +7,9 @@ import { assertBrowserActionCurrent, WorkspaceHtmlExternalUnavailableError, type
 import { writeClipboardText } from "../clipboard-action.js";
 import { RENDERED_SHARE_CONTENT_PENDING_ATTRIBUTE, RENDERED_SHARE_EXCLUDE_ATTRIBUTE, useRenderedShareSelection } from "./rendered-share-dom.js";
 import { useClipboardAction } from "./use-clipboard-action.js";
+import { useArtifactDownload } from "./use-artifact-download.js";
 import { TimelineLinkMenu } from "./TimelineLinkMenu.js";
-import type { ArtifactView, OperationApi, TimelineInputMentionRangeView, TimelineInputMentionView } from "../model.js";
+import type { ArtifactDownloadContext, ArtifactDownloadOutcome, ArtifactView, OperationApi, TimelineInputMentionRangeView, TimelineInputMentionView } from "../model.js";
 import type { Translator } from "./types.js";
 import { WorkspaceImageLightbox } from "./WorkspaceImageLightbox.js";
 import { parseSentMessageReferences, resolveSentSessionMention, resolveSentWorkspaceMention, resolveTimelineReference, sentInputMentionSegments, type TimelineReferenceTarget } from "./timeline-references.js";
@@ -24,6 +25,8 @@ export interface TimelineWorkspaceAsset {
   readonly mediaType?: string;
 }
 
+export type TimelineWorkspaceDirectoryDownload = (path: string, context: ArtifactDownloadContext) => Promise<ArtifactDownloadOutcome>;
+
 export interface TimelineReferenceActions {
   readonly ownerKey: string;
   readonly sessionId: string;
@@ -34,6 +37,7 @@ export interface TimelineReferenceActions {
   readonly renderArtifactPreview?: (artifact: ArtifactView, trigger: HTMLElement, onClose: () => void) => ReactNode;
   readonly onOpenHttpLink?: (url: string, options?: HttpLinkOpenOptions) => void | Promise<void>;
   readonly onOpenWorkspaceHtml?: (path: string, options?: HttpLinkOpenOptions) => void | Promise<void>;
+  readonly onDownloadWorkspaceDirectory?: TimelineWorkspaceDirectoryDownload;
   readonly onLoadWorkspaceAsset?: (path: string) => Promise<TimelineWorkspaceAsset>;
   readonly onWorkspaceImageToComposer?: (file: File) => void | Promise<void>;
 }
@@ -206,6 +210,8 @@ function TimelineReferenceLink({ target, actions, mention = false, anchorProps, 
   const sourceKey = actions.sourceKey ?? markdownSource;
   const copy = useClipboardAction({ ownerKey: JSON.stringify([actions.ownerKey, actions.sessionId]),
     sourceKey: JSON.stringify([target.href, sourceKey]), ownerDocument });
+  const downloadDirectory = target.kind === "workspace" && target.directory ? actions.onDownloadWorkspaceDirectory : undefined;
+  const directoryDownload = useArtifactDownload(JSON.stringify([actions.ownerKey, actions.sessionId, target.href, sourceKey]), downloadDirectory);
   useLayoutEffect(() => {
     const scope = new AbortController();
     scopeRef.current = scope;
@@ -226,6 +232,7 @@ function TimelineReferenceLink({ target, actions, mention = false, anchorProps, 
   }, [actions.ownerKey, actions.sessionId, sourceKey, target.href, ownerDocument, epoch]);
   const close = (restoreFocus: boolean): void => {
     setMenu(undefined);
+    directoryDownload.cancel();
     copy.cancel(); requestRef.current?.abort(); requestRef.current = undefined; setOpening(false);
     if (restoreFocus && !scopeRef.current?.signal.aborted && trigger?.isConnected && trigger.ownerDocument === ownerDocument) trigger.focus({ preventScroll: true });
   };
@@ -270,7 +277,7 @@ function TimelineReferenceLink({ target, actions, mention = false, anchorProps, 
     ref={setTrigger}
     className={[className, !external && "timeline-reference-chip", mention && "is-mention"].filter(Boolean).join(" ") || undefined}
     href={target.href}
-    aria-busy={opening || copy.pending}
+    aria-busy={opening || copy.pending || directoryDownload.pending}
     {...(external ? { target: "_blank", rel: "noreferrer" } : {})}
     onClick={open}
     onKeyDown={(event) => {
@@ -295,14 +302,28 @@ function TimelineReferenceLink({ target, actions, mention = false, anchorProps, 
         <button type="button" role="menuitem" disabled={!canOpen} aria-disabled={opening || copy.pending || !canOpen} onClick={() => openLink({ forceExternal: true })}><Globe2 aria-hidden="true" />{actions.t(html ? "timeline.openInManagedBrowser" : "timeline.openInDefaultBrowser")}</button>
         <span role="separator" />
       </>}
-      <button type="button" role="menuitem" aria-disabled={opening || copy.pending} onClick={() => {
-        if (opening || copy.pending || requestRef.current !== undefined || scopeRef.current?.signal.aborted) return;
+      {downloadDirectory !== undefined && target.kind === "workspace" && <button type="button" role="menuitem"
+        aria-disabled={directoryDownload.pending || copy.pending} onClick={() => {
+          if (copy.pending || scopeRef.current?.signal.aborted || !trigger.isConnected) return;
+          directoryDownload.run(trigger.ownerDocument, async context => {
+            await downloadDirectory(target.path, context);
+            if (!context.signal.aborted && trigger.isConnected) {
+              setMenu(undefined);
+              trigger.focus({ preventScroll: true });
+            }
+          });
+        }}><Download aria-hidden="true" />{actions.t("workspace.downloadDirectory")}</button>}
+      <button type="button" role="menuitem" aria-disabled={opening || copy.pending || directoryDownload.pending} onClick={() => {
+        if (opening || copy.pending || directoryDownload.pending || requestRef.current !== undefined || scopeRef.current?.signal.aborted) return;
         const value = target.kind === "workspace" ? `${target.path}${target.line === undefined ? "" : `:${target.line}${target.column === undefined ? "" : `:${target.column}`}`}` : target.href;
         copy.run(trigger.ownerDocument, (context) => writeClipboardText(value, context));
       }}><Clipboard aria-hidden="true" />{actions.t(external ? "timeline.copyUrl" : "workspace.copyRelativePath")}</button>
       {(copy.state !== "idle" || opening || openFailed) && <span role="status" aria-live="polite">{actions.t(
         opening ? "timeline.linkOpening" : openFailed ? externalUnavailable ? "timeline.htmlExternalUnavailable" : "timeline.linkOpenFailed" : copy.pending ? "timeline.linkCopying"
           : copy.state === "failed" ? "timeline.linkCopyFailed" : external ? "timeline.linkCopied" : "workspace.pathCopied"
+      )}</span>}
+      {(directoryDownload.pending || directoryDownload.failed) && <span role="status" aria-live="polite">{actions.t(
+        directoryDownload.pending ? "workspace.downloadingDirectory" : "workspace.directoryDownloadFailed"
       )}</span>}
     </TimelineLinkMenu>}
     {menu === undefined && (opening || openFailed) && ownerDocument !== undefined && createPortal(

@@ -3660,6 +3660,30 @@ export function createConnectServices(application: OrchestratorApplication, proj
       } catch (error) { owner.assertCurrent(); throw error; }
       finally { owner.dispose(); }
     },
+    prepareWorkspaceDirectoryDownload: async (request, context) => {
+      const connection = authenticate(context);
+      const owner = captureWorkspaceFileRequest(dependencies.connections, connection, context.signal);
+      try {
+        const result = await dependencies.workspaceService.materializeRemoteDirectory(request.workspaceId, {
+          relativePath: request.relativePath,
+          expectedRevision: request.expectedRevision?.opaqueRevision ?? "",
+          maximumBytes: Math.min(contract.WORKSPACE_DIRECTORY_ARCHIVE_MAXIMUM_BYTES, dependencies.artifactStore.maximumBlobBytes)
+        }, async (handle, options) => {
+          const archive = await dependencies.artifactStore.ingestFileHandle(handle, {
+            expectedSize: options.expectedSize,
+            signal: owner.signal,
+            fileName: `${options.directoryName}.tar.gz`,
+            mimeType: contract.WORKSPACE_DIRECTORY_ARCHIVE_MEDIA_TYPE,
+            expiresAt: Date.now() + 5 * 60 * 1000,
+            beforeFinalize: options.beforeFinalize
+          });
+          return { archive: directArtifactBlob(archive), directoryName: options.directoryName };
+        }, owner);
+        owner.assertCurrent();
+        return result;
+      } catch (error) { owner.assertCurrent(); throw toConnectError(error); }
+      finally { owner.dispose(); }
+    },
     resolveWorkspaceFileSource: async (request, context) => {
       const connection = authenticate(context);
       const hostAuthorization = context.requestHeader.get(DESKTOP_HOST_AUTHORIZATION_HEADER) ?? undefined;

@@ -6736,6 +6736,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   watchWorkspaceFileChanges(scope: WorkspaceFileChangeScopeView, signal?: AbortSignal): AsyncIterable<WorkspaceFileChangeView>;
   readWorkspaceHtmlSnapshot(sessionId: string, workspaceId: string, path: string, signal: AbortSignal): Promise<{ readonly file: { readonly workspaceId: string; readonly relativePath: string; readonly expectedRevision: string }; readonly html: string }>;
   readWorkspaceFile(workspaceId: string, path: string): Promise<WorkspaceFilePreviewView>;
+  downloadWorkspaceDirectory?(workspaceId: string, path: string, expectedRevision: string | undefined, context: ArtifactDownloadContext): Promise<ArtifactDownloadOutcome>;
   /** Previous text for immediate display; a fresh read still verifies access. */
   peekWorkspaceFile?(workspaceId: string, path: string): WorkspaceFilePreviewView | undefined;
   writeWorkspaceTextFile(workspaceId: string, draft: WorkspaceTextFileWriteDraft): Promise<WorkspaceTextFileWriteResultView>;

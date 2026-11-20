@@ -62,6 +62,7 @@ import type {
   DesktopProjectDirectorySelection,
   DesktopProviderModelRefreshLifecycleHint,
   DesktopSaveFileRequest,
+  DesktopWorkspaceDirectoryDownloadRequest,
   DesktopCopyFileRequest,
   DesktopCopyFileResult,
   DesktopOpenFileRequest,
@@ -249,6 +250,8 @@ const DESKTOP_CHANNELS = {
   taskSharingInvitationAcknowledge: "joko:task-sharing:invitation:acknowledge",
   taskSharingInvitationDeliver: "joko:task-sharing:invitation:deliver",
   saveFile: "joko:files:save",
+  saveWorkspaceDirectory: "joko:files:save-workspace-directory",
+  cancelWorkspaceDirectoryDownload: "joko:files:save-workspace-directory-cancel",
   copyFile: "joko:files:copy",
   cancelFileCopy: "joko:files:copy-cancel",
   openFile: "joko:files:open",
@@ -353,6 +356,7 @@ const desktopCapabilities = Object.freeze([
   ...(openWithDocumentOccurrence === undefined ? [] : ["files.openWith" as const]),
   "files.revealSource",
   "files.openWorkspaceSource",
+  "files.workspaceDirectoryDownload",
   "hardware.dedicatedInput",
   ...(nativeGamepadDocumentOccurrence === undefined ? [] : ["hardware.nativeGamepad" as const]),
   "layout.reset",
@@ -1097,6 +1101,17 @@ const desktopApi = Object.freeze({
   saveFile: (request: DesktopSaveFileRequest): Promise<boolean> => {
     if (!isDesktopSaveFileRequest(request)) return Promise.reject(new TypeError("The file save request is invalid."));
     return ipcRenderer.invoke(DESKTOP_CHANNELS.saveFile, request).then(parseDesktopBoolean);
+  },
+  saveWorkspaceDirectory: (request: DesktopWorkspaceDirectoryDownloadRequest): Promise<boolean> => {
+    if (typeof request !== "object" || request === null || Object.keys(request).sort().join(",") !== "bytes,directoryName,requestId"
+      || !isNativeFileActionRequestId(request.requestId) || !isDesktopSaveFileRequest({
+        name: request.directoryName, mediaType: "application/gzip", bytes: request.bytes
+      }) || request.bytes.byteLength === 0) return Promise.reject(new TypeError("The directory download request is invalid."));
+    return ipcRenderer.invoke(DESKTOP_CHANNELS.saveWorkspaceDirectory, request).then(parseDesktopBoolean);
+  },
+  cancelWorkspaceDirectoryDownload: (requestId: string): Promise<void> => {
+    if (!isNativeFileActionRequestId(requestId)) return Promise.reject(new TypeError("The directory download identity is invalid."));
+    return ipcRenderer.invoke(DESKTOP_CHANNELS.cancelWorkspaceDirectoryDownload, requestId).then(() => undefined);
   },
   copyFile: (request: DesktopCopyFileRequest): Promise<DesktopCopyFileResult> => {
     if (typeof request !== "object" || request === null || Object.keys(request).sort().join(",") !== "file,requestId" || !isNativeFileActionRequestId(request.requestId) || !isDesktopSaveFileRequest(request.file)) return Promise.reject(new TypeError("The file copy request is invalid."));

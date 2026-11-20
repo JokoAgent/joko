@@ -1,4 +1,4 @@
-import { nativeFileActionRequestId } from "@joko/contracts";
+import { nativeFileActionRequestId, WORKSPACE_DIRECTORY_ARCHIVE_MAXIMUM_BYTES } from "@joko/contracts";
 import { assertBrowserActionCurrent, type BrowserActionContext } from "./browser-action.js";
 
 export type NativeFileCopyOutcome = JokoDesktopCopyFileResult;
@@ -68,6 +68,34 @@ export function captureNativeFileOpen(): Pick<NonNullable<Window["jokoDesktop"]>
   if (!nativeFileOpenAvailable()) return undefined;
   const desktop = window.jokoDesktop!;
   return { openFile: desktop.openFile.bind(desktop), cancelFileOpen: desktop.cancelFileOpen.bind(desktop) };
+}
+
+export function captureNativeWorkspaceDirectoryDownload() {
+  const desktop = typeof window === "undefined" ? undefined : window.jokoDesktop;
+  if (desktop?.capabilities.includes("files.workspaceDirectoryDownload") !== true
+    || desktop.saveWorkspaceDirectory === undefined || desktop.cancelWorkspaceDirectoryDownload === undefined) return undefined;
+  return { owner: window.document, save: desktop.saveWorkspaceDirectory.bind(desktop), cancel: desktop.cancelWorkspaceDirectoryDownload.bind(desktop) };
+}
+
+export async function saveNativeWorkspaceDirectory(
+  bytes: Uint8Array,
+  directoryName: string,
+  context: BrowserActionContext,
+  host: NonNullable<ReturnType<typeof captureNativeWorkspaceDirectoryDownload>>
+): Promise<boolean> {
+  assertBrowserActionCurrent(context);
+  if (bytes.byteLength === 0 || bytes.byteLength > WORKSPACE_DIRECTORY_ARCHIVE_MAXIMUM_BYTES) {
+    throw new Error("The workspace directory download exceeds the available size.");
+  }
+  const requestId = nextNativeFileActionId(host.owner);
+  const cancel = (): void => { void host.cancel(requestId).catch(() => undefined); };
+  context.signal.addEventListener("abort", cancel, { once: true });
+  try {
+    assertBrowserActionCurrent(context);
+    return await host.save({ requestId, directoryName, bytes });
+  } finally {
+    context.signal.removeEventListener("abort", cancel);
+  }
 }
 
 /** Capture one Document-scoped Windows application-list host before any asynchronous work. */

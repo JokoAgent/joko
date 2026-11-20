@@ -433,6 +433,7 @@ import {
 } from "./desktop-open-with-document.js";
 import { NativeArtifactSourceRevealer } from "./native-artifact-source-revealer.js";
 import { NativeWorkspaceFileSource } from "./native-workspace-file-source.js";
+import { NativeWorkspaceDirectoryDownload } from "./native-workspace-directory-download.js";
 import { DesktopPersonalDevelopmentHost } from "./personal-development-native-host.js";
 import { DesktopInputHandoffHost } from "./input-handoff-native-host.js";
 import { DesktopVoiceConversationHost } from "./voice-conversation-host.js";
@@ -1038,6 +1039,7 @@ let nativeFileClipboard: NativeFileClipboard | undefined;
 let nativeFileOpener: NativeFileOpener | undefined;
 let nativeArtifactSourceRevealer: NativeArtifactSourceRevealer | undefined;
 let nativeWorkspaceFileSource: NativeWorkspaceFileSource | undefined;
+let nativeWorkspaceDirectoryDownload: NativeWorkspaceDirectoryDownload | undefined;
 let windowsOpenWithApps: WindowsOpenWithApps | undefined;
 const nativeFileActionScopes = new WeakMap<WebContents, NativeFileActionScope>();
 const portableSessionSave = new PortableSessionSave();
@@ -1133,6 +1135,7 @@ if (!app.requestSingleInstanceLock()) {
     windowsOpenWithApps?.cancelPending();
     nativeArtifactSourceRevealer?.cancelPending();
     nativeWorkspaceFileSource?.cancelPending();
+    nativeWorkspaceDirectoryDownload?.cancelPending();
     mainWindowCloseController?.cancelPending();
     quitting = true;
     desktopRemoteDesktopViewerPrewarm.cancel();
@@ -9979,6 +9982,21 @@ function registerIpc(): void {
     const scope = nativeFileActionScopes.get(event.sender);
     if (scope !== undefined) nativeWorkspaceFileSource?.cancel(parameters[0], scope.id);
   });
+  ipcMain.handle(DESKTOP_CHANNELS.saveWorkspaceDirectory, (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 1) throw new TypeError("A workspace directory download requires one request.");
+    nativeWorkspaceDirectoryDownload ??= new NativeWorkspaceDirectoryDownload({
+      downloadRoot: () => app.getPath("downloads"),
+      revealPath: (path) => shell.showItemInFolder(path)
+    });
+    return nativeWorkspaceDirectoryDownload.save(parameters[0], nativeFileActionScope(event));
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.cancelWorkspaceDirectoryDownload, (event, ...parameters: unknown[]) => {
+    assertTrustedIpcSender(event);
+    if (parameters.length !== 1 || typeof parameters[0] !== "string") throw new TypeError("A directory download cancellation requires one identity.");
+    const scope = nativeFileActionScopes.get(event.sender);
+    if (scope !== undefined) nativeWorkspaceDirectoryDownload?.cancel(parameters[0], scope.id);
+  });
   ipcMain.handle(DESKTOP_CHANNELS.discoveryScan, async (event) => {
     assertTrustedIpcSender(event);
     return runDiscoveryScan();
@@ -11523,6 +11541,7 @@ function nativeFileActionScope(event: IpcMainInvokeEvent): NativeFileActionScope
     nativeFileOpener?.retireScope(scope.id);
     nativeArtifactSourceRevealer?.retireScope(scope.id);
     nativeWorkspaceFileSource?.retireScope(scope.id);
+    nativeWorkspaceDirectoryDownload?.retireScope(scope.id);
     portableSessionSave.retire(scope);
     if (nativeFileActionScopes.get(contents) === scope) nativeFileActionScopes.delete(contents);
     contents.removeListener("did-start-navigation", navigate);

@@ -269,6 +269,7 @@ type JokoDesktopCapability =
   | "files.openWith"
   | "files.revealSource"
   | "files.openWorkspaceSource"
+  | "files.workspaceDirectoryDownload"
   | "hardware.dedicatedInput"
   | "hardware.nativeGamepad"
   | "app.info"
@@ -710,6 +711,8 @@ interface JokoDesktopApi {
     subscribe(listener: (invitation: string) => void): () => void;
   };
   saveFile(file: JokoDesktopFile): Promise<boolean>;
+  saveWorkspaceDirectory?(request: { readonly requestId: string; readonly directoryName: string; readonly bytes: Uint8Array }): Promise<boolean>;
+  cancelWorkspaceDirectoryDownload?(requestId: string): Promise<void>;
   copyFile(request: { readonly requestId: string; readonly file: JokoDesktopFile }): Promise<JokoDesktopCopyFileResult>;
   cancelFileCopy(requestId: string): Promise<void>;
   openFile(request: { readonly requestId: string; readonly file: JokoDesktopFile }): Promise<JokoDesktopOpenFileResult>;

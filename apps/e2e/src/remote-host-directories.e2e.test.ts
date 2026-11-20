@@ -1,9 +1,13 @@
 import { create } from "@bufbuild/protobuf";
+import { execFileSync } from "node:child_process";
+import { posix } from "node:path";
 import { Code, createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
 import { EntityKind, OperationMutationSchema, OperationState, RemoteHostService } from "@joko/contracts";
 import { RemoteHostRegistry } from "@joko/orchestrator";
 import type { RemoteFileTransportPort, RemoteProcessTransportPort } from "@joko/remote-ssh";
+import { PI_LIKE_PROFILE } from "@joko/testkit";
+import { chromium, type Browser } from "playwright-core";
 import { expect, it, vi } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
@@ -146,6 +150,114 @@ it.each(["/srv/new-project", "/home/fixture/server/new-project"])("browses and c
       unsubscribe();
     }
   } finally {
+    await fixture.close();
+  }
+});
+
+const browserPath = process.env.JOKO_BROWSER_EXECUTABLE?.trim();
+const webDirectory = process.env.JOKO_MOUNTED_WEB_DIR?.trim();
+
+it.skipIf(!browserPath || !webDirectory)("downloads the original named SSH directory from task history and Files", { timeout: 90_000 }, async () => {
+  const workspaceRoot = "/srv/project";
+  const folder = `${workspaceRoot}/docs`;
+  const guide = Buffer.from("Remote guide bytes");
+  const binary = Buffer.from([0, 1, 254, 255]);
+  const directories = [workspaceRoot, folder, `${folder}/nested`, `${folder}/nested/empty`];
+  const contents = new Map([[ `${folder}/guide.txt`, guide ], [ `${folder}/nested/data.bin`, binary ]]);
+  const files: RemoteFileTransportPort = {
+    realpath: async path => path,
+    stat: async path => {
+      const bytes = contents.get(path);
+      if (bytes !== undefined) return { kind: "file", size: bytes.length, modifiedAt: 10, mode: 0o644 };
+      if (directories.includes(path)) return { kind: "directory", size: 0, modifiedAt: 10, mode: 0o755 };
+      throw new Error("The fixture has no such entry.");
+    },
+    list: async path => [
+      ...directories.filter(child => posix.dirname(child) === path).map(child => ({ kind: "directory" as const, name: posix.basename(child) })),
+      ...[...contents.keys()].filter(child => posix.dirname(child) === path).map(child => ({ kind: "file" as const, name: posix.basename(child) }))
+    ],
+    read: async ({ path, maximumBytes }) => {
+      const bytes = contents.get(path);
+      if (bytes === undefined) throw new Error("The fixture has no such file.");
+      return bytes.subarray(0, maximumBytes);
+    },
+    write: vi.fn(async () => { throw new Error("A directory download may not write on the source."); }),
+    mkdir: vi.fn(async () => { throw new Error("A directory download may not create source entries."); }),
+    rename: vi.fn(async () => { throw new Error("A directory download may not rename source entries."); }),
+    remove: vi.fn(async () => { throw new Error("A directory download may not remove source entries."); })
+  };
+  const capabilities = { commandExecution: true, processStreaming: true, fileTransfer: true, tcpForwarding: false, interactiveTerminal: false };
+  const profile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities, { key: "workspace.files", supported: true }] };
+  const fixture = await OrchestratorE2eFixture.start({ profiles: [profile], webDirectory, createAuxiliaryServices: async store => ({
+    remoteHosts: new RemoteHostRegistry({ store, ownerId: "remote-directory-download-test", connector: {
+      capabilities,
+      connect: async request => {
+        await request.verifyHostKey({ algorithm: "ssh-ed25519", key: Uint8Array.of(4, 5, 6) });
+        request.onAuthenticating();
+        return { capabilities, files, processes: { open: async () => { throw new Error("The download uses only the SSH file port."); } },
+          close: async () => undefined };
+      }
+    } })
+  }) });
+  let browser: Browser | undefined;
+  try {
+    const registry = fixture.application.remoteHosts!;
+    const store = fixture.application.store;
+    const backendId = fixture.adapter().id;
+    const hostTargetId = fixture.targetId();
+    const host = registry.create({ targetId: hostTargetId, id: "directory-download-host", hostname: "owned-ssh.invalid", user: "fixture", source: "manual" });
+    expect((await registry.connect(hostTargetId, host.id, host.revision)).ok).toBe(true);
+    const workspaceId = "remote-folder-workspace", targetId = "remote-folder-project", sessionId = "remote-folder-task";
+    const binding = { kind: "ssh" as const, hostTargetId, hostId: host.id, workspaceRoot };
+    store.upsertTarget({ id: targetId, backendId, displayName: "Remote folder project", workspaceRoot, managed: false,
+      trusted: true, remoteWorkspace: binding }, { workspaceId });
+    await fixture.application.workspaces.register({ id: workspaceId, root: workspaceRoot, displayName: "Remote folder project",
+      trusted: true, remote: { targetId, binding } });
+    store.createSession({ id: sessionId, backendId, targetId, title: "Remote folder task", remoteWorkspace: binding,
+      binding: { opaqueRef: "remote-folder-native", generation: 1 }, pinned: false, archived: false, permissionMode: "ask",
+      planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
+    store.appendEvent({ id: "remote-folder-link", backendId, targetId, sessionId, generation: 1, traceId: "remote-folder-link",
+      payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "[Remote docs](./docs/)" }] } });
+    await expect(fixture.anonymous.workspace.prepareWorkspaceDirectoryDownload({ workspaceId, relativePath: "docs" }))
+      .rejects.toMatchObject({ code: Code.Unauthenticated });
+
+    browser = await chromium.launch({ executablePath: browserPath!, headless: true });
+    const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 }, acceptDownloads: true });
+    const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Directory download Browser" })).challenge!;
+    await page.goto(`${fixture.baseUrl}/#/tasks/${sessionId}`, { waitUntil: "domcontentloaded" });
+    await page.getByRole("button", { name: "Add Joko node", exact: true }).click();
+    await page.locator("details.device-authorization__manual > summary").click();
+    await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+    await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
+    await page.getByLabel("Device name").fill("Directory download Browser");
+    await page.locator("form.pair-form button[type=submit]").click();
+    const link = page.getByRole("link", { name: "Remote docs", exact: true });
+    await link.click({ button: "right" });
+    const checkDownload = async (): Promise<void> => {
+      const [download] = await Promise.all([
+        page.waitForEvent("download"),
+        page.getByRole("menuitem", { name: "Download folder", exact: true }).click()
+      ]);
+      expect(download.suggestedFilename()).toBe("docs.tar.gz");
+      const path = (await download.path())!;
+      const members = execFileSync("tar", ["-tzf", path], { encoding: "utf8" }).trim().split(/\r?\n/u);
+      expect(members.map(name => name.replace(/^\.\//u, "")).sort()).toEqual([
+        "docs/", "docs/guide.txt", "docs/nested/", "docs/nested/data.bin", "docs/nested/empty/"
+      ]);
+      for (const [name, bytes] of [["docs/guide.txt", guide], ["docs/nested/data.bin", binary]] as const) {
+        const member = members.find(value => value.replace(/^\.\//u, "") === name)!;
+        expect(execFileSync("tar", ["-xOzf", path, member])).toEqual(bytes);
+      }
+    };
+    await checkDownload();
+    await page.goto(`${fixture.baseUrl}/#/files/${encodeURIComponent(sessionId)}`);
+    const row = page.locator('[data-workspace-tree-row][data-relative-path="docs"]');
+    await row.click({ button: "right" });
+    await checkDownload();
+    expect(files.write).not.toHaveBeenCalled();
+    expect(files.remove).not.toHaveBeenCalled();
+  } finally {
+    await browser?.close();
     await fixture.close();
   }
 });

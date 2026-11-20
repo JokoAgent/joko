@@ -189,7 +189,7 @@ describe("RemoteWorkspaceService", () => {
     await workspaces.close();
   });
 
-  it.each(["read-preflight", "read-in-flight", "write"] as const)("retires a revoked Connect Owner during a remote file %s", async (stage) => {
+  it.each(["read-preflight", "read-in-flight", "directory-in-flight", "write"] as const)("retires a revoked Connect Owner during a remote workspace %s", async (stage) => {
     const f = await memoryWorkspaceFixture();
     const store = new OperationalStore(":memory:");
     let release!: () => void;
@@ -211,10 +211,15 @@ describe("RemoteWorkspaceService", () => {
         return { connection, context };
       };
       const original = caller("original-file-owner"), observer = caller("current-file-owner");
+      const ingestFileHandle = vi.fn();
       const services = createConnectServices({ config: { publicOrigin: "http://127.0.0.1" }, store, connections, workspaces: f.workspaces,
-        artifacts: { maximumBlobBytes: 1024 }, sessionHost: {}, scheduler: {}, adapters: [], browserActivity: [] } as unknown as OrchestratorApplication);
+        artifacts: { maximumBlobBytes: 1024, ingestFileHandle }, sessionHost: {}, scheduler: {}, adapters: [], browserActivity: [] } as unknown as OrchestratorApplication);
       const path = "/workspace/note.txt", fields = { workspaceId: f.registration.id, relativePath: "note.txt" };
       await f.files.write({ path, content: Buffer.from("Original text") });
+      if (stage === "directory-in-flight") {
+        await f.files.mkdir("/workspace/docs");
+        await f.files.write({ path: "/workspace/docs/note.txt", content: Buffer.from("Original directory file") });
+      }
       const readRequest = create(contract.ReadWorkspaceFileRequestSchema, { ...fields, maximumBytes: 1024n });
       const preview = await services.workspace.readWorkspaceFile(readRequest, observer.context);
       const writeRequest = create(contract.WriteWorkspaceTextFileRequestSchema, {
@@ -223,7 +228,7 @@ describe("RemoteWorkspaceService", () => {
       const readFile = f.files.read.bind(f.files);
       const read = vi.spyOn(f.files, "read");
       const write = vi.spyOn(f.files, "write");
-      if (stage === "read-in-flight") {
+      if (stage === "read-in-flight" || stage === "directory-in-flight") {
         read.mockImplementationOnce(async (request) => { await pause(); return readFile(request); });
       } else {
         const statFile = f.files.stat.bind(f.files);
@@ -235,14 +240,19 @@ describe("RemoteWorkspaceService", () => {
       }
       const result = stage === "write"
         ? services.workspace.writeWorkspaceTextFile(writeRequest, original.context)
-        : services.workspace.readWorkspaceFile(readRequest, original.context);
+        : stage === "directory-in-flight"
+          ? services.workspace.prepareWorkspaceDirectoryDownload(create(contract.PrepareWorkspaceDirectoryDownloadRequestSchema, {
+            workspaceId: fields.workspaceId, relativePath: "docs"
+          }), original.context)
+          : services.workspace.readWorkspaceFile(readRequest, original.context);
       const denied = expect(result).rejects.toMatchObject({ code: Code.Unauthenticated });
       await vi.waitFor(() => expect(waiting).toHaveBeenCalledOnce());
       connections.revokeDevice(original.connection.deviceId);
       release();
       await denied;
       expect(original.context.signal.aborted).toBe(false);
-      expect(read).toHaveBeenCalledTimes(stage === "read-in-flight" ? 1 : 0);
+      expect(read).toHaveBeenCalledTimes(stage === "read-in-flight" || stage === "directory-in-flight" ? 1 : 0);
+      expect(ingestFileHandle).not.toHaveBeenCalled();
       expect(write).not.toHaveBeenCalled();
       expect(Buffer.from(await readFile({ path, maximumBytes: 1024 })).toString()).toBe("Original text");
 

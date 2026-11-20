@@ -675,6 +675,13 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const addTimelineWorkspaceImage = useCallback((file: File): void => {
     setComposerAttachmentInsertion({ id: ++composerAttachmentInsertionIdRef.current, sessionId: session.id, file });
   }, [session.id]);
+  const canDownloadWorkspaceDirectory = workspace?.remoteWorkspace !== undefined && workspace.trusted && !guest && !reviewReadOnly;
+  const downloadWorkspaceDirectory = useMemo(() => {
+    const download = controller.downloadWorkspaceDirectory;
+    const id = workspace?.id;
+    if (download === undefined || id === undefined || !canDownloadWorkspaceDirectory) return undefined;
+    return (path: string, context: Parameters<typeof download>[3]) => download(id, path, undefined, context);
+  }, [controller.downloadWorkspaceDirectory, workspace?.id, canDownloadWorkspaceDirectory, controller.state.connectionGeneration]);
   // Freeze reviewer input/settings but still expose Stop for the
   // isolated task that is currently running.
   const canAbort = backend?.capabilities.get("turn.abort")?.supported === true;
@@ -2639,6 +2646,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         streamFadeEnabled={controller.state.preferences.streamFadeEnabled}
         onOpenHttpLink={(url, options) => controller.openHttpLink(url, { ...options, sessionId: session.id })}
         onOpenWorkspaceHtml={workspace === undefined ? undefined : (path, options) => controller.openWorkspaceHtml(session.id, workspace.id, path, options)}
+        onDownloadWorkspaceDirectory={downloadWorkspaceDirectory}
         onLoadWorkspaceAsset={canOpenWorkspaceReferences ? loadTimelineWorkspaceAsset : undefined}
         onWorkspaceImageToComposer={canAddWorkspaceImage ? addTimelineWorkspaceImage : undefined}
         subagentRuns={subagentRuns}

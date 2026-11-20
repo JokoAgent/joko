@@ -25,6 +25,7 @@ import {
   ChevronRight,
   ChevronsDownUp,
   Clipboard,
+  Download,
   Eye,
   File,
   FileCode2,
@@ -44,6 +45,8 @@ import {
 } from "lucide-react";
 
 import { IconButton, cx } from "./ui.js";
+import type { OperationApi } from "../model.js";
+import { useArtifactDownload } from "./use-artifact-download.js";
 import {
   WORKSPACE_ENTRY_DRAG_MIME,
   WORKSPACE_FILTER_RESULT_LIMIT,
@@ -141,6 +144,7 @@ export interface WorkspaceFilesDocumentActions {
   /** False means the formal document host cancelled at its dirty-leave gate. */
   readonly delete?: (input: { readonly workspaceId: string; readonly path: string; readonly kind: WorkspaceFilesEntryView["kind"]; readonly expectedRevision: string }) => Promise<void | boolean>;
   readonly copyRelativePath?: (input: { readonly workspaceId: string; readonly path: string }) => Promise<void>;
+  readonly downloadDirectory?: OperationApi["downloadWorkspaceDirectory"];
 }
 
 export interface WorkspaceFilesSidebarLabels {
@@ -175,6 +179,9 @@ export interface WorkspaceFilesSidebarLabels {
   readonly rename: string;
   readonly delete: string;
   readonly copyRelativePath: string;
+  readonly downloadDirectory: string;
+  readonly downloadingDirectory: string;
+  readonly directoryDownloadFailed: string;
   readonly cancel: string;
   readonly confirm: string;
   readonly name: string;
@@ -337,6 +344,9 @@ const DEFAULT_LABELS: WorkspaceFilesSidebarLabels = {
   rename: "Rename",
   delete: "Delete",
   copyRelativePath: "Copy relative path",
+  downloadDirectory: "Download folder",
+  downloadingDirectory: "Downloading folder…",
+  directoryDownloadFailed: "Couldn’t download this folder.",
   cancel: "Cancel",
   confirm: "Confirm",
   name: "Name",
@@ -840,6 +850,7 @@ const WorkspaceFilesSidebarBody = forwardRef<WorkspaceFilesSidebarHandle, Worksp
 
     {contextMenu !== undefined && ownerDocument !== undefined && createPortal(<WorkspaceFilesContextMenu
       state={contextMenu}
+      workspaceId={workspaceId}
       actions={documentActions}
       labels={labels}
       onClose={() => closeContextMenu(true)}
@@ -1660,8 +1671,9 @@ function WorkspaceFilesProjectSwitcher({ activeTargetId, displayName, labels, pr
   </details>;
 }
 
-function WorkspaceFilesContextMenu({ state, actions, labels, onClose, onOperation, onCopy }: {
+function WorkspaceFilesContextMenu({ state, workspaceId, actions, labels, onClose, onOperation, onCopy }: {
   readonly state: ContextMenuState;
+  readonly workspaceId: string;
   readonly actions?: WorkspaceFilesDocumentActions;
   readonly labels: WorkspaceFilesSidebarLabels;
   readonly onClose: () => void;
@@ -1676,11 +1688,18 @@ function WorkspaceFilesContextMenu({ state, actions, labels, onClose, onOperatio
     if (typeaheadRef.current.timer !== undefined) ownerWindow?.clearTimeout(typeaheadRef.current.timer);
   }, []);
   const entry = state.entry;
+  const downloadDirectory = actions?.downloadDirectory;
+  const download = useArtifactDownload(JSON.stringify([workspaceId, entry?.path, entry?.revision]), downloadDirectory);
   const parentPath = entry?.kind === "directory" ? entry.path : "";
   const items: JSX.Element[] = [];
   if ((entry === undefined || entry.kind === "directory") && canDocumentAction(actions, "createFile")) items.push(<button type="button" role="menuitem" tabIndex={-1} key="create-file" onClick={() => onOperation({ kind: "createFile", parentPath, ownerDocument: state.ownerDocument })}><FilePlus aria-hidden="true" />{labels.newFile}</button>);
   if ((entry === undefined || entry.kind === "directory") && canDocumentAction(actions, "createDirectory")) items.push(<button type="button" role="menuitem" tabIndex={-1} key="create-directory" onClick={() => onOperation({ kind: "createDirectory", parentPath, ownerDocument: state.ownerDocument })}><FolderPlus aria-hidden="true" />{labels.newFolder}</button>);
   if (entry !== undefined && canDocumentAction(actions, "copyRelativePath")) items.push(<button type="button" role="menuitem" tabIndex={-1} key="copy" onClick={() => onCopy(entry)}><Clipboard aria-hidden="true" />{labels.copyRelativePath}</button>);
+  if (entry?.kind === "directory" && downloadDirectory !== undefined) items.push(<button type="button" role="menuitem" tabIndex={-1} key="download"
+    aria-disabled={download.pending} onClick={() => download.run(state.ownerDocument, async context => {
+      await downloadDirectory(workspaceId, entry.path, entry.revision, context);
+      if (!context.signal.aborted) onClose();
+    })}><Download aria-hidden="true" />{labels.downloadDirectory}</button>);
   if (entry !== undefined && canDocumentAction(actions, "rename")) items.push(<button type="button" role="menuitem" tabIndex={-1} key="rename" disabled={!entry.revision} onClick={() => onOperation({ kind: "rename", entry, ownerDocument: state.ownerDocument })}><Pencil aria-hidden="true" />{labels.rename}</button>);
   if (entry?.kind === "file" && canDocumentAction(actions, "delete")) items.push(<button type="button" role="menuitem" tabIndex={-1} className="is-danger" key="delete" disabled={!entry.revision} onClick={() => onOperation({ kind: "delete", entry, ownerDocument: state.ownerDocument })}><Trash2 aria-hidden="true" />{labels.delete}</button>);
   return <div
@@ -1693,7 +1712,9 @@ function WorkspaceFilesContextMenu({ state, actions, labels, onClose, onOperatio
     onPointerDown={(event) => event.stopPropagation()}
     onContextMenu={(event) => event.preventDefault()}
     onKeyDown={(event) => navigateMenu(event, ref, typeaheadRef, onClose)}
-  >{items}</div>;
+  >{items}{(download.pending || download.failed) && <span role="status" aria-live="polite">
+    {download.pending ? labels.downloadingDirectory : labels.directoryDownloadFailed}
+  </span>}</div>;
 }
 
 function WorkspaceFilesInlineInput({ operation, depth, labels, onCancel, onError, onSubmit }: {
@@ -1919,6 +1940,7 @@ function hasWorkspaceContextActions(actions: WorkspaceFilesDocumentActions | und
   if (entry === undefined || entry.kind === "directory") {
     if (canDocumentAction(actions, "createFile") || canDocumentAction(actions, "createDirectory")) return true;
   }
+  if (entry?.kind === "directory" && actions?.downloadDirectory !== undefined) return true;
   return entry !== undefined && (canDocumentAction(actions, "copyRelativePath")
     || canDocumentAction(actions, "rename")
     || (entry.kind === "file" && canDocumentAction(actions, "delete")));

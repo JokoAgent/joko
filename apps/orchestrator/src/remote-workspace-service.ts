@@ -2,8 +2,15 @@ import { createHash, randomUUID } from "node:crypto";
 import { open, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path, { posix, win32, type PlatformPath } from "node:path";
+import { create as createTarArchive } from "tar";
 
-import { reviewImageMimeType, workspaceEntryAbsentRevision } from "@joko/contracts";
+import {
+  isWorkspaceDirectoryArchiveName,
+  reviewImageMimeType,
+  WORKSPACE_DIRECTORY_ARCHIVE_MAXIMUM_ENTRIES,
+  workspaceDirectoryArchiveNameKey,
+  workspaceEntryAbsentRevision
+} from "@joko/contracts";
 import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
 import type {
   RemoteDirectoryEntry,
@@ -41,6 +48,8 @@ import {
   type GitState,
   type RemoteWorkspaceDelegate,
   type ReviewGitRunner,
+  type WorkspaceDirectoryArchiveIngest,
+  type WorkspaceDirectoryArchiveRequest,
   type WorkspaceEntryListingOptions,
   type WorkspaceEntryMutationResult,
   type WorkspaceEntryRecord,
@@ -74,6 +83,7 @@ import {
 const MAXIMUM_PROCESS_OUTPUT = 16 * 1024 * 1024;
 const MAXIMUM_TREE_ENTRIES = 100_000;
 const MAXIMUM_COPY_BYTES = 256 * 1024 * 1024;
+const MAXIMUM_DOWNLOAD_FILE_BYTES = 64 * 1024 * 1024;
 const GIT_METHODS = new Set([
   "gitState", "gitDiff", "gitReviewDiff", "readGitDiffFile", "readGitReviewFile", "readGitDiffImage",
   "applyGitDiffHunk", "applyGitDiff", "commitGitReview", "pushGitReview"
@@ -252,6 +262,8 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
         case "list": result = await this.#list(registration, transports.files, args[0] as string, args[1] as WorkspaceEntryListingOptions | undefined); break;
         case "preview": result = await this.#preview(registration, transports.files, args[0] as string, args[1] as number, args[2] as number | undefined, request?.signal, transports.assertCurrent); break;
         case "materializeFile": result = await this.#materialize(registration, transports.files, args, transports.assertCurrent); break;
+        case "materializeDirectory": result = await this.#materializeDirectory(registration, transports.files,
+          args[0] as WorkspaceDirectoryArchiveRequest, args[1] as WorkspaceDirectoryArchiveIngest<unknown>, transports.assertCurrent, request?.signal); break;
         case "listFiles": result = await this.#listFiles(registration, transports.files); break;
         case "writeTextFile": result = await this.#writeTextFile(registration, transports.files, args[0] as WorkspaceTextFileWriteInput, request?.signal); break;
         case "createEntry": result = await this.#createEntry(registration, transports.files, args[0] as { path: string; kind: "file" | "directory"; expectedRevision: string }); break;
@@ -342,23 +354,24 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     registration: WorkspaceRegistration,
     files: RemoteFileTransportPort,
     directory = "",
-    options?: WorkspaceEntryListingOptions
+    options?: WorkspaceEntryListingOptions,
+    signal?: AbortSignal
   ): Promise<readonly WorkspaceEntryRecord[]> {
     const start = remoteWorkspacePath(registration, directory, true);
     const maximum = Math.min(Math.max(options?.maximumEntries ?? 10_000, 1), MAXIMUM_TREE_ENTRIES);
     const output: WorkspaceEntryRecord[] = [];
     const visit = async (absolute: string, prefix: string, depth: number): Promise<void> => {
       if (depth > 128) throw new WorkspaceScanError("Remote workspace tree is too deep.", "limit");
-      if (await files.realpath(absolute) !== absolute || (await files.stat(absolute)).kind !== "directory") throw new WorkspaceScanError("Remote listing requires a canonical directory.", "scan_failed");
-      const entries = [...await files.list(absolute)].sort(compareRemoteEntries);
+      if (await files.realpath(absolute, signal) !== absolute || (await files.stat(absolute, signal)).kind !== "directory") throw new WorkspaceScanError("Remote listing requires a canonical directory.", "scan_failed");
+      const entries = [...await files.list(absolute, signal)].sort(compareRemoteEntries);
       for (const entry of entries) {
         if (!safeEntryName(entry.name) || entry.kind === "symbolic_link" || entry.kind === "other") continue;
         if (entry.name === ".git") continue;
         const relativePath = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
         const path = pathApi(registration).join(absolute, entry.name);
-        const info = await files.stat(path);
+        const info = await files.stat(path, signal);
         if (info.kind !== "file" && info.kind !== "directory") continue;
-        if (await files.realpath(path) !== path) continue;
+        if (await files.realpath(path, signal) !== path) continue;
         if (output.length >= maximum) throw new WorkspaceScanError("Remote workspace listing exceeded its limit.", "limit");
         output.push(remoteEntry(relativePath, info));
         if (info.kind === "directory" && options?.recursive === true) await visit(path, relativePath, depth + 1);
@@ -437,7 +450,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     const path = remoteWorkspacePath(registration, relativePath, false);
     if (await files.realpath(path, signal) !== path) throw new WorkspaceFilePreviewError("Remote download path is not canonical.", "invalid");
     const before = await files.stat(path, signal);
-    if (before.kind !== "file" || before.size > 64 * 1024 * 1024) {
+    if (before.kind !== "file" || before.size > MAXIMUM_DOWNLOAD_FILE_BYTES) {
       throw new WorkspaceFilePreviewError("Remote download requires a bounded regular file.", "unsupported");
     }
     const { bytes: content } = await this.#readFileBytes(registration, files, path, before,
@@ -467,6 +480,107 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     } finally {
       await handle.close().catch(() => undefined);
       await rm(directory, { recursive: true, force: true });
+    }
+  }
+
+  async #materializeDirectory(
+    registration: WorkspaceRegistration,
+    files: RemoteFileTransportPort,
+    request: WorkspaceDirectoryArchiveRequest,
+    ingest: WorkspaceDirectoryArchiveIngest<unknown>,
+    assertCurrent: () => void,
+    signal?: AbortSignal
+  ): Promise<unknown> {
+    const segments = request.relativePath.split("/");
+    if (!registration.trusted) throw new WorkspaceFilePreviewError("Directory download requires a trusted remote workspace.", "unsupported");
+    if (!segments.every(isWorkspaceDirectoryArchiveName) || request.relativePath.length > 4_096) {
+      throw new WorkspaceFilePreviewError("The remote download directory path is invalid.", "invalid");
+    }
+    const directoryName = segments[segments.length - 1]!;
+    const source = remoteWorkspacePath(registration, request.relativePath, false);
+    assertCurrent();
+    if (await files.realpath(source, signal) !== source) {
+      throw new WorkspaceFilePreviewError("Remote download requires a canonical directory.", "unsupported");
+    }
+    const before = await files.stat(source, signal);
+    if (before.kind !== "directory") {
+      throw new WorkspaceFilePreviewError("Remote download requires a canonical directory.", "unsupported");
+    }
+    if (request.expectedRevision !== "" && request.expectedRevision !== remoteRevision(before)) {
+      throw new WorkspaceFilePreviewError("The remote directory changed before download.", "stale");
+    }
+    const listing = { recursive: true, maximumEntries: WORKSPACE_DIRECTORY_ARCHIVE_MAXIMUM_ENTRIES };
+    const entries = await this.#list(registration, files, request.relativePath, listing, signal);
+    let byteLength = 0;
+    const relativePaths = new Set<string>();
+    for (const entry of entries) {
+      if (!isWorkspaceDirectoryArchiveName(entry.name)) {
+        throw new WorkspaceFilePreviewError("The remote directory contains a name that cannot be downloaded safely.", "unsupported");
+      }
+      const nameKey = workspaceDirectoryArchiveNameKey(entry.path);
+      if (relativePaths.has(nameKey)) {
+        throw new WorkspaceFilePreviewError("The remote directory contains names that would overwrite each other.", "unsupported");
+      }
+      relativePaths.add(nameKey);
+      if (entry.kind === "directory") continue;
+      byteLength += entry.size;
+      if (!Number.isSafeInteger(entry.size) || entry.size < 0 || entry.size > MAXIMUM_DOWNLOAD_FILE_BYTES
+        || byteLength > request.maximumBytes) {
+        throw new WorkspaceFilePreviewError("The remote directory exceeds the configured download size.", "unsupported");
+      }
+    }
+    const snapshotStillCurrent = async (): Promise<void> => {
+      assertCurrent();
+      const current = await files.stat(source, signal);
+      if (remoteRevision(before) !== remoteRevision(current) || await files.realpath(source, signal) !== source) {
+        throw new WorkspaceFilePreviewError("The remote directory changed during download.", "stale");
+      }
+      const latest = await this.#list(registration, files, request.relativePath, listing, signal);
+      if (latest.length !== entries.length || latest.some((entry, index) =>
+        entry.path !== entries[index]?.path || entry.revision !== entries[index]?.revision)) {
+        throw new WorkspaceFilePreviewError("The remote directory changed during download.", "stale");
+      }
+      assertCurrent();
+    };
+
+    const staging = await mkdtemp(path.join(tmpdir(), "joko-workspace-download-"));
+    const content = path.join(staging, "content");
+    const archive = path.join(staging, "workspace.tar.gz");
+    try {
+      await mkdir(content, { mode: 0o700 });
+      await mkdir(path.join(content, directoryName), { mode: 0o700 });
+      for (const entry of entries) {
+        assertCurrent();
+        const destination = path.join(content, ...entry.path.split("/").slice(segments.length - 1));
+        if (entry.kind === "directory") {
+          await mkdir(destination, { mode: 0o700 });
+          continue;
+        }
+        const candidate = remoteWorkspacePath(registration, entry.path, false);
+        if (await files.realpath(candidate, signal) !== candidate) {
+          throw new WorkspaceFilePreviewError("A remote file changed before download.", "stale");
+        }
+        const observed = await files.stat(candidate, signal);
+        if (observed.kind !== "file" || remoteRevision(observed) !== entry.revision) {
+          throw new WorkspaceFilePreviewError("A remote file changed before download.", "stale");
+        }
+        const { bytes } = await this.#readFileBytes(registration, files, candidate, observed, Math.max(entry.size, 1), false, assertCurrent, signal);
+        if (bytes.length !== entry.size) throw new WorkspaceFilePreviewError("The remote file download was incomplete.", "stale");
+        await writeFile(destination, bytes, { flag: "wx", mode: 0o600, signal });
+      }
+      assertCurrent();
+      await createTarArchive({ cwd: content, file: archive, portable: true, gzip: true, strict: true, follow: false,
+        onWriteEntry: () => assertCurrent() }, [`./${directoryName}`]);
+      const handle = await open(archive, "r");
+      try {
+        const { size } = await handle.stat();
+        if (size > request.maximumBytes) throw new WorkspaceFilePreviewError("The directory archive exceeds the configured download size.", "unsupported");
+        return await ingest(handle, { directoryName, expectedSize: size, beforeFinalize: snapshotStillCurrent });
+      } finally {
+        await handle.close();
+      }
+    } finally {
+      await rm(staging, { recursive: true, force: true });
     }
   }
 
