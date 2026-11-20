@@ -77,6 +77,7 @@ export interface MobileSettingsScreenProps {
   readonly onThemeChange: (preference: MobileThemePreference) => Promise<void>;
   readonly onLocaleChange: (preference: MobileLocalePreference) => Promise<void>;
   readonly onPushEnabledChange: (enabled: boolean) => Promise<void>;
+  readonly onPushPreviewEnabledChange: (enabled: boolean) => Promise<void>;
   readonly onDiagnosticsEnabledChange: (enabled: boolean) => Promise<void>;
   readonly onDiagnosticsClear: () => Promise<void>;
   readonly onDiagnosticsExport: () => Promise<void>;
@@ -128,7 +129,7 @@ export function resolveMobileSettingsCurrentDevice(state: MobileState): MobileSe
 
 export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
   const { colors, state, foreground, theme, locale, diagnostics, voiceDictionary, client, onThemeChange,
-  onLocaleChange, onPushEnabledChange, onDiagnosticsEnabledChange, onDiagnosticsClear, onDiagnosticsExport, onBack,
+  onLocaleChange, onPushEnabledChange, onPushPreviewEnabledChange, onDiagnosticsEnabledChange, onDiagnosticsClear, onDiagnosticsExport, onBack,
   onVoiceDictionaryRetry, onVoiceDictionaryReset, onVoiceInstructionsChange, onVoiceAutoLearningChange, onVoiceDictionaryAdd,
   onVoiceDictionaryEdit, onVoiceDictionaryDelete, onConnections, onDevices, updates, updateActions, push,
   appVersion } = props;
@@ -463,7 +464,20 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
             void onPushEnabledChange(value).catch(() => setLocalError(t("settings.notifications.error")));
           }} />
       </View>
-      <Text style={[styles.caption, { color: colors.muted }]}>{t("settings.notifications.privacy")}</Text>
+      {push.status !== "unsupported-platform" && <View style={styles.toggleRow}>
+        <View style={styles.fill}>
+          <Text style={[styles.label, { color: colors.ink }]}>{t("settings.notifications.preview")}</Text>
+          <Text style={[styles.caption, { color: colors.muted }]}>{t("settings.notifications.previewDescription")}</Text>
+        </View>
+        <Switch accessibilityLabel={t("settings.notifications.preview")} value={push.previewEnabled === true}
+          disabled={!push.enabled || push.status === "loading" || push.saving}
+          trackColor={{ false: colors.border, true: colors.accent }} thumbColor={colors.surface}
+          onValueChange={(value) => {
+            setLocalError("");
+            setNotice("");
+            void onPushPreviewEnabledChange(value).catch(() => setLocalError(t("settings.notifications.error")));
+          }} />
+      </View>}
       {push.error && <ErrorNotice colors={colors} text={t(push.error === "retirement"
         ? "settings.notifications.retirement" : "settings.notifications.error")} />}
     </View>

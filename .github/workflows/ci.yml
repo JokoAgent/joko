@@ -107,6 +107,7 @@ jobs:
         run: >-
           pnpm exec vitest run
           src/artifact-store.test.ts src/browser-automation-node.test.ts src/collaboration-worker-workspace.test.ts
+          src/mobile-push.test.ts src/apns-mobile-push-provider.test.ts
           src/connect-services.audit.test.ts src/connect-services.extension-catalog.test.ts
           src/connect-services.features.test.ts src/connect-services.git-review.test.ts src/connect-services.test.ts
           src/extension-catalog.test.ts src/extension-device-sync.test.ts

@@ -45,6 +45,7 @@ message MobilePushRegistration {
   MobilePushLocale locale = 6;
   google.protobuf.Timestamp expires_at = 7;
   EntityVersion version = 8;
+  bool preview_enabled = 9;
 }
 
 // A narrowly-scoped credential that can only delete one exact registration
@@ -76,6 +77,8 @@ message RegisterMobilePushRequest {
   // retired exactly after logout, forget, or a profile switch.
   string registration_id = 8;
   string revocation_secret = 9;
+  // An explicit opt-in to short ordinary task previews on this registration.
+  bool preview_enabled = 10;
 }
 
 message RegisterMobilePushResponse {

@@ -42,6 +42,7 @@ interface Props {
   readonly ownerKey: string;
   readonly selectable?: boolean;
   readonly quoteAction?: MobileMessageQuoteAction;
+  readonly codeQuoteAction?: MobileMessageQuoteAction;
   readonly resourceClient?: MobileMarkdownResourceClient;
   readonly resourceOwnerKey?: string;
   readonly messageId?: string;
@@ -87,7 +88,7 @@ export const MobileMarkdownMessage = memo(function MobileMarkdownMessage(props: 
 });
 
 const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ text, colors, locale, ownerKey, selectable = true,
-  preparedResources: resources, onOpenImage, onOpenPath, retryPath, onAnnotateDiagram }: Props & {
+  codeQuoteAction, preparedResources: resources, onOpenImage, onOpenPath, retryPath, onAnnotateDiagram }: Props & {
     readonly preparedResources?: MobileMarkdownResourceDescriptor;
     readonly retryPath?: (key: string) => void;
   }) {
@@ -105,19 +106,24 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
     maxTextRunBlocks: 48, maxTextRunUtf16Length: 12_000, maxTextRunInlineFragments: 512, rendersInlineImage
   }), [parsed, rendersInlineImage]);
   const [notice, setNotice] = useState<string | { readonly source: MarkdownCopySource; readonly copied: boolean }>("");
+  const [expanded, setExpanded] = useState<Extract<MobileMarkdownBlock, { type: "math" | "mermaid" }>>();
   const committedCopySources = useRef(new Map<string, MarkdownCopySource>());
   const copySources = new Map<string, MarkdownCopySource>();
+  const registerCopySource = (key: string, type: MarkdownCopySource["type"], text: string): MarkdownCopySource => {
+    const previous = committedCopySources.current.get(key);
+    const source = previous?.ownerKey === ownerKey && previous.type === type && previous.text === text
+      ? previous : { ownerKey, key, type, text };
+    copySources.set(key, source);
+    return source;
+  };
   for (const block of parsed.blocks) {
-    if (block.type !== "code" && block.type !== "math" && block.type !== "mermaid") continue;
-    const source = committedCopySources.current.get(block.key);
-    copySources.set(block.key, source?.ownerKey === ownerKey && source.type === block.type && source.text === block.text
-      ? source : { ownerKey, key: block.key, type: block.type, text: block.text });
+    if (block.type === "code" || block.type === "math" || block.type === "mermaid") registerCopySource(block.key, block.type, block.text);
   }
+  const expandedCopySource = expanded === undefined ? undefined : registerCopySource(`expanded:${expanded.key}`, expanded.type, expanded.text);
   useLayoutEffect(() => { committedCopySources.current = copySources; });
   const noticeText = typeof notice === "string" ? notice : copySources.get(notice.source.key) === notice.source
     ? mobileMessage(locale, notice.copied ? "markdown.copied" : "markdown.copyFailed") : "";
   const [copying, setCopying] = useState(false);
-  const [expanded, setExpanded] = useState<Extract<MobileMarkdownBlock, { type: "math" | "mermaid" }>>();
   const [viewDiagramSource, setViewDiagramSource] = useState(false);
   const diagramScope = useRef<AbortController | undefined>(undefined);
   const diagramHandoff = useRef<{ readonly ownerKey: string; readonly open: () => void } | undefined>(undefined);
@@ -212,16 +218,18 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
   </View>;
   const block = (value: MobileMarkdownBlock) => {
     if (value.type === "code") {
-      const runs = mobileCodeHighlight(value.text, value.language);
+      const codeQuote = selectable ? codeQuoteAction : undefined;
+      const runs = codeQuote === undefined ? mobileCodeHighlight(value.text, value.language) : [];
       return <View key={value.key} style={[styles.frame, { borderColor: colors.border, backgroundColor: colors.background }]}>
         {toolbar(copySources.get(value.key)!, value.language ?? mobileMessage(locale, "markdown.code"))}
         <ScrollView horizontal nestedScrollEnabled contentContainerStyle={styles.codeContent}>
-          <Text selectable={selectable} style={[styles.code, { color: colors.ink }]}>
+          {codeQuote !== undefined ? <MobileSelectableMessageText text={value.text} ink={colors.ink} lineHeight={20} action={codeQuote} />
+            : <Text selectable={selectable} style={[styles.code, { color: colors.ink }]}>
             {runs.map((run, index) => <Text key={index} style={run.kind ? {
               color: /comment|meta/u.test(run.kind) ? colors.muted : /keyword|number|literal/u.test(run.kind) ? colors.accent : colors.ink,
               ...(/keyword/u.test(run.kind) ? { fontWeight: "600" as const } : {})
             } : undefined}>{run.text}</Text>)}
-          </Text>
+          </Text>}
         </ScrollView>
       </View>;
     }
@@ -294,7 +302,7 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
           <ScrollView contentContainerStyle={styles.expanded}>
             {expanded.type === "math" && <MobileMarkdownRichBlock kind="math" source={expanded.text} colors={colors}
               locale={locale} ownerKey={`${ownerKey}/expanded/${expanded.key}`} zoomable />}
-            {toolbar(expanded.text, mobileMessage(locale, "markdown.source"))}
+            {expandedCopySource && toolbar(expandedCopySource, mobileMessage(locale, "markdown.source"))}
             <Text selectable style={[styles.code, { color: colors.ink }]}>{expanded.text}</Text>
           </ScrollView>
         </>}

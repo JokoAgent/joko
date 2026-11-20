@@ -321,7 +321,7 @@ it("preserves edits to the retained task draft while the same node reconnects", 
   const text = "Keep the draft edited during reconnect";
   await act(async () => input.onEdit(replaceMobileComposerRange(original, { start: 0, end: original.text.length }, text), original));
   expect(input.draft.text).toBe(text);
-  const sendButton = [...host.querySelectorAll("button")].find(button => button.getAttribute("aria-label") === mobileMessage("en", "composer.send"));
+  const sendButton = Array.from(host.querySelectorAll("button")).find(button => button.getAttribute("aria-label") === mobileMessage("en", "composer.send"));
   expect(sendButton?.disabled).toBe(true);
   expect(send).not.toHaveBeenCalled();
   retainedDraftEditable = false;
@@ -338,7 +338,7 @@ it("offers the original retained input retry in the latest timeline only after n
     input: plainTextMobileComposerDraft("Original retained input"), storageIds: [], state: "confirming", attempted: true };
   retainedOutbox = [original];
   await act(async () => root.render(taskScreen()));
-  const button = (key: "common.retry" | "receipt.check") => [...host.querySelectorAll("button")]
+  const button = (key: "common.retry" | "receipt.check") => Array.from(host.querySelectorAll("button"))
     .find(item => item.getAttribute("aria-label") === mobileMessage("en", key));
   expect(button("receipt.check")).toBeDefined();
   expect(button("common.retry")).toBeUndefined();

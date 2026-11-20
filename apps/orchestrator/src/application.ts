@@ -918,17 +918,18 @@ export async function createOrchestratorApplication(
         privateKeyPem: await readFile(config.mobilePush.apns.privateKeyPath, "utf8"),
         topic: config.mobilePush.apns.topic
       }));
-  const mobilePush = new MobilePushCoordinator({
-    store,
-    vault: credentialVault,
-    serverId,
-    ...(mobilePushProvider === undefined ? {} : { provider: mobilePushProvider })
-  });
   const credentials = new CredentialManager({
     vault: credentialVault,
     storagePath: join(config.dataDirectory, "credentials", "records.json")
   });
   await credentials.initialize();
+  const mobilePush = new MobilePushCoordinator({
+    store,
+    vault: credentialVault,
+    serverId,
+    redactText: value => credentials.redactText(value),
+    ...(mobilePushProvider === undefined ? {} : { provider: mobilePushProvider })
+  });
   const serverAccess = new ServerAccessManager({ config, serverId, store, credentials, connections });
   reserveLinkspanTurnCredentials(store, credentials);
   reserveManagedLinkspanResourceCredentials({ config, store, credentials });

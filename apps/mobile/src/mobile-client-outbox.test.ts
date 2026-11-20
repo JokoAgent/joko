@@ -127,7 +127,7 @@ async function fixture() {
   const network = {
     inspect: vi.fn(async () => { if (!online) throw new Error("Network is offline"); return node; }),
     readOwner: vi.fn(async (_credential: PairedCredential) => ({ connection, device, snapshot: owner })),
-    readSession: vi.fn(async () => clone(SnapshotSchema, detail)),
+    readSession: vi.fn(async (_credential: PairedCredential, _sessionId: string) => clone(SnapshotSchema, detail)),
     streamOwner: vi.fn(async function* (_credential: PairedCredential, _cursor: unknown, signal: AbortSignal) {
       if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
     }),
@@ -316,6 +316,35 @@ describe("durable ordinary mobile task inputs", () => {
     expect(f.network.submit).toHaveBeenCalledTimes(2);
     await client.refresh();
     expect(f.network.submit.mock.calls[1]?.[1]).not.toBe("rejected-input"); expect(client.taskOutboxItems()).toEqual([]);
+  });
+
+  it.each(["identity", "old task"] as const)("opens the cached task during the pending %s read and adopts its exact connected detail", async held => {
+    const f = await fixture(), { client } = f.makeClient();
+    const secondId = "other-session";
+    const secondSession = { ...f.owner.sessions[0]!, sessionId: secondId, displayName: "Other cached task" };
+    f.owner.sessions.push(secondSession);
+    const secondDetail = create(SnapshotSchema, { ...f.detail, snapshotId: "other-detail", sessions: [secondSession],
+      scope: create(SnapshotScopeSchema, { kind: { case: "session", value: { sessionId: secondId, recentTimelineItems: 120 } } }) });
+    await f.cache.save(profileFromCredential(credential), node, f.owner, secondDetail);
+    f.network.readSession.mockImplementation(async (_credential, id) => clone(SnapshotSchema, id === secondId ? secondDetail : f.detail));
+    f.online();
+    let finishRead: (() => void) | undefined;
+    if (held === "identity") f.network.inspect.mockImplementationOnce(() => new Promise(resolve => { finishRead = () => resolve(node); }));
+    else f.network.readSession.mockImplementationOnce(() => new Promise(resolve => { finishRead = () => resolve(f.detail); }));
+    const connecting = client.start();
+    try {
+      await vi.waitFor(() => { expect(finishRead).toBeDefined(); expect(client.canOpenCachedTaskWhileConnecting(secondId)).toBe(true); });
+      expect(client.state.busy).toBe(true);
+      expect(client.canOpenCachedTaskWhileConnecting("another-node-task")).toBe(false);
+      await client.select(secondId);
+      expect(client.state).toMatchObject({ selectedId: secondId, status: "connecting", detail: { sessions: [{ sessionId: secondId }] } });
+      expect(f.network.readOwner).toHaveBeenCalledTimes(held === "identity" ? 0 : 1);
+      expect(f.network.readSession.mock.calls.map(([, id]) => id)).toEqual(held === "identity" ? [] : ["session"]);
+      expect(f.network.submit).not.toHaveBeenCalled();
+    } finally { finishRead?.(); await connecting; }
+    expect(client.state).toMatchObject({ selectedId: secondId, status: "connected", detail: { sessions: [{ sessionId: secondId }] } });
+    expect(f.network.readSession.mock.calls.map(([, id]) => id)).toEqual(held === "identity" ? [secondId] : ["session", secondId]);
+    expect(await f.storage.loadSelection(credential.profileId)).toBe(secondId);
   });
 
   it("authorizes only local draft edits for the exact cached task during reconnect", async () => {

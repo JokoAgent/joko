@@ -192,6 +192,7 @@ export interface MobilePushRegistrationInput {
   readonly locale: MobilePushLocale;
   readonly deviceToken: string;
   readonly ticket: MobilePushRevocationTicket;
+  readonly previewEnabled?: boolean;
 }
 
 export interface MobilePushRegistrationResult {
@@ -2751,6 +2752,7 @@ export const mobileNetwork: MobileNetwork = {
     if (ticket.serverId !== credential.serverId) throw new Error("The mobile push ticket belongs to another Joko node.");
     const environment = wireMobilePushEnvironment(input.environment);
     const locale = wireMobilePushLocale(input.locale);
+    const previewEnabled = input.previewEnabled === true;
     const response = await createClient(ConnectionService, credentialTransport(credential)).registerMobilePush({
       connectionId: credential.connectionId,
       deviceId: credential.deviceId,
@@ -2760,7 +2762,8 @@ export const mobileNetwork: MobileNetwork = {
       locale,
       deviceToken: normalizedMobilePushToken(input.deviceToken),
       registrationId: ticket.registrationId,
-      revocationSecret: ticket.secret
+      revocationSecret: ticket.secret,
+      previewEnabled
     }, options(signal));
     const registration = response.registration;
     const returnedTicket = response.revocationTicket;
@@ -2770,7 +2773,7 @@ export const mobileNetwork: MobileNetwork = {
       || registration.registrationId !== ticket.registrationId
       || registration.connectionId !== credential.connectionId || registration.deviceId !== credential.deviceId
       || registration.provider !== MobilePushProvider.APNS || registration.environment !== environment
-      || registration.locale !== locale || returnedTicket.serverId !== ticket.serverId
+      || registration.locale !== locale || registration.previewEnabled !== previewEnabled || returnedTicket.serverId !== ticket.serverId
       || returnedTicket.registrationId !== ticket.registrationId || returnedTicket.secret !== ticket.secret) {
       throw new Error("The Joko node returned an invalid mobile push registration.");
     }

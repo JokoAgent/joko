@@ -36,6 +36,7 @@ function clientFixture(initial = authority()) {
     environment: "sandbox" | "production";
     locale: "en" | "zh-CN" | "zh-TW" | "ja" | "ko";
     deviceToken: string;
+    previewEnabled?: boolean;
   }) => {
     void owner;
     void input;
@@ -207,6 +208,29 @@ describe("MobilePushController", () => {
     expect(fixture.notifications.requestPermissionsAsync).not.toHaveBeenCalled();
     expect(fixture.client.registerMobilePush).toHaveBeenCalledTimes(1);
     expect(fixture.controller.snapshot.status).toBe("registered");
+  });
+
+  it("syncs the explicit preview preference on the original registration and restores it after reopening", async () => {
+    const fixture = controllerFixture({ enabled: true });
+    await fixture.controller.start(() => true);
+    const initial = fixture.client.registerMobilePush.mock.calls[0]![1];
+    expect(initial.previewEnabled).toBe(false);
+    await fixture.controller.setPreviewEnabled(true);
+    expect(fixture.client.registerMobilePush.mock.calls[1]![1]).toEqual({ ...initial, previewEnabled: true });
+    expect(fixture.storage.store.snapshot.registrations[0]).toMatchObject({ previewEnabled: true, confirmed: true });
+    fixture.controller.stop();
+
+    const reopened = controllerFixture({ persisted: fixture.storage });
+    await reopened.controller.start(() => true);
+    expect(reopened.controller.snapshot).toMatchObject({ previewEnabled: true, status: "registered" });
+    expect(reopened.client.registerMobilePush.mock.calls[0]![1]).toEqual({ ...initial, previewEnabled: true });
+    reopened.client.registerMobilePush.mockRejectedValueOnce(new Error("registration reply lost"));
+    await reopened.controller.setPreviewEnabled(false);
+    expect(reopened.controller.snapshot).toMatchObject({ previewEnabled: false, status: "error", error: "sync" });
+    await reopened.controller.reconcile();
+    expect(reopened.client.registerMobilePush.mock.calls.slice(1).map(([, input]) => input)).toEqual([initial, initial]);
+    expect(reopened.storage.store.snapshot.registrations[0]).toMatchObject({ previewEnabled: false, confirmed: true });
+    reopened.controller.stop();
   });
 
   it.each(["foreground resume", "reconnect"] as const)("repairs a removed server registration after %s with its original ticket", async (entry) => {

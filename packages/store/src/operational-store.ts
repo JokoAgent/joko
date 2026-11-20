@@ -459,6 +459,7 @@ export function messagingConversationContextAad(
   ]);
 }
 const MESSAGE_SEARCH_RRF_K = 60;
+const MOBILE_PUSH_PREVIEW_SETTING_KEY = "mobile-push-preview.v1";
 const STORE_SCAN_PAGE_SIZE = 100_000;
 const NATIVE_BLANK_RECOVERY_SETTING_KEY = "runtime.native_blank_recovery";
 const MESSAGE_REWIND_CONTINUATION_SETTING_KEY = "runtime.message_rewind_continuation";
@@ -2049,6 +2050,10 @@ export class OperationalStore {
     ).all() as Row[]).map(mobilePushRegistrationFromRow);
   }
 
+  mobilePushPreviewEnabled(registration: Pick<MobilePushRegistrationRecord, "id" | "connectionId">): boolean {
+    return this.findSetting("connection", registration.connectionId, MOBILE_PUSH_PREVIEW_SETTING_KEY)?.value === registration.id;
+  }
+
   putMobilePushRegistration(input: PutMobilePushRegistrationInput): MobilePushRegistrationRecord {
     return this.write(() => {
       const now = input.now ?? this.now();
@@ -2144,6 +2149,12 @@ export class OperationalStore {
         now,
         asSqlInteger(this.requireActiveRevision())
       );
+      // This preference belongs to the exact registration on this Connection.
+      if (input.previewEnabled === true) {
+        this.setSetting("connection", connection.id, MOBILE_PUSH_PREVIEW_SETTING_KEY, id, now);
+      } else {
+        this.deleteSetting("connection", connection.id, MOBILE_PUSH_PREVIEW_SETTING_KEY);
+      }
       return this.getMobilePushRegistration(id);
     });
   }

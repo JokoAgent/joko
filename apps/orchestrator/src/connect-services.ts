@@ -1868,10 +1868,11 @@ export function createConnectServices(application: OrchestratorApplication, proj
         locale: nativeMobilePushLocale(request.locale),
         deviceToken: request.deviceToken,
         registrationId: request.registrationId,
-        revocationSecret: request.revocationSecret
+        revocationSecret: request.revocationSecret,
+        previewEnabled: request.previewEnabled
       });
       return {
-        registration: toProtoMobilePushRegistration(registered.registration),
+        registration: toProtoMobilePushRegistration(registered.registration, registered.previewEnabled),
         revocationTicket: create(contract.MobilePushRevocationTicketSchema, {
           serverId: coordinator.serverId,
           registrationId: registered.registration.id,
@@ -7719,7 +7720,7 @@ function nativeMobilePushLocale(value: contract.MobilePushLocale): MobilePushReg
 }
 
 function toProtoMobilePushRegistration(
-  record: MobilePushRegistrationRecord
+  record: MobilePushRegistrationRecord, previewEnabled: boolean
 ): contract.MobilePushRegistration {
   return create(contract.MobilePushRegistrationSchema, {
     registrationId: record.id,
@@ -7739,7 +7740,8 @@ function toProtoMobilePushRegistration(
             ? contract.MobilePushLocale.JA
             : contract.MobilePushLocale.KO,
     expiresAt: toProtoTimestamp(record.expiresAt),
-    version: toProtoEntityVersion(record.revision, 0, record.updatedAt)
+    version: toProtoEntityVersion(record.revision, 0, record.updatedAt),
+    previewEnabled
   });
 }
 

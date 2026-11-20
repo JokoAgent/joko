@@ -139,6 +139,7 @@ function DrawerFixture(props: MobileDrawerProps): ReactNode {
   return mounted ? createElement("div", { "data-testid": "drawer-fixture" }, props.children) : null;
 }
 let state: MobileState;
+let cachedConnectingTaskId: string | undefined;
 let learningPartner: typeof profilePartner | undefined;
 let collaborationApi: import("./mobile-collaboration").MobileCollaborationApi | undefined;
 let learningProfileProps: ComponentProps<typeof import("./MobilePartnerProfileSheet").MobilePartnerProfileSheet> | undefined;
@@ -146,6 +147,7 @@ const client = new Proxy({
   get state() { return state; }, select, around, latest, taskReadingPosition, restoreTaskReadingPosition,
   searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, reconcile, dismissUnconfirmed, refresh,
   partnerRosterSources: () => empty,
+  canOpenCachedTaskWhileConnecting: (sessionId: string) => sessionId === cachedConnectingTaskId,
   taskQueueItems: () => empty, taskRetryableQueueItems: () => empty, taskInteractions: () => empty, taskTimelineRows: () => empty,
   subscribe: () => () => {}, taskForeground: () => true, taskQueueCapabilities: () => ({}), taskPendingImagePasteCount: () => 0,
   partnerConversationTransport: () => learningPartner ? { ownerKey: "original-partner-owner" } : undefined,
@@ -357,6 +359,7 @@ beforeEach(async () => {
   messageActionsProps = undefined;
   collaborationApi = undefined;
   learningPartner = undefined; learningProfileProps = undefined;
+  cachedConnectingTaskId = undefined;
   taskWindowGeometry = undefined;
   platformOS = "android";
   themeSnapshot = { preference: "system", status: "ready", saving: false };
@@ -1109,6 +1112,17 @@ describe("actual Home navigation hosts", () => {
 
     await act(async () => root.render(createElement(Home, { key: "cold", source: "another-pairing" })));
     expect(button(message("home.filter.active")).getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("lets the user open the adopted cached task during busy startup", async () => {
+    cachedConnectingTaskId = "other";
+    await render({ state: { ...state, status: "connecting", busy: true, offlineSnapshotAt: 500 } });
+    const alpha = button(mobileMessage("en", "home.openTask", { name: "Alpha" }));
+    const beta = button(mobileMessage("en", "home.openTask", { name: "Beta" }));
+    expect(alpha.disabled).toBe(true);
+    expect(beta.disabled).toBe(false);
+    await act(async () => beta.click());
+    expect(runNavigation).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: "other" });
   });
 
   it("hands row, new task, share and menu intents to the host before any navigation effect", async () => {

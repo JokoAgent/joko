@@ -128,6 +128,23 @@ export function parseMobileMarkdown(
   return parseMobileMarkdownDocument(input, options).blocks;
 }
 
+export function completeMobileCodeFences(input: string): readonly { start: number; end: number; bodyStart: number; exactBody: boolean }[] {
+  const document = parseMobileMarkdownDocument(input, { srcLines: true });
+  const offsets = [0];
+  for (let offset = input.indexOf("\n"); offset >= 0; offset = input.indexOf("\n", offset + 1)) offsets.push(offset + 1);
+  const line = (index: number) => input.slice(offsets[index], offsets[index + 1] ?? input.length).replace(/\r?\n$/u, "");
+  return document.blocks.flatMap((block, index) => {
+    if (block.type !== "code") return [];
+    const { startLine, endLineExclusive } = document.ranges[index]!;
+    const opening = parseOpeningCodeFence(line(startLine));
+    if (!opening || opening.markerLength < 3 || endLineExclusive <= startLine + 1
+      || !isClosingCodeFence(line(endLineExclusive - 1), opening)) return [];
+    const start = offsets[startLine]!, bodyStart = offsets[startLine + 1]!, end = offsets[endLineExclusive] ?? input.length;
+    const body = input.slice(bodyStart, offsets[endLineExclusive - 1]).replace(/\r?\n$/u, "");
+    return [{ start, end, bodyStart, exactBody: body === block.text }];
+  });
+}
+
 /**
  * Parse Markdown while retaining enough source metadata to reuse completed
  * blocks when a streaming message only grows at the end.
@@ -949,7 +966,7 @@ function parseOpeningCodeFence(line: string): ParsedOpeningCodeFence | null {
   };
 }
 
-function isClosingCodeFence(line: string, code: CodeFenceState): boolean {
+function isClosingCodeFence(line: string, code: Pick<CodeFenceState, "marker" | "markerLength">): boolean {
   const trimmed = line.trim();
   if (trimmed.length < code.markerLength) return false;
   for (let index = 0; index < trimmed.length; index += 1) {

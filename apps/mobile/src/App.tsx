@@ -1226,6 +1226,7 @@ export function App() {
                   onThemeChange={(preference) => mobileThemePreferences.setPreference(preference)}
                   onLocaleChange={(preference) => mobileLocalePreferences.setPreference(preference)}
                   onPushEnabledChange={(enabled) => mobilePush.setEnabled(enabled)}
+                  onPushPreviewEnabledChange={(enabled) => mobilePush.setPreviewEnabled(enabled)}
                   onDiagnosticsEnabledChange={(enabled) => mobileDiagnostics.setEnabled(enabled)}
                   onDiagnosticsClear={() => mobileDiagnostics.clear()}
                   onDiagnosticsExport={() => mobileDiagnostics.export({
@@ -1839,7 +1840,8 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
           disabled={state.status !== "connected"}>
           <View style={[styles.row, { backgroundColor: colors.surface,
             borderColor: item.session.sessionId === currentSessionId ? colors.accent : colors.border }]}>
-            <Pressable disabled={state.busy} accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.openTask", {
+            <Pressable disabled={state.busy && client.canOpenCachedTaskWhileConnecting?.(item.session.sessionId) !== true}
+              accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.openTask", {
               name: item.session.displayName || mobileMessage(locale, "home.untitled")
             })}
               accessibilityHint={attention === undefined ? undefined : mobileMessage(locale, "home.taskUnread")}
@@ -7303,7 +7305,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
           onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} onRetryPath={retryMarkdownPath} onAnnotateDiagram={annotateDiagram} />
           : item.kind === "user" ? <MobileUserMessageContent ownerKey={`${blockOwnerKey}/${item.id}`} text={item.text}
-            quoteAction={quoteAction}
+            quoteAction={quoteAction} formatExpandedCode={!item.optimistic}
             automation={item.automationOrigin !== undefined} selectable={!item.optimistic} colors={colors} locale={locale} />
           : item.planReview ? <View style={styles.field}>
             <Text style={[styles.label, { color: colors.ink }]}>{mobilePlanDecisionLabel(item.planReview.decision, locale)}</Text>
