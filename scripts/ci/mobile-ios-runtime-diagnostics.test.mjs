@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { test } from "node:test";
 import { assertNoNotificationStartupError, isUiRunnerAccessibilityStartupFailure, locateInstalledSimulatorApplication, parseCrashReport,
   parseVirtualMemory, prepareSimulatorService, projectOwnedCrash, projectOwnedStartupLogs, readUiTestSummary,
-  requireSimulatorApplicationContainer, stopOwnedMetroGroup, summarizeProcesses } from "./mobile-ios-runtime-diagnostics.mjs";
+  requireSimulatorApplicationContainer, stopOwnedMetroGroup, stopOwnedPdfFixtureProcess, summarizeProcesses } from "./mobile-ios-runtime-diagnostics.mjs";
 
 test("repeats the same Simulator service read only once after its exact command timeout", async () => {
   const timeout = Object.assign(new Error("timed out"), { code: "ETIMEDOUT", status: null, signal: "SIGTERM" });
@@ -75,6 +77,21 @@ test("reports a still-present or unsignalable Metro group with bounded cleanup e
     const outcome = code ?? "sent";
     assert.deepEqual(result, { terminate: outcome, afterTerminate: outcome, force: outcome, afterForce: outcome, gone: false });
     assert.equal(waits, 40);
+  }
+});
+
+test("allows the owned PDF fixture to drain after the supervisor disconnects its IPC", { timeout: 12_000 }, async () => {
+  const child = spawn(process.execPath, ["-e", 'process.once("disconnect", () => setTimeout(() => {}, 5_500)); process.send("ready");'], {
+    stdio: ["ignore", "ignore", "inherit", "ipc"]
+  });
+  try {
+    const [message] = await once(child, "message");
+    assert.equal(message, "ready");
+    assert.deepEqual(await stopOwnedPdfFixtureProcess(child), { exitCode: 0, signal: null });
+    assert.equal(child.connected, false);
+    assert.equal(child.exitCode, 0);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
   }
 });
 

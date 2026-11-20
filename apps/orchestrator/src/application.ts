@@ -1753,7 +1753,7 @@ export async function createOrchestratorApplication(
         resolveNativeMemoryEnabled: () => makerMemory.nativeEnabledForBackend(instanceId),
         oauthFetch: claudeCodeOAuthFetch,
         readBlob: (blob) => artifacts.readBlob(blob),
-        resolveFile: (blob) => artifacts.resolveBlobPath(blob),
+        resolveFile: (blob) => artifacts.resolveClaudeInputFile(blob),
         resolveTextResources: (context, signal) => piResources.runtimeTextSnapshot(
           instanceId,
           context.target.id,

@@ -8,7 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { assertNoNotificationStartupError, collectHostResources, collectRuntimeFailureDiagnostics, isUiRunnerAccessibilityStartupFailure,
-  locateInstalledSimulatorApplication, readUiTestSummary, requireSimulatorApplicationContainer, stopOwnedMetroGroup } from "./mobile-ios-runtime-diagnostics.mjs";
+  locateInstalledSimulatorApplication, readUiTestSummary, requireSimulatorApplicationContainer, stopOwnedMetroGroup, stopOwnedPdfFixtureProcess } from "./mobile-ios-runtime-diagnostics.mjs";
 
 const exec = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -33,6 +33,7 @@ process.once("SIGINT", stop); process.once("SIGTERM", stop);
 let evidence, udid, deviceName, bundleId, executable, installedExecutable, metro, metroClosed = false;
 let preInputApplication;
 let pdfPairingFormActive = false;
+let uiProbeClosed;
 let stage = "preconditions";
 const startupCommandReceipts = [];
 const hostResourceSnapshots = [];
@@ -375,29 +376,44 @@ async function guiCommand(args, logName, timeout) {
   }
 }
 
-async function exportPreInputSetupFailure(screenshots, files, { expectedSha, expectedHash, requests, unexpectedRequests, steps }) {
+function readUiTestAttachment(screenshots, attachments, name, extensions, maxBytes) {
+  const matches = attachments.filter(attachment => new RegExp(`^${name}(?:_[0-9]+_[A-Fa-f0-9-]{36})?(?:\\.(?:${extensions}))?$`, "u")
+    .test(attachment.suggestedHumanReadableName ?? ""));
+  if (matches.length === 0) return;
+  if (matches.length !== 1 || !/^[A-Fa-f0-9-]{36}(?:\.(?:png|json|txt))?$/u.test(matches[0].exportedFileName ?? "")) {
+    throw new Error("The UI-test attachment identity was ambiguous.");
+  }
+  const path = join(screenshots, matches[0].exportedFileName), stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > maxBytes) {
+    throw new Error("The UI-test attachment exceeded its file boundary.");
+  }
+  return readFileSync(path);
+}
+
+function exportFirstAddressFailure(screenshots, attachments, { requests, unexpectedRequests, steps, progress }) {
+  if (requests !== 0 || unexpectedRequests !== 0 || steps.slice(4).some(step => step.screenshotExported)
+    || !progress.some(item => item.checkpoint === "04-address-tapped")) return;
+  const bytes = readUiTestAttachment(screenshots, attachments, "04-public-address-input-mismatch", "json|txt", 8 * 1024);
+  if (bytes === undefined) return;
+  const state = JSON.parse(bytes.toString("utf8"));
+  const expected = "not-an-address";
+  if (state.scope !== "fixed-public-connection-address-only" || state.expectedValue !== expected || state.expectedCharacters !== expected.length
+    || !["focus", "replace"].includes(state.stage) || typeof state.hasFocus !== "boolean" || typeof state.keyboardPresent !== "boolean"
+    || !(state.observedCharacters === null || Number.isSafeInteger(state.observedCharacters) && state.observedCharacters >= 0)) return;
+  const observed = state.observedValue;
+  const valueCategory = typeof observed !== "string" ? "unavailable" : observed === "" ? "empty"
+    : observed === "http://192.168.1.20:4318" ? "placeholder" : expected.startsWith(observed) ? "partial_input" : "other";
+  // Keep enough information to distinguish empty, partial, and replaced
+  // input while retaining no read-back field text.
+  save("gui-address-input-receipt.json", { stage: state.stage, hasFocus: state.hasFocus, keyboardPresent: state.keyboardPresent,
+    expectedCharacters: expected.length, observedCharacters: state.observedCharacters, valueCategory });
+}
+
+async function exportPreInputSetupFailure(screenshots, attachments, { expectedSha, expectedHash, requests, unexpectedRequests, steps }) {
   // Only our explicitly named pre-input attachments are eligible. Automatic XCTest
   // trees from later actions can contain connection inputs and stay unexported.
   if (requests !== 0 || unexpectedRequests !== 0 || steps.slice(3).some(step => step.screenshotExported)) return;
-  const manifests = files.filter(name => name.endsWith(".json")).flatMap(name => {
-    const manifest = JSON.parse(readFileSync(join(screenshots, name), "utf8"));
-    return Array.isArray(manifest) ? manifest : [];
-  });
-  const attachments = manifests.filter(entry => entry.testIdentifier === "JokoConnectionUITests/testConnectionPageInteractions()")
-    .flatMap(entry => entry.attachments ?? []).filter(attachment => attachment.deviceId === udid);
-  const readAttachment = (name, extensions, maxBytes) => {
-    const matches = attachments.filter(attachment => new RegExp(`^${name}(?:_[0-9]+_[A-Fa-f0-9-]{36})?(?:\\.(?:${extensions}))?$`, "u")
-      .test(attachment.suggestedHumanReadableName ?? ""));
-    if (matches.length === 0) return;
-    if (matches.length !== 1 || !/^[A-Fa-f0-9-]{36}(?:\.(?:png|json|txt))?$/u.test(matches[0].exportedFileName ?? "")) {
-      throw new Error("The pre-input setup attachment identity was ambiguous.");
-    }
-    const path = join(screenshots, matches[0].exportedFileName), stat = lstatSync(path);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > maxBytes) {
-      throw new Error("The pre-input setup attachment exceeded its file boundary.");
-    }
-    return readFileSync(path);
-  };
+  const readAttachment = (name, extensions, maxBytes) => readUiTestAttachment(screenshots, attachments, name, extensions, maxBytes);
   const addressStage = steps.slice(0, 3).every(step => step.screenshotExported) && steps.length >= 3;
   const firstTabStage = steps[0]?.screenshotExported === true && steps.slice(1).every(step => !step.screenshotExported);
   if (!addressStage && !firstTabStage && steps.some(step => step.screenshotExported)) return;
@@ -454,16 +470,29 @@ function startWorkspacePdfFixture() {
   const child = fork(join(root, "apps/e2e/src/ios-workspace-pdf-fixture.ts"), [], {
     cwd: root, execArgv: ["--import", "tsx"], stdio: ["ignore", "ignore", "inherit", "ipc"]
   });
-  let inputs, pairingCode, paired = false, exit, childError;
-  const issuedCodes = [];
+  let inputs, pairingCode, paired = false, exit, childError, pairingWindow;
+  let pairingWindowRequested = false;
+  const issuedCodes = [], steps = [];
+  let linkspanUpgrades = 0;
+  const serverInfoStatuses = [];
+  const setupSteps = new Set(["child-started", "node-started", "manager-paired", "workspace-index-ready", "original-task-completed"]);
+  const started = Date.now();
   child.once("error", (error) => { childError = error; });
-  const exited = new Promise((accept) => child.once("close", (code, signal) => {
-    exit = { code, signal }; accept(exit);
-  }));
+  child.once("exit", (code, signal) => { exit = { code, signal }; });
   child.on("message", (message) => {
-    if (message.kind === "ready" && /^http:\/\/127\.0\.0\.1:\d+$/u.test(message.origin)
+    if (message.kind === "setupStep" && setupSteps.has(message.step) && !steps.some(item => item.step === message.step)) {
+      steps.push({ step: message.step, elapsedMs: Date.now() - started });
+    } else if (message.kind === "ready" && /^http:\/\/127\.0\.0\.1:\d+$/u.test(message.origin)
       && typeof message.publicKey === "string" && /^[0-9a-f]{64}$/u.test(message.pdfSha256)) {
       inputs = { origin: message.origin, publicKey: message.publicKey, pdfSha256: message.pdfSha256 };
+    } else if (message.kind === "simulatorPairingWindow" && pairingWindowRequested && pairingWindow === undefined
+      && typeof message.previouslyOpen === "boolean" && message.open === true) {
+      pairingWindow = { previouslyOpen: message.previouslyOpen, open: true, elapsedMs: Date.now() - started };
+      save("gui-pdf-pairing-window-receipt.json", pairingWindow);
+    } else if (message.kind === "simulatorIdentityTransport" && pairingWindowRequested) {
+      if (message.effect === "linkspan_upgrade") linkspanUpgrades++;
+      if (message.effect === "server_info" && Number.isInteger(message.status)
+        && message.status >= 100 && message.status <= 599 && serverInfoStatuses.length < 8) serverInfoStatuses.push(message.status);
     } else if (message.kind === "pairingCode" && typeof message.code === "string") {
       issuedCodes.push(message.code);
       pairingCode = message.code;
@@ -475,21 +504,31 @@ function startWorkspacePdfFixture() {
   });
   return {
     get inputs() { return inputs; },
+    get pairingWindow() { return pairingWindow; },
+    inputsForSimulator() {
+      if (!pairingWindowRequested && inputs !== undefined && !exit && !childError) {
+        pairingWindowRequested = true;
+        child.send({ kind: "openSimulatorPairingWindow" }, error => { if (error) childError = error; });
+      }
+      return pairingWindow?.open === true ? inputs : undefined;
+    },
     get pairingCode() { return pairingCode; },
     get paired() { return paired; },
     get pairingRequests() { return issuedCodes.length; },
+    identityTransport() { return { linkspanUpgrades, serverInfoStatuses }; },
     async ready() {
-      const deadline = Date.now() + 45_000;
-      while (!inputs && exit === undefined && !childError && Date.now() < deadline) {
-        await delay(150, undefined, { signal: abort.signal });
+      const deadline = started + 120_000;
+      try {
+        while (!inputs && exit === undefined && !childError && Date.now() < deadline) {
+          await delay(150, undefined, { signal: abort.signal });
+        }
+        if (!inputs || exit || childError) throw new Error("The owned PDF task node did not become ready.");
+      } finally {
+        save("gui-pdf-fixture-ready-receipt.json", { ready: inputs !== undefined && exit === undefined && childError === undefined,
+          elapsedMs: Date.now() - started, steps, ...(exit ?? {}), childStartError: childError !== undefined });
       }
-      if (!inputs || exit || childError) throw new Error("The owned PDF task node did not become ready.");
     },
     async close() {
-      if (child.connected) child.disconnect();
-      const stop = setTimeout(() => child.kill("SIGKILL"), 5_000);
-      const result = await exited;
-      clearTimeout(stop);
       for (const name of ["gui-test.log", "gui-test-retry.log"]) {
         const path = join(evidence, name);
         if (!existsSync(path) || !issuedCodes.length) continue;
@@ -497,12 +536,16 @@ function startWorkspacePdfFixture() {
         for (const code of issuedCodes) text = text.replaceAll(code, "[pairing code]");
         writeFileSync(path, text);
       }
-      if (result.code !== 0 || childError) throw new Error("The owned PDF task node did not close cleanly.");
+      const started = Date.now();
+      const result = await stopOwnedPdfFixtureProcess(child);
+      save("gui-pdf-fixture-cleanup-receipt.json", { confirmedExit: result !== undefined,
+        elapsedMs: Date.now() - started, ...result });
+      if (result?.exitCode !== 0 || childError) throw new Error("The owned PDF task node did not close cleanly.");
     }
   };
 }
 
-async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopenedPid, minimumOsVersion) {
+async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopenedPid, minimumOsVersion, workspacePdf) {
   const owner = { udid, bundleId, installedExecutable };
   const assertIdentity = async (phase) => {
     abort.signal.throwIfAborted();
@@ -524,19 +567,21 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
   const names = ["01-connection-page", "02-saved-nodes", "03-nearby", sdkRuntime === 'http-connect-native' ? "04-webrtc-unavailable" : "04-webrtc-mode", "04-invalid-address", "05-local-identity-error",
     "06-inspection-pending", "07-cancelled-draft-retained", "08-returned-address-draft", "09-dark-theme", "10-light-theme",
     ...(sdkRuntime === 'http-connect-native' ? ['11-http-connect-invitation'] : []),
-    ...(verifyWorkspacePdf ? ["11-original-workspace-pdf", "12-native-pdf-selection", "13-pdf-word-pasted"] : [])];
-  const progressNames = new Set([...names, "04-https-selected", "04-address-tapped", "04-address-typing", "04-address-typed", "04-address-value-observed"]);
+    ...(verifyWorkspacePdf ? ["11-original-workspace-pdf", "12-pdf-word-held", "12-native-pdf-selection", "13-pdf-word-pasted"] : [])];
+  const progressNames = new Set([...names, "04-https-selected", "04-address-tapped", "04-address-quickpath-dismissed",
+    "04-address-typing", "04-address-typed", "04-address-retyped", "04-address-value-observed",
+    "11-pdf-address-and-key-confirmed", "11-pdf-identity-check-tapped", "11-pdf-identity-confirmed", "11-pdf-pairing-available",
+    "11-pdf-task-link-visible", "11-pdf-task-link-tapped"]);
   // A loopback-only Connect error endpoint exercises the real native transport.
   // It never supplies a node identity, challenge, credential or successful pair.
   let requests = 0, unexpectedRequests = 0, screenshotCount = 0;
-  let workspacePdf;
   let testAttempt = 0, testStartedAt;
   const progress = [];
   const probe = createHttpServer((request, response) => {
     if (request.method === "GET" && (request.url === "/ci-pdf-fixture" || request.url === "/ci-pdf-pairing-code")) {
-      const value = request.url === "/ci-pdf-fixture" ? workspacePdf?.inputs
+      const value = request.url === "/ci-pdf-fixture" ? workspacePdf?.inputsForSimulator()
         : workspacePdf?.pairingCode ? { code: workspacePdf.pairingCode } : undefined;
-      if (!value) { response.writeHead(204); response.end(); return; }
+      if (!value) { response.writeHead(workspacePdf === undefined ? 204 : 202); response.end(); return; }
       response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
       response.end(JSON.stringify(value)); return;
     }
@@ -585,12 +630,8 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
     }, executionError);
     return { summary, executionError };
   };
+  let uiFailed = false;
   try {
-    if (verifyWorkspacePdf) {
-      stage = "owned workspace PDF task preparation";
-      workspacePdf = startWorkspacePdfFixture();
-      await workspacePdf.ready();
-    }
     stage = "Apple UI-test target preparation";
     await command("ruby", [join(root, "scripts/ci/ios-prepare-ui-tests.rb"), project,
       join(root, "scripts/ci/ios-connection-ui-tests.swift"), String(port), String(probePort), minimumOsVersion, sdkRuntime]);
@@ -633,7 +674,10 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
     const pdfTask = workspacePdf === undefined ? undefined : {
       pdfSha256: workspacePdf.inputs?.pdfSha256, pairingRequests: workspacePdf.pairingRequests,
       pairedIosDevice: workspacePdf.paired,
-      passed: workspacePdf.paired && workspacePdf.pairingRequests === 1 && steps.slice(-3).every(step => step.screenshotExported)
+      pairingWindowOpened: workspacePdf.pairingWindow?.open === true,
+      identityTransport: workspacePdf.identityTransport(),
+      passed: workspacePdf.pairingWindow?.open === true && workspacePdf.paired && workspacePdf.pairingRequests === 1
+        && steps.slice(-3).every(step => step.screenshotExported)
     };
     save("gui-steps.json", { sourceCommit: expectedSha, executableSha256: expectedHash, simulatorUdid: udid, bundleId, sdkRuntime,
       steps, screenshotCount, localIdentityRequests: requests, unexpectedRequests, pdfTask,
@@ -641,9 +685,13 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
         && summary.failedTests === 0 && summary.skippedTests === 0 && steps.every(step => step.screenshotExported)
         && (!verifyWorkspacePdf || pdfTask?.passed === true) });
     if (executionError || summary.result !== "Passed") {
-      try { await exportPreInputSetupFailure(screenshots, files, { expectedSha, expectedHash, requests, unexpectedRequests, steps }); }
+      try {
+        exportFirstAddressFailure(screenshots, attachments, { requests, unexpectedRequests, steps, progress });
+        await exportPreInputSetupFailure(screenshots, attachments, { expectedSha, expectedHash, requests, unexpectedRequests, steps });
+      }
       catch { save("gui-pre-input-export-receipt.json", { result: "failed", onlyAllowlistedPreInputAttachmentsExported: true }); }
     }
+    stage = "actual connection page UI operations";
     if (executionError) throw executionError;
     if (summary.result !== "Passed" || summary.passedTests !== 1 || summary.failedTests !== 0 || summary.skippedTests !== 0
       || !steps.every(step => step.screenshotExported) || requests !== 2 || unexpectedRequests !== 0
@@ -658,11 +706,21 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
       executableSha256: expectedHash, simulatorUdid: udid, bundleId, pid, screenshotCount, pdfTask,
       scope: pdfTask ? "Connection-page checks and native copy/paste from a paired task's original workspace PDF."
         : "Connection-page modes, address typing and validation, the local error and cancellation, retained draft, theme changes and selected CONNECT invitation configuration." };
+  } catch (error) {
+    uiFailed = true;
+    throw error;
   } finally {
     save("gui-local-probe.json", { loopbackOnly: true, localIdentityRequests: requests, unexpectedRequests, progress });
-    probe.closeAllConnections();
-    await new Promise(accept => probe.close(accept));
-    await workspacePdf?.close();
+    const closed = new Promise((resolve, reject) => {
+      probe.close(error => error ? reject(error) : resolve());
+      probe.closeAllConnections();
+    });
+    const [probeResult] = await Promise.allSettled([closed]);
+    uiProbeClosed = probeResult.status === "fulfilled";
+    if (!uiFailed && probeResult.status === "rejected") {
+      stage = "UI-test loopback cleanup";
+      throw probeResult.reason;
+    }
   }
 }
 async function capturePostUiFrame(ocr, identity, expectedPid) {
@@ -694,7 +752,7 @@ async function capturePostUiFrame(ocr, identity, expectedPid) {
   }
   return receipt;
 }
-async function cleanup() {
+async function cleanup(workspacePdf) {
   const errors = [];
   let simulatorCleanup = udid ? "unconfirmed" : "not_created";
   const ownedMetroPid = metro?.pid;
@@ -714,6 +772,14 @@ async function cleanup() {
         simulatorCleanup = "deleted";
       } else simulatorCleanup = "already_absent";
     } catch (error) { errors.push(error.message); }
+  }
+  let pdfFixtureClosed = null;
+  if (workspacePdf !== undefined) {
+    try { await workspacePdf.close(); pdfFixtureClosed = true; }
+    catch (error) { pdfFixtureClosed = false; errors.push(error.message); }
+  }
+  if (evidence && (uiProbeClosed !== undefined || workspacePdf !== undefined)) {
+    save("gui-cleanup-receipt.json", { probeClosed: uiProbeClosed ?? null, pdfFixtureClosed });
   }
   if (evidence) save("cleanup.json", { simulatorUdid: udid, simulatorName: deviceName, ownedMetroPid, metroCleanup,
     simulatorCleanup, deletedOnlyCreatedSimulator: simulatorCleanup === "deleted" || simulatorCleanup === "already_absent", errors });
@@ -812,7 +878,7 @@ async function readAppearance(startupLabel) {
 }
 
 async function main() {
-  let result;
+  let result, workspacePdf;
   try {
     if (process.platform !== "darwin") throw new Error("The real Simulator runtime check requires macOS and Xcode.");
     if (process.argv.length > 2 && !startupDiagnosticsOnly) throw new Error("Unknown iOS runtime observation mode.");
@@ -874,8 +940,14 @@ async function main() {
     preInputApplication = { pid: reopenedPid, startedAt: reopenedStartedAt };
     const reopened = await observe("reopened", reopenedPid, ocr);
     preInputApplication = undefined;
+    if (verifyWorkspacePdf) {
+      // The paired task is needed by XCTest. Finish the cold launches before starting its service and native model process.
+      stage = "owned workspace PDF task preparation";
+      workspacePdf = startWorkspacePdfFixture();
+      await workspacePdf.ready();
+    }
     const identity = JSON.parse(readFileSync(join(evidence, "identity.json"), "utf8"));
-    const gui = await runConnectionUiTests(app, port, identity.sourceCommit, identity.executableSha256, reopenedPid, info.MinimumOSVersion);
+    const gui = await runConnectionUiTests(app, port, identity.sourceCommit, identity.executableSha256, reopenedPid, info.MinimumOSVersion, workspacePdf);
     const postGuiFrame = await capturePostUiFrame(ocr, identity, reopenedPid);
     assertNoNotificationStartupError(readFileSync(join(evidence, "metro.log"), "utf8"));
     result = { passed: true, sourceCommit: await command("git", ["rev-parse", "HEAD"]), bundleId, simulatorUdid: udid,
@@ -886,10 +958,10 @@ async function main() {
         "Simulator does not exercise the physical device's first local network privacy permission."] };
   } catch (error) {
     if (evidence) {
-      await recordHostResources("failed-operation").catch(() => undefined);
-      if (udid && !pdfPairingFormActive) await command("xcrun", ["simctl", "io", udid, "screenshot", "--type=png", join(evidence, "failure.png")], { cleanup: true }).catch(() => undefined);
       save("failure.json", { stage, message: error.message, simulatorUdid: udid, bundleId,
         scope: startupDiagnosticsOnly ? "simulator-startup-command-probe" : "joko-app-runtime-and-gui", noGuiSuccessClaimed: true });
+      await recordHostResources("failed-operation").catch(() => undefined);
+      if (udid && !pdfPairingFormActive) await command("xcrun", ["simctl", "io", udid, "screenshot", "--type=png", join(evidence, "failure.png")], { cleanup: true }).catch(() => undefined);
       const diagnostics = await collectRuntimeFailureDiagnostics({ bundleId, executable, installedExecutable,
         simulatorUdid: udid, startedAt: observationStartedAt,
         startup: ["first native launch", "native reopen"].includes(stage) ? preInputApplication : undefined }).catch(() => ({ collectionFailed: true }));
@@ -897,7 +969,7 @@ async function main() {
     }
     throw error;
   } finally {
-    const errors = await cleanup();
+    const errors = await cleanup(workspacePdf);
     if (result && errors.length === 0) {
       save("result.json", result);
       process.stdout.write(startupDiagnosticsOnly ? "Owned Simulator startup commands and framebuffer capture passed; no application GUI was tested.\n"

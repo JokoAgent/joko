@@ -196,8 +196,8 @@ export function buildMobilePdfViewerHtml({
     #pages { align-items: center; display: flex; flex: 1 1 auto; flex-direction: column; gap: 16px; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 16px; }
     .page { align-items: center; background: ${cssColor(surface)}; border: 1px solid ${cssColor(border)}; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.12); display: flex; flex: 0 0 auto; justify-content: center; min-height: 320px; overflow: hidden; position: relative; width: min(100%, 760px); }
     .page-label { color: ${cssColor(muted)}; font-size: 13px; left: 12px; pointer-events: none; position: absolute; top: 10px; z-index: 1; }
-    .page-content { max-width: 100%; position: relative; }
-    .page-selection { inset: 0; position: absolute; transform-origin: top left; }
+    .page-content { max-width: 100%; position: relative; -webkit-user-select: none; user-select: none; }
+    .page-selection { inset: 0; pointer-events: none; position: absolute; transform-origin: top left; }
     .page-text {
       --scale-round-x: 1px;
       --scale-round-y: 1px;
@@ -223,9 +223,10 @@ export function buildMobilePdfViewerHtml({
       transform-origin: top left;
       white-space: pre;
     }
+    .page-text > span { pointer-events: auto; -webkit-user-select: text; user-select: text; }
     .page-text ::selection { background: rgba(54, 112, 219, 0.32); color: transparent; }
     button.page-link { background: transparent; border: 0; border-radius: 0; min-height: 0; min-width: 0; padding: 0; position: absolute; z-index: 2; }
-    canvas { display: block; max-width: 100%; }
+    canvas { display: block; max-width: 100%; pointer-events: none; -webkit-touch-callout: none; }
     .page-error { color: #b42318; max-width: 80%; text-align: center; }
   </style>
 </head>

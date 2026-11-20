@@ -12,21 +12,46 @@ import { createSessionMutation, sendInputMutation, sessionIdFrom, submit } from 
 async function observePdfTask(): Promise<void> {
   if (!process.send || !process.connected) throw new Error("The iOS PDF fixture requires its owned supervisor.");
   const disconnected = once(process, "disconnect");
+  const setupStep = (step: string): void => {
+    if (process.connected) process.send?.({ kind: "setupStep", step });
+  };
+  setupStep("child-started");
   const profile = { ...PI_LIKE_PROFILE, capabilities: [
     ...PI_LIKE_PROFILE.capabilities,
     { key: capabilityNames.workspaceFiles, supported: true as const }
   ] };
-  const fixture = await OrchestratorE2eFixture.start({ profiles: [profile] });
+  let openedForSimulator = false;
+  const fixture = await OrchestratorE2eFixture.start({ profiles: [profile], serverId: "ios-workspace-pdf", webRtc: true,
+    observeIdentityTransport: (effect, status) => {
+      if (openedForSimulator && process.connected) process.send?.({ kind: "simulatorIdentityTransport", effect, status });
+    }
+  });
   let observePairing: ReturnType<typeof setInterval> | undefined;
   let removePairingListener: (() => void) | undefined;
+  const openForSimulator = (message: unknown): void => {
+    if (openedForSimulator || !process.connected || !message || typeof message !== "object"
+      || !("kind" in message) || message.kind !== "openSimulatorPairingWindow") return;
+    openedForSimulator = true;
+    const previouslyOpen = fixture.application.connections.pairingEnabled;
+    fixture.application.connections.openPairingWindow();
+    process.send?.({ kind: "simulatorPairingWindow", previouslyOpen, open: fixture.application.connections.pairingEnabled });
+  };
   try {
+    if (!process.connected) return;
+    setupStep("node-started");
     const { application } = fixture;
+    const publicKey = application.linkspanIdentity?.publicKey;
+    if (!publicKey) throw new Error("The owned PDF node did not publish a Linkspan public key.");
     const targetId = fixture.targetId(profile.id);
     const docs = join(application.store.getTarget(targetId).descriptor.workspaceRoot, "docs");
     const bytes = pdfPage();
     await mkdir(docs);
     await writeFile(join(docs, "manual.pdf"), bytes);
     const manager = await fixture.pair("PDF fixture manager");
+    setupStep("manager-paired");
+    const index = await manager.clients.workspace.listWorkspaceFiles({ workspaceId: "workspace-main" });
+    if (!index.relativePaths.includes("docs/manual.pdf")) throw new Error("The paired Workspace index did not include the original PDF.");
+    setupStep("workspace-index-ready");
     const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
       createSessionMutation({ backendId: profile.id, targetId, displayName: "Original workspace PDF task" })));
     const generation = BigInt(application.store.getSession(sessionId).descriptor.binding.generation);
@@ -38,8 +63,8 @@ async function observePdfTask(): Promise<void> {
         && (await manager.clients.run.getRun({ runId: runs[0]!.descriptor.id })).run?.state === RunState.SUCCEEDED;
     }, (succeeded) => succeeded, "the original PDF task's completed message");
 
-    const publicKey = application.linkspanIdentity?.publicKey;
-    if (!publicKey || !process.connected) throw new Error("The owned PDF node identity is unavailable.");
+    if (!process.connected) return;
+    setupStep("original-task-completed");
     removePairingListener = application.connections.onPairingIssued(({ code }) => {
       if (process.connected) process.send?.({ kind: "pairingCode", code });
     });
@@ -51,11 +76,14 @@ async function observePdfTask(): Promise<void> {
       clearInterval(observePairing);
       process.send?.({ kind: "paired" });
     }, 150);
+    process.on("message", openForSimulator);
     process.send({ kind: "ready", origin: fixture.baseUrl, publicKey, pdfSha256: createHash("sha256").update(bytes).digest("hex") });
     await disconnected;
   } finally {
     clearInterval(observePairing);
+    process.off("message", openForSimulator);
     removePairingListener?.();
+    fixture.dropPublicConnections();
     await fixture.close();
   }
 }
