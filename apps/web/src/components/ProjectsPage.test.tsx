@@ -5,7 +5,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import { emptySnapshot, type ResourceView, type SessionView, type TargetView } from "../model.js";
+import { emptySnapshot, type AppSnapshot, type ResourceView, type SessionView, type TargetView } from "../model.js";
 import { translate } from "../i18n.js";
 import { DEFAULT_SIDEBAR_OWNER_LAYOUT } from "../sidebar-layout.js";
 import { ProjectsPage } from "./ProjectsPage.js";
@@ -20,15 +20,16 @@ afterEach(async () => {
 it("discovers registered remote project resources through the existing trust and capability gate with visible retry and approval status", async () => {
   const discoverProjectResources = vi.fn().mockRejectedValueOnce(new Error("Remote project is offline.")).mockResolvedValue(undefined);
   const controller = { state: { connectionState: "connected", preferences: DEFAULT_UI_PREFERENCES }, discoverProjectResources } as unknown as AppController;
-  const target: TargetView = { id: "remote-project", backendId: "backend", name: "Remote Project", workspaceId: "remote-workspace",
+  const target: TargetView = { id: "remote-project", backendId: "codex", name: "Remote Project", workspaceId: "remote-workspace",
     revision: 1n, workspaceName: "Registered project", trusted: true, pinned: false, archived: false,
     remoteWorkspace: { kind: "ssh", hostTargetId: "registered-host-target", hostId: "registered-host", workspaceRoot: "/registered/project" } };
   const resource = { id: "opaque-resource", backendId: target.backendId, targetId: target.id, state: "awaitingApproval" } as ResourceView;
-  let snapshot = { ...emptySnapshot(), targets: [target], resources: [resource],
+  const registeredProject: AppSnapshot = { ...emptySnapshot(), targets: [target], resources: [resource],
     workspaces: [{ id: target.workspaceId, targetId: target.id, name: "Registered project", kind: "userProject" as const,
       serverPath: "", trusted: true, dirty: false, entries: [] }],
     backends: [{ id: target.backendId, name: "Agent", version: "1", health: "healthy" as const,
       capabilities: new Map([["runtime.resources", { name: "runtime.resources", supported: true, options: ["skill"] }]]) }] };
+  let snapshot = registeredProject;
   const container = document.createElement("div"); document.body.append(container);
   const root = createRoot(container); roots.push(root);
   let pending: Promise<void> = Promise.resolve();
@@ -45,8 +46,28 @@ it("discovers registered remote project resources through the existing trust and
   expect(discoverProjectResources.mock.calls).toEqual([[target.id], [target.id]]);
   snapshot = { ...snapshot, backends: [] }; await render();
   expect(container.textContent).not.toContain("Discover resources");
-  snapshot = { ...snapshot, workspaces: [{ ...snapshot.workspaces[0]!, trusted: false }] }; await render();
+  snapshot = { ...registeredProject, workspaces: [{ ...registeredProject.workspaces[0]!, trusted: false }] }; await render();
   expect(container.textContent).not.toContain("Discover resources");
+  snapshot = { ...registeredProject, targets: [{ ...target, trusted: false }] }; await render();
+  expect(container.textContent).not.toContain("Discover resources");
+
+  const claude = { ...registeredProject.backends[0]!, id: "claude-code" };
+  snapshot = { ...registeredProject, backends: [claude],
+    targets: [{ ...target, backendId: claude.id }] };
+  await render();
+  expect(container.textContent).not.toContain("Discover resources");
+
+  const pi = { ...registeredProject.backends[0]!, id: "pi" };
+  snapshot = { ...registeredProject, backends: [pi], targets: [{ ...target, backendId: pi.id,
+    remoteWorkspace: { kind: "device_peer", controllerDeviceId: "owner", targetDeviceId: "peer", workspaceRoot: "/peer/project" } }] };
+  await render();
+  expect(container.textContent).not.toContain("Discover resources");
+
+  const { remoteWorkspace: _remoteWorkspace, ...localTarget } = target;
+  snapshot = { ...registeredProject, backends: [claude], targets: [{ ...localTarget, backendId: claude.id }] };
+  await render();
+  await act(async () => { button(container, "Discover resources").click(); await pending; });
+  expect(discoverProjectResources.mock.calls).toEqual([[target.id], [target.id], [target.id]]);
 });
 
 it("requires explicit read-write selection and preserves removal of an unavailable approval", async () => {

@@ -1,7 +1,7 @@
 import type { BackendView } from "../model.js";
 import { describe, expect, it } from "vitest";
 
-import { resourceKindsForBackend, backendSupportsResourceDiscovery } from "../resource-capabilities.js";
+import { resourceKindsForBackend, projectSupportsResourceDiscovery } from "../resource-capabilities.js";
 import { backendPermissionModes } from "./SettingsPage.js";
 import { planModeSupported } from "./backend-control-capabilities.js";
 
@@ -49,8 +49,8 @@ describe("Backend settings capabilities", () => {
     ]);
     expect(resourceKindsForBackend(resourceBackend("empty", []))).toEqual([]);
     expect(resourceKindsForBackend(resourceBackend("disabled", ["skill"], false))).toEqual([]);
-    expect(backendSupportsResourceDiscovery(resourceBackend("claude", ["skill", "prompt"]))).toBe(true);
-    expect(backendSupportsResourceDiscovery(resourceBackend("unknown", ["theme-alias"]))).toBe(false);
+    expect(projectSupportsResourceDiscovery(resourceBackend("claude", ["skill", "prompt"]))).toBe(true);
+    expect(projectSupportsResourceDiscovery(resourceBackend("unknown", ["theme-alias"]))).toBe(false);
   });
 });
 
