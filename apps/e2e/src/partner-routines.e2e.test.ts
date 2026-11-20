@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { Code } from "@connectrpc/connect";
-import { PartnerDraftSchema, PermissionMode, RoutineRunStatus, SnapshotScopeSchema } from "@joko/contracts";
+import { NightlyLearningFrequency, PartnerDraftSchema, PermissionMode, RoutineRunStatus, SnapshotScopeSchema } from "@joko/contracts";
 import { afterEach, expect, it } from "vitest";
 import { RealPiSystemFixture, REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID } from "./real-pi-fixture.js";
 import { waitFor } from "./fixture.js";
@@ -20,6 +20,16 @@ it("runs a durable Partner timer without a UI, hides its backing automation and 
       identitySource: "You review changes in this home.", templateId: "general", usesDirectoryDefaults: false,
       capabilities: { modelChain: [{ backendId: "pi", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, fastMode: false }], permissionMode: PermissionMode.AUTO, planMode: false } }) });
   const partner = created.partner!;
+  const nightly = await clients.partnerRoutine.getPartnerNightlyLearning({ partnerId: partner.partnerId });
+  expect(nightly).toMatchObject({ partnerId: partner.partnerId, schedule: { enabled: true, frequency: NightlyLearningFrequency.DAILY }, pendingConversations: 0 });
+  expect(nightly.scheduleRevision?.value).toBeGreaterThan(0n);
+  await expect(fixture.anonymous.partnerRoutine.getPartnerNightlyLearning({ partnerId: partner.partnerId })).rejects.toMatchObject({ code: Code.Unauthenticated });
+  const nightlyUpdate = { partnerId: partner.partnerId, expectedPartnerRevision: nightly.partnerRevision,
+    expectedStateRevision: nightly.stateRevision, expectedScheduleRevision: nightly.scheduleRevision,
+    action: { case: "schedule" as const, value: { enabled: false, frequency: NightlyLearningFrequency.WEEKLY } } };
+  const nightlySaved = (await clients.partnerRoutine.updatePartnerNightlyLearning(nightlyUpdate)).state!;
+  expect(nightlySaved.schedule).toMatchObject({ enabled: false, frequency: NightlyLearningFrequency.WEEKLY });
+  await expect(clients.partnerRoutine.updatePartnerNightlyLearning(nightlyUpdate)).rejects.toMatchObject({ code: Code.FailedPrecondition });
   const save = { partnerId: partner.partnerId, expectedPartnerRevision: partner.revision, intent: { case: "creationRequestId" as const, value: "routine-product-creation" },
     definition: { name: "Scheduled review", prompt: "ROUTINE_PRODUCT_CHAIN: report the current home status.", enabled: true, silentWhenIdle: true,
       triggers: [{ id: "once", kind: { case: "once" as const, value: { at: timestampFromDate(new Date(Date.now() + 4000)) } } }] } };
@@ -48,6 +58,9 @@ it("runs a durable Partner timer without a UI, hides its backing automation and 
   const builtin = beforeRestart.routines.filter(value => value.builtin === "follow-up"); expect(builtin).toHaveLength(1); expect(builtin[0]!.builtinVersion).toBe(1);
   await fixture.close(); fixture = await RealPiSystemFixture.start({ rootDirectory: root, keepRoot: true, port });
   const reopened = fixture.clients(paired.authKey).partnerRoutine;
+  expect(await reopened.getPartnerNightlyLearning({ partnerId: partner.partnerId })).toMatchObject({
+    schedule: nightlySaved.schedule, scheduleRevision: nightlySaved.scheduleRevision, timezone: nightlySaved.timezone, pendingConversations: 0
+  });
   const catalog = await reopened.listPartnerRoutines({ partnerId: partner.partnerId }); const persisted = catalog.routines.find(value => value.id === routine.id)!;
   expect(catalog.routines).toEqual(beforeRestart.routines); expect(persisted).toEqual(disabled); expect(persisted.definition?.enabled).toBe(false);
   expect((await reopened.listPartnerRoutineRuns({ partnerId: partner.partnerId, routineId: routine.id })).runs[0]?.id).toBe(result.runs[0]?.id);

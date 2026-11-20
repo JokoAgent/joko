@@ -22,6 +22,7 @@ import {
 import { type McpRouter, type PiMcpBridgeSnapshot } from "./mcp-router.js";
 import { createMcpModelProxy, type McpModelRequestExtra } from "./mcp-apps/server-proxy.js";
 import type { AppConnection } from "./mcp-apps/connection.js";
+import { PARTNER_IMPORT_COMMAND_SERVER, PARTNER_IMPORT_COMMAND_TOOL } from "./partner-import-command-tools.js";
 
 const DEFAULT_GRANT_TTL_MS = 60_000;
 const MINIMUM_GRANT_TTL_MS = 1_000;
@@ -192,11 +193,17 @@ export class CodexMcpBridgeManager {
         routePort = forward.remotePort;
       }
       input.assertSessionCurrent();
-      const routes = [...toolsByServer.keys()].sort().map((serverId) => Object.freeze({
-        serverId,
-        name: codexServerName(input, serverId, routeSecret),
-        url: `http://${routeHost}:${routePort}/${routeSecret}/${encodeURIComponent(serverId)}`
-      }));
+      const routes = [...toolsByServer.keys()].sort().map((serverId) => {
+        const importCommand = authority === undefined && serverId === PARTNER_IMPORT_COMMAND_SERVER
+          && toolsByServer.get(serverId)?.some(tool => tool.name === PARTNER_IMPORT_COMMAND_TOOL && tool.requiresPermission === false);
+        return Object.freeze({
+          serverId,
+          name: codexServerName(input, serverId, routeSecret),
+          url: `http://${routeHost}:${routePort}/${routeSecret}/${encodeURIComponent(serverId)}`,
+          // The import tool checks the original Owner and approves the exact selection.
+          ...(importCommand ? { hostApprovalTool: PARTNER_IMPORT_COMMAND_TOOL } : {})
+        });
+      });
       const lease: CodexMcpRuntimeLease = Object.freeze({
         routes: Object.freeze(routes),
         assertCurrent,

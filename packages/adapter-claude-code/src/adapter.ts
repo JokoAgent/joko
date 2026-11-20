@@ -1009,7 +1009,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         this.#inputResolvers,
         this.#resolveTextResources !== undefined || this.#resolveNativeSkills !== undefined,
         supportsAccountUsage,
-        this.#supportsPortableHistory()
+        this.#supportsPortableHistory(),
+        this.#managedProviders !== undefined
       ),
       ...(this.#managedProviders === undefined ? {} : { providerRuntimeSupport: managedProviderSupport(this.#managedProviders.support) }),
       providers: [{
@@ -6486,6 +6487,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       }
     }
     try { turn.context.nativeToolAuthorization?.assertCurrent(); } catch { return { behavior: "deny", message: "The originating delegated task authority changed." }; }
+    const lease = runtime.mcpLease;
+    if (!runtime.remote && !turn.context.hostedExecution && lease?.tools.some(tool => tool.approvalInHost
+      && toolName === `mcp__${claudeMcpServerName(tool.serverId)}__${tool.name}`)) {
+      try { lease.assertCurrent(); } catch { return { behavior: "deny", message: "The approved tool is no longer attached to this task." }; }
+      // The original service tool approves the exact selected entries.
+      return { behavior: "allow", updatedInput: input };
+    }
     const requestId = this.#projection.identifier(options.requestId, "missing-request");
     let fingerprint: string;
     try {
@@ -8346,7 +8354,8 @@ function capabilityManifest(
   inputResolvers: ClaudeInputResolvers,
   textResourcesSupported: boolean,
   accountUsageSupported: boolean,
-  portableHistorySupported: boolean
+  portableHistorySupported: boolean,
+  managedProviderConfigured: boolean
 ): ReadonlyMap<string, Capability> {
   const supported = new Set<KnownCapability>([
     "model.working_context",
@@ -8381,6 +8390,7 @@ function capabilityManifest(
   ]);
   if (workspaceDerivationSupported) supported.add("workspace.derive");
   if (portableHistorySupported) supported.add("session.portable_transfer");
+  if (managedProviderConfigured) supported.add("provider.managed_catalog");
   if (freshContextSupported) {
     supported.add("session.rewind_to_start");
     supported.add("session.message_delete");

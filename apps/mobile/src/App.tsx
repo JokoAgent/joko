@@ -8272,6 +8272,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       memoryFactory={(partner, ownerKey) => client.partnerMemoryEditor(partner, ownerKey)}
       connectionsFactory={(partner, ownerKey) => client.partnerConnectionsEditor(partner, ownerKey)}
       skillsFactory={(partner, ownerKey) => client.partnerSkillsEditor(partner, ownerKey)}
+      nightlyFactory={(partner, ownerKey) => client.partnerNightlyLearningEditor(partner, ownerKey)}
       onOpenHome={partner => { const api = client.partnerHomeApi(); if (api) setPartnerHome({ api, partnerId: partner.partnerId, revision: partner.revision, inputHandoff: partner.capabilities.inputHandoff ?? true }); }}
       deletionTransport={client.partnerDeletionTransport()}
       restartTransport={client.partnerRestartTransport()}

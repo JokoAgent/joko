@@ -238,6 +238,8 @@ export interface CodexMcpRoute {
   readonly name: string;
   /** Private remote-loopback route. It never contains the McpRouter bearer. */
   readonly url: string;
+  /** One built-in tool whose action approval is owned by the local Host. */
+  readonly hostApprovalTool?: string;
 }
 
 export interface CodexMcpRuntimeLease {
@@ -4163,6 +4165,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const routeNames = new Set<string>();
     for (const route of routes) {
       if (!validMcpRoute(route)
+        || (scope.remote && route.hostApprovalTool !== undefined)
         || routeNames.has(route.name)
         || configuredMcpNames.has(route.name)
         || observedMcpNames.has(route.name)) throw mcpUnavailable(scope.remote);
@@ -4190,6 +4193,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       isolatedConfig[`${prefix}.enabled`] = true;
       isolatedConfig[`${prefix}.startup_timeout_sec`] = 60;
       isolatedConfig[`${prefix}.tool_timeout_sec`] = 600;
+      if (route.hostApprovalTool !== undefined) {
+        isolatedConfig[`${prefix}.tools.${route.hostApprovalTool}.approval_mode`] = "approve";
+      }
     }
     scope.assertCurrent();
     return isolatedConfig;
@@ -8708,7 +8714,8 @@ function validExecutionDomain(value: string): boolean {
 
 function validMcpRoute(route: CodexMcpRoute): boolean {
   if (route.serverId.length === 0 || route.serverId.length > 512
-    || !/^joko_[A-Za-z0-9_-]{1,64}$/u.test(route.name)) return false;
+    || !/^joko_[A-Za-z0-9_-]{1,64}$/u.test(route.name)
+    || (route.hostApprovalTool !== undefined && !/^[A-Za-z0-9_-]{1,128}$/u.test(route.hostApprovalTool))) return false;
   try {
     const url = new URL(route.url);
     const loopback = url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "::1" || url.hostname === "localhost";

@@ -112,6 +112,7 @@ it("keeps a persisted unknown creation in the actual StrictMode dialog until its
   await act(async () => { button(m.checkCreate, dialog).click(); await settle(); }); expect(f.controller.navigate).toHaveBeenCalledWith({ kind: "partners", groupId: f.group.id }); expect(localStorage.length).toBe(0);
 });
 it("keeps editable image vectors on the same original and reuses the burned upload for an unknown group send", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   const f = fixture(), file = new File(["original"], "photo.jpg", { type: "image/jpeg" });
   vi.mocked(f.api.newRequestId).mockReturnValueOnce("original-image-send").mockReturnValueOnce("unexpected-replacement");
   Object.defineProperties(URL, { createObjectURL: { configurable: true, value: () => "blob:group-original" }, revokeObjectURL: { configurable: true, value: () => {} } });
@@ -160,7 +161,8 @@ async function editGroupDraftImage(draw?: boolean): Promise<void> {
   act(() => { image.dispatchEvent(new Event("load")); button("workspace.imageAnnotate", overlay).click(); });
   if (draw) { for (const type of ["pointerdown", "pointerup"]) { const event = new Event(type, { bubbles: true }); Object.defineProperties(event, { pointerId: { value: 1 }, pointerType: { value: "pen" }, button: { value: 0 }, clientX: { value: 100 }, clientY: { value: 100 } }); act(() => (type === "pointerdown" ? wrap : overlay).dispatchEvent(event)); } }
   else if (draw === false) { expect(overlay.querySelectorAll(".workspace-image-lightbox__image-wrap g")).toHaveLength(1); act(() => button("workspace.imageUndoAnnotation", overlay).click()); }
-  await act(async () => { button("Save", overlay).click(); await new Promise(resolve => setTimeout(resolve, 180)); });
+  await act(async () => button("Save", overlay).click());
+  await act(async () => { await vi.runOnlyPendingTimersAsync(); });
   expect(document.querySelector(".workspace-image-lightbox")).toBeNull();
 }
 it("acknowledges only observed messages and exposes plan retry, reassignment, continuation and authenticated handoff actions", async () => {

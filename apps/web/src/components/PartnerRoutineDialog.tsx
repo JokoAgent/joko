@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, useSyncExternalStore, type JSX } from "react";
 import { create } from "@bufbuild/protobuf";
-import { PartnerRoutineEditor, RoutineCreationReceipts, RoutineTriggerSchema, RoutineFilterOperator, RoutineSourceStatus,
+import { PartnerNightlyLearningEditor, PartnerRoutineEditor, RoutineCreationReceipts, RoutineTriggerSchema, RoutineFilterOperator, RoutineSourceStatus,
   newRoutineTrigger, routineMessages, routineDateInput, routineTimestamp, routineMilliseconds, routineTime, validRoutineDraft,
   RoutineSessionMode, RoutineModelSchema, decodeModelSpeed, encodeModelSpeed,
   type RoutineDefinition, type RoutineModelChoice, type RoutineTrigger, type RoutineMessages } from "@joko/contracts";
@@ -8,12 +8,14 @@ import type { AppController } from "../controller.js";
 import { usePartnerDocumentForeground } from "./use-partner-working-status.js";
 import { Button, Modal, CheckboxControl } from "./ui.js";
 import { ModelSpeedControl } from "./ModelSpeedControl.js";
+import { PartnerNightlyLearningPanel } from "./PartnerNightlyLearningPanel.js";
 
 export function PartnerRoutineDialog({ controller, partnerId, ownerKey, onClose, ownerDocument = document }: {
   readonly controller: AppController; readonly partnerId: string; readonly ownerKey: string; readonly onClose: () => void;
   readonly ownerDocument?: Document;
 }): JSX.Element {
   const [editor, setEditor] = useState<PartnerRoutineEditor>();
+  const [nightly, setNightly] = useState<PartnerNightlyLearningEditor>();
   const [failed, setFailed] = useState(false);
   const m = routineMessages(controller.state.effectiveLocale);
   useEffect(() => {
@@ -29,12 +31,22 @@ export function PartnerRoutineDialog({ controller, partnerId, ownerKey, onClose,
     } catch { setFailed(true); }
     return () => current?.dispose();
   }, [controller, partnerId, ownerKey, ownerDocument]);
+  useEffect(() => {
+    try {
+      const api = controller.partnerAutonomyApi?.(ownerKey).nightlyLearning?.(partnerId);
+      if (!api) { setNightly(undefined); return; }
+      const next = new PartnerNightlyLearningEditor(api); setNightly(next);
+      return () => next.dispose();
+    } catch { setNightly(undefined); }
+  }, [controller, ownerKey, partnerId]);
+  const currentNightly = nightly?.api.ownerKey === ownerKey && nightly.api.partnerId === partnerId ? nightly : undefined;
   return editor ? <RoutineContent editor={editor} connected={controller.state.connectionState === "connected"} m={m} onClose={onClose} ownerDocument={ownerDocument}
-    locale={controller.state.effectiveLocale} onOpenSession={sessionId => { onClose(); controller.navigate({ kind: "session", sessionId }); }} />
+    nightly={currentNightly} locale={controller.state.effectiveLocale} onOpenSession={sessionId => { onClose(); controller.navigate({ kind: "session", sessionId }); }} />
     : <Modal open ownerDocument={ownerDocument} title={m.title} size="large" onClose={onClose} showClose closeLabel={m.close}><p role="alert">{failed ? m.failed : m.busy}</p></Modal>;
 }
 
-function RoutineContent({ editor, connected, m, onClose, ownerDocument, locale, onOpenSession }: { readonly editor: PartnerRoutineEditor; readonly connected: boolean; readonly m: RoutineMessages; readonly onClose: () => void; readonly ownerDocument: Document;
+function RoutineContent({ editor, connected, m, onClose, ownerDocument, locale, onOpenSession, nightly }: { readonly editor: PartnerRoutineEditor; readonly connected: boolean; readonly m: RoutineMessages; readonly onClose: () => void; readonly ownerDocument: Document;
+  readonly nightly?: PartnerNightlyLearningEditor;
   readonly locale: string; readonly onOpenSession: (sessionId: string) => void }): JSX.Element {
   const state = useSyncExternalStore(editor.subscribe, editor.snapshot);
   const foreground = usePartnerDocumentForeground(ownerDocument);
@@ -47,6 +59,7 @@ function RoutineContent({ editor, connected, m, onClose, ownerDocument, locale, 
   const draft = state.draft;
   return <Modal open ownerDocument={ownerDocument} title={m.title} description={m.body} size="large" onClose={close} showClose closeLabel={m.close}>
     <div className="partner-editor">
+      {nightly && <PartnerNightlyLearningPanel editor={nightly} online={foreground && connected} ownerDocument={ownerDocument} locale={locale} />}
       <div className="toolbar-actions"><Button disabled={state.busy || !foreground || !connected} onClick={refresh}>{m.refresh}</Button>
         <Button disabled={locked || editor.dirty || !!state.pendingId} onClick={() => editor.select()}>{m.add}</Button>{state.busy && <span role="status">{m.busy}</span>}</div>
       {state.error && <p role="alert">{state.error === "pending" ? m.pending : m.failed}</p>}

@@ -907,6 +907,10 @@ export class PiBackendAdapter implements
     validateManagedSubagentProviderAuthenticationOptions(this.#options);
   }
 
+  get providerCatalogGeneration(): number | undefined {
+    return this.#managedGeneration.options.catalogGeneration;
+  }
+
   async describe(): Promise<BackendDescriptor> {
     const { catalog } = await this.#initialize();
     const [probe, compatibility, tools] = await Promise.all([

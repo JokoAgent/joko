@@ -41,7 +41,7 @@ import type { AppDefaultModelUiPort } from "./app-default-model-ui.js";
 import { projectPartnerDeletion, type PartnerDeletionView, type PartnerDeletionResult } from "@joko/contracts";
 import { projectPartnerRestart, type PartnerRestartView, type PartnerRestartResult } from "@joko/contracts";
 import { projectPartnerSessionTaskReceipt } from "@joko/contracts";
-import { createPartnerRoutineApi, PartnerRoutineService, createPartnerImportApi, PartnerImportService, createPartnerAutonomyApi, createPartnerMessagingApi, createPartnerTodoCheckApi } from "@joko/contracts";
+import { createPartnerRoutineApi, PartnerRoutineService, createPartnerImportApi, PartnerImportService, createPartnerAutonomyApi, createPartnerMessagingApi, createPartnerTodoCheckApi, createPartnerNightlyLearningApi } from "@joko/contracts";
 import { createPartnerHomeApi, PartnerHomeService } from "@joko/contracts";
 import { createPartnerGroupApi, PartnerGroupService } from "@joko/contracts";
 import { createPartnerMemoryApi } from "@joko/contracts";
@@ -6216,6 +6216,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       signal.throwIfAborted(); if (this.#transport !== transport || this.#abort !== owner || owner?.signal.aborted) throw new GatewayError("Task observation connection changed.");
     };
     return createPartnerAutonomyApi({ rpc: createClient(PartnerService, transport), ownerKey, newOperationId: () => crypto.randomUUID(), assertCurrent,
+      nightlyLearning: partnerId => createPartnerNightlyLearningApi({
+        rpc: createClient(PartnerRoutineService, transport), partnerId, ownerKey, newRequestId: () => crypto.randomUUID(), assertCurrent
+      }),
       todoCheck: partnerId => createPartnerTodoCheckApi(createPartnerRoutineApi({
         rpc: createClient(PartnerRoutineService, transport), partnerId, ownerKey, newRequestId: () => crypto.randomUUID(), assertCurrent
       })) });

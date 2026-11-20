@@ -5,6 +5,7 @@ import type { MakerMemoryController } from "./maker-memory.js";
 import type { PartnerLearningSaveCapture } from "./mcp-router.js";
 import type { PartnerManager } from "./partner-manager.js";
 import type { PartnerSkillsManager } from "./partner-skills.js";
+import { nativeBindingFingerprint } from "./native-state-observation.js";
 import { hasPartnerLearningEvidence, parsePartnerLearningReviewPlan, partnerLearningReviewInstructions,
   partnerLearningSnapshotBudget, type PartnerLearningReviewMessage } from "./partner-learning-plan.js";
 
@@ -136,6 +137,32 @@ export class PartnerLearningManager {
 
   /** A service shutdown and owning checks can wait for the already scheduled work without replaying it. */
   async drain(): Promise<void> { await Promise.allSettled([...this.#jobs.values()]); }
+
+  async messagesForNightly(turn: PartnerLearningTurnRecord, homeTargetId: string, assertCurrent: () => void): Promise<PartnerLearningReviewMessage[]> {
+    assertCurrent();
+    if (!this.nightlyTurnCurrent(turn, homeTargetId)) return [];
+    const messages = await this.#messages(turn, assertCurrent);
+    assertCurrent();
+    return this.nightlyTurnCurrent(turn, homeTargetId) ? messages : [];
+  }
+
+  nightlyTurnCurrent(turn: PartnerLearningTurnRecord, homeTargetId: string): boolean {
+    const { store, profiles } = this.options, source = turn.source;
+    try {
+      if (source.targetId !== homeTargetId || !turn.completionEventId) return false;
+      const link = profiles.getSessionLink(source.sessionId), session = store.getSession(source.sessionId).descriptor;
+      if (link?.partnerId !== turn.partnerId || !["canonical", "history", "topic", "channel"].includes(link.role)
+        || session.targetId !== homeTargetId || session.backendId !== source.backendId || session.deletedAt !== undefined
+        || nativeBindingFingerprint(session.binding.opaqueRef) !== source.bindingFingerprint
+        || !store.findVisibleSessionMessageOrigin({ sessionId: source.sessionId, eventId: turn.completionEventId })) return false;
+      const queue = store.getQueueItem(source.sourceQueueItemId);
+      if (queue.body.messagingOrigin) {
+        if (!queue.body.messagingOrigin.isOwner || queue.body.messagingOrigin.partnerId !== turn.partnerId || !this.options.assertMessagingSource) return false;
+        this.options.assertMessagingSource(queue);
+      } else if (link.role === "channel") return false;
+      return true;
+    } catch { return false; }
+  }
 
   async #review(turn: PartnerLearningTurnRecord, signal: AbortSignal): Promise<void> {
     const { store, memory, skills, auxiliary } = this.options;

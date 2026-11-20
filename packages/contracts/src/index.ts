@@ -98,6 +98,7 @@ export * from "./gen/joko/v1/terminal_pb.js";
 export * from "./gen/joko/v1/voice_pb.js";
 export * from "./gen/joko/v1/workspace_pb.js";
 export * from "./gen/joko/v1/partner_routine_pb.js";
+export * from "./partner-nightly-learning.js";
 export * from "./gen/joko/v1/partner_autonomy_pb.js";
 export * from "./gen/joko/v1/partner_todo_pb.js";
 export * from "./partner-autonomy.js";

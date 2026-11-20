@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { ListPartnerRoutinesResponseSchema, PartnerRoutineSchema, ListPartnerRoutineRunsResponseSchema,
   GetPartnerRoutineCreationResponseSchema, RetirePartnerRoutineCreationResponseSchema, RoutineFilterOperator, RoutineSourceStatus,
-  RoutineSessionMode, type PartnerRoutineApi } from "@joko/contracts";
+  GetPartnerNightlyLearningResponseSchema, NightlyLearningFrequency, RoutineSessionMode, type PartnerNightlyLearningApi, type PartnerRoutineApi } from "@joko/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { PartnerRoutineDialog } from "./PartnerRoutineDialog.js";
@@ -13,7 +13,7 @@ let root: Root | undefined; let host: HTMLDivElement;
 beforeEach(() => { vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); localStorage.clear();
   Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" }); });
 afterEach(async () => { await act(async () => root?.unmount()); root = undefined; document.body.replaceChildren(); vi.restoreAllMocks(); vi.unstubAllGlobals(); localStorage.clear(); });
-function fixture() {
+function fixture(nightly?: PartnerNightlyLearningApi) {
   let catalog = create(ListPartnerRoutinesResponseSchema, { partnerId: "partner", partnerRevision: { value: 3n }, writable: true,
     models: [{ route: { backendId: 'pi', selection: { model: { providerId: 'vision', modelId: 'multimodal' }, effortId: 'medium' } }, name: 'Pi · Vision', efforts: ['medium', 'high'] }],
     sources: [{ id: "extension:watcher", name: "Watcher", status: RoutineSourceStatus.LISTENING, events: [{ type: "change", name: "Change", fields: ["path"] }] }] });
@@ -25,7 +25,7 @@ function fixture() {
     }), run: vi.fn(async () => {}), remove: vi.fn(async () => {}), history: vi.fn(async () => create(ListPartnerRoutineRunsResponseSchema)),
     lookup: vi.fn(async () => create(GetPartnerRoutineCreationResponseSchema)), retire: vi.fn(async () => create(RetirePartnerRoutineCreationResponseSchema, { retired: true })) };
   const close = vi.fn(); const state = { effectiveLocale: "en", connectionState: "connected", activeProfile: { id: "profile", serverId: "server", deviceId: "device", origin: "http://127.0.0.1:7319" } };
-  const controller = { state, partnerRoutineApi: () => api } as unknown as AppController;
+  const controller = { state, partnerRoutineApi: () => api, partnerAutonomyApi: () => ({ nightlyLearning: () => nightly }) } as unknown as AppController;
   const render = async () => { if (!root) { host = document.createElement("div"); document.body.append(host); root = createRoot(host); }
     await act(async () => root!.render(createElement(PartnerRoutineDialog, { controller, partnerId: "partner", ownerKey: "owner", onClose: close }))); };
   return { api, state, close, render };
@@ -41,6 +41,29 @@ async function fill(label: string, value: string) { const field = input(label);
     Object.getOwnPropertyDescriptor(prototype, "value")!.set!.call(field, value); field.dispatchEvent(new Event(field instanceof HTMLSelectElement ? "change" : "input", { bubbles: true })); }); }
 
 describe("Partner routine settings", () => {
+  it("updates the current Partner's nightly schedule and starts one review through the routines dialog", async () => {
+    const nightly = create(GetPartnerNightlyLearningResponseSchema, { partnerId: "partner",
+      partnerRevision: { value: 3n }, stateRevision: { value: 4n }, scheduleRevision: { value: 5n }, timezone: "Europe/Berlin",
+      schedule: { enabled: true, frequency: NightlyLearningFrequency.DAILY }, writable: true, memoryEnabled: true });
+    const update = vi.fn<PartnerNightlyLearningApi["update"]>(async (current, action) =>
+      action.case === "schedule" ? { ...current, schedule: action.value, scheduleRevision: { ...current.scheduleRevision!, value: 6n } }
+        : { ...current, running: true });
+    const f = fixture({ partnerId: "partner", ownerKey: "owner", newRequestId: () => "nightly-review-request",
+      read: async () => nightly, update });
+    await f.render();
+    const frequency = document.querySelector<HTMLSelectElement>('select[aria-label="Review frequency"]')!;
+    await act(async () => {
+      frequency.value = String(NightlyLearningFrequency.WEEKLY);
+      frequency.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(update).toHaveBeenNthCalledWith(1, nightly,
+      expect.objectContaining({ case: "schedule", value: expect.objectContaining({ enabled: true, frequency: NightlyLearningFrequency.WEEKLY }) }), expect.any(AbortSignal));
+    await press("Review now");
+    expect(update).toHaveBeenNthCalledWith(2, expect.objectContaining({ scheduleRevision: expect.objectContaining({ value: 6n }) }),
+      { case: "runRequestId", value: "nightly-review-request" }, expect.any(AbortSignal));
+    expect(button("Review now").disabled).toBe(true);
+    expect(f.api.save).not.toHaveBeenCalled();
+  });
   it('saves an independent task mode and complete model route, then restores inheritance explicitly', async () => {
     const f = fixture(); await f.render(); await fill('Name', 'Separate review'); await fill('Instructions', 'Review work');
     await fill('Task context', 'fresh'); await fill('Routine model', JSON.stringify(['pi', 'vision', 'multimodal'])); await fill('Reasoning effort', 'high');

@@ -16,7 +16,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/partner_routine.proto.
  */
 export const file_joko_v1_partner_routine: GenFile = /*@__PURE__*/
-  fileDesc("Ch1qb2tvL3YxL3BhcnRuZXJfcm91dGluZS5wcm90bxIHam9rby52MSI6ChJSb3V0aW5lQ3JvblRyaWdnZXISEgoKZXhwcmVzc2lvbhgBIAEoCRIQCgh0aW1lem9uZRgCIAEoCSJTChZSb3V0aW5lSW50ZXJ2YWxUcmlnZ2VyEhMKC2ludGVydmFsX21zGAEgASgEEhYKCWFuY2hvcl9tcxgCIAEoBEgAiAEBQgwKCl9hbmNob3JfbXMiPAoSUm91dGluZU9uY2VUcmlnZ2VyEiYKAmF0GAEgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCJkChJSb3V0aW5lRXZlbnRGaWx0ZXISDQoFZmllbGQYASABKAkSMAoIb3BlcmF0b3IYAiABKA4yHi5qb2tvLnYxLlJvdXRpbmVGaWx0ZXJPcGVyYXRvchINCgV2YWx1ZRgDIAEoCSJqChNSb3V0aW5lRXZlbnRUcmlnZ2VyEhEKCXNvdXJjZV9pZBgBIAEoCRISCgpldmVudF90eXBlGAIgASgJEiwKB2ZpbHRlcnMYAyADKAsyGy5qb2tvLnYxLlJvdXRpbmVFdmVudEZpbHRlciLiAQoOUm91dGluZVRyaWdnZXISCgoCaWQYASABKAkSKwoEY3JvbhgCIAEoCzIbLmpva28udjEuUm91dGluZUNyb25UcmlnZ2VySAASMwoIaW50ZXJ2YWwYAyABKAsyHy5qb2tvLnYxLlJvdXRpbmVJbnRlcnZhbFRyaWdnZXJIABIrCgRvbmNlGAQgASgLMhsuam9rby52MS5Sb3V0aW5lT25jZVRyaWdnZXJIABItCgVldmVudBgFIAEoCzIcLmpva28udjEuUm91dGluZUV2ZW50VHJpZ2dlckgAQgYKBGtpbmQiTAoRUm91dGluZVByZVJ1bkhvb2sSDwoHY29tbWFuZBgBIAEoCRIXCgp0aW1lb3V0X21zGAIgASgESACIAQFCDQoLX3RpbWVvdXRfbXMiTgoMUm91dGluZU1vZGVsEhIKCmJhY2tlbmRfaWQYASABKAkSKgoJc2VsZWN0aW9uGAIgASgLMhcuam9rby52MS5Nb2RlbFNlbGVjdGlvbiKWAQoSUm91dGluZU1vZGVsQ2hvaWNlEiQKBXJvdXRlGAEgASgLMhUuam9rby52MS5Sb3V0aW5lTW9kZWwSDAoEbmFtZRgCIAEoCRIPCgdlZmZvcnRzGAMgAygJEhoKEnN1cHBvcnRzX2Zhc3RfbW9kZRgEIAEoCBIfChdzdXBwb3J0c191bHRyYWZhc3RfbW9kZRgFIAEoCCLGAgoRUm91dGluZURlZmluaXRpb24SDAoEbmFtZRgBIAEoCRIOCgZwcm9tcHQYAiABKAkSFAoHZW5hYmxlZBgDIAEoCEgAiAEBEikKCHRyaWdnZXJzGAQgAygLMhcuam9rby52MS5Sb3V0aW5lVHJpZ2dlchIdChBzaWxlbnRfd2hlbl9pZGxlGAUgASgISAGIAQESMAoMcHJlX3J1bl9ob29rGAYgASgLMhouam9rby52MS5Sb3V0aW5lUHJlUnVuSG9vaxIxCgxzZXNzaW9uX21vZGUYByABKA4yGy5qb2tvLnYxLlJvdXRpbmVTZXNzaW9uTW9kZRItCg5tb2RlbF9vdmVycmlkZRgIIAEoCzIVLmpva28udjEuUm91dGluZU1vZGVsQgoKCF9lbmFibGVkQhMKEV9zaWxlbnRfd2hlbl9pZGxlIvgCCg5QYXJ0bmVyUm91dGluZRIKCgJpZBgBIAEoCRISCgpwYXJ0bmVyX2lkGAIgASgJEiMKCHJldmlzaW9uGAMgASgLMhEuam9rby52MS5SZXZpc2lvbhIuCgpkZWZpbml0aW9uGAQgASgLMhouam9rby52MS5Sb3V0aW5lRGVmaW5pdGlvbhIwCghhY3Rpdml0eRgFIAEoDjIZLmpva28udjEuUm91dGluZVJ1blN0YXR1c0gAiAEBEi4KCmNyZWF0ZWRfYXQYBiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEi4KCnVwZGF0ZWRfYXQYByABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEhQKB2J1aWx0aW4YCCABKAlIAYgBARIcCg9idWlsdGluX3ZlcnNpb24YCSABKA1IAogBAUILCglfYWN0aXZpdHlCCgoIX2J1aWx0aW5CEgoQX2J1aWx0aW5fdmVyc2lvbiJAChJSb3V0aW5lU291cmNlRXZlbnQSDAoEdHlwZRgBIAEoCRIMCgRuYW1lGAIgASgJEg4KBmZpZWxkcxgDIAMoCSK3AQoNUm91dGluZVNvdXJjZRIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEiwKBnN0YXR1cxgDIAEoDjIcLmpva28udjEuUm91dGluZVNvdXJjZVN0YXR1cxIrCgZldmVudHMYBCADKAsyGy5qb2tvLnYxLlJvdXRpbmVTb3VyY2VFdmVudBIxCg1sYXN0X2V2ZW50X2F0GAUgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCKmAwoRUGFydG5lclJvdXRpbmVSdW4SCgoCaWQYASABKAkSEgoKcm91dGluZV9pZBgCIAEoCRIuChNkZWZpbml0aW9uX3JldmlzaW9uGAMgASgLMhEuam9rby52MS5SZXZpc2lvbhITCgt0cmlnZ2VyX2lkcxgEIAMoCRIpCgZzdGF0dXMYBSABKA4yGS5qb2tvLnYxLlJvdXRpbmVSdW5TdGF0dXMSLgoKY3JlYXRlZF9hdBgGIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLwoLZmluaXNoZWRfYXQYByABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEhIKBWVycm9yGAggASgJSACIAQESHAoPc2NoZWR1bGVfcnVuX2lkGAkgASgJSAGIAQESGAoLcmVzdWx0X3RleHQYCiABKAlIAogBARIXCgpzZXNzaW9uX2lkGAsgASgJSAOIAQFCCAoGX2Vycm9yQhIKEF9zY2hlZHVsZV9ydW5faWRCDgoMX3Jlc3VsdF90ZXh0Qg0KC19zZXNzaW9uX2lkIjAKGkxpc3RQYXJ0bmVyUm91dGluZXNSZXF1ZXN0EhIKCnBhcnRuZXJfaWQYASABKAki8QEKG0xpc3RQYXJ0bmVyUm91dGluZXNSZXNwb25zZRISCgpwYXJ0bmVyX2lkGAEgASgJEisKEHBhcnRuZXJfcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uEhAKCHdyaXRhYmxlGAMgASgIEikKCHJvdXRpbmVzGAQgAygLMhcuam9rby52MS5QYXJ0bmVyUm91dGluZRInCgdzb3VyY2VzGAUgAygLMhYuam9rby52MS5Sb3V0aW5lU291cmNlEisKBm1vZGVscxgGIAMoCzIbLmpva28udjEuUm91dGluZU1vZGVsQ2hvaWNlIoICChlTYXZlUGFydG5lclJvdXRpbmVSZXF1ZXN0EhIKCnBhcnRuZXJfaWQYASABKAkSNAoZZXhwZWN0ZWRfcGFydG5lcl9yZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24SLgoKZGVmaW5pdGlvbhgDIAEoCzIaLmpva28udjEuUm91dGluZURlZmluaXRpb24SHQoTY3JlYXRpb25fcmVxdWVzdF9pZBgEIAEoCUgAEhQKCnJvdXRpbmVfaWQYBSABKAlIABIsChFleHBlY3RlZF9yZXZpc2lvbhgGIAEoCzIRLmpva28udjEuUmV2aXNpb25CCAoGaW50ZW50IkYKGlNhdmVQYXJ0bmVyUm91dGluZVJlc3BvbnNlEigKB3JvdXRpbmUYASABKAsyFy5qb2tvLnYxLlBhcnRuZXJSb3V0aW5lIroBChhSdW5QYXJ0bmVyUm91dGluZVJlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCRI0ChlleHBlY3RlZF9wYXJ0bmVyX3JldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbhISCgpyb3V0aW5lX2lkGAMgASgJEiwKEWV4cGVjdGVkX3JldmlzaW9uGAQgASgLMhEuam9rby52MS5SZXZpc2lvbhISCgpyZXF1ZXN0X2lkGAUgASgJIhsKGVJ1blBhcnRuZXJSb3V0aW5lUmVzcG9uc2UiqQEKG0RlbGV0ZVBhcnRuZXJSb3V0aW5lUmVxdWVzdBISCgpwYXJ0bmVyX2lkGAEgASgJEjQKGWV4cGVjdGVkX3BhcnRuZXJfcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uEhIKCnJvdXRpbmVfaWQYAyABKAkSLAoRZXhwZWN0ZWRfcmV2aXNpb24YBCABKAsyES5qb2tvLnYxLlJldmlzaW9uIh4KHERlbGV0ZVBhcnRuZXJSb3V0aW5lUmVzcG9uc2UiZwodTGlzdFBhcnRuZXJSb3V0aW5lUnVuc1JlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCRISCgpyb3V0aW5lX2lkGAIgASgJEhMKBm9mZnNldBgDIAEoDUgAiAEBQgkKB19vZmZzZXQidAoeTGlzdFBhcnRuZXJSb3V0aW5lUnVuc1Jlc3BvbnNlEigKBHJ1bnMYASADKAsyGi5qb2tvLnYxLlBhcnRuZXJSb3V0aW5lUnVuEhgKC25leHRfb2Zmc2V0GAIgASgNSACIAQFCDgoMX25leHRfb2Zmc2V0IkoKIEdldFBhcnRuZXJSb3V0aW5lQ3JlYXRpb25SZXF1ZXN0EhIKCnBhcnRuZXJfaWQYASABKAkSEgoKcmVxdWVzdF9pZBgCIAEoCSJeCiFHZXRQYXJ0bmVyUm91dGluZUNyZWF0aW9uUmVzcG9uc2USKAoHcm91dGluZRgBIAEoCzIXLmpva28udjEuUGFydG5lclJvdXRpbmUSDwoHcmV0aXJlZBgCIAEoCCJNCiNSZXRpcmVQYXJ0bmVyUm91dGluZUNyZWF0aW9uUmVxdWVzdBISCgpwYXJ0bmVyX2lkGAEgASgJEhIKCnJlcXVlc3RfaWQYAiABKAkiYQokUmV0aXJlUGFydG5lclJvdXRpbmVDcmVhdGlvblJlc3BvbnNlEigKB3JvdXRpbmUYASABKAsyFy5qb2tvLnYxLlBhcnRuZXJSb3V0aW5lEg8KB3JldGlyZWQYAiABKAgqsgEKFVJvdXRpbmVGaWx0ZXJPcGVyYXRvchInCiNST1VUSU5FX0ZJTFRFUl9PUEVSQVRPUl9VTlNQRUNJRklFRBAAEiIKHlJPVVRJTkVfRklMVEVSX09QRVJBVE9SX0VRVUFMUxABEiQKIFJPVVRJTkVfRklMVEVSX09QRVJBVE9SX0NPTlRBSU5TEAISJgoiUk9VVElORV9GSUxURVJfT1BFUkFUT1JfTk9UX0VRVUFMUxADKpoCChBSb3V0aW5lUnVuU3RhdHVzEiIKHlJPVVRJTkVfUlVOX1NUQVRVU19VTlNQRUNJRklFRBAAEh0KGVJPVVRJTkVfUlVOX1NUQVRVU19RVUVVRUQQARIeChpST1VUSU5FX1JVTl9TVEFUVVNfUlVOTklORxACEh4KGlJPVVRJTkVfUlVOX1NUQVRVU19TVUNDRVNTEAMSHQoZUk9VVElORV9SVU5fU1RBVFVTX0ZBSUxFRBAEEiIKHlJPVVRJTkVfUlVOX1NUQVRVU19JTlRFUlJVUFRFRBAFEiAKHFJPVVRJTkVfUlVOX1NUQVRVU19DQU5DRUxMRUQQBhIeChpST1VUSU5FX1JVTl9TVEFUVVNfU0tJUFBFRBAHKqoBChNSb3V0aW5lU291cmNlU3RhdHVzEiUKIVJPVVRJTkVfU09VUkNFX1NUQVRVU19VTlNQRUNJRklFRBAAEiMKH1JPVVRJTkVfU09VUkNFX1NUQVRVU19MSVNURU5JTkcQARImCiJST1VUSU5FX1NPVVJDRV9TVEFUVVNfRElTQ09OTkVDVEVEEAISHwobUk9VVElORV9TT1VSQ0VfU1RBVFVTX0VSUk9SEAMqfwoSUm91dGluZVNlc3Npb25Nb2RlEiQKIFJPVVRJTkVfU0VTU0lPTl9NT0RFX1VOU1BFQ0lGSUVEEAASIwofUk9VVElORV9TRVNTSU9OX01PREVfUEVSU0lTVEVOVBABEh4KGlJPVVRJTkVfU0VTU0lPTl9NT0RFX0ZSRVNIEAIy9QUKFVBhcnRuZXJSb3V0aW5lU2VydmljZRJgChNMaXN0UGFydG5lclJvdXRpbmVzEiMuam9rby52MS5MaXN0UGFydG5lclJvdXRpbmVzUmVxdWVzdBokLmpva28udjEuTGlzdFBhcnRuZXJSb3V0aW5lc1Jlc3BvbnNlEl0KElNhdmVQYXJ0bmVyUm91dGluZRIiLmpva28udjEuU2F2ZVBhcnRuZXJSb3V0aW5lUmVxdWVzdBojLmpva28udjEuU2F2ZVBhcnRuZXJSb3V0aW5lUmVzcG9uc2USWgoRUnVuUGFydG5lclJvdXRpbmUSIS5qb2tvLnYxLlJ1blBhcnRuZXJSb3V0aW5lUmVxdWVzdBoiLmpva28udjEuUnVuUGFydG5lclJvdXRpbmVSZXNwb25zZRJjChREZWxldGVQYXJ0bmVyUm91dGluZRIkLmpva28udjEuRGVsZXRlUGFydG5lclJvdXRpbmVSZXF1ZXN0GiUuam9rby52MS5EZWxldGVQYXJ0bmVyUm91dGluZVJlc3BvbnNlEmkKFkxpc3RQYXJ0bmVyUm91dGluZVJ1bnMSJi5qb2tvLnYxLkxpc3RQYXJ0bmVyUm91dGluZVJ1bnNSZXF1ZXN0Gicuam9rby52MS5MaXN0UGFydG5lclJvdXRpbmVSdW5zUmVzcG9uc2UScgoZR2V0UGFydG5lclJvdXRpbmVDcmVhdGlvbhIpLmpva28udjEuR2V0UGFydG5lclJvdXRpbmVDcmVhdGlvblJlcXVlc3QaKi5qb2tvLnYxLkdldFBhcnRuZXJSb3V0aW5lQ3JlYXRpb25SZXNwb25zZRJ7ChxSZXRpcmVQYXJ0bmVyUm91dGluZUNyZWF0aW9uEiwuam9rby52MS5SZXRpcmVQYXJ0bmVyUm91dGluZUNyZWF0aW9uUmVxdWVzdBotLmpva28udjEuUmV0aXJlUGFydG5lclJvdXRpbmVDcmVhdGlvblJlc3BvbnNlYgZwcm90bzM", [file_google_protobuf_timestamp, file_joko_v1_common, file_joko_v1_model]);
+  fileDesc("Ch1qb2tvL3YxL3BhcnRuZXJfcm91dGluZS5wcm90bxIHam9rby52MSI6ChJSb3V0aW5lQ3JvblRyaWdnZXISEgoKZXhwcmVzc2lvbhgBIAEoCRIQCgh0aW1lem9uZRgCIAEoCSJTChZSb3V0aW5lSW50ZXJ2YWxUcmlnZ2VyEhMKC2ludGVydmFsX21zGAEgASgEEhYKCWFuY2hvcl9tcxgCIAEoBEgAiAEBQgwKCl9hbmNob3JfbXMiPAoSUm91dGluZU9uY2VUcmlnZ2VyEiYKAmF0GAEgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCJkChJSb3V0aW5lRXZlbnRGaWx0ZXISDQoFZmllbGQYASABKAkSMAoIb3BlcmF0b3IYAiABKA4yHi5qb2tvLnYxLlJvdXRpbmVGaWx0ZXJPcGVyYXRvchINCgV2YWx1ZRgDIAEoCSJqChNSb3V0aW5lRXZlbnRUcmlnZ2VyEhEKCXNvdXJjZV9pZBgBIAEoCRISCgpldmVudF90eXBlGAIgASgJEiwKB2ZpbHRlcnMYAyADKAsyGy5qb2tvLnYxLlJvdXRpbmVFdmVudEZpbHRlciLiAQoOUm91dGluZVRyaWdnZXISCgoCaWQYASABKAkSKwoEY3JvbhgCIAEoCzIbLmpva28udjEuUm91dGluZUNyb25UcmlnZ2VySAASMwoIaW50ZXJ2YWwYAyABKAsyHy5qb2tvLnYxLlJvdXRpbmVJbnRlcnZhbFRyaWdnZXJIABIrCgRvbmNlGAQgASgLMhsuam9rby52MS5Sb3V0aW5lT25jZVRyaWdnZXJIABItCgVldmVudBgFIAEoCzIcLmpva28udjEuUm91dGluZUV2ZW50VHJpZ2dlckgAQgYKBGtpbmQiTAoRUm91dGluZVByZVJ1bkhvb2sSDwoHY29tbWFuZBgBIAEoCRIXCgp0aW1lb3V0X21zGAIgASgESACIAQFCDQoLX3RpbWVvdXRfbXMiTgoMUm91dGluZU1vZGVsEhIKCmJhY2tlbmRfaWQYASABKAkSKgoJc2VsZWN0aW9uGAIgASgLMhcuam9rby52MS5Nb2RlbFNlbGVjdGlvbiKWAQoSUm91dGluZU1vZGVsQ2hvaWNlEiQKBXJvdXRlGAEgASgLMhUuam9rby52MS5Sb3V0aW5lTW9kZWwSDAoEbmFtZRgCIAEoCRIPCgdlZmZvcnRzGAMgAygJEhoKEnN1cHBvcnRzX2Zhc3RfbW9kZRgEIAEoCBIfChdzdXBwb3J0c191bHRyYWZhc3RfbW9kZRgFIAEoCCLGAgoRUm91dGluZURlZmluaXRpb24SDAoEbmFtZRgBIAEoCRIOCgZwcm9tcHQYAiABKAkSFAoHZW5hYmxlZBgDIAEoCEgAiAEBEikKCHRyaWdnZXJzGAQgAygLMhcuam9rby52MS5Sb3V0aW5lVHJpZ2dlchIdChBzaWxlbnRfd2hlbl9pZGxlGAUgASgISAGIAQESMAoMcHJlX3J1bl9ob29rGAYgASgLMhouam9rby52MS5Sb3V0aW5lUHJlUnVuSG9vaxIxCgxzZXNzaW9uX21vZGUYByABKA4yGy5qb2tvLnYxLlJvdXRpbmVTZXNzaW9uTW9kZRItCg5tb2RlbF9vdmVycmlkZRgIIAEoCzIVLmpva28udjEuUm91dGluZU1vZGVsQgoKCF9lbmFibGVkQhMKEV9zaWxlbnRfd2hlbl9pZGxlIvgCCg5QYXJ0bmVyUm91dGluZRIKCgJpZBgBIAEoCRISCgpwYXJ0bmVyX2lkGAIgASgJEiMKCHJldmlzaW9uGAMgASgLMhEuam9rby52MS5SZXZpc2lvbhIuCgpkZWZpbml0aW9uGAQgASgLMhouam9rby52MS5Sb3V0aW5lRGVmaW5pdGlvbhIwCghhY3Rpdml0eRgFIAEoDjIZLmpva28udjEuUm91dGluZVJ1blN0YXR1c0gAiAEBEi4KCmNyZWF0ZWRfYXQYBiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEi4KCnVwZGF0ZWRfYXQYByABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEhQKB2J1aWx0aW4YCCABKAlIAYgBARIcCg9idWlsdGluX3ZlcnNpb24YCSABKA1IAogBAUILCglfYWN0aXZpdHlCCgoIX2J1aWx0aW5CEgoQX2J1aWx0aW5fdmVyc2lvbiJAChJSb3V0aW5lU291cmNlRXZlbnQSDAoEdHlwZRgBIAEoCRIMCgRuYW1lGAIgASgJEg4KBmZpZWxkcxgDIAMoCSK3AQoNUm91dGluZVNvdXJjZRIKCgJpZBgBIAEoCRIMCgRuYW1lGAIgASgJEiwKBnN0YXR1cxgDIAEoDjIcLmpva28udjEuUm91dGluZVNvdXJjZVN0YXR1cxIrCgZldmVudHMYBCADKAsyGy5qb2tvLnYxLlJvdXRpbmVTb3VyY2VFdmVudBIxCg1sYXN0X2V2ZW50X2F0GAUgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCKmAwoRUGFydG5lclJvdXRpbmVSdW4SCgoCaWQYASABKAkSEgoKcm91dGluZV9pZBgCIAEoCRIuChNkZWZpbml0aW9uX3JldmlzaW9uGAMgASgLMhEuam9rby52MS5SZXZpc2lvbhITCgt0cmlnZ2VyX2lkcxgEIAMoCRIpCgZzdGF0dXMYBSABKA4yGS5qb2tvLnYxLlJvdXRpbmVSdW5TdGF0dXMSLgoKY3JlYXRlZF9hdBgGIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLwoLZmluaXNoZWRfYXQYByABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEhIKBWVycm9yGAggASgJSACIAQESHAoPc2NoZWR1bGVfcnVuX2lkGAkgASgJSAGIAQESGAoLcmVzdWx0X3RleHQYCiABKAlIAogBARIXCgpzZXNzaW9uX2lkGAsgASgJSAOIAQFCCAoGX2Vycm9yQhIKEF9zY2hlZHVsZV9ydW5faWRCDgoMX3Jlc3VsdF90ZXh0Qg0KC19zZXNzaW9uX2lkIjAKGkxpc3RQYXJ0bmVyUm91dGluZXNSZXF1ZXN0EhIKCnBhcnRuZXJfaWQYASABKAki8QEKG0xpc3RQYXJ0bmVyUm91dGluZXNSZXNwb25zZRISCgpwYXJ0bmVyX2lkGAEgASgJEisKEHBhcnRuZXJfcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uEhAKCHdyaXRhYmxlGAMgASgIEikKCHJvdXRpbmVzGAQgAygLMhcuam9rby52MS5QYXJ0bmVyUm91dGluZRInCgdzb3VyY2VzGAUgAygLMhYuam9rby52MS5Sb3V0aW5lU291cmNlEisKBm1vZGVscxgGIAMoCzIbLmpva28udjEuUm91dGluZU1vZGVsQ2hvaWNlIoICChlTYXZlUGFydG5lclJvdXRpbmVSZXF1ZXN0EhIKCnBhcnRuZXJfaWQYASABKAkSNAoZZXhwZWN0ZWRfcGFydG5lcl9yZXZpc2lvbhgCIAEoCzIRLmpva28udjEuUmV2aXNpb24SLgoKZGVmaW5pdGlvbhgDIAEoCzIaLmpva28udjEuUm91dGluZURlZmluaXRpb24SHQoTY3JlYXRpb25fcmVxdWVzdF9pZBgEIAEoCUgAEhQKCnJvdXRpbmVfaWQYBSABKAlIABIsChFleHBlY3RlZF9yZXZpc2lvbhgGIAEoCzIRLmpva28udjEuUmV2aXNpb25CCAoGaW50ZW50IkYKGlNhdmVQYXJ0bmVyUm91dGluZVJlc3BvbnNlEigKB3JvdXRpbmUYASABKAsyFy5qb2tvLnYxLlBhcnRuZXJSb3V0aW5lIroBChhSdW5QYXJ0bmVyUm91dGluZVJlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCRI0ChlleHBlY3RlZF9wYXJ0bmVyX3JldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbhISCgpyb3V0aW5lX2lkGAMgASgJEiwKEWV4cGVjdGVkX3JldmlzaW9uGAQgASgLMhEuam9rby52MS5SZXZpc2lvbhISCgpyZXF1ZXN0X2lkGAUgASgJIhsKGVJ1blBhcnRuZXJSb3V0aW5lUmVzcG9uc2UiqQEKG0RlbGV0ZVBhcnRuZXJSb3V0aW5lUmVxdWVzdBISCgpwYXJ0bmVyX2lkGAEgASgJEjQKGWV4cGVjdGVkX3BhcnRuZXJfcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uEhIKCnJvdXRpbmVfaWQYAyABKAkSLAoRZXhwZWN0ZWRfcmV2aXNpb24YBCABKAsyES5qb2tvLnYxLlJldmlzaW9uIh4KHERlbGV0ZVBhcnRuZXJSb3V0aW5lUmVzcG9uc2UiZwodTGlzdFBhcnRuZXJSb3V0aW5lUnVuc1JlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCRISCgpyb3V0aW5lX2lkGAIgASgJEhMKBm9mZnNldBgDIAEoDUgAiAEBQgkKB19vZmZzZXQidAoeTGlzdFBhcnRuZXJSb3V0aW5lUnVuc1Jlc3BvbnNlEigKBHJ1bnMYASADKAsyGi5qb2tvLnYxLlBhcnRuZXJSb3V0aW5lUnVuEhgKC25leHRfb2Zmc2V0GAIgASgNSACIAQFCDgoMX25leHRfb2Zmc2V0IkoKIEdldFBhcnRuZXJSb3V0aW5lQ3JlYXRpb25SZXF1ZXN0EhIKCnBhcnRuZXJfaWQYASABKAkSEgoKcmVxdWVzdF9pZBgCIAEoCSJeCiFHZXRQYXJ0bmVyUm91dGluZUNyZWF0aW9uUmVzcG9uc2USKAoHcm91dGluZRgBIAEoCzIXLmpva28udjEuUGFydG5lclJvdXRpbmUSDwoHcmV0aXJlZBgCIAEoCCJNCiNSZXRpcmVQYXJ0bmVyUm91dGluZUNyZWF0aW9uUmVxdWVzdBISCgpwYXJ0bmVyX2lkGAEgASgJEhIKCnJlcXVlc3RfaWQYAiABKAkiYQokUmV0aXJlUGFydG5lclJvdXRpbmVDcmVhdGlvblJlc3BvbnNlEigKB3JvdXRpbmUYASABKAsyFy5qb2tvLnYxLlBhcnRuZXJSb3V0aW5lEg8KB3JldGlyZWQYAiABKAgiYAoXTmlnaHRseUxlYXJuaW5nU2NoZWR1bGUSDwoHZW5hYmxlZBgBIAEoCBI0CglmcmVxdWVuY3kYAiABKA4yIS5qb2tvLnYxLk5pZ2h0bHlMZWFybmluZ0ZyZXF1ZW5jeSK6AQoVTmlnaHRseUxlYXJuaW5nQ2hhbmdlEgoKAmlkGAEgASgJEjAKBGtpbmQYAiABKA4yIi5qb2tvLnYxLk5pZ2h0bHlMZWFybmluZ0NoYW5nZUtpbmQSNAoGYWN0aW9uGAMgASgOMiQuam9rby52MS5OaWdodGx5TGVhcm5pbmdDaGFuZ2VBY3Rpb24SDQoFdGl0bGUYBCABKAkSDgoGcmVhc29uGAUgASgJEg4KBnVuZG9uZRgGIAEoCCLYAQoSTmlnaHRseUxlYXJuaW5nUnVuEgoKAmlkGAEgASgJEi4KCnN0YXJ0ZWRfYXQYAiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEikKBnN0YXR1cxgDIAEoDjIZLmpva28udjEuUm91dGluZVJ1blN0YXR1cxIOCgZtYW51YWwYBCABKAgSGgoSY29udmVyc2F0aW9uX2NvdW50GAUgASgNEi8KB2NoYW5nZXMYBiADKAsyHi5qb2tvLnYxLk5pZ2h0bHlMZWFybmluZ0NoYW5nZSJ5ChhOaWdodGx5TGVhcm5pbmdDYW5kaWRhdGUSCgoCaWQYASABKAkSDQoFdGl0bGUYAiABKAkSDwoHc3VtbWFyeRgDIAEoCRIxCg1maXJzdF9zZWVuX2F0GAQgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCI2CiBHZXRQYXJ0bmVyTmlnaHRseUxlYXJuaW5nUmVxdWVzdBISCgpwYXJ0bmVyX2lkGAEgASgJIsIDCiFHZXRQYXJ0bmVyTmlnaHRseUxlYXJuaW5nUmVzcG9uc2USKwoQcGFydG5lcl9yZXZpc2lvbhgBIAEoCzIRLmpva28udjEuUmV2aXNpb24SKQoOc3RhdGVfcmV2aXNpb24YAiABKAsyES5qb2tvLnYxLlJldmlzaW9uEjIKCHNjaGVkdWxlGAMgASgLMiAuam9rby52MS5OaWdodGx5TGVhcm5pbmdTY2hlZHVsZRIQCgh0aW1lem9uZRgEIAEoCRIQCgh3cml0YWJsZRgFIAEoCBIPCgdydW5uaW5nGAYgASgIEh0KFXBlbmRpbmdfY29udmVyc2F0aW9ucxgHIAEoDRIWCg5tZW1vcnlfZW5hYmxlZBgIIAEoCBIsCgdoaXN0b3J5GAkgAygLMhsuam9rby52MS5OaWdodGx5TGVhcm5pbmdSdW4SNQoKY2FuZGlkYXRlcxgKIAMoCzIhLmpva28udjEuTmlnaHRseUxlYXJuaW5nQ2FuZGlkYXRlEhIKCnBhcnRuZXJfaWQYCyABKAkSLAoRc2NoZWR1bGVfcmV2aXNpb24YDCABKAsyES5qb2tvLnYxLlJldmlzaW9uIlAKHU5pZ2h0bHlMZWFybmluZ0NoYW5nZURlY2lzaW9uEg4KBnJ1bl9pZBgBIAEoCRIRCgljaGFuZ2VfaWQYAiABKAkSDAoEcmVkbxgDIAEoCCJJCiBOaWdodGx5TGVhcm5pbmdDYW5kaWRhdGVEZWNpc2lvbhIUCgxjYW5kaWRhdGVfaWQYASABKAkSDwoHcHJvbW90ZRgCIAEoCCKuAwojVXBkYXRlUGFydG5lck5pZ2h0bHlMZWFybmluZ1JlcXVlc3QSEgoKcGFydG5lcl9pZBgBIAEoCRI0ChlleHBlY3RlZF9wYXJ0bmVyX3JldmlzaW9uGAIgASgLMhEuam9rby52MS5SZXZpc2lvbhIyChdleHBlY3RlZF9zdGF0ZV9yZXZpc2lvbhgDIAEoCzIRLmpva28udjEuUmV2aXNpb24SNAoIc2NoZWR1bGUYBCABKAsyIC5qb2tvLnYxLk5pZ2h0bHlMZWFybmluZ1NjaGVkdWxlSAASGAoOcnVuX3JlcXVlc3RfaWQYBSABKAlIABI4CgZjaGFuZ2UYBiABKAsyJi5qb2tvLnYxLk5pZ2h0bHlMZWFybmluZ0NoYW5nZURlY2lzaW9uSAASPgoJY2FuZGlkYXRlGAcgASgLMikuam9rby52MS5OaWdodGx5TGVhcm5pbmdDYW5kaWRhdGVEZWNpc2lvbkgAEjUKGmV4cGVjdGVkX3NjaGVkdWxlX3JldmlzaW9uGAggASgLMhEuam9rby52MS5SZXZpc2lvbkIICgZhY3Rpb24iYQokVXBkYXRlUGFydG5lck5pZ2h0bHlMZWFybmluZ1Jlc3BvbnNlEjkKBXN0YXRlGAEgASgLMiouam9rby52MS5HZXRQYXJ0bmVyTmlnaHRseUxlYXJuaW5nUmVzcG9uc2UqsgEKFVJvdXRpbmVGaWx0ZXJPcGVyYXRvchInCiNST1VUSU5FX0ZJTFRFUl9PUEVSQVRPUl9VTlNQRUNJRklFRBAAEiIKHlJPVVRJTkVfRklMVEVSX09QRVJBVE9SX0VRVUFMUxABEiQKIFJPVVRJTkVfRklMVEVSX09QRVJBVE9SX0NPTlRBSU5TEAISJgoiUk9VVElORV9GSUxURVJfT1BFUkFUT1JfTk9UX0VRVUFMUxADKpoCChBSb3V0aW5lUnVuU3RhdHVzEiIKHlJPVVRJTkVfUlVOX1NUQVRVU19VTlNQRUNJRklFRBAAEh0KGVJPVVRJTkVfUlVOX1NUQVRVU19RVUVVRUQQARIeChpST1VUSU5FX1JVTl9TVEFUVVNfUlVOTklORxACEh4KGlJPVVRJTkVfUlVOX1NUQVRVU19TVUNDRVNTEAMSHQoZUk9VVElORV9SVU5fU1RBVFVTX0ZBSUxFRBAEEiIKHlJPVVRJTkVfUlVOX1NUQVRVU19JTlRFUlJVUFRFRBAFEiAKHFJPVVRJTkVfUlVOX1NUQVRVU19DQU5DRUxMRUQQBhIeChpST1VUSU5FX1JVTl9TVEFUVVNfU0tJUFBFRBAHKqoBChNSb3V0aW5lU291cmNlU3RhdHVzEiUKIVJPVVRJTkVfU09VUkNFX1NUQVRVU19VTlNQRUNJRklFRBAAEiMKH1JPVVRJTkVfU09VUkNFX1NUQVRVU19MSVNURU5JTkcQARImCiJST1VUSU5FX1NPVVJDRV9TVEFUVVNfRElTQ09OTkVDVEVEEAISHwobUk9VVElORV9TT1VSQ0VfU1RBVFVTX0VSUk9SEAMqfwoSUm91dGluZVNlc3Npb25Nb2RlEiQKIFJPVVRJTkVfU0VTU0lPTl9NT0RFX1VOU1BFQ0lGSUVEEAASIwofUk9VVElORV9TRVNTSU9OX01PREVfUEVSU0lTVEVOVBABEh4KGlJPVVRJTkVfU0VTU0lPTl9NT0RFX0ZSRVNIEAIqkwEKGE5pZ2h0bHlMZWFybmluZ0ZyZXF1ZW5jeRIqCiZOSUdIVExZX0xFQVJOSU5HX0ZSRVFVRU5DWV9VTlNQRUNJRklFRBAAEiQKIE5JR0hUTFlfTEVBUk5JTkdfRlJFUVVFTkNZX0RBSUxZEAESJQohTklHSFRMWV9MRUFSTklOR19GUkVRVUVOQ1lfV0VFS0xZEAIqmgEKGU5pZ2h0bHlMZWFybmluZ0NoYW5nZUtpbmQSLAooTklHSFRMWV9MRUFSTklOR19DSEFOR0VfS0lORF9VTlNQRUNJRklFRBAAEicKI05JR0hUTFlfTEVBUk5JTkdfQ0hBTkdFX0tJTkRfTUVNT1JZEAESJgoiTklHSFRMWV9MRUFSTklOR19DSEFOR0VfS0lORF9TS0lMTBACKv4BChtOaWdodGx5TGVhcm5pbmdDaGFuZ2VBY3Rpb24SLgoqTklHSFRMWV9MRUFSTklOR19DSEFOR0VfQUNUSU9OX1VOU1BFQ0lGSUVEEAASKgomTklHSFRMWV9MRUFSTklOR19DSEFOR0VfQUNUSU9OX0NSRUFURUQQARIqCiZOSUdIVExZX0xFQVJOSU5HX0NIQU5HRV9BQ1RJT05fVVBEQVRFRBACEioKJk5JR0hUTFlfTEVBUk5JTkdfQ0hBTkdFX0FDVElPTl9SRU1PVkVEEAMSKwonTklHSFRMWV9MRUFSTklOR19DSEFOR0VfQUNUSU9OX0RJU0FCTEVEEAQy5gcKFVBhcnRuZXJSb3V0aW5lU2VydmljZRJgChNMaXN0UGFydG5lclJvdXRpbmVzEiMuam9rby52MS5MaXN0UGFydG5lclJvdXRpbmVzUmVxdWVzdBokLmpva28udjEuTGlzdFBhcnRuZXJSb3V0aW5lc1Jlc3BvbnNlEl0KElNhdmVQYXJ0bmVyUm91dGluZRIiLmpva28udjEuU2F2ZVBhcnRuZXJSb3V0aW5lUmVxdWVzdBojLmpva28udjEuU2F2ZVBhcnRuZXJSb3V0aW5lUmVzcG9uc2USWgoRUnVuUGFydG5lclJvdXRpbmUSIS5qb2tvLnYxLlJ1blBhcnRuZXJSb3V0aW5lUmVxdWVzdBoiLmpva28udjEuUnVuUGFydG5lclJvdXRpbmVSZXNwb25zZRJjChREZWxldGVQYXJ0bmVyUm91dGluZRIkLmpva28udjEuRGVsZXRlUGFydG5lclJvdXRpbmVSZXF1ZXN0GiUuam9rby52MS5EZWxldGVQYXJ0bmVyUm91dGluZVJlc3BvbnNlEmkKFkxpc3RQYXJ0bmVyUm91dGluZVJ1bnMSJi5qb2tvLnYxLkxpc3RQYXJ0bmVyUm91dGluZVJ1bnNSZXF1ZXN0Gicuam9rby52MS5MaXN0UGFydG5lclJvdXRpbmVSdW5zUmVzcG9uc2UScgoZR2V0UGFydG5lclJvdXRpbmVDcmVhdGlvbhIpLmpva28udjEuR2V0UGFydG5lclJvdXRpbmVDcmVhdGlvblJlcXVlc3QaKi5qb2tvLnYxLkdldFBhcnRuZXJSb3V0aW5lQ3JlYXRpb25SZXNwb25zZRJ7ChxSZXRpcmVQYXJ0bmVyUm91dGluZUNyZWF0aW9uEiwuam9rby52MS5SZXRpcmVQYXJ0bmVyUm91dGluZUNyZWF0aW9uUmVxdWVzdBotLmpva28udjEuUmV0aXJlUGFydG5lclJvdXRpbmVDcmVhdGlvblJlc3BvbnNlEnIKGUdldFBhcnRuZXJOaWdodGx5TGVhcm5pbmcSKS5qb2tvLnYxLkdldFBhcnRuZXJOaWdodGx5TGVhcm5pbmdSZXF1ZXN0Giouam9rby52MS5HZXRQYXJ0bmVyTmlnaHRseUxlYXJuaW5nUmVzcG9uc2USewocVXBkYXRlUGFydG5lck5pZ2h0bHlMZWFybmluZxIsLmpva28udjEuVXBkYXRlUGFydG5lck5pZ2h0bHlMZWFybmluZ1JlcXVlc3QaLS5qb2tvLnYxLlVwZGF0ZVBhcnRuZXJOaWdodGx5TGVhcm5pbmdSZXNwb25zZWIGcHJvdG8z", [file_google_protobuf_timestamp, file_joko_v1_common, file_joko_v1_model]);
 
 /**
  * @generated from message joko.v1.RoutineCronTrigger
@@ -860,6 +860,360 @@ export const RetirePartnerRoutineCreationResponseSchema: GenMessage<RetirePartne
   messageDesc(file_joko_v1_partner_routine, 27);
 
 /**
+ * @generated from message joko.v1.NightlyLearningSchedule
+ */
+export type NightlyLearningSchedule = Message<"joko.v1.NightlyLearningSchedule"> & {
+  /**
+   * @generated from field: bool enabled = 1;
+   */
+  enabled: boolean;
+
+  /**
+   * @generated from field: joko.v1.NightlyLearningFrequency frequency = 2;
+   */
+  frequency: NightlyLearningFrequency;
+};
+
+/**
+ * Describes the message joko.v1.NightlyLearningSchedule.
+ * Use `create(NightlyLearningScheduleSchema)` to create a new message.
+ */
+export const NightlyLearningScheduleSchema: GenMessage<NightlyLearningSchedule> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_routine, 28);
+
+/**
+ * @generated from message joko.v1.NightlyLearningChange
+ */
+export type NightlyLearningChange = Message<"joko.v1.NightlyLearningChange"> & {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id: string;
+
+  /**
+   * @generated from field: joko.v1.NightlyLearningChangeKind kind = 2;
+   */
+  kind: NightlyLearningChangeKind;
+
+  /**
+   * @generated from field: joko.v1.NightlyLearningChangeAction action = 3;
+   */
+  action: NightlyLearningChangeAction;
+
+  /**
+   * @generated from field: string title = 4;
+   */
+  title: string;
+
+  /**
+   * @generated from field: string reason = 5;
+   */
+  reason: string;
+
+  /**
+   * @generated from field: bool undone = 6;
+   */
+  undone: boolean;
+};
+
+/**
+ * Describes the message joko.v1.NightlyLearningChange.
+ * Use `create(NightlyLearningChangeSchema)` to create a new message.
+ */
+export const NightlyLearningChangeSchema: GenMessage<NightlyLearningChange> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_routine, 29);
+
+/**
+ * @generated from message joko.v1.NightlyLearningRun
+ */
+export type NightlyLearningRun = Message<"joko.v1.NightlyLearningRun"> & {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id: string;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp started_at = 2;
+   */
+  startedAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: joko.v1.RoutineRunStatus status = 3;
+   */
+  status: RoutineRunStatus;
+
+  /**
+   * @generated from field: bool manual = 4;
+   */
+  manual: boolean;
+
+  /**
+   * @generated from field: uint32 conversation_count = 5;
+   */
+  conversationCount: number;
+
+  /**
+   * @generated from field: repeated joko.v1.NightlyLearningChange changes = 6;
+   */
+  changes: NightlyLearningChange[];
+};
+
+/**
+ * Describes the message joko.v1.NightlyLearningRun.
+ * Use `create(NightlyLearningRunSchema)` to create a new message.
+ */
+export const NightlyLearningRunSchema: GenMessage<NightlyLearningRun> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_routine, 30);
+
+/**
+ * @generated from message joko.v1.NightlyLearningCandidate
+ */
+export type NightlyLearningCandidate = Message<"joko.v1.NightlyLearningCandidate"> & {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id: string;
+
+  /**
+   * @generated from field: string title = 2;
+   */
+  title: string;
+
+  /**
+   * @generated from field: string summary = 3;
+   */
+  summary: string;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp first_seen_at = 4;
+   */
+  firstSeenAt?: Timestamp | undefined;
+};
+
+/**
+ * Describes the message joko.v1.NightlyLearningCandidate.
+ * Use `create(NightlyLearningCandidateSchema)` to create a new message.
+ */
+export const NightlyLearningCandidateSchema: GenMessage<NightlyLearningCandidate> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_routine, 31);
+
+/**
+ * @generated from message joko.v1.GetPartnerNightlyLearningRequest
+ */
+export type GetPartnerNightlyLearningRequest = Message<"joko.v1.GetPartnerNightlyLearningRequest"> & {
+  /**
+   * @generated from field: string partner_id = 1;
+   */
+  partnerId: string;
+};
+
+/**
+ * Describes the message joko.v1.GetPartnerNightlyLearningRequest.
+ * Use `create(GetPartnerNightlyLearningRequestSchema)` to create a new message.
+ */
+export const GetPartnerNightlyLearningRequestSchema: GenMessage<GetPartnerNightlyLearningRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_routine, 32);
+
+/**
+ * @generated from message joko.v1.GetPartnerNightlyLearningResponse
+ */
+export type GetPartnerNightlyLearningResponse = Message<"joko.v1.GetPartnerNightlyLearningResponse"> & {
+  /**
+   * @generated from field: joko.v1.Revision partner_revision = 1;
+   */
+  partnerRevision?: Revision | undefined;
+
+  /**
+   * @generated from field: joko.v1.Revision state_revision = 2;
+   */
+  stateRevision?: Revision | undefined;
+
+  /**
+   * @generated from field: joko.v1.NightlyLearningSchedule schedule = 3;
+   */
+  schedule?: NightlyLearningSchedule | undefined;
+
+  /**
+   * @generated from field: string timezone = 4;
+   */
+  timezone: string;
+
+  /**
+   * @generated from field: bool writable = 5;
+   */
+  writable: boolean;
+
+  /**
+   * @generated from field: bool running = 6;
+   */
+  running: boolean;
+
+  /**
+   * @generated from field: uint32 pending_conversations = 7;
+   */
+  pendingConversations: number;
+
+  /**
+   * @generated from field: bool memory_enabled = 8;
+   */
+  memoryEnabled: boolean;
+
+  /**
+   * @generated from field: repeated joko.v1.NightlyLearningRun history = 9;
+   */
+  history: NightlyLearningRun[];
+
+  /**
+   * @generated from field: repeated joko.v1.NightlyLearningCandidate candidates = 10;
+   */
+  candidates: NightlyLearningCandidate[];
+
+  /**
+   * @generated from field: string partner_id = 11;
+   */
+  partnerId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision schedule_revision = 12;
+   */
+  scheduleRevision?: Revision | undefined;
+};
+
+/**
+ * Describes the message joko.v1.GetPartnerNightlyLearningResponse.
+ * Use `create(GetPartnerNightlyLearningResponseSchema)` to create a new message.
+ */
+export const GetPartnerNightlyLearningResponseSchema: GenMessage<GetPartnerNightlyLearningResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_routine, 33);
+
+/**
+ * @generated from message joko.v1.NightlyLearningChangeDecision
+ */
+export type NightlyLearningChangeDecision = Message<"joko.v1.NightlyLearningChangeDecision"> & {
+  /**
+   * @generated from field: string run_id = 1;
+   */
+  runId: string;
+
+  /**
+   * @generated from field: string change_id = 2;
+   */
+  changeId: string;
+
+  /**
+   * @generated from field: bool redo = 3;
+   */
+  redo: boolean;
+};
+
+/**
+ * Describes the message joko.v1.NightlyLearningChangeDecision.
+ * Use `create(NightlyLearningChangeDecisionSchema)` to create a new message.
+ */
+export const NightlyLearningChangeDecisionSchema: GenMessage<NightlyLearningChangeDecision> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_routine, 34);
+
+/**
+ * @generated from message joko.v1.NightlyLearningCandidateDecision
+ */
+export type NightlyLearningCandidateDecision = Message<"joko.v1.NightlyLearningCandidateDecision"> & {
+  /**
+   * @generated from field: string candidate_id = 1;
+   */
+  candidateId: string;
+
+  /**
+   * @generated from field: bool promote = 2;
+   */
+  promote: boolean;
+};
+
+/**
+ * Describes the message joko.v1.NightlyLearningCandidateDecision.
+ * Use `create(NightlyLearningCandidateDecisionSchema)` to create a new message.
+ */
+export const NightlyLearningCandidateDecisionSchema: GenMessage<NightlyLearningCandidateDecision> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_routine, 35);
+
+/**
+ * @generated from message joko.v1.UpdatePartnerNightlyLearningRequest
+ */
+export type UpdatePartnerNightlyLearningRequest = Message<"joko.v1.UpdatePartnerNightlyLearningRequest"> & {
+  /**
+   * @generated from field: string partner_id = 1;
+   */
+  partnerId: string;
+
+  /**
+   * @generated from field: joko.v1.Revision expected_partner_revision = 2;
+   */
+  expectedPartnerRevision?: Revision | undefined;
+
+  /**
+   * @generated from field: joko.v1.Revision expected_state_revision = 3;
+   */
+  expectedStateRevision?: Revision | undefined;
+
+  /**
+   * @generated from oneof joko.v1.UpdatePartnerNightlyLearningRequest.action
+   */
+  action: {
+    /**
+     * @generated from field: joko.v1.NightlyLearningSchedule schedule = 4;
+     */
+    value: NightlyLearningSchedule;
+    case: "schedule";
+  } | {
+    /**
+     * @generated from field: string run_request_id = 5;
+     */
+    value: string;
+    case: "runRequestId";
+  } | {
+    /**
+     * @generated from field: joko.v1.NightlyLearningChangeDecision change = 6;
+     */
+    value: NightlyLearningChangeDecision;
+    case: "change";
+  } | {
+    /**
+     * @generated from field: joko.v1.NightlyLearningCandidateDecision candidate = 7;
+     */
+    value: NightlyLearningCandidateDecision;
+    case: "candidate";
+  } | { case: undefined; value?: undefined };
+
+  /**
+   * @generated from field: joko.v1.Revision expected_schedule_revision = 8;
+   */
+  expectedScheduleRevision?: Revision | undefined;
+};
+
+/**
+ * Describes the message joko.v1.UpdatePartnerNightlyLearningRequest.
+ * Use `create(UpdatePartnerNightlyLearningRequestSchema)` to create a new message.
+ */
+export const UpdatePartnerNightlyLearningRequestSchema: GenMessage<UpdatePartnerNightlyLearningRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_routine, 36);
+
+/**
+ * @generated from message joko.v1.UpdatePartnerNightlyLearningResponse
+ */
+export type UpdatePartnerNightlyLearningResponse = Message<"joko.v1.UpdatePartnerNightlyLearningResponse"> & {
+  /**
+   * @generated from field: joko.v1.GetPartnerNightlyLearningResponse state = 1;
+   */
+  state?: GetPartnerNightlyLearningResponse | undefined;
+};
+
+/**
+ * Describes the message joko.v1.UpdatePartnerNightlyLearningResponse.
+ * Use `create(UpdatePartnerNightlyLearningResponseSchema)` to create a new message.
+ */
+export const UpdatePartnerNightlyLearningResponseSchema: GenMessage<UpdatePartnerNightlyLearningResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_routine, 37);
+
+/**
  * @generated from enum joko.v1.RoutineFilterOperator
  */
 export enum RoutineFilterOperator {
@@ -999,6 +1353,94 @@ export const RoutineSessionModeSchema: GenEnum<RoutineSessionMode> = /*@__PURE__
   enumDesc(file_joko_v1_partner_routine, 3);
 
 /**
+ * @generated from enum joko.v1.NightlyLearningFrequency
+ */
+export enum NightlyLearningFrequency {
+  /**
+   * @generated from enum value: NIGHTLY_LEARNING_FREQUENCY_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: NIGHTLY_LEARNING_FREQUENCY_DAILY = 1;
+   */
+  DAILY = 1,
+
+  /**
+   * @generated from enum value: NIGHTLY_LEARNING_FREQUENCY_WEEKLY = 2;
+   */
+  WEEKLY = 2,
+}
+
+/**
+ * Describes the enum joko.v1.NightlyLearningFrequency.
+ */
+export const NightlyLearningFrequencySchema: GenEnum<NightlyLearningFrequency> = /*@__PURE__*/
+  enumDesc(file_joko_v1_partner_routine, 4);
+
+/**
+ * @generated from enum joko.v1.NightlyLearningChangeKind
+ */
+export enum NightlyLearningChangeKind {
+  /**
+   * @generated from enum value: NIGHTLY_LEARNING_CHANGE_KIND_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: NIGHTLY_LEARNING_CHANGE_KIND_MEMORY = 1;
+   */
+  MEMORY = 1,
+
+  /**
+   * @generated from enum value: NIGHTLY_LEARNING_CHANGE_KIND_SKILL = 2;
+   */
+  SKILL = 2,
+}
+
+/**
+ * Describes the enum joko.v1.NightlyLearningChangeKind.
+ */
+export const NightlyLearningChangeKindSchema: GenEnum<NightlyLearningChangeKind> = /*@__PURE__*/
+  enumDesc(file_joko_v1_partner_routine, 5);
+
+/**
+ * @generated from enum joko.v1.NightlyLearningChangeAction
+ */
+export enum NightlyLearningChangeAction {
+  /**
+   * @generated from enum value: NIGHTLY_LEARNING_CHANGE_ACTION_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: NIGHTLY_LEARNING_CHANGE_ACTION_CREATED = 1;
+   */
+  CREATED = 1,
+
+  /**
+   * @generated from enum value: NIGHTLY_LEARNING_CHANGE_ACTION_UPDATED = 2;
+   */
+  UPDATED = 2,
+
+  /**
+   * @generated from enum value: NIGHTLY_LEARNING_CHANGE_ACTION_REMOVED = 3;
+   */
+  REMOVED = 3,
+
+  /**
+   * @generated from enum value: NIGHTLY_LEARNING_CHANGE_ACTION_DISABLED = 4;
+   */
+  DISABLED = 4,
+}
+
+/**
+ * Describes the enum joko.v1.NightlyLearningChangeAction.
+ */
+export const NightlyLearningChangeActionSchema: GenEnum<NightlyLearningChangeAction> = /*@__PURE__*/
+  enumDesc(file_joko_v1_partner_routine, 6);
+
+/**
  * @generated from service joko.v1.PartnerRoutineService
  */
 export const PartnerRoutineService: GenService<{
@@ -1057,6 +1499,22 @@ export const PartnerRoutineService: GenService<{
     methodKind: "unary";
     input: typeof RetirePartnerRoutineCreationRequestSchema;
     output: typeof RetirePartnerRoutineCreationResponseSchema;
+  },
+  /**
+   * @generated from rpc joko.v1.PartnerRoutineService.GetPartnerNightlyLearning
+   */
+  getPartnerNightlyLearning: {
+    methodKind: "unary";
+    input: typeof GetPartnerNightlyLearningRequestSchema;
+    output: typeof GetPartnerNightlyLearningResponseSchema;
+  },
+  /**
+   * @generated from rpc joko.v1.PartnerRoutineService.UpdatePartnerNightlyLearning
+   */
+  updatePartnerNightlyLearning: {
+    methodKind: "unary";
+    input: typeof UpdatePartnerNightlyLearningRequestSchema;
+    output: typeof UpdatePartnerNightlyLearningResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_joko_v1_partner_routine, 0);

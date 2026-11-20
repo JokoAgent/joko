@@ -5,6 +5,7 @@ import { PartnerTodoView, PartnerTodoUiAction, type ListPartnerTodosResponse, ty
 import type { ListPartnerTaskOutputsResponse, PartnerTaskOutput } from "./gen/joko/v1/partner_pb.js";
 import { RoutineDefinitionSchema, type PartnerRoutine } from "./gen/joko/v1/partner_routine_pb.js";
 import type { PartnerRoutineApi } from "./partner-routines.js";
+import type { PartnerNightlyLearningApi } from "./partner-nightly-learning.js";
 
 export type PartnerAutonomySettingChoice = NonNullable<MessageInitShape<typeof UpdatePartnerAutonomySettingsRequestSchema>["choice"]>;
 export const PARTNER_TODO_CHECK_PROMPT = "Look for new items I need to handle in your authorized sources. Add verified discoveries to my todos with their source evidence, and tell me what needs my attention.";
@@ -54,6 +55,7 @@ export interface PartnerAutonomyApi {
   updateTodo(operationId: string, partnerId: string, partnerRevision: bigint, todo: PartnerTodo, action: "delete" | "restore", signal: AbortSignal): Promise<PartnerTodo>;
   outputs(partnerId: string, signal: AbortSignal): Promise<readonly PartnerTaskOutput[]>;
   todoCheck?(partnerId: string): PartnerTodoCheckApi;
+  nightlyLearning?(partnerId: string): PartnerNightlyLearningApi;
 }
 interface AutonomyRpc {
   getPartnerAutonomySettings(request: object, options: { signal: AbortSignal }): Promise<GetPartnerAutonomySettingsResponse>;
@@ -66,7 +68,8 @@ interface AutonomyRpc {
 /** Web and Mobile share generated payloads and the same connection retirement fence. */
 export function createPartnerAutonomyApi(input: { readonly rpc: AutonomyRpc; readonly ownerKey: string;
   readonly newOperationId: () => string; readonly assertCurrent: (signal: AbortSignal) => void;
-  readonly todoCheck?: (partnerId: string) => PartnerTodoCheckApi }): PartnerAutonomyApi {
+  readonly todoCheck?: (partnerId: string) => PartnerTodoCheckApi;
+  readonly nightlyLearning?: (partnerId: string) => PartnerNightlyLearningApi }): PartnerAutonomyApi {
   const check = (signal: AbortSignal) => { signal.throwIfAborted(); input.assertCurrent(signal); };
   const invoke = async <T>(signal: AbortSignal, action: () => Promise<T>): Promise<T> => { check(signal); const value = await action(); check(signal); return value; };
   const settings = (value: PartnerAutonomySettings | undefined): PartnerAutonomySettings => {
@@ -76,6 +79,7 @@ export function createPartnerAutonomyApi(input: { readonly rpc: AutonomyRpc; rea
   };
   return { ownerKey: input.ownerKey, newOperationId: input.newOperationId,
     ...(input.todoCheck === undefined ? {} : { todoCheck: input.todoCheck }),
+    ...(input.nightlyLearning === undefined ? {} : { nightlyLearning: input.nightlyLearning }),
     settings: signal => invoke(signal, async () => settings((await input.rpc.getPartnerAutonomySettings({}, { signal })).settings)),
     save: (operationId, revision, choice, signal) => invoke(signal, async () => settings((await input.rpc.updatePartnerAutonomySettings({ operationId,
       expectedRevision: { value: revision }, choice }, { signal })).settings)),

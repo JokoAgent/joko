@@ -136,6 +136,77 @@ message GetPartnerRoutineCreationResponse { PartnerRoutine routine = 1; bool ret
 message RetirePartnerRoutineCreationRequest { string partner_id = 1; string request_id = 2; }
 message RetirePartnerRoutineCreationResponse { PartnerRoutine routine = 1; bool retired = 2; }
 
+enum NightlyLearningFrequency {
+  NIGHTLY_LEARNING_FREQUENCY_UNSPECIFIED = 0;
+  NIGHTLY_LEARNING_FREQUENCY_DAILY = 1;
+  NIGHTLY_LEARNING_FREQUENCY_WEEKLY = 2;
+}
+message NightlyLearningSchedule { bool enabled = 1; NightlyLearningFrequency frequency = 2; }
+enum NightlyLearningChangeKind {
+  NIGHTLY_LEARNING_CHANGE_KIND_UNSPECIFIED = 0;
+  NIGHTLY_LEARNING_CHANGE_KIND_MEMORY = 1;
+  NIGHTLY_LEARNING_CHANGE_KIND_SKILL = 2;
+}
+enum NightlyLearningChangeAction {
+  NIGHTLY_LEARNING_CHANGE_ACTION_UNSPECIFIED = 0;
+  NIGHTLY_LEARNING_CHANGE_ACTION_CREATED = 1;
+  NIGHTLY_LEARNING_CHANGE_ACTION_UPDATED = 2;
+  NIGHTLY_LEARNING_CHANGE_ACTION_REMOVED = 3;
+  NIGHTLY_LEARNING_CHANGE_ACTION_DISABLED = 4;
+}
+message NightlyLearningChange {
+  string id = 1;
+  NightlyLearningChangeKind kind = 2;
+  NightlyLearningChangeAction action = 3;
+  string title = 4;
+  string reason = 5;
+  bool undone = 6;
+}
+message NightlyLearningRun {
+  string id = 1;
+  google.protobuf.Timestamp started_at = 2;
+  RoutineRunStatus status = 3;
+  bool manual = 4;
+  uint32 conversation_count = 5;
+  repeated NightlyLearningChange changes = 6;
+}
+message NightlyLearningCandidate {
+  string id = 1;
+  string title = 2;
+  string summary = 3;
+  google.protobuf.Timestamp first_seen_at = 4;
+}
+message GetPartnerNightlyLearningRequest { string partner_id = 1; }
+message GetPartnerNightlyLearningResponse {
+  Revision partner_revision = 1;
+  Revision state_revision = 2;
+  NightlyLearningSchedule schedule = 3;
+  string timezone = 4;
+  bool writable = 5;
+  bool running = 6;
+  uint32 pending_conversations = 7;
+  bool memory_enabled = 8;
+  repeated NightlyLearningRun history = 9;
+  repeated NightlyLearningCandidate candidates = 10;
+  string partner_id = 11;
+  Revision schedule_revision = 12;
+}
+message NightlyLearningChangeDecision { string run_id = 1; string change_id = 2; bool redo = 3; }
+message NightlyLearningCandidateDecision { string candidate_id = 1; bool promote = 2; }
+message UpdatePartnerNightlyLearningRequest {
+  string partner_id = 1;
+  Revision expected_partner_revision = 2;
+  Revision expected_state_revision = 3;
+  oneof action {
+    NightlyLearningSchedule schedule = 4;
+    string run_request_id = 5;
+    NightlyLearningChangeDecision change = 6;
+    NightlyLearningCandidateDecision candidate = 7;
+  }
+  Revision expected_schedule_revision = 8;
+}
+message UpdatePartnerNightlyLearningResponse { GetPartnerNightlyLearningResponse state = 1; }
+
 service PartnerRoutineService {
   rpc ListPartnerRoutines(ListPartnerRoutinesRequest) returns (ListPartnerRoutinesResponse);
   rpc SavePartnerRoutine(SavePartnerRoutineRequest) returns (SavePartnerRoutineResponse);
@@ -144,4 +215,6 @@ service PartnerRoutineService {
   rpc ListPartnerRoutineRuns(ListPartnerRoutineRunsRequest) returns (ListPartnerRoutineRunsResponse);
   rpc GetPartnerRoutineCreation(GetPartnerRoutineCreationRequest) returns (GetPartnerRoutineCreationResponse);
   rpc RetirePartnerRoutineCreation(RetirePartnerRoutineCreationRequest) returns (RetirePartnerRoutineCreationResponse);
+  rpc GetPartnerNightlyLearning(GetPartnerNightlyLearningRequest) returns (GetPartnerNightlyLearningResponse);
+  rpc UpdatePartnerNightlyLearning(UpdatePartnerNightlyLearningRequest) returns (UpdatePartnerNightlyLearningResponse);
 }

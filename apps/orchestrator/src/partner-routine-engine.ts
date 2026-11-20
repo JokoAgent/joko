@@ -202,6 +202,12 @@ export class RoutineEngine {
     return this.writeRoutine(partnerId, raw, { id, builtin, builtinVersion, assertCurrent });
   }
 
+  async configureNightlyLearning(partnerId: string, definition: RoutineInput, id: string, expectedRevision: number,
+    assertCurrent: () => void): Promise<Routine> {
+    return this.writeRoutine(partnerId, definition, { id, expectedRevision, builtin: "nightly-learning", builtinVersion: 1,
+      updateBuiltinSchedule: true, assertCurrent });
+  }
+
   isRetired(id: string): boolean { return this.state.retiredRoutineIds.includes(id); }
 
   async retireCreation(partnerId: string, id: string): Promise<Routine | undefined> {
@@ -216,7 +222,7 @@ export class RoutineEngine {
     });
   }
 
-  private async writeRoutine(partnerId: string, raw: RoutineInput, options: { id?: string; expectedRevision?: number; creationId?: string; authority?: object; assertCurrent?: () => void; builtin?: Routine["builtin"]; builtinVersion?: number }): Promise<Routine> {
+  private async writeRoutine(partnerId: string, raw: RoutineInput, options: { id?: string; expectedRevision?: number; creationId?: string; authority?: object; assertCurrent?: () => void; builtin?: Routine["builtin"]; builtinVersion?: number; updateBuiltinSchedule?: true }): Promise<Routine> {
     const { expectedRevision, creationId } = options;
     const id = options.id ?? creationId;
     const parsed = parseRoutineInput(raw);
@@ -231,7 +237,8 @@ export class RoutineEngine {
             (routine) => routine.id === id && routine.partnerId === partnerId,
           )
         : undefined;
-      const input = options.builtin && existing ? { ...parsed, enabled: existing.enabled,
+      if (options.updateBuiltinSchedule && existing?.builtin !== options.builtin) throw new Error("The built-in routine changed");
+      const input = options.builtin && existing && !options.updateBuiltinSchedule ? { ...parsed, enabled: existing.enabled,
         ...(options.builtin === "follow-up" ? { sessionMode: existing.sessionMode, modelOverride: existing.modelOverride } : {}) } : parsed;
       if (id && !existing && !creationId && !options.builtin) throw new Error("Routine not found");
       if ((creationId || options.builtin) && state.routines.some(row => row.id === id && row.partnerId !== partnerId)) throw new Error("Routine creation ID already used");
@@ -442,7 +449,8 @@ export class RoutineEngine {
     }
   }
 
-  async runNow(partnerId: string, id: string, expectedRevision?: number, requestId?: string, assertCurrent?: () => void): Promise<void> {
+  async runNow(partnerId: string, id: string, expectedRevision?: number, requestId?: string, assertCurrent?: () => void,
+    hostBuiltin?: "nightly-learning"): Promise<void> {
     assertCurrent?.();
     await this.deps.beforeActivate?.(partnerId, id);
     await this.change((state) => {
@@ -452,7 +460,7 @@ export class RoutineEngine {
         (row) => row.id === id && row.partnerId === partnerId,
       );
       if (!routine) throw new Error("Routine not found");
-      if (routine.builtin) throw new Error("Built-in observation runs only on current host events.");
+      if (routine.builtin !== hostBuiltin) throw new Error("Built-in observation runs only on current host events.");
       if (requestId !== undefined) {
         const previous = state.runs.find(run => run.id === requestId);
         if (previous) {
