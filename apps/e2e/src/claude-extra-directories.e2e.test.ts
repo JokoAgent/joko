@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import { create, fromBinary } from "@bufbuild/protobuf";
 import { ClaudeCodeAdapter } from "@joko/adapter-claude-code";
-import { capabilityNames, EntityKind, ExtraDirectoryAccess, InputMentionRangeSchema, InputPartSchema, ListWorkspaceEntriesRequestSchema, ListWorkspaceEntriesResponseSchema, OperationMutationSchema, OperationPreconditionSchema, OperationState, PerTurnOverridesSchema, QueueItemState, StateImpact, WorkspaceEntryKind } from "@joko/contracts";
+import { capabilityNames, EntityKind, ExtraDirectoryAccess, FileKind, InputMentionRangeSchema, InputPartSchema, ListWorkspaceEntriesRequestSchema, ListWorkspaceEntriesResponseSchema, OperationMutationSchema, OperationPreconditionSchema, OperationState, PerTurnOverridesSchema, QueueItemState, StateImpact } from "@joko/contracts";
 import { chromium } from "playwright-core";
 import { afterEach, expect, it, vi } from "vitest";
 
@@ -292,7 +292,7 @@ mountedIt("replaces the selected directory of an existing queued Claude input fr
     const listing = await listed;
     expect(listing.ok()).toBe(true);
     expect(fromBinary(ListWorkspaceEntriesResponseSchema, await listing.body()).entries).toContainEqual(expect.objectContaining({
-      relativePath: "notes", kind: WorkspaceEntryKind.DIRECTORY
+      relativePath: "notes", kind: FileKind.DIRECTORY
     }));
     const updatedText = "Review @notes/ for decisions.";
     await waitFor(() => editor.inputValue(), value => value === updatedText, "the selected replacement directory in the original editor");
