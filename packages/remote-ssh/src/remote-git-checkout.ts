@@ -84,7 +84,7 @@ export interface RemoteGitCheckoutServiceOptions {
    * Recovery operations recapture a fresh generation and compare stable identity. */
   readonly assertCurrent: (
     authority: RemoteGitCheckoutAuthority,
-    operation: "probe" | "derive" | "inspect" | "assert" | "cleanup" | "release"
+    operation: "probe" | "derive" | "inspect" | "assert" | "assertReleased" | "cleanup" | "release"
   ) => Promise<void> | void;
   /** Fixed remote Node executable supplied by the ready runtime setup. */
   readonly nodeExecutable: string;
@@ -209,6 +209,12 @@ export class RemoteGitCheckoutService {
     }
   }
 
+  async assertReleased(lease: RemoteGitCheckoutLease): Promise<void> {
+    validateLease(lease, this.#paths);
+    const response = await this.#invoke("assertReleased", lease, false);
+    if (response.status !== "released") throw new RemoteGitCheckoutError("LEASE_CONFLICT");
+  }
+
   /** Retire only an unadopted preparing manifest. Dirty or ambiguous state is retained. */
   async cleanupPending(plan: RemoteGitCheckoutPlan, signal?: AbortSignal): Promise<"absent" | "released" | "preserved"> {
     this.#validatePlan(plan);
@@ -268,7 +274,7 @@ export class RemoteGitCheckoutService {
   }
 
   async #invoke(
-    operation: "probe" | "derive" | "inspect" | "assert" | "cleanup" | "release",
+    operation: "probe" | "derive" | "inspect" | "assert" | "assertReleased" | "cleanup" | "release",
     data: RemoteGitCheckoutPlan | RemoteGitCheckoutLease | {
       readonly authority: RemoteGitCheckoutAuthority;
       readonly sourceCwd: string;
@@ -832,10 +838,16 @@ try {
     }
     else if(m.phase==='released') respond({status:'released'});
     else respond({status:'pending'});
-  } else if(request.operation==='assert') {
+  } else if(request.operation==='assert'||request.operation==='assertReleased') {
     ordinary(root); const lease=request.data; const m=readManifest(root,lease.id);
-    if(!m||m.phase!=='active'||!m.lease||!sameLease(m.lease,lease)) fail('LEASE_CONFLICT');
-    respond({status:'active',lease:verifyActive(root,m)});
+    if(!m||!m.lease||!sameLease(m.lease,lease)) fail('LEASE_CONFLICT');
+    if(request.operation==='assertReleased') {
+      if(m.phase!=='released') fail('LEASE_CONFLICT');
+      respond({status:'released'});
+    } else {
+      if(m.phase!=='active') fail('LEASE_CONFLICT');
+      respond({status:'active',lease:verifyActive(root,m)});
+    }
   } else if(request.operation==='cleanup') {
     if(!fs.existsSync(root)) {
       if(orphaned(request.data)) fail('LEASE_CONFLICT');

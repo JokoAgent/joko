@@ -18,15 +18,24 @@ import type { OperationalStore, StoredTarget } from "@joko/store";
 
 import { devicePeerClaudeInstallation, probeRemoteClaudeInstallation } from "./remote-claude-installation.js";
 import type { RemoteExecutionRouter } from "./remote-execution-router.js";
+import { matchesRemoteWorktreeTargetRevision } from "./ssh-worktree-rename-authority.js";
+
+type WorktreeOwnerStore = Pick<OperationalStore, "getTarget" | "findSession" | "findSetting">;
+
+interface OriginalCheckoutAuthority {
+  readonly kind: "reclamation" | "display_rename";
+  readonly authority: RemoteGitCheckoutAuthority;
+  readonly assertCurrent: () => void;
+}
 
 /** Adapter-side remote checkout owner. The Target retains its source remote
  * binding; a Session worktree carries the effective POSIX cwd separately. */
 export class RemoteClaudeWorktreeOwner {
-  readonly #store: Pick<OperationalStore, "getTarget">;
+  readonly #store: WorktreeOwnerStore;
   readonly #remoteExecution: Pick<RemoteExecutionRouter, "processes">;
 
   constructor(options: {
-    readonly store: Pick<OperationalStore, "getTarget">;
+    readonly store: WorktreeOwnerStore;
     readonly remoteExecution: Pick<RemoteExecutionRouter, "processes">;
   }) {
     this.#store = options.store;
@@ -61,44 +70,58 @@ export class RemoteClaudeWorktreeOwner {
   }
 
   async derive(plan: RemoteGitCheckoutPlan, signal?: AbortSignal, assertEffectCurrent?: () => void): Promise<RemoteGitCheckoutLease> {
-    const captured = await this.#captureFor(plan.remote, signal, assertEffectCurrent);
+    const captured = await this.#captureFor(plan.remote, { signal, assertEffectCurrent });
     return captured.service.derive(plan, signal);
   }
 
   async inspectExact(plan: RemoteGitCheckoutPlan, signal?: AbortSignal, assertReclamationCurrent?: () => void): Promise<RemoteGitCheckoutInspection> {
-    return (await this.#captureFor(plan.remote, signal, undefined, assertReclamationCurrent)).service.inspectExact(plan, signal);
+    return (await this.#captureFor(plan.remote, { signal, assertReclamationCurrent })).service.inspectExact(plan, signal);
   }
 
   async cleanupPending(plan: RemoteGitCheckoutPlan, signal?: AbortSignal, assertReclamationCurrent?: () => void): Promise<"absent" | "released" | "preserved"> {
-    return (await this.#captureFor(plan.remote, signal, undefined, assertReclamationCurrent)).service.cleanupPending(plan, signal);
+    return (await this.#captureFor(plan.remote, { signal, assertReclamationCurrent })).service.cleanupPending(plan, signal);
   }
 
   async assertExact(sessionId: string, binding: SessionWorktreeBinding, signal?: AbortSignal): Promise<void> {
     const lease = remoteLeaseFromBinding(sessionId, binding);
-    await (await this.#captureFor(lease.remote, signal)).service.assertExact(lease, signal);
+    await (await this.#captureFor(lease.remote, { signal, adopted: { sessionId, binding } })).service.assertExact(lease, signal);
+  }
+
+  async assertReleased(sessionId: string, binding: SessionWorktreeBinding): Promise<void> {
+    const lease = remoteLeaseFromBinding(sessionId, binding);
+    await (await this.#captureFor(lease.remote, { adopted: { sessionId, binding } })).service.assertReleased(lease);
   }
 
   async releaseExact(sessionId: string, binding: SessionWorktreeBinding, signal?: AbortSignal, assertReclamationCurrent?: () => void): Promise<"released" | "preserved"> {
     const lease = remoteLeaseFromBinding(sessionId, binding);
-    return (await this.#captureFor(lease.remote, signal, undefined, assertReclamationCurrent)).service.releaseExact(lease, signal);
+    return (await this.#captureFor(lease.remote, { signal, assertReclamationCurrent, adopted: { sessionId, binding } })).service.releaseExact(lease, signal);
   }
 
   async #captureFor(
     expected: RemoteGitCheckoutAuthority & { readonly manifestId: string },
-    signal?: AbortSignal,
-    assertEffectCurrent?: () => void,
-    assertReclamationCurrent?: () => void
+    { signal, assertEffectCurrent, assertReclamationCurrent, adopted }: {
+      readonly signal?: AbortSignal | undefined;
+      readonly assertEffectCurrent?: (() => void) | undefined;
+      readonly assertReclamationCurrent?: (() => void) | undefined;
+      readonly adopted?: { readonly sessionId: string; readonly binding: SessionWorktreeBinding };
+    }
   ): Promise<{ readonly authority: RemoteGitCheckoutAuthority; readonly service: RemoteGitCheckoutService }> {
     const target = this.#store.getTarget(expected.targetId);
-    // Only the original unadopted cleanup claim may recapture a newer revision.
-    // Admission and adopted runtime use continue to require the acquisition revision.
-    const reclamation = expected.binding.kind === "ssh" && assertReclamationCurrent !== undefined
-      ? { authority: expected, assertCurrent: assertReclamationCurrent } : undefined;
-    if (reclamation !== undefined && (target.descriptor.remoteWorkspace === undefined
+    let original: OriginalCheckoutAuthority | undefined;
+    if (expected.binding.kind === "ssh" && assertReclamationCurrent !== undefined) {
+      original = { kind: "reclamation", authority: expected, assertCurrent: assertReclamationCurrent };
+    } else if (expected.binding.kind === "ssh" && adopted !== undefined && target.revision.toString() !== expected.targetRevision) {
+      original = { kind: "display_rename", authority: expected, assertCurrent: () => {
+        if (!matchesRemoteWorktreeTargetRevision(this.#store, target, adopted.sessionId, adopted.binding)) {
+          throw new RemoteGitCheckoutError("AUTHORITY_CHANGED");
+        }
+      } };
+    }
+    if (original !== undefined && (target.descriptor.remoteWorkspace === undefined
       || !sameBinding(target.descriptor.remoteWorkspace, expected.binding))) throw new RemoteGitCheckoutError("AUTHORITY_CHANGED");
-    const captured = await this.#capture(target, signal, assertEffectCurrent, reclamation);
+    const captured = await this.#capture(target, signal, assertEffectCurrent, original);
     if (!sameStableAuthority(captured.authority, expected)
-      || (reclamation === undefined && captured.authority.targetRevision !== expected.targetRevision)) {
+      || (original === undefined && captured.authority.targetRevision !== expected.targetRevision)) {
       throw new RemoteGitCheckoutError("AUTHORITY_CHANGED");
     }
     return captured;
@@ -108,13 +131,13 @@ export class RemoteClaudeWorktreeOwner {
     target: StoredTarget,
     signal?: AbortSignal,
     assertEffectCurrent?: () => void,
-    reclamation?: { readonly authority: RemoteGitCheckoutAuthority; readonly assertCurrent: () => void }
+    original?: OriginalCheckoutAuthority
   ): Promise<{ readonly authority: RemoteGitCheckoutAuthority; readonly service: RemoteGitCheckoutService }> {
     const remote = target.descriptor.remoteWorkspace;
     if (remote === undefined || !target.descriptor.trusted || !target.descriptor.managed) {
       throw new RemoteGitCheckoutError("AUTHORITY_CHANGED");
     }
-    reclamation?.assertCurrent();
+    original?.assertCurrent();
     const captured = await this.#remoteExecution.processes(remote, signal);
     captured.assertCurrent();
     const remotePath = captured.pathStyle === "win32" ? win32 : posix;
@@ -127,7 +150,7 @@ export class RemoteClaudeWorktreeOwner {
     });
     const assertCurrent = (): void => {
       captured.assertCurrent();
-      reclamation?.assertCurrent();
+      original?.assertCurrent();
       const current = this.#store.getTarget(target.descriptor.id);
       const currentRemote = current.descriptor.remoteWorkspace;
       if (current.revision !== target.revision
@@ -137,12 +160,12 @@ export class RemoteClaudeWorktreeOwner {
       }
     };
     assertCurrent();
-    if (reclamation !== undefined && !sameStableAuthority(authority, reclamation.authority)) {
+    if (original !== undefined && !sameStableAuthority(authority, original.authority)) {
       throw new RemoteGitCheckoutError("AUTHORITY_CHANGED");
     }
     const installation = captured.kind === "device_peer"
       ? await devicePeerClaudeInstallation(remote.workspaceRoot, captured.pathStyle)
-      : await probeRemoteClaudeInstallation(processes, remote.workspaceRoot, reclamation === undefined ? captured.assertCurrent : assertCurrent, signal);
+      : await probeRemoteClaudeInstallation(processes, remote.workspaceRoot, original === undefined ? captured.assertCurrent : assertCurrent, signal);
     assertCurrent();
     if (installation.state !== "ready" || installation.workspaceRoot !== remote.workspaceRoot) {
       throw new RemoteGitCheckoutError("UNAVAILABLE");
@@ -155,16 +178,19 @@ export class RemoteClaudeWorktreeOwner {
       pathStyle: captured.pathStyle,
       assertCurrent: (expected, operation) => {
         assertCurrent();
-        const reclaiming = reclamation !== undefined && (operation === "inspect" || operation === "cleanup" || operation === "release")
-          && sameStableAuthority(reclamation.authority, expected) && reclamation.authority.targetRevision === expected.targetRevision;
+        const matchesOriginal = original !== undefined
+          && sameStableAuthority(original.authority, expected) && original.authority.targetRevision === expected.targetRevision
+          && (original.kind === "reclamation"
+            ? operation === "inspect" || operation === "cleanup" || operation === "release"
+            : operation === "assert" || operation === "assertReleased" || operation === "release");
         if (!sameStableAuthority(authority, expected)
-          || (!reclaiming && authority.targetRevision !== expected.targetRevision)) {
+          || (!matchesOriginal && authority.targetRevision !== expected.targetRevision)) {
           throw new RemoteGitCheckoutError("AUTHORITY_CHANGED");
         }
       },
       execute: async (options) => {
         assertCurrent();
-        const assertDispatch = assertEffectCurrent === undefined && reclamation === undefined ? undefined : () => {
+        const assertDispatch = assertEffectCurrent === undefined && original === undefined ? undefined : () => {
           try { assertCurrent(); assertEffectCurrent?.(); }
           catch { throw new RemoteGitCheckoutDispatchDeniedError(); }
         };

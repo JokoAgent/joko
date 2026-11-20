@@ -58,6 +58,7 @@ function fixture() {
   const storedTarget = { descriptor: sourceTarget, revision: targetRevision } as StoredTarget;
   const store = {
     getTarget: () => ({ descriptor: sourceTarget, revision: targetRevision }),
+    findSetting: () => undefined,
     getOperation: () => ({ status: operationStatus, kind: "clone_session", bodyHash: "original-body" }),
     getBackend: () => ({ descriptor: { instanceGeneration: 4 } }),
     findNativeSessionDerivation: (id: string) => receipts.find(receipt => receipt.operationId === id),

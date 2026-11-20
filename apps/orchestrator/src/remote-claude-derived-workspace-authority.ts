@@ -4,9 +4,11 @@ import { operationBodyHash, type OperationalStore, type StoredTarget } from "@jo
 
 import type { RemoteClaudeDerivedWorkspaceAuthority } from "./remote-claude-runtime.js";
 import type { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
+import { matchesRemoteWorktreeTargetRevision } from "./ssh-worktree-rename-authority.js";
 
 type RemoteWorktreeAuthorityStore = Pick<OperationalStore,
-  "getTarget" | "getOperation" | "getBackend" | "findNativeSessionDerivation" | "listSessions" | "listUnadoptedNativeSessionDerivations">;
+  "getTarget" | "getOperation" | "getBackend" | "findNativeSessionDerivation" | "listSessions" | "listUnadoptedNativeSessionDerivations"
+  | "findSession" | "findSetting">;
 
 /** Admit only a durable, exact remote checkout. The same lease survives the
  * receipt-to-Session transition without granting authority to another path. */
@@ -36,7 +38,7 @@ export function createRemoteClaudeDerivedWorkspaceAuthorizer(options: {
     const targetRevision = storedTarget.revision;
     const targetDigest = operationBodyHash(storedTarget.descriptor);
     const findBinding = cleanup === undefined
-      ? () => findExactBinding(store, target.id, targetRevision, target.workspaceRoot)
+      ? () => findExactBinding(store, storedTarget, target.workspaceRoot)
       : () => findExactCleanupBinding(store, target, targetRevision, cleanup);
     const initial = findBinding();
     const sessionId = initial.sessionId;
@@ -123,25 +125,26 @@ function sameRemoteExecutionBinding(
 
 function findExactBinding(
   store: RemoteWorktreeAuthorityStore,
-  targetId: string,
-  targetRevision: bigint,
+  target: StoredTarget,
   workspaceRoot: string
 ): { readonly sessionId: string; readonly binding: SessionWorktreeBinding } {
+  const targetId = target.descriptor.id;
   const candidates = new Map<string, SessionWorktreeBinding>();
   for (const session of store.listSessions({ includeArchived: true, includeDeleted: true })) {
     const binding = session.descriptor.worktree;
     if (session.descriptor.targetId === targetId && !session.descriptor.archived
       && session.descriptor.deletedAt === undefined
-      && matches(binding, targetId, targetRevision, workspaceRoot)) {
-      candidates.set(session.descriptor.id, binding!);
+      && matchesWorkspace(binding, targetId, workspaceRoot)
+      && matchesRemoteWorktreeTargetRevision(store, target, session.descriptor.id, binding)) {
+      candidates.set(session.descriptor.id, binding);
     }
   }
   for (const receipt of store.listUnadoptedNativeSessionDerivations()) {
     const binding = receipt.worktree;
-    if (receipt.targetId !== targetId || receipt.targetRevision !== targetRevision
+    if (receipt.targetId !== targetId || receipt.targetRevision !== target.revision
       || (receipt.state !== "prepared" && receipt.state !== "recorded")
       || store.getOperation(receipt.operationId).status !== "started"
-      || !matches(binding, targetId, targetRevision, workspaceRoot)) continue;
+      || !matches(binding, targetId, target.revision, workspaceRoot)) continue;
     const existing = candidates.get(receipt.sessionId);
     if (existing !== undefined && operationBodyHash(existing) !== operationBodyHash(binding)) {
       throw new Error("The derived remote workspace lease is ambiguous.");
@@ -159,9 +162,13 @@ function matches(
   targetRevision: bigint,
   workspaceRoot: string
 ): boolean {
+  return matchesWorkspace(binding, targetId, workspaceRoot) && binding.remote.targetRevision === targetRevision.toString();
+}
+
+function matchesWorkspace(binding: SessionWorktreeBinding | undefined, targetId: string, workspaceRoot: string
+): binding is SessionWorktreeBinding & { readonly remote: NonNullable<SessionWorktreeBinding["remote"]> } {
   return binding !== undefined && binding.state === "active" && binding.remote !== undefined
     && binding.workspaceId.length > 0
     && binding.path === workspaceRoot
-    && binding.remote.targetId === targetId
-    && binding.remote.targetRevision === targetRevision.toString();
+    && binding.remote.targetId === targetId;
 }

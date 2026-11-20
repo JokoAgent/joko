@@ -169,6 +169,7 @@ import {
   SCHEDULED_WORKTREE_OWNER_SETTING_KEY,
   type SessionWorktreeCoordinator
 } from "./session-worktree-coordinator.js";
+import { matchesRemoteWorktreeTargetRevision } from "./ssh-worktree-rename-authority.js";
 import {
   buildPortableSessionExport,
   adoptPortableSessionArtifacts,
@@ -6151,7 +6152,7 @@ export class SessionHost {
         : expectedRemote !== undefined && contextRemote !== undefined
           && contextRemote.workspaceRoot === worktree.path
           && worktree.remote.targetId === expected.descriptor.id
-          && worktree.remote.targetRevision === expected.revision.toString()
+          && matchesRemoteWorktreeTargetRevision(this.#store, expected, source.descriptor.id, worktree)
           && sameRemoteWorkspaceBinding(worktree.remote.binding, expectedRemote)
           && sameRemoteExecutionBinding(contextRemote, expectedRemote));
     if (
