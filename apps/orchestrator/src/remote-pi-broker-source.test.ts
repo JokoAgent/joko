@@ -3,6 +3,7 @@ import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStream
 import { chmod, copyFile, link, lstat, mkdir, open, readdir, readFile, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { createServer, type Server } from "node:http";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { once } from "node:events";
@@ -135,6 +136,7 @@ interface BrokerFixture {
   readonly recoveryIdentity: string;
   readonly compatibilityHash: string;
   readonly nodeExecutable?: string;
+  readonly electronExecutable?: string;
 }
 
 async function brokerFixture(source = REMOTE_PI_BROKER_SOURCE): Promise<BrokerFixture> {
@@ -424,7 +426,7 @@ function bootstrap(
       : {})
   };
   const shape = {
-    command: fixture.nodeExecutable ?? process.execPath,
+    command: fixture.electronExecutable === undefined ? fixture.nodeExecutable ?? process.execPath : "node",
     args: [fixture.childPath],
     cwd: fixture.root,
     env
@@ -534,7 +536,7 @@ async function startBridge(
   readonly state: AuthorityState;
 }> {
   const startedAt = performance.now();
-  const child = spawn(fixture.nodeExecutable ?? process.execPath, [
+  const child = spawn(fixture.electronExecutable ?? fixture.nodeExecutable ?? process.execPath, [
     fixture.sourcePath,
     "bridge",
     fixture.managedRoot,
@@ -542,7 +544,11 @@ async function startBridge(
     value.launchHash,
     randomUUID()
   ], {
-    env: { ...process.env, JOKO_REMOTE_BROKER_SOURCE_HASH: fixture.sourceHash ?? REMOTE_PI_BROKER_SOURCE_SHA256 },
+    env: {
+      ...process.env,
+      ...(fixture.electronExecutable === undefined ? {} : { ELECTRON_RUN_AS_NODE: "1" }),
+      JOKO_REMOTE_BROKER_SOURCE_HASH: fixture.sourceHash ?? REMOTE_PI_BROKER_SOURCE_SHA256
+    },
     stdio: ["pipe", "pipe", "pipe"]
   });
   let diagnostics = "";
@@ -1065,8 +1071,12 @@ async function processHasArgument(argument: string): Promise<boolean> {
 }
 
 async function authorityKill(fixture: BrokerFixture, authority: AuthorityEnvelope): Promise<void> {
-  const child = spawn(process.execPath, [fixture.sourcePath, "kill", fixture.managedRoot], {
-    env: { ...process.env, JOKO_REMOTE_BROKER_SOURCE_HASH: fixture.sourceHash ?? REMOTE_PI_BROKER_SOURCE_SHA256 },
+  const child = spawn(fixture.electronExecutable ?? process.execPath, [fixture.sourcePath, "kill", fixture.managedRoot], {
+    env: {
+      ...process.env,
+      ...(fixture.electronExecutable === undefined ? {} : { ELECTRON_RUN_AS_NODE: "1" }),
+      JOKO_REMOTE_BROKER_SOURCE_HASH: fixture.sourceHash ?? REMOTE_PI_BROKER_SOURCE_SHA256
+    },
     stdio: ["pipe", "pipe", "pipe"]
   });
   child.stdin.end(`${JSON.stringify({
@@ -1398,10 +1408,15 @@ try {
     }
   }, 30_000);
 
-  it.runIf(["linux", "win32", "darwin"].includes(process.platform))(
-    "keeps the exact child and replay alive across manager crash, then rotates relay authority",
-    async () => {
-      const fixture = await brokerFixture();
+  it.runIf(["linux", "win32", "darwin"].includes(process.platform)).each(
+    process.platform === "win32" ? ["Node", "Electron"] : ["Node"]
+  )(
+    "keeps the exact child and replay alive across manager crash, then rotates relay authority (%s)",
+    async (runtime) => {
+      const electronExecutable = runtime === "Electron"
+        ? await realpath(createRequire(new URL("../../desktop/package.json", import.meta.url))("electron") as string)
+        : undefined;
+      const fixture: BrokerFixture = { ...await brokerFixture(), ...(electronExecutable === undefined ? {} : { electronExecutable }) };
       const firstUpstream = await upstream();
       const currentBearerOne = "orchestrator-current-bearer-one-000000000000";
       const currentBearerTwo = "orchestrator-current-bearer-two-000000000000";
@@ -1412,6 +1427,7 @@ try {
       try {
         const firstBootstrap = bootstrap(fixture, 1, currentBearerOne, firstUpstream.port);
         firstBridge = await startBridge(fixture, firstBootstrap, true, true);
+        finalAuthority = firstBridge.authority;
         firstBridge.process.stdin.write(sequencedFrame(FRAME_STDIN, 1, Buffer.from("call\n")));
         const firstOutput = sequenced(await nextFrameOfType(firstBridge.reader, FRAME_STDOUT));
         expect(firstOutput.content.toString("utf8")).toContain("response:");
@@ -1423,7 +1439,7 @@ try {
         firstBridge.process.stdin.write(sequencedFrame(FRAME_OUTPUT_ACK, firstOutput.sequence));
         firstBridge.process.stdin.write(sequencedFrame(FRAME_STDIN, 2, Buffer.from("node\n")));
         const nodeOutput = sequenced(await nextFrameOfType(firstBridge.reader, FRAME_STDOUT));
-        expect(nodeOutput.content.toString("utf8")).toBe(`node:${await realpath(process.execPath)}\n`);
+        expect(nodeOutput.content.toString("utf8")).toBe(`node:${electronExecutable ?? await realpath(process.execPath)}\n`);
         firstBridge.process.stdin.write(sequencedFrame(FRAME_OUTPUT_ACK, nodeOutput.sequence));
         firstBridge.process.stdin.write(sequencedFrame(FRAME_STDIN, 3, Buffer.from("leak\n")));
         const redactedOutput = sequenced(await nextFrameOfType(firstBridge.reader, FRAME_STDOUT));

@@ -18,6 +18,9 @@ const execFileAsync = promisify(execFile);
 
 const VERSION = ${REMOTE_PI_BROKER_PROTOCOL_VERSION};
 const SOURCE_HASH = process.env.JOKO_REMOTE_BROKER_SOURCE_HASH || "";
+const NODE_MODE_ENVIRONMENT = typeof process.versions.electron === "string"
+  ? { ELECTRON_RUN_AS_NODE: "1" }
+  : {};
 const MAX_CONTROL_BYTES = 1024 * 1024;
 const MAX_FRAME_BYTES = 64 * 1024 * 1024;
 const MAX_REPLAY_BYTES = 4 * 1024 * 1024;
@@ -1619,7 +1622,7 @@ function janitorArguments(root, record, sourcePath = process.argv[1]) {
   ];
 }
 function safeDaemonEnvironment() {
-  const environment = { JOKO_REMOTE_BROKER_SOURCE_HASH: SOURCE_HASH };
+  const environment = { JOKO_REMOTE_BROKER_SOURCE_HASH: SOURCE_HASH, ...NODE_MODE_ENVIRONMENT };
   for (const name of ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR", "TMP", "TEMP", "SystemRoot", "WINDIR"]) {
     if (typeof process.env[name] === "string") environment[name] = process.env[name];
   }
@@ -3585,6 +3588,7 @@ async function runSessionOwner(root, request, ownerIdentity) {
     const recoveryKey = randomBytes(32);
     const childEnvironment = {
       ...request.env,
+      ...(sameNativePath(childExecutable, nodeExecutable) ? NODE_MODE_ENVIRONMENT : {}),
       JOKO_PI_MCP_TOKEN: stableBearer,
       ...(stableNativeAuthReservationToken === undefined
         ? {}
@@ -3876,6 +3880,7 @@ async function runSessionOwner(root, request, ownerIdentity) {
       replacementSentinelFingerprint = await spawnBootstrapSentinel(root, replacementMarker);
       const replacementEnvironment = {
         ...replacement.env,
+        ...(sameNativePath(replacementExecutable, session.nodeExecutable) ? NODE_MODE_ENVIRONMENT : {}),
         JOKO_PI_MCP_TOKEN: session.stableBearer,
         ...(session.stableNativeAuthReservationToken === undefined
           ? {}
