@@ -20653,7 +20653,7 @@ function nativeHistoryAncestorCtes(): string {
       SELECT json_extract(link.value, '$[0]') AS entry_id, json_extract(link.value, '$[1]') AS parent_entry_id
       FROM native_history_position AS position
       JOIN events AS marker ON marker.global_cursor = position.marker_cursor AND marker.session_id = position.session_id
-        AND marker.namespace = 'pi.native_history'
+        AND marker.namespace IN ('pi.native_history', 'codex.native_history')
         AND json_extract(marker.payload_json, '$.payload.type') = 'native_session_changed'
         AND json_extract(marker.payload_json, '$.payload.opaqueRef') = position.native_opaque_ref
         AND json_extract(marker.payload_json, '$.payload.leafId') = position.leaf_id

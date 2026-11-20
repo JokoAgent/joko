@@ -18804,10 +18804,12 @@ export class SessionHost {
       [NATIVE_HISTORY_USER_IMAGES_FIELD]: observedImages,
       ...activeFields
     } = activeEntryMetadata?.fields ?? {};
-    const legacyAnchors = activeEntryMetadata?.namespace === "codex.native_history" && typeof observedLegacyAnchors === "string"
-      && this.isOrdinaryLocalCodexSession(store.getSession(session.id)) ? observedLegacyAnchors : undefined;
+    const ordinaryCodex = activeEntryMetadata?.namespace === "codex.native_history"
+      && this.isOrdinaryLocalCodexSession(store.getSession(session.id));
+    const legacyAnchors = ordinaryCodex && typeof observedLegacyAnchors === "string" ? observedLegacyAnchors : undefined;
     let unprojectedParents: string | undefined;
-    if (activeEntryMetadata?.namespace === "pi.native_history" && validNativeLineage(history)) {
+    // A private Codex retry input still connects the answer to the original visible prompt.
+    if ((activeEntryMetadata?.namespace === "pi.native_history" || ordinaryCodex) && validNativeLineage(history)) {
       const projectedEntries = new Set(history.events.map(event => event.nativeEntryId));
       unprojectedParents = JSON.stringify(history.activeLineage!.flatMap(({ entryId, parentEntryId }) =>
         parentEntryId !== undefined && !projectedEntries.has(entryId) ? [[entryId, parentEntryId]] : []));
@@ -18819,8 +18821,7 @@ export class SessionHost {
     const previousUnprojectedParents = previous?.metadata?.fields[NATIVE_HISTORY_UNPROJECTED_PARENTS_FIELD] ?? "[]";
     const previousLegacyAnchors = previous?.metadata?.fields[NATIVE_HISTORY_LEGACY_REWIND_ANCHORS_FIELD];
     const previousImages = sameBinding ? previous?.metadata?.fields[NATIVE_HISTORY_USER_IMAGES_FIELD] : undefined;
-    const images = activeEntryMetadata?.namespace === "codex.native_history" && typeof observedImages === "string"
-      && this.isOrdinaryLocalCodexSession(store.getSession(session.id)) ? observedImages : previousImages;
+    const images = ordinaryCodex && typeof observedImages === "string" ? observedImages : previousImages;
     if (sameLeaf && (unprojectedParents === undefined || unprojectedParents === previousUnprojectedParents)
       && legacyAnchors === previousLegacyAnchors && images === previousImages) return;
     const leafToken = history.activeEntryId ?? "<none>";

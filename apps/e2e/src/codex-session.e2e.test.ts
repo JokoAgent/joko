@@ -93,14 +93,17 @@ it.each([
         await waitFor(read, value => value.run?.state === RunState.SUCCEEDED, "the original Run's completed response");
         const events = await timeline();
         expect(events.some(event => event.payload?.kind.case === "terminalError")).toBe(false);
+        const originalUser = (first["items"] as JsonObject[])[0];
         expect(events.filter(event => event.payload?.kind.case === "messageStarted"
           && event.payload.kind.value.role === MessageRole.USER)).toMatchObject([{ payload: { kind: { value: {
-            userInput: { parts: [{ content: { case: "text", value: text } }] }
+            nativeIdentity: { entryId: originalUser?.["id"] }, userInput: { parts: [{ content: { case: "text", value: text } }] }
           } } } }]);
         expect(events.filter(event => event.payload?.kind.case === "messageCompleted"
           && event.payload.kind.value.role === MessageRole.ASSISTANT)).toMatchObject([{ payload: { kind: { value: {
             blocks: [{ content: { case: "text", value: "The original request succeeded." } }]
           } } } }]);
+        expect(store.listEvents({ sessionId, activeNativeTimeline: true }).some(event =>
+          event.payload.type === "status" && event.payload.key === "native_turn_failed")).toBe(false);
       }
     }
     expect(store.getSession(sessionId).descriptor.binding).toEqual(binding);
