@@ -742,7 +742,7 @@ jobs:
         run: |
           pnpm --filter @joko/connection-transport test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/connection-transports.log"
           pnpm --filter @joko/orchestrator exec vitest run linkspan src/config.test.ts src/connection-manager.test.ts device-peer src/remote-desktop-coordinator.test.ts src/hosted-agent-desktop-service.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/connection-media-lifecycles.log"
-          pnpm --filter @joko/desktop exec vitest run linkspan src/connection-transport.test.ts test/remote-desktop-media.test.ts test/remote-desktop-native.test.ts test/secure-files.test.ts test/native-workspace-directory-download.test.ts test/mcp-app-host.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-sdk-connections.log"
+          pnpm --filter @joko/desktop exec vitest run linkspan src/connection-transport.test.ts test/remote-desktop-media.test.ts test/remote-desktop-native.test.ts test/secure-files.test.ts test/native-workspace-directory-download.test.ts test/distribution.test.ts test/mcp-app-host.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-sdk-connections.log"
           pnpm --filter @joko/web exec vitest run linkspan src/gateway.auth-context.test.ts src/local-state-credentials.test.ts DevicePairingInvitation ConnectionScreen 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/web-sdk-connections.log"
           pnpm --filter @joko/mobile exec vitest run linkspan network mobile-client mobile-iroh-native mobile-http-connect-native connection-storage mobile-connection-protocol mobile-workspace-inputs MobileDevicePairingInvitation MobileSharedConnectionScreen MobileSettingsScreen mobile-file-share.secure-transfer mobile-release-artifact 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/mobile-sdk-connections.log"
 

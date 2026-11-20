@@ -1,6 +1,6 @@
 import { create } from "@bufbuild/protobuf";
 import { execFileSync } from "node:child_process";
-import { posix } from "node:path";
+import { basename, dirname, posix } from "node:path";
 import { Code, createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
 import { EntityKind, OperationMutationSchema, OperationState, RemoteHostService } from "@joko/contracts";
@@ -239,14 +239,17 @@ it.skipIf(!browserPath || !webDirectory)("downloads the original named SSH direc
         page.getByRole("menuitem", { name: "Download folder", exact: true }).click()
       ]);
       expect(download.suggestedFilename()).toBe("docs.tar.gz");
-      const path = (await download.path())!;
-      const members = execFileSync("tar", ["-tzf", path], { encoding: "utf8" }).trim().split(/\r?\n/u);
+      const archivePath = (await download.path())!;
+      // GNU tar interprets a Windows drive letter in an archive name as a remote host.
+      const archiveName = basename(archivePath);
+      const cwd = dirname(archivePath);
+      const members = execFileSync("tar", ["-tzf", archiveName], { cwd, encoding: "utf8" }).trim().split(/\r?\n/u);
       expect(members.map(name => name.replace(/^\.\//u, "")).sort()).toEqual([
         "docs/", "docs/guide.txt", "docs/nested/", "docs/nested/data.bin", "docs/nested/empty/"
       ]);
       for (const [name, bytes] of [["docs/guide.txt", guide], ["docs/nested/data.bin", binary]] as const) {
         const member = members.find(value => value.replace(/^\.\//u, "") === name)!;
-        expect(execFileSync("tar", ["-xOzf", path, member])).toEqual(bytes);
+        expect(execFileSync("tar", ["-xOzf", archiveName, member], { cwd })).toEqual(bytes);
       }
     };
     await checkDownload();

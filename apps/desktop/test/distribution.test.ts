@@ -93,6 +93,7 @@ describe("Desktop distribution", () => {
       "electron-window-state": "5.0.3",
       loudness: "0.4.2",
       sharp: "0.35.3",
+      tar: "7.5.22",
       yaml: "2.9.0"
     });
     expect(manifest.devDependencies).toMatchObject({
