@@ -10574,15 +10574,18 @@ export class OperationalStore {
       }
       ordered.splice(index, 0, current);
       const revision = asSqlInteger(this.requireActiveRevision());
+      const changed: string[] = [];
       for (const [position, item] of ordered.entries()) {
         if (item.position === position && item.id !== current.id) continue;
         this.database.prepare(`
           UPDATE queue_items SET position = ?, updated_at = ?, revision = ?
           WHERE id = ? AND state = 'accepted'
         `).run(position, at, revision, item.id);
+        changed.push(item.id);
       }
       const updated = this.getQueueItem(current.id);
-      this.appendQueueEvent(updated, this.getSession(updated.sessionId), input.traceId);
+      const session = this.getSession(updated.sessionId);
+      for (const id of changed) this.appendQueueEvent(id === updated.id ? updated : this.getQueueItem(id), session, input.traceId);
       return updated;
     });
   }

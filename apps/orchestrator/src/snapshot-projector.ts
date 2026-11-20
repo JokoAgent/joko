@@ -700,7 +700,7 @@ export class SnapshotProjector {
       });
     });
 
-    const mappedQueue = input.queueItems.map((item, index) => {
+    const mappedQueue = input.queueItems.map((item) => {
       const session = sessionById.get(item.sessionId);
       const run = runById.get(item.runId);
       if (session === undefined) throw projectionReferenceError("queue_item.session_id", item.id, item.sessionId);
@@ -713,7 +713,7 @@ export class SnapshotProjector {
         retryBeforeDispatch: this.options.canRetryFailedQueueInput?.(item) ?? false,
         ...(run.descriptor.parentRunId === undefined ? {} : { parentRunId: run.descriptor.parentRunId }),
         generation: session.descriptor.binding.generation
-      }, BigInt(index));
+      });
     });
 
     const mappedSchedules = input.schedules.map((schedule) => toProtoSchedule(

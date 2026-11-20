@@ -1272,6 +1272,55 @@ describe("session host, durable events, and reconnect semantics", () => {
     expect(viewed).toContain(cursor);
   });
 
+  mountedTimelineIt("updates the mounted queue order from another connection's reorder events", { timeout: 75_000 }, async () => {
+    fixture = await OrchestratorE2eFixture.start({
+      webDirectory: process.env.JOKO_MOUNTED_WEB_DIR!,
+      createAdapter: profile => new class extends InstrumentedFakeAdapter {
+        override async send(): Promise<void> { /* Retain the active turn until the test closes the node. */ }
+      }(profile)
+    });
+    const manager = await fixture.pair("Queue editor");
+    const operation = manager.clients.operation;
+    const sessionId = sessionIdFrom(await submit(operation, manager.connectionId,
+      createSessionMutation({ backendId: fixture.adapter().id, targetId: fixture.targetId(), displayName: "Reordered queue" })));
+    const { store } = fixture.application;
+    const generation = BigInt(store.getSession(sessionId).descriptor.binding.generation);
+    const send = async (text: string) => queueItemFrom(await submit(operation, manager.connectionId,
+      sendInputMutation(sessionId, generation, text)));
+    const active = await send("Keep the current Run active");
+    await waitFor(async () => store.getQueueItem(active.queueItemId).state, state => state === "backend_accepted", "the original Run to hold the pending queue");
+    const first = await send("First pending input"), second = await send("Second pending input"), third = await send("Third pending input");
+    const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Queue observer" })).challenge!;
+    browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
+    await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
+    await page.locator(".connection-tabs > button").nth(2).click();
+    await page.locator('details.device-authorization__manual > summary').click();
+    await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+    await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
+    await page.getByLabel("Device name").fill("Queue observer");
+    await page.locator("form.pair-form button[type=submit]").click();
+    const order = () => page.locator("[data-queue-item-id]").evaluateAll(rows => rows.map(row => row.getAttribute("data-queue-item-id")));
+    const before = [first.queueItemId, second.queueItemId, third.queueItemId];
+    await waitFor(order, value => value.join() === before.join(), "the initial mounted queue order");
+    let snapshots = 0;
+    page.on("request", request => { if (request.url().endsWith("/joko.v1.EventService/GetSnapshot")) snapshots += 1; });
+
+    const control = (await manager.clients.queue.getQueueControl({ sessionId })).queueControl!;
+    const lock = randomUUID();
+    expect((await submit(operation, manager.connectionId, setQueueInteractionLockMutation(control, lock, true))).state).toBe(OperationState.SUCCEEDED);
+    const reorder = reorderQueuedInputBeforeMutation(second, third.queueItemId, lock);
+    if (reorder.payload.case !== "reorderQueueItem") throw new Error("Expected a queue reorder.");
+    reorder.payload.value.placement!.anchor = { case: "afterQueueItemId", value: third.queueItemId };
+    expect((await submit(operation, manager.connectionId, reorder)).state).toBe(OperationState.SUCCEEDED);
+    expect((await submit(operation, manager.connectionId, setQueueInteractionLockMutation(control, lock, false))).state).toBe(OperationState.SUCCEEDED);
+    const after = [first.queueItemId, third.queueItemId, second.queueItemId];
+    await waitFor(order, value => value.join() === after.join(), "the reordered queue on the observing Web client");
+    expect(snapshots).toBe(0);
+    expect(store.getRun(active.runId).descriptor.state).toBe("running");
+    expect(store.listQueueItems({ sessionId, states: ["accepted"] }).map(item => item.id)).toEqual(after);
+  });
+
   mountedTimelineIt("keeps Stop and composer Escape available during a native Claude retry wait", { timeout: 75_000 }, async () => {
     let activeTurn: AdapterContext | undefined;
     fixture = await OrchestratorE2eFixture.start({
