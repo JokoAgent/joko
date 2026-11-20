@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { create } from "@bufbuild/protobuf";
 import * as contract from "@joko/contracts";
 import type { BlobRef } from "@joko/core";
-import { sanitizeBrowserFileName, type BrowserDownloadHandler, type BrowserDownloadSource, type BrowserLease,
+import { sanitizeBrowserFileName, type BrowserDownloadSource, type BrowserLease,
   type BrowserLeaseFence, type BrowserProvider, type BrowserTakeoverFence } from "@joko/tool-browser";
 
 import type { ArtifactStore } from "./artifact-store.js";
@@ -172,8 +172,10 @@ export class BrowserTransferCoordinator {
   }
 
   /** A BrowserProvider.onDownload-compatible hook. */
-  readonly onDownload: BrowserDownloadHandler = async download => {
+  readonly onDownload = async (download: BrowserDownloadSource,
+    onReceipt?: (transfer: contract.BrowserTransfer) => void): Promise<"completed" | "cancelled"> => {
     const transfer = await this.ingestDownload(download);
+    onReceipt?.(transfer);
     if (transfer.state === contract.BrowserTransferState.CANCELLED) return "cancelled";
     if (transfer.state === contract.BrowserTransferState.COMPLETED) return "completed";
     throw new Error("Browser download artifact ingest failed.");

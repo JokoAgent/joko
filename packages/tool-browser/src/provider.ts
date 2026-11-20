@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, extname, join, resolve } from "node:path";
+import { setTimeout as wait } from "node:timers/promises";
 import {
   chromium,
   type APIResponse,
@@ -59,6 +60,8 @@ const MAXIMUM_PATH_LENGTH = 32_768;
 const MAXIMUM_SCROLL_DELTA = 100_000;
 const MAXIMUM_VIEWPORT_EDGE = 8_192;
 const MAXIMUM_WAIT_MILLISECONDS = 30_000;
+const CLICK_DOWNLOAD_GRACE_MILLISECONDS = 2_000;
+const MAXIMUM_CLICK_DOWNLOADS = 8;
 const MAXIMUM_EVALUATE_SOURCE_LENGTH = 64 * 1024;
 const MAXIMUM_EVALUATE_RESULT_BYTES = 200_000;
 const MAXIMUM_RESPONSE_BODY_CHARACTERS = 200_000;
@@ -310,6 +313,15 @@ export interface BrowserDialogSnapshot {
 export interface BrowserClickReceipt {
   readonly page: BrowserPageState;
   readonly dialog?: BrowserDialogSnapshot;
+  readonly downloadsPending?: true;
+}
+
+interface BrowserClickDownloadCapture {
+  readonly page: Page;
+  readonly documentId: string;
+  readonly signal: AbortSignal;
+  readonly handler: BrowserDownloadHandler;
+  readonly pending: Promise<void>[];
 }
 
 interface PendingBrowserClickDialog {
@@ -542,6 +554,7 @@ export class BrowserProvider {
   #stopInFlight: Promise<void> | undefined;
   #generationAbort = new AbortController();
   #downloadHandler: BrowserDownloadHandler | undefined;
+  #clickDownloadCapture: BrowserClickDownloadCapture | undefined;
   #takeoverRequestPending = false;
   #takeoverRateWindow: { takeoverId: string; startedAt: number; count: number } | undefined;
 
@@ -1798,7 +1811,8 @@ export class BrowserProvider {
     pageId: string,
     lease: BrowserLeaseFence,
     action: Extract<BrowserAction, { type: "click" }>,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    captureDownload?: BrowserDownloadHandler
   ): Promise<BrowserClickReceipt> {
     const fence = copyAgentFence(lease), safePageId = validatePublicPageId(pageId);
     const safeAction = validateAndCopyBrowserAction(action);
@@ -1812,18 +1826,52 @@ export class BrowserProvider {
       generationSignal.throwIfAborted();
       signal?.throwIfAborted();
       const deadline = Date.now() + MAXIMUM_WAIT_MILLISECONDS;
+      const invocationSignal = signal === undefined ? generationSignal : AbortSignal.any([generationSignal, signal]);
+      let capture: BrowserClickDownloadCapture | undefined;
+      if (captureDownload !== undefined) {
+        // Let Playwright resolve and position the actual target before observing
+        // downloads. A delayed locator should not collect earlier background work.
+        await raceAgainstAbort(page.locator(safeAction.selector).click({ trial: true }), invocationSignal);
+        invocationSignal.throwIfAborted();
+        this.#leases.assert(fence);
+        const documentId = this.documentIdForPage(page);
+        if (documentId !== undefined) {
+          capture = { page, documentId, signal: invocationSignal, handler: captureDownload, pending: [] };
+        }
+      }
       let watch!: (page: Page, id: string, dialog: Dialog) => void;
       const observed = new Promise<{ readonly id: string; readonly dialog: Dialog }>((resolve) => {
         watch = (source, id, dialog) => { if (source === page) resolve({ id, dialog }); };
       });
       this.#watchClickDialog = watch;
+      this.#clickDownloadCapture = capture;
       const completion = clickBrowserLocator(page, safeAction).then(async () => {
         if (!generationSignal.aborted) await this.emit({ at: Date.now(), type: "action", pageId: safePageId, detail: "click" });
       });
       let pending: { readonly id: string; readonly dialog: Dialog } | undefined;
-      try { pending = await Promise.race([observed, completion.then(() => undefined)]); }
-      finally { if (this.#watchClickDialog === watch) this.#watchClickDialog = undefined; }
-      if (pending === undefined) return { page: await this.pageState(page) };
+      try {
+        try { pending = await Promise.race([observed, completion.then(() => undefined)]); }
+        finally { if (this.#watchClickDialog === watch) this.#watchClickDialog = undefined; }
+        if (pending === undefined && capture !== undefined) {
+          await wait(CLICK_DOWNLOAD_GRACE_MILLISECONDS, undefined, { signal: invocationSignal });
+        }
+      } finally {
+        if (this.#clickDownloadCapture === capture) this.#clickDownloadCapture = undefined;
+      }
+      if (pending === undefined) {
+        const pageResult = await this.pageState(page);
+        if (capture === undefined || capture.pending.length === 0) return { page: pageResult };
+        const timeout = AbortSignal.timeout(Math.max(1, deadline - Date.now()));
+        const waiting = AbortSignal.any([invocationSignal, timeout]);
+        try {
+          await raceAgainstAbort(Promise.all(capture.pending), waiting);
+        } catch (error) {
+          invocationSignal.throwIfAborted();
+          if (!timeout.aborted) throw error;
+          return { page: pageResult, downloadsPending: true };
+        }
+        return { page: pageResult };
+      }
       const { id, dialog } = pending;
       let timer: ReturnType<typeof setTimeout>;
       const release = () => {
@@ -2333,7 +2381,7 @@ export class BrowserProvider {
       this.#watchClickDialog?.(page, id, dialog);
     });
     page.on("popup", (popup) => void this.adoptHumanPopup(page, popup).catch(() => undefined));
-    page.on("download", (download) => void this.handleDownload(pageId, generation, download).catch(() => undefined));
+    page.on("download", (download) => void this.handleDownload(page, pageId, generation, download).catch(() => undefined));
     void this.emit({ at: Date.now(), type: "page", pageId, detail: "Page opened." });
   }
 
@@ -2422,7 +2470,7 @@ export class BrowserProvider {
     return value.length <= maximumCharacters ? value : `${value.slice(0, Math.max(0, maximumCharacters - 1))}…`;
   }
 
-  private async handleDownload(pageId: string, generation: number, download: Download): Promise<void> {
+  private async handleDownload(page: Page, pageId: string, generation: number, download: Download): Promise<void> {
     const handler = this.#downloadHandler;
     let staged: Awaited<ReturnType<typeof stageBrowserDownload>> | undefined;
     const generationSignal = this.#generationAbort.signal;
@@ -2448,8 +2496,15 @@ export class BrowserProvider {
         return staged.verifiedLocalPath;
       };
       let outcome: "completed" | "cancelled" = "completed";
-      if (handler === undefined) await stage();
-      else outcome = await handler({ pageId, generation, fileName, assertCurrent, stage, cancel: () => download.cancel() });
+      const source = { pageId, generation, fileName, assertCurrent, stage, cancel: () => download.cancel() };
+      const capture = this.#clickDownloadCapture;
+      if (capture?.page === page && !capture.signal.aborted
+        && capture.documentId === this.documentIdForPage(page) && capture.pending.length < MAXIMUM_CLICK_DOWNLOADS) {
+        const ingest = capture.handler(source);
+        capture.pending.push(ingest.then(() => undefined, () => undefined));
+        outcome = await ingest;
+      } else if (handler === undefined) await stage();
+      else outcome = await handler(source);
       if (!isCurrent()) return;
       await this.emit({ at: Date.now(), type: "download", pageId, detail: outcome === "cancelled"
         ? "A browser download was cancelled before ingest."

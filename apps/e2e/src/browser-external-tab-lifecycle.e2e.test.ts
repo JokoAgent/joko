@@ -1,16 +1,17 @@
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, type ServerResponse } from "node:http";
 import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import { BrowserAutomationTarget, BrowserTakeoverActionMutationSchema, BrowserTakeoverMouseButton, OperationMutationSchema,
-  BrowserTransferState, OperationState, TransferDirection } from "@joko/contracts";
+  BrowserTransferState, OperationState, PermissionMode, RunState, TransferDirection } from "@joko/contracts";
 import { OperationalBrowserState } from "@joko/orchestrator";
-import { chromium } from "playwright-core";
+import { chromium, type Browser } from "playwright-core";
 import { expect, it } from "vitest";
 
 import { waitFor } from "./fixture.js";
-import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
+import { createSessionMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 import { REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID, RealPiSystemFixture } from "./real-pi-fixture.js";
 
 const executable = process.env.JOKO_BROWSER_EXECUTABLE?.trim();
@@ -88,6 +89,142 @@ browserIt("removes a closed native external tab from Owner recovery and preserve
 });
 
 const sidebarExecutable = executable ?? chromium.executablePath();
+const mountedWebDirectory = process.env.JOKO_MOUNTED_WEB_DIR?.trim();
+
+it.skipIf(!existsSync(sidebarExecutable) || !mountedWebDirectory)(
+  "returns a one-time native Browser POST download to the original Pi tool and Run after switching tasks",
+  { timeout: 120_000 }, async () => {
+    const fileName = "pi-browser-original.csv";
+    const bytes = Buffer.from("name,count\noriginal Browser download,42\n");
+    const digest = createHash("sha256").update(bytes).digest("hex");
+    const exportMethods: string[] = [];
+    let exportResponse: ServerResponse | undefined;
+    const server = createServer((request, response) => {
+      if (request.url === "/") {
+        response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        response.end('<form method="POST" action="/export"><button>Export original report</button></form>');
+        return;
+      }
+      if (request.url !== "/export") {
+        response.writeHead(404).end();
+        return;
+      }
+      exportMethods.push(request.method ?? "");
+      if (request.method !== "POST" || exportMethods.length !== 1) {
+        response.writeHead(410).end();
+        return;
+      }
+      request.resume();
+      response.writeHead(200, { "content-type": "text/csv", "content-length": bytes.byteLength,
+        "content-disposition": `attachment; filename="${fileName}"` });
+      response.write(bytes.subarray(0, 8));
+      exportResponse = response;
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("The original export fixture did not expose a TCP port.");
+
+    let fixture: RealPiSystemFixture | undefined;
+    let clientBrowser: Browser | undefined;
+    const toolName = "mcp__joko_browser__call_tool";
+    const callId = "original-post-export";
+    try {
+      fixture = await RealPiSystemFixture.start({ externalBrowserExecutable: sidebarExecutable, webDirectory: mountedWebDirectory!,
+        providerResponder: ({ requestNumber }) => {
+          if (requestNumber === 1) return { kind: "tool", name: toolName, callId: "original-browser-page",
+            arguments: { name: "browser", args: { action: "open", url: `http://127.0.0.1:${address.port}/` } } };
+          if (requestNumber === 2) return { kind: "tool", name: toolName, callId,
+            arguments: { name: "browser", args: { action: "act", request: {
+              kind: "click", query: { role: "button", name: "Export original report" }
+            } } } };
+          return { kind: "text", text: "The original Browser export finished." };
+        } });
+      const provider = fixture.application.browser;
+      if (provider === undefined) throw new Error("The sidebar Browser Provider was not configured.");
+      const store = fixture.application.store;
+      const owner = await fixture.pair("Browser export Owner");
+      const targetId = "workspace-real-pi";
+      const mutate = (payload: NonNullable<MessageInitShape<typeof OperationMutationSchema>["payload"]>) =>
+        submit(owner.clients.operation, owner.connectionId, create(OperationMutationSchema, { payload }));
+      expect((await mutate({ case: "setWorkspaceTrust", value: { workspaceId: targetId, trusted: true } })).state)
+        .toBe(OperationState.SUCCEEDED);
+      expect((await mutate({ case: "updateBrowserSettings", value: { patch: {
+        browserProviderId: provider.id, automationTarget: BrowserAutomationTarget.SIDEBAR,
+        targetId, enabled: true, allowDownloads: true
+      } } })).state).toBe(OperationState.SUCCEEDED);
+      const makeTask = async (displayName: string) => sessionIdFrom(await submit(owner.clients.operation, owner.connectionId,
+        createSessionMutation({ backendId: "pi", targetId, displayName, providerId: REAL_PI_PROVIDER_ID,
+          modelId: REAL_PI_MODEL_ID, effortId: "off", permissionMode: PermissionMode.BYPASS_PERMISSIONS })));
+      const sessionId = await makeTask("Original Browser export task");
+      const otherSessionId = await makeTask("Separate foreground task");
+
+      const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Browser export client" })).challenge!;
+      clientBrowser = await chromium.launch({ executablePath: sidebarExecutable, headless: true });
+      const page = await clientBrowser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
+      const taskUrl = (id: string) => `${fixture!.baseUrl}/#/tasks/${encodeURIComponent(id)}`;
+      const pane = (id: string) => page.locator(`.session-pane[data-input-session-id='${id}']`);
+      await page.goto(taskUrl(sessionId), { waitUntil: "domcontentloaded" });
+      await page.locator(".connection-tabs > button").nth(2).click();
+      await page.locator("details.device-authorization__manual > summary").click();
+      await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+      await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
+      await page.getByLabel("Device name").fill("Browser export client");
+      await page.locator("form.pair-form button[type=submit]").click();
+      await pane(sessionId).waitFor({ state: "visible", timeout: 30_000 });
+      const runId = queueRunIdFrom(await submit(owner.clients.operation, owner.connectionId,
+        sendInputMutation(sessionId, BigInt(store.getSession(sessionId).descriptor.binding.generation), "Export the original report.")));
+
+      const originalPage = await waitFor(async () => (await provider.listPages().catch(() => [])).find(value =>
+        value.url === `http://127.0.0.1:${address.port}/`), value => value !== undefined, "the original native Browser page", 25_000);
+      if (originalPage === undefined) throw new Error("The original Pi Browser open returned no native page.");
+      const transfers = async () => (await owner.clients.browser.listBrowserTransfers({ browserProviderId: provider.id,
+        pageId: originalPage.id, direction: TransferDirection.DOWNLOAD })).transfers;
+      const running = await waitFor(async () => (await transfers()).find(value => value.state === BrowserTransferState.RUNNING),
+        value => value !== undefined && exportResponse !== undefined, "the in-flight native Browser export");
+      expect(running).toMatchObject({ fileName, state: BrowserTransferState.RUNNING });
+      await page.goto(taskUrl(otherSessionId));
+      await pane(otherSessionId).waitFor({ state: "visible", timeout: 10_000 });
+      expect(await pane(sessionId).count()).toBe(0);
+      exportResponse!.end(bytes.subarray(8));
+
+      const tool = await waitFor(async () => store.listEvents({ sessionId }).find(event =>
+        event.runId === runId && event.payload.type === "tool_result" && event.payload.callId === callId),
+      value => value !== undefined, "the original published Pi tool result", 25_000);
+      if (tool?.payload.type !== "tool_result") throw new Error("The Browser download has no original Pi ToolCall.");
+      expect(tool.payload.isError).toBe(false);
+      expect(tool.payload.output).toContain(fileName);
+      const outputs = tool.payload.parts?.filter(part => part.kind === "artifact");
+      expect(outputs).toHaveLength(1);
+      const blob = outputs?.[0]?.blob;
+      expect(blob).toMatchObject({ fileName, sha256: digest, byteLength: bytes.byteLength });
+      const result = await waitFor(() => owner.clients.run.getRun({ runId }),
+        value => value.run?.state === RunState.SUCCEEDED || value.run?.state === RunState.FAILED,
+        "the original Pi Run to finish");
+      expect(result.run?.state).toBe(RunState.SUCCEEDED);
+
+      const { artifacts } = await owner.clients.artifact.listArtifacts({ sessionId, runId });
+      expect(artifacts).toHaveLength(1);
+      expect(artifacts[0]).toMatchObject({ artifactId: blob!.id, blob: { blobId: blob!.id, fileName, sha256Hex: digest } });
+      expect((await owner.clients.artifact.listArtifacts({ sessionId: otherSessionId })).artifacts).toHaveLength(0);
+      const [originalTransfer] = await transfers();
+      expect(originalTransfer).toMatchObject({ browserTransferId: running?.browserTransferId, fileName,
+        state: BrowserTransferState.COMPLETED, blob: { fileName, sha256Hex: digest } });
+      expect(originalTransfer?.blob?.blobId).not.toBe(blob!.id);
+      const { ticket } = await owner.clients.artifact.getBlobDownloadTicket({ blobId: blob!.id });
+      if (ticket === undefined) throw new Error("The original Run artifact has no authorized download ticket.");
+      const downloaded = await fetch(`${fixture.baseUrl}${ticket.relativeEndpoint}`, { headers: { authorization: `Bearer ${owner.authKey}` } });
+      expect(downloaded.status).toBe(200);
+      expect(Buffer.from(await downloaded.arrayBuffer())).toEqual(bytes);
+      expect(exportMethods).toEqual(["POST"]);
+    } finally {
+      server.closeAllConnections();
+      await Promise.all([clientBrowser?.close(), fixture?.close({ removeRoot: true }),
+        new Promise<void>(resolve => server.close(() => resolve()))]);
+    }
+  }
+);
+
 it.skipIf(!existsSync(sidebarExecutable))("cancels exactly the Owner's in-flight native download before artifact ingest", { timeout: 75_000 }, async () => {
   let disconnected = false;
   const server = createServer((request, response) => {
