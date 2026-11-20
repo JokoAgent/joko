@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, mkdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,8 +8,123 @@ import { createChildRuntimeEnvironment } from "@joko/runtime-governance";
 import { expect, test, vi } from "vitest";
 import { z } from "zod";
 import { ClaudeCodeAdapter, managedModelLimitEnvironment } from "./adapter.js";
+import { SessionSdkOwner } from "./session-sdk-owner.js";
 
 const enabled = process.env["JOKO_CLAUDE_LOCAL_GATEWAY_PROBE"] === "1";
+
+test.skipIf(!enabled)("continues a portable Claude transcript in a cold independent profile and workspace", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "joko-claude-portable-")));
+  const fromProfile = join(root, "from-profile"), fromProject = join(root, "from-project");
+  const toProfile = join(root, "to-profile"), toProject = join(root, "to-project");
+  const requests: string[] = [];
+  const model = "claude-sonnet-4-6";
+  const sourcePrompt = "Keep the original portable checklist.";
+  const restoredPrompt = "Review the restored checklist.";
+  const fixtureReply = "The portable checklist has two observations.";
+  const server = createServer(async (request, response) => {
+    if (request.method !== "POST" || !["/v1/messages", "/v1/messages/count_tokens"].includes(request.url?.split("?")[0] ?? "")) {
+      request.resume();
+      response.writeHead(404).end();
+      return;
+    }
+    if (request.url?.startsWith("/v1/messages/count_tokens")) {
+      request.resume();
+      response.writeHead(200, { "content-type": "application/json" }).end('{"input_tokens":7}');
+      return;
+    }
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    requests.push(Buffer.concat(chunks).toString("utf8"));
+    sendTextMessage(response, model, fixtureReply + " " + requests.length);
+  });
+  const owners: SessionSdkOwner[] = [];
+  const adapters: ClaudeCodeAdapter[] = [];
+  let phase = "creating the isolated workspaces";
+  try {
+    await Promise.all([fromProfile, fromProject, toProfile, toProject].map(path => mkdir(path)));
+    await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("The fixture listener did not bind.");
+    const turn = async (profile: string, cwd: string, prompt: string, resume?: string): Promise<string> => {
+      const env = createChildRuntimeEnvironment({ overrides: { HOME: profile, USERPROFILE: profile, CLAUDE_CONFIG_DIR: profile,
+        ANTHROPIC_BASE_URL: `http://127.0.0.1:${address.port}`, ANTHROPIC_API_KEY: "joko-portable-loopback-only",
+        CLAUDE_CODE_OAUTH_TOKEN: undefined, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" } }).environment;
+      const run = query({ prompt, options: { cwd, model, env, tools: [], settingSources: [], persistSession: true,
+        permissionMode: "default", ...(resume === undefined ? {} : { resume }) } });
+      try {
+        for await (const message of run) {
+          if (message.type !== "result") continue;
+          expect(message.subtype).toBe("success");
+          return message.session_id;
+        }
+        throw new Error("The bundled CLI did not return a terminal result.");
+      } finally { run.close(); }
+    };
+    const sessionOwner = (profile: string) => {
+      const owner = new SessionSdkOwner({ environment: { CLAUDE_CONFIG_DIR: profile }, timeoutMs: 15_000, cleanupTimeoutMs: 5_000 });
+      owners.push(owner);
+      return owner;
+    };
+    const adapterFor = (profile: string, workspaceRoot: string) => {
+      const adapter = new ClaudeCodeAdapter({ instanceGeneration: 1, environment: { CLAUDE_CONFIG_DIR: profile } });
+      adapters.push(adapter);
+      const target: TargetDescriptor = { id: "portable-project", backendId: adapter.id, displayName: "Portable project",
+        workspaceRoot, trusted: true, managed: false };
+      return { adapter, target };
+    };
+    const assertCurrent = () => {};
+    phase = "running the original Claude turn";
+    const fromId = await turn(fromProfile, fromProject, sourcePrompt);
+    expect(requests).toHaveLength(1);
+    const original = sessionOwner(fromProfile);
+    const sourceHistory = await original.run({ kind: "getSessionMessages", sessionId: fromId,
+      options: { dir: fromProject, limit: 50, offset: 0, includeSystemMessages: true } }, {});
+    expect(JSON.stringify(sourceHistory)).toContain(sourcePrompt);
+    expect(JSON.stringify(sourceHistory)).toContain(fixtureReply);
+    phase = "exporting the original native transcript";
+    const source = adapterFor(fromProfile, fromProject);
+    const binding = await source.adapter.resolveNativeSessionReference(`claude-code:session:${fromId}`, source.target, 1);
+    const exported = await source.adapter.readStoredPortableNativeSession({ target: source.target, binding, assertCurrent });
+    if (exported === undefined) throw new Error("The bundled CLI did not persist the original transcript.");
+    await original.close();
+    await source.adapter.dispose();
+    await rename(fromProfile, join(root, "retired-profile"));
+    await rename(fromProject, join(root, "retired-project"));
+    phase = "adopting the restored transcript through the receiving Adapter";
+    const destination = adapterFor(toProfile, toProject);
+    const adopted = await destination.adapter.importPortableNativeSession({
+      target: destination.target, bytes: exported.bytes, generation: 1, nativeSessionId: "portable-claude-independent-owner"
+    }, AbortSignal.timeout(20_000));
+    const restoredId = adopted.nativeSessionId;
+    if (restoredId === undefined) throw new Error("The receiving Adapter did not return a native Session identity.");
+    expect(restoredId).not.toBe(fromId);
+    const receiving = sessionOwner(toProfile);
+    const info = await receiving.run({ kind: "getSessionInfo", sessionId: restoredId, options: { dir: toProject } }, {});
+    expect(info).toMatchObject({ sessionId: restoredId, cwd: toProject });
+    const targetHistory = await receiving.run({ kind: "getSessionMessages", sessionId: restoredId,
+      options: { dir: toProject, limit: 50, offset: 0, includeSystemMessages: true } }, {});
+    const identity = (history: unknown) => (history as Array<{ uuid?: string; type?: string; message?: unknown }>).map(({ uuid, type, message }) =>
+      ({ uuid, type, message }));
+    expect(identity(targetHistory)).toEqual(identity(sourceHistory));
+    await receiving.close();
+    await destination.adapter.dispose();
+    expect(requests).toHaveLength(1);
+    phase = "sending a new model turn from the independently adopted history";
+    expect(await turn(toProfile, toProject, restoredPrompt, restoredId)).toBe(restoredId);
+    expect(requests).toHaveLength(2);
+    expect(requests[1]).toContain(sourcePrompt);
+    expect(requests[1]).toContain(fixtureReply);
+    expect(requests[1]).toContain(restoredPrompt);
+  } catch (error) {
+    throw new Error(`Claude portable history failed while ${phase} (${requests.length} loopback model requests).`, { cause: error });
+  } finally {
+    await Promise.allSettled(adapters.map(adapter => adapter.dispose()));
+    await Promise.allSettled(owners.map(owner => owner.close()));
+    server.closeAllConnections();
+    await new Promise<void>(done => server.close(() => done()));
+    await rm(root, { recursive: true, force: true });
+  }
+}, 60_000);
 
 test.skipIf(!enabled)("uses fixed-SDK per-model effort and context leases through a local gateway while preserving credentials", async () => {
   const directory = await mkdtemp(join(tmpdir(), "joko-claude-local-gateway-"));

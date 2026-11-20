@@ -365,6 +365,8 @@ export interface PortableNativeSession {
   readonly bytes: Uint8Array;
   readonly sha256: string;
   readonly nativeSessionId: string;
+  /** Exact binding references whose retained prefix bytes are embedded in this snapshot. */
+  readonly sourceNativeReferences?: readonly string[];
 }
 
 export interface StoredPortableNativeSessionInput {

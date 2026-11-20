@@ -20,8 +20,8 @@ describe("portable session UI policy", () => {
     } }, snapshot)).toBe(false);
     expect(portableSessionExportSupported(session({ backendId: "limited" }), snapshot)).toBe(false);
     expect(portableSessionTargetOptions(snapshot, new Set(["project-target"]))).toEqual([
-      { id: "project-target", label: "Project · Workspace", worktreeSupported: true },
-      { id: "dialogue-target", label: "Dialogue", worktreeSupported: false }
+      { id: "project-target", label: "Project · Workspace", worktreeSupported: true, nativeFormat: "native-portable-session-v1" },
+      { id: "dialogue-target", label: "Dialogue", worktreeSupported: false, nativeFormat: "native-portable-session-v1" }
     ]);
     expect(portableSessionWorktreeProbeTargetIds(snapshot)).toEqual(["project-target"]);
   });

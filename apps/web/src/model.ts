@@ -6099,6 +6099,7 @@ export interface PortableSessionTargetOption {
   readonly id: string;
   readonly label: string;
   readonly worktreeSupported: boolean;
+  readonly nativeFormat: string;
 }
 
 export interface PortableSessionExecutionSelection {

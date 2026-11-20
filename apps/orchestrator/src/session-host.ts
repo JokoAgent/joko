@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { capabilityNames, codexRetryProgressKind, queuePauseForStopReason, supportedExtraDirectoryAccessModes, taskMessageReferenceHref, validInputMessageReferences } from "@joko/contracts";
+import { capabilityNames, codexRetryProgressKind, portableSessionNativeFormat, queuePauseForStopReason, supportedExtraDirectoryAccessModes, taskMessageReferenceHref, validInputMessageReferences } from "@joko/contracts";
 import { MAXIMUM_EDITABLE_PLAN_LENGTH, modelPricesWithOverride, NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD, NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
   parseNativeModelUsage, parseNativeUsageRequests, type ModelPriceOverride } from "@joko/core";
 import { DocumentPathError, type DocumentPathAuthorizer } from "@joko/tool-document";
@@ -9071,8 +9071,9 @@ export class SessionHost {
     assertProtectedNativeExport(this.#store, stored.descriptor);
     const adapter = this.requireAdapter(stored.descriptor.backendId);
     const backend = this.#store.getBackend(stored.descriptor.backendId).descriptor;
-    const capability = backend.capabilities.get("session.portable_transfer");
-    if (capability?.supported !== true || adapter.exportPortableNativeSession === undefined) {
+    const capability = backend.capabilities.get(capabilityNames.sessionPortableTransfer);
+    const target = this.#store.getTarget(stored.descriptor.targetId);
+    if (!supportsNativeStartNavigation(capability, target.descriptor) || adapter.exportPortableNativeSession === undefined) {
       throw new JokoError({
         code: "PORTABLE_SESSION_EXPORT_UNSUPPORTED",
         message: "The selected Backend does not support portable task export.",
@@ -9118,9 +9119,8 @@ export class SessionHost {
         assertProtectedNativeExport(this.#store, latest.descriptor);
       };
     };
-    const target = this.#store.getTarget(stored.descriptor.targetId);
     const readStored = adapter.readStoredPortableNativeSession;
-    if (backend.adapterKind === "pi" && readStored !== undefined && this.canReadStoredPortableSession(stored, target)) {
+    if (readStored !== undefined && this.canReadStoredPortableSession(stored, target)) {
       const { backendId, id: sessionId, binding } = stored.descriptor;
       const assertCurrent = exportSourceFence(stored, target, this.requireAdapterGeneration(backendId, adapter), true);
       assertCurrent();
@@ -9171,8 +9171,19 @@ export class SessionHost {
     input: ExportPortableSessionInput,
     current: StoredSession,
     nativeSession: PortableNativeSession | undefined,
-    assertCurrent: () => void
+    assertSourceCurrent: () => void
   ): Promise<ExportPortableSessionResult> {
+    const nativeSources = new Set(nativeSession?.sourceNativeReferences ?? []);
+    const backendId = current.descriptor.backendId;
+    const assertCurrent = (): void => {
+      assertSourceCurrent();
+      for (const reference of nativeSources) {
+        const fingerprint = nativeBindingFingerprint(reference);
+        for (const ownerId of this.#store.listNativeBindingOwners(backendId, reference)) {
+          assertProtectedNativeBindingExport(this.#store, ownerId, fingerprint);
+        }
+      }
+    };
     assertCurrent();
     const events: PersistedEvent[] = [];
     let portableMessageCount = 0;
@@ -9239,7 +9250,7 @@ export class SessionHost {
         applicationVersion: input.applicationVersion ?? "0.1.0",
         title: current.descriptor.title,
         workspaceKind: target.managed ? "dialogue" : "project",
-        backendCapability: "native-portable-session-v1",
+        backendCapability: portableSessionNativeFormat(current.descriptor.backendId),
         events,
         ...(nativeSession === undefined ? {} : {
           nativeSession,
@@ -12323,11 +12334,11 @@ export class SessionHost {
     const importTitle = portableImportTitle(input.title, prepared.manifest.title);
     const nativeTranscriptSha256 = prepared.nativeSession === undefined ? undefined
       : createHash("sha256").update(prepared.nativeSession.bytes).digest("hex");
-    const localPiDigest = (store: OperationalStore, target: StoredTarget): string | undefined =>
-      target.descriptor.remoteWorkspace === undefined && store.getBackend(target.descriptor.backendId).descriptor.adapterKind === "pi"
+    const localNativeDigest = (store: OperationalStore, target: StoredTarget): string | undefined =>
+      target.descriptor.remoteWorkspace === undefined && supportsPortableTranscriptDeduplication(store.getBackend(target.descriptor.backendId).descriptor.adapterKind)
         ? nativeTranscriptSha256 : undefined;
     const findConflict = (store: OperationalStore, target: StoredTarget): StoredSession | undefined =>
-      findPortableImportConflict(store, target.descriptor.id, input.package.sha256, localPiDigest(store, target));
+      findPortableImportConflict(store, target.descriptor.id, input.package.sha256, localNativeDigest(store, target));
     const claim = this.#store.claimAuthorizedDeferredEffectOperation<ImportPortableSessionResult>(
       input.connection.id,
       input.connection.authKeyDigest,
@@ -12417,15 +12428,17 @@ export class SessionHost {
       );
       if (prepared.nativeSession !== undefined) {
         const capability = this.#store.getBackend(target.descriptor.backendId).descriptor.capabilities
-          .get("session.portable_transfer");
-        if (capability?.supported !== true || adapter.importPortableNativeSession === undefined) {
+          .get(capabilityNames.sessionPortableTransfer);
+        if (capability?.supported !== true || adapter.importPortableNativeSession === undefined
+          || prepared.manifest.backendCapability !== portableSessionNativeFormat(target.descriptor.backendId)
+          || !supportsNativeStartNavigation(capability, target.descriptor)) {
           throw new JokoError({
             code: "PORTABLE_SESSION_IMPORT_UNSUPPORTED",
             message: "The selected Backend cannot restore this package's native task history.",
             phase: "capability",
             retryable: false,
             stateMayHaveChanged: false,
-            recovery: "Choose a Backend that advertises session.portable_transfer."
+            recovery: "Choose a receiving workspace compatible with this package's native session format."
           });
         }
       }
@@ -12552,7 +12565,7 @@ export class SessionHost {
             throw new RevisionConflictError("Target", input.targetId, target.revision, currentTarget.revision);
           }
           const currentConflict = findConflict(store, currentTarget);
-          if (currentConflict !== undefined && !input.overwrite && localPiDigest(store, currentTarget) !== undefined) {
+          if (currentConflict !== undefined && !input.overwrite && localNativeDigest(store, currentTarget) !== undefined) {
             throw portableImportConflict(currentConflict.descriptor.id);
           }
           if (currentConflict?.descriptor.id !== replaced?.descriptor.id) {
@@ -12606,9 +12619,9 @@ export class SessionHost {
               at: now
             });
           }
-          const storedDigest = localPiDigest(store, currentTarget);
-          // Preserve the input transcript identity before Pi rewrites its
-          // native ID and workspace for the receiving task.
+          const storedDigest = localNativeDigest(store, currentTarget);
+          // Preserve the input transcript identity before the receiving Adapter
+          // assigns its local workspace and native Session identity.
           store.setSetting("session", sessionId, PORTABLE_IMPORT_SOURCE_SETTING_KEY, {
             format: 1,
             targetId: input.targetId,
@@ -20405,11 +20418,15 @@ function findPortableImportConflict(
     if (nativeTranscriptSha256 !== undefined
       && setting.value["nativeTranscriptSha256"] === nativeTranscriptSha256
       && session.descriptor.remoteWorkspace === undefined
-      && store.getBackend(session.descriptor.backendId).descriptor.adapterKind === "pi") {
+      && supportsPortableTranscriptDeduplication(store.getBackend(session.descriptor.backendId).descriptor.adapterKind)) {
       sameTranscript ??= session;
     }
   }
   return sameTranscript;
+}
+
+function supportsPortableTranscriptDeduplication(adapterKind: string): boolean {
+  return adapterKind === "pi" || adapterKind === "codex" || adapterKind === "claude-agent-sdk-stdio";
 }
 
 function portableImportConflict(sessionId: string): JokoError {
@@ -20503,7 +20520,11 @@ function protectedNativeInputFingerprints(store: OperationalStore, sessionId: st
 }
 
 function assertProtectedNativeExport(store: OperationalStore, session: SessionDescriptor): void {
-  if (protectedNativeInputFingerprints(store, session.id, nativeBindingFingerprint(session.binding.opaqueRef)).size === 0) return;
+  assertProtectedNativeBindingExport(store, session.id, nativeBindingFingerprint(session.binding.opaqueRef));
+}
+
+function assertProtectedNativeBindingExport(store: OperationalStore, sessionId: string, bindingFingerprint: string): void {
+  if (protectedNativeInputFingerprints(store, sessionId, bindingFingerprint).size === 0) return;
   throw inputCapabilityError("PROTECTED_NATIVE_EXPORT_UNAVAILABLE", "This native task contains protected Telegram input and cannot be exported as a portable task.");
 }
 

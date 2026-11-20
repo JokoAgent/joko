@@ -58,6 +58,7 @@ export const capabilityNames = {
   contextUsage: "context.usage",
   contextCompact: "context.compact",
   sessionExport: "session.export",
+  sessionPortableTransfer: "session.portable_transfer",
   workspaceFiles: "workspace.files",
   workspaceFilesWatch: "workspace.files.watch",
   workspaceFilesWrite: "workspace.files.write",
@@ -97,6 +98,13 @@ export const capabilityNames = {
 } as const;
 
 export type StandardCapabilityName = (typeof capabilityNames)[keyof typeof capabilityNames];
+
+/** Resolve the native history format of a Backend that supports portable transfer. */
+export function portableSessionNativeFormat(backendId: string): string {
+  if (backendId === "codex") return "codex-native-portable-session-v1";
+  if (backendId === "claude-code") return "claude-native-portable-session-v1";
+  return "native-portable-session-v1";
+}
 
 /** Pause reason for pending input held by the Owner's Stop action. */
 export const queuePauseForStopReason = "Paused while stopping the current run.";

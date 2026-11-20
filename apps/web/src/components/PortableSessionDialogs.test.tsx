@@ -43,6 +43,7 @@ const labels: PortableSessionDialogLabels = {
   fidelity: (value) => `Fidelity: ${value}`,
   riskWarning: "Imported history can influence later agent behavior.",
   destination: "Destination",
+  noDestination: "No compatible destination",
   createWorktree: "Create in a worktree",
   createWorktreeHint: "Keep the imported task isolated.",
   import: "Import",
@@ -293,7 +294,7 @@ describe("PortableSessionImportDialog", () => {
       open
       initialFile={new File(["package"], "task.jshare", { type: "application/vnd.joko.session" })}
       labels={labels}
-      targets={[{ id: "target-1", label: "Local project", worktreeSupported: true }]}
+      targets={[{ id: "target-1", label: "Local project", worktreeSupported: true, nativeFormat: "native-portable-session-v1" }]}
       defaultTargetId="target-1"
       executionForTarget={() => ({ fastMode: true, permissionMode: "ask", planMode: false })}
       onClose={onClose}
@@ -365,7 +366,7 @@ describe("PortableSessionImportDialog", () => {
     expect(onCancelDraft).toHaveBeenCalledWith("late-draft");
   });
 
-  it("commits the capability-filtered execution defaults for the selected destination", async () => {
+  it("filters destinations by native history format and commits the selected execution defaults", async () => {
     const onCommit = vi.fn().mockResolvedValue({
       sessionId: "session-new",
       fidelity: "product_only",
@@ -380,8 +381,8 @@ describe("PortableSessionImportDialog", () => {
       initialFile={new File(["package"], "task.jshare")}
       labels={labels}
       targets={[
-        { id: "target-1", label: "First", worktreeSupported: false },
-        { id: "target-2", label: "Second", worktreeSupported: false }
+        { id: "target-1", label: "First", worktreeSupported: false, nativeFormat: "native-portable-session-v1" },
+        { id: "target-2", label: "Second", worktreeSupported: false, nativeFormat: "codex-native-portable-session-v1" }
       ]}
       defaultTargetId="target-1"
       executionForTarget={(targetId) => targetId === "target-2"
@@ -393,7 +394,7 @@ describe("PortableSessionImportDialog", () => {
         expiresAt: Date.now() + 60_000,
         encrypted: false,
         passwordRequired: false,
-        preview: preview()
+        preview: { ...preview(), backendCapability: "codex-native-portable-session-v1" }
       })}
       onUnlock={vi.fn()}
       onCancelDraft={vi.fn()}
@@ -403,7 +404,9 @@ describe("PortableSessionImportDialog", () => {
     />);
 
     await flush();
-    await select(required(container.querySelector("select")), "target-2");
+    const selector = required(container.querySelector("select"));
+    expect([...selector.options].map(option => option.value)).toEqual(["target-2"]);
+    expect(selector.value).toBe("target-2");
     await act(async () => buttonWithText(container, "Import").click());
     expect(onCommit).toHaveBeenCalledWith(expect.objectContaining({
       targetId: "target-2",
@@ -437,7 +440,7 @@ describe("PortableSessionImportDialog", () => {
       open
       initialFile={new File(["package"], "task.jshare")}
       labels={labels}
-      targets={[{ id: "target-1", label: "Local", worktreeSupported: false }]}
+      targets={[{ id: "target-1", label: "Local", worktreeSupported: false, nativeFormat: "native-portable-session-v1" }]}
       defaultTargetId="target-1"
       executionForTarget={() => ({ fastMode: false, permissionMode: "ask", planMode: false })}
       onClose={vi.fn()}
@@ -476,7 +479,7 @@ function preview() {
     workspaceKind: "project" as const,
     exportedAt: Date.now(),
     applicationVersion: "1.0.0",
-    backendCapability: "pi",
+    backendCapability: "native-portable-session-v1",
     fidelity: "full" as const,
     messageCount: 7,
     mediaCount: 2,
@@ -509,14 +512,6 @@ async function change(input: HTMLInputElement, value: string): Promise<void> {
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
     setter?.call(input, value);
     input.dispatchEvent(new Event("input", { bubbles: true }));
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-  });
-}
-
-async function select(input: HTMLSelectElement, value: string): Promise<void> {
-  await act(async () => {
-    const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set;
-    setter?.call(input, value);
     input.dispatchEvent(new Event("change", { bubbles: true }));
   });
 }
