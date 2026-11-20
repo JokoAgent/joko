@@ -102,14 +102,13 @@ describe("Partner task observation", () => {
   it("runs the opt-in daily todo check in a private routine lane and keeps its builtin instructions fixed", async () => {
     const f = await fixture();
     await f.autonomy.start();
-    const initial = f.routines.list(f.partner.id).find(row => row.builtin === "todo-check")!;
-    expect(initial).toMatchObject({ builtinVersion: 1, enabled: false, silentWhenIdle: true,
+    expect(f.routines.list(f.partner.id).some(row => row.builtin === "todo-check")).toBe(false);
+    const enable = () => f.routines.enableDailyTodoCheck(f.partner.id, f.partners.getPartner(f.partner.id).revision, () => undefined);
+    const active = await enable();
+    expect(active).toMatchObject({ builtinVersion: 1, enabled: true, silentWhenIdle: true,
       triggers: [{ kind: "cron", expression: "0 9 * * 1-5", timezone: expect.any(String) }] });
-    expect(f.routines.nextRunAt(f.partner.id, initial.id)).toBeUndefined();
-    await expect(f.routines.save({ partnerId: f.partner.id, partnerRevision: f.partner.revision, routineId: initial.id,
-      revision: initial.revision, definition: { ...initial, prompt: "Replace the fixed daily check." } })).rejects.toThrow(/cannot be edited/u);
-    const active = await f.routines.save({ partnerId: f.partner.id, partnerRevision: f.partner.revision, routineId: initial.id,
-      revision: initial.revision, definition: { ...initial, enabled: true } });
+    await expect(f.routines.save({ partnerId: f.partner.id, partnerRevision: f.partner.revision, routineId: active.id,
+      revision: active.revision, definition: { ...active, prompt: "Replace the fixed daily check." } })).rejects.toThrow(/cannot be edited/u);
     const next = f.routines.nextRunAt(f.partner.id, active.id);
     expect(typeof next).toBe("number");
     const ledger = new PartnerTodoManager(f.store, f.profiles, f.partners);
@@ -144,9 +143,10 @@ describe("Partner task observation", () => {
       revision: active.revision, definition: { ...active, enabled: false } });
     await f.autonomy.sweep();
     expect(f.routines.list(f.partner.id).filter(row => row.builtin === "todo-check")).toEqual([
-      expect.objectContaining({ id: initial.id, enabled: false })
+      expect.objectContaining({ id: active.id, enabled: false })
     ]);
-    expect(f.routines.nextRunAt(f.partner.id, initial.id)).toBeUndefined();
+    expect(f.routines.nextRunAt(f.partner.id, active.id)).toBeUndefined();
+    expect(await enable()).toMatchObject({ id: active.id, enabled: false });
   }, 20_000);
 
   it("keeps all-task observation off until an explicit setting, replays its original save, and pages every row", async () => {

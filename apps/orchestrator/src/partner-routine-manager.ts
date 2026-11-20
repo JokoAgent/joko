@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import { PARTNER_TODO_CHECK_CREATION_REQUEST_ID } from "@joko/contracts";
 import { redactSecrets, type Routine, type RoutineInput, type RoutineRun, type RoutineSource } from "@joko/core";
 import { PartnerRoutineStore, type OperationalStore } from "@joko/store";
 import type { PartnerManager } from "./partner-manager.js";
@@ -94,7 +95,7 @@ export class PartnerRoutineManager {
     else if (state === "active") await this.resumePartner(partnerId);
     else await this.suspendPartner(partnerId);
   }
-  list(partnerId: string): readonly Routine[] { this.#owner(partnerId, false); return this.engine.list(partnerId); }
+  list(partnerId: string): readonly Routine[] { this.#owner(partnerId, false); return this.engine.list(partnerId).filter(routine => !isDormantTodoCheck(routine)); }
   nextRunAt(partnerId: string, routineId: string): number | undefined {
     this.#owner(partnerId, false);
     if (!this.engine.list(partnerId).some((routine) => routine.id === routineId)) return undefined;
@@ -103,7 +104,7 @@ export class PartnerRoutineManager {
   catalog(partnerId: string) {
     const { partner } = this.#owner(partnerId, false);
     return { partnerId, partnerRevision: partner.revision, writable: partner.lifecycle === "active",
-      routines: this.engine.list(partnerId), sources: this.engine.listSources(), models: this.options.partners.routineModels(partnerId) };
+      routines: this.list(partnerId), sources: this.engine.listSources(), models: this.options.partners.routineModels(partnerId) };
   }
   sources(partnerId: string): readonly RoutineSource[] { this.#owner(partnerId, false); return this.engine.listSources(); }
   assertExecutionCaller(context: { readonly sessionId: string; readonly targetId: string; readonly generation: number;
@@ -162,6 +163,28 @@ export class PartnerRoutineManager {
     return this.engine.createOnce(input.partnerId, input.definition, this.creationId(input.partnerId, input.requestId), input.assertCaller);
     });
   }
+  /** The first activation creates the fixed rule. A repeated creation receipt preserves later owner choices. */
+  async enableDailyTodoCheck(partnerId: string, partnerRevision: bigint, assertCaller: () => void): Promise<Routine> {
+    const assertCurrent = () => { assertCaller(); this.#owner(partnerId, true, partnerRevision); };
+    return this.options.partners.runOwnedManagement(partnerId, partnerRevision, async () => {
+      assertCurrent();
+      const id = todoCheckId(partnerId);
+      const existing = this.engine.list(partnerId).find(routine => routine.id === id);
+      if (existing) {
+        if (existing.builtin !== "todo-check") throw new PartnerRoutineError("changed", "The daily todo check identity is occupied.");
+        return isDormantTodoCheck(existing) ? this.engine.put(partnerId, { ...existing, enabled: true, sessionMode: "persistent", modelOverride: null },
+          id, existing.revision, undefined, assertCurrent) : existing;
+      }
+      const routine = await this.engine.ensureBuiltin(partnerId, {
+        name: "Daily todo check", enabled: true, silentWhenIdle: true, sessionMode: "persistent", modelOverride: null,
+        prompt: "Check for items I need to handle that appeared since the previous check. Read the todo ledger and use only sources already authorized and available to this Partner. Add each verified new discovery with a stable key and its source evidence. Leave existing owner decisions alone. Call schedule_notify_current_run only when you recorded a new item that needs my attention.",
+        triggers: [{ id: "weekday-morning", kind: "cron", expression: "0 9 * * 1-5",
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC" }]
+      }, id, 1, "todo-check", assertCurrent);
+      if (!routine) throw new PartnerRoutineError("changed", "The Partner is paused.");
+      return routine;
+    });
+  }
   /** Trusted package definitions are saved disabled independently of model and task readiness. */
   async installPackage(partnerId: string, definition: RoutineInput, requestId: string, assertCurrent: () => void): Promise<Routine> {
     assertCurrent(); const partner = this.options.partners.getPartner(partnerId);
@@ -172,10 +195,14 @@ export class PartnerRoutineManager {
   creation(partnerId: string, requestId: string): { readonly routine?: Routine; readonly retired: boolean } {
     this.#owner(partnerId, false);
     if (!/^[A-Za-z0-9_-]{16,100}$/u.test(requestId)) throw new PartnerRoutineError("invalid", "Creation request is invalid.");
+    if (requestId === PARTNER_TODO_CHECK_CREATION_REQUEST_ID) return {
+      routine: this.list(partnerId).find(item => item.id === todoCheckId(partnerId)), retired: false
+    };
     const id = this.creationId(partnerId, requestId); const routine = this.engine.list(partnerId).find(item => item.id === id);
     return { ...(routine ? { routine } : {}), retired: this.engine.isRetired(id) };
   }
   async retireCreation(partnerId: string, requestId: string) {
+    if (requestId === PARTNER_TODO_CHECK_CREATION_REQUEST_ID) throw new PartnerRoutineError("invalid", "Pause the daily todo check from At a glance.");
     this.creation(partnerId, requestId);
     await this.engine.retireCreation(partnerId, this.creationId(partnerId, requestId));
     return this.creation(partnerId, requestId);
@@ -359,4 +386,13 @@ export class PartnerRoutineManager {
       if (events.length < 1000) return result;
     }
   }
+}
+
+function todoCheckId(partnerId: string): string {
+  return `builtin-todo-check-${createHash("sha256").update(partnerId).digest("hex").slice(0, 40)}`;
+}
+
+function isDormantTodoCheck(routine: Routine): boolean {
+  return routine.builtin === "todo-check" && !routine.enabled && routine.revision === 1
+    && routine.sessionMode === undefined && routine.modelOverride === undefined;
 }

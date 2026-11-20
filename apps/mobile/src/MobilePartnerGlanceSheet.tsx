@@ -125,7 +125,7 @@ export function MobilePartnerGlanceSheet({ api, homeApi, partnerId, name, visibl
             {checkFailed && <Text accessibilityRole="alert" style={{ color: colors.negative }}>{m.checkFailed}</Text>}
             {state.dailyCheck && <View style={styles.invitation}>
               <Switch accessibilityLabel={m.dailyCheck} disabled={!state.dailyCheck.writable || state.dailyCheckSaving || state.dailyCheckFailed}
-                value={state.dailyCheck.routine.definition?.enabled === true} onValueChange={value => void editor.setDailyCheck(value)} />
+                value={state.dailyCheck.enabled} onValueChange={value => void editor.setDailyCheck(value)} />
               <Text style={{ color: colors.ink, flex: 1 }}>{m.dailyCheck}</Text>
             </View>}
             {state.dailyCheckFailed && <><Text accessibilityRole="alert" style={{ color: colors.negative }}>{m.dailyCheckFailed}</Text>

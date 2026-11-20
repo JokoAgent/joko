@@ -8,14 +8,16 @@ import type { PartnerRoutineApi } from "./partner-routines.js";
 
 export type PartnerAutonomySettingChoice = NonNullable<MessageInitShape<typeof UpdatePartnerAutonomySettingsRequestSchema>["choice"]>;
 export const PARTNER_TODO_CHECK_PROMPT = "Look for new items I need to handle in your authorized sources. Add verified discoveries to my todos with their source evidence, and tell me what needs my attention.";
+export const PARTNER_TODO_CHECK_CREATION_REQUEST_ID = "builtin-todo-check-v1";
 export interface PartnerTodoCheck {
-  readonly routine: PartnerRoutine;
+  readonly routine?: PartnerRoutine;
+  readonly enabled: boolean;
   readonly partnerRevision: bigint;
   readonly writable: boolean;
 }
 
 export interface PartnerTodoCheckApi {
-  read(signal: AbortSignal): Promise<PartnerTodoCheck | undefined>;
+  read(signal: AbortSignal): Promise<PartnerTodoCheck>;
   set(current: PartnerTodoCheck, enabled: boolean, signal: AbortSignal): Promise<PartnerTodoCheck>;
 }
 
@@ -26,16 +28,19 @@ export function createPartnerTodoCheckApi(routines: Pick<PartnerRoutineApi, "lis
       const checks = catalog.routines.filter(item => item.builtin === "todo-check");
       if (checks.length > 1) throw new Error("The Partner has conflicting daily todo checks.");
       const routine = checks[0];
-      return routine === undefined ? undefined : { routine, partnerRevision: catalog.partnerRevision!.value, writable: catalog.writable };
+      return { routine, enabled: routine?.definition?.enabled === true, partnerRevision: catalog.partnerRevision!.value, writable: catalog.writable };
     },
     async set(current, enabled, signal) {
       const { routine } = current;
-      if (!current.writable || routine.builtin !== "todo-check" || !routine.definition) throw new Error("The daily todo check is unavailable.");
-      const updated = await routines.save(current.partnerRevision, create(RoutineDefinitionSchema, { ...routine.definition, enabled }), { routine }, signal);
-      if (updated.id !== routine.id || updated.builtin !== "todo-check" || updated.definition?.enabled !== enabled) {
+      if (!current.writable || routine && (routine.builtin !== "todo-check" || !routine.definition)) throw new Error("The daily todo check is unavailable.");
+      if (!routine && !enabled) return current;
+      const definition = routine?.definition ? create(RoutineDefinitionSchema, { ...routine.definition, enabled }) : create(RoutineDefinitionSchema, { enabled });
+      const updated = await routines.save(current.partnerRevision, definition,
+        routine ? { routine } : { requestId: PARTNER_TODO_CHECK_CREATION_REQUEST_ID }, signal);
+      if (routine && updated.id !== routine.id || updated.builtin !== "todo-check" || updated.definition?.enabled !== enabled) {
         throw new Error("The daily todo check receipt is invalid.");
       }
-      return { ...current, routine: updated };
+      return { ...current, routine: updated, enabled };
     }
   };
 }

@@ -36,7 +36,7 @@ import {
   FileKind, FilePreviewSchema, FileRevisionSchema, TextFilePreviewSchema, TargetSchema, WorkspaceDescriptorSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
   WorkspaceSearchMatchSchema, WorkspaceChangeSetSchema, WorkspaceRewindPreviewSchema, WorkspaceRewindResultSchema, RewindSafety, FileChangeKind,
   JOKO_API_VERSION, NativeEntryKind, NativeSessionBindingSchema, NativeSessionTreeNodeSchema, NativeSessionTreeSchema, OperationSchema,
-  ListPartnerSessionsResponseSchema, PartnerSessionRole,
+  ListPartnerSessionsResponseSchema, PartnerSessionRole, PARTNER_TODO_CHECK_PROMPT,
   InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk,
   CustomToolPermissionSubjectSchema, PermissionRequestSchema, PermissionSubjectSchema, PlanReviewDecisionKind, ImageThumbnailSchema,
   EventCursorSchema, EventIdentitySchema, EventSchema, ImageRefSchema, MessageCompletedEventSchema, MessageDeletedEventSchema, MessageInputDelivery, MessageRole, MessageStartedEventSchema,
@@ -10664,22 +10664,25 @@ describe("native current-task message and Queue actions", () => {
     expect(JSON.stringify(saved.pending())).not.toContain("related");
   });
 
-  it("sends independent text in the original task without replacing its saved composer draft", async () => {
+  it("sends the manual todo check in the original task without replacing its saved composer draft", async () => {
     const network = projectedNetwork(sessionMentionSnapshot);
     const drafts = memoryDraftStores();
     const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids(), undefined, drafts);
     await app.start();
     const identity = { profileId: credential.profileId, sessionId: "session" };
+    expect(app.state.selectedId).toBe(identity.sessionId);
+    const generation = app.state.detail?.sessions.find(session => session.sessionId === identity.sessionId)?.nativeBinding?.runtimeGeneration;
+    expect(generation).toBeDefined();
     const retained = sessionMentionDraft();
     drafts.composer.save(identity, retained);
     await drafts.composer.flush(identity);
-    const text = "Check my authorized sources for new todos.";
+    const text = PARTNER_TODO_CHECK_PROMPT;
 
     expect(await app.send(plainTextMobileComposerDraft(text), { keepComposerDraft: true })).toBe(true);
 
     expect(network.submit).toHaveBeenCalledTimes(1);
     expect(vi.mocked(network.submit).mock.calls[0]?.[2]).toMatchObject({
-      preconditions: [{ entity: { kind: EntityKind.SESSION, id: "session" }, expectedGeneration: expect.any(BigInt) }],
+      preconditions: [{ entity: { kind: EntityKind.SESSION, id: identity.sessionId }, expectedGeneration: generation }],
       payload: { case: "sendInput", value: { sessionId: "session", input: { parts: [{ content: { case: "text", value: text } }] } } }
     });
     expect(drafts.composer.readSync(identity)).toEqual(retained);

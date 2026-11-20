@@ -57,9 +57,9 @@ export function PartnerGlanceContents({ api, partnerId, editor, locale, enabled,
           .finally(() => { if (alive.current) setChecking(false); });
       }}>{m.checkNow}</Button>}
       {checkFailed && <p role="alert">{m.checkFailed}</p>}
-      {state.dailyCheck && <Button role="switch" aria-checked={state.dailyCheck.routine.definition?.enabled === true}
+      {state.dailyCheck && <Button role="switch" aria-checked={state.dailyCheck.enabled}
         disabled={!state.dailyCheck.writable || state.dailyCheckSaving || state.dailyCheckFailed}
-        onClick={() => void editor.setDailyCheck(state.dailyCheck?.routine.definition?.enabled !== true)}>{m.dailyCheck}</Button>}
+        onClick={() => void editor.setDailyCheck(state.dailyCheck?.enabled !== true)}>{m.dailyCheck}</Button>}
       {state.dailyCheckFailed && <><p role="alert">{m.dailyCheckFailed}</p><Button onClick={() => void editor.refreshDailyCheck()}>{m.refresh}</Button></>}
       {state.failed && <p role="alert">{state.pending ? m.saveUnknown : m.failed}</p>}
       {state.failed && <Button disabled={state.saving} onClick={() => state.pending ? void editor.mutate() : void editor.refresh()}>{state.pending ? m.retrySave : m.refresh}</Button>}

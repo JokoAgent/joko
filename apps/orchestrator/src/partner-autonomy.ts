@@ -15,7 +15,6 @@ const SETTINGS_SCOPE = "partner.autonomy.v1", SETTINGS_KEY = "settings";
 const RESPONSIBILITY_PREFIX = "responsibility.";
 const MAX_RESPONSIBILITIES = 10_000;
 const FOLLOW_UP_VERSION = 1;
-const TODO_CHECK_VERSION = 1;
 export interface PartnerAutonomySettings {
   readonly revision: number; readonly customized: boolean; readonly schedulerPartnerId?: string;
   readonly schedulerFallbackPartnerIds: readonly string[];
@@ -311,10 +310,6 @@ export class PartnerAutonomyManager implements PartnerFollowUpRuntime {
         try {
           this.#partner(partner.id, true);
           await this.options.routines.engine.ensureBuiltin(partner.id, followUpInput(partner.id), followUpId(partner.id), FOLLOW_UP_VERSION);
-          if (!this.options.routines.engine.list(partner.id).some(routine => routine.builtin === "todo-check" && routine.builtinVersion === TODO_CHECK_VERSION)) {
-            await this.options.routines.engine.ensureBuiltin(partner.id, todoCheckInput(),
-              `builtin-todo-check-${hash(partner.id).slice(0, 40)}`, TODO_CHECK_VERSION, "todo-check");
-          }
         }
         catch { /* Other Partners keep observing; this owner will be retried. */ }
       }
@@ -394,15 +389,6 @@ export function canSendFollowUpTaskMessage(
   return delegation.requesterPartnerId === owner.id && delegation.childSessionId === targetSessionId
     && delegation.targetPartnerId === child.partnerId && delegation.targetProfileVersion === child.profileVersion
     && delegation.status !== "cancelled";
-}
-
-function todoCheckInput(): RoutineInput {
-  return {
-    name: "Daily todo check", enabled: false, silentWhenIdle: true,
-    prompt: "Check for items I need to handle that appeared since the previous check. Read the todo ledger and use only sources already authorized and available to this Partner. Add each verified new discovery with a stable key and its source evidence. Leave existing owner decisions alone. Call schedule_notify_current_run only when you recorded a new item that needs my attention.",
-    triggers: [{ id: "weekday-morning", kind: "cron", expression: "0 9 * * 1-5",
-      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC" }]
-  };
 }
 
 function taskResponsibility(value: unknown): TaskResponsibility | null {

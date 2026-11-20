@@ -17,7 +17,8 @@ import {
   OperationState,
   PARTNER_TODO_CHECK_PROMPT,
   PermissionMode,
-  RunState
+  RunState,
+  SavePartnerRoutineResponseSchema
 } from "@joko/contracts";
 import { chromium, type Browser, type Page, type Request, type Response, type Route } from "playwright-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -95,9 +96,7 @@ describe("mounted Partner collaboration product chain", () => {
     const partner = await createPartner(fixture, manager, "Elin", "orbit");
     const read = async () => (await manager.clients.partnerRoutine.listPartnerRoutines({ partnerId: partner.partnerId }))
       .routines.find(routine => routine.builtin === "todo-check");
-    const initial = await waitFor(read, value => value !== undefined, "the current Partner's daily check template");
-    expect(initial).toMatchObject({ builtinVersion: 1, definition: { enabled: false, silentWhenIdle: true,
-      triggers: [{ kind: { case: "cron", value: { expression: "0 9 * * 1-5" } } }] } });
+    expect(await read()).toBeUndefined();
     const device = "Glance Browser";
     const challenge = required((await fixture.anonymous.connection.beginPairing({ deviceDisplayName: device })).challenge, "the pairing challenge");
     browser = await chromium.launch({ executablePath: requiredEnvironment("JOKO_BROWSER_EXECUTABLE"), headless: true });
@@ -117,14 +116,28 @@ describe("mounted Partner collaboration product chain", () => {
     const daily = page.getByRole("switch", { name: "Daily todo check", exact: true });
     await glance.click();
     expect(await daily.getAttribute("aria-checked")).toBe("false");
+    const saveReceipt = () => page.waitForResponse(response => response.url().endsWith("/joko.v1.PartnerRoutineService/SavePartnerRoutine"));
+    const creating = saveReceipt();
     await daily.click();
-    const enabled = await waitFor(read, value => value?.definition?.enabled === true, "the saved daily check");
-    expect(enabled?.id).toBe(initial?.id);
+    const created = await creating;
+    expect(created.ok(), created.ok() ? undefined : await created.text()).toBe(true);
+    const enabled = fromBinary(SavePartnerRoutineResponseSchema, await created.body()).routine;
+    expect(enabled).toMatchObject({ builtinVersion: 1, definition: { enabled: true, silentWhenIdle: true,
+      triggers: [{ kind: { case: "cron", value: { expression: "0 9 * * 1-5" } } }] } });
+    expect((await read())?.id).toBe(enabled?.id);
     await page.reload({ waitUntil: "domcontentloaded" });
+    await page.getByRole("button", { name: "Saved nodes", exact: true }).click();
+    await page.locator(".connection-card .profile-card").filter({ hasText: device })
+      .getByRole("button", { name: "Connect", exact: true }).click();
+    const draft = page.locator(`.session-pane[data-input-session-id="${partner.canonicalSessionId}"] .composer-rich-editor__content`);
+    await draft.fill("Keep this separate composer draft.");
     await glance.click();
     expect(await daily.getAttribute("aria-checked")).toBe("true");
+    const pausing = saveReceipt();
     await daily.click();
-    await waitFor(read, value => value?.definition?.enabled === false, "the same daily check to pause");
+    const paused = await pausing;
+    expect(paused.ok(), paused.ok() ? undefined : await paused.text()).toBe(true);
+    expect(await read()).toMatchObject({ id: enabled?.id, definition: { enabled: false } });
 
     const store = fixture.application.store;
     const native = store.getSession(partner.canonicalSessionId).descriptor.binding.opaqueRef;
@@ -135,6 +148,7 @@ describe("mounted Partner collaboration product chain", () => {
     expect(item?.sessionId).toBe(partner.canonicalSessionId);
     expect(store.getSession(partner.canonicalSessionId).descriptor.binding.opaqueRef).toBe(native);
     expect(fixture.providerRequests.filter(request => latestUserText(request).includes(PARTNER_TODO_CHECK_PROMPT))).toHaveLength(1);
+    expect(await draft.innerText()).toBe("Keep this separate composer draft.");
   });
 
   mountedIt("retains an independent Pi task result in the original Partner conversation after reload", async () => {
