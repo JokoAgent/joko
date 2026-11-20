@@ -1679,7 +1679,7 @@ export async function createOrchestratorApplication(
               }
             },
             readBlob: (blob) => artifacts.readBlob(blob),
-            resolveFile: (blob) => artifacts.resolveBlobPath(blob),
+            resolveFile: (blob) => artifacts.resolveNativeInputFile(blob, "image/gif"),
             maximumBlobBytes: artifacts.maximumBlobBytes,
             resolveArtifactMention: createArtifactMentionResolver({
               store, artifacts,
@@ -1747,7 +1747,7 @@ export async function createOrchestratorApplication(
         resolveNativeMemoryEnabled: () => makerMemory.nativeEnabledForBackend(instanceId),
         oauthFetch: claudeCodeOAuthFetch,
         readBlob: (blob) => artifacts.readBlob(blob),
-        resolveFile: (blob) => artifacts.resolveClaudeInputFile(blob),
+        resolveFile: (blob) => artifacts.resolveNativeInputFile(blob, "application/pdf"),
         resolveTextResources: (context, signal) => piResources.runtimeTextSnapshot(
           instanceId,
           context.target.id,
