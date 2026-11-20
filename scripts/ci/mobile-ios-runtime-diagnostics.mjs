@@ -51,6 +51,30 @@ export async function stopOwnedMetroGroup(signalGroup, wait = delay) {
   return { terminate, afterTerminate, force, afterForce, gone: afterForce === "ESRCH" };
 }
 
+export async function stopOwnedPdfFixtureProcess(child) {
+  if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) {
+    return { exitCode: child.exitCode, signal: child.signalCode };
+  }
+  let force, deadline;
+  let observeExit;
+  try {
+    return await new Promise(resolve => {
+      // This fork inherits stderr, and the supervisor deliberately disconnects
+      // its IPC channel. The underlying child exit settles the owned process.
+      observeExit = (exitCode, signal) => resolve({ exitCode, signal });
+      child.once("exit", observeExit);
+      if (child.connected) child.disconnect();
+      // The owned HTTP server can spend up to ten seconds draining requests.
+      force = setTimeout(() => child.kill("SIGKILL"), 15_000);
+      deadline = setTimeout(() => resolve(undefined), 20_000);
+    });
+  } finally {
+    clearTimeout(force);
+    clearTimeout(deadline);
+    if (observeExit) child.off("exit", observeExit);
+  }
+}
+
 export function requireSimulatorApplicationContainer(value) {
   if (typeof value !== "string" || !posix.isAbsolute(value) || /[\0\r\n]/u.test(value)) {
     throw new Error("The installed Simulator application query did not return an absolute container path.");

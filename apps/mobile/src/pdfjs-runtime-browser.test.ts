@@ -96,10 +96,14 @@ describe("bundled mobile pdf.js browser runtime", () => {
       expect(quartz.y).toBeGreaterThan(canvas.y);
       expect(quartz.y + quartz.height).toBeLessThan(canvas.y + canvas.height);
 
-      await page.mouse.dblclick(quartz.x + quartz.width / 2, quartz.y + quartz.height / 2);
-      expect(await page.evaluate(() => window.getSelection()?.toString())).toBe("Quartz");
+      const center = { x: quartz.x + quartz.width / 2, y: quartz.y + quartz.height / 2 };
+      expect(await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.textContent, center)).toBe("Quartz River");
+      await page.mouse.dblclick(center.x, center.y);
+      const selectedText = await page.evaluate(() => window.getSelection()?.toString());
+      // Chromium on Windows includes the following space when selecting the word.
+      expect(selectedText).toMatch(/^Quartz ?$/u);
       await page.keyboard.press("ControlOrMeta+c");
-      await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe("Quartz");
+      await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(selectedText);
       expect(externalRequests).toEqual([]);
     } finally { await browser.close(); }
   }, 35_000);

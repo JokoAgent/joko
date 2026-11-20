@@ -100,6 +100,7 @@ export interface FixtureOptions {
   readonly dictionaryPeerMulticastPort?: number;
   /** Rebind the same public address for paired-client restart and offline-cache journeys. */
   readonly publicPort?: number;
+  readonly observeIdentityTransport?: (effect: "linkspan_upgrade" | "server_info", status?: number) => void;
   /** Bind explicitly enabled private-LAN HTTP to one fixture-owned host interface. */
   readonly publicLanHost?: string;
   readonly terminals?: OrchestratorApplication["terminals"];
@@ -639,6 +640,17 @@ export class OrchestratorE2eFixture {
     };
     const server = await createPublicServer(application);
     server.log.level = "silent";
+    if (options.observeIdentityTransport) {
+      const observe = options.observeIdentityTransport;
+      server.server.on("upgrade", (request) => {
+        if (request.url === "/_linkspan") observe("linkspan_upgrade");
+      });
+      server.server.on("request", (request, response) => {
+        if (request.method === "POST" && request.url === "/joko.v1.ConnectionService/GetServerInfo") {
+          response.once("finish", () => observe("server_info", response.statusCode));
+        }
+      });
+    }
     await server.listen({ host: publicHost, port: publicPort });
     const address = server.server.address();
     if (address === null || typeof address === "string") throw new Error("Fastify did not expose an ephemeral TCP port.");

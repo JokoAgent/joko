@@ -1,4 +1,5 @@
 import Foundation
+import Vision
 import XCTest
 
 // Real accessibility interactions with the shipped connection WebView. No
@@ -186,29 +187,83 @@ final class JokoConnectionUITests: XCTestCase {
         }
     }
 
-    private func dismissQuickPathIfPresent(until deadline: Date) {
+    @discardableResult
+    private func dismissQuickPathIfPresent(until deadline: Date, checkSystemScreen: Bool = false) -> Bool {
         let guideText = "Speed up your typing by sliding your finger across the letters to compose a word."
         let guide = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", guideText)).firstMatch
-        guard guide.exists else { return }
-        let proceed = app.buttons.matching(NSPredicate(format: "label == %@", "Continue")).firstMatch
-        XCTAssertTrue(proceed.waitForExistence(timeout: max(0, deadline.timeIntervalSinceNow)))
-        guard proceed.exists && proceed.isHittable else {
-            XCTFail("The exact QuickPath guide must expose its native Continue button.")
-            return
+        let dismissed: Bool
+        let source: String
+        if guide.exists {
+            let proceed = app.buttons.matching(NSPredicate(format: "label == %@", "Continue")).firstMatch
+            XCTAssertTrue(proceed.waitForExistence(timeout: max(0, deadline.timeIntervalSinceNow)))
+            guard proceed.exists && proceed.isHittable else {
+                XCTFail("The exact QuickPath guide must expose its native Continue button.")
+                return false
+            }
+            proceed.tap()
+            let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: guide)
+            dismissed = XCTWaiter.wait(for: [gone], timeout: max(0, deadline.timeIntervalSinceNow)) == .completed
+            source = "application-accessibility"
+        } else {
+            // The fresh Simulator can show QuickPath outside the application's
+            // accessibility tree. Use the screen only for the first public address.
+            guard checkSystemScreen, deadline.timeIntervalSinceNow > 0,
+                  let observed = quickPathOnScreen(guideText), observed.guideVisible else { return false }
+            guard let proceed = observed.continueButton, deadline.timeIntervalSinceNow > 0 else {
+                XCTFail("The exact QuickPath guide must expose one visible Continue button below its text.")
+                return false
+            }
+            app.coordinate(withNormalizedOffset: CGVector(dx: proceed.midX, dy: 1 - proceed.midY)).tap()
+            var guideDisappeared = false
+            while deadline.timeIntervalSinceNow > 0 {
+                if let current = quickPathOnScreen(guideText), !current.guideVisible {
+                    guideDisappeared = true
+                    break
+                }
+                Thread.sleep(forTimeInterval: min(0.2, max(0, deadline.timeIntervalSinceNow)))
+            }
+            dismissed = guideDisappeared
+            source = "system-screen"
+            if dismissed { reportCheckpoint("04-address-quickpath-dismissed") }
         }
-        proceed.tap()
-        let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: guide)
-        let result = XCTWaiter.wait(for: [dismissed], timeout: max(0, deadline.timeIntervalSinceNow))
         let receipt: [String: Any] = ["scope": "owned-native-quickpath-guide-only",
-            "guideText": guideText, "button": "Continue", "dismissed": result == .completed]
+            "guideText": guideText, "button": "Continue", "dismissed": dismissed, "source": source]
         if let data = try? JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys]) {
             let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
             attachment.name = "native-quickpath-guide-handled"
             attachment.lifetime = .keepAlways
             add(attachment)
         }
-        XCTAssertEqual(result, .completed,
-                       "The exact QuickPath guide must disappear after Continue.")
+        XCTAssertTrue(dismissed, "The exact QuickPath guide must disappear after Continue.")
+        return dismissed
+    }
+
+    private func quickPathOnScreen(_ guideText: String) -> (guideVisible: Bool, continueButton: CGRect?)? {
+        guard let screenshot = XCUIScreen.main.screenshot().image.cgImage else { return nil }
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.recognitionLanguages = ["en-US"]
+        request.usesLanguageCorrection = false
+        do { try VNImageRequestHandler(cgImage: screenshot).perform([request]) }
+        catch { return nil }
+        let lines = (request.results ?? []).compactMap { observation -> (text: String, bounds: CGRect)? in
+            let bounds = observation.boundingBox
+            guard bounds.midY < 0.4, let candidate = observation.topCandidates(1).first else { return nil }
+            return (candidate.string.split(whereSeparator: \.isWhitespace).joined(separator: " "), bounds)
+        }.sorted { $0.bounds.midY > $1.bounds.midY }
+        let guideWords = guideText.split(separator: " ")
+        for index in lines.indices {
+            var words: [Substring] = []
+            for line in lines[index...] {
+                words.append(contentsOf: line.text.split(separator: " "))
+                guard guideWords.starts(with: words) else { break }
+                if words == guideWords {
+                    let buttons = lines.filter { $0.text == "Continue" && $0.bounds.maxY < line.bounds.minY }
+                    return (true, buttons.count == 1 ? buttons[0].bounds : nil)
+                }
+            }
+        }
+        return (false, nil)
     }
 
     private func recordPublicInputMismatch(_ field: XCUIElement, expected text: String, knownPublicInvitation: Bool,
@@ -255,7 +310,7 @@ final class JokoConnectionUITests: XCTestCase {
             tap(field, atCenter: true)
         }
         let keyboardReady = field.hasFocus || keyboard.waitForExistence(timeout: max(0, focusDeadline.timeIntervalSinceNow))
-        dismissQuickPathIfPresent(until: focusDeadline)
+        dismissQuickPathIfPresent(until: focusDeadline, checkSystemScreen: traceFirstAddressEntry && keyboardReady)
         let readyToType = field.hasFocus || (keyboardReady && keyboard.exists)
         if !readyToType { recordPublicInputMismatch(field, expected: text, knownPublicInvitation: knownPublicInvitation, stage: "focus") }
         XCTAssertTrue(readyToType, "Tapping the native field must make text input available.")
@@ -289,19 +344,30 @@ final class JokoConnectionUITests: XCTestCase {
         field.typeText(text)
         if traceFirstAddressEntry { reportCheckpoint("04-address-typed") }
         let valueDeadline = Date().addingTimeInterval(10)
-        dismissQuickPathIfPresent(until: valueDeadline)
-        // The native guide can appear after typing has returned. Observe it
-        // between value checks inside the original deadline, without sending
-        // the input again or accepting the stale placeholder as a typed value.
-        // Read the actual field between waits: a short wait's timeout must not
-        // override a value that already matches the exact requested input.
-        var valueMatches = (field.value as? String) == text
-        while !valueMatches && valueDeadline.timeIntervalSinceNow > 0 {
-            dismissQuickPathIfPresent(until: valueDeadline)
+        var restoredFirstEntry = false
+        var valueMatches: Bool
+        repeat {
+            let dismissedGuide = dismissQuickPathIfPresent(until: valueDeadline,
+                checkSystemScreen: traceFirstAddressEntry && (field.value as? String) != text)
             let changed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", text), object: field)
-            _ = XCTWaiter.wait(for: [changed], timeout: min(1, max(0, valueDeadline.timeIntervalSinceNow)))
+            let remaining = valueDeadline.timeIntervalSinceNow
+            if remaining > 0 && (field.value as? String) != text {
+                _ = XCTWaiter.wait(for: [changed], timeout: min(1, remaining))
+            }
+            // The one-time system guide can consume the first public fixture
+            // address. Type it once more only if the guide was observed and
+            // dismissed and the exact field still contains no typed text.
+            if traceFirstAddressEntry && dismissedGuide && !restoredFirstEntry && valueDeadline.timeIntervalSinceNow > 0,
+               let observed = field.value as? String, observed.isEmpty || observed == placeholder {
+                if !field.hasFocus { tap(field, atCenter: true) }
+                if valueDeadline.timeIntervalSinceNow > 0 && (field.hasFocus || keyboard.exists) {
+                    restoredFirstEntry = true
+                    field.typeText(text)
+                    reportCheckpoint("04-address-retyped")
+                }
+            }
             valueMatches = (field.value as? String) == text
-        }
+        } while !valueMatches && valueDeadline.timeIntervalSinceNow > 0
         if !valueMatches { recordPublicInputMismatch(field, expected: text, knownPublicInvitation: knownPublicInvitation, stage: "replace") }
         XCTAssertTrue(valueMatches, "The native field must contain the exact requested value.")
         // The URL keyboard's real Done accessory dismisses it. On a layout
@@ -367,15 +433,18 @@ final class JokoConnectionUITests: XCTestCase {
         return try XCTUnwrap(nil as [String: String]?, "The owned PDF task fixture must return the expected input.")
     }
 
-    private func textMenuAction(_ label: String) throws -> XCUIElement {
-        let deadline = Date().addingTimeInterval(10)
+    private func visibleTextMenuAction(_ label: String, timeout: TimeInterval = 10) -> XCUIElement? {
+        let deadline = Date().addingTimeInterval(timeout)
+        let exactLabel = NSPredicate(format: "label == %@", label)
         repeat {
-            for action in [app.menuItems[label].firstMatch, app.buttons[label].firstMatch] {
+            let actionInMenu = app.menuItems.matching(exactLabel).firstMatch
+            let actionInApplication = app.descendants(matching: .any).matching(exactLabel).firstMatch
+            for action in [actionInMenu, actionInApplication] {
                 if action.exists && action.isHittable { return action }
             }
             Thread.sleep(forTimeInterval: 0.25)
         } while Date() < deadline
-        return try XCTUnwrap(nil as XCUIElement?, "The system text menu must offer \(label).")
+        return nil
     }
 
     private func copyOriginalWorkspacePdf(_ inputs: [String: String]) throws {
@@ -386,9 +455,17 @@ final class JokoConnectionUITests: XCTestCase {
         let pin = connectionPage.textViews["Trusted node invitation or public key"].firstMatch
         XCTAssertTrue(pin.waitForExistence(timeout: 10))
         replace(pin, with: key)
-        tap(button("Check node identity"))
+        reportCheckpoint("11-pdf-address-and-key-confirmed")
+        let inspect = button("Check node identity")
+        wait(inspect, "enabled == true")
+        tap(inspect, atCenter: true)
+        reportCheckpoint("11-pdf-identity-check-tapped")
+        let identity = connectionPage.staticTexts["Identity: ios-workspace-pdf"].firstMatch
+        XCTAssertTrue(identity.waitForExistence(timeout: 25), "The owned PDF node identity was not shown after the native check.")
+        reportCheckpoint("11-pdf-identity-confirmed")
         let request = button("Request pairing")
         wait(request, "enabled == true")
+        reportCheckpoint("11-pdf-pairing-available")
         tap(request)
         let pairing = try XCTUnwrap(pdfFixtureInput("ci-pdf-pairing-code", waitForCode: true))
         let code = try XCTUnwrap(pairing["code"])
@@ -401,25 +478,43 @@ final class JokoConnectionUITests: XCTestCase {
         XCTAssertTrue(task.waitForExistence(timeout: 35))
         tap(task)
         let link = app.links["Reference PDF"].firstMatch
-        XCTAssertTrue(link.waitForExistence(timeout: 25))
+        XCTAssertTrue(link.waitForExistence(timeout: 25), "The original task must display its Workspace PDF link.")
+        reportCheckpoint("11-pdf-task-link-visible")
         tap(link)
+        reportCheckpoint("11-pdf-task-link-tapped")
         let word = app.webViews.staticTexts["Quartz"].firstMatch
-        XCTAssertTrue(word.waitForExistence(timeout: 35))
+        XCTAssertTrue(word.waitForExistence(timeout: 35), "The actual PDF page must expose the Quartz text span.")
         XCTAssertTrue(word.isHittable)
+        XCTAssertLessThan(word.frame.width, app.windows.firstMatch.frame.width / 2)
         XCTAssertTrue(app.buttons["Fit PDF pages to width"].firstMatch.exists)
         screenshot("11-original-workspace-pdf")
-        word.press(forDuration: 0.8)
-        let copy = try textMenuAction("Copy")
+        let backToFiles = app.buttons["Back to Files"].firstMatch
+        XCTAssertTrue(backToFiles.isHittable)
+        // The header already has 16 points of padding, and the portrait status bar adds at least 20.
+        XCTAssertGreaterThanOrEqual(backToFiles.frame.minY - app.windows.firstMatch.frame.minY, 36,
+                                    "The PDF preview header must clear the iPhone status bar.")
+        let wordCenter = word.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        wordCenter.press(forDuration: 0.8)
+        screenshot("12-pdf-word-held")
+        var copy = visibleTextMenuAction("Copy", timeout: 2)
+        if copy == nil {
+            // Tapping the selected text can reveal the iOS editing menu.
+            wordCenter.tap()
+            copy = visibleTextMenuAction("Copy")
+        }
+        let copyAction = try XCTUnwrap(copy, "The system text menu must offer Copy.")
         screenshot("12-native-pdf-selection")
-        copy.tap()
+        tap(copyAction, atCenter: true)
 
-        tap(app.buttons["Back to Task"].firstMatch)
+        tap(backToFiles, atCenter: true)
+        tap(app.buttons["Back to Task"].firstMatch, atCenter: true)
         XCTAssertTrue(app.staticTexts["Original workspace PDF task"].firstMatch.waitForExistence(timeout: 10))
         let composer = app.webViews.textViews["Task message"].firstMatch
         XCTAssertTrue(composer.waitForExistence(timeout: 10))
         tap(composer, atCenter: true)
         composer.press(forDuration: 0.8)
-        try textMenuAction("Paste").tap()
+        let paste = try XCTUnwrap(visibleTextMenuAction("Paste"), "The system text menu must offer Paste.")
+        tap(paste, atCenter: true)
         let allowPaste = app.alerts.buttons["Allow Paste"].firstMatch
         if allowPaste.waitForExistence(timeout: 2) { allowPaste.tap() }
         wait(composer, "value == 'Quartz'")

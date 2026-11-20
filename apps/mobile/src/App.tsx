@@ -8893,8 +8893,7 @@ function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sh
     instanceId={preview.leaseId} kind={preview.mediaKind} locale={locale} mediaType={preview.mediaType}
     onStatusChange={setMediaStatus} style={styles.mediaPreview} surface={colors.surface}
     title={preview.title} uri={preview.uri} /> : undefined;
-  return <Modal visible={preview !== undefined} animationType="slide" onRequestClose={requestClose}>
-    <SafeAreaView accessibilityViewIsModal style={[styles.fill, { backgroundColor: colors.background }]}
+  const contents = <SafeAreaView accessibilityViewIsModal style={[styles.fill, { backgroundColor: colors.background }]}
       edges={["top", "bottom", "left", "right"]}>
       {preview && <>
         <View style={[styles.header, { borderBottomColor: colors.border }]}>
@@ -9036,7 +9035,10 @@ function FilePreviewModal({ colors, preview, source, pager, onNavigate, busy, sh
           </View>}
         </MobileFilesPreviewPager>
       </>}
-    </SafeAreaView>
+    </SafeAreaView>;
+  return <Modal visible={preview !== undefined} animationType="slide" onRequestClose={requestClose}>
+    {/* The iOS modal has its own native view hierarchy and safe area. */}
+    {Platform.OS === "ios" ? <SafeAreaProvider>{contents}</SafeAreaProvider> : contents}
   </Modal>;
 }
 
