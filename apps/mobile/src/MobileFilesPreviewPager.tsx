@@ -46,7 +46,7 @@ export function MobileFilesPreviewPager({ pager, colors, locale, disabled, canSw
     const value = event.nativeEvent.layout.width;
     if (current.current === frame && Number.isFinite(value) && value > 0) setLayout({ windowWidth: viewport.width, width: value });
   }}>
-    <FlatList ref={list} style={styles.fill} horizontal pagingEnabled data={pager.pages}
+    <FlatList ref={list} style={styles.fill} horizontal pagingEnabled keyboardShouldPersistTaps="handled" data={pager.pages}
       keyExtractor={(page) => page.key} initialScrollIndex={pager.index}
       getItemLayout={(_data, index) => ({ length: width, offset: width * index, index })}
       extraData={pager.index} initialNumToRender={1} maxToRenderPerBatch={3} windowSize={3}
