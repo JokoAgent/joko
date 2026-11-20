@@ -3386,9 +3386,13 @@ export class SessionHost {
     const session = stored.descriptor;
     const target = this.#store.getTarget(session.targetId).descriptor;
     const remote = session.remoteWorkspace;
+    const adapterKind = this.#store.getBackend(session.backendId).descriptor.adapterKind;
+    const claudeDirectoryUnavailable = remote === undefined && adapterKind === "claude-agent-sdk-stdio"
+      && item.error.code === "WORKSPACE_DIRECTORY_UNAVAILABLE"
+      && item.body.mentions.some(mention => mention.kind === "workspace_directory");
     return target.trusted && (remote === undefined || remote.kind === "ssh")
       && sameRemoteWorkspaceBinding(remote, target.remoteWorkspace)
-      && this.#store.getBackend(session.backendId).descriptor.adapterKind === "codex"
+      && (adapterKind === "codex" || claudeDirectoryUnavailable)
       && this.isOrdinarySession(stored) && !this.isReviewReadOnlySession(item.sessionId)
       && this.#store.findObjective(item.sessionId) === undefined && !this.#providerGroupApplies(item)
       && this.#store.findSetting("session", item.sessionId, `mcp_app_queue:${item.id}`) === undefined

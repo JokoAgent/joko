@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { lstatSync, realpathSync } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { JokoError, NATIVE_PROMPT_IMAGE_MEDIA_TYPES, type AdapterContext, type ArtifactMentionResolver, type BlobRef, type PromptInput } from "@joko/core";
@@ -139,7 +140,8 @@ export async function prepareClaudePrompt(
       throw inputError("WORKSPACE_LINE_RANGE_INVALID", "Workspace line ranges require ordered positive source line numbers.");
     }
     const directory = mention.kind === "workspace_directory";
-    const path = await workspacePath(context.target.workspaceRoot, mention.reference, directory);
+    const { path, assertDirectoryCurrent } = await workspacePath(context.target.workspaceRoot, mention.reference, directory);
+    if (assertDirectoryCurrent !== undefined) mentionAuthorities.push(assertDirectoryCurrent);
     text.push(`Workspace ${directory ? "directory" : "file"} reference: ${JSON.stringify({
       name: mention.label,
       path,
@@ -166,10 +168,13 @@ export async function prepareClaudePrompt(
 }
 
 async function workspaceFile(workspaceRoot: string, value: string): Promise<string> {
-  return workspacePath(workspaceRoot, value, false);
+  return (await workspacePath(workspaceRoot, value, false)).path;
 }
 
-async function workspacePath(workspaceRoot: string, value: string, directory: boolean): Promise<string> {
+async function workspacePath(workspaceRoot: string, value: string, directory: boolean): Promise<{
+  readonly path: string;
+  readonly assertDirectoryCurrent?: () => void;
+}> {
   if (value.length === 0 || value.length > 4_096 || isAbsolute(value) || /[\u0000-\u001f\u007f]/u.test(value)) {
     throw inputError("WORKSPACE_PATH_DENIED", "Workspace references must use a bounded relative path.");
   }
@@ -181,40 +186,53 @@ async function workspacePath(workspaceRoot: string, value: string, directory: bo
   }
   const candidate = resolve(root, value);
   if (!inside(root, candidate)) throw inputError("WORKSPACE_PATH_DENIED", "A file reference is outside the current workspace.");
-  const path = await regularPath(candidate, directory);
+  const { path, dev, ino } = await regularPath(candidate, directory);
   if (!inside(root, path)) throw inputError("WORKSPACE_PATH_DENIED", "A file reference resolves outside the current workspace.");
   const currentRoot = await realpath(workspaceRoot).catch(() => undefined);
   const currentPath = await realpath(candidate).catch(() => undefined);
   if (currentRoot !== root || currentPath !== path) {
+    if (directory) throw directoryUnavailable();
     throw inputError("WORKSPACE_PATH_DENIED", "A workspace reference changed while its path was resolved.");
   }
-  return path;
+  if (!directory) return { path };
+  return { path, assertDirectoryCurrent: () => {
+    // The SDK input iterator calls this synchronously immediately before it
+    // hands off the prepared description of the selected directory.
+    try {
+      const current = lstatSync(candidate, { bigint: true });
+      if (current.isDirectory() && current.dev === dev && current.ino === ino
+        && realpathSync(workspaceRoot) === root && realpathSync(candidate) === path) return;
+    } catch { /* The original directory cannot currently be resolved. */ }
+    throw directoryUnavailable();
+  } };
 }
 
 async function regularFile(value: string): Promise<string> {
-  return regularPath(value, false);
+  return (await regularPath(value, false)).path;
 }
 
-async function regularPath(value: string, directory: boolean): Promise<string> {
+async function regularPath(value: string, directory: boolean): Promise<{
+  readonly path: string;
+  readonly dev: bigint;
+  readonly ino: bigint;
+}> {
   if (!isAbsolute(value)) throw inputError("FILE_UNSAFE", "The file resolver did not return an absolute path.");
-  const before = await lstat(value).catch(() => {
+  const unavailable = (error: NodeJS.ErrnoException): never => {
+    if (directory && (error.code === "ENOENT" || error.code === "ENOTDIR")) throw directoryUnavailable();
     throw inputError("FILE_UNAVAILABLE", "A referenced file is unavailable.");
-  });
+  };
+  const before = await lstat(value, { bigint: true }).catch(unavailable);
   if (!(directory ? before.isDirectory() : before.isFile()) || before.isSymbolicLink()) {
     throw inputError("FILE_UNSAFE", "A workspace reference does not match its declared file or directory kind.");
   }
-  if (!directory && before.size > MAXIMUM_FILE_BYTES) throw inputError("FILE_TOO_LARGE", "A referenced file exceeds the native input size limit.");
-  const canonical = await realpath(value).catch(() => {
-    throw inputError("FILE_UNAVAILABLE", "A referenced file is unavailable.");
-  });
-  const after = await lstat(canonical).catch(() => {
-    throw inputError("FILE_UNAVAILABLE", "A referenced file is unavailable.");
-  });
+  if (!directory && before.size > BigInt(MAXIMUM_FILE_BYTES)) throw inputError("FILE_TOO_LARGE", "A referenced file exceeds the native input size limit.");
+  const canonical = await realpath(value).catch(unavailable);
+  const after = await lstat(canonical, { bigint: true }).catch(unavailable);
   if (!(directory ? after.isDirectory() : after.isFile()) || after.isSymbolicLink()
     || before.dev !== after.dev || before.ino !== after.ino) {
     throw inputError("FILE_UNSAFE", "A referenced file changed while its path was resolved.");
   }
-  return canonical;
+  return { path: canonical, dev: after.dev, ino: after.ino };
 }
 
 async function verifyFileContent(path: string, blob: BlobRef, signal: AbortSignal): Promise<void> {
@@ -263,4 +281,11 @@ function inside(root: string, path: string): boolean {
 
 function inputError(code: string, message: string) {
   return claudeCodeError(code, message, "input", { recovery: "Choose valid bounded attachments from the current workspace or Artifact storage and retry." });
+}
+
+function directoryUnavailable() {
+  return claudeCodeError("WORKSPACE_DIRECTORY_UNAVAILABLE", "The selected workspace directory is missing or has changed.", "input", {
+    retryable: true,
+    recovery: "Restore the directory and retry the original input."
+  });
 }

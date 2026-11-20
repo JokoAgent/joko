@@ -1,14 +1,14 @@
-import { mkdir, realpath } from "node:fs/promises";
+import { mkdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { create } from "@bufbuild/protobuf";
 import { ClaudeCodeAdapter } from "@joko/adapter-claude-code";
-import { capabilityNames, ExtraDirectoryAccess, OperationMutationSchema, OperationState, PerTurnOverridesSchema, StateImpact } from "@joko/contracts";
+import { capabilityNames, EntityKind, ExtraDirectoryAccess, InputPartSchema, OperationMutationSchema, OperationPreconditionSchema, OperationState, PerTurnOverridesSchema, QueueItemState, StateImpact } from "@joko/contracts";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { ControlledClaudeRuntime } from "./controlled-claude-runtime.js";
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
-import { createSessionMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
+import { createSessionMutation, queueItemIdFrom, queueRunIdFrom, retryRunMutation, runIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 
 const BACKEND_ID = "claude-directory-product";
 let fixture: OrchestratorE2eFixture | undefined;
@@ -158,6 +158,68 @@ it("rejects a new read-only approval and keeps an existing record out of the Cla
   await expect(setup.remove(retained.id)).resolves.toMatchObject({ state: OperationState.SUCCEEDED });
   expect(host.extraDirectories.listForTarget(targetId).map(directory => directory.path)).toEqual([firstPath]);
 }, 30_000);
+
+it.each(["missing before preparation", "replaced during the native history read"] as const)(
+  "retries the original Claude directory input when its directory was %s", async (failure) => {
+    const setup = await directoryFixture();
+    const { paired, runtime, store } = setup;
+    const sessionId = await setup.createSession("Claude referenced directory");
+    const binding = store.getSession(sessionId).descriptor.binding;
+    const query = runtime.queries[0]!;
+    const firstRun = await setup.send(sessionId, "Keep the original Claude context");
+    await waitFor(async () => store.getRun(firstRun).descriptor.state, state => state === "running", "original Claude Run");
+    query.complete("Original Claude turn completed.");
+    await waitFor(async () => store.getRun(firstRun).descriptor.state, state => state === "completed", "original Claude completion");
+
+    const docs = join(fixture!.workspaceDirectory, "docs");
+    const preserved = join(fixture!.workspaceDirectory, "original-docs");
+    await mkdir(docs);
+    if (failure === "missing before preparation") {
+      await rename(docs, preserved);
+    } else {
+      const readHistory = runtime.getSessionMessages.bind(runtime);
+      vi.spyOn(runtime, "getSessionMessages").mockImplementationOnce(async (...args) => {
+        await rename(docs, preserved);
+        await writeFile(docs, "A replacement regular file");
+        return await readHistory(...args);
+      });
+    }
+    const mutation = sendInputMutation(sessionId, BigInt(binding.generation), "Inspect the selected docs directory");
+    if (mutation.payload.case !== "sendInput") throw new Error("Expected the original directory input.");
+    mutation.payload.value.input!.parts.push(create(InputPartSchema, { content: { case: "workspaceMention", value: {
+      workspaceId: "workspace-main", relativePath: "docs", displayText: "docs", directory: true
+    } } }));
+    const accepted = await submit(paired.clients.operation, paired.connectionId, mutation);
+    expect(accepted.state).toBe(OperationState.SUCCEEDED);
+    const queueItemId = queueItemIdFrom(accepted), runId = queueRunIdFrom(accepted);
+    const list = async () => (await paired.clients.queue.listQueueItems({ sessionId })).queueItems;
+    const original = await waitFor(async () => (await list()).find(item => item.queueItemId === queueItemId),
+      item => item?.state === QueueItemState.FAILED, "the original known failed directory input");
+    expect(original).toMatchObject({ runId, retryBeforeDispatch: true, error: { code: "WORKSPACE_DIRECTORY_UNAVAILABLE", retryable: true } });
+    expect(store.getQueueItem(queueItemId).error).toMatchObject({ stateMayHaveChanged: false });
+    expect(query.receivedInputs).toHaveLength(1);
+
+    if (failure === "replaced during the native history read") await unlink(docs);
+    await rename(preserved, docs);
+    const retry = retryRunMutation(runId);
+    retry.preconditions.push(create(OperationPreconditionSchema, {
+      entity: { kind: EntityKind.QUEUE_ITEM, id: queueItemId },
+      expectedRevision: original!.version!.revision!, expectedGeneration: original!.version!.generation
+    }));
+    const continued = await submit(paired.clients.operation, paired.connectionId, retry);
+    expect(continued.state).toBe(OperationState.SUCCEEDED);
+    const continuation = runIdFrom(continued);
+    await waitFor(async () => store.getRun(continuation).descriptor.state, state => state === "running", "exact directory retry");
+    expect(store.getRun(continuation).descriptor.parentRunId).toBe(runId);
+    expect(store.getSession(sessionId).descriptor.binding).toEqual(binding);
+    expect(query.receivedInputs).toHaveLength(2);
+    expect(query.receivedInputs[1]!.message.content).toBe([
+      "Inspect the selected docs directory",
+      `Workspace directory reference: ${JSON.stringify({ name: "docs", path: await realpath(docs) })}`
+    ].join("\n\n"));
+    query.complete("The restored directory was used once.");
+    await waitFor(async () => store.getRun(continuation).descriptor.state, state => state === "completed", "directory retry completion");
+  }, 30_000);
 
 async function directoryFixture() {
   const runtime = new ControlledClaudeRuntime();
