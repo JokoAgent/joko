@@ -58,6 +58,17 @@ jobs:
       - name: Use the canonical temporary directory for service fixtures
         run: |
           node -e "const fs=require('node:fs'); const os=require('node:os'); const canonical=fs.realpathSync.native(os.tmpdir()); fs.appendFileSync(process.env.GITHUB_ENV,['TMPDIR='+canonical,'TMP='+canonical,'TEMP='+canonical,''].join('\n'));"
+      - name: Install ripgrep for actual remote workspace searches
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          apt_sources=(-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=-)
+          if ! command -v rg; then
+            sudo apt-get "${apt_sources[@]}" update --error-on=any
+            sudo apt-get "${apt_sources[@]}" install --no-install-recommends --yes ripgrep
+          fi
+          rg --version
       - name: Prepare Linkspan from remote main
         run: node scripts/prepare-linkspan.mjs
       - name: Build the actual service dependency closure
@@ -100,6 +111,11 @@ jobs:
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' && runner.os == 'Linux' }}
         shell: bash
         run: pnpm --filter @joko/adapter-pi exec vitest run src/adapter.test.ts -t 'keeps the configured npm symlink for the local probe and stages its published bundle for SSH' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/pi-launcher.log"
+      - name: Check actual remote Review and workspace search
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' && runner.os == 'Linux' }}
+        working-directory: apps/orchestrator
+        shell: bash
+        run: pnpm exec vitest run src/remote-workspace-regressions.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/remote-workspace.log"
       - name: Check the reproduced service boundaries and recovery failures
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
         working-directory: apps/orchestrator
@@ -115,7 +131,7 @@ jobs:
           src/model-favorite-settings.test.ts
           src/partner-autonomy.test.ts src/partner-messaging.test.ts src/partner-network-plan-runtime.test.ts
           src/hosted-agent-guest-peer-workflow.test.ts src/provider-group-hosted-lifecycle.test.ts src/provider-group-session-host.test.ts src/provider-group-source-native.test.ts src/provider-sharing-service.test.ts
-          src/remote-pi-broker-source.test.ts src/remote-pi-process.test.ts src/remote-workspace-service.test.ts src/remote-workspace-regressions.test.ts src/workspace-service.git-review.test.ts src/scheduler.test.ts
+          src/remote-pi-broker-source.test.ts src/remote-pi-process.test.ts src/remote-workspace-service.test.ts src/workspace-service.git-review.test.ts src/scheduler.test.ts
           src/remote-skill-input-system.test.ts
           src/session-lifecycle.test.ts src/session-worktree-coordinator.test.ts
           src/voice-conversation/dashscope-voices.test.ts src/voice-conversation/manager.test.ts
