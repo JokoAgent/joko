@@ -131,7 +131,7 @@ async function mount(options: { unavailable?: boolean; pending?: boolean; sendFa
   let snapshot: AppSnapshot = { ...emptySnapshot(), generation: 2n,
     backends: [{ id: "backend", name: "Backend", version: "1", health: "healthy", instanceGeneration: 1,
       capabilities: new Map([["input.text", { name: "input.text", supported: true, options: [] }], ["permission.modes", { name: "permission.modes", supported: true, options: ["ask"] }],
-        ["workspace.extra_dirs", { name: "workspace.extra_dirs", supported: true, options: [] }]]) }],
+        ["workspace.extra_dirs", { name: "workspace.extra_dirs", supported: true, options: ["read_only"] }]]) }],
     targets: [{ id: "project", revision: 3n, backendId: "backend", name: "Project", workspaceId: "workspace", workspaceName: "Project", trusted: true, pinned: false, archived: false }],
     resources: [{ id: "extension-resource", backendId: "backend", name: "Document organizer", kind: "package", scope: "global", state: "installed", enabled: true,
       source: "local", discoveredRevision: "sha256:content", compatibilityDetails: [], runtimeRequirements: [], warnings: [], disabledLifecycleScripts: [], canToggle: true, requiresExtensionApproval: false, postMutationNotice: false }],

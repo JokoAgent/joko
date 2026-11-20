@@ -101,7 +101,7 @@ it("requires explicit read-write selection and preserves removal of an unavailab
   expect(button(dialog, "Add").disabled).toBe(true);
   await act(async () => select.click());
   const options = [...document.body.querySelectorAll<HTMLElement>('[role="listbox"] [role="option"]')];
-  expect(options.map(option => option.textContent)).toEqual(["Choose access", "Read write"]);
+  expect(options.map(option => option.textContent)).toEqual(["Choose access", "Read and write"]);
   await act(async () => {
     required(options[1] ?? null).click();
   });

@@ -229,7 +229,9 @@ beforeAll(async () => {
     has: () => true,
     getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: {} })
   }));
-  const nativeModules = ["network", "native-lan-discovery", "native-notifications", "mobile-media-preview", "mobile-pdf-preview", "mobile-model-preview", "mobile-file-share", "mobile-files-thumbnail-cache", "mobile-incoming-share"];
+  vi.doMock("./network", () => ({ mobileNetwork: {}, MOBILE_FILE_SHARE_MAXIMUM_BYTES: 256 * 1024 * 1024,
+    MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES: 32 * 1024 * 1024, assertWorkspaceFilePreview() {} }));
+  const nativeModules = ["native-lan-discovery", "native-notifications", "mobile-media-preview", "mobile-pdf-preview", "mobile-model-preview", "mobile-file-share", "mobile-files-thumbnail-cache", "mobile-incoming-share"];
   for (const name of nativeModules) vi.doMock(`./${name}`, () => new Proxy({}, { get: () => ({}), has: () => true, getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: {} }) }));
   vi.doMock("./mobile-push-controller", () => ({ MobilePushController: class {} }));
   vi.doMock("./mobile-voice-dictionary-readonly-controller", () => ({ MobileVoiceDictionaryReadOnlyController: class {} }));
