@@ -2281,9 +2281,10 @@ export interface UpdateQueueStateInput {
    * Optional current product-generation Attempt used only by the emitted
    * Queue projection. The durable Queue owner remains `attemptId`; this is
    * required when startup recovery observes the exact old dispatch from a new
-   * product Session generation.
+   * product Session generation. Null emits a terminal projection that cannot
+   * use a retired Attempt in the current product generation.
    */
-  readonly projectionAttemptId?: AttemptId;
+  readonly projectionAttemptId?: AttemptId | null;
   readonly attemptId?: AttemptId;
   readonly error?: PublicError;
   readonly at?: UnixMillis;

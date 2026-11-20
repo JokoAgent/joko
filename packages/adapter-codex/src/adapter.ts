@@ -1940,6 +1940,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
   }
 
+  captureSteerTurnId(sessionId: string, owner: import("@joko/core").NativeTurnOwner): string | undefined {
+    const runtime = this.#sessions.get(sessionId);
+    const turnId = runtime?.state.activeTurnId;
+    const context = runtime?.activeTurnContext;
+    return runtime !== undefined && turnId !== undefined && !runtime.routeUnknown
+      && !runtime.state.terminalTurnIds.has(turnId) && context?.generation === owner.generation
+      && context.inputQueueItemId === owner.queueItemId && context.inputAttemptId === owner.attemptId
+      ? turnId : undefined;
+  }
+
   async send(input: PromptInput, context: AdapterContext): Promise<void> {
     return this.#withNativeMutation(context, () => this.#send(input, context));
   }
@@ -2009,7 +2019,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       runtime.dispatchLifetime.signal,
       ...(yieldDispatch === undefined ? [] : [yieldDispatch.signal])
     ]);
-    const expectedTurnId = input.disposition === "steer" ? runtime.state.activeTurnId : undefined;
+    const steerTarget = input.nativeSteerTarget;
+    const expectedTurnId = input.disposition === "steer" ? steerTarget?.nativeTurnId ?? runtime.state.activeTurnId : undefined;
     const assertDispatchReady = () => {
       assertDispatchNotCancelled(dispatchSignal);
       this.#assertRuntimeDispatchFence(runtime, context, hostGeneration);
@@ -2017,7 +2028,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         || yieldDispatch.claim.state !== "starting")) throw yieldContinuationCancelled();
       if (input.disposition === "steer" && (expectedTurnId === undefined
         || runtime.state.activeTurnId !== expectedTurnId
-        || runtime.state.terminalTurnIds.has(expectedTurnId))) {
+        || runtime.state.terminalTurnIds.has(expectedTurnId)
+        || steerTarget !== undefined && this.captureSteerTurnId(context.sessionId, steerTarget) !== expectedTurnId)) {
         throw adapterError({
           code: "CODEX_ACTIVE_TURN_REQUIRED",
           message: "The Codex turn selected for steering is no longer active.",
@@ -6419,6 +6431,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             ? { reason: "not_implemented" as const }
             : {}),
         ...(key === "permission.modes" ? { options: ["ask", "auto", "bypassPermissions"] } : {}),
+        ...(key === "turn.steer" && available && this.#hosted === undefined ? {
+          options: ["same_turn", "files", ...(this.#resolvers.readBlob === undefined ? [] : ["images"])]
+        } : {}),
         ...(key === "session.message_delete" && available ? { options: [SESSION_REWIND_SERVICE_NODE_ONLY_OPTION] } : {}),
         ...(key === "model.fast_mode" ? { options: [
           ...(this.#models.some(model => model.supportsFastMode) ? ["fast"] : []),

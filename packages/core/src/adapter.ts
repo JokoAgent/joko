@@ -656,6 +656,8 @@ export interface NativeSubscriptionAuthority {
 
 export interface BackendAdapter {
   readonly id: string;
+  /** Returns a currently active native turn owned by the specified durable input. */
+  captureSteerTurnId?(sessionId: SessionId, owner: import("./types.js").NativeTurnOwner): string | undefined;
   /** Native execution support, separate from remote HTTP model inference. */
   readonly hostedExecutionCapabilities?: { readonly toolsOnSource: true; readonly isolatedGuests: true };
   /** Text review channels do not implicitly expose plugin one-shot inference. */

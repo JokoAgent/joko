@@ -3617,6 +3617,64 @@ export class SessionHost {
     this.wakeBackendQueues(backendId);
   }
 
+  /** Called by the ordinary Owner queue mutations, before admission or an edit commits. */
+  pinLocalCodexSteer(sessionId: string, prompt: PromptInput, expectedRunId: string | undefined, allowManualPause: boolean): PromptInput {
+    if (prompt.disposition !== "steer") return prompt;
+    const session = this.#store.getSession(sessionId);
+    if (!this.isOrdinaryLocalCodexSession(session)) return prompt;
+    if (expectedRunId === undefined && prompt.nativeSteerTarget !== undefined) return prompt;
+    const runs = expectedRunId === undefined
+      ? listAllRuns(this.#store, { sessionId, activeOnly: true })
+      : [this.#store.getRun(expectedRunId)];
+    for (const { descriptor } of runs) {
+      const target = this.captureLocalCodexSteer(session, descriptor);
+      if (target !== undefined) return { ...prompt, nativeSteerTarget: { ...target, allowManualPause } };
+    }
+    throw inactiveCodexSteerTarget();
+  }
+
+  private captureLocalCodexSteer(session: StoredSession, run: RunDescriptor): Omit<NonNullable<PromptInput["nativeSteerTarget"]>, "allowManualPause"> | undefined {
+    const { id, backendId, binding } = session.descriptor;
+    if (run.sessionId !== id || run.state !== "running" || run.source !== "user"
+      || run.parentRunId !== undefined || run.activeAttemptId === undefined) return undefined;
+    const original = this.#store.findQueueItemByRunId(id, run.id);
+    const active = this.#active.get(id);
+    if (original === undefined || original.state !== "backend_accepted" || original.disposition !== "prompt"
+      || original.attemptId !== run.activeAttemptId || active === undefined || !this.isOwnerRunInput(original)
+      || original.backendInstanceGeneration !== active.backendInstanceGeneration
+      || this.#store.getBackend(backendId).descriptor.instanceGeneration !== active.backendInstanceGeneration) return undefined;
+    const attempt = this.#store.getAttempt(run.activeAttemptId).descriptor;
+    if (attempt.endedAt !== undefined || attempt.generation !== binding.generation) return undefined;
+    const owner = { queueItemId: original.id, attemptId: attempt.id, generation: attempt.generation };
+    const nativeTurnId = active.adapter.captureSteerTurnId?.(id, owner);
+    return nativeTurnId === undefined ? undefined : { ...owner, runId: run.id, nativeTurnId };
+  }
+
+  private isLocalCodexSteerCurrent(sessionId: string, target: NonNullable<PromptInput["nativeSteerTarget"]>): boolean {
+    const session = this.#store.getSession(sessionId);
+    const run = this.#store.findRun(target.runId)?.descriptor;
+    const live = run === undefined || !this.isOrdinaryLocalCodexSession(session) ? undefined : this.captureLocalCodexSteer(session, run);
+    return live !== undefined && live.queueItemId === target.queueItemId && live.attemptId === target.attemptId
+      && live.generation === target.generation && live.nativeTurnId === target.nativeTurnId;
+  }
+
+  private failRetiredLocalCodexSteer(item: QueueItemRecord): void {
+    this.#store.transaction(store => {
+      const current = store.getQueueItem(item.id);
+      if (current.revision !== item.revision || current.state !== "accepted") return;
+      const attempt = current.attemptId === undefined ? undefined : store.getAttempt(current.attemptId).descriptor;
+      const currentGeneration = store.getSession(item.sessionId).descriptor.binding.generation;
+      const retired = attempt !== undefined && attempt.generation !== currentGeneration;
+      const error = inactiveCodexSteerTarget().publicError;
+      const traceId = `dispatch:${item.id}:original-steer-retired`;
+      store.updateQueueState({ queueItemId: item.id, state: "failed", error, traceId,
+        ...(retired ? { projectionAttemptId: null } : {}) });
+      store.updateRunState({ runId: item.runId, state: "failed", error, traceId, operationId: item.operationId,
+        ...(attempt === undefined || retired ? {} : { activeAttemptId: attempt.id }) });
+      if (attempt !== undefined) store.finishAttempt(attempt.id, error);
+    });
+  }
+
   /** Called inside the caller's authorized Store transaction; no adapter effects run here. */
   canShareSession(sessionId: string): boolean {
     this.#assertOpen();
@@ -7963,8 +8021,10 @@ export class SessionHost {
     const attachments = sameQueuePublicAttachments(current.body, proposed)
       ? { images: current.body.images, files: current.body.files }
       : this.canonicalQueueAttachmentEdit(current, proposed, attachmentEditGeneration);
+    const { nativeSteerTarget, ...currentBody } = current.body;
+    const steer = proposed.disposition === "steer" && nativeSteerTarget !== undefined ? { nativeSteerTarget } : {};
     if (textSplices.length === 0 && sameQueuePublicText(current.body, proposed)) {
-      return { ...current.body, ...attachments, disposition: proposed.disposition };
+      return { ...currentBody, ...attachments, ...steer, disposition: proposed.disposition };
     }
     if (proposed.quotesEncoded === true) {
       throw inputCapabilityError(
@@ -8068,6 +8128,7 @@ export class SessionHost {
       artifactReferenceSnapshots: _untrustedArtifactSnapshots,
       automaticContinuation: _untrustedContinuation,
       objectiveContinuation: _untrustedObjectiveContinuation,
+      nativeSteerTarget: _untrustedNativeSteerTarget,
       inputHandoffContinuation: _untrustedInputHandoffContinuation,
       quotesEncoded: _untrustedQuotesEncoded,
       pastedTextRanges: _untrustedPastedTextRanges,
@@ -8082,6 +8143,7 @@ export class SessionHost {
       ...publicProposal,
       text: replayed.text,
       ...attachments,
+      ...steer,
       ...(current.body.replyQuote ? { replyQuote: current.body.replyQuote } : {}),
       ...(current.body.todoQuote ? { todoQuote: current.body.todoQuote } : {}),
       ...(current.body.messagingOrigin ? { messagingOrigin: current.body.messagingOrigin } : {}),
@@ -15184,6 +15246,13 @@ export class SessionHost {
     });
   }
 
+  private nextQueueItemForDispatch(sessionId: string): QueueItemRecord | undefined {
+    const control = this.#store.getQueueControl(sessionId);
+    if (control.paused && (control.pausedByConnectionId === undefined || control.resumeOnUserInput)) return undefined;
+    return this.#store.findAcceptedNativeSteer(sessionId, control.paused)
+      ?? (control.paused ? undefined : this.#store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0]);
+  }
+
   private async drain(sessionId: string): Promise<void> {
     // This synchronous prelude also runs when an older dispatcher still owns
     // the per-Session settlement. Newly committed work must become a durable
@@ -15235,12 +15304,12 @@ export class SessionHost {
           || this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined
           || this.#backendDispatchBlocked(this.#store.getSession(sessionId).descriptor.backendId)
         ) return;
-        // claimNextQueueItem intentionally returns undefined while paused. Exit
-        // instead of polling a durable control state in a synchronous loop;
-        // resumeQueue explicitly wakes this session after its commit.
-        if (this.#store.getQueueControl(sessionId).paused) return;
-        let pending = this.#store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0];
+        let pending = this.nextQueueItemForDispatch(sessionId);
         if (pending === undefined) return;
+        if (pending.body.nativeSteerTarget !== undefined && !this.isLocalCodexSteerCurrent(sessionId, pending.body.nativeSteerTarget)) {
+          this.failRetiredLocalCodexSteer(pending);
+          continue;
+        }
         if (this.localCodexPlanReviewBlocksDispatch(this.#store.getSession(sessionId))) return;
         if (this.#store.findMessagingInboundRequestByRunId(pending.runId)?.protectedContent === true
           && !this.#protectedMessagingPrompts.has(pending.id)) {
@@ -15253,7 +15322,7 @@ export class SessionHost {
           this.#failExpiredApplicationInput(pending);
           continue;
         }
-        if (this.#providerGroupApplies(pending)) {
+        if (pending.body.nativeSteerTarget === undefined && this.#providerGroupApplies(pending)) {
           if (listAllRuns(this.#store, { sessionId, activeOnly: true }).some(run => run.descriptor.id !== pending!.runId && run.descriptor.state !== "queued")) return;
           try {
             await this.#providerGroups!.service.beforeSend(sessionId, new AbortController().signal, pending.id);
@@ -15277,8 +15346,7 @@ export class SessionHost {
             this.providerGroupSessionPort().status(sessionId, "unavailable");
             this.recordFailure("provider_group_before_send", error); return;
           }
-          if (this.#store.getQueueControl(sessionId).paused) return;
-          pending = this.#store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0]; if (!pending) return;
+          pending = this.nextQueueItemForDispatch(sessionId); if (!pending) return;
         }
         // Authentication is an admission fence, not a turn-serialization
         // concern. Fail a newly durable item before any context rebuild,
@@ -15323,9 +15391,14 @@ export class SessionHost {
         // Inspection yields to queue control, cancellation, reordering, and
         // native events. Re-read every durable precondition, then perform the
         // final barrier check and claim synchronously so they cannot race.
-        if (this.#store.getQueueControl(sessionId).paused || this.restoringTurnOverrides(sessionId)) return;
-        pending = this.#store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0];
+        if (this.restoringTurnOverrides(sessionId)) return;
+        pending = this.nextQueueItemForDispatch(sessionId);
         if (pending === undefined) return;
+        const nativeSteer = pending.body.nativeSteerTarget;
+        if (nativeSteer !== undefined && !this.isLocalCodexSteerCurrent(sessionId, nativeSteer)) {
+          this.failRetiredLocalCodexSteer(pending);
+          continue;
+        }
         // Classification/reordering awaited Backend state. Never let its
         // bypass authorization transfer to a different item that was moved or
         // cancelled concurrently; restart the decision against durable truth.
@@ -15393,6 +15466,7 @@ export class SessionHost {
             return store.claimNextQueueItem({
               sessionId,
               backendInstanceGeneration: claimBackendInstanceGeneration,
+              ...(nativeSteer === undefined ? {} : { nativeSteerQueueItemId: candidate.id }),
               traceId: `dispatch:${candidate.id}`
             });
           });
@@ -15415,7 +15489,7 @@ export class SessionHost {
         try {
           let active: ActiveSession | undefined;
           try {
-            active = await this.activate(
+            active = nativeSteer !== undefined ? this.#active.get(sessionId) : await this.activate(
               sessionId,
               this.effectiveQueueProviderId(item, this.#store.getSession(sessionId))
             );
@@ -15436,6 +15510,7 @@ export class SessionHost {
             }
           }
           dispatchPreparation.cancellation.signal.throwIfAborted();
+          if (nativeSteer !== undefined && !this.isLocalCodexSteerCurrent(sessionId, nativeSteer)) throw inactiveCodexSteerTarget();
           if (active === undefined) throw new Error("Session activation returned no active runtime.");
           this.assertQueueProviderAuthentication(item, this.#store.getSession(sessionId));
           if (
@@ -15486,7 +15561,7 @@ export class SessionHost {
           this.assertQueueProviderAuthentication(item, stored);
           const target = this.targetForSession(stored);
           // The local scanner cannot attest to paths on a Source's Device.
-          if (this.#workspaceCapture !== undefined && !reviewReadOnly && !this.isSourceDeviceTarget(target)) {
+          if (this.#workspaceCapture !== undefined && !reviewReadOnly && nativeSteer === undefined && !this.isSourceDeviceTarget(target)) {
             let navigationAnchor: import("@joko/core").NativeNavigationAnchor | undefined;
             if (active.adapter.getNativeHistoryProjection !== undefined) {
               const captureLease = this.beginActiveBackendSideEffect(sessionId, active);
@@ -15697,7 +15772,7 @@ export class SessionHost {
           sending.documentPathDispatch = this.#captureDocumentPathDispatch(item, sending, stored, sendContext);
           const pendingAcceptance: PendingDispatchAcceptance = {};
           this.#pendingDispatchAcceptances.set(run.descriptor.id, pendingAcceptance);
-          if (!reviewReadOnly) {
+          if (!reviewReadOnly && nativeSteer === undefined) {
             const profile = this.getSessionRuntimeControl(sessionId).effective;
             if (profile) this.#captureProviderGroupUsage(run.descriptor.id, sessionId, item.executionOverrides?.providerId && item.executionOverrides.modelId
               ? { ...profile, providerId: item.executionOverrides.providerId, modelId: item.executionOverrides.modelId } : profile);
@@ -15709,6 +15784,7 @@ export class SessionHost {
             ? scheduleNativeSubscriptionKey(scheduleAdmission.body["executionSnapshot"]) : undefined;
           const send = () => {
             telegramHistory?.assertCurrent();
+            if (nativeSteer !== undefined && !this.isLocalCodexSteerCurrent(sessionId, nativeSteer)) throw inactiveCodexSteerTarget();
             if (!reviewReadOnly && sending.adapter.sendWithDurableNativeDispatchFence !== undefined) {
               return sending.adapter.sendWithDurableNativeDispatchFence(dispatchBody, sendContext, async (preparation) => {
                 if (scheduleAccountKey !== undefined) {
@@ -15785,6 +15861,16 @@ export class SessionHost {
                 resources: dispatchResources,
                 mentions: dispatchBody.mentions
               });
+            }
+            if (nativeSteer !== undefined) {
+              // The steer acknowledged delivery into an existing turn. Only
+              // that turn's original Run owns any later native completion.
+              const traceId = `dispatch:${item.id}:steered`;
+              store.updateQueueState({ queueItemId: item.id, state: "completed", attemptId, traceId });
+              store.updateRunState({ runId: run.descriptor.id, state: "completed", activeAttemptId: attemptId,
+                endedAt: Date.now(), traceId, operationId: item.operationId, suppressTerminalAttention: true });
+              if (attemptId !== undefined) store.finishAttempt(attemptId);
+              removeNativeDispatchRecoveryEntry(store, sessionId, run.descriptor.id);
             }
           });
           appContext?.consume();
@@ -15877,8 +15963,10 @@ export class SessionHost {
               : "Start a new review after checking provider and artifact availability."
           } : adapterFailure;
           const uncertain = failure.stateMayHaveChanged;
-          this.#providerGroups?.service.turnSettled(sessionId, false);
-          this.#providerGroups?.reporter.leasesChanged();
+          if (nativeSteer === undefined) {
+            this.#providerGroups?.service.turnSettled(sessionId, false);
+            this.#providerGroups?.reporter.leasesChanged();
+          }
           if (dispatchPreparation.phase === "sending" && item.disposition === "steer"
             && error instanceof JokoError && failure.code === "PI_STEER_REQUIRES_ACTIVE_RUN" && !uncertain
             && this.#extensionTargetSteerFallback !== undefined
@@ -21353,6 +21441,14 @@ export function withSessionReferenceCapability(descriptor: BackendDescriptor): B
     ...descriptor,
     capabilities: new Map(descriptor.capabilities).set("input.mention", { ...mention, options })
   };
+}
+
+function inactiveCodexSteerTarget(): JokoError {
+  return new JokoError({
+    code: "CODEX_ACTIVE_TURN_REQUIRED", message: "The original Codex turn selected for steering is no longer active.",
+    phase: "dispatch", retryable: false, stateMayHaveChanged: false,
+    recovery: "Select the current turn or send the input as a new prompt."
+  });
 }
 
 function inputCapabilityError(code: string, message: string): JokoError {

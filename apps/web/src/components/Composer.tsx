@@ -2031,6 +2031,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     const sourceRoute = sendRouteKey;
     const sourceEpoch = sendEpochRef.current;
     const sourceDeliveryMode = modeOverride ?? deliveryMode;
+    const expectedSteerRunId = sourceDeliveryMode === "steer" ? sourceController.captureNativeSteerRunId?.(session.id) : undefined;
     const draftMedia = [...attachments, ...browserComments.map((item) => item.screenshot)];
     const sourceMentions = composerMentionsFromRanges(mentionsRef.current, inlineMentionRangesRef.current);
     const sourceMentionRanges = [...inlineMentionRangesRef.current];
@@ -2209,7 +2210,9 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
           inlineMentionRanges: sourceMentionRanges,
           deliveryMode: sourceDeliveryMode,
           ...(sourceExtraDirectoryIds === undefined ? {} : { extraDirectoryIds: sourceExtraDirectoryIds })
-        }, { expectedGeneration: sourceGeneration, ...(quotaChoice ? { providerGroupRebalance: quotaChoice } : {}) });
+        }, { expectedGeneration: sourceGeneration,
+          ...(expectedSteerRunId === undefined ? {} : { expectedSteerRunId }),
+          ...(quotaChoice ? { providerGroupRebalance: quotaChoice } : {}) });
         if (sourceReplyQuote) clearSentReplyQuote?.(sourceReplyQuote);
         if (sourceTodoQuote) clearSentTodoQuote?.(sourceTodoQuote);
         partnerConversation?.userSent?.();

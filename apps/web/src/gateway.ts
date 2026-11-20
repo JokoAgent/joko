@@ -2360,6 +2360,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   async send(sessionId: string, draft: ComposerDraft, admission: Parameters<OperationApi["send"]>[2]): Promise<void> {
     const scope = this.captureActionScope();
     const expectedGeneration = admission.expectedGeneration;
+    const steerRunId = draft.deliveryMode === "steer"
+      ? admission.expectedSteerRunId === undefined ? this.captureNativeSteerRunId(sessionId) : admission.expectedSteerRunId
+      : undefined;
+    if (steerRunId === null) throw new GatewayError("The original turn selected for steering is no longer active.");
     const edit = admission.messageEdit;
     if (expectedGeneration < 1n || expectedGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new GatewayError("Input requires the source task generation.");
@@ -2511,6 +2515,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       }
     };
     const preconditions: MutationPrecondition[] = [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration }];
+    if (steerRunId !== undefined) preconditions.push({ entity: { kind: EntityKind.RUN, id: steerRunId } });
     if (edit === undefined) {
       await this.submit(payload, false, preconditions, scope.signal);
       return;
@@ -4582,9 +4587,29 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     );
   }
 
-  async steerQueueItemNow(queueItemId: string, lockToken: string): Promise<void> {
+  captureNativeSteerRunId(sessionId: string): string | null | undefined {
+    if (this.#taskSharing !== undefined) return undefined;
+    const snapshot = this.#rawSnapshot;
+    const session = snapshot?.sessions.find(item => item.sessionId === sessionId);
+    if (snapshot === undefined || session?.location?.kind.case !== "serviceNode" || session.archived
+      || session.automationOrigin !== undefined || session.derivationOrigin?.sideChat === true) return undefined;
+    const backend = snapshot.backends.find(item => item.backendId === session.backendId);
+    const steer = backend?.capabilities?.capabilities.find(item => item.name === capabilityNames.turnSteer);
+    if (steer?.support !== CapabilitySupport.SUPPORTED || steer.options?.kind.case !== "turn"
+      || !steer.options.kind.value.sameTurn) return undefined;
+    const runs = snapshot.runs.filter(run => run.sessionId === sessionId && run.state === RunState.RUNNING
+      && snapshot.queueItems.some(item => item.sessionId === sessionId && item.runId === run.runId
+        && item.state === QueueItemState.BACKEND_ACCEPTED && item.deliveryMode === QueueDeliveryMode.PROMPT));
+    return runs.length === 1 ? runs[0]!.runId : null;
+  }
+
+  async steerQueueItemNow(queueItemId: string, lockToken: string, expectedSteerRunId?: string | null): Promise<void> {
     const existing = this.#rawSnapshot?.queueItems.find((item) => item.queueItemId === queueItemId);
     if (existing === undefined) throw new GatewayError("This queued input is no longer available.");
+    const steerRunId = expectedSteerRunId === undefined ? this.captureNativeSteerRunId(existing.sessionId) : expectedSteerRunId;
+    if (steerRunId === null) throw new GatewayError("The original turn selected for steering is no longer active.");
+    const preconditions: MutationPrecondition[] = [queueItemPrecondition(existing)];
+    if (steerRunId !== undefined) preconditions.push({ entity: { kind: EntityKind.RUN, id: steerRunId } });
     await this.submit({
       case: "editQueueItem",
       value: {
@@ -4593,7 +4618,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         deliveryMode: QueueDeliveryMode.STEER,
         lockToken
       }
-    }, true, [queueItemPrecondition(existing)]);
+    }, true, preconditions);
   }
 
   async pauseQueue(sessionId: string, reason = "Paused by user"): Promise<void> {

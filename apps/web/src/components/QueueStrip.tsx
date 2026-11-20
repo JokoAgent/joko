@@ -374,6 +374,12 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, s
     };
   }, [sessionId, controller.setQueueItemEditLock, controller.setQueueInteractionLock]);
   const deliveryUnavailable = supportedDispositions.length === 0;
+  const steerItem = (item: QueueItemView): void => {
+    const expectedRun = controller.captureNativeSteerRunId?.(sessionId);
+    runWithEditLock(item, `steer-now:${item.id}`, (lockToken) => expectedRun === undefined
+      ? controller.steerQueueItemNow(item.id, lockToken)
+      : controller.steerQueueItemNow(item.id, lockToken, expectedRun));
+  };
   useImperativeHandle(actionsRef, () => ({
     steerSole: () => {
       const item = ordered[0];
@@ -382,7 +388,7 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, s
         || !canEditSharedQueueItem(controller.state.sessionAccess, item)
         || editingId !== undefined || editLockRef.current !== undefined || control?.interactionLocked
         || pendingItemIdsRef.current.size > 0 || queueControlPendingRef.current) return false;
-      runWithEditLock(item, `steer-now:${item.id}`, (lockToken) => controller.steerQueueItemNow(item.id, lockToken));
+      steerItem(item);
       return true;
     }
   }));
@@ -440,7 +446,7 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, s
                 || !userEditable || !steerSupported || blocked || editingId === item.id) return;
               event.preventDefault();
               event.stopPropagation();
-              runWithEditLock(item, `steer-now:${item.id}`, (lockToken) => controller.steerQueueItemNow(item.id, lockToken));
+              steerItem(item);
             }}
             onDragOver={(event) => {
               if (draggingQueueItemId === undefined || draggingQueueItemId === item.id || !mutable || pending) return;
@@ -534,7 +540,7 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, s
                   const attempt = trackItemAction(item.id, `retry-queue:${item.id}`, () => controller.retry(retryRunId, item));
                   void attempt?.catch(() => undefined);
                 }}>{t("common.retry")}</Button></div></>}
-              {mutable && editingId !== item.id && <div className="queue-strip__actions">{userEditable && <IconButton data-queue-edit label={t("queue.edit")} disabled={blocked || itemDeliveryUnavailable} disabledReason={lockReason ?? (itemDeliveryUnavailable ? t("queue.deliveryUnavailable") : undefined)} onClick={() => beginEdit(item)}><Pencil aria-hidden="true" /></IconButton>}{userEditable && steerSupported && <IconButton label={t("queue.steerNow")} disabled={blocked} disabledReason={lockReason} onClick={() => runWithEditLock(item, `steer-now:${item.id}`, (lockToken) => controller.steerQueueItemNow(item.id, lockToken))}><Zap aria-hidden="true" /></IconButton>}<IconButton label={t("queue.cancel")} disabled={blocked} disabledReason={lockReason} onClick={() => { const promise = trackItemAction(item.id, `cancel-queue:${item.id}`, () => controller.cancelQueueItem(item.id)); void promise?.catch(() => undefined); }}><X aria-hidden="true" /></IconButton></div>}
+              {mutable && editingId !== item.id && <div className="queue-strip__actions">{userEditable && <IconButton data-queue-edit label={t("queue.edit")} disabled={blocked || itemDeliveryUnavailable} disabledReason={lockReason ?? (itemDeliveryUnavailable ? t("queue.deliveryUnavailable") : undefined)} onClick={() => beginEdit(item)}><Pencil aria-hidden="true" /></IconButton>}{userEditable && steerSupported && <IconButton label={t("queue.steerNow")} disabled={blocked} disabledReason={lockReason} onClick={() => steerItem(item)}><Zap aria-hidden="true" /></IconButton>}<IconButton label={t("queue.cancel")} disabled={blocked} disabledReason={lockReason} onClick={() => { const promise = trackItemAction(item.id, `cancel-queue:${item.id}`, () => controller.cancelQueueItem(item.id)); void promise?.catch(() => undefined); }}><X aria-hidden="true" /></IconButton></div>}
             </div>
             {editingId === item.id && <form className="queue-strip__editor" aria-busy={pending || undefined} onSubmit={(event) => {
               event.preventDefault();

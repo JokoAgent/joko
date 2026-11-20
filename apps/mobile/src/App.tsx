@@ -21,7 +21,7 @@ import Constants from "expo-constants";
 import { randomUUID } from "expo-crypto";
 import * as Clipboard from "expo-clipboard";
 import {
-  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, InteractionState, ModelSourceKind, QueueItemState, RuntimeCommandInputMode, SessionState, TargetState, WorkspaceKind, capabilityNames, partnerResumeMessages,
+  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, InteractionState, ModelSourceKind, QueueItemState, QueueSourceKind, RuntimeCommandInputMode, SessionState, TargetState, WorkspaceKind, capabilityNames, partnerResumeMessages,
   partnerSessionTaskMessages, partnerSessionTaskReceiptLabel,
   type QueueItem, type Session
 } from "@joko/contracts";
@@ -4544,6 +4544,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   }, [messageFocusIndex, messageFocusKey, onReadingPositionHandled, readingFocus, readingFocusOwner]);
   const unknown = state.pending.some((item) => item.kind === "send" && item.sessionId === state.selectedId && item.state === "unknown");
   const queueItems = client.taskQueueItems();
+  const queueSteerRunId = client.taskQueueSteerRunId();
   const retryableQueueItems = workerReadOnly ? [] : client.taskRetryableQueueItems();
   const sharedQueueResume = state.taskSource?.kind === "joined" ? client.taskSharedQueueResumeControl() : undefined;
   const composerAvailable = state.status === "connected" || client.canQueueTaskInput?.() === true;
@@ -7765,6 +7766,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
                   .catch(failure => setLocalError(errorText(failure)));
               }} />)}</View>
           <View style={styles.queueActions}>
+            {queueCapabilities.edit && queueSteerRunId !== undefined && item.sourceKind === QueueSourceKind.UI && item.sharedTaskAuthor === undefined
+              && <Action label={mobileMessage(locale, "task.steerQueuedInput")} colors={colors} compact
+                disabled={disabled || editing || item.editLocked}
+                onPress={() => mutateQueue(() => client.steerQueueItemNow(item.queueItemId, queueSteerRunId))} />}
             {queueCapabilities.edit && client.taskQueueItemOwned(item) && <Action label={editing ? mobileMessage(locale, "composer.editing") : mobileMessage(locale, "common.edit")} colors={colors} compact
               disabled={disabled || editing || item.editLocked || editableText === undefined}
               onPress={() => void beginQueueEdit(item)} />}

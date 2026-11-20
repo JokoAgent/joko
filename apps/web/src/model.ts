@@ -6377,6 +6377,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   getVoiceInputSession(voiceInputId: string, signal?: AbortSignal): Promise<VoiceInputSessionView>;
   send(sessionId: string, draft: ComposerDraft, admission: {
     readonly expectedGeneration: bigint;
+    readonly expectedSteerRunId?: string | null;
     readonly providerGroupRebalance?: { readonly suggestionKey: string; readonly remember: boolean };
     readonly messageEdit?: MessageEditRequest & { readonly assertCurrent: () => void };
   }): Promise<void>;
@@ -6531,7 +6532,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   setQueueInteractionLock(sessionId: string, lockToken: string, locked: boolean): Promise<void>;
   editQueueItem(queueItemId: string, edit: QueueItemTextEditView, mode: DeliveryMode, lockToken: string, attachments?: QueueItemAttachmentEditView): Promise<void>;
   reorderQueueItem(queueItemId: string, placement: "first" | "last" | "before" | "after", anchorQueueItemId?: string, interactionLockToken?: string): Promise<void>;
-  steerQueueItemNow(queueItemId: string, lockToken: string): Promise<void>;
+  captureNativeSteerRunId(sessionId: string): string | null | undefined;
+  steerQueueItemNow(queueItemId: string, lockToken: string, expectedSteerRunId?: string | null): Promise<void>;
   pauseQueue(sessionId: string, reason?: string): Promise<void>;
   resumeQueue(sessionId: string): Promise<void>;
   restartBrowser(browserId: string): Promise<void>;

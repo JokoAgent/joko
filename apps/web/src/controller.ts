@@ -2975,6 +2975,7 @@ export function useAppController(): AppController {
       setQueueInteractionLock: (...args: Parameters<AppController["setQueueInteractionLock"]>) => original().setQueueInteractionLock(...args),
       editQueueItem: (...args: Parameters<AppController["editQueueItem"]>) => original().editQueueItem(...args),
       reorderQueueItem: (...args: Parameters<AppController["reorderQueueItem"]>) => original().reorderQueueItem(...args),
+      captureNativeSteerRunId: (sessionId: string) => artifactGateway?.captureNativeSteerRunId(sessionId),
       steerQueueItemNow: (...args: Parameters<AppController["steerQueueItemNow"]>) => original().steerQueueItemNow(...args),
       pauseQueue: (...args: Parameters<AppController["pauseQueue"]>) => original().pauseQueue(...args),
       resumeQueue: (...args: Parameters<AppController["resumeQueue"]>) => original().resumeQueue(...args)

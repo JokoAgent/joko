@@ -18515,10 +18515,15 @@ async function dispatchMutation(
                 phase: "admission", retryable: false, stateMayHaveChanged: false, recovery: "Refresh the original task to see its current input options." });
             }
           }
+          const selectedRun = mutation.preconditions.find(condition => condition.entity?.kind === contract.EntityKind.RUN)?.entity?.id;
+          const boundPrompt = host.pinLocalCodexSteer(payload.value.sessionId, prompt, selectedRun, false);
+          if (boundPrompt.nativeSteerTarget !== undefined && overrides !== undefined) {
+            throw invalidArgument("A same-turn steer keeps the original turn's execution settings.");
+          }
           const queued = host.commitQueuedInput(store, {
             operationId,
             sessionId: payload.value.sessionId,
-            prompt,
+            prompt: boundPrompt,
             restoreArchived: true,
             ...(payload.value.providerGroupRebalance === undefined ? {} : { providerGroupRebalance: payload.value.providerGroupRebalance }),
             ...(overrides === undefined ? {} : { overrides })
@@ -18948,7 +18953,7 @@ async function dispatchMutation(
           if (durableRun.source !== "user" || durableRun.parentRunId !== undefined) {
             throw new StoreError("Only user-created queued input can be edited.");
           }
-          const prompt = dependencies.sessionHost.canonicalQueueItemEdit(durableCurrent, {
+          const canonical = dependencies.sessionHost.canonicalQueueItemEdit(durableCurrent, {
             ...publicPrompt,
             disposition: requestedDisposition ?? durableCurrent.disposition
           }, payload.value.textSplices.map((splice) => ({
@@ -18956,6 +18961,13 @@ async function dispatchMutation(
             end: splice.end,
             replacementText: splice.replacementText
           })), attachmentEditGeneration, true);
+          const selectedRun = mutation.preconditions.find(condition => condition.entity?.kind === contract.EntityKind.RUN)?.entity?.id;
+          const prompt = requestedDisposition === "steer"
+            ? host.pinLocalCodexSteer(durableCurrent.sessionId, canonical, selectedRun, true)
+            : canonical;
+          if (prompt.nativeSteerTarget !== undefined && durableCurrent.executionOverrides !== undefined) {
+            throw invalidArgument("A same-turn steer keeps the original turn's execution settings.");
+          }
           dependencies.sessionHost.assertInputCapabilities(durableCurrent.sessionId, prompt);
           const updated = store.editQueueItem({
             queueItemId: durableCurrent.id,

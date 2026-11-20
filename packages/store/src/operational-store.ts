@@ -10202,6 +10202,18 @@ export class OperationalStore {
     return numberValue(row["count"]);
   }
 
+  findAcceptedNativeSteer(sessionId: string, manualPauseOnly: boolean): QueueItemRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT * FROM queue_items
+      WHERE session_id = ? AND state = 'accepted' AND disposition = 'steer'
+        AND json_type(body_json, '$.nativeSteerTarget') = 'object'
+        AND (? = 0 OR json_extract(body_json, '$.nativeSteerTarget.allowManualPause') = 1)
+      ORDER BY position, created_at, id LIMIT 1
+    `).get(sessionId, manualPauseOnly ? 1 : 0) as Row | undefined;
+    return row === undefined ? undefined : queueItemFromRow(row, this.now());
+  }
+
   hasCompletedPromptAtQueueAdmission(item: QueueItemRecord, generation: number, backendInstanceGeneration: number): boolean {
     this.assertOpen();
     const row = this.database.prepare(`
@@ -10733,6 +10745,7 @@ export class OperationalStore {
     readonly sessionId: string;
     /** Candidate authority owned by the exact Adapter instance selected for dispatch. */
     readonly backendInstanceGeneration: number;
+    readonly nativeSteerQueueItemId?: string;
     readonly traceId?: string;
     readonly at?: number;
   }): QueueItemRecord | undefined {
@@ -10742,6 +10755,11 @@ export class OperationalStore {
         throw new StoreError("Queue claim Backend instance generation must be a non-negative safe integer.");
       }
       const at = options.at ?? this.now();
+      const steer = options.nativeSteerQueueItemId === undefined ? undefined : this.getQueueItem(options.nativeSteerQueueItemId);
+      if (steer !== undefined && (steer.sessionId !== sessionId || steer.state !== "accepted"
+        || steer.disposition !== "steer" || steer.body.nativeSteerTarget === undefined)) return undefined;
+      const steerId = steer?.id ?? null;
+      const allowManualPause = steer?.body.nativeSteerTarget?.allowManualPause === true;
       const row = this.database.prepare(`
         SELECT q.id, q.attempt_id, q.backend_instance_generation FROM queue_items q
         JOIN queue_controls control ON control.session_id = q.session_id
@@ -10751,8 +10769,11 @@ export class OperationalStore {
         WHERE q.state = 'accepted'
           AND (q.backend_instance_generation IS NULL OR q.backend_instance_generation = backend.instance_generation)
           AND attempt.backend_instance_generation IS q.backend_instance_generation
-          AND q.session_id = ? AND control.paused = 0
-          AND NOT EXISTS (
+          AND q.session_id = ? AND (? IS NULL OR q.id = ?)
+          AND (control.paused = 0 OR (
+            ? = 1 AND control.paused_by_connection_id IS NOT NULL AND control.resume_on_user_input = 0
+          ))
+          AND (? IS NOT NULL OR NOT EXISTS (
             SELECT 1 FROM queue_items preceding
             WHERE preceding.session_id = q.session_id
               AND preceding.state = 'accepted'
@@ -10766,7 +10787,7 @@ export class OperationalStore {
                   )
                 )
               )
-          )
+          ))
           AND (control.interaction_lock_expires_at IS NULL OR control.interaction_lock_expires_at <= ?)
           AND (q.edit_lock_expires_at IS NULL OR q.edit_lock_expires_at <= ?)
           AND backend.instance_generation = ?
@@ -10782,7 +10803,7 @@ export class OperationalStore {
             WHERE cleanup.state = 'pending' AND cleanup.session_id = q.session_id
           )
         ORDER BY q.position, q.created_at, q.id LIMIT 1
-      `).get(sessionId, at, at, options.backendInstanceGeneration) as Row | undefined;
+      `).get(sessionId, steerId, steerId, allowManualPause ? 1 : 0, steerId, at, at, options.backendInstanceGeneration) as Row | undefined;
       if (row === undefined) return undefined;
       const id = stringValue(row["id"]);
       if (row["backend_instance_generation"] === null) {
@@ -10915,7 +10936,11 @@ export class OperationalStore {
           throw new StoreError("Queue item and Attempt Backend instance generations do not match.");
         }
       }
-      if (input.projectionAttemptId !== undefined) {
+      if (input.projectionAttemptId === null && (input.state !== "failed" || effectiveAttemptId === undefined
+        || this.getAttempt(effectiveAttemptId).descriptor.generation === this.getSession(current.sessionId).descriptor.binding.generation)) {
+        throw new StoreError("Only a failed Queue projection may omit a retired Attempt.");
+      }
+      if (input.projectionAttemptId != null) {
         const projectionAttempt = this.getAttempt(input.projectionAttemptId);
         const session = this.getSession(current.sessionId);
         if (

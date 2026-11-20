@@ -4901,6 +4901,17 @@ function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | u
         serviceNodeOnly: capability.options?.includes(SESSION_REWIND_SERVICE_NODE_ONLY_OPTION) === true
       }
     };
+  } else if (capability.key === contract.capabilityNames.turnSteer && capability.options?.includes("same_turn")) {
+    kind = {
+      case: "turn",
+      value: {
+        $typeName: "joko.v1.TurnCapabilityOptions",
+        sameTurn: true,
+        acceptsImages: capability.options.includes("images"),
+        acceptsFiles: capability.options.includes("files"),
+        deliveryModes: [contract.QueueDeliveryMode.STEER]
+      }
+    };
   } else if (capability.key.startsWith("model.")) {
     kind = {
       case: "model",
@@ -4993,6 +5004,11 @@ function fromProtoCapabilityOptions(options: CapabilityOptions | undefined): rea
   if (options === undefined) return [];
   switch (options.kind.case) {
     case "session": return options.kind.value.serviceNodeOnly ? [SESSION_REWIND_SERVICE_NODE_ONLY_OPTION] : [];
+    case "turn": return [
+      ...(options.kind.value.sameTurn ? ["same_turn"] : []),
+      ...(options.kind.value.acceptsImages ? ["images"] : []),
+      ...(options.kind.value.acceptsFiles ? ["files"] : [])
+    ];
     case "model": return options.kind.value.effortIds;
     case "input": return options.kind.value.mediaTypes;
     case "permission": return options.kind.value.modes.map(fromProtoPermissionMode);

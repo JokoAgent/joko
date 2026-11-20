@@ -366,6 +366,18 @@ function isUtf16Boundary(text: string, offset: number): boolean {
   return !(before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff);
 }
 
+export interface NativeTurnOwner {
+  readonly queueItemId: QueueItemId;
+  readonly attemptId: AttemptId;
+  readonly generation: number;
+}
+
+export interface NativeSteerTarget extends NativeTurnOwner {
+  readonly runId: RunId;
+  readonly nativeTurnId: string;
+  readonly allowManualPause: boolean;
+}
+
 export interface PromptInput {
   readonly text: string;
   readonly images: readonly ImageInput[];
@@ -381,6 +393,8 @@ export interface PromptInput {
    * the service-owned context and removes it from the prompt. */
   readonly artifactReferenceSnapshots?: readonly ArtifactReferenceSnapshot[];
   readonly disposition: InputDisposition;
+  /** Exact service-owned target of an ordinary same-turn input. Public input cannot set this. */
+  readonly nativeSteerTarget?: NativeSteerTarget;
   /** True only when the product encoded inline quote atoms into text. */
   readonly quotesEncoded?: boolean;
   /** Durable UTF-16 spans for compact sent-paste rendering. */
