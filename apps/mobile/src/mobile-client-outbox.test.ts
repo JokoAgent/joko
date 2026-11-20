@@ -318,6 +318,27 @@ describe("durable ordinary mobile task inputs", () => {
     expect(f.network.submit.mock.calls[1]?.[1]).not.toBe("rejected-input"); expect(client.taskOutboxItems()).toEqual([]);
   });
 
+  it("authorizes only local draft edits for the exact cached task during reconnect", async () => {
+    const f = await fixture(), { client } = f.makeClient();
+    f.online(); await client.start();
+    f.online(false); await client.refresh();
+    expect(client.state.status).toBe("offline");
+    expect(client.canQueueTaskInput()).toBe(true);
+    expect(client.canEditRetainedTaskDraft()).toBe(false);
+    let finish!: (value: NodeIdentity) => void;
+    f.online();
+    f.network.inspect.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const refreshing = client.refresh();
+    try {
+      await vi.waitFor(() => expect(client.state.status).toBe("connecting"));
+      expect(client.canEditRetainedTaskDraft()).toBe(true);
+      expect(client.canQueueTaskInput()).toBe(false);
+      expect(f.network.submit).not.toHaveBeenCalled();
+    } finally { finish?.(node); await refreshing; }
+    expect(client.state.status).toBe("connected");
+    expect(client.canEditRetainedTaskDraft()).toBe(false);
+  });
+
   it("recovers a persisted confirming record with no durable server operation for explicit retry using the original identity", async () => {
     const f = await fixture(), { client } = f.makeClient(); await client.start();
     await client.send(plainTextMobileComposerDraft("Original operation"), { operationId: "not-admitted" }); client.dispose();
