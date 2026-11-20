@@ -22,6 +22,7 @@ import {
   type ProviderModelDiscoverySpec
 } from "./provider-model-discovery.js";
 import { materializeDiscoveredModel, refreshDiscoveredModel, saveDiscoveredModelConfiguration } from "./provider-model-metadata.js";
+import { videoGenerationBaseUrl } from "./video-generation-protocol.js";
 import {
   PROVIDER_ACCOUNT_USAGE_CAPABILITY,
   type ProviderAccountUsageCredential,
@@ -1126,6 +1127,11 @@ export interface ProviderInferenceIdentity {
   readonly generationId: string;
 }
 
+interface ProviderInferenceOptions {
+  readonly requireImages?: boolean;
+  readonly purpose?: "audio_speech" | "xai_video";
+}
+
 /** Public provider catalog plus an in-memory credential join for Pi spawning. */
 export class ProviderCatalogManager {
   readonly #store: OperationalStore;
@@ -1445,7 +1451,7 @@ export class ProviderCatalogManager {
     backendId: string,
     providerId: string,
     modelId: string,
-    options: { readonly requireImages?: boolean; readonly purpose?: "audio_speech" } = {}
+    options: ProviderInferenceOptions = {}
   ): boolean {
     this.#assertInitialized();
     const normalizedProviderId = nonBlank(providerId, "Inference Provider ID");
@@ -1459,16 +1465,24 @@ export class ProviderCatalogManager {
       || entry.provider.baseUrl === undefined
     ) return false;
     const model = entry.provider.models.find((candidate) => candidate.id === normalizedModelId);
-    if (model === undefined || !(options.purpose === "audio_speech" ? isManagedSpeechModel(model) : isManagedChatModel(model))) return false;
+    if (model === undefined || !inferenceModelMatchesPurpose(model, options.purpose)) return false;
     const api = model.api ?? entry.provider.api;
     if (api !== "anthropic-messages" && api !== "openai-responses" && api !== "openai-completions") return false;
     if (options.requireImages === true && model.input?.includes("image") !== true) return false;
+    if (options.purpose === "xai_video") {
+      if (entry.kind !== "api_key" && entry.kind !== "custom_endpoint" && entry.kind !== "local_keyless") return false;
+      const base = videoGenerationBaseUrl(entry.provider.baseUrl);
+      if (base === undefined) return false;
+      if (entry.provider.apiKeyEnv !== undefined) return new URL(base).origin === entry.credentialOrigin;
+      return entry.provider.keyless === true && Object.keys(entry.provider.headers ?? {}).length === 0
+        && ["localhost", "127.0.0.1", "[::1]"].includes(new URL(base).hostname);
+    }
     return safeEmbeddingBaseUrl(entry.provider.baseUrl);
   }
 
   /** Describe readiness and all credential replacements without opening any secret. */
   describeInferenceRoute(backendId: string, providerId: string, modelId: string,
-    options: { readonly requireImages?: boolean; readonly purpose?: "audio_speech" } = {}): ProviderInferenceIdentity | undefined {
+    options: ProviderInferenceOptions = {}): ProviderInferenceIdentity | undefined {
     const normalizedProviderId = nonBlank(providerId, "Inference Provider ID");
     const normalizedModelId = nonBlank(modelId, "Inference model ID");
     if (!this.hasInferenceModel(backendId, normalizedProviderId, normalizedModelId, options)) return undefined;
@@ -1503,7 +1517,7 @@ export class ProviderCatalogManager {
     backendId: string,
     providerId: string,
     modelId: string,
-    options: { readonly requireImages?: boolean; readonly purpose?: "audio_speech" } = {}
+    options: ProviderInferenceOptions = {}
   ): ProviderInferenceRoute | undefined {
     this.#assertInitialized();
     const normalizedProviderId = nonBlank(providerId, "Inference Provider ID");
@@ -1517,12 +1531,14 @@ export class ProviderCatalogManager {
       || entry.provider.baseUrl === undefined
     ) return undefined;
     const model = entry.provider.models.find((candidate) => candidate.id === normalizedModelId);
-    if (model === undefined || !(options.purpose === "audio_speech" ? isManagedSpeechModel(model) : isManagedChatModel(model))) return undefined;
+    if (model === undefined || !inferenceModelMatchesPurpose(model, options.purpose)) return undefined;
     const api = model.api ?? entry.provider.api;
     if (api !== "anthropic-messages" && api !== "openai-responses" && api !== "openai-completions") return undefined;
     const supportsImages = model.input?.includes("image") === true;
     if (options.requireImages === true && !supportsImages) return undefined;
-    if (!safeEmbeddingBaseUrl(entry.provider.baseUrl)) return undefined;
+    const video = options.purpose === "xai_video";
+    const baseUrl = video ? videoGenerationBaseUrl(entry.provider.baseUrl) : entry.provider.baseUrl;
+    if (baseUrl === undefined || !safeEmbeddingBaseUrl(baseUrl)) return undefined;
 
     let secret: string | undefined;
     if (entry.provider.apiKeyEnv !== undefined) {
@@ -1538,6 +1554,7 @@ export class ProviderCatalogManager {
     }
     const headers: Record<string, string> = {};
     for (const [headerName, source] of Object.entries(entry.provider.headers ?? {})) {
+      if (video && VIDEO_CONNECTION_OMITTED_HEADERS.has(headerName.toLowerCase())) continue;
       const reference = entry.credentialBindings[source.env];
       if (reference === undefined) return undefined;
       try {
@@ -1548,7 +1565,7 @@ export class ProviderCatalogManager {
     }
     let authorization: string | undefined;
     if (secret !== undefined) {
-      if (api === "anthropic-messages" && entry.provider.authHeader !== true) {
+      if (!video && api === "anthropic-messages" && entry.provider.authHeader !== true) {
         headers["x-api-key"] = secret;
         if (!Object.keys(headers).some((name) => name.toLowerCase() === "anthropic-version")) {
           headers["anthropic-version"] = "2023-06-01";
@@ -1566,8 +1583,8 @@ export class ProviderCatalogManager {
       generationId,
       modelId: normalizedModelId,
       api,
-      baseUrl: entry.provider.baseUrl,
-      ...(entry.requestPath === undefined ? {} : { requestPath: entry.requestPath }),
+      baseUrl,
+      ...(video || entry.requestPath === undefined ? {} : { requestPath: entry.requestPath }),
       ...(authorization === undefined ? {} : { authorization }),
       headers,
       supportsImages
@@ -2841,6 +2858,15 @@ function validateEndpoint(raw: string): void {
   for (const key of url.searchParams.keys()) {
     if (/(?:token|secret|key|password|auth|credential)/iu.test(key)) throw new Error("Provider endpoint contains a secret-like query parameter.");
   }
+}
+
+const VIDEO_CONNECTION_OMITTED_HEADERS = new Set(["authorization", "x-api-key", "api-key", "cookie", "host", "content-type",
+  "content-length", "connection", "proxy-authorization", "anthropic-beta", "openai-beta", "chatgpt-account-id", "openai-account-id", "session_id"]);
+
+function inferenceModelMatchesPurpose(model: PiManagedModel, purpose: ProviderInferenceOptions["purpose"]): boolean {
+  if (purpose === "xai_video") return model.mode === "xai_video"
+    && (model.discoveredMetadata === undefined || model.metadataOverrides?.includes("mode") === true);
+  return purpose === "audio_speech" ? isManagedSpeechModel(model) : isManagedChatModel(model);
 }
 
 function safeEmbeddingBaseUrl(raw: string): boolean {

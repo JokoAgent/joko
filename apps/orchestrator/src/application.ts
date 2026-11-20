@@ -203,6 +203,7 @@ import { MANAGED_LOCAL_PROVIDER_ID } from "./local-model-runtime-coordinator.js"
 import type { ModelWorkingContextCoordinator } from "./model-working-context.js";
 import { composeModelWorkingContext } from "./model-working-context-system.js";
 import { createOutboundStreamingFetch } from "./outbound-streaming-fetch.js";
+import { VideoGenerationBridgeToolProvider } from "./video-generation-bridge-tool-provider.js";
 import { LocalCodexRuntime } from "./local-codex-runtime.js";
 import { createNativeCodexExecution } from "./native-codex-execution.js";
 import { ManagedChildWorktreeOwner } from "./managed-child-worktree-owner.js";
@@ -1193,10 +1194,15 @@ export async function createOrchestratorApplication(
   });
   const listExtensionImageModels = () => imageGenerationBridge.listModels();
   const unregisterImageGenerationBridge = mcpRouter.registerBridgeToolProvider(imageGenerationBridge);
+  let sessionHostForHelperTools: SessionHost | undefined;
+  const unregisterVideoGenerationBridge = mcpRouter.registerBridgeToolProvider(new VideoGenerationBridgeToolProvider({
+    store, providers, artifacts,
+    fetch: createOutboundFetch(dependencies.resolveOutboundProxy, Math.min(artifacts.maximumBlobBytes, 256 * 1024 * 1024)),
+    approveDownload: (request, signal) => sessionHostForHelperTools?.requestOwnerToolApproval(request, signal) ?? Promise.resolve(false)
+  }));
   const unregisterPersonalDevelopmentTools = mcpRouter.registerBridgeToolProvider(
     new PersonalDevelopmentReportTools(() => personalDevelopmentCoordinator)
   );
-  let sessionHostForHelperTools: SessionHost | undefined;
   let messageSearchForHelperTools: MessageSearchEmbeddingCoordinator | undefined;
   const unregisterSessionHelperTools = mcpRouter.registerBridgeToolProvider(
     new SessionHelperToolBridgeProvider({
@@ -3680,6 +3686,7 @@ export async function createOrchestratorApplication(
     await attempt(() => unregisterComputerBridge?.());
     await attempt(() => unregisterAndroidBridge?.());
     await attempt(() => unregisterImageGenerationBridge());
+    await attempt(() => unregisterVideoGenerationBridge());
     await attempt(() => unregisterSessionHelperTools());
     await attempt(() => unregisterContactTools());
     await attempt(() => unregisterCollaborationGoalTools());
@@ -4006,6 +4013,7 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterComputerBridge?.());
         await attempt(() => unregisterAndroidBridge?.());
         await attempt(() => unregisterImageGenerationBridge());
+        await attempt(() => unregisterVideoGenerationBridge());
         await attempt(() => unregisterSessionHelperTools());
         await attempt(() => unregisterContactTools());
         await attempt(() => unregisterCollaborationGoalTools());
