@@ -131,6 +131,7 @@ it.skipIf(!existsSync(sidebarExecutable) || !mountedWebDirectory)(
     const callId = "original-post-export";
     try {
       fixture = await RealPiSystemFixture.start({ externalBrowserExecutable: sidebarExecutable, webDirectory: mountedWebDirectory!,
+        enableInternalServer: true,
         providerResponder: ({ requestNumber }) => {
           if (requestNumber === 1) return { kind: "tool", name: toolName, callId: "original-browser-page",
             arguments: { name: "browser", args: { action: "open", url: `http://127.0.0.1:${address.port}/` } } };
@@ -175,8 +176,17 @@ it.skipIf(!existsSync(sidebarExecutable) || !mountedWebDirectory)(
       const runId = queueRunIdFrom(await submit(owner.clients.operation, owner.connectionId,
         sendInputMutation(sessionId, BigInt(store.getSession(sessionId).descriptor.binding.generation), "Export the original report.")));
 
-      const originalPage = await waitFor(async () => (await provider.listPages().catch(() => [])).find(value =>
-        value.url === `http://127.0.0.1:${address.port}/`), value => value !== undefined, "the original native Browser page", 25_000);
+      const originalPage = await waitFor(async () => {
+        const found = (await provider.listPages().catch(() => [])).find(value => value.url === `http://127.0.0.1:${address.port}/`);
+        if (found !== undefined) return found;
+        const run = store.getRun(runId).descriptor;
+        if (run.state === "completed" || run.state === "failed") {
+          const results = store.listEvents({ sessionId }).flatMap(({ payload, runId: origin }) =>
+            origin === runId && payload.type === "tool_result" ? [{ name: payload.name, output: payload.output.slice(0, 512) }] : []);
+          throw new Error(`The original native Browser page was absent after the Run settled: ${JSON.stringify({ state: run.state, error: run.error?.code, results })}`);
+        }
+        return undefined;
+      }, value => value !== undefined, "the original native Browser page", 25_000);
       if (originalPage === undefined) throw new Error("The original Pi Browser open returned no native page.");
       const transfers = async () => (await owner.clients.browser.listBrowserTransfers({ browserProviderId: provider.id,
         pageId: originalPage.id, direction: TransferDirection.DOWNLOAD })).transfers;
