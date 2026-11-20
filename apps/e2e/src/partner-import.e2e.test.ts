@@ -103,7 +103,9 @@ async function exerciseAgentImport(backendId: "pi" | "claude-code" | "codex"): P
   store.upsertTarget({ ...target.descriptor, trusted: true }, target.metadata);
   const createTask = async () => {
     const created = await submit(clients.operation, connectionId, createSessionMutation({ targetId, backendId,
-      providerId: REAL_PI_PROVIDER_ID, modelId, permissionMode: PermissionMode.BYPASS_PERMISSIONS }));
+      providerId: REAL_PI_PROVIDER_ID, modelId, permissionMode: PermissionMode.BYPASS_PERMISSIONS,
+      // The selected managed Claude and Codex models advertise no reasoning levels.
+      effortId: backendId === "pi" ? "off" : "" }));
     expect(created.state, JSON.stringify({ backendId, modelId, error: created.error?.code,
       message: created.error?.message, phase: created.error?.phase, nativeSessionImpact: created.error?.nativeSessionImpact,
       loopbackRequests: fixture!.providerRequests.length })).toBe(OperationState.SUCCEEDED);
