@@ -1,4 +1,4 @@
-import { EXTENSION_LIBRARY_CLIPBOARD_MAXIMUM_BYTES } from "@joko/contracts";
+import { EXTENSION_LIBRARY_CLIPBOARD_MAXIMUM_BYTES, EXTENSION_LIBRARY_SQL_MAXIMUM_BATCH_STATEMENTS } from "@joko/contracts";
 import type { ExtensionLibraryCallView, ExtensionLibrarySqlStatementView, ExtensionLibrarySqlValueView } from "./model.js";
 
 export const EXTENSION_LIBRARY_BRIDGE_REQUEST = "joko:extension-library-request";
@@ -155,7 +155,8 @@ function parseCall(value: Record<string, unknown>): ExtensionLibraryCallView | u
     }
     case "sqlBatch": {
       if (!exact(value, ["kind", "handleId", "statements"]) || !safeId(value.handleId)
-        || !Array.isArray(value.statements) || value.statements.length === 0 || value.statements.length > 100) return undefined;
+        || !Array.isArray(value.statements) || value.statements.length === 0
+        || value.statements.length > EXTENSION_LIBRARY_SQL_MAXIMUM_BATCH_STATEMENTS) return undefined;
       const statements = value.statements.map(parseStatement);
       return statements.some((statement) => statement === undefined)
         ? undefined

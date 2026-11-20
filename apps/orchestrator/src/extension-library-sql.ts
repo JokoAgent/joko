@@ -4,6 +4,7 @@ import { constants, type BigIntStats } from "node:fs";
 import { lstat, open, unlink, type FileHandle } from "node:fs/promises";
 import { toNamespacedPath } from "node:path";
 import { backup, constants as sqliteConstants, DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
+import { EXTENSION_LIBRARY_SQL_MAXIMUM_BATCH_STATEMENTS } from "@joko/contracts";
 
 import {
   ExtensionLibraryError,
@@ -24,9 +25,10 @@ export const EXTENSION_LIBRARY_SQL_LIMITS: ExtensionLibrarySqlLimits = Object.fr
   maximumRows: 2_000,
   maximumResultBytes: 16 * 1024 * 1024,
   maximumParameters: 256,
-  maximumBatchStatements: 100,
+  maximumBatchStatements: EXTENSION_LIBRARY_SQL_MAXIMUM_BATCH_STATEMENTS,
   maximumSqlCharacters: 128 * 1024
 });
+const MAXIMUM_MIGRATION_STATEMENTS = 100;
 
 export type ExtensionLibrarySqlValue = null | number | bigint | string | Uint8Array;
 export type ExtensionLibrarySqlRow = Readonly<Record<string, ExtensionLibrarySqlValue>>;
@@ -646,7 +648,8 @@ export class ExtensionLibrarySqlCore {
   async migrate(handleId: string, migrations: readonly ExtensionLibrarySqlMigration[]): Promise<number> {
     const entry = this.#handle(handleId);
     if (entry.readonly) throw new ExtensionLibraryError("READ_ONLY", "Library database handle is read-only.");
-    if (!Array.isArray(migrations) || migrations.length === 0 || migrations.length > this.#limits.maximumBatchStatements) {
+    const maximumStatements = Math.min(this.#limits.maximumBatchStatements, MAXIMUM_MIGRATION_STATEMENTS);
+    if (!Array.isArray(migrations) || migrations.length === 0 || migrations.length > maximumStatements) {
       throw new ExtensionLibraryError("TOO_LARGE", "Library database migration count is outside the supported boundary.");
     }
     if ([...this.#handles.values()].some((candidate) => candidate.handleId !== handleId && candidate.absolutePath === entry.absolutePath)) {
@@ -662,7 +665,7 @@ export class ExtensionLibrarySqlCore {
         throw new ExtensionLibraryError("CONFLICT", "Library database migrations must be non-empty and contiguous.");
       }
       statementCount += migration.statements.length;
-      if (statementCount > this.#limits.maximumBatchStatements) {
+      if (statementCount > maximumStatements) {
         throw new ExtensionLibraryError("TOO_LARGE", "Library database migration statement count exceeded the supported boundary.");
       }
       for (const sql of migration.statements) {
@@ -968,7 +971,8 @@ function validateMigrationShape(
   migrations: readonly ExtensionLibrarySqlMigration[],
   limits: ExtensionLibrarySqlLimits
 ): void {
-  if (!Array.isArray(migrations) || migrations.length === 0 || migrations.length > limits.maximumBatchStatements) {
+  const maximumStatements = Math.min(limits.maximumBatchStatements, MAXIMUM_MIGRATION_STATEMENTS);
+  if (!Array.isArray(migrations) || migrations.length === 0 || migrations.length > maximumStatements) {
     throw new ExtensionLibraryError("TOO_LARGE", "Library database migration count is outside the supported boundary.");
   }
   let previousVersion: number | undefined;
@@ -980,7 +984,7 @@ function validateMigrationShape(
       throw new ExtensionLibraryError("CONFLICT", "Library database migrations must be non-empty and contiguous.");
     }
     statementCount += migration.statements.length;
-    if (statementCount > limits.maximumBatchStatements) {
+    if (statementCount > maximumStatements) {
       throw new ExtensionLibraryError("TOO_LARGE", "Library database migration statement count exceeded the supported boundary.");
     }
     for (const sql of migration.statements) {

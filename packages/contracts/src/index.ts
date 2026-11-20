@@ -12,6 +12,7 @@ export * from "./task-link-source.js";
 export * from "./remote-desktop-system-action.js";
 export * from "./remote-desktop-clipboard-version.js";
 export * from "./extension-library-clipboard.js";
+export * from "./extension-library-sql.js";
 export * from "./partner-session-tasks.js";
 export * from "./session-handoff-messages.js";
 export * from "./question-references.js";

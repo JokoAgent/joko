@@ -83,6 +83,7 @@ describe("Mobile Library wire and authority", () => {
       { kind: "list", limit: 501 }, { kind: "read", path: "mail", length: 16n * 1024n ** 2n + 1n },
       { kind: "writeBegin", path: "mail", totalBytes: 8n * 1024n ** 3n + 1n },
       { kind: "sqlOpen", path: "mail.json" }, { kind: "sqlExecute", handleId: "db", statement: { sql: "SELECT ?", parameters: [{ kind: "number", value: Infinity }] } },
+      { kind: "sqlBatch", handleId: "db", statements: Array.from({ length: 201 }, () => ({ sql: "SELECT 1" })) },
       { kind: "reveal", path: "mail" }, { kind: "write", path: "mail", content: Uint8Array.of(1), secret: "unknown" }
     ]) expect(parseMobileExtensionLibraryRequest(request(operation))).toBeUndefined();
     expect(parseMobileExtensionLibraryRequest({ ...request({ kind: "open" }), version: 2 })).toBeUndefined();
@@ -101,7 +102,9 @@ describe("Mobile Library wire and authority", () => {
         { kind: "null" }, { kind: "number", value: 1.5 }, { kind: "integer", value: -9_007_199_254_740_993n },
         { kind: "text", value: "mail" }, { kind: "blob", value: Uint8Array.of(128) }
       ] } },
-      { kind: "sqlBatch", handleId: "db", statements: [{ sql: "SELECT 1" }] },
+      { kind: "sqlBatch", handleId: "db", statements: Array.from({ length: 101 }, (_, index) => ({
+        sql: "INSERT INTO notes(id) VALUES (?)", parameters: [{ kind: "integer", value: BigInt(index + 1) }]
+      })) },
       { kind: "sqlMigrate", handleId: "db", migrations: [{ version: 1, statements: ["CREATE TABLE mail(id INTEGER)"] }] },
       { kind: "sqlBackup", handleId: "db", targetPath: "backup.sqlite" }, { kind: "sqlCheck", handleId: "db" }, { kind: "sqlClose", handleId: "db" }
     ];

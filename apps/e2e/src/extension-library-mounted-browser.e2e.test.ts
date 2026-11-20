@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 
-import { create, type MessageInitShape } from "@bufbuild/protobuf";
-import { ExtensionLibraryCallSchema, type ExtensionCatalogEntry } from "@joko/contracts";
+import { create, fromBinary, type MessageInitShape } from "@bufbuild/protobuf";
+import { CallExtensionLibraryRequestSchema, ExtensionLibraryCallSchema, type ExtensionCatalogEntry } from "@joko/contracts";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -44,6 +44,17 @@ describe("mounted Extension Library main-view bridge", () => {
     browser = await chromium.launch({ executablePath, headless: true });
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
     const browserErrors = observeBrowserErrors(page);
+    const libraryCallUrl = `${fixture.baseUrl}/joko.v1.ExtensionService/CallExtensionLibrary`;
+    const rejectedLibraryCalls: Array<{ status: number; kind: string | undefined; count: number | undefined; lastParameter: string | undefined }> = [];
+    page.on("response", response => {
+      if (response.url() !== libraryCallUrl || response.status() < 400) return;
+      const bytes = response.request().postDataBuffer();
+      const operation = bytes === null ? undefined : fromBinary(CallExtensionLibraryRequestSchema, bytes).call?.operation;
+      const statements = operation?.case === "sqlBatch" ? operation.value.statements : undefined;
+      const lastParameter = statements?.at(-1)?.parameters[0]?.value;
+      rejectedLibraryCalls.push({ status: response.status(), kind: operation?.case, count: statements?.length,
+        lastParameter: lastParameter?.case === "integerValue" ? lastParameter.value : undefined });
+    });
     await page.goto(`${fixture.baseUrl}/#/extensions/${encodeURIComponent(extension.extensionId)}`, {
       waitUntil: "domcontentloaded"
     });
@@ -92,7 +103,11 @@ describe("mounted Extension Library main-view bridge", () => {
     expect(await overflow(page)).toBeLessThanOrEqual(1);
     expect(await result.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth))
       .toBeLessThanOrEqual(1);
-    expect(browserErrors).toEqual([]);
+    expect(rejectedLibraryCalls).toEqual([{ status: 400, kind: "sqlBatch", count: 101, lastParameter: "101" }]);
+    const expectedRejection = (error: typeof browserErrors[number]) => error.kind === "console"
+      && error.url === libraryCallUrl && error.text === "Failed to load resource: the server responded with a status of 400 (Bad Request)";
+    expect(browserErrors.filter(expectedRejection).length).toBeLessThanOrEqual(1);
+    expect(browserErrors.filter(error => !expectedRejection(error))).toEqual([]);
 
     let resumeImageResponse!: () => void;
     const imageResponseGate = new Promise<void>(resolve => { resumeImageResponse = resolve; });
@@ -153,7 +168,7 @@ describe("mounted Extension Library main-view bridge", () => {
     expect(video).toMatchObject({ bytes: 24 * 1024 * 1024, mime: "video/mp4", marker: 0x53 });
     if (video.supported) expect(video.time).toBeCloseTo(1.25);
     console.info(`Mounted Library video ${video.supported ? "decoded and sought" : "assembled without a supported decoder"}.`);
-    expect(browserErrors.filter(error => error.startsWith("pageerror:"))).toEqual([]);
+    expect(browserErrors.filter(error => error.kind === "pageerror")).toEqual([]);
   }, 90_000);
 });
 
@@ -207,11 +222,11 @@ bAAAAAAAAAAAAAAAAAhpbHN0AAAACGZyZWUAAAA3bWRhdAAAAApliIQ6JigACQLgAAAABUGaIBKl
 AAAAC2WIggMomKAALC+AAAAABUGaIBKl
 `, "base64");
 
-function observeBrowserErrors(page: Page): string[] {
-  const errors: string[] = [];
-  page.on("pageerror", (error) => errors.push(`pageerror:${error.message}`));
+function observeBrowserErrors(page: Page): { kind: "pageerror" | "console"; text: string; url?: string }[] {
+  const errors: ReturnType<typeof observeBrowserErrors> = [];
+  page.on("pageerror", (error) => errors.push({ kind: "pageerror", text: error.message }));
   page.on("console", (message) => {
-    if (message.type() === "error") errors.push(`console:${message.text()}`);
+    if (message.type() === "error") errors.push({ kind: "console", text: message.text(), url: message.location().url });
   });
   return errors;
 }
