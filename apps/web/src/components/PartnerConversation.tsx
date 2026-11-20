@@ -9,6 +9,7 @@ import { validatePartnerSourceSession } from "../partner-sources.js";
 import { taskSourceKey } from "../task-sharing.js";
 import { PartnerSettingsDialog } from "./PartnersPage.js";
 import type { PartnerHomeApi, PartnerHomeDestination, PartnerLearningSettingsDestination } from "@joko/contracts";
+import { PARTNER_TODO_CHECK_PROMPT } from "@joko/contracts";
 import type { Translator } from "./types.js";
 
 type ConversationIdentity =
@@ -67,6 +68,7 @@ export interface PartnerConversationView {
   readonly openHomeSettings?: (destination: PartnerHomeDestination) => void;
   readonly todoQuote?: PendingPartnerTodoQuote;
   readonly quoteTodo?: (todo: import("@joko/contracts").PartnerTodo) => void;
+  readonly checkTodosNow?: () => Promise<void>;
   readonly clearTodoQuote?: () => void;
   readonly clearSentTodoQuote?: (value: PendingPartnerTodoQuote) => void;
   readonly workbenchAvailable: boolean;
@@ -363,6 +365,15 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
     openHomeSettings: destination => { if (editable && partnerIdentity && conversationOwnerRef.current === conversationOwner) setSettings({ owner: conversationOwner, section: "profile", homeDestination: destination }); },
     todoQuote: partnerIdentity ? pendingTodoQuote : undefined,
     quoteTodo: todo => { if (editable && partnerIdentity && conversationOwnerRef.current === conversationOwner) setPendingPartnerTodoQuote(quoteOwner, partnerIdentity.partner.id, todo); },
+    checkTodosNow: editable && active && !sharedSource && !partnerIdentity?.topic && partnerIdentity?.partner.canonicalSessionId === session.id ? async () => {
+      if (conversationOwnerRef.current !== conversationOwner || !readContextRef.current.active || !readContextRef.current.editable
+        || controllerRef.current.state.connectionState !== "connected") {
+        throw new Error("The original Partner conversation changed.");
+      }
+      await controllerRef.current.send(session.id, { text: PARTNER_TODO_CHECK_PROMPT, deliveryMode: "prompt", mentions: [], attachments: [] },
+        { expectedGeneration: session.generation });
+      if (conversationOwnerRef.current === conversationOwner) setEngagedOwner(ownerKey);
+    } : undefined,
     clearTodoQuote: () => { if (partnerIdentity) setPendingPartnerTodoQuote(quoteOwner, partnerIdentity.partner.id); },
     clearSentTodoQuote: todo => clearSentPartnerTodoQuote(quoteOwner, todo),
     workbenchAvailable, workbenchRequest: workbenchRequest?.owner === ownerKey ? workbenchRequest.sequence : undefined,

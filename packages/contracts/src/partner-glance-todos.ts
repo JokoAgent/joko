@@ -1,5 +1,5 @@
 import type { PartnerTodo } from "./gen/joko/v1/partner_todo_pb.js";
-import type { PartnerAutonomyApi } from "./partner-autonomy.js";
+import type { PartnerAutonomyApi, PartnerTodoCheck, PartnerTodoCheckApi } from "./partner-autonomy.js";
 import { partnerMutationWasRejected } from "./partner-autonomy.js";
 
 export interface PartnerGlanceTodoState {
@@ -7,22 +7,32 @@ export interface PartnerGlanceTodoState {
   readonly openTotal: number; readonly doneTotal: number; readonly loaded: boolean; readonly failed: boolean;
   readonly saving: boolean; readonly pending: boolean; readonly deleted?: PartnerTodo; readonly partnerRevision?: bigint;
   readonly nextDeferredAt?: number; readonly now: number;
+  readonly dailyCheck?: PartnerTodoCheck; readonly dailyCheckSaving?: boolean; readonly dailyCheckFailed?: boolean;
 }
 /** Bounded page reads, expired deferrals and the exact mutation request are shared by both clients. */
 export class PartnerGlanceTodos {
   readonly #listeners = new Set<() => void>(); #request: AbortController | undefined; #closed = false; #foreground = false;
   #epoch = 0; #timer: ReturnType<typeof setTimeout> | undefined;
+  readonly #dailyApi: PartnerTodoCheckApi | undefined;
+  #dailyRequest: AbortController | undefined;
   #attempt: { readonly operationId: string; readonly revision: bigint; readonly todo: PartnerTodo; readonly action: "delete" | "restore" } | undefined;
   #state: PartnerGlanceTodoState = { open: [], done: [], openTotal: 0, doneTotal: 0, loaded: false, failed: false, saving: false, pending: false, now: Date.now() };
-  constructor(readonly api: PartnerAutonomyApi, readonly partnerId: string, private readonly completedWindow: "oldest" | "newest" = "oldest") {}
+  constructor(readonly api: PartnerAutonomyApi, readonly partnerId: string, private readonly completedWindow: "oldest" | "newest" = "oldest") {
+    this.#dailyApi = api.todoCheck?.(partnerId);
+  }
   snapshot = (): PartnerGlanceTodoState => this.#state;
   subscribe = (listener: () => void): (() => void) => { this.#listeners.add(listener); return () => { this.#listeners.delete(listener); }; };
   #set(patch: Partial<PartnerGlanceTodoState>) { if (this.#closed) return; this.#state = { ...this.#state, ...patch }; for (const listener of this.#listeners) listener(); }
   activate(): void { if (this.#closed) return; this.#foreground = true; void this.refresh(); }
-  suspend(): void { this.#foreground = false; this.#epoch++; this.#request?.abort(); clearTimeout(this.#timer); }
+  suspend(): void {
+    this.#foreground = false; this.#epoch++; this.#request?.abort(); clearTimeout(this.#timer);
+    this.#dailyRequest?.abort(); this.#dailyRequest = undefined;
+    if (this.#state.dailyCheckSaving) this.#set({ dailyCheckSaving: false });
+  }
   dispose(): void { this.suspend(); this.#closed = true; this.#listeners.clear(); }
   async refresh(): Promise<void> {
     if (!this.#foreground || this.#closed || this.#state.saving) return;
+    void this.refreshDailyCheck();
     const epoch = ++this.#epoch, request = new AbortController(); this.#request?.abort(); this.#request = request;
     try {
       const read = async (view: "open" | "done") => {
@@ -53,6 +63,38 @@ export class PartnerGlanceTodos {
       this.#arm();
     } catch { if (!request.signal.aborted && epoch === this.#epoch) this.#set({ loaded: true, failed: true }); }
     finally { if (this.#request === request) this.#request = undefined; }
+  }
+  async refreshDailyCheck(): Promise<void> {
+    if (!this.#dailyApi || !this.#foreground || this.#closed || this.#dailyRequest) return;
+    const request = new AbortController();
+    this.#dailyRequest = request;
+    try {
+      const dailyCheck = await this.#dailyApi.read(request.signal);
+      if (!request.signal.aborted) this.#set({ dailyCheck, dailyCheckFailed: false });
+    } catch {
+      if (!request.signal.aborted) this.#set({ dailyCheckFailed: true });
+    } finally {
+      if (this.#dailyRequest === request) this.#dailyRequest = undefined;
+    }
+  }
+  async setDailyCheck(enabled: boolean): Promise<void> {
+    const current = this.#state.dailyCheck;
+    if (!this.#dailyApi || !this.#foreground || this.#closed || !current?.writable || this.#state.dailyCheckSaving || this.#state.dailyCheckFailed) return;
+    this.#dailyRequest?.abort();
+    const request = new AbortController();
+    this.#dailyRequest = request;
+    this.#set({ dailyCheckSaving: true, dailyCheckFailed: false });
+    try {
+      const dailyCheck = await this.#dailyApi.set(current, enabled, request.signal);
+      if (!request.signal.aborted) this.#set({ dailyCheck });
+    } catch {
+      if (!request.signal.aborted) this.#set({ dailyCheckFailed: true });
+    } finally {
+      if (this.#dailyRequest === request) {
+        this.#dailyRequest = undefined;
+        this.#set({ dailyCheckSaving: false });
+      }
+    }
   }
   #arm(): void {
     clearTimeout(this.#timer); if (!this.#foreground || this.#closed) return;

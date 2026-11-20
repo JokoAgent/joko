@@ -69,7 +69,7 @@ function assertState(value: unknown): asserts value is RoutineState {
         || model.effort !== undefined && !text(model.effort, 128)
         || typeof model.fastMode !== "boolean" && model.fastMode !== "ultrafast") invalid();
     }
-    if (routine.builtin !== undefined && routine.builtin !== "follow-up"
+    if (routine.builtin !== undefined && routine.builtin !== "follow-up" && routine.builtin !== "todo-check"
       || routine.builtinVersion !== undefined && (routine.builtin === undefined || !positive(routine.builtinVersion))) invalid();
     if (routine.preRunHook !== undefined) {
       const hook = record(routine.preRunHook);

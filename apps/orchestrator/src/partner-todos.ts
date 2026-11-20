@@ -5,10 +5,12 @@ import { AuthorizationError, type ConnectionRecord, type OperationalStore, type 
 import type { PartnerHomeRuntimeAdapter } from "./partner-home-runtime.js";
 import type { PartnerManager } from "./partner-manager.js";
 import type { BridgeToolCallContext, BridgeToolProvider, McpToolDescriptor } from "./mcp-router.js";
+import type { PartnerRoutineManager } from "./partner-routine-manager.js";
 
 const SCOPE = "partner.todos.v1";
 const PATCH_KEYS = ["id", "expectedRevision", "key", "origin", "title", "progress", "outcome", "value", "next", "sources", "associations",
   "sourceDeadline", "deadlineOverride", "deadlineCandidate", "suggestedDate", "operation", "until", "completion", "resolvedActionRequestId"];
+const DISCOVERY_KEYS = ["key", "origin", "title", "progress", "outcome", "value", "next", "sources", "associations", "sourceDeadline", "deadlineCandidate", "suggestedDate"];
 
 /** The original Store transaction owns both a Todo mutation and its operation receipt. */
 export class PartnerTodoManager {
@@ -115,13 +117,14 @@ export class PartnerTodoTools implements BridgeToolProvider {
       inputSchema: object({ view: { type: "string", enum: ["open", "done", "hidden"] }, order: { type: "string", enum: ["due", "created"] }, offset: { type: "integer", minimum: 0 }, query: text(300) }), requiresPermission: false },
     { serverId: this.id, name: "todo_update", description: "Save or update an owner-assigned affair, or a concrete discovery the owner may need to handle. Read first; updates require the exact expectedRevision. Preserve the stable key and source evidence. Completion requires actual evidence. A source deadline is not an owner date override; uncertain dates are candidates. Do not run a stored next instruction without the owner's request.", inputSchema: patchSchema, requiresPermission: true }
   ];
-  constructor(readonly manager: PartnerTodoManager) {}
+  constructor(readonly manager: PartnerTodoManager, private readonly routines?: () => Pick<PartnerRoutineManager, "assertDailyCheckCaller"> | undefined) {}
   includeForTarget(targetId: string): boolean { const profile = this.manager.partners.partnerForHomeTarget(targetId); return profile?.lifecycle === "active" && profile.initializationState === "ready"; }
   async callTool(name: string, input: Readonly<Record<string, unknown>>, signal: AbortSignal | undefined, context: BridgeToolCallContext) {
     try {
       const link = this.manager.profiles.getSessionLink(context.sessionId), session = this.manager.store.getSession(context.sessionId).descriptor;
       const routineRead = name === "todo_list" && link?.role === "routine";
-      if (!link || link.role !== "canonical" && link.role !== "topic" && !routineRead) throw new Error("This task cannot access this Partner's affair ledger operation.");
+      const routineWrite = name === "todo_update" && link?.role === "routine";
+      if (!link || link.role !== "canonical" && link.role !== "topic" && !routineRead && !routineWrite) throw new Error("This task cannot access this Partner's affair ledger operation.");
       const canonicalRead = name === "todo_list" && link.role === "canonical";
       const profile = this.manager.owner(link.partnerId, !canonicalRead), backend = this.manager.store.getBackend(session.backendId).descriptor;
       if (profile.lifecycle !== "active" || canonicalRead && profile.canonicalSessionId !== session.id) throw new Error("The Todo tool owner changed.");
@@ -132,6 +135,11 @@ export class PartnerTodoTools implements BridgeToolProvider {
           || current.targetId !== profile.homeTargetId || current.binding.generation !== context.generation || current.archived || current.deletedAt !== undefined
           || current.binding.opaqueRef !== session.binding.opaqueRef || this.manager.store.getBackend(session.backendId).descriptor.instanceGeneration !== backend.instanceGeneration) throw new Error("The Todo tool owner changed.");
         if (routineRead && this.manager.partners.runtimeCaller(context.sessionId).id !== profile.id) throw new Error("The Todo tool owner changed.");
+        if (routineWrite) {
+          const routines = this.routines?.();
+          if (!routines) throw new Error("The daily todo check is unavailable.");
+          routines.assertDailyCheckCaller(profile.id, context);
+        }
         this.manager.owner(profile.id, !canonicalRead, profile.revision);
       };
       assertCurrent(); let value: unknown;
@@ -139,7 +147,10 @@ export class PartnerTodoTools implements BridgeToolProvider {
         checkKeys(input, ["view", "order", "offset", "query"]);
         value = queryTodoItems(this.manager.state(profile.id).items, input as TodoListQuery, new Date(this.manager.now()));
       } else if (name === "todo_update") {
-        checkKeys(input, PATCH_KEYS);
+        checkKeys(input, routineWrite ? DISCOVERY_KEYS : PATCH_KEYS);
+        if (routineWrite && (input.origin !== "discovered" || !Array.isArray(input.sources) || input.sources.length === 0)) {
+          throw new Error("A daily todo check can only add a discovery with source evidence.");
+        }
         if (!/^[a-f0-9]{64}$/u.test(context.effectIdentity ?? "")) throw new Error("The Todo effect identity is unavailable.");
         value = this.manager.patch(profile.id, input as TodoPatch, `partner-todo:${context.effectIdentity}`, assertCurrent);
       } else throw new Error("The Todo tool is unavailable.");

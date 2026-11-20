@@ -22,7 +22,7 @@ import { randomUUID } from "expo-crypto";
 import * as Clipboard from "expo-clipboard";
 import {
   CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, InteractionState, ModelSourceKind, QueueItemState, QueueSourceKind, RuntimeCommandInputMode, SessionState, TargetState, WorkspaceKind, capabilityNames, partnerResumeMessages, queueQuotaRetryAt,
-  partnerSessionTaskMessages, partnerSessionTaskReceiptLabel,
+  PARTNER_TODO_CHECK_PROMPT, partnerSessionTaskMessages, partnerSessionTaskReceiptLabel,
   type QueueItem, type Session
 } from "@joko/contracts";
 import type { PartnerLearningSettingsDestination } from "@joko/contracts";
@@ -8242,6 +8242,11 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       homeApi={partnerGlanceHomeApi}
       name={partnerIdentity.partner.displayName} visible={partnerGlanceOwner === partnerConversationTransport?.ownerKey} engaged={messageRows.some(row => row.kind === 'user' && !!row.operationId)}
       colors={colors} locale={locale} onClose={() => setPartnerGlanceOwner(undefined)}
+      onCheck={state.status === "connected" && composerOwnerReady && partnerIdentity.partner.canonicalSessionId === state.selectedId ? async () => {
+        if (client.partnerConversationTransport()?.ownerKey !== partnerGlanceApi.ownerKey
+          || client.state.status !== "connected" || client.state.selectedId !== partnerIdentity.partner?.canonicalSessionId) return false;
+        return client.send({ text: PARTNER_TODO_CHECK_PROMPT, mentions: [], atoms: [], slashCommands: [], attachments: [] }, { keepComposerDraft: true });
+      } : undefined}
       onHomeSettings={() => { const partner = partnerIdentity.partner, api = client.partnerHomeApi(); if (api && partner && client.partnerConversationTransport()?.ownerKey === partnerGlanceApi.ownerKey)
         setPartnerHome({ api, partnerId: partner.partnerId, revision: partner.revision, inputHandoff: partner.capabilities.inputHandoff ?? true }); }}
       onOpenTask={sessionId => { if (client.partnerConversationTransport()?.ownerKey === partnerGlanceApi.ownerKey) void client.select(sessionId).catch(failure => setLocalError(errorText(failure))); }}

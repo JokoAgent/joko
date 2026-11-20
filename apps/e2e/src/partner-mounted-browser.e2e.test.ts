@@ -15,6 +15,7 @@ import {
   CancelPartnerDelegationRequestSchema,
   CancelPartnerDelegationResponseSchema,
   OperationState,
+  PARTNER_TODO_CHECK_PROMPT,
   PermissionMode,
   RunState
 } from "@joko/contracts";
@@ -83,6 +84,57 @@ describe("mounted Partner collaboration product chain", () => {
     browser = undefined;
     await fixture?.close({ removeRoot: true });
     fixture = undefined;
+  });
+
+  mountedIt("changes the daily todo check from an empty Glance and sends the manual check to the original Partner", { timeout: 120_000 }, async () => {
+    fixture = await RealPiSystemFixture.start({
+      webDirectory: requiredEnvironment("JOKO_MOUNTED_WEB_DIR"), enableInternalServer: true,
+      providerResponder: () => ({ kind: "text", text: "I checked the existing todos. There is nothing new to add." })
+    });
+    const manager = await fixture.pair("Glance owner");
+    const partner = await createPartner(fixture, manager, "Elin", "orbit");
+    const read = async () => (await manager.clients.partnerRoutine.listPartnerRoutines({ partnerId: partner.partnerId }))
+      .routines.find(routine => routine.builtin === "todo-check");
+    const initial = await waitFor(read, value => value !== undefined, "the current Partner's daily check template");
+    expect(initial).toMatchObject({ builtinVersion: 1, definition: { enabled: false, silentWhenIdle: true,
+      triggers: [{ kind: { case: "cron", value: { expression: "0 9 * * 1-5" } } }] } });
+    const device = "Glance Browser";
+    const challenge = required((await fixture.anonymous.connection.beginPairing({ deviceDisplayName: device })).challenge, "the pairing challenge");
+    browser = await chromium.launch({ executablePath: requiredEnvironment("JOKO_BROWSER_EXECUTABLE"), headless: true });
+    const page = await browser.newPage({ viewport: { width: 1280, height: 800 }, locale: "en-US" });
+    const taskUrl = `${fixture.baseUrl}/#/tasks/${encodeURIComponent(partner.canonicalSessionId)}`;
+    await page.goto(`${fixture.baseUrl}/#/partners`, { waitUntil: "domcontentloaded" });
+    await page.locator(".connection-tabs > button").nth(2).click();
+    await page.locator('details.device-authorization__manual > summary').click();
+    await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+    await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
+    await page.getByLabel("Device name").fill(device);
+    await page.locator("form.pair-form button[type=submit]").click();
+    await page.locator(partnerCard(partner.partnerId)).waitFor({ state: "visible", timeout: 30_000 });
+    await page.goto(taskUrl, { waitUntil: "domcontentloaded" });
+
+    const glance = page.locator("details.partner-glance > summary").filter({ hasText: "At a glance" });
+    const daily = page.getByRole("switch", { name: "Daily todo check", exact: true });
+    await glance.click();
+    expect(await daily.getAttribute("aria-checked")).toBe("false");
+    await daily.click();
+    const enabled = await waitFor(read, value => value?.definition?.enabled === true, "the saved daily check");
+    expect(enabled?.id).toBe(initial?.id);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await glance.click();
+    expect(await daily.getAttribute("aria-checked")).toBe("true");
+    await daily.click();
+    await waitFor(read, value => value?.definition?.enabled === false, "the same daily check to pause");
+
+    const store = fixture.application.store;
+    const native = store.getSession(partner.canonicalSessionId).descriptor.binding.opaqueRef;
+    await page.getByRole("button", { name: "Help me check", exact: true }).click();
+    const item = await waitFor(async () => store.listQueueItems({ sessionId: partner.canonicalSessionId })
+      .find(queue => queue.body.text === PARTNER_TODO_CHECK_PROMPT),
+    value => value?.state === "completed", "the manual check in the original Partner conversation");
+    expect(item?.sessionId).toBe(partner.canonicalSessionId);
+    expect(store.getSession(partner.canonicalSessionId).descriptor.binding.opaqueRef).toBe(native);
+    expect(fixture.providerRequests.filter(request => latestUserText(request).includes(PARTNER_TODO_CHECK_PROMPT))).toHaveLength(1);
   });
 
   mountedIt("retains an independent Pi task result in the original Partner conversation after reload", async () => {

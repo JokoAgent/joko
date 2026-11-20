@@ -8,6 +8,7 @@ import type { ScheduleCoordinator } from "./schedule-coordinator.js";
 import { defaultScheduleExtensionSnapshot, withScheduleExtensionSnapshot } from "./schedule-extensions.js";
 import { executeSchedulePreRunHook, schedulePreRunFailureSummary } from "./schedule-pre-run-hook.js";
 import type { PartnerFollowUpRuntime } from "./partner-autonomy.js";
+import type { BridgeToolCallContext } from "./mcp-router.js";
 
 export class PartnerRoutineError extends Error {
   constructor(readonly code: "invalid" | "changed" | "unavailable", message: string) { super(message); this.name = "PartnerRoutineError"; }
@@ -106,13 +107,31 @@ export class PartnerRoutineManager {
   }
   sources(partnerId: string): readonly RoutineSource[] { this.#owner(partnerId, false); return this.engine.listSources(); }
   assertExecutionCaller(context: { readonly sessionId: string; readonly targetId: string; readonly generation: number;
-    readonly providerGeneration?: number }): void {
+    readonly providerGeneration?: number }) {
     const partner = this.options.partners.runtimeCaller(context.sessionId), session = this.options.store.getSession(context.sessionId).descriptor;
+    const link = this.options.partners.listSessions(partner.id).find(row => row.link.sessionId === session.id && row.link.role === 'routine')?.link;
     if (session.targetId !== context.targetId || session.binding.generation !== context.generation
-      || context.providerGeneration !== undefined && context.providerGeneration !== 1
-      || !this.options.partners.listSessions(partner.id).some(row => row.link.sessionId === session.id && row.link.role === 'routine')) {
+      || context.providerGeneration !== undefined && context.providerGeneration !== 1 || !link) {
       throw new PartnerRoutineError('changed', 'The routine execution caller changed.');
     }
+    return { partner, session, link };
+  }
+  assertDailyCheckCaller(partnerId: string, context: BridgeToolCallContext): void {
+    const { partner, session, link } = this.assertExecutionCaller(context);
+    const store = this.options.store, input = context.inputQueueItem;
+    const routine = this.engine.list(partnerId).find(row => row.builtin === "todo-check" && row.enabled && link.routineKey === `routine:${row.id}`);
+    const unavailable = () => new PartnerRoutineError("changed", "The daily todo check is no longer active.");
+    if (partner.id !== partnerId || !routine || !input) throw unavailable();
+    const queue = store.findQueueItemByRunId(session.id, input.runId);
+    const run = store.findRun(input.runId)?.descriptor;
+    const attempt = queue?.attemptId === input.attemptId ? store.getAttempt(input.attemptId).descriptor : undefined;
+    const occurrence = store.findScheduleRunByRunId(input.runId);
+    if (queue?.id !== input.id || !["dispatching", "backend_accepted"].includes(queue.state)
+      || run?.source !== "schedule" || run.sessionId !== session.id || run.activeAttemptId !== input.attemptId
+      || !["queued", "running", "waiting", "retrying"].includes(run.state)
+      || !attempt || attempt.runId !== run.id || attempt.generation !== context.generation || attempt.endedAt !== undefined
+      || attempt.backendInstanceGeneration !== store.getBackend(session.backendId).descriptor.instanceGeneration
+      || occurrence?.scheduleId !== `partner-routine-${routine.id}` || occurrence.sessionId !== session.id) throw unavailable();
   }
   history(partnerId: string, routineId: string, offset = 0): { readonly runs: readonly RoutineRun[]; readonly nextOffset?: number } {
     this.#owner(partnerId, false); this.#routine(partnerId, routineId);

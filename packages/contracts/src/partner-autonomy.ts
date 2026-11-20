@@ -1,10 +1,44 @@
-import type { MessageInitShape } from "@bufbuild/protobuf";
+import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import type { GetPartnerGlanceResponse, GetPartnerAutonomySettingsResponse, PartnerAutonomySettings,
   UpdatePartnerAutonomySettingsResponse, UpdatePartnerAutonomySettingsRequestSchema } from "./gen/joko/v1/partner_autonomy_pb.js";
 import { PartnerTodoView, PartnerTodoUiAction, type ListPartnerTodosResponse, type PartnerTodo, type UpdatePartnerTodoResponse } from "./gen/joko/v1/partner_todo_pb.js";
 import type { ListPartnerTaskOutputsResponse, PartnerTaskOutput } from "./gen/joko/v1/partner_pb.js";
+import { RoutineDefinitionSchema, type PartnerRoutine } from "./gen/joko/v1/partner_routine_pb.js";
+import type { PartnerRoutineApi } from "./partner-routines.js";
 
 export type PartnerAutonomySettingChoice = NonNullable<MessageInitShape<typeof UpdatePartnerAutonomySettingsRequestSchema>["choice"]>;
+export const PARTNER_TODO_CHECK_PROMPT = "Look for new items I need to handle in your authorized sources. Add verified discoveries to my todos with their source evidence, and tell me what needs my attention.";
+export interface PartnerTodoCheck {
+  readonly routine: PartnerRoutine;
+  readonly partnerRevision: bigint;
+  readonly writable: boolean;
+}
+
+export interface PartnerTodoCheckApi {
+  read(signal: AbortSignal): Promise<PartnerTodoCheck | undefined>;
+  set(current: PartnerTodoCheck, enabled: boolean, signal: AbortSignal): Promise<PartnerTodoCheck>;
+}
+
+export function createPartnerTodoCheckApi(routines: Pick<PartnerRoutineApi, "list" | "save">): PartnerTodoCheckApi {
+  return {
+    async read(signal) {
+      const catalog = await routines.list(signal);
+      const checks = catalog.routines.filter(item => item.builtin === "todo-check");
+      if (checks.length > 1) throw new Error("The Partner has conflicting daily todo checks.");
+      const routine = checks[0];
+      return routine === undefined ? undefined : { routine, partnerRevision: catalog.partnerRevision!.value, writable: catalog.writable };
+    },
+    async set(current, enabled, signal) {
+      const { routine } = current;
+      if (!current.writable || routine.builtin !== "todo-check" || !routine.definition) throw new Error("The daily todo check is unavailable.");
+      const updated = await routines.save(current.partnerRevision, create(RoutineDefinitionSchema, { ...routine.definition, enabled }), { routine }, signal);
+      if (updated.id !== routine.id || updated.builtin !== "todo-check" || updated.definition?.enabled !== enabled) {
+        throw new Error("The daily todo check receipt is invalid.");
+      }
+      return { ...current, routine: updated };
+    }
+  };
+}
 export interface PartnerAutonomyApi {
   readonly ownerKey: string;
   newOperationId(): string;
@@ -14,6 +48,7 @@ export interface PartnerAutonomyApi {
   todos(partnerId: string, view: "open" | "done", offset: number, signal: AbortSignal): Promise<ListPartnerTodosResponse>;
   updateTodo(operationId: string, partnerId: string, partnerRevision: bigint, todo: PartnerTodo, action: "delete" | "restore", signal: AbortSignal): Promise<PartnerTodo>;
   outputs(partnerId: string, signal: AbortSignal): Promise<readonly PartnerTaskOutput[]>;
+  todoCheck?(partnerId: string): PartnerTodoCheckApi;
 }
 interface AutonomyRpc {
   getPartnerAutonomySettings(request: object, options: { signal: AbortSignal }): Promise<GetPartnerAutonomySettingsResponse>;
@@ -25,7 +60,8 @@ interface AutonomyRpc {
 }
 /** Web and Mobile share generated payloads and the same connection retirement fence. */
 export function createPartnerAutonomyApi(input: { readonly rpc: AutonomyRpc; readonly ownerKey: string;
-  readonly newOperationId: () => string; readonly assertCurrent: (signal: AbortSignal) => void }): PartnerAutonomyApi {
+  readonly newOperationId: () => string; readonly assertCurrent: (signal: AbortSignal) => void;
+  readonly todoCheck?: (partnerId: string) => PartnerTodoCheckApi }): PartnerAutonomyApi {
   const check = (signal: AbortSignal) => { signal.throwIfAborted(); input.assertCurrent(signal); };
   const invoke = async <T>(signal: AbortSignal, action: () => Promise<T>): Promise<T> => { check(signal); const value = await action(); check(signal); return value; };
   const settings = (value: PartnerAutonomySettings | undefined): PartnerAutonomySettings => {
@@ -34,6 +70,7 @@ export function createPartnerAutonomyApi(input: { readonly rpc: AutonomyRpc; rea
     return value;
   };
   return { ownerKey: input.ownerKey, newOperationId: input.newOperationId,
+    ...(input.todoCheck === undefined ? {} : { todoCheck: input.todoCheck }),
     settings: signal => invoke(signal, async () => settings((await input.rpc.getPartnerAutonomySettings({}, { signal })).settings)),
     save: (operationId, revision, choice, signal) => invoke(signal, async () => settings((await input.rpc.updatePartnerAutonomySettings({ operationId,
       expectedRevision: { value: revision }, choice }, { signal })).settings)),
@@ -72,6 +109,8 @@ const english = {
   saveUnknown: "The save receipt was lost. Retry the same request to recover its result.", failed: "Task observation could not refresh. Retry.", loading: "Loading…", more: "Show more",
   all: "All tasks on this node", own: "Tasks this Partner created or took over", waiting: "Waiting for you", working: "Working", done: "{count} done today",
   empty: "None", permission: "Waiting for permission", limit: "Waiting for usage reset", task: "Open the original task", minutes: "min",
+  dailyCheck: "Daily todo check", checkNow: "Help me check", checkFailed: "The check could not start. Retry.",
+  dailyCheckFailed: "Refresh to see the current daily todo check setting.",
   todos: "Your affairs", completed: "Completed", remove: "Delete", undo: "Undo delete", quote: "Discuss this affair", computers: "Computer", outputs: "Outputs", here: "Home computer", online: "Online", offline: "Offline", offlineCount: "{count} offline computers", computersFailed: "Computers could not refresh. Retry."
 };
 const chinese: typeof english = {
@@ -82,6 +121,8 @@ const chinese: typeof english = {
   saveUnknown: "保存回执丢失，请重试原请求取回结果。", failed: "近况刷新失败，请重试。", loading: "加载中…", more: "查看更多",
   all: "本节点全部任务", own: "这位伙伴创建或明确接手的任务", waiting: "等你", working: "在做", done: "今天完成 {count} 件",
   empty: "暂无", permission: "等待权限确认", limit: "等待用量恢复", task: "打开原任务", minutes: "分钟",
+  dailyCheck: "每日检查待办", checkNow: "帮我查查", checkFailed: "无法开始检查，请重试。",
+  dailyCheckFailed: "请刷新以查看当前的每日检查设置。",
   todos: "待办", completed: "已完成", remove: "删除", undo: "撤销删除", quote: "引用这条待办", computers: "电脑", outputs: "输出内容", here: "主力电脑", online: "在线", offline: "离线", offlineCount: "{count} 台电脑离线", computersFailed: "无法读取电脑，请重试。"
 };
 export function partnerAutonomyMessages(locale?: string): typeof english { return locale === "zh-CN" ? chinese : english; }
