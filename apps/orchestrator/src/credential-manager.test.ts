@@ -373,6 +373,22 @@ describe("ProviderCatalogManager", () => {
     store.close();
   });
 
+  it("reads the xAI subscription access token without requiring a ChatGPT account ID", async () => {
+    const { credentials, store, now } = await fixture();
+    try {
+      const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi", now: () => now });
+      providers.initialize();
+      await providers.registerNativeAuthProviders([{ provider: { id: "xai", api: "openai-responses", models: [] },
+        displayName: "xAI", kind: "subscription", accountUsageAvailable: true }]);
+      await providers.persistNativeAuth({ providerId: "xai", expectedCatalogGeneration: providers.generation,
+        credential: { type: "oauth", access: "fixture-xai-access", refresh: "fixture-xai-refresh", expires: now + 60_000 } });
+      const identity = providers.describeProviderAccountUsage("xai");
+      expect(identity).toBeDefined();
+      await expect(providers.useProviderAccountUsageCredential(identity!, async credential => ({ ...credential })))
+        .resolves.toEqual({ accessToken: "fixture-xai-access" });
+    } finally { store.close(); }
+  });
+
   it("opens subscription account credentials only inside a generation-fenced callback", async () => {
     const { root, credentials, store, now } = await fixture();
     const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi", now: () => now });

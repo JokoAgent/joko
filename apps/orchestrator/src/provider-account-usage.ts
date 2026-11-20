@@ -2,6 +2,9 @@ import type { ProviderAccountCreditsSnapshot, ProviderAccountUsageSnapshot, Prov
 export type { ProviderAccountCreditsSnapshot, ProviderAccountUsageSnapshot, ProviderAccountUsageWindow } from "@joko/core";
 
 const ACCOUNT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+const XAI_SETTINGS_URL = "https://cli-chat-proxy.grok.com/v1/settings";
+const XAI_WEEKLY_CREDITS_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
+const WEEK_MINUTES = 7 * 24 * 60;
 const DEFAULT_TIMEOUT_MS = 5_000;
 const DEFAULT_BODY_LIMIT_BYTES = 64 * 1024;
 const DEFAULT_CACHE_TTL_MS = 60_000;
@@ -20,7 +23,7 @@ export interface ProviderAccountUsageCredentialIdentity {
 
 export interface ProviderAccountUsageCredential {
   readonly accessToken: string;
-  readonly accountId: string;
+  readonly accountId?: string;
 }
 
 /** Service-owned port. Plaintext credentials exist only for the duration of useCredential. */
@@ -112,7 +115,7 @@ export class ProviderAccountUsageProvider {
       this.invalidate(providerId);
       return undefined;
     }
-    return entry.snapshot;
+    return currentAccountUsage(entry.snapshot, this.#now());
   }
 
   async get(providerId: string, signal?: AbortSignal): Promise<ProviderAccountUsageSnapshot | undefined> {
@@ -130,13 +133,14 @@ export class ProviderAccountUsageProvider {
       cached = undefined;
     }
     const now = this.#now();
-    if (cached !== undefined && cached.expiresAt > now) {
+    const visible = currentAccountUsage(cached?.snapshot, now);
+    if (cached !== undefined && cached.expiresAt > now && (visible !== undefined || cached.snapshot === undefined)) {
       this.#touch(providerId, cached, now);
-      return cached.snapshot;
+      return visible;
     }
     if (cached !== undefined && cached.retryAt > now) {
       this.#touch(providerId, cached, now);
-      return cached.snapshot;
+      return visible;
     }
     const existing = this.#inflight.get(providerId);
     if (existing !== undefined && existing.identityKey === key) {
@@ -223,7 +227,7 @@ export class ProviderAccountUsageProvider {
         failures,
         lastAccessedAt: now
       });
-      return previous?.snapshot;
+      return currentAccountUsage(previous?.snapshot, now);
     }
   }
 
@@ -288,31 +292,32 @@ async function fetchProviderAccountUsage(input: {
   try {
     throwIfAborted(input.signal);
     const accessToken = safeHeaderValue(input.credential.accessToken, 64 * 1024);
-    const accountId = safeHeaderValue(input.credential.accountId, 256);
-    const response = await input.fetch(ACCOUNT_USAGE_URL, {
-      method: "GET",
-      headers: {
-        accept: "application/json",
-        authorization: `Bearer ${accessToken}`,
-        "chatgpt-account-id": accountId
-      },
-      signal: controller.signal,
-      redirect: "error",
-      credentials: "omit",
-      cache: "no-store",
-      referrerPolicy: "no-referrer"
-    });
-    if (response.redirected) throw new Error("Provider account usage redirected.");
-    if (response.status === 401 || response.status === 403) throw new ProviderAccountUsageUnauthorizedError();
-    if (response.status !== 200) throw new Error("Provider account usage is temporarily unavailable.");
-    const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
-    if (contentType !== "application/json") throw new Error("Provider account usage returned an unsupported representation.");
-    const body = await readBoundedJson(response, input.bodyLimitBytes);
+    const get = async (url: string, headers: Record<string, string>) => readAccountUsageJson(await input.fetch(url, {
+      method: "GET", headers: { accept: "application/json", authorization: `Bearer ${accessToken}`, ...headers },
+      signal: controller.signal, redirect: "error", credentials: "omit", cache: "no-store", referrerPolicy: "no-referrer"
+    }), input.bodyLimitBytes);
+    if (input.providerId === "xai") {
+      const headers = { "x-xai-token-auth": "xai-grok-cli", "x-grok-client-version": "1.0.3", "x-grok-client-mode": "interactive" };
+      const [settings, credits] = await Promise.all([get(XAI_SETTINGS_URL, headers), get(XAI_WEEKLY_CREDITS_URL, headers)]);
+      return parseXaiAccountUsage(settings, credits, input.now());
+    }
+    const accountId = safeHeaderValue(input.credential.accountId ?? "", 256);
+    const body = await get(ACCOUNT_USAGE_URL, { "chatgpt-account-id": accountId });
     return parseProviderAccountUsage(input.providerId, body, input.now());
   } finally {
     clearTimeout(timeout);
     input.signal.removeEventListener("abort", abort);
+    if (input.providerId === "xai") controller.abort();
   }
+}
+
+async function readAccountUsageJson(response: Response, maximumBytes: number): Promise<unknown> {
+  if (response.redirected) throw new Error("Provider account usage redirected.");
+  if (response.status === 401 || response.status === 403) throw new ProviderAccountUsageUnauthorizedError();
+  if (response.status !== 200) throw new Error("Provider account usage is temporarily unavailable.");
+  const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+  if (contentType !== "application/json") throw new Error("Provider account usage returned an unsupported representation.");
+  return readBoundedJson(response, maximumBytes);
 }
 
 async function readBoundedJson(response: Response, maximumBytes: number): Promise<unknown> {
@@ -376,6 +381,33 @@ function parseProviderAccountUsage(providerId: string, value: unknown, observedA
     ...(credits === undefined ? {} : { credits }),
     observedAt
   };
+}
+
+function parseXaiAccountUsage(settings: unknown, credits: unknown, observedAt: number): ProviderAccountUsageSnapshot {
+  const parent = record(credits, "credits");
+  const config = optionalRecord(parent, "config") ?? parent;
+  const period = optionalRecord(config, "currentPeriod");
+  const end = period?.["end"];
+  const resetAt = typeof end === "number" ? Math.floor(end * 1_000) : typeof end === "string" ? Date.parse(end) : NaN;
+  const used = Object.hasOwn(config, "creditUsagePercent") ? normalizedFiniteNumber(config["creditUsagePercent"]) : 0;
+  if (period?.["type"] !== "USAGE_PERIOD_TYPE_WEEKLY" || !Number.isSafeInteger(resetAt) || resetAt <= observedAt || used === undefined) {
+    throw new Error("The xAI weekly account usage window is unavailable.");
+  }
+  const planType = optionalText(record(settings, "settings"), "subscription_tier_display", 128);
+  const raw = config["prepaidBalance"];
+  const cents = normalizedFiniteNumber(raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>)["val"] : raw);
+  const balance = cents !== undefined && cents >= 0 && cents <= Number.MAX_SAFE_INTEGER ? (cents / 100).toFixed(2) : undefined;
+  return {
+    providerId: "xai", observedAt,
+    secondaryWindow: { usedPercent: Math.min(100, Math.max(0, used)), windowMinutes: WEEK_MINUTES, resetAt },
+    ...(planType === undefined ? {} : { planType }),
+    ...(balance === undefined ? {} : { credits: { observedAt, balance, hasCredits: cents! > 0 } })
+  };
+}
+
+function currentAccountUsage(snapshot: ProviderAccountUsageSnapshot | undefined, now: number): ProviderAccountUsageSnapshot | undefined {
+  if (snapshot?.providerId === "xai" && (snapshot.secondaryWindow?.resetAt ?? 0) <= now) return undefined;
+  return snapshot;
 }
 
 function usageWindow(parent: Record<string, unknown>, name: string, observedAt: number): ProviderAccountUsageWindow | undefined {

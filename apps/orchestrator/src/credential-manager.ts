@@ -2149,12 +2149,12 @@ export class ProviderCatalogManager {
     if (stored === undefined) throw new Error("Provider account usage credential is unavailable.");
     const credential = parseNativePiCredential(stored.serializedCredential);
     if (credential.type !== "oauth") throw new Error("Provider account usage requires an OAuth credential.");
-    const accountId = credential["accountId"];
-    if (typeof accountId !== "string" || accountId.length < 1 || accountId.length > 256
-        || /[\u0000-\u001f\u007f]/u.test(accountId)) {
+    const accountId = identity.providerId === "xai" ? undefined : credential["accountId"];
+    if (identity.providerId !== "xai" && (typeof accountId !== "string" || accountId.length < 1 || accountId.length > 256
+        || /[\u0000-\u001f\u007f]/u.test(accountId))) {
       throw new Error("Provider account usage identity is unavailable.");
     }
-    const result = await operation({ accessToken: credential.access, accountId });
+    const result = await operation({ accessToken: credential.access, ...(typeof accountId === "string" ? { accountId } : {}) });
     if (!sameProviderAccountUsageIdentity(this.describeProviderAccountUsage(identity.providerId), identity)) {
       throw new Error("Provider account usage credential generation changed during the request.");
     }

@@ -47,8 +47,8 @@ describe("nativeThinkingLevels", () => {
 });
 
 describe("supportsProviderAccountUsage", () => {
-  const provider = (input: { readonly subscription: boolean; readonly apis: readonly string[] }) => ({
-    id: "renamed-subscription-provider",
+  const provider = (input: { readonly subscription: boolean; readonly apis: readonly string[]; readonly id?: string }) => ({
+    id: input.id ?? "renamed-subscription-provider",
     getModels: () => input.apis.map((api, index) => ({
       id: `model-${index}`,
       api,
@@ -63,7 +63,7 @@ describe("supportsProviderAccountUsage", () => {
     }
   });
 
-  it("derives support from subscription auth plus the runtime protocol, not Provider identity", () => {
+  it("keeps the existing runtime protocol qualification for WHAM", () => {
     expect(supportsProviderAccountUsage(provider({
       subscription: true,
       apis: ["openai-codex-responses"]
@@ -76,6 +76,11 @@ describe("supportsProviderAccountUsage", () => {
       subscription: true,
       apis: ["openai-codex-responses", "openai-responses"]
     }))).toBe(false);
+  });
+  it("adopts the xAI quota surface only for the published subscription model protocol", () => {
+    expect(supportsProviderAccountUsage(provider({ id: "xai", subscription: true, apis: ["openai-responses"] }))).toBe(true);
+    expect(supportsProviderAccountUsage(provider({ id: "xai", subscription: false, apis: ["openai-responses"] }))).toBe(false);
+    expect(supportsProviderAccountUsage(provider({ subscription: true, apis: ["openai-responses"] }))).toBe(false);
   });
 });
 

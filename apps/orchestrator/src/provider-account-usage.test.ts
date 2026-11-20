@@ -45,6 +45,43 @@ class FakeCredentialResolver implements ProviderAccountUsageCredentialResolver {
 }
 
 describe("ProviderAccountUsageProvider", () => {
+  it("reads the xAI subscription's current weekly window and retires it at its own reset", async () => {
+    const credentials = new FakeCredentialResolver();
+    credentials.identity = { ...credentials.identity!, providerId: "xai" };
+    credentials.credential = { accessToken: "fixture-xai-access" };
+    const resetAt = NOW + 60_000;
+    let now = NOW;
+    let usage: Record<string, unknown> = { creditUsagePercent: 75 };
+    const fetch = vi.fn(async (url: string | URL | Request, _init?: RequestInit) => {
+      return String(url).endsWith("/settings") ? jsonResponse({ subscription_tier_display: "SuperGrok", email: "ignored@example.test" })
+        : jsonResponse({ config: { currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: resetAt / 1_000 }, prepaidBalance: { val: 925 }, ...usage } });
+    });
+    const provider = new ProviderAccountUsageProvider({ credentials, fetch, now: () => now, cacheTtlMs: 100, initialBackoffMs: 10 });
+
+    await expect(provider.get("xai")).resolves.toEqual({ providerId: "xai", planType: "SuperGrok", observedAt: NOW,
+      secondaryWindow: { usedPercent: 75, windowMinutes: 10_080, resetAt }, credits: { balance: "9.25", hasCredits: true, observedAt: NOW } });
+    expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+      "https://cli-chat-proxy.grok.com/v1/settings", "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+    ]);
+    for (const [, init] of fetch.mock.calls) {
+      expect(init).toMatchObject({ redirect: "error", credentials: "omit", method: "GET", headers: {
+        authorization: "Bearer fixture-xai-access", "x-xai-token-auth": "xai-grok-cli"
+      } });
+      expect(init?.headers).not.toHaveProperty("chatgpt-account-id");
+    }
+    expect(JSON.stringify(provider.peek("xai"))).not.toMatch(/fixture-xai-access|ignored@example/u);
+
+    now += 200;
+    usage = { creditUsagePercent: "malformed" };
+    await expect(provider.get("xai")).resolves.toMatchObject({ secondaryWindow: { usedPercent: 75 } });
+    now += 200;
+    usage = {};
+    await expect(provider.get("xai")).resolves.toMatchObject({ secondaryWindow: { usedPercent: 0, resetAt } });
+    now = resetAt;
+    expect(provider.peek("xai")).toBeUndefined();
+    await expect(provider.get("xai")).resolves.toBeUndefined();
+  });
+
   it("uses the fixed credential-free transport shape and parses both account windows", async () => {
     const credentials = new FakeCredentialResolver();
     let capturedUrl: string | URL | Request | undefined;
