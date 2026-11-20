@@ -11,7 +11,7 @@ import { AppServerHost, CodexBackendAdapter } from "@joko/adapter-codex";
 import { FakeCodexAppServer, type ScriptedRpcTransport } from "@joko/adapter-codex/testing";
 import type { RemoteFileTransportPort, RemoteFileStat, RemoteProcessHandle, RemoteProcessTransportPort, RemoteProcessStartRequest } from "@joko/remote-ssh";
 import { OperationalStore } from "@joko/store";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ArtifactStore } from "./artifact-store.js";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import type { OrchestratorApplication } from "./application.js";
@@ -25,6 +25,7 @@ import { RemoteSkillSourceOwner } from "./remote-skill-source.js";
 import { PiResourceManager } from "./resource-manager.js";
 import { createPublicServer } from "./server.js";
 import { SessionHost } from "./session-host.js";
+import { SkillManager } from "./skill-manager.js";
 import { mkdtemp } from "./test-paths.js";
 import { WorkspaceService } from "./workspace-service.js";
 
@@ -32,7 +33,7 @@ const serialize = (value: unknown): string => JSON.stringify(value, (_key, item:
 const profile = "/home/test/.joko/runtime/v1/codex-home";
 
 describe("registered remote project Skill input composition", () => {
-  it.each([["selection", "idle"], ["selection", "active"], ["rename", "idle"], ["rename", "active"]] as const)(
+  it.each([["selection", "idle"], ["selection", "active"], ["rename", "idle"], ["rename", "active"], ["Skill disable", "idle"]] as const)(
     "keeps the original Run through project %s and handles its %s mount on shutdown", async (projectEdit, shutdownState) => {
     const root = await mkdtemp(join(tmpdir(), "joko-remote-skill-chain-"));
     const database = join(root, "store.db");
@@ -60,6 +61,7 @@ describe("registered remote project Skill input composition", () => {
     const sourceOwner = new RemoteSkillSourceOwner({ store, managedRoot: join(root, "source-generations"),
       captureSkillSourceAuthority: (workspaceId, signal) => workspaces.captureSkillSourceAuthority(workspaceId, signal) });
     const resources = new PiResourceManager({ store, managedRoot: join(root, "resources"), remoteProjectSkills: sourceOwner });
+    const skills = new SkillManager({ resources, store, rootDirectory: join(root, "skills") });
     const resolver = new RemoteCodexRuntimeResolver({ store, remoteExecution: router, nativeSkillJournalRoot: join(root, "mount-journals"),
       captureSkillSourceAuthority: (workspaceId, signal) => workspaces.captureSkillSourceAuthority(workspaceId, signal) });
     const localCatalog = new FakeCodexAppServer();
@@ -77,7 +79,7 @@ describe("registered remote project Skill input composition", () => {
     let finalQueueState = "";
     let server: Awaited<ReturnType<typeof createPublicServer>> | undefined;
     try {
-      await host.initialize(); await resources.initialize();
+      await host.initialize(); await resources.initialize(); await skills.initialize();
       const binding = { kind: "ssh" as const, hostTargetId: "remote-target", hostId: "ssh-host", workspaceRoot: "/srv/project" };
       const target = { id: "remote-target", backendId: adapter.id, displayName: "Remote project", workspaceRoot: root,
         managed: false, trusted: true, remoteWorkspace: binding };
@@ -86,10 +88,11 @@ describe("registered remote project Skill input composition", () => {
         remote: { targetId: "remote-target", binding } });
       await resolver.resolve(target);
       await host.registerTarget(target, { workspaceId: "remote-workspace" });
+      const restartBackend = vi.fn(async () => undefined);
       server = await createPublicServer({ config: { publicOrigin: "http://127.0.0.1", allowInsecureLoopback: true, allowInsecureLan: false,
         corsOrigins: [], webDirectory: join(root, "no-web"), dataDirectory: root }, store, connections, sessionHost: host,
-        piResources: resources, artifacts: {}, blobTransfers: {}, artifactRepository: {}, workspaces: workspaceService, workspaceChanges: {}, scheduler: {},
-        adapters: [adapter], browserActivity: [], restartBackend: async () => undefined } as unknown as OrchestratorApplication);
+        piResources: resources, skills, artifacts: {}, blobTransfers: {}, artifactRepository: {}, workspaces: workspaceService, workspaceChanges: {}, scheduler: {},
+        adapters: [adapter], browserActivity: [], restartBackend } as unknown as OrchestratorApplication);
       server.log.level = "silent";
       const baseUrl = await server.listen({ host: "127.0.0.1", port: 0 });
       const transport = createConnectTransport({ baseUrl, httpVersion: "1.1", interceptors: [next => request => {
@@ -112,6 +115,34 @@ describe("registered remote project Skill input composition", () => {
         mutation: { payload: { case: "approveResource", value: { resourceId, discoveredRevision: discovered.discoveredRevision } } } });
       await operations.submitOperation({ operationId: "enable-remote-project", connectionId: paired.connection.id,
         mutation: { payload: { case: "setResourceEnabled", value: { resourceId, enabled: true } } } });
+      let other: { sessionId: string; skill: contract.SessionResource } | undefined;
+      if (projectEdit === "Skill disable") {
+        const otherBinding = { ...binding, workspaceRoot: "/srv/other" };
+        const otherTarget = { ...target, id: "other-target", displayName: "Other project", remoteWorkspace: otherBinding };
+        const skillDirectory = "/srv/other/.agents/skills/Other-report";
+        await files.mkdir(skillDirectory, { recursive: true });
+        await files.write({ path: `${skillDirectory}/SKILL.md`, content: Buffer.from("---\nname: other-report\ndescription: Other approved Skill\n---\nOther instructions.\n") });
+        store.upsertTarget(otherTarget, { workspaceId: "other-workspace" });
+        await workspaceService.register({ id: "other-workspace", root: otherBinding.workspaceRoot, displayName: otherTarget.displayName,
+          trusted: true, remote: { targetId: otherTarget.id, binding: otherBinding } });
+        await resolver.resolve(otherTarget);
+        await host.registerTarget(otherTarget, { workspaceId: "other-workspace" });
+        await operations.submitOperation({ operationId: "discover-other-project", connectionId: paired.connection.id,
+          mutation: { payload: { case: "discoverProjectResources", value: { targetId: otherTarget.id } } } });
+        const entry = (await catalogClient.listPiResources({ backendId: adapter.id, targetId: otherTarget.id })).resources[0]!;
+        await operations.submitOperation({ operationId: "approve-other-project", connectionId: paired.connection.id,
+          mutation: { payload: { case: "approveResource", value: { resourceId: entry.resourceId, discoveredRevision: entry.discoveredRevision } } } });
+        await operations.submitOperation({ operationId: "enable-other-project", connectionId: paired.connection.id,
+          mutation: { payload: { case: "setResourceEnabled", value: { resourceId: entry.resourceId, enabled: true } } } });
+        const otherNativeId = daemon.fake.seedThread(otherBinding.workspaceRoot);
+        const candidate = (await adapter.listNativeSessions(otherTarget)).find(item => item.nativeSessionId === otherNativeId)!;
+        const task = (await host.createSession({ operationId: "create-other-skill-task", connection: paired.connection,
+          targetId: otherTarget.id, title: otherTarget.displayName, providerId: "openai", modelId: "gpt-test",
+          nativeStart: { kind: "attach", nativeReference: candidate.nativeReference }, fastMode: false, permissionMode: "ask", planMode: false })).value;
+        const skill = (await sessions.listSessionResources({ sessionId: task.sessionId })).resources[0]!;
+        expect(skill).toMatchObject({ resourceId: entry.resourceId, name: "Other-report" });
+        other = { sessionId: task.sessionId, skill };
+      }
       daemon.fake.seedThread(binding.workspaceRoot);
       const nativeReference = (await adapter.listNativeSessions(target))[0]!.nativeReference;
       sessionId = (await host.createSession({ operationId: "create-remote-skill-task", connection: paired.connection,
@@ -122,7 +153,7 @@ describe("registered remote project Skill input composition", () => {
         })).value.sessionId;
       const loaded = (await sessions.listSessionResources({ sessionId })).resources[0]!;
       expect(loaded).toMatchObject({ resourceId, name: "Public-report", kind: contract.ResourceKind.SKILL });
-      mountedPath = daemon.mountPaths[0]!;
+      mountedPath = daemon.mountPaths.at(-1)!;
       expect(mountedPath).toMatch(/^\/home\/test\/\.joko\/runtime\/v1\/codex-home\/\.joko-approved-skills\//u);
       expect(await files.read({ path: posix.join(posix.dirname(mountedPath), "assets/template.bin"), maximumBytes: 4 })).toEqual(Buffer.from([0, 255, 8, 12]));
       expect((await sessions.listRuntimeCommands({ sessionId })).commands).toEqual([{
@@ -136,7 +167,7 @@ describe("registered remote project Skill input composition", () => {
         sessionId,
         inputMode: contract.RuntimeCommandInputMode.RESOURCE_MENTION
       }]);
-      const nativeStart = daemon.messages.find(message => message.method === "thread/resume")!;
+      const nativeStart = daemon.messages.findLast(message => message.method === "thread/resume")!;
       expect(serialize(nativeStart.params)).toContain('"skills.config"');
       expect(serialize(nativeStart.params)).toContain('"enabled":false');
       await expect(createClient(contract.SessionService, createConnectTransport({ baseUrl, httpVersion: "1.1" }))
@@ -173,6 +204,34 @@ describe("registered remote project Skill input composition", () => {
       const initializeCount = daemon.messages.filter(message => message.method === "initialize").length;
       expect(originalProxy).toBeDefined(); expect(originalTransport).toBeDefined();
       expect(daemon.messages.filter(message => message.method === "initialize" && message.proxyId === originalProxyId)).toHaveLength(1);
+      let otherTurn: { queueId: string; nativeId: string; transport: ScriptedRpcTransport } | undefined;
+      if (other !== undefined) {
+        daemon.beforeTurnWrite = undefined;
+        const originalRestartCount = restartBackend.mock.calls.length;
+        const skillClient = createClient(contract.SkillService, transport);
+        const current = (await skillClient.listSkills({ query: loaded.name })).skills.find(entry => entry.skillId === resourceId)!;
+        const disabled = await operations.submitOperation({ operationId: "disable-original-project-skill", connectionId: paired.connection.id,
+          mutation: { payload: { case: "setSkillEnabled", value: { skillId: resourceId,
+            expectedResourceRevision: current.entityVersion?.revision, enabled: false } } } });
+        expect(disabled.operation).toMatchObject({ state: contract.OperationState.SUCCEEDED,
+          result: { payload: { case: "skill", value: { skill: { skillId: resourceId, enabled: false } } } } });
+        expect(restartBackend).toHaveBeenCalledTimes(originalRestartCount);
+        expect(store.getQueueItem(queueId).state).toBe("backend_accepted");
+        const retained = other.skill;
+        const sent = await operations.submitOperation({ operationId: "send-other-original-skill", connectionId: paired.connection.id,
+          mutation: { preconditions: [{ entity: { kind: contract.EntityKind.SESSION, id: other.sessionId }, expectedGeneration: retained.runtimeGeneration }],
+            payload: { case: "sendInput", value: { sessionId: other.sessionId, deliveryMode: contract.QueueDeliveryMode.PROMPT,
+              input: { parts: [{ content: { case: "text", value: "Use @Other-report" } }, { content: { case: "resourceMention", value: {
+                resourceId: retained.resourceId, displayText: "@Other-report", discoveredRevision: retained.discoveredRevision,
+                resourceVersion: retained.resourceVersion, runtimeGeneration: retained.runtimeGeneration } } }],
+                mentionRanges: [{ start: 4, end: 17, mentionIndex: 0 }] } } } } });
+        expect(sent.operation).toMatchObject({ state: contract.OperationState.SUCCEEDED, result: { payload: { case: "queueItem" } } });
+        const otherTaskId = other.sessionId;
+        await expect.poll(() => store.listQueueItems({ sessionId: otherTaskId, limit: 1 })[0]?.state, { timeout: 10_000 }).toBe("backend_accepted");
+        otherTurn = { queueId: store.listQueueItems({ sessionId: otherTaskId, limit: 1 })[0]!.id,
+          nativeId: store.getSession(otherTaskId).descriptor.binding.nativeSessionId!, transport: daemon.activeTurnTransport! };
+        expect(store.getSession(otherTaskId).descriptor.binding.generation).toBe(Number(retained.runtimeGeneration));
+      }
       if (projectEdit === "rename") {
         await operations.submitOperation({ operationId: "rename-active-remote-project", connectionId: paired.connection.id,
           mutation: { preconditions: [{ entity: { kind: contract.EntityKind.TARGET, id: target.id },
@@ -207,15 +266,35 @@ describe("registered remote project Skill input composition", () => {
           && event.payload.role === "assistant" && serialize(event.payload).includes(text))).toHaveLength(1);
         if (projectEdit === "rename") await selectProject();
       }
+      if (otherTurn !== undefined) {
+        const input = "Continue the first project with ordinary text after the Skill changed.";
+        await operations.submitOperation({ operationId: "send-after-project-skill-disable", connectionId: paired.connection.id,
+          mutation: { preconditions: [{ entity: { kind: contract.EntityKind.SESSION, id: sessionId }, expectedGeneration: BigInt(originalBinding.generation) }],
+            payload: { case: "sendInput", value: { sessionId, deliveryMode: contract.QueueDeliveryMode.PROMPT,
+              input: { parts: [{ content: { case: "text", value: input } }] } } } } });
+        const ownNext = () => store.listQueueItems({ sessionId, limit: 20 })
+          .find(item => item.operationId === "send-after-project-skill-disable");
+        await expect.poll(() => ownNext()?.state, { timeout: 10_000 }).toBe("backend_accepted");
+        const resumed = store.getSession(sessionId).descriptor.binding;
+        expect(resumed).toMatchObject({ opaqueRef: originalBinding.opaqueRef, nativeSessionId: originalBinding.nativeSessionId });
+        expect(resumed.generation).toBeGreaterThan(originalBinding.generation);
+        expect(files.entries.has(mountedPath)).toBe(false);
+        expect((await sessions.listSessionResources({ sessionId })).resources).toEqual([]);
+        expect(store.getQueueItem(otherTurn.queueId).state).toBe("backend_accepted");
+        await daemon.fake.completeTurn(resumed.nativeSessionId!, "Plain input after refresh", daemon.activeTurnTransport);
+        await daemon.fake.completeTurn(otherTurn.nativeId, "Other project's Skill finished", otherTurn.transport);
+        await expect.poll(() => ownNext()?.state, { timeout: 10_000 }).toBe("completed");
+        await expect.poll(() => store.getQueueItem(otherTurn!.queueId).state, { timeout: 10_000 }).toBe("completed");
+      }
       const releasesBeforeShutdown = daemon.messages.filter(message => message.method === "thread/unsubscribe").length;
       await host.dispose();
       const releasesAfterShutdown = daemon.messages.filter(message => message.method === "thread/unsubscribe").length;
-      expect(releasesAfterShutdown - releasesBeforeShutdown).toBe(shutdownState === "idle" ? 1 : 0);
+      expect(releasesAfterShutdown - releasesBeforeShutdown).toBe(other === undefined ? (shutdownState === "idle" ? 1 : 0) : 2);
       expect(files.entries.has(mountedPath)).toBe(shutdownState === "active");
       expect(await readdir(join(root, "mount-journals"))).toHaveLength(shutdownState === "idle" ? 0 : 1);
       finalQueueState = store.getQueueItem(queueId).state;
     } finally {
-      await server?.close(); await host.dispose(); await adapter.dispose(); await resolver.shutdown(); await workspaceService.close();
+      await server?.close(); await skills.close(); await host.dispose(); await adapter.dispose(); await resolver.shutdown(); await workspaceService.close();
       await localHost.shutdown();
       leaseCurrent = false; store.close();
     }

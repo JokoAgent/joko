@@ -1194,6 +1194,7 @@ type ExtendedSessionHost = SessionHost & {
     effect: (sessionId: string, adapter: import("@joko/core").BackendAdapter, context: import("@joko/core").AdapterContext) => Promise<void>
   ): Promise<readonly string[]>;
   fenceBackendResourceCatalogs(backendId: string): symbol;
+  publishCodexSkillCatalogChange(backendId: string, targetId: string | undefined): void;
   completeBackendResourceCatalogRefresh(
     backendId: string,
     token: symbol,
@@ -24231,7 +24232,7 @@ async function preparedSkillEffectOperation<T>(
   }
   let prepared: PreparedSkillMutation<T> | undefined;
   let resource: NativePiResourceDescriptor | undefined;
-  let resourceCatalogFence: symbol | undefined;
+  let resourceCatalogFence: symbol | "published" | undefined;
   const execution = await dependencies.sessionHost.mutate<OperationOutcome>({
     operationId,
     connection,
@@ -24257,7 +24258,11 @@ async function preparedSkillEffectOperation<T>(
       requiredPreparedSkillMutation(prepared),
       (finalize) => {
         const completed = commit(finalize);
-        resourceCatalogFence = dependencies.sessionHost.fenceBackendResourceCatalogs(resource!.backendId);
+        const { backendId, scope, targetId } = resource!;
+        if (kind === "setSkillEnabled" && dependencies.store.getBackend(backendId).descriptor.adapterKind === "codex") {
+          dependencies.sessionHost.publishCodexSkillCatalogChange(backendId, scope === "project" ? targetId : undefined);
+          resourceCatalogFence = "published";
+        } else resourceCatalogFence = dependencies.sessionHost.fenceBackendResourceCatalogs(backendId);
         return completed;
       }
     ))
@@ -24266,7 +24271,9 @@ async function preparedSkillEffectOperation<T>(
     if (resource === undefined || resourceCatalogFence === undefined) {
       throw new StoreError("Skill operation completed without its Resource runtime fence.");
     }
-    await reconcileCommittedResourceRuntime(dependencies, resource.backendId, resource.id, resourceCatalogFence);
+    if (resourceCatalogFence !== "published") {
+      await reconcileCommittedResourceRuntime(dependencies, resource.backendId, resource.id, resourceCatalogFence);
+    }
   }
   return presented(execution);
 }

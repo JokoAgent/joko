@@ -245,6 +245,7 @@ const SESSION_RUNTIME_USAGE_SOURCE_ID = "session-runtime";
 interface ActiveSession {
   readonly adapter: BackendAdapter;
   readonly sessionId: string;
+  readonly targetId: string;
   /** Private prompt identity applied when this runtime handle was activated. */
   readonly appendSystemPromptDigest: string;
   /** Exact Backend process instance that owns this native runtime handle. */
@@ -963,6 +964,8 @@ export class SessionHost {
   /** Ephemeral authority populated only by the formal task-scoped live read. */
   readonly #activeResourceCatalogs = new Map<string, ActiveResourceCatalog>();
   readonly #backendResourceCatalogEpochs = new Map<string, bigint>();
+  readonly #targetResourceCatalogEpochs = new Map<string, bigint>();
+  #resourceCatalogEpoch = 0n;
   readonly #backendResourceCatalogFences = new Map<string, Map<symbol, bigint>>();
   readonly #activating = new Map<string, Promise<ActiveSession>>();
   readonly #nativeSessionCatalogFlights = new Map<string, NativeSessionCatalogFlight>();
@@ -2501,7 +2504,7 @@ export class SessionHost {
       const backend = this.#store.getBackend(route.backendId).descriptor;
       const adapter = this.requireAdapter(backend.id);
       const backendInstanceGeneration = this.requireAdapterGeneration(backend.id, adapter);
-      const resourceCatalogEpoch = this.backendResourceCatalogEpoch(backend.id);
+      const resourceCatalogEpoch = this.#resourceCatalogEpoch;
       const generation = original.binding.generation + 1;
       const runtimeControlGeneration = this.getSessionRuntimeControl(sessionId).generation + 1;
       const assertCurrent = (store: OperationalStore): void => {
@@ -3145,7 +3148,7 @@ export class SessionHost {
       return { reviewerSessionId };
     }
     const backendInstanceGeneration = this.requireAdapterGeneration(target.descriptor.backendId, adapter);
-    const resourceCatalogEpoch = this.backendResourceCatalogEpoch(target.descriptor.backendId);
+    const resourceCatalogEpoch = this.#resourceCatalogEpoch;
     const releaseBackendAdmission = this.beginBackendAdmissionEffect(target.descriptor.backendId);
     const now = Date.now();
     const context = this.provisionalContext(
@@ -5614,6 +5617,13 @@ export class SessionHost {
     this.#backendResourceCatalogFences.set(backendId, fences);
     this.clearBackendResourceCatalogs(backendId);
     return token;
+  }
+
+  /** Codex applies approved Skill configuration when it attaches a native thread. */
+  publishCodexSkillCatalogChange(backendId: string, targetId: string | undefined): void {
+    if (targetId === undefined) this.nextBackendResourceCatalogEpoch(backendId);
+    else this.#targetResourceCatalogEpochs.set(targetId, ++this.#resourceCatalogEpoch);
+    this.clearBackendResourceCatalogs(backendId, targetId);
   }
 
   /**
@@ -12077,6 +12087,7 @@ export class SessionHost {
     this.#serviceRuntimePrompts.clear();
     this.#preparedRuntimeHandoffPrompts.clear();
     this.#backendResourceCatalogEpochs.clear();
+    this.#targetResourceCatalogEpochs.clear();
     this.#backendResourceCatalogFences.clear();
     this.#activating.clear();
     this.#draining.clear();
@@ -12266,7 +12277,7 @@ export class SessionHost {
       const adapter = this.requireAdapter(target.descriptor.backendId);
       adapterForCleanup = adapter;
       backendInstanceGeneration = this.requireAdapterGeneration(target.descriptor.backendId, adapter);
-      resourceCatalogEpoch = this.backendResourceCatalogEpoch(target.descriptor.backendId);
+      resourceCatalogEpoch = this.#resourceCatalogEpoch;
       releaseBackendAdmission = this.beginBackendAdmissionEffect(target.descriptor.backendId);
       this.validateFastSelection(
         target.descriptor.backendId,
@@ -12801,7 +12812,7 @@ export class SessionHost {
       }
       let adapter = this.requireAdapter(target.descriptor.backendId);
       let backendInstanceGeneration = this.requireAdapterGeneration(target.descriptor.backendId, adapter);
-      let resourceCatalogEpoch = this.backendResourceCatalogEpoch(target.descriptor.backendId);
+      let resourceCatalogEpoch = this.#resourceCatalogEpoch;
       if (input.catalogImport === undefined) {
         this.assertBackendCreationReady(target.descriptor.backendId, routedInput);
       }
@@ -13133,7 +13144,7 @@ export class SessionHost {
               target = { ...registeredTarget, descriptor: { ...registeredTarget.descriptor, backendId: next.profile.backendId } };
               adapter = this.requireAdapter(target.descriptor.backendId); adapterForCleanup = adapter;
               backendInstanceGeneration = this.requireAdapterGeneration(target.descriptor.backendId, adapter);
-              resourceCatalogEpoch = this.backendResourceCatalogEpoch(target.descriptor.backendId);
+              resourceCatalogEpoch = this.#resourceCatalogEpoch;
               releaseBackendAdmission = this.beginBackendAdmissionEffect(target.descriptor.backendId);
               routedInput = { ...input, providerId: next.profile.providerId, modelId: next.profile.modelId, ...(next.profile.effort === undefined ? {} : { effort: next.profile.effort }), fastMode: next.profile.fastMode };
               runtimeTarget = { ...runtimeTarget, backendId: target.descriptor.backendId };
@@ -14087,12 +14098,13 @@ export class SessionHost {
       const stored = this.#store.getSession(sessionId);
       const { descriptor } = stored;
       const idleExit = active.adapter.hasConfirmedIdleSessionExit?.(sessionId, descriptor.binding) === true;
-      // Pi pins resources to the native runtime. Adopt a published catalog by
-      // resuming the same native Session once this runtime can be retired safely.
-      const refreshResources = active.resourceCatalogEpoch !== this.backendResourceCatalogEpoch(descriptor.backendId)
+      // Adopt published resources by resuming the same native Session once
+      // its current owner can be retired safely.
+      const backend = this.#store.getBackend(descriptor.backendId).descriptor;
+      const refreshResources = !this.activeResourceCatalogIsCurrent(active)
         && (this.#backendResourceCatalogFences.get(descriptor.backendId)?.size ?? 0) === 0
-        && this.#store.getBackend(descriptor.backendId).descriptor.adapterKind === "pi"
-        && this.isOrdinaryLocalSession(stored);
+        && (backend.adapterKind === "pi" && this.isOrdinaryLocalSession(stored)
+          || backend.adapterKind === "codex" && !this.isReviewReadOnlySession(sessionId));
       if ((!idleExit && !refreshResources && active.appendSystemPromptDigest === this.serviceRuntimeDigest(descriptor))
         || !this.canRefreshPrivatePromptAtBoundary(sessionId)) {
         active.lastActivityAt = this.#monotonicNow();
@@ -14209,7 +14221,7 @@ export class SessionHost {
     }
     const adapter = this.requireAdapter(stored.descriptor.backendId);
     const backendInstanceGeneration = this.requireAdapterGeneration(stored.descriptor.backendId, adapter);
-    const resourceCatalogEpoch = this.backendResourceCatalogEpoch(stored.descriptor.backendId);
+    const resourceCatalogEpoch = this.#resourceCatalogEpoch;
     const previousBinding = stored.descriptor.binding;
     const previousUsage = this.#runtimeUsageReadings.get(sessionId);
     const previousUsageKey = JSON.stringify([stored.descriptor.backendId, previousBinding.generation, nativeBindingFingerprint(previousBinding.opaqueRef)]);
@@ -18799,6 +18811,7 @@ export class SessionHost {
     return {
       adapter,
       sessionId,
+      targetId: session.descriptor.targetId,
       appendSystemPromptDigest: this.serviceRuntimeDigest(session.descriptor),
       backendInstanceGeneration,
       resourceCatalogEpoch,
@@ -18862,19 +18875,22 @@ export class SessionHost {
   }
 
   private nextBackendResourceCatalogEpoch(backendId: string): bigint {
-    const next = this.backendResourceCatalogEpoch(backendId) + 1n;
+    const next = ++this.#resourceCatalogEpoch;
     this.#backendResourceCatalogEpochs.set(backendId, next);
     return next;
   }
 
-  private clearBackendResourceCatalogs(backendId: string): void {
+  private clearBackendResourceCatalogs(backendId: string, targetId?: string): void {
     for (const [sessionId, catalog] of this.#activeResourceCatalogs) {
-      if (catalog.active.adapter.id === backendId) this.#activeResourceCatalogs.delete(sessionId);
+      if (catalog.active.adapter.id === backendId && (targetId === undefined || catalog.active.targetId === targetId)) {
+        this.#activeResourceCatalogs.delete(sessionId);
+      }
     }
   }
 
   private activeResourceCatalogIsCurrent(active: ActiveSession): boolean {
-    return active.resourceCatalogEpoch === this.backendResourceCatalogEpoch(active.adapter.id)
+    return active.resourceCatalogEpoch >= this.backendResourceCatalogEpoch(active.adapter.id)
+      && active.resourceCatalogEpoch >= (this.#targetResourceCatalogEpochs.get(active.targetId) ?? 0n)
       && (this.#backendResourceCatalogFences.get(active.adapter.id)?.size ?? 0) === 0;
   }
 
