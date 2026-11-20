@@ -817,7 +817,7 @@ export const BUILTIN_BROWSER_SITE_GUIDES: readonly unknown[] = [{
   "entry": {
     "searchApi": "https://export.arxiv.org/api/query?search_query=all:&max_results=20&sortBy=relevance"
   },
-  "recipes": ["arxiv-search"],
+  "recipes": ["arxiv-search", "opencli:arxiv/search"],
   "notes": "Search the public arXiv API at https://export.arxiv.org/api/query?search_query=all:&max_results=20&sortBy=relevance. It returns Atom XML: each <entry> under <feed> contains <title>, <summary>, <author><name>, <id> (paper URL), and <published>. Navigate to the URL, extract the body XML, and parse entries. Use HTTPS to avoid an HTTP redirect. search_query supports prefixes such as all:, ti:, au:, and abs:; sortBy accepts relevance, lastUpdatedDate, or submittedDate."
 },{
   "site": "barchart.com",
@@ -1207,7 +1207,7 @@ export const BUILTIN_BROWSER_SITE_GUIDES: readonly unknown[] = [{
   "entry": {
     "searchApi": "https://api.stackexchange.com/2.3/search/advanced?order=desc&sort=relevance&q=&site=stackoverflow"
   },
-  "recipes": ["stackoverflow-search"],
+  "recipes": ["stackoverflow-search", "opencli:stackoverflow/search"],
   "notes": "Search the public Stack Exchange API at api.stackexchange.com/2.3/search/advanced?order=desc&sort=relevance&q=&site=stackoverflow. Navigate there and read {items:[{title,link,score,answer_count,is_answered,question_id,tags,...}],has_more,quota_remaining}. Browsers decompress the default gzip response automatically. Requests without a key have a lower quota, reported in quota_remaining. Change site to search another Stack Exchange site."
 },{
   "site": "store.steampowered.com",

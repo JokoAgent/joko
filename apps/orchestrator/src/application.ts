@@ -3583,6 +3583,8 @@ export async function createOrchestratorApplication(
       const userKnowledge = new BrowserUserKnowledgeStore(store);
       const browserBridge = new BrowserToolBridgeProvider({
         browser: configuredBrowser,
+        adapterFetch: createOutboundStreamingFetch({ resolveProxy: dependencies.resolveOutboundProxy,
+          environmentProxyForTarget: target => environmentProxyForTarget(target, process.env) }),
         transfers: configuredTransfers,
         artifacts,
         state: browserState,

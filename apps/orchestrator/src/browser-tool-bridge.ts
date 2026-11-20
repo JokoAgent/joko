@@ -28,6 +28,8 @@ import {
 } from "@joko/tool-browser";
 
 import type { ArtifactStore } from "./artifact-store.js";
+import { ARXIV_ADAPTER_RECIPE, executeArxivSearch, prepareArxivSearch } from "./browser-arxiv-recipe.js";
+import { STACK_OVERFLOW_ADAPTER_RECIPE, StackOverflowPublicSearch, prepareStackOverflowSearch } from "./browser-stackoverflow-recipe.js";
 import { BrowserResultCache, type BrowserResultSource } from "./browser-result-cache.js";
 import { BrowserExperienceRecorder, BROWSER_EXPERIENCE_ACTIONS, browserExperienceSite, deferredBrowserRecipeIssue, suggestBrowserRecipes,
   type BrowserExperience, type BrowserExperienceAction } from "./browser-experience.js";
@@ -426,6 +428,8 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
   readonly #userKnowledge: BrowserUserKnowledgeLayer | undefined;
   readonly #setBackend: ((mode: BrowserTargetMode, assertCurrent: () => void) => Promise<BrowserTargetMode>) | undefined;
   readonly #recipes = new Map<string, BrowserRecipe>();
+  readonly #adapterFetch: typeof fetch;
+  readonly #stackOverflowSearch = new StackOverflowPublicSearch();
   readonly #siteGuides = new Map<string, BrowserSiteGuide>();
   readonly #builtinRecipeIds = new Set<string>();
   readonly #builtinSiteGuideIds = new Set<string>();
@@ -448,6 +452,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     readonly enabledForNewSessions?: (targetId: string) => boolean;
     readonly remoteNodes?: BrowserRemoteNodeRouter;
     readonly localNodeId?: string;
+    readonly adapterFetch?: typeof fetch;
     readonly userKnowledge?: BrowserUserKnowledgeLayer;
     readonly setBackend?: (mode: BrowserTargetMode, assertCurrent: () => void) => Promise<BrowserTargetMode>;
   }) {
@@ -458,12 +463,17 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     this.#enabledForNewSessions = input.enabledForNewSessions ?? (() => true);
     this.#remoteNodes = input.remoteNodes;
     this.#localNodeId = input.localNodeId;
+    this.#adapterFetch = input.adapterFetch ?? fetch;
     this.#userKnowledge = input.userKnowledge;
     this.#setBackend = input.setBackend;
     for (const raw of BUILTIN_BROWSER_RECIPES) {
       if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new Error("Built-in Browser recipe is invalid.");
       const recipe = validateRecipe(raw as Readonly<Record<string, unknown>>);
       if (this.#recipes.has(recipe.id)) throw new Error(`Built-in Browser recipe '${recipe.id}' is duplicated.`);
+      this.#recipes.set(recipe.id, recipe);
+      this.#builtinRecipeIds.add(recipe.id);
+    }
+    for (const recipe of [ARXIV_ADAPTER_RECIPE, STACK_OVERFLOW_ADAPTER_RECIPE]) {
       this.#recipes.set(recipe.id, recipe);
       this.#builtinRecipeIds.add(recipe.id);
     }
@@ -1586,6 +1596,8 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     if (layer?.catalogVersion === undefined || layer.catalogVersion === this.#knowledgeVersion) return;
     const recipes = new Map<string, BrowserRecipe>(), guides = new Map<string, BrowserSiteGuide>();
     for (const raw of BUILTIN_BROWSER_RECIPES) { if (!isRecord(raw)) throw new Error("Built-in Browser recipe is invalid."); const value = validateRecipe(raw); recipes.set(value.id, value); }
+    recipes.set(ARXIV_ADAPTER_RECIPE.id, ARXIV_ADAPTER_RECIPE);
+    recipes.set(STACK_OVERFLOW_ADAPTER_RECIPE.id, STACK_OVERFLOW_ADAPTER_RECIPE);
     for (const raw of BUILTIN_BROWSER_SITE_GUIDES) { if (!isRecord(raw)) throw new Error("Built-in Browser guide is invalid."); const value = validateSiteGuide(raw); guides.set(value.site, value); }
     const recipeIds = new Set<string>(), guideIds = new Set<string>();
     for (const raw of layer.recipes ?? []) {
@@ -1691,6 +1703,29 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     const expectedRecipe = this.#userKnowledge?.recipes?.find(raw => isRecord(raw) && raw["id"] === recipe.id);
     const expectedContent = expectedRecipe === undefined ? null : JSON.stringify(expectedRecipe);
     const vars: Record<string, unknown> = { ...(optionalRecord(input, "inputs") ?? {}) };
+    if (draft === undefined && (recipe === ARXIV_ADAPTER_RECIPE || recipe === STACK_OVERFLOW_ADAPTER_RECIPE)) {
+      let started = false;
+      try {
+        const arxiv = recipe === ARXIV_ADAPTER_RECIPE;
+        const request = arxiv ? prepareArxivSearch(vars) : prepareStackOverflowSearch(vars);
+        const assertCurrent = () => {
+          signal?.throwIfAborted();
+          this.#assertSessionContext();
+          if (epoch !== this.#syncResultEpoch()) throw new Error("The Browser source changed.");
+        };
+        assertCurrent();
+        started = true;
+        const output = arxiv ? await executeArxivSearch(request, this.#adapterFetch, signal)
+          : await this.#stackOverflowSearch.execute(request, this.#adapterFetch, signal);
+        assertCurrent();
+        return this.#result("recipe", { recipe: id, provenance: "builtin", steps: [{ action: "adapter", ok: true }], output });
+      } catch (error) {
+        signal?.throwIfAborted();
+        return browserError("recipe", { recipe: id, steps: started ? [{ action: "adapter", ok: false }] : [],
+          failureKind: started ? "action" : "input", ...(started ? { failedStep: 0, failedAction: "adapter" } : {}),
+          message: error instanceof Error ? error.message : "The public search failed." });
+      }
+    }
     for (const [name, spec] of Object.entries(recipe.inputs ?? {})) {
       if (spec.required === true && (vars[name] === undefined || vars[name] === null)) {
         throw new Error(`Browser recipe is missing required input '${name}'.`);
@@ -2810,12 +2845,15 @@ function stringRecord(
 }
 
 function recipeSummary(recipe: BrowserRecipe | undefined, id: string): Readonly<Record<string, unknown>> {
+  const publicAdapter = recipe === ARXIV_ADAPTER_RECIPE || recipe === STACK_OVERFLOW_ADAPTER_RECIPE;
   return {
     id,
     description: recipe?.description,
-    ...(recipe?.access === undefined ? {} : { access: recipe.access }),
+    ...(publicAdapter ? { readOnly: true }
+      : recipe?.access === undefined ? {} : { access: recipe.access }),
     ...(recipe?.validation === undefined ? {} : { state: recipe.validation.state }),
     inputs: Object.keys(recipe?.inputs ?? {}),
+    ...(publicAdapter ? { inputDetails: recipe.inputs } : {}),
     required: Object.entries(recipe?.inputs ?? {}).filter(([, spec]) => spec.required === true).map(([name]) => name),
     match: recipe?.match ?? []
   };
