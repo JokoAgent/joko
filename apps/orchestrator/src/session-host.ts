@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { queuePauseForStopReason, taskMessageReferenceHref, validInputMessageReferences } from "@joko/contracts";
+import { capabilityNames, queuePauseForStopReason, supportedExtraDirectoryAccessModes, taskMessageReferenceHref, validInputMessageReferences } from "@joko/contracts";
 import { MAXIMUM_EDITABLE_PLAN_LENGTH, modelPricesWithOverride, NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD, NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
   parseNativeModelUsage, parseNativeUsageRequests, type ModelPriceOverride } from "@joko/core";
 import { DocumentPathError, type DocumentPathAuthorizer } from "@joko/tool-document";
@@ -7841,16 +7841,36 @@ export class SessionHost {
         "The selected Backend does not support per-turn plan mode changes."
       );
     }
-    if (
-      overrides.extraDirectoryIds !== undefined &&
-      backend.capabilities.get("workspace.extra_dirs")?.supported !== true
-    ) {
-      throw turnOverrideError(
-        "TURN_OVERRIDE_EXTRA_DIRECTORIES_UNSUPPORTED",
-        "The selected Backend does not support per-turn extra directories."
-      );
+    if (overrides.extraDirectoryIds !== undefined) {
+      if (backend.capabilities.get(capabilityNames.workspaceExtraDirs)?.supported !== true) {
+        throw turnOverrideError(
+          "TURN_OVERRIDE_EXTRA_DIRECTORIES_UNSUPPORTED",
+          "The selected Backend does not support per-turn extra directories."
+        );
+      }
+      this.nativeExtraDirectories(stored.descriptor.targetId, backend, overrides.extraDirectoryIds);
     }
-    this.extraDirectories.resolveSelection(stored.descriptor.targetId, overrides.extraDirectoryIds);
+  }
+
+  private nativeExtraDirectories(targetId: string, backend: BackendDescriptor, ids?: readonly string[]): readonly ApprovedDirectory[] {
+    const modes = supportedExtraDirectoryAccessModes(backend.capabilities.get(capabilityNames.workspaceExtraDirs));
+    const directories = this.extraDirectories.resolveSelection(targetId, ids);
+    const supported = directories.filter(directory => modes.includes(directory.access));
+    if (ids !== undefined && supported.length !== directories.length) {
+      throw turnOverrideError("TURN_OVERRIDE_EXTRA_DIRECTORY_ACCESS_UNSUPPORTED",
+        "The selected Backend does not support the access level of a selected extra directory.");
+    }
+    return supported;
+  }
+
+  private assertNativeExtraDirectoriesCurrent(target: TargetDescriptor, directories: readonly ApprovedDirectory[]): void {
+    if (directories.length === 0) return;
+    const backend = this.#store.getBackend(target.backendId).descriptor;
+    const modes = supportedExtraDirectoryAccessModes(backend.capabilities.get(capabilityNames.workspaceExtraDirs));
+    if (directories.some(directory => !modes.includes(directory.access))) {
+      throw new StoreError("The native task's extra-directory access is no longer supported.");
+    }
+    this.extraDirectories.assertCurrent(target.id, directories);
   }
 
   /**
@@ -8586,10 +8606,9 @@ export class SessionHost {
       new Set([stored.descriptor.id]),
       "Per-turn execution policy changed while the interaction was pending."
     );
-    const selectedDirectories = overrides.extraDirectoryIds === undefined
-      ? this.extraDirectories.listForTarget(stored.descriptor.targetId)
-      : this.extraDirectories.resolveSelection(stored.descriptor.targetId, overrides.extraDirectoryIds);
-    const baselineDirectories = this.extraDirectories.listForTarget(stored.descriptor.targetId);
+    const baselineDirectories = baseContext.extraDirectories ?? [];
+    const selectedDirectories = overrides.extraDirectoryIds === undefined ? baselineDirectories
+      : this.nativeExtraDirectories(stored.descriptor.targetId, this.#store.getBackend(stored.descriptor.backendId).descriptor, overrides.extraDirectoryIds);
     const extraDirectoriesChanged = overrides.extraDirectoryIds !== undefined &&
       !sameDirectorySelection(selectedDirectories, baselineDirectories);
     if (extraDirectoriesChanged && active.adapter.setExtraDirectories === undefined) {
@@ -8770,7 +8789,8 @@ export class SessionHost {
     if (lease.permissionModeChanged) await active.adapter.setPermissionMode(lease.permissionMode, context);
     if (lease.planModeChanged) await active.adapter.setPlanMode(lease.planMode, context);
     if (lease.extraDirectoriesChanged && active.adapter.setExtraDirectories !== undefined) {
-      await active.adapter.setExtraDirectories(this.extraDirectories.listForTarget(context.target.id), context);
+      const backend = this.#store.getBackend(context.target.backendId).descriptor;
+      await active.adapter.setExtraDirectories(this.nativeExtraDirectories(context.target.id, backend), context);
     }
   }
 
@@ -16063,9 +16083,9 @@ export class SessionHost {
     const backendInstanceGeneration = backendInstanceGenerationOverride ??
       this.#active.get(sessionId)?.backendInstanceGeneration ??
       backend.instanceGeneration;
-    const extraDirectoriesSupported = backend.capabilities.get("workspace.extra_dirs")?.supported === true;
+    const extraDirectoriesSupported = backend.capabilities.get(capabilityNames.workspaceExtraDirs)?.supported === true;
     const extraDirectories = runtimePolicy === "review_read_only" || !extraDirectoriesSupported
-      ? [] : selectedExtraDirectories ?? this.extraDirectories.listForTarget(target.id);
+      ? [] : selectedExtraDirectories ?? this.nativeExtraDirectories(target.id, backend);
     const originalArtifactAuthority = artifactWorkspaceAuthority(this.#store.getTarget(target.id).descriptor, target, worktree);
     const assertArtifactAuthority = (store: OperationalStore, targetRevision: bigint): StoredSession => {
       this.#assertOpen();
@@ -16147,7 +16167,7 @@ export class SessionHost {
               || current.descriptor.targetId !== target.id || current.descriptor.backendId !== target.backendId
               || artifactWorkspaceAuthority(registered, this.targetForSession(current), current.descriptor.worktree) !== originalArtifactAuthority) throw new StoreError("The native task workspace authority changed.");
           } else if (artifactWorkspaceAuthority(registered, target, worktree) !== originalArtifactAuthority) throw new StoreError("The provisional native workspace authority changed.");
-          this.extraDirectories.assertCurrent(target.id, extraDirectories);
+          this.assertNativeExtraDirectoriesCurrent(target, extraDirectories);
           if (expectedRevision !== undefined && expectedRevision !== context.nativeToolAuthorization!.capture()) throw new StoreError("The native policy or originating task authority changed.");
           const authority = this.#extensionNativeToolAuthorization?.(sessionId);
           authority?.assertCurrent();
@@ -16189,7 +16209,7 @@ export class SessionHost {
       ...(runtimePolicy === "review_read_only" || appendSystemPrompt === undefined ? {} : { appendSystemPrompt }),
       extraDirectories,
       ...(extraDirectoriesSupported ? {
-        assertExtraDirectoriesCurrent: (directories: readonly ApprovedDirectory[]) => this.extraDirectories.assertCurrent(target.id, directories)
+        assertExtraDirectoriesCurrent: (directories: readonly ApprovedDirectory[]) => this.assertNativeExtraDirectoriesCurrent(target, directories)
       } : {}),
       ...(binding === undefined ? {} : { binding }),
       ...(operationId === undefined ? {} : { operationId }),

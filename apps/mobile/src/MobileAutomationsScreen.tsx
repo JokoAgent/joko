@@ -409,8 +409,8 @@ function AutomationEditor({ colors, state, client, schedule, initialDraft, local
   const permissions = advertisedPermissions.includes(draft.permissionMode)
     ? advertisedPermissions : [draft.permissionMode, ...advertisedPermissions];
   const extraDirectories = useMemo(
-    () => mobileAutomationExtraDirectoryOptions(state.owner, draft.targetId),
-    [draft.targetId, state.owner]
+    () => mobileAutomationExtraDirectoryOptions(state.owner, draft.targetId, draft.extraDirectoryIds),
+    [draft.extraDirectoryIds, draft.targetId, state.owner]
   );
   const execution = resolveMobileNewTaskExecutionAuthority(state.owner, draft.backendId);
   const selectedTarget = targets.find((target) => target.targetId === draft.targetId);

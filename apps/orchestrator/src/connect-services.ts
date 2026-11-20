@@ -19608,15 +19608,17 @@ async function dispatchMutation(
           "Workspace is not attached to a durable Target."
         );
       }
-      const backend = dependencies.store.getBackend(target.descriptor.backendId).descriptor;
-      if (backend.capabilities.get("workspace.extra_dirs")?.supported !== true) {
+      const access = coreExtraDirectoryAccess(payload.value.access);
+      const supportsAccess = (backendId: string) => contract.supportedExtraDirectoryAccessModes(dependencies.store.getBackend(backendId)
+        .descriptor.capabilities.get(contract.capabilityNames.workspaceExtraDirs)).includes(access);
+      if (!supportsAccess(target.descriptor.backendId)) {
         return unsupportedOperation(
           dependencies,
           operationId,
           connection,
           mutation,
           payload.case,
-          "Backend does not support workspace.extra_dirs."
+          "The Backend does not support the requested extra-directory access."
         );
       }
       let targetId: string | undefined;
@@ -19626,22 +19628,20 @@ async function dispatchMutation(
         kind: payload.case,
         body: mutation,
         effect: async () => {
-          const currentTarget = targetForWorkspace(dependencies.store, payload.value.workspaceId);
-          if (currentTarget?.descriptor.id !== target.descriptor.id) {
-            throw new StoreError("Workspace Target changed before the extra-directory policy could be applied.");
-          }
-          const currentBackend = dependencies.store.getBackend(currentTarget.descriptor.backendId).descriptor;
-          if (currentBackend.capabilities.get("workspace.extra_dirs")?.supported !== true) {
-            throw new StoreError("Backend extra-directory capability changed before the policy could be applied.");
-          }
-          dependencies.sessionHost.fencePendingInteractionsForTarget(
-            currentTarget.descriptor.id,
-            "Approved extra-directory policy is changing."
-          );
           const directory = await dependencies.sessionHost.extraDirectories.add({
             workspaceId: payload.value.workspaceId,
             serverPath: payload.value.serverPath,
-            access: coreExtraDirectoryAccess(payload.value.access)
+            access
+          }, () => {
+            dependencies.connections.fence(connection);
+            const current = targetForWorkspace(dependencies.store, payload.value.workspaceId)?.descriptor;
+            if (current?.id !== target.descriptor.id || current.backendId !== target.descriptor.backendId) {
+              throw new StoreError("Workspace Target changed before the extra-directory policy could be applied.");
+            }
+            if (!supportsAccess(current.backendId)) {
+              throw new StoreError("Backend extra-directory access changed before the policy could be applied.");
+            }
+            dependencies.sessionHost.fencePendingInteractionsForTarget(current.id, "Approved extra-directory policy is changing.");
           });
           targetId = directory.targetId;
           await dependencies.sessionHost.refreshTargetExtraDirectories(directory.targetId);
@@ -25179,9 +25179,9 @@ function protoPortableSessionImportDraft(
 }
 
 function coreExtraDirectoryAccess(value: contract.ExtraDirectoryAccess): "read_only" | "read_write" {
-  if (value === contract.ExtraDirectoryAccess.READ_ONLY) return "read_only";
-  if (value === contract.ExtraDirectoryAccess.READ_WRITE) return "read_write";
-  throw invalidArgument("extra_directory.access is required");
+  const mode = contract.extraDirectoryAccessMode(value);
+  if (mode === undefined) throw invalidArgument("extra_directory.access is required");
+  return mode;
 }
 
 function nativePiQueueMode(value: contract.PiQueueMode): "all" | "one-at-a-time" {

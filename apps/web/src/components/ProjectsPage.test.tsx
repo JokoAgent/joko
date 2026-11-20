@@ -49,6 +49,45 @@ it("discovers registered remote project resources through the existing trust and
   expect(container.textContent).not.toContain("Discover resources");
 });
 
+it("requires explicit read-write selection and preserves removal of an unavailable approval", async () => {
+  const addExtraDirectory = vi.fn(async () => undefined);
+  const controller = { state: { connectionState: "connected", preferences: DEFAULT_UI_PREFERENCES }, addExtraDirectory } as unknown as AppController;
+  const target: TargetView = { id: "project", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n,
+    workspaceName: "Workspace", trusted: true, pinned: false, archived: false };
+  const snapshot = { ...emptySnapshot(), targets: [target],
+    workspaces: [{ id: target.workspaceId, targetId: target.id, name: "Workspace", kind: "userProject" as const,
+      serverPath: "/project", trusted: true, dirty: false, entries: [] }],
+    backends: [{ id: target.backendId, name: "Claude Code", version: "1", health: "healthy" as const,
+      capabilities: new Map([["workspace.extra_dirs", { name: "workspace.extra_dirs", supported: true, options: ["read_write"] }]]) }],
+    extraDirectories: [{ id: "original-extra", workspaceId: target.workspaceId, access: "readOnly" as const,
+      serverPath: "/original-read-only", trusted: true }] };
+  const host = document.createElement("div"); document.body.append(host);
+  const root = createRoot(host); roots.push(root);
+  await act(async () => root.render(<ProjectsPage controller={controller} snapshot={snapshot}
+    t={(key, values) => translate("en", key, values)} onOpenNavigation={() => undefined}
+    runAction={(_key, action) => { void action(); }} prepareSessionRemoval={async () => undefined} />));
+  const directories = required(host.querySelector<HTMLElement>(".project-card__directories"));
+  expect(directories.textContent).toContain("Read only · Unavailable for this Backend");
+  expect(directories.querySelector('[aria-label="Remove /original-read-only"]')).toBeTruthy();
+  await act(async () => button(directories, "Add").click());
+  const dialog = required(host.querySelector<HTMLElement>("[role='dialog']"));
+  const field = required(dialog.querySelector("input"));
+  const select = required(dialog.querySelector<HTMLButtonElement>('[role="combobox"]'));
+  await act(async () => {
+    setNativeValue(field, "/new-directory");
+    field.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(button(dialog, "Add").disabled).toBe(true);
+  await act(async () => select.click());
+  const options = [...document.body.querySelectorAll<HTMLElement>('[role="listbox"] [role="option"]')];
+  expect(options.map(option => option.textContent)).toEqual(["Choose access", "Read write"]);
+  await act(async () => {
+    required(options[1] ?? null).click();
+  });
+  await act(async () => button(dialog, "Add").click());
+  expect(addExtraDirectory).toHaveBeenCalledExactlyOnceWith(target.workspaceId, "/new-directory", "readWrite");
+});
+
 it("restores the same project once and includes it in the current sidebar filter after persistence", async () => {
   const view = await mount();
   expect(view.host.querySelector(".project-card dl")?.textContent).toContain("projects.tasks1");

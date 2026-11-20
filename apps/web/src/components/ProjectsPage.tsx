@@ -7,6 +7,7 @@ import type { AppSnapshot, ExtraDirectoryView, SessionView, TargetDraft, TargetV
 import type { WorktreeRemovalPreflightSummary } from "../worktree-removal-preflight.js";
 import { sidebarOwnerLayoutFor } from "../sidebar-layout.js";
 import { backendSupportsResourceDiscovery } from "../resource-capabilities.js";
+import { extraDirectoryAccessChoices } from "../extra-directory-access.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, StatusDot, cx, CheckboxControl, SelectControl } from "./ui.js";
 import { WorktreeRemovalWarnings } from "./SessionDialogs.js";
@@ -55,6 +56,7 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, t, runActio
   }, []);
   useLayoutEffect(() => {
     openEditor(undefined);
+    setExtraWorkspace(undefined);
     return () => { editorAttempt.current = undefined; };
   }, [openEditor, profile?.id, profile?.serverId, profile?.deviceId, profile?.origin,
     snapshot.generation, controller.state.navigationRevision, controller.state.connectionGeneration]);
@@ -203,6 +205,8 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, t, runActio
       if (isCurrent()) openEditor(undefined);
     });
   };
+  const extraTarget = extraWorkspace === undefined ? undefined : snapshot.targets.find(target => target.workspaceId === extraWorkspace.id);
+  const extraAccess = extraDirectoryAccessChoices(snapshot.backends.find(backend => backend.id === extraTarget?.backendId));
   return <main ref={pageRef} className="route-page projects-page">
     <header className="route-header">{!controller.state.preferences.navigationOpen && <IconButton className="mobile-panel-toggle" label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}<div><p className="eyebrow">{t("projects.eyebrow")}</p><h1>{t("nav.projects")}</h1><p>{t("projects.subtitle")}</p></div><Button tone="primary" onClick={() => openEditor("new")}><FolderPlus aria-hidden="true" />{t("projects.new")}</Button></header>
     <div className="projects-toolbar"><div className="segmented" role="radiogroup" aria-label={t("projects.filter")}><button type="button" role="radio" aria-checked={!showArchived} className={!showArchived ? "segmented__item is-active" : "segmented__item"} onClick={() => setShowArchived(false)}>{t("projects.active")}</button><button type="button" role="radio" aria-checked={showArchived} className={showArchived ? "segmented__item is-active" : "segmented__item"} onClick={() => setShowArchived(true)}>{t("nav.archived")}</button></div></div>
@@ -210,6 +214,7 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, t, runActio
       const workspace = snapshot.workspaces.find((candidate) => candidate.id === target.workspaceId);
       const backend = snapshot.backends.find((candidate) => candidate.id === target.backendId);
       const directories = snapshot.extraDirectories.filter((directory) => directory.workspaceId === workspace?.id);
+      const directoryAccess = extraDirectoryAccessChoices(backend);
       const taskCount = snapshot.sessions.filter((session) => session.projectId === target.id).length;
       const projectResources = snapshot.resources.filter((resource) => resource.targetId === target.id && resource.backendId === target.backendId && resource.state !== "removed");
       const resourceCount = projectResources.length;
@@ -221,7 +226,15 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, t, runActio
         {target.error !== undefined && <p className="project-card__error" role="alert">{target.error}</p>}
         {target.remoteWorkspace?.kind === "ssh" && <p className="muted">{t("resource.sourceRemoteProject")}{awaitingApproval > 0 ? ` · ${t("projects.resourcesAwaitingApproval", { count: awaitingApproval })}` : ""}</p>}
         {workspace !== undefined && <section className="project-card__trust"><div><Shield aria-hidden="true" /><span><strong>{workspace.trusted ? t("projects.trusted") : t("projects.untrusted")}</strong><small>{t("projects.trustBody")}</small></span></div><div className="project-card__trust-actions">{workspace.trusted && resourceDiscoverySupported && <Button onClick={() => runAction(`project-resource-scan:${target.id}`, () => controller.discoverProjectResources(target.id))}><ScanSearch aria-hidden="true" />{t("projects.discoverResources")}{resourceCount > 0 ? ` · ${resourceCount}` : ""}</Button>}<Button tone={workspace.trusted ? "ghost" : "primary"} onClick={() => setTrustWorkspace(workspace)}>{workspace.trusted ? t("projects.revokeTrust") : t("projects.reviewTrust")}</Button></div></section>}
-        {workspace !== undefined && <section className="project-card__directories"><header><h3>{t("projects.extraDirectories")}</h3><Button tone="ghost" onClick={() => setExtraWorkspace(workspace)}><Plus aria-hidden="true" />{t("common.add")}</Button></header>{directories.length === 0 ? <p className="muted">{t("projects.noExtraDirectories")}</p> : directories.map((directory) => <div key={directory.id}><span><strong>{directory.serverPath}</strong><small>{directory.access === "readWrite" ? t("projects.readWrite") : t("projects.readOnly")} · {directory.trusted ? t("projects.trusted") : t("projects.untrusted")}</small></span><IconButton label={`${t("common.remove")} ${directory.serverPath}`} onClick={() => setRemoveExtra(directory)}><Trash2 aria-hidden="true" /></IconButton></div>)}</section>}
+        {workspace !== undefined && <section className="project-card__directories">
+          <header><h3>{t("projects.extraDirectories")}</h3>{directoryAccess.length > 0 &&
+            <Button tone="ghost" onClick={() => setExtraWorkspace(workspace)}><Plus aria-hidden="true" />{t("common.add")}</Button>}</header>
+          {directories.length === 0 ? <p className="muted">{t("projects.noExtraDirectories")}</p> : directories.map((directory) => <div key={directory.id}>
+            <span><strong>{directory.serverPath}</strong><small>{directory.access === "readWrite" ? t("projects.readWrite") : t("projects.readOnly")} · {
+              directoryAccess.includes(directory.access) ? (directory.trusted ? t("projects.trusted") : t("projects.untrusted")) : t("projects.directoryAccessUnavailable")}</small></span>
+            <IconButton label={`${t("common.remove")} ${directory.serverPath}`} onClick={() => setRemoveExtra(directory)}><Trash2 aria-hidden="true" /></IconButton>
+          </div>)}
+        </section>}
         <footer><Button onClick={() => runAction(`project-pin:${target.id}`, () => controller.updateTarget(target.id, { pinned: !target.pinned }, target.revision))}><Pin aria-hidden="true" />{target.pinned ? t("projects.unpin") : t("projects.pin")}</Button><Button onClick={() => openEditor(target)}><Pencil aria-hidden="true" />{t("common.edit")}</Button><Button data-project-archive-action="" disabled={archivePendingIds.has(archiveOperationKey(target.id))} onClick={(event) => toggleArchived(target, event.currentTarget)}><Archive aria-hidden="true" />{archivePendingIds.has(archiveOperationKey(target.id)) ? t("common.working") : target.archived ? t("projects.restore") : t("session.archive")}</Button><Button tone="ghost" className="project-card__delete" onClick={() => setDeleteTarget(target)}><Trash2 aria-hidden="true" />{t("common.delete")}</Button></footer>
       </article>;
     })}{targets.length === 0 && <div className="project-empty"><FolderKanban aria-hidden="true" /><h2>{showArchived ? t("projects.noArchived") : t("projects.empty")}</h2><p>{t("projects.emptyBody")}</p>{!showArchived && <Button tone="primary" onClick={() => openEditor("new")}>{t("projects.new")}</Button>}</div>}</section>
@@ -255,7 +268,11 @@ export function ProjectsPage({ controller, snapshot, focusProjectId, t, runActio
         );
       }}
     />
-    <ExtraDirectoryDialog workspace={extraWorkspace} t={t} onClose={() => setExtraWorkspace(undefined)} onSave={(path, access) => { const workspace = extraWorkspace; setExtraWorkspace(undefined); if (workspace !== undefined) runAction(`extra-directory:${workspace.id}`, () => controller.addExtraDirectory(workspace.id, path, access)); }} />
+    {extraWorkspace !== undefined && <ExtraDirectoryDialog key={extraWorkspace.id} accessChoices={extraAccess} t={t}
+      onClose={() => setExtraWorkspace(undefined)} onSave={(path, access) => {
+        setExtraWorkspace(undefined);
+        runAction(`extra-directory:${extraWorkspace.id}`, () => controller.addExtraDirectory(extraWorkspace.id, path, access));
+      }} />}
     <Modal open={removeExtra !== undefined} title={t("projects.removeDirectory")} description={removeExtra?.serverPath} size="small" onClose={() => setRemoveExtra(undefined)}><p>{t("projects.removeDirectoryBody")}</p><div className="modal__actions"><Button onClick={() => setRemoveExtra(undefined)}>{t("common.cancel")}</Button><Button tone="danger" onClick={() => { const directory = removeExtra; setRemoveExtra(undefined); if (directory !== undefined) runAction(`extra-remove:${directory.id}`, () => controller.removeExtraDirectory(directory.id)); }}>{t("common.remove")}</Button></div></Modal>
   </main>;
 }
@@ -337,11 +354,30 @@ function DeleteProjectDialog({ target, workspace, sessions, prepareSessionRemova
   </div></Modal>;
 }
 
-function ExtraDirectoryDialog({ workspace, t, onClose, onSave }: { readonly workspace?: WorkspaceView; readonly t: Translator; readonly onClose: () => void; readonly onSave: (path: string, access: ExtraDirectoryView["access"]) => void }): JSX.Element {
+function ExtraDirectoryDialog({ accessChoices, t, onClose, onSave }: { readonly accessChoices: readonly ExtraDirectoryView["access"][];
+  readonly t: Translator; readonly onClose: () => void; readonly onSave: (path: string, access: ExtraDirectoryView["access"]) => void }): JSX.Element {
   const [path, setPath] = useState("");
-  const [access, setAccess] = useState<ExtraDirectoryView["access"]>("readOnly");
-  useEffect(() => { setPath(""); setAccess("readOnly"); }, [workspace?.id]);
-  return <Modal open={workspace !== undefined} title={t("projects.addDirectory")} description={t("projects.addDirectoryBody")} size="medium" onClose={onClose}><form className="settings-form" onSubmit={(event) => { event.preventDefault(); if (path.trim()) onSave(path.trim(), access); }}><label className="field"><span>{t("projects.serverPath")}</span><input required value={path} onChange={(event) => setPath(event.target.value)} placeholder={t("projects.serverPathPlaceholder")} /><small>{t("projects.serverPathHelp")}</small></label><label className="field"><span>{t("projects.access")}</span><SelectControl value={access} onChange={(event) => setAccess(event.target.value as ExtraDirectoryView["access"])}><option value="readOnly">{t("projects.readOnly")}</option><option value="readWrite">{t("projects.readWrite")}</option></SelectControl></label><div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button type="submit" tone="primary" disabled={path.trim().length === 0}>{t("common.add")}</Button></div></form></Modal>;
+  const [access, setAccess] = useState<ExtraDirectoryView["access"] | undefined>(() => accessChoices.includes("readOnly") ? "readOnly" : undefined);
+  const selectedAccess = access !== undefined && accessChoices.includes(access) ? access : undefined;
+  return <Modal open title={t("projects.addDirectory")} description={t("projects.addDirectoryBody")} size="medium" onClose={onClose}>
+    <form className="settings-form" onSubmit={(event) => {
+      event.preventDefault();
+      if (path.trim() && selectedAccess !== undefined) onSave(path.trim(), selectedAccess);
+    }}>
+      <label className="field"><span>{t("projects.serverPath")}</span>
+        <input required value={path} onChange={(event) => setPath(event.target.value)} placeholder={t("projects.serverPathPlaceholder")} />
+        <small>{t("projects.serverPathHelp")}</small>
+      </label>
+      <label className="field"><span>{t("projects.access")}</span><SelectControl disabled={accessChoices.length === 0} value={selectedAccess ?? ""}
+        onChange={(event) => setAccess(accessChoices.find(choice => choice === event.target.value))}>
+        <option value="" disabled>{t(accessChoices.length === 0 ? "projects.directoryAccessUnavailable" : "projects.chooseDirectoryAccess")}</option>
+        {accessChoices.map(choice => <option key={choice} value={choice}>{t(choice === "readOnly" ? "projects.readOnly" : "projects.readWrite")}</option>)}
+      </SelectControl></label>
+      <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button>
+        <Button type="submit" tone="primary" disabled={path.trim().length === 0 || selectedAccess === undefined}>{t("common.add")}</Button>
+      </div>
+    </form>
+  </Modal>;
 }
 
 function sameRemovalSummary(left: WorktreeRemovalPreflightSummary, right: WorktreeRemovalPreflightSummary): boolean {

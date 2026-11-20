@@ -22,6 +22,7 @@ import { taskSourceKey } from "../task-sharing.js";
 import { capabilityNames, partnerResumeMessages, providerGroupRebalanceMessages, type ProviderGroupRebalanceView } from "@joko/contracts";
 import type { ComposerSendShortcutPreference } from "../local-state.js";
 import { modelSourceAccess } from "../model-source-access.js";
+import { extraDirectoryAccessChoices } from "../extra-directory-access.js";
 import { remapComposerInlineMentionReplacement } from "../composer-mention-ranges.js";
 import { ModelSourceNotice } from "./ModelSourceNotice.js";
 import { PersonalDevelopmentSettings, rememberPersonalDevelopmentDoctor, type PersonalDevelopmentLaunch } from "./PersonalDevelopmentSettings.js";
@@ -384,8 +385,10 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     reviewSupported
   } as const;
   const availableCommandItems = composerCommandItems(commands, commandOptions);
-  const extraDirectoriesSupported = backend?.capabilities.get("workspace.extra_dirs")?.supported === true && workspace !== undefined;
-  const selectableExtraDirectories = extraDirectories.filter((directory) => directory.workspaceId === workspace?.id && directory.trusted);
+  const directoryAccess = extraDirectoryAccessChoices(backend);
+  const extraDirectoriesSupported = directoryAccess.length > 0 && workspace !== undefined;
+  const selectableExtraDirectories = extraDirectories.filter(directory => directory.workspaceId === workspace?.id
+    && directory.trusted && directoryAccess.includes(directory.access));
   const shellDraft = resolveUserShellDraft(text, bashMode, bashExcluded);
   const effectiveBashMode = shellDraft !== null && browserComments.length === 0;
   const bashPermitted = bashCapable;

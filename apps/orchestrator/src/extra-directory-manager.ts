@@ -70,9 +70,10 @@ export class ExtraDirectoryManager {
     readonly workspaceId: string;
     readonly serverPath: string;
     readonly access: ExtraDirectoryAccess;
-  }): Promise<ExtraDirectoryRecord> {
+  }, assertCurrent?: () => void): Promise<ExtraDirectoryRecord> {
     const target = this.requireWorkspace(input.workspaceId);
     const canonicalPath = await canonicalDirectory(input.serverPath);
+    assertCurrent?.();
     const existing = this.#ordinary().filter((entry) => entry.targetId === target.descriptor.id);
     const duplicate = existing.find((entry) => samePath(entry.path, canonicalPath));
     if (duplicate !== undefined) {

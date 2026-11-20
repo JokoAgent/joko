@@ -18,7 +18,9 @@ import {
   ContextRebuildReason as ProtoContextRebuildReason,
   ErrorSeverity,
   ExtensionWidgetPlacement,
-  ExtraDirectoryAccess,
+  extraDirectoryAccessMode,
+  extraDirectoryAccessProto,
+  supportedExtraDirectoryAccessModes,
   FileChangeKind,
   FileKind,
   GitDiffSource,
@@ -2709,9 +2711,7 @@ export function toProtoExtraDirectory(record: ExtraDirectoryRecord): ProtoExtraD
     extraDirectoryId: record.id,
     workspaceId: record.workspaceId,
     serverPathDisplay: record.path,
-    access: record.access === "read_write"
-      ? ExtraDirectoryAccess.READ_WRITE
-      : ExtraDirectoryAccess.READ_ONLY,
+    access: extraDirectoryAccessProto(record.access),
     trusted: true,
     version: toProtoEntityVersion(record.revision, 0, record.updatedAt)
   });
@@ -4857,7 +4857,8 @@ export function fromProtoCapability(capability: ProtoCapability): Capability {
     supported: capability.support === CapabilitySupport.SUPPORTED,
     ...(reason === undefined ? {} : { reason }),
     ...(capability.reason === "" ? {} : { detail: capability.reason }),
-    ...(options.length === 0 ? {} : { options })
+    ...(options.length > 0 || capability.name === "workspace.extra_dirs" && capability.options?.kind.case === "workspace"
+      ? { options } : {})
   };
 }
 
@@ -4954,6 +4955,22 @@ function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | u
         maximumItems: 0
       }
     };
+  } else if (capability.key === contract.capabilityNames.workspaceExtraDirs) {
+    const access = supportedExtraDirectoryAccessModes(capability);
+    kind = {
+      case: "workspace",
+      value: {
+        $typeName: "joko.v1.WorkspaceCapabilityOptions",
+        remoteFiles: false,
+        search: false,
+        gitStatus: false,
+        gitDiff: false,
+        turnChangeSets: false,
+        rewindPreview: false,
+        extraDirectories: access.length > 0,
+        extraDirectoryAccess: access.map(extraDirectoryAccessProto)
+      }
+    };
   } else if (capability.key === "runtime.resources" && capability.options?.length) {
     kind = {
       case: "runtime",
@@ -4979,6 +4996,7 @@ function fromProtoCapabilityOptions(options: CapabilityOptions | undefined): rea
     case "model": return options.kind.value.effortIds;
     case "input": return options.kind.value.mediaTypes;
     case "permission": return options.kind.value.modes.map(fromProtoPermissionMode);
+    case "workspace": return options.kind.value.extraDirectoryAccess.flatMap(value => extraDirectoryAccessMode(value) ?? []);
     case "runtime": return options.kind.value.resourceKinds;
     default: return [];
   }
