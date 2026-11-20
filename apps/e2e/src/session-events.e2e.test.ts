@@ -28,7 +28,7 @@ import {
 } from "@joko/contracts";
 import { PI_LIKE_PROFILE, type FakeAdapterProfile } from "@joko/testkit";
 import type { AdapterContext, NativeHistoryEventContext, NativeSessionBinding, PromptInput, SubagentRunDetail, UsageSnapshot } from "@joko/core";
-import { chromium, type Browser, type Page } from "playwright-core";
+import { chromium, type Browser, type Page, type Request } from "playwright-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture, PromptRecordingFakeAdapter, waitFor } from "./fixture.js";
@@ -1293,6 +1293,18 @@ describe("session host, durable events, and reconnect semantics", () => {
     const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Queue observer" })).challenge!;
     browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
     const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
+    const snapshotPath = "/joko.v1.EventService/GetSnapshot";
+    const initialReads = new Set<Request>();
+    let holdReads = false;
+    let releaseReads!: () => void;
+    const blockedReads = new Promise<void>(resolve => { releaseReads = resolve; });
+    page.on("requestfinished", request => initialReads.delete(request));
+    page.on("requestfailed", request => initialReads.delete(request));
+    await page.route(`**${snapshotPath}`, async route => {
+      if (holdReads) await blockedReads;
+      else initialReads.add(route.request());
+      await route.continue().catch(error => { if (!page.isClosed()) throw error; });
+    });
     await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
     await page.locator('details.device-authorization__manual > summary').click();
@@ -1310,22 +1322,26 @@ describe("session host, durable events, and reconnect semantics", () => {
     expect((await submit(operation, manager.connectionId, setQueueInteractionLockMutation(control, lock, true))).state).toBe(OperationState.SUCCEEDED);
     const held = page.getByText("Queue in use", { exact: true });
     await held.waitFor({ state: "visible" });
-    expect(await order()).toEqual(before);
-    let snapshots = 0;
-    page.on("request", request => { if (request.url().endsWith("/joko.v1.EventService/GetSnapshot")) snapshots += 1; });
+    holdReads = true;
+    try {
+      await waitFor(async () => initialReads.size, count => count === 0, "the initial Snapshot responses to drain");
+      expect(await order()).toEqual(before);
+      let snapshots = 0;
+      page.on("response", response => { if (response.url().endsWith(snapshotPath) && response.ok()) snapshots += 1; });
 
-    const reorder = reorderQueuedInputBeforeMutation(second, third.queueItemId, lock);
-    if (reorder.payload.case !== "reorderQueueItem") throw new Error("Expected a queue reorder.");
-    reorder.payload.value.placement!.anchor = { case: "afterQueueItemId", value: third.queueItemId };
-    expect((await submit(operation, manager.connectionId, reorder)).state).toBe(OperationState.SUCCEEDED);
-    expect((await submit(operation, manager.connectionId, setQueueInteractionLockMutation(control, lock, false))).state).toBe(OperationState.SUCCEEDED);
-    const after = [first.queueItemId, third.queueItemId, second.queueItemId];
-    await waitFor(order, value => value.join() === after.join(), "the reordered queue on the observing Web client");
-    await held.waitFor({ state: "hidden" });
-    expect(snapshots).toBe(0);
-    expect(await page.locator(`[data-queue-item-id="${active.queueItemId}"]`).count()).toBe(1);
-    expect(store.getRun(active.runId).descriptor.state).toBe("running");
-    expect(store.listQueueItems({ sessionId, states: ["accepted"] }).map(item => item.id)).toEqual(after);
+      const reorder = reorderQueuedInputBeforeMutation(second, third.queueItemId, lock);
+      if (reorder.payload.case !== "reorderQueueItem") throw new Error("Expected a queue reorder.");
+      reorder.payload.value.placement!.anchor = { case: "afterQueueItemId", value: third.queueItemId };
+      expect((await submit(operation, manager.connectionId, reorder)).state).toBe(OperationState.SUCCEEDED);
+      expect((await submit(operation, manager.connectionId, setQueueInteractionLockMutation(control, lock, false))).state).toBe(OperationState.SUCCEEDED);
+      const after = [first.queueItemId, third.queueItemId, second.queueItemId];
+      await waitFor(order, value => value.join() === after.join(), "the reordered queue on the observing Web client");
+      await held.waitFor({ state: "hidden" });
+      expect(snapshots).toBe(0);
+      expect(await page.locator(`[data-queue-item-id="${active.queueItemId}"]`).count()).toBe(1);
+      expect(store.getRun(active.runId).descriptor.state).toBe("running");
+      expect(store.listQueueItems({ sessionId, states: ["accepted"] }).map(item => item.id)).toEqual(after);
+    } finally { releaseReads(); }
   });
 
   mountedTimelineIt("keeps Stop and composer Escape available during a native Claude retry wait", { timeout: 75_000 }, async () => {

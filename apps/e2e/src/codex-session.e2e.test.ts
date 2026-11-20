@@ -172,9 +172,8 @@ mountedIt("steers an existing paused input and a new composer input only into th
     await resume.click();
     await waitFor(async () => store.getQueueControl(sessionId).paused, paused => !paused, "the explicit queue resume");
     await pane.locator(".composer-rich-editor__content").fill("Steer this new input before the ordinary queue.");
-    await pane.getByRole("radio", { name: "Steer current run", exact: true }).click();
     const sending = steerRequest("sendInput");
-    await pane.locator(".send-button").click();
+    await pane.getByRole("button", { name: "Steer current run", exact: true }).click();
     expect((await sending).preconditions).toContainEqual(expect.objectContaining({
       entity: expect.objectContaining({ kind: EntityKind.RUN, id: active })
     }));
