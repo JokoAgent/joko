@@ -48,7 +48,7 @@ import {
   VoiceInputSaucSettingsSchema, VoiceInputSaucMode, VoiceInputSaucAuthentication,
   QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind, ResourceKind, ResourceState,
   ReviewRunSchema, ReviewRunState, RuntimeCommandSchema, RuntimeCommandInputMode, RuntimeCommandSource, SessionResourceSchema,
-  RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleMisfirePolicy, ScheduleOverlapPolicy,
+  RunSchema, RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleMisfirePolicy, ScheduleOverlapPolicy,
   ScheduleGeneratedSessionDisposition,
   ScheduleDeletionResultSchema, ScheduleRunCostAttribution, ScheduleRunHistorySchema, ScheduleRunOutcome, ScheduleRunPhase, ScheduleSchema,
   ScheduleSessionMode, ScheduleSource, ScheduleState, SchedulerRuntimeSnapshotSchema,
@@ -11572,17 +11572,23 @@ describe("native current-task message and Queue actions", () => {
 
   it("sends the original ordinary queue item to the selected active turn", async () => {
     const runId = "original-active-run";
+    const backend = queueSnapshot.backends[0]!;
+    const steer = create(CapabilitySchema, {
+      name: capabilityNames.turnSteer, support: CapabilitySupport.SUPPORTED,
+      options: create(CapabilityOptionsSchema, { kind: { case: "turn", value: {
+        sameTurn: true, deliveryModes: [QueueDeliveryMode.STEER]
+      } } })
+    });
     const current = create(SnapshotSchema, {
       ...queueSnapshot,
-      backends: [{ ...queueSnapshot.backends[0]!, capabilities: { capabilities: [
-        ...queueSnapshot.backends[0]!.capabilities!.capabilities,
-        { name: capabilityNames.turnSteer, support: CapabilitySupport.SUPPORTED, options: {
-          kind: { case: "turn", value: { sameTurn: true, deliveryModes: [QueueDeliveryMode.STEER] } }
-        } }
-      ] } }],
-      sessions: [{ ...queueSnapshot.sessions[0]!, state: SessionState.RUNNING, location: { kind: { case: "serviceNode", value: {} } } }],
+      backends: [create(BackendDescriptorSchema, { ...backend, capabilities: create(CapabilityManifestSchema, {
+        ...backend.capabilities!, capabilities: [...backend.capabilities!.capabilities, steer]
+      }) })],
+      sessions: [create(SessionSchema, { ...queueSnapshot.sessions[0]!, state: SessionState.RUNNING,
+        location: create(WorkspaceLocationSchema, { kind: { case: "serviceNode", value: {} } }) })],
       queueItems: [...queueSnapshot.queueItems, { ...queueTwo, queueItemId: "active-queue", runId, state: QueueItemState.BACKEND_ACCEPTED }],
-      runs: [{ runId, sessionId: "session", backendId: "backend", targetId: "target", state: RunState.RUNNING, sourceQueueItemId: "active-queue" }]
+      runs: [create(RunSchema, { runId, sessionId: "session", backendId: "backend", targetId: "target", state: RunState.RUNNING,
+        sourceQueueItemId: "active-queue" })]
     });
     const network = projectedNetwork(current);
     const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids());
