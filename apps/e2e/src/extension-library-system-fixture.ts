@@ -358,7 +358,7 @@ window.addEventListener("message", (event) => {
 });
 const call = async (operation) => {
   const response = await window.joko.library(operation);
-  if (response.ok !== true) throw new Error(response.errorCode + ":" + response.message);
+  if (response.ok !== true) throw new Error(operation.kind + ":" + response.errorCode + ":" + response.message);
   return response;
 };
 const run = async () => {
@@ -367,7 +367,7 @@ const run = async () => {
   const opened = await call({ kind: "open" });
   await call({ kind: "write", path: "bridge/result.txt", content: new TextEncoder().encode("mounted-bridge"), ifNotExists: false });
   const read = await call({ kind: "read", path: "bridge/result.txt" });
-  const database = await call({ kind: "sqlOpen", path: "bridge.sqlite", create: true, readOnly: false });
+  let database = await call({ kind: "sqlOpen", path: "bridge.sqlite", create: true, readOnly: false });
   await call({ kind: "sqlMigrate", handleId: database.handleId, migrations: [{ version: 1, statements: ["CREATE TABLE checks(id INTEGER PRIMARY KEY, value TEXT NOT NULL)"] }] });
   const execute = (sql) => call({ kind: "sqlExecute", handleId: database.handleId, statement: { sql } });
   await execute("CREATE TABLE IF NOT EXISTS batch_checks(id INTEGER PRIMARY KEY)");
@@ -376,7 +376,10 @@ const run = async () => {
   const batch = statements => ({ kind: "sqlBatch", handleId: database.handleId, statements });
   await call(batch(Array.from({ length: 101 }, (_, index) => insert(index + 1))));
   const rejected = await window.joko.library(batch([...Array.from({ length: 100 }, (_, index) => insert(index + 102)), insert(101)]));
-  if (rejected.ok !== false) throw new Error("the duplicate ID did not reject the batch");
+  if (rejected.ok !== false || rejected.errorCode !== "UNAVAILABLE") throw new Error("SQLite did not reject the duplicate ID: " + rejected.errorCode);
+  // The bridge retires the session on a failed SQL call. Reopen the same
+  // SQLite file to verify the original transaction from a fresh handle.
+  database = await call({ kind: "sqlOpen", path: "bridge.sqlite", create: false, readOnly: false });
   const count = await execute("SELECT count(*) AS total FROM batch_checks");
   if (String(count.value.rows[0].cells[0].value.value) !== "101") throw new Error("the batch did not commit and roll back atomically");
   await call({ kind: "sqlExecute", handleId: database.handleId, statement: { sql: "INSERT OR REPLACE INTO checks(id, value) VALUES(1, ?)", parameters: [{ kind: "text", value: "chromium" }] } });
