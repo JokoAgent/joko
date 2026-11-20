@@ -146,7 +146,7 @@ const client = new Proxy({
   get state() { return state; }, select, around, latest, taskReadingPosition, restoreTaskReadingPosition,
   searchHome, setSessionPinned, setSessionArchived, prepareSessionArchive, renameSession, deleteSession, suggestTaskTitle, reconcile, dismissUnconfirmed, refresh,
   partnerRosterSources: () => empty,
-  taskQueueItems: () => empty, taskInteractions: () => empty, taskTimelineRows: () => empty,
+  taskQueueItems: () => empty, taskRetryableQueueItems: () => empty, taskInteractions: () => empty, taskTimelineRows: () => empty,
   subscribe: () => () => {}, taskForeground: () => true, taskQueueCapabilities: () => ({}), taskPendingImagePasteCount: () => 0,
   partnerConversationTransport: () => learningPartner ? { ownerKey: "original-partner-owner" } : undefined,
   partnerProfileTransport: () => learningPartner ? { ownerKey: "original-partner-owner" } : undefined,

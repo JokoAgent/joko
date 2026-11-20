@@ -95,6 +95,9 @@ export const capabilityNames = {
 
 export type StandardCapabilityName = (typeof capabilityNames)[keyof typeof capabilityNames];
 
+/** Pause reason for pending input held by the Owner's Stop action. */
+export const queuePauseForStopReason = "Paused while stopping the current run.";
+
 /** Explicit expected-revision fence for creating a path that must not exist. */
 export const workspaceEntryAbsentRevision = "workspace-entry:absent:v1";
 

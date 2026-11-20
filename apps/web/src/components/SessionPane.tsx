@@ -556,9 +556,10 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const canAcknowledgeSessionAttention = backend?.capabilities.get("session.attention")?.supported === true;
   const displayBranch = codeHostDisplayBranch(workspace, session.codeHostPullRequests);
   const canExport = !reviewReadOnly && !sideChatRuntimeReadOnly && backend?.capabilities.get("session.export")?.supported === true;
-  const canDeriveWorkspace = session.worktree === undefined
-    || backend?.capabilities.get("workspace.derive")?.supported === true;
-  const canClone = !reviewReadOnly && !sideChatRuntimeReadOnly && canDeriveWorkspace
+  const derivesWorkspace = backend?.capabilities.get("workspace.derive")?.supported === true;
+  const canDeriveWorkspace = session.worktree === undefined || derivesWorkspace;
+  const sshCloneBlocked = derivesWorkspace && session.remoteWorkspace?.kind === "ssh" && target?.sshWorktreeDerivationAllowed === false;
+  const canClone = !reviewReadOnly && !sideChatRuntimeReadOnly && canDeriveWorkspace && !sshCloneBlocked
     && backend?.capabilities.get("session.clone")?.supported === true;
   const canExportPortable = onExportPortableSession !== undefined
     && portableSessionExportSupported(session, controller.state.snapshot);

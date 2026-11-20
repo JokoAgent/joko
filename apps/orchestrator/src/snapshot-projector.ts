@@ -105,6 +105,7 @@ export interface SnapshotProviderCatalogEntry {
 
 export interface SnapshotProjectorOptions {
   readonly resolveSideChatSourceAllowed?: (sessionId: string) => boolean;
+  readonly canRetryFailedQueueInput?: (item: QueueItemRecord) => boolean;
   /** Server identity placed in every snapshot. A factory can refresh server_time per request. */
   readonly server: ServerInfo | (() => ServerInfo);
   readonly now?: () => number;
@@ -709,6 +710,7 @@ export class SnapshotProjector {
         targetId: session.descriptor.targetId,
         source: run.descriptor.source,
         sharedTaskAuthor: new TaskShareStore(this.store).getAuthorForOperation(item.operationId),
+        retryBeforeDispatch: this.options.canRetryFailedQueueInput?.(item) ?? false,
         ...(run.descriptor.parentRunId === undefined ? {} : { parentRunId: run.descriptor.parentRunId }),
         generation: session.descriptor.binding.generation
       }, BigInt(index));
@@ -740,22 +742,25 @@ export class SnapshotProjector {
       if (session === undefined) throw projectionReferenceError("tool_lease.session_id", lease.id, lease.sessionId);
       return toProtoToolLease(lease, session.descriptor.backendId);
     });
-    const mappedTimeline = input.timeline.map((event) => toProtoEvent(event, {
-      sharedTaskAuthor: taskShareEventAuthor(this.store, event),
-      learning: event.payload.type === "message_complete" && event.payload.role === "assistant"
-        ? this.store.getPartnerLearningFeedback(event.id) : undefined,
-      queueItem: eventQueueItem(event, queueById, input.queueItems),
-      queueControl: event.payload.type === "queue_control"
-        ? this.store.getQueueControl(event.sessionId)
-        : undefined,
-      interaction: eventInteraction(event, interactionById),
-      artifact: event.payload.type === "artifact" ? artifactById.get(event.payload.artifact.id) : undefined,
-      run: event.runId === undefined ? undefined : runById.get(event.runId),
-      attempts: event.runId === undefined ? undefined : attemptsByRun.get(event.runId),
-      session: sessionById.get(event.sessionId),
-      sessionContext: sessionContexts.get(event.sessionId),
-      target: targetById.get(event.targetId)
-    } satisfies EventMappingContext));
+    const mappedTimeline = input.timeline.map((event) => {
+      const queueItem = eventQueueItem(event, queueById, input.queueItems);
+      return toProtoEvent(event, {
+        sharedTaskAuthor: taskShareEventAuthor(this.store, event),
+        learning: event.payload.type === "message_complete" && event.payload.role === "assistant"
+          ? this.store.getPartnerLearningFeedback(event.id) : undefined,
+        queueItem,
+        retryQueueInputBeforeDispatch: event.payload.type === "queue_update" && queueItem !== undefined
+          && this.options.canRetryFailedQueueInput?.(queueItem) === true,
+        queueControl: event.payload.type === "queue_control" ? this.store.getQueueControl(event.sessionId) : undefined,
+        interaction: eventInteraction(event, interactionById),
+        artifact: event.payload.type === "artifact" ? artifactById.get(event.payload.artifact.id) : undefined,
+        run: event.runId === undefined ? undefined : runById.get(event.runId),
+        attempts: event.runId === undefined ? undefined : attemptsByRun.get(event.runId),
+        session: sessionById.get(event.sessionId),
+        sessionContext: sessionContexts.get(event.sessionId),
+        target: targetById.get(event.targetId)
+      } satisfies EventMappingContext);
+    });
     const mappedBackgroundTasks: Snapshot["backgroundTasks"] = input.sessions.flatMap((session) =>
       this.store.listActiveSessionBackgroundTaskEvents(session.descriptor.id).flatMap((event) => {
         const kind = toProtoEvent(event).payload?.kind;

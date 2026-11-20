@@ -10141,6 +10141,22 @@ export class OperationalStore {
     return numberValue(row["count"]);
   }
 
+  hasCompletedPromptAtQueueAdmission(item: QueueItemRecord, generation: number, backendInstanceGeneration: number): boolean {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT 1 FROM runs AS run
+      JOIN queue_items AS prompt ON prompt.run_id = run.id AND prompt.session_id = run.session_id
+      JOIN attempts AS attempt ON attempt.id = prompt.attempt_id AND attempt.id = run.active_attempt_id
+      WHERE run.session_id = ? AND run.id <> ?
+        AND run.source = 'user' AND run.parent_run_id IS NULL AND run.state = 'completed'
+        AND prompt.disposition = 'prompt' AND prompt.state = 'completed'
+        AND prompt.backend_accepted_at <= ? AND run.ended_at > ?
+        AND prompt.backend_instance_generation = ? AND attempt.generation = ?
+      LIMIT 1
+    `).get(item.sessionId, item.runId, item.createdAt, item.createdAt, backendInstanceGeneration, generation);
+    return row !== undefined;
+  }
+
   hasOverlappingUserWorkspaceInput(input: {
     readonly sessionId: string;
     readonly runId: string;

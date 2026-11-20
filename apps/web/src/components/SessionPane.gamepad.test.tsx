@@ -6,7 +6,7 @@ import type { AppController } from "../controller.js";
 import type { AppShortcutOverrides } from "../app-shortcuts.js";
 import { dispatchGamepadOwnedAction, type GamepadOwnedAction } from "../gamepad-actions.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import { emptySnapshot, type BackendView, type ModelView, type SessionView, type TimelineItemView } from "../model.js";
+import { emptySnapshot, type BackendView, type ModelView, type SessionView, type TargetView, type TimelineItemView } from "../model.js";
 import { SessionPane } from "./SessionPane.js";
 
 vi.mock("./Composer.js", () => ({ Composer: () => <button>Message input</button> }));
@@ -382,6 +382,26 @@ describe("session gamepad actions", () => {
     expect(view.api.navigate).not.toHaveBeenCalled();
   });
 
+  it("uses the current SSH project policy for Clone and keeps message actions separate", async () => {
+    const view = await mount();
+    const remoteWorkspace = { kind: "ssh" as const, hostTargetId: "target", hostId: "ssh", workspaceRoot: "/srv/project" };
+    const remoteSession = { ...session, remoteWorkspace };
+    const derivingBackend: BackendView = { ...backend, capabilities: new Map([...backend.capabilities,
+      ["workspace.derive", { name: "workspace.derive", supported: true, options: [] }]]) };
+    const project: TargetView = { id: "target", revision: 1n, backendId: backend.id, name: "SSH project",
+      workspaceId: "workspace", workspaceName: "SSH project", trusted: true, pinned: false, archived: false,
+      remoteWorkspace, sshWorktreeDerivationAllowed: false };
+
+    await view.render(remoteSession, derivingBackend, false, {}, [message], [message], project);
+    expect(view.menuLabels()).not.toContain("session.clone");
+    expect(view.host.querySelector('[data-testid="message-fork"]')).not.toBeNull();
+    expect(view.api.cloneSession).not.toHaveBeenCalled();
+
+    await view.render(remoteSession, derivingBackend, false, {}, [message], [message],
+      { ...project, revision: 2n, sshWorktreeDerivationAllowed: true });
+    expect(view.menuLabels()).toContain("session.clone");
+  });
+
   it.each(["fork", "clone", "learn"] as const)("discards a stale %s failure after leaving the source task", async (action) => {
     const view = await mount();
     let fail!: () => void;
@@ -469,13 +489,14 @@ async function mount(overrides: AppShortcutOverrides = {}) {
   const host = document.body.appendChild(document.createElement("div")); const root = createRoot(host); roots.push(root);
   const controller = { ...api } as unknown as AppController;
   const render = async (current = session, currentBackend = backend, readOnly = false, stateOverrides: Partial<AppController["state"]> = {},
-    items: readonly TimelineItemView[] = [message], liveItems = items) => {
+    items: readonly TimelineItemView[] = [message], liveItems = items, target?: TargetView) => {
     const snapshot = { ...emptySnapshot(), revision: 1n, sessions: [current], backends: [currentBackend], models: [model],
+      ...(target === undefined ? {} : { targets: [target] }),
       timelineBySession: liveItems.length === 0 ? new Map() : new Map([[current.id, liveItems]]) };
     Object.assign(controller, { ...api, state: { ready: true, connectionState: "connected", connectionGeneration: 1, navigationRevision: 1,
       activeProfile: { id: "profile", serverId: "server", deviceId: "device", name: "Node", origin: "https://node.example" },
       preferences: { ...DEFAULT_UI_PREFERENCES, appShortcutOverrides: overrides }, snapshot, route: { kind: "session", sessionId: current.id }, ...stateOverrides } });
-    await act(async () => root.render(<SessionPane controller={controller} session={current} backend={currentBackend} reviewReadOnly={readOnly} models={[model]} timeline={items}
+    await act(async () => root.render(<SessionPane controller={controller} session={current} target={target} backend={currentBackend} reviewReadOnly={readOnly} models={[model]} timeline={items}
       timelineHasEarlier={false} timelineHistoryLoading={false} onLoadEarlierTimeline={async () => undefined} extensionWidgets={[]} extensionStatuses={[]}
       queue={[]} extraDirectories={[]} resources={[]} commandRefreshSignal={[]} remainingInteractions={0} navigationOpen inspectorOpen t={(key) => key}
       runAction={(_key, action) => { const result = action(); void result.catch(() => undefined); pending.push(result); }} onOpenNavigation={() => undefined} onOpenInspector={() => undefined} onRename={() => undefined} onDelete={() => undefined}

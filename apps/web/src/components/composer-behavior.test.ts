@@ -165,6 +165,7 @@ describe("composer Stop semantics", () => {
     };
     await pauseQueueThenAbort(controller, "session-a", "run-a", true, false);
     expect(calls).toEqual(["pause:session-a", "abort:run-a"]);
+    expect(controller.pauseQueue).toHaveBeenCalledExactlyOnceWith("session-a", "Paused while stopping the current run.");
   });
 
   it("does not issue a duplicate pause when the queue is already paused", async () => {

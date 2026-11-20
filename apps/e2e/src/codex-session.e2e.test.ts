@@ -9,14 +9,16 @@ import { timestampFromMs } from "@bufbuild/protobuf/wkt";
 import { createCodexAdapter, AppServerHost, TransportFault } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
 import { CreateTargetMutationSchema, EntityKind, GetOperationRequestSchema, MessageRole, NativeCatalogImportPresentationSchema, NativeSessionPlacement, NativeSessionStartSchema,
-  ObjectiveStatus, OperationMutationSchema, OperationState, RetryState, RunState, ScheduleRecurrenceSchema,
+  ObjectiveStatus, OperationMutationSchema, OperationPreconditionSchema, OperationState, QueueItemState, RetryState, RunState, ScheduleRecurrenceSchema,
   SetWorkspaceTrustMutationSchema, SubmitOperationRequestSchema, TargetWorkspaceInputSchema, ToolCallState, WorkspaceKind, type Event } from "@joko/contracts";
 import { chromium, type Browser } from "playwright-core";
+import { JokoError } from "@joko/core";
 import { expect, it, vi } from "vitest";
 
+import { createE2eClients } from "./connect-clients.js";
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import {
-  abortRunMutation, createManualScheduleMutation, createSessionMutation, navigateMutation, pauseQueueMutation, queueRunIdFrom, resumeQueueMutation,
+  abortRunMutation, createManualScheduleMutation, createSessionMutation, navigateMutation, pauseQueueMutation, queueItemIdFrom, queueRunIdFrom, resumeQueueMutation,
   retryRunMutation, runIdFrom, scheduleIdFrom, sendInputMutation, sessionIdFrom, submit, triggerScheduleMutation
 } from "./operations.js";
 
@@ -1325,6 +1327,122 @@ mountedIt("shows a Codex turn, restores it after reload, and isolates another ta
     await browser?.close();
     await fixture?.close();
     await host.shutdown();
+  }
+});
+
+mountedIt("retries the exact known pre-dispatch SSH Codex input after opening the original task cold", { timeout: 120_000 }, async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "joko-ssh-codex-queue-retry-")));
+  const backendId = "codex-ssh-queue-retry", targetId = "ssh-queue-retry-target", remoteRoot = "/srv/queue-retry";
+  const native = new FakeCodexAppServer();
+  const failure = { code: "CODEX_REMOTE_MCP_UNAVAILABLE", message: "The controlled SSH resource inventory is unavailable.",
+    phase: "provision", retryable: true, stateMayHaveChanged: false, recovery: "Retry after restoring the original MCP inventory." };
+  let failBeforeDispatch = false;
+  const start = () => {
+    const localNative = new FakeCodexAppServer();
+    const local = new AppServerHost({ transportFactory: () => localNative.createTransport() });
+    const remote = new AppServerHost({ transportFactory: () => native.createTransport() });
+    return OrchestratorE2eFixture.start({ rootDirectory: root, webDirectory: resolve(process.env.JOKO_MOUNTED_WEB_DIR!),
+      backendFactories: [{ instanceId: backendId, adapterKind: "codex", displayName: "SSH Codex queue fixture", create: ({ generation }) => {
+        const adapter = createCodexAdapter({ id: backendId, instanceGeneration: generation, host: local,
+          remoteRuntimes: { resolve: async () => ({ host: remote, workspaceRoot: remoteRoot, profileKey: "a".repeat(64),
+            executionDomain: "ssh-codex-queue-retry-fixture", assertCurrent: () => undefined }), shutdown: () => remote.shutdown() } });
+        const getResources = adapter.getResources.bind(adapter);
+        vi.spyOn(adapter, "getResources").mockImplementation(async context => {
+          if (failBeforeDispatch && context.target.id === targetId) {
+            failBeforeDispatch = false;
+            throw new JokoError(failure);
+          }
+          return getResources(context);
+        });
+        return adapter;
+      } }] });
+  };
+  let fixture: OrchestratorE2eFixture | undefined, browser: Browser | undefined;
+  try {
+    fixture = await start();
+    await fixture.application.sessionHost.registerTarget({ id: targetId, backendId, displayName: "Original SSH workspace",
+      workspaceRoot: fixture.workspaceDirectory, trusted: true, managed: false,
+      remoteWorkspace: { kind: "ssh", hostTargetId: targetId, hostId: "queue-retry-ssh-host", workspaceRoot: remoteRoot } });
+    const { clients, authKey, connectionId } = await fixture.pair("SSH queue Owner");
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId,
+      createSessionMutation({ backendId, targetId, displayName: "Original SSH queue task" })));
+    const input = (text: string) => sendInputMutation(sessionId,
+      BigInt(fixture!.application.store.getSession(sessionId).descriptor.binding.generation), text);
+    const session = fixture.application.store.getSession(sessionId).descriptor;
+    const nativeId = session.binding.nativeSessionId;
+    if (!nativeId) throw new Error("The original SSH Codex task has no native thread.");
+    const nativeTurns = () => native.threads.get(nativeId)!.turns;
+    const send = (text: string) => submit(clients.operation, connectionId, input(text));
+    const first = await send("Finish the original active turn");
+    const firstId = queueItemIdFrom(first);
+    const queueState = (id: string) => fixture!.application.store.getQueueItem(id).state;
+    await waitFor(async () => queueState(firstId), state => state === "backend_accepted", "the original active SSH turn");
+    const pendingText = "Retry this exact queued SSH input";
+    const pending = await send(pendingText), pendingId = queueItemIdFrom(pending), pendingRunId = queueRunIdFrom(pending);
+    expect(queueState(pendingId)).toBe("accepted");
+    expect(nativeTurns()).toHaveLength(1);
+    failBeforeDispatch = true;
+    await native.completeTurn(nativeId);
+    await waitFor(async () => queueState(pendingId), state => state === "failed", "the accepted input rejected before native dispatch");
+    const originalQueue = fixture.application.store.getQueueItem(pendingId);
+    expect(originalQueue).toMatchObject({ operationId: pending.operationId, runId: pendingRunId, error: failure, body: { text: pendingText } });
+    expect(originalQueue.backendAcceptedAt).toBeUndefined();
+    expect(fixture.application.store.getRun(pendingRunId).descriptor).toMatchObject({ state: "failed", error: failure });
+    expect(fixture.application.store.getAttempt(originalQueue.attemptId!).descriptor).toMatchObject({ runId: pendingRunId, endedAt: expect.any(Number), error: failure });
+    expect(nativeTurns()).toHaveLength(1);
+
+    await fixture.close({ removeRoot: false });
+    fixture = await start();
+    const cold = createE2eClients(fixture.baseUrl, authKey);
+    expect((await cold.operation.getOperation({ operationId: pending.operationId })).operation).toMatchObject({
+      state: OperationState.SUCCEEDED, connectionId, result: { payload: { case: "queueItem", value: { queueItemId: pendingId } } }
+    });
+    const list = async () => (await cold.queue.listQueueItems({ sessionId })).queueItems;
+    const original = (await list()).find(item => item.queueItemId === pendingId)!;
+    expect(original).toMatchObject({ state: QueueItemState.FAILED, runId: pendingRunId, retryBeforeDispatch: true });
+    const exactRetry = retryRunMutation(pendingRunId);
+    exactRetry.preconditions.push(create(OperationPreconditionSchema, { entity: { kind: EntityKind.QUEUE_ITEM, id: pendingId },
+      expectedRevision: original.version!.revision!, expectedGeneration: original.version!.generation }));
+
+    const challenge = (await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "SSH queue Browser" })).challenge!;
+    browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+    await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
+    await page.locator(".connection-tabs > button").nth(2).click();
+    await page.locator('details.device-authorization__manual > summary').click();
+    await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+    await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
+    await page.getByLabel("Device name").fill("SSH queue Browser");
+    await page.locator("form.pair-form button[type=submit]").click();
+    const row = page.locator(`[data-queue-item-id="${pendingId}"]`);
+    await row.getByText(pendingText, { exact: true }).waitFor({ state: "visible" });
+    const retry = row.getByRole("button", { name: "Retry", exact: true });
+    await retry.click();
+    const child = await waitFor(async () => fixture!.application.store.findRunByParentId(pendingRunId)?.descriptor,
+      run => run?.state === "running", "the one continuation of the original failed Run");
+    expect(child).toMatchObject({ sessionId, parentRunId: pendingRunId });
+    expect(nativeTurns()).toHaveLength(2);
+    expect(nativeTurns().at(-1)).toMatchObject({ items: [{ type: "userMessage", content: [{ type: "text", text: pendingText }] }] });
+    expect((await list()).find(item => item.queueItemId === pendingId)?.retryBeforeDispatch).toBe(false);
+    await retry.waitFor({ state: "hidden" });
+    const duplicate = await submit(cold.operation, connectionId, exactRetry);
+    expect(duplicate.state).toBe(OperationState.FAILED);
+    expect(nativeTurns()).toHaveLength(2);
+    await native.completeTurn(nativeId);
+    await waitFor(async () => fixture!.application.store.getRun(child!.id).descriptor.state, state => state === "completed", "the retried input completion");
+
+    native.timeoutNextTurnStart = true;
+    const unknown = await submit(cold.operation, connectionId, input("Preserve the unknown native acknowledgment"));
+    const unknownId = queueItemIdFrom(unknown);
+    await waitFor(async () => queueState(unknownId), state => state === "dispatch_unknown", "the original unknown dispatch");
+    const uncertain = (await list()).find(item => item.queueItemId === unknownId);
+    expect(uncertain).toMatchObject({ state: QueueItemState.DISPATCH_UNKNOWN, retryBeforeDispatch: false });
+    await page.locator(`[data-queue-item-id="${unknownId}"]`).waitFor({ state: "visible" });
+    expect(await page.locator(`[data-queue-item-id="${unknownId}"]`).getByRole("button", { name: "Retry", exact: true }).count()).toBe(0);
+  } finally {
+    await browser?.close();
+    await fixture?.close({ removeRoot: false });
+    await rm(root, { recursive: true, force: true, maxRetries: 3 });
   }
 });
 

@@ -26,7 +26,7 @@ export interface PendingOperation {
   readonly taskJoinId?: string;
   readonly kind: "create" | "send" | "logout" | "revoke" | "device-rename" | "rename" | "pin" | "archive" | "delete"
     | "message-delete" | "queue-cancel" | "queue-edit-lock" | "queue-edit"
-    | "queue-interaction-lock" | "queue-reorder" | "queue-resume" | "interaction-resolve" | "interaction-dismiss"
+    | "queue-interaction-lock" | "queue-reorder" | "queue-resume" | "queue-retry" | "interaction-resolve" | "interaction-dismiss"
     | "session-model" | "session-permission" | "session-plan" | "session-compact" | "session-branch" | "session-stop"
     | "session-shell" | "session-reset" | "session-review" | "session-clone" | "session-fork" | "session-side-chat" | "session-rewind" | "workspace-rewind"
     | "task-tag"
@@ -524,7 +524,7 @@ function isPending(value: unknown): value is PendingOperation {
   const record = value as Record<string, unknown>;
   if (typeof record.operationId !== "string" || typeof record.connectionId !== "string"
     || !["create", "send", "logout", "revoke", "device-rename", "rename", "pin", "archive", "delete", "message-delete",
-      "queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder", "queue-resume",
+      "queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder", "queue-resume", "queue-retry",
       "interaction-resolve", "interaction-dismiss", "session-model", "session-permission", "session-plan", "session-compact", "session-stop",
       "objective-set", "objective-pause", "objective-resume", "objective-clear",
       "collaboration-enable", "collaboration-create", "collaboration-release", "collaboration-archive", "collaboration-end",
@@ -571,11 +571,12 @@ function isPending(value: unknown): value is PendingOperation {
   if (record.kind === "send" && typeof record.sessionId !== "string") return false;
   if (["rename", "pin", "archive", "delete"].includes(String(record.kind)) && typeof record.sessionId !== "string") return false;
   if (record.kind === "message-delete" && (typeof record.sessionId !== "string" || typeof record.eventId !== "string")) return false;
-  if (record.kind === "session-stop") {
+  if (record.kind === "session-stop" || record.kind === "queue-retry") {
     if (!validReceiptIdentity(record.sessionId) || !validReceiptIdentity(record.runId) || record.taskJoinId !== undefined) return false;
   } else if (record.runId !== undefined) return false;
   if (["queue-cancel", "queue-edit-lock", "queue-edit", "queue-reorder"].includes(String(record.kind))
     && (typeof record.sessionId !== "string" || typeof record.queueItemId !== "string")) return false;
+  if (record.kind === "queue-retry" && (!validReceiptIdentity(record.queueItemId) || record.sourceGeneration === undefined)) return false;
   if (record.kind === "queue-interaction-lock" && typeof record.sessionId !== "string") return false;
   if (record.kind === "queue-resume" && (!validReceiptIdentity(record.sessionId) || !validReceiptIdentity(record.taskJoinId))) return false;
   if (["interaction-resolve", "interaction-dismiss"].includes(String(record.kind))

@@ -4056,7 +4056,7 @@ export function useAppController(): AppController {
     reobserveReview: (reviewRunId) => gateway().reobserveReview(reviewRunId),
     abort: (...args) => gateway().abort(...args),
     abortRetry: (runId) => gateway().abortRetry(runId),
-    retry: (runId) => gateway().retry(runId),
+    retry: (...args) => gateway().retry(...args),
     resetSession: (sessionId) => gateway().resetSession(sessionId),
     deleteSessionMessage: async (...args) => taskGateway().deleteSessionMessage(...args),
     renameSession: async (sessionId, name) => taskGateway().renameSession(sessionId, name),

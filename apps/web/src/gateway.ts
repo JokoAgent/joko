@@ -2658,8 +2658,18 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.submit({ case: "abortRetry", value: { runId } });
   }
 
-  async retry(runId: string): Promise<void> {
-    await this.submit({ case: "retryRun", value: { runId } }, true);
+  async retry(runId: string, queueItem?: QueueItemView): Promise<void> {
+    const preconditions: MutationPrecondition[] = [];
+    if (queueItem !== undefined) {
+      const current = this.#rawSnapshot?.queueItems.find(item => item.queueItemId === queueItem.id);
+      if (this.#taskSharing !== undefined || !current?.retryBeforeDispatch || current.runId !== runId
+        || current.sessionId !== queueItem.sessionId || current.version?.revision?.value !== queueItem.revision
+        || current.version?.generation !== queueItem.generation) {
+        throw new GatewayError("This failed queued input is no longer available to retry.");
+      }
+      preconditions.push(queueItemPrecondition(current));
+    }
+    await this.submit({ case: "retryRun", value: { runId } }, true, preconditions);
   }
 
   async resetSession(sessionId: string): Promise<void> {
@@ -13126,6 +13136,7 @@ function mapTargetView(target: Snapshot["targets"][number], workspaces: readonly
     pinned: target.pinned,
     archived: target.state === 2,
     ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }),
+    ...(target.sshWorktreeDerivationAllowed === undefined ? {} : { sshWorktreeDerivationAllowed: target.sshWorktreeDerivationAllowed }),
     ...(target.error?.message ? { error: presentJokoServiceTerminology(target.error.message) } : {})
   };
 }
@@ -16322,6 +16333,7 @@ function mapQueueItem(item: QueueItem): QueueItemView {
     ...(mentionRanges.length === 0 ? {} : { mentionRanges }),
     ...(attachments.length === 0 ? {} : { attachments }),
     state: queueState(item.state),
+    ...(item.retryBeforeDispatch && item.state === QueueItemState.FAILED && item.runId ? { retryRunId: item.runId } : {}),
     editLocked: item.editLocked,
     ordinal: numberValue(item.ordinal),
     createdAt: timestampMs(item.acceptedAt)

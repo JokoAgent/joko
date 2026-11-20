@@ -208,6 +208,9 @@ message Target {
   // Required strict location. Clients must reject an absent/unspecified kind
   // rather than infer service-node execution from missing remote fields.
   WorkspaceLocation location = 11;
+  // Current project policy for SSH Worktree derivation. Capability and source
+  // lease checks still apply at dispatch.
+  optional bool ssh_worktree_derivation_allowed = 12;
 }
 
 enum SessionState {
@@ -669,6 +672,8 @@ message QueueItem {
   // server-private; snapshots and Events expose only this boolean.
   bool edit_locked = 17;
   SharedTaskAuthor shared_task_author = 18;
+  // A current failed user input with a known pre-dispatch outcome and no continuation.
+  bool retry_before_dispatch = 19;
 }
 
 // Durable dispatch control for the serialized queue owned by one product

@@ -15585,7 +15585,7 @@ describe("SessionHost", () => {
   });
 
   it("applies scoped turn policy, restores it after settlement, and delays overridden steer", async () => {
-    const adapter = new PolicyFakeAdapter();
+    const adapter = new PolicyFakeAdapter(["read_only"]);
     const fixture = await createFixture(adapter);
     const extraPath = join(fixture.directory, "approved-extra");
     mkdirSync(extraPath);
@@ -15633,6 +15633,7 @@ describe("SessionHost", () => {
     });
     await eventually(() => fixture.store.getRun(first.value.runId).descriptor.state === "completed");
     await eventually(() => fixture.store.getRun(steered.value.runId).descriptor.state === "completed");
+    await eventually(() => adapter.currentPolicy.providerId === "test" && !adapter.currentPolicy.planMode);
     expect(adapter.sentPolicies.map((value) => value.text)).toEqual(["first", "steer"]);
     expect(adapter.sentPolicies[1]).toMatchObject({
       providerId: "vision",
@@ -21136,14 +21137,14 @@ class PolicyFakeAdapter extends FakeBackendAdapter {
   };
   readonly sentPolicies: Array<typeof this.currentPolicy & { text: string }> = [];
 
-  constructor() {
+  constructor(extraDirectoryAccess: readonly ("read_only" | "read_write")[] = ["read_write"]) {
     super({
       ...MUTABLE_RUNTIME_POLICY_PROFILE,
       streamDelayMs: 40,
       capabilities: [
         ...MUTABLE_RUNTIME_POLICY_PROFILE.capabilities.map((capability) =>
           capability.key === "model.fast_mode" ? { key: capability.key, supported: true } : capability),
-        { key: "workspace.extra_dirs", supported: true, options: ["read_write"] }
+        { key: "workspace.extra_dirs", supported: true, options: extraDirectoryAccess }
       ],
       models: PI_LIKE_PROFILE.models.map((model) => ({ ...model, supportsFastMode: true }))
     });

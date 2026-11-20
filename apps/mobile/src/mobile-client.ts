@@ -63,7 +63,7 @@ import {
   MarkScheduleRunReadMutationSchema, MarkScheduleRunsReadMutationSchema, NavigateSessionBranchMutationSchema,
   OperationPreconditionSchema, OperationState, OperationMutationSchema, PerTurnOverridesSchema, RewindSafety,
   MessageRole, PermissionMode, PinSessionMutationSchema, QueueDeliveryMode, QueueDispatchState, QueueItemState, RenameSessionMutationSchema, TaskTagColor,
-  ReorderQueueItemMutationSchema, ResetSessionMutationSchema, ResolveInteractionMutationSchema, RestartScheduleRunMutationSchema,
+  ReorderQueueItemMutationSchema, ResetSessionMutationSchema, ResolveInteractionMutationSchema, RestartScheduleRunMutationSchema, RetryRunMutationSchema,
   DeviceSchema, RenameDeviceMutationSchema, ResetDeviceNameMutationSchema, RevisionSchema, RevokeDeviceMutationSchema,
   CloneProjectScheduleToUserMutationSchema, PromoteScheduleToProjectMutationSchema,
   ReconcileProjectAutomationsMutationSchema, RemoveProjectScheduleMutationSchema,
@@ -12146,6 +12146,15 @@ export class MobileClient {
     return acceptedQueueItems(this.#state.detail?.queueItems ?? [], this.#state.selectedId);
   }
 
+  taskRetryableQueueItems(): readonly QueueItem[] {
+    const session = this.#selectedSession();
+    if (this.#joinedTask || !session || session.archived || !this.#taskAuthorityKey()) return [];
+    return (this.#state.detail?.queueItems ?? []).filter(item => item.state === QueueItemState.FAILED
+      && item.retryBeforeDispatch && item.runId !== "" && item.sessionId === session.sessionId
+      && item.backendId === session.backendId && item.targetId === session.targetId
+      && item.version?.revision !== undefined && item.version.generation === session.nativeBinding?.runtimeGeneration);
+  }
+
   /** Stable page-local owner occurrence; excludes normal entity revision advancement. */
   taskPresentationOwnerKey(allowOffline = false): string | undefined {
     if (this.#joinedTask) return this.#taskAuthorityKey();
@@ -14444,8 +14453,11 @@ export class MobileClient {
       const matches = runtime.backend.capabilities?.capabilities.filter((capability) => capability.name === name) ?? [];
       return matches.length === 1 && matches[0]!.support === CapabilitySupport.SUPPORTED;
     };
+    const derivesWorkspace = supported("workspace.derive");
+    const sshCloneBlocked = capability === capabilityNames.sessionClone && derivesWorkspace
+      && runtime.session.location?.kind.case === "sshHost" && target.sshWorktreeDerivationAllowed === false;
     const canDerive = supported(capability)
-      && (capability === capabilityNames.sessionSideChat || !runtime.session.worktree || supported("workspace.derive"))
+      && !sshCloneBlocked && (capability === capabilityNames.sessionSideChat || !runtime.session.worktree || derivesWorkspace)
       && !this.#state.detail?.reviewRuns.some((review) => review.reviewerSessionId === runtime.session.sessionId)
       && !this.#state.pending.some((pending) => pending.sessionId === runtime.session.sessionId
         && (pending.kind.startsWith("session-") || pending.kind === "workspace-rewind"));
@@ -15040,6 +15052,32 @@ export class MobileClient {
         preconditions: [this.#queueItemPrecondition(item)],
         payload: { case: "cancelQueueItem", value: create(CancelQueueItemMutationSchema, { queueItemId }) }
       }), { kind: "queue-cancel", sessionId: session.sessionId, queueItemId });
+    } finally { this.#releaseMutation(action); }
+  }
+
+  async retryQueueItem(source: QueueItem): Promise<boolean> {
+    const current = () => this.taskRetryableQueueItems().find(item => item.queueItemId === source.queueItemId
+      && item.runId === source.runId && item.sessionId === source.sessionId
+      && item.version?.generation === source.version?.generation
+      && item.version?.revision?.value === source.version?.revision?.value);
+    const item = current();
+    if (!item) throw new Error("This failed queued input is no longer available to retry.");
+    this.#assertNoPendingQueueMutation(item.sessionId, item.queueItemId);
+    const credential = this.#ready(), epoch = this.#epoch;
+    const precondition = this.#queueItemPrecondition(item);
+    const action = this.#claimMutation();
+    try {
+      const result = await this.#submitTerminal(create(OperationMutationSchema, {
+        preconditions: [precondition],
+        payload: { case: "retryRun", value: create(RetryRunMutationSchema, { runId: item.runId }) }
+      }), { kind: "queue-retry", sessionId: item.sessionId, queueItemId: item.queueItemId, runId: item.runId,
+        sourceGeneration: precondition.expectedGeneration.toString() }, undefined, true, true, {
+        signal: this.#abort!.signal,
+        isCurrent: () => this.#current(epoch) && this.#credential === credential,
+        beforeDispatch: () => current() !== undefined,
+        retireUndispatched: true
+      });
+      return result.accepted && result.definitive;
     } finally { this.#releaseMutation(action); }
   }
 
@@ -16174,7 +16212,7 @@ export class MobileClient {
   #assertNoPendingQueueMutation(sessionId: string, queueItemId: string): void {
     if (this.#state.pending.some((item) => item.sessionId === sessionId
       && (item.queueItemId === queueItemId || item.kind === "queue-interaction-lock")
-      && ["queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder"].includes(item.kind))) {
+      && ["queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder", "queue-retry"].includes(item.kind))) {
       throw new Error("A previous change to this queued input is still pending. Check its operation before retrying.");
     }
   }
@@ -17885,7 +17923,8 @@ export class MobileClient {
     try {
       operation = await this.network.submit(credential, pending.operationId, mutation, operationSignal);
     } catch (error) {
-      if (!this.#joinedTask && (pending.kind === "interaction-resolve" || pending.kind === "interaction-dismiss" || pending.kind === "session-stop")
+      if (!this.#joinedTask && (pending.kind === "interaction-resolve" || pending.kind === "interaction-dismiss"
+        || pending.kind === "session-stop" || pending.kind === "queue-retry")
         && pending.sessionId === this.#state.selectedId
         && error instanceof ConnectError && (error.code === Code.Aborted || error.code === Code.FailedPrecondition)
         && this.#current(epoch) && requestCurrent()) {
@@ -18055,6 +18094,16 @@ export class MobileClient {
       return mutation?.case === "abortRun" && mutation.value.runId === pending.runId
         && (operation.state !== OperationState.SUCCEEDED || result?.case === "acknowledgement" && result.value.accepted);
     }
+    if (pending.kind === "queue-retry") {
+      const mutation = operation.mutation;
+      const result = operation.result?.payload;
+      return mutation?.payload.case === "retryRun" && mutation.payload.value.runId === pending.runId
+        && mutation.preconditions.some(condition => condition.entity?.kind === EntityKind.QUEUE_ITEM
+          && condition.entity.id === pending.queueItemId && condition.expectedRevision !== undefined
+          && condition.expectedGeneration.toString() === pending.sourceGeneration)
+        && (operation.state !== OperationState.SUCCEEDED || result?.case === "run"
+          && result.value.sessionId === pending.sessionId && result.value.retryOfRunId === pending.runId);
+    }
     if (pending.kind === "session-fork") {
       const mutation = operation.mutation;
       if (mutation?.payload.case !== "forkSession") return false;
@@ -18167,10 +18216,11 @@ export class MobileClient {
           }
           if (operation.state === OperationState.SUCCEEDED
             && ["device-rename", "rename", "pin", "archive", "delete", "message-delete", "queue-cancel", "queue-edit-lock",
-              "queue-edit", "queue-interaction-lock", "queue-reorder", "queue-resume", "interaction-resolve", "interaction-dismiss",
+              "queue-edit", "queue-interaction-lock", "queue-reorder", "queue-resume", "queue-retry", "interaction-resolve", "interaction-dismiss",
               "session-model", "session-permission", "session-plan", "session-compact", "session-branch", "session-stop",
               "session-shell", "session-reset", "session-review", "session-clone", "session-rewind", "workspace-rewind", "task-tag", "model-favorite"].includes(pending.kind)
-            && this.#current(epoch) && (pending.kind !== "message-delete" && pending.kind !== "session-stop" || this.#operationReceiptMatches(operation, pending))) {
+            && this.#current(epoch) && (pending.kind !== "message-delete" && pending.kind !== "session-stop"
+              && pending.kind !== "queue-retry" || this.#operationReceiptMatches(operation, pending))) {
             await this.refresh();
             if ((pending.kind === "message-delete" || pending.kind === "session-rewind") && this.#foreground && this.#credential === credential
               && this.#state.selectedId === pending.sessionId) this.#clearHistory();

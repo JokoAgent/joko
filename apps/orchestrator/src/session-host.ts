@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { taskMessageReferenceHref, validInputMessageReferences } from "@joko/contracts";
+import { queuePauseForStopReason, taskMessageReferenceHref, validInputMessageReferences } from "@joko/contracts";
 import { MAXIMUM_EDITABLE_PLAN_LENGTH, modelPricesWithOverride, NATIVE_HISTORY_ASSISTANT_SOURCE_FIELD, NATIVE_HISTORY_OBSERVED_ASSISTANT_FIELD,
   parseNativeModelUsage, parseNativeUsageRequests, type ModelPriceOverride } from "@joko/core";
 import { DocumentPathError, type DocumentPathAuthorizer } from "@joko/tool-document";
@@ -3366,6 +3366,30 @@ export class SessionHost {
     return execution;
   }
 
+  canRetryFailedQueueInput(item: QueueItemRecord): boolean {
+    if (item.state !== "failed" || item.disposition !== "prompt" || item.backendAcceptedAt !== undefined
+      || item.error?.retryable !== true || item.error.stateMayHaveChanged !== false) return false;
+
+    const run = this.#store.findRun(item.runId)?.descriptor;
+    if (run?.sessionId !== item.sessionId || run.source !== "user" || run.parentRunId !== undefined
+      || run.state !== "failed" || run.error?.retryable !== true || run.error.stateMayHaveChanged !== false
+      || !this.isOwnerRunInput(item)) return false;
+
+    if (this.#store.findRunByParentId(run.id) !== undefined) return false;
+
+    const stored = this.#store.getSession(item.sessionId);
+    const session = stored.descriptor;
+    const target = this.#store.getTarget(session.targetId).descriptor;
+    const remote = session.remoteWorkspace;
+    return target.trusted && (remote === undefined || remote.kind === "ssh")
+      && sameRemoteWorkspaceBinding(remote, target.remoteWorkspace)
+      && this.#store.getBackend(session.backendId).descriptor.adapterKind === "codex"
+      && this.isOrdinarySession(stored) && !this.isReviewReadOnlySession(item.sessionId)
+      && this.#store.findObjective(item.sessionId) === undefined && !this.#providerGroupApplies(item)
+      && this.#store.findSetting("session", item.sessionId, `mcp_app_queue:${item.id}`) === undefined
+      && this.#store.findSetting("session", item.sessionId, `extension_card_queue:${item.id}`) === undefined;
+  }
+
   manualRetryPrompt(run: RunDescriptor, source: QueueItemRecord): PromptInput {
     const stored = this.#store.getSession(run.sessionId);
     if (run.source !== "user" || source.disposition !== "prompt" || source.body.messagingOrigin !== undefined
@@ -4797,6 +4821,20 @@ export class SessionHost {
       && (operation.kind === "sendInput" || operation.kind === "send_input");
   }
 
+  releaseEmptyQueueAfterOwnerStop(store: OperationalStore, withdrawn: QueueItemRecord, traceId: string): void {
+    const { sessionId } = withdrawn;
+    const control = store.getQueueControl(sessionId);
+    if (!control.paused || control.pauseReason !== queuePauseForStopReason || control.pausedAt === undefined
+      || withdrawn.createdAt > control.pausedAt || !this.isOwnerRunInput(withdrawn)) return;
+    const session = store.getSession(sessionId);
+    if (store.getBackend(session.descriptor.backendId).descriptor.adapterKind !== "pi"
+      || !this.isOrdinaryLocalSession(session) || session.descriptor.worktree !== undefined
+      || store.findCollaborationWorkerBySession(sessionId) !== undefined
+      || withdrawn.disposition !== "prompt" || store.getRun(withdrawn.runId).descriptor.source !== "user"
+      || store.listQueueItems({ sessionId, states: ["accepted", "dispatch_unknown"], limit: 1 }).length > 0) return;
+    store.setQueuePaused({ sessionId, paused: false, expectedRevision: control.revision, traceId });
+  }
+
   async cancelBackgroundTask(sessionId: string, taskId: string, operationId?: string): Promise<void> {
     this.#assertOpen();
     if (sessionId.trim() === "") throw backgroundTaskCancellationError(
@@ -5691,6 +5729,18 @@ export class SessionHost {
       (store) => {
         const source = store.getSession(input.sourceSessionId);
         this.assertSessionDerivationSource(source, input.sideChat === true);
+        if (input.kind === "clone" && source.descriptor.remoteWorkspace?.kind === "ssh"
+          && store.getBackend(source.descriptor.backendId).descriptor.capabilities.get("workspace.derive")?.supported === true) {
+          const target = store.getTarget(source.descriptor.targetId).descriptor;
+          if (!target.managed || !target.trusted) throw new JokoError({
+            code: "SESSION_DERIVATION_WORKTREE_UNAVAILABLE",
+            message: "Cloning through an SSH Worktree requires a trusted managed project.",
+            phase: "workspace",
+            retryable: false,
+            stateMayHaveChanged: false,
+            recovery: "Use a trusted managed project for an isolated clone."
+          });
+        }
         if (input.expectedGeneration !== undefined && source.descriptor.binding.generation !== input.expectedGeneration) {
           throw new StoreError(input.sideChat ? "The Side Chat source generation changed." : "The message fork source generation changed.");
         }
@@ -11288,14 +11338,19 @@ export class SessionHost {
 
   private isOrdinaryLocalCodexSession(stored: StoredSession): boolean {
     return this.#store.getBackend(stored.descriptor.backendId).descriptor.adapterKind === "codex"
-      && this.isOrdinaryLocalPlanSession(stored);
+      && this.isOrdinaryLocalSession(stored);
   }
 
-  private isOrdinaryLocalPlanSession(stored: StoredSession): boolean {
+  private isOrdinaryLocalSession(stored: StoredSession): boolean {
     const session = stored.descriptor;
     return session.remoteWorkspace === undefined
       && this.#store.getTarget(session.targetId).descriptor.remoteWorkspace === undefined
-      && session.automationOrigin === undefined && session.derivationOrigin?.sideChat !== true
+      && this.isOrdinarySession(stored);
+  }
+
+  private isOrdinarySession(stored: StoredSession): boolean {
+    const session = stored.descriptor;
+    return session.automationOrigin === undefined && session.derivationOrigin?.sideChat !== true
       && !session.hidden && !session.archived && session.deletedAt === undefined
       && this.#store.sessionCreationServiceKind(session.id) === undefined
       && this.#partnerSessionPolicy(session.id) === undefined
@@ -11307,7 +11362,7 @@ export class SessionHost {
     const stored = this.#store.getSession(sessionId);
     const backend = this.#store.getBackend(stored.descriptor.backendId).descriptor.adapterKind;
     if (backend === "codex") return this.isLocalCodexPlanRun(stored, runId) ? backend : undefined;
-    if (backend !== "claude-agent-sdk-stdio" || !this.isOrdinaryLocalPlanSession(stored)) return undefined;
+    if (backend !== "claude-agent-sdk-stdio" || !this.isOrdinaryLocalSession(stored)) return undefined;
     const run = this.#store.findRun(runId)?.descriptor;
     const queue = this.#store.findQueueItemByRunId(sessionId, runId, { includeCleared: true });
     return run?.source === "user" && run.parentRunId === undefined && queue?.disposition === "prompt"
@@ -15212,8 +15267,8 @@ export class SessionHost {
           this.failQueueItemForAuthentication(pending, authenticationFailure);
           continue;
         }
-        const claimBackendInstanceGeneration = this.#store
-          .getBackend(claimSession.descriptor.backendId).descriptor.instanceGeneration;
+        const claimBackend = this.#store.getBackend(claimSession.descriptor.backendId).descriptor;
+        const claimBackendInstanceGeneration = claimBackend.instanceGeneration;
         if (pending.backendInstanceGeneration !== undefined && pending.backendInstanceGeneration !== claimBackendInstanceGeneration) {
           this.#failExpiredApplicationInput(pending, {
             code: "APPLICATION_INPUT_EXPIRED", message: "The original Backend instance is no longer available.",
@@ -15223,12 +15278,29 @@ export class SessionHost {
         }
         const scheduleGate = scheduled ? this.#scheduleDispatchGate : undefined;
         if (scheduleGate?.acquire(pending.runId) === false) return;
+        const candidate = pending;
         let claimedItem: ReturnType<OperationalStore["claimNextQueueItem"]>;
         try {
-          claimedItem = this.#store.claimNextQueueItem({
-            sessionId,
-            backendInstanceGeneration: claimBackendInstanceGeneration,
-            traceId: `dispatch:${pending.id}`
+          claimedItem = this.#store.transaction((store) => {
+            // Once its native predecessor finishes, a held follow-up can start a fresh turn.
+            if (!otherActive && !bypassesCompaction && claimBackend.adapterKind === "pi"
+              && candidate.disposition === "follow_up" && !candidate.editLocked && !store.getQueueControl(sessionId).interactionLocked
+              && candidate.body.text.trim() !== "" && !candidate.body.text.trimStart().startsWith("/")
+              && candidate.body.images.length === 0 && candidate.body.files.length === 0 && candidate.body.mentions.length === 0
+              && candidate.body.replyQuote === undefined && candidate.body.todoQuote === undefined
+              && !candidate.body.messageReferences?.length && !hasTurnOverrides(candidate.executionOverrides)
+              && claimSession.descriptor.worktree === undefined && this.isOrdinaryLocalSession(claimSession) && this.isOwnerRunInput(candidate)
+              && store.hasCompletedPromptAtQueueAdmission(candidate, claimSession.descriptor.binding.generation, claimBackendInstanceGeneration)) {
+              store.editQueueItem({
+                queueItemId: candidate.id, body: { ...candidate.body, disposition: "prompt" },
+                expectedRevision: candidate.revision, traceId: `dispatch:${candidate.id}:settled-follow-up`
+              });
+            }
+            return store.claimNextQueueItem({
+              sessionId,
+              backendInstanceGeneration: claimBackendInstanceGeneration,
+              traceId: `dispatch:${candidate.id}`
+            });
           });
         } catch (error) { scheduleGate?.release(pending.runId); throw error; }
         if (claimedItem === undefined) {

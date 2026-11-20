@@ -195,6 +195,27 @@ function responsesEvents(body: string): Record<string, unknown>[] {
 }
 
 describe("Managed Provider native proxy", () => {
+  it("accepts the Claude SDK Messages query only with the original model operation", async () => {
+    const f = await fixture(false, "anthropic-messages", "claude-messages-provider", null, "anthropic-messages");
+    try {
+      const binding = await f.port.prepare(f.owner);
+      expect((await fetch(`${binding.baseUrl}/api/hello`)).status).toBe(404);
+      const post = (search: string, token: string) => fetch(`${binding.baseUrl}/v1/messages${search}`, {
+        method: "POST", headers: { "content-type": "application/json", "x-api-key": token },
+        body: JSON.stringify({ model: f.owner.modelId, messages: [{ role: "user", content: "Authorized fixture turn" }], max_tokens: 10 })
+      });
+      expect((await post("?beta=true", "wrong-token")).status).toBe(403);
+      expect((await post("?beta=true", f.token)).status).toBe(409);
+      expect(f.received).toEqual([]);
+      const lease = await binding.activate({ operationId: "claude-beta-turn", signal: new AbortController().signal, assertCurrent: () => undefined });
+      try {
+        expect((await post("?beta=false", f.token)).status).toBe(403);
+        expect((await post("?beta=true", f.token)).status).toBe(200);
+        expect(f.received).toMatchObject([{ path: "/v1/messages?beta=true", model: f.owner.modelId }]);
+      } finally { lease.release(); }
+    } finally { await f.dispose(); }
+  });
+
   it("translates a Claude SDK Messages turn through the selected account's standard Responses endpoint", async () => {
     const f = await fixture(false, "openai-responses", "claude-response-provider", null, "anthropic-messages");
     try {
