@@ -12,6 +12,7 @@ export * from "./sourceAutomations.js";
 export * from "./media.js";
 export * from "./nativeCron.js";
 export * from "./takeover.js";
+export * from "./bot-takeover.js";
 export * from "./connections.js";
 export * from "./skillResources.js";
 export * from "./httpBindings.js";

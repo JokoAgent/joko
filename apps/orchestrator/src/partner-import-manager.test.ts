@@ -308,8 +308,12 @@ describe("native import service and owning effects", () => {
     const skillEntry = preview.entries.find((entry) => entry.category === PartnerImportCategory.SKILLS);
     expect(skillEntry?.description).toContain("Verify");
     expect(skillEntry?.description).not.toContain(referenced);
+    expect(preview.entries).toContainEqual(expect.objectContaining({ category: PartnerImportCategory.BOTS, selected: false }));
+    const knowledgeCategories = new Set<PartnerImportCategory>([
+      PartnerImportCategory.PERSONALITY, PartnerImportCategory.MEMORY, PartnerImportCategory.SKILLS
+    ]);
     const selection = { previewId: preview.id, requestId: "owner_import_discord_0001", name: "Redaction fixture",
-      entryIds: preview.entries.filter((entry) => entry.category !== PartnerImportCategory.CONNECTIONS).map((entry) => entry.id), takeover: false, deferSetup: true };
+      entryIds: preview.entries.filter((entry) => knowledgeCategories.has(entry.category)).map((entry) => entry.id), takeover: false, deferSetup: true };
     await f.api.start(selection, signal);
     const saved = await f.imports.waitForRequest(selection.requestId);
     expect(saved.checks).toContainEqual(expect.objectContaining({ status: "needs-attention", message: "MEMORY_WRITE_FAILED" }));

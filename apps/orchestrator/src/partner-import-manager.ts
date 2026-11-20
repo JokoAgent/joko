@@ -35,7 +35,7 @@ export interface PartnerImportEffectContext {
   readonly assertOwner: () => void;
   readonly activateNativePackage?: boolean;
 }
-type ImportEffects = Pick<TransferDeps, "partnerId" | "createPartner" | "importItem" | "saveEnvironment" | "createConversation" | "createRoutine" | "verifyAutomation" | "pauseSource" | "resumeSource" | "enableRoutine"> & {
+type ImportEffects = Pick<TransferDeps, "partnerId" | "createPartner" | "importItem" | "saveEnvironment" | "createConversation" | "createRoutine" | "verifyAutomation" | "pauseSource" | "resumeSource" | "enableRoutine" | "takeOverBot"> & {
   validateItems?(items: ImportItem[]): void | Promise<void>;
 };
 interface OwnedValue<T> { readonly owner: string; readonly expires: number; readonly value: T; readonly bytes: number; readonly sourceId?: string; }

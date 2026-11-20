@@ -13,6 +13,8 @@ import { RealPiSystemFixture, REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID } from "./re
 import { waitFor } from "./fixture.js";
 import { createSessionMutation, queueItemIdFrom, queueRunIdFrom, resolvePermissionMutation, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 import { installLocalSkill } from "./skill-system-fixture.js";
+import { TELEGRAM_SYSTEM_OWNER_ID, TELEGRAM_SYSTEM_TOKEN, TelegramSystemFixture } from "./telegram-system-fixture.js";
+import { DISCORD_SYSTEM_DM_ID, DISCORD_SYSTEM_OWNER_ID, DISCORD_SYSTEM_TOKEN, DiscordSystemFixture } from "./discord-system-fixture.js";
 
 let fixture: RealPiSystemFixture | undefined;
 afterEach(async () => {
@@ -253,6 +255,181 @@ async function exerciseAgentImport(backendId: "pi" | "claude-code" | "codex"): P
   expect(requests).toContain(catalogToolName ?? toolName);
   expect(requests).not.toContain(secret);
 }
+
+it.skipIf(process.platform !== "linux")("moves the approved original Telegram bot to the same ready Partner and consumes an Owner message",
+  { timeout: 120_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-real-pi-system-e2e-"));
+    const native = join(root, ".hermes");
+    const bin = join(root, ".local", "bin");
+    await Promise.all([mkdir(native), mkdir(bin, { recursive: true })]);
+    const file = join(native, "config.yaml");
+    await writeFile(file, JSON.stringify({ name: "Messaging agent", platforms: { telegram: { enabled: true } } }));
+    await writeFile(join(native, ".env"), `TELEGRAM_BOT_TOKEN=${TELEGRAM_SYSTEM_TOKEN}\nTELEGRAM_ALLOWED_USERS=${TELEGRAM_SYSTEM_OWNER_ID}\n`);
+    await writeFile(join(bin, "hermes"), `#!${process.execPath}
+const { readFileSync, writeFileSync, appendFileSync } = require("node:fs");
+const { join } = require("node:path");
+const [command, verb, field, value] = process.argv.slice(2);
+if (process.cwd() !== process.env.HERMES_HOME || command !== "config" || verb !== "set" || field !== "platforms.telegram.enabled" || !["false", "true"].includes(value)) process.exit(2);
+const file = join(process.cwd(), "config.yaml");
+const config = JSON.parse(readFileSync(file));
+config.platforms.telegram.enabled = value === "true";
+writeFileSync(file, JSON.stringify(config));
+appendFileSync(join(process.cwd(), "owned-switches.log"), value + "\\n");
+`, { mode: 0o700 });
+    const sourceIsEnabled = async () => (JSON.parse(await readFile(file, "utf8")) as { platforms: { telegram: { enabled: boolean } } }).platforms.telegram.enabled;
+    const telegram = await TelegramSystemFixture.start();
+    try {
+      const sources = { home: root, environment: { PATH: process.env.PATH } };
+      fixture = await RealPiSystemFixture.start({ rootDirectory: root, keepRoot: true, enableInternalServer: true, agentImportSources: sources,
+        telegramApiBaseUrl: telegram.baseUrl, messagingPollTimeoutSeconds: 1, messagingRetryDelayMs: 20 });
+      const paired = await fixture.pair("Original Messaging import owner");
+      const directory = (await paired.clients.partner.getPartnerDirectory({})).directory!;
+      await paired.clients.partner.updatePartnerDefaults({ expectedDirectoryRevision: directory.revision, capabilities: {
+        modelChain: [{ backendId: "pi", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, fastMode: false }],
+        permissionMode: PermissionMode.ASK, planMode: false
+      } });
+      const api = createPartnerImportApi({ rpc: paired.clients.partnerImport, ownerKey: paired.connectionId, controllerId: "messaging-import",
+        assertCurrent() {}, newRequestId: randomUUID });
+      const signal = new AbortController().signal;
+      const preview = await api.preview((await api.sources(signal))[0]!.id, signal);
+      const bot = preview.entries.find(entry => entry.category === PartnerImportCategory.BOTS)!;
+      expect(bot).toMatchObject({ selected: false, name: "Telegram · default" });
+      expect(JSON.stringify(preview)).not.toContain(TELEGRAM_SYSTEM_TOKEN);
+      const selected = new Set([bot.id]);
+      const selection = importSelectionInput(preview, selected, { requestId: "owned_bot_transfer_0001", name: "Imported Messenger",
+        takeover: false, deferSetup: true });
+      await expect(api.start(selection, signal)).rejects.toThrow();
+      expect(await sourceIsEnabled()).toBe(true);
+      const approved = { ...selection, takeoverBots: true };
+      await api.start(approved, signal);
+      const settled = (label: string) => waitFor(() => api.status(approved.requestId, signal),
+        value => value !== undefined && value.status !== PartnerImportStatus.RUNNING, label, 45_000);
+      const saved = await settled("the original Partner before the approved bot handover");
+      expect(saved?.canonicalSessionId).toBeTruthy();
+      expect(saved?.checks).toContainEqual(expect.objectContaining({ entryId: bot.id, message: "IMPORT_SETUP_DEFERRED" }));
+      expect(await sourceIsEnabled()).toBe(true);
+      expect(telegram.methodCount("getUpdates")).toBe(0);
+
+      telegram.failNextPollWithConflict();
+      await api.retry(approved.requestId, true, signal);
+      const failed = await settled("the owned source to become available again");
+      expect(failed?.checks).toContainEqual(expect.objectContaining({ entryId: bot.id, message: "IMPORT_IM_BOT_CONNECT_FAILED" }));
+      expect(await sourceIsEnabled()).toBe(true);
+      expect(fixture.application.messaging!.listConnections().map(connection => connection.enabled)).toEqual([false]);
+
+      await api.retry(approved.requestId, true, signal);
+      const connected = await settled("the same original bot after successful native polling");
+      expect(connected?.status).toBe(PartnerImportStatus.COMPLETE);
+      expect(connected?.canonicalSessionId).toBe(saved?.canonicalSessionId);
+      expect(connected?.checks).toContainEqual(expect.objectContaining({ entryId: bot.id, status: PartnerImportCheckStatus.TAKEN_OVER }));
+      expect(await sourceIsEnabled()).toBe(false);
+      expect((await readFile(join(native, "owned-switches.log"), "utf8")).split("\n").filter(Boolean)).toEqual(["false", "true", "false"]);
+      const [connection] = fixture.application.messaging!.listConnections();
+      expect(connection).toMatchObject({ channel: "telegram", enabled: true, ownerProviderUserId: String(TELEGRAM_SYSTEM_OWNER_ID) });
+      expect(fixture.application.partnerMessaging!.binding(connection!.id).partnerId).toBe(saved?.partnerId);
+
+      telegram.enqueueDirectMessage({ updateId: 1, messageId: 1, text: "Reply to the approved imported bot." });
+      await waitFor(async () => fixture!.providerRequests.some(request => JSON.stringify(request.body).includes("Reply to the approved imported bot.")),
+        value => value === true, "the original Owner message in the published Pi task", 30_000);
+      await waitFor(async () => fixture!.application.store.listRuns({ sessionId: saved!.canonicalSessionId! }).some(run => run.descriptor.state === "completed"),
+        value => value === true, "the original bot message to finish on the same canonical task", 30_000);
+      expect(await api.start(approved, signal)).toEqual(connected);
+      expect((await readFile(join(root, "data", "orchestrator.db"))).includes(Buffer.from(TELEGRAM_SYSTEM_TOKEN))).toBe(false);
+    } finally {
+      try { await fixture?.close({ removeRoot: true }); }
+      finally { fixture = undefined; await telegram.close(); }
+    }
+  });
+
+it.skipIf(process.platform !== "linux")("hands over the exact OpenClaw Discord bot, resumes the same Partner and retires its connection", { timeout: 120_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "joko-agent-import-discord-"));
+  const native = join(root, ".openclaw"), bin = join(root, ".local", "bin");
+  await Promise.all([mkdir(join(native, "workspace"), { recursive: true }), mkdir(bin, { recursive: true })]);
+  const config = join(native, "openclaw.json");
+  await writeFile(config, JSON.stringify({ agents: { list: [{ id: "main", default: true }, { id: "other" }] },
+    channels: { discord: { defaultAccount: "owned", accounts: {
+      owned: { enabled: true, token: DISCORD_SYSTEM_TOKEN, allowFrom: [DISCORD_SYSTEM_OWNER_ID] },
+      separate: { enabled: true, token: "independent-fixture-discord-token", allowFrom: ["999999999999999999"] }
+    } } }, bindings: [{ agentId: "main", match: { channel: "discord", accountId: "owned" } },
+      { agentId: "other", match: { channel: "discord", accountId: "separate" } }] }));
+  await writeFile(join(bin, "openclaw"), `#!${process.execPath}
+const { readFileSync, writeFileSync, appendFileSync } = require("node:fs");
+const { join } = require("node:path");
+const path = join(process.cwd(), "openclaw.json");
+if (process.env.OPENCLAW_CONFIG_PATH !== path || process.env.OPENCLAW_STATE_DIR !== process.cwd()) process.exit(2);
+const config = JSON.parse(readFileSync(path, "utf8"));
+const args = process.argv.slice(2).join(" ");
+const owned = config.channels.discord.accounts.owned;
+if (args === "gateway call channels.status --json") {
+  const running = owned.enabled;
+  appendFileSync(join(process.cwd(), "channel-receipts.log"), "observed:" + running + "\\n");
+  process.stdout.write(JSON.stringify({ channelAccounts: { discord: [{ accountId: "owned", running, connected: running },
+    { accountId: "separate", running: true, connected: true }] } }));
+} else if (args === "config patch --stdin") {
+  const patch = JSON.parse(readFileSync(0, "utf8"));
+  if (JSON.stringify(patch) !== '{"channels":{"discord":{"accounts":{"owned":{"enabled":false}}}}}') process.exit(3);
+  owned.enabled = false;
+  writeFileSync(path, JSON.stringify(config));
+  appendFileSync(join(process.cwd(), "channel-receipts.log"), "owned:false\\n");
+} else process.exit(4);
+`, { mode: 0o700 });
+  const discord = await DiscordSystemFixture.start();
+  const options = { rootDirectory: root, keepRoot: true, enableInternalServer: true,
+    agentImportSources: { home: root, environment: { PATH: process.env.PATH } }, discordApiBaseUrl: discord.apiBaseUrl, messagingPollTimeoutSeconds: 1 };
+  try {
+    fixture = await RealPiSystemFixture.start(options);
+    const paired = await fixture.pair("Original Discord import Owner");
+    const directory = (await paired.clients.partner.getPartnerDirectory({})).directory!;
+    await paired.clients.partner.updatePartnerDefaults({ expectedDirectoryRevision: directory.revision, capabilities: {
+      modelChain: [{ backendId: "pi", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, fastMode: false }],
+      permissionMode: PermissionMode.ASK, planMode: false
+    } });
+    const api = (client: typeof paired.clients.partnerImport) => createPartnerImportApi({ rpc: client, ownerKey: paired.connectionId,
+      controllerId: "discord-import", assertCurrent() {}, newRequestId: randomUUID });
+    const importer = api(paired.clients.partnerImport);
+    const signal = new AbortController().signal;
+    const source = (await importer.sources(signal)).find(candidate => candidate.name === "main")!;
+    const preview = await importer.preview(source.id, signal);
+    const bot = preview.entries.find(entry => entry.category === PartnerImportCategory.BOTS)!;
+    expect(bot).toMatchObject({ name: "Discord · owned", description: DISCORD_SYSTEM_OWNER_ID, selected: false });
+    expect(JSON.stringify(preview)).not.toContain(DISCORD_SYSTEM_TOKEN);
+    const request = importSelectionInput(preview, new Set([bot.id]), { requestId: "owned_discord_import_0001",
+      name: "Discord Partner", takeover: false, takeoverBots: true, deferSetup: false });
+    await importer.start(request, signal);
+    const saved = await waitFor(() => importer.status(request.requestId, signal),
+      value => value !== undefined && value.status !== PartnerImportStatus.RUNNING, "the original Discord receiving connection", 45_000);
+    expect(saved).toMatchObject({ status: PartnerImportStatus.COMPLETE });
+    expect(saved?.checks).toContainEqual(expect.objectContaining({ entryId: bot.id, status: PartnerImportCheckStatus.TAKEN_OVER }));
+    const original = fixture.application.messaging!.listConnections()[0]!;
+    expect(original).toMatchObject({ ownerProviderUserId: DISCORD_SYSTEM_OWNER_ID, channel: "discord", enabled: true });
+    expect((await readFile(join(native, "channel-receipts.log"), "utf8")).split("\n").filter(Boolean)).toEqual(
+      ["observed:true", "owned:false", "observed:false"]);
+    expect(JSON.parse(await readFile(config, "utf8")).channels.discord.accounts.separate.enabled).toBe(true);
+
+    await fixture.close();
+    const resumes = discord.resumeSequences.length;
+    fixture = await RealPiSystemFixture.start(options);
+    const clients = fixture.clients(paired.authKey);
+    expect(await api(clients.partnerImport).status(request.requestId, signal)).toEqual(saved);
+    await waitFor(async () => discord.resumeSequences.length, value => value > resumes, "the same Discord Gateway cursor after restart", 20_000);
+    const messageId = "900000000000000011";
+    const text = "Reply to the original Discord Owner after restart.";
+    discord.enqueueMessage({ messageId, channelId: DISCORD_SYSTEM_DM_ID, text });
+    await waitFor(async () => fixture!.application.store.listMessagingInboundRequests().find(record => record.providerMessageId === messageId),
+      value => value?.status === "completed", "the original Discord message to finish", 45_000);
+    expect(fixture.application.store.listMessagingConversations({ connectionId: original.id })[0]?.sessionId).toBe(saved?.canonicalSessionId);
+    expect(fixture.providerRequests.some(record => JSON.stringify(record.body).includes(text))).toBe(true);
+
+    const partner = (await clients.partner.getPartner({ partnerId: saved!.partnerId })).partner!;
+    await clients.partner.deletePartner({ requestId: "owned_discord_partner_delete", partnerId: partner.partnerId,
+      expectedRevision: partner.revision, confirmName: partner.displayName });
+    expect(fixture.application.messaging!.listConnections().find(connection => connection.id === original.id)?.enabled).toBe(false);
+    expect(fixture.application.partnerMessaging!.binding(original.id).partnerId).toBeUndefined();
+  } finally {
+    try { await fixture?.close({ removeRoot: true }); }
+    finally { fixture = undefined; await discord.close(); }
+  }
+});
 
 it("imports into the production HTTP/SQLite/published runtime, uses its full redacted resources and routines without a UI and restores the same task after restart", async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-real-pi-system-e2e-")); const native = join(root, ".hermes");

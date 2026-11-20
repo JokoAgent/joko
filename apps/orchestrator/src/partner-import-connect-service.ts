@@ -52,7 +52,7 @@ export function createPartnerImportConnectService(manager: PartnerImportManager 
       return create(contract.StartPartnerImportResponseSchema, { result: result(await owner().start({ previewId: value.previewId, requestId: value.requestId,
         name: value.name, ...(value.avatarImageBase64 !== undefined ? { avatarImageBase64: value.avatarImageBase64 } : {}), entryIds: value.entryIds,
         ...(value.entryRanges.length ? { entryRanges: value.entryRanges.map(range => [range.first, range.last] as const) } : {}),
-        takeover: value.takeover, deferSetup: value.deferSetup }, controller)) });
+        takeover: value.takeover, ...(value.takeoverBots ? { takeoverBots: true } : {}), deferSetup: value.deferSetup }, controller)) });
     }),
     getPartnerImportStatus: (request, context) => invoke(context, undefined, async controller => {
       const value = await owner().status(request.requestId, controller);
@@ -70,7 +70,8 @@ function toProtoImportSource(value: AgentImportSource): contract.PartnerImportSo
 function toProtoImportPage(value: AgentImportPreview, offset: number): contract.PartnerImportPreviewPage {
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > value.entries.length) throw new AgentImportError("INVALID_SELECTION");
   const categories = { personality: contract.PartnerImportCategory.PERSONALITY, memory: contract.PartnerImportCategory.MEMORY,
-    skills: contract.PartnerImportCategory.SKILLS, connections: contract.PartnerImportCategory.CONNECTIONS, automations: contract.PartnerImportCategory.AUTOMATIONS };
+    skills: contract.PartnerImportCategory.SKILLS, connections: contract.PartnerImportCategory.CONNECTIONS,
+    automations: contract.PartnerImportCategory.AUTOMATIONS, bots: contract.PartnerImportCategory.BOTS };
   return create(contract.PartnerImportPreviewPageSchema, { id: value.id, source: toProtoImportSource(value.source), name: value.name,
     ...(value.avatarImageBase64 !== undefined ? { avatarImageBase64: value.avatarImageBase64 } : {}), total: value.entries.length,
     entries: value.entries.slice(offset, offset + 20).map((entry, index) => create(contract.PartnerImportEntrySchema, { ...entry, index: index + offset,

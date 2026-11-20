@@ -1,6 +1,6 @@
 /** Native source identifiers are interoperability values, independent of a Backend. */
 export type AgentImportSourceKind = "hermes" | "openclaw" | "package";
-export type AgentImportCategory = "personality" | "memory" | "skills" | "connections" | "automations";
+export type AgentImportCategory = "personality" | "memory" | "skills" | "connections" | "automations" | "bots";
 
 /** Safe domain projections are mapped into generated contracts at the service boundary. */
 export interface AgentImportSource {
@@ -37,6 +37,7 @@ export interface AgentImportSelection {
   readonly entryIds: readonly string[];
   readonly entryRanges?: ReadonlyArray<readonly [number, number]>;
   readonly takeover: boolean;
+  readonly takeoverBots?: boolean;
   readonly deferSetup: boolean;
 }
 
@@ -91,6 +92,13 @@ export interface ImportedMcpServer {
 
 export interface ImportedDelivery { connectionId: string; chatId: string; threadId?: number }
 
+export interface ImportedMessagingBot {
+  readonly channel: "telegram" | "discord";
+  readonly account: string;
+  readonly ownerProviderUserId: string;
+  readonly sourceFingerprint: string;
+}
+
 export type ImportedRoutineTrigger =
   | { id: string; kind: "cron"; expression: string; timezone: string }
   | { id: string; kind: "interval"; intervalMs: number; anchorMs?: number }
@@ -130,6 +138,7 @@ export interface ImportItem {
   envDependencies?: { names: string[]; entries: string[] };
   mcp?: ImportedMcpServer;
   credential?: { format: string; value: unknown };
+  bot?: ImportedMessagingBot;
   asset?: { name: string; bytes: Buffer; executable?: boolean };
   automation?: {
     sourceId: string;

@@ -132,7 +132,8 @@ export function importSelectionRanges(entries: readonly PartnerImportEntry[], se
   const ranges: Array<{ first: number; last: number }> = [];
   for (const index of indexes) { const previous = ranges.at(-1); if (previous && previous.last + 1 === index) previous.last = index; else ranges.push({ first: index, last: index }); } return ranges;
 }
-export function importSelectionInput(preview: PartnerImportPreview, selected: ReadonlySet<string>, fields: { requestId: string; name: string; takeover: boolean; deferSetup: boolean; avatarImageBase64?: string }): Omit<PartnerImportSelection, "$typeName"> {
+export function importSelectionInput(preview: PartnerImportPreview, selected: ReadonlySet<string>, fields: { requestId: string; name: string; takeover: boolean; takeoverBots?: boolean; deferSetup: boolean; avatarImageBase64?: string }): Omit<PartnerImportSelection, "$typeName"> {
   if (!fields.name.trim() || fields.name.length > 200) throw new Error("IMPORT_NAME_REQUIRED");
-  return { ...fields, previewId: preview.id, entryIds: [], entryRanges: importSelectionRanges(preview.entries, selected).map(range => ({ $typeName: "joko.v1.PartnerImportEntryRange", ...range })) };
+  return { ...fields, takeoverBots: fields.takeoverBots === true, previewId: preview.id, entryIds: [],
+    entryRanges: importSelectionRanges(preview.entries, selected).map(range => ({ $typeName: "joko.v1.PartnerImportEntryRange", ...range })) };
 }
