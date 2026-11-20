@@ -288,6 +288,7 @@ type JokoDesktopCapability =
   | "layout.reset"
   | "microphone.lifecycle"
   | "native.taskStatus"
+  | "native.localAgents"
   | "navigation.deepLinks"
   | "notifications.session"
   | "page.search"
@@ -497,6 +498,11 @@ type DesktopRuntimeProcessMonitorResponse = {
 
 interface JokoDesktopApi {
   readonly codeHostLogin?: JokoDesktopCodeHostLogin;
+  readonly localAgents?: {
+    list(): Promise<{ readonly origin: string; readonly applications: import("@joko/contracts").ListDesktopLocalAgentsResponse }>;
+    review(requestId: string): Promise<void>;
+    revoke(grantId: string): Promise<void>;
+  };
   readonly voiceConversation?: { control(serverId: string, bytes: Uint8Array): Promise<Uint8Array> };
   readonly linkspan?: { request(kind: 'iroh' | 'tailcat' | 'http-connect', message: import('@jokoagent/linkspan-core/stream').StreamBridgeRequest): Promise<{ readonly success: true; readonly value?: unknown } | { readonly success: false; readonly code: import('@jokoagent/linkspan-core').LinkspanErrorCode }> };
   readonly menuBar?: {

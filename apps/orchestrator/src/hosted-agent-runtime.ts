@@ -149,6 +149,46 @@ export class HostedAgentRuntime {
         if (!this.#factories.get(backendId)?.providerIds().includes(providerId)) throw new HostedAgentHostError("UNAVAILABLE");
       }, onChanged: () => this.endpoint.sweep() } };
   }
+  localApplicationOptions(authenticate: HostedAgentConnectOptions["authenticate"]): HostedAgentConnectOptions {
+    return {
+      host: this.host,
+      authenticate,
+      catalog: principal => {
+        principal.assertCurrent();
+        if (!principal.localApplication || principal.trust !== "guest") throw new HostedAgentHostError("ACCESS_DENIED");
+        const backends = [...this.#factories.values()].flatMap(factory => {
+          if (factory.isolatedGuests?.() !== true) return [];
+          const models = factory.models();
+          const providers = factory.providerIds().flatMap(providerId => {
+            const matching = models.filter(model => model.providerId === providerId);
+            if (!matching.length) return [];
+            return [{
+              providerId, displayName: factory.providerDisplayName?.(providerId) ?? providerId,
+              connected: true, models: matching.map(model => toProtoModelDescriptor(factory.backendId, model))
+            }];
+          });
+          if (!providers.length) return [];
+          const descriptor = this.#options.store.getBackend(factory.backendId).descriptor;
+          return [{
+            backendId: factory.backendId, displayName: factory.displayName ?? factory.backendId, providers,
+            nativeAdapterKind: descriptor.adapterKind, instanceGeneration: BigInt(descriptor.instanceGeneration),
+            maxRuns: this.settings.limits().perDevice
+          }];
+        });
+        return create(contract.GetHostedAgentCatalogResponseSchema, { format: HOSTED_AGENT_WIRE_FORMAT, backends });
+      }
+    };
+  }
+  async retireLocalApplication(principal: HostedAgentPrincipal): Promise<void> {
+    if (principal.localApplication !== true || principal.trust !== "guest") throw new HostedAgentHostError("ACCESS_DENIED");
+    await this.host.closePrincipal(principal);
+    const store = new HostedAgentStore(this.#options.store);
+    for (const record of store.list()) {
+      if (record.owner.authorityId !== principal.id || record.owner.deviceId !== principal.deviceId || record.owner.trust !== "guest") continue;
+      if (!this.#canPurgeNativeRecord(store, record)) throw new HostedAgentHostError("UNAVAILABLE");
+      await purgeHostedAgentStorage({ root: this.#options.root, store, key: record.key, leaseId: record.leaseId });
+    }
+  }
   async close(): Promise<void> {
     // The facade owns onward native cleanups; base retains the actual local
     // processes. An uncertain onward close must not skip local cleanup.
@@ -290,7 +330,9 @@ export class HostedAgentRuntime {
     } finally { clearInterval(timer); owner.abort(); }
   };
   readonly #authorize: HostedAgentHostOptions["authorize"] = (principal, input) => {
-    principal.assertCurrent(); const assertComputer = this.settings.captureComputer(), factory = this.#factories.get(input.backendId);
+    principal.assertCurrent();
+    if (principal.localApplication) return this.#authorizeLocalApplication(principal, input);
+    const assertComputer = this.settings.captureComputer(), factory = this.#factories.get(input.backendId);
     if (!factory) throw new HostedAgentHostError("UNAVAILABLE");
     this.assertGuestSelection(principal, input);
     // An owner may change among its explicitly remote-enabled Providers. A
@@ -322,4 +364,29 @@ export class HostedAgentRuntime {
       createAdapter: creation => { principal.assertCurrent(); assertModelAllowed(creation.providerId, input.modelId);
         return factory.create({ ...creation, providerIds, assertModelAllowed }); } };
   };
+
+  #authorizeLocalApplication(principal: HostedAgentPrincipal, input: HostedAgentOpen): ReturnType<HostedAgentHostOptions["authorize"]> {
+    const factory = this.#factories.get(input.backendId);
+    if (principal.trust !== "guest" || !factory || factory.isolatedGuests?.() !== true) throw new HostedAgentHostError("ACCESS_DENIED");
+    const generation = this.#options.store.getBackend(input.backendId).descriptor.instanceGeneration;
+    const assertModelAllowed = (providerId: string, modelId: string) => {
+      principal.assertCurrent();
+      if (providerId !== input.providerId || modelId !== input.modelId) throw new HostedAgentHostError("ACCESS_DENIED");
+      if (this.#options.store.getBackend(input.backendId).descriptor.instanceGeneration !== generation
+        || factory.isolatedGuests?.() !== true || !factory.providerIds().includes(providerId)
+        || !factory.models().some(model => model.providerId === providerId && model.modelId === modelId)) {
+        throw new HostedAgentHostError("UNAVAILABLE");
+      }
+    };
+    const assertCurrent = () => assertModelAllowed(input.providerId, input.modelId);
+    assertCurrent();
+    return {
+      root: this.#options.root, store: new HostedAgentStore(this.#options.store), slots: this.slots,
+      artifactCapacityBytes: this.#options.artifactCapacityBytes, modelIds: [input.modelId], assertCurrent, assertModelAllowed,
+      createAdapter: creation => {
+        assertCurrent();
+        return factory.create({ ...creation, providerIds: [input.providerId], assertModelAllowed });
+      }
+    };
+  }
 }

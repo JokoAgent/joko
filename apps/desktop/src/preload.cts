@@ -1,4 +1,4 @@
-import type { DesktopRemoteDesktopViewerOwner, MenubarState, MenubarSettings, DesktopMenubarSnapshot, DesktopMenubarAction } from "@joko/contracts";
+import type { DesktopRemoteDesktopViewerOwner, MenubarState, MenubarSettings, DesktopMenubarSnapshot, DesktopMenubarAction, ListDesktopLocalAgentsResponse } from "@joko/contracts";
 import type {
   DesktopAppInfo,
   DesktopCodeHostLoginScope,
@@ -110,6 +110,9 @@ const DESKTOP_CHANNELS = {
   codeHostLoginStatus: "joko:code-host-login:status",
   codeHostLoginStart: "joko:code-host-login:start",
   codeHostLoginCancel: "joko:code-host-login:cancel",
+  localAgentsList: "joko:local-agents:list",
+  localAgentsReview: "joko:local-agents:review",
+  localAgentsRevoke: "joko:local-agents:revoke",
   windowMinimize: "joko:window:minimize",
   windowToggleMaximize: "joko:window:toggle-maximize",
   windowToggleFullscreen: "joko:window:toggle-fullscreen",
@@ -375,6 +378,7 @@ const desktopCapabilities = Object.freeze([
   "runtime.processMonitorWindow",
   "remote.desktopHost",
   ...(mainDocumentOccurrence === undefined ? [] : ["remote.desktopViewer"]),
+  ...(mainDocumentOccurrence === undefined ? [] : ["native.localAgents"]),
   "session.windows",
   "extension.windows",
   "extension.libraryLocationPicker",
@@ -389,6 +393,14 @@ const startupTheme = process.platform === "win32" && (themeArgument === "light" 
   ? themeArgument : undefined;
 
 const desktopApi = Object.freeze({
+  ...(mainDocumentOccurrence === undefined ? {} : { localAgents: Object.freeze({
+    list: (): Promise<{ readonly origin: string; readonly applications: ListDesktopLocalAgentsResponse }> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.localAgentsList, mainDocumentOccurrence),
+    review: (requestId: string): Promise<void> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.localAgentsReview, mainDocumentOccurrence, requestId),
+    revoke: (grantId: string): Promise<void> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.localAgentsRevoke, mainDocumentOccurrence, grantId)
+  }) }),
   ...(mainDocumentOccurrence === undefined ? {} : { codeHostLogin: Object.freeze({
     status: (scope: DesktopCodeHostLoginScope): Promise<DesktopCodeHostLoginState> =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.codeHostLoginStatus, mainDocumentOccurrence, scope),

@@ -13,6 +13,8 @@ export interface HostedAgentPrincipal {
   readonly deviceId: string;
   readonly trust: "owner" | "guest";
   readonly assertCurrent: () => void;
+  /** Issued only by the loopback application grant registry. */
+  readonly localApplication?: true;
   /** Server-owned Provider capability. Never decoded from an open payload. */
   readonly providerGrant?: HostedAgentProviderGrant;
 }
