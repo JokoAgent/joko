@@ -105,7 +105,7 @@ async function exerciseAgentImport(backendId: "pi" | "claude-code" | "codex"): P
     const created = await submit(clients.operation, connectionId, createSessionMutation({ targetId, backendId,
       providerId: REAL_PI_PROVIDER_ID, modelId, permissionMode: PermissionMode.BYPASS_PERMISSIONS }));
     expect(created.state, JSON.stringify({ backendId, modelId, error: created.error?.code,
-      message: created.error?.message, phase: created.error?.phase, mayHaveChanged: created.error?.stateMayHaveChanged,
+      message: created.error?.message, phase: created.error?.phase, nativeSessionImpact: created.error?.nativeSessionImpact,
       loopbackRequests: fixture!.providerRequests.length })).toBe(OperationState.SUCCEEDED);
     return sessionIdFrom(created);
   };
