@@ -4857,7 +4857,8 @@ function providerApi(api: ProviderModel["api"]): ProviderApiCompatibility {
 }
 
 export function toProtoCapability(capability: Capability): ProtoCapability {
-  const scopeInvalid = (capability.key === "session.rewind_to_start" || capability.key === "session.message_delete" || capability.key === "context.compact")
+  const scopeInvalid = (capability.key === "session.rewind_to_start" || capability.key === "session.message_delete" || capability.key === "context.compact"
+    || capability.key === contract.capabilityNames.sessionPortableTransfer)
     && !nativeStartScopeOptionsAreValid(capability);
   return message<ProtoCapability>("joko.v1.Capability", {
     name: capability.key,
@@ -4903,7 +4904,8 @@ function capabilityReason(support: CapabilitySupport): Capability["reason"] | un
 function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | undefined {
   let kind: CapabilityOptions["kind"];
   if (capability.key === "session.rewind_to_start"
-    || ((capability.key === "session.message_delete" || capability.key === "context.compact")
+    || ((capability.key === "session.message_delete" || capability.key === "context.compact"
+      || capability.key === contract.capabilityNames.sessionPortableTransfer)
       && capability.options?.includes(SESSION_REWIND_SERVICE_NODE_ONLY_OPTION))) {
     if (!nativeStartScopeOptionsAreValid(capability)) return undefined;
     kind = {

@@ -37,6 +37,8 @@ import {
   type CreateNativeSessionInput,
   type DurableNativeDispatchPreparation,
   type HostComposedCapability,
+  type ImportPortableNativeSessionInput,
+  type ImportPortableNativeSessionResult,
   type KnownCapability,
   type ManagedProviderRuntimePort,
   type ManagedProviderRouteBinding,
@@ -66,10 +68,12 @@ import {
   type NativeSessionState,
   type NativeSubscriptionAuthority,
   type PermissionMode,
+  type PortableNativeSession,
   type PromptInput,
   type PublicError,
   type ProviderModel,
   type RuntimeProcessUsageSnapshot,
+  type StoredPortableNativeSessionInput,
   type TargetDescriptor
 } from "@joko/core";
 import { AppServerHost, type AppServerHostOptions, type HostSubscription } from "./host.js";
@@ -101,6 +105,7 @@ import {
 import { codexLegacyRewindAnchor, codexNativeDispatchFingerprint, materializeCodexHistoryImages, projectCodexNativeHistory } from "./native-history.js";
 import { readCodexNativeSessionPreview } from "./native-session-preview.js";
 import { readCodexCatalogRolloutMessages } from "./catalog-rollout-history.js";
+import { readCodexPortableRollout, stageCodexPortableRollout } from "./portable-rollout.js";
 import { codexAccountResetFacts } from "./account-rate-limit-resets.js";
 import {
   inspectCodexCatalogMaterialization,
@@ -2584,6 +2589,98 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   override async fork(entryId: string, context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> {
     return this.#withNativeMutation(context, () => this.#fork(entryId, context, derivation));
+  }
+
+  async exportPortableNativeSession(context: AdapterContext): Promise<PortableNativeSession> {
+    assertStandardReviewContext(context, "export portable native history");
+    this.#assertBackendContext(context);
+    if (context.binding === undefined || context.binding.generation !== context.generation) throw invalidNativeReference();
+    const result = await this.readStoredPortableNativeSession({ target: context.target, binding: context.binding,
+      assertCurrent: () => { context.signal.throwIfAborted(); this.#assertOpen(); this.#assertBackendContext(context); } });
+    if (result === undefined) throw codexPortableUnavailable("This Codex task has no persisted native rollout.");
+    return result;
+  }
+
+  async readStoredPortableNativeSession(input: StoredPortableNativeSessionInput): Promise<PortableNativeSession | undefined> {
+    input.assertCurrent();
+    const scope = await this.#portableReadScope(input.target);
+    const parsed = parseNativeReference(input.binding.opaqueRef);
+    if (parsed.profileKey !== scope.profileKey || input.binding.nativeSessionId !== parsed.threadId) throw invalidNativeReference();
+    const assertCurrent = (): void => { input.assertCurrent(); scope.assertCurrent(); };
+    assertCurrent();
+    const response = await scope.host.request("thread/read", { threadId: parsed.threadId, includeTurns: false }, { beforeDispatch: assertCurrent });
+    if (response.hostGeneration !== scope.hostGeneration) throw nativeHistoryReadFailure("STALE");
+    const thread = parseThreadResult(response.value);
+    if (thread.ephemeral === true) return undefined;
+    await assertNativeThreadTarget(thread, parsed.threadId, scope.workspaceRoot, "probe");
+    assertCurrent();
+    const path = optionalString(objectValue(objectValue(response.value, "portable thread result")["thread"], "portable thread")["path"]);
+    if (path === undefined) return undefined;
+    const { sourceNativeSessionIds, ...portable } = await readCodexPortableRollout(this.#profileDirectory, path, parsed.threadId, assertCurrent);
+    return { ...portable, sourceNativeReferences: sourceNativeSessionIds.filter(id => id !== parsed.threadId)
+      .map(id => bindingForThread(id, input.binding.generation, scope.profileKey).opaqueRef) };
+  }
+
+  async importPortableNativeSession(input: ImportPortableNativeSessionInput, signal: AbortSignal): Promise<ImportPortableNativeSessionResult> {
+    signal.throwIfAborted();
+    const scope = await this.#portableReadScope(input.target, signal);
+    const hostGeneration = scope.hostGeneration;
+    const assertCurrent = (): void => { signal.throwIfAborted(); scope.assertCurrent(); };
+    const staged = await stageCodexPortableRollout({ home: this.#profileDirectory, workspace: scope.workspaceRoot, bytes: input.bytes,
+      ...(input.nativeSessionId === undefined ? {} : { operationIdentity: input.nativeSessionId }), assertCurrent });
+    let resumed = false;
+    try {
+      // The read-only resume builds the index using a built-in Provider.
+      // A source Session can name a proxy Provider that only existed on its node.
+      const receipt = await scope.host.request("thread/resume", { threadId: staged.threadId, cwd: scope.workspaceRoot,
+        modelProvider: "openai", excludeTurns: true, approvalPolicy: "never", sandbox: "read-only", config: { "features.goals": false } },
+        { signal, beforeDispatch: assertCurrent });
+      const raw = objectValue(objectValue(receipt.value, "adopted portable thread result")["thread"], "adopted portable thread");
+      const receiptPath = optionalString(raw["path"]);
+      if (receipt.hostGeneration !== hostGeneration || receiptPath === undefined || !equalNativePaths(await realpath(receiptPath), staged.path)) {
+        throw codexPortableUnavailable("Codex did not resolve the receiving task's original staged rollout.");
+      }
+      resumed = true;
+      await assertNativeThreadTarget(parseThreadResult(receipt.value), staged.threadId, scope.workspaceRoot, "provision");
+      const history = await this.#readCompleteHistoryFromHost({ host: scope.host, hostGeneration, threadId: staged.threadId,
+        workspaceRoot: scope.workspaceRoot, remote: false, signal, assertOwner: assertCurrent });
+      const projection = projectCodexNativeHistory(history.thread, { maximumEvents: this.#maximumHistoryEvents });
+      if (input.activeEntryId !== undefined && (projection.activeEntryId ?? null) !== input.activeEntryId) {
+        throw codexPortableUnavailable("Codex did not restore the selected task history position.");
+      }
+      const messages = new Set(projection.events.flatMap(event => event.payload.type === "message_complete"
+        ? [`${event.payload.role}\0${event.nativeEntryId}`] : []));
+      if (input.messageIdentities?.some(message => !messages.has(`${message.role}\0${message.entryId}`))) {
+        throw codexPortableUnavailable("Codex did not restore all verified messages in the selected history.");
+      }
+      history.assertCurrent();
+      await scope.host.releaseUnboundThread(staged.threadId, hostGeneration);
+      resumed = false;
+      assertCurrent();
+      return { ...bindingForThread(staged.threadId, input.generation, scope.profileKey),
+        ...(input.messageIdentities === undefined ? {} : { confirmedMessageIdentities: input.messageIdentities }) };
+    } catch (error) {
+      try {
+        if (resumed) await scope.host.releaseUnboundThread(staged.threadId, hostGeneration);
+        await staged.rollback();
+      } catch (cleanup) { throw new AggregateError([error, cleanup], "Could not retire the unadopted portable Codex rollout."); }
+      throw error;
+    }
+  }
+
+  async #portableReadScope(target: TargetDescriptor, signal?: AbortSignal): Promise<CodexReadScope & { readonly hostGeneration: number }> {
+    if (this.#hosted !== undefined || target.remoteWorkspace !== undefined) {
+      throw codexPortableUnavailable("Portable Codex history requires the owning service-node Target.");
+    }
+    const scope = await this.#readScope(target, signal);
+    if (scope.hostGeneration === undefined || versionFromUserAgent(scope.host.initializeResult?.userAgent) !== AUDITED_APP_SERVER_VERSION) {
+      throw codexPortableUnavailable("Portable Codex history requires the audited App Server version.");
+    }
+    const { hostGeneration } = scope;
+    return { ...scope, hostGeneration, assertCurrent: () => {
+      scope.assertCurrent();
+      if (!scope.host.isActiveGeneration(hostGeneration)) throw nativeHistoryReadFailure("STALE");
+    } };
   }
 
   async #fork(entryId: string, context: AdapterContext, derivation: NativeSessionDerivation): Promise<NativeSessionForkResult> {
@@ -6601,6 +6698,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       "interaction.question"
     ]);
     if (this.#hosted === undefined) supported.add("session.message_delete");
+    if (this.#hosted === undefined && versionFromUserAgent(this.#host.initializeResult?.userAgent) === AUDITED_APP_SERVER_VERSION) {
+      supported.add("session.portable_transfer");
+    }
     if (this.#managedProviders !== undefined) supported.add("provider.managed_catalog");
     if (this.#resolveNativeSkills !== undefined) { supported.add("runtime.resources"); supported.add("runtime.commands"); }
     if (this.#resolveNativeMemoryEnabled !== undefined && supportsNativeMemoryRuntime(this.#host)) {
@@ -6662,6 +6762,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           options: ["same_turn", "files", ...(this.#resolvers.readBlob === undefined ? [] : ["images"])]
         } : {}),
         ...(key === "session.message_delete" && available ? { options: [SESSION_REWIND_SERVICE_NODE_ONLY_OPTION] } : {}),
+        ...(key === "session.portable_transfer" && available ? { options: [SESSION_REWIND_SERVICE_NODE_ONLY_OPTION] } : {}),
         ...(key === "model.fast_mode" ? { options: [
           ...(this.#models.some(model => model.supportsFastMode) ? ["fast"] : []),
           ...(this.#models.some(model => model.supportsUltrafastMode) ? ["ultrafast"] : [])
@@ -7408,6 +7509,11 @@ function nativeManagedProviderId(route: ManagedProviderRouteBinding): string {
   return route.protocol === "openai-completions"
     ? `joko-chat-${createHash("sha256").update(route.providerId).digest("hex").slice(0, 24)}`
     : route.providerId;
+}
+
+function codexPortableUnavailable(message: string): JokoError {
+  return adapterError({ code: "CODEX_PORTABLE_NATIVE_UNAVAILABLE", message, phase: "provision", stateMayHaveChanged: false,
+    recovery: "Choose a portable Codex package and an available local Codex workspace." });
 }
 
 function managedRouteUnavailable(stateMayHaveChanged = false): JokoError {

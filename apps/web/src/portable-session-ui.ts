@@ -1,3 +1,4 @@
+import { capabilityNames, portableSessionNativeFormat } from "@joko/contracts";
 import type {
   AppSnapshot,
   PortableSessionExecutionSelection,
@@ -17,7 +18,7 @@ export function portableSessionExportSupported(
   if (session.remoteWorkspace !== undefined) return false;
   return snapshot.backends
     .find((backend) => backend.id === session.backendId)
-    ?.capabilities.get("session.portable_transfer")?.supported === true;
+    ?.capabilities.get(capabilityNames.sessionPortableTransfer)?.supported === true;
 }
 
 export function portableSessionTargetOptions(
@@ -27,8 +28,9 @@ export function portableSessionTargetOptions(
   return snapshot.targets.flatMap((target) => {
     if (target.archived) return [];
     const backend = snapshot.backends.find((candidate) => candidate.id === target.backendId);
-    if (backend?.health === "unavailable"
-      || backend?.capabilities.get("session.portable_transfer")?.supported !== true) return [];
+    const capability = backend?.capabilities.get(capabilityNames.sessionPortableTransfer);
+    if (backend?.health === "unavailable" || capability?.supported !== true
+      || (target.remoteWorkspace !== undefined && capability.options.includes("service_node_only"))) return [];
     const workspace = snapshot.workspaces.find((candidate) => candidate.id === target.workspaceId);
     if (workspace === undefined) return [];
     return [{
@@ -36,7 +38,8 @@ export function portableSessionTargetOptions(
       label: target.name === target.workspaceName
         ? target.name
         : `${target.name} · ${target.workspaceName}`,
-      worktreeSupported: worktreeSupportedTargetIds.has(target.id)
+      worktreeSupported: worktreeSupportedTargetIds.has(target.id),
+      nativeFormat: portableSessionNativeFormat(target.backendId)
     }];
   });
 }
@@ -57,8 +60,10 @@ export function portableSessionExecutionForTarget(
   const target = snapshot.targets.find((candidate) => candidate.id === targetId && !candidate.archived);
   if (target === undefined) return undefined;
   const backend = snapshot.backends.find((candidate) => candidate.id === target.backendId);
+  const capability = backend?.capabilities.get(capabilityNames.sessionPortableTransfer);
   if (backend === undefined || backend.health === "unavailable"
-    || backend.capabilities.get("session.portable_transfer")?.supported !== true) return undefined;
+    || capability?.supported !== true
+    || (target.remoteWorkspace !== undefined && capability.options.includes("service_node_only"))) return undefined;
 
   const defaults = snapshot.settings.backendSettings.find((candidate) => candidate.backendId === backend.id);
   const availableOptions = resolveNewSessionExecutionOptions(backend, snapshot.models, "");

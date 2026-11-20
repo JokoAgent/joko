@@ -13,6 +13,7 @@ import {
   prepareClaudeSessionStoreDerivation,
   prepareClaudeSessionStoreImport,
   readClaudeSessionStoreOperation,
+  readClaudeSessionStorePortableTranscript,
   recoverClaudeSessionStoreOperation,
   rebindClaudeSessionStoreGeneration,
   type ClaudeSessionStoreAuthority,
@@ -135,6 +136,11 @@ export class SessionSdkOwner {
 
   readStoredSessionOperation(access: ClaudeSessionStoreOperationAccess): ClaudeSessionStoreOperationSnapshot {
     return readClaudeSessionStoreOperation(this.#requireSessionStoreAuthority(), access);
+  }
+
+  readStoredPortableTranscript(input: { readonly workspaceAuthority: string; readonly sessionId: string }): Buffer | undefined {
+    if (this.#closed || this.ownsSession(input.sessionId)) throw new SessionSdkFailure("FAILED", false);
+    return readClaudeSessionStorePortableTranscript(this.#requireSessionStoreAuthority(), input);
   }
 
   recoverStoredSessionOperation(input: {

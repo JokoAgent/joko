@@ -8524,6 +8524,15 @@ export class OperationalStore {
     }));
   }
 
+  /** Find every product owner that has adopted this exact native history source. */
+  listNativeBindingOwners(backendId: string, opaqueRef: string): readonly string[] {
+    this.assertOpen();
+    const rows = this.database.prepare(`
+      SELECT session_id FROM native_binding_adoptions WHERE backend_id = ? AND native_opaque_ref = ? COLLATE NOCASE
+    `).all(backendId, opaqueRef) as Row[];
+    return rows.map(row => stringValue(row["session_id"]));
+  }
+
   private recordNativeBindingAdoption(sessionId: string, backendId: string, binding: NativeSessionBinding, at: number): void {
     this.deleteSetting("session", sessionId, MESSAGE_REWIND_CONTINUATION_SETTING_KEY);
     this.database.prepare(`

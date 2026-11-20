@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { Code, createClient } from "@connectrpc/connect";
@@ -21,8 +22,137 @@ import {
 import type { ImportPortableNativeSessionInput, NativeSessionBinding, PortableNativeSession } from "@joko/core";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { expect, it, vi } from "vitest";
-import { InstrumentedFakeAdapter, OrchestratorE2eFixture } from "./fixture.js";
-import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
+import { createE2eClients, type PairedClient } from "./connect-clients.js";
+import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
+import { createSessionMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
+import { REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID, RealPiSystemFixture } from "./real-pi-fixture.js";
+
+const verifiedCodex = process.env["JOKO_CODEX_HOSTED_TEST_BINARY"];
+
+for (const backendId of ["claude-code", "codex"] as const) {
+  it.skipIf(process.platform !== "linux" || backendId === "codex" && !verifiedCodex)(
+    `restores an encrypted ${backendId} package in another service node and continues after restart`, { timeout: 120_000 }, async () => {
+      const root = await mkdtemp(join(tmpdir(), "joko-portable-native-product-"));
+      let source: RealPiSystemFixture | undefined;
+      let receiver: RealPiSystemFixture | undefined;
+      let phase = "starting the source node";
+      const claude = backendId === "claude-code";
+      const modelId = claude ? "claude-sonnet-4-6" : REAL_PI_MODEL_ID;
+      const targetId = `workspace-real-pi:${backendId}`;
+      const password = "owned portable test password";
+      const question = "Remember the test inventory: Cobalt, Copper, Tin.";
+      const originalReply = "Retained the test inventory.";
+      const newQuestion = "Continue the inventory from the imported native thread.";
+      const start = async (name: "source" | "receiver", reply: string) => {
+        const rootDirectory = join(root, name);
+        await Promise.all([join(rootDirectory, "claude-config"), join(rootDirectory, "codex-home")].map(directory => mkdir(directory, { recursive: true })));
+        vi.stubEnv("CLAUDE_CONFIG_DIR", join(rootDirectory, "claude-config"));
+        vi.stubEnv("CODEX_HOME", join(rootDirectory, "codex-home"));
+        const fixture = await RealPiSystemFixture.start({ rootDirectory,
+          ...(claude ? { providerApi: "anthropic-messages" as const } : { codexExecutable: verifiedCodex! }),
+          providerResponder: () => ({ kind: "text", text: reply })
+        });
+        if (name === "source") source = fixture;
+        else receiver = fixture;
+        const { providers, store, refreshBackendDescriptor } = fixture.application;
+        const local = providers!.resolveInferenceRoute("pi", REAL_PI_PROVIDER_ID, REAL_PI_MODEL_ID)!;
+        expect(local.baseUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+(?:\/v1)?$/u);
+        await providers!.upsert({
+          backendId, credentialOrigin: "", provider: { id: REAL_PI_PROVIDER_ID,
+            baseUrl: local.baseUrl, api: claude ? "anthropic-messages" : "openai-completions",
+            keyless: true, models: [{ id: modelId, name: "Local package fixture model", contextWindow: 64_000, maxTokens: 4_096 }] },
+          displayName: "Local package fixture Provider", kind: "local_keyless", credentialBindings: {},
+          enabled: true, supportsLogin: false, supportsLogout: false, supportsRefresh: false
+        });
+        await refreshBackendDescriptor(backendId);
+        const target = store.getTarget(targetId);
+        store.upsertTarget({ ...target.descriptor, trusted: true }, target.metadata);
+        return fixture;
+      };
+      const send = async (fixture: RealPiSystemFixture, owner: PairedClient, sessionId: string, text: string) => {
+        const store = fixture.application.store;
+        const generation = BigInt(store.getSession(sessionId).descriptor.binding.generation);
+        const operation = await submit(owner.clients.operation, owner.connectionId, sendInputMutation(sessionId, generation, text));
+        expect(operation.state, operation.error?.code).toBe(OperationState.SUCCEEDED);
+        const runId = queueRunIdFrom(operation);
+        const run = await waitFor(async () => store.getRun(runId).descriptor,
+          value => ["completed", "failed", "aborted", "dispatch_unknown"].includes(value.state), "the package fixture turn", 30_000);
+        expect(run.state, run.error?.code).toBe("completed");
+      };
+      try {
+        const original = await start("source", originalReply);
+        const originalOwner = await original.pair("Package source owner");
+        const created = await submit(originalOwner.clients.operation, originalOwner.connectionId, createSessionMutation({
+          backendId, targetId, providerId: REAL_PI_PROVIDER_ID, modelId, effortId: "", permissionMode: PermissionMode.ASK
+        }));
+        expect(created.state, created.error?.code).toBe(OperationState.SUCCEEDED);
+        const sourceId = sessionIdFrom(created);
+        phase = "recording original native history";
+        await send(original, originalOwner, sourceId, question);
+        const sourceBinding = original.application.store.getSession(sourceId).descriptor.binding;
+        expect(sourceBinding.nativeSessionId).toBeTruthy();
+        phase = "exporting and downloading the encrypted product package";
+        const exported = await originalOwner.clients.portableSession.exportPortableSession({ sessionId: sourceId, password });
+        expect(exported).toMatchObject({ fidelity: PortableSessionFidelity.FULL, messageCount: 2n });
+        const sourceTicket = (await originalOwner.clients.artifact.getBlobDownloadTicket({ blobId: exported.artifact!.blobId })).ticket!;
+        const downloaded = await fetch(`${original.baseUrl}${sourceTicket.relativeEndpoint}`, { headers: { authorization: `Bearer ${originalOwner.authKey}` } });
+        expect(downloaded.status).toBe(200);
+        const bytes = await downloaded.arrayBuffer();
+        expect(Buffer.from(bytes).includes(Buffer.from(question))).toBe(false);
+        await original.close({ removeRoot: false });
+        await rename(join(root, "source"), join(root, "retired-source"));
+
+        phase = "unlocking the package on a distinct node";
+        const destination = await start("receiver", "Imported inventory continued.");
+        const owner = await destination.pair("Package receiving owner");
+        const upload = (await owner.clients.artifact.beginBlobUpload({
+          fileName: "native-task.jshare", mediaType: "application/vnd.joko.session", disposition: BlobDisposition.PORTABLE_IMPORT,
+          byteSize: BigInt(bytes.byteLength), sha256Hex: createHash("sha256").update(new Uint8Array(bytes)).digest("hex")
+        })).upload!;
+        const put = await fetch(`${destination.baseUrl}${upload.ticket!.relativeEndpoint}`, { method: "PUT", body: bytes,
+          headers: { authorization: `Bearer ${owner.authKey}`, "content-type": "application/octet-stream" } });
+        expect(put.status).toBe(201);
+        const blob = (await owner.clients.artifact.completeBlobUpload({ uploadId: upload.uploadId })).blob!;
+        const portable = owner.clients.portableSession;
+        const draft = (await portable.inspectPortableSessionImport({ package: blob })).draft!;
+        expect(draft).toMatchObject({ encrypted: true, passwordRequired: true });
+        const { preview } = (await portable.unlockPortableSessionImport({ draftId: draft.draftId, password })).draft!;
+        expect(preview).toMatchObject({ fidelity: PortableSessionFidelity.FULL, nativeHistory: true, messageCount: 2n });
+        const commit = { operationId: randomUUID(), draftId: draft.draftId, targetId, permissionMode: PermissionMode.ASK,
+          model: { model: { providerId: REAL_PI_PROVIDER_ID, modelId } } };
+        phase = "committing the exact new workspace and receipt";
+        await expect(portable.commitPortableSessionImport({ ...commit, operationId: randomUUID(), targetId: "workspace-real-pi" }))
+          .rejects.toMatchObject({ code: Code.FailedPrecondition });
+        const { result } = await portable.commitPortableSessionImport(commit);
+        expect(result).toMatchObject({ fidelity: PortableSessionFidelity.FULL, messageCount: 2n, replacedSessionIds: [] });
+        expect(result?.activationError).toBeUndefined();
+        const sessionId = result!.sessionId;
+        expect(sessionId).not.toEqual(sourceId);
+        const binding = destination.application.store.getSession(sessionId).descriptor.binding;
+        expect(binding.nativeSessionId).toBeTruthy();
+        expect(binding.nativeSessionId).not.toEqual(sourceBinding.nativeSessionId);
+        await expect(portable.commitPortableSessionImport(commit)).resolves.toMatchObject({ replayed: true, result: { sessionId } });
+        expect(destination.providerRequests).toHaveLength(0);
+        await destination.close({ removeRoot: false });
+
+        phase = "continuing the imported task on the cold receiving node";
+        const reopened = await start("receiver", "Imported inventory continued.");
+        expect(reopened.application.store.getSession(sessionId).descriptor.binding).toEqual(binding);
+        await send(reopened, { ...owner, clients: createE2eClients(reopened.baseUrl, owner.authKey, 60_000) }, sessionId, newQuestion);
+        const requests = JSON.stringify(reopened.providerRequests.map(request => request.body));
+        expect(requests).toContain(question);
+        expect(requests).toContain(originalReply);
+        expect(requests).toContain(newQuestion);
+      } catch (error) {
+        throw new Error(`${backendId} product transfer failed while ${phase}.`, { cause: error });
+      } finally {
+        await Promise.all([source?.close({ removeRoot: false }), receiver?.close({ removeRoot: false })]);
+        vi.unstubAllEnvs();
+        await rm(root, { recursive: true, force: true, maxRetries: 3 });
+      }
+    }
+  );
+}
 
 it("restores portable worker results and activity on a separate node without granting native controls", async () => {
   let nativeControls = 0;

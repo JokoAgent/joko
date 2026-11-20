@@ -319,6 +319,20 @@ export function readClaudeSessionStoreOperation(
   ));
 }
 
+export function readClaudeSessionStorePortableTranscript(
+  authority: ClaudeSessionStoreAuthority,
+  input: { readonly workspaceAuthority: string; readonly sessionId: string }
+): Buffer | undefined {
+  const normalized = normalizeAuthority(authority);
+  validateGenerationAndSessionAccess({ generation: normalized.generation, ...input });
+  return withDatabase(normalized, database => readTransaction(database, () => {
+    const session = requireSession(database, input.workspaceAuthority, input.sessionId);
+    if (session.lifecycle !== "adopted" || session.writerGeneration > normalized.generation) throw failure("CONFLICT");
+    const entries = loadSessionEntries(database, session, undefined);
+    return entries === null ? undefined : Buffer.from(entries.map(entry => JSON.stringify(entry)).join("\n") + "\n", "utf8");
+  }));
+}
+
 /**
  * Reconstruct and claim one exact durable operation after a Backend restart.
  * The caller supplies only Host-owned identity; the Store discovers the prior

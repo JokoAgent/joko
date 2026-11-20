@@ -53,6 +53,7 @@ export interface PortableSessionDialogLabels {
   readonly fidelity: (value: PortableSessionFidelity) => string;
   readonly riskWarning: string;
   readonly destination: string;
+  readonly noDestination: string;
   readonly createWorktree: string;
   readonly createWorktreeHint: string;
   readonly import: string;
@@ -262,6 +263,7 @@ export function PortableSessionImportDialog({
   const [showPassword, setShowPassword] = useState(false);
   const [passwordError, setPasswordError] = useState(false);
   const [targetId, setTargetId] = useState("");
+  const [conflictTargetId, setConflictTargetId] = useState<string>();
   const [useWorktree, setUseWorktree] = useState(false);
   const [result, setResult] = useState<PortableSessionImportResultView>();
   const [error, setError] = useState<string>();
@@ -275,13 +277,16 @@ export function PortableSessionImportDialog({
   const openRef = useRef(open);
   const passwordRef = useRef<HTMLInputElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-  targetOptionsRef.current = targets;
+  const preview = draft?.preview;
+  const availableTargets = preview?.nativeHistory === true
+    ? targets.filter(target => target.nativeFormat === preview.backendCapability)
+    : targets;
+  targetOptionsRef.current = availableTargets;
   defaultTargetIdRef.current = defaultTargetId;
   openRef.current = open;
   const busy = inspecting || unlocking || retryingActivation || step === "committing";
-  const preview = draft?.preview;
-  const selectedTarget = targets.find((target) => target.id === targetId);
-  const selectedExecution = executionForTarget(targetId);
+  const selectedTarget = availableTargets.find(target => target.id === targetId);
+  const selectedExecution = selectedTarget === undefined ? undefined : executionForTarget(selectedTarget.id);
 
   useLayoutEffect(() => {
     lifecycleRef.current += 1;
@@ -296,6 +301,7 @@ export function PortableSessionImportDialog({
     setPassword("");
     setShowPassword(false);
     setPasswordError(false);
+    setConflictTargetId(undefined);
     setTargetId(preferredTargetId !== undefined && availableTargets.some((target) => target.id === preferredTargetId)
       ? preferredTargetId
       : availableTargets[0]?.id ?? "");
@@ -307,7 +313,7 @@ export function PortableSessionImportDialog({
     setRetryingActivation(false);
   }, [open]);
 
-  const targetIdentity = targets.map((target) => target.id).join("\u0000");
+  const targetIdentity = availableTargets.map(target => target.id).join("\u0000");
   useEffect(() => {
     if (!open) return;
     const availableTargets = targetOptionsRef.current;
@@ -404,7 +410,7 @@ export function PortableSessionImportDialog({
     }
   };
   const commit = async (overwrite: boolean): Promise<void> => {
-    if (draft === undefined || targetId === "" || selectedExecution === undefined) return;
+    if (draft === undefined || targetId === "" || selectedExecution === undefined || (overwrite && conflictTargetId !== targetId)) return;
     const lifecycle = lifecycleRef.current;
     setStep("committing");
     setError(undefined);
@@ -423,8 +429,10 @@ export function PortableSessionImportDialog({
       setStep("done");
     } catch (candidate) {
       if (lifecycle !== lifecycleRef.current || !openRef.current) return;
-      if (!overwrite && portableSessionErrorCode(candidate) === "PORTABLE_SESSION_IMPORT_CONFLICT") setStep("conflict");
-      else {
+      if (!overwrite && portableSessionErrorCode(candidate) === "PORTABLE_SESSION_IMPORT_CONFLICT") {
+        setConflictTargetId(targetId);
+        setStep("conflict");
+      } else {
         setError(labels.importFailed);
         setStep("preview");
       }
@@ -518,12 +526,12 @@ export function PortableSessionImportDialog({
           <span>{labels.fidelity(preview.fidelity)}</span>
         </div>
         <div className="portable-session-risk" role="note"><ShieldAlert aria-hidden="true" /><p>{labels.riskWarning}</p></div>
-        <label className="portable-session-select">
+        {availableTargets.length === 0 ? <p role="status">{labels.noDestination}</p> : <label className="portable-session-select">
           <span>{labels.destination}</span>
           <SelectControl value={targetId} disabled={step === "committing"} onChange={(event) => { setTargetId(event.target.value); setUseWorktree(false); }}>
-            {targets.map((target) => <option key={target.id} value={target.id}>{target.label}</option>)}
+            {availableTargets.map(target => <option key={target.id} value={target.id}>{target.label}</option>)}
           </SelectControl>
-        </label>
+        </label>}
         {preview.workspaceKind === "project" && selectedTarget?.worktreeSupported === true && <label className="portable-session-check portable-session-check--detail">
           <CheckboxControl checked={useWorktree} disabled={step === "committing"} onChange={(event) => setUseWorktree(event.target.checked)} />
           <span><strong>{labels.createWorktree}</strong><small>{labels.createWorktreeHint}</small></span>
@@ -550,7 +558,7 @@ export function PortableSessionImportDialog({
         {(step === "preview" || step === "committing") && <Button tone="primary" disabled={!canCommit || step === "committing"} onClick={() => void commit(false)}>
           {step === "committing" && <LoaderCircle className="is-spinning" aria-hidden="true" />}{labels.import}
         </Button>}
-        {step === "conflict" && <><Button onClick={() => setStep("preview")}>{labels.cancel}</Button><Button tone="primary" onClick={() => void commit(true)}>{labels.overwrite}</Button></>}
+        {step === "conflict" && <><Button onClick={() => setStep("preview")}>{labels.cancel}</Button><Button tone="primary" disabled={!canCommit || conflictTargetId !== targetId} onClick={() => void commit(true)}>{labels.overwrite}</Button></>}
         {step === "done" && result !== undefined && <>
           <Button disabled={retryingActivation} onClick={close}>{labels.close}</Button>
           {result.status === "ready"

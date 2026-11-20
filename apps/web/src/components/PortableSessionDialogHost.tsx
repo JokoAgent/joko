@@ -131,6 +131,7 @@ export function portableSessionDialogLabels(t: Translator, locale: string): Port
     fidelity: (value) => portableSessionFidelityLabel(value, t),
     riskWarning: t("portable.riskWarning"),
     destination: t("portable.destination"),
+    noDestination: t("portable.noDestination"),
     createWorktree: t("portable.createWorktree"),
     createWorktreeHint: t("portable.createWorktreeHint"),
     import: t("portable.import"),

@@ -43,6 +43,8 @@ import {
   type HostComposedCapability,
   type InteractionDecision,
   type InteractionPayload,
+  type ImportPortableNativeSessionInput,
+  type ImportPortableNativeSessionResult,
   type KnownCapability,
   type MessageBlock,
   type ManagedProviderRuntimePort,
@@ -68,6 +70,7 @@ import {
   type NativeSessionState,
   type NativeTextInferenceInput,
   type PermissionMode,
+  type PortableNativeSession,
   type PromptInput,
   type ProviderAccountUsageSnapshot,
   type ProviderModel,
@@ -75,6 +78,7 @@ import {
   type RuntimeProcessUsageSnapshot,
   type RuntimeResource,
   type RuntimeCommand,
+  type StoredPortableNativeSessionInput,
   type SubagentControlInput,
   type TargetDescriptor,
   type TerminateRuntimeProcessInput,
@@ -93,6 +97,7 @@ import { readBackgroundWorkflowProgress } from "./workflow-progress.js";
 import type { ClaudeFreshContextBindingLookup, ClaudeFreshContextIdentity, ClaudeFreshContextSnapshot } from "./fresh-context-owner.js";
 import { prepareClaudePrompt, type ClaudeInputResolvers, type PreparedClaudePrompt } from "./prompt-input.js";
 import { claudeNativeDispatchFingerprint } from "./native-dispatch-fingerprint.js";
+import { portableClaudeTranscript, readClaudePortableTranscript, stageClaudePortableTranscript } from "./portable-transcript.js";
 import {
   loadedClaudeTextResources,
   snapshotClaudeTextResources,
@@ -109,6 +114,7 @@ import {
   stringValue
 } from "./projection.js";
 import {
+  CLAUDE_AGENT_SDK_CLI_VERSION,
   CLAUDE_AGENT_SDK_VERSION,
   CLAUDE_MANAGED_AGENT_TOOL_NAME,
   DefaultClaudeSdkRuntime,
@@ -1002,7 +1008,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         supportsLogout,
         this.#inputResolvers,
         this.#resolveTextResources !== undefined || this.#resolveNativeSkills !== undefined,
-        supportsAccountUsage
+        supportsAccountUsage,
+        this.#supportsPortableHistory()
       ),
       ...(this.#managedProviders === undefined ? {} : { providerRuntimeSupport: managedProviderSupport(this.#managedProviders.support) }),
       providers: [{
@@ -1632,6 +1639,110 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       return "present";
     } catch {
       return "unknown";
+    }
+  }
+
+  async exportPortableNativeSession(context: AdapterContext): Promise<PortableNativeSession> {
+    assertStandardReviewContext(context, "export portable native history");
+    const binding = context.binding;
+    if (binding === undefined) throw continuityGap();
+    this.#assertBindingContext(binding, context);
+    const snapshot = await this.readStoredPortableNativeSession({ target: context.target, binding, assertCurrent: () => {
+      context.signal.throwIfAborted();
+      this.#assertBindingContext(binding, context);
+    } });
+    if (snapshot === undefined) throw claudePortableUnavailable("This Claude task has no persisted native transcript.");
+    return snapshot;
+  }
+
+  async readStoredPortableNativeSession(input: StoredPortableNativeSessionInput): Promise<PortableNativeSession | undefined> {
+    const assertCurrent = (): void => {
+      input.assertCurrent();
+      this.#assertPortableHistory(input.target);
+    };
+    assertCurrent();
+    await this.validateTarget(input.target);
+    const route = parseBindingRoute(input.binding);
+    const target = { ...input.target, workspaceRoot: await realpath(input.target.workspaceRoot) };
+    assertCurrent();
+    if (route.kind === "stored") {
+      const store = this.#runtime.storedSessions;
+      if (route.workspaceAuthority !== claudeWorkspaceAuthority(input.target)
+        || store?.readPortableTranscript === undefined) throw continuityGap();
+      const raw = store.readPortableTranscript({ workspaceAuthority: route.workspaceAuthority, sessionId: route.nativeSessionId });
+      assertCurrent();
+      return raw === undefined ? undefined : portableClaudeTranscript(raw, route.nativeSessionId);
+    }
+    const info = await this.#sessionInfo(route.nativeSessionId, target);
+    assertCurrent();
+    if (info === undefined) return undefined;
+    assertSessionInfo(info, route.nativeSessionId, target.workspaceRoot);
+    const projectDirectoryName = this.#environment["CLAUDE_CODE_PROJECT_DIR_NAME"];
+    const snapshot = await readClaudePortableTranscript({ profile: this.#nativeMemoryConfigDirectory, workspace: target.workspaceRoot,
+      sessionId: route.nativeSessionId, assertCurrent, ...(projectDirectoryName === undefined ? {} : { projectDirectoryName }) });
+    const confirmed = await this.#sessionInfo(route.nativeSessionId, target);
+    assertCurrent();
+    if (snapshot === undefined || confirmed === undefined || confirmed.lastModified !== info.lastModified) {
+      throw claudePortableUnavailable("The original Claude transcript changed during export.");
+    }
+    assertSessionInfo(confirmed, route.nativeSessionId, target.workspaceRoot);
+    return snapshot;
+  }
+
+  async importPortableNativeSession(input: ImportPortableNativeSessionInput, signal: AbortSignal): Promise<ImportPortableNativeSessionResult> {
+    const assertCurrent = (): void => { signal.throwIfAborted(); this.#assertPortableHistory(input.target); };
+    assertCurrent();
+    await this.validateTarget(input.target);
+    const target = { ...input.target, workspaceRoot: await realpath(input.target.workspaceRoot) };
+    const projectDirectoryName = this.#environment["CLAUDE_CODE_PROJECT_DIR_NAME"];
+    const staged = await stageClaudePortableTranscript({ profile: this.#nativeMemoryConfigDirectory, workspace: target.workspaceRoot,
+      bytes: input.bytes, assertCurrent, ...(projectDirectoryName === undefined ? {} : { projectDirectoryName }),
+      ...(input.nativeSessionId === undefined ? {} : { operationIdentity: input.nativeSessionId }) });
+    try {
+      const info = await this.#sessionInfo(staged.sessionId, target, signal);
+      assertCurrent();
+      if (info === undefined) throw claudePortableUnavailable("Claude could not identify the restored transcript.");
+      assertSessionInfo(info, staged.sessionId, target.workspaceRoot);
+      const readPage = async (offset: number): Promise<readonly ClaudeSdkSessionMessage[]> => {
+        const page = await this.#runtime.getSessionMessages(staged.sessionId, { dir: target.workspaceRoot, signal,
+          limit: NATIVE_HISTORY_PAGE_LIMIT, offset, includeSystemMessages: true });
+        assertCurrent();
+        if (!Array.isArray(page) || page.length > NATIVE_HISTORY_PAGE_LIMIT) throw invalidNativeHistory();
+        return page;
+      };
+      const first = await readPage(0);
+      const history = first.length === NATIVE_HISTORY_PAGE_LIMIT ? await completeLocalNativeHistory(first, readPage) : first;
+      const projection = projectNativeHistory(history, staged.sessionId, this.#projection);
+      if (input.activeEntryId !== undefined && (projection.activeEntryId ?? null) !== input.activeEntryId) {
+        throw claudePortableUnavailable("Claude did not restore the selected task history position.");
+      }
+      const messages = new Set(projection.events.flatMap(event => event.payload.type === "message_complete"
+        ? [`${event.payload.role}\0${event.nativeEntryId}`] : []));
+      const confirmed = await this.#sessionInfo(staged.sessionId, target, signal);
+      assertCurrent();
+      if (confirmed === undefined || confirmed.lastModified !== info.lastModified) {
+        throw claudePortableUnavailable("The receiving Claude transcript changed during verification.");
+      }
+      assertSessionInfo(confirmed, staged.sessionId, target.workspaceRoot);
+      return { ...bindingFor(staged.sessionId, input.generation),
+        ...(input.messageIdentities === undefined ? {} : { confirmedMessageIdentities: input.messageIdentities
+          .filter(message => messages.has(`${message.role}\0${message.entryId}`)) }) };
+    } catch (error) {
+      try { await staged.rollback(); }
+      catch (cleanup) { throw new AggregateError([error, cleanup], "Could not retire the unadopted Claude transcript."); }
+      throw error;
+    }
+  }
+
+  #supportsPortableHistory(): boolean {
+    return this.#hostedSubscriptionTransport === undefined && (this.#lastCliVersion === CLAUDE_AGENT_SDK_CLI_VERSION
+      || (this.#pathToExecutable === undefined && this.#runtime.bundledCliVersion === CLAUDE_AGENT_SDK_CLI_VERSION));
+  }
+
+  #assertPortableHistory(target: TargetDescriptor): void {
+    this.#assertUsable();
+    if (!this.#supportsPortableHistory() || target.backendId !== this.id || target.remoteWorkspace !== undefined) {
+      throw claudePortableUnavailable("Portable Claude history requires the fixed native runtime and its service-node workspace.");
     }
   }
 
@@ -8234,7 +8345,8 @@ function capabilityManifest(
   supportsLogout: boolean,
   inputResolvers: ClaudeInputResolvers,
   textResourcesSupported: boolean,
-  accountUsageSupported: boolean
+  accountUsageSupported: boolean,
+  portableHistorySupported: boolean
 ): ReadonlyMap<string, Capability> {
   const supported = new Set<KnownCapability>([
     "model.working_context",
@@ -8268,6 +8380,7 @@ function capabilityManifest(
     "interaction.plan_review"
   ]);
   if (workspaceDerivationSupported) supported.add("workspace.derive");
+  if (portableHistorySupported) supported.add("session.portable_transfer");
   if (freshContextSupported) {
     supported.add("session.rewind_to_start");
     supported.add("session.message_delete");
@@ -8300,7 +8413,8 @@ function capabilityManifest(
   return new Map(CAPABILITIES.map((key): [string, Capability] => {
     const implemented = supported.has(key);
     const available = key === "session.catalog" || key === "session.preview" || (installed && implemented);
-    const options = key === "context.compact" || key === "session.message_delete" && freshContextSupported
+    const options = key === "context.compact" || key === "session.portable_transfer" && portableHistorySupported
+      || key === "session.message_delete" && freshContextSupported
       || key === "session.rewind_to_start" && freshContextSupported && !remoteFreshContextSupported
       ? [SESSION_REWIND_SERVICE_NODE_ONLY_OPTION]
       : key === "provider.login" && supportsLogin
@@ -8978,6 +9092,12 @@ function assertClaudeDerivationTarget(
       { recovery: "Retry through the owning Session and its derived workspace lease." }
     );
   }
+}
+
+function claudePortableUnavailable(message: string): Error {
+  return claudeCodeError("CLAUDE_PORTABLE_HISTORY_UNAVAILABLE", message, "session", {
+    recovery: "Select an ordinary task and a compatible service-node workspace."
+  });
 }
 
 function assertSessionInfo(
