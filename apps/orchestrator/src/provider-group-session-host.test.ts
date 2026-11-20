@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -119,7 +120,7 @@ it.each(["reorder", "withdraw"] as const)("retires the quota wait when the owner
   secondAvailable = true;
   if (action === "withdraw") f.store.cancelQueueItem({ queueItemId: first.queueItemId, connectionId: f.connection.id, traceId: "withdraw-old-head" });
   else {
-    const lock = { sessionId, connectionId: f.connection.id, lockToken: "head-reorder", ttlMs: 5000 };
+    const lock = { sessionId, connectionId: f.connection.id, lockToken: randomUUID(), ttlMs: 5000 };
     f.store.setQueueInteractionLock({ ...lock, locked: true, traceId: "lock-reorder" });
     f.store.reorderQueueItem({ queueItemId: second.queueItemId, placement: { beforeQueueItemId: first.queueItemId },
       connectionId: f.connection.id, lockToken: lock.lockToken, traceId: "move-new-head" });
