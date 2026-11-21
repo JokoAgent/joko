@@ -59,7 +59,7 @@ type NativePanFixture = Record<string, (_event?: unknown, gesture?: { y0?: numbe
 const panResponders: NativePanFixture[] = [];
 type HomeListProps = {
   sections: readonly { key: string; data: readonly unknown[] }[];
-  renderItem: (value: { item: unknown; index: number }) => ReactNode;
+  renderItem: (value: { item: unknown; index: number; section: HomeListProps["sections"][number] }) => ReactNode;
   renderSectionHeader: (value: { section: unknown }) => ReactNode;
   renderSectionFooter?: (value: { section: unknown }) => ReactNode;
   ListEmptyComponent?: ReactNode;
@@ -200,7 +200,7 @@ beforeAll(async () => {
       }) }), []);
       return createElement("div", { "data-testid": "home-list" }, sections.length === 0 ? ListEmptyComponent
         : sections.map(section => createElement("section", { key: section.key }, renderSectionHeader({ section }),
-          section.data.map((item, index) => createElement("div", { key: index }, renderItem({ item, index }))), renderSectionFooter?.({ section }))));
+          section.data.map((item, index) => createElement("div", { key: index }, renderItem({ item, index, section }))), renderSectionFooter?.({ section }))));
     }),
     FlatList: forwardRef(({ data, renderItem, ListEmptyComponent, onViewableItemsChanged }: { data?: readonly { id: string }[];
       renderItem?: (value: { item: unknown }) => ReactNode; ListEmptyComponent?: ReactNode;
