@@ -4,7 +4,7 @@ import type { BackendView } from "./model.js";
 import { discoveredProviderModelInterface, providerModelInterfaceOptions, providerPresetRuntime, providerPresets, updateProviderPresetEndpoint } from "./provider-presets.js";
 
 const base: Omit<BackendView, "id" | "name"> = {
-  version: "1", health: "healthy", capabilities: new Map([[capabilityNames.providerManagedCatalog, { name: capabilityNames.providerManagedCatalog, supported: true }]])
+  version: "1", health: "healthy", capabilities: new Map([[capabilityNames.providerManagedCatalog, { name: capabilityNames.providerManagedCatalog, supported: true, options: [] }]])
 };
 const claude: BackendView = { ...base, id: "claude-code", name: "Claude Code", providerRuntimeSupport: {
   protocols: ["anthropic", "openaiResponses", "openaiCompletions"], fields: ["modelEndpoint", "modelLimits", "modelInputModalities", "modelThinkingLevels"]

@@ -42,10 +42,10 @@ describe("ProviderSettings model visibility", () => {
     const base = emptySnapshot();
     const backends: BackendView[] = [
       { id: "claude-code", name: "Claude Code", version: "1", health: "healthy",
-        capabilities: new Map([["provider.managed_catalog", { name: "provider.managed_catalog", supported: true }]]),
+        capabilities: new Map([["provider.managed_catalog", { name: "provider.managed_catalog", supported: true, options: [] }]]),
         providerRuntimeSupport: { protocols: ["anthropic", "openaiResponses"], fields: ["modelsEndpoint"] } },
       { id: "codex", name: "Codex", version: "1", health: "healthy",
-        capabilities: new Map([["provider.managed_catalog", { name: "provider.managed_catalog", supported: true }]]),
+        capabilities: new Map([["provider.managed_catalog", { name: "provider.managed_catalog", supported: true, options: [] }]]),
         providerRuntimeSupport: { protocols: ["openaiResponses", "openaiCompletions"], fields: ["modelsEndpoint", "modelInputModalities"] } }
     ];
     const snapshot = { ...base, backends };
