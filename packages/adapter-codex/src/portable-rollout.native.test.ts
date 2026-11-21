@@ -82,7 +82,7 @@ it.skipIf(!executable).each(["paginated root", "legacy root", "derived lineage"]
       } });
       hosts.push(host);
       await host.ensureStarted();
-      expect(host.initializeResult?.userAgent).toContain("0.159.2");
+      expect(host.initializeResult?.userAgent).toContain("0.166.0");
       return host;
     };
     const sessionConfig = { model: "gpt-6-astra", approvalPolicy: "never", sandbox: "read-only" } as const;

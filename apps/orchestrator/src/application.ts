@@ -17,6 +17,7 @@ import {
 import {
   CodexBackendAdapter,
   createCodexAdapter,
+  CODEX_APP_SERVER_VERSION,
   CODEX_MANAGED_PROVIDER_SUPPORT,
   prepareCodexSmartRouting
 } from "@joko/adapter-codex";
@@ -1563,7 +1564,7 @@ export async function createOrchestratorApplication(
         // authoritative. Its exact current publication must not be rolled back.
         const current = backendInstances.get(codexBackendId);
         if (current.generation === expectedGeneration || current.state !== "available"
-          || current.descriptor.version !== "0.159.2") throw error;
+          || current.descriptor.version !== CODEX_APP_SERVER_VERSION) throw error;
       }
     }
   });

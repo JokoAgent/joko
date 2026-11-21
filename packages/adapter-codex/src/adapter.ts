@@ -502,7 +502,7 @@ interface CompactionWaiter {
 
 const NATIVE_REFERENCE_PREFIX = "codex-thread:";
 const NATIVE_REFERENCE_VERSION = 1;
-const AUDITED_APP_SERVER_VERSION = "0.159.2";
+export const CODEX_APP_SERVER_VERSION = "0.166.0";
 const REVIEW_PERMISSION_PROFILE = "joko-review-readonly";
 const REVIEW_MAXIMUM_INVENTORY_ITEMS = 4_096;
 const REVIEW_MAXIMUM_INVENTORY_PAGES = 100;
@@ -2675,7 +2675,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       throw codexPortableUnavailable("Portable Codex history requires the owning service-node Target.");
     }
     const scope = await this.#readScope(target, signal);
-    if (scope.hostGeneration === undefined || versionFromUserAgent(scope.host.initializeResult?.userAgent) !== AUDITED_APP_SERVER_VERSION) {
+    if (scope.hostGeneration === undefined || versionFromUserAgent(scope.host.initializeResult?.userAgent) !== CODEX_APP_SERVER_VERSION) {
       throw codexPortableUnavailable("Portable Codex history requires the audited App Server version.");
     }
     const { hostGeneration } = scope;
@@ -2709,7 +2709,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   #supportsLegacyDialogueRewind(runtime: SessionRuntime): boolean {
     return !runtime.remote && this.#hosted === undefined
-      && versionFromUserAgent(runtime.host.initializeResult?.userAgent) === AUDITED_APP_SERVER_VERSION;
+      && versionFromUserAgent(runtime.host.initializeResult?.userAgent) === CODEX_APP_SERVER_VERSION;
   }
 
   override async navigateTree(target: NativeNavigationTarget, summarize: boolean, context: AdapterContext, customInstructions: string | undefined, navigation: NativeSessionNavigation): Promise<NativeSessionNavigationResult> {
@@ -3305,7 +3305,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       && this.#accountHostOptions.transportFactory === undefined && this.#accountHostOptions.transport?.command === undefined) throw new Error("The selected native account reset is unavailable.");
     const generation = await this.#ensureLocalHostStarted(), originalHost = this.#host, epoch = this.#nativeAuthenticationEpoch;
     const home = originalHost.initializeResult?.codexHome;
-    if (!home || versionFromUserAgent(originalHost.initializeResult?.userAgent) !== AUDITED_APP_SERVER_VERSION) throw new Error("The selected native account reset protocol is unavailable.");
+    if (!home || versionFromUserAgent(originalHost.initializeResult?.userAgent) !== CODEX_APP_SERVER_VERSION) throw new Error("The selected native account reset protocol is unavailable.");
     const assertCurrent = () => {
       this.#assertOpen(); input.signal?.throwIfAborted(); input.assertCurrent(); this.#assertNativeAuthenticationAdmission(epoch);
       if (this.#host !== originalHost || !originalHost.isActiveGeneration(generation) || this.#account?.authenticationState === "pending") throw nativeAuthenticationObservationStale();
@@ -3351,7 +3351,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     try {
       input.signal?.throwIfAborted();
       const isolatedGeneration = await host.ensureStarted(); await readAccount();
-      if (versionFromUserAgent(host.initializeResult?.userAgent) !== AUDITED_APP_SERVER_VERSION) throw new Error("The selected native account reset protocol is unavailable.");
+      if (versionFromUserAgent(host.initializeResult?.userAgent) !== CODEX_APP_SERVER_VERSION) throw new Error("The selected native account reset protocol is unavailable.");
       const assertIsolated = () => { assertCurrent(); if (!host.isActiveGeneration(isolatedGeneration)) throw nativeAuthenticationObservationStale(); };
       const refreshAuthentication = async () => {
         assertIsolated(); await readAccount();
@@ -3814,10 +3814,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       const hostGeneration = await runtime.host.ensureStarted();
       runtime.assertCurrent();
       if (!runtime.host.isActiveGeneration(hostGeneration)
-        || versionFromUserAgent(runtime.host.initializeResult?.userAgent) !== AUDITED_APP_SERVER_VERSION) {
+        || versionFromUserAgent(runtime.host.initializeResult?.userAgent) !== CODEX_APP_SERVER_VERSION) {
         throw adapterError({
           code: "CODEX_REMOTE_VERSION_INCOMPATIBLE",
-          message: `The remote Codex runtime must match the audited ${AUDITED_APP_SERVER_VERSION} app-server protocol.`,
+          message: `The remote Codex runtime must match the audited ${CODEX_APP_SERVER_VERSION} app-server protocol.`,
           phase: "provision",
           recovery: "Install the fixed Joko-owned Codex runtime on the remote host and retry."
         });
@@ -6704,7 +6704,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       "interaction.question"
     ]);
     if (this.#hosted === undefined) supported.add("session.message_delete");
-    if (this.#hosted === undefined && versionFromUserAgent(this.#host.initializeResult?.userAgent) === AUDITED_APP_SERVER_VERSION) {
+    if (this.#hosted === undefined && versionFromUserAgent(this.#host.initializeResult?.userAgent) === CODEX_APP_SERVER_VERSION) {
       supported.add("session.portable_transfer");
     }
     if (this.#managedProviders !== undefined) supported.add("provider.managed_catalog");
@@ -6718,7 +6718,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (this.#account?.supportsLogout === true) supported.add("provider.logout");
     if (this.#hosted === undefined && this.#account?.authenticationState === "authenticated" && this.#account.authMode === "chatgpt"
       && (this.#ownsHost || this.#accountHostOptions.transportFactory !== undefined || this.#accountHostOptions.transport?.command !== undefined)
-      && versionFromUserAgent(this.#host.initializeResult?.userAgent) === AUDITED_APP_SERVER_VERSION) supported.add("provider.account_resets");
+      && versionFromUserAgent(this.#host.initializeResult?.userAgent) === CODEX_APP_SERVER_VERSION) supported.add("provider.account_resets");
     if (this.#resolvers.readBlob !== undefined) supported.add("input.image");
     if (this.#host.processInspectionSupported) supported.add("runtime.process_usage");
     const isolatedReviewSupported = supportsIsolatedReview(this.#host.initializeResult?.userAgent);
@@ -7370,8 +7370,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       if (context.runtimePolicy === "review_read_only" && context.persistentReadOnly !== "side_chat" || context.target.remoteWorkspace) throw new TypeError("This hosted native execution does not accept another runtime domain.");
       this.#hosted.assertModel(context.modelSelection?.providerId, context.modelSelection?.modelId);
       await this.#ensureLocalHostStarted();
-      if (versionFromUserAgent(this.#host.initializeResult?.userAgent) !== AUDITED_APP_SERVER_VERSION) {
-        throw adapterError({ code: "CODEX_HOSTED_PROTOCOL_UNSUPPORTED", message: `Hosted Codex requires the audited ${AUDITED_APP_SERVER_VERSION} native protocol.`,
+      if (versionFromUserAgent(this.#host.initializeResult?.userAgent) !== CODEX_APP_SERVER_VERSION) {
+        throw adapterError({ code: "CODEX_HOSTED_PROTOCOL_UNSUPPORTED", message: `Hosted Codex requires the audited ${CODEX_APP_SERVER_VERSION} native protocol.`,
           phase: "provision", recovery: "Select the supported native runtime before opening this task's hosted Agent." });
       }
       await this.#hosted.prepare(this.#host, this.#profileDirectory, context.signal);
@@ -7402,9 +7402,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   async #prepareNativeExecution(scope: CodexReadScope, context: AdapterContext): Promise<void> {
     if (this.#nativeExecution === undefined) return;
-    if (versionFromUserAgent(scope.host.initializeResult?.userAgent) !== AUDITED_APP_SERVER_VERSION) {
+    if (versionFromUserAgent(scope.host.initializeResult?.userAgent) !== CODEX_APP_SERVER_VERSION) {
       await this.#closeNativeEnvironment(context.sessionId);
-      throw adapterError({ code: "CODEX_NATIVE_EXECUTION_PROTOCOL_UNSUPPORTED", message: `Native execution requires the audited ${AUDITED_APP_SERVER_VERSION} protocol.`,
+      throw adapterError({ code: "CODEX_NATIVE_EXECUTION_PROTOCOL_UNSUPPORTED", message: `Native execution requires the audited ${CODEX_APP_SERVER_VERSION} protocol.`,
         phase: "provision", recovery: "Install the supported native runtime before opening this task." });
     }
     let entry = this.#nativeEnvironments.get(context.sessionId);
@@ -7660,13 +7660,13 @@ function supportsNativeCollaboration(userAgent: string | undefined): boolean {
 }
 
 function unsupportedSmartRoutingRuntime(userAgent: string | undefined): string {
-  return `Smart subagent routing requires the audited Codex app-server ${AUDITED_APP_SERVER_VERSION}; `
+  return `Smart subagent routing requires the audited Codex app-server ${CODEX_APP_SERVER_VERSION}; `
     + `the active runtime is ${versionFromUserAgent(userAgent)}.`;
 }
 
 function matchesExactAppServerVersion(userAgent: string | undefined): boolean {
   const version = /^[^/\s]+\/([^\s]+)(?:\s|$)/u.exec(userAgent ?? "")?.[1];
-  return version === AUDITED_APP_SERVER_VERSION;
+  return version === CODEX_APP_SERVER_VERSION;
 }
 
 interface ReviewSkillInventory {
@@ -8698,7 +8698,7 @@ function supportsNativeMemoryRuntime(
   host: AppServerHost,
   pathStyle: "posix" | "win32" = nativeRuntimePathStyle(host)
 ): boolean {
-  return versionFromUserAgent(host.initializeResult?.userAgent) === AUDITED_APP_SERVER_VERSION
+  return versionFromUserAgent(host.initializeResult?.userAgent) === CODEX_APP_SERVER_VERSION
     && codexNativeMemoryDirectory(host, pathStyle) !== undefined;
 }
 

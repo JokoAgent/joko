@@ -122,7 +122,7 @@ describe.skipIf(!binary)("published native ephemeral account contract", () => {
     const host = new AppServerHost({ requireEphemeralAuth: true, apiKeyAuth: async () => "private-fixture-api-key",
       transport: { command: binary!, cwd: tmpdir(), env: environment(home), args: ["app-server", "--listen", "stdio://", "-c", 'cli_auth_credentials_store="ephemeral"'] } });
     try {
-      await host.ensureStarted(); expect(host.initializeResult?.userAgent).toContain("0.159.2");
+      await host.ensureStarted(); expect(host.initializeResult?.userAgent).toContain("0.166.0");
       expect((await host.request("config/read", { includeLayers: false })).value).toMatchObject({ config: { cli_auth_credentials_store: "ephemeral" } });
       expect((await host.request("account/read", { refreshToken: false })).value).toMatchObject({ account: { type: "apiKey" } });
       expect(await readFile(auth, "utf8")).toBe(sentinel);
@@ -182,7 +182,7 @@ describe.skipIf(!binary)("published native ephemeral account contract", () => {
       host = new AppServerHost({ requireEphemeralAuth: true, externalAuth: { readTokens: async (refresh, stale) => {
         reads.push(refresh); return authority.readTokens(refresh, stale);
       } }, transport: { command: binary!, cwd: root, args: argumentsFor("ephemeral"), env: environment(home), requestTimeoutMs: 20_000 } });
-      await host.ensureStarted(); expect(host.initializeResult?.userAgent).toContain("0.159.2");
+      await host.ensureStarted(); expect(host.initializeResult?.userAgent).toContain("0.166.0");
       expect((await host.request("account/read", { refreshToken: false })).value).toMatchObject({ account: { type: "chatgpt", email: "owned@example.invalid" } });
       const started = (await host.request("thread/start", { model: "gpt-6-astra", cwd: root, approvalPolicy: "never", sandbox: "read-only" })).value as JsonObject;
       const thread = started["thread"] as JsonObject, id = thread["id"] as string;

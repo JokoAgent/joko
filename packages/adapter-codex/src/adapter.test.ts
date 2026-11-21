@@ -1181,8 +1181,8 @@ describe("CodexBackendAdapter", () => {
 
   it.each([
     ["codex/0.159.1", true, 1, false, false, "requires the audited Codex app-server"],
-    ["codex/0.159.2", true, 2, true, true, ""],
-    ["codex/0.159.2", false, 1, false, true, "native account is unavailable"]
+    ["codex/0.166.0", true, 2, true, true, ""],
+    ["codex/0.166.0", false, 1, false, true, "native account is unavailable"]
   ] as const)("probes runtime %s without smart flags before deciding its process generation", async (
     userAgent,
     nativeAccountAvailable,
@@ -1484,7 +1484,7 @@ describe("CodexBackendAdapter", () => {
       id: "codex-test",
       adapterKind: "codex",
       instanceGeneration: 7,
-      version: "0.159.2",
+      version: "0.166.0",
       health: "healthy",
       authenticationState: "authenticated"
     });
@@ -5625,8 +5625,9 @@ describe("CodexBackendAdapter", () => {
   it.each([
     "codex/0.153.4",
     "codex/0.159.1",
-    "codex/0.159.2-alpha.1",
-    "codex/0.159.2+unverified",
+    "codex/0.159.2",
+    "codex/0.166.0-alpha.1",
+    "codex/0.166.0+unverified",
     "codex/0.159.3",
     "codex/0.160.0",
     "unknown"

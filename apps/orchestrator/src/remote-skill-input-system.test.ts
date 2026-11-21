@@ -330,11 +330,11 @@ class RemoteSkillDaemon implements RemoteProcessTransportPort {
   activeTurnProxyId: number | undefined;
   activeTurnTransport: ScriptedRpcTransport | undefined;
   beforeTurnWrite?: () => void;
-  constructor() { this.fake.codexHome = profile; this.fake.userAgent = "codex-cli/0.159.2 (linux; x86_64) joko/0.1.0";
+  constructor() { this.fake.codexHome = profile; this.fake.userAgent = "codex-cli/0.166.0 (linux; x86_64) joko/0.1.0";
     this.fake.reviewConfig = { skills: { config: [{ path: "/home/test/.agents/skills/ambient/SKILL.md", enabled: true }] } }; }
   async open(request: RemoteProcessStartRequest): Promise<RemoteProcessHandle> {
     if (request.executable === "/bin/sh") {
-      const process = new SkillProcess(); setImmediate(() => { process.stdout.write([request.cwd, profile, `${profile}/packages/standalone/current/codex`, "codex-cli 0.159.2", "ready", ""].join("\0")); process.finish(); }); return process;
+      const process = new SkillProcess(); setImmediate(() => { process.stdout.write([request.cwd, profile, `${profile}/packages/standalone/current/bin/codex`, "codex-cli 0.166.0", "ready", ""].join("\0")); process.finish(); }); return process;
     }
     if (request.args.join(" ") === "app-server daemon version") {
       const process = new SkillProcess(); setImmediate(() => { process.stdout.write(JSON.stringify({ socketPath: `${profile}/app-server-control/app-server-control.sock` })); process.finish(); }); return process;

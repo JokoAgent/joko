@@ -78,7 +78,7 @@ describe("external account authentication", () => {
 
 function transport(credentialStore = "ephemeral") {
   return new ScriptedRpcTransport(async (method, params): Promise<JsonValue> => method === "initialize"
-    ? { userAgent: "joko/0.159.2", codexHome: "/private", platformFamily: "unix", platformOs: "linux" }
+    ? { userAgent: "joko/0.166.0", codexHome: "/private", platformFamily: "unix", platformOs: "linux" }
     : method === "config/read" ? { config: { cli_auth_credentials_store: credentialStore } }
     : method === "account/login/start" ? { type: (params as JsonObject)["type"]! } : {});
 }
