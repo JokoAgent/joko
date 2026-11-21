@@ -6,27 +6,29 @@ import UIKit
 import WidgetKit
 
 public final class JokoHomeSurfacesModule: Module {
+  private let bridge = DispatchTime.now().uptimeNanoseconds
+
   public func definition() -> ModuleDefinition {
     Name("JokoHomeSurfaces")
     Events("onWidgetRefresh")
     OnStartObserving("onWidgetRefresh") {
       DispatchQueue.main.async {
-        JokoHomeWidgetRefresh.shared.onChange = { [weak self] id, expired in
+        JokoHomeWidgetRefresh.shared.observe(bridge: self.bridge) { [weak self] id, expired in
           self?.sendEvent("onWidgetRefresh", ["id": id, "expired": expired])
         }
       }
     }
     OnStopObserving("onWidgetRefresh") {
-      DispatchQueue.main.async { JokoHomeWidgetRefresh.shared.onChange = nil }
+      DispatchQueue.main.async { JokoHomeWidgetRefresh.shared.stopObserving(bridge: self.bridge) }
     }
     AsyncFunction("apply") { (sequence: Int, owner: String?, usage: String?, task: String?, mayStart: Bool) async throws in
-      try await JokoHomeSurfaces.shared.apply(sequence: sequence, owner: owner, usage: usage, task: task, mayStart: mayStart)
+      try await JokoHomeSurfaces.shared.apply(bridge: self.bridge, sequence: sequence, owner: owner, usage: usage, task: task, mayStart: mayStart)
     }
     AsyncFunction("pendingWidgetRefresh") { () async -> String? in
       await MainActor.run { JokoHomeWidgetRefresh.shared.pendingId }
     }
     AsyncFunction("completeWidgetRefresh") { (id: String, sequence: Int, owner: String?, usage: String?) async throws in
-      try await JokoHomeSurfaces.shared.completeRefresh(id: id, sequence: sequence, owner: owner, usage: usage)
+      try await JokoHomeSurfaces.shared.completeRefresh(id: id, bridge: self.bridge, sequence: sequence, owner: owner, usage: usage)
     }
   }
 }
@@ -34,28 +36,27 @@ public final class JokoHomeSurfacesModule: Module {
 @MainActor
 private final class JokoHomeSurfaces {
   static let shared = JokoHomeSurfaces()
+  private var latestBridge: UInt64 = 0
   private var latest = 0
   private let dismissalSetting = "joko.homeSurfaces.dismissedActivity"
   private var activityObservation: Task<Void, Never>?
   private var observedActivityId: String?
 
-  func apply(sequence: Int, owner: String?, usage: String?, task: String?, mayStart: Bool) async throws {
-    guard sequence > latest else { return }
-    latest = sequence
+  func apply(bridge: UInt64, sequence: Int, owner: String?, usage: String?, task: String?, mayStart: Bool) async throws {
+    guard accept(bridge: bridge, sequence: sequence) else { return }
     let owner = owner.flatMap { JokoHomeSurfaceProjection.validOwner($0) ? $0 : nil }
     let widget = Result { try synchronizeWidget(owner: owner, usage: usage) }
-    await synchronizeActivity(sequence: sequence, owner: owner, task: task, mayStart: mayStart)
+    await synchronizeActivity(bridge: bridge, sequence: sequence, owner: owner, task: task, mayStart: mayStart)
     try widget.get()
   }
 
-  func completeRefresh(id: String, sequence: Int, owner: String?, usage: String?) throws {
+  func completeRefresh(id: String, bridge: UInt64, sequence: Int, owner: String?, usage: String?) throws {
     let refresh = JokoHomeWidgetRefresh.shared
-    guard refresh.pendingId == id else { return }
-    guard sequence > latest, let owner, let usage, JokoHomeSurfaceProjection.validOwner(owner) else {
+    guard refresh.pendingId == id, accept(bridge: bridge, sequence: sequence) else { return }
+    guard let owner, let usage, JokoHomeSurfaceProjection.validOwner(owner) else {
       refresh.finish(id: id, success: false)
       return
     }
-    latest = sequence
     do {
       try synchronizeWidget(owner: owner, usage: usage)
       refresh.finish(id: id, success: true)
@@ -63,6 +64,13 @@ private final class JokoHomeSurfaces {
       refresh.finish(id: id, success: false)
       throw error
     }
+  }
+
+  private func accept(bridge: UInt64, sequence: Int) -> Bool {
+    guard bridge > latestBridge || (bridge == latestBridge && sequence > latest) else { return false }
+    latestBridge = bridge
+    latest = sequence
+    return true
   }
 
   private func synchronizeWidget(owner: String?, usage: String?) throws {
@@ -86,7 +94,7 @@ private final class JokoHomeSurfaces {
     }
   }
 
-  private func synchronizeActivity(sequence: Int, owner: String?, task: String?, mayStart: Bool) async {
+  private func synchronizeActivity(bridge: UInt64, sequence: Int, owner: String?, task: String?, mayStart: Bool) async {
     if #available(iOS 17.0, *) {
       let state = task.flatMap { value -> JokoTaskActivityAttributes.ContentState? in
         guard value.utf8.count <= 4096,
@@ -103,7 +111,7 @@ private final class JokoHomeSurfaces {
       }
       var existing: Activity<JokoTaskActivityAttributes>?
       for activity in Activity<JokoTaskActivityAttributes>.activities {
-        guard sequence == latest else { return }
+        guard bridge == latestBridge && sequence == latest else { return }
         if enabled, let owner, let state, activity.attributes.owner == owner,
            activity.attributes.task == state.link, existing == nil, dismissed != expected {
           existing = activity
@@ -116,7 +124,7 @@ private final class JokoHomeSurfaces {
           await activity.end(nil, dismissalPolicy: .immediate)
         }
       }
-      guard sequence == latest, enabled, let owner, let state, expected != dismissed else { return }
+      guard bridge == latestBridge && sequence == latest, enabled, let owner, let state, expected != dismissed else { return }
       let content = ActivityContent(state: state, staleDate: state.expiration)
       if let existing {
         observe(existing)

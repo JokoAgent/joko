@@ -9,6 +9,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.SystemClock
 import android.util.AtomicFile
 import android.widget.RemoteViews
 import expo.modules.kotlin.modules.Module
@@ -21,21 +22,14 @@ import java.util.Locale
 import org.json.JSONObject
 
 class JokoHomeSurfacesModule : Module() {
-  private var lastSequence = 0
+  private val bridge = SystemClock.elapsedRealtimeNanos()
 
   override fun definition() = ModuleDefinition {
     Name("JokoHomeSurfaces")
     AsyncFunction("apply") { sequence: Int, owner: String?, usage: String?, _: String?, _: Boolean ->
       val context = appContext.reactContext?.applicationContext ?: error("The Android widget store is unavailable.")
-      apply(context, sequence, owner, usage)
+      HomeWidgets.apply(context, bridge, sequence, owner, usage)
     }
-  }
-
-  @Synchronized
-  private fun apply(context: Context, sequence: Int, owner: String?, usage: String?) {
-    if (sequence <= lastSequence) return
-    lastSequence = sequence
-    HomeWidgets.apply(context, owner, usage)
   }
 }
 
@@ -62,13 +56,18 @@ private object HomeWidgets {
   private val ownerPattern = Regex("[a-f0-9]{64}")
   private val tokenPattern = Regex("[0-9]{1,32}")
   private val datePattern = Regex("[0-9]{4}-[0-9]{2}-[0-9]{2}")
+  private var latestBridge = 0L
+  private var latest = 0
 
   private data class Quota(val title: String, val remaining: Int, val resetsAt: Long)
   private data class Usage(val tokens: String, val cost: Double?, val estimated: Boolean)
   private data class Projection(val owner: String, val language: String, val expiresAt: Long, val quotas: List<Quota>, val usage: Usage?)
 
   @Synchronized
-  fun apply(context: Context, owner: String?, usage: String?) {
+  fun apply(context: Context, bridge: Long, sequence: Int, owner: String?, usage: String?) {
+    if (bridge < latestBridge || bridge == latestBridge && sequence <= latest) return
+    latestBridge = bridge
+    latest = sequence
     val file = cache(context)
     val now = System.currentTimeMillis()
     val current = read(file, now)

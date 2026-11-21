@@ -10,9 +10,21 @@ final class JokoHomeWidgetRefresh {
   private let identifier = Bundle.main.object(forInfoDictionaryKey: "JokoHomeSurfaceRefresh") as? String
   private var current: (id: String, task: BGAppRefreshTask)?
   private var registered = false
-  var onChange: ((String, Bool) -> Void)?
+  private var observerBridge: UInt64 = 0
+  private var onChange: ((String, Bool) -> Void)?
 
   var pendingId: String? { current?.id }
+
+  func observe(bridge: UInt64, onChange: @escaping (String, Bool) -> Void) {
+    guard bridge >= observerBridge else { return }
+    observerBridge = bridge
+    self.onChange = onChange
+    if let pendingId { onChange(pendingId, false) }
+  }
+
+  func stopObserving(bridge: UInt64) {
+    if bridge == observerBridge { onChange = nil }
+  }
 
   func register() {
     guard let identifier, !registered else { return }
