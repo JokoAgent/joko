@@ -1,4 +1,5 @@
 import ActivityKit
+import CryptoKit
 import ExpoModulesCore
 import Foundation
 import UIKit
@@ -34,6 +35,9 @@ public final class JokoHomeSurfacesModule: Module {
 private final class JokoHomeSurfaces {
   static let shared = JokoHomeSurfaces()
   private var latest = 0
+  private let dismissalSetting = "joko.homeSurfaces.dismissedActivity"
+  private var activityObservation: Task<Void, Never>?
+  private var observedActivityId: String?
 
   func apply(sequence: Int, owner: String?, usage: String?, task: String?, mayStart: Bool) async throws {
     guard sequence > latest else { return }
@@ -91,26 +95,70 @@ private final class JokoHomeSurfaces {
         return next
       }
       let enabled = ActivityAuthorizationInfo().areActivitiesEnabled
+      let expected = owner.flatMap { owner in state.map { dismissalKey(owner: owner, task: $0.link) } }
+      var dismissed = UserDefaults.standard.string(forKey: dismissalSetting)
+      if dismissed != nil && (owner == nil || (mayStart && expected != dismissed)) {
+        UserDefaults.standard.removeObject(forKey: dismissalSetting)
+        dismissed = nil
+      }
       var existing: Activity<JokoTaskActivityAttributes>?
       for activity in Activity<JokoTaskActivityAttributes>.activities {
         guard sequence == latest else { return }
         if enabled, let owner, let state, activity.attributes.owner == owner,
-           activity.attributes.task == state.link, existing == nil {
+           activity.attributes.task == state.link, existing == nil, dismissed != expected {
           existing = activity
         } else if enabled && task == nil && !mayStart && owner != nil
                     && activity.attributes.owner == owner && activity.content.staleDate.map({ $0 > Date() }) == true {
+          observe(activity)
           continue
         } else {
+          stopObserving(activity.id)
           await activity.end(nil, dismissalPolicy: .immediate)
         }
       }
-      guard sequence == latest, enabled, let owner, let state else { return }
+      guard sequence == latest, enabled, let owner, let state, expected != dismissed else { return }
       let content = ActivityContent(state: state, staleDate: state.expiration)
       if let existing {
+        observe(existing)
         if existing.content.state != state { await existing.update(content) }
       } else if mayStart && UIApplication.shared.applicationState == .active {
-        _ = try? Activity.request(attributes: JokoTaskActivityAttributes(owner: owner, task: state.link), content: content)
+        if let created = try? Activity.request(attributes: JokoTaskActivityAttributes(owner: owner, task: state.link), content: content) {
+          observe(created)
+        }
       }
     }
+  }
+
+  @available(iOS 17.0, *)
+  private func observe(_ activity: Activity<JokoTaskActivityAttributes>) {
+    guard observedActivityId != activity.id else { return }
+    activityObservation?.cancel()
+    observedActivityId = activity.id
+    activityObservation = Task { @MainActor [weak self] in
+      for await state in activity.activityStateUpdates {
+        guard let self, !Task.isCancelled, self.observedActivityId == activity.id else { return }
+        if state == .dismissed {
+          let key = self.dismissalKey(owner: activity.attributes.owner, task: activity.attributes.task)
+          UserDefaults.standard.set(key, forKey: self.dismissalSetting)
+          self.stopObserving(activity.id)
+          return
+        }
+        if state == .ended {
+          self.stopObserving(activity.id)
+          return
+        }
+      }
+    }
+  }
+
+  private func stopObserving(_ id: String) {
+    guard observedActivityId == id else { return }
+    activityObservation?.cancel()
+    activityObservation = nil
+    observedActivityId = nil
+  }
+
+  private func dismissalKey(owner: String, task: String) -> String {
+    SHA256.hash(data: Data("\(owner)\n\(task)".utf8)).map { String(format: "%02x", $0) }.joined()
   }
 }
