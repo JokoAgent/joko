@@ -4291,7 +4291,9 @@ export class MobileClient {
     return ++this.#epoch;
   }
 
-  #current(epoch: number): boolean { return !this.#disposed && this.#foreground && this.#epoch === epoch; }
+  #current(epoch: number, allowBackground = false): boolean {
+    return !this.#disposed && (allowBackground || this.#foreground) && this.#epoch === epoch;
+  }
 
   #partnerPrivateCredentialKey(credential: PairedCredential | undefined): string | undefined {
     return credential === undefined ? undefined : [credential.profileId, credential.origin, credential.serverId,
@@ -4805,7 +4807,7 @@ export class MobileClient {
         if (record.state === "staging") await this.#finishTaskOutboxHandoff(record);
         else if (record.state === "restoring") await this.#restoreTaskOutboxDraft(record);
       }
-      if (!this.#current(epoch)) return;
+      if (!this.#current(epoch, true)) return;
       this.#profiles = [...index.profiles];
       this.#automaticProfileId = index.automaticProfileId;
       this.#allPending = pending;
@@ -4829,10 +4831,11 @@ export class MobileClient {
         });
         return;
       }
+      if (!this.#foreground) return;
       try { await this.connectSaved(index.automaticProfileId); }
       catch { /* connectSaved owns the exact, actionable recovery state. */ }
     } catch (error) {
-      if (this.#current(epoch)) this.#set({ status: "unpaired", error: message(error) });
+      if (this.#current(epoch, true)) this.#set({ status: "unpaired", error: message(error) });
     }
   }
 
