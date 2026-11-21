@@ -65,7 +65,9 @@ export function resolveLocalePreference(
   preference: LocalePreference,
   systemLocale: SystemLocale
 ): Locale {
-  return preference === "system" ? systemLocale : preference;
+  if (preference === "system") return systemLocale;
+  if (preference === "en-XA" && import.meta.env.MODE !== "test") return "en";
+  return preference;
 }
 
 /** Read the host-owned system locale, preferring the Desktop bridge when present. */

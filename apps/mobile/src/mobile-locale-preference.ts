@@ -1,13 +1,15 @@
 import type { MobilePlainStorageDriver } from "./connection-storage";
 
-export const MOBILE_SUPPORTED_LOCALES = ["en", "zh-CN", "zh-TW", "ja", "ko"] as const;
+export const MOBILE_UI_LOCALES = ["en", "zh-CN"] as const;
+type MobileUiLocale = typeof MOBILE_UI_LOCALES[number];
+export const MOBILE_SUPPORTED_LOCALES = [...MOBILE_UI_LOCALES, "zh-TW", "ja", "ko"] as const;
 export type MobileSupportedLocale = typeof MOBILE_SUPPORTED_LOCALES[number];
-export type MobileLocalePreference = "system" | MobileSupportedLocale;
+export type MobileLocalePreference = "system" | MobileUiLocale;
 
 export interface MobileLocalePreferenceState {
   readonly status: "loading" | "ready" | "error";
   readonly preference: MobileLocalePreference;
-  readonly effectiveLocale: MobileSupportedLocale;
+  readonly effectiveLocale: MobileUiLocale;
   readonly saving: boolean;
   readonly error?: string;
 }
@@ -94,7 +96,7 @@ export class MobileLocalePreferenceStore {
     }
   }
 
-  #effective(preference: MobileLocalePreference): MobileSupportedLocale {
+  #effective(preference: MobileLocalePreference): MobileUiLocale {
     if (preference !== "system") return preference;
     try { return resolveMobileSystemLocale(this.systemLocale()); }
     catch { return "en"; }
@@ -106,15 +108,9 @@ export class MobileLocalePreferenceStore {
   }
 }
 
-export function resolveMobileSystemLocale(languageTag: string | null | undefined): MobileSupportedLocale {
-  const tag = typeof languageTag === "string" ? languageTag.trim().toLowerCase().replace(/_/gu, "-") : "";
-  if (tag.startsWith("zh")) {
-    if (tag.includes("hant") || /(?:^|-)(?:tw|hk|mo)(?:-|$)/u.test(tag)) return "zh-TW";
-    return "zh-CN";
-  }
-  if (tag.startsWith("ja")) return "ja";
-  if (tag.startsWith("ko")) return "ko";
-  return "en";
+export function resolveMobileSystemLocale(languageTag: string | null | undefined): MobileUiLocale {
+  const tag = languageTag?.trim().replaceAll("_", "-") ?? "";
+  return /^zh(?:-|$)/iu.test(tag) ? "zh-CN" : "en";
 }
 
 export function detectMobileSystemLanguageTag(): string | undefined {
@@ -129,16 +125,18 @@ function parseMobileLocalePreference(raw: string): MobileLocalePreference {
   }
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record).sort();
+  const savedLocale = record.locale;
+  const preference = savedLocale === "zh-TW" ? "zh-CN" : savedLocale === "ja" || savedLocale === "ko" ? "en" : savedLocale;
   if (keys.length !== 2 || keys[0] !== "locale" || keys[1] !== "version"
-    || record.version !== 1 || !isMobileLocalePreference(record.locale)) {
+    || record.version !== 1 || !isMobileLocalePreference(preference)) {
     throw new Error("the record is not the strict current-v1 shape");
   }
-  return record.locale;
+  return preference;
 }
 
 function isMobileLocalePreference(value: unknown): value is MobileLocalePreference {
   return value === "system" || typeof value === "string"
-    && (MOBILE_SUPPORTED_LOCALES as readonly string[]).includes(value);
+    && (MOBILE_UI_LOCALES as readonly string[]).includes(value);
 }
 
 function errorText(cause: unknown): string {
