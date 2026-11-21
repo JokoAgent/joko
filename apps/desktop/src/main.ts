@@ -20,6 +20,7 @@ import {
   systemPreferences,
   Tray,
   protocol,
+  type IpcMainEvent,
   type IpcMainInvokeEvent,
   type NativeImage,
   type MessageBoxOptions,
@@ -3874,6 +3875,19 @@ async function verifyPackagedSmokeSystemHandoff(
   const documentOccurrence = currentMainWindowDocumentOccurrence();
   if (documentOccurrence === undefined) {
     throw new Error("Packaged smoke system handoff has no current primary Document occurrence.");
+  }
+  if (desktopRegionCapture !== undefined) {
+    const captureOwner = desktopRegionCaptureOwner;
+    if (captureOwner?.documentOccurrence !== documentOccurrence) {
+      throw new Error("Packaged smoke screen capture was not configured by the current primary Document.");
+    }
+    const configured = await owner.webContents.executeJavaScript(
+      `window.jokoDesktop.regionCapture.configure(${JSON.stringify(captureOwner.owner)}, null)`, true
+    );
+    if (configured !== true || currentMainWindowDocumentOccurrence() !== documentOccurrence) {
+      throw new Error("Packaged smoke screen capture configuration replaced its primary Document.");
+    }
+    recordPackagedSmokeProgress("region_capture_primary_document_preserved");
   }
 
   await verifyPackagedSmokeCancelledMainNavigation(owner, documentOccurrence);
@@ -8814,22 +8828,22 @@ function configureRegionCaptureShortcut(): boolean {
 
 function registerIpc(): void {
   ipcMain.handle("joko:region-capture:configure", (event, occurrence: unknown, owner: unknown, accelerator: unknown) => {
-    if (typeof occurrence !== "string" || desktopRegionCapture === undefined
-      || captureMainApplicationDocumentOccurrenceForSender(event, occurrence) === undefined
+    if (desktopRegionCapture === undefined || quitting
       || !(owner === null || typeof owner === "string" && owner.length >= 1 && owner.length <= 4096)
       || !(accelerator === null || typeof accelerator === "string" && accelerator.length <= 96
         && /^(?:(?:Ctrl|Control|Alt|Command|CommandOrControl|Super|Meta|Shift)\+){1,4}[\x20-\x7e]+$/u.test(accelerator))) {
-      throw new Error("Screen capture configuration requires its current primary application window.");
+      throw new Error("Screen capture configuration is unavailable or invalid.");
     }
-    desktopRegionCaptureOwner = owner === null ? undefined : { documentOccurrence: occurrence, owner };
+    const documentOccurrence = assertCurrentMainApplicationDocumentSender(event, occurrence);
+    desktopRegionCaptureOwner = owner === null ? undefined : { documentOccurrence, owner };
     selectedRegionCaptureShortcut = accelerator;
     return configureRegionCaptureShortcut();
   });
   ipcMain.handle("joko:region-capture:start", async (event, occurrence: unknown) => {
-    if (typeof occurrence !== "string" || desktopRegionCapture === undefined || quitting
-      || captureMainApplicationDocumentOccurrenceForSender(event, occurrence) === undefined) {
-      throw new Error("Screen capture requires its current primary application window.");
+    if (desktopRegionCapture === undefined || quitting) {
+      throw new Error("Screen capture is unavailable.");
     }
+    assertCurrentMainApplicationDocumentSender(event, occurrence);
     await desktopRegionCapture.begin();
   });
   desktopLinkspan.register();
@@ -11489,7 +11503,7 @@ function currentMainWindowDocumentOccurrence(): string | undefined {
 }
 
 function captureMainApplicationDocumentOccurrenceForSender(
-  event: Pick<IpcMainInvokeEvent, "sender" | "senderFrame">,
+  event: IpcMainEvent,
   claim: string
 ): string | undefined {
   const window = mainWindow;

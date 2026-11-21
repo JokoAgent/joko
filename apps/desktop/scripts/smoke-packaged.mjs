@@ -232,6 +232,7 @@ async function runSmokeJourney() {
   const connectSmoke = await createConnectSmokeServer();
   const requiredSmokeProgress = ["dedicated_hardware_main_snapshot_verified", ...(smokeScope === "full" ? [
     "system_handoff_cold_argv_ingress",
+    ...(process.platform === "win32" || process.platform === "darwin" ? ["region_capture_primary_document_preserved"] : []),
     "system_handoff_cancelled_navigation_preserved",
     "system_handoff_failed_document_request_injected",
     "system_handoff_failed_document_load_stopped",
