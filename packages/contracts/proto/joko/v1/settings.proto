@@ -944,6 +944,7 @@ message SettingsSnapshot {
   AuxiliaryTextSettings auxiliary_text = 30;
   repeated SubagentModelSettings subagent_models = 31;
   ModelFavoriteSettings model_favorites = 32;
+  bool task_model_groups_available = 33;
 }
 
 message AppearanceSettingsPatch {

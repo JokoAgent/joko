@@ -763,7 +763,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   };
   const taskModelsApi = controller.providerGroups?.taskModels;
   const taskModelGroupScope = JSON.stringify([profileScope, controller.state.connectionGeneration]);
-  const taskModelGroupsAllowed = taskModelsApi !== undefined && contactsDraft === undefined && startKind === "fresh"
+  const taskModelGroupsAllowed = snapshot.settings.taskModelGroupsAvailable === true
+    && taskModelsApi !== undefined && contactsDraft === undefined && startKind === "fresh"
     && (selection?.kind === "dialogue" || selected?.trusted === true && selected.remoteWorkspace === undefined);
   useEffect(() => {
     if (!taskModelsApi || !taskModelGroupsAllowed) return;

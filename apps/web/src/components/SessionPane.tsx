@@ -986,7 +986,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const usageLimitSource = errorTailUsageLimitRecovery === null ? historyUsageLimitRecovery?.item : errorTailProjection?.item;
   const usageLimitSourceRef = useRef(usageLimitSource);
   usageLimitSourceRef.current = usageLimitSource;
-  const taskModelsApi = !guest && !reviewReadOnly && !running && !session.archived
+  const taskModelsApi = controller.state.snapshot.settings.taskModelGroupsAvailable === true
+    && !guest && !reviewReadOnly && !running && !session.archived
     ? controller.providerGroups?.taskModels : undefined;
   const modelGroupRecovery = (runId: string | undefined) => taskModelsApi?.applySwitch === undefined || runId === undefined ? undefined
     : <TaskModelGroupSwitchAction key={JSON.stringify([session.id, session.generation.toString(), runId])}

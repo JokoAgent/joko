@@ -66,6 +66,7 @@ describe("mounted Provider configuration", () => {
     await page.getByLabel("Joko node address").fill(fixture.baseUrl); await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId)); await page.getByLabel("Device name").fill("Balance Web");
     await page.locator("form.pair-form button[type=submit]").click();
     await page.locator(".provider-master-row", { hasText: "Official balance" }).click();
+    expect(await page.getByRole("button", { name: "Model groups", exact: true }).count()).toBe(0);
     const toggle = page.getByRole("button", { name: "Account balance / plan usage", exact: true });
     await toggle.waitFor({ state: "visible", timeout: 20_000 }); expect(fetches).toBe(0);
     await toggle.focus(); await page.keyboard.press("Enter");
@@ -86,8 +87,12 @@ describe("mounted Provider configuration", () => {
     const betaId = "managed-beta";
     fixture = await OrchestratorE2eFixture.start({
       webDirectory: resolve(process.env.JOKO_MOUNTED_WEB_DIR!),
-      profiles: [{ ...PI_LIKE_PROFILE, id: alphaId, displayName: "Alpha runtime" }, { ...PI_LIKE_PROFILE, id: betaId, displayName: "Beta runtime" }],
-      createAdapter: (profile) => new ManagedProviderAdapter(profile),
+      taskModelGroups: true,
+      profiles: [],
+      backendFactories: [{ id: alphaId, displayName: "Alpha runtime" }, { id: betaId, displayName: "Beta runtime" }].map(profile => ({
+        instanceId: profile.id, adapterKind: "pi", displayName: profile.displayName,
+        create: () => new ManagedProviderAdapter({ ...PI_LIKE_PROFILE, ...profile })
+      })),
       createAuxiliaryServices: async (store, directory) => {
         const vault = await CredentialVault.open(join(directory, "provider-vault.key"));
         const credentials = new CredentialManager({ vault, storagePath: join(directory, "provider-credentials.json") });
@@ -221,6 +226,24 @@ describe("mounted Provider configuration", () => {
     expect(fixture.application.providers!.resolveInferenceRoute(alphaId, "mounted-route", "original-video-model")).toBeUndefined();
     expect(fixture.application.providers!.resolveInferenceRoute(alphaId, "mounted-route", "original-video-model", { purpose: "xai_video" }))
       .toMatchObject({ modelId: "original-video-model", baseUrl: alpha.endpoint });
+
+    await first.getByRole("button", { name: "Model groups", exact: true }).click();
+    const groups = first.getByRole("region", { name: "Model groups", exact: true });
+    await groups.getByRole("button", { name: "Add model group", exact: true }).click();
+    await groups.getByLabel("Group name").fill("Mounted models");
+    const source = groups.getByLabel("Add a model source");
+    const route = source.getByRole("option", { name: /Test Text · test · Alpha runtime/u });
+    await route.waitFor({ state: "attached" });
+    await source.selectOption({ value: (await route.getAttribute("value"))! });
+    await groups.getByRole("button", { name: "Save group", exact: true }).click();
+    await groups.getByText("Group saved.", { exact: true }).waitFor();
+    expect(fixture.application.providerGroups!.taskModels.list().config?.groups[0]).toMatchObject({
+      name: "Mounted models", candidates: [{ source: { backendId: alphaId, providerId: "test", modelId: "text" } }]
+    });
+    await first.setViewportSize({ width: 390, height: 844 });
+    await groups.getByLabel("Group name").waitFor({ state: "visible" });
+    expect(await overflow(first)).toBeLessThanOrEqual(1);
+    await first.setViewportSize({ width: 1440, height: 960 });
 
     await first.locator(".provider-master-row", { hasText: "Mounted Route" }).dblclick();
     editor = first.locator(".provider-editor-modal");

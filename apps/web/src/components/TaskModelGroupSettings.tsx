@@ -7,6 +7,7 @@ import type { BackendView } from "../model.js";
 import type { TaskModelGroupsApi } from "../provider-group-settings.js";
 import { randomUuid } from "../web-crypto.js";
 import { Button } from "./ui.js";
+import "./provider-group-settings.css";
 
 type Translate = (key: MessageKey, values?: Readonly<Record<string, string | number>>) => string;
 

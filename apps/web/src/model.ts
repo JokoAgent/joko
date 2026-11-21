@@ -5253,6 +5253,7 @@ export type ModelFavoriteMutationView =
 
 export interface SettingsView {
   readonly revision: bigint;
+  readonly taskModelGroupsAvailable?: boolean;
   readonly providers: readonly ProviderConfigurationView[];
   readonly credentials: readonly CredentialView[];
   readonly mcpServers: readonly McpServerView[];

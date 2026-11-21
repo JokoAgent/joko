@@ -630,6 +630,7 @@ export interface ConnectServiceDependencies {
   readonly auxiliaryText?: AuxiliaryTextRouting;
   readonly subagentModels?: SubagentModelSettings;
   readonly modelFavorites?: ModelFavoriteSettings;
+  readonly taskModelGroupsAvailable?: boolean;
   readonly holdSubagentSmartRoutingDispatch?: (backendId: string) => void;
   readonly refreshSubagentSmartRouting?: (backendId: string) => Promise<void>;
   readonly holdNativeMemoryDispatch?: (backendId: string) => void;
@@ -1456,6 +1457,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     ...(application.auxiliaryText === undefined ? {} : { auxiliaryText: application.auxiliaryText }),
     ...(application.subagentModels === undefined ? {} : { subagentModels: application.subagentModels }),
     modelFavorites: application.modelFavorites,
+    taskModelGroupsAvailable: application.providerGroups?.taskModels !== undefined,
     ...(application.sessionNavigation === undefined ? {} : { sessionNavigation: application.sessionNavigation }),
     ...(application.reviewCoordinator === undefined ? {} : { reviewCoordinator: application.reviewCoordinator }),
     ...(application.remoteHosts === undefined ? {} : { remoteHosts: application.remoteHosts }),
@@ -14662,6 +14664,7 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
       ? ""
       : "No available Backend advertises memory.curated.";
   return create(contract.SettingsSnapshotSchema, {
+    taskModelGroupsAvailable: dependencies.taskModelGroupsAvailable === true,
     appearance: appearance ?? create(contract.AppearanceSettingsSchema, {
       locale: "en",
       theme: contract.ThemePreference.SYSTEM,

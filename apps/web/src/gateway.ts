@@ -20645,6 +20645,7 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
   }
   return {
     revision: settings?.revision?.value ?? 0n,
+    taskModelGroupsAvailable: settings.taskModelGroupsAvailable,
     providers: (settings?.providers ?? []).map(mapProviderConfiguration),
     credentials: (settings?.credentials ?? []).map(mapCredential),
     mcpServers: (settings?.mcpServers ?? []).map(mapMcpServer),

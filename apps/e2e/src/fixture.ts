@@ -21,12 +21,14 @@ import {
   LanDiscoveryService,
   DurableWorkspaceRunCapture,
   HistoryMaintenance,
+  HostedAgentSources,
   ModelFavoriteSettings,
   cleanHistoryMaintenanceCopy,
   OperationalWorkspaceSnapshotRepository,
   OperationalArtifactRepository,
   ObjectiveManager,
   PartnerManager,
+  ProviderGroupRuntime,
   DurableReviewEvidenceProvider,
   ReviewCoordinator,
   RemoteExecutionRouter,
@@ -79,6 +81,7 @@ type FixtureAuxiliaryServices = Pick<OrchestratorApplication,
   | "browserSettings" | "browserState" | "voiceInput" | "diagnosticsBundles">;
 
 export interface FixtureOptions {
+  readonly taskModelGroups?: boolean;
   readonly serverAccess?: boolean;
   readonly tls?: OrchestratorConfig['tls'];
   readonly taskSharing?: boolean;
@@ -454,6 +457,21 @@ export class OrchestratorE2eFixture {
     const connections = new RecordingConnectionManager(store);
     connections.openPairingWindow();
     const serverId = options.serverId ?? options.dictionaryPeerNodeId ?? "orchestrator-e2e";
+    const groupSources = options.taskModelGroups === true ? new HostedAgentSources({
+      store, peers: devicePeers, registry: backendInstances, host: sessionHost,
+      temporaryRoot: join(dataDirectory, "hosted-source-transfers"),
+      readBlob: async (blob) => (await artifacts.readBlob(blob)).data,
+      readPolicy: () => { throw new Error("Hosted execution is not enabled in this fixture."); }
+    }) : undefined;
+    const providerGroups = groupSources === undefined ? undefined : new ProviderGroupRuntime({
+      store, registry: backendInstances, sources: groupSources, nodeId: serverId,
+      nodeName: () => "Fixture node", sessions: sessionHost.providerGroupSessionPort(),
+      ownerGeneration: () => serverId, activeTurns: (backendId, providerId) => sessionHost.activeProviderTurns(backendId, providerId),
+      readAccountUsage: async () => undefined,
+      assertRemoteAllowed: () => { throw new Error("Remote Provider use is not enabled in this fixture."); }
+    });
+    await groupSources?.initialize();
+    if (providerGroups !== undefined) sessionHost.installProviderGroupRuntime(providerGroups);
     const lanDiscovery = new LanDiscoveryService({
       self: () => ({
         serverId,
@@ -585,6 +603,7 @@ export class OrchestratorE2eFixture {
       },
       nativeMemoryRestartPending: backendId => nativeMemoryPending.has(backendId),
       modelFavorites,
+      ...(providerGroups === undefined ? {} : { providerGroups }),
       browserActivity: [],
       contacts,
       partners,
@@ -617,6 +636,8 @@ export class OrchestratorE2eFixture {
         await attempt(() => historyMaintenance.close());
         await attempt(() => objectives?.close());
         await attempt(() => sessionHost.dispose());
+        await attempt(() => providerGroups?.close());
+        await attempt(() => groupSources?.close());
         await attempt(() => backendInstances.disposeRetainedCleanups());
         await attempt(() => auxiliaryServices?.mcpRouter?.dispose());
         await attempt(() => auxiliaryServices?.remoteHosts?.close());
