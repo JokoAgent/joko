@@ -196,7 +196,12 @@ mountedIt("copies from the mounted task menu and opens the authoritative destina
     "mounted-copy.txt"), "utf8")).toBe("mounted direct copy");
   await dialog.getByRole("button", { name: "Open task", exact: true }).click();
   await dialog.waitFor({ state: "hidden", timeout: 25_000 });
-  await expect.poll(() => page.url()).toContain(encodeURIComponent(copied[0]!.descriptor.id));
+  const copiedTaskPath = `/tasks/${encodeURIComponent(copied[0]!.descriptor.id)}`;
+  // The dialog disappears when the source connection retires, before the destination route commits.
+  await page.waitForURL(url => {
+    const route = new URL(url.hash.slice(1), url.origin);
+    return route.pathname === copiedTaskPath && route.searchParams.has("profile");
+  }, { timeout: 25_000 });
   await page.getByText("The mounted source conversation", { exact: true }).first().waitFor({ timeout: 25_000 });
 });
 
