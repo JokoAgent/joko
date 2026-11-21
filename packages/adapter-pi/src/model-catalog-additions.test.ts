@@ -1,6 +1,6 @@
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { zstdDecompressSync } from "node:zlib";
-import { clampThinkingLevel, type SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, normalizeContext, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { buildBaseOptions } from "@earendil-works/pi-ai/api/simple-options";
 import { modelTokenPricesAt } from "@joko/core";
 import { describe, expect, it, vi } from "vitest";
@@ -262,7 +262,7 @@ describe("Pi model catalog additions", () => {
     const provider = additions.extendProvider(runtime.getProvider(providerId)!, () => fast);
     const model = provider.getModels().find((candidate) => candidate.id === "gpt-6-astra")!;
     let request: Record<string, unknown> | undefined;
-    const stream = provider.streamSimple(model, { messages: [] }, {
+    const stream = provider.streamSimple(model, normalizeContext({ messages: [] }), {
       apiKey: providerId === "openai-codex" ? testSubscriptionToken() : "test-placeholder",
       reasoning: "low",
       transport: "sse",
@@ -313,7 +313,7 @@ describe("Pi model catalog additions", () => {
         });
       }
     };
-    const context = { messages: [{ role: "user" as const, content: "Check options.", timestamp: 0 }] };
+    const context = normalizeContext({ messages: [{ role: "user", content: "Check options.", timestamp: 0 }] });
     for (const provider of [native, extended]) {
       const message = await provider.streamSimple(model, context, options).result();
       expect(message.stopReason, message.errorMessage).not.toBe("error");

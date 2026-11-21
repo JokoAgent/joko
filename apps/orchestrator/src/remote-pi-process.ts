@@ -66,13 +66,22 @@ const PI_RELEASE_STARTUP_MEMBERS: Readonly<Record<string, readonly string[]>> = 
   theme: ["dark.json", "light.json"]
 };
 const PI_PUBLISHED_ENTRY = `node_modules/${PUBLISHED_PI_PACKAGE_NAME}/joko-rpc-launch.mjs`;
+const PI_AI_PACKAGE = "@earendil-works/pi-ai";
+const PI_TELEMETRY_PACKAGE = "@earendil-works/pi-telemetry";
 const PI_MANAGED_BRIDGE_PACKAGES = {
-  "@earendil-works/pi-ai": ["package.json", "dist/api/simple-options.js", "dist/utils/estimate.js", "README.md"]
+  [PI_AI_PACKAGE]: [
+    "package.json", "README.md", "dist/models.js", "dist/models-store.js", "dist/telemetry.js",
+    "dist/api/lazy.js", "dist/api/simple-options.js",
+    "dist/auth/context.js", "dist/auth/credential-store.js", "dist/auth/resolve.js",
+    "dist/utils/abort.js", "dist/utils/diagnostics.js", "dist/utils/estimate.js", "dist/utils/event-stream.js",
+    "dist/utils/identity.js", "dist/utils/model-operations.js", "dist/utils/models-error.js",
+    "dist/utils/text.js", "dist/utils/transcript.js", "dist/utils/version.js"
+  ],
+  [PI_TELEMETRY_PACKAGE]: ["package.json", "README.md", "dist"]
 } as const;
 const PI_PUBLISHED_SSH_FILES = {
   [PUBLISHED_PI_PACKAGE_NAME]: ["package.json", "dist/bundle", "dist/modes/interactive/theme", "dist/modes/interactive/assets",
     "dist/core/export-html", "docs", "examples", "README.md", "CHANGELOG.md"],
-  "@earendil-works/chord": ["package.json", "dist/context", "README.md"],
   ...PI_MANAGED_BRIDGE_PACKAGES,
   jiti: ["package.json", "lib", "dist", "LICENSE"],
   typebox: ["package.json", "build", "license"],
@@ -3492,15 +3501,11 @@ async function snapshotPublishedPiPackages(
   root: string,
   packages: Readonly<Record<string, readonly string[]>>
 ): Promise<readonly LocalAssetSnapshotEntry[]> {
-  const packageModulesRoot = dirname(dirname(root));
   const entries: LocalAssetSnapshotEntry[] = [];
   const directories = new Set<string>();
   for (const [name, members] of Object.entries(packages)) {
-    const packageRoot = name === PUBLISHED_PI_PACKAGE_NAME ? root
-      : await realpath(join(root, "node_modules", name)).catch((error: NodeJS.ErrnoException) => {
-          if (error.code !== "ENOENT") throw error;
-          return realpath(join(packageModulesRoot, name));
-        });
+    const owner = name === PI_TELEMETRY_PACKAGE ? await installedPiPackageRoot(root, PI_AI_PACKAGE) : root;
+    const packageRoot = name === PUBLISHED_PI_PACKAGE_NAME ? root : await installedPiPackageRoot(owner, name);
     for (const member of members) {
       const destination = `node_modules/${name}/${member}`;
       let parent = "";
@@ -3517,6 +3522,14 @@ async function snapshotPublishedPiPackages(
     }
   }
   return entries;
+}
+
+async function installedPiPackageRoot(owner: string, name: string): Promise<string> {
+  try { return await realpath(join(owner, "node_modules", name)); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return realpath(join(dirname(dirname(owner)), name));
+  }
 }
 
 async function snapshotLocalCompatibilityAsset(root: string, kind?: "pi_release" | "published_package"): Promise<LocalAssetSnapshot> {

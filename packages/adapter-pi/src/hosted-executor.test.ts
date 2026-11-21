@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import * as sdk from "@earendil-works/pi-coding-agent";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, expect, it } from "vitest";
 import { createPiHostedExecutor, type PiHostedExecutorConfiguration } from "./hosted-executor.js";
 import { MANAGED_HOSTED_EXECUTOR_RUNTIME_SOURCE } from "./hosted-executor-runtime.js";
@@ -72,7 +72,7 @@ async function fixture() {
     respond: (callback: NonNullable<typeof modelResponse>) => { modelResponse = callback; },
     reject: () => { reject = true; }, hold: (value: Promise<void>) => { wait = value; } };
 }
-const context = {} as ExtensionContext;
+const context = {} as ExtensionToolContext;
 
 it("runs published SDK file, search and shell tools on the task node through the generated companion", async () => {
   const f = await fixture();

@@ -69,10 +69,13 @@ export function createPiModelCatalogAdditionsFactory(nativeOptions: {
     "xiaomi-token-plan-cn": { baseUrl: "https://token-plan-cn.xiaomimimo.com/v1" }
   } as const;
   const zeroCost = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
-  const exactBaseUrl = (value: string | undefined) => value?.replace(/\/+$/, "");
+  const exactBaseUrl = (value: string | undefined, providerId?: string) => {
+    const clean = value?.replace(/\/+$/, "");
+    return providerId === "kimi-coding" && clean === routes["kimi-coding"].baseUrl + "/v1" ? routes["kimi-coding"].baseUrl : clean;
+  };
   const routeFor = (provider: { readonly id: string; readonly baseUrl?: string }) => {
     const route = routes[provider.id as keyof typeof routes];
-    return route !== undefined && (exactBaseUrl(provider.baseUrl) === route.baseUrl
+    return route !== undefined && (exactBaseUrl(provider.baseUrl, provider.id) === route.baseUrl
       || provider.id === "google-vertex" && provider.baseUrl === undefined) ? route : undefined;
   };
 
@@ -295,7 +298,7 @@ export function createPiModelCatalogAdditionsFactory(nativeOptions: {
   ): CatalogMetadata | undefined {
     const provider = model.provider ?? "";
     const route = routes[provider as keyof typeof routes];
-    if (route === undefined || exactBaseUrl(model.baseUrl) !== route.baseUrl) return undefined;
+    if (route === undefined || exactBaseUrl(model.baseUrl, provider) !== route.baseUrl) return undefined;
     if (model.id === "gpt-6-astra" && (provider === "openai" || provider === "openai-codex")) {
       return {
         ...priced(
