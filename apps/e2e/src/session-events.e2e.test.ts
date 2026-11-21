@@ -1064,11 +1064,12 @@ describe("session host, durable events, and reconnect semantics", () => {
         await page.locator("form.pair-form button[type=submit]").click();
       };
       await pairOnPage(current, "Project Search Current Web");
-      const currentRow = page.locator(`.sidebar [data-session-id="${currentTask}"]`).first();
+      // A cached row for this task can appear while the new connection is still opening.
+      const currentRow = page.locator(`.sidebar [data-session-id="${currentTask}"]:not([data-machine-profile])`).first();
       await currentRow.waitFor({ state: "visible" });
       await page.getByRole("button", { name: "Disconnect", exact: true }).click();
       await pairOnPage(remote, "Project Search Remote Web");
-      await page.locator(`.sidebar [data-session-id="${remoteTask}"]`).first().waitFor({ state: "visible" });
+      await page.locator(`.sidebar [data-session-id="${remoteTask}"]:not([data-machine-profile])`).first().waitFor({ state: "visible" });
       const machine = page.locator(".machine-switcher");
       const machineSummary = machine.locator("summary");
       const machineA = machine.locator(".machine-switcher__profile-main").filter({ hasText: current.baseUrl });
