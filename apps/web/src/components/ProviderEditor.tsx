@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type Dispatch, type JSX, type SetStateAction } from "react";
 import { CirclePlus, Trash2 } from "lucide-react";
-import { capabilityNames } from "@joko/contracts";
+import { capabilityNames, isGeminiChatEndpoint } from "@joko/contracts";
 import type { AppController } from "../controller.js";
 import type { AppSnapshot, BackendView, ProviderCompatibilityView, ProviderConfigurationView, ProviderDraft, ProviderModelConfigurationView, ProviderRuntimeConfigurationView, ModelInputModalityView } from "../model.js";
 import { emptyProviderModel, emptyProviderRuntime, providerCatalogEndpointValid, providerCompatibilityLabel, providerCredentialBindingsValid, providerEndpointOrigin, providerRequestPathValid, supportsProviderField, updateProviderModelMetadata } from "../provider-runtime-draft.js";
@@ -26,16 +26,19 @@ export function ProviderEditor({ open, provider, preset, backends, credentials, 
     preset === undefined ? emptyProviderRuntime(backend) : providerPresetRuntime(preset.definition, backend);
   const available = backends.filter((backend) => backend.capabilities.get(capabilityNames.providerManagedCatalog)?.supported === true
     && (backend.providerRuntimeSupport?.protocols.length ?? 0) > 0 && (preset === undefined || supportsProviderPreset(preset.definition, backend)));
-  const initial = (): ProviderDraft => provider ?? {
+  const initial = (): ProviderDraft => provider === undefined ? {
     id: preset === undefined ? "" : uniqueProviderId(preset.definition.id, providerIds),
     name: preset?.name ?? "",
     kind: "customEndpoint",
     enabled: true,
     revision: 0n,
     runtimes: available[0] === undefined ? [] : [newRuntime(available[0])!]
-  };
+  } : { id: provider.id, name: provider.name, kind: provider.kind, enabled: provider.enabled, revision: provider.revision, runtimes: provider.runtimes };
   const [draft, setDraft] = useState<ProviderDraft>(initial);
   const [activeId, setActiveId] = useState(() => draft.runtimes[0]?.backendId ?? available[0]?.id ?? "");
+  const initialImageBackend = provider?.geminiImageBackendId ?? (preset?.definition.id === "google-gemini-api" ? available[0]?.id : undefined);
+  const [imageBackend, setImageBackend] = useState(initialImageBackend);
+  const [imageBackendEdited, setImageBackendEdited] = useState(false);
   const [secrets, setSecrets] = useState<Readonly<Record<string, string>>>({});
   const [idEdited, setIdEdited] = useState(provider !== undefined || preset !== undefined);
   const [saving, setSaving] = useState(false);
@@ -60,9 +63,11 @@ export function ProviderEditor({ open, provider, preset, backends, credentials, 
   useEffect(() => {
     const next = initial(); setDraft(next); setActiveId(next.runtimes[0]?.backendId ?? available[0]?.id ?? "");
     setSecrets({}); setIdEdited(provider !== undefined || preset !== undefined); setRetired(false); setSaveError(undefined); setTransfer(undefined);
+    setImageBackend(initialImageBackend); setImageBackendEdited(false);
   }, [open, provider?.id, preset?.definition.id]);
   const backend = available.find((item) => item.id === activeId);
   const runtime = draft.runtimes.find((item) => item.backendId === activeId);
+  const eligibleImageBackend = draft.runtimes.find(item => item.backendId === imageBackend && geminiImageRouteEligible(item))?.backendId;
   const updateRuntime: Dispatch<SetStateAction<ProviderRuntimeConfigurationView>> = (update) => setDraft((current) => ({ ...current,
     runtimes: current.runtimes.map((value) => value.backendId === activeId ? typeof update === "function" ? update(value) : update : value) }));
   const setSecret = (value: string): void => setSecrets((current) => ({ ...current, [activeId]: value }));
@@ -89,9 +94,11 @@ export function ProviderEditor({ open, provider, preset, backends, credentials, 
     if (!valid || retired || owner === undefined || owner.pending || owner.abort.signal.aborted) return;
     owner.pending = true; setSaving(true); setSaveError(undefined); setTransfer(undefined);
     const current = (): boolean => scope.current === owner && !owner.abort.signal.aborted;
+    const requestedImageBackend = imageBackendEdited ? eligibleImageBackend ?? "" : provider === undefined ? eligibleImageBackend : undefined;
     let prepared: ProviderDraft = {
       ...draft, id: draft.id.trim(), name: draft.name.trim(),
-      runtimes: preset === undefined ? draft.runtimes : draft.runtimes.map(runtime => finalizeProviderPresetEndpoint(preset.definition, runtime))
+      runtimes: preset === undefined ? draft.runtimes : draft.runtimes.map(runtime => finalizeProviderPresetEndpoint(preset.definition, runtime)),
+      ...(requestedImageBackend !== undefined && (draft.enabled || requestedImageBackend === "") ? { geminiImageBackendSelection: requestedImageBackend } : {})
     };
     let credentialSaved = false;
     try {
@@ -165,6 +172,11 @@ export function ProviderEditor({ open, provider, preset, backends, credentials, 
               <label className="field"><span>{t("settings.environmentName")}</span><input value={runtime.environmentName} onChange={(event) => updateRuntime((value) => ({ ...value, environmentName: event.target.value }))} placeholder={providerCredentialEnvironment(draft.id || "provider")} /></label>
               {supportsProviderField(backend, "authHeader") && <label className="setting-row"><span>{t("settings.authorizationHeader")}</span><SwitchControl checked={runtime.authHeader} onChange={(event) => updateRuntime((value) => ({ ...value, authHeader: event.target.checked }))} /></label>}
             </>}
+            {geminiImageRouteEligible(runtime) && <label className="setting-row"><span>{t("settings.providerWizard.geminiImageReuse")}</span>
+              <CheckboxControl checked={imageBackend === activeId} onChange={event => {
+                setImageBackend(event.target.checked ? activeId : undefined); setImageBackendEdited(true);
+              }} />
+            </label>}
             {credentialMismatch && <div className="provider-editor__credential-authority"><p role="alert">{t("settings.runtimeEditor.originChanged")}</p><Button disabled={providerEndpointOrigin(runtime.endpoint) === undefined} onClick={() => updateRuntime((value) => ({ ...value, credentialOrigin: providerEndpointOrigin(value.endpoint)! }))}>{t("settings.runtimeEditor.authorizeOrigin")}</Button>
               <Button onClick={() => updateRuntime((value) => ({ ...value, credentialId: "", environmentName: "", credentialOrigin: "", headers: [] }))}>{t("settings.runtimeEditor.clearCredentials")}</Button></div>}
             {!credentialsValid(runtime) && <p role="alert">{t("settings.runtimeEditor.credentialConflict")}</p>}
@@ -192,6 +204,10 @@ export function ProviderEditor({ open, provider, preset, backends, credentials, 
         setTransfer(undefined);
       }} />}
   </>;
+}
+
+function geminiImageRouteEligible(runtime: ProviderRuntimeConfigurationView): boolean {
+  return !runtime.keyless && runtime.headers.length === 0 && runtime.compatibility === "openaiCompletions" && isGeminiChatEndpoint(runtime.endpoint);
 }
 
 function ProviderModelPreview({ backend, runtime, secret, preview, updateRuntime, t }: {

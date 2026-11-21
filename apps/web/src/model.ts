@@ -3968,6 +3968,7 @@ export interface ProviderConfigurationView {
   readonly enabled: boolean;
   readonly revision: bigint;
   readonly runtimes: readonly ProviderRuntimeConfigurationView[];
+  readonly geminiImageBackendId?: string;
 }
 
 export type ProviderCompatibilityView = "anthropic" | "openaiResponses" | "openaiChat" | "openaiCompletions" | "native" | "google";
@@ -5336,6 +5337,8 @@ export interface ProviderDraft {
   readonly enabled: boolean;
   readonly revision: bigint;
   readonly runtimes: readonly ProviderRuntimeConfigurationView[];
+  /** Set only after the owner selects or releases a chat key for image generation. */
+  readonly geminiImageBackendSelection?: string;
 }
 
 export type ProviderLoginMethodView = "apiKey" | "oauthBrowser" | "deviceCode" | "subscription";

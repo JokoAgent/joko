@@ -10,7 +10,7 @@ import { join } from "node:path";
 
 import { create } from "@bufbuild/protobuf";
 import { managedSubagentRunRoot, managedSubagentSessionKey } from "@joko/adapter-pi";
-import { BackendModelAccessUpdateSchema } from "@joko/contracts";
+import { BackendModelAccessUpdateSchema, GEMINI_CHAT_ENDPOINT } from "@joko/contracts";
 import { OperationalStore } from "@joko/store";
 import {
   ANDROID_TOOL_NAMES,
@@ -23,7 +23,7 @@ import { ANDROID_BRIDGE_PROVIDER_ID, AndroidToolBridgeProvider } from "./android
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
 import { modelRoutingEnabled, providerRoutingEnabled, writeBackendModelAccess } from "./backend-model-access.js";
-import { CredentialManager } from "./credential-manager.js";
+import { CredentialManager, ProviderCatalogManager } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
 import { ImageGenerationBridgeToolProvider } from "./image-generation-bridge-tool-provider.js";
 import { ProviderCredentialSurfaceResolver, resolveDeclaredProviderCredentialSurface } from "./provider-credential-surface.js";
@@ -3132,14 +3132,31 @@ describe("McpRouter", () => {
     }
   });
 
-  it.each(["openai-images", "gemini-images"] as const)("edits exact images through %s and retires an undispatched edit when its input connection is revoked", async executionApi => {
+  it.each([
+    { name: "OpenAI Images", executionApi: "openai-images", reuseGeminiKey: false },
+    { name: "Gemini Images", executionApi: "gemini-images", reuseGeminiKey: false },
+    { name: "Gemini Images with its chat key", executionApi: "gemini-images", reuseGeminiKey: true }
+  ] as const)("edits exact images through $name and retires an undispatched edit when its input connection is revoked", async ({ executionApi, reuseGeminiKey }) => {
     const { root, store, router, credentials, artifacts } = await fixture();
-    const { modelId, setKey, credentialSurfaces } = configureImageTestRoute(store, credentials, executionApi);
+    const providers = reuseGeminiKey ? new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" }) : undefined;
+    providers?.initialize();
+    const { modelId, setKey, credentialSurfaces } = configureImageTestRoute(store, credentials, executionApi, providers);
     const proxyEntered = deferred<void>(), releaseProxy = deferred<void>();
     const requests: Request[] = [];
     let holdProxy = false;
     try {
-      await setKey("synthetic-image-edit-key");
+      await setKey(reuseGeminiKey ? "separate-image-key" : "synthetic-image-edit-key");
+      if (providers !== undefined) {
+        const credentialReferenceId = "managed-chat-key";
+        const ticket = credentials.createUploadTicket({ kind: "api_key" });
+        credentials.upload(ticket.credentialUploadTicketId, "synthetic-image-edit-key");
+        await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId,
+          displayName: "Google AI Studio", kind: "api_key" });
+        await providers.upsertConfiguration({ providerId: "my-gemini-account", displayName: "Google AI Studio", kind: "custom_endpoint", enabled: true,
+          expectedVersion: 0n, geminiImageBackendId: "pi", runtimes: [{ backendId: "pi", credentialOrigin: new URL(GEMINI_CHAT_ENDPOINT).origin,
+            credentialBindings: { GOOGLE_KEY: credentialReferenceId }, provider: { id: "my-gemini-account", baseUrl: GEMINI_CHAT_ENDPOINT,
+              api: "openai-completions", apiKeyEnv: "GOOGLE_KEY", models: [{ id: "gemini-3.1-pro-preview" }] } }] });
+      }
       const provider = new ImageGenerationBridgeToolProvider({ store, artifacts, credentialSurfaces,
         fetch: async (input, init, beforeDispatch) => {
           if (holdProxy) { proxyEntered.resolve(); await releaseProxy.promise; }
@@ -3151,6 +3168,7 @@ describe("McpRouter", () => {
         }
       });
       router.registerBridgeToolProvider(provider);
+      if (reuseGeminiKey) expect(provider.listModels()).toEqual([expect.objectContaining({ providerId: "my-gemini-account", id: modelId })]);
       const scope = bridgeScope(1);
       const granted = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp",
         targetId: scope.targetId, sessionId: scope.sessionId, expectedPiGeneration: 1 });
@@ -3622,7 +3640,8 @@ function bridgeScope(generation: number) {
   return { requestId: randomUUID(), sessionId: `session-${generation}`, targetId: "target-1" } as const;
 }
 
-function configureImageTestRoute(store: OperationalStore, credentials: CredentialManager, executionApi: "openai-images" | "gemini-images" = "openai-images") {
+function configureImageTestRoute(store: OperationalStore, credentials: CredentialManager,
+  executionApi: "openai-images" | "gemini-images" = "openai-images", providers?: ProviderCatalogManager) {
   const gemini = executionApi === "gemini-images";
   const identity = { backendId: gemini ? "pi" : "codex", providerId: gemini ? "gemini" : "openai", surfaceId: "image-generation" };
   const modelId = gemini ? "gemini/gemini-3.1-flash-image" : "gpt-image-2";
@@ -3637,7 +3656,7 @@ function configureImageTestRoute(store: OperationalStore, credentials: Credentia
   const owner = resolveDeclaredProviderCredentialSurface(store, credentials, identity)!;
   return {
     identity, modelId,
-    credentialSurfaces: new ProviderCredentialSurfaceResolver({ store, credentials,
+    credentialSurfaces: new ProviderCredentialSurfaceResolver({ store, credentials, providers,
       providerEnabled: (backendId, providerId) => providerRoutingEnabled(store, backendId, providerId),
       modelEnabled: (backendId, providerId, model) => modelRoutingEnabled(store, backendId, providerId, model) }),
     async setKey(secret: string) {

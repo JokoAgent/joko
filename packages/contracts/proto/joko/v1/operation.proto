@@ -1259,6 +1259,9 @@ message UpdateDiagnosticSettingsMutation {
 
 message UpsertProviderMutation {
   ProviderConfiguration provider = 1;
+  // Omission preserves the image source. An empty string explicitly releases
+  // this Provider's bound chat credential. Otherwise select its exact Backend.
+  optional string gemini_image_backend_id = 2;
 }
 
 message DeleteProviderMutation {

@@ -10,6 +10,7 @@ import {
   type PiManagedProvider,
   type PiManagedSettings
 } from "@joko/adapter-pi";
+import { isGeminiChatEndpoint } from "@joko/contracts";
 import type { OperationalStore } from "@joko/store";
 
 import { CredentialVault, type EncryptedCredential } from "./credential-vault.js";
@@ -914,6 +915,15 @@ interface StoredProviderCatalog {
   readonly format: 1;
   readonly generation: number;
   readonly configurations: readonly StoredProviderConfiguration[];
+  /** Null retires the selected source. An absent value keeps the standalone image credential. */
+  readonly geminiImageConnection?: GeminiImageConnection | null;
+}
+
+interface GeminiImageConnection {
+  readonly providerId: string;
+  readonly backendId: string;
+  readonly credentialReferenceId: string;
+  readonly credentialGeneration: string;
 }
 
 interface StoredProviderConfiguration {
@@ -1085,6 +1095,7 @@ export interface ProviderConfigurationDescriptor {
   readonly version: bigint;
   readonly updatedAt: number;
   readonly runtimes: readonly ProviderDescriptor[];
+  readonly geminiImageBackendId?: string;
 }
 
 export interface ManagedProviderRuntimeInput {
@@ -1164,6 +1175,7 @@ export class ProviderCatalogManager {
   readonly #modelDiscoveries = new Map<string, { review?: HeldProviderModelReview }>();
   readonly #nativeEntries = new Map<string, NativeProviderAuthEntry>();
   readonly #authentication = new Map<string, { readonly state: ProviderAuthenticationState; readonly error?: string }>();
+  #geminiImageConnection: GeminiImageConnection | null | undefined;
   #generation = 0;
   #initialized = false;
   #nativeAuth: ProviderNativeAuthSupervisor | undefined;
@@ -1264,6 +1276,7 @@ export class ProviderCatalogManager {
         throw new Error("Provider catalog setting has an unsupported format.");
       }
       this.#generation = stored.value.generation;
+      this.#geminiImageConnection = geminiImageConnectionFromStorage(stored.value.geminiImageConnection);
       for (const item of stored.value.configurations.flatMap(providerConfigurationFromStorage)) {
         const entry = providerFromStorage(item);
         validateProviderEntry(entry);
@@ -1342,7 +1355,32 @@ export class ProviderCatalogManager {
     return [...grouped].map(([providerId, runtimes]) => {
       const metadata = [...runtimes].sort((a, b) => a.version > b.version ? -1 : a.version < b.version ? 1 : 0)[0]!;
       return { providerId, displayName: metadata.displayName, kind: metadata.kind,
-        enabled: metadata.enabled, version: metadata.version, updatedAt: metadata.updatedAt, runtimes };
+        enabled: metadata.enabled, version: metadata.version, updatedAt: metadata.updatedAt, runtimes,
+        ...(this.#geminiImageConnection?.providerId === providerId ? { geminiImageBackendId: this.#geminiImageConnection.backendId } : {}) };
+    });
+  }
+
+  /** Undefined uses the separate image key. Null means a selected chat key has been retired. */
+  geminiImageChatCredential(): { readonly backendId: string; readonly providerId: string; readonly credential: CredentialDescriptor } | null | undefined {
+    this.#assertInitialized();
+    const connection = this.#geminiImageConnection;
+    if (connection == null) return connection;
+    const entry = this.#entries.get(managedProviderKey(connection.backendId, connection.providerId));
+    if (entry?.enabled !== true || !this.#providerEnabled(connection.backendId, connection.providerId)
+      || geminiChatCredentialReference(entry, entry.kind) !== connection.credentialReferenceId) return null;
+    const credential = this.#credentials.find(connection.credentialReferenceId);
+    if (credential?.configured !== true || credential.kind !== "api_key" || credential.generation !== connection.credentialGeneration) return null;
+    return { backendId: connection.backendId, providerId: connection.providerId, credential };
+  }
+
+  async useStandaloneGeminiImageCredential(assertCurrent: () => void): Promise<void> {
+    this.#assertInitialized();
+    await this.#mutate(async () => {
+      assertCurrent();
+      const previous = this.#geminiImageConnection;
+      if (previous === undefined) return;
+      this.#geminiImageConnection = undefined;
+      await this.#bumpAndPersist(() => { this.#geminiImageConnection = previous; });
     });
   }
 
@@ -1353,6 +1391,7 @@ export class ProviderCatalogManager {
     readonly enabled: boolean;
     readonly expectedVersion: bigint;
     readonly runtimes: readonly ManagedProviderRuntimeInput[];
+    readonly geminiImageBackendId?: string;
   }, options: { readonly stillActive?: () => boolean } = {}): Promise<void> {
     this.#assertInitialized();
     if (input.runtimes.length === 0 || new Set(input.runtimes.map((runtime) => runtime.backendId)).size !== input.runtimes.length) {
@@ -1368,6 +1407,24 @@ export class ProviderCatalogManager {
       const existing = [...this.#entries].filter(([, entry]) => entry.provider.id === input.providerId);
       const revision = existing.reduce((maximum, [, entry]) => entry.version > maximum ? entry.version : maximum, 0n);
       if (revision !== input.expectedVersion) throw new Error("Provider configuration changed concurrently.");
+      const previousImageConnection = this.#geminiImageConnection;
+      const requestedImageBackend = input.geminiImageBackendId;
+      let imageConnection = previousImageConnection;
+      if (requestedImageBackend === "") {
+        if (imageConnection?.providerId === input.providerId) imageConnection = undefined;
+      } else if (requestedImageBackend !== undefined) {
+        const runtime = input.runtimes.find(item => item.backendId === requestedImageBackend);
+        const reference = runtime === undefined ? undefined : geminiChatCredentialReference(runtime, input.kind);
+        const credential = this.#credentials.list({ kind: "api_key" }).find(item => item.credentialReferenceId === reference);
+        if (!input.enabled || credential?.configured !== true || (credential.providerId && credential.providerId !== input.providerId)) {
+          throw new Error("Gemini image reuse requires the selected chat route's active Google AI Studio API key.");
+        }
+        imageConnection = { providerId: input.providerId, backendId: requestedImageBackend,
+          credentialReferenceId: credential.credentialReferenceId, credentialGeneration: credential.generation };
+      } else if (imageConnection?.providerId === input.providerId) {
+        const selected = input.runtimes.find(runtime => runtime.backendId === previousImageConnection?.backendId);
+        if (selected === undefined || geminiChatCredentialReference(selected, input.kind) !== imageConnection.credentialReferenceId) imageConnection = null;
+      }
       const updatedAt = this.#now();
       const runtimes = input.runtimes.map(runtime => {
         const previous = existing.find(([, entry]) => entry.backendId === runtime.backendId)?.[1];
@@ -1383,9 +1440,11 @@ export class ProviderCatalogManager {
           version: revision === 0n ? BigInt(this.#generation) + 1n : revision + 1n, updatedAt, supportsLogin: false, supportsLogout: false, supportsRefresh: false
         });
       }
+      this.#geminiImageConnection = imageConnection;
       await this.#bumpAndPersist(() => {
         for (const [key, entry] of this.#entries) if (entry.provider.id === input.providerId) this.#entries.delete(key);
         for (const [key, entry] of existing) this.#entries.set(key, entry);
+        this.#geminiImageConnection = previousImageConnection;
       });
     });
   }
@@ -1831,8 +1890,13 @@ export class ProviderCatalogManager {
       const revision = existing.reduce((maximum, [, entry]) => entry.version > maximum ? entry.version : maximum, 0n);
       if (options.expectedVersion !== undefined && revision !== options.expectedVersion) throw new Error("Provider configuration changed concurrently.");
       if (existing.length === 0) return false;
+      const previousImageConnection = this.#geminiImageConnection;
+      if (previousImageConnection?.providerId === providerId) this.#geminiImageConnection = null;
       for (const [key] of existing) { this.#entries.delete(key); this.#modelDiscoveries.delete(key); }
-      await this.#bumpAndPersist(() => { for (const [key, entry] of existing) this.#entries.set(key, entry); });
+      await this.#bumpAndPersist(() => {
+        for (const [key, entry] of existing) this.#entries.set(key, entry);
+        this.#geminiImageConnection = previousImageConnection;
+      });
       return true;
     });
   }
@@ -2528,7 +2592,8 @@ export class ProviderCatalogManager {
       this.#store.setSetting("service", this.#scopeId, "provider_catalog", {
         format: 1,
         generation: this.#generation,
-        configurations: providerConfigurationsForStorage([...this.#entries.values()])
+        configurations: providerConfigurationsForStorage([...this.#entries.values()]),
+        geminiImageConnection: this.#geminiImageConnection
       } satisfies StoredProviderCatalog);
     } catch (error) {
       this.#generation = previousGeneration;
@@ -2547,7 +2612,8 @@ export class ProviderCatalogManager {
         store.setSetting("service", this.#scopeId, "provider_catalog", {
           format: 1,
           generation: this.#generation,
-          configurations: providerConfigurationsForStorage([...this.#entries.values()])
+          configurations: providerConfigurationsForStorage([...this.#entries.values()]),
+          geminiImageConnection: this.#geminiImageConnection
         } satisfies StoredProviderCatalog);
         store.setSetting("service", this.#scopeId, "native_provider_auth_catalog", {
           format: 1,
@@ -2570,6 +2636,22 @@ export class ProviderCatalogManager {
   #assertInitialized(): void {
     if (!this.#initialized) throw new Error("Provider catalog manager is not initialized.");
   }
+}
+
+function geminiChatCredentialReference(runtime: ManagedProviderRuntimeInput, kind: ProviderKind): string | undefined {
+  const { provider, credentialBindings } = runtime;
+  if ((kind !== "custom_endpoint" && kind !== "api_key") || provider.api !== "openai-completions" || provider.keyless === true
+    || !isGeminiChatEndpoint(provider.baseUrl) || provider.apiKeyEnv === undefined || Object.keys(credentialBindings).length !== 1) return undefined;
+  return credentialBindings[provider.apiKeyEnv];
+}
+
+function geminiImageConnectionFromStorage(value: unknown): GeminiImageConnection | null | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value) || typeof value["providerId"] !== "string" || typeof value["backendId"] !== "string"
+    || typeof value["credentialReferenceId"] !== "string" || typeof value["credentialGeneration"] !== "string"
+    || !/^[a-f0-9]{64}$/u.test(value["credentialGeneration"])) return null;
+  return { providerId: value["providerId"], backendId: value["backendId"],
+    credentialReferenceId: value["credentialReferenceId"], credentialGeneration: value["credentialGeneration"] };
 }
 
 function descriptor(record: StoredCredential, now: number): CredentialDescriptor {

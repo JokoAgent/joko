@@ -10647,7 +10647,8 @@ function mapProviderConfiguration(item: ProviderConfigurationDescriptor): contra
   return create(contract.ProviderConfigurationSchema, {
     providerId: item.providerId, displayName: item.displayName, kind: protoProviderKind(item.kind), enabled: item.enabled,
     version: toProtoEntityVersion(item.version, 0, item.updatedAt),
-    runtimes: item.runtimes.map(mapProviderRuntimeConfiguration)
+    runtimes: item.runtimes.map(mapProviderRuntimeConfiguration),
+    geminiImageBackendId: item.geminiImageBackendId
   });
 }
 
@@ -21576,7 +21577,9 @@ async function dispatchMutation(
         accepted: true,
         resultCase: "settings"
       }, async () => {
-        await dependencies.providers!.upsertConfiguration(entry);
+        await dependencies.providers!.upsertConfiguration({ ...entry, geminiImageBackendId: payload.value.geminiImageBackendId }, {
+          stillActive: () => { dependencies.connections.fence(connection); return true; }
+        });
         clearManagedProviderRateLimit(dependencies, entry.providerId);
         await refreshManagedProviderBackends(dependencies, changedBackends);
         dependencies.messageSearch?.reconcileAvailability();
@@ -21734,6 +21737,10 @@ async function dispatchMutation(
           providerId,
           connectionId: connection.id
         });
+        if (dependencies.providers?.nativeAuthenticationBackendId === backendId && providerId === "gemini" && surfaceId === "image-generation"
+          && current.surface.executionApi === "gemini-images") {
+          await dependencies.providers.useStandaloneGeminiImageCredential(() => { dependencies.connections.fence(connection); });
+        }
         await dependencies.refreshPiGeneration?.();
       });
     }

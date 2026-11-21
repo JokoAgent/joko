@@ -954,13 +954,6 @@ export async function createOrchestratorApplication(
   reserveLinkspanTurnCredentials(store, credentials);
   reserveManagedLinkspanResourceCredentials({ config, store, credentials });
   reserveIrohRelayLeaseCredentials({ store, credentials });
-  const providerCredentialSurfaces = new ProviderCredentialSurfaceResolver({
-    store,
-    credentials,
-    providerEnabled: (backendId, providerId) => providerRoutingEnabled(store, backendId, providerId),
-    modelEnabled: (backendId, providerId, modelId) =>
-      modelRoutingEnabled(store, backendId, providerId, modelId)
-  });
   const sshKeys = dependencies.sshKeys ?? new SshKeyManager();
   const remoteHosts = new RemoteHostRegistry({
     nodeKeys: sshKeys,
@@ -1010,6 +1003,13 @@ export async function createOrchestratorApplication(
     modelEnabled: (backendId, providerId, modelId) => modelRoutingEnabled(store, backendId, providerId, modelId)
   });
   providers.initialize();
+  const providerCredentialSurfaces = new ProviderCredentialSurfaceResolver({
+    store,
+    credentials,
+    providers,
+    providerEnabled: (backendId, providerId) => providerRoutingEnabled(store, backendId, providerId),
+    modelEnabled: (backendId, providerId, modelId) => modelRoutingEnabled(store, backendId, providerId, modelId)
+  });
   const modelRoutes = createModelRouteCatalog(store, providers);
   const voiceDictionary = voiceDictionaryOwner = new VoiceDictionarySyncRepository({ store });
   let retireVoiceInputConfiguration = (): void => undefined;

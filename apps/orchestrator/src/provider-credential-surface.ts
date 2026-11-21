@@ -9,7 +9,8 @@ import type { OperationalStore } from "@joko/store";
 
 import {
   CredentialManager,
-  type CredentialDescriptor
+  type CredentialDescriptor,
+  type ProviderCatalogManager
 } from "./credential-manager.js";
 
 export interface ProviderCredentialSurfaceIdentity {
@@ -25,8 +26,10 @@ export interface ResolvedProviderCredentialSurface {
   readonly credentialReferenceId: string;
 }
 
-export interface ConfiguredProviderCredentialSurface extends ResolvedProviderCredentialSurface {
+export interface ConfiguredProviderCredentialSurface extends Omit<ResolvedProviderCredentialSurface, "provider"> {
+  readonly provider: Pick<BackendProviderDescriptor, "providerId">;
   readonly credential: CredentialDescriptor;
+  readonly reusesGeminiChatKey?: true;
 }
 
 export interface ProviderCredentialSurfaceResolverOptions {
@@ -34,6 +37,7 @@ export interface ProviderCredentialSurfaceResolverOptions {
   readonly credentials: CredentialManager;
   readonly providerEnabled?: (backendId: string, providerId: string) => boolean;
   readonly modelEnabled?: (backendId: string, providerId: string, modelId: string) => boolean;
+  readonly providers?: Pick<ProviderCatalogManager, "nativeAuthenticationBackendId" | "geminiImageChatCredential">;
 }
 
 /** Stable exact-owner reference shared by upload, projection, and dispatch. */
@@ -108,18 +112,24 @@ export class ProviderCredentialSurfaceResolver {
   readonly #credentials: CredentialManager;
   readonly #providerEnabled: (backendId: string, providerId: string) => boolean;
   readonly #modelEnabled: (backendId: string, providerId: string, modelId: string) => boolean;
+  readonly #providers: ProviderCredentialSurfaceResolverOptions["providers"];
 
   constructor(options: ProviderCredentialSurfaceResolverOptions) {
     this.#store = options.store;
     this.#credentials = options.credentials;
     this.#providerEnabled = options.providerEnabled ?? (() => true);
     this.#modelEnabled = options.modelEnabled ?? (() => true);
+    this.#providers = options.providers;
   }
 
   listConfigured(input: {
     readonly capability: BackendProviderCredentialSurface["capability"];
     readonly executionApi: BackendProviderCredentialSurface["executionApi"];
   }): readonly ConfiguredProviderCredentialSurface[] {
+    if (input.capability === "image_generation" && input.executionApi === "gemini-images") {
+      const reuse = this.#geminiChatSurface();
+      if (reuse !== undefined) return reuse === null ? [] : [reuse];
+    }
     const configured: ConfiguredProviderCredentialSurface[] = [];
     const referenceOwners = new Map<string, string>();
     const collidedReferences = new Set<string>();
@@ -188,13 +198,21 @@ export class ProviderCredentialSurfaceResolver {
 
   modelEnabled(surface: ConfiguredProviderCredentialSurface, modelId: string): boolean {
     try {
-      return this.#modelEnabled(surface.backend.id, surface.provider.providerId, modelId);
+      return this.#modelEnabled(surface.backend.id, surface.provider.providerId, modelId)
+        && (!surface.reusesGeminiChatKey || this.#modelEnabled(this.#providers!.nativeAuthenticationBackendId, "gemini", modelId));
     } catch {
       return false;
     }
   }
 
   assertDispatchedCredential(input: ConfiguredProviderCredentialSurface, modelId: string): void {
+    if (input.surface.executionApi === "gemini-images") {
+      const reused = this.#assertGeminiSource(input);
+      if (reused !== undefined) {
+        if (!reused.surface.models.some(model => model.modelId === modelId) || !this.modelEnabled(reused, modelId)) throw new Error("The original image generation authority changed.");
+        return;
+      }
+    }
     const backendId = input.backend.id, providerId = input.provider.providerId;
     const current = resolveDeclaredProviderCredentialSurface(this.#store, undefined, {
       backendId, providerId, surfaceId: input.surface.surfaceId
@@ -214,6 +232,10 @@ export class ProviderCredentialSurfaceResolver {
   resolveSecret(input: ConfiguredProviderCredentialSurface): string {
     if (!this.#providerEnabled(input.backend.id, input.provider.providerId)) {
       throw new Error("Provider credential surface is disabled.");
+    }
+    if (input.surface.executionApi === "gemini-images") {
+      const reused = this.#assertGeminiSource(input);
+      if (reused !== undefined) return this.#credentials.resolve(reused.credentialReferenceId);
     }
     const current = resolveDeclaredProviderCredentialSurface(this.#store, this.#credentials, {
       backendId: input.backend.id,
@@ -237,6 +259,33 @@ export class ProviderCredentialSurfaceResolver {
       throw new Error("Provider credential surface is not configured.");
     }
     return secret;
+  }
+
+  #assertGeminiSource(input: ConfiguredProviderCredentialSurface): ConfiguredProviderCredentialSurface | undefined {
+    const selected = this.#geminiChatSurface();
+    if (!input.reusesGeminiChatKey && selected === undefined) return undefined;
+    if (!input.reusesGeminiChatKey || selected == null || selected.backend.id !== input.backend.id
+      || selected.backend.instanceGeneration !== input.backend.instanceGeneration || selected.provider.providerId !== input.provider.providerId
+      || selected.credentialReferenceId !== input.credentialReferenceId || selected.credential.generation !== input.credential.generation) {
+      throw new Error("The original image generation authority changed.");
+    }
+    return selected;
+  }
+
+  #geminiChatSurface(): ConfiguredProviderCredentialSurface | null | undefined {
+    const selection = this.#providers?.geminiImageChatCredential();
+    if (selection == null) return selection;
+    const declaration = resolveDeclaredProviderCredentialSurface(this.#store, undefined, {
+      backendId: this.#providers!.nativeAuthenticationBackendId, providerId: "gemini", surfaceId: "image-generation"
+    });
+    if (declaration?.surface.executionApi !== "gemini-images" || declaration.surface.kind !== "api_key"
+      || declaration.surface.capability !== "image_generation") return null;
+    try {
+      const backend = this.#store.getBackend(selection.backendId).descriptor;
+      if (!this.#providerEnabled(backend.id, selection.providerId) || !this.#providerEnabled(declaration.backend.id, declaration.provider.providerId)) return null;
+      return { backend, provider: { providerId: selection.providerId }, surface: { ...declaration.surface, surfaceId: "gemini-chat-image-generation" },
+        credentialReferenceId: selection.credential.credentialReferenceId, credential: selection.credential, reusesGeminiChatKey: true };
+    } catch { return null; }
   }
 }
 

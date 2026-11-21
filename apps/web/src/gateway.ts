@@ -8617,7 +8617,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       enabled: draft.enabled, version: { revision: { value: draft.revision } }, runtimes
     });
     if (provider.providerId.length === 0 || provider.displayName.length === 0) throw new GatewayError("Provider ID and name are required.");
-    await this.submit({ case: "upsertProvider", value: { provider } }, true, [], scope.signal);
+    await this.submit({ case: "upsertProvider", value: { provider,
+      ...(draft.geminiImageBackendSelection === undefined ? {} : { geminiImageBackendId: draft.geminiImageBackendSelection }) } }, true, [], scope.signal);
     // A credential upload may have started a snapshot read before this commit.
     // Let any such read settle, then project the committed Provider revision.
     await this.#refreshPromise?.catch(() => undefined);
@@ -20962,6 +20963,7 @@ function mapProviderConfiguration(provider: ProviderConfiguration): SettingsView
     kind: providerKind(provider.kind),
     enabled: provider.enabled,
     revision: provider.version?.revision?.value ?? 0n,
+    ...(provider.geminiImageBackendId === undefined ? {} : { geminiImageBackendId: provider.geminiImageBackendId }),
     runtimes: provider.runtimes.map(mapProviderRuntimeConfiguration)
   };
 }
