@@ -11,6 +11,11 @@
 .provider-editor [role="tabpanel"] > .provider-editor__models-heading > p { flex: 1 1 100%; color: var(--text-soft); margin: 0; }
 .provider-editor__credential-authority { display: flex; flex-wrap: wrap; gap: 10px; border-block: 1px solid var(--line); }
 .provider-editor__credential-authority > p { flex-basis: 100%; margin: 0; }
+.provider-model-preview { display: grid; gap: 12px; justify-items: start; }
+.provider-model-preview > .field, .provider-model-preview__results { width: 100%; }
+.provider-model-preview__results:empty { display: none; }
+.provider-model-preview__results > label { display: flex; gap: 10px; align-items: center; min-height: 38px; overflow-wrap: anywhere; }
+.provider-model-preview__results small { display: block; color: var(--text-soft); }
 .provider-transfer-target { min-width: 0; padding-block: 12px; border-bottom: 1px solid var(--line); }
 .provider-transfer-target h3 { margin: 0 0 8px; font-size: var(--text-13); }
 .provider-transfer-row { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 10px; align-items: start; padding-block: 10px; }

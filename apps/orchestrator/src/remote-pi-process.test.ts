@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { EventEmitter, once } from "node:events";
-import { link, mkdir, open, readFile, readdir, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, open, readFile, readdir, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { dirname, join, posix as remotePath, win32, type PlatformPath } from "node:path";
@@ -727,7 +727,10 @@ describe("RemotePiProcessFactory", () => {
     await terminal;
   });
 
-  it.runIf(process.platform === "linux").each(["default", "npm bin", "target PATH"] as const)("starts the published %s SSH Pi RPC without changing owned argv", async entry => {
+  const releaseExecutable = process.env["JOKO_PI_STANDALONE_TEST_EXECUTABLE"];
+  const publishedEntries = ["default", "npm bin", "target PATH",
+    ...(releaseExecutable === undefined ? [] : ["standalone archive" as const])] as const;
+  it.runIf(process.platform === "linux").each(publishedEntries)("starts the published %s SSH Pi RPC without changing owned argv", async entry => {
     const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-published-"));
     temporaryDirectories.push(fixture);
     const runtime = join(fixture, "runtime"), sessions = join(fixture, "sessions"), staged = join(fixture, "staged");
@@ -741,11 +744,12 @@ describe("RemotePiProcessFactory", () => {
       if (member === undefined) return;
       const destination = join(staged, ...member.split("/"));
       await mkdir(dirname(destination), { recursive: true });
-      await writeFile(destination, request.content);
+      await writeFile(destination, request.content, { mode: request.mode ?? 0o600 });
     });
     await files.mkdir("/workspace", { recursive: true });
     await files.mkdir("/home/maker", { recursive: true });
     const bridge = new ManualRemoteProcess();
+    const standalone = entry === "standalone archive";
     const publishedCli = entry === "default" ? PUBLISHED_PI_LOCAL_CLI : join(PUBLISHED_PI_PACKAGE_ROOT, "dist", "bundle", "cli.js");
     const targetPath = join(fixture, "target-bin");
     if (entry === "target PATH") {
@@ -765,24 +769,33 @@ describe("RemotePiProcessFactory", () => {
     const registry = { transports: async () => ({ host: {}, lease }) } as unknown as RemoteHostRegistry;
     const args = ["--mode", "rpc", "--no-session", "--no-extensions", "--offline", "--extension"];
     const mapped = await remoteFactory(registry, join(fixture, "authority")).create({
-      command: entry === "target PATH" ? "pi" : process.execPath,
-      args: [...(entry === "target PATH" ? [] : [publishedCli]), ...args, extensionPath], cwd: "/workspace", remoteWorkspace: TEST_REMOTE_WORKSPACE,
+      command: standalone ? releaseExecutable! : entry === "target PATH" ? "pi" : process.execPath,
+      args: [...(standalone || entry === "target PATH" ? [] : [publishedCli]), ...args, extensionPath],
+      cwd: "/workspace", remoteWorkspace: TEST_REMOTE_WORKSPACE,
       env: { JOKO_PI_TARGET_ID: "target-a", JOKO_PI_SPAWN_IDENTITY: "a".repeat(64), JOKO_PI_REMOTE_RECOVERY_IDENTITY: "b".repeat(64),
         JOKO_PI_GENERATION: "1", JOKO_PI_MCP_TOKEN: "bridge-token-a", JOKO_PI_CONTROL_FILE: control, PI_CODING_AGENT_SESSION_DIR: sessions }
     });
     try {
       const bootstrap = JSON.parse(bridge.input[0]!.toString("utf8")) as { executable: string; args: string[] };
       expect(probes).toBe(entry === "target PATH" ? 1 : 0);
-      expect(bootstrap.executable).toBe("node");
-      expect(bootstrap.args.slice(1, -1)).toEqual(args);
-      expect(bootstrap.args[0]).toMatch(entry === "target PATH" ? /\/assets\/[a-f0-9]{64}-pi-path\.mjs$/u
-        : /\/assets\/[a-f0-9]{64}-pi-runtime\/node_modules\/@earendil-works\/pi-coding-agent\/joko-rpc-launch\.mjs$/u);
+      expect(bootstrap.args.slice(standalone ? 0 : 1, -1)).toEqual(args);
+      if (standalone) {
+        expect(bootstrap.executable).toMatch(/\/bin\/[a-f0-9]{64}\/pi$/u);
+      } else {
+        expect(bootstrap.executable).toBe("node");
+        expect(bootstrap.args[0]).toMatch(entry === "target PATH" ? /\/assets\/[a-f0-9]{64}-pi-path\.mjs$/u
+          : /\/assets\/[a-f0-9]{64}-pi-runtime\/node_modules\/@earendil-works\/pi-coding-agent\/joko-rpc-launch\.mjs$/u);
+      }
       expect(bootstrap.args.at(-1)).toMatch(/\/managed\/joko-managed-bridge\.ts$/u);
       const localStagedPath = (remote: string) => join(staged, ...remote.split("/").slice(6));
-      const launcher = localStagedPath(bootstrap.args[0]!);
       const stagedExtension = localStagedPath(bootstrap.args.at(-1)!);
-      const launchArgs = [launcher, ...args, stagedExtension];
-      const child = spawn(process.execPath, launchArgs, {
+      const executable = standalone ? localStagedPath(bootstrap.executable) : process.execPath;
+      if (standalone) {
+        const publishedOptions = join(dirname(executable), "node_modules", "@earendil-works", "pi-ai", "dist", "api", "simple-options.js");
+        expect(await readFile(publishedOptions, "utf8")).toContain("function buildBaseOptions");
+      }
+      const launchArgs = [...(standalone ? [] : [localStagedPath(bootstrap.args[0]!)]), ...args, stagedExtension];
+      const child = spawn(executable, launchArgs, {
         cwd: fixture, env: { HOME: fixture, PI_CODING_AGENT_DIR: join(fixture, "agent-home"),
           PI_SKIP_VERSION_CHECK: "1", JOKO_PI_GENERATION: "1", JOKO_PI_CONTROL_FILE: join(staged, "control.json") },
         stdio: ["pipe", "pipe", "pipe"]
@@ -807,7 +820,8 @@ describe("RemotePiProcessFactory", () => {
         const commands = responses.get("staged-pi-commands");
         expect(commands, diagnostics).toMatchObject({ type: "response", command: "get_commands", success: true });
         expect(() => assertManagedBridgeHandshake(commands?.data, stagedExtension), diagnostics).not.toThrow();
-        expect((await readFile(`/proc/${child.pid}/cmdline`, "utf8")).split("\0")).toEqual([process.execPath, ...launchArgs, ""]);
+        expect((await readFile(`/proc/${child.pid}/cmdline`, "utf8")).split("\0")).toEqual([executable, ...launchArgs, ""]);
+        if (standalone) expect(await realpath(`/proc/${child.pid}/exe`)).toBe(await realpath(executable));
       } finally {
         clearTimeout(watchdog);
         lines.close();
@@ -877,7 +891,9 @@ describe("RemotePiProcessFactory", () => {
     expect(files.text(`${remoteRelease}/package.json`)).toBe(packageJson);
     expect(files.text(`${remoteRelease}/theme/dark.json`)).toBe('{"name":"dark"}');
     expect(files.text(`${remoteRelease}/theme/light.json`)).toBe('{"name":"light"}');
-    expect((await files.list(remoteRelease)).map(entry => entry.name).sort()).toEqual(["package.json", "pi", "theme"]);
+    expect((await files.list(remoteRelease)).map(entry => entry.name).sort()).toEqual(["node_modules", "package.json", "pi", "theme"]);
+    expect(files.text(`${remoteRelease}/node_modules/@earendil-works/pi-ai/dist/api/simple-options.js`))
+      .toContain("function buildBaseOptions");
 
     const terminal = new Promise<void>((resolveExit) => mapped.once("exit", () => resolveExit()));
     bridge.stdout.write(testFrame(4, 1, terminalContent(0, null)));

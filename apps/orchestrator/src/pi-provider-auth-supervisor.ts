@@ -1086,7 +1086,7 @@ export function supportsProviderAccountUsage(provider: PiNativeOAuthProvider): b
   const models = provider.getModels();
   return provider.auth.oauth?.isSubscription === true
     && models.length > 0
-    && models.every((model) => model.api === "openai-codex-responses");
+    && models.every((model) => model.api === (provider.id === "xai" ? "openai-responses" : "openai-codex-responses"));
 }
 
 function commonNativeProviderApi(models: ReturnType<PiNativeOAuthProvider["getModels"]>): PiSupportedApi | undefined {

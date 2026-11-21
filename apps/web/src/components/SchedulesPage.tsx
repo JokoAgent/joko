@@ -1063,7 +1063,7 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
             effortEnabled={execution.effortSupported}
             fastEnabled={execution.fastModeSupported}
             t={t}
-            onOpen={() => backend === undefined ? undefined : controller.refreshProviderModels(backend.id, undefined, true).catch(() => undefined)}
+            onOpen={() => backend === undefined ? undefined : controller.refreshProviderModels(backend.id, undefined, true).then(() => undefined, () => undefined)}
             onSelect={(selection) => {
               if (selection === undefined) {
                 setDraft((current) => ({ ...current, providerId: "", modelId: "", effort: undefined, fastMode: false }));

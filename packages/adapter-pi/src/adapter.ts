@@ -5184,12 +5184,10 @@ export class PiBackendAdapter implements
     const sshLaunch = context.target.remoteWorkspace?.kind === "ssh";
     const configuredBundle = sshLaunch && this.#command !== process.execPath
       ? await resolvePublishedPiBundleRoot(this.#command) : undefined;
-    const stagedPublishedPi = sshLaunch && (this.#command === "pi" || configuredBundle !== undefined || this.#command === process.execPath
-      && this.#commandArgs[0] === PUBLISHED_PI_LOCAL_CLI);
-    // The default SSH runtime owns its policy bridge and relative support files as one tree.
+    // The SSH runtime owns its policy bridge and relative support files as one tree.
     const [bridgePath, subagentPath] = await Promise.all([
-      stagedPublishedPi ? provisionManagedBridge(runtimeDirectory) : generationBridgePath,
-      stagedPublishedPi && managedSubagentToolsEnabled ? provisionManagedSubagent(runtimeDirectory) : generationSubagentPath
+      sshLaunch ? provisionManagedBridge(runtimeDirectory) : generationBridgePath,
+      sshLaunch && managedSubagentToolsEnabled ? provisionManagedSubagent(runtimeDirectory) : generationSubagentPath
     ]);
     const sessionKey = stableSessionKey(context.sessionId);
     const spawnIdentity = stableSpawnIdentity(agentHome, this.#sessionStore.sessionsRoot, sessionKey, context.generation);

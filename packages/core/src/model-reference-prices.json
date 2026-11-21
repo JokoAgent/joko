@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "updatedAt": "2026-10-27T11:55:00.000Z",
+  "updatedAt": "2026-11-18T05:57:00.000Z",
   "models": [
     {
       "id": "openai/gpt-6.1-sol",
@@ -273,6 +273,20 @@
               "effectiveFrom": "2026-09-22",
               "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
               "verifiedAt": "2026-09-23"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5,
+                "cacheWrite1h": 4
+              },
+              "effectiveFrom": "2026-10-22",
+              "sourceUrl": "https://assets.claude.com/5633dc848caa431115468f31c7085d695bbfb9cc.pdf",
+              "verifiedAt": "2026-11-06"
             }
           ]
         }
@@ -895,6 +909,20 @@
               "effectiveFrom": "2026-09-11",
               "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
               "verifiedAt": "2026-09-11"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.125,
+                "cacheWrite": 6.25,
+                "cacheWrite1h": 10
+              },
+              "effectiveFrom": "2026-10-22",
+              "sourceUrl": "https://assets.claude.com/5633dc848caa431115468f31c7085d695bbfb9cc.pdf",
+              "verifiedAt": "2026-11-06"
             }
           ]
         }
@@ -922,6 +950,20 @@
               "effectiveFrom": "2026-06-09",
               "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
               "verifiedAt": "2026-07-31"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "cacheWrite1h": 10
+              },
+              "effectiveFrom": "2026-10-22",
+              "sourceUrl": "https://assets.claude.com/5633dc848caa431115468f31c7085d695bbfb9cc.pdf",
+              "verifiedAt": "2026-11-06"
             }
           ]
         }
@@ -949,6 +991,20 @@
               "effectiveFrom": "2026-06-09",
               "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
               "verifiedAt": "2026-07-31"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 5,
+                "output": 25,
+                "cacheRead": 0.5,
+                "cacheWrite": 6.25,
+                "cacheWrite1h": 10
+              },
+              "effectiveFrom": "2026-10-22",
+              "sourceUrl": "https://assets.claude.com/5633dc848caa431115468f31c7085d695bbfb9cc.pdf",
+              "verifiedAt": "2026-11-06"
             }
           ]
         }
@@ -990,6 +1046,20 @@
               "effectiveFrom": "2026-07-24",
               "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
               "verifiedAt": "2026-08-02"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 2.5,
+                "output": 12.5,
+                "cacheRead": 0.25,
+                "cacheWrite": 3.125,
+                "cacheWrite1h": 5
+              },
+              "effectiveFrom": "2026-10-22",
+              "sourceUrl": "https://assets.claude.com/5633dc848caa431115468f31c7085d695bbfb9cc.pdf",
+              "verifiedAt": "2026-11-06"
             }
           ]
         }
@@ -1031,6 +1101,20 @@
               "effectiveFrom": "2026-05-28",
               "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
               "verifiedAt": "2026-08-02"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 2.5,
+                "output": 12.5,
+                "cacheRead": 0.25,
+                "cacheWrite": 3.125,
+                "cacheWrite1h": 5
+              },
+              "effectiveFrom": "2026-10-22",
+              "sourceUrl": "https://assets.claude.com/5633dc848caa431115468f31c7085d695bbfb9cc.pdf",
+              "verifiedAt": "2026-11-06"
             }
           ]
         }
@@ -1058,6 +1142,20 @@
               "effectiveFrom": "2026-04-16",
               "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
               "verifiedAt": "2026-07-31"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 2.5,
+                "output": 12.5,
+                "cacheRead": 0.25,
+                "cacheWrite": 3.125,
+                "cacheWrite1h": 5
+              },
+              "effectiveFrom": "2026-10-22",
+              "sourceUrl": "https://assets.claude.com/5633dc848caa431115468f31c7085d695bbfb9cc.pdf",
+              "verifiedAt": "2026-11-06"
             }
           ]
         }
@@ -1085,6 +1183,20 @@
               "effectiveFrom": "2026-02-05",
               "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
               "verifiedAt": "2026-07-31"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 2.5,
+                "output": 12.5,
+                "cacheRead": 0.25,
+                "cacheWrite": 3.125,
+                "cacheWrite1h": 5
+              },
+              "effectiveFrom": "2026-10-22",
+              "sourceUrl": "https://assets.claude.com/5633dc848caa431115468f31c7085d695bbfb9cc.pdf",
+              "verifiedAt": "2026-11-06"
             }
           ]
         }
@@ -1112,6 +1224,21 @@
               "effectiveFrom": "2025-11-01",
               "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
               "verifiedAt": "2026-07-31"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 2.5,
+                "output": 12.5,
+                "cacheRead": 0.25,
+                "cacheWrite": 3.125,
+                "cacheWrite1h": 5
+              },
+              "maxInputTokens": 200001,
+              "effectiveFrom": "2026-10-22",
+              "sourceUrl": "https://assets.claude.com/5633dc848caa431115468f31c7085d695bbfb9cc.pdf",
+              "verifiedAt": "2026-11-06"
             }
           ]
         }
@@ -1139,6 +1266,20 @@
               "effectiveFrom": "2026-06-30",
               "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
               "verifiedAt": "2026-08-12"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 1,
+                "output": 5,
+                "cacheRead": 0.1,
+                "cacheWrite": 1.25,
+                "cacheWrite1h": 2
+              },
+              "effectiveFrom": "2026-10-22",
+              "sourceUrl": "https://assets.claude.com/5633dc848caa431115468f31c7085d695bbfb9cc.pdf",
+              "verifiedAt": "2026-11-06"
             }
           ]
         }
@@ -1166,6 +1307,20 @@
               "effectiveFrom": "2026-02-17",
               "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
               "verifiedAt": "2026-07-31"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 1.5,
+                "output": 7.5,
+                "cacheRead": 0.15,
+                "cacheWrite": 1.875,
+                "cacheWrite1h": 3
+              },
+              "effectiveFrom": "2026-10-22",
+              "sourceUrl": "https://assets.claude.com/5633dc848caa431115468f31c7085d695bbfb9cc.pdf",
+              "verifiedAt": "2026-11-06"
             }
           ]
         }
@@ -1193,6 +1348,18 @@
               "effectiveFrom": "2025-09-29",
               "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
               "verifiedAt": "2026-07-31"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 1.5,
+                "output": 7.5
+              },
+              "maxInputTokens": 200001,
+              "effectiveFrom": "2026-11-06",
+              "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
+              "verifiedAt": "2026-11-06"
             }
           ]
         }
@@ -1220,6 +1387,21 @@
               "effectiveFrom": "2025-10-01",
               "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
               "verifiedAt": "2026-07-31"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 0.5,
+                "output": 2.5,
+                "cacheRead": 0.05,
+                "cacheWrite": 0.625,
+                "cacheWrite1h": 1
+              },
+              "maxInputTokens": 200001,
+              "effectiveFrom": "2026-10-22",
+              "sourceUrl": "https://assets.claude.com/5633dc848caa431115468f31c7085d695bbfb9cc.pdf",
+              "verifiedAt": "2026-11-06"
             }
           ]
         }
@@ -2502,8 +2684,37 @@
                 "cacheWrite": 20
               },
               "effectiveFrom": "2026-09-23",
+              "effectiveUntil": "2026-11-05",
               "sourceUrl": "https://platform.kimi.com/",
               "verifiedAt": "2026-09-23"
+            },
+            {
+              "currencyCode": "CNY",
+              "variant": "standard",
+              "cost": {
+                "input": 20,
+                "output": 100,
+                "cacheRead": 2,
+                "cacheWrite": 20,
+                "cacheWrite1h": 40
+              },
+              "effectiveFrom": "2026-11-05",
+              "sourceUrl": "https://platform.kimi.com/docs/guide/context-caching",
+              "verifiedAt": "2026-11-05"
+            },
+            {
+              "currencyCode": "CNY",
+              "variant": "batch",
+              "cost": {
+                "input": 12,
+                "output": 60,
+                "cacheRead": 1.2,
+                "cacheWrite": 12,
+                "cacheWrite1h": 24
+              },
+              "effectiveFrom": "2026-11-07",
+              "sourceUrl": "https://platform.kimi.com/docs/pricing/batch",
+              "verifiedAt": "2026-11-07"
             }
           ]
         },
@@ -2533,8 +2744,37 @@
                 "cacheWrite": 3
               },
               "effectiveFrom": "2026-09-23",
+              "effectiveUntil": "2026-11-05",
               "sourceUrl": "https://platform.kimi.ai/",
               "verifiedAt": "2026-09-23"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 3,
+                "output": 15,
+                "cacheRead": 0.3,
+                "cacheWrite": 3,
+                "cacheWrite1h": 6
+              },
+              "effectiveFrom": "2026-11-05",
+              "sourceUrl": "https://platform.kimi.ai/docs/guide/context-caching",
+              "verifiedAt": "2026-11-05"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 1.8,
+                "output": 9,
+                "cacheRead": 0.18,
+                "cacheWrite": 1.8,
+                "cacheWrite1h": 3.6
+              },
+              "effectiveFrom": "2026-11-07",
+              "sourceUrl": "https://platform.kimi.ai/docs/pricing/batch",
+              "verifiedAt": "2026-11-07"
             }
           ]
         }
@@ -2607,6 +2847,23 @@
               "effectiveFrom": "2026-10-24",
               "sourceUrl": "https://platform.minimax.io/docs/pricing/overview",
               "verifiedAt": "2026-10-24"
+            }
+          ]
+        },
+        {
+          "id": "cn",
+          "tariffs": [
+            {
+              "currencyCode": "CNY",
+              "variant": "standard",
+              "cost": {
+                "input": 1,
+                "output": 4,
+                "cacheRead": 0.1
+              },
+              "effectiveFrom": "2026-11-05",
+              "sourceUrl": "https://platform.minimaxi.com/docs/pricing/overview",
+              "verifiedAt": "2026-11-05"
             }
           ]
         }
@@ -2973,6 +3230,807 @@
               "effectiveFrom": "2026-10-27",
               "sourceUrl": "https://wiki.agnes-ai.com/en/docs/pricing",
               "verifiedAt": "2026-10-27"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "openai/gpt-6.2-sol",
+      "aliases": [
+        "gpt-6.2-sol"
+      ],
+      "groups": [
+        {
+          "id": "global",
+          "tariffs": [
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5
+              },
+              "maxInputTokens": 272001,
+              "effectiveFrom": "2026-11-17",
+              "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-6.2-sol",
+              "verifiedAt": "2026-11-18"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 4,
+                "output": 15,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
+              },
+              "minInputTokens": 272001,
+              "effectiveFrom": "2026-11-17",
+              "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-6.2-sol",
+              "verifiedAt": "2026-11-18"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "fast",
+              "cost": {
+                "input": 4,
+                "output": 20,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
+              },
+              "maxInputTokens": 272001,
+              "effectiveFrom": "2026-11-17",
+              "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-6.2-sol",
+              "verifiedAt": "2026-11-18"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "fast",
+              "cost": {
+                "input": 8,
+                "output": 30,
+                "cacheRead": 0.4,
+                "cacheWrite": 10
+              },
+              "minInputTokens": 272001,
+              "effectiveFrom": "2026-11-17",
+              "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-6.2-sol",
+              "verifiedAt": "2026-11-18"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 1,
+                "output": 5,
+                "cacheRead": 0.05,
+                "cacheWrite": 1.25
+              },
+              "maxInputTokens": 272001,
+              "effectiveFrom": "2026-11-17",
+              "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-6.2-sol",
+              "verifiedAt": "2026-11-18"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 2,
+                "output": 7.5,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5
+              },
+              "minInputTokens": 272001,
+              "effectiveFrom": "2026-11-17",
+              "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-6.2-sol",
+              "verifiedAt": "2026-11-18"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "openai/gpt-6.1-terra",
+      "aliases": [
+        "gpt-6.1-terra"
+      ],
+      "groups": [
+        {
+          "id": "global",
+          "tariffs": [
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 1,
+                "output": 5,
+                "cacheRead": 0.05,
+                "cacheWrite": 1.25
+              },
+              "maxInputTokens": 272001,
+              "effectiveFrom": "2026-10-26",
+              "sourceUrl": "https://developers.openai.com/api/docs/pricing",
+              "verifiedAt": "2026-11-12"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "fast",
+              "cost": {
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5
+              },
+              "maxInputTokens": 272001,
+              "effectiveFrom": "2026-10-26",
+              "sourceUrl": "https://developers.openai.com/api/docs/pricing",
+              "verifiedAt": "2026-11-12"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "fast",
+              "cost": {
+                "input": 4,
+                "output": 15,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
+              },
+              "minInputTokens": 272001,
+              "effectiveFrom": "2026-10-26",
+              "sourceUrl": "https://developers.openai.com/api/docs/pricing",
+              "verifiedAt": "2026-11-12"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 0.5,
+                "output": 2.5,
+                "cacheRead": 0.025,
+                "cacheWrite": 0.625
+              },
+              "maxInputTokens": 272001,
+              "effectiveFrom": "2026-10-26",
+              "sourceUrl": "https://developers.openai.com/api/docs/pricing",
+              "verifiedAt": "2026-11-12"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 1,
+                "output": 3.75,
+                "cacheRead": 0.05,
+                "cacheWrite": 1.25
+              },
+              "minInputTokens": 272001,
+              "effectiveFrom": "2026-10-26",
+              "sourceUrl": "https://developers.openai.com/api/docs/pricing",
+              "verifiedAt": "2026-11-12"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "anthropic/claude-sonnet-5-5",
+      "aliases": [
+        "claude-sonnet-5-5"
+      ],
+      "groups": [
+        {
+          "id": "global",
+          "tariffs": [
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.1,
+                "cacheWrite": 2.5,
+                "cacheWrite1h": 4
+              },
+              "effectiveFrom": "2026-11-05",
+              "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
+              "verifiedAt": "2026-11-05"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "anthropic/claude-haiku-5-5",
+      "aliases": [
+        "claude-haiku-5-5"
+      ],
+      "groups": [
+        {
+          "id": "global",
+          "tariffs": [
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 0.1,
+                "output": 0.5,
+                "cacheRead": 0.01,
+                "cacheWrite": 0.125,
+                "cacheWrite1h": 0.2
+              },
+              "maxInputTokens": 100001,
+              "effectiveFrom": "2026-11-05",
+              "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
+              "verifiedAt": "2026-11-05"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 0.5,
+                "output": 2.5,
+                "cacheRead": 0.05,
+                "cacheWrite": 0.625,
+                "cacheWrite1h": 1
+              },
+              "minInputTokens": 100001,
+              "effectiveFrom": "2026-11-05",
+              "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
+              "verifiedAt": "2026-11-05"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 0.05,
+                "output": 0.25
+              },
+              "maxInputTokens": 100001,
+              "effectiveFrom": "2026-11-06",
+              "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
+              "verifiedAt": "2026-11-06"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 0.25,
+                "output": 1.25
+              },
+              "minInputTokens": 100001,
+              "effectiveFrom": "2026-11-06",
+              "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
+              "verifiedAt": "2026-11-06"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "openai/gpt-6-cyber",
+      "aliases": [
+        "gpt-6-cyber"
+      ],
+      "groups": [
+        {
+          "id": "global",
+          "tariffs": [
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 20,
+                "output": 100,
+                "cacheRead": 2,
+                "cacheWrite": 25
+              },
+              "maxInputTokens": 272001,
+              "effectiveFrom": "2026-11-05",
+              "sourceUrl": "https://developers.openai.com/api/docs/pricing",
+              "verifiedAt": "2026-11-17"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "openai/gpt-6.2-astra",
+      "aliases": [
+        "gpt-6.2-astra"
+      ],
+      "groups": [
+        {
+          "id": "global",
+          "tariffs": [
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 8,
+                "output": 40,
+                "cacheRead": 0.4,
+                "cacheWrite": 10
+              },
+              "maxInputTokens": 272001,
+              "effectiveFrom": "2026-11-17",
+              "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-6.2-astra",
+              "verifiedAt": "2026-11-18"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 16,
+                "output": 60,
+                "cacheRead": 0.8,
+                "cacheWrite": 20
+              },
+              "minInputTokens": 272001,
+              "effectiveFrom": "2026-11-17",
+              "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-6.2-astra",
+              "verifiedAt": "2026-11-18"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "fast",
+              "cost": {
+                "input": 16,
+                "output": 80,
+                "cacheRead": 0.8,
+                "cacheWrite": 20
+              },
+              "maxInputTokens": 272001,
+              "effectiveFrom": "2026-11-17",
+              "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-6.2-astra",
+              "verifiedAt": "2026-11-18"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "fast",
+              "cost": {
+                "input": 32,
+                "output": 120,
+                "cacheRead": 1.6,
+                "cacheWrite": 40
+              },
+              "minInputTokens": 272001,
+              "effectiveFrom": "2026-11-17",
+              "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-6.2-astra",
+              "verifiedAt": "2026-11-18"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 4,
+                "output": 20,
+                "cacheRead": 0.2,
+                "cacheWrite": 5
+              },
+              "maxInputTokens": 272001,
+              "effectiveFrom": "2026-11-17",
+              "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-6.2-astra",
+              "verifiedAt": "2026-11-18"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 8,
+                "output": 30,
+                "cacheRead": 0.4,
+                "cacheWrite": 10
+              },
+              "minInputTokens": 272001,
+              "effectiveFrom": "2026-11-17",
+              "sourceUrl": "https://developers.openai.com/api/docs/models/gpt-6.2-astra",
+              "verifiedAt": "2026-11-18"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "anthropic/claude-fable-5-2",
+      "aliases": [
+        "claude-fable-5-2"
+      ],
+      "groups": [
+        {
+          "id": "global",
+          "tariffs": [
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 8,
+                "output": 40,
+                "cacheRead": 0.2,
+                "cacheWrite": 10,
+                "cacheWrite1h": 16
+              },
+              "effectiveFrom": "2026-11-09",
+              "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
+              "verifiedAt": "2026-11-12"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "fast",
+              "cost": {
+                "input": 16,
+                "output": 80,
+                "cacheRead": 0.4,
+                "cacheWrite": 20,
+                "cacheWrite1h": 32
+              },
+              "effectiveFrom": "2026-11-09",
+              "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
+              "verifiedAt": "2026-11-12"
+            },
+            {
+              "currencyCode": "USD",
+              "variant": "batch",
+              "cost": {
+                "input": 4,
+                "output": 20
+              },
+              "effectiveFrom": "2026-11-09",
+              "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
+              "verifiedAt": "2026-11-12"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "google/gemini-4-carbon",
+      "aliases": [
+        "gemini-4-carbon"
+      ],
+      "groups": [
+        {
+          "id": "global",
+          "tariffs": [
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.1
+              },
+              "effectiveFrom": "2026-11-10",
+              "effectiveUntil": "2026-12-01",
+              "sourceUrl": "https://ai.google.dev/gemini-api/docs/pricing",
+              "verifiedAt": "2026-11-12"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "google/gemini-4-hydrogen",
+      "aliases": [
+        "gemini-4-hydrogen"
+      ],
+      "groups": [
+        {
+          "id": "global",
+          "tariffs": [
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 1.5,
+                "output": 7.5,
+                "cacheRead": 0.075
+              },
+              "effectiveFrom": "2026-11-12",
+              "sourceUrl": "https://ai.google.dev/gemini-api/docs/pricing",
+              "verifiedAt": "2026-11-13"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "google/gemini-3.1-pro-preview",
+      "aliases": [
+        "gemini-3.1-pro-preview"
+      ],
+      "groups": [
+        {
+          "id": "global",
+          "tariffs": [
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 2,
+                "output": 12,
+                "cacheRead": 0.2
+              },
+              "maxInputTokens": 200001,
+              "effectiveFrom": "2026-11-12",
+              "sourceUrl": "https://ai.google.dev/gemini-api/docs/pricing",
+              "verifiedAt": "2026-11-12"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "google/gemini-3-flash-preview",
+      "aliases": [
+        "gemini-3-flash-preview"
+      ],
+      "groups": [
+        {
+          "id": "global",
+          "tariffs": [
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 0.5,
+                "output": 3,
+                "cacheRead": 0.05
+              },
+              "effectiveFrom": "2026-11-12",
+              "sourceUrl": "https://ai.google.dev/gemini-api/docs/pricing",
+              "verifiedAt": "2026-11-12"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "qwen/qwen4-max",
+      "aliases": [
+        "qwen4-max"
+      ],
+      "groups": [
+        {
+          "id": "cn",
+          "tariffs": [
+            {
+              "currencyCode": "CNY",
+              "variant": "standard",
+              "cost": {
+                "input": 10,
+                "output": 30,
+                "cacheRead": 0.5,
+                "cacheWrite": 12.5
+              },
+              "effectiveFrom": "2026-11-17",
+              "sourceUrl": "https://help.aliyun.com/zh/model-studio/model-pricing",
+              "verifiedAt": "2026-11-17"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "minimax/minimax-m3",
+      "aliases": [
+        "MiniMax-M3"
+      ],
+      "groups": [
+        {
+          "id": "global",
+          "tariffs": [
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 0.3,
+                "output": 1.2,
+                "cacheRead": 0.06
+              },
+              "maxInputTokens": 512001,
+              "effectiveFrom": "2026-11-12",
+              "sourceUrl": "https://platform.minimax.io/docs/guides/pricing-paygo",
+              "verifiedAt": "2026-11-12"
+            }
+          ]
+        },
+        {
+          "id": "cn",
+          "tariffs": [
+            {
+              "currencyCode": "CNY",
+              "variant": "standard",
+              "cost": {
+                "input": 2.1,
+                "output": 8.4,
+                "cacheRead": 0.42
+              },
+              "maxInputTokens": 512001,
+              "effectiveFrom": "2026-11-12",
+              "sourceUrl": "https://platform.minimaxi.com/docs/guides/pricing-paygo",
+              "verifiedAt": "2026-11-12"
+            },
+            {
+              "currencyCode": "CNY",
+              "variant": "standard",
+              "cost": {
+                "input": 4.2,
+                "output": 16.8,
+                "cacheRead": 0.84
+              },
+              "minInputTokens": 512001,
+              "effectiveFrom": "2026-11-12",
+              "sourceUrl": "https://platform.minimaxi.com/docs/guides/pricing-paygo",
+              "verifiedAt": "2026-11-12"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "tencent/hy4",
+      "aliases": [],
+      "groups": [
+        {
+          "id": "cn",
+          "tariffs": [
+            {
+              "currencyCode": "CNY",
+              "variant": "standard",
+              "cost": {
+                "input": 6,
+                "output": 18,
+                "cacheRead": 0.3
+              },
+              "effectiveFrom": "2026-11-12",
+              "sourceUrl": "https://cloud.tencent.com/document/product/1823/130055",
+              "verifiedAt": "2026-11-12"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "tencent/hy4-flash",
+      "aliases": [],
+      "groups": [
+        {
+          "id": "cn",
+          "tariffs": [
+            {
+              "currencyCode": "CNY",
+              "variant": "standard",
+              "cost": {
+                "input": 0.5,
+                "output": 2,
+                "cacheRead": 0.02
+              },
+              "effectiveFrom": "2026-11-17",
+              "sourceUrl": "https://cloud.tencent.com/document/product/1823/130055",
+              "verifiedAt": "2026-11-17"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "moonshotai/kimi-k3.1-pro",
+      "aliases": [
+        "kimi-k3.1-pro",
+        "k3.1-pro"
+      ],
+      "groups": [
+        {
+          "id": "cn",
+          "tariffs": [
+            {
+              "currencyCode": "CNY",
+              "variant": "standard",
+              "cost": {
+                "input": 13,
+                "output": 68,
+                "cacheRead": 1.3,
+                "cacheWrite": 13,
+                "cacheWrite1h": 26
+              },
+              "effectiveFrom": "2026-11-05",
+              "sourceUrl": "https://platform.kimi.com/docs/pricing/chat",
+              "verifiedAt": "2026-11-05"
+            }
+          ]
+        },
+        {
+          "id": "global",
+          "tariffs": [
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 2,
+                "output": 10,
+                "cacheRead": 0.2,
+                "cacheWrite": 2,
+                "cacheWrite1h": 4
+              },
+              "effectiveFrom": "2026-11-05",
+              "sourceUrl": "https://platform.kimi.ai/docs/pricing/chat",
+              "verifiedAt": "2026-11-05"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "moonshotai/kimi-k3.1-pro-highspeed",
+      "aliases": [
+        "kimi-k3.1-pro-highspeed",
+        "k3.1-pro-highspeed"
+      ],
+      "groups": [
+        {
+          "id": "cn",
+          "tariffs": [
+            {
+              "currencyCode": "CNY",
+              "variant": "standard",
+              "cost": {
+                "input": 26,
+                "output": 136,
+                "cacheRead": 1.3,
+                "cacheWrite": 26,
+                "cacheWrite1h": 52
+              },
+              "effectiveFrom": "2026-11-05",
+              "sourceUrl": "https://platform.kimi.com/docs/pricing/chat",
+              "verifiedAt": "2026-11-05"
+            }
+          ]
+        },
+        {
+          "id": "global",
+          "tariffs": [
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 4,
+                "output": 20,
+                "cacheRead": 0.2,
+                "cacheWrite": 4,
+                "cacheWrite1h": 8
+              },
+              "effectiveFrom": "2026-11-05",
+              "sourceUrl": "https://platform.kimi.ai/docs/pricing/chat",
+              "verifiedAt": "2026-11-05"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "meta/muse-ember-1.0",
+      "aliases": [
+        "muse-ember-1.0"
+      ],
+      "groups": [
+        {
+          "id": "global",
+          "tariffs": [
+            {
+              "currencyCode": "USD",
+              "variant": "standard",
+              "cost": {
+                "input": 0.1,
+                "output": 0.5,
+                "cacheRead": 0.004
+              },
+              "maxInputTokens": 200001,
+              "effectiveFrom": "2026-11-12",
+              "sourceUrl": "https://dev.meta.ai/docs/pricing-rate-limits",
+              "verifiedAt": "2026-11-12"
             }
           ]
         }

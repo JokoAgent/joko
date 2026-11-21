@@ -1,5 +1,6 @@
 import "./protobuf-text-encoding.js";
 export * from "./model-speed.js";
+export * from "./provider-catalog-endpoint.js";
 export * from "./session-context-budget.js";
 export * from "./background-workflow.js";
 export * from "./extension-settings-bridge.js";

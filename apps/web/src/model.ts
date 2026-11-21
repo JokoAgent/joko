@@ -1,7 +1,7 @@
 import type { JSONContent } from "@tiptap/core";
 import type { PartnerAvatarView, PartnerAvatarInputView } from "./partner-avatar.js";
 import type { SessionWorkingStatus, VoiceDictionaryPeerApi, VoiceInputSaucSettingsView, VoiceInputRecognitionContextView, PartnerWorkbenchRoutine, BackgroundTaskOutput } from "@joko/contracts";
-import type { PartnerLearningFeedbackView, PersonalDevelopmentDoctorRun, PersonalDevelopmentTask } from "@joko/contracts";
+import type { PartnerLearningFeedbackView, PersonalDevelopmentDoctorRun, PersonalDevelopmentTask, ProviderModelWithdrawalReview } from "@joko/contracts";
 import type { PersonalDevelopmentApi } from "./personal-development-api.js";
 import type { HostedAgentSettingsApi } from "./hosted-agent-settings.js";
 
@@ -6775,8 +6775,10 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   authorizeNewDevice?(options?: import("@joko/connection-transport/trust").NewDeviceAuthorizationOptions): Promise<import("@joko/connection-transport/trust").NodePairingInvitation>;
   cancelDevicePairing?(invitation: import("@joko/connection-transport/trust").NodePairingInvitation): Promise<void>;
   saveProvider(draft: ProviderDraft, signal?: AbortSignal): Promise<void>;
+  previewProviderModels?(runtime: ProviderRuntimeConfigurationView, secret: string, signal: AbortSignal): Promise<readonly ProviderModelConfigurationView[]>;
   deleteProvider(providerId: string): Promise<void>;
-  refreshProviderModels(backendId: string, providerId?: string, automatic?: boolean): Promise<void>;
+  refreshProviderModels(backendId: string, providerId?: string, automatic?: boolean): Promise<ProviderModelWithdrawalReview | void>;
+  confirmProviderModelWithdrawals(review: ProviderModelWithdrawalReview, modelIds: readonly string[], operationId: string): Promise<void>;
   refreshManagedModelRuntimes(signal?: AbortSignal): Promise<readonly ManagedModelRuntimeView[]>;
   ensureManagedModelRuntimeProvider(runtimeId: string): Promise<ManagedModelRuntimeView>;
   stopManagedModelRuntime(runtimeId: string): Promise<ManagedModelRuntimeView>;

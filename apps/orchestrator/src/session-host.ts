@@ -103,7 +103,8 @@ import type {
   QueueItemRecord,
   ScheduleRecord,
   StoredTarget,
-  StoredSession
+  StoredSession,
+  UsageReferenceRequest
 } from "@joko/store";
 import type { PendingRuntimeHandoff, RuntimeHandoffSource } from "@joko/store";
 import type { ImportProbeAction } from "@joko/agent-import";
@@ -241,6 +242,8 @@ const NATIVE_DERIVATION_CLEANUP_TIMEOUT_MS = 5_000;
 const RUN_SILENCE_WATCHDOG_SLICE_MS = 60_000;
 const RUN_SILENCE_SUSPEND_GAP_MS = 30_000;
 const SESSION_RUNTIME_USAGE_SOURCE_ID = "session-runtime";
+const PI_REQUEST_USAGE_CURSOR_KEY = "usage.pi_request_cursor";
+const USAGE_COUNTERS = ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "totalTokens"] as const;
 
 interface ActiveSession {
   readonly adapter: BackendAdapter;
@@ -17987,8 +17990,24 @@ export class SessionHost {
     const reportedCostMicros = nativeSubscriptionValue ? 0 : usage.cost > 0 || native !== undefined || childAccounting?.costComplete !== undefined
       ? Math.round(usage.cost * 1_000_000)
       : undefined;
+    const previousMeasuredAt = store.findUsageObservationMeasuredAt(this.#usageOwnerId, session.descriptor.id, accountingSourceId);
+    const piRequests = backend.adapterKind === "pi" && sourceId === SESSION_RUNTIME_USAGE_SOURCE_ID && native === undefined
+      && usage.pricingContext === undefined
+      ? this.consumePiUsageRequests(store, session.descriptor.id, generation, usage, measuredAt, previousMeasuredAt)
+      : undefined;
     const priced = !canPriceReference ? undefined : modelUsageCostRates(model, priceOverride, usage,
       usage.pricingContext?.requestedAt ?? (runUsageId === undefined ? measuredAt : store.getRun(runUsageId).descriptor.startedAt ?? measuredAt));
+    const currencies = new Set<string>();
+    const referenceRequests: UsageReferenceRequest[] | undefined =
+      canPriceReference && reportedCostMicros === undefined && piRequests?.every(request => request.usage.cost === 0)
+        ? piRequests.map(({ usage: request, emittedAt }) => {
+          const price = modelUsageCostRates(model, priceOverride, request, request.pricingContext?.requestedAt ?? emittedAt);
+          if (price !== undefined) currencies.add(price.currencyCode);
+          return { ...request, costRates: price?.rates, cacheWrite1hTokens: request.pricingContext?.cacheWrite1hTokens };
+        })
+        : undefined;
+    if (referenceRequests !== undefined && priced !== undefined) currencies.add(priced.currencyCode);
+    const requestCurrency = currencies.size === 1 ? [...currencies][0] : undefined;
     const costRates = nativeReferenceRequest && usage.cacheWriteTokens > 0 && usage.pricingContext?.cacheWrite1hTokens === undefined
       ? priced === undefined ? undefined : {
           ...(priced.rates.inputMicrosPerMillion === undefined ? {} : { inputMicrosPerMillion: priced.rates.inputMicrosPerMillion }),
@@ -17997,13 +18016,12 @@ export class SessionHost {
         }
       : priced?.rates;
     const currencyCode = reportedCostMicros === undefined
-      ? priced?.currencyCode ?? model?.pricing?.currencyCode ?? "USD"
+      ? requestCurrency ?? priced?.currencyCode ?? model?.pricing?.currencyCode ?? "USD"
       : "USD";
     const runCurrencyCode = reportedCostMicros !== undefined ? "USD"
-      : priced?.currencyCode;
+      : requestCurrency ?? priced?.currencyCode;
     // Local callbacks are already serialized by this owner. Distinct observations can
     // arrive in one clock tick; retain their order without weakening ledger conflicts.
-    const previousMeasuredAt = store.findUsageObservationMeasuredAt(this.#usageOwnerId, session.descriptor.id, accountingSourceId);
     const orderedMeasuredAt = previousMeasuredAt === undefined ? measuredAt : Math.max(measuredAt, previousMeasuredAt + 1);
     const previousReferenceCounters = nativeSubscriptionValue
       ? store.findUsageObservationCounters(this.#usageOwnerId, session.descriptor.id, accountingSourceId) : undefined;
@@ -18033,6 +18051,7 @@ export class SessionHost {
         ? {}
         : { reportedCostEstimated: true }),
       ...(costRates === undefined ? {} : { costRates }),
+      ...(referenceRequests === undefined || currencies.size > 1 ? {} : { referenceRequests }),
       ...(native === undefined && childAccounting?.costComplete === undefined ? {} : { observedCostComplete: nativeSubscriptionValue
         ? !unpricedReferenceDelta
         : native?.costComplete ?? childAccounting?.costComplete }),
@@ -18068,6 +18087,51 @@ export class SessionHost {
       });
     }
     return result;
+  }
+
+  /** Reconcile live request receipts with the original cumulative accounting cursor. */
+  private consumePiUsageRequests(store: OperationalStore, sessionId: string, generation: number, usage: UsageSnapshot,
+    measuredAt: number, previousMeasuredAt: number | undefined): readonly { usage: UsageSnapshot; emittedAt: number }[] | undefined {
+    const previous = store.findUsageObservationCounters(this.#usageOwnerId, sessionId, SESSION_RUNTIME_USAGE_SOURCE_ID);
+    const saved = store.findSetting<string>("session", sessionId, PI_REQUEST_USAGE_CURSOR_KEY)?.value;
+    const remaining = USAGE_COUNTERS.map(key => previous === undefined || usage[key] < previous[key] ? usage[key] : usage[key] - previous[key]);
+    const complete = () => remaining.every(value => value === 0);
+    if (complete()) {
+      if (previous === undefined && saved === undefined) {
+        store.setSetting("session", sessionId, PI_REQUEST_USAGE_CURSOR_KEY, store.health().globalCursor.toString(), measuredAt);
+      }
+      return undefined;
+    }
+    const afterCursor = saved === undefined ? undefined : BigInt(saved);
+    const query = { sessionId, includeTombstoned: true, messageCompleteOnly: true, limit: 1000,
+      ...(afterCursor === undefined ? { emittedFrom: previousMeasuredAt === undefined ? 0 : previousMeasuredAt + 1 } : {}) };
+    let cursor = afterCursor;
+    const requests: Array<{ usage: UsageSnapshot; emittedAt: number }> = [];
+    // The runtime can be polled between message_end and Pi's native append.
+    // Leave a receipt beyond the observed counters available for the next poll.
+    for (;;) {
+      const events = store.listEvents({ ...query, afterCursor: cursor });
+      let blocked = false;
+      for (const event of events) {
+        const request = "pi" in event && event.pi?.rpcEventType === "message_end" && event.generation === generation
+          && event.payload.type === "message_complete" && event.payload.role === "assistant" ? event.payload.usage : undefined;
+        if (request !== undefined && USAGE_COUNTERS.some(key => request[key] > 0)) {
+          if (USAGE_COUNTERS.some((key, index) => request[key] > remaining[index]!)) {
+            blocked = true;
+            break;
+          }
+          for (const [index, key] of USAGE_COUNTERS.entries()) remaining[index] = remaining[index]! - request[key];
+          requests.push({ usage: request, emittedAt: event.emittedAt });
+        }
+        cursor = event.globalCursor;
+        if (complete()) break;
+      }
+      if (blocked || complete() || events.length < query.limit) break;
+    }
+    if (cursor !== undefined && cursor !== afterCursor) {
+      store.setSetting("session", sessionId, PI_REQUEST_USAGE_CURSOR_KEY, cursor.toString(), measuredAt);
+    }
+    return requests.length === 0 ? undefined : requests;
   }
 
   /**

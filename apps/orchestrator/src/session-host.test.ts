@@ -5596,6 +5596,55 @@ describe("SessionHost", () => {
   });
 
   it.each([
+    { inputs: [200_000], outputs: [1_000], remainderInput: 0, costMicros: 812_000 },
+    { inputs: [100_000, 100_000], outputs: [500, 500], remainderInput: 0, costMicros: 406_000 },
+    { inputs: [200_000], outputs: [1_000], remainderInput: 10_000, costMicros: 832_000 }
+  ])("prices the closed Pi requests $inputs and a residual $remainderInput behind one stats read", async ({ inputs, outputs, remainderInput, costMicros }) => {
+    const { catalogModelReferencePricing } = await import("@joko/core");
+    const adapter = new FakeBackendAdapter({ ...PI_LIKE_PROFILE, models: PI_LIKE_PROFILE.models.map(model => ({
+      ...model, pricing: catalogModelReferencePricing("xai/grok-4.7")
+    })) });
+    const describe = adapter.describe.bind(adapter);
+    vi.spyOn(adapter, "describe").mockImplementation(async () => ({ ...await describe(), adapterKind: "pi" }));
+    let stats: UsageSnapshot = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0, cost: 0 };
+    const inspect = adapter.inspectSession.bind(adapter);
+    vi.spyOn(adapter, "inspectSession").mockImplementation(async (binding, context) => ({
+      ...await inspect(binding, context), usage: stats
+    }));
+    vi.spyOn(adapter, "send").mockImplementation(async (input, context) => {
+      if (input.text === "record requests") {
+        for (const [index, inputTokens] of inputs.entries()) {
+          const outputTokens = outputs[index]!;
+          const totalTokens = inputTokens + outputTokens;
+          const usage = { inputTokens, outputTokens, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens, cost: 0,
+            pricingContext: { inputTokens, requestedAt: Date.UTC(2026, 10, 21), fastMode: false } };
+          await context.emit({ type: "message_complete", role: "assistant", blocks: [], usage }, {
+            namespace: "pi", fields: {}, pi: { rpcEventType: "message_end", payload: { case: "messageLifecycle",
+              value: { kind: "message_end", nativeMessageId: "", nativeEntryId: "", parentEntryId: "", role: "assistant", contentIndex: 0 } } }
+          });
+          stats = { ...stats, inputTokens: stats.inputTokens + inputTokens, outputTokens: stats.outputTokens + outputTokens,
+            totalTokens: stats.totalTokens + totalTokens };
+        }
+        stats = { ...stats, inputTokens: stats.inputTokens + remainderInput, totalTokens: stats.totalTokens + remainderInput };
+      }
+      await context.emit({ type: "done", outcome: "completed" });
+    });
+    const fixture = await createFixture(adapter, { usageMoneyKind: () => "reference-value" });
+    const { sessionId } = (await fixture.host.createSession({
+      operationId: "create-pi-request-prices", connection: fixture.connection, targetId: "target-one", title: "Pi request prices",
+      providerId: "test", modelId: "text", fastMode: false, permissionMode: "ask", planMode: false
+    })).value;
+    for (const text of ["record requests", "read the same counters again"]) {
+      const { runId } = fixture.host.enqueueInput({ operationId: text, connection: fixture.connection, sessionId,
+        prompt: { text, images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+      await eventually(() => fixture.store.getRun(runId).descriptor.state === "completed");
+      expect(fixture.store.listUsageLedger({ ownerId: "orchestrator" })).toEqual([expect.objectContaining({
+        inputTokens: 200_000 + remainderInput, outputTokens: 1_000, totalTokens: 201_000 + remainderInput, costMicros, costComplete: true, estimated: true
+      })]);
+    }
+  });
+
+  it.each([
     { name: "standard at the threshold", requestInput: 272_000, fastMode: false, costMicros: 3_750_000 },
     { name: "fast at the threshold", requestInput: 272_000, fastMode: true, costMicros: 7_500_000 },
     { name: "standard above the threshold", requestInput: 272_001, fastMode: false, costMicros: 7_450_040 },
@@ -5636,18 +5685,21 @@ describe("SessionHost", () => {
 
   it.each([
     { model: "claude-opus-5-5", at: Date.UTC(2026, 9, 29), fastMode: false, cacheWrite1hTokens: 1_000, costMicros: 890_000, complete: true },
-    { model: "claude-opus-5-5", at: Date.UTC(2026, 9, 29), fastMode: false, cacheWrite1hTokens: 1_000, overrideCacheWrite: 10, costMicros: 916_000, complete: true },
+    { model: "claude-opus-5-5", at: Date.UTC(2026, 9, 29), fastMode: false, cacheWrite1hTokens: 1_000, override: { cacheWrite: 10 }, costMicros: 916_000, complete: true },
     { model: "claude-opus-5-5", at: Date.UTC(2026, 9, 29), fastMode: true, cacheWrite1hTokens: 1_000, costMicros: 1_780_000, complete: true },
     { model: "google/gemini-3.8-flash", at: Date.UTC(2026, 11, 31, 23, 59, 59), fastMode: false, costMicros: 169_500, complete: false },
-    { model: "google/gemini-3.8-flash", at: Date.UTC(2027, 0, 1), fastMode: false, costMicros: 339_000, complete: false }
-  ])("records $model tariffs using request time $at and observed cache duration", async testCase => {
+    { model: "google/gemini-3.8-flash", at: Date.UTC(2027, 0, 1), fastMode: false, costMicros: 339_000, complete: false },
+    { model: "openai/gpt-6.2-sol", at: Date.UTC(2026, 10, 17), requestInput: 272_000, fastMode: false, costMicros: 730_000, complete: true },
+    { model: "openai/gpt-6.2-sol", at: Date.UTC(2026, 10, 17), requestInput: 272_001, fastMode: false, costMicros: 1_450_008, complete: true },
+    { model: "openai/gpt-6.2-sol", at: Date.UTC(2026, 10, 17), requestInput: 272_001, fastMode: false, override: { input: 3 }, costMicros: 2_130_012, complete: true }
+  ])("records $model tariffs using request time and observed usage as $costMicros micros", async testCase => {
     const { catalogModelReferencePricing, captureModelPriceReference } = await import("@joko/core");
-    const fixture = await createFixture(new TieredUsageFakeAdapter({ requestInput: 200_000, fastMode: testCase.fastMode,
+    const fixture = await createFixture(new TieredUsageFakeAdapter({ requestInput: testCase.requestInput ?? 200_000, fastMode: testCase.fastMode,
       requestedAt: testCase.at, cacheWrite1hTokens: testCase.cacheWrite1hTokens, pricing: catalogModelReferencePricing(testCase.model) }),
     { usageMoneyKind: () => "reference-value" });
-    if (testCase.overrideCacheWrite !== undefined) fixture.store.upsertModelPriceOverride({
+    if (testCase.override !== undefined) fixture.store.upsertModelPriceOverride({
       ownerId: "orchestrator", backendId: fixture.adapter.id, providerId: "test", modelId: "text",
-      values: { cacheWrite: testCase.overrideCacheWrite },
+      values: testCase.override,
       baseReference: captureModelPriceReference(fixture.store.getBackend(fixture.adapter.id).descriptor.models[0]!, testCase.at)
     });
     const sessionId = (await fixture.host.createSession({ operationId: "create-tariff-usage", connection: fixture.connection,

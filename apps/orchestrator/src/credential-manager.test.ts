@@ -373,6 +373,22 @@ describe("ProviderCatalogManager", () => {
     store.close();
   });
 
+  it("reads the xAI subscription access token without requiring a ChatGPT account ID", async () => {
+    const { credentials, store, now } = await fixture();
+    try {
+      const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi", now: () => now });
+      providers.initialize();
+      await providers.registerNativeAuthProviders([{ provider: { id: "xai", api: "openai-responses", models: [] },
+        displayName: "xAI", kind: "subscription", accountUsageAvailable: true }]);
+      await providers.persistNativeAuth({ providerId: "xai", expectedCatalogGeneration: providers.generation,
+        credential: { type: "oauth", access: "fixture-xai-access", refresh: "fixture-xai-refresh", expires: now + 60_000 } });
+      const identity = providers.describeProviderAccountUsage("xai");
+      expect(identity).toBeDefined();
+      await expect(providers.useProviderAccountUsageCredential(identity!, async credential => ({ ...credential })))
+        .resolves.toEqual({ accessToken: "fixture-xai-access" });
+    } finally { store.close(); }
+  });
+
   it("opens subscription account credentials only inside a generation-fenced callback", async () => {
     const { root, credentials, store, now } = await fixture();
     const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi", now: () => now });
@@ -683,6 +699,54 @@ describe("ProviderCatalogManager", () => {
           }) } }] });
       expect(providers.get("pi", "local").provider.models.find(model => model.id === "small"))
         .toMatchObject({ contextWindow: 8_000, contextWindowMax: 16_000, contextWindowSource: "declared" });
+    } finally { store.close(); }
+  });
+
+  it("reviews only models observed on the original authenticated catalog and commits just the selected rows", async () => {
+    const { store, credentials } = await fixture();
+    const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" });
+    providers.initialize();
+    try {
+      const ticket = credentials.createUploadTicket();
+      credentials.upload(ticket.credentialUploadTicketId, "first-catalog-key");
+      await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId,
+        credentialReferenceId: "review-key", displayName: "Key", kind: "api_key" });
+      const entry = { backendId: "pi", credentialOrigin: "https://catalog.example.test", displayName: "Same name", enabled: true,
+        kind: "custom_endpoint" as const, credentialBindings: { CATALOG_KEY: "review-key" }, supportsLogin: false, supportsLogout: false, supportsRefresh: false,
+        provider: { id: "catalog", baseUrl: "https://catalog.example.test/v1", api: "openai-responses" as const, apiKeyEnv: "CATALOG_KEY",
+          models: [{ id: "manual", name: "Custom route" }] } };
+      await providers.upsert(entry);
+      await providers.upsert({ ...entry, provider: { ...entry.provider, id: "other-catalog", models: [{ id: "a", name: "Another account model" }] } });
+      const refresh = (ids: string[], extra = {}) => providers.discoverProviderModels("pi", "catalog",
+        (async () => Response.json({ data: ids.map(id => ({ id })), ...extra })) as typeof fetch, () => undefined, "review-device");
+      const current = () => providers.get("pi", "catalog").provider.models.map(model => model.id);
+      const confirm = (reviewId: string, modelIds: string[], owner = "review-device") =>
+        providers.confirmModelWithdrawals({ backendId: "pi", providerId: "catalog", reviewId, modelIds }, owner, () => undefined);
+
+      await refresh(["a", "b", "manual"]);
+      expect((await refresh(["b"], { next_cursor: "page-two" })).withdrawalReview).toBeUndefined();
+      const first = (await refresh(["b"])).withdrawalReview!;
+      expect(first).toMatchObject({ providerId: "catalog", backendId: "pi", suspicious: true, models: [{ modelId: "a" }] });
+      expect(current()).toEqual(["a", "b", "manual"]);
+      await expect(confirm(first.reviewId, ["a"], "another-device")).rejects.toThrow(/changed/);
+      await expect(confirm(first.reviewId, ["manual"])).rejects.toThrow(/current withdrawal review/);
+      await refresh(["a", "b"]);
+      await expect(confirm(first.reviewId, ["a"])).rejects.toThrow(/changed/);
+
+      const empty = (await refresh([])).withdrawalReview!;
+      expect(empty).toMatchObject({ suspicious: true, models: [{ modelId: "a" }, { modelId: "b" }] });
+      await credentials.replaceSecret("review-key", "replacement-catalog-key");
+      await expect(confirm(empty.reviewId, ["a"])).rejects.toThrow(/changed/);
+      expect((await refresh(["b"])).withdrawalReview).toBeUndefined();
+      await refresh(["a", "b"]);
+      const next = (await refresh([])).withdrawalReview!;
+      await confirm(next.reviewId, ["a"]);
+      expect(current()).toEqual(["b", "manual"]);
+      expect(providers.get("pi", "other-catalog").provider.models.map(model => model.id)).toEqual(["a"]);
+      await expect(confirm(next.reviewId, ["b"])).rejects.toThrow(/changed/);
+      const reopened = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" });
+      reopened.initialize();
+      expect(reopened.get("pi", "catalog").provider.models.map(model => model.id)).toEqual(["b", "manual"]);
     } finally { store.close(); }
   });
 

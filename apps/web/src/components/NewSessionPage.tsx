@@ -3056,7 +3056,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                   effortEnabled
                   fastEnabled
                   t={t}
-                  onOpen={() => backend === undefined ? undefined : controller.refreshProviderModels(backend.id, undefined, true).catch(() => undefined)}
+                  onOpen={() => backend === undefined ? undefined : controller.refreshProviderModels(backend.id, undefined, true).then(() => undefined, () => undefined)}
                   onConnectSource={() => { window.location.hash = "#/settings/providers"; }}
                   onSelect={async (modelChoice) => {
                     if (modelChoice === undefined) {

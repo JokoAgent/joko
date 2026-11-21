@@ -2326,6 +2326,11 @@ export interface UsageCostRates {
   readonly cacheWrite1hMicrosPerMillion?: number;
 }
 
+export interface UsageReferenceRequest extends UsageTokenTotals {
+  readonly costRates?: UsageCostRates;
+  readonly cacheWrite1hTokens?: number;
+}
+
 export interface RecordUsageObservationInput extends UsageTokenTotals {
   /** Cumulative one-hour subset of cacheWriteTokens, when reported by the source. */
   readonly cacheWrite1hTokens?: number;
@@ -2346,6 +2351,8 @@ export interface RecordUsageObservationInput extends UsageTokenTotals {
   readonly observedCostComplete?: boolean;
   /** Catalog pricing used only for the newly observed token delta. */
   readonly costRates?: UsageCostRates;
+  /** Closed requests included in the estimated delta in this currency. */
+  readonly referenceRequests?: readonly UsageReferenceRequest[];
   readonly currencyCode?: string;
   /** Service-owned Run attribution, committed atomically with the source cursor. */
   readonly runUsage?: { readonly runId: RunId; readonly currencyCode?: string; readonly tokensComplete?: boolean };
