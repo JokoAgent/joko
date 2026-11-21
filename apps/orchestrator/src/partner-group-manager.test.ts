@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PartnerGroupStore, PartnerStore } from "@joko/store";
 import { PartnerGroupManager, type PartnerGroupRuntime } from "./partner-group-manager.js";
+import type { PlanDecision } from "./partner-group-division.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -25,7 +26,7 @@ async function fixture(withPlan = false) {
     stop: async () => true, archive: async () => undefined, hasPendingInteraction: () => false
   };
   const notifyStep = vi.fn(async (): Promise<void> => undefined);
-  const decidePlan = vi.fn(async () => withPlan
+  const decidePlan = vi.fn(async (): Promise<PlanDecision> => withPlan
     ? { needsPlan: true, steps: members.map((member, index) => ({ partnerId: member.id, task: index ? "Review result" : "Write result" })) }
     : { needsPlan: false });
   const manager = new PartnerGroupManager({ storage, partners: { getPartner: id => profiles.getPartner(id), listPartners: () => profiles.listPartners() },
