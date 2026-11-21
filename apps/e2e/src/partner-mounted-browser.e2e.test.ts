@@ -361,6 +361,11 @@ describe("mounted Partner collaboration product chain", () => {
     await dialog.locator(".partner-discovery__name").first().click();
     await dialog.getByRole("heading", { name: "How you work together", exact: true }).waitFor({ state: "visible" });
     expect(await dialog.getByText("Off by default", { exact: true }).count()).toBeGreaterThan(0);
+    for (const tool of ["GitHub", "GitLab", "Notion"]) {
+      const row = dialog.locator(".partner-discovery__module article").filter({ has: page.getByText(tool, { exact: true }) });
+      await row.getByText("Account authorization required to use", { exact: true }).waitFor({ state: "visible" });
+      expect(await row.getByText("Not installed", { exact: true }).count()).toBe(1);
+    }
     expect((await manager.clients.partner.listPartners({})).partners).toHaveLength(0);
     await dialog.getByRole("button", { name: "Close", exact: true }).click();
     await page.goto(`${fixture.baseUrl}/#/settings/appearance`);

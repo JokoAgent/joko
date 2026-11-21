@@ -21,6 +21,16 @@ function fixture(count = 6) {
 }
 
 describe("authority-owned single-speaker groups", () => {
+  it("records a human broadcast without interrupting the speaking queue", () => {
+    const f = fixture(2), source = f.send("Discuss this"), plan = f.store.plans.current(f.room.id)!;
+    const job = f.store.claim(f.room.id, f.ownerId, f.actors[0]!.id)!;
+    const broadcast = f.store.send({ roomId: f.room.id, operationId: "people-only", actorId: f.ownerId, text: "For the people",
+      mentions: [], mentionAll: true, threadRootId: "", quoteId: "", attachments: [] });
+    expect(broadcast.mentions).toEqual([]);
+    expect(f.store.plans.current(f.room.id)).toEqual(plan);
+    expect(f.store.executions(f.room.id)).toMatchObject([{ id: job.id, sourceMessageId: source.id, status: "running" }]);
+  });
+
   it("creates one deterministic queue, automatically finishes five turns, and retains the exact sixth-turn receipt", () => {
     const f = fixture(), source = f.send("Everyone give a view"), initial = f.store.plans.current(f.room.id)!;
     expect(initial).toMatchObject({ kind: "talk", organizerId: "", status: "running", sourceMessageId: source.id });

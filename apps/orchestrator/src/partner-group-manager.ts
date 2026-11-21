@@ -244,12 +244,13 @@ export class PartnerGroupManager {
           authorName: "", content: input.text.trim(), mentions, noticeCode: null, planId: null, files: [], attachments: prepared.attachments });
         if (!appended.created) return appended.message;
         posted = true; await prepared.commit(); await this.#cancelRound(group.id); this.#cancelPlanning(group.id); this.#emit(group.id, "messages");
+        if (!input.division && !mentions.partnerIds.length && (mentions.all || group.replyMode === "mentioned")) return appended.message;
         const available = members.filter(member => this.#available(member));
         for (const id of mentions.partnerIds) {
           const member = members.find(member => member.partnerId === id); if (member && !this.#available(member)) this.#notice(group.id, member, "member-unavailable");
         }
-        const responders = mentions.all ? available.map(member => member.partnerId) : mentions.partnerIds.length
-          ? mentions.partnerIds.filter(id => available.some(member => member.partnerId === id)) : group.replyMode === "all" ? available.map(member => member.partnerId) : [];
+        const responders = mentions.partnerIds.length
+          ? mentions.partnerIds.filter(id => available.some(member => member.partnerId === id)) : available.map(member => member.partnerId);
         const chat = () => this.#startRound(group.id, responders, mentions, group.speakingMode === "auto" && responders.length > 1 && (mentions.all || mentions.partnerIds.length === 0));
         if (mentions.partnerIds.length && !input.division) chat();
         else if (input.division || open?.status === "proposed") this.#startPlanning(group.id, appended.message, input.division ? "forced" : "revise", open, null);

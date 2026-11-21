@@ -8,6 +8,11 @@ import "./partner-discovery.css";
 
 export const partnerDiscoveryTitle = (locale: string): string => locale.startsWith("zh") ? "发现伙伴" : "Discover partners";
 
+const toolNames: Readonly<Record<string, string>> = {
+  art: "Art", github: "GitHub", gitlab: "GitLab", notion: "Notion", "google-drive": "Google Drive", "google-gmail": "Gmail",
+  "google-sheets": "Google Sheets", "opendesign-trial": "OpenDesign", "outlook-mail": "Outlook Mail", "web-search": "Web Search", "x-manager": "X Manager"
+};
+
 export function PartnerDiscoveryDialog({ controller, ownerKey, foreground, onClose, onCreated }: {
   readonly controller: AppController; readonly ownerKey: string; readonly foreground: boolean;
   readonly onClose: () => void; readonly onCreated: (result: PartnerImportResult) => void;
@@ -42,6 +47,12 @@ export function PartnerDiscoveryDialog({ controller, ownerKey, foreground, onClo
     return () => { active = false; read.abort(); };
   }, [api, locale, foreground, revision]);
   const entry = entries?.find(row => row.packageId === selected);
+  const extensions = new Map(controller.state.snapshot.extensions.map(extension => [extension.id, extension]));
+  const toolName = (id: string) => extensions.get(id)?.name ?? toolNames[id] ?? id;
+  const openTool = (id: string) => {
+    onClose();
+    controller.navigate({ kind: "tools", tab: "extensions", ...(extensions.has(id) ? { extensionId: id } : {}) });
+  };
   useLayoutEffect(() => {
     setCompact(false);
     const element = heading.current;
@@ -79,8 +90,10 @@ export function PartnerDiscoveryDialog({ controller, ownerKey, foreground, onClo
   const action = (item: PartnerPackageEntry, primary = false) => <Button tone={primary ? "primary" : undefined} disabled={!foreground || pending !== undefined}
     onClick={() => { if (item.installation?.saved) onCreated(item.installation); else void invite(item); }}>
     {pending === item.packageId ? <Spinner /> : null}{item.installation?.saved ? zh ? "打开伙伴" : "Open partner" : zh ? "邀请加入" : "Invite"}</Button>;
-  const modules = (title: string, rows: readonly { name: string; description: string }[], icon: ReactNode, paused = false) => rows.length > 0 && <section className="partner-discovery__module">
-    <h3>{icon}{title}</h3><div>{rows.map(row => <article key={row.name}><div><strong>{row.name}</strong><p>{row.description}</p></div>{paused && <span>{zh ? "默认关闭" : "Off by default"}</span>}</article>)}</div></section>;
+  const modules = (title: string, rows: readonly { name: string; description: string; optionalToolIds?: readonly string[] }[], icon: ReactNode, paused = false) => rows.length > 0 && <section className="partner-discovery__module">
+    <h3>{icon}{title}</h3><div>{rows.map(row => <article key={row.name}><div><strong>{row.name}</strong><p>{row.description}</p>
+      {!!row.optionalToolIds?.length && <p>{zh ? "可选工具" : "Optional tools"} · {row.optionalToolIds.map(toolName).join(" · ")}</p>}
+    </div>{paused && <span>{zh ? "默认关闭" : "Off by default"}</span>}</article>)}</div></section>;
   const failed = entry?.installation?.checks.filter(check => check.status === PartnerImportCheckStatus.NEEDS_ATTENTION);
   return <Modal open title={partnerDiscoveryTitle(locale)} showClose size="large" className="partner-discovery" onClose={onClose}>
     {error && <p role="alert">{error}<Button disabled={pending !== undefined} onClick={() => refresh(value => value + 1)}>{zh ? "重新加载" : "Reload"}</Button></p>}
@@ -97,9 +110,16 @@ export function PartnerDiscoveryDialog({ controller, ownerKey, foreground, onClo
         <div>{entry.knowledge.map(row => <article key={row.name}><div><strong>{row.name}</strong><p>{row.description}</p></div></article>)}
         {entry.remembers.length > 0 && <article className="partner-discovery__memory"><strong>{zh ? "会记住你的" : "Remembers your"}</strong><ul>{entry.remembers.map(item => <li key={item}>{item}</li>)}</ul></article>}</div></section>}
       {entry.tools.length > 0 && <section className="partner-discovery__module"><h3><Plug aria-hidden="true" />{zh ? "工作工具" : "Work tools"}</h3><div>{entry.tools.map(tool => {
-        const installed = controller.state.snapshot?.extensions.find(extension => extension.id === tool.id && extension.installed);
-        const name = installed?.name ?? ({ "google-gmail": "Gmail", gitlab: "GitLab", "web-search": "Web Search", "opendesign-trial": "OpenDesign", art: "Art", "google-sheets": "Google Sheets" } as Record<string, string>)[tool.id] ?? tool.id;
-        return <article key={tool.id}><div><strong>{name}</strong><p>{tool.purpose}</p></div><span>{installed ? zh ? "已安装" : "Installed" : controller.state.snapshot?.extensionCatalogRecovered ? zh ? "未安装" : "Not installed" : ""}</span></article>;
+        const extension = extensions.get(tool.id);
+        const installed = extension?.installed === true;
+        const needsSetup = extension !== undefined && ((extension.setup.state !== "notRequired" && extension.setup.state !== "ready")
+          || extension.permissions.some(permission => permission.required && !permission.granted));
+        const status = !installed ? zh ? "未安装" : "Not installed" : !extension.enabled ? zh ? "已停用" : "Disabled"
+          : needsSetup ? zh ? "需要设置" : "Setup needed" : zh ? "已安装" : "Installed";
+        return <article key={tool.id}><div><strong>{toolName(tool.id)}</strong><p>{tool.purpose}</p>
+          {tool.requiresUserAuthorization && <p>{zh ? "使用前需授权账号" : "Account authorization required to use"}</p>}
+        </div>{foreground && (extension && (!installed || needsSetup || !extension.enabled)
+          ? <Button tone="ghost" onClick={() => openTool(tool.id)}>{status}</Button> : <span>{status}</span>)}</article>;
       })}</div></section>}
       {modules(zh ? "例行任务" : "Routines", entry.routines, <Repeat2 aria-hidden="true" />, true)}
       {!!failed?.length && <section role="status"><p>{zh ? "以下内容尚未保存完成：" : "These items still need attention:"}</p><ul>{failed.map(check => <li key={check.entryId}>{check.name ?? check.entryId} · {importReasonLabel(check.message, messages)}</li>)}</ul>

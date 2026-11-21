@@ -99,8 +99,17 @@ message GetPartnerImportStatusResponse { PartnerImportResult result = 1; }
 message RetryPartnerImportRequest { string request_id = 1; bool resume_setup = 2; }
 message RetryPartnerImportResponse { PartnerImportResult result = 1; }
 
-message PartnerPackageModule { string name = 1; string description = 2; }
-message PartnerPackageTool { string id = 1; string purpose = 2; }
+message PartnerPackageModule {
+  string name = 1;
+  string description = 2;
+  // The routine may use these tools only after normal extension authorization.
+  repeated string optional_tool_ids = 3;
+}
+message PartnerPackageTool {
+  string id = 1;
+  string purpose = 2;
+  bool requires_user_authorization = 3;
+}
 message PartnerPackageCapability { string icon = 1; string label = 2; }
 message PartnerPackageEntry {
   string package_id = 1;

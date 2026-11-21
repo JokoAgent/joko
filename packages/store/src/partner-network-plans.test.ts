@@ -10,25 +10,71 @@ function fixture() {
   const store = new PartnerNetworkStore(db, () => clock), ownerId = networkHumanId("home"), a = networkPartnerId("home", "writer"), b = networkPartnerId("home", "reviewer");
   const room = store.create({ operationId: "create", singleSpeaker: false, serverId: "home", origin: "https://home.test", name: "Group", displayName: "Owner",
     partners: [{ id: "writer", name: "Writer", description: "Write" }, { id: "reviewer", name: "Reviewer", description: "Review" }] });
-  const send = (text: string, options: { forcePlan?: boolean; mentionAll?: boolean; mentions?: string[]; actorId?: string } = {}) => store.send({ operationId: `send:${++operation}`,
+  const send = (text: string, options: Partial<Parameters<PartnerNetworkStore["send"]>[0]> = {}) => store.send({ operationId: `send:${++operation}`,
     roomId: room.id, actorId: ownerId, text, mentions: [], mentionAll: false, attachments: [], threadRootId: "", quoteId: "", ...options });
   const settle = (actorId: string, values: Partial<NetworkExecutionSettlement> = {}) => { const job = store.claim(room.id, ownerId, actorId)!; expect(job).toBeDefined();
     return store.settle({ roomId: room.id, ownerId, executionId: job.id, lease: job.lease, action: "complete", text: "", failureCode: "", ...values }); };
   const current = () => store.plans.current(room.id)!;
+  const manage = (action: string, value: string, actorId = ownerId) => store.manage({ operationId: `manage:${++operation}`, roomId: room.id, actorId,
+    expectedRevision: store.get(room.id).revision, action, targetId: "", value, throughSequence: 0 });
   const action = (kind: string, plan = current(), position = 0, targetId = "") => store.plans.action({ operationId: `action:${++operation}`, roomId: room.id, actorId: ownerId,
     planId: plan.id, expectedRevision: plan.revision, action: kind, position, targetId, sourceMessageId: "" });
   const propose = () => { const source = send("Produce a result", { forcePlan: true }); settle(a, { decision: { needsPlan: true, steps: [{ actorId: a, task: "Write result" }, { actorId: b, task: "Review result" }, { actorId: a, task: "Revise result" }] } }); return { source, plan: current() }; };
-  return { db, store, room, ownerId, a, b, send, settle, current, action, propose, advance: (ms: number) => { clock += ms; } };
+  return { db, store, room, ownerId, a, b, send, settle, current, manage, action, propose, advance: (ms: number) => { clock += ms; } };
 }
 describe("server-owned interactive work plans", () => {
-  it("decides every unmentioned request before ordinary replies, including @everyone and mentioned-only rooms", () => {
-    const f = fixture(); f.store.manage({ operationId: "mentioned", roomId: f.room.id, actorId: f.ownerId, expectedRevision: f.store.get(f.room.id).revision,
-      action: "reply-mode", targetId: "", value: "mentioned", throughSequence: 0 });
-    f.send("Should everyone help?"); expect(f.store.executions(f.room.id)).toMatchObject([{ kind: "plan-decision", decisionMode: "auto" }]);
-    f.settle(f.a, { decision: { needsPlan: false, steps: [] } }); expect(f.store.executions(f.room.id).filter(job => job.status === "queued")).toEqual([]);
-    f.send("Everyone: produce this", { mentionAll: true }); f.settle(f.a, { decision: { needsPlan: false, steps: [] } });
-    expect(f.store.executions(f.room.id).filter(job => job.status === "queued").map(job => job.actorId).sort()).toEqual([f.a, f.b].sort());
-    f.send("Writer only", { mentions: [f.a] }); expect(f.store.executions(f.room.id).at(-1)?.kind).toBe("reply");
+  it.each(["auto", "sequential"] as const)("keeps quiet sends out of the organizer with %s speaking", speakingMode => {
+    const f = fixture();
+    const people = f.send("Only the people", { mentionAll: true });
+    expect(people.mentions).toEqual([]);
+    f.manage("reply-mode", "mentioned");
+    f.manage("speaking-mode", speakingMode);
+    const quiet = { operationId: "quiet" };
+    const original = f.send("A note", quiet);
+    expect(f.send("A note", quiet)).toEqual(original);
+    expect(f.store.executions(f.room.id)).toEqual([]);
+    expect(f.store.messages(f.room.id).map(message => message.id)).toEqual([people.id, original.id]);
+    expect(() => f.send("A changed note", quiet)).toThrow();
+    expect(() => f.send("All companions", { mentionAllPartners: true })).toThrow(/disabled/);
+    expect(f.store.messages(f.room.id)).toHaveLength(2);
+
+    f.manage("partner-broadcast", "true");
+    const all = f.send("All companions", { mentionAllPartners: true });
+    expect(all.mentions).toEqual([f.a, f.b]);
+    expect(f.store.executions(f.room.id)).toMatchObject([{ kind: "plan-decision", decisionMode: "auto" }]);
+    f.settle(f.a, { decision: { needsPlan: false, steps: [] } });
+    const replies = f.store.executions(f.room.id).filter(job => job.kind === "reply" && job.sourceMessageId === all.id);
+    expect(replies).toHaveLength(2);
+    expect(replies.every(job => job.parallel === (speakingMode === "auto"))).toBe(true);
+    const named = f.send("Writer only", { mentions: [f.a] });
+    expect(f.store.executions(f.room.id).filter(job => job.sourceMessageId === named.id)).toMatchObject([{ kind: "reply", actorId: f.a }]);
+    const forced = f.send("Arrange this with the writer", { forcePlan: true, mentions: [f.a] });
+    expect(f.store.executions(f.room.id).filter(job => job.sourceMessageId === forced.id)).toMatchObject([{ kind: "plan-decision", decisionMode: "forced" }]);
+  });
+  it("routes Thread and quote replies by stored author and never treats a human address as a plan note", () => {
+    const f = fixture(), digest = networkHash("reply-guest");
+    f.store.invite({ operationId: "invite-guest", roomId: f.room.id, actorId: f.ownerId, expectedRevision: f.store.get(f.room.id).revision,
+      digest, reusable: false, lifetimeMs: 60_000 });
+    const guest = f.store.accept({ operationId: "join-guest", linkDigest: digest, homeServerId: "guest", displayName: "Guest", credentialDigest: networkHash("reply-credential") }).memberId;
+    expect(() => f.manage("partner-broadcast", "true", guest)).toThrow();
+    const { plan } = f.propose();
+    const quiet = f.send("For the people", { mentionAll: true });
+    expect(quiet.mentions).toEqual([guest]);
+    f.send("For Guest", { mentions: [guest] });
+    expect(f.current()).toEqual(plan);
+    expect(f.store.executions(f.room.id).filter(job => job.status === "queued")).toEqual([]);
+
+    f.manage("reply-mode", "mentioned");
+    const root = f.store.appendActorMessage({ roomId: f.room.id, ownerId: f.ownerId, actorId: f.b, operationId: "partner-root", text: "Notes from the reviewer" });
+    const thread = f.send("Thread reply", { threadRootId: root.id });
+    expect(thread.mentions).toEqual([f.b]);
+    expect(f.store.executions(f.room.id).filter(job => job.sourceMessageId === thread.id)).toMatchObject([{ kind: "reply", actorId: f.b }]);
+    const quote = f.send("Quoted reply", { quoteId: root.id });
+    expect(quote.mentions).toEqual([f.b]);
+    expect(f.store.executions(f.room.id).filter(job => job.sourceMessageId === quote.id)).toMatchObject([{ kind: "reply", actorId: f.b }]);
+    const humanThread = f.send("Stay in the conversation", { threadRootId: root.id, mentionAll: true });
+    expect(humanThread.mentions).toEqual([guest]);
+    expect(f.store.executions(f.room.id).filter(job => job.sourceMessageId === humanThread.id)).toEqual([]);
   });
   it("validates and merges proposed steps, requires approval, and leaves one open card after revision", () => {
     const f = fixture(), first = f.propose(); expect(f.current().status).toBe("proposed"); expect(f.store.executions(f.room.id).filter(job => job.status === "queued")).toEqual([]);

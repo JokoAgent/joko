@@ -35,16 +35,18 @@ describe("network work-plan controls", () => {
     expect(followUp.textContent).toContain("Reviewer"); await act(async () => { button(followUp, "Continue to next partner").click(); }); expect(action).toHaveBeenLastCalledWith("continue", waiting);
   });
 
-  it("sends explicit arrange mode and @everyone as distinct immutable intent", async () => {
+  it("sends explicit arrange mode and both mention audiences as distinct immutable intent", async () => {
     const rows: wire.PartnerNetworkMessage[] = [], send = vi.fn(async (request: wire.SendPartnerNetworkRequest) => { const message = create(wire.PartnerNetworkMessageSchema, { id: "message", sequence: 1n, createdAtMs: 1n, text: request.text }); rows.push(message); return create(wire.SendPartnerNetworkResponseSchema, { message }); });
-    const api = { getPartnerNetwork: vi.fn(async () => create(wire.GetPartnerNetworkResponseSchema, { snapshot: { room, messages: rows } })), sendPartnerNetwork: send,
+    const broadcastRoom = create(wire.PartnerNetworkRoomSchema, { ...room, allowMentionAllPartners: true });
+    const api = { getPartnerNetwork: vi.fn(async () => create(wire.GetPartnerNetworkResponseSchema, { snapshot: { room: broadcastRoom, messages: rows } })), sendPartnerNetwork: send,
       managePartnerNetwork: vi.fn(async () => create(wire.ManagePartnerNetworkResponseSchema, { room })), getPartnerNetworkOwnerControls: vi.fn(async () => ({ controls: [] })) } as unknown as PartnerNetworkApi;
     const controller = { partnerNetwork: api, state: { effectiveLocale: "en", activeProfile: { id: "profile", deviceId: "browser", serverId: "authority" }, connectionGeneration: 1 },
       listPartners: vi.fn(async () => ({ partners: [] })), navigate: vi.fn() } as unknown as AppController;
     const view = await mount(<PartnerNetworkPage controller={controller} route="network:host:room" t={((key: string) => key) as Translator} onOpenNavigation={() => {}} />);
     await act(async () => { const input = view.querySelector("textarea")!; Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(input, "Produce a report"); input.dispatchEvent(new Event("input", { bubbles: true })); input.dispatchEvent(new Event("change", { bubbles: true })); });
     await act(async () => { button(view, "Arrange work").click(); button(view, "Everyone").click(); });
+    await act(async () => { button(view, "All companions").click(); });
     await act(async () => { button(view, "Send").click(); await settle(); }); expect(send).toHaveBeenCalledOnce();
-    expect(send.mock.calls[0]?.[0]).toMatchObject({ forcePlan: true, mentionAll: true, mentions: [], text: "Produce a report @Everyone " });
+    expect(send.mock.calls[0]?.[0]).toMatchObject({ forcePlan: true, mentionAll: true, mentionAllPartners: true, mentions: [], text: "Produce a report @Everyone @All companions " });
   });
 });

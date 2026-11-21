@@ -20,9 +20,9 @@ export function partnerOpeningGreeting(welcome: string): string {
 }
 export interface PartnerPackageSkill { name: string; description: string }
 export interface PartnerPackageReference { title: string; summary: string }
-export interface PartnerPackageTool { id: string; purpose: string }
+export interface PartnerPackageTool { id: string; purpose: string; requiresUserAuthorization: boolean }
 /** `cron` is the package's example expression; its timezone is deliberately dropped. */
-export interface PartnerPackageRoutine { name: string; summary: string; cron?: string }
+export interface PartnerPackageRoutine { name: string; summary: string; optionalToolIds: readonly string[]; cron?: string }
 export type PartnerPackageLocale = 'en' | 'ja' | 'ko' | 'zh-TW';
 /** The language-dependent fields of a catalog entry: the entry holds them in Simplified Chinese, `locales` in the others. */
 export interface PartnerPackageCopy {

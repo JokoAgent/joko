@@ -19,7 +19,7 @@ export function networkRoom(room: NetworkRoom, selfId: string, joinId = ""): con
     revision: BigInt(room.revision), state: room.state, members: room.members.map(networkActor), latestSequence: BigInt(room.latestSequence),
     readSequence: BigInt(self?.readSequence ?? 0), selfId, joinId, replyMode: room.replyMode, speakingMode: room.speakingMode,
     removedFromList: self?.removedFromList ?? false, availability: self?.state === "joined" ? "available" : "denied", updatedAtMs: BigInt(room.updatedAt), unread: self !== undefined && self.unreadSequence > self.readSequence,
-    organizerId: room.organizerId ?? "", singleSpeaker: room.singleSpeaker === true });
+    organizerId: room.organizerId ?? "", singleSpeaker: room.singleSpeaker === true, allowMentionAllPartners: room.allowMentionAllPartners === true });
 }
 function networkActor(actor: NetworkActor): contract.PartnerNetworkActor {
   return create(contract.PartnerNetworkActorSchema, { id: actor.id, kind: actor.kind, name: actor.name, ownerId: actor.ownerId,
@@ -153,6 +153,7 @@ export class PartnerNetworkHost {
   send(request: contract.SendPartnerNetworkRequest, actorId: string): contract.PartnerNetworkMessage {
     return networkMessage(this.storage.send({ operationId: request.operationId, roomId: request.roomId, actorId, text: request.text,
       mentions: request.mentions, mentionAll: request.mentionAll, threadRootId: request.threadRootId, quoteId: request.quoteId, forcePlan: request.forcePlan,
+      ...(request.mentionAllPartners ? { mentionAllPartners: true } : {}),
       attachments: request.attachments.map(attachment => ({ id: attachment.id, name: attachment.name, mediaType: attachment.mediaType, sizeBytes: networkInteger(attachment.sizeBytes) })) }));
   }
   manage(request: contract.ManagePartnerNetworkRequest, actorId: string, local: boolean): contract.PartnerNetworkRoom {

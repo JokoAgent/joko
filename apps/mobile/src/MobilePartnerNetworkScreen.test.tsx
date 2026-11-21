@@ -65,6 +65,17 @@ it("keeps owner settings reachable and hides last-owner leave until transfer or 
   expect(document.querySelector('[role="dialog"]')?.textContent).toContain("Invite my companion"); expect(Array.from(document.querySelectorAll("button")).some(button => button.textContent === "Leave group")).toBe(false);
   await fill("Renamed", "Group name"); await click("Save"); expect(f.manage).toHaveBeenCalledWith(expect.objectContaining({ action: "rename", value: "Renamed", roomId: "room", expectedRevision: 1n }), expect.anything());
 });
+it("uses the same people and companion audiences on native sends and retries", async () => {
+  const f = fixture(); f.room.allowMentionAllPartners = true;
+  f.send.mockRejectedValueOnce(new ConnectError("reply lost", Code.Unavailable));
+  await mount(f); await click("Shared room"); await click("@Everyone"); await click("@All companions"); await click("Send");
+  const original = f.send.mock.calls[0]![0];
+  expect(original).toMatchObject({ mentionAll: true, mentionAllPartners: true, mentions: [] });
+  await click("Retry");
+  expect(f.send.mock.calls[1]![0]).toEqual(original);
+  await click("Group settings"); await click("Allow mentioning all companions");
+  expect(f.manage).toHaveBeenCalledWith(expect.objectContaining({ action: "partner-broadcast", value: "false" }), expect.anything());
+});
 it("opens files using only a current short-lived download URL and never hands a membership bearer to the system", async () => {
   const f = fixture(); f.rows.push(create(contract.PartnerNetworkMessageSchema, { id: "file-message", authorId: "partner", text: "A document", sequence: 1n, attachments: [{ id: "file", name: "report.txt", mediaType: "text/plain", sizeBytes: 12n }] }));
   await mount(f); await click("Shared room"); await click("report.txt"); expect(f.media).toHaveBeenCalledWith(expect.objectContaining({ action: "authorize", mediaId: "file" }), expect.anything());

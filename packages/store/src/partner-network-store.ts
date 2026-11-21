@@ -14,7 +14,7 @@ export interface NetworkRoom {
   format: 1; id: string; name: string; hostServerId: string; hostOrigin: string; revision: number;
   state: "active" | "archived" | "dissolved"; members: NetworkActor[]; latestSequence: number;
   replyMode: "all" | "mentioned"; speakingMode: "auto" | "sequential"; updatedAt: number; organizerId?: string;
-  singleSpeaker?: boolean;
+  singleSpeaker?: boolean; allowMentionAllPartners?: boolean;
 }
 export interface NetworkAttachment { id: string; name: string; mediaType: string; sizeBytes: number; }
 export interface NetworkTaskCard {
@@ -208,6 +208,11 @@ export class PartnerNetworkStore {
           if (!link) throw new PartnerNetworkStoreError("not_found"); this.#put("host", `link:${link.digest}`, { ...link, state: "revoked" }); break; }
         case "reply-mode": if (room.singleSpeaker || !["all", "mentioned"].includes(input.value)) throw new PartnerNetworkStoreError("invalid"); room.replyMode = input.value as NetworkRoom["replyMode"]; break;
         case "speaking-mode": if (room.singleSpeaker || !["auto", "sequential"].includes(input.value)) throw new PartnerNetworkStoreError("invalid"); room.speakingMode = input.value as NetworkRoom["speakingMode"]; break;
+        case "partner-broadcast":
+          if (actor.role !== "owner") throw new PartnerNetworkStoreError("denied");
+          this.#active(room);
+          if (input.value !== "true" && input.value !== "false") throw new PartnerNetworkStoreError("invalid");
+          room.allowMentionAllPartners = input.value === "true"; break;
         case "organizer": if (room.singleSpeaker || input.value && !room.members.some(member => member.id === input.value && member.kind === "partner" && member.state === "joined")) throw new PartnerNetworkStoreError("denied"); room.organizerId = input.value; break;
         case "stop": {
           if (!room.singleSpeaker) { this.plans.stop(room.id); this.#cancel(room.id); break; }
@@ -268,24 +273,38 @@ export class PartnerNetworkStore {
     for (const actor of room.members) if (actor.kind === "human" && actor.state === "joined" && actor.id !== value.authorId) actor.unreadSequence = value.sequence;
     this.#put(room.id, `message:${value.id}`, value); return value;
   }
-  send(input: { operationId: string; roomId: string; actorId: string; text: string; mentions: readonly string[]; mentionAll: boolean; threadRootId: string; quoteId: string; attachments: readonly NetworkAttachment[]; forcePlan?: boolean }): NetworkMessage {
+  send(input: { operationId: string; roomId: string; actorId: string; text: string; mentions: readonly string[]; mentionAll: boolean; mentionAllPartners?: boolean; threadRootId: string; quoteId: string; attachments: readonly NetworkAttachment[]; forcePlan?: boolean }): NetworkMessage {
     this.assertJoined(input.roomId, input.actorId);
     return this.operation(input.roomId, input.actorId, input.operationId, input, () => {
       const { room, actor } = this.assertJoined(input.roomId, input.actorId); this.#active(room);
       const text = networkText(input.text, 8_000, true); if (!text.trim() && !input.attachments.length || input.attachments.length > 20) throw new PartnerNetworkStoreError("invalid");
-      if (input.mentions.length > 100 || input.mentions.some(id => !room.members.some(member => member.id === id && member.state === "joined"))) throw new PartnerNetworkStoreError("changed", "A mentioned member has left. Edit the message before sending.");
-      const mentions = [...new Set([...input.mentions, ...input.mentionAll ? room.members.filter(member => member.state === "joined").map(member => member.id) : []])].filter(id => id !== actor.id);
-      if (input.threadRootId) { const root = this.message(room.id, input.threadRootId); if (root.deleted || root.threadRootId) throw new PartnerNetworkStoreError("invalid"); }
-      if (input.quoteId) { const quote = this.message(room.id, input.quoteId); if (quote.deleted || quote.threadRootId) throw new PartnerNetworkStoreError("changed", "The quoted message is unavailable."); }
+      const joined = room.members.filter(member => member.state === "joined");
+      if (input.mentions.length > 100 || input.mentions.some(id => !joined.some(member => member.id === id))) throw new PartnerNetworkStoreError("changed", "A mentioned member has left. Edit the message before sending.");
+      if (input.mentionAllPartners && !room.allowMentionAllPartners) throw new PartnerNetworkStoreError("invalid", "Mentioning all companions is disabled in this group.");
+      const root = input.threadRootId ? this.message(room.id, input.threadRootId) : undefined;
+      if (root && (root.deleted || root.threadRootId || input.forcePlan)) throw new PartnerNetworkStoreError("invalid");
+      const quote = input.quoteId ? this.message(room.id, input.quoteId) : undefined;
+      if (quote && (quote.deleted || quote.threadRootId)) throw new PartnerNetworkStoreError("changed", "The quoted message is unavailable.");
+      const reply = root ?? quote;
+      const broadcast = input.mentionAll || input.mentionAllPartners === true;
+      const replyTo = !broadcast && reply && (!reply.kind || reply.kind === "message")
+        ? joined.find(member => member.kind === "partner" && member.id === reply.authorId) : undefined;
+      const named = [...input.mentions, ...(replyTo ? [replyTo.id] : [])];
+      const audience = joined.filter(member => member.kind === "human" ? input.mentionAll : input.mentionAllPartners === true);
+      const mentions = [...new Set([...named, ...audience.map(member => member.id)])].filter(id => id !== actor.id);
       for (const attachment of input.attachments) {
         const saved = this.#get<{ actorId: string; attachment: NetworkAttachment; complete: boolean }>(room.id, `media:${networkIdentity(attachment.id)}`);
         if (!saved?.complete || saved.actorId !== actor.id || networkHash(saved.attachment) !== networkHash(attachment)) throw new PartnerNetworkStoreError("denied");
       }
-      const message = this.#append(room, { authorId: actor.id, authorName: actor.nickname || actor.name, text, mentions, mentionAll: input.mentionAll,
+      const message = this.#append(room, { authorId: actor.id, authorName: actor.nickname || actor.name, text, mentions, mentionAll: input.mentionAllPartners === true,
         threadRootId: input.threadRootId, quoteId: input.quoteId, attachments: [...input.attachments] });
-      const specific = input.mentions.some(id => room.members.some(member => member.id === id && member.kind === "partner"));
-      if (room.singleSpeaker) this.#singleSpeakerSend(room, actor, message);
-      else if (!this.plans.onSend(room, actor.id, message, input.forcePlan === true, specific)) {
+      const specific = named.some(id => id !== actor.id && joined.some(member => member.id === id && member.kind === "partner"));
+      const directed = named.length > 0 || broadcast;
+      const mayReply = specific || input.mentionAllPartners === true || (!directed && room.replyMode === "all");
+      if (room.singleSpeaker) {
+        if (mayReply) this.#singleSpeakerSend(room, actor, message);
+      } else if ((mayReply || input.forcePlan === true)
+        && !this.plans.onSend(room, actor, message, { force: input.forcePlan === true, specific, directed })) {
         this.#cancel(room.id, undefined, false, message.threadRootId); this.#queue(room, actor.id, message, message.id);
       }
       this.#save(room); return message;
