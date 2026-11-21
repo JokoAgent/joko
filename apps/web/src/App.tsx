@@ -3041,7 +3041,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           controller.navigate({ kind: "session", sessionId });
         }}
       />
-      {controller.taskCopy && taskCopyRequest?.owner === controller.taskCopy.owner && <TaskCopyDialog
+      {controller.taskCopy && taskCopyRequest && taskCopyRequest.owner === controller.taskCopy.owner && <TaskCopyDialog
         key={JSON.stringify([taskCopyRequest.owner, taskCopyRequest.session.id, taskCopyRequest.session.generation.toString()])}
         api={controller.taskCopy}
         session={taskCopyRequest.session}

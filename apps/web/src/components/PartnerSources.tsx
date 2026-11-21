@@ -21,7 +21,7 @@ function PartnerSourceSection({ controller, source, t }: { readonly controller: 
   const [pending, setPending] = useState<string>();
   const [failure, setFailure] = useState<{ readonly owner: string; readonly message: string }>();
   const rows = source.rows.filter(row => row.lifecycle === "active" || row.lifecycle === "paused");
-  const dragProfile = source.status === "online" ? controller.state.profiles.find(profile => partnerSourceKey(profile) === source.key) : undefined;
+  const dragProfile = source.status === "online" ? controller.state.profiles?.find(profile => partnerSourceKey(profile) === source.key) : undefined;
   const open = async (id: string, destination: "session" | "settings" | "preparation"): Promise<void> => {
     if (!controller.openSourcePartner || pending !== undefined) return;
     setPending(id); setFailure(undefined);
