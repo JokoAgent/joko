@@ -3316,18 +3316,21 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async readFailedInputModel(sessionId: string, generation: bigint, input: import("./model.js").FailedInputIdentity):
-    Promise<import("./usage-limit-recovery.js").FailedInputModel | undefined> {
+    Promise<import("./usage-limit-recovery.js").FailedInputModelRead | undefined> {
     if (this.#taskSharing !== undefined) return undefined;
     const scope = this.captureActionScope();
     const session = this.#snapshot?.sessions.find(item => item.id === sessionId);
-    if (session?.generation !== generation || session.backendId !== input.backendId || session.targetId !== input.targetId) return undefined;
+    if (session?.backendId !== input.backendId || session.targetId !== input.targetId) return undefined;
+    const changedRuntime = (currentGeneration: bigint) => session.backendId === "pi" && currentGeneration > generation
+      ? { kind: "runtimeChanged" } as const : undefined;
+    if (session.generation !== generation) return changedRuntime(session.generation);
     const { operation } = await createClient(OperationService, scope.transport).getOperation(
       { operationId: input.operationId }, { signal: scope.signal, timeoutMs: 5_000 }
     );
     scope.signal.throwIfAborted();
     const current = this.#snapshot?.sessions.find(item => item.id === sessionId);
-    if (current?.generation !== generation || current.backendId !== session.backendId
-      || current.targetId !== session.targetId || this.#transport !== scope.transport) return undefined;
+    if (current?.backendId !== session.backendId || current.targetId !== session.targetId || this.#transport !== scope.transport) return undefined;
+    if (current.generation !== generation) return changedRuntime(current.generation);
     const mutation = operation?.mutation?.payload;
     const receipt = operation?.result?.payload;
     if (operation?.operationId !== input.operationId || operation.state !== OperationState.SUCCEEDED

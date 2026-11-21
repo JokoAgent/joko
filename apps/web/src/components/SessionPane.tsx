@@ -28,7 +28,7 @@ import {
 import { appRouteHash, type AppController, type AppRoute } from "../controller.js";
 import { modelPreferenceOwnerId } from "../model-picker-preferences.js";
 import { isRoutableConversationModel } from "../model-capabilities.js";
-import type { ArtifactReferenceCatalogItemView, AttachmentDraft, NativeNavigationTargetView, BackendView, ComposerDraft, ComposerSelectionQuoteDraft, ErrorView, ExtensionStatusView, ExtensionWidgetView, ExtraDirectoryView, InteractionView, ModelView, PendingMessageEdit, PermissionMode, QueueControlView, QueueItemView, ResourceView, RuntimeCommandView, SessionResourceView, SessionView, SubagentRunDetailView, SubagentRunView, TargetView, TimelineItemView, UsageTokensView, WorkspaceRewindPreviewView, WorkspaceView } from "../model.js";
+import type { ArtifactReferenceCatalogItemView, AttachmentDraft, NativeNavigationTargetView, BackendView, ComposerDraft, ComposerSelectionQuoteDraft, ErrorView, ExtensionStatusView, ExtensionWidgetView, ExtraDirectoryView, FailedInputIdentity, InteractionView, ModelView, PendingMessageEdit, PermissionMode, QueueControlView, QueueItemView, ResourceView, RuntimeCommandView, SessionResourceView, SessionView, SubagentRunDetailView, SubagentRunView, TargetView, TimelineItemView, UsageTokensView, WorkspaceRewindPreviewView, WorkspaceView } from "../model.js";
 import { appendQuoteToComposerDocument, composerDocumentFromEditedEncodedMessage, composerDocumentFromMessage, composerDocumentPlainText, plainTextToComposerDocument } from "../composer-quote-document.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, Pill, StatusDot, cx, CheckboxControl } from "./ui.js";
@@ -58,7 +58,7 @@ import { RecoveryActionSingleFlight, executableRecoveryActions, nextPermissionMo
 import { SessionScopedRequestGuard, type SessionScopedRequest } from "./compact-request-behavior.js";
 import { hasContextToCompact, resolveActiveCompaction } from "./compaction-status-behavior.js";
 import { hasPendingComposerQueueItems, pauseQueueThenAbort, pauseQueueThenAbortRetry, resolveComposerAttachmentPolicy } from "./composer-behavior.js";
-import { ErrorTailLocalProjectionStore, explicitErrorAttentionCursor, findFailedInputUsageLimit, resolveErrorTail } from "./error-tail-behavior.js";
+import { ErrorTailLocalProjectionStore, explicitErrorAttentionCursor, findFailedInputUsageLimit, hasErrorTailQueueContinuation, resolveErrorTail } from "./error-tail-behavior.js";
 import { hidesFromTimelineHistory, resolveActiveRetry, resolveRetryEscapeIntent, resolveRetryStopAction, type RetryEscapeInput, type RetryEscapeTarget } from "./retry-status-behavior.js";
 import { projectRuntimeRecoveryTimeline } from "../runtime-recovery.js";
 import { timelineHistoryOwnerKey } from "../timeline-history-cache.js";
@@ -396,7 +396,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     timelineRootRef.current = root;
   }, []);
   const getTimelineRoot = useCallback((): HTMLDivElement | null => timelineRootRef.current, []);
-  const artifactCatalogDocumentEpochRef = useRef(0);
+  const paneDocumentEpochRef = useRef(0);
   const [artifactCatalogDocumentOwner, setArtifactCatalogDocumentOwner] = useState<{
     readonly document: Document;
     readonly epoch: number;
@@ -414,13 +414,13 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     setConversationCopyFeedback(undefined);
     setMessageRewind(undefined);
     setRewindPreview(undefined);
-    artifactCatalogDocumentEpochRef.current += 1;
+    paneDocumentEpochRef.current += 1;
     if (document === undefined) {
       rewindDocumentRef.current = undefined;
       setArtifactCatalogDocumentOwner(undefined);
       return;
     }
-    setArtifactCatalogDocumentOwner({ document, epoch: artifactCatalogDocumentEpochRef.current });
+    setArtifactCatalogDocumentOwner({ document, epoch: paneDocumentEpochRef.current });
     const retire = () => {
       rewindEpochRef.current += 1;
       rewindDraftContinuationOwnerRef.current = undefined;
@@ -428,14 +428,14 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       conversationCopyFlightRef.current?.abort.abort();
       conversationCopyFlightRef.current = undefined;
       setConversationCopyFeedback(undefined);
-      artifactCatalogDocumentEpochRef.current += 1;
+      paneDocumentEpochRef.current += 1;
       setMessageRewind(undefined);
       setRewindPreview(undefined);
       setArtifactCatalogDocumentOwner(undefined);
     };
     const restore = () => {
-      artifactCatalogDocumentEpochRef.current += 1;
-      setArtifactCatalogDocumentOwner({ document, epoch: artifactCatalogDocumentEpochRef.current });
+      paneDocumentEpochRef.current += 1;
+      setArtifactCatalogDocumentOwner({ document, epoch: paneDocumentEpochRef.current });
     };
     document.defaultView?.addEventListener("pagehide", retire);
     document.defaultView?.addEventListener("pageshow", restore);
@@ -460,7 +460,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     setRewindDraftContinuation(undefined);
   }, [session.id, controller.navigateSessionBranch, controller.state.navigationRevision, controller.state.connectionGeneration]);
   const captureTaskActionSource = (
-    matchesRoute: (route: AppRoute) => boolean = (route) => sessionRouteIsCurrent(route, session.id)
+    matchesRoute: (route: AppRoute) => boolean = (route) => sessionRouteIsCurrent(route, session.id),
+    scope: "runtime" | "task" = "runtime"
   ): (() => boolean) => {
     const sourceState = controllerRef.current.state;
     const sourceProfileId = sourceState.activeProfile?.id;
@@ -472,10 +473,14 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     const sourceSessionId = session.id;
     const sourceSessionGeneration = session.generation;
     const sourceEpoch = rewindEpochRef.current;
+    const documentEpoch = paneDocumentEpochRef.current;
     const sourceResourceOwner = timelineResourceOwnerRef.current;
     return () => {
       const current = controllerRef.current.state;
-      return rewindEpochRef.current === sourceEpoch
+      const epochIsCurrent = scope === "task" ? paneDocumentEpochRef.current === documentEpoch
+        : rewindEpochRef.current === sourceEpoch
+          && current.snapshot.sessions.find((candidate) => candidate.id === sourceSessionId)?.generation === sourceSessionGeneration;
+      return epochIsCurrent
         && sourceResourceOwner !== undefined
         && timelineResourceOwnerRef.current === sourceResourceOwner
         && current.connectionState === "connected"
@@ -486,7 +491,6 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         && current.snapshot.generation === sourceSnapshotGeneration
         && current.navigationRevision === sourceNavigationRevision
         && activeSessionIdRef.current === sourceSessionId
-        && current.snapshot.sessions.find((candidate) => candidate.id === sourceSessionId)?.generation === sourceSessionGeneration
         && matchesRoute(current.route);
     };
   };
@@ -495,13 +499,13 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     derivedTaskActionRef.current = occurrence;
     return { isCurrent: () => derivedTaskActionRef.current === occurrence && isSourceCurrent() };
   };
-  const capturePaneMessageAction = (allowSplitPane: boolean): (() => boolean) => {
+  const capturePaneMessageAction = (allowSplitPane: boolean, scope: "runtime" | "task" = "runtime"): (() => boolean) => {
     const pane = paneRef.current;
     const view = pane?.ownerDocument.defaultView;
     const locationHash = view?.location.hash;
     const routeHash = appRouteHash(controllerRef.current.state.route);
     const isSourceCurrent = captureTaskActionSource((route) => appRouteHash(route) === routeHash
-      && (sessionRouteIsCurrent(route, session.id) || allowSplitPane && route.kind === "session"));
+      && (sessionRouteIsCurrent(route, session.id) || allowSplitPane && route.kind === "session"), scope);
     return () => {
       const current = controllerRef.current.state.snapshot.sessions.find((candidate) => candidate.id === session.id);
       return pane?.isConnected === true && paneRef.current === pane && view?.location.hash === locationHash && isSourceCurrent()
@@ -981,6 +985,12 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const usageLimitSource = errorTailUsageLimitRecovery === null ? historyUsageLimitRecovery?.item : errorTailProjection?.item;
   const usageLimitSourceRef = useRef(usageLimitSource);
   usageLimitSourceRef.current = usageLimitSource;
+  const [pendingUsageLimitRecovery, setPendingUsageLimitRecovery] = useState<{
+    readonly itemId: string;
+    readonly input: FailedInputIdentity;
+    readonly previousGeneration: bigint;
+    readonly isOwnerCurrent: () => boolean;
+  }>();
   const stopAllBackgroundTasks = (): void => {
     if (!canStopBackgroundTasks || backgroundStopping || backgroundTaskIds.length === 0) return;
     const taskIds = [...backgroundTaskIds];
@@ -1386,7 +1396,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     });
   };
 
-  const scheduleUsageLimitRecovery = (item: TimelineItemView, hint: UsageLimitRecoveryHint): void => {
+  const scheduleUsageLimitRecovery = (item: TimelineItemView, hint: UsageLimitRecoveryHint, retryOwner?: () => boolean): void => {
     if (usageLimitSourceRef.current?.id !== item.id || guest || reviewReadOnly) return;
     const error = item.error;
     if (error === undefined) return;
@@ -1411,17 +1421,43 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     const input = item.failedInput;
     const read = controller.readFailedInputModel;
     if (input === undefined || read === undefined) {
-      openDraft(item.runId === undefined || providerGroupUsage !== undefined ? { kind: "inherited" } : undefined);
+      if (retryOwner === undefined) openDraft(item.runId === undefined || providerGroupUsage !== undefined ? { kind: "inherited" } : undefined);
       return;
     }
-    const source = beginDerivedTaskAction(capturePaneMessageAction(true));
-    if (!source.isCurrent()) return;
+    const isBindingCurrent = capturePaneMessageAction(true);
+    const canRetry = retryOwner === undefined && session.backendId === "pi";
+    const isOwnerCurrent = retryOwner ?? beginDerivedTaskAction(canRetry ? capturePaneMessageAction(true, "task") : isBindingCurrent).isCurrent;
+    if (!isBindingCurrent() || !isOwnerCurrent()) return;
     runAction(`schedule-recovery:${input.runId}`, async () => {
       const selection = await read(session.id, session.generation, input).catch(() => undefined);
-      if (!source.isCurrent() || usageLimitSourceRef.current?.id !== item.id) return;
-      openDraft(selection);
+      if (!isOwnerCurrent()) return;
+      if (selection?.kind !== "runtimeChanged" && isBindingCurrent()) {
+        if (usageLimitSourceRef.current?.id === item.id) openDraft(selection);
+        return;
+      }
+      if (!canRetry) return;
+      // Cold Pi attach replaces the runtime while the read is in flight. Wait
+      // for the current history and read the original Operation again.
+      const current = controllerRef.current.state.snapshot.sessions.find(candidate => candidate.id === session.id);
+      if (selection?.kind === "runtimeChanged" || current !== undefined && current.generation > session.generation) {
+        setPendingUsageLimitRecovery({ itemId: item.id, input, previousGeneration: session.generation, isOwnerCurrent });
+      }
     });
   };
+  useEffect(() => {
+    if (pendingUsageLimitRecovery === undefined) return;
+    const { itemId, input, previousGeneration, isOwnerCurrent } = pendingUsageLimitRecovery;
+    const canRecover = isOwnerCurrent() && !guest && !reviewReadOnly && !session.archived && !running
+      && !hasErrorTailQueueContinuation(queue, session.id);
+    if (canRecover && (session.generation <= previousGeneration || timelineHistoryLoading)) return;
+    setPendingUsageLimitRecovery(undefined);
+    if (!canRecover || timelineHistoryError !== undefined || usageLimitSource?.id !== itemId) return;
+    const current = usageLimitSource.failedInput;
+    const hint = errorTailUsageLimitRecovery ?? historyUsageLimitRecovery?.hint;
+    if (current?.operationId !== input.operationId || current.queueItemId !== input.queueItemId || current.runId !== input.runId
+      || current.backendId !== input.backendId || current.targetId !== input.targetId || hint === undefined) return;
+    scheduleUsageLimitRecovery(usageLimitSource, hint, isOwnerCurrent);
+  });
 
   const setCompactConfirmation = (value: typeof compactConfirmation): void => {
     compactConfirmationRef.current = value;
@@ -2168,7 +2204,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     let preparedRevision: number | undefined;
     let draftFailed = false;
     const sourcePane = paneRef.current;
-    const sourceDocumentEpoch = artifactCatalogDocumentEpochRef.current;
+    const sourceDocumentEpoch = paneDocumentEpochRef.current;
     const sourceDraftEpoch = composerLocalDraftEpochRef.current;
     const sourceState = controllerRef.current.state;
     const sourceProfile = sourceState.activeProfile;
@@ -2190,7 +2226,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         const state = controllerRef.current.state;
         const task = state.snapshot.sessions.find(candidate => candidate.id === rewind.sessionId);
         return rewindDraftContinuationOwnerRef.current === owner && paneRef.current === sourcePane && sourcePane?.isConnected === true
-          && artifactCatalogDocumentEpochRef.current === sourceDocumentEpoch && composerLocalDraftEpochRef.current === sourceDraftEpoch
+          && paneDocumentEpochRef.current === sourceDocumentEpoch && composerLocalDraftEpochRef.current === sourceDraftEpoch
           && activeSessionIdRef.current === rewind.sessionId && task !== undefined && task.backendId === session.backendId && task.targetId === session.targetId
           && state.connectionState === "connected" && state.connectionGeneration === sourceState.connectionGeneration
           && state.sessionAccess?.role !== "guest" && state.taskSource?.kind !== "joined"
