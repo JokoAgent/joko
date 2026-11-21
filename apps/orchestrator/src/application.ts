@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { publicConnectionCapabilities } from './connection-entries.js';
-import { ManagedProviderProxy } from "./managed-provider-proxy.js";
+import { assertManagedProviderOwner, ManagedProviderProxy } from "./managed-provider-proxy.js";
 import { answerDeliveryPrompt } from "./answer-delivery-prompt.js";
 import { createHostedAgentAutoReviewer } from "./hosted-agent-auto-review.js";
 import { richAnswerText } from "@joko/contracts";
@@ -1614,12 +1614,7 @@ export async function createOrchestratorApplication(
     assertOwner: (owner) => {
       const session = store.getSession(owner.sessionId).descriptor;
       const target = store.getTarget(owner.targetId).descriptor;
-      const instance = backendInstances.get(owner.backendId);
-      if (session.deletedAt !== undefined || session.targetId !== owner.targetId || session.backendId !== owner.backendId
-        || session.binding.generation !== owner.sessionGeneration || target.backendId !== owner.backendId
-        || instance.state !== "available" || instance.generation !== owner.backendInstanceGeneration) {
-        throw new Error("Managed Provider operation owner is no longer current.");
-      }
+      assertManagedProviderOwner(owner, session, target, backendInstances.get(owner.backendId));
     }
   });
   await managedProviderProxy.start();
@@ -2252,6 +2247,10 @@ export async function createOrchestratorApplication(
   providerGroups = new ProviderGroupRuntime({ store, registry: backendInstances, sources: hostedAgentSources, nodeId: serverId,
     nodeName: () => hostname().trim() || "This computer", sessions: sessionHost.providerGroupSessionPort(),
     ownerGeneration: () => { if (closed) throw new Error("Provider groups have closed."); return providerGroupOwnerGeneration; },
+    taskModelEnabled: (backendId, providerId, modelId) =>
+      store.findSetting<{ readonly enabled?: boolean }>("service", "orchestrator", `settings.backend.${backendId}`)?.value.enabled !== false
+      && modelRoutingEnabled(store, backendId, providerId, modelId) && configuredProviderRouteEnabled(backendId, providerId)
+      && hostedAgentSources?.modelAvailable(backendId, providerId, modelId) !== false,
     activeTurns: (backendId, providerId) => sessionHost.activeProviderTurns(backendId, providerId) + hostedAgents.endpoint.activeProviderTurns(backendId, providerId),
     assertRemoteAllowed: key => { if (!hostedAgents.settings.providerEnabled(key.backendId, key.providerId)) throw new Error("Remote Provider use is disabled."); },
     sharing: providerSharing.directory, ownedRecipients: key => providerSharing!.host.ownedRecipients(key.backendId, key.providerId),

@@ -1,4 +1,5 @@
 import type { JSONContent } from "@tiptap/core";
+import type { ListTaskModelGroupsResponse, PreviewTaskModelGroupResponse } from "@joko/contracts";
 import { resolveModelSpeed } from "../model-speed.js";
 import { extraDirectoryAccessChoices } from "../extra-directory-access.js";
 import { WorktreeBranchSync } from "./WorktreeBranchSync.js";
@@ -250,6 +251,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [nativeDiscoveryRevision, setNativeDiscoveryRevision] = useState(0);
   const [nativeSelectionWarning, setNativeSelectionWarning] = useState<string>();
   const [modelKey, setModelKey] = useState("");
+  const [taskModelGroupId, setTaskModelGroupId] = useState<string>();
+  const [taskModelGroupList, setTaskModelGroupList] = useState<{ readonly scope: string; readonly value: ListTaskModelGroupsResponse }>();
+  const [taskModelGroupPreview, setTaskModelGroupPreview] = useState<{ readonly key: string; readonly value: PreviewTaskModelGroupResponse }>();
   const [effort, setEffort] = useState("");
   const [fastMode, setFastMode] = useState<boolean | "ultrafast">(false);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("ask");
@@ -757,9 +761,44 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       : defaultModelEffort(pickerDefaultModel) === undefined ? {} : { effort: defaultModelEffort(pickerDefaultModel) }),
     fastMode: resolveModelSpeed(pickerDefaultModel, pickerBackendDefaults?.model?.fastMode, execution.fastModeSupported)
   };
+  const taskModelsApi = controller.providerGroups?.taskModels;
+  const taskModelGroupScope = JSON.stringify([profileScope, controller.state.connectionGeneration]);
+  const taskModelGroupsAllowed = snapshot.settings.taskModelGroupsAvailable === true
+    && taskModelsApi !== undefined && contactsDraft === undefined && startKind === "fresh"
+    && (selection?.kind === "dialogue" || selected?.trusted === true && selected.remoteWorkspace === undefined);
+  useEffect(() => {
+    if (!taskModelsApi || !taskModelGroupsAllowed) return;
+    const request = new AbortController();
+    void taskModelsApi.list(request.signal).then(value => {
+      if (!request.signal.aborted) setTaskModelGroupList({ scope: taskModelGroupScope, value });
+    }).catch(() => {
+      if (!request.signal.aborted) setTaskModelGroupList(undefined);
+    });
+    return () => request.abort();
+  }, [taskModelsApi, taskModelGroupsAllowed, taskModelGroupScope]);
+  const groupList = taskModelGroupsAllowed && taskModelGroupList?.scope === taskModelGroupScope ? taskModelGroupList.value : undefined;
+  const targetModelGroup = groupList?.config?.groups.find(group => group.groupId === taskModelGroupId);
+  const groupRevision = groupList?.config?.revision;
+  const groupHasImages = attachments.some(attachment => attachment.kind === "image") || browserComments.length > 0;
+  const groupPreviewKey = JSON.stringify([taskModelGroupScope, targetModelGroup?.groupId, groupRevision?.toString(), groupHasImages]);
+  const groupPreview = taskModelGroupPreview?.key === groupPreviewKey ? taskModelGroupPreview.value : undefined;
+  useEffect(() => {
+    if (!taskModelsApi || !targetModelGroup || groupRevision === undefined) return;
+    const request = new AbortController();
+    void taskModelsApi.preview({ groupId: targetModelGroup.groupId, expectedRevision: groupRevision, hasImages: groupHasImages }, request.signal)
+      .then(value => { if (!request.signal.aborted) setTaskModelGroupPreview({ key: groupPreviewKey, value }); }).catch(() => undefined);
+    return () => request.abort();
+  }, [taskModelsApi, targetModelGroup, groupRevision, groupHasImages, groupPreviewKey]);
+  const groupVisionCandidate = targetModelGroup?.preferVisionWithImages !== true ? undefined : groupList?.sources.find(source =>
+    source.available && source.supportsImages && targetModelGroup.candidates.some(candidate => !candidate.disabled
+      && candidate.source?.sourceKey === source.source?.sourceKey && candidate.source?.modelId === source.source?.modelId));
+  const mediaGroupSource = groupPreview?.selected?.supportsImages ? groupPreview.selected : !groupHasImages && groupVisionCandidate
+    ? groupVisionCandidate : groupPreview?.selected;
+  const mediaBackend = snapshot.backends.find(item => item.id === mediaGroupSource?.source?.backendId) ?? backend;
+  const mediaImages = mediaGroupSource?.supportsImages ?? selectedModel?.supportsImages;
   const attachmentPolicy = useMemo(
-    () => resolveComposerAttachmentPolicy(backend, selectedModel?.supportsImages),
-    [backend, selectedModel?.supportsImages]
+    () => resolveComposerAttachmentPolicy(mediaBackend, mediaImages),
+    [mediaBackend, mediaImages]
   );
   const mentionCapability = backend?.capabilities.get("input.mention");
   const trustedLocalWorkspace = usableWorkspace?.trusted === true && usableWorkspace.remoteWorkspace === undefined;
@@ -1192,6 +1231,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         return next;
       });
       setStartKind(draft?.nativeStart.kind ?? "fresh");
+      setTaskModelGroupId(initialModel === undefined ? draft?.taskModelGroupId : undefined);
       setNativeReference(draft?.nativeStart.kind === "attach" ? draft.nativeStart.reference : "");
       setNativeSelectionWarning(undefined);
       setWorktreeEnabled(controllerRef.current.state.preferences.newSessionWorktreeEnabled);
@@ -1467,6 +1507,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   useEffect(() => {
     if (!hydrated || hydratedProfileScope !== profileScope || submitting) return;
     const draft: NewSessionLocalDraft = {
+      ...(taskModelGroupId === undefined || !taskModelGroupsAllowed ? {} : { taskModelGroupId }),
       ...(contactsDialogueRef.current === undefined ? {} : { contactsDialogue: contactsDialogueRef.current }),
       ...(preparationRef.current === undefined ? {} : { preparation: preparationRef.current }),
       selection: selection ?? { kind: "unselected" },
@@ -1500,7 +1541,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       void enqueueNewSessionDraftSave(draftSaveChainRef, sourceControllerRef, draft).then(() => { if (!cancelled) setDraftError(undefined); }).catch((error: unknown) => { if (!cancelled) setDraftError(messageOf(error)); });
     }, 420);
     return () => { cancelled = true; window.clearTimeout(timer); };
-  }, [controller.saveNewSessionDraft, attachments, browserComments, canSelectExtraDirectories, editorDocument, effort, execution.effortSupported, execution.fastModeSupported, execution.permissionModes, execution.planModeSupported, extraDirectoryIds, fastMode, hydrated, hydratedProfileScope, mentions, inlineMentionRanges, modelKey, nativeReference, permissionMode, planMode, preparation, profileScope, refreshWorktreeRemote, selected?.id, selectedModel?.efforts, selectedModel?.supportsFast, selectionKey, startKind, submitting, text, worktreeEnabled, worktreeSourceRef]);
+  }, [controller.saveNewSessionDraft, attachments, browserComments, canSelectExtraDirectories, editorDocument, effort, execution.effortSupported, execution.fastModeSupported, execution.permissionModes, execution.planModeSupported, extraDirectoryIds, fastMode, hydrated, hydratedProfileScope, mentions, inlineMentionRanges, modelKey, nativeReference, permissionMode, planMode, preparation, profileScope, refreshWorktreeRemote, selected?.id, selectedModel?.efforts, selectedModel?.supportsFast, selectionKey, startKind, submitting, taskModelGroupId, taskModelGroupsAllowed, text, worktreeEnabled, worktreeSourceRef]);
 
   const draftMedia = [...attachments, ...browserComments.map((item) => item.screenshot)];
   const attachmentsAllowed = draftAttachmentsAllowed(draftMedia, attachmentPolicy);
@@ -1514,7 +1555,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     ? backend !== undefined
     : selection?.kind === "target" && selected !== undefined && backend !== undefined && targetWorkspaceReady
       && (startKind === "fresh" || nativeSelectionReady);
-  const modelRouteReady = modelSourceAccess(backend, modelSelection, selectedModel, snapshot.providers).available;
+  const modelRouteReady = groupPreview?.selected !== undefined || modelSourceAccess(backend, modelSelection, selectedModel, snapshot.providers).available;
   const worktreeDecisionReady = !worktreePreferenceRelevant || (
     !worktreePreferenceSaving
     && (!worktreeEnabled || (!worktreeLoading && worktreeError === undefined && worktreeEligible))
@@ -1527,6 +1568,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const canSend = (canFinishVoiceSend || personalDraft && personalDevelopmentSupported && hydrated && !submitting)
     && hasInput && !voice.active;
   const prewarmDraft: NewSessionDraft | undefined = contactsDraft === undefined && selection?.kind === "target" && selected?.trusted === true
+    && targetModelGroup === undefined
     && selected.remoteWorkspace === undefined && targetWorkspaceReady && startKind === "fresh"
     && backend?.capabilities.get("session.prewarm")?.supported === true && modelRouteReady && selectedModel !== undefined
     && !effectiveWorktreeEnabled && (!worktreeRequested || worktreeConfirmedIneligible)
@@ -2323,7 +2365,12 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         });
         if (!owner.isCurrent()) return;
       }
-      const prepared = contactsDialogue !== undefined ? {} : await provisionalTask.take({ targetId: selected?.id ?? "", expectedTargetRevision: selected?.revision,
+      const taskModelGroup = targetModelGroup !== undefined && groupRevision !== undefined
+        && (firstInputDisposition === undefined || firstInputDisposition.kind === "send") ? {
+          groupId: targetModelGroup.groupId, expectedRevision: groupRevision,
+          hasImages: sourceAttachments.some(attachment => attachment.kind === "image") || sourceBrowserComments.length > 0
+        } : undefined;
+      const prepared = contactsDialogue !== undefined || taskModelGroup !== undefined ? {} : await provisionalTask.take({ targetId: selected?.id ?? "", expectedTargetRevision: selected?.revision,
         name: t("session.newName"), nativeStart: selected !== undefined && startKind === "attach" && nativeSelectionReady
           ? { kind: "attach", reference: selectedNativeSession!.reference } : { kind: "fresh" }, providerId: selectedModel?.providerId ?? "", modelId: selectedModel?.modelId ?? "",
         ...(execution.effortSelectable && effort.length > 0 ? { effort } : {}), fastMode: execution.fastModeSelectable && fastMode,
@@ -2332,6 +2379,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       if (!owner.isCurrent()) return;
       await onSubmit({
         ...prepared,
+        ...(taskModelGroup === undefined ? {} : { taskModelGroup }),
         selection,
         ...(selection.kind === "target" && selected !== undefined
           ? { expectedTargetRevision: selected.revision }
@@ -3035,6 +3083,17 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
               </div>
               <div className="new-task-composer__controls">
                 {voice.supported && <VoiceInputButton phase={voice.phase} held={heldVoice.held} sendTargetActive={heldVoice.sendTargetActive} startedAt={voice.startedAt} ownerWindow={voice.ownerWindow} enabled={hydrated && !submitting} buttonProps={heldVoice.buttonProps} t={t} />}
+                {groupList?.config !== undefined && <select className="new-task-composer__select new-task-composer__select--model"
+                  aria-label={t("modelGroups.title")} value={targetModelGroup === undefined ? "" : `group:${targetModelGroup.groupId}`} disabled={submitting}
+                  onChange={event => {
+                    const value = event.target.value;
+                    if (value === "manage") { window.location.hash = "#/settings/providers"; return; }
+                    setTaskModelGroupId(value.startsWith("group:") ? value.slice(6) : undefined);
+                  }}>
+                  <option value="">{t("modelGroups.exact")}</option>
+                  {groupList.config.groups.map(group => <option key={group.groupId} value={`group:${group.groupId}`}>{group.name}</option>)}
+                  <option value="manage">{t("modelGroups.manage")}</option>
+                </select>}
                 {execution.modelSwitchSupported && <ModelPicker
                   className="new-task-composer__select--model"
                   models={unifiedModels}
@@ -3060,6 +3119,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                   onConnectSource={() => { window.location.hash = "#/settings/providers"; }}
                   onSelect={async (modelChoice) => {
                     if (modelChoice === undefined) {
+                      setTaskModelGroupId(undefined);
                       setModelKey("");
                       setEffort("");
                       setFastMode(false);
@@ -3092,6 +3152,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                       } else nextSelection = { kind: "dialogue", backendId: nextBackend.id };
                     }
                     setModelKey(modelKeyFor(nextModel.providerId, nextModel.modelId));
+                    setTaskModelGroupId(undefined);
                     const nextEffort = nextOptions.effortSupported
                       ? modelChoice.effort !== undefined && nextModel.efforts.includes(modelChoice.effort)
                         ? modelChoice.effort : defaultModelEffort(nextModel) ?? "" : "";
@@ -3111,7 +3172,11 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
               <IconButton buttonRef={bindVoiceSend} className={cx("send-button", heldVoice.sendTargetActive && "is-voice-target")} tooltipOpen={heldVoice.sendTargetActive ? true : undefined} label={voice.active ? t(heldVoice.sendTargetActive ? "voice.releaseToSend" : "voice.finishAndSend") : t("composer.send")} disabled={voice.active ? !canFinishVoiceSend : !canSend} disabledReason={!canSend ? submitting ? t("common.working") : !hasInput ? t("composer.placeholder") : t("composer.inputUnavailable") : undefined} onClick={() => { if (voice.isActive()) finishVoiceAndSend(); else void submit(); }}><Send aria-hidden="true" /></IconButton>
             </div>
           </div>
-          <div className="new-task-composer__meta"><span>{selection?.kind === "dialogue" ? t("newTask.dialogue") : selected?.workspaceName ?? t("session.noProjects")}</span><span>{backend?.name ?? ""}</span></div>
+          <div className="new-task-composer__meta"><span>{selection?.kind === "dialogue" ? t("newTask.dialogue") : selected?.workspaceName ?? t("session.noProjects")}</span><span role={groupPreview ? "status" : undefined}>
+            {groupPreview === undefined ? backend?.name ?? "" : groupPreview.selected === undefined ? t("modelGroups.noSource")
+              : groupPreview.quotaLimited ? t("modelGroups.previewLimited", { model: groupPreview.selected.modelName })
+                : t("modelGroups.preview", { model: groupPreview.selected.modelName, provider: groupPreview.selected.providerName, computer: groupPreview.selected.computerName })}
+          </span></div>
         </div>
 
         <HomeSuggestionList

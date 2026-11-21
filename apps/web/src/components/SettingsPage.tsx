@@ -39,6 +39,7 @@ import {
   RefreshCw,
   Search,
   Server,
+  Settings2,
   Shield,
   Sun,
   Sparkles,
@@ -66,6 +67,7 @@ import { ProviderLoginDialog } from "./ProviderLoginDialog.js";
 import { ProviderAccountUsageDetails } from "./ProviderAccountUsage.js";
 import { ProviderSharingOwnerSettings } from "./ProviderSharingOwnerSettings.js";
 import { ProviderGroupOwnerSettings } from "./ProviderGroupOwnerSettings.js";
+import { TaskModelGroupSettings } from "./TaskModelGroupSettings.js";
 import { ProviderMark } from "./ProviderMark.js";
 import { ProviderEditor } from "./ProviderEditor.js";
 import { providerPresetMatches, providerPresetName, providerPresets, supportsProviderPreset, type ProviderPreset } from "../provider-presets.js";
@@ -3547,8 +3549,10 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
     ? undefined
     : providerApiKeyAlternative(snapshot, availableProviders, loginTarget);
   const selectedProvider = selectedProviderEntry?.provider;
+  const hasTaskModelGroups = snapshot.settings.taskModelGroupsAvailable === true && controller.providerGroups?.taskModels !== undefined;
   const effectiveSelectedItem = selectedItem === "credentials"
       || selectedItem === "usage"
+      || (selectedItem === "taskModelGroups" && hasTaskModelGroups)
       || selectedProviderEntry !== undefined
       || (selectedProviderId !== undefined && selectedProviderId === pendingProviderSelection)
     ? selectedItem
@@ -3763,6 +3767,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
             <button type="button" className={cx("provider-master-row", selectedItem === "credentials" && "is-active")} aria-current={selectedItem === "credentials" ? "true" : undefined} onClick={() => selectProviderItem("credentials")}><span className="provider-master-row__icon"><KeyRound aria-hidden="true" /></span><span><strong>{t("settings.credentials")}</strong><small>{t("settings.credentialCount", { count: snapshot.settings.credentials.length })}</small></span><ChevronRight aria-hidden="true" /></button>
           </>}
           <button type="button" className={cx("provider-master-row", selectedItem === "usage" && "is-active")} aria-current={selectedItem === "usage" ? "true" : undefined} onClick={() => selectProviderItem("usage")}><span className="provider-master-row__icon"><Database aria-hidden="true" /></span><span><strong>{t("usage.title")}</strong></span><ChevronRight aria-hidden="true" /></button>
+          {hasTaskModelGroups && <button type="button" className={cx("provider-master-row", selectedItem === "taskModelGroups" && "is-active")} aria-current={selectedItem === "taskModelGroups" ? "true" : undefined} onClick={() => selectProviderItem("taskModelGroups")}><span className="provider-master-row__icon"><Settings2 aria-hidden="true" /></span><span><strong>{t("modelGroups.title")}</strong></span><ChevronRight aria-hidden="true" /></button>}
           {orderedProviders.length === 0 && detectedProviders.length === 0 && <p className="provider-master__empty">{t("settings.noProviders")}</p>}
         </div>
         {orderedProviders.length > 0 && pickerOwnerId === undefined && <p className="provider-master__warning" role="status">{t("settings.providerOrderUnavailable")}</p>}
@@ -3770,7 +3775,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
       </aside>
       <div className="provider-detail">
         <button type="button" className="provider-detail__mobile-back" onClick={closeMobileProviderDetail}><ArrowLeft aria-hidden="true" />{t("settings.providersBack")}</button>
-        {selectedItem === "usage" ? <UsageHistorySection controller={controller} t={t} /> : selectedItem === "credentials" ? <CredentialVaultPanel controller={controller} snapshot={snapshot} runAction={runAction} onAdd={() => setCredentialEditorOpen(true)} t={t} /> : selectedProvider !== undefined ? <>
+        {selectedItem === "taskModelGroups" && hasTaskModelGroups ? <div className="provider-detail__scroll provider-detail__scroll--runtime"><TaskModelGroupSettings controller={controller} t={t} /></div> : selectedItem === "usage" ? <UsageHistorySection controller={controller} t={t} /> : selectedItem === "credentials" ? <CredentialVaultPanel controller={controller} snapshot={snapshot} runAction={runAction} onAdd={() => setCredentialEditorOpen(true)} t={t} /> : selectedProvider !== undefined ? <>
           <header className={cx("provider-detail__header", selectedImageCredentialSurfaces.length > 0 && "has-detail")}>
             <div className="provider-detail__top-row">
               <div className="provider-detail__identity"><span className="provider-detail__icon" aria-hidden="true"><ProviderMark providerId={selectedProvider.id} name={selectedProvider.name} /></span><span><span className="provider-detail__title"><strong>{selectedProvider.name}</strong><Pill className="provider-detail__model-count">{providerModelCountLabel(logicalProviderModelCount, t)}</Pill>{providerRuntime?.kind === "subscription" && <Pill className="provider-detail__tag">{t("settings.providerSubscription", { product: providerRuntime.accessProduct ?? selectedProvider.name })}</Pill>}{!selectedProviderEnabled && <Pill className="provider-detail__tag">{t("settings.providerDisabled")}</Pill>}{providerConfigurationEditable(selectedProvider) && <Pill className="provider-detail__tag">{t("settings.customEndpoint")}</Pill>}</span><small>{providerDetailSubtitle(selectedProviderEntry!, t)}</small></span></div>

@@ -6,11 +6,13 @@ import {
   provisionManagedCatalog,
   isManagedChatModel,
   isManagedSpeechModel,
+  supportedPiThinkingLevels,
   type PiManagedModel,
   type PiManagedProvider,
   type PiManagedSettings
 } from "@joko/adapter-pi";
 import { isGeminiChatEndpoint } from "@joko/contracts";
+import { isSameOriginModelEndpoint } from "@joko/core";
 import type { OperationalStore } from "@joko/store";
 
 import { CredentialVault, type EncryptedCredential } from "./credential-vault.js";
@@ -1620,7 +1622,7 @@ export class ProviderCatalogManager {
     const supportsImages = model.input?.includes("image") === true;
     if (options.requireImages === true && !supportsImages) return undefined;
     const video = options.purpose === "xai_video";
-    const baseUrl = video ? videoGenerationBaseUrl(entry.provider.baseUrl) : entry.provider.baseUrl;
+    const baseUrl = video ? videoGenerationBaseUrl(entry.provider.baseUrl) : model.baseUrl ?? entry.provider.baseUrl;
     if (baseUrl === undefined || !safeEmbeddingBaseUrl(baseUrl)) return undefined;
 
     let secret: string | undefined;
@@ -2593,7 +2595,7 @@ export class ProviderCatalogManager {
         format: 1,
         generation: this.#generation,
         configurations: providerConfigurationsForStorage([...this.#entries.values()]),
-        geminiImageConnection: this.#geminiImageConnection
+        ...(this.#geminiImageConnection === undefined ? {} : { geminiImageConnection: this.#geminiImageConnection })
       } satisfies StoredProviderCatalog);
     } catch (error) {
       this.#generation = previousGeneration;
@@ -2613,7 +2615,7 @@ export class ProviderCatalogManager {
           format: 1,
           generation: this.#generation,
           configurations: providerConfigurationsForStorage([...this.#entries.values()]),
-          geminiImageConnection: this.#geminiImageConnection
+          ...(this.#geminiImageConnection === undefined ? {} : { geminiImageConnection: this.#geminiImageConnection })
         } satisfies StoredProviderCatalog);
         store.setSetting("service", this.#scopeId, "native_provider_auth_catalog", {
           format: 1,
@@ -2710,13 +2712,19 @@ function providerForStorage(entry: ManagedProviderEntry): StoredProviderEntry {
     provider: sourceProvider,
     credentialBindings: sourceBindings,
     version: sourceVersion,
+    upstreamListing,
     ...metadata
   } = entry;
-  const { headers: _headers, ...provider } = sourceProvider;
+  const { headers: _headers, models: sourceModels, ...provider } = sourceProvider;
   return {
     ...metadata,
+    ...(upstreamListing === undefined ? {} : { upstreamListing }),
     provider: {
       ...provider,
+      models: sourceModels.map(({ api, baseUrl, ...model }) => ({ ...model,
+        ...(api === undefined ? {} : { api }),
+        ...(baseUrl === undefined ? {} : { baseUrl })
+      })),
       ...(sourceProvider.headers === undefined
         ? {}
         : {
@@ -2776,6 +2784,7 @@ function providerFromStorage(entry: StoredProviderEntry): ManagedProviderEntry {
     provider: storedProvider,
     credentialEnvironmentReferences,
     version,
+    upstreamListing,
     ...metadata
   } = entry;
   const { headerEnvironmentReferences, ...provider } = storedProvider;
@@ -2787,7 +2796,13 @@ function providerFromStorage(entry: StoredProviderEntry): ManagedProviderEntry {
   const credentialBindings = Object.fromEntries(credentialEnvironmentReferences.map((item) => [item.environmentName, item.credentialReferenceId]));
   return {
     ...metadata,
-    provider: { ...provider, ...(headers === undefined ? {} : { headers }) },
+    ...(upstreamListing == null ? {} : { upstreamListing }),
+    provider: { ...provider, ...(headers === undefined ? {} : { headers }),
+      models: Array.isArray(provider.models) ? provider.models.map(({ api, baseUrl, ...model }) => ({ ...model,
+        ...(api == null ? {} : { api }),
+        ...(baseUrl == null ? {} : { baseUrl })
+      })) : provider.models
+    },
     credentialBindings,
     version: BigInt(version)
   };
@@ -2920,7 +2935,7 @@ export function discoveredManagedModel(model: DiscoveredProviderModel, customPiA
 
 function eligibleForWithdrawal(entry: ManagedProviderEntry, model: PiManagedModel): boolean {
   return model.discoveredMetadata !== undefined && model.metadataOverrides?.includes("name") !== true
-    && model.api === undefined && entry.provider.modelOverrides?.[model.id] === undefined && isManagedChatModel(model);
+    && model.api === undefined && model.baseUrl === undefined && entry.provider.modelOverrides?.[model.id] === undefined && isManagedChatModel(model);
 }
 
 function automaticOpenCodeGoResponsesModel(entry: ManagedProviderEntry): PiManagedModel | undefined {
@@ -2949,6 +2964,12 @@ function validateProviderEntry(entry: ManagedProviderEntry): void {
     throw new Error("Provider kind is invalid.");
   }
   if (entry.provider.baseUrl !== undefined) validateEndpoint(entry.provider.baseUrl);
+  for (const model of entry.provider.models ?? []) {
+    if (model.baseUrl !== undefined && !isSameOriginModelEndpoint(entry.provider.baseUrl, model.baseUrl)) throw new Error("Provider model endpoint must use the configured origin.");
+    if (model.defaultEffort !== undefined && !supportedPiThinkingLevels(model.reasoning, model.thinkingLevelMap).includes(model.defaultEffort)) {
+      throw new Error("Provider model default effort is unavailable for its reasoning configuration.");
+    }
+  }
   if (typeof entry.credentialOrigin !== "string") throw new Error("Provider credential origin is required.");
   const origin = entry.provider.baseUrl === undefined ? undefined : new URL(entry.provider.baseUrl).origin;
   if (Object.keys(entry.credentialBindings).length > 0 && (origin === undefined || entry.credentialOrigin !== origin)) {

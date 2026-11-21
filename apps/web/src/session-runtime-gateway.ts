@@ -1,5 +1,6 @@
+import { create } from "@bufbuild/protobuf";
 import { createClient, type Transport } from "@connectrpc/connect";
-import { SessionService, encodeModelSpeed, type OperationMutation, type TaskShareRuntimeControl } from "@joko/contracts";
+import { SessionService, SetSessionRuntimeMutationSchema, encodeModelSpeed, type OperationMutation, type TaskShareRuntimeControl } from "@joko/contracts";
 
 export interface SessionRuntimeModelSelection {
   readonly backendId: string;
@@ -30,9 +31,9 @@ export function createSessionRuntimeGateway(port: SessionRuntimeGatewayPort) {
       const control = await createClient(SessionService, scope.transport).getSessionRuntimeControl({ sessionId }, { signal: scope.signal });
       scope.assertCurrent();
       if (!control.control || control.control.handoffState === "unknown") throw new Error("The previous runtime handoff needs to be recovered.");
-      await port.submit({ case: "setSessionRuntime", value: { $typeName: "joko.v1.SetSessionRuntimeMutation", sessionId,
+      await port.submit({ case: "setSessionRuntime", value: create(SetSessionRuntimeMutationSchema, { sessionId,
         expectedRuntimeGeneration: control.control.generation, backendId: selection.backendId,
-        providerId: selection.providerId, modelId: selection.modelId, effort: selection.effort ?? "", ...encodeModelSpeed(selection.fastMode) } });
+        providerId: selection.providerId, modelId: selection.modelId, effort: selection.effort ?? "", ...encodeModelSpeed(selection.fastMode) }) });
       scope.assertCurrent();
     }
   };

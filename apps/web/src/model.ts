@@ -3973,7 +3973,7 @@ export interface ProviderConfigurationView {
 
 export type ProviderCompatibilityView = "anthropic" | "openaiResponses" | "openaiChat" | "openaiCompletions" | "native" | "google";
 export type ProviderConfigurationFieldView = "requestPath" | "modelsEndpoint" | "headers" | "keyless" | "authHeader"
-  | "modelLimits" | "modelCosts" | "modelInputModalities" | "modelThinkingLevels" | "modelSampling" | "modelCompatibility" | "modelFastMode";
+  | "modelLimits" | "modelCosts" | "modelInputModalities" | "modelThinkingLevels" | "modelSampling" | "modelCompatibility" | "modelFastMode" | "modelEndpoint";
 
 export interface ProviderRuntimeConfigurationView {
   readonly backendId: string;
@@ -4004,9 +4004,11 @@ export interface ProviderThinkingLevelView {
 export interface ProviderModelConfigurationView {
   readonly modelId: string;
   readonly name: string;
+  readonly endpoint?: string;
   readonly mode?: string;
   readonly compatibility?: ProviderCompatibilityView;
   readonly reasoning: boolean;
+  readonly defaultEffort?: string;
   readonly inputModalities: readonly ModelInputModalityView[];
   readonly contextWindowTokens: number;
   readonly maximumOutputTokens: number;
@@ -5249,6 +5251,7 @@ export type ModelFavoriteMutationView =
 
 export interface SettingsView {
   readonly revision: bigint;
+  readonly taskModelGroupsAvailable?: boolean;
   readonly providers: readonly ProviderConfigurationView[];
   readonly credentials: readonly CredentialView[];
   readonly mcpServers: readonly McpServerView[];
@@ -5652,6 +5655,7 @@ export interface SessionPreparationView {
 }
 
 export interface NewSessionDraft {
+  readonly taskModelGroup?: Omit<import("@joko/contracts").TaskModelGroupSelection, "$typeName">;
   /** Stable, client-owned preparation receipt; never contains first input. */
   readonly operationId?: string;
   readonly provisionalDraftId?: string;
@@ -5751,6 +5755,7 @@ export interface NewSessionModelRequest {
  * opaque approved-record IDs and is revalidated against the current snapshot
  * before it is shown or sent; server paths are never copied into this record. */
 export interface NewSessionLocalDraft {
+  readonly taskModelGroupId?: string;
   readonly preparation?: ProvisionalTaskReceipt;
   readonly builtinSkillIntent?: "plugin_creator";
   readonly contactsDialogue?: { readonly requestId: string; readonly name: string };

@@ -42,10 +42,10 @@ describe("ProviderSettings model visibility", () => {
     const base = emptySnapshot();
     const backends: BackendView[] = [
       { id: "claude-code", name: "Claude Code", version: "1", health: "healthy",
-        capabilities: new Map([["provider.managed_catalog", { name: "provider.managed_catalog", supported: true }]]),
+        capabilities: new Map([["provider.managed_catalog", { name: "provider.managed_catalog", supported: true, options: [] }]]),
         providerRuntimeSupport: { protocols: ["anthropic", "openaiResponses"], fields: ["modelsEndpoint"] } },
       { id: "codex", name: "Codex", version: "1", health: "healthy",
-        capabilities: new Map([["provider.managed_catalog", { name: "provider.managed_catalog", supported: true }]]),
+        capabilities: new Map([["provider.managed_catalog", { name: "provider.managed_catalog", supported: true, options: [] }]]),
         providerRuntimeSupport: { protocols: ["openaiResponses", "openaiCompletions"], fields: ["modelsEndpoint", "modelInputModalities"] } }
     ];
     const snapshot = { ...base, backends };
@@ -80,8 +80,11 @@ describe("ProviderSettings model visibility", () => {
     await act(async () => required(sub2api).click());
     await setControlValue(endpoint(), "https://gateway.example.test/custom");
     await setControlValue(required(document.body.querySelector<HTMLInputElement>('.provider-editor input[type="password"]')), "test-provider-key");
-    const list = [...document.body.querySelectorAll<HTMLButtonElement>(".provider-editor button")].find(button => button.textContent === "List available models");
-    await act(async () => required(list).click());
+    const catalog = document.body.querySelectorAll<HTMLInputElement>('.provider-editor [role="tabpanel"] input[type="url"]')[1];
+    expect(catalog?.value).toBe("https://gateway.example.test/custom/v1/models?client_version=0.147.0");
+    const list = required(document.body.querySelector<HTMLButtonElement>(".provider-model-preview > button"));
+    expect(list.disabled).toBe(false);
+    await act(async () => list.click());
     expect(previewProviderModels).toHaveBeenCalledWith(expect.objectContaining({
       backendId: "claude-code", compatibility: "openaiResponses", endpoint: "https://gateway.example.test/custom/v1",
       modelsEndpoint: "https://gateway.example.test/custom/v1/models?client_version=0.147.0"
@@ -90,6 +93,7 @@ describe("ProviderSettings model visibility", () => {
     const model = required(document.body.querySelector<HTMLInputElement>('.provider-model-preview__results input[type="checkbox"]'));
     await act(async () => model.click());
     const save = required(document.body.querySelector<HTMLButtonElement>('.provider-editor button[type="submit"]'));
+    expect(save.disabled).toBe(false);
     await act(async () => save.click());
     expect(saveProvider).toHaveBeenCalledWith(expect.objectContaining({ id: "sub2api", runtimes: [expect.objectContaining({
       endpoint: "https://gateway.example.test/custom/v1", credentialOrigin: "https://gateway.example.test",

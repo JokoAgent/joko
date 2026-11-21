@@ -275,7 +275,7 @@ export interface CodexRemoteRuntimePort {
 
 export const CODEX_MANAGED_PROVIDER_SUPPORT: ProviderRuntimeSupport = Object.freeze<ProviderRuntimeSupport>({
   protocols: ["openai-responses", "openai-completions"],
-  fields: ["request_path", "models_endpoint", "headers", "keyless", "model_costs", "model_input_modalities", "model_fast_mode"]
+  fields: ["request_path", "models_endpoint", "headers", "keyless", "model_costs", "model_input_modalities", "model_fast_mode", "model_endpoint"]
 });
 
 export interface CodexAccountSnapshot {

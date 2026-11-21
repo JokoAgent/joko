@@ -5,11 +5,13 @@ import { piProviderModel } from "@joko/adapter-pi";
 import type {
   BackendProviderDescriptor, ManagedProviderOperationLease, ManagedProviderRouteBinding,
   ManagedProviderRouteOwner, ManagedProviderRuntimePort, ManagedProviderSmartRoutingBinding,
-  ManagedProviderSmartRoutingRoute, ProviderRuntimeProtocol, ProviderRuntimeSupport
+  ManagedProviderSmartRoutingRoute, ProviderRuntimeProtocol, ProviderRuntimeSupport, SessionDescriptor, TargetDescriptor
 } from "@joko/core";
+import type { BackendInstanceSnapshot } from "./backend-instance-registry.js";
 import type { ProviderCatalogManager, ProviderInferenceRoute } from "./credential-manager.js";
+import { ManagedAnthropicToolIds, supportsManagedAnthropicToolIdRepair } from "./managed-anthropic-tool-ids.js";
 import { estimateClaudeInputTokens, prepareClaudeResponsesRequest, writeClaudeResponse } from "./managed-claude-responses.js";
-import { createManagedResponsesSseRepair } from "./managed-responses-sse-repair.js";
+import { createManagedResponsesSseRepair, createManagedSseRepair } from "./managed-responses-sse-repair.js";
 import { prepareChatCompletion, writeResponsesFromChat } from "./responses-chat-bridge/transport.js";
 
 const BODY_LIMIT = 32 * 1024 * 1024;
@@ -18,8 +20,25 @@ const MAXIMUM_BINDINGS = 4_096;
 const MAXIMUM_SUBTASK_ROUTES = 256;
 const MAXIMUM_SMART_DESCENDANTS = 512;
 const MAXIMUM_RETIRED_SMART_DESCENDANTS = 4_096;
+const MAXIMUM_ANTHROPIC_TOOL_HISTORY_THREADS = 128;
 const REQUEST_TIMEOUT_MS = 10 * 60_000;
 const SMART_TOKEN_HEADER = "x-joko-provider-proxy-token";
+
+export function assertManagedProviderOwner(
+  owner: ManagedProviderRouteOwner,
+  session: SessionDescriptor,
+  target: TargetDescriptor,
+  instance: Pick<BackendInstanceSnapshot, "state" | "generation">
+): void {
+  // A trusted service-node workspace can adopt a runtime distinct from its registered Backend.
+  const localRuntimeSelection = target.trusted && target.remoteWorkspace === undefined && session.remoteWorkspace === undefined;
+  if (session.deletedAt !== undefined || session.id !== owner.sessionId
+    || session.targetId !== owner.targetId || target.id !== owner.targetId || session.backendId !== owner.backendId
+    || session.binding.generation !== owner.sessionGeneration || (target.backendId !== owner.backendId && !localRuntimeSelection)
+    || instance.state !== "available" || instance.generation !== owner.backendInstanceGeneration) {
+    throw new Error("Managed Provider operation owner is no longer current.");
+  }
+}
 
 interface RuntimeOwner {
   readonly backendId: string;
@@ -110,6 +129,7 @@ export class ManagedProviderProxy {
   readonly #assertOwner: (owner: ManagedProviderRouteOwner) => void;
   readonly #bindings = new Map<string, BindingState>();
   readonly #smartBindings = new Map<string, SmartBindingState>();
+  readonly #anthropicToolIds = new Map<string, ManagedAnthropicToolIds>();
   #origin = "";
   #closed = false;
 
@@ -467,6 +487,7 @@ export class ManagedProviderProxy {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.#anthropicToolIds.clear();
     for (const binding of this.#bindings.values()) binding.active?.release();
     this.#bindings.clear();
     for (const binding of this.#smartBindings.values()) binding.active?.release();
@@ -811,9 +832,13 @@ export class ManagedProviderProxy {
       const appliedOutputTokens = constrainOutput
         ? Math.min(requestedOutputTokens as number, maxOutputTokens as number)
         : undefined;
-      const upstreamBody = appliedOutputTokens !== undefined
-        ? Buffer.from(JSON.stringify({ ...(parsed as Record<string, unknown>), max_tokens: appliedOutputTokens }))
-        : body;
+      const messagesRequest = parsed as Record<string, unknown>;
+      const toolIds = suffix === "" && supportsManagedAnthropicToolIdRepair(route)
+        ? this.#anthropicToolHistory(state, route).prepare(messagesRequest) : undefined;
+      if (appliedOutputTokens !== undefined) messagesRequest["max_tokens"] = appliedOutputTokens;
+      const upstreamBody = appliedOutputTokens !== undefined || toolIds?.changed === true
+        ? Buffer.from(JSON.stringify(messagesRequest)) : body;
+      if (upstreamBody.byteLength > BODY_LIMIT) { fail(response, 413); return; }
       const fetchUpstream = this.#fetchForRoute?.(route) ?? this.#fetch;
       const upstream = await fetchUpstream(endpoint, { method: "POST", headers, body: upstreamBody, redirect: "manual", signal });
       if (subtask === undefined) this.#assertOperation(state, operation);
@@ -832,10 +857,9 @@ export class ManagedProviderProxy {
           if (subtask === undefined) this.#assertOperation(state, operation);
           else this.#assertSubtask(state, operation, subtask);
         },
-        repair: createManagedResponsesSseRepair({
-          protocol: state.protocol,
-          contentType: upstream.headers.get("content-type") ?? ""
-        })
+        repair: toolIds === undefined
+          ? createManagedResponsesSseRepair({ protocol: state.protocol, contentType: upstream.headers.get("content-type") })
+          : createManagedSseRepair(upstream.headers.get("content-type"), toolIds.repair)
       });
       response.end();
     } catch {
@@ -847,6 +871,18 @@ export class ManagedProviderProxy {
       request.off("aborted", close);
       response.off("close", close);
     }
+  }
+
+  #anthropicToolHistory(state: BindingState, route: ProviderInferenceRoute): ManagedAnthropicToolIds {
+    const owner = state.owner;
+    const key = JSON.stringify([owner.backendId, owner.backendInstanceGeneration, owner.targetId, owner.sessionId, owner.sessionGeneration, route.generationId]);
+    const history = this.#anthropicToolIds.get(key) ?? new ManagedAnthropicToolIds();
+    this.#anthropicToolIds.delete(key);
+    this.#anthropicToolIds.set(key, history);
+    if (this.#anthropicToolIds.size > MAXIMUM_ANTHROPIC_TOOL_HISTORY_THREADS) {
+      this.#anthropicToolIds.delete(this.#anthropicToolIds.keys().next().value!);
+    }
+    return history;
   }
 
   async #handleClaudeBridge(

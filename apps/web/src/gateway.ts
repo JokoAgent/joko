@@ -1296,7 +1296,17 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       const assertCurrent = () => { active.throwIfAborted(); if (this.#transport !== scope.transport) throw new Error("The Provider group connection changed."); };
       assertCurrent(); const value = await work(active); assertCurrent(); return value;
     };
-    return { getProviderGroup: (key, signal) => invoke(signal, active => api.getProviderGroup(key, active)),
+    return { taskModels: {
+        list: (signal) => invoke(signal, active => api.taskModels!.list(active)),
+        save: (revision, groups, signal) => invoke(signal, active => api.taskModels!.save(revision, groups, active)),
+        preview: (selection, signal) => invoke(signal, active => api.taskModels!.preview(selection, active)),
+        switchOffer: (request, signal) => invoke(signal, active => api.taskModels!.switchOffer(request, active)),
+        applySwitch: (offer, signal) => invoke(signal, async active => {
+          await this.submit({ case: "setSessionRuntime", value: {
+            sessionId: offer.sessionId, expectedRuntimeGeneration: offer.expectedRuntimeGeneration, taskModelGroupSwitch: offer
+          } }, true, [{ entity: { kind: EntityKind.SESSION, id: offer.sessionId }, expectedGeneration: offer.sessionGeneration }], active);
+        })
+      }, getProviderGroup: (key, signal) => invoke(signal, active => api.getProviderGroup(key, active)),
       listProviderGroupCandidates: (key, signal) => invoke(signal, active => api.listProviderGroupCandidates(key, active)),
       updateProviderGroup: (key, revision, config, signal) => invoke(signal, active => api.updateProviderGroup(key, revision, config, active)),
       getProviderGroupUsage: (query, signal) => invoke(signal, active => api.getProviderGroupUsage(query, active)),
@@ -3264,6 +3274,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         reuseProvisionalSessionId: draft.reuseProvisionalSessionId ?? "",
         nativeStart,
         ...(draft.providerId.length > 0 && draft.modelId.length > 0 ? { model: { model: { providerId: draft.providerId, modelId: draft.modelId }, effortId: draft.effort ?? "", ...encodeModelSpeed(draft.fastMode) } } : {}),
+        ...(draft.taskModelGroup === undefined ? {} : { taskModelGroup: draft.taskModelGroup }),
         permissionMode: protoPermission(draft.permissionMode),
         planMode: draft.planMode,
         initialPlacement: draft.initialPlacement === "dialogue"
@@ -8534,7 +8545,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     });
     let ticketId: string | undefined;
     if (secret !== "") {
-      const response = await createClient(CredentialService, scope.transport).beginProviderModelPreviewUpload(route, { signal: scope.signal });
+      const response = await createClient(CredentialService, scope.transport).beginProviderModelPreviewUpload({ route }, { signal: scope.signal });
       ticketId = await this.uploadCredentialTicket(secret, response.ticket, scope);
     }
     const authentication = ticketId !== undefined ? { case: "credentialUploadTicketId" as const, value: ticketId }
@@ -8566,6 +8577,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       displayName: model.name.trim(),
       ...(model.mode === undefined ? {} : { mode: model.mode }),
       ...(model.compatibility === undefined ? {} : { apiCompatibility: protoProviderCompatibility(model.compatibility) }),
+      endpoint: model.endpoint === undefined ? "" : canonicalProviderEndpoint(model.endpoint),
+      defaultEffort: model.defaultEffort,
       reasoning: model.reasoning,
       inputModalities: model.inputModalities.map(protoInputModality),
       contextWindowTokens: safeUnsignedBigInt(model.contextWindowTokens),
@@ -20616,6 +20629,7 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
   }
   return {
     revision: settings?.revision?.value ?? 0n,
+    taskModelGroupsAvailable: settings.taskModelGroupsAvailable,
     providers: (settings?.providers ?? []).map(mapProviderConfiguration),
     credentials: (settings?.credentials ?? []).map(mapCredential),
     mcpServers: (settings?.mcpServers ?? []).map(mapMcpServer),
@@ -20993,6 +21007,8 @@ function mapProviderModelConfiguration(model: ProviderModelConfiguration): Provi
   return {
     modelId: model.modelId,
     name: model.displayName,
+    ...(model.endpoint === undefined ? {} : { endpoint: model.endpoint }),
+    ...(model.defaultEffort === undefined ? {} : { defaultEffort: model.defaultEffort }),
     ...(model.mode === undefined ? {} : { mode: model.mode }),
     ...(model.apiCompatibility === undefined ? {} : { compatibility: providerCompatibility(model.apiCompatibility) }),
     reasoning: model.reasoning,
@@ -25166,6 +25182,7 @@ function providerConfigurationField(value: ProviderConfigurationField): NonNulla
     case ProviderConfigurationField.MODEL_SAMPLING: return "modelSampling";
     case ProviderConfigurationField.MODEL_COMPATIBILITY: return "modelCompatibility";
     case ProviderConfigurationField.MODEL_FAST_MODE: return "modelFastMode";
+    case ProviderConfigurationField.MODEL_ENDPOINT: return "modelEndpoint";
     default: return undefined;
   }
 }

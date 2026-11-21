@@ -69,7 +69,10 @@ export function emptyProviderModel(backend: BackendView): ProviderModelConfigura
 
 export function updateProviderModelMetadata(model: ProviderModelConfigurationView, patch: Partial<ProviderModelConfigurationView>): ProviderModelConfigurationView {
   const changedIdentity = patch.modelId !== undefined && patch.modelId !== model.modelId;
+  const obsoleteDefault = changedIdentity || patch.reasoning === false
+    || model.defaultEffort !== undefined && patch.thinkingLevels !== undefined && !patch.thinkingLevels.some(level => level.effortId === model.defaultEffort);
   return { ...model, ...patch,
+    ...(obsoleteDefault ? { defaultEffort: undefined } : {}),
     ...(model.inheritedFields === undefined ? {} : { inheritedFields: changedIdentity ? []
       : model.inheritedFields.filter(field => !Object.hasOwn(patch, field)) }),
     ...(changedIdentity ? { contextWindowMaxTokens: undefined } : {}) };
@@ -99,11 +102,13 @@ function transferModels(source: ProviderRuntimeConfigurationView, target: Provid
       ...(allowed("modelCosts") ? { inputCostMicrosPerMillion: model.inputCostMicrosPerMillion, outputCostMicrosPerMillion: model.outputCostMicrosPerMillion,
         cacheReadCostMicrosPerMillion: model.cacheReadCostMicrosPerMillion, cacheWriteCostMicrosPerMillion: model.cacheWriteCostMicrosPerMillion } : {}),
       ...(allowed("modelInputModalities") ? { inputModalities: model.inputModalities } : {}),
-      ...(allowed("modelThinkingLevels") ? { reasoning: model.reasoning, thinkingLevels: model.thinkingLevels } : {}),
+      ...(allowed("modelThinkingLevels") ? { reasoning: model.reasoning, thinkingLevels: model.thinkingLevels, defaultEffort: model.defaultEffort } : {}),
       ...(allowed("modelFastMode") ? { supportsFastMode: model.supportsFastMode } : {}),
       ...(model.supportsTools === undefined ? {} : { supportsTools: model.supportsTools }),
       ...(allowed("modelSampling") ? { sampling: model.sampling } : {}),
-      ...(allowed("modelCompatibility") ? { compatibility: model.compatibility, compatibilityOptions: model.compatibilityOptions } : {})
+      ...(allowed("modelCompatibility") || allowed("modelEndpoint") ? { compatibility: model.compatibility } : {}),
+      ...(allowed("modelCompatibility") ? { compatibilityOptions: model.compatibilityOptions } : {}),
+      ...(allowed("modelEndpoint") ? { endpoint: model.endpoint } : {})
     });
   });
 }
@@ -123,9 +128,12 @@ export function providerTransferDifferences(source: ProviderRuntimeConfiguration
   if (source.endpoint.trim()) add("endpoint", [source.endpoint.trim(), source.compatibility, source.requestPath ?? ""],
     [target.endpoint.trim(), target.compatibility, target.requestPath ?? ""], target.endpoint.trim() !== "", endpointCompatible);
   if (source.models.some((model) => model.modelId.trim() && model.name.trim())) {
+    const routesCompatible = source.models.every(model =>
+      (model.compatibility === undefined || targetBackend.providerRuntimeSupport?.protocols.includes(model.compatibility))
+      && (model.endpoint === undefined || destinationOriginCompatible && supportsProviderField(targetBackend, "modelEndpoint")
+        && providerEndpointOrigin(model.endpoint) === sourceOrigin));
     add("models", transferModels(source, target, sourceBackend, targetBackend), target.models,
-      target.models.some((model) => model.modelId.trim() !== ""), !supportsProviderField(sourceBackend, "modelCompatibility") || !supportsProviderField(targetBackend, "modelCompatibility")
-        || source.models.every((model) => model.compatibility === undefined || targetBackend.providerRuntimeSupport?.protocols.includes(model.compatibility)));
+      target.models.some((model) => model.modelId.trim() !== ""), routesCompatible);
   }
   if (hasSourceSecret || source.credentialId || source.keyless) {
     const authHeader = source.keyless || !supportsProviderField(targetBackend, "authHeader") ? false
@@ -155,13 +163,17 @@ export function transferProviderRuntime(source: ProviderRuntimeConfigurationView
     next = { ...next, endpoint: source.endpoint.trim(), compatibility: source.compatibility, requestPath: source.requestPath };
     if (source.compatibility !== target.compatibility) next.authHeader = supportsProviderField(targetBackend, "authHeader") && source.compatibility !== "anthropic";
     if (providerEndpointOrigin(next.endpoint) !== providerEndpointOrigin(target.endpoint)) {
-      next = { ...next, credentialId: "", environmentName: "", credentialOrigin: "", headers: [], modelsEndpoint: undefined };
+      next = { ...next, credentialId: "", environmentName: "", credentialOrigin: "", headers: [], modelsEndpoint: undefined,
+        models: next.models.map(model => model.endpoint === undefined ? model : { ...model, endpoint: undefined }) };
     }
   }
   const origin = providerEndpointOrigin(next.endpoint);
   const sourceOrigin = providerEndpointOrigin(source.endpoint);
   if ((selected.includes("authentication") || selected.includes("headers") || selected.includes("modelsEndpoint"))
     && (origin === undefined || origin !== sourceOrigin)) throw new Error("Select the source endpoint before transferring its credential or catalog authority.");
+  if (selected.includes("models") && source.models.some(model => model.endpoint !== undefined && providerEndpointOrigin(model.endpoint) !== origin)) {
+    throw new Error("Select the source endpoint before transferring its model routes.");
+  }
   if (next.credentialOrigin !== origin && (selected.includes("authentication") && !source.keyless && next.headers.length > 0 && !selected.includes("headers")
     || selected.includes("headers") && next.credentialId !== "" && !selected.includes("authentication"))) {
     throw new Error("Transferring one credential cannot authorize unrelated destination credentials.");

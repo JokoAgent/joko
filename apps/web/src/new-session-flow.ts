@@ -226,6 +226,7 @@ function sessionDraft(draft: DelayedNewSessionDraft): Omit<NewSessionDraft, "tar
     ...(draft.operationId === undefined ? {} : { operationId: draft.operationId }),
     ...(draft.provisionalDraftId === undefined ? {} : { provisionalDraftId: draft.provisionalDraftId }),
     ...(draft.reuseProvisionalSessionId === undefined ? {} : { reuseProvisionalSessionId: draft.reuseProvisionalSessionId }),
+    ...(draft.taskModelGroup === undefined ? {} : { taskModelGroup: draft.taskModelGroup }),
     name: draft.name,
     nativeStart: draft.nativeStart,
     providerId: draft.providerId,

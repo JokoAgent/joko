@@ -11,12 +11,17 @@ import { ProviderGroupUnavailableError } from "./provider-group-failure-policy.j
 import { providerGroupQuota } from "./provider-group-quota.js";
 import type { ProviderGroupTaskMember } from "./provider-group-runtime.js";
 import { ConnectionAuthenticationError } from "./connection-manager.js";
+import type { TaskModelGroups } from "./task-model-groups.js";
 
 export interface ProviderGroupPrincipal {
   readonly id: string; readonly trust: "owner"; readonly management: boolean; assertCurrent(): void;
 }
 export interface ProviderGroupConnectOptions {
   readonly service: ProviderGroupService; readonly usage: ProviderGroupUsage;
+  readonly taskModels?: TaskModelGroups;
+  readonly taskModelGroupSwitch?: (
+    request: contract.GetTaskModelGroupSwitchRequest, signal: AbortSignal
+  ) => ReturnType<import("./session-host.js").SessionHost["getTaskModelGroupSwitch"]>;
   readonly authenticate: (context: HandlerContext) => ProviderGroupPrincipal | Promise<ProviderGroupPrincipal>;
   readonly assertRemoteAllowed: (key: ProviderGroupKey) => void;
   readonly schedulingState: (key: ProviderGroupKey, modelId: string, signal: AbortSignal) => Promise<{ readonly activeTurns: number; readonly accountUsage?: ProviderAccountUsageSnapshot }>;
@@ -56,7 +61,25 @@ export function createProviderGroupConnectService(options: ProviderGroupConnectO
     }
   };
   const key = (value: contract.ProviderGroupKey | undefined, principal: ProviderGroupPrincipal) => { const result = fromGroupKey(value); if (!principal.management) options.assertRemoteAllowed(result); return result; };
+  const taskModels = (): TaskModelGroups => {
+    if (!options.taskModels) throw new ConnectError("Task model groups are unavailable.", Code.Unimplemented);
+    return options.taskModels;
+  };
   return {
+    listTaskModelGroups: (_request, context) => invoke(context, true, async () => taskModels().list()),
+    saveTaskModelGroups: (request, context) => invoke(context, true, async () =>
+      create(contract.SaveTaskModelGroupsResponseSchema, { config: taskModels().save(request.expectedRevision, request.groups) })),
+    previewTaskModelGroup: (request, context) => invoke(context, true, async () => {
+      if (!request.selection) throw new ConnectError("A model group selection is required.", Code.InvalidArgument);
+      return await taskModels().preview(request.selection, context.signal);
+    }),
+    getTaskModelGroupSwitch: (request, context) => invoke(context, true, async () => {
+      identity(request.sessionId);
+      identity(request.failedRunId);
+      if (request.sessionGeneration < 1n) throw new ConnectError("The original task generation is required.", Code.InvalidArgument);
+      const offer = await options.taskModelGroupSwitch?.(request, context.signal);
+      return create(contract.GetTaskModelGroupSwitchResponseSchema, offer === undefined ? {} : { offer });
+    }),
     listProviderGroups: (_request, context) => invoke(context, true, async () => create(contract.ListProviderGroupsResponseSchema, { groups: service.list().map(toGroupSnapshot) })),
     getProviderGroup: (request, context) => invoke(context, false, async principal => {
       const group = service.snapshot(key(request.key, principal));

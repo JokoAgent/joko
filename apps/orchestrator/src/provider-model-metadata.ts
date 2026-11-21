@@ -18,15 +18,17 @@ export function refreshDiscoveredModel(model: PiManagedModel, update: PiModelDis
 }
 
 export function saveDiscoveredModelConfiguration(current: PiManagedModel | undefined, input: PiManagedModel): PiManagedModel {
+  const preservedEndpoint = !Object.hasOwn(input, "baseUrl") && current?.baseUrl !== undefined ? { baseUrl: current.baseUrl } : {};
   if (current?.discoveredMetadata === undefined) {
     const { metadataOverrides: _metadataOverrides, discoveredMetadata: _discoveredMetadata, contextWindowMax: _contextWindowMax,
       declaredInputModalities: _declaredInputModalities, ...manual } = input;
-    return manual;
+    return { ...preservedEndpoint, ...manual };
   }
   const editable = new Set<PiModelMetadataField>(PI_EDITABLE_MODEL_METADATA_FIELDS);
   const privateOverrides = current.metadataOverrides!.filter(field => !editable.has(field));
+  if (input.defaultEffort !== undefined && !privateOverrides.includes("defaultEffort")) privateOverrides.push("defaultEffort");
   const editableOverrides = (input.metadataOverrides ?? PI_EDITABLE_MODEL_METADATA_FIELDS).filter(field => editable.has(field));
-  return materializeDiscoveredModel({ ...current, ...input, discoveredMetadata: current.discoveredMetadata,
+  return materializeDiscoveredModel({ ...current, ...preservedEndpoint, ...input, api: input.api, discoveredMetadata: current.discoveredMetadata,
     ...(editableOverrides.includes("contextWindow") && input.contextWindow !== undefined ? { contextWindowSource: "declared" as const } : {}),
     ...(editableOverrides.includes("maxTokens") && input.maxTokens !== undefined ? { maxOutputTokensSource: "declared" as const } : {}),
     metadataOverrides: [...privateOverrides, ...editableOverrides] });

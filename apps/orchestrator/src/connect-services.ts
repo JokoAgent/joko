@@ -630,6 +630,7 @@ export interface ConnectServiceDependencies {
   readonly auxiliaryText?: AuxiliaryTextRouting;
   readonly subagentModels?: SubagentModelSettings;
   readonly modelFavorites?: ModelFavoriteSettings;
+  readonly taskModelGroupsAvailable?: boolean;
   readonly holdSubagentSmartRoutingDispatch?: (backendId: string) => void;
   readonly refreshSubagentSmartRouting?: (backendId: string) => Promise<void>;
   readonly holdNativeMemoryDispatch?: (backendId: string) => void;
@@ -1269,7 +1270,8 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
     const connection = application.connections.authenticate(context.requestHeader.get("authorization") ?? undefined);
     return { id: connection.id, trust: "owner", management: true,
       assertCurrent: () => { context.signal.throwIfAborted(); application.connections.fence(connection); } };
-  }), taskAccountUsage: async (sessionId, generation, signal) => {
+  }), taskModelGroupSwitch: (request, signal) => application.sessionHost.getTaskModelGroupSwitch(request, signal),
+    taskAccountUsage: async (sessionId, generation, signal) => {
     const assertCurrent = () => {
       signal.throwIfAborted();
       const session = application.store.getSession(sessionId).descriptor;
@@ -1455,6 +1457,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     ...(application.auxiliaryText === undefined ? {} : { auxiliaryText: application.auxiliaryText }),
     ...(application.subagentModels === undefined ? {} : { subagentModels: application.subagentModels }),
     modelFavorites: application.modelFavorites,
+    taskModelGroupsAvailable: application.providerGroups?.taskModels !== undefined,
     ...(application.sessionNavigation === undefined ? {} : { sessionNavigation: application.sessionNavigation }),
     ...(application.reviewCoordinator === undefined ? {} : { reviewCoordinator: application.reviewCoordinator }),
     ...(application.remoteHosts === undefined ? {} : { remoteHosts: application.remoteHosts }),
@@ -4396,7 +4399,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     beginProviderModelPreviewUpload: (request, context) => {
       const connection = authenticate(context);
       if (dependencies.credentials === undefined) throw new ConnectError("Provider credentials are unavailable.", Code.FailedPrecondition);
-      const { purpose } = providerModelPreviewRoute(dependencies, request);
+      const { purpose } = providerModelPreviewRoute(dependencies, request.route);
       const ticket = dependencies.credentials.createUploadTicket({ kind: "api_key", connectionId: connection.id, servicePurpose: purpose });
       return { ticket: { ticketId: ticket.credentialUploadTicketId,
         relativeEndpoint: `/v1/credentials/upload/${encodeURIComponent(ticket.credentialUploadTicketId)}`,
@@ -4715,9 +4718,18 @@ export function createConnectServices(application: OrchestratorApplication, proj
         if (saved !== undefined && credentials?.find(saved.credentialReferenceId)?.generation !== saved.generation) {
           throw new ConnectError("The saved API key changed during the catalog preview.", Code.FailedPrecondition);
         }
+        const catalogId = contract.publicProviderCatalogId(endpoint.toString());
         return { models: models
-          .filter(model => (model.metadata?.nativeApi === undefined || model.metadata.nativeApi === api)
-            && (!apiKey || apiKey.length < 8 || ![model.id, model.name, model.metadata?.name].some(value => value?.includes(apiKey!))))
+          .filter(model => {
+            if (apiKey && apiKey.length >= 8 && [model.id, model.name, model.metadata?.name].some(value => value?.includes(apiKey!))) return false;
+            if (catalogId !== undefined) {
+              const interfaces = contract.publicProviderInterfaces(catalogId, endpoint.toString(), model.id);
+              if (interfaces.length > 0) return interfaces.some(profile => backend.providerRuntimeSupport?.protocols.some(protocol => protocol === profile.api)
+                && (new URL(profile.baseUrl).pathname === endpoint.pathname || backend.providerRuntimeSupport.fields.includes("model_endpoint")));
+              if (contract.publicProviderModel(catalogId, model.id)?.status === "retired") return false;
+            }
+            return model.metadata?.nativeApi === undefined || model.metadata.nativeApi === api;
+          })
           .map(model => discoveredManagedModel(model, api)).filter(isManagedChatModel).map(mapProviderModelConfiguration) };
       } catch (error) {
         if (!(error instanceof ProviderModelDiscoveryError)) throw error;
@@ -10685,6 +10697,8 @@ function mapProviderModelConfiguration(item: PiManagedModel): contract.ProviderM
     mode: managedModelMode(item),
     displayName: item.name ?? item.id,
     apiCompatibility: item.api === undefined ? undefined : protoProviderApi(item.api),
+    endpoint: item.baseUrl,
+    defaultEffort: item.discoveredMetadata === undefined || item.metadataOverrides?.includes("defaultEffort") ? item.defaultEffort : undefined,
     reasoning: item.reasoning ?? false,
     supportsFastMode: item.supportsFastMode === true,
     defaultVisible: item.defaultVisible,
@@ -10781,10 +10795,11 @@ function assertProviderRuntimeSupport(dependencies: ConnectServiceDependencies, 
       requireField("model_limits", model.contextWindow !== undefined || model.maxTokens !== undefined);
       requireField("model_costs", model.cost !== undefined);
       requireField("model_input_modalities", model.input?.some((value) => value !== "text") === true);
-      requireField("model_thinking_levels", model.reasoning === true || Object.keys(model.thinkingLevelMap ?? {}).length > 0);
+      requireField("model_thinking_levels", model.reasoning === true || model.defaultEffort !== undefined || Object.keys(model.thinkingLevelMap ?? {}).length > 0);
       requireField("model_sampling", Object.keys(model.samplingParams ?? {}).length > 0);
       requireField("model_compatibility", Object.keys(model.compat ?? {}).length > 0);
       requireField("model_fast_mode", model.supportsFastMode === true);
+      requireField("model_endpoint", model.baseUrl !== undefined);
     }
   }
 }
@@ -10900,6 +10915,8 @@ function providerModelFromProto(input: contract.ProviderModelConfiguration): PiM
     ...(inherited.size === 0 ? {} : { metadataOverrides: PI_EDITABLE_MODEL_METADATA_FIELDS.filter(field => !inherited.has(field)) }),
     ...(input.displayName === "" ? {} : { name: input.displayName }),
     ...(input.apiCompatibility === undefined ? {} : { api: nativeProviderApi(input.apiCompatibility, false)! }),
+    ...(input.endpoint === undefined ? {} : { baseUrl: input.endpoint || undefined }),
+    ...(input.defaultEffort === undefined ? {} : { defaultEffort: input.defaultEffort }),
     reasoning: input.reasoning,
     supportsFastMode: input.supportsFastMode,
     ...(input.defaultVisible === undefined ? {} : { defaultVisible: input.defaultVisible }),
@@ -14644,6 +14661,7 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
       ? ""
       : "No available Backend advertises memory.curated.";
   return create(contract.SettingsSnapshotSchema, {
+    taskModelGroupsAvailable: dependencies.taskModelGroupsAvailable === true,
     appearance: appearance ?? create(contract.AppearanceSettingsSchema, {
       locale: "en",
       theme: contract.ThemePreference.SYSTEM,
@@ -17737,7 +17755,13 @@ async function dispatchMutation(
         : requestedAppendSystemPrompt;
       const model = payload.value.model;
       const requestedModel = model?.model;
-      if (requestedModel !== undefined) {
+      const taskModelGroup = payload.value.taskModelGroup;
+      if (taskModelGroup !== undefined && (!taskModelGroup.groupId.trim() || taskModelGroup.expectedRevision < 1n
+        || payload.value.provisionalDraftId || payload.value.reuseProvisionalSessionId || catalogImport !== undefined
+        || nativeStart !== undefined && (nativeStart.case !== "newSession" || nativeStart.value.parentNativeReference !== ""))) {
+        throw invalidArgument("A model group requires a fresh ordinary task and its saved revision.");
+      }
+      if (requestedModel !== undefined && taskModelGroup === undefined) {
         const advertised = dependencies.store.getBackend(payload.value.backendId).descriptor.models.some((candidate) =>
           candidate.providerId === requestedModel.providerId && candidate.modelId === requestedModel.modelId);
         if (!advertised) {
@@ -17829,6 +17853,7 @@ async function dispatchMutation(
               ...(model?.model?.providerId === undefined ? {} : { providerId: model.model.providerId }),
               ...(model?.model?.modelId === undefined ? {} : { modelId: model.model.modelId }),
               ...(model?.effortId === undefined || model.effortId === "" ? {} : { effort: model.effortId }),
+              ...(taskModelGroup === undefined ? {} : { taskModelGroup }),
               fastMode: contract.decodeModelSpeed(model ?? {}),
               permissionMode: corePermission(payload.value.permissionMode),
               planMode: payload.value.planMode,
@@ -18441,6 +18466,16 @@ async function dispatchMutation(
       const value = payload.value, expectedGeneration = Number(value.expectedRuntimeGeneration);
       if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) throw invalidArgument("The runtime generation is invalid.");
       return effectOperation(dependencies, operationId, connection, mutation, payload.case, { accepted: true }, async () => {
+        const modelGroupSwitch = value.taskModelGroupSwitch;
+        if (modelGroupSwitch !== undefined) {
+          if (value.sessionId !== modelGroupSwitch.sessionId || value.expectedRuntimeGeneration !== modelGroupSwitch.expectedRuntimeGeneration
+            || value.backendId !== undefined || value.providerId !== undefined || value.modelId !== undefined
+            || value.effort !== undefined || value.fastMode !== undefined || value.ultrafastMode !== undefined) {
+            throw invalidArgument("The model group recovery must use the exact offered task and route.");
+          }
+          await host.applyTaskModelGroupSwitch(modelGroupSwitch, () => dependencies.connections.fence(connection));
+          return;
+        }
         await host.setSessionRuntimeControl({ sessionId: value.sessionId, expectedGeneration,
           patch: { ...(value.backendId === undefined ? {} : { backendId: value.backendId }),
             ...(value.providerId === undefined ? {} : { providerId: value.providerId }),

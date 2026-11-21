@@ -13,6 +13,13 @@ export interface ProviderGroupDirectorySource extends ProviderGroupKey {
   /** Exact live registry/route/grant generation, checked again at admission. */
   readonly assertCurrent: () => void;
 }
+
+export function providerGroupDefaultMember(source: ProviderGroupDirectorySource): ProviderGroupMember {
+  return { key: source.key, kind: source.kind, backendId: source.backendId, nativeBackendId: source.nativeBackendId,
+    providerId: source.providerId, nodeId: source.nodeId, displayName: source.displayName, capacity: 4, weight: 1,
+    paused: false, ...(source.received === undefined ? {} : { received: source.received }) };
+}
+
 export interface ProviderGroupMemberStatus {
   readonly member: ProviderGroupMember; readonly available: boolean; readonly reachable: boolean;
   readonly model?: ProviderModel; readonly quota: ProviderGroupQuota; readonly running: number;

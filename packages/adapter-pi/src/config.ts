@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { PermissionMode, PolicySubjectKind, ProviderModel } from "@joko/core";
+import { isSameOriginModelEndpoint } from "@joko/core";
 import { piError } from "./errors.js";
 import { createPiModelCatalogAdditions } from "./model-catalog-additions.js";
 import { isManagedChatModel, isManagedSpeechModel } from "./model-purpose.js";
@@ -55,6 +56,7 @@ export interface PiManagedModel {
   readonly discoveredMetadata?: PiModelDiscoveryMetadata;
   readonly metadataOverrides?: readonly PiModelMetadataField[];
   readonly api?: PiSupportedApi;
+  readonly baseUrl?: string;
   readonly reasoning?: boolean;
   /** Explicit BYOM declaration; never inferred from an arbitrary endpoint. */
   readonly supportsFastMode?: boolean;
@@ -561,6 +563,9 @@ function validateProvider(provider: PiManagedProvider): void {
     }
     if (model.api !== undefined && !["anthropic-messages", "openai-responses", "openai-completions", "google-generative-ai"].includes(model.api)) {
       throw piError("PI_MODEL_INVALID_API", `Model '${provider.id}/${model.id}' has an invalid API type`, "provision");
+    }
+    if (model.baseUrl !== undefined && !isSameOriginModelEndpoint(provider.baseUrl, model.baseUrl)) {
+      throw piError("PI_MODEL_UNSAFE_BASE_URL", `Model '${provider.id}/${model.id}' must use the Provider origin`, "provision");
     }
     if (model.mode !== undefined && (typeof model.mode !== "string" || !/^[a-z][a-z0-9_]{0,63}$/u.test(model.mode))
       || model.description !== undefined && (typeof model.description !== "string" || model.description.length > 16_384)

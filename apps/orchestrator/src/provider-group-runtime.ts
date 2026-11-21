@@ -21,11 +21,13 @@ import type { HostedAgentPrincipal } from "./hosted-agent-host.js";
 import type { ProviderGroupNativeCapture } from "./provider-group-hosted.js";
 import { ProviderGroupRemoteRouter } from "./provider-group-remote.js";
 import { ProviderGroupReporter } from "./provider-group-reporter.js";
+import { TaskModelGroups } from "./task-model-groups.js";
 
 export interface ProviderGroupRuntimeOptions {
   readonly store: OperationalStore; readonly registry: BackendInstanceRegistry; readonly sources: HostedAgentSources;
   readonly nodeId: string; readonly nodeName: () => string; readonly sessions: ProviderGroupSessionPort;
   readonly ownerGeneration: () => string;
+  readonly taskModelEnabled?: (backendId: string, providerId: string, modelId: string) => boolean;
   readonly readAccountUsage: (backendId: string, providerId: string, signal: AbortSignal) => Promise<ProviderAccountUsageSnapshot | undefined>;
   /** Count active turns on the native execution node, including direct and
    * hosted use. This is not the count of open native sessions. */
@@ -46,6 +48,7 @@ export class ProviderGroupRuntime {
   readonly guestSwitch: ProviderGroupGuestSwitch;
   readonly remote: ProviderGroupRemoteRouter;
   readonly reporter: ProviderGroupReporter;
+  readonly taskModels: TaskModelGroups;
   readonly #remoteRunning = new Map<string, number>();
   readonly #options: ProviderGroupRuntimeOptions;
   nodeName(): string { return this.#options.nodeName(); }
@@ -110,6 +113,8 @@ export class ProviderGroupRuntime {
     this.directory = new ProviderGroupDirectory({ sources: () => this.sources(), quotas, ownerGeneration: options.ownerGeneration,
       running: source => source.kind === "local" ? options.activeTurns(source.backendId, source.providerId) : this.#remoteRunning.get(source.key) ?? 0,
       ...(options.refreshSources ? { refresh: options.refreshSources } : {}), ...(options.sharing ? { sharing: options.sharing } : {}) });
+    this.taskModels = new TaskModelGroups({ store: options.store, ownerId: options.nodeId, directory: this.directory,
+      ownerGeneration: options.ownerGeneration, modelEnabled: options.taskModelEnabled ?? (() => true), now });
     this.leases = new ProviderGroupLeases(now);
     this.remote = new ProviderGroupRemoteRouter({ store: this.store, sources: options.sources, directory: this.directory, leases: this.leases,
       localNodeId: options.nodeId, ownerGeneration: options.ownerGeneration });
@@ -173,7 +178,7 @@ export class ProviderGroupRuntime {
       poller: first.pool.poller, assertCurrent: () => { assertCurrent(); first.assertCurrent(); }, close: async (runId, signal) => { const captured = captures.get(runId); if (!captured) throw new Error("The original group cleanup was not captured."); await captured.close(signal); } };
   }
   connectOptions(authenticate: ProviderGroupConnectOptions["authenticate"]): ProviderGroupConnectOptions {
-    return { service: this.service, usage: this.usage, authenticate, assertRemoteAllowed: this.#options.assertRemoteAllowed,
+    return { service: this.service, usage: this.usage, taskModels: this.taskModels, authenticate, assertRemoteAllowed: this.#options.assertRemoteAllowed,
       memberAccountUsage: (key, revision, memberKey, signal) => this.memberAccountUsage(key, revision, memberKey, signal),
       schedulingState: async (key, _modelId, signal) => {
         this.#options.assertRemoteAllowed(key);
@@ -243,10 +248,7 @@ export class ProviderGroupRuntime {
 export function providerGroupMemberKey(nodeId: string, nativeBackendId: string, providerId: string, joinId?: string): string {
   return "member-" + createHash("sha256").update(JSON.stringify([nodeId, nativeBackendId, providerId, joinId ?? null])).digest("hex").slice(0, 32);
 }
-export function providerGroupDefaultMember(source: ProviderGroupDirectorySource): ProviderGroupMember {
-  return { key: source.key, kind: source.kind, backendId: source.backendId, nativeBackendId: source.nativeBackendId, providerId: source.providerId, nodeId: source.nodeId, displayName: source.displayName,
-    capacity: 4, weight: 1, paused: false, ...(source.received ? { received: source.received } : {}) };
-}
+export { providerGroupDefaultMember } from "./provider-group-directory.js";
 function providerBrand(accessKind: string | undefined, product: string | undefined): { readonly brand?: string } {
   if (accessKind !== "subscription") return {};
   switch (product?.trim().toLowerCase()) {

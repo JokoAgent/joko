@@ -3,12 +3,13 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { OperationalStore } from "@joko/store";
 import { createCodexAdapter } from "@joko/adapter-codex";
-import type { AdapterContext, EventPayload, NativeSessionBinding, TargetDescriptor } from "@joko/core";
+import type { AdapterContext, EventPayload, ManagedProviderRouteOwner, NativeSessionBinding, SessionDescriptor, TargetDescriptor } from "@joko/core";
+import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { mkdir, readFile, readdir } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 import { CredentialManager, ProviderCatalogManager } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
-import { ManagedProviderProxy } from "./managed-provider-proxy.js";
+import { assertManagedProviderOwner, ManagedProviderProxy } from "./managed-provider-proxy.js";
 import { mkdtemp } from "./test-paths.js";
 
 async function fixture(
@@ -16,7 +17,8 @@ async function fixture(
   protocol: "openai-responses" | "openai-completions" | "anthropic-messages" = "openai-responses",
   providerId = "provider",
   configuredPath?: string | null,
-  clientProtocol?: "anthropic-messages"
+  clientProtocol?: "anthropic-messages",
+  officialRoute?: { readonly baseUrl: string; readonly modelId: string }
 ) {
   const directory = await mkdtemp(join(tmpdir(), "joko-provider-proxy-"));
   const store = new OperationalStore(join(directory, "store.db"));
@@ -105,9 +107,13 @@ async function fixture(
   await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
   const endpoint = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
   let ownerCurrent = true; let sessionPresent = true;
+  let checkOwner: ((owner: ManagedProviderRouteOwner) => void) | undefined;
   const routedFetch: typeof fetch = async (input, init) => {
     const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
     if (url.origin === endpoint) return await fetch(input, init);
+    if (officialRoute !== undefined && url.origin === new URL(officialRoute.baseUrl).origin) {
+      return await fetch(new URL(url.pathname + url.search, endpoint), init);
+    }
     const headers = new Headers(init?.headers);
     const body = JSON.parse(typeof init?.body === "string" ? init.body : Buffer.from(init?.body as Uint8Array).toString("utf8"));
     nativeReceived.push({
@@ -122,28 +128,31 @@ async function fixture(
   const proxy = new ManagedProviderProxy({
     providers,
     fetch: routedFetch,
-    assertOwner: () => { if (!ownerCurrent || !sessionPresent) throw new Error("Owner changed"); }
+    assertOwner: owner => {
+      if (!ownerCurrent || !sessionPresent) throw new Error("Owner changed");
+      checkOwner?.(owner);
+    }
   });
   await proxy.start();
   const port = proxy.createRuntime({ backendId: "runtime", generation: 3, support: { protocols: [protocol], fields: [] }, clientProtocol,
     assertCurrent: () => { if (!ownerCurrent) throw new Error("Runtime changed"); } });
-  const owner = { backendId: "runtime", backendInstanceGeneration: 3, targetId: "target", sessionId: "session", sessionGeneration: 4, providerId, modelId: "model" };
+  const owner = { backendId: "runtime", backendInstanceGeneration: 3, targetId: "target", sessionId: "session", sessionGeneration: 4, providerId, modelId: officialRoute?.modelId ?? "model" };
   const requestPath = configuredPath === null ? undefined : configuredPath ?? (protocol === "anthropic-messages" ? "/custom/messages"
     : protocol === "openai-completions" ? "/custom/chat/completions" : "/custom/responses");
-  const baseUrl = configuredPath === null ? `${endpoint}/v1` : endpoint;
+  const baseUrl = officialRoute?.baseUrl ?? (configuredPath === null ? `${endpoint}/v1` : endpoint);
   const catalogModels = [
-    { id: "model", input: ["text"] as const, contextWindow: 64_000, maxTokens: 4_000 },
+    { id: owner.modelId, input: ["text"] as const, contextWindow: 64_000, maxTokens: 4_000 },
     { id: "child-model", input: ["text"] as const, contextWindow: 128_000, maxTokens: 8_000 }
   ];
-  const write = async (revision: bigint, secret: string) => {
+  const write = async (revision: bigint, secret: string, modelEndpoint?: string) => {
     const reference = `credential-${revision}`;
     const ticket = credentials.createUploadTicket(); credentials.upload(ticket.credentialUploadTicketId, secret);
     await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: reference, displayName: "Provider credential", kind: "api_key" });
     await providers.upsertConfiguration({ providerId, displayName: "Provider", kind: "custom_endpoint", enabled: true, expectedVersion: revision,
       runtimes: [{ backendId: "runtime", provider: { id: providerId, api: protocol, baseUrl, apiKeyEnv: "PROVIDER_KEY",
         headers: { "X-Joko-Provider-Proxy-Token": { env: "PROVIDER_KEY" } },
-        models: catalogModels },
-        credentialBindings: { PROVIDER_KEY: reference }, credentialOrigin: endpoint, requestPath }] });
+        models: modelEndpoint === undefined ? catalogModels : catalogModels.map(model => model.id === owner.modelId ? { ...model, baseUrl: modelEndpoint } : model) },
+        credentialBindings: { PROVIDER_KEY: reference }, credentialOrigin: new URL(baseUrl).origin, requestPath }] });
   };
   await write(0n, "first-private-provider-credential");
   const markProviderUnavailable = async () => {
@@ -172,6 +181,7 @@ async function fixture(
   };
   return { directory, store, credentials, providers, proxy, port, owner, received, receivedBodies, nativeReceived, forwardedProxyTokens, forwardedFedrampHeaders, forwardedClaudeKeys,
     disableModel: (modelId: string) => disabledModels.add(modelId),
+    checkOwnerWith: (check: (owner: ManagedProviderRouteOwner) => void) => { checkOwner = check; },
     write, markProviderUnavailable, requestPath,
     token: port.environment[port.secretEnvironmentNames[0]!]!, toolOutcome: () => toolOutcome,
     hold: () => { hold = true; }, reject: () => { reject = true; },
@@ -195,6 +205,103 @@ function responsesEvents(body: string): Record<string, unknown>[] {
 }
 
 describe("Managed Provider native proxy", () => {
+  it("dispatches an adopted local Backend and fences the exact Session, workspace and process generations", async () => {
+    const f = await fixture();
+    try {
+      const originalBackendId = "project-backend";
+      for (const id of [originalBackendId, f.owner.backendId]) {
+        f.store.upsertBackend(await new FakeBackendAdapter({ ...PI_LIKE_PROFILE, id }).describe());
+      }
+      const target = { id: f.owner.targetId, backendId: originalBackendId, displayName: "Workspace", workspaceRoot: f.directory, managed: false, trusted: true };
+      f.store.upsertTarget(target);
+      const session: SessionDescriptor = { id: f.owner.sessionId, targetId: target.id, backendId: f.owner.backendId, title: "Adopted runtime",
+        binding: { opaqueRef: "adopted-task", generation: f.owner.sessionGeneration }, createdAt: 1, updatedAt: 1,
+        archived: false, pinned: false, permissionMode: "ask", planMode: false, fastMode: false,
+        providerId: f.owner.providerId, modelId: f.owner.modelId };
+      expect(() => f.store.createSession(session)).toThrow("Session backend does not match its target backend.");
+      f.store.createSession(session, { localRuntimeBackendSelection: true });
+      let targetOverride: TargetDescriptor | undefined;
+      let sessionGeneration = session.binding.generation;
+      let backendGeneration = f.owner.backendInstanceGeneration;
+      f.checkOwnerWith(owner => {
+        const stored = f.store.getSession(owner.sessionId).descriptor;
+        assertManagedProviderOwner(owner, { ...stored, binding: { ...stored.binding, generation: sessionGeneration } },
+          targetOverride ?? f.store.getTarget(owner.targetId).descriptor, { state: "available", generation: backendGeneration });
+      });
+      const binding = await f.port.prepare(f.owner);
+      const lease = await binding.activate({ operationId: "adopted-local-turn", signal: new AbortController().signal, assertCurrent: () => undefined });
+      const request = () => fetch(`${binding.baseUrl}/responses`, {
+        method: "POST", headers: { authorization: `Bearer ${f.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ model: f.owner.modelId, input: "Use the adopted route" })
+      });
+      try {
+        const success = await request();
+        expect(success.status).toBe(200);
+        await success.text();
+        for (const changed of [
+          { ...target, trusted: false },
+          { ...target, remoteWorkspace: { kind: "ssh", hostTargetId: "ssh-target", hostId: "host", workspaceRoot: "/work" } } as const,
+          { ...target, remoteWorkspace: { kind: "device_peer", controllerDeviceId: "controller", targetDeviceId: "peer", workspaceRoot: "/work" } } as const
+        ]) {
+          targetOverride = changed;
+          expect((await request()).ok).toBe(false);
+        }
+        targetOverride = undefined;
+        sessionGeneration++;
+        expect((await request()).ok).toBe(false);
+        sessionGeneration--;
+        backendGeneration++;
+        expect((await request()).ok).toBe(false);
+        expect(f.received).toMatchObject([{ path: f.requestPath, model: f.owner.modelId }]);
+      } finally { lease.release(); binding.dispose(); }
+    } finally { await f.dispose(); }
+  });
+
+  it("keeps Kimi Messages tool exchanges unique across duplicate history, compaction, and runtime reattachment", async () => {
+    const f = await fixture(false, "anthropic-messages", "configured-kimi-account", null, "anthropic-messages", {
+      baseUrl: "https://api.kimi.com/coding", modelId: "k3.1-pro"
+    });
+    const start = (id: string) => ({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id, name: "Read", input: {} } });
+    const delta = chatEvent({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"path":"note.txt"}' } });
+    const call = (id: string) => ({ role: "assistant", content: [{ type: "tool_use", id, name: "Read", input: {} }] });
+    const result = (id: string, content: string) => ({ role: "user", content: [{ type: "tool_result", tool_use_id: id, content }] });
+    const emptyHistory = [{ role: "user", content: "Read another file." }];
+    try {
+      const turn = async (operationId: string, messages: readonly unknown[], sessionId = f.owner.sessionId, stream = true) => {
+        const binding = await f.port.prepare({ ...f.owner, sessionId });
+        const lease = await binding.activate({ operationId, signal: new AbortController().signal, assertCurrent: () => undefined });
+        try {
+          const response = await fetch(`${binding.baseUrl}/v1/messages`, {
+            method: "POST", headers: { "content-type": "application/json", "x-api-key": f.token },
+            body: JSON.stringify({ model: f.owner.modelId, messages, stream, max_tokens: 100 })
+          });
+          expect(response.status).toBe(200);
+          return await response.text();
+        } finally { lease.release(); binding.dispose(); }
+      };
+      f.respondWith(chatEvent(start("Read_7")) + delta);
+      const first = await turn("kimi-first", emptyHistory);
+      expect(first).toBe(chatEvent(start("Read_7")) + delta);
+      const compacted = await turn("kimi-compacted", emptyHistory);
+      expect(compacted).toBe(chatEvent(start("Read_7_dup2")) + delta);
+      const repaired = await turn("kimi-duplicate-history", [
+        call("Read_7"), result("Read_7", "first result"), call("Read_7"), result("Read_7", "second result"),
+        call("Read_7_dup2"), result("Read_7_dup2", "already has that suffix")
+      ]);
+      expect(repaired).toBe(chatEvent(start("Read_7_dup4")) + delta);
+      expect(f.receivedBodies.at(-1)?.messages).toEqual([
+        call("Read_7"), result("Read_7", "first result"), call("Read_7_dup3"), result("Read_7_dup3", "second result"),
+        call("Read_7_dup2"), result("Read_7_dup2", "already has that suffix")
+      ]);
+      expect(await turn("kimi-separate-task", emptyHistory, "another-task")).toBe(first);
+      const json = JSON.stringify({ type: "message", content: [start("Read_7").content_block] });
+      f.respondWith(json, "application/json");
+      expect(await turn("kimi-json", emptyHistory, f.owner.sessionId, false)).toBe(json);
+      expect(f.received.every(request => request.path === "/coding/v1/messages" && request.model === "k3.1-pro")).toBe(true);
+      expect(f.forwardedClaudeKeys.every(key => key === "first-private-provider-credential")).toBe(true);
+    } finally { await f.dispose(); }
+  });
+
   it("accepts the Claude SDK Messages query only with the original model operation", async () => {
     const f = await fixture(false, "anthropic-messages", "claude-messages-provider", null, "anthropic-messages");
     try {
@@ -320,6 +427,28 @@ describe("Managed Provider native proxy", () => {
         await f.credentials.replaceSecret("credential-0", "different-managed-key");
         expect((await request({ messages: [user] })).ok).toBe(false);
         expect(f.received).toHaveLength(2);
+      } finally { lease.release(); binding.dispose(); }
+    } finally { await f.dispose(); }
+  });
+
+  it("sends inference to a saved same-origin model endpoint and rejects a different authority", async () => {
+    const f = await fixture(false, "openai-responses", "per-model-provider", null);
+    try {
+      const configured = f.providers.get(f.owner.backendId, f.owner.providerId);
+      const modelEndpoint = new URL("/model-api/v2", configured.provider.baseUrl).href;
+      await f.write(configured.version, "managed-model-credential", modelEndpoint);
+      const updated = f.providers.get(f.owner.backendId, f.owner.providerId);
+      await expect(f.write(updated.version, "different-secret", "https://other.example.test/v2")).rejects.toThrow("configured origin");
+      const binding = await f.port.prepare(f.owner);
+      const lease = await binding.activate({ operationId: "saved-model-endpoint", signal: new AbortController().signal, assertCurrent: () => undefined });
+      try {
+        const response = await fetch(`${binding.baseUrl}/responses`, {
+          method: "POST", headers: { authorization: `Bearer ${f.token}`, "content-type": "application/json" },
+          body: JSON.stringify({ model: f.owner.modelId, input: "Selected model route" })
+        });
+        expect(response.status).toBe(200);
+        await response.text();
+        expect(f.received).toEqual([{ path: "/model-api/v2/responses", model: "model", authorization: "Bearer managed-model-credential" }]);
       } finally { lease.release(); binding.dispose(); }
     } finally { await f.dispose(); }
   });

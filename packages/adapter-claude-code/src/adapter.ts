@@ -9397,12 +9397,13 @@ export const CLAUDE_MANAGED_PROVIDER_SUPPORT: ProviderRuntimeSupport = Object.fr
 
 export const CLAUDE_LOCAL_MANAGED_PROVIDER_SUPPORT: ProviderRuntimeSupport = Object.freeze({
   ...CLAUDE_MANAGED_PROVIDER_SUPPORT,
-  protocols: Object.freeze(["anthropic-messages", "openai-responses", "openai-completions"] as const)
+  protocols: Object.freeze(["anthropic-messages", "openai-responses", "openai-completions"] as const),
+  fields: Object.freeze([...CLAUDE_MANAGED_PROVIDER_SUPPORT.fields, "model_endpoint"] as const)
 });
 
 function managedProviderSupport(support: ProviderRuntimeSupport): ProviderRuntimeSupport {
   return { protocols: support.protocols.filter((protocol) => CLAUDE_LOCAL_MANAGED_PROVIDER_SUPPORT.protocols.includes(protocol)),
-    fields: support.fields.filter((field) => CLAUDE_MANAGED_PROVIDER_SUPPORT.fields.includes(field)) };
+    fields: support.fields.filter((field) => CLAUDE_LOCAL_MANAGED_PROVIDER_SUPPORT.fields.includes(field)) };
 }
 
 function normalizeProductEffort(value: string | undefined): string | undefined {

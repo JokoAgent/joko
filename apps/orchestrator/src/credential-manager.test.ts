@@ -1012,11 +1012,12 @@ describe("ProviderCatalogManager", () => {
       credentialReferenceId: "cred_go_route_test", displayName: "Go fixture key", kind: "api_key" });
     const go = "https://opencode.ai/zen/go/v1", luna = "gpt-5.6-luna", deepseek = "deepseek-v4-flash";
     const models: readonly PiManagedModel[] = [{ id: deepseek }, { id: luna }];
-    const variants = [
+    const variants: { readonly id: string; readonly baseUrl: string; readonly models: readonly PiManagedModel[]; readonly requestPath?: string }[] = [
       { id: "custom-go", baseUrl: go, models },
       { id: "explicit-model", baseUrl: go, models: [{ id: deepseek }, { id: luna, api: "openai-completions" as const }] },
       { id: "explicit-path", baseUrl: go, models, requestPath: "/zen/go/v1/chat/completions" },
       { id: "other-path", baseUrl: "https://opencode.ai/zen/v1", models },
+      { id: "explicit-model-endpoint", baseUrl: go, models: [{ id: luna, baseUrl: "https://opencode.ai/zen/v1" }] },
       { id: "single-model", baseUrl: go, models: [{ id: luna }] }
     ];
     try {
@@ -1058,12 +1059,17 @@ describe("ProviderCatalogManager", () => {
         await runtime.complete(model!, { messages: [{ role: "user", content: "Read the test input", timestamp: 1 }] },
           { env: current.environment, fetch });
       }
+      const modelEndpoint = runtime.getModel("explicit-model-endpoint", luna);
+      expect(modelEndpoint).toMatchObject({ baseUrl: "https://opencode.ai/zen/v1", api: "openai-completions" });
+      await runtime.complete(modelEndpoint!, { messages: [{ role: "user", content: "Read the test input", timestamp: 1 }] },
+        { env: current.environment, fetch });
       expect(requests).toEqual([
         { url: `${go}/responses`, method: "POST", model: luna },
-        { url: `${go}/chat/completions`, method: "POST", model: deepseek }
+        { url: `${go}/chat/completions`, method: "POST", model: deepseek },
+        { url: "https://opencode.ai/zen/v1/chat/completions", method: "POST", model: luna }
       ]);
       for (const variant of variants.slice(1)) {
-        expect(runtime.getModel(variant.id, luna)).toMatchObject({ api: "openai-completions", baseUrl: variant.baseUrl });
+        expect(runtime.getModel(variant.id, luna)).toMatchObject({ api: "openai-completions", baseUrl: variant.models.find(model => model.id === luna)?.baseUrl ?? variant.baseUrl });
       }
     } finally { store.close(); }
   });

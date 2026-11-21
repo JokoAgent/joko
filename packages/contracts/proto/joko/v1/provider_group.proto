@@ -20,7 +20,94 @@ service ProviderGroupService {
   rpc ReportProviderGroupUsage(ReportProviderGroupUsageRequest) returns (ReportProviderGroupUsageResponse);
   rpc GetProviderSchedulingState(GetProviderSchedulingStateRequest) returns (GetProviderSchedulingStateResponse);
   rpc GetProviderGroupMemberAccountUsage(GetProviderGroupMemberAccountUsageRequest) returns (GetProviderGroupMemberAccountUsageResponse);
+  rpc ListTaskModelGroups(ListTaskModelGroupsRequest) returns (ListTaskModelGroupsResponse);
+  rpc SaveTaskModelGroups(SaveTaskModelGroupsRequest) returns (SaveTaskModelGroupsResponse);
+  rpc PreviewTaskModelGroup(PreviewTaskModelGroupRequest) returns (PreviewTaskModelGroupResponse);
+  rpc GetTaskModelGroupSwitch(GetTaskModelGroupSwitchRequest) returns (GetTaskModelGroupSwitchResponse);
 }
+enum TaskModelGroupStrategy {
+  TASK_MODEL_GROUP_STRATEGY_UNSPECIFIED = 0;
+  TASK_MODEL_GROUP_STRATEGY_EXPIRING_QUOTA = 1;
+  TASK_MODEL_GROUP_STRATEGY_ORDERED = 2;
+  TASK_MODEL_GROUP_STRATEGY_ROUND_ROBIN = 3;
+  TASK_MODEL_GROUP_STRATEGY_LOWEST_COST = 4;
+}
+message TaskModelGroupSourceRef {
+  string source_key = 1;
+  string backend_id = 2;
+  string provider_id = 3;
+  string model_id = 4;
+}
+message TaskModelGroupCandidate {
+  TaskModelGroupSourceRef source = 1;
+  bool disabled = 2;
+}
+message TaskModelGroupSchedule {
+  uint32 start_hour = 1;
+  uint32 end_hour = 2;
+  string use_group_id = 3;
+}
+message TaskModelGroup {
+  string group_id = 1;
+  string name = 2;
+  TaskModelGroupStrategy strategy = 3;
+  repeated TaskModelGroupCandidate candidates = 4;
+  string effort_id = 5;
+  bool prefer_vision_with_images = 6;
+  repeated TaskModelGroupSchedule schedules = 7;
+}
+message TaskModelGroupConfig {
+  uint64 revision = 1;
+  repeated TaskModelGroup groups = 2;
+}
+message TaskModelGroupSource {
+  TaskModelGroupSourceRef source = 1;
+  string model_name = 2;
+  string provider_name = 3;
+  string computer_name = 4;
+  bool available = 5;
+  bool supports_images = 6;
+}
+message TaskModelGroupSelection {
+  string group_id = 1;
+  uint64 expected_revision = 2;
+  bool has_images = 3;
+}
+message ListTaskModelGroupsRequest {}
+message ListTaskModelGroupsResponse {
+  TaskModelGroupConfig config = 1;
+  repeated TaskModelGroupSource sources = 2;
+}
+message SaveTaskModelGroupsRequest {
+  uint64 expected_revision = 1;
+  repeated TaskModelGroup groups = 2;
+}
+message SaveTaskModelGroupsResponse { TaskModelGroupConfig config = 1; }
+message PreviewTaskModelGroupRequest { TaskModelGroupSelection selection = 1; }
+message PreviewTaskModelGroupResponse {
+  string group_name = 1;
+  string effective_group_name = 2;
+  TaskModelGroupSource selected = 3;
+  string effort_id = 4;
+  bool quota_limited = 5;
+  optional int64 available_at_ms = 6;
+}
+message GetTaskModelGroupSwitchRequest {
+  string session_id = 1;
+  uint64 session_generation = 2;
+  string failed_run_id = 3;
+}
+message TaskModelGroupSwitch {
+  string session_id = 1;
+  uint64 session_generation = 2;
+  uint64 expected_runtime_generation = 3;
+  uint64 config_revision = 4;
+  string failed_run_id = 5;
+  string group_name = 6;
+  TaskModelGroupSource selected = 7;
+}
+message GetTaskModelGroupSwitchResponse { TaskModelGroupSwitch offer = 1; }
+
 message ProviderGroupKey { string backend_id = 1; string provider_id = 2; }
 enum ProviderGroupStrategy {
   PROVIDER_GROUP_STRATEGY_UNSPECIFIED = 0;

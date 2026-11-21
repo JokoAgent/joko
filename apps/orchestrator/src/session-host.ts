@@ -114,7 +114,8 @@ import { boundOneShotScheduleProvider, scheduleNativeSubscriptionKey } from "./s
 import type { ProviderGroupRuntime } from "./provider-group-runtime.js";
 import type { ProviderGroupSessionPort, ProviderGroupRecoveryLease, ProviderGroupRecoveryHandoff } from "./provider-group-service.js";
 import type { ProviderGroupAssignment } from "./provider-group-router.js";
-import { PROVIDER_GROUP_SUPERSEDED_ERROR, ProviderGroupUnavailableError, providerGroupFailureSignals } from "./provider-group-failure-policy.js";
+import { PROVIDER_GROUP_SUPERSEDED_ERROR, ProviderGroupUnavailableError, decideProviderGroupFailure, providerGroupFailureSignals } from "./provider-group-failure-policy.js";
+import type { TaskModelGroupAssignment } from "./task-model-groups.js";
 import type { InputHandoffTaskScope } from "./input-handoff/coordinator.js";
 import { operationBodyHash } from "@joko/store";
 import type { ArtifactStore } from "./artifact-store.js";
@@ -570,6 +571,7 @@ export interface CreateSessionInput {
   readonly reuseProvisionalSessionId?: string;
   readonly providerId?: string;
   readonly modelId?: string;
+  readonly taskModelGroup?: import("@joko/contracts").TaskModelGroupSelection;
   readonly effort?: string;
   readonly fastMode: boolean | "ultrafast";
   readonly permissionMode: PermissionMode;
@@ -2120,9 +2122,13 @@ export class SessionHost {
   async createSession(input: CreateSessionInput): Promise<OperationExecution<{ readonly sessionId: string }>> {
     this.#assertOpen();
     validateAppendSystemPrompt(input.appendSystemPrompt);
+    if (input.taskModelGroup !== undefined && (input.provisionalDraftId !== undefined || input.reuseProvisionalSessionId !== undefined
+      || input.catalogImport !== undefined || input.nativeStart !== undefined && (input.nativeStart.kind !== "new" || input.nativeStart.parentNativeReference !== undefined))) {
+      throw new StoreError("A model group can only be used for a fresh ordinary task.");
+    }
     if (input.reuseProvisionalSessionId !== undefined) return this.adoptProvisionalSession(input);
     const target = this.#store.getTarget(input.targetId);
-    if (input.nativeStart?.kind !== "attach") {
+    if (input.nativeStart?.kind !== "attach" && input.taskModelGroup === undefined) {
       this.validateFastSelection(
         target.descriptor.backendId,
         input.providerId,
@@ -2826,6 +2832,121 @@ export class SessionHost {
         void this.drain(input.sessionId);
       }
     });
+  }
+
+  async getTaskModelGroupSwitch(
+    input: import("@joko/contracts").GetTaskModelGroupSwitchRequest,
+    signal: AbortSignal
+  ): Promise<import("@bufbuild/protobuf").MessageInitShape<typeof import("@joko/contracts").TaskModelGroupSwitchSchema> | undefined> {
+    const resolved = await this.#resolveTaskModelGroupSwitch(input, signal);
+    if (!resolved) return undefined;
+    return {
+      sessionId: input.sessionId, sessionGeneration: input.sessionGeneration, failedRunId: input.failedRunId,
+      expectedRuntimeGeneration: BigInt(resolved.runtimeGeneration), configRevision: resolved.revision, groupName: resolved.choice.groupName,
+      selected: { source: { sourceKey: resolved.choice.source.key, backendId: resolved.choice.profile.backendId,
+        providerId: resolved.choice.profile.providerId, modelId: resolved.choice.profile.modelId },
+        modelName: resolved.choice.model.displayName, providerName: resolved.choice.source.providerName,
+        computerName: resolved.choice.source.displayName, available: true, supportsImages: resolved.choice.model.supportsImages }
+    };
+  }
+
+  async applyTaskModelGroupSwitch(
+    offered: import("@joko/contracts").TaskModelGroupSwitch,
+    assertOwner: () => void
+  ): Promise<void> {
+    assertOwner();
+    const resolved = await this.#resolveTaskModelGroupSwitch(offered, new AbortController().signal);
+    const source = offered.selected?.source;
+    if (!resolved || !source || offered.configRevision !== resolved.revision
+      || offered.expectedRuntimeGeneration !== BigInt(resolved.runtimeGeneration)
+      || source.sourceKey !== resolved.choice.source.key || source.backendId !== resolved.choice.profile.backendId
+      || source.providerId !== resolved.choice.profile.providerId || source.modelId !== resolved.choice.profile.modelId) {
+      throw new StoreError("The model group recovery offer expired. Read the task's current failure again.");
+    }
+    const assertAuthority = () => {
+      assertOwner();
+      const current = this.#store.getSession(offered.sessionId);
+      if (BigInt(current.descriptor.binding.generation) !== offered.sessionGeneration || !this.#taskModelGroupSwitchAllowed(current)
+        || this.#store.findLatestRunForSessionGeneration(offered.sessionId, current.descriptor.binding.generation)?.descriptor.id !== offered.failedRunId
+        || this.nextQueueItemForDispatch(offered.sessionId) !== undefined) {
+        throw new StoreError("The model group recovery no longer belongs to this ordinary local task.");
+      }
+      resolved.choice.assertCurrent();
+    };
+    assertAuthority();
+    await this.setSessionRuntimeControl({ sessionId: offered.sessionId, expectedGeneration: resolved.runtimeGeneration,
+      patch: resolved.choice.profile, assertAuthority });
+    const control = this.getSessionRuntimeControl(offered.sessionId);
+    const adopted = control.pending?.profile ?? control.effective;
+    if (adopted?.backendId !== source.backendId || adopted.providerId !== source.providerId || adopted.modelId !== source.modelId) {
+      throw new StoreError("The task did not adopt the selected model group source.");
+    }
+    assertAuthority();
+    resolved.choice.bind(offered.sessionId, true);
+  }
+
+  #taskModelGroupSwitchAllowed(stored: StoredSession): boolean {
+    const id = stored.descriptor.id;
+    return this.isOrdinaryLocalSession(stored) && this.#store.getTarget(stored.descriptor.targetId).descriptor.trusted
+      && this.#store.findObjective(id) === undefined && this.#store.findCollaborationWorkerBySession(id) === undefined
+      && !new TaskShareStore(this.#store).list().some(share => share.sessionId === id && share.status === "active");
+  }
+
+  async #resolveTaskModelGroupSwitch(
+    input: { readonly sessionId: string; readonly sessionGeneration: bigint; readonly failedRunId: string },
+    signal: AbortSignal
+  ): Promise<{ readonly choice: TaskModelGroupAssignment; readonly revision: bigint; readonly runtimeGeneration: number } | undefined> {
+    this.#assertOpen();
+    const runtime = this.#providerGroups;
+    const binding = runtime?.taskModels.binding(input.sessionId);
+    const stored = this.#store.findSession(input.sessionId);
+    const run = this.#store.findRun(input.failedRunId)?.descriptor;
+    if (!runtime || !binding || !stored || run?.sessionId !== input.sessionId || run.state !== "failed" || run.source !== "user" || !run.error
+      || run.endedAt === undefined
+      || BigInt(stored.descriptor.binding.generation) !== input.sessionGeneration || !this.#taskModelGroupSwitchAllowed(stored)
+      || this.#store.findLatestRunForSessionGeneration(input.sessionId, stored.descriptor.binding.generation)?.descriptor.id !== run.id) return undefined;
+    const queue = this.#store.findQueueItemByRunId(input.sessionId, run.id, { includeCleared: true });
+    if (!queue || queue.state !== "failed" || queue.disposition !== "prompt" || !this.isOwnerRunInput(queue)
+      || queue.attemptId === undefined || this.#store.getAttempt(queue.attemptId).descriptor.endedAt === undefined
+      || hasTurnRouteOverrides(queue.executionOverrides) || this.nextQueueItemForDispatch(input.sessionId) !== undefined
+      || this.#store.findRunByParentId(run.id) !== undefined) return undefined;
+    const signals = providerGroupFailureSignals(run.error), decision = decideProviderGroupFailure(signals, "run");
+    if (decision.action !== "switch" || decision.cause !== "usage-limit" && decision.cause !== "overload") return undefined;
+    const control = this.getSessionRuntimeControl(input.sessionId);
+    const effective = control.effective;
+    if (control.pending || !effective || !runtime.taskModels.ownsRoute(input.sessionId, effective)) return undefined;
+    const original = runtime.directory.sources().find(source => source.key === binding.source.sourceKey
+      && source.backendId === binding.source.backendId && source.providerId === binding.source.providerId && source.kind === "local");
+    if (!original) return undefined;
+    const config = runtime.taskModels.config;
+    if (!config.groups.some(group => group.groupId === binding.groupId)) return undefined;
+    const choice = await runtime.taskModels.resolve({
+      $typeName: "joko.v1.TaskModelGroupSelection", groupId: binding.groupId,
+      expectedRevision: config.revision, hasImages: queue.body.images.length > 0
+    }, { signal, lastPicked: binding.source, requireReady: true, accepts: (source, model) => {
+      if (source.kind !== "local" || source.nodeId !== original.nodeId || source.key === original.key
+        && (model.modelId === binding.source.modelId || decision.cause === "usage-limit" && signals.modelScoped !== true)) return false;
+      if (decision.cause === "usage-limit" && signals.modelScoped !== true && source.providerId === original.providerId) return false;
+      const backend = this.#store.getBackend(source.backendId).descriptor;
+      try {
+        const route = { backendId: source.backendId, providerId: source.providerId, modelId: model.modelId, fastMode: false };
+        if (route.backendId !== effective.backendId) {
+          this.#assertRuntimeHandoffSession(stored);
+          this.#resolveRuntimeHandoffProfile(stored, route, effective);
+        } else {
+          this.assertBackendCreationReady(source.backendId, route);
+          if (backend.capabilities.get("model.switch")?.supported !== true) return false;
+        }
+        return true;
+      } catch (error) {
+        if (error instanceof JokoError || error instanceof SessionRuntimeControlError) return false;
+        throw error;
+      }
+    } });
+    if (!choice || this.#store.findSession(input.sessionId)?.revision !== stored.revision
+      || this.getSessionRuntimeControl(input.sessionId).generation !== control.generation || !this.#taskModelGroupSwitchAllowed(stored)
+      || this.#store.findLatestRunForSessionGeneration(input.sessionId, stored.descriptor.binding.generation)?.descriptor.id !== run.id) return undefined;
+    return { choice, revision: config.revision, runtimeGeneration: control.generation };
   }
 
   /** A complete owner selection becomes the new durable baseline and cancels temporary routing. */
@@ -3781,6 +3902,15 @@ export class SessionHost {
       ...(input.overrides === undefined ? {} : { executionOverrides: input.overrides }),
       createdAt: now
     });
+    const group = this.#providerGroups?.taskModels;
+    if (group?.binding(input.sessionId) !== undefined && (input.source ?? "user") === "user" && !input.parentRunId
+      && acceptedPrompt.disposition === "prompt" && !hasTurnRouteOverrides(input.overrides)
+      && store.getOperation(input.operationId).connectionId !== undefined
+      && new TaskShareStore(store).getAuthorForOperation(input.operationId)?.sessionId !== input.sessionId
+      && store.findObjective(input.sessionId) === undefined
+      && group.ownsRoute(input.sessionId, this.getSessionRuntimeControl(input.sessionId).effective)) {
+      group.acceptFirstPrompt(input.sessionId);
+    }
     if (consumedQueueRetryId !== undefined) store.recordQueueRetryAdmission(consumedQueueRetryId, runId, `operation:${input.operationId}:source-retry`);
     const result = { sessionId: input.sessionId, runId, attemptId, queueItemId };
     if ((input.source ?? "user") === "user") {
@@ -7309,12 +7439,25 @@ export class SessionHost {
     if (!groups || hasTurnRouteOverrides(item.executionOverrides) || item.body.inputHandoffContinuation !== undefined || this.isReviewReadOnlySession(item.sessionId)
       || new TaskShareStore(this.#store).getAuthorForOperation(item.operationId)?.sessionId === item.sessionId) return false;
     const session = this.providerGroupSessionPort().read(item.sessionId); if (!session?.eligible || session.dispatchUnknown) return false;
+    if (groups.taskModels.ownsRoute(item.sessionId, session.profile)) return false;
     const binding = groups.store.binding(item.sessionId);
     return binding !== undefined || groups.remote.owns({ backendId: session.profile.backendId, providerId: session.profile.providerId })
       || groups.store.snapshot({ backendId: session.profile.backendId, providerId: session.profile.providerId }).config !== undefined;
   }
+  #taskModelGroupApplies(item: QueueItemRecord): boolean {
+    const models = this.#providerGroups?.taskModels;
+    if (models?.binding(item.sessionId) === undefined || hasTurnRouteOverrides(item.executionOverrides)
+      || item.body.inputHandoffContinuation !== undefined || item.body.nativeSteerTarget !== undefined
+      || this.#store.findObjective(item.sessionId) !== undefined || !this.isOwnerRunInput(item)
+      || new TaskShareStore(this.#store).getAuthorForOperation(item.operationId)?.sessionId === item.sessionId) return false;
+    const session = this.providerGroupSessionPort().read(item.sessionId);
+    return session?.eligible === true && !session.dispatchUnknown && models.ownsRoute(item.sessionId, session.profile);
+  }
+
   #providerGroupMayHandleRun(sessionId: string, runId: string, error: PublicError): boolean {
     if (this.#store.findMessagingInboundRequestByRunId(runId)?.protectedContent === true) return false;
+    const models = this.#providerGroups?.taskModels;
+    if (models?.binding(sessionId) !== undefined && models.ownsRoute(sessionId, this.getSessionRuntimeControl(sessionId).effective)) return false;
     const item = this.#store.findQueueItemByRunId(sessionId, runId, { includeCleared: true });
     return item !== undefined && !hasTurnRouteOverrides(item.executionOverrides)
       && new TaskShareStore(this.#store).getAuthorForOperation(item.operationId)?.sessionId !== sessionId
@@ -12957,6 +13100,7 @@ export class SessionHost {
     let releaseBackendAdmission: (() => void) | undefined;
     let privateCreationSessionId: string | undefined;
     let groupAssignment: ProviderGroupAssignment | undefined;
+    let taskModelAssignment: TaskModelGroupAssignment | undefined;
     let groupCreationEffectDispatched = false;
     try {
       const registeredTarget = this.assertTargetAcceptsSessionCreation(this.#store, input.targetId);
@@ -12967,7 +13111,37 @@ export class SessionHost {
       }
       let target = runtimeBackendId === undefined ? registeredTarget : { ...registeredTarget,
         descriptor: { ...registeredTarget.descriptor, backendId: runtimeBackendId } };
-      let routedInput = this.resolveNewSessionRoute(target.descriptor.backendId, input);
+      const taskModelGroup = authorized ? input.taskModelGroup : undefined;
+      if (taskModelGroup !== undefined) {
+        if (!registeredTarget.descriptor.trusted || registeredTarget.descriptor.remoteWorkspace !== undefined || !this.#providerGroups) {
+          throw new StoreError("Model groups require a trusted local task workspace.");
+        }
+        taskModelAssignment = await this.#providerGroups.taskModels.resolve(taskModelGroup, {
+          signal: new AbortController().signal,
+          accepts: (source, model) => {
+            const backend = this.#store.getBackend(source.backendId).descriptor;
+            if (input.permissionMode !== "ask" && !supportsPermissionMode(backend, input.permissionMode)) return false;
+            if (input.planMode && backend.capabilities.get("plan_mode")?.supported !== true) return false;
+            try {
+              this.assertBackendCreationReady(source.backendId, { providerId: source.providerId, modelId: model.modelId, fastMode: false });
+              return true;
+            } catch (error) {
+              if (error instanceof JokoError) return false;
+              throw error;
+            }
+          }
+        });
+        if (taskModelAssignment !== undefined) {
+          taskModelAssignment.assertCurrent();
+          target = { ...registeredTarget, descriptor: { ...registeredTarget.descriptor, backendId: taskModelAssignment.profile.backendId } };
+        } else {
+          this.validateFastSelection(target.descriptor.backendId, input.providerId, input.modelId, input.fastMode, "Creating a Fast Mode task");
+        }
+      }
+      let routedInput = taskModelAssignment === undefined ? this.resolveNewSessionRoute(target.descriptor.backendId, input) : {
+        ...input, providerId: taskModelAssignment.profile.providerId, modelId: taskModelAssignment.profile.modelId,
+        effort: taskModelAssignment.profile.effort, fastMode: taskModelAssignment.profile.fastMode
+      };
       const sessionId = stableId("session", input.operationId);
       const initialProfile = routedInput.providerId && routedInput.modelId ? { backendId: target.descriptor.backendId, providerId: routedInput.providerId,
         modelId: routedInput.modelId, ...(routedInput.effort === undefined ? {} : { effort: routedInput.effort }), fastMode: routedInput.fastMode } : undefined;
@@ -12975,7 +13149,7 @@ export class SessionHost {
       const groupStart = initialProfile ? { sessionId, profile: initialProfile, agentKind: initialSource?.agentKind ?? this.#store.getBackend(initialProfile.backendId).descriptor.adapterKind,
         ...(initialSource?.models.find(model => model.modelId === initialProfile.modelId)?.logicalId === undefined ? {} : {
           logicalModelId: initialSource.models.find(model => model.modelId === initialProfile.modelId)!.logicalId! }) } : undefined;
-      if (groupStart && input.catalogImport === undefined && (!input.nativeStart || input.nativeStart.kind === "new" && input.nativeStart.parentNativeReference === undefined)
+      if (taskModelGroup === undefined && groupStart && input.catalogImport === undefined && (!input.nativeStart || input.nativeStart.kind === "new" && input.nativeStart.parentNativeReference === undefined)
         && registeredTarget.descriptor.trusted && registeredTarget.descriptor.remoteWorkspace === undefined) {
         groupAssignment = await this.#providerGroups?.service.assignBeforeStart(groupStart, new AbortController().signal);
         if (groupAssignment) {
@@ -13175,10 +13349,11 @@ export class SessionHost {
         this.#store.setSetting("service", sessionId, PRIVATE_CREATION_RECEIPT_KEY, { version: 1, operationId: claim.operation.id, phase: "prepared" } satisfies PrivateCreationReceipt);
         input.assertServiceScope(); await input.beforeNativeCreation(sessionId, runtimeTarget); input.assertServiceScope();
       }
-      const creationAuthority = authorized && runtimeTarget.remoteWorkspace?.kind === "ssh" ? {
+      const creationAuthority = authorized && (runtimeTarget.remoteWorkspace?.kind === "ssh" || taskModelAssignment !== undefined) ? {
         assertNativeCreationCurrent: () => {
           this.#assertOpen();
           this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+          taskModelAssignment?.assertCurrent();
         }
       } : {};
       let context = { ...this.provisionalContext(
@@ -13287,8 +13462,9 @@ export class SessionHost {
               context = { ...context, appendSystemPrompt: nativeAppendSystemPrompt };
             }
             try {
-              if (groupAssignment) {
-                groupAssignment.assertCurrent();
+              if (groupAssignment || taskModelAssignment) {
+                groupAssignment?.assertCurrent();
+                taskModelAssignment?.assertCurrent();
                 this.#runtimeHandoffs.stageCreation({ operationId: claim.operation.id, operationBodyHash: claim.operation.bodyHash, sessionId,
                   targetId: registeredTarget.descriptor.id, targetRevision: registeredTarget.revision.toString(), backendId: target.descriptor.backendId,
                   backendInstanceGeneration, workspaceRoot: runtimeTarget.workspaceRoot });
@@ -13306,12 +13482,13 @@ export class SessionHost {
                 ...(nativeAppendSystemPrompt === undefined ? {} : { appendSystemPrompt: nativeAppendSystemPrompt }), nativeStart }, context);
               break;
             } catch (error) {
-              if (!groupAssignment || !groupStart) throw error;
+              if (!groupAssignment && !taskModelAssignment) throw error;
               const evidence = providerGroupFailureSignals(error);
               const closed = evidence.stateMayHaveChanged === false;
               this.#runtimeHandoffs.creationPhase(claim.operation.id, closed ? "closed" : "unknown");
               if (!closed) throw error;
               groupCreationEffectDispatched = false;
+              if (!groupAssignment || !groupStart) throw error;
               const next = await this.#providerGroups!.service.nextAfterStartFailure(groupStart, groupAssignment, error, context.signal);
               if (!next) throw error; groupAssignment = next;
               groupAssignment.assertCurrent(); releaseBackendAdmission?.();
@@ -13457,12 +13634,13 @@ export class SessionHost {
               ...("frozenOccurrenceRouting" in input && input.frozenOccurrenceRouting !== undefined ? {
                 automationOccurrenceRouting: input.frozenOccurrenceRouting
               } : {}),
-              localRuntimeBackendSelection: runtimeBackendId !== undefined || groupAssignment !== undefined,
+              localRuntimeBackendSelection: runtimeBackendId !== undefined || groupAssignment !== undefined || taskModelAssignment !== undefined,
               nativeSessionBlank: nativeStart.kind === "new"
                 && nativeStart.parentNativeReference === undefined
             });
             if (workerWorkspace) store.setSetting("service", sessionId, WORKER_WORKSPACE_BINDING_KEY, workerWorkspace);
             groupAssignment?.commit();
+            taskModelAssignment?.bind(sessionId);
             this.#runtimeHandoffs.finishCreation(claim.operation.id);
             if ("onAdmitted" in input && input.onAdmitted !== undefined) input.onAdmitted(store, created);
             if ("onMessagingAdmitted" in input) input.onMessagingAdmitted?.(store, created);
@@ -15396,7 +15574,8 @@ export class SessionHost {
           this.#failExpiredApplicationInput(pending);
           continue;
         }
-        if (pending.body.nativeSteerTarget === undefined && this.#providerGroupApplies(pending)) {
+        const explicitModelGroup = this.#taskModelGroupApplies(pending);
+        if (pending.body.nativeSteerTarget === undefined && (explicitModelGroup || this.#providerGroupApplies(pending))) {
           if (listAllRuns(this.#store, { sessionId, activeOnly: true }).some(run => run.descriptor.id !== pending!.runId && run.descriptor.state !== "queued")) return;
           const candidate = pending;
           const queueIsCurrent = () => {
@@ -15407,9 +15586,18 @@ export class SessionHost {
           };
           if (!queueIsCurrent()) { this.scheduleQueueLockWakeup(sessionId); return; }
           try {
-            await this.#providerGroups!.service.beforeSend(sessionId, new AbortController().signal, pending.id, () => {
+            const assertQueueCurrent = () => {
               if (!queueIsCurrent()) throw new Error(PROVIDER_GROUP_SUPERSEDED_ERROR);
-            });
+            };
+            const signal = new AbortController().signal;
+            if (explicitModelGroup) {
+              const quota = await this.#providerGroups!.taskModels.boundQuota(sessionId, signal);
+              assertQueueCurrent();
+              if (this.#taskModelGroupApplies(candidate) && quota?.limited && quota.resetAt !== undefined
+                && quota.resetAt > Date.now() && quota.resetAt <= Date.now() + 8 * 24 * 60 * 60_000) {
+                throw new ProviderGroupUnavailableError(quota.resetAt);
+              }
+            } else await this.#providerGroups!.service.beforeSend(sessionId, signal, pending.id, assertQueueCurrent);
             const held = this.#heldProviderGroupRecovery(sessionId, pending.runId);
             if (held?.kind === "queue-head" && held.queueItemId === pending.id) {
               this.#writeQueuedProviderGroupWait(held); this.#cancelProviderGroupWait(sessionId);
@@ -15424,7 +15612,8 @@ export class SessionHost {
               && error.retryAt <= Date.now() + 8 * 24 * 60 * 60_000) {
               const previous = this.#heldProviderGroupRecovery(sessionId, pending.runId);
               const captured = previous ?? this.#holdProviderGroupRecovery(sessionId, pending.runId, { type: "error", terminal: true,
-                error: { code: "PROVIDER_GROUP_UNAVAILABLE", message: "This input is waiting for the Provider group's quota window.", phase: "dispatch", retryable: true,
+                error: { code: "PROVIDER_GROUP_UNAVAILABLE", message: explicitModelGroup ? "This input is waiting for the selected model's quota window."
+                  : "This input is waiting for the Provider group's quota window.", phase: "dispatch", retryable: true,
                   stateMayHaveChanged: false, recovery: "Keep this queued input or explicitly cancel it." } }, "queue-head");
               if (captured && captured.attempts < 32 && this.#providerGroupRecoverySourceCurrent(captured)) {
                 const wait = { ...captured, resumeAt: Math.ceil(error.retryAt), attempts: captured.attempts + 1 };
@@ -21142,6 +21331,9 @@ function createSessionOperationBody(input: SessionCreationInput): unknown {
     title: input.title,
     ...("provisionalDraftId" in input && input.provisionalDraftId !== undefined ? { provisionalDraftId: input.provisionalDraftId } : {}),
     ...("reuseProvisionalSessionId" in input && input.reuseProvisionalSessionId !== undefined ? { reuseProvisionalSessionId: input.reuseProvisionalSessionId } : {}),
+    ...("taskModelGroup" in input && input.taskModelGroup !== undefined ? { taskModelGroup: {
+      groupId: input.taskModelGroup.groupId, expectedRevision: input.taskModelGroup.expectedRevision.toString(), hasImages: input.taskModelGroup.hasImages
+    } } : {}),
     providerId: input.providerId,
     modelId: input.modelId,
     effort: input.effort,

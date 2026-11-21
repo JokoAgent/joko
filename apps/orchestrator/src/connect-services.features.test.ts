@@ -171,7 +171,7 @@ describe("Connect typed feature boundaries", () => {
 
   it("previews a self-hosted catalog with a one-shot key bound to the route and connection", async () => {
     const root = mkdtempSync(join(tmpdir(), "joko-provider-preview-connect-")); cleanupPaths.push(root);
-    const credentials = new CredentialManager({ vault: await CredentialVault.open(join(root, "vault.key")), directory: root });
+    const credentials = new CredentialManager({ vault: await CredentialVault.open(join(root, "vault.key")), storagePath: join(root, "credentials.json") });
     await credentials.initialize();
     const store = new OperationalStore(":memory:");
     store.upsertBackend({ id: "codex", adapterKind: "codex", instanceGeneration: 1, displayName: "Codex", version: "1", health: "healthy",
@@ -193,7 +193,8 @@ describe("Connect typed feature boundaries", () => {
     ] }));
     vi.stubGlobal("fetch", upstream);
     try {
-      const receipt = await invoke<contract.BeginCredentialUploadResponse>(services.credential.beginProviderModelPreviewUpload, route);
+      const receipt = await invoke<contract.BeginProviderModelPreviewUploadResponse>(services.credential.beginProviderModelPreviewUpload,
+        create(contract.BeginProviderModelPreviewUploadRequestSchema, { route }));
       const ticket = receipt.ticket!.ticketId;
       credentials.upload(ticket, fakeKey, connection.id);
       const preview = (requestedRoute: contract.ProviderModelPreviewRoute) => invoke<contract.PreviewProviderModelsResponse>(

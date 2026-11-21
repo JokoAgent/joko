@@ -416,8 +416,7 @@ describe("PiProviderAuthSupervisor", () => {
     expect(nativeModels.find((model) => model.providerId === "xiaomi" && model.modelId === "mimo-v2.6-pro"))
       .toMatchObject({ contextWindow: 1_048_576, maxOutputTokens: 131_072, supportsImages: true,
         thinkingLevels: [], pricing: { currencyCode: "CNY" } });
-    expect(nativeModels.find((model) => model.providerId === "xiaomi" && model.modelId === "mimo-v2.5"))
-      .toMatchObject({ defaultVisible: false });
+    expect(nativeModels.some((model) => model.providerId === "xiaomi" && model.modelId === "mimo-v2.5")).toBe(false);
     expect(nativeModels.find((model) => model.providerId === "xiaomi-token-plan-cn" && model.modelId === "mimo-v2.6-pro"))
       .toMatchObject({ contextWindow: 1_048_576, maxOutputTokens: 131_072, supportsImages: true,
         thinkingLevels: [], pricing: { currencyCode: "CNY" } });

@@ -3,16 +3,35 @@ import type { Client } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 
 export interface ProviderGroupSettingsApi {
+  readonly taskModels?: TaskModelGroupsApi;
   getProviderGroup(key: { readonly backendId: string; readonly providerId: string }, signal?: AbortSignal): Promise<contract.ProviderGroupSnapshot>;
   listProviderGroupCandidates(key: { readonly backendId: string; readonly providerId: string }, signal?: AbortSignal): Promise<readonly contract.ProviderGroupCandidate[]>;
   updateProviderGroup(key: { readonly backendId: string; readonly providerId: string }, expectedRevision: bigint, config: contract.ProviderGroupConfig | undefined, signal?: AbortSignal): Promise<contract.ProviderGroupSnapshot>;
   getProviderGroupUsage(query: Omit<contract.GetProviderGroupUsageRequest, "$typeName">, signal?: AbortSignal): Promise<readonly contract.ProviderGroupUsageRow[]>;
   getProviderGroupMemberAccountUsage(query: Omit<contract.GetProviderGroupMemberAccountUsageRequest, "$typeName">, signal?: AbortSignal): Promise<contract.GetProviderGroupMemberAccountUsageResponse>;
 }
+
+export interface TaskModelGroupsApi {
+  list(signal?: AbortSignal): Promise<contract.ListTaskModelGroupsResponse>;
+  save(expectedRevision: bigint, groups: readonly contract.TaskModelGroup[], signal?: AbortSignal): Promise<contract.TaskModelGroupConfig>;
+  preview(selection: Omit<contract.TaskModelGroupSelection, "$typeName">, signal?: AbortSignal): Promise<contract.PreviewTaskModelGroupResponse>;
+  switchOffer(request: Omit<contract.GetTaskModelGroupSwitchRequest, "$typeName">, signal?: AbortSignal): Promise<contract.TaskModelGroupSwitch | undefined>;
+  applySwitch?(offer: contract.TaskModelGroupSwitch, signal?: AbortSignal): Promise<void>;
+}
 /** The parent gateway owns the authenticated current-node client. Mutations
  * are never replayed after a transport failure or a configuration conflict. */
 export function createProviderGroupSettingsApi(client: Client<typeof contract.ProviderGroupService>): ProviderGroupSettingsApi {
   return {
+    taskModels: {
+      list: (signal) => client.listTaskModelGroups({}, { signal }),
+      save: async (expectedRevision, groups, signal) => {
+        const result = await client.saveTaskModelGroups({ expectedRevision, groups: [...groups] }, { signal });
+        if (!result.config) throw new Error("The saved model groups are unavailable.");
+        return result.config;
+      },
+      preview: (selection, signal) => client.previewTaskModelGroup({ selection }, { signal }),
+      switchOffer: async (request, signal) => (await client.getTaskModelGroupSwitch(request, { signal })).offer
+    },
     getProviderGroup: async (key, signal) => {
       const result = await client.getProviderGroup({ key }, { signal }); return assertSnapshot(result.group, key);
     },

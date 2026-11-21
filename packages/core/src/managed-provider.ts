@@ -5,6 +5,17 @@ import type {
   ProviderRuntimeSupport
 } from "./types.js";
 
+/** Per-model routes may change the API path while retaining the Provider's credential origin. */
+export function isSameOriginModelEndpoint(providerEndpoint: string | undefined, modelEndpoint: string): boolean {
+  if (providerEndpoint === undefined) return false;
+  try {
+    const provider = new URL(providerEndpoint);
+    const model = new URL(modelEndpoint);
+    return (model.protocol === "https:" || model.protocol === "http:") && model.origin === provider.origin
+      && !model.username && !model.password && !model.search && !model.hash;
+  } catch { return false; }
+}
+
 /** Private composition authority. None of these objects cross Store or Connect. */
 export interface ManagedProviderRouteOwner {
   readonly backendId: string;

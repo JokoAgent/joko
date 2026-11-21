@@ -4843,7 +4843,8 @@ const providerConfigurationFields = {
   model_thinking_levels: ProviderConfigurationField.MODEL_THINKING_LEVELS,
   model_sampling: ProviderConfigurationField.MODEL_SAMPLING,
   model_compatibility: ProviderConfigurationField.MODEL_COMPATIBILITY,
-  model_fast_mode: ProviderConfigurationField.MODEL_FAST_MODE
+  model_fast_mode: ProviderConfigurationField.MODEL_FAST_MODE,
+  model_endpoint: ProviderConfigurationField.MODEL_ENDPOINT
 } satisfies Record<NonNullable<BackendDescriptor["providerRuntimeSupport"]>["fields"][number], ProviderConfigurationField>;
 
 function providerApi(api: ProviderModel["api"]): ProviderApiCompatibility {

@@ -3689,7 +3689,7 @@ export function useAppController(): AppController {
     return artifactGateway.saveProvider(draft, signal);
   }, [artifactGateway, linkGatewayGeneration]);
   const previewProviderModels = useCallback<NonNullable<AppController["previewProviderModels"]>>(async (runtime, secret, signal) => {
-    if (artifactGateway === undefined || gatewayRef.current !== artifactGateway
+    if (artifactGateway?.previewProviderModels === undefined || gatewayRef.current !== artifactGateway
       || gatewayGenerationRef.current !== linkGatewayGeneration || connectionStateRef.current !== "connected") {
       throw new Error("The Provider configuration connection is no longer current.");
     }
