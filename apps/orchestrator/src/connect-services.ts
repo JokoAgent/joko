@@ -7073,7 +7073,8 @@ function operationResult(
   });
   if (outcome.accepted && outcome.providerModelWithdrawalReview) return create(contract.OperationResultSchema, {
     payload: { case: "providerModelWithdrawalReview", value: create(contract.ProviderModelWithdrawalReviewSchema, {
-      ...outcome.providerModelWithdrawalReview, models: [...outcome.providerModelWithdrawalReview.models]
+      ...outcome.providerModelWithdrawalReview,
+      models: outcome.providerModelWithdrawalReview.models.map(model => create(contract.ProviderModelWithdrawalCandidateSchema, model))
     }) }
   });
   if (outcome.accepted && outcome.pickedDirectory) {
