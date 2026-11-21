@@ -176,7 +176,7 @@ describe("remote Claude installation", () => {
     expect(script).toContain('HOME="$stage/home"');
     expect(script).toContain('env -i HOME="$stage/home"');
     expect(script).toContain('env -i HOME="$root/profile"');
-    expect(script).toContain('"@anthropic-ai/claude-agent-sdk":"0.3.292"');
+    expect(script).toContain('"@anthropic-ai/claude-agent-sdk":"0.3.321"');
     expect(script).toContain('"@anthropic-ai/sdk":"0.123.0"');
     expect(script).toContain('"@modelcontextprotocol/sdk":"1.29.0"');
     expect(script).toContain('"zod":"4.4.3"');
@@ -289,8 +289,8 @@ function probeOutput(
       overrides.claudeExecutable
         ?? `${root}/current/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude`,
       `${root}/run/manager.sock`,
-      overrides.sdk ?? "0.3.292",
-      overrides.cli ?? "2.1.292",
+      overrides.sdk ?? "0.3.321",
+      overrides.cli ?? "2.1.321",
       state,
       ""
     ].join("\0"), "utf8"),

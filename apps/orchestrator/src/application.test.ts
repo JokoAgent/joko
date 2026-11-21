@@ -737,7 +737,7 @@ describe("Orchestrator application composition", () => {
       installationState: "installed"
     });
     expect(application.store.getBackend("claude-code").descriptor.providerRuntimeSupport).toMatchObject({
-      protocols: ["anthropic-messages", "openai-responses"],
+      protocols: ["anthropic-messages", "openai-responses", "openai-completions"],
       fields: expect.arrayContaining(["model_limits"])
     });
     const claudeCapabilities = application.store.getBackend("claude-code").descriptor.capabilities;

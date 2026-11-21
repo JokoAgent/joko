@@ -3948,7 +3948,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       try {
         managedRoute = await waitFor(preparing, this.#initializationTimeoutMs, context.signal, managedRouteUnavailable);
         if (!managedProviderSupport(this.#managedProviders.support).protocols.includes(managedRoute.protocol)
-          || (managedRoute.protocol === "openai-responses" && (scoped.remote || context.hostedExecution))
+          || (managedRoute.protocol !== "anthropic-messages" && (scoped.remote || context.hostedExecution))
           || managedRoute.providerId !== providerId
           || managedRoute.model.providerId !== providerId || managedRoute.model.modelId !== modelId
           || managedRoute.model.api !== managedRoute.protocol) throw managedRouteUnavailable();
@@ -9397,7 +9397,7 @@ export const CLAUDE_MANAGED_PROVIDER_SUPPORT: ProviderRuntimeSupport = Object.fr
 
 export const CLAUDE_LOCAL_MANAGED_PROVIDER_SUPPORT: ProviderRuntimeSupport = Object.freeze({
   ...CLAUDE_MANAGED_PROVIDER_SUPPORT,
-  protocols: Object.freeze(["anthropic-messages", "openai-responses"] as const)
+  protocols: Object.freeze(["anthropic-messages", "openai-responses", "openai-completions"] as const)
 });
 
 function managedProviderSupport(support: ProviderRuntimeSupport): ProviderRuntimeSupport {
