@@ -368,10 +368,16 @@ export class PartialMessageBuffer {
 
 export function providerModel(model: ClaudeSdkModelInfo, projection: SafeProjection): ProviderModel {
   const modelId = projection.identifier(model.value, "unknown-model");
-  const estimate = claudeModelEstimate(modelId);
-  const pricing = catalogModelReferencePricing(modelId.startsWith("anthropic/") ? modelId : `anthropic/${modelId}`);
-  const thinkingLevels = estimate?.thinkingLevels
-    ?? (model.supportsEffort ? [...(model.supportedEffortLevels ?? ["low", "medium", "high"])] : []);
+  const resolved = model.resolvedModel === undefined ? undefined : projection.identifier(model.resolvedModel, "");
+  const catalogId = resolved && /^(?:anthropic\/)?claude-[a-z0-9.-]+$/iu.test(resolved) ? resolved : modelId;
+  const estimate = claudeModelEstimate(catalogId.replace(/^anthropic\//iu, ""));
+  const pricing = catalogModelReferencePricing(catalogId.startsWith("anthropic/") ? catalogId : `anthropic/${catalogId}`);
+  const declared = model.supportedEffortLevels;
+  const thinkingLevels = model.supportsEffort === false ? []
+    : declared !== undefined ? [...new Set(declared)]
+    : estimate?.thinkingLevels ?? (model.supportsEffort ? ["low", "medium", "high"] : []);
+  const defaultEffort = declared === undefined ? estimate?.defaultEffort
+    : thinkingLevels.includes("high") ? "high" : thinkingLevels.at(-1);
   return {
     providerId: "claude-code",
     modelId,
@@ -387,9 +393,9 @@ export function providerModel(model: ClaudeSdkModelInfo, projection: SafeProject
     ...(estimate?.maximumOutputTokens === undefined ? {} : { maxOutputTokensSource: "estimated" as const }),
     supportsImages: estimate?.supportsImages ?? false,
     ...(estimate?.defaultVisible === undefined ? {} : { defaultVisible: estimate.defaultVisible }),
-    supportsFastMode: model.supportsFastMode === true || estimate?.fastModeMultiplier !== undefined,
+    supportsFastMode: model.supportsFastMode ?? (estimate?.fastModeMultiplier !== undefined),
     thinkingLevels,
-    ...(estimate?.defaultEffort !== undefined && thinkingLevels.includes(estimate.defaultEffort) ? { defaultEffort: estimate.defaultEffort } : {}),
+    ...(defaultEffort !== undefined && thinkingLevels.includes(defaultEffort) ? { defaultEffort } : {}),
     cost: estimate?.price ?? {},
     ...(estimate?.price === undefined && pricing === undefined ? {} : {
       pricing: pricing ?? {

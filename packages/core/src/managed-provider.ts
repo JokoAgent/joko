@@ -79,6 +79,8 @@ export interface ManagedProviderRouteBinding {
   /** Exact model configuration: null disables an effort; absent keys retain identity mapping. */
   readonly thinkingLevelMap: Readonly<Record<string, string | null>>;
   readonly protocol: ProviderRuntimeProtocol;
+  /** The upstream accepts Anthropic's deferred MCP tool protocol. */
+  readonly supportsDeferredMcpTools?: boolean;
   readonly revision: string;
   readonly baseUrl: string;
   readonly apiKeyEnvironment: string;

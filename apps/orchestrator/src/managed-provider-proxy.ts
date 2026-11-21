@@ -252,6 +252,8 @@ export class ManagedProviderProxy {
         };
         const binding: ManagedProviderRouteBinding = {
           providerId: owner.providerId, model: { ...piProviderModel(entry.provider, model), contextWindow: model.contextWindow ?? 0, maxOutputTokens: model.maxTokens ?? 0 }, protocol,
+          ...(runtime.clientProtocol === "anthropic-messages" && protocol === "anthropic-messages"
+            && isOfficialAnthropicMessages(model.baseUrl ?? entry.provider.baseUrl, entry.requestPath) ? { supportsDeferredMcpTools: true } : {}),
           revision: state.revision, baseUrl: `${this.#origin}/managed/${state.id}`, apiKeyEnvironment: ENVIRONMENT_NAME,
           thinkingLevelMap: Object.freeze({ ...model.thinkingLevelMap }),
           assertCurrent,
@@ -1051,6 +1053,14 @@ function sameSmartThreadRoute(left: ActiveSmartThreadRoute, right: ActiveSmartTh
     && left.modelId === right.modelId
     && left.revision === right.revision
     && left.native === right.native;
+}
+
+function isOfficialAnthropicMessages(baseUrl: string | undefined, requestPath: string | undefined): boolean {
+  if (baseUrl === undefined) return false;
+  const base = new URL(baseUrl);
+  return base.origin === "https://api.anthropic.com" && (requestPath === undefined
+    ? ["/", "/v1", "/v1/"].includes(base.pathname)
+    : ["/v1/messages", "/v1/messages/"].includes(requestPath));
 }
 
 function requestSuffix(protocol: ProviderRuntimeProtocol, path: string): string | undefined {

@@ -12,6 +12,110 @@ import { SessionSdkOwner } from "./session-sdk-owner.js";
 
 const enabled = process.env["JOKO_CLAUDE_LOCAL_GATEWAY_PROBE"] === "1";
 
+test("resumes legacy minted tool call IDs through the bundled Claude CLI and sends both original results", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "joko-claude-legacy-tools-")));
+  const profile = join(root, "profile"), work = join(root, "workspace");
+  const requests: Record<string, unknown>[] = [];
+  const model = "claude-sonnet-4-6";
+  const starter = "Create a native record with both Read results.";
+  const continuation = "Continue with both stored results.";
+  const reads = ["first", "second"].map(label => ({ label, id: `toolu_seed_${label}`, path: join(work, `${label}.txt`) }));
+  let nextRead = 0;
+  const server = createServer(async (request, response) => {
+    const path = request.url?.split("?")[0];
+    if (request.method !== "POST" || !["/v1/messages", "/v1/messages/count_tokens"].includes(path ?? "")) {
+      request.resume();
+      response.writeHead(404).end();
+      return;
+    }
+    if (path?.endsWith("/count_tokens")) {
+      request.resume();
+      response.writeHead(200, { "content-type": "application/json" }).end('{"input_tokens":10}');
+      return;
+    }
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+    requests.push(payload);
+    const history = JSON.stringify(payload["messages"] ?? []);
+    if (history.includes(starter) && !history.includes(continuation) && nextRead < reads.length) {
+      const read = reads[nextRead++]!;
+      sendNativeReadMessage(response, model, read.id, read.path);
+      return;
+    }
+    sendTextMessage(response, model, "The continued transcript was received.");
+  });
+  let adapter: ClaudeCodeAdapter | undefined;
+  try {
+    await Promise.all([mkdir(profile), mkdir(work)]);
+    for (const read of reads) await writeFile(read.path, `Original ${read.label} tool result.\n`);
+    await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("The loopback Claude fixture did not bind.");
+    const overrides = { HOME: profile, USERPROFILE: profile, CLAUDE_CONFIG_DIR: profile,
+      ANTHROPIC_BASE_URL: `http://127.0.0.1:${address.port}`, ANTHROPIC_API_KEY: "legacy-transcript-fixture",
+      CLAUDE_CODE_OAUTH_TOKEN: undefined, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
+    const initial = query({ prompt: starter, options: { cwd: work, model,
+      env: { ...createChildRuntimeEnvironment({ overrides }).environment }, tools: ["Read"], settingSources: [], persistSession: true,
+      permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true } });
+    let nativeId: string | undefined;
+    try {
+      for await (const event of initial) {
+        if (event.type !== "result") continue;
+        expect(event.subtype).toBe("success");
+        nativeId = event.session_id;
+        break;
+      }
+    } finally { initial.close(); }
+    if (!nativeId) throw new Error("The bundled CLI did not create a native Session.");
+    const projects = join(profile, "projects");
+    const [project] = await readdir(projects);
+    if (!project) throw new Error("The bundled CLI did not store a project.");
+    const path = join(projects, project, `${nativeId}.jsonl`);
+    const raw = await readFile(path, "utf8");
+    let legacy = raw;
+    for (const read of reads) {
+      expect(raw).toContain(`"tool_use_id":"${read.id}"`);
+      expect(raw).toContain(`Original ${read.label} tool result.`);
+      legacy = legacy.replaceAll(`"${read.id}"`, '"Read_38"');
+    }
+    await writeFile(path, legacy);
+
+    adapter = new ClaudeCodeAdapter({ instanceGeneration: 1, environment: overrides, settingSources: [],
+      probeCwd: work, initializationTimeoutMs: 30_000 });
+    const target: TargetDescriptor = { id: "legacy-tool-transcript", backendId: adapter.id, displayName: "Legacy Claude tools",
+      workspaceRoot: work, managed: false, trusted: true };
+    const events: EventPayload[] = [];
+    const signal = AbortSignal.timeout(55_000);
+    const context: AdapterContext = { sessionId: "legacy-cli-tool-task", generation: 1, backendInstanceGeneration: 1,
+      target, signal, emit: async event => { events.push(event); }, requestInteraction: async () => ({ kind: "cancelled" }),
+      artifactCapacityBytes: 1024, storeArtifact: async () => { throw new Error("This fixture does not create artifacts."); } };
+    const binding = await adapter.resolveNativeSessionReference(`claude-code:session:${nativeId}`, target, 1);
+    await adapter.resumeSession(binding, { ...context, binding });
+    expect(await readFile(path, "utf8")).not.toContain('"tool_use_id":"Read_38"');
+    await adapter.send({ text: continuation, images: [], files: [], mentions: [], disposition: "prompt" },
+      { ...context, binding, operationId: "legacy-tool-turn" });
+    await vi.waitFor(() => expect(events.at(-1)).toMatchObject({ type: "done", outcome: "completed" }), { timeout: 38_000 });
+    const messages = requests.filter(request => JSON.stringify(request["messages"] ?? []).includes(continuation)).at(-1)?.["messages"] as
+      { readonly content: string | { readonly type: string; readonly id?: string; readonly tool_use_id?: string; readonly content?: unknown }[] }[] | undefined;
+    const blocks = (messages ?? []).flatMap(message => typeof message.content === "string" ? [] : message.content);
+    const first = blocks.find(block => block.type === "tool_result" && JSON.stringify(block.content).includes("Original first tool result."));
+    const second = blocks.find(block => block.type === "tool_result" && JSON.stringify(block.content).includes("Original second tool result."));
+    expect(first?.tool_use_id).toMatch(/^toolu_joko_/u);
+    expect(second?.tool_use_id).toMatch(/^toolu_joko_/u);
+    expect(second?.tool_use_id).not.toBe(first?.tool_use_id);
+    expect(blocks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "tool_use", id: first?.tool_use_id }),
+      expect.objectContaining({ type: "tool_use", id: second?.tool_use_id })
+    ]));
+  } finally {
+    await adapter?.dispose();
+    server.closeAllConnections();
+    if (server.listening) await new Promise<void>(done => server.close(() => done()));
+    await rm(root, { recursive: true, force: true, maxRetries: 8 });
+  }
+}, 75_000);
+
 test.skipIf(!enabled)("continues a portable Claude transcript in a cold independent profile and workspace", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "joko-claude-portable-")));
   const fromProfile = join(root, "from-profile"), fromProject = join(root, "from-project");
@@ -845,6 +949,19 @@ function sendTextMessage(response: ServerResponse, model: string, text: string):
   send("content_block_delta", { index: 0, delta: { type: "text_delta", text } });
   send("content_block_stop", { index: 0 });
   send("message_delta", { delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 5 } });
+  send("message_stop", {});
+  response.end();
+}
+
+function sendNativeReadMessage(response: ServerResponse, model: string, id: string, filePath: string): void {
+  response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+  const send = (type: string, value: Record<string, unknown>) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...value })}\n\n`);
+  send("message_start", { message: { id: `msg_${id}`, type: "message", role: "assistant", model, content: [],
+    stop_reason: null, stop_sequence: null, usage: { input_tokens: 5, output_tokens: 0 } } });
+  send("content_block_start", { index: 0, content_block: { type: "tool_use", id, name: "Read", input: {} } });
+  send("content_block_delta", { index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify({ file_path: filePath }) } });
+  send("content_block_stop", { index: 0 });
+  send("message_delta", { delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 5 } });
   send("message_stop", {});
   response.end();
 }

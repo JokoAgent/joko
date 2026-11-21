@@ -42,6 +42,19 @@ afterEach(async () => {
 });
 
 describe("ModelPicker", () => {
+  it.each([true, false])("honors the projected Fast ability when the Backend has a Fast-capable model (%s)", async (supportsFast) => {
+    const onSelect = vi.fn();
+    const candidate = { ...models[1]!, supportsFast };
+    await renderPicker(onSelect, "owner-one", undefined, false, undefined, [models[0]!, candidate]);
+    await openPicker();
+    await act(async () => required(findRow("Large").querySelector<HTMLButtonElement>(".model-picker__configure")).click());
+    const toggle = required(document.querySelector<HTMLInputElement>('.model-picker__config-flyout input[type="checkbox"]'));
+    expect(toggle.disabled).toBe(!supportsFast);
+    await act(async () => toggle.click());
+    await act(async () => findRow("Large").click());
+    expect(onSelect).toHaveBeenLastCalledWith(expect.objectContaining({ modelId: candidate.modelId, fastMode: supportsFast }));
+  });
+
   it("saves and selects an advertised Ultrafast configuration as a distinct value", async () => {
     const declared = { ...models[0]!, supportsUltrafast: true }, onSelect = vi.fn();
     await renderPicker(onSelect, "owner-one", undefined, false, undefined, [declared]); await openPicker();

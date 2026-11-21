@@ -526,13 +526,30 @@ describe("ClaudeCodeAdapter", () => {
   });
   test("preserves native model metadata presence independently of known capacity estimates", async () => {
     const runtime = new FakeSdkRuntime(), adapter = adapterFor(runtime);
-    runtime.probeInitialization = { ...initialization(), models: [{ value: "claude-opus-5-5", displayName: "Native model", description: "Native description", supportsEffort: true, supportedEffortLevels: ["high"], supportsFastMode: false }, { value: "future-model", displayName: "Future", description: "Future description" }] };
+    runtime.probeInitialization = runtime.queryInitialization = { ...initialization(), models: [
+      { value: "claude-opus-5-5", displayName: "Native model", description: "Native description", supportsEffort: true, supportedEffortLevels: ["high"], supportsFastMode: false },
+      { value: "future-model", displayName: "Future", description: "Future description" },
+      { value: "claude-haiku-5-5", displayName: "Effort disabled", description: "Disabled by the SDK", supportsEffort: false },
+      { value: "claude-sonnet-5-5", displayName: "Effort omitted", description: "No effort declaration" },
+      { value: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus alias", description: "Native alias", supportsFastMode: true }
+    ] };
     try {
       const models = (await adapter.describe()).models;
-      expect(models[0]).toMatchObject({ description: "Native description", declaredSupportsFastMode: false, contextWindowSource: "estimated", maxOutputTokensSource: "estimated", protocolMode: "matching" });
-      expect(models[0]!.defaultEffort).toBe("medium"); expect(models[0]!.declaredSupportsImages).toBeUndefined();
+      expect(models[0]).toMatchObject({ description: "Native description", declaredSupportsFastMode: false, supportsFastMode: false,
+        contextWindowSource: "estimated", maxOutputTokensSource: "estimated", protocolMode: "matching" });
+      expect(models[0]).toMatchObject({ defaultEffort: "high", thinkingLevels: ["high"] });
+      expect(models[0]!.declaredSupportsImages).toBeUndefined();
       expect(models[1]!.defaultEffort).toBeUndefined(); expect(models[1]!.declaredSupportsFastMode).toBeUndefined(); expect(models[1]!.contextWindowSource).toBeUndefined();
-      expect(models).toHaveLength(2);
+      expect(models[2]!.thinkingLevels).toEqual([]);
+      expect(models[2]!.defaultEffort).toBeUndefined();
+      expect(models[3]!.thinkingLevels).toContain("medium");
+      expect(models[4]).toMatchObject({ modelId: "opus", supportsFastMode: true, contextWindow: 1_000_000,
+        maxOutputTokens: 128_000, supportsImages: true, pricing: models[0]!.pricing });
+      const binding = await adapter.createSession(createInput({ providerId: "claude-code", modelId: "claude-opus-5-5" }), contextFor().context);
+      const context = contextFor(binding).context;
+      await expect(adapter.setEffort("medium", context)).rejects.toMatchObject({ publicError: { code: "EFFORT_UNAVAILABLE" } });
+      await expect(adapter.setEffort(models[0]!.defaultEffort!, context)).resolves.toBeUndefined();
+      await expect(adapter.setFastMode(true, context)).rejects.toMatchObject({ publicError: { code: "FAST_MODE_UNAVAILABLE" } });
     } finally { await adapter.dispose(); }
   });
   test("applies working context to same UUID Query replacements and retains the active turn budget", async () => {
@@ -1246,7 +1263,7 @@ describe("ClaudeCodeAdapter", () => {
   test("keeps the Claude SDK on the managed Messages transport when the selected account speaks Responses", async () => {
     const managed = managedProviderFixture({}, {}, "openai-responses");
     const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model" } });
-    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port, settingSources: [] });
     try {
       const descriptor = await adapter.describe();
       expect(descriptor.providerRuntimeSupport?.protocols).toEqual(["openai-responses"]);
@@ -1255,7 +1272,7 @@ describe("ClaudeCodeAdapter", () => {
       const binding = await adapter.createSession(createInput(modelSelection), contextFor().context);
       const query = runtime.queries[0]!;
       expect(query.params.options.env).toMatchObject({ ANTHROPIC_BASE_URL: "http://127.0.0.1:31415/routes/fixture",
-        ANTHROPIC_API_KEY: managed.token, CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1" });
+        ANTHROPIC_API_KEY: managed.token, CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1", ENABLE_TOOL_SEARCH: "false" });
       const turn = contextFor(binding, { operationId: "openai-responses-ordinary-turn" });
       await adapter.send(textPrompt("send through the original Claude input"), { ...turn.context, modelSelection });
       expect(managed.activations).toHaveLength(1);
@@ -1263,6 +1280,25 @@ describe("ClaudeCodeAdapter", () => {
       await eventually(() => turn.events.some((event) => event.type === "done"));
       expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
     } finally { await adapter.dispose(); }
+  });
+
+  test("uses the current local owner's explicit Claude ToolSearch preference for a managed connection", async () => {
+    const profile = await mkdtemp(join(tmpdir(), "joko-claude-tool-search-"));
+    const modelSelection = { providerId: "configured-provider", modelId: "configured-model" };
+    try {
+      await writeFile(join(profile, "settings.json"), '\uFEFF{ // owner settings\n"env": {"ENABLE_TOOL_SEARCH":"TRUE",}, "anotherSetting": "// preserved", }');
+      for (const [environmentChoice, expected] of [[undefined, "true"], ["auto:12", "auto:12"]] as const) {
+        const managed = managedProviderFixture();
+        const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: modelSelection.modelId } });
+        const adapter = adapterFor(runtime, { managedProviders: managed.port,
+          environment: { CLAUDE_CONFIG_DIR: profile, ENABLE_TOOL_SEARCH: environmentChoice } });
+        try {
+          await adapter.describe();
+          await adapter.createSession(createInput(modelSelection), contextFor().context);
+          expect(runtime.queries[0]!.params.options.env["ENABLE_TOOL_SEARCH"]).toBe(expected);
+        } finally { await adapter.dispose(); }
+      }
+    } finally { await rm(profile, { recursive: true, force: true }); }
   });
 
   test("runs a foreground managed Agent in an independently configured exact child Query", async () => {
@@ -3078,7 +3114,7 @@ describe("ClaudeCodeAdapter", () => {
       models: [initialization().models[0]!],
       account: { email: "developer@example.test" }
     };
-    runtime.probeCliVersion = "2.1.240";
+    runtime.probeCliVersion = "2.1.322";
     const probeCwd = resolve(process.cwd(), "probe-workspace");
     const adapter = adapterFor(runtime, { probeCwd });
 
@@ -3086,7 +3122,8 @@ describe("ClaudeCodeAdapter", () => {
     expect(first.authenticationState).toBe("authenticated");
     expect(first.models.map((model) => model.modelId)).toEqual(["model-a"]);
     expect(first.capabilities.get("model.effort")?.supported).toBe(true);
-    expect(first.version).toContain("cli-2.1.240");
+    expect(first.version).toContain("cli-2.1.322");
+    expect(first.capabilities.get("turn.steer")?.supported).toBe(false);
     expect(runtime.queries).toEqual([]);
     expect(runtime.probeInputs).toEqual([expect.objectContaining({
       cwd: probeCwd,

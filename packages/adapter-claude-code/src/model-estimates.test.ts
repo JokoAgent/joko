@@ -48,12 +48,17 @@ describe("Claude model estimates", () => {
       maxOutputTokens: 128_000,
       maxOutputTokensSource: "estimated",
       supportsImages: true,
-      supportsFastMode: true,
-      thinkingLevels: ["low", "medium", "high", "xhigh", "max"],
-      defaultEffort: "medium",
+      supportsFastMode: false,
+      thinkingLevels: [],
       cost: { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 },
       pricing
     });
+    const model = { value: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus", description: "" };
+    const projection = new SafeProjection([]);
+    expect(providerModel(model, projection)).toMatchObject({ modelId: "opus", contextWindow: 1_000_000,
+      maxOutputTokens: 128_000, supportsImages: true, defaultEffort: "medium", supportsFastMode: true, pricing });
+    expect(providerModel({ ...model, supportsEffort: true, supportedEffortLevels: ["low", "high"], supportsFastMode: true }, projection))
+      .toMatchObject({ modelId: "opus", thinkingLevels: ["low", "high"], defaultEffort: "high", declaredSupportsFastMode: true, supportsFastMode: true });
   });
 
   it.each(["claude-fable-5", "claude-opus-5", "claude-opus-4-8"])(
