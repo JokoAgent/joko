@@ -75,4 +75,18 @@ describe("runtime command state", () => {
       expect(materializedRuntimeCommands({ format: 1, generation: 2, observedAt: 10, commands: [candidate] })).toBeUndefined();
     }
   });
+
+  it.each(["plugin_creator", "skill_creator"] as const)("retains the exact %s bundle through observation and v1 projection", (id) => {
+    const digest = "a".repeat(64);
+    const revision = `sha256:${digest}`;
+    const command = { name: "creator", description: "Author a package", source: "skill" as const, loaded: true,
+      resourceId: `builtin:${id}:${digest}`, inputMode: "resource_mention" as const, builtinSkill: { id, revision } };
+    const restored = materializedRuntimeCommands(runtimeCommandsObservation(2, [command]))!.commands[0]!;
+    const wire = toProtoRuntimeCommand(restored, "authoring");
+    expect(wire.builtinSkill?.id).toBe(id === "plugin_creator" ? id : undefined);
+    expect(wire.skillCreatorRevision).toBe(id === "skill_creator" ? revision : undefined);
+    expect(fromProtoRuntimeCommand(wire)).toEqual(command);
+    expect(sameRuntimeCommands([command], [{ ...command, builtinSkill: undefined }])).toBe(false);
+    expect(() => normalizeRuntimeCommands([{ ...command, resourceId: "user-skill" }])).toThrow("invalid shipped Skill identity");
+  });
 });

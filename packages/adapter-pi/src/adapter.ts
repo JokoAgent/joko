@@ -7477,7 +7477,7 @@ export function resolvePiComposerSlashCommand(
     const aliases = commands.filter((candidate) => candidate.loaded && candidate.name === invocation);
     const skill = aliases[0];
     if (aliases.length === 1 && skill?.source === "skill" && skill.inputMode === "text"
-      && skill.builtinSkill === undefined && validResourceUsageIdentity(skill.resourceId, 4_096)) {
+      && skill.builtinSkill?.id !== "plugin_creator" && validResourceUsageIdentity(skill.resourceId, 4_096)) {
       return { message: `/${invocation}${text.slice(requested.length + 1)}`, skillResourceId: skill.resourceId };
     }
   }

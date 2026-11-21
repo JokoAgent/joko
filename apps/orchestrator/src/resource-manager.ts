@@ -2628,7 +2628,9 @@ export class PiResourceManager {
       const sourceOwns = this.#runtimeCatalogSource(catalogSource, runtimeOwner);
       const seeds: ApprovedSkillSeed[] = [];
       if (this.#builtinSkills && this.#backendSupportsResourceKind(backendId, "skill") && allowedSkillIds === undefined) {
-        seeds.push(...await this.#builtinSkills.snapshot(() => this.#assertTargetOwner(backendId, targetId, runtimeOwner), signal));
+        const localAuthoring = runtimeOwner !== undefined && runtimeOwner.target.trusted && runtimeOwner.target.remoteWorkspace === undefined
+          && runtimeOwner.hostedExecution === undefined && runtimeOwner.runtimePolicy !== "review_read_only";
+        seeds.push(...await this.#builtinSkills.snapshot(() => this.#assertTargetOwner(backendId, targetId, runtimeOwner), signal, localAuthoring));
       }
       for (const record of this.#records.values()) {
         if (record.backendId !== backendId && !sourceOwns(record) && !(runtimeOwner !== undefined && record.targetId === targetId
@@ -5882,7 +5884,12 @@ async function discoverCanonicalProjectCandidates(
     const claudeRoot = join(workspaceRoot, ".claude");
     await assertOptionalSafeDirectory(workspaceRoot, claudeRoot, "Claude project resource root");
     if (kinds.has("skill")) {
+      const agentsRoot = join(workspaceRoot, ".agents");
+      await assertOptionalSafeDirectory(workspaceRoot, agentsRoot, "Project resource root");
       for (const sourcePath of await discoverClaudeSkillEntries(workspaceRoot, join(claudeRoot, "skills"))) {
+        push("skill", sourcePath);
+      }
+      for (const sourcePath of await discoverSkillEntries(workspaceRoot, join(agentsRoot, "skills"))) {
         push("skill", sourcePath);
       }
     }

@@ -20302,8 +20302,11 @@ function extensionSetupFieldKind(value: ProtoExtensionSetupFieldKind): Extension
 }
 
 function mapRuntimeCommand(command: RuntimeCommand): RuntimeCommandView {
-  if (command.builtinSkill !== undefined && (command.builtinSkill.id !== "plugin_creator"
-    || !/^sha256:[a-f0-9]{64}$/u.test(command.builtinSkill.revision) || command.source !== 3 || !command.loaded || !command.resourceId)) {
+  const legacy = command.builtinSkill;
+  const creatorRevision = command.skillCreatorRevision;
+  const revision = creatorRevision ?? legacy?.revision;
+  if (legacy !== undefined && (legacy.id !== "plugin_creator" || creatorRevision !== undefined)
+    || revision !== undefined && (!/^sha256:[a-f0-9]{64}$/u.test(revision) || command.source !== 3 || !command.loaded || !command.resourceId)) {
     throw new GatewayError("Orchestrator returned an invalid built-in Skill attestation.");
   }
   const inputMode = command.inputMode === 1 ? "text" : command.inputMode === 2 ? "resource_mention" : undefined;
@@ -20318,7 +20321,7 @@ function mapRuntimeCommand(command: RuntimeCommand): RuntimeCommandView {
     source: runtimeCommandSource(command.source),
     inputMode,
     ...(command.resourceId.length > 0 ? { resourceId: command.resourceId } : {}),
-    ...(command.builtinSkill === undefined ? {} : { builtinSkill: { id: "plugin_creator" as const, revision: command.builtinSkill.revision } }),
+    ...(revision === undefined ? {} : { builtinSkill: { id: creatorRevision === undefined ? "plugin_creator" as const : "skill_creator" as const, revision } }),
     loaded: command.loaded
   };
 }

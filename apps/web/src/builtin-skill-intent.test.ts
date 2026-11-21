@@ -1,5 +1,5 @@
 import { expect, it, vi } from "vitest";
-import { builtinSkillIntentForText, pluginCreatorDraft, resolveBuiltinSkillDraft } from "./builtin-skill-intent.js";
+import { builtinSkillIntentForText, pluginCreatorDraft, resolveBuiltinSkillDraft, skillCreatorDraft } from "./builtin-skill-intent.js";
 import type { ComposerDraft, RuntimeCommandView, SessionResourceView } from "./model.js";
 const revision = "sha256:" + "a".repeat(64);
 const input: ComposerDraft = { builtinSkillIntent: "plugin_creator", text: "/joko-plugin-creator Build a timer", mentions: [], attachments: [], deliveryMode: "prompt" };
@@ -19,10 +19,21 @@ it("uses an exact loaded resource mention so a native slash-command collision ca
 });
 it("rejects same-name user Skills, absent or changed environments and leaves the original draft intact", async () => {
   const api = { listCommands: vi.fn(async (): Promise<readonly RuntimeCommandView[]> => [{ ...command, builtinSkill: undefined }]), listSessionResources: vi.fn(async () => [resource]) };
-  await expect(resolveBuiltinSkillDraft(input, "task", 3n, api, new AbortController().signal)).rejects.toThrow("no available");
+  await expect(resolveBuiltinSkillDraft(input, "task", 3n, api, new AbortController().signal)).rejects.toThrow("does not offer /joko-plugin-creator");
   api.listCommands.mockResolvedValue([command]); api.listSessionResources.mockResolvedValue([{ ...resource, runtimeGeneration: 4 }]);
   await expect(resolveBuiltinSkillDraft(input, "task", 3n, api, new AbortController().signal)).rejects.toThrow("owner changed");
   expect(input.mentions).toHaveLength(0); expect(input.builtinSkillIntent).toBe("plugin_creator");
   const controller = new AbortController(); controller.abort();
   await expect(resolveBuiltinSkillDraft(input, "task", 3n, api, controller.signal)).rejects.toThrow();
+});
+
+it("opens ordinary Skill authoring from a draft and invokes only the exact observed creator", async () => {
+  const draft = skillCreatorDraft(pluginCreatorDraft());
+  expect(draft.text).toBe("/joko-skill-creator");
+  const input: ComposerDraft = { ...draft, mentions: [], attachments: [], deliveryMode: "prompt" };
+  const api = { listCommands: async () => [command, { ...command, builtinSkill: { id: "skill_creator" as const, revision } }],
+    listSessionResources: async () => [resource] };
+  const resolved = await resolveBuiltinSkillDraft(input, "task", 3n, api, new AbortController().signal);
+  expect(resolved.mentions[0]).toMatchObject({ token: "/joko-skill-creator", reference: resource.id, discoveredRevision: revision });
+  expect(resolved.inlineMentionRanges?.[0]?.to).toBe(draft.text.length);
 });

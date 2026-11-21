@@ -2909,7 +2909,7 @@ export function toProtoRuntimeCommand(
   sessionId: string
 ): contract.RuntimeCommand {
   const normalizedSessionId = requireText(sessionId, "runtime_command.session_id");
-  if (item.builtinSkill && (item.builtinSkill.id !== "plugin_creator" || !/^sha256:[a-f0-9]{64}$/u.test(item.builtinSkill.revision)
+  if (item.builtinSkill && ((item.builtinSkill.id !== "plugin_creator" && item.builtinSkill.id !== "skill_creator") || !/^sha256:[a-f0-9]{64}$/u.test(item.builtinSkill.revision)
     || item.source !== "skill" || !item.loaded || !item.resourceId)) throw new ProtoMappingError("unsupported_mapping", "runtime_command.builtin_skill", "Invalid built-in Skill attestation.");
   const inputMode = item.inputMode === "text" ? contract.RuntimeCommandInputMode.TEXT
     : item.inputMode === "resource_mention" ? contract.RuntimeCommandInputMode.RESOURCE_MENTION : undefined;
@@ -2928,7 +2928,8 @@ export function toProtoRuntimeCommand(
       backend: contract.RuntimeCommandSource.BACKEND
     }[item.source],
     resourceId: item.resourceId ?? "",
-    ...(item.builtinSkill === undefined ? {} : { builtinSkill: message<contract.BuiltinSkillIdentity>("joko.v1.BuiltinSkillIdentity", item.builtinSkill) }),
+    ...(item.builtinSkill?.id === "plugin_creator" ? { builtinSkill: message<contract.BuiltinSkillIdentity>("joko.v1.BuiltinSkillIdentity", item.builtinSkill) } : {}),
+    ...(item.builtinSkill?.id === "skill_creator" ? { skillCreatorRevision: item.builtinSkill.revision } : {}),
     inputMode,
     loaded: item.loaded,
     sessionId: normalizedSessionId
@@ -2936,8 +2937,13 @@ export function toProtoRuntimeCommand(
 }
 
 export function fromProtoRuntimeCommand(item: contract.RuntimeCommand): CoreRuntimeCommand {
-  if (item.builtinSkill && (item.builtinSkill.id !== "plugin_creator" || !/^sha256:[a-f0-9]{64}$/u.test(item.builtinSkill.revision)
-    || item.source !== contract.RuntimeCommandSource.SKILL || !item.loaded || !item.resourceId)) throw new ProtoMappingError("unsupported_mapping", "runtime_command.builtin_skill", "Invalid built-in Skill attestation.");
+  const legacy = item.builtinSkill;
+  const creatorRevision = item.skillCreatorRevision;
+  const revision = creatorRevision ?? legacy?.revision;
+  if (legacy !== undefined && (legacy.id !== "plugin_creator" || creatorRevision !== undefined)
+    || revision !== undefined && (!/^sha256:[a-f0-9]{64}$/u.test(revision) || item.source !== contract.RuntimeCommandSource.SKILL || !item.loaded || !item.resourceId)) {
+    throw new ProtoMappingError("unsupported_mapping", "runtime_command.builtin_skill", "Invalid built-in Skill attestation.");
+  }
   const inputMode = item.inputMode === contract.RuntimeCommandInputMode.TEXT ? "text"
     : item.inputMode === contract.RuntimeCommandInputMode.RESOURCE_MENTION ? "resource_mention" : undefined;
   if (inputMode === undefined || (inputMode === "resource_mention" && (!item.loaded || !item.resourceId))) {
@@ -2962,7 +2968,7 @@ export function fromProtoRuntimeCommand(item: contract.RuntimeCommand): CoreRunt
     source,
     inputMode,
     ...(item.resourceId === "" ? {} : { resourceId: requireText(item.resourceId, "runtime_command.resource_id") }),
-    ...(item.builtinSkill ? { builtinSkill: { id: "plugin_creator" as const, revision: item.builtinSkill.revision } } : {}),
+    ...(revision === undefined ? {} : { builtinSkill: { id: creatorRevision === undefined ? "plugin_creator" as const : "skill_creator" as const, revision } }),
     loaded: item.loaded
   };
 }

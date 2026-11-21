@@ -31,11 +31,13 @@ test("Runtime command input modes preserve explicit text and selected Resource s
   assert.equal(contract.RuntimeCommandInputMode.UNSPECIFIED, 0);
   assert.equal(create(contract.RuntimeCommandSchema).inputMode, contract.RuntimeCommandInputMode.UNSPECIFIED);
   assert.equal(contract.RuntimeCommandSchema.fields.find(field => field.name === "input_mode").number, 8);
+  assert.equal(contract.RuntimeCommandSchema.fields.find(field => field.name === "skill_creator_revision").number, 10);
+  assert.equal(create(contract.RuntimeCommandSchema).skillCreatorRevision, undefined);
   for (const inputMode of [contract.RuntimeCommandInputMode.TEXT, contract.RuntimeCommandInputMode.RESOURCE_MENTION]) {
     const command = create(contract.RuntimeCommandSchema, { name: "report", resourceId: "opaque-resource", loaded: true, inputMode });
     assert.deepEqual(fromBinary(contract.RuntimeCommandSchema, toBinary(contract.RuntimeCommandSchema, command)), command);
   }
-  assert.deepEqual([...fieldNames(contract.RuntimeCommandSchema)], ["command_id", "name", "description", "source", "resource_id", "loaded", "session_id", "input_mode", "builtin_skill"]);
+  assert.deepEqual([...fieldNames(contract.RuntimeCommandSchema)], ["command_id", "name", "description", "source", "resource_id", "loaded", "session_id", "input_mode", "builtin_skill", "skill_creator_revision"]);
 });
 
 test("Model working context and declared metadata preserve strict optional presence and exact route CAS", () => {

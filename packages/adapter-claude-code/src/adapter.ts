@@ -2000,7 +2000,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       if (discovery || loaded?.kind !== "skill" || loaded.revision !== revision) continue;
       const command = { name, source: "skill" as const, inputMode: "resource_mention" as const, loaded: true, resourceId: id };
       if (trustedBuiltin !== undefined) {
-        commands.push({ ...command, description: "Create or update a Joko plugin using the shipped authoring instructions.", builtinSkill: trustedBuiltin });
+        const description = trustedBuiltin.id === "skill_creator" ? "Create or update a reusable local Agent Skill."
+          : "Create or update a Joko plugin using the shipped authoring instructions.";
+        commands.push({ ...command, description, builtinSkill: trustedBuiltin });
       } else if (!snapshot.restrictImplicit && context.target.trusted && loaded.resourceVersion === resourceVersion
         && snapshot.skillOverrides[name] !== "off" && names.get(name.toLowerCase()) === 1
         && name.length <= 256 && /^[^\s/\\\u0000-\u001f\u007f]+$/u.test(name) && !isProductSlashCommand(name)) {

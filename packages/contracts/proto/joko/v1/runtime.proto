@@ -1140,8 +1140,10 @@ message RuntimeCommand {
   // snapshots, where commands from multiple Sessions share one collection.
   string session_id = 7;
   RuntimeCommandInputMode input_mode = 8;
-  // Attested by the service-owned bundle and the exact observed native loader path.
+  // Plugin creator attestation used by the original v1 clients.
   BuiltinSkillIdentity builtin_skill = 9;
+  // A local Skill creator loaded from the service-owned bundle in this task.
+  optional string skill_creator_revision = 10;
 }
 
 message BuiltinSkillIdentity {

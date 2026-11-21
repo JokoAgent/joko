@@ -5270,6 +5270,7 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .skill-search > input::placeholder { color: var(--text-faint); }
 .skill-catalog__toolbar > .select-control { width: 100%; min-height: 34px; border-radius: 9px; background-color: var(--surface); font-size: var(--text-10); }
 .skill-catalog__toolbar > .icon-button { width: 32px; height: 32px; }
+.skill-catalog__creator { grid-column: 1 / -1; }
 .skill-catalog__groups { min-height: 0; display: flex; flex: 1; flex-direction: column; gap: 13px; overflow-y: auto; padding: 9px 7px 16px; }
 .skill-catalog__groups > section > h3, .skill-recoveries > h3 { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0; padding: 5px 8px; color: var(--text-faint); font-size: var(--text-9); font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
 .skill-catalog__groups > section > h3 span { min-width: 18px; text-align: right; }
