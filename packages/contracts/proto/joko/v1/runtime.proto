@@ -211,6 +211,7 @@ message Target {
   // Current project policy for SSH Worktree derivation. Capability and source
   // lease checks still apply at dispatch.
   optional bool ssh_worktree_derivation_allowed = 12;
+  bool project_archive_preserves_files = 13;
 }
 
 enum SessionState {

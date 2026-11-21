@@ -2752,6 +2752,21 @@ export function createConnectServices(application: OrchestratorApplication, proj
       authenticate(context);
       return { target: toProtoTarget(requireUndeletedTarget(dependencies.store, request.targetId)) };
     },
+    getProjectArchivePreview: (request, context) => {
+      authenticate(context);
+      const target = requireLocalProjectArchiveTarget(dependencies.store, request.targetId);
+      const members = dependencies.store.listSessions({ excludeHidden: true }).flatMap(stored => {
+        const session = stored.descriptor;
+        if (session.projectId !== request.targetId || !dependencies.sessionHost.isProjectArchiveMember(stored)) return [];
+        const blocker = projectArchiveBlocker(dependencies, stored);
+        const schedules = blocker === contract.ProjectArchiveBlocker.UNSPECIFIED
+          ? dependencies.store.readSessionArchiveSchedules(session.id) : undefined;
+        return [{ sessionId: session.id, revision: toProtoRevision(stored.revision), blocker,
+          activeScheduleCount: schedules?.count ?? 0, archiveConfirmation: schedules?.confirmation ?? "",
+          activeScheduleNames: schedules === undefined ? [] : [...schedules.names] }];
+      });
+      return { targetId: request.targetId, targetRevision: toProtoRevision(target.revision), members };
+    },
     listProjectDirectories: async (request, context) => {
       const connection = authenticate(context);
       const listing = await listProjectDirectories(request.path, context.signal);
@@ -8758,6 +8773,28 @@ function assertSessionArchiveIdle(store: OperationalStore, sessionId: string): v
       Code.FailedPrecondition
     );
   }
+}
+
+function requireLocalProjectArchiveTarget(store: OperationalStore, targetId: string): StoredTarget {
+  const target = requireUndeletedTarget(store, targetId);
+  if (target.descriptor.remoteWorkspace !== undefined) throw new ConnectError("A local project is required.", Code.FailedPrecondition);
+  const state = asRecord(target.metadata)["state"];
+  if (state === "deleting" || state === "archived") throw new ConnectError("An active project is required.", Code.FailedPrecondition);
+  return target;
+}
+
+function projectArchiveBlocker(dependencies: ConnectServiceDependencies, stored: StoredSession): contract.ProjectArchiveBlocker {
+  const session = stored.descriptor;
+  if (session.pinned) return contract.ProjectArchiveBlocker.PINNED;
+  if (dependencies.store.findMessagingConversationBySessionId(session.id) !== undefined) return contract.ProjectArchiveBlocker.ATTACHED;
+  if (dependencies.store.findPendingSessionLifecycleCleanup(session.id) !== undefined) return contract.ProjectArchiveBlocker.RUNNING;
+  try {
+    dependencies.sessionHost.assertSessionLifecycleIdle(session.id);
+  } catch (error) {
+    if (error instanceof StoreError) return contract.ProjectArchiveBlocker.RUNNING;
+    throw error;
+  }
+  return contract.ProjectArchiveBlocker.UNSPECIFIED;
 }
 
 /**
@@ -17518,13 +17555,27 @@ async function dispatchMutation(
     }
     case "archiveTarget": {
       return dependencies.targetWorkspaceRuntime.run(payload.value.targetId, async () => {
+        const projectArchive = payload.value.projectArchive;
+        if (projectArchive !== undefined) {
+          if (!payload.value.archived) throw invalidArgument("A reviewed project removal is required.");
+          requireEntityVersionPrecondition(mutation, contract.EntityKind.TARGET, payload.value.targetId, "project archive");
+        }
         const execution = await host.mutate({
           operationId,
           connection,
           kind: payload.case,
           body: mutation,
           commit: (store) => {
-            const existing = requireUndeletedTarget(store, payload.value.targetId);
+            const existing = projectArchive === undefined ? requireUndeletedTarget(store, payload.value.targetId)
+              : requireLocalProjectArchiveTarget(store, payload.value.targetId);
+            if (projectArchive !== undefined) {
+              validatePreconditions(store, mutation);
+              const skipped = new Set(projectArchive.reviewedSkippedSessionIds);
+              if (store.listSessions({ excludeHidden: true }).some(stored =>
+                stored.descriptor.projectId === existing.descriptor.id && !skipped.has(stored.descriptor.id)
+                  && host.isProjectArchiveMember(stored)
+              )) throw new ConnectError("The project changed during archive. Review the remaining tasks.", Code.Aborted);
+            }
             store.upsertTarget(existing.descriptor, {
               ...asRecord(existing.metadata),
               state: payload.value.archived ? "archived" : "active",
@@ -18122,6 +18173,12 @@ async function dispatchMutation(
     }
     case "archiveSession": {
       const existing = dependencies.store.getSession(payload.value.sessionId);
+      const projectArchive = payload.value.projectArchive;
+      const reviewedTargetRevision = projectArchive?.targetRevision;
+      if (projectArchive !== undefined) {
+        if (!payload.value.archived || reviewedTargetRevision === undefined) throw invalidArgument("A reviewed project archive is required.");
+        requireEntityVersionPrecondition(mutation, contract.EntityKind.SESSION, payload.value.sessionId, "project archive");
+      }
       const personalPurpose = readPersonalDevelopmentPurpose(dependencies.store, payload.value.sessionId);
       if (personalPurpose !== undefined) {
         if (dependencies.assertPersonalDevelopmentLocalConnection === undefined) throw new ConnectError("A local Desktop connection is required.", Code.PermissionDenied);
@@ -18162,6 +18219,17 @@ async function dispatchMutation(
           body: mutation,
           sessionLifecycleFenceId: payload.value.sessionId,
           precondition: (store) => {
+            if (projectArchive !== undefined && store.findSessionLifecycleCleanup(operationId) === undefined) {
+              validatePreconditions(store, mutation);
+              const project = requireLocalProjectArchiveTarget(store, projectArchive.targetId);
+              const member = store.getSession(payload.value.sessionId);
+              if (project.revision !== reviewedTargetRevision?.value
+                || member.descriptor.projectId !== project.descriptor.id
+                || !host.isProjectArchiveMember(member)
+                || projectArchiveBlocker(dependencies, member) !== contract.ProjectArchiveBlocker.UNSPECIFIED) {
+                throw new ConnectError("The task or project changed since the archive review.", Code.Aborted);
+              }
+            }
             if (dependencies.isPartnerCanonicalTask?.(payload.value.sessionId)) {
               throw new ConnectError("Use Partner settings to archive this Partner.", Code.FailedPrecondition);
             }
@@ -18184,7 +18252,7 @@ async function dispatchMutation(
                 operationId,
                 sessionId: payload.value.sessionId,
                 disposition: "archive",
-                releaseWorktree: existing.descriptor.worktree !== undefined,
+                releaseWorktree: projectArchive === undefined && existing.descriptor.worktree !== undefined,
                 at: (dependencies.now ?? Date.now)()
               });
             cleanup = await advanceSessionLifecycleCleanup(dependencies, cleanup);
@@ -24903,6 +24971,9 @@ async function updateSessionOperation(
     kind,
     body: mutation,
     commit: (store) => {
+      if (patch.pinned !== undefined && store.findPendingSessionLifecycleCleanup(sessionId) !== undefined) {
+        throw new ConnectError("Wait for the task lifecycle transition to finish before changing its pin.", Code.FailedPrecondition);
+      }
       store.updateSession(sessionId, patch);
       return { accepted: true, resultCase: "session", entityId: sessionId } satisfies OperationOutcome;
     },

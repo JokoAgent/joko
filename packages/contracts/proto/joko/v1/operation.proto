@@ -601,6 +601,7 @@ message SetDeviceControllerAllowedMutation {
 message ArchiveTargetMutation {
   string target_id = 1;
   bool archived = 2;
+  ProjectArchiveFinalGuard project_archive = 3;
 }
 
 message DeleteTargetMutation {
@@ -732,6 +733,7 @@ message ArchiveSessionMutation {
   string session_id = 1;
   bool archived = 2;
   string archive_confirmation = 3;
+  ProjectArchiveSessionGuard project_archive = 4;
 }
 
 message SetSessionSnoozeMutation {
@@ -1932,3 +1934,12 @@ message MarkScheduleRunsReadMutation {
 }
 
 message MarkAllScheduleRunsReadMutation {}
+
+message ProjectArchiveSessionGuard {
+  string target_id = 1;
+  Revision target_revision = 2;
+}
+
+message ProjectArchiveFinalGuard {
+  repeated string reviewed_skipped_session_ids = 1;
+}

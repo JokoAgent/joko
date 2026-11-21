@@ -4,7 +4,7 @@ import { inspectorLayoutOwner, openInspectorExtension } from "./inspector-layout
 import type { JSX, KeyboardEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject } from "react";
 import { useCallback, useEffect, useEffectEvent, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { taskSnoozeDeadline } from "@joko/contracts";
+import { ProjectArchiveBlocker, taskSnoozeDeadline, type GetProjectArchivePreviewResponse } from "@joko/contracts";
 import {
   AlignJustify,
   Activity,
@@ -281,7 +281,8 @@ interface SidebarProjectActions {
   readonly onPinTarget: (target: TargetView) => void;
   readonly onSearchTarget: (target: TargetView) => void;
   readonly onCopyTargetLink?: (target: TargetView) => void;
-  readonly onRemoveTarget?: (target: TargetView, confirm: HTMLElement, returnFocus: HTMLElement | null) => void;
+  readonly onRemoveTarget?: (target: TargetView, confirm: HTMLElement, returnFocus: HTMLElement | null, archive?: GetProjectArchivePreviewResponse) => void;
+  readonly getProjectArchivePreview?: (targetId: string, signal: AbortSignal) => Promise<GetProjectArchivePreviewResponse>;
   readonly onSetTargetSessionsArchived?: (target: TargetView, sessions: readonly SessionView[], archived: boolean) => void;
 }
 const SIDEBAR_SESSION_INFO_OPTIONS = [
@@ -320,7 +321,8 @@ export interface SidebarProps {
   readonly onPin: (session: SessionView) => void;
   readonly onPinTarget: (target: TargetView) => void;
   readonly onRenameTarget?: (target: TargetView, name: string) => void;
-  readonly onRemoveTarget?: (target: TargetView) => void;
+  readonly onRemoveTarget?: (target: TargetView, archive?: GetProjectArchivePreviewResponse) => void;
+  readonly getProjectArchivePreview?: SidebarProjectActions["getProjectArchivePreview"];
   readonly onSetTargetSessionsArchived?: (target: TargetView, sessions: readonly SessionView[], archived: boolean) => void;
   readonly onCopyTargetLink?: (target: TargetView) => void;
   readonly onArchive: (session: SessionView) => void;
@@ -1566,7 +1568,8 @@ export function Sidebar(props: SidebarProps): JSX.Element {
       window.requestAnimationFrame(() => props.searchInputRef.current?.focus({ preventScroll: true }));
     },
     onCopyTargetLink: props.onCopyTargetLink,
-    onRemoveTarget: props.onRemoveTarget === undefined ? undefined : (target, confirm, returnFocus) => {
+    getProjectArchivePreview: props.getProjectArchivePreview,
+    onRemoveTarget: props.onRemoveTarget === undefined ? undefined : (target, confirm, returnFocus, archive) => {
       projectRemovalFocusRef.current?.cancel();
       const ownerDocument = confirm.ownerDocument;
       const ownerWindow = ownerDocument.defaultView;
@@ -1616,7 +1619,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
         ownerWindow.addEventListener("blur", request.cancel);
         ownerWindow.addEventListener("pagehide", request.cancel);
       }
-      props.onRemoveTarget?.(target);
+      props.onRemoveTarget?.(target, archive);
     },
     onSetTargetSessionsArchived: props.onSetTargetSessionsArchived
   };
@@ -4034,6 +4037,27 @@ function ProjectGroupHeading({ target, sessions, displayedSessionCount, collapse
   const [editValue, setEditValue] = useState(target.name);
   const [menu, setMenu] = useState<{ readonly x: number; readonly y: number }>();
   const [removeConfirmation, setRemoveConfirmation] = useState(false);
+  const [projectArchive, setProjectArchive] = useState<GetProjectArchivePreviewResponse | "failed">();
+  const [archiveOnRemoval, setArchiveOnRemoval] = useState(false);
+  const canReviewRemoval = target.projectArchivePreservesFiles === true && !target.archived && actions.getProjectArchivePreview !== undefined;
+  const readRemovalReview = useEffectEvent((targetId: string, signal: AbortSignal) => actions.getProjectArchivePreview?.(targetId, signal));
+  useEffect(() => {
+    setProjectArchive(undefined);
+    setArchiveOnRemoval(false);
+    if (!removeConfirmation || !canReviewRemoval) return;
+    const request = new AbortController();
+    void readRemovalReview(target.id, request.signal)?.then(preview => {
+      if (!request.signal.aborted) setProjectArchive(preview);
+    }).catch(() => { if (!request.signal.aborted) setProjectArchive("failed"); });
+    return () => request.abort();
+  }, [removeConfirmation, canReviewRemoval, target.id, target.revision]);
+  const removalReview = canReviewRemoval && projectArchive !== "failed" && projectArchive?.targetId === target.id
+    && projectArchive.targetRevision?.value === target.revision ? projectArchive : undefined;
+  const removalCandidates = removalReview?.members.filter(member => member.blocker === ProjectArchiveBlocker.UNSPECIFIED) ?? [];
+  const removalSkipped = (removalReview?.members.length ?? 0) - removalCandidates.length;
+  const removalSchedules = removalCandidates.reduce((count, member) => count + member.activeScheduleCount, 0);
+  const removalScheduleNames = removalCandidates.flatMap(member => member.activeScheduleNames).slice(0, 20);
+  const archiveRemoval = archiveOnRemoval && removalCandidates.length > 0 ? removalReview : undefined;
   const archiveCandidates = actions.showArchived
     ? sessions.filter((session) => session.archived)
     : sessions.filter((session) => !session.archived && !session.pinned
@@ -4269,12 +4293,22 @@ function ProjectGroupHeading({ target, sessions, displayedSessionCount, collapse
       restoreFocusFallback={() => moreRef.current}
       onClose={() => setRemoveConfirmation(false)}
     >
+      {canReviewRemoval && projectArchive === undefined && <p role="status">{t("common.loading")}</p>}
+      {canReviewRemoval && projectArchive !== undefined && removalReview === undefined && <p role="status">{t("projects.archiveRemovalReviewFailed")}</p>}
+      {removalCandidates.length > 0 && <label className="setting-row"><span>{t("projects.archiveOnRemoval", { count: removalCandidates.length })}</span>
+        <CheckboxControl checked={archiveOnRemoval} onChange={event => setArchiveOnRemoval(event.target.checked)} />
+      </label>}
+      {removalSkipped > 0 && <p>{t("projects.archiveRemovalSkipped", { count: removalSkipped })}</p>}
+      {archiveRemoval !== undefined && removalSchedules > 0 && <div>
+        <p role="status">{t("projects.archiveRemovalSchedules", { count: removalSchedules })}</p>
+        <ul>{removalScheduleNames.map((name, index) => <li key={index}>{name}</li>)}</ul>
+      </div>}
       <div className="modal__actions">
         <Button onClick={() => setRemoveConfirmation(false)}>{t("common.cancel")}</Button>
         <Button tone="danger" onClick={(event) => {
           setRemoveConfirmation(false);
-          actions.onRemoveTarget?.(target, event.currentTarget, moreRef.current);
-        }}>{t("common.remove")}</Button>
+          actions.onRemoveTarget?.(target, event.currentTarget, moreRef.current, archiveRemoval);
+        }}>{t(archiveRemoval === undefined ? "common.remove" : "projects.removeAndArchive")}</Button>
       </div>
     </Modal>
   </>;

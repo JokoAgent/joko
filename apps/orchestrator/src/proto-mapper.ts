@@ -611,6 +611,7 @@ export function toProtoTarget(record: StoredTarget): ProtoTarget {
     version: toProtoEntityVersion(record.revision, 0, record.updatedAt),
     error: undefined,
     location: toProtoWorkspaceLocation(target.remoteWorkspace),
+    projectArchivePreservesFiles: target.remoteWorkspace === undefined,
     sshWorktreeDerivationAllowed: target.remoteWorkspace?.kind === "ssh" ? target.managed && target.trusted : undefined
   });
 }

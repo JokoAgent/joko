@@ -11720,6 +11720,14 @@ export class SessionHost {
       && this.#store.findPendingSessionLifecycleCleanup(id) === undefined;
   }
 
+  isProjectArchiveMember(stored: StoredSession): boolean {
+    const session = stored.descriptor;
+    return this.isOrdinarySession(stored, false, true) && session.remoteWorkspace === undefined
+      && this.#store.getTarget(session.targetId).descriptor.remoteWorkspace === undefined
+      && readProvisionalSession(this.#store, session.id) === undefined
+      && readPersonalDevelopmentPurpose(this.#store, session.id) === undefined;
+  }
+
   private isOrdinarySession(stored: StoredSession, allowArchived = false, allowScheduled = false): boolean {
     const session = stored.descriptor;
     return (allowScheduled || session.automationOrigin === undefined) && session.derivationOrigin?.sideChat !== true

@@ -127,6 +127,7 @@ service BackendService {
 service TargetService {
   rpc ListTargets(ListTargetsRequest) returns (ListTargetsResponse);
   rpc GetTarget(GetTargetRequest) returns (GetTargetResponse);
+  rpc GetProjectArchivePreview(GetProjectArchivePreviewRequest) returns (GetProjectArchivePreviewResponse);
   // Browses directories on the connected Orchestrator node, never the client.
   rpc ListProjectDirectories(ListProjectDirectoriesRequest) returns (ListProjectDirectoriesResponse);
   // Revalidates and registers the exact durable workspace binding for a
@@ -3564,4 +3565,30 @@ message PrepareTargetWorkspaceRequest {
 
 message PrepareTargetWorkspaceResponse {
   WorkspaceDescriptor workspace = 1;
+}
+
+message GetProjectArchivePreviewRequest {
+  string target_id = 1;
+}
+
+enum ProjectArchiveBlocker {
+  PROJECT_ARCHIVE_BLOCKER_UNSPECIFIED = 0;
+  PROJECT_ARCHIVE_BLOCKER_PINNED = 1;
+  PROJECT_ARCHIVE_BLOCKER_ATTACHED = 2;
+  PROJECT_ARCHIVE_BLOCKER_RUNNING = 3;
+}
+
+message ProjectArchiveMember {
+  string session_id = 1;
+  Revision revision = 2;
+  ProjectArchiveBlocker blocker = 3;
+  uint32 active_schedule_count = 4;
+  string archive_confirmation = 5;
+  repeated string active_schedule_names = 6;
+}
+
+message GetProjectArchivePreviewResponse {
+  string target_id = 1;
+  Revision target_revision = 2;
+  repeated ProjectArchiveMember members = 3;
 }

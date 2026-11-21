@@ -4121,6 +4121,8 @@ export function useAppController(): AppController {
     listNativeCatalogAdoptions: (signal) => gateway().listNativeCatalogAdoptions(signal),
     reconcileNativeCatalogAdoption: (operationId) => gateway().reconcileNativeCatalogAdoption(operationId),
     archiveTarget: (targetId, archived) => gateway().archiveTarget(targetId, archived),
+    getProjectArchivePreview: (targetId, signal) => gateway().getProjectArchivePreview(targetId, signal),
+    archiveProjectKeepingFiles: (targetId, preview) => gateway().archiveProjectKeepingFiles(targetId, preview),
     deleteTarget: (targetId, deleteManagedWorkspace) => gateway().deleteTarget(targetId, deleteManagedWorkspace),
     setWorkspaceTrust: (workspaceId, trusted) => gateway().setWorkspaceTrust(workspaceId, trusted),
     addExtraDirectory: (workspaceId, serverPath, access) => gateway().addExtraDirectory(workspaceId, serverPath, access),

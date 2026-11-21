@@ -126,6 +126,7 @@ export interface TargetView {
   readonly archived: boolean;
   readonly remoteWorkspace?: RemoteWorkspaceView;
   readonly sshWorktreeDerivationAllowed?: boolean;
+  readonly projectArchivePreservesFiles?: boolean;
   readonly error?: string;
 }
 
@@ -6466,6 +6467,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   }, expectedRevision: bigint): Promise<void>;
   /** Returns the same Target from the authoritative post-operation snapshot, or undefined if it no longer exists. */
   archiveTarget(targetId: string, archived: boolean): Promise<TargetView | undefined>;
+  getProjectArchivePreview?(targetId: string, signal?: AbortSignal): Promise<import("@joko/contracts").GetProjectArchivePreviewResponse>;
+  archiveProjectKeepingFiles?(targetId: string, preview: import("@joko/contracts").GetProjectArchivePreviewResponse): Promise<void>;
   deleteTarget(targetId: string, deleteManagedWorkspace: boolean): Promise<void>;
   setWorkspaceTrust(workspaceId: string, trusted: boolean): Promise<void>;
   addExtraDirectory(workspaceId: string, serverPath: string, access: ExtraDirectoryView["access"]): Promise<void>;
