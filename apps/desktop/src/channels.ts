@@ -562,9 +562,10 @@ export function isDesktopSessionDragGestureId(value: unknown): value is string {
 }
 
 export function isDesktopSessionDragPreviewRequest(value: unknown): value is DesktopSessionDragPreviewRequest {
+  if (value === null || typeof value !== "object") return false;
   const baseKeys = ["gestureId", "label", "hint", "palette"];
-  const hasPartner = plainRecordWithKeys(value, [...baseKeys, "partnerWindow"]);
-  if (!hasPartner && !plainRecordWithKeys(value, [...baseKeys, "profileId", "sessionId"])) return false;
+  const hasPartner = Object.hasOwn(value, "partnerWindow");
+  if (!plainRecordWithKeys(value, hasPartner ? [...baseKeys, "partnerWindow"] : [...baseKeys, "profileId", "sessionId"])) return false;
   if (hasPartner ? !isDesktopPartnerWindowOwner(value.partnerWindow)
     : !isDesktopSessionWindowOwner({ profileId: value.profileId, sessionId: value.sessionId })) return false;
   if (!isDesktopSessionDragGestureId(value.gestureId) ||
