@@ -1,11 +1,11 @@
 import { lstat, realpath, writeFile } from "node:fs/promises";
-import { devNull } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
 import { GitCommandError, runGit } from "./git.js";
 import { DEFAULT_WORKTREE_OPERATION_TIMEOUT_MS, WorktreeOperationControl } from "./operation.js";
 
 const bundleRef = "refs/joko/task-copy";
-const environment = { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: devNull, GIT_NO_REPLACE_OBJECTS: "1", GIT_OPTIONAL_LOCKS: "0",
+// Git interprets /dev/null itself, including when spawned by Node on Windows.
+const environment = { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_NO_REPLACE_OBJECTS: "1", GIT_OPTIONAL_LOCKS: "0",
   GIT_AUTHOR_NAME: "Joko", GIT_AUTHOR_EMAIL: "copy@joko.invalid", GIT_COMMITTER_NAME: "Joko", GIT_COMMITTER_EMAIL: "copy@joko.invalid" };
 const oid = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
 
