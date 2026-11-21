@@ -690,7 +690,13 @@ export function AppearanceSettings({ controller, locale, theme, onSuccess, onOpe
               t={t}
               onReset={() => saveLocale(DEFAULT_UI_PREFERENCES.locale, true)}
             />
-            <SelectControl value={localePreference} disabled={localePending} aria-busy={localePending} onChange={(event) => saveLocale(event.target.value as LocalePreference)} aria-label={t("settings.locale")}><option value="system">{t("settings.system")}</option><option value="en">{t("language.en")}</option><option value="zh-CN">{t("language.zh-CN")}</option><option value="en-XA">{t("language.en-XA")}</option></SelectControl>
+            <SelectControl value={localePreference === "en-XA" ? "en" : localePreference}
+              disabled={localePending} aria-busy={localePending} aria-label={t("settings.locale")}
+              onChange={(event) => saveLocale(event.target.value as LocalePreference)}>
+              <option value="system">{t("settings.system")}</option>
+              <option value="en">{t("language.en")}</option>
+              <option value="zh-CN">{t("language.zh-CN")}</option>
+            </SelectControl>
           </div>
         </div>
         {localeError !== undefined && <ErrorBanner message={localeError} dismissLabel={t("common.dismiss")} onClose={() => setLocaleFeedback((current) => current.owner === localeOwner ? { ...current, error: undefined } : current)} />}

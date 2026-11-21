@@ -95,6 +95,7 @@ import { appendTextToComposerDocument, composerDocumentKeepingQuotes } from "./c
 import { restoreRejectedComposerDraft } from "./composer-draft-recovery.js";
 import { sessionDraftSurface } from "./session-draft-surface.js";
 import { isSessionApplicationWindow } from "./session-window-navigation.js";
+import { partnerApplicationWindowIdentity, partnerWindowMatchesProfile } from "./partner-window-navigation.js";
 import { emptySnapshot } from "./model.js";
 import { visionBridgeToastStore } from "./vision-bridge-toast-store.js";
 import {
@@ -220,6 +221,8 @@ export interface ControllerState {
   readonly machinePresenceByProfile: Readonly<Record<string, MachinePresenceView>>;
   readonly nativeTaskStatusLiveSources?: readonly NativeTaskStatusLiveSource[];
   readonly partnerSources?: readonly PartnerSourceView[];
+  readonly partnerWindowOwner?: JokoDesktopPartnerWindowOwner;
+  readonly partnerWindowConnectionGeneration?: number;
   readonly activeProfile?: ConnectionProfile;
   readonly discoveredNodes: readonly DiscoveredOrchestratorView[];
   readonly discoveryState: "idle" | "discovering" | "ready";
@@ -484,6 +487,7 @@ export function useAppController(): AppController {
   const discoveryGenerationRef = useRef(0);
   const discoveryAbortRef = useRef<AbortController | undefined>(undefined);
   const startupAutoConnectRef = useRef<ConnectionProfile | undefined>(undefined);
+  const partnerWindowOwnerRef = useRef<JokoDesktopPartnerWindowOwner | undefined>(undefined);
   const startupManagedLocalAutoPendingRef = useRef(false);
   const explicitDisconnectRef = useRef(false);
   const entryAttemptRef = useRef<AbortController | undefined>(undefined);
@@ -697,13 +701,15 @@ export function useAppController(): AppController {
       const startupQuery = new URLSearchParams(startupSearch);
       const desktopSessionWindow = desktop !== undefined && startupQuery.has("sessionWindow");
       const bootSessionId = desktopSessionWindow && isSessionApplicationWindow(window.location) ? startupQuery.get("bootSession") : null;
-      const [persistedProfiles, machineCaches, preferences, managedStatus, automaticConnectionAvailable, bootOwner] = await Promise.all([
+      const requestedPartner = partnerApplicationWindowIdentity(window.location);
+      const [persistedProfiles, machineCaches, preferences, managedStatus, automaticConnectionAvailable, bootOwner, nativePartnerOwner] = await Promise.all([
         local.listProfiles(),
         local.listMachineCaches(),
         local.readPreferences(),
         readDesktopManagedOrchestratorStatus(),
         automaticConnectionPersistenceAvailable(),
-        bootSessionId === null ? undefined : desktop?.sessionWindows?.getOwner?.().catch(() => undefined)
+        bootSessionId === null ? undefined : desktop?.sessionWindows?.getOwner?.().catch(() => undefined),
+        requestedPartner === undefined ? undefined : desktop?.sessionWindows?.getPartnerOwner?.().catch(() => undefined)
       ]);
       if (cancelled) return;
       let profiles = persistedProfiles;
@@ -743,9 +749,18 @@ export function useAppController(): AppController {
         : startupRoute.kind === "session" || startupRoute.kind === "partners" || startupRoute.kind === "tools" || startupRoute.kind === "extensionMainView" ? startupRoute.profileId : undefined;
       const bootProfileId = bootOwner !== undefined && bootOwner.sessionId === bootSessionId
         && window.location.search === startupSearch && window.jokoDesktop === desktop ? bootOwner.profileId : undefined;
-      const startupProfileId = desktopSessionWindow ? bootProfileId : routedProfileId;
+      const partnerOwner = requestedPartner !== undefined && nativePartnerOwner !== undefined
+        && requestedPartner.kind === nativePartnerOwner.kind && requestedPartner.conversationId === nativePartnerOwner.conversationId
+        && requestedPartner.profileId === nativePartnerOwner.profileId && requestedPartner.serverId === nativePartnerOwner.serverId
+        && window.location.search === startupSearch && window.location.hash === "" && window.jokoDesktop === desktop
+        ? nativePartnerOwner : undefined;
+      partnerWindowOwnerRef.current = partnerOwner;
+      const startupProfileId = requestedPartner !== undefined ? partnerOwner?.profileId
+        : desktopSessionWindow ? bootProfileId : routedProfileId;
       const startupProfile = profiles.find(profile => profile.id === startupProfileId);
-      const automaticProfile = startupProfileId !== undefined
+      const automaticProfile = requestedPartner !== undefined
+        ? partnerOwner !== undefined && partnerWindowMatchesProfile(partnerOwner, startupProfile) ? startupProfile : undefined
+        : startupProfileId !== undefined
         ? expectedServerId === undefined || expectedServerId === startupProfile?.serverId ? startupProfile : undefined
         : (!desktopSessionWindow && expectedServerId === undefined && automaticConnectionAvailable
         ? automaticConnectionProfile(effectivePreferences.automaticConnectionTarget, profiles, effectiveManagedStatus)
@@ -753,6 +768,7 @@ export function useAppController(): AppController {
       startupAutoConnectRef.current = automaticProfile;
       startupManagedLocalAutoPendingRef.current = automaticConnectionAvailable
         && !desktopSessionWindow
+        && requestedPartner === undefined
         && routedProfileId === undefined
         && effectivePreferences.automaticConnectionTarget?.kind === "managedLocal"
         && automaticProfile === undefined
@@ -813,6 +829,7 @@ export function useAppController(): AppController {
         preferences: effectivePreferences,
         systemLocale,
         effectiveLocale: resolveLocalePreference(effectivePreferences.locale, systemLocale),
+        ...(partnerOwner === undefined ? {} : { partnerWindowOwner: partnerOwner }),
         ...(managedBootstrapError === undefined ? {} : { error: managedBootstrapError }),
         ...(automaticProfile === undefined ? {} : { activeProfile: automaticProfile, connectionState: "connecting" as const })
       }));
@@ -836,6 +853,10 @@ export function useAppController(): AppController {
     };
     const onHashChange = (event: HashChangeEvent): void => {
       const requestedHash = window.location.hash;
+      if (partnerApplicationWindowIdentity(window.location) !== undefined) {
+        if (requestedHash !== "") window.history.replaceState(window.history.state, "", window.location.pathname + window.location.search);
+        return;
+      }
       if (event.newURL !== "") {
         try {
           if (new URL(event.newURL).hash !== requestedHash) return;
@@ -1246,7 +1267,8 @@ export function useAppController(): AppController {
           serverId: profile.serverId,
           profileId: profile.id,
           activeSessionId,
-          draftSurface: () => sessionDraftSurface(profile.id, effect.sessionId, () => gatewayGenerationRef.current === generation),
+          draftSurface: () => sessionDraftSurface(profile.id, effect.sessionId, () => gatewayGenerationRef.current === generation,
+            undefined, verifiedPartnerWindowSession(partnerWindowOwnerRef.current, activeProfileRef.current, routeRef.current)),
           isCurrent: () => gatewayGenerationRef.current === generation,
           isLatestEditorEffect: () => latestExtensionEditorEffectRef.current.get(editorScope) === effect.eventId
         });
@@ -1466,6 +1488,10 @@ export function useAppController(): AppController {
     finally { if (entryAttemptRef.current === attempt) entryAttemptRef.current = undefined; }
   }, [adoptConnectionUnlocked, projectEntries, updatePreferences]);
   const connectProfile = useCallback(async (profile: ConnectionProfile, options?: ConnectionSelectionOptions, callerIsCurrent: () => boolean = () => true): Promise<boolean> => {
+    if (partnerApplicationWindowIdentity(window.location) !== undefined) {
+      const owner = partnerWindowOwnerRef.current;
+      if (owner === undefined || !partnerWindowMatchesProfile(owner, profile)) return false;
+    }
     const leave = beginConnectionLeave();
     try {
       if (!await leave.confirm() || !leave.current() || !callerIsCurrent()) return false;
@@ -1607,6 +1633,32 @@ export function useAppController(): AppController {
     startupAutoConnectRef.current = undefined;
     void connect(automaticProfile).catch(() => undefined);
   }, [connect, state.ready]);
+
+  useEffect(() => {
+    const owner = state.partnerWindowOwner, gateway = gatewayRef.current, profile = activeProfileRef.current;
+    if (owner === undefined || gateway === undefined || profile === undefined
+      || !partnerWindowMatchesProfile(owner, profile) || state.connectionState !== "connected") return;
+    const abort = new AbortController(), generation = gatewayGenerationRef.current;
+    const current = (): boolean => !abort.signal.aborted && gatewayRef.current === gateway
+      && gatewayGenerationRef.current === generation && partnerWindowMatchesProfile(owner, activeProfileRef.current);
+    const activate = async (): Promise<void> => {
+      const resolution = owner.kind === "private"
+        ? await resolvePartnerSourceSession(gateway, owner.conversationId, () => snapshotRef.current, abort.signal)
+        : undefined;
+      if (!current()) return;
+      validatePartnerSourceOwner(profile, snapshotRef.current);
+      const route: AppRoute = resolution === undefined
+        ? { kind: "partners", groupId: owner.conversationId, profileId: profile.id }
+        : { kind: "session", sessionId: resolution.session.id, profileId: profile.id, partnerId: resolution.partner.id };
+      routeRef.current = route;
+      const navigationRevision = ++navigationRevisionRef.current;
+      setState(previous => ({ ...previous, route, navigationRevision, partnerWindowConnectionGeneration: generation, error: undefined }));
+    };
+    void activate().catch(error => {
+      if (current()) setState(previous => ({ ...previous, error: messageOf(error) }));
+    });
+    return () => abort.abort();
+  }, [state.partnerWindowOwner, state.connectionState, state.connectionGeneration]);
 
   const adoptManagedOrchestratorStatus = useCallback(async (status: JokoDesktopManagedOrchestratorStatus): Promise<void> => {
     if (status.state !== "ready") {
@@ -1969,6 +2021,10 @@ export function useAppController(): AppController {
   }, [beginConnectionLeave, removeProfile, state.profiles]);
 
   const navigate = useCallback<AppController["navigate"]>((route, options) => {
+    if (partnerApplicationWindowIdentity(window.location) !== undefined) {
+      options?.onSettled?.();
+      return;
+    }
     const externalOwnerIsCurrent = (): boolean => {
       if (options?.signal?.aborted === true) return false;
       try {
@@ -3157,6 +3213,8 @@ export function useAppController(): AppController {
       value.id, value.backendId, value.targetId, value.generation.toString(), value.derivationOrigin
     ]);
     const originalLineage = lineage(child);
+    const partnerOwner = partnerWindowOwnerRef.current;
+    const verifiedPartnerSessionId = verifiedPartnerWindowSession(partnerOwner, activeProfileRef.current, routeRef.current);
     let retired = false;
     const retire = () => { retired = true; };
     window.addEventListener("pagehide", retire, { once: true });
@@ -3164,12 +3222,15 @@ export function useAppController(): AppController {
       if (retired || window.location.search !== search || window.jokoDesktop?.sessionWindows !== bridge || gatewayRef.current !== artifactGateway
         || gatewayGenerationRef.current !== linkGatewayGeneration || activeProfileRef.current?.serverId !== draftServerId
         || activeProfileRef.current.id !== draftProfileId) return false;
+      if (partnerOwner !== undefined) {
+        return sessionId === verifiedPartnerSessionId && verifiedPartnerWindowSession(partnerOwner, activeProfileRef.current, routeRef.current) === sessionId;
+      }
       if (anchor === undefined) return true;
       const candidate = snapshotRef.current.sessions.find(session => session.id === sessionId);
       return lineage(candidate) === originalLineage && (anchor.kind === "side-chat" || (ordinarySession(candidate) && currentTaskRoute()));
     };
     try {
-      const surface = await sessionDraftSurface(draftProfileId, sessionId, current, anchor);
+      const surface = await sessionDraftSurface(draftProfileId, sessionId, current, anchor, verifiedPartnerSessionId);
       if (surface !== "application" && !current()) throw new Error("The task draft window owner is no longer current.");
       const result = await run(surface);
       if (surface !== "application" && !current()) throw new Error("The task draft window owner is no longer current.");
@@ -5390,6 +5451,11 @@ export function composerDraftWithEditorText(text: string, draft: ComposerDraft |
 
 export function newSessionDraftScope(profile: ConnectionProfile): string {
   return `${profile.serverId}\u0000${profile.id}`;
+}
+
+function verifiedPartnerWindowSession(owner: JokoDesktopPartnerWindowOwner | undefined, profile: ConnectionProfile | undefined, route: AppRoute): string | undefined {
+  return owner?.kind === "private" && partnerWindowMatchesProfile(owner, profile)
+    && route.kind === "session" && route.profileId === owner.profileId && route.partnerId === owner.conversationId ? route.sessionId : undefined;
 }
 
 function routeFromLocation(): AppRoute {

@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState, type ComponentType } from "react";
-import { Alert, Pressable, StyleSheet, Text, View } from "react-native";
+import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import { ActivityIndicator, Modal, Pressable, StyleSheet, Text, View } from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
 import { Image as ExpoImage, type ImageProps, type ImageLoadEventData } from "expo-image";
 import { PartnerGroupAttachmentCategory, partnerGroupMessages, type PartnerGroupAttachment, type PartnerGroupMessage, type PartnerGroupSummary } from "@joko/contracts";
 import type { MobileGroupAttachmentTransport } from "./mobile-partner-groups";
@@ -11,11 +12,15 @@ import type { MobileFilesThumbnailPreview } from "./mobile-files-thumbnails";
 import { MobileImageLightbox } from "./MobileImageLightbox";
 import { mobileImageOutput } from "./mobile-image-output";
 import { mobileMessage } from "./mobile-messages";
+import { MobilePdfViewer } from "./MobilePdfViewer";
+import { MobileFileTextPreview } from "./MobileFileTextPreview";
+import type { MobileGroupFilePreview } from "./mobile-partner-group-media";
 
 const PreviewImage = ExpoImage as unknown as ComponentType<ImageProps>;
 export function MobileGroupAttachments({ group, message, transport, colors, locale }: { group: PartnerGroupSummary; message: PartnerGroupMessage; transport?: MobileGroupAttachmentTransport; colors: MobilePartnersColors; locale: MobileSupportedLocale }) {
   const m = partnerGroupMessages(locale), images = useMemo(() => message.attachments.filter(item => item.category === PartnerGroupAttachmentCategory.IMAGE && item.blob), [message.attachments]);
   const [index, setIndex] = useState<number>(), [retry, setRetry] = useState(0), [error, setError] = useState<string>();
+  const [file, setFile] = useState<{ id: string; blobId: string; sha256Hex: string; owner: string }>();
   const [loaded, setLoaded] = useState<{ index: number; session: MobileComposerImageEditorSession; transport: MobileGroupAttachmentTransport }>();
   useEffect(() => { setLoaded(undefined); setError(undefined); const attachment = index === undefined ? undefined : images[index];
     if (!attachment || !transport) return; const controller = new AbortController(); let session: MobileComposerImageEditorSession | undefined;
@@ -30,9 +35,19 @@ export function MobileGroupAttachments({ group, message, transport, colors, loca
   const session: MobileImageGalleryPageSession | undefined = current && selected ? { ...current.session, galleryLeaseId: descriptor.leaseId, pageId: selected.id, pageIndex: index!, pageCount: images.length,
     sourceKind: "timeline", sourceLabel: group.name, expectedWidthPixels: current.session.expectedWidthPixels!, expectedHeightPixels: current.session.expectedHeightPixels!, expectedAnimated: current.session.animated === true, addable: false } : undefined;
   const fail = () => { if (current) current.transport.closeMediaImage(current.session.leaseId); setLoaded(undefined); setError(mobileMessage(locale, "image.decoderDimensions")); };
-  return <View style={styles.attachments}>{message.attachments.map(attachment => attachment.category === PartnerGroupAttachmentCategory.IMAGE && transport
+  const document = transport && file?.owner === transport.ownerKey
+    ? message.attachments.find(item => item.id === file.id && item.blob !== undefined
+      && item.blob.blobId === file.blobId && item.blob.sha256Hex === file.sha256Hex) : undefined;
+  useEffect(() => { if (!document) setFile(undefined); }, [document === undefined]);
+  return <View style={styles.attachments}>{message.attachments.map(attachment => attachment.category === PartnerGroupAttachmentCategory.IMAGE && transport && attachment.blob
     ? <GroupThumbnail key={attachment.id} group={group} message={message} attachment={attachment} transport={transport} colors={colors} locale={locale} onOpen={() => setIndex(images.findIndex(item => item.id === attachment.id))} />
-    : <Pressable key={attachment.id} accessibilityRole="button" accessibilityLabel={attachment.name} onPress={() => Alert.alert(attachment.name, m.readOnlyFiles)} style={[styles.file, { borderColor: colors.border }]}><Text style={{ color: colors.ink }}>{attachment.name}</Text></Pressable>)}
+    : <Pressable key={attachment.id} accessibilityRole="button" accessibilityLabel={attachment.name}
+      disabled={!transport || !attachment.blob} accessibilityState={{ disabled: !transport || !attachment.blob }}
+      onPress={() => { if (transport && attachment.blob) setFile({ id: attachment.id, blobId: attachment.blob.blobId,
+        sha256Hex: attachment.blob.sha256Hex, owner: transport.ownerKey }); }}
+      style={[styles.file, { borderColor: colors.border }]}><Text style={{ color: colors.ink }}>{attachment.name}</Text></Pressable>)}
+    {document && transport && <GroupFilePreview key={JSON.stringify([transport.ownerKey, group.id, message.id, document.id, document.blob?.sha256Hex])}
+      group={group} message={message} attachment={document} transport={transport} colors={colors} locale={locale} close={() => setFile(undefined)} />}
     {index !== undefined && <MobileImageLightbox session={session} locale={locale} onClose={() => setIndex(undefined)} onSave={async () => { throw new Error(m.unavailable); }}
       gallery={{ descriptor, pageIndex: index, pageKey: `${descriptor.leaseId}:${selected?.id}:${retry}`, busy: !current && !error, error, onRetry: () => setRetry(value => value + 1),
         onNativeFailed: fail, onPreviewFailed: fail, onNavigate: next => { if (next >= 0 && next < images.length) setIndex(next); },
@@ -43,6 +58,70 @@ export function MobileGroupAttachments({ group, message, transport, colors, loca
         const output = await current.transport.prepareMediaOutput(current.session.leaseId, decoded, signal); await mobileImageOutput.perform(action, output.source, rendered, signal, output.assertCurrent);
         return mobileMessage(locale, action === "copy" ? "image.copied" : action === "save" ? "image.saved" : "image.shared"); }} />}
   </View>;
+}
+
+function GroupFilePreview({ group, message, attachment, transport, colors, locale, close }: {
+  group: PartnerGroupSummary; message: PartnerGroupMessage; attachment: PartnerGroupAttachment;
+  transport: MobileGroupAttachmentTransport; colors: MobilePartnersColors; locale: MobileSupportedLocale; close(): void;
+}) {
+  const [preview, setPreview] = useState<MobileGroupFilePreview>();
+  const [failed, setFailed] = useState(false);
+  const [retry, setRetry] = useState(0);
+  const [sharing, setSharing] = useState(false);
+  const [shareFailed, setShareFailed] = useState(false);
+  const shareFlight = useRef<AbortController | undefined>(undefined);
+  useEffect(() => {
+    const controller = new AbortController();
+    let owned: MobileGroupFilePreview | undefined;
+    setFailed(false);
+    setPreview(undefined);
+    void transport.prepareMediaFile(group, message, attachment, controller.signal).then(value => {
+      if (controller.signal.aborted) return transport.releaseMediaFile(value);
+      owned = value;
+      setPreview(value);
+    }).catch(() => { if (!controller.signal.aborted) setFailed(true); });
+    return () => {
+      controller.abort();
+      if (owned) void transport.releaseMediaFile(owned).catch(() => undefined);
+    };
+  }, [transport, group.id, message.id, attachment.id, attachment.blob?.blobId, retry]);
+  useEffect(() => () => shareFlight.current?.abort(), []);
+  const share = () => {
+    if (shareFlight.current) return;
+    const controller = new AbortController();
+    shareFlight.current = controller;
+    setSharing(true);
+    setShareFailed(false);
+    void transport.shareMediaFile(group, message, attachment, controller.signal)
+      .catch(() => { if (!controller.signal.aborted) setShareFailed(true); })
+      .finally(() => {
+        shareFlight.current = undefined;
+        if (!controller.signal.aborted) setSharing(false);
+      });
+  };
+  const button = (label: string, action: () => void, disabled = false) =>
+    <Pressable accessibilityRole="button" accessibilityState={{ disabled }} disabled={disabled} onPress={action} style={styles.fileControl}>
+      <Text style={{ color: disabled ? colors.muted : colors.accent }}>{label}</Text>
+    </Pressable>;
+  return <Modal visible presentationStyle="fullScreen" onRequestClose={close}>
+    <SafeAreaView accessibilityViewIsModal style={[styles.fileViewer, { backgroundColor: colors.background }]}>
+      <View style={[styles.fileToolbar, { borderColor: colors.border }]}>
+        {button(mobileMessage(locale, "common.close"), close)}
+        <Text accessibilityRole="header" numberOfLines={1} style={[styles.fileTitle, { color: colors.ink }]}>{attachment.name}</Text>
+        {button(mobileMessage(locale, sharing ? "image.sharing" : "common.share"), share, sharing)}
+      </View>
+      {shareFailed && <Text accessibilityRole="alert" style={[styles.fileNotice, { color: colors.negative }]}>{partnerGroupMessages(locale).unavailable}</Text>}
+      {failed ? <View style={styles.fileNotice}>
+        <Text accessibilityRole="alert" style={{ color: colors.negative }}>{partnerGroupMessages(locale).unavailable}</Text>
+        {button(mobileMessage(locale, "common.retry"), () => setRetry(value => value + 1))}
+      </View> : preview?.kind === "text" ? <MobileFileTextPreview preview={preview} locale={locale} colors={colors} />
+        : preview?.kind === "pdf" ? <MobilePdfViewer style={styles.fileViewer} {...colors} title={attachment.name} locale={locale}
+          fileName={preview.pdf.fileName} byteSize={preview.pdf.localByteSize} instanceId={preview.pdf.leaseId}
+          uri={preview.pdf.uri} sha256Hex={preview.pdf.sha256Hex} />
+        : preview?.kind === "unsupported" ? <Text style={[styles.fileNotice, { color: colors.muted }]}>{mobileMessage(locale, "task.fileFallback")}</Text>
+        : <ActivityIndicator accessibilityLabel={mobileMessage(locale, "preview.loadingExact")} color={colors.accent} style={styles.fileNotice} />}
+    </SafeAreaView>
+  </Modal>;
 }
 function GroupThumbnail({ group, message, attachment, transport, colors, locale, onOpen }: { group: PartnerGroupSummary; message: PartnerGroupMessage; attachment: PartnerGroupAttachment; transport: MobileGroupAttachmentTransport; colors: MobilePartnersColors; locale: MobileSupportedLocale; onOpen(): void }) {
   const [preview, setPreview] = useState<MobileFilesThumbnailPreview>(), [failed, setFailed] = useState(false);
@@ -59,4 +138,13 @@ function GroupThumbnail({ group, message, attachment, transport, colors, locale,
     <Text style={{ color: colors.ink }}>{attachment.name}</Text>{failed && <Text style={{ color: colors.muted }}>{mobileMessage(locale, "image.previewFailed")}</Text>}
   </Pressable>;
 }
-const styles = StyleSheet.create({ attachments: { flexDirection: "row", flexWrap: "wrap", gap: 8 }, image: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 12, padding: 6, gap: 4 }, file: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 12, padding: 10, minHeight: 44 } });
+const styles = StyleSheet.create({
+  attachments: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  image: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 12, padding: 6, gap: 4 },
+  file: { borderWidth: StyleSheet.hairlineWidth, borderRadius: 12, padding: 10, minHeight: 44 },
+  fileViewer: { flex: 1 },
+  fileToolbar: { flexDirection: "row", alignItems: "center", borderBottomWidth: StyleSheet.hairlineWidth, paddingHorizontal: 8 },
+  fileTitle: { flex: 1, textAlign: "center", fontWeight: "600" },
+  fileControl: { minHeight: 44, minWidth: 44, paddingHorizontal: 8, justifyContent: "center", alignItems: "center" },
+  fileNotice: { margin: 16 }
+});

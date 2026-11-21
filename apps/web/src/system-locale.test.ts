@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_SYSTEM_LOCALE,
   readHostSystemLocale,
@@ -58,6 +58,12 @@ describe("system locale resolution", () => {
     expect(resolveLocalePreference("system", "zh-CN")).toBe("zh-CN");
     expect(resolveLocalePreference("en", "zh-CN")).toBe("en");
     expect(resolveLocalePreference("en-XA", "zh-CN")).toBe("en-XA");
+  });
+
+  it("reads a saved pseudo locale as English in the application", () => {
+    vi.stubEnv("MODE", "production");
+    try { expect(resolveLocalePreference("en-XA", "zh-CN")).toBe("en"); }
+    finally { vi.unstubAllEnvs(); }
   });
 
   it("prefers the Desktop locale and otherwise reads browser language priority", () => {

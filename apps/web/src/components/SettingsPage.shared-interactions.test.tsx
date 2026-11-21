@@ -135,7 +135,9 @@ describe("shared settings interactions", () => {
     const container = await renderAppearance(controller);
     const language = required(container.querySelector<HTMLButtonElement>(`[role="combobox"][aria-label="${translate("zh-CN", "settings.locale")}"]`));
 
-    expect(language.parentElement?.querySelector<HTMLSelectElement>("select")?.value).toBe("system");
+    const select = required(language.parentElement?.querySelector<HTMLSelectElement>("select"));
+    expect(select.value).toBe("system");
+    expect(Array.from(select.options, (option) => option.value)).toEqual(["system", "en", "zh-CN"]);
     expect(language.textContent).toContain(translate("zh-CN", "settings.system"));
     expect(container.textContent).not.toContain(translate("zh-CN", "settings.defaults.customized"));
   });

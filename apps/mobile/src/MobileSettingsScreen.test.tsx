@@ -568,22 +568,24 @@ describe("MobileSettingsScreen", () => {
     expect(mounted.container.textContent).toContain("Device ID copied.");
   });
 
-  it("offers every supported language, publishes a selection, and rerenders the mounted surface", async () => {
+  it("offers only the product languages and rerenders after a confirmed change", async () => {
     const mounted = mount();
-    const languageLabels = ["System", "English", "简体中文", "繁體中文", "日本語", "한국어"];
-    for (const label of languageLabels) expect(button(mounted.container, label)).not.toBeNull();
+    for (const label of ["System", "English", "简体中文"]) expect(button(mounted.container, label)).not.toBeNull();
+    for (const label of ["繁體中文", "日本語", "한국어"]) {
+      expect(mounted.container.querySelector(`[role="radio"][aria-label="${label}"]`)).toBeNull();
+    }
 
-    await act(async () => button(mounted.container, "日本語").click());
-    expect(mounted.onLocaleChange).toHaveBeenCalledWith("ja");
+    await act(async () => button(mounted.container, "简体中文").click());
+    expect(mounted.onLocaleChange).toHaveBeenCalledWith("zh-CN");
 
-    mounted.rerender({ locale: { status: "ready", preference: "ja", effectiveLocale: "ja", saving: false } });
-    expect(mounted.container.textContent).toContain("設定");
-    expect(mounted.container.textContent).toContain("言語");
-    expect(mounted.container.textContent).toContain("ローカル診断");
-    expect(button(mounted.container, "日本語").getAttribute("aria-checked")).toBe("true");
+    mounted.rerender({ locale: { status: "ready", preference: "zh-CN", effectiveLocale: "zh-CN", saving: false } });
+    expect(mounted.container.textContent).toContain("设置");
+    expect(mounted.container.textContent).toContain("语言");
+    expect(mounted.container.textContent).toContain("本地诊断");
+    expect(button(mounted.container, "简体中文").getAttribute("aria-checked")).toBe("true");
 
-    mounted.rerender({ locale: { status: "ready", preference: "ja", effectiveLocale: "ja", saving: true } });
-    for (const label of ["システム", "English", "简体中文", "繁體中文", "日本語", "한국어"]) {
+    mounted.rerender({ locale: { status: "ready", preference: "zh-CN", effectiveLocale: "zh-CN", saving: true } });
+    for (const label of ["跟随系统", "English", "简体中文"]) {
       expect(button(mounted.container, label).disabled).toBe(true);
     }
   });

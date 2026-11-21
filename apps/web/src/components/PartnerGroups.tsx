@@ -3,6 +3,7 @@ import { ArrowLeft, Check, CircleAlert, CircleCheck, CircleDashed, FileText, Fol
 import * as groupWire from "@joko/contracts";
 import { findPartnerGroupMentionQuery, filterPartnerGroupMentionCandidates, insertPartnerGroupMention } from "@joko/contracts";
 import type { AppController } from "../controller.js";
+import { partnerConversationDragProps } from "../partner-window-navigation.js";
 import type { ArtifactView, AttachmentDraft, PartnerProfileView } from "../model.js";
 import type { Translator } from "./types.js";
 import { PartnerAvatar, PartnerAvatarProvider } from "./PartnerAvatar.js";
@@ -70,9 +71,11 @@ export function PartnerGroupsNavigation({ controller, t, onClose }: { controller
   const { root, view, state, key, m } = useGroups(controller), [partners, setPartners] = useState<readonly PartnerProfileView[]>([]), [creating, setCreating] = useState(false);
   useEffect(() => { const abort = new AbortController(); if (view) void controller.listPartners(undefined, abort.signal).then(result => { if (!abort.signal.aborted) setPartners(result.partners); }).catch(() => undefined); return () => abort.abort(); }, [controller, view]);
   if (!view) return null;
+  const dragProfile = state.status === "ready" && controller.state.connectionState === "connected" ? controller.state.activeProfile : undefined;
   return <PartnerAvatarProvider controller={controller} ownerKey={key}><section className="partner-groups-navigation" ref={root} aria-label={m.groups}>
     <header><span>{m.groups}</span><IconButton label={m.create} disabled={state.status !== "ready"} onClick={() => setCreating(true)}><Plus /></IconButton></header>
     {state.catalog?.groups.map(group => <button type="button" key={group.id} className={`partner-group-directory-row${controller.state.route.kind === "partners" && controller.state.route.groupId === group.id ? " is-active" : ""}`}
+      {...partnerConversationDragProps(dragProfile, "group", group.id, group.name, t("session.openNewWindow"))}
       onClick={() => { controller.navigate({ kind: "partners", groupId: group.id }); onClose(); }}><AvatarPile group={group} partners={partners} /><span><strong>{group.name}</strong><small>{group.speakers.length ? m.replying : group.openPlan ? m.plan : group.lastMessage?.content || group.members.map(member => member.name).join(" · ")}</small></span>{group.unread && <span className="partner-group-unread" aria-label={m.unread} />}</button>)}
     {state.error && <p role="alert">{state.error}<Button onClick={() => view.setActive(true)}>{m.refresh}</Button></p>}
     {creating && <GroupCreate key={key} view={view} controller={controller} partners={partners} m={m} onClose={() => setCreating(false)} onCreated={group => { setCreating(false); controller.navigate({ kind: "partners", groupId: group.id }); onClose(); }} ownerDocument={root.current?.ownerDocument} />}
@@ -81,11 +84,14 @@ export function PartnerGroupsNavigation({ controller, t, onClose }: { controller
 export function PartnerGroupsSection({ controller, partners, t }: { controller: AppController; partners: readonly PartnerProfileView[]; t: Translator }): JSX.Element {
   const { root, view, state, key, m } = useGroups(controller), [creating, setCreating] = useState(false);
   if (!view) return <section className="partner-groups-section" ref={root}><h2>{m.groups}</h2><p>{m.unavailable}</p></section>;
+  const dragProfile = state.status === "ready" && controller.state.connectionState === "connected" ? controller.state.activeProfile : undefined;
   return <section className="partner-groups-section" ref={root} aria-label={m.groups}>
     <header><h2><Users aria-hidden="true" />{m.groups}</h2><Button disabled={state.status !== "ready"} onClick={() => setCreating(true)}><Plus aria-hidden="true" />{m.create}</Button></header>
     {state.error && <p role="alert">{state.error}<Button onClick={() => view.setActive(true)}>{m.refresh}</Button></p>}
     {state.status === "loading" && <Spinner />}
-    <div className="partner-group-directory">{state.catalog?.groups.map(group => <button type="button" key={group.id} className="partner-group-directory-row" onClick={() => controller.navigate({ kind: "partners", groupId: group.id })}>
+    <div className="partner-group-directory">{state.catalog?.groups.map(group => <button type="button" key={group.id} className="partner-group-directory-row"
+      {...partnerConversationDragProps(dragProfile, "group", group.id, group.name, t("session.openNewWindow"))}
+      onClick={() => controller.navigate({ kind: "partners", groupId: group.id })}>
       <AvatarPile group={group} partners={partners} /><span><strong>{group.name}</strong><small>{group.speakers.length ? m.replying : group.openPlan ? m.plan : group.lastMessage?.content || group.members.map(member => member.name).join(" · ")}</small></span>
       {group.unread && <span className="partner-group-unread" aria-label={m.unread} />}
     </button>)}</div>
@@ -143,11 +149,12 @@ export function PartnerGroupPage({ controller, groupId, t, onOpenNavigation }: {
   useEffect(() => { const element = last.current, host = timeline.current; if (!element || !host || !detail?.messages.length) return;
     const observer = new IntersectionObserver(entries => { if (entries.some(entry => entry.isIntersecting)) view?.markVisible(detail.messages.at(-1)!.sequence); }, { root: host, threshold: .6 }); observer.observe(element); return () => observer.disconnect();
   }, [view, detail?.messages.at(-1)?.sequence]);
-  if (!view) return <main className="partner-group-page" ref={root}><Button onClick={() => controller.navigate({ kind: "partners" })}>{m.back}</Button><p>{m.unavailable}</p></main>;
+  const separateWindow = controller.state.partnerWindowOwner !== undefined;
+  if (!view) return <main className="partner-group-page" ref={root}>{!separateWindow && <Button onClick={() => controller.navigate({ kind: "partners" })}>{m.back}</Button>}<p>{m.unavailable}</p></main>;
   return <PartnerAvatarProvider controller={controller} ownerKey={key}><main className="partner-group-page" ref={root}
     onDragOver={event => { if (dropFiles.current && event.dataTransfer.types.includes("Files")) event.preventDefault(); }}
     onDrop={event => { if (dropFiles.current && event.dataTransfer.files.length) { event.preventDefault(); dropFiles.current(Array.from(event.dataTransfer.files)); } }}>
-    <header className="partner-group-header"><IconButton label={m.back} onClick={() => controller.navigate({ kind: "partners" })}><ArrowLeft /></IconButton>
+    <header className="partner-group-header">{!separateWindow && <IconButton label={m.back} onClick={() => controller.navigate({ kind: "partners" })}><ArrowLeft /></IconButton>}
       {composerGroup && <AvatarPile group={composerGroup} partners={partners} />}<div><h1>{composerGroup?.name ?? m.groups}</h1><small>{composerGroup?.members.map(member => member.name).join(" · ")}</small></div>
       <IconButton label={m.settings} disabled={!group || state.busy} onClick={() => setSettings(true)}><Settings /></IconButton></header>
     {state.error && <div className="partner-group-error" role="alert">{state.error}<Button onClick={() => view.setActive(true)}>{m.refresh}</Button></div>}

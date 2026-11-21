@@ -84,6 +84,24 @@ describe("native task drag preview", () => {
     expect(onStop).toHaveBeenCalledOnce();
   });
 
+  it("hands off an exact Partner room only when the release is outside the application's windows", () => {
+    vi.useFakeTimers();
+    const environment = previewEnvironment();
+    const coordinator = new SessionDragPreviewCoordinator(environment), owner = {};
+    const partnerWindow = { kind: "group", profileId: "paired-guest", serverId: "guest-node", conversationId: "network:join-id:room-id" } as const;
+    const { gestureId, label, hint, palette } = request();
+    const drag = { gestureId, label, hint, palette, partnerWindow };
+    expect(isDesktopSessionDragPreviewRequest({ ...drag, sessionId: "ordinary-task" })).toBe(false);
+    expect(isDesktopSessionDragPreviewRequest({ ...drag, partnerWindow: { ...partnerWindow, token: "opaque" } })).toBe(false);
+    environment.point = { x: 200, y: 200 };
+    expect(coordinator.begin(owner, drag, new PreviewWindow())).toBe(true);
+    expect(coordinator.finish(owner, gestureId)).toEqual({ kind: "inside" });
+    environment.point = { x: -500, y: 400 };
+    expect(coordinator.begin(owner, drag, new PreviewWindow())).toBe(true);
+    expect(coordinator.finishNativeRelease()).toEqual({ kind: "outside", point: environment.point, partnerWindow, owner, gestureId });
+    expect(coordinator.finish(owner, gestureId)).toBeUndefined();
+  });
+
   it("returns one successful native open result to the matching renderer without retrying", async () => {
     vi.useFakeTimers();
     const owner = {};

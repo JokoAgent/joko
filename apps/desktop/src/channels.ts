@@ -13,6 +13,7 @@ export const DESKTOP_CHANNELS = {
   localAgentsRevoke: "joko:local-agents:revoke",
   sessionWindowOpen: "joko:session-window:open",
   sessionWindowGetOwner: "joko:session-window:owner:get",
+  partnerWindowGetOwner: "joko:partner-window:owner:get",
   extensionWindowOpen: "joko:extension-window:open",
   extensionLibraryPickLocation: "joko:extension-library:pick-location",
   projectPickDirectory: "joko:project:pick-directory",
@@ -428,6 +429,21 @@ export interface DesktopSessionWindowContext extends DesktopSessionWindowOwner {
   readonly draftSlot: number;
 }
 
+export interface DesktopPartnerWindowOwner {
+  readonly kind: "private" | "group";
+  readonly profileId: string;
+  readonly serverId: string;
+  readonly conversationId: string;
+}
+
+export function isDesktopPartnerWindowOwner(value: unknown): value is DesktopPartnerWindowOwner {
+  return plainRecordWithKeys(value, ["kind", "profileId", "serverId", "conversationId"])
+    && (value.kind === "private" || value.kind === "group")
+    && boundedDragText(value.profileId, 256)
+    && boundedDragText(value.serverId, 256)
+    && boundedDragText(value.conversationId, 256);
+}
+
 export function isDesktopSessionWindowOwner(value: unknown): value is DesktopSessionWindowOwner {
   return plainRecordWithKeys(value, ["profileId", "sessionId"])
     && boundedDragText(value.profileId, 256)
@@ -522,14 +538,16 @@ export interface DesktopSessionDragPreviewPalette {
   readonly accent: string;
 }
 
-export interface DesktopSessionDragPreviewRequest {
+export type DesktopConversationDragTarget =
+  | DesktopSessionWindowOwner
+  | { readonly partnerWindow: DesktopPartnerWindowOwner };
+
+export type DesktopSessionDragPreviewRequest = DesktopConversationDragTarget & {
   readonly gestureId: string;
-  readonly profileId: string;
-  readonly sessionId: string;
   readonly label: string;
   readonly hint: string;
   readonly palette: DesktopSessionDragPreviewPalette;
-}
+};
 
 export interface DesktopSessionWindowDropResult {
   readonly opened: boolean;
@@ -543,9 +561,13 @@ export function isDesktopSessionDragGestureId(value: unknown): value is string {
 }
 
 export function isDesktopSessionDragPreviewRequest(value: unknown): value is DesktopSessionDragPreviewRequest {
-  if (!plainRecordWithKeys(value, ["gestureId", "profileId", "sessionId", "label", "hint", "palette"])) return false;
-  if (!isDesktopSessionDragGestureId(value.gestureId) || !boundedDragText(value.profileId, 256) ||
-    !boundedDragText(value.sessionId, 256) ||
+  if (value === null || typeof value !== "object") return false;
+  const baseKeys = ["gestureId", "label", "hint", "palette"];
+  const hasPartner = Object.hasOwn(value, "partnerWindow");
+  if (!plainRecordWithKeys(value, hasPartner ? [...baseKeys, "partnerWindow"] : [...baseKeys, "profileId", "sessionId"])) return false;
+  if (hasPartner ? !isDesktopPartnerWindowOwner(value.partnerWindow)
+    : !isDesktopSessionWindowOwner({ profileId: value.profileId, sessionId: value.sessionId })) return false;
+  if (!isDesktopSessionDragGestureId(value.gestureId) ||
     !boundedDragText(value.label, 160) || !boundedDragText(value.hint, 160) ||
     !plainRecordWithKeys(value.palette, ["surface", "border", "text", "muted", "accent"])) return false;
   return Object.values(value.palette).every((color) => typeof color === "string" && color.length <= 128 &&

@@ -18,10 +18,10 @@ describe("mobile locale resolution", () => {
     ["zh-Hans-CN", "zh-CN"],
     ["zh_CN", "zh-CN"],
     ["zh-SG", "zh-CN"],
-    ["zh-Hant-HK", "zh-TW"],
-    ["zh-TW", "zh-TW"],
-    ["ja-JP", "ja"],
-    ["ko-KR", "ko"],
+    ["zh-Hant-HK", "zh-CN"],
+    ["zh-TW", "zh-CN"],
+    ["ja-JP", "en"],
+    ["ko-KR", "en"],
     ["fr-FR", "en"],
     [undefined, "en"]
   ])("maps %s to %s", (tag, expected) => {
@@ -35,7 +35,7 @@ describe("MobileLocalePreferenceStore", () => {
     expect(store.snapshot).toEqual({
       status: "loading",
       preference: "system",
-      effectiveLocale: "zh-TW",
+      effectiveLocale: "zh-CN",
       saving: false
     });
   });
@@ -43,14 +43,23 @@ describe("MobileLocalePreferenceStore", () => {
   it("hydrates a strict explicit preference and ignores later system changes", async () => {
     let system = "en-US";
     const store = new MobileLocalePreferenceStore(
-      driver(JSON.stringify({ version: 1, locale: "ja" })),
+      driver(JSON.stringify({ version: 1, locale: "en" })),
       () => system
     );
     await store.hydrate();
     system = "zh-Hant-TW";
     store.refreshSystemLocale();
 
-    expect(store.snapshot).toEqual({ status: "ready", preference: "ja", effectiveLocale: "ja", saving: false });
+    expect(store.snapshot).toEqual({ status: "ready", preference: "en", effectiveLocale: "en", saving: false });
+  });
+
+  it.each([["zh-TW", "zh-CN"], ["ja", "en"], ["ko", "en"]])("reads the saved %s choice as %s without rewriting it", async (legacy, current) => {
+    const saved = driver(JSON.stringify({ version: 1, locale: legacy }));
+    const store = new MobileLocalePreferenceStore(saved);
+    await store.hydrate();
+
+    expect(store.snapshot).toEqual({ status: "ready", preference: current, effectiveLocale: current, saving: false });
+    expect(saved.setItem).not.toHaveBeenCalled();
   });
 
   it("refreshes only a system preference when the phone locale changes", async () => {
@@ -65,7 +74,7 @@ describe("MobileLocalePreferenceStore", () => {
     expect(store.snapshot).toEqual({
       status: "ready",
       preference: "system",
-      effectiveLocale: "zh-TW",
+      effectiveLocale: "zh-CN",
       saving: false
     });
     expect(listener).toHaveBeenCalledTimes(2);
@@ -80,7 +89,7 @@ describe("MobileLocalePreferenceStore", () => {
     const store = new MobileLocalePreferenceStore(driver(raw), () => "ko-KR");
     await store.hydrate();
 
-    expect(store.snapshot).toMatchObject({ status: "error", preference: "system", effectiveLocale: "ko" });
+    expect(store.snapshot).toMatchObject({ status: "error", preference: "system", effectiveLocale: "en" });
     expect(store.snapshot.error).toContain("phone's language is being used");
   });
 
@@ -105,7 +114,7 @@ describe("MobileLocalePreferenceStore", () => {
 
   it("persists an explicit return to the system language", async () => {
     const saved = driver(JSON.stringify({ version: 1, locale: "ja" }));
-    const store = new MobileLocalePreferenceStore(saved, () => "ko-KR");
+    const store = new MobileLocalePreferenceStore(saved, () => "zh-Hant-TW");
     await store.hydrate();
     await store.setPreference("system");
 
@@ -116,7 +125,7 @@ describe("MobileLocalePreferenceStore", () => {
     expect(store.snapshot).toEqual({
       status: "ready",
       preference: "system",
-      effectiveLocale: "ko",
+      effectiveLocale: "zh-CN",
       saving: false
     });
   });
@@ -127,10 +136,10 @@ describe("MobileLocalePreferenceStore", () => {
     await store.hydrate();
     saved.setItem.mockRejectedValueOnce(new Error("disk unavailable"));
 
-    await expect(store.setPreference("ja")).rejects.toThrow("disk unavailable");
+    await expect(store.setPreference("zh-CN")).rejects.toThrow("disk unavailable");
 
-    expect(store.snapshot.preference).toBe("ko");
-    expect(store.snapshot.effectiveLocale).toBe("ko");
+    expect(store.snapshot.preference).toBe("en");
+    expect(store.snapshot.effectiveLocale).toBe("en");
     expect(store.snapshot.error).toContain("could not be saved");
   });
 

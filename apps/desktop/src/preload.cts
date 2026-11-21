@@ -83,6 +83,7 @@ import type {
   DesktopRuntimeProcessMonitorSession,
   DesktopRuntimeProcessSample,
   DesktopSessionDragPreviewRequest,
+  DesktopPartnerWindowOwner,
   DesktopSessionWindowDropResult,
   DesktopSessionWindowContext,
   DesktopSessionWindowOwner,
@@ -121,6 +122,7 @@ const DESKTOP_CHANNELS = {
   windowClose: "joko:window:close",
   sessionWindowOpen: "joko:session-window:open",
   sessionWindowGetOwner: "joko:session-window:owner:get",
+  partnerWindowGetOwner: "joko:partner-window:owner:get",
   extensionWindowOpen: "joko:extension-window:open",
   extensionLibraryPickLocation: "joko:extension-library:pick-location",
   projectPickDirectory: "joko:project:pick-directory",
@@ -509,6 +511,11 @@ const desktopApi = Object.freeze({
     },
     getOwner: (): Promise<DesktopSessionWindowContext> =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.sessionWindowGetOwner).then(parseDesktopSessionWindowContext),
+    getPartnerOwner: (): Promise<DesktopPartnerWindowOwner> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.partnerWindowGetOwner).then((owner: unknown) => {
+        if (!isDesktopPartnerWindowOwner(owner)) throw new TypeError("Partner window owner is invalid.");
+        return owner;
+      }),
     beginDragPreview: (request: DesktopSessionDragPreviewRequest): Promise<boolean> => {
       if (!isDesktopSessionDragPreviewRequest(request)) {
         return Promise.reject(new TypeError("Task drag preview request is invalid."));
@@ -1481,6 +1488,12 @@ function isDesktopSessionWindowOwner(value: unknown): value is DesktopSessionWin
     && isDesktopNotificationSessionId(value["sessionId"]);
 }
 
+function isDesktopPartnerWindowOwner(value: unknown): value is DesktopPartnerWindowOwner {
+  return exactRecord(value, ["kind", "profileId", "serverId", "conversationId"])
+    && (value["kind"] === "private" || value["kind"] === "group")
+    && [value["profileId"], value["serverId"], value["conversationId"]].every(isDesktopNotificationSessionId);
+}
+
 function isDesktopExtensionId(value: unknown): value is string {
   return typeof value === "string" && /^extension_[a-f0-9]{32}$/u.test(value);
 }
@@ -1531,9 +1544,13 @@ function isDesktopSessionDragGestureId(value: unknown): value is string {
 }
 
 function isDesktopSessionDragPreviewRequest(value: unknown): value is DesktopSessionDragPreviewRequest {
-  if (!nativeRecord(value) || nativeKeys(value) !== "gestureId,hint,label,palette,profileId,sessionId" ||
-    !isDesktopSessionDragGestureId(value["gestureId"]) || !nativeDragText(value["sessionId"], 256) ||
-    !nativeDragText(value["profileId"], 256) ||
+  if (!nativeRecord(value)) return false;
+  const keys = nativeKeys(value);
+  if (keys === "gestureId,hint,label,palette,partnerWindow") {
+    if (!isDesktopPartnerWindowOwner(value["partnerWindow"])) return false;
+  } else if (keys !== "gestureId,hint,label,palette,profileId,sessionId" ||
+    !nativeDragText(value["sessionId"], 256) || !nativeDragText(value["profileId"], 256)) return false;
+  if (!isDesktopSessionDragGestureId(value["gestureId"]) ||
     !nativeDragText(value["label"], 160) || !nativeDragText(value["hint"], 160)) return false;
   const palette = value["palette"];
   return nativeRecord(palette) && nativeKeys(palette) === "accent,border,muted,surface,text" &&

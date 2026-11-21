@@ -18,7 +18,7 @@ import type { MobileClient, MobileState, SavedMobileConnection } from "./mobile-
 import type { MobileThemePreference, MobileThemePreferenceState } from "./mobile-theme-preference";
 import type { MobileDiagnosticsState } from "./mobile-diagnostics";
 import {
-  MOBILE_SUPPORTED_LOCALES,
+  MOBILE_UI_LOCALES,
   type MobileLocalePreference,
   type MobileLocalePreferenceState,
   type MobileSupportedLocale
@@ -383,7 +383,7 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
 
     <Text style={[styles.section, { color: colors.muted }]}>{t("settings.language")}</Text>
     <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-      {(["system", ...MOBILE_SUPPORTED_LOCALES] as const).map((preference) => <LanguageChoice key={preference}
+      {(["system", ...MOBILE_UI_LOCALES] as const).map((preference) => <LanguageChoice key={preference}
         preference={preference} selected={locale.preference === preference} effective={locale.effectiveLocale}
         language={locale.effectiveLocale} colors={colors} disabled={locale.status === "loading" || locale.saving}
         onPress={() => void changeLocale(preference)} />)}
@@ -627,7 +627,7 @@ function ThemeChoice({ preference, selected, disabled, colors, language, onPress
 function LanguageChoice({ preference, selected, effective, disabled, colors, language, onPress }: {
   readonly preference: MobileLocalePreference;
   readonly selected: boolean;
-  readonly effective: MobileSupportedLocale;
+  readonly effective: MobileLocalePreferenceState["effectiveLocale"];
   readonly disabled: boolean;
   readonly colors: MobileSettingsColors;
   readonly language: MobileSupportedLocale;
@@ -653,12 +653,7 @@ function LanguageChoice({ preference, selected, effective, disabled, colors, lan
 }
 
 function mobileLocaleLabel(language: MobileSupportedLocale, locale: MobileLocalePreference): string {
-  const key: MobileMessageKey = locale === "system" ? "settings.language.system"
-    : locale === "en" ? "settings.language.en"
-      : locale === "zh-CN" ? "settings.language.zh-CN"
-        : locale === "zh-TW" ? "settings.language.zh-TW"
-          : locale === "ja" ? "settings.language.ja" : "settings.language.ko";
-  return mobileMessage(language, key);
+  return mobileMessage(language, `settings.language.${locale}`);
 }
 
 function NavigationRow({ label, description, colors, onPress }: {
