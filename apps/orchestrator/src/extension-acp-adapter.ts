@@ -94,6 +94,11 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
       displayName: this.options.name, version: this.version,
       health: ready ? "healthy" : "unavailable", installationState: "installed", authenticationState: ready ? "not_required" : "error",
       models: ready ? [this.model(DEFAULT_MODEL, this.options.name, state.images), ...this.models] : [],
+      providers: ready ? [{
+        providerId: this.providerId, displayName: this.options.name, accessKind: "localKeyless", api: "acp",
+        authenticationState: "not_required", loginMethods: [], supportsLogin: false, supportsLogout: false,
+        supportsRefresh: false, supportsModelRefresh: false, providesModelPricing: false
+      }] : [],
       tools: [], diagnostics: [],
       capabilities: new Map(CAPABILITIES.map(key => {
         const options = key === "permission.modes" ? state.modes : undefined;
