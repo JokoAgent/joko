@@ -284,7 +284,6 @@ export async function startManagedOrchestrator(options: StartManagedOrchestrator
   });
   const { child, requestPipe, responsePipe } = spawned;
   const whenExited = new Promise<number | null>(resolveExit => child.once("exit", resolveExit));
-  let started = false;
   try {
     const responsePromise = receiveResponse(responsePipe, child, MANAGED_ORCHESTRATOR_START_TIMEOUT_MS);
     await sendRequest(requestPipe, request);
@@ -296,7 +295,6 @@ export async function startManagedOrchestrator(options: StartManagedOrchestrator
     let desktopHostAuthKey: string | undefined = deriveDesktopHostAuthorizationKey(request);
     let committed = false;
     let committing: Promise<void> | undefined;
-    started = true;
     const processControl = createProcessControl(child, requestPipe, responsePipe,
       () => !committed || ephemeral);
     return {
@@ -343,17 +341,14 @@ export async function startManagedOrchestrator(options: StartManagedOrchestrator
       }
     };
   } catch {
-    // The response pipe may close before Node has observed the child's exit.
-    if (await waitForChildExit(child, 250) && child.exitCode === DESKTOP_OPERATIONAL_DATABASE_CORRUPTED_EXIT) {
+    responsePipe.destroy();
+    requestPipe.destroy();
+    // The pipe can end while the child is still releasing startup resources.
+    await terminateManagedOrchestratorChild(child, 1_250);
+    if (child.exitCode === DESKTOP_OPERATIONAL_DATABASE_CORRUPTED_EXIT) {
       throw new ManagedOrchestratorDatabaseCorruptionError();
     }
     throw startupUnavailable();
-  } finally {
-    if (!started) {
-      responsePipe.destroy();
-      requestPipe.destroy();
-      await terminateManagedOrchestratorChild(child, 1_000);
-    }
   }
 }
 
