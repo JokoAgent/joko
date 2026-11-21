@@ -6,7 +6,7 @@
  * 成员离群后仍保留显式目标，由宿主拒绝失效目标。宿主按解析结果决定谁回答
  * （the group mention contract §4.1）。
  */
-interface NetworkMention { readonly all: boolean; readonly actorIds: string[]; }
+interface NetworkMention { readonly all: boolean; readonly allPartners: boolean; readonly actorIds: string[]; }
 
 export interface NetworkMentionMember {
   actorId: string;
@@ -54,25 +54,28 @@ function endsAtBoundary(label: string, next: string | undefined): boolean {
 
 interface LabelEntry {
   label: string;
-  all: boolean;
+  audience?: "people" | "partners";
   actorIds: string[];
 }
 
 function buildLabelEntries(
   members: readonly NetworkMentionMember[],
   allLabels: readonly string[],
+  allPartnerLabels: readonly string[],
   tracked: readonly NetworkTrackedMention[],
 ): LabelEntry[] {
   const byLabel = new Map<string, LabelEntry>();
-  for (const raw of allLabels) {
-    const label = raw.trim();
-    if (label) byLabel.set(label, { label, all: true, actorIds: [] });
+  for (const [labels, audience] of [[allLabels, "people"], [allPartnerLabels, "partners"]] as const) {
+    for (const raw of labels) {
+      const label = raw.trim();
+      if (label) byLabel.set(label, { label, audience, actorIds: [] });
+    }
   }
   for (const member of members) {
     for (const raw of [member.name, member.nickname || member.displayName || '']) {
       const label = raw.trim();
-      if (!label || byLabel.get(label)?.all) continue;
-      const entry = byLabel.get(label) ?? { label, all: false, actorIds: [] };
+      if (!label || byLabel.get(label)?.audience) continue;
+      const entry = byLabel.get(label) ?? { label, actorIds: [] };
       if (!entry.actorIds.includes(member.actorId)) entry.actorIds.push(member.actorId);
       byLabel.set(label, entry);
     }
@@ -81,7 +84,7 @@ function buildLabelEntries(
   // records intent, not membership: the host must reject unavailable targets.
   for (const mention of tracked) {
     const label = mention.label.trim();
-    if (label && !byLabel.has(label)) byLabel.set(label, { label, all: false, actorIds: [] });
+    if (label && !byLabel.has(label)) byLabel.set(label, { label, actorIds: [] });
   }
   // 最长优先：`@小满满` 不能先被 `@小满` 截走。
   return [...byLabel.values()].sort((a, b) => b.label.length - a.label.length);
@@ -124,24 +127,29 @@ export function resolveNetworkMentions(
   input: {
     members: readonly NetworkMentionMember[];
     allLabels: readonly string[];
+    allPartnerLabels?: readonly string[];
     tracked?: readonly NetworkTrackedMention[];
   },
 ): NetworkMention {
-  const entries = buildLabelEntries(input.members, input.allLabels, input.tracked ?? []);
+  const entries = buildLabelEntries(input.members, input.allLabels, input.allPartnerLabels ?? [], input.tracked ?? []);
   const actorIds: string[] = [];
   let all = false;
+  let allPartners = false;
   for (const token of scanMentionTokens(text, entries)) {
     // A pick names that companion even when its name is also a 「所有人」 label; only the
     // 「所有人」 option or a typed reserved word addresses everyone.
     const picked = (input.tracked ?? []).filter(mention =>
       mention.start === token.start && mention.label.trim() === token.entry.label);
-    if (token.entry.all && picked.length === 0) all = true;
+    if (picked.length === 0) {
+      if (token.entry.audience === "people") all = true;
+      if (token.entry.audience === "partners") allPartners = true;
+    }
     for (const actorId of picked.length ? picked.map(mention => mention.actorId) : token.entry.actorIds) {
       if (!actorIds.includes(actorId)) actorIds.push(actorId);
     }
   }
   // 按正文里点名的先后输出：宿主直接按这个顺序轮流发言（group mention contract §4.1）。
-  return { all, actorIds };
+  return { all, allPartners, actorIds };
 }
 
 /** Move intact picked tokens with a text edit; forget tokens the edit replaces. */
@@ -151,6 +159,7 @@ export function retainNetworkTrackedMentions(
   input: {
     members: readonly NetworkMentionMember[];
     allLabels: readonly string[];
+    allPartnerLabels?: readonly string[];
     tracked: readonly NetworkTrackedMention[];
     /** Previous selection start (or new caret after deletion) disambiguates identical tokens. */
     editStart?: number;
@@ -172,7 +181,7 @@ export function retainNetworkTrackedMentions(
     if (mention.start >= previousEnd) return [{ ...mention, start: mention.start + delta }];
     return []; // This particular token was edited or deleted, even if a namesake remains.
   });
-  const entries = buildLabelEntries(input.members, input.allLabels, tracked);
+  const entries = buildLabelEntries(input.members, input.allLabels, input.allPartnerLabels ?? [], tracked);
   const tokens = scanMentionTokens(text, entries);
   return tracked.filter(mention => tokens.some(token =>
     token.start === mention.start && token.entry.label === mention.label.trim()));

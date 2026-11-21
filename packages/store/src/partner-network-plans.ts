@@ -52,23 +52,32 @@ export class PartnerNetworkPlans {
   #organizer(room: NetworkRoom, requesterId: string): NetworkActor | undefined {
     const members = this.eligible(room, requesterId); return members.find(actor => actor.id === room.organizerId) ?? members[0];
   }
-  onSend(room: NetworkRoom, requesterId: string, message: NetworkMessage, force: boolean, specific: boolean): boolean {
-    if (specific || message.threadRootId || message.kind === "member-joined") return false;
+  onSend(room: NetworkRoom, requester: NetworkActor, message: NetworkMessage, { force, specific, directed }: {
+    force: boolean; specific: boolean; directed: boolean;
+  }): boolean {
+    if (specific && !force || message.threadRootId || message.kind === "member-joined") return false;
     const plan = this.current(room.id);
-    if (plan && ["running", "waiting"].includes(plan.status)) {
+    if (plan?.status === "proposed" && plan.requesterId !== requester.id) {
+      if (force) throw new PartnerNetworkStoreError("changed", "Finish or stop the open plan first.");
+      return false;
+    }
+    if (plan && directed && !force) return false;
+    if (plan && (plan.status === "running" || plan.status === "waiting")) {
+      if (force) throw new PartnerNetworkStoreError("changed", "Finish or stop the open plan first.");
+      if (plan.requesterId !== requester.id && !["owner", "admin"].includes(requester.role)) return false;
       if (plan.noteMessageIds.length >= 100) throw new PartnerNetworkStoreError("invalid", "Finish the current step before adding more notes.");
       plan.noteMessageIds.push(message.id);
-      if (plan.status === "waiting") this.#begin(room, this.#put(plan), plan.currentStep, requesterId, false);
+      if (plan.status === "waiting") this.#begin(room, this.#put(plan), plan.currentStep, requester.id, false);
       else this.#put(plan);
       return true;
     }
-    const organizer = this.#organizer(room, requesterId);
+    const organizer = this.#organizer(room, requester.id);
     if (!organizer) {
       if (force || plan?.status === "proposed") throw new PartnerNetworkStoreError("denied", "No available organizer can arrange this work.");
       return false;
     }
     this.port.cancel(room.id);
-    this.#decision(room, requesterId, organizer, message, plan?.status === "proposed" ? "revise" : force ? "forced" : "auto", plan?.id ?? "");
+    this.#decision(room, requester.id, organizer, message, plan?.status === "proposed" ? "revise" : force ? "forced" : "auto", plan?.id ?? "");
     return true;
   }
   onTalkSend(room: NetworkRoom, requester: NetworkActor, message: NetworkMessage, responders: readonly NetworkActor[], explicit: boolean): boolean {

@@ -102,6 +102,7 @@ message PartnerNetworkRoom {
   bool unread = 17;
   string organizer_id = 18;
   bool single_speaker = 19;
+  bool allow_mention_all_partners = 20;
 }
 message PartnerNetworkSnapshot {
   PartnerNetworkRoom room = 1;
@@ -159,11 +160,14 @@ message SendPartnerNetworkRequest {
   string join_id = 3;
   string text = 4;
   repeated string mentions = 5;
+  // Broadcast to joined humans.
   bool mention_all = 6;
   string thread_root_id = 7;
   string quote_id = 8;
   repeated PartnerNetworkAttachment attachments = 9;
   bool force_plan = 10;
+  // Broadcast to joined companions when the room owner has enabled it.
+  bool mention_all_partners = 11;
 }
 message SendPartnerNetworkResponse { PartnerNetworkMessage message = 1; }
 message ManagePartnerNetworkRequest {
@@ -235,6 +239,7 @@ message PartnerNetworkGuestServiceSendPartnerNetworkRequest {
   string quote_id = 8;
   repeated PartnerNetworkAttachment attachments = 9;
   bool force_plan = 10;
+  bool mention_all_partners = 11;
 }
 message PartnerNetworkGuestServiceSendPartnerNetworkResponse { PartnerNetworkMessage message = 1; }
 message PartnerNetworkGuestServiceManagePartnerNetworkRequest {
