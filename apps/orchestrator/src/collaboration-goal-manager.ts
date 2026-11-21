@@ -1713,7 +1713,7 @@ function serviceOperationId(seed: string, kind: string): string {
   return `${kind}:${createHash("sha256").update(seed).digest("hex")}`;
 }
 
-function workerSystemPrompt(goal: CollaborationGoalRecord, worker: CollaborationWorkerRecord): string {
+export function workerSystemPrompt(goal: CollaborationGoalRecord, worker: CollaborationWorkerRecord): string {
   return [
     "# Collaboration worker",
     `You are the durable worker ${JSON.stringify(worker.label)} with role ${JSON.stringify(worker.role)}.`,

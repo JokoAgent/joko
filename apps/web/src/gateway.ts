@@ -1098,6 +1098,7 @@ export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage
   deviceAuthorizationOwner?(): import('@joko/connection-transport/device-authorization').DeviceAuthorizationOwner;
   serverAccess?(): import('@joko/connection-transport/server-access').ServerAccessClient;
   taskActivity?(): import('@joko/connection-transport').TaskActivityPort;
+  taskCopyChannel?(signal?: AbortSignal): import("./task-copy-ui.js").TaskCopyChannel;
   inputHandoffApi(openLive?: (peer: DevicePeerRouteIdentity, requestId: string, signal: AbortSignal) => Promise<void>): InputHandoffApi;
   providerSharingApi(): ProviderSharingApi;
   partnerNetworkApi(): PartnerNetworkApi;
@@ -3798,6 +3799,16 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }
     ownedContext.signal.throwIfAborted();
     return this.downloadArtifact(blob.blobId, blob.fileName || payload.value.title || "session-export.html", ownedContext);
+  }
+
+  taskCopyChannel(signal?: AbortSignal): import("./task-copy-ui.js").TaskCopyChannel {
+    if (this.#taskSharing !== undefined) throw new GatewayError("Copying a task requires the node owner connection.");
+    const scope = this.captureActionScope(signal);
+    return {
+      portable: createClient(PortableSessionService, scope.transport),
+      connection: createClient(ConnectionService, scope.transport),
+      signal: scope.signal
+    };
   }
 
   async exportPortableSession(

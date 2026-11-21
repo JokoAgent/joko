@@ -2,6 +2,7 @@
 .modal.portable-session-dialog--import { max-width: 480px; }
 .portable-session-form { display: grid; gap: 12px; }
 .portable-session-form p { margin: 0; }
+.task-copy-skipped-path { overflow-wrap: anywhere; }
 .portable-session-form__hint { color: var(--text-soft); font-size: var(--text-12); line-height: 1.5; }
 .portable-session-form__error { color: var(--red); font-size: var(--text-11); line-height: 1.45; }
 .portable-session-check { display: flex; align-items: flex-start; gap: 8px; color: var(--text); font-size: var(--text-12); cursor: pointer; }

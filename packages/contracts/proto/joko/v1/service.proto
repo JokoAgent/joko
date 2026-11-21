@@ -188,6 +188,11 @@ service PortableSessionService {
   rpc GetPortableReplacementCleanup(GetPortableReplacementCleanupRequest) returns (GetPortableReplacementCleanupResponse);
   rpc ReconcilePortableReplacementCleanup(ReconcilePortableReplacementCleanupRequest) returns (ReconcilePortableReplacementCleanupResponse);
   rpc RetryPortableReplacementCleanup(RetryPortableReplacementCleanupRequest) returns (RetryPortableReplacementCleanupResponse);
+  rpc PreparePortableTaskCopy(PreparePortableTaskCopyRequest) returns (PreparePortableTaskCopyResponse);
+  rpc ReadPortableTaskCopy(ReadPortableTaskCopyRequest) returns (stream ReadPortableTaskCopyResponse);
+  rpc CancelPortableTaskCopy(CancelPortableTaskCopyRequest) returns (CancelPortableTaskCopyResponse);
+  rpc ImportPortableTaskCopy(ImportPortableTaskCopyRequest) returns (ImportPortableTaskCopyResponse);
+  rpc GetPortableTaskCopyReceipt(GetPortableTaskCopyReceiptRequest) returns (GetPortableTaskCopyReceiptResponse);
 }
 
 service RunService {

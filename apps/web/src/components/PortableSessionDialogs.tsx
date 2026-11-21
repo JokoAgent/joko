@@ -79,6 +79,7 @@ export function PortableSessionExportDialog({
   labels,
   onClose,
   onExport,
+  copyToNode,
   connectionOwner,
   onExported
 }: {
@@ -86,6 +87,7 @@ export function PortableSessionExportDialog({
   readonly labels: PortableSessionDialogLabels;
   readonly onClose: () => void;
   readonly onExport: (input: { readonly password?: string; readonly excludeMedia: boolean }, context: ArtifactDownloadContext) => Promise<PortableSessionExportOutcome>;
+  readonly copyToNode?: { readonly label: string; readonly open: () => void };
   readonly connectionOwner: unknown;
   readonly onExported: (fidelity: PortableSessionFidelity, status: "exported" | "dispatched") => void;
 }): JSX.Element {
@@ -211,6 +213,7 @@ export function PortableSessionExportDialog({
       {error !== undefined && <p className="portable-session-form__error" role="alert">{error}</p>}
       <div className="modal__actions">
         <Button disabled={busy} onClick={close}>{labels.cancel}</Button>
+        {copyToNode && <Button disabled={busy} onClick={copyToNode.open}>{copyToNode.label}</Button>}
         <Button tone="primary" disabled={!canSubmit} onClick={(event) => void submit(event.currentTarget.ownerDocument)}>
           {busy && <LoaderCircle className="is-spinning" aria-hidden="true" />}
           {excludeMedia ? labels.exportWithoutMedia : labels.export}

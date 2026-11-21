@@ -7891,10 +7891,12 @@ export class OperationalStore {
     this.assertOpen();
     const row = this.database.prepare(`SELECT kind FROM operations
       WHERE status = 'completed' AND json_extract(response_json, '$.sessionId') = ?
-        AND kind IN ('create_partner_session', 'create_collaboration_worker_session', 'create_messaging_session', 'create_learning_session')
+        AND (kind IN ('create_partner_session', 'create_collaboration_worker_session', 'create_messaging_session', 'create_learning_session')
+          OR (kind = 'import_portable_session' AND json_extract(body_json, '$.taskCopy.kind') = 'worker'))
       ORDER BY created_at LIMIT 1`).get(nonBlank(sessionId, "Session ID")) as Row | undefined;
     return row === undefined ? undefined : row["kind"] === "create_partner_session" ? "partner"
-      : row["kind"] === "create_collaboration_worker_session" ? "collaboration" : row["kind"] === "create_messaging_session" ? "messaging" : "learning";
+      : row["kind"] === "create_collaboration_worker_session" || row["kind"] === "import_portable_session"
+        ? "collaboration" : row["kind"] === "create_messaging_session" ? "messaging" : "learning";
   }
 
   findNativeCatalogCreation(sessionId: string): OperationRecord | undefined {

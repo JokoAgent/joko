@@ -185,3 +185,100 @@ message RetryPortableReplacementCleanupResponse {
   PortableReplacementCleanup cleanup = 1;
   PortableReplacementInspection inspection = 2;
 }
+
+// A transient, purpose-bound grant for direct transfer between two paired nodes.
+// The read secret never enters an Operation or an Event.
+message PortableTaskCopyGrant {
+  string transfer_id = 1;
+  bytes read_secret = 2;
+  string operation_id = 3;
+  string source_server_id = 4;
+  string destination_server_id = 5;
+  string source_session_id = 6;
+  uint64 source_session_generation = 7;
+  google.protobuf.Timestamp expires_at = 8;
+  PortableTaskCopyPart session_package = 9;
+  PortableTaskCopyPart workspace_archive = 10;
+  string source_title = 11;
+  string source_backend_id = 12;
+  WorkspaceKind source_workspace_kind = 13;
+}
+
+message PortableTaskCopyPart {
+  string sha256 = 1;
+  uint64 size = 2;
+}
+
+enum PortableTaskCopyPartKind {
+  PORTABLE_TASK_COPY_PART_KIND_UNSPECIFIED = 0;
+  PORTABLE_TASK_COPY_PART_KIND_SESSION = 1;
+  PORTABLE_TASK_COPY_PART_KIND_WORKSPACE = 2;
+}
+
+message PreparePortableTaskCopyRequest {
+  string operation_id = 1;
+  string session_id = 2;
+  uint64 expected_session_generation = 3;
+  string destination_server_id = 4;
+}
+
+message PreparePortableTaskCopyResponse {
+  PortableTaskCopyGrant grant = 1;
+}
+
+message ReadPortableTaskCopyRequest {
+  string transfer_id = 1;
+  string operation_id = 2;
+  string destination_server_id = 3;
+  PortableTaskCopyPartKind part = 4;
+}
+
+message ReadPortableTaskCopyResponse {
+  uint64 offset = 1;
+  bytes content = 2;
+}
+
+message CancelPortableTaskCopyRequest {
+  string transfer_id = 1;
+  string operation_id = 2;
+}
+
+message CancelPortableTaskCopyResponse {
+  bool cancelled = 1;
+}
+
+message ImportPortableTaskCopyRequest {
+  PortableTaskCopyGrant grant = 1;
+  string source_origin = 2;
+  // A v1 trusted-node invitation for the paired source route, when available.
+  optional string source_invitation = 3;
+  string backend_id = 4;
+  // An explicit approved local project may hold the new isolated copy directory.
+  optional string parent_target_id = 5;
+  optional Revision expected_parent_revision = 6;
+}
+
+message PortableTaskCopySkippedFile {
+  string relative_path = 1;
+  string reason = 2;
+}
+
+message PortableTaskCopyReceipt {
+  string operation_id = 1;
+  string target_id = 2;
+  PortableSessionImportResult task = 3;
+  uint64 skipped_file_count = 4;
+  repeated PortableTaskCopySkippedFile skipped_files = 5;
+}
+
+message ImportPortableTaskCopyResponse {
+  PortableTaskCopyReceipt receipt = 1;
+}
+
+message GetPortableTaskCopyReceiptRequest {
+  string operation_id = 1;
+}
+
+message GetPortableTaskCopyReceiptResponse {
+  optional PortableTaskCopyReceipt receipt = 1;
+}

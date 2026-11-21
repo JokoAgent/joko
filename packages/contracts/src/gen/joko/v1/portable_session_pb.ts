@@ -8,7 +8,7 @@ import type { Timestamp } from "@bufbuild/protobuf/wkt";
 import { file_google_protobuf_timestamp } from "@bufbuild/protobuf/wkt";
 import type { PermissionMode } from "./capability_pb.js";
 import { file_joko_v1_capability } from "./capability_pb.js";
-import type { BlobRef, ErrorInfo } from "./common_pb.js";
+import type { BlobRef, ErrorInfo, Revision } from "./common_pb.js";
 import { file_joko_v1_common } from "./common_pb.js";
 import type { ModelSelection } from "./model_pb.js";
 import { file_joko_v1_model } from "./model_pb.js";
@@ -20,7 +20,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/portable_session.proto.
  */
 export const file_joko_v1_portable_session: GenFile = /*@__PURE__*/
-  fileDesc("Ch5qb2tvL3YxL3BvcnRhYmxlX3Nlc3Npb24ucHJvdG8SB2pva28udjEi7QIKHFBvcnRhYmxlU2Vzc2lvbkltcG9ydFByZXZpZXcSDQoFdGl0bGUYASABKAkSLgoOd29ya3NwYWNlX2tpbmQYAiABKA4yFi5qb2tvLnYxLldvcmtzcGFjZUtpbmQSLwoLZXhwb3J0ZWRfYXQYAyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEhsKE2FwcGxpY2F0aW9uX3ZlcnNpb24YBCABKAkSFgoOZm9ybWF0X3ZlcnNpb24YBSABKA0SGgoSYmFja2VuZF9jYXBhYmlsaXR5GAYgASgJEjIKCGZpZGVsaXR5GAcgASgOMiAuam9rby52MS5Qb3J0YWJsZVNlc3Npb25GaWRlbGl0eRIVCg1tZXNzYWdlX2NvdW50GAggASgEEhMKC21lZGlhX2NvdW50GAkgASgEEhQKDHdvcmtlcl9jb3VudBgKIAEoBBIWCg5uYXRpdmVfaGlzdG9yeRgLIAEoCCLVAQoaUG9ydGFibGVTZXNzaW9uSW1wb3J0RHJhZnQSEAoIZHJhZnRfaWQYASABKAkSLgoKZXhwaXJlc19hdBgCIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASEQoJZW5jcnlwdGVkGAMgASgIEhkKEXBhc3N3b3JkX3JlcXVpcmVkGAQgASgIEjsKB3ByZXZpZXcYBSABKAsyJS5qb2tvLnYxLlBvcnRhYmxlU2Vzc2lvbkltcG9ydFByZXZpZXdIAIgBAUIKCghfcHJldmlldyJtChxFeHBvcnRQb3J0YWJsZVNlc3Npb25SZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSFQoIcGFzc3dvcmQYAiABKAlIAIgBARIVCg1leGNsdWRlX21lZGlhGAMgASgIQgsKCV9wYXNzd29yZCLrAQodRXhwb3J0UG9ydGFibGVTZXNzaW9uUmVzcG9uc2USIgoIYXJ0aWZhY3QYASABKAsyEC5qb2tvLnYxLkJsb2JSZWYSMgoIZmlkZWxpdHkYAiABKA4yIC5qb2tvLnYxLlBvcnRhYmxlU2Vzc2lvbkZpZGVsaXR5EhUKDW1lc3NhZ2VfY291bnQYAyABKAQSEwoLbWVkaWFfY291bnQYBCABKAQSGwoTbWlzc2luZ19tZWRpYV9jb3VudBgFIAEoBBIUCgx3b3JrZXJfY291bnQYBiABKAQSEwoLbWVkaWFfYnl0ZXMYByABKAQiSAojSW5zcGVjdFBvcnRhYmxlU2Vzc2lvbkltcG9ydFJlcXVlc3QSIQoHcGFja2FnZRgBIAEoCzIQLmpva28udjEuQmxvYlJlZiJaCiRJbnNwZWN0UG9ydGFibGVTZXNzaW9uSW1wb3J0UmVzcG9uc2USMgoFZHJhZnQYASABKAsyIy5qb2tvLnYxLlBvcnRhYmxlU2Vzc2lvbkltcG9ydERyYWZ0IkgKIlVubG9ja1BvcnRhYmxlU2Vzc2lvbkltcG9ydFJlcXVlc3QSEAoIZHJhZnRfaWQYASABKAkSEAoIcGFzc3dvcmQYAiABKAkiWQojVW5sb2NrUG9ydGFibGVTZXNzaW9uSW1wb3J0UmVzcG9uc2USMgoFZHJhZnQYASABKAsyIy5qb2tvLnYxLlBvcnRhYmxlU2Vzc2lvbkltcG9ydERyYWZ0IjYKIkNhbmNlbFBvcnRhYmxlU2Vzc2lvbkltcG9ydFJlcXVlc3QSEAoIZHJhZnRfaWQYASABKAkiOAojQ2FuY2VsUG9ydGFibGVTZXNzaW9uSW1wb3J0UmVzcG9uc2USEQoJY2FuY2VsbGVkGAEgASgIIv0CCiJDb21taXRQb3J0YWJsZVNlc3Npb25JbXBvcnRSZXF1ZXN0EhQKDG9wZXJhdGlvbl9pZBgBIAEoCRIQCghkcmFmdF9pZBgCIAEoCRIRCgl0YXJnZXRfaWQYAyABKAkSEgoFdGl0bGUYBCABKAlIAIgBARIrCgVtb2RlbBgFIAEoCzIXLmpva28udjEuTW9kZWxTZWxlY3Rpb25IAYgBARIwCg9wZXJtaXNzaW9uX21vZGUYBiABKA4yFy5qb2tvLnYxLlBlcm1pc3Npb25Nb2RlEhEKCXBsYW5fbW9kZRgHIAEoCBIRCglvdmVyd3JpdGUYCCABKAgSFAoMdXNlX3dvcmt0cmVlGAkgASgIEiAKE3dvcmt0cmVlX3NvdXJjZV9yZWYYCiABKAlIAogBARIfChdyZWZyZXNoX3dvcmt0cmVlX3JlbW90ZRgLIAEoCEIICgZfdGl0bGVCCAoGX21vZGVsQhYKFF93b3JrdHJlZV9zb3VyY2VfcmVmIsMCChtQb3J0YWJsZVNlc3Npb25JbXBvcnRSZXN1bHQSEgoKc2Vzc2lvbl9pZBgBIAEoCRIyCghmaWRlbGl0eRgCIAEoDjIgLmpva28udjEuUG9ydGFibGVTZXNzaW9uRmlkZWxpdHkSFQoNbWVzc2FnZV9jb3VudBgDIAEoBBITCgttZWRpYV9jb3VudBgEIAEoBBIUCgx3b3JrZXJfY291bnQYBSABKAQSHAoUcmVwbGFjZWRfc2Vzc2lvbl9pZHMYBiADKAkSNAoGc3RhdHVzGAcgASgOMiQuam9rby52MS5Qb3J0YWJsZVNlc3Npb25JbXBvcnRTdGF0dXMSMQoQYWN0aXZhdGlvbl9lcnJvchgIIAEoCzISLmpva28udjEuRXJyb3JJbmZvSACIAQFCEwoRX2FjdGl2YXRpb25fZXJyb3IibQojQ29tbWl0UG9ydGFibGVTZXNzaW9uSW1wb3J0UmVzcG9uc2USNAoGcmVzdWx0GAEgASgLMiQuam9rby52MS5Qb3J0YWJsZVNlc3Npb25JbXBvcnRSZXN1bHQSEAoIcmVwbGF5ZWQYAiABKAgiOwolUmV0cnlQb3J0YWJsZVNlc3Npb25BY3RpdmF0aW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIroBCiZSZXRyeVBvcnRhYmxlU2Vzc2lvbkFjdGl2YXRpb25SZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEjQKBnN0YXR1cxgCIAEoDjIkLmpva28udjEuUG9ydGFibGVTZXNzaW9uSW1wb3J0U3RhdHVzEjEKEGFjdGl2YXRpb25fZXJyb3IYAyABKAsyEi5qb2tvLnYxLkVycm9ySW5mb0gAiAEBQhMKEV9hY3RpdmF0aW9uX2Vycm9yIv0BChpQb3J0YWJsZVJlcGxhY2VtZW50Q2xlYW51cBIbChNpbXBvcnRlZF9zZXNzaW9uX2lkGAEgASgJEj0KDG5hdGl2ZV9zdGF0ZRgCIAEoDjInLmpva28udjEuUG9ydGFibGVSZXBsYWNlbWVudE5hdGl2ZVN0YXRlEkEKDndvcmt0cmVlX3N0YXRlGAMgASgOMikuam9rby52MS5Qb3J0YWJsZVJlcGxhY2VtZW50V29ya3RyZWVTdGF0ZRIQCghyZXZpc2lvbhgEIAEoBBIuCgp1cGRhdGVkX2F0GAUgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCJDCiRHZXRQb3J0YWJsZVJlcGxhY2VtZW50Q2xlYW51cFJlcXVlc3QSGwoTaW1wb3J0ZWRfc2Vzc2lvbl9pZBgBIAEoCSJuCiVHZXRQb3J0YWJsZVJlcGxhY2VtZW50Q2xlYW51cFJlc3BvbnNlEjkKB2NsZWFudXAYASABKAsyIy5qb2tvLnYxLlBvcnRhYmxlUmVwbGFjZW1lbnRDbGVhbnVwSACIAQFCCgoIX2NsZWFudXAiSQoqUmVjb25jaWxlUG9ydGFibGVSZXBsYWNlbWVudENsZWFudXBSZXF1ZXN0EhsKE2ltcG9ydGVkX3Nlc3Npb25faWQYASABKAkinwEKK1JlY29uY2lsZVBvcnRhYmxlUmVwbGFjZW1lbnRDbGVhbnVwUmVzcG9uc2USNAoHY2xlYW51cBgBIAEoCzIjLmpva28udjEuUG9ydGFibGVSZXBsYWNlbWVudENsZWFudXASOgoKaW5zcGVjdGlvbhgCIAEoDjImLmpva28udjEuUG9ydGFibGVSZXBsYWNlbWVudEluc3BlY3Rpb24ifwomUmV0cnlQb3J0YWJsZVJlcGxhY2VtZW50Q2xlYW51cFJlcXVlc3QSGwoTaW1wb3J0ZWRfc2Vzc2lvbl9pZBgBIAEoCRIZChFleHBlY3RlZF9yZXZpc2lvbhgCIAEoBBIdChVjb25maXJtX25hdGl2ZV9kZWxldGUYAyABKAgimwEKJ1JldHJ5UG9ydGFibGVSZXBsYWNlbWVudENsZWFudXBSZXNwb25zZRI0CgdjbGVhbnVwGAEgASgLMiMuam9rby52MS5Qb3J0YWJsZVJlcGxhY2VtZW50Q2xlYW51cBI6CgppbnNwZWN0aW9uGAIgASgOMiYuam9rby52MS5Qb3J0YWJsZVJlcGxhY2VtZW50SW5zcGVjdGlvbiq7AQoXUG9ydGFibGVTZXNzaW9uRmlkZWxpdHkSKQolUE9SVEFCTEVfU0VTU0lPTl9GSURFTElUWV9VTlNQRUNJRklFRBAAEiIKHlBPUlRBQkxFX1NFU1NJT05fRklERUxJVFlfRlVMTBABEiUKIVBPUlRBQkxFX1NFU1NJT05fRklERUxJVFlfUEFSVElBTBACEioKJlBPUlRBQkxFX1NFU1NJT05fRklERUxJVFlfUFJPRFVDVF9PTkxZEAMqtgEKG1BvcnRhYmxlU2Vzc2lvbkltcG9ydFN0YXR1cxIuCipQT1JUQUJMRV9TRVNTSU9OX0lNUE9SVF9TVEFUVVNfVU5TUEVDSUZJRUQQABIoCiRQT1JUQUJMRV9TRVNTSU9OX0lNUE9SVF9TVEFUVVNfUkVBRFkQARI9CjlQT1JUQUJMRV9TRVNTSU9OX0lNUE9SVF9TVEFUVVNfSU1QT1JURURfQUNUSVZBVElPTl9GQUlMRUQQAiqUAgoeUG9ydGFibGVSZXBsYWNlbWVudE5hdGl2ZVN0YXRlEjEKLVBPUlRBQkxFX1JFUExBQ0VNRU5UX05BVElWRV9TVEFURV9VTlNQRUNJRklFRBAAEi0KKVBPUlRBQkxFX1JFUExBQ0VNRU5UX05BVElWRV9TVEFURV9QRU5ESU5HEAESMAosUE9SVEFCTEVfUkVQTEFDRU1FTlRfTkFUSVZFX1NUQVRFX0RJU1BBVENIRUQQAhItCilQT1JUQUJMRV9SRVBMQUNFTUVOVF9OQVRJVkVfU1RBVEVfVU5LTk9XThADEi8KK1BPUlRBQkxFX1JFUExBQ0VNRU5UX05BVElWRV9TVEFURV9DT01QTEVURUQQBCq7AQogUG9ydGFibGVSZXBsYWNlbWVudFdvcmt0cmVlU3RhdGUSMwovUE9SVEFCTEVfUkVQTEFDRU1FTlRfV09SS1RSRUVfU1RBVEVfVU5TUEVDSUZJRUQQABIvCitQT1JUQUJMRV9SRVBMQUNFTUVOVF9XT1JLVFJFRV9TVEFURV9QRU5ESU5HEAESMQotUE9SVEFCTEVfUkVQTEFDRU1FTlRfV09SS1RSRUVfU1RBVEVfQ09NUExFVEVEEAIq1gEKHVBvcnRhYmxlUmVwbGFjZW1lbnRJbnNwZWN0aW9uEi8KK1BPUlRBQkxFX1JFUExBQ0VNRU5UX0lOU1BFQ1RJT05fVU5TUEVDSUZJRUQQABIrCidQT1JUQUJMRV9SRVBMQUNFTUVOVF9JTlNQRUNUSU9OX1BSRVNFTlQQARIqCiZQT1JUQUJMRV9SRVBMQUNFTUVOVF9JTlNQRUNUSU9OX0FCU0VOVBACEisKJ1BPUlRBQkxFX1JFUExBQ0VNRU5UX0lOU1BFQ1RJT05fVU5LTk9XThADYgZwcm90bzM", [file_google_protobuf_timestamp, file_joko_v1_capability, file_joko_v1_common, file_joko_v1_model, file_joko_v1_workspace]);
+  fileDesc("Ch5qb2tvL3YxL3BvcnRhYmxlX3Nlc3Npb24ucHJvdG8SB2pva28udjEi7QIKHFBvcnRhYmxlU2Vzc2lvbkltcG9ydFByZXZpZXcSDQoFdGl0bGUYASABKAkSLgoOd29ya3NwYWNlX2tpbmQYAiABKA4yFi5qb2tvLnYxLldvcmtzcGFjZUtpbmQSLwoLZXhwb3J0ZWRfYXQYAyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEhsKE2FwcGxpY2F0aW9uX3ZlcnNpb24YBCABKAkSFgoOZm9ybWF0X3ZlcnNpb24YBSABKA0SGgoSYmFja2VuZF9jYXBhYmlsaXR5GAYgASgJEjIKCGZpZGVsaXR5GAcgASgOMiAuam9rby52MS5Qb3J0YWJsZVNlc3Npb25GaWRlbGl0eRIVCg1tZXNzYWdlX2NvdW50GAggASgEEhMKC21lZGlhX2NvdW50GAkgASgEEhQKDHdvcmtlcl9jb3VudBgKIAEoBBIWCg5uYXRpdmVfaGlzdG9yeRgLIAEoCCLVAQoaUG9ydGFibGVTZXNzaW9uSW1wb3J0RHJhZnQSEAoIZHJhZnRfaWQYASABKAkSLgoKZXhwaXJlc19hdBgCIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASEQoJZW5jcnlwdGVkGAMgASgIEhkKEXBhc3N3b3JkX3JlcXVpcmVkGAQgASgIEjsKB3ByZXZpZXcYBSABKAsyJS5qb2tvLnYxLlBvcnRhYmxlU2Vzc2lvbkltcG9ydFByZXZpZXdIAIgBAUIKCghfcHJldmlldyJtChxFeHBvcnRQb3J0YWJsZVNlc3Npb25SZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSFQoIcGFzc3dvcmQYAiABKAlIAIgBARIVCg1leGNsdWRlX21lZGlhGAMgASgIQgsKCV9wYXNzd29yZCLrAQodRXhwb3J0UG9ydGFibGVTZXNzaW9uUmVzcG9uc2USIgoIYXJ0aWZhY3QYASABKAsyEC5qb2tvLnYxLkJsb2JSZWYSMgoIZmlkZWxpdHkYAiABKA4yIC5qb2tvLnYxLlBvcnRhYmxlU2Vzc2lvbkZpZGVsaXR5EhUKDW1lc3NhZ2VfY291bnQYAyABKAQSEwoLbWVkaWFfY291bnQYBCABKAQSGwoTbWlzc2luZ19tZWRpYV9jb3VudBgFIAEoBBIUCgx3b3JrZXJfY291bnQYBiABKAQSEwoLbWVkaWFfYnl0ZXMYByABKAQiSAojSW5zcGVjdFBvcnRhYmxlU2Vzc2lvbkltcG9ydFJlcXVlc3QSIQoHcGFja2FnZRgBIAEoCzIQLmpva28udjEuQmxvYlJlZiJaCiRJbnNwZWN0UG9ydGFibGVTZXNzaW9uSW1wb3J0UmVzcG9uc2USMgoFZHJhZnQYASABKAsyIy5qb2tvLnYxLlBvcnRhYmxlU2Vzc2lvbkltcG9ydERyYWZ0IkgKIlVubG9ja1BvcnRhYmxlU2Vzc2lvbkltcG9ydFJlcXVlc3QSEAoIZHJhZnRfaWQYASABKAkSEAoIcGFzc3dvcmQYAiABKAkiWQojVW5sb2NrUG9ydGFibGVTZXNzaW9uSW1wb3J0UmVzcG9uc2USMgoFZHJhZnQYASABKAsyIy5qb2tvLnYxLlBvcnRhYmxlU2Vzc2lvbkltcG9ydERyYWZ0IjYKIkNhbmNlbFBvcnRhYmxlU2Vzc2lvbkltcG9ydFJlcXVlc3QSEAoIZHJhZnRfaWQYASABKAkiOAojQ2FuY2VsUG9ydGFibGVTZXNzaW9uSW1wb3J0UmVzcG9uc2USEQoJY2FuY2VsbGVkGAEgASgIIv0CCiJDb21taXRQb3J0YWJsZVNlc3Npb25JbXBvcnRSZXF1ZXN0EhQKDG9wZXJhdGlvbl9pZBgBIAEoCRIQCghkcmFmdF9pZBgCIAEoCRIRCgl0YXJnZXRfaWQYAyABKAkSEgoFdGl0bGUYBCABKAlIAIgBARIrCgVtb2RlbBgFIAEoCzIXLmpva28udjEuTW9kZWxTZWxlY3Rpb25IAYgBARIwCg9wZXJtaXNzaW9uX21vZGUYBiABKA4yFy5qb2tvLnYxLlBlcm1pc3Npb25Nb2RlEhEKCXBsYW5fbW9kZRgHIAEoCBIRCglvdmVyd3JpdGUYCCABKAgSFAoMdXNlX3dvcmt0cmVlGAkgASgIEiAKE3dvcmt0cmVlX3NvdXJjZV9yZWYYCiABKAlIAogBARIfChdyZWZyZXNoX3dvcmt0cmVlX3JlbW90ZRgLIAEoCEIICgZfdGl0bGVCCAoGX21vZGVsQhYKFF93b3JrdHJlZV9zb3VyY2VfcmVmIsMCChtQb3J0YWJsZVNlc3Npb25JbXBvcnRSZXN1bHQSEgoKc2Vzc2lvbl9pZBgBIAEoCRIyCghmaWRlbGl0eRgCIAEoDjIgLmpva28udjEuUG9ydGFibGVTZXNzaW9uRmlkZWxpdHkSFQoNbWVzc2FnZV9jb3VudBgDIAEoBBITCgttZWRpYV9jb3VudBgEIAEoBBIUCgx3b3JrZXJfY291bnQYBSABKAQSHAoUcmVwbGFjZWRfc2Vzc2lvbl9pZHMYBiADKAkSNAoGc3RhdHVzGAcgASgOMiQuam9rby52MS5Qb3J0YWJsZVNlc3Npb25JbXBvcnRTdGF0dXMSMQoQYWN0aXZhdGlvbl9lcnJvchgIIAEoCzISLmpva28udjEuRXJyb3JJbmZvSACIAQFCEwoRX2FjdGl2YXRpb25fZXJyb3IibQojQ29tbWl0UG9ydGFibGVTZXNzaW9uSW1wb3J0UmVzcG9uc2USNAoGcmVzdWx0GAEgASgLMiQuam9rby52MS5Qb3J0YWJsZVNlc3Npb25JbXBvcnRSZXN1bHQSEAoIcmVwbGF5ZWQYAiABKAgiOwolUmV0cnlQb3J0YWJsZVNlc3Npb25BY3RpdmF0aW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIroBCiZSZXRyeVBvcnRhYmxlU2Vzc2lvbkFjdGl2YXRpb25SZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEjQKBnN0YXR1cxgCIAEoDjIkLmpva28udjEuUG9ydGFibGVTZXNzaW9uSW1wb3J0U3RhdHVzEjEKEGFjdGl2YXRpb25fZXJyb3IYAyABKAsyEi5qb2tvLnYxLkVycm9ySW5mb0gAiAEBQhMKEV9hY3RpdmF0aW9uX2Vycm9yIv0BChpQb3J0YWJsZVJlcGxhY2VtZW50Q2xlYW51cBIbChNpbXBvcnRlZF9zZXNzaW9uX2lkGAEgASgJEj0KDG5hdGl2ZV9zdGF0ZRgCIAEoDjInLmpva28udjEuUG9ydGFibGVSZXBsYWNlbWVudE5hdGl2ZVN0YXRlEkEKDndvcmt0cmVlX3N0YXRlGAMgASgOMikuam9rby52MS5Qb3J0YWJsZVJlcGxhY2VtZW50V29ya3RyZWVTdGF0ZRIQCghyZXZpc2lvbhgEIAEoBBIuCgp1cGRhdGVkX2F0GAUgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcCJDCiRHZXRQb3J0YWJsZVJlcGxhY2VtZW50Q2xlYW51cFJlcXVlc3QSGwoTaW1wb3J0ZWRfc2Vzc2lvbl9pZBgBIAEoCSJuCiVHZXRQb3J0YWJsZVJlcGxhY2VtZW50Q2xlYW51cFJlc3BvbnNlEjkKB2NsZWFudXAYASABKAsyIy5qb2tvLnYxLlBvcnRhYmxlUmVwbGFjZW1lbnRDbGVhbnVwSACIAQFCCgoIX2NsZWFudXAiSQoqUmVjb25jaWxlUG9ydGFibGVSZXBsYWNlbWVudENsZWFudXBSZXF1ZXN0EhsKE2ltcG9ydGVkX3Nlc3Npb25faWQYASABKAkinwEKK1JlY29uY2lsZVBvcnRhYmxlUmVwbGFjZW1lbnRDbGVhbnVwUmVzcG9uc2USNAoHY2xlYW51cBgBIAEoCzIjLmpva28udjEuUG9ydGFibGVSZXBsYWNlbWVudENsZWFudXASOgoKaW5zcGVjdGlvbhgCIAEoDjImLmpva28udjEuUG9ydGFibGVSZXBsYWNlbWVudEluc3BlY3Rpb24ifwomUmV0cnlQb3J0YWJsZVJlcGxhY2VtZW50Q2xlYW51cFJlcXVlc3QSGwoTaW1wb3J0ZWRfc2Vzc2lvbl9pZBgBIAEoCRIZChFleHBlY3RlZF9yZXZpc2lvbhgCIAEoBBIdChVjb25maXJtX25hdGl2ZV9kZWxldGUYAyABKAgimwEKJ1JldHJ5UG9ydGFibGVSZXBsYWNlbWVudENsZWFudXBSZXNwb25zZRI0CgdjbGVhbnVwGAEgASgLMiMuam9rby52MS5Qb3J0YWJsZVJlcGxhY2VtZW50Q2xlYW51cBI6CgppbnNwZWN0aW9uGAIgASgOMiYuam9rby52MS5Qb3J0YWJsZVJlcGxhY2VtZW50SW5zcGVjdGlvbiLYAwoVUG9ydGFibGVUYXNrQ29weUdyYW50EhMKC3RyYW5zZmVyX2lkGAEgASgJEhMKC3JlYWRfc2VjcmV0GAIgASgMEhQKDG9wZXJhdGlvbl9pZBgDIAEoCRIYChBzb3VyY2Vfc2VydmVyX2lkGAQgASgJEh0KFWRlc3RpbmF0aW9uX3NlcnZlcl9pZBgFIAEoCRIZChFzb3VyY2Vfc2Vzc2lvbl9pZBgGIAEoCRIhChlzb3VyY2Vfc2Vzc2lvbl9nZW5lcmF0aW9uGAcgASgEEi4KCmV4cGlyZXNfYXQYCCABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEjYKD3Nlc3Npb25fcGFja2FnZRgJIAEoCzIdLmpva28udjEuUG9ydGFibGVUYXNrQ29weVBhcnQSOAoRd29ya3NwYWNlX2FyY2hpdmUYCiABKAsyHS5qb2tvLnYxLlBvcnRhYmxlVGFza0NvcHlQYXJ0EhQKDHNvdXJjZV90aXRsZRgLIAEoCRIZChFzb3VyY2VfYmFja2VuZF9pZBgMIAEoCRI1ChVzb3VyY2Vfd29ya3NwYWNlX2tpbmQYDSABKA4yFi5qb2tvLnYxLldvcmtzcGFjZUtpbmQiNAoUUG9ydGFibGVUYXNrQ29weVBhcnQSDgoGc2hhMjU2GAEgASgJEgwKBHNpemUYAiABKAQijgEKHlByZXBhcmVQb3J0YWJsZVRhc2tDb3B5UmVxdWVzdBIUCgxvcGVyYXRpb25faWQYASABKAkSEgoKc2Vzc2lvbl9pZBgCIAEoCRIjChtleHBlY3RlZF9zZXNzaW9uX2dlbmVyYXRpb24YAyABKAQSHQoVZGVzdGluYXRpb25fc2VydmVyX2lkGAQgASgJIlAKH1ByZXBhcmVQb3J0YWJsZVRhc2tDb3B5UmVzcG9uc2USLQoFZ3JhbnQYASABKAsyHi5qb2tvLnYxLlBvcnRhYmxlVGFza0NvcHlHcmFudCKYAQobUmVhZFBvcnRhYmxlVGFza0NvcHlSZXF1ZXN0EhMKC3RyYW5zZmVyX2lkGAEgASgJEhQKDG9wZXJhdGlvbl9pZBgCIAEoCRIdChVkZXN0aW5hdGlvbl9zZXJ2ZXJfaWQYAyABKAkSLwoEcGFydBgEIAEoDjIhLmpva28udjEuUG9ydGFibGVUYXNrQ29weVBhcnRLaW5kIj8KHFJlYWRQb3J0YWJsZVRhc2tDb3B5UmVzcG9uc2USDgoGb2Zmc2V0GAEgASgEEg8KB2NvbnRlbnQYAiABKAwiSgodQ2FuY2VsUG9ydGFibGVUYXNrQ29weVJlcXVlc3QSEwoLdHJhbnNmZXJfaWQYASABKAkSFAoMb3BlcmF0aW9uX2lkGAIgASgJIjMKHkNhbmNlbFBvcnRhYmxlVGFza0NvcHlSZXNwb25zZRIRCgljYW5jZWxsZWQYASABKAgiugIKHUltcG9ydFBvcnRhYmxlVGFza0NvcHlSZXF1ZXN0Ei0KBWdyYW50GAEgASgLMh4uam9rby52MS5Qb3J0YWJsZVRhc2tDb3B5R3JhbnQSFQoNc291cmNlX29yaWdpbhgCIAEoCRIeChFzb3VyY2VfaW52aXRhdGlvbhgDIAEoCUgAiAEBEhIKCmJhY2tlbmRfaWQYBCABKAkSHQoQcGFyZW50X3RhcmdldF9pZBgFIAEoCUgBiAEBEjgKGGV4cGVjdGVkX3BhcmVudF9yZXZpc2lvbhgGIAEoCzIRLmpva28udjEuUmV2aXNpb25IAogBAUIUChJfc291cmNlX2ludml0YXRpb25CEwoRX3BhcmVudF90YXJnZXRfaWRCGwoZX2V4cGVjdGVkX3BhcmVudF9yZXZpc2lvbiJEChtQb3J0YWJsZVRhc2tDb3B5U2tpcHBlZEZpbGUSFQoNcmVsYXRpdmVfcGF0aBgBIAEoCRIOCgZyZWFzb24YAiABKAkizwEKF1BvcnRhYmxlVGFza0NvcHlSZWNlaXB0EhQKDG9wZXJhdGlvbl9pZBgBIAEoCRIRCgl0YXJnZXRfaWQYAiABKAkSMgoEdGFzaxgDIAEoCzIkLmpva28udjEuUG9ydGFibGVTZXNzaW9uSW1wb3J0UmVzdWx0EhoKEnNraXBwZWRfZmlsZV9jb3VudBgEIAEoBBI7Cg1za2lwcGVkX2ZpbGVzGAUgAygLMiQuam9rby52MS5Qb3J0YWJsZVRhc2tDb3B5U2tpcHBlZEZpbGUiUwoeSW1wb3J0UG9ydGFibGVUYXNrQ29weVJlc3BvbnNlEjEKB3JlY2VpcHQYASABKAsyIC5qb2tvLnYxLlBvcnRhYmxlVGFza0NvcHlSZWNlaXB0IjkKIUdldFBvcnRhYmxlVGFza0NvcHlSZWNlaXB0UmVxdWVzdBIUCgxvcGVyYXRpb25faWQYASABKAkiaAoiR2V0UG9ydGFibGVUYXNrQ29weVJlY2VpcHRSZXNwb25zZRI2CgdyZWNlaXB0GAEgASgLMiAuam9rby52MS5Qb3J0YWJsZVRhc2tDb3B5UmVjZWlwdEgAiAEBQgoKCF9yZWNlaXB0KrsBChdQb3J0YWJsZVNlc3Npb25GaWRlbGl0eRIpCiVQT1JUQUJMRV9TRVNTSU9OX0ZJREVMSVRZX1VOU1BFQ0lGSUVEEAASIgoeUE9SVEFCTEVfU0VTU0lPTl9GSURFTElUWV9GVUxMEAESJQohUE9SVEFCTEVfU0VTU0lPTl9GSURFTElUWV9QQVJUSUFMEAISKgomUE9SVEFCTEVfU0VTU0lPTl9GSURFTElUWV9QUk9EVUNUX09OTFkQAyq2AQobUG9ydGFibGVTZXNzaW9uSW1wb3J0U3RhdHVzEi4KKlBPUlRBQkxFX1NFU1NJT05fSU1QT1JUX1NUQVRVU19VTlNQRUNJRklFRBAAEigKJFBPUlRBQkxFX1NFU1NJT05fSU1QT1JUX1NUQVRVU19SRUFEWRABEj0KOVBPUlRBQkxFX1NFU1NJT05fSU1QT1JUX1NUQVRVU19JTVBPUlRFRF9BQ1RJVkFUSU9OX0ZBSUxFRBACKpQCCh5Qb3J0YWJsZVJlcGxhY2VtZW50TmF0aXZlU3RhdGUSMQotUE9SVEFCTEVfUkVQTEFDRU1FTlRfTkFUSVZFX1NUQVRFX1VOU1BFQ0lGSUVEEAASLQopUE9SVEFCTEVfUkVQTEFDRU1FTlRfTkFUSVZFX1NUQVRFX1BFTkRJTkcQARIwCixQT1JUQUJMRV9SRVBMQUNFTUVOVF9OQVRJVkVfU1RBVEVfRElTUEFUQ0hFRBACEi0KKVBPUlRBQkxFX1JFUExBQ0VNRU5UX05BVElWRV9TVEFURV9VTktOT1dOEAMSLworUE9SVEFCTEVfUkVQTEFDRU1FTlRfTkFUSVZFX1NUQVRFX0NPTVBMRVRFRBAEKrsBCiBQb3J0YWJsZVJlcGxhY2VtZW50V29ya3RyZWVTdGF0ZRIzCi9QT1JUQUJMRV9SRVBMQUNFTUVOVF9XT1JLVFJFRV9TVEFURV9VTlNQRUNJRklFRBAAEi8KK1BPUlRBQkxFX1JFUExBQ0VNRU5UX1dPUktUUkVFX1NUQVRFX1BFTkRJTkcQARIxCi1QT1JUQUJMRV9SRVBMQUNFTUVOVF9XT1JLVFJFRV9TVEFURV9DT01QTEVURUQQAirWAQodUG9ydGFibGVSZXBsYWNlbWVudEluc3BlY3Rpb24SLworUE9SVEFCTEVfUkVQTEFDRU1FTlRfSU5TUEVDVElPTl9VTlNQRUNJRklFRBAAEisKJ1BPUlRBQkxFX1JFUExBQ0VNRU5UX0lOU1BFQ1RJT05fUFJFU0VOVBABEioKJlBPUlRBQkxFX1JFUExBQ0VNRU5UX0lOU1BFQ1RJT05fQUJTRU5UEAISKwonUE9SVEFCTEVfUkVQTEFDRU1FTlRfSU5TUEVDVElPTl9VTktOT1dOEAMqngEKGFBvcnRhYmxlVGFza0NvcHlQYXJ0S2luZBIsCihQT1JUQUJMRV9UQVNLX0NPUFlfUEFSVF9LSU5EX1VOU1BFQ0lGSUVEEAASKAokUE9SVEFCTEVfVEFTS19DT1BZX1BBUlRfS0lORF9TRVNTSU9OEAESKgomUE9SVEFCTEVfVEFTS19DT1BZX1BBUlRfS0lORF9XT1JLU1BBQ0UQAmIGcHJvdG8z", [file_google_protobuf_timestamp, file_joko_v1_capability, file_joko_v1_common, file_joko_v1_model, file_joko_v1_workspace]);
 
 /**
  * @generated from message joko.v1.PortableSessionImportPreview
@@ -660,6 +660,406 @@ export const RetryPortableReplacementCleanupResponseSchema: GenMessage<RetryPort
   messageDesc(file_joko_v1_portable_session, 21);
 
 /**
+ * A transient, purpose-bound grant for direct transfer between two paired nodes.
+ * The read secret never enters an Operation or an Event.
+ *
+ * @generated from message joko.v1.PortableTaskCopyGrant
+ */
+export type PortableTaskCopyGrant = Message<"joko.v1.PortableTaskCopyGrant"> & {
+  /**
+   * @generated from field: string transfer_id = 1;
+   */
+  transferId: string;
+
+  /**
+   * @generated from field: bytes read_secret = 2;
+   */
+  readSecret: Uint8Array;
+
+  /**
+   * @generated from field: string operation_id = 3;
+   */
+  operationId: string;
+
+  /**
+   * @generated from field: string source_server_id = 4;
+   */
+  sourceServerId: string;
+
+  /**
+   * @generated from field: string destination_server_id = 5;
+   */
+  destinationServerId: string;
+
+  /**
+   * @generated from field: string source_session_id = 6;
+   */
+  sourceSessionId: string;
+
+  /**
+   * @generated from field: uint64 source_session_generation = 7;
+   */
+  sourceSessionGeneration: bigint;
+
+  /**
+   * @generated from field: google.protobuf.Timestamp expires_at = 8;
+   */
+  expiresAt?: Timestamp | undefined;
+
+  /**
+   * @generated from field: joko.v1.PortableTaskCopyPart session_package = 9;
+   */
+  sessionPackage?: PortableTaskCopyPart | undefined;
+
+  /**
+   * @generated from field: joko.v1.PortableTaskCopyPart workspace_archive = 10;
+   */
+  workspaceArchive?: PortableTaskCopyPart | undefined;
+
+  /**
+   * @generated from field: string source_title = 11;
+   */
+  sourceTitle: string;
+
+  /**
+   * @generated from field: string source_backend_id = 12;
+   */
+  sourceBackendId: string;
+
+  /**
+   * @generated from field: joko.v1.WorkspaceKind source_workspace_kind = 13;
+   */
+  sourceWorkspaceKind: WorkspaceKind;
+};
+
+/**
+ * Describes the message joko.v1.PortableTaskCopyGrant.
+ * Use `create(PortableTaskCopyGrantSchema)` to create a new message.
+ */
+export const PortableTaskCopyGrantSchema: GenMessage<PortableTaskCopyGrant> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 22);
+
+/**
+ * @generated from message joko.v1.PortableTaskCopyPart
+ */
+export type PortableTaskCopyPart = Message<"joko.v1.PortableTaskCopyPart"> & {
+  /**
+   * @generated from field: string sha256 = 1;
+   */
+  sha256: string;
+
+  /**
+   * @generated from field: uint64 size = 2;
+   */
+  size: bigint;
+};
+
+/**
+ * Describes the message joko.v1.PortableTaskCopyPart.
+ * Use `create(PortableTaskCopyPartSchema)` to create a new message.
+ */
+export const PortableTaskCopyPartSchema: GenMessage<PortableTaskCopyPart> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 23);
+
+/**
+ * @generated from message joko.v1.PreparePortableTaskCopyRequest
+ */
+export type PreparePortableTaskCopyRequest = Message<"joko.v1.PreparePortableTaskCopyRequest"> & {
+  /**
+   * @generated from field: string operation_id = 1;
+   */
+  operationId: string;
+
+  /**
+   * @generated from field: string session_id = 2;
+   */
+  sessionId: string;
+
+  /**
+   * @generated from field: uint64 expected_session_generation = 3;
+   */
+  expectedSessionGeneration: bigint;
+
+  /**
+   * @generated from field: string destination_server_id = 4;
+   */
+  destinationServerId: string;
+};
+
+/**
+ * Describes the message joko.v1.PreparePortableTaskCopyRequest.
+ * Use `create(PreparePortableTaskCopyRequestSchema)` to create a new message.
+ */
+export const PreparePortableTaskCopyRequestSchema: GenMessage<PreparePortableTaskCopyRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 24);
+
+/**
+ * @generated from message joko.v1.PreparePortableTaskCopyResponse
+ */
+export type PreparePortableTaskCopyResponse = Message<"joko.v1.PreparePortableTaskCopyResponse"> & {
+  /**
+   * @generated from field: joko.v1.PortableTaskCopyGrant grant = 1;
+   */
+  grant?: PortableTaskCopyGrant | undefined;
+};
+
+/**
+ * Describes the message joko.v1.PreparePortableTaskCopyResponse.
+ * Use `create(PreparePortableTaskCopyResponseSchema)` to create a new message.
+ */
+export const PreparePortableTaskCopyResponseSchema: GenMessage<PreparePortableTaskCopyResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 25);
+
+/**
+ * @generated from message joko.v1.ReadPortableTaskCopyRequest
+ */
+export type ReadPortableTaskCopyRequest = Message<"joko.v1.ReadPortableTaskCopyRequest"> & {
+  /**
+   * @generated from field: string transfer_id = 1;
+   */
+  transferId: string;
+
+  /**
+   * @generated from field: string operation_id = 2;
+   */
+  operationId: string;
+
+  /**
+   * @generated from field: string destination_server_id = 3;
+   */
+  destinationServerId: string;
+
+  /**
+   * @generated from field: joko.v1.PortableTaskCopyPartKind part = 4;
+   */
+  part: PortableTaskCopyPartKind;
+};
+
+/**
+ * Describes the message joko.v1.ReadPortableTaskCopyRequest.
+ * Use `create(ReadPortableTaskCopyRequestSchema)` to create a new message.
+ */
+export const ReadPortableTaskCopyRequestSchema: GenMessage<ReadPortableTaskCopyRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 26);
+
+/**
+ * @generated from message joko.v1.ReadPortableTaskCopyResponse
+ */
+export type ReadPortableTaskCopyResponse = Message<"joko.v1.ReadPortableTaskCopyResponse"> & {
+  /**
+   * @generated from field: uint64 offset = 1;
+   */
+  offset: bigint;
+
+  /**
+   * @generated from field: bytes content = 2;
+   */
+  content: Uint8Array;
+};
+
+/**
+ * Describes the message joko.v1.ReadPortableTaskCopyResponse.
+ * Use `create(ReadPortableTaskCopyResponseSchema)` to create a new message.
+ */
+export const ReadPortableTaskCopyResponseSchema: GenMessage<ReadPortableTaskCopyResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 27);
+
+/**
+ * @generated from message joko.v1.CancelPortableTaskCopyRequest
+ */
+export type CancelPortableTaskCopyRequest = Message<"joko.v1.CancelPortableTaskCopyRequest"> & {
+  /**
+   * @generated from field: string transfer_id = 1;
+   */
+  transferId: string;
+
+  /**
+   * @generated from field: string operation_id = 2;
+   */
+  operationId: string;
+};
+
+/**
+ * Describes the message joko.v1.CancelPortableTaskCopyRequest.
+ * Use `create(CancelPortableTaskCopyRequestSchema)` to create a new message.
+ */
+export const CancelPortableTaskCopyRequestSchema: GenMessage<CancelPortableTaskCopyRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 28);
+
+/**
+ * @generated from message joko.v1.CancelPortableTaskCopyResponse
+ */
+export type CancelPortableTaskCopyResponse = Message<"joko.v1.CancelPortableTaskCopyResponse"> & {
+  /**
+   * @generated from field: bool cancelled = 1;
+   */
+  cancelled: boolean;
+};
+
+/**
+ * Describes the message joko.v1.CancelPortableTaskCopyResponse.
+ * Use `create(CancelPortableTaskCopyResponseSchema)` to create a new message.
+ */
+export const CancelPortableTaskCopyResponseSchema: GenMessage<CancelPortableTaskCopyResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 29);
+
+/**
+ * @generated from message joko.v1.ImportPortableTaskCopyRequest
+ */
+export type ImportPortableTaskCopyRequest = Message<"joko.v1.ImportPortableTaskCopyRequest"> & {
+  /**
+   * @generated from field: joko.v1.PortableTaskCopyGrant grant = 1;
+   */
+  grant?: PortableTaskCopyGrant | undefined;
+
+  /**
+   * @generated from field: string source_origin = 2;
+   */
+  sourceOrigin: string;
+
+  /**
+   * A v1 trusted-node invitation for the paired source route, when available.
+   *
+   * @generated from field: optional string source_invitation = 3;
+   */
+  sourceInvitation?: string | undefined;
+
+  /**
+   * @generated from field: string backend_id = 4;
+   */
+  backendId: string;
+
+  /**
+   * An explicit approved local project may hold the new isolated copy directory.
+   *
+   * @generated from field: optional string parent_target_id = 5;
+   */
+  parentTargetId?: string | undefined;
+
+  /**
+   * @generated from field: optional joko.v1.Revision expected_parent_revision = 6;
+   */
+  expectedParentRevision?: Revision | undefined;
+};
+
+/**
+ * Describes the message joko.v1.ImportPortableTaskCopyRequest.
+ * Use `create(ImportPortableTaskCopyRequestSchema)` to create a new message.
+ */
+export const ImportPortableTaskCopyRequestSchema: GenMessage<ImportPortableTaskCopyRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 30);
+
+/**
+ * @generated from message joko.v1.PortableTaskCopySkippedFile
+ */
+export type PortableTaskCopySkippedFile = Message<"joko.v1.PortableTaskCopySkippedFile"> & {
+  /**
+   * @generated from field: string relative_path = 1;
+   */
+  relativePath: string;
+
+  /**
+   * @generated from field: string reason = 2;
+   */
+  reason: string;
+};
+
+/**
+ * Describes the message joko.v1.PortableTaskCopySkippedFile.
+ * Use `create(PortableTaskCopySkippedFileSchema)` to create a new message.
+ */
+export const PortableTaskCopySkippedFileSchema: GenMessage<PortableTaskCopySkippedFile> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 31);
+
+/**
+ * @generated from message joko.v1.PortableTaskCopyReceipt
+ */
+export type PortableTaskCopyReceipt = Message<"joko.v1.PortableTaskCopyReceipt"> & {
+  /**
+   * @generated from field: string operation_id = 1;
+   */
+  operationId: string;
+
+  /**
+   * @generated from field: string target_id = 2;
+   */
+  targetId: string;
+
+  /**
+   * @generated from field: joko.v1.PortableSessionImportResult task = 3;
+   */
+  task?: PortableSessionImportResult | undefined;
+
+  /**
+   * @generated from field: uint64 skipped_file_count = 4;
+   */
+  skippedFileCount: bigint;
+
+  /**
+   * @generated from field: repeated joko.v1.PortableTaskCopySkippedFile skipped_files = 5;
+   */
+  skippedFiles: PortableTaskCopySkippedFile[];
+};
+
+/**
+ * Describes the message joko.v1.PortableTaskCopyReceipt.
+ * Use `create(PortableTaskCopyReceiptSchema)` to create a new message.
+ */
+export const PortableTaskCopyReceiptSchema: GenMessage<PortableTaskCopyReceipt> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 32);
+
+/**
+ * @generated from message joko.v1.ImportPortableTaskCopyResponse
+ */
+export type ImportPortableTaskCopyResponse = Message<"joko.v1.ImportPortableTaskCopyResponse"> & {
+  /**
+   * @generated from field: joko.v1.PortableTaskCopyReceipt receipt = 1;
+   */
+  receipt?: PortableTaskCopyReceipt | undefined;
+};
+
+/**
+ * Describes the message joko.v1.ImportPortableTaskCopyResponse.
+ * Use `create(ImportPortableTaskCopyResponseSchema)` to create a new message.
+ */
+export const ImportPortableTaskCopyResponseSchema: GenMessage<ImportPortableTaskCopyResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 33);
+
+/**
+ * @generated from message joko.v1.GetPortableTaskCopyReceiptRequest
+ */
+export type GetPortableTaskCopyReceiptRequest = Message<"joko.v1.GetPortableTaskCopyReceiptRequest"> & {
+  /**
+   * @generated from field: string operation_id = 1;
+   */
+  operationId: string;
+};
+
+/**
+ * Describes the message joko.v1.GetPortableTaskCopyReceiptRequest.
+ * Use `create(GetPortableTaskCopyReceiptRequestSchema)` to create a new message.
+ */
+export const GetPortableTaskCopyReceiptRequestSchema: GenMessage<GetPortableTaskCopyReceiptRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 34);
+
+/**
+ * @generated from message joko.v1.GetPortableTaskCopyReceiptResponse
+ */
+export type GetPortableTaskCopyReceiptResponse = Message<"joko.v1.GetPortableTaskCopyReceiptResponse"> & {
+  /**
+   * @generated from field: optional joko.v1.PortableTaskCopyReceipt receipt = 1;
+   */
+  receipt?: PortableTaskCopyReceipt | undefined;
+};
+
+/**
+ * Describes the message joko.v1.GetPortableTaskCopyReceiptResponse.
+ * Use `create(GetPortableTaskCopyReceiptResponseSchema)` to create a new message.
+ */
+export const GetPortableTaskCopyReceiptResponseSchema: GenMessage<GetPortableTaskCopyReceiptResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_portable_session, 35);
+
+/**
  * @generated from enum joko.v1.PortableSessionFidelity
  */
 export enum PortableSessionFidelity {
@@ -808,4 +1208,30 @@ export enum PortableReplacementInspection {
  */
 export const PortableReplacementInspectionSchema: GenEnum<PortableReplacementInspection> = /*@__PURE__*/
   enumDesc(file_joko_v1_portable_session, 4);
+
+/**
+ * @generated from enum joko.v1.PortableTaskCopyPartKind
+ */
+export enum PortableTaskCopyPartKind {
+  /**
+   * @generated from enum value: PORTABLE_TASK_COPY_PART_KIND_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: PORTABLE_TASK_COPY_PART_KIND_SESSION = 1;
+   */
+  SESSION = 1,
+
+  /**
+   * @generated from enum value: PORTABLE_TASK_COPY_PART_KIND_WORKSPACE = 2;
+   */
+  WORKSPACE = 2,
+}
+
+/**
+ * Describes the enum joko.v1.PortableTaskCopyPartKind.
+ */
+export const PortableTaskCopyPartKindSchema: GenEnum<PortableTaskCopyPartKind> = /*@__PURE__*/
+  enumDesc(file_joko_v1_portable_session, 5);
 
