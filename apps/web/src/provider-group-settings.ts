@@ -15,6 +15,8 @@ export interface TaskModelGroupsApi {
   list(signal?: AbortSignal): Promise<contract.ListTaskModelGroupsResponse>;
   save(expectedRevision: bigint, groups: readonly contract.TaskModelGroup[], signal?: AbortSignal): Promise<contract.TaskModelGroupConfig>;
   preview(selection: Omit<contract.TaskModelGroupSelection, "$typeName">, signal?: AbortSignal): Promise<contract.PreviewTaskModelGroupResponse>;
+  switchOffer(request: Omit<contract.GetTaskModelGroupSwitchRequest, "$typeName">, signal?: AbortSignal): Promise<contract.TaskModelGroupSwitch | undefined>;
+  applySwitch?(offer: contract.TaskModelGroupSwitch, signal?: AbortSignal): Promise<void>;
 }
 /** The parent gateway owns the authenticated current-node client. Mutations
  * are never replayed after a transport failure or a configuration conflict. */
@@ -27,7 +29,8 @@ export function createProviderGroupSettingsApi(client: Client<typeof contract.Pr
         if (!result.config) throw new Error("The saved model groups are unavailable.");
         return result.config;
       },
-      preview: (selection, signal) => client.previewTaskModelGroup({ selection }, { signal })
+      preview: (selection, signal) => client.previewTaskModelGroup({ selection }, { signal }),
+      switchOffer: async (request, signal) => (await client.getTaskModelGroupSwitch(request, { signal })).offer
     },
     getProviderGroup: async (key, signal) => {
       const result = await client.getProviderGroup({ key }, { signal }); return assertSnapshot(result.group, key);

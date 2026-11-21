@@ -1299,7 +1299,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return { taskModels: {
         list: (signal) => invoke(signal, active => api.taskModels!.list(active)),
         save: (revision, groups, signal) => invoke(signal, active => api.taskModels!.save(revision, groups, active)),
-        preview: (selection, signal) => invoke(signal, active => api.taskModels!.preview(selection, active))
+        preview: (selection, signal) => invoke(signal, active => api.taskModels!.preview(selection, active)),
+        switchOffer: (request, signal) => invoke(signal, active => api.taskModels!.switchOffer(request, active)),
+        applySwitch: (offer, signal) => invoke(signal, async active => {
+          await this.submit({ case: "setSessionRuntime", value: {
+            sessionId: offer.sessionId, expectedRuntimeGeneration: offer.expectedRuntimeGeneration, taskModelGroupSwitch: offer
+          } }, true, [{ entity: { kind: EntityKind.SESSION, id: offer.sessionId }, expectedGeneration: offer.sessionGeneration }], active);
+        })
       }, getProviderGroup: (key, signal) => invoke(signal, active => api.getProviderGroup(key, active)),
       listProviderGroupCandidates: (key, signal) => invoke(signal, active => api.listProviderGroupCandidates(key, active)),
       updateProviderGroup: (key, revision, config, signal) => invoke(signal, active => api.updateProviderGroup(key, revision, config, active)),

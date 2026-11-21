@@ -1269,7 +1269,8 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
     const connection = application.connections.authenticate(context.requestHeader.get("authorization") ?? undefined);
     return { id: connection.id, trust: "owner", management: true,
       assertCurrent: () => { context.signal.throwIfAborted(); application.connections.fence(connection); } };
-  }), taskAccountUsage: async (sessionId, generation, signal) => {
+  }), taskModelGroupSwitch: (request, signal) => application.sessionHost.getTaskModelGroupSwitch(request, signal),
+    taskAccountUsage: async (sessionId, generation, signal) => {
     const assertCurrent = () => {
       signal.throwIfAborted();
       const session = application.store.getSession(sessionId).descriptor;
@@ -18462,6 +18463,16 @@ async function dispatchMutation(
       const value = payload.value, expectedGeneration = Number(value.expectedRuntimeGeneration);
       if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) throw invalidArgument("The runtime generation is invalid.");
       return effectOperation(dependencies, operationId, connection, mutation, payload.case, { accepted: true }, async () => {
+        const modelGroupSwitch = value.taskModelGroupSwitch;
+        if (modelGroupSwitch !== undefined) {
+          if (value.sessionId !== modelGroupSwitch.sessionId || value.expectedRuntimeGeneration !== modelGroupSwitch.expectedRuntimeGeneration
+            || value.backendId !== undefined || value.providerId !== undefined || value.modelId !== undefined
+            || value.effort !== undefined || value.fastMode !== undefined || value.ultrafastMode !== undefined) {
+            throw invalidArgument("The model group recovery must use the exact offered task and route.");
+          }
+          await host.applyTaskModelGroupSwitch(modelGroupSwitch, () => dependencies.connections.fence(connection));
+          return;
+        }
         await host.setSessionRuntimeControl({ sessionId: value.sessionId, expectedGeneration,
           patch: { ...(value.backendId === undefined ? {} : { backendId: value.backendId }),
             ...(value.providerId === undefined ? {} : { providerId: value.providerId }),

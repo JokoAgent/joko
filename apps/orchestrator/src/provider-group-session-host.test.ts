@@ -124,6 +124,32 @@ it("retains the earliest eligible quota-limited route and its original input thr
   } finally { clock.mockRestore(); }
 });
 
+it("offers a same-computer group source for the exact settled quota error and rebinds through the ordinary runtime control", async () => {
+  const f = await fixture(true);
+  const group = taskModelGroup(f, contract.TaskModelGroupStrategy.ORDERED);
+  const sessionId = (await group.create("start-group-quota-switch")).value.sessionId;
+  vi.spyOn(f.first, "send").mockImplementationOnce(async (_input, context) => {
+    await context.emit({ type: "error", terminal: true, error: { code: "USAGE_LIMIT", message: "Account quota exhausted",
+      phase: "turn", retryable: true, stateMayHaveChanged: false, recovery: "Wait for quota." } });
+    await context.emit({ type: "done", outcome: "failed" });
+  });
+  const queue = f.send(sessionId, "failing-model-group-input");
+  await until(() => f.store.getRun(queue.runId).descriptor.state === "failed" && f.store.getQueueItem(queue.queueItemId).state === "failed");
+  const sessionGeneration = BigInt(f.store.getSession(sessionId).descriptor.binding.generation);
+  const request = message(contract.GetTaskModelGroupSwitchRequestSchema, { sessionId, sessionGeneration, failedRunId: queue.runId });
+  const offer = await f.host.getTaskModelGroupSwitch(request, new AbortController().signal);
+  const exact = message(contract.TaskModelGroupSwitchSchema, offer!);
+  expect(exact).toMatchObject({ sessionId, failedRunId: queue.runId, selected: { source: group.image } });
+  await expect(f.host.applyTaskModelGroupSwitch({ ...exact, expectedRuntimeGeneration: exact.expectedRuntimeGeneration + 1n }, () => undefined)).rejects.toThrow("offer expired");
+  await f.host.applyTaskModelGroupSwitch(exact, () => undefined);
+  expect(f.host.getSessionRuntimeControl(sessionId).pending?.profile).toMatchObject({ backendId: f.second.id, providerId: "vision", modelId: "multimodal" });
+  expect(f.groups.taskModels.binding(sessionId)?.source).toEqual({
+    sourceKey: group.image.sourceKey, backendId: group.image.backendId, providerId: group.image.providerId, modelId: group.image.modelId
+  });
+  expect(f.store.listRuns({ sessionId })).toHaveLength(1);
+  expect(await f.host.getTaskModelGroupSwitch(request, new AbortController().signal)).toBeUndefined();
+});
+
 function quotaBoundary(f: Pick<Awaited<ReturnType<typeof fixture>>, "groups" | "registry">, resetAt: number) {
   return vi.spyOn(f.groups.directory, "read").mockImplementation(async member => {
     const limited = Date.now() < resetAt, model = f.registry.get(member.backendId).descriptor.models.find(model => model.providerId === member.providerId)!;

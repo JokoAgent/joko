@@ -113,7 +113,7 @@ import { boundOneShotScheduleProvider, scheduleNativeSubscriptionKey } from "./s
 import type { ProviderGroupRuntime } from "./provider-group-runtime.js";
 import type { ProviderGroupSessionPort, ProviderGroupRecoveryLease, ProviderGroupRecoveryHandoff } from "./provider-group-service.js";
 import type { ProviderGroupAssignment } from "./provider-group-router.js";
-import { PROVIDER_GROUP_SUPERSEDED_ERROR, ProviderGroupUnavailableError, providerGroupFailureSignals } from "./provider-group-failure-policy.js";
+import { PROVIDER_GROUP_SUPERSEDED_ERROR, ProviderGroupUnavailableError, decideProviderGroupFailure, providerGroupFailureSignals } from "./provider-group-failure-policy.js";
 import type { TaskModelGroupAssignment } from "./task-model-groups.js";
 import type { InputHandoffTaskScope } from "./input-handoff/coordinator.js";
 import { operationBodyHash } from "@joko/store";
@@ -2829,6 +2829,121 @@ export class SessionHost {
         void this.drain(input.sessionId);
       }
     });
+  }
+
+  async getTaskModelGroupSwitch(
+    input: import("@joko/contracts").GetTaskModelGroupSwitchRequest,
+    signal: AbortSignal
+  ): Promise<import("@bufbuild/protobuf").MessageInitShape<typeof import("@joko/contracts").TaskModelGroupSwitchSchema> | undefined> {
+    const resolved = await this.#resolveTaskModelGroupSwitch(input, signal);
+    if (!resolved) return undefined;
+    return {
+      sessionId: input.sessionId, sessionGeneration: input.sessionGeneration, failedRunId: input.failedRunId,
+      expectedRuntimeGeneration: BigInt(resolved.runtimeGeneration), configRevision: resolved.revision, groupName: resolved.choice.groupName,
+      selected: { source: { sourceKey: resolved.choice.source.key, backendId: resolved.choice.profile.backendId,
+        providerId: resolved.choice.profile.providerId, modelId: resolved.choice.profile.modelId },
+        modelName: resolved.choice.model.displayName, providerName: resolved.choice.source.providerName,
+        computerName: resolved.choice.source.displayName, available: true, supportsImages: resolved.choice.model.supportsImages }
+    };
+  }
+
+  async applyTaskModelGroupSwitch(
+    offered: import("@joko/contracts").TaskModelGroupSwitch,
+    assertOwner: () => void
+  ): Promise<void> {
+    assertOwner();
+    const resolved = await this.#resolveTaskModelGroupSwitch(offered, new AbortController().signal);
+    const source = offered.selected?.source;
+    if (!resolved || !source || offered.configRevision !== resolved.revision
+      || offered.expectedRuntimeGeneration !== BigInt(resolved.runtimeGeneration)
+      || source.sourceKey !== resolved.choice.source.key || source.backendId !== resolved.choice.profile.backendId
+      || source.providerId !== resolved.choice.profile.providerId || source.modelId !== resolved.choice.profile.modelId) {
+      throw new StoreError("The model group recovery offer expired. Read the task's current failure again.");
+    }
+    const assertAuthority = () => {
+      assertOwner();
+      const current = this.#store.getSession(offered.sessionId);
+      if (BigInt(current.descriptor.binding.generation) !== offered.sessionGeneration || !this.#taskModelGroupSwitchAllowed(current)
+        || this.#store.findLatestRunForSessionGeneration(offered.sessionId, current.descriptor.binding.generation)?.descriptor.id !== offered.failedRunId
+        || this.nextQueueItemForDispatch(offered.sessionId) !== undefined) {
+        throw new StoreError("The model group recovery no longer belongs to this ordinary local task.");
+      }
+      resolved.choice.assertCurrent();
+    };
+    assertAuthority();
+    await this.setSessionRuntimeControl({ sessionId: offered.sessionId, expectedGeneration: resolved.runtimeGeneration,
+      patch: resolved.choice.profile, assertAuthority });
+    const control = this.getSessionRuntimeControl(offered.sessionId);
+    const adopted = control.pending?.profile ?? control.effective;
+    if (adopted?.backendId !== source.backendId || adopted.providerId !== source.providerId || adopted.modelId !== source.modelId) {
+      throw new StoreError("The task did not adopt the selected model group source.");
+    }
+    assertAuthority();
+    resolved.choice.bind(offered.sessionId, true);
+  }
+
+  #taskModelGroupSwitchAllowed(stored: StoredSession): boolean {
+    const id = stored.descriptor.id;
+    return this.isOrdinaryLocalSession(stored) && this.#store.getTarget(stored.descriptor.targetId).descriptor.trusted
+      && this.#store.findObjective(id) === undefined && this.#store.findCollaborationWorkerBySession(id) === undefined
+      && !new TaskShareStore(this.#store).list().some(share => share.sessionId === id && share.status === "active");
+  }
+
+  async #resolveTaskModelGroupSwitch(
+    input: { readonly sessionId: string; readonly sessionGeneration: bigint; readonly failedRunId: string },
+    signal: AbortSignal
+  ): Promise<{ readonly choice: TaskModelGroupAssignment; readonly revision: bigint; readonly runtimeGeneration: number } | undefined> {
+    this.#assertOpen();
+    const runtime = this.#providerGroups;
+    const binding = runtime?.taskModels.binding(input.sessionId);
+    const stored = this.#store.findSession(input.sessionId);
+    const run = this.#store.findRun(input.failedRunId)?.descriptor;
+    if (!runtime || !binding || !stored || run?.sessionId !== input.sessionId || run.state !== "failed" || run.source !== "user" || !run.error
+      || run.endedAt === undefined
+      || BigInt(stored.descriptor.binding.generation) !== input.sessionGeneration || !this.#taskModelGroupSwitchAllowed(stored)
+      || this.#store.findLatestRunForSessionGeneration(input.sessionId, stored.descriptor.binding.generation)?.descriptor.id !== run.id) return undefined;
+    const queue = this.#store.findQueueItemByRunId(input.sessionId, run.id, { includeCleared: true });
+    if (!queue || queue.state !== "failed" || queue.disposition !== "prompt" || !this.isOwnerRunInput(queue)
+      || queue.attemptId === undefined || this.#store.getAttempt(queue.attemptId).descriptor.endedAt === undefined
+      || hasTurnRouteOverrides(queue.executionOverrides) || this.nextQueueItemForDispatch(input.sessionId) !== undefined
+      || this.#store.findRunByParentId(run.id) !== undefined) return undefined;
+    const signals = providerGroupFailureSignals(run.error), decision = decideProviderGroupFailure(signals, "run");
+    if (decision.action !== "switch" || decision.cause !== "usage-limit" && decision.cause !== "overload") return undefined;
+    const control = this.getSessionRuntimeControl(input.sessionId);
+    const effective = control.effective;
+    if (control.pending || !effective || !runtime.taskModels.ownsRoute(input.sessionId, effective)) return undefined;
+    const original = runtime.directory.sources().find(source => source.key === binding.source.sourceKey
+      && source.backendId === binding.source.backendId && source.providerId === binding.source.providerId && source.kind === "local");
+    if (!original) return undefined;
+    const config = runtime.taskModels.config;
+    if (!config.groups.some(group => group.groupId === binding.groupId)) return undefined;
+    const choice = await runtime.taskModels.resolve({
+      $typeName: "joko.v1.TaskModelGroupSelection", groupId: binding.groupId,
+      expectedRevision: config.revision, hasImages: queue.body.images.length > 0
+    }, { signal, lastPicked: binding.source, requireReady: true, accepts: (source, model) => {
+      if (source.kind !== "local" || source.nodeId !== original.nodeId || source.key === original.key
+        && (model.modelId === binding.source.modelId || decision.cause === "usage-limit" && signals.modelScoped !== true)) return false;
+      if (decision.cause === "usage-limit" && signals.modelScoped !== true && source.providerId === original.providerId) return false;
+      const backend = this.#store.getBackend(source.backendId).descriptor;
+      try {
+        const route = { backendId: source.backendId, providerId: source.providerId, modelId: model.modelId, fastMode: false };
+        if (route.backendId !== effective.backendId) {
+          this.#assertRuntimeHandoffSession(stored);
+          this.#resolveRuntimeHandoffProfile(stored, route, effective);
+        } else {
+          this.assertBackendCreationReady(source.backendId, route);
+          if (backend.capabilities.get("model.switch")?.supported !== true) return false;
+        }
+        return true;
+      } catch (error) {
+        if (error instanceof JokoError || error instanceof SessionRuntimeControlError) return false;
+        throw error;
+      }
+    } });
+    if (!choice || this.#store.findSession(input.sessionId)?.revision !== stored.revision
+      || this.getSessionRuntimeControl(input.sessionId).generation !== control.generation || !this.#taskModelGroupSwitchAllowed(stored)
+      || this.#store.findLatestRunForSessionGeneration(input.sessionId, stored.descriptor.binding.generation)?.descriptor.id !== run.id) return undefined;
+    return { choice, revision: config.revision, runtimeGeneration: control.generation };
   }
 
   /** A complete owner selection becomes the new durable baseline and cancels temporary routing. */

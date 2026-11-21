@@ -19,6 +19,9 @@ export interface ProviderGroupPrincipal {
 export interface ProviderGroupConnectOptions {
   readonly service: ProviderGroupService; readonly usage: ProviderGroupUsage;
   readonly taskModels?: TaskModelGroups;
+  readonly taskModelGroupSwitch?: (
+    request: contract.GetTaskModelGroupSwitchRequest, signal: AbortSignal
+  ) => ReturnType<import("./session-host.js").SessionHost["getTaskModelGroupSwitch"]>;
   readonly authenticate: (context: HandlerContext) => ProviderGroupPrincipal | Promise<ProviderGroupPrincipal>;
   readonly assertRemoteAllowed: (key: ProviderGroupKey) => void;
   readonly schedulingState: (key: ProviderGroupKey, modelId: string, signal: AbortSignal) => Promise<{ readonly activeTurns: number; readonly accountUsage?: ProviderAccountUsageSnapshot }>;
@@ -69,6 +72,13 @@ export function createProviderGroupConnectService(options: ProviderGroupConnectO
     previewTaskModelGroup: (request, context) => invoke(context, true, async () => {
       if (!request.selection) throw new ConnectError("A model group selection is required.", Code.InvalidArgument);
       return await taskModels().preview(request.selection, context.signal);
+    }),
+    getTaskModelGroupSwitch: (request, context) => invoke(context, true, async () => {
+      identity(request.sessionId);
+      identity(request.failedRunId);
+      if (request.sessionGeneration < 1n) throw new ConnectError("The original task generation is required.", Code.InvalidArgument);
+      const offer = await options.taskModelGroupSwitch?.(request, context.signal);
+      return create(contract.GetTaskModelGroupSwitchResponseSchema, offer === undefined ? {} : { offer });
     }),
     listProviderGroups: (_request, context) => invoke(context, true, async () => create(contract.ListProviderGroupsResponseSchema, { groups: service.list().map(toGroupSnapshot) })),
     getProviderGroup: (request, context) => invoke(context, false, async principal => {

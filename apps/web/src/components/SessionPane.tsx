@@ -37,6 +37,7 @@ import { Composer, type ComposerHistoryEntry, type ComposerSelectionQuoteInserti
 import { CompactionStatusIndicator } from "./CompactionStatusIndicator.js";
 import { formatTokenCount, resolveDisplayContextWindow } from "./ContextCapacityRing.js";
 import { ErrorTailBanner } from "./ErrorTailBanner.js";
+import { TaskModelGroupSwitchAction } from "./TaskModelGroupSwitchAction.js";
 import { InteractionDialog } from "./InteractionDialog.js";
 import { InteractionPromptHost } from "./InteractionPortal.js";
 import { InputHandoffPanel } from "./InputHandoffCard.js";
@@ -985,6 +986,17 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const usageLimitSource = errorTailUsageLimitRecovery === null ? historyUsageLimitRecovery?.item : errorTailProjection?.item;
   const usageLimitSourceRef = useRef(usageLimitSource);
   usageLimitSourceRef.current = usageLimitSource;
+  const taskModelsApi = !guest && !reviewReadOnly && !running && !session.archived
+    ? controller.providerGroups?.taskModels : undefined;
+  const modelGroupRecovery = (runId: string | undefined) => taskModelsApi?.applySwitch === undefined || runId === undefined ? undefined
+    : <TaskModelGroupSwitchAction key={JSON.stringify([session.id, session.generation.toString(), runId])}
+        api={taskModelsApi} sessionId={session.id} generation={session.generation} runId={runId} t={t}
+        retry={session.retryRunId !== runId ? undefined : async failedRunId => {
+          const owner = controllerRef.current;
+          if (activeSessionIdRef.current !== session.id || owner.providerGroups?.taskModels !== taskModelsApi
+            || owner.state.snapshot.sessions.find(item => item.id === session.id)?.retryRunId !== failedRunId) return;
+          await owner.retry(failedRunId);
+        }} />;
   const [pendingUsageLimitRecovery, setPendingUsageLimitRecovery] = useState<{
     readonly itemId: string;
     readonly input: FailedInputIdentity;
@@ -2804,6 +2816,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         item={errorTailProjection.item}
         actions={errorTailActions}
         usageLimitRecovery={guest || reviewReadOnly ? undefined : errorTailUsageLimitRecovery ?? undefined}
+        modelGroupSwitch={modelGroupRecovery(errorTailProjection.item.failedInput?.runId ?? errorTailProjection.item.error?.runId)}
         actionFailure={errorTailActionFailure?.localKey === errorTailProjection.localKey ? errorTailActionFailure.message : undefined}
         t={t}
         onAction={handleErrorTailAction}
@@ -2814,6 +2827,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         <Button tone="ghost" onClick={() => scheduleUsageLimitRecovery(historyUsageLimitRecovery.item, historyUsageLimitRecovery.hint)}>
           <CalendarClock aria-hidden="true" />{t("errorTail.scheduleAfterReset")}
         </Button>
+        {errorTailProjection?.bannerVisible !== true && modelGroupRecovery(historyUsageLimitRecovery.item.failedInput?.runId)}
       </div>}
       {currentCompactFeedback !== undefined && !(currentCompactFeedback.phase === "busy" && activeCompaction !== undefined) && <CompactActionFeedback
         feedback={currentCompactFeedback}

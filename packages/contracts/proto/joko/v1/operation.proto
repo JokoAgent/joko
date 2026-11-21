@@ -875,6 +875,7 @@ message SetSessionRuntimeMutation {
   optional string effort = 6;
   optional bool fast_mode = 7;
   optional bool ultrafast_mode = 8;
+  TaskModelGroupSwitch task_model_group_switch = 9;
 }
 
 message SendInputMutation {

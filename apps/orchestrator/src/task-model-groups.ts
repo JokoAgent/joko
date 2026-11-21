@@ -65,7 +65,7 @@ export interface TaskModelGroupAssignment {
   readonly status: ProviderGroupMemberStatus;
   readonly profile: SessionRuntimeProfile;
   assertCurrent(): void;
-  bind(sessionId: string): void;
+  bind(sessionId: string, keepRotation?: boolean): void;
 }
 
 interface TaskModelGroupBinding {
@@ -79,6 +79,8 @@ interface TaskModelGroupBinding {
 interface ResolveOptions {
   readonly signal: AbortSignal;
   readonly accepts?: (source: ProviderGroupDirectorySource, model: ProviderModel) => boolean;
+  readonly lastPicked?: TaskModelGroupSource;
+  readonly requireReady?: boolean;
 }
 
 export class TaskModelGroups {
@@ -210,8 +212,9 @@ export class TaskModelGroups {
     assertCurrent();
     const rotation = this.options.store.findSetting<Record<string, string>>("service", this.options.ownerId, ROTATION_KEY)?.value;
     // Keep positions of disabled or unavailable members so rotation resumes in list order.
-    const picked = pickChoice(group, choices, now, rotation?.[group.groupId], selection.hasImages);
-    if (!picked) return undefined;
+    const last = options.lastPicked === undefined ? rotation?.[group.groupId] : candidateKey(options.lastPicked);
+    const picked = pickChoice(group, choices, now, last, selection.hasImages);
+    if (!picked || options.requireReady === true && picked.status.quota.limited) return undefined;
     const effort = picked.model.thinkingLevels.includes(group.effortId) ? group.effortId : undefined;
     const assertChoice = () => {
       assertCurrent();
@@ -227,11 +230,11 @@ export class TaskModelGroups {
         ...(effort === undefined ? {} : { effort }), fastMode: false
       }, groupName: original.name, effectiveGroupName: group.name,
       assertCurrent: assertChoice,
-      bind: sessionId => {
+      bind: (sessionId, keepRotation = false) => {
         assertChoice();
         this.options.store.setSetting("session", sessionId, BINDING_KEY, {
           groupId: original.groupId, effectiveGroupId: group.groupId, revision: config.revision.toString(),
-          source: picked.reference, rotationCommitted: false
+          source: picked.reference, rotationCommitted: keepRotation
         } satisfies TaskModelGroupBinding);
       }
     };

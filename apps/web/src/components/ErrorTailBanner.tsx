@@ -1,4 +1,4 @@
-import type { JSX } from "react";
+import type { JSX, ReactNode } from "react";
 import { AlertCircle, CalendarClock, RotateCcw, X } from "lucide-react";
 import type { ErrorView, TimelineItemView } from "../model.js";
 import type { UsageLimitRecoveryHint } from "../usage-limit-recovery.js";
@@ -6,10 +6,11 @@ import type { ExecutableRecoveryAction } from "./coding-ui-behavior.js";
 import type { Translator } from "./types.js";
 import { Button, IconButton } from "./ui.js";
 
-export function ErrorTailBanner({ item, actions, usageLimitRecovery, actionFailure, t, onAction, onScheduleUsageRecovery, onDismiss }: {
+export function ErrorTailBanner({ item, actions, usageLimitRecovery, modelGroupSwitch, actionFailure, t, onAction, onScheduleUsageRecovery, onDismiss }: {
   readonly item: TimelineItemView;
   readonly actions: readonly ExecutableRecoveryAction[];
   readonly usageLimitRecovery?: UsageLimitRecoveryHint;
+  readonly modelGroupSwitch?: ReactNode;
   readonly actionFailure?: string;
   readonly t: Translator;
   readonly onAction: (error: ErrorView, action: ExecutableRecoveryAction) => void;
@@ -26,7 +27,7 @@ export function ErrorTailBanner({ item, actions, usageLimitRecovery, actionFailu
           <span>{error?.message ?? item.text ?? t("errorTail.fallback")}</span>
           {actionFailure !== undefined && <small>{t("errorTail.actionFailed", { message: actionFailure })}</small>}
         </div>
-        {error !== undefined && (actions.length > 0 || usageLimitRecovery !== undefined) && (
+        {error !== undefined && (actions.length > 0 || usageLimitRecovery !== undefined || modelGroupSwitch !== undefined) && (
           <div className="error-tail-banner__actions">
             {actions.map((action, index) => (
               <Button key={action.id} tone="ghost" className={index === 0 ? "is-primary" : undefined} onClick={() => onAction(error, action)}>
@@ -38,6 +39,7 @@ export function ErrorTailBanner({ item, actions, usageLimitRecovery, actionFailu
                 <CalendarClock aria-hidden="true" />{t("errorTail.scheduleAfterReset")}
               </Button>
             )}
+            {modelGroupSwitch}
           </div>
         )}
         {onDismiss !== undefined && <IconButton className="error-tail-banner__dismiss" label={t("errorTail.dismiss")} onClick={onDismiss}><X aria-hidden="true" /></IconButton>}

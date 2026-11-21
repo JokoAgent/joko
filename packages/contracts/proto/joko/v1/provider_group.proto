@@ -23,6 +23,7 @@ service ProviderGroupService {
   rpc ListTaskModelGroups(ListTaskModelGroupsRequest) returns (ListTaskModelGroupsResponse);
   rpc SaveTaskModelGroups(SaveTaskModelGroupsRequest) returns (SaveTaskModelGroupsResponse);
   rpc PreviewTaskModelGroup(PreviewTaskModelGroupRequest) returns (PreviewTaskModelGroupResponse);
+  rpc GetTaskModelGroupSwitch(GetTaskModelGroupSwitchRequest) returns (GetTaskModelGroupSwitchResponse);
 }
 enum TaskModelGroupStrategy {
   TASK_MODEL_GROUP_STRATEGY_UNSPECIFIED = 0;
@@ -91,6 +92,21 @@ message PreviewTaskModelGroupResponse {
   bool quota_limited = 5;
   optional int64 available_at_ms = 6;
 }
+message GetTaskModelGroupSwitchRequest {
+  string session_id = 1;
+  uint64 session_generation = 2;
+  string failed_run_id = 3;
+}
+message TaskModelGroupSwitch {
+  string session_id = 1;
+  uint64 session_generation = 2;
+  uint64 expected_runtime_generation = 3;
+  uint64 config_revision = 4;
+  string failed_run_id = 5;
+  string group_name = 6;
+  TaskModelGroupSource selected = 7;
+}
+message GetTaskModelGroupSwitchResponse { TaskModelGroupSwitch offer = 1; }
 
 message ProviderGroupKey { string backend_id = 1; string provider_id = 2; }
 enum ProviderGroupStrategy {
