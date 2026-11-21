@@ -2,6 +2,7 @@ import { Bot, CircleAlert, MessageSquare, Pencil, RefreshCcw } from "lucide-reac
 import { useRef, useState, type JSX } from "react";
 import type { AppController } from "../controller.js";
 import { partnerSourceKey, type PartnerSourceView } from "../partner-sources.js";
+import { partnerConversationDragProps } from "../partner-window-navigation.js";
 import { PartnerAvatar, PartnerAvatarProvider } from "./PartnerAvatar.js";
 import type { Translator } from "./types.js";
 import { Button, Pill, Spinner } from "./ui.js";
@@ -20,6 +21,7 @@ function PartnerSourceSection({ controller, source, t }: { readonly controller: 
   const [pending, setPending] = useState<string>();
   const [failure, setFailure] = useState<{ readonly owner: string; readonly message: string }>();
   const rows = source.rows.filter(row => row.lifecycle === "active" || row.lifecycle === "paused");
+  const dragProfile = source.status === "online" ? controller.state.profiles.find(profile => partnerSourceKey(profile) === source.key) : undefined;
   const open = async (id: string, destination: "session" | "settings" | "preparation"): Promise<void> => {
     if (!controller.openSourcePartner || pending !== undefined) return;
     setPending(id); setFailure(undefined);
@@ -41,6 +43,8 @@ function PartnerSourceSection({ controller, source, t }: { readonly controller: 
         <footer>{row.initializationState !== "ready" && <Button disabled={source.status !== "online" || pending !== undefined}
           onClick={() => void open(row.id, "preparation")}><RefreshCcw aria-hidden="true" />{pending === row.id ? t("common.working") : t("partners.source.continuePreparation")}</Button>}
           <Button disabled={source.status !== "online" || pending !== undefined || row.initializationState !== "ready" || row.lifecycle !== "active"}
+          {...partnerConversationDragProps(pending === undefined && row.initializationState === "ready" && row.lifecycle === "active" ? dragProfile : undefined,
+            "private", row.id, row.displayName, t("session.openNewWindow"))}
           onClick={() => void open(row.id, "session")}><MessageSquare aria-hidden="true" />{pending === row.id ? t("common.working") : t("partners.openTask")}</Button>
           <Button disabled={source.status !== "online" || pending !== undefined || row.initializationState !== "ready" || row.lifecycle === "archived"}
             onClick={() => void open(row.id, "settings")}><Pencil aria-hidden="true" />{t("common.edit")}</Button></footer>

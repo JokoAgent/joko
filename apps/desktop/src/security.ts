@@ -1,6 +1,6 @@
 import { isAbsolute, dirname, extname, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { desktopExtensionWindowKey, isDesktopExtensionWindowOwner, type DesktopExtensionWindowOwner } from "./channels.js";
+import { desktopExtensionWindowKey, isDesktopExtensionWindowOwner, isDesktopPartnerWindowOwner, type DesktopExtensionWindowOwner, type DesktopPartnerWindowOwner } from "./channels.js";
 
 export const DESKTOP_APP_SCHEME = "joko";
 export const DESKTOP_APP_HOST = "app";
@@ -132,7 +132,7 @@ export function isAllowedDesktopAppEntrySearch(search: string): boolean {
     return query.get("extensionWindow") === "1" &&
       /^extension_[a-f0-9]{32}$/u.test(query.get("bootExtension") ?? "");
   }
-  return sessionWindowIdentity(query) !== undefined;
+  return sessionWindowIdentity(query) !== undefined || partnerWindowIdentity(query) !== undefined;
 }
 
 /** Primary windows cannot adopt an auxiliary entry while retaining their broader preload. */
@@ -187,6 +187,35 @@ export function isAllowedExtensionWindowNavigation(
   } catch {
     return false;
   }
+}
+
+export function partnerWindowEntryUrl(base: string, owner: DesktopPartnerWindowOwner): string {
+  if (!isDesktopPartnerWindowOwner(owner)) throw new TypeError("Partner window owner is invalid.");
+  const url = new URL(base);
+  url.username = "";
+  url.password = "";
+  url.search = new URLSearchParams({
+    partnerWindow: owner.kind, bootPartner: owner.conversationId, profile: owner.profileId, server: owner.serverId
+  }).toString();
+  url.hash = "";
+  return url.href;
+}
+
+export function isAllowedPartnerWindowNavigation(value: string, owner: DesktopPartnerWindowOwner, policy: DesktopNavigationPolicy): boolean {
+  if (!isDesktopPartnerWindowOwner(owner) || !isAllowedMainFrameNavigation(value, policy)) return false;
+  const url = new URL(value);
+  const expected = new URL(partnerWindowEntryUrl(policy.developmentUrl ?? DESKTOP_APP_ENTRY_URL, owner));
+  return url.origin === expected.origin && url.pathname === expected.pathname && url.hash === ""
+    && partnerWindowIdentity(url.searchParams) !== undefined && url.search === expected.search;
+}
+
+function partnerWindowIdentity(query: URLSearchParams): DesktopPartnerWindowOwner | undefined {
+  if ([...query.keys()].sort().join(",") !== "bootPartner,partnerWindow,profile,server") return undefined;
+  const owner = {
+    kind: query.get("partnerWindow"), conversationId: query.get("bootPartner"),
+    profileId: query.get("profile"), serverId: query.get("server")
+  };
+  return isDesktopPartnerWindowOwner(owner) ? owner : undefined;
 }
 
 function isAllowedPackagedAppResourceHash(url: URL): boolean {

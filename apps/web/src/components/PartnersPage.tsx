@@ -29,6 +29,8 @@ import { partnerHomeMessages } from "@joko/contracts";
 import { PartnerResumeDialog } from "./PartnerResumeDialog.js";
 import { PartnerRoutineDialog } from "./PartnerRoutineDialog.js";
 import { PartnerNetworkSection } from "./PartnerNetwork.js";
+import { PartnerGroupsSection } from "./PartnerGroups.js";
+import { partnerConversationDragProps } from "../partner-window-navigation.js";
 import { PartnerIdentityDirectory } from "./PartnerIdentityDirectory.js";
 import { PartnerImportDialog } from "./PartnerImportDialog.js";
 import { PartnerDiscoveryDialog, partnerDiscoveryTitle } from "./PartnerDiscoveryDialog.js";
@@ -304,7 +306,10 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, preparation
       <div className={catalog.directory.errorCount > 0 ? "is-warning" : undefined}><strong>{catalog.directory.errorCount}</strong><span>{t("partners.needsAttention")}</span></div>
       <Button tone="ghost" onClick={() => load()} disabled={loading}><RefreshCcw aria-hidden="true" />{t("common.refresh")}</Button>
     </section>}
-    {catalog && catalogCurrent && <PartnerNetworkSection key={`network:${ownerKey}`} controller={controller} partners={catalog.partners} />}
+    {catalog && catalogCurrent && <>
+      <PartnerGroupsSection key={`groups:${ownerKey}`} controller={controller} partners={catalog.partners} t={t} />
+      <PartnerNetworkSection key={`network:${ownerKey}`} controller={controller} partners={catalog.partners} />
+    </>}
     {catalog && catalogCurrent && <PartnerIdentityDirectory key={`identity:${ownerKey}`} controller={controller} partners={catalog.partners} />}
     <div className="partners-toolbar">
       <div className="segmented" role="radiogroup" aria-label={t("partners.filter")}>
@@ -424,7 +429,9 @@ function PartnerCard({ partner, controller, snapshot, workingOwner, pending, pre
     <dl><div><dt>{t("partners.profileVersion")}</dt><dd>{partner.profileVersion.toString()}</dd></div><div><dt>{t("partners.modelRoutes")}</dt><dd>{partner.capabilities.modelChain.length}</dd></div><div><dt>{t("partners.settingsSource")}</dt><dd>{t(partner.usesDirectoryDefaults ? "partners.sharedDefaults" : "partners.customSettings")}</dd></div></dl>
     {partner.initializationState === "error" && <div className="partner-card__error" role="alert"><CircleAlert aria-hidden="true" /><span><strong>{t("partners.preparationFailed")}</strong><small>{t(`partners.error.${partner.initializationErrorCode ?? "stateChanged"}`)}</small></span></div>}
     <footer>
-      {partner.lifecycle === "active" && partner.initializationState === "ready" && <Button onClick={onOpen}><MessageSquare aria-hidden="true" />{t("partners.openTask")}</Button>}
+      {partner.lifecycle === "active" && partner.initializationState === "ready" && <Button onClick={onOpen}
+        {...partnerConversationDragProps(workingOwner && partner.canonicalSessionId ? controller.state.activeProfile : undefined,
+          "private", partner.id, partner.displayName, t("session.openNewWindow"))}><MessageSquare aria-hidden="true" />{t("partners.openTask")}</Button>}
       {partner.initializationState === "error" && <Button onClick={onRetry} disabled={pending}><RotateCcw aria-hidden="true" />{pending ? t("common.working") : t("common.retry")}</Button>}
       <Button onClick={onEdit} disabled={preparationTarget && partner.capabilities.modelChain.length > 0}><Pencil aria-hidden="true" />{t("common.edit")}</Button>
       {partner.lifecycle === "active" && partner.canonicalSessionId !== undefined && <Button onClick={onRestart} disabled={pending}><RefreshCcw aria-hidden="true" />{t("partners.restartAction")}</Button>}

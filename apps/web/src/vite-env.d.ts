@@ -344,10 +344,19 @@ interface JokoDesktopDeepLinkAcknowledgement {
   readonly deliveryOccurrence: number;
 }
 
-interface JokoDesktopSessionDragPreviewRequest {
-  readonly gestureId: string;
+interface JokoDesktopPartnerWindowOwner {
+  readonly kind: "private" | "group";
   readonly profileId: string;
-  readonly sessionId: string;
+  readonly serverId: string;
+  readonly conversationId: string;
+}
+
+type JokoDesktopConversationDragTarget =
+  | { readonly profileId: string; readonly sessionId: string }
+  | { readonly partnerWindow: JokoDesktopPartnerWindowOwner };
+
+type JokoDesktopSessionDragPreviewRequest = JokoDesktopConversationDragTarget & {
+  readonly gestureId: string;
   readonly label: string;
   readonly hint: string;
   readonly palette: {
@@ -357,7 +366,7 @@ interface JokoDesktopSessionDragPreviewRequest {
     readonly muted: string;
     readonly accent: string;
   };
-}
+};
 
 interface JokoDesktopGlobalVoiceShortcut {
   readonly code: string;
@@ -548,6 +557,7 @@ interface JokoDesktopApi {
   readonly sessionWindows: {
     open(owner: { readonly profileId: string; readonly sessionId: string }): Promise<{ readonly opened: true }>;
     getOwner(): Promise<{ readonly profileId: string; readonly sessionId: string; readonly draftSlot: number }>;
+    getPartnerOwner?(): Promise<JokoDesktopPartnerWindowOwner>;
     beginDragPreview(request: JokoDesktopSessionDragPreviewRequest): Promise<boolean>;
     endDragPreview(gestureId: string): Promise<boolean>;
     openIfDroppedOutside(gestureId: string): Promise<

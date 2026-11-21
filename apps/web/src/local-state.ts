@@ -473,7 +473,7 @@ function currentDraftRecord(value: unknown): ComposerDraftRecord | undefined {
   return value as ComposerDraftRecord;
 }
 
-export type SessionDraftSurface = "application" | `task-window:${number}` | `task-window:${number}:navigation:${string}`;
+export type SessionDraftSurface = "application" | "partner-window" | `task-window:${number}` | `task-window:${number}:navigation:${string}`;
 
 export function normalizePendingSideChatDraft(value: unknown): PendingSideChatDraft | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -523,7 +523,7 @@ function sessionDraftKey(serverId: string, profileId: string, sessionId: string,
   return JSON.stringify([serverId, profileId, sessionId, surface]);
 }
 function validSessionDraftSurface(surface: string): surface is SessionDraftSurface {
-  if (surface === "application") return true;
+  if (surface === "application" || surface === "partner-window") return true;
   const match = /^task-window:(0|[1-9][0-9]*)(?::navigation:(.+))?$/u.exec(surface);
   if (match === null || !Number.isSafeInteger(Number(match[1]))) return false;
   const encoded = match[2];

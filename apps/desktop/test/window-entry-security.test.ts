@@ -16,9 +16,11 @@ import {
   extensionWindowEntryUrl,
   isAllowedMainFrameNavigation,
   isAllowedPackagedBundleResource,
+  isAllowedPartnerWindowNavigation,
   isAllowedPrimaryWindowNavigation,
   isAllowedRuntimeProcessMonitorNavigation,
   isAllowedSessionWindowNavigation,
+  partnerWindowEntryUrl,
   runtimeProcessMonitorEntryUrl
 } from "../src/security.js";
 import { remoteDesktopViewerEntryUrl, isAllowedRemoteDesktopViewerNavigation } from "../src/security.js";
@@ -87,6 +89,23 @@ describe("trusted auxiliary window entries", () => {
       "joko://app/index.html?sessionWindow=1&bootSession=task%2Fone#/tasks/task%2Ftwo",
       policy
     )).toBe(false);
+  });
+
+  it("binds a Partner window to its own node and conversation without admitting another route", () => {
+    const policy = createNavigationPolicy(resolve("dist/web/index.html"));
+    const owner = { kind: "group", profileId: "connection/one", serverId: "node-one", conversationId: "network:join-one:room" } as const;
+    const entry = partnerWindowEntryUrl("joko://app/index.html?auth=old#/tasks/old", owner);
+    expect(entry).toBe("joko://app/index.html?partnerWindow=group&bootPartner=network%3Ajoin-one%3Aroom&profile=connection%2Fone&server=node-one");
+    expect(isAllowedPartnerWindowNavigation(entry, owner, policy)).toBe(true);
+    expect(isAllowedPackagedBundleResource(entry, policy)).toBe(true);
+    expect(isAllowedPrimaryWindowNavigation(entry, policy)).toBe(false);
+    expect(isAllowedPartnerWindowNavigation(entry, { ...owner, serverId: "node-two" }, policy)).toBe(false);
+    expect(isAllowedPartnerWindowNavigation(entry, { ...owner, conversationId: "network:host:room" }, policy)).toBe(false);
+    expect(isAllowedPartnerWindowNavigation(entry, { ...owner, kind: "private" }, policy)).toBe(false);
+    for (const mismatch of [entry + "&profile=other", entry + "&auth=secret", entry + "#/tasks/example"]) {
+      expect(isAllowedPartnerWindowNavigation(mismatch, owner, policy)).toBe(false);
+      expect(isAllowedPackagedBundleResource(mismatch, policy)).toBe(false);
+    }
   });
 
   it("admits only exact credential-free application queries", () => {

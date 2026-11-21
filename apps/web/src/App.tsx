@@ -115,6 +115,7 @@ import {
   type SessionSplitSide
 } from "./session-split-layout.js";
 import { desktopSessionTaskLink, isSessionApplicationWindow, openSessionWindowFallback, sessionTaskLink } from "./session-window-navigation.js";
+import { partnerApplicationWindowIdentity, partnerWindowMatchesProfile } from "./partner-window-navigation.js";
 import {
   DesktopDeepLinkDeliveryOrder,
   desktopDeepLinkAppRoute,
@@ -155,6 +156,7 @@ import {
   type WorktreeRemovalPreflightSummary
 } from "./worktree-removal-preflight.js";
 import { PartnerConversationScope } from "./components/PartnerConversation.js";
+import { PartnerGroupPage, PartnerGroupsNavigation } from "./components/PartnerGroups.js";
 import { PartnerNetworkPage, PartnerNetworkNavigation } from "./components/PartnerNetwork.js";
 
 const SessionPane = lazy(async () => ({ default: (await import("./components/SessionPane.js")).SessionPane }));
@@ -277,6 +279,7 @@ function ConnectedAppControllerRoot(): JSX.Element {
   const t = useCallback((key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate(controller.state.effectiveLocale, key, values), [controller.state.effectiveLocale]);
   const applicationWindowOwner = typeof window !== "undefined"
     && !isSessionApplicationWindow(window.location)
+    && partnerApplicationWindowIdentity(window.location) === undefined
     && !isExtensionApplicationWindow(window.location);
   return <><RuntimeProcessMonitorBroker controller={controller} />{applicationWindowOwner && <DesktopRemoteDesktopViewerBridge controller={controller} />}<StartupUpdateOverlay t={t} />{applicationWindowOwner && <DesktopGlobalVoiceBridge controller={controller} />}<AppWithController controller={controller} /><DesktopWindowControls t={t} /></>;
 }
@@ -306,8 +309,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const wallpaper = useWallpaperSettings().state.settings;
   const wallpaperActive = wallpaper?.mode === "custom" && wallpaper.customImage !== null;
   const sessionApplicationWindow = typeof window !== "undefined" && isSessionApplicationWindow(window.location);
+  const partnerApplicationWindow = typeof window !== "undefined" && partnerApplicationWindowIdentity(window.location) !== undefined;
   const extensionApplicationWindow = typeof window !== "undefined" && isExtensionApplicationWindow(window.location);
-  const auxiliaryApplicationWindow = sessionApplicationWindow || extensionApplicationWindow;
+  const auxiliaryApplicationWindow = sessionApplicationWindow || partnerApplicationWindow || extensionApplicationWindow;
   const taskSharingInvitationOwner = useRef<string | undefined>(undefined);
   useEffect(() => {
     const key = state.activeProfile === undefined ? undefined : `${state.activeProfile.id}:${state.connectionGeneration}`;
@@ -1955,6 +1959,19 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     </AppErrorBoundary>
   </>;
   if (!state.ready) return <>{applicationMenuFeedback}{actionErrorFeedback !== null && <div className="app-banners">{actionErrorFeedback}</div>}<LoadingScreen label={t("common.loading")} body={t("app.openingState")} /></>;
+  if (partnerApplicationWindow) {
+    const owner = state.partnerWindowOwner;
+    if (owner === undefined || !partnerWindowMatchesProfile(owner, state.activeProfile)
+      || state.connectionState === "disconnected" || state.error !== undefined && state.connectionState !== "connected") {
+      return <main className="empty-session-page"><EmptyState icon={<AlertTriangle />} title={state.error ?? t("partners.unavailable")} /></main>;
+    }
+    const activated = owner.kind === "private"
+      ? state.route.kind === "session" && state.route.partnerId === owner.conversationId && state.route.profileId === owner.profileId
+      : state.route.kind === "partners" && state.route.groupId === owner.conversationId && state.route.profileId === owner.profileId;
+    if (!activated || state.connectionState !== "connected" || state.connectionGeneration !== state.partnerWindowConnectionGeneration) return state.error === undefined
+      ? <LoadingScreen label={t("common.loading")} body={t("connection.connecting")} />
+      : <main className="empty-session-page"><EmptyState icon={<AlertTriangle />} title={t("partners.unavailable")} body={state.error} /></main>;
+  }
   if (deviceReview) return <DeviceAuthorizationReview key={deviceReview.requestId} controller={controller} review={deviceReview} t={t} onClose={() => setDeviceReview(undefined)} />;
   if (deviceInvitation) return <><Button onClick={() => setDeviceInvitation(undefined)}>{t('common.cancel')}</Button><ConnectionScreen
     controller={{ ...controller, state: { ...state, initialMode: 'pair' },
@@ -2556,7 +2573,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       {applicationMenuFeedback}
       {!formalFilesMode && !settingsRoute && <Sidebar
         appShortcutOverrides={shortcutOverrides}
-        groupNavigation={<><TaskSharingNavigation controller={controller} t={t} onClose={closeNavigation} /><PartnerNetworkNavigation controller={controller} onClose={closeNavigation} /></>}
+        groupNavigation={<><TaskSharingNavigation controller={controller} t={t} onClose={closeNavigation} /><PartnerGroupsNavigation controller={controller} t={t} onClose={closeNavigation} /><PartnerNetworkNavigation controller={controller} t={t} onClose={closeNavigation} /></>}
         snapshot={sidebarSnapshot}
         activeSessionId={creatingNewSession ? undefined : activeSession?.id}
         route={state.route}
@@ -2826,8 +2843,11 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             t={t} locale={state.effectiveLocale} editable={connectionOwner !== undefined} navigationOpen={navigationOpen}
             onOpenNavigation={() => setWindowNavigationOpen(true)} onOpen={(session) => controller.navigate({ kind: "session", sessionId: session.id })}
             onSnooze={requestSessionSnooze} onDone={completeInboxTask} />}
-          {state.route.kind === "partners" && (state.route.groupId?.startsWith("network:") ? <PartnerNetworkPage controller={controller} route={state.route.groupId} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />
-            : <PartnersPage controller={controller} snapshot={state.snapshot} focusPartnerId={state.route.partnerId} preparation={state.route.preparation} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />)}
+          {state.route.kind === "partners" && (state.route.groupId === undefined
+            ? <PartnersPage controller={controller} snapshot={state.snapshot} focusPartnerId={state.route.partnerId} preparation={state.route.preparation} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />
+            : state.route.groupId.startsWith("network:")
+              ? <PartnerNetworkPage controller={controller} route={state.route.groupId} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />
+              : <PartnerGroupPage key={state.route.groupId} controller={controller} groupId={state.route.groupId} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />)}
           {state.route.kind === "sharedTask" && <TaskSharingSession controller={controller} joinId={state.route.joinId} profileId={state.route.profileId} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} />}
           {state.route.kind === "tools" && <ToolsPage
             controller={controller}

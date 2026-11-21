@@ -1,12 +1,21 @@
 import type { SessionDraftSurface } from "./local-state.js";
 import { isSessionApplicationWindow } from "./session-window-navigation.js";
+import { partnerApplicationWindowIdentity } from "./partner-window-navigation.js";
 
 type DraftWindowAnchor = { readonly kind: "side-chat" | "navigation"; readonly sessionId: string };
 
 /** A native task instance supplies only its stable local draft slot. */
-export async function sessionDraftSurface(profileId: string, sessionId: string, isCurrent: () => boolean, anchor?: DraftWindowAnchor): Promise<SessionDraftSurface> {
+export async function sessionDraftSurface(profileId: string, sessionId: string, isCurrent: () => boolean, anchor?: DraftWindowAnchor,
+  verifiedPartnerSessionId?: string): Promise<SessionDraftSurface> {
   const search = window.location.search;
   const query = new URLSearchParams(search);
+  const partner = partnerApplicationWindowIdentity(window.location);
+  if (partner !== undefined) {
+    if (partner.kind !== "private" || partner.profileId !== profileId || verifiedPartnerSessionId !== sessionId || !isCurrent()) {
+      throw new Error("The Partner draft window owner is no longer current.");
+    }
+    return "partner-window";
+  }
   if (!query.has("sessionWindow")) return "application";
   const ownerSessionId = anchor?.sessionId ?? sessionId;
   if (anchor?.sessionId === sessionId || !ownerSessionId || !isSessionApplicationWindow(window.location)

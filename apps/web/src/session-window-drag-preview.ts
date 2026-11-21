@@ -1,18 +1,16 @@
 export const SESSION_WINDOW_DRAG_PREVIEW_TIMEOUT_MS = 30_000;
 
-interface SessionWindowDragPreviewStart {
+type SessionWindowDragPreviewStart = JokoDesktopConversationDragTarget & {
   readonly dataTransfer: DataTransfer;
   readonly row: HTMLElement;
-  readonly profileId: string;
-  readonly sessionId: string;
   readonly label: string;
   readonly hint: string;
   readonly ownerWindow: Window;
-}
+};
 
 interface ActiveSessionWindowDragPreview {
   readonly gestureId: string;
-  readonly sessionId: string;
+  readonly sessionId?: string;
   readonly row: HTMLElement;
   readonly ownerWindow: Window;
   readonly dragImage: HTMLCanvasElement;
@@ -70,7 +68,7 @@ export function startSessionWindowDragPreview(request: SessionWindowDragPreviewS
   );
   const active: ActiveSessionWindowDragPreview = {
     gestureId,
-    sessionId: request.sessionId,
+    ...("sessionId" in request ? { sessionId: request.sessionId } : {}),
     row: request.row,
     ownerWindow: request.ownerWindow,
     dragImage,
@@ -93,8 +91,8 @@ export function startSessionWindowDragPreview(request: SessionWindowDragPreviewS
   try {
     void api?.beginDragPreview({
       gestureId,
-      profileId: request.profileId,
-      sessionId: request.sessionId,
+      ...("partnerWindow" in request ? { partnerWindow: request.partnerWindow }
+        : { profileId: request.profileId, sessionId: request.sessionId }),
       label,
       hint,
       palette

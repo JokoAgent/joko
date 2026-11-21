@@ -4,6 +4,8 @@ import { create } from "@bufbuild/protobuf";
 import * as wire from "@joko/contracts";
 import { Plus, Users, Settings, Send, Square, ArrowLeft } from "lucide-react";
 import type { AppController } from "../controller.js";
+import { translate } from "../i18n.js";
+import { partnerConversationDragProps } from "../partner-window-navigation.js";
 import type { PartnerNetworkApi } from "../partner-network-api.js";
 import { PartnerNetworkEntryJournal } from "../partner-network-entry-journal.js";
 import type { PartnerProfileView, TimelineItemView, AttachmentDraft } from "../model.js";
@@ -32,22 +34,26 @@ function errorText(error: unknown, m: Copy): string {
   return error instanceof ConnectError && [Code.PermissionDenied, Code.Unauthenticated].includes(error.code) ? m.denied : m.unavailable;
 }
 function useDirectory(api: PartnerNetworkApi | undefined) {
-  const [rooms, setRooms] = useState<wire.PartnerNetworkRoom[]>(), [error, setError] = useState<unknown>(), [refresh, setRefresh] = useState(0);
+  const [result, setResult] = useState<{ api: PartnerNetworkApi; rooms: wire.PartnerNetworkRoom[] }>(), [error, setError] = useState<unknown>(), [refresh, setRefresh] = useState(0);
   useEffect(() => {
     if (!api) return; const lifetime = new AbortController(); let reading = false;
     const read = async () => { if (reading || lifetime.signal.aborted || document.visibilityState === "hidden") return; reading = true;
-      try { const result = await api.listPartnerNetwork({}, { signal: lifetime.signal }); if (!lifetime.signal.aborted) { setRooms(result.rooms); setError(undefined); } }
+      try { const result = await api.listPartnerNetwork({}, { signal: lifetime.signal }); if (!lifetime.signal.aborted) { setResult({ api, rooms: result.rooms }); setError(undefined); } }
       catch (reason) { if (!lifetime.signal.aborted) setError(reason); } finally { reading = false; } };
     void read(); const timer = setInterval(() => { void read(); }, 5_000); document.addEventListener("visibilitychange", read);
     return () => { lifetime.abort(); clearInterval(timer); document.removeEventListener("visibilitychange", read); };
   }, [api, refresh]);
-  return { rooms, error, refresh: () => setRefresh(value => value + 1) };
+  return { rooms: result?.api === api ? result?.rooms : undefined, error, refresh: () => setRefresh(value => value + 1) };
 }
 export function PartnerNetworkNavigation({ controller, onClose }: { controller: AppController; onClose(): void }): JSX.Element | null {
   const api = controller.partnerNetwork, { rooms } = useDirectory(api), m = wire.partnerNetworkMessages(controller.state.effectiveLocale);
   if (!api || !rooms?.some(room => !room.removedFromList && room.state === "active")) return null;
+  const profile = controller.state.connectionState === "connected" ? controller.state.activeProfile : undefined;
+  const dragHint = translate(controller.state.effectiveLocale, "session.openNewWindow");
   return <section className="partner-groups-navigation" aria-label={m.title}>{rooms.filter(room => !room.removedFromList && room.state === "active").map(room =>
-    <button type="button" className="partner-group-directory-row" key={`${room.hostServerId}:${room.id}`} onClick={() => { controller.navigate({ kind: "partners", groupId: partnerNetworkRoute(room) }); onClose(); }}>
+    <button type="button" className="partner-group-directory-row" key={`${room.hostServerId}:${room.id}`}
+      {...partnerConversationDragProps(profile, "group", partnerNetworkRoute(room), room.name, dragHint)}
+      onClick={() => { controller.navigate({ kind: "partners", groupId: partnerNetworkRoute(room) }); onClose(); }}>
       <Users aria-hidden="true" /><span><strong>{room.name}</strong><small>{room.members.filter(member => member.state === "joined").map(member => wire.partnerNetworkActorName(member, room)).join(" · ")}</small></span>
       {room.unread && <span className="partner-group-unread" aria-label={m.unread} />}</button>)}</section>;
 }
@@ -55,6 +61,8 @@ export function PartnerNetworkSection({ controller, partners }: { controller: Ap
   const api = controller.partnerNetwork, m = wire.partnerNetworkMessages(controller.state.effectiveLocale), directory = useDirectory(api);
   const [dialog, setDialog] = useState<"create" | "join">(), [search, setSearch] = useState(""), [history, setHistory] = useState(false);
   if (!api) return null;
+  const profile = controller.state.connectionState === "connected" && directory.error === undefined ? controller.state.activeProfile : undefined;
+  const dragHint = translate(controller.state.effectiveLocale, "session.openNewWindow");
   const rooms = directory.rooms?.filter(room => !room.removedFromList && (history || room.state === "active") && [room.name, ...room.members.map(member => wire.partnerNetworkActorName(member, room))].some(value => value.toLocaleLowerCase().includes(search.toLocaleLowerCase())));
   return <section className="partner-groups-section partner-network-section" aria-label={m.title}>
     <header><h2><Users aria-hidden="true" />{m.title}</h2><div><Button onClick={() => setDialog("create")}><Plus aria-hidden="true" />{m.create}</Button><Button onClick={() => setDialog("join")}>{m.join}</Button></div></header>
@@ -63,7 +71,9 @@ export function PartnerNetworkSection({ controller, partners }: { controller: Ap
     {directory.error !== undefined && <p role="alert">{errorText(directory.error, m)} <Button onClick={directory.refresh}>{m.refresh}</Button></p>}
     {!directory.rooms && !directory.error && <Spinner />}
     {rooms?.length === 0 && <p>{m.empty}</p>}
-    <div className="partner-group-directory">{rooms?.map(room => <button type="button" key={`${room.hostServerId}:${room.id}`} className="partner-group-directory-row" onClick={() => controller.navigate({ kind: "partners", groupId: partnerNetworkRoute(room) })}>
+    <div className="partner-group-directory">{rooms?.map(room => <button type="button" key={`${room.hostServerId}:${room.id}`} className="partner-group-directory-row"
+      {...partnerConversationDragProps(room.state === "active" ? profile : undefined, "group", partnerNetworkRoute(room), room.name, dragHint)}
+      onClick={() => controller.navigate({ kind: "partners", groupId: partnerNetworkRoute(room) })}>
       <Users aria-hidden="true" /><span><strong>{room.name}</strong><small>{room.state === "archived" ? m.archived : room.state === "dissolved" ? m.dissolved : room.members.filter(member => member.state === "joined").map(member => wire.partnerNetworkActorName(member, room)).join(" · ")}</small></span>{room.unread && <span className="partner-group-unread" aria-label={m.unread} />}</button>)}</div>
     {dialog && <NetworkEntry api={api} m={m} kind={dialog} partners={partners} owner={JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id, controller.state.activeProfile?.deviceId])} onClose={() => setDialog(undefined)} onJoined={room => { setDialog(undefined); directory.refresh(); controller.navigate({ kind: "partners", groupId: partnerNetworkRoute(room) }); }} />}
   </section>;
@@ -320,7 +330,11 @@ function NetworkConversation({ api, target, controller, m, t, onOpenNavigation, 
   const firstReply = messages.findIndex(message => message.threadRootId === thread), showUnreadDivider = unreadStart > firstReply;
   const speaking = snapshot?.plans.find(plan => plan.kind === "talk" && plan.status === "running")?.steps.find(step => step.status === "running");
   const speakingName = room?.members.find(actor => actor.id === speaking?.actorId)?.name;
-  return <section className="partner-group-page partner-network-page"><header className="partner-group-header"><IconButton label={thread ? m.close : m.back} onClick={() => thread ? setThread("") : onOpenNavigation()}><ArrowLeft /></IconButton><div><h1>{thread ? m.replies : room?.name || m.title}</h1><small>{speakingName ? `${speakingName} · ${m.speaking}` : thread ? room?.name : `${room?.members.filter(member => member.state === "joined").length ?? 0} ${m.members}`}</small></div>{thread && snapshot?.readerStateSupported ? <Button tone="ghost" aria-pressed={snapshot.threadFollowing} disabled={busy || !allowed} onClick={() => { void followThread(); }}>{snapshot.threadFollowing ? m.following : m.follow}</Button> : <IconButton label={m.settings} onClick={() => setSettings(true)} disabled={!room}><Settings /></IconButton>}</header>
+  return <section className="partner-group-page partner-network-page"><header className="partner-group-header">
+    {(thread || controller.state.partnerWindowOwner === undefined) && <IconButton label={thread ? m.close : m.back} onClick={() => thread ? setThread("") : onOpenNavigation()}><ArrowLeft /></IconButton>}
+    <div><h1>{thread ? m.replies : room?.name || m.title}</h1><small>{speakingName ? `${speakingName} · ${m.speaking}` : thread ? room?.name : `${room?.members.filter(member => member.state === "joined").length ?? 0} ${m.members}`}</small></div>
+    {thread && snapshot?.readerStateSupported ? <Button tone="ghost" aria-pressed={snapshot.threadFollowing} disabled={busy || !allowed} onClick={() => { void followThread(); }}>{snapshot.threadFollowing ? m.following : m.follow}</Button> : <IconButton label={m.settings} onClick={() => setSettings(true)} disabled={!room}><Settings /></IconButton>}
+  </header>
     {error && <p className="partner-group-error" role="alert">{error}<Button onClick={() => { void read(); }}>{m.refresh}</Button></p>}
     {failures.error && !error && <p role="status">{m.unavailable}</p>}
     {room?.state !== "active" && room && <p className="partner-group-error">{room.state === "archived" ? m.archived : m.dissolved}</p>}

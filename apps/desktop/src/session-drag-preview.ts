@@ -1,4 +1,4 @@
-import type { DesktopSessionDragPreviewRequest } from "./channels.js";
+import type { DesktopConversationDragTarget, DesktopSessionDragPreviewRequest } from "./channels.js";
 import { isDesktopSessionDragPreviewRequest } from "./channels.js";
 import {
   pointIsInsideAnyRectangle,
@@ -37,12 +37,7 @@ interface ActiveSessionDrag<Owner extends object> {
 
 export type SessionDragPreviewCompletion =
   | { readonly kind: "inside" }
-  | {
-      readonly kind: "outside";
-      readonly point: DesktopPoint;
-      readonly profileId: string;
-      readonly sessionId: string;
-    };
+  | ({ readonly kind: "outside"; readonly point: DesktopPoint } & DesktopConversationDragTarget);
 
 export type TrustedSessionDragPreviewCompletion<Owner extends object> = SessionDragPreviewCompletion & {
   readonly owner: Owner;
@@ -215,10 +210,12 @@ export class SessionDragPreviewCoordinator<Owner extends object> {
   private finishActiveGesture(active: ActiveSessionDrag<Owner>): SessionDragPreviewCompletion {
     const point = this.environment.getCursorPoint();
     const inside = pointIsInsideAnyRectangle(point, this.environment.getVisibleApplicationBounds());
-    const profileId = active.request.profileId;
-    const sessionId = active.request.sessionId;
+    const request = active.request;
     this.stopActive();
-    return inside ? { kind: "inside" } : { kind: "outside", point, profileId, sessionId };
+    if (inside) return { kind: "inside" };
+    return "partnerWindow" in request
+      ? { kind: "outside", point, partnerWindow: request.partnerWindow }
+      : { kind: "outside", point, profileId: request.profileId, sessionId: request.sessionId };
   }
 
   dispose(): void {

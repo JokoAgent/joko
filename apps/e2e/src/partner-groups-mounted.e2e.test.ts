@@ -173,6 +173,49 @@ mountedIt("recovers a new single-speaker group, delivers an attachment and decis
   expect(errors).toEqual([]);
 }, 180_000);
 
+mountedIt("opens a local group from the ordinary Partners page and submits its dropped file to the same group", async () => {
+  fixture = await RealPiSystemFixture.start({ webDirectory: webDirectory!, enableInternalServer: true,
+    providerResponder: () => ({ kind: "text", text: "Received the local group note." }) });
+  const manager = await fixture.pair("Local group manager");
+  const memberIds: string[] = [];
+  for (const displayName of ["Aster", "Beryl"]) {
+    const { directory } = await manager.clients.partner.getPartnerDirectory({});
+    const { partner } = await manager.clients.partner.createPartner({
+      requestId: `local-group-member-${displayName}`, expectedDirectoryRevision: directory!.revision,
+      draft: create(wire.PartnerDraftSchema, {
+        displayName, avatar: { value: { case: "presetId", value: "orbit" } },
+        templateId: "general", identitySource: `You are ${displayName}.`, usesDirectoryDefaults: false,
+        capabilities: { modelChain: [{ backendId: "pi", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID }], permissionMode: wire.PermissionMode.AUTO }
+      })
+    });
+    expect(partner?.initializationState).toBe(wire.PartnerInitializationState.READY);
+    memberIds.push(partner!.partnerId);
+  }
+  const { revision } = await manager.clients.partnerGroup.listPartnerGroups({});
+  const { group } = await manager.clients.partnerGroup.createPartnerGroup({
+    requestId: "local-group-formal-entry", name: "Local meeting board", memberIds, expectedDirectoryRevision: revision
+  });
+  browser = await chromium.launch({ executablePath: browserPath!, headless: true });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
+  await pairPage(page, fixture);
+  await page.locator(".partner-groups-section").getByRole("button", { name: /Local meeting board/u }).click();
+  await page.getByRole("heading", { name: "Local meeting board", exact: true }).waitFor();
+  const composer = page.getByRole("textbox", { name: "Message the group · @mention a partner" });
+  await composer.fill("@Aster keep this local");
+  await page.locator(".partner-group-page").evaluate(pageRoot => {
+    const files = new DataTransfer();
+    files.items.add(new File(["Minutes from the local group."], "minutes.txt", { type: "text/plain" }));
+    pageRoot.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: files }));
+  });
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  const saved = await waitFor(() => manager.clients.partnerGroup.getPartnerGroup({ groupId: group!.id }),
+    value => value.detail?.messages.some(message => message.content === "@Aster keep this local"
+      && message.attachments.some(file => file.name === "minutes.txt")) === true,
+    "the local group's user message and dropped file");
+  expect(saved.detail?.group?.id).toBe(group!.id);
+  expect((await manager.clients.partnerNetwork.listPartnerNetwork({})).rooms).toHaveLength(0);
+}, 120_000);
+
 async function pairPage(page: Page, system: RealPiSystemFixture) {
   const begun = await system.anonymous.connection.beginPairing({ deviceDisplayName: "Group Web" });
   await page.goto(`${system.baseUrl}/#/partners`, { waitUntil: "domcontentloaded" });
