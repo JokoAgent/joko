@@ -48,6 +48,15 @@ export interface ExtensionRoutineEventsDescriptor {
   readonly events: readonly { readonly type: string; readonly name: string; readonly fields: readonly string[] }[];
 }
 
+export interface ExtensionTaskEngineDescriptor {
+  readonly id: string;
+  readonly name: string;
+  readonly description?: string;
+  readonly protocol: string;
+  /** Inspected package-relative Node entry, separate from the Pi extension. */
+  readonly entry: string;
+}
+
 const MESSAGE_SUBSCRIPTION_TOPICS = ["turn", "session"] as const;
 const MESSAGE_SUBSCRIPTION_HOOKS = ["will-user-message", "will-assistant-message"] as const;
 
@@ -85,6 +94,7 @@ export interface ExtensionSurfaceBinding {
   readonly library?: ExtensionLibraryDescriptor;
   readonly routineEvents?: ExtensionRoutineEventsDescriptor;
   readonly runtime?: ExtensionRuntimeDescriptor;
+  readonly taskEngines?: readonly ExtensionTaskEngineDescriptor[];
   readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
 }
 
@@ -136,14 +146,14 @@ export function parseExtensionSurfaceManifest(
   const result: ExtensionSurfaceBinding[] = [];
   for (const rawBinding of surfaces.extensions) {
     const binding = requirePlainObject(rawBinding, "Extension surface declaration");
-    requireExactKeys(binding, ["entry", "mainView", "taskView", "settings", "library", "routineEvents", "runtime", "recommendations"], ["entry"], "Extension surface declaration");
+    requireExactKeys(binding, ["entry", "mainView", "taskView", "settings", "library", "routineEvents", "runtime", "recommendations", "taskEngines"], ["entry"], "Extension surface declaration");
     const entry = requirePortablePath(binding.entry, "Extension surface entry");
     if (!EXTENSION_SUFFIXES.has(extname(entry).toLowerCase())) throw new Error("Extension surface entry has an unsupported file type.");
     if (!discoveredEntries.has(entry)) throw new Error("Extension surface entry does not exactly match a discovered Extension.");
     if (seenEntries.has(entry)) throw new Error("Extension surface entry is declared more than once.");
     seenEntries.add(entry);
 
-    if (binding.mainView === undefined && binding.taskView === undefined && binding.settings === undefined && binding.library === undefined && binding.routineEvents === undefined && binding.runtime === undefined && binding.recommendations === undefined) {
+    if (binding.mainView === undefined && binding.taskView === undefined && binding.settings === undefined && binding.library === undefined && binding.routineEvents === undefined && binding.runtime === undefined && binding.recommendations === undefined && binding.taskEngines === undefined) {
       throw new Error("Extension surface declaration must advertise at least one current capability.");
     }
     let mainView: ExtensionMainViewDescriptor | undefined;
@@ -183,6 +193,10 @@ export function parseExtensionSurfaceManifest(
       : validateExtensionRecommendations(binding.recommendations).items;
     const routineEvents = binding.routineEvents === undefined ? undefined : parseExtensionRoutineEvents(binding.routineEvents);
     const runtime = binding.runtime === undefined ? undefined : parseExtensionRuntime(binding.runtime, taskView !== undefined);
+    const taskEngines = binding.taskEngines === undefined ? undefined : parseExtensionTaskEngines(binding.taskEngines);
+    if (taskEngines?.some(engine => discoveredEntries.has(engine.entry) || !discoveredFiles.has(engine.entry))) {
+      throw new Error("Task engines must use inspected Node files separate from the package's Pi extensions.");
+    }
     if (runtime && !discoveredFiles.has(runtime.html)) throw new Error("Extension runtime HTML is not an inspected regular package file.");
     if (routineEvents && !discoveredFiles.has(routineEvents.html)) throw new Error("Routine publisher HTML is not an inspected regular package file.");
     result.push({
@@ -193,10 +207,36 @@ export function parseExtensionSurfaceManifest(
       ...(library === undefined ? {} : { library }),
       ...(routineEvents === undefined ? {} : { routineEvents }),
       ...(runtime === undefined ? {} : { runtime }),
+      ...(taskEngines === undefined ? {} : { taskEngines }),
       ...(recommendations === undefined ? {} : { recommendations })
     });
   }
   return result;
+}
+
+export function parseExtensionTaskEngines(value: unknown): readonly ExtensionTaskEngineDescriptor[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 4) {
+    throw new Error("An Extension can declare one to four task engines.");
+  }
+  const engines = value.map(item => {
+    const engine = requirePlainObject(item, "Extension task engine");
+    requireExactKeys(engine, ["id", "name", "description", "protocol", "entry"], ["id", "name", "protocol", "entry"], "Extension task engine");
+    const { id, name, description, protocol } = engine;
+    if (typeof id !== "string" || !/^[a-z][a-z0-9-]{0,31}$/u.test(id) ||
+      typeof name !== "string" || name.trim() !== name || name.length === 0 || name.length > 64 || FORBIDDEN_TEXT.test(name) ||
+      (description !== undefined && (typeof description !== "string" || description.trim() !== description ||
+        description.length === 0 || description.length > 200 || FORBIDDEN_TEXT.test(description))) ||
+      typeof protocol !== "string" || !/^[a-z][a-z0-9._/-]{0,63}$/u.test(protocol)) {
+      throw new Error("Task engine identity or description is invalid.");
+    }
+    const entry = requirePortablePath(engine.entry, "Extension task engine entry");
+    if (!/\.(?:js|mjs|cjs)$/u.test(entry)) throw new Error("Task engines require a packaged JavaScript entry.");
+    return { id, name, protocol, entry, ...(description === undefined ? {} : { description }) };
+  });
+  if (new Set(engines.map(engine => engine.id)).size !== engines.length) {
+    throw new Error("Extension task engine IDs must be unique.");
+  }
+  return engines;
 }
 
 export function parseExtensionRuntime(value: unknown, taskViewAvailable = false): ExtensionRuntimeDescriptor {

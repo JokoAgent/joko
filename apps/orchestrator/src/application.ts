@@ -160,6 +160,7 @@ import { DocumentToolBridgeProvider } from "./document-tool-provider.js";
 import { ChromiumDocumentPdfRenderer } from "./document-pdf-renderer.js";
 import { ElectronDocumentPdfRenderer } from "./document-electron-pdf-renderer.js";
 import { ExtensionCatalogManager } from "./extension-catalog.js";
+import { ExtensionAcpEngines } from "./extension-acp-engines.js";
 import { ExtensionProjectPolicies } from "./extension-project-policy.js";
 import { ExtensionLibraryManager } from "./extension-library-manager.js";
 import { ExtensionMainViewManager } from "./extension-main-view-manager.js";
@@ -1827,6 +1828,7 @@ export async function createOrchestratorApplication(
   let startupCardRuntime: ExtensionCardRuntime | undefined;
   let startupHostedAgents: HostedAgentRuntime | undefined;
   let startupExtensionCards: ExtensionCardsManager | undefined;
+  let startupExtensionAcpEngines: ExtensionAcpEngines | undefined;
   let startupBackendCleanup: Promise<readonly unknown[]> | undefined;
   const cleanupStartupBackendOwners = (): Promise<readonly unknown[]> => {
     if (startupBackendCleanup !== undefined) return startupBackendCleanup;
@@ -1841,6 +1843,7 @@ export async function createOrchestratorApplication(
       await attempt(() => inputHandoffNotifications?.close());
       await attempt(() => nativeInputHandoff?.close());
       await attempt(() => desktopVoiceConversation?.close());
+      await attempt(() => startupExtensionAcpEngines?.close());
       if (startupSessionHost === undefined) {
         await attempt(() => backendInstances.dispose());
       } else {
@@ -3420,6 +3423,14 @@ export async function createOrchestratorApplication(
         message: "Native child workspace isolation is unavailable; its existing leases remain retained.", details: {} });
     });
     await partnerWorkbenches.initialize();
+    const extensionAcpEngines = new ExtensionAcpEngines({
+      store, catalog: extensionCatalog, resources: piResources, registry: backendInstances, host: sessionHost,
+      directories: join(config.dataDirectory, "extension-acp"), supervisor: createDefaultManagedProcessSupervisor(),
+      workspace: config.workspace, readBlob: async blob => (await artifacts.readBlob(blob)).data
+    });
+    startupExtensionAcpEngines = extensionAcpEngines;
+    await extensionAcpEngines.recoverProcesses();
+    await extensionAcpEngines.reconcile();
     await sessionHost.initialize();
     await taskSharingHome.initialize();
     await personalDevelopmentCoordinator.initialize();
@@ -4052,6 +4063,7 @@ export async function createOrchestratorApplication(
         await attempt(() => terminals.dispose());
         await attempt(() => artifactMaintenance.close());
         await attempt(() => historyMaintenance.close());
+        await attempt(() => startupExtensionAcpEngines?.close());
         await attempt(() => sessionHost.dispose());
         await attempt(() => hostedAgentSources?.close());
         await attempt(() => hostedAgents.close());
