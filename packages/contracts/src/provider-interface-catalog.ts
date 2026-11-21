@@ -29,7 +29,7 @@ export interface PublicProviderInterface {
 interface PublicModelRoute {
   readonly providerId: string;
   readonly modelId: string;
-  readonly status: string;
+  readonly status?: string;
   readonly agents: readonly string[];
   readonly nativeApi?: string | null;
   readonly baseDefaults: PublicProviderModelDefaults;
