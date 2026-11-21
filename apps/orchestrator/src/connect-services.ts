@@ -3272,13 +3272,15 @@ export function createConnectServices(application: OrchestratorApplication, proj
       } catch (error) { throw toConnectError(error); }
     },
     readPortableTaskCopy: async function* (request, context) {
+      const authorization = context.requestHeader.get("authorization");
+      if (!authorization) throw new ConnectError("Task copy authorization is required.", Code.Unauthenticated);
       const owner = requiredTaskCopyHost(dependencies);
       const part = request.part === contract.PortableTaskCopyPartKind.SESSION ? "session"
         : request.part === contract.PortableTaskCopyPartKind.WORKSPACE ? "workspace" : undefined;
       if (!part) throw invalidArgument("Choose one task copy part.");
       try {
         for await (const chunk of owner.read({ transferId: request.transferId, operationId: request.operationId,
-          destinationServerId: request.destinationServerId, part, authorization: context.requestHeader.get("authorization"), signal: context.signal })) {
+          destinationServerId: request.destinationServerId, part, authorization, signal: context.signal })) {
           yield chunk;
         }
       } catch (error) { throw toConnectError(error); }
