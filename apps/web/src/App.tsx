@@ -63,7 +63,7 @@ import { activateDetachedInspectorWindow } from "./components/inspector-detach.j
 import { requestWorkspaceDocumentLeave } from "./workspace-document-lifecycle.js";
 import { useNewSessionSubmission, type NewSessionAcceptanceOwner } from "./use-new-session-submission.js";
 import type { FirstInputAcceptance } from "./new-session-flow.js";
-import { currentAppShortcutPlatform, type AppShortcutId, type AppShortcutOverrides } from "./app-shortcuts.js";
+import { comboToElectronAccelerator, currentAppShortcutPlatform, effectiveAppShortcutCombos, type AppShortcutId, type AppShortcutOverrides } from "./app-shortcuts.js";
 import {
   createDesktopApplicationMenuCommandQueue,
   desktopApplicationMenuAccelerators,
@@ -331,6 +331,27 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     : undefined;
   const t = useCallback((key: Parameters<typeof translate>[1], values?: Parameters<typeof translate>[2]) => translate(state.effectiveLocale, key, values), [state.effectiveLocale]);
   const connectionOwner = authenticatedConnectionKey(state);
+  const regionCaptureOwner = useRef(connectionOwner);
+  regionCaptureOwner.current = connectionOwner;
+  const [regionAttachment, setRegionAttachment] = useState<{ readonly id: string; readonly file: File; readonly owner: string }>();
+  useEffect(() => {
+    const capture = window.jokoDesktop?.regionCapture;
+    if (!capture || auxiliaryApplicationWindow) return;
+    return capture.onAttachment(({ id, owner, name, bytes }) => {
+      if (regionCaptureOwner.current !== owner) return;
+      setRegionAttachment({ id, owner, file: new File([new Uint8Array(bytes)], name, { type: "image/png" }) });
+      const route = controller.state.route;
+      if (route.kind !== "newSession" || route.contactsDraft !== undefined) {
+        controller.navigate({ kind: "newSession" }, { isCurrent: () => regionCaptureOwner.current === owner });
+      }
+    });
+  }, [auxiliaryApplicationWindow, controller.state.route, controller.navigate]);
+  useEffect(() => {
+    if (regionAttachment !== undefined && regionAttachment.owner !== connectionOwner) setRegionAttachment(undefined);
+    if (regionAttachment === undefined) return;
+    const timeout = window.setTimeout(() => setRegionAttachment(value => value === regionAttachment ? undefined : value), 30_000);
+    return () => window.clearTimeout(timeout);
+  }, [connectionOwner, regionAttachment]);
   const [renameRequest, setRenameRequest] = useState<{ readonly session: SessionView; readonly owner: string }>();
   const renameSession = renameRequest?.owner === connectionOwner ? renameRequest?.session : undefined;
   const requestRename = (session: SessionView): void => {
@@ -1660,6 +1681,14 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   };
   applicationMenuCommandQueue.sync(applicationMenuPreferences);
   const applicationMenuAccelerators = desktopApplicationMenuAccelerators(shortcutOverrides);
+  const regionCapturePlatform = currentAppShortcutPlatform();
+  const regionCaptureCombo = effectiveAppShortcutCombos("capture-region", shortcutOverrides, regionCapturePlatform)[0];
+  const regionCaptureAccelerator = regionCaptureCombo === undefined ? null : comboToElectronAccelerator(regionCaptureCombo, regionCapturePlatform);
+  useEffect(() => {
+    const capture = window.jokoDesktop?.regionCapture;
+    if (!capture || !state.ready || auxiliaryApplicationWindow) return;
+    void capture.configure(connectionOwner ?? null, regionCaptureAccelerator).catch(() => undefined);
+  }, [state.ready, auxiliaryApplicationWindow, connectionOwner, regionCaptureAccelerator]);
 
   // Subscribe before the initial full accelerator sync. Main holds menu
   // commands behind that sync, so no cold-start click can outrun this listener.
@@ -2800,6 +2829,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             contactsDraft={state.route.contactsDraft}
             projectPickerRequest={projectPickerRequest}
             onProjectPickerRequestConsumed={(requestId) => setProjectPickerRequest((current) => current?.requestId === requestId ? undefined : current)}
+            regionCaptureAttachment={regionAttachment !== undefined && regionAttachment.owner === connectionOwner ? regionAttachment : undefined}
+            onRegionCaptureConsumed={(id) => setRegionAttachment(value => value?.id === id ? undefined : value)}
             navigationOpen={navigationOpen}
             t={t}
             onOpenNavigation={() => setWindowNavigationOpen(true)}

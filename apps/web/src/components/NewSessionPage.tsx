@@ -161,6 +161,8 @@ interface NewSessionPageProps {
   readonly contactsDraft?: ContactsDraftOwner;
   readonly projectPickerRequest?: NewSessionProjectPickerRequest;
   readonly onProjectPickerRequestConsumed?: (requestId: number) => void;
+  readonly regionCaptureAttachment?: { readonly id: string; readonly file: File };
+  readonly onRegionCaptureConsumed?: (id: string) => void;
   readonly navigationOpen: boolean;
   readonly t: Translator;
   readonly onOpenNavigation: () => void;
@@ -202,7 +204,7 @@ interface NewTaskInlineMentionActivation extends ComposerInlineMentionActivation
 }
 
 /** Delayed-create route rendered within Joko's visual language. */
-export function NewSessionPage({ controller, snapshot, initialTargetId, initialDialogueBackendId, recommendationNonce, initialModel, contactsDraft, projectPickerRequest, onProjectPickerRequestConsumed, navigationOpen, t, onOpenNavigation, onClose, onSubmit }: NewSessionPageProps): JSX.Element {
+export function NewSessionPage({ controller, snapshot, initialTargetId, initialDialogueBackendId, recommendationNonce, initialModel, contactsDraft, projectPickerRequest, onProjectPickerRequestConsumed, regionCaptureAttachment, onRegionCaptureConsumed, navigationOpen, t, onOpenNavigation, onClose, onSubmit }: NewSessionPageProps): JSX.Element {
   const contactsOwnerCurrent = contactsDraft === undefined || contactsDraftOwnerMatches(contactsDraft, controller.state.activeProfile);
   const projectTargets = contactsDraft === undefined ? snapshot.targets.filter((target) => !target.archived) : [];
   const activeTargets = newSessionTargets(projectTargets, snapshot.settings.backendSettings).filter((target) => {
@@ -2058,6 +2060,14 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     images: attachmentPolicy.images,
     files: attachmentPolicy.files
   });
+  const consumedRegionCapture = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!hydrated || submitting || voice.active || contactsDraft !== undefined || controller.state.connectionState !== "connected"
+      || regionCaptureAttachment === undefined || consumedRegionCapture.current === regionCaptureAttachment.id) return;
+    consumedRegionCapture.current = regionCaptureAttachment.id;
+    addFiles([regionCaptureAttachment.file]);
+    onRegionCaptureConsumed?.(regionCaptureAttachment.id);
+  }, [regionCaptureAttachment, hydrated, submitting, voice.active, contactsDraft, controller.state.connectionState]);
   const openAttachmentPicker = (
     requirement: ComposerAttachmentPickerRequirement = "either",
     requireConnection = false

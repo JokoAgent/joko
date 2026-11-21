@@ -382,6 +382,7 @@ const desktopCapabilities = Object.freeze([
   "remote.desktopHost",
   ...(mainDocumentOccurrence === undefined ? [] : ["remote.desktopViewer"]),
   ...(mainDocumentOccurrence === undefined ? [] : ["native.localAgents"]),
+  ...(mainDocumentOccurrence !== undefined && (process.platform === "darwin" || process.platform === "win32") ? ["region.capture" as const] : []),
   "session.windows",
   "extension.windows",
   "extension.libraryLocationPicker",
@@ -396,6 +397,21 @@ const startupTheme = process.platform === "win32" && (themeArgument === "light" 
   ? themeArgument : undefined;
 
 const desktopApi = Object.freeze({
+  ...(mainDocumentOccurrence !== undefined && (process.platform === "darwin" || process.platform === "win32") ? { regionCapture: Object.freeze({
+    configure: (owner: string | null, accelerator: string | null): Promise<boolean> =>
+      ipcRenderer.invoke("joko:region-capture:configure", mainDocumentOccurrence, owner, accelerator).then(parseDesktopBoolean),
+    start: (): Promise<void> => ipcRenderer.invoke("joko:region-capture:start", mainDocumentOccurrence).then(() => undefined),
+    onAttachment: (listener: (attachment: { id: string; owner: string; name: string; bytes: Uint8Array }) => void): (() => void) => {
+      const receive = (_event: unknown, value: unknown): void => {
+        if (!exactRecord(value, ["documentOccurrence", "owner", "id", "name", "bytes"]) || value["documentOccurrence"] !== mainDocumentOccurrence
+          || typeof value["owner"] !== "string" || typeof value["id"] !== "string" || typeof value["name"] !== "string"
+          || !(value["bytes"] instanceof Uint8Array) || value["bytes"].byteLength < 33 || value["bytes"].byteLength > 24 * 1024 * 1024) return;
+        listener({ id: value["id"], owner: value["owner"], name: value["name"], bytes: value["bytes"] });
+      };
+      ipcRenderer.on("joko:region-capture:attachment", receive);
+      return () => { ipcRenderer.removeListener("joko:region-capture:attachment", receive); };
+    }
+  }) } : {}),
   ...(mainDocumentOccurrence === undefined ? {} : { localAgents: Object.freeze({
     list: (): Promise<{ readonly origin: string; readonly applications: ListDesktopLocalAgentsResponse }> =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.localAgentsList, mainDocumentOccurrence),

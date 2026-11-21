@@ -264,6 +264,7 @@ import {
 } from "./window-close-settings.js";
 import { DesktopWallpaperStore } from "./wallpaper-store.js";
 import { registerDesktopLoginItemIpc } from "./login-item.js";
+import { DesktopRegionCapture, type RegionCaptureNode } from "./region-capture.js";
 import { DesktopMenuBar, createMenuBarSettingsStore, registerMenuBarIpc } from "./menu-bar.js";
 import { verifyMenuBarHelper } from "./menu-bar-native-host.js";
 import { DesktopLocalAgentService, isMenubarSupportedPlatform } from "@joko/contracts";
@@ -1056,6 +1057,10 @@ let nativeWorkspaceFileSource: NativeWorkspaceFileSource | undefined;
 let nativeWorkspaceDirectoryDownload: NativeWorkspaceDirectoryDownload | undefined;
 let windowsOpenWithApps: WindowsOpenWithApps | undefined;
 const nativeFileActionScopes = new WeakMap<WebContents, NativeFileActionScope>();
+let desktopRegionCapture: DesktopRegionCapture | undefined;
+let desktopRegionCaptureOwner: RegionCaptureNode | undefined;
+let registeredRegionCaptureShortcut: string | undefined;
+let selectedRegionCaptureShortcut: string | null | undefined;
 const portableSessionSave = new PortableSessionSave();
 type DesktopOpenWithDocumentOwnerForWindow = DesktopOpenWithDocumentOwner<WebContents>;
 const desktopOpenWithDocuments = new DesktopOpenWithDocumentAuthority<WebContents>(
@@ -1224,6 +1229,8 @@ if (!app.requestSingleInstanceLock()) {
     nativeWorkspaceFileSource?.dispose();
     globalVoiceShortcutRecovery.dispose();
     unregisterGlobalVoiceShortcut();
+    unregisterRegionCaptureShortcut();
+    desktopRegionCapture?.dispose();
     stopGlobalVoiceShortcutCapture();
     const globalVoiceRecording = globalVoiceInputLease.snapshot();
     if (globalVoiceRecording.state !== "idle") {
@@ -1309,6 +1316,9 @@ if (!app.requestSingleInstanceLock()) {
     await desktopRemoteDesktopSettings.initialize();
     await desktopRemoteDesktopViewerPreferences.initialize();
     registerIpc();
+    if (process.platform === "darwin" || process.platform === "win32") {
+      initializeRegionCapture();
+    }
     installMicrophoneLifecycle();
     installProviderModelPowerLifecycle();
     preferredSystemLocale = readDesktopPreferredSystemLocale(app);
@@ -6843,6 +6853,7 @@ function retireMainWindowDocument(window: BrowserWindow, contents: WebContents, 
   const retired = mainWindowDocuments.retire(contents);
   recordPackagedSmokeNativeCleanup("main_document_authority_retire_completed");
   if (retired !== undefined) {
+    if (desktopRegionCaptureOwner?.documentOccurrence === retired.occurrence) desktopRegionCaptureOwner = undefined;
     desktopCodeHostLogin.retire(retired.occurrence);
     recordPackagedSmokeNativeCleanup("main_document_notifications_retire_started");
     desktopNotifications.retireOwner(retired.endpoint, retired.occurrence);
@@ -7307,6 +7318,7 @@ function releaseApplicationMenuShortcutRecording(ownerId: number): void {
   if (transition.wasActive === transition.active) return;
   const result = applicationMenuConfigurationState.apply({ shortcutRecording: transition.active });
   if (result.menuChanged) installDesktopApplicationMenu();
+  configureRegionCaptureShortcut();
   if (!transition.active) {
     void restoreGlobalVoiceShortcutAfterSuspension(GLOBAL_VOICE_APPLICATION_SHORTCUT_RECORDING_SUSPENSION);
     void globalVoiceShortcutRecovery.request();
@@ -8737,7 +8749,68 @@ function bindDesktopPageSearchResults(contents: WebContents): Map<number, number
   return tokens;
 }
 
+function initializeRegionCapture(): void {
+  desktopRegionCapture = new DesktopRegionCapture({
+    entryUrl: () => new URL("./region-capture.html", navigationPolicy.developmentUrl ?? DESKTOP_APP_ENTRY_URL).href,
+    preload: join(sourceDirectory, "region-capture-preload.cjs"),
+    locale: () => applicationMenuLocale,
+    dark: () => nativeTheme.shouldUseDarkColors,
+    node: () => currentMainWindowDocumentOccurrence() === desktopRegionCaptureOwner?.documentOccurrence ? desktopRegionCaptureOwner : undefined,
+    deliver: (owner, file) => {
+      const window = mainWindow;
+      if (window === undefined || window.isDestroyed() || quitting || currentMainWindowDocumentOccurrence() !== owner.documentOccurrence
+        || desktopRegionCaptureOwner?.owner !== owner.owner || trustedApplicationWindowForContents(window.webContents) !== window) return false;
+      window.webContents.send("joko:region-capture:attachment", { ...file, ...owner });
+      showWindowFromTray(window);
+      return true;
+    }
+  });
+  desktopRegionCapture.register(ipcMain);
+  configureRegionCaptureShortcut();
+}
+
+function unregisterRegionCaptureShortcut(): void {
+  if (registeredRegionCaptureShortcut !== undefined) globalShortcut.unregister(registeredRegionCaptureShortcut);
+  registeredRegionCaptureShortcut = undefined;
+}
+
+function configureRegionCaptureShortcut(): boolean {
+  const accelerator = selectedRegionCaptureShortcut === undefined
+    ? process.platform === "darwin" ? "Control+Shift+A" : "Alt+Shift+A" : selectedRegionCaptureShortcut;
+  if (desktopRegionCapture === undefined || accelerator === null || applicationMenuConfigurationState.snapshot().configuration.shortcutRecording
+    || packagedSmoke || externalPackagedE2e || quitting) {
+    unregisterRegionCaptureShortcut();
+    return accelerator === null;
+  }
+  if (accelerator === registeredRegionCaptureShortcut) return true;
+  unregisterRegionCaptureShortcut();
+  try {
+    if (!globalShortcut.register(accelerator, () => { void desktopRegionCapture?.begin().catch(() => undefined); })) return false;
+    registeredRegionCaptureShortcut = accelerator;
+    return true;
+  } catch { return false; }
+}
+
 function registerIpc(): void {
+  ipcMain.handle("joko:region-capture:configure", (event, occurrence: unknown, owner: unknown, accelerator: unknown) => {
+    if (typeof occurrence !== "string" || desktopRegionCapture === undefined
+      || captureMainApplicationDocumentOccurrenceForSender(event, occurrence) === undefined
+      || !(owner === null || typeof owner === "string" && owner.length >= 1 && owner.length <= 4096)
+      || !(accelerator === null || typeof accelerator === "string" && accelerator.length <= 96
+        && /^(?:(?:Ctrl|Control|Alt|Command|CommandOrControl|Super|Meta|Shift)\+){1,4}[\x20-\x7e]+$/u.test(accelerator))) {
+      throw new Error("Screen capture configuration requires its current primary application window.");
+    }
+    desktopRegionCaptureOwner = owner === null ? undefined : { documentOccurrence: occurrence, owner };
+    selectedRegionCaptureShortcut = accelerator;
+    return configureRegionCaptureShortcut();
+  });
+  ipcMain.handle("joko:region-capture:start", async (event, occurrence: unknown) => {
+    if (typeof occurrence !== "string" || desktopRegionCapture === undefined || quitting
+      || captureMainApplicationDocumentOccurrenceForSender(event, occurrence) === undefined) {
+      throw new Error("Screen capture requires its current primary application window.");
+    }
+    await desktopRegionCapture.begin();
+  });
   desktopLinkspan.register();
   desktopMcpApps.register();
   desktopExtensionOAuth.register();
@@ -8923,6 +8996,7 @@ function registerIpc(): void {
       ? patch
       : { ...patch, shortcutRecording: recordingTransition.active }, renderer);
     if (result.menuChanged) installDesktopApplicationMenu();
+    if (recordingTransition !== undefined) configureRegionCaptureShortcut();
     for (const command of result.commands) dispatchApplicationMenuCommand(command);
     if (recordingTransition !== undefined && !recordingTransition.wasActive && recordingTransition.active) {
       await globalVoiceShortcutBinding.suspend(GLOBAL_VOICE_APPLICATION_SHORTCUT_RECORDING_SUSPENSION);

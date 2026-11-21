@@ -302,6 +302,7 @@ type JokoDesktopCapability =
   | "remote.desktopViewer"
   | "selection.quote.contextMenu"
   | "session.windows"
+  | "region.capture"
   | "voice.globalDictation"
   | "window.activationClick"
   | "window.mainCloseBehavior";
@@ -534,6 +535,11 @@ interface JokoDesktopApi {
   /** OS-preferred locale captured by the trusted Desktop preload for this app start. */
   readonly preferredSystemLocale: "en" | "zh-CN";
   readonly capabilities: readonly JokoDesktopCapability[];
+  readonly regionCapture?: {
+    configure(owner: string | null, accelerator: string | null): Promise<boolean>;
+    start(): Promise<void>;
+    onAttachment(listener: (attachment: { id: string; owner: string; name: string; bytes: Uint8Array }) => void): () => void;
+  };
   readonly wallpaper?: {
     get(): Promise<JokoDesktopWallpaperSettings>;
     set(change: JokoDesktopWallpaperSettingsChange): Promise<JokoDesktopWallpaperSettings>;
