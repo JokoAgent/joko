@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createDefaultManagedProcessSupervisor } from "@joko/runtime-governance";
+import { createDefaultManagedProcessSupervisor } from "@joko/adapter-pi";
 import { OperationalStore } from "@joko/store";
 import { expect, it, vi } from "vitest";
 import type { ExtensionMainViewAuthority } from "../extension-main-view-manager.js";
