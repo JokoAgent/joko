@@ -14,6 +14,7 @@ import {
   type ExtensionRuntimeDescriptor,
   type ExtensionMainViewDescriptor,
   type ExtensionTaskViewDescriptor,
+  type ExtensionTaskEngineDescriptor,
   type ExtensionSettingsDescriptor,
   type ExtensionRecommendationDescriptor
 } from "./extension-surface-manifest.js";
@@ -89,6 +90,7 @@ export interface PiPackageResourceDetail {
   readonly library?: ExtensionLibraryDescriptor;
   readonly routineEvents?: ExtensionRoutineEventsDescriptor;
   readonly runtime?: ExtensionRuntimeDescriptor;
+  readonly taskEngines?: readonly ExtensionTaskEngineDescriptor[];
   readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
   readonly compatibility: PiPackageCompatibility;
   readonly compatibilityIssues: readonly PiPackageCompatibilityIssue[];
@@ -140,6 +142,7 @@ export interface PiPackageCatalogInspection {
     readonly library?: ExtensionLibraryDescriptor;
     readonly routineEvents?: ExtensionRoutineEventsDescriptor;
   readonly runtime?: ExtensionRuntimeDescriptor;
+      readonly taskEngines?: readonly ExtensionTaskEngineDescriptor[];
     readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
   }[];
 }
@@ -462,6 +465,7 @@ export async function inspectPiPackageCatalog(packagePath: string): Promise<PiPa
       ...(surface?.library === undefined ? {} : { library: surface.library }),
       ...(surface?.routineEvents === undefined ? {} : { routineEvents: surface.routineEvents }),
       ...(surface?.runtime === undefined ? {} : { runtime: structuredClone(surface.runtime) }),
+      ...(surface?.taskEngines === undefined ? {} : { taskEngines: structuredClone(surface.taskEngines) }),
       ...(surface?.recommendations === undefined ? {} : { recommendations: copyRecommendations(surface.recommendations) })
     };
   });
@@ -587,7 +591,8 @@ async function extensionDetail(
     readonly settings?: ExtensionSettingsDescriptor;
     readonly library?: ExtensionLibraryDescriptor;
     readonly routineEvents?: ExtensionRoutineEventsDescriptor;
-  readonly runtime?: ExtensionRuntimeDescriptor;
+    readonly runtime?: ExtensionRuntimeDescriptor;
+    readonly taskEngines?: readonly ExtensionTaskEngineDescriptor[];
     readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
   }
 ): Promise<PiPackageResourceDetail> {
@@ -603,6 +608,7 @@ async function extensionDetail(
       ...(surface?.library === undefined ? {} : { library: surface.library }),
       ...(surface?.routineEvents === undefined ? {} : { routineEvents: surface.routineEvents }),
       ...(surface?.runtime === undefined ? {} : { runtime: structuredClone(surface.runtime) }),
+      ...(surface?.taskEngines === undefined ? {} : { taskEngines: structuredClone(surface.taskEngines) }),
       ...(surface?.recommendations === undefined ? {} : { recommendations: copyRecommendations(surface.recommendations) }),
       compatibility: analysis.compatibility,
       compatibilityIssues: analysis.compatibilityIssues,
@@ -620,6 +626,7 @@ async function extensionDetail(
       ...(surface?.library === undefined ? {} : { library: surface.library }),
       ...(surface?.routineEvents === undefined ? {} : { routineEvents: surface.routineEvents }),
       ...(surface?.runtime === undefined ? {} : { runtime: structuredClone(surface.runtime) }),
+      ...(surface?.taskEngines === undefined ? {} : { taskEngines: structuredClone(surface.taskEngines) }),
       ...(surface?.recommendations === undefined ? {} : { recommendations: copyRecommendations(surface.recommendations) })
     };
   }

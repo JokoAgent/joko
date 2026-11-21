@@ -4,7 +4,7 @@ import type { RuntimeCommand, RuntimeToolDescriptor } from "@joko/core";
 import type { OperationalStore } from "@joko/store";
 
 import type { CredentialKind, CredentialManager } from "./credential-manager.js";
-import type { ExtensionRuntimeDescriptor, ExtensionRoutineEventsDescriptor, ExtensionMainViewDescriptor, ExtensionTaskViewDescriptor, ExtensionSettingsDescriptor, ExtensionRecommendationDescriptor } from "./extension-surface-manifest.js";
+import type { ExtensionRuntimeDescriptor, ExtensionRoutineEventsDescriptor, ExtensionMainViewDescriptor, ExtensionTaskViewDescriptor, ExtensionSettingsDescriptor, ExtensionRecommendationDescriptor, ExtensionTaskEngineDescriptor } from "./extension-surface-manifest.js";
 import type { ExtensionSourceDescriptor } from "./extension-source-manager.js";
 import type { McpServerDescriptor, McpServerInput } from "./mcp-router.js";
 import type { PiResourceDescriptor } from "./resource-manager.js";
@@ -131,6 +131,14 @@ export type ExtensionOwnerBinding =
       readonly contentRevision: string;
     };
 
+export interface ApprovedExtensionTaskEngine {
+  readonly extensionId: string;
+  readonly extensionEntry: string;
+  readonly binding: Extract<ExtensionOwnerBinding, { kind: "resource" }>;
+  readonly engine: ExtensionTaskEngineDescriptor;
+  readonly assertCurrent: () => void;
+}
+
 interface SetupRequirement {
   readonly id: string;
   readonly label: string;
@@ -169,6 +177,7 @@ interface ExtensionDefinition {
   readonly library?: { readonly schemaVersion: 1; readonly extensionEntry: string };
   readonly routineEvents?: ExtensionRoutineEventsDescriptor & { readonly extensionEntry: string };
   readonly runtime?: ExtensionRuntimeDescriptor & { readonly extensionEntry: string };
+  readonly taskEngines?: readonly ExtensionTaskEngineDescriptor[];
   readonly sidebarSupported: boolean;
   readonly tools: readonly ExtensionToolDescriptor[];
   readonly permissions: readonly Omit<ExtensionPermissionDescriptor, "granted">[];
@@ -378,6 +387,37 @@ export class ExtensionCatalogManager {
 
   binding(extensionId: string): ExtensionOwnerBinding {
     return this.#requireDefinition(extensionId).binding;
+  }
+
+  approvedTaskEngines(): readonly ApprovedExtensionTaskEngine[] {
+    this.#assertInitialized();
+    const result: ApprovedExtensionTaskEngine[] = [];
+    for (const definition of this.#definitions.values()) {
+      const record = this.#records.get(definition.id);
+      const authorization = record?.authorization;
+      if (!definition.enabled || !definition.installed || definition.binding.kind !== "resource" ||
+        definition.runtimeEntryPath === undefined || authorization === undefined ||
+        !validAuthorization(definition, authorization, this.#credentials)) continue;
+      for (const engine of definition.taskEngines ?? []) {
+        const permission = taskEnginePermissionId(engine.id);
+        if (engine.protocol !== "acp" || authorization.values[permission] !== true) continue;
+        result.push({
+          extensionId: definition.id,
+          extensionEntry: definition.runtimeEntryPath,
+          binding: definition.binding,
+          engine: { ...engine },
+          assertCurrent: () => {
+            const current = this.#requireDefinition(definition.id);
+            const approved = this.#requireRecord(definition.id).authorization;
+            if (!current.enabled || !current.installed || current.authorityIdentity !== definition.authorityIdentity ||
+              approved !== authorization || !validAuthorization(current, approved, this.#credentials)) {
+              throw new Error("The task engine approval changed.");
+            }
+          }
+        });
+      }
+    }
+    return result;
   }
 
   setSidebarVisible(extensionId: string, visible: boolean, expectedRevision: bigint): ExtensionCatalogDescriptor {
@@ -719,7 +759,10 @@ export class ExtensionCatalogManager {
       tools,
       permissions: definition.permissions.map((permission) => ({
         ...permission,
-        granted: setup.state === "ready" || setup.state === "not_required"
+        granted: permission.id.startsWith("task-engine:")
+          ? definition.enabled && validAuthorization(definition, record.authorization, this.#credentials)
+            && record.authorization?.values[permission.id] === true
+          : setup.state === "ready" || setup.state === "not_required"
       })),
       commands,
       recommendations: copyRecommendations(definition.recommendations),
@@ -816,6 +859,20 @@ function runtimePermissions(runtime: ExtensionRuntimeDescriptor | undefined): re
     ...(runtime.tasks?.hidden ? [{ id: "runtime-hidden-tasks", label: "Background tasks", description: "May hide its own tasks from normal lists, search and notifications. You can open or reveal them in plugin details.", required: true }] : []),
     ...(runtime.text?.oneshot ? [{ id: "runtime-text", label: "Text inference", description: "Runs bounded one-shot text requests using your plugin model or auxiliary models.", required: true }] : [])
   ];
+}
+
+function taskEnginePermissionId(engineId: string): string {
+  return `task-engine:${engineId}`;
+}
+
+function taskEngineSetup(engines: readonly ExtensionTaskEngineDescriptor[]): readonly SetupRequirement[] {
+  return engines.filter(engine => engine.protocol === "acp").map(engine => ({
+    id: taskEnginePermissionId(engine.id),
+    label: `Run ${engine.name}`,
+    description: "Runs this plugin's packaged ACP engine on the service computer under its operating-system account.",
+    kind: "confirmation",
+    required: false
+  }));
 }
 
 function runtimeSetup(extensionId: string, runtime: ExtensionRuntimeDescriptor | undefined): readonly SetupRequirement[] {
@@ -954,12 +1011,15 @@ function projectDefinitions(
           : resource.state === "error"
             ? "error"
             : installed ? "installed" : "available";
+      const taskEngines = resource.kind === "package" ? detail.taskEngines ?? [] : [];
+      const engineSetup = taskEngineSetup(taskEngines);
       const permissions = [...detail.detectedApis.map((api) => ({
         id: `runtime-api:${api}`,
         label: api,
         description: `Uses the ${api} runtime extension capability.`,
         required: true
-      })), ...runtimePermissions(detail.runtime)];
+      })), ...runtimePermissions(detail.runtime),
+        ...engineSetup.map(({ id, label, description, required }) => ({ id, label, description, required }))];
       const authorityIdentity = digest({
         bindingKey,
         discoveredRevision: resource.discoveredRevision,
@@ -995,11 +1055,12 @@ function projectDefinitions(
         }),
         ...(detail.routineEvents === undefined || detail.entryPath === undefined ? {} : { routineEvents: { ...detail.routineEvents, extensionEntry: detail.entryPath } }),
         ...(detail.runtime === undefined || detail.entryPath === undefined ? {} : { runtime: { ...structuredClone(detail.runtime), extensionEntry: detail.entryPath } }),
+        ...(taskEngines.length === 0 ? {} : { taskEngines: structuredClone(taskEngines) }),
         sidebarSupported: detail.mainView !== undefined,
         tools: (detail.runtime?.tools ?? []).map(tool => ({ name: tool.name, description: tool.description, requiresPermission: !tool.readOnly || detail.runtime?.network !== undefined })),
         permissions,
         recommendations: copyRecommendations(detail.recommendations ?? []),
-        setupRequirements: runtimeSetup(id, detail.runtime),
+        setupRequirements: [...runtimeSetup(id, detail.runtime), ...engineSetup],
         authorityIdentity,
         projectionIdentity: digest({
           authorityIdentity,
