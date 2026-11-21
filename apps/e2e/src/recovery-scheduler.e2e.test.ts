@@ -1,8 +1,14 @@
 import { randomUUID } from "node:crypto";
 
+import { create, clone } from "@bufbuild/protobuf";
+import { Code } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
-import { OperationState, QueueDispatchState, QueueItemState, RunState, ScheduleSessionMode, ScheduleState, type QueueControl } from "@joko/contracts";
+import {
+  OperationMutationSchema, OperationState, QueueDispatchState, QueueItemState, RunState, ScheduleInputSchema,
+  ScheduleRunOutcome, ScheduleSessionMode, ScheduleState, schedulePullRequestRuleToProto, type QueueControl
+} from "@joko/contracts";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
+import { SCHEDULE_PULL_REQUEST_WATCH_SETTING_KEY } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
@@ -27,6 +33,107 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
   afterEach(async () => {
     await fixture?.close({ removeRoot: true });
     fixture = undefined;
+  });
+
+  it("wakes only the authorized bound task for a changed pull request, coalesces busy events, and cancels a pending wake", { timeout: 45_000 }, async () => {
+    let clock = Date.now() - 10 * 60_000;
+    let checks = ["check:in_progress:"];
+    const reads: { owner: string; url: string; authorized: boolean }[] = [];
+    fixture = await OrchestratorE2eFixture.start({ scheduler: {
+      now: () => clock,
+      heartbeatLeaseMs: 20 * 60_000,
+      pullRequestProviders: authority => [{
+        capability: "code-host.pull-request",
+        minimumTimeToLiveMs: 5_000,
+        supports: reference => reference.host === "github.com",
+        getPullRequest: async (reference, options) => {
+          const authorized = authority.authorize(options.sessionOwnerId, reference);
+          reads.push({ owner: options.sessionOwnerId, url: reference.webUrl,
+            authorized: authorized !== undefined && options.purpose === "follow" && authority.isCurrent(authorized, reference) });
+          return { state: "open", draft: false, title: "Follow checks", headBranch: "feature",
+            observedAt: clock, activity: { headSha: "a".repeat(40), checks } };
+        }
+      }]
+    } });
+    const { clients, connectionId } = await fixture.pair("Pull request automation owner");
+    const { store } = fixture.application;
+    const backendId = fixture.adapter().id;
+    const targetId = fixture.targetId();
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId,
+      createSessionMutation({ backendId, targetId, displayName: "Bound follow task" })));
+    const unrelatedId = sessionIdFrom(await submit(clients.operation, connectionId,
+      createSessionMutation({ backendId, targetId, displayName: "Unrelated task" })));
+    const rawUrl = "https://github.com/JokoAgent/Joko/pull/17/";
+    const url = "https://github.com/jokoagent/joko/pull/17";
+    const request = createManualScheduleMutation({ backendId, targetId, sessionId,
+      sessionMode: ScheduleSessionMode.BOUND, text: "Inspect the changed checks.", execution: {
+        followPullRequest: schedulePullRequestRuleToProto({ url: rawUrl, change: "checks" })
+      } });
+    if (request.payload.case !== "createSchedule" || request.payload.value.schedule === undefined) throw new Error("Missing Automation input.");
+    const original = request.payload.value.schedule;
+    const invalid = clone(ScheduleInputSchema, original);
+    invalid.sessionId = "";
+    invalid.sessionMode = ScheduleSessionMode.FRESH;
+    await expect(submit(clients.operation, connectionId, create(OperationMutationSchema, {
+      payload: { case: "createSchedule", value: { schedule: invalid } }
+    }))).rejects.toMatchObject({ code: Code.InvalidArgument });
+    const scheduleId = scheduleIdFrom(await submit(clients.operation, connectionId, request));
+    const history = async () => (await clients.scheduler.listScheduleRunHistory({ scheduleId })).history;
+    const clockTick = async (ms: number, expectedReads: number) => {
+      clock += ms;
+      await expect.poll(() => reads.length, { timeout: 8_000 }).toBe(expectedReads);
+    };
+    await clockTick(5_001, 1);
+    expect(reads[0]).toEqual({ owner: scheduleId, url, authorized: true });
+    expect(await history()).toHaveLength(0);
+    await clockTick(5_001, 2);
+    expect(await history()).toHaveLength(0);
+
+    checks = ["check:completed:failure"];
+    await clockTick(5_001, 3);
+    await expect.poll(async () => (await history()).map(run => run.outcome)).toEqual([ScheduleRunOutcome.SUCCEEDED]);
+    const first = (await history())[0]!;
+    expect(first).toMatchObject({ sessionId, pullRequestUrl: url });
+    const queueControl = async () => requiredQueueControl(await clients.queue.getQueueControl({ sessionId }));
+    await submit(clients.operation, connectionId, pauseQueueMutation(await queueControl()));
+    await submit(clients.operation, connectionId, sendInputMutation(sessionId,
+      BigInt(store.getSession(sessionId).descriptor.binding.generation), "Keep this task busy"));
+    checks = ["check:queued:"];
+    await clockTick(5_001, 4);
+    checks = ["check:completed:success"];
+    await clockTick(5_001, 5);
+    expect(await history()).toHaveLength(1);
+    expect(fixture.adapter().sendCalls.map(input => input.text)).toEqual(["Inspect the changed checks."]);
+    await submit(clients.operation, connectionId, resumeQueueMutation(await queueControl()));
+    await expect.poll(() => store.listRuns({ sessionId, activeOnly: true }).length).toBe(0);
+    await clockTick(5_001, 6);
+    expect(await history()).toHaveLength(1);
+    await clockTick(60_001, 7);
+    await expect.poll(async () => (await history()).map(run => run.outcome))
+      .toEqual([ScheduleRunOutcome.SUCCEEDED, ScheduleRunOutcome.SUCCEEDED]);
+    expect((await history()).map(run => run.sessionId)).toEqual([sessionId, sessionId]);
+    expect(store.listRuns({ sessionId: unrelatedId })).toHaveLength(0);
+
+    const legacy = clone(ScheduleInputSchema, original);
+    legacy.execution!.followPullRequest = undefined;
+    const update = (schedule: typeof legacy) => submit(clients.operation, connectionId, create(OperationMutationSchema, {
+      payload: { case: "updateSchedule", value: { scheduleId, schedule } }
+    }));
+    expect((await update(legacy)).state).toBe(OperationState.SUCCEEDED);
+    expect((await clients.scheduler.getSchedule({ scheduleId })).schedule?.execution?.followPullRequest?.url).toBe(url);
+    checks = ["check:completed:failure"];
+    await clockTick(5_001, 8);
+    expect(await history()).toHaveLength(2);
+    const watchState = () => store.findSetting<{ pending?: { url: string } }>("service", scheduleId, SCHEDULE_PULL_REQUEST_WATCH_SETTING_KEY);
+    await expect.poll(() => watchState()?.value.pending?.url).toBe(url);
+    legacy.execution!.followPullRequest = schedulePullRequestRuleToProto(null);
+    expect((await update(legacy)).state).toBe(OperationState.SUCCEEDED);
+    expect((await clients.scheduler.getSchedule({ scheduleId })).schedule?.execution?.followPullRequest).toBeUndefined();
+    expect(watchState()).toBeUndefined();
+    clock += 60_001;
+    await fixture.application.scheduler.tick();
+    expect(await history()).toHaveLength(2);
+    expect(reads.every(read => read.authorized)).toBe(true);
   });
 
   it("fences an in-flight dispatch as dispatch_unknown after server/store restart without replay", async () => {

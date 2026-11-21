@@ -66,6 +66,35 @@ describe("public code-host Provider conformance", () => {
     expect(String(fetch.mock.calls[0]?.[0])).toBe("https://api.github.com/repos/acme/widgets/pulls/42");
   });
 
+  it("reads complete check facts from the canonical PR head without credentials", async () => {
+    const headSha = "a".repeat(40);
+    const fetch = vi.fn<typeof globalThis.fetch>(async (input, init) => {
+      const url = new URL(String(input));
+      expect(url.origin).toBe("https://api.github.com");
+      expect(new Headers(init?.headers).has("authorization")).toBe(false);
+      expect(init?.redirect).toBe("error");
+      if (url.pathname.endsWith("/check-runs")) return jsonResponse({
+        total_count: 1, check_runs: [{ status: "completed", conclusion: "failure" }]
+      });
+      if (url.pathname.endsWith("/status")) return jsonResponse({
+        total_count: 1, statuses: [{ state: "pending" }]
+      });
+      return jsonResponse({ state: "open", draft: false, merged: false, merged_at: null, title: "New checks",
+        head: { ref: "feature/checks", sha: headSha }, comments: 3, review_comments: 2, mergeable_state: "blocked" });
+    });
+    const provider = new PublicCodeHostProvider({ fetch });
+    await expect(provider.getPullRequest(reference, {
+      signal: new AbortController().signal, sessionOwnerId: "schedule-a", purpose: "follow"
+    })).resolves.toMatchObject({
+      activity: { headSha, checks: ["check:completed:failure", "status:pending"], commentCount: 3, reviewCommentCount: 2, mergeState: "blocked" }
+    });
+    expect(fetch.mock.calls.map(([input]) => String(input))).toEqual([
+      "https://api.github.com/repos/acme/widgets/pulls/42",
+      `https://api.github.com/repos/acme/widgets/commits/${headSha}/check-runs?per_page=100`,
+      `https://api.github.com/repos/acme/widgets/commits/${headSha}/status?per_page=100`
+    ]);
+  });
+
   it("maps 404 without reading a body", async () => {
     const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response("upstream detail", {
       status: 404,

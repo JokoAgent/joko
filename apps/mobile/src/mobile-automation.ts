@@ -1,4 +1,4 @@
-import { decodeModelSpeed } from "@joko/contracts";
+import { decodeModelSpeed, schedulePullRequestRuleFromProto, schedulePullRequestUrl } from "@joko/contracts";
 import {
   PermissionMode,
   ScheduleExecutionMode,
@@ -14,6 +14,7 @@ import {
   ScheduleState,
   type Schedule,
   type SchedulePreRunResult,
+  type SchedulePullRequestRule,
   type ScheduleRunHistory,
   type ScheduleRunMoney,
   type SchedulerRuntimeSnapshot
@@ -57,6 +58,7 @@ export interface MobileAutomationRun {
   readonly finishedAt?: number;
   readonly durationMs?: number;
   readonly resultText?: string;
+  readonly pullRequestUrl?: string;
   readonly error?: string;
   readonly zeroCost: boolean;
   readonly costAttribution: "exact" | "direct" | "mixed" | "zero" | "unavailable";
@@ -109,6 +111,7 @@ export interface MobileAutomationSchedule {
     readonly timeoutMs?: number;
   };
   readonly overlapPolicy: "queue" | "skip";
+  readonly followPullRequest?: SchedulePullRequestRule;
   readonly misfirePolicy: "runOnce" | "skip";
   readonly nextTriggerAt?: number;
   readonly lastTriggeredAt?: number;
@@ -198,6 +201,8 @@ export function projectMobileAutomationSchedule(
   }
   const recurrence = scheduleRecurrence(schedule);
   const execution = scheduleExecution(schedule);
+  const followPullRequest = schedule.execution?.followPullRequest === undefined
+    ? undefined : schedulePullRequestRuleFromProto(schedule.execution.followPullRequest);
   const editableInputText = editableScheduleInputText(schedule);
   const overlapPolicy = scheduleOverlapPolicy(schedule.overlapPolicy);
   const misfirePolicy = scheduleMisfirePolicy(schedule.misfirePolicy);
@@ -228,6 +233,7 @@ export function projectMobileAutomationSchedule(
     inputText: mobileInputSummary(schedule.input),
     ...(editableInputText === undefined ? {} : { editableInputText }),
     ...execution,
+    ...(followPullRequest === undefined ? {} : { followPullRequest }),
     overlapPolicy,
     misfirePolicy,
     ...(schedule.nextTriggerAt === undefined ? {} : { nextTriggerAt: requiredTimestamp(schedule.nextTriggerAt, "next trigger") }),
@@ -272,6 +278,7 @@ export function projectMobileAutomationRun(run: ScheduleRunHistory): MobileAutom
   }
   const durationMs = run.duration === undefined ? undefined : requiredDuration(run.duration, "Automation run");
   const readAt = optionalTimestamp(run.readAt, "Automation run read receipt");
+  const pullRequestUrl = schedulePullRequestUrl(run.pullRequestUrl);
   return {
     triggerId,
     runId,
@@ -281,6 +288,7 @@ export function projectMobileAutomationRun(run: ScheduleRunHistory): MobileAutom
     triggeredAt,
     ...(finishedAt === undefined ? {} : { finishedAt }),
     ...(durationMs === undefined ? {} : { durationMs }),
+    ...(pullRequestUrl === undefined ? {} : { pullRequestUrl }),
     ...(run.resultText.length === 0 ? {} : { resultText: boundedText(run.resultText, "Automation result", 131_072) }),
     ...(run.error?.message ? { error: boundedText(run.error.message, "Automation run error") } : {}),
     zeroCost: run.zeroCost,

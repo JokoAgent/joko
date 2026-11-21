@@ -477,6 +477,7 @@ const MESSAGE_REWIND_CONTINUATION_SETTING_KEY = "runtime.message_rewind_continua
 const CATALOG_ROLLOUT_HISTORY_NAMESPACE = "codex.catalog_rollout_history";
 const RETAINED_CONTEXT_EVENTS_KEY = "runtime.retained_context_events";
 export const EXTENSION_USAGE_SETTINGS_PREFIX = "extension-usage.v1:";
+export const SCHEDULE_PULL_REQUEST_WATCH_SETTING_KEY = "schedule.pull-request-watch.v1";
 const EXTENSION_USAGE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface ExtensionUsageSubject {
@@ -16122,6 +16123,12 @@ export class OperationalStore {
           input.id,
           asSqlInteger(existing.revision)
         );
+        const previousRule = storedSchedulePullRequestRule(existing.executionSnapshot);
+        if (previousRule !== undefined && (
+          input.enabled !== existing.enabled || input.backendId !== existing.backendId ||
+          input.targetId !== existing.targetId || input.sessionId !== existing.sessionId ||
+          serializeJson(previousRule) !== serializeJson(storedSchedulePullRequestRule(input.executionSnapshot) ?? null)
+        )) this.deleteSetting("service", input.id, SCHEDULE_PULL_REQUEST_WATCH_SETTING_KEY);
       }
       return this.getSchedule(input.id);
     });
@@ -16285,6 +16292,7 @@ export class OperationalStore {
       if (result.changes !== 1) {
         throw new RevisionConflictError("Schedule", id, current.revision, this.findSchedule(id)?.revision ?? 0n);
       }
+      this.deleteSetting("service", id, SCHEDULE_PULL_REQUEST_WATCH_SETTING_KEY);
       const linkedSessions = (this.database.prepare(`
         SELECT id FROM product_sessions WHERE automation_schedule_id = ? ORDER BY id
       `).all(id) as Row[]).map((row) => stringValue(row["id"]));
@@ -16431,8 +16439,10 @@ export class OperationalStore {
       if (existing.firedAt !== input.firedAt) {
         throw new StoreError("Schedule occurrence identity was reused with a different fire time.");
       }
+      const pullRequestUrl = isRecord(existing.detail) ? existing.detail["pullRequestUrl"] : undefined;
       const detail = scheduleRunDetailWithReadAt(
-        input.detail === undefined ? existing.detail : input.detail,
+        input.detail === undefined ? existing.detail
+          : typeof pullRequestUrl === "string" ? { ...(isRecord(input.detail) ? input.detail : {}), pullRequestUrl } : input.detail,
         existing.readAt ?? (status.toLowerCase() === "skipped" ? input.finishedAt ?? input.firedAt : undefined)
       );
       this.database.prepare(`
@@ -20896,6 +20906,11 @@ function messageSearchVectorFingerprint(semantic: NormalizedMessageSearchSemanti
     )
     .update(bytes)
     .digest("hex");
+}
+
+function storedSchedulePullRequestRule(snapshot: unknown): unknown {
+  if (!isRecord(snapshot) || !isRecord(snapshot["scheduler"])) return undefined;
+  return snapshot["scheduler"]["followPullRequest"];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -2,6 +2,7 @@ import type { JSONContent } from "@tiptap/core";
 import type { PartnerAvatarView, PartnerAvatarInputView } from "./partner-avatar.js";
 import type { SessionWorkingStatus, VoiceDictionaryPeerApi, VoiceInputSaucSettingsView, VoiceInputRecognitionContextView, PartnerWorkbenchRoutine, BackgroundTaskOutput } from "@joko/contracts";
 import type { PartnerLearningFeedbackView, PersonalDevelopmentDoctorRun, PersonalDevelopmentTask, ProviderModelWithdrawalReview } from "@joko/contracts";
+import type { SchedulePullRequestRule } from "@joko/contracts";
 import type { PersonalDevelopmentApi } from "./personal-development-api.js";
 import type { HostedAgentSettingsApi } from "./hosted-agent-settings.js";
 
@@ -2842,6 +2843,7 @@ export interface ScheduleView {
     readonly timeoutMs?: number;
   };
   readonly overlapPolicy: "queue" | "skip";
+  readonly followPullRequest?: SchedulePullRequestRule;
   readonly misfirePolicy: "runOnce" | "skip";
   readonly nextRunAt?: number;
   readonly lastRun?: { readonly state: ScheduleRunHistoryView["state"]; readonly at: number };
@@ -2914,6 +2916,7 @@ export interface ScheduleRunHistoryView {
   readonly triggeredAt: number;
   readonly finishedAt?: number;
   readonly durationMs?: number;
+  readonly pullRequestUrl?: string;
   readonly resultText?: string;
   readonly zeroCost: boolean;
   readonly costAttribution: "exact" | "direct" | "mixed" | "zero" | "unavailable";
@@ -3017,6 +3020,7 @@ export interface ScheduleDraft {
   readonly notifyDesktop: boolean;
   readonly expireAtExpression: string;
   readonly preRunHook?: ScheduleView["preRunHook"];
+  readonly followPullRequest?: SchedulePullRequestRule | null;
   readonly overlapPolicy: ScheduleView["overlapPolicy"];
   readonly misfirePolicy: ScheduleView["misfirePolicy"];
 }
@@ -5255,6 +5259,7 @@ export type ModelFavoriteMutationView =
 export interface SettingsView {
   readonly revision: bigint;
   readonly taskModelGroupsAvailable?: boolean;
+  readonly schedulePullRequestFollowAvailable?: boolean;
   readonly providers: readonly ProviderConfigurationView[];
   readonly credentials: readonly CredentialView[];
   readonly mcpServers: readonly McpServerView[];

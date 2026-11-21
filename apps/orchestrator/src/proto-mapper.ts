@@ -5554,6 +5554,7 @@ function toProtoScheduleExecution(value: unknown): ScheduleExecutionSnapshot {
     useWorktree: booleanField(record, "useWorktree") ?? false,
     worktreeSourceRef: stringField(record, "worktreeSourceRef"),
     refreshWorktreeRemote: booleanField(record, "refreshWorktreeRemote") ?? false,
+    followPullRequest: extension.followPullRequest === undefined ? undefined : contract.schedulePullRequestRuleToProto(extension.followPullRequest),
     extraDirectoryIds,
     executionMode: extension.executionMode === "script"
       ? contract.ScheduleExecutionMode.SCRIPT
@@ -5636,6 +5637,12 @@ function fromProtoScheduleExecution(value: ScheduleExecutionSnapshot | undefined
           ? {}
           : { timeoutMs: fromProtoDuration(value.preRunHook.timeout, "schedule.execution.pre_run_hook.timeout") as number })
       };
+  const followPullRequest = value.followPullRequest === undefined
+    ? undefined : contract.schedulePullRequestRuleFromProto(value.followPullRequest);
+  if (value.followPullRequest !== undefined && followPullRequest === undefined &&
+    (value.followPullRequest.url !== "" || value.followPullRequest.change !== contract.SchedulePullRequestChange.UNSPECIFIED)) {
+    throw new ProtoMappingError("invalid_argument", "schedule.execution.follow_pull_request", "Select a valid GitHub pull request and condition.");
+  }
   const extension: ScheduleExtensionSnapshot = {
     format: 1,
     silentWhenIdle: value.silentWhenIdle,
@@ -5645,7 +5652,8 @@ function fromProtoScheduleExecution(value: ScheduleExecutionSnapshot | undefined
     ...(value.expireAt === undefined ? {} : {
       expireAt: fromProtoTimestamp(value.expireAt, "schedule.execution.expire_at") as number
     }),
-    ...(preRunHook === undefined ? {} : { preRunHook })
+    ...(preRunHook === undefined ? {} : { preRunHook }),
+    ...(followPullRequest === undefined ? {} : { followPullRequest })
   };
   return withScheduleExtensionSnapshot(base, extension);
 }
@@ -5673,6 +5681,7 @@ function toProtoScheduleHistory(record: ScheduleRunRecord, run: StoredRun | unde
       ? redactSecrets(script["resultText"])
       : "",
     zeroCost: detail["costAttribution"] === "zero",
+    pullRequestUrl: typeof detail["pullRequestUrl"] === "string" ? contract.schedulePullRequestUrl(detail["pullRequestUrl"]) ?? "" : "",
     outcome: scheduleRunOutcome(record.status),
     costAttribution: scheduleRunCostAttribution(detail["costAttribution"]),
     ...(cost === undefined ? {} : { cost }),

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import { resolveModelSpeed } from "../model-speed.js";
 import { extraDirectoryAccessChoices } from "../extra-directory-access.js";
 import type { JSX, KeyboardEvent } from "react";
+import { schedulePullRequestChanges, schedulePullRequestUrl } from "@joko/contracts";
 import { ArrowUpToLine, CalendarClock, Check, CheckCircle2, ChevronDown, ChevronRight, CirclePlus, Clock3, Copy, FolderGit2, FolderMinus, GitBranch, History, Menu, MoreHorizontal, Pause, Pencil, Play, RefreshCw, Trash2, TriangleAlert } from "lucide-react";
 import type { AppController } from "../controller.js";
 import { modelPreferenceOwnerId } from "../model-picker-preferences.js";
@@ -385,7 +386,7 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
                     return <div id={`schedule-row-${schedule.id}`} role="listitem" className={`schedule-master__row${selected ? " is-selected" : ""}${status === "paused" ? " is-paused" : ""}`} key={schedule.id}>
                       <button type="button" className="schedule-master__row-main" aria-current={selected ? "true" : undefined} onClick={() => selectSchedule(schedule)} onDoubleClick={() => setEditor(schedule)}>
                         <StatusDot state={runtimeStatus === undefined ? status === "paused" ? "paused" : schedule.lastRun?.state ?? "idle" : "running"} label={runtimeStatus === undefined ? status === "expired" ? t("scheduler.expired") : status === "active" ? t("common.enabled") : t("scheduler.filterPaused") : scheduleRuntimeLabel(runtimeStatus, runtime, t)} />
-                        <span><span className="schedule-master__row-title"><strong>{schedule.name}</strong>{schedule.unreadRunCount > 0 && <span className="schedule-run-unread-count" aria-label={t("scheduler.unreadRunCount", { count: schedule.unreadRunCount })}>{schedule.unreadRunCount}</span>}{schedule.source === "project" && <span className="schedule-source-chip" title={t("scheduler.projectSourceTooltip", { path: schedule.projectConfigPath ?? ".joko/automations/schedules.json" })}><FolderGit2 aria-hidden="true" />{t("scheduler.projectSource")}</span>}</span><small>{runtimeStatus !== undefined ? scheduleRuntimeLabel(runtimeStatus, runtime, t) : runPending ? t("scheduler.runtimeLoading") : status === "expired" ? t("scheduler.once") : schedule.nextRunAt === undefined ? scheduleKind(schedule.kind, t) : t("scheduler.nextRunRelative", { time: formatRelativeTime(schedule.nextRunAt, locale) })}</small></span>
+                        <span><span className="schedule-master__row-title"><strong>{schedule.name}</strong>{schedule.unreadRunCount > 0 && <span className="schedule-run-unread-count" aria-label={t("scheduler.unreadRunCount", { count: schedule.unreadRunCount })}>{schedule.unreadRunCount}</span>}{schedule.source === "project" && <span className="schedule-source-chip" title={t("scheduler.projectSourceTooltip", { path: schedule.projectConfigPath ?? ".joko/automations/schedules.json" })}><FolderGit2 aria-hidden="true" />{t("scheduler.projectSource")}</span>}</span><small>{runtimeStatus !== undefined ? scheduleRuntimeLabel(runtimeStatus, runtime, t) : runPending ? t("scheduler.runtimeLoading") : status === "expired" ? t("scheduler.once") : schedule.followPullRequest !== undefined ? t("scheduler.followPullRequest") : schedule.nextRunAt === undefined ? scheduleKind(schedule.kind, t) : t("scheduler.nextRunRelative", { time: formatRelativeTime(schedule.nextRunAt, locale) })}</small></span>
                       </button>
                       <div className="schedule-master__row-actions">
                         <IconButton disabled={runPending || boundTaskUnavailable} disabledReason={boundTaskUnavailable ? t("scheduler.runTaskUnavailable") : undefined} label={`${t("scheduler.runNow")} · ${schedule.name}`} onClick={() => runScheduleOnce(schedule.id)}><Play aria-hidden="true" /></IconButton>
@@ -731,6 +732,10 @@ function ScheduleDetail({ controller, schedule, sessions, session, target, runti
         {runtimeStatus?.kind === "run" && <div><dt>{t("scheduler.fireSource")}</dt><dd>{runtimeStatus.run.source === "runNow" ? t("scheduler.sourceRunNow") : t("scheduler.sourceAutomatic")}</dd></div>}
         {runtimeStatus?.kind === "run" && <div><dt>{t("scheduler.lastProgress")}</dt><dd>{formatRelativeTime(runtimeStatus.run.lastProgressAt, locale)}</dd></div>}
         <div><dt>{t("scheduler.type")}</dt><dd><Pill>{scheduleKind(schedule.kind, t)}</Pill></dd></div>
+        {schedule.followPullRequest !== undefined && <div><dt>{t("scheduler.followPullRequest")}</dt><dd>
+          <a href={schedule.followPullRequest.url} target="_blank" rel="noreferrer">{schedule.followPullRequest.url.replace("https://github.com/", "")}</a>
+          <small>{t(`scheduler.pullRequest.${schedule.followPullRequest.change}`)}</small>
+        </dd></div>}
         <div><dt>{t("scheduler.expression")}</dt><dd><code>{schedule.expression || t("scheduler.manual")}</code></dd></div>
         <div><dt>{t("scheduler.timezone")}</dt><dd>{schedule.timezone}</dd></div>
         <div><dt>{t("scheduler.executionMode")}</dt><dd>{schedule.executionMode === "script" ? t("scheduler.executionScript") : t("scheduler.executionAgent")}</dd></div>
@@ -738,7 +743,7 @@ function ScheduleDetail({ controller, schedule, sessions, session, target, runti
         <div><dt>{t("worktree.title")}</dt><dd>{schedule.useWorktree ? t("common.enabled") : t("common.disabled")}</dd></div>
         {schedule.useWorktree && <div><dt>{t("worktree.source")}</dt><dd><code>{schedule.worktreeSourceRef ?? t("worktree.defaultSource")}</code></dd></div>}
         {schedule.useWorktree && <div><dt>{t("worktree.refreshRemote")}</dt><dd>{schedule.refreshWorktreeRemote ? t("common.enabled") : t("common.disabled")}</dd></div>}
-        <div><dt>{t("scheduler.nextRun")}</dt><dd>{schedule.nextRunAt === undefined ? displayStatus === "expired" ? t("scheduler.expired") : "—" : <><Clock3 aria-hidden="true" />{formatScheduleDateTime(schedule.nextRunAt, locale, schedule.timezone)} <small>({formatRelativeTime(schedule.nextRunAt, locale)})</small></>}</dd></div>
+        <div><dt>{t(schedule.followPullRequest !== undefined && !(schedule.followPullRequest.change === "any" && schedule.preRunHook !== undefined) ? "scheduler.nextPullRequestCheck" : "scheduler.nextRun")}</dt><dd>{schedule.nextRunAt === undefined ? displayStatus === "expired" ? t("scheduler.expired") : "—" : <><Clock3 aria-hidden="true" />{formatScheduleDateTime(schedule.nextRunAt, locale, schedule.timezone)} <small>({formatRelativeTime(schedule.nextRunAt, locale)})</small></>}</dd></div>
         <div><dt>{t("scheduler.permission")}</dt><dd>{schedule.permissionMode}</dd></div>
         <div><dt>{t("scheduler.overlap")}</dt><dd>{schedule.overlapPolicy}</dd></div>
         <div><dt>{t("scheduler.notification")}</dt><dd>{schedule.notifyDesktop ? t("common.enabled") : t("common.disabled")}</dd></div>
@@ -906,10 +911,14 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
     : undefined;
   const onceInvalid = draft.kind === "once" && draft.expression.length > 0 && timezoneValid && onceEpoch === undefined;
   const oncePast = draft.kind === "once" && draft.enabled && onceEpoch !== undefined && onceEpoch <= Date.now();
+  const canFollowPullRequest = !projectOwned && controller.state.snapshot.settings.schedulePullRequestFollowAvailable === true
+    && draft.sessionMode === "bound" && draft.executionMode === "agent" && draft.kind !== "once";
+  const followPullRequest = draft.followPullRequest;
+  const validPullRequest = followPullRequest == null || canFollowPullRequest && schedulePullRequestUrl(followPullRequest.url) !== undefined;
   const valid = draft.name.trim().length > 0 && draft.targetId.length > 0 &&
     (draft.sessionMode !== "bound" || draft.sessionId.length > 0) &&
     (draft.executionMode === "script" ? draft.scriptCommand.trim().length > 0 && validScriptTimeout : draft.inputText.trim().length > 0) &&
-    worktreeValid &&
+    worktreeValid && validPullRequest &&
     timezoneValid && validExpression(draft, onceEpoch, oncePast);
   const updateTarget = (targetId: string): void => {
     const target = targets.find((candidate) => candidate.id === targetId);
@@ -977,6 +986,7 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
               sessionMode: current.sessionMode === "bound" ? "bound" as const : "fresh" as const,
               sessionId: current.sessionMode === "bound" ? current.sessionId : "",
               silentWhenIdle: false,
+              ...(current.followPullRequest == null ? {} : { followPullRequest: null }),
               useWorktree: false,
               worktreeSourceRef: undefined,
               refreshWorktreeRemote: false
@@ -988,6 +998,7 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
           return {
             ...current,
             sessionMode,
+            ...(sessionMode !== "bound" && current.followPullRequest != null ? { followPullRequest: null } : {}),
             sessionId: sessionMode === "fresh"
               ? ""
               : sessionMode === "bound"
@@ -1011,7 +1022,10 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
         }}><option value="">—</option>{matchingSessions.map((session) => <option value={session.id} key={session.id}>{session.name}</option>)}</SelectControl></label>}
         <label className="field"><span>{t("scheduler.recurrence")}</span><SelectControl value={draft.kind} onChange={(event) => {
           const kind = event.target.value as ScheduleDraft["kind"];
-          setDraft((current) => ({ ...current, ...defaultRecurrence(kind, current.timezone) }));
+          setDraft((current) => ({
+            ...current, ...defaultRecurrence(kind, current.timezone),
+            ...(kind === "once" && current.followPullRequest != null ? { followPullRequest: null } : {})
+          }));
         }}><option value="manual">{t("scheduler.manual")}</option><option value="once">{t("scheduler.once")}</option><option value="interval">{t("scheduler.interval")}</option><option value="cron">{t("scheduler.cron")}</option></SelectControl></label>
         {draft.kind !== "manual" && <label className="field"><span>{draft.kind === "once" ? t("scheduler.triggerAt") : draft.kind === "interval" ? t("scheduler.intervalSeconds") : t("scheduler.cronExpression")}</span><input required aria-invalid={onceInvalid || oncePast || undefined} type={draft.kind === "once" ? "datetime-local" : draft.kind === "interval" ? "number" : "text"} min={draft.kind === "interval" ? 1 : undefined} value={draft.expression} onChange={(event) => setDraft((current) => ({ ...current, expression: event.target.value, onceTriggerAt: undefined }))} placeholder={draft.kind === "cron" ? "0 9 * * 1-5" : undefined} />{onceInvalid && <small className="inline-error">{t("scheduler.invalidOneShot")}</small>}{oncePast && <small className="inline-error">{t("scheduler.oneShotPast")}</small>}</label>}
         <label className="field"><span>{t("scheduler.timezone")}</span><input required list="schedule-time-zone-options" aria-invalid={timezoneInvalid || undefined} value={draft.timezone} onChange={(event) => {
@@ -1020,6 +1034,27 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
         }} />{timezoneInvalid && <small className="inline-error">{t("scheduler.invalidTimezone")}</small>}</label>
         <datalist id="schedule-time-zone-options">{scheduleTimeZoneOptions(draft.timezone).map((timezone) => <option value={timezone} key={timezone} />)}</datalist>
       </div>
+      {canFollowPullRequest && <fieldset className="schedule-editor__execution">
+        <legend>{t("scheduler.followPullRequest")}</legend>
+        <div className="schedule-editor__toggles"><label>
+          <CheckboxControl checked={followPullRequest != null} onChange={event => setDraft(current => ({
+            ...current, followPullRequest: event.target.checked ? { url: "", change: "any" } : null
+          }))} />{t("scheduler.enablePullRequest")}
+        </label></div>
+        {followPullRequest != null && <div className="schedule-editor__grid">
+          <label className="field"><span>{t("scheduler.pullRequestUrl")}</span>
+            <input type="url" required value={followPullRequest.url} aria-invalid={followPullRequest.url !== "" && !validPullRequest || undefined}
+              onChange={event => setDraft(current => ({ ...current, followPullRequest: { ...followPullRequest, url: event.target.value } }))} />
+            {followPullRequest.url !== "" && !validPullRequest && <small className="inline-error">{t("scheduler.invalidPullRequest")}</small>}
+          </label>
+          <label className="field"><span>{t("scheduler.pullRequestCondition")}</span>
+            <SelectControl value={followPullRequest.change} onChange={event => {
+              const change = schedulePullRequestChanges.find(candidate => candidate === event.target.value);
+              if (change !== undefined) setDraft(current => ({ ...current, followPullRequest: { ...followPullRequest, change } }));
+            }}>{schedulePullRequestChanges.map(change => <option key={change} value={change}>{t(`scheduler.pullRequest.${change}`)}</option>)}</SelectControl>
+          </label>
+        </div>}
+      </fieldset>}
       {draft.executionMode === "agent" ? <label className="interaction-input"><span>{t("scheduler.scheduledInput")}</span><textarea required rows={5} value={draft.inputText} onChange={(event) => setDraft((current) => ({ ...current, inputText: event.target.value }))} placeholder={t("scheduler.inputPlaceholder")} /></label> : <label className="interaction-input"><span>{t("scheduler.scriptCommand")}</span><textarea required rows={5} spellCheck={false} value={draft.scriptCommand} onChange={(event) => setDraft((current) => ({ ...current, scriptCommand: event.target.value }))} placeholder={t("scheduler.scriptCommandPlaceholder")} /></label>}
       {(worktreeCompatible || draft.useWorktree) && <section className="new-task-worktree" aria-label={t("worktree.title")}>
         <header>
@@ -1154,6 +1189,7 @@ export function scheduleDraft(schedule: ScheduleView | undefined, targets: reado
     notifyDesktop: schedule?.notifyDesktop ?? true,
     expireAtExpression: schedule?.expireAt === undefined ? "" : scheduleLocalDateTimeFromEpoch(schedule.expireAt, timezone),
     ...(schedule?.preRunHook === undefined ? {} : { preRunHook: schedule.preRunHook }),
+    ...(schedule?.followPullRequest === undefined ? {} : { followPullRequest: schedule.followPullRequest }),
     overlapPolicy: schedule?.overlapPolicy ?? "queue",
     misfirePolicy: schedule?.misfirePolicy ?? "runOnce"
   };

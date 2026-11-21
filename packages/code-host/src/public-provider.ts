@@ -7,6 +7,7 @@ import {
   type CodeHostPullRequestReference
 } from "./types.js";
 import { codeHostPullRequestReferenceKey } from "./reference.js";
+import { githubPublicChecks, githubPullRequestActivity } from "./github-pull-request-activity.js";
 import { boundedCodeHostHeadBranch, boundedCodeHostPullRequestTitle } from "./validation.js";
 
 const PUBLIC_REFERENCE_HOST = "github.com";
@@ -67,7 +68,7 @@ export class PublicCodeHostProvider implements CodeHostProvider {
 
   async getPullRequest(
     reference: CodeHostPullRequestReference,
-    options: { readonly signal: AbortSignal; readonly sessionOwnerId: string }
+    options: { readonly signal: AbortSignal; readonly sessionOwnerId: string; readonly purpose?: "follow" }
   ): Promise<CodeHostProviderResult> {
     if (!isSupportedPublicReference(reference)) {
       throw new TypeError("The public code-host reference is outside the outbound policy.");
@@ -82,7 +83,18 @@ export class PublicCodeHostProvider implements CodeHostProvider {
         request.signal,
         this.#maximumPullRequestBodyBytes
       );
-      return parsePullRequest(pullRequest);
+      const result = parsePullRequest(pullRequest);
+      if (options.purpose !== "follow") return result;
+      const activity = githubPullRequestActivity(pullRequest);
+      const head = activity.headSha;
+      const checks = head === undefined ? undefined : await Promise.all([
+        this.#readJson(publicCheckUrl(reference, head, "check-runs"), request.signal, this.#maximumPullRequestBodyBytes),
+        this.#readJson(publicCheckUrl(reference, head, "status"), request.signal, this.#maximumPullRequestBodyBytes)
+      ]).then(([runs, statuses]) => githubPublicChecks(runs, statuses), () => {
+        options.signal.throwIfAborted();
+        return undefined;
+      });
+      return { ...result, activity: { ...activity, ...(checks === undefined ? {} : { checks }) } };
     } finally {
       request.dispose();
     }
@@ -146,14 +158,21 @@ function publicApiUrl(reference: CodeHostPullRequestReference): URL {
   return url;
 }
 
+function publicCheckUrl(reference: CodeHostPullRequestReference, head: string, endpoint: "check-runs" | "status"): URL {
+  const owner = encodeURIComponent(reference.repositoryOwner);
+  const repository = encodeURIComponent(reference.repositoryName);
+  return new URL(`/repos/${owner}/${repository}/commits/${head}/${endpoint}?per_page=100`, PUBLIC_API_ORIGIN);
+}
+
 function assertPublicApiUrl(url: URL): void {
+  const validPullRequest = url.search === "" && /^\/repos\/[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}\/pulls\/[1-9][0-9]{0,9}$/u.test(url.pathname);
+  const validChecks = url.search === "?per_page=100" && /^\/repos\/[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}\/commits\/[a-f0-9]{40}\/(?:check-runs|status)$/u.test(url.pathname);
   if (
     url.origin !== PUBLIC_API_ORIGIN
     || url.username !== ""
     || url.password !== ""
     || url.hash !== ""
-    || !/^\/repos\/[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}\/pulls\/[1-9][0-9]{0,9}$/u.test(url.pathname)
-    || url.search !== ""
+    || (!validPullRequest && !validChecks)
   ) throw new Error("The public code-host destination is outside the outbound policy.");
 }
 

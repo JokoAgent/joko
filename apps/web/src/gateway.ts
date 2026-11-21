@@ -9,6 +9,7 @@ import { providerModelInheritedField, protoProviderModelInheritedField } from ".
 import { extensionSettingsOperationReceipt, extensionSettingsProfileKey, pendingExtensionSettingsOperation,
   parsePendingExtensionSettingsOperation, type ExtensionSettingsOperationKind } from "./extension-settings-operation.js";
 import { ProjectArchiveBlocker, readSessionArchivePreview, type GetProjectArchivePreviewResponse } from "@joko/contracts";
+import { normalizeSchedulePullRequestRule, schedulePullRequestRuleFromProto, schedulePullRequestRuleToProto, schedulePullRequestUrl } from "@joko/contracts";
 import { builtinSkillIntentForText, resolveBuiltinSkillDraft } from "./builtin-skill-intent.js";
 import { CONTACTS_TOOL_POLICY_ID } from "./contacts-draft.js";
 import { projectProviderGroupRebalance } from "@joko/contracts";
@@ -4486,6 +4487,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }
     if (scriptMode && draft.sessionMode === "persistent") throw new GatewayError("Script schedules require fresh or bound task mode.");
     if (draft.sessionMode === "bound" && !draft.sessionId) throw new GatewayError("Choose a task for the bound schedule.");
+    const followPullRequest = draft.followPullRequest == null ? draft.followPullRequest : normalizeSchedulePullRequestRule(draft.followPullRequest);
+    if (draft.followPullRequest != null && followPullRequest === undefined) throw new GatewayError("Select a valid GitHub pull request and condition.");
     if (draft.scriptTimeoutMs !== undefined && (!Number.isSafeInteger(draft.scriptTimeoutMs) || draft.scriptTimeoutMs <= 0)) {
       throw new GatewayError("Script timeout must be a positive whole number of milliseconds.");
     }
@@ -4517,6 +4520,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           ? {}
           : { worktreeSourceRef: draft.worktreeSourceRef }),
         refreshWorktreeRemote: draft.useWorktree && draft.refreshWorktreeRemote,
+        ...(followPullRequest === undefined ? {} : { followPullRequest: schedulePullRequestRuleToProto(followPullRequest) }),
         extraDirectoryIds: scriptMode ? [] : [...draft.extraDirectoryIds],
         executionMode: scriptMode ? ScheduleExecutionMode.SCRIPT : ScheduleExecutionMode.AGENT,
         ...(scriptMode ? {
@@ -17282,6 +17286,8 @@ function mapSchedule(schedule: Schedule): ScheduleView {
     expression = `${durationSeconds(recurrence.value.interval)}s`;
   }
   const last = schedule.recentRuns[0];
+  const followPullRequest = schedule.execution?.followPullRequest === undefined
+    ? undefined : schedulePullRequestRuleFromProto(schedule.execution.followPullRequest);
   return {
     id: schedule.scheduleId,
     name: schedule.displayName,
@@ -17330,6 +17336,7 @@ function mapSchedule(schedule: Schedule): ScheduleView {
       ? {}
       : { worktreeSourceRef: schedule.execution.worktreeSourceRef }),
     refreshWorktreeRemote: schedule.execution?.refreshWorktreeRemote ?? false,
+    ...(followPullRequest === undefined ? {} : { followPullRequest }),
     extraDirectoryIds: [...(schedule.execution?.extraDirectoryIds ?? [])],
     silentWhenIdle: schedule.execution?.silentWhenIdle ?? false,
     notifyDesktop: schedule.execution?.notify?.desktop ?? true,
@@ -17353,6 +17360,7 @@ function mapSchedule(schedule: Schedule): ScheduleView {
 }
 
 function mapScheduleRunHistory(run: ScheduleRunHistory): ScheduleView["history"][number] {
+  const pullRequestUrl = schedulePullRequestUrl(run.pullRequestUrl);
   return {
     id: run.triggerId,
     runId: run.runId,
@@ -17362,6 +17370,7 @@ function mapScheduleRunHistory(run: ScheduleRunHistory): ScheduleView["history"]
     triggeredAt: timestampMs(run.triggeredAt),
     ...(run.finishedAt === undefined ? {} : { finishedAt: timestampMs(run.finishedAt) }),
     ...(run.duration === undefined ? {} : { durationMs: schedulerDurationMs(run.duration, "run") }),
+    ...(pullRequestUrl === undefined ? {} : { pullRequestUrl }),
     ...(run.resultText.length === 0 ? {} : { resultText: run.resultText }),
     zeroCost: run.zeroCost,
     costAttribution: scheduleRunCostAttribution(run.costAttribution),
@@ -20683,6 +20692,7 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
   return {
     revision: settings?.revision?.value ?? 0n,
     taskModelGroupsAvailable: settings.taskModelGroupsAvailable,
+    schedulePullRequestFollowAvailable: settings.schedulePullRequestFollowAvailable,
     providers: (settings?.providers ?? []).map(mapProviderConfiguration),
     credentials: (settings?.credentials ?? []).map(mapCredential),
     mcpServers: (settings?.mcpServers ?? []).map(mapMcpServer),

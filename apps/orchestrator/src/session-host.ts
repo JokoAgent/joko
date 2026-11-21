@@ -4128,6 +4128,7 @@ export class SessionHost {
     readonly scheduledAt: number;
     readonly boundBackendId?: string;
     readonly nextRunAt?: number;
+    readonly pullRequestUrl?: string;
   }): OperationExecution<EnqueueResult> {
     const sessionId = input.sessionId;
     const session = this.#store.getSession(sessionId).descriptor;
@@ -4181,6 +4182,7 @@ export class SessionHost {
       scheduledAt: input.scheduledAt,
       prompt: acceptedPrompt,
       executionSnapshot: input.schedule.executionSnapshot,
+      ...(input.pullRequestUrl === undefined ? {} : { pullRequestUrl: input.pullRequestUrl }),
       ...(input.boundBackendId === undefined ? {} : { boundBackendId: input.boundBackendId })
     };
     const execution = this.#store.runOperation(
@@ -4230,7 +4232,7 @@ export class SessionHost {
           input.schedule.id,
           runId,
           validationFailure === undefined ? "queued" : "failed",
-          validationFailure,
+          input.pullRequestUrl === undefined ? validationFailure : { ...validationFailure, pullRequestUrl: input.pullRequestUrl },
           input.scheduledAt
         );
         this.markScheduledWorktreeAdmitted(store, sessionId, input.schedule.id, runId);
@@ -11726,6 +11728,14 @@ export class SessionHost {
       && this.#store.getTarget(session.targetId).descriptor.remoteWorkspace === undefined
       && readProvisionalSession(this.#store, session.id) === undefined
       && readPersonalDevelopmentPurpose(this.#store, session.id) === undefined;
+  }
+
+  canFollowPullRequestInTask(stored: StoredSession): boolean {
+    const sessionId = stored.descriptor.id;
+    return this.isOrdinarySession(stored, true)
+      && readProvisionalSession(this.#store, sessionId) === undefined
+      && readPersonalDevelopmentPurpose(this.#store, sessionId) === undefined
+      && this.#store.findCollaborationWorkerBySession(sessionId) === undefined;
   }
 
   private isOrdinarySession(stored: StoredSession, allowArchived = false, allowScheduled = false): boolean {
