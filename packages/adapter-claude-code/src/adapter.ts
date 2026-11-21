@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import { lstat, mkdtemp, open, readFile, realpath, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, posix as remotePath, relative, resolve, sep, win32 as win32Path } from "node:path";
@@ -203,11 +204,7 @@ const MAX_PERMISSION_RULE_CONTENT = 4_096;
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 const PERSISTED_MODEL_EFFORT_LEVELS = ["low", "medium", "high", "xhigh"] as const;
 const DEFAULT_SETTING_SOURCES = ["user", "project", "local"] as const;
-const ISOLATED_REVIEW_CLI_VERSION = [2, 1, 292] as const;
-const NATIVE_TASK_CLI_VERSION = [2, 1, 292] as const;
-const SUBAGENT_DEFAULT_MODEL_CLI_VERSION = [2, 1, 292] as const;
-const STEER_CLI_VERSION = [2, 1, 292] as const;
-const READ_ONLY_EXTRA_DIRECTORY_CLI_VERSION = [2, 1, 292] as const;
+const NATIVE_CLI_PROFILE_VERSIONS = new Set(["2.1.292", "2.1.321"]);
 const MAX_TURN_INPUTS = 64;
 const REVIEW_READ_TOOLS = ["Read", "Glob", "Grep"] as const;
 const REVIEW_DISALLOWED_TOOLS = [
@@ -781,7 +778,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         NO_PROXY: "127.0.0.1,::1", no_proxy: "127.0.0.1,::1" };
     }
     const childEnvironment = createChildRuntimeEnvironment({
-      allowedKeys: CLAUDE_RUNTIME_ENVIRONMENT_KEYS,
+      allowedKeys: [...CLAUDE_RUNTIME_ENVIRONMENT_KEYS, "ENABLE_TOOL_SEARCH"],
       overrides: {
         ...options.environment,
         ...(options.credentialPort === undefined ? {} : managedAuthEnvironmentOverrides()),
@@ -973,8 +970,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const catalogModels = [...this.#models.values()];
     const supportsLogin = installed && this.#oauthAccount !== undefined;
     const supportsLogout = installed && this.#oauthAccount !== undefined && this.#ownsCredential;
+    const nativeCliProfileSupported = supportsNativeCliProfile(this.#lastCliVersion);
     const supportsAccountUsage = installed && this.#oauthAccount !== undefined && this.#runtime.supportsAccountUsage === true && this.#runtime.readAccountUsage !== undefined
-      && supportsIsolatedReview(this.#lastCliVersion);
+      && nativeCliProfileSupported;
     const descriptor: BackendDescriptor = {
       id: this.id,
       adapterKind: "claude-agent-sdk-stdio",
@@ -992,11 +990,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         this.#runtime.supportsWorkspaceDerivation === true,
         this.#runtime.freshContexts !== undefined && this.#runtime.prepareFreshContextRecovery !== undefined,
         this.#remoteRuntimes?.supportsFreshContexts === true,
-        supportsIsolatedReview(this.#lastCliVersion),
-        supportsNativeTaskProjection(this.#lastCliVersion),
-        supportsSteer(this.#lastCliVersion),
-        supportsReadOnlyExtraDirectories(this.#lastCliVersion),
-        supportsSubagentDefaultModel(this.#lastCliVersion),
+        nativeCliProfileSupported,
         this.#resolveSubagentModel !== undefined,
         this.#resolveNativeMemoryEnabled !== undefined,
         catalogModels,
@@ -1079,7 +1073,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     this.#assertUsable();
     if (providerId !== PROVIDER_ID) throw claudeCodeError("CLAUDE_CODE_PROVIDER_ID_MISMATCH",
       "The selected Provider does not belong to this native account.", "probe");
-    if (this.#oauthAccount === undefined || this.#runtime.supportsAccountUsage !== true || this.#runtime.readAccountUsage === undefined || !supportsIsolatedReview(this.#lastCliVersion)) {
+    if (this.#oauthAccount === undefined || this.#runtime.supportsAccountUsage !== true || this.#runtime.readAccountUsage === undefined || !supportsNativeCliProfile(this.#lastCliVersion)) {
       return this.unsupported("provider.account_usage");
     }
     try {
@@ -3725,7 +3719,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       if (authorization && !authorization.isCurrent()) throw new Error("Native text authorization changed."); };
     try {
       current(); if (!this.#lastCliVersion || !this.#models.has(input.modelId)) await this.describe(); current();
-      if (!supportsIsolatedReview(this.#lastCliVersion) || !this.#models.has(input.modelId)) throw new Error("The selected native text model is unavailable.");
+      if (!supportsNativeCliProfile(this.#lastCliVersion) || !this.#models.has(input.modelId)) throw new Error("The selected native text model is unavailable.");
       authorization = await this.#oauthAccount?.runtimeAuthorization(); current();
       if (this.#oauthAccount && !authorization) throw new Error("The native text account is unavailable.");
       directory = await mkdtemp(join(tmpdir(), "joko-text-")); current();
@@ -4272,7 +4266,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         if (bundledCliVersion.length > 0) this.#lastCliVersion = bundledCliVersion;
       }
       if (this.#lastCliVersion === undefined) await this.describe();
-      if (!supportsSubagentDefaultModel(this.#lastCliVersion)) throw subagentDefaultModelUnavailable();
+      if (!supportsNativeCliProfile(this.#lastCliVersion)) throw subagentDefaultModelUnavailable();
       this.#assertUsable();
       this.#assertBackendInstance(context);
       context.signal.throwIfAborted();
@@ -4336,11 +4330,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           env: {
             ...this.#environment,
             ...runtimeAuthorization?.environment,
-            ...(managedRoute === undefined ? {} : managedQueryEnvironment(
+            ...(managedRoute === undefined ? {} : await managedQueryEnvironment(
               managedRoute,
               this.#managedProviders!,
               this.#environment,
-              managedLimitEnvironment!
+              managedLimitEnvironment!,
+              !context.target.remoteWorkspace && !context.hostedExecution && launch.runtimePolicy === "standard"
+                && this.#settingSources.includes("user")
             )),
             CLAUDE_CODE_SUBAGENT_MODEL: subagentModel,
             CLAUDE_CODE_SUBAGENT_MODEL_FORCE: undefined,
@@ -4517,13 +4513,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       assertSessionTarget(observedCwd, runtime.runtimeWorkspaceRoot, runtime.remote);
       this.#lastCliVersion = this.#projection.text(cliVersion, 128);
       if (runtime.additionalDirectories.some(directory => directory.access === "read_only")
-        && !supportsReadOnlyExtraDirectories(this.#lastCliVersion)) throw readOnlyExtraDirectoryUnavailable(true);
-      if (runtime.subagentModel !== undefined && !supportsSubagentDefaultModel(this.#lastCliVersion)) {
+        && !supportsNativeCliProfile(this.#lastCliVersion)) throw readOnlyExtraDirectoryUnavailable(true);
+      if (runtime.subagentModel !== undefined && !supportsNativeCliProfile(this.#lastCliVersion)) {
         throw subagentDefaultModelUnavailable(true);
       }
       runtime.nativeTaskProjectionEnabled = runtime.runtimePolicy === "standard"
-        && supportsNativeTaskProjection(this.#lastCliVersion);
-      runtime.steerEnabled = runtime.runtimePolicy === "standard" && supportsSteer(this.#lastCliVersion);
+        && supportsNativeCliProfile(this.#lastCliVersion);
+      runtime.steerEnabled = runtime.runtimePolicy === "standard" && supportsNativeCliProfile(this.#lastCliVersion);
       if (runtime.managedRoute !== undefined && stringValue(envelope["model"]) !== runtime.managedRoute.model.modelId) throw managedRouteUnavailable(true);
       runtime.modelId = stringValue(envelope["model"]) ?? runtime.modelId;
       if (runtime.managedRoute === undefined) runtime.effort = stringValue(envelope["effort"]) ?? runtime.effort;
@@ -5883,7 +5879,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           cwd,
           env: {
             ...this.#environment,
-            ...managedQueryEnvironment(route, this.#managedProviders, this.#environment, limitEnvironment),
+            ...await managedQueryEnvironment(route, this.#managedProviders, this.#environment, limitEnvironment,
+              !turn.context.target.remoteWorkspace && !turn.context.hostedExecution && this.#settingSources.includes("user")),
             CLAUDE_CODE_SUBAGENT_MODEL: runtime.subagentModel,
             CLAUDE_CODE_SUBAGENT_MODEL_FORCE: undefined,
             ...(turn.context.hostedExecution ? claudeHostedEnvironment(turn.context.hostedExecution, this.#environment) : {})
@@ -7344,7 +7341,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     }
     if (directories.some(directory => directory.access === "read_only")) {
       if (this.#lastCliVersion === undefined) await this.describe();
-      if (!supportsReadOnlyExtraDirectories(this.#lastCliVersion)) throw readOnlyExtraDirectoryUnavailable();
+      if (!supportsNativeCliProfile(this.#lastCliVersion)) throw readOnlyExtraDirectoryUnavailable();
     }
     const seen = new Set<string>();
     const validated: ApprovedDirectory[] = [];
@@ -7870,26 +7867,10 @@ function assertReviewFastModeDisabled(value: unknown): void {
   if (value !== "off") throw invalidReviewProfile();
 }
 
-function supportsIsolatedReview(cliVersion: string | undefined): boolean {
-  return exactCliVersion(cliVersion, ISOLATED_REVIEW_CLI_VERSION);
-}
-
 function hasNativeCompactCommand(initialization: ClaudeSdkInitializationResult | undefined): boolean {
   const commands = initialization?.commands;
   return Array.isArray(commands) && commands.length <= MAX_DESCRIPTOR_ITEMS
     && commands.some((command) => record(command)?.["name"] === "compact");
-}
-
-function supportsNativeTaskProjection(cliVersion: string | undefined): boolean {
-  return exactCliVersion(cliVersion, NATIVE_TASK_CLI_VERSION);
-}
-
-function supportsSteer(cliVersion: string | undefined): boolean {
-  return exactCliVersion(cliVersion, STEER_CLI_VERSION);
-}
-
-function supportsReadOnlyExtraDirectories(cliVersion: string | undefined): boolean {
-  return exactCliVersion(cliVersion, READ_ONLY_EXTRA_DIRECTORY_CLI_VERSION);
 }
 
 function readOnlyExtraDirectoryUnavailable(stateMayHaveChanged = false): JokoError {
@@ -7955,10 +7936,6 @@ async function nativePathWithExistingAncestor(path: string): Promise<string | un
   }
 }
 
-function supportsSubagentDefaultModel(cliVersion: string | undefined): boolean {
-  return exactCliVersion(cliVersion, SUBAGENT_DEFAULT_MODEL_CLI_VERSION);
-}
-
 function subagentDefaultModelUnavailable(stateMayHaveChanged = false): JokoError {
   return claudeCodeError("SUBAGENT_MODEL_DEFAULT_UNAVAILABLE", "The native runtime cannot preserve the configured subtask model's default priority.", "session_start", {
     stateMayHaveChanged,
@@ -7966,11 +7943,9 @@ function subagentDefaultModelUnavailable(stateMayHaveChanged = false): JokoError
   });
 }
 
-function exactCliVersion(cliVersion: string | undefined, expected: readonly number[]): boolean {
-  const match = /^(\d+)\.(\d+)\.(\d+)/u.exec(cliVersion ?? "");
-  if (match === null) return false;
-  const observed = [Number(match[1]), Number(match[2]), Number(match[3])] as const;
-  return expected.every((part, index) => observed[index] === part);
+function supportsNativeCliProfile(cliVersion: string | undefined): boolean {
+  const release = /^(\d+\.\d+\.\d+)(?=\s|$)/u.exec(cliVersion ?? "")?.[1];
+  return release !== undefined && NATIVE_CLI_PROFILE_VERSIONS.has(release);
 }
 
 async function reviewToolDecision(
@@ -8337,11 +8312,7 @@ function capabilityManifest(
   workspaceDerivationSupported: boolean,
   freshContextSupported: boolean,
   remoteFreshContextSupported: boolean,
-  isolatedReviewSupported: boolean,
-  nativeTasksSupported: boolean,
-  steerSupported: boolean,
-  readOnlyExtraDirectoriesSupported: boolean,
-  subagentDefaultModelSupported: boolean,
+  nativeCliProfileSupported: boolean,
   subagentDefaultModelConfigured: boolean,
   nativeMemoryConfigured: boolean,
   models: readonly ClaudeSdkModelInfo[],
@@ -8398,9 +8369,10 @@ function capabilityManifest(
   if (inputResolvers.readBlob !== undefined) supported.add("input.image");
   if (inputResolvers.resolveFile !== undefined) supported.add("input.file");
   if (textResourcesSupported) supported.add("runtime.resources");
-  if (isolatedReviewSupported) supported.add("review.isolated");
-  if (nativeTasksSupported) {
+  if (nativeCliProfileSupported) {
     for (const capability of [
+      "review.isolated",
+      "turn.steer",
       "background.tasks",
       "background.tasks.cancel",
       "subagents.list",
@@ -8412,8 +8384,7 @@ function capabilityManifest(
   if (supportsLogin) supported.add("provider.login");
   if (supportsLogout) supported.add("provider.logout");
   if (accountUsageSupported) supported.add("provider.account_usage");
-  if (steerSupported) supported.add("turn.steer");
-  if (subagentDefaultModelSupported && subagentDefaultModelConfigured) supported.add("subagents.default_model");
+  if (nativeCliProfileSupported && subagentDefaultModelConfigured) supported.add("subagents.default_model");
   if (nativeMemoryConfigured) supported.add("memory.native");
   if (processInspectionSupported) supported.add("runtime.process_usage");
   if (processInspectionSupported && processTerminationSupported) supported.add("runtime.process_terminate");
@@ -8434,7 +8405,7 @@ function capabilityManifest(
       : key === "input.image" && available
         ? NATIVE_PROMPT_IMAGE_MEDIA_TYPES
       : key === "workspace.extra_dirs"
-        ? readOnlyExtraDirectoriesSupported ? ["read_only", "read_write"] : ["read_write"]
+        ? nativeCliProfileSupported ? ["read_only", "read_write"] : ["read_write"]
         : key === "input.mention"
           ? [
               "workspace_file",
@@ -8454,16 +8425,15 @@ function capabilityManifest(
       supported: available,
       ...(!available && !installed ? { reason: "upstream_missing" as const }
         : key === "model.fast_mode" && !available ? { reason: "upstream_missing" as const }
-        : key === "review.isolated" && !isolatedReviewSupported ? { reason: "upstream_missing" as const }
-        : key === "turn.steer" && !steerSupported ? { reason: "upstream_missing" as const }
-        : key === "subagents.default_model" && !subagentDefaultModelSupported ? { reason: "upstream_missing" as const }
+        : (key === "review.isolated" || key === "turn.steer" || key === "subagents.default_model") && !nativeCliProfileSupported
+          ? { reason: "upstream_missing" as const }
         : key === "subagents.default_model" && !subagentDefaultModelConfigured ? { reason: "not_implemented" as const }
         : (key === "runtime.process_usage" && !processInspectionSupported)
           || (key === "runtime.process_terminate" && (!processInspectionSupported || !processTerminationSupported))
           ? { reason: "platform_limited" as const }
         : (key === "background.tasks"
           || key === "background.tasks.cancel"
-          || key.startsWith("subagents.")) && !nativeTasksSupported
+          || key.startsWith("subagents.")) && !nativeCliProfileSupported
           ? { reason: "upstream_missing" as const }
         : !available && !implemented ? { reason: "not_implemented" as const }
           : {}),
@@ -9663,15 +9633,18 @@ function mcpBindUnknown(): JokoError {
   });
 }
 
-function managedQueryEnvironment(route: ManagedProviderRouteBinding, port: ManagedProviderRuntimePort,
+async function managedQueryEnvironment(route: ManagedProviderRouteBinding, port: ManagedProviderRuntimePort,
   environment: Readonly<Record<string, string>>,
-  modelLimits: Readonly<Record<string, string>>): Readonly<Record<string, string | undefined>> {
+  modelLimits: Readonly<Record<string, string>>,
+  readOwnerPreference: boolean): Promise<Readonly<Record<string, string | undefined>>> {
   const token = port.environment[route.apiKeyEnvironment];
   const endpoint = new URL(route.baseUrl);
   if (!managedProviderSupport(port.support).protocols.includes(route.protocol) || token === undefined || token.length === 0
     || !port.secretEnvironmentNames.includes(route.apiKeyEnvironment)
     || endpoint.protocol !== "http:" || !["127.0.0.1", "[::1]"].includes(endpoint.hostname)
     || endpoint.username !== "" || endpoint.password !== "" || endpoint.search !== "" || endpoint.hash !== "") throw managedRouteUnavailable();
+  const toolSearch = readOwnerPreference ? await claudeToolSearchPreference(environment) : undefined;
+  route.assertCurrent();
   return {
     ...managedAuthEnvironmentOverrides(),
     ...Object.fromEntries(port.secretEnvironmentNames.map((key) => [key, undefined])),
@@ -9685,8 +9658,45 @@ function managedQueryEnvironment(route: ManagedProviderRouteBinding, port: Manag
     NO_PROXY: "127.0.0.1,::1", no_proxy: "127.0.0.1,::1",
     ANTHROPIC_API_KEY: token,
     ANTHROPIC_BASE_URL: route.baseUrl,
+    ENABLE_TOOL_SEARCH: toolSearch ?? (route.supportsDeferredMcpTools === true ? "true" : "false"),
     CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
   };
+}
+
+function normalizedToolSearch(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const mode = value.trim().toLowerCase();
+  return /^(?:true|false|auto(?::(?:\d{1,2}|100))?)$/u.test(mode) ? mode : undefined;
+}
+
+async function claudeToolSearchPreference(environment: Readonly<Record<string, string>>): Promise<string | undefined> {
+  const fromEnvironment = normalizedToolSearch(environment["ENABLE_TOOL_SEARCH"]);
+  if (fromEnvironment !== undefined) return fromEnvironment;
+  const directory = environment["CLAUDE_CONFIG_DIR"];
+  if (directory === undefined) return undefined;
+  const limit = 128 * 1024;
+  const file = await open(join(directory, "settings.json"), fsConstants.O_RDONLY | fsConstants.O_NONBLOCK).catch(() => undefined);
+  if (file === undefined) return undefined;
+  try {
+    const info = await file.stat();
+    if (!info.isFile() || info.size > limit) return undefined;
+    const buffer = Buffer.alloc(limit + 1);
+    let size = 0;
+    while (size < buffer.length) {
+      const { bytesRead } = await file.read(buffer, size, buffer.length - size, size);
+      if (bytesRead === 0) break;
+      size += bytesRead;
+    }
+    if (size > limit) return undefined;
+    const content = buffer.toString("utf8", 0, size).replace(/^\uFEFF/u, "")
+      .replace(/("(?:[^"\\]|\\[\s\S])*")|\/\/[^\r\n]*|\/\*[\s\S]*?\*\//gu, (_token, literal: string | undefined) => literal ?? " ")
+      .replace(/("(?:[^"\\]|\\[\s\S])*")|,(?=\s*[}\]])/gu, (_token, literal: string | undefined) => literal ?? "");
+    return normalizedToolSearch(record(record(JSON.parse(content))?.["env"])?.["ENABLE_TOOL_SEARCH"]);
+  } catch {
+    return undefined;
+  } finally {
+    await file.close().catch(() => undefined);
+  }
 }
 
 export function claudeNativeDerivationOperationId(operationId: string): string {

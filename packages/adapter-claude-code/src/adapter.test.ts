@@ -1246,7 +1246,7 @@ describe("ClaudeCodeAdapter", () => {
   test("keeps the Claude SDK on the managed Messages transport when the selected account speaks Responses", async () => {
     const managed = managedProviderFixture({}, {}, "openai-responses");
     const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model" } });
-    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port, settingSources: [] });
     try {
       const descriptor = await adapter.describe();
       expect(descriptor.providerRuntimeSupport?.protocols).toEqual(["openai-responses"]);
@@ -1255,7 +1255,7 @@ describe("ClaudeCodeAdapter", () => {
       const binding = await adapter.createSession(createInput(modelSelection), contextFor().context);
       const query = runtime.queries[0]!;
       expect(query.params.options.env).toMatchObject({ ANTHROPIC_BASE_URL: "http://127.0.0.1:31415/routes/fixture",
-        ANTHROPIC_API_KEY: managed.token, CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1" });
+        ANTHROPIC_API_KEY: managed.token, CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1", ENABLE_TOOL_SEARCH: "false" });
       const turn = contextFor(binding, { operationId: "openai-responses-ordinary-turn" });
       await adapter.send(textPrompt("send through the original Claude input"), { ...turn.context, modelSelection });
       expect(managed.activations).toHaveLength(1);
@@ -1263,6 +1263,25 @@ describe("ClaudeCodeAdapter", () => {
       await eventually(() => turn.events.some((event) => event.type === "done"));
       expect(managed.activations[0]!.release).toHaveBeenCalledOnce();
     } finally { await adapter.dispose(); }
+  });
+
+  test("uses the current local owner's explicit Claude ToolSearch preference for a managed connection", async () => {
+    const profile = await mkdtemp(join(tmpdir(), "joko-claude-tool-search-"));
+    const modelSelection = { providerId: "configured-provider", modelId: "configured-model" };
+    try {
+      await writeFile(join(profile, "settings.json"), '\uFEFF{ // owner settings\n"env": {"ENABLE_TOOL_SEARCH":"TRUE",}, "anotherSetting": "// preserved", }');
+      for (const [environmentChoice, expected] of [[undefined, "true"], ["auto:12", "auto:12"]] as const) {
+        const managed = managedProviderFixture();
+        const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: modelSelection.modelId } });
+        const adapter = adapterFor(runtime, { managedProviders: managed.port,
+          environment: { CLAUDE_CONFIG_DIR: profile, ENABLE_TOOL_SEARCH: environmentChoice } });
+        try {
+          await adapter.describe();
+          await adapter.createSession(createInput(modelSelection), contextFor().context);
+          expect(runtime.queries[0]!.params.options.env["ENABLE_TOOL_SEARCH"]).toBe(expected);
+        } finally { await adapter.dispose(); }
+      }
+    } finally { await rm(profile, { recursive: true, force: true }); }
   });
 
   test("runs a foreground managed Agent in an independently configured exact child Query", async () => {
@@ -3078,7 +3097,7 @@ describe("ClaudeCodeAdapter", () => {
       models: [initialization().models[0]!],
       account: { email: "developer@example.test" }
     };
-    runtime.probeCliVersion = "2.1.240";
+    runtime.probeCliVersion = "2.1.322";
     const probeCwd = resolve(process.cwd(), "probe-workspace");
     const adapter = adapterFor(runtime, { probeCwd });
 

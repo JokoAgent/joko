@@ -205,6 +205,19 @@ function responsesEvents(body: string): Record<string, unknown>[] {
 }
 
 describe("Managed Provider native proxy", () => {
+  it.each([
+    { baseUrl: "https://api.anthropic.com/v1", expected: true },
+    { baseUrl: "https://api.anthropic.com.example.test/v1", expected: undefined },
+    { baseUrl: "https://api.anthropic.com/extra/v1", expected: undefined }
+  ])("prepares Claude tool discovery for the exact endpoint $baseUrl", async ({ baseUrl, expected }) => {
+    const f = await fixture(false, "anthropic-messages", "configured-account", null, "anthropic-messages", { baseUrl, modelId: "claude-fixture" });
+    try {
+      const binding = await f.port.prepare(f.owner);
+      expect(binding.supportsDeferredMcpTools).toBe(expected);
+      binding.dispose();
+    } finally { await f.dispose(); }
+  });
+
   it("dispatches an adopted local Backend and fences the exact Session, workspace and process generations", async () => {
     const f = await fixture();
     try {

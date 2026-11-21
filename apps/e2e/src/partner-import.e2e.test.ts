@@ -78,6 +78,7 @@ async function exerciseAgentImport(backendId: "pi" | "claude-code" | "codex"): P
       }
       if (claude) {
         const definitions = request.body["tools"] as readonly { name: string; input_schema?: ImportSchema }[];
+        if (!definitions?.length) return { kind: "text", text: "Local import" };
         const tool = definitions?.find(definition => definition.name === toolName);
         expect(tool?.input_schema?.properties?.operation?.enum).toEqual(["sources", "preview", "start", "status"]);
         catalogToolName = toolName;
