@@ -61,7 +61,7 @@ async function removeFixedDirectory(path) {
   if (!info.isDirectory() || info.isSymbolicLink() || !samePath(await realpath(path), path)) {
     throw new Error(`Refusing to clean an unsafe runtime dist path: ${path}`);
   }
-  await rm(path, { recursive: true, force: false });
+  await rm(path, { recursive: true, force: false, maxRetries: 10, retryDelay: 150 });
 }
 
 async function removeFixedFile(path) {
