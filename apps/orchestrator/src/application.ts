@@ -1674,6 +1674,7 @@ export async function createOrchestratorApplication(
             id: instanceId,
             instanceGeneration: generation,
             localMcpBridge: (input) => mcpBridge!.openLocal(input),
+            prepareLocalMcpBridge: (input) => mcpBridge!.openLocal(input),
             remoteRuntimes: new RemoteCodexRuntimeResolver({
               store,
               remoteExecution,

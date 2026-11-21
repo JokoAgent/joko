@@ -31,7 +31,7 @@ export interface AppServerHostOptions {
   readonly apiKeyAuth?: () => Promise<string>;
   readonly requireEphemeralAuth?: boolean;
   readonly transport?: StdioJsonRpcTransportOptions;
-  readonly transportFactory?: () => RpcTransport;
+  readonly transportFactory?: (options?: StdioJsonRpcTransportOptions) => RpcTransport;
   readonly clientName?: string;
   readonly clientTitle?: string;
   readonly clientVersion?: string;
@@ -385,7 +385,7 @@ export class AppServerHost {
 
   async #start(): Promise<number> {
     const generation = this.#generation + 1;
-    const transport = this.#options.transportFactory?.() ?? new StdioJsonRpcTransport(this.#options.transport);
+    const transport = this.#options.transportFactory?.(this.#options.transport) ?? new StdioJsonRpcTransport(this.#options.transport);
     this.#generation = generation;
     this.#transport = transport;
     this.#initializeResult = undefined;

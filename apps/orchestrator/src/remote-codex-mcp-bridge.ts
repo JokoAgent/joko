@@ -3,7 +3,8 @@ import { createServer, type IncomingMessage, type Server as HttpServer, type Ser
 import type { AddressInfo } from "node:net";
 import {
   type CodexMcpOpenInput,
-  type CodexMcpRuntimeLease
+  type CodexMcpRuntimeLease,
+  type CodexMcpSessionInput
 } from "@joko/adapter-codex";
 import type { RemoteForwardingTransportPort, RemoteReverseForwardHandle } from "@joko/remote-ssh";
 import { Server as ProtocolServer } from "@modelcontextprotocol/sdk/server/index.js";
@@ -30,6 +31,7 @@ const MAXIMUM_REQUEST_BYTES = 2 * 1_024 * 1_024;
 const SHUTDOWN_TIMEOUT_MS = 2_000;
 
 type FrozenTool = PiMcpBridgeSnapshot["mcpBridge"]["tools"][number];
+type LocalCodexMcpInput = CodexMcpSessionInput & { readonly threadId?: string };
 
 export interface RemoteCodexMcpForwardingAuthority {
   readonly forwarding?: RemoteForwardingTransportPort;
@@ -83,13 +85,13 @@ export class CodexMcpBridgeManager {
     return this.#open(authority, input);
   }
 
-  async openLocal(input: CodexMcpOpenInput): Promise<CodexMcpRuntimeLease> {
+  async openLocal(input: LocalCodexMcpInput): Promise<CodexMcpRuntimeLease> {
     return this.#open(undefined, input);
   }
 
   async #open(
     authority: RemoteCodexMcpForwardingAuthority | undefined,
-    input: CodexMcpOpenInput
+    input: LocalCodexMcpInput
   ): Promise<CodexMcpRuntimeLease> {
     this.#assertOpen();
     input.signal?.throwIfAborted();
@@ -239,7 +241,7 @@ export class CodexMcpBridgeManager {
   async #handleRequest(input: {
     readonly request: IncomingMessage;
     readonly response: ServerResponse;
-    readonly input: CodexMcpOpenInput;
+    readonly input: LocalCodexMcpInput;
     readonly snapshot: PiMcpBridgeSnapshot;
     readonly pathServers: ReadonlyMap<string, { readonly serverId: string; readonly tools: readonly FrozenTool[] }>;
     readonly sessions: Map<string, ProtocolSession>;
@@ -280,7 +282,7 @@ export class CodexMcpBridgeManager {
 
   async #createProtocolSession(
     route: { readonly serverId: string; readonly tools: readonly FrozenTool[] },
-    input: CodexMcpOpenInput,
+    input: LocalCodexMcpInput,
     snapshot: PiMcpBridgeSnapshot,
     routeAbort: AbortSignal,
     assertCurrent: () => void,
@@ -378,13 +380,13 @@ function groupTools(tools: readonly FrozenTool[]): Map<string, readonly FrozenTo
   return new Map([...mutable].map(([serverId, group]) => [serverId, Object.freeze([...group])])) as Map<string, readonly FrozenTool[]>;
 }
 
-function codexServerName(input: CodexMcpOpenInput, serverId: string, routeSecret: string): string {
+function codexServerName(input: LocalCodexMcpInput, serverId: string, routeSecret: string): string {
   const slug = serverId.replace(/[^A-Za-z0-9_-]/gu, "_").replace(/^_+|_+$/gu, "").slice(0, 24) || "tools";
   const digest = createHash("sha256")
     .update(input.sessionId).update("\0")
     .update(input.targetId).update("\0")
     .update(String(input.generation)).update("\0")
-    .update(input.threadId).update("\0")
+    .update(input.threadId ?? "").update("\0")
     .update(serverId).update("\0")
     .update(routeSecret)
     .digest("hex").slice(0, 12);

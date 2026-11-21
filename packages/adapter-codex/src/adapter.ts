@@ -194,6 +194,8 @@ export interface CodexAdapterOptions extends Omit<CodexInputResolvers, "resolveS
   readonly remoteRuntimes?: CodexRemoteRuntimePort;
   /** Owner-private standard MCP facade for local Codex Sessions. */
   readonly localMcpBridge?: (input: CodexMcpOpenInput) => Promise<CodexMcpRuntimeLease>;
+  /** Prepare a local Session's catalog before its new native thread has an ID. */
+  readonly prepareLocalMcpBridge?: (input: CodexMcpSessionInput) => Promise<CodexMcpRuntimeLease>;
   /** Durable service-owned effective preference for Codex native memory. */
   readonly resolveNativeMemoryEnabled?: () => boolean | Promise<boolean>;
   readonly resolveNativeSkills?: ApprovedSkillResolver;
@@ -326,6 +328,7 @@ interface LoadedCodexSkill {
 
 interface SessionRuntime {
   readonly host: AppServerHost;
+  readonly processProviderId?: string;
   readonly profileKey: string;
   readonly remote: boolean;
   readonly prepareNativeSkills?: CodexRemoteRuntime["prepareNativeSkills"];
@@ -473,6 +476,7 @@ interface YieldTurnResolution {
 interface CodexReadScope {
   readonly host: AppServerHost;
   readonly hostGeneration?: number;
+  readonly processProviderId?: string;
   readonly workspaceRoot: string;
   readonly profileKey: string;
   readonly remote: boolean;
@@ -503,6 +507,8 @@ interface CompactionWaiter {
 const NATIVE_REFERENCE_PREFIX = "codex-thread:";
 const NATIVE_REFERENCE_VERSION = 1;
 export const CODEX_APP_SERVER_VERSION = "0.166.0";
+const MANAGED_PROCESS_PROVIDER = "joko-managed";
+const SMART_PROCESS_PROVIDER = "joko-smart";
 const REVIEW_PERMISSION_PROFILE = "joko-review-readonly";
 const REVIEW_MAXIMUM_INVENTORY_ITEMS = 4_096;
 const REVIEW_MAXIMUM_INVENTORY_PAGES = 100;
@@ -630,6 +636,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   readonly #ownedHostOptions: AppServerHostOptions | undefined;
   readonly #accountHostOptions: AppServerHostOptions;
   readonly #accountResetHosts = new Set<AppServerHost>();
+  readonly #providerHosts = new Map<string, AppServerHost>();
   #accountResetQueue: Promise<void> = Promise.resolve();
   #accountResetPending = 0;
   readonly #resolvers: CodexInputResolvers;
@@ -654,6 +661,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   readonly #catalogEntrySources = new WeakMap<NativeSessionCatalogEntry, CodexCatalogSource>();
   readonly #remoteRuntimes: CodexRemoteRuntimePort | undefined;
   readonly #localMcpBridge: CodexAdapterOptions["localMcpBridge"];
+  readonly #prepareLocalMcpBridge: CodexAdapterOptions["prepareLocalMcpBridge"];
   readonly #hostedMcpBridge: CodexHostedExecutionOptions["openMcpBridge"];
   readonly #resolveNativeMemoryEnabled: CodexAdapterOptions["resolveNativeMemoryEnabled"];
   readonly #resolveNativeSkills: ApprovedSkillResolver | undefined;
@@ -661,12 +669,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   readonly #taskShellEnv: CodexAdapterOptions["taskShellEnv"];
   #catalogMaterializationTail: Promise<void> = Promise.resolve();
   #nativeMemoryReconcileTail: Promise<void> = Promise.resolve();
-  #nativeMemoryOverride: {
-    readonly host: AppServerHost;
+  readonly #nativeMemoryOverrides = new Map<AppServerHost, {
     readonly hostGeneration: number;
     readonly enabled: boolean;
     readonly threadsPrepared: boolean;
-  } | undefined;
+  }>();
   readonly #sessions = new Map<string, SessionRuntime>();
   readonly #freshNativeHistory = new WeakMap<SessionRuntime, { readonly thread: NativeThread; readonly revision: bigint }>();
   readonly #sessionMutations = new Map<string, { count: number; rewinding: boolean }>();
@@ -678,6 +685,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   #smartRoutingUnavailableReason: string;
   #smartRoutingRuntimeRevision: string;
   #smartRoutingHostReady = false;
+  #smartLaunchArgs: readonly string[] = [];
   #smartRoutingHostFlight: Promise<number> | undefined;
   #account: CodexAccountSnapshot | undefined;
   #nativeAuthenticationEpoch = 0;
@@ -703,7 +711,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#hosted = options.hostedExecution === undefined ? undefined : new CodexHostedExecution(options.hostedExecution);
     this.#nativeExecution = options.nativeExecution;
     if (this.#hosted && (options.host !== undefined || options.remoteRuntimes !== undefined
-      || options.localMcpBridge !== undefined || options.resolveNativeSkills !== undefined || options.resolveNativeSkillPolicy !== undefined
+      || options.localMcpBridge !== undefined || options.prepareLocalMcpBridge !== undefined
+      || options.resolveNativeSkills !== undefined || options.resolveNativeSkillPolicy !== undefined
       || options.resolveNativeMemoryEnabled !== undefined || options.smartRouting !== undefined)) {
       throw new TypeError("A hosted native process cannot borrow a local runtime, resources or subagent routing.");
     }
@@ -769,6 +778,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#resolveNativeSkillPolicy = options.resolveNativeSkillPolicy;
     this.#taskShellEnv = options.taskShellEnv;
     this.#localMcpBridge = options.hostedExecution?.openMcpBridge ?? options.localMcpBridge;
+    this.#prepareLocalMcpBridge = options.prepareLocalMcpBridge;
     this.#hostedMcpBridge = options.hostedExecution?.openMcpBridge;
     this.#resolveNativeMemoryEnabled = options.resolveNativeMemoryEnabled;
     if (!Number.isSafeInteger(this.#instanceGeneration) || this.#instanceGeneration < 1) {
@@ -863,7 +873,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Use a service node with exact local process inspection support."
       });
     }
-    const usage = (await Promise.all([host, ...this.#accountResetHosts].filter(candidate => candidate.processInspectionSupported)
+    const usage = (await Promise.all([host, ...this.#providerHosts.values(), ...this.#accountResetHosts].filter(candidate => candidate.processInspectionSupported)
       .map(candidate => candidate.inspectProcessUsage()))).flat();
     if (host !== this.#host) return { capturedAt: this.#now(), processes: [] };
     return {
@@ -958,6 +968,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       const smartGeneration = await smartHost.ensureStarted();
       this.#assertOpen();
       if (supportsNativeCollaboration(smartHost.initializeResult?.userAgent)) {
+        this.#smartLaunchArgs = generation.launchArgs;
         this.#smartRoutingApplied = true;
         this.#smartRoutingUnavailableReason = "";
         return smartGeneration;
@@ -1050,19 +1061,19 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       if (!supportsNativeMemoryRuntime(this.#host)) return this.unsupported("memory.native");
       const enabled = await this.#readNativeMemoryPreference();
       this.#assertOpen();
-      return this.#applyNativeMemoryPreference(
-        this.#host,
-        enabled,
-        false,
-        () => this.#assertOpen()
-      );
+      if ([...this.#nativeMemoryOverrides].some(([host, value]) => host.isActiveGeneration(value.hostGeneration)
+        && value.threadsPrepared && value.enabled !== enabled)) return "next_session";
+      for (const host of [this.#host, ...this.#providerHosts.values()]) {
+        if (!host.isActiveGeneration(host.generation)) continue;
+        const result = await this.#applyNativeMemoryPreference(host, enabled, false, () => this.#assertOpen());
+        if (result !== "immediate") return result;
+      }
+      return "immediate";
     });
   }
 
   nativeMemoryHasPreparedThreads(): boolean {
-    const applied = this.#nativeMemoryOverride;
-    return applied?.host === this.#host && applied.threadsPrepared
-      && this.#host.isActiveGeneration(applied.hostGeneration);
+    return [...this.#nativeMemoryOverrides].some(([host, value]) => value.threadsPrepared && host.isActiveGeneration(value.hostGeneration));
   }
 
   async readNativeMemoryStatus(signal?: AbortSignal): Promise<NativeMemoryStatus> {
@@ -1125,11 +1136,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }
       // config/read describes the process defaults, not the configuration of
       // already loaded threads. A drifted default cannot confirm their state.
-      if (this.#nativeMemoryOverride?.host === this.#host
-        && this.#nativeMemoryOverride.hostGeneration === hostGeneration
-        && this.#nativeMemoryOverride.enabled !== enabled) return {};
-      if (this.#nativeMemoryOverride?.host !== this.#host
-        || this.#nativeMemoryOverride.hostGeneration !== hostGeneration) {
+      const applied = this.#nativeMemoryOverrides.get(this.#host);
+      if ([...this.#nativeMemoryOverrides].some(([host, value]) => host.isActiveGeneration(value.hostGeneration)
+        && (host === this.#host || value.threadsPrepared) && value.enabled !== enabled)) return {};
+      if (applied?.hostGeneration !== hostGeneration) {
         const desiredEnabled = await this.#readNativeMemoryPreference();
         assertCurrent();
         if (desiredEnabled !== enabled) return {};
@@ -1197,7 +1207,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {
-    return this.#withNativeMutation(context, () => this.#createSession(input, context));
+    return this.#withNativeMutation(context, () => this.#createSession(input, context), input);
   }
 
   async #createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {
@@ -1208,8 +1218,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (input.target.remoteWorkspace !== undefined && input.nativeStart?.kind !== "attach") {
       throw remoteMutationUnsupported("create or fork a native Session");
     }
-    const scope = await this.#readScope(input.target, context.signal, { requireNewSessionAdmission: true });
     if (input.nativeStart?.kind === "attach") {
+      await this.#readScope(input.target, context.signal, { requireNewSessionAdmission: true });
       const binding = bindingFromReference(input.nativeStart.nativeReference, context.generation);
       const resumed = await this.#resumeSession(binding, context, true);
       return resumed.binding;
@@ -1221,6 +1231,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       input.fastMode
     );
     this.#hosted?.assertModel(input.providerId, input.modelId);
+    const scope = await this.#taskReadScope(context, input);
     if (input.permissionMode === "bypassPermissions" && !input.target.trusted && this.#hosted === undefined) {
       throw adapterError({
         code: "CODEX_FULL_ACCESS_REQUIRES_TRUST",
@@ -1298,7 +1309,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     let initialMcp: CodexMcpRuntimeLease | undefined;
     if (runtimePolicy === "standard" && (scope.remote || scope.openMcpBridge !== undefined)) {
       try {
-        if (this.#hostedMcpBridge) {
+        if (this.#hostedMcpBridge || (!scope.remote && this.#prepareLocalMcpBridge)) {
           // A fresh native thread has no rollout to resume. Install the private
           // Source routes at creation; tool admission still requires its live turn.
           const prepared = await this.#openMcpRuntime(scope, undefined, context);
@@ -1320,9 +1331,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         nativeConfiguration = prepared.nativeConfiguration;
       } catch (error) { managedRoute?.dispose(); smartRoute?.dispose(); await initialMcp?.release(); throw error; }
     }
-    if (smartRoute !== undefined) (request.params as JsonObject)["modelProvider"] = smartRoute.modelProviderId;
-    else if (managedRoute !== undefined) (request.params as JsonObject)["modelProvider"] = nativeManagedProviderId(managedRoute);
-    const managedConfiguration = this.#nativeRouteConfiguration(managedRoute, smartRoute);
+    if (smartRoute !== undefined) (request.params as JsonObject)["modelProvider"] = scope.processProviderId ?? smartRoute.modelProviderId;
+    else if (managedRoute !== undefined) (request.params as JsonObject)["modelProvider"] = scope.processProviderId ?? nativeManagedProviderId(managedRoute);
+    const managedConfiguration = this.#nativeRouteConfiguration(managedRoute, smartRoute, scope.processProviderId);
     nativeConfiguration = workingContextConfiguration({ ...(nativeConfiguration ?? {}), ...this.#taskShellConfiguration(context),
       ...nativeWebPolicyConfiguration(context.nativeToolAuthorization?.snapshot?.() ?? context.policySnapshot) }, context, input.providerId, input.modelId);
     const initialConfiguration: JsonObject = {
@@ -1377,10 +1388,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         });
       }
       record = objectValue(response.value, "session response");
-      this.#assertManagedRouteResponse(record, managedRoute);
+      this.#assertManagedRouteResponse(record, managedRoute, scope.processProviderId);
       const observedModelId = optionalString(record["model"]) ?? input.modelId;
       if (smartRoute !== undefined) {
-        if (record["modelProvider"] !== smartRoute.modelProviderId || observedModelId === undefined) throw smartRouteUnavailable(true);
+        if (record["modelProvider"] !== (scope.processProviderId ?? smartRoute.modelProviderId) || observedModelId === undefined) throw smartRouteUnavailable(true);
         smartRoute.bindRoot({
           threadId: thread.id,
           providerId: input.providerId ?? this.#providerId,
@@ -1476,7 +1487,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       context.target,
       "provision",
       context.signal,
-      parseNativeReference(resumedBinding.opaqueRef).profileKey
+      parseNativeReference(resumedBinding.opaqueRef).profileKey,
+      await this.#taskReadScope(context)
     ).catch((error) => {
       throw this.#nativeThreadReadFailure(error, "provision");
     });
@@ -1616,7 +1628,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       const record = objectValue(response.value, "resume response");
       const observedModelId = optionalString(record["model"]) ?? context.modelSelection?.modelId;
       if (smartRoute !== undefined) {
-        if (record["modelProvider"] !== smartRoute.modelProviderId || observedModelId === undefined) throw smartRouteUnavailable(true);
+        if (record["modelProvider"] !== (inspection.scope.processProviderId ?? smartRoute.modelProviderId) || observedModelId === undefined) throw smartRouteUnavailable(true);
         smartRoute.bindRoot({
           threadId: thread.id,
           providerId: context.modelSelection?.providerId ?? this.#providerId,
@@ -1676,12 +1688,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       if (threadId !== runtime.threadId) throw invalidReviewProfile();
       return stateFromRuntime(runtime);
     }
+    const candidate = this.#sessions.get(context.sessionId);
+    const live = candidate !== undefined && this.#matchesCoreFence(candidate, context)
+      && this.#isRuntimeCurrent(candidate, candidate.hostGeneration) ? candidate : undefined;
     const inspected = await this.#readValidatedNativeThread(
       threadId,
       context.target,
       "probe",
       context.signal,
-      parseNativeReference(binding.opaqueRef).profileKey
+      parseNativeReference(binding.opaqueRef).profileKey,
+      live === undefined ? undefined : this.#scopeForRuntime(live)
     ).catch((error) => {
       throw this.#requestFailure(error, "probe", "CODEX_NATIVE_SESSION_UNAVAILABLE", false);
     });
@@ -3552,7 +3568,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   dispose(): Promise<void> {
     if (this.#disposeFlight !== undefined) return this.#disposeFlight;
-    if (this.#disposed && this.#nativeEnvironments.size === 0 && this.#accountResetHosts.size === 0) return Promise.resolve();
+    if (this.#disposed && this.#nativeEnvironments.size === 0 && this.#accountResetHosts.size === 0 && this.#providerHosts.size === 0) return Promise.resolve();
     this.#disposed = true;
     for (const flight of this.#nativeTextFlights) flight.abort();
     this.#managedProviders?.dispose();
@@ -3608,6 +3624,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }));
     await Promise.all([
       ...(this.#ownsHost ? [this.#host.shutdown()] : []),
+      ...[...this.#providerHosts].map(([id, host]) => this.#closeProviderHost(id, host, false)),
       ...[...this.#accountResetHosts].map(host => this.#closeAccountResetHost(host)),
       ...(this.#remoteRuntimes === undefined ? [] : [this.#remoteRuntimes.shutdown()])
     ]);
@@ -3659,6 +3676,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     await Promise.allSettled(runtimes.map((runtime) => this.#releaseRuntimeSubscription(runtime, false)));
     await Promise.all([
       ...(this.#ownsHost ? [this.#host.forceShutdown()] : []),
+      ...[...this.#providerHosts].map(([id, host]) => this.#closeProviderHost(id, host, true)),
       ...[...this.#accountResetHosts].map(host => this.#closeAccountResetHost(host)),
       ...(this.#remoteRuntimes === undefined
         ? []
@@ -3687,7 +3705,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       if (!scope.host.isActiveGeneration(expectedHostGeneration)) throw remoteRuntimeStale();
     };
     assertCurrent();
-    const managedConfiguration = this.#nativeRouteConfiguration(managedRoute, smartRoute);
+    const managedConfiguration = this.#nativeRouteConfiguration(managedRoute, smartRoute, scope.processProviderId);
     const configuration: JsonObject = {
       ...(managedConfiguration ?? {}),
       ...(nativeConfiguration ?? {}),
@@ -3701,8 +3719,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       ...(permissionMode === undefined ? {} : permissionParams(permissionMode)),
       excludeTurns: true,
       ...(selection === undefined
-        ? smartRoute === undefined ? {} : { modelProvider: smartRoute.modelProviderId }
-        : { modelProvider: smartRoute?.modelProviderId ?? (managedRoute === undefined ? selection.providerId : nativeManagedProviderId(managedRoute)), model: selection.modelId }),
+        ? smartRoute === undefined ? {} : { modelProvider: scope.processProviderId ?? smartRoute.modelProviderId }
+        : { modelProvider: scope.processProviderId ?? smartRoute?.modelProviderId ?? (managedRoute === undefined ? selection.providerId : nativeManagedProviderId(managedRoute)), model: selection.modelId }),
       ...(this.#hosted === undefined
         ? developerInstructions === undefined ? {} : { developerInstructions }
         : { developerInstructions: this.#hosted.instructions(developerInstructions) }),
@@ -3754,7 +3772,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const thread = parseThreadResult(response.value);
     await assertNativeThreadTarget(thread, threadId, workspaceRoot, "provision", scope.remote);
     assertCurrent();
-    this.#assertManagedRouteResponse(objectValue(response.value, "resume response"), managedRoute);
+    this.#assertManagedRouteResponse(objectValue(response.value, "resume response"), managedRoute, scope.processProviderId);
     return response;
   }
 
@@ -3873,20 +3891,87 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
   }
 
+  async #taskReadScope(context: AdapterContext, selection: { readonly providerId?: string; readonly modelId?: string } | undefined = context.modelSelection): Promise<CodexReadScope> {
+    const current = this.#sessions.get(context.sessionId);
+    if (current !== undefined && this.#matchesCoreFence(current, context) && this.#isRuntimeCurrent(current, current.hostGeneration)) {
+      return this.#scopeForRuntime(current);
+    }
+    const scope = await this.#readScope(context.target, context.signal);
+    if (scope.remote || this.#ownedHostOptions?.transport?.command === undefined
+      || versionFromUserAgent(scope.host.initializeResult?.userAgent) !== CODEX_APP_SERVER_VERSION) return scope;
+    const smart = this.#smartRoutingApplied && context.runtimePolicy !== "review_read_only";
+    const managed = selection?.providerId !== undefined && selection.modelId !== undefined
+      && this.#managedProviders?.hasProvider(selection.providerId) === true;
+    if (!smart && !managed) return scope;
+    let processProviderId = smart ? SMART_PROCESS_PROVIDER : MANAGED_PROCESS_PROVIDER;
+    if (context.binding !== undefined) {
+      const stored = await this.#readValidatedNativeThread(threadIdFromBinding(context.binding), context.target,
+        "provision", context.signal, parseNativeReference(context.binding.opaqueRef).profileKey, scope);
+      const previous = stored.processProviderId;
+      const providerId = selection?.providerId;
+      const previousManaged = managed && !smart && providerId !== undefined && (previous === providerId
+        || previous === nativeManagedChatProviderId(providerId));
+      if (previous !== undefined && (previousManaged || smart && /^joko-smart-[0-9a-f]{32}$/u.test(previous))) {
+        processProviderId = previous;
+      }
+    }
+    return this.#providerProcessScope(scope, processProviderId, smart);
+  }
+
+  async #providerProcessScope(scope: CodexReadScope, providerId: string, smart: boolean): Promise<CodexReadScope> {
+    scope.assertCurrent();
+    const launch = this.#ownedHostOptions;
+    if (launch?.transport?.command === undefined || scope.remote || !/^[A-Za-z0-9_.-]{1,128}$/u.test(providerId)) {
+      throw managedRouteUnavailable();
+    }
+    let host = this.#providerHosts.get(providerId);
+    if (host === undefined) {
+      const prefix = `model_providers.${JSON.stringify(providerId)}`;
+      const processOwner = launch.transport.processOwner;
+      // The published app-server validates the process selection on every input.
+      // Only a Session-scoped configuration can make this placeholder routable.
+      host = new AppServerHost({ ...launch, transport: { ...launch.transport,
+        ...(processOwner === undefined ? {} : { processOwner: { ...processOwner, recoverStale: false } }),
+        args: [...(launch.transport.args ?? []), ...(smart ? this.#smartLaunchArgs : []),
+          "-c", `model_provider=${JSON.stringify(providerId)}`, "-c", `${prefix}.name=${JSON.stringify(providerId)}`,
+          "-c", `${prefix}.base_url="http://127.0.0.1:0"`, "-c", `${prefix}.wire_api="responses"`]
+      } });
+      this.#providerHosts.set(providerId, host);
+    }
+    const owned = host;
+    const hostGeneration = await owned.ensureStarted();
+    const assertCurrent = () => {
+      scope.assertAuthorityCurrent();
+      if (this.#providerHosts.get(providerId) !== owned || !owned.isActiveGeneration(hostGeneration)
+        || versionFromUserAgent(owned.initializeResult?.userAgent) !== CODEX_APP_SERVER_VERSION) throw managedRouteUnavailable();
+    };
+    assertCurrent();
+    return { ...scope, host: owned, hostGeneration, processProviderId: providerId, assertCurrent };
+  }
+
+  async #closeProviderHost(id: string, host: AppServerHost, force: boolean): Promise<void> {
+    if (force) await host.forceShutdown();
+    else await host.shutdown().catch(() => host.forceShutdown());
+    if (this.#providerHosts.get(id) === host) this.#providerHosts.delete(id);
+    this.#nativeMemoryOverrides.delete(host);
+  }
+
   async #readValidatedNativeThread(
     threadId: string,
     target: TargetDescriptor,
     phase: "probe" | "provision",
     signal?: AbortSignal,
-    expectedProfileKey?: string
+    expectedProfileKey?: string,
+    suppliedScope?: CodexReadScope
   ): Promise<{
     readonly thread: NativeThread;
     readonly hostGeneration: number;
     readonly workspaceRoot: string;
     readonly profileKey: string;
     readonly scope: CodexReadScope;
+    readonly processProviderId?: string;
   }> {
-    const scope = await this.#readScope(target, signal);
+    const scope = suppliedScope ?? await this.#readScope(target, signal);
     if (expectedProfileKey !== undefined && expectedProfileKey !== scope.profileKey) throw invalidNativeReference();
     scope.assertCurrent();
     const response = await scope.host.request("thread/read", { threadId, includeTurns: false }, {
@@ -3896,6 +3981,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     scope.assertCurrent();
     if (scope.hostGeneration !== undefined && response.hostGeneration !== scope.hostGeneration) throw remoteRuntimeStale();
     const thread = parseThreadResult(response.value);
+    const processProviderId = optionalString(objectValue(objectValue(response.value)["thread"])["modelProvider"]);
     await assertNativeThreadTarget(thread, threadId, scope.workspaceRoot, phase, scope.remote);
     scope.assertCurrent();
     return {
@@ -3903,7 +3989,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       hostGeneration: response.hostGeneration,
       workspaceRoot: scope.workspaceRoot,
       profileKey: scope.profileKey,
-      scope
+      scope,
+      ...(processProviderId === undefined ? {} : { processProviderId })
     };
   }
 
@@ -3912,6 +3999,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     return {
       host: runtime.host,
       hostGeneration: runtime.hostGeneration,
+      ...(runtime.processProviderId === undefined ? {} : { processProviderId: runtime.processProviderId }),
       workspaceRoot: runtime.targetWorkspaceRoot,
       profileKey: runtime.profileKey,
       remote: runtime.remote,
@@ -4051,14 +4139,15 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   #nativeRouteConfiguration(
     route?: ManagedProviderRouteBinding,
-    smartRoute?: ManagedProviderSmartRoutingBinding
+    smartRoute?: ManagedProviderSmartRoutingBinding,
+    processProviderId?: string
   ): JsonObject | undefined {
     if (this.#managedProviders === undefined) return undefined;
     return {
       "shell_environment_policy.exclude": [...this.#managedProviders.secretEnvironmentNames],
       ...(smartRoute === undefined ? {} : {
-        model_providers: { [smartRoute.modelProviderId]: {
-          name: smartRoute.modelProviderId,
+        model_providers: { [processProviderId ?? smartRoute.modelProviderId]: {
+          name: processProviderId ?? smartRoute.modelProviderId,
           base_url: smartRoute.baseUrl,
           wire_api: "responses",
           requires_openai_auth: true,
@@ -4069,8 +4158,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         } }
       }),
       ...(route === undefined ? {} : {
-        model_providers: { [nativeManagedProviderId(route)]: {
-          name: nativeManagedProviderId(route),
+        model_providers: { [processProviderId ?? nativeManagedProviderId(route)]: {
+          name: processProviderId ?? nativeManagedProviderId(route),
           base_url: route.baseUrl,
           wire_api: "responses",
           env_key: route.apiKeyEnvironment,
@@ -4408,6 +4497,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           }
         };
         if (this.#hostedMcpBridge) mcp = await this.#hostedMcpBridge(input);
+        else if (!scope.remote && threadId === undefined && this.#prepareLocalMcpBridge) mcp = await this.#prepareLocalMcpBridge(input);
         else {
           if (threadId === undefined) throw mcpUnavailable(scope.remote);
           mcp = await scope.openMcpBridge({ ...input, threadId });
@@ -4477,8 +4567,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
   }
 
-  #assertManagedRouteResponse(record: JsonObject, route?: ManagedProviderRouteBinding): void {
-    if (route !== undefined && (record["modelProvider"] !== nativeManagedProviderId(route) || record["model"] !== route.model.modelId)) {
+  #assertManagedRouteResponse(record: JsonObject, route?: ManagedProviderRouteBinding, processProviderId?: string): void {
+    if (route !== undefined && (record["modelProvider"] !== (processProviderId ?? nativeManagedProviderId(route)) || record["model"] !== route.model.modelId)) {
       throw managedRouteUnavailable(true);
     }
   }
@@ -4550,6 +4640,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (runtimeHasProductWork(runtime) || runtime.compaction !== undefined || runtime.nativeTasks.hasActiveTasks()) throw managedRouteUnavailable();
     const smartRoute = await this.#prepareSmartRoute(providerId, modelId, context);
     const route = smartRoute === undefined ? await this.#prepareManagedRoute(providerId, modelId, context) : undefined;
+    if (this.#ownedHostOptions?.transport?.command !== undefined && versionFromUserAgent(runtime.host.initializeResult?.userAgent) === CODEX_APP_SERVER_VERSION
+      && (runtime.processProviderId !== undefined) !== (route !== undefined || smartRoute !== undefined)) {
+      route?.dispose(); smartRoute?.dispose();
+      throw adapterError({ code: "CODEX_PROVIDER_HANDOFF_REQUIRED", message: "Codex requires a new native thread when changing between native and managed Providers.",
+        phase: "dispatch", recovery: "Continue the task using a new thread on the selected Provider." });
+    }
     const nativeAuthenticationAdmission = this.#nativeAuthenticationAdmission(
       runtime.remote,
       route,
@@ -4598,10 +4694,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       assertCurrent();
       const record = objectValue(response.value, "route resume response");
       if (smartRoute === undefined) {
-        const nativeProviderId = route === undefined ? providerId : nativeManagedProviderId(route);
+        const nativeProviderId = runtime.processProviderId ?? (route === undefined ? providerId : nativeManagedProviderId(route));
         if (record["modelProvider"] !== nativeProviderId || record["model"] !== modelId) throw managedRouteUnavailable(true);
       } else {
-        if (record["modelProvider"] !== smartRoute.modelProviderId || record["model"] !== modelId) throw smartRouteUnavailable(true);
+        if (record["modelProvider"] !== (runtime.processProviderId ?? smartRoute.modelProviderId) || record["model"] !== modelId) throw smartRouteUnavailable(true);
         smartRoute.bindRoot({ threadId: runtime.threadId, providerId, modelId });
       }
       const next = await this.#installRuntime({
@@ -4967,6 +5063,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       : codexNativeMemoryDirectory(input.scope.host, input.scope.pathStyle);
     const runtime: SessionRuntime = {
       host: input.scope.host,
+      ...(input.scope.processProviderId === undefined ? {} : { processProviderId: input.scope.processProviderId }),
       profileKey: input.scope.profileKey,
       remote: input.scope.remote,
       ...(input.scope.prepareNativeSkills === undefined ? {} : { prepareNativeSkills: input.scope.prepareNativeSkills }),
@@ -6849,7 +6946,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (runtime.mcpPending) return allowPending;
     if (runtime.mcp === undefined) return true;
     if (!runtime.remote && !this.#hostedMcpBridge && runtime.mcp.routes.length === 0) {
-      return runtimeHasProductWork(runtime) || runtime.nativeTasks.hasActiveTasks();
+      const fresh = this.#freshNativeHistory.get(runtime);
+      if (this.#prepareLocalMcpBridge === undefined || fresh === undefined
+        || runtime.host.contentRevision(runtime.threadId, runtime.hostGeneration) !== fresh.revision) {
+        return runtimeHasProductWork(runtime) || runtime.nativeTasks.hasActiveTasks();
+      }
     }
     try {
       runtime.mcp.assertCurrent();
@@ -7125,9 +7226,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       // Claim the configuration before thread/start or thread/resume can load
       // it. A concurrent settings change must not mutate this generation while
       // native thread creation is in flight, even before runtime publication.
-      const applied = this.#nativeMemoryOverride;
-      if (applied?.host === scope.host && scope.host.isActiveGeneration(applied.hostGeneration)) {
-        this.#nativeMemoryOverride = { ...applied, threadsPrepared: true };
+      const applied = this.#nativeMemoryOverrides.get(scope.host);
+      if (applied !== undefined && scope.host.isActiveGeneration(applied.hostGeneration)) {
+        this.#nativeMemoryOverrides.set(scope.host, { ...applied, threadsPrepared: true });
       }
     });
   }
@@ -7173,18 +7274,17 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const observedGeneration = host.generation;
     const running = host.initializeResult !== undefined && host.isActiveGeneration(observedGeneration);
     if (!running && !startIfNeeded) return "next_session";
-    if (running
-      && this.#nativeMemoryOverride?.host === host
-      && this.#nativeMemoryOverride.hostGeneration === observedGeneration) {
+    const applied = this.#nativeMemoryOverrides.get(host);
+    if (running && applied?.hostGeneration === observedGeneration) {
       // Native feature updates do not replace loaded threads' execution
       // configuration. Keep one preference for this process generation until
       // the owning Host can retire it without interrupting accepted work.
-      if (this.#nativeMemoryOverride.enabled === enabled) return "immediate";
-      if (this.#nativeMemoryOverride.threadsPrepared) return "next_session";
+      if (applied.enabled === enabled) return "immediate";
+      if (applied.threadsPrepared) return "next_session";
     }
     // A failed or unconfirmed write can still change an empty process. Its
     // previous confirmed value must not authorize a later reverted setting.
-    this.#nativeMemoryOverride = undefined;
+    this.#nativeMemoryOverrides.delete(host);
     let response;
     try {
       response = await host.request("experimentalFeature/enablement/set", {
@@ -7242,12 +7342,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     } catch (error) {
       throw this.#requestFailure(error, startIfNeeded ? "provision" : "dispatch", "CODEX_NATIVE_MEMORY_RECONCILE_FAILED", true);
     }
-    this.#nativeMemoryOverride = {
-      host,
+    this.#nativeMemoryOverrides.set(host, {
       hostGeneration: response.hostGeneration,
       enabled,
       threadsPrepared: false
-    };
+    });
     return "immediate";
   }
 
@@ -7359,32 +7458,32 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     } else throw new JokoError(error);
   }
 
-  async #withNativeMutation<T>(context: AdapterContext, action: () => Promise<T>): Promise<T> {
+  async #withNativeMutation<T>(context: AdapterContext, action: () => Promise<T>, selection?: { readonly providerId?: string; readonly modelId?: string }): Promise<T> {
     this.#assertOpen();
     this.#assertBackendContext(context);
     assertDispatchNotCancelled(context.signal);
     const preparation = { context }, preparations = this.#nativePreparationContexts.get(context.sessionId) ?? new Set<{ readonly context: AdapterContext }>();
     preparations.add(preparation); this.#nativePreparationContexts.set(context.sessionId, preparations);
     try {
-      return await this.#withPreparedNativeMutation(context, action);
+      return await this.#withPreparedNativeMutation(context, action, selection);
     } finally {
       preparations.delete(preparation);
       if (preparations.size === 0 && this.#nativePreparationContexts.get(context.sessionId) === preparations) this.#nativePreparationContexts.delete(context.sessionId);
     }
   }
 
-  async #withPreparedNativeMutation<T>(context: AdapterContext, action: () => Promise<T>): Promise<T> {
+  async #withPreparedNativeMutation<T>(context: AdapterContext, action: () => Promise<T>, selection?: { readonly providerId?: string; readonly modelId?: string }): Promise<T> {
     if (this.#hosted) {
       if (context.runtimePolicy === "review_read_only" && context.persistentReadOnly !== "side_chat" || context.target.remoteWorkspace) throw new TypeError("This hosted native execution does not accept another runtime domain.");
       this.#hosted.assertModel(context.modelSelection?.providerId, context.modelSelection?.modelId);
-      await this.#ensureLocalHostStarted();
-      if (versionFromUserAgent(this.#host.initializeResult?.userAgent) !== CODEX_APP_SERVER_VERSION) {
+      const scope = await this.#taskReadScope(context, selection);
+      if (versionFromUserAgent(scope.host.initializeResult?.userAgent) !== CODEX_APP_SERVER_VERSION) {
         throw adapterError({ code: "CODEX_HOSTED_PROTOCOL_UNSUPPORTED", message: `Hosted Codex requires the audited ${CODEX_APP_SERVER_VERSION} native protocol.`,
           phase: "provision", recovery: "Select the supported native runtime before opening this task's hosted Agent." });
       }
-      await this.#hosted.prepare(this.#host, this.#profileDirectory, context.signal);
+      await this.#hosted.prepare(scope.host, this.#profileDirectory, context.signal);
     } else if (this.#nativeExecution !== undefined && context.runtimePolicy !== "review_read_only") {
-      await this.#prepareNativeExecution(await this.#readScope(context.target, context.signal), context);
+      await this.#prepareNativeExecution(await this.#taskReadScope(context, selection), context);
     }
     if (this.#sessions.get(context.sessionId)?.rewindUnknown) throw rewindUnknown();
     const admission = this.#sessionMutations.get(context.sessionId) ?? { count: 0, rewinding: false };
@@ -7521,8 +7620,12 @@ function skillMentionUnavailable(): JokoError {
 function nativeManagedProviderId(route: ManagedProviderRouteBinding): string {
   // App Server reserves built-in provider names for their own inference and compaction protocols.
   return route.protocol === "openai-completions"
-    ? `joko-chat-${createHash("sha256").update(route.providerId).digest("hex").slice(0, 24)}`
+    ? nativeManagedChatProviderId(route.providerId)
     : route.providerId;
+}
+
+function nativeManagedChatProviderId(providerId: string): string {
+  return `joko-chat-${createHash("sha256").update(providerId).digest("hex").slice(0, 24)}`;
 }
 
 function codexPortableUnavailable(message: string): JokoError {
