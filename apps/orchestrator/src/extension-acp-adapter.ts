@@ -156,17 +156,17 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
     return this.confirmedIdleExits.has(JSON.stringify([sessionId, binding.opaqueRef, binding.generation]));
   }
 
-  async closeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
+  override async closeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
     this.nativeId(binding, context);
     const session = this.sessions.get(context.sessionId);
     if (session !== undefined) await this.stop(context.sessionId, session, false);
   }
 
-  override async detachSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
+  async detachSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
     await this.closeSession(binding, context);
   }
 
-  async setModel(providerId: string, modelId: string, context: AdapterContext): Promise<ProviderModel> {
+  override async setModel(providerId: string, modelId: string, context: AdapterContext): Promise<ProviderModel> {
     if (providerId !== this.providerId) throw acpError("ACP_MODEL_UNAVAILABLE", "The model belongs to another task engine.");
     const session = this.exactSession(context);
     const selected = this.models.find(model => model.modelId === modelId);
