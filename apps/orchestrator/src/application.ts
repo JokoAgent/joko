@@ -297,6 +297,7 @@ import { PartnerImportRuntime } from "./partner-import-runtime.js";
 import { adoptPartnerImportSettings, createPartnerImportEffects, isSavedPackageMissingDefault, preparePartnerImportCreation } from "./partner-import-effects.js";
 import { ExtensionRoutineRuntime } from "./extension-routine-runtime.js";
 import { ExtensionCardRuntime } from "./extension-cards/runtime.js";
+import { ExtensionNodeWorkers } from "./extension-cards/node-workers.js";
 import { ExtensionNetworkConnections } from "./extension-cards/network-connections.js";
 import { ExtensionNetworkSettings } from "./extension-cards/network-settings.js";
 import { ExtensionOAuthAccounts } from "./extension-cards/oauth-accounts.js";
@@ -2912,6 +2913,8 @@ export async function createOrchestratorApplication(
     authority: id => extensionCardRuntime?.authority(id), locale: () => persistedLocale(store),
     continueTask: (scope, text, guard) => sessionHost.enqueueExtensionCardMessage(scope.sessionId, scope.extensionId, text, guard) });
   extensionCardRuntime = new ExtensionCardRuntime({ catalog: extensionCatalog, resources: piResources, store, projects: extensionProjects,
+    nodeWorkers: new ExtensionNodeWorkers({ rootDirectory: join(config.dataDirectory, "extension-node-workers"),
+      generation: durableRuntimeGeneration(), supervisor: createDefaultManagedProcessSupervisor(), resources: piResources, redact: value => credentials.redactText(value) }),
     subscriptionTarget: (...args) => sessionHost.extensionMessageHookTarget(...args),
     subscriptionRun: (...args) => sessionHost.extensionSubscriptionRun(...args),
     taskViews: extensionTaskViews,

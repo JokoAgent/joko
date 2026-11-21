@@ -74,3 +74,32 @@ Neither invent a `joko-media://` reference nor copy it from a foreign task. `as:
 uses the file receipt; it does not silently turn an arbitrary file into supported
 media. Missing/revoked authority must preserve the user's draft and allow explicit
 retry through the existing host flow.
+
+## Verify a public download and process it locally
+
+Declare `runtime.node` with the worker entry and its JSON-RPC methods, for example
+`{"entry":"workers/rules.mjs","methods":["readRules"]}`. Keep the worker entry
+separate from the Pi extension. When the user
+grants **Run the packaged Node worker**, tools in this installation can call it.
+Declare public HTTPS hosts in `runtime.network.hosts` for downloadable assets.
+
+```js
+const verified = await joko.downloads.start({callId: message.callId, id: "rules-v1",
+  url: asset.url, sha256: asset.sha256, bytes: asset.bytes});
+if (!verified.ok) return {ok: false, result: {message: "Could not verify the rules file."}};
+const applied = await joko.node.request({callId: message.callId, method: "readRules",
+  params: {format: "json"}, downloadTokens: {rules: verified.token}});
+return {ok: applied.ok, result: applied.ok ? applied.result : {message: "Could not read the rules."}};
+```
+
+Use the expected SHA-256 and size from the asset's release metadata. The host
+checks the declared HTTPS hosts at each redirect and issues the receipt after
+both values match. Repeating a download ID with identical inputs can recover
+the receipt within 30 minutes. `joko.downloads.cancel({callId, id})` cancels the transfer or retires
+the receipt and any active worker using it.
+
+The worker accepts one JSON-RPC 2.0 request on stdin and responds with the same
+request ID on stdout. The host sets `params.downloads` to the exact leased file
+paths for that request. Read those files during the request and return the
+processed result. Node calls use the active tool ID. The host removes private
+paths from worker replies and expires receipts when the approval changes.

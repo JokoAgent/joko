@@ -5,7 +5,7 @@ import type { ExtensionCatalogManager } from "../extension-catalog.js";
 import type { PiResourceManager } from "../resource-manager.js";
 import type { ExtensionMainViewAuthority, ExtensionMainViewManager, ExtensionMainViewSurface } from "../extension-main-view-manager.js";
 import type { BridgeToolProvider, BridgeToolCallContext, BridgeToolCallResult } from "../mcp-router.js";
-import type { ExtensionMessageHook, ExtensionMessageTopic, ExtensionRuntimeDescriptor } from "../extension-surface-manifest.js";
+import { EXTENSION_NODE_PERMISSION_ID, type ExtensionMessageHook, type ExtensionMessageTopic, type ExtensionRuntimeDescriptor } from "../extension-surface-manifest.js";
 import type { ExtensionCardAuthority, ExtensionCardAction, ExtensionCardsManager } from "./manager.js";
 import type { ExtensionCardScope } from "./service.js";
 import { withExtensionCardToken } from "./service.js";
@@ -30,12 +30,14 @@ import type { ExtensionText } from "../extension-text.js";
 import type { ExtensionProjectPolicies } from "../extension-project-policy.js";
 import type { ExtensionDeviceSync } from "../extension-device-sync.js";
 import { extensionTaskViewInstallation, type ExtensionTaskViewDispatcher } from "../extension-task-view-dispatcher.js";
+import type { ExtensionNodeWorkers } from "./node-workers.js";
 
 interface Authority extends ExtensionCardAuthority {
   readonly surface: ExtensionMainViewAuthority;
   readonly installationKey: string;
   readonly taskViewInstallation?: string;
   readonly approvedAt: number;
+  readonly nodeApproved: boolean;
 }
 interface SubscriptionQueue {
   readonly items: { readonly event: SubscriptionEvent; readonly assertCurrent: () => void }[];
@@ -47,7 +49,7 @@ interface Instance {
   opening?: Promise<Page>; readonly tickets: Map<string, { scope: ExtensionCardScope; assertCurrent: () => void }>;
   readonly calls: Set<string>; pending: number;
   readonly taskViewGestures: Map<string, { connectionId: string; observedAt: number; sourceSessionId: string; assertCurrent: () => void }>;
-  readonly callGuards: Map<string, { signal: AbortSignal; assertCurrent: () => void; usage?: { nonce: string; record: () => void } }>;
+  readonly callGuards: Map<string, { signal: AbortSignal; workerSignal?: AbortSignal; assertCurrent: () => void; usage?: { nonce: string; record: () => void } }>;
   messageHookFailures: number;
   messageHooksPending: number;
   readonly subscriptions: SubscriptionQueue;
@@ -96,6 +98,7 @@ interface Options {
   readonly tasks?: Pick<ExtensionTasks, "installation" | "request" | "drain">;
   readonly targets?: Pick<ExtensionTargets, "request" | "drain">;
   readonly deviceSync?: Pick<ExtensionDeviceSync, "request" | "setActive" | "invalidatePlugin">;
+  readonly nodeWorkers?: ExtensionNodeWorkers;
   readonly text?: Pick<ExtensionText, "oneshot">;
   readonly extraDirectories?: Pick<ExtraDirectoryManager, "resolveSelection" | "listForTarget">;
   readonly connections?: Pick<ExtensionNetworkConnections, "hosts" | "token" | "identity" | "list">;
@@ -209,7 +212,9 @@ export class ExtensionCardRuntime {
       oauth: runtime.network?.secrets?.filter(secret => secret.source === "oauth").map(secret => this.options.oauth?.identity(id, secret.key) ?? null) });
     const installationKey = JSON.stringify({ ...surface, backendRevision: surface.backendRevision.toString(), resourceRevision: surface.resourceRevision.toString() });
     const taskViewInstallation = extensionTaskViewInstallation(extension);
-    return { key, installationKey, name: extension.name, runtime, surface, approvedAt: resource.approvedAt ?? 0,
+    const nodeApproved = this.options.nodeWorkers !== undefined && runtime.node !== undefined
+      && extension.permissions.some(permission => permission.id === EXTENSION_NODE_PERMISSION_ID && permission.granted);
+    return { key, installationKey, name: extension.name, runtime, surface, approvedAt: resource.approvedAt ?? 0, nodeApproved,
       ...(taskViewInstallation === undefined ? {} : { taskViewInstallation }) };
   }
   #assert(instance: Instance): void {
@@ -233,6 +238,7 @@ export class ExtensionCardRuntime {
     if (!instance.current) return;
     instance.current = false; instance.abort.abort(); instance.unregister(); instance.tickets.clear(); instance.taskViewGestures.clear();
     instance.subscriptions.items.length = 0;
+    this.options.nodeWorkers?.retire(instance.authority.key);
     this.options.deviceSync?.invalidatePlugin(instance.authority.surface.extensionId);
     this.options.cards.revoke(instance.authority.surface.extensionId);
   }
@@ -348,7 +354,9 @@ export class ExtensionCardRuntime {
       try { usage.record(); } catch { /* Usage storage does not own the dispatch outcome. */ }
       return true;
     });
-    await page.addInitScript({ content: `(${EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE})(${JSON.stringify({ agent: instance.authority.runtime.agent === true, network: instance.authority.runtime.network !== undefined, tasks: !!instance.authority.runtime.tasks, targets: instance.authority.runtime.targets === true, text: !!instance.authority.runtime.text, deviceSync: instance.authority.runtime.deviceSync === true, taskView: instance.authority.taskViewInstallation !== undefined, messageHooks: instance.authority.runtime.subscribe?.hooks ?? [] })})` });
+    await page.addInitScript({ content: `(${EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE})(${JSON.stringify({ agent: instance.authority.runtime.agent === true, network: instance.authority.runtime.network !== undefined,
+      node: instance.authority.nodeApproved, downloads: instance.authority.nodeApproved && (instance.authority.runtime.network?.hosts.length ?? 0) > 0,
+      tasks: !!instance.authority.runtime.tasks, targets: instance.authority.runtime.targets === true, text: !!instance.authority.runtime.text, deviceSync: instance.authority.runtime.deviceSync === true, taskView: instance.authority.taskViewInstallation !== undefined, messageHooks: instance.authority.runtime.subscribe?.hooks ?? [] })})` });
     if (instance.authority.runtime.mail) await page.addInitScript({ content: `${MAIL_COMPOSE_RUNTIME_SOURCE}\nObject.defineProperty(window, "jokoMail", { value: jokoMail, writable: false, configurable: false });` });
     await page.goto(url.href, { waitUntil: "load", timeout: 15_000 }); this.#assert(instance);
     return page;
@@ -467,6 +475,38 @@ export class ExtensionCardRuntime {
           readOnly: this.options.store.findSessionRuntimePolicy(scope.sessionId)?.policy === "review_read_only",
           task: scope, signal: guard.signal, assertCurrent: () => { current(); guard.assertCurrent(); this.options.cards.assertAuthority(scope); } }, request);
       }
+      case "node-request":
+      case "download-start":
+      case "download-cancel": {
+        const worker = instance.authority.runtime.node, workers = this.options.nodeWorkers;
+        if (!instance.authority.nodeApproved || !worker || !workers) return { ok: false, errorCode: "PERMISSION_DENIED" };
+        const { callId, payload: input } = request;
+        if (Object.keys(request).some(key => !["type", "callId", "payload"].includes(key)) || typeof callId !== "string"
+          || !input || typeof input !== "object" || Array.isArray(input)) return { ok: false, errorCode: "INVALID_REQUEST" };
+        const scope = this.options.cards.cards.callInfoOf(callId);
+        const workerSignal = instance.callGuards.get(callId)?.workerSignal;
+        const origin = this.#requestOwner(instance, callId);
+        if (!scope || !workerSignal || !instance.calls.has(callId) || this.options.store.findSessionRuntimePolicy(scope.sessionId)?.policy === "review_read_only") {
+          return { ok: false, errorCode: "PERMISSION_DENIED" };
+        }
+        const signal = AbortSignal.any([origin.signal, workerSignal]);
+        const owner = { key: instance.authority.key, signal, worker, installation: instance.authority.surface,
+          downloadHosts: instance.authority.runtime.network?.hosts ?? [], assertCurrent: () => {
+            origin.assertCurrent();
+            this.options.cards.assertAuthority(scope);
+            if (this.options.store.findSessionRuntimePolicy(scope.sessionId)?.policy === "review_read_only") throw new Error("Task access changed.");
+          } };
+        const args = input as Record<string, unknown>;
+        try {
+          if (request.type === "node-request") return await workers.request(owner, args);
+          if (request.type === "download-start") return await workers.download(owner, args);
+          if (Object.keys(args).length !== 1) return { ok: false, errorCode: "INVALID_REQUEST" };
+          await workers.cancelDownload(owner, args.id);
+          return { ok: true };
+        } catch {
+          return { ok: false, errorCode: signal.aborted ? "CANCELLED" : request.type === "node-request" ? "WORKER_REQUEST_FAILED" : "DOWNLOAD_FAILED" };
+        }
+      }
       case "card-update": {
         const result = await this.options.cards.cards.handleCardUpdate(id, instance.authority.key, request, current);
         return { ok: result.accepted };
@@ -521,10 +561,11 @@ export class ExtensionCardRuntime {
     const page = await this.#ensure(instance); assertCurrent();
     const callId = this.options.cards.registerCall(instance.authority.surface.extensionId, instance.authority.key, context.sessionId, null);
     const callAbort = new AbortController();
+    const workerAbort = new AbortController();
     const callSignal = AbortSignal.any([callAbort.signal, instance.abort.signal, ...(signal ? [signal] : [])]);
     const assertCallCurrent = () => { callSignal.throwIfAborted(); assertCurrent(); };
     for (const id of instance.callGuards.keys()) if (!this.options.cards.cards.callInfoOf(id)) instance.callGuards.delete(id);
-    instance.callGuards.set(callId, { signal: callSignal, assertCurrent: assertCallCurrent, ...(usage ? { usage } : {}) });
+    instance.callGuards.set(callId, { signal: callSignal, workerSignal: workerAbort.signal, assertCurrent: assertCallCurrent, ...(usage ? { usage } : {}) });
     instance.calls.add(callId);
     let rejectAbort: (reason?: unknown) => void = () => {};
     const cancelled = new Promise<never>((_, reject) => { rejectAbort = reject; });
@@ -557,6 +598,7 @@ export class ExtensionCardRuntime {
         ...(result.result && typeof result.result === "object" && !Array.isArray(result.result) ? { structuredContent: JSON.parse(this.options.redact(JSON.stringify(result.result))) as Record<string, unknown> } : {}) };
     } finally {
       clearTimeout(timer); signal?.removeEventListener("abort", cancel); instance.abort.signal.removeEventListener("abort", cancel);
+      workerAbort.abort();
       const guard = instance.callGuards.get(callId);
       if (guard) delete guard.usage;
       instance.calls.delete(callId); if (!finalized) await this.options.cards.finalizeCall(callId);
@@ -921,8 +963,11 @@ export class ExtensionCardRuntime {
     await this.#tail;
     await this.options.tasks?.drain();
     await this.options.targets?.drain();
-    await Promise.all([...this.#instances.values()].map(instance => this.#close(instance))); this.#instances.clear();
-    await this.#browser?.close().catch(() => undefined); this.#browser = undefined;
+    try { await this.options.nodeWorkers?.drain(); }
+    finally {
+      await Promise.all([...this.#instances.values()].map(instance => this.#close(instance))); this.#instances.clear();
+      await this.#browser?.close().catch(() => undefined); this.#browser = undefined;
+    }
   }
 }
 

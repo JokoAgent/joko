@@ -20,7 +20,7 @@ import type { McpServerDescriptor } from "./mcp-router.js";
 import type { PiResourceDescriptor } from "./resource-manager.js";
 import { extensionNetworkCredentialReference } from "./extension-cards/network-manifest.js";
 import { ExtensionSettingsManager } from "./extension-settings.js";
-import { parseExtensionRuntime } from "./extension-surface-manifest.js";
+import { EXTENSION_NODE_PERMISSION_ID, parseExtensionRuntime } from "./extension-surface-manifest.js";
 import type { ExtensionMainViewSurface } from "./extension-main-view-manager.js";
 import { SessionHost } from "./session-host.js";
 
@@ -99,6 +99,34 @@ async function fixture() {
   catalog.initialize();
   return { root, store, credentials, catalog };
 }
+
+it("requires a separate current grant for a packaged worker even when HTTPS is already approved", async () => {
+  const { catalog, store } = await fixture();
+  try {
+    const runtime = parseExtensionRuntime({ html: "ui/runtime/index.html", tools: [{ name: "read", description: "Read", inputSchema: { type: "object" } }],
+      network: { hosts: ["files.example.test"] }, node: { entry: "worker.mjs", methods: ["read"] } });
+    const installation = resource({ kind: "package", resourceDetails: [{ ...resource().resourceDetails[0]!, entryPath: "extension.ts", runtime }] });
+    let entry = catalog.reconcile([installation], []).entries[0]!;
+    const isGranted = () => entry.permissions.find(permission => permission.id === EXTENSION_NODE_PERMISSION_ID)?.granted;
+    const finishSetup = (grantWorker: boolean) => {
+      entry = catalog.beginSetup(entry.id, entry.revision);
+      const attemptId = entry.setup.attemptId!;
+      const approve = (fieldId: string) => {
+        entry = catalog.submitSetupInteraction({ extensionId: entry.id, attemptId, fieldId, value: true, expectedRevision: entry.revision });
+      };
+      approve("permission-confirmation");
+      if (grantWorker) approve(EXTENSION_NODE_PERMISSION_ID);
+      entry = catalog.completeSetup(entry.id, attemptId, entry.revision);
+    };
+    finishSetup(false);
+    expect(entry.setup.state).toBe("ready");
+    expect(isGranted()).toBe(false);
+    finishSetup(true);
+    expect(isGranted()).toBe(true);
+    entry = catalog.reconcile([{ ...installation, enabled: false }], []).entries[0]!;
+    expect(isGranted()).toBe(false);
+  } finally { store.close(); }
+});
 
 it("stops setup revocation after the original device loses authority between credential retirements", async () => {
   const { root, store, credentials, catalog } = await fixture();
