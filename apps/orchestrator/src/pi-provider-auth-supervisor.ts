@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import type { OperationalStore } from "@joko/store";
 import { knownModelTokenPrices, type ProviderModel } from "@joko/core";
-import { createPiModelCatalogAdditions, type PiSupportedApi } from "@joko/adapter-pi";
+import { createPiModelCatalogAdditions, openAiDefaultWorkingContext, type PiSupportedApi } from "@joko/adapter-pi";
 
 import {
   ProviderAuthUnsupportedError,
@@ -1128,6 +1128,7 @@ function nativeModelCatalog(runtime: PiProviderAuthRuntime): readonly ProviderMo
       seen.add(identity);
       const api = nonBlankNativeModelText(model.api, "API");
       const contextWindow = positiveSafeNativeModelInteger(model.contextWindow, "context window");
+      const defaultWorkingContextTokens = openAiDefaultWorkingContext(model, contextWindow);
       const maxOutputTokens = positiveSafeNativeModelInteger(model.maxTokens, "maximum output tokens");
       const input = model.input ?? ["text"];
       if (input.length === 0 || input.some((modality) => modality !== "text" && modality !== "image")) {
@@ -1148,6 +1149,7 @@ function nativeModelCatalog(runtime: PiProviderAuthRuntime): readonly ProviderMo
         displayName: model.name?.trim() || modelId,
         api,
         contextWindow,
+        ...(defaultWorkingContextTokens === undefined ? {} : { defaultWorkingContextTokens }),
         maxOutputTokens,
         supportsImages: input.includes("image"),
         // This is authoritative installed Pi registry metadata, not an

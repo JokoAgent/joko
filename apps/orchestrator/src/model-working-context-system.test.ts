@@ -67,6 +67,22 @@ async function openNode(root: string, generation: number) {
 }
 
 describe("node model working-context composition", () => {
+  it("keeps the advertised model capacity and applies the route working default through v1", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-working-default-node-"));
+    const node = await openNode(root, 1);
+    const target = targets[0]!;
+    try {
+      const descriptor = node.store.getBackend(target.backendId).descriptor;
+      node.store.upsertBackend({ ...descriptor, models: descriptor.models.map(model => model.modelId === target.modelId
+        ? { ...model, contextWindow: 1_050_000, defaultWorkingContextTokens: 500_000 } : model) });
+      expect(node.contexts.resolve(target)).toBe(500_000);
+      expect((await node.client.getModelWorkingContext({ target })).context).toMatchObject({
+        customized: false, defaultContextWindowTokens: 500_000n, effectiveContextWindowTokens: 500_000n
+      });
+      expect(node.store.getBackend(target.backendId).descriptor.models.find(model => model.modelId === target.modelId)?.contextWindow).toBe(1_050_000);
+    } finally { await node.close(); }
+  });
+
   it("persists separate Pi model compaction thresholds and restores one without changing either working window", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-model-compaction-node-"));
     let node = await openNode(root, 1);

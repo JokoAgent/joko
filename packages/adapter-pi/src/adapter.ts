@@ -139,7 +139,7 @@ import {
   stopAndRemoveManagedSubagentRuns
 } from "./durable-subagent-runs.js";
 import { handleExtensionUiRequest } from "./interactions.js";
-import { createPiModelCatalogAdditions } from "./model-catalog-additions.js";
+import { createPiModelCatalogAdditions, openAiDefaultWorkingContext } from "./model-catalog-additions.js";
 import {
   assertManagedSubagentControlTarget,
   ManagedSubagentObserver,
@@ -7897,6 +7897,8 @@ function modelFromRpc(model: PiRpcModel, authoritativeLevels?: readonly string[]
     ? canonicalPiThinkingLevels(authoritativeLevels)
     : supportedPiThinkingLevels(model.reasoning, thinkingLevelMap);
   const contextWindow = numeric(model.contextWindow, 128_000);
+  const defaultWorkingContextTokens = openAiDefaultWorkingContext({ id: model.id, api: model.api,
+    baseUrl: typeof model["baseUrl"] === "string" ? model["baseUrl"] : undefined }, contextWindow);
   const nativeCost = knownModelTokenPrices(model.cost);
   return {
     providerId: model.provider,
@@ -7907,6 +7909,7 @@ function modelFromRpc(model: PiRpcModel, authoritativeLevels?: readonly string[]
     ...(Array.isArray(model.input) ? { declaredInputModalities: [...model.input], declaredSupportsImages: model.input.includes("image") } : {}),
     ...(thinkingLevels.includes(metadata?.defaultEffort ?? "medium") ? { defaultEffort: metadata?.defaultEffort ?? "medium" } : {}),
     contextWindow,
+    ...(defaultWorkingContextTokens === undefined ? {} : { defaultWorkingContextTokens }),
     ...(contextWindowMax === undefined || contextWindowMax < contextWindow ? {} : { contextWindowMax }),
     maxOutputTokens: piModelOutputTokenLimit(optionalNumeric(model.maxTokens), contextWindow),
     ...(model.contextWindow === undefined ? {} : { contextWindowSource: "declared" as const }),

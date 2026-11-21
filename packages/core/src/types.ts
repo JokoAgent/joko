@@ -452,6 +452,8 @@ export interface ProviderModel {
     | string;
   readonly contextWindow: number;
   readonly contextWindowMax?: number;
+  /** Route default for native working context when it differs from the catalog capacity. */
+  readonly defaultWorkingContextTokens?: number;
   readonly maxOutputTokens: number;
   readonly contextWindowSource?: "declared" | "estimated";
   readonly maxOutputTokensSource?: "declared" | "estimated";

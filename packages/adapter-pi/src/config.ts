@@ -4,7 +4,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { PermissionMode, PolicySubjectKind, ProviderModel } from "@joko/core";
 import { isSameOriginModelEndpoint } from "@joko/core";
 import { piError } from "./errors.js";
-import { createPiModelCatalogAdditions } from "./model-catalog-additions.js";
+import { createPiModelCatalogAdditions, openAiDefaultWorkingContext } from "./model-catalog-additions.js";
 import { isManagedChatModel, isManagedSpeechModel } from "./model-purpose.js";
 
 export type PiSupportedApi =
@@ -638,6 +638,10 @@ export function piProviderModel(provider: PiManagedProvider, model: PiManagedMod
   const api = model.api ?? provider.api ?? "openai-completions";
   const thinkingLevels = supportedPiThinkingLevels(model.reasoning, model.thinkingLevelMap);
   const contextWindow = model.contextWindow ?? 128_000;
+  const explicitWindow = model.contextWindow !== undefined
+    && (model.discoveredMetadata === undefined || model.metadataOverrides?.includes("contextWindow") === true);
+  const defaultWorkingContextTokens = explicitWindow || !isManagedChatModel(model) ? undefined
+    : openAiDefaultWorkingContext({ id: model.id, api, baseUrl: model.baseUrl ?? provider.baseUrl }, contextWindow);
   return {
     providerId: provider.id,
     modelId: model.id,
@@ -659,6 +663,7 @@ export function piProviderModel(provider: PiManagedProvider, model: PiManagedMod
       : { declaredOutputModalities: [...model.declaredOutputModalities] }),
     ...(model.supportsFastMode === undefined ? {} : { declaredSupportsFastMode: model.supportsFastMode }),
     contextWindow,
+    ...(defaultWorkingContextTokens === undefined ? {} : { defaultWorkingContextTokens }),
     ...(model.contextWindowMax === undefined ? {} : { contextWindowMax: model.contextWindowMax }),
     maxOutputTokens: piModelOutputTokenLimit(model.maxTokens, contextWindow),
     ...(model.contextWindow === undefined ? {} : { contextWindowSource: model.contextWindowSource ?? "declared" as const }),

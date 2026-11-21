@@ -4,7 +4,8 @@ import { clampThinkingLevel, normalizeContext, type SimpleStreamOptions } from "
 import { buildBaseOptions } from "@earendil-works/pi-ai/api/simple-options";
 import { modelTokenPricesAt } from "@joko/core";
 import { describe, expect, it, vi } from "vitest";
-import { createPiModelCatalogAdditions, type createPiModelCatalogAdditionsFactory } from "./model-catalog-additions.js";
+import { createPiModelCatalogAdditions, openAiDefaultWorkingContext, type createPiModelCatalogAdditionsFactory } from "./model-catalog-additions.js";
+import { piProviderModel } from "./config.js";
 import { MANAGED_MODEL_CATALOG_RUNTIME_SOURCE } from "./model-catalog-runtime.js";
 
 type NativeProvider = ReturnType<ModelRuntime["getProviders"]>[number];
@@ -75,6 +76,23 @@ describe("Pi model catalog additions", () => {
       const custom = { ...provider, baseUrl: "https://gateway.example.test/v1" };
       expect(additions.extendProvider(custom)).toBe(custom);
     }
+  });
+
+  it("projects different API-key and subscription working defaults on the exact OpenAI connection", () => {
+    const id = "gpt-6.2-sol", capacity = 1_050_000;
+    const official = { id, api: "openai-responses" as const, baseUrl: "https://api.openai.com/v1" };
+    const subscription = { id, api: "openai-codex-responses", baseUrl: "https://chatgpt.com/backend-api" };
+    expect(openAiDefaultWorkingContext(official, capacity)).toBe(272_000);
+    expect(openAiDefaultWorkingContext(subscription, capacity)).toBe(500_000);
+    expect(openAiDefaultWorkingContext(subscription, 128_000)).toBeUndefined();
+    expect(openAiDefaultWorkingContext({ ...official, baseUrl: "https://proxy.example.test/v1" }, capacity)).toBeUndefined();
+    expect(openAiDefaultWorkingContext({ ...official, id: "other-vendor/gpt-6.2-sol" }, capacity)).toBeUndefined();
+    const provider = { id: "configured-key", api: official.api, baseUrl: official.baseUrl, models: [] };
+    const discovered = { id, contextWindow: capacity, discoveredMetadata: { contextWindow: capacity }, metadataOverrides: [] };
+    expect(piProviderModel(provider, discovered)).toMatchObject({ contextWindow: capacity, defaultWorkingContextTokens: 272_000 });
+    expect(piProviderModel(provider, { ...discovered, contextWindow: 630_000, metadataOverrides: ["contextWindow"] }))
+      .toMatchObject({ contextWindow: 630_000 });
+    expect(piProviderModel(provider, { ...discovered, metadataOverrides: ["contextWindow"] }).defaultWorkingContextTokens).toBeUndefined();
   });
 
   it.each([
