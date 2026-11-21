@@ -108,8 +108,8 @@ describe.skipIf(!binary)("ordinary actual Codex native execution", () => {
           expect(input.openExecServerProcess).toBeUndefined();
           native = input;
           return execution.openExecServer(input);
-        } }, appServer: { transport: { command: binary!, env }, transportFactory: () => {
-          const transport = new StdioJsonRpcTransport({ command: binary!, env, managedEnvironment: managedProviders.environment, requestTimeoutMs: 30_000 });
+        } }, appServer: { transport: { command: binary!, env }, transportFactory: options => {
+          const transport = new StdioJsonRpcTransport({ ...options, command: binary!, requestTimeoutMs: 30_000 });
           const dispatch = transport.request.bind(transport);
           transport.request = (method, params, options) => { calls.push({ method, params }); return dispatch(method, params, options); };
           return transport;
@@ -120,6 +120,7 @@ describe.skipIf(!binary)("ordinary actual Codex native execution", () => {
       expect(native).toBeDefined();
       const start = calls.find(call => call.method === "thread/start")?.params;
       expect(start).toMatchObject({ approvalPolicy: "never", sandbox: "danger-full-access",
+        modelProvider: "joko-managed",
         environments: [{ environmentId: expect.any(String), cwd: project, runtimeWorkspaceRoots: [project] }] });
       expect(calls.some(call => call.method === "environment/add")).toBe(true);
       const prompt = { text: "Execute the supplied controlled file command once and report its result.", images: [], files: [], mentions: [], disposition: "prompt" as const };

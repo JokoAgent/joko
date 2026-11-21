@@ -69,7 +69,7 @@ describe("RemoteCodexRuntimeResolver", () => {
       const child = await runtime.openExecServerProcess!(signal);
       try {
         expect(fixture.processes.requests.at(-1)).toMatchObject({
-          executable: options.peerWin32 ? DEVICE_PEER_RUNTIME_EXECUTABLES.codex : "/home/test/.joko/runtime/v1/codex-home/packages/standalone/current/codex",
+          executable: options.peerWin32 ? DEVICE_PEER_RUNTIME_EXECUTABLES.codex : "/home/test/.joko/runtime/v1/codex-home/packages/standalone/current/bin/codex",
           args: ["exec-server", "--listen", "stdio://"], cwd: runtime.workspaceRoot,
           env: { CODEX_HOME: options.peerWin32 ? "C:\\work\\project\\.joko\\runtime\\v1\\codex-home" : "/home/test/.joko/runtime/v1/codex-home" }
         });
@@ -160,7 +160,7 @@ describe("RemoteCodexRuntimeResolver", () => {
     })).resolves.toMatchObject({ value: { data: [], nextCursor: null } });
     const invocations = fixture.processes.requests.map((request) => request.args.join(" "));
     expect(invocations).toEqual([
-      expect.stringContaining("packages/standalone/current/codex"),
+      expect.stringContaining("packages/standalone/current/bin/codex"),
       "app-server daemon version",
       "app-server daemon bootstrap --remote-control",
       "app-server daemon version",
@@ -168,7 +168,7 @@ describe("RemoteCodexRuntimeResolver", () => {
     ]);
     for (const request of fixture.processes.requests.slice(1)) {
       expect(request).toMatchObject({
-        executable: "/home/test/.joko/runtime/v1/codex-home/packages/standalone/current/codex",
+        executable: "/home/test/.joko/runtime/v1/codex-home/packages/standalone/current/bin/codex",
         cwd: "/srv/project-real",
         env: { CODEX_HOME: "/home/test/.joko/runtime/v1/codex-home" }
       });
@@ -501,7 +501,7 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
   constructor(options: FixtureOptions) {
     this.#daemonReady = options.daemonInitiallyReady ?? true;
     this.#daemonVersionBeforeOpen = options.daemonVersionBeforeOpen === true;
-    this.#probeVersion = options.probeVersion ?? "codex-cli 0.159.2";
+    this.#probeVersion = options.probeVersion ?? "codex-cli 0.166.0";
     this.#stderr = options.stderr ?? "";
     this.#disconnectOnMethod = options.disconnectOnMethod;
     this.#peerWin32 = options.peerWin32 === true;
@@ -527,9 +527,9 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
         processHandle.stdout.write(Buffer.from([
           canonicalWorkspace,
           "/home/test/.joko/runtime/v1/codex-home",
-          "/home/test/.joko/runtime/v1/codex-home/packages/standalone/current/codex",
+          "/home/test/.joko/runtime/v1/codex-home/packages/standalone/current/bin/codex",
           this.#probeVersion,
-          this.#runtimeAdmitted && this.#probeVersion === "codex-cli 0.159.2" ? "ready" : "not_installed",
+          this.#runtimeAdmitted && this.#probeVersion === "codex-cli 0.166.0" ? "ready" : "not_installed",
           ""
         ].join("\0"), "utf8"));
         processHandle.finish(0);
@@ -605,7 +605,7 @@ class FakeRemoteProcesses implements RemoteProcessTransportPort {
     }
     const result = message.method === "initialize"
       ? {
-          userAgent: "codex-cli/0.159.2 (linux; x86_64) joko/0.1.0",
+          userAgent: "codex-cli/0.166.0 (linux; x86_64) joko/0.1.0",
           codexHome: "/home/test/.joko/runtime/v1/codex-home",
           platformFamily: "unix",
           platformOs: "linux"

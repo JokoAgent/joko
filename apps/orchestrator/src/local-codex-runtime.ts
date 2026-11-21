@@ -3,9 +3,10 @@ import { createReadStream } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
+import { CODEX_APP_SERVER_VERSION } from "@joko/adapter-codex";
 import { extract as extractTar, list as listTar } from "tar";
 
-export const LOCAL_CODEX_RUNTIME_VERSION = "0.159.2";
+export const LOCAL_CODEX_RUNTIME_VERSION = CODEX_APP_SERVER_VERSION;
 
 interface RuntimeAsset {
   readonly target: string;
@@ -16,13 +17,17 @@ interface RuntimeAsset {
 
 // Fixed official complete packages, including the code-mode host and resources.
 export const LOCAL_CODEX_RUNTIME_ASSETS: Readonly<Record<string, RuntimeAsset>> = Object.freeze({
-  "darwin-arm64": { target: "aarch64-apple-darwin", sha256: "38aaf6dce63099fd10988948d03bbc6c0474253aef6961fcbe60f8d154b39101", size: 129522674, entrypoint: "bin/codex" },
-  "darwin-x64": { target: "x86_64-apple-darwin", sha256: "6b9b38bfad6ac8019aa6a243ee3ab11d3e22889eafd5458b0344cf20e797e680", size: 140813958, entrypoint: "bin/codex" },
-  "linux-x64": { target: "x86_64-unknown-linux-musl", sha256: "9e2d29a713b94478b240dec2f10e11324cd05fad76dc43e7c639bdf8a1337a6b", size: 159961162, entrypoint: "bin/codex" },
-  "linux-arm64": { target: "aarch64-unknown-linux-musl", sha256: "05a524a463cadf7e3e22c7f923539c0d0b74c3e78b1f5f1fab52e50e6fb3312f", size: 150270060, entrypoint: "bin/codex" },
-  "win32-x64": { target: "x86_64-pc-windows-msvc", sha256: "a7ab591043d99e8a88d0c2bebf15f810b15599a71148c4af944a755af3c71eef", size: 156614559, entrypoint: "bin/codex.exe" },
-  "win32-arm64": { target: "aarch64-pc-windows-msvc", sha256: "f017342f77ec57dffff57e59723738ac9f228ddab4f656c2bdfc65f1d9b87da3", size: 144725539, entrypoint: "bin/codex.exe" }
+  "darwin-arm64": { target: "aarch64-apple-darwin", sha256: "55a440cb579f970abe7c79ab181e54b0ea4c419be99f333bbd868eebac9c21f0", size: 165951869, entrypoint: "bin/codex" },
+  "darwin-x64": { target: "x86_64-apple-darwin", sha256: "1cb65690230be5982c654ba2655e3a3b594dce9c55b780e78bfdfeff829d7ad9", size: 180076524, entrypoint: "bin/codex" },
+  "linux-x64": { target: "x86_64-unknown-linux-musl", sha256: "1d44b28bc4ac9937d7d3532264baa68a507ce364956a0d4ebb856f331cdee254", size: 199694962, entrypoint: "bin/codex" },
+  "linux-arm64": { target: "aarch64-unknown-linux-musl", sha256: "7821b77dda2e6283fb1f63f3165177a271da8833e857cf673c6ca1c9db3bfcc6", size: 187370368, entrypoint: "bin/codex" },
+  "win32-x64": { target: "x86_64-pc-windows-msvc", sha256: "d559bb88e74d471265857b93b7f19bc250dae527673b9191b33534478093f6bc", size: 202589789, entrypoint: "bin/codex.exe" },
+  "win32-arm64": { target: "aarch64-pc-windows-msvc", sha256: "9383152a72f97bb5dd148493c8214e4fed38d805aa2c3297cb3739f7f130becf", size: 187024318, entrypoint: "bin/codex.exe" }
 });
+
+export function codexPackageDownloadUrl(asset: RuntimeAsset): string {
+  return `https://github.com/openai/codex/releases/download/rust-v${LOCAL_CODEX_RUNTIME_VERSION}/codex-package-${asset.target}.tar.gz`;
+}
 
 export type LocalBackendRuntimeState = "not_supported" | "not_installed" | "ready" | "downloading" | "extracting" | "validating" | "activating" | "complete" | "failed" | "cancelled";
 export interface LocalBackendRuntimeSnapshot {
@@ -225,7 +230,7 @@ export class LocalCodexRuntime {
   async #download(path: string, asset: RuntimeAsset, signal: AbortSignal, progress: (received: number) => void): Promise<void> {
     const deadline = AbortSignal.timeout(10 * 60_000);
     const downloadSignal = AbortSignal.any([signal, deadline]);
-    const response = await this.#fetch(`https://github.com/openai/codex/releases/download/rust-v${LOCAL_CODEX_RUNTIME_VERSION}/codex-package-${asset.target}.tar.gz`, { signal: downloadSignal });
+    const response = await this.#fetch(codexPackageDownloadUrl(asset), { signal: downloadSignal });
     if (!response.ok || response.body === null) throw new Error("The fixed runtime archive could not be downloaded.");
     const length = response.headers.get("content-length");
     if (length !== null && Number(length) !== asset.size) { await response.body.cancel(); throw new Error("The runtime archive size does not match its pin."); }

@@ -1,9 +1,10 @@
 import { once, EventEmitter } from "node:events";
-import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it } from "vitest";
+import { CODEX_APP_SERVER_VERSION } from "./adapter.js";
 import { AppServerHost } from "./host.js";
 import { useCodexHistoryHome } from "./external-auth.js";
 import { codexLegacyRewindAnchor } from "./native-history.js";
@@ -11,7 +12,7 @@ import { objectValue, parseFullTurnPage, parseThreadResult, stringValue } from "
 
 const binary = process.env["JOKO_CODEX_HOSTED_TEST_BINARY"];
 
-it.skipIf(!binary)("reads and forks the exact completed Legacy prefix from the published App Server", async () => {
+it.skipIf(!binary)("discovers a Skill and reattaches to the exact Legacy fork on the published App Server", async () => {
   const home = await realpath(await mkdtemp(join(tmpdir(), "joko-native-legacy-rewind-")));
   let modelRequests = 0;
   const provider = createServer((request, response) => {
@@ -38,7 +39,10 @@ it.skipIf(!binary)("reads and forks the exact completed Legacy prefix from the p
     const address = provider.address();
     if (address === null || typeof address === "string") throw new Error("Missing loopback model listener.");
     const baseUrl = `http://127.0.0.1:${address.port}`;
-    const app = host = new AppServerHost({ transport: { command: binary!, cwd: home, requestTimeoutMs: 20_000,
+    const skillDir = join(home, ".agents", "skills", "verify-runtime");
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(skillDir, "SKILL.md"), "---\nname: verify-runtime\ndescription: Verify the installed runtime.\n---\n\nReport the observed version.\n");
+    const options = { transport: { command: binary!, cwd: home, requestTimeoutMs: 20_000,
       env: useCodexHistoryHome({ PATH: process.env["PATH"] ?? "", SystemRoot: process.env["SystemRoot"] ?? "",
         HOME: home, USERPROFILE: home, APPDATA: home, LOCALAPPDATA: home, TMP: home, TEMP: home }, home),
       args: ["app-server", "--listen", "stdio://", "--disable", "plugins", "--disable", "remote_plugin",
@@ -46,9 +50,14 @@ it.skipIf(!binary)("reads and forks the exact completed Legacy prefix from the p
         "-c", `model_providers.probe.base_url=${JSON.stringify(baseUrl)}`, "-c", 'model_providers.probe.wire_api="responses"',
         "-c", "model_providers.probe.request_max_retries=0", "-c", "model_providers.probe.stream_max_retries=0",
         "-c", "model_providers.probe.requires_openai_auth=false", "-c", `chatgpt_base_url=${JSON.stringify(baseUrl)}`]
-    } });
+    } };
+    const app = host = new AppServerHost(options);
     await app.ensureStarted();
-    expect(app.initializeResult?.userAgent).toContain("0.159.2");
+    expect(app.initializeResult?.userAgent).toContain(CODEX_APP_SERVER_VERSION);
+    const resources = (await app.request("skills/list", { cwds: [home], forceReload: true })).value;
+    expect(resources).toMatchObject({ data: expect.arrayContaining([
+      expect.objectContaining({ skills: expect.arrayContaining([expect.objectContaining({ name: "verify-runtime" })]) })
+    ]) });
     const started = (await app.request("thread/start", { cwd: home, model: "gpt-6-astra", historyMode: "legacy",
       approvalPolicy: "never", sandbox: "read-only" })).value;
     const source = parseThreadResult(started);
@@ -80,6 +89,17 @@ it.skipIf(!binary)("reads and forks the exact completed Legacy prefix from the p
     expect(await readTurns(fork.id)).toEqual(original.slice(0, 1));
     expect(await readTurns(source.id)).toEqual(original);
     expect(await readFile(rolloutPath)).toEqual(sourceBytes);
+    await app.shutdown();
+    host = new AppServerHost(options);
+    await host.ensureStarted();
+    const resumed = parseThreadResult((await host.request("thread/resume", {
+      threadId: fork.id, cwd: home, approvalPolicy: "never", sandbox: "read-only", excludeTurns: true
+    })).value);
+    expect(resumed.id).toBe(fork.id);
+    const reopened = parseFullTurnPage((await host.request("thread/turns/list", {
+      threadId: resumed.id, sortDirection: "asc", itemsView: "full", limit: 100
+    })).value, { maximumTurns: 100, maximumItems: 300 }).turns;
+    expect(reopened).toEqual(original.slice(0, 1));
     expect(modelRequests).toBe(2);
   } finally {
     await host?.shutdown();

@@ -67,8 +67,8 @@ describe.skipIf(!binary)("Hosted actual Codex environment", () => {
         apiKeyEnvironment: "JOKO_FIXTURE_PROVIDER_TOKEN", assertCurrent: () => undefined, activate: async () => ({ release: () => undefined }), dispose: () => undefined }) };
     const adapter = new CodexBackendAdapter({ instanceGeneration: 1, profileDirectory: executionHome, managedProviders,
       hostedExecution: { execution, openExecServer: createHostedAgentCodexTunnel },
-      appServer: { transport: { command: binary!, env }, transportFactory: () => {
-        const transport = new StdioJsonRpcTransport({ command: binary!, env, managedEnvironment: managedProviders.environment, requestTimeoutMs: 30_000 });
+      appServer: { transport: { command: binary!, env }, transportFactory: options => {
+        const transport = new StdioJsonRpcTransport({ ...options, command: binary!, requestTimeoutMs: 30_000 });
         const request = transport.request.bind(transport);
         transport.request = async (method, params, options) => { calls.push({ method, params }); return request(method, params, options); };
         return transport;
@@ -85,6 +85,7 @@ describe.skipIf(!binary)("Hosted actual Codex environment", () => {
       expect(binding.nativeSessionId).toBeTruthy();
       const registered = calls.find(call => call.method === "environment/add"); expect(registered).toBeDefined();
       const start = calls.find(call => call.method === "thread/start")!.params as Record<string, unknown>;
+      expect(start.modelProvider).toBe("joko-managed");
       expect(start.environments).toEqual([{ environmentId: expect.any(String), cwd: shadow, runtimeWorkspaceRoots: [shadow] }]);
       expect(start.developerInstructions).toContain("SOURCE PERSONAL INSTRUCTIONS");
       expect(start.developerInstructions).not.toContain("PRIVATE HOST USER");

@@ -71,23 +71,23 @@ it.skipIf(!executable).each(["paginated root", "legacy root", "derived lineage"]
     const address = provider.address();
     if (address === null || typeof address === "string") throw new Error("The owned model listener is unavailable.");
     const baseUrl = `http://127.0.0.1:${address.port}`;
-    const startHost = async (home: string, cwd: string) => {
+    const startHost = async (home: string, cwd: string, providerId: "source-probe" | "receiver-probe") => {
       const host = new AppServerHost({ transport: { command: executable!, cwd, requestTimeoutMs: 20_000,
         env: useCodexHistoryHome({ PATH: process.env["PATH"] ?? "", HOME: home }, home),
         args: ["app-server", "--listen", "stdio://", "--disable", "plugins", "--disable", "remote_plugin",
-          "-c", 'model_provider="probe"', "-c", 'model_providers.probe.name="Probe"',
-          "-c", `model_providers.probe.base_url=${JSON.stringify(baseUrl)}`, "-c", 'model_providers.probe.wire_api="responses"',
-          "-c", "model_providers.probe.request_max_retries=0", "-c", "model_providers.probe.stream_max_retries=0",
-          "-c", "model_providers.probe.requires_openai_auth=false", "-c", `chatgpt_base_url=${JSON.stringify(baseUrl)}`]
+          "-c", `model_provider=${JSON.stringify(providerId)}`, "-c", `model_providers.${providerId}.name="Probe"`,
+          "-c", `model_providers.${providerId}.base_url=${JSON.stringify(baseUrl)}`, "-c", `model_providers.${providerId}.wire_api="responses"`,
+          "-c", `model_providers.${providerId}.request_max_retries=0`, "-c", `model_providers.${providerId}.stream_max_retries=0`,
+          "-c", `model_providers.${providerId}.requires_openai_auth=false`, "-c", `chatgpt_base_url=${JSON.stringify(baseUrl)}`]
       } });
       hosts.push(host);
       await host.ensureStarted();
-      expect(host.initializeResult?.userAgent).toContain("0.159.2");
+      expect(host.initializeResult?.userAgent).toContain("0.166.0");
       return host;
     };
     const sessionConfig = { model: "gpt-6-astra", approvalPolicy: "never", sandbox: "read-only" } as const;
     phase = "starting the original thread";
-    const originalHost = await startHost(originalHome, originalProject);
+    const originalHost = await startHost(originalHome, originalProject, "source-probe");
     const historyMode = strategy === "legacy root" ? "legacy" : "paginated";
     const sourceResult = (await originalHost.request("thread/start", {
       ...sessionConfig, cwd: originalProject, historyMode
@@ -128,7 +128,7 @@ it.skipIf(!executable).each(["paginated root", "legacy root", "derived lineage"]
     const modelCount = modelRequests.length;
 
     phase = "adopting the exact restored rollout through the production Adapter";
-    const receiver = await startHost(receiverHome, receiverProject);
+    const receiver = await startHost(receiverHome, receiverProject, "receiver-probe");
     adapter = new CodexBackendAdapter({ host: receiver, profileDirectory: receiverHome, instanceGeneration: 1 });
     const target = { id: "receiving-target", backendId: adapter.id, displayName: "Receiving project",
       workspaceRoot: receiverProject, managed: false, trusted: true } as const;
@@ -149,7 +149,7 @@ it.skipIf(!executable).each(["paginated root", "legacy root", "derived lineage"]
     await receiver.shutdown();
 
     phase = "reopening the remapped thread on a cold receiving host";
-    const reopened = await startHost(receiverHome, receiverProject);
+    const reopened = await startHost(receiverHome, receiverProject, "receiver-probe");
     const resumed = parseThreadResult((await reopened.request("thread/resume", {
       ...sessionConfig, threadId: chosenId, cwd: receiverProject, excludeTurns: true
     })).value);

@@ -536,7 +536,7 @@ describe("RemoteHostService", () => {
     const installBytes = vi.fn();
     const kill = vi.fn(() => true);
     const probeOutput = Buffer.from(["/srv/project", "/home/test/.joko/runtime/v1/codex-home",
-      "/home/test/.joko/runtime/v1/codex-home/packages/standalone/current/codex", "codex-cli 9.9.9", "not_installed", ""].join("\0"));
+      "/home/test/.joko/runtime/v1/codex-home/packages/standalone/current/bin/codex", "codex-cli 9.9.9", "not_installed", ""].join("\0"));
     const open = vi.fn<RemoteProcessTransportPort["open"]>(async (request) => {
       const probe = request.args[0] === "-c";
       if (!probe && stage === "launch") { waiting(); await gate; }
@@ -623,7 +623,7 @@ describe("RemoteHostService", () => {
           final(callback) {
             const finish = () => {
               if (probe) handle.stdout.write(Buffer.from(["/srv/project", "/home/test/.joko/runtime/v1/codex-home",
-                "/home/test/.joko/runtime/v1/codex-home/packages/standalone/current/codex",
+                "/home/test/.joko/runtime/v1/codex-home/packages/standalone/current/bin/codex",
                 installed ? REMOTE_CODEX_EXPECTED_VERSION_OUTPUT : "", installed ? "ready" : "not_installed", ""].join("\0")));
               else { installed = true; handle.stdout.write("JOKO_PHASE validating\nJOKO_PHASE complete\n"); }
               handle.exitCode = 0; handle.emit("exit", 0, null);
@@ -841,7 +841,7 @@ describe("RemoteHostService", () => {
       targetId: "target-a",
       hostId: "build-box",
       state: contract.RemoteBackendRuntimeState.NOT_INSTALLED,
-      expectedVersion: "0.159.2"
+      expectedVersion: "0.166.0"
     });
 
     const installSignal = new AbortController().signal;
@@ -1091,8 +1091,8 @@ function runtimeSnapshot(
     targetId: "target-a",
     hostId: "build-box",
     displayName: "Codex",
-    expectedVersion: "0.159.2",
-    ...(ready ? { installedVersion: "0.159.2" } : {}),
+    expectedVersion: "0.166.0",
+    ...(ready ? { installedVersion: "0.166.0" } : {}),
     state,
     canInstall: !ready,
     canReinstall: ready,

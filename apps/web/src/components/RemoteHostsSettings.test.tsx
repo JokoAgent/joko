@@ -402,7 +402,7 @@ it("probes and manages the fixed remote Backend runtime with exact Target and Ho
 
   await fixture.publish([readyHost]);
   expect(probe).toHaveBeenCalledWith("target-one", "build-box", 1n, 1n, expect.any(AbortSignal));
-  expect(document.body.textContent).toContain("Required version 0.159.2");
+  expect(document.body.textContent).toContain("Required version 0.166.0");
   expect(document.body.textContent).toContain("Not installed");
 
   await act(async () => button("Install").click());
@@ -682,8 +682,8 @@ function runtime(state: RemoteBackendRuntimeView["state"]): RemoteBackendRuntime
     targetId: "target-one",
     hostId: "build-box",
     displayName: "Codex",
-    expectedVersion: "0.159.2",
-    ...(ready ? { installedVersion: "0.159.2" } : {}),
+    expectedVersion: "0.166.0",
+    ...(ready ? { installedVersion: "0.166.0" } : {}),
     state,
     canInstall: state === "notInstalled" || state === "failed" || state === "outcomeUnknown",
     canReinstall: ready,

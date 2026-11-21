@@ -2,21 +2,37 @@ import { posix as remotePath } from "node:path";
 import { TextDecoder } from "node:util";
 
 import type { RemoteProcessHandle, RemoteProcessTransportPort } from "@joko/remote-ssh";
+import { LOCAL_CODEX_RUNTIME_ASSETS, LOCAL_CODEX_RUNTIME_VERSION, codexPackageDownloadUrl } from "./local-codex-runtime.js";
 
-export const REMOTE_CODEX_EXPECTED_VERSION = "0.159.2";
+export const REMOTE_CODEX_EXPECTED_VERSION = LOCAL_CODEX_RUNTIME_VERSION;
 export const REMOTE_CODEX_EXPECTED_VERSION_OUTPUT = `codex-cli ${REMOTE_CODEX_EXPECTED_VERSION}`;
 export const REMOTE_CODEX_PROFILE_SUFFIX = ".joko/runtime/v1/codex-home";
-export const REMOTE_CODEX_BINARY_SUFFIX = `${REMOTE_CODEX_PROFILE_SUFFIX}/packages/standalone/current/codex`;
+const PACKAGE_PATH = "packages/standalone/current";
+export const REMOTE_CODEX_BINARY_SUFFIX = `${REMOTE_CODEX_PROFILE_SUFFIX}/${PACKAGE_PATH}/bin/codex`;
 export const REMOTE_CODEX_SENTINEL_SUFFIX = `${REMOTE_CODEX_PROFILE_SUFFIX}/.joko-runtime-ready-v1`;
 
 const PROBE_TIMEOUT_MS = 10_000;
-const INSTALL_TIMEOUT_MS = 5 * 60_000;
+const INSTALL_TIMEOUT_MS = 10 * 60_000;
 const UNINSTALL_TIMEOUT_MS = 10_000;
 const MAXIMUM_COMMAND_OUTPUT_BYTES = 64 * 1_024;
 const SENTINEL_VALUE = `joko-codex-runtime-v1:${REMOTE_CODEX_EXPECTED_VERSION}`;
-const RELEASE_INSTALLER_URL = `https://github.com/openai/codex/releases/download/rust-v${REMOTE_CODEX_EXPECTED_VERSION}/install.sh`;
+const PACKAGE_SELECTION = Object.entries({
+  "Linux:x86_64": "linux-x64", "Linux:aarch64": "linux-arm64", "Linux:arm64": "linux-arm64",
+  "Darwin:x86_64": "darwin-x64", "Darwin:arm64": "darwin-arm64"
+}).map(([machine, platform]) => {
+  const asset = LOCAL_CODEX_RUNTIME_ASSETS[platform]!;
+  return `  ${machine}) url='${codexPackageDownloadUrl(asset)}'; size=${asset.size}; digest='${asset.sha256}' ;;`;
+}).join("\n");
+
+const PACKAGE_LAYOUT_CHECK = `has_complete_package() {
+  for entry in bin/codex bin/codex-code-mode-host codex-path/rg; do
+    [ -f "$1/$entry" ] && [ ! -L "$1/$entry" ] && [ -x "$1/$entry" ] || return 1
+  done
+  [ -d "$1/codex-resources" ] && [ ! -L "$1/codex-resources" ] && [ -s "$1/codex-package.json" ]
+}`;
 
 const RUNTIME_PROBE_SCRIPT = `set -eu
+${PACKAGE_LAYOUT_CHECK}
 workspace=$(pwd -P)
 home=\${HOME-}
 case "$home" in /*) ;; *) exit 20 ;; esac
@@ -24,7 +40,7 @@ profile="$home/${REMOTE_CODEX_PROFILE_SUFFIX}"
 binary="$home/${REMOTE_CODEX_BINARY_SUFFIX}"
 sentinel="$home/${REMOTE_CODEX_SENTINEL_SUFFIX}"
 version=""
-if [ -x "$binary" ]; then
+if has_complete_package "$profile/${PACKAGE_PATH}"; then
   version=$("$binary" --version 2>/dev/null || true)
 fi
 state=not_installed
@@ -33,10 +49,9 @@ if [ -f "$sentinel" ] && [ "$(cat "$sentinel" 2>/dev/null || true)" = "${SENTINE
 fi
 printf '%s\\0%s\\0%s\\0%s\\0%s\\0' "$workspace" "$profile" "$binary" "$version" "$state"`;
 
-// The upstream installer is run with HOME redirected below the staging tree.
-// It therefore cannot append its PATH block to the SSH user's shell profiles.
 const INSTALL_SCRIPT = `set -eu
 umask 077
+${PACKAGE_LAYOUT_CHECK}
 home=\${HOME-}
 case "$home" in /*) ;; *) exit 20 ;; esac
 profile="$home/${REMOTE_CODEX_PROFILE_SUFFIX}"
@@ -74,7 +89,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 printf '%s\\n' 'JOKO_PHASE probing'
 current_version=""
-if [ -x "$binary" ]; then current_version=$("$binary" --version 2>/dev/null || true); fi
+if has_complete_package "$profile/${PACKAGE_PATH}"; then current_version=$("$binary" --version 2>/dev/null || true); fi
 if [ "$reinstall" != "1" ] && [ -f "$sentinel" ] && [ "$(cat "$sentinel" 2>/dev/null || true)" = "${SENTINEL_VALUE}" ] && [ "$current_version" = "${REMOTE_CODEX_EXPECTED_VERSION_OUTPUT}" ]; then
   printf '%s\\n' 'JOKO_PHASE validating'
   printf '%s\\n' 'JOKO_PHASE complete'
@@ -84,20 +99,34 @@ fi
 if [ ! -e "$profile/packages" ] && [ -e "$previous" ]; then mv "$previous" "$profile/packages"; fi
 rm -rf "$stage" "$next"
 if [ -e "$profile/packages" ]; then rm -rf "$previous"; fi
-mkdir -p "$stage/home" "$stage/codex-home" "$stage/bin"
+case "$(uname -s):$(uname -m)" in
+${PACKAGE_SELECTION}
+  *) exit 40 ;;
+esac
+staged_package="$stage/${PACKAGE_PATH}"
+archive="$stage/runtime.tar.gz"
+mkdir -p "$staged_package"
 printf '%s\\n' 'JOKO_PHASE downloading'
-if ! curl -fsSL --connect-timeout 30 --max-time 120 -o "$stage/install.sh" '${RELEASE_INSTALLER_URL}' >/dev/null 2>&1; then
+if ! curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 30 --max-time 480 --max-filesize "$size" -o "$archive" "$url" >/dev/null 2>&1; then
   exit 41
 fi
-[ -s "$stage/install.sh" ] || exit 42
+[ "$(wc -c < "$archive")" -eq "$size" ] || exit 42
+if command -v sha256sum >/dev/null 2>&1; then
+  checksum=$(sha256sum "$archive")
+elif command -v shasum >/dev/null 2>&1; then
+  checksum=$(shasum -a 256 "$archive")
+else
+  exit 42
+fi
+case "$checksum" in "$digest"[[:space:]]*) ;; *) exit 42 ;; esac
 printf '%s\\n' 'JOKO_PHASE installing'
-if ! env HOME="$stage/home" CODEX_HOME="$stage/codex-home" CODEX_INSTALL_DIR="$stage/bin" CODEX_NON_INTERACTIVE=1 sh "$stage/install.sh" --release '${REMOTE_CODEX_EXPECTED_VERSION}' >/dev/null 2>&1; then
+if ! tar -xzf "$archive" -C "$staged_package" >/dev/null 2>&1; then
   exit 43
 fi
-staged_binary="$stage/codex-home/packages/standalone/current/codex"
-[ -x "$staged_binary" ] || exit 44
+staged_binary="$staged_package/bin/codex"
+has_complete_package "$staged_package" || exit 44
 [ "$("$staged_binary" --version 2>/dev/null || true)" = "${REMOTE_CODEX_EXPECTED_VERSION_OUTPUT}" ] || exit 45
-mv "$stage/codex-home/packages" "$next"
+mv "$stage/packages" "$next"
 if [ -e "$profile/packages" ]; then
   mv "$profile/packages" "$previous"
   old_moved=1
@@ -105,7 +134,7 @@ fi
 mv "$next" "$profile/packages"
 new_moved=1
 printf '%s\\n' 'JOKO_PHASE validating'
-[ -x "$binary" ] || exit 46
+has_complete_package "$profile/${PACKAGE_PATH}" || exit 46
 [ "$("$binary" --version 2>/dev/null || true)" = "${REMOTE_CODEX_EXPECTED_VERSION_OUTPUT}" ] || exit 47
 printf '%s\\n' '${SENTINEL_VALUE}' > "$profile/.joko-runtime-ready-v1.tmp"
 mv "$profile/.joko-runtime-ready-v1.tmp" "$sentinel"
@@ -172,7 +201,7 @@ export async function probeRemoteCodexInstallation(
   if (!normalizedAbsoluteRemotePath(canonicalWorkspace)
     || !normalizedAbsoluteRemotePath(profileRoot)
     || !normalizedAbsoluteRemotePath(executable)
-    || executable !== remotePath.join(profileRoot, "packages", "standalone", "current", "codex")
+    || executable !== remotePath.join(profileRoot, PACKAGE_PATH, "bin", "codex")
     || (state !== "ready" && state !== "not_installed")
     || (state === "ready" && installedVersion !== REMOTE_CODEX_EXPECTED_VERSION_OUTPUT)) {
     throw installationFault("The fixed remote Codex runtime probe returned invalid metadata.");
