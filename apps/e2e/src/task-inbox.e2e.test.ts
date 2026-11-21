@@ -5,7 +5,7 @@ import { OperationMutationSchema, OperationState, SnapshotScopeSchema } from "@j
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { chromium } from "playwright-core";
 import { expect, it } from "vitest";
-import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
+import { closeCompactNavigationDrawer, OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import { archiveMutation, createSessionMutation, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 
 it("shares the exact snoozed task between paired owners and wakes it when a new prompt is accepted", async () => {
@@ -80,6 +80,7 @@ it.skipIf(!browserPath || !webDirectory)("moves a task between the live Web inbo
       expect(fixture.application.store.getSession(sessionId).descriptor.snooze?.setAt).toBeDefined();
       await page.emulateMedia({ colorScheme: "dark" });
       await page.setViewportSize({ width: 390, height: 900 });
+      await closeCompactNavigationDrawer(page);
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
       await snoozed.getByRole("button", { name: "Wake", exact: true }).click();
       await inbox.getByRole("button", { name: "Review inbox delivery", exact: true }).waitFor();

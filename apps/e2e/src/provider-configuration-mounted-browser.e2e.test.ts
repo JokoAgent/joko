@@ -230,18 +230,20 @@ describe("mounted Provider configuration", () => {
     await first.getByRole("button", { name: "Model groups", exact: true }).click();
     const groups = first.getByRole("region", { name: "Model groups", exact: true });
     await groups.getByRole("button", { name: "Add model group", exact: true }).click();
-    await groups.getByLabel("Group name").fill("Mounted models");
-    const source = groups.getByLabel("Add a model source");
-    const route = source.getByRole("option", { name: /Test Text · test · Alpha runtime/u });
-    await route.waitFor({ state: "attached" });
-    await source.selectOption({ value: (await route.getAttribute("value"))! });
+    const groupName = groups.getByRole("textbox", { name: "Group name", exact: true });
+    await groupName.fill("Mounted models");
+    const source = groups.getByRole("combobox", { name: "Add a model source", exact: true });
+    const catalogSource = fixture.application.providerGroups!.taskModels.list().sources.find(({ source, available }) =>
+      available && source?.backendId === alphaId && source.providerId === "test" && source.modelId === "text")?.source;
+    if (catalogSource === undefined) throw new Error("The Alpha text model is missing from the task model group catalog.");
+    await source.selectOption(JSON.stringify([catalogSource.sourceKey, catalogSource.backendId, catalogSource.providerId, catalogSource.modelId]));
     await groups.getByRole("button", { name: "Save group", exact: true }).click();
     await groups.getByText("Group saved.", { exact: true }).waitFor();
     expect(fixture.application.providerGroups!.taskModels.list().config?.groups[0]).toMatchObject({
       name: "Mounted models", candidates: [{ source: { backendId: alphaId, providerId: "test", modelId: "text" } }]
     });
     await first.setViewportSize({ width: 390, height: 844 });
-    await groups.getByLabel("Group name").waitFor({ state: "visible" });
+    await groupName.waitFor({ state: "visible" });
     expect(await overflow(first)).toBeLessThanOrEqual(1);
     await first.setViewportSize({ width: 1440, height: 960 });
 
