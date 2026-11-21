@@ -42,7 +42,7 @@ export type ConnectionScreenManagedStatus =
   | { readonly state: "ready"; readonly connection: {
     readonly profileId: string; readonly serverId: string;
   } }
-  | { readonly state: "retryableError"; readonly reason: "serviceUnavailable" | "startFailed" }
+  | { readonly state: "retryableError"; readonly reason: "serviceUnavailable" | "startFailed" | "databaseCorrupted" }
   | { readonly state: "recoveryRequired"; readonly reason: "credentialUnavailable" | "credentialRejected" | "identityConflict" };
 
 export interface ConnectionScreenLabels {
