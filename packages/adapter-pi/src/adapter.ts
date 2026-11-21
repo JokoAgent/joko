@@ -8005,6 +8005,7 @@ function piTreeEntryPreview(
   if (entry.type === "message") {
     const message = isRecord(entry.message) ? entry.message : undefined;
     const role = typeof message?.role === "string" ? message.role : "custom";
+    if (role === "system") return undefined;
     const content = role === "user" && containsManagedResourceExpansion(message?.content)
       ? ""
       : piTreeContentText(message?.content);

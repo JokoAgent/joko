@@ -445,7 +445,9 @@ export default function (pi) {
       const linearTree = await adapter.getTree(first);
       const linearNodes = flattenTree(linearTree.roots);
       expect(linearTree.leafId).toBeDefined();
-      expect(linearNodes.filter((node) => node.kind === "message")).toHaveLength(4);
+      const linearMessages = linearNodes.filter((node) => node.kind === "message");
+      expect(linearMessages.map(node => node.role)).toEqual(["custom", "user", "assistant", "user", "assistant"]);
+      expect(linearMessages[0]?.label).toBeUndefined();
       const forkMessagesBeforeBranch = await adapter.getForkMessages(first);
       expect(forkMessagesBeforeBranch.map((message) => message.text)).toEqual(["workflow turn one", "workflow turn two"]);
       const navigationTarget = forkMessagesBeforeBranch[0]?.entryId;
@@ -458,7 +460,8 @@ export default function (pi) {
       await firstSink.waitForDone(3);
       const branchedTree = await adapter.getTree(first);
       expect(branchedTree.leafId).not.toBe(linearTree.leafId);
-      expect(flattenTree(branchedTree.roots).filter((node) => node.kind === "message")).toHaveLength(6);
+      expect(flattenTree(branchedTree.roots).filter(node => node.role === "user")).toHaveLength(3);
+      expect(flattenTree(branchedTree.roots).filter(node => node.role === "assistant")).toHaveLength(3);
 
       await expect(adapter.compact("Preserve the workflow branch name.", first)).resolves.toBe("compacted");
       const compactedTree = await adapter.getTree(first);
@@ -1134,9 +1137,9 @@ function smokeContext(target: TargetDescriptor, generation: number, sink: EventS
   };
 }
 
-function flattenTree(nodes: readonly SessionTreeNode[]): readonly Pick<SessionTreeNode, "entryId" | "kind">[] {
+function flattenTree(nodes: readonly SessionTreeNode[]): readonly Pick<SessionTreeNode, "entryId" | "kind" | "role" | "label">[] {
   return nodes.flatMap((node) => [
-    { entryId: node.entryId, kind: node.kind },
+    { entryId: node.entryId, kind: node.kind, role: node.role, label: node.label },
     ...flattenTree(node.children)
   ]);
 }

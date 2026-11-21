@@ -167,7 +167,9 @@ describe("Pi model catalog additions", () => {
         cost: { input: 1, output: 2, cacheRead: 0.02, cacheWrite: 0 },
         pricing: { currencyCode: "CNY" }
       });
-    expect(additions.referenceCatalogMetadata(xiaomi.find((model) => model.id === "mimo-v2.5")!))
+    expect(xiaomi.some(model => model.id === "mimo-v2.5")).toBe(false);
+    const savedXiaomi = { ...xiaomi.find((model) => model.id === "mimo-v2.6-flash")!, id: "mimo-v2.5" };
+    expect(additions.referenceCatalogMetadata(savedXiaomi))
       .toMatchObject({ defaultVisible: false });
 
     const xiaomiTokenPlan = models("xiaomi-token-plan-cn");
@@ -322,12 +324,15 @@ describe("Pi model catalog additions", () => {
     const { service_tier: serviceTier, ...request } = requests[1]!;
     expect(serviceTier).toBe("priority");
     expect(request).toEqual(requests[0]);
-    expect(request.reasoning).toMatchObject({ effort: "high" });
     expect(request.tool_choice).toBe("none");
     if (providerId === "openai") {
+      expect(request.reasoning).toMatchObject({ effort: "medium" });
+      expect(request.input).toEqual(expect.arrayContaining([{ type: "configuration_update", reasoning: { effort: "high" } }]));
       expect(request.max_output_tokens).toBeLessThan(8_192);
       expect(request).toMatchObject({ top_p: 0.7, temperature: 0.5 });
       expect(headers.map((value) => value.get("authorization"))).toEqual(["Bearer header-placeholder", "Bearer header-placeholder"]);
+    } else {
+      expect(request.reasoning).toMatchObject({ effort: "high" });
     }
     expect(headers.map((value) => value.get("x-request-context"))).toEqual(["test", "test"]);
     expect(onPayload).toHaveBeenCalledTimes(2);
