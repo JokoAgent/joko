@@ -46,7 +46,12 @@ it("authors a project Skill in a real Pi task and loads it after explicit review
   } });
   try {
     const { clients, connectionId } = await fixture.pair("Ordinary Skill author");
-    const target = required((await clients.target.listTargets({ backendId: "pi" })).targets.find(item => item.trusted), "trusted Pi Target");
+    const target = required((await clients.target.listTargets({ backendId: "pi" })).targets
+      .find(item => item.workspaceId === "workspace-real-pi"), "the original Pi Target");
+    const trusted = await submit(clients.operation, connectionId, create(OperationMutationSchema, {
+      payload: { case: "setWorkspaceTrust", value: { workspaceId: target.workspaceId, trusted: true } }
+    }));
+    expect(trusted.state, trusted.error?.message).toBe(OperationState.SUCCEEDED);
     const startTask = async () => sessionIdFrom(await submit(clients.operation, connectionId, createSessionMutation({
       backendId: "pi", targetId: target.targetId, providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID,
       permissionMode: PermissionMode.BYPASS_PERMISSIONS
