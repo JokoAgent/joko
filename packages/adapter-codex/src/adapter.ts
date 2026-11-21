@@ -1210,7 +1210,50 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     return this.#withNativeMutation(context, () => this.#createSession(input, context), input);
   }
 
-  async #createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {
+  async requiresModelProviderHandoff(providerId: string, context: AdapterContext): Promise<boolean> {
+    if (this.#hosted !== undefined || context.target.remoteWorkspace !== undefined || context.runtimePolicy === "review_read_only"
+      || this.#ownedHostOptions?.transport?.command === undefined) return false;
+    const scope = await this.#readScope(context.target, context.signal);
+    if (versionFromUserAgent(scope.host.initializeResult?.userAgent) !== CODEX_APP_SERVER_VERSION || !context.binding) return false;
+    const current = this.#sessions.get(context.sessionId);
+    const saved = current !== undefined && this.#matchesCoreFence(current, context) && this.#isRuntimeCurrent(current, current.hostGeneration)
+      ? current.processProviderId ?? current.providerId
+      : (await this.#readValidatedNativeThread(threadIdFromBinding(context.binding), context.target, "provision",
+          context.signal, parseNativeReference(context.binding.opaqueRef).profileKey, scope)).processProviderId;
+    if (!saved) throw invalidNativeReference();
+    if (this.#smartRoutingApplied) return saved !== SMART_PROCESS_PROVIDER && !/^joko-smart-[0-9a-f]{32}$/u.test(saved);
+    if (this.#managedProviders?.hasProvider(providerId)) {
+      return saved !== MANAGED_PROCESS_PROVIDER && saved !== providerId && saved !== nativeManagedChatProviderId(providerId);
+    }
+    return saved !== providerId;
+  }
+
+  hasEmptyModelProviderHandoffSource(binding: NativeSessionBinding, context: AdapterContext): boolean {
+    const runtime = this.#sessions.get(context.sessionId);
+    if (runtime === undefined || runtime.binding.opaqueRef !== binding.opaqueRef
+      || !this.#matchesCoreFence(runtime, context) || !this.#isRuntimeCurrent(runtime, runtime.hostGeneration)
+      || runtimeHasProductWork(runtime) || runtime.compaction !== undefined || runtime.nativeTasks.hasActiveTasks()) return false;
+    const proof = this.#freshNativeHistory.get(runtime);
+    return proof !== undefined && runtime.host.contentRevision(runtime.threadId, runtime.hostGeneration) === proof.revision;
+  }
+
+  async forkSessionForModel(source: NativeSessionBinding, input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {
+    const fork = { ...input, nativeStart: { kind: "new" as const, parentNativeReference: source.opaqueRef } };
+    return this.#withNativeMutation(context, async () => {
+      this.#assertContextTarget(context, input.target);
+      assertStandardReviewContext(context, "fork native history for a new Provider");
+      if (!input.target.trusted || input.target.remoteWorkspace !== undefined || this.#hosted !== undefined
+        || source.generation + 1 !== context.generation) throw managedRouteUnavailable();
+      const threadId = threadIdFromBinding(source);
+      const inspected = await this.#readValidatedNativeThread(threadId, input.target, "provision", context.signal,
+        parseNativeReference(source.opaqueRef).profileKey).catch(error => { throw this.#nativeThreadReadFailure(error, "provision"); });
+      if (inspected.thread.status?.["type"] === "active") throw managedRouteUnavailable();
+      inspected.scope.assertCurrent();
+      return this.#createSession(fork, context, threadId);
+    }, fork);
+  }
+
+  async #createSession(input: CreateNativeSessionInput, context: AdapterContext, providerForkSource?: string): Promise<NativeSessionBinding> {
     this.#assertOpen();
     const nativeAuthenticationEpoch = this.#nativeAuthenticationEpoch;
     const runtimePolicy = reviewRuntimePolicy(input, context);
@@ -1269,6 +1312,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             ...(input.modelId === undefined ? {} : { model: input.modelId }),
             ...(input.providerId === undefined ? {} : { modelProvider: input.providerId }),
             serviceTier: fastServiceTier(input.fastMode),
+            ...(providerForkSource === undefined || (input.appendSystemPrompt === undefined && context.appendSystemPrompt === undefined)
+              ? {} : { developerInstructions: input.appendSystemPrompt ?? context.appendSystemPrompt }),
             ...permissionParams(input.permissionMode)
           }
         }
@@ -1356,6 +1401,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         mutation: true,
         signal: context.signal,
         beforeDispatch: () => {
+          input.assertNativeCreationCurrent?.();
           scope.assertCurrent();
           this.#assertNativeAuthenticationAdmission(nativeAuthenticationAdmission);
           nativeSkills?.assertCurrent();
@@ -1377,6 +1423,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     try {
       this.#assertNativeAuthenticationAdmission(nativeAuthenticationAdmission);
       thread = parseThreadResult(response.value);
+      if (thread.id === providerForkSource) throw invalidNativeReference();
       createdThreadId = thread.id;
       if (request.method === "thread/start" && thread.historyMode !== "paginated") {
         throw adapterError({
@@ -1389,6 +1436,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }
       record = objectValue(response.value, "session response");
       this.#assertManagedRouteResponse(record, managedRoute, scope.processProviderId);
+      if (providerForkSource !== undefined) {
+        const expectedProvider = (request.params as JsonObject)["modelProvider"];
+        await assertNativeThreadTarget(thread, thread.id, cwd, "provision");
+        if (typeof expectedProvider !== "string" || record["modelProvider"] !== expectedProvider
+          || record["model"] !== input.modelId) throw managedRouteUnavailable(true);
+      }
       const observedModelId = optionalString(record["model"]) ?? input.modelId;
       if (smartRoute !== undefined) {
         if (record["modelProvider"] !== (scope.processProviderId ?? smartRoute.modelProviderId) || observedModelId === undefined) throw smartRouteUnavailable(true);

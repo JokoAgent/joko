@@ -714,6 +714,11 @@ export interface BackendAdapter {
     recoveryReference: string
   ): Promise<"present" | "absent" | "unknown">;
   createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding>;
+  /** An explicit local owner route selection that requires a new native history writer on the same Backend. */
+  requiresModelProviderHandoff?(providerId: string, context: AdapterContext): Promise<boolean>;
+  /** An observed new thread may have no materialized history for the native fork API. */
+  hasEmptyModelProviderHandoffSource?(binding: NativeSessionBinding, context: AdapterContext): boolean;
+  forkSessionForModel?(binding: NativeSessionBinding, input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding>;
   resumeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState>;
   /** An idle local runtime actually exited, so the same durable binding can be resumed before dispatch. */
   hasConfirmedIdleSessionExit?(sessionId: SessionId, binding: NativeSessionBinding): boolean;
