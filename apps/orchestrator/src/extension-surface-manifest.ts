@@ -57,6 +57,13 @@ export interface ExtensionTaskEngineDescriptor {
   readonly entry: string;
 }
 
+export const EXTENSION_NODE_PERMISSION_ID = "runtime-node-worker";
+
+export interface ExtensionNodeDescriptor {
+  readonly entry: string;
+  readonly methods: readonly string[];
+}
+
 const MESSAGE_SUBSCRIPTION_TOPICS = ["turn", "session"] as const;
 const MESSAGE_SUBSCRIPTION_HOOKS = ["will-user-message", "will-assistant-message"] as const;
 
@@ -197,6 +204,9 @@ export function parseExtensionSurfaceManifest(
     if (taskEngines?.some(engine => discoveredEntries.has(engine.entry) || !discoveredFiles.has(engine.entry))) {
       throw new Error("Task engines must use inspected Node files separate from the package's Pi extensions.");
     }
+    const nodeEntry = runtime?.node?.entry;
+    if (nodeEntry !== undefined && (discoveredEntries.has(nodeEntry) || !discoveredFiles.has(nodeEntry)
+      || taskEngines?.some(engine => engine.entry === nodeEntry))) throw new Error("Extension Node worker must name a separate packaged file.");
     if (runtime && !discoveredFiles.has(runtime.html)) throw new Error("Extension runtime HTML is not an inspected regular package file.");
     if (routineEvents && !discoveredFiles.has(routineEvents.html)) throw new Error("Routine publisher HTML is not an inspected regular package file.");
     result.push({
@@ -241,7 +251,7 @@ export function parseExtensionTaskEngines(value: unknown): readonly ExtensionTas
 
 export function parseExtensionRuntime(value: unknown, taskViewAvailable = false): ExtensionRuntimeDescriptor {
   const raw = requirePlainObject(value, "Extension runtime");
-  requireExactKeys(raw, ["html", "tools", "card", "mail", "mailReader", "agent", "network", "tasks", "targets", "text", "showTaskPreferences", "deviceSync", "pick", "image", "subscribe"], ["html", "tools"], "Extension runtime");
+  requireExactKeys(raw, ["html", "tools", "card", "mail", "mailReader", "agent", "network", "node", "tasks", "targets", "text", "showTaskPreferences", "deviceSync", "pick", "image", "subscribe"], ["html", "tools"], "Extension runtime");
   const html = requirePortablePath(raw.html, "Extension runtime HTML");
   if (extname(html) !== ".html" || posix.dirname(html) === ".") throw new Error("Extension runtime HTML must be in a self-contained directory.");
   const subscribe = raw.subscribe === undefined ? undefined : parseMessageSubscription(raw.subscribe);
@@ -275,6 +285,8 @@ export function parseExtensionRuntime(value: unknown, taskViewAvailable = false)
   const mailReader = raw.mailReader === undefined ? undefined : parseMailReader(raw.mailReader);
   if (mailReader === null || mailReader && (raw.mail !== true || !tools.some(tool => tool.name === mailReader.tool))) throw new Error("Mail reader must name a declared tool and mail capability.");
   const network = raw.network === undefined ? undefined : parseExtensionNetwork(raw.network);
+  const node = raw.node === undefined ? undefined : parseExtensionNode(raw.node);
+  if (node && tools.length === 0) throw new Error("Extension Node workers require a declared runtime tool.");
   let tasks: ExtensionRuntimeDescriptor["tasks"];
   if (raw.tasks !== undefined) {
     const value = requirePlainObject(raw.tasks, "Extension managed tasks");
@@ -291,12 +303,22 @@ export function parseExtensionRuntime(value: unknown, taskViewAvailable = false)
   }
   if (raw.showTaskPreferences !== undefined && typeof raw.showTaskPreferences !== "boolean") throw new Error("showTaskPreferences must be boolean.");
   return { html, tools, ...(card === undefined ? {} : { card }), ...(raw.mail === true ? { mail: true } : {}), ...(mailReader ? { mailReader } : {}), ...(raw.agent === true ? { agent: true } : {}), ...(network ? { network } : {}),
-    ...(raw.deviceSync === true ? { deviceSync: true } : {}),
+    ...(node === undefined ? {} : { node }), ...(raw.deviceSync === true ? { deviceSync: true } : {}),
     ...(raw.pick === true ? { pick: true } : {}),
     ...(raw.image === undefined ? {} : { image: ["generate"] as const }),
     ...(raw.targets === true ? { targets: true } : {}),
     ...(subscribe === undefined ? {} : { subscribe }),
     ...(tasks ? { tasks } : {}), ...(text ? { text } : {}), ...(typeof raw.showTaskPreferences === "boolean" ? { showTaskPreferences: raw.showTaskPreferences } : {}) };
+}
+
+function parseExtensionNode(value: unknown): ExtensionNodeDescriptor {
+  const raw = requirePlainObject(value, "Extension Node worker");
+  requireExactKeys(raw, ["entry", "methods"], ["entry", "methods"], "Extension Node worker");
+  const entry = requirePortablePath(raw.entry, "Extension Node entry");
+  if (![".js", ".mjs", ".cjs"].includes(extname(entry)) || !Array.isArray(raw.methods) || raw.methods.length === 0
+    || raw.methods.length > 32 || raw.methods.some(method => typeof method !== "string" || !/^[a-zA-Z][a-zA-Z0-9_./:-]{0,127}$/u.test(method))
+    || new Set(raw.methods).size !== raw.methods.length) throw new Error("Extension Node entry or methods are invalid.");
+  return { entry, methods: [...raw.methods] as string[] };
 }
 
 function parseMessageSubscription(value: unknown): ExtensionMessageSubscription {
@@ -529,6 +551,7 @@ export interface ExtensionRuntimeDescriptor {
   readonly image?: readonly ["generate"];
   readonly targets?: true;
   readonly network?: ExtensionNetworkDeclaration;
+  readonly node?: ExtensionNodeDescriptor;
   readonly tasks?: { readonly hidden?: true };
   readonly text?: { readonly oneshot: true; readonly model?: string };
   readonly showTaskPreferences?: boolean;

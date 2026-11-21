@@ -9,6 +9,7 @@ export const EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE = String.raw`(capabilities)
     return transport(JSON.parse(serialized));
   };
   const handlers = new Map(), listeners = [], calls = new Map(), hooks = new Map();
+  const workerRequest = (type, { callId, ...payload } = {}) => request({ type, callId, payload });
   Object.defineProperty(window, "joko", { value: Object.freeze({
     send: payload => request(payload),
     onHostMessage: listener => { if (typeof listener !== "function" || listeners.length >= 64) throw new Error("Invalid event listener."); listeners.push(listener); },
@@ -23,6 +24,9 @@ export const EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE = String.raw`(capabilities)
       connections: key => request({ type: "connections-list", key }),
       accounts: key => request({ type: "oauth-accounts", key }),
       reportInsufficientScopes: (key, scopes) => request({ type: "oauth-insufficient-scopes", key, scopes }) }) } : {}),
+    ...(capabilities.node ? { node: Object.freeze({ request: payload => workerRequest("node-request", payload) }) } : {}),
+    ...(capabilities.downloads ? { downloads: Object.freeze({ start: payload => workerRequest("download-start", payload),
+      cancel: payload => workerRequest("download-cancel", payload) }) } : {}),
     ...(capabilities.agent ? { agent: Object.freeze({ run: payload => request({ ...payload, type: "agent-run" }) }) } : {}),
     ...(capabilities.text ? { text: Object.freeze({ oneshot: payload => request({ ...payload, type: "text-oneshot" }) }) } : {}),
     ...(capabilities.deviceSync ? { deviceSync: Object.freeze({

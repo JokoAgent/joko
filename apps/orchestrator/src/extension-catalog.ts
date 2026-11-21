@@ -5,6 +5,7 @@ import type { OperationalStore } from "@joko/store";
 
 import type { CredentialKind, CredentialManager } from "./credential-manager.js";
 import type { ExtensionRuntimeDescriptor, ExtensionRoutineEventsDescriptor, ExtensionMainViewDescriptor, ExtensionTaskViewDescriptor, ExtensionSettingsDescriptor, ExtensionRecommendationDescriptor, ExtensionTaskEngineDescriptor } from "./extension-surface-manifest.js";
+import { EXTENSION_NODE_PERMISSION_ID } from "./extension-surface-manifest.js";
 import type { ExtensionSourceDescriptor } from "./extension-source-manager.js";
 import type { McpServerDescriptor, McpServerInput } from "./mcp-router.js";
 import type { PiResourceDescriptor } from "./resource-manager.js";
@@ -759,7 +760,7 @@ export class ExtensionCatalogManager {
       tools,
       permissions: definition.permissions.map((permission) => ({
         ...permission,
-        granted: permission.id.startsWith("task-engine:")
+        granted: permission.id.startsWith("task-engine:") || permission.id === EXTENSION_NODE_PERMISSION_ID
           ? definition.enabled && validAuthorization(definition, record.authorization, this.#credentials)
             && record.authorization?.values[permission.id] === true
           : setup.state === "ready" || setup.state === "not_required"
@@ -842,6 +843,7 @@ function runtimePermissions(runtime: ExtensionRuntimeDescriptor | undefined): re
     ...(runtime.card?.externalLinks ? [{ id: "runtime-card-links", label: "External card links", description: "Opens card links after owner confirmation.", required: true }] : []),
     ...(runtime.mail ? [{ id: "runtime-mail", label: "Mail drafts", description: "Uses the host mail editor with its provider account adapters.", required: true }] : []),
     ...(runtime.network ? [{ id: `runtime-network:${digest(runtime.network)}`, label: "Network access", description: `HTTPS requests to: ${[...runtime.network.hosts, ...(runtime.network.connections?.length ? ["addresses configured in connection settings"] : [])].join(", ")}. Protected credentials stay in the host.`, required: true }] : []),
+    ...(runtime.node ? [NODE_WORKER_SETUP] : []),
     ...(runtime.agent ? [{ id: "runtime-task-continuation", label: "Task continuation", description: "May continue the original task once after an explicit card action.", required: true }] : []),
     ...(runtime.tasks ? [{ id: "runtime-managed-tasks", label: "Managed tasks", description: "Creates and controls its own ordinary tasks using your selected model and task permissions.", required: true }] : []),
     ...(runtime.targets ? [{ id: "runtime-targets", label: "Deliver to projects, tasks and partners", description: "Lists local target names and sends plugin text or images to a selected target. This does not grant access to its message history.", required: true }] : []),
@@ -875,15 +877,20 @@ function taskEngineSetup(engines: readonly ExtensionTaskEngineDescriptor[]): rea
   }));
 }
 
+const NODE_WORKER_SETUP: SetupRequirement = { id: EXTENSION_NODE_PERMISSION_ID, label: "Run the packaged Node worker",
+  description: "Runs the installed worker on the service computer under its operating-system account. The worker can read verified downloads for this installation.",
+  kind: "confirmation", required: false };
+
 function runtimeSetup(extensionId: string, runtime: ExtensionRuntimeDescriptor | undefined): readonly SetupRequirement[] {
   const network = runtime?.network;
   const pick: readonly SetupRequirement[] = runtime?.pick ? [{ id: "directory-confirmation", label: "Allow directory selection", description: "The plugin can request a native chooser and receive a bounded read deposit only for a directory you explicitly select.", kind: "confirmation", required: true }] : [];
-  if (!network) return pick;
+  const node = runtime?.node ? [NODE_WORKER_SETUP] : [];
+  if (!network) return [...pick, ...node];
   return [...(network.secrets ?? []).filter(secret => secret.source !== "oauth").map(secret => ({ id: `network-secret:${secret.key}`, label: secret.label,
     description: secret.hint ?? `Protected ${secret.inject.header} credential for ${(secret.inject.hosts ?? network.hosts).join(", ")}.`,
     kind: "secret" as const, required: true, credentialReferenceId: extensionNetworkCredentialReference(extensionId, network, secret),
     credentialKinds: ["header_secret" as const, "api_key" as const] })),
-    { id: "permission-confirmation", label: "Allow extension network access", description: `Allow HTTPS requests to ${[...network.hosts, ...(network.connections?.length ? ["addresses explicitly configured in connection settings"] : [])].join(", ")}.`, kind: "confirmation", required: true }, ...pick];
+    { id: "permission-confirmation", label: "Allow extension network access", description: `Allow HTTPS requests to ${[...network.hosts, ...(network.connections?.length ? ["addresses explicitly configured in connection settings"] : [])].join(", ")}.`, kind: "confirmation", required: true }, ...pick, ...node];
 }
 
 /** Uses the same identity as the Catalog for an installed resource's facets. */
