@@ -70,7 +70,7 @@ it("copies a settled Pi Goal with distinct worker files and native history to an
     const workerId = worker!.workerId;
     const workerSession = worker!.sessionId!;
     await waitFor(async () => source.application.store.getCollaborationWorker(workerId).status,
-      state => state === "completed" || state === "idle" && source.application.store.listRuns({ sessionId: workerSession }).some(row => row.descriptor.state === "succeeded"),
+      state => state === "completed" || state === "idle" && source.application.store.listRuns({ sessionId: workerSession }).some(row => row.descriptor.state === "completed"),
       "the source worker and input queue to settle", 30_000);
 
     const request = (operationId: string) => ({ operationId, sessionId: lead, expectedSessionGeneration: sourceGeneration,
