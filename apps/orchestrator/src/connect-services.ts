@@ -2825,7 +2825,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
       return { control: { generation: BigInt(control.generation), baseline: control.baseline && { ...control.baseline, ...contract.encodeModelSpeed(control.baseline.fastMode) },
         effective: control.effective && { ...control.effective, ...contract.encodeModelSpeed(control.effective.fastMode) },
         ...(control.pending ? { pending: { ...control.pending.profile, ...contract.encodeModelSpeed(control.pending.profile.fastMode) }, pendingGeneration: BigInt(control.pending.generation) } : {}),
-        handoffState: control.handoffState ?? "" } };
+        handoffState: control.handoffState ?? "", ...dependencies.sessionHost.taskModelGroupSelectionState(request.sessionId, control) } };
     },
     listSessions: async (request, context) => {
       authenticate(context);
@@ -18556,10 +18556,18 @@ async function dispatchMutation(
       if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) throw invalidArgument("The runtime generation is invalid.");
       return effectOperation(dependencies, operationId, connection, mutation, payload.case, { accepted: true }, async () => {
         const modelGroupSwitch = value.taskModelGroupSwitch;
+        const explicitRoute = value.backendId !== undefined || value.providerId !== undefined || value.modelId !== undefined
+          || value.effort !== undefined || value.fastMode !== undefined || value.ultrafastMode !== undefined;
+        if (value.taskModelGroup !== undefined || value.taskModelGroupSessionGeneration !== 0n) {
+          if (value.taskModelGroup === undefined || value.taskModelGroupSessionGeneration < 1n || modelGroupSwitch !== undefined || explicitRoute) {
+            throw invalidArgument("Model group selection requires the original task binding and one group.");
+          }
+          await host.selectTaskModelGroup({ sessionId: value.sessionId, expectedGeneration, sessionGeneration: value.taskModelGroupSessionGeneration,
+            selection: value.taskModelGroup, assertOwner: () => dependencies.connections.fence(connection) });
+          return;
+        }
         if (modelGroupSwitch !== undefined) {
-          if (value.sessionId !== modelGroupSwitch.sessionId || value.expectedRuntimeGeneration !== modelGroupSwitch.expectedRuntimeGeneration
-            || value.backendId !== undefined || value.providerId !== undefined || value.modelId !== undefined
-            || value.effort !== undefined || value.fastMode !== undefined || value.ultrafastMode !== undefined) {
+          if (value.sessionId !== modelGroupSwitch.sessionId || value.expectedRuntimeGeneration !== modelGroupSwitch.expectedRuntimeGeneration || explicitRoute) {
             throw invalidArgument("The model group recovery must use the exact offered task and route.");
           }
           await host.applyTaskModelGroupSwitch(modelGroupSwitch, () => dependencies.connections.fence(connection));

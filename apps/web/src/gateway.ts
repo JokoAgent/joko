@@ -1309,6 +1309,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           await this.submit({ case: "setSessionRuntime", value: {
             sessionId: offer.sessionId, expectedRuntimeGeneration: offer.expectedRuntimeGeneration, taskModelGroupSwitch: offer
           } }, true, [{ entity: { kind: EntityKind.SESSION, id: offer.sessionId }, expectedGeneration: offer.sessionGeneration }], active);
+        }),
+        applySelection: (input, signal) => invoke(signal, async active => {
+          await this.submit({ case: "setSessionRuntime", value: {
+            sessionId: input.sessionId, expectedRuntimeGeneration: input.runtimeGeneration, taskModelGroupSessionGeneration: input.sessionGeneration,
+            taskModelGroup: { groupId: input.groupId, expectedRevision: input.expectedRevision, hasImages: false }
+          } }, true, [{ entity: { kind: EntityKind.SESSION, id: input.sessionId }, expectedGeneration: input.sessionGeneration }], active);
         })
       }, getProviderGroup: (key, signal) => invoke(signal, active => api.getProviderGroup(key, active)),
       listProviderGroupCandidates: (key, signal) => invoke(signal, active => api.listProviderGroupCandidates(key, active)),

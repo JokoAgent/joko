@@ -888,6 +888,8 @@ message SetSessionRuntimeMutation {
   optional bool fast_mode = 7;
   optional bool ultrafast_mode = 8;
   TaskModelGroupSwitch task_model_group_switch = 9;
+  TaskModelGroupSelection task_model_group = 10;
+  uint64 task_model_group_session_generation = 11;
 }
 
 message SendInputMutation {

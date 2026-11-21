@@ -187,6 +187,7 @@ export function createTaskSharingRuntime(
         }
         case "setSessionRuntime": {
           const value = payload.value, expectedGeneration = Number(value.expectedRuntimeGeneration);
+          if (value.taskModelGroup !== undefined || value.taskModelGroupSessionGeneration !== 0n || value.taskModelGroupSwitch !== undefined) throw denied();
           if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) throw new ConnectError("The runtime generation is invalid.", Code.InvalidArgument);
           const patch = { ...(value.backendId === undefined ? {} : { backendId: value.backendId }),
             ...(value.providerId === undefined ? {} : { providerId: value.providerId }),

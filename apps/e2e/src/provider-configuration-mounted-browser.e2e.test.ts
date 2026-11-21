@@ -8,6 +8,7 @@ import { CredentialManager, CredentialVault, ProviderCatalogManager, ProviderAcc
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture, routeFixtureDiscovery } from "./fixture.js";
+import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
   ? it : it.skip;
@@ -246,6 +247,17 @@ describe("mounted Provider configuration", () => {
     await groupName.waitFor({ state: "visible" });
     expect(await overflow(first)).toBeLessThanOrEqual(1);
     await first.setViewportSize({ width: 1440, height: 960 });
+
+    const ordinaryTask = sessionIdFrom(await submit(inspector.clients.operation, inspector.connectionId, createSessionMutation({
+      backendId: alphaId, targetId: fixture.targetId(alphaId), providerId: "vision", modelId: "multimodal", displayName: "Existing task with a group"
+    })));
+    await first.goto(`${fixture.baseUrl}/#/tasks/${ordinaryTask}`, { waitUntil: "domcontentloaded" });
+    await first.locator(".composer__controls .model-picker-trigger").click({ timeout: 20_000 });
+    const chooseGroup = first.getByRole("combobox", { name: "Model groups", exact: true });
+    await chooseGroup.selectOption({ label: "Mounted models" });
+    await expect.poll(() => fixture!.application.store.getSession(ordinaryTask).descriptor.modelId).toBe("text");
+    expect(fixture.application.providerGroups!.taskModels.binding(ordinaryTask)?.source).toMatchObject({ providerId: "test", modelId: "text" });
+    await first.goto(`${fixture.baseUrl}/#/settings/providers`, { waitUntil: "domcontentloaded" });
 
     await first.locator(".provider-master-row", { hasText: "Mounted Route" }).dblclick();
     editor = first.locator(".provider-editor-modal");

@@ -4998,6 +4998,7 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 .model-picker__rail button small.model-picker__group-usage { white-space: normal; overflow-wrap: anywhere; line-height: 1.25; }
 
 .model-picker__content { min-height: 0; overflow-y: auto; padding: 5px; overscroll-behavior: contain; }
+.model-picker__task-groups { width: 100%; margin-bottom: 5px; border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; background: var(--surface); color: var(--text); font: inherit; }
 .model-picker__list { display: grid; gap: 1px; }
 .model-picker__default-row {
   width: 100%;

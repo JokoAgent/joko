@@ -17,6 +17,8 @@ export interface TaskModelGroupsApi {
   preview(selection: Omit<contract.TaskModelGroupSelection, "$typeName">, signal?: AbortSignal): Promise<contract.PreviewTaskModelGroupResponse>;
   switchOffer(request: Omit<contract.GetTaskModelGroupSwitchRequest, "$typeName">, signal?: AbortSignal): Promise<contract.TaskModelGroupSwitch | undefined>;
   applySwitch?(offer: contract.TaskModelGroupSwitch, signal?: AbortSignal): Promise<void>;
+  applySelection?(input: { readonly sessionId: string; readonly sessionGeneration: bigint; readonly runtimeGeneration: bigint;
+    readonly groupId: string; readonly expectedRevision: bigint }, signal?: AbortSignal): Promise<void>;
 }
 /** The parent gateway owns the authenticated current-node client. Mutations
  * are never replayed after a transport failure or a configuration conflict. */

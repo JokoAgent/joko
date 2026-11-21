@@ -96,6 +96,48 @@ it("rotates across exact accounts and Backends after first input, and binds the 
   expect(f.store.getSession(exact).descriptor).toMatchObject({ backendId: f.first.id, providerId: "test", modelId: "text" });
 });
 
+it("selects a model group on an existing task and holds a new input until the chosen Backend owns it", async () => {
+  const f = await fixture(true);
+  const group = taskModelGroup(f, contract.TaskModelGroupStrategy.ROUND_ROBIN);
+  const sessionId = (await f.create("existing-ordinary-task")).value.sessionId;
+  const generation = BigInt(f.store.getSession(sessionId).descriptor.binding.generation);
+  const initial = f.host.getSessionRuntimeControl(sessionId).generation;
+  const pick = (expectedGeneration: number) => f.host.selectTaskModelGroup({
+    sessionId, sessionGeneration: generation, expectedGeneration, selection: group.selection(), assertOwner: () => undefined
+  });
+  expect(f.host.taskModelGroupSelectionState(sessionId)).toEqual({ taskModelGroupSelectionAvailable: true });
+  await pick(initial);
+  expect(f.host.taskModelGroupSelectionState(sessionId)).toMatchObject({ taskModelGroupId: "work" });
+  expect(f.store.getSession(sessionId).descriptor.binding.generation).toBe(Number(generation));
+  await expect(pick(initial)).rejects.toThrow(/changed/u);
+  expect((await group.preview()).selected?.source).toEqual(group.image);
+
+  let release!: () => void;
+  let reading = false;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const read = f.groups.directory.read.bind(f.groups.directory);
+  const waitForSelection = vi.spyOn(f.groups.directory, "read").mockImplementation(async (...args) => {
+    reading = true;
+    await gate;
+    return read(...args);
+  });
+  const oldBackend = vi.spyOn(f.first, "send"), chosenBackend = vi.spyOn(f.second, "send");
+  const choosing = pick(f.host.getSessionRuntimeControl(sessionId).generation);
+  await until(() => reading);
+  const queued = f.send(sessionId, "input while choosing the next group source");
+  expect(f.store.getQueueItem(queued.queueItemId).state).toBe("accepted");
+  expect(oldBackend).not.toHaveBeenCalled();
+  release();
+  await choosing;
+  waitForSelection.mockRestore();
+  await until(() => f.store.getQueueItem(queued.queueItemId).state === "completed");
+  expect(oldBackend).not.toHaveBeenCalled();
+  expect(chosenBackend).toHaveBeenCalledOnce();
+  expect(f.store.getSession(sessionId).descriptor).toMatchObject({ backendId: f.second.id, modelId: "multimodal", targetId: "target" });
+  expect(f.groups.taskModels.binding(sessionId)?.source).toEqual({ sourceKey: group.image.sourceKey,
+    backendId: f.second.id, providerId: "vision", modelId: "multimodal" });
+});
+
 it("retains the earliest eligible quota-limited route and its original input through queue admission", async () => {
   const f = await fixture(true);
   const group = taskModelGroup(f, contract.TaskModelGroupStrategy.ORDERED);
