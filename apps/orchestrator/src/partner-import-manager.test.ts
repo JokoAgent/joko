@@ -677,6 +677,9 @@ describe("native import service and owning effects", () => {
     const catalog = await f.api.packages!("en", signal);
     expect(catalog).toHaveLength(10); const entry = catalog.find(row => row.packageId === "engineer-bot")!;
     expect(entry.skills).toHaveLength(2); expect(entry.knowledge).toHaveLength(1); expect(entry.routines).toHaveLength(1);
+    expect(entry.tools.map(tool => [tool.id, tool.requiresUserAuthorization])).toEqual([["github", true], ["gitlab", true], ["notion", true]]);
+    expect(catalog.find(row => row.packageId === "ad-spend-watch")?.routines[0]?.optionalToolIds)
+      .toEqual(["google-sheets", "google-gmail", "outlook-mail"]);
     await expect(f.api.invitePackage!({ ...entry, packageHash: "0".repeat(64) }, "en", signal)).rejects.toMatchObject({ code: Code.FailedPrecondition });
     const [first, second] = await Promise.all([f.api.invitePackage!(entry, "en", signal), f.api.invitePackage!(entry, "en", signal)]);
     expect(second.requestId).toBe(first.requestId);
@@ -697,6 +700,11 @@ describe("native import service and owning effects", () => {
     expect((await f.api.invitePackage!(entry, "en", signal)).canonicalSessionId).toBe(canonical);
     expect((await f.api.status(result.requestId, signal))?.canonicalSessionId).toBe(canonical);
     expect(f.storage.readReceipt(result.requestId)?.result.canonicalSessionId).toBe(profile.canonicalSessionId);
+    const legacy = { ...receipt.nativePackage!, packageVersion: "0.1.0",
+      packageHash: "fc5d20a857ec05b1aa9a87ba0a2ca00e63f3d8cbeac878885dc50862e5c8b8ab" };
+    f.storage.saveReceipt({ ...receipt, nativePackage: legacy });
+    expect((await f.api.invitePackage!(entry, "en", signal))).toMatchObject({ requestId: result.requestId, partnerId: profile.id });
+    expect(f.storage.readReceipt(result.requestId)?.nativePackage).toEqual(legacy);
     const deletion = await f.partners.deletePartner({ requestId: "package_install_delete_0001", partnerId: profile.id, expectedRevision: profile.revision, confirmName: profile.displayName });
     expect(deletion.phase).toBe("completed");
     expect((await f.api.packages!("en", signal)).find(row => row.packageId === entry.packageId)?.installation).toBeUndefined();

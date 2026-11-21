@@ -11,7 +11,7 @@ import { AgentImportError, type ImportItem, type ImportSnapshot } from '@joko/ag
 export const PARTNER_PACKAGE_IDS = ['engineer-bot', 'nightly-audit-engineer', 'startup-qa-bot',
   'seo-aeo-desk', 'cooper', 'video-editor', 'proto-bot',
   'ad-spend-watch', 'apple-search-ads-review', 'sable-game-art'] as const;
-export const PARTNER_PACKAGE_VERSION = '0.1.0';
+export const PARTNER_PACKAGE_VERSION = '0.1.1';
 const MAX_FILE = 2 * 1024 * 1024;
 const MAX_TOTAL = 16 * 1024 * 1024;
 const invalid = (): never => { throw new AgentImportError('INVALID_PACKAGE'); };
@@ -139,6 +139,15 @@ export async function readNativePartnerPackage(root: string, packageId: string):
   const profile = record(manifest.profile), presentation = record(manifest.presentation);
   const dependencies = record(manifest.dependencies);
   if (record(dependencies.model).mode !== 'inherit') invalid();
+  const plugins = new Map<string, boolean>();
+  for (const value of array(dependencies.plugins)) {
+    const plugin = exact(value, ['id', 'required', 'connection']);
+    const id = text(plugin.id, 100);
+    if (!/^[a-z0-9][a-z0-9-]*$/u.test(id) || plugins.has(id) || plugin.required !== false
+      || (plugin.connection !== 'none' && plugin.connection !== 'user-authorization')) invalid();
+    plugins.set(id, plugin.connection === 'user-authorization');
+  }
+  const tools = (detail: Detail) => detail.tools.map(tool => ({ ...tool, requiresUserAuthorization: plugins.get(tool.id)! }));
   const identity = { packageId, packageVersion: PARTNER_PACKAGE_VERSION, packageHash: sha(canonicalPackageJson(manifest)) };
   const avatar = record(profile.avatar);
   if (avatar.kind !== 'preset' || !['orbit', 'spark', 'leaf', 'wave'].includes(String(avatar.id))) invalid();
@@ -178,14 +187,15 @@ export async function readNativePartnerPackage(root: string, packageId: string):
     const routine = record(value);
     if (routine.enabledByDefault !== false) invalid();
     const id = text(routine.id, 80);
+    const optionalToolIds = array(routine.dependencies).map(value => text(value, 100));
+    if (new Set(optionalToolIds).size !== optionalToolIds.length || optionalToolIds.some(tool => !plugins.has(tool))) invalid();
     const input = parseRoutineInput({ name: text(routine.name), prompt: text(routine.prompt), triggers: routine.triggers, enabled: false, silentWhenIdle: false });
     itemNames[`routine-${id}`] = input.name;
     items.push({ view: { id: `routine-${id}`, name: input.name, category: 'automations', selected: true, enabled: false },
       automation: { sourceId: id, input, original: routine, deliveries: [], fingerprint: sha(canonicalPackageJson(routine)) } });
     const cron = input.triggers.find(trigger => trigger.kind === 'cron');
-    return { id, name: input.name, ...(cron?.kind === 'cron' ? { cron: cron.expression } : {}) };
+    return { id, name: input.name, optionalToolIds, ...(cron?.kind === 'cron' ? { cron: cron.expression } : {}) };
   });
-  const plugins = array(dependencies.plugins).map(value => text(record(value).id, 100));
   const skillSlugs = items.flatMap(item => item.view.category === 'skills' ? [item.view.name] : []);
   const welcome = text(firstUse.welcome, 400);
   const onboardingSkill = firstUse.onboardingSkill === undefined ? undefined : text(firstUse.onboardingSkill, 64);
@@ -200,7 +210,7 @@ export async function readNativePartnerPackage(root: string, packageId: string):
     return { icon, label: text(capability.label, 16) };
   });
   if (capabilities.length !== 3) invalid();
-  const known = { skills: skills.map(skill => skill.slug), knowledge: knowledge.map(doc => doc.id), plugins, routines: routines.map(routine => routine.id) };
+  const known = { skills: skills.map(skill => skill.slug), knowledge: knowledge.map(doc => doc.id), plugins: [...plugins.keys()], routines: routines.map(routine => routine.id) };
   const detail = readDetail(presentation.detailZh, known);
   const bubble = detailText(presentation.bubbleZh, 20);
   // Every language must mirror the Chinese detail copy and starter options.
@@ -220,9 +230,9 @@ export async function readNativePartnerPackage(root: string, packageId: string):
       capabilities: capabilities.map((capability, index) => ({ icon: capability.icon, label: l.labels[index]! })),
       skills: l.detail.skills.map(skill => ({ name: skill.title, description: skill.summary })),
       knowledge: l.detail.knowledge.map(doc => ({ title: doc.title, summary: doc.summary })),
-      remembers: l.detail.remembers, tools: l.detail.tools,
+      remembers: l.detail.remembers, tools: tools(l.detail),
       routines: routines.map((routine, index) => ({ name: l.detail.routines[index]!.title, summary: l.detail.routines[index]!.summary,
-        ...(routine.cron ? { cron: routine.cron } : {}) })),
+        optionalToolIds: routine.optionalToolIds, ...(routine.cron ? { cron: routine.cron } : {}) })),
       itemNames: names };
     localized[locale] = { name: l.name, description: l.description, welcome: l.welcome, capabilityLabels: l.labels, starterOptions: l.starters,
       routineNames: Object.fromEntries(routines.map((routine, index) => [routine.id, l.detail.routines[index]!.title])) };
@@ -233,9 +243,9 @@ export async function readNativePartnerPackage(root: string, packageId: string):
     skills: detail.skills.map(skill => ({ name: skill.title, description: skill.summary })),
     knowledge: detail.knowledge.map(doc => ({ title: doc.title, summary: doc.summary })),
     remembers: detail.remembers,
-    tools: detail.tools,
+    tools: tools(detail),
     routines: routines.map((routine, index) => ({ name: detail.routines[index]!.title, summary: detail.routines[index]!.summary,
-      ...(routine.cron ? { cron: routine.cron } : {}) })) };
+      optionalToolIds: routine.optionalToolIds, ...(routine.cron ? { cron: routine.cron } : {}) })) };
   if (new Set(items.map(item => item.view.id)).size !== items.length) invalid();
   return { identity, entry, localized, snapshot: { source: { kind: 'package', agentId: packageId, name, root: path.resolve(root), workspace: path.resolve(root), configFile: path.resolve(root, 'manifest.json') },
     nativePackage: { ...identity, description, avatarPreset, opening: { welcome, capabilities: capabilities.map(item => item.label),

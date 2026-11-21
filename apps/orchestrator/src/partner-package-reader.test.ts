@@ -5,6 +5,34 @@ import { PARTNER_PACKAGE_IDS, applyNativeLocale, readNativePartnerPackage } from
 import { packageFiles } from "./partner-packages/index.js";
 
 describe("bundled partner packages", () => {
+  it("projects optional tools and their account authorization for all ten packages and locales", async () => {
+    const expected: Record<string, readonly string[]> = {
+      "ad-spend-watch": ["google-sheets", "google-gmail", "outlook-mail"],
+      "apple-search-ads-review": ["google-sheets", "google-gmail", "outlook-mail"],
+      cooper: ["web-search", "x-manager"],
+      "engineer-bot": ["github", "gitlab", "notion"],
+      "nightly-audit-engineer": ["github", "gitlab"],
+      "proto-bot": ["opendesign-trial", "art", "github", "gitlab"],
+      "sable-game-art": ["art", "web-search", "notion", "google-drive"],
+      "seo-aeo-desk": ["web-search", "google-sheets", "notion"],
+      "startup-qa-bot": ["github", "gitlab"],
+      "video-editor": ["art", "google-drive"]
+    };
+    const noAccount = new Set(["web-search", "opendesign-trial", "art"]);
+    for (const id of PARTNER_PACKAGE_IDS) {
+      const { entry } = await readNativePartnerPackage(tmpdir(), id);
+      expect(entry.packageVersion).toBe("0.1.1");
+      for (const copy of [entry, ...Object.values(entry.locales)]) {
+        expect(copy.tools.map(tool => [tool.id, tool.requiresUserAuthorization])).toEqual(
+          expected[id]!.map(toolId => [toolId, !noAccount.has(toolId)])
+        );
+      }
+      if (id === "ad-spend-watch" || id === "apple-search-ads-review") {
+        expect(entry.routines[0]?.optionalToolIds).toEqual(["google-sheets", "google-gmail", "outlook-mail"]);
+      }
+    }
+  });
+
   it("validates all ten packages and preserves full skills and disabled routines through the current checkpoint", async () => {
     let skills = 0; let routines = 0;
     for (const id of PARTNER_PACKAGE_IDS) {

@@ -36,7 +36,8 @@ export function createPartnerImportConnectService(manager: PartnerImportManager 
           remembers: entry.remembers, tools: entry.tools.map(tool => create(contract.PartnerPackageToolSchema, tool)),
           routines: entry.routines.map(module => {
             const rhythm = partnerPackageRoutineRhythm(module.cron, request.locale);
-            return create(contract.PartnerPackageModuleSchema, { name: module.name + (rhythm ? ` · ${rhythm}` : ""), description: module.summary });
+            return create(contract.PartnerPackageModuleSchema, { name: module.name + (rhythm ? ` · ${rhythm}` : ""), description: module.summary,
+              optionalToolIds: [...module.optionalToolIds] });
           }),
           ...(entry.installation ? { installation: result(entry.installation) } : {}) })) })),
     invitePartnerPackage: (request, context) => invoke(context, request.controllerId, async controller =>
