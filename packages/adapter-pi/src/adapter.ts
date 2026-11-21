@@ -4114,6 +4114,11 @@ export class PiBackendAdapter implements
       if (!credentials[providerId]) throw new Error("Native text account is unavailable.");
       const auth = new InMemoryCredentialStore(); await auth.modify(providerId, async () => credentials[providerId]); current();
       const runtime = await ModelRuntime.create({ credentials: auth, modelsPath: null, allowModelNetwork: false, refreshOnCreate: false, signal }); current();
+      const additions = createPiModelCatalogAdditions();
+      if (providerId === additions.legacyAzureResponsesId && runtime.getProvider(providerId) === undefined) {
+        const legacy = additions.legacyAzureResponsesProvider(runtime.getProvider("azure"));
+        if (legacy !== undefined) runtime.registerNativeProvider(legacy);
+      }
       const model = runtime.getModel(providerId, modelId); if (!model) throw new Error("The exact native text model is unavailable.");
       if (images.length && !model.input.includes("image")) throw new Error("The selected model does not accept images.");
       const answer = await runtime.complete(model, { systemPrompt: input.system, messages: [{ role: "user", content: [{ type: "text", text: input.user },
@@ -5421,11 +5426,11 @@ export class PiBackendAdapter implements
       JOKO_PI_RUNTIME_POLICY: profile.runtimePolicy,
       JOKO_PI_ARTIFACT_CAPACITY_BYTES: String(requireArtifactCapacity(context)),
       JOKO_PI_SECRET_ENV_NAMES: JSON.stringify([...secretNames].sort()),
+      JOKO_PI_NATIVE_AUTH_PROVIDER_IDS: JSON.stringify((options.nativeAuthProviderIds ?? []).filter(id => hosted?.trust !== "guest" || id === hosted.providerId)),
       ...(managedSubagentToolsEnabled ? {
         [MANAGED_SUBAGENT_PRODUCT_SESSION_ENV]: context.sessionId,
         [MANAGED_SUBAGENT_RUN_ROOT_ENV]: managedSubagentRunRoot(this.#sessionStore.root),
         [MANAGED_SUBAGENT_NODE_ENV]: process.execPath,
-        JOKO_PI_NATIVE_AUTH_PROVIDER_IDS: JSON.stringify((options.nativeAuthProviderIds ?? []).filter(id => hosted?.trust !== "guest" || id === hosted.providerId)),
         JOKO_PI_NATIVE_AUTHENTICATED_PROVIDER_IDS: JSON.stringify((options.nativeAuthenticatedProviderIds ?? []).filter(id => hosted?.trust !== "guest" || id === hosted.providerId)),
         JOKO_PI_SUBAGENT_CREDENTIAL_ENV_NAMES: JSON.stringify([...subagentCredentialNames].sort()),
         [MANAGED_SUBAGENT_PROVIDER_CREDENTIAL_NAMES_ENV]: JSON.stringify(Object.fromEntries(
@@ -7613,10 +7618,13 @@ function validKnownPiHistoryEntryPayload(entry: Readonly<Record<string, unknown>
 }
 
 function validPiAgentMessage(value: unknown): boolean {
-  if (!isRecord(value) || !nonEmptyPiHistoryText(value.role) || !finiteNonNegativePiNumber(value.timestamp)) {
-    return false;
-  }
+  if (!isRecord(value) || !nonEmptyPiHistoryText(value.role)) return false;
+  // Published forks can keep a role-only system marker on the native tree.
+  if (value.role === "system" && Object.keys(value).length === 1) return true;
+  if (!finiteNonNegativePiNumber(value.timestamp)) return false;
   switch (value.role) {
+    case "system":
+      return value.content == null || typeof value.content === "string";
     case "user":
       return validPiUserContent(value.content);
     case "assistant":
@@ -8000,6 +8008,7 @@ function piTreeEntryPreview(
   if (entry.type === "message") {
     const message = isRecord(entry.message) ? entry.message : undefined;
     const role = typeof message?.role === "string" ? message.role : "custom";
+    if (role === "system") return undefined;
     const content = role === "user" && containsManagedResourceExpansion(message?.content)
       ? ""
       : piTreeContentText(message?.content);
@@ -9477,7 +9486,10 @@ function takeLifecycleParticipant(
 }
 
 function redactPiRpcEntry(entry: PiRpcEntry, secrets: readonly string[]): PiRpcEntry {
-  const redacted = redactPiNativeValue(entry, secrets);
+  const visible = entry.type === "message" && isRecord(entry.message) && entry.message.role === "system"
+    ? { id: entry.id, parentId: entry.parentId, timestamp: entry.timestamp, type: entry.type, message: { role: "system" } }
+    : entry;
+  const redacted = redactPiNativeValue(visible, secrets);
   if (!isRecord(redacted)) {
     throw piError("PI_ENTRY_RESPONSE_INVALID", "Pi returned an invalid native history entry", "stream");
   }
@@ -9531,7 +9543,7 @@ function projectPiMessage(
   const role: PiProjectedMessageRole = nativeRole === "user" || nativeRole === "assistant" || nativeRole === "toolResult"
     ? nativeRole
     : "custom";
-  let content = projectPiMessageParts(value.content, secrets);
+  let content = nativeRole === "system" ? [] : projectPiMessageParts(value.content, secrets);
   if (content.length === 0) {
     const fallback = projectPiCustomMessageText(nativeRole, value, secrets);
     if (fallback !== undefined) content = [{ type: "text", text: fallback }];

@@ -1384,11 +1384,11 @@ function isExactProviderSmokeTimelineInference(body, expectedPrompt = PACKAGED_S
     if (typeof tool !== "object" || tool === null || Array.isArray(tool)
       || Object.keys(tool).sort().join(",") !== "function,type" || tool.type !== "function"
       || typeof tool.function !== "object" || tool.function === null || Array.isArray(tool.function)
-      || Object.keys(tool.function).sort().join(",") !== "description,name,parameters,strict"
+      || Object.keys(tool.function).sort().join(",") !== "description,name,parameters"
       || typeof tool.function.name !== "string" || tool.function.name.trim() === ""
       || typeof tool.function.description !== "string"
       || typeof tool.function.parameters !== "object" || tool.function.parameters === null
-      || Array.isArray(tool.function.parameters) || typeof tool.function.strict !== "boolean") return false;
+      || Array.isArray(tool.function.parameters)) return false;
     names.add(tool.function.name);
   }
   return names.size === body.tools.length;
@@ -1435,6 +1435,7 @@ function runProviderSmokeClassifierRegressionTests() {
     ["user content part extra field", (body) => { body.messages[1].content[0].extra = true; }],
     ["tool extra field", (body) => { body.tools[0].extra = true; }],
     ["tool function extra field", (body) => { body.tools[0].function.extra = true; }],
+    ["unexpected strict JSON schema", (body) => { body.tools[0].function.strict = true; }],
     ["malformed system content", (body) => { body.messages[0].content = { text: "system" }; }],
     ["malformed user content", (body) => { body.messages[1].content = { text: PACKAGED_SMOKE_TIMELINE_PROMPT }; }],
     ["malformed tool parameters", (body) => { body.tools[0].function.parameters = []; }],
@@ -1540,8 +1541,7 @@ function providerSmokeTimelineInferenceFixture() {
       function: {
         name: `packaged_smoke_tool_${index}`,
         description: "Packaged smoke fixture tool.",
-        parameters: { type: "object" },
-        strict: true
+        parameters: { type: "object" }
       }
     }))
   };

@@ -2348,7 +2348,7 @@ describe("PiBackendAdapter", () => {
     expect(descriptor.providerRuntimeSupport).toEqual({
       protocols: ["anthropic-messages", "openai-responses", "openai-completions", "google-generative-ai"],
       fields: ["models_endpoint", "headers", "keyless", "auth_header", "model_limits", "model_costs",
-        "model_input_modalities", "model_thinking_levels", "model_sampling", "model_compatibility", "model_fast_mode"]
+        "model_input_modalities", "model_thinking_levels", "model_sampling", "model_compatibility", "model_fast_mode", "model_endpoint"]
     });
     expect(descriptor.tools.map((tool) => tool.name)).toEqual(["read", "bash", "edit", "write", "grep", "find", "ls", "ask_user_question", "subagent", "subagent_status"]);
     expect(descriptor.tools.filter((tool) => tool.enabled).map((tool) => tool.name)).toEqual(["read", "bash", "edit", "write", "ask_user_question", "subagent", "subagent_status"]);

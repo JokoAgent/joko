@@ -50,6 +50,7 @@ export function createPiModelCatalogAdditionsFactory(nativeOptions: {
   readonly buildBaseOptions: typeof buildBaseOptions;
   readonly clampThinkingLevel: typeof clampThinkingLevel;
 }) {
+  const legacyAzureResponsesId = "azure-openai-responses";
   const routes = {
     openai: { baseUrl: "https://api.openai.com/v1" },
     "openai-codex": { baseUrl: "https://chatgpt.com/backend-api" },
@@ -69,10 +70,13 @@ export function createPiModelCatalogAdditionsFactory(nativeOptions: {
     "xiaomi-token-plan-cn": { baseUrl: "https://token-plan-cn.xiaomimimo.com/v1" }
   } as const;
   const zeroCost = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
-  const exactBaseUrl = (value: string | undefined) => value?.replace(/\/+$/, "");
+  const exactBaseUrl = (value: string | undefined, providerId?: string) => {
+    const clean = value?.replace(/\/+$/, "");
+    return providerId === "kimi-coding" && clean === routes["kimi-coding"].baseUrl + "/v1" ? routes["kimi-coding"].baseUrl : clean;
+  };
   const routeFor = (provider: { readonly id: string; readonly baseUrl?: string }) => {
     const route = routes[provider.id as keyof typeof routes];
-    return route !== undefined && (exactBaseUrl(provider.baseUrl) === route.baseUrl
+    return route !== undefined && (exactBaseUrl(provider.baseUrl, provider.id) === route.baseUrl
       || provider.id === "google-vertex" && provider.baseUrl === undefined) ? route : undefined;
   };
 
@@ -295,7 +299,7 @@ export function createPiModelCatalogAdditionsFactory(nativeOptions: {
   ): CatalogMetadata | undefined {
     const provider = model.provider ?? "";
     const route = routes[provider as keyof typeof routes];
-    if (route === undefined || exactBaseUrl(model.baseUrl) !== route.baseUrl) return undefined;
+    if (route === undefined || exactBaseUrl(model.baseUrl, provider) !== route.baseUrl) return undefined;
     if (model.id === "gpt-6-astra" && (provider === "openai" || provider === "openai-codex")) {
       return {
         ...priced(
@@ -431,8 +435,26 @@ export function createPiModelCatalogAdditionsFactory(nativeOptions: {
     return normalizeResponsesPayload(model, payload);
   }
 
+  function legacyAzureResponsesProvider(provider: NativeProvider | undefined): NativeProvider | undefined {
+    if (provider?.id !== "azure") return undefined;
+    const models = provider.getModels()
+      .filter(model => model.provider === "azure" && model.api === "azure-openai-responses")
+      .map(model => ({ ...model, provider: legacyAzureResponsesId }));
+    if (models.length === 0) return undefined;
+    return {
+      id: legacyAzureResponsesId,
+      name: "Azure OpenAI",
+      auth: provider.auth,
+      getModels: () => models,
+      stream: (model, context, options) => provider.stream(model, context, options),
+      streamSimple: (model, context, options) => provider.streamSimple(model, context, options)
+    };
+  }
+
   return {
     extendProvider,
+    legacyAzureResponsesId,
+    legacyAzureResponsesProvider,
     referenceCatalogMetadata,
     normalizeResponsesPayload,
     prepareProviderPayload

@@ -910,10 +910,15 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     ]);
     expect(nativeState.state).toMatchObject({
       streaming: false,
-      messageCount: 2n,
+      messageCount: 3n,
       pendingMessageCount: 0n,
       model: { providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID }
     });
+    expect(nativeMessages.messages.map(message => [message.role, message.parts.length])).toEqual([
+      [PiMessageRole.CUSTOM, 0], [PiMessageRole.USER, 1], [PiMessageRole.ASSISTANT, 1]
+    ]);
+    expect(nativeEntries.entries.filter(entry => entry.payload.case === "message" && entry.payload.value.role === PiMessageRole.CUSTOM))
+      .toMatchObject([{ payload: { value: { parts: [] } } }]);
     const typedMessageText = nativeMessages.messages.flatMap((message) => message.parts)
       .map((part) => part.content.case === "text" ? part.content.value : "")
       .join("\n");
@@ -1919,9 +1924,17 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
   });
 
   it("recovers an installed-Pi context overflow through compaction and one retry", { timeout: 90_000 }, async () => {
+    const historySummary = "Fixture checkpoint of the previous turn.";
+    const pendingInputSummary = "Fixture checkpoint of the input that overflowed.";
     fixture = await RealPiSystemFixture.start({
       piSettings: { compaction: { enabled: true, thresholdPercent: 95, keepRecentTokens: 1 } },
-      overflowRequestNumbers: [2]
+      overflowRequestNumbers: [2],
+      providerResponder: ({ request }) => {
+        const messages = JSON.stringify(request.body["messages"]);
+        const text = messages.includes("conversation to summarize") ? historySummary
+          : messages.includes("earlier context from an ongoing conversation") ? pendingInputSummary : REAL_PI_RESPONSE_TEXT;
+        return { kind: "text", text };
+      }
     });
     const paired = await fixture.pair("Real Pi overflow compaction E2E");
     const created = await submit(
@@ -2007,7 +2020,14 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     // The observed lifecycle retains its actual reason after native history
     // sync. Its exact persisted receipt prevents a second unknown-trigger card.
     expect(events).toEqual(liveOverflowEvents);
-    expect(fixture.providerRequests).toHaveLength(4);
+    const requests = fixture.providerRequests.map(request => JSON.stringify(request.body["messages"]));
+    expect(requests).toHaveLength(5);
+    expect(requests[0]).toContain("Establish history before the context overflow.");
+    expect(requests[1]).toContain("Recover this turn after one simulated context overflow.");
+    expect(requests[2]).toContain("conversation to summarize");
+    expect(requests[3]).toContain("earlier context from an ongoing conversation");
+    expect(requests[4]).toContain(historySummary);
+    expect(requests[4]).toContain(pendingInputSummary);
     const nativeEntries = await paired.clients.pi.listPiEntries({ sessionId });
     expect(nativeEntries.entries).toEqual(expect.arrayContaining([
       expect.objectContaining({ payload: expect.objectContaining({ case: "compaction" }) })

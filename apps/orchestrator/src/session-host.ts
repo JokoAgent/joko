@@ -20750,20 +20750,35 @@ function nativeDispatchHistoryOwnership(
     events.push(event);
     eventsByEntry.set(event.nativeEntryId, events);
   }
-  const firstEvents = eventsByEntry.get(suffixLineage[0]!.entryId) ?? [];
+  let firstInputIndex = 0;
+  while (firstInputIndex < suffixLineage.length) {
+    const entryId = suffixLineage[firstInputIndex]!.entryId;
+    const events = eventsByEntry.get(entryId);
+    const system = events?.[0];
+    if (events?.length !== 1 || system?.metadata?.namespace !== "pi.native_history"
+      || system.metadata.fields["nativeEntryType"] !== "message" || system.projectionKind !== "message_unknown"
+      || system.contentIndex !== 0 || system.payload.type !== "status" || system.payload.key !== "pi.history.message.system") break;
+    // Pi 1.5 records its prompt and tool loadout before the first user message.
+    // Keep the native parent chain without attributing system controls to the accepted input.
+    suffixIds.delete(entryId);
+    firstInputIndex++;
+  }
+  const firstInput = suffixLineage[firstInputIndex];
+  if (firstInput === undefined) return undefined;
+  const firstEvents = eventsByEntry.get(firstInput.entryId) ?? [];
   const userMessages = firstEvents.filter((event) =>
     event.payload.type === "message_complete" && event.payload.role === "user");
   if (userMessages.length !== 1 ||
       userMessages[0]!.metadata?.fields["nativeDispatchFingerprint"] !== baseline.inputFingerprint) {
     return undefined;
   }
-  if (suffixLineage.slice(1).some((entry) => (eventsByEntry.get(entry.entryId) ?? []).some((event) =>
+  if (suffixLineage.slice(firstInputIndex + 1).some((entry) => (eventsByEntry.get(entry.entryId) ?? []).some((event) =>
     event.payload.type === "message_complete" && event.payload.role === "user"))) return undefined;
 
   let terminalIndex = suffixLineage.length - 1;
   if (mode === "recovery" && store.getBackend(session.backendId).descriptor.adapterKind === "pi"
     && userMessages[0]!.metadata?.namespace === "pi.native_history") {
-    while (terminalIndex > 0) {
+    while (terminalIndex > firstInputIndex) {
       const entryId = suffixLineage[terminalIndex]!.entryId;
       const projections = eventsByEntry.get(entryId);
       const control = projections?.[0];
@@ -20805,7 +20820,7 @@ function nativeDispatchHistoryOwnership(
   if (mode === "recovery" && terminalAssistantMessages.length === 0 && codexTurnStatus("native_turn_failed", "failed")) {
     return { baseline, outcome: "failed", nativeEntryIds: suffixIds };
   }
-  if (terminalIndex < 1 || terminalAssistantMessages.length !== 1) return undefined;
+  if (terminalIndex <= firstInputIndex || terminalAssistantMessages.length !== 1) return undefined;
   if (terminalIndex < suffixLineage.length - 1 && terminalAssistantMessages[0]!.metadata?.namespace !== "pi.native_history") return undefined;
   const terminalOutcome = terminalAssistantMessages[0]!.metadata?.fields["nativeTerminalOutcome"];
   if (terminalOutcome !== "completed" && terminalOutcome !== "aborted" && terminalOutcome !== "failed") {

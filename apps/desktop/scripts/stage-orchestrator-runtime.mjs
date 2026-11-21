@@ -102,7 +102,6 @@ try {
   await overlayWorkspacePackages();
   const normalizedCommandShims = await normalizeRuntimeCommandShims(workspaceRoot, candidateRoot);
   await auditRegularRuntimeTree(candidateRoot);
-  const optionalDependency = await assertOptionalDependencyPreserved(candidateRoot);
   const importSmoke = await runCandidateImportSmoke(candidateRoot);
   const sqliteVecSmoke = await runCandidateSqliteVecSmoke(candidateRoot);
   const extensionLibrarySmoke = await runCandidateExtensionLibrarySmoke(candidateRoot);
@@ -130,10 +129,10 @@ try {
     files: audit.files,
     bytes: audit.bytes,
     normalizedCommandShims,
-    optionalDependency,
     criticalImportsResolvedWithinCandidate: importSmoke.criticalImports,
     isolatedExtensionDocument: importSmoke.isolatedExtensionDocument,
     piCliResolvedWithinCandidate: importSmoke.piCli,
+    piRuntime: importSmoke.piRuntime,
     npmRuntime: importSmoke.npmRuntime,
     sqliteVec: sqliteVecSmoke,
     extensionLibrary: extensionLibrarySmoke,
@@ -246,9 +245,20 @@ async function runCandidateImportSmoke(root) {
     'const extensionDocument = await isolatedExtensionDocument({ html: Buffer.from(\'<script src="./entry.js"></script>\'), entry: "index.html",',
     '  assertCurrent: async () => {}, read: async path => { if (path !== "entry.js") throw new Error("Unexpected isolated resource."); return { body: Buffer.from("window.jokoPackagingProbe = 1;"), mimeType: "text/javascript" }; } });',
     'if (!Buffer.isBuffer(extensionDocument) || !extensionDocument.includes(Buffer.from("data:text/javascript;base64,"))) throw new Error("The isolated MainView compiler did not run in the staged runtime.");',
-    'const piEntry = await realpath(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")));',
-    'const piCli = await realpath(resolve(dirname(piEntry), "cli.js"));',
-    'assertContained(piCli);',
+    'const { PUBLISHED_PI_PACKAGE_NAME, PUBLISHED_PI_PACKAGE_ROOT, PUBLISHED_PI_LOCAL_CLI, resolvePublishedPiBundleRoot } = await import("@joko/adapter-pi");',
+    'const piRoot = await realpath(PUBLISHED_PI_PACKAGE_ROOT);',
+    'assertContained(piRoot);',
+    'const piManifest = JSON.parse(await readFile(resolve(piRoot, "package.json"), "utf8"));',
+    'if (piManifest.name !== PUBLISHED_PI_PACKAGE_NAME || typeof piManifest.version !== "string" || piManifest.bin?.pi !== "dist/bundle/cli.js") {',
+    '  throw new Error("The published Pi package identity is invalid.");',
+    '}',
+    'const piCli = await realpath(PUBLISHED_PI_LOCAL_CLI);',
+    'const piBundle = await realpath(resolve(piRoot, piManifest.bin.pi));',
+    'const piRpc = await realpath(fileURLToPath(import.meta.resolve(`${PUBLISHED_PI_PACKAGE_NAME}/rpc-entry`)));',
+    'for (const entry of [piCli, piBundle, piRpc]) assertContained(entry);',
+    'if (await resolvePublishedPiBundleRoot(piBundle) !== piRoot || piRpc !== resolve(piRoot, "dist/bundle/rpc-entry.js")) {',
+    '  throw new Error("The staged Pi CLI or RPC bundle does not match the installed package.");',
+    '}',
     'const npmManifestPath = await realpath(resolve(root, npmRuntime.manifestRelativePath));',
     'const npmCli = await realpath(resolve(root, npmRuntime.cliRelativePath));',
     'assertContained(npmManifestPath);',
@@ -257,7 +267,7 @@ async function runCandidateImportSmoke(root) {
     'if (npmManifest.name !== npmRuntime.name || npmManifest.version !== npmRuntime.version || npmManifest.bin?.npm !== npmRuntime.packageBinTarget) {',
     '  throw new Error("The bundled npm runtime identity is invalid.");',
     '}',
-    'process.stdout.write(JSON.stringify({ ok: true, root, piCli, npmCli, npmVersion: npmManifest.version, isolatedExtensionDocument: true }));'
+    'process.stdout.write(JSON.stringify({ ok: true, root, piCli, piBundle, piRpc, piVersion: piManifest.version, npmCli, npmVersion: npmManifest.version, isolatedExtensionDocument: true }));'
   ].join("\n");
   await writeFile(smokePath, `${source}\n`, { flag: "wx", mode: 0o600 });
   try {
@@ -275,6 +285,18 @@ async function runCandidateImportSmoke(root) {
       throw new Error("The isolated Electron-Node import smoke returned an invalid npm runtime identity.");
     }
     if (parsed.isolatedExtensionDocument !== true) throw new Error("The staged MainView compiler was not exercised.");
+    if (![parsed.piCli, parsed.piBundle, parsed.piRpc, parsed.piVersion].every(value => typeof value === "string" && value.length > 0)) {
+      throw new Error("The staged Pi runtime did not report its published entry points.");
+    }
+    for (const entry of [parsed.piCli, parsed.piBundle]) {
+      const piResult = await runCommand(electronExecutable(), [entry, "--version"], {
+        cwd: root,
+        environment: electronNodeEnvironment(),
+        timeoutMs: 45_000,
+        label: "isolated published Pi CLI smoke"
+      });
+      if (piResult.stdout.trim() !== parsed.piVersion) throw new Error("The staged Pi executable did not report the published version.");
+    }
     const npmResult = await runCommand(electronExecutable(), [parsed.npmCli, "--version"], {
       cwd: root,
       environment: electronNodeEnvironment(),
@@ -288,6 +310,7 @@ async function runCandidateImportSmoke(root) {
       criticalImports: ORCHESTRATOR_RUNTIME_CRITICAL_IMPORTS.length,
       isolatedExtensionDocument: true,
       piCli: parsed.piCli,
+      piRuntime: { version: parsed.piVersion, bundledCli: parsed.piBundle, rpc: parsed.piRpc },
       npmRuntime: { cli: parsed.npmCli, version: parsed.npmVersion }
     };
   } finally {
@@ -471,19 +494,6 @@ async function assertRepositoryStateUnchanged() {
     throw new Error("Isolated runtime staging modified the repository node_modules workspace state.");
   }
   return after;
-}
-
-async function assertOptionalDependencyPreserved(root) {
-  const manifestPath = join(root, "node_modules", "@mariozechner", "clipboard", "package.json");
-  const info = await lstat(manifestPath);
-  if (!info.isFile() || info.isSymbolicLink()) {
-    throw new Error("The Pi optional clipboard dependency was not preserved as a regular package.");
-  }
-  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  if (manifest?.name !== "@mariozechner/clipboard") {
-    throw new Error("The preserved Pi optional dependency has an unexpected identity.");
-  }
-  return manifest.name;
 }
 
 function electronExecutable() {

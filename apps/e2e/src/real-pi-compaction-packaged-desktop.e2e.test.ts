@@ -256,7 +256,7 @@ describe("packaged Desktop Pi compaction", () => {
     await editor.getByRole("tab", { name: /Pi/u }).first().click();
     await editor.getByRole("button", { name: /Configure.*Pi/u }).click();
     await editor.getByLabel("Protocol").click();
-    await page.getByRole("option", { name: "OpenAI Completions", exact: true }).click();
+    await page.getByRole("option", { name: "OpenAI Chat Completions", exact: true }).click();
     await editor.getByLabel("Base URL").fill(providerUrl);
     await editor.getByRole("button", { name: "No authentication" }).click();
     await editor.getByLabel("Model ID").fill(REAL_PI_MODEL_ID);

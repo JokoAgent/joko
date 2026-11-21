@@ -118,12 +118,12 @@ jobs:
         run: |
           pi_release_dir="$(mktemp -d "$RUNNER_TEMP/published-pi.XXXXXX")"
           pi_archive="$pi_release_dir/pi-linux-x64.tar.gz"
-          curl --fail --location --retry 2 'https://github.com/earendil-works/pi/releases/download/v0.85.1/pi-linux-x64.tar.gz' --output "$pi_archive"
-          printf '%s  %s\n' 494e498f47d74d21f40b3386f6a5e921a3d49531a169cab55bbdaca0ea1fe25a "$pi_archive" | sha256sum --check
+          curl --fail --location --retry 2 'https://github.com/earendil-works/pi/releases/download/v1.5.2/pi-linux-x64.tar.gz' --output "$pi_archive"
+          printf '%s  %s\n' 811c6f2c9e7aaee252b5404252e556fb713aa209c1f7f924226aa77d4ef70cb5 "$pi_archive" | sha256sum --check
           tar -tzf "$pi_archive" | tee "$RUNNER_TEMP/orchestrator-regressions/pi-standalone-members.log"
           tar --extract --gzip --file "$pi_archive" --directory "$pi_release_dir" --no-same-owner
           export JOKO_PI_STANDALONE_TEST_EXECUTABLE="$pi_release_dir/pi/pi"
-          test "$("$JOKO_PI_STANDALONE_TEST_EXECUTABLE" --version)" = '0.85.1'
+          test "$("$JOKO_PI_STANDALONE_TEST_EXECUTABLE" --version)" = '1.5.2'
           pnpm --filter @joko/orchestrator exec vitest run src/remote-pi-process.test.ts -t 'starts the published standalone archive SSH Pi RPC' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/pi-standalone-rpc.log"
       - name: Check actual remote Review and workspace search
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' && runner.os == 'Linux' }}
@@ -409,7 +409,7 @@ jobs:
         if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full') }}
         timeout-minutes: 20
         shell: bash
-        run: node scripts/ci/prepare-codex-native.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/codex-native-prepare.log"
+        run: node --import tsx scripts/ci/prepare-codex-native.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/codex-native-prepare.log"
 
       - name: Prepare Ubuntu user namespaces for native Backend tests
         id: codex_sandbox

@@ -57,6 +57,7 @@ describe("real Pi managed generation smoke", () => {
     const create = { target, providerId: "endpoint-fixture", modelId, fastMode: false, permissionMode: "ask" as const };
     const send = (text: string, bound: AdapterContext) => adapter.send({ text, images: [], files: [], mentions: [], disposition: "prompt" }, bound);
     try {
+      expect((await adapter.describe()).version).toBe("1.5.2");
       const binding = await adapter.createSession(create, context);
       const queuedBinding = await adapter.createSession(create, queuedContext);
       const bound = { ...context, binding };
@@ -444,7 +445,9 @@ export default function (pi) {
       const linearTree = await adapter.getTree(first);
       const linearNodes = flattenTree(linearTree.roots);
       expect(linearTree.leafId).toBeDefined();
-      expect(linearNodes.filter((node) => node.kind === "message")).toHaveLength(4);
+      const linearMessages = linearNodes.filter((node) => node.kind === "message");
+      expect(linearMessages.map(node => node.role)).toEqual(["custom", "user", "assistant", "user", "assistant"]);
+      expect(linearMessages[0]?.label).toBeUndefined();
       const forkMessagesBeforeBranch = await adapter.getForkMessages(first);
       expect(forkMessagesBeforeBranch.map((message) => message.text)).toEqual(["workflow turn one", "workflow turn two"]);
       const navigationTarget = forkMessagesBeforeBranch[0]?.entryId;
@@ -457,7 +460,8 @@ export default function (pi) {
       await firstSink.waitForDone(3);
       const branchedTree = await adapter.getTree(first);
       expect(branchedTree.leafId).not.toBe(linearTree.leafId);
-      expect(flattenTree(branchedTree.roots).filter((node) => node.kind === "message")).toHaveLength(6);
+      expect(flattenTree(branchedTree.roots).filter(node => node.role === "user")).toHaveLength(3);
+      expect(flattenTree(branchedTree.roots).filter(node => node.role === "assistant")).toHaveLength(3);
 
       await expect(adapter.compact("Preserve the workflow branch name.", first)).resolves.toBe("compacted");
       const compactedTree = await adapter.getTree(first);
@@ -520,6 +524,20 @@ export default function (pi) {
         sessionId: "real-pi-workflow-clone",
         target: forkContext.target,
         recordBinding: (binding) => { cloneReceipt.push(binding); }
+      }).catch(error => {
+        const entries = SessionManager.open(forkBinding.opaqueRef).getEntries().map(entry => {
+          const fields = Object.fromEntries(Object.entries(entry).map(([key, value]) => [key, value === null ? "null" : typeof value]));
+          if (entry.type === "message") {
+            fields["role"] = entry.message.role;
+            for (const [key, value] of Object.entries(entry.message)) {
+              if (key === "role") continue;
+              fields[`message.${key}`] = Array.isArray(value) ? value.map(part => part?.type ?? typeof part).join(",")
+                : value === null ? "null" : typeof value;
+            }
+          }
+          return { type: entry.type, fields };
+        });
+        throw new Error(`The published Pi fork could not be cloned. Native entry shapes: ${JSON.stringify(entries)}`, { cause: error });
       });
       expect(cloneReceipt).toEqual([cloneBinding]);
       expect(cloneBinding).toMatchObject({ generation: 1 });
@@ -601,7 +619,7 @@ export default function (pi) {
       await adapter.setAutoCompactionThreshold(75, context);
       const compacted = await adapter.getTree(context);
       expect(flattenTree(compacted.roots).filter((node) => node.kind === "compaction")).toEqual([
-        { entryId: compacted.leafId, kind: "compaction" }
+        { entryId: compacted.leafId, kind: "compaction", role: undefined, label: "native-response-3" }
       ]);
       const [started, completed] = compactions();
       expect(compactions()).toHaveLength(2);
@@ -1133,9 +1151,9 @@ function smokeContext(target: TargetDescriptor, generation: number, sink: EventS
   };
 }
 
-function flattenTree(nodes: readonly SessionTreeNode[]): readonly Pick<SessionTreeNode, "entryId" | "kind">[] {
+function flattenTree(nodes: readonly SessionTreeNode[]): readonly Pick<SessionTreeNode, "entryId" | "kind" | "role" | "label">[] {
   return nodes.flatMap((node) => [
-    { entryId: node.entryId, kind: node.kind },
+    { entryId: node.entryId, kind: node.kind, role: node.role, label: node.label },
     ...flattenTree(node.children)
   ]);
 }

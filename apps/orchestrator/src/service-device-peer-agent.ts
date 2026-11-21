@@ -163,7 +163,7 @@ export async function createServiceDevicePeerRuntimeExecutables(
     const piRoot = resolve(dirname(piEntry), "..");
     const piManifest = await readRuntimeManifest(piRoot);
     if (piManifest["name"] !== "@earendil-works/pi-coding-agent"
-      || piManifest["version"] !== "0.85.1"
+      || piManifest["version"] !== "1.5.2"
       || !isRecord(piManifest["bin"])
       || piManifest["bin"]["pi"] !== "dist/bundle/cli.js") {
       throw new Error("The Service Device peer Pi locator is unavailable.");
