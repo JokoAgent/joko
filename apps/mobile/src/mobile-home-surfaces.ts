@@ -29,7 +29,10 @@ let nextSequence = 0;
 
 function nativeHomeSurfaces(): HomeSurfacesNative | undefined {
   if (Platform.OS !== "ios" && Platform.OS !== "android") return undefined;
-  try { return requireOptionalNativeModule<HomeSurfacesNative>("JokoHomeSurfaces") ?? undefined; }
+  try {
+    const native = requireOptionalNativeModule<HomeSurfacesNative>("JokoHomeSurfaces");
+    return typeof native?.apply === "function" ? native : undefined;
+  }
   catch { return undefined; }
 }
 
