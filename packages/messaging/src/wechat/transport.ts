@@ -190,6 +190,7 @@ export class WeChatTransport {
     readonly context?: WeChatSendContext;
     readonly attachments: readonly { readonly kind: "image" | "file"; readonly bytes: Uint8Array; readonly fileName: string; readonly mimeType: string }[];
     readonly replyToMessageId?: string;
+    readonly assertCurrent?: () => void;
     readonly signal?: AbortSignal;
   }): Promise<MessagingSendReceipt> {
     this.#assertAddress(input.address);
@@ -202,6 +203,7 @@ export class WeChatTransport {
     const classified = classifyWeChatOutbound(attachment);
     const signal = input.signal ?? new AbortController().signal;
     signal.throwIfAborted();
+    input.assertCurrent?.();
     const prepared = prepareWeChatUpload(attachment.bytes);
     const admitted = await this.#api.getUploadUrl({
       peerId: input.address.providerConversationId,
@@ -223,6 +225,7 @@ export class WeChatTransport {
     }, signal, this.#mediaOptions);
     this.#assertOpen();
     signal.throwIfAborted();
+    input.assertCurrent?.();
     await this.#api.sendMedia({
       peerId: input.address.providerConversationId,
       context,

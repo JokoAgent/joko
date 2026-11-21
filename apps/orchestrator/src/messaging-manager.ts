@@ -1,4 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import {
+  beginWeChatNoticePreparation, delayedWeChatReply, finishWeChatNoticePreparation, hasWeChatNoticeReceipt,
+  recoverWeChatNoticePreparations, rememberWeChatQuestion, saveWeChatNoticeReceipt, weChatDelayedNotice
+} from "./wechat-delayed-reply.js";
 import { fileTypeFromBuffer } from "file-type";
 import {
   DISCORD_MAXIMUM_INBOUND_FILE_BYTES,
@@ -276,6 +280,7 @@ interface MessagingTransportEffectsPort {
       readonly mimeType: string;
     }[];
     readonly replyToMessageId?: string;
+    readonly assertCurrent?: () => void;
     readonly signal?: AbortSignal;
   }): Promise<MessagingSendReceipt>;
   sendInteractionCard(input: {
@@ -642,7 +647,9 @@ export class MessagingManager {
     for (const reference of this.#managedCredentialReferences()) {
       this.#credentials.reserveManagedSecret({ credentialReferenceId: reference, kind: "api_key" });
     }
-    this.#store.recoverClaimedMessagingDeliveries(this.#now());
+    const recoveredAt = this.#now();
+    recoverWeChatNoticePreparations(this.#store, recoveredAt);
+    this.#store.recoverClaimedMessagingDeliveries(recoveredAt);
     this.#store.recoverClaimedMessagingInteractions(this.#now());
     this.#unsubscribeProgress = this.#store.subscribe(event => { this.#observeFeishuProgress(event); this.#observeReplyStream(event); });
     await this.#cleanupCredentials();
@@ -3038,6 +3045,7 @@ export class MessagingManager {
         queueItemId: admitted.queueItemId,
         updatedAt: this.#now()
       });
+      if (connection.channel === "wechat" && !admittedRequest.protectedContent) rememberWeChatQuestion(store, request.id, event.text);
       if (connection.channel === "telegram" && groupHistory.messageIds.length > 0) {
         groupHistory.selections = this.#rememberTelegramHistorySelection(connection, request.id, event,
           groupHistory.messageIds, store.getQueueItem(admitted.queueItemId).bodyHash);
@@ -4476,19 +4484,25 @@ export class MessagingManager {
       signal.throwIfAborted();
       const connection = this.#requireWorkerConnection(transport.connectionId, transport.generation);
       const claimToken = this.#idFactory();
-      const delivery = this.#store.claimNextMessagingDelivery({
-        connectionId: connection.id,
-        expectedChannelGeneration: connection.generation,
-        claimToken,
-        claimedAt: this.#now()
+      const claimed = this.#store.transaction(store => {
+        const claimedAt = this.#now();
+        const delivery = store.claimNextMessagingDelivery({ connectionId: connection.id, expectedChannelGeneration: connection.generation, claimToken, claimedAt });
+        if (!delivery) return undefined;
+        const delayed = delayedWeChatReply(store, connection, delivery, claimedAt);
+        if (delayed) beginWeChatNoticePreparation(store, delivery, claimToken);
+        return { delivery, delayed };
       });
-      if (delivery === undefined) return;
+      if (claimed === undefined) return;
+      const { delivery, delayed } = claimed;
+      let bodyMayHaveStarted = delayed === undefined;
+      const finishNotice = () => { if (delayed) finishWeChatNoticePreparation(this.#store, delivery.id); };
       try {
         const retiredLifecycle = connection.channel === "discord" && delivery.kind === "notice"
           && /^lifecycle:(?:connected|shutdown):generation:/u.test(delivery.dedupeKey)
           && !delivery.dedupeKey.endsWith(`:instance:${this.#discordLifecycleId}`);
         const streamPayload = isRecord(delivery.payload) && (delivery.payload["replyStream"] !== undefined || delivery.payload["streamFinalRequestId"] !== undefined);
         if (retiredLifecycle || this.#obsoleteInteractionDelivery(delivery) || streamPayload && !this.#streamDeliverySource(delivery)) {
+          finishNotice();
           this.#store.settleMessagingDelivery({
             deliveryId: delivery.id,
             expectedRevision: delivery.revision,
@@ -4533,7 +4547,36 @@ export class MessagingManager {
           if (source.start?.status === "sent" && !this.#store.hasUnknownMessagingDelivery({ connectionId: connection.id, channelGeneration: connection.generation,
             conversationId: delivery.conversationId, dedupeKeyPrefix: `request:${source.request.id}:progress:` })) streamCarrierMessageId = source.start.providerMessageId;
         }
-        const providerMessageId = await dispatchMessagingDelivery(transport, delivery, this.#artifacts, deliverySignal, context, fallbackProgressMessageId, assertDeliveryCurrent, streamCarrierMessageId);
+        const assertContext = () => {
+          assertDeliveryCurrent();
+          if (delayed && context && this.#weChatSendContext(connection, delivery).contextToken !== context.contextToken) {
+            throw new MessagingTransportError("provider_rejected", "The original WeChat reply context changed before dispatch.", { effect: "none", retryable: true });
+          }
+        };
+        const beforeWeChatReply = delayed && context && replyConversation ? async (address: MessagingAddress): Promise<void> => {
+          if (!sameMessagingAddress(address, addressFor(connection, replyConversation))) throw invalid("The delayed WeChat reply lost its recipient.");
+          assertContext();
+          const notice = weChatDelayedNotice(delivery, delayed, context.contextToken, this.#now());
+          if (!hasWeChatNoticeReceipt(this.#store, delivery.conversationId, notice.id)) {
+            try {
+              await transport.sendTextPart({ address, text: notice.text, context: { ...context, clientId: notice.id },
+                signal: deliverySignal, assertCurrent: assertContext });
+            } catch (error) {
+              // Only the notice may have reached WeChat. Its stable ID can be
+              // retried while the original body remains eligible for dispatch.
+              if (externalEffectUnknown(error)) throw new MessagingTransportError("provider_rejected",
+                "The delayed WeChat notice did not return a confirmation.", { effect: "none", retryable: true });
+              throw error;
+            }
+            assertDeliveryCurrent();
+            saveWeChatNoticeReceipt(this.#store, delivery.conversationId, notice.id);
+          }
+          assertContext();
+          finishNotice();
+          bodyMayHaveStarted = true;
+        } : undefined;
+        const providerMessageId = await dispatchMessagingDelivery(transport, delivery, this.#artifacts, deliverySignal, context, fallbackProgressMessageId,
+          assertContext, streamCarrierMessageId, beforeWeChatReply);
         const settled = this.#store.settleMessagingDelivery({
           deliveryId: delivery.id,
           expectedRevision: delivery.revision,
@@ -4561,14 +4604,17 @@ export class MessagingManager {
           if (request !== undefined) this.#finishSlackProgress(request);
         }
       } catch (error) {
-        const unknown = externalEffectUnknown(error);
-        const settled = this.#store.settleMessagingDelivery({
-          deliveryId: delivery.id,
-          expectedRevision: delivery.revision,
-          claimToken,
-          status: unknown ? "unknown" : "failed",
-          errorCode: transportErrorCode(error),
-          settledAt: this.#now()
+        const unknown = bodyMayHaveStarted && externalEffectUnknown(error);
+        const settled = this.#store.transaction(store => {
+          finishNotice();
+          return store.settleMessagingDelivery({
+            deliveryId: delivery.id,
+            expectedRevision: delivery.revision,
+            claimToken,
+            status: unknown ? "unknown" : "failed",
+            errorCode: transportErrorCode(error),
+            settledAt: this.#now()
+          });
         });
         const retryLimit = connection.channel === "telegram" && error instanceof MessagingTransportError
           && error.options.providerStatus === 429 ? 2 : 5;
@@ -4835,7 +4881,8 @@ async function dispatchMessagingDelivery(
   context?: { readonly contextToken: string; readonly clientId: string },
   fallbackProgressMessageId?: string,
   assertCurrent: () => void = () => signal.throwIfAborted(),
-  streamCarrierMessageId?: string
+  streamCarrierMessageId?: string,
+  beforeWeChatReply?: (address: MessagingAddress) => Promise<void>
 ): Promise<string> {
   assertCurrent();
   if ((transport.channel === "telegram" || transport.channel === "discord") && isRecord(delivery.payload) && isRecord(delivery.payload["replyStream"])) {
@@ -4935,6 +4982,7 @@ async function dispatchMessagingDelivery(
       });
       return receipt.providerMessageId;
     }
+    if (beforeWeChatReply) await beforeWeChatReply(payload.address);
     const receipt = await transport.sendTextPart({
       address: payload.address,
       text: payload.text,
@@ -4976,11 +5024,13 @@ async function dispatchMessagingDelivery(
       });
     }
     assertCurrent();
+    if (beforeWeChatReply) await beforeWeChatReply(payload.address);
     const receipt = await transport.sendAttachments({
       address: payload.address,
       attachments,
       ...(context === undefined ? {} : { context }),
       ...(payload.replyToMessageId === undefined ? {} : { replyToMessageId: payload.replyToMessageId }),
+      ...(transport.channel === "wechat" ? { assertCurrent } : {}),
       signal
     });
     return receipt.providerMessageId;

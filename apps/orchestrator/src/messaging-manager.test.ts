@@ -68,6 +68,7 @@ import { SessionHost } from "./session-host.js";
 import { PartnerManager } from "./partner-manager.js";
 import { PartnerMessagingRuntime } from "./partner-messaging.js";
 import { mkdtempSync } from "./test-paths.js";
+import { beginWeChatNoticePreparation } from "./wechat-delayed-reply.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
 
@@ -1355,6 +1356,68 @@ describe("MessagingManager", () => {
       .toEqual(["private-context-a", "rotated-context-a"]);
     expect(fixture.store.getMessagingDelivery(otherPeer.id)).toEqual(otherPeer);
     expect(fixture.store.getMessagingDelivery(unknown.id)).toEqual(unknown);
+  });
+
+  it.each([30 * 60_000 - 1_000, 30 * 60_000])("attributes WeChat reply age %d against the original outbox timestamp after restart", async delayMs => {
+    let now = Math.floor(Date.now() / (30 * 60_000)) * (30 * 60_000) + 10_000;
+    const batch = weChatDirectBatch(), original = batch.events[0]!;
+    if (original.kind !== "message") throw new Error("Expected a WeChat message.");
+    const question = `First  question ${"😀".repeat(130)} Tail of original question`;
+    const transport = new FakeWeChatTransport({ ...batch, events: [{ ...original, text: question, occurredAt: now - 5_000 }],
+      privateContexts: [batch.privateContexts[0]!] });
+    const send = transport.sendTextPart.bind(transport);
+    const attempts = vi.spyOn(transport, "sendTextPart").mockImplementationOnce(async () => {
+      throw new MessagingTransportError("provider_rejected", "Temporary failure before sending.", { retryable: true, effect: "none", retryAfterMs: 30_000 });
+    });
+    const f = await createFixture(undefined, undefined, undefined, undefined, undefined, undefined, () => transport,
+      undefined, undefined, undefined, undefined, undefined, () => now);
+    f.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const created = f.manager.createWeChatConnection();
+    const enabled = await f.manager.commitWeChatAuthorization({ clientConnectionId: "desktop-one", connectionId: created.id,
+      expectedRevision: created.revision, expectedGeneration: created.generation, expectedCredentialReferenceId: null, expectedCredentialGeneration: null,
+      expectedEnabled: false, credentials: { token: "weChat-private-token", botId: "wx-bot", userId: "wx-account", baseUrl: "https://ilinkai.weixin.qq.com" }, enable: true });
+    const replies = () => f.store.listMessagingDeliveries({ connectionId: enabled.id }).filter(row => row.kind === "text");
+    await vi.waitFor(() => expect(replies()).toMatchObject([{ status: "pending", attempts: 1 }]), { timeout: 5_000 });
+    const first = replies()[0]!;
+    await f.manager.close();
+    now = first.createdAt + delayMs;
+    const delayed = delayMs === 30 * 60_000;
+    if (delayed) {
+      f.store.transaction(store => {
+        const sleeping = store.claimNextMessagingDelivery({ connectionId: enabled.id, expectedChannelGeneration: enabled.generation,
+          claimToken: "notice-only-claim", claimedAt: now });
+        expect(sleeping?.id).toBe(first.id);
+        beginWeChatNoticePreparation(store, sleeping!, "notice-only-claim");
+      });
+      attempts.mockImplementationOnce(async input => {
+        expect(input.text).toMatch(/^Delayed reply/u);
+        await send(input);
+        throw new MessagingTransportError("malformed_response", "The notice confirmation was lost.", { retryable: false, effect: "unknown" });
+      });
+    }
+    await f.restartManager();
+    if (delayed) {
+      await vi.waitFor(() => expect(replies()[0]).toMatchObject({ status: "pending", attempts: 3 }), { timeout: 5_000 });
+      expect(transport.sentText).toHaveLength(1);
+      const notice = transport.sentText[0]!;
+      const excerpt = Array.from(question.replace(/\s+/gu, " ")).slice(0, 120).join("");
+      expect(notice.text).toContain(`“${excerpt}”`);
+      expect(notice.text).not.toContain("Tail of original question");
+      expect(notice.context?.clientId).not.toBe(first.id);
+      await f.manager.close();
+      now = replies()[0]!.availableAt;
+      attempts.mockImplementationOnce(async input => {
+        expect(input.context).toEqual(notice.context);
+        expect(input.text).toBe(notice.text);
+        return { providerMessageId: notice.context!.clientId, address: input.address };
+      });
+      await f.restartManager();
+    }
+    await vi.waitFor(() => expect(replies()[0]).toMatchObject({ status: "sent" }), { timeout: 5_000 });
+    expect(transport.sentText).toHaveLength(delayed ? 2 : 1);
+    expect(transport.sentText.at(-1)?.context).toEqual({ contextToken: "private-context-a", clientId: first.id });
+    expect(transport.sentText.every(row => row.address.providerConversationId === "wx-peer-a")).toBe(true);
+    expect(attempts.mock.calls.filter(([input]) => input.context?.clientId === first.id)).toHaveLength(2);
   });
 
   it("keeps the canonical Partner task open when its WeChat owner sends /new", async () => {
@@ -5250,7 +5313,8 @@ async function createFixture(
   slackTransportFactory?: (options: SlackTransportOptions) => FastFailureSlackTransport,
   replyStreamTiming?: MessagingManagerOptions["replyStreamTiming"],
   sessionRuntimeRecoveryDelayMs?: (attempt: number) => number,
-  contacts?: ContactManager
+  contacts?: ContactManager,
+  now?: () => number
 ) {
   const root = mkdtempSync(join(tmpdir(), "joko-messaging-manager-"));
   const store = new OperationalStore(join(root, "operational.db"));
@@ -5292,6 +5356,7 @@ async function createFixture(
     contextVault: vault,
     sessionHost: host,
     artifacts,
+    ...(now === undefined ? {} : { now }),
     ...(contacts === undefined ? {} : { contacts }),
     retryDelayMs: 5,
     ...(weChatPresenceTiming === undefined ? {} : { weChatPresenceTiming }),
