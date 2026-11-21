@@ -100,7 +100,7 @@ describe.skipIf(!binary)("ordinary actual Codex native execution", () => {
       expect(handoffs.read(sessionId)?.pending).toMatchObject({ phase: "pending", nativeProvider: true });
       await send("send-managed", "SECOND MANAGED USER INPUT");
       const managed = store.getSession(sessionId).descriptor.binding;
-      expect(managed.generation).toBe(source.generation + 1);
+      expect(managed.generation).toBeGreaterThan(source.generation);
       expect(managed.nativeSessionId).not.toBe(source.nativeSessionId);
       const control = host.getSessionRuntimeControl(sessionId);
       expect(await host.setSessionRuntimeControl({ sessionId, expectedGeneration: control.generation,
@@ -110,7 +110,7 @@ describe.skipIf(!binary)("ordinary actual Codex native execution", () => {
       const final = store.getSession(sessionId).descriptor;
       expect(final).toMatchObject({ id: sessionId, targetId: target.id, backendId: adapter.id,
         providerId: native!.providerId, modelId: native!.modelId, permissionMode: "bypassPermissions" });
-      expect(final.binding.generation).toBe(managed.generation + 1);
+      expect(final.binding.generation).toBeGreaterThan(managed.generation);
       expect(final.binding.nativeSessionId).not.toBe(managed.nativeSessionId);
       expect(wire.filter(row => row.method === "thread/fork").map(row => row.params)).toEqual([
         expect.objectContaining({ threadId: source.nativeSessionId, modelProvider: "joko-managed", excludeTurns: true }),

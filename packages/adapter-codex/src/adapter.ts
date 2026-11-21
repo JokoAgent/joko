@@ -2646,7 +2646,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     let response;
     try {
       await this.#activateManagedOperation(runtime, context);
-      response = await this.#host.request("thread/compact/start", { threadId: runtime.threadId }, { mutation: true, signal: context.signal });
+      response = await runtime.host.request("thread/compact/start", { threadId: runtime.threadId }, {
+        mutation: true, signal: context.signal, beforeDispatch: () => this.#assertRuntimeFence(runtime, context, runtime.hostGeneration)
+      });
       this.#assertRuntimeFence(runtime, context, response.hostGeneration);
       await completion;
       this.#assertRuntimeFence(runtime, context, response.hostGeneration);
@@ -2804,23 +2806,26 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const admission = { count: 0, rewinding: true };
     this.#sessionMutations.set(context.sessionId, admission);
     const hostGeneration = runtime.hostGeneration;
+    const host = runtime.host;
     const signal = AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]);
-    const assertIdle = () => {
+    const assertIdle = (checkNotifications = true) => {
       assertDispatchNotCancelled(signal);
       if (!this.#matchesCoreFence(runtime, context) || runtime.hostGeneration !== hostGeneration
-        || !this.#host.isActiveGeneration(hostGeneration)) throw nativeHistoryReadFailure("STALE");
+        || !host.isActiveGeneration(hostGeneration)) throw nativeHistoryReadFailure("STALE");
       if (runtimeHasProductWork(runtime) || runtime.compaction !== undefined
         || runtime.pendingServerRequests.size !== 0 || runtime.nativeTasks.hasActiveTasks()
-        || this.#host.hasPendingThreadNotifications(runtime.threadId, hostGeneration)) throw rewindBusy();
+        || checkNotifications && host.hasPendingThreadNotifications(runtime.threadId, hostGeneration)) throw rewindBusy();
     };
     try {
+      assertIdle(false);
+      await host.waitForThreadNotifications(runtime.threadId, hostGeneration, AbortSignal.any([signal, AbortSignal.timeout(this.#historyReadTimeoutMs)]));
       assertIdle();
       const history = await this.#readCompleteHistory(runtime, context);
       assertIdle();
       const legacy = history.thread.historyMode === "legacy" && this.#supportsLegacyDialogueRewind(runtime);
       if (!legacy) assertRewindableHistory(history.thread);
       for (const lineage of runtime.nativeTasks.mergeHistory(history.thread)) {
-        await this.#host.registerDescendantThread(lineage.childThreadId, lineage.parentThreadId, hostGeneration);
+        await host.registerDescendantThread(lineage.childThreadId, lineage.parentThreadId, hostGeneration);
         history.assertCurrent();
       }
       assertIdle();
@@ -2852,7 +2857,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       const expectedPrefix = history.thread.turns.slice(0, index + 1).map(fullTurnSignature);
       let response;
       try {
-        response = await this.#host.request("thread/revert", { threadId: runtime.threadId, beforeTurnId: excluded.id }, {
+        response = await host.request("thread/revert", { threadId: runtime.threadId, beforeTurnId: excluded.id }, {
           mutation: true, signal, beforeDispatch
         });
       } catch (error) {
@@ -2875,7 +2880,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         // A lost acknowledgement is never resent. Only the exact retained
         // prefix, read from the same live owner, can confirm the desired state.
         const confirm = async () => {
-          await this.#host.waitForThreadNotifications(runtime.threadId, hostGeneration, confirmationSignal);
+          await host.waitForThreadNotifications(runtime.threadId, hostGeneration, confirmationSignal);
           assertIdle();
           return this.#readCompleteHistory(runtime, confirmationContext);
         };
@@ -2892,7 +2897,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         if (JSON.stringify(retained.thread.turns.map(fullTurnSignature)) !== JSON.stringify(expectedPrefix)) throw new ProtocolShapeError("revert retained prefix differs");
         retained.assertCurrent();
         const retainedDescendants = runtime.nativeTasks.replaceHistory(retained.thread);
-        this.#host.retainDescendantThreads(runtime.threadId, hostGeneration, new Set(retainedDescendants.map((lineage) => lineage.childThreadId)));
+        host.retainDescendantThreads(runtime.threadId, hostGeneration, new Set(retainedDescendants.map((lineage) => lineage.childThreadId)));
         runtime.state.activeTurnId = undefined;
         runtime.state.usage = undefined;
         runtime.state.itemNames.clear();
