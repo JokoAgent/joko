@@ -110,7 +110,12 @@ mounted("renders and encodes a scrolling region, a looping GIF, and a WebM from 
   await page.getByRole("button", { name: "Record video", exact: true }).click();
   await page.getByText("Recording · 1s", { exact: true }).waitFor();
   await page.getByRole("button", { name: "Finish", exact: true }).click();
-  await page.locator("#playback").waitFor({ state: "visible" });
+  const video = page.locator("#playback");
+  await video.waitFor({ state: "visible" });
+  await expect.poll(() => video.evaluate(node => {
+    const duration = (node as HTMLVideoElement).duration;
+    return Number.isFinite(duration) && duration > 0.5;
+  })).toBe(true);
   await page.getByRole("button", { name: "Copy", exact: true }).click();
   await expect.poll(async () => (await evidence()).actions.length).toBe(1);
   expect(Buffer.from((await evidence()).actions[0]!.data).readUInt32BE(0)).toBe(0x1a45dfa3);

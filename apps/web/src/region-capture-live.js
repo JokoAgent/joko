@@ -1,4 +1,5 @@
 import { regionScrollOffset, regionScrollExtraRows } from "./region-capture-scroll.js";
+import { finalizeRecordedWebm } from "./region-capture-webm.js";
 
 const maxBytes = 36 * 1024 * 1024;
 
@@ -200,6 +201,7 @@ export async function beginRegionRecording(mode, grant, options) {
         try {
           if (failure) throw failure;
           if (recorder) {
+            const duration = (paused ? pausedAt : performance.now()) - startedAt - pauseTime;
             await new Promise((resolve, reject) => {
               if (recorder.state === "inactive") { reject(new Error("The video encoder is unavailable.")); return; }
               const timeout = window.setTimeout(() => reject(new Error("The video encoder did not finish.")), 5000);
@@ -207,7 +209,9 @@ export async function beginRegionRecording(mode, grant, options) {
               recorder.stop();
             });
             if (failure || !byteCount) throw failure ?? new Error("No video frames were recorded.");
-            return new Blob(chunks, { type: "video/webm" });
+            const bytes = finalizeRecordedWebm(new Uint8Array(await new Blob(chunks).arrayBuffer()), duration);
+            if (bytes.byteLength > maxBytes) throw new Error("The recording exceeds the WebM size limit.");
+            return new Blob([bytes], { type: "video/webm" });
           }
           if (worker) {
             await frameRequest?.promise;
