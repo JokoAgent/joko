@@ -122,7 +122,7 @@ describe("mounted Skill management surface", () => {
     expect(await overflow(page)).toBeLessThanOrEqual(1);
     await page.getByRole("button", { name: "Create Skill with Agent", exact: true }).click();
     const composer = page.locator(".new-task-composer [data-composer-editor='true']");
-    await composer.waitFor({ state: "visible" });
+    await composer.filter({ hasText: "/joko-skill-creator" }).waitFor({ state: "visible", timeout: 15_000 });
     expect((await composer.textContent())?.trim()).toBe("/joko-skill-creator");
     expect(browserErrors).toEqual([]);
   }, 120_000);

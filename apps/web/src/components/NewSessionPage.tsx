@@ -1213,7 +1213,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       if (cancelled) return;
 
       restoredExecutionRef.current = restored;
-      builtinSkillIntentRef.current = restored?.builtinSkillIntent;
+      builtinSkillIntentRef.current = draft?.builtinSkillIntent;
       setSelection(restoredSelection);
       editorDocumentRef.current = restoredDocument;
       setEditorDocument(restoredDocument);
