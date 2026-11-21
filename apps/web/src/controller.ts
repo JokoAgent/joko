@@ -2996,6 +2996,7 @@ export function useAppController(): AppController {
   const taskCopy = useMemo<TaskCopyApi | undefined>(() => {
     const profile = state.activeProfile;
     if (!profile || state.connectionState !== "connected" || state.sessionAccess !== undefined || !artifactGateway?.taskCopyChannel) return undefined;
+    const sourceGateway = artifactGateway;
     const sourceKey = remoteMachineProfileKey(profile);
     const machines = state.profiles.filter(candidate => candidate.serverId !== profile.serverId && !machineCacheRevoked(candidate));
     if (!machines.length) return undefined;
@@ -3016,7 +3017,7 @@ export function useAppController(): AppController {
       action: (source: TaskCopyChannel, destination: TaskCopyChannel, current: () => void) => Promise<T>): Promise<T> {
       const target = selection.profile;
       const authority = machineCacheAuthorityRef.current.get(target.id);
-      const source = artifactGateway.taskCopyChannel!(signal);
+      const source = sourceGateway.taskCopyChannel!(signal);
       const current = () => {
         source.signal.throwIfAborted();
         assertSource();
