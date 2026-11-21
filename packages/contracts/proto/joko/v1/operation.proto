@@ -9,6 +9,7 @@ import "joko/v1/device_peer.proto";
 import "joko/v1/extension.proto";
 import "joko/v1/interaction.proto";
 import "joko/v1/model.proto";
+import "joko/v1/provider_group.proto";
 import "joko/v1/review.proto";
 import "joko/v1/runtime.proto";
 import "joko/v1/settings.proto";
@@ -634,6 +635,8 @@ message CreateSessionMutation {
   // Adopt this exact unused provisional task instead of creating another one.
   // The service checks the original connection, draft and complete configuration.
   string reuse_provisional_session_id = 15;
+  // Explicit owner model group for a fresh ordinary task.
+  TaskModelGroupSelection task_model_group = 16;
 }
 
 message NativeCatalogImportPresentation {

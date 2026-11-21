@@ -1368,8 +1368,10 @@ export function normalizeNewSessionLocalDraft(value: unknown): NewSessionLocalDr
   const contactsDialogue = record["contactsDialogue"];
   const dialogue = contactsDialogue !== null && typeof contactsDialogue === "object" && !Array.isArray(contactsDialogue)
     ? contactsDialogue as Record<string, unknown> : undefined;
+  const taskModelGroupId = record["taskModelGroupId"];
   return {
     ...(preparation === undefined ? {} : { preparation }),
+    ...(nativeStart.kind === "fresh" && validId(taskModelGroupId) && taskModelGroupId.length <= 96 ? { taskModelGroupId } : {}),
     ...(typeof dialogue?.["requestId"] === "string" && /^[a-f0-9-]{36}$/u.test(dialogue["requestId"])
       && typeof dialogue["name"] === "string" && dialogue["name"].trim() !== "" && dialogue["name"].length <= 120
       ? { contactsDialogue: { requestId: dialogue["requestId"], name: dialogue["name"] } } : {}),

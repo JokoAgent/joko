@@ -5654,6 +5654,7 @@ export interface SessionPreparationView {
 }
 
 export interface NewSessionDraft {
+  readonly taskModelGroup?: Omit<import("@joko/contracts").TaskModelGroupSelection, "$typeName">;
   /** Stable, client-owned preparation receipt; never contains first input. */
   readonly operationId?: string;
   readonly provisionalDraftId?: string;
@@ -5753,6 +5754,7 @@ export interface NewSessionModelRequest {
  * opaque approved-record IDs and is revalidated against the current snapshot
  * before it is shown or sent; server paths are never copied into this record. */
 export interface NewSessionLocalDraft {
+  readonly taskModelGroupId?: string;
   readonly preparation?: ProvisionalTaskReceipt;
   readonly builtinSkillIntent?: "plugin_creator";
   readonly contactsDialogue?: { readonly requestId: string; readonly name: string };

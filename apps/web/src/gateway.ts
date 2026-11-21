@@ -1296,7 +1296,11 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       const assertCurrent = () => { active.throwIfAborted(); if (this.#transport !== scope.transport) throw new Error("The Provider group connection changed."); };
       assertCurrent(); const value = await work(active); assertCurrent(); return value;
     };
-    return { getProviderGroup: (key, signal) => invoke(signal, active => api.getProviderGroup(key, active)),
+    return { taskModels: {
+        list: (signal) => invoke(signal, active => api.taskModels!.list(active)),
+        save: (revision, groups, signal) => invoke(signal, active => api.taskModels!.save(revision, groups, active)),
+        preview: (selection, signal) => invoke(signal, active => api.taskModels!.preview(selection, active))
+      }, getProviderGroup: (key, signal) => invoke(signal, active => api.getProviderGroup(key, active)),
       listProviderGroupCandidates: (key, signal) => invoke(signal, active => api.listProviderGroupCandidates(key, active)),
       updateProviderGroup: (key, revision, config, signal) => invoke(signal, active => api.updateProviderGroup(key, revision, config, active)),
       getProviderGroupUsage: (query, signal) => invoke(signal, active => api.getProviderGroupUsage(query, active)),
@@ -3264,6 +3268,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         reuseProvisionalSessionId: draft.reuseProvisionalSessionId ?? "",
         nativeStart,
         ...(draft.providerId.length > 0 && draft.modelId.length > 0 ? { model: { model: { providerId: draft.providerId, modelId: draft.modelId }, effortId: draft.effort ?? "", ...encodeModelSpeed(draft.fastMode) } } : {}),
+        ...(draft.taskModelGroup === undefined ? {} : { taskModelGroup: draft.taskModelGroup }),
         permissionMode: protoPermission(draft.permissionMode),
         planMode: draft.planMode,
         initialPlacement: draft.initialPlacement === "dialogue"

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { create as message } from "@bufbuild/protobuf";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,12 +24,14 @@ import { mkdtemp } from "./test-paths.js";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanups.splice(0)) await close(); });
-async function fixture() {
+async function fixture(taskModels = false) {
   const root = await mkdtemp(join(tmpdir(), "joko-group-host-")), store = new OperationalStore(join(root, "store.db"));
   const artifacts = new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] }); await artifacts.initialize();
   const profile = { ...PI_LIKE_PROFILE, capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes" ? { ...capability, options: ["ask", "auto", "bypassPermissions"] } : capability) };
   const first = new FakeBackendAdapter({ ...profile, id: "group-first" }), second = new FakeBackendAdapter({ ...profile, id: "group-second" });
-  const registry = new BackendInstanceRegistry(store); await registry.provision([first, second].map(adapter => ({ instanceId: adapter.id, adapterKind: "fake", displayName: adapter.id, create: () => adapter })));
+  const registry = new BackendInstanceRegistry(store); await registry.provision([first, second].map((adapter, index) => ({
+    instanceId: adapter.id, adapterKind: taskModels ? index === 0 ? "codex" : "pi" : "fake", displayName: adapter.id, create: () => adapter
+  })));
   const host = new SessionHost(store, artifacts, registry.availableAdapters(), { backendDescriptors: registry.descriptors(), backendDescriptorsAlreadyPublished: true }); await host.initialize();
   const sources = { groupCatalog: () => [], installGroupSwitch: () => {}, installGroupStore: () => {}, sourceKind: () => undefined } as unknown as HostedAgentSources;
   const groups = new ProviderGroupRuntime({ store, registry, sources, nodeId: "group-node", nodeName: () => "This node", ownerGeneration: () => "owner-1",
@@ -44,6 +47,82 @@ async function fixture() {
 }
 const prompt = (text: string): PromptInput => ({ text, images: [], files: [], mentions: [], disposition: "prompt" });
 async function until(predicate: () => boolean): Promise<void> { await vi.waitFor(() => expect(predicate()).toBe(true), { timeout: 8000, interval: 10 }); }
+
+function taskModelGroup(f: Awaited<ReturnType<typeof fixture>>, strategy: contract.TaskModelGroupStrategy) {
+  const sources = f.groups.taskModels.list().sources;
+  const text = sources.find(row => row.source?.backendId === f.first.id && row.source.modelId === "text")!.source!;
+  const image = sources.find(row => row.source?.backendId === f.second.id && row.source.modelId === "multimodal")!.source!;
+  const group = message(contract.TaskModelGroupSchema, { groupId: "work", name: "Work", strategy,
+    preferVisionWithImages: true, effortId: "high", candidates: [{ source: text }, { source: image }] });
+  const config = f.groups.taskModels.save(0n, [group]);
+  const selection = (hasImages = false) => message(contract.TaskModelGroupSelectionSchema, { groupId: "work", expectedRevision: config.revision, hasImages });
+  const preview = (hasImages = false) => f.groups.taskModels.preview(selection(hasImages), new AbortController().signal);
+  const create = (operationId: string, hasImages = false) => f.host.createSession({
+    operationId, connection: f.connection, targetId: "target", title: "Grouped", taskModelGroup: selection(hasImages),
+    providerId: "test", modelId: "text", permissionMode: "ask", planMode: false, fastMode: false
+  });
+  return { text, image, group, config, selection, preview, create };
+}
+
+it("rotates across exact accounts and Backends after first input, and binds the picked model to the task", async () => {
+  const f = await fixture(true);
+  const group = taskModelGroup(f, contract.TaskModelGroupStrategy.ROUND_ROBIN);
+  const firstStart = vi.spyOn(f.first, "createSession"), secondStart = vi.spyOn(f.second, "createSession");
+  expect((await group.preview()).selected?.source).toEqual(group.text);
+  expect((await group.preview(true)).selected?.source).toEqual(group.image);
+  const firstId = (await group.create("start-group-first")).value.sessionId;
+  expect(firstStart.mock.calls[0]?.[0]).toMatchObject({ providerId: "test", modelId: "text" });
+  expect(firstStart.mock.calls[0]?.[0].effort).toBeUndefined();
+  expect((await group.preview()).selected?.source).toEqual(group.text);
+  const queued = f.send(firstId, "first-group-input");
+  await until(() => f.store.getQueueItem(queued.queueItemId).state === "completed");
+  expect((await group.preview()).selected?.source).toEqual(group.image);
+  const second = await group.create("start-group-second");
+  expect(secondStart.mock.calls[0]?.[0]).toMatchObject({ providerId: "vision", modelId: "multimodal", effort: "high" });
+  expect(f.store.getSession(second.value.sessionId).descriptor).toMatchObject({
+    backendId: f.second.id, providerId: "vision", modelId: "multimodal", targetId: "target"
+  });
+  expect(f.groups.taskModels.binding(second.value.sessionId)).toMatchObject({
+    groupId: "work", source: { backendId: f.second.id, providerId: "vision", modelId: "multimodal" }
+  });
+  expect((await group.create("start-group-second")).replayed).toBe(true);
+  expect(secondStart).toHaveBeenCalledOnce();
+  const secondInput = f.send(second.value.sessionId, "second-group-input");
+  await until(() => f.store.getQueueItem(secondInput.queueItemId).state === "completed");
+  expect((await group.preview()).selected?.source).toEqual(group.text);
+  expect((await group.preview(true)).selected?.source).toEqual(group.image);
+  const exact = (await f.create("exact-outside-group")).value.sessionId;
+  expect(f.groups.taskModels.binding(exact)).toBeUndefined();
+  expect(f.store.getSession(exact).descriptor).toMatchObject({ backendId: f.first.id, providerId: "test", modelId: "text" });
+});
+
+it("retains the earliest eligible quota-limited route and its original input through queue admission", async () => {
+  const f = await fixture(true);
+  const group = taskModelGroup(f, contract.TaskModelGroupStrategy.ORDERED);
+  const resetAt = Date.now() + 60_000;
+  const ready = new Set<string>();
+  vi.spyOn(f.groups.directory, "read").mockImplementation(async (member, request) => {
+    const model = f.registry.get(member.backendId).descriptor.models.find(model => model.modelId === request.modelId && model.providerId === member.providerId);
+    const limited = !ready.has(member.backendId);
+    return { member, available: !limited, reachable: true, model, running: 0, assertCurrent: () => {},
+      quota: { limited, ...(limited ? { resetAt: resetAt + (member.backendId === f.first.id ? 10_000 : 0) } : {}) } };
+  });
+  expect(await group.preview()).toMatchObject({ selected: { source: group.image }, quotaLimited: true, availableAtMs: BigInt(resetAt) });
+  const session = (await group.create("wait-on-group")).value.sessionId;
+  const send = vi.spyOn(f.second, "send");
+  const queued = f.send(session, "exact-group-waiting-input");
+  await until(() => f.store.getQueueItem(queued.queueItemId).error?.retryAt === resetAt);
+  expect(send).not.toHaveBeenCalled();
+  ready.add(f.second.id);
+  const clock = vi.spyOn(Date, "now").mockReturnValue(resetAt + 1);
+  try {
+    f.host.requestQueueDrain(session);
+    await until(() => f.store.getQueueItem(queued.queueItemId).state === "completed");
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0]?.[0].text).toContain("exact-group-waiting-input");
+    expect(f.store.listRuns({ sessionId: session })).toHaveLength(1);
+  } finally { clock.mockRestore(); }
+});
 
 function quotaBoundary(f: Pick<Awaited<ReturnType<typeof fixture>>, "groups" | "registry">, resetAt: number) {
   return vi.spyOn(f.groups.directory, "read").mockImplementation(async member => {

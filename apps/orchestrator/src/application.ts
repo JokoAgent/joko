@@ -2248,6 +2248,10 @@ export async function createOrchestratorApplication(
   providerGroups = new ProviderGroupRuntime({ store, registry: backendInstances, sources: hostedAgentSources, nodeId: serverId,
     nodeName: () => hostname().trim() || "This computer", sessions: sessionHost.providerGroupSessionPort(),
     ownerGeneration: () => { if (closed) throw new Error("Provider groups have closed."); return providerGroupOwnerGeneration; },
+    taskModelEnabled: (backendId, providerId, modelId) =>
+      store.findSetting<{ readonly enabled?: boolean }>("service", "orchestrator", `settings.backend.${backendId}`)?.value.enabled !== false
+      && modelRoutingEnabled(store, backendId, providerId, modelId) && configuredProviderRouteEnabled(backendId, providerId)
+      && hostedAgentSources?.modelAvailable(backendId, providerId, modelId) !== false,
     activeTurns: (backendId, providerId) => sessionHost.activeProviderTurns(backendId, providerId) + hostedAgents.endpoint.activeProviderTurns(backendId, providerId),
     assertRemoteAllowed: key => { if (!hostedAgents.settings.providerEnabled(key.backendId, key.providerId)) throw new Error("Remote Provider use is disabled."); },
     sharing: providerSharing.directory, ownedRecipients: key => providerSharing!.host.ownedRecipients(key.backendId, key.providerId),

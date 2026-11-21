@@ -17751,7 +17751,13 @@ async function dispatchMutation(
         : requestedAppendSystemPrompt;
       const model = payload.value.model;
       const requestedModel = model?.model;
-      if (requestedModel !== undefined) {
+      const taskModelGroup = payload.value.taskModelGroup;
+      if (taskModelGroup !== undefined && (!taskModelGroup.groupId.trim() || taskModelGroup.expectedRevision < 1n
+        || payload.value.provisionalDraftId || payload.value.reuseProvisionalSessionId || catalogImport !== undefined
+        || nativeStart !== undefined && (nativeStart.case !== "newSession" || nativeStart.value.parentNativeReference !== ""))) {
+        throw invalidArgument("A model group requires a fresh ordinary task and its saved revision.");
+      }
+      if (requestedModel !== undefined && taskModelGroup === undefined) {
         const advertised = dependencies.store.getBackend(payload.value.backendId).descriptor.models.some((candidate) =>
           candidate.providerId === requestedModel.providerId && candidate.modelId === requestedModel.modelId);
         if (!advertised) {
@@ -17843,6 +17849,7 @@ async function dispatchMutation(
               ...(model?.model?.providerId === undefined ? {} : { providerId: model.model.providerId }),
               ...(model?.model?.modelId === undefined ? {} : { modelId: model.model.modelId }),
               ...(model?.effortId === undefined || model.effortId === "" ? {} : { effort: model.effortId }),
+              ...(taskModelGroup === undefined ? {} : { taskModelGroup }),
               fastMode: contract.decodeModelSpeed(model ?? {}),
               permissionMode: corePermission(payload.value.permissionMode),
               planMode: payload.value.planMode,
