@@ -43,6 +43,7 @@ import {
   type WeChatRawMessage,
   type WeChatTransportOptions
 } from "@joko/messaging";
+import { IMessageTransport } from "@joko/messaging/imessage";
 import type { AdapterContext, BlobRef, DurableNativeDispatchPreparation, EventPayload, InteractionDecision, MessageBlock, NativeHistoryProjection, PromptInput } from "@joko/core";
 import { ContactStore, OperationalStore, PartnerStore, operationBodyHash } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
@@ -77,6 +78,74 @@ afterEach(async () => {
 });
 
 describe("MessagingManager", () => {
+  it("relays an iMessage guest permission to the verified owner direct chat without a second task", async () => {
+    const adapter = new PermissionFakeAdapter();
+    const owner = "+12025550101", guest = "+12025550102";
+    const direct = `iMessage;-;${owner}`, group = "any;+;chat-test-group";
+    const history: Array<{ readonly chatGuid: string; readonly row: Record<string, unknown> }> = [];
+    const sent: Array<{ readonly chatGuid: string; readonly message: string; readonly method: string }> = [];
+    const add = (chatGuid: string, guid: string, address: string, text: string, threadOriginatorGuid?: string) => {
+      history.push({ chatGuid, row: { guid, text, dateCreated: Date.now(), isFromMe: false, service: "iMessage",
+        handle: { address, service: "iMessage" }, chats: [{ guid: chatGuid }], threadOriginatorGuid } });
+    };
+    const response = (data: unknown) => Response.json({ status: 200, data });
+    const fixture = await createFixture(undefined, () => adapter, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, options => new IMessageTransport({
+        ...options, pollIntervalMs: 10, fetch: async (input, init) => {
+          const url = new URL(String(input));
+          expect(url.searchParams.get("password")).toBe(token("imessage"));
+          if (url.pathname === "/api/v1/server/info") return response({ private_api: true, helper_connected: true });
+          const chatGuid = decodeURIComponent(url.pathname.split("/").at(-1)!);
+          if (url.pathname.startsWith("/api/v1/chat/")) return response({
+            guid: chatGuid, participants: (chatGuid === direct ? [owner] : [owner, guest]).map(address => ({ address, service: "iMessage" }))
+          });
+          if (url.pathname === "/api/v1/message/query") {
+            const query = JSON.parse(String(init?.body)) as { readonly chatGuid: string; readonly after: number; readonly before: number };
+            return response(history.filter(item => item.chatGuid === query.chatGuid && Number(item.row["dateCreated"]) > query.after
+              && Number(item.row["dateCreated"]) <= query.before).map(item => item.row));
+          }
+          if (url.pathname === "/api/v1/message/text") {
+            const item = JSON.parse(String(init?.body)) as typeof sent[number];
+            sent.push(item);
+            const guid = `outbound-${sent.length}`;
+            history.push({ chatGuid: item.chatGuid, row: { guid, text: item.message, dateCreated: Date.now(), isFromMe: true,
+              service: "iMessage", chats: [{ guid: item.chatGuid }] } });
+            return response({ guid });
+          }
+          if (url.pathname.startsWith("/api/v1/message/")) {
+            return response(history.find(item => item.row["guid"] === chatGuid)?.row ?? null);
+          }
+          throw new Error("Unexpected BlueBubbles request");
+        }
+      }));
+    fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const connection = await replaceCredential(fixture, fixture.manager.createIMessageConnection({
+      ownerProviderUserId: owner, configuration: { serverOrigin: "http://127.0.0.1:4300", aliases: ["Joko"],
+        chats: [{ guid: direct, activation: "always", selfAddress: owner }, { guid: group, activation: "mention" }] }
+    }), "imessage", true);
+    await vi.waitFor(() => expect(fixture.manager.getConnection(connection.id).runtimeStatus).toBe("connected"));
+    add(group, "ambient", guest, "Background discussion");
+    add(group, "invocation", guest, "@Joko check this");
+    await vi.waitFor(() => expect(sent.some(item => item.message.includes("Run command") && item.chatGuid === direct)).toBe(true));
+    expect(sent.filter(item => item.message.includes("Run command")).map(item => item.chatGuid)).toEqual([direct]);
+    const sentCard = fixture.store.listMessagingDeliveries().find(delivery => delivery.kind === "interaction");
+    expect(sentCard).toMatchObject({ providerMessageId: "outbound-1" });
+    expect(fixture.store.getMessagingConversation(sentCard!.conversationId)).toMatchObject({ status: "observed" });
+    add(group, "guest-answer", guest, "1", "outbound-1");
+    await vi.waitFor(() => {
+      const row = fixture.store.listMessagingInboundRequests()[0]!;
+      expect(fixture.store.findMessagingGroupObservation(row.conversationId!, "guest-answer")).toBeDefined();
+    });
+    expect(adapter.decision).toBeUndefined();
+    add(direct, "owner-answer", owner, "2", "outbound-1");
+    await vi.waitFor(() => expect(adapter.decision).toEqual({ kind: "selected", value: "deny_once" }));
+    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({ chatGuid: group, method: "private-api", message: "Decision: selected" })));
+    await fixture.restartManager();
+    await vi.waitFor(() => expect(fixture.manager.getConnection(connection.id).runtimeStatus).toBe("connected"));
+    expect(fixture.store.listMessagingInboundRequests().map(row => row.providerMessageId)).toEqual(["invocation"]);
+    expect(fixture.store.listMessagingInteractions()).toHaveLength(1);
+  });
+
   it.each(["reply", "permission"] as const)("recovers a %s made durable before Messaging initializes", async (outcome) => {
     const fixture = await createFixture(undefined, () => new ControlledReplyAdapter(), () => new StreamingDiscordTransport());
     const enqueue = fixture.store.enqueueQueueItem.bind(fixture.store);
@@ -5314,7 +5383,8 @@ async function createFixture(
   replyStreamTiming?: MessagingManagerOptions["replyStreamTiming"],
   sessionRuntimeRecoveryDelayMs?: (attempt: number) => number,
   contacts?: ContactManager,
-  now?: () => number
+  now?: () => number,
+  createIMessageTransport?: MessagingManagerOptions["createIMessageTransport"]
 ) {
   const root = mkdtempSync(join(tmpdir(), "joko-messaging-manager-"));
   const store = new OperationalStore(join(root, "operational.db"));
@@ -5357,6 +5427,7 @@ async function createFixture(
     sessionHost: host,
     artifacts,
     ...(now === undefined ? {} : { now }),
+    ...(createIMessageTransport === undefined ? {} : { createIMessageTransport }),
     ...(contacts === undefined ? {} : { contacts }),
     retryDelayMs: 5,
     ...(weChatPresenceTiming === undefined ? {} : { weChatPresenceTiming }),

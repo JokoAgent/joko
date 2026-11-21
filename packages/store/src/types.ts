@@ -885,7 +885,8 @@ export const MESSAGING_CHANNELS = [
   "lark",
   "wecom",
   "wechat",
-  "slack"
+  "slack",
+  "imessage"
 ] as const;
 
 export type MessagingChannel = (typeof MESSAGING_CHANNELS)[number];
@@ -1222,7 +1223,7 @@ export interface EnqueueMessagingDeliveryInput {
   readonly connectionId: string;
   readonly expectedChannelGeneration: number;
   readonly conversationId: string;
-  /** An idle task-control notice can be sent before the conversation has a Session. */
+  /** Permit an idle task-control notice or an iMessage owner approval in a known chat without a Session. */
   readonly allowObservedConversation?: true;
   readonly dedupeKey: string;
   readonly kind: MessagingDeliveryKind;

@@ -39,7 +39,7 @@ describe("MessagingService", () => {
     );
     expect(empty.connections).toEqual([]);
     const channels = empty.channels ?? [];
-    expect(channels).toHaveLength(8);
+    expect(channels).toHaveLength(9);
     expect(channels.find((channel) => channel.channel === contract.MessagingChannel.TELEGRAM))
       .toMatchObject({ available: true, reason: "" });
     expect(channels.find((channel) => channel.channel === contract.MessagingChannel.DISCORD))
@@ -54,7 +54,9 @@ describe("MessagingService", () => {
       .toMatchObject({ available: true, reason: "" });
     expect(channels.find((channel) => channel.channel === contract.MessagingChannel.SLACK))
       .toMatchObject({ available: true, reason: "" });
-    expect(channels.filter((channel) => channel.available)).toHaveLength(7);
+    expect(channels.find((channel) => channel.channel === contract.MessagingChannel.IMESSAGE))
+      .toMatchObject({ available: true, reason: "" });
+    expect(channels.filter((channel) => channel.available)).toHaveLength(8);
 
     const created = await service.createMessagingConnection(create(
       contract.CreateMessagingConnectionRequestSchema,

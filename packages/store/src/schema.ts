@@ -1547,7 +1547,7 @@ CREATE TABLE messaging_channels (
           length(trim(id)) BETWEEN 1 AND 256 AND instr(id, char(0)) = 0
         ),
         channel TEXT NOT NULL CHECK (channel IN (
-          'telegram', 'discord', 'dingtalk', 'feishu', 'lark', 'wecom', 'wechat', 'slack'
+          'telegram', 'discord', 'dingtalk', 'feishu', 'lark', 'wecom', 'wechat', 'slack', 'imessage'
         )),
         generation INTEGER NOT NULL CHECK (generation >= 1),
         enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),

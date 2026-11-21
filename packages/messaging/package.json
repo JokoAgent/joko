@@ -11,7 +11,8 @@
     "./telegram": "./src/telegram/index.ts",
     "./wecom": "./src/wecom/index.ts",
     "./wechat": "./src/wechat/index.ts",
-    "./slack": "./src/slack/index.ts"
+    "./slack": "./src/slack/index.ts",
+    "./imessage": "./src/imessage/index.ts"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

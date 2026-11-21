@@ -296,6 +296,7 @@ service MessagingService {
   rpc UpdateFeishuMessagingConfiguration(UpdateFeishuMessagingConfigurationRequest) returns (UpdateFeishuMessagingConfigurationResponse);
   rpc UpdateWeComMessagingConfiguration(UpdateWeComMessagingConfigurationRequest) returns (UpdateWeComMessagingConfigurationResponse);
   rpc UpdateSlackMessagingConfiguration(UpdateSlackMessagingConfigurationRequest) returns (UpdateSlackMessagingConfigurationResponse);
+  rpc UpdateIMessageMessagingConfiguration(UpdateIMessageMessagingConfigurationRequest) returns (UpdateIMessageMessagingConfigurationResponse);
   rpc BeginWeChatAuthorization(BeginWeChatAuthorizationRequest) returns (BeginWeChatAuthorizationResponse);
   rpc GetWeChatAuthorization(GetWeChatAuthorizationRequest) returns (GetWeChatAuthorizationResponse);
   rpc BeginWeChatVerificationInput(BeginWeChatVerificationInputRequest) returns (BeginWeChatVerificationInputResponse);

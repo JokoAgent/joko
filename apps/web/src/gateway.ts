@@ -430,6 +430,9 @@ import {
   FeishuReplyQuoteMode as ProtoFeishuReplyQuoteMode,
   SlackEmojiReactions as ProtoSlackEmojiReactions,
   SlackGroupActivation as ProtoSlackGroupActivation,
+  IMessageGroupActivation as ProtoIMessageGroupActivation,
+  IMessageMessagingConfigurationSchema as ProtoIMessageMessagingConfigurationSchema,
+  type IMessageMessagingConfiguration as ProtoIMessageMessagingConfiguration,
   SlackGroupActivationRuleSchema as ProtoSlackGroupActivationRuleSchema,
   TelegramEmojiReactions as ProtoTelegramEmojiReactions,
   TelegramGroupActivation as ProtoTelegramGroupActivation,
@@ -760,6 +763,7 @@ import type {
   WeChatAuthorizationAttemptView,
   WeChatMessagingConfigurationView,
   SlackMessagingConfigurationView,
+  IMessageMessagingConfigurationView,
   OperationApi,
   ObjectiveLimitsView,
   ObjectiveUpdatePatchView,
@@ -9132,6 +9136,26 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       channel: ProtoMessagingChannel.SLACK,
       ownerProviderUserId,
       ...(configuration === undefined ? {} : { slackConfiguration: protoSlackMessagingConfiguration(configuration) })
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async createIMessageMessagingConnection(ownerAddress: string, configuration: IMessageMessagingConfigurationView, signal?: AbortSignal): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).createMessagingConnection({
+      channel: ProtoMessagingChannel.IMESSAGE, ownerProviderUserId: ownerAddress, imessageConfiguration: protoIMessageMessagingConfiguration(configuration)
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapMessagingConnection(response.connection);
+  }
+
+  async updateIMessageMessagingConfiguration(connectionId: string, expectedRevision: bigint, expectedGeneration: bigint,
+    ownerAddress: string, configuration: IMessageMessagingConfigurationView, signal?: AbortSignal): Promise<MessagingConnectionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(MessagingService, scope.transport).updateIMessageMessagingConfiguration({
+      connectionId, expectedRevision: { value: expectedRevision }, expectedGeneration, ownerProviderUserId: ownerAddress,
+      configuration: protoIMessageMessagingConfiguration(configuration)
     }, { signal: scope.signal });
     scope.signal.throwIfAborted();
     return mapMessagingConnection(response.connection);
@@ -24252,6 +24276,7 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
   const slackConfiguration = channel === "slack"
     ? mapSlackMessagingConfiguration(value.slackConfiguration)
     : undefined;
+  const imessageConfiguration = channel === "imessage" ? mapIMessageMessagingConfiguration(value.imessageConfiguration) : undefined;
   if (channel !== "telegram" && value.telegramConfiguration !== undefined) {
     throw new GatewayError("Orchestrator returned Telegram configuration for another Messaging channel.");
   }
@@ -24272,6 +24297,9 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
   }
   if (channel !== "slack" && value.slackConfiguration !== undefined) {
     throw new GatewayError("Orchestrator returned Slack configuration for another Messaging channel.");
+  }
+  if (channel !== "imessage" && value.imessageConfiguration !== undefined) {
+    throw new GatewayError("Orchestrator returned iMessage configuration for another Messaging channel.");
   }
   if (channel === "slack" && !validSlackOwnerId(value.ownerProviderUserId ?? "")) {
     throw new GatewayError("Orchestrator returned an invalid Slack owner user ID.");
@@ -24294,6 +24322,7 @@ function mapMessagingConnection(value: ProtoMessagingConnection | undefined): Me
     ...(wecomConfiguration === undefined ? {} : { wecomConfiguration }),
     ...(wechatConfiguration === undefined ? {} : { wechatConfiguration }),
     ...(slackConfiguration === undefined ? {} : { slackConfiguration }),
+    ...(imessageConfiguration === undefined ? {} : { imessageConfiguration }),
     ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
     ...(value.errorSummary === undefined ? {} : { errorSummary: value.errorSummary }),
     ...(value.lastConnectedAt === undefined
@@ -24336,8 +24365,28 @@ function mapMessagingChannel(value: ProtoMessagingChannel): import("./model.js")
     case ProtoMessagingChannel.WECOM: return "wecom";
     case ProtoMessagingChannel.WECHAT: return "wechat";
     case ProtoMessagingChannel.SLACK: return "slack";
+    case ProtoMessagingChannel.IMESSAGE: return "imessage";
     default: throw new GatewayError("Orchestrator returned an unknown Messaging channel.");
   }
+}
+
+const iMessageActivation = {
+  mention: ProtoIMessageGroupActivation.MENTION, always: ProtoIMessageGroupActivation.ALWAYS, disabled: ProtoIMessageGroupActivation.DISABLED
+} as const;
+
+function mapIMessageMessagingConfiguration(value: ProtoIMessageMessagingConfiguration | undefined): IMessageMessagingConfigurationView {
+  if (!value || !value.serverOrigin || value.chats.length < 1) throw new GatewayError("Orchestrator returned an invalid iMessage configuration.");
+  return { serverOrigin: value.serverOrigin, aliases: value.aliases, chats: value.chats.map(chat => {
+    const activation = (Object.keys(iMessageActivation) as (keyof typeof iMessageActivation)[])
+      .find(mode => iMessageActivation[mode] === chat.activation);
+    if (!chat.chatGuid || !activation) throw new GatewayError("Orchestrator returned an invalid iMessage chat.");
+    return { guid: chat.chatGuid, activation, ...(chat.selfAddress === undefined ? {} : { selfAddress: chat.selfAddress }) };
+  }) };
+}
+
+function protoIMessageMessagingConfiguration(value: IMessageMessagingConfigurationView) {
+  return create(ProtoIMessageMessagingConfigurationSchema, { serverOrigin: value.serverOrigin, aliases: [...value.aliases],
+    chats: value.chats.map(chat => ({ chatGuid: chat.guid, activation: iMessageActivation[chat.activation], selfAddress: chat.selfAddress })) });
 }
 
 function mapMessagingRuntimeStatus(

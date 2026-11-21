@@ -6690,6 +6690,27 @@ const en = {
   ,"messaging.feishuGroupPermission": "Group execution permission"
   ,"messaging.feishuGroupSafety": "Group history is untrusted. Keep Ask unless you explicitly accept bypassing execution permission for approved group chats."
   ,"messaging.wecomConfigureTitle": "WeCom identity"
+  ,"messaging.addIMessage": "Add iMessage"
+  ,"messaging.imessageConfigureTitle": "Configure iMessage"
+  ,"messaging.imessageConfigureBody": "Connect a BlueBubbles server and choose the iMessage chats that can reach Joko."
+  ,"messaging.imessageOrigin": "BlueBubbles server URL"
+  ,"messaging.imessageOriginLocked": "Clear the saved password to change the server URL."
+  ,"messaging.imessageOwner": "Owner’s iMessage phone number or email address"
+  ,"messaging.imessageAliases": "Names for group mentions, one per line"
+  ,"messaging.imessageChatsHint": "Enter each chat’s exact GUID from BlueBubbles. Include the owner’s direct chat to receive approvals."
+  ,"messaging.imessageChatGuid": "Chat GUID"
+  ,"messaging.imessageSelf": "Mac sender address for this chat (optional)"
+  ,"messaging.imessageActivationMention": "When mentioned"
+  ,"messaging.imessageActivationAlways": "Every message"
+  ,"messaging.imessageAddChat": "Add chat"
+  ,"messaging.imessageRemoveChat": "Remove chat"
+  ,"messaging.imessagePassword": "BlueBubbles password"
+  ,"messaging.imessageAddPassword": "Add BlueBubbles password"
+  ,"messaging.imessageReplacePassword": "Replace BlueBubbles password"
+  ,"messaging.imessagePasswordSafety": "Joko stores the password in the node’s credential vault."
+  ,"messaging.imessageCredentialBody": "Enter the API password configured on this BlueBubbles server."
+  ,"messaging.imessageClearCredential": "Clear BlueBubbles password"
+  ,"messaging.imessageClearBody": "Clearing the password stops new messages and replies through this connection."
   ,"messaging.wecomConfigureBody": "Configure the bot identity used for this WebSocket connection."
   ,"messaging.wecomBotIdChangeBody": "Changing the Bot ID retires the active transport and clears the claimed owner. The next direct-message sender claims ownership again."
   ,"messaging.slackConfigureTitle": "Slack behavior"
@@ -11397,6 +11418,27 @@ const zhBase: Record<MessageKey, string> = {
     "messaging.feishuGroupPermission": "群聊执行权限",
     "messaging.feishuGroupSafety": "群聊历史是不可信输入。除非你明确接受为已批准群聊绕过执行权限，否则请保持“询问”。",
     "messaging.wecomConfigureTitle": "企业微信机器人身份",
+    "messaging.addIMessage": "添加 iMessage",
+    "messaging.imessageConfigureTitle": "配置 iMessage",
+    "messaging.imessageConfigureBody": "连接 BlueBubbles 服务器，选择可以联系 Joko 的 iMessage 聊天。",
+    "messaging.imessageOrigin": "BlueBubbles 服务器网址",
+    "messaging.imessageOriginLocked": "清除已保存的密码后可以更改服务器网址。",
+    "messaging.imessageOwner": "所有者的 iMessage 手机号或邮箱",
+    "messaging.imessageAliases": "群聊中可提及的名称，每行一个",
+    "messaging.imessageChatsHint": "输入 BlueBubbles 中各聊天的准确 GUID。添加所有者的私聊以接收审批。",
+    "messaging.imessageChatGuid": "聊天 GUID",
+    "messaging.imessageSelf": "此聊天中 Mac 的发件地址（可选）",
+    "messaging.imessageActivationMention": "被提及时",
+    "messaging.imessageActivationAlways": "每条消息",
+    "messaging.imessageAddChat": "添加聊天",
+    "messaging.imessageRemoveChat": "移除聊天",
+    "messaging.imessagePassword": "BlueBubbles 密码",
+    "messaging.imessageAddPassword": "添加 BlueBubbles 密码",
+    "messaging.imessageReplacePassword": "更换 BlueBubbles 密码",
+    "messaging.imessagePasswordSafety": "Joko 将密码保存在节点的凭据库中。",
+    "messaging.imessageCredentialBody": "输入这台 BlueBubbles 服务器上配置的 API 密码。",
+    "messaging.imessageClearCredential": "清除 BlueBubbles 密码",
+    "messaging.imessageClearBody": "清除密码后，此连接将停止接收新消息和发送回复。",
     "messaging.wecomConfigureBody": "配置此 WebSocket 连接所使用的机器人身份。",
     "messaging.wecomBotIdChangeBody": "修改机器人 ID 会退休当前传输并清除已认领的所有者；下一位发送私聊的用户会重新认领。",
     "messaging.slackConfigureTitle": "Slack 行为",

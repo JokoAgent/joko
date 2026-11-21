@@ -8,6 +8,7 @@ import {
   FeishuEmojiReactions,
   FeishuGroupActivation,
   FeishuReplyQuoteMode,
+  IMessageGroupActivation,
   MessagingChannel,
   PermissionMode,
   TelegramEmojiReactions,
@@ -36,6 +37,8 @@ import {
   DiscordSystemFixture
 } from "./discord-system-fixture.js";
 import { RealPiSystemFixture } from "./real-pi-fixture.js";
+import { IMESSAGE_SYSTEM_DIRECT, IMESSAGE_SYSTEM_GROUP, IMESSAGE_SYSTEM_OWNER, IMESSAGE_SYSTEM_PASSWORD,
+  startIMessageSystemFixture } from "./imessage-system-fixture.js";
 import {
   FEISHU_SYSTEM_APP_ID,
   FEISHU_SYSTEM_APP_SECRET,
@@ -66,6 +69,7 @@ describe("mounted Messaging Settings product chain", () => {
   let dingtalk: DingTalkSystemFixture | undefined;
   let feishu: FeishuSystemFixture | undefined;
   let wecom: WeComSystemFixture | undefined;
+  let blueBubbles: Awaited<ReturnType<typeof startIMessageSystemFixture>> | undefined;
   let browser: Browser | undefined;
 
   afterEach(async () => {
@@ -73,6 +77,8 @@ describe("mounted Messaging Settings product chain", () => {
     browser = undefined;
     await fixture?.close({ removeRoot: true });
     fixture = undefined;
+    await blueBubbles?.close();
+    blueBubbles = undefined;
     await telegram?.close();
     telegram = undefined;
     await discord?.close();
@@ -126,8 +132,8 @@ describe("mounted Messaging Settings product chain", () => {
       timeout: 30_000
     });
     browserErrors.clear();
-    expect(await settings.locator(".messaging-channel").count()).toBe(8);
-    expect(await settings.locator(".messaging-channel.is-available").count()).toBe(8);
+    expect(await settings.locator(".messaging-channel").count()).toBe(9);
+    expect(await settings.locator(".messaging-channel.is-available").count()).toBe(9);
     await settings.getByText("Telegram", { exact: true }).first().waitFor({ state: "visible" });
     await settings.getByText("Discord", { exact: true }).waitFor({ state: "visible" });
     await settings.getByText("DingTalk", { exact: true }).first().waitFor({ state: "visible" });
@@ -566,6 +572,35 @@ describe("mounted Messaging Settings product chain", () => {
     expect(await larkCard.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
     expect(await wecomCard.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
     expect(browserErrors.unexpected()).toEqual([]);
+
+    const bridge = blueBubbles = await startIMessageSystemFixture();
+    await settings.getByRole("button", { name: "Add iMessage", exact: true }).click();
+    const iMessageSetup = page.getByRole("dialog", { name: "Add iMessage", exact: true });
+    await iMessageSetup.getByLabel("BlueBubbles server URL").fill(bridge.origin);
+    await iMessageSetup.getByLabel("Owner’s iMessage phone number or email address").fill(IMESSAGE_SYSTEM_OWNER);
+    await iMessageSetup.getByLabel("Chat GUID").fill(IMESSAGE_SYSTEM_DIRECT);
+    await iMessageSetup.getByRole("button", { name: "Add chat", exact: true }).click();
+    await iMessageSetup.getByLabel("Chat GUID").nth(1).fill(IMESSAGE_SYSTEM_GROUP);
+    await choose(page, iMessageSetup, "Group activation rules", "Every message");
+    expect(await overflow(page)).toBeLessThanOrEqual(1);
+    await iMessageSetup.getByRole("button", { name: "Save", exact: true }).click();
+    const iMessageSecret = page.getByRole("dialog", { name: "Add BlueBubbles password", exact: true });
+    await iMessageSecret.getByLabel("BlueBubbles password", { exact: true }).fill(IMESSAGE_SYSTEM_PASSWORD);
+    await iMessageSecret.getByRole("button", { name: "Save", exact: true }).click();
+    const iMessageCard = settings.locator(".messaging-connection-card").filter({
+      has: page.getByRole("heading", { name: "iMessage", exact: true })
+    });
+    await iMessageCard.getByText("Connected", { exact: true }).waitFor({ state: "visible", timeout: 15_000 });
+    const iMessageSettings = (await inspector.clients.messaging.getMessagingSettings({})).connections.find(
+      connection => connection.channel === MessagingChannel.IMESSAGE);
+    expect(iMessageSettings).toMatchObject({ ownerProviderUserId: IMESSAGE_SYSTEM_OWNER, credentialConfigured: true,
+      imessageConfiguration: { serverOrigin: bridge.origin, chats: [{ chatGuid: IMESSAGE_SYSTEM_DIRECT },
+        { chatGuid: IMESSAGE_SYSTEM_GROUP, activation: IMessageGroupActivation.ALWAYS }] } });
+    await iMessageCard.getByRole("button", { name: "Clear BlueBubbles password", exact: true }).click();
+    const clearIMessage = page.getByRole("alertdialog", { name: "Clear BlueBubbles password", exact: true });
+    await clearIMessage.getByRole("button", { name: "Clear BlueBubbles password", exact: true }).click();
+    await clearIMessage.waitFor({ state: "hidden" });
+    expect(await page.locator("body").innerText()).not.toContain(IMESSAGE_SYSTEM_PASSWORD);
 
     const durableProjection = JSON.stringify({
       settings: fixture.application.store.listSettings(),

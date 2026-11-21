@@ -17,6 +17,7 @@ enum MessagingChannel {
   MESSAGING_CHANNEL_WECOM = 6;
   MESSAGING_CHANNEL_WECHAT = 7;
   MESSAGING_CHANNEL_SLACK = 8;
+  MESSAGING_CHANNEL_IMESSAGE = 9;
 }
 
 enum MessagingConnectionRuntimeStatus {
@@ -204,6 +205,25 @@ message SlackGroupActivationRule {
   SlackGroupActivation activation = 2;
 }
 
+enum IMessageGroupActivation {
+  I_MESSAGE_GROUP_ACTIVATION_UNSPECIFIED = 0;
+  I_MESSAGE_GROUP_ACTIVATION_MENTION = 1;
+  I_MESSAGE_GROUP_ACTIVATION_ALWAYS = 2;
+  I_MESSAGE_GROUP_ACTIVATION_DISABLED = 3;
+}
+
+message IMessageChatBinding {
+  string chat_guid = 1;
+  IMessageGroupActivation activation = 2;
+  optional string self_address = 3;
+}
+
+message IMessageMessagingConfiguration {
+  string server_origin = 1;
+  repeated IMessageChatBinding chats = 2;
+  repeated string aliases = 3;
+}
+
 message MessagingChannelCapability {
   MessagingChannel channel = 1;
   bool available = 2;
@@ -233,6 +253,7 @@ message MessagingConnection {
   optional WeComMessagingConfiguration wecom_configuration = 20;
   optional WeChatMessagingConfiguration wechat_configuration = 21;
   optional SlackMessagingConfiguration slack_configuration = 22;
+  optional IMessageMessagingConfiguration imessage_configuration = 23;
 }
 
 message MessagingRoute {
@@ -336,6 +357,7 @@ message CreateMessagingConnectionRequest {
   optional WeComMessagingConfiguration wecom_configuration = 7;
   optional WeChatMessagingConfiguration wechat_configuration = 8;
   optional SlackMessagingConfiguration slack_configuration = 9;
+  optional IMessageMessagingConfiguration imessage_configuration = 10;
 }
 
 message CreateMessagingConnectionResponse {
@@ -448,6 +470,18 @@ message UpdateSlackMessagingConfigurationRequest {
 }
 
 message UpdateSlackMessagingConfigurationResponse {
+  MessagingConnection connection = 1;
+}
+
+message UpdateIMessageMessagingConfigurationRequest {
+  string connection_id = 1;
+  Revision expected_revision = 2;
+  uint64 expected_generation = 3;
+  string owner_provider_user_id = 4;
+  IMessageMessagingConfiguration configuration = 5;
+}
+
+message UpdateIMessageMessagingConfigurationResponse {
   MessagingConnection connection = 1;
 }
 
