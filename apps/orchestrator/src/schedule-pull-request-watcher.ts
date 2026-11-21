@@ -48,6 +48,12 @@ interface WatchState {
   readonly pending?: SchedulePullRequestWakeup;
 }
 
+// The operational Store materializes undefined fields as null in older rows.
+type StoredWatchState = Omit<WatchState, "lastDispatchedAt" | "pending"> & {
+  readonly lastDispatchedAt?: number | null;
+  readonly pending?: SchedulePullRequestWakeup | null;
+};
+
 /** An explicitly saved, enabled task binding authorizes reads of exactly one canonical PR. */
 export class SchedulePullRequestAuthorization implements CodeHostSessionAuthorizationPort {
   constructor(
@@ -122,8 +128,8 @@ export class SchedulePullRequestWatcher {
   }
 
   ownsOccurrence(scheduleId: string, runId: string): boolean {
-    const state = this.options.store.findSetting<WatchState>("service", scheduleId, SCHEDULE_PULL_REQUEST_WATCH_SETTING_KEY)?.value;
-    return state?.pending !== undefined && scheduleRunIdFromDigest(createHash("sha256").update(state.pending.operationId).digest("hex")) === runId;
+    const pending = this.options.store.findSetting<StoredWatchState>("service", scheduleId, SCHEDULE_PULL_REQUEST_WATCH_SETTING_KEY)?.value.pending;
+    return pending != null && scheduleRunIdFromDigest(createHash("sha256").update(pending.operationId).digest("hex")) === runId;
   }
 
   private async sweep(signal: AbortSignal): Promise<void> {
@@ -148,8 +154,12 @@ export class SchedulePullRequestWatcher {
       return;
     }
     const isCurrent = () => !signal.aborted && ownsScheduler() && authority.current(scheduleId)?.ownerRevision === watched.ownerRevision;
-    const saved = store.findSetting<WatchState>("service", scheduleId, SCHEDULE_PULL_REQUEST_WATCH_SETTING_KEY)?.value;
-    let state = saved?.format === 1 && saved.identity === watched.identity && saved.baseline !== undefined ? saved : undefined;
+    const saved = store.findSetting<StoredWatchState>("service", scheduleId, SCHEDULE_PULL_REQUEST_WATCH_SETTING_KEY)?.value;
+    let state: WatchState | undefined;
+    if (saved?.format === 1 && saved.identity === watched.identity && saved.baseline != null) {
+      const { pending, lastDispatchedAt, ...watch } = saved;
+      state = { ...watch, ...(pending == null ? {} : { pending }), ...(lastDispatchedAt == null ? {} : { lastDispatchedAt }) };
+    }
     if (state?.pending !== undefined) {
       const committed = store.findOperation(state.pending.operationId) ?? store.findOperation(`${state.pending.operationId}-outcome`);
       if (committed?.status === "completed") {
@@ -174,7 +184,9 @@ export class SchedulePullRequestWatcher {
           : matchesChange(watched.rule, previous, current);
         const pending = changed ? { operationId: `pull-request-schedule-${randomUUID()}`, observedAt: now(), url: watched.rule.url } : state?.pending;
         if (state === undefined || changed || !equalObservation(baseline, state.baseline)) {
-          state = { format: 1, identity: watched.identity, baseline, lastDispatchedAt: state?.lastDispatchedAt, pending };
+          state = { format: 1, identity: watched.identity, baseline,
+            ...(state?.lastDispatchedAt === undefined ? {} : { lastDispatchedAt: state.lastDispatchedAt }),
+            ...(pending === undefined ? {} : { pending }) };
           store.setSetting("service", scheduleId, SCHEDULE_PULL_REQUEST_WATCH_SETTING_KEY, state);
         }
       }
@@ -241,5 +253,6 @@ function matchesChange(rule: SchedulePullRequestRule, previous: Observation, cur
 }
 
 function equalObservation(a: Observation, b: Observation): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
+  const keys = Object.keys(a) as Array<keyof Observation>;
+  return keys.length === Object.keys(b).length && keys.every(key => a[key] === b[key]);
 }

@@ -79,6 +79,7 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
     }))).rejects.toMatchObject({ code: Code.InvalidArgument });
     const scheduleId = scheduleIdFrom(await submit(clients.operation, connectionId, request));
     const history = async () => (await clients.scheduler.listScheduleRunHistory({ scheduleId })).history;
+    const watchState = () => store.findSetting<{ pending?: { url: string } | null }>("service", scheduleId, SCHEDULE_PULL_REQUEST_WATCH_SETTING_KEY);
     const clockTick = async (ms: number, expectedReads: number) => {
       clock += ms;
       await expect.poll(() => reads.length, { timeout: 8_000 }).toBe(expectedReads);
@@ -86,6 +87,11 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
     await clockTick(5_001, 1);
     expect(reads[0]).toEqual({ owner: scheduleId, url, authorized: true });
     expect(await history()).toHaveLength(0);
+    const baseline = watchState();
+    expect(baseline?.value).toMatchObject({ format: 1 });
+    expect(baseline?.value).not.toHaveProperty("pending");
+    store.setSetting("service", scheduleId, SCHEDULE_PULL_REQUEST_WATCH_SETTING_KEY,
+      { ...baseline!.value, pending: null, lastDispatchedAt: null });
     await clockTick(5_001, 2);
     expect(await history()).toHaveLength(0);
 
@@ -124,7 +130,6 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
     checks = ["check:completed:failure"];
     await clockTick(5_001, 8);
     expect(await history()).toHaveLength(2);
-    const watchState = () => store.findSetting<{ pending?: { url: string } }>("service", scheduleId, SCHEDULE_PULL_REQUEST_WATCH_SETTING_KEY);
     await expect.poll(() => watchState()?.value.pending?.url).toBe(url);
     legacy.execution!.followPullRequest = schedulePullRequestRuleToProto(null);
     expect((await update(legacy)).state).toBe(OperationState.SUCCEEDED);
