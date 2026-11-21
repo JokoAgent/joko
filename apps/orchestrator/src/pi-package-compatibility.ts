@@ -591,7 +591,8 @@ async function extensionDetail(
     readonly settings?: ExtensionSettingsDescriptor;
     readonly library?: ExtensionLibraryDescriptor;
     readonly routineEvents?: ExtensionRoutineEventsDescriptor;
-  readonly runtime?: ExtensionRuntimeDescriptor;
+    readonly runtime?: ExtensionRuntimeDescriptor;
+    readonly taskEngines?: readonly ExtensionTaskEngineDescriptor[];
     readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
   }
 ): Promise<PiPackageResourceDetail> {

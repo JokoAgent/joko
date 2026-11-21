@@ -146,7 +146,7 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
     return this.state(session);
   }
 
-  async inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
+  override async inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
     const session = this.exactSession(context);
     this.nativeId(binding, context);
     return this.state(session);
@@ -162,7 +162,7 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
     if (session !== undefined) await this.stop(context.sessionId, session, false);
   }
 
-  async detachSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
+  override async detachSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
     await this.closeSession(binding, context);
   }
 
@@ -176,13 +176,13 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
     return selected;
   }
 
-  async setEffort(level: string, context: AdapterContext): Promise<void> {
+  override async setEffort(level: string, context: AdapterContext): Promise<void> {
     const session = this.exactSession(context);
     await this.configureEffort(session, level);
     this.publish(session);
   }
 
-  async setPermissionMode(mode: PermissionMode, context: AdapterContext): Promise<void> {
+  override async setPermissionMode(mode: PermissionMode, context: AdapterContext): Promise<void> {
     await this.applyPermissionMode(this.exactSession(context), mode);
   }
 
@@ -399,7 +399,7 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
 
   private model(id: string, name: string, images: boolean, efforts: readonly string[] = []): ProviderModel {
     return { providerId: this.providerId, modelId: id, displayName: name, api: "acp", contextWindow: 0,
-      maxOutputTokens: 0, supportsImages: images, thinkingLevels: efforts };
+      maxOutputTokens: 0, supportsImages: images, thinkingLevels: efforts, cost: {} };
   }
 
   private publish(session: AcpLiveSession): void {
