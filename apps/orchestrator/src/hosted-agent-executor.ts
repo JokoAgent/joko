@@ -5,7 +5,7 @@ import { access, mkdir, open, readdir, realpath, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
-import { createGrepToolDefinition, createLocalBashOperations, type ExtensionContext, type GrepToolInput } from "@earendil-works/pi-coding-agent";
+import { createGrepTool, createLocalBashOperations, type GrepToolInput } from "@earendil-works/pi-coding-agent";
 import { classifyToolCall, decideToolCall, evaluateOrderedPolicyRules, policyObservationForToolCall, redactSecrets, type AdapterContext, type ApprovedDirectory,
   type PermissionMode, type PolicySnapshot, type ToolCall, type NativeToolAuthorizationDecision } from "@joko/core";
 import type { CommandConcurrencyGate } from "@joko/runtime-governance";
@@ -320,8 +320,8 @@ export class HostedAgentExecutor {
             if (result.exitCode !== 0 && result.exitCode !== 1) throw new HostedAgentExecutorError("EXECUTOR_FAILED");
             const lines = result.output.toString("utf8").split(/\r?\n/u).filter(Boolean).slice(0, Number(params.limit ?? 100));
             return { text: this.#workspace.mapTextForAgent(lines.join("\n")), details: {} }; }
-          const result = await createGrepToolDefinition(this.#options.context.target.workspaceRoot).execute(request.callId,
-            { ...params, path } as GrepToolInput, activeSignal, undefined, {} as ExtensionContext);
+          const result = await createGrepTool(this.#options.context.target.workspaceRoot).execute(request.callId,
+            { ...params, path } as GrepToolInput, activeSignal);
           assert(); return { text: this.#workspace.mapTextForAgent(result.content.filter(part => part.type === "text").map(part => part.text).join("\n")), details: result.details };
         }
         case "exec.run": {

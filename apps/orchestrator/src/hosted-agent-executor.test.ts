@@ -30,8 +30,9 @@ async function fixture(sideChat = false) {
   return { root, task, agent, context, questions, executor, gate,
     call: async (operation: string, payload: Record<string, unknown>, signal?: AbortSignal) => {
       const callId = `native-call-${++sequence}`;
-      const name = operation === "exec.run" ? "bash" : operation === "fs.write" ? "write" : operation === "fs.readdir" || operation === "fs.stat" ? "ls" : "read";
-      const input = operation === "exec.run" ? payload : { path: payload.path };
+      const name = operation === "pi.grep" ? "grep" : operation === "exec.run" ? "bash"
+        : operation === "fs.write" ? "write" : operation === "fs.readdir" || operation === "fs.stat" ? "ls" : "read";
+      const input = operation === "pi.grep" ? payload.params : operation === "exec.run" ? payload : { path: payload.path };
       const request = (index: number, operation: string, payload: Record<string, unknown>) => executor.execute({ format: 1, callId, requestId: `${callId}:${index}`, operation, payload }, signal);
       await request(1, "tool.begin", { name, input });
       try { return await request(2, operation, payload); }
@@ -40,6 +41,15 @@ async function fixture(sideChat = false) {
     setPolicy: (value: Partial<HostedAgentExecutorPolicy>) => { policy = { ...policy, ...value, revision: String(++policyRevision) }; },
     setAnswer: (callback: typeof answer) => { answer = callback; }, revoke: () => { current = false; } };
 }
+
+it("searches the original task workspace through Pi's published grep tool", async () => {
+  const { task, agent, call } = await fixture();
+  await writeFile(join(task, "match.txt"), "a needle in the original workspace\n");
+  await writeFile(join(agent, "other.txt"), "a needle in the virtual workspace\n");
+  const result = await call("pi.grep", { params: { pattern: "needle", path: ".", literal: true } });
+  expect(result).toMatchObject({ text: expect.stringContaining("a needle in the original workspace") });
+  expect(result).not.toMatchObject({ text: expect.stringContaining("virtual workspace") });
+});
 
 it("executes native file operations on the task computer and round-trips projected text without changing binary bytes", async () => {
   const f = await fixture(), path = join(f.agent, "source.json"), real = join(f.task, "source.json");
