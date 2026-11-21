@@ -336,7 +336,8 @@ import {
   type InteractionDecisionSubmission,
   type InteractionQuestionAnswerSubmission,
   type SessionHost,
-  type SessionRuntimeActivityKind
+  type SessionRuntimeActivityKind,
+  TaskCopySourceUnavailableError
 } from "./session-host.js";
 import type { ScheduleCoordinator } from "./schedule-coordinator.js";
 import {
@@ -943,6 +944,7 @@ function toConnectError(error: unknown): ConnectError {
   }
   if (error instanceof OperationInProgressError) return new ConnectError(error.message, Code.Aborted);
   if (error instanceof InvalidStateTransitionError) return new ConnectError(error.message, Code.FailedPrecondition);
+  if (error instanceof TaskCopySourceUnavailableError) return new ConnectError(error.message, Code.FailedPrecondition);
   if (error instanceof UsageReportQueryError) return new ConnectError(error.message, Code.InvalidArgument);
   if (error instanceof UsageReportCapacityError) return new ConnectError(error.message, Code.ResourceExhausted);
   if (error instanceof ResourceUsageReportQueryError) return new ConnectError(error.message, Code.InvalidArgument);

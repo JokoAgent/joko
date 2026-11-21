@@ -961,6 +961,8 @@ export interface BackendProviderAuthenticationRetirement {
   readonly retirementToken: symbol;
 }
 
+export class TaskCopySourceUnavailableError extends Error {}
+
 export class SessionHost {
   readonly #store: OperationalStore;
   readonly #runtimeHandoffs: SessionRuntimeHandoffStore;
@@ -9428,7 +9430,7 @@ export class SessionHost {
       || this.#store.sessionCreationServiceKind(sessionId) !== undefined || this.#partnerSessionPolicy(sessionId) !== undefined
       || this.#store.findCollaborationWorkerBySession(sessionId) !== undefined || this.#store.findSessionRuntimePolicy(sessionId) !== undefined
       || readPersonalDevelopmentPurpose(this.#store, sessionId) !== undefined) {
-      throw new StoreError("Choose an ordinary local task to copy to another node.");
+      throw new TaskCopySourceUnavailableError("Choose an ordinary local task to copy to another node.");
     }
     const busy = (id: string) => this.#store.listRuns({ sessionId: id, activeOnly: true, limit: 1 }).length > 0
       || this.#store.listQueueItems({ sessionId: id, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 1 }).length > 0
@@ -9438,8 +9440,12 @@ export class SessionHost {
       const target = this.targetForSession(this.#store.getSession(row.id));
       const revision = this.#store.getTarget(row.targetId).revision;
       if (target.remoteWorkspace || row.remoteWorkspace || row.deletedAt !== undefined || !target.trusted) {
-        throw new StoreError("The task and each worker must use an approved local workspace.");
+        throw new TaskCopySourceUnavailableError("The task and each worker must use an approved local workspace.");
       }
+      const assertIdle = (): void => {
+        if (busy(row.id)) throw new TaskCopySourceUnavailableError("Wait until the original task, its workers, and their input queues are idle.");
+      };
+      assertIdle();
       const active = row.archived ? undefined : this.captureToolWorkspace({ sessionId: row.id, targetId: row.targetId, generation });
       const assertCurrent = () => {
         active?.assertCurrent();
@@ -9448,9 +9454,9 @@ export class SessionHost {
           || current.descriptor.archived !== row.archived || current.descriptor.deletedAt !== undefined
           || this.#store.getTarget(row.targetId).revision !== revision || this.targetForSession(current).workspaceRoot !== target.workspaceRoot
           || (row.archived && row.worktree !== undefined && this.#worktrees?.activeWorkspacePath(row.id, row.worktree) !== target.workspaceRoot)) {
-          throw new StoreError("The original task copy workspace changed.");
+          throw new TaskCopySourceUnavailableError("The original task copy workspace changed.");
         }
-        if (busy(row.id)) throw new StoreError("Wait until the original task, its workers, and their input queues are idle.");
+        assertIdle();
       };
       assertCurrent();
       assertProtectedNativeExport(this.#store, row);
@@ -9458,7 +9464,7 @@ export class SessionHost {
     };
     const lead = capture(session, expectedGeneration);
     const goal = this.#store.findActiveCollaborationGoalByLeadSession(sessionId);
-    if (goal && goal.sessionGeneration !== expectedGeneration) throw new StoreError("The active collaboration Goal changed.");
+    if (goal && goal.sessionGeneration !== expectedGeneration) throw new TaskCopySourceUnavailableError("The active collaboration Goal changed.");
     const sourceWorkers = goal === undefined ? [] : this.#store.listCollaborationWorkers({ goalId: goal.id, includeArchived: true });
     const byId = new Map(sourceWorkers.map(worker => [worker.id, worker]));
     const positioned = new Map<string, number>();
@@ -9469,13 +9475,13 @@ export class SessionHost {
       if (previous !== undefined) return previous;
       const worker = byId.get(id);
       if (!worker?.sessionId || worker.sessionGeneration === undefined || !copyableWorkerStatus(worker.status) || visiting.has(id)) {
-        throw new StoreError("A collaboration worker is busy or its original local task is unavailable.");
+        throw new TaskCopySourceUnavailableError("A collaboration worker is busy or its original local task is unavailable.");
       }
       visiting.add(id);
       const parent = worker.parentWorkerId === undefined ? undefined : addWorker(worker.parentWorkerId);
       const source = capture(this.#store.getSession(worker.sessionId).descriptor, worker.sessionGeneration);
       const verify = () => {
-        if (this.#store.getCollaborationWorker(id).revision !== worker.revision) throw new StoreError("The original collaboration worker changed.");
+        if (this.#store.getCollaborationWorker(id).revision !== worker.revision) throw new TaskCopySourceUnavailableError("The original collaboration worker changed.");
         source.assertCurrent();
       };
       const index = workers.length;
@@ -9485,7 +9491,7 @@ export class SessionHost {
       visiting.delete(id);
       return index;
     };
-    if (sourceWorkers.length > 128) throw new StoreError("The collaboration Goal contains too many workers to copy.");
+    if (sourceWorkers.length > 128) throw new TaskCopySourceUnavailableError("The collaboration Goal contains too many workers to copy.");
     for (const worker of sourceWorkers) addWorker(worker.id);
     const groupIds = new Set([lead.sessionId, ...workers.map(worker => worker.source.sessionId)]);
     const roots = [lead.root, ...workers.map(worker => worker.source.root)];
@@ -9498,7 +9504,7 @@ export class SessionHost {
     const assertCurrent = () => {
       lead.assertCurrent();
       const current = this.#store.findActiveCollaborationGoalByLeadSession(sessionId);
-      if (current?.id !== goal?.id || current?.revision !== goal?.revision) throw new StoreError("The original collaboration Goal changed.");
+      if (current?.id !== goal?.id || current?.revision !== goal?.revision) throw new TaskCopySourceUnavailableError("The original collaboration Goal changed.");
       for (const worker of workers) worker.verify();
     };
     const assertWorkspaceIdle = () => {
@@ -9508,7 +9514,7 @@ export class SessionHost {
         const root = this.targetForSession(other).workspaceRoot;
         if (roots.some(candidate => (workerPathWithin(candidate, root) || workerPathWithin(root, candidate))
           && !excludedRoots(candidate).some(excluded => workerPathWithin(excluded, root)))) {
-          throw new StoreError("Another task is using the source workspace.");
+          throw new TaskCopySourceUnavailableError("Another task is using the source workspace.");
         }
       }
     };

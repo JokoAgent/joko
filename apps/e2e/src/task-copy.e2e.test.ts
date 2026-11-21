@@ -78,7 +78,8 @@ it("copies a settled Pi Goal with distinct worker files and native history to an
     const runId = await send(originalOwner, lead, sourceGeneration, blockedInput);
     await waitFor(async () => source.providerRequests.some(item => JSON.stringify(item.body).includes(blockedInput)),
       value => value, "the held source input", 30_000);
-    await expect(originalOwner.clients.portableSession.preparePortableTaskCopy(request(randomUUID()))).rejects.toThrow(/idle/u);
+    await expect(originalOwner.clients.portableSession.preparePortableTaskCopy(request(randomUUID())))
+      .rejects.toMatchObject({ code: Code.FailedPrecondition, rawMessage: expect.stringMatching(/idle/u) });
     release();
     await waitForSuccess(originalOwner, runId);
 
@@ -179,7 +180,7 @@ mountedIt("copies from the mounted task menu and opens the authoritative destina
   await page.getByRole("button", { name: "Disconnect", exact: true }).click({ timeout: 20_000 });
   await pairPage(page, source, "Copy source");
   await page.goto(`${source.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
-  await page.locator(".session-header-menu").getByLabel("Actions for Mounted task for direct copy", { exact: true })
+  await page.locator('.session-header-menu summary[aria-label="Actions for Mounted task for direct copy"]')
     .click({ timeout: 25_000 });
   await page.getByRole("menuitem", { name: "Export task…", exact: true }).click();
   await page.getByRole("button", { name: "Copy to another node", exact: true }).click();
