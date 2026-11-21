@@ -524,6 +524,20 @@ export default function (pi) {
         sessionId: "real-pi-workflow-clone",
         target: forkContext.target,
         recordBinding: (binding) => { cloneReceipt.push(binding); }
+      }).catch(error => {
+        const entries = SessionManager.open(forkBinding.opaqueRef).getEntries().map(entry => {
+          const fields = Object.fromEntries(Object.entries(entry).map(([key, value]) => [key, value === null ? "null" : typeof value]));
+          if (entry.type === "message") {
+            fields["role"] = entry.message.role;
+            for (const [key, value] of Object.entries(entry.message)) {
+              if (key === "role") continue;
+              fields[`message.${key}`] = Array.isArray(value) ? value.map(part => part?.type ?? typeof part).join(",")
+                : value === null ? "null" : typeof value;
+            }
+          }
+          return { type: entry.type, fields };
+        });
+        throw new Error(`The published Pi fork could not be cloned. Native entry shapes: ${JSON.stringify(entries)}`, { cause: error });
       });
       expect(cloneReceipt).toEqual([cloneBinding]);
       expect(cloneBinding).toMatchObject({ generation: 1 });
@@ -605,7 +619,7 @@ export default function (pi) {
       await adapter.setAutoCompactionThreshold(75, context);
       const compacted = await adapter.getTree(context);
       expect(flattenTree(compacted.roots).filter((node) => node.kind === "compaction")).toEqual([
-        { entryId: compacted.leafId, kind: "compaction" }
+        { entryId: compacted.leafId, kind: "compaction", role: undefined, label: "native-response-3" }
       ]);
       const [started, completed] = compactions();
       expect(compactions()).toHaveLength(2);
