@@ -106,7 +106,7 @@ it("starts only an approved packaged ACP engine and keeps task, permission, sche
       connectionId, interactionId: interaction.interactionId, generation: interaction.generation
     }));
     expect(decided.state, decided.error?.message).toBe(OperationState.SUCCEEDED);
-    await waitFor(() => clients.run.getRun({ runId: blocked }), result => result.run?.state === RunState.COMPLETED, "completed ACP permission");
+    await waitFor(() => clients.run.getRun({ runId: blocked }), result => result.run?.state === RunState.SUCCEEDED, "completed ACP permission");
     expect(store.listEvents({ sessionId, limit: 200 }).map(event => event.payload)).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "new: allow-once" }] })
     ]));
