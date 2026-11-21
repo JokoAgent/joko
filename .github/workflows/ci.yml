@@ -282,6 +282,19 @@ jobs:
         shell: bash
         run: pnpm install --frozen-lockfile 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/install.log"
 
+      - name: Verify the Linux terminal addon after restoring dependencies
+        if: runner.os == 'Linux'
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          verify_terminal_addon() {
+            node --input-type=commonjs -e 'const {createRequire} = require("node:module"); const {resolve} = require("node:path"); createRequire(resolve("packages/tool-terminal/package.json"))("node-pty");'
+          }
+          if ! verify_terminal_addon; then
+            PNPM_CONFIG_SIDE_EFFECTS_CACHE=false pnpm --filter @joko/tool-terminal rebuild node-pty
+            verify_terminal_addon
+          fi
+
       - name: Diagnose the reproducible macOS LAN discovery failure
         id: lan_discovery
         if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'macOS' }}
@@ -536,6 +549,14 @@ jobs:
         shell: bash
         run: pnpm --filter @joko/web exec vitest run src/components/Timeline.viewport.test.tsx src/components/Timeline.test.ts src/components/timeline-follow-intent.test.ts src/dev/VisualHarness.artifact-storage.test.tsx src/components/ToolsPage.browser-new-session.test.tsx src/gateway.browser-ledger.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-owners.log"
 
+      - name: Check Terminal screen recovery and live Web controls
+        if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' }}
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          pnpm --filter @joko/tool-terminal exec vitest run src/provider.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/terminal-provider.log"
+          pnpm --filter @joko/web exec vitest run src/components/InteractiveTerminalPanel.test.tsx 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/terminal-web.log"
+
       - name: Check the durable transfer ledger and native Browser FileList (Linux)
         if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' && steps.chromium_sandbox.outcome == 'success' && runner.os == 'Linux' }}
         timeout-minutes: 5
@@ -578,6 +599,8 @@ jobs:
             ${{ runner.temp }}/joko-ci-logs/browser-regressions.log
             ${{ runner.temp }}/joko-ci-logs/browser-owners.log
             ${{ runner.temp }}/joko-ci-logs/browser-transfers.log
+            ${{ runner.temp }}/joko-ci-logs/terminal-provider.log
+            ${{ runner.temp }}/joko-ci-logs/terminal-web.log
           if-no-files-found: warn
           retention-days: 3
 

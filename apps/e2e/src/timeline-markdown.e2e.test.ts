@@ -33,8 +33,16 @@ describe("mounted Timeline Markdown documents", () => {
       .find((address) => address.family === "IPv4" && !address.internal && isPrivateLanHost(address.address))?.address;
     if (publicLanHost === undefined) { context.skip(); return; }
     const terminalText = "LANCLIPBOARD";
+    const terminalProgram = `
+      process.stdin.setRawMode(true);
+      process.stdin.resume();
+      process.stdout.write(${JSON.stringify(terminalText + "\r\n")});
+      process.stdin.on("data", (bytes) => {
+        for (const byte of bytes) process.stdout.write("INPUT:" + byte.toString(16).padStart(2, "0") + "\\r\\n");
+      });
+    `;
     const terminals = new TerminalProvider({ shells: async () => [{ id: "test-tty", label: "Test TTY", executable: process.execPath,
-      args: ["-e", `process.stdin.setRawMode(true);process.stdin.resume();process.stdout.write(${JSON.stringify(terminalText + "\r\n")});process.stdin.on('data',bytes=>process.stdout.write('INPUT:'+bytes.toString('hex')+'\\r\\n'));`],
+      args: ["-e", terminalProgram],
       isDefault: true }] });
     fixture = await OrchestratorE2eFixture.start({ webDirectory: process.env.JOKO_MOUNTED_WEB_DIR!, publicLanHost, terminals });
     const manager = await fixture.pair("Private HTTP manager");

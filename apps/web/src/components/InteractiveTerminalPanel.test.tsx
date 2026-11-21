@@ -188,6 +188,19 @@ it("waits for the live appearance acknowledgement, replays current overrides aft
   await act(async () => terminal.input("\x1b[O"));
   expect(api.writeTerminal).toHaveBeenCalledTimes(2);
   terminal.modes.sendFocusMode = false;
+  await act(async () => watches[0]!.update({ kind: "output", sequence: 3n, appearanceRevision: 100n, data: "" }));
+  let confirmFocus!: () => void;
+  updateAppearance.mockImplementationOnce(async (_session, _id, _generation, appearance, _claim, expected) => new Promise((resolve) => {
+    confirmFocus = () => resolve({ accepted: true, acceptedViewRevision: appearance.viewRevision, appearanceRevision: expected + 1n, ownsDefaults: true });
+  }));
+  await act(async () => terminal.focus());
+  expect(updateAppearance).toHaveBeenLastCalledWith("session-one", "terminal-one", 1n, expect.anything(), true, 100n, expect.any(AbortSignal));
+  expect(terminal.options.disableStdin).toBe(false);
+  await act(async () => terminal.input("x"));
+  expect(api.writeTerminal).toHaveBeenCalledTimes(2);
+  await act(async () => confirmFocus());
+  expect(api.writeTerminal).toHaveBeenCalledTimes(3);
+  expect(api.writeTerminal).toHaveBeenLastCalledWith("session-one", "terminal-one", 1n, watches[0]!.appearance.viewId, 3n, "x", expect.any(AbortSignal));
   let rejectOld!: (reason: Error) => void;
   updateAppearance.mockImplementationOnce(async () => new Promise((_, reject) => { rejectOld = reject; }));
   color = "#abcdef";
@@ -273,11 +286,11 @@ it("owns the emulator, ordered input and recovery while hidden, reattached or re
     openHttpLink: vi.fn(async () => undefined)
   };
   const host = document.body.appendChild(document.createElement("div"));
-  root = createRoot(host);
-  let detachedDocument: Document | undefined;
-  const render = async (active = true, connected = true, mount = "main") => act(async () => {
-    const panel = <InteractiveTerminalPanel key={mount} controller={{ ...methods, state: { connectionState: connected ? "connected" : "reconnecting", activeProfile: { id: "profile", serverId: "server" } } } as unknown as AppController} sessionId="session-one" terminalId="terminal-one" active={active} capabilities={capabilities} t={t} onState={vi.fn()} />;
-    root!.render(detachedDocument === undefined ? panel : createPortal(panel, detachedDocument.body));
+  const mount = host.appendChild(document.createElement("div"));
+  root = createRoot(host.appendChild(document.createElement("div")));
+  const render = async (active = true, connected = true) => act(async () => {
+    const panel = <InteractiveTerminalPanel controller={{ ...methods, state: { connectionState: connected ? "connected" : "reconnecting", activeProfile: { id: "profile", serverId: "server" } } } as unknown as AppController} sessionId="session-one" terminalId="terminal-one" active={active} capabilities={capabilities} viewDocument={mount.ownerDocument} t={t} onState={vi.fn()} />;
+    root!.render(createPortal(panel, mount));
   });
   await render();
   const terminal = mocks.terminals[0];
@@ -467,7 +480,7 @@ it("owns the emulator, ordered input and recovery while hidden, reattached or re
     expect(writeTerminal).toHaveBeenCalledTimes(inputCountBeforeRefresh);
   }
   const frame = document.body.appendChild(document.createElement("iframe"));
-  detachedDocument = frame.contentDocument!;
+  const detachedDocument = frame.contentDocument!;
   const detachedWindow = frame.contentWindow!;
   vi.spyOn(detachedWindow, "getComputedStyle").mockReturnValue({ getPropertyValue: () => "#654321" } as unknown as CSSStyleDeclaration);
   const detachedObserve = vi.fn();
@@ -476,14 +489,31 @@ it("owns the emulator, ordered input and recovery while hidden, reattached or re
   Object.defineProperty(detachedWindow, "cancelAnimationFrame", { value: window.cancelAnimationFrame.bind(window) });
   const detachedClipboard = { writeText: vi.fn(async () => undefined) };
   Object.defineProperty(detachedWindow.navigator, "clipboard", { value: detachedClipboard });
-  await render(true, true, "detached");
+  const formerWatch = watches.at(-1)!;
+  detachedDocument.body.append(mount);
+  await render();
   expect(terminal.dispose).toHaveBeenCalledTimes(1);
-  expect(watches.at(-1)!.after).toBeUndefined();
+  expect(formerWatch.signal.aborted).toBe(true);
+  const detachedWatch = watches.at(-1)!;
+  expect(detachedWatch.after).toBeUndefined();
   expect(detachedObserve.mock.calls[0]?.[0].ownerDocument).toBe(detachedDocument);
   expect(detachedDocument.querySelector("textarea")).not.toBeNull();
-  mocks.terminals.at(-1)!.selection = "detached selection";
-  mocks.terminals.at(-1)!.key(new KeyboardEvent("keydown", { code: "KeyC", ctrlKey: true }));
+  const detachedTerminal = mocks.terminals.at(-1)!;
+  await act(async () => detachedWatch.update({ appearanceRevision: 1n, activeColorOverrides: "", kind: "reset", terminal: descriptor, sequence: 17n, data: "screen during handoff" }));
+  await act(async () => detachedWatch.update({ appearanceRevision: 1n, activeColorOverrides: "", kind: "output", sequence: 18n, data: "live child output" }));
+  expect(detachedTerminal.write.mock.calls).toEqual([
+    ["screen during handoff", expect.any(Function)], ["live child output", expect.any(Function)]
+  ]);
+  detachedTerminal.selection = "detached selection";
+  detachedTerminal.key(new KeyboardEvent("keydown", { code: "KeyC", ctrlKey: true }));
   expect(detachedClipboard.writeText).toHaveBeenCalledWith("detached selection");
+  await act(async () => detachedWatch.update({ appearanceRevision: 1n, kind: "state", terminal: { ...descriptor, status: "exited", exitCode: 7 }, sequence: 19n, data: "" }));
+  expect(detachedDocument.body.textContent).toContain(t("terminal.exited", { code: 7 }));
+  host.append(mount);
+  await render();
+  expect(detachedWatch.signal.aborted).toBe(true);
+  expect(detachedTerminal.dispose).toHaveBeenCalledOnce();
+  expect(watches.at(-1)!.after).toBeUndefined();
   expect(methods.closeTerminal).not.toHaveBeenCalled();
   await act(async () => root!.unmount());
   root = undefined;
