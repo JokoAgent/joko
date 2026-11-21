@@ -18,6 +18,11 @@ class ManagedProviderAdapter extends InstrumentedFakeAdapter {
     const descriptor = await super.describe();
     return { ...descriptor,
       capabilities: new Map([...descriptor.capabilities, ["provider.managed_catalog", { key: "provider.managed_catalog", supported: true }]]),
+      providers: descriptor.models.map((model) => ({
+        providerId: model.providerId, displayName: model.providerId, api: model.api,
+        authenticationState: "not_required", accessKind: "localKeyless", loginMethods: [],
+        supportsLogin: false, supportsLogout: false, supportsRefresh: false, supportsModelRefresh: false
+      })),
       providerRuntimeSupport: { protocols: ["openai-completions"], fields: ["auth_header", "keyless", "headers", "model_limits", "model_input_modalities"] }
     };
   }
