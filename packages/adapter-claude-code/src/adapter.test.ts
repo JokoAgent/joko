@@ -3105,7 +3105,8 @@ describe("ClaudeCodeAdapter", () => {
     expect(first.authenticationState).toBe("authenticated");
     expect(first.models.map((model) => model.modelId)).toEqual(["model-a"]);
     expect(first.capabilities.get("model.effort")?.supported).toBe(true);
-    expect(first.version).toContain("cli-2.1.240");
+    expect(first.version).toContain("cli-2.1.322");
+    expect(first.capabilities.get("turn.steer")?.supported).toBe(false);
     expect(runtime.queries).toEqual([]);
     expect(runtime.probeInputs).toEqual([expect.objectContaining({
       cwd: probeCwd,
