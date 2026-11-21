@@ -225,6 +225,7 @@ export interface MobileNetwork {
   extensionCardApi?(credential: PairedCredential): import("./mobile-extension-card-api").MobileExtensionCardApi;
   getProviderUsage?(credential: PairedCredential, backendId: string, providerId: string,
     signal?: AbortSignal): Promise<import("@joko/contracts").ProviderAccountUsageSnapshot | undefined>;
+  getHomeUsage?(credential: PairedCredential, signal: AbortSignal): Promise<import("@joko/contracts").UsageHistory | undefined>;
   providerAccountResets?(credential: PairedCredential, ownerKey: string, newId: () => string, assertCurrent: (backendId: string, providerId: string) => void): import("@joko/contracts").ProviderAccountResetApi;
   getTaskProviderGroupRebalance?(credential: PairedCredential, sessionId: string, generation: bigint,
     signal: AbortSignal): Promise<ProviderGroupRebalanceSuggestion | undefined>;
@@ -1760,6 +1761,11 @@ export const mobileNetwork: MobileNetwork = {
     signal?.throwIfAborted();
     if (result.accountUsage && result.accountUsage.providerId !== providerId) throw new Error("The account usage Provider changed.");
     return result.accountUsage;
+  },
+  async getHomeUsage(credential, signal) {
+    const result = await createClient(BackendService, credentialTransport(credential)).getUsageHistory({ days: 1 }, options(signal));
+    signal.throwIfAborted();
+    return result.history;
   },
   providerAccountResets(credential, ownerKey, newId, assertCurrent) {
     return createProviderAccountResetApi({ ownerKey, connectionId: credential.connectionId, transport: credentialTransport(credential),

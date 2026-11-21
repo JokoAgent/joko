@@ -1,0 +1,7 @@
+{
+  "name": "@joko/mobile-home-surfaces",
+  "version": "0.1.0",
+  "description": "Joko-owned iOS WidgetKit and task Live Activity projections.",
+  "private": true,
+  "peerDependencies": { "expo": "*" }
+}

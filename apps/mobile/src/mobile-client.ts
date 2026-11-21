@@ -3952,6 +3952,41 @@ export class MobileClient {
     return mobilePushRetirementRoute(this.#ready(), current.endpointPublicKey);
   }
 
+  homeSurfaceUsage(): import("./mobile-home-surfaces").HomeSurfaceUsageSource | undefined {
+    const authority = this.mobilePushAuthority(), credential = this.#credential;
+    if (this.platform !== "ios" || authority === undefined || credential === undefined || this.#joinedTask) return undefined;
+    const readProjection = () => {
+      const providers = this.network.getProviderUsage === undefined ? [] : (this.#state.owner?.providers ?? [])
+        .filter(mobileProviderUsageSupported)
+        .sort((left, right) => left.displayName.localeCompare(right.displayName) || left.providerId.localeCompare(right.providerId)).slice(0, 12);
+      const catalog = JSON.stringify(providers.map(mobileProviderUsageIdentity));
+      return { providers, catalog };
+    };
+    const { providers, catalog } = readProjection();
+    const assertCurrent = (signal: AbortSignal): void => {
+      signal.throwIfAborted();
+      if (this.#disposed || this.#credential !== credential || this.mobilePushAuthority()?.key !== authority.key
+        || this.#joinedTask || readProjection().catalog !== catalog) throw new Error("The original widget usage source changed.");
+    };
+    return {
+      key: JSON.stringify([authority.key, catalog]), catalog, providers,
+      readQuota: async (provider, signal) => {
+        assertCurrent(signal);
+        if (!providers.includes(provider)) throw new Error("The original widget Provider is unavailable.");
+        const result = await this.network.getProviderUsage?.(credential, provider.backendId, provider.providerId, signal);
+        assertCurrent(signal);
+        if (result !== undefined && result.providerId !== provider.providerId) throw new Error("The widget Provider changed.");
+        return result;
+      },
+      readUsage: async signal => {
+        assertCurrent(signal);
+        const result = await this.network.getHomeUsage?.(credential, signal);
+        assertCurrent(signal);
+        return result;
+      }
+    };
+  }
+
   async getMobilePushCapability(
     authority: MobilePushAuthority,
     signal?: AbortSignal

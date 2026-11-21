@@ -469,6 +469,18 @@ jobs:
       - name: Verify the Simulator application's local signature
         run: codesign --verify --deep --strict "$RUNNER_TEMP/joko-ios-simulator/Build/Products/Debug-iphonesimulator/Joko.app"
 
+      - name: Verify the embedded WidgetKit target and its app group
+        run: |
+          app="$RUNNER_TEMP/joko-ios-simulator/Build/Products/Debug-iphonesimulator/Joko.app"
+          widget="$app/PlugIns/JokoHomeWidgets.appex"
+          test "$(plutil -extract NSSupportsLiveActivities raw -o - "$app/Info.plist")" = true
+          test "$(plutil -extract JokoHomeSurfaceGroup raw -o - "$app/Info.plist")" = group.app.joko.mobile.widgets
+          test "$(plutil -extract CFBundleIdentifier raw -o - "$widget/Info.plist")" = app.joko.mobile.home-widgets
+          test "$(plutil -extract NSExtension.NSExtensionPointIdentifier raw -o - "$widget/Info.plist")" = com.apple.widgetkit-extension
+          test "$(plutil -extract JokoHomeSurfaceGroup raw -o - "$widget/Info.plist")" = group.app.joko.mobile.widgets
+          test -s "$widget/$(plutil -extract CFBundleExecutable raw -o - "$widget/Info.plist")"
+          codesign --verify --strict "$widget"
+
       - name: Archive the compiled Simulator app
         id: ios-archive
         run: tar -C "$RUNNER_TEMP/joko-ios-simulator/Build/Products/Debug-iphonesimulator" -czf "$RUNNER_TEMP/joko-ios-simulator-debug.tar.gz" Joko.app

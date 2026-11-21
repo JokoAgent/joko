@@ -37,6 +37,8 @@ describe("mobile release artifact configuration", () => {
       iosBundleIdentifier: "app.joko.mobile",
       androidPackage: "app.joko.mobile",
       appGroupId: "group.app.joko.mobile",
+      widgetAppGroupId: "group.app.joko.mobile.widgets",
+      widgetExtensionBundleIdentifier: "app.joko.mobile.home-widgets",
       shareExtensionBundleIdentifier: "app.joko.mobile.expo-sharing-extension"
     });
     expect(resolveAndroidArtifactKinds(undefined)).toEqual(["apk", "aab"]);
@@ -258,12 +260,13 @@ describe("mobile release artifact configuration", () => {
     expect(() => patchAndroidReleaseSigning("android { buildTypes {} }")).toThrow(/signingConfigs/u);
   });
 
-  it("pins separate app and share-extension profiles in Xcode and export options", () => {
+  it("pins separate app, share and WidgetKit profiles in Xcode and export options", () => {
     const identity = loadMobileReleaseIdentity(mobileDirectory);
     const signing = resolveIosSigningConfiguration({
       JOKO_IOS_TEAM_ID: "ABCDE12345",
       JOKO_IOS_APP_PROFILE: "Joko App Store",
       JOKO_IOS_SHARE_PROFILE: "Joko Share App Store",
+      JOKO_IOS_WIDGET_PROFILE: "Joko Widgets App Store",
       JOKO_IOS_SIGNING_IDENTITY: "Apple Distribution: Joko LLC (ABCDE12345)",
       JOKO_IOS_SIGNING_CERT_SHA256: "cd".repeat(32),
       JOKO_IOS_EXPORT_METHOD: "app-store-connect"
@@ -285,14 +288,25 @@ describe("mobile release artifact configuration", () => {
 \t\t\t};
 \t\t\tname = Release;
 \t\t};
+\t\tCCC333 /* Release */ = {
+\t\t\tisa = XCBuildConfiguration;
+\t\t\tbuildSettings = {
+\t\t\t\tCODE_SIGN_STYLE = Automatic;
+\t\t\t\tPRODUCT_BUNDLE_IDENTIFIER = "app.joko.mobile.home-widgets";
+\t\t\t};
+\t\t\tname = Release;
+\t\t};
 /* End XCBuildConfiguration section */`;
     const patched = patchIosManualSigning(project, identity, signing);
-    expect(patched.match(/CODE_SIGN_STYLE = "Manual";/gu)).toHaveLength(2);
+    expect(patched.match(/CODE_SIGN_STYLE = "Manual";/gu)).toHaveLength(3);
     expect(patched).toContain('PROVISIONING_PROFILE_SPECIFIER = "Joko App Store";');
     expect(patched).toContain('PROVISIONING_PROFILE_SPECIFIER = "Joko Share App Store";');
+    expect(patched).toContain('PROVISIONING_PROFILE_SPECIFIER = "Joko Widgets App Store";');
     const plist = buildIosExportOptionsPlist(identity, signing);
     expect(plist).toContain("<key>app.joko.mobile</key>");
     expect(plist).toContain("<key>app.joko.mobile.expo-sharing-extension</key>");
+    expect(plist).toContain("<key>app.joko.mobile.home-widgets</key>");
+    expect(plist).toContain("<string>Joko Widgets App Store</string>");
     expect(plist).toContain("<string>Joko Share App Store</string>");
     expect(plist).toContain("<string>app-store-connect</string>");
     expect(IOS_EXPORT_METHODS).toEqual(["debugging", "release-testing", "enterprise", "app-store-connect"]);
@@ -300,12 +314,15 @@ describe("mobile release artifact configuration", () => {
       JOKO_IOS_TEAM_ID: "ABCDE12345",
       JOKO_IOS_APP_PROFILE: "Joko App Store",
       JOKO_IOS_SHARE_PROFILE: "Joko Share App Store",
+      JOKO_IOS_WIDGET_PROFILE: "Joko Widgets App Store",
       JOKO_IOS_SIGNING_IDENTITY: "Apple Distribution: Joko LLC (ABCDE12345)",
       JOKO_IOS_SIGNING_CERT_SHA256: "cd".repeat(32),
       JOKO_IOS_EXPORT_METHOD: "app-store"
     })).toThrow(/must be one of/u);
-    const withoutExtension = project.replace(/\t\tBBB222[\s\S]+?\n\t\t\};\n(?=\/\* End XCBuildConfiguration)/u, "");
+    const withoutExtension = project.replace(/\t\tBBB222[\s\S]+?\n\t\t\};\n(?=\t\tCCC333)/u, "");
     expect(() => patchIosManualSigning(withoutExtension, identity, signing)).toThrow(/expo-sharing-extension/u);
+    const withoutWidget = project.replace(/\t\tCCC333[\s\S]+?\n\t\t\};\n(?=\/\* End XCBuildConfiguration)/u, "");
+    expect(() => patchIosManualSigning(withoutWidget, identity, signing)).toThrow(/home-widgets/u);
   });
 
   it("writes a path-free manifest bound to source, runtime, artifact hashes, and signer", () => {
