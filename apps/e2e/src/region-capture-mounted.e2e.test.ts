@@ -35,13 +35,15 @@ mounted("renders and encodes a scrolling region, a looping GIF, and a WebM from 
       }
       writer.putImageData(pixels, 0, 0);
     };
-    draw(0);
+    let frameOrigin = 0;
+    draw(frameOrigin);
     const initial = async () => {
       const blob = await new Promise<Blob | null>(resolve => feed.toBlob(resolve, "image/png"));
       return { png: new Uint8Array(await blob!.arrayBuffer()), width, height };
     };
     const audioTracks: MediaStreamTrack[] = [];
-    const evidence = { actions: [] as { action: string; data: number[] }[], modes: [] as string[], audioTracks, draw };
+    const evidence = { actions: [] as { action: string; data: number[] }[], modes: [] as string[], audioTracks,
+      draw: (origin: number) => { frameOrigin = origin; draw(origin); } };
     const action = async (name: string, bytes: Uint8Array) => {
       evidence.actions.push({ action: name, data: Array.from(bytes.subarray(0, 128)) });
       return true;
@@ -60,6 +62,11 @@ mounted("renders and encodes a scrolling region, a looping GIF, and a WebM from 
     Object.defineProperty(navigator, "mediaDevices", { value: {
       getDisplayMedia: async (options: DisplayMediaStreamOptions) => {
         const stream = feed.captureStream(20);
+        const track = stream.getVideoTracks()[0]!;
+        const frames = window.setInterval(() => {
+          if (track.readyState === "ended") window.clearInterval(frames);
+          else draw(frameOrigin);
+        }, 50);
         if (options.audio === true) stream.addTrack(await audio());
         return stream;
       },

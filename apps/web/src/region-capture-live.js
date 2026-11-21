@@ -74,7 +74,12 @@ export async function beginRegionRecording(mode, grant, options) {
       throw new Error("The selected microphone is unavailable.");
     }
     source.srcObject = display;
-    await source.play();
+    let previewDeadline;
+    try {
+      await Promise.race([source.play(), new Promise((_, reject) => {
+        previewDeadline = window.setTimeout(() => reject(new Error("The selected screen did not provide a video frame.")), 6_000);
+      })]);
+    } finally { window.clearTimeout(previewDeadline); }
     await options.showControls();
     await new Promise(resolve => window.setTimeout(resolve, 180));
     options.signal.throwIfAborted();
