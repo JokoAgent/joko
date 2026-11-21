@@ -1963,7 +1963,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     const owner = state.partnerWindowOwner;
     if (owner === undefined || !partnerWindowMatchesProfile(owner, state.activeProfile)
       || state.connectionState === "disconnected" || state.error !== undefined && state.connectionState !== "connected") {
-      return <main className="empty-session-page"><EmptyState icon={<AlertTriangle />} title={state.error ?? t("partners.unavailable")} /></main>;
+      return <main className="empty-session-page"><EmptyState icon={<AlertTriangle />} title={t("partners.unavailable")}
+        body={state.error ?? t("nav.linkedTaskUnavailable")} /></main>;
     }
     const activated = owner.kind === "private"
       ? state.route.kind === "session" && state.route.partnerId === owner.conversationId && state.route.profileId === owner.profileId
@@ -2573,7 +2574,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       {applicationMenuFeedback}
       {!formalFilesMode && !settingsRoute && <Sidebar
         appShortcutOverrides={shortcutOverrides}
-        groupNavigation={<><TaskSharingNavigation controller={controller} t={t} onClose={closeNavigation} /><PartnerGroupsNavigation controller={controller} t={t} onClose={closeNavigation} /><PartnerNetworkNavigation controller={controller} t={t} onClose={closeNavigation} /></>}
+        groupNavigation={<><TaskSharingNavigation controller={controller} t={t} onClose={closeNavigation} /><PartnerGroupsNavigation controller={controller} t={t} onClose={closeNavigation} /><PartnerNetworkNavigation controller={controller} onClose={closeNavigation} /></>}
         snapshot={sidebarSnapshot}
         activeSessionId={creatingNewSession ? undefined : activeSession?.id}
         route={state.route}

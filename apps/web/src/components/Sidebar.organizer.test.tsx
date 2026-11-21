@@ -114,8 +114,7 @@ describe("Sidebar organizer display controls", () => {
       await Promise.resolve();
     });
     const request = beginDragPreview.mock.calls[0]?.[0] as JokoDesktopSessionDragPreviewRequest | undefined;
-    expect(request?.profileId).toBe("profile-local");
-    expect(request?.sessionId).toBe("session");
+    expect(request).toMatchObject({ profileId: "profile-local", sessionId: "session" });
     expect(setDragImage).toHaveBeenCalledOnce();
     expect(clearData).toHaveBeenCalledOnce();
     expect(setData).not.toHaveBeenCalledWith("text/plain", expect.anything());
