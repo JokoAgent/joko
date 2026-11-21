@@ -263,6 +263,7 @@ service HistoryMaintenanceService {
 
 service CredentialService {
   rpc BeginCredentialUpload(BeginCredentialUploadRequest) returns (BeginCredentialUploadResponse);
+  rpc BeginProviderModelPreviewUpload(ProviderModelPreviewRoute) returns (BeginCredentialUploadResponse);
   rpc ListCredentials(ListCredentialsRequest) returns (ListCredentialsResponse);
   rpc BeginProviderLoginInputUpload(BeginProviderLoginInputUploadRequest) returns (BeginProviderLoginInputUploadResponse);
   rpc SubmitProviderLoginInput(SubmitProviderLoginInputRequest) returns (SubmitProviderLoginInputResponse);
@@ -271,6 +272,7 @@ service CredentialService {
 
 service SettingsService {
   rpc GetSettings(GetSettingsRequest) returns (GetSettingsResponse);
+  rpc PreviewProviderModels(PreviewProviderModelsRequest) returns (PreviewProviderModelsResponse);
 }
 
 // Authenticated node-owned third-party Messaging authority. Credentials enter
@@ -2558,6 +2560,31 @@ message GetSettingsRequest {}
 
 message GetSettingsResponse {
   SettingsSnapshot settings = 1;
+}
+
+message ProviderModelPreviewRoute {
+  string backend_id = 1;
+  ProviderApiCompatibility api_compatibility = 2;
+  string endpoint = 3;
+  optional string models_endpoint = 4;
+}
+
+message PreviewProviderModelsRequest {
+  ProviderModelPreviewRoute route = 1;
+  oneof authentication {
+    string credential_upload_ticket_id = 2;
+    ProviderModelPreviewCredential saved_credential = 3;
+    bool keyless = 4;
+  }
+}
+
+message ProviderModelPreviewCredential {
+  string credential_reference_id = 1;
+  string credential_origin = 2;
+}
+
+message PreviewProviderModelsResponse {
+  repeated ProviderModelConfiguration models = 1;
 }
 
 message ListToolProvidersRequest {

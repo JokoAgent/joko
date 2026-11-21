@@ -1,3 +1,4 @@
+import { sameOriginProviderCatalogEndpoint } from "@joko/contracts";
 import type { BackendView, ProviderCompatibilityView, ProviderConfigurationFieldView, ProviderModelConfigurationView, ProviderRuntimeConfigurationView } from "./model.js";
 
 export type ProviderTransferField = "endpoint" | "models" | "authentication" | "headers" | "modelsEndpoint";
@@ -17,6 +18,13 @@ export function providerEndpointOrigin(endpoint: string): string | undefined {
     if (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))) return undefined;
     return url.origin;
   } catch { return undefined; }
+}
+
+export function providerCatalogEndpointValid(endpoint: string, modelsEndpoint?: string): boolean {
+  if (!modelsEndpoint) return true;
+  if (providerEndpointOrigin(endpoint) === undefined) return false;
+  try { return sameOriginProviderCatalogEndpoint(new URL(endpoint), new URL(modelsEndpoint)); }
+  catch { return false; }
 }
 
 export function providerRequestPathValid(path: string | undefined): boolean {
@@ -130,7 +138,7 @@ export function providerTransferDifferences(source: ProviderRuntimeConfiguration
   if (source.headers.length) add("headers", source.headers, target.headers, target.headers.length > 0,
     destinationOriginCompatible && supportsProviderField(sourceBackend, "headers") && supportsProviderField(targetBackend, "headers"));
   if (source.modelsEndpoint) add("modelsEndpoint", source.modelsEndpoint, target.modelsEndpoint ?? "", !!target.modelsEndpoint,
-    destinationOriginCompatible && supportsProviderField(targetBackend, "modelsEndpoint") && providerEndpointOrigin(source.modelsEndpoint) === sourceOrigin);
+    destinationOriginCompatible && supportsProviderField(targetBackend, "modelsEndpoint") && providerCatalogEndpointValid(source.endpoint, source.modelsEndpoint));
   return rows;
 }
 

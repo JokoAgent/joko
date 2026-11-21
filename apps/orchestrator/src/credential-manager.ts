@@ -2819,7 +2819,7 @@ function assertLeasedNativeCredentialAccount(current: NativePiCredential, next: 
   }
 }
 
-function discoveredManagedModel(model: DiscoveredProviderModel, customPiApi: PiManagedProvider["api"]): PiManagedModel {
+export function discoveredManagedModel(model: DiscoveredProviderModel, customPiApi: PiManagedProvider["api"]): PiManagedModel {
   const metadata = model.metadata;
   const defaultVisible = customPiApi !== undefined
     && isManagedChatModel({ id: model.id, discoveredMetadata: metadata })

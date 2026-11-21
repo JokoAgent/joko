@@ -6775,6 +6775,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   authorizeNewDevice?(options?: import("@joko/connection-transport/trust").NewDeviceAuthorizationOptions): Promise<import("@joko/connection-transport/trust").NodePairingInvitation>;
   cancelDevicePairing?(invitation: import("@joko/connection-transport/trust").NodePairingInvitation): Promise<void>;
   saveProvider(draft: ProviderDraft, signal?: AbortSignal): Promise<void>;
+  previewProviderModels?(runtime: ProviderRuntimeConfigurationView, secret: string, signal: AbortSignal): Promise<readonly ProviderModelConfigurationView[]>;
   deleteProvider(providerId: string): Promise<void>;
   refreshProviderModels(backendId: string, providerId?: string, automatic?: boolean): Promise<ProviderModelWithdrawalReview | void>;
   confirmProviderModelWithdrawals(review: ProviderModelWithdrawalReview, modelIds: readonly string[], operationId: string): Promise<void>;

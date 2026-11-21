@@ -169,6 +169,57 @@ describe("Connect typed feature boundaries", () => {
     expect(host.getBackgroundTaskOutput).toHaveBeenCalledTimes(1);
   });
 
+  it("previews a self-hosted catalog with a one-shot key bound to the route and connection", async () => {
+    const root = mkdtempSync(join(tmpdir(), "joko-provider-preview-connect-")); cleanupPaths.push(root);
+    const credentials = new CredentialManager({ vault: await CredentialVault.open(join(root, "vault.key")), directory: root });
+    await credentials.initialize();
+    const store = new OperationalStore(":memory:");
+    store.upsertBackend({ id: "codex", adapterKind: "codex", instanceGeneration: 1, displayName: "Codex", version: "1", health: "healthy",
+      installationState: "installed", authenticationState: "not_required", models: [], tools: [], diagnostics: [],
+      capabilities: new Map([["provider.managed_catalog", { key: "provider.managed_catalog", supported: true }]]),
+      providerRuntimeSupport: { protocols: ["openai-responses"], fields: ["models_endpoint"] } });
+    const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" }); providers.initialize();
+    let activeConnection = connection;
+    const services = createConnectServices(stubApplication({ store, providers, credentials,
+      connections: { authenticate: () => activeConnection, fence: () => activeConnection } }));
+    const route = create(contract.ProviderModelPreviewRouteSchema, { backendId: "codex", apiCompatibility: contract.ProviderApiCompatibility.OPENAI_RESPONSES,
+      endpoint: "https://gateway.example.test/v1", modelsEndpoint: "https://gateway.example.test/v1/models?client_version=0.147.0" });
+    const fakeKey = "fixture-private-provider-key";
+    const upstream = vi.fn<typeof fetch>(async () => Response.json({ data: [
+      { id: "model-one", display_name: "Responses model", supports_image_input: true },
+      { id: "embeddings", mode: "embedding" },
+      { id: "chat-only", native_api: "openai-completions" },
+      { id: "echoed", display_name: fakeKey }
+    ] }));
+    vi.stubGlobal("fetch", upstream);
+    try {
+      const receipt = await invoke<contract.BeginCredentialUploadResponse>(services.credential.beginProviderModelPreviewUpload, route);
+      const ticket = receipt.ticket!.ticketId;
+      credentials.upload(ticket, fakeKey, connection.id);
+      const preview = (requestedRoute: contract.ProviderModelPreviewRoute) => invoke<contract.PreviewProviderModelsResponse>(
+        services.settings.previewProviderModels, create(contract.PreviewProviderModelsRequestSchema, {
+          route: requestedRoute, authentication: { case: "credentialUploadTicketId", value: ticket }
+        }));
+      await expect(preview({ ...route, endpoint: "https://other.example.test/v1" })).rejects.toMatchObject({ code: Code.InvalidArgument });
+      await expect(preview({ ...route, endpoint: "https://other.example.test/v1", modelsEndpoint: "https://other.example.test/v1/models?client_version=0.147.0" }))
+        .rejects.toMatchObject({ code: Code.FailedPrecondition });
+      activeConnection = { ...connection, id: "different-connection" };
+      await expect(preview(route)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+      expect(upstream).not.toHaveBeenCalled();
+      activeConnection = connection;
+      const list = await preview(route);
+      expect(list.models.map(model => model.modelId)).toEqual(["model-one"]);
+      expect(list.models[0]).toMatchObject({ displayName: "Responses model", inputModalities: [contract.ModelInputModality.TEXT, contract.ModelInputModality.IMAGE] });
+      expect(upstream).toHaveBeenCalledWith(route.modelsEndpoint, expect.objectContaining({
+        headers: { authorization: "Bearer " + fakeKey }, redirect: "error"
+      }));
+      await expect(preview(route)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+      expect(upstream).toHaveBeenCalledOnce();
+      expect(credentials.list()).toEqual([]);
+      expect(providers.list()).toEqual([]);
+    } finally { vi.unstubAllGlobals(); store.close(); }
+  });
+
   it("saves a discovered model through the typed settings form without freezing untouched facts or accepting a posted maximum", async () => {
     const root = mkdtempSync(join(tmpdir(), "joko-provider-discovery-connect-")); cleanupPaths.push(root);
     const credentials = new CredentialManager({ vault: await CredentialVault.open(join(root, "vault.key")), storagePath: join(root, "credentials.json") });

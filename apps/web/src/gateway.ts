@@ -281,6 +281,7 @@ import {
   ProviderApiCompatibility,
   ProviderConfigurationField,
   ProviderRuntimeConfigurationSchema,
+  ProviderModelPreviewRouteSchema,
   ProviderCredentialSurfaceCapability,
   ProviderCredentialSurfaceKind,
   ProviderKind,
@@ -358,6 +359,7 @@ import {
   SessionMessageSearchSemanticMode,
   SessionMessageSearchSessionStatus,
   SessionService,
+  SettingsService,
   SessionExportFormat,
   SessionAttentionKind,
   SessionAttentionAcknowledgementIntent,
@@ -536,6 +538,7 @@ import {
   type ProviderDescriptor,
   type ProviderConfiguration,
   type ProviderRuntimeConfiguration,
+  type ProviderModelConfiguration,
   type ProviderLoginFlow,
   type ProviderModelWithdrawalReview,
   type QueueItem,
@@ -8519,6 +8522,28 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   async logoutConnection(connectionId: string): Promise<void> {
     await this.submit({ case: "logoutConnection", value: { connectionId } }, true);
+  }
+
+  async previewProviderModels(runtime: ProviderDraft["runtimes"][number], secret: string, signal: AbortSignal) {
+    const scope = this.captureActionScope(signal);
+    const route = create(ProviderModelPreviewRouteSchema, {
+      backendId: runtime.backendId,
+      apiCompatibility: protoProviderCompatibility(runtime.compatibility),
+      endpoint: runtime.endpoint,
+      modelsEndpoint: runtime.modelsEndpoint || undefined
+    });
+    let ticketId: string | undefined;
+    if (secret !== "") {
+      const response = await createClient(CredentialService, scope.transport).beginProviderModelPreviewUpload(route, { signal: scope.signal });
+      ticketId = await this.uploadCredentialTicket(secret, response.ticket, scope);
+    }
+    const authentication = ticketId !== undefined ? { case: "credentialUploadTicketId" as const, value: ticketId }
+      : runtime.keyless ? { case: "keyless" as const, value: true }
+      : { case: "savedCredential" as const, value: { credentialReferenceId: runtime.credentialId, credentialOrigin: runtime.credentialOrigin } };
+    scope.signal.throwIfAborted();
+    const response = await createClient(SettingsService, scope.transport).previewProviderModels({ route, authentication }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return response.models.map(mapProviderModelConfiguration);
   }
 
   async saveProvider(draft: ProviderDraft, signal?: AbortSignal): Promise<void> {
@@ -20958,52 +20983,56 @@ function mapProviderRuntimeConfiguration(provider: ProviderRuntimeConfiguration)
       environmentName: header.environmentName,
       credentialId: header.credentialReferenceId
     })),
-    models: provider.models.map((model) => ({
-      modelId: model.modelId,
-      name: model.displayName,
-      ...(model.mode === undefined ? {} : { mode: model.mode }),
-      ...(model.apiCompatibility === undefined ? {} : { compatibility: providerCompatibility(model.apiCompatibility) }),
-      reasoning: model.reasoning,
-      inputModalities: model.inputModalities.map(inputModality),
-      contextWindowTokens: numberValue(model.contextWindowTokens),
-      maximumOutputTokens: numberValue(model.maximumOutputTokens),
-      ...(model.inheritedFields.length === 0 ? {} : { inheritedFields: model.inheritedFields.map(providerModelInheritedField) }),
-      ...(model.contextWindowMaxTokens === undefined ? {} : { contextWindowMaxTokens: numberValue(model.contextWindowMaxTokens) }),
-      inputCostMicrosPerMillion: numberValueSigned(model.inputCostMicrosPerMillion),
-      outputCostMicrosPerMillion: numberValueSigned(model.outputCostMicrosPerMillion),
-      cacheReadCostMicrosPerMillion: numberValueSigned(model.cacheReadCostMicrosPerMillion),
-      cacheWriteCostMicrosPerMillion: numberValueSigned(model.cacheWriteCostMicrosPerMillion),
-      thinkingLevels: model.thinkingLevels.map((level) => ({ effortId: level.effortId, ...(level.nativeLevel === undefined ? {} : { nativeLevel: level.nativeLevel }) })),
-      ...(model.sampling === undefined ? {} : { sampling: {
-        ...(model.sampling.temperature === undefined ? {} : { temperature: model.sampling.temperature }),
-        ...(model.sampling.topP === undefined ? {} : { topP: model.sampling.topP }),
-        ...(model.sampling.topK === undefined ? {} : { topK: model.sampling.topK }),
-        ...(model.sampling.minP === undefined ? {} : { minP: model.sampling.minP }),
-        ...(model.sampling.repetitionPenalty === undefined ? {} : { repetitionPenalty: model.sampling.repetitionPenalty }),
-        ...(model.sampling.frequencyPenalty === undefined ? {} : { frequencyPenalty: model.sampling.frequencyPenalty }),
-        ...(model.sampling.presencePenalty === undefined ? {} : { presencePenalty: model.sampling.presencePenalty }),
-        ...(model.sampling.seed === undefined ? {} : { seed: numberValue(model.sampling.seed) })
-      } }),
-      ...(model.compatibility === undefined ? {} : { compatibilityOptions: {
-        ...(model.compatibility.supportsDeveloperRole === undefined ? {} : { supportsDeveloperRole: model.compatibility.supportsDeveloperRole }),
-        ...(model.compatibility.supportsReasoningEffort === undefined ? {} : { supportsReasoningEffort: model.compatibility.supportsReasoningEffort }),
-        ...(model.compatibility.supportsUsageInStreaming === undefined ? {} : { supportsUsageInStreaming: model.compatibility.supportsUsageInStreaming }),
-        ...(model.compatibility.supportsFinishReason === undefined ? {} : { supportsFinishReason: model.compatibility.supportsFinishReason }),
-        ...(model.compatibility.requiresReasoningContentOnAssistantMessages === undefined ? {} : { requiresReasoningContentOnAssistantMessages: model.compatibility.requiresReasoningContentOnAssistantMessages }),
-        ...(model.compatibility.supportsStore === undefined ? {} : { supportsStore: model.compatibility.supportsStore }),
-        ...(model.compatibility.supportsStrictMode === undefined ? {} : { supportsStrictMode: model.compatibility.supportsStrictMode }),
-        ...(model.compatibility.supportsOpenaiGrammarTools === undefined ? {} : { supportsOpenaiGrammarTools: model.compatibility.supportsOpenaiGrammarTools }),
-        ...(model.compatibility.supportsEagerToolInputStreaming === undefined ? {} : { supportsEagerToolInputStreaming: model.compatibility.supportsEagerToolInputStreaming }),
-        ...(model.compatibility.supportsLongCacheRetention === undefined ? {} : { supportsLongCacheRetention: model.compatibility.supportsLongCacheRetention }),
-        ...(model.compatibility.supportsCacheControlOnTools === undefined ? {} : { supportsCacheControlOnTools: model.compatibility.supportsCacheControlOnTools }),
-        ...(model.compatibility.supportsStrictTools === undefined ? {} : { supportsStrictTools: model.compatibility.supportsStrictTools }),
-        ...(model.compatibility.thinkingFormat === undefined ? {} : { thinkingFormat: model.compatibility.thinkingFormat }),
-        ...(model.compatibility.cacheControlFormat === undefined ? {} : { cacheControlFormat: model.compatibility.cacheControlFormat })
-      } }),
-      supportsFastMode: model.supportsFastMode,
-      ...(model.defaultVisible === undefined ? {} : { defaultVisible: model.defaultVisible }),
-      ...(model.supportsTools === undefined ? {} : { supportsTools: model.supportsTools })
-    }))
+    models: provider.models.map(mapProviderModelConfiguration)
+  };
+}
+
+function mapProviderModelConfiguration(model: ProviderModelConfiguration): ProviderDraft["runtimes"][number]["models"][number] {
+  return {
+    modelId: model.modelId,
+    name: model.displayName,
+    ...(model.mode === undefined ? {} : { mode: model.mode }),
+    ...(model.apiCompatibility === undefined ? {} : { compatibility: providerCompatibility(model.apiCompatibility) }),
+    reasoning: model.reasoning,
+    inputModalities: model.inputModalities.map(inputModality),
+    contextWindowTokens: numberValue(model.contextWindowTokens),
+    maximumOutputTokens: numberValue(model.maximumOutputTokens),
+    ...(model.inheritedFields.length === 0 ? {} : { inheritedFields: model.inheritedFields.map(providerModelInheritedField) }),
+    ...(model.contextWindowMaxTokens === undefined ? {} : { contextWindowMaxTokens: numberValue(model.contextWindowMaxTokens) }),
+    inputCostMicrosPerMillion: numberValueSigned(model.inputCostMicrosPerMillion),
+    outputCostMicrosPerMillion: numberValueSigned(model.outputCostMicrosPerMillion),
+    cacheReadCostMicrosPerMillion: numberValueSigned(model.cacheReadCostMicrosPerMillion),
+    cacheWriteCostMicrosPerMillion: numberValueSigned(model.cacheWriteCostMicrosPerMillion),
+    thinkingLevels: model.thinkingLevels.map((level) => ({ effortId: level.effortId, ...(level.nativeLevel === undefined ? {} : { nativeLevel: level.nativeLevel }) })),
+    ...(model.sampling === undefined ? {} : { sampling: {
+      ...(model.sampling.temperature === undefined ? {} : { temperature: model.sampling.temperature }),
+      ...(model.sampling.topP === undefined ? {} : { topP: model.sampling.topP }),
+      ...(model.sampling.topK === undefined ? {} : { topK: model.sampling.topK }),
+      ...(model.sampling.minP === undefined ? {} : { minP: model.sampling.minP }),
+      ...(model.sampling.repetitionPenalty === undefined ? {} : { repetitionPenalty: model.sampling.repetitionPenalty }),
+      ...(model.sampling.frequencyPenalty === undefined ? {} : { frequencyPenalty: model.sampling.frequencyPenalty }),
+      ...(model.sampling.presencePenalty === undefined ? {} : { presencePenalty: model.sampling.presencePenalty }),
+      ...(model.sampling.seed === undefined ? {} : { seed: numberValue(model.sampling.seed) })
+    } }),
+    ...(model.compatibility === undefined ? {} : { compatibilityOptions: {
+      ...(model.compatibility.supportsDeveloperRole === undefined ? {} : { supportsDeveloperRole: model.compatibility.supportsDeveloperRole }),
+      ...(model.compatibility.supportsReasoningEffort === undefined ? {} : { supportsReasoningEffort: model.compatibility.supportsReasoningEffort }),
+      ...(model.compatibility.supportsUsageInStreaming === undefined ? {} : { supportsUsageInStreaming: model.compatibility.supportsUsageInStreaming }),
+      ...(model.compatibility.supportsFinishReason === undefined ? {} : { supportsFinishReason: model.compatibility.supportsFinishReason }),
+      ...(model.compatibility.requiresReasoningContentOnAssistantMessages === undefined ? {} : { requiresReasoningContentOnAssistantMessages: model.compatibility.requiresReasoningContentOnAssistantMessages }),
+      ...(model.compatibility.supportsStore === undefined ? {} : { supportsStore: model.compatibility.supportsStore }),
+      ...(model.compatibility.supportsStrictMode === undefined ? {} : { supportsStrictMode: model.compatibility.supportsStrictMode }),
+      ...(model.compatibility.supportsOpenaiGrammarTools === undefined ? {} : { supportsOpenaiGrammarTools: model.compatibility.supportsOpenaiGrammarTools }),
+      ...(model.compatibility.supportsEagerToolInputStreaming === undefined ? {} : { supportsEagerToolInputStreaming: model.compatibility.supportsEagerToolInputStreaming }),
+      ...(model.compatibility.supportsLongCacheRetention === undefined ? {} : { supportsLongCacheRetention: model.compatibility.supportsLongCacheRetention }),
+      ...(model.compatibility.supportsCacheControlOnTools === undefined ? {} : { supportsCacheControlOnTools: model.compatibility.supportsCacheControlOnTools }),
+      ...(model.compatibility.supportsStrictTools === undefined ? {} : { supportsStrictTools: model.compatibility.supportsStrictTools }),
+      ...(model.compatibility.thinkingFormat === undefined ? {} : { thinkingFormat: model.compatibility.thinkingFormat }),
+      ...(model.compatibility.cacheControlFormat === undefined ? {} : { cacheControlFormat: model.compatibility.cacheControlFormat })
+    } }),
+    supportsFastMode: model.supportsFastMode,
+    ...(model.defaultVisible === undefined ? {} : { defaultVisible: model.defaultVisible }),
+    ...(model.supportsTools === undefined ? {} : { supportsTools: model.supportsTools })
   };
 }
 

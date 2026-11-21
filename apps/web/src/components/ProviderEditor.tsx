@@ -3,7 +3,8 @@ import { CirclePlus, Trash2 } from "lucide-react";
 import { capabilityNames } from "@joko/contracts";
 import type { AppController } from "../controller.js";
 import type { AppSnapshot, BackendView, ProviderCompatibilityView, ProviderConfigurationView, ProviderDraft, ProviderModelConfigurationView, ProviderRuntimeConfigurationView, ModelInputModalityView } from "../model.js";
-import { emptyProviderModel, emptyProviderRuntime, providerCompatibilityLabel, providerCredentialBindingsValid, providerEndpointOrigin, providerRequestPathValid, supportsProviderField, updateProviderModelMetadata } from "../provider-runtime-draft.js";
+import { emptyProviderModel, emptyProviderRuntime, providerCatalogEndpointValid, providerCompatibilityLabel, providerCredentialBindingsValid, providerEndpointOrigin, providerRequestPathValid, supportsProviderField, updateProviderModelMetadata } from "../provider-runtime-draft.js";
+import { finalizeProviderPresetEndpoint, providerPresetRuntime, supportsProviderPreset, updateProviderPresetEndpoint, type ProviderPreset } from "../provider-presets.js";
 import { randomUuid } from "../web-crypto.js";
 import type { Translator } from "./types.js";
 import { Button, CheckboxControl, ErrorBanner, IconButton, Modal, SelectControl, SwitchControl, cx } from "./ui.js";
@@ -13,20 +14,30 @@ import "./provider-editor.css";
 
 interface ProviderEditorProps {
   readonly open: boolean; readonly provider?: ProviderConfigurationView; readonly backends: readonly BackendView[];
+  readonly preset?: { readonly definition: ProviderPreset; readonly name: string };
   readonly credentials: AppSnapshot["settings"]["credentials"]; readonly providerIds: readonly string[];
   readonly saveCredential: AppController["saveCredential"]; readonly saveProvider: AppController["saveProvider"];
+  readonly previewProviderModels?: AppController["previewProviderModels"];
   readonly t: Translator; readonly onClose: () => void; readonly onBack?: () => void; readonly onSaved: () => void;
 }
 
-export function ProviderEditor({ open, provider, backends, credentials, providerIds, saveCredential, saveProvider, t, onClose, onBack, onSaved }: ProviderEditorProps): JSX.Element {
-  const available = backends.filter((backend) => backend.capabilities.get(capabilityNames.providerManagedCatalog)?.supported === true && (backend.providerRuntimeSupport?.protocols.length ?? 0) > 0);
-  const initial = (): ProviderDraft => provider === undefined
-    ? { id: "", name: "", kind: "customEndpoint", enabled: true, revision: 0n, runtimes: available[0] === undefined ? [] : [emptyProviderRuntime(available[0])] }
-    : { ...provider };
+export function ProviderEditor({ open, provider, preset, backends, credentials, providerIds, saveCredential, saveProvider, previewProviderModels, t, onClose, onBack, onSaved }: ProviderEditorProps): JSX.Element {
+  const newRuntime = (backend: BackendView): ProviderRuntimeConfigurationView | undefined =>
+    preset === undefined ? emptyProviderRuntime(backend) : providerPresetRuntime(preset.definition, backend);
+  const available = backends.filter((backend) => backend.capabilities.get(capabilityNames.providerManagedCatalog)?.supported === true
+    && (backend.providerRuntimeSupport?.protocols.length ?? 0) > 0 && (preset === undefined || supportsProviderPreset(preset.definition, backend)));
+  const initial = (): ProviderDraft => provider ?? {
+    id: preset === undefined ? "" : uniqueProviderId(preset.definition.id, providerIds),
+    name: preset?.name ?? "",
+    kind: "customEndpoint",
+    enabled: true,
+    revision: 0n,
+    runtimes: available[0] === undefined ? [] : [newRuntime(available[0])!]
+  };
   const [draft, setDraft] = useState<ProviderDraft>(initial);
   const [activeId, setActiveId] = useState(() => draft.runtimes[0]?.backendId ?? available[0]?.id ?? "");
   const [secrets, setSecrets] = useState<Readonly<Record<string, string>>>({});
-  const [idEdited, setIdEdited] = useState(provider !== undefined);
+  const [idEdited, setIdEdited] = useState(provider !== undefined || preset !== undefined);
   const [saving, setSaving] = useState(false);
   const [retired, setRetired] = useState(false);
   const [saveError, setSaveError] = useState<string>();
@@ -45,11 +56,11 @@ export function ProviderEditor({ open, provider, backends, credentials, provider
     if (previousApi.current !== api && open) { setRetired(true); setSecrets({}); setTransfer(undefined); setSaveError(t("settings.customProvider.connectionChanged")); }
     previousApi.current = api;
     return () => { owner.abort.abort(); if (scope.current === owner) scope.current = undefined; };
-  }, [api, open, provider?.id]);
+  }, [api, open, provider?.id, preset?.definition.id]);
   useEffect(() => {
     const next = initial(); setDraft(next); setActiveId(next.runtimes[0]?.backendId ?? available[0]?.id ?? "");
-    setSecrets({}); setIdEdited(provider !== undefined); setRetired(false); setSaveError(undefined); setTransfer(undefined);
-  }, [open, provider?.id]);
+    setSecrets({}); setIdEdited(provider !== undefined || preset !== undefined); setRetired(false); setSaveError(undefined); setTransfer(undefined);
+  }, [open, provider?.id, preset?.definition.id]);
   const backend = available.find((item) => item.id === activeId);
   const runtime = draft.runtimes.find((item) => item.backendId === activeId);
   const updateRuntime: Dispatch<SetStateAction<ProviderRuntimeConfigurationView>> = (update) => setDraft((current) => ({ ...current,
@@ -61,7 +72,7 @@ export function ProviderEditor({ open, provider, backends, credentials, provider
     const owner = available.find((item) => item.id === value.backendId);
     const origin = providerEndpointOrigin(value.endpoint);
     return owner !== undefined && owner.providerRuntimeSupport!.protocols.includes(value.compatibility)
-      && origin !== undefined && providerRequestPathValid(value.requestPath) && (!value.modelsEndpoint || providerEndpointOrigin(value.modelsEndpoint) === origin)
+      && origin !== undefined && providerRequestPathValid(value.requestPath) && providerCatalogEndpointValid(value.endpoint, value.modelsEndpoint)
       && value.models.length > 0 && new Set(value.models.map((model) => model.modelId.trim())).size === value.models.length
       && value.models.every((model) => model.modelId.trim() && model.name.trim() && model.inputModalities.length > 0
         && model.inputModalities.every((modality) => modality === "text" || modality === "image")
@@ -78,7 +89,10 @@ export function ProviderEditor({ open, provider, backends, credentials, provider
     if (!valid || retired || owner === undefined || owner.pending || owner.abort.signal.aborted) return;
     owner.pending = true; setSaving(true); setSaveError(undefined); setTransfer(undefined);
     const current = (): boolean => scope.current === owner && !owner.abort.signal.aborted;
-    let prepared: ProviderDraft = { ...draft, id: draft.id.trim(), name: draft.name.trim() };
+    let prepared: ProviderDraft = {
+      ...draft, id: draft.id.trim(), name: draft.name.trim(),
+      runtimes: preset === undefined ? draft.runtimes : draft.runtimes.map(runtime => finalizeProviderPresetEndpoint(preset.definition, runtime))
+    };
     let credentialSaved = false;
     try {
       for (const value of prepared.runtimes) {
@@ -102,12 +116,13 @@ export function ProviderEditor({ open, provider, backends, credentials, provider
   const unavailable = draft.runtimes.filter((value) => !available.some((item) => item.id === value.backendId));
   const credentialMismatch = runtime !== undefined && !!(runtime.credentialId || runtime.headers.length) && runtime.credentialOrigin !== providerEndpointOrigin(runtime.endpoint);
   return <>
-    <Modal open={open} title={provider === undefined ? t("settings.customProvider.addTitle") : t("settings.editProvider", { name: provider.name })} size="large" className="provider-editor-modal" onClose={onClose}
+    <Modal open={open} title={provider !== undefined ? t("settings.editProvider", { name: provider.name }) : preset === undefined
+      ? t("settings.customProvider.addTitle") : t("settings.providerWizard.titleWith", { name: preset.name })} size="large" className="provider-editor-modal" onClose={onClose}
       headerLeading={<ProviderFlowBackButton onBack={onBack ?? onClose} t={t} />}>
       <form className="settings-form provider-editor provider-editor--guided" aria-busy={saving} onSubmit={(event) => { event.preventDefault(); void submit(); }}>
         {saveError && <ErrorBanner message={saveError} />}
         <fieldset className="provider-editor__fields" disabled={saving || retired}>
-          <p>{t("settings.customProvider.description")}</p>
+          <p>{preset === undefined ? t("settings.customProvider.description") : <a href={preset.definition.docsUrl} target="_blank" rel="noreferrer">{t("settings.providerWizard.providerDocs")}</a>}</p>
           <label className="field"><span>{t("settings.displayName")}</span><input required value={draft.name} onChange={(event) => { const name = event.target.value;
             setDraft((value) => ({ ...value, name, ...(provider === undefined && !idEdited ? { id: uniqueProviderId(name, providerIds) } : {}) })); }} placeholder={t("settings.customProvider.namePlaceholder")} /></label>
           <div className="provider-editor__segments" role="tablist" aria-label={t("settings.customProvider.runtime")} onKeyDown={(event) => {
@@ -121,13 +136,19 @@ export function ProviderEditor({ open, provider, backends, credentials, provider
           {available.length === 0 && <p>{t("settings.customProvider.runtimeUnavailable")}</p>}
           {unavailable.map((value) => <div className="setting-row" key={value.backendId}><p>{t("settings.runtimeEditor.unavailable", { runtime: backends.find((item) => item.id === value.backendId)?.name ?? value.backendId })}</p>
             <Button onClick={() => setDraft((current) => ({ ...current, runtimes: current.runtimes.filter((item) => item.backendId !== value.backendId) }))}>{t("common.remove")}</Button></div>)}
-          {backend !== undefined && runtime === undefined && <Button onClick={() => setDraft((current) => ({ ...current, runtimes: [...current.runtimes, emptyProviderRuntime(backend)] }))}>{t("settings.runtimeEditor.configure", { runtime: backend.name })}</Button>}
+          {backend !== undefined && runtime === undefined && <Button onClick={() => {
+            const configured = newRuntime(backend);
+            if (configured !== undefined) setDraft((current) => ({ ...current, runtimes: [...current.runtimes, configured] }));
+          }}>{t("settings.runtimeEditor.configure", { runtime: backend.name })}</Button>}
           {backend !== undefined && runtime !== undefined && <section role="tabpanel" aria-label={backend.name}>
             <div className="provider-editor__models-heading"><p>{t("settings.runtimeEditor.independent")}</p><Button disabled={available.length < 2} onClick={() => setTransfer({ draft, backendId: activeId, descriptorKey, secrets, savedRevision: provider?.revision })}>{t("settings.runtimeTransfer.open")}</Button>
               <Button onClick={() => { setDraft((current) => ({ ...current, runtimes: current.runtimes.filter((item) => item.backendId !== activeId) })); setSecret(""); }}>{t("settings.runtimeEditor.remove")}</Button></div>
             <label className="field"><span>{t("settings.customProvider.protocol")}</span><SelectControl value={runtime.compatibility} onChange={(event) => updateRuntime((value) => ({ ...value, compatibility: event.target.value as ProviderCompatibilityView,
               authHeader: supportsProviderField(backend, "authHeader") && event.target.value !== "anthropic" }))}>{providerCompatibilityOptions(backend)}</SelectControl></label>
-            <label className="field"><span>{t("settings.customProvider.baseUrl")}</span><input required type="url" value={runtime.endpoint} onChange={(event) => updateRuntime((value) => ({ ...value, endpoint: event.target.value }))} placeholder="https://api.example.com/v1" /><small>{t("settings.endpointSafety")}</small></label>
+            <label className="field"><span>{t("settings.customProvider.baseUrl")}</span><input required type="url" value={runtime.endpoint} onChange={(event) => {
+              const endpoint = event.target.value;
+              updateRuntime((value) => preset === undefined ? { ...value, endpoint } : updateProviderPresetEndpoint(preset.definition, value, backend, endpoint));
+            }} placeholder="https://api.example.com/v1" /><small>{t("settings.endpointSafety")}</small></label>
             {supportsProviderField(backend, "requestPath") && <label className="field"><span>{t("settings.runtimeEditor.requestPath")}</span><input value={runtime.requestPath ?? ""} placeholder="/responses" onChange={(event) => updateRuntime((value) => ({ ...value, requestPath: event.target.value || undefined }))} /></label>}
             {supportsProviderField(backend, "modelsEndpoint") && <label className="field"><span>{t("settings.runtimeEditor.modelsEndpoint")}</span><input type="url" value={runtime.modelsEndpoint ?? ""} onChange={(event) => updateRuntime((value) => ({ ...value, modelsEndpoint: event.target.value || undefined }))} /><small>{t("settings.runtimeEditor.sameOrigin")}</small></label>}
             <div className="provider-editor__segments" role="group" aria-label={t("settings.customProvider.authentication")}>
@@ -148,6 +169,9 @@ export function ProviderEditor({ open, provider, backends, credentials, provider
               <Button onClick={() => updateRuntime((value) => ({ ...value, credentialId: "", environmentName: "", credentialOrigin: "", headers: [] }))}>{t("settings.runtimeEditor.clearCredentials")}</Button></div>}
             {!credentialsValid(runtime) && <p role="alert">{t("settings.runtimeEditor.credentialConflict")}</p>}
             {supportsProviderField(backend, "headers") && <ProviderHeaderFields runtime={runtime} credentials={credentials} setRuntime={updateRuntime} t={t} />}
+            {open && previewProviderModels !== undefined && <ProviderModelPreview key={activeId} backend={backend}
+              runtime={preset === undefined ? runtime : finalizeProviderPresetEndpoint(preset.definition, runtime)}
+              secret={secrets[activeId]?.trim() ?? ""} preview={previewProviderModels} updateRuntime={updateRuntime} t={t} />}
             <ProviderRuntimeModels draft={runtime} setDraft={updateRuntime} backend={backend} t={t} />
           </section>}
           <details className="provider-editor__advanced"><summary>{t("settings.customProvider.advancedProvider")}</summary>
@@ -168,6 +192,78 @@ export function ProviderEditor({ open, provider, backends, credentials, provider
         setTransfer(undefined);
       }} />}
   </>;
+}
+
+function ProviderModelPreview({ backend, runtime, secret, preview, updateRuntime, t }: {
+  readonly backend: BackendView;
+  readonly runtime: ProviderRuntimeConfigurationView;
+  readonly secret: string;
+  readonly preview: NonNullable<AppController["previewProviderModels"]>;
+  readonly updateRuntime: Dispatch<SetStateAction<ProviderRuntimeConfigurationView>>;
+  readonly t: Translator;
+}): JSX.Element {
+  const [models, setModels] = useState<readonly ProviderModelConfigurationView[]>();
+  const [pending, setPending] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const [query, setQuery] = useState("");
+  const [visible, setVisible] = useState(60);
+  const request = useRef<AbortController | undefined>(undefined);
+  const origin = providerEndpointOrigin(runtime.endpoint);
+  const route = JSON.stringify([backend.instanceGeneration, runtime.compatibility, runtime.endpoint, runtime.modelsEndpoint, runtime.keyless,
+    runtime.credentialId, runtime.credentialOrigin, runtime.headers]);
+  useEffect(() => {
+    setModels(undefined); setFailed(false); setPending(false); setQuery(""); setVisible(60);
+    return () => { request.current?.abort(); request.current = undefined; };
+  }, [preview, route, secret]);
+  const allowed = origin !== undefined && providerCatalogEndpointValid(runtime.endpoint, runtime.modelsEndpoint) && runtime.headers.length === 0
+    && (runtime.keyless ? origin.startsWith("http://") : !!secret || !!runtime.credentialId && runtime.credentialOrigin === origin);
+  const load = async (): Promise<void> => {
+    if (!allowed || request.current !== undefined) return;
+    const owner = new AbortController();
+    request.current = owner;
+    setPending(true); setFailed(false);
+    try { const result = await preview(runtime, secret, owner.signal); if (!owner.signal.aborted) setModels(result); }
+    catch { if (!owner.signal.aborted) setFailed(true); }
+    finally {
+      if (request.current === owner) { request.current = undefined; setPending(false); }
+    }
+  };
+  const toggle = (model: ProviderModelConfigurationView, checked: boolean): void => {
+    const defaults = emptyProviderModel(backend);
+    const thinking = supportsProviderField(backend, "modelThinkingLevels");
+    const candidate: ProviderModelConfigurationView = {
+      ...defaults,
+      modelId: model.modelId,
+      name: model.name,
+      mode: model.mode,
+      supportsTools: model.supportsTools,
+      inputModalities: supportsProviderField(backend, "modelInputModalities") && model.inputModalities.includes("image") ? ["text", "image"] : ["text"],
+      contextWindowTokens: supportsProviderField(backend, "modelLimits") ? model.contextWindowTokens || defaults.contextWindowTokens : 0,
+      maximumOutputTokens: supportsProviderField(backend, "modelLimits") ? model.maximumOutputTokens || defaults.maximumOutputTokens : 0,
+      reasoning: thinking && model.reasoning,
+      thinkingLevels: thinking ? model.thinkingLevels : [],
+      supportsFastMode: supportsProviderField(backend, "modelFastMode") && model.supportsFastMode
+    };
+    updateRuntime(value => ({ ...value, models: checked
+      ? [...value.models.filter(item => item.modelId !== candidate.modelId && (item.modelId || item.name)), candidate]
+      : value.models.filter(item => item.modelId !== candidate.modelId) }));
+  };
+  const search = query.trim().toLocaleLowerCase();
+  const filtered = models?.filter(model => [model.name, model.modelId].some(value => value.toLocaleLowerCase().includes(search)));
+  return <section className="provider-editor__section provider-model-preview" aria-busy={pending}>
+    <Button disabled={!allowed || pending} onClick={() => { void load(); }}>{pending ? t("common.loading") : t("settings.providerWizard.discoverModels")}</Button>
+    {failed && <ErrorBanner message={t("settings.providerWizard.discoveryFailed")} />}
+    {models !== undefined && <>
+      {models.length > 0 && <label className="field"><span>{t("settings.providerWizard.searchDiscoveredModels")}</span><input
+        value={query} onChange={(event) => { setQuery(event.target.value); setVisible(60); }} /></label>}
+      {filtered?.length === 0 && <p role="status">{t("settings.providerWizard.noDiscoveredModels")}</p>}
+      <div className="provider-model-preview__results">{filtered?.slice(0, visible).map(model => <label key={model.modelId}>
+        <CheckboxControl checked={runtime.models.some(item => item.modelId === model.modelId)} onChange={event => toggle(model, event.target.checked)} />
+        <span>{model.name}{model.name !== model.modelId && <small>{model.modelId}</small>}</span>
+      </label>)}</div>
+      {(filtered?.length ?? 0) > visible && <Button onClick={() => setVisible(current => current + 60)}>{t("settings.providerWizard.moreModels")}</Button>}
+    </>}
+  </section>;
 }
 
 function ProviderHeaderFields({ runtime, setRuntime, credentials, t }: { readonly runtime: ProviderRuntimeConfigurationView;

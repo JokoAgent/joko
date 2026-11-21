@@ -198,7 +198,8 @@ import type {
   ProviderDescriptor as NativeProviderDescriptor,
   ProviderLoginFlow as NativeProviderLoginFlow
 } from "./credential-manager.js";
-import { ProviderAuthUnsupportedError, type ProviderModelWithdrawalReview } from "./credential-manager.js";
+import { discoveredManagedModel, ProviderAuthUnsupportedError, type ProviderModelWithdrawalReview } from "./credential-manager.js";
+import { fetchProviderModels, ProviderModelDiscoveryError, safeDiscoveryBaseUrl } from "./provider-model-discovery.js";
 import type { DiagnosticsBundleService } from "./diagnostics-bundle.js";
 import type {
   ExtensionCatalogDescriptor as NativeExtensionCatalogDescriptor,
@@ -4392,6 +4393,15 @@ export function createConnectServices(application: OrchestratorApplication, proj
   } satisfies ServiceImpl<typeof contract.HistoryMaintenanceService>;
 
   const credential = {
+    beginProviderModelPreviewUpload: (request, context) => {
+      const connection = authenticate(context);
+      if (dependencies.credentials === undefined) throw new ConnectError("Provider credentials are unavailable.", Code.FailedPrecondition);
+      const { purpose } = providerModelPreviewRoute(dependencies, request);
+      const ticket = dependencies.credentials.createUploadTicket({ kind: "api_key", connectionId: connection.id, servicePurpose: purpose });
+      return { ticket: { ticketId: ticket.credentialUploadTicketId,
+        relativeEndpoint: `/v1/credentials/upload/${encodeURIComponent(ticket.credentialUploadTicketId)}`,
+        expiresAt: toProtoTimestamp(ticket.expiresAt), maximumBytes: BigInt(ticket.maximumBytes) } };
+    },
     beginCredentialUpload: (request, context) => {
       const connection = authenticate(context);
       if (dependencies.credentials === undefined) return {};
@@ -4674,6 +4684,45 @@ export function createConnectServices(application: OrchestratorApplication, proj
       authenticate(context);
       await refreshNativeMemoryStatuses(dependencies, context.signal);
       return { settings: settingsSnapshot(dependencies) };
+    },
+    previewProviderModels: async (request, context) => {
+      const connection = authenticate(context);
+      const { backend, api, endpoint, modelsEndpoint, purpose } = providerModelPreviewRoute(dependencies, request.route);
+      const credentials = dependencies.credentials;
+      const auth = request.authentication;
+      let apiKey: string | undefined;
+      let saved: NativeCredentialDescriptor | undefined;
+      if (auth.case === "credentialUploadTicketId" && credentials !== undefined) {
+        try { apiKey = credentials.consumeServiceInput({ credentialUploadTicketId: auth.value, connectionId: connection.id, servicePurpose: purpose, kind: "api_key" }); }
+        catch { throw new ConnectError("The Provider preview key does not match this connection and route.", Code.FailedPrecondition); }
+      } else if (auth.case === "savedCredential" && credentials !== undefined) {
+        reserveAllProviderCredentialSurfaces(dependencies);
+        saved = credentials.list({ kind: "api_key" }).find(item => item.credentialReferenceId === auth.value.credentialReferenceId);
+        if (!saved?.configured || auth.value.credentialOrigin !== endpoint.origin) throw new ConnectError("The saved API key is unavailable for this origin.", Code.FailedPrecondition);
+        apiKey = credentials.resolve(saved.credentialReferenceId);
+      } else if (auth.case !== "keyless" || auth.value !== true || !backend.providerRuntimeSupport?.fields.includes("keyless") || endpoint.protocol !== "http:") {
+        throw invalidArgument("An authorized API key or a keyless loopback endpoint is required.");
+      }
+      dependencies.connections.fence(connection);
+      context.signal.throwIfAborted();
+      try {
+        const models = await fetchProviderModels({ baseUrl: endpoint.toString(), modelsEndpoint, api, apiKey, signal: context.signal });
+        dependencies.connections.fence(connection);
+        context.signal.throwIfAborted();
+        if (dependencies.store.getBackend(backend.id).descriptor.instanceGeneration !== backend.instanceGeneration) {
+          throw new ConnectError("The Provider runtime changed during the catalog preview.", Code.FailedPrecondition);
+        }
+        if (saved !== undefined && credentials?.find(saved.credentialReferenceId)?.generation !== saved.generation) {
+          throw new ConnectError("The saved API key changed during the catalog preview.", Code.FailedPrecondition);
+        }
+        return { models: models
+          .filter(model => (model.metadata?.nativeApi === undefined || model.metadata.nativeApi === api)
+            && (!apiKey || apiKey.length < 8 || ![model.id, model.name, model.metadata?.name].some(value => value?.includes(apiKey!))))
+          .map(model => discoveredManagedModel(model, api)).filter(isManagedChatModel).map(mapProviderModelConfiguration) };
+      } catch (error) {
+        if (!(error instanceof ProviderModelDiscoveryError)) throw error;
+        throw new ConnectError(error.message, error.code === "unauthorized" ? Code.FailedPrecondition : Code.Unavailable);
+      }
     }
   } satisfies ServiceImpl<typeof contract.SettingsService>;
 
@@ -10680,6 +10729,29 @@ function mapProviderModelConfiguration(item: PiManagedModel): contract.ProviderM
       cacheControlFormat: optionalStringValue(compat["cacheControlFormat"])
     })
   });
+}
+
+function providerModelPreviewRoute(dependencies: ConnectServiceDependencies, route: contract.ProviderModelPreviewRoute | undefined) {
+  if (dependencies.providers === undefined) throw new ConnectError("The managed Provider catalog is unavailable.", Code.FailedPrecondition);
+  if (route === undefined) throw invalidArgument("A Provider runtime route is required.");
+  const backendId = nonBlankRequest(route.backendId, "backend_id");
+  const backend = dependencies.store.getBackend(backendId).descriptor;
+  const api = nativeProviderApi(route.apiCompatibility, false)!;
+  const support = backend.providerRuntimeSupport;
+  if (backend.capabilities.get("provider.managed_catalog")?.supported !== true || !support?.protocols.includes(api)) {
+    throw invalidArgument("Provider runtime does not support the selected protocol.");
+  }
+  const endpoint = safeDiscoveryBaseUrl(route.endpoint);
+  if (endpoint === undefined || endpoint.search || route.endpoint.length > 2048) throw invalidArgument("The Provider endpoint is invalid.");
+  let modelsEndpoint: string | undefined;
+  if (route.modelsEndpoint !== undefined) {
+    if (!support.fields.includes("models_endpoint") || route.modelsEndpoint.length > 2048) throw invalidArgument("The Provider catalog endpoint is unavailable.");
+    const catalog = safeDiscoveryBaseUrl(route.modelsEndpoint);
+    if (catalog === undefined || !contract.sameOriginProviderCatalogEndpoint(endpoint, catalog)) throw invalidArgument("The Provider catalog endpoint must match its inference origin.");
+    modelsEndpoint = catalog.toString();
+  }
+  const purpose = "provider-model-preview:" + createHash("sha256").update(JSON.stringify([backendId, backend.instanceGeneration, api, endpoint.toString(), modelsEndpoint])).digest("hex");
+  return { backend, api, endpoint, modelsEndpoint, purpose };
 }
 
 function assertProviderRuntimeSupport(dependencies: ConnectServiceDependencies, entry: Parameters<ProviderCatalogManager["upsertConfiguration"]>[0]): void {

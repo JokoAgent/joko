@@ -38,6 +38,65 @@ afterEach(async () => {
 });
 
 describe("ProviderSettings model visibility", () => {
+  it("opens presets from a clean search and saves a model discovered at the edited self-hosted endpoint", async () => {
+    const base = emptySnapshot();
+    const backends: BackendView[] = [
+      { id: "claude-code", name: "Claude Code", version: "1", health: "healthy",
+        capabilities: new Map([["provider.managed_catalog", { name: "provider.managed_catalog", supported: true }]]),
+        providerRuntimeSupport: { protocols: ["anthropic", "openaiResponses"], fields: ["modelsEndpoint"] } },
+      { id: "codex", name: "Codex", version: "1", health: "healthy",
+        capabilities: new Map([["provider.managed_catalog", { name: "provider.managed_catalog", supported: true }]]),
+        providerRuntimeSupport: { protocols: ["openaiResponses", "openaiCompletions"], fields: ["modelsEndpoint", "modelInputModalities"] } }
+    ];
+    const snapshot = { ...base, backends };
+    const saveProvider = vi.fn<AppController["saveProvider"]>(async () => undefined);
+    const saveCredential = vi.fn<AppController["saveCredential"]>(async () => undefined);
+    const previewProviderModels = vi.fn<NonNullable<AppController["previewProviderModels"]>>(async () => [configuredModel("discovered-model", "Discovered model")]);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    roots.push(root);
+    await act(async () => root.render(<ProviderSettings controller={{ ...controllerFor(snapshot), saveProvider, saveCredential, previewProviderModels }}
+      snapshot={snapshot} runAction={() => undefined} t={(key, values) => translate("en", key, values)} />));
+    const searchFor = async (query: string) => {
+      const search = required(document.body.querySelector<HTMLInputElement>('input[aria-label="Search providers…"]'));
+      await setControlValue(search, query);
+      return [...document.body.querySelectorAll<HTMLButtonElement>(".provider-add-wizard__catalog button")];
+    };
+    const open = required(container.querySelector<HTMLButtonElement>(".provider-master__footer button"));
+    await act(async () => open.click());
+    const opencode = (await searchFor("OpenCode Go")).find(button => button.textContent?.includes("OpenCode Go"));
+    await act(async () => required(opencode).click());
+    const endpoint = () => required(document.body.querySelector<HTMLInputElement>('.provider-editor [role="tabpanel"] input[type="url"]'));
+    expect(endpoint().value).toBe("https://opencode.ai/zen/go");
+    const codex = [...document.body.querySelectorAll<HTMLButtonElement>('.provider-editor [role="tab"]')].find(tab => tab.textContent === "Codex");
+    await act(async () => required(codex).click());
+    const configure = [...document.body.querySelectorAll<HTMLButtonElement>(".provider-editor button")].find(button => button.textContent === "Configure Codex");
+    await act(async () => required(configure).click());
+    expect(endpoint().value).toBe("https://opencode.ai/zen/go/v1");
+    const back = required(document.body.querySelector<HTMLButtonElement>('.provider-editor-modal .modal__header button[aria-label="Back"]'));
+    await act(async () => back.click());
+    const sub2api = (await searchFor("Sub2API")).find(button => button.textContent?.includes("Sub2API"));
+    await act(async () => required(sub2api).click());
+    await setControlValue(endpoint(), "https://gateway.example.test/custom");
+    await setControlValue(required(document.body.querySelector<HTMLInputElement>('.provider-editor input[type="password"]')), "test-provider-key");
+    const list = [...document.body.querySelectorAll<HTMLButtonElement>(".provider-editor button")].find(button => button.textContent === "List available models");
+    await act(async () => required(list).click());
+    expect(previewProviderModels).toHaveBeenCalledWith(expect.objectContaining({
+      backendId: "claude-code", compatibility: "openaiResponses", endpoint: "https://gateway.example.test/custom/v1",
+      modelsEndpoint: "https://gateway.example.test/custom/v1/models?client_version=0.147.0"
+    }), "test-provider-key", expect.any(AbortSignal));
+    expect(saveCredential).not.toHaveBeenCalled();
+    const model = required(document.body.querySelector<HTMLInputElement>('.provider-model-preview__results input[type="checkbox"]'));
+    await act(async () => model.click());
+    const save = required(document.body.querySelector<HTMLButtonElement>('.provider-editor button[type="submit"]'));
+    await act(async () => save.click());
+    expect(saveProvider).toHaveBeenCalledWith(expect.objectContaining({ id: "sub2api", runtimes: [expect.objectContaining({
+      endpoint: "https://gateway.example.test/custom/v1", credentialOrigin: "https://gateway.example.test",
+      models: [expect.objectContaining({ modelId: "discovered-model" })]
+    })] }), expect.any(AbortSignal));
+  });
+
   it("keeps authenticated backend-native Provider entries separate when Provider IDs overlap", () => {
     const base = emptySnapshot();
     const configuration = provider("shared", "Shared account", { enabled: false, runtimes: [runtimeConfiguration({ keyless: false })] });
@@ -1627,6 +1686,7 @@ function controllerFor(snapshot: ReturnType<typeof emptySnapshot>): AppControlle
     state: {
       activeProfile: { id: "profile-one", serverId: "orchestrator-one", name: "Orchestrator", origin: "https://orchestrator.invalid" },
       preferences: { locale: "en" },
+      effectiveLocale: "en",
       snapshot
     }
   } as unknown as AppController;

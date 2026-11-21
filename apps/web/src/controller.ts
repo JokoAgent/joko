@@ -3688,6 +3688,13 @@ export function useAppController(): AppController {
     }
     return artifactGateway.saveProvider(draft, signal);
   }, [artifactGateway, linkGatewayGeneration]);
+  const previewProviderModels = useCallback<NonNullable<AppController["previewProviderModels"]>>(async (runtime, secret, signal) => {
+    if (artifactGateway === undefined || gatewayRef.current !== artifactGateway
+      || gatewayGenerationRef.current !== linkGatewayGeneration || connectionStateRef.current !== "connected") {
+      throw new Error("The Provider configuration connection is no longer current.");
+    }
+    return artifactGateway.previewProviderModels(runtime, secret, signal);
+  }, [artifactGateway, linkGatewayGeneration]);
   const getCollaborationDirectory = useCallback<AppController["getCollaborationDirectory"]>(async (signal) => {
     signal?.throwIfAborted();
     if (artifactGateway === undefined || gatewayRef.current !== artifactGateway
@@ -4381,6 +4388,7 @@ export function useAppController(): AppController {
     taskActivity,
     logoutConnection,
     saveProvider,
+    previewProviderModels,
     deleteProvider: (providerId) => gateway().deleteProvider(providerId),
     refreshProviderModels: (backendId, providerId, automatic) => gateway().refreshProviderModels(backendId, providerId, automatic),
     confirmProviderModelWithdrawals: (review, modelIds, operationId) => gateway().confirmProviderModelWithdrawals(review, modelIds, operationId),
@@ -4751,7 +4759,7 @@ export function useAppController(): AppController {
     openArtifactFile,
     openArtifactFileWithApplication,
     revealArtifactSource
-}), [portableImportApi, catalogGateway, taskGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, readPendingMessageFork, forkMessage, messageEditDrafts, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, downloadWorkspaceDirectory, exportSession, exportPortableSession, getArtifactUrl, acquireArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, readTaskProviderGroupUsage, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setTerminalFamily, setTerminalSize, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
+}), [portableImportApi, catalogGateway, taskGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, previewProviderModels, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, readPendingMessageFork, forkMessage, messageEditDrafts, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, downloadWorkspaceDirectory, exportSession, exportPortableSession, getArtifactUrl, acquireArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, readTaskProviderGroupUsage, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setTerminalFamily, setTerminalSize, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {

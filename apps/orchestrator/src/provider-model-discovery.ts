@@ -1,4 +1,5 @@
 import type { PiManagedModel } from "@joko/adapter-pi";
+import { sameOriginProviderCatalogEndpoint } from "@joko/contracts";
 
 export interface DiscoveredProviderModel {
   readonly id: string;
@@ -32,6 +33,7 @@ export interface ProviderModelDiscoverySpec {
   readonly headers?: Readonly<Record<string, string>>;
   /** Retain purpose facts for speech configuration and capability withdrawals. */
   readonly includeNonChat?: boolean;
+  readonly signal?: AbortSignal;
 }
 
 export type ProviderModelDiscoveryErrorCode =
@@ -241,12 +243,13 @@ export async function fetchProviderModelCatalog(
   let endpoint: URL;
   try {
     endpoint = spec.modelsEndpoint === undefined ? new URL(deriveProviderModelsUrl(baseUrl.toString(), spec.api)) : new URL(spec.modelsEndpoint);
-    if (endpoint.origin !== baseUrl.origin || endpoint.username !== "" || endpoint.password !== "" || endpoint.hash !== "" || endpoint.search !== "") throw new Error("Model catalog authority differs.");
+    if (!sameOriginProviderCatalogEndpoint(baseUrl, endpoint)) throw new Error("Model catalog authority differs.");
   } catch {
     throw new ProviderModelDiscoveryError("unavailable");
   }
   const sourceUrl = endpoint.toString();
-  const signal = AbortSignal.timeout(DISCOVERY_TIMEOUT_MS);
+  const timeout = AbortSignal.timeout(DISCOVERY_TIMEOUT_MS);
+  const signal = spec.signal === undefined ? timeout : AbortSignal.any([spec.signal, timeout]);
   const { value: first, hasNextLink } = await fetchModelPage(sourceUrl, headers, signal, fetchImpl);
   const listedIds = new Set<string>();
   let validListing = true;
@@ -400,7 +403,7 @@ function discoveryHeaders(spec: ProviderModelDiscoverySpec): Record<string, stri
   return result;
 }
 
-function safeDiscoveryBaseUrl(raw: string): URL | undefined {
+export function safeDiscoveryBaseUrl(raw: string): URL | undefined {
   let url: URL;
   try {
     url = new URL(raw);

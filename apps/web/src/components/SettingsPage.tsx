@@ -68,6 +68,7 @@ import { ProviderSharingOwnerSettings } from "./ProviderSharingOwnerSettings.js"
 import { ProviderGroupOwnerSettings } from "./ProviderGroupOwnerSettings.js";
 import { ProviderMark } from "./ProviderMark.js";
 import { ProviderEditor } from "./ProviderEditor.js";
+import { providerPresetMatches, providerPresetName, providerPresets, supportsProviderPreset, type ProviderPreset } from "../provider-presets.js";
 import { ProviderFlowBackButton, ProviderFlowFooter, ProviderWizardProgress } from "./ProviderFlow.js";
 import { AppShortcutsSettings } from "./AppShortcutsSettings.js";
 import { GamepadSettings } from "./GamepadSettings.js";
@@ -3471,7 +3472,9 @@ function permissionModeLabel(mode: PermissionMode, t: Translator): string {
 }
 
 export function ProviderSettings({ controller, snapshot, runAction, onSuccess, initialView, t }: { readonly controller: AppController; readonly snapshot: AppSnapshot; readonly runAction: RunAction; readonly onSuccess?: (text: string) => void; readonly initialView?: "credentials" | "usage"; readonly t: Translator }): JSX.Element {
-  const [editor, setEditor] = useState<ProviderConfigurationView | "new">();
+  const [editor, setEditor] = useState<ProviderConfigurationView | { readonly definition: ProviderPreset; readonly name: string } | "new">();
+  const presetEditor = typeof editor === "object" && "definition" in editor ? editor : undefined;
+  const configurationEditor = typeof editor === "object" && "runtimes" in editor ? editor : undefined;
   const [addWizardOpen, setAddWizardOpen] = useState(false);
   const [runtimeOnboardingId, setRuntimeOnboardingId] = useState<string>();
   const [runtimeAddError, setRuntimeAddError] = useState(false);
@@ -3512,6 +3515,10 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
   const configuredProviders = providerCatalog.configured;
   const availableProviders = providerCatalog.available;
   const detectedProviders = providerCatalog.detected;
+  const availablePresets = useMemo(
+    () => providerPresets.filter(preset => snapshot.backends.some(backend => supportsProviderPreset(preset, backend))),
+    [snapshot.backends]
+  );
   const availableModelRuntimes = useMemo(
     () => snapshot.managedModelRuntimes ?? [],
     [snapshot.managedModelRuntimes]
@@ -3829,8 +3836,17 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
         </> : <div className="provider-detail-empty provider-detail-empty--page"><Server aria-hidden="true" /><strong>{t("settings.noProviders")}</strong><span>{t("settings.providerEmptyBody")}</span><Button tone="primary" onClick={() => setAddWizardOpen(true)}>{t("settings.addProvider")}</Button></div>}
       </div>
     </section>
-    <ProviderAddWizard open={addWizardOpen} providers={availableProviders} runtimes={availableModelRuntimes} runtimePending={runtimeAdding} runtimeError={runtimeAddError} t={t} onClose={() => { runtimeAddRequest.current = undefined; runtimeAddPending.current = false; setRuntimeAdding(false); setAddWizardOpen(false); }} onChoose={(entry) => { setAddWizardOpen(false); selectProviderItem(`provider:${entry.id}`); setLoginFromAddWizard(true); setLoginTarget(entry); }} onChooseRuntime={chooseManagedRuntime} onCustom={() => { setAddWizardOpen(false); setEditor("new"); }} />
-    <ProviderEditor open={editor !== undefined} provider={editor === "new" ? undefined : editor} credentials={snapshot.settings.credentials} providerIds={providers.map((item) => item.id)} backends={snapshot.backends} saveCredential={controller.saveCredential} saveProvider={controller.saveProvider} t={t} onClose={() => setEditor(undefined)} onBack={editor === "new" ? () => { setEditor(undefined); setAddWizardOpen(true); } : undefined} onSaved={() => setEditor(undefined)} />
+    <ProviderAddWizard open={addWizardOpen} providers={availableProviders} presets={availablePresets} locale={controller.state.effectiveLocale}
+      runtimes={availableModelRuntimes} runtimePending={runtimeAdding} runtimeError={runtimeAddError} t={t}
+      onClose={() => { runtimeAddRequest.current = undefined; runtimeAddPending.current = false; setRuntimeAdding(false); setAddWizardOpen(false); }}
+      onChoose={(entry) => { setAddWizardOpen(false); selectProviderItem(`provider:${entry.id}`); setLoginFromAddWizard(true); setLoginTarget(entry); }}
+      onChoosePreset={(definition, name) => { setAddWizardOpen(false); setEditor({ definition, name }); }}
+      onChooseRuntime={chooseManagedRuntime} onCustom={() => { setAddWizardOpen(false); setEditor("new"); }} />
+    <ProviderEditor open={editor !== undefined} provider={configurationEditor} preset={presetEditor}
+      credentials={snapshot.settings.credentials} providerIds={[...providers.map(item => item.id), ...snapshot.providers.map(item => item.id)]}
+      backends={snapshot.backends} saveCredential={controller.saveCredential} saveProvider={controller.saveProvider} previewProviderModels={controller.previewProviderModels} t={t}
+      onClose={() => setEditor(undefined)} onBack={configurationEditor === undefined ? () => { setEditor(undefined); setAddWizardOpen(true); } : undefined}
+      onSaved={() => setEditor(undefined)} />
     <Modal
       open={runtimeOnboardingId !== undefined}
       title={t("settings.providerWizard.titleWith", { name: snapshot.managedModelRuntimes?.find((runtime) => runtime.id === runtimeOnboardingId)?.name ?? t("settings.localModelRuntime") })}
@@ -4608,23 +4624,49 @@ function CredentialVaultPanel({ controller, snapshot, runAction, onAdd, t }: { r
   return <><div className="provider-detail__scroll provider-vault"><div className="provider-vault-header"><span><strong>{t("settings.credentials")}</strong><small>{t("settings.credentialsBody")}</small></span><Button tone="primary" onClick={onAdd}>{t("settings.addCredential")}</Button></div><CredentialList credentials={snapshot.settings.credentials} controller={controller} onDelete={setRemovalTarget} t={t} emptyLabel={t("settings.noCredentials")} /><section className="credential-assurance"><div className="credential-assurance__icon"><KeyRound aria-hidden="true" /></div><div><strong>{t("settings.secretAssurance")}</strong><p>{t("settings.secretAssuranceBody")}</p><ul><li><Check aria-hidden="true" />{t("settings.credentialProjection")}</li><li><Check aria-hidden="true" />{t("settings.ticketSafety")}</li><li><Check aria-hidden="true" />{t("settings.secretUnreadable")}</li></ul></div></section></div><Modal open={removalTarget !== undefined} title={t("settings.deleteCredentialTitle", { name: removalTarget?.name ?? "" })} description={t("settings.deleteCredentialBody")} size="small" onClose={() => setRemovalTarget(undefined)} headerLeading={<ModalBackButton label={t("common.back")} onClick={() => setRemovalTarget(undefined)} />}><div className="modal__actions"><Button tone="danger" onClick={() => { const target = removalTarget; if (target === undefined) return; setRemovalTarget(undefined); runAction(`delete-credential:${target.id}`, () => controller.deleteCredential(target.id)); }}>{t("common.delete")}</Button></div></Modal></>;
 }
 
-function ProviderAddWizard({ open, providers, runtimes, runtimePending = false, runtimeError = false, onClose, onChoose, onChooseRuntime, onCustom, t }: { readonly open: boolean; readonly providers: readonly ProviderSettingsEntry[]; readonly runtimes: NonNullable<AppSnapshot["managedModelRuntimes"]>; readonly runtimePending?: boolean; readonly runtimeError?: boolean; readonly onClose: () => void; readonly onChoose: (provider: ProviderSettingsEntry) => void; readonly onChooseRuntime: (runtimeId: string) => void; readonly onCustom: () => void; readonly t: Translator }): JSX.Element {
+function ProviderAddWizard({ open, providers, presets, locale, runtimes, runtimePending = false, runtimeError = false, onClose, onChoose, onChoosePreset, onChooseRuntime, onCustom, t }: {
+  readonly open: boolean;
+  readonly providers: readonly ProviderSettingsEntry[];
+  readonly presets: readonly ProviderPreset[];
+  readonly locale: string;
+  readonly runtimes: NonNullable<AppSnapshot["managedModelRuntimes"]>;
+  readonly runtimePending?: boolean;
+  readonly runtimeError?: boolean;
+  readonly onClose: () => void;
+  readonly onChoose: (provider: ProviderSettingsEntry) => void;
+  readonly onChoosePreset: (preset: ProviderPreset, name: string) => void;
+  readonly onChooseRuntime: (runtimeId: string) => void;
+  readonly onCustom: () => void;
+  readonly t: Translator;
+}): JSX.Element {
   const [query, setQuery] = useState("");
   useEffect(() => { if (open) setQuery(""); }, [open]);
   const normalizedQuery = query.trim().toLocaleLowerCase();
-  const filtered = providers.filter((provider) => {
-    const normalized = query.trim().toLocaleLowerCase();
-    return normalized.length === 0 || provider.provider.name.toLocaleLowerCase().includes(normalized) || provider.provider.id.toLocaleLowerCase().includes(normalized) || provider.backendName?.toLocaleLowerCase().includes(normalized) === true;
-  });
+  const filtered = providers.filter(({ provider, backendName }) => [provider.name, provider.id, backendName]
+    .some(value => value?.toLocaleLowerCase().includes(normalizedQuery)));
   const filteredRuntimes = runtimes.filter((runtime) => normalizedQuery.length === 0 || runtime.name.toLocaleLowerCase().includes(normalizedQuery));
+  const filteredPresets = presets.filter(preset => providerPresetMatches(preset, normalizedQuery));
   const groups = [
-    { id: "local", label: t("settings.providerWizard.localGroup"), runtimes: filteredRuntimes, providers: [] as readonly ProviderSettingsEntry[] },
+    { id: "local", label: t("settings.providerWizard.localGroup"), runtimes: filteredRuntimes, presets: filteredPresets.filter(preset => preset.authMethod === "none"), providers: [] as readonly ProviderSettingsEntry[] },
     { id: "account", label: t("settings.providerWizard.accountGroup"), providers: filtered.filter((entry) => entry.provider.kind === "oauth" || entry.provider.kind === "subscription" || entry.runtime?.loginMethods.some((method) => method !== "apiKey") === true) },
-    { id: "api", label: t("settings.providerWizard.apiGroup"), providers: filtered.filter((entry) => entry.runtime?.loginMethods.some((method) => method !== "apiKey") !== true && (entry.provider.kind === "apiKey" || entry.provider.kind === "managed" || entry.runtime?.loginMethods.includes("apiKey") === true)) }
-  ].filter((group) => group.providers.length > 0 || (group.runtimes?.length ?? 0) > 0);
+    { id: "api", label: t("settings.providerWizard.apiGroup"), presets: filteredPresets.filter(preset => preset.authMethod !== "none"), providers: filtered.filter((entry) => entry.runtime?.loginMethods.some((method) => method !== "apiKey") !== true && (entry.provider.kind === "apiKey" || entry.provider.kind === "managed" || entry.runtime?.loginMethods.includes("apiKey") === true)) }
+  ].filter((group) => group.providers.length > 0 || (group.runtimes?.length ?? 0) > 0 || (group.presets?.length ?? 0) > 0);
   return <Modal open={open} title={t("settings.addProvider")} size="large" className="provider-flow-modal provider-add-wizard-modal" onClose={onClose} headerLeading={<ProviderFlowBackButton onBack={onClose} t={t} />} headerTrailing={<ProviderWizardProgress activeStep={1} t={t} />}><div className="provider-add-wizard">
     {runtimePending && <p role="status">{t("common.loading")}</p>}{runtimeError && <p className="danger-text" role="alert">{t("settings.localRuntime.actionFailed")}</p>}
-    <label className="provider-add-wizard__search"><Search aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("settings.providerWizard.search")} aria-label={t("settings.providerWizard.search")} /></label><div className="provider-add-wizard__catalog">{groups.map((group) => <section key={group.id}><h3>{group.label}</h3>{group.runtimes?.map((runtime) => <button type="button" key={`runtime:${runtime.id}`} disabled={runtimePending} onClick={() => onChooseRuntime(runtime.id)}><span className="provider-catalog-icon" aria-hidden="true"><Server /></span><span><strong>{runtime.name}</strong><small>{t("settings.providerWizard.localSuggestion")}</small></span><Pill>BETA</Pill><ChevronRight aria-hidden="true" /></button>)}{group.providers.map((entry) => <button type="button" key={entry.id} disabled={runtimePending} onClick={() => onChoose(entry)}><span className="provider-catalog-icon" aria-hidden="true"><ProviderMark providerId={entry.provider.id} name={entry.provider.name} /></span><span><strong>{entry.provider.name}</strong><small>{[entry.backendName, providerConnectionLabel(entry.provider, t)].filter(Boolean).join(" · ")}</small></span><ChevronRight aria-hidden="true" /></button>)}</section>)}{groups.length === 0 && <p className="provider-add-wizard__empty">{t("settings.providerWizard.noMatches")}</p>}</div><button type="button" className="provider-add-wizard__custom" disabled={runtimePending} onClick={onCustom}><span className="provider-catalog-icon"><CirclePlus aria-hidden="true" /></span><span><strong>{t("settings.providerWizard.customTitle")}</strong><small>{t("settings.providerWizard.customBody")}</small></span><ChevronRight aria-hidden="true" /></button><p className="provider-add-wizard__note">{t("settings.providerWizard.authNote")}</p></div></Modal>;
+    <label className="provider-add-wizard__search"><Search aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("settings.providerWizard.search")} aria-label={t("settings.providerWizard.search")} /></label>
+    <div className="provider-add-wizard__catalog">{groups.map((group) => <section key={group.id}><h3>{group.label}</h3>
+      {group.runtimes?.map((runtime) => <button type="button" key={`runtime:${runtime.id}`} disabled={runtimePending} onClick={() => onChooseRuntime(runtime.id)}><span className="provider-catalog-icon" aria-hidden="true"><Server /></span><span><strong>{runtime.name}</strong><small>{t("settings.providerWizard.localSuggestion")}</small></span><Pill>BETA</Pill><ChevronRight aria-hidden="true" /></button>)}
+      {group.providers.map((entry) => <button type="button" key={entry.id} disabled={runtimePending} onClick={() => onChoose(entry)}><span className="provider-catalog-icon" aria-hidden="true"><ProviderMark providerId={entry.provider.id} name={entry.provider.name} /></span><span><strong>{entry.provider.name}</strong><small>{[entry.backendName, providerConnectionLabel(entry.provider, t)].filter(Boolean).join(" · ")}</small></span><ChevronRight aria-hidden="true" /></button>)}
+      {group.presets?.map(preset => {
+        const name = providerPresetName(preset, locale);
+        return <button type="button" key={`preset:${preset.id}`} disabled={runtimePending} onClick={() => onChoosePreset(preset, name)}>
+          <span className="provider-catalog-icon" aria-hidden="true"><ProviderMark providerId={preset.id} name={name} /></span>
+          <span><strong>{name}</strong><small>{t(preset.authMethod === "none" ? "settings.customProvider.noAuthentication" : "settings.apiKey")}</small></span>
+          <ChevronRight aria-hidden="true" />
+        </button>;
+      })}
+    </section>)}{groups.length === 0 && <p className="provider-add-wizard__empty">{t("settings.providerWizard.noMatches")}</p>}</div>
+    <button type="button" className="provider-add-wizard__custom" disabled={runtimePending} onClick={onCustom}><span className="provider-catalog-icon"><CirclePlus aria-hidden="true" /></span><span><strong>{t("settings.providerWizard.customTitle")}</strong><small>{t("settings.providerWizard.customBody")}</small></span><ChevronRight aria-hidden="true" /></button><p className="provider-add-wizard__note">{t("settings.providerWizard.authNote")}</p></div></Modal>;
 }
 
 function providerStatusTone(state: AppSnapshot["providers"][number]["authenticationState"], enabled: boolean): string {
