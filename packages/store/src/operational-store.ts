@@ -43,6 +43,7 @@ import type {
   SessionAttentionKind,
   SessionDescriptor,
   SessionReferenceSnapshot,
+  SessionSnooze,
   SessionWorktreeBinding,
   TaskTagCatalog,
   TaskTagColor,
@@ -471,6 +472,7 @@ const ACTIVE_MOBILE_PUSH_DEVICE_SQL = `
 `;
 const STORE_SCAN_PAGE_SIZE = 100_000;
 const NATIVE_BLANK_RECOVERY_SETTING_KEY = "runtime.native_blank_recovery";
+const SESSION_SNOOZE_SETTING_KEY = "task_inbox.snooze";
 const MESSAGE_REWIND_CONTINUATION_SETTING_KEY = "runtime.message_rewind_continuation";
 const CATALOG_ROLLOUT_HISTORY_NAMESPACE = "codex.catalog_rollout_history";
 const RETAINED_CONTEXT_EVENTS_KEY = "runtime.retained_context_events";
@@ -3919,7 +3921,8 @@ export class OperationalStore {
       sessionFromRow(row),
       this.findSessionAttention(id),
       this.findSessionWorktree(id),
-      this.listSessionTaskTags(id)
+      this.listSessionTaskTags(id),
+      this.findSessionSnooze(id)
     );
   }
 
@@ -7838,7 +7841,8 @@ export class OperationalStore {
         session,
         this.findSessionAttention(session.descriptor.id),
         this.findSessionWorktree(session.descriptor.id),
-        this.listSessionTaskTags(session.descriptor.id)
+        this.listSessionTaskTags(session.descriptor.id),
+        this.findSessionSnooze(session.descriptor.id)
       );
     });
   }
@@ -7857,7 +7861,8 @@ export class OperationalStore {
       session,
       this.findSessionAttention(session.descriptor.id),
       this.findSessionWorktree(session.descriptor.id),
-      this.listSessionTaskTags(session.descriptor.id)
+      this.listSessionTaskTags(session.descriptor.id),
+      this.findSessionSnooze(session.descriptor.id)
     );
   }
 
@@ -8851,6 +8856,9 @@ export class OperationalStore {
       );
       if (patch.hidden === true) this.database.prepare(`UPDATE mobile_push_deliveries SET status = 'failed', outcome_code = 'TASK_HIDDEN', updated_at = ?, revision = ? WHERE session_id = ? AND status = 'pending'`)
         .run(now, asSqlInteger(this.requireActiveRevision()), id);
+      if (patch.deletedAt !== undefined || patch.hidden === true || patch.archived === true || patch.archived === false && descriptor.archived) {
+        this.deleteSetting("session", id, SESSION_SNOOZE_SETTING_KEY);
+      }
       const pushRetirement = patch.deletedAt !== undefined ? "TASK_DELETED"
         : patch.archived !== undefined && (patch.archived || descriptor.archived) ? "TASK_ARCHIVED" : undefined;
       if (pushRetirement) {
@@ -9129,6 +9137,42 @@ export class OperationalStore {
       this.appendSessionProjectionEvent(updated, `session-summary-clear:${sessionId}:${updated.revision.toString(10)}`);
       return updated;
     });
+  }
+
+  private findSessionSnooze(sessionId: string): SessionSnooze | undefined {
+    return this.findSetting<SessionSnooze>("session", sessionId, SESSION_SNOOZE_SETTING_KEY)?.value;
+  }
+
+  setSessionSnooze(sessionId: string, choice: number | "indefinitely" | "wake", at = this.now()): void {
+    this.write(() => {
+      const session = this.getSession(sessionId).descriptor;
+      if (session.archived || session.hidden || session.deletedAt !== undefined) throw new StoreError("This task cannot be snoozed.");
+      if (choice === "wake") {
+        if (!this.deleteSetting("session", sessionId, SESSION_SNOOZE_SETTING_KEY)) return;
+      } else {
+        if (!Number.isSafeInteger(at) || at < 0 || (typeof choice === "number"
+          && (!Number.isSafeInteger(choice) || choice <= at || choice - at > 366 * 86_400_000))) {
+          throw new StoreError("Choose a task snooze deadline within the next year.");
+        }
+        this.setSetting("session", sessionId, SESSION_SNOOZE_SETTING_KEY, { setAt: at, ...(typeof choice === "number" ? { until: choice } : {}) });
+      }
+      this.publishSessionSnoozeChange(sessionId);
+    });
+  }
+
+  wakeSessionAfterAcceptedInput(sessionId: string, acceptedAt: number): void {
+    this.write(() => {
+      const snooze = this.findSessionSnooze(sessionId);
+      if (snooze === undefined || acceptedAt <= snooze.setAt) return;
+      this.deleteSetting("session", sessionId, SESSION_SNOOZE_SETTING_KEY);
+      this.publishSessionSnoozeChange(sessionId);
+    });
+  }
+
+  private publishSessionSnoozeChange(sessionId: string): void {
+    const revision = this.requireActiveRevision();
+    this.database.prepare("UPDATE product_sessions SET revision = ? WHERE id = ?").run(asSqlInteger(revision), sessionId);
+    this.appendSessionProjectionEvent(this.getSession(sessionId), `session-snooze:${sessionId}:${revision.toString(10)}`);
   }
 
   private appendSessionProjectionEvent(session: StoredSession, traceId: string): PersistedEvent {
@@ -21836,7 +21880,8 @@ function withSessionPresentation(
   session: StoredSession,
   attention: SessionAttentionRecord | undefined,
   worktree: SessionWorktreeBinding | undefined,
-  taskTags: readonly TaskTagRecord[]
+  taskTags: readonly TaskTagRecord[],
+  snooze: SessionSnooze | undefined
 ): StoredSession {
   const attended = withSessionAttention(session, attention);
   return {
@@ -21844,6 +21889,7 @@ function withSessionPresentation(
     descriptor: {
       ...attended.descriptor,
       ...(worktree === undefined ? {} : { worktree }),
+      ...(snooze === undefined || session.descriptor.archived ? {} : { snooze }),
       taskTags
     }
   };

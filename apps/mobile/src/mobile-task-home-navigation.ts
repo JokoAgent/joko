@@ -3,6 +3,7 @@ import type { MobileHomeDisplayPreferences, MobileHomeSearchMatch, MobileHomeSea
 export interface MobileHomeViewState {
   readonly search: string;
   readonly statusFilter: "active" | "archived" | "all";
+  readonly taskInbox?: boolean;
   readonly searchSort?: MobileHomeSearchSort;
   readonly display?: MobileHomeDisplayPreferences;
 }

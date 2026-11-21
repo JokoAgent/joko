@@ -24,7 +24,7 @@ export interface PendingOperation {
   readonly operationId: string;
   readonly connectionId: string;
   readonly taskJoinId?: string;
-  readonly kind: "create" | "send" | "logout" | "revoke" | "device-rename" | "rename" | "pin" | "archive" | "delete"
+  readonly kind: "create" | "send" | "logout" | "revoke" | "device-rename" | "rename" | "pin" | "archive" | "delete" | "snooze"
     | "message-delete" | "queue-cancel" | "queue-edit-lock" | "queue-edit"
     | "queue-interaction-lock" | "queue-reorder" | "queue-resume" | "queue-retry" | "interaction-resolve" | "interaction-dismiss"
     | "session-model" | "session-permission" | "session-plan" | "session-compact" | "session-branch" | "session-stop"
@@ -523,7 +523,7 @@ function isPending(value: unknown): value is PendingOperation {
   if (!value || typeof value !== "object") return false;
   const record = value as Record<string, unknown>;
   if (typeof record.operationId !== "string" || typeof record.connectionId !== "string"
-    || !["create", "send", "logout", "revoke", "device-rename", "rename", "pin", "archive", "delete", "message-delete",
+    || !["create", "send", "logout", "revoke", "device-rename", "rename", "pin", "archive", "delete", "snooze", "message-delete",
       "queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder", "queue-resume", "queue-retry",
       "interaction-resolve", "interaction-dismiss", "session-model", "session-permission", "session-plan", "session-compact", "session-stop",
       "objective-set", "objective-pause", "objective-resume", "objective-clear",

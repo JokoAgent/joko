@@ -381,6 +381,7 @@ export interface RunMappingContext {
 
 export interface SessionMappingContext {
   readonly sideChatSourceAllowed?: boolean;
+  readonly inboxSnoozeAllowed?: boolean;
   readonly provisionalDraftId?: string;
   readonly localWorkspace?: { readonly workspaceId: string; readonly path: string };
   readonly taskActivity?: import("./session-task-activity.js").SessionTaskActivityProjection;
@@ -729,6 +730,12 @@ export function toProtoSession(record: StoredSession, context: SessionMappingCon
     pinned: session.pinned,
     archived: session.archived,
     hidden: session.hidden === true,
+    inboxSnoozeAllowed: context.inboxSnoozeAllowed,
+    snooze: session.snooze === undefined || context.inboxSnoozeAllowed !== true ? undefined
+      : message<contract.SessionSnooze>("joko.v1.SessionSnooze", {
+        setAt: toProtoTimestamp(session.snooze.setAt),
+        until: session.snooze.until === undefined ? undefined : toProtoTimestamp(session.snooze.until)
+      }),
     context: context.usage === undefined
       ? undefined
       : toProtoContextUsage(context.usage, context.usageMeasuredAt ?? session.updatedAt),

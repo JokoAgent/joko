@@ -1022,8 +1022,15 @@ export interface SessionDescriptor {
   readonly appendSystemPrompt?: string;
   /** Durable, content-free attention/read receipt projected by Orchestrator. */
   readonly attention?: SessionAttention;
+  /** An explicit owner choice. An omitted deadline keeps the task snoozed indefinitely. */
+  readonly snooze?: SessionSnooze;
   readonly createdAt: UnixMillis;
   readonly updatedAt: UnixMillis;
+}
+
+export interface SessionSnooze {
+  readonly setAt: UnixMillis;
+  readonly until?: UnixMillis;
 }
 
 export interface SessionDerivationOrigin {

@@ -1,4 +1,5 @@
-import { SessionAttentionKind, SessionState, WorkspaceKind, type Session, type Snapshot } from "@joko/contracts";
+import { classifyTaskInbox, InteractionState, ScheduleState, SessionAttentionKind, SessionState, TaskCompletionNotification, taskInboxSections,
+  taskSnoozeDeadline, WorkspaceKind, type Session, type Snapshot, type TaskInboxSection } from "@joko/contracts";
 import { safeWindowRect, windowDivision, type MobileWindowGeometry } from "./mobile-window-geometry";
 
 export type MobileHomeStatusFilter = "active" | "archived" | "all";
@@ -50,7 +51,7 @@ export interface MobileHomeSessionItem {
 
 export interface MobileHomeSection {
   readonly key: string;
-  readonly kind: "pinned" | "dialogue" | "project" | "search";
+  readonly kind: "pinned" | "dialogue" | "project" | "search" | "taskInbox";
   readonly title: string;
   readonly items: readonly MobileHomeSessionItem[];
 }
@@ -64,6 +65,7 @@ export interface BuildMobileHomeSectionsOptions {
   readonly projectId?: string;
   readonly now?: number;
   readonly messageSessionIds?: ReadonlySet<string>;
+  readonly inboxLabels?: Readonly<Record<TaskInboxSection, string>>;
   readonly labels: {
     readonly dialogue: string;
     readonly project: string;
@@ -75,6 +77,7 @@ export function buildMobileHomeSections(options: BuildMobileHomeSectionsOptions)
   const snapshot = options.snapshot;
   if (!snapshot) return [];
   const normalizedQuery = options.query.trim().toLocaleLowerCase();
+  const inboxLabels = options.projectId === undefined && !normalizedQuery ? options.inboxLabels : undefined;
   const display = options.display ?? DEFAULT_MOBILE_HOME_DISPLAY;
   const cutoff = display.lastActivity === "all" ? undefined
     : (options.now ?? Date.now()) - MOBILE_HOME_ACTIVITY_DAYS[display.lastActivity] * 86_400_000;
@@ -82,15 +85,16 @@ export function buildMobileHomeSections(options: BuildMobileHomeSectionsOptions)
   const workspaces = new Map(snapshot.workspaces.map((workspace) => [workspace.targetId, workspace]));
   const items = snapshot.sessions.flatMap((session): MobileHomeSessionItem[] => {
     if (session.hidden || session.derivationOrigin?.sideChat) return [];
-    if (options.statusFilter === "active" && session.archived) return [];
-    if (options.statusFilter === "archived" && !session.archived) return [];
+    if (inboxLabels === undefined && options.statusFilter === "active" && session.archived) return [];
+    if (inboxLabels === undefined && options.statusFilter === "archived" && !session.archived) return [];
+    if (inboxLabels !== undefined && session.provisionalDraftId) return [];
     const projectId = session.projectId;
     const target = projectId === undefined ? undefined : targets.get(projectId);
     const workspace = projectId === undefined ? undefined : workspaces.get(projectId);
     const project = workspace?.kind === WorkspaceKind.USER_PROJECT;
     const groupKey = project ? `project:${projectId}` : "dialogue";
     if (options.projectId !== undefined && (!project || projectId !== options.projectId)) return [];
-    if (!normalizedQuery && !session.pinned) {
+    if (!normalizedQuery && inboxLabels === undefined && !session.pinned) {
       if (display.projectFilter !== "all" && !display.projectFilter.includes(groupKey)) return [];
       if (display.backendId !== null && display.backendId !== session.backendId) return [];
       if (cutoff !== undefined && sessionActivityMillis(session) < cutoff) return [];
@@ -124,6 +128,32 @@ export function buildMobileHomeSections(options: BuildMobileHomeSectionsOptions)
         || recent || leftId.localeCompare(rightId);
     });
     return [{ key: "search", kind: "search", title: "", items: sorted }];
+  }
+  if (inboxLabels !== undefined) {
+    const awaiting = new Set(snapshot.interactions.filter(item => item.state === InteractionState.PENDING).map(item => item.sessionId));
+    const schedules = snapshot.schedules.filter(mobileInboxScheduleActive);
+    const subscribedSessions = new Set(schedules.map(schedule => schedule.sessionId));
+    const activeScheduleIds = new Set(schedules.map(schedule => schedule.scheduleId));
+    const now = options.now ?? Date.now();
+    const grouped = new Map<TaskInboxSection, MobileHomeSessionItem[]>(taskInboxSections.map(section => [section, []]));
+    for (const item of items) {
+      const session = item.session;
+      const section = classifyTaskInbox({ archived: session.archived, snooze: mobileTaskSnooze(session),
+        awaiting: awaiting.has(session.sessionId) || session.state === SessionState.WAITING || session.attention?.kind === SessionAttentionKind.ERROR,
+        running: session.state === SessionState.RUNNING || session.state === SessionState.RECOVERING,
+        unread: session.attention?.unread === true, subscribed: subscribedSessions.has(session.sessionId)
+          || (session.automationOrigin !== undefined && activeScheduleIds.has(session.automationOrigin.scheduleId)),
+        teammate: session.inboxSnoozeAllowed === false || session.taskActivity?.completionNotification === TaskCompletionNotification.TEAMMATE
+      }, now);
+      if (section !== undefined) grouped.get(section)!.push(item);
+    }
+    return taskInboxSections.flatMap((section): MobileHomeSection[] => {
+      const items = sortHomeItems(grouped.get(section)!);
+      if (items.length === 0) return [];
+      if (section === "snoozed") items.sort((left, right) => taskSnoozeDeadline(mobileTaskSnooze(left.session))
+        - taskSnoozeDeadline(mobileTaskSnooze(right.session)));
+      return [{ key: section, kind: "taskInbox", title: inboxLabels[section], items }];
+    });
   }
   const sections: MobileHomeSection[] = [];
   const pinned = sortHomeItems(items.filter((item) => item.session.pinned));
@@ -177,6 +207,21 @@ export function previewMobileHomeProject(
 function sessionActivityMillis(session: Session): number {
   const time = session.lastActivityAt;
   return time === undefined ? Number.NEGATIVE_INFINITY : Number(time.seconds) * 1_000 + time.nanos / 1_000_000;
+}
+
+export function mobileTaskSnooze(session: Session): { readonly until?: number } | undefined {
+  if (session.snooze?.setAt === undefined) return undefined;
+  const until = session.snooze.until;
+  return until === undefined ? {} : { until: Number(until.seconds) * 1_000 + until.nanos / 1_000_000 };
+}
+
+function mobileInboxScheduleActive(schedule: Snapshot["schedules"][number]): boolean {
+  return schedule.state === ScheduleState.ENABLED || schedule.state === ScheduleState.RUNNING || schedule.state === ScheduleState.ERROR;
+}
+
+export function mobileTaskFollowsActiveAutomation(snapshot: Snapshot | undefined, session: Session): boolean {
+  return snapshot?.schedules.some(schedule => mobileInboxScheduleActive(schedule) && (schedule.sessionId === session.sessionId
+      || schedule.scheduleId === session.automationOrigin?.scheduleId)) === true;
 }
 
 function sortHomeItems(items: readonly MobileHomeSessionItem[], sortBy: MobileHomeTaskSort = "activity"): MobileHomeSessionItem[] {

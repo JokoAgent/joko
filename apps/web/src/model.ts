@@ -1487,6 +1487,8 @@ export interface TaskTagDeletePreviewView {
 
 export interface SessionView {
   readonly sideChatSourceAllowed?: boolean;
+  readonly inboxSnoozeAllowed?: boolean;
+  readonly snooze?: { readonly setAt: number; readonly until?: number };
   readonly provisionalDraftId?: string;
   readonly localWorkspace?: { readonly workspaceId: string; readonly path: string };
   readonly taskActivity?: {
@@ -6411,6 +6413,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   deleteTaskTag(originSessionId: string, preview: TaskTagDeletePreviewView): Promise<void>;
   suggestSessionTitle(sessionId: string, signal?: AbortSignal): Promise<SessionTitleSuggestionView>;
   pinSession(sessionId: string, pinned: boolean): Promise<void>;
+  setSessionSnooze(sessionId: string, choice: import("@joko/contracts").TaskSnoozeChoice): Promise<void>;
   archiveSession(sessionId: string, archived: boolean, archiveConfirmation?: string, projectId?: string): Promise<void>;
   openSideChat(sessionId: string, expectedGeneration: bigint, options?: {
     readonly operationId?: string; readonly signal?: AbortSignal; readonly beforeDispatch?: (operationId: string) => Promise<void>;

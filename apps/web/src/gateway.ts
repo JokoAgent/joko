@@ -2915,6 +2915,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.submit({ case: "pinSession", value: { sessionId, pinned } });
   }
 
+  async setSessionSnooze(sessionId: string, choice: import("@joko/contracts").TaskSnoozeChoice): Promise<void> {
+    const scope = this.captureActionScope();
+    const session = this.#rawSnapshot?.sessions.find(candidate => candidate.sessionId === sessionId);
+    const revision = session?.version?.revision;
+    if (session?.inboxSnoozeAllowed !== true || revision === undefined || revision.value < 1n) {
+      throw new GatewayError("A current task is required to change its snooze.");
+    }
+    await this.submit({ case: "setSessionSnooze", value: { sessionId, choice: typeof choice === "number"
+      ? { case: "until", value: timestampFromMs(choice) } : { case: choice, value: true } } }, true, [{
+      entity: { kind: EntityKind.SESSION, id: sessionId }, expectedRevision: revision
+    }], scope.signal);
+  }
+
   async archiveSession(sessionId: string, archived: boolean, archiveConfirmation = "", projectId?: string): Promise<void> {
     const payload: MutationPayload = { case: "archiveSession", value: { sessionId, archived, archiveConfirmation } };
     if (projectId === undefined) {
@@ -15696,6 +15709,9 @@ function mapSession(
         }
       }),
     codeHostPullRequests: session.codeHostPullRequests.map(mapCodeHostPullRequest),
+    ...(session.inboxSnoozeAllowed === undefined ? {} : { inboxSnoozeAllowed: session.inboxSnoozeAllowed }),
+    ...(session.snooze?.setAt === undefined ? {} : { snooze: { setAt: timestampMs(session.snooze.setAt),
+      ...(session.snooze.until === undefined ? {} : { until: timestampMs(session.snooze.until) }) } }),
     createdAt: timestampMs(session.createdAt),
     updatedAt: timestampMs(session.lastActivityAt) || timestampMs(session.createdAt),
     ...(session.lastUserInputAt === undefined

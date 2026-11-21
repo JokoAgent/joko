@@ -3902,6 +3902,14 @@ export class SessionHost {
       ...(input.overrides === undefined ? {} : { executionOverrides: input.overrides }),
       createdAt: now
     });
+    const admission = store.getOperation(input.operationId);
+    if ((input.source ?? "user") === "user" && input.parentRunId === undefined && admission.connectionId !== undefined
+      && (admission.kind === "sendInput" || admission.kind === "send_input") && acceptedPrompt.messagingOrigin === undefined
+      && acceptedPrompt.automaticContinuation === undefined && acceptedPrompt.objectiveContinuation === undefined
+      && acceptedPrompt.inputHandoffContinuation === undefined
+      && new TaskShareStore(store).getAuthorForOperation(input.operationId)?.sessionId !== input.sessionId) {
+      store.wakeSessionAfterAcceptedInput(input.sessionId, now);
+    }
     const group = this.#providerGroups?.taskModels;
     if (group?.binding(input.sessionId) !== undefined && (input.source ?? "user") === "user" && !input.parentRunId
       && acceptedPrompt.disposition === "prompt" && !hasTurnRouteOverrides(input.overrides)
@@ -4229,6 +4237,7 @@ export class SessionHost {
           input.scheduledAt
         );
         this.markScheduledWorktreeAdmitted(store, sessionId, input.schedule.id, runId);
+        if (validationFailure === undefined) store.wakeSessionAfterAcceptedInput(sessionId, input.scheduledAt);
         return { sessionId, runId, attemptId, queueItemId };
       }
     );
@@ -11707,9 +11716,16 @@ export class SessionHost {
       && this.isOrdinarySession(stored, allowArchived);
   }
 
-  private isOrdinarySession(stored: StoredSession, allowArchived = false): boolean {
+  canSnoozeSession(stored: StoredSession): boolean {
+    const id = stored.descriptor.id;
+    return this.isOrdinarySession(stored, false, true) && readProvisionalSession(this.#store, id) === undefined
+      && readPersonalDevelopmentPurpose(this.#store, id) === undefined
+      && this.#store.findPendingSessionLifecycleCleanup(id) === undefined;
+  }
+
+  private isOrdinarySession(stored: StoredSession, allowArchived = false, allowScheduled = false): boolean {
     const session = stored.descriptor;
-    return session.automationOrigin === undefined && session.derivationOrigin?.sideChat !== true
+    return (allowScheduled || session.automationOrigin === undefined) && session.derivationOrigin?.sideChat !== true
       && !session.hidden && (allowArchived || !session.archived) && session.deletedAt === undefined
       && this.#store.sessionCreationServiceKind(session.id) === undefined
       && this.#partnerSessionPolicy(session.id) === undefined
