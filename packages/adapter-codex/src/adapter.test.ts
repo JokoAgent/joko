@@ -21,7 +21,7 @@ import type {
   ProviderModel,
   TargetDescriptor
 } from "@joko/core";
-import { CAPABILITIES } from "@joko/core";
+import { CAPABILITIES, modelTokenPricesAt } from "@joko/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CodexBackendAdapter,
@@ -1578,6 +1578,7 @@ describe("CodexBackendAdapter", () => {
       isDefault: model === "gpt-6.1-sol"
     });
     setup.fake.modelList = [
+      nativeModel("gpt-6.2-sol", "GPT-6.2 Sol"),
       nativeModel("gpt-6.1-sol", "GPT-6.1 Sol"),
       nativeModel("gpt-6-sol", "GPT-6 Sol"),
       nativeModel("gpt-6-luna", "GPT-6 Luna"),
@@ -1585,6 +1586,10 @@ describe("CodexBackendAdapter", () => {
     ];
 
     const descriptor = await setup.adapter.describe();
+    const sol = descriptor.models.find((model) => model.modelId === "gpt-6.2-sol")!;
+    expect(sol.supportsFastMode).toBe(false);
+    expect(modelTokenPricesAt(sol, { at: Date.UTC(2026, 10, 17), inputTokens: 272_001 }))
+      .toMatchObject({ currencyCode: "USD", cost: { input: 4, output: 15 } });
     expect(descriptor.models.find((model) => model.modelId === "gpt-6.1-sol")).toMatchObject({
       contextWindow: 500_000,
       maxOutputTokens: 128_000,
@@ -1602,7 +1607,7 @@ describe("CodexBackendAdapter", () => {
       .toEqual({ input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 });
     expect(descriptor.models.find((model) => model.modelId === "gpt-5.6-sol"))
       .toMatchObject({ defaultVisible: false });
-    expect(descriptor.models.some((model) => model.modelId === "gpt-6-astra")).toBe(false);
+    expect(descriptor.models.some((model) => model.modelId === "gpt-6.2-astra")).toBe(false);
   });
 
   it("continues an existing yielded exec cell without publishing an intermediate product terminal", async () => {

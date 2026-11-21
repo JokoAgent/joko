@@ -37,6 +37,40 @@ describe("model reference pricing", () => {
     expect(modelTokenPricesAt(grok, { at, fastMode: "ultrafast" })).toBeUndefined();
   });
 
+  it("applies the GPT-6.2 Sol launch date and selects Standard, Fast and Batch independently", () => {
+    const sol = model("openai/gpt-6.2-sol");
+    const launch = Date.UTC(2026, 10, 17);
+    expect(modelTokenPricesAt(sol, { at: launch - 1, inputTokens: 272_000 })).toBeUndefined();
+    expect(modelTokenPricesAt(sol, { at: launch, inputTokens: 272_000 }))
+      .toMatchObject({ currencyCode: "USD", cost: { input: 2, output: 10 } });
+    expect(modelTokenPricesAt(sol, { at: launch, inputTokens: 272_001 }))
+      .toMatchObject({ currencyCode: "USD", cost: { input: 4, output: 15 } });
+    expect(modelTokenPricesAt(sol, { at: launch, inputTokens: 272_001, fastMode: true }))
+      .toMatchObject({ currencyCode: "USD", cost: { input: 8, output: 30 } });
+    expect(selectModelReferenceTariff(sol.pricing!.tariffs!, { at: launch, inputTokens: 272_001, variant: "batch" }))
+      .toMatchObject({ currencyCode: "USD", cost: { input: 2, output: 7.5 } });
+    expect(catalogModelReferencePricing("anthropic/gpt-6.2-sol")).toBeUndefined();
+    expect(catalogModelReferencePricing("openai/unlisted-model")).toBeUndefined();
+  });
+
+  it.each([
+    { group: "cn", currencyCode: "CNY", input: 20, cacheWrite1h: 40, batchInput: 12 },
+    { group: "global", currencyCode: "USD", input: 3, cacheWrite1h: 6, batchInput: 1.8 }
+  ])("closes the previous Kimi K3 window in $group before applying the new tariff", ({ group, currencyCode, input, cacheWrite1h, batchInput }) => {
+    const pricing = catalogModelReferencePricing("moonshotai/kimi-k3", group)!;
+    const kimi = { ...model("moonshotai/kimi-k3"), pricing };
+    const change = Date.UTC(2026, 10, 5);
+    const previous = selectModelReferenceTariff(pricing.tariffs!, { at: change - 1 });
+    expect(previous).toMatchObject({ currencyCode, effectiveFrom: "2026-09-23", effectiveUntil: "2026-11-05", cost: { input } });
+    expect(previous?.cost.cacheWrite1h).toBeUndefined();
+    expect(modelTokenPricesAt(kimi, { at: change, cacheWriteTtl: "1h" }))
+      .toMatchObject({ currencyCode, cost: { input, cacheWrite: cacheWrite1h } });
+    const batch = Date.UTC(2026, 10, 7);
+    expect(selectModelReferenceTariff(pricing.tariffs!, { at: batch - 1, variant: "batch" })).toBeUndefined();
+    expect(selectModelReferenceTariff(pricing.tariffs!, { at: batch, variant: "batch" }))
+      .toMatchObject({ currencyCode, cost: { input: batchInput } });
+  });
+
   it("retains one-hour cache tariffs, market currencies and absent Fast prices", () => {
     const opus = model("claude-opus-5-5");
     expect(modelTokenPricesAt(opus, { at })?.cost.cacheWrite).toBe(5);

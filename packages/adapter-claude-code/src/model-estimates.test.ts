@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { catalogModelReferencePricing } from "@joko/core";
+import { catalogModelReferencePricing, modelTokenPricesAt } from "@joko/core";
 
 import { claudeModelEstimate } from "./model-estimates.js";
 import { providerModel, SafeProjection } from "./projection.js";
@@ -61,11 +61,16 @@ describe("Claude model estimates", () => {
     (modelId) => expect(claudeModelEstimate(modelId)).toEqual({ defaultVisible: false })
   );
 
-  it.each(["claude-sonnet-5-5", "claude-haiku-5-5"])("enriches a runtime-discovered %s without inventing reference prices", modelId => {
+  it.each([
+    { modelId: "claude-sonnet-5-5", input: 2, output: 10 },
+    { modelId: "claude-haiku-5-5", input: 0.1, output: 0.5 }
+  ])("attaches public pricing to runtime-discovered $modelId", ({ modelId, input, output }) => {
     const projected = providerModel({ value: modelId, displayName: modelId, description: "", supportsEffort: true }, new SafeProjection([]));
     expect(projected).toMatchObject({ modelId, contextWindow: 1_000_000, maxOutputTokens: 128_000, supportsImages: true,
       thinkingLevels: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "medium" });
-    expect(projected.pricing).toBeUndefined();
-    expect(claudeModelEstimate('private/' + modelId)).toBeUndefined();
+    expect(modelTokenPricesAt(projected, { at: Date.UTC(2026, 10, 5) }))
+      .toMatchObject({ currencyCode: "USD", cost: { input, output } });
+    expect(providerModel({ value: `private/${modelId}`, displayName: modelId, description: "" }, new SafeProjection([])).pricing)
+      .toBeUndefined();
   });
 });

@@ -77,6 +77,10 @@ describe("durable usage ledger", () => {
     ]));
     fixture.store.updateSession("session-1", { pinned: true }, fixture.store.getSession("session-1").revision);
     fixture.reopen();
+    expect(fixture.store.getUsageReport(query).totals).toEqual(expect.arrayContaining([
+      expect.objectContaining({ currencyCode: "USD", costMicros: 130 }),
+      expect.objectContaining({ currencyCode: "CNY", costMicros: 20 })
+    ]));
     expect(fixture.store.getUsageReport({ ...query, pageToken: first.nextPageToken }).entries[0]).toMatchObject({ modelId: "model-b" });
     expect(fixture.store.getUsageReport({ ...query, ownerId: "owner-b" }).entries).toEqual([]);
     expect(fixture.store.getUsageReport({ ...query, providerId: "provider-b", modelId: "model-a", fromDay: "2026-08-22", throughDay: "2026-08-22" })).toMatchObject({ totalGroups: 1, totals: [{ totalTokens: 20 }] });

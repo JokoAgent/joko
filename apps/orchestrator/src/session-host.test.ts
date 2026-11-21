@@ -5636,18 +5636,21 @@ describe("SessionHost", () => {
 
   it.each([
     { model: "claude-opus-5-5", at: Date.UTC(2026, 9, 29), fastMode: false, cacheWrite1hTokens: 1_000, costMicros: 890_000, complete: true },
-    { model: "claude-opus-5-5", at: Date.UTC(2026, 9, 29), fastMode: false, cacheWrite1hTokens: 1_000, overrideCacheWrite: 10, costMicros: 916_000, complete: true },
+    { model: "claude-opus-5-5", at: Date.UTC(2026, 9, 29), fastMode: false, cacheWrite1hTokens: 1_000, override: { cacheWrite: 10 }, costMicros: 916_000, complete: true },
     { model: "claude-opus-5-5", at: Date.UTC(2026, 9, 29), fastMode: true, cacheWrite1hTokens: 1_000, costMicros: 1_780_000, complete: true },
     { model: "google/gemini-3.8-flash", at: Date.UTC(2026, 11, 31, 23, 59, 59), fastMode: false, costMicros: 169_500, complete: false },
-    { model: "google/gemini-3.8-flash", at: Date.UTC(2027, 0, 1), fastMode: false, costMicros: 339_000, complete: false }
-  ])("records $model tariffs using request time $at and observed cache duration", async testCase => {
+    { model: "google/gemini-3.8-flash", at: Date.UTC(2027, 0, 1), fastMode: false, costMicros: 339_000, complete: false },
+    { model: "openai/gpt-6.2-sol", at: Date.UTC(2026, 10, 17), requestInput: 272_000, fastMode: false, costMicros: 730_000, complete: true },
+    { model: "openai/gpt-6.2-sol", at: Date.UTC(2026, 10, 17), requestInput: 272_001, fastMode: false, costMicros: 1_450_008, complete: true },
+    { model: "openai/gpt-6.2-sol", at: Date.UTC(2026, 10, 17), requestInput: 272_001, fastMode: false, override: { input: 3 }, costMicros: 2_130_012, complete: true }
+  ])("records $model tariffs using request time and observed usage as $costMicros micros", async testCase => {
     const { catalogModelReferencePricing, captureModelPriceReference } = await import("@joko/core");
-    const fixture = await createFixture(new TieredUsageFakeAdapter({ requestInput: 200_000, fastMode: testCase.fastMode,
+    const fixture = await createFixture(new TieredUsageFakeAdapter({ requestInput: testCase.requestInput ?? 200_000, fastMode: testCase.fastMode,
       requestedAt: testCase.at, cacheWrite1hTokens: testCase.cacheWrite1hTokens, pricing: catalogModelReferencePricing(testCase.model) }),
     { usageMoneyKind: () => "reference-value" });
-    if (testCase.overrideCacheWrite !== undefined) fixture.store.upsertModelPriceOverride({
+    if (testCase.override !== undefined) fixture.store.upsertModelPriceOverride({
       ownerId: "orchestrator", backendId: fixture.adapter.id, providerId: "test", modelId: "text",
-      values: { cacheWrite: testCase.overrideCacheWrite },
+      values: testCase.override,
       baseReference: captureModelPriceReference(fixture.store.getBackend(fixture.adapter.id).descriptor.models[0]!, testCase.at)
     });
     const sessionId = (await fixture.host.createSession({ operationId: "create-tariff-usage", connection: fixture.connection,

@@ -2,6 +2,7 @@ import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { zstdDecompressSync } from "node:zlib";
 import { clampThinkingLevel, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { buildBaseOptions } from "@earendil-works/pi-ai/api/simple-options";
+import { modelTokenPricesAt } from "@joko/core";
 import { describe, expect, it, vi } from "vitest";
 import { createPiModelCatalogAdditions, type createPiModelCatalogAdditionsFactory } from "./model-catalog-additions.js";
 import { MANAGED_MODEL_CATALOG_RUNTIME_SOURCE } from "./model-catalog-runtime.js";
@@ -189,6 +190,13 @@ describe("Pi model catalog additions", () => {
       cost: { input: 20, output: 100, cacheRead: 2, cacheWrite: 20 },
       pricing: { currencyCode: "CNY" }
     });
+    const at = Date.UTC(2026, 10, 5);
+    const globalQuote = additions.referenceCatalogMetadata(globalK3);
+    const chinaQuote = additions.referenceCatalogMetadata(chinaK3);
+    expect(modelTokenPricesAt({ cost: globalK3.cost, pricing: globalQuote?.pricing }, { at, cacheWriteTtl: "1h" }))
+      .toMatchObject({ currencyCode: "USD", cost: { cacheWrite: 6 } });
+    expect(modelTokenPricesAt({ cost: chinaK3.cost, pricing: chinaQuote?.pricing }, { at, cacheWriteTtl: "1h" }))
+      .toMatchObject({ currencyCode: "CNY", cost: { cacheWrite: 40 } });
 
     const custom = { ...runtime.getProvider("xiaomi")!, baseUrl: "https://gateway.example.test/v1" };
     expect(additions.extendProvider(custom)).toBe(custom);
