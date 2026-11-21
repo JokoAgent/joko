@@ -2628,21 +2628,29 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const scope = await this.#portableReadScope(input.target, signal);
     const hostGeneration = scope.hostGeneration;
     const assertCurrent = (): void => { signal.throwIfAborted(); scope.assertCurrent(); };
-    const staged = await stageCodexPortableRollout({ home: this.#profileDirectory, workspace: scope.workspaceRoot, bytes: input.bytes,
+    const currentConfig = await scope.host.request("config/read", { cwd: scope.workspaceRoot, includeLayers: false }, { signal, beforeDispatch: assertCurrent });
+    assertCurrent();
+    const provider = objectValue(objectValue(currentConfig.value, "receiving configuration")["config"], "effective configuration")["model_provider"] ?? "openai";
+    if (currentConfig.hostGeneration !== hostGeneration || typeof provider !== "string" || provider.trim() === ""
+      || provider.length > 256 || /[\u0000-\u001F\u007F]/u.test(provider)) {
+      throw codexPortableUnavailable("Codex did not confirm the receiving workspace's active Provider.");
+    }
+    const staged = await stageCodexPortableRollout({ home: this.#profileDirectory, workspace: scope.workspaceRoot, bytes: input.bytes, provider,
       ...(input.nativeSessionId === undefined ? {} : { operationIdentity: input.nativeSessionId }), assertCurrent });
     let resumed = false;
     try {
-      // The read-only resume builds the index using a built-in Provider.
-      // A source Session can name a proxy Provider that only existed on its node.
-      const receipt = await scope.host.request("thread/resume", { threadId: staged.threadId, cwd: scope.workspaceRoot,
-        modelProvider: "openai", excludeTurns: true, approvalPolicy: "never", sandbox: "read-only", config: { "features.goals": false } },
+      // Cold resume validates both the saved route and requested route against the receiving workspace.
+      const receipt = await scope.host.request("thread/resume", { threadId: staged.threadId, path: staged.path, cwd: scope.workspaceRoot,
+        modelProvider: provider, excludeTurns: true, approvalPolicy: "never", sandbox: "read-only", config: { "features.goals": false } },
         { signal, beforeDispatch: assertCurrent });
-      const raw = objectValue(objectValue(receipt.value, "adopted portable thread result")["thread"], "adopted portable thread");
+      const adopted = objectValue(receipt.value, "adopted portable thread result");
+      const raw = objectValue(adopted["thread"], "adopted portable thread");
       const receiptPath = optionalString(raw["path"]);
-      if (receipt.hostGeneration !== hostGeneration || receiptPath === undefined || !equalNativePaths(await realpath(receiptPath), staged.path)) {
+      resumed = receipt.hostGeneration === hostGeneration && raw["id"] === staged.threadId;
+      if (!resumed || adopted["modelProvider"] !== provider || receiptPath === undefined
+        || !equalNativePaths(await realpath(receiptPath), staged.path)) {
         throw codexPortableUnavailable("Codex did not resolve the receiving task's original staged rollout.");
       }
-      resumed = true;
       await assertNativeThreadTarget(parseThreadResult(receipt.value), staged.threadId, scope.workspaceRoot, "provision");
       const history = await this.#readCompleteHistoryFromHost({ host: scope.host, hostGeneration, threadId: staged.threadId,
         workspaceRoot: scope.workspaceRoot, remote: false, signal, assertOwner: assertCurrent });

@@ -144,6 +144,7 @@ export async function stageCodexPortableRollout(input: {
   readonly home: string;
   readonly workspace: string;
   readonly bytes: Uint8Array;
+  readonly provider: string;
   readonly operationIdentity?: string;
   readonly assertCurrent: () => void;
 }): Promise<StagedCodexPortableRollout> {
@@ -152,7 +153,7 @@ export async function stageCodexPortableRollout(input: {
   const home = await realpath(input.home);
   const { metadata, file } = rollouts[0];
   const threadId = transferredId(input.operationIdentity ?? randomUUID(), digest(input.bytes), file.threadId);
-  const payload: JsonObject = { ...metadata.payload, id: threadId, session_id: threadId, cwd: input.workspace };
+  const payload: JsonObject = { ...metadata.payload, id: threadId, session_id: threadId, cwd: input.workspace, model_provider: input.provider };
   if (payload["runtime_workspace_roots"] !== undefined) payload["runtime_workspace_roots"] = [input.workspace];
   for (const field of ["history_base", "forked_from_id", "forked_from_ordinal_exclusive", "creator_user_id", "creator_account_id",
     "agent_path", "selected_capability_roots", "dynamic_tools", "parent_thread_id", "attached_to_thread_id"]) delete payload[field];
