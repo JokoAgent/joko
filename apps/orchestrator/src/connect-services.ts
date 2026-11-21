@@ -4721,8 +4721,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
             if (apiKey && apiKey.length >= 8 && [model.id, model.name, model.metadata?.name].some(value => value?.includes(apiKey!))) return false;
             if (catalogId !== undefined) {
               const interfaces = contract.publicProviderInterfaces(catalogId, endpoint.toString(), model.id);
-              if (interfaces.length > 0) return interfaces.some(profile => !profile.compatibility?.includes("kimi-tool-ids-v1")
-                && backend.providerRuntimeSupport?.protocols.some(protocol => protocol === profile.api)
+              if (interfaces.length > 0) return interfaces.some(profile => backend.providerRuntimeSupport?.protocols.some(protocol => protocol === profile.api)
                 && (new URL(profile.baseUrl).pathname === endpoint.pathname || backend.providerRuntimeSupport.fields.includes("model_endpoint")));
               if (contract.publicProviderModel(catalogId, model.id)?.status === "retired") return false;
             }

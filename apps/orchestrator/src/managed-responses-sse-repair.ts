@@ -25,19 +25,27 @@ const encoder = new TextEncoder();
 export function createManagedResponsesSseRepair(
   options: ManagedResponsesSseRepairOptions
 ): ManagedResponsesSseRepair | undefined {
-  if (options.protocol !== "openai-responses" || !isEventStream(options.contentType)) return undefined;
-  return new ManagedResponsesSseRepairState();
+  return options.protocol === "openai-responses" ? createManagedSseRepair(options.contentType, repairEvent) : undefined;
 }
 
-class ManagedResponsesSseRepairState implements ManagedResponsesSseRepair {
+export function createManagedSseRepair(
+  contentType: string | null | undefined,
+  repair: (value: unknown) => JsonObject | undefined
+): ManagedResponsesSseRepair | undefined {
+  return isEventStream(contentType) ? new ManagedSseRepairState(repair) : undefined;
+}
+
+class ManagedSseRepairState implements ManagedResponsesSseRepair {
   #finished = false;
   #oversizedFrame = false;
   #oversizedSuffix: Uint8Array = EMPTY_BYTES;
   #pending: Uint8Array = EMPTY_BYTES;
 
+  constructor(readonly repair: (value: unknown) => JsonObject | undefined) {}
+
   write(chunk: Uint8Array): readonly Uint8Array[] {
-    if (this.#finished) throw new Error("The managed Responses SSE body is already complete.");
-    if (!(chunk instanceof Uint8Array)) throw new Error("The managed Responses SSE body chunk is invalid.");
+    if (this.#finished) throw new Error("The managed SSE body is already complete.");
+    if (!(chunk instanceof Uint8Array)) throw new Error("The managed SSE body chunk is invalid.");
     if (chunk.byteLength === 0) return [];
     const output: Uint8Array[] = [];
     let remaining = chunk;
@@ -57,7 +65,7 @@ class ManagedResponsesSseRepairState implements ManagedResponsesSseRepair {
     if (this.#pending.byteLength === 0) return [];
     const pending = this.#pending;
     this.#pending = EMPTY_BYTES;
-    return [rewriteFrame(pending, EMPTY_BYTES, pending)];
+    return [rewriteFrame(pending, EMPTY_BYTES, pending, this.repair)];
   }
 
   #writeBuffered(chunk: Uint8Array, output: Uint8Array[]): void {
@@ -71,7 +79,7 @@ class ManagedResponsesSseRepairState implements ManagedResponsesSseRepair {
       const delimiter = buffered.subarray(boundary.start, boundary.end);
       output.push(frame.byteLength > MAXIMUM_PENDING_FRAME_BYTES
         ? framed
-        : rewriteFrame(frame, delimiter, framed));
+        : rewriteFrame(frame, delimiter, framed, this.repair));
       offset = boundary.end;
     }
     this.#pending = buffered.slice(offset);
@@ -100,7 +108,7 @@ class ManagedResponsesSseRepairState implements ManagedResponsesSseRepair {
   }
 }
 
-function rewriteFrame(frame: Uint8Array, delimiter: Uint8Array, original: Uint8Array): Uint8Array {
+function rewriteFrame(frame: Uint8Array, delimiter: Uint8Array, original: Uint8Array, repair: (value: unknown) => JsonObject | undefined): Uint8Array {
   let text: string;
   try {
     text = new TextDecoder("utf-8", { fatal: true }).decode(frame);
@@ -126,7 +134,7 @@ function rewriteFrame(frame: Uint8Array, delimiter: Uint8Array, original: Uint8A
   } catch {
     return original;
   }
-  const repaired = repairEvent(event);
+  const repaired = repair(event);
   if (repaired === undefined) return original;
 
   const firstDataIndex = dataIndexes[0]!;

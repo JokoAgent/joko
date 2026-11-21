@@ -16,7 +16,8 @@ async function fixture(
   protocol: "openai-responses" | "openai-completions" | "anthropic-messages" = "openai-responses",
   providerId = "provider",
   configuredPath?: string | null,
-  clientProtocol?: "anthropic-messages"
+  clientProtocol?: "anthropic-messages",
+  officialRoute?: { readonly baseUrl: string; readonly modelId: string }
 ) {
   const directory = await mkdtemp(join(tmpdir(), "joko-provider-proxy-"));
   const store = new OperationalStore(join(directory, "store.db"));
@@ -108,6 +109,9 @@ async function fixture(
   const routedFetch: typeof fetch = async (input, init) => {
     const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
     if (url.origin === endpoint) return await fetch(input, init);
+    if (officialRoute !== undefined && url.origin === new URL(officialRoute.baseUrl).origin) {
+      return await fetch(new URL(url.pathname + url.search, endpoint), init);
+    }
     const headers = new Headers(init?.headers);
     const body = JSON.parse(typeof init?.body === "string" ? init.body : Buffer.from(init?.body as Uint8Array).toString("utf8"));
     nativeReceived.push({
@@ -127,12 +131,12 @@ async function fixture(
   await proxy.start();
   const port = proxy.createRuntime({ backendId: "runtime", generation: 3, support: { protocols: [protocol], fields: [] }, clientProtocol,
     assertCurrent: () => { if (!ownerCurrent) throw new Error("Runtime changed"); } });
-  const owner = { backendId: "runtime", backendInstanceGeneration: 3, targetId: "target", sessionId: "session", sessionGeneration: 4, providerId, modelId: "model" };
+  const owner = { backendId: "runtime", backendInstanceGeneration: 3, targetId: "target", sessionId: "session", sessionGeneration: 4, providerId, modelId: officialRoute?.modelId ?? "model" };
   const requestPath = configuredPath === null ? undefined : configuredPath ?? (protocol === "anthropic-messages" ? "/custom/messages"
     : protocol === "openai-completions" ? "/custom/chat/completions" : "/custom/responses");
-  const baseUrl = configuredPath === null ? `${endpoint}/v1` : endpoint;
+  const baseUrl = officialRoute?.baseUrl ?? (configuredPath === null ? `${endpoint}/v1` : endpoint);
   const catalogModels = [
-    { id: "model", input: ["text"] as const, contextWindow: 64_000, maxTokens: 4_000 },
+    { id: owner.modelId, input: ["text"] as const, contextWindow: 64_000, maxTokens: 4_000 },
     { id: "child-model", input: ["text"] as const, contextWindow: 128_000, maxTokens: 8_000 }
   ];
   const write = async (revision: bigint, secret: string, modelEndpoint?: string) => {
@@ -143,7 +147,7 @@ async function fixture(
       runtimes: [{ backendId: "runtime", provider: { id: providerId, api: protocol, baseUrl, apiKeyEnv: "PROVIDER_KEY",
         headers: { "X-Joko-Provider-Proxy-Token": { env: "PROVIDER_KEY" } },
         models: modelEndpoint === undefined ? catalogModels : catalogModels.map(model => model.id === owner.modelId ? { ...model, baseUrl: modelEndpoint } : model) },
-        credentialBindings: { PROVIDER_KEY: reference }, credentialOrigin: endpoint, requestPath }] });
+        credentialBindings: { PROVIDER_KEY: reference }, credentialOrigin: new URL(baseUrl).origin, requestPath }] });
   };
   await write(0n, "first-private-provider-credential");
   const markProviderUnavailable = async () => {
@@ -195,6 +199,51 @@ function responsesEvents(body: string): Record<string, unknown>[] {
 }
 
 describe("Managed Provider native proxy", () => {
+  it("keeps Kimi Messages tool exchanges unique across duplicate history, compaction, and runtime reattachment", async () => {
+    const f = await fixture(false, "anthropic-messages", "configured-kimi-account", null, "anthropic-messages", {
+      baseUrl: "https://api.kimi.com/coding", modelId: "k3.1-pro"
+    });
+    const start = (id: string) => ({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id, name: "Read", input: {} } });
+    const delta = chatEvent({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"path":"note.txt"}' } });
+    const call = (id: string) => ({ role: "assistant", content: [{ type: "tool_use", id, name: "Read", input: {} }] });
+    const result = (id: string, content: string) => ({ role: "user", content: [{ type: "tool_result", tool_use_id: id, content }] });
+    const emptyHistory = [{ role: "user", content: "Read another file." }];
+    try {
+      const turn = async (operationId: string, messages: readonly unknown[], sessionId = f.owner.sessionId, stream = true) => {
+        const binding = await f.port.prepare({ ...f.owner, sessionId });
+        const lease = await binding.activate({ operationId, signal: new AbortController().signal, assertCurrent: () => undefined });
+        try {
+          const response = await fetch(`${binding.baseUrl}/v1/messages`, {
+            method: "POST", headers: { "content-type": "application/json", "x-api-key": f.token },
+            body: JSON.stringify({ model: f.owner.modelId, messages, stream, max_tokens: 100 })
+          });
+          expect(response.status).toBe(200);
+          return await response.text();
+        } finally { lease.release(); binding.dispose(); }
+      };
+      f.respondWith(chatEvent(start("Read_7")) + delta);
+      const first = await turn("kimi-first", emptyHistory);
+      expect(first).toBe(chatEvent(start("Read_7")) + delta);
+      const compacted = await turn("kimi-compacted", emptyHistory);
+      expect(compacted).toBe(chatEvent(start("Read_7_dup2")) + delta);
+      const repaired = await turn("kimi-duplicate-history", [
+        call("Read_7"), result("Read_7", "first result"), call("Read_7"), result("Read_7", "second result"),
+        call("Read_7_dup2"), result("Read_7_dup2", "already has that suffix")
+      ]);
+      expect(repaired).toBe(chatEvent(start("Read_7_dup4")) + delta);
+      expect(f.receivedBodies.at(-1)?.messages).toEqual([
+        call("Read_7"), result("Read_7", "first result"), call("Read_7_dup3"), result("Read_7_dup3", "second result"),
+        call("Read_7_dup2"), result("Read_7_dup2", "already has that suffix")
+      ]);
+      expect(await turn("kimi-separate-task", emptyHistory, "another-task")).toBe(first);
+      const json = JSON.stringify({ type: "message", content: [start("Read_7").content_block] });
+      f.respondWith(json, "application/json");
+      expect(await turn("kimi-json", emptyHistory, f.owner.sessionId, false)).toBe(json);
+      expect(f.received.every(request => request.path === "/coding/v1/messages" && request.model === "k3.1-pro")).toBe(true);
+      expect(f.forwardedClaudeKeys.every(key => key === "first-private-provider-credential")).toBe(true);
+    } finally { await f.dispose(); }
+  });
+
   it("accepts the Claude SDK Messages query only with the original model operation", async () => {
     const f = await fixture(false, "anthropic-messages", "claude-messages-provider", null, "anthropic-messages");
     try {

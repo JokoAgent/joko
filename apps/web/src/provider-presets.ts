@@ -71,8 +71,7 @@ export function providerModelInterfaceOptions(backend: BackendView, endpoint: st
     const compatibility = compatibilityForWireProtocol(profile.api);
     if (compatibility === undefined || backend.providerRuntimeSupport?.protocols.includes(compatibility) !== true
       || providerEndpointOrigin(profile.baseUrl) !== origin
-      || (profile.baseUrl !== endpoint && !supportsProviderField(backend, "modelEndpoint"))
-      || profile.compatibility?.includes("kimi-tool-ids-v1")) return [];
+      || (profile.baseUrl !== endpoint && !supportsProviderField(backend, "modelEndpoint"))) return [];
     return [{ profile, compatibility, endpoint: profile.baseUrl === endpoint ? undefined : profile.baseUrl }];
   });
 }
