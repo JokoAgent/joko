@@ -67,6 +67,7 @@ vi.mock("../src/remote-desktop-linux-clipboard.js", () => ({
   desktopRemoteDesktopLinuxClipboard: { closePublishedWriter: h.closeClipboardWriter }
 }));
 vi.mock("../src/remote-desktop-linux.js", () => ({ WAYLAND_REMOTE_DESKTOP_DISPLAY_ID: "wayland-portal",
+  isDesktopRemoteDesktopX11: () => false,
   isDesktopRemoteDesktopWayland: () => h.linuxWayland, supportsDesktopRemoteDesktopLinuxCapture: () => h.linuxNative,
   readDesktopRemoteDesktopLinuxSessionState: vi.fn(async () => h.linuxSession),
   readDesktopRemoteDesktopLinuxLockSessionState: vi.fn(async () => h.linuxSession),

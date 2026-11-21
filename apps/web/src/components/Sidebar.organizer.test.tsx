@@ -794,7 +794,7 @@ describe("Sidebar organizer display controls", () => {
     await act(async () => buttonWithText(menu, "projects.removeFromSidebar").click());
     const dialog = required(document.body.querySelector<HTMLElement>("[role='alertdialog']"));
     await act(async () => buttonWithText(dialog, "common.remove").click());
-    expect(onRemoveTarget).toHaveBeenCalledWith(target);
+    expect(onRemoveTarget).toHaveBeenCalledWith(target, undefined);
 
     menu = await openMenu();
     await act(async () => buttonWithText(menu, "projects.search").click());
@@ -819,7 +819,7 @@ describe("Sidebar organizer display controls", () => {
     await act(async () => buttonWithText(required(document.body.querySelector<HTMLElement>(".sidebar-project-actions-menu")), "projects.removeFromSidebar").click());
     const confirm = buttonWithText(required(document.body.querySelector<HTMLElement>("[role='alertdialog']")), "common.remove");
     await act(async () => { confirm.focus(); confirm.click(); });
-    expect(onRemoveTarget).toHaveBeenCalledExactlyOnceWith(target);
+    expect(onRemoveTarget).toHaveBeenCalledExactlyOnceWith(target, undefined);
     expect(document.activeElement).toBe(more);
     if (outcome === "user-focus") {
       const other = document.createElement("button"); document.body.append(other);

@@ -585,7 +585,9 @@ describe("Managed Provider native proxy", () => {
       const lease = await binding.activate({ operationId: "chat-history", signal: new AbortController().signal, assertCurrent: () => undefined });
       try {
         f.respondWith(JSON.stringify({ id: "history-result", choices: [
-          { index: 0, message: { role: "assistant", content: "History accepted." }, finish_reason: "stop" }
+          { index: 0, message: { role: "assistant", content: null, tool_calls: [
+            { id: "next-note", type: "function", function: { name: "read_note", arguments: "{}" } }
+          ] }, finish_reason: "tool_calls" }
         ] }), "application/json");
         const response = await fetch(`${binding.baseUrl}/responses`, { method: "POST", headers: {
           "content-type": "application/json", authorization: `Bearer ${f.token}`
