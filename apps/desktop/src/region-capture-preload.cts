@@ -9,6 +9,17 @@ if (process.isMainFrame) {
     selectWindow: (id: string) => ipcRenderer.invoke("joko:region-capture:select-window", id),
     action: (name: "copy" | "save" | "attach" | "pin", bytes: Uint8Array) =>
       ipcRenderer.invoke("joko:region-capture:action", name, bytes),
+    startLive: (mode: "scroll" | "gif" | "video", microphone: boolean, systemAudio: boolean) =>
+      ipcRenderer.invoke("joko:region-capture:live:start", mode, microphone, systemAudio),
+    showLive: () => ipcRenderer.invoke("joko:region-capture:live:show"),
+    endLive: (keepOutput: boolean) => ipcRenderer.invoke("joko:region-capture:live:end", keepOutput),
+    recordingAction: (name: "copy" | "save", bytes: Uint8Array) =>
+      ipcRenderer.invoke("joko:region-capture:recording:action", name, bytes),
+    onShortcutStop: (listener: () => void) => {
+      const receive = () => listener();
+      ipcRenderer.on("joko:region-capture:live:stop", receive);
+      return () => { ipcRenderer.removeListener("joko:region-capture:live:stop", receive); };
+    },
     cancel: () => ipcRenderer.invoke("joko:region-capture:cancel")
   }));
 }

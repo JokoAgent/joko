@@ -1,10 +1,11 @@
-import { BrowserWindow, clipboard, desktopCapturer, dialog, nativeImage, powerMonitor, screen, systemPreferences,
-  type DesktopCapturerSource, type Display, type IpcMain, type IpcMainInvokeEvent, type NativeImage, type Rectangle } from "electron";
+import { BrowserWindow, clipboard, desktopCapturer, dialog, nativeImage, powerMonitor, screen, session, systemPreferences,
+  type DesktopCapturerSource, type Display, type IpcMain, type IpcMainInvokeEvent, type NativeImage, type Rectangle, type Session } from "electron";
 import { writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 
 const MAX_IMAGE_PIXELS = 36_000_000;
 const MAX_IMAGE_BYTES = 24 * 1024 * 1024;
+const MAX_RECORDING_BYTES = 36 * 1024 * 1024;
 const MAX_PINS = 4;
 const FREEZE_TIMEOUT = 5_000;
 const SELECTION_TIMEOUT = 5 * 60_000;
@@ -21,6 +22,8 @@ interface CaptureOptions {
   readonly locale: () => "en" | "zh-CN";
   readonly dark: () => boolean;
   readonly node: () => RegionCaptureNode | undefined;
+  readonly installResources: (partition: Session) => void;
+  readonly canStopByShortcut: () => boolean;
   readonly deliver: (owner: RegionCaptureNode, file: { id: string; bytes: Uint8Array; name: string }) => boolean;
 }
 
@@ -36,14 +39,29 @@ interface CaptureSurface {
   readonly mode: "screen" | "pin";
   readonly display?: Display;
   selected?: NativeImage;
+  selection?: UnitRect;
+  output?: { readonly mode: "scroll" | "gif" | "video"; readonly width: number; readonly height: number };
 }
 
 export const REGION_CAPTURE_IPC = {
   read: "joko:region-capture:read", select: "joko:region-capture:select", listWindows: "joko:region-capture:list-windows",
-  selectWindow: "joko:region-capture:select-window", action: "joko:region-capture:action", cancel: "joko:region-capture:cancel"
+  selectWindow: "joko:region-capture:select-window", action: "joko:region-capture:action", cancel: "joko:region-capture:cancel",
+  startLive: "joko:region-capture:live:start", showLive: "joko:region-capture:live:show", endLive: "joko:region-capture:live:end",
+  saveRecording: "joko:region-capture:recording:action", stopLive: "joko:region-capture:live:stop"
 } as const;
 
 type UnitRect = { readonly left: number; readonly top: number; readonly right: number; readonly bottom: number };
+type LiveMode = "scroll" | "gif" | "video";
+interface RegionLiveCapture {
+  readonly surface: CaptureSurface;
+  readonly mode: LiveMode;
+  readonly display: Display;
+  readonly microphone: boolean;
+  readonly systemAudio: boolean;
+  readonly originalBounds: Rectangle;
+  readonly controls?: Rectangle;
+  grantAvailable: boolean;
+}
 
 export function regionCaptureCrop(value: unknown, image: { width: number; height: number }): Rectangle | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
@@ -68,6 +86,7 @@ export function validRegionPngHeader(bytes: Uint8Array, expected: { width: numbe
 export class DesktopRegionCapture {
   readonly #options: CaptureOptions;
   readonly #surfaces = new Map<number, CaptureSurface>();
+  #partition: Session | undefined;
   #node: RegionCaptureNode | undefined;
   #selected: CaptureSurface | undefined;
   #windowChoices = new Map<string, DesktopCapturerSource>();
@@ -76,6 +95,7 @@ export class DesktopRegionCapture {
   #deadline: NodeJS.Timeout | undefined;
   #disposed = false;
   #actionPending = false;
+  #live: RegionLiveCapture | undefined;
 
   constructor(options: CaptureOptions) { this.#options = options; }
 
@@ -89,7 +109,9 @@ export class DesktopRegionCapture {
       const surface = this.#requireScreen(event);
       const crop = regionCaptureCrop(rectangle, surface.image.getSize(1));
       if (!crop) throw new TypeError("The capture region is invalid.");
-      return this.#select(surface, surface.image.crop(crop));
+      const result = this.#select(surface, surface.image.crop(crop));
+      surface.selection = rectangle as UnitRect;
+      return result;
     });
     ipc.handle(REGION_CAPTURE_IPC.listWindows, event => this.#listWindows(this.#requireScreen(event)));
     ipc.handle(REGION_CAPTURE_IPC.selectWindow, (event, choice: unknown) => {
@@ -99,6 +121,30 @@ export class DesktopRegionCapture {
       return this.#select(surface, source.thumbnail);
     });
     ipc.handle(REGION_CAPTURE_IPC.action, (event, action: unknown, bytes: unknown) => this.#perform(this.#requireScreen(event), action, bytes));
+    ipc.handle(REGION_CAPTURE_IPC.startLive, (event, mode: unknown, microphone: unknown, audio: unknown) =>
+      this.#startLive(this.#requireScreen(event), mode, microphone, audio));
+    ipc.handle(REGION_CAPTURE_IPC.showLive, event => {
+      const live = this.#requireLive(event);
+      const window = live.surface.window;
+      window.setContentProtection(true);
+      if (live.controls === undefined) window.hide();
+      else {
+        window.setBounds(live.controls, false);
+        window.showInactive();
+      }
+    });
+    ipc.handle(REGION_CAPTURE_IPC.endLive, (event, keepOutput: unknown) => {
+      const live = this.#requireLive(event);
+      if (typeof keepOutput !== "boolean") throw new TypeError("Screen recording outcome is invalid.");
+      this.#live = undefined;
+      const window = live.surface.window;
+      if (!keepOutput) live.surface.output = undefined;
+      window.setBounds(live.originalBounds, false);
+      window.setContentProtection(false);
+      window.show();
+    });
+    ipc.handle(REGION_CAPTURE_IPC.saveRecording, (event, action: unknown, bytes: unknown) =>
+      this.#recordingAction(this.#requireScreen(event), action, bytes));
     ipc.handle(REGION_CAPTURE_IPC.cancel, event => {
       const surface = this.#requireSurface(event);
       if (surface.mode === "pin") surface.window.destroy();
@@ -112,6 +158,11 @@ export class DesktopRegionCapture {
 
   async begin(): Promise<void> {
     if (this.#disposed || this.#starting) return;
+    const live = this.#live;
+    if (live !== undefined && !live.surface.window.isDestroyed()) {
+      live.surface.window.webContents.send(REGION_CAPTURE_IPC.stopLive);
+      return;
+    }
     if (this.#selected !== undefined && !this.#selected.window.isDestroyed()) {
       this.#selected.window.focus();
       return;
@@ -154,6 +205,7 @@ export class DesktopRegionCapture {
     this.#deadline = undefined;
     this.#node = undefined;
     this.#selected = undefined;
+    this.#live = undefined;
     this.#windowChoices.clear();
     for (const [id, surface] of this.#surfaces) if (surface.mode === "screen") {
       this.#surfaces.delete(id);
@@ -201,6 +253,33 @@ export class DesktopRegionCapture {
     return surface;
   }
 
+  #requireLive(event: IpcMainInvokeEvent): RegionLiveCapture {
+    const surface = this.#requireSurface(event);
+    const live = this.#live;
+    if (live === undefined || live.surface !== surface) throw new Error("The selected screen recording is no longer active.");
+    return live;
+  }
+
+  #startLive(surface: CaptureSurface, mode: unknown, microphone: unknown, systemAudio: unknown) {
+    const { display, selection, selected } = surface;
+    if ((mode !== "scroll" && mode !== "gif" && mode !== "video") || typeof microphone !== "boolean" || typeof systemAudio !== "boolean"
+      || (mode !== "video" && (microphone || systemAudio)) || !display || !selection || !selected || this.#live !== undefined || this.#actionPending) {
+      throw new Error("Select one display region before recording.");
+    }
+    const crop = regionCaptureCrop(selection, display.bounds);
+    if (!crop) throw new Error("The display region changed.");
+    const controls = regionCaptureControlBounds({ x: display.bounds.x + crop.x, y: display.bounds.y + crop.y, width: crop.width, height: crop.height },
+      [display.workArea, ...screen.getAllDisplays().filter(candidate => candidate.id !== display.id).map(candidate => candidate.workArea)]);
+    if (controls === undefined && !this.#options.canStopByShortcut()) throw new Error("The capture shortcut or room for recording controls is required.");
+    const size = selected.getSize(1);
+    const edge = mode === "gif" ? 960 : mode === "video" ? 1920 : 1600;
+    const scale = Math.min(1, edge / Math.max(size.width, size.height));
+    const width = Math.max(1, Math.round(size.width * scale)), height = Math.max(1, Math.round(size.height * scale));
+    surface.output = { mode, width, height };
+    this.#live = { surface, mode, display, microphone, systemAudio, originalBounds: surface.window.getBounds(), controls, grantAvailable: true };
+    return { selection, width, height, shortcutStops: controls === undefined };
+  }
+
   #select(surface: CaptureSurface, image: NativeImage): CaptureImage {
     const payload = captureImage(image);
     surface.selected = image;
@@ -232,8 +311,13 @@ export class DesktopRegionCapture {
   }
 
   async #perform(surface: CaptureSurface, action: unknown, bytes: unknown): Promise<boolean> {
-    if (!surface.selected || this.#actionPending || !(bytes instanceof Uint8Array)
-      || !validRegionPngHeader(bytes, surface.selected.getSize(1))) throw new Error("The edited capture is unavailable.");
+    if (!surface.selected || this.#actionPending || this.#live || !(bytes instanceof Uint8Array)) throw new Error("The edited capture is unavailable.");
+    const expected = surface.output?.mode === "scroll" && bytes.length >= 33
+      ? { width: surface.output.width, height: Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).readUInt32BE(20) }
+      : surface.selected.getSize(1);
+    if (!validRegionPngHeader(bytes, expected) || (surface.output?.mode === "scroll" && (expected.height < surface.output.height || expected.height > 16_000))) {
+      throw new Error("The edited capture size changed.");
+    }
     const edited = nativeImage.createFromBuffer(Buffer.from(bytes));
     if (edited.isEmpty()) throw new Error("The edited capture could not be decoded.");
     const generation = this.#generation;
@@ -264,12 +348,73 @@ export class DesktopRegionCapture {
     }
   }
 
+  async #recordingAction(surface: CaptureSurface, action: unknown, bytes: unknown): Promise<boolean> {
+    const output = surface.output;
+    if (this.#live || this.#actionPending || !output || output.mode === "scroll" || !(bytes instanceof Uint8Array)
+      || !validRegionRecording(bytes, output.mode, output)) throw new Error("The recording result is unavailable.");
+    if (action !== "copy" && action !== "save") throw new TypeError("Unknown recording action.");
+    const format = output.mode === "gif" ? "gif" : "webm", generation = this.#generation;
+    this.#actionPending = true;
+    try {
+      if (action === "copy") clipboard.writeBuffer(format === "gif" ? "image/gif" : "video/webm", Buffer.from(bytes));
+      else {
+        const target = await dialog.showSaveDialog(surface.window, { defaultPath: `Screen recording ${Date.now()}.${format}`,
+          filters: [{ name: format === "gif" ? "GIF" : "WebM", extensions: [format] }] });
+        if (generation !== this.#generation || target.canceled || !target.filePath) return false;
+        await writeFile(target.filePath, bytes);
+      }
+      if (generation === this.#generation) this.retireSelection();
+      return true;
+    } finally { this.#actionPending = false; }
+  }
+
+  #capturePartition(): Session {
+    if (this.#partition) return this.#partition;
+    const partition = session.fromPartition("joko-region-capture-local", { cache: false });
+    this.#options.installResources(partition);
+    const claimsOwner = (contents: Electron.WebContents | null, isMainFrame: boolean, frameUrl: string | undefined): boolean => {
+      const window = this.#live?.surface.window;
+      return window !== undefined && !window.isDestroyed() && contents === window.webContents && isMainFrame
+        && frameUrl === this.#options.entryUrl() && contents?.getURL() === frameUrl;
+    };
+    partition.setPermissionCheckHandler((contents, permission, _origin, details) => {
+      return claimsOwner(contents, details.isMainFrame, details.requestingUrl)
+        && (permission === "display-capture" || permission === "media" && (details.mediaType === "unknown"
+          || details.mediaType === "audio" && this.#live?.microphone === true));
+    });
+    partition.setPermissionRequestHandler((contents, permission, callback, details) => {
+      const requestedMedia = "mediaTypes" in details ? details.mediaTypes : undefined;
+      callback(claimsOwner(contents, details.isMainFrame, details.requestingUrl)
+        && (permission === "display-capture" || permission === "media" && Array.isArray(requestedMedia) && (requestedMedia.length === 0
+          || (requestedMedia.length === 1 && requestedMedia[0] === "audio" && this.#live?.microphone === true))));
+    });
+    partition.setDisplayMediaRequestHandler((request, callback) => {
+      const live = this.#live, window = live?.surface.window;
+      if (!live || !window || window.isDestroyed() || !live.grantAvailable || request.frame !== window.webContents.mainFrame
+        || request.frame?.url !== this.#options.entryUrl() || !request.userGesture
+        || !request.videoRequested || request.audioRequested !== live.systemAudio) {
+        callback({});
+        return;
+      }
+      live.grantAvailable = false;
+      void readSources({ types: ["screen"], thumbnailSize: { width: 0, height: 0 } }).then(sources => {
+        const source = sources.find(item => item.display_id === String(live.display.id))
+          ?? (sources.length === 1 && screen.getAllDisplays().length === 1 ? sources[0] : undefined);
+        if (this.#live !== live || window.isDestroyed() || request.frame !== window.webContents.mainFrame || !source) callback({});
+        else callback({ video: source, ...(live.systemAudio ? { audio: "loopback" as const } : {}) });
+      }, () => callback({}));
+    });
+    partition.on("will-download", event => event.preventDefault());
+    this.#partition = partition;
+    return partition;
+  }
+
   #open(mode: CaptureSurface["mode"], image: NativeImage, bounds: Rectangle, display: Display | undefined, focus: boolean): void {
     const url = this.#options.entryUrl();
     const window = new BrowserWindow({ ...bounds, title: "Joko", frame: false, show: false, skipTaskbar: true,
       hasShadow: mode === "pin", resizable: mode === "pin", fullscreenable: false, movable: mode === "pin",
       webPreferences: { preload: this.#options.preload, sandbox: true, contextIsolation: true, nodeIntegration: false,
-        webSecurity: true, navigateOnDragDrop: false, spellcheck: false, backgroundThrottling: false }
+        webSecurity: true, navigateOnDragDrop: false, spellcheck: false, backgroundThrottling: false, session: this.#capturePartition() }
     });
     const contents = window.webContents, contentsId = contents.id;
     this.#surfaces.set(contentsId, { window, image, mode, ...(display === undefined ? {} : { display }) });
@@ -288,6 +433,30 @@ export class DesktopRegionCapture {
     window.once("ready-to-show", () => { if (!window.isDestroyed()) focus ? window.show() : window.showInactive(); });
     void window.loadURL(url).catch(() => { if (!window.isDestroyed()) window.destroy(); });
   }
+}
+
+export function regionCaptureControlBounds(selection: Rectangle, displays: readonly Rectangle[]): Rectangle | undefined {
+  for (const area of displays) {
+    const width = Math.min(460, area.width - 20), height = 71;
+    if (width < 270 || area.height < height + 20) continue;
+    const x = area.x + Math.round((area.width - width) / 2);
+    for (const y of [area.y + 10, area.y + area.height - height - 10]) {
+      if (x + width <= selection.x || x >= selection.x + selection.width || y + height <= selection.y || y >= selection.y + selection.height) {
+        return { x, y, width, height };
+      }
+    }
+  }
+  return undefined;
+}
+
+export function validRegionRecording(bytes: Uint8Array, mode: "gif" | "video", size: { width: number; height: number }): boolean {
+  if (bytes.byteLength < 16 || bytes.byteLength > MAX_RECORDING_BYTES) return false;
+  const data = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (mode === "gif") {
+    return ["GIF87a", "GIF89a"].includes(data.toString("ascii", 0, 6)) && data.readUInt16LE(6) === size.width
+      && data.readUInt16LE(8) === size.height && data.at(-1) === 0x3b;
+  }
+  return data.readUInt32BE(0) === 0x1a45dfa3 && data.subarray(4, 128).includes(Buffer.from("webm", "ascii"));
 }
 
 function thumbnailSize(displays: readonly Display[]) {

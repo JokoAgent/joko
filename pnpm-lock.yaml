@@ -852,6 +852,9 @@ importers:
       diff:
         specifier: 8.0.4
         version: 8.0.4
+      gifenc:
+        specifier: 1.0.3
+        version: 1.0.3
       html-to-image:
         specifier: 1.11.13
         version: 1.11.13
@@ -6158,6 +6161,9 @@ packages:
   getenv@2.0.0:
     resolution: {integrity: sha512-VilgtJj/ALgGY77fiLam5iD336eSWi96Q15JSAG1zi8NRBysm3LXKdGnHb4m5cuyxvOLQQKWpBZAT6ni4FI2iQ==}
     engines: {node: '>=6'}
+
+  gifenc@1.0.3:
+    resolution: {integrity: sha512-xdr6AdrfGBcfzncONUOlXMBuc5wJDtOueE3c5rdG0oNgtINLD+f2iFZltrBRZYzACRbKr+mSVU/x98zv2u3jmw==}
 
   glob@11.1.0:
     resolution: {integrity: sha512-vuNwKSaKiqm7g0THUBu2x7ckSs3XJLXE+2ssL7/MfTGPLLcrJQ/4Uq1CjPTtO5cCIiRxqvN6Twy1qOwhL0Xjcw==}
@@ -14565,6 +14571,8 @@ snapshots:
       pump: 3.0.4
 
   getenv@2.0.0: {}
+
+  gifenc@1.0.3: {}
 
   glob@11.1.0:
     dependencies:

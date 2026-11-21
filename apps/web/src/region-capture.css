@@ -38,6 +38,14 @@ nav > div { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 #status { bottom: 18px; padding: 8px 12px; font-size: 13px; }
 [data-mode="pin"] nav { left: auto; right: 4px; top: 4px; transform: none; padding: 3px; }
 [data-mode="pin"] #stage { -webkit-app-region: drag; }
+[data-mode="live"] #stage { display: none; }
+[data-mode="live"] { background: var(--surface); }
+[data-mode="live"] nav { top: 6px; }
+[data-mode="recording"] #stage { padding: 72px 24px 28px; background: var(--veil); }
+#playback, #animation { max-width: 100%; max-height: 100%; object-fit: contain; }
+#audio { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font-size: 13px; }
+#audio[open] label { display: inline-flex; align-items: center; }
+#audio summary { cursor: pointer; }
 button, select {
   color: inherit;
   background: var(--surface);

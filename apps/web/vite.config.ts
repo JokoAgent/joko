@@ -1,4 +1,5 @@
 import { defineConfig } from "vite";
+import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 
 import { modelViewerAssetsPlugin } from "./model-viewer-assets.js";
@@ -20,6 +21,10 @@ export default defineConfig({
     sourcemap: true,
     chunkSizeWarningLimit: 500,
     rollupOptions: {
+      input: {
+        index: fileURLToPath(new URL("./index.html", import.meta.url)),
+        "region-capture": fileURLToPath(new URL("./region-capture.html", import.meta.url))
+      },
       output: {
         manualChunks(id) {
           const path = id.replace(/\\/gu, '/');

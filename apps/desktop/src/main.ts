@@ -8755,6 +8755,27 @@ function initializeRegionCapture(): void {
     preload: join(sourceDirectory, "region-capture-preload.cjs"),
     locale: () => applicationMenuLocale,
     dark: () => nativeTheme.shouldUseDarkColors,
+    canStopByShortcut: () => registeredRegionCaptureShortcut !== undefined,
+    installResources: partition => {
+      const developmentUrl = navigationPolicy.developmentUrl;
+      if (developmentUrl === undefined) {
+        partition.protocol.handle(DESKTOP_APP_SCHEME, async request => {
+          const url = new URL(request.url);
+          const resource = request.method === "GET" && url.search === "" && url.hash === ""
+            && (url.pathname === "/region-capture.html" || url.pathname.startsWith("/assets/"))
+            ? resolvePackagedAppResource(request.url, navigationPolicy) : undefined;
+          if (resource === undefined) return new Response(null, { status: 404 });
+          const response = await net.fetch(pathToFileURL(resource).href, { bypassCustomProtocolHandlers: true });
+          return securePackagedAppScriptResponse(response, resource);
+        });
+      }
+      partition.webRequest.onBeforeRequest((request, reply) => {
+        const url = new URL(request.url);
+        const local = developmentUrl === undefined ? url.protocol === `${DESKTOP_APP_SCHEME}:` && url.hostname === "app"
+          : url.origin === new URL(developmentUrl).origin;
+        reply({ cancel: !local && url.protocol !== "blob:" });
+      });
+    },
     node: () => currentMainWindowDocumentOccurrence() === desktopRegionCaptureOwner?.documentOccurrence ? desktopRegionCaptureOwner : undefined,
     deliver: (owner, file) => {
       const window = mainWindow;

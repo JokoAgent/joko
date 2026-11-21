@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; img-src blob:; media-src blob:; connect-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'">
+  <title>Joko · Screen capture</title>
+  <link rel="stylesheet" href="./src/region-capture.css">
+</head>
+<body>
+  <main id="view" data-mode="loading">
+    <div id="stage">
+      <canvas id="capture"></canvas>
+      <video id="playback" playsinline controls hidden></video>
+      <img id="animation" alt="Captured animation" hidden>
+    </div>
+    <nav id="controls" aria-label="Screen capture" hidden>
+      <div id="select-actions" hidden>
+        <span data-label="choose">Drag to select a region</span>
+        <button id="full" data-label="full" type="button">Full screen</button>
+        <button id="windows" data-label="windows" type="button">Choose a window</button>
+        <select id="window-choices" aria-label="Choose a window" hidden></select>
+      </div>
+      <div id="edit-actions" hidden>
+        <button id="pen" aria-pressed="true" data-label="pen" type="button">Draw</button>
+        <button id="outline" aria-pressed="false" data-label="outline" type="button">Rectangle</button>
+        <button id="undo" data-label="undo" disabled type="button">Undo</button>
+        <button id="scroll" data-label="scroll" type="button">Scrolling capture</button>
+        <button id="gif" type="button">GIF</button>
+        <button id="video" data-label="video" type="button">Record video</button>
+        <details id="audio">
+          <summary data-label="audio">Audio</summary>
+          <label><input id="microphone" type="checkbox"><span data-label="microphone">Microphone</span></label>
+          <label><input id="system-audio" type="checkbox"><span data-label="systemAudio">Computer audio</span></label>
+        </details>
+        <button id="copy" data-label="copy" type="button">Copy</button>
+        <button id="save" data-label="save" type="button">Save</button>
+        <button id="pin" data-label="pin" type="button">Pin</button>
+        <button id="attach" data-label="attach" type="button" hidden>Attach to new task</button>
+      </div>
+      <div id="live-actions" hidden>
+        <span id="live-status" role="status"></span>
+        <button id="pause" data-label="pause" type="button">Pause</button>
+        <button id="finish" data-label="finish" type="button">Finish</button>
+      </div>
+      <div id="recording-actions" hidden>
+        <button id="copy-recording" data-label="copy" type="button">Copy</button>
+        <button id="save-recording" data-label="save" type="button">Save</button>
+      </div>
+      <button id="cancel" data-label="cancel" type="button">Close</button>
+    </nav>
+    <p id="status" role="status" hidden></p>
+  </main>
+  <script src="./src/region-capture.js" type="module"></script>
+</body>
+</html>

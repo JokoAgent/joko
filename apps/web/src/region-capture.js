@@ -1,3 +1,5 @@
+import { beginRegionRecording } from "./region-capture-live.js";
+
 const bridge = window.jokoRegionCapture;
 const element = (id) => document.getElementById(id);
 const view = element("view");
@@ -14,15 +16,24 @@ let tool = "pen";
 const marks = [];
 let liveMark;
 let pendingPaint = 0;
+let activeRecording;
+let recordedBlob;
+let playbackUrl;
+let canRecord = false;
 
 const chinese = {
   choose: "拖动以选择区域", full: "整个屏幕", windows: "选择窗口", pen: "画笔", outline: "矩形",
   undo: "撤销", copy: "复制", save: "保存", pin: "置顶", attach: "附加到新任务", cancel: "关闭",
-  unavailable: "无法完成截图操作。", noWindows: "没有可截取的窗口。", select: "选择窗口", closed: "操作未完成。"
+  unavailable: "无法完成截图操作。", noWindows: "没有可截取的窗口。", select: "选择窗口", closed: "操作未完成。",
+  scroll: "滚动截图", video: "录制视频", audio: "音频", microphone: "麦克风", systemAudio: "电脑声音",
+  pause: "暂停", resume: "继续", finish: "完成", scrolling: "滚动选区内的窗口", joining: "请减小滚动距离以对齐画面",
+  recording: "录制中", recordingFailed: "无法录制选中的屏幕或音频。"
 };
 const english = {
   unavailable: "Screen capture could not complete.", noWindows: "No capturable windows are available.",
-  select: "Choose a window", closed: "The action did not complete."
+  select: "Choose a window", closed: "The action did not complete.",
+  pause: "Pause", resume: "Resume", scrolling: "Scroll within the selected area", joining: "Scroll a shorter distance to align the frames",
+  recording: "Recording", recordingFailed: "The selected screen or audio could not be recorded."
 };
 let copy = english;
 
@@ -119,16 +130,21 @@ function changeMode(next) {
   element("controls").hidden = false;
   element("select-actions").hidden = mode !== "screen";
   element("edit-actions").hidden = mode !== "edit";
+  element("live-actions").hidden = mode !== "live";
+  element("recording-actions").hidden = mode !== "recording";
+  canvas.hidden = mode === "recording";
+  for (const id of ["scroll", "gif", "video", "audio"]) element(id).hidden = !canRecord;
   paint();
 }
 
-async function choose(load) {
+async function choose(load, region = false) {
   if (busy || mode !== "screen") return;
   busy = true;
   notice("");
   try {
     const image = await load();
     await showImage(image);
+    canRecord = region;
     changeMode("edit");
     element("copy").focus();
   } catch {
@@ -165,7 +181,7 @@ canvas.addEventListener("pointerup", (event) => {
   const bounds = rectangle(start, position(event));
   start = current = undefined;
   if ((bounds.right - bounds.left) * canvas.clientWidth >= 3 && (bounds.bottom - bounds.top) * canvas.clientHeight >= 3) {
-    void choose(() => bridge.select(bounds));
+    void choose(() => bridge.select(bounds), true);
   } else paint();
 });
 canvas.addEventListener("lostpointercapture", () => {
@@ -173,7 +189,7 @@ canvas.addEventListener("lostpointercapture", () => {
   paint();
 });
 
-element("full").addEventListener("click", () => choose(() => bridge.select({ left: 0, top: 0, right: 1, bottom: 1 })));
+element("full").addEventListener("click", () => choose(() => bridge.select({ left: 0, top: 0, right: 1, bottom: 1 }), true));
 element("windows").addEventListener("click", async () => {
   if (busy) return;
   busy = true;
@@ -213,6 +229,112 @@ for (const action of ["copy", "save", "pin", "attach"]) {
     } catch { notice(copy.unavailable); }
     finally { busy = false; }
   });
+}
+
+async function startRecording(format) {
+  if (busy || mode !== "edit" || !canRecord) return;
+  busy = true;
+  notice("");
+  const recording = { format, abort: new AbortController(), runtime: undefined, paused: false, finishing: false };
+  activeRecording = recording;
+  const microphone = format === "video" && element("microphone").checked;
+  const systemAudio = format === "video" && element("system-audio").checked;
+  try {
+    const capture = await bridge.startLive(format, microphone, systemAudio);
+    recording.abort.signal.throwIfAborted();
+    recording.runtime = await beginRegionRecording(format, capture, {
+      microphone, systemAudio, signal: recording.abort.signal,
+      showControls: () => {
+        element("live-status").textContent = format === "scroll" ? copy.scrolling : copy.recording;
+        element("pause").textContent = copy.pause;
+        changeMode("live");
+        return bridge.showLive();
+      },
+      progress: ({ seconds, height }) => {
+        element("live-status").textContent = format === "scroll" ? `${copy.scrolling} · ${height} px` : `${copy.recording} · ${seconds}s`;
+      },
+      unmatched: () => { element("live-status").textContent = copy.joining; },
+      finish: () => { setTimeout(() => { if (activeRecording === recording) void finishRecording(); }, 0); }
+    });
+  } catch {
+    await bridge.endLive(false).catch(() => undefined);
+    activeRecording = undefined;
+    changeMode("edit");
+    if (!recording.abort.signal.aborted) notice(copy.recordingFailed);
+  } finally { busy = false; }
+}
+
+async function finishRecording() {
+  const recording = activeRecording;
+  if (!recording || recording.finishing) return;
+  if (recording.runtime === undefined) {
+    recording.abort.abort();
+    await bridge.endLive(false).catch(() => undefined);
+    return;
+  }
+  recording.finishing = true;
+  busy = true;
+  try {
+    const result = await recording.runtime.finish();
+    if (recording.format === "scroll") {
+      const png = new Uint8Array(await result.arrayBuffer());
+      const head = new DataView(png.buffer);
+      marks.length = 0;
+      element("undo").disabled = true;
+      await showImage({ png, width: head.getUint32(16), height: head.getUint32(20) });
+      await bridge.endLive(true);
+      canRecord = false;
+      changeMode("edit");
+      element("copy").focus();
+    } else {
+      recordedBlob = result;
+      await bridge.endLive(true);
+      if (playbackUrl) URL.revokeObjectURL(playbackUrl);
+      playbackUrl = URL.createObjectURL(result);
+      const target = element(recording.format === "gif" ? "animation" : "playback");
+      target.hidden = false;
+      target.src = playbackUrl;
+      changeMode("recording");
+      element("save-recording").focus();
+    }
+  } catch {
+    await bridge.endLive(false).catch(() => undefined);
+    changeMode("edit");
+    notice(copy.recordingFailed);
+  } finally {
+    activeRecording = undefined;
+    busy = false;
+  }
+}
+
+for (const format of ["scroll", "gif", "video"]) {
+  element(format).addEventListener("click", () => { void startRecording(format); });
+}
+element("finish").addEventListener("click", () => { void finishRecording(); });
+element("pause").addEventListener("click", () => {
+  const record = activeRecording;
+  if (!record?.runtime || record.finishing) return;
+  record.paused = !record.paused;
+  record.runtime.pause(record.paused);
+  element("pause").textContent = record.paused ? copy.resume : copy.pause;
+});
+for (const action of ["copy", "save"]) {
+  element(`${action}-recording`).addEventListener("click", async () => {
+    if (busy || recordedBlob === undefined || mode !== "recording") return;
+    busy = true;
+    try {
+      if (!(await bridge.recordingAction(action, new Uint8Array(await recordedBlob.arrayBuffer())))) notice(copy.closed);
+    } catch { notice(copy.unavailable); }
+    finally { busy = false; }
+  });
+}
+if (bridge) {
+  const clearShortcut = bridge.onShortcutStop(() => { void finishRecording(); });
+  window.addEventListener("pagehide", () => {
+    clearShortcut();
+    activeRecording?.abort.abort();
+    if (playbackUrl) URL.revokeObjectURL(playbackUrl);
+  }, { once: true });
 }
 
 try {
