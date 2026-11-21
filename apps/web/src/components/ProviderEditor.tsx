@@ -67,6 +67,8 @@ export function ProviderEditor({ open, provider, preset, backends, credentials, 
   }, [open, provider?.id, preset?.definition.id]);
   const backend = available.find((item) => item.id === activeId);
   const runtime = draft.runtimes.find((item) => item.backendId === activeId);
+  const prepareRuntime = (value: ProviderRuntimeConfigurationView): ProviderRuntimeConfigurationView =>
+    preset === undefined ? value : finalizeProviderPresetEndpoint(preset.definition, value);
   const eligibleImageBackend = draft.runtimes.find(item => item.backendId === imageBackend && geminiImageRouteEligible(item))?.backendId;
   const updateRuntime: Dispatch<SetStateAction<ProviderRuntimeConfigurationView>> = (update) => setDraft((current) => ({ ...current,
     runtimes: current.runtimes.map((value) => value.backendId === activeId ? typeof update === "function" ? update(value) : update : value) }));
@@ -90,7 +92,8 @@ export function ProviderEditor({ open, provider, preset, backends, credentials, 
       && credentialsValid(value)
       && (!(value.credentialId || value.headers.length) || value.credentialOrigin === origin || !!secrets[value.backendId]?.trim() && value.headers.length === 0);
   };
-  const valid = draft.id.trim() !== "" && draft.name.trim() !== "" && draft.runtimes.length > 0 && draft.runtimes.every(runtimeValid);
+  const preparedRuntimes = draft.runtimes.map(prepareRuntime);
+  const valid = draft.id.trim() !== "" && draft.name.trim() !== "" && preparedRuntimes.length > 0 && preparedRuntimes.every(runtimeValid);
   const submit = async (): Promise<void> => {
     const owner = scope.current;
     if (!valid || retired || owner === undefined || owner.pending || owner.abort.signal.aborted) return;
@@ -99,7 +102,7 @@ export function ProviderEditor({ open, provider, preset, backends, credentials, 
     const requestedImageBackend = imageBackendEdited ? eligibleImageBackend ?? "" : provider === undefined ? eligibleImageBackend : undefined;
     let prepared: ProviderDraft = {
       ...draft, id: draft.id.trim(), name: draft.name.trim(),
-      runtimes: preset === undefined ? draft.runtimes : draft.runtimes.map(runtime => finalizeProviderPresetEndpoint(preset.definition, runtime)),
+      runtimes: preparedRuntimes,
       ...(requestedImageBackend !== undefined && (draft.enabled || requestedImageBackend === "") ? { geminiImageBackendSelection: requestedImageBackend } : {})
     };
     let credentialSaved = false;
@@ -184,7 +187,7 @@ export function ProviderEditor({ open, provider, preset, backends, credentials, 
             {!credentialsValid(runtime) && <p role="alert">{t("settings.runtimeEditor.credentialConflict")}</p>}
             {supportsProviderField(backend, "headers") && <ProviderHeaderFields runtime={runtime} credentials={credentials} setRuntime={updateRuntime} t={t} />}
             {open && previewProviderModels !== undefined && <ProviderModelPreview key={activeId} backend={backend}
-              runtime={preset === undefined ? runtime : finalizeProviderPresetEndpoint(preset.definition, runtime)}
+              runtime={prepareRuntime(runtime)}
               catalogId={preset?.definition.id} secret={secrets[activeId]?.trim() ?? ""}
               preview={previewProviderModels} updateRuntime={updateRuntime} t={t} />}
             <ProviderRuntimeModels draft={runtime} setDraft={updateRuntime} backend={backend} t={t} />

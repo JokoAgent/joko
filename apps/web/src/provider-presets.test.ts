@@ -36,8 +36,10 @@ it("keeps provider defaults specific to the Backend and selects exact model inte
 
 it("uses declared capabilities and advisory defaults without inferring an unrelated native protocol", () => {
   const kimi = providerPresets.find(item => item.id === "moonshot-kimi-code")!;
-  expect(providerPresetRuntime(kimi, pi)!.models.find(model => model.modelId === "k3.1-pro")).toMatchObject({
-    compatibility: "anthropic", contextWindowTokens: 262_144, maximumOutputTokens: 262_144, defaultEffort: "max", inputModalities: ["text", "image"]
+  const kimiPi = providerPresetRuntime(kimi, pi)!;
+  expect(kimiPi).toMatchObject({ compatibility: "anthropic", endpoint: "https://api.kimi.com/coding" });
+  expect(kimiPi.models.find(model => model.modelId === "k3.1-pro")).toMatchObject({
+    compatibility: undefined, contextWindowTokens: 262_144, maximumOutputTokens: 262_144, defaultEffort: "max", inputModalities: ["text", "image"]
   });
   expect(discoveredProviderModelInterface("k3.1-pro", claude, "https://api.kimi.com/coding/v1")).toMatchObject({
     api: "anthropic-messages", baseUrl: "https://api.kimi.com/coding"
