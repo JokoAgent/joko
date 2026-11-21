@@ -945,6 +945,7 @@ message SettingsSnapshot {
   repeated SubagentModelSettings subagent_models = 31;
   ModelFavoriteSettings model_favorites = 32;
   bool task_model_groups_available = 33;
+  bool schedule_pull_request_follow_available = 34;
 }
 
 message AppearanceSettingsPatch {

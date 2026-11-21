@@ -1,3 +1,4 @@
+import { normalizeSchedulePullRequestRule, type SchedulePullRequestRule } from "@joko/contracts";
 import type { ScheduleRecord } from "@joko/store";
 import type { ScheduleScriptCapability } from "./schedule-script-runner.js";
 
@@ -41,6 +42,7 @@ export interface ScheduleExtensionSnapshot {
   readonly scriptConfig?: ScheduleScriptExecutionConfiguration;
   readonly expireAt?: number;
   readonly preRunHook?: SchedulePreRunHookConfiguration;
+  readonly followPullRequest?: SchedulePullRequestRule;
 }
 
 export function scheduleExtensionSnapshot(value: unknown): ScheduleExtensionSnapshot {
@@ -61,6 +63,10 @@ export function scheduleExtensionSnapshot(value: unknown): ScheduleExtensionSnap
   const preRunHook = scheduler["preRunHook"] === undefined
     ? undefined
     : schedulePreRunHookConfiguration(scheduler["preRunHook"]);
+  const followPullRequest = normalizeSchedulePullRequestRule(scheduler["followPullRequest"]);
+  if (scheduler["followPullRequest"] !== undefined && followPullRequest === undefined) {
+    throw new Error("Stored Schedule pull request trigger is invalid.");
+  }
   const executionMode = scheduler["executionMode"];
   if (executionMode !== "agent" && executionMode !== "script") {
     throw new Error("Stored Schedule execution mode is invalid.");
@@ -78,7 +84,8 @@ export function scheduleExtensionSnapshot(value: unknown): ScheduleExtensionSnap
     executionMode,
     ...(scriptConfig === undefined ? {} : { scriptConfig }),
     ...(expireAt === undefined ? {} : { expireAt: expireAt as number }),
-    ...(preRunHook === undefined ? {} : { preRunHook })
+    ...(preRunHook === undefined ? {} : { preRunHook }),
+    ...(followPullRequest === undefined ? {} : { followPullRequest })
   };
 }
 
@@ -102,7 +109,8 @@ export function withScheduleExtensionSnapshot(
         }
       }),
       ...(extension.expireAt === undefined ? {} : { expireAt: extension.expireAt }),
-      ...(extension.preRunHook === undefined ? {} : { preRunHook: { ...extension.preRunHook } })
+      ...(extension.preRunHook === undefined ? {} : { preRunHook: { ...extension.preRunHook } }),
+      ...(extension.followPullRequest === undefined ? {} : { followPullRequest: { ...extension.followPullRequest } })
     }
   };
 }

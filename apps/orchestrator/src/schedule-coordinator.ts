@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 
+import type { CodeHostProvider, CodeHostSessionAuthorizationPort } from "@joko/code-host";
 import { manualScheduleDispatchOperationId, scheduleRunIdFromDigest } from "@joko/contracts";
 import { redactSecrets, type NativeSubscriptionAuthority, type PermissionMode, type SessionDescriptor } from "@joko/core";
 import type {
@@ -18,6 +19,11 @@ import {
   type ScheduleWorktreeConfiguration
 } from "./schedule-extensions.js";
 import { validateScheduleHookScriptBinding } from "./schedule-hook-script-installer.js";
+import {
+  SchedulePullRequestAuthorization,
+  SchedulePullRequestWatcher,
+  type SchedulePullRequestWakeup
+} from "./schedule-pull-request-watcher.js";
 import {
   durableSchedulePreRunHookResult,
   executeSchedulePreRunHook,
@@ -65,6 +71,7 @@ export interface ScheduleCoordinatorOptions {
   readonly stallAbortGraceMs?: number;
   readonly staleAbortGraceMs?: number;
   readonly suspendGapMs?: number;
+  readonly pullRequestProviders?: (authority: CodeHostSessionAuthorizationPort) => readonly CodeHostProvider[];
 }
 
 export interface ScheduleDispatchResult {
@@ -92,6 +99,7 @@ export class ScheduleCoordinator {
   readonly #scriptBroker: ScheduleScriptCapabilityBroker;
   readonly #runtime: SchedulerRuntimeState;
   readonly #recovery: SchedulerOccurrenceRecovery;
+  readonly #pullRequests: SchedulePullRequestWatcher | undefined;
   readonly #activeOccurrences = new Map<string, Map<AbortController, string>>();
   readonly #deletionFences = new Map<string, string>();
   readonly #deletionCreationReceipts = new Map<string, {
@@ -147,6 +155,19 @@ export class ScheduleCoordinator {
         return run.state === "queued" && item?.state === "accepted" && item.backendInstanceGeneration === undefined;
       }
     });
+    if (options.pullRequestProviders !== undefined) {
+      const authority = new SchedulePullRequestAuthorization(store, host, this.#now);
+      const providers = options.pullRequestProviders(authority);
+      if (providers.length > 0) this.#pullRequests = new SchedulePullRequestWatcher({
+        store, authority, providers, now: this.#now,
+        ownsScheduler: () => {
+          if (this.#timer === undefined) return false;
+          const owner = store.getSchedulerRuntimeOwner();
+          return owner?.ownerId === this.#runtime.instanceId() && owner.leaseExpiresAt > this.#now();
+        },
+        dispatch: (schedule, wakeup, isCurrent) => this.dispatchPullRequestWakeup(schedule, wakeup, isCurrent)
+      });
+    }
     this.connectRunLifecycle();
     this.observeAdmittedRuns();
   }
@@ -167,6 +188,7 @@ export class ScheduleCoordinator {
   stop(): void {
     if (this.#timer !== undefined) clearInterval(this.#timer);
     this.#timer = undefined;
+    this.#pullRequests?.stop();
     this.#recovery.stop();
     this.#unsubscribeRuns?.();
     this.#unsubscribeRuns = undefined;
@@ -367,6 +389,10 @@ export class ScheduleCoordinator {
     return this.#runtime.snapshot();
   }
 
+  pullRequestFollowAvailable(): boolean {
+    return this.#pullRequests !== undefined;
+  }
+
   async tick(): Promise<void> {
     if (this.#ticking) return;
     this.#ticking = true;
@@ -389,6 +415,16 @@ export class ScheduleCoordinator {
         // Loading, hooks and scripts retain their own occurrence until they
         // settle. A later scan must still admit unrelated due Schedules.
         if ((this.#activeOccurrences.get(schedule.id)?.size ?? 0) > 0) continue;
+        if (usesTimedPullRequestCheck(schedule)) {
+          const nextRunAt = nextScheduleOccurrenceOrUndefined(schedule, dueAt);
+          this.#store.upsertSchedule(copyScheduleForCoordinator(schedule, {
+            enabled: nextRunAt !== undefined,
+            ...(nextRunAt === undefined ? {} : { nextRunAt }),
+            expectedRevision: schedule.revision,
+            now: dueAt
+          }));
+          continue;
+        }
         if (!this.#runtime.hasCapacity()) {
           waiting.push({
             scheduleId: schedule.id,
@@ -402,6 +438,7 @@ export class ScheduleCoordinator {
           .catch((error: unknown) => this.recordFailure(schedule, error)));
       }
       this.#runtime.syncWaiting(waiting);
+      this.#pullRequests?.tick();
     } finally {
       this.#ticking = false;
     }
@@ -430,6 +467,39 @@ export class ScheduleCoordinator {
     });
   }
 
+  private async dispatchPullRequestWakeup(
+    schedule: ScheduleRecord,
+    wakeup: SchedulePullRequestWakeup,
+    isCurrent: () => boolean
+  ): Promise<boolean> {
+    if (!isCurrent() || !this.#runtime.hasCapacity() || (this.#activeOccurrences.get(schedule.id)?.size ?? 0) > 0 ||
+      this.#deletionFences.has(schedule.id) || !this.pullRequestTaskIdle(schedule.sessionId)) return false;
+    const runId = scheduledRunId(wakeup.operationId);
+    const recorded = () => {
+      const run = this.#store.findScheduleRunByRunId(runId);
+      return run?.scheduleId === schedule.id && run.status !== "preflight_passed";
+    };
+    if (recorded()) return true;
+    await this.dispatchOccurrence(schedule, {
+      scheduledAt: wakeup.observedAt,
+      operationId: wakeup.operationId,
+      preserveNextRun: true,
+      ignoreMisfire: true,
+      pullRequestUrl: wakeup.url,
+      canDispatch: isCurrent
+    });
+    return recorded();
+  }
+
+  private pullRequestTaskIdle(sessionId: string | undefined): boolean {
+    if (sessionId === undefined || this.#store.findPendingSessionLifecycleCleanup(sessionId) !== undefined ||
+      this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined) return false;
+    try {
+      this.#host.assertSessionLifecycleIdle(sessionId);
+      return true;
+    } catch { return false; }
+  }
+
   private async dispatchOccurrence(
     schedule: ScheduleRecord,
     options: {
@@ -439,6 +509,7 @@ export class ScheduleCoordinator {
       readonly ignoreMisfire?: boolean;
       readonly source?: "automatic" | "run-now";
       readonly canDispatch?: () => boolean;
+      readonly pullRequestUrl?: string;
     } = {}
   ): Promise<ScheduleDispatchResult> {
     if (this.#deletionFences.has(schedule.id)) {
@@ -563,6 +634,7 @@ export class ScheduleCoordinator {
       readonly ignoreMisfire?: boolean;
       readonly source?: "automatic" | "run-now";
       readonly canDispatch?: () => boolean;
+      readonly pullRequestUrl?: string;
     },
     signal: AbortSignal
   ): Promise<ScheduleDispatchResult> {
@@ -705,6 +777,9 @@ export class ScheduleCoordinator {
     this.#recovery.transition(runId, "running", { executionMode: extension.executionMode });
     const preRun = await this.evaluatePreRunHook(schedule, runId, scheduledAt, extension.preRunHook, signal, subscription?.assertCurrent);
     if (this.#recovery.wasForceReleased(runId)) return { runId, status: "failed" };
+    if (options.pullRequestUrl !== undefined && (signal.aborted || options.canDispatch?.() === false)) {
+      return { runId, status: "aborted" };
+    }
     if (preRun !== undefined) {
       const current = this.#store.findSchedule(schedule.id);
       if (current === undefined) return { runId, status: "aborted" };
@@ -779,6 +854,7 @@ export class ScheduleCoordinator {
     schedule = resolved.schedule;
     const sessionId = resolved.sessionId;
     if (signal.aborted || this.#deletionFences.has(schedule.id) || options.canDispatch?.() === false) {
+      if (options.pullRequestUrl !== undefined) return { runId, sessionId, status: "aborted" };
       const current = this.#store.findSchedule(schedule.id);
       if (current !== undefined) {
         this.recordPreSessionOutcome({
@@ -799,6 +875,9 @@ export class ScheduleCoordinator {
     }
 
     const currentSession = this.#store.getSession(sessionId).descriptor;
+    if (options.pullRequestUrl !== undefined && !this.pullRequestTaskIdle(sessionId)) {
+      return { runId, sessionId, status: "aborted" };
+    }
     const boundBackendId = currentSession.backendId === schedule.backendId ? undefined : currentSession.backendId;
     if (boundBackendId !== undefined && (!this.#store.scheduleMatchesSession(schedule, currentSession) || !this.#isPairedPiBackend(boundBackendId))) {
       this.recordPreSessionOutcome({ schedule, operationId, runId, scheduledAt,
@@ -830,6 +909,7 @@ export class ScheduleCoordinator {
       sessionId,
       scheduledAt,
       ...(boundBackendId === undefined ? {} : { boundBackendId }),
+      ...(options.pullRequestUrl === undefined ? {} : { pullRequestUrl: options.pullRequestUrl }),
       // The admitted Run consumes a one-shot, even when Run Now fired it early.
       ...(schedule.kind === "one_shot" || nextRunAt === undefined ? {} : { nextRunAt })
     }); } catch (error) { this.#admittedRuns.delete(runId); throw error; }
@@ -920,6 +1000,8 @@ export class ScheduleCoordinator {
     readonly detail: unknown;
   }): void {
     const finishedAt = Math.max(input.scheduledAt, this.#now());
+    const pullRequestUrl = input.operationId.startsWith("pull-request-schedule-")
+      ? scheduleExtensionSnapshot(input.schedule.executionSnapshot).followPullRequest?.url : undefined;
     this.#store.runOperation(
       {
         id: `${input.operationId}-outcome`,
@@ -941,7 +1023,7 @@ export class ScheduleCoordinator {
           firedAt: input.scheduledAt,
           finishedAt,
           status: input.status,
-          detail: input.detail
+          detail: pullRequestUrl === undefined ? input.detail : { ...(isRecord(input.detail) ? input.detail : {}), pullRequestUrl }
         });
         return { runId: input.runId, status: input.status };
       }
@@ -1182,7 +1264,9 @@ export class ScheduleCoordinator {
     const history = this.#store.findScheduleRunByRunId(occurrence.runId);
     if (history !== undefined && !isRecoverableScheduleRuntimeStatus(history.status)) return;
     const now = this.#now();
-    const nextRunAt = occurrence.source === "run-now"
+    const pullRequest = this.#pullRequests?.ownsOccurrence(occurrence.scheduleId, occurrence.runId) === true ||
+      isRecord(history?.detail) && typeof history.detail["pullRequestUrl"] === "string";
+    const nextRunAt = occurrence.source === "run-now" || pullRequest
       ? schedule.nextRunAt
       : nextScheduleOccurrenceOrUndefined(schedule, Math.max(now, occurrence.scheduledAt));
     const status = reason === "stalled" ? "failed" : "interrupted";
@@ -1198,7 +1282,7 @@ export class ScheduleCoordinator {
       runId: occurrence.runId,
       scheduledAt: occurrence.scheduledAt,
       ...(nextRunAt === undefined ? {} : { nextRunAt }),
-      intervalFromFinish: occurrence.source === "automatic" && cadence?.["intervalFromFinish"] === true,
+      intervalFromFinish: !pullRequest && occurrence.source === "automatic" && cadence?.["intervalFromFinish"] === true,
       status,
       detail: {
         ...previousDetail,
@@ -1442,6 +1526,14 @@ function nextScheduleOccurrenceOrUndefined(schedule: ScheduleRecord, after: numb
   } catch {
     return undefined;
   }
+}
+
+function usesTimedPullRequestCheck(schedule: ScheduleRecord): boolean {
+  try {
+    const extension = scheduleExtensionSnapshot(schedule.executionSnapshot);
+    return extension.followPullRequest !== undefined &&
+      !(extension.followPullRequest.change === "any" && extension.preRunHook !== undefined);
+  } catch { return false; }
 }
 
 function scheduledRunId(operationId: string): string {

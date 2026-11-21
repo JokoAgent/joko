@@ -75,6 +75,7 @@ export function ScheduleRunHistoryCard({ run, sessionAvailable, locale, t, pendi
     </header>
     <div className="schedule-history-card__meta">
       <span>{run.runId || run.id}</span>
+      {run.pullRequestUrl !== undefined && <a href={run.pullRequestUrl} target="_blank" rel="noreferrer">{t("scheduler.pullRequestRun")}</a>}
       {durationMs !== undefined && <span>{t("scheduler.runDuration", { duration: formatScheduleDuration(durationMs) })}</span>}
       {cost !== undefined && <span>{cost}</span>}
       {run.sessionId.length > 0 && !sessionAvailable && <span>{t("scheduler.runTaskUnavailable")}</span>}

@@ -914,6 +914,8 @@ message ScheduleExecutionSnapshot {
   bool use_worktree = 11;
   optional string worktree_source_ref = 12;
   bool refresh_worktree_remote = 13;
+  // An empty message explicitly clears a previously configured trigger.
+  SchedulePullRequestTrigger follow_pull_request = 14;
 }
 
 enum ScheduleExecutionMode {
@@ -965,6 +967,7 @@ message ScheduleRunHistory {
   SchedulePreRunResult pre_run = 15;
   google.protobuf.Timestamp read_at = 16;
   google.protobuf.Duration duration = 17;
+  string pull_request_url = 18;
 }
 
 enum ScheduleRunPhase {
@@ -1324,3 +1327,16 @@ message CancelLocalRuntimeInstallRequest {
   string request_id = 2;
 }
 message CancelLocalRuntimeInstallResponse { bool cancelled = 1; }
+
+enum SchedulePullRequestChange {
+  SCHEDULE_PULL_REQUEST_CHANGE_UNSPECIFIED = 0;
+  SCHEDULE_PULL_REQUEST_CHANGE_ANY = 1;
+  SCHEDULE_PULL_REQUEST_CHANGE_MERGED = 2;
+  SCHEDULE_PULL_REQUEST_CHANGE_REVIEW = 3;
+  SCHEDULE_PULL_REQUEST_CHANGE_CHECKS = 4;
+}
+
+message SchedulePullRequestTrigger {
+  string url = 1;
+  SchedulePullRequestChange change = 2;
+}

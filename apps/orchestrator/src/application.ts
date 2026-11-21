@@ -2851,7 +2851,8 @@ export async function createOrchestratorApplication(
   });
   const scheduler = new ScheduleCoordinator(store, sessionHost, {
     onActivityTransition: runtimeActivity.markBlockingActivity,
-    isPairedPiBackend: (backendId) => hostedAgentSources?.isReadyPairedPiBackend(backendId) === true
+    isPairedPiBackend: (backendId) => hostedAgentSources?.isReadyPairedPiBackend(backendId) === true,
+    pullRequestProviders: authority => composeCodeHostProviders(dependencies.codeHostProviders, authority, codeHostCredentials)
   });
   schedulerForBridgeTools = scheduler;
   partnerRoutines = new PartnerRoutineManager({ partners, store, scheduler,

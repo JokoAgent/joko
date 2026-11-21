@@ -333,12 +333,16 @@ function AutomationDetail({ colors, state, schedule, client, online, localError,
     </View>
     <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <Info label={mobileMessage(locale, "automation.info.timing")} value={mobileAutomationRecurrenceLabel(locale, schedule)} colors={colors} />
+      {schedule.followPullRequest !== undefined && <Info label={mobileMessage(locale, "automation.info.pullRequest")}
+        value={schedule.followPullRequest.url.replace("https://github.com/", "")} colors={colors} />}
       <Info label={mobileMessage(locale, "automation.info.taskMode")} value={mobileAutomationSessionModeLabel(locale, schedule.sessionMode)} colors={colors} />
       <Info label={mobileMessage(locale, "automation.info.execution")} value={mobileAutomationExecutionModeLabel(locale, schedule.executionMode)} colors={colors} />
       <Info label={mobileMessage(locale, "automation.info.timeZone")} value={schedule.timeZone} colors={colors} />
       <Info label={mobileMessage(locale, "automation.info.overlap")} value={mobileAutomationOverlapLabel(locale, schedule.overlapPolicy)} colors={colors} />
       <Info label={mobileMessage(locale, "automation.info.missedRun")} value={mobileAutomationMisfireLabel(locale, schedule.misfirePolicy)} colors={colors} />
-      {schedule.nextTriggerAt !== undefined && <Info label={mobileMessage(locale, "automation.info.nextRun")}
+      {schedule.nextTriggerAt !== undefined && <Info label={mobileMessage(locale,
+        schedule.followPullRequest !== undefined && !(schedule.followPullRequest.change === "any" && schedule.preRunHook !== undefined)
+          ? "automation.info.nextPullRequestCheck" : "automation.info.nextRun")}
         value={formatMobileAutomationDate(schedule.nextTriggerAt, locale, schedule.timeZone)} colors={colors} />}
       {schedule.lastTriggeredAt !== undefined && <Info label={mobileMessage(locale, "automation.info.lastRun")}
         value={formatMobileAutomationDate(schedule.lastTriggeredAt, locale, schedule.timeZone)} colors={colors} />}
@@ -897,6 +901,8 @@ function RunCard({ run, schedule, colors, client, disabled, onRun, onOpenTask, s
       {unread && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>{mobileMessage(locale, "automation.run.unread")}</Text>}
     </View>
     <Text style={[styles.caption, { color: colors.muted }]}>{formatMobileAutomationCost(run, locale)}</Text>
+    {run.pullRequestUrl !== undefined && <Info label={mobileMessage(locale, "automation.info.pullRequest")}
+      value={run.pullRequestUrl.replace("https://github.com/", "")} colors={colors} />}
     {run.resultText && <Text style={[styles.body, { color: colors.ink }]}>{run.resultText}</Text>}
     {run.error && <Text accessibilityRole="alert" style={[styles.body, { color: colors.negative }]}>{run.error}</Text>}
     {run.preRun && <View style={[styles.preRun, { borderColor: colors.border }]}>

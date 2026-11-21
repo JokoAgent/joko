@@ -14705,6 +14705,7 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
       : "No available Backend advertises memory.curated.";
   return create(contract.SettingsSnapshotSchema, {
     taskModelGroupsAvailable: dependencies.taskModelGroupsAvailable === true,
+    schedulePullRequestFollowAvailable: dependencies.scheduleCoordinator.pullRequestFollowAvailable?.() === true,
     appearance: appearance ?? create(contract.AppearanceSettingsSchema, {
       locale: "en",
       theme: contract.ThemePreference.SYSTEM,
@@ -19470,6 +19471,10 @@ async function dispatchMutation(
       const existing = dependencies.store.getSchedule(payload.value.scheduleId);
       const projectOrigin = scheduleProjectAutomationOrigin(existing.executionSnapshot);
       const runtimeInput = projectOrigin === undefined ? input : projectScheduleWithRuntimeBinding(input, existing);
+      if (runtimeInput.execution?.followPullRequest === undefined && scheduleExtensionSnapshot(existing.executionSnapshot).followPullRequest !== undefined &&
+        (runtimeInput.sessionId !== existing.sessionId || runtimeInput.backendId !== existing.backendId || runtimeInput.targetId !== existing.targetId)) {
+        throw invalidArgument("Review the pull request trigger before changing its task binding.");
+      }
       const parsed = scheduleInput(existing.id, runtimeInput, (dependencies.now ?? Date.now)(), existing);
       const candidate = projectOrigin === undefined
         ? parsed
@@ -25211,6 +25216,9 @@ function scheduleInput(
   const prompt = fromProtoInputContent(input.input, "prompt");
   const executionSnapshot = scheduleExecutionSnapshot(input.execution, existing?.executionSnapshot);
   const extension = scheduleExtensionSnapshot(executionSnapshot);
+  if (extension.followPullRequest !== undefined && (sessionMode !== "bound" || kind === "one_shot" || extension.executionMode !== "agent")) {
+    throw invalidArgument("Pull request following requires a task-bound Agent automation with a manual or recurring trigger.");
+  }
   const worktree = scheduleWorktreeConfiguration(executionSnapshot);
   assertPublicScheduleExecutionCompatibility(
     extension,
@@ -25296,7 +25304,17 @@ async function validateScheduleWorkspaceEligibility(
   schedule: Pick<ScheduleRecord, "targetId" | "sessionMode" | "sessionId" | "enabled" | "executionSnapshot">
 ): Promise<void> {
   assertScriptScheduleWorkspace(dependencies.store, schedule);
-  const hook = scheduleExtensionSnapshot(schedule.executionSnapshot).preRunHook;
+  const extension = scheduleExtensionSnapshot(schedule.executionSnapshot);
+  if (extension.followPullRequest !== undefined) {
+    if (!dependencies.scheduleCoordinator.pullRequestFollowAvailable()) {
+      throw invalidArgument("Pull request following is unavailable on this node.");
+    }
+    const session = schedule.sessionId === undefined ? undefined : dependencies.store.findSession(schedule.sessionId);
+    if (session === undefined || !dependencies.sessionHost.canFollowPullRequestInTask(session)) {
+      throw invalidArgument("Select an ordinary task owned by this node to follow a pull request.");
+    }
+  }
+  const hook = extension.preRunHook;
   if (hook !== undefined) {
     const target = dependencies.store.getTarget(schedule.targetId).descriptor;
     if (!target.trusted || target.remoteWorkspace !== undefined) throw invalidArgument("Pre-run checks require this node's trusted workspace");
@@ -25428,6 +25446,14 @@ function scheduleExecutionSnapshot(
   const requestedPreRunHook = publicSchedulePreRunHook(input.preRunHook);
   const preRunHook = requestedPreRunHook;
   const expireAt = fromProtoTimestamp(input.expireAt, "schedule.execution.expire_at");
+  const follow = input.followPullRequest;
+  const followPullRequest = follow === undefined
+    ? existing === undefined ? undefined : scheduleExtensionSnapshot(existing).followPullRequest
+    : contract.schedulePullRequestRuleFromProto(follow);
+  if (follow !== undefined && followPullRequest === undefined &&
+    (follow.url !== "" || follow.change !== contract.SchedulePullRequestChange.UNSPECIFIED)) {
+    throw invalidArgument("Select a valid GitHub pull request and condition.");
+  }
   const extension: ScheduleExtensionSnapshot = {
     format: 1,
     silentWhenIdle: input.silentWhenIdle,
@@ -25435,7 +25461,8 @@ function scheduleExecutionSnapshot(
     executionMode,
     ...(scriptConfig === undefined ? {} : { scriptConfig }),
     ...(expireAt === undefined ? {} : { expireAt }),
-    ...(preRunHook === undefined ? {} : { preRunHook })
+    ...(preRunHook === undefined ? {} : { preRunHook }),
+    ...(followPullRequest === undefined ? {} : { followPullRequest })
   };
   return withScheduleExtensionSnapshot(base, extension);
 }

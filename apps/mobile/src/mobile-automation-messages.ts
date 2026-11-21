@@ -57,6 +57,8 @@ const rows = [
   ["automation.removeProject.confirm", "Remove", "移除", "移除", "削除", "제거"],
   ["automation.removeProject.keepCopy", "Keep personal copy", "保留个人副本", "保留個人副本", "個人用コピーを残す", "개인 사본 유지"],
   ["automation.info.timing", "Timing", "定时", "排程時間", "タイミング", "예약"],
+  ["automation.info.pullRequest", "Pull request", "拉取请求", "提取要求", "プルリクエスト", "풀 리퀘스트"],
+  ["automation.info.nextPullRequestCheck", "Next scheduled check", "下次定时检查", "下次排程檢查", "次回の定期チェック", "다음 예약 확인"],
   ["automation.info.taskMode", "Task mode", "任务模式", "任務模式", "タスクモード", "작업 모드"],
   ["automation.info.execution", "Execution", "执行", "執行", "実行", "실행"],
   ["automation.info.timeZone", "Time zone", "时区", "時區", "タイムゾーン", "시간대"],

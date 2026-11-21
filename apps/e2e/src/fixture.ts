@@ -35,6 +35,7 @@ import {
   RemoteWorkspaceService,
   RuntimeGovernanceSettingsRepository,
   ScheduleCoordinator,
+  type ScheduleCoordinatorOptions,
   ScheduleHookScriptInstaller,
   createScheduleHookScriptGenerator,
   SessionHost,
@@ -107,6 +108,7 @@ export interface FixtureOptions {
   /** Bind explicitly enabled private-LAN HTTP to one fixture-owned host interface. */
   readonly publicLanHost?: string;
   readonly terminals?: OrchestratorApplication["terminals"];
+  readonly scheduler?: Pick<ScheduleCoordinatorOptions, "now" | "heartbeatLeaseMs" | "pullRequestProviders">;
   readonly createAuxiliaryServices?: (
     store: OperationalStore,
     dataDirectory: string,
@@ -420,7 +422,7 @@ export class OrchestratorE2eFixture {
     }
     await objectives.initialize();
     await historyMaintenance.initialize();
-    const scheduler = new ScheduleCoordinator(store, sessionHost, { tickMs: 25 });
+    const scheduler = new ScheduleCoordinator(store, sessionHost, { tickMs: 25, ...options.scheduler });
     scheduler.start();
     const scheduleHookScripts = new ScheduleHookScriptInstaller(auxiliaryServices?.providers === undefined ? {} : {
       generate: createScheduleHookScriptGenerator(auxiliaryServices.providers, {

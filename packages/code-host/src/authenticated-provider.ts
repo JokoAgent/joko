@@ -13,6 +13,7 @@ import {
   type GhCliTokenSource
 } from "./gh-cli-token-source.js";
 import { isSupportedPublicReference } from "./public-provider.js";
+import { githubGraphQlActivity, githubPullRequestActivity } from "./github-pull-request-activity.js";
 import { boundedCodeHostHeadBranch, boundedCodeHostPullRequestTitle } from "./validation.js";
 
 const API_ORIGIN = "https://api.github.com";
@@ -25,13 +26,30 @@ const DEFAULT_REST_BODY_BYTES = 256 * 1024;
 const DEFAULT_GRAPHQL_BODY_BYTES = 256 * 1024;
 const MAXIMUM_REVIEW_THREADS = 100;
 
-const UNRESOLVED_REVIEW_THREADS_QUERY = `query($owner: String!, $repo: String!, $number: Int!) {
+const PULL_REQUEST_ACTIVITY_FIELDS = `
+      mergeStateStatus
+      reviewDecision
+      commits(last: 1) {
+        nodes { commit { oid statusCheckRollup {
+          contexts(first: 100) {
+            totalCount
+            nodes {
+              __typename
+              ... on CheckRun { status conclusion }
+              ... on StatusContext { state }
+            }
+          }
+        } } }
+      }`;
+
+const PULL_REQUEST_REVIEW_QUERY = (follow: boolean) => `query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       reviewThreads(first: 100) {
         nodes { isResolved }
         pageInfo { hasNextPage }
       }
+      ${follow ? PULL_REQUEST_ACTIVITY_FIELDS : ""}
     }
   }
 }`;
@@ -102,7 +120,7 @@ export class AuthenticatedCodeHostProvider implements CodeHostProvider {
 
   async getPullRequest(
     reference: CodeHostPullRequestReference,
-    options: { readonly signal: AbortSignal; readonly sessionOwnerId: string }
+    options: { readonly signal: AbortSignal; readonly sessionOwnerId: string; readonly purpose?: "follow" }
   ): Promise<CodeHostProviderResult> {
     if (!isSupportedPublicReference(reference)) {
       throw new TypeError("The authenticated code-host reference is outside the outbound policy.");
@@ -124,20 +142,32 @@ export class AuthenticatedCodeHostProvider implements CodeHostProvider {
     assertCredential(credential);
     this.#assertFences(authorization, credential, reference);
 
-    const graphQl = this.#readUnresolvedReviewThreadCount(reference, credential, options.signal)
+    const follow = options.purpose === "follow";
+    const graphQl = this.#readReview(reference, credential, options.signal, follow)
       .catch((error: unknown) => {
         if (options.signal.aborted) throw options.signal.reason ?? error;
         return undefined;
       });
-    const result = await this.#readPullRequest(reference, credential, options.signal).catch((error: unknown) => {
+    const rest = this.#readPullRequest(reference, credential, options.signal).catch((error: unknown) => {
       if (error instanceof CodeHostPullRequestNotFoundError) this.#assertFences(authorization, credential, reference);
       throw error;
     });
-    const unresolvedReviewThreadCount = await graphQl;
+    const [raw, review] = await Promise.all([rest, graphQl]);
     this.#assertFences(authorization, credential, reference);
+    const result = parsePullRequest(raw);
+    const unresolvedReviewThreadCount = review === undefined ? undefined : parseUnresolvedReviewThreadCount(review);
+    const activity = follow ? githubPullRequestActivity(raw) : undefined;
+    const graphQlActivity = follow ? githubGraphQlActivity(review) : undefined;
     return {
       ...result,
-      ...(unresolvedReviewThreadCount === undefined ? {} : { unresolvedReviewThreadCount })
+      ...(unresolvedReviewThreadCount === undefined ? {} : { unresolvedReviewThreadCount }),
+      ...(activity === undefined || graphQlActivity === undefined ? {} : { activity: {
+        ...activity,
+        ...(graphQlActivity.headSha !== undefined && graphQlActivity.headSha === activity.headSha && graphQlActivity.checks !== undefined
+          ? { checks: graphQlActivity.checks } : {}),
+        ...(graphQlActivity.mergeState === undefined ? {} : { mergeState: graphQlActivity.mergeState }),
+        ...(graphQlActivity.reviewDecision === undefined ? {} : { reviewDecision: graphQlActivity.reviewDecision })
+      } })
     };
   }
 
@@ -145,7 +175,7 @@ export class AuthenticatedCodeHostProvider implements CodeHostProvider {
     reference: CodeHostPullRequestReference,
     credential: GhCliCredentialLease,
     signal: AbortSignal
-  ): Promise<Pick<CodeHostProviderResult, "state" | "draft" | "title" | "headBranch">> {
+  ): Promise<unknown> {
     const request = combinedAbortSignal(signal, this.#restTimeoutMs, "REST");
     try {
       let response: Response;
@@ -168,21 +198,22 @@ export class AuthenticatedCodeHostProvider implements CodeHostProvider {
       }
       if (!response.ok) throw new Error("The authenticated code-host REST request failed.");
       assertJsonResponse(response);
-      return parsePullRequest(await readBoundedJson(response, this.#maximumRestBodyBytes));
+      return await readBoundedJson(response, this.#maximumRestBodyBytes);
     } finally {
       request.dispose();
     }
   }
 
-  async #readUnresolvedReviewThreadCount(
+  async #readReview(
     reference: CodeHostPullRequestReference,
     credential: GhCliCredentialLease,
-    signal: AbortSignal
-  ): Promise<number> {
+    signal: AbortSignal,
+    follow: boolean
+  ): Promise<Readonly<Record<string, unknown>> | undefined> {
     const request = combinedAbortSignal(signal, this.#graphQlTimeoutMs, "GraphQL");
     try {
       const body = JSON.stringify({
-        query: UNRESOLVED_REVIEW_THREADS_QUERY,
+        query: PULL_REQUEST_REVIEW_QUERY(follow),
         variables: {
           owner: reference.repositoryOwner,
           repo: reference.repositoryName,
@@ -208,7 +239,9 @@ export class AuthenticatedCodeHostProvider implements CodeHostProvider {
       }
       if (!response.ok) throw new Error("The authenticated code-host GraphQL request failed.");
       assertJsonResponse(response);
-      return parseUnresolvedReviewThreadCount(await readBoundedJson(response, this.#maximumGraphQlBodyBytes));
+      const root = objectValue(await readBoundedJson(response, this.#maximumGraphQlBodyBytes));
+      if (root === undefined || root["errors"] !== undefined) return undefined;
+      return objectValue(objectValue(objectValue(root["data"])?.["repository"])?.["pullRequest"]);
     } finally {
       request.dispose();
     }
@@ -304,14 +337,7 @@ function parsePullRequest(value: unknown): Pick<CodeHostProviderResult, "state" 
   };
 }
 
-function parseUnresolvedReviewThreadCount(value: unknown): number {
-  const root = objectValue(value);
-  if (root === undefined || root["errors"] !== undefined) {
-    throw new Error("The authenticated code-host GraphQL response is invalid.");
-  }
-  const data = objectValue(root["data"]);
-  const repository = objectValue(data?.["repository"]);
-  const pullRequest = objectValue(repository?.["pullRequest"]);
+function parseUnresolvedReviewThreadCount(pullRequest: Readonly<Record<string, unknown>>): number | undefined {
   const reviewThreads = objectValue(pullRequest?.["reviewThreads"]);
   const nodes = reviewThreads?.["nodes"];
   const hasNextPage = objectValue(reviewThreads?.["pageInfo"])?.["hasNextPage"];
@@ -320,14 +346,12 @@ function parseUnresolvedReviewThreadCount(value: unknown): number {
     || nodes.length > MAXIMUM_REVIEW_THREADS
     || hasNextPage !== false
   ) {
-    throw new Error("The authenticated code-host GraphQL response is invalid.");
+    return undefined;
   }
   let unresolved = 0;
   for (const node of nodes) {
     const isResolved = objectValue(node)?.["isResolved"];
-    if (typeof isResolved !== "boolean") {
-      throw new Error("The authenticated code-host GraphQL response is invalid.");
-    }
+    if (typeof isResolved !== "boolean") return undefined;
     if (!isResolved) unresolved += 1;
   }
   return unresolved;

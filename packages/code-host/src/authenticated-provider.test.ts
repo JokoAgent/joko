@@ -105,6 +105,37 @@ describe("authenticated code-host Provider", () => {
     });
   });
 
+  it("observes the authorized pull request's review and checks, discarding a stale check head", async () => {
+    const sha = "b".repeat(40);
+    let observedSha = sha;
+    const fetch = vi.fn<typeof globalThis.fetch>(async (input, init) => {
+      if (new URL(String(input)).pathname !== "/graphql") {
+        return jsonResponse({ state: "open", draft: false, merged: false, merged_at: null, title: "Private PR",
+          head: { ref: "feature", sha }, review_comments: 5 });
+      }
+      const body = JSON.parse(String(init?.body)) as { query: string };
+      expect(body.query).toContain("statusCheckRollup");
+      expect(body.query).toContain("reviewDecision");
+      return jsonResponse({ data: { repository: { pullRequest: {
+        reviewDecision: "CHANGES_REQUESTED", mergeStateStatus: "BLOCKED",
+        commits: { nodes: [{ commit: { oid: observedSha, statusCheckRollup: {
+          contexts: { totalCount: 1, nodes: [{ __typename: "CheckRun", status: "COMPLETED", conclusion: "FAILURE" }] }
+        } } }] },
+        reviewThreads: { nodes: [{ isResolved: false }], pageInfo: { hasNextPage: false } }
+      } } } });
+    });
+    const provider = new AuthenticatedCodeHostProvider({
+      authorization: authorization(), credentialSource: credentialSource("gho_private_scheduled_checks"), fetch
+    });
+    const read = () => provider.getPullRequest(reference, { ...requestOptions(), purpose: "follow" });
+    await expect(read()).resolves.toMatchObject({
+      unresolvedReviewThreadCount: 1,
+      activity: { headSha: sha, checks: ["check:completed:failure"], reviewDecision: "changes_requested", mergeState: "blocked", reviewCommentCount: 5 }
+    });
+    observedSha = "c".repeat(40);
+    expect((await read()).activity?.checks).toBeUndefined();
+  });
+
   it.each([
     { label: "more than the bounded first page", pageInfo: { hasNextPage: true } },
     { label: "missing pageInfo", pageInfo: undefined },

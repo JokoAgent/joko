@@ -48,6 +48,18 @@ export interface CodeHostProviderResult {
   readonly title: string;
   readonly headBranch: string;
   readonly unresolvedReviewThreadCount?: number;
+  /** Additional facts read only for an explicitly configured automation. */
+  readonly activity?: CodeHostPullRequestActivity;
+}
+
+export interface CodeHostPullRequestActivity {
+  readonly headSha?: string;
+  readonly mergedAt?: number;
+  readonly checks?: readonly string[];
+  readonly mergeState?: string;
+  readonly reviewDecision?: string;
+  readonly commentCount?: number;
+  readonly reviewCommentCount?: number;
 }
 
 /**
@@ -65,6 +77,7 @@ export interface CodeHostProvider {
       readonly signal: AbortSignal;
       /** Opaque product owner used to resolve an owner-scoped credential reference. */
       readonly sessionOwnerId: string;
+      readonly purpose?: "follow";
     }
   ): Promise<CodeHostProviderResult>;
 }
