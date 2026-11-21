@@ -2,8 +2,8 @@ import { useEffect, useId, useRef, useState, type JSX } from "react";
 import { Menu } from "lucide-react";
 import { classifyTaskInbox, parseLocalTaskSnoozeTime, taskInboxSections, taskSnoozeChoices, taskSnoozeDeadline,
   type TaskInboxSection, type TaskSnoozeChoice } from "@joko/contracts";
-import type { Translator } from "../i18n.js";
 import type { AppSnapshot, SessionView } from "../model.js";
+import type { Translator } from "./types.js";
 import { Button, IconButton, Modal } from "./ui.js";
 
 interface InboxRow {
