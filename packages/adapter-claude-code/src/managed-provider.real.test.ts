@@ -1,5 +1,4 @@
 import { mkdtemp, readFile, readdir, mkdir, realpath, rename, rm, writeFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
 import { createServer, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,6 +17,10 @@ test("resumes legacy minted tool call IDs through the bundled Claude CLI and sen
   const profile = join(root, "profile"), work = join(root, "workspace");
   const requests: Record<string, unknown>[] = [];
   const model = "claude-sonnet-4-6";
+  const starter = "Create a native record with both Read results.";
+  const continuation = "Continue with both stored results.";
+  const reads = ["first", "second"].map(label => ({ label, id: `toolu_seed_${label}`, path: join(work, `${label}.txt`) }));
+  let nextRead = 0;
   const server = createServer(async (request, response) => {
     const path = request.url?.split("?")[0];
     if (request.method !== "POST" || !["/v1/messages", "/v1/messages/count_tokens"].includes(path ?? "")) {
@@ -32,20 +35,29 @@ test("resumes legacy minted tool call IDs through the bundled Claude CLI and sen
     }
     const chunks: Buffer[] = [];
     for await (const chunk of request) chunks.push(Buffer.from(chunk));
-    requests.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+    requests.push(payload);
+    const history = JSON.stringify(payload["messages"] ?? []);
+    if (history.includes(starter) && !history.includes(continuation) && nextRead < reads.length) {
+      const read = reads[nextRead++]!;
+      sendNativeReadMessage(response, model, read.id, read.path);
+      return;
+    }
     sendTextMessage(response, model, "The continued transcript was received.");
   });
   let adapter: ClaudeCodeAdapter | undefined;
   try {
     await Promise.all([mkdir(profile), mkdir(work)]);
+    for (const read of reads) await writeFile(read.path, `Original ${read.label} tool result.\n`);
     await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
     const address = server.address();
     if (address === null || typeof address === "string") throw new Error("The loopback Claude fixture did not bind.");
     const overrides = { HOME: profile, USERPROFILE: profile, CLAUDE_CONFIG_DIR: profile,
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${address.port}`, ANTHROPIC_API_KEY: "legacy-transcript-fixture",
       CLAUDE_CODE_OAUTH_TOKEN: undefined, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
-    const initial = query({ prompt: "Create a native record for the test.", options: { cwd: work, model,
-      env: { ...createChildRuntimeEnvironment({ overrides }).environment }, tools: [], settingSources: [], persistSession: true } });
+    const initial = query({ prompt: starter, options: { cwd: work, model,
+      env: { ...createChildRuntimeEnvironment({ overrides }).environment }, tools: ["Read"], settingSources: [], persistSession: true,
+      permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true } });
     let nativeId: string | undefined;
     try {
       for await (const event of initial) {
@@ -61,29 +73,13 @@ test("resumes legacy minted tool call IDs through the bundled Claude CLI and sen
     if (!project) throw new Error("The bundled CLI did not store a project.");
     const path = join(projects, project, `${nativeId}.jsonl`);
     const raw = await readFile(path, "utf8");
-    const rows = raw.trimEnd().split("\n").map(line => JSON.parse(line) as Record<string, unknown>);
-    const user = rows.findLast(row => row["type"] === "user")!;
-    const assistant = rows.findLast(row => row["type"] === "assistant")!;
-    expect(user).toBeDefined();
-    expect(assistant).toBeDefined();
-    let parent = assistant["uuid"];
-    const exchange: Record<string, unknown>[] = [];
-    for (const label of ["first", "second"]) {
-      const ask = randomUUID(), tool = randomUUID(), replied = randomUUID();
-      exchange.push(
-        { ...user, uuid: ask, parentUuid: parent, message: { role: "user", content: `Read the ${label} fact.` } },
-        { ...assistant, uuid: tool, parentUuid: ask, requestId: randomUUID(), message: {
-          ...assistant["message"] as object, id: `msg_${label}`, stop_reason: "tool_use", content: [
-            { type: "tool_use", id: "Read_38", name: "Read", input: { file_path: `${label}.txt` } }
-          ]
-        } },
-        { ...user, uuid: replied, parentUuid: tool, sourceToolAssistantUUID: tool, message: { role: "user", content: [
-          { type: "tool_result", tool_use_id: "Read_38", content: `Original ${label} tool result.` }
-        ] } }
-      );
-      parent = replied;
+    let legacy = raw;
+    for (const read of reads) {
+      expect(raw).toContain(`"tool_use_id":"${read.id}"`);
+      expect(raw).toContain(`Original ${read.label} tool result.`);
+      legacy = legacy.replaceAll(`"${read.id}"`, '"Read_38"');
     }
-    await writeFile(path, raw.trimEnd() + "\n" + exchange.map(row => JSON.stringify(row)).join("\n") + "\n");
+    await writeFile(path, legacy);
 
     adapter = new ClaudeCodeAdapter({ instanceGeneration: 1, environment: overrides, settingSources: [],
       probeCwd: work, initializationTimeoutMs: 30_000 });
@@ -96,10 +92,11 @@ test("resumes legacy minted tool call IDs through the bundled Claude CLI and sen
       artifactCapacityBytes: 1024, storeArtifact: async () => { throw new Error("This fixture does not create artifacts."); } };
     const binding = await adapter.resolveNativeSessionReference(`claude-code:session:${nativeId}`, target, 1);
     await adapter.resumeSession(binding, { ...context, binding });
-    await adapter.send({ text: "Continue with both stored results.", images: [], files: [], mentions: [], disposition: "prompt" },
+    expect(await readFile(path, "utf8")).not.toContain('"tool_use_id":"Read_38"');
+    await adapter.send({ text: continuation, images: [], files: [], mentions: [], disposition: "prompt" },
       { ...context, binding, operationId: "legacy-tool-turn" });
     await vi.waitFor(() => expect(events.at(-1)).toMatchObject({ type: "done", outcome: "completed" }), { timeout: 38_000 });
-    const messages = requests.filter(request => JSON.stringify(request["messages"]).includes("Continue with both stored results.")).at(-1)?.["messages"] as
+    const messages = requests.filter(request => JSON.stringify(request["messages"] ?? []).includes(continuation)).at(-1)?.["messages"] as
       { readonly content: string | { readonly type: string; readonly id?: string; readonly tool_use_id?: string; readonly content?: unknown }[] }[] | undefined;
     const blocks = (messages ?? []).flatMap(message => typeof message.content === "string" ? [] : message.content);
     const first = blocks.find(block => block.type === "tool_result" && JSON.stringify(block.content).includes("Original first tool result."));
@@ -952,6 +949,19 @@ function sendTextMessage(response: ServerResponse, model: string, text: string):
   send("content_block_delta", { index: 0, delta: { type: "text_delta", text } });
   send("content_block_stop", { index: 0 });
   send("message_delta", { delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 5 } });
+  send("message_stop", {});
+  response.end();
+}
+
+function sendNativeReadMessage(response: ServerResponse, model: string, id: string, filePath: string): void {
+  response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+  const send = (type: string, value: Record<string, unknown>) => response.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...value })}\n\n`);
+  send("message_start", { message: { id: `msg_${id}`, type: "message", role: "assistant", model, content: [],
+    stop_reason: null, stop_sequence: null, usage: { input_tokens: 5, output_tokens: 0 } } });
+  send("content_block_start", { index: 0, content_block: { type: "tool_use", id, name: "Read", input: {} } });
+  send("content_block_delta", { index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify({ file_path: filePath }) } });
+  send("content_block_stop", { index: 0 });
+  send("message_delta", { delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 5 } });
   send("message_stop", {});
   response.end();
 }
