@@ -284,7 +284,7 @@ export class PiProviderAuthSupervisor implements ProviderNativeAuthSupervisor {
 
   static async create(options: PiProviderAuthSupervisorOptions): Promise<PiProviderAuthSupervisor> {
     const supervisor = new PiProviderAuthSupervisor(options);
-    const runtimeFactory = options.runtimeFactory ?? createNativePiRuntime;
+    const runtimeFactory = options.runtimeFactory ?? (credentials => createNativePiRuntime(credentials, options.providers));
     supervisor.#runtime = await runtimeFactory(supervisor.#credentials);
     supervisor.#nativeModels = nativeModelCatalog(supervisor.#runtime);
     await options.providers.registerNativeAuthProviders(nativeProviderRegistrations(supervisor.#runtime));
@@ -1035,7 +1035,7 @@ export class PiProviderAuthSupervisor implements ProviderNativeAuthSupervisor {
   }
 }
 
-async function createNativePiRuntime(credentials: PiCredentialStore): Promise<PiProviderAuthRuntime> {
+async function createNativePiRuntime(credentials: PiCredentialStore, providers: ProviderCatalogManager): Promise<PiProviderAuthRuntime> {
   const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
   const runtime = await ModelRuntime.create({
     credentials,
@@ -1047,6 +1047,14 @@ async function createNativePiRuntime(credentials: PiCredentialStore): Promise<Pi
   for (const provider of runtime.getProviders()) {
     const extended = additions.extendProvider(provider);
     if (extended !== provider) runtime.registerNativeProvider(extended);
+  }
+  const legacyId = additions.legacyAzureResponsesId;
+  // Keep the original vault record and saved selection of existing Azure Responses tasks.
+  if (providers.hasPersistedNativeAuthProvider(legacyId)
+    && !providers.hasManagedProvider(providers.nativeAuthenticationBackendId, legacyId)
+    && runtime.getProvider(legacyId) === undefined) {
+    const legacy = additions.legacyAzureResponsesProvider(runtime.getProvider("azure"));
+    if (legacy !== undefined) runtime.registerNativeProvider(legacy);
   }
   return runtime as unknown as PiProviderAuthRuntime;
 }

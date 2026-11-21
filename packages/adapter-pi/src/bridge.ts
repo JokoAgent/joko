@@ -708,6 +708,12 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
     const extended = modelCatalog.extendProvider(provider, () => readControl().fastMode);
     if (extended !== provider) pi.registerProvider(extended);
   }
+  const nativeAuthProviderIds: unknown = JSON.parse(process.env.JOKO_PI_NATIVE_AUTH_PROVIDER_IDS ?? "[]");
+  if (Array.isArray(nativeAuthProviderIds) && nativeAuthProviderIds.includes(modelCatalog.legacyAzureResponsesId)
+    && nativeModels.getProvider(modelCatalog.legacyAzureResponsesId) === undefined) {
+    const legacy = modelCatalog.legacyAzureResponsesProvider(nativeModels.getProvider("azure"));
+    if (legacy !== undefined) pi.registerProvider(legacy);
+  }
   // This hook runs on the final Provider-specific payload for every ordinary
   // prompt, steer, follow-up, retry, and queued turn. Orchestrator validates model
   // eligibility before toggling the generation-fenced control value.

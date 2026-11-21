@@ -1308,6 +1308,11 @@ export class ProviderCatalogManager {
 
   get nativeAuthenticationBackendId(): string { return this.#nativeBackendId; }
 
+  hasPersistedNativeAuthProvider(providerId: string): boolean {
+    this.#assertInitialized();
+    return this.#nativeEntries.has(providerId);
+  }
+
   hasManagedProvider(backendId: string, providerId: string): boolean {
     this.#assertInitialized();
     return this.#entries.has(managedProviderKey(backendId, providerId));

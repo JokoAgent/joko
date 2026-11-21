@@ -432,7 +432,7 @@ describe("PiProviderAuthSupervisor", () => {
     expect(native.map((provider) => provider.provider.id)).toEqual(expect.arrayContaining([
       "amazon-bedrock",
       "anthropic",
-      "azure-openai-responses",
+      "azure",
       "github-copilot",
       "google-vertex",
       "kimi-coding",
@@ -458,7 +458,7 @@ describe("PiProviderAuthSupervisor", () => {
       supportsLogout: true
     });
     expect(providers.get("managed-runtime", "openai-codex").capabilities?.has(PROVIDER_ACCOUNT_USAGE_CAPABILITY)).toBe(true);
-    for (const providerId of ["amazon-bedrock", "azure-openai-responses", "google-vertex"]) {
+    for (const providerId of ["amazon-bedrock", "azure", "google-vertex"]) {
       expect(providers.get("managed-runtime", providerId)).toMatchObject({
         kind: "api_key",
         authenticationState: "signed_out",
@@ -472,7 +472,7 @@ describe("PiProviderAuthSupervisor", () => {
     expect(snapshot.nativeAuthProviderIds).toEqual(expect.arrayContaining([
       "amazon-bedrock",
       "anthropic",
-      "azure-openai-responses",
+      "azure",
       "github-copilot",
       "google-vertex",
       "kimi-coding",
@@ -482,6 +482,7 @@ describe("PiProviderAuthSupervisor", () => {
       "xai"
     ]));
     expect(snapshot.nativeAuthenticatedProviderIds).toEqual([]);
+    expect(snapshot.nativeAuthProviderIds).not.toContain("azure-openai-responses");
     expect(snapshot.environment).toEqual({});
     expect(JSON.parse(await readFile(join(snapshot.agentHome, "models.json"), "utf8"))).toEqual({ providers: {} });
     expect(supervisor.loadNativeAuth({
@@ -491,6 +492,33 @@ describe("PiProviderAuthSupervisor", () => {
     expect(stringify(store.listSettings())).not.toContain('"models"');
     await supervisor.close();
     store.close();
+  });
+
+  it("reopens the previous Azure Responses identity with its original scoped credential", async () => {
+    const { root, store, credentials, providers } = await fixture("unused", false);
+    const legacyId = "azure-openai-responses";
+    await providers.registerNativeAuthProviders([{
+      provider: { id: legacyId, models: [] }, kind: "api_key", displayName: "Azure OpenAI"
+    }]);
+    const credential = { type: "api_key", key: "previous-local-azure-fixture-key" };
+    const original = await providers.writeNativeCredential({ providerId: legacyId, serializedCredential: JSON.stringify(credential) });
+    const reopened = new ProviderCatalogManager({ store, credentials, nativeBackendId: "managed-runtime" });
+    reopened.initialize();
+    const supervisor = await PiProviderAuthSupervisor.create({ store, backendId: "managed-runtime", providers: reopened,
+      refreshPiGeneration: async () => undefined });
+    try {
+      expect(reopened.get("managed-runtime", legacyId).authenticationState).toBe("authenticated");
+      expect(reopened.get("managed-runtime", "azure").authenticationState).toBe("signed_out");
+      expect(reopened.readNativeCredential(legacyId)?.descriptor.credentialReferenceId).toBe(original.credentialReferenceId);
+      const snapshot = await reopened.createPiGenerationSnapshot({ snapshotsRoot: join(root, "azure-generations") });
+      expect(snapshot.nativeAuthenticatedProviderIds).toEqual([legacyId]);
+      expect(snapshot.providers).toEqual([]);
+      expect(supervisor.loadNativeAuth({ providerIds: [legacyId, "azure"], expectedCatalogGeneration: snapshot.catalogGeneration }).credentials)
+        .toEqual({ [legacyId]: credential });
+      const models = supervisor.listNativeModels();
+      expect(models).toContainEqual(expect.objectContaining({ providerId: legacyId, modelId: "gpt-4.1", api: "azure-openai-responses" }));
+      expect(models.some(model => model.providerId === legacyId && model.api === "openai-completions")).toBe(false);
+    } finally { await supervisor.close(); store.close(); }
   });
 
   it("returns a durable starting flow without waiting for Provider network discovery", async () => {

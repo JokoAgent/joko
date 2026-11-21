@@ -50,6 +50,7 @@ export function createPiModelCatalogAdditionsFactory(nativeOptions: {
   readonly buildBaseOptions: typeof buildBaseOptions;
   readonly clampThinkingLevel: typeof clampThinkingLevel;
 }) {
+  const legacyAzureResponsesId = "azure-openai-responses";
   const routes = {
     openai: { baseUrl: "https://api.openai.com/v1" },
     "openai-codex": { baseUrl: "https://chatgpt.com/backend-api" },
@@ -434,8 +435,26 @@ export function createPiModelCatalogAdditionsFactory(nativeOptions: {
     return normalizeResponsesPayload(model, payload);
   }
 
+  function legacyAzureResponsesProvider(provider: NativeProvider | undefined): NativeProvider | undefined {
+    if (provider?.id !== "azure") return undefined;
+    const models = provider.getModels()
+      .filter(model => model.provider === "azure" && model.api === "azure-openai-responses")
+      .map(model => ({ ...model, provider: legacyAzureResponsesId }));
+    if (models.length === 0) return undefined;
+    return {
+      id: legacyAzureResponsesId,
+      name: "Azure OpenAI",
+      auth: provider.auth,
+      getModels: () => models,
+      stream: (model, context, options) => provider.stream(model, context, options),
+      streamSimple: (model, context, options) => provider.streamSimple(model, context, options)
+    };
+  }
+
   return {
     extendProvider,
+    legacyAzureResponsesId,
+    legacyAzureResponsesProvider,
     referenceCatalogMetadata,
     normalizeResponsesPayload,
     prepareProviderPayload

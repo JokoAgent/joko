@@ -4114,6 +4114,11 @@ export class PiBackendAdapter implements
       if (!credentials[providerId]) throw new Error("Native text account is unavailable.");
       const auth = new InMemoryCredentialStore(); await auth.modify(providerId, async () => credentials[providerId]); current();
       const runtime = await ModelRuntime.create({ credentials: auth, modelsPath: null, allowModelNetwork: false, refreshOnCreate: false, signal }); current();
+      const additions = createPiModelCatalogAdditions();
+      if (providerId === additions.legacyAzureResponsesId && runtime.getProvider(providerId) === undefined) {
+        const legacy = additions.legacyAzureResponsesProvider(runtime.getProvider("azure"));
+        if (legacy !== undefined) runtime.registerNativeProvider(legacy);
+      }
       const model = runtime.getModel(providerId, modelId); if (!model) throw new Error("The exact native text model is unavailable.");
       if (images.length && !model.input.includes("image")) throw new Error("The selected model does not accept images.");
       const answer = await runtime.complete(model, { systemPrompt: input.system, messages: [{ role: "user", content: [{ type: "text", text: input.user },
@@ -5421,11 +5426,11 @@ export class PiBackendAdapter implements
       JOKO_PI_RUNTIME_POLICY: profile.runtimePolicy,
       JOKO_PI_ARTIFACT_CAPACITY_BYTES: String(requireArtifactCapacity(context)),
       JOKO_PI_SECRET_ENV_NAMES: JSON.stringify([...secretNames].sort()),
+      JOKO_PI_NATIVE_AUTH_PROVIDER_IDS: JSON.stringify((options.nativeAuthProviderIds ?? []).filter(id => hosted?.trust !== "guest" || id === hosted.providerId)),
       ...(managedSubagentToolsEnabled ? {
         [MANAGED_SUBAGENT_PRODUCT_SESSION_ENV]: context.sessionId,
         [MANAGED_SUBAGENT_RUN_ROOT_ENV]: managedSubagentRunRoot(this.#sessionStore.root),
         [MANAGED_SUBAGENT_NODE_ENV]: process.execPath,
-        JOKO_PI_NATIVE_AUTH_PROVIDER_IDS: JSON.stringify((options.nativeAuthProviderIds ?? []).filter(id => hosted?.trust !== "guest" || id === hosted.providerId)),
         JOKO_PI_NATIVE_AUTHENTICATED_PROVIDER_IDS: JSON.stringify((options.nativeAuthenticatedProviderIds ?? []).filter(id => hosted?.trust !== "guest" || id === hosted.providerId)),
         JOKO_PI_SUBAGENT_CREDENTIAL_ENV_NAMES: JSON.stringify([...subagentCredentialNames].sort()),
         [MANAGED_SUBAGENT_PROVIDER_CREDENTIAL_NAMES_ENV]: JSON.stringify(Object.fromEntries(
