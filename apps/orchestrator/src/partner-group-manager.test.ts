@@ -25,20 +25,51 @@ async function fixture(withPlan = false) {
     stop: async () => true, archive: async () => undefined, hasPendingInteraction: () => false
   };
   const notifyStep = vi.fn(async (): Promise<void> => undefined);
+  const decidePlan = vi.fn(async () => withPlan
+    ? { needsPlan: true, steps: members.map((member, index) => ({ partnerId: member.id, task: index ? "Review result" : "Write result" })) }
+    : { needsPlan: false });
   const manager = new PartnerGroupManager({ storage, partners: { getPartner: id => profiles.getPartner(id), listPartners: () => profiles.listPartners() },
     runtime, work: { validateProject: async path => path, prepare: async (_group, plan) => ({ path: plan.workDir ?? "/owned/group-plan", branch: null }),
       snapshot: async () => new Map(), changedFiles: async () => ["result.txt"], trashGroup: async () => undefined },
     attachments: { prepare: async input => ({ attachments: input.attachments, commit: async () => undefined, discard: async () => undefined }) },
-    decidePlan: async () => withPlan ? { needsPlan: true, steps: members.map((member, index) => ({ partnerId: member.id, task: index ? "Review result" : "Write result" })) } : { needsPlan: false }, changed: () => undefined, notifyStep });
+    decidePlan, changed: () => undefined, notifyStep });
   await manager.start();
   cleanups.push(async () => { await manager.close(); profiles.close(); storage.close(); await rm(root, { recursive: true, force: true }); });
   const group = manager.create({ requestId: "group-original-create", expectedDirectoryRevision: storage.directoryRevision(), name: "Project", memberIds: members.map(member => member.id) });
   const send = (text: string, clientId: string, division = false) => manager.send({ groupId: group.id, expectedRevision: storage.get(group.id).revision, clientId,
     text, mentions: null, division, attachments: [], deviceId: "viewer", assertRequest: () => undefined });
-  return { manager, profiles, storage, group, members, runtime, calls, send, notifyStep };
+  return { manager, profiles, storage, group, members, runtime, calls, send, notifyStep, decidePlan };
 }
 
 describe("Partner group execution owner", () => {
+  it.each(["auto", "sequential"] as const)("keeps unaddressed messages quiet in a mention-only group with %s speaking", async speakingMode => {
+    const f = await fixture(true);
+    await f.manager.update(f.group.id, f.group.revision, { replyMode: "mentioned", speakingMode }, () => undefined);
+    const quiet = await f.send("A note for the chat", "local-quiet");
+    expect(await f.send("A note for the chat", "local-quiet")).toEqual(quiet);
+    expect(f.storage.messages(f.group.id).messages.map(message => message.id)).toEqual([quiet.id]);
+    expect(f.decidePlan).not.toHaveBeenCalled();
+    expect(f.calls).toEqual([]);
+
+    await f.send("@all @Reviewer Please respond", "local-named");
+    await vi.waitFor(() => expect(f.calls.map(call => call.partnerId)).toEqual([f.members[1]!.id]));
+    expect(f.decidePlan).not.toHaveBeenCalled();
+
+    await f.send("Arrange the work", "local-division", true);
+    await vi.waitFor(() => expect(f.storage.openPlan(f.group.id)?.status).toBe("proposed"));
+    expect(f.decidePlan).toHaveBeenCalledOnce();
+    await f.send("A note outside the plan", "local-quiet-during-plan");
+    expect(f.decidePlan).toHaveBeenCalledOnce();
+  });
+
+  it("records a human broadcast without waking the organizer in a reply-all group", async () => {
+    const f = await fixture();
+    await f.send("@all A note for people", "local-human-broadcast");
+    expect(f.storage.messages(f.group.id).messages).toMatchObject([{ mentions: { all: true, partnerIds: [] } }]);
+    expect(f.decidePlan).not.toHaveBeenCalled();
+    expect(f.calls).toEqual([]);
+  });
+
   it("accepts a new note after the handoff commits while its outbox notification is still settling", async () => {
     const f = await fixture(true); let release!: () => void;
     f.notifyStep.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
