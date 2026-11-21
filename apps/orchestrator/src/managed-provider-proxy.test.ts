@@ -3,12 +3,13 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { OperationalStore } from "@joko/store";
 import { createCodexAdapter } from "@joko/adapter-codex";
-import type { AdapterContext, EventPayload, NativeSessionBinding, TargetDescriptor } from "@joko/core";
+import type { AdapterContext, EventPayload, ManagedProviderRouteOwner, NativeSessionBinding, SessionDescriptor, TargetDescriptor } from "@joko/core";
+import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { mkdir, readFile, readdir } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 import { CredentialManager, ProviderCatalogManager } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
-import { ManagedProviderProxy } from "./managed-provider-proxy.js";
+import { assertManagedProviderOwner, ManagedProviderProxy } from "./managed-provider-proxy.js";
 import { mkdtemp } from "./test-paths.js";
 
 async function fixture(
@@ -106,6 +107,7 @@ async function fixture(
   await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
   const endpoint = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
   let ownerCurrent = true; let sessionPresent = true;
+  let checkOwner: ((owner: ManagedProviderRouteOwner) => void) | undefined;
   const routedFetch: typeof fetch = async (input, init) => {
     const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
     if (url.origin === endpoint) return await fetch(input, init);
@@ -126,7 +128,10 @@ async function fixture(
   const proxy = new ManagedProviderProxy({
     providers,
     fetch: routedFetch,
-    assertOwner: () => { if (!ownerCurrent || !sessionPresent) throw new Error("Owner changed"); }
+    assertOwner: owner => {
+      if (!ownerCurrent || !sessionPresent) throw new Error("Owner changed");
+      checkOwner?.(owner);
+    }
   });
   await proxy.start();
   const port = proxy.createRuntime({ backendId: "runtime", generation: 3, support: { protocols: [protocol], fields: [] }, clientProtocol,
@@ -176,6 +181,7 @@ async function fixture(
   };
   return { directory, store, credentials, providers, proxy, port, owner, received, receivedBodies, nativeReceived, forwardedProxyTokens, forwardedFedrampHeaders, forwardedClaudeKeys,
     disableModel: (modelId: string) => disabledModels.add(modelId),
+    checkOwnerWith: (check: (owner: ManagedProviderRouteOwner) => void) => { checkOwner = check; },
     write, markProviderUnavailable, requestPath,
     token: port.environment[port.secretEnvironmentNames[0]!]!, toolOutcome: () => toolOutcome,
     hold: () => { hold = true; }, reject: () => { reject = true; },
@@ -199,6 +205,58 @@ function responsesEvents(body: string): Record<string, unknown>[] {
 }
 
 describe("Managed Provider native proxy", () => {
+  it("dispatches an adopted local Backend and fences the exact Session, workspace and process generations", async () => {
+    const f = await fixture();
+    try {
+      const originalBackendId = "project-backend";
+      for (const id of [originalBackendId, f.owner.backendId]) {
+        f.store.upsertBackend(await new FakeBackendAdapter({ ...PI_LIKE_PROFILE, id }).describe());
+      }
+      const target = { id: f.owner.targetId, backendId: originalBackendId, displayName: "Workspace", workspaceRoot: f.directory, managed: false, trusted: true };
+      f.store.upsertTarget(target);
+      const session: SessionDescriptor = { id: f.owner.sessionId, targetId: target.id, backendId: f.owner.backendId, title: "Adopted runtime",
+        binding: { opaqueRef: "adopted-task", generation: f.owner.sessionGeneration }, createdAt: 1, updatedAt: 1,
+        archived: false, pinned: false, permissionMode: "ask", planMode: false, fastMode: false,
+        providerId: f.owner.providerId, modelId: f.owner.modelId };
+      expect(() => f.store.createSession(session)).toThrow("Session backend does not match its target backend.");
+      f.store.createSession(session, { localRuntimeBackendSelection: true });
+      let targetOverride: TargetDescriptor | undefined;
+      let sessionGeneration = session.binding.generation;
+      let backendGeneration = f.owner.backendInstanceGeneration;
+      f.checkOwnerWith(owner => {
+        const stored = f.store.getSession(owner.sessionId).descriptor;
+        assertManagedProviderOwner(owner, { ...stored, binding: { ...stored.binding, generation: sessionGeneration } },
+          targetOverride ?? f.store.getTarget(owner.targetId).descriptor, { state: "available", generation: backendGeneration });
+      });
+      const binding = await f.port.prepare(f.owner);
+      const lease = await binding.activate({ operationId: "adopted-local-turn", signal: new AbortController().signal, assertCurrent: () => undefined });
+      const request = () => fetch(`${binding.baseUrl}/responses`, {
+        method: "POST", headers: { authorization: `Bearer ${f.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ model: f.owner.modelId, input: "Use the adopted route" })
+      });
+      try {
+        const success = await request();
+        expect(success.status).toBe(200);
+        await success.text();
+        for (const changed of [
+          { ...target, trusted: false },
+          { ...target, remoteWorkspace: { kind: "ssh", hostTargetId: "ssh-target", hostId: "host", workspaceRoot: "/work" } } as const,
+          { ...target, remoteWorkspace: { kind: "device_peer", controllerDeviceId: "controller", targetDeviceId: "peer", workspaceRoot: "/work" } } as const
+        ]) {
+          targetOverride = changed;
+          expect((await request()).ok).toBe(false);
+        }
+        targetOverride = undefined;
+        sessionGeneration++;
+        expect((await request()).ok).toBe(false);
+        sessionGeneration--;
+        backendGeneration++;
+        expect((await request()).ok).toBe(false);
+        expect(f.received).toMatchObject([{ path: f.requestPath, model: f.owner.modelId }]);
+      } finally { lease.release(); binding.dispose(); }
+    } finally { await f.dispose(); }
+  });
+
   it("keeps Kimi Messages tool exchanges unique across duplicate history, compaction, and runtime reattachment", async () => {
     const f = await fixture(false, "anthropic-messages", "configured-kimi-account", null, "anthropic-messages", {
       baseUrl: "https://api.kimi.com/coding", modelId: "k3.1-pro"

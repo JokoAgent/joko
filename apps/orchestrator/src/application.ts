@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { publicConnectionCapabilities } from './connection-entries.js';
-import { ManagedProviderProxy } from "./managed-provider-proxy.js";
+import { assertManagedProviderOwner, ManagedProviderProxy } from "./managed-provider-proxy.js";
 import { answerDeliveryPrompt } from "./answer-delivery-prompt.js";
 import { createHostedAgentAutoReviewer } from "./hosted-agent-auto-review.js";
 import { richAnswerText } from "@joko/contracts";
@@ -1613,12 +1613,7 @@ export async function createOrchestratorApplication(
     assertOwner: (owner) => {
       const session = store.getSession(owner.sessionId).descriptor;
       const target = store.getTarget(owner.targetId).descriptor;
-      const instance = backendInstances.get(owner.backendId);
-      if (session.deletedAt !== undefined || session.targetId !== owner.targetId || session.backendId !== owner.backendId
-        || session.binding.generation !== owner.sessionGeneration || target.backendId !== owner.backendId
-        || instance.state !== "available" || instance.generation !== owner.backendInstanceGeneration) {
-        throw new Error("Managed Provider operation owner is no longer current.");
-      }
+      assertManagedProviderOwner(owner, session, target, backendInstances.get(owner.backendId));
     }
   });
   await managedProviderProxy.start();

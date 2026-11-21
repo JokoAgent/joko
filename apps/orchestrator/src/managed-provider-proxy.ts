@@ -5,8 +5,9 @@ import { piProviderModel } from "@joko/adapter-pi";
 import type {
   BackendProviderDescriptor, ManagedProviderOperationLease, ManagedProviderRouteBinding,
   ManagedProviderRouteOwner, ManagedProviderRuntimePort, ManagedProviderSmartRoutingBinding,
-  ManagedProviderSmartRoutingRoute, ProviderRuntimeProtocol, ProviderRuntimeSupport
+  ManagedProviderSmartRoutingRoute, ProviderRuntimeProtocol, ProviderRuntimeSupport, SessionDescriptor, TargetDescriptor
 } from "@joko/core";
+import type { BackendInstanceSnapshot } from "./backend-instance-registry.js";
 import type { ProviderCatalogManager, ProviderInferenceRoute } from "./credential-manager.js";
 import { ManagedAnthropicToolIds, supportsManagedAnthropicToolIdRepair } from "./managed-anthropic-tool-ids.js";
 import { estimateClaudeInputTokens, prepareClaudeResponsesRequest, writeClaudeResponse } from "./managed-claude-responses.js";
@@ -22,6 +23,22 @@ const MAXIMUM_RETIRED_SMART_DESCENDANTS = 4_096;
 const MAXIMUM_ANTHROPIC_TOOL_HISTORY_THREADS = 128;
 const REQUEST_TIMEOUT_MS = 10 * 60_000;
 const SMART_TOKEN_HEADER = "x-joko-provider-proxy-token";
+
+export function assertManagedProviderOwner(
+  owner: ManagedProviderRouteOwner,
+  session: SessionDescriptor,
+  target: TargetDescriptor,
+  instance: Pick<BackendInstanceSnapshot, "state" | "generation">
+): void {
+  // A trusted service-node workspace can adopt a runtime distinct from its registered Backend.
+  const localRuntimeSelection = target.trusted && target.remoteWorkspace === undefined && session.remoteWorkspace === undefined;
+  if (session.deletedAt !== undefined || session.id !== owner.sessionId
+    || session.targetId !== owner.targetId || target.id !== owner.targetId || session.backendId !== owner.backendId
+    || session.binding.generation !== owner.sessionGeneration || (target.backendId !== owner.backendId && !localRuntimeSelection)
+    || instance.state !== "available" || instance.generation !== owner.backendInstanceGeneration) {
+    throw new Error("Managed Provider operation owner is no longer current.");
+  }
+}
 
 interface RuntimeOwner {
   readonly backendId: string;
