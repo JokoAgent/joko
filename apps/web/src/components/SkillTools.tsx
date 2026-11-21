@@ -19,6 +19,8 @@ import {
 } from "lucide-react";
 
 import type { AppController } from "../controller.js";
+import { skillCreatorDraft } from "../builtin-skill-intent.js";
+import { authenticatedConnectionKey } from "../connection-owner.js";
 import type {
   BackendView,
   ResourceView,
@@ -148,6 +150,8 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
   const [editing, setEditing] = useState(false);
   const [editorText, setEditorText] = useState("");
   const [actionError, setActionError] = useState<string>();
+  const [creatorError, setCreatorError] = useState<string>();
+  const [openingCreator, setOpeningCreator] = useState(false);
   const [busy, setBusy] = useState(false);
   const [preview, setPreview] = useState<{ readonly draft: SkillDraftView; readonly source: "edit" | "rename" }>();
   const [renameOpen, setRenameOpen] = useState(false);
@@ -171,6 +175,14 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
   const dirty = editing && fileState?.kind === "ready" && editorText !== fileState.value.content;
   const dirtyRef = useRef(dirty);
   dirtyRef.current = dirty;
+  const creatorOwner = controller.state === undefined ? undefined : authenticatedConnectionKey(controller.state);
+  const creatorOwnerRef = useRef(creatorOwner);
+  creatorOwnerRef.current = creatorOwner;
+  const canCreateSkill = creatorOwner !== undefined && targets.some(target => {
+    const backend = backends.find(item => item.id === target.backendId);
+    return target.trusted && !target.archived && target.remoteWorkspace === undefined && backend?.health !== "unavailable"
+      && resourceKindsForBackend(backend).includes("skill");
+  });
   useEffect(() => registerCatalogNavigationLeave(signal => {
     if (!dirtyRef.current) return undefined;
     const accepted = !signal.aborted && window.confirm(t("skills.unsavedLeave"));
@@ -318,6 +330,24 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
   }, []);
 
   const discardAllowed = (): boolean => !dirty || window.confirm(t("skills.unsavedLeave"));
+  const launchCreator = async (trigger: HTMLButtonElement): Promise<void> => {
+    if (!canCreateSkill || openingCreator || busy || !discardAllowed()) return;
+    dirtyRef.current = false;
+    setEditing(false);
+    const current = () => trigger.isConnected && creatorOwnerRef.current === creatorOwner;
+    setOpeningCreator(true);
+    setCreatorError(undefined);
+    try {
+      const original = await controller.readNewSessionDraft();
+      if (!current()) return;
+      await controller.saveNewSessionDraft(skillCreatorDraft(original));
+      if (current()) controller.navigate({ kind: "newSession" });
+    } catch (error) {
+      if (current()) setCreatorError(errorMessage(error, t));
+    } finally {
+      if (trigger.isConnected) setOpeningCreator(false);
+    }
+  };
   const selectSkill = (skill: SkillDescriptorView): void => {
     if (skill.id === selectedId) {
       setMobileDetail(true);
@@ -418,6 +448,10 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
             <option value="project">{t("skills.scopeProject")}</option>
           </SelectControl>
           <IconButton label={t("common.refresh")} onClick={() => { if (discardAllowed()) loadCatalog(); }}><RefreshCcw aria-hidden="true" /></IconButton>
+          {canCreateSkill && <div className="skill-catalog__creator"><Button disabled={openingCreator || busy}
+            onClick={event => { void launchCreator(event.currentTarget); }}><Sparkles aria-hidden="true" />{t("skills.createWithAgent")}</Button>
+            {creatorError !== undefined && <InlineError message={creatorError} />}
+          </div>}
         </header>
         {catalog.kind === "loading" && <CatalogStatus label={t("skills.loading")} />}
         {catalog.kind === "error" && <CatalogStatus error label={catalog.message} action={<Button onClick={loadCatalog}>{t("common.retry")}</Button>} />}

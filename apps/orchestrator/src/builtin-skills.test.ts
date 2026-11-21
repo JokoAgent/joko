@@ -11,14 +11,17 @@ import { ExtensionCardService } from "./extension-cards/service.js";
 it("loads the actual shipped Skill and relative references into an immutable native mount", async () => {
   const catalog = await BuiltinSkillCatalog.load(inspectPiSkillPackage);
   const current = vi.fn(); const controller = new AbortController();
-  const seeds = await catalog.snapshot(current, controller.signal);
-  expect(seeds).toHaveLength(1);
+  const seeds = await catalog.snapshot(current, controller.signal, true);
+  expect(seeds).toHaveLength(2);
   expect(seeds[0]?.resource.trustedBuiltin).toEqual({ id: "plugin_creator", revision: seeds[0]?.resource.revision });
+  expect(seeds[1]?.resource.trustedBuiltin).toEqual({ id: "skill_creator", revision: seeds[1]?.resource.revision });
   const mounted = await snapshotNativeSkills(seeds, controller.signal);
   try {
     expect(await readFile(mounted.skills[0]!.filePath, "utf8")).toContain("name: joko-plugin-creator");
     const guide = await readFile(join(mounted.skills[0]!.path, "references", "tasks.md"), "utf8");
     expect(guide).toContain("expectedRevision"); expect(guide).toContain("joko.tasks.create");
+    expect(await readFile(mounted.skills[1]!.filePath, "utf8")).toContain(".agents/skills/<name>/");
+    expect((await catalog.snapshot(current, controller.signal, false)).map(seed => seed.resource.name)).toEqual(["joko-plugin-creator"]);
     await mounted.assertFilesCurrent(controller.signal);
     expect(current).toHaveBeenCalled();
   } finally { await mounted.dispose(); }
@@ -27,8 +30,8 @@ it("does not attest a changed shipped revision or a stale runtime owner", async 
   const inspect = vi.fn(inspectPiSkillPackage);
   const catalog = await BuiltinSkillCatalog.load(inspect);
   inspect.mockImplementationOnce(async (...args) => ({ ...await inspectPiSkillPackage(...args), revision: "sha256:" + "0".repeat(64) }));
-  await expect(catalog.snapshot(() => undefined, new AbortController().signal)).rejects.toThrow("bundle changed");
-  await expect(catalog.snapshot(() => { throw Error("old owner"); }, new AbortController().signal)).rejects.toThrow("old owner");
+  await expect(catalog.snapshot(() => undefined, new AbortController().signal, true)).rejects.toThrow("bundle changed");
+  await expect(catalog.snapshot(() => { throw Error("old owner"); }, new AbortController().signal, true)).rejects.toThrow("old owner");
 });
 it("runs the shipped example with the actual SDK and card service, including the user refresh action", async () => {
   const html: string[] = [], scope = { extensionId: "extension", authorityKey: "install", sessionId: "session", sessionCreatedAt: 1, targetId: "target", toolUseId: null };

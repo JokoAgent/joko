@@ -3879,6 +3879,8 @@ export interface ResourceDraft {
   readonly version: string;
 }
 
+export type BuiltinSkillIntent = "plugin_creator" | "skill_creator";
+
 export interface RuntimeCommandView {
   readonly id: string;
   readonly sessionId?: string;
@@ -3888,7 +3890,7 @@ export interface RuntimeCommandView {
   readonly resourceId?: string;
   readonly inputMode: "text" | "resource_mention";
   readonly loaded: boolean;
-  readonly builtinSkill?: { readonly id: "plugin_creator"; readonly revision: string };
+  readonly builtinSkill?: { readonly id: BuiltinSkillIntent; readonly revision: string };
 }
 
 export type RuntimeToolFieldTypeView = "string" | "number" | "integer" | "boolean" | "object" | "array" | "blob" | "unknown";
@@ -5765,7 +5767,7 @@ export interface NewSessionModelRequest {
 export interface NewSessionLocalDraft {
   readonly taskModelGroupId?: string;
   readonly preparation?: ProvisionalTaskReceipt;
-  readonly builtinSkillIntent?: "plugin_creator";
+  readonly builtinSkillIntent?: BuiltinSkillIntent;
   readonly contactsDialogue?: { readonly requestId: string; readonly name: string };
   readonly selection: NewSessionDraftSelection | { readonly kind: "unselected" };
   readonly nativeStart: { readonly kind: "fresh" } | { readonly kind: "attach"; readonly reference: string };
@@ -5916,7 +5918,7 @@ export type SideChatOperationView =
 export interface ComposerDraft {
   readonly replyQuote?: PartnerReplyQuoteView;
   readonly todoQuote?: { readonly partnerId: string; readonly todoId: string; readonly revision: bigint; readonly title: string };
-  readonly builtinSkillIntent?: "plugin_creator";
+  readonly builtinSkillIntent?: BuiltinSkillIntent;
   readonly text: string;
   /** Ordered rich-text source of truth for inline selected-text quote atoms. */
   readonly editorDocument?: JSONContent;

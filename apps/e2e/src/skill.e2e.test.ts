@@ -1,14 +1,20 @@
 import { randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
+import { join } from "node:path";
 
 import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
 import {
   ApplySkillDraftMutationSchema,
   DeleteSkillMutationSchema,
+  InputMentionRangeSchema,
+  InputPartSchema,
   OperationMutationSchema,
   OperationState,
+  PermissionMode,
+  ResourceKind,
   ResourceScope,
+  RunState,
   SetSkillEnabledMutationSchema,
   SkillFileKind,
   SkillRecoveryStatus,
@@ -18,8 +24,74 @@ import {
 } from "@joko/contracts";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { submit } from "./operations.js";
+import { waitFor } from "./fixture.js";
+import { createSessionMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
+import { REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID, RealPiSystemFixture } from "./real-pi-fixture.js";
 import { installLocalSkill, SkillSystemFixture } from "./skill-system-fixture.js";
+
+it("authors a project Skill in a real Pi task and loads it after explicit review and enablement", { timeout: 90_000 }, async () => {
+  const authoringCommand = "/joko-skill-creator";
+  const projectPath = ".agents/skills/report-triage/SKILL.md";
+  const authoredBody = "Classify each report by observed impact before summarizing.";
+  const authored = `---\nname: report-triage\ndescription: Triage reports by observed impact.\n---\n\n${authoredBody}\n`;
+  const fixture = await RealPiSystemFixture.start({ providerResponder: ({ request }) => {
+    const messages = request.body["messages"] as Array<{ role?: string }> | undefined;
+    if (messages?.at(-1)?.role === "tool") return { kind: "text", text: "Wrote the requested project Skill." };
+    const serialized = JSON.stringify(messages ?? []);
+    if (serialized.includes("Create the report triage Skill in this project") && serialized.includes("[Joko loaded resource]")
+      && serialized.includes("Choose a lowercase hyphenated name")) {
+      return { kind: "tool", name: "write", arguments: { path: projectPath, content: authored } };
+    }
+    return { kind: "text", text: serialized.includes(authoredBody) ? "Applied the reviewed project Skill." : "Finished." };
+  } });
+  try {
+    const { clients, connectionId } = await fixture.pair("Ordinary Skill author");
+    const target = required((await clients.target.listTargets({ backendId: "pi" })).targets.find(item => item.trusted), "trusted Pi Target");
+    const startTask = async () => sessionIdFrom(await submit(clients.operation, connectionId, createSessionMutation({
+      backendId: "pi", targetId: target.targetId, providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID,
+      permissionMode: PermissionMode.BYPASS_PERMISSIONS
+    })));
+    const runSkill = async (sessionId: string, resourceId: string, invocation: string, instruction: string) => {
+      const active = required((await clients.session.listSessionResources({ sessionId })).resources.find(item => item.resourceId === resourceId), "loaded Skill");
+      const mutation = sendInputMutation(sessionId, active.runtimeGeneration, `${invocation} ${instruction}`);
+      if (mutation.payload.case !== "sendInput" || mutation.payload.value.input === undefined) throw new Error("Missing Skill input.");
+      mutation.payload.value.input.parts.push(create(InputPartSchema, { content: { case: "resourceMention", value: {
+        resourceId, discoveredRevision: active.discoveredRevision, resourceVersion: active.resourceVersion,
+        runtimeGeneration: active.runtimeGeneration, displayText: invocation
+      } } }));
+      mutation.payload.value.input.mentionRanges.push(create(InputMentionRangeSchema, { start: 0, end: invocation.length, mentionIndex: 0 }));
+      const runId = queueRunIdFrom(await submit(clients.operation, connectionId, mutation));
+      await waitFor(() => clients.run.getRun({ runId }), result => result.run?.state === RunState.COMPLETED, instruction);
+    };
+    const original = await startTask();
+    const commands = (await clients.session.listRuntimeCommands({ sessionId: original })).commands;
+    const creator = required(commands.find(command => command.skillCreatorRevision !== undefined), "loaded ordinary Skill creator");
+    expect(creator.resourceId).toMatch(/^builtin:skill_creator:/u);
+    expect(commands.find(command => command.builtinSkill?.id === "plugin_creator")?.resourceId).toMatch(/^builtin:plugin_creator:/u);
+    await runSkill(original, creator.resourceId, authoringCommand, "Create the report triage Skill in this project");
+    expect((await readFile(join(fixture.workspaceDirectory, projectPath), "utf8")).replaceAll("\r\n", "\n")).toBe(authored);
+    expect((await clients.skill.listSkills({ targetId: target.targetId })).skills).toHaveLength(0);
+
+    const discovered = await submit(clients.operation, connectionId, create(OperationMutationSchema, {
+      payload: { case: "discoverProjectResources", value: { targetId: target.targetId } }
+    }));
+    expect(discovered.state, discovered.error?.message).toBe(OperationState.SUCCEEDED);
+    const review = required((await clients.pi.listPiResources({ backendId: "pi", kind: ResourceKind.SKILL })).resources
+      .find(resource => resource.targetId === target.targetId && resource.name === "report-triage"), "reviewable project Skill");
+    expect(review.enabled).toBe(false);
+    const approved = await submit(clients.operation, connectionId, create(OperationMutationSchema, {
+      payload: { case: "approveResource", value: { resourceId: review.resourceId, discoveredRevision: review.discoveredRevision } }
+    }));
+    expect(approved.state, approved.error?.message).toBe(OperationState.SUCCEEDED);
+    const skill = required((await clients.skill.listSkills({ targetId: target.targetId })).skills.find(item => item.skillId === review.resourceId), "approved project Skill");
+    const enabled = skillResult(await submit(clients.operation, connectionId, create(OperationMutationSchema, {
+      payload: { case: "setSkillEnabled", value: { skillId: skill.skillId, expectedResourceRevision: skill.entityVersion?.revision, enabled: true } }
+    })), "enable the authored Skill");
+    expect(enabled.skill?.enabled).toBe(true);
+    await runSkill(await startTask(), review.resourceId, "/report-triage", "Apply the reviewed project rule");
+    expect(fixture.providerRequests.some(request => JSON.stringify(request.body["messages"]).includes(authoredBody))).toBe(true);
+  } finally { await fixture.close(); }
+});
 
 describe("production Skill management chain", () => {
   let fixture: SkillSystemFixture | undefined;

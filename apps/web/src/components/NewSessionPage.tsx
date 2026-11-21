@@ -276,7 +276,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [attachments, setAttachments] = useState<readonly AttachmentDraft[]>([]);
   const [browserComments, setBrowserComments] = useState<readonly BrowserCommentDraftItem[]>([]);
   const [extraDirectoryIds, setExtraDirectoryIds] = useState<readonly string[]>([]);
-  const builtinSkillIntentRef = useRef<"plugin_creator" | undefined>(undefined);
+  const builtinSkillIntentRef = useRef<NewSessionLocalDraft["builtinSkillIntent"]>(undefined);
   const [attachmentError, setAttachmentError] = useState<string>();
   const [draftError, setDraftError] = useState<string>();
   const [preparation, setPreparation] = useState<ProvisionalTaskReceipt>();

@@ -1,4 +1,5 @@
 import { redactSecrets, type RuntimeCommand } from "@joko/core";
+import { builtinSkillResourceId } from "./builtin-skills.js";
 
 export const SESSION_RUNTIME_COMMANDS_SETTING_KEY = "runtime.commands.observation";
 
@@ -78,6 +79,8 @@ export function sameRuntimeCommands(
       command.inputMode === candidate.inputMode &&
       command.path === candidate.path &&
       command.resourceId === candidate.resourceId &&
+      command.builtinSkill?.id === candidate.builtinSkill?.id &&
+      command.builtinSkill?.revision === candidate.builtinSkill?.revision &&
       command.loaded === candidate.loaded;
   });
 }
@@ -105,6 +108,12 @@ function normalizeRuntimeCommand(value: RuntimeCommand, index: number): RuntimeC
   if (inputMode === "resource_mention" && (source !== "skill" || !value["loaded"] || !resourceId)) {
     throw new Error(`Runtime command ${index} has no loaded Skill Resource identity.`);
   }
+  const builtinSkill = value["builtinSkill"];
+  if (builtinSkill !== undefined && (!isRecord(builtinSkill) || (builtinSkill.id !== "plugin_creator" && builtinSkill.id !== "skill_creator")
+    || typeof builtinSkill.revision !== "string" || !/^sha256:[a-f0-9]{64}$/u.test(builtinSkill.revision) || source !== "skill" || !value["loaded"]
+    || builtinSkillResourceId(builtinSkill) !== resourceId)) {
+    throw new Error(`Runtime command ${index} has an invalid shipped Skill identity.`);
+  }
   return {
     name,
     description,
@@ -112,6 +121,7 @@ function normalizeRuntimeCommand(value: RuntimeCommand, index: number): RuntimeC
     inputMode,
     ...(path === undefined || path === "" ? {} : { path }),
     ...(resourceId === undefined || resourceId === "" ? {} : { resourceId }),
+    ...(builtinSkill === undefined ? {} : { builtinSkill: { id: builtinSkill.id, revision: builtinSkill.revision } }),
     loaded: value["loaded"]
   };
 }
@@ -129,6 +139,7 @@ function compareRuntimeCommands(left: RuntimeCommand, right: RuntimeCommand): nu
   const identity = compareText(runtimeCommandIdentity(left), runtimeCommandIdentity(right));
   if (identity !== 0) return identity;
   if (left.loaded !== right.loaded) return left.loaded ? -1 : 1;
+  if (Boolean(left.builtinSkill) !== Boolean(right.builtinSkill)) return left.builtinSkill === undefined ? 1 : -1;
   return compareText(left.description, right.description);
 }
 

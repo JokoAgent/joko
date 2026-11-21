@@ -120,6 +120,10 @@ describe("mounted Skill management surface", () => {
     await page.getByText("No local Skills", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
     await page.getByText("Recoverable copies", { exact: true }).waitFor({ state: "visible" });
     expect(await overflow(page)).toBeLessThanOrEqual(1);
+    await page.getByRole("button", { name: "Create Skill with Agent", exact: true }).click();
+    const composer = page.locator(".new-task-composer [data-composer-editor='true']");
+    await composer.waitFor({ state: "visible" });
+    expect((await composer.textContent())?.trim()).toBe("/joko-skill-creator");
     expect(browserErrors).toEqual([]);
   }, 120_000);
 });

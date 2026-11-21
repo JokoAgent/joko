@@ -421,6 +421,11 @@ export interface ContextRebuildInput {
 
 export type RuntimeCommandInputMode = "text" | "resource_mention";
 
+export interface BuiltinSkillIdentity {
+  readonly id: "plugin_creator" | "skill_creator";
+  readonly revision: string;
+}
+
 export interface RuntimeCommand {
   readonly name: string;
   readonly description: string;
@@ -431,7 +436,7 @@ export interface RuntimeCommand {
   readonly resourceId?: string;
   readonly loaded: boolean;
   /** Host-attested only after an exact native loader/path observation. */
-  readonly builtinSkill?: { readonly id: "plugin_creator"; readonly revision: string };
+  readonly builtinSkill?: BuiltinSkillIdentity;
 }
 
 export interface NativeMemoryResetResult {
@@ -455,7 +460,7 @@ export interface RuntimeResource {
   readonly kind: "extension" | "skill" | "prompt" | "package";
   readonly name: string;
   /** Private service seed provenance, never accepted from a client manifest. */
-  readonly trustedBuiltin?: { readonly id: "plugin_creator"; readonly revision: string };
+  readonly trustedBuiltin?: BuiltinSkillIdentity;
   readonly source: string;
   readonly state: "discovered" | "approved" | "loaded" | "disabled" | "error";
   /** Exact content revision captured into this immutable runtime snapshot. */

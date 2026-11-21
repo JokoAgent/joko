@@ -4443,7 +4443,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const native = matches.length === 1 ? matches[0] : undefined;
     if (native === undefined || snapshot.skillOverrides[native.name] === "off") return undefined;
     const mount = snapshot.skills.find(mount => mount.filePath === native.path);
-    if (!mount || mount.discovery || mount.seed.resource.trustedBuiltin !== undefined) return undefined;
+    if (!mount || mount.discovery || mount.seed.resource.trustedBuiltin?.id === "plugin_creator") return undefined;
     return resolvedCodexSkill(native, snapshot, assertCurrent);
   }
 

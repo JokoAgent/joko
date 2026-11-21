@@ -181,7 +181,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   const [inlineMentionActivation, setInlineMentionActivation] = useState<(ComposerInlineMentionActivation & { readonly source: "typed" | "button" })>();
   const [inlineMentionActiveIndex, setInlineMentionActiveIndex] = useState(0);
   const [extraDirectoryIds, setExtraDirectoryIds] = useState<readonly string[] | undefined>();
-  const builtinSkillIntentRef = useRef<"plugin_creator" | undefined>(undefined);
+  const builtinSkillIntentRef = useRef<ComposerDraft["builtinSkillIntent"]>(undefined);
   const [attachmentError, setAttachmentError] = useState<string>();
   const [deliveryMode, setDeliveryMode] = useState<DeliveryMode>("prompt");
   const [hydratedSession, setHydratedSession] = useState<string>();
