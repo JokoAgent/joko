@@ -20,10 +20,11 @@ import { StatusBar } from "expo-status-bar";
 import Constants from "expo-constants";
 import { randomUUID } from "expo-crypto";
 import * as Clipboard from "expo-clipboard";
+import { create } from "@bufbuild/protobuf";
 import {
-  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, InteractionState, ModelSourceKind, QueueItemState, QueueSourceKind, RuntimeCommandInputMode, SessionState, TargetState, WorkspaceKind, capabilityNames, partnerResumeMessages, queueQuotaRetryAt,
+  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, InteractionState, ModelSourceKind, QueueItemState, QueueSourceKind, QueueTextEditSpliceSchema, RuntimeCommandInputMode, SessionState, TargetState, WorkspaceKind, capabilityNames, partnerResumeMessages, queueQuotaRetryAt,
   PARTNER_TODO_CHECK_PROMPT, partnerSessionTaskMessages, partnerSessionTaskReceiptLabel,
-  type QueueItem, type Session
+  type QueueItem, type QueueTextEditSplice, type Session
 } from "@joko/contracts";
 import type { PartnerLearningSettingsDestination } from "@joko/contracts";
 import { MobilePartnerLearningFooter } from "./MobilePartnerLearningFooter";
@@ -315,7 +316,8 @@ import {
   type MobileFilesSearchMode
 } from "./workspace-files";
 import { buildMobileMessageActions, buildMobileMessageCopyText, captureMobileMessageReference, commitMobileMessageReference,
-  createMobileSideChatMessageDraft, queueItemText, type MobileMessageActionId, type MobileMessageReferenceLease } from "./task-actions";
+  createMobileSideChatMessageDraft, maximumMobileQueueTextEditSplices, mobileQueueTextSplice, queueItemText, retainedQueueRanges,
+  type MobileMessageActionId, type MobileMessageReferenceLease } from "./task-actions";
 import { useMobileVoiceInput, type MobileVoiceInputBinding } from "./use-mobile-voice-input";
 import { useMobileVoicePermissionSettings } from "./use-mobile-voice-permission-settings";
 import { MobileVoiceDictionaryController } from "./mobile-voice-dictionary-controller";
@@ -4009,6 +4011,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     readonly lease: MobileQueueEditLease;
     readonly profileId: string;
     readonly stashedDraft: MobileComposerDraft;
+    readonly textSplices: QueueTextEditSplice[];
   }>();
   const [composerContentHeight, setComposerContentHeight] = useState(composerMinimumInputHeight);
   const [composerManualHeight, setComposerManualHeight] = useState<number | null>(null);
@@ -6152,10 +6155,22 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       setWorkspaceMentionsVisible(false);
       throw new Error(mobileMessage(locale, "task.error.workspaceChecking"));
     }
-    const result = insertMobileWorkspaceMention(draft, composerSelection, {
+    const currentDraft = composerDraftRef.current;
+    const currentSelection = composerSelectionRef.current;
+    const result = insertMobileWorkspaceMention(currentDraft, currentSelection, {
       ...current,
       ...(lineRange === undefined ? {} : { lineRange })
     }, randomUUID());
+    if (queueOwner !== undefined) {
+      if (queueOwner.textSplices.length <= maximumMobileQueueTextEditSplices) {
+        const { start, end } = result.replacedRange;
+        queueOwner.textSplices.push(create(QueueTextEditSpliceSchema, {
+          start, end, replacementText: result.draft.text.slice(start, result.selection.end)
+        }));
+      }
+      composerDraftRef.current = result.draft;
+      composerSelectionRef.current = result.selection;
+    }
     setDraft(result.draft);
     setComposerSelection(result.selection);
     if (queueOwner === undefined) mobileComposerDrafts.save(identity, result.draft);
@@ -6773,11 +6788,14 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         await client.cancelQueueEdit(lease).catch(() => undefined);
         return;
       }
-      const active = { lease, profileId, stashedDraft };
+      const textSplices: QueueTextEditSplice[] = [];
+      const active = { lease, profileId, stashedDraft, textSplices };
       queueEditRef.current = active;
       setQueueEdit(active);
       const queuedDraft = plainTextMobileComposerDraft(lease.text);
+      composerDraftRef.current = queuedDraft;
       setDraft(queuedDraft);
+      composerSelectionRef.current = { start: queuedDraft.text.length, end: queuedDraft.text.length };
       setComposerSelection({ start: queuedDraft.text.length, end: queuedDraft.text.length });
     } catch (error) {
       if (taskMountedRef.current) setLocalError(errorText(error));
@@ -6985,8 +7003,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         }
         return;
       }
-      const directories = draft.mentions.flatMap(mention => mention.kind === "workspace" && mention.directory ? [mention] : []);
-      if (!await client.saveQueueEdit(active.lease, draft.text, deliveryMode === QueueDeliveryMode.STEER ? deliveryMode : undefined, directories)) return;
+      const queuedDraft = composerDraftRef.current;
+      const directories = queuedDraft.mentions.flatMap(mention => mention.kind === "workspace" && mention.directory ? [mention] : []);
+      if (!await client.saveQueueEdit(active.lease, queuedDraft.text, deliveryMode === QueueDeliveryMode.STEER ? deliveryMode : undefined,
+        directories, active.textSplices)) return;
       if (queueEditRef.current !== active) return;
       queueEditRef.current = undefined;
       setQueueEdit(undefined);
@@ -7827,9 +7847,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     </View>}
     {queueEdit && <View style={[styles.queueEditBanner, { borderColor: colors.border, backgroundColor: colors.brandBackground }]}>
       <Text style={[styles.caption, styles.fill, { color: colors.ink }]}>
-        {queueEdit.lease.replacesStructuredInput
-          ? mobileMessage(locale, "composer.editingStructured")
-          : mobileMessage(locale, "composer.editing")}
+        {mobileMessage(locale, queueEdit.lease.hasEncodedQuote ? "composer.editingEncodedQuote"
+          : queueEdit.lease.hasStructuredInput ? "composer.editingStructured" : "composer.editing")}
       </Text>
       {queueDirectoryControls && <Action label={mobileMessage(locale, "composer.referenceWorkspace")} colors={colors} compact
         disabled={state.status !== "connected" || state.busy} onPress={() => { Keyboard.dismiss(); setWorkspaceMentionsVisible(true); }} />}
@@ -8004,11 +8023,20 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           value={composerOwnerReady ? draft.text : ""} selection={composerSelection}
           maxLength={mobileComposerNativeInputMaximumCharacters}
           onSelectionChange={(event) => {
-            const nextSelection = boundedComposerSelection(event.nativeEvent.selection, draft.text.length);
+            const nextSelection = boundedComposerSelection(event.nativeEvent.selection, composerDraftRef.current.text.length);
             composerSelectionRef.current = nextSelection;
             setComposerSelection(nextSelection);
           }}
-          onChangeText={(value) => setDraft(plainTextMobileComposerDraft(value))}
+          onChangeText={(value) => {
+            if (queueEditRef.current !== queueEdit) return;
+            const previous = composerDraftRef.current;
+            const splice = mobileQueueTextSplice(previous.text, value, composerSelectionRef.current);
+            if (!splice) return;
+            const next = { ...plainTextMobileComposerDraft(value), mentions: retainedQueueRanges(previous.mentions, [splice]) };
+            if (queueEdit.textSplices.length <= maximumMobileQueueTextEditSplices) queueEdit.textSplices.push(splice);
+            composerDraftRef.current = next;
+            setDraft(next);
+          }}
           onContentSizeChange={(event) => setComposerContentHeight(Math.max(
             composerMinimumInputHeight,
             Math.ceil(event.nativeEvent.contentSize.height)

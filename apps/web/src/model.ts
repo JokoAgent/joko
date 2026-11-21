@@ -6341,7 +6341,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   readProviderAccountBalance?(backendId: string, providerId: string, forceRefresh: boolean, signal?: AbortSignal): Promise<import("@joko/contracts").ProviderAccountBalanceResult>;
   providerAccountResets?(): import("@joko/contracts").ProviderAccountResetApi | undefined;
   readTaskProviderGroupUsage?(sessionId: string, generation: bigint, signal?: AbortSignal): Promise<import("./provider-group-task-usage.js").TaskProviderGroupUsageView | undefined>;
-  readFailedInputModel?(sessionId: string, generation: bigint, input: FailedInputIdentity): Promise<import("./usage-limit-recovery.js").FailedInputModel | undefined>;
+  readFailedInputModel?(sessionId: string, generation: bigint, input: FailedInputIdentity): Promise<import("./usage-limit-recovery.js").FailedInputModelRead | undefined>;
   readTaskProviderGroupRebalance?(sessionId: string, generation: bigint, signal?: AbortSignal): Promise<import("@joko/contracts").ProviderGroupRebalanceView | undefined>;
   getArtifactStorageStats(protectedSha256?: readonly string[]): Promise<ArtifactStorageMaintenanceView>;
   listSessionArtifacts(sessionId: string, signal?: AbortSignal): Promise<readonly ArtifactView[]>;

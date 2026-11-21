@@ -190,6 +190,7 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
           (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value));
         throw error;
       }
+      expect(recoveryReads.slice(before.receiptReads)).toContain(200);
       const picker = editor.locator(".schedule-editor__model-picker");
       expect(await triggerAt.inputValue()).toBe(new Date(trigger).toISOString().slice(0, 16));
       expect(await picker.innerText()).toContain("Joko real Pi E2E model");

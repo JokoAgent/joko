@@ -5,6 +5,7 @@ import { scheduleLocalDateTimeFromEpoch } from "./schedule-time.js";
 type RecoveryModel = Pick<ScheduleDraft, "providerId" | "modelId" | "effort" | "fastMode">;
 
 export type FailedInputModel = { readonly kind: "inherited" } | { readonly kind: "override"; readonly model: RecoveryModel };
+export type FailedInputModelRead = FailedInputModel | { readonly kind: "runtimeChanged" };
 
 export interface UsageLimitRecoveryHint {
   readonly resetAtMs: number | null;

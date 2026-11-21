@@ -37,7 +37,7 @@ import {
   WorkspaceSearchMatchSchema, WorkspaceChangeSetSchema, WorkspaceRewindPreviewSchema, WorkspaceRewindResultSchema, RewindSafety, FileChangeKind,
   JOKO_API_VERSION, NativeEntryKind, NativeSessionBindingSchema, NativeSessionTreeNodeSchema, NativeSessionTreeSchema, OperationSchema,
   ListPartnerSessionsResponseSchema, PartnerSessionRole, PARTNER_TODO_CHECK_PROMPT,
-  InputCapabilityOptionsSchema, InputContentSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk,
+  InputCapabilityOptionsSchema, InputContentSchema, InputMentionRangeSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk,
   CustomToolPermissionSubjectSchema, PermissionRequestSchema, PermissionSubjectSchema, PlanReviewDecisionKind, ImageThumbnailSchema,
   EventCursorSchema, EventIdentitySchema, EventSchema, ImageRefSchema, MessageCompletedEventSchema, MessageDeletedEventSchema, MessageInputDelivery, MessageRole, MessageStartedEventSchema,
   ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
@@ -122,6 +122,7 @@ import {
   plainTextMobileComposerDraft,
   type MobileComposerDraft
 } from "./mobile-composer-document";
+import { mobileQueueTextSplice } from "./task-actions";
 import { createMobileAutomationDraft } from "./mobile-automation-authoring";
 import { parseMobileNativeIntent } from "./mobile-native-intent";
 import type { MobileExtension, MobileExtensionMainViewSurface } from "./mobile-extensions";
@@ -11638,7 +11639,10 @@ describe("native current-task message and Queue actions", () => {
   });
 
   it("locks, replaces, and unlocks one Queue item while revoking covered reference authority", async () => {
-    const network = projectedNetwork(queueSnapshot);
+    const covered = create(QueueItemSchema, { ...queueOne, input: create(InputContentSchema, {
+      ...queueOne.input!, mentionRanges: [create(InputMentionRangeSchema, { start: 0, end: 18, mentionIndex: 0 })]
+    }) });
+    const network = projectedNetwork(create(SnapshotSchema, { ...queueSnapshot, queueItems: [covered, queueTwo] }));
     const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids());
     await app.start();
 
@@ -11648,7 +11652,7 @@ describe("native current-task message and Queue actions", () => {
       sessionId: "session",
       queueItemId: "queue-1",
       text: "First queued input",
-      replacesStructuredInput: true
+      hasStructuredInput: true
     });
     await expect(app.saveQueueEdit(lease, "Revised queued input")).resolves.toBe(true);
 
@@ -11706,9 +11710,10 @@ describe("native current-task message and Queue actions", () => {
     });
   });
 
-  it("replaces a queued Workspace directory through the original Mobile edit lease", async () => {
+  it.each(["append", "replace"])("saves a queued Workspace directory edit through the original Mobile lease (%s)", async mode => {
     const originalText = "Compare @docs/";
-    const updatedText = "Compare @notes/";
+    const append = mode === "append";
+    const updatedText = append ? `${originalText}.` : "Compare @notes/";
     const backend = queueSnapshot.backends[0]!;
     const current = create(SnapshotSchema, {
       ...queueSnapshot,
@@ -11757,28 +11762,30 @@ describe("native current-task message and Queue actions", () => {
     try {
       await app.start();
       const lease = await app.beginQueueEdit(queueOne.queueItemId);
-      expect(lease).toMatchObject({ queueItemId: queueOne.queueItemId, text: originalText, replacesStructuredInput: true });
+      expect(lease).toMatchObject({ queueItemId: queueOne.queueItemId, text: originalText, hasStructuredInput: true });
       const controls = app.taskWorkspaceMentionControls()!;
       const { entries } = await app.listTaskWorkspaceMentionDirectory(controls.surfaceOwnerKey, "");
       expect(network.listWorkspaceDirectory).toHaveBeenCalledWith(credential, "workspace", "", undefined);
       expect(entries).toEqual([{ workspaceId: "workspace", relativePath: "notes", displayText: "notes", directory: true }]);
 
-      await expect(app.saveQueueEdit(lease, updatedText, undefined, [{
-        ...entries[0]!, kind: "workspace", mentionId: "notes-reference", start: 8, end: 15
-      }])).resolves.toBe(true);
+      const selected = append ? [] : [{
+        ...entries[0]!, kind: "workspace" as const, mentionId: "notes-reference", start: 8, end: 15
+      }];
+      const edits = append ? [mobileQueueTextSplice(originalText, updatedText, { start: 14, end: 14 })!] : [];
+      await expect(app.saveQueueEdit(lease, updatedText, undefined, selected, edits)).resolves.toBe(true);
 
       const mutations = vi.mocked(network.submit).mock.calls.map(call => call[2]);
       expect(mutations.map(mutation => mutation.payload)).toMatchObject([
         { case: "setQueueItemEditLock", value: { queueItemId: queueOne.queueItemId, locked: true, lockToken: lease.lockToken } },
         { case: "editQueueItem", value: {
           queueItemId: queueOne.queueItemId, deliveryMode: queueOne.deliveryMode, lockToken: lease.lockToken,
-          textSplices: [{ start: 0, end: 14, replacementText: updatedText }],
+          textSplices: [{ start: append ? 14 : 0, end: 14, replacementText: append ? "." : updatedText }],
           input: {
             parts: [
               { content: { case: "text", value: updatedText } },
-              { content: { case: "workspaceMention", value: { workspaceId: "workspace", relativePath: "notes", directory: true } } }
+              { content: { case: "workspaceMention", value: { workspaceId: "workspace", relativePath: append ? "docs" : "notes", directory: true } } }
             ],
-            mentionRanges: [{ start: 8, end: 15, mentionIndex: 0 }]
+            mentionRanges: [{ start: 8, end: append ? 14 : 15, mentionIndex: 0 }]
           }
         } },
         { case: "setQueueItemEditLock", value: { queueItemId: queueOne.queueItemId, locked: false, lockToken: lease.lockToken } }

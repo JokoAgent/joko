@@ -768,7 +768,8 @@ export interface MobileQueueEditLease {
   readonly lockToken: string;
   readonly authorityKey: string;
   readonly text: string;
-  readonly replacesStructuredInput: boolean;
+  readonly hasStructuredInput: boolean;
+  readonly hasEncodedQuote: boolean;
 }
 
 interface MobileQueueInteractionLease {
@@ -15254,7 +15255,8 @@ export class MobileClient {
       lockToken,
       authorityKey,
       text,
-      replacesStructuredInput: queueItemHasStructuredInput(item.input)
+      hasStructuredInput: queueItemHasStructuredInput(item.input),
+      hasEncodedQuote: item.input?.quotesEncoded === true
     };
     this.#queueEditLease = lease;
     try {
@@ -15301,7 +15303,8 @@ export class MobileClient {
   }
 
   async saveQueueEdit(lease: MobileQueueEditLease, text: string, deliveryMode?: QueueDeliveryMode,
-    directories: readonly MobileComposerWorkspaceMention[] = []): Promise<boolean> {
+    directories: readonly MobileComposerWorkspaceMention[] = [],
+    edits: readonly import("@joko/contracts").QueueTextEditSplice[] = []): Promise<boolean> {
     this.#assertQueueEditLease(lease);
     const { item, capabilities } = this.#queueItemContext(lease.queueItemId);
     if (!capabilities.edit) throw new Error("This Backend no longer supports editing queued input.");
@@ -15312,11 +15315,11 @@ export class MobileClient {
         throw new Error("The original queued input no longer supports edits to Workspace directories.");
       }
     }
-    if (directories.length === 0 && queueItemText(item.input) === text && (deliveryMode === undefined || deliveryMode === item.deliveryMode)) {
+    if (directories.length === 0 && edits.length === 0 && queueItemText(item.input) === text && (deliveryMode === undefined || deliveryMode === item.deliveryMode)) {
       await this.cancelQueueEdit(lease);
       return true;
     }
-    const edit = editQueueItemText(item.input, text, directories);
+    const edit = editQueueItemText(item.input, text, directories, edits);
     if (!edit) throw new Error("Use non-empty text that the current queued-input editor can represent.");
     return this.#submitQueueEdit(lease, item, create(EditQueueItemMutationSchema, {
       queueItemId: item.queueItemId, input: edit.input, deliveryMode: deliveryMode ?? item.deliveryMode,
