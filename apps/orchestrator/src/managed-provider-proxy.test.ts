@@ -571,6 +571,7 @@ describe("Managed Provider native proxy", () => {
     } finally { await f.dispose(); }
   });
 
+  it.each([
     { name: "official DeepSeek", baseUrl: "https://api.deepseek.com/v1", path: "/v1/chat/completions",
       modelId: "deepseek-v4-pro", deepSeek: true, gemini: false },
     { name: "official Gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", path: "/v1beta/openai/chat/completions",
