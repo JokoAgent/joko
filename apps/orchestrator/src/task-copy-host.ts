@@ -5,7 +5,7 @@ import { join, relative } from "node:path";
 import { createClient, Code, ConnectError } from "@connectrpc/connect";
 import { createConnectTransport, endpointOrigin, parseTrustedNodeInvitation } from "@joko/connection-transport/node";
 import * as contract from "@joko/contracts";
-import { capabilityNames, type BlobRef, type TargetDescriptor } from "@joko/core";
+import type { BlobRef, TargetDescriptor } from "@joko/core";
 import { operationBodyHash, type ConnectionRecord, type OperationalStore } from "@joko/store";
 import type { ArtifactStore } from "./artifact-store.js";
 import { isLoopbackHost, isPrivateLanHttpOrigin } from "./config.js";
@@ -387,7 +387,7 @@ export class TaskCopyHost {
 
   #assertBackend(backendId: string, sourceBackendId: string) {
     const backend = this.options.store.getBackend(backendId).descriptor;
-    if (backend.health === "unavailable" || backend.capabilities.get(capabilityNames.sessionPortableTransfer)?.supported !== true
+    if (backend.health === "unavailable" || backend.capabilities.get(contract.capabilityNames.sessionPortableTransfer)?.supported !== true
       || contract.portableSessionNativeFormat(backendId) !== contract.portableSessionNativeFormat(sourceBackendId)) {
       throw new ConnectError("Choose destination runtimes that can restore the task and each worker.", Code.FailedPrecondition);
     }

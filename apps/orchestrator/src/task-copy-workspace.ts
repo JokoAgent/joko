@@ -100,7 +100,7 @@ export async function restoreTaskCopyWorkspace(input: WorkspaceCopyBudget & {
   } });
   if (!wireEntries.has(manifestName)) throw invalid();
   await extractTar({ cwd: input.stage, file: input.archive, strict: true, preservePaths: false, noMtime: true,
-    filter(path, entry) { policy.check(); if (entry.type !== "File" || wireEntries.get(path) !== entry.size) throw invalid(); return true; } });
+    filter(path, entry) { policy.check(); if (!("type" in entry) || entry.type !== "File" || wireEntries.get(path) !== entry.size) throw invalid(); return true; } });
   const manifest = parseManifest(JSON.parse(await readFile(join(input.stage, manifestName), "utf8")), wireEntries);
   const entries = new Map(manifest.entries.map(entry => [workspaceDirectoryArchiveNameKey(entry.path), entry]));
   const extraSkipped: TaskCopySkippedFile[] = [];
@@ -228,7 +228,7 @@ function parseManifest(value: unknown, parts: ReadonlyMap<string, number>): Work
     ...(repository === undefined ? {} : { repository: repository as unknown as TaskCopyRepository }) };
 }
 
-function resolveLink(link: { readonly path: string; readonly target: string }, entries: ReadonlyMap<string, { readonly target?: string }>): string | undefined {
+function resolveLink(link: { readonly path: string; readonly target: string }, entries: ReadonlyMap<string, { readonly kind: WorkspaceEntry["kind"]; readonly target?: string }>): string | undefined {
   const relativeTarget = (target: string) => target.length > 0 && target.length <= MAXIMUM_PATH_LENGTH && !/[\\:\u0000-\u001f]/u.test(target) && !target.startsWith("/");
   if (!relativeTarget(link.target)) return undefined;
   const resolved = link.path.split("/").slice(0, -1);

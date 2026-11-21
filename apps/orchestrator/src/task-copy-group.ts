@@ -69,7 +69,7 @@ export async function unpackTaskCopyLayout(archive: string, root: string, maximu
   if (!seen.has(manifestName)) throw invalid();
   await extract({ cwd: root, file: archive, strict: true, preservePaths: false, noMtime: true, filter(path, entry) {
     check();
-    if (entry.type !== "File" || seen.get(path) !== entry.size) throw invalid();
+    if (!("type" in entry) || entry.type !== "File" || seen.get(path) !== entry.size) throw invalid();
     return true;
   } });
   const layout = parseLayout(JSON.parse(await readFile(join(root, manifestName), "utf8")));

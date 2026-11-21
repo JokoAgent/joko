@@ -25632,8 +25632,8 @@ function protoTaskCopyGrant(value: PreparedTaskCopy): contract.PortableTaskCopyG
     transferId: value.transferId, readSecret: new Uint8Array(value.secret), operationId: value.operationId,
     sourceServerId: value.sourceServerId, destinationServerId: value.destinationServerId, sourceSessionId: value.sourceSessionId,
     sourceSessionGeneration: BigInt(value.sourceSessionGeneration), expiresAt: toProtoTimestamp(value.expiresAt),
-    sessionPackage: { sha256: value.sessionPackage.sha256, size: BigInt(value.sessionPackage.size) },
-    workspaceArchive: { sha256: value.workspaceArchive.sha256, size: BigInt(value.workspaceArchive.size) },
+    sessionPackage: create(contract.PortableTaskCopyPartSchema, { sha256: value.sessionPackage.sha256, size: BigInt(value.sessionPackage.size) }),
+    workspaceArchive: create(contract.PortableTaskCopyPartSchema, { sha256: value.workspaceArchive.sha256, size: BigInt(value.workspaceArchive.size) }),
     sourceTitle: value.title, sourceBackendId: value.backendId,
     sourceWorkspaceKind: value.managed ? contract.WorkspaceKind.MANAGED_DIALOGUE : contract.WorkspaceKind.USER_PROJECT
   });
@@ -25658,12 +25658,12 @@ function protoTaskCopyReceipt(value: TaskCopyReceipt): contract.PortableTaskCopy
   const task = value.task;
   return create(contract.PortableTaskCopyReceiptSchema, {
     operationId: value.operationId, targetId: value.targetId,
-    task: { sessionId: task.sessionId, fidelity: protoPortableSessionFidelity(task.fidelity), messageCount: BigInt(task.messageCount),
+    task: create(contract.PortableSessionImportResultSchema, { sessionId: task.sessionId, fidelity: protoPortableSessionFidelity(task.fidelity), messageCount: BigInt(task.messageCount),
       mediaCount: BigInt(task.mediaCount), workerCount: BigInt(task.workerCount), replacedSessionIds: [...task.replacedSessionIds],
       status: protoPortableSessionImportStatus(task.status),
-      ...(task.activationError === undefined ? {} : { activationError: mapErrorToProto(task.activationError) }) },
+      ...(task.activationError === undefined ? {} : { activationError: mapErrorToProto(task.activationError) }) }),
     skippedFileCount: BigInt(value.workspace.skippedCount),
-    skippedFiles: value.workspace.skipped.map(file => ({ relativePath: file.path, reason: file.reason }))
+    skippedFiles: value.workspace.skipped.map(file => create(contract.PortableTaskCopySkippedFileSchema, { relativePath: file.path, reason: file.reason }))
   });
 }
 
