@@ -263,7 +263,7 @@ service HistoryMaintenanceService {
 
 service CredentialService {
   rpc BeginCredentialUpload(BeginCredentialUploadRequest) returns (BeginCredentialUploadResponse);
-  rpc BeginProviderModelPreviewUpload(ProviderModelPreviewRoute) returns (BeginCredentialUploadResponse);
+  rpc BeginProviderModelPreviewUpload(BeginProviderModelPreviewUploadRequest) returns (BeginProviderModelPreviewUploadResponse);
   rpc ListCredentials(ListCredentialsRequest) returns (ListCredentialsResponse);
   rpc BeginProviderLoginInputUpload(BeginProviderLoginInputUploadRequest) returns (BeginProviderLoginInputUploadResponse);
   rpc SubmitProviderLoginInput(SubmitProviderLoginInputRequest) returns (SubmitProviderLoginInputResponse);
@@ -2512,6 +2512,14 @@ message BeginCredentialUploadRequest {
 }
 
 message BeginCredentialUploadResponse {
+  CredentialUploadTicket ticket = 1;
+}
+
+message BeginProviderModelPreviewUploadRequest {
+  ProviderModelPreviewRoute route = 1;
+}
+
+message BeginProviderModelPreviewUploadResponse {
   CredentialUploadTicket ticket = 1;
 }
 

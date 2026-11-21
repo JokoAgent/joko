@@ -193,7 +193,8 @@ describe("Connect typed feature boundaries", () => {
     ] }));
     vi.stubGlobal("fetch", upstream);
     try {
-      const receipt = await invoke<contract.BeginCredentialUploadResponse>(services.credential.beginProviderModelPreviewUpload, route);
+      const receipt = await invoke<contract.BeginProviderModelPreviewUploadResponse>(services.credential.beginProviderModelPreviewUpload,
+        create(contract.BeginProviderModelPreviewUploadRequestSchema, { route }));
       const ticket = receipt.ticket!.ticketId;
       credentials.upload(ticket, fakeKey, connection.id);
       const preview = (requestedRoute: contract.ProviderModelPreviewRoute) => invoke<contract.PreviewProviderModelsResponse>(

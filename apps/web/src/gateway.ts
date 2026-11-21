@@ -8534,7 +8534,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     });
     let ticketId: string | undefined;
     if (secret !== "") {
-      const response = await createClient(CredentialService, scope.transport).beginProviderModelPreviewUpload(route, { signal: scope.signal });
+      const response = await createClient(CredentialService, scope.transport).beginProviderModelPreviewUpload({ route }, { signal: scope.signal });
       ticketId = await this.uploadCredentialTicket(secret, response.ticket, scope);
     }
     const authentication = ticketId !== undefined ? { case: "credentialUploadTicketId" as const, value: ticketId }

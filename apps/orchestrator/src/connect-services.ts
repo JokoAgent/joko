@@ -4396,7 +4396,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     beginProviderModelPreviewUpload: (request, context) => {
       const connection = authenticate(context);
       if (dependencies.credentials === undefined) throw new ConnectError("Provider credentials are unavailable.", Code.FailedPrecondition);
-      const { purpose } = providerModelPreviewRoute(dependencies, request);
+      const { purpose } = providerModelPreviewRoute(dependencies, request.route);
       const ticket = dependencies.credentials.createUploadTicket({ kind: "api_key", connectionId: connection.id, servicePurpose: purpose });
       return { ticket: { ticketId: ticket.credentialUploadTicketId,
         relativeEndpoint: `/v1/credentials/upload/${encodeURIComponent(ticket.credentialUploadTicketId)}`,
