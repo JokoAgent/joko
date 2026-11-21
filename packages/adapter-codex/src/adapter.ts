@@ -3926,16 +3926,17 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
     let host = this.#providerHosts.get(providerId);
     if (host === undefined) {
-      const prefix = `model_providers.${JSON.stringify(providerId)}`;
-      const processOwner = launch.transport.processOwner;
+      const processOwner = scope.host.processOwner;
+      if (launch.transport.processOwner !== undefined && processOwner === undefined) throw managedRouteUnavailable();
+      const quotedId = JSON.stringify(providerId);
       // The published app-server validates the process selection on every input.
       // Only a Session-scoped configuration can make this placeholder routable.
+      // The CLI splits override paths at every dot, so put the ID in a TOML table value.
       host = new AppServerHost({ ...launch, transport: { ...launch.transport,
-        ...(processOwner === undefined || !("recoverStale" in processOwner)
-          ? {} : { processOwner: { ...processOwner, recoverStale: false } }),
+        ...(processOwner === undefined ? {} : { processOwner }),
         args: [...(launch.transport.args ?? []), ...(smart ? this.#smartLaunchArgs : []),
-          "-c", `model_provider=${JSON.stringify(providerId)}`, "-c", `${prefix}.name=${JSON.stringify(providerId)}`,
-          "-c", `${prefix}.base_url="http://127.0.0.1:0"`, "-c", `${prefix}.wire_api="responses"`]
+          "-c", `model_provider=${quotedId}`,
+          "-c", `model_providers={ ${quotedId} = { name = ${quotedId}, base_url = "http://127.0.0.1:0", wire_api = "responses" } }`]
       } });
       this.#providerHosts.set(providerId, host);
     }
