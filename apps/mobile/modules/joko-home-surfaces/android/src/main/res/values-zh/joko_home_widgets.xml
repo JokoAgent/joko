@@ -1,0 +1,4 @@
+<resources>
+  <string name="joko_quota_widget">Joko 账户额度</string>
+  <string name="joko_usage_widget">Joko 今日用量</string>
+</resources>

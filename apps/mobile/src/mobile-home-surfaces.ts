@@ -18,9 +18,9 @@ export interface HomeSurfaceUsageSource {
 
 interface HomeSurfacesNative {
   apply(sequence: number, owner: string | null, usage: string | null, activity: string | null, mayStart: boolean): Promise<void>;
-  pendingWidgetRefresh(): Promise<string | null>;
-  completeWidgetRefresh(id: string, sequence: number, owner: string | null, usage: string | null): Promise<void>;
-  addListener(event: "onWidgetRefresh", listener: (value: { id: string; expired: boolean }) => void): { remove(): void };
+  pendingWidgetRefresh?(): Promise<string | null>;
+  completeWidgetRefresh?(id: string, sequence: number, owner: string | null, usage: string | null): Promise<void>;
+  addListener?(event: "onWidgetRefresh", listener: (value: { id: string; expired: boolean }) => void): { remove(): void };
 }
 
 const QUOTA_REFRESH = 5 * 60_000;
@@ -28,7 +28,7 @@ const ACTIVITY_REFRESH = 60_000;
 let nextSequence = 0;
 
 function nativeHomeSurfaces(): HomeSurfacesNative | undefined {
-  if (Platform.OS !== "ios") return undefined;
+  if (Platform.OS !== "ios" && Platform.OS !== "android") return undefined;
   try { return requireOptionalNativeModule<HomeSurfacesNative>("JokoHomeSurfaces") ?? undefined; }
   catch { return undefined; }
 }
@@ -98,7 +98,7 @@ export function useMobileHomeSurfaces(client: MobileClient, state: MobileState, 
   const source = native !== undefined && foreground && owner !== undefined ? client.homeSurfaceUsage?.() : undefined;
   const language = locale === "zh-CN" ? "zh-CN" : "en";
   const hydrated = state.status !== "starting";
-  const task = source === undefined ? undefined : homeSurfaceActivity(state, language, 0);
+  const task = source === undefined || Platform.OS !== "ios" ? undefined : homeSurfaceActivity(state, language, 0);
   const taskKey = task === undefined ? undefined : JSON.stringify(task);
   const current = useRef({ owner, source, task, foreground, language });
   current.current = { owner, source, task, foreground, language };
@@ -150,7 +150,8 @@ export function useMobileHomeSurfaces(client: MobileClient, state: MobileState, 
   }, [native, owner, source?.key, foreground, language]);
 
   useEffect(() => {
-    if (!native || !owner || foreground) return;
+    if (Platform.OS !== "ios" || !native?.pendingWidgetRefresh || !native.completeWidgetRefresh || !native.addListener || !owner || foreground) return;
+    const complete = native.completeWidgetRefresh.bind(native);
     const abort = new AbortController();
     const refresh = async (id: string): Promise<void> => {
       if (abort.signal.aborted || requestedRefresh.current === id) return;
@@ -168,7 +169,7 @@ export function useMobileHomeSurfaces(client: MobileClient, state: MobileState, 
       } catch {
         // The last authorized projection expires independently of this refresh.
       } finally {
-        await native.completeWidgetRefresh(id, ++nextSequence, data === null ? null : owner, data).catch(() => undefined);
+        await complete(id, ++nextSequence, data === null ? null : owner, data).catch(() => undefined);
       }
     };
     const subscription = native.addListener("onWidgetRefresh", event => {

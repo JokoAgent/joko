@@ -222,6 +222,15 @@ jobs:
           "$ANDROID_HOME/build-tools/36.0.0/aapt2" dump permissions "$JOKO_ANDROID_TEST_APK" > "$(dirname "$JOKO_ANDROID_TEST_APK")/android-permissions.txt"
           node -e "const fs=require('node:fs'); const path=require('node:path'); const text=fs.readFileSync(path.join(path.dirname(process.env.JOKO_ANDROID_TEST_APK), 'android-permissions.txt'), 'utf8'); if (!text.includes('android.permission.REQUEST_INSTALL_PACKAGES')) throw new Error('The actual APK is missing its configured package-installer permission.');"
 
+      - name: Verify both home widget receivers in the actual APK
+        env:
+          JOKO_ANDROID_TEST_APK: ${{ steps.native-artifact.outputs.apk-path }}
+        run: |
+          manifest="$RUNNER_TEMP/joko-android-widget-manifest.txt"
+          "$ANDROID_HOME/build-tools/36.0.0/aapt2" dump xmltree --file AndroidManifest.xml "$JOKO_ANDROID_TEST_APK" > "$manifest"
+          grep -Fq 'app.joko.homesurfaces.AccountQuotaWidget' "$manifest"
+          grep -Fq 'app.joko.homesurfaces.DailyUsageWidget' "$manifest"
+
       - name: Enable the hosted runner's KVM device
         run: |
           test -c /dev/kvm

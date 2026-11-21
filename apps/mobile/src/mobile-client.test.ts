@@ -5160,6 +5160,21 @@ it("reads a cold iOS widget refresh through the opted-in saved owner and fences 
   } finally { app.dispose(); }
 });
 
+it("lets the authorized Android home widgets read the current paired node and retires the source in the background", async () => {
+  const network = fakeNetwork();
+  network.getHomeUsage = vi.fn(async () => undefined);
+  const app = client(network, memoryStorage(credential).storage);
+  await app.start();
+  const source = app.homeSurfaceUsage();
+  expect(source).toBeDefined();
+  const signal = new AbortController().signal;
+  await source!.readUsage(signal);
+  expect(network.getHomeUsage).toHaveBeenCalledExactlyOnceWith(credential, signal);
+  app.setForeground(false);
+  expect(app.homeSurfaceUsage()).toBeUndefined();
+  await expect(source!.readUsage(signal)).rejects.toThrow(/source changed/u);
+});
+
 describe("native mobile push authority", () => {
   it("binds registration to the exact current iOS profile, Connection, Device revision, and late-response fence", async () => {
     const iosDevice = create(DeviceSchema, { ...device, platform: "ios" });

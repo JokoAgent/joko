@@ -1,0 +1,18 @@
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+  android:id="@android:id/background"
+  android:layout_width="match_parent" android:layout_height="match_parent"
+  android:background="@drawable/joko_home_widget_surface"
+  android:padding="14dp" android:orientation="vertical">
+  <TextView android:id="@+id/joko_widget_heading"
+    android:layout_width="match_parent" android:layout_height="wrap_content"
+    android:textColor="@color/joko_widget_ink" android:textStyle="bold"
+    android:ellipsize="end" android:maxLines="1" android:textSize="14sp" />
+  <TextView android:id="@+id/joko_widget_value"
+    android:layout_width="match_parent" android:layout_height="wrap_content"
+    android:layout_marginTop="6dp" android:textColor="@color/joko_widget_ink"
+    android:ellipsize="end" android:maxLines="1" android:textSize="16sp" />
+  <TextView android:id="@+id/joko_widget_detail"
+    android:layout_width="match_parent" android:layout_height="wrap_content"
+    android:layout_marginTop="3dp" android:textColor="@color/joko_widget_subtle"
+    android:ellipsize="end" android:maxLines="2" android:textSize="12sp" />
+</LinearLayout>

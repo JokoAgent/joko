@@ -3954,7 +3954,7 @@ export class MobileClient {
 
   homeSurfaceUsage(): import("./mobile-home-surfaces").HomeSurfaceUsageSource | undefined {
     const authority = this.mobilePushAuthority(), credential = this.#credential;
-    if (this.platform !== "ios" || authority === undefined || credential === undefined || this.#joinedTask) return undefined;
+    if (authority === undefined || credential === undefined || this.#joinedTask) return undefined;
     const { providers, catalog } = this.#homeSurfaceProviders(this.#state.owner?.providers ?? []);
     const assertCurrent = (signal: AbortSignal): void => {
       signal.throwIfAborted();
