@@ -21,7 +21,7 @@ import {
 import type { AppController } from "../controller.js";
 import { readVoiceInputPreferences, type VoiceInputShortcutPreference } from "../voice-input-preferences.js";
 import type { Translator } from "./types.js";
-import { IconButton } from "./ui.js";
+import { Button, IconButton } from "./ui.js";
 
 interface RecordingError {
   readonly id: AppShortcutId;
@@ -40,7 +40,8 @@ export function AppShortcutsSettings({ controller, overrides, t, platform = curr
   /** Explicit only for deterministic platform-surface tests. */
   readonly platform?: AppShortcutPlatform;
 }): JSX.Element {
-  const definitions = visibleAppShortcutDefinitions(platform);
+  const capture = window.jokoDesktop?.regionCapture;
+  const definitions = visibleAppShortcutDefinitions(platform).filter(item => item.id !== "capture-region" || capture !== undefined);
   const [recordingId, setRecordingId] = useState<AppShortcutId | null>(null);
   const [savingId, setSavingId] = useState<AppShortcutId | "all" | null>(null);
   const [error, setError] = useState<RecordingError | null>(null);
@@ -185,6 +186,9 @@ export function AppShortcutsSettings({ controller, overrides, t, platform = curr
               <div className="shortcut-settings__copy">
                 <strong>{t(definition.labelKey)}</strong>
                 <span>{t(definition.descriptionKey)}</span>
+                {definition.id === "capture-region" && capture && <Button onClick={() => {
+                  void capture.start().catch(() => setError({ id: definition.id, message: t("settings.shortcuts.errors.saveFailed") }));
+                }}>{t("settings.shortcuts.captureRegionNow")}</Button>}
                 {rowError !== null && !isRecording && <small className="shortcut-settings__error" role="alert">{rowError}</small>}
               </div>
               <kbd className={isRecording ? "is-recording" : combos.length === 0 ? "is-empty" : undefined}>

@@ -20,12 +20,20 @@ export interface DelayedNewSessionDraft extends Omit<NewSessionDraft, "targetId"
   readonly selection: NewSessionDraftSelection;
 }
 
+export interface RegionCaptureTaskAttachment {
+  readonly id: string;
+  readonly file: File;
+  readonly action: "attach" | "translate" | "explain" | "extract";
+  readonly language: string;
+}
+
 /** The initiating draft activation; a later route with the same values is a new owner. */
 export interface NewSessionSubmissionOwner {
   readonly ownerDocument: Document;
   readonly signal: AbortSignal;
   readonly isCurrent: () => boolean;
   readonly contactsDialogueRequestId?: string;
+  readonly preserveSourceDraft?: true;
   /** Validate an authored command against the newly created runtime, before
    * the first input can be accepted. A pre-existing task is not required. */
   readonly beforeFirstInput?: (sessionId: string) => Promise<void>;

@@ -749,7 +749,7 @@ describe("actual Home navigation hosts", () => {
     expect(searchHome).toHaveBeenLastCalledWith("Beta", "active");
     expect(host.textContent).toContain("Beta"); expect(host.textContent).not.toContain("Alpha");
     await press(message("home.filter.archived"));
-    expect(viewState).toEqual({ search: "Beta", statusFilter: "archived" });
+    expect(viewState).toEqual({ search: "Beta", statusFilter: "archived", taskInbox: false });
     await act(async () => root.unmount()); root = createRoot(host);
     await render({ host: "persistent" });
     expect(host.querySelector<HTMLInputElement>(`input[aria-label="${message("home.search")}"]`)?.value).toBe("Beta");

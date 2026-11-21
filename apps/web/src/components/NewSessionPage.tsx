@@ -66,7 +66,7 @@ import type {
   WorkspaceEntryView
 } from "../model.js";
 import type { TargetDraft } from "../model.js";
-import type { DelayedNewSessionDraft, FirstInputAcceptance, FirstInputDisposition, NewSessionSubmissionOwner } from "../new-session-flow.js";
+import type { DelayedNewSessionDraft, FirstInputAcceptance, FirstInputDisposition, NewSessionSubmissionOwner, RegionCaptureTaskAttachment } from "../new-session-flow.js";
 import { randomUuid } from "../web-crypto.js";
 import { resourceKindsForBackend } from "../resource-capabilities.js";
 import { composerDocumentIsPlainTextInvocation } from "../skill-learning-command.js";
@@ -161,6 +161,8 @@ interface NewSessionPageProps {
   readonly contactsDraft?: ContactsDraftOwner;
   readonly projectPickerRequest?: NewSessionProjectPickerRequest;
   readonly onProjectPickerRequestConsumed?: (requestId: number) => void;
+  readonly regionCaptureAttachment?: RegionCaptureTaskAttachment;
+  readonly onRegionCaptureConsumed?: (id: string) => void;
   readonly navigationOpen: boolean;
   readonly t: Translator;
   readonly onOpenNavigation: () => void;
@@ -195,6 +197,7 @@ interface NewTaskSubmitOptions {
   readonly allowEmpty?: boolean;
   readonly propagateError?: boolean;
   readonly clearDraftOnAccepted?: boolean;
+  readonly captureAttachment?: AttachmentDraft;
 }
 
 interface NewTaskInlineMentionActivation extends ComposerInlineMentionActivation {
@@ -202,7 +205,7 @@ interface NewTaskInlineMentionActivation extends ComposerInlineMentionActivation
 }
 
 /** Delayed-create route rendered within Joko's visual language. */
-export function NewSessionPage({ controller, snapshot, initialTargetId, initialDialogueBackendId, recommendationNonce, initialModel, contactsDraft, projectPickerRequest, onProjectPickerRequestConsumed, navigationOpen, t, onOpenNavigation, onClose, onSubmit }: NewSessionPageProps): JSX.Element {
+export function NewSessionPage({ controller, snapshot, initialTargetId, initialDialogueBackendId, recommendationNonce, initialModel, contactsDraft, projectPickerRequest, onProjectPickerRequestConsumed, regionCaptureAttachment, onRegionCaptureConsumed, navigationOpen, t, onOpenNavigation, onClose, onSubmit }: NewSessionPageProps): JSX.Element {
   const contactsOwnerCurrent = contactsDraft === undefined || contactsDraftOwnerMatches(contactsDraft, controller.state.activeProfile);
   const projectTargets = contactsDraft === undefined ? snapshot.targets.filter((target) => !target.archived) : [];
   const activeTargets = newSessionTargets(projectTargets, snapshot.settings.backendSettings).filter((target) => {
@@ -1634,6 +1637,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const submissionScopeRef = useRef(submissionScope); submissionScopeRef.current = submissionScope;
   const submissionValidityRef = useRef(false);
   submissionValidityRef.current = contactsReady && hydrated && validContext && modelRouteReady && attachmentsAllowed && mentionsAllowed && worktreeDecisionReady && fullAccessConfirmationRef.current === undefined && controller.state.connectionState === "connected";
+  const captureValidity = useRef(submissionValidityRef.current);
+  captureValidity.current = contactsReady && hydrated && validContext && modelRouteReady && worktreeDecisionReady
+    && fullAccessConfirmationRef.current === undefined && controller.state.connectionState === "connected" && attachmentPolicy.images;
   useLayoutEffect(() => {
     const ownerWindow = voiceRoot?.ownerDocument.defaultView;
     const activate = (): void => { submissionEpochRef.current = {}; };
@@ -2058,6 +2064,24 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     images: attachmentPolicy.images,
     files: attachmentPolicy.files
   });
+  const consumedRegionCapture = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!hydrated || submitting || voice.active || contactsDraft !== undefined || controller.state.connectionState !== "connected"
+      || regionCaptureAttachment === undefined || consumedRegionCapture.current === regionCaptureAttachment.id) return;
+    consumedRegionCapture.current = regionCaptureAttachment.id;
+    const { action, file, language } = regionCaptureAttachment;
+    if (action === "attach") addFiles([file]);
+    else {
+      const prompt = action === "translate" ? t("composer.screenshotTranslate", {
+        language: new Intl.DisplayNames([controller.state.effectiveLocale], { type: "language" }).of(language) ?? language
+      })
+        : action === "explain" ? t("composer.screenshotExplain") : t("composer.screenshotExtract");
+      void submitRef.current(plainTextToComposerDocument(prompt), undefined, undefined, {
+        captureAttachment: { id: regionCaptureAttachment.id, file, kind: "image" }, firstInputDisposition: { kind: "send" }, propagateError: true
+      }).catch(error => { if (mountedRef.current) setDraftError(messageOf(error)); });
+    }
+    onRegionCaptureConsumed?.(regionCaptureAttachment.id);
+  }, [regionCaptureAttachment, hydrated, submitting, voice.active, contactsDraft, controller.state.connectionState]);
   const openAttachmentPicker = (
     requirement: ComposerAttachmentPickerRequirement = "either",
     requireConnection = false
@@ -2156,11 +2180,15 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   ): Promise<void> => {
     const sourceEditorDocument = normalizeComposerDocument(activeDocument, textRef.current);
     const sourceText = composerDocumentPlainText(sourceEditorDocument);
-    const sourceRanges = restoreComposerInlineMentionRanges(sourceText, mentionsRef.current, inlineMentionRangesRef.current);
-    const sourceMentions = composerMentionsFromRanges(mentionsRef.current, sourceRanges);
-    const sourceBrowserComments = browserCommentsRef.current;
-    const sourceAttachments = attachmentsRef.current;
-    const candidateCommand = contactsDraft === undefined ? composerBuiltInCommand(sourceText, commandOptions) : undefined;
+    const capture = options.captureAttachment;
+    const draftComments = browserCommentsRef.current;
+    const draftAttachments = attachmentsRef.current;
+    const sourceRanges = capture ? [] : restoreComposerInlineMentionRanges(sourceText, mentionsRef.current, inlineMentionRangesRef.current);
+    const sourceMentions = capture ? [] : composerMentionsFromRanges(mentionsRef.current, sourceRanges);
+    const sourceBrowserComments = capture ? [] : draftComments;
+    const sourceAttachments = capture ? [capture] : draftAttachments;
+    const sourceAttachmentsAllowed = capture ? draftAttachmentsAllowed(sourceAttachments, attachmentPolicy) : attachmentsAllowed;
+    const candidateCommand = contactsDraft === undefined && !capture ? composerBuiltInCommand(sourceText, commandOptions) : undefined;
     const parsedCommand = candidateCommand?.kind === "personalDevelopment" && runtimeCommandOwnsApplicationCommand(availableGlobalCommands,
       candidateCommand.mode === "check" ? "joko-make-doctor" : "joko-make") ? undefined : candidateCommand;
     const learnCommand = parsedCommand?.kind === "learn" ? parsedCommand : undefined;
@@ -2171,7 +2199,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       : validContext
       && modelRouteReady
       && (options.allowEmpty === true || !composerDocumentIsEmpty(sourceEditorDocument) || sourceAttachments.length > 0 || sourceBrowserComments.length > 0)
-      && attachmentsAllowed
+      && sourceAttachmentsAllowed
       && newTaskMentionsAllowed(sourceMentions, mentionPolicy, usableWorkspace?.id)
       && composerDirectoryReferencesAllowed(sourceEditorDocument, mentionPolicy.directories, usableWorkspace?.id)
       && worktreeDecisionReady
@@ -2201,14 +2229,14 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const sourceDraft = editorDocumentRef.current;
     const sourceInput: ComposerDraft = {
       text: sourceText,
-      builtinSkillIntent: builtinSkillIntentForText(sourceText, builtinSkillIntentRef.current),
+      builtinSkillIntent: capture ? undefined : builtinSkillIntentForText(sourceText, builtinSkillIntentRef.current),
       editorDocument: sourceEditorDocument,
       attachments: sourceAttachments,
       browserComments: sourceBrowserComments,
       mentions: sourceMentions,
       inlineMentionRanges: sourceRanges,
       deliveryMode: "prompt",
-      ...(canSelectExtraDirectories ? { extraDirectoryIds } : {})
+      ...(canSelectExtraDirectories && !capture ? { extraDirectoryIds } : {})
     };
     const firstInputDisposition: FirstInputDisposition | undefined = options.firstInputDisposition ?? (learnCommand !== undefined
       ? {
@@ -2285,6 +2313,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const owner: NewSessionSubmissionOwner = {
       ownerDocument,
       signal: request.signal,
+      ...(capture ? { preserveSourceDraft: true as const } : {}),
       ...(contactsDialogue === undefined ? {} : { contactsDialogueRequestId: contactsDialogue.requestId }),
       ...(beforeFirstInput === undefined ? {} : { beforeFirstInput }),
       ...(firstInputDisposition === undefined ? {} : { firstInputDisposition }),
@@ -2292,9 +2321,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         ? {}
         : { onFirstInputAccepted: acceptFirstInput }),
       isCurrent: () => submissionScopeRef.current === sourceScope && submissionEpochRef.current === sourceEpoch && submissionRef.current === attempt
-        && !request.signal.aborted && (personalCommand !== undefined ? personalDevelopmentSupported : submissionValidityRef.current)
+        && !request.signal.aborted && (capture ? captureValidity.current : personalCommand !== undefined ? personalDevelopmentSupported : submissionValidityRef.current)
         && voiceRoot?.isConnected === true && voiceRoot.ownerDocument === ownerDocument && !ownerWindow.closed
-        && editorDocumentRef.current === sourceDraft && attachmentsRef.current === sourceAttachments && browserCommentsRef.current === sourceBrowserComments
+        && editorDocumentRef.current === sourceDraft && attachmentsRef.current === draftAttachments && browserCommentsRef.current === draftComments
         && newTaskMentionsAllowed(sourceMentions, mentionPolicyRef.current, workspaceIdRef.current)
         && composerDirectoryReferencesAllowed(sourceEditorDocument, mentionPolicyRef.current.directories, workspaceIdRef.current)
     };
@@ -2370,7 +2399,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
           groupId: targetModelGroup.groupId, expectedRevision: groupRevision,
           hasImages: sourceAttachments.some(attachment => attachment.kind === "image") || sourceBrowserComments.length > 0
         } : undefined;
-      const prepared = contactsDialogue !== undefined || taskModelGroup !== undefined ? {} : await provisionalTask.take({ targetId: selected?.id ?? "", expectedTargetRevision: selected?.revision,
+      const prepared = capture || contactsDialogue !== undefined || taskModelGroup !== undefined ? {} : await provisionalTask.take({ targetId: selected?.id ?? "", expectedTargetRevision: selected?.revision,
         name: t("session.newName"), nativeStart: selected !== undefined && startKind === "attach" && nativeSelectionReady
           ? { kind: "attach", reference: selectedNativeSession!.reference } : { kind: "fresh" }, providerId: selectedModel?.providerId ?? "", modelId: selectedModel?.modelId ?? "",
         ...(execution.effortSelectable && effort.length > 0 ? { effort } : {}), fastMode: execution.fastModeSelectable && fastMode,
@@ -2385,7 +2414,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
           ? { expectedTargetRevision: selected.revision }
           : {}),
         name: contactsDialogue?.name ?? t("session.newName"),
-        nativeStart: selected !== undefined && startKind === "attach" && nativeSelectionReady
+        nativeStart: !capture && selected !== undefined && startKind === "attach" && nativeSelectionReady
           ? { kind: "attach", reference: selectedNativeSession!.reference }
           : { kind: "fresh" },
         providerId: selectedModel?.providerId ?? "",

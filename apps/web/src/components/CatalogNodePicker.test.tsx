@@ -79,7 +79,7 @@ async function mount(openMachineCatalog: AppController["openMachineCatalog"]) {
   root = createRoot(document.body.appendChild(document.createElement("div")));
   const render = async (active = a, catalogProfileId?: string) => {
     const controller = { state: { activeProfile: active, profiles: [a, b, c], connectionGeneration: active === a ? 1 : 2,
-      connectionState: "connected", machinePresenceByProfile: { [b.id]: "offline" }, preferences: { navigationOpen: true } },
+      connectionState: "connected", snapshot: emptySnapshot(), machinePresenceByProfile: { [b.id]: "offline" }, preferences: { navigationOpen: true } },
       openMachineCatalog, listSkills: reads, listSkillRecoveries: async () => [] } as unknown as AppController;
     await act(async () => root!.render(<ToolsPage controller={controller} snapshot={emptySnapshot()} catalogProfileId={catalogProfileId}
       selectedTab="skills" locale="en" t={t} runAction={(_key, action) => { void action(); }} onOpenNavigation={() => undefined} />));

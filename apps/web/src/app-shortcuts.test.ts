@@ -28,10 +28,11 @@ const ctrlF: AppShortcutCombo = { code: "KeyF", meta: false, ctrl: true, alt: fa
 const ctrlG: AppShortcutCombo = { code: "KeyG", meta: false, ctrl: true, alt: false, shift: false };
 
 describe("application shortcut registry", () => {
-  it("registers every executable action including the interactive terminal", () => {
-    expect(APP_SHORTCUT_IDS).toHaveLength(28);
+  it("registers every executable action including the interactive terminal and region capture", () => {
+    expect(APP_SHORTCUT_IDS).toHaveLength(29);
     expect(APP_SHORTCUT_DEFINITION_LIST.map((definition) => definition.id)).toEqual(APP_SHORTCUT_IDS);
     expect(APP_SHORTCUT_DEFINITION_LIST.map((definition) => definition.id)).toContain("open-terminal");
+    expect(APP_SHORTCUT_DEFINITION_LIST.map((definition) => definition.id)).toContain("capture-region");
     expect(effectiveAppShortcutCombos("copy-conversation-markdown", {}, "win32")).toEqual([]);
     expect(SWITCH_SESSION_SHORTCUT_IDS).toHaveLength(9);
   });
@@ -39,6 +40,12 @@ describe("application shortcut registry", () => {
   it("keeps platform defaults and exact physical-key matching", () => {
     expect(effectiveAppShortcutCombos("open-terminal", {}, "darwin")).toEqual([
       { code: "Backquote", meta: false, ctrl: true, alt: false, shift: false }
+    ]);
+    expect(effectiveAppShortcutCombos("capture-region", {}, "darwin")).toEqual([
+      { code: "KeyA", meta: false, ctrl: true, alt: false, shift: true }
+    ]);
+    expect(effectiveAppShortcutCombos("capture-region", {}, "win32")).toEqual([
+      { code: "KeyA", meta: false, ctrl: false, alt: true, shift: true }
     ]);
     expect(effectiveAppShortcutCombos("new-maker", {}, "win32")).toEqual([
       { code: "KeyN", meta: false, ctrl: true, alt: false, shift: false }
@@ -122,6 +129,8 @@ describe("application shortcut registry", () => {
     expect(APP_SHORTCUT_DEFINITION_LIST.find((definition) => definition.id === "toggle-sidebar")?.menuBacked).toBeUndefined();
     expect(isAppShortcutAvailableOnPlatform("open-settings", "darwin")).toBe(true);
     expect(isAppShortcutAvailableOnPlatform("open-settings", "win32")).toBe(false);
+    expect(isAppShortcutAvailableOnPlatform("capture-region", "win32")).toBe(true);
+    expect(isAppShortcutAvailableOnPlatform("capture-region", "linux")).toBe(false);
     expect(isAppShortcutAvailableOnPlatform("zoom-in", "darwin")).toBe(false);
     expect(isAppShortcutAvailableOnPlatform("zoom-in", "linux")).toBe(true);
     expect(effectiveAppShortcutCombos("open-settings", {}, "darwin")).toEqual([
@@ -162,6 +171,7 @@ describe("application shortcut registry", () => {
       "right-tab-next",
       "open-terminal",
       "copy-conversation-markdown",
+      "capture-region",
       "find-in-page",
       "search-in-project",
       "browser-focus-url",

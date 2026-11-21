@@ -242,8 +242,8 @@
       }
     ],
     "extendInfo": {
-      "NSMicrophoneUsageDescription": "Joko uses the microphone only while you choose to dictate into the composer.",
-      "NSAudioCaptureUsageDescription": "Joko shares computer audio only when you enable audio in Remote Desktop.",
+      "NSMicrophoneUsageDescription": "Joko uses the microphone when you choose to dictate or enable microphone audio in a screen recording.",
+      "NSAudioCaptureUsageDescription": "Joko captures computer audio when you enable it in Remote Desktop or in a screen recording.",
       "NSAppleEventsUsageDescription": "Joko controls Contacts to import cards you choose and to add or update cards after you approve an export.",
       "NSContactsUsageDescription": "Joko imports contacts you choose and adds or updates cards only after you approve an export."
     },

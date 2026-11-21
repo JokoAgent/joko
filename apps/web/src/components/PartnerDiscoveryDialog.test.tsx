@@ -5,6 +5,7 @@ import { create } from "@bufbuild/protobuf";
 import { PartnerPackageEntrySchema, PartnerImportResultSchema, PartnerImportStatus, PartnerImportCheckStatus } from "@joko/contracts";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
+import { emptySnapshot } from "../model.js";
 import { PartnerDiscoveryDialog } from "./PartnerDiscoveryDialog.js";
 
 let root: Root | undefined;
@@ -14,14 +15,15 @@ const entry = () => create(PartnerPackageEntrySchema, { packageId: "engineer", p
   name: "Engineering partner", description: "Keeps delivery moving", bubble: "Review the current delivery", avatar: "orbit",
   capabilities: [{ icon: "code", label: "Review code" }, { icon: "check", label: "Check evidence" }, { icon: "file", label: "Report results" }],
   skills: [{ name: "Review", description: "Review selected work" }], knowledge: [{ name: "Evidence", description: "What counts as evidence" }], remembers: ["Repository"],
-  tools: [{ id: "gitlab", purpose: "Read selected merge requests" }], routines: [{ name: "Daily check", description: "Check selected work" }] });
+  tools: [{ id: "gitlab", purpose: "Read selected merge requests", requiresUserAuthorization: true }],
+  routines: [{ name: "Daily check", description: "Check selected work", optionalToolIds: ["gitlab"] }] });
 const result = () => create(PartnerImportResultSchema, { requestId: "request-one", partnerId: "partner-one", canonicalSessionId: "session-one", saved: true,
   status: PartnerImportStatus.NEEDS_ATTENTION, checks: [{ entryId: "routine-one", name: "Daily check", status: PartnerImportCheckStatus.NEEDS_ATTENTION, message: "IMPORT_ITEM_FAILED" }] });
 async function settle() { for (let i = 0; i < 12; i++) await Promise.resolve(); }
 function button(label: string) { const match = [...document.querySelectorAll<HTMLButtonElement>("button")].find(node => node.textContent?.trim() === label); if (!match) throw new Error("Missing button: " + label); return match; }
 async function mount(invite: (...args: unknown[]) => Promise<ReturnType<typeof result>>, created: (value: ReturnType<typeof result>) => void) {
   const api = { ownerKey: "owner", packages: vi.fn(async () => [entry()]), invitePackage: vi.fn(invite), status: vi.fn() };
-  const controller = { state: { effectiveLocale: "en" }, partnerImportApi: () => api } as unknown as AppController;
+  const controller = { state: { effectiveLocale: "en", snapshot: emptySnapshot() }, partnerImportApi: () => api } as unknown as AppController;
   const container = document.body.appendChild(document.createElement("div")); root = createRoot(container);
   await act(async () => { root!.render(<PartnerDiscoveryDialog controller={controller} ownerKey="owner" foreground onClose={() => {}} onCreated={created} />); await settle(); });
   return api;
@@ -32,6 +34,8 @@ it("shows authored detail modules, keeps routines off, and opens a partial insta
   await act(async () => { button("Engineering partner").click(); await settle(); });
   expect(document.body.textContent).toContain("Off by default"); expect(document.body.textContent).toContain("GitLab");
   expect(document.body.textContent).toContain("Knowledge and memory");
+  expect(document.body.textContent).toContain("Account authorization required to use");
+  expect(document.body.textContent).toContain("Optional tools · GitLab");
   await act(async () => { button("Invite").click(); await settle(); });
   expect(api.invitePackage).toHaveBeenCalledTimes(1); expect(created).not.toHaveBeenCalled();
   expect(document.body.textContent).toContain("Daily check");

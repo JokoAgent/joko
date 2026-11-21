@@ -68,6 +68,22 @@ async function mount(controller: AppController, onFirstInputAccepted?: Parameter
   return { render, submit: (...args: Parameters<typeof submit>) => submit(...args), error: () => error, busy: () => busy };
 }
 
+it("sends the screenshot input to a new task while retaining the originating draft", async () => {
+  const original = api();
+  const probe = await mount(original);
+  const png = new File(["captured image"], "capture.png", { type: "image/png" });
+  const screenshot: ComposerDraft = { ...input, text: "Translate the text in the screenshot into German.",
+    attachments: [{ id: "screenshot", kind: "image", file: png }] };
+
+  await act(async () => probe.submit(draft, screenshot, { ownerDocument: document, signal: new AbortController().signal,
+    isCurrent: () => true, preserveSourceDraft: true, firstInputDisposition: { kind: "send" } }));
+
+  expect(original.createSession).toHaveBeenCalledOnce();
+  expect(original.send).toHaveBeenCalledExactlyOnceWith("created", screenshot, { expectedGeneration: 4n });
+  expect(original.navigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: "created" });
+  expect(original.clearNewSessionDraft).not.toHaveBeenCalled();
+});
+
 it("forwards an exact bare /goal dialog handoff after revealing and installing the created task draft", async () => {
   const original = api();
   const shellAccepted = vi.fn();

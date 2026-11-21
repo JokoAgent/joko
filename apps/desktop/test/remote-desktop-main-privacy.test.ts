@@ -67,6 +67,7 @@ vi.mock("../src/remote-desktop-linux-clipboard.js", () => ({
   desktopRemoteDesktopLinuxClipboard: { closePublishedWriter: h.closeClipboardWriter }
 }));
 vi.mock("../src/remote-desktop-linux.js", () => ({ WAYLAND_REMOTE_DESKTOP_DISPLAY_ID: "wayland-portal",
+  isDesktopRemoteDesktopX11: () => false,
   isDesktopRemoteDesktopWayland: () => h.linuxWayland, supportsDesktopRemoteDesktopLinuxCapture: () => h.linuxNative,
   readDesktopRemoteDesktopLinuxSessionState: vi.fn(async () => h.linuxSession),
   readDesktopRemoteDesktopLinuxLockSessionState: vi.fn(async () => h.linuxSession),
@@ -387,7 +388,7 @@ it("Linux Main admits one portal source and reads actual locked state without us
   expect(await h.host!.sessionState(signal)).toBe("unsupported");
 });
 
-it("Linux X11 Main exposes only fresh physical desktop viewing even with unrelated native tools installed", async () => {
+it("Linux X11 Main exposes fresh physical desktop viewing and input even with unrelated tools installed", async () => {
   h.linuxWayland = false; h.linuxMute = true; h.linuxLock = true; h.linuxPrivacy = true;
   h.linuxAudio = true; h.linuxClipboard = true; h.linuxInput = true; h.linuxCursor = true; h.linuxModes = true;
   h.linuxViewer = true; h.linuxWorkspace = true; h.linuxSystemMenu = true;
@@ -395,7 +396,7 @@ it("Linux X11 Main exposes only fresh physical desktop viewing even with unrelat
   const signal = new AbortController().signal;
   expect(await h.host!.sessionState(signal)).toBe("unlocked");
   expect(await h.host!.displays(signal)).toEqual([{ id: "1", name: "Desktop", width: 1920, height: 1080 }]);
-  expect(await h.host!.linuxCapabilities!(signal)).toEqual({ canControl: false, cursorOverlay: false,
+  expect(await h.host!.linuxCapabilities!(signal)).toEqual({ canControl: true, cursorOverlay: false,
     displayModes: false, viewerDisplay: false, lockOnExit: false, privacyScreen: false, workspaceNavigation: false, systemMenu: false });
   expect(h.host).toMatchObject({ systemAudio: false });
   for (const capability of ["clipboard", "hostMute", "privacyScreen", "credentials", "lockScreen", "createViewerDisplay"] as const) {

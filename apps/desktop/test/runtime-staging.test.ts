@@ -514,7 +514,7 @@ async function claudeSessionRuntimeFixture() {
   const runtimeRoot = temporaryDirectory("session-sdk-electron");
   writeFileSync(resolve(runtimeRoot, "package.json"), '{"name":"session-sdk-electron-smoke","private":true,"type":"module"}\n');
   const adapterRequire = createRequire(new URL("../../../packages/adapter-claude-code/package.json", import.meta.url));
-  for (const name of ["adapter-claude-code", "runtime-governance"]) {
+  for (const name of ["adapter-claude-code", "runtime-governance", "core"]) {
     const manifestPath = resolve(import.meta.dirname, "../../../packages", name, "package.json");
     const packageRoot = resolve(runtimeRoot, "node_modules/@joko", name);
     mkdirSync(packageRoot, { recursive: true });

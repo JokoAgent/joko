@@ -1711,7 +1711,7 @@ export function useAppController(): AppController {
     if (shouldConnect) await connect(reconciled.profile);
   }, [connect]);
 
-  useEffect(() => window.jokoDesktop?.managedOrchestrator.onDatabaseCorrupted?.(() => {
+  useEffect(() => window.jokoDesktop?.managedOrchestrator?.onDatabaseCorrupted?.(() => {
     void adoptManagedOrchestratorStatus({ state: "retryableError", reason: "databaseCorrupted" });
   }), [adoptManagedOrchestratorStatus]);
 

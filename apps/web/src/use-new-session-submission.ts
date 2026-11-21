@@ -129,10 +129,12 @@ export function useNewSessionSubmission(
           try { void original.recordRecentProject(recentProject).catch(() => undefined); } catch { /* Local history must not block durable input. */ }
         }
         if (!isCurrent()) return;
-        try {
-          await original.clearNewSessionDraft();
-        } catch (error) {
-          if (isCurrent()) setError(describeError(error));
+        if (!owner.preserveSourceDraft) {
+          try {
+            await original.clearNewSessionDraft();
+          } catch (error) {
+            if (isCurrent()) setError(describeError(error));
+          }
         }
         if (!isCurrent()) return;
         expectedSession = sessionId;

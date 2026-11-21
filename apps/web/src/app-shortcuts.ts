@@ -18,6 +18,7 @@ export const APP_SHORTCUT_IDS = [
   "right-tab-next",
   "open-terminal",
   "copy-conversation-markdown",
+  "capture-region",
   "open-settings",
   "find-in-page",
   "search-in-project",
@@ -113,6 +114,8 @@ const CORE_SHORTCUT_DEFINITIONS: readonly AppShortcutDefinition[] = [
     : [combo("PageDown", { ctrl: true }), combo("Tab", { ctrl: true })]),
   definition("open-terminal", "app", () => [combo("Backquote", { ctrl: true })]),
   definition("copy-conversation-markdown", "app", () => []),
+  definition("capture-region", "app", (platform) => [combo("KeyA", platform === "darwin"
+    ? { ctrl: true, shift: true } : { alt: true, shift: true })], { menuBacked: true, platforms: ["darwin", "win32"] }),
   definition("open-settings", "app", () => [combo("Comma", { meta: true })], {
     hiddenInSettings: true,
     menuBacked: true,
