@@ -7,7 +7,7 @@ import { EntityKind, OperationMutationSchema, OperationState, RemoteHostService 
 import { RemoteHostRegistry } from "@joko/orchestrator";
 import type { RemoteFileTransportPort, RemoteProcessTransportPort } from "@joko/remote-ssh";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
-import { chromium, type Browser } from "playwright-core";
+import { chromium, type Browser, type Download, type Request, type Response } from "playwright-core";
 import { expect, it, vi } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
@@ -233,11 +233,30 @@ it.skipIf(!browserPath || !webDirectory)("downloads the original named SSH direc
     await page.locator("form.pair-form button[type=submit]").click();
     const link = page.getByRole("link", { name: "Remote docs", exact: true });
     await link.click({ button: "right" });
-    const checkDownload = async (): Promise<void> => {
-      const [download] = await Promise.all([
-        page.waitForEvent("download"),
-        page.getByRole("menuitem", { name: "Download folder", exact: true }).click()
-      ]);
+    const checkDownload = async (surface: string): Promise<void> => {
+      const preparePath = "/joko.v1.WorkspaceService/PrepareWorkspaceDirectoryDownload";
+      let preparation = "no archive request";
+      const onRequest = (request: Request): void => {
+        if (new URL(request.url()).pathname === preparePath) preparation = "archive requested";
+      };
+      const onResponse = (response: Response): void => {
+        if (new URL(response.url()).pathname === preparePath) preparation = `archive response HTTP ${response.status()}`;
+      };
+      page.on("request", onRequest);
+      page.on("response", onResponse);
+      const downloaded = page.waitForEvent("download");
+      void downloaded.catch(() => undefined);
+      let download: Download;
+      try {
+        await page.getByRole("menuitem", { name: "Download folder", exact: true }).click();
+        download = await downloaded;
+      } catch (cause) {
+        const failureShown = await page.getByText("Couldn’t download this folder.", { exact: true }).isVisible().catch(() => false);
+        throw new Error(`Directory download from ${surface} failed (${preparation}, failure shown: ${failureShown}).`, { cause });
+      } finally {
+        page.off("request", onRequest);
+        page.off("response", onResponse);
+      }
       expect(download.suggestedFilename()).toBe("docs.tar.gz");
       const archivePath = (await download.path())!;
       // GNU tar interprets a Windows drive letter in an archive name as a remote host.
@@ -252,11 +271,11 @@ it.skipIf(!browserPath || !webDirectory)("downloads the original named SSH direc
         expect(execFileSync("tar", ["-xOzf", archiveName, member], { cwd })).toEqual(bytes);
       }
     };
-    await checkDownload();
+    await checkDownload("task history");
     await page.goto(`${fixture.baseUrl}/#/files/${encodeURIComponent(sessionId)}`);
     const row = page.locator('[data-workspace-tree-row][data-relative-path="docs"]');
     await row.click({ button: "right" });
-    await checkDownload();
+    await checkDownload("Files");
     expect(files.write).not.toHaveBeenCalled();
     expect(files.remove).not.toHaveBeenCalled();
   } finally {

@@ -632,7 +632,7 @@ jobs:
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            files=(src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts src/document-tools.e2e.test.ts src/paired-backends.e2e.test.ts)
+            files=(src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts src/document-tools.e2e.test.ts src/paired-backends.e2e.test.ts src/remote-host-directories.e2e.test.ts)
           else
             files=(src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts)
           fi
