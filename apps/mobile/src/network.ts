@@ -241,7 +241,7 @@ export interface MobileNetwork {
   cancelPairing?(origin: string, challengeId: string, signal?: AbortSignal, endpointPublicKey?: string, transportKind?: EndpointTransportKind): Promise<void>;
   authorizeNewDevice?(credential: PairedCredential, signal?: AbortSignal, options?: NewDeviceAuthorizationOptions): Promise<NodePairingInvitation>;
   completePairing(origin: string, challengeId: string, code: string, deviceName: string, platform: string, deviceNameSource: DeviceNameSource, signal?: AbortSignal): Promise<{ credential: PairedCredential; identity: NodeIdentity }>;
-  readOwner(credential: PairedCredential, deviceNameSource: DeviceNameSource, signal?: AbortSignal): Promise<{ connection: Connection; device: Device; snapshot: Snapshot }>;
+  readOwner(credential: PairedCredential, deviceNameSource: DeviceNameSource | undefined, signal?: AbortSignal): Promise<{ connection: Connection; device: Device; snapshot: Snapshot }>;
   listRemoteDesktopHosts?(credential: PairedCredential, signal?: AbortSignal): Promise<readonly DevicePeerDescriptor[]>;
   getRemoteDesktopCapabilities?(credential: PairedCredential, peer: DevicePeerRouteIdentity,
     signal?: AbortSignal): Promise<RemoteDesktopCapabilities>;

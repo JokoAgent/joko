@@ -18,6 +18,9 @@ export interface HomeSurfaceUsageSource {
 
 interface HomeSurfacesNative {
   apply(sequence: number, owner: string | null, usage: string | null, activity: string | null, mayStart: boolean): Promise<void>;
+  pendingWidgetRefresh(): Promise<string | null>;
+  completeWidgetRefresh(id: string, sequence: number, owner: string | null, usage: string | null): Promise<void>;
+  addListener(event: "onWidgetRefresh", listener: (value: { id: string; expired: boolean }) => void): { remove(): void };
 }
 
 const QUOTA_REFRESH = 5 * 60_000;
@@ -31,8 +34,9 @@ function nativeHomeSurfaces(): HomeSurfacesNative | undefined {
 }
 
 export function homeSurfaceOwner(state: MobileState): string | undefined {
-  if (state.status === "unpaired" || state.status === "revoked" || state.activeProfileId === undefined) return undefined;
-  const profile = state.saved.find(item => item.profileId === state.activeProfileId);
+  if (state.status === "unpaired" || state.status === "revoked") return undefined;
+  const active = state.activeProfileId ?? (state.status === "connecting" ? state.automaticProfileId : undefined);
+  const profile = state.saved.find(item => item.profileId === active);
   if (profile === undefined || ["missing", "unreadable", "identity-conflict"].includes(profile.credentialState)) return undefined;
   return bytesToHex(sha256(new TextEncoder().encode(JSON.stringify([profile.profileId, profile.serverId, profile.connectionId, profile.deviceId]))));
 }
@@ -99,6 +103,7 @@ export function useMobileHomeSurfaces(client: MobileClient, state: MobileState, 
   const current = useRef({ owner, source, task, foreground, language });
   current.current = { owner, source, task, foreground, language };
   const catalog = useRef<{ owner: string; key: string } | undefined>(undefined);
+  const requestedRefresh = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (!native || !hydrated) return;
     const apply = (usage: string | null = null): Promise<void> => {
@@ -143,6 +148,37 @@ export function useMobileHomeSurfaces(client: MobileClient, state: MobileState, 
     const timer = setInterval(() => void read(), QUOTA_REFRESH);
     return () => { abort.abort(); clearInterval(timer); };
   }, [native, owner, source?.key, foreground, language]);
+
+  useEffect(() => {
+    if (!native || !owner || foreground) return;
+    const abort = new AbortController();
+    const refresh = async (id: string): Promise<void> => {
+      if (abort.signal.aborted || requestedRefresh.current === id) return;
+      requestedRefresh.current = id;
+      const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(20_000)]);
+      let data: string | null = null;
+      try {
+        const { source, verify } = await client.homeSurfaceBackgroundUsage(signal);
+        const projection = await readHomeSurfaceUsage(source, owner, language, signal);
+        await verify();
+        signal.throwIfAborted();
+        if (current.current.owner === owner && !current.current.foreground && current.current.language === language) {
+          data = JSON.stringify(projection);
+        }
+      } catch {
+        // The last authorized projection expires independently of this refresh.
+      } finally {
+        await native.completeWidgetRefresh(id, ++nextSequence, data === null ? null : owner, data).catch(() => undefined);
+      }
+    };
+    const subscription = native.addListener("onWidgetRefresh", event => {
+      if (event.expired) {
+        if (requestedRefresh.current === event.id) abort.abort();
+      } else void refresh(event.id);
+    });
+    void native.pendingWidgetRefresh().then(id => { if (id) void refresh(id); }).catch(() => undefined);
+    return () => { abort.abort(); subscription.remove(); };
+  }, [native, client, owner, foreground, language]);
 }
 
 function presentationText(value: string, length: number): string {

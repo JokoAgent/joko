@@ -475,6 +475,8 @@ jobs:
           widget="$app/PlugIns/JokoHomeWidgets.appex"
           test "$(plutil -extract NSSupportsLiveActivities raw -o - "$app/Info.plist")" = true
           test "$(plutil -extract JokoHomeSurfaceGroup raw -o - "$app/Info.plist")" = group.app.joko.mobile.widgets
+          plutil -extract UIBackgroundModes json -o - "$app/Info.plist" | jq -e 'index("fetch") != null'
+          plutil -extract BGTaskSchedulerPermittedIdentifiers json -o - "$app/Info.plist" | jq -e 'index("app.joko.mobile.refresh-home-widgets") != null'
           test "$(plutil -extract CFBundleIdentifier raw -o - "$widget/Info.plist")" = app.joko.mobile.home-widgets
           test "$(plutil -extract NSExtension.NSExtensionPointIdentifier raw -o - "$widget/Info.plist")" = com.apple.widgetkit-extension
           test "$(plutil -extract JokoHomeSurfaceGroup raw -o - "$widget/Info.plist")" = group.app.joko.mobile.widgets

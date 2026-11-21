@@ -8,7 +8,7 @@ import { COLLABORATION_WORKER_HARD_LIMIT_CODE, ErrorInfoSchema } from "@joko/con
 import { projectProviderGroupRebalance, type ProviderGroupRebalanceSuggestion } from "@joko/contracts";
 import { assertMobileExtensionPackagePreview, type MobileExtensionPackagePreview } from "./mobile-extension-packages";
 import { currentQueueRetryInput, executeExtensionSettingsCall, ExtensionSettingsRejected, type ExtensionLibraryFileMatch } from "@joko/connection-transport";
-import type { SessionArchivePreview } from "@joko/contracts";
+import type { ProviderDescriptor, SessionArchivePreview } from "@joko/contracts";
 import { InteractionSchema, splitQuestionReferences } from "@joko/contracts";
 import { clipBareHttpAutolinkText } from "./mobile-markdown-url-boundary";
 import { clone, create, equals, fromJsonString, toBinary } from "@bufbuild/protobuf";
@@ -3955,21 +3955,77 @@ export class MobileClient {
   homeSurfaceUsage(): import("./mobile-home-surfaces").HomeSurfaceUsageSource | undefined {
     const authority = this.mobilePushAuthority(), credential = this.#credential;
     if (this.platform !== "ios" || authority === undefined || credential === undefined || this.#joinedTask) return undefined;
-    const readProjection = () => {
-      const providers = this.network.getProviderUsage === undefined ? [] : (this.#state.owner?.providers ?? [])
-        .filter(mobileProviderUsageSupported)
-        .sort((left, right) => left.displayName.localeCompare(right.displayName) || left.providerId.localeCompare(right.providerId)).slice(0, 12);
-      const catalog = JSON.stringify(providers.map(mobileProviderUsageIdentity));
-      return { providers, catalog };
-    };
-    const { providers, catalog } = readProjection();
+    const { providers, catalog } = this.#homeSurfaceProviders(this.#state.owner?.providers ?? []);
     const assertCurrent = (signal: AbortSignal): void => {
       signal.throwIfAborted();
       if (this.#disposed || this.#credential !== credential || this.mobilePushAuthority()?.key !== authority.key
-        || this.#joinedTask || readProjection().catalog !== catalog) throw new Error("The original widget usage source changed.");
+        || this.#joinedTask || this.#homeSurfaceProviders(this.#state.owner?.providers ?? []).catalog !== catalog) {
+        throw new Error("The original widget usage source changed.");
+      }
     };
+    return this.#homeSurfaceUsageSource(credential, authority.key, providers, catalog, assertCurrent);
+  }
+
+  async homeSurfaceBackgroundUsage(signal: AbortSignal): Promise<{
+    source: import("./mobile-home-surfaces").HomeSurfaceUsageSource;
+    verify: () => Promise<void>;
+  }> {
+    const selected = () => this.#activeProfileId ?? (this.#state.status === "connecting" ? this.#automaticProfileId : undefined);
+    const profile = this.#profiles.find(item => item.profileId === selected());
+    if (this.platform !== "ios" || profile === undefined) throw new Error("The widget connection is unavailable.");
+    const epoch = this.#epoch;
+    const assertCurrent = (request: AbortSignal): void => {
+      signal.throwIfAborted(); request.throwIfAborted();
+      if (this.#disposed || this.#foreground || this.#joinedTask || this.#epoch !== epoch || selected() !== profile.profileId
+        || this.#state.status === "revoked" || this.#state.status === "unpaired" || !this.#profiles.includes(profile)
+        || this.#state.saved.some(item => item.profileId === profile.profileId
+          && ["missing", "unreadable", "identity-conflict"].includes(item.credentialState))) {
+        throw new Error("The original widget usage source changed.");
+      }
+    };
+    assertCurrent(signal);
+    await this.storage.loadEndpointTransport?.(profile);
+    assertCurrent(signal);
+    rememberEndpointTrust(profile);
+    const node = await this.network.inspect(profile.origin, signal);
+    assertCurrent(signal);
+    if (node.serverId !== profile.serverId) throw new CredentialIdentityError();
+    const credential = await this.storage.loadCredential(profile.profileId);
+    assertCurrent(signal);
+    if (credential === undefined || !credentialMatchesProfile(credential, profile)) throw new CredentialIdentityError();
+    const inspectOwner = async () => {
+      assertCurrent(signal);
+      const owner = await this.network.readOwner(credential, undefined, signal);
+      assertCurrent(signal);
+      this.#assertOwner(credential, owner, node);
+      const deviceRevision = owner.device.version?.revision?.value ?? 0n;
+      if (owner.device.platform.trim().toLocaleLowerCase("en-US") !== "ios" || !owner.device.connectionIds.includes(credential.connectionId)
+        || deviceRevision < 1n) throw new CredentialIdentityError();
+      return { deviceRevision, ...this.#homeSurfaceProviders(owner.snapshot.providers) };
+    };
+    const original = await inspectOwner();
     return {
-      key: JSON.stringify([authority.key, catalog]), catalog, providers,
+      source: this.#homeSurfaceUsageSource(credential, JSON.stringify([profile.profileId, epoch, original.deviceRevision.toString()]),
+        original.providers, original.catalog, assertCurrent),
+      verify: async () => {
+        const current = await inspectOwner();
+        if (current.deviceRevision !== original.deviceRevision || current.catalog !== original.catalog) {
+          throw new Error("The original widget usage source changed.");
+        }
+      }
+    };
+  }
+
+  #homeSurfaceProviders(catalogProviders: readonly ProviderDescriptor[]) {
+    const providers = this.network.getProviderUsage === undefined ? [] : catalogProviders.filter(mobileProviderUsageSupported)
+      .sort((left, right) => left.displayName.localeCompare(right.displayName) || left.providerId.localeCompare(right.providerId)).slice(0, 12);
+    return { providers, catalog: JSON.stringify(providers.map(mobileProviderUsageIdentity)) };
+  }
+
+  #homeSurfaceUsageSource(credential: PairedCredential, key: string, providers: readonly ProviderDescriptor[], catalog: string,
+    assertCurrent: (signal: AbortSignal) => void): import("./mobile-home-surfaces").HomeSurfaceUsageSource {
+    return {
+      key: JSON.stringify([key, catalog]), catalog, providers,
       readQuota: async (provider, signal) => {
         assertCurrent(signal);
         if (!providers.includes(provider)) throw new Error("The original widget Provider is unavailable.");

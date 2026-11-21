@@ -16,6 +16,7 @@ function withJokoHomeWidgets(config) {
   if (!bundle) throw new Error("Home widgets require the Joko iOS bundle identity.");
   const group = `group.${bundle}.widgets`;
   const extensionBundle = `${bundle}.home-widgets`;
+  const refreshTask = `${bundle}.refresh-home-widgets`;
   const experimental = config.extra?.eas?.build?.experimental ?? {};
   config.extra = { ...config.extra, eas: { ...config.extra?.eas, build: { ...config.extra?.eas?.build,
     experimental: { ...experimental, ios: { ...experimental.ios, appExtensions: [
@@ -26,6 +27,9 @@ function withJokoHomeWidgets(config) {
   config = withInfoPlist(config, next => {
     next.modResults.NSSupportsLiveActivities = true;
     next.modResults.JokoHomeSurfaceGroup = group;
+    next.modResults.JokoHomeSurfaceRefresh = refreshTask;
+    next.modResults.BGTaskSchedulerPermittedIdentifiers = [...new Set([...(next.modResults.BGTaskSchedulerPermittedIdentifiers ?? []), refreshTask])];
+    next.modResults.UIBackgroundModes = [...new Set([...(next.modResults.UIBackgroundModes ?? []), "fetch"])];
     return next;
   });
   config = withEntitlementsPlist(config, next => {

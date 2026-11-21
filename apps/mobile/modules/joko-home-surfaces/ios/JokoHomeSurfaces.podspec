@@ -15,6 +15,6 @@ Pod::Spec.new do |s|
   s.source           = { :path => '.' }
   s.static_framework = true
   s.dependency 'ExpoModulesCore'
-  s.frameworks       = 'WidgetKit', 'ActivityKit'
+  s.frameworks       = 'WidgetKit', 'ActivityKit', 'BackgroundTasks'
   s.source_files     = '**/*.swift'
 end

@@ -5136,6 +5136,30 @@ function mobileExtensionOwnerSnapshot(): Snapshot {
   });
 }
 
+it("reads a cold iOS widget refresh through the opted-in saved owner and fences a revoked response", async () => {
+  let currentDevice = create(DeviceSchema, { ...device, platform: "ios" });
+  const network = fakeNetwork();
+  network.readOwner = vi.fn(async () => ({ connection, device: currentDevice,
+    snapshot: create(SnapshotSchema, { ...snapshot, devices: [currentDevice] }) }));
+  network.getHomeUsage = vi.fn(async () => undefined);
+  const app = iosClient(network, memoryStorage(credential).storage);
+  app.setForeground(false);
+  await app.start();
+  expect(app.state).toMatchObject({ status: "connecting", automaticProfileId: credential.profileId });
+  expect(app.state.owner).toBeUndefined();
+  const signal = new AbortController().signal;
+  try {
+    const refresh = await app.homeSurfaceBackgroundUsage(signal);
+    expect(network.readOwner).toHaveBeenCalledExactlyOnceWith(credential, undefined, signal);
+    await refresh.source.readUsage(signal);
+    expect(network.getHomeUsage).toHaveBeenCalledExactlyOnceWith(credential, signal);
+    await expect(refresh.verify()).resolves.toBeUndefined();
+    currentDevice = create(DeviceSchema, { ...currentDevice, revoked: true });
+    await expect(refresh.verify()).rejects.toThrow();
+    expect(app.state.owner).toBeUndefined();
+  } finally { app.dispose(); }
+});
+
 describe("native mobile push authority", () => {
   it("binds registration to the exact current iOS profile, Connection, Device revision, and late-response fence", async () => {
     const iosDevice = create(DeviceSchema, { ...device, platform: "ios" });

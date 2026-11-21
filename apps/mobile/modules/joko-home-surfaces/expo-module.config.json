@@ -1,4 +1,7 @@
 {
   "platforms": ["apple"],
-  "apple": { "modules": ["JokoHomeSurfacesModule"] }
+  "apple": {
+    "modules": ["JokoHomeSurfacesModule"],
+    "appDelegateSubscribers": ["JokoHomeWidgetRefreshDelegate"]
+  }
 }

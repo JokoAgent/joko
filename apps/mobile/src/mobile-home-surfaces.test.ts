@@ -21,6 +21,8 @@ it("retains the same cold WidgetKit owner during reconnect and clears revoked or
   const owner = homeSurfaceOwner(state());
   expect(owner).toMatch(/^[a-f0-9]{64}$/u);
   expect(homeSurfaceOwner(state({ status: "connecting" }))).toBe(owner);
+  expect(homeSurfaceOwner(state({ status: "connecting", activeProfileId: undefined, automaticProfileId: paired.profileId }))).toBe(owner);
+  expect(homeSurfaceOwner(state({ status: "unpaired", activeProfileId: undefined, automaticProfileId: paired.profileId }))).toBeUndefined();
   expect(homeSurfaceOwner(state({ status: "offline" }))).toBe(owner);
   expect(homeSurfaceOwner(state({ status: "revoked" }))).toBeUndefined();
   expect(homeSurfaceOwner(state({ saved: [{ ...paired, credentialState: "missing" }] }))).toBeUndefined();
