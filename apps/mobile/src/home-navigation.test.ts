@@ -1,5 +1,5 @@
 import { create } from "@bufbuild/protobuf";
-import { ScheduleState, SessionDerivationKind, SessionDerivationOriginSchema, SessionState, SnapshotSchema, TargetState, WorkspaceKind } from "@joko/contracts";
+import { ScheduleSchema, ScheduleState, SessionDerivationKind, SessionDerivationOriginSchema, SessionSnoozeSchema, SessionState, SnapshotSchema, TargetState, WorkspaceKind } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
 import type { MobileWindowGeometry } from "./mobile-window-geometry";
 import {
@@ -44,15 +44,16 @@ const labels = { dialogue: "Dialogue", project: "Project", pinned: "Pinned" } as
 
 describe("mobile Home presentation", () => {
   it("places snoozes before activity and keeps a subscribed task working after its result has been read", () => {
+    const indefinite = create(SessionSnoozeSchema, { setAt: { seconds: 1n } });
     const sessions = snapshot.sessions.map(session => {
-      if (session.sessionId === "dialogue") return { ...session, state: SessionState.WAITING, snooze: { setAt: { seconds: 1n } } };
-      if (session.sessionId === "project-new") return { ...session, snooze: { setAt: { seconds: 1n }, until: { seconds: 90n } } };
-      if (session.sessionId === "archived") return { ...session, snooze: { setAt: { seconds: 1n } } };
+      if (session.sessionId === "dialogue") return { ...session, state: SessionState.WAITING, snooze: indefinite };
+      if (session.sessionId === "project-new") return { ...session, snooze: create(SessionSnoozeSchema, { setAt: { seconds: 1n }, until: { seconds: 90n } }) };
+      if (session.sessionId === "archived") return { ...session, snooze: indefinite };
       if (session.sessionId === "same-a") return { ...session, inboxSnoozeAllowed: false };
       return session;
     });
     const input = create(SnapshotSchema, { ...snapshot, sessions,
-      schedules: [{ scheduleId: "schedule", state: ScheduleState.ENABLED, sessionId: "same-b" }] });
+      schedules: [create(ScheduleSchema, { scheduleId: "schedule", state: ScheduleState.ENABLED, sessionId: "same-b" })] });
     const options = { snapshot: input, statusFilter: "active" as const, query: "", labels,
       inboxLabels: { inbox: "Inbox", working: "Working", snoozed: "Snoozed", archived: "Archived" } };
     const groups = (now: number) => buildMobileHomeSections({ ...options, now })

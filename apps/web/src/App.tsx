@@ -2646,7 +2646,14 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         onPin={(session) => runAction(`pin:${session.id}`, () => controller.pinSession(session.id, !session.pinned))}
         onPinTarget={(target) => runAction(`project-pin:${target.id}`, () => controller.updateTarget(target.id, { pinned: !target.pinned }, target.revision))}
         onRenameTarget={(target, name) => runAction(`project-rename:${target.id}`, () => controller.updateTarget(target.id, { name }, target.revision))}
-        onRemoveTarget={(target) => runAction(`project-archive:${target.id}`, async () => { await controller.archiveTarget(target.id, true); })}
+        getProjectArchivePreview={controller.archiveProjectKeepingFiles === undefined ? undefined : controller.getProjectArchivePreview}
+        onRemoveTarget={(target, archive) => runAction(`project-archive:${target.id}`, async () => {
+          if (archive === undefined) await controller.archiveTarget(target.id, true);
+          else {
+            if (controller.archiveProjectKeepingFiles === undefined) throw new Error(t("projects.archiveRemovalReviewFailed"));
+            await controller.archiveProjectKeepingFiles(target.id, archive);
+          }
+        })}
         onSetTargetSessionsArchived={(target, sessions, archived) => {
           if (removalOwnerId === undefined) return;
           const projectArchive = { projectId: target.id, ownerId: removalOwnerId, connectionGeneration: state.connectionGeneration };

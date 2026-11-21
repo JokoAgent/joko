@@ -8,7 +8,7 @@ import { isModelVisible, modelPreferenceOwnerId, readModelPickerOwnerPreferences
 import { providerModelInheritedField, protoProviderModelInheritedField } from "./provider-model-inheritance.js";
 import { extensionSettingsOperationReceipt, extensionSettingsProfileKey, pendingExtensionSettingsOperation,
   parsePendingExtensionSettingsOperation, type ExtensionSettingsOperationKind } from "./extension-settings-operation.js";
-import { readSessionArchivePreview } from "@joko/contracts";
+import { ProjectArchiveBlocker, readSessionArchivePreview, type GetProjectArchivePreviewResponse } from "@joko/contracts";
 import { builtinSkillIntentForText, resolveBuiltinSkillDraft } from "./builtin-skill-intent.js";
 import { CONTACTS_TOOL_POLICY_ID } from "./contacts-draft.js";
 import { projectProviderGroupRebalance } from "@joko/contracts";
@@ -1083,8 +1083,10 @@ export interface PairingOutcome {
   readonly authKey: string;
 }
 
-export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage" | "recoverBrowserPage" | "readProviderAccountBalance" | "getSessionContextBudget" | "setSessionContextBudget">,
-  Required<Pick<OperationApi, "readProviderAccountBalance" | "getSessionContextBudget" | "setSessionContextBudget">>, AppDefaultModelUiPort {
+export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage" | "recoverBrowserPage" | "readProviderAccountBalance" | "getSessionContextBudget" | "setSessionContextBudget" |
+  "getProjectArchivePreview" | "archiveProjectKeepingFiles">,
+  Required<Pick<OperationApi, "readProviderAccountBalance" | "getSessionContextBudget" | "setSessionContextBudget" |
+    "getProjectArchivePreview" | "archiveProjectKeepingFiles">>, AppDefaultModelUiPort {
   submitMessageFork(record: import("./model.js").PendingMessageFork, assertCurrent: () => void): Promise<import("./model.js").SideChatOperationView>;
   readMessageFork(record: import("./model.js").PendingMessageFork): Promise<import("./model.js").SideChatOperationView>;
   prepareContactsDialogue(draft: TargetDraft, requestId: string, signal: AbortSignal): Promise<Pick<TargetView, "id" | "revision">>;
@@ -1238,6 +1240,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   #sharedTaskRecovery: Promise<void> | undefined;
   #sharedTaskHistoryEpoch = 0;
   #transport: Transport | undefined;
+  readonly #projectArchiveReviews = new WeakMap<GetProjectArchivePreviewResponse, Transport>();
   #abort: AbortController | undefined;
   #snapshot: AppSnapshot | undefined;
   #rawSnapshot: Snapshot | undefined;
@@ -3224,6 +3227,39 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     // the in-flight refresh also covers an event-stream update that won the race.
     await this.refresh();
     return this.#snapshot?.targets.find((target) => target.id === targetId);
+  }
+
+  async getProjectArchivePreview(targetId: string, signal?: AbortSignal): Promise<GetProjectArchivePreviewResponse> {
+    const scope = this.captureActionScope(signal);
+    const preview = await createClient(TargetService, scope.transport).getProjectArchivePreview({ targetId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (preview.targetId !== targetId || (preview.targetRevision?.value ?? 0n) < 1n) throw new GatewayError("The project archive review is unavailable.");
+    this.#projectArchiveReviews.set(preview, scope.transport);
+    return preview;
+  }
+
+  async archiveProjectKeepingFiles(targetId: string, preview: GetProjectArchivePreviewResponse): Promise<void> {
+    const scope = this.captureActionScope();
+    if (this.#projectArchiveReviews.get(preview) !== scope.transport || preview.targetId !== targetId || preview.targetRevision === undefined) {
+      throw new GatewayError("Open the project archive review on the current connection.");
+    }
+    const targetRevision = preview.targetRevision;
+    const reviewed = new Set<string>();
+    for (const member of preview.members) {
+      if (member.blocker !== ProjectArchiveBlocker.UNSPECIFIED) {
+        reviewed.add(member.sessionId);
+        continue;
+      }
+      if (member.revision === undefined) throw new GatewayError("A project task is missing its archive revision.");
+      await this.submit({ case: "archiveSession", value: { sessionId: member.sessionId, archived: true,
+        archiveConfirmation: member.archiveConfirmation, projectArchive: { targetId, targetRevision } } }, true, [{
+        entity: { kind: EntityKind.SESSION, id: member.sessionId }, expectedRevision: member.revision
+      }], scope.signal);
+    }
+    await this.submit({ case: "archiveTarget", value: { targetId, archived: true,
+      projectArchive: { reviewedSkippedSessionIds: [...reviewed] } } }, true, [{
+      entity: { kind: EntityKind.TARGET, id: targetId }, expectedRevision: targetRevision
+    }], scope.signal);
   }
 
   async deleteTarget(targetId: string, deleteManagedWorkspace: boolean): Promise<void> {
@@ -13314,6 +13350,7 @@ function mapTargetView(target: Snapshot["targets"][number], workspaces: readonly
     trusted: workspace?.trusted ?? false,
     pinned: target.pinned,
     archived: target.state === 2,
+    projectArchivePreservesFiles: target.projectArchivePreservesFiles,
     ...(remoteWorkspace === undefined ? {} : { remoteWorkspace }),
     ...(target.sshWorktreeDerivationAllowed === undefined ? {} : { sshWorktreeDerivationAllowed: target.sshWorktreeDerivationAllowed }),
     ...(target.error?.message ? { error: presentJokoServiceTerminology(target.error.message) } : {})
