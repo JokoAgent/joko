@@ -92,7 +92,7 @@ export class ModelWorkingContextCoordinator {
     const route = this.options.resolveRoute(target);
     if (!route?.supported) return undefined;
     return this.state(owner.ownerId).entries.find(entry => key(entry.target) === key(target))?.overrideTokens
-      ?? validDefault(route.model.contextWindow);
+      ?? defaultWorkingContext(route.model);
   }
   async read(query: ModelWorkingContextQuery, signal?: AbortSignal): Promise<ModelWorkingContextView> {
     const targets = validateTargets(query); const owner = this.owner(signal);
@@ -178,7 +178,8 @@ export class ModelWorkingContextCoordinator {
     const revision = createHash("sha256").update(JSON.stringify(targets.map((target, index) => {
       const route = routes[index]; return [target, route === undefined ? null : [route.catalogRevision.toString(), route.instanceGeneration,
         route.providerRevision?.toString() ?? null, route.supported, route.available, route.model.contextWindow,
-        route.defaultAutoCompactionThresholdPercent ?? null]];
+        route.defaultAutoCompactionThresholdPercent ?? null,
+        ...(route.model.defaultWorkingContextTokens === undefined ? [] : [route.model.defaultWorkingContextTokens])]];
     }))).digest("hex");
     return { routes, revision };
   }
@@ -190,7 +191,7 @@ export class ModelWorkingContextCoordinator {
     const defaultAutoCompactionThresholdPercent = primary?.defaultAutoCompactionThresholdPercent;
     const autoCompactionThresholdPercent = defaultAutoCompactionThresholdPercent === undefined ? undefined
       : entries.find(entry => key(entry.target) === key(targets[0]!))?.autoCompactionThresholdPercent;
-    const defaultContextWindowTokens = primary === undefined ? undefined : validDefault(primary.model.contextWindow);
+    const defaultContextWindowTokens = primary === undefined ? undefined : defaultWorkingContext(primary.model);
     const canConfigure = source.routes.every(route => route !== undefined && route.supported && route.available);
     return { target: targets[0]!, ...(limitTokens === undefined ? {} : { limitTokens }),
       ...(defaultContextWindowTokens === undefined ? {} : { defaultContextWindowTokens }),
@@ -226,7 +227,10 @@ function validLimit(value: number): boolean { return Number.isSafeInteger(value)
 function validThreshold(value: number): boolean {
   return Number.isSafeInteger(value) && value >= PI_AUTO_COMPACTION_THRESHOLD_PERCENT_MINIMUM && value <= PI_AUTO_COMPACTION_THRESHOLD_PERCENT_MAXIMUM;
 }
-function validDefault(value: number): number | undefined { return Number.isSafeInteger(value) && value > 0 ? value : undefined; }
+function defaultWorkingContext(model: ProviderModel): number | undefined {
+  const value = model.defaultWorkingContextTokens ?? model.contextWindow;
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
 function validateTarget(target: ModelRouteTarget): void {
   if (!target || typeof target !== "object" || Object.keys(target).some(field => !["backendId", "providerId", "modelId", "$typeName"].includes(field))
     || !text(target.backendId) || !text(target.providerId) || !text(target.modelId)) throw new ModelWorkingContextError("invalid");

@@ -1070,6 +1070,7 @@ export class SessionHost {
   readonly #prewarmReleaseOperations = new Map<string, { readonly operationId: string; readonly bodyHash: string; readonly binding: NativeSessionBinding; closed: boolean }>();
   readonly #assertPrewarmResources: ((target: TargetDescriptor) => string) | undefined;
   readonly #sessionRuntimeControlEffects = new Set<string>();
+  readonly #taskModelGroupSelections = new Set<string>();
   readonly #sessionRuntimeRecoveries = new Map<string, SessionRuntimeRecoveryState>();
   #providerGroups?: ProviderGroupRuntime;
   readonly #providerGroupRecoveries = new Map<string, { readonly runId: string; readonly controller: AbortController; readonly lease: ProviderGroupRecoveryLease }>();
@@ -2892,6 +2893,113 @@ export class SessionHost {
       && !new TaskShareStore(this.#store).list().some(share => share.sessionId === id && share.status === "active");
   }
 
+  taskModelGroupSelectionState(sessionId: string, control = this.getSessionRuntimeControl(sessionId)):
+    { readonly taskModelGroupSelectionAvailable: boolean; readonly taskModelGroupId?: string } {
+    const groups = this.#providerGroups?.taskModels;
+    const stored = this.#store.getSession(sessionId);
+    const available = groups !== undefined && control.effective !== undefined && this.#manualTaskModelGroupAllowed(stored)
+      && control.handoffState !== "unknown" && control.handoffState !== "effect";
+    const profile = control.pending?.profile ?? control.effective;
+    const binding = groups?.binding(sessionId);
+    return { taskModelGroupSelectionAvailable: available, ...(available && profile && binding && groups!.ownsRoute(sessionId, profile)
+      ? { taskModelGroupId: binding.groupId } : {}) };
+  }
+
+  #manualTaskModelGroupAllowed(stored: StoredSession): boolean {
+    const adapter = this.#store.getBackend(stored.descriptor.backendId).descriptor.adapterKind;
+    return ["pi", "codex", "claude-agent-sdk-stdio"].includes(adapter) && this.#taskModelGroupSwitchAllowed(stored)
+      && this.#store.listCollaborationGoals({ leadSessionId: stored.descriptor.id }).length === 0;
+  }
+
+  async selectTaskModelGroup(input: {
+    readonly sessionId: string;
+    readonly sessionGeneration: bigint;
+    readonly expectedGeneration: number;
+    readonly selection: import("@joko/contracts").TaskModelGroupSelection;
+    readonly assertOwner: () => void;
+  }): Promise<void> {
+    this.#assertOpen();
+    const { sessionId, selection } = input;
+    await this.#withSessionRuntimeControlLock(sessionId, async () => {
+      const groups = this.#providerGroups?.taskModels;
+      const assertTask = () => {
+        input.assertOwner();
+        const current = this.#store.getSession(sessionId);
+        if (!groups || BigInt(current.descriptor.binding.generation) !== input.sessionGeneration || !this.#manualTaskModelGroupAllowed(current)
+          || this.getSessionRuntimeControl(sessionId).generation !== input.expectedGeneration) {
+          throw new StoreError("The task model group selection changed. Reopen the model picker.");
+        }
+        return current;
+      };
+      const stored = assertTask();
+      const snapshot = this.getSessionRuntimeControl(sessionId);
+      const current = snapshot.pending?.profile ?? snapshot.effective;
+      if (!current || snapshot.handoffState === "unknown" || snapshot.handoffState === "effect") throw new StoreError("The task runtime must be ready to change models.");
+      if (this.#sessionRuntimeMutationMustDefer(sessionId) || this.nextQueueItemForDispatch(sessionId) !== undefined) {
+        throw new StoreError("Wait for the current input to settle before choosing a model group.");
+      }
+      this.#taskModelGroupSelections.add(sessionId);
+      this.#sessionRuntimeControlEffects.add(sessionId);
+      try {
+        const models = groups!;
+        const choice = await models.resolve(selection, { signal: new AbortController().signal, requireReady: true,
+          accepts: (source, model) => source.kind === "local" && this.#canSelectTaskGroupRoute(stored, current, source.backendId, source.providerId, model.modelId) });
+        if (!choice) throw new StoreError("There is no available model in this group on the task's current node.");
+        const assertChoice = () => { assertTask(); choice.assertCurrent(); };
+        const bind = () => { choice.bind(sessionId); models.commitBoundRotation(sessionId); };
+        assertChoice();
+        const patch = choice.profile;
+        if (patch.backendId !== stored.descriptor.backendId || snapshot.handoffState === "closed") {
+          this.#stageSessionRuntimeHandoff({ sessionId, expectedGeneration: input.expectedGeneration, patch, onStaged: bind }, stored, snapshot);
+          return;
+        }
+        const baseline = sessionRuntimeBaseline(stored.descriptor)!;
+        const backend = this.#store.getBackend(stored.descriptor.backendId).descriptor;
+        const profile = resolveSessionRuntimeProfile({ baseline, current: snapshot.effective ?? baseline, patch, models: backend.models,
+          fastModeSupported: backend.capabilities.get("model.fast_mode")?.supported === true });
+        if (!profile) throw new StoreError("The selected model no longer supports the requested settings.");
+        const active = await this.activate(sessionId);
+        assertChoice();
+        await this.#applySessionRuntimeProfile(sessionId, active, profile, assertChoice);
+        try {
+          this.#store.transaction(store => {
+            assertChoice();
+            bind();
+            store.updateSession(sessionId, { providerId: profile.providerId, modelId: profile.modelId,
+              effort: profile.effort ?? null, fastMode: profile.fastMode });
+          });
+          this.recordUserSessionRuntimeSelection(sessionId);
+        } catch (error) {
+          await active.adapter.closeSession(stored.descriptor.binding, this.contextFor(stored)).catch(() => undefined);
+          this.deleteActiveSession(sessionId, active);
+          throw error;
+        }
+      } finally {
+        this.#sessionRuntimeControlEffects.delete(sessionId);
+        this.#taskModelGroupSelections.delete(sessionId);
+        void this.drain(sessionId);
+      }
+    });
+  }
+
+  #canSelectTaskGroupRoute(stored: StoredSession, current: SessionRuntimeProfile, backendId: string, providerId: string, modelId: string): boolean {
+    try {
+      const route = { backendId, providerId, modelId, fastMode: false };
+      if (backendId !== stored.descriptor.backendId) {
+        this.#assertRuntimeHandoffSession(stored);
+        this.#resolveRuntimeHandoffProfile(stored, route, current);
+      } else {
+        this.assertBackendCreationReady(backendId, route);
+        this.assertProviderAuthenticationAvailable(backendId, providerId);
+        if (this.#store.getBackend(backendId).descriptor.capabilities.get("model.switch")?.supported !== true) return false;
+      }
+      return true;
+    } catch (error) {
+      if (error instanceof JokoError || error instanceof SessionRuntimeControlError) return false;
+      throw error;
+    }
+  }
+
   async #resolveTaskModelGroupSwitch(
     input: { readonly sessionId: string; readonly sessionGeneration: bigint; readonly failedRunId: string },
     signal: AbortSignal
@@ -2927,21 +3035,7 @@ export class SessionHost {
       if (source.kind !== "local" || source.nodeId !== original.nodeId || source.key === original.key
         && (model.modelId === binding.source.modelId || decision.cause === "usage-limit" && signals.modelScoped !== true)) return false;
       if (decision.cause === "usage-limit" && signals.modelScoped !== true && source.providerId === original.providerId) return false;
-      const backend = this.#store.getBackend(source.backendId).descriptor;
-      try {
-        const route = { backendId: source.backendId, providerId: source.providerId, modelId: model.modelId, fastMode: false };
-        if (route.backendId !== effective.backendId) {
-          this.#assertRuntimeHandoffSession(stored);
-          this.#resolveRuntimeHandoffProfile(stored, route, effective);
-        } else {
-          this.assertBackendCreationReady(source.backendId, route);
-          if (backend.capabilities.get("model.switch")?.supported !== true) return false;
-        }
-        return true;
-      } catch (error) {
-        if (error instanceof JokoError || error instanceof SessionRuntimeControlError) return false;
-        throw error;
-      }
+      return this.#canSelectTaskGroupRoute(stored, effective, source.backendId, source.providerId, model.modelId);
     } });
     if (!choice || this.#store.findSession(input.sessionId)?.revision !== stored.revision
       || this.getSessionRuntimeControl(input.sessionId).generation !== control.generation || !this.#taskModelGroupSwitchAllowed(stored)
@@ -3917,7 +4011,7 @@ export class SessionHost {
       && new TaskShareStore(store).getAuthorForOperation(input.operationId)?.sessionId !== input.sessionId
       && store.findObjective(input.sessionId) === undefined
       && group.ownsRoute(input.sessionId, this.getSessionRuntimeControl(input.sessionId).effective)) {
-      group.acceptFirstPrompt(input.sessionId);
+      group.commitBoundRotation(input.sessionId);
     }
     if (consumedQueueRetryId !== undefined) store.recordQueueRetryAdmission(consumedQueueRetryId, runId, `operation:${input.operationId}:source-retry`);
     const result = { sessionId: input.sessionId, runId, attemptId, queueItemId };
@@ -6803,12 +6897,16 @@ export class SessionHost {
     readonly sessionId: string; readonly expectedGeneration: number; readonly patch: SessionRuntimePatch;
     readonly source?: SessionRuntimeMutationSource;
     readonly fresh?: boolean;
+    readonly onStaged?: () => void;
   }, stored: StoredSession, snapshot: SessionRuntimeControlSnapshot): SessionRuntimeMutationResult {
     this.#assertRuntimeHandoffSession(stored);
     const current = snapshot.pending?.profile ?? snapshot.effective!;
     const profile = this.#resolveRuntimeHandoffProfile(stored, input.patch, current);
     const source = input.source ?? "agent";
-    this.#runtimeHandoffs.stage(input.sessionId, snapshot.generation + 1, profile, source, input.fresh);
+    this.#store.transaction(() => {
+      input.onStaged?.();
+      this.#runtimeHandoffs.stage(input.sessionId, snapshot.generation + 1, profile, source, input.fresh);
+    });
     this.#preparedRuntimeHandoffPrompts.delete(input.sessionId);
     const accepted = this.#sessionRuntimeControl.acceptDeferred(input.sessionId, source, profile, snapshot.effective);
     this.#publishSessionRuntimeControlChanged(stored);
@@ -15530,6 +15628,7 @@ export class SessionHost {
   }
 
   private async drain(sessionId: string): Promise<void> {
+    if (this.#taskModelGroupSelections.has(sessionId)) return;
     // This synchronous prelude also runs when an older dispatcher still owns
     // the per-Session settlement. Newly committed work must become a durable
     // auth failure immediately instead of waiting behind that native turn.

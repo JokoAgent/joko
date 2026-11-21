@@ -45,6 +45,17 @@ const referencePriceRoutes: Readonly<Record<string, { readonly baseUrl: string; 
   "xiaomi-token-plan-cn": { baseUrl: "https://token-plan-cn.xiaomimimo.com/v1", family: "xiaomi", group: "cn" }
 };
 
+export function openAiDefaultWorkingContext(model: { readonly id: string; readonly api?: string; readonly baseUrl?: string },
+  contextWindow: number): number | undefined {
+  const baseUrl = model.baseUrl?.replace(/\/+$/u, "");
+  const subscription = baseUrl === referencePriceRoutes["openai-codex"]!.baseUrl && model.api === "openai-codex-responses";
+  const apiKey = baseUrl === referencePriceRoutes["openai"]!.baseUrl && (model.api === "openai-responses" || model.api === "openai-completions");
+  const id = model.id.replace(/^(?:openai|chatgpt)\//u, "");
+  if ((!subscription && !apiKey) || id.includes("/") || !/^(?:gpt-|codex-|o\d+(?:[.-]|$))/u.test(id)) return undefined;
+  const window = subscription && /^gpt-6\.[12]-sol(?:\[1m\])?$/u.test(id) ? 500_000 : 272_000;
+  return contextWindow > window ? window : undefined;
+}
+
 /** Explicit helpers keep the provisioned factory independent of module closures. */
 export function createPiModelCatalogAdditionsFactory(nativeOptions: {
   readonly buildBaseOptions: typeof buildBaseOptions;

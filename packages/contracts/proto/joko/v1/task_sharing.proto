@@ -27,6 +27,8 @@ message TaskShareRuntimeControl {
   TaskShareRuntimeProfile pending = 4;
   uint64 pending_generation = 5;
   string handoff_state = 6;
+  bool task_model_group_selection_available = 7;
+  optional string task_model_group_id = 8;
 }
 message GetRuntimeControlRequest { string session_id = 1; }
 message GetRuntimeControlResponse { TaskShareRuntimeControl control = 1; }

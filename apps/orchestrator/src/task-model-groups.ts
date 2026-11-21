@@ -166,7 +166,7 @@ export class TaskModelGroups {
     }
   }
 
-  acceptFirstPrompt(sessionId: string): void {
+  commitBoundRotation(sessionId: string): void {
     const binding = this.binding(sessionId);
     if (binding === undefined || binding.rotationCommitted) return;
     const store = this.options.store;

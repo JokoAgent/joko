@@ -24,7 +24,7 @@ import {
   type DiscoveredProviderModel,
   type ProviderModelDiscoverySpec
 } from "./provider-model-discovery.js";
-import { materializeDiscoveredModel, refreshDiscoveredModel, saveDiscoveredModelConfiguration } from "./provider-model-metadata.js";
+import { materializeDiscoveredModel, publicDiscoveryDefaults, refreshDiscoveredModel, saveDiscoveredModelConfiguration } from "./provider-model-metadata.js";
 import { videoGenerationBaseUrl } from "./video-generation-protocol.js";
 import {
   PROVIDER_ACCOUNT_USAGE_CAPABILITY,
@@ -1549,8 +1549,10 @@ export class ProviderCatalogManager {
       || !this.#modelEnabled(backendId, normalizedProviderId, normalizedModelId)
       || entry.provider.baseUrl === undefined
     ) return false;
-    const model = entry.provider.models.find((candidate) => candidate.id === normalizedModelId);
-    if (model === undefined || !inferenceModelMatchesPurpose(model, options.purpose)) return false;
+    const configured = entry.provider.models.find((candidate) => candidate.id === normalizedModelId);
+    if (configured === undefined) return false;
+    const model = this.#publicModelDefaults(entry, configured);
+    if (!inferenceModelMatchesPurpose(model, options.purpose)) return false;
     const api = model.api ?? entry.provider.api;
     if (api !== "anthropic-messages" && api !== "openai-responses" && api !== "openai-completions") return false;
     if (options.requireImages === true && model.input?.includes("image") !== true) return false;
@@ -1615,8 +1617,10 @@ export class ProviderCatalogManager {
       || !this.#modelEnabled(backendId, normalizedProviderId, normalizedModelId)
       || entry.provider.baseUrl === undefined
     ) return undefined;
-    const model = entry.provider.models.find((candidate) => candidate.id === normalizedModelId);
-    if (model === undefined || !inferenceModelMatchesPurpose(model, options.purpose)) return undefined;
+    const configured = entry.provider.models.find((candidate) => candidate.id === normalizedModelId);
+    if (configured === undefined) return undefined;
+    const model = this.#publicModelDefaults(entry, configured);
+    if (!inferenceModelMatchesPurpose(model, options.purpose)) return undefined;
     const api = model.api ?? entry.provider.api;
     if (api !== "anthropic-messages" && api !== "openai-responses" && api !== "openai-completions") return undefined;
     const supportsImages = model.input?.includes("image") === true;
@@ -2380,6 +2384,7 @@ export class ProviderCatalogManager {
     return this.#mutate(async () => {
       const generation = this.#generation;
       let usesOpenCodeGoResponses = false;
+      let usesPublicDefaults = false;
       const entries = [...this.#entries.values()].flatMap((entry): ManagedProviderEntry[] => {
         if (
           entry.backendId !== this.#nativeBackendId || !entry.enabled
@@ -2388,12 +2393,14 @@ export class ProviderCatalogManager {
         ) return [];
         const responsesModel = input.hosted === true || this.#nativeEntries.has(entry.provider.id)
           ? undefined : automaticOpenCodeGoResponsesModel(entry);
-        const models = entry.provider.models.filter((model) =>
-          isManagedChatModel(model) && this.#modelEnabled(entry.backendId, entry.provider.id, model.id)
-          && input.modelEnabled?.(entry.provider.id, model.id) !== false).map((model): PiManagedModel => {
-            if (model !== responsesModel) return model;
+        const models = entry.provider.models.filter((model) => this.#modelEnabled(entry.backendId, entry.provider.id, model.id)
+          && input.modelEnabled?.(entry.provider.id, model.id) !== false).flatMap((model): PiManagedModel[] => {
+            const projected = this.#publicModelDefaults(entry, model, "pi");
+            if (!isManagedChatModel(projected)) return [];
+            usesPublicDefaults ||= projected !== model;
+            if (model !== responsesModel) return [projected];
             usesOpenCodeGoResponses = true;
-            return { ...model, api: "openai-responses" };
+            return [{ ...projected, api: "openai-responses" }];
           });
         return models.length === 0 ? [] : [{ ...entry, provider: { ...entry.provider, models } }];
       });
@@ -2410,7 +2417,7 @@ export class ProviderCatalogManager {
       try {
         await mkdir(input.snapshotsRoot, { recursive: true, mode: 0o700 });
         // A generation materialized by an earlier build remains immutable.
-        const snapshotName = `generation-${generation}${usesOpenCodeGoResponses ? "-opencode-go-responses" : ""}`;
+        const snapshotName = `generation-${generation}${usesOpenCodeGoResponses ? "-opencode-go-responses" : ""}${usesPublicDefaults ? "-public-defaults" : ""}`;
         const finalPath = join(input.snapshotsRoot, snapshotName);
         const temporary = join(input.snapshotsRoot, `.${snapshotName}-${randomUUID()}.tmp`);
         try {
@@ -2457,6 +2464,17 @@ export class ProviderCatalogManager {
     });
   }
 
+  #catalogBackendKind(backendId: string): string {
+    return backendId === this.#nativeBackendId ? "pi"
+      : this.#store.listBackends().find(({ descriptor }) => descriptor.id === backendId)?.descriptor.adapterKind ?? backendId;
+  }
+
+  #publicModelDefaults(entry: ManagedProviderEntry, model: PiManagedModel, kind?: string): PiManagedModel {
+    if (model.discoveredMetadata === undefined) return model;
+    return publicDiscoveryDefaults(model, model.baseUrl ?? entry.provider.baseUrl, kind ?? this.#catalogBackendKind(entry.backendId),
+      model.api ?? entry.provider.api);
+  }
+
   #descriptor(entry: ManagedProviderEntry, native = entry.backendId === this.#nativeBackendId ? this.#nativeEntries.get(entry.provider.id) : undefined): ProviderDescriptor {
     const balance = this.describeAccountBalance(entry.backendId, entry.provider.id);
     const nativeReference = native?.credentialReferenceId ?? entry.nativeCredentialReferenceId;
@@ -2477,8 +2495,10 @@ export class ProviderCatalogManager {
     else if (providerEnvironmentNames(entry.provider).size > 0 && existing.length === 0) authenticationState = "signed_out";
     else authenticationState = "authenticated";
     const { upstreamListing: _listing, ...descriptor } = entry;
+    const kind = this.#catalogBackendKind(entry.backendId);
     return {
       ...descriptor,
+      provider: { ...entry.provider, models: entry.provider.models.map(model => this.#publicModelDefaults(entry, model, kind)) },
       ...(native === undefined ? {} : {
         kind: native.kind,
         supportsLogin: native.kind === "api_key" || native.kind === "oauth" || native.kind === "subscription",

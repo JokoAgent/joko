@@ -8,6 +8,7 @@ import { CredentialManager, CredentialVault, ProviderCatalogManager, ProviderAcc
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture, routeFixtureDiscovery } from "./fixture.js";
+import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
   ? it : it.skip;
@@ -17,6 +18,11 @@ class ManagedProviderAdapter extends InstrumentedFakeAdapter {
     const descriptor = await super.describe();
     return { ...descriptor,
       capabilities: new Map([...descriptor.capabilities, ["provider.managed_catalog", { key: "provider.managed_catalog", supported: true }]]),
+      providers: descriptor.models.map((model) => ({
+        providerId: model.providerId, displayName: model.providerId, api: model.api,
+        authenticationState: "not_required", accessKind: "localKeyless", loginMethods: [],
+        supportsLogin: false, supportsLogout: false, supportsRefresh: false, supportsModelRefresh: false
+      })),
       providerRuntimeSupport: { protocols: ["openai-completions"], fields: ["auth_header", "keyless", "headers", "model_limits", "model_input_modalities"] }
     };
   }
@@ -230,20 +236,33 @@ describe("mounted Provider configuration", () => {
     await first.getByRole("button", { name: "Model groups", exact: true }).click();
     const groups = first.getByRole("region", { name: "Model groups", exact: true });
     await groups.getByRole("button", { name: "Add model group", exact: true }).click();
-    await groups.getByLabel("Group name").fill("Mounted models");
-    const source = groups.getByLabel("Add a model source");
-    const route = source.getByRole("option", { name: /Test Text · test · Alpha runtime/u });
-    await route.waitFor({ state: "attached" });
-    await source.selectOption({ value: (await route.getAttribute("value"))! });
+    const groupName = groups.getByRole("textbox", { name: "Group name", exact: true });
+    await groupName.fill("Mounted models");
+    const source = groups.getByRole("combobox", { name: "Add a model source", exact: true });
+    const catalogSource = fixture.application.providerGroups!.taskModels.list().sources.find(({ source, available }) =>
+      available && source?.backendId === alphaId && source.providerId === "test" && source.modelId === "text")?.source;
+    if (catalogSource === undefined) throw new Error("The Alpha text model is missing from the task model group catalog.");
+    await source.selectOption(JSON.stringify([catalogSource.sourceKey, catalogSource.backendId, catalogSource.providerId, catalogSource.modelId]));
     await groups.getByRole("button", { name: "Save group", exact: true }).click();
     await groups.getByText("Group saved.", { exact: true }).waitFor();
     expect(fixture.application.providerGroups!.taskModels.list().config?.groups[0]).toMatchObject({
       name: "Mounted models", candidates: [{ source: { backendId: alphaId, providerId: "test", modelId: "text" } }]
     });
     await first.setViewportSize({ width: 390, height: 844 });
-    await groups.getByLabel("Group name").waitFor({ state: "visible" });
+    await groupName.waitFor({ state: "visible" });
     expect(await overflow(first)).toBeLessThanOrEqual(1);
     await first.setViewportSize({ width: 1440, height: 960 });
+
+    const ordinaryTask = sessionIdFrom(await submit(inspector.clients.operation, inspector.connectionId, createSessionMutation({
+      backendId: alphaId, targetId: fixture.targetId(alphaId), providerId: "vision", modelId: "multimodal", displayName: "Existing task with a group"
+    })));
+    await first.goto(`${fixture.baseUrl}/#/tasks/${ordinaryTask}`, { waitUntil: "domcontentloaded" });
+    await first.locator(".composer__controls .model-picker-trigger").click({ timeout: 20_000 });
+    const chooseGroup = first.getByRole("combobox", { name: "Model groups", exact: true });
+    await chooseGroup.selectOption({ label: "Mounted models" });
+    await expect.poll(() => fixture!.application.store.getSession(ordinaryTask).descriptor.modelId).toBe("text");
+    expect(fixture.application.providerGroups!.taskModels.binding(ordinaryTask)?.source).toMatchObject({ providerId: "test", modelId: "text" });
+    await first.goto(`${fixture.baseUrl}/#/settings/providers`, { waitUntil: "domcontentloaded" });
 
     await first.locator(".provider-master-row", { hasText: "Mounted Route" }).dblclick();
     editor = first.locator(".provider-editor-modal");

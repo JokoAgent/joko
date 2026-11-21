@@ -29,6 +29,7 @@ export interface PublicProviderInterface {
 interface PublicModelRoute {
   readonly providerId: string;
   readonly modelId: string;
+  readonly variant?: "1m";
   readonly status?: string;
   readonly agents: readonly string[];
   readonly nativeApi?: string | null;
@@ -62,7 +63,12 @@ function profileAcceptsEndpoint(profile: PublicProviderInterface, endpoint: stri
 /** Established connections can offer catalog routes only when their endpoint identifies one product. */
 export function publicProviderCatalogId(endpoint: string): string | undefined {
   const ids = [...new Set(providerInterfaceProfiles.filter(profile => profileAcceptsEndpoint(profile, endpoint)).map(profile => profile.providerId))];
-  return ids.length === 1 ? ids[0] : undefined;
+  if (ids.length !== 0) return ids.length === 1 ? ids[0] : undefined;
+  switch (normalizedEndpoint(endpoint)) {
+    case "https://api.openai.com/v1": return "openai";
+    case "https://api.anthropic.com": return "anthropic";
+    default: return undefined;
+  }
 }
 
 function providerModelId(providerId: string, modelId: string): string {
@@ -78,7 +84,9 @@ export function publicProviderModel(providerId: string, modelId: string): Public
 
 function matchingPublicModels(providerId: string, modelId: string): readonly PublicModelRoute[] {
   const id = providerModelId(providerId, modelId);
-  return publicModelRoutes.filter(model => model.providerId === providerId && model.modelId === id);
+  const models = publicModelRoutes.filter(model => model.providerId === providerId && model.modelId === id);
+  const explicit = modelId.endsWith("[1m]") ? models.filter(model => model.variant === "1m") : [];
+  return explicit.length > 0 ? explicit : models.filter(model => model.variant === undefined);
 }
 
 export function publicModelNativeApi(providerId: string, modelId: string, mode?: string): string | null | undefined {
@@ -305,7 +313,7 @@ const publicModelRoutes: readonly PublicModelRoute[] = [
   {"providerId":"anthropic","modelId":"claude-sonnet-5-5","status":"active","agents":["claude-code","codex"],"nativeApi":"anthropic-messages","baseDefaults":{"name":"Sonnet 5.5","contextWindow":1000000,"maxOutputTokens":128000,"efforts":["low","medium","high","xhigh","max"],"defaultEffort":"medium","supportsImageInput":true},"defaults":{"name":"Sonnet 5.5"}},
   {"providerId":"anthropic","modelId":"claude-haiku-5-5","status":"active","agents":["claude-code","codex"],"nativeApi":"anthropic-messages","baseDefaults":{"name":"Haiku 5.5","contextWindow":1000000,"maxOutputTokens":128000,"efforts":["low","medium","high","xhigh","max"],"defaultEffort":"medium","supportsImageInput":true},"defaults":{"name":"Haiku 5.5"}},
   {"providerId":"openai","modelId":"gpt-5.6-sol","status":"active","agents":["claude-code","codex"],"nativeApi":"openai-responses","baseDefaults":{"maxOutputTokens":128000,"defaultEffort":"medium","name":"GPT-5.6-Sol","efforts":["low","medium","high","xhigh","max"]},"defaults":{"name":"GPT-5.6-Sol","defaultEnabled":false,"contextWindow":1050000,"efforts":["low","medium","high","xhigh","max"],"supportsFastMode":true},"perBackend":{"codex":{"efforts":["low","medium","high","xhigh","max","ultra"],"contextWindow":272000},"claude-code":{"contextWindow":272000}}},
-  {"providerId":"openai","modelId":"gpt-5.6-sol","status":"deprecated","agents":["claude-code"],"nativeApi":"openai-responses","baseDefaults":{"maxOutputTokens":128000,"defaultEffort":"medium","name":"GPT-5.6-Sol","efforts":["low","medium","high","xhigh","max"]},"defaults":{"name":"GPT-5.6-Sol (1M · Higher usage)","defaultEnabled":false,"contextWindow":1000000,"efforts":["low","medium","high","xhigh"],"supportsFastMode":true}},
+  {"providerId":"openai","modelId":"gpt-5.6-sol","variant":"1m","status":"deprecated","agents":["claude-code"],"nativeApi":"openai-responses","baseDefaults":{"maxOutputTokens":128000,"defaultEffort":"medium","name":"GPT-5.6-Sol","efforts":["low","medium","high","xhigh","max"]},"defaults":{"name":"GPT-5.6-Sol (1M · Higher usage)","defaultEnabled":false,"contextWindow":1000000,"efforts":["low","medium","high","xhigh"],"supportsFastMode":true}},
   {"providerId":"openai","modelId":"gpt-5.6-terra","status":"active","agents":["claude-code","codex"],"nativeApi":"openai-responses","baseDefaults":{"name":"GPT-5.6-Terra","maxOutputTokens":128000,"efforts":["low","medium","high","xhigh","max"],"defaultEffort":"medium"},"defaults":{"name":"GPT-5.6-Terra","defaultEnabled":false,"contextWindow":1050000,"supportsFastMode":true},"perBackend":{"codex":{"efforts":["low","medium","high","xhigh","max","ultra"],"contextWindow":272000},"claude-code":{"contextWindow":272000}}},
   {"providerId":"openai","modelId":"gpt-5.6-luna","status":"active","agents":["claude-code","codex"],"nativeApi":"openai-responses","baseDefaults":{"name":"GPT-5.6-Luna","efforts":["low","medium","high","xhigh","max"],"defaultEffort":"medium"},"defaults":{"name":"GPT-5.6-Luna","defaultEnabled":false,"contextWindow":1050000,"maxOutputTokens":128000,"efforts":["low","medium","high","xhigh","max"],"defaultEffort":"medium"},"perBackend":{"codex":{"contextWindow":272000},"claude-code":{"contextWindow":272000}}},
   {"providerId":"openai","modelId":"gpt-5.5","status":"active","agents":["claude-code","codex"],"nativeApi":"openai-responses","baseDefaults":{"name":"GPT-5.5","maxOutputTokens":128000,"efforts":["low","medium","high","xhigh"],"defaultEffort":"medium"},"defaults":{"name":"GPT-5.5","defaultEnabled":false,"contextWindow":272000,"supportsFastMode":true},"perBackend":{"codex":{"contextWindow":272000}}},

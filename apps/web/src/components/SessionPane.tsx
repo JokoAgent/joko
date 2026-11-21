@@ -324,6 +324,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const [modelRuntimeControl, setModelRuntimeControl] = useState<{
     readonly sessionId: string; readonly ownerKey: string; readonly control: import("@joko/contracts").TaskShareRuntimeControl;
   }>();
+  const [taskModelGroupCatalog, setTaskModelGroupCatalog] = useState<{
+    readonly ownerKey: string; readonly runtimeGeneration: bigint; readonly config: import("@joko/contracts").TaskModelGroupConfig;
+  }>();
   useEffect(() => {
     if (guest || !controller.getSessionRuntimeControl) return;
     let current = true;
@@ -2399,8 +2402,28 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     } : {})
   });
 
-  const runtimeSelection = modelRuntimeControl?.sessionId === session.id && modelRuntimeControl.ownerKey === providerGroupOwnerKey
-    ? modelRuntimeControl.control.pending ?? modelRuntimeControl.control.effective : undefined;
+  const pickerRuntime = modelRuntimeControl?.sessionId === session.id && modelRuntimeControl.ownerKey === providerGroupOwnerKey
+    ? modelRuntimeControl.control : undefined;
+  const runtimeSelection = pickerRuntime?.pending ?? pickerRuntime?.effective;
+  const refreshPickerRuntime = async (loadGroups: boolean): Promise<void> => {
+    const control = await controller.getSessionRuntimeControl?.(session.id);
+    if (!control || providerGroupOwnerRef.current !== providerGroupOwnerKey) return;
+    setModelRuntimeControl({ sessionId: session.id, ownerKey: providerGroupOwnerKey, control });
+    if (loadGroups && control.taskModelGroupSelectionAvailable && taskModelsApi?.applySelection) {
+      const result = await taskModelsApi.list();
+      if (providerGroupOwnerRef.current === providerGroupOwnerKey) setTaskModelGroupCatalog(result.config
+        ? { ownerKey: providerGroupOwnerKey, runtimeGeneration: control.generation, config: result.config } : undefined);
+    }
+  };
+  const pickerGroups = pickerRuntime?.taskModelGroupSelectionAvailable && taskModelsApi?.applySelection
+    && taskModelGroupCatalog?.ownerKey === providerGroupOwnerKey && taskModelGroupCatalog.runtimeGeneration === pickerRuntime.generation
+    ? { choices: taskModelGroupCatalog.config.groups.map(group => ({ id: group.groupId, name: group.name })), selectedId: pickerRuntime.taskModelGroupId,
+      select: async (groupId: string) => {
+        if (providerGroupOwnerRef.current !== providerGroupOwnerKey) throw new Error("The task changed.");
+        await taskModelsApi.applySelection!({ sessionId: session.id, sessionGeneration: session.generation,
+          runtimeGeneration: pickerRuntime.generation, groupId, expectedRevision: taskModelGroupCatalog.config.revision });
+        await refreshPickerRuntime(false);
+      } } : undefined;
   const unifiedSessionModels = !guest && controller.setRuntimeModel ? controller.state.snapshot.models.filter(model =>
     controller.state.snapshot.backends.some(candidate => candidate.id === model.backendId
       && candidate.capabilities.get("input.text")?.supported && candidate.capabilities.get("model.switch")?.supported)
@@ -2444,10 +2467,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         }}
         t={t}
         providerGroupUsage={providerGroupUsage}
+        taskGroups={pickerGroups}
         onOpen={() => Promise.allSettled([controller.refreshProviderModels(session.backendId, undefined, true), refreshTaskProviderGroupUsage(),
-          controller.getSessionRuntimeControl?.(session.id).then(control => {
-            if (providerGroupOwnerRef.current === providerGroupOwnerKey) setModelRuntimeControl({ sessionId: session.id, ownerKey: providerGroupOwnerKey, control });
-          })]).then(() => undefined)}
+          refreshPickerRuntime(true)]).then(() => undefined)}
         onConnectSource={guest ? undefined : () => { window.location.hash = "#/settings/providers"; }}
         onSelect={async (selection) => {
           if (selection === undefined) return;
@@ -2457,8 +2479,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           if (!guest && controller.setRuntimeModel) {
             await controller.setRuntimeModel(session.id, { backendId: model.backendId, providerId: model.providerId,
               modelId: model.modelId, effort: selection.effort, fastMode: resolveModelSpeed(model, selection.fastMode) });
-            const control = await controller.getSessionRuntimeControl?.(session.id);
-            if (control && providerGroupOwnerRef.current === providerGroupOwnerKey) setModelRuntimeControl({ sessionId: session.id, ownerKey: providerGroupOwnerKey, control });
+            await refreshPickerRuntime(false);
             return;
           }
           await controller.setModel(

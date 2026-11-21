@@ -53,6 +53,7 @@ const DISCOVERY_TIMEOUT_MS = 10_000;
 const MAXIMUM_RESPONSE_BYTES = 1024 * 1024;
 const MAXIMUM_DISCOVERY_PAGES = 100;
 const MAXIMUM_DISCOVERED_MODELS = 10_000;
+const CATALOG_PAGE_PARAMETERS = new Set(["after_id", "cursor", "page", "page_token", "pageToken"]);
 
 export function deriveProviderModelsUrl(baseUrl: string, api?: string): string {
   const url = new URL(baseUrl);
@@ -250,79 +251,140 @@ export async function fetchProviderModelCatalog(
   const sourceUrl = endpoint.toString();
   const timeout = AbortSignal.timeout(DISCOVERY_TIMEOUT_MS);
   const signal = spec.signal === undefined ? timeout : AbortSignal.any([spec.signal, timeout]);
-  const { value: first, hasNextLink } = await fetchModelPage(sourceUrl, headers, signal, fetchImpl);
   const listedIds = new Set<string>();
+  const models = new Map<string, DiscoveredProviderModel>();
+  const visited = new Set<string>([sourceUrl]);
+  const bounds = { pages: 0, models: 0 };
   let validListing = true;
-  const recordListing = (value: unknown): void => {
-    const list = modelList(value);
-    if (list === undefined) throw new ProviderModelDiscoveryError("invalid_response");
+  let complete = false;
+  let current = endpoint;
+  for (let count = 1; count <= MAXIMUM_DISCOVERY_PAGES; count += 1) {
+    let page: Awaited<ReturnType<typeof fetchModelPage>>;
+    try {
+      page = await fetchModelPage(current.toString(), headers, signal, fetchImpl);
+    } catch (error) {
+      if (count === 1 || spec.signal?.aborted) throw error;
+      break;
+    }
+    const list = modelList(page.value);
+    const invalidAnthropicPage = spec.api === "anthropic-messages" && current.searchParams.has("after_id")
+      && (!isRecord(page.value) || !Array.isArray(page.value["data"]) || typeof page.value["has_more"] !== "boolean");
+    if (list === undefined || invalidAnthropicPage) {
+      if (count === 1) throw new ProviderModelDiscoveryError("invalid_response");
+      break;
+    }
+    const pageIds = new Set<string>();
     for (const item of list) {
       const id = modelIdentity(item, spec.api === "google-generative-ai");
       if (!validIdentity(id)) validListing = false;
-      else listedIds.add(id);
+      else if (!listedIds.has(id)) pageIds.add(id);
     }
-    if (listedIds.size > MAXIMUM_DISCOVERED_MODELS) throw new ProviderModelDiscoveryError("invalid_response");
-  };
-  recordListing(first);
-  let firstModels = parseProviderModels(first, sourceUrl, spec.includeNonChat);
+    if (listedIds.size + pageIds.size > MAXIMUM_DISCOVERED_MODELS) {
+      if (count === 1) throw new ProviderModelDiscoveryError("invalid_response");
+      break;
+    }
+    for (const id of pageIds) listedIds.add(id);
+    for (const model of parseProviderModels(page.value, sourceUrl, spec.includeNonChat)) {
+      const previous = models.get(model.id);
+      models.set(model.id, previous === undefined ? model : {
+        ...previous, ...model, name: model.metadata?.name ?? previous.name,
+        ...(previous.metadata === undefined && model.metadata === undefined ? {} : { metadata: { ...previous.metadata, ...model.metadata } }),
+        ...(previous.cost === undefined && model.cost === undefined ? {} : { cost: { ...previous.cost, ...model.cost } })
+      });
+    }
+    const hasContinuation = catalogHasContinuation(page.value, bounds);
+    const next = nextCatalogPage(page.value, page.link, endpoint, current);
+    if (next === undefined) {
+      complete = validListing && !hasNextLink(page.link) && !hasContinuation && count >= bounds.pages && listedIds.size >= bounds.models
+        && ![...endpoint.searchParams.keys()].some(key => CATALOG_PAGE_PARAMETERS.has(key));
+      break;
+    }
+    if (visited.has(next.toString())) break;
+    visited.add(next.toString());
+    current = next;
+  }
   if (spec.includeNonChat && officialModelsEndpoint(sourceUrl, "https://openrouter.ai/api/v1/models")) {
     const speechEndpoint = new URL(endpoint);
     speechEndpoint.searchParams.set("output_modalities", "speech");
     try {
       const { value } = await fetchModelPage(speechEndpoint.toString(), headers, signal, fetchImpl);
       const speech = parseProviderModels(value, speechEndpoint.toString(), true);
-      const combined = new Map(firstModels.map(model => [model.id, model]));
       for (const model of speech.filter(model => model.metadata?.mode === "audio_speech")) {
-        const previous = combined.get(model.id);
-        if (previous === undefined && combined.size >= MAXIMUM_DISCOVERED_MODELS) break;
-        combined.set(model.id, { ...previous, ...model,
+        const previous = models.get(model.id);
+        if (previous === undefined && models.size >= MAXIMUM_DISCOVERED_MODELS) break;
+        models.set(model.id, { ...previous, ...model,
           name: model.metadata?.name ?? previous?.metadata?.name ?? model.name,
           metadata: { ...previous?.metadata, ...model.metadata } });
       }
-      firstModels = [...combined.values()];
     } catch { /* The independent speech catalog must not discard a successful chat discovery. */ }
   }
-  if (spec.api !== "anthropic-messages" || !isRecord(first) || first["has_more"] !== true) {
-    return { models: firstModels, listedIds, complete: validListing && !hasNextLink && !catalogHasContinuation(first, listedIds.size) };
-  }
-  if (!Array.isArray(first["data"])) throw new ProviderModelDiscoveryError("invalid_response");
-
-  const models = new Map(firstModels.map(model => [model.id, model]));
-  const seenCursors = new Set<string>();
-  let page = first;
-  for (let count = 1; count < MAXIMUM_DISCOVERY_PAGES; count += 1) {
-    const cursor = page["last_id"];
-    if (!validIdentity(cursor) || seenCursors.has(cursor) || models.size > MAXIMUM_DISCOVERED_MODELS) {
-      throw new ProviderModelDiscoveryError("invalid_response");
-    }
-    seenCursors.add(cursor);
-    const next = new URL(endpoint);
-    next.searchParams.set("after_id", cursor);
-    const { value, hasNextLink } = await fetchModelPage(next.toString(), headers, signal, fetchImpl);
-    if (!isRecord(value) || !Array.isArray(value["data"]) || typeof value["has_more"] !== "boolean") {
-      throw new ProviderModelDiscoveryError("invalid_response");
-    }
-    recordListing(value);
-    for (const model of parseProviderModels(value, sourceUrl, spec.includeNonChat)) if (!models.has(model.id)) models.set(model.id, model);
-    if (!value["has_more"]) {
-      return { models: [...models.values()], listedIds, complete: validListing && !hasNextLink && !catalogHasContinuation(value, listedIds.size) };
-    }
-    page = value;
-  }
-  throw new ProviderModelDiscoveryError("invalid_response");
+  return { models: [...models.values()], listedIds, complete };
 }
 
-function catalogHasContinuation(value: unknown, listedCount: number): boolean {
+function nextCatalogPage(value: unknown, linkHeader: string, endpoint: URL, current: URL): URL | undefined {
+  const continuation = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 4096;
+  if (isRecord(value)) {
+    for (const scope of [value, value["pagination"]].filter(isRecord)) {
+      for (const [field, param] of [["nextPageToken", "pageToken"], ["next_page_token", "page_token"], ["next_cursor", "cursor"]] as const) {
+        const token = scope[field];
+        if (!continuation(token)) continue;
+        const next = new URL(endpoint);
+        next.searchParams.set(param, token);
+        return next;
+      }
+      if (scope["has_more"] === true && validIdentity(scope["last_id"])) {
+        const next = new URL(endpoint);
+        next.searchParams.set("after_id", scope["last_id"]);
+        return next;
+      }
+    }
+  }
+  const links = isRecord(value) && isRecord(value["links"]) ? value["links"] : undefined;
+  const link = isRecord(value) && continuation(value["next"]) ? value["next"] : links?.["next"];
+  const target = link ?? [...linkHeader.matchAll(/<([^>]*)>([^<]*)/gu)].find(match => hasNextLink(match[2] ?? ""))?.[1];
+  if (!continuation(target)) return undefined;
+  try {
+    const next = new URL(target, current);
+    if (next.origin !== endpoint.origin || next.pathname !== endpoint.pathname || next.username || next.password || next.hash) return undefined;
+    // A query-only link may omit configured filters or an API version.
+    // Keep those parameters fixed across the original catalog.
+    for (const key of new Set(endpoint.searchParams.keys())) {
+      if (CATALOG_PAGE_PARAMETERS.has(key)) continue;
+      const original = endpoint.searchParams.getAll(key), offered = next.searchParams.getAll(key);
+      if (offered.length === 0) for (const value of original) next.searchParams.append(key, value);
+      else if (original.length !== offered.length || original.some((value, index) => value !== offered[index])) return undefined;
+    }
+    return next;
+  } catch { /* An invalid link keeps the catalog partial. */ }
+  return undefined;
+}
+
+function hasNextLink(value: string): boolean {
+  return /;\s*rel\s*=\s*(?:"[^"]*\bnext\b[^"]*"|next\b)/iu.test(value);
+}
+
+function catalogHasContinuation(value: unknown, bounds: { pages: number; models: number }): boolean {
   if (!isRecord(value)) return false;
-  const scopes = [value, value["pagination"]].filter(isRecord);
-  return scopes.some(scope => scope["has_more"] === true || scope["hasMore"] === true
-    || ["next", "next_cursor", "next_page", "next_page_token", "nextPageToken"].some(key => {
-      const cursor = scope[key];
-      return cursor !== undefined && cursor !== null && cursor !== "" && cursor !== false;
-    }) || (typeof scope["total"] === "number" && scope["total"] > listedCount));
+  let hasHint = false;
+  const scan = (scope: Record<string, unknown>, depth: number): void => {
+    for (const [key, hint] of Object.entries(scope)) {
+      if (depth === 0 && (key === "data" || key === "models")) continue;
+      if (/^(?:next.*|has_?(?:more|next).*|.*cursor.*|.*page_?token.*)$/iu.test(key)
+        && hint !== undefined && hint !== null && hint !== "" && hint !== false && hint !== 0) hasHint = true;
+      if (typeof hint === "number" && Number.isFinite(hint)) {
+        if (/^(?:total_?pages|page_?count|pages|last_?page|num_?pages|current_?page|page|page_?number)$/iu.test(key)) {
+          bounds.pages = Math.max(bounds.pages, hint);
+        }
+        if (/^(?:total|total_?count|total_?items|total_?results|count_?total)$/iu.test(key)) bounds.models = Math.max(bounds.models, hint);
+      }
+      if (depth < 2 && isRecord(hint)) scan(hint, depth + 1);
+    }
+  };
+  scan(value, 0);
+  return hasHint;
 }
 
-async function fetchModelPage(url: string, headers: Readonly<Record<string, string>>, signal: AbortSignal, fetchImpl: typeof fetch): Promise<{ value: unknown; hasNextLink: boolean }> {
+async function fetchModelPage(url: string, headers: Readonly<Record<string, string>>, signal: AbortSignal, fetchImpl: typeof fetch): Promise<{ value: unknown; link: string }> {
   let response: Response;
   try {
     signal.throwIfAborted();
@@ -350,7 +412,7 @@ async function fetchModelPage(url: string, headers: Readonly<Record<string, stri
     throw new ProviderModelDiscoveryError("invalid_response");
   }
   try {
-    return { value: JSON.parse(body) as unknown, hasNextLink: /;\s*rel\s*=\s*(?:"[^"]*\bnext\b[^"]*"|next\b)/iu.test(response.headers.get("link") ?? "") };
+    return { value: JSON.parse(body) as unknown, link: response.headers.get("link") ?? "" };
   } catch {
     throw new ProviderModelDiscoveryError("invalid_response");
   }

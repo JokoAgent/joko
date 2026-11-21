@@ -4,6 +4,7 @@ import { MULTILINGUAL_FIXTURES } from "./i18n/multilingual-fixtures.js";
 import {
   ProviderModelDiscoveryError,
   deriveProviderModelsUrl,
+  fetchProviderModelCatalog,
   fetchProviderModels,
   parseProviderModels
 } from "./provider-model-discovery.js";
@@ -180,10 +181,54 @@ describe("Provider model discovery", () => {
     const cursor = "https://unrelated.example.test/v1/models";
     const request = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) =>
       Response.json({ data: [{ id: "listed-model" }], has_more: true, last_id: cursor }));
-    await expect(fetchProviderModels({ baseUrl: "https://api.example.test/v1", modelsEndpoint,
-      api: "anthropic-messages", apiKey: "test-key" }, request as typeof fetch)).rejects.toMatchObject({ code: "invalid_response" });
+    await expect(fetchProviderModelCatalog({ baseUrl: "https://api.example.test/v1", modelsEndpoint,
+      api: "anthropic-messages", apiKey: "test-key" }, request as typeof fetch)).resolves.toMatchObject({
+      listedIds: new Set(["listed-model"]), complete: false
+    });
     expect(request.mock.calls.map(([url]) => url)).toEqual([modelsEndpoint, `${modelsEndpoint}?after_id=${encodeURIComponent(cursor)}`]);
     expect(request.mock.calls[0]?.[1]?.signal).toBe(request.mock.calls[1]?.[1]?.signal);
+  });
+
+  it.each([
+    { fields: { next_cursor: "second" }, query: "cursor" },
+    { fields: { nextPageToken: "second" }, query: "pageToken" },
+    { fields: { next_page_token: "second" }, query: "page_token" },
+    { fields: { next: "?page=second" }, query: "page" }
+  ])("collects a second page via $query on the original endpoint", async ({ fields, query }) => {
+    const baseUrl = "https://api.example.test/v1";
+    const request = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer catalog-key");
+      expect(init?.redirect).toBe("error");
+      return url === `${baseUrl}/models`
+        ? Response.json({ data: [{ id: "a" }, { id: "b" }], ...fields, pagination: { totalPages: 2 } })
+        : Response.json({ data: [{ id: "c" }] });
+    });
+    const catalog = await fetchProviderModelCatalog({ baseUrl, apiKey: "catalog-key" }, request);
+    expect(catalog.complete).toBe(true);
+    expect(catalog.listedIds).toEqual(new Set(["a", "b", "c"]));
+    expect(catalog.models.map(model => model.id)).toEqual(["a", "b", "c"]);
+    expect(request.mock.calls.map(([url]) => url)).toEqual([`${baseUrl}/models`, `${baseUrl}/models?${query}=second`]);
+  });
+
+  it.each(["https://unrelated.example.test/v1/models", "/v1/account"])("retains a partial catalog for a next link to %s", async next => {
+    const request = vi.fn(async () => Response.json({ data: [{ id: "a" }] }, { headers: { link: `<${next}>; rel="next"` } }));
+    await expect(fetchProviderModelCatalog({ baseUrl: "https://api.example.test/v1", apiKey: "catalog-key" }, request))
+      .resolves.toMatchObject({ listedIds: new Set(["a"]), complete: false });
+    expect(request).toHaveBeenCalledOnce();
+  });
+
+  it("follows an HTTP next link without switching the configured catalog filter", async () => {
+    const endpoint = "https://api.example.test/v1/models";
+    const spec = { baseUrl: "https://api.example.test/v1", modelsEndpoint: `${endpoint}?scope=approved`, apiKey: "catalog-key" };
+    const request = vi.fn(async (url: string | URL | Request) => {
+      if (url === spec.modelsEndpoint) return Response.json({ data: [{ id: "first" }] }, { headers: { link: '<?page=2>; rel="next"' } });
+      expect(url).toBe(`${endpoint}?page=2&scope=approved`);
+      return Response.json({ data: [{ id: "second" }] });
+    });
+    expect(await fetchProviderModelCatalog(spec, request)).toMatchObject({ complete: true, listedIds: new Set(["first", "second"]) });
+    const differentScope = vi.fn(async () => Response.json({ data: [{ id: "first" }], next: "?page=2&scope=other" }));
+    expect(await fetchProviderModelCatalog(spec, differentScope)).toMatchObject({ complete: false, listedIds: new Set(["first"]) });
+    expect(differentScope).toHaveBeenCalledOnce();
   });
 
   it("cancels an oversized streaming response without buffering the remaining upstream body", async () => {

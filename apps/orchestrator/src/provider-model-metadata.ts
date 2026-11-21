@@ -1,7 +1,47 @@
 import {
   PI_EDITABLE_MODEL_METADATA_FIELDS, PI_MODEL_METADATA_FIELDS, supportedPiThinkingLevels,
-  type PiManagedModel, type PiModelDiscoveryMetadata, type PiModelMetadataField
+  type PiManagedModel, type PiModelDiscoveryMetadata, type PiModelMetadataField, type PiSupportedApi
 } from "@joko/adapter-pi";
+import { publicModelNativeApi, publicProviderCatalogId, publicProviderInterfaces, publicProviderModel } from "@joko/contracts";
+
+const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** Project defaults for discovered members of the exact public connection. */
+export function publicDiscoveryDefaults(model: PiManagedModel, endpoint: string | undefined, backend: string,
+  api: PiSupportedApi | undefined): PiManagedModel {
+  const live = model.discoveredMetadata;
+  if (live === undefined || endpoint === undefined) return model;
+  const catalog = publicProviderCatalogId(endpoint);
+  if (catalog === undefined) return model;
+  const declaration = publicProviderModel(catalog, model.id);
+  if (declaration === undefined || declaration.status === "retired") return model;
+  const profile = publicProviderInterfaces(catalog, endpoint, model.id).find(item => item.api === api
+    && item.baseUrl.replace(/\/+$/u, "") === endpoint.replace(/\/+$/u, ""));
+  const defaults = { ...declaration.baseDefaults, ...declaration.defaults, ...declaration.perBackend?.[backend], ...profile?.defaults };
+  const nativeApi = publicModelNativeApi(catalog, model.id, live.mode ?? defaults.mode);
+  const efforts = live.efforts ?? defaults.efforts;
+  const intent = live.defaultEffort === null || defaults.defaultEffort === undefined ? live.defaultEffort : defaults.defaultEffort;
+  const offered = efforts === undefined ? undefined : thinkingLevels.filter(value => efforts.includes(value));
+  const defaultEffort = !intent || offered === undefined || offered.includes(intent) ? intent
+    : offered.filter(value => thinkingLevels.indexOf(value) <= thinkingLevels.indexOf(intent)).at(-1) ?? offered[0];
+  const capacity = catalog === "openai" ? declaration.baseDefaults.contextWindow ?? defaults.contextWindow : defaults.contextWindow;
+  return materializeDiscoveredModel(model, {
+    mode: defaults.mode, name: defaults.name,
+    contextWindow: live.contextWindow ?? live.contextWindowMax ?? capacity,
+    maxOutputTokens: defaults.maxOutputTokens,
+    nativeApi: nativeApi === "anthropic-messages" || nativeApi === "openai-responses" || nativeApi === "openai-completions"
+      || nativeApi === "google-generative-ai" ? nativeApi : undefined,
+    inputModalities: defaults.modalities?.input,
+    outputModalities: defaults.modalities?.output,
+    supportsImages: defaults.supportsImageInput,
+    supportsTools: defaults.supportsToolCalls,
+    supportsFastMode: defaults.supportsFastMode,
+    ...live,
+    efforts,
+    defaultEffort,
+    ...(live.inputModalities === undefined || live.supportsImages !== undefined ? {} : { supportsImages: live.inputModalities.includes("image") })
+  });
+}
 
 /** Keep facts separate from the values explicitly declared by the owner. */
 export function refreshDiscoveredModel(model: PiManagedModel, update: PiModelDiscoveryMetadata): PiManagedModel {
@@ -34,25 +74,25 @@ export function saveDiscoveredModelConfiguration(current: PiManagedModel | undef
     metadataOverrides: [...privateOverrides, ...editableOverrides] });
 }
 
-export function materializeDiscoveredModel(model: PiManagedModel): PiManagedModel {
-  const metadata = model.discoveredMetadata!;
+export function materializeDiscoveredModel(model: PiManagedModel, metadata = model.discoveredMetadata!): PiManagedModel {
+  const live = model.discoveredMetadata!;
   const overrides = new Set(model.metadataOverrides);
   const user = Object.fromEntries(PI_MODEL_METADATA_FIELDS.filter(field => overrides.has(field)).map(field => [field, model[field]]));
   const base = Object.fromEntries(Object.entries(model).filter(([field]) => !PI_MODEL_METADATA_FIELDS.includes(field as PiModelMetadataField)
     && !["contextWindowSource", "maxOutputTokensSource", "declaredInputModalities"].includes(field)));
   const levels = metadata.efforts;
   const thinkingLevelMap = levels === undefined ? undefined : Object.fromEntries(
-    ["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(level => [level, levels.includes(level) ? level : null]));
+    thinkingLevels.map(level => [level, levels.includes(level) ? level : null]));
   const reportedInput = metadata.supportsImages === false ? metadata.inputModalities?.filter(value => value !== "image")
     : metadata.supportsImages === true ? [...new Set([...(metadata.inputModalities ?? ["text"]), "image"])] : metadata.inputModalities;
   const input = reportedInput?.filter((value): value is "text" | "image" => value === "text" || value === "image");
   const result: PiManagedModel = {
-    ...base, id: model.id, discoveredMetadata: metadata, metadataOverrides: model.metadataOverrides,
+    ...base, id: model.id, discoveredMetadata: live, metadataOverrides: model.metadataOverrides,
     name: metadata.name ?? model.id,
     contextWindow: metadata.contextWindow ?? metadata.contextWindowMax ?? 128_000,
-    contextWindowSource: metadata.contextWindow === undefined ? "estimated" : "declared",
+    contextWindowSource: live.contextWindow === undefined ? "estimated" : "declared",
     maxTokens: metadata.maxOutputTokens ?? 16_384,
-    maxOutputTokensSource: metadata.maxOutputTokens === undefined ? "estimated" : "declared",
+    maxOutputTokensSource: live.maxOutputTokens === undefined ? "estimated" : "declared",
     ...(metadata.mode === undefined ? {} : { mode: metadata.mode }),
     ...(metadata.contextWindowMax === undefined ? {} : { contextWindowMax: metadata.contextWindowMax }),
     ...(metadata.description === undefined ? {} : { description: metadata.description }),

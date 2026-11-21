@@ -1,4 +1,4 @@
-import { capabilityNames, publicModelNativeApi, publicModelRecommendedBackend, providerInterfaceProfiles } from "@joko/contracts";
+import { capabilityNames, publicModelNativeApi, publicModelRecommendedBackend, publicProviderModel, providerInterfaceProfiles } from "@joko/contracts";
 import { expect, it } from "vitest";
 import type { BackendView } from "./model.js";
 import { discoveredProviderModelInterface, providerModelInterfaceOptions, providerPresetRuntime, providerPresets, updateProviderPresetEndpoint } from "./provider-presets.js";
@@ -45,6 +45,8 @@ it("uses declared capabilities and advisory defaults without inferring an unrela
     api: "anthropic-messages", baseUrl: "https://api.kimi.com/coding"
   });
   expect(publicModelNativeApi("openai", "chatgpt/gpt-unlisted[1m]")).toBe("openai-responses");
+  expect(publicProviderModel("openai", "gpt-5.6-sol")).toMatchObject({ status: "active", baseDefaults: { maxOutputTokens: 128_000 } });
+  expect(publicProviderModel("openai", "chatgpt/gpt-5.6-sol[1m]")).toMatchObject({ status: "deprecated", defaults: { contextWindow: 1_000_000 } });
   expect(publicModelNativeApi("openai", "gpt-unlisted-audio", "audio_speech")).toBeUndefined();
   expect(publicModelNativeApi("anthropic", "claude-unlisted")).toBe("anthropic-messages");
   expect(publicModelNativeApi("xai", "grok-unlisted")).toBe("openai-responses");

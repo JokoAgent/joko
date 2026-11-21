@@ -86,6 +86,8 @@ export interface ModelPickerProps {
   readonly fastEnabled?: boolean;
   readonly useMorphPopover?: boolean;
   readonly retainCurrentSource?: boolean;
+  readonly taskGroups?: { readonly choices: readonly { readonly id: string; readonly name: string }[];
+    readonly selectedId?: string; readonly select: (id: string) => Promise<void> };
   readonly providerGroupUsage?: {
     readonly group: { readonly backendId: string; readonly providerId: string };
     readonly memberRoute?: { readonly backendId: string; readonly providerId: string };
@@ -138,6 +140,7 @@ export function ModelPicker({
   fastEnabled = true,
   useMorphPopover = false,
   providerGroupUsage,
+  taskGroups,
   retainCurrentSource = false
 }: ModelPickerProps): JSX.Element {
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -398,11 +401,11 @@ export function ModelPicker({
     rowRefs.current.get(activeRowKey)?.scrollIntoView?.({ block: "nearest" });
   }, [activeRowKey]);
 
-  const commitSelection = (selection: ModelPickerSelection | undefined): void => {
+  const commitChange = (select: () => void | Promise<void>): void => {
     if (selectionBusyRef.current) return;
     setSelectionError(false);
     let result: void | Promise<void>;
-    try { result = onSelect(selection); }
+    try { result = select(); }
     catch { setSelectionError(true); return; }
     if (result === undefined) { closeAfterSelection(); return; }
     const owner = ownerId;
@@ -412,6 +415,8 @@ export function ModelPicker({
       .catch(() => { if (favoriteOwnerRef.current === owner) setSelectionError(true); })
       .finally(() => { if (favoriteOwnerRef.current === owner) { selectionBusyRef.current = false; setSelectionBusy(false); } });
   };
+
+  const commitSelection = (selection: ModelPickerSelection | undefined): void => commitChange(() => onSelect(selection));
 
   const selectRow = (row: PickerRow): void => {
     if (!row.model.available) return;
@@ -598,6 +603,13 @@ export function ModelPicker({
         </nav>
         <div className="model-picker__content">
           {(favoriteError || selectionError) && <p className="inline-error" role="alert">{t(selectionError ? "modelPicker.selectionSaveFailed" : "modelPicker.favoriteSaveFailed")}</p>}
+          {taskGroups && taskGroups.choices.length > 0 && rail === "all" && query.trim() === "" && <select
+            className="model-picker__task-groups" aria-label={t("modelGroups.title")} value="" disabled={selectionBusy}
+            onKeyDown={event => { if (event.key !== "Escape") event.stopPropagation(); }}
+            onChange={event => { const id = event.target.value; if (id) commitChange(() => taskGroups.select(id)); }}>
+            <option value="" disabled>{taskGroups.choices.find(group => group.id === taskGroups.selectedId)?.name ?? t("modelGroups.title")}</option>
+            {taskGroups.choices.map(group => <option key={group.id} value={group.id}>{group.name}</option>)}
+          </select>}
           {allowDefault && query.trim() === "" && rail === "all" && <button
             type="button"
             className={cx("model-picker__default-row", value === undefined && "is-selected")}
