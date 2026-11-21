@@ -358,6 +358,7 @@ interface SessionRuntime {
   readonly pendingServerRequests: Map<string, PendingServerRequest>;
   readonly pendingMcpCalls: Set<PendingMcpCall>;
   readonly nativeTasks: CodexNativeTaskProjection;
+  readonly openMcpBridge?: CodexReadScope["openMcpBridge"];
   readonly mcp?: CodexMcpRuntimeLease;
   /** Local create isolated the native profile before the durable Session existed. */
   readonly mcpPending: boolean;
@@ -1576,13 +1577,14 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const mustReloadConfiguration = this.#hosted !== undefined || this.#nativeExecution !== undefined || nativeWebPolicy(context.nativeToolAuthorization?.snapshot?.() ?? context.policySnapshot) !== undefined
       || workingContextWindow !== undefined || managedRoute !== undefined || smartRoute !== undefined
       || (!inspection.scope.remote && (inspection.scope.openMcpBridge !== undefined || this.#resolveNativeSkills !== undefined))
+      || (inspection.scope.remote && current?.mcp !== undefined && inspection.scope.openMcpBridge !== undefined)
       || (inspection.scope.prepareNativeSkills !== undefined && this.#resolveNativeSkills !== undefined);
     if (mustReloadConfiguration) {
       if (inspection.thread.status?.["type"] === "active") {
         managedRoute?.dispose(); smartRoute?.dispose();
         throw smartRoute !== undefined ? smartRouteUnavailable(true)
           : managedRoute !== undefined ? managedRouteUnavailable(true)
-          : mcpUnavailable(false);
+          : mcpUnavailable(inspection.scope.remote);
       }
     }
     const mcpPending = deferLocalMcpUntilSessionCommit
@@ -1629,7 +1631,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         await mcp?.release().catch(() => undefined);
         throw smartRoute !== undefined ? smartRouteUnavailable(true)
           : managedRoute !== undefined ? managedRouteUnavailable(true)
-          : mcpUnavailable(false, true);
+          : mcpUnavailable(inspection.scope.remote, true);
       }
     }
     const response = await this.#resumeNativeThread(
@@ -4066,7 +4068,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       pathStyle: runtime.remote
         ? remoteWorkspacePathStyle(runtime.context.target.remoteWorkspace) ?? "posix"
         : nativeRuntimePathStyle(runtime.host),
-      ...(!runtime.remote && this.#localMcpBridge !== undefined ? { openMcpBridge: this.#localMcpBridge } : {}),
+      ...(runtime.openMcpBridge === undefined ? {} : { openMcpBridge: runtime.openMcpBridge }),
       ...(runtime.prepareNativeSkills === undefined ? {} : { prepareNativeSkills: runtime.prepareNativeSkills }),
       ...(runtime.assertRemoteShutdownCurrent === undefined ? {} : { assertRemoteShutdownCurrent: runtime.assertRemoteShutdownCurrent }),
       ...(runtime.openExecServerProcess === undefined ? {} : { openExecServerProcess: runtime.openExecServerProcess }),
@@ -5150,6 +5152,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       pendingServerRequests: new Map(),
       pendingMcpCalls: new Set(),
       nativeTasks,
+      ...(input.scope.openMcpBridge === undefined ? {} : { openMcpBridge: input.scope.openMcpBridge }),
       ...(input.mcp === undefined ? {} : { mcp: input.mcp }),
       mcpPending: input.mcpPending === true,
       workingContextWindow: typeof input.nativeConfiguration?.["model_context_window"] === "number"
