@@ -3931,7 +3931,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       // The published app-server validates the process selection on every input.
       // Only a Session-scoped configuration can make this placeholder routable.
       host = new AppServerHost({ ...launch, transport: { ...launch.transport,
-        ...(processOwner === undefined ? {} : { processOwner: { ...processOwner, recoverStale: false } }),
+        ...(processOwner === undefined || !("recoverStale" in processOwner)
+          ? {} : { processOwner: { ...processOwner, recoverStale: false } }),
         args: [...(launch.transport.args ?? []), ...(smart ? this.#smartLaunchArgs : []),
           "-c", `model_provider=${JSON.stringify(providerId)}`, "-c", `${prefix}.name=${JSON.stringify(providerId)}`,
           "-c", `${prefix}.base_url="http://127.0.0.1:0"`, "-c", `${prefix}.wire_api="responses"`]
