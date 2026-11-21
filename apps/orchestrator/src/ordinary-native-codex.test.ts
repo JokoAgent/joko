@@ -126,7 +126,7 @@ describe.skipIf(!binary)("ordinary actual Codex native execution", () => {
       expect(requests[2]?.history).toContain("FIRST NATIVE USER INPUT");
       expect(requests[2]?.history).toContain("SECOND MANAGED USER INPUT");
       expect(requests[2]?.history).toContain("THIRD NATIVE USER INPUT");
-      expect(store.listRuns({ sessionId }).map(row => row.descriptor.state)).toEqual(["succeeded", "succeeded", "succeeded"]);
+      expect(store.listRuns({ sessionId }).map(row => row.descriptor.state)).toEqual(["completed", "completed", "completed"]);
     } finally {
       try { if (host) await host.dispose(); else await adapter?.dispose(); }
       finally {

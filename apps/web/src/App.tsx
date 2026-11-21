@@ -50,6 +50,8 @@ import { TaskSharingInvitationDialog, TaskSharingNavigation } from "./components
 import { TaskSharingSession } from "./components/TaskSharingSession.js";
 import { offerTaskSharingInvitation, clearTaskSharingInvitation } from "./task-sharing-invitation.js";
 import { PortableSessionDialogHost, type PortableSessionImportRequest } from "./components/PortableSessionDialogHost.js";
+import { TaskCopyDialog } from "./components/TaskCopyDialog.js";
+import { taskCopySourceSupported } from "./task-copy-ui.js";
 import { authenticatedConnectionKey } from "./connection-owner.js";
 import type { PortableSessionImportOwner } from "./portable-session-import-connection.js";
 import { PortableSessionDropTarget } from "./components/PortableSessionDropTarget.js";
@@ -356,6 +358,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const [focusedSplitSessionId, setFocusedSplitSessionId] = useState<string>();
   const [splitMessageForks, setSplitMessageForks] = useState<readonly SplitMessageFork[]>([]);
   const [portableExportSession, setPortableExportSession] = useState<SessionView>();
+  const [taskCopyRequest, setTaskCopyRequest] = useState<{ readonly owner: string; readonly session: SessionView }>();
   const [snoozeRequest, setSnoozeRequest] = useState<{ readonly owner: string; readonly sessionId: string }>();
   const [portableImportRequest, setPortableImportRequest] = useState<PortableSessionImportRequest>();
   const portableImportOwner = useMemo<PortableSessionImportOwner | undefined>(() => connectionOwner === undefined ? undefined : {
@@ -2991,6 +2994,11 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         defaultTargetId={settingsTargetIdRef.current}
         worktreeSupportedTargetIds={portableWorktreeTargetIds}
         onCloseExport={() => setPortableExportSession(undefined)}
+        onCopyToNode={controller.taskCopy && portableExportSession && taskCopySourceSupported(portableExportSession, state.snapshot)
+          ? () => {
+            setTaskCopyRequest({ owner: controller.taskCopy!.owner, session: portableExportSession });
+            setPortableExportSession(undefined);
+          } : undefined}
         onCloseImport={(requestId) => setPortableImportRequest(current => current?.id === requestId ? undefined : current)}
         onExported={(fidelity, status) => setLayoutNotice(t(status === "dispatched"
           ? fidelity === "full" ? "portable.downloadRequested"
@@ -3002,6 +3010,14 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           controller.navigate({ kind: "session", sessionId });
         }}
       />
+      {controller.taskCopy && taskCopyRequest && taskCopyRequest.owner === controller.taskCopy.owner && <TaskCopyDialog
+        key={JSON.stringify([taskCopyRequest.owner, taskCopyRequest.session.id, taskCopyRequest.session.generation.toString()])}
+        api={controller.taskCopy}
+        session={taskCopyRequest.session}
+        t={t}
+        onClose={() => setTaskCopyRequest(undefined)}
+        openTask={controller.openMachineSession}
+      />}
       {!auxiliaryApplicationWindow && <TaskSharingInvitationDialog controller={controller} t={t} />}
       {portableImportTargets.length > 0 && <PortableSessionDropTarget
         label={t("portable.importEntryBody")}

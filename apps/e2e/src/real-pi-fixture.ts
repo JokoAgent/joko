@@ -57,6 +57,7 @@ export interface RealPiSystemFixtureOptions {
   readonly rootDirectory?: string;
   readonly keepRoot?: boolean;
   readonly webDirectory?: string;
+  readonly corsOrigins?: readonly string[];
   readonly externalBrowserExecutable?: string;
   readonly port?: number;
   /** Give shared-task invitations the exact loopback server origin. */
@@ -232,7 +233,7 @@ export class RealPiSystemFixture {
         ...(options.externalBrowserExecutable === undefined ? {} : {
           browser: { executablePath: options.externalBrowserExecutable, headless: false }
         }),
-        corsOrigins: []
+        corsOrigins: options.corsOrigins ?? []
       };
       application = await createOrchestratorApplication(config, {
         ...(options.agentImportSources === undefined ? {} : { agentImportSources: options.agentImportSources }),

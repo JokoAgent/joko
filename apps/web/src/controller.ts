@@ -13,6 +13,7 @@ import type { NativeTaskStatusCompletionSource } from "./native-task-status-comp
 import { nativeTaskStatusAvatar } from "./native-task-status-avatar.js";
 import { readDesktopMenuBarUsage, type DesktopMenuBarSource, type DesktopMenuBarUsage } from "./desktop-menu-bar.js";
 import { bindPortableSessionImportApi } from "./portable-session-import-connection.js";
+import { copyPortableTask, taskCopyDestination, taskCopySourceSupported, type TaskCopyApi, type TaskCopyChannel, type TaskCopySelection } from "./task-copy-ui.js";
 import { bindExtensionSettingsOperationJournal, extensionSettingsProfileKey } from "./extension-settings-operation.js";
 import type { AppDefaultModelUiPort } from "./app-default-model-ui.js";
 import type { SessionAccess, TaskSource } from "./task-sharing.js";
@@ -309,6 +310,7 @@ export interface AppController extends OperationApi {
   isMachineRouteHandoffPending?(): boolean;
   openMachineCatalog(profileId: string, tab: "extensions" | "skills", signal?: AbortSignal): Promise<boolean>;
   openMachineSession(profileId: string, sessionId: string, messageTarget?: MachineSessionMessageTarget): Promise<void>;
+  readonly taskCopy?: TaskCopyApi;
   refreshPartnerSource?(sourceKey: string): Promise<void>;
   openSourcePartner?(sourceKey: string, partnerId: string, destination: "session" | "settings" | "preparation"): Promise<void>;
   readSourcePartnerAvatar?(sourceKey: string, partnerId: string, revision: bigint, image: import("./partner-avatar.js").PartnerAvatarImageView, signal: AbortSignal): Promise<string>;
@@ -3043,6 +3045,99 @@ export function useAppController(): AppController {
     artifactGateway !== undefined && gatewayRef.current === artifactGateway
       && gatewayGenerationRef.current === linkGatewayGeneration && connectionStateRef.current === "connected"
   ), [artifactGateway, linkGatewayGeneration]);
+  const taskCopy = useMemo<TaskCopyApi | undefined>(() => {
+    const profile = state.activeProfile;
+    if (!profile || state.connectionState !== "connected" || state.sessionAccess !== undefined || !artifactGateway?.taskCopyChannel) return undefined;
+    const sourceGateway = artifactGateway;
+    const sourceKey = remoteMachineProfileKey(profile);
+    const machines = state.profiles.filter(candidate => candidate.serverId !== profile.serverId && !machineCacheRevoked(candidate));
+    if (!machines.length) return undefined;
+    const assertSource = () => {
+      const selected = activeProfileRef.current;
+      if (gatewayRef.current !== artifactGateway || gatewayGenerationRef.current !== linkGatewayGeneration
+        || connectionStateRef.current !== "connected" || !selected || remoteMachineProfileKey(selected) !== sourceKey) {
+        throw new Error("The original task copy connection changed.");
+      }
+    };
+    const assertTask = (session: Pick<import("./model.js").SessionView, "id" | "generation">) => {
+      assertSource();
+      const snapshot = snapshotRef.current;
+      const task = snapshot.sessions.find(candidate => candidate.id === session.id && candidate.generation === session.generation);
+      if (!task || !taskCopySourceSupported(task, snapshot)) throw new Error("The original task or its workspace is no longer available for copying.");
+    };
+    async function withDestination<T>(selection: TaskCopySelection, signal: AbortSignal,
+      action: (source: TaskCopyChannel, destination: TaskCopyChannel, current: () => void) => Promise<T>): Promise<T> {
+      const target = selection.profile;
+      const authority = machineCacheAuthorityRef.current.get(target.id);
+      const source = sourceGateway.taskCopyChannel!(signal);
+      const current = () => {
+        source.signal.throwIfAborted();
+        assertSource();
+        if (profile?.serverId === target.serverId || !currentMachineCacheOwner(target, authority) || machineCacheRevoked(target)) {
+          throw new Error("The selected destination node is no longer paired.");
+        }
+      };
+      current();
+      const local = requireLocal(localRef.current);
+      await local.loadEndpointTransport(target);
+      current();
+      rememberEndpointTrust(target);
+      const identity = await probeOrchestratorOrigin(target.origin, AbortSignal.any([source.signal, AbortSignal.timeout(15_000)]));
+      current();
+      if (identity.serverId !== target.serverId) throw new Error("The selected address belongs to a different Joko node.");
+      const authKey = await local.readAuthKey(target);
+      current();
+      if (authKey === undefined) throw new Error("The destination's saved connection is unavailable. Pair it again.");
+      const gateway = createOrchestratorGateway(target, authKey, {});
+      const stop = () => gateway.disconnect();
+      source.signal.addEventListener("abort", stop, { once: true });
+      try {
+        await gateway.connect({ snapshotOnly: true });
+        current();
+        return await action(source, gateway.taskCopyChannel!(source.signal), current);
+      } finally {
+        source.signal.removeEventListener("abort", stop);
+        gateway.disconnect();
+      }
+    }
+    return {
+      owner: JSON.stringify([sourceKey, linkGatewayGeneration]),
+      machines,
+      async loadDestination(profileId, task, signal) {
+        assertTask(task);
+        const target = machines.find(candidate => candidate.id === profileId);
+        if (!target) throw new Error("Choose a saved destination node.");
+        const snapshot = await loadMachineSnapshot(target);
+        signal.throwIfAborted();
+        assertTask(task);
+        return taskCopyDestination(target, snapshot, task);
+      },
+      async copy(selection, task, operationId, signal, onPhase) {
+        assertSource();
+        return withDestination(selection, signal, (source, destination, assertCurrent) => copyPortableTask({
+          operationId, source: task, selection, sourceProfile: profile, sourceChannel: source, destination, assertCurrent, onPhase,
+          assertTask: () => assertTask(task),
+          cancelSource: (grant) => {
+            try {
+              const channel = artifactGateway.taskCopyChannel!(AbortSignal.timeout(10_000));
+              void channel.portable.cancelPortableTaskCopy({ operationId, transferId: grant.transferId }, { signal: channel.signal }).catch(() => undefined);
+            } catch { /* The original source grant also expires automatically. */ }
+          }
+        }));
+      },
+      async receipt(selection, operationId, signal) {
+        return withDestination(selection, signal, async (_source, destination, current) => {
+          const result = await destination.portable.getPortableTaskCopyReceipt({ operationId }, { signal: destination.signal, timeoutMs: 15_000 });
+          current();
+          if (result.receipt && (result.receipt.operationId !== operationId || !result.receipt.task)) {
+            throw new Error("The destination returned an invalid task copy receipt.");
+          }
+          return result.receipt;
+        });
+      }
+    };
+  }, [state.activeProfile, state.connectionState, state.profiles, state.sessionAccess, artifactGateway, linkGatewayGeneration,
+    currentMachineCacheOwner, loadMachineSnapshot, machineCacheRevoked]);
   const catalogGateway = useCallback((): OrchestratorGateway => {
     if (artifactGateway === undefined || gatewayRef.current !== artifactGateway
       || gatewayGenerationRef.current !== linkGatewayGeneration || connectionStateRef.current !== "connected") {
@@ -3984,6 +4079,7 @@ export function useAppController(): AppController {
     isMachineRouteHandoffPending: () => machineRouteHandoffRef.current?.isCurrent() === true,
     openMachineCatalog,
     openMachineSession,
+    taskCopy,
     openSourcePartner,
     refreshPartnerSource: (sourceKey) => partnerDirectoryRef.current!.refresh(sourceKey),
     readSourcePartnerAvatar: (sourceKey, partnerId, revision, image, signal) => partnerDirectoryRef.current!.readAvatar(sourceKey, partnerId, revision, image, signal),
@@ -4830,7 +4926,7 @@ export function useAppController(): AppController {
     openArtifactFile,
     openArtifactFileWithApplication,
     revealArtifactSource
-}), [portableImportApi, catalogGateway, taskGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, previewProviderModels, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, readPendingMessageFork, forkMessage, messageEditDrafts, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, downloadWorkspaceDirectory, exportSession, exportPortableSession, getArtifactUrl, acquireArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, readTaskProviderGroupUsage, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setTerminalFamily, setTerminalSize, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
+}), [portableImportApi, taskCopy, catalogGateway, taskGateway, modelPriceApi, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, previewProviderModels, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, readPendingMessageFork, forkMessage, messageEditDrafts, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, downloadWorkspaceDirectory, exportSession, exportPortableSession, getArtifactUrl, acquireArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, readTaskProviderGroupUsage, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setTerminalFamily, setTerminalSize, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {

@@ -336,7 +336,8 @@ import {
   type InteractionDecisionSubmission,
   type InteractionQuestionAnswerSubmission,
   type SessionHost,
-  type SessionRuntimeActivityKind
+  type SessionRuntimeActivityKind,
+  TaskCopySourceUnavailableError
 } from "./session-host.js";
 import type { ScheduleCoordinator } from "./schedule-coordinator.js";
 import {
@@ -504,6 +505,7 @@ import { createObjectiveConnectService } from "./objective-connect-service.js";
 import type { ManagedModelRuntimeRegistry } from "./managed-model-runtime-registry.js";
 import { PortableSessionPackageError } from "./portable-session-package.js";
 import { PORTABLE_IMPORT_DRAFT_TTL_MS, PortableSessionExportTooLargeError } from "./portable-session-transfer.js";
+import { TaskCopyHost, type PreparedTaskCopy, type TaskCopyReceipt } from "./task-copy-host.js";
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
 import type { RemoteBackendRuntimeSetupManager } from "./remote-backend-runtime-setup.js";
 import { createVoiceInputConnectService } from "./voice-input-connect-service.js";
@@ -660,6 +662,7 @@ export interface ConnectServiceDependencies {
   readonly nativeMemoryStatuses: Map<string, NativeMemoryStatusObservation>;
   readonly nativeMemoryStatusEpochs: Map<string, bigint>;
   readonly managedWorkspaceRoot?: string;
+  readonly taskCopy?: TaskCopyHost;
   /** Public, credential-free LAN bootstrap projection. */
   readonly discoveredNodes?: () => readonly DiscoveredNodeRecord[];
   readonly server?: {
@@ -940,6 +943,7 @@ function toConnectError(error: unknown): ConnectError {
   }
   if (error instanceof OperationInProgressError) return new ConnectError(error.message, Code.Aborted);
   if (error instanceof InvalidStateTransitionError) return new ConnectError(error.message, Code.FailedPrecondition);
+  if (error instanceof TaskCopySourceUnavailableError) return new ConnectError(error.message, Code.FailedPrecondition);
   if (error instanceof UsageReportQueryError) return new ConnectError(error.message, Code.InvalidArgument);
   if (error instanceof UsageReportCapacityError) return new ConnectError(error.message, Code.ResourceExhausted);
   if (error instanceof ResourceUsageReportQueryError) return new ConnectError(error.message, Code.InvalidArgument);
@@ -1340,7 +1344,20 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.PiService, withConnectErrors(services.pi));
 }
 
+const taskCopyHosts = new WeakMap<OrchestratorApplication, TaskCopyHost>();
+
 export function createConnectServices(application: OrchestratorApplication, projectionShutdownSignal?: AbortSignal): ConnectServiceSet {
+  let taskCopy = taskCopyHosts.get(application);
+  if (taskCopy === undefined && application.config.dataDirectory !== undefined) {
+    taskCopy = new TaskCopyHost({
+      store: application.store, host: application.sessionHost, connections: application.connections, artifacts: application.artifacts,
+      dataDirectory: application.config.dataDirectory, serverId: application.serverId, applicationVersion: "0.1.0",
+      allowInsecureLoopback: application.config.allowInsecureLoopback, allowInsecureLan: application.config.allowInsecureLan
+    });
+    const owner = taskCopy;
+    taskCopyHosts.set(application, owner);
+    application.registerServiceCleanup?.(() => owner.close());
+  }
   const providerLoginFlows = new Map<string, NativeProviderLoginFlow>();
   const providerLoginEvidence = new Map<string, BackendProviderAuthenticationEvidence>();
   const backendProviderLoginFlows = new Map<string, BackendProviderLoginFlow>();
@@ -1483,6 +1500,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     nativeMemoryStatuses,
     nativeMemoryStatusEpochs,
     ...(application.config.dataDirectory === undefined ? {} : { managedWorkspaceRoot: join(application.config.dataDirectory, "managed-workspaces") }),
+    ...(taskCopy === undefined ? {} : { taskCopy }),
     browserActivities: () => application.browserActivity,
     ...(application.lanDiscovery === undefined ? {} : { discoveredNodes: () => application.lanDiscovery.list() }),
     generation: RUNTIME_GENERATION,
@@ -3243,6 +3261,55 @@ export function createConnectServices(application: OrchestratorApplication, proj
   } satisfies ServiceImpl<typeof contract.SessionService>;
 
   const portableSession = {
+    preparePortableTaskCopy: async (request, context) => {
+      const connection = authenticate(context);
+      const owner = requiredTaskCopyHost(dependencies);
+      try {
+        const grant = await owner.prepare({ operationId: request.operationId, sessionId: request.sessionId,
+          generation: Number(request.expectedSessionGeneration), destinationServerId: request.destinationServerId }, stableConnection(connection), context.signal);
+        return { grant: protoTaskCopyGrant(grant) };
+      } catch (error) { throw toConnectError(error); }
+    },
+    readPortableTaskCopy: async function* (request, context) {
+      const authorization = context.requestHeader.get("authorization");
+      if (!authorization) throw new ConnectError("Task copy authorization is required.", Code.Unauthenticated);
+      const owner = requiredTaskCopyHost(dependencies);
+      const part = request.part === contract.PortableTaskCopyPartKind.SESSION ? "session"
+        : request.part === contract.PortableTaskCopyPartKind.WORKSPACE ? "workspace" : undefined;
+      if (!part) throw invalidArgument("Choose one task copy part.");
+      try {
+        for await (const chunk of owner.read({ transferId: request.transferId, operationId: request.operationId,
+          destinationServerId: request.destinationServerId, part, authorization, signal: context.signal })) {
+          yield chunk;
+        }
+      } catch (error) { throw toConnectError(error); }
+    },
+    cancelPortableTaskCopy: (request, context) => {
+      const connection = authenticate(context);
+      return { cancelled: requiredTaskCopyHost(dependencies).cancel(request.transferId, request.operationId, stableConnection(connection)) };
+    },
+    importPortableTaskCopy: async (request, context) => {
+      const connection = authenticate(context);
+      const owner = requiredTaskCopyHost(dependencies);
+      if ((request.parentTargetId === undefined) !== (request.expectedParentRevision === undefined)) {
+        throw invalidArgument("The selected destination project requires its revision.");
+      }
+      try {
+        const receipt = await owner.receive({ grant: coreTaskCopyGrant(request.grant), sourceOrigin: request.sourceOrigin,
+          ...(request.sourceInvitation === undefined ? {} : { sourceInvitation: request.sourceInvitation }),
+          backendId: request.backendId,
+          ...(request.parentTargetId === undefined ? {} : {
+            parentTarget: { id: request.parentTargetId, revision: request.expectedParentRevision!.value }
+          })
+        }, stableConnection(connection), context.signal);
+        return { receipt: protoTaskCopyReceipt(receipt) };
+      } catch (error) { throw toConnectError(error); }
+    },
+    getPortableTaskCopyReceipt: (request, context) => {
+      const connection = authenticate(context);
+      const receipt = requiredTaskCopyHost(dependencies).receipt(request.operationId, stableConnection(connection));
+      return receipt ? { receipt: protoTaskCopyReceipt(receipt) } : {};
+    },
     exportPortableSession: async (request, context) => {
       const connection = authenticate(context);
       const assertCurrent = () => { context.signal.throwIfAborted(); dependencies.connections.fence(connection); };
@@ -25558,6 +25625,51 @@ function requiredCorePermission(value: contract.PermissionMode, field: string): 
     && value !== contract.PermissionMode.BYPASS_PERMISSIONS
   ) throw invalidArgument(`${field} is required`);
   return corePermission(value);
+}
+
+function requiredTaskCopyHost(dependencies: ConnectServiceDependencies): TaskCopyHost {
+  if (dependencies.taskCopy === undefined) throw new ConnectError("Direct task copy is unavailable on this node.", Code.Unimplemented);
+  return dependencies.taskCopy;
+}
+
+function protoTaskCopyGrant(value: PreparedTaskCopy): contract.PortableTaskCopyGrant {
+  return create(contract.PortableTaskCopyGrantSchema, {
+    transferId: value.transferId, readSecret: new Uint8Array(value.secret), operationId: value.operationId,
+    sourceServerId: value.sourceServerId, destinationServerId: value.destinationServerId, sourceSessionId: value.sourceSessionId,
+    sourceSessionGeneration: BigInt(value.sourceSessionGeneration), expiresAt: toProtoTimestamp(value.expiresAt),
+    sessionPackage: create(contract.PortableTaskCopyPartSchema, { sha256: value.sessionPackage.sha256, size: BigInt(value.sessionPackage.size) }),
+    workspaceArchive: create(contract.PortableTaskCopyPartSchema, { sha256: value.workspaceArchive.sha256, size: BigInt(value.workspaceArchive.size) }),
+    sourceTitle: value.title, sourceBackendId: value.backendId,
+    sourceWorkspaceKind: value.managed ? contract.WorkspaceKind.MANAGED_DIALOGUE : contract.WorkspaceKind.USER_PROJECT
+  });
+}
+
+function coreTaskCopyGrant(value: contract.PortableTaskCopyGrant | undefined): PreparedTaskCopy {
+  if (!value?.sessionPackage || !value.workspaceArchive || !value.expiresAt
+    || value.sourceWorkspaceKind !== contract.WorkspaceKind.USER_PROJECT && value.sourceWorkspaceKind !== contract.WorkspaceKind.MANAGED_DIALOGUE) {
+    throw invalidArgument("The source task copy grant is required.");
+  }
+  return {
+    transferId: value.transferId, secret: value.readSecret, operationId: value.operationId,
+    sourceServerId: value.sourceServerId, destinationServerId: value.destinationServerId, sourceSessionId: value.sourceSessionId,
+    sourceSessionGeneration: Number(value.sourceSessionGeneration), expiresAt: fromProtoTimestamp(value.expiresAt, "grant.expires_at")!,
+    sessionPackage: { sha256: value.sessionPackage.sha256, size: Number(value.sessionPackage.size) },
+    workspaceArchive: { sha256: value.workspaceArchive.sha256, size: Number(value.workspaceArchive.size) },
+    title: value.sourceTitle, backendId: value.sourceBackendId, managed: value.sourceWorkspaceKind === contract.WorkspaceKind.MANAGED_DIALOGUE
+  };
+}
+
+function protoTaskCopyReceipt(value: TaskCopyReceipt): contract.PortableTaskCopyReceipt {
+  const task = value.task;
+  return create(contract.PortableTaskCopyReceiptSchema, {
+    operationId: value.operationId, targetId: value.targetId,
+    task: create(contract.PortableSessionImportResultSchema, { sessionId: task.sessionId, fidelity: protoPortableSessionFidelity(task.fidelity), messageCount: BigInt(task.messageCount),
+      mediaCount: BigInt(task.mediaCount), workerCount: BigInt(task.workerCount), replacedSessionIds: [...task.replacedSessionIds],
+      status: protoPortableSessionImportStatus(task.status),
+      ...(task.activationError === undefined ? {} : { activationError: mapErrorToProto(task.activationError) }) }),
+    skippedFileCount: BigInt(value.workspace.skippedCount),
+    skippedFiles: value.workspace.skipped.map(file => create(contract.PortableTaskCopySkippedFileSchema, { relativePath: file.path, reason: file.reason }))
+  });
 }
 
 function protoPortableSessionFidelity(

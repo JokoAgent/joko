@@ -6,6 +6,7 @@ import { DocumentPathError, type DocumentPathAuthorizer } from "@joko/tool-docum
 import { DOCUMENT_TOOL_PROVIDER_ID } from "./document-tool-provider.js";
 import { prepareWorkerRuntimeWorkspace, readWorkerWorkspaceBinding, workerPathWithin, workerWorkspaceTarget, WORKER_WORKSPACE_BINDING_KEY, createSideChatWorkspaceReference,
   type WorkerWorkspacePlan } from "./collaboration-worker-workspace.js";
+import { copyableWorkerStatus, publishTaskCopyGoal, type CopiedWorker, type TaskCopyImportRole } from "./task-copy-group.js";
 import type { McpAppMessageGuard } from "./mcp-apps/message.js";
 import type { McpAppModelContext } from "./mcp-apps/host.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -728,6 +729,9 @@ export interface ExportPortableSessionInput {
   readonly password?: string;
   readonly excludeMedia?: boolean;
   readonly applicationVersion?: string;
+  readonly expiresAt?: number;
+  /** An internal task-copy source fence has approved this exact local root. */
+  readonly taskCopyRoot?: string;
 }
 
 export interface ExportPortableSessionResult extends Omit<PortableSessionExportBuild, "bytes"> {
@@ -752,6 +756,9 @@ export interface ImportPortableSessionInput {
   readonly planMode: boolean;
   readonly overwrite: boolean;
   readonly worktree?: { readonly sourceRef?: string; readonly refreshRemote: boolean };
+  /** Private node-to-node import. The public file-import APIs cannot assign worker ownership. */
+  readonly taskCopy?: TaskCopyImportRole;
+  readonly assertTaskCopyCurrent?: () => void;
 }
 
 export interface ImportPortableSessionResult {
@@ -956,6 +963,8 @@ export interface BackendProviderAuthenticationRetirement {
   readonly providerId: string;
   readonly retirementToken: symbol;
 }
+
+export class TaskCopySourceUnavailableError extends Error {}
 
 export class SessionHost {
   readonly #store: OperationalStore;
@@ -9417,6 +9426,106 @@ export class SessionHost {
     }
   }
 
+  captureTaskCopySource(sessionId: string, expectedGeneration: number) {
+    const session = this.#store.getSession(sessionId).descriptor;
+    if (session.hidden || session.archived || session.deletedAt !== undefined || session.remoteWorkspace !== undefined
+      || session.automationOrigin !== undefined || session.derivationOrigin?.sideChat || this.isReviewReadOnlySession(sessionId)
+      || this.#store.sessionCreationServiceKind(sessionId) !== undefined || this.#partnerSessionPolicy(sessionId) !== undefined
+      || this.#store.findCollaborationWorkerBySession(sessionId) !== undefined || this.#store.findSessionRuntimePolicy(sessionId) !== undefined
+      || readPersonalDevelopmentPurpose(this.#store, sessionId) !== undefined) {
+      throw new TaskCopySourceUnavailableError("Choose an ordinary local task to copy to another node.");
+    }
+    const busy = (id: string) => this.#store.listRuns({ sessionId: id, activeOnly: true, limit: 1 }).length > 0
+      || this.#store.listQueueItems({ sessionId: id, states: ["accepted", "dispatching", "backend_accepted", "dispatch_unknown"], limit: 1 }).length > 0
+      || this.#store.findPendingSessionLifecycleCleanup(id) !== undefined || this.#sessionLifecycleFences.has(id)
+      || this.#closeIfActiveFlights.has(id) || this.#runtimeRestartFences.has(id) || this.#sessionResetLocks.has(id);
+    const capture = (row: SessionDescriptor, generation: number) => {
+      const target = this.targetForSession(this.#store.getSession(row.id));
+      const revision = this.#store.getTarget(row.targetId).revision;
+      if (target.remoteWorkspace || row.remoteWorkspace || row.deletedAt !== undefined || !target.trusted) {
+        throw new TaskCopySourceUnavailableError("The task and each worker must use an approved local workspace.");
+      }
+      const assertIdle = (): void => {
+        if (busy(row.id)) throw new TaskCopySourceUnavailableError("Wait until the original task, its workers, and their input queues are idle.");
+      };
+      assertIdle();
+      const active = row.archived ? undefined : this.captureToolWorkspace({ sessionId: row.id, targetId: row.targetId, generation });
+      const assertCurrent = () => {
+        active?.assertCurrent();
+        const current = this.#store.getSession(row.id);
+        if (current.descriptor.binding.generation !== generation || current.descriptor.binding.opaqueRef !== row.binding.opaqueRef
+          || current.descriptor.archived !== row.archived || current.descriptor.deletedAt !== undefined
+          || this.#store.getTarget(row.targetId).revision !== revision || this.targetForSession(current).workspaceRoot !== target.workspaceRoot
+          || (row.archived && row.worktree !== undefined && this.#worktrees?.activeWorkspacePath(row.id, row.worktree) !== target.workspaceRoot)) {
+          throw new TaskCopySourceUnavailableError("The original task copy workspace changed.");
+        }
+        assertIdle();
+      };
+      assertCurrent();
+      assertProtectedNativeExport(this.#store, row);
+      return { sessionId: row.id, root: target.workspaceRoot, title: row.title, backendId: row.backendId, managed: target.managed, assertCurrent };
+    };
+    const lead = capture(session, expectedGeneration);
+    const goal = this.#store.findActiveCollaborationGoalByLeadSession(sessionId);
+    if (goal && goal.sessionGeneration !== expectedGeneration) throw new TaskCopySourceUnavailableError("The active collaboration Goal changed.");
+    const sourceWorkers = goal === undefined ? [] : this.#store.listCollaborationWorkers({ goalId: goal.id, includeArchived: true });
+    const byId = new Map(sourceWorkers.map(worker => [worker.id, worker]));
+    const positioned = new Map<string, number>();
+    const visiting = new Set<string>();
+    const workers: { readonly source: ReturnType<typeof capture>; readonly values: Omit<CopiedWorker, "workspace">; readonly verify: () => void }[] = [];
+    const addWorker = (id: string): number => {
+      const previous = positioned.get(id);
+      if (previous !== undefined) return previous;
+      const worker = byId.get(id);
+      if (!worker?.sessionId || worker.sessionGeneration === undefined || !copyableWorkerStatus(worker.status) || visiting.has(id)) {
+        throw new TaskCopySourceUnavailableError("A collaboration worker is busy or its original local task is unavailable.");
+      }
+      visiting.add(id);
+      const parent = worker.parentWorkerId === undefined ? undefined : addWorker(worker.parentWorkerId);
+      const source = capture(this.#store.getSession(worker.sessionId).descriptor, worker.sessionGeneration);
+      const verify = () => {
+        if (this.#store.getCollaborationWorker(id).revision !== worker.revision) throw new TaskCopySourceUnavailableError("The original collaboration worker changed.");
+        source.assertCurrent();
+      };
+      const index = workers.length;
+      workers.push({ source, verify, values: { backendId: source.backendId, managed: source.managed, parent, label: worker.label, role: worker.role,
+        assignment: worker.assignment, status: worker.status } });
+      positioned.set(id, index);
+      visiting.delete(id);
+      return index;
+    };
+    if (sourceWorkers.length > 128) throw new TaskCopySourceUnavailableError("The collaboration Goal contains too many workers to copy.");
+    for (const worker of sourceWorkers) addWorker(worker.id);
+    const groupIds = new Set([lead.sessionId, ...workers.map(worker => worker.source.sessionId)]);
+    const roots = [lead.root, ...workers.map(worker => worker.source.root)];
+    const otherWorktrees = this.#store.listSessions({ includeArchived: true }).flatMap(({ descriptor: other }) => {
+      if (groupIds.has(other.id) || !other.worktree || other.worktree.remote !== undefined) return [];
+      const current = this.#worktrees?.activeWorkspacePath(other.id, other.worktree);
+      return current ? [current] : [];
+    });
+    const excludedRoots = (root: string) => [...otherWorktrees, ...roots].filter(path => path !== root && workerPathWithin(root, path));
+    const assertCurrent = () => {
+      lead.assertCurrent();
+      const current = this.#store.findActiveCollaborationGoalByLeadSession(sessionId);
+      if (current?.id !== goal?.id || current?.revision !== goal?.revision) throw new TaskCopySourceUnavailableError("The original collaboration Goal changed.");
+      for (const worker of workers) worker.verify();
+    };
+    const assertWorkspaceIdle = () => {
+      assertCurrent();
+      for (const other of this.#store.listSessions()) {
+        if (groupIds.has(other.descriptor.id) || other.descriptor.remoteWorkspace !== undefined || !busy(other.descriptor.id)) continue;
+        const root = this.targetForSession(other).workspaceRoot;
+        if (roots.some(candidate => (workerPathWithin(candidate, root) || workerPathWithin(root, candidate))
+          && !excludedRoots(candidate).some(excluded => workerPathWithin(excluded, root)))) {
+          throw new TaskCopySourceUnavailableError("Another task is using the source workspace.");
+        }
+      }
+    };
+    assertWorkspaceIdle();
+    return { lead, goal: goal === undefined ? undefined : { title: goal.title, objective: goal.objective, maximumWorkers: goal.maximumWorkers },
+      workers, excludedRoots, assertCurrent, assertWorkspaceIdle };
+  }
+
   /**
    * Builds a portable task package. The package is materialized as an
    * authenticated Artifact; neither a service path nor the transient password
@@ -9432,6 +9541,10 @@ export class SessionHost {
     const backend = this.#store.getBackend(stored.descriptor.backendId).descriptor;
     const capability = backend.capabilities.get(capabilityNames.sessionPortableTransfer);
     const target = this.#store.getTarget(stored.descriptor.targetId);
+    const canReadDetached = (source: StoredSession, candidate: StoredTarget) => input.taskCopyRoot === undefined
+      ? this.canReadStoredPortableSession(source, candidate)
+      : assertConnectionCurrent !== undefined && candidate.descriptor.remoteWorkspace === undefined
+        && source.descriptor.remoteWorkspace === undefined && this.targetForSession(source).workspaceRoot === input.taskCopyRoot;
     if (!supportsNativeStartNavigation(capability, target.descriptor) || adapter.exportPortableNativeSession === undefined) {
       throw new JokoError({
         code: "PORTABLE_SESSION_EXPORT_UNSUPPORTED",
@@ -9457,7 +9570,7 @@ export class SessionHost {
           || latest.descriptor.archived !== source.descriptor.archived || latest.descriptor.deletedAt !== undefined
           || !sameNativeBinding(latest.descriptor.binding, binding) || latestTarget.revision !== target.revision
           || this.#store.findLatestNativeSessionChange(sessionId)?.id !== nativeMarkerId
-          || (readingDetached && !this.canReadStoredPortableSession(latest, latestTarget))
+          || (readingDetached && !canReadDetached(latest, latestTarget))
           || this.#store.findPendingSessionLifecycleCleanup(sessionId) !== undefined || this.#sessionLifecycleFences.has(sessionId)
           || this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined
           || this.#store.findPendingContextRebuild(sessionId) !== undefined || this.#sessionResetLocks.has(sessionId)
@@ -9479,14 +9592,15 @@ export class SessionHost {
       };
     };
     const readStored = adapter.readStoredPortableNativeSession;
-    if (readStored !== undefined && this.canReadStoredPortableSession(stored, target)) {
+    if (readStored !== undefined && canReadDetached(stored, target)) {
       const { backendId, id: sessionId, binding } = stored.descriptor;
       const assertCurrent = exportSourceFence(stored, target, this.requireAdapterGeneration(backendId, adapter), true);
       assertCurrent();
       const release = this.registerBackendSideEffectFlight(backendId, sessionId);
       try {
         const nativeSession = await readStored.call(adapter, {
-          target: { ...target.descriptor, backendId }, binding, assertCurrent
+          target: { ...target.descriptor, backendId,
+            ...(input.taskCopyRoot === undefined ? {} : { workspaceRoot: input.taskCopyRoot }) }, binding, assertCurrent
         });
         assertCurrent();
         return await this.buildPortableTaskArtifact(input, stored, nativeSession, assertCurrent);
@@ -9495,6 +9609,7 @@ export class SessionHost {
       }
     }
 
+    if (input.taskCopyRoot !== undefined) throw new StoreError("This runtime cannot copy its stored task without starting the original session.");
     assertConnectionCurrent?.();
     const active = await this.activate(input.sessionId);
     const lease = this.beginActiveBackendSideEffect(input.sessionId, active);
@@ -9631,6 +9746,7 @@ export class SessionHost {
     const storedArtifact = await this.#artifactStore.ingestBytes(built.bytes, {
       fileName: `${portableFileStem(current.descriptor.title)}.jshare`,
       mimeType: "application/vnd.joko.session",
+      expiresAt: input.expiresAt,
       assertCurrent
     });
     assertCurrent();
@@ -9656,6 +9772,14 @@ export class SessionHost {
     input: ImportPortableSessionInput
   ): Promise<OperationExecution<ImportPortableSessionResult>> {
     return this.importPortableSessionPrepared(input);
+  }
+
+  readPortableTaskCopyReceipt(operationId: string, connection: ConnectionRecord): ImportPortableSessionResult | undefined {
+    this.#store.authorizeConnection(connection.id, connection.authKeyDigest);
+    const operation = this.#store.findOperation<ImportPortableSessionResult>(operationId);
+    if (!operation || operation.connectionId !== connection.id || operation.kind !== "import_portable_session"
+      || operation.status !== "completed" || !operation.response) return undefined;
+    return this.portableImportExecutionWithActivation({ replayed: true, operation, value: operation.response }).value;
   }
 
   /**
@@ -12690,6 +12814,7 @@ export class SessionHost {
     input: ImportPortableSessionInput,
     preparedDraft?: PreparedPortableSessionImport
   ): Promise<OperationExecution<ImportPortableSessionResult>> {
+    input.assertTaskCopyCurrent?.();
     const logicalBody = portableImportOperationBody(input);
     if (this.#store.findOperation<ImportPortableSessionResult>(input.operationId) !== undefined) {
       const replay = this.#store.claimAuthorizedDeferredEffectOperation<ImportPortableSessionResult>(
@@ -12713,6 +12838,10 @@ export class SessionHost {
         contentLimitBytes: Math.min(this.#artifactStore.maximumBlobBytes, 256 * 1024 * 1024)
       }
     );
+    input.assertTaskCopyCurrent?.();
+    if (input.assertTaskCopyCurrent !== undefined && prepared.nativeSession === undefined) {
+      throw new StoreError("This task copy has no stored native session to restore.");
+    }
     const importTitle = portableImportTitle(input.title, prepared.manifest.title);
     const nativeTranscriptSha256 = prepared.nativeSession === undefined ? undefined
       : createHash("sha256").update(prepared.nativeSession.bytes).digest("hex");
@@ -12942,6 +13071,7 @@ export class SessionHost {
         claim.operation.id,
         claim.operation.bodyHash,
         (store) => {
+          input.assertTaskCopyCurrent?.();
           const currentTarget = this.assertTargetAcceptsSessionCreation(store, input.targetId);
           if (currentTarget.revision !== target.revision) {
             throw new RevisionConflictError("Target", input.targetId, target.revision, currentTarget.revision);
@@ -12979,6 +13109,7 @@ export class SessionHost {
             binding: createdBinding!,
             pinned: false,
             archived: false,
+            ...(input.taskCopy?.kind === "worker" ? { hidden: true } : {}),
             permissionMode: input.permissionMode,
             planMode: input.planMode,
             ...(providerId === undefined ? {} : { providerId }),
@@ -13100,12 +13231,14 @@ export class SessionHost {
               }
             });
           }
+          const linkedWorkers = input.taskCopy?.kind === "lead"
+            ? publishTaskCopyGoal(store, input.connection, sessionId, input.operationId, input.taskCopy.goal) : 0;
           return {
             sessionId,
             fidelity: materialized.manifest.fidelity,
             messageCount: materialized.manifest.messageCount,
             mediaCount: materialized.manifest.mediaCount,
-            workerCount: materialized.manifest.workers?.length ?? 0,
+            workerCount: linkedWorkers + (materialized.manifest.workers?.length ?? 0),
             replacedSessionIds: replaced === undefined ? [] : [replaced.descriptor.id],
             status: initialActivation.status,
             ...(initialActivation.error === undefined ? {} : { activationError: initialActivation.error })
@@ -13116,7 +13249,9 @@ export class SessionHost {
       acquiredWorktree = false;
       createdBinding = undefined;
       cleanupContext = undefined;
-      if (createdLiveRuntime) {
+      if (input.taskCopy?.kind === "worker") {
+        this.persistPortableImportActivation(sessionId, portableActivationReadyRecord());
+      } else if (createdLiveRuntime) {
         this.setActiveSession(
           sessionId,
           this.activeSession(adapter, sessionId, backendInstanceGeneration, resourceCatalogEpoch)
@@ -20850,7 +20985,8 @@ function portableImportOperationBody(input: ImportPortableSessionInput): unknown
     permissionMode: input.permissionMode,
     planMode: input.planMode,
     overwrite: input.overwrite,
-    worktree: input.worktree
+    worktree: input.worktree,
+    ...(input.taskCopy === undefined ? {} : { taskCopy: input.taskCopy })
   };
 }
 

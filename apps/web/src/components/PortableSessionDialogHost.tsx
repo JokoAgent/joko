@@ -43,6 +43,7 @@ export function PortableSessionDialogHost({
   defaultTargetId,
   worktreeSupportedTargetIds,
   onCloseExport,
+  onCopyToNode,
   onCloseImport,
   onExported,
   onOpenTask
@@ -57,6 +58,7 @@ export function PortableSessionDialogHost({
   readonly defaultTargetId?: string;
   readonly worktreeSupportedTargetIds: ReadonlySet<string>;
   readonly onCloseExport: () => void;
+  readonly onCopyToNode?: () => void;
   readonly onCloseImport: (requestId: number) => void;
   readonly onExported: (fidelity: PortableSessionFidelity, status: "exported" | "dispatched") => void;
   readonly onOpenTask: (sessionId: string) => void;
@@ -75,6 +77,7 @@ export function PortableSessionDialogHost({
       open={exportSession !== undefined}
       labels={labels}
       onClose={onCloseExport}
+      copyToNode={onCopyToNode === undefined ? undefined : { label: t("taskCopy.title"), open: onCopyToNode }}
       onExport={(options, context) => exportSession === undefined
         ? Promise.resolve({ status: "cancelled" })
         : controller.exportPortableSession(exportSession, options, context)}

@@ -21,6 +21,7 @@ export interface GitRunOptions {
   readonly idleTimeoutMs?: number;
   readonly environment?: Readonly<Record<string, string>>;
   readonly indexFile?: string;
+  readonly input?: string;
   readonly refTransaction?: {
     readonly commands: string;
     readonly beforeCommit: () => Promise<void>;
@@ -81,6 +82,10 @@ export async function runGit(
   }
 
   const transaction = options.refTransaction;
+  if (transaction !== undefined && options.input !== undefined) {
+    throw new WorktreeServiceError("INVALID_ARGUMENT", "A Git reference transaction already owns the input stream.");
+  }
+  const writesInput = transaction !== undefined || options.input !== undefined;
   return new Promise<GitResult>((resolve, reject) => {
     let child: ChildProcess;
     try {
@@ -90,7 +95,7 @@ export async function runGit(
         windowsHide: true,
         shell: false,
         detached: process.platform !== "win32",
-        stdio: [transaction === undefined ? "ignore" : "pipe", "pipe", "pipe"]
+        stdio: [writesInput ? "pipe" : "ignore", "pipe", "pipe"]
       });
     } catch (error) {
       reject(spawnError(error));
@@ -100,7 +105,7 @@ export async function runGit(
     const stdoutStream = child.stdout;
     const stderrStream = child.stderr;
     const stdinStream = child.stdin;
-    if (stdoutStream === null || stderrStream === null || (transaction !== undefined && stdinStream === null)) {
+    if (stdoutStream === null || stderrStream === null || (writesInput && stdinStream === null)) {
       terminateProcessTree(child, "SIGKILL");
       reject(new WorktreeServiceError("GIT_FAILED", "Git process streams were unavailable."));
       return;
@@ -211,9 +216,10 @@ export async function runGit(
     });
     control.signal?.addEventListener("abort", abort, { once: true });
     if (control.signal?.aborted === true) abort();
-    else if (transaction !== undefined && stdinStream !== null) {
+    else if (writesInput && stdinStream !== null) {
       stdinStream.on("error", () => { /* Git supplies the command error on exit. */ });
-      stdinStream.write(transaction.commands);
+      if (transaction !== undefined) stdinStream.write(transaction.commands);
+      else stdinStream.end(options.input);
     }
   });
 }
