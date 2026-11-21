@@ -61,7 +61,7 @@ it("authors a project Skill in a real Pi task and loads it after explicit review
       } } }));
       mutation.payload.value.input.mentionRanges.push(create(InputMentionRangeSchema, { start: 0, end: invocation.length, mentionIndex: 0 }));
       const runId = queueRunIdFrom(await submit(clients.operation, connectionId, mutation));
-      await waitFor(() => clients.run.getRun({ runId }), result => result.run?.state === RunState.COMPLETED, instruction);
+      await waitFor(() => clients.run.getRun({ runId }), result => result.run?.state === RunState.SUCCEEDED, instruction);
     };
     const original = await startTask();
     const commands = (await clients.session.listRuntimeCommands({ sessionId: original })).commands;
