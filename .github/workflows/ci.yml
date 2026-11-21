@@ -396,7 +396,7 @@ jobs:
         if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && (github.event_name != 'workflow_dispatch' || inputs.scope == 'full') }}
         timeout-minutes: 20
         shell: bash
-        run: node scripts/ci/prepare-codex-native.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/codex-native-prepare.log"
+        run: node --import tsx scripts/ci/prepare-codex-native.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/codex-native-prepare.log"
 
       - name: Prepare Ubuntu user namespaces for native Backend tests
         id: codex_sandbox
