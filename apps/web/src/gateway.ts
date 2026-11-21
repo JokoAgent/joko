@@ -32,6 +32,7 @@ import { ProviderGroupService } from "@joko/contracts";
 import { createProviderGroupSettingsApi, type ProviderGroupSettingsApi } from "./provider-group-settings.js";
 import { projectTaskProviderGroupUsage, type TaskProviderGroupUsageView } from "./provider-group-task-usage.js";
 import { WorkspaceTextPreviewCache, workspacePreviewConnectionFailure } from "./workspace-text-preview-cache.js";
+import { isWorkspaceDirectoryArchiveName, WORKSPACE_DIRECTORY_ARCHIVE_MAXIMUM_BYTES, WORKSPACE_DIRECTORY_ARCHIVE_MEDIA_TYPE } from "@joko/contracts";
 import { hostedAgentSettingsMutation, projectHostedAgentCatalog, projectHostedAgentSettings, type HostedAgentSettingsUpdate,
   type HostedAgentSettingsView, type HostedAgentCatalogView } from "./hosted-agent-settings.js";
 import { HelpService, HelpRole, WorktreeRecycleAction, WorktreeRecycleState, WorktreeRecycleReason, type WorktreeRecycleRecord } from "@joko/contracts";
@@ -626,13 +627,15 @@ import {
   captureNativeArtifactSourceReveal,
   captureNativeFileCopy,
   captureNativeFileOpen,
+  captureNativeWorkspaceDirectoryDownload,
   copyNativeArtifactFile,
   NATIVE_FILE_COPY_MAXIMUM_BYTES,
   NATIVE_FILE_OPEN_MAXIMUM_BYTES,
   nativeFileOpenApplicationAvailable,
   openNativeArtifactFile,
   openNativeArtifactFileWithApplication,
-  revealNativeArtifactSource
+  revealNativeArtifactSource,
+  saveNativeWorkspaceDirectory
 } from "./native-file-actions.js";
 import type {
   AppSnapshot,
@@ -7904,6 +7907,42 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (preview.path !== path) throw new GatewayError("Orchestrator returned a different workspace file.");
     if (identity !== undefined && cacheRevision === this.#workspaceTextPreviews.revision) this.#workspaceTextPreviews.set(identity, workspaceId, preview);
     return preview;
+  }
+
+  async downloadWorkspaceDirectory(workspaceId: string, path: string, expectedRevision: string | undefined, context: ArtifactDownloadContext): Promise<ArtifactDownloadOutcome> {
+    const scope = this.captureActionScope(context.signal);
+    const owner = this.workspacePreviewScope(workspaceId);
+    const workspace = this.#snapshot?.workspaces.find(value => value.id === workspaceId);
+    const ownedContext = { ownerDocument: context.ownerDocument, signal: scope.signal };
+    const desktop = captureNativeWorkspaceDirectoryDownload();
+    const name = path.split("/").at(-1) ?? "";
+    if (owner === undefined || workspace?.remoteWorkspace === undefined || !workspace.trusted || !isWorkspaceDirectoryArchiveName(name)) {
+      throw new GatewayError("A trusted remote workspace directory is required.");
+    }
+    const assertCurrent = (): void => {
+      assertBrowserActionCurrent(ownedContext);
+      if (this.requireTransport() !== scope.transport || this.workspacePreviewScope(workspaceId) !== owner) {
+        throw new GatewayError("The workspace directory source changed.");
+      }
+    };
+    assertCurrent();
+    const { archive, directoryName } = await createClient(WorkspaceService, scope.transport).prepareWorkspaceDirectoryDownload({
+      workspaceId, relativePath: path, expectedRevision: expectedRevision === undefined ? undefined : { opaqueRevision: expectedRevision }
+    }, { signal: scope.signal });
+    assertCurrent();
+    if (directoryName !== name || !archive?.blobId || archive.fileName !== `${name}.tar.gz`
+      || archive.mediaType !== WORKSPACE_DIRECTORY_ARCHIVE_MEDIA_TYPE || archive.byteSize <= 0n
+      || archive.byteSize > BigInt(WORKSPACE_DIRECTORY_ARCHIVE_MAXIMUM_BYTES) || !/^[a-f0-9]{64}$/u.test(archive.sha256Hex)) {
+      throw new GatewayError("Orchestrator returned an invalid directory archive.");
+    }
+    const blob = await this.fetchArtifact(archive.blobId, scope.signal);
+    assertCurrent();
+    if (BigInt(blob.size) !== archive.byteSize) throw new GatewayError("The workspace directory archive was incomplete.");
+    const bytes = await blob.arrayBuffer();
+    if (await sha256Hex(bytes) !== archive.sha256Hex) throw new GatewayError("The workspace directory archive changed during transfer.");
+    assertCurrent();
+    if (desktop === undefined) return downloadArtifactBlob(blob, archive.fileName, ownedContext);
+    return await saveNativeWorkspaceDirectory(new Uint8Array(bytes), directoryName, ownedContext, desktop) ? "saved" : "cancelled";
   }
 
   peekWorkspaceFile(workspaceId: string, path: string): WorkspaceFilePreviewView | undefined {

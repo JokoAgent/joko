@@ -131,7 +131,7 @@ import { parseToolFileChangeSet, type ToolFileChangeView } from "@joko/contracts
 import { describeToolPresentation, type ToolPresentationAction } from "@joko/contracts";
 import { WorkspaceImageLightbox } from "./WorkspaceImageLightbox.js";
 import type { ToolPayloadSection } from "@joko/contracts";
-import { SentMessageReferenceChips, SentMessageReferenceText, TimelineLinkSourceContext, TimelineMarkdownImage, TimelineMarkdownLink, type TimelineReferenceActions, type TimelineWorkspaceAsset } from "./TimelineReferenceContent.js";
+import { SentMessageReferenceChips, SentMessageReferenceText, TimelineLinkSourceContext, TimelineMarkdownImage, TimelineMarkdownLink, type TimelineReferenceActions, type TimelineWorkspaceAsset, type TimelineWorkspaceDirectoryDownload } from "./TimelineReferenceContent.js";
 import { validSentInputMentionRanges } from "./timeline-references.js";
 import { normalizeTimelineMathDelimiters } from "./timeline-markdown-math.js";
 import { TimelineMarkdownDocument } from "./TimelineMarkdownDocument.js";
@@ -190,6 +190,7 @@ interface TimelinePersonalizationContextValue {
   readonly onReadArtifact?: OperationApi["readSessionArtifact"];
   readonly onOpenHttpLink?: (url: string, options?: HttpLinkOpenOptions) => void | Promise<void>;
   readonly onOpenWorkspaceHtml?: (path: string, options?: HttpLinkOpenOptions) => void | Promise<void>;
+  readonly onDownloadWorkspaceDirectory?: TimelineWorkspaceDirectoryDownload;
   readonly onLoadWorkspaceAsset?: (path: string) => Promise<TimelineWorkspaceAsset>;
   readonly onWorkspaceImageToComposer?: (file: File) => void | Promise<void>;
 }
@@ -251,7 +252,7 @@ interface TimelineMessageEditDraft {
   readonly draft: UserMessageEditDraft;
 }
 
-export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSendRichAnswer, onSendPartnerStarter, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, unloadedGapBefore, historyLoading, historyError, historyOwnerKey, historyDeletion, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onAskSideChat, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, messageEdit, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange, onRootChange }: {
+export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSendRichAnswer, onSendPartnerStarter, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onDownloadWorkspaceDirectory, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, unloadedGapBefore, historyLoading, historyError, historyOwnerKey, historyDeletion, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onAskSideChat, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, messageEdit, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange, onRootChange }: {
   readonly onSendRichAnswer?: (text: string, receiptKey: string) => Promise<boolean>;
   readonly onSendPartnerStarter?: (text: string, eventId: string) => Promise<boolean>;
   readonly ownerKey: string;
@@ -270,6 +271,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
   readonly streamFadeEnabled: boolean;
   readonly onOpenHttpLink?: (url: string, options?: HttpLinkOpenOptions) => void | Promise<void>;
   readonly onOpenWorkspaceHtml?: (path: string, options?: HttpLinkOpenOptions) => void | Promise<void>;
+  readonly onDownloadWorkspaceDirectory?: TimelineWorkspaceDirectoryDownload;
   readonly onLoadWorkspaceAsset?: (path: string) => Promise<TimelineWorkspaceAsset>;
   readonly onWorkspaceImageToComposer?: (file: File) => void | Promise<void>;
   readonly subagentRuns?: ReadonlyMap<string, SubagentRunView>;
@@ -467,9 +469,10 @@ export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, onSe
     onReadArtifact,
     ...(mailLinkContext === undefined ? {} : { onOpenHttpLink: mailLinkContext }),
     ...(onOpenWorkspaceHtml === undefined ? {} : { onOpenWorkspaceHtml }),
+    onDownloadWorkspaceDirectory,
     ...(onLoadWorkspaceAsset === undefined ? {} : { onLoadWorkspaceAsset }),
     ...(onWorkspaceImageToComposer === undefined ? {} : { onWorkspaceImageToComposer })
-  }), [items, onLoadWorkspaceAsset, mailLinkContext, onOpenWorkspaceHtml, onWorkspaceImageToComposer, onReadArtifact, workspaceId, ownerKey, answerStateOwnerKey, onSendRichAnswer, onSendPartnerStarter, locale, reducedMotion, sessionId, streamFadeEnabled]);
+  }), [items, onLoadWorkspaceAsset, mailLinkContext, onOpenWorkspaceHtml, onDownloadWorkspaceDirectory, onWorkspaceImageToComposer, onReadArtifact, workspaceId, ownerKey, answerStateOwnerKey, onSendRichAnswer, onSendPartnerStarter, locale, reducedMotion, sessionId, streamFadeEnabled]);
   const subagentContext = useMemo<TimelineSubagentContextValue>(() => ({
     runs: subagentRuns ?? new Map(),
     details: subagentRunDetails ?? new Map(),
@@ -1835,9 +1838,10 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
       onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} onClose={onClose} />,
     ...(personalization.onOpenHttpLink === undefined ? {} : { onOpenHttpLink: personalization.onOpenHttpLink }),
     ...(personalization.onOpenWorkspaceHtml === undefined ? {} : { onOpenWorkspaceHtml: personalization.onOpenWorkspaceHtml }),
+    onDownloadWorkspaceDirectory: personalization.onDownloadWorkspaceDirectory,
     ...(personalization.onLoadWorkspaceAsset === undefined ? {} : { onLoadWorkspaceAsset: personalization.onLoadWorkspaceAsset }),
     ...(personalization.onWorkspaceImageToComposer === undefined ? {} : { onWorkspaceImageToComposer: personalization.onWorkspaceImageToComposer })
-  }), [item.id, item.sourceEventId, item.text, item.inputMentions, item.mentionRanges, onArtifactUrl, onArtifactDownload, personalization.ownerKey, personalization.workspaceId, personalization.onReadArtifact, personalization.onLoadWorkspaceAsset, personalization.onOpenHttpLink, personalization.onOpenWorkspaceHtml, personalization.onWorkspaceImageToComposer, sessionId, t]);
+  }), [item.id, item.sourceEventId, item.text, item.inputMentions, item.mentionRanges, onArtifactUrl, onArtifactDownload, personalization.ownerKey, personalization.workspaceId, personalization.onReadArtifact, personalization.onLoadWorkspaceAsset, personalization.onOpenHttpLink, personalization.onOpenWorkspaceHtml, personalization.onDownloadWorkspaceDirectory, personalization.onWorkspaceImageToComposer, sessionId, t]);
   const text = item.text ?? "";
   const displayText = role === "assistant" && item.streaming !== true ? stripObjectiveVerdict(text) : text;
   const inputMentions = item.userInputAccepted === true ? item.inputMentions ?? [] : [];
@@ -2345,9 +2349,10 @@ const ParsedMarkdown = memo(function ParsedMarkdown({ text, t, wordFade, onWordF
     t,
     ...(personalization.onOpenHttpLink === undefined ? {} : { onOpenHttpLink: personalization.onOpenHttpLink }),
     ...(personalization.onOpenWorkspaceHtml === undefined ? {} : { onOpenWorkspaceHtml: personalization.onOpenWorkspaceHtml }),
+    onDownloadWorkspaceDirectory: personalization.onDownloadWorkspaceDirectory,
     ...(personalization.onLoadWorkspaceAsset === undefined ? {} : { onLoadWorkspaceAsset: personalization.onLoadWorkspaceAsset }),
     ...(personalization.onWorkspaceImageToComposer === undefined ? {} : { onWorkspaceImageToComposer: personalization.onWorkspaceImageToComposer })
-  }), [personalization.ownerKey, personalization.onLoadWorkspaceAsset, personalization.onOpenHttpLink, personalization.onOpenWorkspaceHtml, personalization.onWorkspaceImageToComposer, personalization.sessionId, t]);
+  }), [personalization.ownerKey, personalization.onLoadWorkspaceAsset, personalization.onOpenHttpLink, personalization.onOpenWorkspaceHtml, personalization.onDownloadWorkspaceDirectory, personalization.onWorkspaceImageToComposer, personalization.sessionId, t]);
   const renderActions = useMemo(() => ({ referenceActions, onWordFadeSettled }), [onWordFadeSettled, referenceActions]);
   const normalized = useMemo(() => normalizeTimelineMathDelimiters(text), [text]);
   const rehypePlugins = useMemo(() => wordFade === undefined

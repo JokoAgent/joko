@@ -565,6 +565,8 @@ export function WorkspaceFilesRoute({
     });
   }, [workspace.id]);
 
+  const downloadDirectory = workspace.remoteWorkspace !== undefined && workspace.trusted && controller.state.taskSource?.kind !== "joined"
+    ? controller.downloadWorkspaceDirectory : undefined;
   const documentActions = useMemo<WorkspaceFilesDocumentActions | undefined>(() => {
     const copyRelativePath = async ({ path }: { readonly path: string }): Promise<void> => {
       const clipboard = rootRef.current?.ownerDocument.defaultView?.navigator.clipboard;
@@ -573,7 +575,8 @@ export function WorkspaceFilesRoute({
     };
     if (!canWrite) return {
       capabilities: { copyRelativePath: true },
-      copyRelativePath
+      copyRelativePath,
+      downloadDirectory
     };
     return {
       capabilities: { createFile: true, createDirectory: true, rename: true, delete: true, copyRelativePath: true },
@@ -611,9 +614,10 @@ export function WorkspaceFilesRoute({
         workspaceSelectedFileStore.clearPrefix(workspaceId, path);
         if (selectedAffected) navigateFile(successor);
       },
-      copyRelativePath
+      copyRelativePath,
+      downloadDirectory
     };
-  }, [canWrite, fileRouteOwner, guardAffectedDocument, navigateFile, selectedPath, t]);
+  }, [canWrite, downloadDirectory, fileRouteOwner, guardAffectedDocument, navigateFile, selectedPath, t]);
 
   const toggleRail = useCallback((): void => {
     const next = !railCollapsed;
@@ -1281,6 +1285,9 @@ function workspaceSidebarLabels(t: Translator) {
     rename: t("workspace.rename"),
     delete: t("common.delete"),
     copyRelativePath: t("workspace.copyRelativePath"),
+    downloadDirectory: t("workspace.downloadDirectory"),
+    downloadingDirectory: t("workspace.downloadingDirectory"),
+    directoryDownloadFailed: t("workspace.directoryDownloadFailed"),
     cancel: t("common.cancel"),
     confirm: t("common.confirm"),
     name: t("workspace.entryName"),

@@ -222,6 +222,7 @@ service WorkspaceService {
   // Lazy filename index (`rg --files --hidden`, 30k cap).
   rpc ListWorkspaceFiles(ListWorkspaceFilesRequest) returns (ListWorkspaceFilesResponse);
   rpc ReadWorkspaceFile(ReadWorkspaceFileRequest) returns (ReadWorkspaceFileResponse);
+  rpc PrepareWorkspaceDirectoryDownload(PrepareWorkspaceDirectoryDownloadRequest) returns (PrepareWorkspaceDirectoryDownloadResponse);
   rpc ResolveWorkspaceFileSource(ResolveWorkspaceFileSourceRequest) returns (ResolveWorkspaceFileSourceResponse);
   rpc ReadWorkspaceHtmlSnapshot(ReadWorkspaceHtmlSnapshotRequest) returns (ReadWorkspaceHtmlSnapshotResponse);
   rpc WriteWorkspaceTextFile(WriteWorkspaceTextFileRequest) returns (WriteWorkspaceTextFileResponse);
@@ -2015,6 +2016,18 @@ message ReadWorkspaceFileRequest {
 
 message ReadWorkspaceFileResponse {
   FilePreview preview = 1;
+}
+
+// Materializes one named directory in a trusted registered remote workspace.
+message PrepareWorkspaceDirectoryDownloadRequest {
+  string workspace_id = 1;
+  string relative_path = 2;
+  FileRevision expected_revision = 3;
+}
+
+message PrepareWorkspaceDirectoryDownloadResponse {
+  BlobRef archive = 1;
+  string directory_name = 2;
 }
 
 // Resolves the original local file for an explicit, authenticated Desktop gesture.

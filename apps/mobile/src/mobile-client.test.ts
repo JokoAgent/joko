@@ -37,7 +37,7 @@ import {
   WorkspaceSearchMatchSchema, WorkspaceChangeSetSchema, WorkspaceRewindPreviewSchema, WorkspaceRewindResultSchema, RewindSafety, FileChangeKind,
   JOKO_API_VERSION, NativeEntryKind, NativeSessionBindingSchema, NativeSessionTreeNodeSchema, NativeSessionTreeSchema, OperationSchema,
   ListPartnerSessionsResponseSchema, PartnerSessionRole, PARTNER_TODO_CHECK_PROMPT,
-  InputCapabilityOptionsSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk,
+  InputCapabilityOptionsSchema, InputContentSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk,
   CustomToolPermissionSubjectSchema, PermissionRequestSchema, PermissionSubjectSchema, PlanReviewDecisionKind, ImageThumbnailSchema,
   EventCursorSchema, EventIdentitySchema, EventSchema, ImageRefSchema, MessageCompletedEventSchema, MessageDeletedEventSchema, MessageInputDelivery, MessageRole, MessageStartedEventSchema,
   ModelDescriptorSchema, ModelInputModality, ModelKeySchema, ModelOutputModality, ModelSelectionSchema,
@@ -11704,6 +11704,92 @@ describe("native current-task message and Queue actions", () => {
         queueItemId: "queue-1", lockToken: lease.lockToken, locked: false
       } }
     });
+  });
+
+  it("replaces a queued Workspace directory through the original Mobile edit lease", async () => {
+    const originalText = "Compare @docs/";
+    const updatedText = "Compare @notes/";
+    const backend = queueSnapshot.backends[0]!;
+    const current = create(SnapshotSchema, {
+      ...queueSnapshot,
+      backends: [create(BackendDescriptorSchema, {
+        ...backend,
+        capabilities: create(CapabilityManifestSchema, { capabilities: [
+          ...backend.capabilities!.capabilities,
+          create(CapabilitySchema, {
+            name: capabilityNames.inputMention,
+            support: CapabilitySupport.SUPPORTED,
+            options: create(CapabilityOptionsSchema, {
+              kind: { case: "input", value: create(InputCapabilityOptionsSchema, {
+                mediaTypes: ["workspace_file", "workspace_directory", "workspace_directory_queue_edit", "workspace_line_range"]
+              }) }
+            })
+          })
+        ] })
+      })],
+      targets: workspaceMentionSnapshot.targets,
+      workspaces: [create(WorkspaceDescriptorSchema, {
+        ...queueSnapshot.workspaces[0]!, trusted: true,
+        location: create(WorkspaceLocationSchema, { kind: { case: "serviceNode", value: {} } })
+      })],
+      sessions: [create(SessionSchema, { ...queueSnapshot.sessions[0]!, state: SessionState.RUNNING })],
+      runs: [create(RunSchema, {
+        runId: "active-run", sessionId: "session", backendId: "backend", targetId: "target", state: RunState.RUNNING
+      })],
+      queueItems: [queueTwo, create(QueueItemSchema, { ...queueOne, input: create(InputContentSchema, {
+        parts: [
+          { content: { case: "text", value: originalText } },
+          { content: { case: "workspaceMention", value: {
+            workspaceId: "workspace", relativePath: "docs", displayText: "docs", directory: true
+          } } }
+        ],
+        mentionRanges: [{ start: 8, end: 14, mentionIndex: 0 }]
+      }) })]
+    });
+    const network = projectedNetwork(current);
+    vi.mocked(network.listWorkspaceDirectory).mockResolvedValue({
+      entries: [create(WorkspaceEntrySchema, {
+        workspaceId: "workspace", relativePath: "notes", displayName: "notes", kind: FileKind.DIRECTORY
+      })],
+      revision: "root-r1"
+    });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids());
+    try {
+      await app.start();
+      const lease = await app.beginQueueEdit(queueOne.queueItemId);
+      expect(lease).toMatchObject({ queueItemId: queueOne.queueItemId, text: originalText, replacesStructuredInput: true });
+      const controls = app.taskWorkspaceMentionControls()!;
+      const { entries } = await app.listTaskWorkspaceMentionDirectory(controls.surfaceOwnerKey, "");
+      expect(network.listWorkspaceDirectory).toHaveBeenCalledWith(credential, "workspace", "", undefined);
+      expect(entries).toEqual([{ workspaceId: "workspace", relativePath: "notes", displayText: "notes", directory: true }]);
+
+      await expect(app.saveQueueEdit(lease, updatedText, undefined, [{
+        ...entries[0]!, kind: "workspace", mentionId: "notes-reference", start: 8, end: 15
+      }])).resolves.toBe(true);
+
+      const mutations = vi.mocked(network.submit).mock.calls.map(call => call[2]);
+      expect(mutations.map(mutation => mutation.payload)).toMatchObject([
+        { case: "setQueueItemEditLock", value: { queueItemId: queueOne.queueItemId, locked: true, lockToken: lease.lockToken } },
+        { case: "editQueueItem", value: {
+          queueItemId: queueOne.queueItemId, deliveryMode: queueOne.deliveryMode, lockToken: lease.lockToken,
+          textSplices: [{ start: 0, end: 14, replacementText: updatedText }],
+          input: {
+            parts: [
+              { content: { case: "text", value: updatedText } },
+              { content: { case: "workspaceMention", value: { workspaceId: "workspace", relativePath: "notes", directory: true } } }
+            ],
+            mentionRanges: [{ start: 8, end: 15, mentionIndex: 0 }]
+          }
+        } },
+        { case: "setQueueItemEditLock", value: { queueItemId: queueOne.queueItemId, locked: false, lockToken: lease.lockToken } }
+      ]);
+      expect(mutations[1]?.preconditions).toMatchObject([{
+        entity: { kind: EntityKind.QUEUE_ITEM, id: queueOne.queueItemId },
+        expectedRevision: queueOne.version!.revision, expectedGeneration: queueOne.version!.generation
+      }]);
+    } finally {
+      await app.dispose();
+    }
   });
 
   it("keeps the edit lease retryable when an unlock receipt cannot be persisted", async () => {

@@ -2476,7 +2476,7 @@ describe("ClaudeCodeAdapter", () => {
       supportsModelRefresh: true
     })]);
     expect(descriptor.capabilities.get("turn.steer")?.supported).toBe(true);
-    expect(descriptor.capabilities.get("workspace.extra_dirs")?.options).toEqual(["read_write"]);
+    expect(descriptor.capabilities.get("workspace.extra_dirs")?.options).toEqual(["read_only", "read_write"]);
   });
 
   test.each(["2.1.280", "2.1.291", "2.1.293", "unknown"])("keeps same-turn input closed for an unverified CLI %s", async (version) => {
@@ -7273,7 +7273,8 @@ describe("ClaudeCodeAdapter", () => {
     await expect(adapter.setExtraDirectories(
       [{ id: "read-only", path: process.cwd(), access: "read_only" }],
       context
-    )).rejects.toMatchObject({ publicError: { code: "EXTRA_DIRECTORY_ACCESS_UNSUPPORTED" } });
+    )).resolves.toBeUndefined();
+    expect(query.settingCalls.at(-1)).toEqual({ permissions: { additionalDirectories: [] } });
 
     await adapter.closeSession(binding, context);
   });

@@ -15,6 +15,7 @@ import { describe, expect, it } from "vitest";
 import {
   canonicalWorkspacePath,
   filterWorkspaceFileNames,
+  isTextFilePreviewMetadata,
   resolveMobileWorkspaceAuthority,
   sortArtifacts,
   sortWorkspaceEntries,
@@ -52,6 +53,15 @@ function fileSnapshot(workspaceId = "workspace") {
 }
 
 describe("mobile Workspace file ownership and presentation", () => {
+  it("recognizes project and configuration text reported as a generic download", () => {
+    for (const path of ["Directory.Build.props", "project.csproj.user", "project.FSPROJ.USER", "project.vbproj.user", "UI.razor", "workspace.slnx", "diagram.mermaid", "LICENSE"]) {
+      expect(isTextFilePreviewMetadata("application/octet-stream", path), path).toBe(true);
+    }
+    for (const path of ["project.csproj.user.bak", "project.user", "document.docx", "sheet.xlsx", "deck.pptx"]) {
+      expect(isTextFilePreviewMetadata("application/octet-stream", path), path).toBe(false);
+    }
+  });
+
   it("requires the exact Session to Target to Workspace chain and advertised capability", () => {
     const owner = fileSnapshot();
     const authority = resolveMobileWorkspaceAuthority(owner, owner, "session");

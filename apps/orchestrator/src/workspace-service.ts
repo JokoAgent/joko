@@ -147,6 +147,18 @@ export interface WorkspaceFileRequestAuthority {
   readonly assertCurrent: () => void;
 }
 
+export interface WorkspaceDirectoryArchiveRequest {
+  readonly relativePath: string;
+  readonly expectedRevision: string;
+  readonly maximumBytes: number;
+}
+
+export type WorkspaceDirectoryArchiveIngest<Result> = (handle: FileHandle, options: {
+  readonly directoryName: string;
+  readonly expectedSize: number;
+  readonly beforeFinalize: () => Promise<void>;
+}) => Promise<Result>;
+
 export type WorkspaceFilePreviewErrorCode =
   | "WORKSPACE_FILE_PREVIEW_INVALID"
   | "WORKSPACE_FILE_PREVIEW_STALE"
@@ -1047,6 +1059,20 @@ export class WorkspaceService {
     } finally {
       await handle.close().catch(() => undefined);
     }
+  }
+
+  async materializeRemoteDirectory<Result>(
+    workspaceId: string,
+    directory: WorkspaceDirectoryArchiveRequest,
+    ingest: WorkspaceDirectoryArchiveIngest<Result>,
+    request: WorkspaceFileRequestAuthority
+  ): Promise<Result> {
+    request.assertCurrent();
+    const workspace = this.requireWorkspace(workspaceId);
+    if (workspace.remote === undefined || !workspace.trusted) {
+      throw new WorkspaceFilePreviewError("Directory download requires a trusted remote workspace.", "unsupported");
+    }
+    return this.#remoteInvoke(workspaceId, "materializeDirectory", [directory, ingest], request);
   }
 
   /**

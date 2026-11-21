@@ -142,6 +142,8 @@ export const DESKTOP_CHANNELS = {
   taskSharingInvitationAcknowledge: "joko:task-sharing:invitation:acknowledge",
   taskSharingInvitationDeliver: "joko:task-sharing:invitation:deliver",
   saveFile: "joko:files:save",
+  saveWorkspaceDirectory: "joko:files:save-workspace-directory",
+  cancelWorkspaceDirectoryDownload: "joko:files:save-workspace-directory-cancel",
   copyFile: "joko:files:copy",
   cancelFileCopy: "joko:files:copy-cancel",
   openFile: "joko:files:open",
@@ -637,6 +639,12 @@ export function requireCurrentDesktopMainDocumentOccurrence(
 export interface DesktopSaveFileRequest {
   readonly name: string;
   readonly mediaType: string;
+  readonly bytes: Uint8Array;
+}
+
+export interface DesktopWorkspaceDirectoryDownloadRequest {
+  readonly requestId: string;
+  readonly directoryName: string;
   readonly bytes: Uint8Array;
 }
 
