@@ -1607,7 +1607,7 @@ export async function createOrchestratorApplication(
         || (route.backendId === codexBackendId && route.api === "openai-completions" && route.baseUrl === OLLAMA_OPENAI_BASE_URL)
       )) return fetch;
       if ((route.backendId === codexBackendId && route.api === "openai-completions")
-        || (route.backendId === claudeCodeBackendId && route.api === "openai-responses")) return streamManagedProvider;
+        || (route.backendId === claudeCodeBackendId && (route.api === "openai-responses" || route.api === "openai-completions"))) return streamManagedProvider;
       return undefined;
     },
     assertOwner: (owner) => {

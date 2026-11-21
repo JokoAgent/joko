@@ -769,8 +769,8 @@ export class ManagedProviderProxy {
         maxOutputTokens = subtask.maxOutputTokens;
         signal = AbortSignal.any([operation.abort.signal, subtask.abort.signal, abort.signal]);
       }
-      if (isClaudeResponsesRoute(state.runtime, route)) {
-        await this.#handleClaudeResponses(response, parsed as Record<string, unknown>, route, suffix, maxOutputTokens, signal, () => {
+      if (state.runtime.clientProtocol === "anthropic-messages" && (route.api === "openai-responses" || route.api === "openai-completions")) {
+        await this.#handleClaudeBridge(response, parsed as Record<string, unknown>, route, suffix, maxOutputTokens, signal, () => {
           if (subtask === undefined) this.#assertOperation(state, operation);
           else this.#assertSubtask(state, operation, subtask);
         });
@@ -849,7 +849,7 @@ export class ManagedProviderProxy {
     }
   }
 
-  async #handleClaudeResponses(
+  async #handleClaudeBridge(
     response: ServerResponse, parsed: Record<string, unknown>, route: ProviderInferenceRoute,
     suffix: string, maxOutputTokens: number | undefined, signal: AbortSignal, assertCurrent: () => void
   ): Promise<void> {
@@ -863,16 +863,20 @@ export class ManagedProviderProxy {
       return;
     }
     const base = new URL(route.baseUrl.endsWith("/") ? route.baseUrl : `${route.baseUrl}/`);
-    const endpoint = route.requestPath === undefined ? new URL("responses", base) : new URL(route.requestPath, base.origin);
+    const chat = route.api === "openai-completions";
+    const endpoint = route.requestPath === undefined ? new URL(chat ? "chat/completions" : "responses", base) : new URL(route.requestPath, base.origin);
     if (endpoint.origin !== base.origin) throw unavailable();
     // Responses reasoning state can only travel back to the exact route that produced it.
     const signaturePrefix = createHash("sha256").update(JSON.stringify([route.backendId, route.providerId, route.modelId, route.generationId]))
       .digest("base64url") + "/";
     let body: string;
+    let translated: ReturnType<typeof prepareChatCompletion> | undefined;
     try {
-      body = JSON.stringify(prepareClaudeResponsesRequest(parsed, {
+      const request = prepareClaudeResponsesRequest(parsed, {
         model: route.modelId, signaturePrefix, supportsImages: route.supportsImages, maxOutputTokens
-      }));
+      });
+      if (chat) translated = prepareChatCompletion(request, { modelId: route.modelId, endpoint, supportsImages: route.supportsImages });
+      body = JSON.stringify(translated?.request ?? request);
     } catch { fail(response, 400); return; }
     if (Buffer.byteLength(body, "utf8") > BODY_LIMIT) { fail(response, 413); return; }
     const headers = new Headers({ "content-type": "application/json", accept: "text/event-stream, application/json" });
@@ -891,7 +895,7 @@ export class ManagedProviderProxy {
       fail(response, upstream.status >= 400 && upstream.status <= 599 ? upstream.status : 502);
       return;
     }
-    await writeClaudeResponse({ upstream, response, model: route.modelId, signaturePrefix, streaming: parsed.stream === true, signal, assertCurrent });
+    await writeClaudeResponse({ upstream, response, model: route.modelId, signaturePrefix, streaming: parsed.stream === true, signal, assertCurrent, chat: translated });
   }
 
   async #handleChat(

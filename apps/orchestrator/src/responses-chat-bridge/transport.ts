@@ -37,37 +37,33 @@ function record(value: unknown): Readonly<Record<string, unknown>> | undefined {
     ? value as Record<string, unknown> : undefined;
 }
 
-export async function writeResponsesFromChat(input: {
+interface ChatResponseSource {
   readonly prepared: TranslatedResponsesChatRequest;
   readonly upstream: Response;
-  readonly response: ServerResponse;
   readonly signal: AbortSignal;
   readonly assertCurrent: () => void;
-}): Promise<void> {
-  const { upstream, response, prepared, signal } = input;
+}
+
+export async function* responsesEventsFromChat(input: ChatResponseSource): AsyncGenerator<Readonly<Record<string, unknown>>> {
+  const { upstream, prepared, signal } = input;
   if (upstream.body === null) throw new Error("The Chat response body is unavailable.");
   const assertCurrent = () => { signal.throwIfAborted(); input.assertCurrent(); };
-  const streaming = prepared.request.stream;
   const sse = upstream.headers.get("content-type")?.toLowerCase().includes("text/event-stream") === true;
   const translator = new ChatSseTranslator(prepared.request.model, {
     toolContext: prepared.toolContext,
     toolChoice: prepared.request.tool_choice
   });
-  let sequenceNumber = 0;
-  let terminal: Readonly<Record<string, unknown>> | undefined;
   let sawChoice = false;
-  const emit = async (events: readonly unknown[]): Promise<void> => {
+  let emitted = false;
+  function* emit(events: readonly unknown[]) {
     for (const raw of events) {
       assertCurrent();
       const event = record(raw);
       if (event === undefined || typeof event["type"] !== "string") continue;
-      if (["response.completed", "response.incomplete", "response.failed"].includes(event["type"])) terminal = record(event["response"]);
-      if (!streaming) continue;
-      if (!response.headersSent) response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store" });
-      const packet = JSON.stringify({ ...event, sequence_number: sequenceNumber++ });
-      if (!response.write(`event: ${event["type"]}\ndata: ${packet}\n\n`)) await once(response, "drain", { signal });
+      emitted = true;
+      yield event;
     }
-  };
+  }
   try {
     for await (const payload of readManagedProviderResponse({ body: upstream.body, sse, assertCurrent })) {
       if (payload.trim() === "[DONE]" && sse) {
@@ -87,16 +83,31 @@ export async function writeResponsesFromChat(input: {
         }
         sawChoice = true;
       }
-      await emit(translator.push(event));
+      yield* emit(translator.push(event));
     }
     if (!sawChoice) throw new Error("The Chat response contained no choices.");
-    await emit(translator.finish(sse));
+    yield* emit(translator.finish(sse));
   } catch {
     assertCurrent();
-    if (!response.headersSent && !sse) throw new Error("The Chat response could not be translated.");
-    await emit(translator.fail("The Chat provider did not complete its response."));
+    if (!sse && !(prepared.request.stream && emitted)) throw new Error("The Chat response could not be translated.");
+    yield* emit(translator.fail("The Chat provider did not complete its response."));
   }
-  assertCurrent();
+}
+
+export async function writeResponsesFromChat(input: ChatResponseSource & { readonly response: ServerResponse }): Promise<void> {
+  const { response, prepared, signal } = input;
+  const streaming = prepared.request.stream;
+  let sequenceNumber = 0;
+  let terminal: Readonly<Record<string, unknown>> | undefined;
+  for await (const event of responsesEventsFromChat(input)) {
+    if (event["type"] === "response.completed" || event["type"] === "response.incomplete" || event["type"] === "response.failed") terminal = record(event["response"]);
+    if (!streaming) continue;
+    if (!response.headersSent) response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store" });
+    const packet = JSON.stringify({ ...event, sequence_number: sequenceNumber++ });
+    if (!response.write(`event: ${event["type"]}\ndata: ${packet}\n\n`)) await once(response, "drain", { signal });
+  }
+  signal.throwIfAborted();
+  input.assertCurrent();
   if (streaming) {
     response.end();
     return;

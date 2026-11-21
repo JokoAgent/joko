@@ -273,6 +273,57 @@ describe("Managed Provider native proxy", () => {
     } finally { await f.dispose(); }
   });
 
+  it("returns Claude tool calls and tool history through the selected Chat Completions route", async () => {
+    const f = await fixture(false, "openai-completions", "claude-chat-provider", null, "anthropic-messages");
+    try {
+      const binding = await f.port.prepare(f.owner);
+      const lease = await binding.activate({ operationId: "claude-chat-turn", signal: new AbortController().signal, assertCurrent: () => undefined });
+      const request = (body: Record<string, unknown>) => fetch(`${binding.baseUrl}/v1/messages`, {
+        method: "POST", headers: { "x-api-key": f.token, "content-type": "application/json" },
+        body: JSON.stringify({ model: "model", max_tokens: 5_000, ...body })
+      });
+      try {
+        const toolName = "read_note";
+        const callId = "call-note";
+        const tools = [{ name: toolName, description: "Read a note", input_schema: { type: "object", properties: { name: { type: "string" } } } }];
+        const user = { role: "user", content: "Read the note." };
+        f.respondWith([
+          { id: "chat-first", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: callId, type: "function", function: { name: toolName, arguments: '{"name":"a"}' } }] }, finish_reason: null }] },
+          { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+          { choices: [], usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 } }
+        ].map(chatEvent).join("") + "data: [DONE]\n\n");
+        const turn = await request({ messages: [user], tools, tool_choice: { type: "tool", name: toolName }, stream: true });
+        expect(turn.status).toBe(200);
+        expect(responsesEvents(await turn.text())).toEqual(expect.arrayContaining([
+          expect.objectContaining({ type: "content_block_start", content_block: expect.objectContaining({ type: "tool_use", id: callId, name: toolName }) }),
+          expect.objectContaining({ type: "content_block_delta", delta: { type: "input_json_delta", partial_json: '{"name":"a"}' } }),
+          expect.objectContaining({ type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null } }),
+          { type: "message_stop" }
+        ]));
+        expect(f.receivedBodies[0]).toMatchObject({ model: "model", max_tokens: 4_000, stream: true,
+          tool_choice: { type: "function", function: { name: toolName } } });
+        f.respondWith([
+          { id: "chat-second", choices: [{ index: 0, delta: { content: "The note is ready." }, finish_reason: null }] },
+          { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }
+        ].map(chatEvent).join("") + "data: [DONE]\n\n");
+        const reply = await request({ tools, stream: false, messages: [
+          user,
+          { role: "assistant", content: [{ type: "tool_use", id: callId, name: toolName, input: { name: "a" } }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: callId, content: "A note" }] }
+        ] });
+        expect(reply.status).toBe(200);
+        expect(await reply.json()).toMatchObject({ type: "message", content: [{ type: "text", text: "The note is ready." }] });
+        expect(f.receivedBodies[1]?.["messages"]).toEqual(expect.arrayContaining([{ role: "tool", tool_call_id: callId, content: "A note" }]));
+        expect(f.received).toEqual(Array.from({ length: 2 }, () => ({ path: "/v1/chat/completions", model: "model",
+          authorization: "Bearer first-private-provider-credential" })));
+        expect(f.forwardedClaudeKeys).toEqual([undefined, undefined]);
+        await f.credentials.replaceSecret("credential-0", "different-managed-key");
+        expect((await request({ messages: [user] })).ok).toBe(false);
+        expect(f.received).toHaveLength(2);
+      } finally { lease.release(); binding.dispose(); }
+    } finally { await f.dispose(); }
+  });
+
   it("sends the exact saved Responses path and appends a distinct compact suffix", async () => {
     const f = await fixture(false, "openai-responses", "provider", "/tenant/responses/");
     try {

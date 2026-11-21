@@ -81,7 +81,7 @@ export function providerCompatibilityLabel(compatibility: ProviderCompatibilityV
     case "openaiChat": return "OpenAI Chat Completions";
     case "anthropic": return "Anthropic Messages";
     case "google": return "Google Generative AI";
-    case "openaiCompletions": return "OpenAI Completions";
+    case "openaiCompletions": return "OpenAI Chat Completions";
     case "native": return "Native";
   }
 }

@@ -2,6 +2,8 @@ import { once } from "node:events";
 import type { ServerResponse } from "node:http";
 import { AnthropicMessageCollector, ResponsesToClaudeStream, type AnthropicSseEvent } from "./managed-claude-responses-stream.js";
 import { readManagedProviderResponse } from "./managed-provider-response.js";
+import { responsesEventsFromChat } from "./responses-chat-bridge/transport.js";
+import type { TranslatedResponsesChatRequest } from "./responses-chat-bridge/translate-request.js";
 
 type Fields = Record<string, unknown>;
 
@@ -181,6 +183,7 @@ export async function writeClaudeResponse(input: {
   readonly streaming: boolean;
   readonly signal: AbortSignal;
   readonly assertCurrent: () => void;
+  readonly chat?: TranslatedResponsesChatRequest;
 }): Promise<void> {
   const { upstream, response, signal } = input;
   if (upstream.body === null) throw new Error("The Responses Provider returned no body.");
@@ -196,10 +199,14 @@ export async function writeClaudeResponse(input: {
       if (!response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)) await once(response, "drain", { signal });
     }
   };
-  for await (const payload of readManagedProviderResponse({ body: upstream.body, sse, assertCurrent })) {
-    if (sse && payload.trim() === "[DONE]") break;
-    const event: unknown = JSON.parse(payload);
-    await emit(sse ? translator.push(event) : translator.pushJson(event));
+  if (input.chat !== undefined) {
+    for await (const event of responsesEventsFromChat({ upstream, prepared: input.chat, signal, assertCurrent })) await emit(translator.push(event));
+  } else {
+    for await (const payload of readManagedProviderResponse({ body: upstream.body, sse, assertCurrent })) {
+      if (sse && payload.trim() === "[DONE]") break;
+      const event: unknown = JSON.parse(payload);
+      await emit(sse ? translator.push(event) : translator.pushJson(event));
+    }
   }
   await emit(translator.finish());
   assertCurrent();
