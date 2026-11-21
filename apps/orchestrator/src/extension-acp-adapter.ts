@@ -142,12 +142,13 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
   }
 
   async resumeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
-    const nativeId = this.nativeId(binding, context);
+    const nativeId = this.nativeId(binding, context, true);
     const current = this.sessions.get(context.sessionId);
-    if (current !== undefined && current.binding.opaqueRef !== binding.opaqueRef) {
+    if (current !== undefined && (current.binding.opaqueRef !== binding.opaqueRef || current.binding.generation !== context.generation)) {
       throw acpError("ACP_SESSION_UNAVAILABLE", "The native task binding changed.");
     }
     const session = current ?? await this.open(context, nativeId, "ask");
+    session.owner.assertCurrent();
     return this.state(session);
   }
 
@@ -380,9 +381,14 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
     return session;
   }
 
-  private nativeId(binding: NativeSessionBinding, context: AdapterContext): string {
+  private nativeId(binding: NativeSessionBinding, context: AdapterContext, reactivating = false): string {
     const id = safeIdentifier(binding.nativeSessionId);
-    if (id === undefined || binding.opaqueRef !== this.opaqueRef(id) || context.generation !== binding.generation) {
+    const current = context.binding;
+    const matchesCurrent = current !== undefined && current.generation === context.generation
+      && current.nativeSessionId === id && current.opaqueRef === binding.opaqueRef;
+    const next = reactivating && matchesCurrent && context.generation === binding.generation + 1;
+    if (id === undefined || binding.opaqueRef !== this.opaqueRef(id) || (current !== undefined && !matchesCurrent)
+      || (context.generation !== binding.generation && !next)) {
       throw acpError("ACP_SESSION_UNAVAILABLE", "The saved task engine binding is invalid.");
     }
     return id;

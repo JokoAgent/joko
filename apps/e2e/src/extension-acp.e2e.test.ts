@@ -114,6 +114,7 @@ it("starts only an approved packaged ACP engine and keeps task, permission, sche
     expect(archived.state, archived.error?.message).toBe(OperationState.SUCCEEDED);
     const restored = await submit(clients.operation, connectionId, archiveMutation(sessionId, false));
     expect(restored.state, restored.error?.message).toBe(OperationState.SUCCEEDED);
+    const detachedGeneration = store.getSession(sessionId).descriptor.binding.generation;
     const scheduleId = scheduleIdFrom(await submit(clients.operation, connectionId, createManualScheduleMutation({
       backendId, targetId, sessionId, sessionMode: ScheduleSessionMode.BOUND, text: "Run from the same engine"
     })));
@@ -122,7 +123,9 @@ it("starts only an approved packaged ACP engine and keeps task, permission, sche
       result => result.history[0]?.outcome === ScheduleRunOutcome.SUCCEEDED, "completed from the ordinary scheduler on the original engine");
     expect(history.history[0]?.sessionId).toBe(sessionId);
     expect(await readFile(launches, "utf8")).toBe("new\nload\n");
-    expect(store.getSession(sessionId).descriptor.binding.nativeSessionId).toBe(binding.nativeSessionId);
+    expect(store.getSession(sessionId).descriptor.binding).toMatchObject({
+      nativeSessionId: binding.nativeSessionId, opaqueRef: binding.opaqueRef, generation: detachedGeneration + 1
+    });
 
     const disabled = await mutate({ case: "setExtensionEnabled", value: { extensionId, enabled: false, expectedRevision: (await extension()).revision } });
     expect(disabled.state, disabled.error?.message).toBe(OperationState.SUCCEEDED);
