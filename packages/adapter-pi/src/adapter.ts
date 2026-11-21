@@ -9477,7 +9477,10 @@ function takeLifecycleParticipant(
 }
 
 function redactPiRpcEntry(entry: PiRpcEntry, secrets: readonly string[]): PiRpcEntry {
-  const redacted = redactPiNativeValue(entry, secrets);
+  const visible = entry.type === "message" && isRecord(entry.message) && entry.message.role === "system"
+    ? { id: entry.id, parentId: entry.parentId, timestamp: entry.timestamp, type: entry.type, message: { role: "system" } }
+    : entry;
+  const redacted = redactPiNativeValue(visible, secrets);
   if (!isRecord(redacted)) {
     throw piError("PI_ENTRY_RESPONSE_INVALID", "Pi returned an invalid native history entry", "stream");
   }
@@ -9531,7 +9534,7 @@ function projectPiMessage(
   const role: PiProjectedMessageRole = nativeRole === "user" || nativeRole === "assistant" || nativeRole === "toolResult"
     ? nativeRole
     : "custom";
-  let content = projectPiMessageParts(value.content, secrets);
+  let content = nativeRole === "system" ? [] : projectPiMessageParts(value.content, secrets);
   if (content.length === 0) {
     const fallback = projectPiCustomMessageText(nativeRole, value, secrets);
     if (fallback !== undefined) content = [{ type: "text", text: fallback }];
