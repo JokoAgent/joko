@@ -377,7 +377,7 @@ export class DesktopRegionCapture {
       return window !== undefined && !window.isDestroyed() && contents === window.webContents && isMainFrame
         && frameUrl === this.#options.entryUrl() && contents?.getURL() === frameUrl;
     };
-    partition.setPermissionCheckHandler((contents, permission, _origin, details) => {
+    partition.setPermissionCheckHandler((contents, permission: string, _origin, details) => {
       return claimsOwner(contents, details.isMainFrame, details.requestingUrl)
         && (permission === "display-capture" || permission === "media" && (details.mediaType === "unknown"
           || details.mediaType === "audio" && this.#live?.microphone === true));
