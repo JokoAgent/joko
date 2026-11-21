@@ -135,14 +135,14 @@ async function fixture(
     { id: "model", input: ["text"] as const, contextWindow: 64_000, maxTokens: 4_000 },
     { id: "child-model", input: ["text"] as const, contextWindow: 128_000, maxTokens: 8_000 }
   ];
-  const write = async (revision: bigint, secret: string) => {
+  const write = async (revision: bigint, secret: string, modelEndpoint?: string) => {
     const reference = `credential-${revision}`;
     const ticket = credentials.createUploadTicket(); credentials.upload(ticket.credentialUploadTicketId, secret);
     await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: reference, displayName: "Provider credential", kind: "api_key" });
     await providers.upsertConfiguration({ providerId, displayName: "Provider", kind: "custom_endpoint", enabled: true, expectedVersion: revision,
       runtimes: [{ backendId: "runtime", provider: { id: providerId, api: protocol, baseUrl, apiKeyEnv: "PROVIDER_KEY",
         headers: { "X-Joko-Provider-Proxy-Token": { env: "PROVIDER_KEY" } },
-        models: catalogModels },
+        models: modelEndpoint === undefined ? catalogModels : catalogModels.map(model => model.id === owner.modelId ? { ...model, baseUrl: modelEndpoint } : model) },
         credentialBindings: { PROVIDER_KEY: reference }, credentialOrigin: endpoint, requestPath }] });
   };
   await write(0n, "first-private-provider-credential");
@@ -320,6 +320,28 @@ describe("Managed Provider native proxy", () => {
         await f.credentials.replaceSecret("credential-0", "different-managed-key");
         expect((await request({ messages: [user] })).ok).toBe(false);
         expect(f.received).toHaveLength(2);
+      } finally { lease.release(); binding.dispose(); }
+    } finally { await f.dispose(); }
+  });
+
+  it("sends inference to a saved same-origin model endpoint and rejects a different authority", async () => {
+    const f = await fixture(false, "openai-responses", "per-model-provider", null);
+    try {
+      const configured = f.providers.get(f.owner.backendId, f.owner.providerId);
+      const modelEndpoint = new URL("/model-api/v2", configured.provider.baseUrl).href;
+      await f.write(configured.version, "managed-model-credential", modelEndpoint);
+      const updated = f.providers.get(f.owner.backendId, f.owner.providerId);
+      await expect(f.write(updated.version, "different-secret", "https://other.example.test/v2")).rejects.toThrow("configured origin");
+      const binding = await f.port.prepare(f.owner);
+      const lease = await binding.activate({ operationId: "saved-model-endpoint", signal: new AbortController().signal, assertCurrent: () => undefined });
+      try {
+        const response = await fetch(`${binding.baseUrl}/responses`, {
+          method: "POST", headers: { authorization: `Bearer ${f.token}`, "content-type": "application/json" },
+          body: JSON.stringify({ model: f.owner.modelId, input: "Selected model route" })
+        });
+        expect(response.status).toBe(200);
+        await response.text();
+        expect(f.received).toEqual([{ path: "/model-api/v2/responses", model: "model", authorization: "Bearer managed-model-credential" }]);
       } finally { lease.release(); binding.dispose(); }
     } finally { await f.dispose(); }
   });

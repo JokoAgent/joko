@@ -3973,7 +3973,7 @@ export interface ProviderConfigurationView {
 
 export type ProviderCompatibilityView = "anthropic" | "openaiResponses" | "openaiChat" | "openaiCompletions" | "native" | "google";
 export type ProviderConfigurationFieldView = "requestPath" | "modelsEndpoint" | "headers" | "keyless" | "authHeader"
-  | "modelLimits" | "modelCosts" | "modelInputModalities" | "modelThinkingLevels" | "modelSampling" | "modelCompatibility" | "modelFastMode";
+  | "modelLimits" | "modelCosts" | "modelInputModalities" | "modelThinkingLevels" | "modelSampling" | "modelCompatibility" | "modelFastMode" | "modelEndpoint";
 
 export interface ProviderRuntimeConfigurationView {
   readonly backendId: string;
@@ -4004,6 +4004,7 @@ export interface ProviderThinkingLevelView {
 export interface ProviderModelConfigurationView {
   readonly modelId: string;
   readonly name: string;
+  readonly endpoint?: string;
   readonly mode?: string;
   readonly compatibility?: ProviderCompatibilityView;
   readonly reasoning: boolean;

@@ -11,6 +11,7 @@ import {
   type PiManagedSettings
 } from "@joko/adapter-pi";
 import { isGeminiChatEndpoint } from "@joko/contracts";
+import { isSameOriginModelEndpoint } from "@joko/core";
 import type { OperationalStore } from "@joko/store";
 
 import { CredentialVault, type EncryptedCredential } from "./credential-vault.js";
@@ -1615,7 +1616,7 @@ export class ProviderCatalogManager {
     const supportsImages = model.input?.includes("image") === true;
     if (options.requireImages === true && !supportsImages) return undefined;
     const video = options.purpose === "xai_video";
-    const baseUrl = video ? videoGenerationBaseUrl(entry.provider.baseUrl) : entry.provider.baseUrl;
+    const baseUrl = video ? videoGenerationBaseUrl(entry.provider.baseUrl) : model.baseUrl ?? entry.provider.baseUrl;
     if (baseUrl === undefined || !safeEmbeddingBaseUrl(baseUrl)) return undefined;
 
     let secret: string | undefined;
@@ -2915,7 +2916,7 @@ export function discoveredManagedModel(model: DiscoveredProviderModel, customPiA
 
 function eligibleForWithdrawal(entry: ManagedProviderEntry, model: PiManagedModel): boolean {
   return model.discoveredMetadata !== undefined && model.metadataOverrides?.includes("name") !== true
-    && model.api === undefined && entry.provider.modelOverrides?.[model.id] === undefined && isManagedChatModel(model);
+    && model.api === undefined && model.baseUrl === undefined && entry.provider.modelOverrides?.[model.id] === undefined && isManagedChatModel(model);
 }
 
 function automaticOpenCodeGoResponsesModel(entry: ManagedProviderEntry): PiManagedModel | undefined {
@@ -2944,6 +2945,9 @@ function validateProviderEntry(entry: ManagedProviderEntry): void {
     throw new Error("Provider kind is invalid.");
   }
   if (entry.provider.baseUrl !== undefined) validateEndpoint(entry.provider.baseUrl);
+  for (const model of entry.provider.models ?? []) {
+    if (model.baseUrl !== undefined && !isSameOriginModelEndpoint(entry.provider.baseUrl, model.baseUrl)) throw new Error("Provider model endpoint must use the configured origin.");
+  }
   if (typeof entry.credentialOrigin !== "string") throw new Error("Provider credential origin is required.");
   const origin = entry.provider.baseUrl === undefined ? undefined : new URL(entry.provider.baseUrl).origin;
   if (Object.keys(entry.credentialBindings).length > 0 && (origin === undefined || entry.credentialOrigin !== origin)) {

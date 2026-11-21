@@ -10685,6 +10685,7 @@ function mapProviderModelConfiguration(item: PiManagedModel): contract.ProviderM
     mode: managedModelMode(item),
     displayName: item.name ?? item.id,
     apiCompatibility: item.api === undefined ? undefined : protoProviderApi(item.api),
+    endpoint: item.baseUrl,
     reasoning: item.reasoning ?? false,
     supportsFastMode: item.supportsFastMode === true,
     defaultVisible: item.defaultVisible,
@@ -10785,6 +10786,7 @@ function assertProviderRuntimeSupport(dependencies: ConnectServiceDependencies, 
       requireField("model_sampling", Object.keys(model.samplingParams ?? {}).length > 0);
       requireField("model_compatibility", Object.keys(model.compat ?? {}).length > 0);
       requireField("model_fast_mode", model.supportsFastMode === true);
+      requireField("model_endpoint", model.baseUrl !== undefined);
     }
   }
 }
@@ -10900,6 +10902,7 @@ function providerModelFromProto(input: contract.ProviderModelConfiguration): PiM
     ...(inherited.size === 0 ? {} : { metadataOverrides: PI_EDITABLE_MODEL_METADATA_FIELDS.filter(field => !inherited.has(field)) }),
     ...(input.displayName === "" ? {} : { name: input.displayName }),
     ...(input.apiCompatibility === undefined ? {} : { api: nativeProviderApi(input.apiCompatibility, false)! }),
+    ...(input.endpoint === undefined ? {} : { baseUrl: input.endpoint || undefined }),
     reasoning: input.reasoning,
     supportsFastMode: input.supportsFastMode,
     ...(input.defaultVisible === undefined ? {} : { defaultVisible: input.defaultVisible }),

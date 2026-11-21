@@ -212,6 +212,9 @@ message ProviderModelConfiguration {
   // Explicit model purpose, such as chat or audio_speech. This is host metadata,
   // independent of the runtime's chat wire protocol and model visibility.
   optional string mode = 20;
+  // Model-specific API base URL on the runtime's credential origin. Omission
+  // preserves a saved endpoint, while an empty string restores inheritance.
+  optional string endpoint = 21;
 }
 
 enum ProviderModelInheritedField {

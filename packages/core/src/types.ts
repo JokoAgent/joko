@@ -795,7 +795,8 @@ export type ProviderConfigurationField =
   | "model_thinking_levels"
   | "model_sampling"
   | "model_compatibility"
-  | "model_fast_mode";
+  | "model_fast_mode"
+  | "model_endpoint";
 
 export interface ProviderRuntimeSupport {
   readonly protocols: readonly ProviderRuntimeProtocol[];

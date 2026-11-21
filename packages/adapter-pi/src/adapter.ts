@@ -951,7 +951,7 @@ export class PiBackendAdapter implements
       providerRuntimeSupport: {
         protocols: ["anthropic-messages", "openai-responses", "openai-completions", "google-generative-ai"],
         fields: ["models_endpoint", "headers", "keyless", "auth_header", "model_limits", "model_costs",
-          "model_input_modalities", "model_thinking_levels", "model_sampling", "model_compatibility", "model_fast_mode"]
+          "model_input_modalities", "model_thinking_levels", "model_sampling", "model_compatibility", "model_fast_mode", "model_endpoint"]
       },
       models: mergeProviderModels(catalog.models, this.#options.nativeModels ?? []),
       providers: [{
@@ -9157,7 +9157,7 @@ function providerAuthenticationRouteExists(options: PiAdapterOptions, providerId
 function managedMessagesEndpoint(providers: readonly PiManagedProvider[] | undefined, providerId: string, modelId: string): string | undefined {
   const provider = providers?.find(candidate => candidate.id === providerId);
   const model = provider?.models.find(candidate => candidate.id === modelId);
-  return model !== undefined && (model.api ?? provider?.api) === "anthropic-messages" ? provider?.baseUrl : undefined;
+  return model !== undefined && (model.api ?? provider?.api) === "anthropic-messages" ? model.baseUrl ?? provider?.baseUrl : undefined;
 }
 
 function providerRequiresAuthentication(options: PiAdapterOptions, providerId: string): boolean {

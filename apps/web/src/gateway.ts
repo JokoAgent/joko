@@ -8566,6 +8566,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       displayName: model.name.trim(),
       ...(model.mode === undefined ? {} : { mode: model.mode }),
       ...(model.compatibility === undefined ? {} : { apiCompatibility: protoProviderCompatibility(model.compatibility) }),
+      endpoint: model.endpoint === undefined ? "" : canonicalProviderEndpoint(model.endpoint),
       reasoning: model.reasoning,
       inputModalities: model.inputModalities.map(protoInputModality),
       contextWindowTokens: safeUnsignedBigInt(model.contextWindowTokens),
@@ -20993,6 +20994,7 @@ function mapProviderModelConfiguration(model: ProviderModelConfiguration): Provi
   return {
     modelId: model.modelId,
     name: model.displayName,
+    ...(model.endpoint === undefined ? {} : { endpoint: model.endpoint }),
     ...(model.mode === undefined ? {} : { mode: model.mode }),
     ...(model.apiCompatibility === undefined ? {} : { compatibility: providerCompatibility(model.apiCompatibility) }),
     reasoning: model.reasoning,
@@ -25166,6 +25168,7 @@ function providerConfigurationField(value: ProviderConfigurationField): NonNulla
     case ProviderConfigurationField.MODEL_SAMPLING: return "modelSampling";
     case ProviderConfigurationField.MODEL_COMPATIBILITY: return "modelCompatibility";
     case ProviderConfigurationField.MODEL_FAST_MODE: return "modelFastMode";
+    case ProviderConfigurationField.MODEL_ENDPOINT: return "modelEndpoint";
     default: return undefined;
   }
 }
