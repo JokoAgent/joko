@@ -7618,10 +7618,13 @@ function validKnownPiHistoryEntryPayload(entry: Readonly<Record<string, unknown>
 }
 
 function validPiAgentMessage(value: unknown): boolean {
-  if (!isRecord(value) || !nonEmptyPiHistoryText(value.role) || !finiteNonNegativePiNumber(value.timestamp)) {
-    return false;
-  }
+  if (!isRecord(value) || !nonEmptyPiHistoryText(value.role)) return false;
+  // Published forks can keep a role-only system marker on the native tree.
+  if (value.role === "system" && Object.keys(value).length === 1) return true;
+  if (!finiteNonNegativePiNumber(value.timestamp)) return false;
   switch (value.role) {
+    case "system":
+      return value.content == null || typeof value.content === "string";
     case "user":
       return validPiUserContent(value.content);
     case "assistant":
