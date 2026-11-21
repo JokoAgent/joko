@@ -38,6 +38,11 @@ export function isDesktopRemoteDesktopWayland(runtime: DesktopRemoteDesktopLinux
   return runtime.platform === "linux" && (runtime.environment["XDG_SESSION_TYPE"] === "wayland"
     || Boolean(runtime.environment["WAYLAND_DISPLAY"]));
 }
+export function isDesktopRemoteDesktopX11(runtime: DesktopRemoteDesktopLinuxRuntime = linuxRuntime()): boolean {
+  return runtime.platform === "linux" && runtime.environment["XDG_SESSION_TYPE"] === "x11"
+    && !isDesktopRemoteDesktopWayland(runtime)
+    && /^(?:unix)?:[0-9]+(?:\.0)?$/u.test(runtime.environment["DISPLAY"] ?? "");
+}
 export function supportsDesktopRemoteDesktopLinuxCapture(runtime: DesktopRemoteDesktopLinuxRuntime = linuxRuntime()): boolean {
   return isDesktopRemoteDesktopWayland(runtime) && Boolean(runtime.environment["HYPRLAND_INSTANCE_SIGNATURE"])
     && runtime.executable(GRIM);
@@ -84,7 +89,7 @@ async function readLinuxSessionState(signal: AbortSignal, runtime: DesktopRemote
       return "unsupported";
     }
     if (sessionType === "x11") {
-      // Chromium captures only an ordinary owned desktop; X11 never grants locked viewing or native effects.
+      // Ordinary X11 viewing and input both require an unlocked, owned login.
       return properties.get("LockedHint") === "no" ? "unlocked" : "unsupported";
     }
     if (!runtime.environment["HYPRLAND_INSTANCE_SIGNATURE"]) {
@@ -168,6 +173,32 @@ export function linuxRemoteDesktopInputMapping(monitors: readonly DesktopRemoteD
   });
 }
 
+/** Convert the full Electron display layout from DIP to a selected X root rectangle. */
+export function linuxRemoteDesktopX11Layout(displays: readonly {
+  readonly id: number;
+  readonly scaleFactor: number;
+  readonly rotation: number;
+  readonly bounds: { readonly x: number; readonly y: number; readonly width: number; readonly height: number };
+}[], displayId: string): { readonly args: readonly string[]; readonly identity: string } {
+  const selected = displays.find(display => String(display.id) === displayId);
+  if (!selected) throw new Error("REMOTE_DESKTOP_DISPLAY_MISSING");
+  const scale = selected.scaleFactor;
+  if (!Number.isFinite(scale) || scale <= 0 || displays.some(display => display.scaleFactor !== scale)) {
+    throw new Error("REMOTE_DESKTOP_INPUT_UNSUPPORTED");
+  }
+  const left = Math.min(...displays.map(display => display.bounds.x));
+  const top = Math.min(...displays.map(display => display.bounds.y));
+  const { x, y, width, height } = selected.bounds;
+  const geometry = [x - left, y - top, width, height].map(value => Math.round(value * scale));
+  if (geometry.some(value => !Number.isSafeInteger(value) || value < 0 || value > 32767)
+    || geometry[2] === 0 || geometry[3] === 0) throw new Error("REMOTE_DESKTOP_DISPLAY_MISSING");
+  return {
+    args: ["--x11", ...geometry.map(String)],
+    identity: JSON.stringify([...displays].sort((first, second) => first.id - second.id)
+      .map(({ id, bounds, scaleFactor, rotation }) => [id, bounds.x, bounds.y, bounds.width, bounds.height, scaleFactor, rotation]))
+  };
+}
+
 export async function readDesktopRemoteDesktopLinuxMonitor(displayId: string, signal: AbortSignal, includeMirrored = false) {
   const monitors = await readDesktopRemoteDesktopLinuxMonitors(signal, linuxRuntime(), includeMirrored);
   const monitor = displayId === WAYLAND_REMOTE_DESKTOP_DISPLAY_ID && monitors.length === 1 ? monitors[0]
@@ -185,7 +216,7 @@ export async function resolveDesktopRemoteDesktopLinuxBinary(kind: "input" | "ca
   const existing = building.get(kind); if (existing !== undefined) return existing;
   const pending = (async () => {
     const root = join(app.getAppPath(), "native", "remote-desktop", `linux-${kind}`);
-    const files = kind === "input" ? ["main.c", "build.mjs", "virtual-keyboard-unstable-v1.xml", "wlr-virtual-pointer-unstable-v1.xml"]
+    const files = kind === "input" ? ["main.c", "x11.h", "build.mjs", "virtual-keyboard-unstable-v1.xml", "wlr-virtual-pointer-unstable-v1.xml"]
       : ["main.c", "cursor.h", "build.mjs", "wlr-screencopy-unstable-v1.xml", "ext-image-copy-capture-v1.xml",
           "ext-image-capture-source-v1.xml", "ext-foreign-toplevel-list-v1.xml"];
     const digest = createHash("sha256").update(process.arch);
@@ -205,8 +236,9 @@ export async function resolveDesktopRemoteDesktopLinuxBinary(kind: "input" | "ca
 
 export interface DesktopRemoteDesktopLinuxHelperRuntime {
   supported(): boolean;
+  x11?(): boolean;
   resolveBinary(kind: "input" | "capture"): Promise<string>;
-  execute(binary: string, command: string, signal: AbortSignal): Promise<string>;
+  execute(binary: string, arguments_: readonly string[], signal: AbortSignal): Promise<string>;
 }
 export async function readDesktopRemoteDesktopLinuxInputSupport(signal: AbortSignal,
   runtime?: DesktopRemoteDesktopLinuxHelperRuntime): Promise<boolean> {
@@ -218,14 +250,16 @@ export async function readDesktopRemoteDesktopLinuxCursorSupport(signal: AbortSi
 }
 async function readHelperSupport(kind: "input" | "capture", command: string, signal: AbortSignal,
   runtime: DesktopRemoteDesktopLinuxHelperRuntime = {
-    supported: supportsDesktopRemoteDesktopLinuxCapture, resolveBinary: resolveDesktopRemoteDesktopLinuxBinary,
-    execute: async (binary, argument, cancellation) =>
-      (await exec(binary, [argument], { timeout: 3_000, maxBuffer: 1_024, signal: cancellation })).stdout
+    supported: supportsDesktopRemoteDesktopLinuxCapture, x11: isDesktopRemoteDesktopX11,
+    resolveBinary: resolveDesktopRemoteDesktopLinuxBinary,
+    execute: async (binary, arguments_, cancellation) =>
+      (await exec(binary, [...arguments_], { timeout: 3_000, maxBuffer: 1_024, signal: cancellation })).stdout
   }): Promise<boolean> {
-  if (!runtime.supported()) return false;
+  const x11 = kind === "input" && runtime.x11?.() === true;
+  if (!x11 && !runtime.supported()) return false;
   try {
     const binary = await runtime.resolveBinary(kind); aborted(signal);
-    const stdout = await runtime.execute(binary, command, signal);
+    const stdout = await runtime.execute(binary, x11 ? ["--x11", command] : [command], signal);
     aborted(signal); return stdout.trim() === "ready";
   } catch { aborted(signal); return false; }
 }

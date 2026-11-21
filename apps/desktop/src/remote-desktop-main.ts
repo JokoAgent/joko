@@ -53,6 +53,8 @@ import { DesktopRemoteDesktopLinuxPrivacyScreen, supportsDesktopRemoteDesktopLin
 import {
   WAYLAND_REMOTE_DESKTOP_DISPLAY_ID,
   isDesktopRemoteDesktopWayland,
+  isDesktopRemoteDesktopX11,
+  linuxRemoteDesktopX11Layout,
   supportsDesktopRemoteDesktopLinuxCapture,
   readDesktopRemoteDesktopLinuxSessionState,
   readDesktopRemoteDesktopLinuxLockSessionState,
@@ -240,17 +242,22 @@ export function createDesktopRemoteDesktopMainHost(
         return () => { linuxDisplayListeners.delete(listener); };
       }
       const removed = (_event: Electron.Event, display: Electron.Display): void => {
+        if (isDesktopRemoteDesktopX11()) host?.releaseControl();
         if (privacy?.active) host?.displayCoverageChanged();
         listener(String(display.id), true, {
           width: display.size.width, height: display.size.height, metrics: ["removed"]
         });
       };
-      const added = (): void => { if (privacy?.active) host?.displayCoverageChanged(); };
+      const added = (): void => {
+        if (isDesktopRemoteDesktopX11()) host?.releaseControl();
+        if (privacy?.active) host?.displayCoverageChanged();
+      };
       const changed = (
         _event: Electron.Event,
         display: Electron.Display,
         metrics: string[]
       ): void => {
+        if (isDesktopRemoteDesktopX11() && metrics.some(metric => ["bounds", "scaleFactor", "rotation"].includes(metric))) host?.releaseControl();
         listener(String(display.id), metrics.some((metric) =>
           metric === "bounds" || metric === "workArea" || metric === "scaleFactor" || metric === "rotation"), {
             width: display.size.width, height: display.size.height, metrics: Object.freeze([...metrics])
@@ -319,7 +326,7 @@ export function createDesktopRemoteDesktopMainHost(
       ...(linuxWorkspace === undefined ? { workspaceNavigation: false, systemMenu: false }
         : await readDesktopRemoteDesktopLinuxWorkspaceSupport(signal)),
       lockOnExit: isDesktopRemoteDesktopWayland() && await supportsDesktopRemoteDesktopLinuxLock(signal),
-      canControl: supportsDesktopRemoteDesktopLinuxCapture() && await readDesktopRemoteDesktopLinuxInputSupport(signal),
+      canControl: (!isDesktopRemoteDesktopX11() || hasDesktopRemoteDesktopX11Layout()) && await readDesktopRemoteDesktopLinuxInputSupport(signal),
       cursorOverlay: supportsDesktopRemoteDesktopLinuxCapture() && await readDesktopRemoteDesktopLinuxCursorSupport(signal),
       displayModes: supportsDesktopRemoteDesktopLinuxCapture() && await supportsDesktopRemoteDesktopLinuxDisplayModes(signal),
       viewerDisplay: supportsDesktopRemoteDesktopLinuxCapture() && await supportsDesktopRemoteDesktopLinuxViewerDisplay(signal),
@@ -427,6 +434,11 @@ export function createDesktopRemoteDesktopMainHost(
 
 export async function closeDesktopRemoteDesktopClipboardWriter(): Promise<void> {
   await desktopRemoteDesktopLinuxClipboard.closePublishedWriter();
+}
+
+function hasDesktopRemoteDesktopX11Layout(): boolean {
+  try { linuxRemoteDesktopX11Layout(screen.getAllDisplays(), String(screen.getPrimaryDisplay().id)); return true; }
+  catch { return false; }
 }
 
 async function desktopSessionState(signal: AbortSignal): Promise<DesktopRemoteDesktopSessionState> {

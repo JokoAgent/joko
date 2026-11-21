@@ -32,6 +32,7 @@ static struct xkb_state *state;
 static bool keys[256], buttons[3];
 static volatile sig_atomic_t stopping;
 static const uint32_t button_codes[] = {BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
+#include "x11.h"
 static uint32_t now(void) {
   struct timespec t;
   clock_gettime(CLOCK_MONOTONIC, &t);
@@ -96,22 +97,30 @@ static void key(uint32_t code, bool down) {
   if (keys[code] == down)
     return;
   keys[code] = down;
+  if (use_x11) {
+    x11_key(code, down);
+    return;
+  }
   zwp_virtual_keyboard_v1_key(keyboard, now(), code, down);
   xkb_state_update_key(state, code + 8, down ? XKB_KEY_DOWN : XKB_KEY_UP);
   modifiers();
 }
 static void release_all(void) {
-  if (keyboard && state)
+  if (use_x11 || (keyboard && state))
     for (uint32_t i = 0; i < 256; i++)
       if (keys[i])
         key(i, false);
-  if (pointer) {
+  if (use_x11 || pointer) {
     for (int i = 0; i < 3; i++)
       if (buttons[i]) {
-        zwlr_virtual_pointer_v1_button(pointer, now(), button_codes[i], 0);
+        if (use_x11)
+          x11_button(i, false);
+        else
+          zwlr_virtual_pointer_v1_button(pointer, now(), button_codes[i], 0);
         buttons[i] = false;
       }
-    zwlr_virtual_pointer_v1_frame(pointer);
+    if (!use_x11)
+      zwlr_virtual_pointer_v1_frame(pointer);
   }
 }
 static int key_code(const char *name) {
@@ -221,6 +230,8 @@ static bool text_input(const char *text) {
     return true;
   release_all(); // Text commits are not keyboard shortcuts; never leave
                  // modifiers held.
+  if (use_x11)
+    return x11_text(text);
   uint32_t syms[4096];
   size_t count = 0;
   const unsigned char *p = (const unsigned char *)text;
@@ -314,7 +325,13 @@ static bool event(json_object *object, bool apply) {
     if (click && (!number(object, "button", 0, 2, &button) ||
                   button != floor(button) || !boolean(object, "down", &down)))
       return false;
-    if (apply) {
+    if (apply && use_x11) {
+      x11_move(x, y);
+      if (click) {
+        buttons[(int)button] = down;
+        x11_button((int)button, down);
+      }
+    } else if (apply) {
       zwlr_virtual_pointer_v1_motion_absolute(
           pointer, now(), (uint32_t)llround(x * 1000000),
           (uint32_t)llround(y * 1000000), 1000000, 1000000);
@@ -336,7 +353,9 @@ static bool event(json_object *object, bool apply) {
     if (!number(object, "dx", -2000, 2000, &x) ||
         !number(object, "dy", -2000, 2000, &y))
       return false;
-    if (apply) {
+    if (apply && use_x11)
+      x11_scroll(x, y);
+    else if (apply) {
       zwlr_virtual_pointer_v1_axis_source(pointer,
                                           WL_POINTER_AXIS_SOURCE_CONTINUOUS);
       if (x)
@@ -368,7 +387,7 @@ static bool event(json_object *object, bool apply) {
     size_t count = 0;
     while (*p) {
       codepoint(&p);
-      if (++count > 4096)
+      if (++count > (use_x11 ? 64u : 4096u))
         return false;
     }
     return !apply || text_input(text);
@@ -387,11 +406,14 @@ static bool batch(const char *line, size_t size, bool apply) {
             json_object_array_length(array) <= 256;
   json_tokener_free(tok);
   if (ok)
-    for (size_t i = 0; i < json_object_array_length(array); i++)
-      if (!event(json_object_array_get_idx(array, i), false)) {
+    for (size_t i = 0; i < json_object_array_length(array); i++) {
+      json_object *item = json_object_array_get_idx(array, i);
+      if (!event(item, false) || (use_x11 && json_object_array_length(array) > 1 &&
+                                  !strcmp(string(item, "kind"), "text"))) {
         ok = false;
         break;
       }
+    }
   if (ok && apply)
     for (size_t i = 0; i < json_object_array_length(array) && !stopping; i++)
       if (!event(json_object_array_get_idx(array, i), true)) {
@@ -405,15 +427,28 @@ static bool batch(const char *line, size_t size, bool apply) {
 int main(int argc, char **argv) {
   bool check = argc == 2 && !strcmp(argv[1], "--check");
   bool validate = argc == 2 && !strcmp(argv[1], "--validate");
-  if (argc > 1 && !check && !validate)
+  use_x11 = argc >= 2 && !strcmp(argv[1], "--x11");
+  if (use_x11) {
+    check = argc == 3 && !strcmp(argv[2], "--check");
+    if (!check && argc != 6)
+      return 2;
+  } else if (argc > 1 && !check && !validate)
     return 2;
   signal(SIGTERM, interrupted);
   signal(SIGINT, interrupted);
   signal(SIGPIPE, SIG_IGN);
-  // Also bound Wayland roundtrips if the compositor or parent stalls.
+  // Also bound native roundtrips if the display server or parent stalls.
   signal(SIGALRM, interrupted);
   alarm(6);
-  if (!validate) {
+  if (use_x11) {
+    if (!x11_open(check ? NULL : argv + 2))
+      return 2;
+    if (check) {
+      puts("ready");
+      XCloseDisplay(xdisplay);
+      return 0;
+    }
+  } else if (!validate) {
     display = wl_display_connect(NULL);
     if (!display)
       return 2;
@@ -457,7 +492,7 @@ int main(int argc, char **argv) {
   while (!stopping) {
     struct pollfd fds[2] = {
         {STDIN_FILENO, POLLIN, 0},
-        {validate ? -1 : wl_display_get_fd(display), POLLIN, 0}};
+        {validate || use_x11 ? -1 : wl_display_get_fd(display), POLLIN, 0}};
     int polled = poll(fds, 2, 6000);
     if (polled <= 0)
       break;
@@ -478,11 +513,15 @@ int main(int argc, char **argv) {
         stopping = 1;
         break;
       }
-      if (!validate && wl_display_roundtrip(display) < 0) {
+      if (use_x11)
+        XSync(xdisplay, False);
+      else if (!validate && wl_display_roundtrip(display) < 0) {
         ok = false;
         stopping = 1;
         break;
       }
+      if (stopping)
+        break;
       puts("ok");
       fflush(stdout);
       alarm(6);
@@ -495,7 +534,11 @@ int main(int argc, char **argv) {
       break;
     }
   }
-  if (!validate) {
+  if (use_x11) {
+    release_all();
+    XSync(xdisplay, False);
+    XCloseDisplay(xdisplay);
+  } else if (!validate) {
     release_all();
     // Wait for releases to be processed before removing virtual devices.
     wl_display_roundtrip(display);

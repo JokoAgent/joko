@@ -15,7 +15,7 @@ import type {
 import type { DesktopRemoteDesktopInputPort, DesktopRemoteDesktopInputOwnership } from "./remote-desktop-host.js";
 import { verifyPackagedDesktopRemoteDesktopBinary } from "./remote-desktop-native-manifest.js";
 import {
-  linuxRemoteDesktopInputMapping, readDesktopRemoteDesktopLinuxInputSupport,
+  isDesktopRemoteDesktopX11, linuxRemoteDesktopInputMapping, linuxRemoteDesktopX11Layout, readDesktopRemoteDesktopLinuxInputSupport,
   readDesktopRemoteDesktopLinuxMonitors, readDesktopRemoteDesktopLinuxSessionState,
   resolveDesktopRemoteDesktopLinuxBinary, type DesktopRemoteDesktopLinuxMonitor
 } from "./remote-desktop-linux.js";
@@ -47,6 +47,7 @@ export interface DesktopRemoteDesktopInputRuntime {
   linuxSupport?(signal: AbortSignal): Promise<boolean>;
   linuxSession?(signal: AbortSignal): Promise<DesktopRemoteDesktopSessionState>;
   linuxMonitors?(signal: AbortSignal): Promise<readonly DesktopRemoteDesktopLinuxMonitor[]>;
+  linuxX11?(displayId: string): ReturnType<typeof linuxRemoteDesktopX11Layout> | undefined;
 }
 
 export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort {
@@ -65,6 +66,7 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
   #privacyPaused = false;
   #linuxMapping: ((x: number, y: number) => { x: number; y: number }) | undefined;
   #linuxLayout = "";
+  #linuxX11 = false;
   #linuxQueue: Promise<void> = Promise.resolve();
   #linuxQueueBytes = 0;
   #linuxAck: ((error?: Error) => void) | undefined;
@@ -90,27 +92,37 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
     const binary = await this.#runtime.resolveBinary();
     let linuxMapping: ((x: number, y: number) => { x: number; y: number }) | undefined;
     let linuxLayout = "";
+    let arguments_: readonly string[] = window ? ["--window", String(window.windowId), String(window.pid)] : [];
+    let x11 = false;
     if (this.#runtime.platform === "linux") {
       if (!await (this.#runtime.linuxSupport ?? readDesktopRemoteDesktopLinuxInputSupport)(signal)
         || await (this.#runtime.linuxSession ?? readDesktopRemoteDesktopLinuxSessionState)(signal) !== "unlocked") {
         throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
       }
-      const monitors = await (this.#runtime.linuxMonitors ?? readDesktopRemoteDesktopLinuxMonitors)(signal);
-      linuxMapping = linuxRemoteDesktopInputMapping(monitors, displayId);
-      linuxLayout = JSON.stringify(monitors);
+      const layout = this.#runtime.linuxX11?.(displayId);
+      if (layout) {
+        x11 = true;
+        arguments_ = layout.args;
+        linuxLayout = layout.identity;
+      } else {
+        const monitors = await (this.#runtime.linuxMonitors ?? readDesktopRemoteDesktopLinuxMonitors)(signal);
+        linuxMapping = linuxRemoteDesktopInputMapping(monitors, displayId);
+        linuxLayout = JSON.stringify(monitors);
+      }
       if (await (this.#runtime.linuxSession ?? readDesktopRemoteDesktopLinuxSessionState)(signal) !== "unlocked") {
         throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
       }
     }
     throwIfAborted(signal);
     if (generation !== this.#generation) throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
-    const child = this.#runtime.spawn(binary, window ? ["--window", String(window.windowId), String(window.pid)] : []);
+    const child = this.#runtime.spawn(binary, arguments_);
     this.#child = child;
     this.#displayId = displayId;
     this.#window = window;
     this.#ownership = ownership; this.#inputAbort = new AbortController();
     this.#linuxMapping = linuxMapping;
     this.#linuxLayout = linuxLayout;
+    this.#linuxX11 = x11;
     child.stderr.resume();
     child.stdin.on("error", () => {
       if (this.#child === child) this.#failed();
@@ -188,6 +200,10 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
     if (this.#privacyPaused) return;
     if (this.#window) { this.#write(events); return; }
     if (this.#runtime.platform === "linux") {
+      if (this.#linuxX11) {
+        this.#writeX11(events);
+        return;
+      }
       if (this.#linuxMapping === undefined || this.#child === undefined) throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
       const projected = events.flatMap((event) => {
         if (event.kind === "move" || event.kind === "button") return [{ ...event, ...this.#linuxMapping!(event.x, event.y) }];
@@ -217,6 +233,25 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
     this.#write(projected, points, events.some(event => event.kind === "scroll"));
   }
 
+  #writeX11(events: readonly RemoteDesktopInput[]): void {
+    const batch: RemoteDesktopInput[] = [];
+    for (const event of events) {
+      if (event.kind !== "text") {
+        batch.push(event);
+        if (batch.length === 256) this.#write(batch.splice(0));
+        continue;
+      }
+      if (batch.length) this.#write(batch.splice(0));
+      // X11 text remaps one spare key temporarily. Acknowledge each bounded
+      // commit before beginning the next batch or another physical key.
+      const scalars = Array.from(event.text);
+      for (let offset = 0; offset < scalars.length; offset += 64) {
+        this.#write([{ kind: "text", text: scalars.slice(offset, offset + 64).join("") }]);
+      }
+    }
+    if (batch.length) this.#write(batch);
+  }
+
   stop(): void {
     this.#generation += 1;
     this.#privacyPaused = false;
@@ -230,6 +265,7 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
     this.#window = undefined;
     this.#linuxMapping = undefined;
     this.#linuxLayout = "";
+    this.#linuxX11 = false;
     this.#linuxAck?.(new Error("REMOTE_DESKTOP_LEASE_EXPIRED"));
     this.#linuxQueueBytes = 0;
     this.#linuxQueue = Promise.resolve();
@@ -354,11 +390,14 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
     this.#linuxQueue = this.#linuxQueue.then(async () => {
       if (generation !== this.#generation || this.#child !== child) return;
       if (this.#runtime.platform === "linux") {
-        const signal = new AbortController().signal;
-        const monitors = await (this.#runtime.linuxMonitors ?? readDesktopRemoteDesktopLinuxMonitors)(signal);
-        const state = await (this.#runtime.linuxSession ?? readDesktopRemoteDesktopLinuxSessionState)(signal);
+        const currentSignal = signal ?? new AbortController().signal;
+        const layout = this.#linuxX11
+          ? this.#runtime.linuxX11?.(this.#displayId)?.identity
+          : JSON.stringify(await (this.#runtime.linuxMonitors ?? readDesktopRemoteDesktopLinuxMonitors)(currentSignal));
+        const state = await (this.#runtime.linuxSession ?? readDesktopRemoteDesktopLinuxSessionState)(currentSignal);
         if (generation !== this.#generation || this.#child !== child) return;
-        if (state !== "unlocked" || JSON.stringify(monitors) !== this.#linuxLayout) throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
+        const after = this.#linuxX11 ? this.#runtime.linuxX11?.(this.#displayId)?.identity : layout;
+        if (state !== "unlocked" || layout !== this.#linuxLayout || after !== layout) throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
       }
       const settled = this.onPointer && (points.length || wheel)
         ? this.onPointer(wheel ? [this.#runtime.cursorScreenPoint?.() ?? screen.getCursorScreenPoint(), ...points] : points) : undefined;
@@ -915,7 +954,9 @@ function electronInputRuntime(): DesktopRemoteDesktopInputRuntime {
         y: display.bounds.y
       });
     },
-    toPhysicalPoint: (point) => process.platform === "win32" ? screen.dipToScreenPoint(point) : point
+    toPhysicalPoint: (point) => process.platform === "win32" ? screen.dipToScreenPoint(point) : point,
+    linuxX11: (displayId) => isDesktopRemoteDesktopX11()
+      ? linuxRemoteDesktopX11Layout(screen.getAllDisplays(), displayId) : undefined
   };
 }
 

@@ -30,7 +30,9 @@ const flags = run('pkg-config', [
   'wayland-client',
   'xkbcommon',
   'json-c',
+  'x11',
 ]).split(/\s+/);
+const xtstHeaders = run('pkg-config', ['--cflags', 'xtst']).split(/\s+/).filter(Boolean);
 const binary = path.join(output, 'joko-linux-remote-desktop-input');
 run('cc', [
   '-std=c11',
@@ -44,6 +46,8 @@ run('cc', [
   '-I',
   output,
   ...flags,
+  ...xtstHeaders,
+  '-ldl',
   '-lm',
   '-o',
   binary + '.tmp',

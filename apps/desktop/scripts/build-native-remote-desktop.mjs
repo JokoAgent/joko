@@ -162,7 +162,7 @@ export function buildNativeRemoteDesktop({
       const inputOutput = join(cache, "linux-input"), captureOutput = join(cache, "linux-capture"),
         clipboardOutput = join(cache, "linux-clipboard");
       run(process.execPath, [join(source, "linux-input", "build.mjs"), inputOutput],
-        "The Remote Desktop Linux input helper requires cc, wayland-scanner, pkg-config, wayland-client, xkbcommon and json-c.");
+        "The Remote Desktop Linux input helper requires cc, wayland-scanner, pkg-config, wayland-client, xkbcommon, json-c, X11 and XTest.");
       run(process.execPath, [join(source, "linux-capture", "build.mjs"), captureOutput],
         "The Remote Desktop Linux capture helper requires cc, wayland-scanner, pkg-config, wayland-client, libturbojpeg and libpng.");
       run(process.execPath, [join(source, "linux-clipboard", "build.mjs"), clipboardOutput],

@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 vi.mock("electron", () => ({ app: {} }));
 import {
-  linuxRemoteDesktopDisplay, linuxRemoteDesktopInputMapping, readDesktopRemoteDesktopLinuxSessionState,
+  isDesktopRemoteDesktopX11, linuxRemoteDesktopDisplay, linuxRemoteDesktopInputMapping, linuxRemoteDesktopX11Layout,
+  readDesktopRemoteDesktopLinuxSessionState,
   readDesktopRemoteDesktopLinuxLockSessionState,
   readDesktopRemoteDesktopLinuxMonitors, readDesktopRemoteDesktopLinuxInputSupport,
   readDesktopRemoteDesktopLinuxCursorSupport, supportsDesktopRemoteDesktopLinuxCapture,
@@ -68,6 +69,9 @@ describe("Linux owned session and physical layout", () => {
       DISPLAY: ":0", HYPRLAND_INSTANCE_SIGNATURE: "stale" } };
     vi.mocked(native.execute).mockResolvedValue("User=1000\nActive=yes\nRemote=no\nType=x11\nLockedHint=no\n");
     expect(supportsDesktopRemoteDesktopLinuxCapture(native)).toBe(false);
+    expect(isDesktopRemoteDesktopX11(native)).toBe(true);
+    expect(isDesktopRemoteDesktopX11({ ...native, environment: { ...native.environment, WAYLAND_DISPLAY: "wayland-0" } })).toBe(false);
+    expect(isDesktopRemoteDesktopX11({ ...native, environment: { ...native.environment, DISPLAY: "localhost:10.0" } })).toBe(false);
     await expect(readDesktopRemoteDesktopLinuxSessionState(signal, native)).resolves.toBe("unlocked");
     expect(native.execute).toHaveBeenCalledOnce();
     expect(native.execute).toHaveBeenCalledWith("/usr/bin/loginctl", ["show-session", "4", "-p", "User", "-p", "Active",
@@ -110,6 +114,16 @@ describe("Linux owned session and physical layout", () => {
     expect(point).toEqual({ x: 960 / 1500, y: 0 });
     expect(() => linuxRemoteDesktopInputMapping(monitors, "hyprland:missing")).toThrow("DISPLAY_MISSING");
   });
+  it("maps an X11 monitor in root pixels and rejects mixed scaling or an unrepresentable rectangle", () => {
+    const left = { id: 1, scaleFactor: 2, rotation: 0, bounds: { x: -800, y: -200, width: 800, height: 600 } };
+    const right = { id: 2, scaleFactor: 2, rotation: 90, bounds: { x: 0, y: 0, width: 300, height: 400 } };
+    const layout = linuxRemoteDesktopX11Layout([right, left], "2");
+    expect(layout.args).toEqual(["--x11", "1600", "400", "600", "800"]);
+    expect(linuxRemoteDesktopX11Layout([left, right], "2").identity).toBe(layout.identity);
+    expect(linuxRemoteDesktopX11Layout([{ ...left, rotation: 180 }, right], "2").identity).not.toBe(layout.identity);
+    expect(() => linuxRemoteDesktopX11Layout([left, { ...right, scaleFactor: 1 }], "2")).toThrow("INPUT_UNSUPPORTED");
+    expect(() => linuxRemoteDesktopX11Layout([left, { ...right, bounds: { ...right.bounds, x: 33000 } }], "2")).toThrow("DISPLAY_MISSING");
+  });
   it.each([[], [{ ...monitor, name: "../../file" }], [{ ...monitor, scale: 0 }], [monitor, monitor]].map(value => ({ value })))
     ("refuses invalid catalog $value", async ({ value }) => {
     const native = runtime(); vi.mocked(native.execute).mockResolvedValue(JSON.stringify(value));
@@ -121,10 +135,17 @@ describe("Linux actual registry probes", () => {
     const native: DesktopRemoteDesktopLinuxHelperRuntime = { supported: () => true, resolveBinary: vi.fn(async kind => `/trusted/${kind}`), execute: vi.fn(async () => "ready\n") };
     await expect(readDesktopRemoteDesktopLinuxInputSupport(signal, native)).resolves.toBe(true);
     await expect(readDesktopRemoteDesktopLinuxCursorSupport(signal, native)).resolves.toBe(true);
-    expect(native.execute).toHaveBeenNthCalledWith(1, "/trusted/input", "--check", signal);
-    expect(native.execute).toHaveBeenNthCalledWith(2, "/trusted/capture", "--cursor-check", signal);
+    expect(native.execute).toHaveBeenNthCalledWith(1, "/trusted/input", ["--check"], signal);
+    expect(native.execute).toHaveBeenNthCalledWith(2, "/trusted/capture", ["--cursor-check"], signal);
     vi.mocked(native.execute).mockResolvedValue("unsupported");
     await expect(readDesktopRemoteDesktopLinuxInputSupport(signal, native)).resolves.toBe(false);
+  });
+  it("probes XTest on the owned X display without granting capture support", async () => {
+    const native: DesktopRemoteDesktopLinuxHelperRuntime = { supported: () => false, x11: () => true,
+      resolveBinary: vi.fn(async () => "helper"), execute: vi.fn(async () => "ready\n") };
+    await expect(readDesktopRemoteDesktopLinuxInputSupport(signal, native)).resolves.toBe(true);
+    await expect(readDesktopRemoteDesktopLinuxCursorSupport(signal, native)).resolves.toBe(false);
+    expect(native.execute).toHaveBeenCalledExactlyOnceWith("helper", ["--x11", "--check"], signal);
   });
   it("does not create input devices or resolve a helper on an unsupported route", async () => {
     const native: DesktopRemoteDesktopLinuxHelperRuntime = { supported: () => false, resolveBinary: vi.fn(), execute: vi.fn() };

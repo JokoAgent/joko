@@ -13,6 +13,52 @@ import {
   type DesktopRemoteDesktopLockRuntime
 } from "../src/remote-desktop-input.js";
 
+it("leases X11 input to the original display layout and acknowledges bounded Unicode commits", async () => {
+  const child = inputChild(), failed = vi.fn();
+  const complete = vi.fn(async () => undefined), close = vi.fn(async () => undefined);
+  const ownership = { begin: vi.fn(async () => complete), close };
+  let identity = "original-layout";
+  const runtime: DesktopRemoteDesktopInputRuntime = {
+    platform: "linux", resolveBinary: async () => "x11-helper",
+    spawn: vi.fn(() => child as unknown as ChildProcessWithoutNullStreams),
+    display: () => undefined, toPhysicalPoint: point => point,
+    linuxSupport: async () => true, linuxSession: async () => "unlocked", linuxMonitors: vi.fn(),
+    linuxX11: () => ({ identity, args: ["--x11", "100", "50", "400", "300"] })
+  };
+  const input = new DesktopRemoteDesktopInput(failed, runtime);
+  const starting = input.start("2", new AbortController().signal, undefined, ownership);
+  await vi.waitFor(() => expect(runtime.spawn).toHaveBeenCalledOnce());
+  child.stdout.write("ready\n");
+  await starting;
+  try {
+    expect(runtime.spawn).toHaveBeenCalledWith("x11-helper", ["--x11", "100", "50", "400", "300"]);
+    input.send([{ kind: "move", x: 1, y: 0.25 }, { kind: "text", text: "界".repeat(64) + "🙂" }]);
+    const readBatch = async (): Promise<unknown[]> => {
+      await vi.waitFor(() => expect(child.stdin.readableLength).toBeGreaterThan(0));
+      return JSON.parse(child.stdin.read().toString()) as unknown[];
+    };
+    expect(await readBatch()).toEqual([{ kind: "move", x: 1, y: 0.25 }]);
+    expect(complete).not.toHaveBeenCalled();
+    child.stdout.write("ok\n");
+    expect(await readBatch()).toEqual([{ kind: "text", text: "界".repeat(64) }]);
+    child.stdout.write("ok\n");
+    expect(await readBatch()).toEqual([{ kind: "text", text: "🙂" }]);
+    child.stdout.write("ok\n");
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(3));
+    identity = "another-monitor-moved";
+    input.send([{ kind: "key", code: "KeyA", down: true }]);
+    await vi.waitFor(() => expect(failed).toHaveBeenCalledOnce());
+    expect(ownership.begin).toHaveBeenCalledTimes(3);
+    expect(await readBatch()).toEqual([{ kind: "release" }]);
+    expect(runtime.linuxMonitors).not.toHaveBeenCalled();
+  } finally {
+    const stopping = input.release();
+    child.emit("close", 0, null);
+    await stopping;
+  }
+  expect(close).toHaveBeenCalledOnce();
+});
+
 describe("Desktop Remote Desktop terminal lock helper", () => {
   it("confines the helper and waits for Source human admission and native ACK before completing input", async () => {
     const child = inputChild(), complete = vi.fn(async () => {}), closed = vi.fn(async () => {});
