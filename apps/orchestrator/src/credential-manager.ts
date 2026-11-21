@@ -2590,7 +2590,7 @@ export class ProviderCatalogManager {
         format: 1,
         generation: this.#generation,
         configurations: providerConfigurationsForStorage([...this.#entries.values()]),
-        geminiImageConnection: this.#geminiImageConnection
+        ...(this.#geminiImageConnection === undefined ? {} : { geminiImageConnection: this.#geminiImageConnection })
       } satisfies StoredProviderCatalog);
     } catch (error) {
       this.#generation = previousGeneration;
@@ -2610,7 +2610,7 @@ export class ProviderCatalogManager {
           format: 1,
           generation: this.#generation,
           configurations: providerConfigurationsForStorage([...this.#entries.values()]),
-          geminiImageConnection: this.#geminiImageConnection
+          ...(this.#geminiImageConnection === undefined ? {} : { geminiImageConnection: this.#geminiImageConnection })
         } satisfies StoredProviderCatalog);
         store.setSetting("service", this.#scopeId, "native_provider_auth_catalog", {
           format: 1,
@@ -2707,13 +2707,19 @@ function providerForStorage(entry: ManagedProviderEntry): StoredProviderEntry {
     provider: sourceProvider,
     credentialBindings: sourceBindings,
     version: sourceVersion,
+    upstreamListing,
     ...metadata
   } = entry;
-  const { headers: _headers, ...provider } = sourceProvider;
+  const { headers: _headers, models: sourceModels, ...provider } = sourceProvider;
   return {
     ...metadata,
+    ...(upstreamListing === undefined ? {} : { upstreamListing }),
     provider: {
       ...provider,
+      models: sourceModels.map(({ api, baseUrl, ...model }) => ({ ...model,
+        ...(api === undefined ? {} : { api }),
+        ...(baseUrl === undefined ? {} : { baseUrl })
+      })),
       ...(sourceProvider.headers === undefined
         ? {}
         : {
@@ -2773,6 +2779,7 @@ function providerFromStorage(entry: StoredProviderEntry): ManagedProviderEntry {
     provider: storedProvider,
     credentialEnvironmentReferences,
     version,
+    upstreamListing,
     ...metadata
   } = entry;
   const { headerEnvironmentReferences, ...provider } = storedProvider;
@@ -2784,7 +2791,13 @@ function providerFromStorage(entry: StoredProviderEntry): ManagedProviderEntry {
   const credentialBindings = Object.fromEntries(credentialEnvironmentReferences.map((item) => [item.environmentName, item.credentialReferenceId]));
   return {
     ...metadata,
-    provider: { ...provider, ...(headers === undefined ? {} : { headers }) },
+    ...(upstreamListing == null ? {} : { upstreamListing }),
+    provider: { ...provider, ...(headers === undefined ? {} : { headers }),
+      models: Array.isArray(provider.models) ? provider.models.map(({ api, baseUrl, ...model }) => ({ ...model,
+        ...(api == null ? {} : { api }),
+        ...(baseUrl == null ? {} : { baseUrl })
+      })) : provider.models
+    },
     credentialBindings,
     version: BigInt(version)
   };
