@@ -11,7 +11,7 @@ export function useMobileHomeViewPreference(sourceKey: string, storage?: Pick<Mo
   readonly change: MobileHomeViewChange;
 } {
   const [local, setLocal] = useState<{ sourceKey: string; search: string; status: StatusFilter | undefined;
-    sort?: MobileHomeViewState["searchSort"]; display?: MobileHomeDisplayPreferences }>();
+    sort?: MobileHomeViewState["searchSort"]; display?: MobileHomeDisplayPreferences; taskInbox?: boolean }>();
   const [saved, setSaved] = useState<{ sourceKey: string; status: StatusFilter }>();
   const [savedDisplay, setSavedDisplay] = useState<{ sourceKey: string; value: MobileHomeDisplayPreferences }>();
   const latest = useRef(sourceKey);
@@ -36,10 +36,11 @@ export function useMobileHomeViewPreference(sourceKey: string, storage?: Pick<Mo
   const savedStatus = storage && saved?.sourceKey === sourceKey ? saved.status : undefined;
   const display = current?.display ?? (storage && savedDisplay?.sourceKey === sourceKey ? savedDisplay.value : DEFAULT_MOBILE_HOME_DISPLAY);
   const view: MobileHomeViewState = { search: current?.search ?? "", statusFilter: current?.status ?? savedStatus ?? "active",
-    ...(current?.sort === undefined ? {} : { searchSort: current.sort }), display };
+    ...(current?.sort === undefined ? {} : { searchSort: current.sort }), display, taskInbox: current?.taskInbox };
   const change: MobileHomeViewChange = (next, chooseStatus = false, chooseDisplay = false) => {
     if (latest.current !== sourceKey) return;
     setLocal(previous => ({ sourceKey, search: next.search, sort: next.searchSort,
+      taskInbox: next.taskInbox,
       status: chooseStatus ? next.statusFilter : previous?.sourceKey === sourceKey ? previous.status : undefined,
       display: chooseDisplay ? next.display : previous?.sourceKey === sourceKey ? previous.display : undefined }));
     if (storage && chooseStatus) writes.current = writes.current.then(() => storage.setItem(key, next.statusFilter)).catch(() => undefined);

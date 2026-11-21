@@ -4,6 +4,7 @@ import { inspectorLayoutOwner, openInspectorExtension } from "./inspector-layout
 import type { JSX, KeyboardEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject } from "react";
 import { useCallback, useEffect, useEffectEvent, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { taskSnoozeDeadline } from "@joko/contracts";
 import {
   AlignJustify,
   Activity,
@@ -40,6 +41,7 @@ import {
   LoaderCircle,
   MessageSquare,
   Info,
+  Inbox,
   PanelRight,
   Pause,
   Pin,
@@ -322,6 +324,7 @@ export interface SidebarProps {
   readonly onSetTargetSessionsArchived?: (target: TargetView, sessions: readonly SessionView[], archived: boolean) => void;
   readonly onCopyTargetLink?: (target: TargetView) => void;
   readonly onArchive: (session: SessionView) => void;
+  readonly onSnooze?: (session: SessionView) => void;
   readonly onPrefetchRemoval?: (session: SessionView) => void;
   readonly onDelete: (session: SessionView) => void;
   readonly onRunSchedule?: (schedule: ScheduleView) => Promise<void>;
@@ -1950,6 +1953,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
         </nav>
 
         <nav className="sidebar__utility" aria-label={t("a11y.productNavigation")}>
+        <button type="button" className={cx(route.kind === "taskInbox" && "is-active")} aria-current={route.kind === "taskInbox" ? "page" : undefined} onClick={() => navigateAndClose({ kind: "taskInbox" })}><Inbox aria-hidden="true" /><span>{t("inbox.title")}</span></button>
         <button type="button" className={cx(route.kind === "projects" && "is-active")} onClick={() => navigateAndClose({ kind: "projects" })}><FolderKanban aria-hidden="true" /><span>{t("nav.projects")}</span><span className="nav-count">{snapshot.targets.filter((target) => !target.archived).length}</span></button>
         <button type="button" className={cx(route.kind === "partners" && "is-active")} onClick={() => navigateAndClose({ kind: "partners" })}><Bot aria-hidden="true" /><span>{t("nav.partners")}</span></button>
         <button type="button" className={cx(route.kind === "schedules" && "is-active")} onClick={() => navigateAndClose({ kind: "schedules" })}><CalendarClock aria-hidden="true" /><span>{t("nav.schedules")}</span><span className="nav-count">{snapshot.schedules.filter((schedule) => schedule.enabled).length}</span></button>
@@ -2056,6 +2060,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
           </div>
         </nav>
         <nav className="sidebar__rail-utility" aria-label={t("a11y.productNavigation")}>
+          <IconButton className={cx(route.kind === "taskInbox" && "is-active")} label={t("inbox.title")} onClick={() => navigateAndClose({ kind: "taskInbox" })}><Inbox aria-hidden="true" /></IconButton>
           {activeSession !== undefined && activeTarget !== undefined && browsableTargetIds.has(activeTarget.id) && <IconButton
             label={t("workspace.browseFiles", { name: activeTarget.name })}
             onClick={() => callbacks.onBrowseFiles(activeSession)}
@@ -2825,6 +2830,7 @@ function sessionCallbacks(
     onManageTaskTags: props.onManageTaskTags ?? (() => undefined),
     onPin: props.onPin,
     onArchive: props.onArchive,
+    onSnooze: props.onSnooze,
     onPrefetchRemoval: props.onPrefetchRemoval ?? (() => undefined),
     onDelete: props.onDelete,
     onCopyTaskLink: props.onCopyTaskLink ?? (() => undefined),
@@ -2852,6 +2858,7 @@ interface SessionSectionCallbacks {
   readonly onManageTaskTags: (session: SessionView) => void;
   readonly onPin: (session: SessionView) => void;
   readonly onArchive: (session: SessionView) => void;
+  readonly onSnooze?: (session: SessionView) => void;
   readonly onPrefetchRemoval: (session: SessionView) => void;
   readonly onDelete: (session: SessionView) => void;
   readonly onCopyTaskLink: (session: SessionView) => void;
@@ -4452,7 +4459,7 @@ function SessionSection({ title, sessions, targets, activeSessionId, locale, col
   );
 }
 
-function SessionRow({ session, active, locale, targetName, match, t, priorityContext, sessionInfoFields, sessionProfileId, projectNameFor, environmentNameFor, onSelect, onRename, onSuggestTitle, canSuggestTitle, titleSuggestionOwnerKey, taskTags, onToggleTaskTag, onManageTaskTags, onPin, onArchive, onPrefetchRemoval, onDelete, onCopyTaskLink, onExportPortableSession, canExportPortableSession, onSplitSession, onOpenSessionWindow, projectMenuTargets, movingSessionProjectIds, onMoveSessionProject, selectedSessionIds }: { readonly session: SessionView; readonly active: boolean; readonly locale: string; readonly targetName?: string; readonly match?: SidebarFuzzyMatch; readonly t: Translator } & SessionSectionCallbacks & SessionPriorityProps & SessionDisplayProps): JSX.Element {
+function SessionRow({ session, active, locale, targetName, match, t, priorityContext, sessionInfoFields, sessionProfileId, projectNameFor, environmentNameFor, onSelect, onRename, onSuggestTitle, canSuggestTitle, titleSuggestionOwnerKey, taskTags, onToggleTaskTag, onManageTaskTags, onPin, onArchive, onSnooze, onPrefetchRemoval, onDelete, onCopyTaskLink, onExportPortableSession, canExportPortableSession, onSplitSession, onOpenSessionWindow, projectMenuTargets, movingSessionProjectIds, onMoveSessionProject, selectedSessionIds }: { readonly session: SessionView; readonly active: boolean; readonly locale: string; readonly targetName?: string; readonly match?: SidebarFuzzyMatch; readonly t: Translator } & SessionSectionCallbacks & SessionPriorityProps & SessionDisplayProps): JSX.Element {
   const draftPreview = useProvisionalTaskPreview(sessionProfileId, session.id, session.provisionalDraftId);
   if (session.provisionalDraftId) session = { ...session, name: draftPreview || t("session.unsent") };
   const indicator = sidebarSessionIndicatorState(session, priorityContext);
@@ -4781,6 +4788,7 @@ function SessionRow({ session, active, locale, targetName, match, t, priorityCon
         onManageTaskTags={onManageTaskTags}
         onPin={onPin}
         onArchive={onArchive}
+        onSnooze={onSnooze}
         onPrefetchRemoval={onPrefetchRemoval}
         onDelete={onDelete}
         onCopyTaskLink={onCopyTaskLink}
@@ -4811,7 +4819,7 @@ interface SessionMenuContextRequest {
   readonly sequence: number;
 }
 
-function SessionActionsMenu({ session, t, onStartRename, taskTags, onToggleTaskTag, onManageTaskTags, onPin, onArchive, onPrefetchRemoval, onDelete, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow, projectMenuTargets, moving, onMoveSessionProject, contextMenuRequest, onContextMenuRequestHandled }: {
+function SessionActionsMenu({ session, t, onStartRename, taskTags, onToggleTaskTag, onManageTaskTags, onPin, onArchive, onSnooze, onPrefetchRemoval, onDelete, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow, projectMenuTargets, moving, onMoveSessionProject, contextMenuRequest, onContextMenuRequestHandled }: {
   readonly session: SessionView;
   readonly t: Translator;
   readonly onStartRename: () => void;
@@ -4820,6 +4828,7 @@ function SessionActionsMenu({ session, t, onStartRename, taskTags, onToggleTaskT
   readonly onManageTaskTags: (session: SessionView) => void;
   readonly onPin: (session: SessionView) => void;
   readonly onArchive: (session: SessionView) => void;
+  readonly onSnooze?: (session: SessionView) => void;
   readonly onPrefetchRemoval: (session: SessionView) => void;
   readonly onDelete: (session: SessionView) => void;
   readonly onCopyTaskLink: (session: SessionView) => void;
@@ -5110,6 +5119,9 @@ function SessionActionsMenu({ session, t, onStartRename, taskTags, onToggleTaskT
         {!session.archived && <button type="button" role="menuitem" onClick={() => { close(false); onSplitSession(session, "bottom"); }}><Rows2 aria-hidden="true" />{t("session.splitDown")}</button>}
         {!session.archived && <button type="button" role="menuitem" onClick={() => run(onOpenSessionWindow)}><ExternalLink aria-hidden="true" />{t("session.openNewWindow")}</button>}
         <div className="menu-separator" role="separator" />
+        {onSnooze && session.inboxSnoozeAllowed && <button type="button" role="menuitem" onClick={() => run(onSnooze)}>
+          <Clock aria-hidden="true" />{t(taskSnoozeDeadline(session.snooze) > Date.now() ? "inbox.wake" : "inbox.snooze")}
+        </button>}
         <button type="button" role="menuitem" onClick={() => run(onArchive)}>{session.archived ? t("session.unarchive") : t("session.archive")}</button>
         <button type="button" role="menuitem" className="danger-text" onClick={() => run(onDelete)}>{t("session.delete")}</button>
       </div>

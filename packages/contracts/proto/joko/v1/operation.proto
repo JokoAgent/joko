@@ -255,6 +255,7 @@ message OperationMutation {
     UpdateProviderAccountResetSettingsMutation update_provider_account_reset_settings = 233;
     CancelBrowserDownloadMutation cancel_browser_download = 234;
     ConfirmProviderModelWithdrawalsMutation confirm_provider_model_withdrawals = 235;
+    SetSessionSnoozeMutation set_session_snooze = 236;
   }
 }
 
@@ -731,6 +732,15 @@ message ArchiveSessionMutation {
   string session_id = 1;
   bool archived = 2;
   string archive_confirmation = 3;
+}
+
+message SetSessionSnoozeMutation {
+  string session_id = 1;
+  oneof choice {
+    google.protobuf.Timestamp until = 2;
+    bool indefinitely = 3;
+    bool wake = 4;
+  }
 }
 
 message DeleteSessionMutation {

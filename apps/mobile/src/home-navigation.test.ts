@@ -1,5 +1,5 @@
 import { create } from "@bufbuild/protobuf";
-import { SessionDerivationKind, SessionDerivationOriginSchema, SessionState, SnapshotSchema, TargetState, WorkspaceKind } from "@joko/contracts";
+import { ScheduleState, SessionDerivationKind, SessionDerivationOriginSchema, SessionState, SnapshotSchema, TargetState, WorkspaceKind } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
 import type { MobileWindowGeometry } from "./mobile-window-geometry";
 import {
@@ -43,6 +43,28 @@ const snapshot = create(SnapshotSchema, {
 const labels = { dialogue: "Dialogue", project: "Project", pinned: "Pinned" } as const;
 
 describe("mobile Home presentation", () => {
+  it("places snoozes before activity and keeps a subscribed task working after its result has been read", () => {
+    const sessions = snapshot.sessions.map(session => {
+      if (session.sessionId === "dialogue") return { ...session, state: SessionState.WAITING, snooze: { setAt: { seconds: 1n } } };
+      if (session.sessionId === "project-new") return { ...session, snooze: { setAt: { seconds: 1n }, until: { seconds: 90n } } };
+      if (session.sessionId === "archived") return { ...session, snooze: { setAt: { seconds: 1n } } };
+      if (session.sessionId === "same-a") return { ...session, inboxSnoozeAllowed: false };
+      return session;
+    });
+    const input = create(SnapshotSchema, { ...snapshot, sessions,
+      schedules: [{ scheduleId: "schedule", state: ScheduleState.ENABLED, sessionId: "same-b" }] });
+    const options = { snapshot: input, statusFilter: "active" as const, query: "", labels,
+      inboxLabels: { inbox: "Inbox", working: "Working", snoozed: "Snoozed", archived: "Archived" } };
+    const groups = (now: number) => buildMobileHomeSections({ ...options, now })
+      .map(section => [section.key, section.items.map(item => item.session.sessionId)]);
+    expect(groups(89_999)).toEqual([
+      ["inbox", ["pinned"]], ["working", ["same-b"]], ["snoozed", ["project-new", "dialogue"]], ["archived", ["archived"]]
+    ]);
+    expect(groups(90_000)).toEqual([
+      ["inbox", ["pinned", "project-new"]], ["working", ["same-b"]], ["snoozed", ["dialogue"]], ["archived", ["archived"]]
+    ]);
+  });
+
   it("leaves Side Chats in the authoritative snapshot while excluding them from every ordinary navigation filter", () => {
     const input = create(SnapshotSchema, { ...snapshot, sessions: [...snapshot.sessions, {
       ...snapshot.sessions[0]!, sessionId: "aside", displayName: "Aside", pinned: true,

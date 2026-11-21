@@ -3,6 +3,7 @@ import { parseDeviceLink, parseDeviceAuthorizationReview, type DeviceAuthorizati
 import { DeviceAuthorizationReview } from './components/DeviceAuthorizationReview.js';
 import type { CSSProperties, JSX, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import { AlertTriangle, Bell, CircleAlert, CirclePlus, Info, Menu, RefreshCcw, ServerCrash, Sparkles, X } from "lucide-react";
+import { taskSnoozeDeadline, type TaskSnoozeChoice } from "@joko/contracts";
 import { appRouteHash, extensionBackgroundTaskForRoute, useAppController } from "./controller.js";
 import { useAppDefaultModelBridge } from "./app-default-model-bridge.js";
 import { useWallpaperSettings } from "./wallpaper-settings.js";
@@ -174,6 +175,8 @@ type PendingDesktopDeepLinkDelivery =
 const Inspector = lazy(async () => ({ default: (await import("./components/InspectorWorkspace.js")).InspectorWorkspace }));
 const SchedulesPage = lazy(async () => ({ default: (await import("./components/SchedulesPage.js")).SchedulesPage }));
 const ProjectsPage = lazy(async () => ({ default: (await import("./components/ProjectsPage.js")).ProjectsPage }));
+const TaskInboxPage = lazy(async () => ({ default: (await import("./components/TaskInboxPage.js")).TaskInboxPage }));
+const TaskSnoozeDialog = lazy(async () => ({ default: (await import("./components/TaskInboxPage.js")).TaskSnoozeDialog }));
 const PartnersPage = lazy(async () => ({ default: (await import("./components/PartnersPage.js")).PartnersPage }));
 const SettingsPage = lazy(async () => ({ default: (await import("./components/SettingsPage.js")).SettingsPage }));
 const StandaloneAboutPage = lazy(async () => ({ default: (await import("./components/SettingsPage.js")).StandaloneAboutPage }));
@@ -349,6 +352,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const [focusedSplitSessionId, setFocusedSplitSessionId] = useState<string>();
   const [splitMessageForks, setSplitMessageForks] = useState<readonly SplitMessageFork[]>([]);
   const [portableExportSession, setPortableExportSession] = useState<SessionView>();
+  const [snoozeRequest, setSnoozeRequest] = useState<{ readonly owner: string; readonly sessionId: string }>();
   const [portableImportRequest, setPortableImportRequest] = useState<PortableSessionImportRequest>();
   const portableImportOwner = useMemo<PortableSessionImportOwner | undefined>(() => connectionOwner === undefined ? undefined : {
     key: connectionOwner,
@@ -2328,6 +2332,28 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     }
     runAction(`unarchive:${session.id}`, () => controller.archiveSession(session.id, false));
   };
+  const applySnooze = (sessionId: string, choice: TaskSnoozeChoice, owner: string): void => {
+    if (authenticatedConnectionKey(controllerRef.current.state) !== owner) return;
+    setSnoozeRequest(undefined);
+    runAction(`snooze:${sessionId}`, () => controllerRef.current.setSessionSnooze(sessionId, choice));
+  };
+  const requestSessionSnooze = (session: SessionView): void => {
+    if (connectionOwner === undefined || authenticatedConnectionKey(controllerRef.current.state) !== connectionOwner) return;
+    const current = controllerRef.current.state.snapshot.sessions.find(task => task.id === session.id);
+    if (current?.inboxSnoozeAllowed !== true) return;
+    if (taskSnoozeDeadline(current.snooze) > Date.now()) applySnooze(current.id, "wake", connectionOwner);
+    else setSnoozeRequest({ owner: connectionOwner, sessionId: current.id });
+  };
+  const snoozeSession = snoozeRequest?.owner === connectionOwner
+    && state.snapshot.sessions.find(task => task.id === snoozeRequest?.sessionId && task.inboxSnoozeAllowed);
+  const completeInboxTask = (session: SessionView, subscribed: boolean): void => {
+    if (session.archived || !subscribed) { requestArchiveSession(session); return; }
+    const attention = session.attention;
+    if (!attention?.unread) return;
+    runAction(`inbox-read:${session.id}`, () => attention.kind === "error"
+      ? controller.acknowledgeSessionError(session.id, attention.subjectCursor)
+      : controller.acknowledgeSessionAttention(session.id, attention.subjectCursor));
+  };
   const requestDeleteSessions = (sessions: readonly SessionView[]): void => {
     const batch = uniqueSessions(sessions);
     if (batch.length === 0) return;
@@ -2614,6 +2640,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         }}
         onCopyTargetLink={copyTargetLink}
         onArchive={requestArchiveSession}
+        onSnooze={requestSessionSnooze}
         onPrefetchRemoval={prefetchRemoval}
         onDelete={(session) => requestDeleteSessions([session])}
         onBulkArchive={requestArchiveSessions}
@@ -2785,6 +2812,10 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           {state.route.kind === "files" && <main className="empty-session-page"><EmptyState icon={<AlertTriangle />} title={t("workspace.filesLoadFailed")} body={t("workspace.noWorkspace")} action={<Button onClick={() => { const sessionId = activeSession?.id; controller.navigate(sessionId === undefined ? { kind: "session" } : { kind: "session", sessionId }); }}>{t("workspace.filesBack")}</Button>} /></main>}
           {state.route.kind === "schedules" && <SchedulesPage controller={controller} schedules={state.snapshot.schedules} sessions={state.snapshot.sessions} targets={state.snapshot.targets} models={state.snapshot.models} backends={state.snapshot.backends} extraDirectories={state.snapshot.extraDirectories} focusScheduleId={state.route.scheduleId} locale={state.effectiveLocale} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
           {state.route.kind === "projects" && <ProjectsPage controller={controller} snapshot={state.snapshot} focusProjectId={state.route.projectId} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
+          {state.route.kind === "taskInbox" && <TaskInboxPage key={state.activeProfile?.id} snapshot={state.snapshot}
+            t={t} locale={state.effectiveLocale} editable={connectionOwner !== undefined} navigationOpen={navigationOpen}
+            onOpenNavigation={() => setWindowNavigationOpen(true)} onOpen={(session) => controller.navigate({ kind: "session", sessionId: session.id })}
+            onSnooze={requestSessionSnooze} onDone={completeInboxTask} />}
           {state.route.kind === "partners" && (state.route.groupId?.startsWith("network:") ? <PartnerNetworkPage controller={controller} route={state.route.groupId} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />
             : <PartnersPage controller={controller} snapshot={state.snapshot} focusPartnerId={state.route.partnerId} preparation={state.route.preparation} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />)}
           {state.route.kind === "sharedTask" && <TaskSharingSession controller={controller} joinId={state.route.joinId} profileId={state.route.profileId} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} />}
@@ -2839,6 +2870,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           if (session !== undefined) runAction(`rename:${session.id}`, () => controller.renameSession(session.id, name));
         }}
       />
+      {snoozeRequest && snoozeSession && <Suspense fallback={null}><TaskSnoozeDialog session={snoozeSession}
+        t={t} locale={state.effectiveLocale} onClose={() => setSnoozeRequest(undefined)}
+        onChoose={choice => applySnooze(snoozeRequest.sessionId, choice, snoozeRequest.owner)} /></Suspense>}
       <TaskTagDialog
         session={taskTagSessionId === undefined ? undefined : state.snapshot.sessions.find((session) => session.id === taskTagSessionId)}
         catalog={state.snapshot.taskTags}

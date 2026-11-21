@@ -175,5 +175,6 @@ export * from "./document-output.js";
 export * from "./pi-generated-images.js";
 export * from "./gen/joko/v1/task_activity_pb.js";
 export * from "./task-activity-messages.js";
+export * from "./task-inbox.js";
 export * from "./workspace-file-metadata.js";
 export * from "./workspace-directory-download.js";

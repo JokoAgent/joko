@@ -27,6 +27,7 @@ import {
   type QueueItem, type QueueTextEditSplice, type Session
 } from "@joko/contracts";
 import type { PartnerLearningSettingsDestination } from "@joko/contracts";
+import { parseLocalTaskSnoozeTime, taskSnoozeChoices, taskSnoozeDeadline, type TaskSnoozeChoice } from "@joko/contracts";
 import { MobilePartnerLearningFooter } from "./MobilePartnerLearningFooter";
 import { MobileSharedConnectionScreen } from "./MobileSharedConnectionScreen";
 import { mobileEntrySupported, mobileEntryIrohMode } from './mobile-entry-capabilities';
@@ -295,7 +296,7 @@ import { useMobileConversationShare } from "./use-mobile-conversation-share";
 import { measureMobileWindowFrame, readMobileScreenshotVisibleMessages } from "./mobile-screenshot-selection";
 import { useMobileScreenshotSelection } from "./use-mobile-screenshot-selection";
 import {
-  buildMobileHomeSections, buildMobileHomeNavigationLayout, createSwipeRowRegistry,
+  buildMobileHomeSections, buildMobileHomeNavigationLayout, createSwipeRowRegistry, mobileTaskFollowsActiveAutomation, mobileTaskSnooze,
   DEFAULT_MOBILE_HOME_DISPLAY, MOBILE_HOME_ACTIVITY_FILTERS, MOBILE_HOME_PROJECT_PREVIEW_LIMIT, MOBILE_HOME_TASK_SORTS,
   hasMobileHomeDisplayFilters, mergeMobileHomeProjectOrder, previewMobileHomeProject,
   type MobileHomeDisplayPreferences, type MobileHomeSearchMatch, type MobileHomeSearchSort, type MobileHomeSection, type MobileHomeSessionItem, type MobileHomeStatusFilter
@@ -1442,19 +1443,21 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   const listStatusFilter = projectView?.statusFilter ?? statusFilter;
   const setStatusFilter = (statusFilter: MobileHomeStatusFilter): void => {
     if (projectView !== undefined) setRequestedProjectView({ ...projectView, statusFilter });
-    else setViewState({ ...currentView, statusFilter }, true);
+    else setViewState({ ...currentView, statusFilter, taskInbox: false }, true);
   };
   const closeProjectView = useCallback(() => setRequestedProjectView(undefined), []);
   const [filterNow, setFilterNow] = useState(Date.now);
   const [renameSession, setRenameSession] = useState<Session>();
+  const [snoozeSessionId, setSnoozeSessionId] = useState<string>();
   const [taskTagSessionId, setTaskTagSessionId] = useState<string>();
   const [renameDraft, setRenameDraft] = useState("");
   const searchRef = useRef<TextInput>(null);
   const handledSearchFocus = useRef(0);
   const swipeRegistry = useMemo(() => createSwipeRowRegistry(), []);
   const normalizedSearch = projectView === undefined ? search.trim() : "";
+  const taskInboxShown = currentView.taskInbox === true && projectView === undefined && normalizedSearch === "";
   const listRef = useRef<SectionList<MobileHomeSessionItem, MobileHomeSection>>(null);
-  const scrollKey = JSON.stringify(projectView === undefined ? [homeScopeKey, host, statusFilter]
+  const scrollKey = JSON.stringify(projectView === undefined ? [homeScopeKey, host, taskInboxShown ? "task-inbox" : statusFilter]
     : [homeScopeKey, host, projectView.statusFilter, projectView.projectId]);
   const listScroll = useMemo(() => ({
     pendingOffset: scrollOffsets?.get(scrollKey) ?? 0,
@@ -1490,8 +1493,12 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     projectId: projectView?.projectId,
     now: filterNow,
     messageSessionIds: new Set(currentMessageMatches.keys()),
+    inboxLabels: taskInboxShown ? {
+      inbox: mobileMessage(locale, "taskInbox.inbox"), working: mobileMessage(locale, "taskInbox.working"),
+      snoozed: mobileMessage(locale, "taskInbox.snoozed"), archived: mobileMessage(locale, "common.archived")
+    } : undefined,
     labels: mobileHomeSectionLabels(locale)
-  }), [currentMessageMatches, display, filterNow, listStatusFilter, locale, projectView, search, searchSort, state.owner]);
+  }), [currentMessageMatches, display, filterNow, listStatusFilter, locale, projectView, search, searchSort, state.owner, taskInboxShown]);
   const pendingProjectInteractions = useMemo(() => new Set(state.owner?.interactions
     .filter(interaction => interaction.state === InteractionState.PENDING).map(interaction => interaction.sessionId)), [state.owner?.interactions]);
   const hasLongProjectPreview = projectView === undefined && sections.some(section => section.kind === "project" && section.items.length > MOBILE_HOME_PROJECT_PREVIEW_LIMIT);
@@ -1520,6 +1527,19 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     const timer = setInterval(() => setFilterNow(Date.now()), 60_000);
     return () => clearInterval(timer);
   }, [display.lastActivity, foreground, hasLongProjectPreview, normalizedSearch]);
+  useEffect(() => {
+    if (foreground) setFilterNow(Date.now());
+  }, [foreground, state.owner?.sessions]);
+  useEffect(() => {
+    if (!foreground) return;
+    const next = state.owner?.sessions.reduce((earliest, session) => {
+      const until = mobileTaskSnooze(session)?.until ?? 0;
+      return until > filterNow ? Math.min(earliest, until) : earliest;
+    }, Number.POSITIVE_INFINITY) ?? Number.POSITIVE_INFINITY;
+    if (!Number.isFinite(next)) return;
+    const timer = setTimeout(() => setFilterNow(Date.now()), Math.max(1, Math.min(next - Date.now(), 2_147_483_647)));
+    return () => clearTimeout(timer);
+  }, [filterNow, foreground, state.owner?.sessions]);
   useEffect(() => { setDisplaySource(undefined); closeProjectView(); }, [closeProjectView, homeScopeKey]);
   useEffect(() => {
     if (searchFocusRequest <= handledSearchFocus.current) return;
@@ -1633,6 +1653,10 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   const toggleArchive = (session: Session): void => runMutation(() => session.archived
     ? client.setSessionArchived(session.sessionId, false)
     : archiveMobileSession(client, session.sessionId, locale, () => foreground && mountedRef.current && AppState.currentState === "active"));
+  const changeSnooze = (sessionId: string, choice: TaskSnoozeChoice): void => {
+    setSnoozeSessionId(undefined);
+    if (mobileHomeSourceKey(client.state) === homeScopeKey) runMutation(() => client.setSessionSnooze(sessionId, choice));
+  };
   const openOptions = (session: Session): void => {
     if (!foreground || !mountedRef.current || AppState.currentState !== "active") return;
     if (state.status !== "connected" && state.status !== "offline") return;
@@ -1655,6 +1679,11 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
       setRenameSession(session);
     } else if (action === "mark-read") {
       markSessionRead(session);
+    } else if (action === "snooze") {
+      const current = state.owner?.sessions.find(task => task.sessionId === session.sessionId);
+      if (!current?.inboxSnoozeAllowed) return;
+      if (taskSnoozeDeadline(mobileTaskSnooze(current)) > Date.now()) changeSnooze(current.sessionId, "wake");
+      else setSnoozeSessionId(current.sessionId);
     } else if (action === "tags") {
       setTaskTagSessionId(session.sessionId);
     } else if (action.startsWith("tag:")) {
@@ -1690,6 +1719,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     if (state.status !== "connected") {
       swipeRegistry.closeOpenRow();
       setRenameSession(undefined);
+      setSnoozeSessionId(undefined);
       setTaskTagSessionId(undefined);
     }
     if (state.status === "connected" || state.status === "offline") return;
@@ -1702,6 +1732,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     optionsSessionRef.current = undefined;
     setOptionsSession(undefined);
     setRenameSession(undefined);
+    setSnoozeSessionId(undefined);
     setTaskTagSessionId(undefined);
     swipeRegistry.closeOpenRow();
   }, [foreground, homeScopeKey, host, swipeRegistry]);
@@ -1789,10 +1820,16 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
         onPress={() => setDisplaySource(homeScopeKey)} />}
     </View>}
     <View accessibilityRole="tablist" style={styles.filterRow}>
+      {projectView === undefined && !normalizedSearch && <Pressable accessibilityRole="tab"
+        accessibilityState={{ selected: taskInboxShown }} onPress={() => setViewState({ ...currentView, taskInbox: true })}
+        style={[styles.filterChip, { borderColor: taskInboxShown ? colors.accent : colors.border,
+          backgroundColor: taskInboxShown ? colors.brandBackground : colors.surface }]}>
+        <Text style={[styles.caption, { color: colors.ink }]}>{mobileMessage(locale, "taskInbox.title")}</Text>
+      </Pressable>}
       {(["active", "archived", "all"] as const).map((filter) => <Pressable key={filter} accessibilityRole="tab"
-        accessibilityState={{ selected: filter === listStatusFilter }} onPress={() => setStatusFilter(filter)}
-        style={[styles.filterChip, { borderColor: filter === listStatusFilter ? colors.accent : colors.border,
-          backgroundColor: filter === listStatusFilter ? colors.brandBackground : colors.surface }]}>
+        accessibilityState={{ selected: !taskInboxShown && filter === listStatusFilter }} onPress={() => setStatusFilter(filter)}
+        style={[styles.filterChip, { borderColor: !taskInboxShown && filter === listStatusFilter ? colors.accent : colors.border,
+          backgroundColor: !taskInboxShown && filter === listStatusFilter ? colors.brandBackground : colors.surface }]}>
         <Text style={[styles.caption, { color: colors.ink }]}>{mobileMessage(locale, `home.filter.${filter}`)}</Text>
       </Pressable>)}
     </View>
@@ -1809,7 +1846,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
     {copyNotice && <Notice text={copyNotice} colors={colors} locale={locale}
       dismissAccessibilityLabel={mobileMessage(locale, "actions.dismissCopyNotice")}
       onDismiss={() => setCopyNotice("")} />}
-    <PendingReceipts items={state.pending.filter((item) => ["rename", "pin", "archive", "delete", "task-tag"].includes(item.kind))}
+    <PendingReceipts items={state.pending.filter((item) => ["rename", "pin", "archive", "delete", "snooze", "task-tag"].includes(item.kind))}
       colors={colors} locale={locale} disabled={state.status !== "connected"} onError={setLocalError} />
     <SectionList ref={listRef} key={scrollKey} sections={listSections} keyExtractor={(item) => item.session.sessionId}
       scrollEnabled={reorderProjects.marker === undefined} stickySectionHeadersEnabled={reorderEnabled ? false : undefined}
@@ -1837,10 +1874,12 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
         </Pressable> : null}
       ListEmptyComponent={searchPending ? undefined : <Centered label={mobileMessage(locale, state.offlineSnapshotAt !== undefined
         ? "home.empty.offline" : state.status !== "connected" ? "home.empty.reconnect" : normalizedSearch
-          ? "home.empty.search" : projectView === undefined && hasMobileHomeDisplayFilters(display) ? "home.empty.filters"
+          ? "home.empty.search" : projectView === undefined && !taskInboxShown && hasMobileHomeDisplayFilters(display) ? "home.empty.filters"
           : listStatusFilter === "archived" ? "home.empty.archived" : "home.empty.default")} colors={colors} />}
-      renderItem={({ item }) => {
+      renderItem={({ item, section }) => {
         const attention = mobileSessionAttention(state.owner, item.session);
+        const snooze = taskSnoozeDeadline(mobileTaskSnooze(item.session));
+        const subscribed = section.kind === "taskInbox" && mobileTaskFollowsActiveAutomation(state.owner, item.session);
         return <SwipeableSessionRow session={item.session} registry={swipeRegistry} colors={colors} locale={locale}
           onTogglePin={togglePin} onArchive={toggleArchive} onShowOptions={openOptions}
           onMarkRead={attention !== undefined && attentionOwnerKey !== undefined ? markSessionRead : undefined}
@@ -1868,8 +1907,16 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
                 <MobileTaskTagDots tags={item.session.taskTags} locale={locale} dark={colors.dark} />
                 {item.session.pinned && <Text style={[styles.badge, { color: colors.ink, backgroundColor: colors.brandBackground }]}>{mobileMessage(locale, "common.pinned")}</Text>}
               </View>
-                <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{item.navigationName} · {sessionState(item.session.state, locale)}</Text></View>
+                <Text style={[styles.caption, { color: colors.muted }]} numberOfLines={1}>{item.navigationName} · {
+                  !item.session.archived && snooze > filterNow
+                    ? Number.isFinite(snooze) ? new Date(snooze).toLocaleString(locale) : mobileMessage(locale, "taskInbox.indefinitely")
+                    : sessionState(item.session.state, locale)}</Text></View>
             </Pressable>
+            {section.kind === "taskInbox" && section.key !== "working" && item.session.inboxSnoozeAllowed && <Action
+              colors={colors} compact label={mobileMessage(locale, "taskInbox.done")}
+              disabled={state.status !== "connected" || subscribed && attention === undefined
+                || item.session.state === SessionState.RUNNING || item.session.state === SessionState.RECOVERING}
+              onPress={() => subscribed ? markSessionRead(item.session) : toggleArchive(item.session)} />}
             <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "home.optionsFor", {
               name: item.session.displayName || mobileMessage(locale, "home.untitledTask")
             })}
@@ -1905,6 +1952,9 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
           {mobileSessionAttention(state.owner, optionsSession) !== undefined && <MenuRow
             label={mobileMessage(locale, "home.markTaskRead")} onPress={() => scheduleOption("mark-read")} colors={colors}
             disabled={attentionOwnerKey === undefined} />}
+          {optionsSession?.inboxSnoozeAllowed && <MenuRow colors={colors} disabled={state.status !== "connected"}
+            label={mobileMessage(locale, taskSnoozeDeadline(mobileTaskSnooze(optionsSession)) > filterNow ? "taskInbox.wake" : "taskInbox.snooze")}
+            onPress={() => scheduleOption("snooze")} />}
           <MobileTaskTagQuickChoices tags={state.owner?.taskTagCatalog?.taskTags ?? []} selected={optionsSession?.taskTags ?? []}
             locale={locale} colors={colors} disabled={state.status !== "connected"} onSelect={id => scheduleOption(`tag:${id}`)} />
           <MenuRow label={mobileMessage(locale, "taskTags.manage")} onPress={() => scheduleOption("tags")} colors={colors}
@@ -1922,6 +1972,9 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
         </SafeAreaView>
       </View>
     </Modal>
+    {snoozeSessionId !== undefined && state.status === "connected" && <MobileTaskSnoozeSheet
+      key={snoozeSessionId} colors={colors} locale={locale} onClose={() => setSnoozeSessionId(undefined)}
+      onChoose={choice => changeSnooze(snoozeSessionId, choice)} />}
     <Modal visible={state.status === "connected" && renameSession !== undefined} transparent animationType="fade"
       onRequestClose={() => setRenameSession(undefined)} statusBarTranslucent>
       <View style={styles.dialogRoot}>
@@ -1954,7 +2007,34 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
   </View>;
 }
 
-type SessionOption = "rename" | "mark-read" | "copy-link" | "pin" | "archive" | "delete" | "tags" | `tag:${string}`;
+type SessionOption = "rename" | "mark-read" | "copy-link" | "pin" | "archive" | "delete" | "snooze" | "tags" | `tag:${string}`;
+
+function MobileTaskSnoozeSheet({ colors, locale, onClose, onChoose }: Pick<ScreenProps, "colors" | "locale"> & {
+  readonly onClose: () => void;
+  readonly onChoose: (choice: TaskSnoozeChoice) => void;
+}) {
+  const [custom, setCustom] = useState("");
+  const now = Date.now();
+  const date = parseLocalTaskSnoozeTime(custom.trim().replace(" ", "T"), now);
+  return <Modal visible transparent animationType="fade" onRequestClose={onClose} statusBarTranslucent>
+    <View style={styles.dialogRoot}>
+      <View accessibilityViewIsModal style={[styles.renameDialog, { backgroundColor: colors.surface, borderColor: colors.border, maxHeight: "90%" }]}>
+        <ScrollView keyboardShouldPersistTaps="handled">
+          <Text accessibilityRole="header" style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "taskInbox.snooze")}</Text>
+          {taskSnoozeChoices(now).map(({ id, until }) => <MenuRow key={id} label={mobileMessage(locale, `taskInbox.choice.${id}`)}
+            colors={colors} onPress={() => onChoose(until)} />)}
+          <MenuRow label={mobileMessage(locale, "taskInbox.indefinitely")} colors={colors} onPress={() => onChoose("indefinitely")} />
+          <Field label={mobileMessage(locale, "taskInbox.custom")} placeholder="YYYY-MM-DD HH:mm" value={custom} onChange={setCustom} colors={colors} />
+          <View style={styles.actionRow}>
+            <Action label={mobileMessage(locale, "common.cancel")} colors={colors} onPress={onClose} />
+            <Action label={mobileMessage(locale, "common.save")} colors={colors} disabled={date === undefined}
+              onPress={() => { if (date !== undefined) onChoose(date); }} />
+          </View>
+        </ScrollView>
+      </View>
+    </View>
+  </Modal>;
+}
 
 function MobileHomeProjectHeading({ section, expanded, colors, locale, reorderable, reorder, onToggle, onStartDrag }: {
   readonly section: MobileHomeSection;

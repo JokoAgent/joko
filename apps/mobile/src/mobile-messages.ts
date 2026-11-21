@@ -14,7 +14,15 @@ import { mobileFilesMessages } from "./mobile-files-messages";
 import { mobileTaskTagMessages } from "./mobile-task-tag-messages";
 import { mobileExtensionMessages } from "./mobile-extension-messages";
 
+const taskInboxEnglish = {
+  "taskInbox.title": "Task Inbox", "taskInbox.inbox": "Inbox", "taskInbox.working": "Working", "taskInbox.snoozed": "Snoozed",
+  "taskInbox.snooze": "Snooze", "taskInbox.wake": "Wake", "taskInbox.done": "Done", "taskInbox.indefinitely": "Until I wake it",
+  "taskInbox.custom": "Choose date and time", "taskInbox.choice.oneHour": "In one hour", "taskInbox.choice.threeHours": "In three hours",
+  "taskInbox.choice.thisEvening": "This evening", "taskInbox.choice.tomorrow": "Tomorrow", "taskInbox.choice.nextWeek": "Next week"
+} as const;
+
 const en = {
+  ...taskInboxEnglish,
   ...serverAccessEnglish,
   ...mobileObjectiveMessages.en,
   ...mobileConversationSearchMessages.en,
@@ -375,6 +383,10 @@ export type MobileMessageKey = keyof typeof en;
 type MobileMessageCatalog = { readonly [K in MobileMessageKey]: string };
 
 const zhCN: MobileMessageCatalog = {
+  "taskInbox.title": "任务收件箱", "taskInbox.inbox": "收件箱", "taskInbox.working": "工作中", "taskInbox.snoozed": "稍后处理",
+  "taskInbox.snooze": "稍后处理", "taskInbox.wake": "唤醒", "taskInbox.done": "完成", "taskInbox.indefinitely": "直到手动唤醒",
+  "taskInbox.custom": "选择日期和时间", "taskInbox.choice.oneHour": "一小时后", "taskInbox.choice.threeHours": "三小时后",
+  "taskInbox.choice.thisEvening": "今天傍晚", "taskInbox.choice.tomorrow": "明天", "taskInbox.choice.nextWeek": "下周",
   ...serverAccessChinese,
   ...mobileObjectiveMessages["zh-CN"],
   ...mobileConversationSearchMessages["zh-CN"],
@@ -732,6 +744,7 @@ const zhCN: MobileMessageCatalog = {
 };
 
 const zhTW: MobileMessageCatalog = {
+  ...taskInboxEnglish,
   ...serverAccessChinese,
   ...mobileObjectiveMessages["zh-TW"],
   ...mobileConversationSearchMessages.en,
@@ -1089,6 +1102,7 @@ const zhTW: MobileMessageCatalog = {
 };
 
 const ja: MobileMessageCatalog = {
+  ...taskInboxEnglish,
   ...serverAccessEnglish,
   ...mobileObjectiveMessages.ja,
   ...mobileConversationSearchMessages.en,
@@ -1446,6 +1460,7 @@ const ja: MobileMessageCatalog = {
 };
 
 const ko: MobileMessageCatalog = {
+  ...taskInboxEnglish,
   ...serverAccessEnglish,
   ...mobileObjectiveMessages.ko,
   ...mobileConversationSearchMessages.en,

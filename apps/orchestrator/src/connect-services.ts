@@ -1980,6 +1980,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
         canRetryFailedQueueInput: item => dependencies.sessionHost.canRetryFailedQueueInput?.(item) === true,
         resolveSessionContextDefaults: dependencies.resolveSessionContextDefaults,
         resolveSideChatSourceAllowed: sessionId => dependencies.sessionHost.sideChatSourceAllowed(sessionId),
+        resolveInboxSnoozeAllowed: session => dependencies.sessionHost.canSnoozeSession?.(session) === true,
         resolveSessionRuntimeModel: ({ sessionId }) =>
           dependencies.sessionHost.getSessionRuntimeControl(sessionId).effective
       });
@@ -8149,6 +8150,7 @@ function eventContext(
   const sessionContext = item.payload.type === "session_changed" && session !== undefined
     ? sessionProjectionContext(store, session, {
         sideChatSourceAllowed: dependencies.sessionHost.sideChatSourceAllowed(session.descriptor.id),
+        inboxSnoozeAllowed: dependencies.sessionHost.canSnoozeSession?.(session) === true,
         ...(sessionActiveRun === undefined ? {} : { activeRun: sessionActiveRun }),
         runtimeAttached: sessionActiveRun !== undefined,
         resolveContextDefaults: dependencies.resolveSessionContextDefaults,
@@ -8319,6 +8321,7 @@ export function mapSession(
   const sessionActiveRun = activeRun(dependencies.store, session.descriptor.id);
   return toProtoSession(session, sessionProjectionContext(dependencies.store, session, {
     sideChatSourceAllowed: dependencies.sessionHost.sideChatSourceAllowed(session.descriptor.id),
+    inboxSnoozeAllowed: dependencies.sessionHost.canSnoozeSession?.(session) === true,
     ...(sessionActiveRun === undefined ? {} : { activeRun: sessionActiveRun }),
     runtimeAttached: sessionActiveRun !== undefined,
     resolveContextDefaults: dependencies.resolveSessionContextDefaults,
@@ -18097,6 +18100,23 @@ async function dispatchMutation(
           ? async () => dependencies.sessionNavigation?.refreshSummary(payload.value.sessionId, true)
           : undefined
       );
+    case "setSessionSnooze": {
+      const { sessionId, choice } = payload.value;
+      const selected = choice.case === "until" ? fromProtoTimestamp(choice.value, "session_snooze.until")
+        : choice.case === "indefinitely" && choice.value ? "indefinitely"
+        : choice.case === "wake" && choice.value ? "wake" : undefined;
+      if (selected === undefined) throw invalidArgument("Choose a deadline, an indefinite snooze, or wake.");
+      return presented(await host.mutate({
+        operationId, connection, kind: payload.case, body: mutation,
+        commit: store => {
+          if (!host.canSnoozeSession(store.getSession(sessionId))) {
+            throw new ConnectError("This task cannot be snoozed.", Code.FailedPrecondition);
+          }
+          store.setSessionSnooze(sessionId, selected);
+          return { accepted: true, resultCase: "session", entityId: sessionId } satisfies OperationOutcome;
+        }
+      }));
+    }
     case "archiveSession": {
       const existing = dependencies.store.getSession(payload.value.sessionId);
       const personalPurpose = readPersonalDevelopmentPurpose(dependencies.store, payload.value.sessionId);

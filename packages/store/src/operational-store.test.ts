@@ -45,6 +45,34 @@ afterEach(() => {
 });
 
 describe("OperationalStore", () => {
+  it("retains a task snooze across reopen and clears it only on a later accepted input or explicit lifecycle action", () => {
+    const f = createFixture(), id = "session-1";
+    const original = f.store.getSession(id);
+    expect(original.descriptor.snooze).toBeUndefined();
+    expect(() => f.store.setSessionSnooze(id, 100, 100)).toThrow("deadline within the next year");
+    f.store.setSessionSnooze(id, "indefinitely", 100);
+    const path = f.store.filePath;
+    f.store.close();
+    f.replaceStore(new OperationalStore(path));
+    expect(f.store.getSession(id)).toMatchObject({ descriptor: { snooze: { setAt: 100 }, updatedAt: original.descriptor.updatedAt } });
+    f.store.wakeSessionAfterAcceptedInput(id, 99);
+    f.store.wakeSessionAfterAcceptedInput(id, 100);
+    expect(f.store.getSession(id).descriptor.snooze).toEqual({ setAt: 100 });
+    f.store.wakeSessionAfterAcceptedInput(id, 101);
+    expect(f.store.getSession(id).descriptor.snooze).toBeUndefined();
+    f.store.setSessionSnooze(id, 500, 200);
+    expect(f.store.getSession(id).descriptor.snooze).toEqual({ setAt: 200, until: 500 });
+    f.store.setSessionSnooze(id, "wake");
+    expect(f.store.getSession(id).descriptor.snooze).toBeUndefined();
+    f.store.setSessionSnooze(id, "indefinitely");
+    f.store.updateSession(id, { archived: true });
+    expect(() => f.store.setSessionSnooze(id, "indefinitely")).toThrow("cannot be snoozed");
+    f.store.updateSession(id, { archived: false });
+    expect(f.store.getSession(id).descriptor.snooze).toBeUndefined();
+    expect(f.store.listEvents({ sessionId: id }).filter(item => item.traceId.startsWith("session-snooze:")).map(item => item.payload.type))
+      .toEqual(Array.from({ length: 5 }, () => "session_changed"));
+  });
+
   it("keeps read-only native binding history scoped to the adopted task, Backend, generation and time after reopen", () => {
     const f = createFixture(), original = f.store.getSession("session-1");
     const first = { opaqueRef: "native/owned-one", nativeSessionId: "sdk-one", generation: 1 };

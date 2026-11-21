@@ -162,6 +162,7 @@ export type AppRoute =
   | { readonly kind: "files"; readonly sessionId: string; readonly file?: string; readonly search?: string; readonly line?: number }
   | { readonly kind: "newSession"; readonly targetId?: string; readonly dialogueBackendId?: string; readonly recommendationNonce?: string; readonly initialModel?: NewSessionModelRequest; readonly contactsDraft?: ContactsDraftOwner }
   | { readonly kind: "projects"; readonly projectId?: string }
+  | { readonly kind: "taskInbox" }
   | { readonly kind: "partners"; readonly partnerId?: string; readonly profileId?: string; readonly preparation?: boolean; readonly groupId?: string }
   | { readonly kind: "schedules"; readonly scheduleId?: string }
   | { readonly kind: "tools"; readonly profileId?: string; readonly tab?: ToolsTab; readonly extensionId?: string; readonly recommendationNonce?: string }
@@ -4090,6 +4091,7 @@ export function useAppController(): AppController {
       return result;
     },
     pinSession: (sessionId, pinned) => gateway().pinSession(sessionId, pinned),
+    setSessionSnooze: (sessionId, choice) => gateway().setSessionSnooze(sessionId, choice),
     archiveSession: (sessionId, archived, confirmation, projectId) => gateway().archiveSession(sessionId, archived, confirmation, projectId),
     openSideChat: (...args) => gateway().openSideChat(...args),
     readSideChatOperation: (...args) => gateway().readSideChatOperation!(...args),
@@ -5444,6 +5446,7 @@ export function routeFromHash(hash: string): AppRoute {
     return { kind: "session" };
   }
   if (parts[0] === "settings") return { kind: "settings" };
+  if (parts[0] === "task-inbox") return { kind: "taskInbox" };
   if (parts[0] === "tasks" && parts[1] === "new") {
     if (query.has("contacts")) {
       const profileId = query.get("contacts"), serverId = query.get("server");
@@ -5530,6 +5533,7 @@ export function appRouteHash(route: AppRoute): string {
     return `#/tasks/new${query.size === 0 ? "" : `?${query.toString()}`}`;
   }
   if (route.kind === "projects") return route.projectId === undefined ? "#/projects" : `#/projects/${encodeURIComponent(route.projectId)}`;
+  if (route.kind === "taskInbox") return "#/task-inbox";
   if (route.kind === "partners") {
     if (route.groupId) return `#/partners/groups/${encodeURIComponent(route.groupId)}`;
     const query = new URLSearchParams();

@@ -12,6 +12,8 @@ import type { SessionArchivePreview } from "@joko/contracts";
 import { InteractionSchema, splitQuestionReferences } from "@joko/contracts";
 import { clipBareHttpAutolinkText } from "./mobile-markdown-url-boundary";
 import { clone, create, equals, fromJsonString, toBinary } from "@bufbuild/protobuf";
+import { timestampFromDate } from "@bufbuild/protobuf/wkt";
+import { SetSessionSnoozeMutationSchema, type TaskSnoozeChoice } from "@joko/contracts";
 import { MobileTaskOutboxStore, mobileTaskOutboxHistoryDeleted, mobileTaskOutboxHistoryMatches, mobileTaskOutboxModel,
   mobileTaskOutboxOwnerMatches, mobileTaskOutboxQueueMatches, mobileTaskOutboxSessionMatches,
   type MobileTaskOutboxRecord } from "./mobile-task-outbox";
@@ -15610,6 +15612,17 @@ export class MobileClient {
     });
   }
 
+  async setSessionSnooze(sessionId: string, choice: TaskSnoozeChoice): Promise<boolean> {
+    if (!this.#state.owner?.sessions.some(session => session.sessionId === sessionId && session.inboxSnoozeAllowed)) {
+      throw new Error("A current task is required to change its snooze.");
+    }
+    return this.#mutateSession(sessionId, "snooze", {
+      case: "setSessionSnooze",
+      value: create(SetSessionSnoozeMutationSchema, { sessionId, choice: typeof choice === "number"
+        ? { case: "until", value: timestampFromDate(new Date(choice)) } : { case: choice, value: true } })
+    });
+  }
+
   async prepareSessionArchive(sessionId: string): Promise<{
     readonly preview: SessionArchivePreview;
     readonly archive: (onConfirmed?: () => void) => Promise<boolean>;
@@ -15660,7 +15673,7 @@ export class MobileClient {
 
   async #mutateSession(
     sessionId: string,
-    kind: Extract<PendingOperation["kind"], "rename" | "pin" | "archive" | "delete">,
+    kind: Extract<PendingOperation["kind"], "rename" | "pin" | "archive" | "delete" | "snooze">,
     payload: OperationMutation["payload"],
     onArchiveConfirmed?: () => void
   ): Promise<boolean> {
@@ -15668,7 +15681,7 @@ export class MobileClient {
     const revision = session?.version?.revision;
     if (!session || !revision || revision.value < 1n) throw new Error("A current task revision is required.");
     if (this.#state.pending.some((item) => item.sessionId === sessionId
-      && ["rename", "pin", "archive", "delete"].includes(item.kind))) {
+      && ["rename", "pin", "archive", "delete", "snooze"].includes(item.kind))) {
       throw new Error("A previous change to this task is still pending. Check its operation before changing it again.");
     }
     const credential = this.#ready();

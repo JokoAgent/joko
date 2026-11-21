@@ -1,3 +1,18 @@
+.task-inbox-sections { display: grid; gap: 24px; max-width: 900px; }
+.task-inbox-sections h2 { margin: 0 0 8px; font-size: var(--text-15); }
+.task-inbox-sections ul { list-style: none; margin: 0; padding: 0; overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-raised); }
+.task-inbox-sections li { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; min-height: 52px; padding: 6px 12px; }
+.task-inbox-sections li + li { border-top: 1px solid var(--line); }
+.task-inbox-task { flex: 1 1 150px; display: grid; gap: 2px; min-width: 0; padding: 8px 0; text-align: start; border: 0; background: none; color: var(--text); }
+.task-inbox-task:hover { text-decoration: underline; }
+.task-inbox-task span { overflow-wrap: anywhere; }
+.task-inbox-task small, .task-inbox-empty, .task-snooze-choices small { color: var(--text-soft); font-size: var(--text-12); }
+.task-inbox-empty { margin: 0; }
+.task-inbox-actions, .task-snooze-custom { display: flex; flex-wrap: wrap; gap: 6px; align-items: end; }
+.task-snooze-custom { padding-top: 12px; }
+.task-snooze-custom label { flex: 1 1 180px; }
+.task-snooze-choices { display: grid; gap: 6px; }
+.task-snooze-choices button { justify-content: space-between; }
 .device-authorization { display: grid; gap: 16px; min-width: 0; overflow-wrap: anywhere; line-height: 1.55; }
 .device-review-page { display: grid; gap: 16px; width: 100%; max-width: 680px; margin: 0 auto; padding: 24px 16px; box-sizing: border-box; }
 .device-review-page > h1 { font-size: var(--text-20); line-height: 1.3; margin: 0; }
