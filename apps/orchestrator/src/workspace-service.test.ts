@@ -34,9 +34,11 @@ describe("WorkspaceService", () => {
   it("keeps supported code extensions in the truncated text path beyond the UTF-8 probe limit", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-workspace-baseline-code-"));
     const names = ["Component.vue", "main.zig", "events.jsonl", "movie.srt", "Gemfile", ".gitignore",
-      ".env", "production.env.local", "layout.xhtml", "project.csproj", "strings.po", "book.tex"];
+      ".env", "production.env.local", "layout.xhtml", "project.csproj", "strings.po", "book.tex",
+      "Directory.Build.props", "project.csproj.user", "component.razor"];
     await Promise.all(names.map((name) => writeFile(join(root, name), "x".repeat(WORKSPACE_TEXT_FILE_MAXIMUM_BYTES + 1), "utf8")));
-    await writeFile(join(root, "unknown.custom"), "x".repeat(WORKSPACE_TEXT_FILE_MAXIMUM_BYTES + 1), "utf8");
+    const unknownNames = ["unknown.custom", "project.csproj.user.bak"];
+    await Promise.all(unknownNames.map((name) => writeFile(join(root, name), "x".repeat(WORKSPACE_TEXT_FILE_MAXIMUM_BYTES + 1), "utf8")));
     const service = new WorkspaceService();
     await service.register({ id: "workspace-code", root, displayName: "Workspace code", trusted: true });
 
@@ -45,9 +47,11 @@ describe("WorkspaceService", () => {
         mediaType: "text/plain", text: "x".repeat(16), truncated: true
       });
     }
-    const unknown = await service.preview("workspace-code", "unknown.custom", 16);
-    expect(unknown).toMatchObject({ mediaType: "application/octet-stream", truncated: false });
-    expect(unknown.text).toBeUndefined();
+    for (const name of unknownNames) {
+      const unknown = await service.preview("workspace-code", name, 16);
+      expect(unknown).toMatchObject({ mediaType: "application/octet-stream", truncated: false });
+      expect(unknown.text).toBeUndefined();
+    }
     for (const bytes of [Buffer.from([0xff, 0xfe]), Buffer.from("visible\0binary")]) {
       await writeFile(join(root, "invalid.zig"), bytes);
       const invalid = await service.preview("workspace-code", "invalid.zig", 16);
