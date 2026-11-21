@@ -6409,6 +6409,11 @@ const en = {
   ,"settings.refreshingModels": "Refreshing model catalog…"
   ,"settings.modelsRefreshed": "Model catalog refreshed."
   ,"settings.modelsRefreshFailed": "Model catalog refresh failed. Check the provider connection and try again."
+  ,"settings.modelWithdrawalTitle": "Review missing models"
+  ,"settings.modelWithdrawalDescription": "{provider} no longer lists these models for {backend}. Choose which to remove from this connection. Existing task history is kept."
+  ,"settings.modelWithdrawalSuspicious": "The catalog is empty or at least half of its discovered models are missing. Refresh again if this looks unexpected."
+  ,"settings.modelWithdrawalConfirm": "Remove selected models ({count})"
+  ,"settings.modelWithdrawalFailed": "Removal could not be confirmed. If the connection or catalog changed, refresh it and review again."
   ,"settings.hideModel": "Hide {name} from model pickers"
   ,"settings.showModel": "Show {name} in model pickers"
   ,"settings.collaboration.title": "Collaboration"
@@ -10534,6 +10539,11 @@ const zhBase: Record<MessageKey, string> = {
   "settings.refreshingModels": "正在刷新模型目录…",
   "settings.modelsRefreshed": "模型目录已刷新。",
   "settings.modelsRefreshFailed": "模型目录刷新失败，请检查供应商连接后重试。",
+  "settings.modelWithdrawalTitle": "审核目录中缺失的模型",
+  "settings.modelWithdrawalDescription": "{provider} 的 {backend} 目录已不再列出这些模型。请选择要从此连接移除的模型，既有任务历史会保留。",
+  "settings.modelWithdrawalSuspicious": "目录为空，或至少一半的已发现模型缺失。如果结果不符合预期，请再次刷新。",
+  "settings.modelWithdrawalConfirm": "移除选中的模型（{count}）",
+  "settings.modelWithdrawalFailed": "未能确认移除结果。若连接或目录已变更，请刷新后重新审核。",
   "settings.hideModel": "在模型选择器中隐藏 {name}",
   "settings.showModel": "在模型选择器中显示 {name}",
   "settings.processUsage.title": "运行时资源用量",

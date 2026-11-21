@@ -4383,6 +4383,7 @@ export function useAppController(): AppController {
     saveProvider,
     deleteProvider: (providerId) => gateway().deleteProvider(providerId),
     refreshProviderModels: (backendId, providerId, automatic) => gateway().refreshProviderModels(backendId, providerId, automatic),
+    confirmProviderModelWithdrawals: (review, modelIds, operationId) => gateway().confirmProviderModelWithdrawals(review, modelIds, operationId),
     refreshManagedModelRuntimes: (signal) => gateway().refreshManagedModelRuntimes(signal),
     ensureManagedModelRuntimeProvider: (runtimeId) => gateway().ensureManagedModelRuntimeProvider(runtimeId),
     stopManagedModelRuntime: (runtimeId) => gateway().stopManagedModelRuntime(runtimeId),

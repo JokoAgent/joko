@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 
 import { act } from "react";
+import { create } from "@bufbuild/protobuf";
+import { ProviderModelWithdrawalReviewSchema, type ProviderModelWithdrawalReview } from "@joko/contracts";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -957,12 +959,13 @@ describe("ProviderSettings model visibility", () => {
     ]).toBe(true);
   });
 
-  it("auto-refreshes once on open and reports manual refresh progress", async () => {
-    let finishManualRefresh: (() => void) | undefined;
-    const refreshProviderModels = vi.fn((providerId?: string, automatic?: boolean): Promise<void> => {
-      if (automatic === true) return Promise.resolve();
-      return new Promise<void>((resolve) => { finishManualRefresh = resolve; });
+  it("auto-refreshes once and requires a checked selection before removing models after a suspicious result", async () => {
+    let finishManualRefresh: ((review?: ProviderModelWithdrawalReview) => void) | undefined;
+    const refreshProviderModels = vi.fn((_backendId: string, _providerId?: string, automatic?: boolean): Promise<ProviderModelWithdrawalReview | undefined> => {
+      if (automatic === true) return Promise.resolve(undefined);
+      return new Promise((resolve) => { finishManualRefresh = resolve; });
     });
+    const confirmProviderModelWithdrawals = vi.fn(async (_review: ProviderModelWithdrawalReview, _modelIds: readonly string[], _operationId: string) => {});
     const base = emptySnapshot();
     const provider = {
       id: "provider",
@@ -995,6 +998,7 @@ describe("ProviderSettings model visibility", () => {
     };
     const controller = {
       refreshProviderModels,
+      confirmProviderModelWithdrawals,
       state: {
         activeProfile: { id: "profile-one", serverId: "orchestrator-one", name: "Orchestrator", origin: "https://orchestrator.invalid" },
         preferences: { locale: "en" },
@@ -1017,8 +1021,29 @@ describe("ProviderSettings model visibility", () => {
     await act(async () => refresh.click());
     expect(refreshProviderModels).toHaveBeenLastCalledWith("backend-provider-catalog", "provider", false);
     expect(container.textContent).toContain("Refreshing model catalog…");
-    await act(async () => finishManualRefresh?.());
+    const review = create(ProviderModelWithdrawalReviewSchema, { reviewId: "review-one", backendId: "backend-provider-catalog", providerId: "provider",
+      providerName: "Provider", suspicious: true, models: [{ modelId: "old-a", displayName: "Old A" }, { modelId: "old-b", displayName: "Old B" }] });
+    await act(async () => finishManualRefresh?.(review));
     expect(container.textContent).toContain("Model catalog refreshed.");
+    const dialog = required(document.querySelector('[role="dialog"]'));
+    const choices = Array.from(dialog.querySelectorAll<HTMLInputElement>('input[type="checkbox"]'));
+    expect(choices).toHaveLength(2);
+    expect(choices.every(choice => !choice.checked)).toBe(true);
+    const remove = required(Array.from(dialog.querySelectorAll<HTMLButtonElement>("button")).find(button => button.textContent?.includes("Remove selected models")));
+    expect(remove.disabled).toBe(true);
+    await act(async () => required(Array.from(dialog.querySelectorAll<HTMLButtonElement>("button")).find(button => button.textContent === "Cancel")).click());
+    expect(confirmProviderModelWithdrawals).not.toHaveBeenCalled();
+
+    await act(async () => refresh.click());
+    await act(async () => finishManualRefresh?.(review));
+    const reopened = required(document.querySelector('[role="dialog"]'));
+    await act(async () => required(reopened.querySelector<HTMLInputElement>('input[type="checkbox"]')).click());
+    const confirm = required(Array.from(reopened.querySelectorAll<HTMLButtonElement>("button")).find(button => button.textContent?.includes("Remove selected models")));
+    confirmProviderModelWithdrawals.mockRejectedValueOnce(new Error("No receipt"));
+    await act(async () => confirm.click());
+    expect(confirmProviderModelWithdrawals).toHaveBeenCalledWith(review, ["old-a"], expect.any(String));
+    await act(async () => confirm.click());
+    expect(confirmProviderModelWithdrawals.mock.calls[1]).toEqual(confirmProviderModelWithdrawals.mock.calls[0]);
   });
 
   it("disables a Provider across related runtimes and supports per-runtime model visibility", async () => {

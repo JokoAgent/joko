@@ -198,7 +198,7 @@ import type {
   ProviderDescriptor as NativeProviderDescriptor,
   ProviderLoginFlow as NativeProviderLoginFlow
 } from "./credential-manager.js";
-import { ProviderAuthUnsupportedError } from "./credential-manager.js";
+import { ProviderAuthUnsupportedError, type ProviderModelWithdrawalReview } from "./credential-manager.js";
 import type { DiagnosticsBundleService } from "./diagnostics-bundle.js";
 import type {
   ExtensionCatalogDescriptor as NativeExtensionCatalogDescriptor,
@@ -1108,6 +1108,7 @@ interface OperationOutcome {
     readonly expiresAt?: number;
   };
   readonly providerAccountReset?: AccountResetResult;
+  readonly providerModelWithdrawalReview?: ProviderModelWithdrawalReview;
   readonly browserTransferBinaryBase64?: string;
   readonly skillReplacedId?: string;
   readonly skillRecoveryId?: string;
@@ -7070,6 +7071,11 @@ function operationResult(
   if (outcome.accepted && outcome.providerAccountReset) return create(contract.OperationResultSchema, {
     payload: { case: "providerAccountReset", value: toProtoAccountResetResult(outcome.providerAccountReset) }
   });
+  if (outcome.accepted && outcome.providerModelWithdrawalReview) return create(contract.OperationResultSchema, {
+    payload: { case: "providerModelWithdrawalReview", value: create(contract.ProviderModelWithdrawalReviewSchema, {
+      ...outcome.providerModelWithdrawalReview, models: [...outcome.providerModelWithdrawalReview.models]
+    }) }
+  });
   if (outcome.accepted && outcome.pickedDirectory) {
     const value = outcome.pickedDirectory;
     return create(contract.OperationResultSchema, { payload: { case: "pickedDirectory", value: create(contract.ExtensionPickedDirectoryDepositSchema, {
@@ -7635,9 +7641,21 @@ export function outcomeFromRecord(record: OperationRecord<unknown>): OperationOu
     const gitPush = asRecord(response["workspaceGitPush"]);
     const scheduleDeletion = asRecord(response["scheduleDeletion"]);
     const memoryReset = response["memoryReset"];
+    const withdrawal = asRecord(response["providerModelWithdrawalReview"]);
     return {
       accepted: response["accepted"],
       ...(response["providerAccountReset"] === undefined ? {} : { providerAccountReset: accountResetResultFromRecord(response["providerAccountReset"]) }),
+      ...(typeof withdrawal["reviewId"] === "string" && typeof withdrawal["backendId"] === "string"
+        && typeof withdrawal["providerId"] === "string" && typeof withdrawal["providerName"] === "string"
+        && Array.isArray(withdrawal["models"]) ? { providerModelWithdrawalReview: {
+          reviewId: withdrawal["reviewId"], backendId: withdrawal["backendId"], providerId: withdrawal["providerId"],
+          providerName: withdrawal["providerName"], suspicious: withdrawal["suspicious"] === true,
+          models: withdrawal["models"].flatMap(value => {
+            const model = asRecord(value);
+            return typeof model["modelId"] === "string" && typeof model["displayName"] === "string"
+              ? [{ modelId: model["modelId"], displayName: model["displayName"] }] : [];
+          })
+        } } : {}),
       ...(response["pickedDirectory"] === undefined ? {} : { pickedDirectory: pickedExtensionDirectoryFromRecord(response["pickedDirectory"]) }),
       resultCase: stringValue(response["resultCase"]) as OperationOutcome["resultCase"],
       entityId: stringValue(response["entityId"]),
@@ -21511,6 +21529,25 @@ async function dispatchMutation(
       const providerId = rawProviderId.trim();
       if (rawProviderId !== "" && providerId === "") throw invalidArgument("provider_id is invalid");
       if (managedProviderCatalogApplies(dependencies, backendId, providerId || undefined)) {
+        const providers = dependencies.providers;
+        if (!payload.value.automatic && providerId !== "" && providers.canDiscoverProviderModels(backendId, providerId)) {
+          let review: ProviderModelWithdrawalReview | undefined;
+          return presented(await dependencies.sessionHost.mutate({
+            operationId, connection, kind: payload.case, body: mutation,
+            effect: async () => {
+              const assertCurrent = () => dependencies.connections.fence(connection);
+              const refreshed = await providers.discoverProviderModels(backendId, providerId, undefined, assertCurrent, connection.id);
+              if (refreshed.addedModelIds.length || refreshed.updatedModelIds.length) {
+                await refreshManagedProviderBackends(dependencies, new Set([backendId]));
+              }
+              assertCurrent();
+              review = refreshed.withdrawalReview;
+              dependencies.messageSearch?.reconcileAvailability();
+            },
+            commit: () => review ? { accepted: true, resultCase: "providerModelWithdrawalReview", providerModelWithdrawalReview: review } satisfies OperationOutcome
+              : { accepted: true, resultCase: "acknowledgement" } satisfies OperationOutcome
+          }));
+        }
         if (backendId === dependencies.providers.nativeAuthenticationBackendId && dependencies.providerAuth === undefined) {
           return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Provider model catalog refresh is not configured.");
         }
@@ -21558,6 +21595,25 @@ async function dispatchMutation(
           if (dependencies.refreshBackendDescriptor === undefined) await operations.listModels!();
           else await dependencies.refreshBackendDescriptor(backendId);
         });
+        dependencies.messageSearch?.reconcileAvailability();
+      });
+    }
+    case "confirmProviderModelWithdrawals": {
+      const backendId = nonBlankRequest(payload.value.backendId, "backend_id");
+      const providerId = nonBlankRequest(payload.value.providerId, "provider_id");
+      const reviewId = nonBlankRequest(payload.value.reviewId, "review_id");
+      const modelIds = payload.value.modelIds;
+      if (!modelIds.length || modelIds.length > 10_000 || modelIds.some(id => id.length > 512 || id.trim() === "")) {
+        throw invalidArgument("model_ids are invalid");
+      }
+      if (!managedProviderCatalogApplies(dependencies, backendId, providerId)) throw new ConnectError("Provider not found.", Code.NotFound);
+      const providers = dependencies.providers;
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, {
+        accepted: true, resultCase: "acknowledgement"
+      }, async () => {
+        await providers.confirmModelWithdrawals({ backendId, providerId, reviewId, modelIds }, connection.id,
+          () => dependencies.connections.fence(connection));
+        await refreshManagedProviderBackends(dependencies, new Set([backendId]));
         dependencies.messageSearch?.reconcileAvailability();
       });
     }

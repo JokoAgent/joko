@@ -33,6 +33,7 @@ describe("Provider model refresh operation", () => {
       sessionHost: immediateHost(store),
       providers: {
         nativeAuthenticationBackendId: "managed-backend",
+        canDiscoverProviderModels: () => false,
         list: () => [{
           backendId: "managed-backend",
           provider: { id: "provider-one" }
@@ -86,23 +87,51 @@ describe("Provider model refresh operation", () => {
     expect(adopted).not.toHaveBeenCalled();
     expect(refreshBackendDescriptor).not.toHaveBeenCalled();
   });
+
+  it("returns a connection-bound review receipt and adopts only a separate explicit selection", async () => {
+    const store = { findOperation: () => undefined, getBackend: () => ({ descriptor: {
+      id: "managed-backend", capabilities: new Map([["provider.managed_catalog", { key: "provider.managed_catalog", supported: true }]])
+    } }) };
+    const review = { reviewId: "review-one", backendId: "managed-backend", providerId: "provider-one", providerName: "Provider One",
+      suspicious: true, models: [{ modelId: "old-a", displayName: "Old A" }] };
+    const discoverProviderModels = vi.fn(async () => ({ addedModelIds: [], updatedModelIds: [], withdrawalReview: review }));
+    const confirmModelWithdrawals = vi.fn(async () => undefined);
+    const refreshBackendDescriptor = vi.fn(async () => undefined);
+    const services = createConnectServices(stubApplication({ store, sessionHost: immediateHost(store),
+      connections: { authenticate: () => connection, fence: vi.fn() }, refreshBackendDescriptor,
+      providers: { nativeAuthenticationBackendId: "pi", list: () => [{ provider: { id: "provider-one" } }],
+        canDiscoverProviderModels: () => true, discoverProviderModels, confirmModelWithdrawals }
+    }));
+    const receipt = await submit(services.operation.submitOperation, "operation-withdrawal-review", "provider-one", false);
+    expect(receipt).toMatchObject({ operation: { result: { payload: { case: "providerModelWithdrawalReview", value: review } } } });
+    expect(discoverProviderModels).toHaveBeenCalledWith(review.backendId, review.providerId, undefined, expect.any(Function), connection.id);
+    expect(confirmModelWithdrawals).not.toHaveBeenCalled();
+
+    await invokeMutation(services.operation.submitOperation, "operation-confirm-withdrawal", {
+      case: "confirmProviderModelWithdrawals",
+      value: create(contract.ConfirmProviderModelWithdrawalsMutationSchema, {
+        backendId: review.backendId, providerId: review.providerId, reviewId: review.reviewId, modelIds: ["old-a"]
+      })
+    });
+    expect(confirmModelWithdrawals).toHaveBeenCalledWith({ backendId: review.backendId, providerId: review.providerId, reviewId: review.reviewId,
+      modelIds: ["old-a"] }, connection.id, expect.any(Function));
+    expect(refreshBackendDescriptor).toHaveBeenCalledExactlyOnceWith(review.backendId);
+  });
 });
 
-async function submit(handler: unknown, operationId: string, providerId: string, automatic: boolean): Promise<void> {
+function submit(handler: unknown, operationId: string, providerId: string, automatic: boolean): Promise<unknown> {
+  return invokeMutation(handler, operationId, {
+    case: "refreshProviderModels",
+    value: create(contract.RefreshProviderModelsMutationSchema, { backendId: "managed-backend", providerId, automatic })
+  });
+}
+
+function invokeMutation(handler: unknown, operationId: string, payload: contract.OperationMutation["payload"]): Promise<unknown> {
   if (typeof handler !== "function") throw new Error("Operation handler is missing.");
-  await (handler as (request: unknown, context: unknown) => Promise<unknown>)({
+  return (handler as (request: unknown, context: unknown) => Promise<unknown>)({
     operationId,
     connectionId: connection.id,
-    mutation: create(contract.OperationMutationSchema, {
-      payload: {
-        case: "refreshProviderModels",
-        value: create(contract.RefreshProviderModelsMutationSchema, {
-          backendId: "managed-backend",
-          providerId,
-          automatic
-        })
-      }
-    })
+    mutation: create(contract.OperationMutationSchema, { payload })
   }, {
     requestHeader: new Headers({ authorization: "Bearer model-refresh-test" }),
     signal: new AbortController().signal

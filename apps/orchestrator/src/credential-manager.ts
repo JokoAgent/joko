@@ -17,7 +17,7 @@ import { isOwnedGgufProvider } from "./managed-gguf-provider.js";
 import { accountBalanceIntegration, PROVIDER_ACCOUNT_BALANCE_CAPABILITY, type AccountBalanceIdentity } from "./provider-account-balance.js";
 import {
   ProviderModelDiscoveryError,
-  fetchProviderModels,
+  fetchProviderModelCatalog,
   type DiscoveredProviderModel,
   type ProviderModelDiscoverySpec
 } from "./provider-model-discovery.js";
@@ -882,6 +882,7 @@ export interface ManagedProviderEntry {
   readonly provider: PiManagedProvider;
   readonly requestPath?: string;
   readonly modelsEndpoint?: string;
+  readonly upstreamListing?: { readonly source: string; readonly modelIds: readonly string[] };
   readonly credentialOrigin: string;
   readonly displayName: string;
   readonly kind: ProviderKind;
@@ -1002,7 +1003,7 @@ export class ProviderAuthGenerationConflictError extends Error {
   }
 }
 
-export interface ProviderDescriptor extends Omit<ManagedProviderEntry, "credentialBindings"> {
+export interface ProviderDescriptor extends Omit<ManagedProviderEntry, "credentialBindings" | "upstreamListing"> {
   readonly credentialReferenceIds: readonly string[];
   readonly authenticationState: ProviderAuthenticationState;
   readonly credentialExpiresAt?: number;
@@ -1017,6 +1018,23 @@ export interface ProviderModelDiscoveryResult {
   readonly addedModelIds: readonly string[];
   readonly updatedModelIds: readonly string[];
   readonly modelCount: number;
+  readonly withdrawalReview?: ProviderModelWithdrawalReview;
+}
+
+export interface ProviderModelWithdrawalReview {
+  readonly reviewId: string;
+  readonly backendId: string;
+  readonly providerId: string;
+  readonly providerName: string;
+  readonly suspicious: boolean;
+  readonly models: readonly { readonly modelId: string; readonly displayName: string }[];
+}
+
+interface HeldProviderModelReview {
+  readonly owner: string;
+  readonly source: string;
+  readonly version: bigint;
+  readonly review: ProviderModelWithdrawalReview;
 }
 
 export interface ProviderLoginFlow {
@@ -1143,6 +1161,7 @@ export class ProviderCatalogManager {
   readonly #providerEnabled: (backendId: string, providerId: string) => boolean;
   readonly #modelEnabled: (backendId: string, providerId: string, modelId: string) => boolean;
   readonly #entries = new Map<string, ManagedProviderEntry>();
+  readonly #modelDiscoveries = new Map<string, { review?: HeldProviderModelReview }>();
   readonly #nativeEntries = new Map<string, NativeProviderAuthEntry>();
   readonly #authentication = new Map<string, { readonly state: ProviderAuthenticationState; readonly error?: string }>();
   #generation = 0;
@@ -1349,10 +1368,10 @@ export class ProviderCatalogManager {
         const previous = existing.find(([, entry]) => entry.backendId === runtime.backendId)?.[1];
         const sameSource = previous?.provider.baseUrl === runtime.provider.baseUrl
           && previous?.provider.api === runtime.provider.api && previous?.modelsEndpoint === runtime.modelsEndpoint;
-        return { ...runtime, provider: { ...runtime.provider, models: runtime.provider.models.map(model =>
+        return { ...runtime, upstreamListing: sameSource ? previous?.upstreamListing : undefined, provider: { ...runtime.provider, models: runtime.provider.models.map(model =>
           saveDiscoveredModelConfiguration(sameSource ? previous?.provider.models.find(candidate => candidate.id === model.id) : undefined, model)) } };
       });
-      for (const [key] of existing) this.#entries.delete(key);
+      for (const [key] of existing) { this.#entries.delete(key); this.#modelDiscoveries.delete(key); }
       for (const runtime of runtimes) {
         this.#entries.set(managedProviderKey(runtime.backendId, input.providerId), {
           ...structuredClone(runtime), displayName: input.displayName, kind: input.kind, enabled: input.enabled,
@@ -1643,12 +1662,14 @@ export class ProviderCatalogManager {
       const next: ManagedProviderEntry = {
         ...input,
         credentialBindings: { ...input.credentialBindings },
+        upstreamListing: existing?.upstreamListing,
         ...(existing?.nativeCredentialReferenceId === undefined
           ? {}
           : { nativeCredentialReferenceId: existing.nativeCredentialReferenceId }),
         version: existing === undefined ? BigInt(this.#generation) + 1n : existing.version + 1n,
         updatedAt: this.#now()
       };
+      this.#modelDiscoveries.delete(key);
       this.#entries.set(key, next);
       await this.#bumpAndPersist(existing === undefined
         ? () => this.#entries.delete(key)
@@ -1667,7 +1688,8 @@ export class ProviderCatalogManager {
     backendId: string,
     providerId: string,
     fetchImpl: typeof fetch = fetch,
-    assertAuthorityCurrent?: () => void
+    assertAuthorityCurrent?: () => void,
+    reviewOwner?: string
   ): Promise<ProviderModelDiscoveryResult> {
     this.#assertInitialized();
     const normalized = managedProviderKey(backendId, providerId);
@@ -1675,72 +1697,125 @@ export class ProviderCatalogManager {
     if (captured === undefined || captured.provider.baseUrl === undefined) {
       throw new ProviderModelDiscoveryError("unsafe_endpoint");
     }
-    const spec = this.#modelDiscoverySpec(captured);
+    assertAuthorityCurrent?.();
+    const discovery: { review?: HeldProviderModelReview } = {};
+    this.#modelDiscoveries.set(normalized, discovery);
     const credentialGenerations = [...new Set(Object.values(captured.credentialBindings))]
       .map(reference => ({ reference, generation: this.#credentials.find(reference)?.generation }));
-    assertAuthorityCurrent?.();
-    const discovered = await fetchProviderModels({ ...spec, includeNonChat: true }, fetchImpl);
-    return this.#mutate(async () => {
-      const current = this.#entries.get(normalized);
-      if (current === undefined || current.version !== captured.version) {
-        throw new Error("Provider configuration changed during model catalog refresh.");
-      }
-      if (credentialGenerations.some(({ reference, generation }) => {
-        const credential = this.#credentials.find(reference);
-        return credential?.configured !== true || credential.generation !== generation;
-      })) throw new Error("Provider credentials changed during model catalog refresh.");
-      const customPiApi = current.backendId === this.#nativeBackendId && current.kind === "custom_endpoint"
-        ? current.provider.api
-        : undefined;
-      const updates = new Map(discovered.map(model => [model.id, model]));
-      const known = new Set(current.provider.models.map(model => model.id));
-      const codexApiKeyResponses = current.kind === "api_key" && current.provider.api === "openai-responses"
-        && current.nativeCredentialReferenceId === undefined && Object.keys(current.credentialBindings).length > 0
-        && this.#store.listBackends().some(({ descriptor }) => descriptor.id === current.backendId && descriptor.adapterKind === "codex");
-      const additions = discovered.filter(model => !known.has(model.id)).map(model => {
-        const managed = discoveredManagedModel(model, customPiApi);
-        return codexApiKeyResponses && model.cost !== undefined && isManagedChatModel(managed) ? { ...managed, cost: model.cost } : managed;
-      }).filter(model => isManagedChatModel(model) || isManagedSpeechModel(model));
-      const updatedModelIds: string[] = [];
-      const retained = current.provider.models.map(model => {
-        const update = updates.get(model.id);
-        if (update === undefined) return model;
-        const next = refreshDiscoveredModel(model, { ...update.metadata,
-          ...(update.contextWindow === undefined ? {} : { contextWindow: update.contextWindow }) });
-        if (JSON.stringify(next) !== JSON.stringify(model)) updatedModelIds.push(model.id);
-        return next;
-      });
-      if (additions.length === 0 && updatedModelIds.length === 0) {
+    const source = this.#withdrawalSource(captured);
+    try {
+      const spec = this.#modelDiscoverySpec(captured);
+      const { models: discovered, listedIds, complete } = await fetchProviderModelCatalog({ ...spec, includeNonChat: true }, fetchImpl);
+      return await this.#mutate(async () => {
+        const current = this.#entries.get(normalized);
+        if (current === undefined || current.version !== captured.version || this.#modelDiscoveries.get(normalized) !== discovery) {
+          throw new Error("Provider configuration changed during model catalog refresh.");
+        }
+        if (credentialGenerations.some(({ reference, generation }) => {
+          const credential = this.#credentials.find(reference);
+          return credential?.configured !== true || credential.generation !== generation;
+        })) throw new Error("Provider credentials changed during model catalog refresh.");
+        const customPiApi = current.backendId === this.#nativeBackendId && current.kind === "custom_endpoint"
+          ? current.provider.api
+          : undefined;
+        const updates = new Map(discovered.map(model => [model.id, model]));
+        const known = new Set(current.provider.models.map(model => model.id));
+        const codexApiKeyResponses = current.kind === "api_key" && current.provider.api === "openai-responses"
+          && current.nativeCredentialReferenceId === undefined && Object.keys(current.credentialBindings).length > 0
+          && this.#store.listBackends().some(({ descriptor }) => descriptor.id === current.backendId && descriptor.adapterKind === "codex");
+        const additions = discovered.filter(model => !known.has(model.id)).map(model => {
+          const managed = discoveredManagedModel(model, customPiApi);
+          return codexApiKeyResponses && model.cost !== undefined && isManagedChatModel(managed) ? { ...managed, cost: model.cost } : managed;
+        }).filter(model => isManagedChatModel(model) || isManagedSpeechModel(model));
+        const updatedModelIds: string[] = [];
+        const retained = current.provider.models.map(model => {
+          const update = updates.get(model.id);
+          if (update === undefined) return model;
+          const next = refreshDiscoveredModel(model, { ...update.metadata,
+            ...(update.contextWindow === undefined ? {} : { contextWindow: update.contextWindow }) });
+          if (JSON.stringify(next) !== JSON.stringify(model)) updatedModelIds.push(model.id);
+          return next;
+        });
+        const models = [...additions, ...retained];
+        const prior = new Set(source !== undefined && current.upstreamListing?.source === source ? current.upstreamListing.modelIds : []);
+        const tracked = source === undefined ? [] : models.filter(model => eligibleForWithdrawal(current, model)
+          && (prior.has(model.id) || listedIds.has(model.id)));
+        const candidates = complete && reviewOwner !== undefined && source !== undefined
+          ? tracked.filter(model => !listedIds.has(model.id))
+          : [];
+        if (discovered.length === 0 && (listedIds.size > 0 || candidates.length === 0)) throw new ProviderModelDiscoveryError("invalid_response");
+        const upstreamListing = tracked.length > 0 ? { source: source!, modelIds: tracked.map(model => model.id).sort() } : undefined;
+        const changed = additions.length > 0 || updatedModelIds.length > 0
+          || JSON.stringify(upstreamListing) !== JSON.stringify(current.upstreamListing);
+        assertAuthorityCurrent?.();
+        if (changed) {
+          const next: ManagedProviderEntry = { ...current, provider: { ...current.provider, models },
+            upstreamListing, version: current.version + 1n, updatedAt: this.#now() };
+          validateProviderEntry(next);
+          this.#entries.set(normalized, next);
+          await this.#bumpAndPersist(() => this.#entries.set(normalized, current));
+        }
+        if (candidates.length > 0 && this.#modelDiscoveries.get(normalized) === discovery) {
+          discovery.review = { owner: reviewOwner!, source: source!, version: this.#entries.get(normalized)!.version,
+            review: { reviewId: randomUUID(), backendId, providerId, providerName: current.displayName,
+              suspicious: listedIds.size === 0 || candidates.length * 2 >= tracked.length,
+              models: candidates.map(model => ({ modelId: model.id, displayName: model.name || model.id })) } };
+        }
         return {
           providerId,
-          addedModelIds: [],
-          updatedModelIds: [],
-          modelCount: current.provider.models.length
+          addedModelIds: additions.map((model) => model.id),
+          updatedModelIds,
+          modelCount: models.length,
+          ...(discovery.review ? { withdrawalReview: discovery.review.review } : {})
         };
+      });
+    } finally {
+      if (discovery.review === undefined && this.#modelDiscoveries.get(normalized) === discovery) this.#modelDiscoveries.delete(normalized);
+    }
+  }
+
+  async confirmModelWithdrawals(input: {
+    readonly backendId: string; readonly providerId: string; readonly reviewId: string; readonly modelIds: readonly string[];
+  }, owner: string, assertAuthorityCurrent: () => void): Promise<void> {
+    this.#assertInitialized();
+    const key = managedProviderKey(input.backendId, input.providerId);
+    await this.#mutate(async () => {
+      assertAuthorityCurrent();
+      const held = this.#modelDiscoveries.get(key)?.review;
+      const current = this.#entries.get(key);
+      if (!held || !current || held.owner !== owner || held.review.reviewId !== input.reviewId || held.version !== current.version
+        || held.source !== this.#withdrawalSource(current)) throw new Error("The provider catalog changed. Refresh it and review the missing models again.");
+      const selected = new Set(input.modelIds);
+      const reviewed = new Set(held.review.models.map(model => model.modelId));
+      if (selected.size === 0 || selected.size !== input.modelIds.length || [...selected].some(id => !reviewed.has(id))) {
+        throw new Error("Select models from the current withdrawal review.");
       }
-      const next: ManagedProviderEntry = {
-        ...current,
-        provider: {
-          ...current.provider,
-          models: [
-            ...additions,
-            ...retained
-          ]
-        },
-        version: current.version + 1n,
-        updatedAt: this.#now()
-      };
+      const models = current.provider.models.filter(model => !selected.has(model.id));
+      const modelIds = current.upstreamListing!.modelIds.filter(id => !selected.has(id));
+      const next: ManagedProviderEntry = { ...current,
+        upstreamListing: modelIds.length ? { source: held.source, modelIds } : undefined,
+        provider: { ...current.provider, models }, version: current.version + 1n, updatedAt: this.#now() };
       validateProviderEntry(next);
-      assertAuthorityCurrent?.();
-      this.#entries.set(normalized, next);
-      await this.#bumpAndPersist(() => this.#entries.set(normalized, current));
-      return {
-        providerId,
-        addedModelIds: additions.map((model) => model.id),
-        updatedModelIds,
-        modelCount: next.provider.models.length
-      };
+      this.#entries.set(key, next);
+      await this.#bumpAndPersist(() => this.#entries.set(key, current));
+      if (this.#modelDiscoveries.get(key)?.review === held) this.#modelDiscoveries.delete(key);
     });
+  }
+
+  #withdrawalSource(entry: ManagedProviderEntry): string | undefined {
+    if (entry.nativeCredentialReferenceId !== undefined || !["api_key", "custom_endpoint"].includes(entry.kind)
+      || entry.provider.baseUrl === undefined) return undefined;
+    const bindings = Object.entries(entry.credentialBindings).sort(([a], [b]) => a.localeCompare(b, "en"));
+    if (bindings.length === 0) return undefined;
+    const generations = bindings.map(([name, reference]) => {
+      const credential = this.#credentials.find(reference);
+      return [name, reference, credential?.configured === true ? credential.generation : undefined];
+    });
+    if (generations.some(([, , generation]) => generation === undefined)) return undefined;
+    return createHash("sha256").update(JSON.stringify([
+      entry.kind, entry.provider.baseUrl, entry.provider.api, entry.modelsEndpoint, entry.requestPath, entry.provider.apiKeyEnv,
+      entry.provider.authHeader, Object.entries(entry.provider.headers ?? {}).sort(([a], [b]) => a.localeCompare(b, "en")), generations
+    ])).digest("hex");
   }
 
   async delete(providerId: string, options: { readonly stillActive?: () => boolean; readonly expectedVersion?: bigint } = {}): Promise<boolean> {
@@ -1751,7 +1826,7 @@ export class ProviderCatalogManager {
       const revision = existing.reduce((maximum, [, entry]) => entry.version > maximum ? entry.version : maximum, 0n);
       if (options.expectedVersion !== undefined && revision !== options.expectedVersion) throw new Error("Provider configuration changed concurrently.");
       if (existing.length === 0) return false;
-      for (const [key] of existing) this.#entries.delete(key);
+      for (const [key] of existing) { this.#entries.delete(key); this.#modelDiscoveries.delete(key); }
       await this.#bumpAndPersist(() => { for (const [key, entry] of existing) this.#entries.set(key, entry); });
       return true;
     });
@@ -2330,8 +2405,9 @@ export class ProviderCatalogManager {
     else if ((native !== undefined || entry.kind === "oauth" || entry.kind === "subscription") && (nativeReference === undefined || existing.length === 0)) authenticationState = "signed_out";
     else if (providerEnvironmentNames(entry.provider).size > 0 && existing.length === 0) authenticationState = "signed_out";
     else authenticationState = "authenticated";
+    const { upstreamListing: _listing, ...descriptor } = entry;
     return {
-      ...entry,
+      ...descriptor,
       ...(native === undefined ? {} : {
         kind: native.kind,
         supportsLogin: native.kind === "api_key" || native.kind === "oauth" || native.kind === "subscription",
@@ -2755,6 +2831,11 @@ function discoveredManagedModel(model: DiscoveredProviderModel, customPiApi: PiM
   } });
 }
 
+function eligibleForWithdrawal(entry: ManagedProviderEntry, model: PiManagedModel): boolean {
+  return model.discoveredMetadata !== undefined && model.metadataOverrides?.includes("name") !== true
+    && model.api === undefined && entry.provider.modelOverrides?.[model.id] === undefined && isManagedChatModel(model);
+}
+
 function automaticOpenCodeGoResponsesModel(entry: ManagedProviderEntry): PiManagedModel | undefined {
   const { provider } = entry;
   if (provider.baseUrl !== "https://opencode.ai/zen/go/v1" || provider.api !== "openai-completions" ||
@@ -2769,6 +2850,12 @@ function validateProviderEntry(entry: ManagedProviderEntry): void {
   if (typeof entry.enabled !== "boolean" || typeof entry.version !== "bigint" || entry.version < 1n
     || !Number.isSafeInteger(entry.updatedAt) || entry.updatedAt < 0) throw new Error("Provider configuration metadata is malformed.");
   if (!isRecord(entry.provider)) throw new Error("Provider configuration must be an object.");
+  if (entry.upstreamListing !== undefined && (!isRecord(entry.upstreamListing) || !/^[a-f0-9]{64}$/u.test(entry.upstreamListing.source)
+    || !Array.isArray(entry.upstreamListing.modelIds) || entry.upstreamListing.modelIds.length > 10_000
+    || new Set(entry.upstreamListing.modelIds).size !== entry.upstreamListing.modelIds.length
+    || entry.upstreamListing.modelIds.some(id => typeof id !== "string" || id.trim() === ""))) {
+    throw new Error("Provider model listing is malformed.");
+  }
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(entry.provider.id)) throw new Error("Provider ID is invalid.");
   nonBlank(entry.displayName, "Provider display name");
   if (!(["managed", "api_key", "oauth", "subscription", "local_keyless", "custom_endpoint"] as const).includes(entry.kind)) {

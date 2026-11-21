@@ -537,6 +537,7 @@ import {
   type ProviderConfiguration,
   type ProviderRuntimeConfiguration,
   type ProviderLoginFlow,
+  type ProviderModelWithdrawalReview,
   type QueueItem,
   type QueueControl,
   type QuestionAnswer,
@@ -8603,11 +8604,22 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.submit({ case: "deleteProvider", value: { providerId } }, true);
   }
 
-  async refreshProviderModels(backendId: string, providerId?: string, automatic = false): Promise<void> {
-    await this.submit({
+  async refreshProviderModels(backendId: string, providerId?: string, automatic = false): Promise<ProviderModelWithdrawalReview | undefined> {
+    const operation = await this.submit({
       case: "refreshProviderModels",
       value: { backendId, providerId: providerId ?? "", automatic }
     }, true);
+    await this.refresh();
+    const result = operation.result?.payload;
+    return result?.case === "providerModelWithdrawalReview" ? result.value : undefined;
+  }
+
+  async confirmProviderModelWithdrawals(review: ProviderModelWithdrawalReview, modelIds: readonly string[], operationId: string): Promise<void> {
+    const scope = this.captureActionScope();
+    await this.submit({ case: "confirmProviderModelWithdrawals", value: {
+      backendId: review.backendId, providerId: review.providerId, reviewId: review.reviewId, modelIds: [...modelIds]
+    } }, true, [], scope.signal, undefined, operationId, true);
+    scope.signal.throwIfAborted();
     await this.refresh();
   }
 

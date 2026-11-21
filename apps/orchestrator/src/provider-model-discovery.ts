@@ -65,12 +65,7 @@ export function deriveProviderModelsUrl(baseUrl: string, api?: string): string {
 }
 
 export function parseProviderModels(value: unknown, sourceUrl?: string, includeNonChat = false): readonly DiscoveredProviderModel[] {
-  if (!Array.isArray(value) && !isRecord(value)) return [];
-  const list = Array.isArray(value) ? value : Array.isArray(value["data"])
-    ? value["data"]
-    : Array.isArray(value["models"])
-      ? value["models"]
-      : undefined;
+  const list = modelList(value);
   if (list === undefined) return [];
   const result: DiscoveredProviderModel[] = [];
   const seen = new Set<string>();
@@ -79,16 +74,7 @@ export function parseProviderModels(value: unknown, sourceUrl?: string, includeN
     const record = isRecord(item) ? item : undefined;
     const google = typeof record?.["name"] === "string" && record["name"].startsWith("models/")
       && Array.isArray(record["supportedGenerationMethods"]) && record["supportedGenerationMethods"].includes("generateContent") ? record : undefined;
-    const id = typeof item === "string"
-      ? item
-      : typeof record?.["id"] === "string"
-        ? record["id"]
-        : typeof record?.["slug"] === "string"
-          ? record["slug"]
-          : typeof record?.["key"] === "string" ? record["key"]
-            : typeof record?.["model_name"] === "string" ? record["model_name"]
-              : typeof record?.["model_id"] === "string" ? record["model_id"]
-                : google ? String(google["name"]).slice("models/".length) : undefined;
+    const id = modelIdentity(item, google !== undefined);
     if (!validIdentity(id) || seen.has(id)) continue;
     seen.add(id);
     const info = isRecord(record?.["model_info"]) ? record["model_info"] : {};
@@ -139,6 +125,24 @@ export function parseProviderModels(value: unknown, sourceUrl?: string, includeN
     });
   }
   return result;
+}
+
+function modelList(value: unknown): readonly unknown[] | undefined {
+  if (Array.isArray(value)) return value;
+  if (!isRecord(value)) return undefined;
+  if (Array.isArray(value["data"])) return value["data"];
+  return Array.isArray(value["models"]) ? value["models"] : undefined;
+}
+
+function modelIdentity(item: unknown, google: boolean): string | undefined {
+  if (typeof item === "string") return item;
+  if (!isRecord(item)) return undefined;
+  for (const field of ["id", "slug", "key", "model_name", "model_id"]) {
+    const value = item[field];
+    if (typeof value === "string") return value;
+  }
+  const name = item["name"];
+  return google && typeof name === "string" && name.startsWith("models/") ? name.slice("models/".length) : undefined;
 }
 
 function parseOpenRouterTokenQuote(value: unknown): DiscoveredProviderModel["cost"] {
@@ -215,6 +219,15 @@ export async function fetchProviderModels(
   spec: ProviderModelDiscoverySpec,
   fetchImpl: typeof fetch = fetch
 ): Promise<readonly DiscoveredProviderModel[]> {
+  const catalog = await fetchProviderModelCatalog(spec, fetchImpl);
+  if (catalog.models.length === 0) throw new ProviderModelDiscoveryError("invalid_response");
+  return catalog.models;
+}
+
+export async function fetchProviderModelCatalog(
+  spec: ProviderModelDiscoverySpec,
+  fetchImpl: typeof fetch = fetch
+): Promise<{ readonly models: readonly DiscoveredProviderModel[]; readonly listedIds: ReadonlySet<string>; readonly complete: boolean }> {
   const baseUrl = safeDiscoveryBaseUrl(spec.baseUrl);
   if (baseUrl === undefined) throw new ProviderModelDiscoveryError("unsafe_endpoint");
   const headers = discoveryHeaders(spec);
@@ -234,13 +247,27 @@ export async function fetchProviderModels(
   }
   const sourceUrl = endpoint.toString();
   const signal = AbortSignal.timeout(DISCOVERY_TIMEOUT_MS);
-  const first = await fetchModelPage(sourceUrl, headers, signal, fetchImpl);
+  const { value: first, hasNextLink } = await fetchModelPage(sourceUrl, headers, signal, fetchImpl);
+  const listedIds = new Set<string>();
+  let validListing = true;
+  const recordListing = (value: unknown): void => {
+    const list = modelList(value);
+    if (list === undefined) throw new ProviderModelDiscoveryError("invalid_response");
+    for (const item of list) {
+      const id = modelIdentity(item, spec.api === "google-generative-ai");
+      if (!validIdentity(id)) validListing = false;
+      else listedIds.add(id);
+    }
+    if (listedIds.size > MAXIMUM_DISCOVERED_MODELS) throw new ProviderModelDiscoveryError("invalid_response");
+  };
+  recordListing(first);
   let firstModels = parseProviderModels(first, sourceUrl, spec.includeNonChat);
   if (spec.includeNonChat && officialModelsEndpoint(sourceUrl, "https://openrouter.ai/api/v1/models")) {
     const speechEndpoint = new URL(endpoint);
     speechEndpoint.searchParams.set("output_modalities", "speech");
     try {
-      const speech = parseProviderModels(await fetchModelPage(speechEndpoint.toString(), headers, signal, fetchImpl), speechEndpoint.toString(), true);
+      const { value } = await fetchModelPage(speechEndpoint.toString(), headers, signal, fetchImpl);
+      const speech = parseProviderModels(value, speechEndpoint.toString(), true);
       const combined = new Map(firstModels.map(model => [model.id, model]));
       for (const model of speech.filter(model => model.metadata?.mode === "audio_speech")) {
         const previous = combined.get(model.id);
@@ -253,8 +280,7 @@ export async function fetchProviderModels(
     } catch { /* The independent speech catalog must not discard a successful chat discovery. */ }
   }
   if (spec.api !== "anthropic-messages" || !isRecord(first) || first["has_more"] !== true) {
-    if (firstModels.length === 0) throw new ProviderModelDiscoveryError("invalid_response");
-    return firstModels;
+    return { models: firstModels, listedIds, complete: validListing && !hasNextLink && !catalogHasContinuation(first, listedIds.size) };
   }
   if (!Array.isArray(first["data"])) throw new ProviderModelDiscoveryError("invalid_response");
 
@@ -269,21 +295,31 @@ export async function fetchProviderModels(
     seenCursors.add(cursor);
     const next = new URL(endpoint);
     next.searchParams.set("after_id", cursor);
-    const value = await fetchModelPage(next.toString(), headers, signal, fetchImpl);
+    const { value, hasNextLink } = await fetchModelPage(next.toString(), headers, signal, fetchImpl);
     if (!isRecord(value) || !Array.isArray(value["data"]) || typeof value["has_more"] !== "boolean") {
       throw new ProviderModelDiscoveryError("invalid_response");
     }
+    recordListing(value);
     for (const model of parseProviderModels(value, sourceUrl, spec.includeNonChat)) if (!models.has(model.id)) models.set(model.id, model);
     if (!value["has_more"]) {
-      if (models.size === 0 || models.size > MAXIMUM_DISCOVERED_MODELS) throw new ProviderModelDiscoveryError("invalid_response");
-      return [...models.values()];
+      return { models: [...models.values()], listedIds, complete: validListing && !hasNextLink && !catalogHasContinuation(value, listedIds.size) };
     }
     page = value;
   }
   throw new ProviderModelDiscoveryError("invalid_response");
 }
 
-async function fetchModelPage(url: string, headers: Readonly<Record<string, string>>, signal: AbortSignal, fetchImpl: typeof fetch): Promise<unknown> {
+function catalogHasContinuation(value: unknown, listedCount: number): boolean {
+  if (!isRecord(value)) return false;
+  const scopes = [value, value["pagination"]].filter(isRecord);
+  return scopes.some(scope => scope["has_more"] === true || scope["hasMore"] === true
+    || ["next", "next_cursor", "next_page", "next_page_token", "nextPageToken"].some(key => {
+      const cursor = scope[key];
+      return cursor !== undefined && cursor !== null && cursor !== "" && cursor !== false;
+    }) || (typeof scope["total"] === "number" && scope["total"] > listedCount));
+}
+
+async function fetchModelPage(url: string, headers: Readonly<Record<string, string>>, signal: AbortSignal, fetchImpl: typeof fetch): Promise<{ value: unknown; hasNextLink: boolean }> {
   let response: Response;
   try {
     signal.throwIfAborted();
@@ -311,7 +347,7 @@ async function fetchModelPage(url: string, headers: Readonly<Record<string, stri
     throw new ProviderModelDiscoveryError("invalid_response");
   }
   try {
-    return JSON.parse(body) as unknown;
+    return { value: JSON.parse(body) as unknown, hasNextLink: /;\s*rel\s*=\s*(?:"[^"]*\bnext\b[^"]*"|next\b)/iu.test(response.headers.get("link") ?? "") };
   } catch {
     throw new ProviderModelDiscoveryError("invalid_response");
   }

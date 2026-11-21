@@ -6,7 +6,7 @@ import { ProviderAccountBalance } from "./ProviderAccountBalance.js";
 import { ProviderAccountResets } from "./ProviderAccountResets.js";
 import { NativeCatalogAdoptionRecovery } from "./NativeCatalogAdoptionRecovery.js";
 import type { CSSProperties, JSX, KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
-import { capabilityNames } from "@joko/contracts";
+import { capabilityNames, type ProviderModelWithdrawalReview } from "@joko/contracts";
 import {
   ArrowLeft,
   Bell,
@@ -3499,6 +3499,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
   });
   const [mobileDetailOpen, setMobileDetailOpen] = useState(() => settingsViewportIsCompact() && initialView !== undefined);
   const [refreshingProviderKey, setRefreshingProviderKey] = useState<string>();
+  const [withdrawal, setWithdrawal] = useState<{ readonly ownerKey: string; readonly review: ProviderModelWithdrawalReview }>();
   const [modelRefreshFeedback, setModelRefreshFeedback] = useState<{
     readonly providerKey: string;
     readonly state: "success" | "error";
@@ -3605,29 +3606,34 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
       void controller.refreshProviderAccountUsage(runtime.backendId, runtime.id).catch(() => requested.delete(providerKey));
     }
   }, [controller, snapshot.providers]);
+  const advancedOwnerKey = JSON.stringify([pickerOwnerId, controller.state.activeProfile?.id, controller.state.connectionGeneration, selectedProviderEntry?.id]);
+  const providerOwner = useRef(advancedOwnerKey);
+  providerOwner.current = advancedOwnerKey;
   const refreshModels = useCallback(async (entry: ProviderSettingsEntry): Promise<void> => {
     if (refreshingProviderKey !== undefined) return;
     setRefreshingProviderKey(entry.id);
     setModelRefreshFeedback(undefined);
+    setWithdrawal(undefined);
     try {
       const runtime = entry.runtime;
       if (runtime === undefined) throw new Error("Provider Backend ownership is unavailable.");
-      await controller.refreshProviderModels(runtime.backendId, entry.provider.id, false);
+      const review = await controller.refreshProviderModels(runtime.backendId, entry.provider.id, false);
+      if (providerOwner.current !== advancedOwnerKey) return;
+      if (review) setWithdrawal({ ownerKey: advancedOwnerKey, review });
       setModelRefreshFeedback({ providerKey: entry.id, state: "success" });
     } catch {
-      setModelRefreshFeedback({ providerKey: entry.id, state: "error" });
+      if (providerOwner.current === advancedOwnerKey) setModelRefreshFeedback({ providerKey: entry.id, state: "error" });
     } finally {
       setRefreshingProviderKey(undefined);
     }
-  }, [controller, refreshingProviderKey]);
+  }, [controller, refreshingProviderKey, advancedOwnerKey]);
   const providerRuntime = selectedProviderEntry?.runtime;
   const relatedProviderRuntimes = selectedProvider === undefined || providerRuntime === undefined
     ? []
     : snapshot.providers.filter((runtime) => providerRuntimesRelated(providerRuntime, runtime));
   const relatedProviderRouteKeys = new Set(relatedProviderRuntimes.map((runtime) => providerPreferenceKey(runtime.backendId, runtime.id)));
   const selectedManagedRuntime = availableModelRuntimes.find((runtime) => runtime.providerRoutes?.some((route) => relatedProviderRouteKeys.has(providerPreferenceKey(route.backendId, route.providerId))));
-  const advancedOwnerKey = JSON.stringify([pickerOwnerId, controller.state.activeProfile?.id, controller.state.connectionGeneration, selectedProviderEntry?.id]);
-  useEffect(() => { setPriceModel(undefined); }, [advancedOwnerKey]);
+  useEffect(() => { setPriceModel(undefined); setWithdrawal(undefined); }, [advancedOwnerKey]);
   const chooseManagedRuntime = (runtimeId: string): void => {
     const runtime = availableModelRuntimes.find((candidate) => candidate.id === runtimeId);
     if (runtime === undefined || runtimeAddPending.current) return;
@@ -3836,6 +3842,10 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
     ><div className="provider-runtime-onboarding">{snapshot.managedModelRuntimes?.find((runtime) => runtime.id === runtimeOnboardingId) !== undefined && <ManagedModelRuntimeSettings controller={controller} runtimes={[snapshot.managedModelRuntimes!.find((runtime) => runtime.id === runtimeOnboardingId)!]} runAction={runAction} />}</div></Modal>
     <Modal open={providerRemovalTarget !== undefined} title={providerRemovalTarget?.kind === "authorization" ? t("settings.removeProviderAuthorizationTitle", { name: providerRemovalTarget.entry.provider.name }) : t("settings.deleteProviderTitle", { name: providerRemovalTarget?.entry.provider.name ?? "" })} description={providerRemovalTarget?.kind === "authorization" ? t("settings.removeProviderAuthorizationBody") : t("settings.deleteProviderBody")} size="small" onClose={() => setProviderRemovalTarget(undefined)} headerLeading={<ModalBackButton label={t("common.back")} onClick={() => setProviderRemovalTarget(undefined)} />}><div className="modal__actions"><Button tone="danger" onClick={() => { const target = providerRemovalTarget; if (target === undefined) return; setProviderRemovalTarget(undefined); if (target.kind === "authorization") { const runtime = target.entry.runtime; if (runtime !== undefined) runAction(`remove-provider-authorization:${target.entry.id}`, () => controller.logoutProvider(runtime.backendId, target.entry.provider.id)); } else runAction(`delete-provider:${target.entry.provider.id}`, () => controller.deleteProvider(target.entry.provider.id)); }}>{providerRemovalTarget?.kind === "authorization" ? t("settings.removeProviderAuthorizationConfirm") : t("common.delete")}</Button></div></Modal>
     <CredentialEditor open={credentialEditorOpen} initialProviderId={selectedProvider?.id} providers={snapshot.settings.providers} t={t} onClose={() => setCredentialEditorOpen(false)} onSave={(draft) => { setCredentialEditorOpen(false); runAction(`save-credential:${draft.id}`, () => controller.saveCredential(draft)); }} />
+    {withdrawal !== undefined && withdrawal.ownerKey === advancedOwnerKey && <ProviderModelWithdrawalDialog
+      key={withdrawal.review.reviewId} review={withdrawal.review} controller={controller} t={t}
+      backend={snapshot.backends.find(backend => backend.id === withdrawal.review.backendId)?.name ?? withdrawal.review.backendId}
+      onClose={() => setWithdrawal(current => current === withdrawal ? undefined : current)} />}
     <ModelPriceOverrideDialog controller={controller} model={priceModel} variants={priceVariants} t={t} onClose={() => { setPriceModel(undefined); setAdvancedPriceRevision(value => value + 1); }} />
     {advancedModel !== undefined && advancedModel.ownerKey === advancedOwnerKey && <ModelAdvancedDrawer
       key={`${advancedOwnerKey}:${advancedModel.model.id}`}
@@ -3887,6 +3897,65 @@ interface ProviderSettingsEntry {
   readonly provider: ProviderConfigurationView;
   readonly runtime?: ProviderRuntimeView;
   readonly backendName?: string;
+}
+
+function ProviderModelWithdrawalDialog({ review, backend, controller, t, onClose }: {
+  readonly review: ProviderModelWithdrawalReview;
+  readonly backend: string;
+  readonly controller: AppController;
+  readonly t: Translator;
+  readonly onClose: () => void;
+}): JSX.Element {
+  const [selected, setSelected] = useState(() => new Set(review.suspicious ? [] : review.models.map(model => model.modelId)));
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const attempt = useRef<{ fingerprint: string; id: string } | undefined>(undefined);
+
+  async function confirm(): Promise<void> {
+    if (busy || selected.size === 0) return;
+    const modelIds = review.models.filter(model => selected.has(model.modelId)).map(model => model.modelId);
+    const fingerprint = JSON.stringify(modelIds);
+    if (attempt.current?.fingerprint !== fingerprint) attempt.current = { fingerprint, id: randomUuid() };
+    setBusy(true);
+    setFailed(false);
+    try {
+      await controller.confirmProviderModelWithdrawals(review, modelIds, attempt.current.id);
+      onClose();
+    } catch {
+      setFailed(true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <Modal open size="small" title={t("settings.modelWithdrawalTitle")}
+    description={t("settings.modelWithdrawalDescription", { provider: review.providerName, backend })}
+    onClose={() => { if (!busy) onClose(); }}>
+    {review.suspicious && <p role="note">{t("settings.modelWithdrawalSuspicious")}</p>}
+    <ul className="provider-editor__model-list">
+      {review.models.map(model => <li key={model.modelId}>
+        <label className="task-import-select-all">
+          <CheckboxControl checked={selected.has(model.modelId)} disabled={busy} onChange={event => {
+            const checked = event.currentTarget.checked;
+            setSelected(previous => {
+              const next = new Set(previous);
+              if (checked) next.add(model.modelId);
+              else next.delete(model.modelId);
+              return next;
+            });
+          }} />
+          <span>{model.displayName === model.modelId ? model.modelId : `${model.displayName} (${model.modelId})`}</span>
+        </label>
+      </li>)}
+    </ul>
+    {failed && <p role="alert" className="danger-text">{t("settings.modelWithdrawalFailed")}</p>}
+    <div className="modal__actions">
+      <Button disabled={busy} onClick={onClose}>{t("common.cancel")}</Button>
+      <Button tone="danger" disabled={busy || selected.size === 0} onClick={() => void confirm()}>
+        {t("settings.modelWithdrawalConfirm", { count: selected.size })}
+      </Button>
+    </div>
+  </Modal>;
 }
 
 function ProviderImageApiKeyRow({ controller, runtime, surface, runAction, onSuccess, t }: {

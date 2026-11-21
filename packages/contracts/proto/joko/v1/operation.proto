@@ -253,6 +253,7 @@ message OperationMutation {
     ConsumeProviderAccountResetMutation consume_provider_account_reset = 232;
     UpdateProviderAccountResetSettingsMutation update_provider_account_reset_settings = 233;
     CancelBrowserDownloadMutation cancel_browser_download = 234;
+    ConfirmProviderModelWithdrawalsMutation confirm_provider_model_withdrawals = 235;
   }
 }
 
@@ -1272,6 +1273,13 @@ message RefreshProviderModelsMutation {
   bool automatic = 3;
 }
 
+message ConfirmProviderModelWithdrawalsMutation {
+  string backend_id = 1;
+  string provider_id = 2;
+  string review_id = 3;
+  repeated string model_ids = 4;
+}
+
 // A one-time ticket is uploaded through the credential channel; the secret is
 // never embedded in this durable operation.
 message CommitCredentialMutation {
@@ -1746,7 +1754,22 @@ message OperationResult {
     ExtensionPickedDirectoryDeposit picked_directory = 36;
     WorkspaceGitCommitResult workspace_git_commit = 37;
     ProviderAccountResetResult provider_account_reset = 38;
+    ProviderModelWithdrawalReview provider_model_withdrawal_review = 39;
   }
+}
+
+message ProviderModelWithdrawalCandidate {
+  string model_id = 1;
+  string display_name = 2;
+}
+
+message ProviderModelWithdrawalReview {
+  string review_id = 1;
+  string backend_id = 2;
+  string provider_id = 3;
+  string provider_name = 4;
+  bool suspicious = 5;
+  repeated ProviderModelWithdrawalCandidate models = 6;
 }
 
 message ScheduleRunsReadResult {

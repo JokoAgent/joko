@@ -1,7 +1,7 @@
 import type { JSONContent } from "@tiptap/core";
 import type { PartnerAvatarView, PartnerAvatarInputView } from "./partner-avatar.js";
 import type { SessionWorkingStatus, VoiceDictionaryPeerApi, VoiceInputSaucSettingsView, VoiceInputRecognitionContextView, PartnerWorkbenchRoutine, BackgroundTaskOutput } from "@joko/contracts";
-import type { PartnerLearningFeedbackView, PersonalDevelopmentDoctorRun, PersonalDevelopmentTask } from "@joko/contracts";
+import type { PartnerLearningFeedbackView, PersonalDevelopmentDoctorRun, PersonalDevelopmentTask, ProviderModelWithdrawalReview } from "@joko/contracts";
 import type { PersonalDevelopmentApi } from "./personal-development-api.js";
 import type { HostedAgentSettingsApi } from "./hosted-agent-settings.js";
 
@@ -6776,7 +6776,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   cancelDevicePairing?(invitation: import("@joko/connection-transport/trust").NodePairingInvitation): Promise<void>;
   saveProvider(draft: ProviderDraft, signal?: AbortSignal): Promise<void>;
   deleteProvider(providerId: string): Promise<void>;
-  refreshProviderModels(backendId: string, providerId?: string, automatic?: boolean): Promise<void>;
+  refreshProviderModels(backendId: string, providerId?: string, automatic?: boolean): Promise<ProviderModelWithdrawalReview | void>;
+  confirmProviderModelWithdrawals(review: ProviderModelWithdrawalReview, modelIds: readonly string[], operationId: string): Promise<void>;
   refreshManagedModelRuntimes(signal?: AbortSignal): Promise<readonly ManagedModelRuntimeView[]>;
   ensureManagedModelRuntimeProvider(runtimeId: string): Promise<ManagedModelRuntimeView>;
   stopManagedModelRuntime(runtimeId: string): Promise<ManagedModelRuntimeView>;
