@@ -37,7 +37,8 @@ it("round-trips inherited discovery fields through the real Gateway and submits 
   const gateway = createOrchestratorGateway({ id: "connection", deviceId: "device", serverId: "server", name: "Node", origin: "https://node.invalid" }, "test-key", {}, () => transport);
   await gateway.connect();
   try {
-    await gateway.saveProvider(provider);
+    const withProjectedImageSource = { ...provider, geminiImageBackendId: "pi" };
+    await gateway.saveProvider(withProjectedImageSource);
     const updated = { ...provider, runtimes: provider.runtimes.map(runtime => ({ ...runtime,
       models: runtime.models.map(model => updateProviderModelMetadata(model, { name: "Owner label" })) })) };
     await gateway.saveProvider(updated);
@@ -52,6 +53,11 @@ it("round-trips inherited discovery fields through the real Gateway and submits 
       inheritedFields: inheritedFields.filter(field => field !== ProviderModelInheritedField.DISPLAY_NAME) });
     expect(model(1).contextWindowMaxTokens).toBeUndefined();
     expect(model(1).mode).toBe("audio_speech");
+    const first = writes[0]!.mutation!.payload;
+    expect(first.case === "upsertProvider" && first.value.geminiImageBackendId).toBeUndefined();
+    await gateway.saveProvider({ ...updated, geminiImageBackendSelection: "pi" });
+    const explicit = writes[2]!.mutation!.payload;
+    expect(explicit.case === "upsertProvider" && explicit.value.geminiImageBackendId).toBe("pi");
   } finally { gateway.disconnect(); }
 });
 

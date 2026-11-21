@@ -100,7 +100,7 @@ export function ProviderEditor({ open, provider, preset, backends, credentials, 
     let prepared: ProviderDraft = {
       ...draft, id: draft.id.trim(), name: draft.name.trim(),
       runtimes: preset === undefined ? draft.runtimes : draft.runtimes.map(runtime => finalizeProviderPresetEndpoint(preset.definition, runtime)),
-      ...(requestedImageBackend !== undefined && (draft.enabled || requestedImageBackend === "") ? { geminiImageBackendId: requestedImageBackend } : {})
+      ...(requestedImageBackend !== undefined && (draft.enabled || requestedImageBackend === "") ? { geminiImageBackendSelection: requestedImageBackend } : {})
     };
     let credentialSaved = false;
     try {

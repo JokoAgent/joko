@@ -5339,7 +5339,7 @@ export interface ProviderDraft {
   readonly revision: bigint;
   readonly runtimes: readonly ProviderRuntimeConfigurationView[];
   /** Set only after the owner selects or releases a chat key for image generation. */
-  readonly geminiImageBackendId?: string;
+  readonly geminiImageBackendSelection?: string;
 }
 
 export type ProviderLoginMethodView = "apiKey" | "oauthBrowser" | "deviceCode" | "subscription";

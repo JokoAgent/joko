@@ -8619,7 +8619,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     });
     if (provider.providerId.length === 0 || provider.displayName.length === 0) throw new GatewayError("Provider ID and name are required.");
     await this.submit({ case: "upsertProvider", value: { provider,
-      ...(draft.geminiImageBackendId === undefined ? {} : { geminiImageBackendId: draft.geminiImageBackendId }) } }, true, [], scope.signal);
+      ...(draft.geminiImageBackendSelection === undefined ? {} : { geminiImageBackendId: draft.geminiImageBackendSelection }) } }, true, [], scope.signal);
     // A credential upload may have started a snapshot read before this commit.
     // Let any such read settle, then project the committed Provider revision.
     await this.#refreshPromise?.catch(() => undefined);
