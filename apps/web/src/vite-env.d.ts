@@ -62,7 +62,7 @@ type JokoDesktopManagedOrchestratorStatus =
   | { readonly state: "ready"; readonly connection: JokoDesktopManagedOrchestratorConnection }
   | {
     readonly state: "retryableError";
-    readonly reason: "serviceUnavailable" | "startFailed";
+    readonly reason: "serviceUnavailable" | "startFailed" | "databaseCorrupted";
   }
   | {
     readonly state: "recoveryRequired";
@@ -748,6 +748,7 @@ interface JokoDesktopApi {
   readonly managedOrchestrator: {
     getConnection(): Promise<JokoDesktopManagedOrchestratorConnection | undefined>;
     getStatus(): Promise<JokoDesktopManagedOrchestratorStatus>;
+    onDatabaseCorrupted?(callback: () => void): () => void;
     retry(): Promise<JokoDesktopManagedOrchestratorStatus>;
     adoptConnection(connection: JokoDesktopManagedOrchestratorConnection): Promise<JokoDesktopManagedOrchestratorStatus>;
     completeLogout(): Promise<JokoDesktopManagedOrchestratorStatus>;

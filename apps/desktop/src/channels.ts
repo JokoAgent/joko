@@ -166,6 +166,7 @@ export const DESKTOP_CHANNELS = {
   discoveryScan: "joko:discovery:scan",
   managedOrchestratorGetConnection: "joko:managed-orchestrator:get-connection",
   managedOrchestratorGetStatus: "joko:managed-orchestrator:get-status",
+  managedOrchestratorDatabaseCorrupted: "joko:managed-orchestrator:database-corrupted",
   managedOrchestratorRetry: "joko:managed-orchestrator:retry",
   managedOrchestratorAdoptConnection: "joko:managed-orchestrator:adopt-connection",
   managedOrchestratorCompleteLogout: "joko:managed-orchestrator:complete-logout",
@@ -1233,7 +1234,7 @@ export type DesktopManagedOrchestratorStatus =
   | { readonly state: "ready"; readonly connection: DesktopManagedOrchestratorConnection }
   | {
     readonly state: "retryableError";
-    readonly reason: "serviceUnavailable" | "startFailed";
+    readonly reason: "serviceUnavailable" | "startFailed" | "databaseCorrupted";
   }
   | {
     readonly state: "recoveryRequired";

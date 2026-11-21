@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, copyFileSync, existsSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -19,6 +19,7 @@ import {
   AuthorizationError,
   InvalidStateTransitionError,
   OperationalStore,
+  OperationalStoreCorruptionError,
   OperationConflictError,
   OperationInProgressError,
   OperationPreviouslyFailedError,
@@ -32,6 +33,7 @@ import {
   StoreError
 } from "./index.js";
 import type { PersistedEvent } from "./types.js";
+import { isOperationalSqliteCorruption } from "./operational-sqlite.js";
 
 vi.mock("node:fs", async original => {
   const fs = await original<typeof import("node:fs")>();
@@ -45,6 +47,66 @@ afterEach(() => {
 });
 
 describe("OperationalStore", () => {
+  it("uses exact SQLite result codes for corruption", () => {
+    const sqliteError = (errcode: number) => Object.assign(new Error("SQLite error"), { code: "ERR_SQLITE_ERROR", errcode });
+    expect([11, 267, 523, 779, 26].every(code => isOperationalSqliteCorruption(sqliteError(code)))).toBe(true);
+    expect([5, 10, 266, 13, 14].some(code => isOperationalSqliteCorruption(sqliteError(code)))).toBe(false);
+    expect(isOperationalSqliteCorruption(Object.assign(new Error("database disk image is malformed"), { code: "EIO" }))).toBe(false);
+  });
+
+  it("preserves a damaged startup database and rejects a fresh empty file after a recorded failure", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "joko-operational-corruption-"));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const databasePath = path.join(root, "operational.db");
+    const original = Buffer.alloc(8192, 0x41);
+    writeFileSync(databasePath, original);
+    expect(() => new OperationalStore(databasePath)).toThrow(expect.objectContaining({ name: "OperationalStoreCorruptionError", phase: "startup" }));
+    expect(readFileSync(databasePath)).toEqual(original);
+    expect(existsSync(databasePath + ".corruption")).toBe(true);
+    rmSync(databasePath);
+    expect(() => new OperationalStore(databasePath)).toThrow(OperationalStoreCorruptionError);
+    expect(existsSync(databasePath)).toBe(false);
+    writeFileSync(databasePath, "");
+    expect(() => new OperationalStore(databasePath)).toThrow(OperationalStoreCorruptionError);
+    expect(readFileSync(databasePath)).toHaveLength(0);
+  });
+
+  it("fences a live corrupted writer while a separate owner continues and verifies the restored original file", async () => {
+    const fixture = createFixture(), independent = createFixture();
+    const { store } = fixture, databasePath = store.filePath;
+    store.setSetting("service", "fixture", "owned", { value: "before corruption" });
+    const database = store as unknown as { readonly databaseNative: DatabaseSync; readonly database: DatabaseSync };
+    const native = database.databaseNative;
+    const received = vi.fn();
+    store.onCorruption(received);
+    expect(() => database.database.exec("SELECT * FROM missing_fixture_table")).toThrow();
+    expect(store.databaseCorrupted).toBe(false);
+    native.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    const page = Number(native.prepare("SELECT rootpage FROM sqlite_schema WHERE name = 'settings'").get()?.["rootpage"]);
+    const pageSize = Number(native.prepare("PRAGMA page_size").get()?.["page_size"]);
+    const verified = databasePath + ".verified-fixture";
+    copyFileSync(databasePath, verified);
+    native.exec("PRAGMA shrink_memory");
+    const handle = openSync(databasePath, "r+");
+    try { writeSync(handle, Buffer.from([0xff]), 0, 1, (page - 1) * pageSize); }
+    finally { closeSync(handle); }
+    expect(() => store.findSetting("service", "fixture", "owned")).toThrow(expect.objectContaining({
+      name: "OperationalStoreCorruptionError", phase: "operation", cause: expect.objectContaining({ code: "ERR_SQLITE_ERROR" })
+    }));
+    expect(() => store.setSetting("service", "fixture", "owned", {})).toThrow(expect.objectContaining({
+      name: "OperationalStoreCorruptionError", phase: "unavailable"
+    }));
+    await Promise.resolve();
+    expect(received).toHaveBeenCalledOnce();
+    expect(independent.store.getSession("session-1").descriptor.id).toBe("session-1");
+    expect(() => new OperationalStore(databasePath)).toThrow(OperationalStoreCorruptionError);
+    copyFileSync(verified, databasePath);
+    fixture.replaceStore(new OperationalStore(databasePath));
+    expect(fixture.store.findSetting("service", "fixture", "owned")?.value).toEqual({ value: "before corruption" });
+    expect(fixture.store.getSession("session-1").descriptor.id).toBe("session-1");
+    expect(existsSync(databasePath + ".corruption")).toBe(false);
+  });
+
   it("retains a task snooze across reopen and clears it only on a later accepted input or explicit lifecycle action", () => {
     const f = createFixture(), id = "session-1";
     const original = f.store.getSession(id);

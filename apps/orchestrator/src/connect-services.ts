@@ -84,6 +84,7 @@ import {
   SensitiveDataError,
   StaleGenerationError,
   StoreClosedError,
+  OperationalStoreCorruptionError,
   StoreError,
   UsageReportQueryError,
   UsageReportCapacityError,
@@ -924,6 +925,7 @@ async function* mapAsyncIterableErrors(values: AsyncIterable<unknown>): AsyncGen
 
 function toConnectError(error: unknown): ConnectError {
   if (error instanceof ConnectError) return error;
+  if (error instanceof OperationalStoreCorruptionError) return new ConnectError(error.message, Code.DataLoss);
   if (typeof error === "object" && error !== null && "name" in error && error.name === "AbortError") {
     return new ConnectError("The request was cancelled.", Code.Canceled);
   }

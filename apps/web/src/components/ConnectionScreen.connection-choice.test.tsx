@@ -337,6 +337,24 @@ describe("ConnectionScreen connection choice", () => {
     container.remove();
   });
 
+  it("shows database recovery at the local service entry and lets the owner retry", async () => {
+    const controller = controllerFixture({ managedOrchestratorStatus: { state: "retryableError", reason: "databaseCorrupted" } });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    try {
+      await act(async () => root.render(<ConnectionScreen controller={controller} t={translator} />));
+      expect(container.textContent).toContain("managedOrchestrator.databaseCorrupted");
+      const retry = Array.from(container.querySelectorAll("button")).find(button => button.textContent?.includes("common.retry"));
+      expect(retry).toBeDefined();
+      await act(async () => retry!.click());
+      expect(controller.retryManagedOrchestrator).toHaveBeenCalledOnce();
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+    }
+  });
+
   it("keeps the internal architecture name out of connection errors", async () => {
     const controller = controllerFixture({
       error: "Desktop-managed Orchestrator runtime state is unavailable.",

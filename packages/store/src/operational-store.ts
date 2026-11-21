@@ -14,6 +14,7 @@ import path, { type PlatformPath } from "node:path";
 import { backup, DatabaseSync } from "node:sqlite";
 import * as sqliteVec from "sqlite-vec";
 import { SessionRuntimeHandoffStore, type RuntimeHandoffSource } from "./session-runtime-handoff-store.js";
+import { guardOperationalDatabase, isOperationalSqliteCorruption } from "./operational-sqlite.js";
 import { TaskShareStore, taskShareQueueLockOwner, type TaskShareGuestProof } from "./task-share-store.js";
 import { captureModelPriceReference, parseNativeModelUsage, parseNativeUsageRequests, validateModelPriceOverrideValues, validModelSubstitution } from "@joko/core";
 import { SIDE_CHAT_HISTORY_BOUNDARY_KEY } from "./side-chat-history.js";
@@ -75,6 +76,7 @@ import {
   InvalidStateTransitionError,
   MessageSearchRevisionConflictError,
   NotFoundError,
+  OperationalStoreCorruptionError,
   OperationConflictError,
   OperationInProgressError,
   OperationPreviouslyFailedError,
@@ -749,6 +751,7 @@ interface NativeMessageSearchVisibility {
 
 export class OperationalStore {
   private database: DatabaseSync;
+  private databaseNative: DatabaseSync;
   private writerLease: DatabaseSync | undefined;
   private readonly now: () => number;
   private readonly idFactory: () => string;
@@ -756,6 +759,7 @@ export class OperationalStore {
   private readonly assistantTextForSearch: OperationalStoreOptions["assistantTextForSearch"];
   private readonly subscribers = new Set<EventSubscriber>();
   private readonly operationSubscribers = new Set<(operationId: string) => void>();
+  private readonly corruptionSubscribers = new Set<() => void>();
   private readonly pendingPublications: PersistedEvent[] = [];
   private readonly transactionFrames: TransactionFrame[] = [];
   private readonly deferredEffectCompletions: string[] = [];
@@ -763,9 +767,12 @@ export class OperationalStore {
   private nextSavepoint = 0;
   private publishing = false;
   private closed = false;
+  private corruptionFailure: OperationalStoreCorruptionError | undefined;
+  private readonly quarantinePath: string | undefined;
   private messageVectorAvailable: boolean;
 
   constructor(readonly filePath: string, options: OperationalStoreOptions = {}) {
+    let verifyRecovery = false;
     try {
       if (filePath !== ":memory:" && !filePath.startsWith("file:")) {
         const resolved = path.resolve(filePath);
@@ -774,12 +781,18 @@ export class OperationalStore {
         const leasePath = path.join(realpathSync(directory), `${path.basename(resolved)}.writer-lease`);
         this.writerLease = acquireOperationalWriterLease(leasePath);
         restrictMaintenanceFile(leasePath);
+        this.quarantinePath = `${resolved}.corruption`;
+        verifyRecovery = existsSync(this.quarantinePath);
+        if (verifyRecovery && !existsSync(resolved)) throw new OperationalStoreCorruptionError("startup");
         recoverInterruptedHistoryMaintenance(resolved);
       }
-      this.database = new DatabaseSync(filePath, { allowExtension: true });
+      this.databaseNative = new DatabaseSync(filePath, { allowExtension: true });
+      this.database = this.databaseNative;
     } catch (error) {
       this.releaseWriterLease();
-      throw error;
+      if (!isOperationalSqliteCorruption(error)) throw error;
+      this.recordCorruptionReceipt();
+      throw new OperationalStoreCorruptionError("startup", { cause: error });
     }
     this.now = options.now ?? Date.now;
     this.idFactory = options.idFactory ?? randomUUID;
@@ -796,6 +809,17 @@ export class OperationalStore {
         // be loaded on a host platform.
       } finally {
         this.database.enableLoadExtension(false);
+      }
+      if (verifyRecovery) {
+        try {
+          if (this.database.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'schema_version'").get() === undefined) {
+            throw new StoreError("The original operational schema is missing.");
+          }
+          verifyOpenOperationalDatabase(this.database);
+        } catch (error) {
+          if (!(error instanceof StoreError) && !isOperationalSqliteCorruption(error)) throw error;
+          throw new OperationalStoreCorruptionError("startup", { cause: error });
+        }
       }
       configureDatabase(this.database);
       initializeDatabase(this.database, this.now());
@@ -832,15 +856,59 @@ export class OperationalStore {
         this.refreshQuestionAnswerSearch(undefined, messageVectorAvailable);
         this.database.exec("COMMIT");
       } catch (error) {
-        this.database.exec("ROLLBACK");
+        try { this.database.exec("ROLLBACK"); } catch { /* Preserve the original failure. */ }
         throw error;
       }
+      if (verifyRecovery) rmSync(this.quarantinePath!, { force: true });
     } catch (error) {
       this.closed = true;
       try { this.database.close(); } finally { this.releaseWriterLease(); }
-      throw error;
+      if (!isOperationalSqliteCorruption(error)) throw error;
+      this.recordCorruptionReceipt();
+      throw new OperationalStoreCorruptionError("startup", { cause: error });
     }
     this.messageVectorAvailable = messageVectorAvailable;
+    this.database = guardOperationalDatabase(this.databaseNative, operation => this.executeOperationalSqlite(operation));
+  }
+
+  get databaseCorrupted(): boolean { return this.corruptionFailure !== undefined; }
+
+  onCorruption(listener: () => void): () => void {
+    if (this.closed && this.databaseCorrupted) {
+      let live = true;
+      queueMicrotask(() => {
+        if (live) try { listener(); } catch { /* Observer lifetime is independent of the Store. */ }
+      });
+      return () => { live = false; };
+    }
+    this.corruptionSubscribers.add(listener);
+    return () => this.corruptionSubscribers.delete(listener);
+  }
+
+  private recordCorruptionReceipt(): void {
+    if (this.quarantinePath === undefined) return;
+    try { writeFileSync(this.quarantinePath, "1\n", { flag: "wx", mode: 0o600, flush: true }); }
+    catch { /* The writer remains fenced when the volume cannot accept a receipt. */ }
+  }
+
+  private executeOperationalSqlite<T>(operation: () => T): T {
+    this.assertOpen();
+    try {
+      return operation();
+    } catch (error) {
+      if (!isOperationalSqliteCorruption(error)) throw error;
+      this.corruptionFailure = new OperationalStoreCorruptionError("unavailable");
+      this.recordCorruptionReceipt();
+      queueMicrotask(() => {
+        const listeners = [...this.corruptionSubscribers];
+        this.corruptionSubscribers.clear();
+        try { this.close(); } catch { /* No further operation can access the quarantined handle. */ }
+        for (const listener of listeners) {
+          try { listener(); } catch { /* One observer cannot interrupt writer retirement. */ }
+        }
+      });
+      throw new OperationalStoreCorruptionError("operation", { cause: error });
+    }
   }
 
   close(): void {
@@ -851,6 +919,7 @@ export class OperationalStore {
     this.closed = true;
     this.subscribers.clear();
     this.operationSubscribers.clear();
+    if (!this.databaseCorrupted) this.corruptionSubscribers.clear();
     try { this.database.close(); } finally { this.releaseWriterLease(); }
   }
 
@@ -1202,7 +1271,7 @@ export class OperationalStore {
     }
     if (this.readRevision() !== input.expectedRevision) return false;
     rmSync(paths.work, { force: true });
-    await backup(this.database, paths.work, { rate: 4_096 });
+    await backup(this.databaseNative, paths.work, { rate: 4_096 });
     if (this.readRevision() === input.expectedRevision) return true;
     rmSync(paths.work, { force: true });
     return false;
@@ -9584,6 +9653,7 @@ export class OperationalStore {
     error: unknown,
     completionMode: OperationRecord["completionMode"] = "transactional"
   ): void {
+    if (this.databaseCorrupted) return;
     const storedError = errorForStorage(error);
     this.transaction(() => {
       const existing = this.findOperation(input.id);
@@ -20282,7 +20352,7 @@ export class OperationalStore {
       this.database.exec("COMMIT");
       return result;
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      try { this.database.exec("ROLLBACK"); } catch { /* Preserve the original failure. */ }
       throw error;
     }
   }
@@ -20382,12 +20452,14 @@ export class OperationalStore {
       database.close();
       throw error;
     }
-    this.database = database;
+    this.databaseNative = database;
+    this.database = guardOperationalDatabase(database, operation => this.executeOperationalSqlite(operation));
     this.messageVectorAvailable = messageVectorAvailable;
     this.closed = false;
   }
 
   private assertOpen(): void {
+    if (this.corruptionFailure) throw this.corruptionFailure;
     if (this.closed) throw new StoreClosedError();
   }
 

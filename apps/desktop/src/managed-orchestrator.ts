@@ -13,6 +13,7 @@ import { pathToFileURL } from "node:url";
 
 import {
   DESKTOP_BOOTSTRAP_MAX_TTL_MS,
+  DESKTOP_OPERATIONAL_DATABASE_CORRUPTED_EXIT,
   DESKTOP_HOST_AUTHORIZATION_HEADER,
   DesktopBootstrapFrameDecoder,
   createDesktopBootstrapCommit,
@@ -64,12 +65,27 @@ export interface ManagedOrchestratorRuntime {
   /** Main-process-only volatile authority; available only after bootstrap commit. */
   readonly readDesktopHostAuthKey: () => string;
   readonly processId?: number;
+  readonly whenExited?: Promise<number | null>;
   /** Complete only after safeStorage and managed profile metadata are durable. */
   readonly commit: () => Promise<void>;
   /** Release bootstrap pipes and unref the daemon without stopping workloads. */
   readonly release: () => void;
   /** Explicit service-management/test cleanup, including bundled Desktop tray exit. */
   readonly stop: () => Promise<void>;
+}
+
+export class ManagedOrchestratorDatabaseCorruptionError extends Error {
+  constructor() {
+    super("The local operational database requires recovery.");
+    this.name = "ManagedOrchestratorDatabaseCorruptionError";
+  }
+}
+
+export async function isManagedOrchestratorDatabaseQuarantined(dataDirectory: string): Promise<boolean> {
+  try {
+    const marker = await readPrivateFile(resolve(dataDirectory, "orchestrator.db.corruption"));
+    return marker !== undefined && Buffer.from(marker).equals(Buffer.from("1\n"));
+  } catch { return false; }
 }
 
 export async function publishManagedExtensionHostLocale(options: {
@@ -267,6 +283,7 @@ export async function startManagedOrchestrator(options: StartManagedOrchestrator
     detached: true
   });
   const { child, requestPipe, responsePipe } = spawned;
+  const whenExited = new Promise<number | null>(resolveExit => child.once("exit", resolveExit));
   let started = false;
   try {
     const responsePromise = receiveResponse(responsePipe, child, MANAGED_ORCHESTRATOR_START_TIMEOUT_MS);
@@ -315,6 +332,7 @@ export async function startManagedOrchestrator(options: StartManagedOrchestrator
         return committing;
       },
       ...(child.pid === undefined ? {} : { processId: child.pid }),
+      whenExited,
       release: () => {
         if (!committed) throw new Error("The managed Orchestrator bootstrap was not durably committed.");
         processControl.release();
@@ -325,6 +343,10 @@ export async function startManagedOrchestrator(options: StartManagedOrchestrator
       }
     };
   } catch {
+    // The response pipe may close before Node has observed the child's exit.
+    if (await waitForChildExit(child, 250) && child.exitCode === DESKTOP_OPERATIONAL_DATABASE_CORRUPTED_EXIT) {
+      throw new ManagedOrchestratorDatabaseCorruptionError();
+    }
     throw startupUnavailable();
   } finally {
     if (!started) {

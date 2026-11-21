@@ -2,6 +2,8 @@ import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 
 export const DESKTOP_BOOTSTRAP_PROTOCOL_VERSION = 1 as const;
 export const DESKTOP_BOOTSTRAP_MAX_TTL_MS = 30_000;
+/** Private child exit status for a database that requires verified recovery. */
+export const DESKTOP_OPERATIONAL_DATABASE_CORRUPTED_EXIT = 65;
 export const DESKTOP_BOOTSTRAP_DEFAULT_TTL_MS = 15_000;
 export const DESKTOP_BOOTSTRAP_MAX_FRAME_BYTES = 16 * 1024;
 export const DESKTOP_HOST_AUTHORIZATION_HEADER = "x-joko-desktop-host-authorization";

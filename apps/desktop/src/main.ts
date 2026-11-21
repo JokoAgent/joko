@@ -357,9 +357,11 @@ import {
   canRespawnManagedOrchestratorAfterProbe,
   commitVerifiedManagedOrchestratorAdoption,
   completeVerifiedManagedOrchestratorLogout,
+  isManagedOrchestratorDatabaseQuarantined,
   loadOrCreateManagedOrchestratorDeviceId,
   managedOrchestratorOutboundProxySnapshotEnvironment,
   ManagedOrchestratorAuthorizationUnavailableError,
+  ManagedOrchestratorDatabaseCorruptionError,
   persistManagedOrchestratorDeviceId,
   probeManagedOrchestratorConnection,
   publishManagedExtensionHostLocale,
@@ -370,6 +372,7 @@ import {
   type ManagedOrchestratorRuntime,
   verifyManagedOrchestratorAdoption
 } from "./managed-orchestrator.js";
+import { DESKTOP_OPERATIONAL_DATABASE_CORRUPTED_EXIT } from "@joko/contracts/desktop-bootstrap";
 import { capturePackagedSmokeProcessBirthIdentitySync } from "./packaged-smoke-process-identity.js";
 import { DesktopDevicePeerAgentExecutor } from "./device-peer-agent.js";
 import { DesktopDevicePeerAgentLifecycle } from "./device-peer-agent-lifecycle.js";
@@ -10062,7 +10065,8 @@ function registerIpc(): void {
     // Renderer transport failures can occur after Desktop previously reached
     // ready. A user retry must therefore re-probe/respawn the managed service,
     // not merely echo a stale ready snapshot.
-    return beginManagedOrchestratorInitialization(true);
+    return beginManagedOrchestratorInitialization(true,
+      managedOrchestratorStatus.state === "retryableError" && managedOrchestratorStatus.reason === "databaseCorrupted");
   });
   ipcMain.handle(DESKTOP_CHANNELS.managedOrchestratorAdoptConnection, async (event, connection: DesktopManagedOrchestratorConnection) => {
     assertTrustedIpcSender(event);
@@ -10368,10 +10372,14 @@ function beginManagedOrchestratorInitialization(
   reconcileDesktopDevicePeerAgentLifecycle();
   const attempt = initializeManagedOrchestrator(controlledStopConfirmed).then<DesktopManagedOrchestratorStatus>(() => {
     const connection = managedOrchestratorConnection;
+    if (managedOrchestratorStatus.state === "retryableError" && managedOrchestratorStatus.reason === "databaseCorrupted") {
+      return managedOrchestratorStatus;
+    }
     if (connection === undefined) return { state: "retryableError", reason: "startFailed" };
     return { state: "ready", connection };
   }).catch((error: unknown): DesktopManagedOrchestratorStatus => {
     if (error instanceof ManagedOrchestratorInitializationError) return error.status;
+    if (error instanceof ManagedOrchestratorDatabaseCorruptionError) return { state: "retryableError", reason: "databaseCorrupted" };
     if (error instanceof ManagedOrchestratorAuthorizationUnavailableError) {
       return managedOrchestratorRecovery("credentialUnavailable");
     }
@@ -10461,6 +10469,7 @@ async function adoptManagedOrchestratorConnection(
     managedOrchestratorRecoveryTarget = undefined;
     managedOrchestratorConnection = runtime.connection;
     managedOrchestratorStatus = { state: "ready", connection: runtime.connection };
+    observeManagedOrchestratorDatabaseCorruption(runtime);
     reconcileDesktopDevicePeerAgentLifecycle();
     if (previous.profileId !== connection.profileId && previous.profileId !== runtime.connection.profileId) {
       await deleteCredential(previous.profileId).catch(() => {
@@ -10552,7 +10561,8 @@ async function initializeManagedOrchestrator(controlledStopConfirmed = false): P
     if (existing === "serviceUnavailable" && !canRespawnManagedOrchestratorAfterProbe(existing, controlledStopConfirmed)) {
       throw new ManagedOrchestratorInitializationError({
       state: "retryableError",
-      reason: "serviceUnavailable"
+      reason: await isManagedOrchestratorDatabaseQuarantined(join(app.getPath("userData"), "orchestrator"))
+        ? "databaseCorrupted" : "serviceUnavailable"
       });
     }
     if (existing === "identityConflict") throw new ManagedOrchestratorInitializationError(
@@ -10590,6 +10600,7 @@ async function initializeManagedOrchestrator(controlledStopConfirmed = false): P
     managedOrchestratorConnection = runtime.connection;
     managedOrchestratorRecoveryTarget = undefined;
     managedOrchestratorRuntime = runtime;
+    observeManagedOrchestratorDatabaseCorruption(runtime);
     if (previous !== undefined && previous.profileId !== runtime.connection.profileId) {
       // The new bootstrap has already revoked this Device's old active
       // connections. Remove the now-useless encrypted credential as cleanup.
@@ -10616,6 +10627,23 @@ async function initializeManagedOrchestrator(controlledStopConfirmed = false): P
   } finally {
     authKey = undefined;
   }
+}
+
+function observeManagedOrchestratorDatabaseCorruption(runtime: ManagedOrchestratorRuntime): void {
+  void runtime.whenExited?.then((code) => {
+    if (code !== DESKTOP_OPERATIONAL_DATABASE_CORRUPTED_EXIT || runtime !== managedOrchestratorRuntime
+      || quitting || managedOrchestratorExplicitlyLoggedOut) return;
+    managedOrchestratorRuntime = undefined;
+    managedOrchestratorConnection = undefined;
+    managedOrchestratorRecoveryTarget = runtime.connection;
+    managedOrchestratorStatus = { state: "retryableError", reason: "databaseCorrupted" };
+    reconcileDesktopDevicePeerAgentLifecycle();
+    refreshTrayContextMenu();
+    for (const window of applicationWindows()) {
+      if (window.isDestroyed() || window.webContents.isDestroyed() || !isTrustedApplicationContents(window.webContents)) continue;
+      try { window.webContents.send(DESKTOP_CHANNELS.managedOrchestratorDatabaseCorrupted); } catch { /* A retiring observer can read the new status on reopen. */ }
+    }
+  });
 }
 
 function writePackagedSmokeManagedRuntimeProcess(runtime: ManagedOrchestratorRuntime): void {

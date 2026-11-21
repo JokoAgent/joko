@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import type { Readable, Writable } from "node:stream";
@@ -17,6 +17,8 @@ import { createDesktopHostedAgentDelegate } from "../src/hosted-agent-delegate.j
 
 import {
   MANAGED_ORCHESTRATOR_START_TIMEOUT_MS,
+  ManagedOrchestratorDatabaseCorruptionError,
+  isManagedOrchestratorDatabaseQuarantined,
   probeManagedOrchestratorConnection,
   resolveManagedOrchestratorEntry,
   selectManagedOrchestratorPorts,
@@ -38,6 +40,19 @@ afterEach(async () => {
 });
 
 describe("real managed Orchestrator child", () => {
+  it("reports an actual startup database failure to Desktop and preserves the original bytes", async () => {
+    const fixture = createFixture();
+    mkdirSync(fixture.dataDirectory, { recursive: true });
+    const path = resolve(fixture.dataDirectory, "orchestrator.db");
+    const damaged = Buffer.alloc(8192, 0x41);
+    writeFileSync(path, damaged);
+    await expect(startRealManagedOrchestrator(fixture)).rejects.toMatchObject({
+      cause: expect.any(ManagedOrchestratorDatabaseCorruptionError)
+    });
+    expect(await isManagedOrchestratorDatabaseQuarantined(fixture.dataDirectory)).toBe(true);
+    expect(readFileSync(path)).toEqual(damaged);
+  }, 45_000);
+
   it("delegates the Desktop route to the actual managed native factories using its private committed proof", async () => {
     const fixture = createFixture(), runtime = await startRealManagedOrchestrator(fixture), authKey = runtime.takeAuthKey();
     await runtime.commit();

@@ -506,6 +506,7 @@ function managedOrchestratorStatusText(status: ConnectionScreenManagedStatus, t:
   if (status.state === "starting") return t("managedOrchestrator.startingTitle");
   if (status.reason === "serviceUnavailable") return t("managedOrchestrator.serviceUnavailable");
   if (status.reason === "startFailed") return t("managedOrchestrator.startFailed");
+  if (status.reason === "databaseCorrupted") return t("managedOrchestrator.databaseCorrupted");
   if (status.reason === "credentialUnavailable") return t("managedOrchestrator.credentialUnavailable");
   if (status.reason === "credentialRejected") return t("managedOrchestrator.credentialRejected");
   return t("managedOrchestrator.identityConflict");

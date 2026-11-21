@@ -1,6 +1,7 @@
 import { createReadStream, createWriteStream, type WriteStream } from "node:fs";
 
-import { DesktopBootstrapGrant } from "@joko/contracts/desktop-bootstrap";
+import { DesktopBootstrapGrant, DESKTOP_OPERATIONAL_DATABASE_CORRUPTED_EXIT } from "@joko/contracts/desktop-bootstrap";
+import { OperationalStoreCorruptionError } from "@joko/store";
 import {
   MANAGED_OUTBOUND_PROXY_SNAPSHOT_ENV,
   createManagedOutboundProxyResolver
@@ -126,9 +127,15 @@ async function main(): Promise<void> {
   const requestExternalShutdown = (signal: string): void => {
     void lifecycle.requestShutdown(signal).catch(() => {
       process.stderr.write("Orchestrator shutdown could not close all resources.\n");
-      process.exitCode = 1;
+      if (process.exitCode !== DESKTOP_OPERATIONAL_DATABASE_CORRUPTED_EXIT) process.exitCode = 1;
     });
   };
+  const stopObservingCorruption = application.store.onCorruption(() => {
+    process.exitCode = DESKTOP_OPERATIONAL_DATABASE_CORRUPTED_EXIT;
+    process.stderr.write("The operational database requires recovery. Restore a verified copy and restart the service.\n");
+    requestExternalShutdown("operational_database_corruption");
+  });
+  application.registerServiceCleanup?.(stopObservingCorruption);
   process.once("SIGINT", () => requestExternalShutdown("SIGINT"));
   process.once("SIGTERM", () => requestExternalShutdown("SIGTERM"));
   const desktopParentDisconnected = desktopBootstrap?.lease.parentDisconnected;
@@ -281,6 +288,11 @@ function disposeDesktopBootstrap(state: DesktopBootstrapState | undefined): void
 }
 
 void main().catch((error: unknown) => {
+  if (error instanceof OperationalStoreCorruptionError || process.exitCode === DESKTOP_OPERATIONAL_DATABASE_CORRUPTED_EXIT) {
+    process.stderr.write("The operational database requires recovery. Restore a verified copy and restart the service.\n");
+    process.exitCode = DESKTOP_OPERATIONAL_DATABASE_CORRUPTED_EXIT;
+    return;
+  }
   const message = error instanceof Error ? error.stack ?? error.message : String(error);
   process.stderr.write(`${message}\n`);
   process.exitCode = 1;

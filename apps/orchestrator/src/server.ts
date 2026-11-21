@@ -6,6 +6,7 @@ import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
 import { fastifyConnectPlugin } from "@connectrpc/connect-fastify";
 import Fastify, { type FastifyInstance } from "fastify";
+import { OperationalStoreCorruptionError } from "@joko/store";
 
 import type { OrchestratorApplication } from "./application.js";
 import { isLoopbackHost, isPrivateLanHost, readTls } from "./config.js";
@@ -177,6 +178,9 @@ export async function createPublicServer(application: OrchestratorApplication, o
     return payload;
   });
   server.setErrorHandler((error, _request, reply) => {
+    if (error instanceof OperationalStoreCorruptionError) {
+      return reply.code(503).send({ status: "unavailable", code: "operational_database_corruption" });
+    }
     if (error instanceof ConnectionAuthenticationError) {
       return reply.code(401).send({ error: "Authentication is required or has been revoked." });
     }
