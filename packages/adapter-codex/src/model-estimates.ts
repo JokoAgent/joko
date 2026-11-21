@@ -18,6 +18,10 @@ export interface CodexModelEstimate {
 export const CODEX_MODEL_ESTIMATES_UPDATED_AT = Date.UTC(2026, 7, 29, 1, 20);
 
 const MODEL_ESTIMATES: Readonly<Record<string, CodexModelEstimate>> = Object.freeze({
+  "gpt-6.2-sol": estimate(500_000, 128_000),
+  "gpt-6.2-astra": estimate(272_000, 128_000),
+  "gpt-6.1-terra": estimate(272_000, 128_000),
+  "gpt-6-cyber": { ...estimate(272_000, 128_000), defaultVisible: false },
   // Native Codex catalog default; its reported active context takes precedence.
   // API reference: https://developers.openai.com/api/docs/models/gpt-6-astra
   "gpt-6-astra": {
