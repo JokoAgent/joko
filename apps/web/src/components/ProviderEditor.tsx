@@ -4,7 +4,7 @@ import { capabilityNames, isGeminiChatEndpoint } from "@joko/contracts";
 import type { AppController } from "../controller.js";
 import type { AppSnapshot, BackendView, ProviderCompatibilityView, ProviderConfigurationView, ProviderDraft, ProviderModelConfigurationView, ProviderRuntimeConfigurationView, ModelInputModalityView } from "../model.js";
 import { emptyProviderModel, emptyProviderRuntime, providerCatalogEndpointValid, providerCompatibilityLabel, providerCredentialBindingsValid, providerEndpointOrigin, providerRequestPathValid, supportsProviderField, updateProviderModelMetadata } from "../provider-runtime-draft.js";
-import { finalizeProviderPresetEndpoint, providerPresetRuntime, supportsProviderPreset, updateProviderPresetEndpoint, type ProviderPreset } from "../provider-presets.js";
+import { discoveredProviderModelInterface, finalizeProviderPresetEndpoint, modelInterfaceConfiguration, providerPresetRuntime, supportsProviderPreset, updateProviderPresetEndpoint, type ProviderPreset } from "../provider-presets.js";
 import { randomUuid } from "../web-crypto.js";
 import type { Translator } from "./types.js";
 import { Button, CheckboxControl, ErrorBanner, IconButton, Modal, SelectControl, SwitchControl, cx } from "./ui.js";
@@ -185,7 +185,8 @@ export function ProviderEditor({ open, provider, preset, backends, credentials, 
             {supportsProviderField(backend, "headers") && <ProviderHeaderFields runtime={runtime} credentials={credentials} setRuntime={updateRuntime} t={t} />}
             {open && previewProviderModels !== undefined && <ProviderModelPreview key={activeId} backend={backend}
               runtime={preset === undefined ? runtime : finalizeProviderPresetEndpoint(preset.definition, runtime)}
-              secret={secrets[activeId]?.trim() ?? ""} preview={previewProviderModels} updateRuntime={updateRuntime} t={t} />}
+              catalogId={preset?.definition.id} secret={secrets[activeId]?.trim() ?? ""}
+              preview={previewProviderModels} updateRuntime={updateRuntime} t={t} />}
             <ProviderRuntimeModels draft={runtime} setDraft={updateRuntime} backend={backend} t={t} />
           </section>}
           <details className="provider-editor__advanced"><summary>{t("settings.customProvider.advancedProvider")}</summary>
@@ -212,9 +213,10 @@ function geminiImageRouteEligible(runtime: ProviderRuntimeConfigurationView): bo
   return !runtime.keyless && runtime.headers.length === 0 && runtime.compatibility === "openaiCompletions" && isGeminiChatEndpoint(runtime.endpoint);
 }
 
-function ProviderModelPreview({ backend, runtime, secret, preview, updateRuntime, t }: {
+function ProviderModelPreview({ backend, runtime, catalogId, secret, preview, updateRuntime, t }: {
   readonly backend: BackendView;
   readonly runtime: ProviderRuntimeConfigurationView;
+  readonly catalogId?: string;
   readonly secret: string;
   readonly preview: NonNullable<AppController["previewProviderModels"]>;
   readonly updateRuntime: Dispatch<SetStateAction<ProviderRuntimeConfigurationView>>;
@@ -249,13 +251,16 @@ function ProviderModelPreview({ backend, runtime, secret, preview, updateRuntime
   const toggle = (model: ProviderModelConfigurationView, checked: boolean): void => {
     const defaults = emptyProviderModel(backend);
     const thinking = supportsProviderField(backend, "modelThinkingLevels");
+    const selected = discoveredProviderModelInterface(model.modelId, backend, runtime.endpoint, catalogId);
+    const supportsImages = selected?.defaults?.modalities?.input?.includes("image") ?? selected?.defaults?.supportsImageInput ?? model.inputModalities.includes("image");
     const candidate: ProviderModelConfigurationView = {
       ...defaults,
+      ...(selected === undefined ? {} : modelInterfaceConfiguration(selected, runtime.endpoint)),
       modelId: model.modelId,
       name: model.name,
       mode: model.mode,
-      supportsTools: model.supportsTools,
-      inputModalities: supportsProviderField(backend, "modelInputModalities") && model.inputModalities.includes("image") ? ["text", "image"] : ["text"],
+      supportsTools: selected?.defaults?.supportsToolCalls ?? model.supportsTools,
+      inputModalities: supportsProviderField(backend, "modelInputModalities") && supportsImages ? ["text", "image"] : ["text"],
       contextWindowTokens: supportsProviderField(backend, "modelLimits") ? model.contextWindowTokens || defaults.contextWindowTokens : 0,
       maximumOutputTokens: supportsProviderField(backend, "modelLimits") ? model.maximumOutputTokens || defaults.maximumOutputTokens : 0,
       reasoning: thinking && model.reasoning,

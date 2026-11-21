@@ -4008,6 +4008,7 @@ export interface ProviderModelConfigurationView {
   readonly mode?: string;
   readonly compatibility?: ProviderCompatibilityView;
   readonly reasoning: boolean;
+  readonly defaultEffort?: string;
   readonly inputModalities: readonly ModelInputModalityView[];
   readonly contextWindowTokens: number;
   readonly maximumOutputTokens: number;

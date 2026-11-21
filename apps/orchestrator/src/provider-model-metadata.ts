@@ -26,6 +26,7 @@ export function saveDiscoveredModelConfiguration(current: PiManagedModel | undef
   }
   const editable = new Set<PiModelMetadataField>(PI_EDITABLE_MODEL_METADATA_FIELDS);
   const privateOverrides = current.metadataOverrides!.filter(field => !editable.has(field));
+  if (input.defaultEffort !== undefined && !privateOverrides.includes("defaultEffort")) privateOverrides.push("defaultEffort");
   const editableOverrides = (input.metadataOverrides ?? PI_EDITABLE_MODEL_METADATA_FIELDS).filter(field => editable.has(field));
   return materializeDiscoveredModel({ ...current, ...preservedEndpoint, ...input, api: input.api, discoveredMetadata: current.discoveredMetadata,
     ...(editableOverrides.includes("contextWindow") && input.contextWindow !== undefined ? { contextWindowSource: "declared" as const } : {}),

@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type JSX, type ReactNode } from "react";
 import { Check, CircleHelp, Minus, SlidersHorizontal } from "lucide-react";
+import { publicModelNativeApi, publicModelRecommendedBackend, publicProviderCatalogId } from "@joko/contracts";
 import type { AppController } from "../controller.js";
 import type { AppSnapshot, ModelPriceOverrideView, ModelView, ModelWorkingContextRoute, ModelWorkingContextTarget, ModelWorkingContextView, ProviderCompatibilityView, ProviderConfigurationView } from "../model.js";
 import { isConversationModel } from "../model-capabilities.js";
 import { clearModelEffort, isModelVisible, modelPreferenceKey, preferredModelEffort, readModelConfiguration, readModelPickerOwnerPreferences, setModelConfiguration, setModelVisible, useModelPickerOwnerPreferences } from "../model-picker-preferences.js";
 import { providerCompatibilityLabel, supportsProviderField } from "../provider-runtime-draft.js";
+import { providerModelInterfaceOptions } from "../provider-presets.js";
 import type { Translator } from "./types.js";
 import { Button, Modal, SelectControl, Spinner, SwitchControl } from "./ui.js";
 import { ManagedModelContextSettings } from "./ManagedModelRuntimeSettings.js";
@@ -65,6 +67,20 @@ export function ModelAdvancedDrawer({ controller, snapshot, routes, configuratio
   };
   if (primary === undefined) return null;
   const metadata = primary.metadata;
+  const modelCatalogProvider = (route: ModelView): string | undefined => {
+    const endpoint = configuration?.runtimes.find(item => item.backendId === route.backendId)?.endpoint;
+    if (endpoint) return publicProviderCatalogId(endpoint);
+    return snapshot.providers.some(item => item.backendId === route.backendId && item.id === route.providerId && !item.ownerManaged)
+      ? route.providerId : undefined;
+  };
+  const primaryCatalog = modelCatalogProvider(primary);
+  const referenceProtocol = metadata?.referenceProtocol
+    ?? (primaryCatalog === undefined ? undefined : publicModelNativeApi(primaryCatalog, primary.modelId, isConversationModel(primary) ? "chat" : "media")) ?? undefined;
+  const recommended = chatRoutes.find(route => {
+    const catalog = modelCatalogProvider(route);
+    return route.available && route.routingEnabled !== false && catalog !== undefined
+      && publicModelRecommendedBackend(catalog, route.modelId) === route.backendId;
+  });
   const formatTokens = (value: number): string => new Intl.NumberFormat(controller.state.effectiveLocale === "zh-CN" ? "zh-CN" : "en").format(value);
   return <Modal open title={primary.name} size="large" showClose closeLabel={t("common.close")} onClose={onClose} className="model-advanced-drawer" initialFocus={() => { const title = heading.current?.closest(".modal")?.querySelector<HTMLElement>("h2"); if (title !== undefined && title !== null) title.tabIndex = 0; return title ?? null; }}>
     <div ref={heading} className="model-advanced-drawer__intro">{t("settings.modelAdvanced.factsHint")}</div>
@@ -73,22 +89,36 @@ export function ModelAdvancedDrawer({ controller, snapshot, routes, configuratio
         {chatRoutes.length > 0 && <>
           <Section title={t("settings.modelAdvanced.engines")} hint={t("settings.modelAdvanced.enginesHint")}>
             {!connected && <p role="status">{t("settings.modelAdvanced.connectionRequired")}</p>}
-            {metadata?.referenceProtocol !== undefined && <Fact label={t("settings.modelAdvanced.referenceProtocol")}>{protocolLabel(metadata.referenceProtocol)}</Fact>}
+            {referenceProtocol !== undefined && <Fact label={t("settings.modelAdvanced.referenceProtocol")}>{protocolLabel(referenceProtocol)}</Fact>}
             {backendIds.map(backendId => {
               const route = routes.find(item => item.backendId === backendId);
               const backend = snapshot.backends.find(item => item.id === backendId);
               const name = backend?.name ?? backendId;
               const storedRuntime = configuration?.runtimes.find(item => item.backendId === backendId);
               const storedModel = storedRuntime?.models.find(item => item.modelId === route?.modelId);
-              const protocolEditable = route !== undefined && route.available && runtime === undefined && storedModel !== undefined && backend !== undefined && supportsProviderField(backend, "modelCompatibility");
+              const protocolEditable = route !== undefined && route.available && runtime === undefined && storedModel !== undefined && backend !== undefined
+                && (supportsProviderField(backend, "modelCompatibility") || supportsProviderField(backend, "modelEndpoint"));
+              const interfaces = protocolEditable ? providerModelInterfaceOptions(backend, storedRuntime!.endpoint, storedModel.modelId) : [];
+              const modelInterface = interfaces.find(item => item.compatibility === (storedModel?.compatibility ?? storedRuntime?.compatibility)
+                && (item.endpoint ?? storedRuntime?.endpoint) === (storedModel?.endpoint ?? storedRuntime?.endpoint));
+              const catalogControl = interfaces.length > 0 && (modelInterface !== undefined || storedModel?.endpoint === undefined && storedModel?.compatibility === undefined);
               const protocol = route?.metadata?.outboundProtocol;
               return <div className="model-advanced-engine" key={backendId}>
-                <div><strong>{name}</strong>{route === undefined ? <p>{t("settings.modelAdvanced.notConfigured")}</p> : <>
-                  <p>{protocolEditable ? <SelectControl aria-label={`${name} · ${t("settings.apiOverride")}`} value={storedModel.compatibility ?? ""} disabled={pending || !connected} onChange={event => {
-                    const next = event.target.value as ProviderCompatibilityView | "";
-                    void act(signal => controller.saveProvider({ ...configuration!, runtimes: configuration!.runtimes.map(item => item.backendId !== backendId ? item : { ...item, models: item.models.map(model => model.modelId !== route.modelId ? model : { ...model, compatibility: next || undefined }) }) }, signal));
-                  }}><option value="">{t("settings.inheritProvider")}</option>{backend.providerRuntimeSupport?.protocols.map(value => <option key={value} value={value}>{providerCompatibilityLabel(value)}</option>)}</SelectControl> : protocol === undefined ? t("settings.modelAdvanced.undeclared") : protocolLabel(protocol)}</p>
-                  <p>{t(route.metadata?.protocolMode === "matching" ? "settings.modelAdvanced.matching" : route.metadata?.protocolMode === "compatibility" ? "settings.modelAdvanced.compatibility" : "settings.modelAdvanced.protocolUnknown")}</p>
+                <div><strong>{name}</strong>{route !== undefined && route === recommended && <small>{t("settings.modelAdvanced.recommendedBackend")}</small>}{route === undefined ? <p>{t("settings.modelAdvanced.notConfigured")}</p> : <>
+                  <p>{protocolEditable ? <SelectControl aria-label={`${name} · ${t("settings.apiOverride")}`}
+                    value={catalogControl ? modelInterface?.profile.id ?? "" : storedModel.compatibility ?? ""} disabled={pending || !connected} onChange={event => {
+                      const choice = interfaces.find(item => item.profile.id === event.target.value);
+                      const change = catalogControl ? { compatibility: choice?.compatibility, endpoint: choice?.endpoint }
+                        : { compatibility: (event.target.value as ProviderCompatibilityView) || undefined };
+                      void act(signal => controller.saveProvider({ ...configuration!, runtimes: configuration!.runtimes.map(item => item.backendId !== backendId ? item
+                        : { ...item, models: item.models.map(model => model.modelId !== route.modelId ? model : { ...model, ...change }) }) }, signal));
+                    }}>
+                    <option value="">{t("settings.inheritProvider")}</option>
+                    {catalogControl ? interfaces.map(item => <option key={item.profile.id} value={item.profile.id}>{providerCompatibilityLabel(item.compatibility)} · {new URL(item.profile.baseUrl).pathname}</option>)
+                      : backend.providerRuntimeSupport?.protocols.map(value => <option key={value} value={value}>{providerCompatibilityLabel(value)}</option>)}
+                  </SelectControl> : protocol === undefined ? t("settings.modelAdvanced.undeclared") : protocolLabel(protocol)}</p>
+                  <p>{t(route.metadata?.protocolMode === "matching" || protocol !== undefined && protocol === referenceProtocol ? "settings.modelAdvanced.matching"
+                    : route.metadata?.protocolMode === "compatibility" || protocol !== undefined && referenceProtocol !== undefined ? "settings.modelAdvanced.compatibility" : "settings.modelAdvanced.protocolUnknown")}</p>
                   {route.contextWindow !== primary.contextWindow && route.contextWindow > 0 && <small>{formatTokens(route.contextWindow)} {t("settings.modelAdvanced.tokens")}</small>}
                   {route.metadata?.fastMode === false && metadata?.fastMode === true && <small>{t("settings.modelAdvanced.noFast")}</small>}
                 </>}</div>

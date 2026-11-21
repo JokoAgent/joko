@@ -6,6 +6,7 @@ import {
   provisionManagedCatalog,
   isManagedChatModel,
   isManagedSpeechModel,
+  supportedPiThinkingLevels,
   type PiManagedModel,
   type PiManagedProvider,
   type PiManagedSettings
@@ -2947,6 +2948,9 @@ function validateProviderEntry(entry: ManagedProviderEntry): void {
   if (entry.provider.baseUrl !== undefined) validateEndpoint(entry.provider.baseUrl);
   for (const model of entry.provider.models ?? []) {
     if (model.baseUrl !== undefined && !isSameOriginModelEndpoint(entry.provider.baseUrl, model.baseUrl)) throw new Error("Provider model endpoint must use the configured origin.");
+    if (model.defaultEffort !== undefined && !supportedPiThinkingLevels(model.reasoning, model.thinkingLevelMap).includes(model.defaultEffort)) {
+      throw new Error("Provider model default effort is unavailable for its reasoning configuration.");
+    }
   }
   if (typeof entry.credentialOrigin !== "string") throw new Error("Provider credential origin is required.");
   const origin = entry.provider.baseUrl === undefined ? undefined : new URL(entry.provider.baseUrl).origin;

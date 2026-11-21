@@ -215,6 +215,8 @@ message ProviderModelConfiguration {
   // Model-specific API base URL on the runtime's credential origin. Omission
   // preserves a saved endpoint, while an empty string restores inheritance.
   optional string endpoint = 21;
+  // Optional declared default used when there is no explicit task effort.
+  optional string default_effort = 22;
 }
 
 enum ProviderModelInheritedField {

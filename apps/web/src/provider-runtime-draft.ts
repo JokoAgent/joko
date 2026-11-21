@@ -69,7 +69,10 @@ export function emptyProviderModel(backend: BackendView): ProviderModelConfigura
 
 export function updateProviderModelMetadata(model: ProviderModelConfigurationView, patch: Partial<ProviderModelConfigurationView>): ProviderModelConfigurationView {
   const changedIdentity = patch.modelId !== undefined && patch.modelId !== model.modelId;
+  const obsoleteDefault = changedIdentity || patch.reasoning === false
+    || model.defaultEffort !== undefined && patch.thinkingLevels !== undefined && !patch.thinkingLevels.some(level => level.effortId === model.defaultEffort);
   return { ...model, ...patch,
+    ...(obsoleteDefault ? { defaultEffort: undefined } : {}),
     ...(model.inheritedFields === undefined ? {} : { inheritedFields: changedIdentity ? []
       : model.inheritedFields.filter(field => !Object.hasOwn(patch, field)) }),
     ...(changedIdentity ? { contextWindowMaxTokens: undefined } : {}) };
@@ -99,7 +102,7 @@ function transferModels(source: ProviderRuntimeConfigurationView, target: Provid
       ...(allowed("modelCosts") ? { inputCostMicrosPerMillion: model.inputCostMicrosPerMillion, outputCostMicrosPerMillion: model.outputCostMicrosPerMillion,
         cacheReadCostMicrosPerMillion: model.cacheReadCostMicrosPerMillion, cacheWriteCostMicrosPerMillion: model.cacheWriteCostMicrosPerMillion } : {}),
       ...(allowed("modelInputModalities") ? { inputModalities: model.inputModalities } : {}),
-      ...(allowed("modelThinkingLevels") ? { reasoning: model.reasoning, thinkingLevels: model.thinkingLevels } : {}),
+      ...(allowed("modelThinkingLevels") ? { reasoning: model.reasoning, thinkingLevels: model.thinkingLevels, defaultEffort: model.defaultEffort } : {}),
       ...(allowed("modelFastMode") ? { supportsFastMode: model.supportsFastMode } : {}),
       ...(model.supportsTools === undefined ? {} : { supportsTools: model.supportsTools }),
       ...(allowed("modelSampling") ? { sampling: model.sampling } : {}),

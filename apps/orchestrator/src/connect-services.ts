@@ -4715,9 +4715,19 @@ export function createConnectServices(application: OrchestratorApplication, proj
         if (saved !== undefined && credentials?.find(saved.credentialReferenceId)?.generation !== saved.generation) {
           throw new ConnectError("The saved API key changed during the catalog preview.", Code.FailedPrecondition);
         }
+        const catalogId = contract.publicProviderCatalogId(endpoint.toString());
         return { models: models
-          .filter(model => (model.metadata?.nativeApi === undefined || model.metadata.nativeApi === api)
-            && (!apiKey || apiKey.length < 8 || ![model.id, model.name, model.metadata?.name].some(value => value?.includes(apiKey!))))
+          .filter(model => {
+            if (apiKey && apiKey.length >= 8 && [model.id, model.name, model.metadata?.name].some(value => value?.includes(apiKey!))) return false;
+            if (catalogId !== undefined) {
+              const interfaces = contract.publicProviderInterfaces(catalogId, endpoint.toString(), model.id);
+              if (interfaces.length > 0) return interfaces.some(profile => !profile.compatibility?.includes("kimi-tool-ids-v1")
+                && backend.providerRuntimeSupport?.protocols.some(protocol => protocol === profile.api)
+                && (new URL(profile.baseUrl).pathname === endpoint.pathname || backend.providerRuntimeSupport.fields.includes("model_endpoint")));
+              if (contract.publicProviderModel(catalogId, model.id)?.status === "retired") return false;
+            }
+            return model.metadata?.nativeApi === undefined || model.metadata.nativeApi === api;
+          })
           .map(model => discoveredManagedModel(model, api)).filter(isManagedChatModel).map(mapProviderModelConfiguration) };
       } catch (error) {
         if (!(error instanceof ProviderModelDiscoveryError)) throw error;
@@ -10686,6 +10696,7 @@ function mapProviderModelConfiguration(item: PiManagedModel): contract.ProviderM
     displayName: item.name ?? item.id,
     apiCompatibility: item.api === undefined ? undefined : protoProviderApi(item.api),
     endpoint: item.baseUrl,
+    defaultEffort: item.discoveredMetadata === undefined || item.metadataOverrides?.includes("defaultEffort") ? item.defaultEffort : undefined,
     reasoning: item.reasoning ?? false,
     supportsFastMode: item.supportsFastMode === true,
     defaultVisible: item.defaultVisible,
@@ -10782,7 +10793,7 @@ function assertProviderRuntimeSupport(dependencies: ConnectServiceDependencies, 
       requireField("model_limits", model.contextWindow !== undefined || model.maxTokens !== undefined);
       requireField("model_costs", model.cost !== undefined);
       requireField("model_input_modalities", model.input?.some((value) => value !== "text") === true);
-      requireField("model_thinking_levels", model.reasoning === true || Object.keys(model.thinkingLevelMap ?? {}).length > 0);
+      requireField("model_thinking_levels", model.reasoning === true || model.defaultEffort !== undefined || Object.keys(model.thinkingLevelMap ?? {}).length > 0);
       requireField("model_sampling", Object.keys(model.samplingParams ?? {}).length > 0);
       requireField("model_compatibility", Object.keys(model.compat ?? {}).length > 0);
       requireField("model_fast_mode", model.supportsFastMode === true);
@@ -10903,6 +10914,7 @@ function providerModelFromProto(input: contract.ProviderModelConfiguration): PiM
     ...(input.displayName === "" ? {} : { name: input.displayName }),
     ...(input.apiCompatibility === undefined ? {} : { api: nativeProviderApi(input.apiCompatibility, false)! }),
     ...(input.endpoint === undefined ? {} : { baseUrl: input.endpoint || undefined }),
+    ...(input.defaultEffort === undefined ? {} : { defaultEffort: input.defaultEffort }),
     reasoning: input.reasoning,
     supportsFastMode: input.supportsFastMode,
     ...(input.defaultVisible === undefined ? {} : { defaultVisible: input.defaultVisible }),
