@@ -856,7 +856,7 @@ describe("RemotePiProcessFactory", () => {
       await handle.truncate(size);
       await handle.write(Buffer.of(42), 0, 1, size - 1);
     } finally { await handle.close(); }
-    const packageJson = JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "0.85.1" });
+    const packageJson = JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "1.5.2" });
     await Promise.all([
       writeFile(control, JSON.stringify({ generation: 1 })),
       writeFile(join(release, "package.json"), packageJson),

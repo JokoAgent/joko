@@ -57,6 +57,7 @@ describe("real Pi managed generation smoke", () => {
     const create = { target, providerId: "endpoint-fixture", modelId, fastMode: false, permissionMode: "ask" as const };
     const send = (text: string, bound: AdapterContext) => adapter.send({ text, images: [], files: [], mentions: [], disposition: "prompt" }, bound);
     try {
+      expect((await adapter.describe()).version).toBe("1.5.2");
       const binding = await adapter.createSession(create, context);
       const queuedBinding = await adapter.createSession(create, queuedContext);
       const bound = { ...context, binding };
