@@ -42,7 +42,7 @@ async function fixture(taskModels = false) {
   cleanups.push(async () => { await host.dispose(); await groups.close(); store.close(); await rm(root, { recursive: true, force: true }); });
   const key = { backendId: first.id, providerId: "test" }, members = groups.sources().filter(row => row.providerId === "test").map(providerGroupDefaultMember);
   const create = (id: string) => host.createSession({ operationId: id, connection, targetId: "target", title: "Grouped task", providerId: "test", modelId: "text", effort: "medium", permissionMode: "ask", planMode: false, fastMode: false });
-  const send = (sessionId: string, id: string) => host.enqueueInput({ operationId: id, connection, sessionId, prompt: prompt(id) }).value;
+  const send = (sessionId: string, id: string, text = id) => host.enqueueInput({ operationId: id, connection, sessionId, prompt: prompt(text) }).value;
   return { root, store, host, groups, registry, first, second, key, members, create, send, connection };
 }
 const prompt = (text: string): PromptInput => ({ text, images: [], files: [], mentions: [], disposition: "prompt" });
@@ -123,13 +123,17 @@ it("selects a model group on an existing task and holds a new input until the ch
   });
   const oldBackend = vi.spyOn(f.first, "send"), chosenBackend = vi.spyOn(f.second, "send");
   const choosing = pick(f.host.getSessionRuntimeControl(sessionId).generation);
-  await until(() => reading);
-  const queued = f.send(sessionId, "input while choosing the next group source");
-  expect(f.store.getQueueItem(queued.queueItemId).state).toBe("accepted");
-  expect(oldBackend).not.toHaveBeenCalled();
-  release();
-  await choosing;
-  waitForSelection.mockRestore();
+  let queued: ReturnType<typeof f.send>;
+  try {
+    await until(() => reading);
+    queued = f.send(sessionId, "input-while-choosing-group", "input while choosing the next group source");
+    expect(f.store.getQueueItem(queued.queueItemId).state).toBe("accepted");
+    expect(oldBackend).not.toHaveBeenCalled();
+  } finally {
+    release();
+    try { await choosing; }
+    finally { waitForSelection.mockRestore(); }
+  }
   await until(() => f.store.getQueueItem(queued.queueItemId).state === "completed");
   expect(oldBackend).not.toHaveBeenCalled();
   expect(chosenBackend).toHaveBeenCalledOnce();

@@ -1618,7 +1618,7 @@ describe("Connect typed feature boundaries", () => {
     }));
     const services = createConnectServices(stubApplication({
       store,
-      sessionHost: immediateHost(store, { applySessionSettings })
+      sessionHost: immediateHost(store, { applySessionSettings, stageUserModelProviderHandoff: async () => false })
     }));
     const select = async (operationId: string, modelId: string) => invoke(services.operation.submitOperation, {
       operationId,
