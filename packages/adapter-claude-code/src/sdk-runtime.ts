@@ -26,6 +26,7 @@ import {
 } from "./fresh-context-owner.js";
 import type { ClaudeMcpCallResult, ClaudeMcpTool } from "./mcp-bridge.js";
 import { locateClaudeNativeRuntime } from "./native-runtime-locator.js";
+import { repairClaudeToolIds } from "./transcript-tool-ids.js";
 import {
   CLAUDE_SESSION_STORE_LIMITS,
   createClaudeDurableSessionStore,
@@ -879,7 +880,7 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
       ...(params.options.resume === undefined ? {} : { resume: params.options.resume }),
       ...(querySessionStore === undefined
         ? {}
-        : { sessionStore: claudeSdkSessionStoreBoundary(querySessionStore) }),
+        : { sessionStore: claudeSdkSessionStoreBoundary(querySessionStore, params.options.resume !== undefined) }),
       ...(params.options.sessionId === undefined ? {} : { sessionId: params.options.sessionId }),
       ...(params.options.settings === undefined ? {} : { settings: { ...params.options.settings } }),
       settingSources: [...params.options.settingSources],
@@ -1402,7 +1403,7 @@ type NativeOptionsWithOAuth = NativeOptions & {
   readonly getOAuthToken?: ClaudeSdkOAuthTokenProvider;
 };
 
-function claudeSdkSessionStoreBoundary(store: ClaudeDurableSessionStore): NativeSessionStore {
+function claudeSdkSessionStoreBoundary(store: ClaudeDurableSessionStore, resuming: boolean): NativeSessionStore {
   return {
     append: async (key, entries) => {
       const json = JSON.stringify(entries);
@@ -1413,7 +1414,13 @@ function claudeSdkSessionStoreBoundary(store: ClaudeDurableSessionStore): Native
       if (!Array.isArray(normalized)) throw new Error("Stored Session batch is invalid.");
       await store.append(key, normalized as NativeSessionStoreEntry[]);
     },
-    load: async (key) => await store.load(key),
+    load: async (key) => {
+      const entries = await store.load(key);
+      // The durable store has already checked each row's identity and digest.
+      // Resume presents canonical tool pairs without rewriting those records.
+      if (entries && resuming) repairClaudeToolIds(entries);
+      return entries;
+    },
     listSessions: async (projectKey) => await store.listSessions(projectKey),
     delete: async (key) => await store.delete(key),
     listSubkeys: async (key) => await store.listSubkeys(key)

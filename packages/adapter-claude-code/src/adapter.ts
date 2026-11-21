@@ -98,7 +98,7 @@ import { readBackgroundWorkflowProgress } from "./workflow-progress.js";
 import type { ClaudeFreshContextBindingLookup, ClaudeFreshContextIdentity, ClaudeFreshContextSnapshot } from "./fresh-context-owner.js";
 import { prepareClaudePrompt, type ClaudeInputResolvers, type PreparedClaudePrompt } from "./prompt-input.js";
 import { claudeNativeDispatchFingerprint } from "./native-dispatch-fingerprint.js";
-import { portableClaudeTranscript, readClaudePortableTranscript, stageClaudePortableTranscript } from "./portable-transcript.js";
+import { portableClaudeTranscript, readClaudePortableTranscript, repairClaudeStoredTranscript, stageClaudePortableTranscript } from "./portable-transcript.js";
 import {
   loadedClaudeTextResources,
   snapshotClaudeTextResources,
@@ -3922,6 +3922,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         else assertSessionInfo(confirmed, nativeSessionId, scoped.workspaceRoot, scoped.remote);
       } else if (storedSessionAccess === undefined) {
         assertSessionInfo(info, nativeSessionId, scoped.workspaceRoot, scoped.remote);
+        if (!scoped.remote && !context.hostedExecution && launch.runtimePolicy === "standard"
+          && this.#runtime === scoped.runtime && ![...this.#sessions.values()].some(runtime => runtime.nativeSessionId === nativeSessionId && !runtime.closed)) {
+          const assertCurrent = () => { context.signal.throwIfAborted(); scoped.assertCurrent(); this.#assertBindingContext(binding, context); };
+          await repairClaudeStoredTranscript({ profile: this.#nativeMemoryConfigDirectory, workspace: scoped.workspaceRoot, sessionId: nativeSessionId,
+            projectDirectoryName: this.#environment["CLAUDE_CODE_PROJECT_DIR_NAME"], assertCurrent }).catch(() => { assertCurrent(); });
+        }
       } else {
         assertSessionInfoIdentity(info, nativeSessionId);
       }

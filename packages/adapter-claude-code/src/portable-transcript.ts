@@ -1,23 +1,64 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
-import { link, lstat, mkdir, open, opendir, realpath, unlink } from "node:fs/promises";
+import { link, lstat, mkdir, open, opendir, realpath, rename, unlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import type { PortableNativeSession } from "@joko/core";
 import { claudeCodeError } from "./errors.js";
 import { record } from "./projection.js";
+import { repairClaudeTranscriptText } from "./transcript-tool-ids.js";
 
 const MAXIMUM_BYTES = 96 * 1024 * 1024;
 const MAXIMUM_PROJECT_KEY_LENGTH = 200;
 const MAXIMUM_PROJECTS = 10_000;
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
-export async function readClaudePortableTranscript(input: {
+interface ClaudeTranscriptSource {
   readonly profile: string;
   readonly workspace: string;
   readonly sessionId: string;
   readonly projectDirectoryName?: string;
   readonly assertCurrent: () => void;
-}): Promise<PortableNativeSession | undefined> {
+}
+
+export async function readClaudePortableTranscript(input: ClaudeTranscriptSource): Promise<PortableNativeSession | undefined> {
+  const path = await locateClaudeTranscript(input);
+  if (!path) return undefined;
+  const bytes = await readStableTranscript(path);
+  const result = portableClaudeTranscript(bytes, input.sessionId);
+  input.assertCurrent();
+  return result;
+}
+
+/** Prepare the CLI's confirmed local transcript for resume. */
+export async function repairClaudeStoredTranscript(input: ClaudeTranscriptSource): Promise<void> {
+  const path = await locateClaudeTranscript(input);
+  if (path === undefined) return;
+  const { bytes, identity } = await readTranscriptSnapshot(path);
+  const original = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  const repaired = repairClaudeTranscriptText(original);
+  if (repaired === original) return;
+  if (Buffer.byteLength(repaired) > MAXIMUM_BYTES) throw invalidTranscript();
+  const directory = dirname(path);
+  const temporary = join(directory, `.${randomUUID()}.claude-resume.tmp`);
+  input.assertCurrent();
+  const handle = await open(temporary, "wx", 0o600);
+  try {
+    try {
+      await handle.writeFile(repaired, "utf8");
+      if (process.platform !== "win32") await handle.chmod(identity.mode & 0o777);
+      await handle.sync();
+    } finally { await handle.close(); }
+    await assertDirectory(directory);
+    if (await realpath(path) !== resolve(path) || !sameFile(identity, await lstat(path))) throw invalidTranscript();
+    input.assertCurrent();
+    await rename(temporary, path);
+    input.assertCurrent();
+  } finally {
+    await unlink(temporary).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
+  }
+}
+
+async function locateClaudeTranscript(input: ClaudeTranscriptSource): Promise<string | undefined> {
   input.assertCurrent();
   if (!SESSION_ID.test(input.sessionId)) throw invalidTranscript();
   const profile = await realpath(input.profile);
@@ -45,10 +86,8 @@ export async function readClaudePortableTranscript(input: {
     path = match;
   }
   await assertDirectory(dirname(path));
-  const bytes = await readStableTranscript(path);
-  const result = portableClaudeTranscript(bytes, input.sessionId);
   input.assertCurrent();
-  return result;
+  return path;
 }
 
 export function portableClaudeTranscript(bytes: Uint8Array, sessionId: string): PortableNativeSession {
@@ -150,6 +189,10 @@ function parseTranscript(bytes: Uint8Array): { readonly sessionId: string; reado
 }
 
 async function readStableTranscript(path: string): Promise<Buffer> {
+  return (await readTranscriptSnapshot(path)).bytes;
+}
+
+async function readTranscriptSnapshot(path: string): Promise<{ readonly bytes: Buffer; readonly identity: Stats }> {
   if (await realpath(path) !== resolve(path)) throw invalidTranscript();
   const observed = await lstat(path);
   if (!observed.isFile() || observed.isSymbolicLink() || observed.nlink !== 1 || observed.size < 1 || observed.size > MAXIMUM_BYTES) {
@@ -170,7 +213,7 @@ async function readStableTranscript(path: string): Promise<Buffer> {
     if (!sameFile(before, await handle.stat()) || !sameFile(before, await lstat(path)) || await realpath(path) !== resolve(path)) {
       throw invalidTranscript();
     }
-    return bytes;
+    return { bytes, identity: before };
   } finally {
     await handle.close();
   }
