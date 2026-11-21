@@ -4807,7 +4807,8 @@ export class MobileClient {
         if (record.state === "staging") await this.#finishTaskOutboxHandoff(record);
         else if (record.state === "restoring") await this.#restoreTaskOutboxDraft(record);
       }
-      if (!this.#current(epoch, true)) return;
+      const automaticProfile = index.profiles.find((profile) => profile.profileId === index.automaticProfileId);
+      if (!this.#current(epoch, this.platform === "ios" && automaticProfile !== undefined)) return;
       this.#profiles = [...index.profiles];
       this.#automaticProfileId = index.automaticProfileId;
       this.#allPending = pending;
@@ -4824,7 +4825,7 @@ export class MobileClient {
         error: undefined
       });
       if (index.automaticProfileId === undefined) return;
-      if (!this.#profiles.some((profile) => profile.profileId === index.automaticProfileId)) {
+      if (automaticProfile === undefined) {
         this.#set({
           status: "unpaired",
           error: "The automatic Joko connection no longer exists on this device. Turn automatic entry off or choose another saved connection."
@@ -4832,10 +4833,10 @@ export class MobileClient {
         return;
       }
       if (!this.#foreground) return;
-      try { await this.connectSaved(index.automaticProfileId); }
+      try { await this.connectSaved(automaticProfile.profileId); }
       catch { /* connectSaved owns the exact, actionable recovery state. */ }
     } catch (error) {
-      if (this.#current(epoch, true)) this.#set({ status: "unpaired", error: message(error) });
+      if (this.#current(epoch)) this.#set({ status: "unpaired", error: message(error) });
     }
   }
 
