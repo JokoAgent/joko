@@ -268,6 +268,7 @@ function ProviderModelPreview({ backend, runtime, catalogId, secret, preview, up
       maximumOutputTokens: supportsProviderField(backend, "modelLimits") ? model.maximumOutputTokens || defaults.maximumOutputTokens : 0,
       reasoning: thinking && model.reasoning,
       thinkingLevels: thinking ? model.thinkingLevels : [],
+      defaultEffort: thinking && model.reasoning ? model.defaultEffort : undefined,
       supportsFastMode: supportsProviderField(backend, "modelFastMode") && model.supportsFastMode
     };
     updateRuntime(value => ({ ...value, models: checked

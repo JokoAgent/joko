@@ -200,6 +200,7 @@ import type {
   ProviderLoginFlow as NativeProviderLoginFlow
 } from "./credential-manager.js";
 import { discoveredManagedModel, ProviderAuthUnsupportedError, type ProviderModelWithdrawalReview } from "./credential-manager.js";
+import { publicDiscoveryDefaults } from "./provider-model-metadata.js";
 import { fetchProviderModels, ProviderModelDiscoveryError, safeDiscoveryBaseUrl } from "./provider-model-discovery.js";
 import type { DiagnosticsBundleService } from "./diagnostics-bundle.js";
 import type {
@@ -4815,7 +4816,9 @@ export function createConnectServices(application: OrchestratorApplication, proj
             }
             return model.metadata?.nativeApi === undefined || model.metadata.nativeApi === api;
           })
-          .map(model => discoveredManagedModel(model, api)).filter(isManagedChatModel).map(mapProviderModelConfiguration) };
+          .map(model => publicDiscoveryDefaults(discoveredManagedModel(model, api), endpoint.toString(), backend.adapterKind, api))
+          .filter(isManagedChatModel)
+          .map(model => ({ ...mapProviderModelConfiguration(model), defaultEffort: model.defaultEffort })) };
       } catch (error) {
         if (!(error instanceof ProviderModelDiscoveryError)) throw error;
         throw new ConnectError(error.message, error.code === "unauthorized" ? Code.FailedPrecondition : Code.Unavailable);

@@ -62,7 +62,12 @@ function profileAcceptsEndpoint(profile: PublicProviderInterface, endpoint: stri
 /** Established connections can offer catalog routes only when their endpoint identifies one product. */
 export function publicProviderCatalogId(endpoint: string): string | undefined {
   const ids = [...new Set(providerInterfaceProfiles.filter(profile => profileAcceptsEndpoint(profile, endpoint)).map(profile => profile.providerId))];
-  return ids.length === 1 ? ids[0] : undefined;
+  if (ids.length !== 0) return ids.length === 1 ? ids[0] : undefined;
+  switch (normalizedEndpoint(endpoint)) {
+    case "https://api.openai.com/v1": return "openai";
+    case "https://api.anthropic.com": return "anthropic";
+    default: return undefined;
+  }
 }
 
 function providerModelId(providerId: string, modelId: string): string {

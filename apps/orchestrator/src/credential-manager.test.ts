@@ -676,6 +676,50 @@ describe("ProviderCatalogManager", () => {
     } finally { store.close(); }
   });
 
+  it("projects public metadata into discovery and Pi's models.json while retaining live declarations and owner overrides", async () => {
+    const { root, store, credentials } = await fixture();
+    const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" });
+    providers.initialize();
+    const ticket = credentials.createUploadTicket({ kind: "api_key" });
+    credentials.upload(ticket.credentialUploadTicketId, "official-model-test-key");
+    await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: "openai-fixture-key",
+      displayName: "Fixture key", kind: "api_key" });
+    const credentialBindings = { JOKO_OPENAI_TEST_KEY: "openai-fixture-key" };
+    const providerId = "my-openai-key", credentialOrigin = "https://api.openai.com";
+    await providers.upsert({ backendId: "pi", credentialOrigin, kind: "api_key", displayName: "OpenAI API", enabled: true,
+      supportsLogin: false, supportsLogout: false, supportsRefresh: false, credentialBindings,
+      provider: { id: providerId, baseUrl: `${credentialOrigin}/v1`, api: "openai-responses", apiKeyEnv: "JOKO_OPENAI_TEST_KEY",
+        models: [{ id: "owner-model", contextWindow: 32_000 }] } });
+    try {
+      await providers.discoverProviderModels("pi", providerId, async (request, init) => {
+        expect(String(request)).toBe(`${credentialOrigin}/v1/models`);
+        expect(new Headers(init?.headers).get("authorization")).toBe("Bearer official-model-test-key");
+        return Response.json({ data: [
+          { id: "gpt-6.2-sol" },
+          { id: "gpt-6.1-sol", context_window: 240_000, input_modalities: ["text"], max_output_tokens: 9_000,
+            reasoning: { supportedEfforts: ["low", "high"] }, supports_fast_mode: false },
+          { id: "unlisted-model" }
+        ] });
+      });
+      const discovered = providers.get("pi", providerId);
+      expect(discovered.provider.models[0]).toMatchObject({ name: "GPT-6.2 Sol", contextWindow: 1_050_000,
+        contextWindowSource: "estimated", maxTokens: 128_000, reasoning: true, defaultEffort: "medium", input: ["text", "image"] });
+      expect(discovered.provider.models[0]?.discoveredMetadata).not.toHaveProperty("contextWindow");
+      expect(discovered.provider.models[1]).toMatchObject({ contextWindow: 240_000, contextWindowSource: "declared",
+        maxTokens: 9_000, defaultEffort: "low", input: ["text"], supportsFastMode: false });
+      expect(discovered.provider.models[2]).toMatchObject({ name: "unlisted-model", contextWindow: 128_000 });
+      const models = discovered.provider.models.map(model => model.id !== "gpt-6.2-sol" ? model : {
+        ...model, contextWindow: 720_000, defaultEffort: undefined, metadataOverrides: ["contextWindow"] as const
+      });
+      await providers.upsertConfiguration({ providerId, displayName: "OpenAI API", kind: "api_key", enabled: true, expectedVersion: discovered.version,
+        runtimes: [{ backendId: "pi", credentialOrigin, credentialBindings, provider: { ...discovered.provider, models } }] });
+      const generation = await providers.createPiGenerationSnapshot({ snapshotsRoot: join(root, "snapshots") });
+      const native = JSON.parse(await readFile(join(generation.agentHome, "models.json"), "utf8")).providers[providerId].models;
+      expect(native[0]).toMatchObject({ id: "gpt-6.2-sol", contextWindow: 720_000, maxTokens: 128_000, reasoning: true });
+      expect(native[0]).not.toHaveProperty("discoveredMetadata");
+    } finally { store.close(); }
+  });
+
   it("refreshes known discovery facts through owner edits, sparse denials, restart and the native catalog", async () => {
     const { root, store, credentials } = await fixture();
     const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" }); providers.initialize();
