@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { GEMINI_CHAT_ENDPOINT } from "@joko/contracts";
 import { OperationalStore } from "@joko/store";
 import { provisionManagedCatalog, type PiManagedModel } from "@joko/adapter-pi";
 import { describe, expect, it, vi } from "vitest";
@@ -320,6 +321,49 @@ describe("CredentialManager", () => {
 });
 
 describe("ProviderCatalogManager", () => {
+  it("retains the exact Gemini image credential through rename and restart and retires it on replacement or deletion", async () => {
+    const { credentials, store } = await fixture();
+    const open = () => {
+      const catalog = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" });
+      catalog.initialize();
+      return catalog;
+    };
+    const reference = "gemini-connection-key";
+    const ticket = credentials.createUploadTicket({ kind: "api_key" });
+    credentials.upload(ticket.credentialUploadTicketId, "first-google-studio-key");
+    await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: reference,
+      displayName: "Google AI Studio", kind: "api_key" });
+    const input = (providerId: string, endpoint = GEMINI_CHAT_ENDPOINT) => ({
+      providerId, displayName: "Google AI Studio", kind: "custom_endpoint" as const, enabled: true, expectedVersion: 0n,
+      runtimes: [{ backendId: "pi", credentialOrigin: new URL(endpoint).origin, credentialBindings: { GOOGLE_KEY: reference },
+        provider: { id: providerId, baseUrl: endpoint, api: "openai-completions" as const, apiKeyEnv: "GOOGLE_KEY", models: [{ id: "gemini-chat" }] } }]
+    });
+    try {
+      let catalog = open();
+      expect(catalog.geminiImageChatCredential()).toBeUndefined();
+      await expect(catalog.upsertConfiguration({ ...input("proxy", "https://provider.example.test/v1beta/openai"), geminiImageBackendId: "pi" }))
+        .rejects.toThrow("Google AI Studio API key");
+      await catalog.upsertConfiguration({ ...input("first-account"), geminiImageBackendId: "pi" });
+      const selected = catalog.geminiImageChatCredential();
+      expect(selected).toMatchObject({ backendId: "pi", providerId: "first-account", credential: { credentialReferenceId: reference } });
+      await catalog.upsertConfiguration(input("second-account"));
+      await catalog.upsertConfiguration({ ...input("first-account"), displayName: "Renamed account", expectedVersion: catalog.get("pi", "first-account").version });
+      catalog = open();
+      expect(catalog.geminiImageChatCredential()).toEqual(selected);
+
+      await credentials.replaceSecret(reference, "replacement-google-studio-key");
+      expect(catalog.geminiImageChatCredential()).toBeNull();
+      await catalog.upsertConfiguration({ ...input("first-account"), geminiImageBackendId: "pi", expectedVersion: catalog.get("pi", "first-account").version });
+      expect(catalog.geminiImageChatCredential()?.credential.generation).not.toBe(selected?.credential.generation);
+      await catalog.delete("first-account");
+      await catalog.upsertConfiguration(input("first-account"));
+      catalog = open();
+      expect(catalog.geminiImageChatCredential()).toBeNull();
+      await catalog.useStandaloneGeminiImageCredential(() => {});
+      expect(open().geminiImageChatCredential()).toBeUndefined();
+    } finally { store.close(); }
+  });
+
   it("describes managed inference readiness without opening secrets and fences every credential replacement", async () => {
     const { credentials, store, now } = await fixture();
     const providers = new ProviderCatalogManager({ store, credentials, nativeBackendId: "pi" });

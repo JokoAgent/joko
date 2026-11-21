@@ -154,6 +154,8 @@ message ProviderConfiguration {
   EntityVersion version = 5;
   // Exactly one configuration per Backend identity; there is no implicit runtime.
   repeated ProviderRuntimeConfiguration runtimes = 6;
+  // Active image credential source, if this configuration supplies it.
+  optional string gemini_image_backend_id = 7;
 }
 
 message ProviderRuntimeConfiguration {
