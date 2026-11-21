@@ -314,6 +314,19 @@ jobs:
         shell: bash
         run: pnpm install --frozen-lockfile 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/install.log"
 
+      - name: Verify the Linux terminal addon after restoring dependencies
+        if: runner.os == 'Linux'
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          verify_terminal_addon() {
+            node --input-type=commonjs -e 'const {createRequire} = require("node:module"); const {resolve} = require("node:path"); createRequire(resolve("packages/tool-terminal/package.json"))("node-pty");'
+          }
+          if ! verify_terminal_addon; then
+            PNPM_CONFIG_SIDE_EFFECTS_CACHE=false pnpm --filter @joko/tool-terminal rebuild node-pty
+            verify_terminal_addon
+          fi
+
       - name: Diagnose the reproducible macOS LAN discovery failure
         id: lan_discovery
         if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'macOS' }}

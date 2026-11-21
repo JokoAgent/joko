@@ -4,11 +4,12 @@ import { isAbsolute, relative } from "node:path";
 
 // This process is the lifetime owner of exactly one native PTY and its native workers.
 // Shell input/output stays in bounded IPC memory and never reaches host stdio or files.
-const native = createRequire(import.meta.url)("node-pty");
+const require = createRequire(import.meta.url);
 const MAXIMUM_PENDING_BYTES = 1024 * 1024;
 const MAXIMUM_CHUNK_BYTES = 64 * 1024;
 const subscriptions = [];
 let pty;
+let dispatchAttempted = false;
 let started = false;
 let paused = false;
 let stopping = false;
@@ -87,7 +88,7 @@ function stop() {
   clearTimeout(startupTimer);
   buffered.length = 0; bufferedBytes = 0;
   if (!pty) {
-    if (process.connected) send({ type: "not-started" }, () => finish(1));
+    if (!dispatchAttempted && process.connected) send({ type: "not-started" }, () => finish(1));
     else finish(1);
     return;
   }
@@ -108,6 +109,7 @@ process.on("message", (message) => {
   if (message.type === "init") {
     if (pty || stopping || !exact(message, ["type", "executable", "args", "cwd", "cols", "rows", "env"]) || !string(message.executable, 8192) || !isAbsolute(message.executable) || !Array.isArray(message.args) || message.args.length > 64 || !message.args.every((arg) => string(arg, 8192)) || !string(message.cwd, 8192) || !isAbsolute(message.cwd) || !integer(message.cols, 2, 500) || !integer(message.rows, 1, 200) || !validEnvironment(message.env)) { fail(); return; }
     try {
+      const native = require("node-pty");
       // Recheck after IPC startup, immediately before the synchronous native spawn.
       const directory = lstatSync(message.cwd);
       if (!directory.isDirectory() || directory.isSymbolicLink() || relative(message.cwd, realpathSync.native(message.cwd)) !== "") throw new Error();
@@ -115,6 +117,9 @@ process.on("message", (message) => {
       // before reporting ready; stat/access deliberately follow shell symlinks.
       if (!statSync(message.executable).isFile()) throw new Error();
       accessSync(message.executable, process.platform === "win32" ? constants.F_OK : constants.X_OK);
+      // The native constructor can throw after creating a process but before
+      // returning its handle. Confirm no-start only before the dispatch call.
+      dispatchAttempted = true;
       pty = native.spawn(message.executable, message.args, {
         name: "xterm-256color", cwd: message.cwd, cols: message.cols, rows: message.rows,
         env: message.env,

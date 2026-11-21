@@ -46,6 +46,32 @@ test("rejects a directory executable before native dispatch", async () => {
   } finally { await rm(workspace, { recursive: true, force: true }); }
 });
 
+test.each([
+  { phase: "module load", source: "throw new Error('load failed');", code: "SPAWN_FAILED", stateMayHaveChanged: false },
+  { phase: "native dispatch", source: "exports.spawn = () => { throw new Error('dispatch failed'); };", code: "CLEANUP_UNKNOWN", stateMayHaveChanged: true }
+])("reports exactly what the host can confirm after a failed $phase", async ({ source, code, stateMayHaveChanged }) => {
+  const workspace = await mkdtemp(join(tmpdir(), "joko-terminal-addon-failure-"));
+  try {
+    const cwd = await realpath(workspace);
+    const preload = join(cwd, "preload.cjs");
+    await writeFile(join(cwd, "node-pty.cjs"), source);
+    await writeFile(preload, `
+      const { registerHooks } = require("node:module");
+      const { join } = require("node:path");
+      const { pathToFileURL } = require("node:url");
+      const url = pathToFileURL(join(__dirname, "node-pty.cjs")).href;
+      registerHooks({ resolve(specifier, context, nextResolve) {
+        if (specifier === "node-pty") return { url, shortCircuit: true };
+        return nextResolve(specifier, context);
+      } });
+    `);
+    const { spawn: realSpawn } = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    vi.mocked(spawn).mockImplementationOnce((command, args, options) => realSpawn(command, ["--require", preload, ...(args ?? [])], options));
+    await expect(spawnTerminalHost(process.execPath, ["-e", "process.exit(0)"], { cwd, cols: 80, rows: 24, env: terminalEnvironment() }))
+      .rejects.toMatchObject({ code, stateMayHaveChanged });
+  } finally { await rm(workspace, { recursive: true, force: true }); }
+});
+
 test.runIf(process.platform !== "win32")("rejects non-executable files and permits an executable symlink", async () => {
   const workspace = await mkdtemp(join(tmpdir(), "joko-terminal-executable-"));
   try {
