@@ -8753,7 +8753,7 @@ function initializeRegionCapture(): void {
   desktopRegionCapture = new DesktopRegionCapture({
     entryUrl: () => new URL("./region-capture.html", navigationPolicy.developmentUrl ?? DESKTOP_APP_ENTRY_URL).href,
     preload: join(sourceDirectory, "region-capture-preload.cjs"),
-    locale: () => applicationMenuLocale,
+    locale: () => applicationMenuLocale === "zh-CN" ? "zh-CN" : "en",
     dark: () => nativeTheme.shouldUseDarkColors,
     canStopByShortcut: () => registeredRegionCaptureShortcut !== undefined,
     installResources: partition => {
