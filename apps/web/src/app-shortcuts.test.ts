@@ -29,7 +29,7 @@ const ctrlG: AppShortcutCombo = { code: "KeyG", meta: false, ctrl: true, alt: fa
 
 describe("application shortcut registry", () => {
   it("registers every executable action including the interactive terminal and region capture", () => {
-    expect(APP_SHORTCUT_IDS).toHaveLength(29);
+    expect(APP_SHORTCUT_IDS).toHaveLength(31);
     expect(APP_SHORTCUT_DEFINITION_LIST.map((definition) => definition.id)).toEqual(APP_SHORTCUT_IDS);
     expect(APP_SHORTCUT_DEFINITION_LIST.map((definition) => definition.id)).toContain("open-terminal");
     expect(APP_SHORTCUT_DEFINITION_LIST.map((definition) => definition.id)).toContain("capture-region");
@@ -55,6 +55,12 @@ describe("application shortcut registry", () => {
     ]);
     expect(effectiveAppShortcutCombos("cycle-permission-mode", {}, "linux")).toEqual([
       { code: "Tab", meta: false, ctrl: false, alt: false, shift: true }
+    ]);
+    expect(effectiveAppShortcutCombos("session-history-back", {}, "linux")).toEqual([
+      { code: "BracketLeft", meta: false, ctrl: true, alt: false, shift: false }
+    ]);
+    expect(effectiveAppShortcutCombos("session-history-forward", {}, "darwin")).toEqual([
+      { code: "BracketRight", meta: true, ctrl: false, alt: false, shift: false }
     ]);
     expect(effectiveAppShortcutCombos("right-tab-prev", {}, "darwin")).toEqual([
       { code: "BracketLeft", meta: true, ctrl: false, alt: false, shift: true },
@@ -149,6 +155,8 @@ describe("application shortcut registry", () => {
       "new-maker",
       "toggle-sidebar",
       "cycle-permission-mode",
+      "session-history-back",
+      "session-history-forward",
       "right-tab-prev",
       "right-tab-next",
       "open-terminal",
@@ -167,6 +175,8 @@ describe("application shortcut registry", () => {
       "new-maker",
       "toggle-sidebar",
       "cycle-permission-mode",
+      "session-history-back",
+      "session-history-forward",
       "right-tab-prev",
       "right-tab-next",
       "open-terminal",

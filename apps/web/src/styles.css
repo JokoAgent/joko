@@ -475,6 +475,13 @@ time { color: var(--text-faint); font-size: var(--text-11); white-space: nowrap;
 .desktop-window-controls > button:focus-visible { outline: 2px solid var(--accent-edge); outline-offset: -2px; }
 .desktop-window-controls > button svg { width: 14px; height: 14px; }
 .desktop-window-controls > .desktop-window-controls__close:hover { background: var(--red); color: var(--red-ink); }
+.desktop-task-visit-controls { position: fixed; z-index: 880; top: 9px; right: 98px; display: flex; gap: 2px; -webkit-app-region: no-drag; }
+.desktop-task-visit-controls > .icon-button { width: 28px; height: 28px; }
+:root[data-desktop-platform="darwin"] .desktop-task-visit-controls { right: auto; left: 78px; }
+:root[data-desktop-platform="darwin"] .app[data-task-visit-history]:is(.navigation-hidden, .navigation-rail, :not(.has-navigation)) :is(.session-header, .new-task-page__header, .empty-session-page > header, .route-header) { padding-left: max(78px, calc(142px - var(--sidebar-width, 0px))); }
+:root[data-desktop-platform="darwin"] .app[data-task-visit-history]:is(.navigation-hidden, :not(.has-navigation)) :is(.session-header, .new-task-page__header, .empty-session-page > header, .route-header) { padding-left: 142px; }
+:root[data-desktop-platform]:not([data-desktop-platform="darwin"]) .app[data-task-visit-history] :is(.session-header, .new-task-page__header, .route-header, .inspector__header) { padding-right: 162px; }
+:root[data-desktop-platform]:not([data-desktop-platform="darwin"]) .app[data-task-visit-history]:has(> .inspector.is-open:not(.is-left):not(.is-detached)) .session-header { padding-right: 10px; }
 :root[data-desktop-platform="darwin"] .sidebar { padding-top: 46px; }
 :root[data-desktop-platform="darwin"] .sidebar::before { height: 46px; position: absolute; z-index: 1; inset: 0 0 auto; background: var(--surface); content: ""; -webkit-app-region: drag; }
 :root[data-desktop-platform]:not([data-desktop-platform="darwin"]) .sidebar__header { -webkit-app-region: drag; }

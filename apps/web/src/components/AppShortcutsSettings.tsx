@@ -41,7 +41,11 @@ export function AppShortcutsSettings({ controller, overrides, t, platform = curr
   readonly platform?: AppShortcutPlatform;
 }): JSX.Element {
   const capture = window.jokoDesktop?.regionCapture;
-  const definitions = visibleAppShortcutDefinitions(platform).filter(item => item.id !== "capture-region" || capture !== undefined);
+  const definitions = visibleAppShortcutDefinitions(platform).filter(item => {
+    if (item.id === "capture-region") return capture !== undefined;
+    if (item.id === "session-history-back" || item.id === "session-history-forward") return window.jokoDesktop !== undefined;
+    return true;
+  });
   const [recordingId, setRecordingId] = useState<AppShortcutId | null>(null);
   const [savingId, setSavingId] = useState<AppShortcutId | "all" | null>(null);
   const [error, setError] = useState<RecordingError | null>(null);

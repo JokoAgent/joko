@@ -284,6 +284,45 @@ packagedIt("converges conversation settings across real application windows and 
   await selected(main.getByRole("combobox", { name: "Language", exact: true }), "English");
   console.info("Packaged settings: formal connection ready.");
 
+  const [firstTask, secondTask] = sessionIds as [string, string];
+  const nextTask = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
+    createSessionMutation({ backendId: PI_LIKE_PROFILE.id, targetId, displayName: "Settings window C" })));
+  const showTask = (id: string) => main.locator(`.timeline[data-timeline-session-id="${id}"]`).waitFor({ state: "visible", timeout: 30_000 });
+  const openTask = async (id: string) => {
+    await main.evaluate(value => { location.hash = "/tasks/" + encodeURIComponent(value); }, id);
+    await showTask(id);
+  };
+  const back = main.getByRole("button", { name: "Previous visited task", exact: true });
+  const forward = main.getByRole("button", { name: "Next visited task", exact: true });
+  await openTask(firstTask);
+  await main.evaluate(() => { location.hash = "/schedules"; });
+  await main.locator(".scheduler-page").waitFor({ state: "visible" });
+  await openTask(secondTask);
+  await back.click();
+  await showTask(firstTask);
+  await forward.focus();
+  await main.keyboard.press("Control+BracketRight");
+  await showTask(secondTask);
+  await back.click();
+  await showTask(firstTask);
+  await openTask(nextTask);
+  await expect.poll(() => forward.isEnabled()).toBe(false);
+
+  await main.evaluate(() => { location.hash = "/settings/shortcuts"; });
+  const editBack = main.getByRole("button", { name: "Edit shortcut for Previous visited task", exact: true });
+  await editBack.click();
+  await expect.poll(async () => {
+    if (await editBack.isVisible()) return true;
+    await main.keyboard.press("Alt+J");
+    return false;
+  }).toBe(true);
+  await back.focus();
+  await main.keyboard.press("Alt+J");
+  await showTask(nextTask);
+  await back.focus();
+  await main.keyboard.press("Alt+J");
+  await showTask(firstTask);
+
   await main.evaluate(() => { location.hash = "/settings/appearance"; });
   await main.getByRole("radiogroup", { name: "Theme", exact: true }).getByRole("radio", { name: "Light", exact: true }).click();
   await waitFor(() => readFile(join(profilePath, "window-appearance.txt"), "utf8").catch(() => ""),

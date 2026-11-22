@@ -2,7 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRe
 import { parseDeviceLink, parseDeviceAuthorizationReview, type DeviceAuthorizationReview as Review } from '@joko/connection-transport/device-authorization';
 import { DeviceAuthorizationReview } from './components/DeviceAuthorizationReview.js';
 import type { CSSProperties, JSX, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
-import { AlertTriangle, Bell, CircleAlert, CirclePlus, Info, Menu, RefreshCcw, ServerCrash, Sparkles, X } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ArrowRight, Bell, CircleAlert, CirclePlus, Info, Menu, RefreshCcw, ServerCrash, Sparkles, X } from "lucide-react";
 import { taskSnoozeDeadline, type TaskSnoozeChoice } from "@joko/contracts";
 import { appRouteHash, extensionBackgroundTaskForRoute, useAppController } from "./controller.js";
 import { useAppDefaultModelBridge } from "./app-default-model-bridge.js";
@@ -72,6 +72,7 @@ import {
   type DesktopApplicationMenuPreferenceView
 } from "./desktop-application-menu.js";
 import { useAppShortcut } from "./use-app-shortcut.js";
+import { EMPTY_SESSION_VISIT_HISTORY, sessionVisitTarget, updateSessionVisitHistory } from "./session-visit-history.js";
 import type { WindowZoomIntent } from "./appearance-settings.js";
 import { GAMEPAD_PANEL_EVENT, useGamepadInput } from "./gamepad-client.js";
 import { toggleGamepadFullscreen } from "./gamepad-fullscreen.js";
@@ -1642,6 +1643,36 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const navigateFromShortcut = (route: Parameters<AppController["navigate"]>[0]): void => {
     void navigateFromApplicationMenu(route);
   };
+  const desktopTaskHistory = window.jokoDesktop !== undefined && !auxiliaryApplicationWindow;
+  const historyOwner = desktopTaskHistory ? connectionOwner : undefined;
+  const historySessionId = state.route.kind === "session" && state.route.backgroundExtensionId === undefined
+    && activeSession?.id === state.route.sessionId ? state.route.sessionId : undefined;
+  const accessibleHistoryIds = useMemo(() => new Set(state.snapshot.sessions
+    .filter(session => !session.archived && !session.hidden).map(session => session.id)), [state.snapshot.sessions]);
+  const [taskHistory, setTaskHistory] = useState(EMPTY_SESSION_VISIT_HISTORY);
+  const historyHop = useRef<ReturnType<typeof sessionVisitTarget>>(undefined);
+  useLayoutEffect(() => {
+    const hop = historyHop.current;
+    historyHop.current = undefined;
+    setTaskHistory(prior => updateSessionVisitHistory(prior, historyOwner, accessibleHistoryIds, historySessionId, hop));
+  }, [accessibleHistoryIds, historyOwner, historySessionId]);
+  const previousVisit = sessionVisitTarget(taskHistory, historyOwner, historySessionId, -1);
+  const nextVisit = sessionVisitTarget(taskHistory, historyOwner, historySessionId, 1);
+  const visitTask = (target: ReturnType<typeof sessionVisitTarget>): boolean => {
+    if (target === undefined || !accessibleHistoryIds.has(target.id)) return false;
+    void navigateFromApplicationMenu({ kind: "session", sessionId: target.id }, () => {
+      const current = controllerRef.current.state;
+      if (authenticatedConnectionKey(current) !== target.owner
+        || !current.snapshot.sessions.some(session => session.id === target.id && !session.hidden && !session.archived)) return false;
+      historyHop.current = target;
+      return true;
+    });
+    return true;
+  };
+  const ownsHistoryKeys = (event: KeyboardEvent) => !(event.target instanceof Element
+    && event.target.closest(".xterm, .cm-editor, input, textarea, select, [contenteditable='true']"));
+  useAppShortcut("session-history-back", shortcutOverrides, event => ownsHistoryKeys(event) && visitTask(previousVisit), { enabled: desktopTaskHistory });
+  useAppShortcut("session-history-forward", shortcutOverrides, event => ownsHistoryKeys(event) && visitTask(nextVisit), { enabled: desktopTaskHistory });
   const applicationMenuPreferences = {
     navigationOpen: effectiveNavigationOpen,
     windowZoom: state.preferences.windowZoom
@@ -2582,6 +2613,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     <div
       className={cx("app", shellNavigationOpen && "has-navigation", settingsRoute ? "navigation-hidden" : `navigation-${navigationMode}`, formalFilesMode && "workspace-files-mode", navigationDrag !== undefined && !settingsRoute && "is-navigation-resizing", inspectorAttached && "has-inspector")}
       data-wallpaper-active={wallpaperActive ? "true" : undefined}
+      data-task-visit-history={desktopTaskHistory ? "true" : undefined}
       style={{
         ...(wallpaperActive ? {
           "--app-wallpaper-image": `url("${wallpaper.customImage!.url}")`,
@@ -2597,6 +2629,12 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         visibleSessionIds={nativeTaskStatusVisibleSessionIds}
       />}
       <DesktopRemoteDesktopStatus t={t} />
+      {desktopTaskHistory && <div className="desktop-task-visit-controls">
+        <IconButton label={t("settings.shortcuts.items.session-history-back.label")} disabled={previousVisit === undefined}
+          onClick={() => { visitTask(previousVisit); }}><ArrowLeft aria-hidden="true" /></IconButton>
+        <IconButton label={t("settings.shortcuts.items.session-history-forward.label")} disabled={nextVisit === undefined}
+          onClick={() => { visitTask(nextVisit); }}><ArrowRight aria-hidden="true" /></IconButton>
+      </div>}
       <TaskActivityBanner />
       <a className="skip-link" href="#main-content">{t("app.skipToContent")}</a>
       <DesktopPageSearchBar overrides={shortcutOverrides} t={t} onOpenChange={setDesktopPageSearchOpen} />

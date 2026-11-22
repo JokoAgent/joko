@@ -14,6 +14,8 @@ export const APP_SHORTCUT_IDS = [
   "toggle-sidebar",
   "cycle-permission-mode",
   "close-tab-or-window",
+  "session-history-back",
+  "session-history-forward",
   "right-tab-prev",
   "right-tab-next",
   "open-terminal",
@@ -106,6 +108,8 @@ const CORE_SHORTCUT_DEFINITIONS: readonly AppShortcutDefinition[] = [
     rebindable: false,
     hiddenInSettings: true
   }),
+  definition("session-history-back", "app", (platform) => [modCombo("BracketLeft", platform)]),
+  definition("session-history-forward", "app", (platform) => [modCombo("BracketRight", platform)]),
   definition("right-tab-prev", "app", (platform) => platform === "darwin"
     ? [combo("BracketLeft", { meta: true, shift: true }), combo("Tab", { ctrl: true, shift: true })]
     : [combo("PageUp", { ctrl: true }), combo("Tab", { ctrl: true, shift: true })]),
