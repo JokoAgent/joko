@@ -1,5 +1,6 @@
 import type { DesktopRemoteDesktopViewerOwner, MenubarState, MenubarSettings, DesktopMenubarSnapshot, DesktopMenubarAction, ListDesktopLocalAgentsResponse } from "@joko/contracts";
 import type { DesktopSpeakerApi } from "@joko/contracts";
+import type { PerformanceRecordingCommand, PerformanceRecordingPhase } from "./performance-recording.js";
 import type {
   DesktopAppInfo,
   DesktopCodeHostLoginScope,
@@ -906,6 +907,15 @@ const desktopApi = Object.freeze({
     push: (id, chunk) => ipcRenderer.invoke("joko:voice-speaker", "push", id, chunk),
     finish: (id) => ipcRenderer.invoke("joko:voice-speaker", "finish", id),
     cancel: (id) => ipcRenderer.invoke("joko:voice-speaker", "cancel", id)
+  }),
+  performanceRecording: Object.freeze({
+    run: (command: PerformanceRecordingCommand, profileId: string): Promise<PerformanceRecordingPhase> =>
+      ipcRenderer.invoke("joko:performance-recording", command, profileId),
+    onOpen: (listener: () => void): (() => void) => {
+      const callback = () => listener();
+      ipcRenderer.on("joko:performance-recording:open", callback);
+      return () => ipcRenderer.removeListener("joko:performance-recording:open", callback);
+    }
   }),
   microphone: Object.freeze({
     getPermission: (): Promise<DesktopMicrophonePermissionSnapshot> =>

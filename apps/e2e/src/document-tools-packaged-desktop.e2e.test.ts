@@ -387,7 +387,9 @@ tr:nth-child(even) td { background: #fafafa; }
   });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
   const closeNavigation = page.locator(".sidebar__mobile-close");
-  if (await closeNavigation.isVisible()) await closeNavigation.click();
+  if (!await closeNavigation.isVisible()) await page.getByRole("button", { name: "Open navigation", exact: true }).click();
+  await closeNavigation.click();
+  await closeNavigation.waitFor({ state: "hidden" });
   await expectExactNativeSave(page, desktopIdentity.pid, profileDirectory, expectedBytes);
 
   await page.reload({ waitUntil: "domcontentloaded" });

@@ -3,6 +3,7 @@ import type { JSX } from "react";
 import { Minus, Square, X } from "lucide-react";
 import type { Translator } from "./types.js";
 import { IconButton } from "./ui.js";
+import { DesktopPerformanceControls } from "./DesktopPerformanceControls.js";
 
 export function shouldRenderDesktopWindowControls(platform: string | undefined): boolean {
   return platform !== undefined && platform !== "darwin";
@@ -22,8 +23,9 @@ export function requestDesktopWindowClose(api: Pick<DesktopWindowControlApi, "wi
   void api.window.close().catch(() => undefined);
 }
 
-export function DesktopWindowControls({ t }: {
+export function DesktopWindowControls({ t, performanceOwner }: {
   readonly t: Translator;
+  readonly performanceOwner?: { readonly id: string; readonly key: string };
 }): JSX.Element | null {
   const desktop: DesktopWindowControlApi | undefined = window.jokoDesktop ?? window.jokoRuntimeProcessDiagnostics;
   const platform = desktop?.platform;
@@ -38,10 +40,16 @@ export function DesktopWindowControls({ t }: {
     };
   }, [platform]);
 
-  if (!shouldRenderDesktopWindowControls(platform) || desktop === undefined) return null;
+  const performance = performanceOwner && window.jokoDesktop?.performanceRecording
+    ? <DesktopPerformanceControls key={performanceOwner.key} api={window.jokoDesktop.performanceRecording}
+      profileId={performanceOwner.id} nativeMenu={platform === "darwin"} t={t} />
+    : null;
+  if (!shouldRenderDesktopWindowControls(platform) || desktop === undefined) return performance;
 
   return (
-    <div className="desktop-window-controls" role="group" aria-label={t("desktop.windowControls")}>
+    <div className="desktop-window-controls" data-performance-recording={performance !== null || undefined}
+      role="group" aria-label={t("desktop.windowControls")}>
+      {performance}
       <IconButton label={t("desktop.minimize")} onClick={() => { void desktop.window.minimize().catch(() => undefined); }}>
         <Minus aria-hidden="true" />
       </IconButton>

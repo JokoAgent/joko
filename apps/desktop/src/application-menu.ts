@@ -23,6 +23,7 @@ export interface MacApplicationMenuOptions {
   /** Display-only: Toggle Sidebar remains owned by the renderer key handler. */
   readonly toggleSidebarAccelerator?: string | null;
   readonly onCommand?: (command: DesktopApplicationMenuCommand) => void;
+  readonly openPerformanceRecording?: () => void;
   /** Main supplies Electron's native localized role label. */
   readonly roleLabel?: (role: ZoomRole) => string;
   readonly appName?: string;
@@ -67,6 +68,7 @@ export function buildMacApplicationMenuTemplate(
           click: () => dispatch("open-settings")
         },
         { label: labels.checkForUpdates, click: () => dispatch("check-for-updates") },
+        ...(options.openPerformanceRecording ? [{ label: labels.performanceRecording, click: options.openPerformanceRecording }] : []),
         { type: "separator" },
         { role: "services" },
         { type: "separator" },

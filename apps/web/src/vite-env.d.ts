@@ -692,6 +692,10 @@ interface JokoDesktopApi {
     ) => void): () => void;
   };
   readonly voiceSpeaker?: import("@joko/contracts").DesktopSpeakerApi;
+  readonly performanceRecording?: {
+    run(command: "state" | "start" | "stop" | "reveal" | "retire", profileId: string): Promise<"idle" | "recording" | "busy" | "ready">;
+    onOpen(listener: () => void): () => void;
+  };
   readonly microphone: {
     getPermission(): Promise<{ readonly status: "granted" | "denied" | "prompt" | "unknown" }>;
     openSettings(): Promise<boolean>;

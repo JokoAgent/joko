@@ -282,7 +282,9 @@ function ConnectedAppControllerRoot(): JSX.Element {
     && !isSessionApplicationWindow(window.location)
     && partnerApplicationWindowIdentity(window.location) === undefined
     && !isExtensionApplicationWindow(window.location);
-  return <><RuntimeProcessMonitorBroker controller={controller} />{applicationWindowOwner && <DesktopRemoteDesktopViewerBridge controller={controller} />}<StartupUpdateOverlay t={t} />{applicationWindowOwner && <DesktopGlobalVoiceBridge controller={controller} />}<AppWithController controller={controller} /><DesktopWindowControls t={t} /></>;
+  const profile = controller.state.connectionState === "connected" ? controller.state.activeProfile : undefined;
+  return <><RuntimeProcessMonitorBroker controller={controller} />{applicationWindowOwner && <DesktopRemoteDesktopViewerBridge controller={controller} />}<StartupUpdateOverlay t={t} />{applicationWindowOwner && <DesktopGlobalVoiceBridge controller={controller} />}<AppWithController controller={controller} /><DesktopWindowControls t={t}
+    performanceOwner={profile && { id: profile.id, key: JSON.stringify([profile.id, profile.serverId, profile.deviceId, profile.origin]) }} /></>;
 }
 
 /** Injectable application shell used by deterministic development harnesses. */

@@ -3,6 +3,7 @@ import {
   autoUpdater as nativeAutoUpdater,
   BrowserWindow,
   clipboard,
+  contentTracing,
   dialog,
   globalShortcut,
   ipcMain,
@@ -308,6 +309,7 @@ import {
   microphoneMediaTypesFromPermissionDetails
 } from "./microphone-permission.js";
 import { registerDesktopSpeakerIpc } from "./voice-speaker.js";
+import { DesktopPerformanceRecording } from "./performance-recording.js";
 import { createProviderModelRefreshHostLifecycle } from "./provider-model-refresh-lifecycle.js";
 import {
   DesktopGlobalShortcutRegistration,
@@ -1059,6 +1061,10 @@ let nativeWorkspaceFileSource: NativeWorkspaceFileSource | undefined;
 let nativeWorkspaceDirectoryDownload: NativeWorkspaceDirectoryDownload | undefined;
 let windowsOpenWithApps: WindowsOpenWithApps | undefined;
 const nativeFileActionScopes = new WeakMap<WebContents, NativeFileActionScope>();
+const desktopPerformanceRecording = new DesktopPerformanceRecording(
+  contentTracing, () => app.getPath("temp"), () => join(app.getPath("userData"), "performance-recordings"),
+  (file) => shell.showItemInFolder(file)
+);
 let desktopRegionCapture: DesktopRegionCapture | undefined;
 let desktopRegionCaptureOwner: RegionCaptureNode | undefined;
 let registeredRegionCaptureShortcut: string | undefined;
@@ -7303,7 +7309,13 @@ function installDesktopApplicationMenu(): void {
     ...configuration,
     shortcutRecording: configuration.shortcutRecording || !ready,
     onCommand: dispatchApplicationMenuCommand,
-    roleLabel: nativeMenuRoleLabel
+    roleLabel: nativeMenuRoleLabel,
+    openPerformanceRecording: () => {
+      const window = BrowserWindow.getFocusedWindow();
+      if (window && trustedApplicationWindowForContents(window.webContents) === window) {
+        window.webContents.send("joko:performance-recording:open");
+      }
+    }
   });
 }
 
@@ -8828,6 +8840,31 @@ function configureRegionCaptureShortcut(): boolean {
 }
 
 function registerIpc(): void {
+  ipcMain.handle("joko:performance-recording", async (event, command: unknown, profileId: unknown) => {
+    assertTrustedIpcSender(event);
+    if (typeof profileId !== "string" || profileId.length === 0 || profileId.length > 512) throw new TypeError("Invalid performance recording owner.");
+    const contents = event.sender;
+    const scope = nativeFileActionScope(event);
+    const pid = contents.getOSProcessId();
+    const source = { id: scope.id, owner: profileId, pid, main: mainWindow?.webContents === contents,
+      isCurrent: () => scope.isCurrent() && contents.getOSProcessId() === pid, destroyed: () => contents.isDestroyed() };
+    if (command === "retire") {
+      desktopPerformanceRecording.retire(source);
+      return "idle";
+    }
+    if (await readCredential(profileId) === undefined || !scope.isCurrent()) throw new Error("The performance recording owner is unavailable.");
+    switch (command) {
+      case "start":
+        assertFocusedTrustedIpcSender(event);
+        await desktopPerformanceRecording.start(source);
+        break;
+      case "stop": await desktopPerformanceRecording.stop(source); break;
+      case "reveal": desktopPerformanceRecording.reveal(source); break;
+      case "state": break;
+      default: throw new TypeError("Invalid performance recording command.");
+    }
+    return desktopPerformanceRecording.state(source);
+  });
   registerDesktopSpeakerIpc(ipcMain, {
     directory: () => app.getPath("userData"),
     assertSource: event => {
