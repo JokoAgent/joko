@@ -30,16 +30,14 @@ import { MobileDeviceAuthorizationSettings } from './MobileDeviceAuthorizationSe
 import { MobileServerAccessSettings } from './MobileServerAccessSettings';
 import { MobileVoiceDictionaryScreen } from "./MobileVoiceDictionaryScreen";
 import { MobileVoiceDictionaryReadOnlyScreen } from "./MobileVoiceDictionaryReadOnlyScreen";
+import { MobileHandheldSettingsSection } from "./MobileHandheldSettingsSection";
+import { MobileSpeakerFilterScreen } from "./MobileSpeakerFilterScreen";
+import { mobileSpeakerMessage } from "./speaker-filter/messages";
 import type { MobileVoiceDictionaryReadOnlyController } from "./mobile-voice-dictionary-readonly-controller";
-import type {
-  MobileVoiceDictionaryEditOutcome,
-  MobileVoicePreferencesStoreState
-} from "./mobile-voice-preferences-store";
+import type { MobileVoicePreferencesStoreState } from "./mobile-voice-preferences-store";
 import { MobileUpdateSettingsSection, type MobileUpdateActions } from "./MobileUpdateSurface";
 import type { MobileUpdateControllerState } from "./mobile-update-controller";
 import type { MobilePushControllerState } from "./mobile-push-controller";
-import type { MobileVoiceDictionaryControllerState } from "./mobile-voice-dictionary-controller";
-import type { MobileVoiceDictionaryTransport } from "./mobile-voice-dictionary-service";
 import type { MobileVoiceSettingsTransport } from "./mobile-voice-service-settings";
 import type { MobileVoiceServiceDraft } from "./MobileVoiceServiceSettings";
 
@@ -65,8 +63,6 @@ export interface MobileSettingsScreenProps {
   readonly locale: MobileLocalePreferenceState;
   readonly diagnostics: MobileDiagnosticsState;
   readonly voiceDictionary: MobileVoicePreferencesStoreState;
-  readonly nodeDictionary: MobileVoiceDictionaryControllerState;
-  readonly voicePeerTransport?: MobileVoiceDictionaryTransport;
   readonly voiceServiceTransport?: MobileVoiceSettingsTransport;
   readonly onVoiceRecognitionContextChange?: (enabled: boolean, contextData: readonly { readonly text: string }[]) => Promise<void>;
   readonly readOnlyDictionary: MobileVoiceDictionaryReadOnlyController;
@@ -85,11 +81,6 @@ export interface MobileSettingsScreenProps {
   readonly onVoiceDictionaryReset: () => Promise<void>;
   readonly onVoiceInstructionsChange: (value: string) => Promise<void>;
   readonly onVoiceAutoLearningChange: (enabled: boolean) => Promise<void>;
-  readonly onVoiceDictionaryRefresh: () => Promise<void>;
-  readonly onVoiceDictionarySyncChange: (enabled: boolean) => Promise<void>;
-  readonly onVoiceDictionaryAdd: (value: string) => Promise<void>;
-  readonly onVoiceDictionaryEdit: (id: string, text: string, aliases: string, revision: bigint) => Promise<MobileVoiceDictionaryEditOutcome>;
-  readonly onVoiceDictionaryDelete: (id: string, revision: bigint) => Promise<void>;
   readonly onBack: () => void;
   readonly onConnections: () => void;
   readonly onDevices: () => void;
@@ -130,8 +121,8 @@ export function resolveMobileSettingsCurrentDevice(state: MobileState): MobileSe
 export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
   const { colors, state, foreground, theme, locale, diagnostics, voiceDictionary, client, onThemeChange,
   onLocaleChange, onPushEnabledChange, onPushPreviewEnabledChange, onDiagnosticsEnabledChange, onDiagnosticsClear, onDiagnosticsExport, onBack,
-  onVoiceDictionaryRetry, onVoiceDictionaryReset, onVoiceInstructionsChange, onVoiceAutoLearningChange, onVoiceDictionaryAdd,
-  onVoiceDictionaryEdit, onVoiceDictionaryDelete, onConnections, onDevices, updates, updateActions, push,
+  onVoiceDictionaryRetry, onVoiceDictionaryReset, onVoiceInstructionsChange, onVoiceAutoLearningChange,
+  onConnections, onDevices, updates, updateActions, push,
   appVersion } = props;
   const current = resolveMobileSettingsCurrentDevice(state);
   const t = (key: MobileMessageKey, variables?: Readonly<Record<string, string | number>>): string =>
@@ -145,6 +136,7 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
   const [developerOpen, setDeveloperOpen] = useState(false);
   const [diagnosticsExpanded, setDiagnosticsExpanded] = useState(false);
   const [voiceOpen, setVoiceOpen] = useState(false);
+  const [speakerOpen, setSpeakerOpen] = useState(false);
   const voiceServiceDraft = useRef<MobileVoiceServiceDraft | undefined>(undefined);
   const [readOnlyOpen, setReadOnlyOpen] = useState(false);
   const saveGeneration = useRef(0);
@@ -314,20 +306,21 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
     }
   };
 
+  if (speakerOpen && current !== undefined) return <MobileSpeakerFilterScreen key={current.ownerKey} owner={current.profile.profileId}
+    colors={colors} locale={locale.effectiveLocale} foreground={foreground} onBack={() => setSpeakerOpen(false)} />;
+
   if (readOnlyOpen) return <MobileVoiceDictionaryReadOnlyScreen colors={colors} locale={locale.effectiveLocale}
     foreground={foreground} controller={props.readOnlyDictionary} backLabel={t(voiceOpen ? "settings.voice.title" : "settings.title")}
     onBack={() => setReadOnlyOpen(false)} />;
 
-  if (voiceOpen) return <MobileVoiceDictionaryScreen key={props.nodeDictionary.ownerKey ?? "unavailable"}
+  if (voiceOpen) return <MobileVoiceDictionaryScreen key={currentOwnerKey ?? "unavailable"}
     colors={colors} locale={locale.effectiveLocale}
-    state={voiceDictionary} dictionary={props.nodeDictionary} peerTransport={foreground ? props.voicePeerTransport : undefined} onBack={() => setVoiceOpen(false)} onRetry={onVoiceDictionaryRetry}
+    state={voiceDictionary} onBack={() => setVoiceOpen(false)} onRetry={onVoiceDictionaryRetry}
     serviceTransport={foreground ? props.voiceServiceTransport : undefined} serviceDraftCache={voiceServiceDraft}
     onSetRecognitionContext={props.onVoiceRecognitionContextChange}
     onReset={onVoiceDictionaryReset}
     onSetInstructions={onVoiceInstructionsChange} onSetAutoLearning={onVoiceAutoLearningChange}
-    onRefreshDictionary={props.onVoiceDictionaryRefresh} onSetSyncEnabled={props.onVoiceDictionarySyncChange}
-    onAddTerm={onVoiceDictionaryAdd} onEditEntry={onVoiceDictionaryEdit}
-    onDeleteEntry={onVoiceDictionaryDelete} onReadOnlyDictionary={() => setReadOnlyOpen(true)} />;
+    onReadOnlyDictionary={() => setReadOnlyOpen(true)} />;
 
   if (editor) {
     const editable = canRename && editor.ownerKey === currentOwnerKey;
@@ -395,6 +388,10 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
       colors={colors} onPress={() => { setLocalError(""); setNotice(""); setVoiceOpen(true); }} />
     <NavigationRow label={t("settings.voiceReadonly.title")} description={t("settings.voiceReadonly.navigation")}
       colors={colors} onPress={() => { setLocalError(""); setNotice(""); setReadOnlyOpen(true); }} />
+    {current !== undefined && <NavigationRow
+      label={mobileSpeakerMessage(locale.effectiveLocale, "title")} description={mobileSpeakerMessage(locale.effectiveLocale, "navigation")}
+      colors={colors} onPress={() => setSpeakerOpen(true)} />}
+    <MobileHandheldSettingsSection colors={colors} locale={locale.effectiveLocale} foreground={foreground} />
 
     {props.onTaskSharing && <>
       <Text style={[styles.section, { color: colors.muted }]}>{t("settings.sharing.title")}</Text>

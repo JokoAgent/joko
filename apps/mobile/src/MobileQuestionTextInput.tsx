@@ -8,10 +8,12 @@ import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import { useMobileVoicePermissionSettings } from "./use-mobile-voice-permission-settings";
+import { mobileSpeakerMessage } from "./speaker-filter/messages";
 
-export function MobileQuestionTextInput({ ownerKey, transport, enabled, label, value, multiline, placeholder, style, colors, locale, onFocus, onChange, onError }: {
+export function MobileQuestionTextInput({ ownerKey, transport, speakerFilter, enabled, label, value, multiline, placeholder, style, colors, locale, onFocus, onChange, onError }: {
   readonly ownerKey: string;
   readonly transport?: MobileVoiceTransport;
+  readonly speakerFilter?: boolean;
   readonly enabled: boolean;
   readonly label: string;
   readonly value: string;
@@ -30,11 +32,11 @@ export function MobileQuestionTextInput({ ownerKey, transport, enabled, label, v
   const selection = useRef<MobileComposerSelection>({ start: value.length, end: value.length });
   const input = useRef<TextInput>(null);
   const pressing = useRef(false);
-  const voice = useMobileVoiceInput({ transport, enabled, draftOwnerKey: ownerKey, locale, requestId: randomUUID, onError,
+  const voice = useMobileVoiceInput({ transport, speakerFilter, enabled, draftOwnerKey: ownerKey, locale, requestId: randomUUID, onError,
     readDraft: (): MobileComposerDraft => ({ text: latest.current.text, mentions: [], atoms: [], slashCommands: [], attachments: [] }),
     readSelection: () => selection.current,
     writeDraft: (draft, nextSelection, persist) => {
-      if (!latest.current.enabled) return;
+      if (!latest.current.enabled || latest.current.ownerKey !== ownerKey) return;
       latest.current.text = draft.text; selection.current = nextSelection;
       if (persist) { setPreview(undefined); latest.current.onChange(draft.text); }
       else setPreview({ ownerKey: latest.current.ownerKey, base: latest.current.value, text: draft.text });
@@ -60,5 +62,9 @@ export function MobileQuestionTextInput({ ownerKey, transport, enabled, label, v
         onPressIn={() => { pressing.current = true; }} onPressOut={() => { pressing.current = false; }}
         onPress={() => { void voice.cancel(); }} style={{ padding: 10 }}><Text style={{ color: colors.negative }}>{mobileMessage(locale, "voice.cancel")}</Text></Pressable>}
     </View>}
+    {enabled && voice.speakerNotice !== undefined && <Text accessibilityLiveRegion="polite"
+      style={{ color: voice.speakerNotice === "unavailable" ? colors.negative : colors.muted }}>
+      {mobileSpeakerMessage(locale, voice.speakerNotice)}
+    </Text>}
   </View>;
 }

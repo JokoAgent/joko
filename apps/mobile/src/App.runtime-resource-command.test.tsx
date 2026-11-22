@@ -1134,6 +1134,7 @@ it.each(["same request", "resolved while reconnecting"] as const)("retains the o
   renderedState = { ...state, owner: snapshot, detail: snapshot };
   await act(async () => root.render(taskScreen()));
   expect(interactionSheet.interactions).toEqual([question]);
+  expect(interactionSheet.speakerFilter).toBe(true);
   interactionDrafts.save(identity, draft);
   await interactionDrafts.flush(identity);
 

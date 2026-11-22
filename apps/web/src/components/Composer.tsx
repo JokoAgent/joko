@@ -3050,12 +3050,14 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
           />
         </PromptRecommendationEditorFrame>
         {voice.draftError !== undefined && <p className="composer__error" role="alert">{voice.draftError}</p>}
+        {voiceUpdate?.state === "done" && voice.speakerNotice && <small role="status">{voice.speakerNotice}</small>}
         {!readOnly && <ModelSourceNotice key={JSON.stringify([voiceDictionaryOwnerKey, sendRouteKey])} controller={controller} backend={backend} selection={session.model} model={session.model} t={t} />}
         {voiceUpdate !== undefined && voiceUpdate.state !== "idle" && voiceUpdate.state !== "done" && voiceUpdate.state !== "cancelled" && (
           <VoiceInputOverlay
             state={voice.phase ?? voiceUpdate.state}
             transcript={voiceUpdate.session?.result?.text ?? voiceUpdate.session?.draft?.text ?? ""}
             error={voice.error}
+            speakerNotice={voice.speakerNotice}
             stallWarning={voiceUpdate.session?.stallWarning === true}
             canUseTranscript={voiceUpdate.session?.result !== undefined && (voiceUpdate.session.failure?.transcriptKept === true || voiceUpdate.session.result.salvaged)}
             t={t}

@@ -32,11 +32,16 @@ import {
   createMobileVoiceInsertedEditTracker
 } from "./mobile-voice-dictionary-learning";
 import type { MobileVoicePreferencesStore } from "./mobile-voice-preferences-store";
+import { mobileHandheld } from "./mobile-handheld";
+import type { MobileSpeakerNotice } from "./speaker-filter/mobile-speaker-filter";
+import { SPEAKER_FILTER_NOTICE_MS } from "@joko/voice-speaker";
 
 export interface UseMobileVoiceInputOptions {
   readonly transport?: MobileVoiceTransport;
   readonly draftOwnerKey?: string;
   readonly enabled: boolean;
+  readonly handheld?: boolean;
+  readonly speakerFilter?: boolean;
   readonly permissionPromptConnection?: "connected" | "connecting";
   readonly readDraft: () => MobileComposerDraft;
   readonly readSelection: () => MobileComposerSelection;
@@ -56,6 +61,7 @@ export interface MobileVoiceInputBinding {
   readonly busy: boolean;
   readonly elapsedLabel?: string;
   readonly error?: MobileVoiceRunError;
+  readonly speakerNotice?: MobileSpeakerNotice;
   start(): Promise<void>;
   stop(): Promise<void>;
   cancel(): Promise<void>;
@@ -71,6 +77,16 @@ interface PendingMicrophonePrompt {
   backgrounded: boolean;
 }
 
+interface HandheldPress {
+  run?: MobileVoiceInputRun;
+  released?: "end" | "cancel";
+}
+
+function activeVoiceRun(run: MobileVoiceInputRun | undefined): boolean {
+  const state = run?.currentState;
+  return state === "starting" || state === "listening" || state === "submitting";
+}
+
 export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): MobileVoiceInputBinding {
   const capture = options.capture ?? mobileVoiceCaptureRuntime;
   const preferencesStore = options.preferencesStore ?? mobileVoicePreferences;
@@ -79,6 +95,8 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
   const [state, setState] = useState<MobileVoiceRunState>("idle");
   const [error, setError] = useState<MobileVoiceRunError | undefined>();
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [speakerNotice, setSpeakerNotice] = useState<MobileSpeakerNotice>();
+  const speakerNoticeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const transportRef = useRef(options.transport);
   const enabledRef = useRef(options.enabled);
   const draftOwnerKeyRef = useRef(options.draftOwnerKey);
@@ -111,6 +129,10 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
     readDraftText: () => readDraftRef.current().text
   }), [preferencesStore]);
   const ownerKey = options.transport?.surfaceOwnerKey;
+  useEffect(() => {
+    setSpeakerNotice(undefined);
+    return () => clearTimeout(speakerNoticeTimer.current);
+  }, [ownerKey, options.draftOwnerKey]);
   transportRef.current = options.transport;
   enabledRef.current = options.enabled;
   draftOwnerKeyRef.current = options.draftOwnerKey;
@@ -238,6 +260,8 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
     const controller = new AbortController();
     setAvailable(false);
     setError(undefined);
+    clearTimeout(speakerNoticeTimer.current);
+    setSpeakerNotice(undefined);
     if (!transport || !options.enabled || !capture.isAvailable()) {
       setChecking(false);
       return () => controller.abort();
@@ -245,8 +269,14 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
     setChecking(true);
     void transport.getCapabilities(controller.signal).then((capability) => {
       if (!controller.signal.aborted && transportRef.current?.surfaceOwnerKey === expectedOwnerKey) {
-        setAvailable(supportsMobileVoiceCapture(capability, capture.isAvailable()));
+        const supported = supportsMobileVoiceCapture(capability, capture.isAvailable());
+        setAvailable(supported);
         recognitionContextSupportedRef.current = capability.supportsRecognitionContext;
+        if (supported && options.speakerFilter) {
+          void import("./speaker-filter/mobile-speaker-filter").then(({ warmMobileSpeakerFilter }) => {
+            if (!controller.signal.aborted && transport.isCurrent()) return warmMobileSpeakerFilter(transport.profileId);
+          }).catch(() => undefined);
+        }
       }
     }).catch(() => {
       if (!controller.signal.aborted && transportRef.current?.surfaceOwnerKey === expectedOwnerKey) setAvailable(false);
@@ -254,7 +284,7 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
       if (!controller.signal.aborted && transportRef.current?.surfaceOwnerKey === expectedOwnerKey) setChecking(false);
     });
     return () => controller.abort();
-  }, [capture, options.enabled, ownerKey]);
+  }, [capture, options.enabled, options.speakerFilter, ownerKey]);
 
   useEffect(() => {
     const run = runRef.current;
@@ -309,21 +339,23 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
     void run?.dispose();
   }, [finishPermissionPrompt]);
 
-  const start = useCallback(async (): Promise<void> => {
+  const start = useCallback(async (press?: HandheldPress): Promise<void> => {
     const transport = transportRef.current;
     const draftOwnerKey = draftOwnerKeyRef.current;
-    if (!transport || !draftOwnerKey || !enabledRef.current || !available || runRef.current?.currentState === "starting"
-      || runRef.current?.currentState === "listening" || runRef.current?.currentState === "submitting") return;
+    if (!transport || !draftOwnerKey || !enabledRef.current || !available || activeVoiceRun(runRef.current)) return;
     rollbackInsertion(false);
     learning.clear();
     usageSessionRef.current = undefined;
     refinementSupportedRef.current = false;
     await preferencesStore.hydrate().catch(() => undefined);
     if (transportRef.current !== transport || !transport.isCurrent()
-      || draftOwnerKeyRef.current !== draftOwnerKey || !enabledRef.current) return;
+      || draftOwnerKeyRef.current !== draftOwnerKey || !enabledRef.current || press?.released !== undefined
+      || activeVoiceRun(runRef.current)) return;
     baseDraftRef.current = cloneMobileComposerDraft(readDraftRef.current());
     baseSelectionRef.current = { ...readSelectionRef.current() };
     setError(undefined);
+    clearTimeout(speakerNoticeTimer.current);
+    setSpeakerNotice(undefined);
     const dictionary = preferencesStore.snapshot;
     if (dictionary.status === "ready" && dictionary.document.recognitionContextEnabled
       && dictionary.document.recognitionContextData.length > 0 && !recognitionContextSupportedRef.current) {
@@ -356,9 +388,24 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
       start: (...args) => capture.start(...args),
       release: () => capture.release()
     } : capture;
+    const showSpeakerNotice = (notice: MobileSpeakerNotice) => {
+      if (transportRef.current?.surfaceOwnerKey !== transport.surfaceOwnerKey
+        || draftOwnerKeyRef.current !== draftOwnerKey || !enabledRef.current || !transport.isCurrent()) return;
+      clearTimeout(speakerNoticeTimer.current);
+      setSpeakerNotice(notice);
+      speakerNoticeTimer.current = setTimeout(() => setSpeakerNotice(undefined), SPEAKER_FILTER_NOTICE_MS);
+    };
     const run = new MobileVoiceInputRun({
       transport,
       capture: runCapture,
+      ...(options.speakerFilter ? {
+        createAudioGate: async (signal: AbortSignal) => {
+          const { mobileSpeakerGate } = await import("./speaker-filter/mobile-speaker-filter");
+          signal.throwIfAborted();
+          return mobileSpeakerGate(transport.profileId, showSpeakerNotice, signal);
+        },
+        onAudioGateUnavailable: () => showSpeakerNotice("unavailable")
+      } : {}),
       requestId: () => requestIdRef.current(),
       locale: localeRef.current,
       ...(refinement === undefined ? {} : { refinement }),
@@ -371,8 +418,9 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
       onUpdate: (update) => handleUpdate(update, transport.surfaceOwnerKey, draftOwnerKey)
     });
     runRef.current = run;
+    if (press) press.run = run;
     await run.start().catch(() => undefined);
-  }, [available, capture, finishPermissionPrompt, handleUpdate, learning, options.permissionPromptConnection, preferencesStore, rollbackInsertion]);
+  }, [available, capture, finishPermissionPrompt, handleUpdate, learning, options.permissionPromptConnection, options.speakerFilter, preferencesStore, rollbackInsertion]);
 
   const stop = useCallback(async (): Promise<void> => {
     await runRef.current?.stop().catch(() => undefined);
@@ -393,6 +441,34 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
     else if (current !== "submitting") await start();
   }, [start, stop]);
 
+  const handheldStart = useRef(start);
+  handheldStart.current = start;
+  useEffect(() => {
+    if (!options.handheld || !options.enabled || ownerKey === undefined || options.draftOwnerKey === undefined) return;
+    const native = mobileHandheld();
+    if (!native) return;
+    let held: HandheldPress | undefined;
+    const release = (phase: "end" | "cancel"): void => {
+      if (!held) return;
+      held.released = phase;
+      const run = held.run;
+      held = undefined;
+      if (!run || runRef.current !== run) return;
+      if (phase === "end" && AppState.currentState === "active") void run.stop().catch(() => undefined);
+      else void run.cancel();
+    };
+    const listener = native.addListener("onVoiceKey", ({ phase }) => {
+      if (phase === "tap") return;
+      if (phase === "end" || phase === "cancel") return release(phase);
+      if (AppState.currentState !== "active" || !enabledRef.current || transportRef.current?.isCurrent() !== true) return;
+      if (!held) {
+        held = {};
+        void handheldStart.current(held);
+      }
+    });
+    return () => { listener.remove(); release("cancel"); };
+  }, [options.draftOwnerKey, options.enabled, options.handheld, ownerKey]);
+
   return {
     available,
     checking,
@@ -400,7 +476,8 @@ export function useMobileVoiceInput(options: UseMobileVoiceInputOptions): Mobile
     busy: state === "starting" || state === "listening" || state === "submitting",
     ...(state === "listening" ? { elapsedLabel: formatVoiceElapsed(elapsedSeconds) } : {}),
     ...(error === undefined ? {} : { error }),
-    start,
+    ...(speakerNotice === undefined ? {} : { speakerNotice }),
+    start: () => start(),
     stop,
     cancel,
     toggle,

@@ -2967,11 +2967,13 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
               resolveRouteReference={(target) => resolveComposerRouteReferenceFromRuntime(controller, target, t("session.unnamed"))}
             />
             {voice.draftError !== undefined && <p className="composer__error" role="alert">{voice.draftError}</p>}
+            {voice.update?.state === "done" && voice.speakerNotice && <small role="status">{voice.speakerNotice}</small>}
             <ModelSourceNotice key={JSON.stringify([profileScope, selectionKey, modelKey])} controller={controller} backend={backend} selection={modelSelection} model={selectedModel} t={t} />
             {voice.update !== undefined && voice.update.state !== "done" && voice.update.state !== "cancelled" && voice.update.state !== "idle" && <VoiceInputOverlay
               state={voice.phase ?? voice.update.state}
               transcript={voice.update.session?.result?.text ?? voice.update.session?.draft?.text ?? ""}
               error={voice.error}
+              speakerNotice={voice.speakerNotice}
               stallWarning={voice.update.session?.stallWarning === true}
               canUseTranscript={voice.update.session?.result !== undefined && (voice.update.session.failure?.transcriptKept === true || voice.update.session.result.salvaged)}
               onStop={() => { void voice.finish(); }}

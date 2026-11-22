@@ -284,6 +284,36 @@ describe("VoiceInputMediaSession", () => {
     expect(capture.stop).toHaveBeenCalledOnce();
     expect(track.stop).toHaveBeenCalledOnce();
   });
+
+  it.each(["active", "disabled", "unavailable"] as const)("uses the local desktop speaker decision before appending PCM (%s)", async mode => {
+    const api = voiceApi();
+    api.getVoiceInputCapabilities = vi.fn(async () => ({ ...capability, limits: { ...capability.limits, supportedMimeTypes: ["audio/pcm"] } }));
+    api.startVoiceInput = vi.fn(async () => voiceSession());
+    api.appendVoiceAudio = vi.fn(async (_id, sequence) => voiceSession({ nextChunkSequence: sequence + 1n }));
+    api.stopVoiceInput = vi.fn(async () => voiceSession({ state: "done", outcome: "success" }));
+    const capture = new FakePcmCapture(), notice = vi.fn();
+    const owner = { audio: new Uint8Array(640).fill(2), durationMs: 20, voiced: true };
+    const other = { audio: new Uint8Array(640).fill(1), durationMs: 20, voiced: true };
+    const silence = { ...other, audio: new Uint8Array(other.audio.length), voiced: false };
+    const speaker = {
+      status: vi.fn(), download: vi.fn(), enroll: vi.fn(), configure: vi.fn(), remove: vi.fn(),
+      begin: vi.fn(async () => mode === "active" ? { mode, id: "voice-filter" } as const : { mode }),
+      push: vi.fn().mockResolvedValueOnce({ chunks: [owner] }).mockResolvedValueOnce({ chunks: [] }),
+      finish: vi.fn(async () => ({ chunks: [silence], notice: "filtered" as const })), cancel: vi.fn()
+    };
+    const media = new VoiceInputMediaSession({ ownerWindow: window, api, pcmCaptureFactory: () => capture,
+      mediaDevices: { getUserMedia: vi.fn(async () => fakeStream(new FakeTrack())) }, preferences: { playInteractionSound: false },
+      speaker: { api: speaker, profileId: "paired-node" }, onSpeakerNotice: notice });
+    await media.start();
+    capture.emit(owner); capture.emit(other);
+    await media.stop();
+    expect(speaker.begin).toHaveBeenCalledExactlyOnceWith("paired-node");
+    expect(speaker.push).toHaveBeenCalledTimes(mode === "active" ? 2 : 0);
+    expect(api.appendVoiceAudio).toHaveBeenNthCalledWith(1, "voice-one", 1n, owner.audio, 20, true);
+    expect(api.appendVoiceAudio).toHaveBeenNthCalledWith(2, "voice-one", 2n,
+      mode === "active" ? silence.audio : other.audio, 20, mode !== "active");
+    expect(notice.mock.calls).toEqual(mode === "active" ? [["filtered"]] : mode === "unavailable" ? [["unavailable"]] : []);
+  });
 });
 
 class FakeTrack extends EventTarget {

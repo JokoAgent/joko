@@ -14,6 +14,8 @@ import type {
 } from "./mobile-voice-dictionary";
 import type { MobileVoiceDictionaryApi } from "./mobile-voice-dictionary-service";
 import { normalizeMobileVoiceRecognitionContext, type MobileVoiceRecognitionContext } from "./mobile-voice-recognition-context";
+import type { AudioGate } from "@joko/voice-speaker";
+import { PendingMobileAudioGate } from "./speaker-filter/pending-audio-gate";
 
 const TERMINAL_POLL_INTERVAL_MS = 180;
 const IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
@@ -170,6 +172,8 @@ export class MobileVoiceRunError extends Error {
 export interface MobileVoiceRunOptions {
   readonly transport: MobileVoiceTransport;
   readonly capture: MobileVoiceCaptureRuntime;
+  readonly createAudioGate?: (signal: AbortSignal) => Promise<AudioGate | undefined>;
+  readonly onAudioGateUnavailable?: () => void;
   readonly requestId: () => string;
   readonly locale?: string;
   readonly refinement?: MobileVoiceRefinementContext;
@@ -185,6 +189,8 @@ export interface MobileVoiceRunOptions {
 export class MobileVoiceInputRun {
   readonly #transport: MobileVoiceTransport;
   readonly #capture: MobileVoiceCaptureRuntime;
+  readonly #createAudioGate?: MobileVoiceRunOptions["createAudioGate"];
+  readonly #onAudioGateUnavailable: () => void;
   readonly #requestId: () => string;
   readonly #locale: string | undefined;
   readonly #refinement: MobileVoiceRefinementContext | undefined;
@@ -195,12 +201,14 @@ export class MobileVoiceInputRun {
   readonly #setTimer: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
   readonly #clearTimer: (timer: ReturnType<typeof setTimeout>) => void;
   #state: MobileVoiceRunState = "idle";
+  #cancellation?: Promise<void>;
   #capability: MobileVoiceCapability | undefined;
   #session: MobileVoiceSession | undefined;
   #abort: AbortController | undefined;
   #pollAbort: AbortController | undefined;
   #pollTimer: ReturnType<typeof setTimeout> | undefined;
   #stopCapture: (() => Promise<void>) | undefined;
+  #audioGate: AudioGate | undefined;
   #appendChain: Promise<void> = Promise.resolve();
   #startBarrier: Promise<void> = Promise.resolve();
   #releaseStartBarrier: (() => void) | undefined;
@@ -217,6 +225,8 @@ export class MobileVoiceInputRun {
   constructor(options: MobileVoiceRunOptions) {
     this.#transport = options.transport;
     this.#capture = options.capture;
+    this.#createAudioGate = options.createAudioGate;
+    this.#onAudioGateUnavailable = options.onAudioGateUnavailable ?? (() => undefined);
     this.#requestId = options.requestId;
     this.#locale = options.locale;
     this.#refinement = options.refinement;
@@ -238,7 +248,7 @@ export class MobileVoiceInputRun {
   }
 
   async start(): Promise<void> {
-    if (this.#disposed || !["idle", "done", "error", "cancelled"].includes(this.#state)) return;
+    if (this.#disposed || this.#cancellation || !["idle", "done", "error", "cancelled"].includes(this.#state)) return;
     const generation = ++this.#generation;
     this.#stopRequested = false;
     this.#session = undefined;
@@ -283,7 +293,15 @@ export class MobileVoiceInputRun {
       }
       this.#assertOwner();
       this.#backgroundSensitiveResources = true;
-
+      if (this.#createAudioGate) {
+        const gate = new PendingMobileAudioGate(this.#createAudioGate, this.#onAudioGateUnavailable);
+        this.#audioGate = gate;
+        gate.begin((pcm, chunk) => {
+          if (chunk === undefined || !this.#isGeneration(generation)) return;
+          const audio = new Uint8Array(pcm);
+          this.#appendPcm(audio, chunk.durationMs, chunk.voiced && audio.some(byte => byte !== 0), generation);
+        });
+      }
       const requestId = this.#requestId();
       if (!IDENTIFIER_PATTERN.test(requestId)) throw new MobileVoiceRunError("serviceUnavailable");
       const locale = capability.supportsLocale ? normalizeMobileVoiceLocale(this.#locale, capability) : undefined;
@@ -297,7 +315,6 @@ export class MobileVoiceInputRun {
           throw new MobileVoiceRunError("cancelled");
         }
         this.#acceptInitialSession(session);
-        this.#releaseBarrier();
         return session;
       });
       const capturePromise = this.#capture.start(
@@ -317,6 +334,7 @@ export class MobileVoiceInputRun {
       this.#assertOwner();
       if (!this.#isCurrent(generation, abort)) throw new MobileVoiceRunError("cancelled");
       this.#setState("listening", this.#session);
+      this.#releaseBarrier();
       this.#schedulePoll(generation);
       if (this.#stopRequested) {
         this.#stopRequested = false;
@@ -336,6 +354,7 @@ export class MobileVoiceInputRun {
   }
 
   async stop(): Promise<MobileVoiceSession | undefined> {
+    if (this.#cancellation) return undefined;
     if (this.#state === "starting") {
       this.#stopRequested = true;
       // Capture and the service handshake start concurrently. Release an
@@ -353,6 +372,9 @@ export class MobileVoiceInputRun {
       await this.#finishCapture();
       try { this.#onCaptureStopped(); }
       catch { /* Optional local feedback must not fail transcription. */ }
+      const gate = this.#audioGate;
+      await gate?.finish();
+      if (this.#audioGate === gate) this.#discardAudioGate();
       await this.#appendChain;
       if (!this.#isGeneration(generation) || this.#session === undefined) return undefined;
       if (isMobileVoiceTerminal(this.#session)) return this.#session;
@@ -373,22 +395,28 @@ export class MobileVoiceInputRun {
     }
   }
 
-  async cancel(): Promise<void> {
-    if (this.#state === "cancelled" || this.#state === "done") return;
+  cancel(): Promise<void> {
+    if (this.#cancellation) return this.#cancellation;
+    if (this.#state === "cancelled" || this.#state === "done") return Promise.resolve();
     ++this.#generation;
     this.#stopRequested = false;
     const id = this.#session?.id;
+    this.#session = undefined;
+    const cancellation = Promise.resolve().then(async () => {
+      await this.#finishCapture().catch(() => undefined);
+      this.#setState("cancelled");
+      if (id !== undefined) await this.#transport.cancel(id).catch(() => undefined);
+    }).finally(() => { this.#cancellation = undefined; });
+    this.#cancellation = cancellation;
     this.#abort?.abort();
+    this.#discardAudioGate();
     this.#recognitionContext = undefined;
     this.#abort = undefined;
     this.#pollAbort?.abort();
     this.#pollAbort = undefined;
     this.#clearPoll();
     this.#releaseBarrier();
-    await this.#finishCapture();
-    this.#session = undefined;
-    this.#setState("cancelled");
-    if (id !== undefined) await this.#transport.cancel(id).catch(() => undefined);
+    return cancellation;
   }
 
   async dispose(): Promise<void> {
@@ -415,6 +443,11 @@ export class MobileVoiceInputRun {
     this.#capturedBytes = nextBytes;
     this.#capturedDurationMs = nextDuration;
     const audio = Uint8Array.from(exact.audio);
+    if (this.#audioGate) this.#audioGate.push(audio.buffer, { durationMs: exact.durationMs, voiced: exact.voiced });
+    else this.#appendPcm(audio, exact.durationMs, exact.voiced, generation);
+  }
+
+  #appendPcm(audio: Uint8Array, durationMs: number, voiced: boolean, generation: number): void {
     this.#appendChain = this.#appendChain.then(async () => {
       await this.#startBarrier;
       if (!this.#isGeneration(generation) || this.#session === undefined
@@ -427,8 +460,8 @@ export class MobileVoiceInputRun {
         this.#session.id,
         sequence,
         audio,
-        exact.durationMs,
-        exact.voiced,
+        durationMs,
+        voiced,
         this.#abort?.signal
       );
       if (!this.#isGeneration(generation)) return;
@@ -439,7 +472,7 @@ export class MobileVoiceInputRun {
       }
       if (result.nextChunkSequence !== sequence + 1n
         || result.acceptedAudioBytes !== priorBytes + audio.byteLength
-        || result.acceptedAudioDurationMs !== priorDuration + exact.durationMs) {
+        || result.acceptedAudioDurationMs !== priorDuration + durationMs) {
         throw new MobileVoiceRunError("serviceUnavailable");
       }
       this.#acceptSession(result);
@@ -513,6 +546,7 @@ export class MobileVoiceInputRun {
   }
 
   async #finishTerminal(session: MobileVoiceSession): Promise<void> {
+    this.#discardAudioGate();
     this.#recognitionContext = undefined;
     this.#pollAbort?.abort();
     this.#pollAbort = undefined;
@@ -539,6 +573,7 @@ export class MobileVoiceInputRun {
     const id = this.#session?.id;
     this.#stopRequested = false;
     this.#abort?.abort();
+    this.#discardAudioGate();
     this.#abort = undefined;
     this.#pollAbort?.abort();
     this.#pollAbort = undefined;
@@ -547,6 +582,11 @@ export class MobileVoiceInputRun {
     await this.#finishCapture();
     this.#setState("error", this.#session, error);
     if (id !== undefined) await this.#transport.cancel(id).catch(() => undefined);
+  }
+
+  #discardAudioGate(): void {
+    this.#audioGate?.abort();
+    this.#audioGate = undefined;
   }
 
   async #finishCapture(): Promise<void> {

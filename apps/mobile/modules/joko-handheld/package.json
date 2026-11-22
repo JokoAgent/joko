@@ -1,0 +1,6 @@
+{
+  "name": "@joko/mobile-handheld",
+  "version": "0.1.0",
+  "private": true,
+  "peerDependencies": { "expo": "*" }
+}

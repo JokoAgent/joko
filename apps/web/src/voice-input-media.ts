@@ -1,4 +1,5 @@
-import { voiceInputRecognitionContextFromTexts, voiceInputRecognitionLocale, type VoiceInputRecognitionContextView } from "@joko/contracts";
+import { voiceInputRecognitionContextFromTexts, voiceInputRecognitionLocale, type VoiceInputRecognitionContextView,
+  type DesktopSpeakerApi, type DesktopSpeakerNotice, type DesktopSpeakerOutput } from "@joko/contracts";
 import type {
   OperationApi,
   VoiceInputCapabilityView,
@@ -61,6 +62,8 @@ export interface VoiceMediaSessionOptions {
   readonly subscribeMicrophoneRelease?: (listener: () => void) => () => void;
   readonly preferences?: VoiceMediaPreferences;
   readonly onUpdate?: (update: VoiceMediaSessionUpdate) => void;
+  readonly speaker?: { readonly api: DesktopSpeakerApi; readonly profileId: string };
+  readonly onSpeakerNotice?: (notice: DesktopSpeakerNotice) => void;
   readonly mediaDevices?: Pick<MediaDevices, "getUserMedia">;
   readonly mediaRecorder?: typeof MediaRecorder;
   readonly pcmCaptureFactory?: VoicePcmCaptureFactory;
@@ -92,6 +95,8 @@ export class VoiceInputMediaSession {
   private readonly preferences: VoiceMediaPreferences;
   private recognitionContext?: VoiceInputRecognitionContextView;
   private readonly onUpdate: (update: VoiceMediaSessionUpdate) => void;
+  private readonly speaker: VoiceMediaSessionOptions["speaker"];
+  private readonly onSpeakerNotice: NonNullable<VoiceMediaSessionOptions["onSpeakerNotice"]>;
   private readonly mediaDevices: Pick<MediaDevices, "getUserMedia">;
   private readonly MediaRecorderClass: typeof MediaRecorder | undefined;
   private readonly pcmCaptureFactory: VoicePcmCaptureFactory | undefined;
@@ -112,6 +117,10 @@ export class VoiceInputMediaSession {
   private acceptedDurationMs = 0;
   private lastChunkAt = 0;
   private appendChain: Promise<void> = Promise.resolve();
+  private speakerChain: Promise<void> = Promise.resolve();
+  private speakerRun?: string;
+  private capturedBytes = 0;
+  private capturedDurationMs = 0;
   private releaseSubscription?: () => void;
   private trackCleanup: Array<() => void> = [];
   private generation = 0;
@@ -127,6 +136,8 @@ export class VoiceInputMediaSession {
     this.recognitionContext = recognitionContext === undefined ? undefined
       : voiceInputRecognitionContextFromTexts(recognitionContext.contextData.map((value) => value.text));
     this.onUpdate = options.onUpdate ?? (() => undefined);
+    this.speaker = options.speaker;
+    this.onSpeakerNotice = options.onSpeakerNotice ?? (() => undefined);
     const mediaDevices = options.mediaDevices ?? options.ownerWindow.navigator.mediaDevices;
     const MediaRecorderClass = options.mediaRecorder ?? options.ownerWindow.MediaRecorder;
     const pcmCaptureFactory = options.pcmCaptureFactory
@@ -183,6 +194,8 @@ export class VoiceInputMediaSession {
       }
       this.stream = stream;
       this.watchTracks(stream);
+      await this.beginSpeaker(mimeType, generation);
+      if (!this.isCurrent(generation) || startAbort.signal.aborted) throw new VoiceMediaError("cancelled");
       const recorder = mimeType === "audio/pcm"
         ? undefined
         : new this.MediaRecorderClass!(stream, { mimeType });
@@ -305,8 +318,52 @@ export class VoiceInputMediaSession {
 
   private readonly handlePcmChunk = (chunk: VoicePcmChunk): void => {
     if (this.state !== "listening" && this.state !== "submitting") return;
-    this.enqueueAudio(chunk.audio, chunk.durationMs, chunk.voiced);
+    const id = this.speakerRun;
+    if (id === undefined || !this.speaker) {
+      this.enqueueAudio(chunk.audio, chunk.durationMs, chunk.voiced);
+      return;
+    }
+    const limits = this.capability!.limits;
+    this.capturedBytes += chunk.audio.length;
+    this.capturedDurationMs += chunk.durationMs;
+    if (chunk.audio.length > limits.maximumAudioChunkBytes || chunk.durationMs > limits.maximumAudioChunkDurationMs
+      || this.capturedBytes > limits.maximumAudioBytes || this.capturedDurationMs > limits.maximumAudioDurationMs) {
+      void this.fail(new VoiceMediaError("audioLimit"));
+      return;
+    }
+    const api = this.speaker.api;
+    this.speakerChain = this.speakerChain.then(async () => {
+      if (this.speakerRun !== id) return;
+      const result = await api.push(id, chunk);
+      if (this.speakerRun === id) this.adoptSpeakerOutput(result);
+    }).catch(() => {
+      if (this.speakerRun === id) void this.fail(new VoiceMediaError("captureFailed"));
+    });
   };
+
+  private async beginSpeaker(mimeType: string, generation: number): Promise<void> {
+    const speaker = this.speaker;
+    if (!speaker) return;
+    try {
+      if (mimeType !== "audio/pcm") {
+        const status = await speaker.api.status(speaker.profileId);
+        if (status.enabled && this.isCurrent(generation)) this.onSpeakerNotice("unavailable");
+        return;
+      }
+      const run = await speaker.api.begin(speaker.profileId);
+      if (run.mode === "active") {
+        if (this.isCurrent(generation)) this.speakerRun = run.id;
+        else await speaker.api.cancel(run.id).catch(() => undefined);
+      } else if (run.mode === "unavailable" && this.isCurrent(generation)) this.onSpeakerNotice("unavailable");
+    } catch {
+      if (this.isCurrent(generation)) this.onSpeakerNotice("unavailable");
+    }
+  }
+
+  private adoptSpeakerOutput(output: DesktopSpeakerOutput): void {
+    if (output.notice) this.onSpeakerNotice(output.notice);
+    for (const chunk of output.chunks) this.enqueueAudio(chunk.audio, chunk.durationMs, chunk.voiced);
+  }
 
   private enqueueAudio(
     source: Uint8Array | (() => Promise<Uint8Array>),
@@ -393,7 +450,16 @@ export class VoiceInputMediaSession {
     if (pcmCapture !== undefined) {
       this.pcmCapture = undefined;
       await pcmCapture.stop();
-      this.stopCaptureResources();
+      this.stopCaptureResources(true);
+      await this.speakerChain;
+      const id = this.speakerRun;
+      if (id !== undefined && this.speaker) {
+        const output = await this.speaker.api.finish(id);
+        if (this.speakerRun === id) {
+          this.speakerRun = undefined;
+          this.adoptSpeakerOutput(output);
+        }
+      }
       return;
     }
     const recorder = this.recorder;
@@ -426,8 +492,13 @@ export class VoiceInputMediaSession {
     this.stopCaptureResources();
   }
 
-  private stopCaptureResources(): void {
+  private stopCaptureResources(keepSpeaker = false): void {
     this.recognitionContext = undefined;
+    if (!keepSpeaker && this.speakerRun !== undefined) {
+      const id = this.speakerRun;
+      this.speakerRun = undefined;
+      void this.speaker?.api.cancel(id).catch(() => undefined);
+    }
     const recorder = this.recorder;
     if (recorder !== undefined) {
       recorder.removeEventListener("dataavailable", this.handleDataAvailable);

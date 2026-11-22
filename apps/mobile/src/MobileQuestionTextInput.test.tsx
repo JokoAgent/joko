@@ -44,8 +44,22 @@ it("hides provisional text and rejects terminal adoption when the question close
   expect(host.querySelector("input")!.value).toBe("original"); expect(changed).not.toHaveBeenCalled();
 });
 
-async function render(onChange: (value: string) => void, enabled = true) {
-  await act(async () => root.render(<MobileQuestionTextInput ownerKey="request/field/other" enabled={enabled} value="original" label="Other"
+it("applies the task speaker filter to the current field and rejects a retired field's transcript", async () => {
+  const first = vi.fn();
+  await render(first, true, true);
+  expect(voice.options).toMatchObject({ speakerFilter: true, draftOwnerKey: "request/field/other" });
+  const write = voice.options!.writeDraft;
+  const next = vi.fn();
+  await render(next, true, false, "other-request/field/other");
+  expect(voice.options).toMatchObject({ speakerFilter: false, draftOwnerKey: "other-request/field/other" });
+  await act(async () => write({ text: "retired", mentions: [], atoms: [], slashCommands: [], attachments: [] }, { start: 7, end: 7 }, true));
+  expect(first).not.toHaveBeenCalled();
+  expect(next).not.toHaveBeenCalled();
+  expect(host.querySelector("input")!.value).toBe("original");
+});
+
+async function render(onChange: (value: string) => void, enabled = true, speakerFilter?: boolean, ownerKey = "request/field/other") {
+  await act(async () => root.render(<MobileQuestionTextInput ownerKey={ownerKey} enabled={enabled} speakerFilter={speakerFilter} value="original" label="Other"
     colors={{ background: "white", surface: "white", ink: "black", muted: "gray", border: "gray", accent: "orange", negative: "red", brandBackground: "white" }}
     locale="en" onChange={onChange} onError={() => undefined} />));
 }

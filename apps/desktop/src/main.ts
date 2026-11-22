@@ -307,6 +307,7 @@ import {
   microphoneMainFrameFromPermissionDetails,
   microphoneMediaTypesFromPermissionDetails
 } from "./microphone-permission.js";
+import { registerDesktopSpeakerIpc } from "./voice-speaker.js";
 import { createProviderModelRefreshHostLifecycle } from "./provider-model-refresh-lifecycle.js";
 import {
   DesktopGlobalShortcutRegistration,
@@ -8827,6 +8828,17 @@ function configureRegionCaptureShortcut(): boolean {
 }
 
 function registerIpc(): void {
+  registerDesktopSpeakerIpc(ipcMain, {
+    directory: () => app.getPath("userData"),
+    assertSource: event => {
+      if (quitting) throw new Error("The voice filter is shutting down.");
+      assertTrustedIpcSender(event);
+    },
+    hasProfile: async profileId => await readCredential(profileId) !== undefined,
+    storageAvailable: secureStorageAvailable,
+    encrypt: text => safeStorage.encryptString(text),
+    decrypt: ciphertext => safeStorage.decryptString(ciphertext)
+  });
   ipcMain.handle("joko:region-capture:configure", (event, occurrence: unknown, owner: unknown, accelerator: unknown) => {
     if (desktopRegionCapture === undefined || quitting
       || !(owner === null || typeof owner === "string" && owner.length >= 1 && owner.length <= 4096)

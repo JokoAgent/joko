@@ -72,5 +72,6 @@ export function QuestionTextInput({ controller, ownerKey, enabled, label, value,
     </span>
     {voice.active && <small role="status">{voice.update?.session?.draft?.text || t(voice.phase === "starting" ? "voice.starting" : voice.phase === "listening" ? "voice.listening" : "voice.submitting")}</small>}
     {(voice.error || voice.draftError) && <small role="alert">{voice.draftError ?? voice.error}</small>}
+    {voice.speakerNotice && <small role="status">{voice.speakerNotice}</small>}
   </div>;
 }

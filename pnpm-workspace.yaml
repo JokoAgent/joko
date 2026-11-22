@@ -14,6 +14,12 @@ overrides:
   '@smithy/core': 3.38.1
   # Use the SDK 57 fix for Swift 6.2 constructor ownership and actor isolation (expo/expo#51040).
   expo-modules-jsi: 57.1.2
+  'sherpa-onnx-node@1.13.8>sherpa-onnx-darwin-arm64': 1.13.8
+  'sherpa-onnx-node@1.13.8>sherpa-onnx-darwin-x64': 1.13.8
+  'sherpa-onnx-node@1.13.8>sherpa-onnx-linux-arm64': 1.13.8
+  'sherpa-onnx-node@1.13.8>sherpa-onnx-linux-x64': 1.13.8
+  'sherpa-onnx-node@1.13.8>sherpa-onnx-win-ia32': 1.13.8
+  'sherpa-onnx-node@1.13.8>sherpa-onnx-win-x64': 1.13.8
   '@jokoagent/linkspan-core': file:.runtime/linkspan-packages/core
   '@jokoagent/linkspan-noise': file:.runtime/linkspan-packages/noise
   '@jokoagent/linkspan-http': file:.runtime/linkspan-packages/http

@@ -4,10 +4,11 @@ import type { VoiceMediaState } from "../voice-input-media.js";
 import type { Translator } from "./types.js";
 import { IconButton } from "./ui.js";
 
-export function VoiceInputOverlay({ state, transcript, error, stallWarning, canUseTranscript = false, t, onStop, onCancel, onRetry, onUseTranscript }: {
+export function VoiceInputOverlay({ state, transcript, error, speakerNotice, stallWarning, canUseTranscript = false, t, onStop, onCancel, onRetry, onUseTranscript }: {
   readonly state: VoiceMediaState | "refining";
   readonly transcript: string;
   readonly error?: string;
+  readonly speakerNotice?: string;
   readonly stallWarning: boolean;
   readonly canUseTranscript?: boolean;
   readonly t: Translator;
@@ -31,6 +32,7 @@ export function VoiceInputOverlay({ state, transcript, error, stallWarning, canU
         <IconButton label={t("voice.cancel")} onClick={onCancel}><X aria-hidden="true" /></IconButton>
       </span>
     </header>
+    {speakerNotice && <small role="status">{speakerNotice}</small>}
     <div className="voice-input-overlay__transcript">
       {failed
         ? <><span role="alert">{error ?? t("voice.errors.serviceUnavailable")}</span>{transcript.trim().length > 0 && <><br /><span>{transcript}</span></>}</>

@@ -260,7 +260,8 @@ beforeAll(async () => {
   for (const name of ["expo-image-picker", "expo-image-manipulator", "expo-image", "expo-sharing", "expo-file-system",
     "expo-media-library", "expo-audio", "expo-network", "expo-secure-store", "expo-notifications", "expo-application"])
     vi.doMock(name, () => new Proxy({}, { get: (_object, key) => key === "then" ? undefined : () => undefined }));
-  vi.doMock("expo-modules-core", () => ({ requireNativeModule: () => ({}), requireOptionalNativeModule: () => ({}),
+  vi.doMock("expo-modules-core", () => ({ requireNativeModule: () => ({}),
+    requireOptionalNativeModule: (name: string) => name === "JokoHandheld" ? null : {},
     NativeModule: class {}, EventEmitter: class {} }));
   vi.doMock("expo", () => ({ requireOptionalNativeModule: () => null }));
   vi.doMock("./mobile-client", () => ({ MobileClient: class { constructor() { return client; } } }));

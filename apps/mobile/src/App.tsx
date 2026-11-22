@@ -321,8 +321,9 @@ import { buildMobileMessageActions, buildMobileMessageCopyText, captureMobileMes
   createMobileSideChatMessageDraft, maximumMobileQueueTextEditSplices, mobileQueueTextSplice, queueItemText, retainedQueueRanges,
   type MobileMessageActionId, type MobileMessageReferenceLease } from "./task-actions";
 import { useMobileVoiceInput, type MobileVoiceInputBinding } from "./use-mobile-voice-input";
+import { mobileHandheld } from "./mobile-handheld";
+import { mobileSpeakerMessage } from "./speaker-filter/messages";
 import { useMobileVoicePermissionSettings } from "./use-mobile-voice-permission-settings";
-import { MobileVoiceDictionaryController } from "./mobile-voice-dictionary-controller";
 import { MobileImageLightbox } from "./MobileImageLightbox";
 import { MobileMediaPlayer } from "./MobileMediaPlayer";
 import type { MobileMediaPlayerStatus } from "./mobile-media-player";
@@ -613,10 +614,6 @@ export function App() {
     } };
     sync(); return client.subscribe(sync);
   }, []);
-  const dictionaryController = useMemo(() => new MobileVoiceDictionaryController(mobileVoicePreferences), []);
-  const nodeDictionary = useSyncExternalStore(
-    (listener) => dictionaryController.subscribe(listener), () => dictionaryController.snapshot
-  );
   const state = useSyncExternalStore((listener) => client.subscribe(listener), () => client.state);
   const theme = useSyncExternalStore(
     (listener) => mobileThemePreferences.subscribe(listener),
@@ -701,15 +698,9 @@ export function App() {
     remoteDesktopLifecycle.current = handler;
     return () => { if (remoteDesktopLifecycle.current === handler) remoteDesktopLifecycle.current = undefined; };
   }, []);
-  const dictionaryTransport = client.voiceDictionaryTransport();
   useEffect(() => {
     readOnlyDictionary.setSources(mobileReadOnlyDictionarySources(state.saved));
   }, [state.saved]);
-  const dictionaryOwnerKey = foreground && page === "settings" ? dictionaryTransport?.ownerKey : undefined;
-  useEffect(() => {
-    dictionaryController.setTransport(dictionaryOwnerKey ? dictionaryTransport : undefined);
-    return () => dictionaryController.setTransport(undefined);
-  }, [dictionaryController, dictionaryOwnerKey]);
   const homeMenuButtonRef = useRef<View>(null);
   const pendingHomeMenuActionRef = useRef<(() => void) | undefined>(undefined);
   const openedIncomingShareRef = useRef<string | undefined>(undefined);
@@ -790,6 +781,7 @@ export function App() {
     void mobileThemePreferences.hydrate();
     void mobileLocalePreferences.hydrate();
     void mobileVoicePreferences.hydrate();
+    void mobileHandheld()?.read().catch(() => undefined);
     void mobileUpdates.start(AppState.currentState === "active");
     let diagnosticsStopped = false;
     let diagnosticsState = AppState.currentState;
@@ -1249,14 +1241,6 @@ export function App() {
                   onVoiceAutoLearningChange={(enabled) => mobileVoicePreferences.setAutoLearningEnabled(enabled)}
                   onVoiceRecognitionContextChange={(enabled, contextData) => mobileVoicePreferences.setRecognitionContext(enabled, contextData)}
                   voiceServiceTransport={foreground ? client.voiceInputSettingsTransport() : undefined}
-                  voicePeerTransport={dictionaryOwnerKey ? dictionaryTransport : undefined}
-                  nodeDictionary={nodeDictionary.ownerKey === dictionaryOwnerKey ? nodeDictionary
-                    : { status: dictionaryOwnerKey ? "loading" : "unavailable", ownerKey: dictionaryOwnerKey, saving: false }}
-                  onVoiceDictionaryRefresh={() => dictionaryController.refresh()}
-                  onVoiceDictionarySyncChange={(enabled) => dictionaryController.setSyncEnabled(enabled)}
-                  onVoiceDictionaryAdd={(value) => dictionaryController.addTerm(value)}
-                  onVoiceDictionaryEdit={(id, text, aliases, revision) => dictionaryController.editEntry(id, text, aliases, revision)}
-                  onVoiceDictionaryDelete={(id, revision) => dictionaryController.deleteEntry(id, revision)}
                   onBack={() => setPage("home")} onConnections={() => setPage("connections")}
                   onDevices={() => setPage("devices")} /> :
                 page === "connections" ? <ConnectionsScreen {...common} onBack={() => setPage("home")}
@@ -2667,6 +2651,8 @@ export function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImpo
   const ownerReady = identity !== undefined && loadedProfileId === profileId && draftReady;
   const voice = useMobileVoiceInput({
     transport: voiceTransport,
+    handheld: true,
+    speakerFilter: true,
     draftOwnerKey: profileId === undefined ? undefined : `new-task\u001f${profileId}`,
     enabled: ownerReady && targetAvailable && state.status === "connected" && !state.busy
       && !mentionBusy && !attachmentBusy && retained === undefined,
@@ -4726,6 +4712,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     command.loaded
   ]));
   const voiceTransport = state.status === "connected" ? client.taskVoiceTransport() : undefined;
+  const useTaskSpeakerFilter = state.taskSource?.kind !== "joined";
   const attachmentControls = composerAvailable ? client.taskAttachmentControls(true) : undefined;
   const attachmentOwnerRef = useRef(attachmentControls?.surfaceOwnerKey);
   const attachmentGenerationRef = useRef(0);
@@ -5410,6 +5397,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   };
   const voice = useMobileVoiceInput({
     transport: voiceTransport,
+    handheld: true,
+    speakerFilter: useTaskSpeakerFilter,
     draftOwnerKey: draftIdentityKey,
     permissionPromptConnection: Platform.OS === "android" && state.taskSource?.kind !== "joined"
       && (state.status === "connected" || state.status === "connecting") ? state.status : undefined,
@@ -8331,7 +8320,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       colors={colors} locale={locale} busy={state.busy || voice.busy || attachmentBusy || !composerOwnerReady || queueEdit !== undefined}
       onClose={() => setComposerAtomId(undefined)} onSavePaste={savePastedTextAtom} onRemove={removeComposerAtom} />
     <MobileInteractionSheet visible={!workerReadOnly && interactionVisible && interactions.length > 0} locale={locale}
-      voiceTransport={voiceTransport} onOpenReference={openQuestionReference}
+      voiceTransport={voiceTransport} speakerFilter={useTaskSpeakerFilter} onOpenReference={openQuestionReference}
       allowPlanEdit={state.taskSource?.kind !== "joined"}
       profileId={taskDraftProfileId} interactions={interactions} selectedId={activeInteractionId}
       busy={state.busy || interactionReceipt?.taskJoinId !== undefined} colors={colors}
@@ -9346,7 +9335,12 @@ function MobileVoiceAction({ voice, colors, locale, disabled }: {
   const controlDisabled = voice.checking || submitting || !voice.busy && disabled === true;
   const label = submitting ? mobileMessage(locale, "voice.transcribing") : recording ? voice.elapsedLabel ?? "0:00"
     : voice.checking ? mobileMessage(locale, "voice.checking") : mobileMessage(locale, "voice.label");
-  return <View style={styles.voiceControls}>
+  return <View style={{ flexShrink: 1, gap: 4 }}>
+    {voice.speakerNotice !== undefined && <Text accessibilityLiveRegion="polite"
+      style={{ color: voice.speakerNotice === "unavailable" ? colors.negative : colors.muted }}>
+      {mobileSpeakerMessage(locale, voice.speakerNotice)}
+    </Text>}
+    <View style={styles.voiceControls}>
     <Pressable accessibilityRole="button" accessibilityLabel={recording
       ? mobileMessage(locale, "voice.stopLabel", { duration: label }) : label}
       accessibilityHint={mobileMessage(locale, "voice.hint")}
@@ -9380,6 +9374,7 @@ function MobileVoiceAction({ voice, colors, locale, disabled }: {
       </>}
     </Pressable>
     {voice.busy && <Action label={mobileMessage(locale, "voice.cancel")} colors={colors} compact danger onPress={() => void voice.cancel()} />}
+    </View>
   </View>;
 }
 

@@ -1,0 +1,13 @@
+apply plugin: 'com.android.library'
+apply plugin: 'expo-module-gradle-plugin'
+
+group = 'app.joko.handheld'
+version = '0.1.0'
+
+android {
+  namespace 'app.joko.handheld'
+  defaultConfig {
+    versionCode 1
+    versionName project.version.toString()
+  }
+}

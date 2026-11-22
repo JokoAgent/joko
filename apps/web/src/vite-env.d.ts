@@ -691,6 +691,7 @@ interface JokoDesktopApi {
       hint: "system-resume" | "screen-unlock" | "meaningful-foreground"
     ) => void): () => void;
   };
+  readonly voiceSpeaker?: import("@joko/contracts").DesktopSpeakerApi;
   readonly microphone: {
     getPermission(): Promise<{ readonly status: "granted" | "denied" | "prompt" | "unknown" }>;
     openSettings(): Promise<boolean>;

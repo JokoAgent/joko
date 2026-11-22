@@ -52,6 +52,7 @@ export * from "./task-sharing.js";
 export * from "./gen/joko/v1/desktop_personal_development_host_pb.js";
 export * from "./gen/joko/v1/desktop_voice_conversation_pb.js";
 export * from "./desktop-speech.js";
+export * from "./desktop-speaker.js";
 export * from "./extra-directory-access.js";
 export * from "./gen/joko/v1/managed_model_runtime_pb.js";
 export * from "./gen/joko/v1/messaging_pb.js";

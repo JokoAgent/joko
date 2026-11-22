@@ -47,6 +47,7 @@
     "@jokoagent/linkspan-iroh-wasm": "*",
     "@jokoagent/linkspan-tailcat-wasm": "*",
     "@joko/remote-desktop-sync": "workspace:*",
+    "@joko/voice-speaker": "workspace:*",
     "@noble/hashes": "2.3.0",
     "@react-native-async-storage/async-storage": "2.2.0",
     "expo": "57.0.17",

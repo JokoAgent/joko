@@ -1,0 +1,10 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "podspecPath": "./ios/JokoSpeakerOnnx.podspec",
+    "modules": ["JokoSpeakerOnnxModule"]
+  },
+  "android": {
+    "modules": ["app.joko.speaker.JokoSpeakerOnnxModule"]
+  }
+}

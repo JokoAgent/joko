@@ -3,6 +3,7 @@ import { defaultVoiceInputSaucSettings, voiceInputSaucEndpoint, voiceInputRecogn
   voiceInputRecognitionLocale, type VoiceInputSaucSettingsView } from "@joko/contracts";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import type { AppController } from "../controller.js";
+import { DesktopSpeakerSettings } from "./DesktopSpeakerSettings.js";
 import { composerVoiceShortcutsConflict } from "../composer-voice-shortcut-conflict.js";
 import { setDesktopGlobalVoiceShortcut } from "../desktop-global-voice-shortcut.js";
 import {
@@ -1010,6 +1011,9 @@ export function VoiceInputSettings({ controller, t }: {
         <div><strong>{t("settings.voiceInputPermission")}</strong><span>{permissionLabel(permission, t)}</span></div>
         {desktopMicrophone !== undefined && permission !== "granted" && <Button tone="ghost" onClick={() => void desktopMicrophone.openSettings()}>{t("settings.voiceInputOpenPermissionSettings")}</Button>}
       </div>
+      {window.jokoDesktop?.voiceSpeaker && controller.state.activeProfile && <DesktopSpeakerSettings
+        key={controller.state.activeProfile.id} api={window.jokoDesktop.voiceSpeaker} profileId={controller.state.activeProfile.id}
+        deviceId={preferences.deviceId} t={t} />}
       <div className="setting-row">
         <div><strong>{t("settings.voiceInputLocale")}</strong><span>{capability.kind === "ready" && !capability.value.supportsLocale ? t("settings.voiceInputLocaleAutomaticHint") : t("settings.voiceInputBody")}</span></div>
         <SelectControl

@@ -13,6 +13,7 @@ import type {
 import { MobileVoicePreferencesStore } from "./mobile-voice-preferences-store";
 import { useMobileVoiceInput, type MobileVoiceInputBinding } from "./use-mobile-voice-input";
 import { EMPTY_MOBILE_VOICE_DICTIONARY } from "./mobile-voice-dictionary";
+import type { MobileHandheldVoiceKey } from "./mobile-handheld";
 
 const appState = vi.hoisted(() => {
   type State = "active" | "background";
@@ -31,6 +32,17 @@ const appState = vi.hoisted(() => {
   return state;
 });
 vi.mock("react-native", () => ({ AppState: appState }));
+const handheld = vi.hoisted(() => {
+  const listeners = new Set<(event: { phase: MobileHandheldVoiceKey }) => void>();
+  return {
+    addListener: (_: string, listener: (event: { phase: MobileHandheldVoiceKey }) => void) => {
+      listeners.add(listener);
+      return { remove: () => listeners.delete(listener) };
+    },
+    send: (phase: MobileHandheldVoiceKey) => { for (const listener of listeners) listener({ phase }); }
+  };
+});
+vi.mock("./mobile-handheld", () => ({ mobileHandheld: () => handheld }));
 vi.mock("./mobile-realtime-audio", () => ({
   mobileVoiceCaptureRuntime: { isAvailable: () => false },
   prewarmMobileRealtimeAudio: () => undefined
@@ -87,6 +99,46 @@ afterEach(async () => {
   root = undefined;
   vi.useRealTimers();
   vi.unstubAllGlobals();
+});
+
+it("routes an Android voice-key hold to the live task once and retires it on a composer change", async () => {
+  const preferences = preferencesStore();
+  const capture: MobileVoiceCaptureRuntime = {
+    isAvailable: () => true, ensurePermission: async () => ({ granted: true, canAskAgain: true }),
+    start: vi.fn(async () => async () => undefined), release: async () => undefined
+  };
+  const transport: MobileVoiceTransport = {
+    profileId: "profile", surfaceOwnerKey: "owner", isCurrent: () => true,
+    getVoiceInputDictionary: async () => ({ revision: 0n, syncEnabled: false, dictionary: EMPTY_MOBILE_VOICE_DICTIONARY, refinementTerms: [] }),
+    applyVoiceInputDictionaryLearning: async () => ({ revision: 0n, syncEnabled: false, dictionary: EMPTY_MOBILE_VOICE_DICTIONARY, refinementTerms: [] }),
+    getCapabilities: async () => voiceCapability, adviseVoiceInputDictionaryEdit: async () => ({ actions: [] }),
+    start: vi.fn(async () => session()),
+    append: async () => session(), get: async () => session(),
+    stop: vi.fn(async () => session({ state: "done", outcome: "noSpeech" })),
+    cancel: vi.fn(async () => session({ state: "done", outcome: "cancelled" }))
+  };
+  let voice: MobileVoiceInputBinding;
+  function Harness({ owner }: { owner: string }) {
+    voice = useMobileVoiceInput({ transport, capture, preferencesStore: preferences, draftOwnerKey: owner, handheld: true,
+      enabled: true, readDraft: () => plainTextMobileComposerDraft(""), readSelection: () => ({ start: 0, end: 0 }),
+      writeDraft: () => undefined, onError: () => undefined, requestId: () => "handheld-voice" });
+    return null;
+  }
+  root = createRoot(document.createElement("div"));
+  await act(async () => root!.render(<Harness owner="task-one" />));
+  await vi.waitFor(() => expect(voice.available).toBe(true));
+  await act(async () => handheld.send("tap"));
+  expect(transport.start).not.toHaveBeenCalled();
+  await act(async () => { handheld.send("start"); handheld.send("start"); });
+  expect(transport.start).toHaveBeenCalledOnce();
+  await act(async () => handheld.send("end"));
+  expect(transport.stop).toHaveBeenCalledOnce();
+  await act(async () => handheld.send("start"));
+  expect(transport.start).toHaveBeenCalledTimes(2);
+  await act(async () => root!.render(<Harness owner="task-two" />));
+  await act(async () => handheld.send("end"));
+  expect(transport.cancel).toHaveBeenCalledOnce();
+  expect(transport.stop).toHaveBeenCalledOnce();
 });
 
 describe("useMobileVoiceInput dictionary integration", () => {

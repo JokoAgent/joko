@@ -13,6 +13,8 @@ import {
   VoiceInputTextSource
 } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
+import { SpeakerGate, type AudioGate } from "@joko/voice-speaker";
+import { SPEAKER_PREPARATION_TIMEOUT_MS } from "./speaker-filter/pending-audio-gate";
 import {
   MobileVoiceInputRun,
   MobileVoiceRunError,
@@ -108,6 +110,96 @@ describe("mobile voice protocol projection", () => {
 });
 
 describe("MobileVoiceInputRun", () => {
+  it("starts capture while the filter prepares, holds early PCM and releases it in order", async () => {
+    let prepared!: (gate: AudioGate | undefined) => void;
+    const preparing = new Promise<AudioGate | undefined>(resolve => { prepared = resolve; });
+    const transport = fakeTransport(), capture = fakeCapture();
+    transport.append.mockResolvedValue(voiceSession({ nextChunkSequence: 2n, acceptedAudioBytes: 1_024, acceptedAudioDurationMs: 32 }));
+    const run = new MobileVoiceInputRun({ transport, capture, requestId: () => "request-cold-filter", createAudioGate: () => preparing });
+    try {
+      await run.start();
+      expect(capture.start).toHaveBeenCalledOnce();
+      const other = new Uint8Array(new Int16Array(512).fill(-1500).buffer);
+      capture.emit({ audio: other, durationMs: 32, voiced: true });
+      expect(transport.append).not.toHaveBeenCalled();
+      prepared(new SpeakerGate({
+        windowSec: 0.032, minVerifySec: 0.032, prerollSec: 0, enrolledEmbedding: new Float32Array([1, 0]),
+        engine: { resetVad: async () => undefined, detectSpeech: async () => [true], embed: async () => new Float32Array([0, 1]) }
+      }));
+      await run.stop();
+      expect(transport.append).toHaveBeenCalledExactlyOnceWith("voice-one", 1n, new Uint8Array(other.length), 32, false, expect.any(AbortSignal));
+    } finally { await run.dispose(); }
+  });
+
+  it.each([false, true])("bounds pending speaker preparation and retires it on cancel (%s)", async cancelled => {
+    vi.useFakeTimers();
+    const transport = fakeTransport(), capture = fakeCapture(), unavailable = vi.fn();
+    transport.append.mockResolvedValue(voiceSession({ nextChunkSequence: 2n, acceptedAudioBytes: 1_024, acceptedAudioDurationMs: 32 }));
+    const begin = vi.fn(), abort = vi.fn();
+    let prepared!: (gate: AudioGate) => void;
+    const preparing = new Promise<AudioGate>(resolve => { prepared = resolve; });
+    const run = new MobileVoiceInputRun({ transport, capture, requestId: () => "request-stalled-filter",
+      createAudioGate: () => preparing, onAudioGateUnavailable: unavailable });
+    try {
+      await run.start();
+      const pcm = new Uint8Array(new Int16Array(512).fill(1500).buffer);
+      capture.emit({ audio: pcm, durationMs: 32, voiced: true });
+      expect(transport.append).not.toHaveBeenCalled();
+      if (cancelled) await run.cancel();
+      await vi.advanceTimersByTimeAsync(SPEAKER_PREPARATION_TIMEOUT_MS - 1);
+      expect(unavailable).not.toHaveBeenCalled();
+      expect(transport.append).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      prepared({ begin, abort, push: vi.fn(), finish: async () => undefined });
+      if (!cancelled) {
+        await run.stop();
+        expect(unavailable).toHaveBeenCalledOnce();
+        expect(transport.append).toHaveBeenCalledExactlyOnceWith("voice-one", 1n, pcm, 32, true, expect.any(AbortSignal));
+      } else {
+        await vi.advanceTimersByTimeAsync(0);
+        expect(unavailable).not.toHaveBeenCalled();
+        expect(transport.append).not.toHaveBeenCalled();
+        expect(transport.stop).not.toHaveBeenCalled();
+      }
+      expect(begin).not.toHaveBeenCalled();
+      expect(abort).toHaveBeenCalledOnce();
+    } finally { await run.dispose(); vi.useRealTimers(); }
+  });
+
+  it.each([true, false])("filters a second speaker before transport only with an active local gate (%s)", async (filter) => {
+    const transport = fakeTransport();
+    const capture = fakeCapture();
+    const decisions: boolean[] = [];
+    let acceptedAudioBytes = 0, acceptedAudioDurationMs = 0;
+    transport.append.mockImplementation(async (_id: string, sequence: bigint, audio: Uint8Array, durationMs: number) => {
+      acceptedAudioBytes += audio.length; acceptedAudioDurationMs += durationMs;
+      return voiceSession({ nextChunkSequence: sequence + 1n, acceptedAudioBytes, acceptedAudioDurationMs });
+    });
+    const run = new MobileVoiceInputRun({ transport, capture, requestId: () => "request-speaker-filter",
+      ...(filter ? { createAudioGate: async () => new SpeakerGate({
+        windowSec: 0.032, minVerifySec: 0.032, prerollSec: 0,
+        enrolledEmbedding: new Float32Array([1, 0]),
+        engine: { resetVad: async () => undefined,
+          detectSpeech: async samples => Array.from({ length: samples.length / 512 }, () => true),
+          embed: async samples => samples[0]! > 0 ? new Float32Array([1, 0]) : new Float32Array([0, 1]) },
+        onDecision: decision => decisions.push(decision.accepted)
+      }) } : {})
+    });
+    const owner = new Uint8Array(new Int16Array(512).fill(1500).buffer);
+    const other = new Uint8Array(new Int16Array(512).fill(-1500).buffer);
+    await run.start();
+    capture.emit({ audio: owner, durationMs: 32, voiced: true });
+    capture.emit({ audio: other, durationMs: 32, voiced: true });
+    await run.stop();
+    expect(transport.append).toHaveBeenCalledTimes(2);
+    expect(transport.append).toHaveBeenNthCalledWith(1, "voice-one", 1n, owner, 32, true, expect.any(AbortSignal));
+    expect(transport.append).toHaveBeenNthCalledWith(2, "voice-one", 2n,
+      filter ? new Uint8Array(other.length) : other, 32, !filter, expect.any(AbortSignal));
+    expect(decisions).toEqual(filter ? [true, false] : []);
+    expect(transport.stop).toHaveBeenCalledWith("voice-one", 3n, expect.any(AbortSignal));
+    await run.dispose();
+  });
+
   it("freezes recognition context for the run and refuses an explicit request without joint capability", async () => {
     const context = { contextData: [{ text: " First\r\nsecond " }] };
     const transport = fakeTransport();

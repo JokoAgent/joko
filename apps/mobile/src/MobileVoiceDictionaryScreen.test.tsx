@@ -6,13 +6,9 @@ import { MobileVoiceDictionaryScreen, type MobileVoiceDictionaryScreenProps } fr
 import { mobileMessage } from "./mobile-messages";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import type { MobileVoicePreferencesStoreState } from "./mobile-voice-preferences-store";
-import type { MobileVoiceDictionaryControllerState } from "./mobile-voice-dictionary-controller";
-import type { VoiceDictionaryPeerStatusView } from "@joko/contracts";
-import type { MobileVoiceDictionaryTransport } from "./mobile-voice-dictionary-service";
 import { create } from "@bufbuild/protobuf";
 import { VoiceInputServiceSettingsSchema, VoiceInputTranscriptionProtocol, VoiceInputSaucMode, VoiceInputSaucAuthentication, TestVoiceInputConnectionResponseSchema } from "@joko/contracts";
 import type { MobileVoiceSettingsTransport } from "./mobile-voice-service-settings";
-import { dictionaryWatchFixture, idleDictionaryWatch } from "./test/voice-dictionary-watch";
 
 const native = vi.hoisted(() => ({ alert: vi.fn() }));
 
@@ -93,51 +89,6 @@ function voiceState(status: MobileVoicePreferencesStoreState["status"] = "ready"
   };
 }
 
-function nodeDictionary(revision = 8n): MobileVoiceDictionaryControllerState {
-  return {
-    status: "ready", ownerKey: "node-a", saving: false,
-    snapshot: { revision, syncEnabled: true, dictionary: {
-        entries: [
-          { id: "source", text: "Variant", source: "automatic", frequency: 3,
-            aliases: [{ text: "variant old", count: 2, lastSeenAt: 20 }], createdAt: 10, updatedAt: 20 },
-          { id: "target", text: "Canonical", source: "manual", frequency: 4,
-            aliases: [], createdAt: 5, updatedAt: 25 }
-        ],
-        candidates: [{ text: "VoiceKit", evidenceCount: 2,
-          aliases: [{ text: "voice kit", count: 2, lastSeenAt: 22 }], createdAt: 8, updatedAt: 22 }],
-        suppressedAutomaticTexts: []
-      }, refinementTerms: ["Canonical", "Variant"] }
-  };
-}
-
-const peerFingerprint = "b".repeat(64);
-function peerStatus(): VoiceDictionaryPeerStatusView {
-  return { available: true, configurationRevision: 3n, nodeId: "node-a", fingerprint: "a".repeat(64), enabled: true,
-    phase: "waiting", peers: [], candidates: [{ nodeId: "node-b", displayName: "Office", fingerprint: peerFingerprint,
-      seenAt: 1_000, granted: false, keyChanged: false }] };
-}
-function peerTransport(): MobileVoiceDictionaryTransport {
-  const unrelated = async () => { throw new Error("Content is controlled by the screen fixture."); };
-  return { ownerKey: "owner-a", isCurrent: () => true,
-    watchVoiceInputDictionary: vi.fn(idleDictionaryWatch),
-    watchVoiceInputDictionaryPeerStatus: vi.fn(idleDictionaryWatch),
-    getVoiceInputDictionary: unrelated, setVoiceInputDictionarySyncEnabled: unrelated, addVoiceInputDictionaryTerms: unrelated,
-    editVoiceInputDictionaryEntry: unrelated, deleteVoiceInputDictionaryEntry: unrelated, applyVoiceInputDictionaryLearning: unrelated,
-    getVoiceInputDictionaryPeerStatus: vi.fn(async () => peerStatus()),
-    grantVoiceInputDictionaryPeer: vi.fn(async () => peerStatus()),
-    revokeVoiceInputDictionaryPeer: vi.fn(async () => peerStatus()),
-    syncVoiceInputDictionaryNow: vi.fn(async () => peerStatus()),
-    configureVoiceInputDictionaryListener: vi.fn(async () => peerStatus()), getVoiceInputDictionaryPeerInvitation: vi.fn(async () => invitation("node-a", "a")),
-    grantVoiceInputDictionaryDirectPeer: vi.fn(async () => peerStatus()), clearVoiceInputDictionaryPeerRoute: vi.fn(async () => peerStatus()) };
-}
-function invitation(nodeId = "node-b", fingerprint = "b"): string { return JSON.stringify({ version: 1, nodeId, displayName: "Office",
-  publicKey: "MCowBQYDK2VuAyEA" + "A".repeat(43) + "=", fingerprint: fingerprint.repeat(64), host: "peer.example", port: 43_121 }); }
-
-function confirmPeerAlert(): void {
-  const actions = native.alert.mock.calls.at(-1)?.[2] as Array<{ text: string; onPress?: () => void }>;
-  actions.find((action) => action.text === mobileMessage("en", "settings.voicePeers.confirm"))?.onPress?.();
-}
-
 let root: Root | undefined;
 let container: HTMLElement;
 
@@ -162,17 +113,11 @@ function render(locale: MobileSupportedLocale, overrides: Partial<MobileVoiceDic
     colors,
     locale,
     state: voiceState(),
-    dictionary: nodeDictionary(),
-    onRefreshDictionary: vi.fn(async () => undefined),
-    onSetSyncEnabled: vi.fn(async () => undefined),
     onBack: vi.fn(),
     onRetry: vi.fn(async () => undefined),
     onReset: vi.fn(async () => undefined),
     onSetInstructions: vi.fn(async () => undefined),
     onSetAutoLearning: vi.fn(async () => undefined),
-    onAddTerm: vi.fn(async () => undefined),
-    onEditEntry: vi.fn(async () => "updated" as const),
-    onDeleteEntry: vi.fn(async () => undefined),
     ...overrides
   };
   act(() => root!.render(createElement(MobileVoiceDictionaryScreen, props)));
@@ -252,94 +197,15 @@ describe("MobileVoiceDictionaryScreen", () => {
     act(() => button("Review current revision").click());
     expect(button("Save configuration").disabled).toBe(false);
   });
-  it("configures and exports a listener, confirms an exact direct invitation, clears its route and retires native confirmations", async () => {
-    const peer = peerTransport();
-    const updates = dictionaryWatchFixture<VoiceDictionaryPeerStatusView>();
-    vi.mocked(peer.watchVoiceInputDictionaryPeerStatus).mockImplementation(updates.watch);
-    await act(async () => { render("en", { peerTransport: peer }); });
-    change(mobileMessage("en", "settings.voicePeers.listenPort"), "43121");
-    change(mobileMessage("en", "settings.voicePeers.publicHost"), "peer.example");
-    change(mobileMessage("en", "settings.voicePeers.publicPort"), "43121");
-    const configured = { ...peerStatus(), configurationRevision: 4n, listener: { listenPort: 43_121, host: "peer.example", port: 43_121 } };
-    vi.mocked(peer.configureVoiceInputDictionaryListener).mockResolvedValue(configured);
-    await act(async () => button(mobileMessage("en", "settings.voicePeers.saveListener")).click());
-    expect(peer.configureVoiceInputDictionaryListener).toHaveBeenCalledExactlyOnceWith(3n, configured.listener, expect.any(AbortSignal));
-    await act(async () => button(mobileMessage("en", "settings.voicePeers.exportInvitation")).click());
-    expect(container.querySelector(`[aria-label="${mobileMessage("en", "settings.voicePeers.invitation")}"]`)!.textContent).toBe(invitation("node-a", "a"));
-    change(mobileMessage("en", "settings.voicePeers.pasteInvitation"), invitation());
-    act(() => button(mobileMessage("en", "settings.voicePeers.previewInvitation")).click());
-    expect(native.alert.mock.calls.at(-1)?.[1]).toContain(peerFingerprint);
-    expect(native.alert.mock.calls.at(-1)?.[1]).toContain("peer.example:43121");
-    const granted = { ...configured, configurationRevision: 5n, candidates: [], peers: [{ peerId: "node-b", revision: 5n,
-      displayName: "Office", fingerprint: peerFingerprint, online: false, grantedAt: 1_000, route: { host: "peer.example", port: 43_121 } }] };
-    vi.mocked(peer.grantVoiceInputDictionaryDirectPeer).mockResolvedValue(granted);
-    await act(async () => confirmPeerAlert());
-    expect(peer.grantVoiceInputDictionaryDirectPeer).toHaveBeenCalledExactlyOnceWith(4n, invitation(), peerFingerprint, expect.any(AbortSignal));
-    expect(container.textContent).toContain(mobileMessage("en", "settings.voicePeers.offline"));
-    const cleared = { ...granted, configurationRevision: 6n, peers: [{ ...granted.peers[0]!, route: undefined }] };
-    vi.mocked(peer.clearVoiceInputDictionaryPeerRoute).mockResolvedValue(cleared);
-    await act(async () => button(mobileMessage("en", "settings.voicePeers.clearRoute")).click());
-    expect(peer.clearVoiceInputDictionaryPeerRoute).toHaveBeenCalledExactlyOnceWith(5n, "node-b", expect.any(AbortSignal));
-    expect(peer.revokeVoiceInputDictionaryPeer).not.toHaveBeenCalled();
-    act(() => button(mobileMessage("en", "settings.voicePeers.previewInvitation")).click());
-    await act(async () => updates.push({ ...cleared, configurationRevision: 7n }));
-    await act(async () => confirmPeerAlert());
-    expect(peer.grantVoiceInputDictionaryDirectPeer).toHaveBeenCalledOnce();
-    expect(container.textContent).toContain(mobileMessage("en", "settings.voicePeers.failed"));
-    act(() => button(mobileMessage("en", "settings.voicePeers.previewInvitation")).click());
-    await act(async () => render("en", { peerTransport: undefined }));
-    await act(async () => render("en", { peerTransport: peer }));
-    await act(async () => confirmPeerAlert());
-    expect(peer.grantVoiceInputDictionaryDirectPeer).toHaveBeenCalledOnce();
-    expect(container.textContent).not.toContain(mobileMessage("en", "settings.voicePeers.saved"));
-  });
-  it.each(["en", "zh-CN", "zh-TW", "ja", "ko"] as const)("renders node dictionary and private preferences in %s", (locale) => {
-    render(locale);
-    expect(container.textContent).toContain(mobileMessage(locale, "settings.voice.title"));
-    expect(container.textContent).toContain(mobileMessage(locale, "settings.voice.privacy"));
-    expect(container.textContent).toContain(mobileMessage(locale, "settings.voice.entries"));
-    expect(container.textContent).toContain(mobileMessage(locale, "settings.voice.candidates"));
+  it.each(["en", "zh-CN"] as const)("opens the read-only node dictionary from voice settings in %s", locale => {
+    const open = vi.fn();
+    render(locale, { onReadOnlyDictionary: open });
+    act(() => button(mobileMessage(locale, "settings.voiceReadonly.title")).click());
+    expect(open).toHaveBeenCalledOnce();
+    for (const key of ["settings.voice.addTerm", "settings.voice.saveEntry", "settings.voice.deleteEntry", "settings.voice.sync"] as const) {
+      expect(Array.from(container.querySelectorAll("[aria-label]")).some(entry => entry.getAttribute("aria-label") === mobileMessage(locale, key))).toBe(false);
+    }
     expect(container.textContent).toContain(mobileMessage(locale, "settings.voice.localActivity"));
-    expect(container.textContent).toContain(mobileMessage(locale, "settings.voice.syncHint"));
-    expect(button(mobileMessage(locale, "settings.voice.confirmCandidate", { term: "VoiceKit" }))).toBeTruthy();
-  });
-
-  it("keeps an edit draft across locale changes, previews a merge, reports the result, and restores input focus", async () => {
-    const onEditEntry = vi.fn(async () => "mergedEntry" as const);
-    render("en", { onEditEntry });
-    act(() => button(mobileMessage("en", "settings.voice.edit", { term: "Variant" })).click());
-    change(mobileMessage("en", "settings.voice.term"), "Canonical");
-    expect(container.textContent).toContain(mobileMessage("en", "settings.voice.mergeEntry", { term: "Canonical" }));
-    render("ja", { onEditEntry });
-    expect((container.querySelector(`[aria-label="${mobileMessage("ja", "settings.voice.term")}"]`) as HTMLInputElement).value)
-      .toBe("Canonical");
-    await act(async () => button(mobileMessage("ja", "settings.voice.saveEntry")).click());
-    expect(onEditEntry).toHaveBeenCalledWith("source", "Canonical", "variant old", 8n);
-    expect(container.textContent).toContain(mobileMessage("ja", "settings.voice.merged"));
-    expect(document.activeElement?.getAttribute("aria-label")).toBe(mobileMessage("ja", "settings.voice.term"));
-  });
-
-  it("keeps a conflicting editor draft and its frozen revision until the user explicitly reviews the latest version", async () => {
-    const onEditEntry = vi.fn(async () => "updated" as const).mockRejectedValueOnce(new Error("revision conflict"));
-    render("en", { onEditEntry });
-    act(() => button(mobileMessage("en", "settings.voice.edit", { term: "Variant" })).click());
-    change(mobileMessage("en", "settings.voice.term"), "Canonical");
-    await act(async () => button(mobileMessage("en", "settings.voice.saveEntry")).click());
-    render("en", { onEditEntry, dictionary: nodeDictionary(9n) });
-    expect((container.querySelector(`[aria-label="${mobileMessage("en", "settings.voice.term")}"]`) as HTMLInputElement).value).toBe("Canonical");
-    expect(container.textContent).toContain(mobileMessage("en", "settings.voice.conflict"));
-    expect(onEditEntry).toHaveBeenCalledWith("source", "Canonical", "variant old", 8n);
-    act(() => button(mobileMessage("en", "settings.voice.reviewLatest")).click());
-    await act(async () => button(mobileMessage("en", "settings.voice.saveEntry")).click());
-    expect(onEditEntry).toHaveBeenLastCalledWith("source", "Canonical", "variant old", 9n);
-  });
-
-  it("disables unavailable node edits while keeping private instructions editable", () => {
-    render("en", { dictionary: { status: "unavailable", saving: false } });
-    expect(container.textContent).toContain(mobileMessage("en", "settings.voice.nodeUnavailable"));
-    expect((container.querySelector(`[aria-label="${mobileMessage("en", "settings.voice.instructions")}"]`) as HTMLInputElement).disabled).toBe(false);
-    expect(button(mobileMessage("en", "settings.voice.addTerm")).disabled).toBe(true);
-    expect((container.querySelector(`[aria-label="${mobileMessage("en", "settings.voice.sync")}"]`) as HTMLInputElement).disabled).toBe(true);
   });
 
   it("distinguishes failed private history from the node dictionary result", () => {
@@ -365,44 +231,4 @@ describe("MobileVoiceDictionaryScreen", () => {
     expect(onReset).toHaveBeenCalledOnce();
   });
 
-  it("requires a native confirmation with the full fingerprint and never rebases its frozen revision on a live update", async () => {
-    const peer = peerTransport();
-    const updates = dictionaryWatchFixture<VoiceDictionaryPeerStatusView>();
-    vi.mocked(peer.watchVoiceInputDictionaryPeerStatus).mockImplementation(updates.watch);
-    await act(async () => { render("en", { peerTransport: peer }); });
-    act(() => button(mobileMessage("en", "settings.voicePeers.allow")).click());
-    expect(native.alert).toHaveBeenCalledWith(expect.any(String), expect.stringContaining(peerFingerprint), expect.any(Array));
-    expect(peer.grantVoiceInputDictionaryPeer).not.toHaveBeenCalled();
-    await act(async () => { updates.push({ ...peerStatus(), configurationRevision: 4n }); });
-    await act(async () => { confirmPeerAlert(); });
-    expect(peer.grantVoiceInputDictionaryPeer).toHaveBeenCalledExactlyOnceWith(3n, "node-b", peerFingerprint, expect.any(AbortSignal));
-    expect(container.textContent).toContain(mobileMessage("en", "settings.voicePeers.saved"));
-  });
-
-  it("does not revive a native alert after backgrounding and returning to the same node", async () => {
-    const peer = peerTransport();
-    await act(async () => { render("en", { peerTransport: peer }); });
-    act(() => button(mobileMessage("en", "settings.voicePeers.allow")).click());
-    await act(async () => { render("en", { peerTransport: undefined }); });
-    await act(async () => { render("en", { peerTransport: peer }); });
-    await act(async () => { confirmPeerAlert(); });
-    expect(peer.grantVoiceInputDictionaryPeer).not.toHaveBeenCalled();
-    expect(container.textContent).not.toContain(mobileMessage("en", "settings.voicePeers.saved"));
-  });
-
-  it("allows revocation while sharing is off and forbids authorizing a changed key", async () => {
-    const peer = peerTransport();
-    const value = { ...peerStatus(), enabled: false, phase: "off" as const,
-      peers: [{ peerId: "node-b", revision: 2n, displayName: "Office", fingerprint: peerFingerprint, online: false, grantedAt: 100 }],
-      candidates: [{ ...peerStatus().candidates[0]!, fingerprint: "c".repeat(64), keyChanged: true }] };
-    vi.mocked(peer.getVoiceInputDictionaryPeerStatus).mockResolvedValue(value);
-    await act(async () => { render("en", { peerTransport: peer }); });
-    expect(button(mobileMessage("en", "settings.voicePeers.syncNow")).disabled).toBe(true);
-    expect(button(mobileMessage("en", "settings.voicePeers.allow")).disabled).toBe(true);
-    expect(container.textContent).toContain(mobileMessage("en", "settings.voicePeers.keyChanged"));
-    act(() => button(mobileMessage("en", "settings.voicePeers.revoke")).click());
-    expect(native.alert.mock.calls.at(-1)?.[1]).toContain(peerFingerprint);
-    await act(async () => { confirmPeerAlert(); });
-    expect(peer.revokeVoiceInputDictionaryPeer).toHaveBeenCalledExactlyOnceWith("node-b", 2n, expect.any(AbortSignal));
-  });
 });

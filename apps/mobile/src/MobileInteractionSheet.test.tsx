@@ -1,13 +1,18 @@
 // @vitest-environment jsdom
-import { act, createElement, type ReactNode } from "react";
+import { act, createElement, type ComponentProps, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind } from "@joko/contracts";
+import { InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk, PlanReviewDecisionKind,
+  QuestionMultipleChoiceInputSchema, QuestionSingleChoiceInputSchema, QuestionTextInputSchema, type QuestionField } from "@joko/contracts";
 import { expect, it, vi } from "vitest";
 import { mobileMessage } from "./mobile-messages";
 import { createMobileInteractionResolution } from "./mobile-interactions";
+import type { MobileQuestionTextInput } from "./MobileQuestionTextInput";
 
-const native = vi.hoisted(() => ({ alert: vi.fn(), textInputs: new Map<string, (text: string) => void>() }));
+const native = vi.hoisted(() => ({
+  alert: vi.fn(), textInputs: new Map<string, (text: string) => void>(),
+  questionInput: vi.fn<(props: ComponentProps<typeof MobileQuestionTextInput>) => null>(() => null)
+}));
 
 vi.mock("react-native", () => {
   const box = ({ children }: { children?: ReactNode }) => createElement("div", {}, children);
@@ -40,13 +45,52 @@ vi.mock("./MobileKeyboardAvoidingView", () => ({
   MobileKeyboardAvoidingView: ({ children }: { children?: ReactNode }) => createElement("div", {}, children),
   useMobileKeyboardState: () => ({ height: 0, visible: false })
 }));
-vi.mock("./MobileQuestionTextInput", () => ({ MobileQuestionTextInput: () => null }));
+vi.mock("./MobileQuestionTextInput", () => ({ MobileQuestionTextInput: native.questionInput }));
 vi.mock("./storage", () => ({ mobileInteractionDrafts: { subscribeErrors: () => () => undefined } }));
 
 import { MobileInteractionSheet } from "./MobileInteractionSheet";
 
 const colors = { background: "#fff", surface: "#fff", ink: "#111", muted: "#666", border: "#ccc", accent: "#f90",
   negative: "#b00", brandBackground: "#eee" };
+
+it.each(["text", "singleChoice", "multipleChoice"] as const)("passes the task voice filter to an allowed %s answer", async kind => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const host = document.body.appendChild(document.createElement("div"));
+  const root = createRoot(host);
+  const choices = [{ choiceId: "first", label: "First" }, { choiceId: "second", label: "Second" }];
+  const input: QuestionField["input"] = kind === "text"
+    ? { case: kind, value: create(QuestionTextInputSchema) }
+    : kind === "singleChoice"
+      ? { case: kind, value: create(QuestionSingleChoiceInputSchema, { choices, allowOther: true }) }
+      : { case: kind, value: create(QuestionMultipleChoiceInputSchema, { choices, allowOther: true }) };
+  const question = create(InteractionSchema, {
+    interactionId: "voice-question", kind: InteractionKind.QUESTION, state: InteractionState.PENDING,
+    backendId: "codex", targetId: "target", sessionId: "task", generation: 2n,
+    version: { revision: { value: 3n }, generation: 2n },
+    request: { case: "question", value: { fields: [{ fieldId: "answer", label: "Answer", input }] } }
+  });
+  const render = (interaction = question, visible = true) => act(async () => {
+    root.render(<MobileInteractionSheet visible={visible} interactions={[interaction]} busy={false} colors={colors} locale="en"
+      speakerFilter onSelect={() => undefined} onMinimize={() => undefined} onResolve={async () => false}
+      onDismiss={async () => true} onError={() => undefined} />);
+  });
+  try {
+    await render();
+    expect(native.questionInput.mock.lastCall?.[0]).toMatchObject({
+      speakerFilter: true, enabled: true, ownerKey: expect.stringMatching(kind === "text" ? /:answer$/u : /:answer:other$/u)
+    });
+    await render(question, false);
+    expect(native.questionInput.mock.lastCall?.[0].enabled).toBe(false);
+    native.questionInput.mockClear();
+    await render(create(InteractionSchema, { ...question, state: InteractionState.EXPIRED }));
+    expect(native.questionInput).not.toHaveBeenCalled();
+  } finally {
+    await act(async () => root.unmount());
+    host.remove();
+    native.questionInput.mockClear();
+    vi.unstubAllGlobals();
+  }
+});
 
 it("submits the exact changed plan only when approving its original editable request", async () => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;

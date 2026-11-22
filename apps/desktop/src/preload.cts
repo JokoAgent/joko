@@ -1,4 +1,5 @@
 import type { DesktopRemoteDesktopViewerOwner, MenubarState, MenubarSettings, DesktopMenubarSnapshot, DesktopMenubarAction, ListDesktopLocalAgentsResponse } from "@joko/contracts";
+import type { DesktopSpeakerApi } from "@joko/contracts";
 import type {
   DesktopAppInfo,
   DesktopCodeHostLoginScope,
@@ -894,6 +895,17 @@ const desktopApi = Object.freeze({
       ipcRenderer.on(DESKTOP_CHANNELS.providerModelRefreshLifecycle, wrapped);
       return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.providerModelRefreshLifecycle, wrapped);
     }
+  }),
+  voiceSpeaker: Object.freeze<DesktopSpeakerApi>({
+    status: (id) => ipcRenderer.invoke("joko:voice-speaker", "status", id),
+    download: (id) => ipcRenderer.invoke("joko:voice-speaker", "download", id),
+    enroll: (id, clips) => ipcRenderer.invoke("joko:voice-speaker", "enroll", id, clips),
+    configure: (id, change) => ipcRenderer.invoke("joko:voice-speaker", "configure", id, change),
+    remove: (id) => ipcRenderer.invoke("joko:voice-speaker", "remove", id),
+    begin: (id) => ipcRenderer.invoke("joko:voice-speaker", "begin", id),
+    push: (id, chunk) => ipcRenderer.invoke("joko:voice-speaker", "push", id, chunk),
+    finish: (id) => ipcRenderer.invoke("joko:voice-speaker", "finish", id),
+    cancel: (id) => ipcRenderer.invoke("joko:voice-speaker", "cancel", id)
   }),
   microphone: Object.freeze({
     getPermission: (): Promise<DesktopMicrophonePermissionSnapshot> =>

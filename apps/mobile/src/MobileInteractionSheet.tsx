@@ -82,6 +82,7 @@ export function MobileInteractionSheet({
   onError,
   allowPlanEdit = false,
   voiceTransport,
+  speakerFilter,
   onOpenReference
 }: {
   readonly visible: boolean;
@@ -100,6 +101,7 @@ export function MobileInteractionSheet({
   readonly onError: (message: string) => void;
   readonly allowPlanEdit?: boolean;
   readonly voiceTransport?: MobileVoiceTransport;
+  readonly speakerFilter?: boolean;
   readonly onOpenReference?: (interactionId: string, href: string) => void;
 }) {
   const interaction = interactions.find((candidate) => candidate.interactionId === selectedId) ?? interactions[0];
@@ -312,7 +314,8 @@ export function MobileInteractionSheet({
                   colors={colors} locale={locale} onResolve={decision => void settle({ kind: "permission", decision })} />
                 : interaction.request.case === "question" && draft?.kind === "question"
                   ? <QuestionRequest interaction={interaction} draft={draft} disabled={responseDisabled || !visible} colors={colors} locale={locale}
-                    ownerKey={identityKey ?? authorityKey ?? interaction.interactionId} voiceTransport={voiceTransport} onError={onError} onOpenReference={onOpenReference}
+                    ownerKey={identityKey ?? authorityKey ?? interaction.interactionId} voiceTransport={voiceTransport} speakerFilter={speakerFilter}
+                    onError={onError} onOpenReference={onOpenReference}
                     onDraft={updateDraft} onResolve={(answers) => void settle({ kind: "question", answers })} />
                   : interaction.request.case === "planReview" && draft?.kind === "plan"
                     ? <PlanRequest interaction={interaction} draft={draft} disabled={responseDisabled} colors={colors} locale={locale}
@@ -381,7 +384,7 @@ function PermissionRequest({ interaction, disabled, colors, locale, onResolve }:
   </View>;
 }
 
-function QuestionRequest({ interaction, draft, disabled, colors, locale, ownerKey, voiceTransport, onError, onOpenReference, onDraft, onResolve }: {
+function QuestionRequest({ interaction, draft, disabled, colors, locale, ownerKey, voiceTransport, speakerFilter, onError, onOpenReference, onDraft, onResolve }: {
   readonly interaction: Interaction;
   readonly draft: Extract<MobileInteractionDraft, { readonly kind: "question" }>;
   readonly disabled: boolean;
@@ -391,6 +394,7 @@ function QuestionRequest({ interaction, draft, disabled, colors, locale, ownerKe
   readonly onResolve: (answers: MobileQuestionAnswers) => void;
   readonly ownerKey: string;
   readonly voiceTransport?: MobileVoiceTransport;
+  readonly speakerFilter?: boolean;
   readonly onError: (message: string) => void;
   readonly onOpenReference?: (interactionId: string, href: string) => void;
 }) {
@@ -418,7 +422,8 @@ function QuestionRequest({ interaction, draft, disabled, colors, locale, ownerKe
       <QuestionReferenceText text={`${field.label || field.fieldId}${field.required ? " *" : ""}`} color={colors.ink} accent={colors.accent} onOpen={onOpenReference && (href => onOpenReference(interaction.interactionId, href))} />
       {field.description.trim() !== "" && <QuestionReferenceText text={field.description} color={colors.muted} accent={colors.accent} onOpen={onOpenReference && (href => onOpenReference(interaction.interactionId, href))} />}
       <QuestionFieldInput key={field.fieldId} field={field} answer={answer} disabled={disabled} colors={colors} locale={locale} onChange={updateAnswer}
-        ownerKey={`${ownerKey}:${field.fieldId}`} voiceTransport={voiceTransport} onError={onError} onOpenReference={onOpenReference && (href => onOpenReference(interaction.interactionId, href))} />
+        ownerKey={`${ownerKey}:${field.fieldId}`} voiceTransport={voiceTransport} speakerFilter={speakerFilter}
+        onError={onError} onOpenReference={onOpenReference && (href => onOpenReference(interaction.interactionId, href))} />
       {fieldError !== undefined && <Text accessibilityRole="alert" style={[sheetStyles.fieldError, { color: colors.negative }]}>{fieldError}</Text>}
     </View>
     <View style={sheetStyles.requestNavigation}>
@@ -436,7 +441,7 @@ function QuestionRequest({ interaction, draft, disabled, colors, locale, ownerKe
   </View>;
 }
 
-function QuestionFieldInput({ field, answer, disabled, colors, locale, ownerKey, voiceTransport, onError, onOpenReference, onChange }: {
+function QuestionFieldInput({ field, answer, disabled, colors, locale, ownerKey, voiceTransport, speakerFilter, onError, onOpenReference, onChange }: {
   readonly field: QuestionField;
   readonly answer: MobileQuestionAnswerDraft | undefined;
   readonly disabled: boolean;
@@ -445,11 +450,13 @@ function QuestionFieldInput({ field, answer, disabled, colors, locale, ownerKey,
   readonly onChange: (answer: MobileQuestionAnswerDraft | undefined) => void;
   readonly ownerKey: string;
   readonly voiceTransport?: MobileVoiceTransport;
+  readonly speakerFilter?: boolean;
   readonly onError: (message: string) => void;
   readonly onOpenReference?: (href: string) => void;
 }) {
   const input = field.input;
-  if (input.case === "text") return <MobileQuestionTextInput ownerKey={ownerKey} transport={voiceTransport} colors={colors} locale={locale} onError={onError} label={field.label || field.fieldId}
+  if (input.case === "text") return <MobileQuestionTextInput ownerKey={ownerKey} transport={voiceTransport} speakerFilter={speakerFilter}
+    colors={colors} locale={locale} onError={onError} label={field.label || field.fieldId}
     multiline={input.value.multiline} enabled={!disabled} value={answer?.kind === "text" ? answer.value : ""}
     placeholder={input.value.placeholder || mobileMessage(locale, "interaction.answerPlaceholder")}
     onChange={(value) => onChange({ kind: "text", value })}
@@ -472,7 +479,8 @@ function QuestionFieldInput({ field, answer, disabled, colors, locale, ownerKey,
         <ChoiceRow label={mobileMessage(locale, "common.other")} role="radio" disabled={disabled}
           selected={answer?.kind === "single" && answer.selection.kind === "other"}
           colors={colors} onPress={() => onChange(setMobileQuestionOther(field, answer, other))} />
-        <MobileQuestionTextInput ownerKey={`${ownerKey}:other`} transport={voiceTransport} colors={colors} locale={locale} onError={onError}
+        <MobileQuestionTextInput ownerKey={`${ownerKey}:other`} transport={voiceTransport} speakerFilter={speakerFilter}
+          colors={colors} locale={locale} onError={onError}
           label={mobileMessage(locale, "interaction.otherLabel", { field: field.label || field.fieldId })} enabled={!disabled}
           value={other} placeholder={mobileMessage(locale, "interaction.otherPlaceholder")}
           onFocus={() => onChange(setMobileQuestionOther(field, answer, other))}
@@ -495,7 +503,8 @@ function QuestionFieldInput({ field, answer, disabled, colors, locale, ownerKey,
           onPress={() => onChange(toggleMobileQuestionChoice(field, answer, choice.choiceId))} />;
       })}
       {input.value.allowOther && <View style={sheetStyles.otherStack}>
-        <MobileQuestionTextInput ownerKey={`${ownerKey}:other`} transport={voiceTransport} colors={colors} locale={locale} onError={onError}
+        <MobileQuestionTextInput ownerKey={`${ownerKey}:other`} transport={voiceTransport} speakerFilter={speakerFilter}
+          colors={colors} locale={locale} onError={onError}
           label={mobileMessage(locale, "interaction.otherLabel", { field: field.label || field.fieldId })} enabled={!disabled && (!atMaximum || other !== "")}
           value={other} placeholder={mobileMessage(locale, "interaction.addOtherPlaceholder")}
           onChange={(value) => onChange(setMobileQuestionOther(field, answer, value))}

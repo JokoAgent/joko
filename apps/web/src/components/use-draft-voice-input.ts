@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { AppController } from "../controller.js";
+import type { DesktopSpeakerNotice } from "@joko/contracts";
 import { recordVoiceInputSession } from "../voice-input-history.js";
 import { supportsVoiceMediaCapture, VoiceInputMediaSession, type VoiceMediaSessionUpdate } from "../voice-input-media.js";
 import { VoiceInputMicrophonePrewarmer } from "../voice-input-prewarm.js";
@@ -40,6 +41,7 @@ export function useDraftVoiceInput<T>(options: DraftVoiceInputOptions<T>) {
   const [preferences, setPreferences] = useState(readVoiceInputPreferences);
   const [update, setUpdate] = useState<VoiceMediaSessionUpdate>();
   const [draftError, setDraftError] = useState<string>();
+  const [speakerNotice, setSpeakerNotice] = useState<DesktopSpeakerNotice>();
   const [startedAt, setStartedAt] = useState<number>();
   const captureRef = useRef<Capture<T> | undefined>(undefined);
   const prewarmerRef = useRef<VoiceInputMicrophonePrewarmer | undefined>(undefined);
@@ -49,6 +51,11 @@ export function useDraftVoiceInput<T>(options: DraftVoiceInputOptions<T>) {
   const connected = options.controller.state.connectionState === "connected";
   const scope = useMemo(() => ({}), [options.ownerKey, options.root, ownerDocument, options.controller.getArtifactUrl, connected, options.controller.state.snapshot.generation]);
   const scopeRef = useRef<object | undefined>(undefined);
+  useEffect(() => {
+    if (!speakerNotice) return;
+    const timeout = setTimeout(() => setSpeakerNotice(undefined), 4_000);
+    return () => clearTimeout(timeout);
+  }, [speakerNotice, scope]);
   const live = useCallback((): boolean => scopeRef.current === scope && latest.current.enabled && connected
     && options.root?.isConnected === true && options.root.ownerDocument === ownerDocument && ownerWindow != null && !ownerWindow.closed,
   [scope, connected, options.root, ownerDocument, ownerWindow]);
@@ -72,12 +79,12 @@ export function useDraftVoiceInput<T>(options: DraftVoiceInputOptions<T>) {
   useEffect(() => subscribeVoiceInputPreferences(setPreferences), []);
   useLayoutEffect(() => {
     scopeRef.current = scope;
-    setUpdate(undefined); setDraftError(undefined); setStartedAt(undefined);
+    setUpdate(undefined); setDraftError(undefined); setStartedAt(undefined); setSpeakerNotice(undefined);
     const suspend = (): void => {
       if (scopeRef.current !== scope) return;
       scopeRef.current = undefined;
       void retire()?.media.cancel(); prewarmerRef.current?.release();
-      setUpdate(undefined); setStartedAt(undefined);
+      setUpdate(undefined); setStartedAt(undefined); setSpeakerNotice(undefined);
     };
     const resume = (): void => {
       if (options.root?.isConnected && options.root.ownerDocument === ownerDocument) scopeRef.current = scope;
@@ -94,7 +101,7 @@ export function useDraftVoiceInput<T>(options: DraftVoiceInputOptions<T>) {
   }, [scope, options.root, ownerDocument, ownerWindow, retire]);
   useEffect(() => {
     if (options.enabled) return;
-    void retire()?.media.cancel(); setUpdate(undefined); setStartedAt(undefined);
+    void retire()?.media.cancel(); setUpdate(undefined); setStartedAt(undefined); setSpeakerNotice(undefined);
   }, [options.enabled, retire]);
   useEffect(() => {
     setSupported(false);
@@ -131,14 +138,21 @@ export function useDraftVoiceInput<T>(options: DraftVoiceInputOptions<T>) {
     if (!supported || !live() || ownerWindow == null) return false;
     const previous = captureRef.current;
     if (previous !== undefined && ["starting", "listening", "submitting"].includes(previous.media.currentState)) return false;
-    void retire()?.media.cancel(); setDraftError(undefined); setStartedAt(undefined);
+    void retire()?.media.cancel(); setDraftError(undefined); setStartedAt(undefined); setSpeakerNotice(undefined);
     const applyTranscript = latest.current.capture();
     let settle!: (value: VoiceDraftCompletion<T>) => void;
     const completion = new Promise<VoiceDraftCompletion<T>>((resolve) => { settle = resolve; });
     try {
       const locale = voiceInputLocale(preferences);
+      const speakerApi = ownerWindow.jokoDesktop?.voiceSpeaker;
+      const profileId = latest.current.controller.state.activeProfile?.id;
       const media = new VoiceInputMediaSession({
         api: latest.current.controller, ownerWindow, subscribeMicrophoneRelease: window.jokoDesktop?.microphone?.onRelease,
+        ...(speakerApi && profileId ? { speaker: { api: speakerApi, profileId } } : {}),
+        onSpeakerNotice: notice => {
+          const capture = captureRef.current;
+          if (capture?.media === media && current(capture)) setSpeakerNotice(notice);
+        },
         preferences: {
           ...(locale === undefined ? {} : { locale }), ...(preferences.deviceId === undefined ? {} : { deviceId: preferences.deviceId }),
           ...(preferences.refinementInstructions === "" ? {} : { refinementInstructions: preferences.refinementInstructions }),
@@ -178,7 +192,7 @@ export function useDraftVoiceInput<T>(options: DraftVoiceInputOptions<T>) {
   const cancel = useCallback((): void => {
     const capture = captureRef.current;
     const restore = capture !== undefined && current(capture) ? capture.focus : undefined;
-    void retire()?.media.cancel(); setUpdate(undefined); setDraftError(undefined); setStartedAt(undefined);
+    void retire()?.media.cancel(); setUpdate(undefined); setDraftError(undefined); setStartedAt(undefined); setSpeakerNotice(undefined);
     if (restore !== undefined && ownerWindow != null) frameRef.current = ownerWindow.requestAnimationFrame(() => {
       frameRef.current = undefined; if (live() && captureRef.current === undefined) restore();
     });
@@ -199,6 +213,7 @@ export function useDraftVoiceInput<T>(options: DraftVoiceInputOptions<T>) {
     return capture !== undefined && current(capture) ? capture : undefined;
   }, [current]);
   return { supported, active, isActive, getCaptureIdentity, update, draftError, start, finish, cancel, useTranscript, preferences, startedAt, ownerDocument, ownerWindow, scope,
+    speakerNotice: speakerNotice === undefined ? undefined : options.t(`voice.speaker.${speakerNotice}`),
     phase: update?.session?.state === "refining" ? "refining" as const : update?.state,
     error: update === undefined ? undefined : draftVoiceError(update, options.t) };
 }

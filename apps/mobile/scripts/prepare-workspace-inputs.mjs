@@ -3,7 +3,8 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
-const buildArguments = ["--filter", "@joko/connection-transport...", "--filter", "@joko/remote-desktop-sync", "--if-present", "build"];
+const buildArguments = ["--filter", "@joko/connection-transport...", "--filter", "@joko/remote-desktop-sync",
+  "--filter", "@joko/voice-speaker", "--if-present", "build"];
 
 /** Client inputs consume the Linkspan source packages prepared before installation. */
 export function prepareMobileWorkspaceInputs() {

@@ -28,7 +28,6 @@ import {
 import type { MobileThemePreferenceState } from "./mobile-theme-preference";
 import type { MobileDiagnosticsState } from "./mobile-diagnostics";
 import type { MobileLocalePreferenceState } from "./mobile-locale-preference";
-import { EMPTY_MOBILE_VOICE_DICTIONARY } from "./mobile-voice-dictionary";
 import { MobileDeviceAuthorizationSettings } from "./MobileDeviceAuthorizationSettings";
 import type { DeviceAuthorizationOwner, DeviceAuthorizationView } from "@joko/connection-transport/device-authorization";
 import { MobileVoiceDictionaryReadOnlyCache } from "./mobile-voice-dictionary-readonly-cache";
@@ -46,6 +45,9 @@ const native = vi.hoisted(() => ({
 }));
 
 vi.mock('expo-camera', () => ({ CameraView: () => null, useCameraPermissions: () => [undefined, vi.fn()] }));
+vi.mock("./mobile-handheld", () => ({ mobileHandheld: () => null }));
+vi.mock("./speaker-filter/native", () => ({ isSpeakerOnnxAvailable: () => false }));
+vi.mock("./MobileSpeakerFilterScreen", () => ({ MobileSpeakerFilterScreen: () => null }));
 
 vi.mock("react-native", async () => {
   const React = await import("react");
@@ -337,8 +339,6 @@ function mount(options: {
     diagnostics,
     voiceDictionary,
     readOnlyDictionary,
-    nodeDictionary: { status: "ready", ownerKey: "node", saving: false,
-      snapshot: { revision: 1n, syncEnabled: false, dictionary: EMPTY_MOBILE_VOICE_DICTIONARY, refinementTerms: [] } },
     updates,
     push,
     updateActions: { onChannelChange, onCheck, onReset },
@@ -354,11 +354,6 @@ function mount(options: {
     onVoiceDictionaryReset: vi.fn(async () => undefined),
     onVoiceInstructionsChange: vi.fn(async () => undefined),
     onVoiceAutoLearningChange: vi.fn(async () => undefined),
-    onVoiceDictionaryRefresh: vi.fn(async () => undefined),
-    onVoiceDictionarySyncChange: vi.fn(async () => undefined),
-    onVoiceDictionaryAdd: vi.fn(async () => undefined),
-    onVoiceDictionaryEdit: vi.fn(async () => "updated" as const),
-    onVoiceDictionaryDelete: vi.fn(async () => undefined),
     onBack,
     onConnections,
     onDevices,
