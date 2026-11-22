@@ -44,11 +44,15 @@ vi.mock("./MobileComposerRichInput", async () => {
 vi.mock("./MobileMarkdownMessage", async () => { const React = await import("react"); return { MobileMarkdownMessage: ({ text }: { text: string }) => React.createElement("span", {}, text) }; });
 vi.mock("./MobileInteractionSheet", () => ({ MobileInteractionSheet: () => null }));
 vi.mock("./MobileImageLightbox", () => ({ MobileImageLightbox: () => null }));
+vi.mock("./MobileMediaPlayer", () => ({ MobileMediaPlayer: () => null }));
+vi.mock("./MobileModelViewer", () => ({ MobileModelViewer: () => null }));
 vi.mock("./MobileGroupIcon", () => ({ MobileGroupIcon: () => null }));
 vi.mock("./MobileActionSheet", async () => { const React = await import("react"); return { MobileActionSheet: ({ visible, items, onClose, onAction }: { visible: boolean; items: readonly { id: string; label: string; disabled?: boolean }[]; onClose(): void; onAction(id: string): void }) => visible ? React.createElement("div", {}, items.map(item => React.createElement("button", { key: item.id, "aria-label": item.label, disabled: item.disabled, onClick: () => { onClose(); onAction(item.id); } }, item.label))) : null }; });
 vi.mock("./MobilePhotoLibrarySheet", () => ({ MobilePhotoLibrarySheet: () => null }));
 vi.mock("./mobile-image-output", () => ({ mobileImageOutput: { perform: vi.fn() } }));
 vi.mock("expo-image", () => ({ Image: () => null }));
+vi.mock("expo", () => ({ requireOptionalNativeModule: () => null }));
+vi.mock("react-native-webview", () => ({ WebView: () => null }));
 vi.mock("react-native-safe-area-context", async () => {
   const React = await import("react");
   return { SafeAreaView: ({ children }: { children: React.ReactNode }) => React.createElement("div", {}, children),
@@ -98,7 +102,8 @@ vi.mock("react-native", async () => {
       style: undefined
     }, props.children);
   return {
-    AppState: { currentState: "active", addEventListener: () => ({ remove() {} }) }, Platform: { get OS() { return native.platform; } },
+    AppState: { currentState: "active", addEventListener: () => ({ remove() {} }) },
+    Platform: { get OS() { return native.platform; }, select: (options: Record<string, unknown>) => options[native.platform] ?? options.default },
     ActivityIndicator: () => React.createElement("span", { "data-loading": true }),
     BackHandler: { addEventListener: (_name: string, handler: () => boolean) => {
       native.back = handler;

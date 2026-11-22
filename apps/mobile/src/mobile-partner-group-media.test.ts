@@ -4,6 +4,8 @@ import { createHash } from "node:crypto";
 import sharp from "sharp";
 import { expect, it, vi } from "vitest";
 import { createMobileGroupMedia } from "./mobile-partner-group-media";
+import { MobileMediaPreviewFiles } from "./mobile-media-preview";
+import { MobileModelPreviewFiles } from "./mobile-model-preview";
 import type { MobilePdfPreviewLease } from "./mobile-pdf-preview";
 
 async function fixture(file?: { readonly mediaType: string; readonly name: string; readonly category: wire.PartnerGroupAttachmentCategory; readonly bytes: Uint8Array }) {
@@ -18,10 +20,20 @@ async function fixture(file?: { readonly mediaType: string; readonly name: strin
   const pdf: MobilePdfPreviewLease = { profileId: "group-owner", leaseId: "pdf-preview", uri: "file:///preview-pdf-preview.pdf",
     fileName: "preview-pdf-preview.pdf", mediaType: "application/pdf", localByteSize: bytes.length, sha256Hex: blob.sha256Hex };
   const pdfFiles = { stage: vi.fn(async () => pdf), remove: vi.fn(async () => {}) };
+  const driver = {
+    prepare: vi.fn(async () => undefined),
+    write: vi.fn(async (fileName: string, bytes: Uint8Array) =>
+      ({ uri: `file:///preview/${fileName}`, fileName, byteSize: bytes.length, bytes })),
+    remove: vi.fn(async () => undefined)
+  };
+  const digest = async (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
   const tools = createMobileGroupMedia({ ownerKey: "group-owner", api: { get } as unknown as wire.PartnerGroupApi,
     newId: () => `media-${++next}`, current: signal => { signal.throwIfAborted(); if (!current) throw new Error("Owner changed"); },
-    thumbnail: async () => undefined, download, authorize: vi.fn(), pdfPreview: { profileId: "group-owner", files: pdfFiles } });
-  return { tools, group, message, attachment, bytes, blob, get, download, pdf, pdfFiles, hide: () => { visible = false; }, retire: () => { current = false; } };
+    thumbnail: async () => undefined, download, authorize: vi.fn(), pdfPreview: { profileId: "group-owner", files: pdfFiles },
+    mediaPreview: { profileId: "group-owner", files: new MobileMediaPreviewFiles(driver, digest) },
+    modelPreview: { profileId: "group-owner", files: new MobileModelPreviewFiles(driver, digest) } });
+  return { tools, group, message, attachment, bytes, blob, get, download, pdf, pdfFiles, driver,
+    hide: () => { visible = false; }, retire: () => { current = false; } };
 }
 it("revalidates a cached group image against its exact message and requires confirmed current bytes for image output", async () => {
   const f = await fixture(), signal = new AbortController().signal;
@@ -69,3 +81,52 @@ it("gives the PDF viewer a verified local lease and retires it if group access c
   await expect(f.tools.prepareMediaFile(f.group, f.message, f.attachment, signal)).rejects.toThrow(/source changed/u);
   expect(f.pdfFiles.remove).toHaveBeenCalledTimes(2);
 });
+
+it.each([
+  { name: "voice.wav", mediaType: "audio/wav", bytes: new TextEncoder().encode("RIFF\0\0\0\0WAVE"),
+    expected: { kind: "media", media: { mediaKind: "audio" } } },
+  { name: "demo.webm", mediaType: "video/webm", bytes: new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, ...new TextEncoder().encode("webm\0V_VP9")]),
+    expected: { kind: "media", media: { mediaKind: "video" } } },
+  { name: "scene.glb", mediaType: "model/gltf-binary", bytes: groupGlb(),
+    expected: { kind: "model", model: { modelKind: "glb", references: [] } } }
+])("opens a verified original $name and cleans up the native viewer lease", async ({ name, mediaType, bytes, expected }) => {
+  const f = await fixture({ name, mediaType, bytes, category: wire.PartnerGroupAttachmentCategory.FILE });
+  const signal = new AbortController().signal;
+  const open = () => f.tools.prepareMediaFile(f.group, f.message, f.attachment, signal);
+  const preview = await open();
+  expect(preview).toMatchObject(expected);
+  const [fileName, written] = f.driver.write.mock.calls[0]!;
+  expect(fileName).toMatch(/^preview-/u);
+  if (preview.kind === "model") {
+    const descriptor = preview.model.files[0]!;
+    expect(written.slice(descriptor.byteOffset, descriptor.byteOffset + descriptor.byteSize)).toEqual(bytes);
+  } else expect(written).toEqual(bytes);
+  await f.tools.releaseMediaFile(preview);
+  expect(f.driver.remove).toHaveBeenCalledTimes(1);
+  f.driver.write.mockImplementationOnce(async (fileName, bytes) => {
+    f.retire();
+    return { uri: `file:///preview/${fileName}`, fileName, byteSize: bytes.length, bytes };
+  });
+  await expect(open()).rejects.toThrow(/Owner changed/u);
+  expect(f.driver.remove).toHaveBeenCalledTimes(2);
+});
+
+it("rejects a group video whose authorized bytes use an audio container", async () => {
+  const f = await fixture({ category: wire.PartnerGroupAttachmentCategory.FILE, name: "demo.webm", mediaType: "video/webm",
+    bytes: new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, ...new TextEncoder().encode("webm\0A_OPUS")]) });
+  await expect(f.tools.prepareMediaFile(f.group, f.message, f.attachment, new AbortController().signal)).rejects.toThrow(/container/u);
+  expect(f.driver.write).not.toHaveBeenCalled();
+});
+
+function groupGlb(): Uint8Array {
+  const json = new TextEncoder().encode('{"asset":{"version":"2.0"}} ');
+  const bytes = new Uint8Array(20 + json.length);
+  const header = new DataView(bytes.buffer);
+  header.setUint32(0, 0x46546c67, true);
+  header.setUint32(4, 2, true);
+  header.setUint32(8, bytes.length, true);
+  header.setUint32(12, json.length, true);
+  header.setUint32(16, 0x4e4f534a, true);
+  bytes.set(json, 20);
+  return bytes;
+}

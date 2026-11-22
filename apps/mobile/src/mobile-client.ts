@@ -2382,6 +2382,8 @@ export class MobileClient {
     const transport: import("./mobile-partner-groups").MobileGroupAttachmentTransport = { ownerKey: context.authorityKey, profileId: context.credential.profileId, photoLibrary,
       ...createMobileGroupMedia({ ownerKey: context.authorityKey, api, newId: this.newId, current, fileShare: this.fileShare,
         pdfPreview: this.pdfPreviewFiles === undefined ? undefined : { profileId: context.credential.profileId, files: this.pdfPreviewFiles },
+        mediaPreview: this.mediaPreviewFiles === undefined ? undefined : { profileId: context.credential.profileId, files: this.mediaPreviewFiles },
+        modelPreview: this.modelPreviewFiles === undefined ? undefined : { profileId: context.credential.profileId, files: this.modelPreviewFiles },
         thumbnail: (blob, signal) => this.network.readImageThumbnail(context.credential, blob, 256, signal),
         download: (blob, signal) => this.network.downloadBlob(context.credential, blob, signal), authorize: (blob, signal) => this.network.authorizeBlobDownload(context.credential, blob, signal) }),
       ...createMobileGroupImageTools({ files, profileId: context.credential.profileId, newId: this.newId, current, policy: policyFor }),

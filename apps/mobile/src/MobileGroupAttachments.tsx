@@ -13,6 +13,8 @@ import { MobileImageLightbox } from "./MobileImageLightbox";
 import { mobileImageOutput } from "./mobile-image-output";
 import { mobileMessage } from "./mobile-messages";
 import { MobilePdfViewer } from "./MobilePdfViewer";
+import { MobileMediaPlayer } from "./MobileMediaPlayer";
+import { MobileModelViewer } from "./MobileModelViewer";
 import { MobileFileTextPreview } from "./MobileFileTextPreview";
 import type { MobileGroupFilePreview } from "./mobile-partner-group-media";
 
@@ -118,6 +120,13 @@ function GroupFilePreview({ group, message, attachment, transport, colors, local
         : preview?.kind === "pdf" ? <MobilePdfViewer style={styles.fileViewer} {...colors} title={attachment.name} locale={locale}
           fileName={preview.pdf.fileName} byteSize={preview.pdf.localByteSize} instanceId={preview.pdf.leaseId}
           uri={preview.pdf.uri} sha256Hex={preview.pdf.sha256Hex} />
+        : preview?.kind === "media" ? <MobileMediaPlayer key={preview.media.leaseId} style={styles.fileViewer}
+          background={colors.background} border={colors.border} ink={colors.ink} surface={colors.surface}
+          instanceId={preview.media.leaseId} kind={preview.media.mediaKind} locale={locale} mediaType={preview.media.mediaType}
+          title={attachment.name} uri={preview.media.uri} />
+        : preview?.kind === "model" ? <MobileModelViewer key={preview.model.leaseId} style={styles.fileViewer}
+          background={colors.background} border={colors.border} ink={colors.ink} surface={colors.surface}
+          accent={colors.accent} muted={colors.muted} lease={preview.model} locale={locale} title={attachment.name} />
         : preview?.kind === "unsupported" ? <Text style={[styles.fileNotice, { color: colors.muted }]}>{mobileMessage(locale, "task.fileFallback")}</Text>
         : <ActivityIndicator accessibilityLabel={mobileMessage(locale, "preview.loadingExact")} color={colors.accent} style={styles.fileNotice} />}
     </SafeAreaView>

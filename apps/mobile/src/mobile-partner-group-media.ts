@@ -10,11 +10,15 @@ import type { MobileImageOutputSource } from "./mobile-image-output";
 import { MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES, type AuthorizedBlobDownload } from "./network";
 import type { MobileFileShare } from "./mobile-file-share";
 import { isMobilePdfPreviewMediaType, type MobilePdfPreviewFiles, type MobilePdfPreviewLease } from "./mobile-pdf-preview";
+import { mobileMediaPreviewKind, type MobileMediaPreviewFiles, type MobileMediaPreviewLease } from "./mobile-media-preview";
+import { mobileModelPreviewKind, type MobileModelPreviewFiles, type MobileModelPreviewLease } from "./mobile-model-preview";
 import { isTextFilePreviewMetadata, normalizeMediaType, type MobileFilePreview } from "./workspace-files";
 
 export type MobileGroupFilePreview =
   | Extract<MobileFilePreview, { kind: "text" }>
   | { readonly kind: "pdf"; readonly pdf: MobilePdfPreviewLease }
+  | { readonly kind: "media"; readonly media: MobileMediaPreviewLease }
+  | { readonly kind: "model"; readonly model: MobileModelPreviewLease }
   | { readonly kind: "unsupported" };
 
 /** Group media uses the original authenticated Blob and native image owners. */
@@ -25,6 +29,8 @@ export function createMobileGroupMedia(input: {
   authorize(blob: BlobRef, signal: AbortSignal): Promise<AuthorizedBlobDownload>;
   fileShare?: Pick<MobileFileShare, "perform">;
   pdfPreview?: { readonly profileId: string; readonly files: Pick<MobilePdfPreviewFiles, "stage" | "remove"> };
+  mediaPreview?: { readonly profileId: string; readonly files: Pick<MobileMediaPreviewFiles, "stage" | "remove"> };
+  modelPreview?: { readonly profileId: string; readonly files: Pick<MobileModelPreviewFiles, "stage" | "remove"> };
 }) {
   const thumbnails = new MobileFilesThumbnailReader();
   type Source = { group: PartnerGroupSummary; message: PartnerGroupMessage; attachment: PartnerGroupAttachment };
@@ -56,21 +62,33 @@ export function createMobileGroupMedia(input: {
       || source.mediaType !== blob.mediaType) throw new Error("The authorized group attachment changed.");
     await input.fileShare.perform({ source, signal, assertCurrent, onDispatch });
   };
+  const releaseMediaFile = async (preview: MobileGroupFilePreview): Promise<void> => {
+    if (preview.kind === "pdf") await input.pdfPreview?.files.remove(preview.pdf);
+    else if (preview.kind === "media") await input.mediaPreview?.files.remove(preview.media);
+    else if (preview.kind === "model") await input.modelPreview?.files.remove(preview.model);
+  };
   return {
     prepareMediaFile: async (group: PartnerGroupSummary, message: PartnerGroupMessage, attachment: PartnerGroupAttachment, signal: AbortSignal): Promise<MobileGroupFilePreview> => {
       if (attachment.category === PartnerGroupAttachmentCategory.IMAGE) throw new Error("Select a group document.");
       const source = { group, message, attachment }, blob = await revalidate(source, signal);
       const pdf = isMobilePdfPreviewMediaType(blob.mediaType) ? input.pdfPreview : undefined;
+      const media = mobileMediaPreviewKind(blob.mediaType) ? input.mediaPreview : undefined;
+      const model = mobileModelPreviewKind(blob.mediaType, blob.fileName) ? input.modelPreview : undefined;
       const text = isTextFilePreviewMetadata(blob.mediaType, attachment.name);
-      if ((!text && !pdf) || blob.byteSize > BigInt(MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES)) return { kind: "unsupported" };
+      if ((!text && !pdf && !media && !model) || blob.byteSize > BigInt(MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES)) return { kind: "unsupported" };
       const bytes = await verifiedDownload(blob, signal);
-      if (pdf) {
-        const staged = await pdf.files.stage(pdf.profileId, input.newId(), blob.fileName, blob.mediaType, blob.sha256Hex, bytes, signal);
+      if (pdf || media || model) {
+        const leaseId = input.newId();
+        let preview: MobileGroupFilePreview;
+        if (pdf) preview = { kind: "pdf", pdf: await pdf.files.stage(pdf.profileId, leaseId, blob.fileName, blob.mediaType, blob.sha256Hex, bytes, signal) };
+        else if (media) preview = { kind: "media", media: await media.files.stage(media.profileId, leaseId, blob.fileName, blob.mediaType, blob.sha256Hex, bytes, signal) };
+        else preview = { kind: "model", model: await model!.files.stage({ profileId: model!.profileId, leaseId, modelPath: blob.fileName,
+          mediaType: blob.mediaType, expectedSha256Hex: blob.sha256Hex, bytes, signal }) };
         try {
           await revalidate(source, signal);
-          return { kind: "pdf", pdf: staged };
+          return preview;
         } catch (error) {
-          await pdf.files.remove(staged).catch(() => undefined);
+          await releaseMediaFile(preview).catch(() => undefined);
           throw error;
         }
       }
@@ -82,9 +100,7 @@ export function createMobileGroupMedia(input: {
         text: decoded, languageId: "", startByte: 0n, endByte: blob.byteSize, truncated: false,
         totalLines: decoded === "" ? 0 : decoded.split(/\r?\n/gu).length };
     },
-    releaseMediaFile: async (preview: MobileGroupFilePreview): Promise<void> => {
-      if (preview.kind === "pdf") await input.pdfPreview?.files.remove(preview.pdf);
-    },
+    releaseMediaFile,
     shareMediaFile: async (group: PartnerGroupSummary, message: PartnerGroupMessage, attachment: PartnerGroupAttachment, signal: AbortSignal) => {
       const source = { group, message, attachment };
       const blob = await revalidate(source, signal);
