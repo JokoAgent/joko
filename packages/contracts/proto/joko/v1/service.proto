@@ -141,6 +141,8 @@ service SessionService {
   rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
   // Private to the managed Desktop host. Closing the sign-in stream cancels it.
   rpc GetSessionCodeHostLogin(GetSessionCodeHostLoginRequest) returns (GetSessionCodeHostLoginResponse);
+  rpc GetSessionCodeHostReferences(GetSessionCodeHostReferencesRequest) returns (GetSessionCodeHostReferencesResponse);
+  rpc SetSessionCodeHostReferences(SetSessionCodeHostReferencesRequest) returns (SetSessionCodeHostReferencesResponse);
   rpc StartSessionCodeHostLogin(StartSessionCodeHostLoginRequest) returns (stream StartSessionCodeHostLoginResponse);
   rpc GetSessionRuntimeControl(GetSessionRuntimeControlRequest) returns (GetSessionRuntimeControlResponse);
   rpc ListTaskTags(ListTaskTagsRequest) returns (ListTaskTagsResponse);

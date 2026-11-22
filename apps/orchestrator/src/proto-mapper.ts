@@ -785,6 +785,9 @@ export function toProtoCodeHostPullRequest(
           : CodeHostPullRequestState.MERGED,
     draft: projection?.draft ?? false,
     unresolvedReviewThreadCount: projection?.unresolvedReviewThreadCount,
+    hasConflicts: projection?.hasConflicts,
+    checks: projection?.checks === undefined ? undefined
+      : message<contract.CodeHostPullRequestChecks>("joko.v1.CodeHostPullRequestChecks", projection.checks),
     observedAt: projection === undefined ? undefined : toProtoTimestamp(projection.observedAt),
     observed: projection !== undefined,
     title: projection?.title ?? "",

@@ -3,7 +3,8 @@ import {
   GitPullRequest,
   GitPullRequestClosed,
   GitPullRequestDraft,
-  MessageSquare
+  MessageSquare,
+  TriangleAlert
 } from "lucide-react";
 import type { JSX } from "react";
 
@@ -24,7 +25,7 @@ export function CodeHostPullRequestSummary({
 }): JSX.Element | null {
   if (pullRequests === undefined || pullRequests.length === 0) return null;
   const first = pullRequests[0]!;
-  const label = `#${first.number}`;
+  const label = `${first.webUrl.includes("/-/merge_requests/") ? "!" : "#"}${first.number}`;
   const visible = pullRequests.length === 1
     ? label
     : t("codeHost.pullRequestCount", { label, count: pullRequests.length - 1 });
@@ -38,6 +39,7 @@ export function CodeHostPullRequestSummary({
   const content = <>
     <StateIcon aria-hidden="true" />
     <span>{visible}</span>
+    {first.projection?.hasConflicts === true && <span className="code-host-pull-request-summary__reviews" aria-hidden="true"><TriangleAlert /></span>}
     {reviewCount > 0 && <span className="code-host-pull-request-summary__reviews" aria-hidden="true">
       <MessageSquare />
       <span>{reviewCount > 99 ? "99+" : reviewCount}</span>
@@ -81,7 +83,8 @@ export function CodeHostPullRequestSidebarBadge({
     aria-label={codeHostPullRequestTooltip(pullRequests, t)}
   >
     <StateIcon aria-hidden="true" />
-    <span className="session-row__code-host-number" aria-hidden="true">#{first.number}</span>
+    <span className="session-row__code-host-number" aria-hidden="true">{first.webUrl.includes("/-/merge_requests/") ? "!" : "#"}{first.number}</span>
+    {first.projection?.hasConflicts === true && <TriangleAlert aria-hidden="true" />}
     {reviewCount > 0 && <span className="session-row__code-host-review" aria-hidden="true" />}
   </span>;
 }
@@ -97,9 +100,11 @@ export function codeHostPullRequestTooltip(
     const reviews = projection?.unresolvedReviewThreadCount !== undefined && projection.unresolvedReviewThreadCount > 0
       ? ` · ${t("codeHost.unresolvedReviewThreads", { count: projection.unresolvedReviewThreadCount })}`
       : "";
+    const checks = projection?.checks === undefined || projection.checks.total === 0 ? ""
+      : "\n" + t("codeHost.checkCounts", projection.checks);
     return projection === undefined
       ? `${codeHostPullRequestCompactLabel(pullRequest, t)} · ${state}`
-      : `${codeHostPullRequestCompactLabel(pullRequest, t)}\n${projection.title}\n${state} · ${projection.headBranch}${reviews}`;
+      : `${codeHostPullRequestCompactLabel(pullRequest, t)}\n${projection.title}\n${state} · ${projection.headBranch}${reviews}${checks}`;
   }).join("\n");
 }
 
@@ -145,7 +150,7 @@ export function codeHostPullRequestStateLabel(
   const state = codeHostPullRequestDisplayState(pullRequest);
   if (state === "merged") return t("codeHost.statusMerged");
   if (state === "draft") return t("codeHost.statusDraft");
-  if (state === "open") return t("codeHost.statusOpen");
+  if (state === "open") return t(pullRequest.projection?.hasConflicts === true ? "codeHost.mergeConflicts" : "codeHost.statusOpen");
   if (state === "closed") return t("codeHost.statusClosed");
   return t("codeHost.statusUnavailable");
 }

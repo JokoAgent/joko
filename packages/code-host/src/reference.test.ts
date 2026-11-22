@@ -40,6 +40,17 @@ describe("code-host pull request references", () => {
     expect(parseCodeHostPullRequestReference("https://code.example/acme/widgets/pull/2#fragment")).toBeUndefined();
   });
 
+  it("canonicalizes nested GitLab projects and supported review subpages", () => {
+    const refs = extractCodeHostPullRequestReferences([
+      "https://gitlab.com/team/sub/repo/-/merge_requests/7/diffs?diff_id=2 https://gitlab.com/team/sub/repo/-/merge_requests/7",
+      "https://github.com/Org/Project/pull/8/files#diff-123 https://github.com/org/project/pull/8",
+      "https://gitlab.com/team/sub/repo/-/issues/7 https://secret@gitlab.com/team/sub/repo/-/merge_requests/7"
+    ]);
+    expect(refs.map(({ repositoryOwner, webUrl }) => ({ repositoryOwner, webUrl }))).toEqual([
+      { repositoryOwner: "team/sub", webUrl: "https://gitlab.com/team/sub/repo/-/merge_requests/7" },
+      { repositoryOwner: "org", webUrl: "https://github.com/org/project/pull/8" }
+    ]);
+  });
   it("deduplicates GitHub repository casing and preserves distinct PRs and other hosts", () => {
     const references = extractCodeHostPullRequestReferences([
       "https://github.com/Acme/Widgets/pull/42 https://github.com/acme/widgets/pull/42",

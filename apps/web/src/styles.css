@@ -248,6 +248,10 @@
   --timeline-bottom-inset: 0px;
 }
 
+.code-host-association-url {
+  overflow-wrap: anywhere;
+}
+
 :root[data-theme="dark"] {
   color-scheme: dark;
   --bg: #0d0d0d;

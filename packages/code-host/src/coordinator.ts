@@ -14,7 +14,7 @@ import {
   type CodeHostSessionProjection,
   type CodeHostSessionReferenceProjection
 } from "./types.js";
-import { boundedCodeHostHeadBranch, boundedCodeHostPullRequestTitle } from "./validation.js";
+import { boundedCodeHostChecks, boundedCodeHostHeadBranch, boundedCodeHostPullRequestTitle } from "./validation.js";
 
 export interface CodeHostProjectionCoordinatorOptions {
   readonly repository: CodeHostProjectionRepository;
@@ -235,6 +235,7 @@ function validatedProviderResult(
   }
   const title = boundedCodeHostPullRequestTitle(value.title);
   const headBranch = boundedCodeHostHeadBranch(value.headBranch);
+  const checks = boundedCodeHostChecks(value.checks);
   if (
     typeof value.draft !== "boolean"
     || title === undefined
@@ -252,9 +253,11 @@ function validatedProviderResult(
     draft: value.draft,
     title,
     headBranch,
+    ...(typeof value.hasConflicts === "boolean" ? { hasConflicts: value.hasConflicts } : {}),
     ...(value.unresolvedReviewThreadCount === undefined
       ? {}
       : { unresolvedReviewThreadCount: value.unresolvedReviewThreadCount }),
+    ...(checks === undefined ? {} : { checks }),
     observedAt
   };
 }

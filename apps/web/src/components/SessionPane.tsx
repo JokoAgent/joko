@@ -93,6 +93,7 @@ import {
   type UsageLimitRecoveryHint
 } from "../usage-limit-recovery.js";
 import { SessionHeaderActionsMenu } from "./SessionHeaderActionsMenu.js";
+import { SessionPullRequestAssociations } from "./SessionPullRequestAssociations.js";
 import { PartnerConversationHeader } from "./PartnerConversationHeader.js";
 import { PartnerConversationProvider, usePartnerConversation } from "./PartnerConversation.js";
 import { TaskTagDots } from "./TaskTags.js";
@@ -2563,6 +2564,11 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
             aria-expanded={collaborationOpen}
             onClick={() => setCollaborationOpen((current) => !current)}
           ><UsersRound aria-hidden="true" /></IconButton>}
+          {!guest && !reviewReadOnly && !session.archived && !session.derivationOrigin?.sideChat
+            && controller.state.connectionState === "connected" && controller.getSessionCodeHostReferences && controller.setSessionCodeHostReferences
+            && <SessionPullRequestAssociations key={`${controller.state.connectionGeneration}:${session.id}:${session.generation}`}
+              sessionId={session.id} generation={session.generation} read={controller.getSessionCodeHostReferences}
+              write={controller.setSessionCodeHostReferences} t={t} />}
           <SessionHeaderActionsMenu
             guestOnly={guest}
             onLeaveSharing={guest ? onArchive : undefined}

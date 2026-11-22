@@ -1614,6 +1614,8 @@ export interface CodeHostPullRequestView {
     readonly title: string;
     readonly headBranch: string;
     readonly unresolvedReviewThreadCount?: number;
+    readonly hasConflicts?: boolean;
+    readonly checks?: { readonly total: number; readonly passed: number; readonly failed: number; readonly pending: number; readonly skipped: number };
     readonly observedAt: number;
   };
 }
@@ -6490,6 +6492,9 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   removeExtraDirectory(extraDirectoryId: string): Promise<void>;
   setModel(sessionId: string, providerId: string, modelId: string, effort: string | undefined, fastMode: boolean | "ultrafast"): Promise<void>;
   getSessionRuntimeControl?(sessionId: string): Promise<import("@joko/contracts").TaskShareRuntimeControl>;
+  getSessionCodeHostReferences?(sessionId: string, signal?: AbortSignal): Promise<import("@joko/contracts").SessionCodeHostReferenceSet>;
+  setSessionCodeHostReferences?(input: import("@bufbuild/protobuf").MessageInitShape<typeof import("@joko/contracts").SetSessionCodeHostReferencesRequestSchema>,
+    signal?: AbortSignal): Promise<import("@joko/contracts").SessionCodeHostReferenceSet>;
   setRuntimeModel?(sessionId: string, selection: import("./session-runtime-gateway.js").SessionRuntimeModelSelection): Promise<void>;
   setPermission(sessionId: string, mode: PermissionMode): Promise<void>;
   setPlanMode(sessionId: string, enabled: boolean): Promise<void>;

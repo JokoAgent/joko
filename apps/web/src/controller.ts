@@ -4291,6 +4291,10 @@ export function useAppController(): AppController {
     setModel: (sessionId, providerId, modelId, effort, fastMode) => gateway().setModel(sessionId, providerId, modelId, effort, fastMode),
     getSessionRuntimeControl: sessionId => gateway().getSessionRuntimeControl?.(sessionId)
       ?? Promise.reject(new Error("The task runtime controls are unavailable.")),
+    getSessionCodeHostReferences: (sessionId, signal) => gateway().getSessionCodeHostReferences?.(sessionId, signal)
+      ?? Promise.reject(new Error("Pull request associations are unavailable.")),
+    setSessionCodeHostReferences: (input, signal) => gateway().setSessionCodeHostReferences?.(input, signal)
+      ?? Promise.reject(new Error("Pull request associations are unavailable.")),
     setRuntimeModel: (sessionId, selection) => gateway().setRuntimeModel?.(sessionId, selection)
       ?? Promise.reject(new Error("The task runtime selection is unavailable.")),
     setPermission: (sessionId, mode) => gateway().setPermission(sessionId, mode),

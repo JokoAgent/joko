@@ -38,6 +38,70 @@ describe("remote connection auth and durable operations", () => {
     fixture = undefined;
   });
 
+  it("orders, removes and restores a task's PR associations through the paired Session service", async () => {
+    const a = "https://github.com/acme/widgets/pull/41";
+    const b = "https://gitlab.com/acme/sub/widgets/-/merge_requests/42";
+    const c = "https://github.com/acme/widgets/pull/43", d = "https://github.com/acme/widgets/pull/44";
+    const racing = "https://github.com/acme/widgets/pull/45", missing = "https://github.com/acme/widgets/pull/46";
+    let verify!: () => void, resume!: () => void;
+    const verifying = new Promise<void>(resolve => { verify = resolve; });
+    const released = new Promise<void>(resolve => { resume = resolve; });
+    fixture = await OrchestratorE2eFixture.start({ codeHostProviders: [{
+      capability: "code-host.pull-request", supports: () => true,
+      async getPullRequest(reference) {
+        if (reference.webUrl === missing) throw new ConnectError("The fixture pull request is missing.", Code.NotFound);
+        if (reference.webUrl === racing) { verify(); await released; }
+        return { state: "open", draft: false, title: "Readable review", headBranch: "feature/association", hasConflicts: reference.webUrl === b };
+      }
+    }] });
+    const { clients, connectionId } = await fixture.pair("Manage task pull requests");
+    const createTask = async (displayName: string) => sessionIdFrom(await submit(clients.operation, connectionId,
+      createSessionMutation({ backendId: fixture!.adapter().id, targetId: fixture!.targetId(), displayName })));
+    const sessionId = await createTask(`Review ${a}`);
+    const otherId = await createTask("Separate task");
+    const task = await clients.session.getSession({ sessionId });
+    const read = (id = sessionId) => clients.session.getSessionCodeHostReferences({ sessionId: id }).then(result => result.references!);
+    const urls = (items: { webUrl: string }[]) => items.map(item => item.webUrl);
+    const write = (expectedRevision: bigint, orderedUrls: string[], removedUrls: string[], pinnedUrls?: string[]) =>
+      clients.session.setSessionCodeHostReferences({ sessionId, expectedRevision: { value: expectedRevision },
+        expectedGeneration: task.session!.version!.generation, orderedUrls, removedUrls,
+        ...(pinnedUrls === undefined ? {} : { pinnedUrls: { urls: pinnedUrls } }) }).then(result => result.references!);
+
+    const original = await read();
+    expect(urls(original.active)).toEqual([a]);
+    await expect(write(original.revision!.value, [a, missing], [])).rejects.toMatchObject({ code: Code.NotFound });
+    expect(await read()).toEqual(original);
+    const added = await write(original.revision!.value, [a, b], []);
+    const reordered = await write(added.revision!.value, [b, a], []);
+    expect(urls(reordered.active)).toEqual([b, a]);
+    await expect(write(original.revision!.value, [a], [])).rejects.toMatchObject({ code: Code.Aborted });
+    await expect(write(reordered.revision!.value, ["https://token@github.com/acme/widgets/pull/43"], []))
+      .rejects.toMatchObject({ code: Code.InvalidArgument });
+    const removed = await write(reordered.revision!.value, [b], [a]);
+    expect(urls((await read()).active)).toEqual([b]);
+    expect(urls(removed.removed)).toEqual([a]);
+    const restored = await write(removed.revision!.value, [b, a], []);
+    expect(urls((await read()).active)).toEqual([b, a]);
+    expect((await clients.session.getSession({ sessionId })).session?.codeHostPullRequests.map(ref => ref.reference?.webUrl)).toEqual([b, a]);
+    expect(urls((await read(otherId)).active)).toEqual([]);
+
+    const pinned = await write(restored.revision!.value, [a, b, c, d], [], [b, c, d]);
+    expect(urls(pinned.active)).toEqual([b, c, d, a]);
+    expect(pinned.pinnedReferenceKeys).toEqual(pinned.active.slice(0, 3).map(reference => reference.referenceKey));
+    await expect(write(pinned.revision!.value, [a, b, c, d], [], [a, b, c, d])).rejects.toMatchObject({ code: Code.InvalidArgument });
+    const oldClient = await write(pinned.revision!.value, [a, c, b, d], []);
+    expect(new Set(oldClient.pinnedReferenceKeys)).toEqual(new Set(pinned.pinnedReferenceKeys));
+    const pending = write(oldClient.revision!.value, [a, b, c, d, racing], [], [c, b, d]);
+    const rejected = expect(pending).rejects.toMatchObject({ code: Code.Aborted });
+    try {
+      await verifying;
+      const winner = await write(oldClient.revision!.value, [a, b, c, d], [], [a, b, c]);
+      expect(urls((await read()).active)).toEqual(urls(winner.active));
+    } finally { resume(); }
+    await rejected;
+    expect(urls((await read()).active)).toEqual([a, b, c, d]);
+  });
+
   it("rejects a second client's mutation fenced by a stale session generation", async () => {
     fixture = await OrchestratorE2eFixture.start();
     const first = await fixture.pair("stale controller");

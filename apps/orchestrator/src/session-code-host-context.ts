@@ -1,7 +1,10 @@
 import {
   CodeHostProjectionCoordinator,
+  CodeHostPullRequestNotFoundError,
+  CodeHostProviderUnavailableError,
   extractCodeHostPullRequestReferences,
   materializeCodeHostSessionProjection,
+  parseCodeHostPullRequestReference,
   type CodeHostPullRequestReference,
   type CodeHostNegativeObservation,
   type CodeHostProjectionRepository,
@@ -14,6 +17,9 @@ import {
 import type { OperationalStore, PersistedEvent, StoredSession } from "@joko/store";
 
 export const SESSION_CODE_HOST_PROJECTION_SETTING_KEY = "codeHost.pullRequests.v1";
+const ASSOCIATIONS_KEY = "codeHost.pullRequestAssociations.v1";
+const MAXIMUM_ASSOCIATIONS = 16;
+const MAXIMUM_PINNED_ASSOCIATIONS = 3;
 const CONTEXT_EVENT_PAGE_SIZE = 200;
 const REFRESH_CONCURRENCY = 4;
 
@@ -79,14 +85,13 @@ export class OperationalCodeHostSessionAuthorization implements CodeHostSessionA
       return undefined;
     }
     if (session.descriptor.id !== sessionOwnerId || session.descriptor.deletedAt !== undefined) return undefined;
-    const authorized = extractCodeHostPullRequestReferences(
-      sessionCodeHostContext(this.store, session)
-    ).some((candidate) => sameReference(candidate, reference));
+    const authorized = effectiveReferences(this.store, session).some(candidate => sameReference(candidate, reference));
     if (!authorized) return undefined;
+    const associations = associationSetting(this.store, sessionOwnerId);
     return Object.freeze({
       sessionOwnerId,
       referenceKey: reference.key,
-      ownerRevision: session.revision.toString(10)
+      ownerRevision: associations === undefined ? session.revision.toString(10) : `${session.revision}:${associations.revision}`
     });
   }
 
@@ -164,8 +169,7 @@ export class SessionCodeHostContextRuntime {
     } catch {
       return undefined;
     }
-    const references = session.descriptor.deletedAt === undefined
-      ? extractCodeHostPullRequestReferences(sessionCodeHostContext(this.store, session)) : [];
+    const references = session.descriptor.deletedAt === undefined ? effectiveReferences(this.store, session) : [];
     const pending = this.refreshes.get(sessionId);
     if (pending !== undefined) {
       if (!sameReferenceList(pending.references, references)) pending.references = references;
@@ -177,8 +181,14 @@ export class SessionCodeHostContextRuntime {
         // Finish reconciling the latest local references before resolving any joined caller.
         for (;;) {
           const current = flight.references;
+          const associationRevision = associationSetting(this.store, sessionId)?.revision;
           const refreshed = await this.coordinator.refreshSession(sessionId, current, (reference) => {
             signIn?.assertCurrent();
+            if (associationSetting(this.store, sessionId)?.revision !== associationRevision) {
+              const latest = this.store.getSession(sessionId);
+              flight.references = latest.descriptor.deletedAt === undefined ? effectiveReferences(this.store, latest) : [];
+              throw new Error("The Session pull request associations changed.");
+            }
             if (flight.references !== current && (reference === undefined || !flight.references.some(candidate => sameReference(candidate, reference)))) {
               throw new Error("The Session pull request references changed.");
             }
@@ -290,6 +300,120 @@ export function readSessionCodeHostReferences(
 
 export function refreshSessionCodeHostReferencesInBackground(store: OperationalStore, sessionIds: readonly string[]): void {
   installedRuntimes.get(store)?.refreshSessionsInBackground(sessionIds);
+}
+
+interface PullRequestAssociations {
+  readonly format: 1;
+  readonly orderedUrls: readonly string[];
+  readonly removedUrls: readonly string[];
+  readonly pinnedUrls?: readonly string[];
+}
+
+export function parseManagedPullRequestUrls(orderedUrls: readonly string[], removedUrls: readonly string[],
+  pinnedUrls?: readonly string[], previousPinned: readonly string[] = []): PullRequestAssociations | undefined {
+  if (orderedUrls.length > MAXIMUM_ASSOCIATIONS || removedUrls.length > MAXIMUM_ASSOCIATIONS) return undefined;
+  const unique = new Set<string>();
+  const normalize = (urls: readonly string[]) => urls.map(url => {
+    const reference = parseCodeHostPullRequestReference(url.trim());
+    if (!reference || !manageableReference(reference) || unique.has(reference.key)) return undefined;
+    unique.add(reference.key);
+    return reference.webUrl;
+  });
+  const ordered = normalize(orderedUrls), removed = normalize(removedUrls);
+  if (!ordered.every(url => url !== undefined) || !removed.every(url => url !== undefined)) return undefined;
+  const pinned = pinnedUrls?.map(url => parseCodeHostPullRequestReference(url.trim())?.webUrl)
+    ?? previousPinned.filter(url => ordered.includes(url));
+  if (pinned.length > MAXIMUM_PINNED_ASSOCIATIONS || new Set(pinned).size !== pinned.length
+    || !pinned.every(url => url !== undefined) || !pinned.every(url => ordered.includes(url))) return undefined;
+  return { format: 1, orderedUrls: ordered, removedUrls: removed, pinnedUrls: pinned };
+}
+
+export function readSessionPullRequestAssociations(store: OperationalStore, session: StoredSession) {
+  const setting = associationSetting(store, session.descriptor.id);
+  const active = effectiveReferences(store, session).filter(manageableReference);
+  const pinned = new Set(setting?.value.pinnedUrls ?? []);
+  return { revision: setting?.revision ?? 0n, active, pinned: active.filter(reference => pinned.has(reference.webUrl)),
+    removed: parseReferences(setting?.value.removedUrls ?? []) };
+}
+
+export async function validateNewPullRequestAssociations(sessionId: string, associations: PullRequestAssociations,
+  current: readonly CodeHostPullRequestReference[], providerFactory: (scope: CodeHostSessionAuthorizationPort) => readonly CodeHostProvider[],
+  assertCurrent: () => void, signal: AbortSignal): Promise<void> {
+  const present = new Set(current.map(reference => reference.key));
+  const additions = parseReferences(associations.orderedUrls).filter(reference => !present.has(reference.key));
+  if (additions.length === 0) return;
+  const ids = new Map(additions.map(reference => [reference.key, reference]));
+  const authorize = (owner: string, reference: CodeHostPullRequestReference): CodeHostSessionAuthorization | undefined => {
+    assertCurrent();
+    const expected = ids.get(reference.key);
+    return owner === sessionId && expected !== undefined && sameReference(expected, reference)
+      ? { sessionOwnerId: sessionId, referenceKey: reference.key, ownerRevision: "pending-association" } : undefined;
+  };
+  const providers = providerFactory({ authorize, isCurrent: (lease, reference) => authorize(lease.sessionOwnerId, reference)?.referenceKey === lease.referenceKey });
+  for (const reference of additions) {
+    let found = false;
+    for (const provider of providers) {
+      if (!provider.supports(reference)) continue;
+      signal.throwIfAborted();
+      assertCurrent();
+      try {
+        await provider.getPullRequest(reference, { sessionOwnerId: sessionId, signal });
+        assertCurrent();
+        found = true;
+        break;
+      } catch (error) {
+        assertCurrent();
+        if (!(error instanceof CodeHostProviderUnavailableError)) throw error;
+      }
+    }
+    if (!found) throw new CodeHostPullRequestNotFoundError();
+  }
+}
+
+export function writeSessionPullRequestAssociations(store: OperationalStore, session: StoredSession, associations: PullRequestAssociations) {
+  const { id, backendId, targetId, binding } = session.descriptor;
+  return store.transaction(current => {
+    current.setSetting("session", id, ASSOCIATIONS_KEY, associations);
+    const active = effectiveReferences(current, session);
+    const previous = new Map(readSessionCodeHostReferences(current, id).map(entry => [entry.reference.key, entry]));
+    new OperationalCodeHostProjectionRepository(current).write({ schemaVersion: 1, sessionOwnerId: id,
+      references: active.map(reference => previous.get(reference.key) ?? { reference }) });
+    current.appendEvent({ backendId, targetId, sessionId: id, generation: binding.generation,
+      traceId: "session-code-host-associations", payload: { type: "session_changed" } });
+    return readSessionPullRequestAssociations(current, session);
+  });
+}
+
+function associationSetting(store: Pick<OperationalStore, "findSetting">, sessionId: string) {
+  return store.findSetting<PullRequestAssociations>("session", sessionId, ASSOCIATIONS_KEY);
+}
+
+function manageableReference(reference: CodeHostPullRequestReference): boolean {
+  return reference.host === "github.com" && reference.webUrl.includes("/pull/")
+    || reference.webUrl.includes("/-/merge_requests/");
+}
+
+function parseReferences(urls: readonly string[]): readonly CodeHostPullRequestReference[] {
+  return urls.flatMap(url => {
+    const reference = parseCodeHostPullRequestReference(url);
+    return reference !== undefined && manageableReference(reference) ? [reference] : [];
+  });
+}
+
+function effectiveReferences(store: OperationalStore, session: StoredSession): readonly CodeHostPullRequestReference[] {
+  const automatic = extractCodeHostPullRequestReferences(sessionCodeHostContext(store, session));
+  const manual = associationSetting(store, session.descriptor.id)?.value;
+  if (manual === undefined) return automatic;
+  const removed = new Set(parseReferences(manual.removedUrls).map(reference => reference.key));
+  const pinned = new Set(manual.pinnedUrls ?? []);
+  const configured = parseReferences(manual.orderedUrls);
+  const ordered = new Map([...configured.filter(reference => pinned.has(reference.webUrl)),
+    ...configured.filter(reference => !pinned.has(reference.webUrl))].map(reference => [reference.key, reference]));
+  for (const reference of automatic) {
+    if (!removed.has(reference.key) && !ordered.has(reference.key)) ordered.set(reference.key, reference);
+    if (ordered.size >= MAXIMUM_ASSOCIATIONS) break;
+  }
+  return [...ordered.values()].slice(0, MAXIMUM_ASSOCIATIONS);
 }
 
 function* sessionCodeHostContext(

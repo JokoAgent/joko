@@ -35,9 +35,9 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
     fixture = undefined;
   });
 
-  it("wakes only the authorized bound task for a changed pull request, coalesces busy events, and cancels a pending wake", { timeout: 45_000 }, async () => {
+  it.each(["checks", "review"] as const)("wakes only the authorized bound task for newly readable PR %s and coalesces busy changes", { timeout: 45_000 }, async change => {
     let clock = Date.now() - 10 * 60_000;
-    let checks: string[] | undefined;
+    let signal: "failure" | "queued" | "success" | undefined;
     const reads: { owner: string; url: string; authorized: boolean }[] = [];
     fixture = await OrchestratorE2eFixture.start({ scheduler: {
       now: () => clock,
@@ -51,7 +51,10 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
           reads.push({ owner: options.sessionOwnerId, url: reference.webUrl,
             authorized: authorized !== undefined && options.purpose === "follow" && authority.isCurrent(authorized, reference) });
           return { state: "open", draft: false, title: "Follow checks", headBranch: "feature",
-            observedAt: clock, activity: { headSha: "a".repeat(40), checks } };
+            observedAt: clock, activity: { headSha: "a".repeat(40),
+              checks: change === "checks" && signal !== undefined ? [signal === "queued" ? "check:queued:" : `check:completed:${signal}`] : undefined,
+              reviewDecision: change === "review" && signal !== undefined
+                ? { failure: "CHANGES_REQUESTED", queued: "REVIEW_REQUIRED", success: "APPROVED" }[signal] : undefined } };
         }
       }]
     } });
@@ -67,7 +70,7 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
     const url = "https://github.com/jokoagent/joko/pull/17";
     const request = createManualScheduleMutation({ backendId, targetId, sessionId,
       sessionMode: ScheduleSessionMode.BOUND, text: "Inspect the changed checks.", execution: {
-        followPullRequest: schedulePullRequestRuleToProto({ url: rawUrl, change: "checks" })
+        followPullRequest: schedulePullRequestRuleToProto({ url: rawUrl, change })
       } });
     if (request.payload.case !== "createSchedule" || request.payload.value.schedule === undefined) throw new Error("Missing Automation input.");
     const original = request.payload.value.schedule;
@@ -95,14 +98,14 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
     await clockTick(5_001, 2);
     expect(await history()).toHaveLength(0);
 
-    checks = ["check:completed:failure"];
+    signal = "failure";
     await clockTick(5_001, 3);
     await expect.poll(async () => (await history()).map(run => run.outcome)).toEqual([ScheduleRunOutcome.SUCCEEDED]);
     const first = (await history())[0]!;
     expect(first).toMatchObject({ sessionId, pullRequestUrl: url });
-    checks = undefined;
+    signal = undefined;
     await clockTick(5_001, 4);
-    checks = ["check:completed:failure"];
+    signal = "failure";
     await clockTick(5_001, 5);
     expect(await history()).toHaveLength(1);
     expect(watchState()?.value.pending).toBeUndefined();
@@ -110,9 +113,9 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
     await submit(clients.operation, connectionId, pauseQueueMutation(await queueControl()));
     await submit(clients.operation, connectionId, sendInputMutation(sessionId,
       BigInt(store.getSession(sessionId).descriptor.binding.generation), "Keep this task busy"));
-    checks = ["check:queued:"];
+    signal = "queued";
     await clockTick(5_001, 6);
-    checks = ["check:completed:success"];
+    signal = "success";
     await clockTick(5_001, 7);
     expect(await history()).toHaveLength(1);
     expect(fixture.adapter().sendCalls.map(input => input.text)).toEqual(["Inspect the changed checks."]);
@@ -133,7 +136,7 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
     }));
     expect((await update(legacy)).state).toBe(OperationState.SUCCEEDED);
     expect((await clients.scheduler.getSchedule({ scheduleId })).schedule?.execution?.followPullRequest?.url).toBe(url);
-    checks = ["check:completed:failure"];
+    signal = "failure";
     await clockTick(5_001, 10);
     expect(await history()).toHaveLength(2);
     await expect.poll(() => watchState()?.value.pending?.url).toBe(url);

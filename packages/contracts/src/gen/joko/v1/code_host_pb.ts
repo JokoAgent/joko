@@ -6,13 +6,15 @@ import type { GenEnum, GenFile, GenMessage } from "@bufbuild/protobuf/codegenv2"
 import { enumDesc, fileDesc, messageDesc } from "@bufbuild/protobuf/codegenv2";
 import type { Timestamp } from "@bufbuild/protobuf/wkt";
 import { file_google_protobuf_timestamp } from "@bufbuild/protobuf/wkt";
+import type { Revision } from "./common_pb.js";
+import { file_joko_v1_common } from "./common_pb.js";
 import type { Message } from "@bufbuild/protobuf";
 
 /**
  * Describes the file joko/v1/code_host.proto.
  */
 export const file_joko_v1_code_host: GenFile = /*@__PURE__*/
-  fileDesc("Chdqb2tvL3YxL2NvZGVfaG9zdC5wcm90bxIHam9rby52MSKXAQocQ29kZUhvc3RQdWxsUmVxdWVzdFJlZmVyZW5jZRIVCg1yZWZlcmVuY2Vfa2V5GAEgASgJEgwKBGhvc3QYAiABKAkSGAoQcmVwb3NpdG9yeV9vd25lchgDIAEoCRIXCg9yZXBvc2l0b3J5X25hbWUYBCABKAkSDgoGbnVtYmVyGAUgASgEEg8KB3dlYl91cmwYBiABKAki0QIKHUNvZGVIb3N0UHVsbFJlcXVlc3RQcm9qZWN0aW9uEjgKCXJlZmVyZW5jZRgBIAEoCzIlLmpva28udjEuQ29kZUhvc3RQdWxsUmVxdWVzdFJlZmVyZW5jZRIwCgVzdGF0ZRgCIAEoDjIhLmpva28udjEuQ29kZUhvc3RQdWxsUmVxdWVzdFN0YXRlEg0KBWRyYWZ0GAMgASgIEi8KC29ic2VydmVkX2F0GAQgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIQCghvYnNlcnZlZBgFIAEoCBINCgV0aXRsZRgGIAEoCRITCgtoZWFkX2JyYW5jaBgHIAEoCRIrCh51bnJlc29sdmVkX3Jldmlld190aHJlYWRfY291bnQYCCABKA1IAIgBAUIhCh9fdW5yZXNvbHZlZF9yZXZpZXdfdGhyZWFkX2NvdW50Im0KGVNlc3Npb25Db2RlSG9zdExvZ2luU2NvcGUSEgoKc2Vzc2lvbl9pZBgBIAEoCRIRCgl0YXJnZXRfaWQYAiABKAkSEgoKZ2VuZXJhdGlvbhgDIAEoBBIVCg1yZWZlcmVuY2Vfa2V5GAQgASgJIlMKHkdldFNlc3Npb25Db2RlSG9zdExvZ2luUmVxdWVzdBIxCgVzY29wZRgBIAEoCzIiLmpva28udjEuU2Vzc2lvbkNvZGVIb3N0TG9naW5TY29wZSI7Ch9HZXRTZXNzaW9uQ29kZUhvc3RMb2dpblJlc3BvbnNlEhgKEHNpZ25faW5fcmVxdWlyZWQYASABKAgiVQogU3RhcnRTZXNzaW9uQ29kZUhvc3RMb2dpblJlcXVlc3QSMQoFc2NvcGUYASABKAsyIi5qb2tvLnYxLlNlc3Npb25Db2RlSG9zdExvZ2luU2NvcGUiWQohU3RhcnRTZXNzaW9uQ29kZUhvc3RMb2dpblJlc3BvbnNlEhUKC2RldmljZV9jb2RlGAEgASgJSAASEwoJY29ubmVjdGVkGAIgASgISABCCAoGdXBkYXRlKsEBChhDb2RlSG9zdFB1bGxSZXF1ZXN0U3RhdGUSLAooQ09ERV9IT1NUX1BVTExfUkVRVUVTVF9TVEFURV9VTlNQRUNJRklFRBAAEiUKIUNPREVfSE9TVF9QVUxMX1JFUVVFU1RfU1RBVEVfT1BFThABEicKI0NPREVfSE9TVF9QVUxMX1JFUVVFU1RfU1RBVEVfQ0xPU0VEEAISJwojQ09ERV9IT1NUX1BVTExfUkVRVUVTVF9TVEFURV9NRVJHRUQQA2IGcHJvdG8z", [file_google_protobuf_timestamp]);
+  fileDesc("Chdqb2tvL3YxL2NvZGVfaG9zdC5wcm90bxIHam9rby52MSKXAQocQ29kZUhvc3RQdWxsUmVxdWVzdFJlZmVyZW5jZRIVCg1yZWZlcmVuY2Vfa2V5GAEgASgJEgwKBGhvc3QYAiABKAkSGAoQcmVwb3NpdG9yeV9vd25lchgDIAEoCRIXCg9yZXBvc2l0b3J5X25hbWUYBCABKAkSDgoGbnVtYmVyGAUgASgEEg8KB3dlYl91cmwYBiABKAkiswMKHUNvZGVIb3N0UHVsbFJlcXVlc3RQcm9qZWN0aW9uEjgKCXJlZmVyZW5jZRgBIAEoCzIlLmpva28udjEuQ29kZUhvc3RQdWxsUmVxdWVzdFJlZmVyZW5jZRIwCgVzdGF0ZRgCIAEoDjIhLmpva28udjEuQ29kZUhvc3RQdWxsUmVxdWVzdFN0YXRlEg0KBWRyYWZ0GAMgASgIEi8KC29ic2VydmVkX2F0GAQgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIQCghvYnNlcnZlZBgFIAEoCBINCgV0aXRsZRgGIAEoCRITCgtoZWFkX2JyYW5jaBgHIAEoCRIrCh51bnJlc29sdmVkX3Jldmlld190aHJlYWRfY291bnQYCCABKA1IAIgBARIyCgZjaGVja3MYCSABKAsyIi5qb2tvLnYxLkNvZGVIb3N0UHVsbFJlcXVlc3RDaGVja3MSGgoNaGFzX2NvbmZsaWN0cxgKIAEoCEgBiAEBQiEKH191bnJlc29sdmVkX3Jldmlld190aHJlYWRfY291bnRCEAoOX2hhc19jb25mbGljdHMibAoZQ29kZUhvc3RQdWxsUmVxdWVzdENoZWNrcxINCgV0b3RhbBgBIAEoDRIOCgZwYXNzZWQYAiABKA0SDgoGZmFpbGVkGAMgASgNEg8KB3BlbmRpbmcYBCABKA0SDwoHc2tpcHBlZBgFIAEoDSJtChlTZXNzaW9uQ29kZUhvc3RMb2dpblNjb3BlEhIKCnNlc3Npb25faWQYASABKAkSEQoJdGFyZ2V0X2lkGAIgASgJEhIKCmdlbmVyYXRpb24YAyABKAQSFQoNcmVmZXJlbmNlX2tleRgEIAEoCSJTCh5HZXRTZXNzaW9uQ29kZUhvc3RMb2dpblJlcXVlc3QSMQoFc2NvcGUYASABKAsyIi5qb2tvLnYxLlNlc3Npb25Db2RlSG9zdExvZ2luU2NvcGUiOwofR2V0U2Vzc2lvbkNvZGVIb3N0TG9naW5SZXNwb25zZRIYChBzaWduX2luX3JlcXVpcmVkGAEgASgIIlUKIFN0YXJ0U2Vzc2lvbkNvZGVIb3N0TG9naW5SZXF1ZXN0EjEKBXNjb3BlGAEgASgLMiIuam9rby52MS5TZXNzaW9uQ29kZUhvc3RMb2dpblNjb3BlIlkKIVN0YXJ0U2Vzc2lvbkNvZGVIb3N0TG9naW5SZXNwb25zZRIVCgtkZXZpY2VfY29kZRgBIAEoCUgAEhMKCWNvbm5lY3RlZBgCIAEoCEgAQggKBnVwZGF0ZSI5CiNHZXRTZXNzaW9uQ29kZUhvc3RSZWZlcmVuY2VzUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJImAKJEdldFNlc3Npb25Db2RlSG9zdFJlZmVyZW5jZXNSZXNwb25zZRI4CgpyZWZlcmVuY2VzGAEgASgLMiQuam9rby52MS5TZXNzaW9uQ29kZUhvc3RSZWZlcmVuY2VTZXQi4gEKI1NldFNlc3Npb25Db2RlSG9zdFJlZmVyZW5jZXNSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSGwoTZXhwZWN0ZWRfZ2VuZXJhdGlvbhgCIAEoBBIsChFleHBlY3RlZF9yZXZpc2lvbhgDIAEoCzIRLmpva28udjEuUmV2aXNpb24SFAoMb3JkZXJlZF91cmxzGAQgAygJEhQKDHJlbW92ZWRfdXJscxgFIAMoCRIwCgtwaW5uZWRfdXJscxgGIAEoCzIbLmpva28udjEuQ29kZUhvc3RQaW5uZWRVcmxzIiIKEkNvZGVIb3N0UGlubmVkVXJscxIMCgR1cmxzGAEgAygJImAKJFNldFNlc3Npb25Db2RlSG9zdFJlZmVyZW5jZXNSZXNwb25zZRI4CgpyZWZlcmVuY2VzGAEgASgLMiQuam9rby52MS5TZXNzaW9uQ29kZUhvc3RSZWZlcmVuY2VTZXQi0AEKG1Nlc3Npb25Db2RlSG9zdFJlZmVyZW5jZVNldBIjCghyZXZpc2lvbhgBIAEoCzIRLmpva28udjEuUmV2aXNpb24SNQoGYWN0aXZlGAIgAygLMiUuam9rby52MS5Db2RlSG9zdFB1bGxSZXF1ZXN0UmVmZXJlbmNlEjYKB3JlbW92ZWQYAyADKAsyJS5qb2tvLnYxLkNvZGVIb3N0UHVsbFJlcXVlc3RSZWZlcmVuY2USHQoVcGlubmVkX3JlZmVyZW5jZV9rZXlzGAQgAygJKsEBChhDb2RlSG9zdFB1bGxSZXF1ZXN0U3RhdGUSLAooQ09ERV9IT1NUX1BVTExfUkVRVUVTVF9TVEFURV9VTlNQRUNJRklFRBAAEiUKIUNPREVfSE9TVF9QVUxMX1JFUVVFU1RfU1RBVEVfT1BFThABEicKI0NPREVfSE9TVF9QVUxMX1JFUVVFU1RfU1RBVEVfQ0xPU0VEEAISJwojQ09ERV9IT1NUX1BVTExfUkVRVUVTVF9TVEFURV9NRVJHRUQQA2IGcHJvdG8z", [file_google_protobuf_timestamp, file_joko_v1_common]);
 
 /**
  * Credential-free identity extracted from bounded, user-visible task context.
@@ -104,6 +106,16 @@ export type CodeHostPullRequestProjection = Message<"joko.v1.CodeHostPullRequest
    * @generated from field: optional uint32 unresolved_review_thread_count = 8;
    */
   unresolvedReviewThreadCount?: number | undefined;
+
+  /**
+   * @generated from field: joko.v1.CodeHostPullRequestChecks checks = 9;
+   */
+  checks?: CodeHostPullRequestChecks | undefined;
+
+  /**
+   * @generated from field: optional bool has_conflicts = 10;
+   */
+  hasConflicts?: boolean | undefined;
 };
 
 /**
@@ -112,6 +124,45 @@ export type CodeHostPullRequestProjection = Message<"joko.v1.CodeHostPullRequest
  */
 export const CodeHostPullRequestProjectionSchema: GenMessage<CodeHostPullRequestProjection> = /*@__PURE__*/
   messageDesc(file_joko_v1_code_host, 1);
+
+/**
+ * Complete counts for the observed head. Absence indicates an incomplete or unknown check list.
+ *
+ * @generated from message joko.v1.CodeHostPullRequestChecks
+ */
+export type CodeHostPullRequestChecks = Message<"joko.v1.CodeHostPullRequestChecks"> & {
+  /**
+   * @generated from field: uint32 total = 1;
+   */
+  total: number;
+
+  /**
+   * @generated from field: uint32 passed = 2;
+   */
+  passed: number;
+
+  /**
+   * @generated from field: uint32 failed = 3;
+   */
+  failed: number;
+
+  /**
+   * @generated from field: uint32 pending = 4;
+   */
+  pending: number;
+
+  /**
+   * @generated from field: uint32 skipped = 5;
+   */
+  skipped: number;
+};
+
+/**
+ * Describes the message joko.v1.CodeHostPullRequestChecks.
+ * Use `create(CodeHostPullRequestChecksSchema)` to create a new message.
+ */
+export const CodeHostPullRequestChecksSchema: GenMessage<CodeHostPullRequestChecks> = /*@__PURE__*/
+  messageDesc(file_joko_v1_code_host, 2);
 
 /**
  * Only the local Desktop host may use this scope to inspect or start sign-in.
@@ -145,7 +196,7 @@ export type SessionCodeHostLoginScope = Message<"joko.v1.SessionCodeHostLoginSco
  * Use `create(SessionCodeHostLoginScopeSchema)` to create a new message.
  */
 export const SessionCodeHostLoginScopeSchema: GenMessage<SessionCodeHostLoginScope> = /*@__PURE__*/
-  messageDesc(file_joko_v1_code_host, 2);
+  messageDesc(file_joko_v1_code_host, 3);
 
 /**
  * @generated from message joko.v1.GetSessionCodeHostLoginRequest
@@ -162,7 +213,7 @@ export type GetSessionCodeHostLoginRequest = Message<"joko.v1.GetSessionCodeHost
  * Use `create(GetSessionCodeHostLoginRequestSchema)` to create a new message.
  */
 export const GetSessionCodeHostLoginRequestSchema: GenMessage<GetSessionCodeHostLoginRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_code_host, 3);
+  messageDesc(file_joko_v1_code_host, 4);
 
 /**
  * @generated from message joko.v1.GetSessionCodeHostLoginResponse
@@ -179,7 +230,7 @@ export type GetSessionCodeHostLoginResponse = Message<"joko.v1.GetSessionCodeHos
  * Use `create(GetSessionCodeHostLoginResponseSchema)` to create a new message.
  */
 export const GetSessionCodeHostLoginResponseSchema: GenMessage<GetSessionCodeHostLoginResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_code_host, 4);
+  messageDesc(file_joko_v1_code_host, 5);
 
 /**
  * @generated from message joko.v1.StartSessionCodeHostLoginRequest
@@ -196,7 +247,7 @@ export type StartSessionCodeHostLoginRequest = Message<"joko.v1.StartSessionCode
  * Use `create(StartSessionCodeHostLoginRequestSchema)` to create a new message.
  */
 export const StartSessionCodeHostLoginRequestSchema: GenMessage<StartSessionCodeHostLoginRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_code_host, 5);
+  messageDesc(file_joko_v1_code_host, 6);
 
 /**
  * The device code is live only for this stream and is never written to task history.
@@ -227,7 +278,149 @@ export type StartSessionCodeHostLoginResponse = Message<"joko.v1.StartSessionCod
  * Use `create(StartSessionCodeHostLoginResponseSchema)` to create a new message.
  */
 export const StartSessionCodeHostLoginResponseSchema: GenMessage<StartSessionCodeHostLoginResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_code_host, 6);
+  messageDesc(file_joko_v1_code_host, 7);
+
+/**
+ * @generated from message joko.v1.GetSessionCodeHostReferencesRequest
+ */
+export type GetSessionCodeHostReferencesRequest = Message<"joko.v1.GetSessionCodeHostReferencesRequest"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+};
+
+/**
+ * Describes the message joko.v1.GetSessionCodeHostReferencesRequest.
+ * Use `create(GetSessionCodeHostReferencesRequestSchema)` to create a new message.
+ */
+export const GetSessionCodeHostReferencesRequestSchema: GenMessage<GetSessionCodeHostReferencesRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_code_host, 8);
+
+/**
+ * @generated from message joko.v1.GetSessionCodeHostReferencesResponse
+ */
+export type GetSessionCodeHostReferencesResponse = Message<"joko.v1.GetSessionCodeHostReferencesResponse"> & {
+  /**
+   * @generated from field: joko.v1.SessionCodeHostReferenceSet references = 1;
+   */
+  references?: SessionCodeHostReferenceSet | undefined;
+};
+
+/**
+ * Describes the message joko.v1.GetSessionCodeHostReferencesResponse.
+ * Use `create(GetSessionCodeHostReferencesResponseSchema)` to create a new message.
+ */
+export const GetSessionCodeHostReferencesResponseSchema: GenMessage<GetSessionCodeHostReferencesResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_code_host, 9);
+
+/**
+ * @generated from message joko.v1.SetSessionCodeHostReferencesRequest
+ */
+export type SetSessionCodeHostReferencesRequest = Message<"joko.v1.SetSessionCodeHostReferencesRequest"> & {
+  /**
+   * @generated from field: string session_id = 1;
+   */
+  sessionId: string;
+
+  /**
+   * @generated from field: uint64 expected_generation = 2;
+   */
+  expectedGeneration: bigint;
+
+  /**
+   * @generated from field: joko.v1.Revision expected_revision = 3;
+   */
+  expectedRevision?: Revision | undefined;
+
+  /**
+   * @generated from field: repeated string ordered_urls = 4;
+   */
+  orderedUrls: string[];
+
+  /**
+   * @generated from field: repeated string removed_urls = 5;
+   */
+  removedUrls: string[];
+
+  /**
+   * @generated from field: joko.v1.CodeHostPinnedUrls pinned_urls = 6;
+   */
+  pinnedUrls?: CodeHostPinnedUrls | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SetSessionCodeHostReferencesRequest.
+ * Use `create(SetSessionCodeHostReferencesRequestSchema)` to create a new message.
+ */
+export const SetSessionCodeHostReferencesRequestSchema: GenMessage<SetSessionCodeHostReferencesRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_code_host, 10);
+
+/**
+ * @generated from message joko.v1.CodeHostPinnedUrls
+ */
+export type CodeHostPinnedUrls = Message<"joko.v1.CodeHostPinnedUrls"> & {
+  /**
+   * @generated from field: repeated string urls = 1;
+   */
+  urls: string[];
+};
+
+/**
+ * Describes the message joko.v1.CodeHostPinnedUrls.
+ * Use `create(CodeHostPinnedUrlsSchema)` to create a new message.
+ */
+export const CodeHostPinnedUrlsSchema: GenMessage<CodeHostPinnedUrls> = /*@__PURE__*/
+  messageDesc(file_joko_v1_code_host, 11);
+
+/**
+ * @generated from message joko.v1.SetSessionCodeHostReferencesResponse
+ */
+export type SetSessionCodeHostReferencesResponse = Message<"joko.v1.SetSessionCodeHostReferencesResponse"> & {
+  /**
+   * @generated from field: joko.v1.SessionCodeHostReferenceSet references = 1;
+   */
+  references?: SessionCodeHostReferenceSet | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SetSessionCodeHostReferencesResponse.
+ * Use `create(SetSessionCodeHostReferencesResponseSchema)` to create a new message.
+ */
+export const SetSessionCodeHostReferencesResponseSchema: GenMessage<SetSessionCodeHostReferencesResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_code_host, 12);
+
+/**
+ * @generated from message joko.v1.SessionCodeHostReferenceSet
+ */
+export type SessionCodeHostReferenceSet = Message<"joko.v1.SessionCodeHostReferenceSet"> & {
+  /**
+   * @generated from field: joko.v1.Revision revision = 1;
+   */
+  revision?: Revision | undefined;
+
+  /**
+   * @generated from field: repeated joko.v1.CodeHostPullRequestReference active = 2;
+   */
+  active: CodeHostPullRequestReference[];
+
+  /**
+   * @generated from field: repeated joko.v1.CodeHostPullRequestReference removed = 3;
+   */
+  removed: CodeHostPullRequestReference[];
+
+  /**
+   * @generated from field: repeated string pinned_reference_keys = 4;
+   */
+  pinnedReferenceKeys: string[];
+};
+
+/**
+ * Describes the message joko.v1.SessionCodeHostReferenceSet.
+ * Use `create(SessionCodeHostReferenceSetSchema)` to create a new message.
+ */
+export const SessionCodeHostReferenceSetSchema: GenMessage<SessionCodeHostReferenceSet> = /*@__PURE__*/
+  messageDesc(file_joko_v1_code_host, 13);
 
 /**
  * @generated from enum joko.v1.CodeHostPullRequestState

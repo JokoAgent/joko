@@ -37,25 +37,26 @@ export function parseCodeHostPullRequestReference(
     url.protocol !== "https:"
     || url.username !== ""
     || url.password !== ""
-    || url.search !== ""
-    || url.hash !== ""
   ) return undefined;
   const host = url.host.toLocaleLowerCase("en-US");
   if (host.length === 0 || host.length > 255 || /[\u0000-\u001f\u007f]/u.test(host)) return undefined;
-  const segments = url.pathname.split("/").filter((segment) => segment !== "");
-  const parsed = pullRequestPath(segments);
+  const segments = url.pathname.replace(/\/$/u, "").slice(1).split("/");
+  const parsed = pullRequestPath(segments, host);
   if (parsed === undefined) return undefined;
-  const owner = decodeRepositorySegment(parsed.owner);
+  if (host !== "github.com" && parsed.kind === "pull" && (url.search !== "" || url.hash !== "")) return undefined;
+  const owner = parsed.owner.map(decodeRepositorySegment);
   const repository = decodeRepositorySegment(parsed.repository);
-  if (owner === undefined || repository === undefined) return undefined;
+  if (owner.some(segment => segment === undefined) || repository === undefined) return undefined;
   if (!/^[1-9][0-9]{0,9}$/u.test(parsed.number)) return undefined;
   const number = Number(parsed.number);
   if (!Number.isSafeInteger(number) || number > MAX_CHANGE_NUMBER) return undefined;
   const githubPullRequest = host === "github.com" && parsed.kind === "pull";
-  const repositoryOwner = githubPullRequest ? owner.toLowerCase() : owner;
+  const repositoryOwner = githubPullRequest ? owner.join("/").toLowerCase() : owner.join("/");
   const repositoryName = githubPullRequest ? repository.toLowerCase() : repository;
+  const key = codeHostPullRequestReferenceKey({ host, repositoryOwner, repositoryName, number });
+  if (key.length > 512) return undefined;
   return {
-    key: codeHostPullRequestReferenceKey({ host, repositoryOwner, repositoryName, number }),
+    key,
     host,
     repositoryOwner,
     repositoryName,
@@ -70,22 +71,31 @@ export function codeHostPullRequestReferenceKey(
   return `${reference.host.toLocaleLowerCase("en-US")}/${reference.repositoryOwner}/${reference.repositoryName}#${reference.number}`;
 }
 
-function pullRequestPath(segments: readonly string[]): {
-  readonly owner: string;
+function pullRequestPath(segments: readonly string[], host: string): {
+  readonly owner: readonly string[];
   readonly repository: string;
   readonly number: string;
   readonly kind: "pull" | "merge-request";
 } | undefined {
-  if (segments.length === 4 && (segments[2] === "pull" || segments[2] === "pulls")) {
-    return { owner: segments[0]!, repository: segments[1]!, number: segments[3]!, kind: "pull" };
+  if ((segments[2] === "pull" || segments[2] === "pulls")
+    && (segments.length === 4 || host === "github.com" && segments.length === 5 && ["files", "commits", "checks"].includes(segments[4]!))) {
+    return { owner: [segments[0]!], repository: segments[1]!, number: segments[3]!, kind: "pull" };
   }
-  if (segments.length === 5 && segments[2] === "-" && segments[3] === "merge_requests") {
-    return { owner: segments[0]!, repository: segments[1]!, number: segments[4]!, kind: "merge-request" };
+  const separator = segments.indexOf("-");
+  if (isCodeHostGitLabHostname(host) && separator >= 2 && segments[separator + 1] === "merge_requests"
+    && (segments.length === separator + 3 || segments.length === separator + 4
+      && ["diffs", "commits", "pipelines"].includes(segments[separator + 3]!))) {
+    return { owner: segments.slice(0, separator - 1), repository: segments[separator - 1]!,
+      number: segments[separator + 2]!, kind: "merge-request" };
   }
-  if (segments.length === 4 && segments[2] === "merge_requests") {
-    return { owner: segments[0]!, repository: segments[1]!, number: segments[3]!, kind: "merge-request" };
+  if (isCodeHostGitLabHostname(host) && segments.length === 4 && segments[2] === "merge_requests") {
+    return { owner: [segments[0]!], repository: segments[1]!, number: segments[3]!, kind: "merge-request" };
   }
   return undefined;
+}
+
+function isCodeHostGitLabHostname(host: string): boolean {
+  return host !== "github.com" && /^[a-z\d](?:[a-z\d.-]*[a-z\d])?$/iu.test(host);
 }
 
 function canonicalWebUrl(
@@ -95,7 +105,7 @@ function canonicalWebUrl(
   number: number,
   kind: "pull" | "merge-request"
 ): string {
-  const owner = encodeURIComponent(repositoryOwner);
+  const owner = repositoryOwner.split("/").map(encodeURIComponent).join("/");
   const repository = encodeURIComponent(repositoryName);
   const path = kind === "pull"
     ? `/${owner}/${repository}/pull/${number}`

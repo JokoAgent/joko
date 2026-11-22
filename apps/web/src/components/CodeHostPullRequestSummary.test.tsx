@@ -28,6 +28,7 @@ describe("code-host pull request summary", () => {
           title: "Draft the badge",
           headBranch: "feature/draft-badge",
           unresolvedReviewThreadCount: 2,
+          checks: { total: 5, passed: 2, failed: 1, pending: 1, skipped: 1 },
           observedAt: 1
         }
       },
@@ -53,6 +54,7 @@ describe("code-host pull request summary", () => {
     expect(tooltip).toContain("Draft the badge");
     expect(tooltip).toContain("feature/draft-badge");
     expect(tooltip).toContain("codeHost.unresolvedReviewThreads:2");
+    expect(tooltip).toContain("codeHost.checkCounts:5:2:1:1:1");
     expect(tooltip).toContain("codeHost.statusMerged");
     const html = renderToStaticMarkup(<CodeHostPullRequestSummary pullRequests={pullRequests} t={t} />);
     expect(html).toContain("codeHost.pullRequestCount");
@@ -72,6 +74,15 @@ describe("code-host pull request summary", () => {
     }
   });
 
+  it.each([true, false, undefined])("shows GitLab conflicts independently of identical green checks (%s)", hasConflicts => {
+    const request = observedPullRequest("open", false);
+    const mr = { ...request, host: "gitlab.com", repositoryOwner: "team/sub", webUrl: "https://gitlab.com/team/sub/widgets/-/merge_requests/42",
+      projection: { ...request.projection!, hasConflicts, checks: { total: 2, passed: 2, failed: 0, pending: 0, skipped: 0 } } };
+    const tooltip = codeHostPullRequestTooltip([mr], t);
+    expect(tooltip).toContain("codeHost.checkCounts:2:2:0:0:0");
+    expect(tooltip.includes("codeHost.mergeConflicts")).toBe(hasConflicts === true);
+    expect(renderToStaticMarkup(<CodeHostPullRequestSummary pullRequests={[mr]} t={t} />)).toContain("!42");
+  });
   it("prefers a trusted workspace branch and otherwise falls back to the most recent observed PR head", () => {
     const pullRequests = [observedPullRequest("open", false), {
       ...observedPullRequest("open", false),

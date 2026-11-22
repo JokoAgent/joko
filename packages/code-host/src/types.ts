@@ -5,6 +5,14 @@ export const CODE_HOST_PULL_REQUEST_HEAD_BRANCH_MAX_LENGTH = 255;
 
 export type CodeHostPullRequestState = "open" | "closed" | "merged";
 
+export interface CodeHostPullRequestChecks {
+  readonly total: number;
+  readonly passed: number;
+  readonly failed: number;
+  readonly pending: number;
+  readonly skipped: number;
+}
+
 /** Credential-free, normalized identity extracted from user-visible task context. */
 export interface CodeHostPullRequestReference {
   readonly key: string;
@@ -23,6 +31,8 @@ export interface CodeHostPullRequestProjection {
   readonly headBranch: string;
   /** Exact GraphQL review-thread count. Absent when authentication or GraphQL is unavailable. */
   readonly unresolvedReviewThreadCount?: number;
+  readonly checks?: CodeHostPullRequestChecks;
+  readonly hasConflicts?: boolean;
   readonly observedAt: number;
 }
 
@@ -48,6 +58,8 @@ export interface CodeHostProviderResult {
   readonly title: string;
   readonly headBranch: string;
   readonly unresolvedReviewThreadCount?: number;
+  readonly checks?: CodeHostPullRequestChecks;
+  readonly hasConflicts?: boolean;
   /** Additional facts read only for an explicitly configured automation. */
   readonly activity?: CodeHostPullRequestActivity;
 }

@@ -3,6 +3,7 @@ syntax = "proto3";
 package joko.v1;
 
 import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
 
 enum CodeHostPullRequestState {
   CODE_HOST_PULL_REQUEST_STATE_UNSPECIFIED = 0;
@@ -32,6 +33,17 @@ message CodeHostPullRequestProjection {
   string title = 6;
   string head_branch = 7;
   optional uint32 unresolved_review_thread_count = 8;
+  CodeHostPullRequestChecks checks = 9;
+  optional bool has_conflicts = 10;
+}
+
+// Complete counts for the observed head. Absence indicates an incomplete or unknown check list.
+message CodeHostPullRequestChecks {
+  uint32 total = 1;
+  uint32 passed = 2;
+  uint32 failed = 3;
+  uint32 pending = 4;
+  uint32 skipped = 5;
 }
 
 // Only the local Desktop host may use this scope to inspect or start sign-in.
@@ -60,4 +72,36 @@ message StartSessionCodeHostLoginResponse {
     string device_code = 1;
     bool connected = 2;
   }
+}
+
+message GetSessionCodeHostReferencesRequest {
+  string session_id = 1;
+}
+
+message GetSessionCodeHostReferencesResponse {
+  SessionCodeHostReferenceSet references = 1;
+}
+
+message SetSessionCodeHostReferencesRequest {
+  string session_id = 1;
+  uint64 expected_generation = 2;
+  Revision expected_revision = 3;
+  repeated string ordered_urls = 4;
+  repeated string removed_urls = 5;
+  CodeHostPinnedUrls pinned_urls = 6;
+}
+
+message CodeHostPinnedUrls {
+  repeated string urls = 1;
+}
+
+message SetSessionCodeHostReferencesResponse {
+  SessionCodeHostReferenceSet references = 1;
+}
+
+message SessionCodeHostReferenceSet {
+  Revision revision = 1;
+  repeated CodeHostPullRequestReference active = 2;
+  repeated CodeHostPullRequestReference removed = 3;
+  repeated string pinned_reference_keys = 4;
 }

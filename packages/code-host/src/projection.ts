@@ -6,7 +6,7 @@ import {
   type CodeHostSessionProjection,
   type CodeHostSessionReferenceProjection
 } from "./types.js";
-import { boundedCodeHostHeadBranch, boundedCodeHostPullRequestTitle } from "./validation.js";
+import { boundedCodeHostChecks, boundedCodeHostHeadBranch, boundedCodeHostPullRequestTitle } from "./validation.js";
 
 const MAX_SESSION_OWNER_ID_LENGTH = 256;
 const MAX_REFERENCE_COUNT = 16;
@@ -90,7 +90,8 @@ function materializeReferenceProjection(value: unknown): { readonly storedKey: s
   if (!isRecord(value) || !isRecord(value["reference"])) return undefined;
   const raw = value["reference"];
   const host = boundedText(raw["host"], 255);
-  const repositoryOwner = boundedRepositoryPart(raw["repositoryOwner"]);
+  const ownerPath = boundedText(raw["repositoryOwner"], 512);
+  const repositoryOwner = ownerPath?.split("/").every(part => boundedRepositoryPart(part) !== undefined) ? ownerPath : undefined;
   const repositoryName = boundedRepositoryPart(raw["repositoryName"]);
   const number = safeInteger(raw["number"], 1, 2_147_483_647);
   const key = boundedText(raw["key"], 512);
@@ -136,6 +137,7 @@ function materializeProjection(value: unknown): CodeHostPullRequestProjection | 
   const draft = value["draft"];
   const title = boundedCodeHostPullRequestTitle(value["title"]);
   const headBranch = boundedCodeHostHeadBranch(value["headBranch"]);
+  const checks = boundedCodeHostChecks(value["checks"]);
   const unresolvedReviewThreadCount = value["unresolvedReviewThreadCount"] === undefined
     ? undefined
     : safeInteger(value["unresolvedReviewThreadCount"], 0, 100);
@@ -153,7 +155,9 @@ function materializeProjection(value: unknown): CodeHostPullRequestProjection | 
     draft,
     title,
     headBranch,
+    ...(typeof value["hasConflicts"] === "boolean" ? { hasConflicts: value["hasConflicts"] } : {}),
     ...(unresolvedReviewThreadCount === undefined ? {} : { unresolvedReviewThreadCount }),
+    ...(checks === undefined ? {} : { checks }),
     observedAt
   };
 }

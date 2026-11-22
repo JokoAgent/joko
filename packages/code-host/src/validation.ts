@@ -1,6 +1,7 @@
 import {
   CODE_HOST_PULL_REQUEST_HEAD_BRANCH_MAX_LENGTH,
-  CODE_HOST_PULL_REQUEST_TITLE_MAX_LENGTH
+  CODE_HOST_PULL_REQUEST_TITLE_MAX_LENGTH,
+  type CodeHostPullRequestChecks
 } from "./types.js";
 
 const UNSAFE_DISPLAY_CHARACTER = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
@@ -8,6 +9,16 @@ const UNSAFE_REF_CHARACTER = /[\u0000-\u0020\u007f~^:?*[\\]/u;
 
 export function boundedCodeHostPullRequestTitle(value: unknown): string | undefined {
   return boundedDisplayText(value, CODE_HOST_PULL_REQUEST_TITLE_MAX_LENGTH);
+}
+
+export function boundedCodeHostChecks(value: unknown): CodeHostPullRequestChecks | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const { total, passed, failed, pending, skipped } = value as Record<string, unknown>;
+  const count = (entry: unknown): entry is number => typeof entry === "number"
+    && Number.isInteger(entry) && entry >= 0 && entry <= 100;
+  if (count(total) && count(passed) && count(failed) && count(pending) && count(skipped)
+    && total === passed + failed + pending + skipped) return { total, passed, failed, pending, skipped };
+  return undefined;
 }
 
 export function boundedCodeHostHeadBranch(value: unknown): string | undefined {

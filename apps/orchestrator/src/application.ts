@@ -36,6 +36,7 @@ import {
 } from "@joko/adapter-pi";
 import {
   createAuthenticatedCodeHostProvider,
+  createGitLabCodeHostProvider,
   createGhCliTokenSource,
   createPublicCodeHostProvider,
   type CodeHostProvider,
@@ -451,6 +452,7 @@ export function composeCodeHostProviders(
     ? Object.freeze([publicProvider])
     : Object.freeze([
       createAuthenticatedCodeHostProvider({ authorization, ...(credentialSource === undefined ? {} : { credentialSource }) }),
+      createGitLabCodeHostProvider({ authorization }),
       publicProvider
     ]);
 }
@@ -623,6 +625,7 @@ export interface OrchestratorApplication {
   readonly sessionNavigation?: SessionNavigationCoordinator;
   /** Capability-owned code-host adapters; each resolves its own credential reference. */
   readonly codeHostProviders?: readonly CodeHostProvider[];
+  readonly codeHostAssociationProviders?: (scope: CodeHostSessionAuthorizationPort) => readonly CodeHostProvider[];
   readonly codeHostCredentials?: GhCliTokenSource;
   /** Publishes a fresh immutable generation for new runtimes without interrupting active ones. */
   readonly refreshPiGeneration?: () => Promise<void>;
@@ -3964,6 +3967,8 @@ export async function createOrchestratorApplication(
     modelFavorites,
     sessionNavigation,
     codeHostProviders,
+    codeHostAssociationProviders: (scope: CodeHostSessionAuthorizationPort) =>
+      composeCodeHostProviders(dependencies.codeHostProviders, scope, codeHostCredentials),
     ...(codeHostCredentials === undefined ? {} : { codeHostCredentials }),
     refreshPiGeneration,
     resolveSessionContextDefaults,

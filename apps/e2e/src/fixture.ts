@@ -108,6 +108,7 @@ export interface FixtureOptions {
   /** Bind explicitly enabled private-LAN HTTP to one fixture-owned host interface. */
   readonly publicLanHost?: string;
   readonly terminals?: OrchestratorApplication["terminals"];
+  readonly codeHostProviders?: OrchestratorApplication["codeHostProviders"];
   readonly scheduler?: Pick<ScheduleCoordinatorOptions, "now" | "heartbeatLeaseMs" | "pullRequestProviders">;
   readonly createAuxiliaryServices?: (
     store: OperationalStore,
@@ -556,6 +557,7 @@ export class OrchestratorE2eFixture {
     const serverAccessMedia = accessCredentials && new ServerAccessMedia({ config, serverId, store, credentials: accessCredentials,
       fallbackIce: { getConfiguration: async () => [] }, fetch, isLocalDesktopRoute: identity => devicePeers.isLocalDesktopRoute(identity) });
     const application: OrchestratorApplication = {
+      codeHostProviders: options.codeHostProviders,
       config,
       store,
       connections,

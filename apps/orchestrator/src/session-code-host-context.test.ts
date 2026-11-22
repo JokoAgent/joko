@@ -58,7 +58,8 @@ describe("Session code-host context", () => {
         draft: false,
         title: "Persist projection metadata",
         headBranch: "feature/persist-projection",
-        unresolvedReviewThreadCount: 0
+        unresolvedReviewThreadCount: 0,
+        checks: { total: 4, passed: 1, failed: 1, pending: 1, skipped: 1 }
       }))
     };
     fixture.store.appendEvent({
@@ -118,7 +119,8 @@ describe("Session code-host context", () => {
       draft: false,
       title: "Persist projection metadata",
       headBranch: "feature/persist-projection",
-      unresolvedReviewThreadCount: 0
+      unresolvedReviewThreadCount: 0,
+      checks: { total: 4, passed: 1, failed: 1, pending: 1, skipped: 1 }
     });
 
     const filePath = fixture.store.filePath;

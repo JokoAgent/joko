@@ -357,7 +357,7 @@ function parseUnresolvedReviewThreadCount(pullRequest: Readonly<Record<string, u
   return unresolved;
 }
 
-function assertJsonResponse(response: Response): void {
+export function assertJsonResponse(response: Response): void {
   const contentType = response.headers.get("content-type")
     ?.split(";", 1)[0]
     ?.trim()
@@ -367,7 +367,7 @@ function assertJsonResponse(response: Response): void {
   }
 }
 
-async function readBoundedJson(response: Response, maximumBytes: number): Promise<unknown> {
+export async function readBoundedJson(response: Response, maximumBytes: number): Promise<unknown> {
   const declaredLength = response.headers.get("content-length");
   if (declaredLength !== null) {
     const length = Number(declaredLength);

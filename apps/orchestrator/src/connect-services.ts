@@ -518,7 +518,9 @@ import {
 } from "./voice-input-settings.js";
 import { createWorktreeConnectService } from "./worktree-connect-service.js";
 import { workspaceIdFor } from "./workspace-run-capture.js";
-import { installSessionCodeHostContextRuntime } from "./session-code-host-context.js";
+import { installSessionCodeHostContextRuntime, parseManagedPullRequestUrls, readSessionPullRequestAssociations,
+  validateNewPullRequestAssociations, writeSessionPullRequestAssociations } from "./session-code-host-context.js";
+import { CodeHostPullRequestNotFoundError } from "@joko/code-host";
 import { SessionCodeHostLogin } from "./session-code-host-login.js";
 import type { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
 import { recordSshWorktreeDisplayRename } from "./ssh-worktree-rename-authority.js";
@@ -2881,6 +2883,47 @@ export function createConnectServices(application: OrchestratorApplication, proj
     getSessionCodeHostLogin: async (request, context) => {
       const { scope, assertCurrent } = codeHostLoginOwner(request.scope, context);
       return { signInRequired: await sessionCodeHostLogin.requiresSignIn(scope, assertCurrent) };
+    },
+    getSessionCodeHostReferences: (request, context) => {
+      authenticate(context);
+      const stored = managedPullRequestSession(dependencies.store, request.sessionId);
+      return { references: mapSessionCodeHostReferenceSet(readSessionPullRequestAssociations(dependencies.store, stored)) };
+    },
+    setSessionCodeHostReferences: async (request, context) => {
+      const connection = authenticate(context);
+      const store = dependencies.store;
+      const owner = captureConnectionRevocation(dependencies.connections, connection);
+      const signal = AbortSignal.any([owner.signal, context.signal, AbortSignal.timeout(25_000),
+        ...(projectionShutdownSignal === undefined ? [] : [projectionShutdownSignal])]);
+      const assertCurrent = () => {
+        dependencies.connections.fence(connection);
+        signal.throwIfAborted();
+        const stored = managedPullRequestSession(store, request.sessionId);
+        if (stored.descriptor.archived) throw new ConnectError("Restore this task before editing its pull requests.", Code.FailedPrecondition);
+        const current = readSessionPullRequestAssociations(store, stored);
+        if (request.expectedGeneration !== BigInt(stored.descriptor.binding.generation) || request.expectedRevision?.value !== current.revision) {
+          throw new ConnectError("The task or its pull request associations changed. Refresh before editing them.", Code.Aborted);
+        }
+        return { stored, current };
+      };
+      try {
+        const { current } = assertCurrent();
+        const associations = parseManagedPullRequestUrls(request.orderedUrls, request.removedUrls, request.pinnedUrls?.urls,
+          current.pinned.map(reference => reference.webUrl));
+        if (associations === undefined) throw invalidArgument("Provide up to 16 distinct pull or merge requests in each list, with up to three active requests pinned.");
+        try {
+          await validateNewPullRequestAssociations(request.sessionId, associations, current.active,
+            application.codeHostAssociationProviders ?? (() => application.codeHostProviders ?? []), assertCurrent, signal);
+        } catch (error) {
+          assertCurrent();
+          if (error instanceof CodeHostPullRequestNotFoundError) throw new ConnectError("The pull or merge request is unavailable to this connection.", Code.NotFound);
+          throw error;
+        }
+        const references = writeSessionPullRequestAssociations(store, assertCurrent().stored, associations);
+        return { references: mapSessionCodeHostReferenceSet(references) };
+      } finally {
+        owner.dispose();
+      }
     },
     startSessionCodeHostLogin: async function* (request, context) {
       const { connection, scope, assertCurrent } = codeHostLoginOwner(request.scope, context);
@@ -9953,6 +9996,29 @@ function managedProviderCatalogApplies(
   if (providerId !== undefined && !dependencies.providers.list(backendId).some((provider) => provider.provider.id === providerId)) return false;
   return dependencies.store.getBackend(backendId).descriptor.capabilities
     .get(MANAGED_PROVIDER_CATALOG_CAPABILITY)?.supported === true;
+}
+
+function managedPullRequestSession(store: OperationalStore, id: string) {
+  const stored = store.getSession(nonBlankRequest(id, "session_id"));
+  const session = stored.descriptor;
+  if (session.deletedAt !== undefined || session.hidden || session.derivationOrigin?.sideChat
+    || store.findSessionRuntimePolicy(id) !== undefined || store.findCollaborationWorkerBySession(id) !== undefined) {
+    throw new ConnectError("Pull request associations are available on ordinary tasks.", Code.FailedPrecondition);
+  }
+  return stored;
+}
+
+function mapSessionCodeHostReferenceSet(input: ReturnType<typeof readSessionPullRequestAssociations>) {
+  const map = (ref: typeof input.active[number]) => create(contract.CodeHostPullRequestReferenceSchema, {
+    referenceKey: ref.key, host: ref.host, repositoryOwner: ref.repositoryOwner, repositoryName: ref.repositoryName,
+    number: BigInt(ref.number), webUrl: ref.webUrl
+  });
+  return create(contract.SessionCodeHostReferenceSetSchema, {
+    revision: create(contract.RevisionSchema, { value: input.revision, etag: "" }),
+    active: input.active.map(map),
+    removed: input.removed.map(map),
+    pinnedReferenceKeys: input.pinned.map(reference => reference.key)
+  });
 }
 
 export function backendCatalogModels(

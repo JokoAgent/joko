@@ -3557,6 +3557,22 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return this.sessionRuntimeGateway().getSessionRuntimeControl(sessionId);
   }
 
+  async getSessionCodeHostReferences(sessionId: string, signal?: AbortSignal) {
+    const scope = this.captureActionScope(signal);
+    const result = await createClient(SessionService, scope.transport).getSessionCodeHostReferences({ sessionId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (result.references === undefined) throw new GatewayError("The task pull request associations are unavailable.");
+    return result.references;
+  }
+
+  async setSessionCodeHostReferences(input: Parameters<NonNullable<OperationApi["setSessionCodeHostReferences"]>>[0], signal?: AbortSignal) {
+    const scope = this.captureActionScope(signal);
+    const result = await createClient(SessionService, scope.transport).setSessionCodeHostReferences(input, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (result.references === undefined) throw new GatewayError("The task pull request associations are unavailable.");
+    return result.references;
+  }
+
   setRuntimeModel(sessionId: string, selection: SessionRuntimeModelSelection): Promise<void> {
     if (this.#taskSharing !== undefined) return this.setSharedTaskRuntime(sessionId, selection);
     return this.sessionRuntimeGateway().setRuntimeModel(sessionId, selection);
@@ -15948,6 +15964,7 @@ function validatedCodeHostPullRequestProjection(
 ): NonNullable<NonNullable<SessionView["codeHostPullRequests"]>[number]["projection"]> {
   const title = boundedCodeHostDisplayText(value.title, 512);
   const headBranch = boundedCodeHostBranch(value.headBranch);
+  const checks = value.checks;
   if (
     title === undefined
     || headBranch === undefined
@@ -15971,6 +15988,9 @@ function validatedCodeHostPullRequestProjection(
         ...(value.unresolvedReviewThreadCount === undefined
           ? {}
           : { unresolvedReviewThreadCount: value.unresolvedReviewThreadCount }),
+        ...(value.hasConflicts === undefined ? {} : { hasConflicts: value.hasConflicts }),
+        ...(checks === undefined || checks.total > 100 || checks.total !== checks.passed + checks.failed + checks.pending + checks.skipped
+          ? {} : { checks: { total: checks.total, passed: checks.passed, failed: checks.failed, pending: checks.pending, skipped: checks.skipped } }),
         observedAt: timestampMs(value.observedAt)
   };
 }
@@ -15985,7 +16005,7 @@ function assertCodeHostPullRequestReference(
     || reference.host.length > 255
     || reference.host !== reference.host.toLocaleLowerCase("en-US")
     || /[\u0000-\u0020\u007f]/u.test(reference.host)
-    || !repositoryPart.test(reference.repositoryOwner)
+    || !reference.repositoryOwner.split("/").every(part => repositoryPart.test(part))
     || !repositoryPart.test(reference.repositoryName)
     || !Number.isSafeInteger(number)
     || number <= 0
@@ -16018,10 +16038,11 @@ function isCanonicalCodeHostPullRequestWebUrl(
     || url.search !== ""
     || url.hash !== ""
   ) return false;
-  const owner = encodeURIComponent(repositoryOwner);
+  const owner = repositoryOwner.split("/").map(encodeURIComponent).join("/");
   const repository = encodeURIComponent(repositoryName);
-  return url.pathname === `/${owner}/${repository}/pull/${number}`
-    || url.pathname === `/${owner}/${repository}/-/merge_requests/${number}`;
+  return !repositoryOwner.includes("/") && url.pathname === `/${owner}/${repository}/pull/${number}`
+    || host !== "github.com" && /^[a-z\d](?:[a-z\d.-]*[a-z\d])?$/iu.test(host)
+      && url.pathname === `/${owner}/${repository}/-/merge_requests/${number}`;
 }
 
 function boundedCodeHostDisplayText(value: unknown, maximumLength: number): string | undefined {

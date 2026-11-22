@@ -244,7 +244,8 @@ function observe(result: CodeHostProviderResult): Observation {
 function matchesChange(rule: SchedulePullRequestRule, previous: Observation, current: Observation): boolean {
   const changed = (key: keyof Observation) => previous[key] !== undefined && current[key] !== undefined && previous[key] !== current[key];
   const checksChanged = current.checks !== undefined && previous.checks !== current.checks;
-  const review = changed("threads") || changed("reviewDecision") || changed("comments") || changed("reviewComments");
+  const reviewDecisionChanged = current.reviewDecision !== undefined && previous.reviewDecision !== current.reviewDecision;
+  const review = reviewDecisionChanged || changed("threads") || changed("comments") || changed("reviewComments");
   switch (rule.change) {
     case "merged": return previous.state !== "merged" && current.state === "merged";
     case "review": return review;

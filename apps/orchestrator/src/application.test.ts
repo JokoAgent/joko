@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 
 import { CodexBackendAdapter } from "@joko/adapter-codex";
 import { PiBackendAdapter } from "@joko/adapter-pi";
+import { parseCodeHostPullRequestReference } from "@joko/code-host";
 import { createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
 import { OperationService, RemoteHostAuthenticationMode, RemoteHostService, RemoteHostStatus, SshKeyService } from "@joko/contracts";
@@ -419,9 +420,11 @@ describe("Orchestrator application composition", () => {
       authorize: () => ({ sessionOwnerId: "session-a", referenceKey: "github.com/acme/widgets#42", ownerRevision: "1" }),
       isCurrent: () => true
     });
-    expect(ownerFencedDefaults).toHaveLength(2);
+    expect(ownerFencedDefaults).toHaveLength(3);
     expect(ownerFencedDefaults[0]?.minimumTimeToLiveMs).toBe(60_000);
-    expect(ownerFencedDefaults[1]?.minimumTimeToLiveMs).toBe(60 * 60_000);
+    expect(ownerFencedDefaults[1]?.supports({ key: "gitlab.com/acme/widgets#42", host: "gitlab.com", repositoryOwner: "acme",
+      repositoryName: "widgets", number: 42, webUrl: "https://gitlab.com/acme/widgets/-/merge_requests/42" })).toBe(true);
+    expect(ownerFencedDefaults[2]?.minimumTimeToLiveMs).toBe(60 * 60_000);
 
     const replacement = {
       capability: "code-host.pull-request" as const,
@@ -658,23 +661,11 @@ describe("Orchestrator application composition", () => {
     });
 
     expect(application.credentials?.list()).toEqual([]);
-    expect(application.codeHostProviders).toHaveLength(2);
-    expect(application.codeHostProviders?.[0]?.supports({
-      key: "github.com/acme/widgets#42",
-      host: "github.com",
-      repositoryOwner: "acme",
-      repositoryName: "widgets",
-      number: 42,
-      webUrl: "https://github.com/acme/widgets/pull/42"
-    })).toBe(true);
-    expect(application.codeHostProviders?.[1]?.supports({
-      key: "github.com/acme/widgets#42",
-      host: "github.com",
-      repositoryOwner: "acme",
-      repositoryName: "widgets",
-      number: 42,
-      webUrl: "https://github.com/acme/widgets/pull/42"
-    })).toBe(true);
+    const pull = parseCodeHostPullRequestReference("https://github.com/acme/widgets/pull/42");
+    const merge = parseCodeHostPullRequestReference("https://gitlab.com/acme/widgets/-/merge_requests/42");
+    if (!pull || !merge) throw new Error("Code-host fixture links did not parse.");
+    expect(application.codeHostProviders?.map(provider => provider.supports(pull))).toEqual([true, false, true]);
+    expect(application.codeHostProviders?.map(provider => provider.supports(merge))).toEqual([false, true, false]);
     expect(application.providers?.list().map((item) => item.provider.id)).toEqual(expect.arrayContaining([
       "openai-codex",
       "github-copilot"

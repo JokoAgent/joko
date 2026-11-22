@@ -1,6 +1,7 @@
 export * from "./authenticated-provider.js";
 export * from "./coordinator.js";
 export * from "./gh-cli-token-source.js";
+export * from "./gitlab-provider.js";
 export * from "./projection.js";
 export * from "./public-provider.js";
 export * from "./reference.js";
