@@ -2006,6 +2006,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
         resolveSessionContextDefaults: dependencies.resolveSessionContextDefaults,
         resolveSideChatSourceAllowed: sessionId => dependencies.sessionHost.sideChatSourceAllowed(sessionId),
         resolveInboxSnoozeAllowed: session => dependencies.sessionHost.canSnoozeSession?.(session) === true,
+        resolveSessionModelOptions: session => dependencies.sessionHost.sessionModelOptions?.(session),
         resolveSessionRuntimeModel: ({ sessionId }) =>
           dependencies.sessionHost.getSessionRuntimeControl(sessionId).effective
       });
@@ -8283,6 +8284,7 @@ function eventContext(
     ? sessionProjectionContext(store, session, {
         sideChatSourceAllowed: dependencies.sessionHost.sideChatSourceAllowed(session.descriptor.id),
         inboxSnoozeAllowed: dependencies.sessionHost.canSnoozeSession?.(session) === true,
+        modelOptions: dependencies.sessionHost.sessionModelOptions?.(session),
         ...(sessionActiveRun === undefined ? {} : { activeRun: sessionActiveRun }),
         runtimeAttached: sessionActiveRun !== undefined,
         resolveContextDefaults: dependencies.resolveSessionContextDefaults,
@@ -8454,6 +8456,7 @@ export function mapSession(
   return toProtoSession(session, sessionProjectionContext(dependencies.store, session, {
     sideChatSourceAllowed: dependencies.sessionHost.sideChatSourceAllowed(session.descriptor.id),
     inboxSnoozeAllowed: dependencies.sessionHost.canSnoozeSession?.(session) === true,
+    modelOptions: dependencies.sessionHost.sessionModelOptions?.(session),
     ...(sessionActiveRun === undefined ? {} : { activeRun: sessionActiveRun }),
     runtimeAttached: sessionActiveRun !== undefined,
     resolveContextDefaults: dependencies.resolveSessionContextDefaults,
@@ -18725,7 +18728,8 @@ async function dispatchMutation(
       const modelKey = model?.model;
       if (model === undefined || modelKey === undefined) return unsupportedOperation(dependencies, operationId, connection, mutation, payload.case, "Model selection is required.");
       const stored = dependencies.store.getSession(payload.value.sessionId);
-      const selectedModel = dependencies.store.getBackend(stored.descriptor.backendId).descriptor.models.find((candidate) =>
+      const catalog = host.sessionModelOptions?.(stored) ?? dependencies.store.getBackend(stored.descriptor.backendId).descriptor.models;
+      const selectedModel = catalog.find((candidate) =>
         candidate.providerId === modelKey.providerId && candidate.modelId === modelKey.modelId);
       if (selectedModel === undefined) {
         throw new ConnectError("The selected model is not advertised by this Backend instance.", Code.FailedPrecondition);

@@ -181,6 +181,7 @@ export type EventPayload =
       readonly partnerPackageOpening?: PartnerPackageOpeningMessage;
       /** Per-message provider accounting when authoritatively reported. */
       readonly usage?: UsageSnapshot;
+      readonly stopReason?: string;
       /** Native-observed replacement of the selected model, scoped to this assistant completion. */
       readonly modelSubstitution?: { readonly selectedModelId: string; readonly actualModelId: string };
       /** Service-owned money semantics; a subscription/reference value is not a billed charge. */
@@ -267,6 +268,7 @@ export type EventPayload =
       readonly output: string;
       readonly parts?: readonly ToolResultContentPart[];
       readonly isError: boolean;
+      readonly aborted?: true;
       readonly artifact?: BlobRef;
       /** Service-authored result of a verified document write. */
       readonly documentOutput?: DocumentOutputResult;

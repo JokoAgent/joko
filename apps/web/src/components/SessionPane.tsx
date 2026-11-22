@@ -2430,6 +2430,13 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       && candidate.capabilities.get("input.text")?.supported && candidate.capabilities.get("model.switch")?.supported)
     && controller.state.snapshot.settings.backendSettings.find(setting => setting.backendId === model.backendId)?.enabled !== false)
     : backendModels;
+  const scopedSessionModels = session.modelOptions?.map(model => ({
+    ...model,
+    routingEnabled: backendModels.find(candidate => candidate.providerId === model.providerId
+      && candidate.modelId === model.modelId)?.routingEnabled ?? model.routingEnabled
+  }));
+  const pickerModels = scopedSessionModels === undefined ? unifiedSessionModels
+    : [...scopedSessionModels, ...unifiedSessionModels.filter(model => model.backendId !== session.backendId)];
   const composerControls = partnerRuntimeLocked ? undefined : (
     <div className="composer__controls" aria-label={t("session.controls")}>
       {canSetPermission && <PermissionSelector
@@ -2445,7 +2452,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       )}
       {(canSwitchModel || ((canSetEffort || canSetFast) && session.model !== undefined)) && <ModelPicker
         className="control-select"
-        models={canSwitchModel ? unifiedSessionModels : session.model === undefined ? [] : [session.model]}
+        models={canSwitchModel ? pickerModels : session.model === undefined ? [] : [session.model]}
         ownerId={modelPreferenceOwnerId(controller.state.activeProfile?.serverId)}
         favoriteSettings={controller.state.snapshot.settings.modelFavorites}
         onMutateFavorite={guest ? undefined : controller.updateModelFavorites}

@@ -4,6 +4,7 @@ import { MAXIMUM_EDITABLE_PLAN_LENGTH, modelPricesWithOverride, NATIVE_HISTORY_A
   parseNativeModelUsage, parseNativeUsageRequests, type ModelPriceOverride } from "@joko/core";
 import { DocumentPathError, type DocumentPathAuthorizer } from "@joko/tool-document";
 import { DOCUMENT_TOOL_PROVIDER_ID } from "./document-tool-provider.js";
+import { ACP_ENGINE_KIND, ExtensionAcpAdapter } from "./extension-acp-adapter.js";
 import { prepareWorkerRuntimeWorkspace, readWorkerWorkspaceBinding, workerPathWithin, workerWorkspaceTarget, WORKER_WORKSPACE_BINDING_KEY, createSideChatWorkspaceReference,
   type WorkerWorkspacePlan } from "./collaboration-worker-workspace.js";
 import { copyableWorkerStatus, publishTaskCopyGoal, type CopiedWorker, type TaskCopyImportRole } from "./task-copy-group.js";
@@ -2751,11 +2752,12 @@ export class SessionHost {
         ? snapshot.pending?.profile ?? snapshot.effective ?? baseline
         : snapshot.effective ?? baseline;
       const backend = this.#store.getBackend(stored.descriptor.backendId).descriptor;
+      const models = this.sessionModelOptions(stored) ?? backend.models;
       const profile = resolveSessionRuntimeProfile({
         baseline,
         current,
         patch: input.patch,
-        models: backend.models,
+        models,
         fastModeSupported: backend.capabilities.get("model.fast_mode")?.supported === true
       });
       if (profile === undefined) {
@@ -2789,7 +2791,7 @@ export class SessionHost {
             resolveCompatibleSessionRuntimeAxisPatch({
               profile: snapshot.pending.profile,
               patch: input.patch,
-              models: backend.models,
+              models,
               fastModeSupported: backend.capabilities.get("model.fast_mode")?.supported === true
             })
           )
@@ -3194,8 +3196,9 @@ export class SessionHost {
       const snapshot = this.#sessionRuntimeControl.snapshot(sessionId, baseline);
       const effective = snapshot.effective ?? baseline;
       const backend = this.#store.getBackend(stored.descriptor.backendId).descriptor;
+      const models = this.sessionModelOptions(stored) ?? backend.models;
       const fastModeSupported = backend.capabilities.get("model.fast_mode")?.supported === true;
-      const selected = backend.models.find((candidate) =>
+      const selected = models.find((candidate) =>
         candidate.providerId === effective.providerId && candidate.modelId === effective.modelId);
       if (selected === undefined || (
         patch.effort === null && selected.thinkingLevels.length > 0
@@ -3212,7 +3215,7 @@ export class SessionHost {
           ...(typeof patch.effort === "string" ? { effort: patch.effort } : {}),
           ...(patch.fastMode === undefined ? {} : { fastMode: patch.fastMode })
         },
-        models: backend.models,
+        models,
         fastModeSupported
       });
       if (profile === undefined) {
@@ -3233,7 +3236,7 @@ export class SessionHost {
         : resolveCompatibleSessionRuntimeAxisPatch({
             profile: snapshot.pending.profile,
             patch,
-            models: backend.models,
+            models,
             fastModeSupported
           });
       const active = await this.activate(sessionId);
@@ -7921,7 +7924,7 @@ export class SessionHost {
       const context = this.#sessionRuntimeFallbackContext(stored.descriptor.backendId);
       candidate = pickSessionRuntimeFallback({
         current: snapshot.effective,
-        models: backend.models.filter((model) =>
+        models: (this.sessionModelOptions(stored) ?? backend.models).filter((model) =>
           this.#modelRoutingEnabled(backend.id, model.providerId, model.modelId)),
         availableProviderIds: context.availableProviderIds,
         requireMatchingApi: (this.#providerGroups?.directory.sources().find(source =>
@@ -7997,7 +8000,7 @@ export class SessionHost {
       || options.reconcileNativePolicy === true && backend.capabilities.get("plan_mode")?.supported === true);
     const selectedModel = providerId === undefined || modelId === undefined
       ? undefined
-      : backend.models.find((candidate) =>
+      : (this.sessionModelOptions(stored) ?? backend.models).find((candidate) =>
           candidate.providerId === providerId && candidate.modelId === modelId);
     if (hasProvider && selectedModel === undefined) {
       throw turnOverrideError(
@@ -8220,7 +8223,7 @@ export class SessionHost {
     const effectiveModelId = modelId ?? stored.descriptor.modelId;
     const effectiveModel = effectiveProviderId === undefined || effectiveModelId === undefined
       ? undefined
-      : backend.models.find((candidate) =>
+      : (this.sessionModelOptions(stored) ?? backend.models).find((candidate) =>
           candidate.providerId === effectiveProviderId && candidate.modelId === effectiveModelId);
     if (hasProvider && effectiveModel === undefined) {
       throw turnOverrideError(
@@ -16791,6 +16794,42 @@ export class SessionHost {
       : { ...context, modelSelection: { providerId, modelId } };
   }
 
+  async recordAcpBackgroundToolEvent(backendId: string, backendInstanceGeneration: number, sessionId: string,
+    binding: NativeSessionBinding, payload: Extract<EventPayload, { type: "tool_start" | "tool_update" | "tool_result" }>): Promise<void> {
+    const active = this.#active.get(sessionId);
+    if (this.#disposed || active?.adapter.id !== backendId || active.backendInstanceGeneration !== backendInstanceGeneration) return;
+    const stored = this.#store.getSession(sessionId);
+    const session = stored.descriptor;
+    if (session.backendId !== backendId || !sameNativeBinding(session.binding, binding) || session.archived || session.deletedAt !== undefined) return;
+    const context = this.contextFor(stored, undefined, undefined, undefined, undefined, backendInstanceGeneration);
+    if (!context.target.trusted) return;
+    context.nativeToolAuthorization?.assertCurrent();
+    await context.emit(payload, { namespace: "acp.session", fields: { turnScope: "background" } });
+  }
+
+  recordAcpSessionModels(backendId: string, sessionId: string, binding: NativeSessionBinding, models: readonly ProviderModel[]): void {
+    const stored = this.#store.findSession(sessionId);
+    if (!stored || stored.descriptor.backendId !== backendId || !sameNativeBinding(stored.descriptor.binding, binding)
+      || stored.descriptor.deletedAt !== undefined) return;
+    const key = "plugin-acp.session-models.v1";
+    const value = { binding: nativeBindingFingerprint(binding.opaqueRef), models };
+    if (JSON.stringify(this.#store.findSetting("session", sessionId, key)?.value) === JSON.stringify(value)) return;
+    this.#store.transaction(store => {
+      store.setSetting("session", sessionId, key, value);
+      store.appendEvent({ backendId, targetId: stored.descriptor.targetId, sessionId, generation: binding.generation,
+        traceId: "acp-session-model-catalog", payload: { type: "session_changed" } });
+    });
+  }
+
+  sessionModelOptions(stored: StoredSession): readonly ProviderModel[] | undefined {
+    const session = stored.descriptor;
+    const backend = this.#store.getBackend(session.backendId).descriptor;
+    if (backend.adapterKind !== ACP_ENGINE_KIND) return undefined;
+    if (backend.health === "unavailable") return [];
+    const saved = this.#store.findSetting<{ binding: string; models: readonly ProviderModel[] }>("session", session.id, "plugin-acp.session-models.v1")?.value;
+    return saved?.binding === nativeBindingFingerprint(session.binding.opaqueRef) ? saved.models : [];
+  }
+
   private provisionalContext(
     sessionId: string,
     target: TargetDescriptor,
@@ -19724,6 +19763,13 @@ export class SessionHost {
   private setActiveSession(sessionId: string, active: ActiveSession): void {
     this.#activeResourceCatalogs.delete(sessionId);
     this.#active.set(sessionId, active);
+    if (active.adapter instanceof ExtensionAcpAdapter) {
+      const binding = this.#store.findSession(sessionId)?.descriptor.binding;
+      if (binding !== undefined) {
+        const models = active.adapter.sessionModels(sessionId, binding);
+        if (models !== undefined) this.recordAcpSessionModels(active.adapter.id, sessionId, binding, models);
+      }
+    }
   }
 
   private deleteActiveSession(sessionId: string, expected?: ActiveSession): void {

@@ -131,6 +131,9 @@ export class ExtensionAcpEngines {
               const adapter = new ExtensionAcpAdapter({
                 id, generation, name: slot.name, approved: () => !this.closed && slot.approval !== undefined && current(slot.approval),
                 open: context => this.open(slot, generation, context), readBlob: this.options.readBlob,
+                emitBackgroundTool: (sessionId, binding, payload) =>
+                  this.options.host.recordAcpBackgroundToolEvent(id, generation, sessionId, binding, payload),
+                sessionCatalogChanged: (sessionId, binding, models) => this.options.host.recordAcpSessionModels(id, sessionId, binding, models),
                 catalogChanged: observed => {
                   const approval = slot.approval;
                   if (this.closed || approval === undefined || !current(approval)) return;

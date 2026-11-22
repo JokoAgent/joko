@@ -393,6 +393,7 @@ export interface SessionMappingContext {
   /** Latest durable, visible user-authored input; automatic continuations are excluded. */
   readonly lastUserInputAt?: number;
   readonly codeHostPullRequests?: readonly CodeHostSessionReferenceProjection[];
+  readonly modelOptions?: readonly ProviderModel[];
   readonly derivationOriginAvailability?: {
     readonly sourceSessionAvailable: boolean;
     readonly sourceMessageAvailable: boolean;
@@ -749,6 +750,9 @@ export function toProtoSession(record: StoredSession, context: SessionMappingCon
           autoRetry: context.contextState.autoRetry
         }),
     codeHostPullRequests: (context.codeHostPullRequests ?? []).map(toProtoCodeHostPullRequest),
+    modelCatalog: context.modelOptions === undefined ? undefined : message<contract.SessionModelCatalog>("joko.v1.SessionModelCatalog", {
+      models: context.modelOptions.map(model => ({ ...toProtoModelDescriptor(session.backendId, model), available: true }))
+    }),
     taskTags: (session.taskTags ?? []).map(toProtoTaskTag),
     attention: session.attention === undefined ? undefined : toProtoSessionAttention(session.attention),
     worktree: session.worktree === undefined ? undefined : toProtoSessionWorktree(session.worktree),
@@ -3214,7 +3218,7 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
           && context.run.descriptor.usage.messageId === (payload.nativeHistory?.identity?.entryId ?? event.id)
           ? toProtoRunUsageSummary(context.run.descriptor.usage)
           : payload.turnUsage === undefined ? undefined : toProtoMessageTurnUsage(payload.turnUsage, event),
-        stopReason: "",
+        stopReason: payload.stopReason ?? "",
         nativeIdentity,
         partnerPrivateOrigin: payload.partnerPrivateOrigin === undefined ? undefined
           : message<contract.PartnerPrivateMessageOrigin>("joko.v1.PartnerPrivateMessageOrigin", payload.partnerPrivateOrigin),
@@ -3288,7 +3292,7 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
             event,
             payload.callId,
             payload.name,
-            payload.isError ? ToolCallState.FAILED : ToolCallState.SUCCEEDED
+            payload.aborted ? ToolCallState.ABORTED : payload.isError ? ToolCallState.FAILED : ToolCallState.SUCCEEDED
           ),
           endedAt: toProtoTimestamp(event.emittedAt),
           result: protoToolResult(payload.output, payload.artifact, payload.parts)

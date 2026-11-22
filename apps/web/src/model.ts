@@ -1551,6 +1551,7 @@ export interface SessionView {
   };
   /** Credential-free task context projected by a capability-owned code-host provider. */
   readonly codeHostPullRequests?: readonly CodeHostPullRequestView[];
+  readonly modelOptions?: readonly ModelView[];
 }
 
 export type ObjectiveStatusView =

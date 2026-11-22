@@ -13721,7 +13721,22 @@ export class OperationalStore {
                 WHERE current_session.id = ${eventAlias}.session_id
                   AND current_session.deleted_at IS NULL
                   AND (${eventAlias}.generation = current_session.generation
-                    OR json_extract(${eventAlias}.metadata_json, '${bindingPath}') IS NOT NULL)
+                    OR json_extract(${eventAlias}.metadata_json, '${bindingPath}') IS NOT NULL
+                    OR (json_extract(${eventAlias}.payload_json, '$.payload.type') IN ('tool_start', 'tool_update', 'tool_result')
+                      AND EXISTS (
+                        SELECT 1 FROM native_binding_adoptions AS adoption
+                        JOIN backends AS backend ON backend.id = adoption.backend_id AND backend.adapter_kind = 'plugin-acp'
+                        WHERE adoption.session_id = current_session.id AND adoption.backend_id = ${eventAlias}.backend_id
+                          AND adoption.backend_id = current_session.backend_id
+                          AND adoption.native_opaque_ref = current_session.native_opaque_ref
+                          AND adoption.native_session_id IS current_session.native_session_id
+                          AND ${eventAlias}.generation BETWEEN adoption.first_generation AND current_session.generation
+                          AND NOT EXISTS (
+                            SELECT 1 FROM native_binding_adoptions AS later
+                            WHERE later.session_id = adoption.session_id AND later.backend_id = adoption.backend_id
+                              AND later.first_generation > adoption.first_generation
+                          )
+                      )))
               )
             )
             OR EXISTS (

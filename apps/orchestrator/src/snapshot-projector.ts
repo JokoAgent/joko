@@ -106,6 +106,7 @@ export interface SnapshotProviderCatalogEntry {
 export interface SnapshotProjectorOptions {
   readonly resolveSideChatSourceAllowed?: (sessionId: string) => boolean;
   readonly resolveInboxSnoozeAllowed?: (session: StoredSession) => boolean;
+  readonly resolveSessionModelOptions?: (session: StoredSession) => SessionMappingContext["modelOptions"];
   readonly canRetryFailedQueueInput?: (item: QueueItemRecord) => boolean;
   /** Server identity placed in every snapshot. A factory can refresh server_time per request. */
   readonly server: ServerInfo | (() => ServerInfo);
@@ -142,6 +143,7 @@ export interface SessionProjectionContextOptions {
   readonly runtimeAttached?: boolean;
   readonly resolveContextDefaults?: SnapshotProjectorOptions["resolveSessionContextDefaults"];
   readonly runtimeModel?: SessionMappingContext["runtimeModel"];
+  readonly modelOptions?: SessionMappingContext["modelOptions"];
 }
 
 /**
@@ -193,6 +195,7 @@ export function sessionProjectionContext(
     ...(options.activeRun === undefined ? {} : { activeRun: options.activeRun }),
     ...(options.runtimeAttached === undefined ? {} : { runtimeAttached: options.runtimeAttached }),
     ...(options.runtimeModel === undefined ? {} : { runtimeModel: options.runtimeModel }),
+    ...(options.modelOptions === undefined ? {} : { modelOptions: options.modelOptions }),
     ...(runtimeState?.usage === undefined ? {} : {
       usage: runtimeState.usage,
       usageMeasuredAt: runtimeState.updatedAt
@@ -666,6 +669,7 @@ export class SnapshotProjector {
       return [session.descriptor.id, sessionProjectionContext(this.store, session, {
         sideChatSourceAllowed: this.options.resolveSideChatSourceAllowed?.(session.descriptor.id),
         inboxSnoozeAllowed: this.options.resolveInboxSnoozeAllowed?.(session),
+        modelOptions: this.options.resolveSessionModelOptions?.(session),
         ...(activeRun === undefined ? {} : { activeRun }),
         runtimeAttached: activeRun !== undefined,
         resolveContextDefaults: this.options.resolveSessionContextDefaults,

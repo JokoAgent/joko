@@ -417,6 +417,12 @@ message Session {
   optional bool side_chat_source_allowed = 33;
   SessionSnooze snooze = 34;
   optional bool inbox_snooze_allowed = 35;
+  // Present when the native engine negotiates an independent catalog for this Session.
+  SessionModelCatalog model_catalog = 36;
+}
+
+message SessionModelCatalog {
+  repeated ModelDescriptor models = 1;
 }
 
 message SessionSnooze {

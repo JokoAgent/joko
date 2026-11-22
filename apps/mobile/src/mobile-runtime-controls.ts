@@ -197,7 +197,7 @@ export function resolveMobileRuntimeControls(
   const canSetFastMode = modelFastMode?.supportsFastMode === true;
 
   const providerGroups = groupBy(owner.providers.filter((provider) => provider.backendId === session.backendId), providerKey);
-  const modelGroups = groupBy(owner.models.filter((model) => model.backendId === session.backendId), modelKey);
+  const modelGroups = groupBy((session.modelCatalog?.models ?? owner.models).filter((model) => model.backendId === session.backendId), modelKey);
   const validRoutes: MobileModelRoute[] = [];
   const structuralRoutes = new Map<string, MobileModelRoute>();
   for (const [key, models] of modelGroups) {

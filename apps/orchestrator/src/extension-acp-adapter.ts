@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
+import { createTwoFilesPatch } from "diff";
 import type { RpcTransport, RpcTransportHandlers } from "@joko/adapter-codex";
 import {
   CAPABILITIES, CapabilityDrivenBackendAdapter, JokoError, NATIVE_PROMPT_IMAGE_MEDIA_TYPES, redactSecrets,
-  type AdapterContext, type BackendDescriptor, type BlobRef, type Capability, type CreateNativeSessionInput,
+  type AdapterContext, type BackendDescriptor, type BlobRef, type Capability, type CreateNativeSessionInput, type EventPayload,
   type MessageBlock, type NativeSessionBinding, type NativeSessionState, type PermissionMode, type PromptInput,
   type ProviderModel, type TargetDescriptor, type UsageSnapshot
 } from "@joko/core";
@@ -10,13 +11,17 @@ import {
 type RpcValue = Parameters<RpcTransport["respond"]>[1];
 type ServerRequest = Parameters<RpcTransportHandlers["onRequest"]>[0];
 type Notification = Parameters<RpcTransportHandlers["onNotification"]>[0];
+type AcpToolEvent = Extract<EventPayload, { type: "tool_start" | "tool_update" | "tool_result" }>;
 
 const ACP_PROTOCOL_VERSION = 1;
 export const ACP_ENGINE_KIND = "plugin-acp";
 const DEFAULT_MODEL = "default";
 const MAXIMUM_REPLY_CHARS = 1_000_000;
+const MAXIMUM_TOOL_OUTPUT_CHARS = 8_192;
+const MAXIMUM_CLOSED_TOOL_IDS = 4_096;
 const MAXIMUM_IMAGE_BYTES = 8 * 1024 * 1024;
 const STOP_GRACE_MS = 5_000;
+const COMPLETED_STOP_REASONS = new Set(["end_turn", "stop_sequence", "max_tokens", "max_turn_requests", "refusal"]);
 const EFFORTS = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
 export interface ExtensionAcpProcess {
@@ -34,6 +39,8 @@ export interface ExtensionAcpAdapterOptions {
   readonly open: (context: AdapterContext) => Promise<ExtensionAcpProcess>;
   readonly readBlob: (blob: BlobRef) => Promise<Uint8Array>;
   readonly catalogChanged: (observed: unknown) => void;
+  readonly sessionCatalogChanged: (sessionId: string, binding: NativeSessionBinding, models: readonly ProviderModel[]) => void;
+  readonly emitBackgroundTool: (sessionId: string, binding: NativeSessionBinding, payload: AcpToolEvent) => Promise<void>;
 }
 
 interface ConfigOption {
@@ -47,19 +54,28 @@ interface AcpTurn {
   readonly context: AdapterContext;
   readonly controller: AbortController;
   readonly blockId: string;
-  readonly tools: Map<string, string>;
   readonly blocks: Array<Extract<MessageBlock, { kind: "text" | "thinking" }>>;
   totalCharacters: number;
   cancelTimer?: ReturnType<typeof setTimeout>;
   cancelled: boolean;
 }
 
+interface AcpToolCall {
+  readonly name: string;
+  readonly turn: AcpTurn | undefined;
+  content: string;
+  rawOutput: string;
+}
+
 interface AcpLiveSession {
+  readonly id: string;
   readonly owner: ExtensionAcpProcess;
   readonly drainNotifications: () => Promise<void>;
   readonly canResume: "session/load" | "session/resume" | undefined;
   readonly canUseImages: boolean;
   readonly binding: NativeSessionBinding;
+  readonly tools: Map<string, AcpToolCall>;
+  readonly closedTools: Set<string>;
   permissionMode: PermissionMode;
   config: readonly ConfigOption[];
   usage?: UsageSnapshot;
@@ -89,11 +105,18 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
   async describe(): Promise<BackendDescriptor> {
     const ready = !this.disposed && this.options.approved();
     const state = this.capabilityState;
+    const models = new Map(this.models.map(model => [model.modelId, model]));
+    for (const session of this.sessions.values()) {
+      for (const model of this.modelsForOptions(session.config, session.canUseImages)) {
+        if (!models.has(model.modelId)) models.set(model.modelId, model);
+      }
+    }
     return {
       id: this.id, adapterKind: ACP_ENGINE_KIND, instanceGeneration: this.options.generation,
       displayName: this.options.name, version: this.version,
       health: ready ? "healthy" : "unavailable", installationState: "installed", authenticationState: ready ? "not_required" : "error",
-      models: ready ? [this.model(DEFAULT_MODEL, this.options.name, state.images), ...this.models] : [],
+      models: ready ? [models.get(DEFAULT_MODEL) ?? this.model(DEFAULT_MODEL, this.options.name, state.images),
+        ...[...models.values()].filter(model => model.modelId !== DEFAULT_MODEL)] : [],
       providers: ready ? [{
         providerId: this.providerId, displayName: this.options.name, accessKind: "localKeyless", api: "acp",
         authenticationState: "not_required", loginMethods: [], supportsLogin: false, supportsLogout: false,
@@ -106,7 +129,7 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
           ["turn.stream", "turn.abort", "turn.graceful_stop", "input.text", "model.list", "permission.modes", "permission.change", "interaction.permission"].includes(key)
           || ((key === "session.resume" || key === "session.detach") && state.resume)
           || (key === "input.image" && state.images)
-          || (key === "model.switch" && state.model)
+          || (key === "model.switch" && (state.model || models.size > 0))
           || (key === "model.effort" && state.effort)
         );
         return [key, { key, supported, ...(supported ? {} : { reason: "upstream_missing" }), ...(options === undefined ? {} : { options }) } satisfies Capability] as const;
@@ -142,12 +165,13 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
   }
 
   async resumeSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
-    const nativeId = this.nativeId(binding, context);
+    const nativeId = this.nativeId(binding, context, true);
     const current = this.sessions.get(context.sessionId);
-    if (current !== undefined && current.binding.opaqueRef !== binding.opaqueRef) {
+    if (current !== undefined && (current.binding.opaqueRef !== binding.opaqueRef || current.binding.generation !== context.generation)) {
       throw acpError("ACP_SESSION_UNAVAILABLE", "The native task binding changed.");
     }
     const session = current ?? await this.open(context, nativeId, "ask");
+    session.owner.assertCurrent();
     return this.state(session);
   }
 
@@ -174,7 +198,11 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
   override async setModel(providerId: string, modelId: string, context: AdapterContext): Promise<ProviderModel> {
     if (providerId !== this.providerId) throw acpError("ACP_MODEL_UNAVAILABLE", "The model belongs to another task engine.");
     const session = this.exactSession(context);
-    const selected = this.models.find(model => model.modelId === modelId);
+    const models = this.modelsForOptions(session.config, session.canUseImages);
+    const selected = models.find(model => model.modelId === modelId);
+    if (modelId === DEFAULT_MODEL && selected === undefined && session.turn === undefined) {
+      return models.find(model => model.modelId === config(session, "model")?.value) ?? this.model(DEFAULT_MODEL, this.options.name, session.canUseImages);
+    }
     if (selected === undefined || session.turn !== undefined) throw acpError("ACP_MODEL_UNAVAILABLE", "The task engine cannot select this model now.");
     await this.configure(session, "model", modelId);
     this.publish(session);
@@ -200,7 +228,7 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
     session.owner.assertCurrent();
     const turn: AcpTurn = {
       context, controller: new AbortController(), blockId: randomUUID(),
-      blocks: [], tools: new Map(), totalCharacters: 0, cancelled: false
+      blocks: [], totalCharacters: 0, cancelled: false
     };
     if (session.turn !== undefined) throw acpError("ACP_TASK_BUSY", "The task engine is already processing a prompt.");
     session.turn = turn;
@@ -216,8 +244,8 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
       void request.then(async result => {
         await session.drainNotifications();
         const reason = record(result)?.["stopReason"];
-        if (reason === "cancelled" || turn.cancelled) return this.finishTurn(session, turn, "aborted");
-        if (reason === "end_turn" || reason === "stop_sequence") return this.finishTurn(session, turn, "completed");
+        if (reason === "cancelled" || turn.cancelled) return this.finishTurn(session, turn, "aborted", undefined, "cancelled");
+        if (typeof reason === "string" && COMPLETED_STOP_REASONS.has(reason)) return this.finishTurn(session, turn, "completed", undefined, reason);
         await this.finishTurn(session, turn, "failed", "The task engine stopped before completing the prompt.");
       }).catch(async () => {
         if (!dispatched) {
@@ -324,10 +352,10 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
       }
       owner.assertCurrent(); context.signal.throwIfAborted();
       live = {
-        owner, drainNotifications: () => delivered,
+        id, owner, drainNotifications: () => delivered,
         canResume, canUseImages: record(capabilities?.["promptCapabilities"])?.["image"] === true,
         binding: { opaqueRef: this.opaqueRef(bindingId), nativeSessionId: bindingId, generation: context.generation },
-        config: configOptions(result["configOptions"]), permissionMode: "ask"
+        config: configOptions(result["configOptions"]), permissionMode: "ask", tools: new Map(), closedTools: new Set()
       };
       await this.applyPermissionMode(live, permissionMode);
       if (engineExited || !transport.running) throw acpError("ACP_SESSION_UNAVAILABLE", "The task engine exited before confirming its session.");
@@ -380,9 +408,14 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
     return session;
   }
 
-  private nativeId(binding: NativeSessionBinding, context: AdapterContext): string {
+  private nativeId(binding: NativeSessionBinding, context: AdapterContext, reactivating = false): string {
     const id = safeIdentifier(binding.nativeSessionId);
-    if (id === undefined || binding.opaqueRef !== this.opaqueRef(id) || context.generation !== binding.generation) {
+    const current = context.binding;
+    const matchesCurrent = current !== undefined && current.generation === context.generation
+      && current.nativeSessionId === id && current.opaqueRef === binding.opaqueRef;
+    const next = reactivating && matchesCurrent && context.generation === binding.generation + 1;
+    if (id === undefined || binding.opaqueRef !== this.opaqueRef(id) || (current !== undefined && !matchesCurrent)
+      || (context.generation !== binding.generation && !next)) {
       throw acpError("ACP_SESSION_UNAVAILABLE", "The saved task engine binding is invalid.");
     }
     return id;
@@ -407,8 +440,26 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
       maxOutputTokens: 0, supportsImages: images, thinkingLevels: efforts, cost: {} };
   }
 
+  sessionModels(sessionId: string, binding: NativeSessionBinding): readonly ProviderModel[] | undefined {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.closing !== undefined || session.binding.generation !== binding.generation
+      || session.binding.opaqueRef !== binding.opaqueRef || session.binding.nativeSessionId !== binding.nativeSessionId) return undefined;
+    session.owner.assertCurrent();
+    const models = this.modelsForOptions(session.config, session.canUseImages);
+    return models.length ? models : [this.model(DEFAULT_MODEL, this.options.name, session.canUseImages)];
+  }
+
+  private modelsForOptions(configurations: readonly ConfigOption[], images: boolean): readonly ProviderModel[] {
+    const model = configurations.find(option => option.category === "model");
+    const effort = configurations.find(option => option.category === "thought_level");
+    return (model?.choices ?? []).map(choice => this.model(choice.value, choice.name, images,
+      choice.value === model?.value ? (effort?.choices ?? []).map(level => level.value.toLowerCase()).filter(level => EFFORTS.includes(level)) : []));
+  }
+
   private publish(session: AcpLiveSession): void {
     const changed = this.projectCatalog(session.canResume !== undefined, session.canUseImages, session.config);
+    const models = this.sessionModels(session.id, session.binding);
+    if (models !== undefined) this.options.sessionCatalogChanged(session.id, session.binding, models);
     if (changed) this.options.catalogChanged({
       format: 1, version: this.version, resume: session.canResume !== undefined, images: session.canUseImages,
       configOptions: session.config.map(option => ({
@@ -431,10 +482,7 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
     const supportedModes = (["ask", "acceptEdits", "auto", "bypassPermissions"] as const).filter(mode =>
       mode === "ask" || mode === "bypassPermissions" || modes.some(choice => modeKey(choice.value) === modeKey(mode)));
     const previous = JSON.stringify([this.models, this.capabilityState]);
-    this.models = (model?.choices ?? []).filter(choice => choice.value !== DEFAULT_MODEL).map(choice => this.model(
-      choice.value, choice.name, images,
-      choice.value === model?.value ? (effort?.choices ?? []).map(level => level.value.toLowerCase()).filter(level => EFFORTS.includes(level)) : []
-    ));
+    this.models = this.modelsForOptions(configurations, images);
     this.capabilityState = { resume, images,
       model: (model?.choices.length ?? 0) > 0, effort: (effort?.choices.length ?? 0) > 0, modes: supportedModes };
     return previous !== JSON.stringify([this.models, this.capabilityState]);
@@ -488,7 +536,7 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
 
   private async onUpdate(session: AcpLiveSession, raw: Notification): Promise<void> {
     const params = record(raw.params);
-    if (raw.method !== "session/update" || params === undefined || params["sessionId"] !== session.binding.nativeSessionId) return;
+    if (session.closing !== undefined || raw.method !== "session/update" || params === undefined || params["sessionId"] !== session.binding.nativeSessionId) return;
     const update = record(params["update"]);
     if (update === undefined) return;
     try { session.owner.assertCurrent(); } catch { return; }
@@ -497,9 +545,13 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
       this.publish(session);
       return;
     }
+    const kind = update["sessionUpdate"];
+    if (kind === "tool_call" || kind === "tool_call_update") {
+      if (this.sessions.get(session.id) === session) await this.updateTool(session, update);
+      return;
+    }
     const turn = session.turn;
     if (turn === undefined || turn.cancelled) return;
-    const kind = update["sessionUpdate"];
     if (kind === "usage_update") {
       const used = update["used"], size = update["size"];
       if (typeof used !== "number" || !Number.isSafeInteger(used) || used < 0 ||
@@ -525,19 +577,46 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
       else turn.blocks.push(block);
       await turn.context.emit({ type: blockKind === "text" ? "text_delta" : "thinking_delta",
         blockId: `${turn.blockId}-${turn.blocks.length}`, delta: text });
-    } else if (kind === "tool_call" || kind === "tool_call_update") {
-      const id = safeIdentifier(update["toolCallId"]);
-      if (id === undefined) return;
-      const name = turn.tools.get(id) ?? redactSecrets(safeIdentifier(update["title"]) ?? "Task engine tool");
-      const status = update["status"];
-      if (!turn.tools.has(id)) {
-        turn.tools.set(id, name);
-        await turn.context.emit({ type: "tool_start", callId: id, name, input: displayAcpValue(update["rawInput"]) });
-      }
-      if (status === "completed" || status === "failed") {
-        await turn.context.emit({ type: "tool_result", callId: id, name, output: displayAcpValue(update["rawOutput"]), isError: status === "failed" });
-      }
     }
+  }
+
+  private async updateTool(session: AcpLiveSession, update: Readonly<Record<string, unknown>>): Promise<void> {
+    const id = safeIdentifier(update["toolCallId"]);
+    if (id === undefined || session.closedTools.has(id)) return;
+    let tool = session.tools.get(id);
+    if (tool === undefined) {
+      const turn = session.turn;
+      if (turn?.cancelled) return;
+      const name = redactSecrets(safeIdentifier(update["title"]) ?? "Task engine tool");
+      tool = { name, turn, content: "", rawOutput: "" };
+      session.tools.set(id, tool);
+      await this.emitTool(session, tool, { type: "tool_start", callId: id, name, input: displayAcpValue(update["rawInput"]) });
+    }
+    if (session.tools.get(id) !== tool || tool.turn?.cancelled) return;
+    const previous = tool.content || tool.rawOutput;
+    // ACP updates replace fields they carry and preserve omitted fields.
+    if (update["content"] === null || Array.isArray(update["content"])) tool.content = displayAcpToolContent(update["content"]);
+    if (Object.hasOwn(update, "rawOutput")) tool.rawOutput = displayAcpValue(update["rawOutput"] ?? undefined);
+    const status = update["status"], output = tool.content || tool.rawOutput;
+    if (status === "completed" || status === "failed") await this.settleTool(session, id, tool, status);
+    else if (output !== previous) await this.emitTool(session, tool, {
+      type: "tool_update", callId: id, name: tool.name, output, outputMode: "replace"
+    });
+  }
+
+  private emitTool(session: AcpLiveSession, tool: AcpToolCall, payload: AcpToolEvent): Promise<void> {
+    const bound = { ...payload, nativeHistory: {} };
+    return tool.turn === undefined ? this.options.emitBackgroundTool(session.id, session.binding, bound) : tool.turn.context.emit(bound);
+  }
+
+  private async settleTool(session: AcpLiveSession, id: string, tool: AcpToolCall, state: "completed" | "failed" | "interrupted"): Promise<void> {
+    if (session.tools.get(id) !== tool) return;
+    session.tools.delete(id);
+    session.closedTools.add(id);
+    if (session.closedTools.size > MAXIMUM_CLOSED_TOOL_IDS) session.closedTools.delete(session.closedTools.values().next().value!);
+    const output = tool.content || tool.rawOutput || (state === "interrupted" ? "Interrupted before the tool finished." : "");
+    await this.emitTool(session, tool, { type: "tool_result", callId: id, name: tool.name, output, isError: state === "failed",
+      ...(state === "interrupted" ? { aborted: true } : {}) });
   }
 
   private async onRequest(session: AcpLiveSession | undefined, transport: RpcTransport, request: ServerRequest): Promise<void> {
@@ -572,12 +651,17 @@ export class ExtensionAcpAdapter extends CapabilityDrivenBackendAdapter {
     } catch { await transport.respond(request.id, cancelled).catch(() => undefined); }
   }
 
-  private async finishTurn(session: AcpLiveSession, turn: AcpTurn, outcome: "completed" | "aborted" | "failed", error?: string): Promise<void> {
+  private async finishTurn(session: AcpLiveSession, turn: AcpTurn, outcome: "completed" | "aborted" | "failed", error?: string, stopReason?: string): Promise<void> {
     if (session.turn !== turn) return;
     session.turn = undefined;
     turn.controller.abort();
     if (turn.cancelTimer !== undefined) clearTimeout(turn.cancelTimer);
-    if (turn.blocks.length > 0) await turn.context.emit({ type: "message_complete", role: "assistant", blocks: turn.blocks });
+    for (const [id, tool] of session.tools) {
+      if (tool.turn === turn) await this.settleTool(session, id, tool, outcome === "completed" ? "completed" : "interrupted");
+    }
+    if (turn.blocks.length > 0 || stopReason !== undefined && stopReason !== "end_turn" && stopReason !== "cancelled") {
+      await turn.context.emit({ type: "message_complete", role: "assistant", blocks: turn.blocks, stopReason, nativeHistory: {} });
+    }
     if (outcome === "failed" && error !== undefined) await turn.context.emit({
       type: "error", terminal: true, error: acpError("ACP_PROMPT_INTERRUPTED", error, true).publicError
     });
@@ -602,11 +686,18 @@ function configOptions(value: unknown): readonly ConfigOption[] {
     const selected = safeIdentifier(source?.["currentValue"]);
     if (source?.["type"] !== "select" || id === undefined || selected === undefined || !Array.isArray(source["options"])) return [];
     const category = safeIdentifier(source["category"]) ?? (id === "reasoning_effort" ? "thought_level" : id);
-    const choices = source["options"].slice(0, 100).flatMap(raw => {
-      const choice = record(raw), value = safeIdentifier(choice?.["value"]), name = safeIdentifier(choice?.["name"]);
-      return value === undefined || name === undefined ? [] : [{ value, name: redactSecrets(name) }];
+    const options = source["options"].slice(0, 100).flatMap(raw => {
+      const group = record(raw)?.["options"];
+      return Array.isArray(group) ? group.slice(0, 100) : [raw];
     });
-    return [{ id, category, value: selected, choices }];
+    const unique = new Map<string, ConfigOption["choices"][number]>();
+    for (const raw of options) {
+      const choice = record(raw), value = safeIdentifier(choice?.["value"]), name = safeIdentifier(choice?.["name"]);
+      if (value === undefined || name === undefined || unique.has(value)) continue;
+      unique.set(value, { value, name: redactSecrets(name) });
+      if (unique.size === 100) break;
+    }
+    return [{ id, category, value: selected, choices: [...unique.values()] }];
   });
 }
 
@@ -619,7 +710,44 @@ function modeKey(value: string): string {
 }
 
 function displayAcpValue(value: unknown): string {
-  return value === undefined ? "" : redactSecrets(typeof value === "string" ? value : JSON.stringify(value)).slice(0, 8_192);
+  return value === undefined ? "" : redactSecrets(typeof value === "string" ? value : JSON.stringify(value)).slice(0, MAXIMUM_TOOL_OUTPUT_CHARS);
+}
+
+function displayAcpToolContent(value: readonly unknown[] | null): string {
+  const parts: string[] = [];
+  let length = 0;
+  for (const entry of value ?? []) {
+    const item = record(entry);
+    let text: string | undefined;
+    if (item?.["type"] === "content") {
+      const block = record(item["content"]);
+      if (block?.["type"] === "text" && typeof block["text"] === "string") text = block["text"];
+      else if (block?.["type"] === "resource_link") text = safeIdentifier(block["uri"]);
+      else if (block?.["type"] === "image") text = "[image]";
+      else if (block?.["type"] === "audio") text = "[audio]";
+      else if (block?.["type"] === "resource") {
+        const resource = record(block["resource"]);
+        text = typeof resource?.["text"] === "string" ? resource["text"] : safeIdentifier(resource?.["uri"]);
+      }
+    } else if (item?.["type"] === "terminal") {
+      const id = safeIdentifier(item["terminalId"]);
+      if (id !== undefined) text = `[terminal ${id}]`;
+    } else if (item?.["type"] === "diff" && typeof item["newText"] === "string") {
+      const path = safeIdentifier(item["path"]) ?? "file";
+      const oldText = typeof item["oldText"] === "string" ? item["oldText"] : "";
+      const newText = item["newText"];
+      text = oldText.length + newText.length <= 2 * MAXIMUM_TOOL_OUTPUT_CHARS
+        ? createTwoFilesPatch(path, path, oldText, newText, undefined, undefined, { context: 3, maxEditLength: 1024 })
+        : undefined;
+      text ??= `${path}: diff exceeds the preview limit.`;
+    }
+    if (!text) continue;
+    const displayed = displayAcpValue(text).slice(0, MAXIMUM_TOOL_OUTPUT_CHARS - length);
+    parts.push(displayed);
+    length += displayed.length + 1;
+    if (length >= MAXIMUM_TOOL_OUTPUT_CHARS) break;
+  }
+  return parts.join("\n");
 }
 
 function acpError(code: string, message: string, stateMayHaveChanged = false): JokoError {

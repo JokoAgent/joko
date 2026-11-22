@@ -15712,7 +15712,10 @@ function mapSession(
   compactingOverride?: boolean
 ): SessionView {
   const selected = session.model?.model;
-  const descriptor = selected === undefined ? undefined : models.get(modelProjectionKey(session.backendId, selected.providerId, selected.modelId));
+  const sessionModels = session.modelCatalog?.models;
+  const descriptor = selected === undefined ? undefined
+    : sessionModels?.find(model => model.key?.providerId === selected.providerId && model.key?.modelId === selected.modelId)
+      ?? models.get(modelProjectionKey(session.backendId, selected.providerId, selected.modelId));
   const selectedProvider = selected === undefined ? undefined : providers.get(providerKey(session.backendId, selected.providerId));
   const context = session.context;
   const cumulativeUsage = context?.cumulativeUsage;
@@ -15807,6 +15810,8 @@ function mapSession(
         }
       }),
     codeHostPullRequests: session.codeHostPullRequests.map(mapCodeHostPullRequest),
+    ...(sessionModels === undefined ? {} : { modelOptions: sessionModels.map(model => mapModel(model,
+      providers.get(providerKey(session.backendId, model.key?.providerId ?? "")))) }),
     ...(session.inboxSnoozeAllowed === undefined ? {} : { inboxSnoozeAllowed: session.inboxSnoozeAllowed }),
     ...(session.snooze?.setAt === undefined ? {} : { snooze: { setAt: timestampMs(session.snooze.setAt),
       ...(session.snooze.until === undefined ? {} : { until: timestampMs(session.snooze.until) }) } }),
@@ -21967,7 +21972,7 @@ function mapToolItem(
     id: call.toolCallId,
     ...(call.runId || existing?.runId ? { runId: call.runId || existing?.runId } : {}),
     sequence,
-    kind: call.state === ToolCallState.SUCCEEDED || call.state === ToolCallState.FAILED ? "toolResult" : "tool",
+    kind: [ToolCallState.SUCCEEDED, ToolCallState.FAILED, ToolCallState.ABORTED].includes(call.state) ? "toolResult" : "tool",
     createdAt,
     ...(endedAt === undefined ? {} : { endedAt }),
     title: name,

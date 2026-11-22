@@ -33,6 +33,8 @@ it("reads the real runtime-control generation and submits a complete exact sourc
       expectedRuntimeGeneration: 23n, backendId: "opaque-source", providerId: "account", modelId: "same-name", effort: "high", fastMode: true }) })]);
     f.reject(); await expect(f.gateway.setRuntimeModel!("task", { backendId: "another-source", providerId: "account", modelId: "same-name", fastMode: false })).rejects.toThrow();
     expect(f.payloads).toHaveLength(2);
+    const rejected = f.payloads[1];
+    expect(rejected?.case === "setSessionRuntime" && rejected.value.effort).toBeUndefined();
   } finally { f.gateway.disconnect(); }
 });
 it("refuses to overwrite an unknown handoff before sending any mutation", async () => {

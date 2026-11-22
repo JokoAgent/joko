@@ -33,7 +33,8 @@ export function createSessionRuntimeGateway(port: SessionRuntimeGatewayPort) {
       if (!control.control || control.control.handoffState === "unknown") throw new Error("The previous runtime handoff needs to be recovered.");
       await port.submit({ case: "setSessionRuntime", value: create(SetSessionRuntimeMutationSchema, { sessionId,
         expectedRuntimeGeneration: control.control.generation, backendId: selection.backendId,
-        providerId: selection.providerId, modelId: selection.modelId, effort: selection.effort ?? "", ...encodeModelSpeed(selection.fastMode) }) });
+        providerId: selection.providerId, modelId: selection.modelId,
+        ...(selection.effort === undefined ? {} : { effort: selection.effort }), ...encodeModelSpeed(selection.fastMode) }) });
       scope.assertCurrent();
     }
   };

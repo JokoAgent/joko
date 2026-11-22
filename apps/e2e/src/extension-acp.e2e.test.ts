@@ -1,13 +1,14 @@
 import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { create, type MessageInitShape } from "@bufbuild/protobuf";
+import { Code } from "@connectrpc/connect";
 import {
-  BackendHealth, ExtensionPackageAction, OperationMutationSchema, OperationState, RunState, ScheduleRunOutcome, ScheduleSessionMode
+  BackendHealth, ExtensionPackageAction, MessageRole, OperationMutationSchema, OperationState, RunState, ScheduleRunOutcome, ScheduleSessionMode, ToolCallState
 } from "@joko/contracts";
 import { expect, it } from "vitest";
 import { waitFor } from "./fixture.js";
 import {
-  archiveMutation, createManualScheduleMutation, createSessionMutation, queueRunIdFrom,
+  abortRunMutation, archiveMutation, createManualScheduleMutation, createSessionMutation, modelMutation, queueRunIdFrom,
   resolvePermissionMutation, scheduleIdFrom, sendInputMutation, sessionIdFrom, submit, triggerScheduleMutation
 } from "./operations.js";
 import { RealPiSystemFixture } from "./real-pi-fixture.js";
@@ -96,6 +97,13 @@ it("starts only an approved packaged ACP engine and keeps task, permission, sche
     const sessionId = sessionIdFrom(created);
     const binding = store.getSession(sessionId).descriptor.binding;
     expect(binding.nativeSessionId).toBe("managed-acp-session");
+    const models = async (id: string) => (await clients.session.getSession({ sessionId: id })).session?.modelCatalog?.models.map(model => model.key?.modelId);
+    const switchModel = (id: string, model: string) => submit(clients.operation, connectionId, modelMutation(id, backendId, model, "", false));
+    expect(await models(sessionId)).toEqual(["alpha", "beta"]);
+    for (const model of ["beta", "alpha"]) {
+      const operation = await switchModel(sessionId, model);
+      expect(operation.state, operation.error?.message).toBe(OperationState.SUCCEEDED);
+    }
     const generation = BigInt(binding.generation);
     const send = async (input: string) => queueRunIdFrom(await submit(clients.operation, connectionId, sendInputMutation(sessionId, generation, input)));
     const blocked = await send("Prompt requiring permission");
@@ -107,13 +115,57 @@ it("starts only an approved packaged ACP engine and keeps task, permission, sche
     }));
     expect(decided.state, decided.error?.message).toBe(OperationState.SUCCEEDED);
     await waitFor(() => clients.run.getRun({ runId: blocked }), result => result.run?.state === RunState.SUCCEEDED, "completed ACP permission");
+    const timeline = async () => (await clients.session.listSessionTimeline({ sessionId, limit: 200 })).events;
+    const completedTools = async () => {
+      return (await timeline()).flatMap(event => {
+        const kind = event.payload?.kind;
+        const call = kind?.case === "toolCallCompleted" ? kind.value.toolCall : undefined;
+        return call === undefined ? [] : [{ id: call.toolCallId, state: call.state, runId: call.runId,
+          output: call.result?.parts.map(part => part.content.case === "text" ? part.content.value : "").join("") }];
+      });
+    };
+    await waitFor(completedTools, results => results.some(result => result.id === "bg-audit"), "the background tool on the original task");
+    const expectToolOutputs = async () => {
+      const results = await completedTools();
+      expect(results).toEqual(expect.arrayContaining([
+        { id: "fixture-tool", output: expect.stringMatching(/Verified result[\s\S]*--- notes\.txt[\s\S]*-old[\s\S]*\+new/u), runId: blocked, state: ToolCallState.SUCCEEDED },
+        { id: "failed-tool", output: "Permission denied for another file", runId: blocked, state: ToolCallState.FAILED },
+        { id: "implicit-tool", output: "file:///project/result.txt\n[image]\n[audio]", runId: blocked, state: ToolCallState.SUCCEEDED },
+        { id: "bg-audit", output: "background result", runId: "", state: ToolCallState.SUCCEEDED }
+      ]));
+      for (const id of ["fixture-tool", "failed-tool", "implicit-tool", "bg-audit"]) expect(results.filter(result => result.id === id)).toHaveLength(1);
+      expect(results.some(result => result.id === "another-session")).toBe(false);
+    };
+    await expectToolOutputs();
+    expect(store.listEvents({ sessionId, limit: 200 })).toContainEqual(expect.objectContaining({
+      payload: expect.objectContaining({ type: "tool_result", callId: "bg-audit" }),
+      metadata: expect.objectContaining({ fields: expect.objectContaining({ turnScope: "background" }) })
+    }));
     expect(store.listEvents({ sessionId, limit: 200 }).map(event => event.payload)).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "new: allow-once" }] })
     ]));
+    for (const stopReason of ["max_tokens", "max_turn_requests", "refusal"]) {
+      const runId = await send(stopReason);
+      await waitFor(() => clients.run.getRun({ runId }), result => result.run?.state === RunState.SUCCEEDED, `completed ACP ${stopReason}`);
+      expect((await timeline()).find(event => event.identity?.runId === runId && event.payload?.kind.case === "messageCompleted"
+        && event.payload.kind.value.role === MessageRole.ASSISTANT)?.payload?.kind)
+        .toMatchObject({ case: "messageCompleted", value: { stopReason, blocks: [expect.objectContaining({ content: { case: "text", value: "new: " + stopReason } })] } });
+    }
+    const cancelledRun = await send("cancel-check");
+    await waitFor(timeline, events => events.some(event => event.identity?.runId === cancelledRun && event.payload?.kind.case === "toolCallStarted"), "the incomplete tool before cancellation");
+    const cancelled = await submit(clients.operation, connectionId, abortRunMutation(cancelledRun));
+    expect(cancelled.state, cancelled.error?.message).toBe(OperationState.SUCCEEDED);
+    await waitFor(() => clients.run.getRun({ runId: cancelledRun }), result => result.run?.state === RunState.ABORTED, "the cancelled ACP prompt");
+    expect((await completedTools()).filter(result => result.id === "cancelled-tool")).toEqual([
+      { id: "cancelled-tool", state: ToolCallState.ABORTED, runId: cancelledRun, output: "Interrupted before the tool finished." }
+    ]);
+    store.appendEvent({ backendId, targetId, sessionId, generation: binding.generation, traceId: "acp-unmarked-history",
+      payload: { type: "tool_result", callId: "unmarked-tool", name: "Older plugin tool", output: "retained result", isError: false } });
     const archived = await submit(clients.operation, connectionId, archiveMutation(sessionId, true));
     expect(archived.state, archived.error?.message).toBe(OperationState.SUCCEEDED);
     const restored = await submit(clients.operation, connectionId, archiveMutation(sessionId, false));
     expect(restored.state, restored.error?.message).toBe(OperationState.SUCCEEDED);
+    const detachedGeneration = store.getSession(sessionId).descriptor.binding.generation;
     const scheduleId = scheduleIdFrom(await submit(clients.operation, connectionId, createManualScheduleMutation({
       backendId, targetId, sessionId, sessionMode: ScheduleSessionMode.BOUND, text: "Run from the same engine"
     })));
@@ -122,7 +174,42 @@ it("starts only an approved packaged ACP engine and keeps task, permission, sche
       result => result.history[0]?.outcome === ScheduleRunOutcome.SUCCEEDED, "completed from the ordinary scheduler on the original engine");
     expect(history.history[0]?.sessionId).toBe(sessionId);
     expect(await readFile(launches, "utf8")).toBe("new\nload\n");
-    expect(store.getSession(sessionId).descriptor.binding.nativeSessionId).toBe(binding.nativeSessionId);
+    expect(store.getSession(sessionId).descriptor.binding).toMatchObject({
+      nativeSessionId: binding.nativeSessionId, opaqueRef: binding.opaqueRef, generation: detachedGeneration + 1
+    });
+    await expectToolOutputs();
+    expect(await completedTools()).toContainEqual({ id: "unmarked-tool", state: ToolCallState.SUCCEEDED, runId: "", output: "retained result" });
+
+    const second = await submit(clients.operation, connectionId, createSessionMutation({
+      backendId, targetId, providerId: backendId, modelId: "default", displayName: "Second session with a separate catalog"
+    }));
+    expect(second.state, second.error?.message).toBe(OperationState.SUCCEEDED);
+    const secondId = sessionIdFrom(second);
+    expect(store.getSession(secondId).descriptor.binding.nativeSessionId).toBe("second-acp-session");
+    expect(await models(secondId)).toEqual(["gamma", "delta"]);
+    expect(await models(sessionId)).toEqual(["alpha", "beta"]);
+    await waitFor(async () => (await clients.backend.listModels({ backendId, page: { pageSize: 100 } })).models.map(model => model.key?.modelId),
+      ids => ["alpha", "beta", "gamma", "delta"].every(id => ids.includes(id)), "the approved Backend catalog includes both live task catalogs");
+    const setRuntimeModel = async (id: string, modelId: string) => {
+      const { control } = await clients.session.getSessionRuntimeControl({ sessionId: id });
+      return mutate({ case: "setSessionRuntime", value: { sessionId: id, expectedRuntimeGeneration: control!.generation,
+        backendId, providerId: backendId, modelId, fastMode: false } });
+    };
+    const switched = await setRuntimeModel(sessionId, "beta");
+    expect(switched.state, switched.error?.message).toBe(OperationState.SUCCEEDED);
+    await expect(switchModel(secondId, "beta")).rejects.toMatchObject({ code: Code.FailedPrecondition,
+      message: expect.stringContaining("not advertised") });
+    const rejectedRuntime = await setRuntimeModel(secondId, "beta");
+    expect(rejectedRuntime.state).toBe(OperationState.FAILED);
+    expect(rejectedRuntime.error?.message).toContain("same-Backend model");
+    const switchedSecond = await setRuntimeModel(secondId, "delta");
+    expect(switchedSecond.state, switchedSecond.error?.message).toBe(OperationState.SUCCEEDED);
+    expect(await readFile(join(fixture.workspaceDirectory, "acp-models.txt"), "utf8")).toBe("managed-acp-session beta\nmanaged-acp-session alpha\nmanaged-acp-session beta\nsecond-acp-session delta\n");
+
+    const attached = store.getSession(sessionId);
+    store.updateSession(sessionId, { binding: { nativeSessionId: "other-native-session", opaqueRef: "acp:other-native-session",
+      generation: attached.descriptor.binding.generation + 1 } }, attached.revision);
+    expect(await completedTools()).toEqual([]);
 
     const disabled = await mutate({ case: "setExtensionEnabled", value: { extensionId, enabled: false, expectedRevision: (await extension()).revision } });
     expect(disabled.state, disabled.error?.message).toBe(OperationState.SUCCEEDED);
@@ -133,40 +220,91 @@ it("starts only an approved packaged ACP engine and keeps task, permission, sche
 });
 
 const ENGINE_SOURCE = `
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 const input = createInterface({ input: process.stdin });
-const nativeId = "managed-acp-session";
-let mode = "new", permissionPrompt;
+let nativeId = "managed-acp-session", model, cwd;
+function options() {
+  const choice = value => ({ value, name: value });
+  const choices = nativeId === "managed-acp-session"
+    ? [{ group: "general", name: "General", options: [choice("alpha")] }, { group: "special", name: "Special", options: [choice("beta"), choice("alpha")] }]
+    : [choice("gamma"), choice("delta")];
+  return [{ id: "model", name: "Model", type: "select", category: "model", currentValue: model, options: choices }];
+}
+let mode = "new", permissionPrompt, cancelledPrompt;
 const send = value => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...value }) + "\\n");
 const respond = (id, result) => send({ id, result });
-function complete(request, text) {
+const update = value => send({ method: "session/update", params: { sessionId: nativeId, update: value } });
+function complete(request, text, stopReason = "end_turn") {
   send({ method: "session/update", params: { sessionId: nativeId, update: {
     sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } });
-  respond(request, { stopReason: "end_turn" });
+  respond(request, { stopReason });
 }
 input.on("line", line => {
   const { id, method, params, result } = JSON.parse(line);
   if (id === "fixture-permission" && permissionPrompt !== undefined) {
+    update({ sessionUpdate: "tool_call", toolCallId: "fixture-tool", title: "Review fixture", status: "in_progress" });
+    update({ sessionUpdate: "tool_call_update", toolCallId: "fixture-tool", content: [
+      { type: "content", content: { type: "text", text: "Verified result" } },
+      { type: "diff", path: "notes.txt", oldText: "old\\n", newText: "new\\n" }
+    ] });
+    update({ sessionUpdate: "tool_call_update", toolCallId: "fixture-tool", status: "completed" });
+    update({ sessionUpdate: "tool_call_update", toolCallId: "fixture-tool", status: "completed" });
+    update({ sessionUpdate: "tool_call", toolCallId: "failed-tool", title: "Second fixture" });
+    update({ sessionUpdate: "tool_call_update", toolCallId: "failed-tool", status: "failed",
+      content: [{ type: "content", content: { type: "text", text: "Permission denied for another file" } }] });
+    update({ sessionUpdate: "tool_call", toolCallId: "implicit-tool", title: "Resources", status: "in_progress" });
+    update({ sessionUpdate: "tool_call_update", toolCallId: "implicit-tool", content: [
+      { type: "content", content: { type: "resource_link", uri: "file:///project/result.txt", name: "Result" } },
+      { type: "content", content: { type: "image", mimeType: "image/png", data: "AQ==" } },
+      { type: "content", content: { type: "audio", mimeType: "audio/wav", data: "AQ==" } }
+    ] });
     complete(permissionPrompt, mode + ": " + result?.outcome?.optionId);
     permissionPrompt = undefined;
+    setTimeout(() => {
+      send({ method: "session/update", params: { sessionId: "different-acp-session", update: {
+        sessionUpdate: "tool_call", toolCallId: "another-session", status: "completed" } } });
+      update({ sessionUpdate: "tool_call", toolCallId: "bg-audit", title: "Background work", status: "in_progress" });
+      update({ sessionUpdate: "tool_call_update", toolCallId: "bg-audit", status: "completed", rawOutput: "background result" });
+      update({ sessionUpdate: "tool_call_update", toolCallId: "bg-audit", status: "completed" });
+    }, 400);
   } else if (method === "initialize") {
     respond(id, { protocolVersion: 1, agentInfo: { name: "fixture", version: "1.0.0" },
       agentCapabilities: { loadSession: true, promptCapabilities: { image: true } } });
   } else if (method === "session/new" || method === "session/load") {
     mode = method === "session/new" ? "new" : "load";
     if (mode === "load" && params.sessionId !== nativeId) throw new Error("Wrong native identity");
-    appendFileSync(join(params.cwd, "acp-launches.txt"), mode + "\\n");
-    respond(id, { sessionId: nativeId });
+    cwd = params.cwd;
+    const launches = join(cwd, "acp-launches.txt");
+    if (mode === "new" && existsSync(launches)) nativeId = "second-acp-session";
+    model = nativeId === "managed-acp-session" ? "alpha" : "gamma";
+    appendFileSync(launches, mode + "\\n");
+    respond(id, { sessionId: nativeId, configOptions: options() });
+  } else if (method === "session/set_config_option") {
+    if (params.sessionId !== nativeId || params.configId !== "model") throw new Error("Wrong model owner");
+    model = params.value;
+    appendFileSync(join(cwd, "acp-models.txt"), nativeId + " " + model + "\\n");
+    respond(id, { configOptions: options() });
   } else if (method === "session/prompt") {
     const prompt = params.prompt[0]?.text ?? "";
-    if (!prompt.includes("permission")) { complete(id, mode + ": " + prompt); return; }
+    if (prompt === "cancel-check") {
+      cancelledPrompt = id;
+      update({ sessionUpdate: "tool_call", toolCallId: "cancelled-tool", title: "Waiting tool", status: "in_progress" });
+      return;
+    }
+    if (!prompt.includes("permission")) {
+      complete(id, mode + ": " + prompt, ["max_tokens", "max_turn_requests", "refusal"].includes(prompt) ? prompt : "end_turn");
+      return;
+    }
     permissionPrompt = id;
     send({ id: "fixture-permission", method: "session/request_permission", params: {
       sessionId: nativeId, toolCall: { toolCallId: "fixture-tool", title: "Review fixture" },
       options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }, { optionId: "deny", name: "Deny", kind: "reject_once" }]
     } });
+  } else if (method === "session/cancel" && cancelledPrompt !== undefined) {
+    respond(cancelledPrompt, { stopReason: "cancelled" });
+    cancelledPrompt = undefined;
   }
 });
 `;
