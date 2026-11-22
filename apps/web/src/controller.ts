@@ -1793,7 +1793,9 @@ export function useAppController(): AppController {
   const pairConnection = useCallback(async (origin: string, code: string, deviceName: string, options?: ConnectionSelectionOptions): Promise<void> => {
     startupManagedLocalAutoPendingRef.current = false;
     const automaticPreferenceIntent = options?.automatic === undefined ? undefined : ++automaticPreferenceIntentRef.current;
+    const disconnectedRoute = explicitDisconnectRef.current ? routeRef.current : undefined;
     const generation = beginGatewayTransition();
+    if (disconnectedRoute !== undefined) explicitDisconnectRef.current = true;
     activeProfileRef.current = undefined;
     connectionStateRef.current = "connecting";
     setState((current) => ({ ...current, activeProfile: undefined, connectionState: "connecting", error: undefined }));
@@ -1845,8 +1847,20 @@ export function useAppController(): AppController {
       if (gatewayGenerationRef.current !== generation) return;
       forgottenProfilesRef.current.delete(connectedProfile.id);
       machineCacheAuthorityRef.current.set(connectedProfile.id, { profileKey: remoteMachineProfileKey(connectedProfile), revoked: false });
+      let navigation: Pick<ControllerState, "route" | "navigationRevision"> | undefined;
+      if (explicitDisconnectRef.current && disconnectedRoute?.kind === "session" && routeRef.current === disconnectedRoute
+        && window.location.hash === appRouteHash(disconnectedRoute)
+        && (disconnectedRoute.serverId !== undefined ? disconnectedRoute.serverId !== connectedProfile.serverId
+          : disconnectedRoute.profileId !== undefined && disconnectedRoute.profileId !== connectedProfile.id)) {
+        const route: AppRoute = { kind: "newSession" };
+        window.history.replaceState(window.history.state, "", appRouteHash(route));
+        routeRef.current = route;
+        navigation = { route, navigationRevision: ++navigationRevisionRef.current };
+      }
+      explicitDisconnectRef.current = false;
       setState((current) => ({
         ...current,
+        ...navigation,
         profiles: profiles ?? [...current.profiles.filter((profile) => profile.id !== connectedProfile.id), connectedProfile],
         activeProfile: connectedProfile,
         // The bundled service lifecycle remains independent when this pairing

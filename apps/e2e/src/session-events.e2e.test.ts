@@ -6,6 +6,7 @@ import { create, fromBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import {
   CompactSessionOutcome,
+  CompletePairingResponseSchema,
   EntityKind,
   EventCursorSchema,
   InteractionState,
@@ -1138,6 +1139,12 @@ describe("session host, durable events, and reconnect semantics", () => {
       await page.goto(a.baseUrl, { waitUntil: "domcontentloaded" });
       const pane = page.locator(`.session-pane[data-input-session-id="${id}"]`);
       const title = (name: string) => pane.getByRole("button", { name, exact: true });
+      const openHash = (hash: string) => page.evaluate(async value => {
+        if (location.hash === value) return;
+        const changed = new Promise<void>(resolve => window.addEventListener("hashchange", () => resolve(), { once: true }));
+        location.hash = value;
+        await changed;
+      }, hash);
       const pairAndCopyTask = async (host: OrchestratorE2eFixture, name: string) => {
         const device = `Rename Browser ${name}`;
         const challenge = (await host.anonymous.connection.beginPairing({ deviceDisplayName: device })).challenge;
@@ -1147,18 +1154,30 @@ describe("session host, durable events, and reconnect semantics", () => {
         await page.getByLabel("Joko node address").fill(host.baseUrl);
         await page.getByLabel("Pairing code").fill(host.pairingCode(challenge.challengeId));
         await page.getByLabel("Device name").fill(device);
-        await page.locator("form.pair-form button[type=submit]").click();
-        await page.locator(`.sidebar [data-session-id="${id}"]`).filter({ hasText: name }).first().click();
+        const [pairing] = await Promise.all([
+          page.waitForResponse(response => response.url() === host.baseUrl + "/joko.v1.ConnectionService/CompletePairing" && response.ok()),
+          page.locator("form.pair-form button[type=submit]").click()
+        ]);
+        const profileId = fromBinary(CompletePairingResponseSchema, await pairing.body()).result?.connection?.connectionId;
+        if (!profileId) throw new Error("The browser pairing has no connection identity.");
+        await page.getByRole("button", { name: "Disconnect", exact: true }).waitFor({ state: "visible" });
+        await page.locator(`.sidebar [data-session-id="${id}"]:not([data-machine-profile])`).filter({ hasText: name }).first().click();
         await title(name).waitFor({ state: "visible" });
         await pane.locator("summary").and(pane.getByLabel(`Actions for ${name}`, { exact: true })).click();
         await pane.getByRole("menuitem", { name: "Copy task link", exact: true }).click();
         const copied = await waitFor(() => page.evaluate(() => navigator.clipboard.readText()),
-          text => URL.canParse(text) && new URLSearchParams(new URL(text).hash.split("?")[1]).has("profile"),
+          text => {
+            if (!URL.canParse(text)) return false;
+            const query = new URLSearchParams(new URL(text).hash.split("?")[1]);
+            return query.get("profile") === profileId;
+          },
           `the node-qualified task link for ${name}`);
         await page.evaluate(() => navigator.clipboard.writeText(""));
         return new URL(copied).hash;
       };
       const aHash = await pairAndCopyTask(a, nameA);
+      await openHash(aHash);
+      await title(nameA).waitFor({ state: "visible" });
       await page.getByRole("button", { name: "Disconnect", exact: true }).click();
       const bHash = await pairAndCopyTask(b, nameB);
       expect(aHash).not.toBe(bHash);
@@ -1173,7 +1192,6 @@ describe("session host, durable events, and reconnect semantics", () => {
           origin: url.origin, taskId: mutation.value.sessionId, title: mutation.value.displayName
         });
       });
-      const openHash = (hash: string) => page.evaluate(value => { location.hash = value; }, hash);
       await openHash(aHash);
       const dialog = page.getByRole("dialog", { name: "Rename task", exact: true });
       await title(nameA).click();
