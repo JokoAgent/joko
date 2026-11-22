@@ -7,6 +7,7 @@ import { createConnectTransport, endpointOrigin, parseTrustedNodeInvitation } fr
 import * as contract from "@joko/contracts";
 import type { BlobRef, TargetDescriptor } from "@joko/core";
 import { operationBodyHash, type ConnectionRecord, type OperationalStore } from "@joko/store";
+import { TaskCopyRepositoryRootError } from "@joko/worktree";
 import type { ArtifactStore } from "./artifact-store.js";
 import { isLoopbackHost, isPrivateLanHttpOrigin } from "./config.js";
 import type { ConnectionManager } from "./connection-manager.js";
@@ -188,7 +189,9 @@ export class TaskCopyHost {
       const workspaceIndexes = new Map<string, number>();
       const workers: CopiedWorker[] = [];
       let exported: Awaited<ReturnType<SessionHost["exportPortableSession"]>> | undefined;
-      for (const [index, member] of [capture.lead, ...capture.workers.map(worker => worker.source)].entries()) {
+      const members = [capture.lead, ...capture.workers.map(worker => worker.source)];
+      const memberWorkspaces: number[] = [];
+      for (const member of members) {
         const root = await realpath(member.root);
         let workspace = workspaceIndexes.get(root);
         if (workspace === undefined) {
@@ -200,6 +203,9 @@ export class TaskCopyHost {
           remaining -= snapshot.uncompressedBytes;
           await rename(snapshot.archive, join(directory.path, taskCopyWorkspaceName(workspace)));
         }
+        memberWorkspaces.push(workspace);
+      }
+      for (const [index, member] of members.entries()) {
         capture.assertWorkspaceIdle();
         const history = await this.options.host.exportPortableSession({ sessionId: member.sessionId, taskCopyRoot: member.root,
           applicationVersion: this.options.applicationVersion, expiresAt: Date.now() + CAPTURE_TTL_MS + TRANSFER_TTL_MS }, check);
@@ -211,7 +217,7 @@ export class TaskCopyHost {
         if (remaining < 0) throw new ConnectError("The workspace and worker histories exceed the task copy limit.", Code.ResourceExhausted);
         const data = await this.options.artifacts.readBlob(history.artifact);
         await writeFile(join(directory.path, taskCopyWorkerName(index - 1)), data.data, { flag: "wx", mode: 0o600, signal });
-        workers.push({ ...capture.workers[index - 1]!.values, workspace });
+        workers.push({ ...capture.workers[index - 1]!.values, workspace: memberWorkspaces[index]! });
       }
       if (exported === undefined) throw invalidGrant();
       capture.assertWorkspaceIdle();
@@ -231,6 +237,9 @@ export class TaskCopyHost {
       this.#transfers.set(grant.transferId, lease);
       published = true;
       return grant;
+    } catch (error) {
+      if (error instanceof TaskCopyRepositoryRootError) throw new ConnectError(error.message, Code.FailedPrecondition);
+      throw error;
     } finally {
       if (!published) { revoke(); if (directory) await removePrivateDirectory(directory); }
     }

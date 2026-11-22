@@ -40,8 +40,8 @@ export async function captureTaskCopyWorkspace(input: WorkspaceCopyBudget & {
   if (relative(root, stage) === "" || contained(root, stage)) throw new Error("Choose a workspace outside the node’s private copy storage.");
   const policy = workspacePolicy(input);
   const excluded = new Set(input.excludedRoots.filter(path => contained(root, path)).map(path => relative(root, path).split(/[\\/]/u).join("/")));
-  const source = await inventory(root, excluded, policy.check);
   const repository = await captureTaskCopyRepository(root, join(stage, "repository-objects"), join(stage, repositoryName), input);
+  const source = await inventory(root, excluded, policy.check);
   if (repository) policy.count(Number((await lstat(join(stage, repositoryName), { bigint: true })).size));
   const entries: WorkspaceEntry[] = [];
   const names = [manifestName];

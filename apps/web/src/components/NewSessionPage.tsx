@@ -67,6 +67,9 @@ import type {
 } from "../model.js";
 import type { TargetDraft } from "../model.js";
 import type { DelayedNewSessionDraft, FirstInputAcceptance, FirstInputDisposition, NewSessionSubmissionOwner, RegionCaptureTaskAttachment } from "../new-session-flow.js";
+import { applyProjectConfiguration, inspectProjectConfiguration, localProjectConversion,
+  type ProjectConversionCandidate, type ProjectConversionPlanner } from "../project-configuration-conversion.js";
+import { ProjectConfigurationDialog, type ProjectConfigurationDecision } from "./ProjectConfigurationDialog.js";
 import { randomUuid } from "../web-crypto.js";
 import { resourceKindsForBackend } from "../resource-capabilities.js";
 import { composerDocumentIsPlainTextInvocation } from "../skill-learning-command.js";
@@ -336,6 +339,12 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const submittingRef = useRef(submitting);
   const submissionAbortRef = useRef<AbortController | undefined>(undefined);
   const submissionOriginRef = useRef<NewSessionSubmissionOwner | undefined>(undefined);
+  const [conversionDialog, setConversionDialog] = useState<{
+    readonly candidates: readonly ProjectConversionCandidate[];
+    readonly ownerDocument: Document;
+    readonly decide: (decision: ProjectConfigurationDecision) => void;
+  }>();
+  const prewarmConversion = useRef<{ readonly scope: string; readonly available: boolean } | undefined>(undefined);
   const fullAccessConfirmationRef = useRef<FullAccessConfirmation | undefined>(undefined);
   const mountedRef = useRef(true);
   const controllerRef = useRef(controller);
@@ -1570,6 +1579,16 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const personalDraft = contactsDraft === undefined && composerBuiltInCommand(text, commandOptions)?.kind === "personalDevelopment";
   const canSend = (canFinishVoiceSend || personalDraft && personalDevelopmentSupported && hydrated && !submitting)
     && hasInput && !voice.active;
+  const projectConversionApi = window.jokoDesktop?.previewProjectConfiguration;
+  const projectConversionProfile = controller.state.activeProfile?.id;
+  const projectConversion = projectConversionApi && projectConversionProfile && contactsDraft === undefined && selected?.trusted === true && startKind === "fresh"
+    ? localProjectConversion(usableWorkspace, backend?.id, controller.state.activeProfile?.managedLocal === true,
+      backend?.capabilities.get("workspace.files.write")?.supported === true) : undefined;
+  const conversionScope = projectConversion === undefined ? "" : JSON.stringify([
+    profileScope, controller.state.connectionGeneration, projectConversion.workspaceId, usableWorkspace?.revision, projectConversion.backend
+  ]);
+  const configurationPlanner: ProjectConversionPlanner | undefined = projectConversionApi && projectConversionProfile
+    ? (backend, files, scripts) => projectConversionApi(projectConversionProfile, backend, files, scripts) : undefined;
   const prewarmDraft: NewSessionDraft | undefined = contactsDraft === undefined && selection?.kind === "target" && selected?.trusted === true
     && targetModelGroup === undefined
     && selected.remoteWorkspace === undefined && targetWorkspaceReady && startKind === "fresh"
@@ -1597,7 +1616,17 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     let retired = false;
     const run = async (): Promise<void> => {
       try {
-        if ((hasInput || voice.active) && prewarmDraft) await provisionalTask.prepare(prewarmDraft);
+        if ((hasInput || voice.active) && prewarmDraft) {
+          if (projectConversion && configurationPlanner) {
+            if (prewarmConversion.current?.scope !== conversionScope) {
+              const preview = await inspectProjectConfiguration(controller, projectConversion, configurationPlanner, () => !retired).catch(() => undefined);
+              if (retired) return;
+              prewarmConversion.current = { scope: conversionScope, available: (preview?.candidates.length ?? 0) > 0 };
+            }
+            if (prewarmConversion.current?.available === true) return;
+          }
+          await provisionalTask.prepare(prewarmDraft);
+        }
         else if (!voice.active && Date.now() >= prewarmVoiceGraceRef.current) await provisionalTask.retire();
       } catch (error) { if (!retired && preparationRef.current) setDraftError(messageOf(error)); }
     };
@@ -1606,7 +1635,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const reconcile = !hasInput && !voice.active && preparation !== undefined
       ? window.setInterval(() => { void run(); }, 5_000) : undefined;
     return () => { retired = true; window.clearTimeout(timer); if (reconcile !== undefined) window.clearInterval(reconcile); };
-  }, [hydrated, hydratedProfileScope, profileScope, submitting, controller.state.connectionState, hasInput, text, voice.active, prewarmConfiguration, provisionalTask, preparation, prewarmInputIntent]);
+  }, [hydrated, hydratedProfileScope, profileScope, submitting, controller.state.connectionState, hasInput, text, voice.active, prewarmConfiguration, provisionalTask, preparation, prewarmInputIntent, conversionScope]);
   const submissionScope = useMemo(() => ({}), [
     profileScope,
     controller.state.connectionGeneration,
@@ -2399,6 +2428,29 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
           groupId: targetModelGroup.groupId, expectedRevision: groupRevision,
           hasImages: sourceAttachments.some(attachment => attachment.kind === "image") || sourceBrowserComments.length > 0
         } : undefined;
+      if (!capture && contactsDialogue === undefined && taskModelGroup === undefined && projectConversion && configurationPlanner) {
+        const preview = await inspectProjectConfiguration(controller, projectConversion, configurationPlanner, owner.isCurrent).catch(() => undefined);
+        if (!owner.isCurrent()) return;
+        if (preview && preview.candidates.length > 0) {
+          const choice = await new Promise<ProjectConfigurationDecision>(resolve => {
+            const abort = () => decide("cancel");
+            const decide = (decision: ProjectConfigurationDecision): void => {
+              owner.signal.removeEventListener("abort", abort);
+              if (mountedRef.current) setConversionDialog(current => current?.decide === decide ? undefined : current);
+              resolve(decision);
+            };
+            owner.signal.addEventListener("abort", abort, { once: true });
+            setConversionDialog({ candidates: preview.candidates, ownerDocument, decide });
+          });
+          if (choice === "cancel" || !owner.isCurrent()) return;
+          if (choice !== "skip") {
+            if (!await provisionalTask.retire()) throw new Error(t("newTask.projectConversion.preparationPending"));
+            if (!owner.isCurrent()) return;
+            await applyProjectConfiguration(controller, projectConversion, configurationPlanner, preview, choice, owner.isCurrent);
+            if (!owner.isCurrent()) return;
+          }
+        }
+      }
       const prepared = capture || contactsDialogue !== undefined || taskModelGroup !== undefined ? {} : await provisionalTask.take({ targetId: selected?.id ?? "", expectedTargetRevision: selected?.revision,
         name: t("session.newName"), nativeStart: selected !== undefined && startKind === "attach" && nativeSelectionReady
           ? { kind: "attach", reference: selectedNativeSession!.reference } : { kind: "fresh" }, providerId: selectedModel?.providerId ?? "", modelId: selectedModel?.modelId ?? "",
@@ -3222,6 +3274,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         <HomeUsageDashboard controller={controller} ownerId={pickerOwnerId} locale={controller.state.effectiveLocale} t={t} />
       </section>
     </div>
+    {conversionDialog && <ProjectConfigurationDialog candidates={conversionDialog.candidates} ownerDocument={conversionDialog.ownerDocument}
+      onDecision={conversionDialog.decide} t={t} />}
     <Modal
       open={activeFullAccessConfirmation !== undefined}
       ownerDocument={activeFullAccessConfirmation?.ownerDocument}

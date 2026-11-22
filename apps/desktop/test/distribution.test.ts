@@ -89,10 +89,13 @@ describe("Desktop distribution", () => {
       "@joko/contracts": "workspace:*",
       "@joko/device-peer": "workspace:*",
       "@joko/remote-desktop-sync": "workspace:*",
+      "@joko/voice-speaker": "workspace:*",
       "electron-updater": "6.8.9",
       "electron-window-state": "5.0.3",
       loudness: "0.4.2",
       sharp: "0.35.3",
+      "sherpa-onnx-node": "1.13.8",
+      "smol-toml": "1.6.1",
       tar: "7.5.22",
       yaml: "2.9.0"
     });

@@ -4078,6 +4078,10 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 @keyframes modal-in { from { transform: translateY(8px) scale(.985); opacity: .4; } }
 .modal__header { display: flex; align-items: flex-start; gap: 12px; border-bottom: 1px solid var(--line); padding: 16px; }.modal__header-copy { min-width: 0; flex: 1; }.modal__header-leading { width: 34px; height: calc(var(--text-15) * 1.2); display: grid; flex: 0 0 auto; place-items: center; }.modal__header-trailing { min-width: 0; flex: 0 0 auto; }.modal__header h2 { margin: 0; font-size: var(--text-15); line-height: 1.2; letter-spacing: -.02em; }.modal__header p { margin: 4px 0 0; color: var(--text-soft); line-height: 1.45; }
 .modal__body { min-height: 0; overflow: auto; padding: 16px; }.modal__actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 24px; }.modal__actions > .button { min-width: 96px; padding: 9px 24px; }.modal--small .modal__header { border-bottom: 0; padding: 16px 16px 0; }.modal--small .modal__body { padding: 12px 16px 16px; }
+.project-configuration-choices { display: grid; gap: 14px; list-style: none; padding: 0; margin: 0; }
+.project-configuration-choices label { display: flex; align-items: center; gap: 8px; }
+.project-configuration-choices ul { padding-inline-start: 28px; margin-block: 4px 0; color: var(--text-soft); overflow-wrap: anywhere; }
+.project-configuration-choices + .modal__actions { flex-wrap: wrap; }
 .provider-login { display: grid; gap: 16px; }
 .provider-login-modal .provider-login { padding: 16px 16px 0; }
 .provider-login-modal .provider-flow-footer { margin-inline: -16px; }

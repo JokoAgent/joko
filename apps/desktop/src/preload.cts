@@ -917,6 +917,8 @@ const desktopApi = Object.freeze({
       return () => ipcRenderer.removeListener("joko:performance-recording:open", callback);
     }
   }),
+  previewProjectConfiguration: (profileId: string, backend: unknown, files: unknown, scripts: unknown) =>
+    ipcRenderer.invoke("joko:project-configuration-preview", profileId, backend, files, scripts),
   microphone: Object.freeze({
     getPermission: (): Promise<DesktopMicrophonePermissionSnapshot> =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.microphoneGetPermission).then(parseDesktopMicrophonePermissionSnapshot),

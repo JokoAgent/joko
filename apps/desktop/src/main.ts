@@ -310,6 +310,7 @@ import {
 } from "./microphone-permission.js";
 import { registerDesktopSpeakerIpc } from "./voice-speaker.js";
 import { DesktopPerformanceRecording } from "./performance-recording.js";
+import { planProjectConfigurationConversion } from "./project-configuration-conversion.js";
 import { createProviderModelRefreshHostLifecycle } from "./provider-model-refresh-lifecycle.js";
 import {
   DesktopGlobalShortcutRegistration,
@@ -8840,6 +8841,14 @@ function configureRegionCaptureShortcut(): boolean {
 }
 
 function registerIpc(): void {
+  ipcMain.handle("joko:project-configuration-preview", (event, profileId: unknown, backend: unknown, files: unknown, scripts: unknown) => {
+    assertTrustedIpcSender(event);
+    const node = managedOrchestratorStatus;
+    if (quitting || node.state !== "ready" || node.connection.profileId !== profileId || !nativeFileActionScope(event).isCurrent()) {
+      throw new Error("Project configuration conversion requires the current desktop-managed node.");
+    }
+    return planProjectConfigurationConversion(backend, files, scripts);
+  });
   ipcMain.handle("joko:performance-recording", async (event, command: unknown, profileId: unknown) => {
     assertTrustedIpcSender(event);
     if (typeof profileId !== "string" || profileId.length === 0 || profileId.length > 512) throw new TypeError("Invalid performance recording owner.");

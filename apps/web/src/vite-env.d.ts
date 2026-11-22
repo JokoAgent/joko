@@ -696,6 +696,8 @@ interface JokoDesktopApi {
     run(command: "state" | "start" | "stop" | "reveal" | "retire", profileId: string): Promise<"idle" | "recording" | "busy" | "ready">;
     onOpen(listener: () => void): () => void;
   };
+  readonly previewProjectConfiguration?: (profileId: string, ...args: Parameters<import("./project-configuration-conversion.js").ProjectConversionPlanner>) =>
+    ReturnType<import("./project-configuration-conversion.js").ProjectConversionPlanner>;
   readonly microphone: {
     getPermission(): Promise<{ readonly status: "granted" | "denied" | "prompt" | "unknown" }>;
     openSettings(): Promise<boolean>;

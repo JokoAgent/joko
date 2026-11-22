@@ -1,11 +1,12 @@
+import type { Stats } from "node:fs";
 import { lstat, realpath, writeFile } from "node:fs/promises";
-import { devNull } from "node:os";
-import { isAbsolute, join, relative } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { GitCommandError, runGit } from "./git.js";
 import { DEFAULT_WORKTREE_OPERATION_TIMEOUT_MS, WorktreeOperationControl } from "./operation.js";
 
 const bundleRef = "refs/joko/task-copy";
-const environment = { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: devNull, GIT_NO_REPLACE_OBJECTS: "1", GIT_OPTIONAL_LOCKS: "0",
+// Git interprets /dev/null itself, including when spawned by Node on Windows.
+const environment = { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_NO_REPLACE_OBJECTS: "1", GIT_OPTIONAL_LOCKS: "0",
   GIT_AUTHOR_NAME: "Joko", GIT_AUTHOR_EMAIL: "copy@joko.invalid", GIT_COMMITTER_NAME: "Joko", GIT_COMMITTER_EMAIL: "copy@joko.invalid" };
 const oid = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
 
@@ -18,21 +19,35 @@ export interface TaskCopyRepository {
 
 interface CopyFence { readonly signal: AbortSignal; readonly assertCurrent: () => void }
 
+export class TaskCopyRepositoryRootError extends Error {
+  constructor() { super("Choose the Git repository root to copy this task."); }
+}
+
 /** Export the current HEAD and staged tree through a private Git repository. */
-export async function captureTaskCopyRepository(root: string, stage: string, bundle: string, fence: CopyFence): Promise<{
+export async function captureTaskCopyRepository(root: string, stage: string, bundle: string,
+  fence: CopyFence): Promise<{
   readonly repository: TaskCopyRepository;
   readonly verifySource: () => Promise<void>;
 } | undefined> {
   const control = new WorktreeOperationControl(fence, DEFAULT_WORKTREE_OPERATION_TIMEOUT_MS);
-  const marker = await lstat(join(root, ".git")).catch((error: unknown) => {
-    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
-    throw error;
-  });
-  control.check();
-  if (!marker) return undefined;
+  // Plain workspaces can be copied even on a node without Git. A marker
+  // elsewhere in the current directory hierarchy must be investigated first.
+  let directory = root;
+  let marker: Stats | undefined;
+  while (marker === undefined) {
+    control.check();
+    marker = await lstat(join(directory, ".git")).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (marker !== undefined) break;
+    const parent = dirname(directory);
+    if (parent === directory) return undefined;
+    directory = parent;
+  }
   if (marker.isSymbolicLink() || !marker.isDirectory() && !marker.isFile()) throw new Error("The task repository marker is invalid.");
-  const sourceRoot = await git(["rev-parse", "--show-toplevel"], root, control);
-  if (relative(root, await realpath(sourceRoot.trim())) !== "") throw new Error("Copy a task from its repository root.");
+  const sourceRoot = await realpath((await git(["rev-parse", "--show-toplevel"], root, control)).trim());
+  if (relative(root, sourceRoot) !== "") throw new TaskCopyRepositoryRootError();
   const rawFormat = (await git(["rev-parse", "--show-object-format"], root, control)).trim();
   if (rawFormat !== "sha1" && rawFormat !== "sha256") throw new Error("The task repository object format is unsupported.");
   const sourceObjects = await realpath((await git(["rev-parse", "--path-format=absolute", "--git-path", "objects"], root, control)).trim());

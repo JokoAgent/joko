@@ -6,8 +6,8 @@ import { promisify } from "node:util";
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
-import { OperationMutationSchema, OperationState, PermissionMode, PortableSessionService, PortableTaskCopyPartKind,
-  RunState, SetWorkspaceTrustMutationSchema } from "@joko/contracts";
+import { CreateTargetMutationSchema, OperationMutationSchema, OperationState, PermissionMode, PortableSessionService, PortableTaskCopyPartKind,
+  RunState, SetWorkspaceTrustMutationSchema, WorkspaceKind } from "@joko/contracts";
 import { afterEach, expect, it } from "vitest";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { routeFixtureDiscovery, waitFor } from "./fixture.js";
@@ -18,6 +18,33 @@ import type { PairedClient } from "./connect-clients.js";
 const execute = promisify(execFile);
 const project = "workspace-real-pi";
 const blockedInput = "Hold this input at the original node";
+
+it("refuses to copy a repository subdirectory before establishing a target on the receiving node", { timeout: 90_000 }, async () => {
+  const source = await RealPiSystemFixture.start();
+  fixtures.push(source);
+  const destination = await RealPiSystemFixture.start();
+  fixtures.push(destination);
+  const owner = await source.pair("Nested task owner");
+  const receiver = await destination.pair("Receiving owner");
+  const root = source.workspaceDirectory;
+  await git(root, "init", "-b", "source");
+  const nested = join(root, "packages", "app");
+  await mkdir(nested, { recursive: true });
+  const created = await submit(owner.clients.operation, owner.connectionId, create(OperationMutationSchema, { payload: {
+    case: "createTarget", value: create(CreateTargetMutationSchema, { backendId: "pi", displayName: "Nested workspace",
+      workspace: { kind: WorkspaceKind.USER_PROJECT, serverPath: nested } })
+  } }));
+  if (created.result?.payload.case !== "target") throw new Error("The nested workspace was not created.");
+  const { workspaceId, targetId } = created.result.payload.value;
+  await trustWorkspace(owner, workspaceId);
+  const sessionId = await createTask(owner, "Nested task", targetId);
+  const operationId = randomUUID();
+  await expect(owner.clients.portableSession.preparePortableTaskCopy({ operationId, sessionId,
+    expectedSessionGeneration: generation(source, sessionId), destinationServerId: destination.application.serverId
+  })).rejects.toMatchObject({ code: Code.FailedPrecondition, rawMessage: "Choose the Git repository root to copy this task." });
+  expect((await receiver.clients.portableSession.getPortableTaskCopyReceipt({ operationId })).receipt).toBeUndefined();
+  expect(destination.application.store.listSessions()).toHaveLength(0);
+});
 
 it("copies a settled Pi Goal with distinct worker files and native history to an independently paired node exactly once", {
   timeout: 180_000
@@ -83,6 +110,25 @@ it("copies a settled Pi Goal with distinct worker files and native history to an
     release();
     await waitForSuccess(originalOwner, runId);
 
+    const workerFile = join(workerDirectory, "worker.txt");
+    await git(root, "add", "--", "worker-area/worker.txt");
+    await writeFile(workerFile, "worker unstaged\n");
+    const rejected = request(randomUUID());
+    await expect(originalOwner.clients.portableSession.preparePortableTaskCopy(rejected)).rejects.toMatchObject({
+      code: Code.FailedPrecondition, rawMessage: expect.stringMatching(/choose the Git repository root/iu)
+    });
+    expect((await receivingOwner.clients.portableSession.getPortableTaskCopyReceipt({ operationId: rejected.operationId })).receipt).toBeUndefined();
+    expect(await git(root, "show", ":worker-area/worker.txt")).toBe("private workspace of the copied worker");
+    expect(await readFile(workerFile, "utf8")).toBe("worker unstaged\n");
+
+    await git(root, "rm", "-f", "--cached", "--", "worker-area/worker.txt");
+    await git(workerDirectory, "init", "-b", "copy-worker");
+    await git(workerDirectory, "add", "--", "worker.txt");
+    await git(workerDirectory, "-c", "user.email=joko@example.invalid", "-c", "user.name=Joko test", "commit", "-m", "worker history");
+    await writeFile(workerFile, "worker staged\n");
+    await git(workerDirectory, "add", "--", "worker.txt");
+    await writeFile(workerFile, "private workspace of the copied worker");
+
     const cancelledRequest = request(randomUUID());
     const { grant: cancelled } = await originalOwner.clients.portableSession.preparePortableTaskCopy(cancelledRequest);
     const reader = source.anonymous.portableSession;
@@ -141,6 +187,9 @@ it("copies a settled Pi Goal with distinct worker files and native history to an
     expect(await git(copiedRoot, "rev-parse", "HEAD")).toBe(await git(root, "rev-parse", "HEAD"));
     expect(await readFile(join(copiedRoot, "ignored.txt"), "utf8")).toBe("still part of the current workspace");
     expect(await readFile(join(copiedWorkerRoot, "worker.txt"), "utf8")).toBe("private workspace of the copied worker");
+    expect(await git(copiedWorkerRoot, "show", ":worker.txt")).toBe("worker staged");
+    expect(await git(copiedWorkerRoot, "symbolic-ref", "--short", "HEAD")).toBe("copy-worker");
+    expect(await git(copiedWorkerRoot, "rev-parse", "HEAD")).toBe(await git(workerDirectory, "rev-parse", "HEAD"));
     await expect(readFile(join(copiedRoot, "worker-area", "worker.txt"))).rejects.toMatchObject({ code: "ENOENT" });
     if (process.platform !== "win32") {
       expect(receipt?.skippedFiles).toContainEqual(expect.objectContaining({ relativePath: "external-link", reason: "external_link" }));
@@ -231,9 +280,9 @@ async function trustWorkspace(owner: PairedClient, workspaceId: string): Promise
   expect(result.state, result.error?.message).toBe(OperationState.SUCCEEDED);
 }
 
-async function createTask(owner: PairedClient, displayName: string): Promise<string> {
+async function createTask(owner: PairedClient, displayName: string, targetId = project): Promise<string> {
   return sessionIdFrom(await submit(owner.clients.operation, owner.connectionId, createSessionMutation({
-    backendId: "pi", targetId: project, displayName, providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID
+    backendId: "pi", targetId, displayName, providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID
   })));
 }
 
