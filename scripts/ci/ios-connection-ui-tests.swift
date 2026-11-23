@@ -195,14 +195,17 @@ final class JokoConnectionUITests: XCTestCase {
         let source: String
         if guide.exists {
             let proceed = app.buttons.matching(NSPredicate(format: "label == %@", "Continue")).firstMatch
-            XCTAssertTrue(proceed.waitForExistence(timeout: max(0, deadline.timeIntervalSinceNow)))
-            guard proceed.exists && proceed.isHittable else {
-                XCTFail("The exact QuickPath guide must expose its native Continue button.")
-                return false
+            let window = app.windows.firstMatch
+            let windowFrame = window.frame
+            // XCTest can retire the system button during interruption handling.
+            // Use its measured hit point from the app window while the guide is present.
+            if proceed.waitForExistence(timeout: max(0, deadline.timeIntervalSinceNow)),
+               let frame = try? proceed.snapshot().frame, !frame.isEmpty, windowFrame.contains(frame), guide.exists {
+                window.coordinate(withNormalizedOffset: .zero)
+                    .withOffset(CGVector(dx: frame.midX - windowFrame.minX, dy: frame.midY - windowFrame.minY)).tap()
             }
-            proceed.tap()
             let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: guide)
-            dismissed = XCTWaiter.wait(for: [gone], timeout: max(0, deadline.timeIntervalSinceNow)) == .completed
+            dismissed = !guide.exists || XCTWaiter.wait(for: [gone], timeout: max(0, deadline.timeIntervalSinceNow)) == .completed
             source = "application-accessibility"
         } else {
             // The fresh Simulator can show QuickPath outside the application's
@@ -224,8 +227,8 @@ final class JokoConnectionUITests: XCTestCase {
             }
             dismissed = guideDisappeared
             source = "system-screen"
-            if dismissed { reportCheckpoint("04-address-quickpath-dismissed") }
         }
+        if dismissed { reportCheckpoint("04-address-quickpath-dismissed") }
         let receipt: [String: Any] = ["scope": "owned-native-quickpath-guide-only",
             "guideText": guideText, "button": "Continue", "dismissed": dismissed, "source": source]
         if let data = try? JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys]) {
@@ -304,13 +307,14 @@ final class JokoConnectionUITests: XCTestCase {
         if traceFirstAddressEntry { reportCheckpoint("04-address-tapped") }
         let keyboard = app.keyboards.firstMatch
         let focusDeadline = Date().addingTimeInterval(10)
-        dismissQuickPathIfPresent(until: focusDeadline)
+        var dismissedGuide = dismissQuickPathIfPresent(until: focusDeadline)
         if !field.hasFocus && !keyboard.waitForExistence(timeout: min(2, max(0, focusDeadline.timeIntervalSinceNow)))
             && focusDeadline.timeIntervalSinceNow > 0 {
             tap(field, atCenter: true)
         }
         let keyboardReady = field.hasFocus || keyboard.waitForExistence(timeout: max(0, focusDeadline.timeIntervalSinceNow))
-        dismissQuickPathIfPresent(until: focusDeadline, checkSystemScreen: traceFirstAddressEntry && keyboardReady)
+        dismissedGuide = dismissQuickPathIfPresent(until: focusDeadline, checkSystemScreen: traceFirstAddressEntry && keyboardReady)
+            || dismissedGuide
         let readyToType = field.hasFocus || (keyboardReady && keyboard.exists)
         if !readyToType { recordPublicInputMismatch(field, expected: text, knownPublicInvitation: knownPublicInvitation, stage: "focus") }
         XCTAssertTrue(readyToType, "Tapping the native field must make text input available.")
@@ -343,27 +347,32 @@ final class JokoConnectionUITests: XCTestCase {
         if traceFirstAddressEntry { reportCheckpoint("04-address-typing") }
         field.typeText(text)
         if traceFirstAddressEntry { reportCheckpoint("04-address-typed") }
-        let valueDeadline = Date().addingTimeInterval(10)
+        var valueDeadline = Date().addingTimeInterval(10)
         var restoredFirstEntry = false
         var valueMatches: Bool
         repeat {
-            let dismissedGuide = dismissQuickPathIfPresent(until: valueDeadline,
+            dismissedGuide = dismissQuickPathIfPresent(until: valueDeadline,
                 checkSystemScreen: traceFirstAddressEntry && (field.value as? String) != text)
+                || dismissedGuide
             let changed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", text), object: field)
             let remaining = valueDeadline.timeIntervalSinceNow
             if remaining > 0 && (field.value as? String) != text {
                 _ = XCTWaiter.wait(for: [changed], timeout: min(1, remaining))
             }
-            // The one-time system guide can consume the first public fixture
-            // address. Type it once more only if the guide was observed and
-            // dismissed and the exact field still contains no typed text.
-            if traceFirstAddressEntry && dismissedGuide && !restoredFirstEntry && valueDeadline.timeIntervalSinceNow > 0,
-               let observed = field.value as? String, observed.isEmpty || observed == placeholder {
-                if !field.hasFocus { tap(field, atCenter: true) }
-                if valueDeadline.timeIntervalSinceNow > 0 && (field.hasFocus || keyboard.exists) {
+            // QuickPath can interrupt the first public address after a prefix.
+            // Restore only the missing suffix once the system guide is gone.
+            if traceFirstAddressEntry && dismissedGuide && !restoredFirstEntry,
+               let observed = field.value as? String, observed != text {
+                let prefix = observed == placeholder ? "" : observed
+                if text.hasPrefix(prefix) {
                     restoredFirstEntry = true
-                    field.typeText(text)
-                    reportCheckpoint("04-address-retyped")
+                    field.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5)).tap()
+                    let current = field.value as? String
+                    if (current == prefix || (prefix.isEmpty && current == placeholder)) && (field.hasFocus || keyboard.exists) {
+                        field.typeText(String(text.dropFirst(prefix.count)))
+                        reportCheckpoint("04-address-input-restored")
+                    }
+                    valueDeadline = Date().addingTimeInterval(10)
                 }
             }
             valueMatches = (field.value as? String) == text
@@ -505,6 +514,7 @@ final class JokoConnectionUITests: XCTestCase {
         let copyAction = try XCTUnwrap(copy, "The system text menu must offer Copy.")
         screenshot("12-native-pdf-selection")
         tap(copyAction, atCenter: true)
+        reportCheckpoint("12-native-pdf-copy-tapped")
 
         tap(backToFiles, atCenter: true)
         tap(app.buttons["Back to Task"].firstMatch, atCenter: true)

@@ -569,9 +569,9 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
     ...(sdkRuntime === 'http-connect-native' ? ['11-http-connect-invitation'] : []),
     ...(verifyWorkspacePdf ? ["11-original-workspace-pdf", "12-pdf-word-held", "12-native-pdf-selection", "13-pdf-word-pasted"] : [])];
   const progressNames = new Set([...names, "04-https-selected", "04-address-tapped", "04-address-quickpath-dismissed",
-    "04-address-typing", "04-address-typed", "04-address-retyped", "04-address-value-observed",
+    "04-address-typing", "04-address-typed", "04-address-input-restored", "04-address-value-observed",
     "11-pdf-address-and-key-confirmed", "11-pdf-identity-check-tapped", "11-pdf-identity-confirmed", "11-pdf-pairing-available",
-    "11-pdf-task-link-visible", "11-pdf-task-link-tapped"]);
+    "11-pdf-task-link-visible", "11-pdf-task-link-tapped", "12-native-pdf-copy-tapped"]);
   // A loopback-only Connect error endpoint exercises the real native transport.
   // It never supplies a node identity, challenge, credential or successful pair.
   let requests = 0, unexpectedRequests = 0, screenshotCount = 0;
