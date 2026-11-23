@@ -247,6 +247,7 @@ function adapter(overrides: Partial<AndroidAdbAdapter> = {}): AndroidAdbAdapter 
     killServer: async () => undefined,
     connect: async (endpoint) => ({ endpoint, output: "" }),
     disconnect: async (endpoint) => ({ endpoint, output: "" }),
+    readScreenSize: async () => { throw new Error("unused"); },
     snapshot: async () => { throw new Error("unused"); },
     tap: async () => undefined,
     swipe: async () => undefined,

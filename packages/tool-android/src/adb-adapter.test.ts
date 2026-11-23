@@ -16,6 +16,8 @@ import type {
   AndroidCommandResult,
   AndroidCommandRunner
 } from "./process-runner.js";
+import { AndroidToolProvider } from "./provider.js";
+import { AndroidAutomationRuntime } from "./runtime.js";
 
 describe("ADB parsers and validators", () => {
   it("parses long device output and drops malformed serials", () => {
@@ -165,6 +167,54 @@ describe("AdbCliAdapter", () => {
       stdoutMode: "binary",
       maximumStdoutBytes: 24 * 1024 * 1024
     }));
+  });
+
+  it("taps an authorized device by coordinate even while its screenshot command fails", async () => {
+    const serial = "emulator-5554";
+    const runner: AndroidCommandRunner = {
+      run: vi.fn(async (request: AndroidCommandRequest) => {
+        switch (request.arguments?.join(" ")) {
+          case "version": return result("Android Debug Bridge version 1.0.41");
+          case "devices -l": return result(`List of devices attached\n${serial} device model:Pixel`);
+          case `-s ${serial} shell dumpsys window displays`:
+            return result("Display: mDisplayId=0 rootTasks=1\n  init=1080x1920 420dpi cur=1080x1920 app=1080x1790");
+          case `-s ${serial} shell wm size`: return result("Physical size: 1080x1920");
+          case `-s ${serial} shell wm density`: return result("Physical density: 420");
+          case `-s ${serial} shell dumpsys window windows`: return result("mCurrentFocus=Window{abc u0 com.example.app/.MainActivity}");
+          case `-s ${serial} shell input tap 20 30`: return result("");
+          case `-s ${serial} exec-out screencap -p`: return result("", "screenshot unavailable", 1);
+          default: throw new Error("Unexpected ADB invocation.");
+        }
+      })
+    };
+    const adapter = new AdbCliAdapter({ executablePath: "adb", runner });
+    const runtime = new AndroidAutomationRuntime({ platform: "linux", adapter, portProbe: async () => true });
+    const provider = new AndroidToolProvider({ runtime });
+
+    const tap = await provider.callTool("task", "tap", { device_serial: serial, x: 20, y: 30 });
+    expect(tap.isError).toBeUndefined();
+    const payload = tap.content[0];
+    if (payload?.type !== "text") throw new Error("Expected a text tap receipt.");
+    expect(JSON.parse(payload.text)).toEqual({ ok: true, data: { device_serial: serial, x: 20, y: 30 } });
+    expect(runtime.cachedSnapshotCount).toBe(0);
+    expect(argumentsFor(runner).filter(args => args[0] === "-s")).toEqual([
+      ["-s", serial, "shell", "dumpsys", "window", "displays"],
+      ["-s", serial, "shell", "input", "tap", "20", "30"]
+    ]);
+    await expect(runtime.snapshot({ sessionId: "task", deviceSerial: serial })).rejects.toMatchObject({
+      code: "command_failed", message: "screenshot unavailable"
+    });
+  });
+
+  it("uses the rotated size of the primary display and falls back to the configured size when its dump is unavailable", async () => {
+    const runner = queuedRunner([
+      result("Display: mDisplayId=2 rootTasks=1\n  cur=480x640\nDisplay: mDisplayId=0 rootTasks=1\n  init=1080x1920 420dpi cur=1920x1080 app=1920x982"),
+      result("", "window data unavailable", 1),
+      result("Physical size: 1080x1920\nOverride size: 900x1600")
+    ]);
+    const adapter = new AdbCliAdapter({ executablePath: "adb", runner });
+    await expect(adapter.readScreenSize("emulator-5554")).resolves.toEqual({ width: 1920, height: 1080 });
+    await expect(adapter.readScreenSize("emulator-5554")).resolves.toEqual({ width: 900, height: 1600 });
   });
 
   it("keeps screenshots usable when UI dump fails", async () => {

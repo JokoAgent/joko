@@ -434,7 +434,8 @@ export class AndroidAutomationRuntime {
     }
     return this.#enqueueDevice(device.serial, async () => {
       let point: AndroidPoint;
-      let screen: AndroidScreenState;
+      let screen: Pick<AndroidScreenState, "width" | "height">;
+      let adapter: AndroidAdbAdapter | undefined;
       if (input.elementIndex !== undefined) {
         if (!Number.isSafeInteger(input.elementIndex) || input.elementIndex < 1) {
           throw new AndroidRuntimeError("invalid_node", "Android node index is invalid.");
@@ -457,16 +458,14 @@ export class AndroidAutomationRuntime {
         point = input.point as AndroidPoint;
         const cached = this.#freshSnapshot(sessionId, device.serial);
         if (cached === undefined) {
-          const adapter = await this.#useAdapter(input.signal);
-          const snapshot = await adapter.snapshot(device.serial, input.signal);
-          this.#snapshots.set(snapshotKey(sessionId, device.serial), { snapshot, capturedAt: this.#now() });
-          screen = snapshot.screen;
+          adapter = await this.#useAdapter(input.signal);
+          screen = await adapter.readScreenSize(device.serial, input.signal);
         } else {
           screen = cached.snapshot.screen;
         }
       }
       assertPointInScreen(point, screen);
-      const adapter = await this.#useAdapter(input.signal);
+      adapter ??= await this.#useAdapter(input.signal);
       this.#dropSnapshotsForSerial(device.serial);
       await adapter.tap(device.serial, point, input.signal);
       return { deviceSerial: device.serial, point };
@@ -848,7 +847,7 @@ function assertReadyDevice(device: AndroidConnectedDevice): void {
   throw new AndroidRuntimeError("no_device", "Requested Android device is not ready.");
 }
 
-function assertPointInScreen(point: AndroidPoint, screen: AndroidScreenState): void {
+function assertPointInScreen(point: AndroidPoint, screen: Pick<AndroidScreenState, "width" | "height">): void {
   if (
     !Number.isSafeInteger(point.x)
     || !Number.isSafeInteger(point.y)

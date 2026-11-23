@@ -532,7 +532,9 @@ async function runNativeScenario(): Promise<void> {
   await tap("Preview file index.html");
   await tap("Open the guide");
   const detailsAddress = "html-guide/details.html#chapter";
-  const waitAddress = (value: string) => waitNode((node) => node.className === "android.widget.EditText" && node.text === value, "HTML display path " + value);
+  const isAddressField = (node: AndroidUiNode) => node.className === "android.widget.EditText" && node.contentDescription === "Page address";
+  const waitAddress = (value: string) => waitNode((node) => isAddressField(node) && (node.text ?? "") === value,
+    value === "" ? "cleared HTML address field" : "HTML display path " + value);
   const waitChapter = () => waitNode((node) => node.text === "Workspace guide chapter" || node.contentDescription === "Workspace guide chapter", "rendered Workspace guide chapter");
   await waitAddress(detailsAddress);
   await waitChapter();
@@ -565,13 +567,22 @@ async function runNativeScenario(): Promise<void> {
     const port = "tcp:" + sitePort.port;
     await adb("reverse", port, port); siteReverse = port;
     const url = `http://127.0.0.1:${sitePort.port}/viewer`;
+    const addressField = await waitAddress(detailsAddress);
     await interaction("text-entry", async () => {
-      await tapNode(await waitAddress(detailsAddress));
-      await adb("shell", "input", "keyevent", "KEYCODE_MOVE_END", ...Array<string>(detailsAddress.length).fill("KEYCODE_DEL"));
-      await adb("shell", "input", "text", `'${url}'`);
-      await adb("shell", "input", "keyevent", "KEYCODE_BACK");
+      try {
+        await tapNode(addressField);
+        // Replace the selection in the real native field after React Native has adopted the clear.
+        await adb("shell", "input", "keycombination", "KEYCODE_CTRL_LEFT", "KEYCODE_A");
+        await adb("shell", "input", "keyevent", "KEYCODE_DEL");
+        await waitAddress("");
+        await adb("shell", "input", "text", `'${url}'`);
+        await waitAddress(url);
+      } catch (error) {
+        await screenshot("html-website-address-error").catch(() => undefined);
+        const observed = await nodes(Date.now() + 5_000).catch(() => []);
+        throw new Error(`Native HTML address entry did not settle. Address field: ${JSON.stringify(observed.find(isAddressField)?.text ?? null)}`, { cause: error });
+      }
     });
-    await waitAddress(url);
     expect(siteRequests).toEqual([]);
     await tap("Open");
     await waitNode((node) => node.text === "Isolated website fixture" || node.contentDescription === "Isolated website fixture", "isolated website rendered in the native app");
@@ -695,27 +706,40 @@ async function adb(...args: string[]): Promise<string> {
 }
 
 async function adbUntil(deadline: number | undefined, ...args: string[]): Promise<string> {
+  return (await adbOutput(deadline, args)).toString("utf8");
+}
+
+class AndroidFixtureAdbError extends Error {
+  constructor(command: string, readonly deviceUnavailable: boolean) {
+    super(`The isolated Android fixture command failed (${command}).`);
+  }
+}
+
+async function adbOutput(deadline: number | undefined, args: readonly string[], maxBuffer = 2 * 1024 * 1024): Promise<Buffer> {
   const timeout = deadline === undefined ? 30_000 : Math.min(30_000, deadline - Date.now());
-  if (timeout <= 0) throw new Error("The initial native connection navigation deadline elapsed.");
+  if (timeout <= 0) throw new Error("The isolated Android fixture command deadline elapsed.");
   const started = elapsed();
   return new Promise((accept, reject) => {
-    execFile(adbExecutable!, ["-s", serial!, ...args], { timeout, maxBuffer: 2 * 1024 * 1024, windowsHide: true },
+    execFile(adbExecutable!, ["-s", serial!, ...args], { encoding: "buffer", timeout, maxBuffer, windowsHide: true },
       (error, stdout, stderr) => {
         // Do not include command arguments or output: pairing input is a transient credential.
         if (error && !(args[0] === "shell" && args[1] === "pidof" && error.code === 1)) {
+          const command = args[0] === "exec-out" && args[1] === "uiautomator" ? "ui-hierarchy"
+            : args[0] === "exec-out" && args[1] === "screencap" ? "screenshot"
+            : args[0] === "shell" && ["am", "dumpsys", "getprop", "input", "pidof", "pm", "sha256sum"].includes(args[1] ?? "")
+              ? `shell-${args[1]}` : ["emu", "install", "uninstall", "reverse", "logcat", "wait-for-device"].includes(args[0] ?? "") ? args[0]! : "adb";
+          const deviceUnavailable = /device offline|device ['"][^\r\n]*['"] not found|no devices\/emulators found|transport (?:is )?closed|connection reset by peer/iu
+            .test(stderr.toString("utf8"));
           if (evidence !== undefined && (evidence.adbFailures?.length ?? 0) < 12) {
-            const command = args[0] === "exec-out" && args[1] === "uiautomator" ? "ui-hierarchy"
-              : args[0] === "shell" && ["am", "dumpsys", "getprop", "input", "pidof", "pm", "rm", "screencap", "sha256sum"].includes(args[1] ?? "")
-                ? `shell-${args[1]}` : ["emu", "install", "uninstall", "pull", "reverse", "logcat"].includes(args[0] ?? "") ? args[0]! : "adb";
             (evidence.adbFailures ??= []).push({
               step: evidence.scenarioResult === "running" ? activeStep?.name ?? "setup" : "cleanup",
               command, afterMs: started, elapsedMs: elapsed() - started,
               ...(typeof error.code === "number" ? { exitCode: error.code } : {}),
               ...(error.signal == null ? {} : { signal: error.signal }),
-              deviceUnavailable: /device offline|device ['"][^\r\n]*['"] not found|no devices\/emulators found|transport is closed/iu.test(stderr)
+              deviceUnavailable
             });
           }
-          reject(new Error("The isolated Android fixture command failed."));
+          reject(new AndroidFixtureAdbError(command, deviceUnavailable));
         } else accept(stdout);
       });
   });
@@ -1043,15 +1067,32 @@ async function digest(path: string): Promise<string> {
 }
 
 async function screenshot(name: EvidenceScreenshot): Promise<EvidenceStep["screenshots"][number]> {
+  const deadline = Date.now() + 30_000;
+  const capture = async (): Promise<Buffer | undefined> => {
+    // Read the actual framebuffer in one ADB command. A disconnected stream
+    // can end before the final PNG chunk arrives.
+    const png = await adbOutput(deadline, ["exec-out", "screencap", "-p"], 8 * 1024 * 1024);
+    return png.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))
+      && png.subarray(-12).equals(Buffer.from("0000000049454e44ae426082", "hex")) ? png : undefined;
+  };
+  let png = await capture().catch((error: unknown) => {
+    if (!(error instanceof AndroidFixtureAdbError) || !error.deviceUnavailable) throw error;
+    return undefined;
+  });
+  if (png === undefined) {
+    // Only repeat the screenshot read after the owned emulator is reachable.
+    await adbUntil(deadline, "wait-for-device");
+    const actualAvd = (await adbUntil(deadline, "emu", "avd", "name")).split(/\r?\n/u)[0]?.trim();
+    if (!ownedAvd || actualAvd !== avd) throw new Error("The owned Android emulator changed during screenshot capture.");
+    png = await capture();
+  }
+  if (png === undefined) throw new Error("The Android screenshot did not contain a complete PNG.");
+
   const directory = join(dirname(apkPath!), "ui-evidence");
   await mkdir(directory, { recursive: true });
-  const remote = "/sdcard/joko-native-" + name + ".png";
-  await adb("shell", "screencap", "-p", remote);
   const file = name + ".png";
-  const local = join(directory, file);
-  await adb("pull", remote, local);
-  await adb("shell", "rm", remote);
-  const frame = { file, sha256: await digest(local), capturedAfterMs: elapsed() };
+  await writeFile(join(directory, file), png);
+  const frame = { file, sha256: createHash("sha256").update(png).digest("hex"), capturedAfterMs: elapsed() };
   activeStep?.screenshots.push(frame);
   await persistEvidence();
   return frame;

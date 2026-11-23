@@ -124,6 +124,24 @@ describe("AndroidAutomationSettingsController", () => {
     expect(fixture.calls).toEqual(["configure:{}", "prepare", "status:cached"]);
   });
 
+  it("retains a missing custom ADB path for repair and recovers with the automatic path", async () => {
+    const missing = "/test-tools/missing/adb";
+    const fixture = createFixture({ missingAdbPath: missing, probe: readyProbe({ platform: "linux" }) });
+    await fixture.controller.setEnabled(true);
+    const failed = await fixture.controller.setAdbPath(missing);
+    expect(failed).toMatchObject({ enabled: true, support: CapabilitySupport.TEMPORARILY_UNAVAILABLE,
+      issue: AndroidAutomationIssue.DRIVER_ERROR, adbPathOverride: missing, adbAvailable: false,
+      runtimeState: AndroidAutomationRuntimeState.ERROR, preparationError: "The configured ADB executable was not found." });
+    expect(fixture.store.getSetting("service", "orchestrator", "settings.automation.android").value)
+      .toEqual({ format: 1, enabled: true, adbPathOverride: missing });
+
+    const automatic = await fixture.controller.setAdbPath();
+    expect(automatic).toMatchObject({ enabled: true, support: CapabilitySupport.SUPPORTED,
+      adbPathOverride: "", adbPathSource: AndroidAdbPathSource.PREPARED, runtimeState: AndroidAutomationRuntimeState.READY });
+    expect(fixture.store.getSetting("service", "orchestrator", "settings.automation.android").value)
+      .toEqual({ format: 1, enabled: true });
+  });
+
   it("turns off without probing and only changes future session grants", async () => {
     const fixture = createFixture({
       refreshGeneration: async () => { fixture.calls.push("refresh"); }
@@ -171,6 +189,7 @@ describe("AndroidAutomationSettingsController", () => {
 function createFixture(options: {
   readonly probe?: AndroidAutomationProbe;
   readonly prepareError?: Error;
+  readonly missingAdbPath?: string;
   readonly refreshGeneration?: () => Promise<void>;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), "joko-android-automation-"));
@@ -190,6 +209,9 @@ function createFixture(options: {
     async prepare() {
       calls.push("prepare");
       if (options.prepareError !== undefined) throw options.prepareError;
+      if (options.missingAdbPath !== undefined && configuration.adbPathOverride === options.missingAdbPath) {
+        throw new Error("The configured ADB executable was not found.");
+      }
     },
     async status(statusOptions) {
       statusRequests.push({

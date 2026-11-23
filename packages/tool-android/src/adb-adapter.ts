@@ -61,6 +61,7 @@ export interface AndroidAdbAdapter {
   killServer(signal?: AbortSignal): Promise<void>;
   connect(endpoint: string, signal?: AbortSignal): Promise<{ readonly endpoint: string; readonly output: string }>;
   disconnect(endpoint: string, signal?: AbortSignal): Promise<{ readonly endpoint: string; readonly output: string }>;
+  readScreenSize(serial: string, signal?: AbortSignal): Promise<Pick<AndroidScreenState, "width" | "height">>;
   snapshot(serial: string, signal?: AbortSignal): Promise<AndroidDeviceSnapshot>;
   tap(serial: string, point: AndroidPoint, signal?: AbortSignal): Promise<void>;
   swipe(
@@ -155,6 +156,22 @@ export class AdbCliAdapter implements AndroidAdbAdapter {
     const safeEndpoint = normalizeAdbEndpoint(endpoint);
     const result = await this.#run(["disconnect", safeEndpoint], this.#actionTimeoutMs, signal);
     return { endpoint: safeEndpoint, output: boundedOutput(result) };
+  }
+
+  async readScreenSize(serial: string, signal?: AbortSignal): Promise<Pick<AndroidScreenState, "width" | "height">> {
+    const safeSerial = validateDeviceSerial(serial);
+    const display = await this.#runDevice(safeSerial, ["shell", "dumpsys", "window", "displays"], signal).catch(error => {
+      if (isAbortError(error)) throw error;
+      signal?.throwIfAborted();
+      return undefined;
+    });
+    if (display !== undefined && !display.stdoutTruncated) {
+      const primary = display.stdout.split(/^[\t ]*Display:\s+mDisplayId=/mu).slice(1).find(part => /^0\b/u.test(part));
+      const logicalSize = screenDimensions(/\bcur=([1-9]\d*)x([1-9]\d*)\b/u.exec(primary ?? ""));
+      if (logicalSize !== undefined) return logicalSize;
+    }
+    const size = await this.#runDevice(safeSerial, ["shell", "wm", "size"], signal);
+    return parseScreenSize(size.stdout);
   }
 
   async snapshot(serial: string, signal?: AbortSignal): Promise<AndroidDeviceSnapshot> {
@@ -539,17 +556,26 @@ export function escapeAdbInputText(value: string): string {
   return value.replace(/ /gu, "%s");
 }
 
-function parseScreenState(sizeOutput: string, densityOutput: string): AndroidScreenState {
-  const allSizes = [...sizeOutput.matchAll(/(?:Physical|Override) size:\s*(\d+)x(\d+)/giu)];
-  const size = allSizes.at(-1);
+function screenDimensions(match: RegExpMatchArray | null | undefined): Pick<AndroidScreenState, "width" | "height"> | undefined {
+  const width = Number(match?.[1]);
+  const height = Number(match?.[2]);
+  return Number.isSafeInteger(width) && width > 0 && Number.isSafeInteger(height) && height > 0 ? { width, height } : undefined;
+}
+
+function parseScreenSize(output: string): Pick<AndroidScreenState, "width" | "height"> {
+  const allSizes = [...output.matchAll(/(?:Physical|Override) size:\s*(\d+)x(\d+)/giu)];
+  const size = screenDimensions(allSizes.at(-1));
   if (size === undefined) {
     throw new AndroidRuntimeError("snapshot_failed", "ADB screen size output could not be parsed.");
   }
+  return size;
+}
+
+function parseScreenState(sizeOutput: string, densityOutput: string): AndroidScreenState {
   const allDensities = [...densityOutput.matchAll(/(?:Physical|Override) density:\s*(\d+)/giu)];
   const density = allDensities.at(-1);
   return {
-    width: Number(size[1]),
-    height: Number(size[2]),
+    ...parseScreenSize(sizeOutput),
     density: density === undefined ? null : Number(density[1])
   };
 }

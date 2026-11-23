@@ -415,6 +415,7 @@ function adapter(overrides: Partial<AndroidAdbAdapter> = {}): AndroidAdbAdapter 
     killServer: vi.fn(async () => undefined),
     connect: vi.fn(async (endpoint) => ({ endpoint, output: "connected" })),
     disconnect: vi.fn(async (endpoint) => ({ endpoint, output: "disconnected" })),
+    readScreenSize: vi.fn(async () => ({ width: 1080, height: 2400 })),
     snapshot: vi.fn(async (serial) => snapshot(serial)),
     tap: vi.fn(async () => undefined),
     swipe: vi.fn(async () => undefined),
