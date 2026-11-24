@@ -670,11 +670,6 @@ export class OrchestratorE2eFixture {
       server.server.on("upgrade", (request) => {
         if (request.url === "/_linkspan") observe("linkspan_upgrade");
       });
-      server.server.on("request", (request, response) => {
-        if (request.method === "POST" && request.url === "/joko.v1.ConnectionService/GetServerInfo") {
-          response.once("finish", () => observe("server_info", response.statusCode));
-        }
-      });
     }
     await server.listen({ host: publicHost, port: publicPort });
     const address = server.server.address();
@@ -688,6 +683,14 @@ export class OrchestratorE2eFixture {
         webRtcRequests.responses.push({ path: request.url, status: reply.statusCode });
     });
     if (secureServer !== undefined) secureServer.log.level = 'silent';
+    if (options.observeIdentityTransport) {
+      const observe = options.observeIdentityTransport;
+      (secureServer ?? server).server.on("request", (request, response) => {
+        if (request.method === "POST" && request.url === "/joko.v1.ConnectionService/GetServerInfo") {
+          response.once("finish", () => observe("server_info", response.statusCode));
+        }
+      });
+    }
     const backendOrigin = secureServer === undefined ? baseUrl : await secureServer.listen({ host: '127.0.0.1', port: 0 });
     if (serverAccess) await serverAccess.attach(createServerAccessRuntime(application, backendOrigin));
     const linkspan = createLinkspanIngress(application, { backendOrigin, server: server.server });

@@ -323,14 +323,19 @@ final class JokoConnectionUITests: XCTestCase {
         // at the start without selecting text. Move to the trailing side of
         // this short, single-line address, then delete its observed characters
         // through the real keyboard and verify the empty value before typing.
-        let placeholder = field.placeholderValue ?? ""
-        if let value = field.value as? String, !value.isEmpty && value != placeholder {
+        // WKWebView can report its placeholder as the value of an empty field
+        // without exposing placeholderValue separately.
+        let formPlaceholder = ["Joko node address": "http://192.168.1.20:4318",
+                               "Trusted node invitation or public key": "ed25519:…",
+                               "Pairing code": "XXXX-XXXX"][field.label] ?? ""
+        let emptyValues = ["", field.placeholderValue ?? "", formPlaceholder]
+        if let value = field.value as? String, !emptyValues.contains(value) {
             if field.elementType == .textView {
                 // The preceding CONNECT invitation can wrap and scroll. Clear
                 // its remaining visible suffix through the real caret before
                 // replacing the public pin; never type over a partial draft.
                 for _ in 0..<8 {
-                    guard let remaining = field.value as? String, !remaining.isEmpty, remaining != placeholder else { break }
+                    guard let remaining = field.value as? String, !emptyValues.contains(remaining) else { break }
                     field.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.95)).tap()
                     field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: remaining.count))
                 }
@@ -339,7 +344,7 @@ final class JokoConnectionUITests: XCTestCase {
                 field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: value.count))
             }
             let cleared = XCTNSPredicateExpectation(predicate: NSPredicate(
-                format: "value == '' OR value == %@", placeholder), object: field)
+                format: "exists == true AND (value == nil OR value IN %@)", argumentArray: [emptyValues]), object: field)
             let clearedResult = XCTWaiter.wait(for: [cleared], timeout: 10)
             XCTAssertEqual(clearedResult, .completed,
                            "The native address field must be empty before replacement.")
@@ -363,12 +368,12 @@ final class JokoConnectionUITests: XCTestCase {
             // Restore only the missing suffix once the system guide is gone.
             if traceFirstAddressEntry && dismissedGuide && !restoredFirstEntry,
                let observed = field.value as? String, observed != text {
-                let prefix = observed == placeholder ? "" : observed
+                let prefix = emptyValues.contains(observed) ? "" : observed
                 if text.hasPrefix(prefix) {
                     restoredFirstEntry = true
                     field.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5)).tap()
                     let current = field.value as? String
-                    if (current == prefix || (prefix.isEmpty && current == placeholder)) && (field.hasFocus || keyboard.exists) {
+                    if (current == prefix || (prefix.isEmpty && emptyValues.contains(current ?? ""))) && (field.hasFocus || keyboard.exists) {
                         field.typeText(String(text.dropFirst(prefix.count)))
                         reportCheckpoint("04-address-input-restored")
                     }
@@ -470,7 +475,9 @@ final class JokoConnectionUITests: XCTestCase {
         tap(inspect, atCenter: true)
         reportCheckpoint("11-pdf-identity-check-tapped")
         let identity = connectionPage.staticTexts["Identity: ios-workspace-pdf"].firstMatch
-        XCTAssertTrue(identity.waitForExistence(timeout: 25), "The owned PDF node identity was not shown after the native check.")
+        // The first pinned check loads the HTTP and Noise chunks serially from
+        // Debug Metro. Their cold build exceeded 25 seconds on the Intel runner.
+        XCTAssertTrue(identity.waitForExistence(timeout: 60), "The owned PDF node identity was not shown after the native check.")
         reportCheckpoint("11-pdf-identity-confirmed")
         let request = button("Request pairing")
         wait(request, "enabled == true")

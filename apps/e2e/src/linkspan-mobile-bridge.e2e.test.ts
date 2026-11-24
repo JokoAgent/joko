@@ -6,7 +6,10 @@ import { createE2eClients } from './connect-clients.js';
 import { OrchestratorE2eFixture, sha256 } from './fixture.js';
 
 it('carries real pinned RPC and Blob records through the Mobile JSON WebRTC bridge without turning graceful close into cancellation', async () => {
-  const fixture = await OrchestratorE2eFixture.start({ webRtc: true });
+  const identityStatuses: number[] = [];
+  const fixture = await OrchestratorE2eFixture.start({ webRtc: true, observeIdentityTransport: (effect, status) => {
+    if (effect === 'server_info' && status !== undefined) identityStatuses.push(status);
+  } });
   const host = createWebRtcBridgeHost();
   let dropCompletion = false, dropped = false;
   const methods: string[] = [];
@@ -28,6 +31,7 @@ it('carries real pinned RPC and Blob records through the Mobile JSON WebRTC brid
   try {
     const anonymous = createE2eClients(fixture.baseUrl, undefined, 20_000, endpointPublicKey);
     expect((await anonymous.connection.getServerInfo({})).server?.endpointPublicKey).toBe(endpointPublicKey);
+    expect(identityStatuses).toEqual([200]);
     expect(methods).toContain('close');
     const invitation = fixture.application.connections.issuePairing('Mobile bridge device');
     const paired = (await anonymous.connection.completePairing({ challengeId: invitation.id, humanCode: invitation.code,

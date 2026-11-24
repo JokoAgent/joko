@@ -4563,7 +4563,7 @@ html[data-desktop-platform="darwin"] .runtime-process-window__titlebar { padding
 @media (pointer: coarse) {
   .connection-card .button, .connection-tabs button, .connection-transport-choice button { min-height: 44px; }
   .connection-auto-choice, .pair-form .lan-http-confirm { min-height: 44px; }
-  .pair-form input { font-size: var(--text-16); }
+  .pair-form :is(input, textarea) { font-size: var(--text-16); }
 }
 
 @media (orientation: portrait), (max-width: 720px) {
