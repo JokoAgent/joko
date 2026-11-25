@@ -1,12 +1,14 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { chmod, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NoOpLogger, type AppUpdater } from "electron-updater";
 import { describe, expect, it, vi } from "vitest";
 
 import { createElectronUpdateDriver } from "../src/electron-update-driver.js";
+import { openLinuxAppImageInstallation } from "../src/linux-appimage-update.js";
 import { atomicWritePrivateFile } from "@joko/device-peer/private-files";
 import { mkdtemp } from "./test-paths.js";
 
@@ -868,6 +870,126 @@ describe("electron-updater driver", () => {
     }
   });
 });
+
+describe.skipIf(process.platform !== "linux" || process.getuid?.() === 0)("Linux AppImage update", () => {
+  it("revalidates the confirmed download and replaces the executable only after an accepted quit", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "joko-linux-update-")));
+    try {
+      const { imagePath, previous, options } = await appImageInstallationFixture(root);
+      const installation = await openLinuxAppImageInstallation(options);
+      if (installation === undefined) throw new Error("Expected a writable AppImage fixture.");
+      const pending = join(root, "pending");
+      const installer = join(pending, "Joko-2.0.0.AppImage");
+      const newImage = appImageBytes("Joko 2.0.0");
+      const sha512 = createHash("sha512").update(newImage).digest("base64");
+      await mkdir(pending);
+      await writeFile(installer, newImage);
+      await writeFile(join(pending, "update-info.json"), JSON.stringify({ fileName: "Joko-2.0.0.AppImage", sha512 }));
+      const updater = new FakeAppUpdater();
+      updater.downloadedUpdateHelper = downloadedHelper(pending, installer, sha512, "2.0.0");
+      const handoff = createQuitHandoff();
+      const relaunch = vi.fn((path: string) => {
+        expect(readFileSync(path)).toEqual(newImage);
+        return true;
+      }).mockReturnValueOnce(false);
+      const driver = createElectronUpdateDriver(updater as unknown as AppUpdater, new EventEmitter(), {
+        platform: "linux", quitHandoff: handoff.adapter, linuxAppImage: { installation, relaunch }
+      });
+      driver.configure("https://updates.example.com/joko");
+      await driver.downloadUpdate("2.0.0");
+      await expect(driver.promoteStagedUpdate("2.0.0")).resolves.toMatchObject({ promoted: true });
+      await expect(driver.relaunchToInstall("2.0.1")).rejects.toThrow("not ready");
+      expect(handoff.quit).not.toHaveBeenCalled();
+
+      const blocked = expect(driver.relaunchToInstall("2.0.0")).rejects.toThrow("install handoff failed");
+      await vi.waitFor(() => expect(handoff.quit).toHaveBeenCalledTimes(1));
+      handoff.block();
+      await blocked;
+      expect(handoff.listenerCount()).toBe(0);
+      expect(relaunch).not.toHaveBeenCalled();
+      expect(await readFile(imagePath)).toEqual(previous);
+
+      const rejected = expect(driver.relaunchToInstall("2.0.0")).rejects.toThrow("install handoff failed");
+      await vi.waitFor(() => expect(handoff.quit).toHaveBeenCalledTimes(2));
+      expect(handoff.emitWillQuit().preventDefault).toHaveBeenCalledOnce();
+      await rejected;
+      expect(await readFile(imagePath)).toEqual(previous);
+
+      const accepted = driver.relaunchToInstall("2.0.0");
+      await vi.waitFor(() => expect(handoff.quit).toHaveBeenCalledTimes(3));
+      expect(await readFile(imagePath)).toEqual(previous);
+      expect(handoff.emitWillQuit().preventDefault).not.toHaveBeenCalled();
+      await expect(accepted).resolves.toBeUndefined();
+      expect(relaunch).toHaveBeenLastCalledWith(imagePath);
+      expect(updater.quitAndInstall).not.toHaveBeenCalled();
+      expect(await readFile(imagePath)).toEqual(newImage);
+      expect(await readFile(installer)).toEqual(newImage);
+      expect((await readdir(root)).filter(entry => entry.startsWith(".joko-appimage-update-"))).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves unsupported installs and a concurrently replaced executable untouched", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "joko-linux-update-scope-")));
+    try {
+      const { imagePath, options } = await appImageInstallationFixture(root);
+      const link = join(root, "shortcut.AppImage");
+      await symlink(imagePath, link);
+      await expect(openLinuxAppImageInstallation({ ...options, imagePath: link })).resolves.toBeUndefined();
+      await expect(openLinuxAppImageInstallation({ ...options, resourcesPath: root })).resolves.toBeUndefined();
+      await chmod(root, 0o555);
+      await expect(openLinuxAppImageInstallation(options)).resolves.toBeUndefined();
+      await chmod(root, 0o700);
+      const installation = await openLinuxAppImageInstallation(options);
+      if (installation === undefined) throw new Error("Expected a writable AppImage fixture.");
+
+      const candidatePath = join(root, "Joko-2.0.0.AppImage");
+      const candidate = appImageBytes("Joko 2.0.0");
+      await writeFile(candidatePath, appImageBytes("other architecture", 183));
+      await expect(installation.accepts(candidatePath)).resolves.toBe(false);
+      await writeFile(candidatePath, candidate);
+      const input = { path: candidatePath, size: candidate.byteLength };
+      await expect(installation.prepare({ ...input, sha512: "invalid" })).rejects.toThrow("could not be verified");
+      const replacement = await installation.prepare({
+        ...input, sha512: createHash("sha512").update(candidate).digest("base64")
+      });
+      const outside = appImageBytes("other installation");
+      const outsidePath = join(root, "another.AppImage");
+      await writeFile(outsidePath, outside, { mode: 0o755 });
+      await rename(outsidePath, imagePath);
+      const relaunch = vi.fn();
+      expect(() => replacement.install(relaunch)).toThrow("path changed before apply");
+      await replacement.dispose();
+      expect(relaunch).not.toHaveBeenCalled();
+      expect(await readFile(imagePath)).toEqual(outside);
+    } finally {
+      await chmod(root, 0o700);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+async function appImageInstallationFixture(root: string) {
+  const imagePath = join(root, "Joko.AppImage");
+  const mountPath = join(root, "mounted");
+  const resourcesPath = join(mountPath, "resources");
+  const previous = appImageBytes("Joko 1.0.0");
+  await mkdir(resourcesPath, { recursive: true });
+  await writeFile(imagePath, previous, { mode: 0o755 });
+  return { imagePath, previous, options: { imagePath, mountPath, resourcesPath } };
+}
+
+function appImageBytes(content: string, architecture = 62): Buffer {
+  const header = Buffer.alloc(20);
+  header.writeUInt32BE(0x7f454c46);
+  header[4] = 2;
+  header[5] = 1;
+  header.writeUInt16BE(0x4149, 8);
+  header[10] = 2;
+  header.writeUInt16LE(architecture, 18);
+  return Buffer.concat([header, Buffer.from(content)]);
+}
 
 class FakeAppUpdater extends EventEmitter {
   logger: unknown = console;

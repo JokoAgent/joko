@@ -12,6 +12,8 @@ import {
   type DesktopUpdateDriver,
   type DesktopUpdateDriverProgressInfo
 } from "./update-service.js";
+import type { LinuxAppImageInstallation } from "./linux-appimage-update.js";
+import { requestDesktopQuitHandoff } from "./update-channel-relaunch.js";
 import { atomicWritePrivateFile, deletePrivateFile } from "@joko/device-peer/private-files";
 
 interface InternalDownloadedUpdateHelper {
@@ -92,6 +94,10 @@ export interface ElectronUpdateDriverOptions {
   readonly platform?: NodeJS.Platform;
   readonly installHandoffTimeoutMs?: number;
   readonly quitHandoff?: ElectronUpdateQuitHandoff;
+  readonly linuxAppImage?: {
+    readonly installation: LinuxAppImageInstallation;
+    readonly relaunch: (path: string) => boolean;
+  };
   readonly writePrivateFile?: (path: string, bytes: Uint8Array) => Promise<void>;
   readonly deletePrivateFile?: (path: string) => Promise<void>;
 }
@@ -114,6 +120,7 @@ export function createElectronUpdateDriver(
   updater.autoInstallOnAppQuit = false;
   updater.autoRunAppAfterInstall = true;
   const platform = options.platform ?? process.platform;
+  const appImage = platform === "linux" ? options.linuxAppImage : undefined;
   const writePrivateFile = options.writePrivateFile ?? atomicWritePrivateFile;
   const deleteDurablePrivateFile = options.deletePrivateFile ?? deletePrivateFile;
   const installHandoffTimeoutMs = options.installHandoffTimeoutMs ?? DESKTOP_UPDATE_INSTALL_HANDOFF_TIMEOUT_MS;
@@ -144,7 +151,8 @@ export function createElectronUpdateDriver(
       const helper = await internalDownloadHelper(updater);
       if (helper === undefined) return null;
       const staged = await readVerifiedStagedUpdate(helper, platform);
-      if (staged === undefined) return null;
+      if (staged === undefined || (appImage !== undefined &&
+        !(await acceptsStagedAppImage(appImage.installation, helper, staged)))) return null;
       if (staged.feedSha256 !== feedSha256) {
         const revoked = await durablyQuarantineStagedUpdate(
           resolve(helper.cacheDirForPendingUpdate),
@@ -238,7 +246,7 @@ export function createElectronUpdateDriver(
       }
       try {
         await updater.downloadUpdate();
-        await persistVerifiedStagedUpdate(updater, version, platform, feedSha256, writePrivateFile);
+        await persistVerifiedStagedUpdate(updater, version, platform, feedSha256, writePrivateFile, appImage?.installation);
         stagedDownloadInThisProcess = true;
         pendingPromotionSnapshot = snapshot;
       } catch {
@@ -251,7 +259,29 @@ export function createElectronUpdateDriver(
         throw new DesktopUpdateDownloadFailure(restored);
       }
     },
-    relaunchToInstall: (): Promise<void> => new Promise((resolvePromise, rejectPromise) => {
+    relaunchToInstall: (version?: string): Promise<void> => appImage === undefined
+      ? requestNativeInstall()
+      : installLinuxAppImage(version, appImage),
+    onProgress: (listener: (progress: DesktopUpdateDriverProgressInfo) => void) => {
+      const wrapped = (progress: ProgressInfo): void => listener({
+        percent: progress.percent,
+        transferred: progress.transferred,
+        total: progress.total,
+        bytesPerSecond: progress.bytesPerSecond
+      });
+      updater.on("download-progress", wrapped);
+      return () => updater.removeListener("download-progress", wrapped);
+    },
+    onError: (listener: () => void) => {
+      const wrapped = (): void => listener();
+      updater.on("error", wrapped);
+      return () => updater.removeListener("error", wrapped);
+    },
+    dispose: (): void => activeInstallCancel?.()
+  });
+
+  function requestNativeInstall(): Promise<void> {
+    return new Promise((resolvePromise, rejectPromise) => {
       activeInstallCancel?.();
       const quitHandoff = options.quitHandoff;
       let settled = false;
@@ -328,24 +358,54 @@ export function createElectronUpdateDriver(
       } catch {
         failed();
       }
-    }),
-    onProgress: (listener: (progress: DesktopUpdateDriverProgressInfo) => void) => {
-      const wrapped = (progress: ProgressInfo): void => listener({
-        percent: progress.percent,
-        transferred: progress.transferred,
-        total: progress.total,
-        bytesPerSecond: progress.bytesPerSecond
+    });
+  }
+
+  async function installLinuxAppImage(
+    version: string | undefined,
+    { installation, relaunch }: NonNullable<ElectronUpdateDriverOptions["linuxAppImage"]>
+  ): Promise<void> {
+    const feed = feedSha256;
+    const quitHandoff = options.quitHandoff;
+    if (feed === undefined || version === undefined || quitHandoff === undefined) {
+      throw new Error("Desktop AppImage update is not ready.");
+    }
+    activeInstallCancel?.();
+    const lifetime = new AbortController();
+    const cancel = (): void => lifetime.abort();
+    activeInstallCancel = cancel;
+    try {
+      const helper = await internalDownloadHelper(updater);
+      const staged = helper === undefined ? undefined : await readVerifiedStagedUpdate(helper, "linux", feed);
+      if (helper === undefined || !staged?.eligible || staged.version !== version ||
+        !(await acceptsStagedAppImage(installation, helper, staged)) || lifetime.signal.aborted || feedSha256 !== feed) {
+        throw new Error("Desktop AppImage update is not ready.");
+      }
+      const replacement = await installation.prepare({
+        path: resolve(helper.cacheDirForPendingUpdate, staged.installer.fileName),
+        size: staged.installer.size,
+        sha512: staged.installer.sha512
       });
-      updater.on("download-progress", wrapped);
-      return () => updater.removeListener("download-progress", wrapped);
-    },
-    onError: (listener: () => void) => {
-      const wrapped = (): void => listener();
-      updater.on("error", wrapped);
-      return () => updater.removeListener("error", wrapped);
-    },
-    dispose: (): void => activeInstallCancel?.()
-  });
+      try {
+        if (feedSha256 !== feed) throw new Error("Desktop AppImage update feed changed.");
+        const accepted = await requestDesktopQuitHandoff({
+          app: quitHandoff,
+          handoffTimeoutMs: installHandoffTimeoutMs,
+          signal: lifetime.signal,
+          ...(quitHandoff.onQuitBlocked === undefined ? {} : { onQuitBlocked: quitHandoff.onQuitBlocked }),
+          onWillQuit: () => {
+            if (feedSha256 !== feed) throw new Error("Desktop AppImage update feed changed.");
+            replacement.install(relaunch);
+          }
+        });
+        if (!accepted) throw new Error("Desktop AppImage install handoff failed.");
+      } finally {
+        await replacement.dispose();
+      }
+    } finally {
+      if (activeInstallCancel === cancel) activeInstallCancel = undefined;
+    }
+  }
 }
 
 async function preserveStagedUpdate(updater: AppUpdater): Promise<StagedUpdateSnapshot | undefined> {
@@ -428,7 +488,8 @@ async function persistVerifiedStagedUpdate(
   version: string,
   platform: "win32" | "darwin" | "linux",
   feedSha256: string,
-  writePrivateFile: (path: string, bytes: Uint8Array) => Promise<void>
+  writePrivateFile: (path: string, bytes: Uint8Array) => Promise<void>,
+  appImage?: LinuxAppImageInstallation
 ): Promise<void> {
   if (compareDesktopUpdateVersions(version, version) !== 0) {
     throw new Error("Desktop update version is not strict SemVer.");
@@ -476,8 +537,20 @@ async function persistVerifiedStagedUpdate(
     },
     ...(packageFile === undefined ? {} : { packageFile })
   };
+  if (appImage !== undefined && !(await acceptsStagedAppImage(appImage, helper, staged))) {
+    throw new Error("Desktop update is not a matching AppImage.");
+  }
   await writePersistedStagedUpdate(pendingDirectory, staged, writePrivateFile);
   await rm(resolve(pendingDirectory, STAGED_UPDATE_QUARANTINE_FILE), { force: true }).catch(() => undefined);
+}
+
+async function acceptsStagedAppImage(
+  installation: LinuxAppImageInstallation,
+  helper: InternalDownloadedUpdateHelper,
+  staged: PersistedStagedUpdate
+): Promise<boolean> {
+  return staged.packageFile === undefined && !staged.installer.isAdminRightsRequired &&
+    await installation.accepts(resolve(helper.cacheDirForPendingUpdate, staged.installer.fileName)).catch(() => false);
 }
 
 async function durablyQuarantineStagedUpdate(

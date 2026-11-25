@@ -1,5 +1,6 @@
 import { appendFile, lstat, mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, relative, sep } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { LocalCodexRuntime, LOCAL_CODEX_RUNTIME_ASSETS, LOCAL_CODEX_RUNTIME_VERSION } from '../../apps/orchestrator/dist/local-codex-runtime.js';
 
 if (process.env.GITHUB_ACTIONS !== 'true' || !process.env.RUNNER_TEMP || !process.env.GITHUB_ENV) {
@@ -23,13 +24,19 @@ const runtime = new LocalCodexRuntime({ rootDirectory: runtimeRoot, backendId: '
   },
   fetch: async (input, options) => {
     console.log(`Downloading pinned complete package: ${String(input)}`);
-    try {
-      const response = await fetch(input, options);
-      console.log(`Download response: status=${response.status} content-length=${response.headers.get('content-length') ?? 'unknown'}`);
-      return response;
-    } catch (error) {
-      console.error('Pinned runtime download failed:', error);
-      throw error;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        const response = await fetch(input, options);
+        console.log(`Download response: status=${response.status} content-length=${response.headers.get('content-length') ?? 'unknown'}`);
+        return response;
+      } catch (error) {
+        if (attempt !== 1 || options?.signal?.aborted || error?.cause?.code !== 'UND_ERR_CONNECT_TIMEOUT') {
+          console.error('Pinned runtime download failed:', error);
+          throw error;
+        }
+        console.warn('Pinned runtime connection timed out before any response. Retrying the same archive once.');
+        await delay(1_000, undefined, { signal: options?.signal });
+      }
     }
   }
 });
