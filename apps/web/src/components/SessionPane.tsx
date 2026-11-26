@@ -355,6 +355,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const [errorTailActionFailure, setErrorTailActionFailure] = useState<{ readonly localKey: string; readonly message: string }>();
   const [compactConfirmation, setCompactConfirmationState] = useState<{
     readonly request: SessionScopedRequest;
+    readonly generation: bigint;
     readonly usage?: { readonly usedTokens: number; readonly contextWindow: number; readonly percent: number };
   }>();
   const [compactFeedback, setCompactFeedback] = useState<CompactRequestFeedback>();
@@ -1257,7 +1258,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       ? undefined
       : current);
     const pending = compactConfirmationRef.current;
-    if (pending !== undefined && pending.request.sessionId !== session.id) {
+    if (pending !== undefined && !compactGuardRef.current.isCurrent(pending.request.sessionId, pending.request.epoch)) {
       pending.request.release();
       compactConfirmationRef.current = undefined;
       setCompactConfirmationState(undefined);
@@ -1266,7 +1267,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     return () => {
       if (compactGuardRef.current.isCurrent(session.id)) compactGuardRef.current.setCurrentSession(null);
     };
-  }, [session.id]);
+  }, [session.id, session.generation, controller.state.connectionGeneration, controller.state.activeProfile?.id, controller.state.activeProfile?.serverId]);
 
   const setPermission = (mode: PermissionMode): void => {
     if (!canSetPermission) return;
@@ -1496,7 +1497,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     const usage = session.context;
     const contextWindow = resolveDisplayContextWindow(usage?.contextWindow ?? 0, session.model?.contextWindow);
     const usedTokens = Math.min(usage?.usedTokens ?? 0, contextWindow);
-    setCompactConfirmation({ request, ...(usage === undefined ? {} : { usage: {
+    setCompactConfirmation({ request, generation: session.generation, ...(usage === undefined ? {} : { usage: {
       usedTokens, contextWindow, percent: Math.round((usedTokens / contextWindow) * 100)
     } }) });
     setCompactRevision((current) => current + 1);
@@ -1512,7 +1513,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     const freshBackend = freshSession === undefined ? undefined : freshSnapshot.backends.find((candidate) => candidate.id === freshSession.backendId);
     const freshTimeline = freshSnapshot.timelineBySession.get(sourceSessionId) ?? [];
     const stale = !compactGuardRef.current.isCurrent(sourceSessionId, pending.request.epoch)
-      || freshSession === undefined
+      || freshSession?.generation !== pending.generation
       || !sessionCapabilitySupportsTarget(freshBackend?.capabilities.get("context.compact"),
         freshSnapshot.targets.find((candidate) => candidate.id === freshSession.targetId))
       || freshSession.state === "running"
@@ -1539,7 +1540,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           && hasContextToCompact(undefined, timeline);
         if (
           !compactGuardRef.current.isCurrent(sourceSessionId, pending.request.epoch)
-          || latest === undefined
+          || latest?.generation !== pending.generation
           || !sessionCapabilitySupportsTarget(latestBackend?.capabilities.get("context.compact"),
             latestSnapshot.targets.find((candidate) => candidate.id === latest.targetId))
           || (!compactableContext && !alreadyPagedBoundary)
@@ -1548,7 +1549,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           || latest.state === "retrying"
           || resolveActiveCompaction(latestTimeline, latest.compacting) !== undefined
         ) return;
-        const outcome = await controllerRef.current.compact(sourceSessionId);
+        const outcome = await controllerRef.current.compact(sourceSessionId, undefined, pending.generation);
         if (compactGuardRef.current.isCurrent(sourceSessionId, pending.request.epoch)) {
           feedbackSettled = true;
           setCompactFeedback({

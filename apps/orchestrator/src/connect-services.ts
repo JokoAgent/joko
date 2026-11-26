@@ -18574,27 +18574,50 @@ async function dispatchMutation(
         ));
     }
     case "compactSession": {
-      let compactSessionOutcome: "compacted" | "noop" | undefined;
+      const sessionId = payload.value.sessionId;
+      // The source version is checked at admission. A cold resume can advance
+      // it inside this operation; the final receipt belongs to that exact binding.
+      type Receipt = Awaited<ReturnType<SessionHost["compactWithBinding"]>>;
+      let admittedGeneration: number | undefined;
+      let receipt: Receipt | undefined;
+      const validateOwner = (store: OperationalStore, { binding, resumption }: Pick<Receipt, "binding" | "resumption">): void => {
+        if (binding.generation === admittedGeneration) return validatePreconditions(store, mutation);
+        if (!resumption || resumption.sourceGeneration !== admittedGeneration) {
+          throw new ConnectError("The original Session generation changed before compaction.", Code.Aborted);
+        }
+        validatePreconditions(store, { ...mutation, preconditions: mutation.preconditions.map(condition => {
+          if (condition.entity?.kind !== contract.EntityKind.SESSION || condition.entity.id !== sessionId) return condition;
+          if (condition.expectedRevision && condition.expectedRevision.value !== resumption.sourceRevision) {
+            throw new ConnectError("The original Session revision changed before compaction.", Code.Aborted);
+          }
+          return { ...condition, expectedGeneration: BigInt(binding.generation),
+            ...(condition.expectedRevision && { expectedRevision: toProtoRevision(resumption.boundRevision) }) };
+        }) });
+      };
       return presented(await host.mutate({
         operationId,
         connection,
         kind: payload.case,
         body: mutation,
+        preconditionScope: "claim",
+        precondition: store => { admittedGeneration = store.getSession(sessionId).descriptor.binding.generation; },
         effect: async () => {
-          compactSessionOutcome = await host.compact(
-            payload.value.sessionId,
-            payload.value.customInstructions || undefined,
-            operationId
-          );
+          receipt = await host.compactWithBinding(sessionId, payload.value.customInstructions || undefined, operationId, owner => {
+            dependencies.connections.fence(connection);
+            validateOwner(dependencies.store, owner);
+          });
         },
-        commit: () => {
-          if (compactSessionOutcome === undefined) {
-            throw new Error("The Backend returned no compact Session outcome.");
+        commit: store => {
+          const current = store.getSession(sessionId).descriptor.binding;
+          if (!receipt || current.generation !== receipt.binding.generation || current.opaqueRef !== receipt.binding.opaqueRef
+            || current.nativeSessionId !== receipt.binding.nativeSessionId) {
+            throw new ConnectError("The compacted Session binding changed before completion.", Code.Aborted);
           }
+          validateOwner(store, receipt);
           return {
             accepted: true,
             resultCase: "compactSession",
-            compactSessionOutcome
+            compactSessionOutcome: receipt.outcome
           } satisfies OperationOutcome;
         }
       }));

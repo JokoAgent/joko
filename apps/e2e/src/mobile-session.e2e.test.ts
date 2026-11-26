@@ -2060,6 +2060,44 @@ describe("native mobile device through the durable product chain", () => {
     expect(storedCompactions.map((event) => event.payload.type === "compaction" ? event.payload.state : undefined))
       .toEqual(["started", "completed"]);
     expect(after?.sessions.find((session) => session.sessionId === sessionId)?.contextState?.compacting).toBe(false);
+
+    // A phone can hold the exact idle snapshot while its native runtime is detached.
+    const detached = await submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
+      payload: { case: "detachSession", value: { sessionId } }
+    }));
+    expect(detached.state).toBe(OperationState.SUCCEEDED);
+    const source = (await paired.clients.session.getSession({ sessionId })).session!;
+    const compactFromSnapshot = (snapshot: typeof source) => create(OperationMutationSchema, {
+      payload: compactMutation(sessionId, "").payload,
+      preconditions: [create(OperationPreconditionSchema, { entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: sessionId }),
+        expectedRevision: snapshot.version!.revision!, expectedGeneration: snapshot.nativeBinding!.runtimeGeneration })]
+    });
+    const coldMutation = compactFromSnapshot(source);
+    const cold = await submit(paired.clients.operation, paired.connectionId, coldMutation);
+    expect(cold).toMatchObject({ state: OperationState.SUCCEEDED, result: { payload: {
+      case: "compactSession", value: { outcome: CompactSessionOutcome.COMPACTED }
+    } } });
+    const resumed = (await paired.clients.session.getSession({ sessionId })).session!;
+    expect(resumed.nativeBinding!.runtimeGeneration).toBeGreaterThan(source.nativeBinding!.runtimeGeneration);
+    expect(resumed.nativeBinding!.opaqueReference).toBe(source.nativeBinding!.opaqueReference);
+    expect((await submit(paired.clients.operation, paired.connectionId, coldMutation, cold.operationId)).result).toEqual(cold.result);
+    await expect(submit(paired.clients.operation, paired.connectionId, coldMutation)).rejects.toMatchObject({ code: Code.Aborted });
+    expect(adapter.compactCalls).toBe(2);
+
+    await submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
+      payload: { case: "detachSession", value: { sessionId } }
+    }));
+    const beforeEdit = (await paired.clients.session.getSession({ sessionId })).session!;
+    const resume = adapter.resumeSession.bind(adapter);
+    vi.spyOn(adapter, "resumeSession").mockImplementationOnce(async (binding, context) => {
+      const pin = await submit(paired.clients.operation, paired.connectionId, pinMutation(sessionId, true));
+      expect(pin.state).toBe(OperationState.SUCCEEDED);
+      return resume(binding, context);
+    });
+    const interrupted = await submit(paired.clients.operation, paired.connectionId, compactFromSnapshot(beforeEdit));
+    expect(interrupted.state).toBe(OperationState.FAILED);
+    expect((await paired.clients.session.getSession({ sessionId })).session?.pinned).toBe(true);
+    expect(adapter.compactCalls).toBe(2);
   });
 
   it("reads and navigates native branches through HTTP, SQLite, and the Session Host", async () => {

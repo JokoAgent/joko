@@ -3,7 +3,10 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   CompactionState,
+  GetSessionStatisticsRequestSchema,
   GetTaskProviderGroupUsageRequestSchema,
+  ListRuntimeCommandsRequestSchema,
+  ListSessionResourcesRequestSchema,
   RunState,
   SessionAttentionAcknowledgementIntent,
   SessionSnapshotScopeSchema,
@@ -122,6 +125,9 @@ describe("mounted Pi compaction product chain", () => {
         ? [item.payload.kind.value.state] : []);
     };
     await send(compactSessionId, "One turn for a manual Pi compaction.");
+    await send(failingSessionId, "First turn for a genuine Provider failure.");
+    await send(failingSessionId, "Second turn for a genuine Provider failure.");
+    const failingSessionReply = `Mounted Pi reply ${fixture.providerRequests.length}`;
 
     const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Mounted Pi compact Web" });
     if (challenge.challenge === undefined) throw new Error("Mounted Web pairing returned no challenge.");
@@ -222,6 +228,7 @@ describe("mounted Pi compaction product chain", () => {
     await waitFor(() => manager.clients.session.getSession({ sessionId: compactSessionId }),
       response => (response.session?.context?.usedTokens ?? 0n) > 0n, "current context usage after the next native response", 30_000);
     const requestsBeforeSummary = fixture.providerRequests.length;
+    const completedBeforeSummary = (await timelineStates(compactSessionId)).filter(state => state === CompactionState.COMPLETED).length;
     holdNextSummary = true;
     await trigger.click();
     await confirmation.getByRole("button", { name: "Compact", exact: true }).click();
@@ -231,15 +238,18 @@ describe("mounted Pi compaction product chain", () => {
     releaseSummary?.();
     releasePendingProvider = undefined;
     await waitFor(() => timelineStates(compactSessionId),
-      (states) => states.includes(CompactionState.COMPLETED), "completed native compaction", 30_000);
+      states => states.filter(state => state === CompactionState.COMPLETED).length > completedBeforeSummary,
+      "the held native compaction to complete", 30_000);
     expect(await page.locator(".compact-action-feedback").count()).toBe(0);
     await navigateMountedTask(page, compactSessionId, "Mounted compact outcomes");
     await page.getByText("Context compacted", { exact: true }).first().waitFor({ state: "visible", timeout: 30_000 });
 
     observedSessionId = failingSessionId;
-    await send(failingSessionId, "First turn for a genuine Provider failure.");
-    await send(failingSessionId, "Second turn for a genuine Provider failure.");
     await navigateMountedTask(page, failingSessionId, "Mounted compact failure");
+    // The route heading can render from the owner snapshot before the task
+    // timeline catches up. Wait for the finished turn before pressing its ring.
+    await page.locator(`.timeline[data-timeline-session-id='${failingSessionId}']:not([aria-busy='true'])`)
+      .getByText(failingSessionReply, { exact: true }).waitFor({ state: "visible" });
     const failingTrigger = compactTrigger(failingSessionId);
     await failingTrigger.waitFor({ state: "visible" });
     const compactControlBeforeClick = await failingTrigger.evaluate(button => ({
@@ -263,6 +273,7 @@ describe("mounted Pi compaction product chain", () => {
         }, { capture: true, once: true });
       }
     });
+    const requestsBeforeFailure = fixture.providerRequests.length;
     failSummary = true;
     await failingTrigger.click();
     await confirmation.getByRole("button", { name: "Compact", exact: true }).click().catch(async (cause: unknown) => {
@@ -287,6 +298,7 @@ describe("mounted Pi compaction product chain", () => {
     const failureStates = await timelineStates(failingSessionId);
     expect(failureStates).toContain(CompactionState.FAILED);
     expect(failureStates).not.toContain(CompactionState.NO_OP);
+    expect(fixture.providerRequests.length).toBeGreaterThan(requestsBeforeFailure);
     expect(errors.filter((error) => error.startsWith("pageerror:"))).toEqual([]);
     // The controlled Provider refusal is intentionally surfaced as HTTP 503.
     usagePhase = "provider-failure-drain";
@@ -295,6 +307,12 @@ describe("mounted Pi compaction product chain", () => {
     errors.splice(0);
 
     observedSessionId = compactSessionId;
+    const readNativeCompactions = async (pi: typeof manager.clients.pi) =>
+      (await pi.listPiEntries({ sessionId: compactSessionId })).entries
+        .filter(entry => entry.payload.case === "compaction").map(entry => entry.entryId);
+    const nativeCompactions = await readNativeCompactions(manager.clients.pi);
+    expect(nativeCompactions).toHaveLength(2);
+    const originalBinding = fixture.application.store.getSession(compactSessionId).descriptor.binding;
     const authKey = manager.authKey;
     usagePhase = "service-stop";
     await fixture.close({ removeRoot: false });
@@ -311,26 +329,62 @@ describe("mounted Pi compaction product chain", () => {
     }) });
     expect(restartedTimeline.snapshot?.timeline.some((item) => item.payload?.kind.case === "compactionChanged"
       && item.payload.kind.value.state === CompactionState.COMPLETED)).toBe(true);
-    usagePhase = "reconnect-document";
-    // Keep the drained route detached while the retiring document navigates.
-    await page.goto(taskUrl(compactSessionId), { waitUntil: "domcontentloaded" });
-    usagePhase = "reconnect-ready";
-    await resumeUsageCapture();
-    await page.getByText("Context compacted", { exact: true }).first().waitFor({ state: "visible", timeout: 30_000 });
-    expect(await page.locator(".compact-action-feedback").count()).toBe(0);
-    // Background Connect polls may fail while the service is deliberately stopped.
-    usagePhase = "reconnect-drain";
-    await pauseUsageCapture();
-    await settleBrowserErrors();
-    errors.splice(0);
-    usagePhase = "restarted-continuation";
-    await resumeUsageCapture();
-    attentionBeforeResume = fixture.application.store.getSessionAttention(compactSessionId).attentionCursor;
+    const bindingBeforePage = fixture.application.store.getSession(compactSessionId).descriptor.binding;
+    expect(bindingBeforePage).toEqual(originalBinding);
+    // Statistics reads the native tree. The command and resource catalogs can also attach the cold session.
+    const activationRoute = /\/joko\.v1\.SessionService\/(GetSessionStatistics|ListRuntimeCommands|ListSessionResources)$/u;
+    const readSessionId: Record<string, (body: Uint8Array) => string> = {
+      GetSessionStatistics: body => fromBinary(GetSessionStatisticsRequestSchema, body).sessionId,
+      ListRuntimeCommands: body => fromBinary(ListRuntimeCommandsRequestSchema, body).sessionId,
+      ListSessionResources: body => fromBinary(ListSessionResourcesRequestSchema, body).sessionId
+    };
+    const activationReads = new Set<string>();
+    let releaseActivation!: () => void;
+    const activationGate = new Promise<void>(resolve => { releaseActivation = resolve; });
+    await page.route(activationRoute, async route => {
+      const request = route.request(), body = request.postDataBuffer();
+      const method = new URL(request.url()).pathname.split("/").at(-1)!;
+      if (body && readSessionId[method]?.(body) === compactSessionId) {
+        activationReads.add(method);
+        await activationGate;
+      }
+      await route.continue();
+    });
+    try {
+      usagePhase = "reconnect-document";
+      await page.goto(taskUrl(compactSessionId), { waitUntil: "domcontentloaded" });
+      usagePhase = "reconnect-ready";
+      await resumeUsageCapture();
+      await page.getByText("Context compacted", { exact: true }).first().waitFor({ state: "visible", timeout: 30_000 });
+      expect(await page.locator(".compact-action-feedback").count()).toBe(0);
+      // Background Connect polls may fail while the service is deliberately stopped.
+      usagePhase = "reconnect-drain";
+      await pauseUsageCapture();
+      await settleBrowserErrors();
+      errors.splice(0);
+      usagePhase = "restarted-continuation";
+      await resumeUsageCapture();
+      await waitFor(async () => activationReads.size, count => count > 0, "the mounted task's first Pi runtime read", 30_000);
+      await trigger.click();
+      await confirmation.waitFor({ state: "visible" });
+      expect(fixture.application.store.getSession(compactSessionId).descriptor.binding).toEqual(bindingBeforePage);
+      attentionBeforeResume = fixture.application.store.getSessionAttention(compactSessionId).attentionCursor;
+    } finally {
+      releaseActivation();
+      await page.unroute(activationRoute);
+    }
+    const bindingBeforeInput = await waitFor(async () => fixture!.application.store.getSession(compactSessionId).descriptor.binding,
+      binding => binding.generation > bindingBeforePage.generation, "the first mounted read to activate the original Pi session", 30_000);
+    expect(bindingBeforeInput).toEqual({ ...originalBinding, generation: originalBinding.generation + 1 });
     const continuationRunId = await send(compactSessionId, "The same native Pi context continues after service restart.");
     const completion = await waitFor(async () => fixture!.application.store.listEvents({ sessionId: compactSessionId })
       .findLast(event => event.runId === continuationRunId && event.payload.type === "done" && event.payload.outcome === "completed"),
     event => event !== undefined, "the resumed native completion", 30_000);
     if (completion === undefined) throw new Error("The resumed Pi Run has no durable completion.");
+    const bindingAfterInput = fixture.application.store.getSession(compactSessionId).descriptor.binding;
+    expect(bindingAfterInput).toEqual(bindingBeforeInput);
+    await confirmation.waitFor({ state: "hidden" });
+    expect(await readNativeCompactions(reconnected.pi)).toEqual(nativeCompactions);
     const acknowledged = await waitFor(() => reconnected.session.getSession({ sessionId: compactSessionId }), response => {
       const attention = response.session?.attention;
       return attention?.unread === false && (attention.readThroughCursor?.sequence ?? 0n) >= completion.globalCursor
@@ -349,6 +403,9 @@ describe("mounted Pi compaction product chain", () => {
         staleViewedAcknowledgements: permittedAttentionErrors.length / 2,
         staleViewedCursors: permittedAttentionCursors,
         observedUsageGenerations,
+        activationReads: [...activationReads],
+        bindingGenerations: { beforeRestart: originalBinding.generation, beforePage: bindingBeforePage.generation,
+          beforeInput: bindingBeforeInput.generation, afterInput: bindingAfterInput.generation },
         preResumeCursor: attentionBeforeResume.toString(),
         nativeCompletionCursor: completion.globalCursor.toString(),
         readThroughCursor: attention.readThroughCursor?.sequence.toString(),
@@ -467,7 +524,8 @@ async function navigateMountedTask(page: Page, sessionId: string, name: string):
   await page.evaluate((id) => { window.location.hash = `/tasks/${encodeURIComponent(id)}`; }, sessionId);
   // Sidebar titles and the previous task's ring can remain visible during the
   // route transition. Wait for the actual task pane before choosing its action.
-  await page.locator(".session-header .breadcrumbs").getByRole("button", { name, exact: true })
+  await page.locator(`.session-pane[data-input-session-id='${sessionId}'] .session-header .breadcrumbs`)
+    .getByRole("button", { name, exact: true })
     .waitFor({ state: "visible" });
 }
 

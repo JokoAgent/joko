@@ -3636,11 +3636,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.submit({ case: "setSessionPlanMode", value: { sessionId, enabled } });
   }
 
-  async compact(sessionId: string, customInstructions?: string): Promise<"compacted" | "noop"> {
+  async compact(sessionId: string, customInstructions?: string, expectedGeneration?: bigint): Promise<"compacted" | "noop"> {
     const instructions = customInstructions?.trim() ?? "";
+    const generation = expectedGeneration ?? this.#snapshot?.sessions.find(session => session.id === sessionId)?.generation;
+    if (generation === undefined || generation < 1n) throw new GatewayError("The original task generation is required for compaction.");
     const operation = await this.submit(
       { case: "compactSession", value: { sessionId, customInstructions: instructions } },
-      true
+      true, [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration: generation }]
     );
     const payload = operation.result?.payload;
     if (payload?.case !== "compactSession") {

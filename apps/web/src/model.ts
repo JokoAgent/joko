@@ -6499,7 +6499,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   setRuntimeModel?(sessionId: string, selection: import("./session-runtime-gateway.js").SessionRuntimeModelSelection): Promise<void>;
   setPermission(sessionId: string, mode: PermissionMode): Promise<void>;
   setPlanMode(sessionId: string, enabled: boolean): Promise<void>;
-  compact(sessionId: string, customInstructions?: string): Promise<CompactSessionOutcomeView>;
+  compact(sessionId: string, customInstructions?: string, expectedGeneration?: bigint): Promise<CompactSessionOutcomeView>;
   exportSession(sessionId: string, context: ArtifactDownloadContext): Promise<ArtifactDownloadOutcome>;
   exportPortableSession(
     session: Pick<SessionView, "id" | "name">,

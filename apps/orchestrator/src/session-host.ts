@@ -262,6 +262,8 @@ interface ActiveSession {
   readonly backendInstanceGeneration: number;
   /** Resource authority observed before this native runtime began activation. */
   readonly resourceCatalogEpoch: bigint;
+  /** Session row versions on either side of this handle's native resume. */
+  readonly resumption?: { readonly sourceGeneration: number; readonly sourceRevision: bigint; readonly boundRevision: bigint };
   documentPathDispatch?: { readonly queueId: string; readonly attemptId: string; readonly authorize: DocumentPathAuthorizer } | undefined;
   lastActivityAt: number;
 }
@@ -454,9 +456,15 @@ interface CompactionQueueWindow {
   willRetry: boolean;
 }
 
+interface CompactionReceipt {
+  readonly outcome: "compacted" | "noop";
+  readonly binding: NativeSessionBinding;
+  readonly resumption?: ActiveSession["resumption"];
+}
+
 interface ExplicitCompactionFlight {
   readonly instructions: string | undefined;
-  promise: Promise<"compacted" | "noop">;
+  readonly promise: Promise<CompactionReceipt>;
 }
 
 type CompactionDispatchDecision =
@@ -9461,6 +9469,11 @@ export class SessionHost {
   }
 
   async compact(sessionId: string, customInstructions?: string, operationId?: string): Promise<"compacted" | "noop"> {
+    return (await this.compactWithBinding(sessionId, customInstructions, operationId)).outcome;
+  }
+
+  async compactWithBinding(sessionId: string, customInstructions?: string, operationId?: string,
+    assertAuthority?: (owner: Pick<CompactionReceipt, "binding" | "resumption">) => void): Promise<CompactionReceipt> {
     if (this.isReviewReadOnlySession(sessionId)) throw new StoreError("Reviewer compaction is disabled.");
     const trimmedInstructions = customInstructions?.trim();
     const instructions = trimmedInstructions === "" ? undefined : trimmedInstructions;
@@ -9475,17 +9488,30 @@ export class SessionHost {
 
     // Install the barrier before the first await. A prompt accepted while
     // activation or the compact RPC is starting must remain durably queued.
+    const source = this.#store.getSession(sessionId);
     const token = this.beginCompactionEffect(sessionId);
     let flight: ExplicitCompactionFlight;
     const promise = Promise.resolve().then(async () => {
+      let lease: ActiveBackendSideEffectLease | undefined;
       try {
         // If dispatch won the synchronous queue-claim race, let its Backend
         // acceptance resolve before compact() can abort or reject that request.
         // The barrier above prevents a second item from being claimed meanwhile.
         await this.#dispatchPreparations.get(sessionId)?.settled;
+        assertBindingFence(source, this.#store.getSession(sessionId));
+        assertAuthority?.({ binding: source.descriptor.binding });
         const active = await this.activate(sessionId);
-        const stored = this.#store.getSession(sessionId);
-        const result = await active.adapter.compact(instructions, this.contextFor(stored, undefined, undefined, operationId));
+        lease = this.beginActiveBackendSideEffect(sessionId, active, operationId);
+        const { binding, backendId, targetId } = lease.stored.descriptor;
+        // Cold activation advances the generation while resuming the same native history.
+        if (backendId !== source.descriptor.backendId || targetId !== source.descriptor.targetId
+          || binding.opaqueRef !== source.descriptor.binding.opaqueRef || binding.nativeSessionId !== source.descriptor.binding.nativeSessionId) {
+          throw new StoreError("The original native Session changed before compaction.");
+        }
+        const owner = { binding, resumption: active.resumption };
+        assertAuthority?.(owner);
+        const result = await active.adapter.compact(instructions, lease.context);
+        this.assertActiveBackendSideEffectLease(lease);
         if (result === "compacted") {
           // compact() acknowledges the native persistence boundary. Project it
           // immediately so the summary/tree leaf is reconnect-safe before this
@@ -9493,8 +9519,10 @@ export class SessionHost {
           await this.synchronizeNativeHistory(sessionId);
         }
         await this.refreshNativeStateBestEffort(sessionId, active, "native_state_compaction_sync", {}, result === "compacted");
-        return result;
+        this.assertActiveBackendSideEffectLease(lease);
+        return { outcome: result, ...owner };
       } finally {
+        lease?.release();
         this.finishCompactionEffect(sessionId, token);
         if (this.#explicitCompactionFlights.get(sessionId) === flight) {
           this.#explicitCompactionFlights.delete(sessionId);
@@ -15024,6 +15052,7 @@ export class SessionHost {
     const backendInstanceGeneration = this.requireAdapterGeneration(stored.descriptor.backendId, adapter);
     const resourceCatalogEpoch = this.#resourceCatalogEpoch;
     const previousBinding = stored.descriptor.binding;
+    const sourceRevision = stored.revision;
     const previousUsage = this.#runtimeUsageReadings.get(sessionId);
     const previousUsageKey = JSON.stringify([stored.descriptor.backendId, previousBinding.generation, nativeBindingFingerprint(previousBinding.opaqueRef)]);
     const nextBinding = { ...previousBinding, generation: previousBinding.generation + 1 };
@@ -15141,7 +15170,10 @@ export class SessionHost {
         adapter,
         backendInstanceGeneration
       );
-      const result = this.activeSession(adapter, sessionId, backendInstanceGeneration, resourceCatalogEpoch);
+      const result: ActiveSession = {
+        ...this.activeSession(adapter, sessionId, backendInstanceGeneration, resourceCatalogEpoch),
+        resumption: { sourceGeneration: previousBinding.generation, sourceRevision, boundRevision: stored.revision }
+      };
       this.setActiveSession(sessionId, result);
       // A normal attachment advances the execution fence while keeping the
       // native context. Carry only the confirmed closed reading for that exact

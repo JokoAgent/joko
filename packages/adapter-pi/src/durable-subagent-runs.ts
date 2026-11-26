@@ -564,10 +564,7 @@ async function readRunStatuses(
     const candidate = await readStatusCandidate(join(directory, "status.json"));
     const config = await readBoundedJson(join(directory, "config.json"));
     const owner = await readBoundedJson(join(directory, "owner.json"));
-    const claim = await readBoundedJson(join(directory, "runner.claim.json")).catch((error: NodeJS.ErrnoException) => {
-      if (error.code === "ENOENT") return undefined;
-      throw error;
-    });
+    const claim = await readRunnerClaim(join(directory, "runner.claim.json"));
     const runnerScript = join(directory, "joko-managed-subagent-runner.cjs");
     const recovered = !isDurableRunStatus(candidate, entry.name, productSessionId);
     const status = recovered
@@ -839,6 +836,20 @@ async function readBoundedJson(path: string): Promise<unknown> {
   const bytes = await readBoundedPrivateFile(path, MAX_STATUS_BYTES, () =>
     piError("PI_SUBAGENT_STATUS_UNSAFE", "Managed background status is linked, oversized, or unavailable", "session"));
   return JSON.parse(bytes.toString("utf8"));
+}
+
+async function readRunnerClaim(path: string): Promise<unknown> {
+  // The exclusive create reserves ownership before the writer finishes the JSON.
+  // An existing incomplete claim must not be treated as an unclaimed launch.
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await readBoundedJson(path);
+    } catch (error) {
+      if (attempt === 1 && (error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      if (!(error instanceof SyntaxError) || attempt >= PRIVATE_FILE_READ_ATTEMPTS) throw error;
+    }
+    await waitForPrivateFileReplacement();
+  }
 }
 
 async function readBoundedPrivateFile(path: string, maximum: number, unsafe: () => Error): Promise<Buffer> {

@@ -4313,7 +4313,7 @@ export function useAppController(): AppController {
       ?? Promise.reject(new Error("The task runtime selection is unavailable.")),
     setPermission: (sessionId, mode) => gateway().setPermission(sessionId, mode),
     setPlanMode: (sessionId, enabled) => gateway().setPlanMode(sessionId, enabled),
-    compact: (sessionId, customInstructions) => gateway().compact(sessionId, customInstructions),
+    compact: (sessionId, customInstructions, expectedGeneration) => gateway().compact(sessionId, customInstructions, expectedGeneration),
     exportSession,
     exportPortableSession,
     ...portableImportApi,

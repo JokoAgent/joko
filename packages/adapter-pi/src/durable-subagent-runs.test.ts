@@ -117,6 +117,33 @@ describe("private background run status snapshots", () => {
     expect((await original.lstat(run.directory)).isDirectory()).toBe(true);
   });
 
+  it("rereads an exclusively created runner claim after its writer completes the JSON", async () => {
+    const run = await terminalRun();
+    const claimPath = join(run.directory, "runner.claim.json");
+    const claim = await original.readFile(join(run.directory, "config.json"), "utf8");
+    await original.writeFile(claimPath, "", { flag: "wx", mode: 0o600 });
+    let observations = 0;
+    native.lstat.mockImplementation(async (path: string) => {
+      // Let the first bounded read see a stable empty file before completing it in place.
+      if (path === claimPath && ++observations === 4) await original.writeFile(claimPath, claim, { flag: "r+" });
+      return original.lstat(path);
+    });
+
+    await stopAndRemoveManagedSubagentRuns(run.root, run.productSessionId, 1000);
+    expect(observations).toBeGreaterThan(3);
+    await expect(original.lstat(run.directory)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("preserves the run when an existing runner claim remains incomplete", async () => {
+    const run = await terminalRun();
+    const claimPath = join(run.directory, "runner.claim.json");
+    await original.writeFile(claimPath, "{", { flag: "wx", mode: 0o600 });
+
+    await expect(stopAndRemoveManagedSubagentRuns(run.root, run.productSessionId, 1000)).rejects.toThrow(SyntaxError);
+    await expect(original.readFile(claimPath, "utf8")).resolves.toBe("{");
+    expect((await original.lstat(run.directory)).isDirectory()).toBe(true);
+  });
+
   it.each(["hard link", "symbolic link", "oversized file"])("continues to reject a %s without deleting its run", async kind => {
     const run = await terminalRun();
     const alias = join(run.root, "other-status.json");

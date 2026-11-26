@@ -2,6 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import {
   CompactSessionOutcome,
+  EntityKind,
   GetOperationResponseSchema,
   GetSnapshotResponseSchema,
   OperationState,
@@ -32,6 +33,10 @@ describe("typed compact Session result", () => {
       case: "compactSession",
       value: { sessionId: "session-1", customInstructions: "" }
     }]);
+    const request = vi.mocked(transport.unary).mock.calls.find(([method]) => method.localName === "submitOperation")?.[4];
+    expect(request).toMatchObject({ mutation: { preconditions: [
+      { entity: { kind: EntityKind.SESSION, id: "session-1" }, expectedGeneration: 7n }
+    ] } });
     gateway.disconnect();
   });
 
@@ -151,6 +156,8 @@ function compactTransport(options: CompactTransportOptions): Transport {
         return response(method, create(GetSnapshotResponseSchema, {
           snapshot: create(SnapshotSchema, {
             generation: 1n,
+            sessions: [{ sessionId: "session-1", location: { kind: { case: "serviceNode", value: {} } },
+              nativeBinding: { runtimeGeneration: 7n } }],
             resumeCursor: { generation: 1n, sequence: 0n }
           })
         }));
