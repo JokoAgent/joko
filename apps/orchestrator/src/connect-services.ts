@@ -524,6 +524,7 @@ import { CodeHostPullRequestNotFoundError } from "@joko/code-host";
 import { SessionCodeHostLogin } from "./session-code-host-login.js";
 import type { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
 import { recordSshWorktreeDisplayRename } from "./ssh-worktree-rename-authority.js";
+import { advanceSessionLifecycleCleanup } from "./session-lifecycle-cleanup.js";
 import { readPersonalDevelopmentPurpose } from "./personal-development-purpose.js";
 import { RuntimeProcessControl } from "./runtime-process-control.js";
 import {
@@ -6663,70 +6664,6 @@ function sessionLifecycleOperationOutcome(
   };
 }
 
-async function advanceSessionLifecycleCleanup(
-  dependencies: Pick<ConnectServiceDependencies, "store" | "sessionHost" | "sessionWorktrees" | "gitSafety" | "terminals" | "now" | "personalDevelopment">,
-  initial: SessionLifecycleCleanupRecord
-): Promise<SessionLifecycleCleanupRecord> {
-  let cleanup = initial;
-  const advance = (phase: "close" | "native" | "worktree" | "git_safety") => {
-    cleanup = dependencies.store.advanceSessionLifecycleCleanup({
-      operationId: cleanup.operationId,
-      phase,
-      at: (dependencies.now ?? Date.now)()
-    });
-  };
-  try {
-    for (const child of dependencies.store.prepareDependentSideChatCleanups(cleanup, (dependencies.now ?? Date.now)())) {
-      await advanceSessionLifecycleCleanup(dependencies, child);
-    }
-    if (!cleanup.closeCompleted) {
-      await dependencies.sessionHost.prepareSessionLifecycleClose(
-        cleanup.sessionId,
-        cleanup.disposition
-      );
-      await dependencies.sessionHost.closeIfActive(cleanup.sessionId);
-      await dependencies.terminals?.closeSession(cleanup.sessionId);
-      advance("close");
-    }
-    if (!cleanup.nativeCompleted) {
-      await dependencies.sessionHost.deleteNativeSession(cleanup.sessionId, cleanup.operationId);
-      advance("native");
-    }
-    if (readPersonalDevelopmentPurpose(dependencies.store, cleanup.sessionId) !== undefined) {
-      const personal = dependencies.personalDevelopment?.();
-      if (personal === undefined) throw new ConnectError("Personal task cleanup is unavailable.", Code.FailedPrecondition);
-      cleanup = await personal.settleSessionLifecycle(cleanup);
-    }
-    if (!cleanup.worktreeCompleted) {
-      const session = dependencies.store.getSession(cleanup.sessionId);
-      const worktree = session.descriptor.worktree;
-      if (worktree !== undefined) {
-        if (dependencies.sessionWorktrees === undefined) {
-          throw new ConnectError("Isolated workspace cleanup is unavailable.", Code.FailedPrecondition);
-        }
-        if (cleanup.disposition === "archive") {
-          if (worktree.state === "active") await dependencies.sessionWorktrees.archive(cleanup.sessionId);
-        } else {
-          await dependencies.sessionWorktrees.release(cleanup.sessionId);
-        }
-      }
-      advance("worktree");
-    }
-    if (!cleanup.gitSafetyCompleted) {
-      await dependencies.gitSafety?.closeSession(cleanup.sessionId);
-      advance("git_safety");
-    }
-    return cleanup;
-  } catch (error) {
-    dependencies.store.recordSessionLifecycleCleanupFailure({
-      operationId: cleanup.operationId,
-      message: redactSecrets(error instanceof Error ? error.message : "Task lifecycle cleanup failed."),
-      at: (dependencies.now ?? Date.now)()
-    });
-    throw error;
-  }
-}
-
 const SCHEDULE_DELETION_RETRY_DELAY_MS = 2_000;
 const SCHEDULE_DELETION_RETRY_MAX_DELAY_MS = 30_000;
 interface ScheduleDeletionRetryState {
@@ -6917,6 +6854,7 @@ async function resumePendingSessionLifecycleCleanup(
 ): Promise<SessionLifecycleCleanupRecord | undefined> {
   let cleanup = dependencies.store.findSessionLifecycleCleanup(operationId);
   if (cleanup?.state !== "pending") return cleanup;
+  if (dependencies.sessionHost.ownsQuietScheduleArchive?.(operationId, cleanup.sessionId)) return cleanup;
   if (dependencies.store.isDependentSideChatCleanup(cleanup)) return cleanup;
   // Service-owned Partner retirement has its own durable recovery coordinator.
   if (dependencies.sessionHost.isPartnerSessionRetiring(cleanup.sessionId)) return cleanup;

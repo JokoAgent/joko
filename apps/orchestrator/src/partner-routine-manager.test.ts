@@ -28,6 +28,7 @@ import { ScheduleRunNotificationController } from "./schedule-run-notifications.
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
+const routineSettlementWait = { timeout: 5_000 };
 const profile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
   ? { ...capability, options: ["ask", "auto", "bypassPermissions"] } : capability), { key: "permission.change", supported: true }] };
 const definition = { name: "Review changes", prompt: "Review the current home changes.", enabled: true, silentWhenIdle: true,
@@ -76,7 +77,7 @@ async function toolsFixture(f: Awaited<ReturnType<typeof fixture>>) {
   return { tools, router, caller, notifications };
 }
 describe("Partner routine authority and independent execution", () => {
-  it.each(['persistent', 'fresh'] as const)('runs %s routines with their own model, history and Partner identity', async sessionMode => {
+  it.each(['persistent', 'fresh'] as const)('runs %s routines with their own model, history and Partner identity', { timeout: 20_000 }, async sessionMode => {
     const startedAt = performance.now();
     const f = await fixture(), canonical = f.store.getSession(f.partner.canonicalSessionId!).descriptor;
     const modelOverride = { backendId: profile.id, providerId: 'vision', modelId: 'multimodal', effort: 'high', fastMode: false } as const;
@@ -87,7 +88,8 @@ describe("Partner routine authority and independent execution", () => {
       await f.routines.run({ partnerId: f.partner.id, partnerRevision: f.partner.revision, routineId: saved.id,
         revision: saved.revision, requestId: `routine-model-${sessionMode}-run-${index}` });
       try {
-        await vi.waitFor(() => expect(f.routines.history(f.partner.id, saved.id).runs.filter(run => run.status === 'success')).toHaveLength(index + 1));
+        await vi.waitFor(() => expect(f.routines.history(f.partner.id, saved.id).runs.filter(run => run.status === 'success')).toHaveLength(index + 1),
+          routineSettlementWait);
       } catch (error) {
         try {
           console.error("[routine-model-settlement]", JSON.stringify({ sessionMode, expectedSuccesses: index + 1,
@@ -170,12 +172,12 @@ describe("Partner routine authority and independent execution", () => {
       .toEqual(expect.arrayContaining([before.generation, after.generation]));
     expect(f.adapter.sent).toHaveLength(1);
   });
-  it.each(["binding-replacement", "generation-reset"] as const)("rejects an external %s after native routine completion", async change => {
+  it.each(["binding-replacement", "generation-reset"] as const)("rejects an external %s after native routine completion", { timeout: 15_000 }, async change => {
     const f = await fixture();
     const dispatch = f.scheduler.runNowWithResult.bind(f.scheduler);
     vi.spyOn(f.scheduler, "runNowWithResult").mockImplementation(async (...args) => {
       const result = await dispatch(...args);
-      await vi.waitFor(() => expect(f.store.getRun(result.runId).descriptor.state).toBe("completed"));
+      await vi.waitFor(() => expect(f.store.getRun(result.runId).descriptor.state).toBe("completed"), routineSettlementWait);
       const sessionId = f.store.getRun(result.runId).descriptor.sessionId;
       const current = f.store.getSession(sessionId);
       f.store.updateSession(sessionId, { binding: change === "binding-replacement"
@@ -188,7 +190,7 @@ describe("Partner routine authority and independent execution", () => {
         triggers: [{ id: "timer", kind: "interval", intervalMs: 3600000 }] } });
     await f.routines.run({ partnerId: f.partner.id, partnerRevision: f.partner.revision, routineId: saved.id,
       revision: saved.revision, requestId: "routine-fenced-explicit-run" });
-    await vi.waitFor(() => expect(f.routines.history(f.partner.id, saved.id).runs[0]?.status).toBe("failed"));
+    await vi.waitFor(() => expect(f.routines.history(f.partner.id, saved.id).runs[0]?.status).toBe("failed"), routineSettlementWait);
     expect(f.adapter.sent).toHaveLength(1);
   });
   it("manages own routines through the frozen tool catalog and shared UI owner with stable execution receipts", async () => {

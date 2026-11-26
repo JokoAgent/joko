@@ -5,6 +5,7 @@ import type { JSX, KeyboardEvent } from "react";
 import { schedulePullRequestChanges, schedulePullRequestUrl } from "@joko/contracts";
 import { ArrowUpToLine, CalendarClock, Check, CheckCircle2, ChevronDown, ChevronRight, CirclePlus, Clock3, Copy, FolderGit2, FolderMinus, GitBranch, History, Menu, MoreHorizontal, Pause, Pencil, Play, RefreshCw, Trash2, TriangleAlert } from "lucide-react";
 import type { AppController } from "../controller.js";
+import { authenticatedConnectionKey } from "../connection-owner.js";
 import { modelPreferenceOwnerId } from "../model-picker-preferences.js";
 import type { BackendView, ExtraDirectoryView, ModelView, SchedulerRuntimeView, ScheduleDraft, ScheduleView, SessionView, TargetView, TargetWorktreeProbeView, WorktreeEligibilityView, WorktreeSourceView } from "../model.js";
 import { clampScheduleListWidth, countActiveSchedules, filterSchedules, groupSchedulesByProject, normalizeScheduleStatusFilter, reconcileScheduleHistory, scheduleDisplayStatus, scheduleRuntimeStatus, selectVisibleScheduleId } from "./scheduler-list.js";
@@ -93,11 +94,12 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
   const [resizeOrigin, setResizeOrigin] = useState<{ readonly clientX: number; readonly width: number }>();
   const [pendingRunNowIds, setPendingRunNowIds] = useState<ReadonlySet<string>>(() => new Set());
   const [runNowDispatchTracker] = useState(() => createScheduleRunNowDispatchTracker(setPendingRunNowIds));
+  const connectionOwner = authenticatedConnectionKey(controller.state);
   const [runtimeOwner, setRuntimeOwner] = useState<{
-    readonly controller: AppController;
+    readonly owner: string | undefined;
     readonly snapshot: SchedulerRuntimeView;
   }>();
-  const runtime = runtimeOwner?.controller === controller ? runtimeOwner.snapshot : undefined;
+  const runtime = runtimeOwner && runtimeOwner.owner === connectionOwner ? runtimeOwner.snapshot : undefined;
   const [projectNotice, setProjectNotice] = useState<ProjectAutomationNotice>();
   const projectNoticeSequenceRef = useRef(0);
   const [removeProjectSchedule, setRemoveProjectSchedule] = useState<ScheduleView>();
@@ -132,7 +134,7 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
     window.addEventListener(CLIENT_LAYOUT_RESET_EVENT, resetLayout);
     return () => window.removeEventListener(CLIENT_LAYOUT_RESET_EVENT, resetLayout);
   }, []);
-  useEffect(() => {
+  useLayoutEffect(() => {
     let disposed = false;
     let timer: number | undefined;
     let request: AbortController | undefined;
@@ -141,7 +143,7 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
       void controller.getSchedulerRuntime(request.signal).then((snapshot) => {
         if (!disposed) {
           runNowDispatchTracker.observe(snapshot);
-          setRuntimeOwner({ controller, snapshot });
+          setRuntimeOwner({ owner: connectionOwner, snapshot });
         }
       }).catch(() => {
         // A transient poll failure must not erase the last authoritative
@@ -155,9 +157,9 @@ export function SchedulesPage({ controller, schedules, sessions, targets, models
       disposed = true;
       request?.abort();
       if (timer !== undefined) window.clearTimeout(timer);
+      runNowDispatchTracker.retire();
     };
-  }, [controller, runNowDispatchTracker]);
-  useLayoutEffect(() => () => runNowDispatchTracker.retire(), [controller, runNowDispatchTracker]);
+  }, [connectionOwner, runNowDispatchTracker]);
   useEffect(() => {
     if (resizeOrigin === undefined) return;
     const move = (event: PointerEvent): void => setListWidth(clampScheduleListWidth(resizeOrigin.width + event.clientX - resizeOrigin.clientX));

@@ -17030,6 +17030,22 @@ export class OperationalStore {
     });
   }
 
+  hasActivitySinceScheduleStart(sessionId: string, runId: string, revision: bigint): boolean {
+    const result = this.database.prepare(`
+      SELECT 1 FROM runs WHERE session_id = ? AND id <> ? AND revision > ?
+      UNION ALL SELECT 1 FROM interactions WHERE session_id = ? AND revision > ?
+      UNION ALL SELECT 1 FROM events WHERE session_id = ? AND revision > ?
+        AND json_extract(payload_json, '$.payload.type') = 'message_complete'
+        AND json_extract(payload_json, '$.payload.role') = 'user'
+        AND run_id IS NOT ? AND json_extract(payload_json, '$.payload.automationOrigin') IS NULL
+      UNION ALL SELECT 1 FROM operations WHERE connection_id IS NOT NULL AND revision > ?
+        AND (json_extract(body_json, '$.payload.value.sessionId') = ? OR json_extract(body_json, '$.sessionId') = ?)
+      LIMIT 1
+    `);
+    const since = asSqlInteger(revision);
+    return result.get(sessionId, runId, since, sessionId, since, sessionId, since, runId, since, sessionId, sessionId) !== undefined;
+  }
+
   prepareSessionLifecycleCleanup(input: {
     readonly operationId: string;
     readonly sessionId: string;
@@ -20404,7 +20420,7 @@ export class OperationalStore {
     }
   }
 
-  private readRevision(): bigint {
+  readRevision(): bigint {
     const row = this.database.prepare(
       "SELECT revision FROM store_meta WHERE singleton = 1"
     ).get() as Row | undefined;

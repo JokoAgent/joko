@@ -3,7 +3,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { create } from "@bufbuild/protobuf";
 import { PartnerImportCategory, PartnerImportPreviewPageSchema, PartnerImportResultSchema, PartnerImportSourceSchema, PartnerImportStatus,
   ListPartnerHomeTargetsResponseSchema, InspectPartnerHomeTargetResponseSchema, MovePartnerHomeResponseSchema,
-  GetPartnerHomeMoveResponseSchema, RetryPartnerHomeMoveResponseSchema, type PartnerHomeApi,
+  GetPartnerHomeMoveResponseSchema, RetryPartnerHomeMoveResponseSchema, PermissionMode, type PartnerHomeApi,
   type PartnerImportApi, type PartnerImportResult, type PartnerMemoryApi, type MemoryCatalog, type MemoryDetail } from "@joko/contracts";
 import { act, type JSX } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -293,6 +293,36 @@ describe("PartnersPage", () => {
       await vi.advanceTimersByTimeAsync(1200); await settle(); });
     expect(updatePartner).toHaveBeenCalledWith(current.id, 8n, expect.objectContaining({ description: "Updated introduction", identitySource: "You are Aster." }));
     expect(current.description).toBe("Updated introduction");
+  });
+
+  it("keeps the selected main computer model and permission across an ordinary controller update", async () => {
+    const selected = partner();
+    const targets = create(ListPartnerHomeTargetsResponseSchema, {
+      home: { identity: { authorityServerId: "original", partnerId: selected.id, generation: 1n }, serviceNode: true },
+      targets: [{ deviceName: "Laptop", destination: { location: { case: "peer", value: { targetDeviceId: "peer", routeGeneration: 1n } } } }]
+    });
+    const model = create(InspectPartnerHomeTargetResponseSchema, { models: [{ displayName: "Selected model",
+      route: { backendId: "pi", providerId: "provider", modelId: "model" }, permissionModes: [PermissionMode.ASK, PermissionMode.ACCEPT_EDITS] }] });
+    const list = vi.fn(async () => targets), inspect = vi.fn(async () => model), move = vi.fn(async () => create(MovePartnerHomeResponseSchema));
+    const view = await mount({ strict: true, partners: [selected], focusPartnerId: selected.id, controllerOverrides: {
+      partnerHomeApi: ownerKey => ({ ownerKey, list, inspect, move, status: vi.fn(), retry: vi.fn() })
+    } });
+    await act(async () => button(document.body, "partners.profileSettings").click());
+    await act(async () => button(document.body, "Main computer").click());
+    const form = required([...document.querySelectorAll<HTMLElement>('[role="dialog"]')].at(-1));
+    const choose = async (label: string, index: number) => {
+      const field = required([...form.querySelectorAll("label")].find(item => item.querySelector("span")?.textContent === label)?.querySelector("select"));
+      await act(async () => { field.selectedIndex = index; field.dispatchEvent(new Event("change", { bubbles: true })); });
+    };
+    await choose("Choose a new main computer", 1); await choose("Model on the new computer", 1); await choose("Permissions", 1);
+    const reads = list.mock.calls.length;
+    await act(async () => view.root.render(<StrictMode>{page({ ...view.app, state: { ...view.app.state } }, snapshot(), selected.id)}</StrictMode>));
+    expect(button(form, "Change main computer").disabled).toBe(false);
+    expect(list).toHaveBeenCalledTimes(reads);
+    expect(inspect).toHaveBeenCalledOnce();
+    await act(async () => button(form, "Change main computer").click());
+    expect(move).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ destination: targets.targets[0]!.destination,
+      capabilities: expect.objectContaining({ modelChain: [model.models[0]!.route], permissionMode: PermissionMode.ACCEPT_EDITS }) }), expect.any(AbortSignal));
   });
 
   it("adds, reorders and autosaves the fourth and fifth routes from profile settings and can remove the last backup", async () => {

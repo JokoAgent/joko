@@ -170,6 +170,9 @@ import { assertProvisionalSessionOwner, PROVISIONAL_SESSION_KEY, provisionalConf
 import { clearProviderRateLimit, recordProviderRateLimit } from "./provider-rate-limit.js";
 import type { CreateFreshReviewerInput, ReviewRuntimeDispatch, ReviewRuntimeOutcome } from "./review-coordinator.js";
 import type { ScheduleRunNotificationController } from "./schedule-run-notifications.js";
+import { advanceSessionLifecycleCleanup } from "./session-lifecycle-cleanup.js";
+import { isPartnerRoutineSchedule } from "./partner-routine-schedule.js";
+import { isSilentTaskRun } from "./session-task-activity.js";
 import {
   SCHEDULED_WORKTREE_OWNER_SETTING_KEY,
   type SessionWorktreeCoordinator
@@ -525,6 +528,18 @@ interface SessionResetPreparation {
 
 const PRIVATE_CREATION_RECEIPT_KEY = "private-session-creation.v1";
 interface PrivateCreationReceipt { readonly version: 1; readonly operationId: string; readonly phase: "prepared" | "creating" | "closed"; }
+
+const QUIET_SCHEDULE_ARCHIVE_SCOPE = "schedule.quiet-archive";
+interface QuietScheduleArchive {
+  readonly runId: string;
+  readonly scheduleId: string;
+  readonly sessionId: string;
+  readonly since: string;
+  readonly binding: string;
+  readonly targetRevision: string;
+  readonly scheduleRevision: string;
+  readonly decision: "agent" | "precheck";
+}
 
 interface ScheduledWorktreeOwner {
   readonly format: 1;
@@ -2342,12 +2357,12 @@ export class SessionHost {
   }
 
   /** Scheduler uses the ordinary archive boundary before hooks or native input. */
-  async restoreScheduledTarget(input: { readonly sessionId: string; readonly operationId: string; readonly assertCurrent: () => void }): Promise<void> {
+  async restoreScheduledTarget(input: { readonly sessionId: string; readonly operationId: string; readonly assertCurrent: () => void }): Promise<boolean> {
     this.#assertOpen(); input.assertCurrent();
-    await this.#withSessionRuntimeControlLock(input.sessionId, async () => {
+    return this.#withSessionRuntimeControlLock(input.sessionId, async () => {
       input.assertCurrent();
       const initial = this.#store.getSession(input.sessionId).descriptor;
-      if (!initial.archived && initial.worktree?.state !== "preserved") return;
+      if (!initial.archived && initial.worktree?.state !== "preserved") return false;
       const target = this.#store.getTarget(initial.targetId);
       const binding = operationBodyHash(initial.binding);
       const worktree = initial.worktree === undefined ? undefined : operationBodyHash({ ...initial.worktree, state: "active", updatedAt: 0 });
@@ -2376,16 +2391,17 @@ export class SessionHost {
       };
       if (initial.worktree?.state !== "preserved") {
         this.#store.runOperation({ id: input.operationId, kind: "restore_scheduled_target", body }, commit);
-        return;
+        return initial.archived;
       }
       check();
       if (!this.#worktrees) throw new StoreError("The scheduled workspace lifecycle is unavailable.");
       const claim = this.#store.claimDeferredEffectOperation<{ readonly sessionId: string }>({ id: input.operationId, kind: "restore_scheduled_target", body }, check);
-      if (!claim.claimed) { check(); return; }
+      if (!claim.claimed) { check(); return false; }
       // A started receipt is deliberately retained on failure. Recovery must
       // inspect the original worktree lease instead of repeating an unknown effect.
       await this.#worktrees.restore(input.sessionId, { assertCurrent: check });
       this.#store.completeDeferredEffectOperation(input.operationId, claim.operation.bodyHash, commit);
+      return initial.archived;
     });
   }
 
@@ -3265,11 +3281,83 @@ export class SessionHost {
     });
   }
 
-  /** Reclaims Scheduler-owned isolated workspaces only after their durable Run
-   * is terminal (or a pre-admission owner is no longer live). Calls coalesce so
-   * startup, scheduler ticks, and terminal callbacks cannot double-release. */
+  /** An occurrence can return only its own temporary or previously archived task to archive. */
+  trackQuietScheduleArchive(scheduleId: string, runId: string, sessionId: string, since: bigint, decision: QuietScheduleArchive["decision"]): void {
+    const session = this.#store.getSession(sessionId);
+    const schedule = this.#store.getSchedule(scheduleId);
+    if (!this.isOrdinarySession(session, false, true) || isPartnerRoutineSchedule(schedule)
+      || readPersonalDevelopmentPurpose(this.#store, sessionId) !== undefined || this.isReviewReadOnlySession(sessionId)
+      || this.#store.findCollaborationWorkerBySession(sessionId) !== undefined) return;
+    this.#store.setSetting("service", QUIET_SCHEDULE_ARCHIVE_SCOPE, stableId("quiet-archive", runId), {
+      sessionId, scheduleId, runId, decision, since: since.toString(),
+      binding: quietScheduleBinding(session.descriptor),
+      targetRevision: this.#store.getTarget(session.descriptor.targetId).revision.toString(),
+      scheduleRevision: schedule.revision.toString()
+    } satisfies QuietScheduleArchive);
+  }
+
+  ownsQuietScheduleArchive(operationId: string, sessionId: string): boolean {
+    const row = this.#store.findSetting<QuietScheduleArchive>("service", QUIET_SCHEDULE_ARCHIVE_SCOPE, operationId)?.value;
+    return row?.sessionId === sessionId && operationId === stableId("quiet-archive", row.runId);
+  }
+
+  private async reconcileQuietScheduleArchive(operationId: string): Promise<void> {
+    const store = this.#store;
+    const starting = store.findSetting<QuietScheduleArchive>("service", QUIET_SCHEDULE_ARCHIVE_SCOPE, operationId)?.value;
+    if (!starting) return;
+    const currentRun = store.findRun(starting.runId)?.descriptor;
+    if (currentRun && !["completed", "aborted", "failed"].includes(currentRun.state)) return;
+    if (!this.hasDurableSessionWork(starting.sessionId)) await this.#drainSettlements.get(starting.sessionId);
+    if (this.#disposed || this.#turnOverrideLeases.has(starting.runId)) return;
+    const cleanup = store.transaction(() => {
+      const candidate = store.findSetting<QuietScheduleArchive>("service", QUIET_SCHEDULE_ARCHIVE_SCOPE, operationId)?.value;
+      if (!candidate || operationId !== stableId("quiet-archive", candidate.runId)) return;
+      const { sessionId, scheduleId, runId } = candidate;
+      const pending = store.findSessionLifecycleCleanup(operationId);
+      if (pending?.sessionId === sessionId && pending.disposition === "archive") return pending;
+      const history = store.findScheduleRunByRunId(runId);
+      const run = store.findRun(runId)?.descriptor;
+      const session = store.findSession(sessionId);
+      const schedule = store.findSchedule(scheduleId);
+      const target = session && store.getTarget(session.descriptor.targetId);
+      const quiet = candidate.decision === "precheck"
+        ? history?.status === "skipped" && schedule?.sessionId === sessionId
+        : history?.status === "success" && history.sessionId === sessionId && run?.state === "completed" && isSilentTaskRun(store, sessionId, runId);
+      const eligible = quiet && history?.scheduleId === scheduleId && session && schedule && target
+        && schedule.revision.toString() === candidate.scheduleRevision && target.descriptor.trusted
+        && target.revision.toString() === candidate.targetRevision && this.isOrdinarySession(session, false, true)
+        && quietScheduleBinding(session.descriptor) === candidate.binding
+        && !session.descriptor.pinned && !session.descriptor.snooze && !this.isReviewReadOnlySession(sessionId)
+        && readPersonalDevelopmentPurpose(store, sessionId) === undefined && !store.findCollaborationWorkerBySession(sessionId)
+        && !store.findPendingSessionLifecycleCleanup(sessionId) && !store.findPendingScheduleDeletionCleanupForSession(sessionId)
+        && !this.#sessionLifecycleFences.has(sessionId) && this.canEnterSessionArchive(sessionId)
+        && !store.hasActiveSessionBackgroundTasks(sessionId) && !store.hasActivitySinceScheduleStart(sessionId, runId, BigInt(candidate.since));
+      // Once admitted, the ordinary task owns its checkout, including when it stays open.
+      const owner = scheduledWorktreeOwner(store.findSetting("service", sessionId, SCHEDULED_WORKTREE_OWNER_SETTING_KEY)?.value);
+      if (owner?.phase === "admitted" && owner.runId === runId && owner.scheduleId === scheduleId) {
+        store.deleteSetting("service", sessionId, SCHEDULED_WORKTREE_OWNER_SETTING_KEY);
+      }
+      if (!eligible) {
+        store.deleteSetting("service", QUIET_SCHEDULE_ARCHIVE_SCOPE, operationId);
+        return;
+      }
+      return store.prepareSessionLifecycleCleanup({ operationId, sessionId, disposition: "archive", releaseWorktree: session.descriptor.worktree !== undefined });
+    });
+    if (!cleanup) return;
+    await advanceSessionLifecycleCleanup({
+      store, sessionHost: this,
+      ...(this.#closeSessionTerminals ? { terminals: { closeSession: this.#closeSessionTerminals } } : {}),
+      ...(this.#worktrees ? { sessionWorktrees: this.#worktrees } : {})
+    }, cleanup);
+    store.transaction(() => {
+      store.finalizeSessionLifecycleCleanup({ operationId });
+      store.deleteSetting("service", QUIET_SCHEDULE_ARCHIVE_SCOPE, operationId);
+    });
+  }
+
+  /** Coalesce startup, scheduler tick and terminal callbacks before touching a host lease. */
   reconcileScheduledWorktrees(): Promise<void> {
-    if (this.#disposed || this.#worktrees === undefined) return Promise.resolve();
+    if (this.#disposed) return Promise.resolve();
     if (this.#scheduledWorktreeReconciliation !== undefined) return this.#scheduledWorktreeReconciliation;
     const task = this.reconcileScheduledWorktreesOnce()
       .finally(() => {
@@ -3282,6 +3370,11 @@ export class SessionHost {
   }
 
   private async reconcileScheduledWorktreesOnce(): Promise<void> {
+    for (const candidate of this.#store.listSettings("service", QUIET_SCHEDULE_ARCHIVE_SCOPE)) {
+      try { await this.reconcileQuietScheduleArchive(candidate.key); }
+      catch (error) { this.recordFailure("scheduled_quiet_archive", error); }
+    }
+    if (this.#worktrees === undefined) return;
     const owners = this.#store.listSettings("service")
       .filter((setting) => setting.key === SCHEDULED_WORKTREE_OWNER_SETTING_KEY)
       .map((setting) => ({ sessionId: setting.scopeId, owner: scheduledWorktreeOwner(setting.value) }))
@@ -3301,7 +3394,14 @@ export class SessionHost {
           }
           if (entry.owner.phase === "creating"
             && this.#store.findScheduleRuntimeOccurrence(entry.owner.runId) !== undefined) continue;
-          if (entry.owner.phase === "admitted" && this.hasDurableSessionWork(entry.sessionId)) continue;
+          if (this.ownsQuietScheduleArchive(stableId("quiet-archive", entry.owner.runId), entry.sessionId)
+            || this.hasDurableSessionWork(entry.sessionId)) continue;
+          // The Session has adopted the checkout. An interrupted creation or older
+          // admission has no confirmed quiet outcome and cannot close a visible task.
+          if (!session.descriptor.archived) {
+            this.#store.deleteSetting("service", entry.sessionId, SCHEDULED_WORKTREE_OWNER_SETTING_KEY);
+            continue;
+          }
         }
         await this.releaseScheduledWorktree(entry.sessionId, entry.owner, session);
       } catch (error) {
@@ -4284,6 +4384,7 @@ export class SessionHost {
     readonly boundBackendId?: string;
     readonly nextRunAt?: number;
     readonly pullRequestUrl?: string;
+    readonly quietArchiveSince?: bigint;
   }): OperationExecution<EnqueueResult> {
     const sessionId = input.sessionId;
     const session = this.#store.getSession(sessionId).descriptor;
@@ -4391,6 +4492,9 @@ export class SessionHost {
           input.scheduledAt
         );
         this.markScheduledWorktreeAdmitted(store, sessionId, input.schedule.id, runId);
+        if (input.quietArchiveSince !== undefined) {
+          this.trackQuietScheduleArchive(input.schedule.id, runId, sessionId, input.quietArchiveSince, "agent");
+        }
         if (validationFailure === undefined) store.wakeSessionAfterAcceptedInput(sessionId, input.scheduledAt);
         return { sessionId, runId, attemptId, queueItemId };
       }
@@ -21990,6 +22094,12 @@ function hasTurnOverrides(value: TurnExecutionOverrides | undefined): value is T
 }
 function hasTurnRouteOverrides(value: TurnExecutionOverrides | undefined): boolean {
   return value !== undefined && (value.providerId !== undefined || value.modelId !== undefined || value.effort !== undefined || value.fastMode !== undefined);
+}
+
+function quietScheduleBinding(session: StoredSession["descriptor"]): string {
+  // Resuming an archived task advances its runtime generation on the original native binding.
+  return operationBodyHash({ backendId: session.backendId, targetId: session.targetId, opaqueRef: session.binding.opaqueRef,
+    nativeSessionId: session.binding.nativeSessionId ?? null, leaseId: session.worktree?.leaseId ?? null });
 }
 
 function scheduledWorktreeOwner(value: unknown): ScheduledWorktreeOwner | undefined {

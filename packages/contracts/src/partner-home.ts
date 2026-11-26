@@ -1,4 +1,5 @@
-import type { MessageInitShape } from "@bufbuild/protobuf";
+import { toJsonString, type MessageInitShape } from "@bufbuild/protobuf";
+import { DevicePeerRouteIdentitySchema } from "./gen/joko/v1/device_peer_pb.js";
 import { MovePartnerHomeRequestSchema, type PartnerHomeDestination, type ListPartnerHomeTargetsResponse,
   type InspectPartnerHomeTargetResponse, type MovePartnerHomeResponse, type GetPartnerHomeMoveResponse,
   type RetryPartnerHomeMoveResponse } from "./gen/joko/v1/partner_home_pb.js";
@@ -21,7 +22,7 @@ export interface PartnerHomeApi {
 }
 export function partnerHomeDestinationKey(destination: PartnerHomeDestination | undefined): string | undefined {
   if (destination?.location.case === "serviceNode") return destination.location.value ? "service-node" : undefined;
-  if (destination?.location.case === "peer") { const route = destination.location.value; return `peer:${route.targetDeviceId}:${route.routeGeneration}`; }
+  if (destination?.location.case === "peer") return toJsonString(DevicePeerRouteIdentitySchema, destination.location.value);
   return undefined;
 }
 export function createPartnerHomeApi(options: { readonly ownerKey: string; readonly rpc: PartnerHomeRpc; readonly assertCurrent: () => void }): PartnerHomeApi {

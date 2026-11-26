@@ -17,6 +17,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
 import { ScheduleCoordinator } from "./schedule-coordinator.js";
+import { ScheduleRunNotificationController } from "./schedule-run-notifications.js";
 import {
   SCHEDULED_WORKTREE_OWNER_SETTING_KEY,
   type AcquireSessionWorktreeInput,
@@ -69,6 +70,79 @@ describe("scheduled isolated workspaces", () => {
     expect(fixture.store.getSession(first.sessionId!).descriptor).toMatchObject({ archived: false, worktree: { state: "active" } });
     expect(fixture.adapter.creationRoots).toHaveLength(1);
     expect(fixture.store.getSchedule(id).sessionId).toBe(first.sessionId);
+  });
+
+  it.each(["quiet", "notify", "pinned", "owner input", "failed"] as const)("settles a fresh workspace after %s", async outcome => {
+    const adapter = new GatedSendAdapter();
+    const fixture = await createFixture(adapter);
+    const scheduler = new ScheduleCoordinator(fixture.store, fixture.host);
+    fixture.store.upsertSchedule(worktreeSchedule("fresh-attention"));
+    const result = await scheduler.runNowWithResult("fresh-attention", "attention");
+    await adapter.entered;
+    const sessionId = result.sessionId!;
+    const session = fixture.store.getSession(sessionId);
+    if (outcome === "notify") fixture.notifications.notify({ sessionId, runId: result.runId, targetId: session.descriptor.targetId });
+    if (outcome === "pinned") fixture.store.updateSession(sessionId, { pinned: true }, session.revision);
+    if (outcome === "owner input") fixture.store.appendEvent({
+      sessionId, backendId: session.descriptor.backendId, targetId: session.descriptor.targetId,
+      generation: session.descriptor.binding.generation, traceId: "owner-input",
+      payload: { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "Keep this task open" }] }
+    });
+    if (outcome === "failed") adapter.injectFault(sessionId, "crash");
+    adapter.release();
+    await eventually(() => fixture.store.getRun(result.runId).descriptor.state === (outcome === "failed" ? "failed" : "completed"));
+    await fixture.host.reconcileScheduledWorktrees();
+    expect(fixture.store.getSession(sessionId).descriptor).toMatchObject({
+      archived: outcome === "quiet", worktree: { state: outcome === "quiet" ? "preserved" : "active" }
+    });
+    expect(ownerSettings(fixture.store)).toEqual([]);
+  });
+
+  it.each(["skipped", "aborted", "failed"] as const)("returns only a skipped precheck's restored target to archive (%s)", async status => {
+    const fixture = await createFixture();
+    const scheduler = new ScheduleCoordinator(fixture.store, fixture.host, {
+      executePreRunHook: async () => ({ status, decision: status === "skipped" ? "skip" : "block",
+        exitCode: status === "skipped" ? 2 : 1, durationMs: 1, stdout: "", stderr: "",
+        stdoutTruncated: false, stderrTruncated: false, timedOut: false, aborted: status === "aborted" })
+    });
+    const id = "restored-precheck";
+    fixture.store.upsertSchedule(worktreeSchedule(id, { sessionMode: "persistent",
+      executionSnapshot: withoutNewWorktree(worktreeSchedule(id).executionSnapshot, true) }));
+    const first = await scheduler.runNowWithResult(id, "create-persistent");
+    const sessionId = first.sessionId!;
+    await eventually(() => fixture.store.getRun(first.runId).descriptor.state === "completed");
+    await fixture.host.reconcileScheduledWorktrees();
+    expect(fixture.store.getSession(sessionId).descriptor.archived).toBe(false);
+    await fixture.host.closeIfActive(sessionId);
+    fixture.store.updateSession(sessionId, { archived: true }, fixture.store.getSession(sessionId).revision);
+    const schedule = fixture.store.getSchedule(id);
+    const execution = withoutNewWorktree(schedule.executionSnapshot);
+    fixture.store.upsertSchedule(worktreeSchedule(id, { sessionMode: "bound", sessionId, expectedRevision: schedule.revision,
+      executionSnapshot: { ...execution, scheduler: { ...(execution["scheduler"] as object), preRunHook: { command: "check", filePath: "" } } } }));
+    const checked = await scheduler.runNowWithResult(id, "bound-precheck");
+    expect(checked.status).toBe(status);
+    await fixture.host.reconcileScheduledWorktrees();
+    expect(fixture.store.getSession(sessionId).descriptor.archived).toBe(status === "skipped");
+    expect(fixture.store.listRuns({ sessionId })).toHaveLength(1);
+  });
+
+  it("re-archives a restored bound task after a quiet agent run on its original native binding", async () => {
+    const fixture = await createFixture(), scheduler = new ScheduleCoordinator(fixture.store, fixture.host), id = "restored-quiet";
+    fixture.store.upsertSchedule(worktreeSchedule(id));
+    const first = await scheduler.runNowWithResult(id, "create-quiet");
+    const sessionId = first.sessionId!;
+    await eventually(() => fixture.store.getRun(first.runId).descriptor.state === "completed");
+    await fixture.host.reconcileScheduledWorktrees();
+    const schedule = fixture.store.getSchedule(id);
+    fixture.store.upsertSchedule(worktreeSchedule(id, { sessionMode: "bound", sessionId, expectedRevision: schedule.revision,
+      executionSnapshot: withoutNewWorktree(schedule.executionSnapshot, true) }));
+    const second = await scheduler.runNowWithResult(id, "run-restored-quiet");
+    expect(second.sessionId).toBe(sessionId);
+    await eventually(() => fixture.store.getRun(second.runId).descriptor.state === "completed");
+    await fixture.host.reconcileScheduledWorktrees();
+    expect(fixture.worktrees.restores).toEqual([sessionId]);
+    expect(fixture.store.getSession(sessionId).descriptor).toMatchObject({ archived: true, worktree: { state: "preserved" } });
+    expect(fixture.adapter.creationRoots).toHaveLength(1);
   });
 
   it("keeps an unconfirmed worktree restore on its original operation and does not repeat it", async () => {
@@ -170,7 +244,7 @@ describe("scheduled isolated workspaces", () => {
   it("confirms interactive terminal cleanup before releasing a completed run worktree", async () => {
     const closeSessionTerminals = vi.fn(async (_sessionId: string) => undefined);
     const fixture = await createFixture(new CaptureCreateAdapter(), closeSessionTerminals);
-    const releaseWorktree = vi.spyOn(fixture.worktrees, "release");
+    const releaseWorktree = vi.spyOn(fixture.worktrees, "archive");
     const scheduler = new ScheduleCoordinator(fixture.store, fixture.host);
     fixture.store.upsertSchedule(worktreeSchedule("schedule-terminal-cleanup"));
 
@@ -181,6 +255,52 @@ describe("scheduled isolated workspaces", () => {
     expect(closeSessionTerminals).toHaveBeenCalledExactlyOnceWith(dispatched.sessionId);
     expect(releaseWorktree).toHaveBeenCalledExactlyOnceWith(dispatched.sessionId);
     expect(closeSessionTerminals.mock.invocationCallOrder[0]).toBeLessThan(releaseWorktree.mock.invocationCallOrder[0]!);
+  });
+
+  it("leaves an admitted fresh task and checkout open after an explicit schedule abort", async () => {
+    const adapter = new CaptureCreateAdapter();
+    // The Backend has accepted the turn and will finish only when the host sends Abort.
+    vi.spyOn(adapter, "send").mockResolvedValue(undefined);
+    const fixture = await createFixture(adapter);
+    const scheduler = new ScheduleCoordinator(fixture.store, fixture.host);
+    fixture.store.upsertSchedule(worktreeSchedule("abort-workspace"));
+    const result = await scheduler.runNowWithResult("abort-workspace", "abort-run");
+    const sessionId = result.sessionId!;
+    await eventually(() => fixture.store.findQueueItemByRunId(sessionId, result.runId)?.state === "backend_accepted");
+    await scheduler.abortSchedule("abort-workspace");
+    await eventually(() => fixture.store.getRun(result.runId).descriptor.state === "aborted");
+    await fixture.host.reconcileScheduledWorktrees();
+    expect(fixture.store.getSession(sessionId).descriptor).toMatchObject({ archived: false, worktree: { state: "active" } });
+    expect(ownerSettings(fixture.store)).toEqual([]);
+  });
+
+  it("resumes a claimed quiet archive after restart without repeating terminal shutdown", async () => {
+    const closeTerminals = vi.fn(async (_sessionId: string) => undefined);
+    const fixture = await createFixture(new CaptureCreateAdapter(), closeTerminals);
+    const archive = fixture.worktrees.archive.bind(fixture.worktrees);
+    let available = false;
+    vi.spyOn(fixture.worktrees, "archive").mockImplementation(async id => {
+      if (!available) throw new Error("Workspace archive unavailable");
+      await archive(id);
+    });
+    const scheduler = new ScheduleCoordinator(fixture.store, fixture.host);
+    fixture.store.upsertSchedule(worktreeSchedule("recover-archive"));
+    const result = await scheduler.runNowWithResult("recover-archive", "quiet-restart");
+    const sessionId = result.sessionId!;
+    await eventually(() => fixture.store.getRun(result.runId).descriptor.state === "completed");
+    await fixture.host.reconcileScheduledWorktrees();
+    expect(fixture.store.findPendingSessionLifecycleCleanup(sessionId)).toMatchObject({ closeCompleted: true, worktreeCompleted: false });
+    await fixture.host.dispose();
+    available = true;
+    const recovered = new SessionHost(fixture.store, fixture.artifacts, [new CaptureCreateAdapter()], {
+      worktrees: fixture.worktrees as unknown as SessionWorktreeCoordinator, closeSessionTerminals: closeTerminals
+    });
+    cleanups.push(() => recovered.dispose());
+    await recovered.initialize();
+    expect(fixture.store.getSession(sessionId).descriptor).toMatchObject({ archived: true, worktree: { state: "preserved" } });
+    expect(fixture.store.findPendingSessionLifecycleCleanup(sessionId)).toBeUndefined();
+    expect(closeTerminals).toHaveBeenCalledExactlyOnceWith(sessionId);
+    expect(fixture.store.listRuns({ sessionId })).toHaveLength(1);
   });
 
   it("compensates a failed native creation without leaving an owner marker or Session", async () => {
@@ -200,7 +320,7 @@ describe("scheduled isolated workspaces", () => {
     ]);
   });
 
-  it("reconciles a pre-admission owner after restart without clearing its preserved Session binding", async () => {
+  it("keeps the adopted workspace open after a restart before admission", async () => {
     const fixture = await createFixture();
     fixture.store.upsertSchedule(worktreeSchedule("schedule-restart"));
     const session = await fixture.host.createScheduledSession({
@@ -236,11 +356,11 @@ describe("scheduled isolated workspaces", () => {
     cleanups.push(() => restarted.dispose());
     await restarted.initialize();
 
-    expect(fixture.worktrees.releases).toEqual([sessionId]);
+    expect(fixture.worktrees.releases).toEqual([]);
     expect(ownerSettings(fixture.store)).toEqual([]);
     expect(fixture.store.getSession(sessionId).descriptor).toMatchObject({
-      archived: true,
-      worktree: { state: "preserved" }
+      archived: false,
+      worktree: { state: "active" }
     });
   });
 
@@ -311,7 +431,9 @@ async function createFixture(
   });
   await artifacts.initialize();
   const worktrees = new FakeSessionWorktrees(store, join(directory, "isolated"));
+  const notifications = new ScheduleRunNotificationController(store);
   const host = new SessionHost(store, artifacts, [adapter], {
+    scheduleRunNotifications: notifications,
     worktrees: worktrees as unknown as SessionWorktreeCoordinator,
     ...(closeSessionTerminals === undefined ? {} : { closeSessionTerminals })
   });
@@ -329,7 +451,7 @@ async function createFixture(
     store.close();
     rmSync(directory, { recursive: true, force: true });
   });
-  return { directory, store, artifacts, adapter, worktrees, host };
+  return { directory, store, artifacts, adapter, worktrees, host, notifications };
 }
 
 class FakeSessionWorktrees {
@@ -371,6 +493,10 @@ class FakeSessionWorktrees {
     if (binding === undefined) return target;
     if (binding.state !== "active") throw new Error("Preserved isolated workspace cannot be resumed.");
     return { ...target, workspaceRoot: binding.path };
+  }
+
+  async archive(sessionId: string): Promise<void> {
+    await this.release(sessionId);
   }
 
   async release(sessionId: string): Promise<void> {
@@ -453,7 +579,7 @@ function worktreeSchedule(
       refreshWorktreeRemote: true,
       scheduler: {
         format: 1,
-        silentWhenIdle: false,
+        silentWhenIdle: true,
         notify: { desktop: true },
         executionMode: "agent"
       }
@@ -469,8 +595,9 @@ function ownerSettings(store: OperationalStore) {
     .filter((setting) => setting.key === SCHEDULED_WORKTREE_OWNER_SETTING_KEY);
 }
 
-function withoutNewWorktree(value: unknown): Record<string, unknown> {
+function withoutNewWorktree(value: unknown, silentWhenIdle = false): Record<string, unknown> {
   const execution: Record<string, unknown> = { ...(value as Record<string, unknown>), useWorktree: false, refreshWorktreeRemote: false };
+  execution["scheduler"] = { ...(execution["scheduler"] as object), silentWhenIdle };
   delete execution["worktreeSourceRef"];
   return execution;
 }

@@ -57,6 +57,16 @@ describe("SchedulesPage Run now dispatch window", () => {
     expect(view.actions[0]?.outcome).toBe("pending");
     const firstRunId = runIdFromRequest(owner, 0);
 
+    const { state } = owner.controller;
+    await view.rerender({ ...owner, controller: { ...owner.controller,
+      state: { ...state, snapshot: { ...state.snapshot, revision: state.snapshot.revision + 1n } } } });
+    expect(view.rowRun("primary").disabled).toBe(true);
+    expect(view.detailRun().disabled).toBe(true);
+    await act(async () => view.detailRun().click());
+    expect(owner.runSchedule).toHaveBeenCalledTimes(1);
+    expect(owner.runRequests[0]?.state).toBe("pending");
+    expect(view.actions[0]?.outcome).toBe("pending");
+
     await pollRuntime(owner, runtime([
       runtimeRun("primary", "run-existing", "runNow", "finalizing"),
       runtimeRun("primary", "automatic-existing", "automatic", "recovering"),
@@ -308,7 +318,9 @@ function controllerFixture(ownerId: string): ControllerFixture {
       snapshot,
       preferences: { ...DEFAULT_UI_PREFERENCES, navigationOpen: true },
       route: { kind: "schedules" },
-      activeProfile: { id: ownerId }
+      connectionState: "connected",
+      connectionGeneration: 1,
+      activeProfile: { id: ownerId, serverId: "node", deviceId: "device", origin: "https://node.example" }
     },
     navigate: vi.fn(),
     getSchedulerRuntime,

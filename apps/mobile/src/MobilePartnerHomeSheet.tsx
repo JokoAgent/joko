@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Modal, Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { PartnerHomeBusyAction, PartnerHomeMovePhase, PermissionMode, partnerHomeMessages,
-  type ListPartnerHomeTargetsResponse, type PartnerHomeApi, type PartnerHomeMove, type PartnerHomeModelChoice } from "@joko/contracts";
+import { PartnerHomeBusyAction, PartnerHomeMovePhase, PermissionMode, partnerHomeDestinationKey, partnerHomeMessages,
+  type ListPartnerHomeTargetsResponse, type PartnerHomeApi, type PartnerHomeDestination, type PartnerHomeMove, type PartnerHomeModelChoice } from "@joko/contracts";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
 
 export function MobilePartnerHomeSheet({ api, partnerId, revision, inputHandoff = true, locale, colors, newRequestId, onClose, onChanged }: {
@@ -11,23 +11,29 @@ export function MobilePartnerHomeSheet({ api, partnerId, revision, inputHandoff 
   readonly colors: MobilePartnersColors; readonly newRequestId: () => string; readonly onClose: () => void; readonly onChanged: (sessionId: string) => void;
 }) {
   const text = partnerHomeMessages(locale), [catalog, setCatalog] = useState<ListPartnerHomeTargetsResponse>();
-  const [target, setTarget] = useState<number>(), [models, setModels] = useState<readonly PartnerHomeModelChoice[]>([]);
+  const [target, setTarget] = useState<PartnerHomeDestination>(), [models, setModels] = useState<readonly PartnerHomeModelChoice[]>([]);
   const [model, setModel] = useState<number>(), [query, setQuery] = useState("");
   const [permission, setPermission] = useState(PermissionMode.ASK), [plan, setPlan] = useState(false);
   const [busyAction, setBusyAction] = useState(PartnerHomeBusyAction.WAIT), [offline, setOffline] = useState(false);
-  const [move, setMove] = useState<PartnerHomeMove>(), [busy, setBusy] = useState(false), [error, setError] = useState(false);
+  const [move, setMove] = useState<PartnerHomeMove>(), [changing, setChanging] = useState(false), [error, setError] = useState(false);
+  const [inspecting, setInspecting] = useState(false), busy = changing || inspecting;
+  const [refresh, setRefresh] = useState(0);
   const alive = useRef(true), sent = useRef<string | undefined>(undefined), notified = useRef<string | undefined>(undefined);
   useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
   const load = async (signal: AbortSignal) => { const value = await api.list(partnerId, signal); if (!signal.aborted && alive.current) {
     setCatalog(value); if (value.pendingMove) setMove(value.pendingMove); setError(false);
+    setTarget(selected => {
+      const key = partnerHomeDestinationKey(selected);
+      return key && value.targets.some(item => partnerHomeDestinationKey(item.destination) === key) ? selected : undefined;
+    });
   } };
-  useEffect(() => { const request = new AbortController(); void load(request.signal).catch(() => { if (!request.signal.aborted) setError(true); }); return () => request.abort(); }, [api, partnerId]);
+  useEffect(() => { const request = new AbortController(); void load(request.signal).catch(() => { if (!request.signal.aborted) setError(true); }); return () => request.abort(); }, [api, partnerId, refresh]);
   useEffect(() => {
     setModels([]); setModel(undefined); setQuery(""); setPlan(false); setPermission(PermissionMode.ASK);
-    if (target === undefined || !catalog?.targets[target]?.destination) return;
-    const request = new AbortController(); setBusy(true); setError(false);
-    void api.inspect(partnerId, catalog.targets[target]!.destination!, request.signal).then(value => { if (!request.signal.aborted) setModels(value.models); })
-      .catch(() => { if (!request.signal.aborted) setError(true); }).finally(() => { if (!request.signal.aborted) setBusy(false); });
+    if (!target) { setInspecting(false); return; }
+    const request = new AbortController(); setInspecting(true); setError(false);
+    void api.inspect(partnerId, target, request.signal).then(value => { if (!request.signal.aborted) setModels(value.models); })
+      .catch(() => { if (!request.signal.aborted) setError(true); }).finally(() => { if (!request.signal.aborted) setInspecting(false); });
     return () => request.abort();
   }, [api, partnerId, target]);
   useEffect(() => {
@@ -42,17 +48,16 @@ export function MobilePartnerHomeSheet({ api, partnerId, revision, inputHandoff 
   } }, [move, onChanged]);
   const choice = model === undefined ? undefined : models[model];
   const running = !!move && move.phase !== PartnerHomeMovePhase.READY && move.phase !== PartnerHomeMovePhase.NEEDS_ATTENTION;
-  const action = (label: string, onPress: () => void, disabled = false, selected = false) => <Pressable key={label} accessibilityRole="button" accessibilityState={{ disabled, selected }} disabled={disabled} onPress={onPress}
+  const action = (label: string, onPress: () => void, disabled = false, selected = false, key = label) => <Pressable key={key} accessibilityRole="button" accessibilityState={{ disabled, selected }} disabled={disabled} onPress={onPress}
     style={{ minHeight: 44, borderWidth: 1, borderColor: selected ? colors.accent : colors.border, borderRadius: 10, padding: 12, opacity: disabled ? .5 : 1 }}><Text style={{ color: selected ? colors.accent : colors.ink }}>{label}</Text></Pressable>;
   const submit = async () => {
-    const destination = target === undefined ? undefined : catalog?.targets[target]?.destination;
-    if (!catalog?.home?.identity || !destination || !choice?.route || busy) return;
-    setBusy(true); setError(false);
+    if (!catalog?.home?.identity || !target || !choice?.route || busy) return;
+    setChanging(true); setError(false);
     try { const requestId = sent.current ?? newRequestId(); sent.current = requestId;
-      const value = await api.move({ requestId, expectedHome: catalog.home.identity, expectedPartnerRevision: { value: revision }, destination,
+      const value = await api.move({ requestId, expectedHome: catalog.home.identity, expectedPartnerRevision: { value: revision }, destination: target,
         capabilities: { modelChain: [choice.route], permissionMode: permission, planMode: plan, inputHandoff }, busyAction, continueWhenSourceOffline: offline }, new AbortController().signal);
       if (alive.current) { setMove(value.move); if (value.move) sent.current = undefined; }
-    } catch { if (alive.current) setError(true); } finally { if (alive.current) setBusy(false); }
+    } catch { if (alive.current) setError(true); } finally { if (alive.current) setChanging(false); }
   };
   return <Modal visible animationType="slide" onRequestClose={onClose}><SafeAreaView style={{ flex: 1, backgroundColor: colors.background }}>
     <View style={{ padding: 16, gap: 12 }}>{action(text.close, onClose)}<Text accessibilityRole="header" style={{ color: colors.ink, fontSize: 22, fontWeight: "600" }}>{text.title}</Text></View>
@@ -60,9 +65,14 @@ export function MobilePartnerHomeSheet({ api, partnerId, revision, inputHandoff 
       <Text style={{ color: colors.muted }}>{text.body}</Text>{catalog?.home && <Text style={{ color: colors.ink }}>{text.current}: {catalog.home.deviceName}</Text>}
       {busy && <ActivityIndicator color={colors.accent} />}
       {move && <><Text accessibilityRole="text" style={{ color: colors.ink }}>{move.phase === PartnerHomeMovePhase.READY ? text.ready : move.phase === PartnerHomeMovePhase.NEEDS_ATTENTION ? text.attention : text.running}</Text><Text style={{ color: colors.muted }}>{move.sourceDeviceName} → {move.targetDeviceName}</Text>
-        {move.phase === PartnerHomeMovePhase.NEEDS_ATTENTION && action(text.retry, () => { setBusy(true); setError(false); void api.retry(move.requestId, new AbortController().signal).then(value => { if (alive.current) setMove(value.move); }).catch(() => { if (alive.current) setError(true); }).finally(() => { if (alive.current) setBusy(false); }); }, busy)}</>}
+        {move.phase === PartnerHomeMovePhase.NEEDS_ATTENTION && action(text.retry, () => { setChanging(true); setError(false); void api.retry(move.requestId, new AbortController().signal).then(value => { if (alive.current) setMove(value.move); }).catch(() => { if (alive.current) setError(true); }).finally(() => { if (alive.current) setChanging(false); }); }, busy)}</>}
       {!running && !catalog?.home?.changing && move?.phase !== PartnerHomeMovePhase.READY && <>
-        <Text style={{ color: colors.ink }}>{text.choose}</Text>{catalog?.targets.map((item, index) => action(`${item.deviceName} · ${item.platform}`, () => { sent.current = undefined; setTarget(index); }, busy || (item.destination?.location.case === "serviceNode" ? catalog.home?.serviceNode === true : item.destination?.location.case === "peer" && item.destination.location.value.targetDeviceId === catalog.home?.deviceId), target === index))}
+        <Text style={{ color: colors.ink }}>{text.choose}</Text>{catalog?.targets.map(item => {
+          const key = partnerHomeDestinationKey(item.destination);
+          return key && action(`${item.deviceName} · ${item.platform}`, () => { sent.current = undefined; setTarget(item.destination); },
+            busy || (item.destination?.location.case === "serviceNode" ? catalog.home?.serviceNode === true : item.destination?.location.case === "peer" && item.destination.location.value.targetDeviceId === catalog.home?.deviceId),
+            key === partnerHomeDestinationKey(target), key);
+        })}
         {target !== undefined && !busy && !models.length && <Text style={{ color: colors.muted }}>{text.unavailable}</Text>}
         {!!models.length && <><Text style={{ color: colors.muted }}>{text.channel}</Text><Text style={{ color: colors.ink }}>{text.model}</Text>
           <TextInput accessibilityLabel={text.model} value={query} onChangeText={setQuery} style={{ minHeight: 44, color: colors.ink, borderColor: colors.border, borderWidth: 1, borderRadius: 10, padding: 10 }} />
@@ -73,10 +83,10 @@ export function MobilePartnerHomeSheet({ api, partnerId, revision, inputHandoff 
         {action(text.wait, () => { sent.current = undefined; setBusyAction(PartnerHomeBusyAction.WAIT); }, busy, busyAction === PartnerHomeBusyAction.WAIT)}
         {action(text.stop, () => { sent.current = undefined; setBusyAction(PartnerHomeBusyAction.STOP); }, busy, busyAction === PartnerHomeBusyAction.STOP)}
         {action(text.offline, () => { sent.current = undefined; setOffline(!offline); }, busy, offline)}
-        {action(text.change, () => void submit(), busy || !choice || !choice.permissionModes.includes(permission))}
+        {action(text.change, () => void submit(), busy || !target || !choice || !choice.permissionModes.includes(permission))}
       </>}
       {error && <Text accessibilityRole="alert" style={{ color: colors.negative }}>{text.error}</Text>}
-      {action(text.refresh, () => { void load(new AbortController().signal).catch(() => setError(true)); }, busy)}
+      {action(text.refresh, () => setRefresh(value => value + 1), busy)}
     </ScrollView>
   </SafeAreaView></Modal>;
 }

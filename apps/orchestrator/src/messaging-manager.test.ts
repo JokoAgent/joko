@@ -2787,9 +2787,12 @@ describe("MessagingManager", () => {
       expect(fixture.store.getMessagingInboundRequest(request.id).status).toBe("queued");
     };
     await enableTelegramReply(fixture, "scoped-images");
-    await vi.waitFor(() => expect(transport.sentAttachments).toEqual([
-      { address: expect.objectContaining({ providerConversationId: "42" }), fileNames: ["own.png"] }
-    ]));
+    await vi.waitFor(() => {
+      expect(fixture.store.listMessagingInboundRequests()[0]?.status).toBe("completed");
+      expect(transport.sentAttachments).toEqual([
+        { address: expect.objectContaining({ providerConversationId: "42" }), fileNames: ["own.png"] }
+      ]);
+    }, { timeout: 5_000 });
   });
 
   it("rechecks channel revocation after reading a generated image and does not send it on restart", async () => {

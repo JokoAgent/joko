@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { create } from "@bufbuild/protobuf";
+import { clone, create } from "@bufbuild/protobuf";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { ListPartnerHomeTargetsResponseSchema, InspectPartnerHomeTargetResponseSchema, MovePartnerHomeResponseSchema,
   GetPartnerHomeMoveResponseSchema, RetryPartnerHomeMoveResponseSchema, PartnerHomeMovePhase, PermissionMode,
@@ -16,7 +16,8 @@ function fixture(pending = false) {
   const api: PartnerHomeApi = { ownerKey: "node:partner", list: vi.fn(async () => create(ListPartnerHomeTargetsResponseSchema, {
     home: { identity: { authorityServerId: "node", partnerId: "partner", generation: 1n }, deviceId: "node", deviceName: "Original", serviceNode: true, available: true, changing: pending },
     targets: [{ destination: { location: { case: "serviceNode", value: true } }, deviceName: "Original", platform: "linux", available: true },
-      { destination: { location: { case: "peer", value: { targetDeviceId: "computer", routeGeneration: 1n } } }, deviceName: "Laptop", platform: "linux", available: true }],
+      { destination: { location: { case: "peer", value: { targetDeviceId: "computer", relationId: "relation", routeGeneration: 1n,
+        relationRevision: { value: 2n }, targetDeviceRevision: { value: 3n } } } }, deviceName: "Laptop", platform: "linux", available: true }],
     ...(pending ? { pendingMove: { ...receipt, phase: PartnerHomeMovePhase.NEEDS_ATTENTION } } : {}) })),
     inspect: vi.fn(async () => create(InspectPartnerHomeTargetResponseSchema, { models: [{ displayName: "Configured model", route: { backendId: "runtime", providerId: "configured", modelId: "model" },
       permissionModes: [PermissionMode.ASK, PermissionMode.ACCEPT_EDITS], canSetPlanMode: true }] })),
@@ -41,17 +42,38 @@ it("does not substitute a reconnected target for an expired route chosen in the 
   await mount(f, true, { ...destination, location: { case: "peer", value: { ...peer!, routeGeneration: 2n } } });
   expect(f.api.inspect).not.toHaveBeenCalled(); expect(f.api.move).not.toHaveBeenCalled(); expect(document.body.textContent).toContain(text.error);
 });
+it("tracks the selected computer across list reordering and clears it when its relation changes", async () => {
+  const f = fixture(), catalog = await f.api.list("partner", new AbortController().signal);
+  const laptop = catalog.targets[1]!;
+  await mount(f); await select(text.choose, "Laptop · linux"); await select(text.model, "0");
+  vi.mocked(f.api.list).mockResolvedValueOnce({ ...catalog, targets: [laptop, catalog.targets[0]!] });
+  await click(text.refresh);
+  const chosen = () => document.querySelector("select")!.selectedOptions[0]?.textContent;
+  expect(chosen()).toBe("Laptop · linux");
+  expect(f.api.inspect).toHaveBeenLastCalledWith("partner", laptop.destination, expect.any(AbortSignal));
+  const inspections = vi.mocked(f.api.inspect).mock.calls.length;
+  const replacement = clone(ListPartnerHomeTargetsResponseSchema, catalog);
+  const peer = replacement.targets[1]!.destination!.location;
+  if (peer.case !== "peer" || !peer.value.relationRevision) throw new Error("Missing peer relation fixture.");
+  peer.value.relationRevision.value++;
+  vi.mocked(f.api.list).mockResolvedValueOnce(replacement);
+  await click(text.refresh);
+  expect(chosen()).toBe("—");
+  expect(f.api.inspect).toHaveBeenCalledTimes(inspections);
+  expect([...document.querySelectorAll("button")].find(button => button.textContent === text.change)?.disabled).toBe(true);
+  expect(f.api.move).not.toHaveBeenCalled();
+});
 async function select(label: string, value: string) {
   const field = [...document.querySelectorAll("label")].find(item => item.textContent?.startsWith(label))?.querySelector("select");
   if (!field) throw new Error(`Missing select: ${label}`);
-  await act(async () => { field.value = value; field.dispatchEvent(new Event("change", { bubbles: true })); });
+  await act(async () => { field.value = [...field.options].find(option => option.textContent === value)?.value ?? value; field.dispatchEvent(new Event("change", { bubbles: true })); });
 }
 async function click(label: string) {
   const button = [...document.querySelectorAll("button")].find(item => item.textContent === label);
   if (!button) throw new Error(`Missing action: ${label}`); await act(async () => { button.click(); });
 }
 it("requires an actual target model and sends explicit permissions and busy policy before following the new canonical Session", async () => {
-  const f = fixture(); await mount(f, false); await select(text.choose, "1");
+  const f = fixture(); await mount(f, false); await select(text.choose, "Laptop · linux");
   expect(f.api.inspect).toHaveBeenCalledWith("partner", expect.objectContaining({ location: expect.objectContaining({ case: "peer" }) }), expect.any(AbortSignal));
   const action = [...document.querySelectorAll("button")].find(item => item.textContent === text.change)!;
   expect(action.disabled).toBe(true); await select(text.model, "0"); await select(text.permissions, String(PermissionMode.ACCEPT_EDITS));

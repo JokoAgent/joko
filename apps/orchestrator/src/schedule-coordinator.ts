@@ -642,6 +642,7 @@ export class ScheduleCoordinator {
     const operationId = options.operationId ?? occurrenceOperationId(schedule.id, scheduledAt);
     const now = this.#now();
     const runId = scheduledRunId(operationId);
+    const quietArchiveSince = this.#store.readRevision();
     this.#recovery.transition(runId, "claiming");
     const misfired = options.ignoreMisfire !== true && now - scheduledAt > this.#misfireGraceMs;
     let extension: ReturnType<typeof scheduleExtensionSnapshot>;
@@ -744,6 +745,7 @@ export class ScheduleCoordinator {
         detail: { reason: "Script Schedules require a project on this node.", costAttribution: "zero" } });
       return { runId, status: "failed" };
     }
+    let restoredArchivedTarget = false;
     if (schedule.sessionMode !== "fresh" && schedule.sessionId !== undefined) {
       const session = this.#store.findSession(schedule.sessionId);
       if (options.source === "automatic" && schedule.enabled && schedule.kind === "interval"
@@ -762,7 +764,7 @@ export class ScheduleCoordinator {
       }
       if (session && session.descriptor.deletedAt === undefined
         && (session.descriptor.archived || session.descriptor.worktree?.state === "preserved")) {
-        await this.#host.restoreScheduledTarget({ sessionId: session.descriptor.id, operationId: `${operationId}-restore`, assertCurrent: () => {
+        restoredArchivedTarget = await this.#host.restoreScheduledTarget({ sessionId: session.descriptor.id, operationId: `${operationId}-restore`, assertCurrent: () => {
           signal.throwIfAborted();
           subscription?.assertCurrent();
           const current = this.#store.findSchedule(schedule.id);
@@ -808,6 +810,8 @@ export class ScheduleCoordinator {
           scheduledAt,
           ...(nextRunAt === undefined ? {} : { nextRunAt }),
           status,
+          ...(status === "skipped" && restoredArchivedTarget && current.sessionId !== undefined
+            ? { quietArchive: { sessionId: current.sessionId, since: quietArchiveSince } } : {}),
           detail: preRun.detail
         });
         return { runId, status };
@@ -908,6 +912,8 @@ export class ScheduleCoordinator {
       schedule,
       sessionId,
       scheduledAt,
+      ...(restoredArchivedTarget || (schedule.sessionMode === "fresh" && currentSession.automationOrigin?.runId === runId
+        && currentSession.automationOrigin.scheduleId === schedule.id) ? { quietArchiveSince } : {}),
       ...(boundBackendId === undefined ? {} : { boundBackendId }),
       ...(options.pullRequestUrl === undefined ? {} : { pullRequestUrl: options.pullRequestUrl }),
       // The admitted Run consumes a one-shot, even when Run Now fired it early.
@@ -996,6 +1002,7 @@ export class ScheduleCoordinator {
     readonly nextRunAt?: number;
     readonly intervalFromFinish?: boolean;
     readonly pauseSchedule?: boolean;
+    readonly quietArchive?: { readonly sessionId: string; readonly since: bigint };
     readonly status: "skipped" | "failed" | "aborted" | "interrupted";
     readonly detail: unknown;
   }): void {
@@ -1025,6 +1032,9 @@ export class ScheduleCoordinator {
           status: input.status,
           detail: pullRequestUrl === undefined ? input.detail : { ...(isRecord(input.detail) ? input.detail : {}), pullRequestUrl }
         });
+        if (input.quietArchive !== undefined) {
+          this.#host.trackQuietScheduleArchive(input.schedule.id, input.runId, input.quietArchive.sessionId, input.quietArchive.since, "precheck");
+        }
         return { runId: input.runId, status: input.status };
       }
     );

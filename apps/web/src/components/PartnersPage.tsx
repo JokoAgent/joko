@@ -729,7 +729,7 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
   const [connectionsVisible, setConnectionsVisible] = useState(false);
   const [restartVisible, setRestartVisible] = useState(false);
   const [homeVisible, setHomeVisible] = useState(initialHomeDestination !== undefined);
-  const homeApi = useMemo(() => controller.partnerHomeApi(ownerKey), [controller, ownerKey]);
+  const homeApi = useMemo(() => controller.partnerHomeApi(ownerKey), [ownerKey, controller.state.connectionGeneration, controller.state.activeProfile?.deviceId]);
   const [restartBusy, setRestartBusy] = useState(false);
   const [resumeVisible, setResumeVisible] = useState(false);
   const [resumeBusy, setResumeBusy] = useState(false);

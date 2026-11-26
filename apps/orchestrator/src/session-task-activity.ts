@@ -11,6 +11,11 @@ const KEY = "task.activity";
 interface NotificationOwner { readonly runId: string; readonly completionNotification?: SessionTaskActivityProjection["completionNotification"]; readonly silent?: boolean; }
 
 /** Typed durable ownership is joined only to its exact current Run. */
+export function isSilentTaskRun(store: OperationalStore, sessionId: string, runId: string): boolean {
+  const owner = store.findSetting<NotificationOwner>("session", sessionId, KEY)?.value;
+  return owner?.runId === runId && owner.silent === true;
+}
+
 export function persistSessionTaskActivity(store: OperationalStore, sessionId: string, patch: NotificationOwner): void {
   let session: StoredSession;
   try { session = store.getSession(sessionId); } catch (error) { if (error instanceof NotFoundError) return; throw error; }

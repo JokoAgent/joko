@@ -13,6 +13,9 @@ import { REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID, RealPiSystemFixture } from "./re
 const browserPath = process.env.JOKO_BROWSER_EXECUTABLE?.trim();
 const webDirectory = process.env.JOKO_MOUNTED_WEB_DIR?.trim();
 const mountedIt = browserPath && webDirectory ? it : it.skip;
+// A saved occurrence still has to dispatch through the cold native Pi runtime.
+const scheduledRunTimeoutMs = 30_000;
+const terminalRunStates = new Set<RunState>([RunState.SUCCEEDED, RunState.FAILED, RunState.ABORTED, RunState.CANCELLED]);
 
 mountedIt("recovers the failed Pi input's original Provider from a cold receipt and honors an edited schedule model", { timeout: 120_000 }, async () => {
   const rootDirectory = await mkdtemp(join(tmpdir(), "joko-quota-recovery-"));
@@ -243,21 +246,22 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
       clockOffset = schedule.triggerAt - realNow();
       if (index === 1) {
         const waiting = await waitFor(() => service.scheduler.listScheduleRunHistory({ scheduleId: saved.scheduleId }),
-          result => result.history.length === 1, "the second saved occurrence while the original model is being restored");
+          result => result.history.length === 1, "the second saved occurrence while the original model is being restored",
+          scheduledRunTimeoutMs);
         const waitingItem = restartedStore.findQueueItemByRunId(sessionId, waiting.history[0]!.runId);
         expect(waitingItem?.state).toBe("accepted");
         expect(fixture.providerRequests.map(({ body }) => body["model"])).toEqual([REAL_PI_MODEL_ID]);
         releaseScheduledRestore();
       }
       const history = await waitFor(() => service.scheduler.listScheduleRunHistory({ scheduleId: saved.scheduleId }),
-        result => result.history[0]?.state === RunState.SUCCEEDED || result.history[0]?.state === RunState.FAILED,
-        "the saved recovery occurrence");
+        result => result.history.some(run => terminalRunStates.has(run.state)),
+        "the saved recovery occurrence", scheduledRunTimeoutMs);
       expect(history.history).toHaveLength(1);
       expect(history.history[0]).toMatchObject({ state: RunState.SUCCEEDED });
       const item = restartedStore.findQueueItemByRunId(sessionId, history.history[0]!.runId);
       expect(item?.executionOverrides).toMatchObject({ providerId: schedule.providerId, modelId: schedule.modelId });
       if (index === 0) await waitFor(async () => restoringScheduleRun,
-        observed => observed === history.history[0]!.runId, "restoration of the first scheduled model");
+        observed => observed === history.history[0]!.runId, "restoration of the first scheduled model", scheduledRunTimeoutMs);
     }
     expect(fixture.providerRequests.map(({ body }) => body["model"])).toEqual([REAL_PI_MODEL_ID, defaultModelId]);
   } catch (error) {
