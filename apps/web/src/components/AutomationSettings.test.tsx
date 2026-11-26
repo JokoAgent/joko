@@ -237,6 +237,29 @@ describe("AutomationSettings", () => {
     expect(controller.requestComputerAutomationPermission).not.toHaveBeenCalled();
   });
 
+  it("keeps the opening pane and active grant through ordinary snapshots, then cleans up the original target", async () => {
+    const value = snapshot(), base = controllerFixture();
+    const controller = { ...base, state: { ...base.state, snapshot: value, connectionGeneration: 1,
+      activeProfile: { id: "profile", serverId: "server", deviceId: "device", origin: "https://example.test" } as NonNullable<AppController["state"]["activeProfile"]> } };
+    let finishOpening!: () => void, finishGrant!: () => void;
+    controller.openComputerAutomationPermissionSettings = vi.fn(() => new Promise<void>(resolve => { finishOpening = resolve; }));
+    controller.requestComputerAutomationPermission = vi.fn(() => new Promise<void>(resolve => { finishGrant = resolve; }));
+    const container = await render(controller, value), root = roots.at(-1)!;
+    const refresh = (generation: number) => {
+      const next = { ...controller, state: { ...controller.state, snapshot: { ...value }, connectionGeneration: generation } };
+      return renderSettings(root, next, next.state.snapshot);
+    };
+    await act(async () => required(container.querySelector<HTMLButtonElement>('[data-automation-permission="accessibility"]')).click());
+    await refresh(1);
+    await act(async () => finishOpening());
+    expect(controller.requestComputerAutomationPermission).toHaveBeenCalledExactlyOnceWith("accessibility");
+    await refresh(1);
+    expect(controller.cancelComputerAutomationPermission).not.toHaveBeenCalled();
+    await refresh(2);
+    expect(controller.cancelComputerAutomationPermission).toHaveBeenCalledOnce();
+    await act(async () => finishGrant());
+  });
+
   it("routes first enable through the mutation that installs a missing computer driver", async () => {
     const controller = controllerFixture();
     const container = await render(controller, snapshot({ installed: false, computerEnabled: false }));
@@ -512,6 +535,11 @@ async function render(controller: AppController, value: AppSnapshot): Promise<HT
   document.body.append(container);
   const root = createRoot(container);
   roots.push(root);
+  await renderSettings(root, controller, value);
+  return container;
+}
+
+async function renderSettings(root: Root, controller: AppController, value: AppSnapshot): Promise<void> {
   await act(async () => root.render(
     <AutomationSettings
       controller={controller}
@@ -521,7 +549,6 @@ async function render(controller: AppController, value: AppSnapshot): Promise<HT
       t={(key, values) => translate("en", key, values)}
     />
   ));
-  return container;
 }
 
 function snapshot(overrides: {

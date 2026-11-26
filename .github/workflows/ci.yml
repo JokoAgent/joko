@@ -275,7 +275,7 @@ jobs:
             printf 'https://mirror.math.princeton.edu/pub/ubuntu/\tpriority:0\n' | sudo tee -a /etc/apt/apt-mirrors.txt
             sudo apt-get "${apt_sources[@]}" update --error-on=any
           fi
-          sudo apt-get "${apt_sources[@]}" install --no-install-recommends --yes build-essential pkg-config libxcb1-dev libxcb-res0-dev libxcb-xkb-dev libwayland-dev libwayland-bin libxkbcommon-dev libjson-c-dev libturbojpeg0-dev libpng-dev ripgrep xauth xvfb openbox x11-utils apparmor
+          sudo apt-get "${apt_sources[@]}" install --no-install-recommends --yes build-essential pkg-config libxcb1-dev libxcb-res0-dev libxcb-xkb-dev libwayland-dev libwayland-bin libxkbcommon-dev libjson-c-dev libturbojpeg0-dev libpng-dev libx11-dev libxtst-dev ripgrep xauth xvfb openbox x11-utils apparmor
 
       - name: Install Windows test dependencies
         if: runner.os == 'Windows'
@@ -865,6 +865,15 @@ jobs:
           fi 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/packaged-desktop-regressions.log"
         env:
           JOKO_DOCUMENT_VISUAL_CAPTURE_DIR: ${{ runner.temp }}/joko-web-evidence/packaged-desktop/documents
+
+      - name: Verify packaged X11 remote input against a private X server
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_package.outcome == 'success' && runner.os == 'Linux' }}
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          mapfile -t binaries < <(find apps/desktop/release -type f -path '*/resources/native-remote-desktop/joko-linux-remote-desktop-input')
+          test "${#binaries[@]}" -eq 1
+          python3 apps/desktop/native/remote-desktop/linux-input/x11-test.py "${binaries[0]}" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-x11-input.log"
 
       - name: Upload packaged Desktop regression evidence
         if: ${{ matrix.workload == 'product' && always() && (steps.packaged_regressions.outcome == 'success' || steps.packaged_regressions.outcome == 'failure') }}

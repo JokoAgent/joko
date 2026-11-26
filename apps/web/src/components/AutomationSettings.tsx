@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type { JSX } from "react";
 import {
   AlertTriangle,
@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 
 import type { AppController } from "../controller.js";
+import { authenticatedConnectionKey } from "../connection-owner.js";
 import type {
   AppSnapshot,
   AndroidAdbPathSourceView,
@@ -124,6 +125,7 @@ export function AutomationSettings({ controller, snapshot, activeTargetId, t, ru
       <div className="automation-divider" aria-hidden="true" />
 
       <ComputerAutomationCard
+        key={authenticatedConnectionKey(controller.state)}
         controller={controller}
         settings={snapshot.settings.computerAutomation}
         runAction={runAction}
@@ -432,7 +434,7 @@ function ComputerAutomationCard({ controller, settings, runAction, onSuccess, t 
   const [driverUpdatePending, setDriverUpdatePending] = useState(false);
   const [activity, setActivity] = useState<"idle" | "checking" | "installing" | "authorizing" | "updating">("idle");
   const joinedUpdate = useRef(false);
-  const permissionGrantActive = useRef(false);
+  const cancelPermissionGrant = useRef<(() => Promise<void>) | undefined>(undefined);
   const permissionFlowGeneration = useRef(0);
   const supported = settings.support === "supported";
   const checking = settings.runtimeState === "checking" || pending;
@@ -445,14 +447,14 @@ function ComputerAutomationCard({ controller, settings, runAction, onSuccess, t 
   const screenRecordingPending = activity === "authorizing" && accessibilityReady && !screenRecordingReady;
 
   useEffect(() => {
-    if (accessibilityReady && screenRecordingReady) permissionGrantActive.current = false;
+    if (accessibilityReady && screenRecordingReady) cancelPermissionGrant.current = undefined;
   }, [accessibilityReady, screenRecordingReady]);
-  useEffect(() => () => {
+  useLayoutEffect(() => () => {
     permissionFlowGeneration.current += 1;
-    if (!permissionGrantActive.current) return;
-    permissionGrantActive.current = false;
-    void controller.cancelComputerAutomationPermission().catch(() => undefined);
-  }, [controller]);
+    const cancel = cancelPermissionGrant.current;
+    cancelPermissionGrant.current = undefined;
+    void cancel?.().catch(() => undefined);
+  }, [isMac, supported, settings.installed, settings.enabled]);
 
   const runComputerAction = (
     key: string,
@@ -486,12 +488,12 @@ function ComputerAutomationCard({ controller, settings, runAction, onSuccess, t 
     const generation = ++permissionFlowGeneration.current;
     await controller.openComputerAutomationPermissionSettings(permission);
     if (granted || permissionFlowGeneration.current !== generation) return;
-    permissionGrantActive.current = true;
+    cancelPermissionGrant.current = () => controller.cancelComputerAutomationPermission();
     try {
       await controller.requestComputerAutomationPermission(permission);
     } catch (error) {
       if (permissionFlowGeneration.current === generation) {
-        permissionGrantActive.current = false;
+        cancelPermissionGrant.current = undefined;
         await controller.cancelComputerAutomationPermission().catch(() => undefined);
       }
       throw error;
@@ -521,9 +523,10 @@ function ComputerAutomationCard({ controller, settings, runAction, onSuccess, t 
               "enabled",
               async () => {
                 if (!enabled) permissionFlowGeneration.current += 1;
-                if (!enabled && permissionGrantActive.current) {
-                  permissionGrantActive.current = false;
-                  await controller.cancelComputerAutomationPermission();
+                if (!enabled && cancelPermissionGrant.current) {
+                  const cancel = cancelPermissionGrant.current;
+                  cancelPermissionGrant.current = undefined;
+                  await cancel();
                 }
                 await controller.updateComputerAutomationSettings(enabled);
               },
