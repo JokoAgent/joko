@@ -154,7 +154,7 @@ it("runs a durable two-Device project through public Connect and the shared Node
     expect((await controller.clients.target.listTargets({})).targets).toHaveLength(targetsBefore);
     expect(product.application.workspaces.listRegistrations()).toHaveLength(workspacesBefore);
 
-    const createdTargets = new Map<string, { targetId: string; workspaceId: string }>();
+    const createdTargets = new Map<string, { targetId: string; workspaceId: string; operationId: string; requestHash: string }>();
     for (const [index, backendId] of BACKEND_IDS.entries()) {
       const mutation = createPeerTargetMutation(
         backendId,
@@ -183,7 +183,8 @@ it("runs a durable two-Device project through public Connect and the shared Node
           workspaceRootDisplay: await realpath(createdProject)
         }
       });
-      createdTargets.set(backendId, { targetId: value.targetId, workspaceId: value.workspaceId });
+      createdTargets.set(backendId, { targetId: value.targetId, workspaceId: value.workspaceId,
+        operationId: operation.operationId, requestHash: operation.requestSha256Hex });
       expect(product.application.store.getTarget(value.targetId).descriptor.remoteWorkspace).toEqual({
         kind: "device_peer",
         controllerDeviceId: controller.deviceId,
@@ -447,6 +448,24 @@ it("runs a durable two-Device project through public Connect and the shared Node
       relationRevision: rotatedRoute.relationRevision
     });
     expect(restartedRoute.routeGeneration).not.toBe(rotatedRoute.routeGeneration);
+    const stored = (await restartedController.clients.operation.getOperation({ operationId: piTarget.operationId })).operation;
+    const storedPayload = stored?.mutation?.payload;
+    if (storedPayload?.case !== "createDevicePeerTarget") throw new Error("Missing persisted device project request.");
+    expect(storedPayload.value).toMatchObject({ backendId: "pi", displayName: "Peer pi project", workspacePath: createdProject, createIfMissing: true });
+    expect(storedPayload.value.peer).toBeUndefined();
+    const registrations = product.application.workspaces.listRegistrations().length;
+    const creations = agent.observation().inbound.filter(frame => frame === "command:createDirectory").length;
+    const replay = await submit(restartedController.clients.operation, controller.connectionId,
+      createPeerTargetMutation("pi", "Peer pi project", restartedRoute, createdProject, true), piTarget.operationId);
+    expect(piTarget.requestHash).toMatch(/^[a-f0-9]{64}$/u);
+    for (const receipt of [stored, replay]) {
+      expect(receipt).toMatchObject({ operationId: piTarget.operationId, connectionId: controller.connectionId,
+        requestSha256Hex: piTarget.requestHash, state: OperationState.SUCCEEDED,
+        result: { payload: { case: "target", value: { targetId: piTarget.targetId, workspaceId: piTarget.workspaceId } } } });
+    }
+    expect(replay.mutation?.payload).toMatchObject({ case: "createDevicePeerTarget", value: { peer: restartedRoute } });
+    expect(product.application.workspaces.listRegistrations()).toHaveLength(registrations);
+    expect(agent.observation().inbound.filter(frame => frame === "command:createDirectory")).toHaveLength(creations);
     await expect(restartedController.clients.devicePeer.inspectDevicePeerDirectory({
       peer: rotatedRoute,
       path: createdProject

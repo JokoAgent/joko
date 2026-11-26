@@ -120,6 +120,31 @@ describe("typed compact Session result", () => {
     gateway.disconnect();
   });
 
+  it("retires an open operation watch with its connection before reconciliation", async () => {
+    let open!: (signal: AbortSignal) => void;
+    let finish!: () => void;
+    const opened = new Promise<AbortSignal>(resolve => { open = resolve; });
+    const closed = new Promise<void>(resolve => { finish = resolve; });
+    const transport = compactTransport({
+      outcome: CompactSessionOutcome.COMPACTED, payloads: [], submitState: OperationState.RUNNING,
+      reconciledState: OperationState.SUCCEEDED,
+      watch: async function* (signal) { open(signal); await closed; }
+    });
+    const gateway = createOrchestratorGateway(
+      { id: "connection-compact", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example", serverId: "server-test" },
+      "secret", {}, () => transport
+    );
+    await gateway.connect();
+    const result = gateway.compact("session-1");
+    const signal = await opened;
+    gateway.disconnect();
+    const rejected = expect(result).rejects.toThrow();
+    finish();
+    await rejected;
+    expect(signal.aborted).toBe(true);
+    expect(vi.mocked(transport.unary).mock.calls.some(([method]) => method.localName === "getOperation")).toBe(false);
+  });
+
   it("does not parse a non-terminal result after WatchOperation closes", async () => {
     const gateway = createOrchestratorGateway(
       { id: "connection-compact", deviceId: "device-test", name: "Browser", origin: "https://orchestrator.example" , serverId: "server-test" },
@@ -144,6 +169,7 @@ interface CompactTransportOptions {
   readonly resultKind?: "typed" | "acknowledgement" | "missing";
   readonly submitState?: OperationState;
   readonly watchTerminal?: boolean;
+  readonly watch?: (signal: AbortSignal) => AsyncIterable<unknown>;
   readonly reconciledState?: OperationState;
 }
 
@@ -185,12 +211,12 @@ function compactTransport(options: CompactTransportOptions): Transport {
       }
       throw new Error(`Unexpected method: ${method.localName}`);
     }),
-    stream: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => response(
+    stream: vi.fn(async (method: any, signal: AbortSignal, _timeout: unknown, _headers: unknown, input: any) => response(
       method,
       method.localName === "watchOperation"
-        ? options.watchTerminal === true
+        ? options.watch?.(signal) ?? (options.watchTerminal === true
           ? terminalStream(input.operationId, resultKind, options.outcome)
-          : emptyStream()
+          : emptyStream())
         : idleStream(),
       true
     ))

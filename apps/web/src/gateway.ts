@@ -12429,9 +12429,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }
     await observeReceipt?.(operationId, operation);
     if (waitForTerminal && !TERMINAL_OPERATION_STATES.has(operation.state)) {
-      const timeout = AbortSignal.timeout(OPERATION_TERMINAL_WAIT_TIMEOUT_MS);
+      const owned = combinedAbortSignal(signal, AbortSignal.timeout(OPERATION_TERMINAL_WAIT_TIMEOUT_MS))!;
       if (this.#taskSharing !== undefined) {
-        const owned = combinedAbortSignal(signal, timeout)!;
         while (!TERMINAL_OPERATION_STATES.has(operation.state)) {
           await abortableDelay(350, owned);
           const update = await client.getOperation({ operationId }, { signal: owned });
@@ -12441,16 +12440,16 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       } else for await (const update of client.watchOperation({
         operationId,
         afterRevision: operation.version?.revision
-      }, { signal: combinedAbortSignal(callerSignal, timeout) })) {
-        callerSignal?.throwIfAborted();
+      }, { signal: owned })) {
+        owned.throwIfAborted();
         if (update.operation === undefined) continue;
         operation = update.operation;
         if (TERMINAL_OPERATION_STATES.has(operation.state)) break;
       }
+      owned.throwIfAborted();
       if (!TERMINAL_OPERATION_STATES.has(operation.state)) {
-        callerSignal?.throwIfAborted();
-        const reconciled = await client.getOperation({ operationId }, options);
-        callerSignal?.throwIfAborted();
+        const reconciled = await client.getOperation({ operationId }, { ...options, signal: owned });
+        owned.throwIfAborted();
         if (reconciled.operation !== undefined) operation = reconciled.operation;
       }
       if (!TERMINAL_OPERATION_STATES.has(operation.state)) {

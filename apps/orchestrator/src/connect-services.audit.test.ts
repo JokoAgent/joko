@@ -3162,7 +3162,7 @@ describe("Connect security and protocol audit", () => {
     revokeOnParentRead = false; revoked = false;
     await expect(submit(true, 8n)).rejects.toMatchObject({ code: Code.Aborted });
     expect(files.mkdir).not.toHaveBeenCalled();
-    const first = await submit(true) as contract.SubmitOperationResponse;
+    await submit(true);
     expect(files.mkdir).toHaveBeenCalledOnce();
     expect(validateTarget).toHaveBeenCalledWith(expect.objectContaining({ remoteWorkspace: {
       kind: "ssh", hostTargetId: sourceDescriptor.id, hostId: "build-box", workspaceRoot: "/srv/new"
@@ -3349,7 +3349,7 @@ describe("Connect security and protocol audit", () => {
     await expect(submit(false)).rejects.toMatchObject({ code: Code.NotFound });
     expect(dispatch).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ action: "createDirectory" }));
     expect(upsertTarget).not.toHaveBeenCalled();
-    await submit(true);
+    const first = await submit(true) as contract.SubmitOperationResponse;
     expect(devicePeers.capture).toHaveBeenCalledWith(
       expect.objectContaining({ id: connection.id, deviceId: connection.deviceId, authKeyDigest: connection.authKeyDigest }),
       identity,
@@ -3425,6 +3425,7 @@ describe("Connect security and protocol audit", () => {
       : "wrong-payload").toBeUndefined();
     expect(first.operation?.mutation?.payload).toMatchObject({ value: { peer: { routeGeneration: BigInt(identity.routeGeneration) } } });
     expect(replay.operation?.mutation?.payload).toMatchObject({ value: { peer: { routeGeneration: 5n } } });
+    expect(first.operation?.requestSha256Hex).toMatch(/^[a-f0-9]{64}$/u);
     expect(replay.operation?.requestSha256Hex).toBe(first.operation?.requestSha256Hex);
     const reread = await invoke(services.operation.getOperation, { operationId: "operation-device-peer-true" }, context()) as contract.GetOperationResponse;
     expect(reread.operation?.mutation).toEqual(restored.operation?.mutation);

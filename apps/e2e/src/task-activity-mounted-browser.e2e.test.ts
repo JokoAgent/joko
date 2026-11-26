@@ -4,6 +4,7 @@ import { chromium, type Page } from "playwright-core";
 import { expect, it, vi } from "vitest";
 import { closeCompactNavigationDrawer, OrchestratorE2eFixture } from "./fixture.js";
 import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
+import { conditionTimeoutMs } from "./test-deadlines.js";
 
 const browserPath = process.env.JOKO_BROWSER_EXECUTABLE?.trim(), webDirectory = process.env.JOKO_MOUNTED_WEB_DIR?.trim();
 const mountedIt = browserPath && webDirectory ? it : it.skip;
@@ -89,11 +90,11 @@ mountedIt("tracks real task panes across shared-owner tabs and revokes only the 
     await tab.locator(".connection-card .profile-card").filter({ hasText: fixture.baseUrl }).getByRole("button", { name: "Connect", exact: true }).click();
     await tab.locator(".app").waitFor({ timeout: 30_000 }); await openTask(tab, tasks[1]!);
     const activity = fixture.application.connections.taskActivity;
-    await expect.poll(() => tasks.map(id => activity.hasRemoteTaskView(id))).toEqual([true, true]);
+    await expect.poll(() => tasks.map(id => activity.hasRemoteTaskView(id)), { timeout: conditionTimeoutMs }).toEqual([true, true]);
     expect(activity.snapshot().activeDevices.map(device => device.deviceId)).toEqual([remoteId]);
     await remote.close();
     expect(activity.snapshot().activeDevices.map(device => device.deviceId)).toEqual([remoteId]);
-    await expect.poll(() => tasks.map(id => activity.hasRemoteTaskView(id))).toEqual([false, true]);
+    await expect.poll(() => tasks.map(id => activity.hasRemoteTaskView(id)), { timeout: conditionTimeoutMs }).toEqual([false, true]);
     await route(tab, "#/settings/general"); await tab.locator(".theme-picker").waitFor();
     await expect.poll(() => fixture.application.connections.taskActivity.snapshot().activeDevices).toEqual([]);
     await expect.poll(() => observer.locator(".task-activity").count()).toBe(0);
