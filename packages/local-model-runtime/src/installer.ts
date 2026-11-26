@@ -388,6 +388,13 @@ export async function installManagedRuntime(input: {
   const archive = join(downloads, `${asset.version}-${asset.assetName}`);
   const stage = join(root, `.stage-${randomUUID()}`);
   const versionDirectory = join(root, `v${asset.version}`);
+  const previousDirectory = join(root, `.previous-${randomUUID()}`);
+  const manifestPath = runtimeManifestPath(input.dataRoot);
+  const temporaryManifest = `${manifestPath}.${randomUUID()}.tmp`;
+  let displaced = false, promoted = false, committed = false;
+  const checkCancelled = () => {
+    if (input.signal?.aborted) throw new LocalRuntimeError("OPERATION_CANCELLED", "The operation was cancelled.");
+  };
   try {
     await mkdir(downloads, { recursive: true, mode: 0o700 });
     const freeDiskBytes = input.readFreeDiskBytes === undefined
@@ -398,7 +405,7 @@ export async function installManagedRuntime(input: {
     if (!preflight.allowed || !Number.isFinite(freeDiskBytes)) {
       throw new LocalRuntimeError(preflight.publicErrorCode ?? "DISK_SPACE_LOW", "There is not enough free disk space for the runtime archive and installation.");
     }
-    if (input.signal?.aborted) throw new LocalRuntimeError("OPERATION_CANCELLED", "The operation was cancelled.");
+    checkCancelled();
     emit({ phase: "downloading", version: asset.version, completedBytes: 0, totalBytes: asset.sizeBytes, percent: 0, done: false });
     await (input.downloadAsset ?? downloadOfficialAsset)({
       asset,
@@ -416,15 +423,24 @@ export async function installManagedRuntime(input: {
     emit({ phase: "verifying", version: asset.version, percent: 100, done: false });
     emit({ phase: "extracting", version: asset.version, done: false });
     const stagedBinary = await (input.extractArchive ?? extractOfficialArchive)({ archivePath: archive, destination: stage, platform: input.platform, signal: input.signal });
-    if (input.signal?.aborted) throw new LocalRuntimeError("OPERATION_CANCELLED", "The operation was cancelled.");
+    checkCancelled();
     const binaryRelativeToStage = relative(stage, stagedBinary);
     assertArchiveEntrySafe(binaryRelativeToStage);
     emit({ phase: "promoting", version: asset.version, done: false });
-    await mkdir(root, { recursive: true, mode: 0o700 });
-    if (!existsSync(versionDirectory)) await rename(stage, versionDirectory);
-    else await rm(stage, { recursive: true, force: true });
     const binary = join(versionDirectory, binaryRelativeToStage);
     assertPathWithin(versionDirectory, binary);
+    const current = await readManagedRuntimeManifest(input.dataRoot);
+    const reuse = current?.version === asset.version && current.archiveSha256 === asset.sha256
+      && resolve(root, current.binaryRelativePath) === resolve(binary);
+    checkCancelled();
+    if (!reuse) {
+      if (existsSync(versionDirectory)) {
+        await rename(versionDirectory, previousDirectory);
+        displaced = true;
+      }
+      await rename(stage, versionDirectory);
+      promoted = true;
+    }
     const promotedStat = await lstat(binary);
     if (!promotedStat.isFile() || promotedStat.isSymbolicLink()) {
       throw new LocalRuntimeError("ARCHIVE_REJECTED", "The promoted runtime executable is invalid.");
@@ -436,15 +452,20 @@ export async function installManagedRuntime(input: {
       binaryRelativePath: relative(root, binary),
       archiveSha256: asset.sha256
     };
-    const manifestPath = runtimeManifestPath(input.dataRoot);
-    const temporaryManifest = `${manifestPath}.${randomUUID()}.tmp`;
-    await writeFile(temporaryManifest, `${JSON.stringify(manifest)}\n`, { encoding: "utf8", mode: 0o600 });
+    await writeFile(temporaryManifest, `${JSON.stringify(manifest)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    checkCancelled();
     await rename(temporaryManifest, manifestPath);
-    await rm(archive, { force: true });
+    committed = true;
     return { version: asset.version, binary, archiveSha256: asset.sha256 };
   } catch (error) {
+    // current.json still selects the original installation until its atomic rename.
+    if (promoted) await rename(versionDirectory, stage);
+    if (displaced) await rename(previousDirectory, versionDirectory);
+    throw error;
+  } finally {
+    if (committed && displaced) await rm(previousDirectory, { recursive: true, force: true, maxRetries: 3 }).catch(() => undefined);
+    await rm(temporaryManifest, { force: true }).catch(() => undefined);
     await rm(stage, { recursive: true, force: true }).catch(() => undefined);
     await rm(archive, { force: true }).catch(() => undefined);
-    throw error;
   }
 }

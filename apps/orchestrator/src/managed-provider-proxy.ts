@@ -198,7 +198,7 @@ export class ManagedProviderProxy {
         if (!entry.enabled || !supported(entry.provider.api)) return [];
         return entry.provider.models.filter((model) => supported(model.api ?? entry.provider.api)
           && this.#providers.hasInferenceModel(input.backendId, entry.provider.id, model.id))
-          .map((model) => ({ ...piProviderModel(entry.provider, model), contextWindow: model.contextWindow ?? 0, maxOutputTokens: model.maxTokens ?? 0 }));
+          .map((model) => ({ ...piProviderModel(entry.provider, model, input.clientProtocol ?? "openai-responses"), contextWindow: model.contextWindow ?? 0, maxOutputTokens: model.maxTokens ?? 0 }));
       }),
       listSmartRoutingCandidates: () => this.#providers.listManaged(input.backendId).flatMap((entry) => {
         if (!entry.enabled || !supported(entry.provider.api)
@@ -212,7 +212,7 @@ export class ManagedProviderProxy {
           return [{
             providerId: entry.provider.id,
             model: {
-              ...piProviderModel(entry.provider, model),
+              ...piProviderModel(entry.provider, model, input.clientProtocol ?? "openai-responses"),
               contextWindow: model.contextWindow ?? 0,
               maxOutputTokens: model.maxTokens ?? 0
             },
@@ -251,7 +251,7 @@ export class ManagedProviderProxy {
           if (current?.generationId !== state.revision) throw unavailable();
         };
         const binding: ManagedProviderRouteBinding = {
-          providerId: owner.providerId, model: { ...piProviderModel(entry.provider, model), contextWindow: model.contextWindow ?? 0, maxOutputTokens: model.maxTokens ?? 0 }, protocol,
+          providerId: owner.providerId, model: { ...piProviderModel(entry.provider, model, input.clientProtocol ?? "openai-responses"), contextWindow: model.contextWindow ?? 0, maxOutputTokens: model.maxTokens ?? 0 }, protocol,
           ...(runtime.clientProtocol === "anthropic-messages" && protocol === "anthropic-messages"
             && isOfficialAnthropicMessages(model.baseUrl ?? entry.provider.baseUrl, entry.requestPath) ? { supportsDeferredMcpTools: true } : {}),
           revision: state.revision, baseUrl: `${this.#origin}/managed/${state.id}`, apiKeyEnvironment: ENVIRONMENT_NAME,
@@ -327,7 +327,7 @@ export class ManagedProviderProxy {
             if (subtask.signal.aborted) release();
             return {
               model: {
-                ...piProviderModel(entry.provider, model),
+                ...piProviderModel(entry.provider, model, input.clientProtocol ?? "openai-responses"),
                 contextWindow: model.contextWindow ?? 0,
                 maxOutputTokens: model.maxTokens ?? 0
               },

@@ -190,6 +190,9 @@ describe("proto mapper", () => {
       contextWindowSource: "estimated", contextWindowTokens: 128000n, contextWindowMaxTokens: 1_000_000n, maxOutputTokensSource: "estimated", api: "openai-responses", referenceApi: "anthropic-messages", protocolMode: "compatibility" });
     expect(value.declaredModalities?.input?.values).toEqual([]); expect(value.declaredModalities?.output).toBeUndefined();
     expect(value.effortLevels.map(level => level.defaultLevel)).toEqual([false, true]);
+    expect(toProtoModelDescriptor("pi", { ...model, protocolMode: "matching" })).toMatchObject({
+      api: "openai-responses", referenceApi: "anthropic-messages", protocolMode: "matching"
+    });
     const unknown = toProtoModelDescriptor("backend", { ...model, defaultEffort: undefined, declaredInputModalities: undefined, declaredSupportsImages: undefined, declaredSupportsFastMode: undefined, referenceApi: undefined });
     expect(unknown.declaredModalities).toBeUndefined(); expect(unknown.declaredSupportsImages).toBeUndefined(); expect(unknown.declaredSupportsFastMode).toBeUndefined();
     expect(unknown.effortLevels.every(level => !level.defaultLevel)).toBe(true); expect(unknown.protocolMode).toBe("unknown");

@@ -9539,8 +9539,11 @@ function modelFromNative(model: NativeModel, providerId: string): ProviderModel 
 
 function withCodexModelContext(model: ProviderModel, native: CodexModelContext | undefined): ProviderModel {
   if (native === undefined) return model;
-  const contextWindow = native.contextWindow ?? Math.min(model.contextWindow, native.contextWindowMax ?? model.contextWindow);
+  const displayOnly = native.contextWindow === undefined && native.contextWindowMax !== undefined && model.contextWindow === 0;
+  const fallback = displayOnly ? 272_000 : model.contextWindow;
+  const contextWindow = native.contextWindow ?? Math.min(fallback, native.contextWindowMax ?? fallback);
   return { ...model, contextWindow,
+    ...(displayOnly ? { contextWindowSource: "estimated" as const, contextWindowDisplayOnly: true as const } : {}),
     ...(native.contextWindow === undefined ? {} : { contextWindowSource: "declared" as const, defaultWorkingContextTokens: native.contextWindow }),
     ...(native.contextWindowMax === undefined ? {} : { contextWindowMax: native.contextWindowMax }) };
 }

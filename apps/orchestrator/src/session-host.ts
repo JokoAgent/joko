@@ -18569,15 +18569,23 @@ export class SessionHost {
     const priced = !canPriceReference ? undefined : modelUsageCostRates(model, priceOverride, usage,
       usage.pricingContext?.requestedAt ?? (runUsageId === undefined ? measuredAt : store.getRun(runUsageId).descriptor.startedAt ?? measuredAt));
     const currencies = new Set<string>();
+    // Pi's stats cost is cumulative across model changes. A positive total
+    // can coexist with closed requests that had no native quote.
+    const unquotedPiRequests = reportedCostMicros === undefined
+      ? piRequests?.every(request => request.usage.cost === 0) ? piRequests : undefined
+      : usageMoneyKind === "actual-cost" ? undefined : piRequests?.filter(request => request.usage.cost === 0);
     const referenceRequests: UsageReferenceRequest[] | undefined =
-      canPriceReference && reportedCostMicros === undefined && piRequests?.every(request => request.usage.cost === 0)
-        ? piRequests.map(({ usage: request, emittedAt }) => {
+      canPriceReference && unquotedPiRequests?.length
+        ? unquotedPiRequests.map(({ usage: request, emittedAt }) => {
           const price = modelUsageCostRates(model, priceOverride, request, request.pricingContext?.requestedAt ?? emittedAt);
           if (price !== undefined) currencies.add(price.currencyCode);
           return { ...request, costRates: price?.rates, cacheWrite1hTokens: request.pricingContext?.cacheWrite1hTokens };
         })
         : undefined;
-    if (referenceRequests !== undefined && priced !== undefined) currencies.add(priced.currencyCode);
+    if (referenceRequests !== undefined) {
+      if (reportedCostMicros !== undefined) currencies.add("USD");
+      else if (priced !== undefined) currencies.add(priced.currencyCode);
+    }
     const requestCurrency = currencies.size === 1 ? [...currencies][0] : undefined;
     const costRates = nativeReferenceRequest && usage.cacheWriteTokens > 0 && usage.pricingContext?.cacheWrite1hTokens === undefined
       ? priced === undefined ? undefined : {

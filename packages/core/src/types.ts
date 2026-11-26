@@ -456,6 +456,8 @@ export interface ProviderModel {
   readonly defaultWorkingContextTokens?: number;
   readonly maxOutputTokens: number;
   readonly contextWindowSource?: "declared" | "estimated";
+  /** An estimate for the model picker that cannot configure the native runtime. */
+  readonly contextWindowDisplayOnly?: true;
   readonly maxOutputTokensSource?: "declared" | "estimated";
   readonly supportsImages: boolean;
   /** Explicit catalog denial used by tool-dependent routing; absence remains unknown. */

@@ -1,7 +1,7 @@
 import { capabilityNames, publicModelNativeApi, publicModelRecommendedBackend, publicProviderModel, providerInterfaceProfiles } from "@joko/contracts";
 import { expect, it } from "vitest";
 import type { BackendView } from "./model.js";
-import { discoveredProviderModelInterface, providerModelInterfaceOptions, providerPresetRuntime, providerPresets, updateProviderPresetEndpoint } from "./provider-presets.js";
+import { discoveredProviderModelInterface, providerModelInterfaceOptions, providerPresetMatches, providerPresetName, providerPresetRuntime, providerPresets, updateProviderPresetEndpoint } from "./provider-presets.js";
 
 const base: Omit<BackendView, "id" | "name"> = {
   version: "1", health: "healthy", capabilities: new Map([[capabilityNames.providerManagedCatalog, { name: capabilityNames.providerManagedCatalog, supported: true, options: [] }]])
@@ -16,8 +16,19 @@ const codex: BackendView = { ...base, id: "codex", name: "Codex", providerRuntim
   protocols: ["openaiResponses", "openaiCompletions"], fields: ["modelEndpoint", "modelInputModalities"]
 } };
 
+it("keeps both regional routes together and identifies each MiMo plan before selection", () => {
+  const ids = providerPresets.map(preset => preset.id);
+  expect(ids.indexOf("zhipu-glm-cn")).toBe(ids.indexOf("zhipu-glm-global") + 1);
+  expect(ids.indexOf("zhipu-coding-plan-cn")).toBe(ids.indexOf("zai-coding-plan-global") + 1);
+  const mainland = providerPresets.find(preset => preset.id === "xiaomi-mimo-token-plan-cn")!;
+  expect(providerPresetName(mainland, "en-US")).toBe("Xiaomi MiMo Token Plan (Mainland China)");
+  expect(providerPresetName(mainland, "zh-CN")).toBe("小米 MiMo Token Plan (中国大陆)");
+  expect(providerPresetMatches(mainland, "mainland china")).toBe(true);
+  expect(providerPresetMatches(providerPresets.find(preset => preset.id === "xiaomi-token-plan-sgp")!, "新加坡")).toBe(true);
+});
+
 it("keeps provider defaults specific to the Backend and selects exact model interfaces within that origin", () => {
-  expect(providerPresets).toHaveLength(38);
+  expect(providerPresets.length).toBeGreaterThan(38);
   expect(providerInterfaceProfiles).toHaveLength(85);
   const router = providerPresets.find(item => item.id === "openrouter")!;
   expect(providerPresetRuntime(router, claude)).toMatchObject({ endpoint: "https://openrouter.ai/api", compatibility: "anthropic" });
@@ -34,6 +45,19 @@ it("keeps provider defaults specific to the Backend and selects exact model inte
   expect(providerModelInterfaceOptions(pi, edited.endpoint, "minimax-m3")).toEqual([]);
 });
 
+it("finds published Groq and Nous presets without borrowing a different origin or unsupported runtime", () => {
+  const groq = providerPresets.find(preset => providerPresetMatches(preset, "groq"))!;
+  const nous = providerPresets.find(preset => providerPresetMatches(preset, "nous"))!;
+  expect(providerPresetRuntime(groq, pi)).toMatchObject({ endpoint: "https://api.groq.com/openai/v1", compatibility: "openaiCompletions",
+    credentialId: "", models: expect.arrayContaining([expect.objectContaining({ modelId: "llama-3.1-8b-instant", defaultVisible: false })]) });
+  expect(providerPresetRuntime(groq, pi)?.models).toHaveLength(7);
+  expect(providerPresetRuntime(groq, { ...pi, providerRuntimeSupport: { protocols: ["anthropic"], fields: [] } })).toBeUndefined();
+  expect(providerPresetRuntime(nous, pi)).toMatchObject({ endpoint: "https://inference-api.nousresearch.com/v1", models: [] });
+  expect(providerPresets.some(preset => preset.id === "openai-codex")).toBe(false);
+  const router = providerPresets.find(preset => preset.id === "openrouter")!;
+  expect(providerPresetRuntime(router, pi)!.models.length).toBeGreaterThan(router.models.length);
+  expect(providerPresetRuntime({ ...groq, runtimes: { pi: { baseUrl: "https://relay.example/v1", wireProtocol: "openai-chat" } } }, pi)?.models).toEqual([]);
+});
 it("uses declared capabilities and advisory defaults without inferring an unrelated native protocol", () => {
   const kimi = providerPresets.find(item => item.id === "moonshot-kimi-code")!;
   const kimiPi = providerPresetRuntime(kimi, pi)!;

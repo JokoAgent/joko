@@ -5598,8 +5598,9 @@ describe("SessionHost", () => {
   it.each([
     { inputs: [200_000], outputs: [1_000], remainderInput: 0, costMicros: 812_000 },
     { inputs: [100_000, 100_000], outputs: [500, 500], remainderInput: 0, costMicros: 406_000 },
-    { inputs: [200_000], outputs: [1_000], remainderInput: 10_000, costMicros: 832_000 }
-  ])("prices the closed Pi requests $inputs and a residual $remainderInput behind one stats read", async ({ inputs, outputs, remainderInput, costMicros }) => {
+    { inputs: [200_000], outputs: [1_000], remainderInput: 10_000, costMicros: 832_000 },
+    { inputs: [200_000], outputs: [1_000], remainderInput: 0, costMicros: 912_000, previousCost: 0.10 }
+  ])("prices closed Pi requests $inputs, residual $remainderInput and prior cost $previousCost", async ({ inputs, outputs, remainderInput, costMicros, previousCost }) => {
     const { catalogModelReferencePricing } = await import("@joko/core");
     const adapter = new FakeBackendAdapter({ ...PI_LIKE_PROFILE, models: PI_LIKE_PROFILE.models.map(model => ({
       ...model, pricing: catalogModelReferencePricing("xai/grok-4.7")
@@ -5612,6 +5613,9 @@ describe("SessionHost", () => {
       ...await inspect(binding, context), usage: stats
     }));
     vi.spyOn(adapter, "send").mockImplementation(async (input, context) => {
+      if (input.text === "record prior native cost") {
+        stats = { ...stats, inputTokens: 100, totalTokens: 100, cost: previousCost! };
+      }
       if (input.text === "record requests") {
         for (const [index, inputTokens] of inputs.entries()) {
           const outputTokens = outputs[index]!;
@@ -5634,12 +5638,23 @@ describe("SessionHost", () => {
       operationId: "create-pi-request-prices", connection: fixture.connection, targetId: "target-one", title: "Pi request prices",
       providerId: "test", modelId: "text", fastMode: false, permissionMode: "ask", planMode: false
     })).value;
-    for (const text of ["record requests", "read the same counters again"]) {
-      const { runId } = fixture.host.enqueueInput({ operationId: text, connection: fixture.connection, sessionId,
+    const send = async (operationId: string, text: string) => {
+      const { runId } = fixture.host.enqueueInput({ operationId, connection: fixture.connection, sessionId,
         prompt: { text, images: [], files: [], mentions: [], disposition: "prompt" } }).value;
       await eventually(() => fixture.store.getRun(runId).descriptor.state === "completed");
+    };
+    if (previousCost !== undefined) {
+      await send("pi-price-baseline", "record prior native cost");
       expect(fixture.store.listUsageLedger({ ownerId: "orchestrator" })).toEqual([expect.objectContaining({
-        inputTokens: 200_000 + remainderInput, outputTokens: 1_000, totalTokens: 201_000 + remainderInput, costMicros, costComplete: true, estimated: true
+        inputTokens: 100, totalTokens: 100, costMicros: 100_000, costComplete: true
+      })]);
+    }
+    const baseline = previousCost === undefined ? 0 : 100;
+    for (const [operationId, text] of [["pi-price-record", "record requests"], ["pi-price-reread", "read the same counters again"]] as const) {
+      await send(operationId, text);
+      expect(fixture.store.listUsageLedger({ ownerId: "orchestrator" })).toEqual([expect.objectContaining({
+        inputTokens: baseline + 200_000 + remainderInput, outputTokens: 1_000, totalTokens: baseline + 201_000 + remainderInput,
+        costMicros, costComplete: true, estimated: true
       })]);
     }
   });

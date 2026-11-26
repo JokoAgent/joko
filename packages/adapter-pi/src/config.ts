@@ -634,7 +634,7 @@ function isLoopbackHostname(hostname: string): boolean {
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1" || normalized === "[::1]";
 }
 
-export function piProviderModel(provider: PiManagedProvider, model: PiManagedModel): ProviderModel {
+export function piProviderModel(provider: PiManagedProvider, model: PiManagedModel, clientProtocol?: PiSupportedApi): ProviderModel {
   const api = model.api ?? provider.api ?? "openai-completions";
   const thinkingLevels = supportedPiThinkingLevels(model.reasoning, model.thinkingLevelMap);
   const contextWindow = model.contextWindow ?? 128_000;
@@ -653,7 +653,7 @@ export function piProviderModel(provider: PiManagedProvider, model: PiManagedMod
     ...(model.displayThinkingLevels === undefined ? {} : { displayThinkingLevels: [...model.displayThinkingLevels] }),
     ...(model.referenceApi === undefined ? {} : {
       referenceApi: model.referenceApi,
-      protocolMode: model.referenceApi === api ? "matching" as const : "compatibility" as const
+      protocolMode: clientProtocol === undefined || clientProtocol === api ? "matching" as const : "compatibility" as const
     }),
     ...(model.declaredInputModalities === undefined && model.input === undefined ? {} : {
       declaredInputModalities: [...(model.declaredInputModalities ?? model.input!)], declaredSupportsImages: model.input?.includes("image") === true

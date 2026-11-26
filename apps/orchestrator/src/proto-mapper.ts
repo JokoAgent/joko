@@ -1974,7 +1974,7 @@ export function toProtoModelDescriptor(backendId: string, model: ProviderModel):
         output: model.declaredOutputModalities === undefined ? undefined : { $typeName: "joko.v1.ModelModalityValues", values: [...model.declaredOutputModalities] } },
     referenceApi: model.referenceApi,
     api: model.api,
-    protocolMode: model.referenceApi === undefined || model.api === "" ? "unknown" : model.api === model.referenceApi ? "matching" : "compatibility",
+    protocolMode: model.protocolMode ?? (model.referenceApi === undefined || model.api === "" ? "unknown" : model.api === model.referenceApi ? "matching" : "compatibility"),
     contextWindowSource: model.contextWindowSource,
     contextWindowMaxTokens: model.contextWindowMax === undefined ? undefined : BigInt(model.contextWindowMax),
     maxOutputTokensSource: model.maxOutputTokensSource,

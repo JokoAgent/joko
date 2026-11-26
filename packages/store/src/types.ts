@@ -2352,7 +2352,7 @@ export interface RecordUsageObservationInput extends UsageTokenTotals {
   readonly observedCostComplete?: boolean;
   /** Catalog pricing used only for the newly observed token delta. */
   readonly costRates?: UsageCostRates;
-  /** Closed requests included in the estimated delta in this currency. */
+  /** Unquoted closed requests estimated in the observation's currency, independently of any reported charge. */
   readonly referenceRequests?: readonly UsageReferenceRequest[];
   readonly currencyCode?: string;
   /** Service-owned Run attribution, committed atomically with the source cursor. */

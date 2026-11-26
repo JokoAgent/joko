@@ -1,4 +1,4 @@
-import { sameOriginProviderCatalogEndpoint } from "@joko/contracts";
+import { resolveProviderCatalogEndpoint } from "@joko/contracts";
 import type { BackendView, ProviderCompatibilityView, ProviderConfigurationFieldView, ProviderModelConfigurationView, ProviderRuntimeConfigurationView } from "./model.js";
 
 export type ProviderTransferField = "endpoint" | "models" | "authentication" | "headers" | "modelsEndpoint";
@@ -23,8 +23,7 @@ export function providerEndpointOrigin(endpoint: string): string | undefined {
 export function providerCatalogEndpointValid(endpoint: string, modelsEndpoint?: string): boolean {
   if (!modelsEndpoint) return true;
   if (providerEndpointOrigin(endpoint) === undefined) return false;
-  try { return sameOriginProviderCatalogEndpoint(new URL(endpoint), new URL(modelsEndpoint)); }
-  catch { return false; }
+  return resolveProviderCatalogEndpoint(endpoint, modelsEndpoint) !== undefined;
 }
 
 export function providerRequestPathValid(path: string | undefined): boolean {

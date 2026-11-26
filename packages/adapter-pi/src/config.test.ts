@@ -31,7 +31,7 @@ describe("managed Pi catalog", () => {
       contextWindow: 32_000, maxTokens: 4_000, input: ["text"], description: "Declared description", defaultEffort: "medium", supportsFastMode: false,
       referenceApi: "anthropic-messages", displayThinkingLevels: ["high"], declaredOutputModalities: ["text"] }, { id: "unknown-model" }] }]);
     expect(result.models[0]).toMatchObject({ description: "Declared description", defaultEffort: "medium", displayThinkingLevels: ["high"], declaredInputModalities: ["text"], declaredSupportsImages: false,
-      declaredSupportsFastMode: false, protocolMode: "compatibility", contextWindowSource: "declared", maxOutputTokensSource: "declared" });
+      declaredSupportsFastMode: false, protocolMode: "matching", contextWindowSource: "declared", maxOutputTokensSource: "declared" });
     expect(result.models[1]!.defaultEffort).toBeUndefined(); expect(result.models[1]!.declaredInputModalities).toBeUndefined();
     const native = JSON.parse(await readFile(join(home, "models.json"), "utf8")).providers.gateway.models[0];
     for (const key of ["description", "defaultEffort", "displayThinkingLevels", "referenceApi", "declaredOutputModalities", "supportsFastMode"]) expect(native[key]).toBeUndefined();

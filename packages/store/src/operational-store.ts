@@ -19738,7 +19738,13 @@ export class OperationalStore {
         // baseline only; charging it again would double-count that prefix.
         costComplete = false;
         estimated = input.reportedCostEstimated === true;
-      } else if (input.referenceRequests !== undefined) {
+      } else if (input.referenceRequests === undefined) {
+        const estimate = usageEstimatedCost(delta, rates ?? {}, knownOneHourDelta);
+        costMicros = estimate.costMicros;
+        costComplete = rates !== undefined && estimate.complete;
+        estimated = true;
+      }
+      if (input.referenceRequests !== undefined) {
         const requests = input.referenceRequests;
         const remainder = { ...delta };
         for (const key of ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "totalTokens"] as const) {
@@ -19746,20 +19752,14 @@ export class OperationalStore {
           if (remainder[key] < 0) throw new StoreError("The closed requests exceed the observed usage delta.");
         }
         const parts = requests.map(request => usageEstimatedCost(request, request.costRates ?? {}, request.cacheWrite1hTokens ?? 0));
-        const remainderOneHour = knownOneHourDelta === undefined ? undefined
-          : knownOneHourDelta - safeUsageSum(requests.map(request => request.cacheWrite1hTokens ?? 0), "Request cache usage");
-        parts.push(usageEstimatedCost(remainder, rates ?? {}, remainderOneHour !== undefined && remainderOneHour >= 0
-          && remainderOneHour <= remainder.cacheWriteTokens ? remainderOneHour : undefined));
-        costMicros = safeUsageSum(parts.map(part => part.costMicros), "Estimated request usage cost");
-        costComplete = parts.every(part => part.complete);
-        estimated = true;
-      } else if (rates !== undefined) {
-        const estimate = usageEstimatedCost(delta, rates, knownOneHourDelta);
-        costMicros = estimate.costMicros;
-        costComplete = estimate.complete;
-        estimated = true;
-      } else {
-        costComplete = false;
+        if (reportedCostMicros === undefined) {
+          const remainderOneHour = knownOneHourDelta === undefined ? undefined
+            : knownOneHourDelta - safeUsageSum(requests.map(request => request.cacheWrite1hTokens ?? 0), "Request cache usage");
+          parts.push(usageEstimatedCost(remainder, rates ?? {}, remainderOneHour !== undefined && remainderOneHour >= 0
+            && remainderOneHour <= remainder.cacheWriteTokens ? remainderOneHour : undefined));
+        }
+        costMicros = safeUsageSum([costMicros, ...parts.map(part => part.costMicros)], "Request usage cost");
+        costComplete = costComplete && parts.every(part => part.complete);
         estimated = true;
       }
       costComplete = costComplete && input.observedCostComplete !== false;

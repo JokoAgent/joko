@@ -80,14 +80,17 @@ describe("ProviderSettings model visibility", () => {
     await act(async () => required(sub2api).click());
     await setControlValue(endpoint(), "https://gateway.example.test/custom");
     await setControlValue(required(document.body.querySelector<HTMLInputElement>('.provider-editor input[type="password"]')), "test-provider-key");
-    const catalog = document.body.querySelectorAll<HTMLInputElement>('.provider-editor [role="tabpanel"] input[type="url"]')[1];
-    expect(catalog?.value).toBe("https://gateway.example.test/custom/v1/models?client_version=0.147.0");
+    const catalog = required(document.body.querySelector<HTMLInputElement>('.provider-editor [role="tabpanel"] input[inputmode="url"]'));
+    expect(catalog.value).toBe("https://gateway.example.test/custom/v1/models?client_version=0.147.0");
     const list = required(document.body.querySelector<HTMLButtonElement>(".provider-model-preview > button"));
+    await setControlValue(catalog, "https://other.example.test/custom/v1/models?scope=approved");
+    expect(list.disabled).toBe(true);
+    await setControlValue(catalog, "/custom/v1/models?scope=approved");
     expect(list.disabled).toBe(false);
     await act(async () => list.click());
     expect(previewProviderModels).toHaveBeenCalledWith(expect.objectContaining({
       backendId: "claude-code", compatibility: "openaiResponses", endpoint: "https://gateway.example.test/custom/v1",
-      modelsEndpoint: "https://gateway.example.test/custom/v1/models?client_version=0.147.0"
+      modelsEndpoint: "/custom/v1/models?scope=approved"
     }), "test-provider-key", expect.any(AbortSignal));
     expect(saveCredential).not.toHaveBeenCalled();
     const model = required(document.body.querySelector<HTMLInputElement>('.provider-model-preview__results input[type="checkbox"]'));

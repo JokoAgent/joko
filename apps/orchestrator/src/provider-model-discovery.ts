@@ -1,5 +1,5 @@
 import type { PiManagedModel } from "@joko/adapter-pi";
-import { sameOriginProviderCatalogEndpoint } from "@joko/contracts";
+import { resolveProviderCatalogEndpoint } from "@joko/contracts";
 
 export interface DiscoveredProviderModel {
   readonly id: string;
@@ -241,13 +241,8 @@ export async function fetchProviderModelCatalog(
   if (!authenticated && !isLoopback(baseUrl.hostname)) {
     throw new ProviderModelDiscoveryError("unsafe_endpoint");
   }
-  let endpoint: URL;
-  try {
-    endpoint = spec.modelsEndpoint === undefined ? new URL(deriveProviderModelsUrl(baseUrl.toString(), spec.api)) : new URL(spec.modelsEndpoint);
-    if (!sameOriginProviderCatalogEndpoint(baseUrl, endpoint)) throw new Error("Model catalog authority differs.");
-  } catch {
-    throw new ProviderModelDiscoveryError("unavailable");
-  }
+  const endpoint = resolveProviderCatalogEndpoint(baseUrl, spec.modelsEndpoint ?? deriveProviderModelsUrl(baseUrl.toString(), spec.api));
+  if (endpoint === undefined) throw new ProviderModelDiscoveryError("unavailable");
   const sourceUrl = endpoint.toString();
   const timeout = AbortSignal.timeout(DISCOVERY_TIMEOUT_MS);
   const signal = spec.signal === undefined ? timeout : AbortSignal.any([spec.signal, timeout]);
@@ -288,8 +283,7 @@ export async function fetchProviderModelCatalog(
       const previous = models.get(model.id);
       models.set(model.id, previous === undefined ? model : {
         ...previous, ...model, name: model.metadata?.name ?? previous.name,
-        ...(previous.metadata === undefined && model.metadata === undefined ? {} : { metadata: { ...previous.metadata, ...model.metadata } }),
-        ...(previous.cost === undefined && model.cost === undefined ? {} : { cost: { ...previous.cost, ...model.cost } })
+        ...(previous.metadata === undefined && model.metadata === undefined ? {} : { metadata: { ...previous.metadata, ...model.metadata } })
       });
     }
     const hasContinuation = catalogHasContinuation(page.value, bounds);
@@ -303,20 +297,29 @@ export async function fetchProviderModelCatalog(
     visited.add(next.toString());
     current = next;
   }
-  if (spec.includeNonChat && officialModelsEndpoint(sourceUrl, "https://openrouter.ai/api/v1/models")) {
+  if (spec.includeNonChat && endpoint.search === "" && officialModelsEndpoint(sourceUrl, "https://openrouter.ai/api/v1/models")) {
     const speechEndpoint = new URL(endpoint);
     speechEndpoint.searchParams.set("output_modalities", "speech");
     try {
-      const { value } = await fetchModelPage(speechEndpoint.toString(), headers, signal, fetchImpl);
+      const { value, link } = await fetchModelPage(speechEndpoint.toString(), headers, signal, fetchImpl);
+      const rows = modelList(value);
+      if (rows === undefined) throw new ProviderModelDiscoveryError("invalid_response");
+      const speechBounds = { pages: 0, models: 0 };
+      if (rows.length > MAXIMUM_DISCOVERED_MODELS || rows.some(row => !validIdentity(modelIdentity(row, false)))
+        || hasNextLink(link) || catalogHasContinuation(value, speechBounds)
+        || speechBounds.pages > 1 || speechBounds.models > rows.length) complete = false;
       const speech = parseProviderModels(value, speechEndpoint.toString(), true);
       for (const model of speech.filter(model => model.metadata?.mode === "audio_speech")) {
         const previous = models.get(model.id);
-        if (previous === undefined && models.size >= MAXIMUM_DISCOVERED_MODELS) break;
+        if (previous === undefined && models.size >= MAXIMUM_DISCOVERED_MODELS) { complete = false; break; }
         models.set(model.id, { ...previous, ...model,
           name: model.metadata?.name ?? previous?.metadata?.name ?? model.name,
           metadata: { ...previous?.metadata, ...model.metadata } });
       }
-    } catch { /* The independent speech catalog must not discard a successful chat discovery. */ }
+    } catch (error) {
+      if (spec.signal?.aborted) throw error;
+      complete = false;
+    }
   }
   return { models: [...models.values()], listedIds, complete };
 }

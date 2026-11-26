@@ -573,7 +573,9 @@ describe("ProviderCatalogManager", () => {
     };
 
     if (rejectNextPage) {
-      await expect(providers.discoverProviderModels("pi", "discoverable", request as typeof fetch)).rejects.toMatchObject({ code: "unavailable" });
+      await expect(providers.discoverProviderModels("pi", "discoverable", request as typeof fetch, undefined, "discovery-test")).resolves.toEqual({
+        providerId: "discoverable", addedModelIds: [], updatedModelIds: ["kept"], modelCount: 1
+      });
       expect(providers.get("pi", "discoverable").provider.models.map(model => model.id)).toEqual(["kept"]);
       rejectNextPage = false;
     }
@@ -581,7 +583,7 @@ describe("ProviderCatalogManager", () => {
     await expect(providers.discoverProviderModels("pi", "discoverable", request as typeof fetch)).resolves.toEqual({
       providerId: "discoverable",
       addedModelIds: ["new-model"],
-      updatedModelIds: ["kept"],
+      updatedModelIds: api === "anthropic-messages" ? [] : ["kept"],
       modelCount: 2
     });
     expect(providers.get("pi", "discoverable")).toMatchObject({ supportsModelRefresh: true });
@@ -629,6 +631,15 @@ describe("ProviderCatalogManager", () => {
     });
     try {
       expect(await providers.discoverProviderModels(backendId, providerId, fetcher)).toMatchObject({ addedModelIds: ["priced", "free"], modelCount: 3 });
+      const partialSpeech = async (request: string | URL | Request) => new URL(String(request)).search
+        ? new Response("unavailable", { status: 503 }) : Response.json({ data: [{ id: "priced", architecture }, { id: "kept", architecture }] });
+      const refresh = await providers.discoverProviderModels(backendId, providerId, partialSpeech, () => undefined, "openrouter-reviewer");
+      expect(refresh.withdrawalReview).toBeUndefined();
+      expect(providers.get(backendId, providerId).provider.models.map(model => model.id)).toEqual(["priced", "free", "kept"]);
+      const completeSpeech = async (request: string | URL | Request) => new URL(String(request)).search
+        ? Response.json({ data: [] }) : Response.json({ data: [{ id: "priced", architecture }, { id: "kept", architecture }] });
+      const complete = await providers.discoverProviderModels(backendId, providerId, completeSpeech, () => undefined, "openrouter-reviewer");
+      expect(complete.withdrawalReview).toMatchObject({ providerId, backendId, models: [{ modelId: "free" }] });
       store.close();
       const reopened = new OperationalStore(join(root, "orchestrator.db"));
       try {

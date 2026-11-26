@@ -47,22 +47,37 @@ describe("Provider model discovery", () => {
       .toEqual({ inputModalities: ["text"], outputModalities: ["speech"], supportsImages: false });
   });
 
-  it.each([false, true])("uses the original OpenRouter credential and deadline for its separate speech list (outage=%s)", async outage => {
+  it.each(["complete", "unavailable", "malformed", "partial"] as const)("keeps OpenRouter chat results and accounts for its %s speech list", async speech => {
     const request = vi.fn(async (value: string | URL | Request, init?: RequestInit) => {
       expect(init?.headers).toMatchObject({ authorization: "Bearer original-key" });
       expect(init?.redirect).toBe("error");
       const url = new URL(String(value));
-      return url.search === "" ? Response.json({ data: [{ id: "chat", name: "Chat" }] })
-        : outage ? new Response("unavailable", { status: 503 })
-          : Response.json({ data: [{ id: "speech", architecture: { input_modalities: ["text"], output_modalities: ["speech"] } }] });
+      if (url.search === "") return Response.json({ data: [{ id: "chat", name: "Chat" }] });
+      if (speech === "unavailable") return new Response("unavailable", { status: 503 });
+      if (speech === "malformed") return Response.json({ data: {} });
+      return Response.json({ data: [{ id: "speech", architecture: { input_modalities: ["text"], output_modalities: ["speech"] } }],
+        ...(speech === "partial" ? { next_cursor: "more" } : {}) });
     });
-    const rows = await fetchProviderModels({ baseUrl: "https://openrouter.ai/api/v1", apiKey: "original-key", includeNonChat: true }, request as typeof fetch);
-    expect(rows.map(row => row.id)).toEqual(outage ? ["chat"] : ["chat", "speech"]);
+    const result = await fetchProviderModelCatalog({ baseUrl: "https://openrouter.ai/api/v1", apiKey: "original-key", includeNonChat: true }, request as typeof fetch);
+    expect(result.models.map(row => row.id)).toEqual(speech === "complete" || speech === "partial" ? ["chat", "speech"] : ["chat"]);
+    expect(result.complete).toBe(speech === "complete");
+    expect([...result.listedIds]).toEqual(["chat"]);
     expect(request.mock.calls.map(([url]) => String(url))).toEqual([
       "https://openrouter.ai/api/v1/models", "https://openrouter.ai/api/v1/models?output_modalities=speech"
     ]);
     expect(request.mock.calls[0]?.[1]?.signal).toBe(request.mock.calls[1]?.[1]?.signal);
   });
+
+  it.each(["https://openrouter.ai/api/v1/models?output_modalities=text", "https://relay.example/api/v1/models"])(
+    "keeps the explicit scope of %s", async modelsEndpoint => {
+      const request = vi.fn(async () => Response.json({ data: [{ id: "chat" }] }));
+      const result = await fetchProviderModelCatalog({ baseUrl: new URL("..", modelsEndpoint).toString(), modelsEndpoint,
+        apiKey: "scoped-key", includeNonChat: true }, request as typeof fetch);
+      expect(result.models.map(model => model.id)).toEqual(["chat"]);
+      expect(result.complete).toBe(true);
+      expect(request).toHaveBeenCalledExactlyOnceWith(modelsEndpoint,
+        expect.objectContaining({ headers: expect.objectContaining({ authorization: "Bearer scoped-key" }) }));
+    });
 
   it("derives versioned endpoints and parses supported response shapes", () => {
     expect(deriveProviderModelsUrl("https://api.example.test/v1")).toBe("https://api.example.test/v1/models");
@@ -217,6 +232,20 @@ describe("Provider model discovery", () => {
     expect(request).toHaveBeenCalledOnce();
   });
 
+  it("retains a complete token quote when a duplicate on the next page omits pricing", async () => {
+    const baseUrl = "https://openrouter.ai/api/v1";
+    const architecture = { output_modalities: ["text"] };
+    const pricing = { prompt: "0.00001", completion: "0.00002", input_cache_read: "0.000003", input_cache_write: "0.000004" };
+    const request = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json({ data: [{ id: "priced", architecture, pricing }], next_cursor: "second" }))
+      .mockResolvedValueOnce(Response.json({ data: [{ id: "priced", name: "Named model", architecture }] }));
+    const catalog = await fetchProviderModelCatalog({ baseUrl, apiKey: "catalog-key" }, request);
+    expect(catalog.complete).toBe(true);
+    expect(catalog.models).toEqual([expect.objectContaining({
+      id: "priced", name: "Named model", cost: { input: 10, output: 20, cacheRead: 3, cacheWrite: 4 }
+    })]);
+  });
+
   it("follows an HTTP next link without switching the configured catalog filter", async () => {
     const endpoint = "https://api.example.test/v1/models";
     const spec = { baseUrl: "https://api.example.test/v1", modelsEndpoint: `${endpoint}?scope=approved`, apiKey: "catalog-key" };
@@ -229,6 +258,16 @@ describe("Provider model discovery", () => {
     const differentScope = vi.fn(async () => Response.json({ data: [{ id: "first" }], next: "?page=2&scope=other" }));
     expect(await fetchProviderModelCatalog(spec, differentScope)).toMatchObject({ complete: false, listedIds: new Set(["first"]) });
     expect(differentScope).toHaveBeenCalledOnce();
+    const relative = vi.fn(async (url: string | URL | Request) => {
+      expect(url).toBe(`${endpoint}?scope=approved`);
+      return Response.json({ data: [{ id: "relative" }] });
+    });
+    await expect(fetchProviderModels({ ...spec, modelsEndpoint: "/v1/models?scope=approved" }, relative))
+      .resolves.toMatchObject([{ id: "relative" }]);
+    for (const path of ["//other.example.test/v1/models?scope=approved", `${endpoint}?api_key=unsafe`, `${endpoint}?client_version=wrong`]) {
+      await expect(fetchProviderModels({ ...spec, modelsEndpoint: path }, relative)).rejects.toMatchObject({ code: "unavailable" });
+    }
+    expect(relative).toHaveBeenCalledOnce();
   });
 
   it("cancels an oversized streaming response without buffering the remaining upstream body", async () => {

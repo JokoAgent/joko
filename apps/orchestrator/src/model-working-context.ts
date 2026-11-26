@@ -92,7 +92,7 @@ export class ModelWorkingContextCoordinator {
     const route = this.options.resolveRoute(target);
     if (!route?.supported) return undefined;
     return this.state(owner.ownerId).entries.find(entry => key(entry.target) === key(target))?.overrideTokens
-      ?? defaultWorkingContext(route.model);
+      ?? (route.model.contextWindowDisplayOnly ? undefined : defaultWorkingContext(route.model));
   }
   async read(query: ModelWorkingContextQuery, signal?: AbortSignal): Promise<ModelWorkingContextView> {
     const targets = validateTargets(query); const owner = this.owner(signal);

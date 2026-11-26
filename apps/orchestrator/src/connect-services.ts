@@ -10043,7 +10043,9 @@ export function backendCatalogModels(
         models.delete(`${provider.provider.id}\u0000${model.id}`);
         continue;
       }
-      const projected = piProviderModel(provider.provider, model);
+      const clientProtocol = backend.adapterKind === "codex" ? "openai-responses"
+        : backend.adapterKind === "claude-code" ? "anthropic-messages" : undefined;
+      const projected = piProviderModel(provider.provider, model, clientProtocol);
       models.set(`${projected.providerId}\u0000${projected.modelId}`, projected);
     }
   }
@@ -10942,8 +10944,8 @@ function providerModelPreviewRoute(dependencies: ConnectServiceDependencies, rou
   let modelsEndpoint: string | undefined;
   if (route.modelsEndpoint !== undefined) {
     if (!support.fields.includes("models_endpoint") || route.modelsEndpoint.length > 2048) throw invalidArgument("The Provider catalog endpoint is unavailable.");
-    const catalog = safeDiscoveryBaseUrl(route.modelsEndpoint);
-    if (catalog === undefined || !contract.sameOriginProviderCatalogEndpoint(endpoint, catalog)) throw invalidArgument("The Provider catalog endpoint must match its inference origin.");
+    const catalog = contract.resolveProviderCatalogEndpoint(endpoint, route.modelsEndpoint);
+    if (catalog === undefined) throw invalidArgument("The Provider catalog endpoint must match its inference origin.");
     modelsEndpoint = catalog.toString();
   }
   const purpose = "provider-model-preview:" + createHash("sha256").update(JSON.stringify([backendId, backend.instanceGeneration, api, endpoint.toString(), modelsEndpoint])).digest("hex");
@@ -11009,6 +11011,8 @@ function providerEntryFromProto(input: contract.ProviderConfiguration): Paramete
 
 function providerRuntimeFromProto(input: contract.ProviderRuntimeConfiguration, providerId: string): ManagedProviderRuntimeInput {
   const api = nativeProviderApi(input.apiCompatibility, true);
+  const catalog = input.modelsEndpoint === undefined ? undefined : contract.resolveProviderCatalogEndpoint(input.endpoint, input.modelsEndpoint);
+  if (input.modelsEndpoint !== undefined && catalog === undefined) throw invalidArgument("The Provider catalog endpoint must match its inference origin.");
   const headers: Record<string, { readonly env: string }> = {};
   const credentialBindings: Record<string, string> = {};
   if (input.credentialReferenceId !== "") {
@@ -11046,7 +11050,7 @@ function providerRuntimeFromProto(input: contract.ProviderRuntimeConfiguration, 
     credentialBindings,
     credentialOrigin: input.credentialOrigin,
     ...(input.requestPath === undefined ? {} : { requestPath: input.requestPath }),
-    ...(input.modelsEndpoint === undefined ? {} : { modelsEndpoint: input.modelsEndpoint })
+    ...(catalog === undefined ? {} : { modelsEndpoint: catalog.toString() })
   };
 }
 

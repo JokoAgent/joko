@@ -36,19 +36,25 @@ function oauth(authority: CodexHostedAuthenticationAuthority) {
 }
 
 describe("original native account authority", () => {
-  it("projects native working and maximum context for the original account and discards its cache after replacement", async () => {
+  it.each(["gpt-6.2-sol", "unlisted-future-model"])("projects native context for %s on the original account", async slug => {
     const f = await fixture();
-    const slug = "gpt-6.2-sol";
     f.fake.modelList = [{ ...f.fake.modelList[0]!, id: "catalog-sol", model: slug, displayName: "GPT-6.2 Sol" }];
     const now = Date.now();
     const stampAuth = async (age: number) => {
       const time = new Date(now - age);
       await utimes(f.authPath, time, time);
     };
-    const catalog = (identity: string, age: number, contextWindow: number, maxContextWindow?: number) =>
+    const catalog = (identity: string, age: number, contextWindow?: number, maxContextWindow?: number) =>
       writeFile(join(f.home, "models_cache.json"), JSON.stringify({ identity: identity.repeat(64), fetched_at: new Date(now - age).toISOString(),
         models: [{ slug, visibility: "list", supported_in_api: true, context_window: contextWindow, max_context_window: maxContextWindow }] }));
     await stampAuth(120_000);
+    if (slug === "unlisted-future-model") {
+      await catalog("a", 110_000, undefined, 180_000);
+      const maxOnly = (await f.adapter.describe()).models[0];
+      expect(maxOnly).toMatchObject({ modelId: slug, contextWindow: 180_000, contextWindowSource: "estimated",
+        contextWindowDisplayOnly: true, contextWindowMax: 180_000 });
+      expect(maxOnly).not.toHaveProperty("defaultWorkingContextTokens");
+    }
     await catalog("a", 90_000, 500_000, 1_050_000);
     expect((await f.adapter.describe()).models[0]).toMatchObject({ modelId: slug, providerId: "openai",
       contextWindow: 500_000, contextWindowSource: "declared", defaultWorkingContextTokens: 500_000, contextWindowMax: 1_050_000 });

@@ -12,6 +12,7 @@
   },
   {
     "id": "openrouter",
+    "regionHint": "global",
     "name": "OpenRouter",
     "docsUrl": "https://openrouter.ai/docs/cookbook/coding-agents/claude-code-integration",
     "runtimes": {
@@ -44,6 +45,7 @@
   },
   {
     "id": "zhipu-glm-cn",
+    "regionHint": "cn",
     "name": "智谱 GLM（中国大陆）",
     "nameEn": "Zhipu GLM (China)",
     "docsUrl": "https://docs.bigmodel.cn/cn/guide/develop/claude",
@@ -61,6 +63,7 @@
   },
   {
     "id": "zhipu-glm-global",
+    "regionHint": "global",
     "name": "Z.ai GLM (Global)",
     "docsUrl": "https://docs.z.ai/devpack/tool/claude",
     "runtimes": {
@@ -77,6 +80,7 @@
   },
   {
     "id": "moonshot-kimi-cn",
+    "regionHint": "cn",
     "name": "Kimi (Moonshot 中国大陆)",
     "nameEn": "Kimi (Moonshot China)",
     "docsUrl": "https://platform.moonshot.cn/docs/guide/agent-support",
@@ -96,6 +100,7 @@
   },
   {
     "id": "moonshot-kimi-global",
+    "regionHint": "global",
     "name": "Kimi (Moonshot Global)",
     "docsUrl": "https://platform.moonshot.ai/docs/guide/agent-support",
     "runtimes": {
@@ -133,6 +138,7 @@
   },
   {
     "id": "minimax-cn",
+    "regionHint": "cn",
     "name": "MiniMax（中国大陆）",
     "nameEn": "MiniMax (China)",
     "docsUrl": "https://platform.minimaxi.com/docs/api-reference/responses-create",
@@ -155,6 +161,7 @@
   },
   {
     "id": "minimax-global",
+    "regionHint": "global",
     "name": "MiniMax (Global)",
     "docsUrl": "https://platform.minimax.io/docs/api-reference/responses-create",
     "runtimes": {
@@ -176,6 +183,7 @@
   },
   {
     "id": "aliyun-bailian-coding",
+    "regionHint": "cn",
     "name": "阿里云百炼 Coding Plan（包月）",
     "nameEn": "Alibaba Cloud Bailian Coding Plan",
     "docsUrl": "https://help.aliyun.com/zh/model-studio/coding-plan",
@@ -196,6 +204,7 @@
   },
   {
     "id": "aliyun-bailian-token-plan-cn",
+    "regionHint": "cn",
     "name": "阿里云百炼 Token Plan（个人版）",
     "nameEn": "Alibaba Cloud Bailian Token Plan (Personal)",
     "docsUrl": "https://help.aliyun.com/zh/model-studio/token-plan-personal-overview",
@@ -218,6 +227,7 @@
   },
   {
     "id": "aliyun-bailian-token-plan-team-cn",
+    "regionHint": "cn",
     "name": "阿里云百炼 Token Plan（团队版）",
     "nameEn": "Alibaba Cloud Bailian Token Plan (Team)",
     "docsUrl": "https://help.aliyun.com/zh/model-studio/token-plan-team-overview",
@@ -248,6 +258,7 @@
   },
   {
     "id": "google-gemini-api",
+    "regionHint": "global",
     "name": "Google Gemini API",
     "docsUrl": "https://ai.google.dev/gemini-api/docs/openai",
     "runtimes": {
@@ -320,6 +331,7 @@
   },
   {
     "id": "zhipu-coding-plan-cn",
+    "regionHint": "cn",
     "name": "智谱 GLM Coding Plan（中国大陆）",
     "nameEn": "Zhipu GLM Coding Plan (China)",
     "docsUrl": "https://docs.bigmodel.cn/cn/coding-plan/quick-start",
@@ -337,6 +349,7 @@
   },
   {
     "id": "zai-coding-plan-global",
+    "regionHint": "global",
     "name": "Z.ai GLM Coding Plan (Global)",
     "docsUrl": "https://docs.z.ai/devpack/overview",
     "runtimes": {
@@ -353,6 +366,7 @@
   },
   {
     "id": "xiaomi-mimo-api-cn",
+    "regionHint": "cn",
     "name": "小米 MiMo API（按量）",
     "nameEn": "Xiaomi MiMo API (pay as you go)",
     "docsUrl": "https://mimo.mi.com/docs/zh-CN/quick-start/summary/first-api-call",
@@ -369,6 +383,7 @@
   },
   {
     "id": "xiaomi-mimo-token-plan-cn",
+    "regionHint": "cn",
     "name": "小米 MiMo Token Plan（包月）",
     "nameEn": "Xiaomi MiMo Token Plan",
     "docsUrl": "https://mimo.mi.com/docs/zh-CN/quick-start/summary/first-api-call",
@@ -384,6 +399,7 @@
   },
   {
     "id": "volcengine-api",
+    "regionHint": "cn",
     "name": "火山方舟 API",
     "nameEn": "Volcengine Ark API",
     "docsUrl": "https://www.volcengine.com/docs/82379/1330310",
@@ -396,6 +412,7 @@
   },
   {
     "id": "siliconflow-cn",
+    "regionHint": "cn",
     "name": "硅基流动（中国大陆）",
     "nameEn": "SiliconFlow (China Mainland)",
     "docsUrl": "https://docs.siliconflow.cn/cn/userguide/quickstart",
@@ -408,6 +425,7 @@
   },
   {
     "id": "siliconflow-global",
+    "regionHint": "global",
     "name": "硅基流动",
     "nameEn": "SiliconFlow",
     "docsUrl": "https://docs.siliconflow.com/en/userguide/quickstart",
@@ -420,6 +438,7 @@
   },
   {
     "id": "volcengine-agent-plan",
+    "regionHint": "cn",
     "name": "火山方舟 Agent Plan",
     "nameEn": "Volcengine Ark Agent Plan",
     "docsUrl": "https://docs.volcengine.com/docs/82379/2373738",
@@ -434,6 +453,7 @@
   },
   {
     "id": "volcengine-coding-plan",
+    "regionHint": "cn",
     "name": "火山方舟 Coding Plan",
     "nameEn": "Volcengine Ark Coding Plan",
     "docsUrl": "https://www.volcengine.com/docs/82379/1925114",
@@ -448,6 +468,7 @@
   },
   {
     "id": "tencentcloud-coding-plan",
+    "regionHint": "cn",
     "name": "腾讯云 Coding Plan",
     "nameEn": "Tencent Cloud Coding Plan",
     "docsUrl": "https://cloud.tencent.com/document/product/1823/130092",
@@ -463,6 +484,7 @@
   },
   {
     "id": "opencode-go",
+    "regionHint": "global",
     "name": "OpenCode Go",
     "docsUrl": "https://opencode.ai/docs/go/",
     "runtimes": {
@@ -492,6 +514,7 @@
   },
   {
     "id": "vercel-ai-gateway",
+    "regionHint": "global",
     "name": "Vercel AI Gateway",
     "docsUrl": "https://vercel.com/docs/ai-gateway/coding-agents",
     "runtimes": {
@@ -507,6 +530,7 @@
   },
   {
     "id": "agnes",
+    "regionHint": "global",
     "name": "Agnes AI",
     "docsUrl": "https://wiki.agnes-ai.com/en/docs/overview",
     "runtimes": {

@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import https from "node:https";
-import { access, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -13,6 +13,7 @@ import {
   isAllowedDownloadUrl,
   DOWNLOAD_TIMEOUT_MS,
   MIN_RUNTIME_INSTALL_FREE_BYTES,
+  managedRuntimeBinary,
   readManagedRuntimeManifest,
   runtimeAssetName,
   runtimeInstallPreflight,
@@ -226,6 +227,53 @@ describe("official runtime installer", () => {
     expect(installed.archiveSha256).toBe("ab".repeat(32));
     expect(relative(runtimeRoot(dataRoot), installed.binary).startsWith("v0.32.14")).toBe(true);
     await expect(readFile(installed.binary, "utf8")).resolves.toBe("binary");
+  });
+
+  it("repairs a missing same-version executable after cancellation and a failed promotion", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "joko-runtime-repair-"));
+    const root = runtimeRoot(dataRoot), version = "0.32.14";
+    const asset = selectOfficialAsset(release(runtimeAssetName(process.platform, "x64")!), process.platform, "x64")!;
+    const install = (mode: "initial" | "cancel" | "invalid" | "repair") => {
+      const abort = new AbortController();
+      return installManagedRuntime({
+        dataRoot, platform: process.platform, arch: "x64", signal: abort.signal, resolveAsset: async () => asset,
+        readFreeDiskBytes: async () => MIN_RUNTIME_INSTALL_FREE_BYTES + asset.sizeBytes,
+        downloadAsset: async ({ destination }) => writeFile(destination, "archive"),
+        extractArchive: async ({ destination }) => {
+          const bin = join(destination, "bin"), executable = join(bin, process.platform === "win32" ? "ollama.exe" : "ollama");
+          await mkdir(bin, { recursive: true });
+          await writeFile(join(destination, "library"), mode);
+          if (mode === "invalid") await mkdir(executable);
+          else await writeFile(executable, mode);
+          return executable;
+        },
+        onProgress: event => { if (mode === "cancel" && event.phase === "promoting") abort.abort(); }
+      });
+    };
+    try {
+      const installed = await install("initial");
+      const manifest = await readFile(join(root, "current.json"), "utf8");
+      await rm(installed.binary);
+      for (const [mode, code] of [["cancel", "OPERATION_CANCELLED"], ["invalid", "ARCHIVE_REJECTED"]] as const) {
+        await expect(install(mode)).rejects.toMatchObject({ code });
+        await expect(managedRuntimeBinary(dataRoot)).resolves.toBeUndefined();
+        await expect(readFile(join(root, "current.json"), "utf8")).resolves.toBe(manifest);
+        await expect(readFile(join(root, `v${version}`, "library"), "utf8")).resolves.toBe("initial");
+        expect((await readdir(root)).sort()).toEqual(["current.json", "downloads", `v${version}`]);
+      }
+      const repaired = await install("repair");
+      expect(repaired).toEqual(installed);
+      await expect(managedRuntimeBinary(dataRoot)).resolves.toBe(repaired.binary);
+      await expect(readFile(repaired.binary, "utf8")).resolves.toBe("repair");
+      await expect(readFile(join(root, `v${version}`, "library"), "utf8")).resolves.toBe("repair");
+      await expect(readManagedRuntimeManifest(dataRoot)).resolves.toMatchObject({
+        version, archiveSha256: asset.sha256, binaryRelativePath: relative(root, repaired.binary)
+      });
+      expect((await readdir(root)).sort()).toEqual(["current.json", "downloads", `v${version}`]);
+      expect(await readdir(join(root, "downloads"))).toEqual([]);
+    } finally {
+      await rm(dataRoot, { recursive: true, force: true });
+    }
   });
 
   it("never promotes an aborted or failed extraction", async () => {
