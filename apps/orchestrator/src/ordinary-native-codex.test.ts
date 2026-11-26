@@ -1,17 +1,145 @@
-import { mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { describe, expect, it } from "vitest";
+import { OperationalStore, SessionRuntimeHandoffStore } from "@joko/store";
 import { CodexBackendAdapter, StdioJsonRpcTransport, CODEX_MANAGED_PROVIDER_SUPPORT, type CodexNativeExecutionInput } from "@joko/adapter-codex";
 import type { AdapterContext, EventPayload, ManagedProviderRuntimePort, NativeSessionBinding, NativeToolAuthorization,
   OrderedPolicyRule, PolicySnapshot, ProviderModel, SessionDescriptor, TargetDescriptor } from "@joko/core";
 import { createNativeCodexExecution } from "./native-codex-execution.js";
 import { reviewNativeToolPolicy } from "./native-tool-policy.js";
+import { OperationalArtifactRepository } from "./artifact-repository.js";
+import { ArtifactStore } from "./artifact-store.js";
+import { BackendInstanceRegistry } from "./backend-instance-registry.js";
+import { SessionHost } from "./session-host.js";
 
 const binary = process.env["JOKO_CODEX_HOSTED_TEST_BINARY"];
 
 describe.skipIf(!binary)("ordinary actual Codex native execution", () => {
+  it("forks native history between the owner-selected native and managed Providers on the original task", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-provider-handoff-")));
+    const home = join(root, "native-home"), workspace = join(root, "workspace");
+    await Promise.all([mkdir(home), mkdir(workspace)]);
+    const requests: { path?: string; key?: string; model: string; history: string }[] = [];
+    const wire: { method: string; params: unknown }[] = [];
+    const server = createServer(async (request, response) => {
+      if (request.method !== "POST" || !request.url?.endsWith("/responses")) {
+        response.writeHead(404).end();
+        return;
+      }
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { model: string; input: unknown };
+      requests.push({ path: request.url, key: request.headers.authorization, model: body.model, history: JSON.stringify(body.input) });
+      const id = String(requests.length);
+      const item = { type: "message", id: "answer-" + id, role: "assistant", status: "completed",
+        content: [{ type: "output_text", text: "REPLY " + id, annotations: [] }] };
+      const events = [
+        { type: "response.created", response: { id, status: "in_progress", output: [] } },
+        { type: "response.output_item.done", output_index: 0, item },
+        { type: "response.completed", response: { id, status: "completed", output: [item], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } }
+      ];
+      response.writeHead(200, { "content-type": "text/event-stream", connection: "close" });
+      response.end(events.map(event => "event: " + event.type + "\ndata: " + JSON.stringify(event) + "\n\n").join(""));
+    });
+    const store = new OperationalStore(join(root, "store.sqlite"));
+    let host: SessionHost | undefined, adapter: CodexBackendAdapter | undefined;
+    try {
+      await new Promise<void>((ready, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", ready); });
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("The controlled model listener is unavailable.");
+      const endpoint = `http://127.0.0.1:${address.port}`;
+      await writeFile(join(home, "config.toml"), `model_provider = "openai"\nopenai_base_url = "${endpoint}/native/v1"\ncli_auth_credentials_store = "file"\n[features]\napi_key_model_discovery = false\nenable_request_compression = false\n`);
+      await writeFile(join(home, "auth.json"), JSON.stringify({ auth_mode: "apikey", OPENAI_API_KEY: "fixture-native-model-key" }));
+      const model: ProviderModel = { providerId: "fixture-managed", modelId: "managed-model", displayName: "Managed model", api: "openai-responses",
+        contextWindow: 32000, maxOutputTokens: 4096, supportsImages: false, thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+      const port: ManagedProviderRuntimePort = { support: CODEX_MANAGED_PROVIDER_SUPPORT, environment: { JOKO_HANDOFF_KEY: "fixture-managed-model-key" },
+        secretEnvironmentNames: ["JOKO_HANDOFF_KEY"], dispose: () => undefined, hasProvider: id => id === model.providerId, listModels: () => [model],
+        getThinkingLevelMap: () => ({}), listProviders: () => [{ providerId: model.providerId, displayName: "Managed", api: model.api,
+          authenticationState: "authenticated", loginMethods: ["api_key"], supportsLogin: false, supportsLogout: false, supportsRefresh: false, supportsModelRefresh: false }],
+        prepare: async () => ({ providerId: model.providerId, model, thinkingLevelMap: {}, protocol: "openai-responses", revision: "fixture-v1",
+          baseUrl: endpoint + "/managed/v1", apiKeyEnvironment: "JOKO_HANDOFF_KEY", assertCurrent: () => undefined,
+          activate: async () => ({ release: () => undefined }), dispose: () => undefined }) };
+      const env = { PATH: process.env["PATH"], SystemRoot: process.env["SystemRoot"], HOME: home, USERPROFILE: home,
+        LOCALAPPDATA: home, APPDATA: home, CODEX_HOME: home, TEMP: root, TMP: root };
+      adapter = new CodexBackendAdapter({ instanceGeneration: 1, profileDirectory: home, managedProviders: port,
+        appServer: { transport: { command: binary!, env }, transportFactory: options => {
+          const transport = new StdioJsonRpcTransport({ ...options, command: binary!, requestTimeoutMs: 30_000 });
+          const dispatch = transport.request.bind(transport);
+          transport.request = (method, params, options) => { wire.push({ method, params }); return dispatch(method, params, options); };
+          return transport;
+        } } });
+      const registry = new BackendInstanceRegistry(store);
+      await registry.provision([{ instanceId: adapter.id, adapterKind: "codex", displayName: "Codex", create: () => adapter! }]);
+      const artifacts = new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] });
+      await artifacts.initialize();
+      host = new SessionHost(store, artifacts, registry.availableAdapters(), { backendDescriptors: registry.descriptors(), backendDescriptorsAlreadyPublished: true });
+      await host.initialize();
+      const target = { id: "codex-handoff-target", backendId: adapter.id, displayName: "Original workspace", workspaceRoot: workspace, managed: false, trusted: true };
+      await host.registerTarget(target);
+      const connection = store.createConnection({ id: "owner", name: "Original owner", authKeyDigest: "fixture-digest" });
+      const native = registry.get(adapter.id).descriptor.models.find(candidate => candidate.providerId === "openai" && candidate.modelId === "gpt-5.5");
+      expect(native).toBeDefined();
+      const { sessionId } = (await host.createSession({ operationId: "create-original", connection, targetId: target.id, title: "Original task",
+        providerId: native!.providerId, modelId: native!.modelId, permissionMode: "bypassPermissions", planMode: false, fastMode: false })).value;
+      const handoffs = new SessionRuntimeHandoffStore(store);
+      const send = async (id: string, text: string) => {
+        const queued = host!.enqueueInput({ operationId: id, connection, sessionId,
+          prompt: { text, images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+        await expect.poll(() => {
+          const row = store.getQueueItem(queued.queueItemId);
+          return { state: row.state, error: row.error, handoff: handoffs.read(sessionId)?.pending?.phase };
+        }, { timeout: 30_000 }).toEqual({ state: "completed", error: undefined, handoff: undefined });
+      };
+      const assertOwner = () => undefined;
+      await send("send-native", "FIRST NATIVE USER INPUT");
+      const source = store.getSession(sessionId).descriptor.binding;
+      expect(await host.stageUserModelProviderHandoff({ sessionId, patch: { providerId: model.providerId, modelId: model.modelId }, assertOwner })).toBe(true);
+      expect(store.getSession(sessionId).descriptor.binding).toEqual(source);
+      expect(handoffs.read(sessionId)?.pending).toMatchObject({ phase: "pending", nativeProvider: true });
+      await send("send-managed", "SECOND MANAGED USER INPUT");
+      const managed = store.getSession(sessionId).descriptor.binding;
+      expect(managed.generation).toBeGreaterThan(source.generation);
+      expect(managed.nativeSessionId).not.toBe(source.nativeSessionId);
+      const control = host.getSessionRuntimeControl(sessionId);
+      expect(await host.setSessionRuntimeControl({ sessionId, expectedGeneration: control.generation,
+        patch: { backendId: adapter.id, providerId: native!.providerId, modelId: native!.modelId },
+        allowNativeProviderHandoff: true, assertAuthority: assertOwner })).toMatchObject({ status: "deferred", effectiveBoundary: "next_send" });
+      await send("send-native-again", "THIRD NATIVE USER INPUT");
+      const final = store.getSession(sessionId).descriptor;
+      expect(final).toMatchObject({ id: sessionId, targetId: target.id, backendId: adapter.id,
+        providerId: native!.providerId, modelId: native!.modelId, permissionMode: "bypassPermissions" });
+      expect(final.binding.generation).toBeGreaterThan(managed.generation);
+      expect(final.binding.nativeSessionId).not.toBe(managed.nativeSessionId);
+      expect(wire.filter(row => row.method === "thread/fork").map(row => row.params)).toEqual([
+        expect.objectContaining({ threadId: source.nativeSessionId, modelProvider: "joko-managed", excludeTurns: true }),
+        expect.objectContaining({ threadId: managed.nativeSessionId, modelProvider: "openai", excludeTurns: true })
+      ]);
+      expect(requests.map(({ path, key, model }) => [path, key, model])).toEqual([
+        ["/native/v1/responses", "Bearer fixture-native-model-key", native!.modelId],
+        ["/managed/v1/responses", "Bearer fixture-managed-model-key", model.modelId],
+        ["/native/v1/responses", "Bearer fixture-native-model-key", native!.modelId]
+      ]);
+      expect(requests[1]?.history).toContain("FIRST NATIVE USER INPUT");
+      expect(requests[1]?.history).toContain("REPLY 1");
+      expect(requests[2]?.history).toContain("FIRST NATIVE USER INPUT");
+      expect(requests[2]?.history).toContain("SECOND MANAGED USER INPUT");
+      expect(requests[2]?.history).toContain("THIRD NATIVE USER INPUT");
+      expect(store.listRuns({ sessionId }).map(row => row.descriptor.state)).toEqual(["succeeded", "succeeded", "succeeded"]);
+    } finally {
+      try { if (host) await host.dispose(); else await adapter?.dispose(); }
+      finally {
+        store.close();
+        server.closeAllConnections();
+        if (server.listening) await new Promise<void>(closed => server.close(() => closed()));
+        const owned = relative(resolve(tmpdir()), resolve(root));
+        if (isAbsolute(owned) || owned === ".." || owned.startsWith(`..${sep}`) || !owned.startsWith("joko-codex-provider-handoff-")) throw new Error("Native fixture cleanup escaped its temporary root.");
+        await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 });
+      }
+    }
+  }, 180_000);
+
   it("enforces ordered command policy in FullAccess and executes only under the next allowed turn owner", async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-ordinary-native-")));
     const project = join(root, "project"), home = join(root, "native-home");

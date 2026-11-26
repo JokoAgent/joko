@@ -12,7 +12,12 @@ const DIRECT_FIELDS: ChatBridgeCapabilities["passthroughFields"] = [
 
 export function prepareChatCompletion(
   body: Record<string, unknown>,
-  options: { readonly modelId: string; readonly endpoint: URL; readonly supportsImages: boolean }
+  options: {
+    readonly modelId: string;
+    readonly endpoint: URL;
+    readonly supportsImages: boolean;
+    readonly codexHistory?: boolean;
+  }
 ): TranslatedResponsesChatRequest {
   if (body["model"] !== options.modelId || body["previous_response_id"] != null
     || body["conversation"] != null || body["background"] === true
@@ -20,12 +25,18 @@ export function prepareChatCompletion(
     throw new UnsupportedResponsesFeatureError("request");
   }
   const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(options.endpoint.hostname);
+  const official = options.codexHistory === true && options.endpoint.protocol === "https:";
+  const deepSeek = official && options.endpoint.hostname === "api.deepseek.com" && /^deepseek/iu.test(options.modelId);
+  const gemini = official && options.endpoint.hostname === "generativelanguage.googleapis.com"
+    && /^\/v1(?:beta)?\/openai\/chat\/completions\/?$/u.test(options.endpoint.pathname) && /^gemini-/iu.test(options.modelId);
   return translateResponsesRequestWithContext(body as unknown as ResponsesRequest, {
     capabilities: {
       developerRole: "system",
       maxTokensField: "max_tokens",
       streamUsage: true,
       passthroughFields: DIRECT_FIELDS,
+      ...(deepSeek ? { reasoningHistoryField: "reasoning_content", toolCallReasoningPlaceholder: true, forceAutoToolChoice: true } : {}),
+      ...(gemini ? { reasoningField: "reasoning_effort", googleThoughtSignaturePlaceholder: true } : {}),
       ...(options.supportsImages ? { imageInput: "image_url" as const } : {}),
       ...(loopback ? { systemMessagePolicy: "coalesce-leading" as const } : {})
     }

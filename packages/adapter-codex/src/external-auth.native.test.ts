@@ -117,10 +117,10 @@ describe.skipIf(!binary)("published native ephemeral account contract", () => {
   it("installs a private API key in memory and leaves the native history credential file untouched", async () => {
     const home = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-ephemeral-key-"))), auth = join(home, "auth.json");
     const sentinel = "unrelated private history credential sentinel"; await writeFile(auth, sentinel);
-    // Native probe children can keep a Windows working directory open while
-    // the app-server exits. Keep that directory outside the credential fixture.
+    // Plugin sync starts Git in CODEX_HOME. Its children can outlive the app-server and hold this directory on Windows.
     const host = new AppServerHost({ requireEphemeralAuth: true, apiKeyAuth: async () => "private-fixture-api-key",
-      transport: { command: binary!, cwd: tmpdir(), env: environment(home), args: ["app-server", "--listen", "stdio://", "-c", 'cli_auth_credentials_store="ephemeral"'] } });
+      transport: { command: binary!, cwd: tmpdir(), env: environment(home), args: ["app-server", "--listen", "stdio://",
+        "--disable", "plugins", "--disable", "remote_plugin", "-c", 'cli_auth_credentials_store="ephemeral"'] } });
     try {
       await host.ensureStarted(); expect(host.initializeResult?.userAgent).toContain("0.166.0");
       expect((await host.request("config/read", { includeLayers: false })).value).toMatchObject({ config: { cli_auth_credentials_store: "ephemeral" } });

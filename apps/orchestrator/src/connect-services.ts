@@ -18581,7 +18581,7 @@ async function dispatchMutation(
             ...(value.modelId === undefined ? {} : { modelId: value.modelId }),
             ...(value.effort === undefined ? {} : { effort: value.effort }),
             ...(value.fastMode === undefined && value.ultrafastMode === undefined ? {} : { fastMode: contract.decodeModelSpeed(value) }) },
-          assertAuthority: () => dependencies.connections.fence(connection) });
+          assertAuthority: () => dependencies.connections.fence(connection), allowNativeProviderHandoff: true });
       });
     }
     case "setSessionModel": {
@@ -18610,12 +18610,22 @@ async function dispatchMutation(
         readonly effort: string | null;
         readonly fastMode: boolean | "ultrafast";
       } | undefined;
+      let providerHandoff = false;
       const execution = await host.mutate({
         operationId,
         connection,
         kind: payload.case,
         body: mutation,
         effect: async () => {
+          if (!axisOnly) {
+            providerHandoff = await host.stageUserModelProviderHandoff({
+              sessionId: payload.value.sessionId,
+              patch: { providerId: modelKey.providerId, modelId: modelKey.modelId,
+                effort: model.effortId || undefined, fastMode: contract.decodeModelSpeed(model) },
+              assertOwner: () => dependencies.connections.fence(connection)
+            });
+            if (providerHandoff) return;
+          }
           const state = axisOnly
             ? await host.applyUserSessionRuntimeAxes(payload.value.sessionId, {
                 effort: selectedModel?.thinkingLevels.length === 0
@@ -18652,12 +18662,13 @@ async function dispatchMutation(
           };
         },
         commit: (store) => {
+          if (providerHandoff) return { accepted: true, resultCase: "session", entityId: payload.value.sessionId } satisfies OperationOutcome;
           if (resolved === undefined) throw new Error("The resolved Backend model selection is missing.");
           store.updateSession(payload.value.sessionId, resolved);
           return { accepted: true, resultCase: "session", entityId: payload.value.sessionId } satisfies OperationOutcome;
         }
       });
-      if (!execution.replayed && !axisOnly) host.recordUserSessionRuntimeSelection(payload.value.sessionId);
+      if (!execution.replayed && !axisOnly && !providerHandoff) host.recordUserSessionRuntimeSelection(payload.value.sessionId);
       return presented(execution);
     }
     case "setSessionPermission": {

@@ -105,6 +105,7 @@ import {
 import { codexLegacyRewindAnchor, codexNativeDispatchFingerprint, materializeCodexHistoryImages, projectCodexNativeHistory } from "./native-history.js";
 import { readCodexNativeSessionPreview } from "./native-session-preview.js";
 import { readCodexCatalogRolloutMessages } from "./catalog-rollout-history.js";
+import { readCodexCatalogAccount, readCodexModelContextCatalog, type CodexModelContext } from "./model-context-catalog.js";
 import { readCodexPortableRollout, stageCodexPortableRollout } from "./portable-rollout.js";
 import { codexAccountResetFacts } from "./account-rate-limit-resets.js";
 import {
@@ -358,6 +359,7 @@ interface SessionRuntime {
   readonly pendingServerRequests: Map<string, PendingServerRequest>;
   readonly pendingMcpCalls: Set<PendingMcpCall>;
   readonly nativeTasks: CodexNativeTaskProjection;
+  readonly openMcpBridge?: CodexReadScope["openMcpBridge"];
   readonly mcp?: CodexMcpRuntimeLease;
   /** Local create isolated the native profile before the durable Session existed. */
   readonly mcpPending: boolean;
@@ -689,6 +691,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   #smartRoutingHostFlight: Promise<number> | undefined;
   #account: CodexAccountSnapshot | undefined;
   #nativeAuthenticationEpoch = 0;
+  #modelContextCatalogOwner?: { readonly accountKey: string; readonly identity: string };
   #accountUsageLoginEpoch = 0;
   #accountUsageLoginRequests = 0;
   #accountUsageRequest = 0;
@@ -836,19 +839,14 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     try {
       account = await this.readAccount();
     } catch {
-      this.#account = undefined;
-      this.#models = [];
       diagnostics.push("Codex account state could not be refreshed.");
     }
     if (account !== undefined && codexAccountModelsAvailable(account.authenticationState)) {
       try {
-        this.#models = await this.listModels();
+        await this.listModels();
       } catch {
-        this.#models = [];
         diagnostics.push("Codex model catalog could not be refreshed.");
       }
-    } else {
-      this.#models = [];
     }
     this.#models = this.#withManagedModels(this.#models);
     const authenticationState = this.#account?.authenticationState ?? "error";
@@ -1210,7 +1208,50 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     return this.#withNativeMutation(context, () => this.#createSession(input, context), input);
   }
 
-  async #createSession(input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {
+  async requiresModelProviderHandoff(providerId: string, context: AdapterContext): Promise<boolean> {
+    if (this.#hosted !== undefined || context.target.remoteWorkspace !== undefined || context.runtimePolicy === "review_read_only"
+      || this.#ownedHostOptions?.transport?.command === undefined) return false;
+    const scope = await this.#readScope(context.target, context.signal);
+    if (versionFromUserAgent(scope.host.initializeResult?.userAgent) !== CODEX_APP_SERVER_VERSION || !context.binding) return false;
+    const current = this.#sessions.get(context.sessionId);
+    const saved = current !== undefined && this.#matchesCoreFence(current, context) && this.#isRuntimeCurrent(current, current.hostGeneration)
+      ? current.processProviderId ?? current.providerId
+      : (await this.#readValidatedNativeThread(threadIdFromBinding(context.binding), context.target, "provision",
+          context.signal, parseNativeReference(context.binding.opaqueRef).profileKey, scope)).processProviderId;
+    if (!saved) throw invalidNativeReference();
+    if (this.#smartRoutingApplied) return saved !== SMART_PROCESS_PROVIDER && !/^joko-smart-[0-9a-f]{32}$/u.test(saved);
+    if (this.#managedProviders?.hasProvider(providerId)) {
+      return saved !== MANAGED_PROCESS_PROVIDER && saved !== providerId && saved !== nativeManagedChatProviderId(providerId);
+    }
+    return saved !== providerId;
+  }
+
+  hasEmptyModelProviderHandoffSource(binding: NativeSessionBinding, context: AdapterContext): boolean {
+    const runtime = this.#sessions.get(context.sessionId);
+    if (runtime === undefined || runtime.binding.opaqueRef !== binding.opaqueRef
+      || !this.#matchesCoreFence(runtime, context) || !this.#isRuntimeCurrent(runtime, runtime.hostGeneration)
+      || runtimeHasProductWork(runtime) || runtime.compaction !== undefined || runtime.nativeTasks.hasActiveTasks()) return false;
+    const proof = this.#freshNativeHistory.get(runtime);
+    return proof !== undefined && runtime.host.contentRevision(runtime.threadId, runtime.hostGeneration) === proof.revision;
+  }
+
+  async forkSessionForModel(source: NativeSessionBinding, input: CreateNativeSessionInput, context: AdapterContext): Promise<NativeSessionBinding> {
+    const fork = { ...input, nativeStart: { kind: "new" as const, parentNativeReference: source.opaqueRef } };
+    return this.#withNativeMutation(context, async () => {
+      this.#assertContextTarget(context, input.target);
+      assertStandardReviewContext(context, "fork native history for a new Provider");
+      if (!input.target.trusted || input.target.remoteWorkspace !== undefined || this.#hosted !== undefined
+        || source.generation + 1 !== context.generation) throw managedRouteUnavailable();
+      const threadId = threadIdFromBinding(source);
+      const inspected = await this.#readValidatedNativeThread(threadId, input.target, "provision", context.signal,
+        parseNativeReference(source.opaqueRef).profileKey).catch(error => { throw this.#nativeThreadReadFailure(error, "provision"); });
+      if (inspected.thread.status?.["type"] === "active") throw managedRouteUnavailable();
+      inspected.scope.assertCurrent();
+      return this.#createSession(fork, context, threadId);
+    }, fork);
+  }
+
+  async #createSession(input: CreateNativeSessionInput, context: AdapterContext, providerForkSource?: string): Promise<NativeSessionBinding> {
     this.#assertOpen();
     const nativeAuthenticationEpoch = this.#nativeAuthenticationEpoch;
     const runtimePolicy = reviewRuntimePolicy(input, context);
@@ -1269,6 +1310,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             ...(input.modelId === undefined ? {} : { model: input.modelId }),
             ...(input.providerId === undefined ? {} : { modelProvider: input.providerId }),
             serviceTier: fastServiceTier(input.fastMode),
+            ...(providerForkSource === undefined || (input.appendSystemPrompt === undefined && context.appendSystemPrompt === undefined)
+              ? {} : { developerInstructions: input.appendSystemPrompt ?? context.appendSystemPrompt }),
             ...permissionParams(input.permissionMode)
           }
         }
@@ -1356,6 +1399,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         mutation: true,
         signal: context.signal,
         beforeDispatch: () => {
+          input.assertNativeCreationCurrent?.();
           scope.assertCurrent();
           this.#assertNativeAuthenticationAdmission(nativeAuthenticationAdmission);
           nativeSkills?.assertCurrent();
@@ -1377,6 +1421,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     try {
       this.#assertNativeAuthenticationAdmission(nativeAuthenticationAdmission);
       thread = parseThreadResult(response.value);
+      if (thread.id === providerForkSource) throw invalidNativeReference();
       createdThreadId = thread.id;
       if (request.method === "thread/start" && thread.historyMode !== "paginated") {
         throw adapterError({
@@ -1389,6 +1434,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }
       record = objectValue(response.value, "session response");
       this.#assertManagedRouteResponse(record, managedRoute, scope.processProviderId);
+      if (providerForkSource !== undefined) {
+        const expectedProvider = (request.params as JsonObject)["modelProvider"];
+        await assertNativeThreadTarget(thread, thread.id, cwd, "provision");
+        if (typeof expectedProvider !== "string" || record["modelProvider"] !== expectedProvider
+          || record["model"] !== input.modelId) throw managedRouteUnavailable(true);
+      }
       const observedModelId = optionalString(record["model"]) ?? input.modelId;
       if (smartRoute !== undefined) {
         if (record["modelProvider"] !== (scope.processProviderId ?? smartRoute.modelProviderId) || observedModelId === undefined) throw smartRouteUnavailable(true);
@@ -1523,13 +1574,14 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const mustReloadConfiguration = this.#hosted !== undefined || this.#nativeExecution !== undefined || nativeWebPolicy(context.nativeToolAuthorization?.snapshot?.() ?? context.policySnapshot) !== undefined
       || workingContextWindow !== undefined || managedRoute !== undefined || smartRoute !== undefined
       || (!inspection.scope.remote && (inspection.scope.openMcpBridge !== undefined || this.#resolveNativeSkills !== undefined))
+      || (inspection.scope.remote && current?.mcp !== undefined && inspection.scope.openMcpBridge !== undefined)
       || (inspection.scope.prepareNativeSkills !== undefined && this.#resolveNativeSkills !== undefined);
     if (mustReloadConfiguration) {
       if (inspection.thread.status?.["type"] === "active") {
         managedRoute?.dispose(); smartRoute?.dispose();
         throw smartRoute !== undefined ? smartRouteUnavailable(true)
           : managedRoute !== undefined ? managedRouteUnavailable(true)
-          : mcpUnavailable(false);
+          : mcpUnavailable(inspection.scope.remote);
       }
     }
     const mcpPending = deferLocalMcpUntilSessionCommit
@@ -1576,7 +1628,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         await mcp?.release().catch(() => undefined);
         throw smartRoute !== undefined ? smartRouteUnavailable(true)
           : managedRoute !== undefined ? managedRouteUnavailable(true)
-          : mcpUnavailable(false, true);
+          : mcpUnavailable(inspection.scope.remote, true);
       }
     }
     const response = await this.#resumeNativeThread(
@@ -2593,7 +2645,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     let response;
     try {
       await this.#activateManagedOperation(runtime, context);
-      response = await this.#host.request("thread/compact/start", { threadId: runtime.threadId }, { mutation: true, signal: context.signal });
+      response = await runtime.host.request("thread/compact/start", { threadId: runtime.threadId }, {
+        mutation: true, signal: context.signal, beforeDispatch: () => this.#assertRuntimeFence(runtime, context, runtime.hostGeneration)
+      });
       this.#assertRuntimeFence(runtime, context, response.hostGeneration);
       await completion;
       this.#assertRuntimeFence(runtime, context, response.hostGeneration);
@@ -2751,23 +2805,26 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const admission = { count: 0, rewinding: true };
     this.#sessionMutations.set(context.sessionId, admission);
     const hostGeneration = runtime.hostGeneration;
+    const host = runtime.host;
     const signal = AbortSignal.any([context.signal, runtime.dispatchLifetime.signal]);
-    const assertIdle = () => {
+    const assertIdle = (checkNotifications = true) => {
       assertDispatchNotCancelled(signal);
       if (!this.#matchesCoreFence(runtime, context) || runtime.hostGeneration !== hostGeneration
-        || !this.#host.isActiveGeneration(hostGeneration)) throw nativeHistoryReadFailure("STALE");
+        || !host.isActiveGeneration(hostGeneration)) throw nativeHistoryReadFailure("STALE");
       if (runtimeHasProductWork(runtime) || runtime.compaction !== undefined
         || runtime.pendingServerRequests.size !== 0 || runtime.nativeTasks.hasActiveTasks()
-        || this.#host.hasPendingThreadNotifications(runtime.threadId, hostGeneration)) throw rewindBusy();
+        || checkNotifications && host.hasPendingThreadNotifications(runtime.threadId, hostGeneration)) throw rewindBusy();
     };
     try {
+      assertIdle(false);
+      await host.waitForThreadNotifications(runtime.threadId, hostGeneration, AbortSignal.any([signal, AbortSignal.timeout(this.#historyReadTimeoutMs)]));
       assertIdle();
       const history = await this.#readCompleteHistory(runtime, context);
       assertIdle();
       const legacy = history.thread.historyMode === "legacy" && this.#supportsLegacyDialogueRewind(runtime);
       if (!legacy) assertRewindableHistory(history.thread);
       for (const lineage of runtime.nativeTasks.mergeHistory(history.thread)) {
-        await this.#host.registerDescendantThread(lineage.childThreadId, lineage.parentThreadId, hostGeneration);
+        await host.registerDescendantThread(lineage.childThreadId, lineage.parentThreadId, hostGeneration);
         history.assertCurrent();
       }
       assertIdle();
@@ -2799,7 +2856,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       const expectedPrefix = history.thread.turns.slice(0, index + 1).map(fullTurnSignature);
       let response;
       try {
-        response = await this.#host.request("thread/revert", { threadId: runtime.threadId, beforeTurnId: excluded.id }, {
+        response = await host.request("thread/revert", { threadId: runtime.threadId, beforeTurnId: excluded.id }, {
           mutation: true, signal, beforeDispatch
         });
       } catch (error) {
@@ -2822,7 +2879,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         // A lost acknowledgement is never resent. Only the exact retained
         // prefix, read from the same live owner, can confirm the desired state.
         const confirm = async () => {
-          await this.#host.waitForThreadNotifications(runtime.threadId, hostGeneration, confirmationSignal);
+          await host.waitForThreadNotifications(runtime.threadId, hostGeneration, confirmationSignal);
           assertIdle();
           return this.#readCompleteHistory(runtime, confirmationContext);
         };
@@ -2839,7 +2896,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         if (JSON.stringify(retained.thread.turns.map(fullTurnSignature)) !== JSON.stringify(expectedPrefix)) throw new ProtocolShapeError("revert retained prefix differs");
         retained.assertCurrent();
         const retainedDescendants = runtime.nativeTasks.replaceHistory(retained.thread);
-        this.#host.retainDescendantThreads(runtime.threadId, hostGeneration, new Set(retainedDescendants.map((lineage) => lineage.childThreadId)));
+        host.retainDescendantThreads(runtime.threadId, hostGeneration, new Set(retainedDescendants.map((lineage) => lineage.childThreadId)));
         runtime.state.activeTurnId = undefined;
         runtime.state.usage = undefined;
         runtime.state.itemNames.clear();
@@ -3522,7 +3579,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   async listModels(): Promise<readonly ProviderModel[]> {
     this.#assertOpen();
-    await this.#ensureLocalHostStarted();
+    const generation = await this.#ensureLocalHostStarted();
     const account = this.#account ?? await this.readAccount();
     if (!codexAccountModelsAvailable(account.authenticationState)) {
       this.#models = this.#withManagedModels([]);
@@ -3531,6 +3588,29 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const models: ProviderModel[] = [];
     const nativeIds = new Set<string>();
     const seenCursors = new Set<string>();
+    const host = this.#host, epoch = this.#nativeAuthenticationEpoch, loginEpoch = this.#accountUsageLoginEpoch;
+    const home = account.authMode === "chatgpt" && this.#hosted === undefined ? host.initializeResult?.codexHome : undefined;
+    const stillCurrent = () => !this.#disposed && host === this.#host && host.isActiveGeneration(generation)
+      && epoch === this.#nativeAuthenticationEpoch && loginEpoch === this.#accountUsageLoginEpoch
+      && this.#accountUsageLoginRequests === 0 && this.#account?.authenticationState !== "pending";
+    const nativeAccount = home === undefined ? undefined : await readCodexCatalogAccount(home);
+    const publish = async () => {
+      const catalog = home === undefined || nativeAccount === undefined ? undefined : await readCodexModelContextCatalog(home);
+      const currentAccount = home === undefined || catalog === undefined ? undefined : await readCodexCatalogAccount(home);
+      if (!stillCurrent()) throw nativeAuthenticationObservationStale();
+      if (nativeAccount !== undefined && currentAccount !== undefined && catalog !== undefined && nativeAccount.key === currentAccount.key) {
+        const prior = this.#modelContextCatalogOwner;
+        const owned = prior?.identity === catalog.identity && prior.accountKey === currentAccount.key
+          || prior?.identity !== catalog.identity && catalog.fetchedAt >= currentAccount.modifiedAt && catalog.fetchedAt <= Date.now() + 60_000;
+        if (owned) {
+          this.#modelContextCatalogOwner = { accountKey: currentAccount.key, identity: catalog.identity };
+          this.#models = this.#withManagedModels(models.map(model => withCodexModelContext(model, catalog.models.get(model.modelId))));
+          return this.#models;
+        }
+      }
+      this.#models = this.#withManagedModels(models);
+      return this.#models;
+    };
     let cursor: string | undefined;
     let pages = 0;
     try {
@@ -3539,11 +3619,13 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           throw paginationError("CODEX_MODEL_PAGINATION_LIMIT", "model discovery");
         }
         const pageLimit = Math.min(100, this.#maximumModels - models.length);
-        const response = await this.#host.request("model/list", {
+        if (!stillCurrent()) throw nativeAuthenticationObservationStale();
+        const response = await host.request("model/list", {
           limit: pageLimit,
           includeHidden: true,
           ...(cursor === undefined ? {} : { cursor })
         });
+        if (!stillCurrent() || response.hostGeneration !== generation) throw nativeAuthenticationObservationStale();
         pages += 1;
         const page = parseModels(response.value, pageLimit);
         for (const native of page.models) {
@@ -3552,16 +3634,14 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           nativeIds.add(identity);
           models.push(modelFromNative(native, this.#providerId));
           if (models.length >= this.#maximumModels) {
-            this.#models = this.#withManagedModels(models);
-            return this.#models;
+            return await publish();
           }
         }
         cursor = nextPaginationCursor(page.nextCursor, seenCursors, "CODEX_MODEL_PAGINATION_INVALID", "model discovery");
       } while (cursor !== undefined);
-      this.#models = this.#withManagedModels(models);
-      return this.#models;
+      return await publish();
     } catch (error) {
-      this.#models = [];
+      if (stillCurrent()) this.#models = [];
       throw this.#requestFailure(error, "probe", "CODEX_MODEL_DISCOVERY_FAILED", false);
     }
   }
@@ -4008,7 +4088,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       pathStyle: runtime.remote
         ? remoteWorkspacePathStyle(runtime.context.target.remoteWorkspace) ?? "posix"
         : nativeRuntimePathStyle(runtime.host),
-      ...(!runtime.remote && this.#localMcpBridge !== undefined ? { openMcpBridge: this.#localMcpBridge } : {}),
+      ...(runtime.openMcpBridge === undefined ? {} : { openMcpBridge: runtime.openMcpBridge }),
       ...(runtime.prepareNativeSkills === undefined ? {} : { prepareNativeSkills: runtime.prepareNativeSkills }),
       ...(runtime.assertRemoteShutdownCurrent === undefined ? {} : { assertRemoteShutdownCurrent: runtime.assertRemoteShutdownCurrent }),
       ...(runtime.openExecServerProcess === undefined ? {} : { openExecServerProcess: runtime.openExecServerProcess }),
@@ -5092,6 +5172,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       pendingServerRequests: new Map(),
       pendingMcpCalls: new Set(),
       nativeTasks,
+      ...(input.scope.openMcpBridge === undefined ? {} : { openMcpBridge: input.scope.openMcpBridge }),
       ...(input.mcp === undefined ? {} : { mcp: input.mcp }),
       mcpPending: input.mcpPending === true,
       workingContextWindow: typeof input.nativeConfiguration?.["model_context_window"] === "number"
@@ -9454,6 +9535,14 @@ function modelFromNative(model: NativeModel, providerId: string): ProviderModel 
       }
     })
   };
+}
+
+function withCodexModelContext(model: ProviderModel, native: CodexModelContext | undefined): ProviderModel {
+  if (native === undefined) return model;
+  const contextWindow = native.contextWindow ?? Math.min(model.contextWindow, native.contextWindowMax ?? model.contextWindow);
+  return { ...model, contextWindow,
+    ...(native.contextWindow === undefined ? {} : { contextWindowSource: "declared" as const, defaultWorkingContextTokens: native.contextWindow }),
+    ...(native.contextWindowMax === undefined ? {} : { contextWindowMax: native.contextWindowMax }) };
 }
 
 function resolveWorkingContext(context: AdapterContext, providerId: string | undefined, modelId: string | undefined): number | undefined {

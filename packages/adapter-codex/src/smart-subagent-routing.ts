@@ -314,7 +314,7 @@ export function buildCodexSmartRoutingLaunchArgs(
   ];
 }
 
-async function readNativeCatalog(codexHome: string): Promise<{ readonly value: unknown; readonly digest: string }> {
+export async function readNativeCatalog(codexHome: string): Promise<{ readonly value: unknown; readonly digest: string }> {
   const requestedHome = resolve(codexHome);
   const home = await realpath(requestedHome);
   if (!samePath(home, requestedHome)) throw new Error("aliased profile");

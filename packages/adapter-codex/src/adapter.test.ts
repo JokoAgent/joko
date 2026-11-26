@@ -1565,12 +1565,12 @@ describe("CodexBackendAdapter", () => {
 
   it("enriches only runtime-returned GPT-6 models and default-hides the superseded family", async () => {
     const setup = await createSetup();
-    const nativeModel = (model: string, displayName: string): JsonObject => ({
+    const nativeModel = (model: string, displayName: string, efforts = ["high"]): JsonObject => ({
       id: `record-${model}`,
       model,
       displayName,
       hidden: false,
-      supportedReasoningEfforts: [{ reasoningEffort: "high", description: "" }],
+      supportedReasoningEfforts: efforts.map(reasoningEffort => ({ reasoningEffort, description: "" })),
       defaultReasoningEffort: "high",
       inputModalities: ["text", "image"],
       serviceTiers: [{ id: "default", name: "Default", description: "" }],
@@ -1578,16 +1578,28 @@ describe("CodexBackendAdapter", () => {
       isDefault: model === "gpt-6.1-sol"
     });
     setup.fake.modelList = [
-      nativeModel("gpt-6.2-sol", "GPT-6.2 Sol"),
+      nativeModel("gpt-6.2-sol", "GPT-6.2 Sol", ["high", "ultra"]),
       nativeModel("gpt-6.1-sol", "GPT-6.1 Sol"),
+      nativeModel("gpt-6.1-terra", "GPT-6.1 Terra"),
       nativeModel("gpt-6-sol", "GPT-6 Sol"),
       nativeModel("gpt-6-luna", "GPT-6 Luna"),
+      nativeModel("gpt-6-cyber", "GPT-6 Cyber", []),
       nativeModel("gpt-5.6-sol", "GPT-5.6 Sol")
     ];
 
     const descriptor = await setup.adapter.describe();
     const sol = descriptor.models.find((model) => model.modelId === "gpt-6.2-sol")!;
-    expect(sol.supportsFastMode).toBe(false);
+    expect(sol).toMatchObject({
+      contextWindow: 500_000,
+      maxOutputTokens: 128_000,
+      contextWindowSource: "estimated",
+      thinkingLevels: ["high", "ultra"],
+      defaultEffort: "high",
+      supportsFastMode: false,
+      supportsUltrafastMode: false
+    });
+    expect(modelTokenPricesAt(sol, { at: Date.UTC(2026, 10, 17), inputTokens: 272_000 }))
+      .toMatchObject({ currencyCode: "USD", cost: { input: 2, output: 10 } });
     expect(modelTokenPricesAt(sol, { at: Date.UTC(2026, 10, 17), inputTokens: 272_001 }))
       .toMatchObject({ currencyCode: "USD", cost: { input: 4, output: 15 } });
     expect(descriptor.models.find((model) => model.modelId === "gpt-6.1-sol")).toMatchObject({
@@ -1605,6 +1617,10 @@ describe("CodexBackendAdapter", () => {
       .toEqual({ input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 });
     expect(descriptor.models.find((model) => model.modelId === "gpt-6-luna")?.cost)
       .toEqual({ input: 0.1, output: 0.5, cacheRead: 0.01, cacheWrite: 0.125 });
+    expect(descriptor.models.find((model) => model.modelId === "gpt-6.1-terra"))
+      .toMatchObject({ contextWindow: 272_000, maxOutputTokens: 128_000, thinkingLevels: ["high"] });
+    expect(descriptor.models.find((model) => model.modelId === "gpt-6-cyber"))
+      .toMatchObject({ contextWindow: 272_000, maxOutputTokens: 128_000, thinkingLevels: [], defaultVisible: false });
     expect(descriptor.models.find((model) => model.modelId === "gpt-5.6-sol"))
       .toMatchObject({ defaultVisible: false });
     expect(descriptor.models.some((model) => model.modelId === "gpt-6.2-astra")).toBe(false);

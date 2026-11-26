@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -36,6 +36,35 @@ function oauth(authority: CodexHostedAuthenticationAuthority) {
 }
 
 describe("original native account authority", () => {
+  it("projects native working and maximum context for the original account and discards its cache after replacement", async () => {
+    const f = await fixture();
+    const slug = "gpt-6.2-sol";
+    f.fake.modelList = [{ ...f.fake.modelList[0]!, id: "catalog-sol", model: slug, displayName: "GPT-6.2 Sol" }];
+    const now = Date.now();
+    const stampAuth = async (age: number) => {
+      const time = new Date(now - age);
+      await utimes(f.authPath, time, time);
+    };
+    const catalog = (identity: string, age: number, contextWindow: number, maxContextWindow?: number) =>
+      writeFile(join(f.home, "models_cache.json"), JSON.stringify({ identity: identity.repeat(64), fetched_at: new Date(now - age).toISOString(),
+        models: [{ slug, visibility: "list", supported_in_api: true, context_window: contextWindow, max_context_window: maxContextWindow }] }));
+    await stampAuth(120_000);
+    await catalog("a", 90_000, 500_000, 1_050_000);
+    expect((await f.adapter.describe()).models[0]).toMatchObject({ modelId: slug, providerId: "openai",
+      contextWindow: 500_000, contextWindowSource: "declared", defaultWorkingContextTokens: 500_000, contextWindowMax: 1_050_000 });
+
+    await writeFile(f.authPath, JSON.stringify({ auth_mode: "chatgpt", tokens: tokens("replacement-account") }));
+    await stampAuth(60_000);
+    expect((await f.adapter.describe()).models[0]).not.toHaveProperty("contextWindowMax");
+    await catalog("b", 30_000, 480_000, 900_000);
+    expect((await f.adapter.listModels())[0]).toMatchObject({
+      contextWindow: 480_000, defaultWorkingContextTokens: 480_000, contextWindowMax: 900_000 });
+    await catalog("b", 20_000, 470_000);
+    const omittedMax = (await f.adapter.listModels())[0];
+    expect(omittedMax).toMatchObject({ contextWindow: 470_000 });
+    expect(omittedMax).not.toHaveProperty("contextWindowMax");
+  });
+
   it("preserves a known reset receipt and retains an unclosed control SDK before admitting another request", async () => {
     const f = await fixture(), facts = await f.adapter.readAccountRateLimitResets({ providerId: "openai", assertCurrent() {} });
     let canClose = false;

@@ -21,6 +21,7 @@ import type {
   BackgroundTaskOutputResult,
   BlobRef,
   ContextRebuildInput,
+  CreateNativeSessionInput,
   DurableNativeDispatchPreparation,
   EventPayload,
   InteractionDecision,
@@ -2694,6 +2695,7 @@ export class SessionHost {
     readonly patch: SessionRuntimePatch;
     readonly source?: SessionRuntimeMutationSource;
     readonly assertAuthority?: () => void;
+    readonly allowNativeProviderHandoff?: boolean;
   }): Promise<SessionRuntimeMutationResult> {
     this.#assertOpen();
     if (!Number.isSafeInteger(input.expectedGeneration) || input.expectedGeneration < 0) {
@@ -2720,7 +2722,12 @@ export class SessionHost {
         throw new SessionRuntimeControlError("CONFLICT", "The task runtime selection changed; read it again before retrying.");
       }
       let handoff = this.#runtimeHandoffs.read(input.sessionId)?.pending;
-      if (handoff?.phase === "pending" && input.patch.backendId === stored.descriptor.backendId) {
+      const routeExplicit = input.patch.providerId !== undefined || input.patch.modelId !== undefined;
+      if (handoff?.nativeProvider && !input.allowNativeProviderHandoff) {
+        throw new SessionRuntimeControlError("ROUTE_UNAVAILABLE", "An explicit owner selection is required to change this pending Provider.");
+      }
+      if (handoff?.phase === "pending" && (input.patch.backendId === stored.descriptor.backendId
+        || handoff.nativeProvider && routeExplicit && input.patch.backendId === undefined)) {
         this.#resolveRuntimeHandoffProfile(stored, input.patch, snapshot.effective ?? baseline);
         this.#runtimeHandoffs.cancel(input.sessionId, snapshot.generation + 1); this.#preparedRuntimeHandoffPrompts.delete(input.sessionId);
         this.#sessionRuntimeControl.cancelPending(input.sessionId); handoff = undefined;
@@ -2728,13 +2735,9 @@ export class SessionHost {
       if (input.patch.backendId !== undefined && (input.patch.backendId !== stored.descriptor.backendId || handoff !== undefined)
         || handoff !== undefined) {
         input.assertAuthority?.();
-        return this.#stageSessionRuntimeHandoff(input, stored, snapshot);
+        return this.#stageSessionRuntimeHandoff({ ...input, nativeProvider: handoff?.nativeProvider
+          && (input.patch.backendId === undefined || input.patch.backendId === stored.descriptor.backendId) }, stored, snapshot);
       }
-      if (handoff !== undefined) {
-        this.#runtimeHandoffs.cancel(input.sessionId, snapshot.generation + 1);
-        this.#preparedRuntimeHandoffPrompts.delete(input.sessionId);
-      }
-      const routeExplicit = input.patch.providerId !== undefined || input.patch.modelId !== undefined;
       const current = routeExplicit && input.patch.backendId !== stored.descriptor.backendId
         ? snapshot.pending?.profile ?? snapshot.effective ?? baseline
         : snapshot.effective ?? baseline;
@@ -2767,6 +2770,10 @@ export class SessionHost {
         backend,
         runtimeProfileChanges(snapshot.effective ?? baseline, profile)
       );
+      if (routeExplicit && input.allowNativeProviderHandoff
+        && await this.#requiresNativeProviderHandoff(stored, profile.providerId, input.assertAuthority)) {
+        return this.#stageSessionRuntimeHandoff({ ...input, patch: profile, nativeProvider: true }, stored, snapshot);
+      }
       const pendingProfile = !routeExplicit && snapshot.pending !== undefined
         ? applySessionRuntimeAxisPatch(
             snapshot.pending.profile,
@@ -2876,7 +2883,7 @@ export class SessionHost {
     };
     assertAuthority();
     await this.setSessionRuntimeControl({ sessionId: offered.sessionId, expectedGeneration: resolved.runtimeGeneration,
-      patch: resolved.choice.profile, assertAuthority });
+      patch: resolved.choice.profile, assertAuthority, allowNativeProviderHandoff: true });
     const control = this.getSessionRuntimeControl(offered.sessionId);
     const adopted = control.pending?.profile ?? control.effective;
     if (adopted?.backendId !== source.backendId || adopted.providerId !== source.providerId || adopted.modelId !== source.modelId) {
@@ -2958,6 +2965,11 @@ export class SessionHost {
         const profile = resolveSessionRuntimeProfile({ baseline, current: snapshot.effective ?? baseline, patch, models: backend.models,
           fastModeSupported: backend.capabilities.get("model.fast_mode")?.supported === true });
         if (!profile) throw new StoreError("The selected model no longer supports the requested settings.");
+        if (await this.#requiresNativeProviderHandoff(stored, profile.providerId, assertChoice)) {
+          this.#stageSessionRuntimeHandoff({ sessionId, expectedGeneration: input.expectedGeneration, patch: profile,
+            onStaged: bind, nativeProvider: true }, stored, snapshot);
+          return;
+        }
         const active = await this.activate(sessionId);
         assertChoice();
         await this.#applySessionRuntimeProfile(sessionId, active, profile, assertChoice);
@@ -3054,6 +3066,40 @@ export class SessionHost {
     this.#clearSessionRuntimeRecovery(sessionId);
     this.#publishSessionRuntimeControlChanged(stored);
     return generation;
+  }
+
+  /** Keep the existing model mutation receipt for older owner clients. */
+  async stageUserModelProviderHandoff(input: {
+    readonly sessionId: string;
+    readonly patch: SessionRuntimePatch & { readonly providerId: string };
+    readonly assertOwner: () => void;
+  }): Promise<boolean> {
+    return this.#withSessionRuntimeControlLock(input.sessionId, async () => {
+      input.assertOwner();
+      const stored = this.#store.getSession(input.sessionId);
+      const snapshot = this.getSessionRuntimeControl(input.sessionId);
+      if (!snapshot.effective || !await this.#requiresNativeProviderHandoff(stored, input.patch.providerId, input.assertOwner)) return false;
+      this.#stageSessionRuntimeHandoff({ sessionId: input.sessionId, expectedGeneration: snapshot.generation,
+        patch: input.patch, nativeProvider: true }, stored, snapshot);
+      return true;
+    });
+  }
+
+  async #requiresNativeProviderHandoff(stored: StoredSession, providerId: string, assertOwner?: () => void): Promise<boolean> {
+    const { id, backendId, binding } = stored.descriptor;
+    if (this.#store.getBackend(backendId).descriptor.adapterKind !== "codex") return false;
+    const adapter = this.requireAdapter(backendId);
+    if (!adapter.requiresModelProviderHandoff) return false;
+    const needsHandoff = await adapter.requiresModelProviderHandoff(providerId, this.contextFor(stored));
+    assertOwner?.();
+    if (!needsHandoff) return false;
+    const current = this.#store.getSession(id);
+    if (current.descriptor.backendId !== backendId || current.descriptor.binding.opaqueRef !== binding.opaqueRef
+      || current.descriptor.binding.generation !== binding.generation || !this.#taskModelGroupSwitchAllowed(current)) {
+      throw new SessionRuntimeControlError("ROUTE_UNAVAILABLE", "This task cannot change its native Provider binding.");
+    }
+    this.#assertRuntimeHandoffSession(current);
+    return true;
   }
 
   /** A service authority may select a model without claiming a node Connection.
@@ -6897,6 +6943,7 @@ export class SessionHost {
     readonly sessionId: string; readonly expectedGeneration: number; readonly patch: SessionRuntimePatch;
     readonly source?: SessionRuntimeMutationSource;
     readonly fresh?: boolean;
+    readonly nativeProvider?: boolean;
     readonly onStaged?: () => void;
   }, stored: StoredSession, snapshot: SessionRuntimeControlSnapshot): SessionRuntimeMutationResult {
     this.#assertRuntimeHandoffSession(stored);
@@ -6905,7 +6952,7 @@ export class SessionHost {
     const source = input.source ?? "agent";
     this.#store.transaction(() => {
       input.onStaged?.();
-      this.#runtimeHandoffs.stage(input.sessionId, snapshot.generation + 1, profile, source, input.fresh);
+      this.#runtimeHandoffs.stage(input.sessionId, snapshot.generation + 1, profile, source, input.fresh, input.nativeProvider);
     });
     this.#preparedRuntimeHandoffPrompts.delete(input.sessionId);
     const accepted = this.#sessionRuntimeControl.acceptDeferred(input.sessionId, source, profile, snapshot.effective);
@@ -6931,6 +6978,10 @@ export class SessionHost {
     try {
       if (!this.#serviceRuntimePrompts.has(sessionId)) await this.refreshServiceRuntimePrompt(sessionId);
       let stored = this.#store.getSession(sessionId); this.#assertRuntimeHandoffSession(stored);
+      const nativeProvider = pending.nativeProvider === true;
+      if (nativeProvider && !this.#taskModelGroupSwitchAllowed(stored)) {
+        throw new StoreError("The ordinary local Provider handoff is no longer authorized.");
+      }
       const profile = this.#resolveRuntimeHandoffProfile(stored, { ...pending.profile }, pending.profile);
       const adapter = this.requireAdapter(profile.backendId), targetBackendGeneration = this.requireAdapterGeneration(profile.backendId, adapter);
       releaseTargetAdmission = this.beginBackendAdmissionEffect(profile.backendId);
@@ -6942,13 +6993,18 @@ export class SessionHost {
         const target = this.#store.getTarget(stored.descriptor.targetId);
         const events = listAllVisibleSessionEvents(this.#store, sessionId);
         const workspaceRoot = this.targetForSession(stored).workspaceRoot;
+        const realWorkspaceRoot = await realpath(workspaceRoot);
+        const active = this.#active.get(sessionId);
+        const nativeHistoryEmpty = nativeProvider && active !== undefined
+          && this.#store.findLatestRunForSessionGeneration(sessionId, stored.descriptor.binding.generation) === undefined
+          && adapter.hasEmptyModelProviderHandoffSource?.(stored.descriptor.binding, this.contextFor(stored)) === true;
         const origin: RuntimeHandoffSource = { backendId: stored.descriptor.backendId, binding: stored.descriptor.binding,
           backendInstanceGeneration: this.#store.getBackend(stored.descriptor.backendId).descriptor.instanceGeneration,
           cursor: events.at(-1)?.globalCursor.toString() ?? "0", targetId: stored.descriptor.targetId, targetRevision: target.revision.toString(),
-          workspaceRoot, realWorkspaceRoot: await realpath(workspaceRoot), worktreeJson: JSON.stringify(stored.descriptor.worktree ?? null),
-          permissionMode: stored.descriptor.permissionMode, planMode: stored.descriptor.planMode, promptDigest: this.serviceRuntimeDigest(stored.descriptor) };
+          workspaceRoot, realWorkspaceRoot, worktreeJson: JSON.stringify(stored.descriptor.worktree ?? null),
+          permissionMode: stored.descriptor.permissionMode, planMode: stored.descriptor.planMode, promptDigest: this.serviceRuntimeDigest(stored.descriptor),
+          ...(nativeHistoryEmpty ? { nativeHistoryEmpty: true } : {}) };
         this.#store.assertSessionRuntimeHandoffSource(sessionId, origin);
-        const active = this.#active.get(sessionId);
         if (active !== undefined) {
           const sourcePrompt = this.#serviceRuntimePrompts.get(sessionId), sourceConfiguration = this.#serviceRuntimeConfigurations.get(sessionId);
           const lease = this.beginActiveBackendSideEffect(sessionId, active);
@@ -6968,22 +7024,28 @@ export class SessionHost {
           }
         }
         this.#releaseSessionTools(sessionId);
-        update({ generation: pending.generation, source: pending.source, profile, phase: "closed", origin, ...(pending.fresh ? { fresh: true } : {}) });
+        update({ generation: pending.generation, source: pending.source, profile, phase: "closed", origin,
+          ...(pending.fresh ? { fresh: true } : {}), ...(nativeProvider ? { nativeProvider: true } : {}) });
       }
       const origin = pending.origin!;
-      const assertCurrent = async (): Promise<void> => {
+      const assertSource = (): void => {
         assertAuthority?.();
         this.#assertOpen(); this.#store.assertSessionRuntimeHandoffSource(sessionId, origin);
-        this.#assertRuntimeHandoffSession(this.#store.getSession(sessionId));
-        this.#resolveRuntimeHandoffProfile(this.#store.getSession(sessionId), { ...profile }, profile);
+        const current = this.#store.getSession(sessionId);
+        this.#assertRuntimeHandoffSession(current);
+        if (nativeProvider && !this.#taskModelGroupSwitchAllowed(current)) throw new StoreError("The Provider handoff lost its local owner authority.");
+        this.#resolveRuntimeHandoffProfile(current, { ...profile }, profile);
         this.assertCurrentAdapterGeneration(profile.backendId, adapter, targetBackendGeneration);
+      };
+      const assertCurrent = async (): Promise<void> => {
+        assertSource();
         if (this.serviceRuntimeDigest(this.#store.getSession(sessionId).descriptor) !== origin.promptDigest
           || await realpath(origin.workspaceRoot) !== origin.realWorkspaceRoot) throw new StoreError("Native handoff private configuration or directory changed.");
         assertAuthority?.();
       };
       await assertCurrent();
       if (pending.phase === "closed") {
-        const parked = pending.fresh ? undefined : record!.parked.find(row => row.backendId === profile.backendId)
+        const parked = pending.fresh || nativeProvider ? undefined : record!.parked.find(row => row.backendId === profile.backendId)
           ?? (origin.backendId === profile.backendId ? origin : undefined);
         const events = listAllVisibleSessionEvents(this.#store, sessionId);
         const all = sessionHandoffMessages(events);
@@ -7002,17 +7064,29 @@ export class SessionHost {
         const provisional = this.provisionalContext(sessionId, target, generation, undefined,
           this.decorateRuntimePrompt(targetPrompt), targetBackendGeneration, stored.descriptor.worktree);
         const context = { ...provisional, emit: async () => undefined };
+        const createInput: CreateNativeSessionInput = { target, name: stored.descriptor.title, providerId: profile.providerId,
+          modelId: profile.modelId, ...(profile.effort === undefined ? {} : { effort: profile.effort }), fastMode: profile.fastMode,
+          permissionMode: stored.descriptor.permissionMode,
+          ...(context.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: context.appendSystemPrompt }),
+          ...(nativeProvider ? { assertNativeCreationCurrent: assertSource } : {}), nativeStart: { kind: "new" } };
         const create = async (): Promise<NativeSessionBinding> => {
           update({ ...pending!, phase: "effect", effect: "create", backendInstanceGeneration: targetBackendGeneration });
-          const binding = await adapter.createSession({ target, name: stored.descriptor.title, providerId: profile.providerId,
-            modelId: profile.modelId, ...(profile.effort === undefined ? {} : { effort: profile.effort }), fastMode: profile.fastMode,
-            permissionMode: stored.descriptor.permissionMode,
-            ...(context.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: context.appendSystemPrompt }), nativeStart: { kind: "new" } }, context);
+          const binding = await adapter.createSession(createInput, context);
           update({ ...pending!, phase: "effect", effect: "configure", binding: { ...binding, generation }, resumed: false, handoff: handoff(false) });
           return { ...binding, generation };
         };
         let binding: NativeSessionBinding;
-        if (parked) {
+        if (nativeProvider) {
+          const carried = record!.injection;
+          if (carried?.queueItemId !== undefined) throw new StoreError("The previous runtime handoff still owns an unresolved input.");
+          const fork = !origin.nativeHistoryEmpty;
+          if (fork && !adapter.forkSessionForModel) throw new StoreError("The Backend cannot preserve the original native history.");
+          update({ ...pending, phase: "effect", effect: fork ? "fork" : "create", backendInstanceGeneration: targetBackendGeneration });
+          const prepared = fork ? await adapter.forkSessionForModel!(origin.binding, createInput, context) : await adapter.createSession(createInput, context);
+          binding = { ...prepared, generation };
+          update({ ...pending, phase: "effect", effect: "configure", binding, resumed: fork,
+            ...(carried === undefined ? {} : { handoff: carried.text }) });
+        } else if (parked) {
           update({ ...pending, phase: "effect", effect: "resume", binding: { ...parked.binding, generation }, backendInstanceGeneration: targetBackendGeneration });
           try {
             const state = await adapter.resumeSession(parked.binding, { ...context, binding: { ...parked.binding, generation } });
@@ -7030,7 +7104,7 @@ export class SessionHost {
         await assertCurrent();
         const selected = { ...context, binding, modelSelection: { providerId: profile.providerId, modelId: profile.modelId } };
         const capabilities = this.#store.getBackend(profile.backendId).descriptor.capabilities;
-        if (capabilities.get("model.switch")?.supported === true) await adapter.setModel(profile.providerId, profile.modelId, selected);
+        if (!nativeProvider && capabilities.get("model.switch")?.supported === true) await adapter.setModel(profile.providerId, profile.modelId, selected);
         await assertCurrent();
         if (profile.effort !== undefined) await adapter.setEffort(profile.effort, selected);
         if (capabilities.get("model.fast_mode")?.supported === true) await adapter.setFastMode(profile.fastMode, selected);
@@ -7062,9 +7136,10 @@ export class SessionHost {
       const latest = this.#runtimeHandoffs.read(sessionId)?.pending;
       if (latest?.phase === "effect") {
         if (error instanceof JokoError && error.publicError.stateMayHaveChanged === false && latest.effect !== "configure") {
+          const mode = { ...(latest.fresh ? { fresh: true } : {}), ...(latest.nativeProvider ? { nativeProvider: true as const } : {}) };
           this.#runtimeHandoffs.transition(sessionId, latest.generation, latest.effect === "close"
-            ? { generation: latest.generation, source: latest.source, profile: latest.profile, phase: "pending", ...(latest.fresh ? { fresh: true } : {}) }
-            : { generation: latest.generation, source: latest.source, profile: latest.profile, phase: "closed", origin: latest.origin!, ...(latest.fresh ? { fresh: true } : {}) });
+            ? { generation: latest.generation, source: latest.source, profile: latest.profile, phase: "pending", ...mode }
+            : { generation: latest.generation, source: latest.source, profile: latest.profile, phase: "closed", origin: latest.origin!, ...mode });
         } else this.#runtimeHandoffs.transition(sessionId, latest.generation, { ...latest, phase: "unknown" });
       }
       const session = this.#store.getSession(sessionId).descriptor;

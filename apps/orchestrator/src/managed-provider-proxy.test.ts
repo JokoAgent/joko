@@ -572,6 +572,62 @@ describe("Managed Provider native proxy", () => {
   });
 
   it.each([
+    { name: "official DeepSeek", baseUrl: "https://api.deepseek.com/v1", path: "/v1/chat/completions",
+      modelId: "deepseek-v4-pro", deepSeek: true, gemini: false },
+    { name: "official Gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", path: "/v1beta/openai/chat/completions",
+      modelId: "gemini-3-flash-preview", deepSeek: false, gemini: true },
+    { name: "an independent gateway", baseUrl: "https://api.deepseek.com.example.invalid/v1", path: "/v1/chat/completions",
+      modelId: "deepseek-v4-pro", deepSeek: false, gemini: false }
+  ])("replays only the supported native Chat history for $name", async ({ baseUrl, path, modelId, deepSeek, gemini }) => {
+    const f = await fixture(false, "openai-completions", "provider", path, undefined, { baseUrl, modelId });
+    try {
+      const binding = await f.port.prepare(f.owner);
+      const lease = await binding.activate({ operationId: "chat-history", signal: new AbortController().signal, assertCurrent: () => undefined });
+      try {
+        f.respondWith(JSON.stringify({ id: "history-result", choices: [
+          { index: 0, message: { role: "assistant", content: "History accepted." }, finish_reason: "stop" }
+        ] }), "application/json");
+        const response = await fetch(`${binding.baseUrl}/responses`, { method: "POST", headers: {
+          "content-type": "application/json", authorization: `Bearer ${f.token}`
+        }, body: JSON.stringify({ model: modelId, stream: false, reasoning: { effort: "high" },
+          tools: [{ type: "function", name: "read_note", parameters: { type: "object", properties: {} } }],
+          tool_choice: { type: "function", name: "read_note" }, input: [
+            { role: "user", content: "Read the first note." },
+            { type: "reasoning", summary: [{ type: "summary_text", text: "provider history" }] },
+            { type: "function_call", call_id: "first", name: "read_note", arguments: "{}" },
+            { type: "function_call_output", call_id: "first", output: "First note" },
+            { role: "assistant", content: "The first note is ready." },
+            { role: "user", content: "Read the second note." },
+            { type: "function_call", call_id: "second", name: "read_note", arguments: "{}" },
+            { type: "function_call_output", call_id: "second", output: "Second note" }
+          ] }) });
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({ id: "history-result", status: "completed" });
+        expect(f.received[0]).toMatchObject({ path, model: modelId });
+        const body = f.receivedBodies[0]!;
+        const assistant = (body["messages"] as Array<Record<string, unknown>>).filter(message => message["role"] === "assistant");
+        const calls = assistant.flatMap(message => Array.isArray(message["tool_calls"]) ? message["tool_calls"] : []);
+        expect(calls.map(call => call.id)).toEqual(["first", "second"]);
+        if (deepSeek) {
+          expect(body["tool_choice"]).toBe("auto");
+          expect(assistant[0]?.["reasoning_content"]).toBe("provider history");
+          expect(assistant.at(-1)?.["reasoning_content"]).toBe("tool call");
+        } else {
+          expect(body["tool_choice"]).toEqual({ type: "function", function: { name: "read_note" } });
+          expect(assistant.every(message => !Object.hasOwn(message, "reasoning_content"))).toBe(true);
+        }
+        if (gemini) {
+          expect(body["reasoning_effort"]).toBe("high");
+          expect(calls.every(call => call.extra_content?.google?.thought_signature === "skip_thought_signature_validator")).toBe(true);
+        } else {
+          expect(body).not.toHaveProperty("reasoning_effort");
+          expect(calls.every(call => call.extra_content === undefined)).toBe(true);
+        }
+      } finally { lease.release(); binding.dispose(); }
+    } finally { await f.dispose(); }
+  });
+
+  it.each([
     { name: "read_note", finish: undefined, toolChoice: "auto" },
     { name: "read_note", finish: "tool_calls", toolChoice: "none" },
     { name: "retired_tool", finish: "tool_calls", toolChoice: "auto" }

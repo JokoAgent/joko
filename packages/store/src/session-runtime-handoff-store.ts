@@ -23,16 +23,18 @@ export interface RuntimeHandoffSource extends ParkedRuntimeBinding {
   readonly realWorkspaceRoot: string;
   readonly worktreeJson: string; readonly permissionMode: PermissionMode; readonly planMode: boolean;
   readonly promptDigest: string;
+  readonly nativeHistoryEmpty?: true;
 }
 export interface PendingRuntimeHandoff {
   readonly generation: number; readonly source: "agent" | "fallback";
   readonly profile: RuntimeHandoffProfile;
   readonly phase: "pending" | "closed" | "effect" | "ready" | "unknown";
   readonly origin?: RuntimeHandoffSource;
-  readonly effect?: "close" | "resume" | "create" | "configure";
+  readonly effect?: "close" | "resume" | "create" | "fork" | "configure";
   readonly backendInstanceGeneration?: number;
   readonly binding?: NativeSessionBinding; readonly resumed?: boolean; readonly handoff?: string;
   readonly fresh?: boolean;
+  readonly nativeProvider?: true;
 }
 export interface RuntimeHandoffRecord {
   readonly format: 1; readonly generation: number;
@@ -124,7 +126,7 @@ export class SessionRuntimeHandoffStore {
     readRuntimeHandoffRecord(record);
     this.store.setSetting("service", SESSION_RUNTIME_HANDOFF_SCOPE, sessionId, record);
   }
-  stage(sessionId: string, generation: number, profile: RuntimeHandoffProfile, source: "agent" | "fallback", fresh = false): void {
+  stage(sessionId: string, generation: number, profile: RuntimeHandoffProfile, source: "agent" | "fallback", fresh = false, nativeProvider = false): void {
     this.store.transaction(() => {
       const current = this.read(sessionId);
       if (generation <= (current?.generation ?? -1)) throw new StoreError("Runtime selection generation did not advance.");
@@ -135,6 +137,7 @@ export class SessionRuntimeHandoffStore {
         ...(current?.injection === undefined ? {} : { injection: current.injection }),
         pending: { generation, profile, source, phase: current?.pending?.phase === "closed" ? "closed" : "pending",
           ...(fresh ? { fresh: true } : {}),
+          ...(nativeProvider ? { nativeProvider: true } : {}),
           ...(current?.pending?.origin === undefined ? {} : { origin: current.pending.origin }) } });
     });
   }
@@ -157,16 +160,17 @@ export class SessionRuntimeHandoffStore {
   }
   settle(sessionId: string, generation: number, binding: NativeSessionBinding): void {
     const current = this.read(sessionId), pending = current?.pending;
-    if (!current || pending?.generation !== generation || pending.phase !== "ready" || !pending.origin || !pending.handoff) {
+    if (!current || pending?.generation !== generation || pending.phase !== "ready" || !pending.origin
+      || (!pending.nativeProvider && !pending.handoff)) {
       throw new StoreError("Runtime adoption has no complete prepared receipt.");
     }
     const { pending: _pending, injection: _injection, ...remaining } = current;
     const { targetId: _target, targetRevision: _revision, workspaceRoot: _root, realWorkspaceRoot: _realRoot, worktreeJson: _worktree,
-      permissionMode: _mode, planMode: _plan, promptDigest: _prompt, ...parked } = pending.origin;
+      permissionMode: _mode, planMode: _plan, promptDigest: _prompt, nativeHistoryEmpty: _empty, ...parked } = pending.origin;
     this.save(sessionId, { ...remaining,
       parked: [...current.parked.filter(row => row.backendId !== parked.backendId && row.backendId !== pending.profile.backendId),
         ...(parked.backendId === pending.profile.backendId ? [] : [parked])],
-      injection: { generation, binding, text: pending.handoff } });
+      ...(pending.handoff === undefined ? {} : { injection: { generation, binding, text: pending.handoff } }) });
   }
   claimInjection(sessionId: string, queueItemId: string): string | undefined {
     return this.store.transaction(() => {
@@ -200,20 +204,22 @@ export function readRuntimeHandoffRecord(value: unknown): RuntimeHandoffRecord {
     || value["format"] !== 1 || !integer(value["generation"]) || !Array.isArray(value["parked"])
     || !value["parked"].every(parked) || new Set(value["parked"].map(row => row.backendId)).size !== value["parked"].length) throw invalid();
   const pending = value["pending"];
-  if (pending !== undefined && (!object(pending) || !keys(pending, ["generation", "source", "profile", "phase", "origin", "effect", "backendInstanceGeneration", "binding", "resumed", "handoff", "fresh"])
+  if (pending !== undefined && (!object(pending) || !keys(pending, ["generation", "source", "profile", "phase", "origin", "effect", "backendInstanceGeneration", "binding", "resumed", "handoff", "fresh", "nativeProvider"])
     || pending["generation"] !== value["generation"] || !["agent", "fallback"].includes(String(pending["source"]))
     || !profile(pending["profile"]) || !["pending", "closed", "effect", "ready", "unknown"].includes(String(pending["phase"]))
     || pending["origin"] !== undefined && !origin(pending["origin"])
     || pending["phase"] !== "pending" && !origin(pending["origin"])
-    || pending["effect"] !== undefined && !["close", "resume", "create", "configure"].includes(String(pending["effect"]))
+    || pending["effect"] !== undefined && !["close", "resume", "create", "fork", "configure"].includes(String(pending["effect"]))
     || pending["phase"] === "effect" && pending["effect"] === undefined
     || pending["backendInstanceGeneration"] !== undefined && !integer(pending["backendInstanceGeneration"])
     || pending["binding"] !== undefined && !binding(pending["binding"])
     || pending["resumed"] !== undefined && typeof pending["resumed"] !== "boolean"
     || pending["fresh"] !== undefined && typeof pending["fresh"] !== "boolean"
+    || pending["nativeProvider"] !== undefined && (pending["nativeProvider"] !== true || pending["fresh"] === true
+      || origin(pending["origin"]) && pending["origin"].backendId !== pending["profile"].backendId)
     || pending["handoff"] !== undefined && !boundedText(pending["handoff"], 20_000)
     || pending["phase"] === "ready" && (!binding(pending["binding"]) || !integer(pending["backendInstanceGeneration"])
-      || typeof pending["resumed"] !== "boolean" || !boundedText(pending["handoff"], 20_000)))) throw invalid();
+      || typeof pending["resumed"] !== "boolean" || pending["nativeProvider"] !== true && !boundedText(pending["handoff"], 20_000)))) throw invalid();
   const injection = value["injection"];
   if (injection !== undefined && (!object(injection) || !keys(injection, ["generation", "binding", "text", "queueItemId"])
     || !integer(injection["generation"]) || !binding(injection["binding"]) || !boundedText(injection["text"], 20_000)
@@ -240,10 +246,11 @@ function parked(value: unknown): value is ParkedRuntimeBinding {
     && typeof value["cursor"] === "string" && /^(0|[1-9][0-9]*)$/u.test(value["cursor"]);
 }
 function origin(value: unknown): value is RuntimeHandoffSource {
-  if (!object(value) || !keys(value, ["backendId", "binding", "backendInstanceGeneration", "cursor", "targetId", "targetRevision", "workspaceRoot", "realWorkspaceRoot", "worktreeJson", "permissionMode", "planMode", "promptDigest"])) return false;
-  const { targetId, targetRevision, workspaceRoot, realWorkspaceRoot, worktreeJson, permissionMode, planMode, promptDigest, ...base } = value;
+  if (!object(value) || !keys(value, ["backendId", "binding", "backendInstanceGeneration", "cursor", "targetId", "targetRevision", "workspaceRoot", "realWorkspaceRoot", "worktreeJson", "permissionMode", "planMode", "promptDigest", "nativeHistoryEmpty"])) return false;
+  const { targetId, targetRevision, workspaceRoot, realWorkspaceRoot, worktreeJson, permissionMode, planMode, promptDigest, nativeHistoryEmpty, ...base } = value;
   return parked(base) && boundedText(targetId, 512) && typeof targetRevision === "string" && /^[1-9][0-9]*$/u.test(targetRevision)
     && boundedText(workspaceRoot, 8192) && boundedText(realWorkspaceRoot, 8192) && typeof worktreeJson === "string" && worktreeJson.length <= 16384
     && ["ask", "acceptEdits", "auto", "bypassPermissions"].includes(String(permissionMode)) && typeof planMode === "boolean"
+    && (nativeHistoryEmpty === undefined || nativeHistoryEmpty === true)
     && typeof promptDigest === "string" && /^[a-f0-9]{64}$/u.test(promptDigest);
 }

@@ -947,7 +947,7 @@ export class ManagedProviderProxy {
     if (endpoint.origin !== base.origin) throw unavailable();
     let prepared;
     try {
-      prepared = prepareChatCompletion(parsed, { modelId: route.modelId, endpoint, supportsImages: route.supportsImages });
+      prepared = prepareChatCompletion(parsed, { modelId: route.modelId, endpoint, supportsImages: route.supportsImages, codexHistory: true });
     } catch {
       fail(response, 400);
       return;

@@ -8730,10 +8730,14 @@ export class OperationalStore {
       const handoffs = new SessionRuntimeHandoffStore(this), record = handoffs.read(sessionId), pending = record?.pending;
       const current = this.getSession(sessionId), source = pending?.origin;
       if (pending?.generation !== generation || pending.phase !== "ready" || !source || !pending.binding
-        || !pending.handoff || pending.backendInstanceGeneration === undefined) throw new StoreError("Native handoff has no exact prepared adoption receipt.");
+        || (!pending.nativeProvider && !pending.handoff) || pending.backendInstanceGeneration === undefined) throw new StoreError("Native handoff has no exact prepared adoption receipt.");
       this.assertSessionRuntimeHandoffSource(sessionId, source);
       if (this.getBackend(pending.profile.backendId).descriptor.instanceGeneration !== pending.backendInstanceGeneration
         || pending.binding.generation !== source.binding.generation + 1) throw new StoreError("Native handoff Backend generation changed before adoption.");
+      if (pending.nativeProvider && (pending.profile.backendId !== source.backendId
+        || pending.binding.opaqueRef.toLowerCase() === source.binding.opaqueRef.toLowerCase())) {
+        throw new StoreError("A native provider handoff requires a distinct binding on the original Backend.");
+      }
       const duplicate = this.findLiveSessionByNativeBinding(pending.profile.backendId, pending.binding.opaqueRef);
       const historic = this.database.prepare("SELECT session_id FROM native_binding_adoptions WHERE backend_id = ? AND native_opaque_ref = ? COLLATE NOCASE")
         .get(pending.profile.backendId, pending.binding.opaqueRef) as Row | undefined;
