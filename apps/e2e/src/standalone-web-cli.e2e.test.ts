@@ -40,7 +40,7 @@ taskIt("runs two sequential Pi BYOM turns and writes local receipts from the pro
   const requests: CapturedProviderRequest[] = [];
   let releaseFirst!: () => void;
   const firstResponse = new Promise<void>(resolve => { releaseFirst = resolve; });
-  const firstText = "The first standalone result", secondText = "The second standalone result";
+  const firstText = "The first standalone result", secondText = "x".repeat(59_999) + "😀END";
   let provider: Server | undefined;
   let completion: Promise<{ stdout: string; stderr: string } | { error: unknown }> | undefined;
   try {
@@ -60,10 +60,10 @@ taskIt("runs two sequential Pi BYOM turns and writes local receipts from the pro
         contextWindowTokens: "16384", maximumOutputTokens: "1024" }]
     }] }));
     const staged = process.env.JOKO_STANDALONE_ORCHESTRATOR_ENTRY?.trim();
-    const args = [...(staged ? [] : ["--import", import.meta.resolve("tsx")]), staged ?? standaloneCliEntry,
+    const args = [...(staged ? [] : ["--import", import.meta.resolve("tsx"), standaloneCliEntry]),
       "run-task", "--profile", profile, "--model", REAL_PI_MODEL_ID, "--working-dir", workspace,
       "--turns-file", turns, "--output-dir", output, "--timeout-ms", "20000"];
-    completion = promisify(execFile)(process.execPath, args, { cwd: workspace, timeout: 100_000,
+    completion = promisify(execFile)(staged || process.execPath, args, { cwd: workspace, timeout: 100_000,
       env: { PATH: process.env.PATH, JOKO_STANDALONE_FIXTURE_KEY: secret, JOKO_DATA_DIR: join(workspace, "must-not-use") },
       encoding: "utf8", maxBuffer: 1024 * 1024 }).then(value => value, error => ({ error }));
     await Promise.race([pollOwned(async () => requests.length, length => length > 0, "the first Provider request", 45_000),
@@ -81,11 +81,14 @@ taskIt("runs two sequential Pi BYOM turns and writes local receipts from the pro
     const resultText = await readFile(join(output, "result.json"), "utf8"), trace = await readFile(join(output, "trace.jsonl"), "utf8");
     const result = JSON.parse(resultText) as { sessionId: string; turns: { runId: string }[] };
     expect(JSON.parse(invocation.stdout)).toEqual(result);
-    expect(result).toMatchObject({ version: 1, status: "completed", sessionId: expect.any(String), turns: [
+    expect(result).toMatchObject({ version: 1, status: "completed", traceTruncated: true, sessionId: expect.any(String), turns: [
       { state: "completed", text: `${firstText} [REDACTED]` }, { state: "completed", text: secondText }
     ] });
     expect(new Set(result.turns.map(turn => turn.runId)).size).toBe(2);
-    const events = trace.trim().split("\n").map(line => JSON.parse(line) as { identity?: { sessionId?: string; runId?: string } });
+    const lines = trace.trimEnd().split("\n");
+    expect(lines.every(line => Buffer.byteLength(line) + 1 <= 32_768)).toBe(true);
+    expect(Buffer.byteLength(trace)).toBeLessThanOrEqual(8 * 1024 * 1024);
+    const events = lines.map(line => JSON.parse(line) as { identity?: { sessionId?: string; runId?: string } });
     expect(events.filter(event => event.identity?.runId).every(event => event.identity?.sessionId === result.sessionId)).toBe(true);
     expect(result.turns.every(turn => events.some(event => event.identity?.runId === turn.runId))).toBe(true);
     expect(`${invocation.stdout}${invocation.stderr}${resultText}${trace}`).not.toContain(secret);

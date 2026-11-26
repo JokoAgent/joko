@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { createReadStream, createWriteStream, type WriteStream } from "node:fs";
 
 import { DesktopBootstrapGrant, DESKTOP_OPERATIONAL_DATABASE_CORRUPTED_EXIT } from "@joko/contracts/desktop-bootstrap";

@@ -10,7 +10,7 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && node scripts/copy-system-skills.mjs && node scripts/prepare-linkspan-helper.mjs && node scripts/prepare-linkspan-runtimes.mjs",
+    "build": "tsc -p tsconfig.build.json && node -e \"if (process.platform !== 'win32') require('node:fs').chmodSync('dist/main.js', 0o755)\" && node scripts/copy-system-skills.mjs && node scripts/prepare-linkspan-helper.mjs && node scripts/prepare-linkspan-runtimes.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "dev": "tsx watch src/main.ts",

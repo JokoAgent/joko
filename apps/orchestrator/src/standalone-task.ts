@@ -19,6 +19,14 @@ import { createInternalServer } from "./server.js";
 const usage = "joko-orchestrator run-task --profile <provider.json> --model <id> --working-dir <directory> --turns-file <texts.json> --output-dir <new-directory> [--timeout-ms N] [--trust-workspace]";
 const directoryFlags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const stoppedRunStates = new Set([contract.RunState.SUCCEEDED, contract.RunState.FAILED, contract.RunState.ABORTED, contract.RunState.CANCELLED]);
+const maxTraceEvents = 2_048;
+
+interface StandaloneTurn {
+  runId: string;
+  state: string;
+  usage?: JsonValue;
+  errorCode?: string;
+}
 
 export async function runStandaloneTask(args: string[]): Promise<number> {
   const { values } = parseArgs({ args, options: { profile: { type: "string" }, model: { type: "string" }, "working-dir": { type: "string" },
@@ -137,7 +145,7 @@ async function executeTask(application: OrchestratorApplication, targetId: strin
     permissionMode: contract.PermissionMode.ASK, model: { model: { providerId: profile.providerId, modelId }, effortId: "off" } } } });
   if (created?.case !== "session" || created.value.nativeBinding === undefined) throw new Error("The standalone task session could not be confirmed.");
   const { sessionId } = created.value, generation = created.value.nativeBinding.runtimeGeneration;
-  const outcomes: { runId: string; state: string; usage?: JsonValue; errorCode?: string }[] = [];
+  const outcomes: StandaloneTurn[] = [];
   let status = "completed";
   for (const text of turns) {
     const receipt = await submit({ preconditions: [{ entity: { kind: contract.EntityKind.SESSION, id: sessionId }, expectedGeneration: generation }],
@@ -168,22 +176,37 @@ async function executeTask(application: OrchestratorApplication, targetId: strin
       ...(terminal?.error?.code ? { errorCode: terminal.error.code } : {}) });
     if (status !== "completed") break;
   }
-  const events: contract.Event[] = [];
+  const { turns: results, traceTruncated, trace } = await exportStandaloneTimeline(outcomes,
+    beforeCursor => sessions.listSessionTimeline({ sessionId, limit: 64, beforeCursor }, options), encode);
+  return { result: { version: 1, status, sessionId, providerId: profile.providerId, modelId, traceTruncated, turns: results }, trace };
+}
+
+export async function exportStandaloneTimeline(outcomes: readonly StandaloneTurn[],
+  readPage: (before: contract.EventCursor | undefined) => Promise<contract.ListSessionTimelineResponse>, encode: (value: unknown) => string) {
+  const traceEvents: contract.Event[] = [];
+  const missingReplies = new Set(outcomes.filter(turn => turn.state === "completed").map(turn => turn.runId));
+  const textByRun = new Map<string, string>();
+  let truncated = false;
   let beforeCursor: contract.EventCursor | undefined;
   do {
-    const page = await sessions.listSessionTimeline({ sessionId, limit: 64, beforeCursor }, options);
-    events.unshift(...page.events);
-    beforeCursor = page.nextBeforeCursor;
-  } while (beforeCursor !== undefined && events.length < 2048);
-  const textByRun = new Map<string, string>();
-  const trace: string[] = [];
-  let truncated = beforeCursor !== undefined;
-  let traceBytes = 0;
-  for (const event of events) {
-    const payload = event.payload?.kind, runId = event.identity?.runId;
-    if (runId && payload?.case === "messageCompleted" && payload.value.role === contract.MessageRole.ASSISTANT) {
-      textByRun.set(runId, payload.value.blocks.flatMap(block => block.content.case === "text" ? [block.content.value] : []).join("\n").slice(0, 60_000));
+    const page = await readPage(beforeCursor);
+    const skip = Math.max(0, traceEvents.length + page.events.length - maxTraceEvents);
+    traceEvents.unshift(...page.events.slice(skip));
+    if (skip > 0) truncated = true;
+    // Pages arrive newest first, with chronological events inside each page.
+    for (let i = page.events.length - 1; i >= 0; i--) {
+      const event = page.events[i]!, payload = event.payload?.kind, runId = event.identity?.runId;
+      if (!runId || textByRun.has(runId) || payload?.case !== "messageCompleted" || payload.value.role !== contract.MessageRole.ASSISTANT) continue;
+      textByRun.set(runId, payload.value.blocks.flatMap(block => block.content.case === "text" ? [block.content.value] : []).join("\n"));
+      missingReplies.delete(runId);
     }
+    beforeCursor = page.nextBeforeCursor;
+  } while (beforeCursor !== undefined && (traceEvents.length < maxTraceEvents || missingReplies.size > 0));
+  if (beforeCursor !== undefined) truncated = true;
+  const trace: string[] = [];
+  let traceBytes = 0;
+  for (const event of traceEvents) {
+    const payload = event.payload?.kind;
     if (payload?.case === "textDelta" || payload?.case === "thinkingDelta") continue;
     const line = encode(toJson(contract.EventSchema, event));
     const bytes = Buffer.byteLength(line) + 1;
@@ -191,8 +214,7 @@ async function executeTask(application: OrchestratorApplication, targetId: strin
     traceBytes += bytes;
     trace.push(line);
   }
-  return { result: { version: 1, status, sessionId, providerId: profile.providerId, modelId, traceTruncated: truncated,
-    turns: outcomes.map(turn => ({ ...turn, text: textByRun.get(turn.runId) })) },
+  return { traceTruncated: truncated, turns: outcomes.map(turn => ({ ...turn, text: textByRun.get(turn.runId) })),
     trace: trace.length === 0 ? "" : trace.join("\n") + "\n" };
 }
 
