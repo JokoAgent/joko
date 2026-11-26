@@ -6,7 +6,7 @@ import { create } from "@bufbuild/protobuf";
 import { ExtensionOAuthAccountSchema, ExtensionOAuthStateSchema, ExtensionOAuthServiceGetResponseSchema } from "@joko/contracts";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
-import type { ExtensionCatalogEntryView, ExtensionOAuthApi } from "../model.js";
+import { emptySnapshot, type ExtensionCatalogEntryView, type ExtensionOAuthApi } from "../model.js";
 import { translate } from "../i18n.js";
 import { ExtensionOAuthSection } from "./ExtensionOAuthSection.js";
 
@@ -18,10 +18,14 @@ const state = () => create(ExtensionOAuthStateSchema, { extensionId: "extension-
 async function render(patch: Partial<ExtensionOAuthApi> = {}) {
   const current = state(), api: ExtensionOAuthApi = { canAuthorize: true, get: async () => create(ExtensionOAuthServiceGetResponseSchema, { state: current }), change: vi.fn(), saveClient: vi.fn(), authorize: vi.fn(), ...patch };
   const container = document.createElement("div"); document.body.append(container); const root = createRoot(container); roots.push(root);
-  const controller = { extensionOAuthApi: () => api } as unknown as AppController, onChanged = vi.fn(async () => {});
+  const onChanged = vi.fn(async () => {});
   const extension = { id: "extension-one", revision: 1n } as ExtensionCatalogEntryView;
-  const renderRevision = (oauthRevision: bigint) => act(async () => root.render(<StrictMode><ExtensionOAuthSection controller={controller} extension={extension}
-    oauthRevision={oauthRevision} disabled={false} t={(key, values) => translate("en", key, values)} onChanged={onChanged} /></StrictMode>));
+  const renderRevision = (oauthRevision: bigint, revision = 1n, connectionGeneration = 1) => {
+    const controller = { state: { connectionState: "connected", connectionGeneration, snapshot: { ...emptySnapshot(), revision },
+      activeProfile: { id: "profile", serverId: "node", deviceId: "desktop", origin: "https://node.example" } }, extensionOAuthApi: () => api } as unknown as AppController;
+    return act(async () => root.render(<StrictMode><ExtensionOAuthSection controller={controller} extension={extension}
+      oauthRevision={oauthRevision} disabled={false} t={(key, values) => translate("en", key, values)} onChanged={onChanged} /></StrictMode>));
+  };
   await renderRevision(0n);
   return { container, root, onChanged, renderRevision };
 }
@@ -75,4 +79,23 @@ it("keeps authorization unavailable without a Desktop controller and retires pen
   const active = await render({ authorize: async (_request, original) => { signal = original; return await new Promise((_resolve, reject) => original.addEventListener("abort", () => reject(new Error("Retired")), { once: true })); } });
   await act(async () => button(active.container, "Connect account").click());
   await act(async () => active.root.unmount()); roots.splice(roots.indexOf(active.root), 1); expect(signal.aborted).toBe(true);
+});
+
+it("keeps the browser authorization across same-connection snapshots and aborts it on a new connection generation", async () => {
+  const authorize = vi.fn<ExtensionOAuthApi["authorize"]>(async (_request, signal) => new Promise((_resolve, reject) =>
+    signal.addEventListener("abort", () => reject(new Error("Retired")), { once: true })));
+  const view = await render({ authorize });
+  await act(async () => button(view.container, "Connect account").click());
+  const signal = authorize.mock.calls[0]![1];
+  await view.renderRevision(0n, 2n);
+  expect(signal.aborted).toBe(false);
+  expect(view.container.querySelector('[role="status"]')).not.toBeNull();
+  expect(button(view.container, "Connect account").disabled).toBe(true);
+  await act(async () => button(view.container, "Connect account").click());
+  expect(authorize).toHaveBeenCalledOnce();
+  await view.renderRevision(0n, 2n, 2);
+  expect(signal.aborted).toBe(true);
+  expect(view.container.querySelector('[role="status"]')).toBeNull();
+  expect(button(view.container, "Connect account").disabled).toBe(false);
+  expect(view.onChanged).not.toHaveBeenCalled();
 });

@@ -1,21 +1,30 @@
-import { useEffect, useMemo, useRef, useState, type JSX } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type JSX } from "react";
 import type { ExtensionOAuthSlot, ExtensionOAuthState } from "@joko/contracts";
+import { authenticatedConnectionKey } from "../connection-owner.js";
 import type { AppController } from "../controller.js";
 import type { ExtensionCatalogEntryView, ExtensionOAuthApi } from "../model.js";
 import type { Translator } from "./types.js";
 import { Button, CheckboxControl, Pill } from "./ui.js";
 import "./extension-network.css";
 
-export function ExtensionOAuthSection({ controller, extension, oauthRevision, disabled, t, onChanged }: {
+interface ExtensionOAuthSectionProps {
   readonly controller: AppController; readonly extension: ExtensionCatalogEntryView; readonly oauthRevision: bigint;
   readonly disabled: boolean; readonly t: Translator; readonly onChanged: () => Promise<void>;
-}): JSX.Element | null {
+}
+
+export function ExtensionOAuthSection(props: ExtensionOAuthSectionProps): JSX.Element | null {
+  const owner = authenticatedConnectionKey(props.controller.state);
+  if (owner === undefined) return null;
+  return <ExtensionOAuthContent key={JSON.stringify([owner, props.extension.id])} {...props} />;
+}
+
+function ExtensionOAuthContent({ controller, extension, oauthRevision, disabled, t, onChanged }: ExtensionOAuthSectionProps): JSX.Element | null {
   const [state, setState] = useState<ExtensionOAuthState>(), [error, setError] = useState(false), [refresh, setRefresh] = useState(0);
   const [mutationError, setMutationError] = useState(false);
   const [busy, setBusy] = useState(false), [authorizing, setAuthorizing] = useState(false), [canAuthorize, setCanAuthorize] = useState(false);
-  const lifetime = useMemo(() => ({ abort: new AbortController(), busy: false }), [controller, extension.id]);
+  const [lifetime] = useState(() => ({ abort: new AbortController(), busy: false }));
   const operation = useRef<AbortController | undefined>(undefined);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (lifetime.abort.signal.aborted) lifetime.abort = new AbortController();
     setBusy(false); setAuthorizing(false); return () => lifetime.abort.abort();
   }, [lifetime]);
@@ -26,7 +35,7 @@ export function ExtensionOAuthSection({ controller, extension, oauthRevision, di
     void api.get({ extensionId: extension.id }, { signal }).then(result => { if (!signal.aborted) { setState(result.state); setError(false); } })
       .catch(() => { if (!signal.aborted) setError(true); });
     return () => abort.abort();
-  }, [controller, extension.id, extension.revision, oauthRevision, lifetime, refresh]);
+  }, [extension.id, extension.revision, oauthRevision, lifetime, refresh]);
   const selected = state?.extensionId === extension.id ? state : undefined;
   const run = async (authorize: boolean, work: (api: ExtensionOAuthApi, state: ExtensionOAuthState, signal: AbortSignal) => Promise<ExtensionOAuthState>) => {
     if (disabled || lifetime.busy || !selected) return false;
