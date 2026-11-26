@@ -75,24 +75,25 @@ describe("Interaction visual harness", () => {
     expect(container.querySelector(".interaction-takeover-minimized")).not.toBeNull();
     await click(required(container.querySelector<HTMLButtonElement>(".interaction-takeover-minimized")));
     expect(container.querySelector<HTMLTextAreaElement>(".question-field textarea")?.value).toBe("Keep the scoped UI evidence and recovery draft.");
-    await click(button("Continue"), 240);
+    await navigateQuestion(button("Continue"), 2);
     await click(required(container.querySelector<HTMLButtonElement>('[data-question-other-toggle="density"]')));
     await input(required(container.querySelector<HTMLTextAreaElement>('[data-question-other-input="density"]')), "Use a tested narrow layout");
-    await click(required(container.querySelector<HTMLButtonElement>('.question-choice-other__editor [aria-label="Continue"]')), 240);
+    await navigateQuestion(required(container.querySelector<HTMLButtonElement>('.question-choice-other__editor [aria-label="Continue"]')), 3);
     await click(choice("Geometry"));
     await click(required(container.querySelector<HTMLButtonElement>('[data-question-other-toggle="evidence"]')));
     await input(required(container.querySelector<HTMLTextAreaElement>('[data-question-other-input="evidence"]')), "Retain retry evidence");
     expect(choice("Keyboard").disabled).toBe(true);
-    await click(button("Continue"), 240);
+    await navigateQuestion(button("Continue"), 4);
     await click(required(container.querySelector<HTMLButtonElement>('.question-field [role="radio"]')));
     await click(button("Submit answers"));
     expect(state()).toMatchObject({ phase: "pending", pending: { kind: "question",
       answeredFieldIds: ["summary", "density", "evidence", "approved"] } });
     await settle("failure");
     expect(container.querySelector('.question-field [role="radio"]')?.getAttribute("aria-checked")).toBe("true");
-    await click(button("Back"), 240);
+    await navigateQuestion(button("Back"), 3);
     expect(container.querySelector<HTMLTextAreaElement>('[data-question-other-input="evidence"]')?.value).toBe("Retain retry evidence");
-    await click(button("Continue"), 240);
+    await navigateQuestion(button("Continue"), 4);
+    expect(button("Submit answers").disabled).toBe(false);
     await click(button("Submit answers"));
     await settle("success");
 
@@ -175,8 +176,16 @@ function choice(label: string): HTMLButtonElement {
   if (control === undefined || control === null) throw new Error(`Expected choice ${label}; observed ${container.querySelector(".question-form")?.textContent}`);
   return control;
 }
-async function click(control: HTMLButtonElement, delay = 35): Promise<void> {
-  await act(async () => { control.click(); await wait(delay); });
+async function click(control: HTMLButtonElement): Promise<void> {
+  await act(async () => { control.click(); await wait(35); });
+}
+async function navigateQuestion(control: HTMLButtonElement, step: number): Promise<void> {
+  await click(control);
+  await vi.waitFor(async () => {
+    await act(async () => wait(0));
+    expect(container.querySelector<HTMLProgressElement>(".question-wizard__progress progress")?.value).toBe(step);
+    expect(container.querySelector(".question-wizard__step:not(.is-leaving-left):not(.is-leaving-right)")).not.toBeNull();
+  }, { timeout: 3000 });
 }
 async function input(control: HTMLTextAreaElement, value: string): Promise<void> {
   await act(async () => {
