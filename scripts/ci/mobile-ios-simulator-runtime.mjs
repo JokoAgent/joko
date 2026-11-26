@@ -18,11 +18,13 @@ if (!['relay', 'iroh-native', 'http-connect-native'].includes(sdkRuntime)) throw
 const verifyWorkspacePdf = !startupDiagnosticsOnly && sdkRuntime === "relay" && process.env.JOKO_IOS_WORKSPACE_PDF === "1";
 const abort = new AbortController();
 const observationStartedAt = Date.now();
-// Cold boot, Metro, two app observations and the XCTest build took nearly
-// 26 minutes on the Intel runner. Leave the first XCTest its full five minutes.
+// Cold boot, two app observations and XCTest share this deadline. The relay
+// run also includes the real pairing and PDF selection/copy operations.
 const observationBudgetMs = (startupDiagnosticsOnly ? 4 : verifyWorkspacePdf ? 37 : 31) * 60_000;
 const observationDeadlineAt = observationStartedAt + observationBudgetMs;
-const simulatorInstallTimeoutMs = 120_000;
+// An Intel startup has recovered the exact installed App almost 150 seconds
+// after installation began. Allow the original installer to finish first.
+const simulatorInstallTimeoutMs = 180_000;
 const simulatorLaunchTimeoutMs = 120_000;
 // A cold Intel runner can finish the real Debug graph after four minutes.
 const metroBundleTimeoutMs = 300_000;
@@ -134,8 +136,8 @@ async function alive(pid) {
 function startMetro(port) {
   const cli = join(root, "apps/mobile/node_modules/expo/bin/cli");
   if (!existsSync(cli)) throw new Error("Install the matched checkout's Expo dependencies before starting Metro.");
-  // Expo binds the literal localhost name. Match the IPv4 address used by the
-  // readiness probe and the Simulator's RCT_jsLocation even when ::1 is first.
+  // Expo binds the literal localhost name. The readiness probe resolves which
+  // loopback address the host actually serves before passing it to the app.
   metro = spawn(process.execPath, ["--dns-result-order=ipv4first", cli, "start", "--host", "localhost", "--port", String(port), "--max-workers", "2"], {
     cwd: join(root, "apps/mobile"), detached: true, stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, CI: "1", EXPO_NO_TELEMETRY: "1", NODE_ENV: "development" }
@@ -151,29 +153,41 @@ function startMetro(port) {
   metro.once("error", error => { record(Buffer.from(error.message)); metroClosed = true; });
   metro.once("close", () => { metroClosed = true; });
 }
-async function waitForMetro(origin) {
+async function waitForMetro(port) {
+  const origins = [`http://127.0.0.1:${port}`, `http://[::1]:${port}`];
   const startedAt = Date.now();
-  const until = Date.now() + 90_000;
-  let attempts = 0, lastProbe;
-  const recordStatus = ready => save("metro-status.json", { origin, ready, attempts, elapsedMs: Date.now() - startedAt,
-    nodeDnsResultOrder: "ipv4first", lastProbe });
-  while (Date.now() < until) {
-    abort.signal.throwIfAborted();
-    if (metroClosed) { recordStatus(false); throw new Error("The owned Metro process exited before it became ready; see metro.log."); }
-    attempts += 1;
-    try {
-      const response = await fetch(`${origin}/status`, { signal: AbortSignal.any([abort.signal, AbortSignal.timeout(3000)]) });
-      const body = (await response.text()).trim();
-      lastProbe = { status: response.status, packagerRunning: body === "packager-status:running" };
-      if (response.ok && lastProbe.packagerRunning) { recordStatus(true); return; }
-    } catch (error) {
-      lastProbe = { error: error.name, code: error.cause?.code ?? null };
+  const timeoutMs = 180_000;
+  const until = startedAt + timeoutMs;
+  let attempts = 0, lastProbes = [], readyOrigin = null;
+  try {
+    while (Date.now() < until) {
       abort.signal.throwIfAborted();
+      if (metroClosed) throw new Error("The owned Metro process exited before it became ready; see metro.log.");
+      attempts += 1;
+      lastProbes = await Promise.all(origins.map(async origin => {
+        try {
+          const response = await fetch(`${origin}/status`, {
+            redirect: "error", signal: AbortSignal.any([abort.signal, AbortSignal.timeout(3000)])
+          });
+          const body = (await response.text()).trim();
+          return { origin, status: response.status, packagerRunning: response.ok && body === "packager-status:running" };
+        } catch (error) {
+          return { origin, error: error.name, code: error.cause?.code ?? null };
+        }
+      }));
+      abort.signal.throwIfAborted();
+      const ready = lastProbes.find(probe => probe.packagerRunning);
+      if (ready !== undefined && !metroClosed) {
+        readyOrigin = ready.origin;
+        return readyOrigin;
+      }
+      await delay(1000, undefined, { signal: abort.signal });
     }
-    await delay(1000, undefined, { signal: abort.signal });
+    throw new Error("The matched checkout's Metro server did not become ready.");
+  } finally {
+    save("metro-status.json", { origin: readyOrigin, ready: readyOrigin !== null, attempts,
+      elapsedMs: Date.now() - startedAt, timeoutMs, nodeDnsResultOrder: "ipv4first", lastProbes });
   }
-  recordStatus(false);
-  throw new Error("The matched checkout's Metro server did not become ready.");
 }
 
 async function compileIosBundle(origin, appBundleId) {
@@ -266,11 +280,11 @@ async function observe(phase, pid, ocr) {
   }
   throw new Error(`${phase}: Joko's real connection page was not observed without a loader, error or permission overlay. See the screenshot and OCR; no GUI success is claimed.`);
 }
-async function launch(port) {
+async function launch(metroLocation) {
   const ownedUdid = udid, application = bundleId, installed = installedExecutable;
   let output;
   try {
-    output = await command("xcrun", ["simctl", "launch", udid, bundleId, "-RCT_jsLocation", `127.0.0.1:${port}`, "-RCT_packager_scheme", "http",
+    output = await command("xcrun", ["simctl", "launch", udid, bundleId, "-RCT_jsLocation", metroLocation, "-RCT_packager_scheme", "http",
       "-AppleLanguages", "(en)", "-AppleLocale", "en_US"],
       { timeout: simulatorLaunchTimeoutMs, startupLabel: "launch-owned-application" });
   } catch (error) {
@@ -474,7 +488,7 @@ function startWorkspacePdfFixture() {
   let pairingWindowRequested = false;
   const issuedCodes = [], steps = [];
   let linkspanUpgrades = 0;
-  const serverInfoStatuses = [];
+  const serverInfoResponses = [];
   const setupSteps = new Set(["child-started", "node-started", "manager-paired", "workspace-index-ready", "original-task-completed"]);
   const started = Date.now();
   child.once("error", (error) => { childError = error; });
@@ -492,7 +506,9 @@ function startWorkspacePdfFixture() {
     } else if (message.kind === "simulatorIdentityTransport" && pairingWindowRequested) {
       if (message.effect === "linkspan_upgrade") linkspanUpgrades++;
       if (message.effect === "server_info" && Number.isInteger(message.status)
-        && message.status >= 100 && message.status <= 599 && serverInfoStatuses.length < 8) serverInfoStatuses.push(message.status);
+        && message.status >= 100 && message.status <= 599 && serverInfoResponses.length < 8) {
+        serverInfoResponses.push({ status: message.status, elapsedMs: Date.now() - started });
+      }
     } else if (message.kind === "pairingCode" && typeof message.code === "string") {
       issuedCodes.push(message.code);
       pairingCode = message.code;
@@ -515,7 +531,7 @@ function startWorkspacePdfFixture() {
     get pairingCode() { return pairingCode; },
     get paired() { return paired; },
     get pairingRequests() { return issuedCodes.length; },
-    identityTransport() { return { linkspanUpgrades, serverInfoStatuses }; },
+    identityTransport() { return { linkspanUpgrades, serverInfoStatuses: serverInfoResponses.map(response => response.status), serverInfoResponses }; },
     async ready() {
       const deadline = started + 120_000;
       try {
@@ -545,7 +561,7 @@ function startWorkspacePdfFixture() {
   };
 }
 
-async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopenedPid, minimumOsVersion, workspacePdf) {
+async function runConnectionUiTests(app, metroLocation, expectedSha, expectedHash, reopenedPid, minimumOsVersion, workspacePdf) {
   const owner = { udid, bundleId, installedExecutable };
   const assertIdentity = async (phase) => {
     abort.signal.throwIfAborted();
@@ -571,7 +587,8 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
   const progressNames = new Set([...names, "04-https-selected", "04-address-tapped", "04-address-quickpath-dismissed",
     "04-address-typing", "04-address-typed", "04-address-input-restored", "04-address-value-observed",
     "11-pdf-address-and-key-confirmed", "11-pdf-identity-check-tapped", "11-pdf-identity-confirmed", "11-pdf-pairing-available",
-    "11-pdf-task-link-visible", "11-pdf-task-link-tapped", "12-native-pdf-copy-tapped"]);
+    "11-pdf-pairing-request-tapped", "11-pdf-pairing-code-issued", "11-pdf-pairing-submitted", "11-pdf-paired-task-visible",
+    "11-pdf-task-opened", "11-pdf-task-link-visible", "11-pdf-task-link-tapped", "12-native-pdf-copy-tapped"]);
   // A loopback-only Connect error endpoint exercises the real native transport.
   // It never supplies a node identity, challenge, credential or successful pair.
   let requests = 0, unexpectedRequests = 0, screenshotCount = 0;
@@ -621,7 +638,7 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
     let executionError;
     try {
       await guiCommand([...common, "test-without-building", "-resultBundlePath", xcresult,
-        "-only-testing:JokoCIUITests/JokoConnectionUITests/testConnectionPageInteractions"], logName, (verifyWorkspacePdf ? 8 : 5) * 60_000);
+        "-only-testing:JokoCIUITests/JokoConnectionUITests/testConnectionPageInteractions"], logName, (verifyWorkspacePdf ? 12 : 5) * 60_000);
     } catch (error) { executionError = error; }
     if (abort.signal.aborted) throw executionError ?? abort.signal.reason;
     const summary = await readUiTestSummary(() => {
@@ -634,7 +651,7 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
   try {
     stage = "Apple UI-test target preparation";
     await command("ruby", [join(root, "scripts/ci/ios-prepare-ui-tests.rb"), project,
-      join(root, "scripts/ci/ios-connection-ui-tests.swift"), String(port), String(probePort), minimumOsVersion, sdkRuntime]);
+      join(root, "scripts/ci/ios-connection-ui-tests.swift"), metroLocation, String(probePort), minimumOsVersion, sdkRuntime]);
     stage = "Apple UI-test runner build";
     await guiCommand([...common, "build-for-testing"], "gui-build.log", 5 * 60_000);
     stage = "UI-test runner prepared application identity verification";
@@ -808,7 +825,7 @@ async function startOwnedSimulator(applicationIdentity) {
     { startupLabel: "create-owned-simulator" });
   if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu.test(created)) throw new Error("Simulator creation returned no exact UDID.");
   udid = created;
-  save("identity.json", { sourceCommit: await command("git", ["rev-parse", "HEAD"]), ...applicationIdentity,
+  save("identity.json", { ...applicationIdentity,
     simulatorUdid: udid, simulatorName: deviceName, runtime: runtime.identifier, deviceType: type.identifier,
     architecture: process.arch === "arm64" ? "arm64" : "x86_64", xcode: await command("xcodebuild", ["-version"]) });
   await command("xcrun", ["simctl", "boot", udid], { startupLabel: "boot-owned-simulator" });
@@ -886,7 +903,8 @@ async function main() {
     if (!output || !isAbsolute(output)) throw new Error("An absolute evidence path is required.");
     evidence = resolve(output); mkdirSync(evidence, { recursive: true });
     if (startupDiagnosticsOnly) {
-      await startOwnedSimulator({ scope: "simulator-startup-command-probe", noApplicationInstalled: true });
+      const sourceCommit = await command("git", ["rev-parse", "HEAD"]);
+      await startOwnedSimulator({ sourceCommit, scope: "simulator-startup-command-probe", noApplicationInstalled: true });
       stage = "owned Simulator framebuffer capture";
       const framebuffer = await captureStartupFramebuffer("simulator-startup.png", "capture-simulator-springboard");
       const identity = JSON.parse(readFileSync(join(evidence, "identity.json"), "utf8"));
@@ -907,27 +925,34 @@ async function main() {
     }
     const binary = join(app, executable), architecture = process.arch === "arm64" ? "arm64" : "x86_64";
     if (!(await command("lipo", ["-archs", binary])).split(/\s+/u).includes(architecture)) throw new Error("The Simulator binary does not contain this runner's architecture.");
+    const applicationIdentity = {
+      sourceCommit: await command("git", ["rev-parse", "HEAD"]), bundleId, executable, compiledApp: app,
+      executableSha256: await hashFile(binary),
+      startupBinding: "Debug RCT_jsLocation points to the owned same-checkout Metro; no development-client DeepLink is used."
+    };
+    save("identity.json", { ...applicationIdentity, architecture });
     const ocr = join(evidence, "screen-text");
     stage = "screen observer compilation";
     await command("xcrun", ["swiftc", join(root, "scripts/ci/mobile-ios-screen-text.swift"), "-framework", "Vision", "-o", ocr],
       { timeout: 60_000, startupLabel: "compile-screen-observer" });
-    await startOwnedSimulator({ bundleId, executable, compiledApp: app, executableSha256: await hashFile(binary),
-      startupBinding: "Debug RCT_jsLocation points to the owned same-checkout Metro; no development-client DeepLink is used." });
+    // Finish the cold graph before boot starts competing for CPU and memory.
+    // Both native launches reuse this Metro process and its compiled graph.
+    stage = "same-checkout Metro startup";
+    await recordHostResources("before-metro");
+    const port = await freePort();
+    startMetro(port);
+    const origin = await waitForMetro(port), metroLocation = new URL(origin).host;
+    stage = "same-checkout iOS bundle compilation";
+    await compileIosBundle(origin, bundleId);
+    await startOwnedSimulator(applicationIdentity);
     stage = "owned application installation";
     const { container, installation } = await installOwnedApplication(app);
     installedExecutable = realpathSync(join(requireSimulatorApplicationContainer(container), executable));
-    if (await hashFile(installedExecutable) !== await hashFile(binary)) throw new Error("The installed app bytes do not match the compiled artifact.");
+    if (await hashFile(installedExecutable) !== applicationIdentity.executableSha256) throw new Error("The installed app bytes do not match the compiled artifact.");
     installation.installedExecutableVerified = true;
     save("installation-state.json", installation);
-    // Keep Metro out of the cold Simulator and installation phases. The app
-    // still reuses the same lazy Debug graph when it first launches.
-    stage = "same-checkout Metro startup";
-    const port = await freePort(), origin = `http://127.0.0.1:${port}`;
-    startMetro(port); await waitForMetro(origin);
-    stage = "same-checkout iOS bundle compilation";
-    await compileIosBundle(origin, bundleId);
     stage = "first native launch";
-    const firstStartedAt = Date.now(), firstPid = await launch(port);
+    const firstStartedAt = Date.now(), firstPid = await launch(metroLocation);
     preInputApplication = { pid: firstPid, startedAt: firstStartedAt };
     const first = await observe("first-launch", firstPid, ocr);
     preInputApplication = undefined;
@@ -936,7 +961,7 @@ async function main() {
     for (let count = 0; count < 20 && await alive(firstPid); count++) await delay(250, undefined, { signal: abort.signal });
     if (await alive(firstPid)) throw new Error("The first app occurrence did not terminate.");
     stage = "native reopen";
-    const reopenedStartedAt = Date.now(), reopenedPid = await launch(port);
+    const reopenedStartedAt = Date.now(), reopenedPid = await launch(metroLocation);
     preInputApplication = { pid: reopenedPid, startedAt: reopenedStartedAt };
     const reopened = await observe("reopened", reopenedPid, ocr);
     preInputApplication = undefined;
@@ -947,7 +972,7 @@ async function main() {
       await workspacePdf.ready();
     }
     const identity = JSON.parse(readFileSync(join(evidence, "identity.json"), "utf8"));
-    const gui = await runConnectionUiTests(app, port, identity.sourceCommit, identity.executableSha256, reopenedPid, info.MinimumOSVersion, workspacePdf);
+    const gui = await runConnectionUiTests(app, metroLocation, identity.sourceCommit, identity.executableSha256, reopenedPid, info.MinimumOSVersion, workspacePdf);
     const postGuiFrame = await capturePostUiFrame(ocr, identity, reopenedPid);
     assertNoNotificationStartupError(readFileSync(join(evidence, "metro.log"), "utf8"));
     result = { passed: true, sourceCommit: await command("git", ["rev-parse", "HEAD"]), bundleId, simulatorUdid: udid,

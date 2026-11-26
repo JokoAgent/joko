@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState, type ForwardRefExoticComponent, type RefAttributes } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ForwardRefExoticComponent, type RefAttributes } from "react";
 import { Alert, AppState, Platform, StyleSheet, Text } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView, type WebViewMessageEvent, type WebViewProps } from "react-native-webview";
@@ -48,6 +48,7 @@ export function MobileSharedConnectionScreen(props: MobileSharedConnectionScreen
   const authorizationAbort = useRef(new AbortController());
   const webView = useRef<ConnectionWebViewHandle | null>(null);
   const ready = useRef(false);
+  const firstDocumentSettled = useRef(false);
   const activeSurface = useRef(surface);
   const lastRequestId = useRef(0);
   const current = useRef(props);
@@ -102,20 +103,33 @@ export function MobileSharedConnectionScreen(props: MobileSharedConnectionScreen
     return () => subscription.remove();
   }, []);
 
-  const recover = () => {
+  const recover = useCallback(() => {
+    if (activeSurface.current !== surface) return;
     authorizationAbort.current.abort();
     scannerRef.current?.reject(new Error('The connection page was replaced.')); scannerRef.current = undefined; setScanner(undefined);
     activeSurface.current = "";
     ready.current = false;
     setNotice(mobileMessage(current.current.locale, "connection.repair"));
     setSurface(`joko-connection-${++surfaceSequence}`);
-  };
+  }, [surface]);
+  useEffect(() => {
+    if (Platform.OS !== "ios" || !foreground || firstDocumentSettled.current) return;
+    // WKWebView can remain blank without delivering a load error. Reopen the
+    // initial local document once while it still cannot accept bridge actions.
+    const timer = setTimeout(() => {
+      if (AppState.currentState !== "active" || activeSurface.current !== surface || firstDocumentSettled.current) return;
+      firstDocumentSettled.current = true;
+      recover();
+    }, 60_000);
+    return () => clearTimeout(timer);
+  }, [foreground, surface, recover]);
   const handleMessage = (event: WebViewMessageEvent) => {
     if (activeSurface.current !== surface) return;
     const message = parseMobileConnectionMessage(event.nativeEvent.data, surface);
     if (!message) return;
     if (message.type === "ready") {
       ready.current = true;
+      firstDocumentSettled.current = true;
       setNotice("");
       webView.current?.injectJavaScript(`window.jokoConnection.update(${mobileConnectionJson(latestPublicView.current)});true;`);
       return;

@@ -2,12 +2,13 @@ require 'xcodeproj'
 
 # Build only XCTest without requiring Pods or producing a replacement app.
 # Runtime tests attach to the installed application on the owned device.
-abort 'Expected new project, Swift source, Metro port, local probe port, minimum OS version and optional selected runtime.' unless (5..6).cover?(ARGV.length)
-project_path, source_path, metro_port, probe_port, deployment, selected_runtime = ARGV
+abort 'Expected new project, Swift source, Metro location, local probe port, minimum OS version and optional selected runtime.' unless (5..6).cover?(ARGV.length)
+project_path, source_path, metro_location, probe_port, deployment, selected_runtime = ARGV
 selected_runtime ||= 'relay'
 abort 'Unknown selected Mobile runtime.' unless ['relay', 'iroh-native', 'http-connect-native'].include?(selected_runtime)
 abort 'Expected a new project and real CI Swift source.' if File.exist?(project_path) || !File.file?(source_path)
-abort 'Expected owned local server ports.' unless [metro_port, probe_port].all? { |port| port.match?(/\A[0-9]+\z/) && (1..65_535).cover?(port.to_i) }
+metro_address = /\A(?:127\.0\.0\.1|\[::1\]):([0-9]+)\z/.match(metro_location)
+abort 'Expected owned local server addresses.' unless metro_address && (1..65_535).cover?(metro_address[1].to_i) && probe_port.match?(/\A[0-9]+\z/) && (1..65_535).cover?(probe_port.to_i)
 abort 'Expected the compiled application minimum OS version.' unless deployment.match?(/\A[0-9]{1,2}(?:\.[0-9]{1,2}){1,2}\z/)
 project = Xcodeproj::Project.new(project_path)
 target = project.new_target(:ui_test_bundle, 'JokoCIUITests', :ios, deployment, nil, :swift)
@@ -34,7 +35,7 @@ scheme.configure_with_targets(nil, target)
 scheme.test_action.build_configuration = 'Debug'
 scheme.test_action.should_use_launch_scheme_args_env = false
 scheme.test_action.environment_variables = Xcodeproj::XCScheme::EnvironmentVariables.new([
-  { :key => 'JOKO_CI_METRO_PORT', :value => metro_port },
+  { :key => 'JOKO_CI_METRO_LOCATION', :value => metro_location },
   { :key => 'JOKO_CI_PROBE_PORT', :value => probe_port },
   { :key => 'JOKO_CI_SDK_RUNTIME', :value => selected_runtime }
 ])

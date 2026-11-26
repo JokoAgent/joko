@@ -4,10 +4,20 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { capabilityNames, RunState } from "@joko/contracts";
+import type { AdapterContext, PromptInput } from "@joko/core";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 
-import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
+import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import { createSessionMutation, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
+
+class PdfTaskAdapter extends InstrumentedFakeAdapter {
+  override async send(_input: PromptInput, context: AdapterContext): Promise<void> {
+    await context.emit({ type: "message_complete", role: "assistant", blocks: [
+      { kind: "text", text: "[Reference PDF](./docs/manual.pdf)" }
+    ] });
+    await context.emit({ type: "done", outcome: "completed" });
+  }
+}
 
 async function observePdfTask(): Promise<void> {
   if (!process.send || !process.connected) throw new Error("The iOS PDF fixture requires its owned supervisor.");
@@ -22,6 +32,7 @@ async function observePdfTask(): Promise<void> {
   ] };
   let openedForSimulator = false;
   const fixture = await OrchestratorE2eFixture.start({ profiles: [profile], serverId: "ios-workspace-pdf", webRtc: true,
+    createAdapter: entry => new PdfTaskAdapter(entry),
     observeIdentityTransport: (effect, status) => {
       if (openedForSimulator && process.connected) process.send?.({ kind: "simulatorIdentityTransport", effect, status });
     }
@@ -56,7 +67,7 @@ async function observePdfTask(): Promise<void> {
       createSessionMutation({ backendId: profile.id, targetId, displayName: "Original workspace PDF task" })));
     const generation = BigInt(application.store.getSession(sessionId).descriptor.binding.generation);
     await submit(manager.clients.operation, manager.connectionId,
-      sendInputMutation(sessionId, generation, "[Reference PDF](./docs/manual.pdf)"));
+      sendInputMutation(sessionId, generation, "Show the original Workspace PDF."));
     await waitFor(async () => {
       const runs = application.store.listRuns({ sessionId });
       return runs.length === 1

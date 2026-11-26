@@ -34,10 +34,10 @@ on:
       ios_runner:
         description: Standard runner architecture for the iOS build and GUI jobs
         type: choice
-        default: intel
+        default: arm64
         options:
-          - intel
           - arm64
+          - intel
       sdk_runtime:
         description: SDK runtime included in the native test app
         type: choice
@@ -352,7 +352,8 @@ jobs:
   ios-simulator:
     if: ${{ inputs.scope != 'js-exports' && inputs.scope != 'android-signer-diagnostics' && inputs.scope != 'ios-startup-diagnostics' && (github.event_name != 'workflow_dispatch' || inputs.platform != 'android') }}
     name: iOS Simulator Debug build and Swift checks
-    runs-on: ${{ inputs.ios_runner == 'arm64' && 'macos-15' || 'macos-15-intel' }}
+    # ARM64 completed the paired PDF check on the standard hosted image.
+    runs-on: ${{ inputs.ios_runner == 'intel' && 'macos-15-intel' || 'macos-15' }}
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
     timeout-minutes: 75
@@ -432,7 +433,7 @@ jobs:
           ruby scripts/ci/ios-prepare-ui-tests.test.rb
           ruby scripts/ci/ios-prepare-ui-tests.rb \
             "$RUNNER_TEMP/JokoCIUITests.xcodeproj" \
-            scripts/ci/ios-connection-ui-tests.swift 12345 12346 16.4
+            scripts/ci/ios-connection-ui-tests.swift 127.0.0.1:12345 12346 16.4
           xcodebuild -quiet \
             -project "$RUNNER_TEMP/JokoCIUITests.xcodeproj" \
             -scheme JokoCIUITests -configuration Debug -sdk iphonesimulator \
@@ -510,12 +511,12 @@ jobs:
     needs: ios-simulator
     name: iOS Simulator startup and native GUI on a fresh runner
     # Match the app build's architecture and Xcode/SDK on a separate runner.
-    runs-on: ${{ inputs.ios_runner == 'arm64' && 'macos-15' || 'macos-15-intel' }}
+    runs-on: ${{ inputs.ios_runner == 'intel' && 'macos-15-intel' || 'macos-15' }}
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
-    # Cold Linkspan preparation and the paired task fixture build run before
-    # the bounded native observations and their evidence upload.
-    timeout-minutes: 75
+    # Runner preparation took 52 minutes on a cold Intel host. Reserve the
+    # full 39-minute observation step plus time to upload evidence and clean up.
+    timeout-minutes: 100
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

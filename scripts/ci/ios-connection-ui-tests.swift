@@ -17,12 +17,13 @@ final class JokoConnectionUITests: XCTestCase {
             throw NSError(domain: "JokoCI", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unknown selected Mobile runtime."])
         }
         sdkRuntime = selected
-        guard let metro = environment["JOKO_CI_METRO_PORT"], Int(metro) != nil,
+        guard let metro = environment["JOKO_CI_METRO_LOCATION"], (metro.hasPrefix("127.0.0.1:") || metro.hasPrefix("[::1]:")),
+              URL(string: "http://\(metro)")?.port != nil,
               let probe = environment["JOKO_CI_PROBE_PORT"], Int(probe) != nil else {
             throw NSError(domain: "JokoCI", code: 1, userInfo: [NSLocalizedDescriptionKey: "Owned local servers were not passed to the UI runner."])
         }
         app = XCUIApplication(bundleIdentifier: "app.joko.mobile")
-        let launchArguments = ["-RCT_jsLocation", "127.0.0.1:\(metro)", "-RCT_packager_scheme", "http", "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
+        let launchArguments = ["-RCT_jsLocation", metro, "-RCT_packager_scheme", "http", "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         ownedLaunchArguments = launchArguments
         // The native owner has already launched, terminated, reopened and
         // observed this exact application. Do not create a third occurrence.
@@ -114,60 +115,57 @@ final class JokoConnectionUITests: XCTestCase {
     }
     private func tab(_ label: String) -> XCUIElement { tabQuery(label).firstMatch }
 
-    private func tap(_ element: XCUIElement, atCenter: Bool = false, beforeConnectionInput: Bool = false) {
-        // Debug builds can present native LogBox toasts over WKWebView controls.
-        // Close those exact development surfaces through their real UI; keep
-        // application errors, dialogs, and every connection assertion visible.
+    private func dismissDevelopmentNotice(overlapping target: CGRect, beforeConnectionInput: Bool) {
+        // A LogBox notice at the bottom can coexist with connection controls.
+        // Dismiss only a known development notice covering this tap target.
         for prefix in ["Open debugger to view warnings.", "[expo-notifications] Error reading persisted"] {
             // This native LogBox version exposes the combined icon and message
             // as Other, with the exact observed "!, " label prefix.
             let notice = app.descendants(matching: .any).matching(NSPredicate(
                 format: "label BEGINSWITH %@ OR label BEGINSWITH %@", prefix, "!, \(prefix)")).firstMatch
-            if notice.exists && notice.isHittable {
-                // The installed SDK places the close button 10 points from
-                // the window edge, plus 12 padding and half its 20-point width.
-                // Use the window's horizontal bounds and this toast's actual Y.
-                let window = app.windows.firstMatch
-                let closeNotice = {
-                    let frame = window.frame
-                    let noticeFrame = notice.frame
-                    XCTAssertGreaterThan(noticeFrame.width, 44)
-                    window.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
-                        dx: frame.width - 32, dy: noticeFrame.midY - frame.minY)).tap()
-                }
-                closeNotice()
-                // A first native press can leave this exact toast present.
-                // Re-measure and press at most once more inside the original
-                // five-second disappearance budget; never ignore the overlay.
-                let deadline = Date().addingTimeInterval(5)
-                let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: notice)
-                var result = XCTWaiter.wait(for: [dismissed], timeout: 1)
-                if result != .completed && deadline.timeIntervalSinceNow > 0 {
-                    if notice.exists && notice.isHittable && deadline.timeIntervalSinceNow > 0 {
-                        closeNotice()
-                    }
-                    let remaining = deadline.timeIntervalSinceNow
-                    if remaining > 0 {
-                        let retry = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: notice)
-                        result = XCTWaiter.wait(for: [retry], timeout: remaining)
-                    }
-                }
-                // The final native tap can close the notice after the earlier
-                // wait expires. Observe its actual state before continuing.
-                let noticeStillPresent = notice.exists
-                if noticeStillPresent && beforeConnectionInput {
-                    try? recordPreInputSetupFailure(launchArguments: ownedLaunchArguments)
-                }
-                XCTAssertFalse(noticeStillPresent, "The actual development notice must close.")
+            let coversTarget = { notice.exists && notice.frame.intersects(target) }
+            guard coversTarget(), notice.isHittable else { continue }
+            let window = app.windows.firstMatch
+            let closeNotice = {
+                let frame = window.frame
+                let noticeFrame = notice.frame
+                // The LogBox close button has 12 points of trailing padding
+                // and a 20-point width inside the measured notice.
+                let closeCenter = CGPoint(x: noticeFrame.maxX - 22, y: noticeFrame.midY)
+                XCTAssertGreaterThan(noticeFrame.width, 44)
+                XCTAssertTrue(frame.contains(closeCenter))
+                window.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
+                    dx: closeCenter.x - frame.minX, dy: closeCenter.y - frame.minY)).tap()
             }
+            closeNotice()
+            let deadline = Date().addingTimeInterval(5)
+            let unblocked = NSPredicate { _, _ in !coversTarget() }
+            let first = XCTNSPredicateExpectation(predicate: unblocked, object: nil)
+            if XCTWaiter.wait(for: [first], timeout: 1) != .completed,
+               Date() < deadline, coversTarget(), notice.isHittable {
+                closeNotice()
+                let remaining = deadline.timeIntervalSinceNow
+                if remaining > 0 {
+                    let retry = XCTNSPredicateExpectation(predicate: unblocked, object: nil)
+                    _ = XCTWaiter.wait(for: [retry], timeout: remaining)
+                }
+            }
+            let stillBlocked = coversTarget()
+            if stillBlocked && beforeConnectionInput {
+                try? recordPreInputSetupFailure(launchArguments: ownedLaunchArguments)
+            }
+            XCTAssertFalse(stillBlocked, "The development notice still overlaps the intended control.")
         }
+    }
+
+    private func tap(_ element: XCUIElement, atCenter: Bool = false, beforeConnectionInput: Bool = false) {
+        XCTAssertTrue(element.waitForExistence(timeout: 10))
+        let initialFrame = element.frame
+        dismissDevelopmentNotice(overlapping: initialFrame, beforeConnectionInput: beforeConnectionInput)
         // WKWebView's page can scroll while the native keyboard is open. Scroll
         // the actual page to expose the control rather than tapping coordinates.
-        // A hittable element is already present. Use one native accessibility
-        // query on this path and sample again only after the UI has changed.
         if !element.isHittable {
-            XCTAssertTrue(element.waitForExistence(timeout: 10))
-            var hittable = element.isHittable
+            var hittable = false
             for _ in 0..<4 where !hittable {
                 connectionPage.swipeUp()
                 hittable = element.isHittable
@@ -176,7 +174,11 @@ final class JokoConnectionUITests: XCTestCase {
                 connectionPage.swipeDown()
                 hittable = element.isHittable
             }
-            XCTAssertTrue(hittable)
+            let scrolledFrame = element.frame
+            if scrolledFrame != initialFrame {
+                dismissDevelopmentNotice(overlapping: scrolledFrame, beforeConnectionInput: beforeConnectionInput)
+            }
+            XCTAssertTrue(element.isHittable)
         }
         if atCenter {
             // Web controls can expose a native hit point outside the editable
@@ -474,34 +476,51 @@ final class JokoConnectionUITests: XCTestCase {
         wait(inspect, "enabled == true")
         tap(inspect, atCenter: true)
         reportCheckpoint("11-pdf-identity-check-tapped")
-        let identity = connectionPage.staticTexts["Identity: ios-workspace-pdf"].firstMatch
-        // The first pinned check loads the HTTP and Noise chunks serially from
-        // Debug Metro. Their cold build exceeded 25 seconds on the Intel runner.
-        XCTAssertTrue(identity.waitForExistence(timeout: 60), "The owned PDF node identity was not shown after the native check.")
-        reportCheckpoint("11-pdf-identity-confirmed")
         let request = button("Request pairing")
-        wait(request, "enabled == true")
+        // The verified identity enables pairing after the first pinned check.
+        // Cold HTTP and Noise chunks took over a minute on the Intel runner.
+        wait(request, "exists == true AND enabled == true", timeout: 120)
+        // WKWebView can group the identity with the other text in its status region.
+        let identityLabel = #"(?s).*\bIdentity: ios-workspace-pdf(?![A-Za-z0-9._-]).*"#
+        let identity = connectionPage.descendants(matching: .any).matching(NSPredicate(
+            format: "label MATCHES %@", identityLabel)).firstMatch
+        if !identity.exists { connectionPage.swipeUp() }
+        XCTAssertTrue(identity.waitForExistence(timeout: 10), "The owned PDF node identity was not shown after the native check.")
+        reportCheckpoint("11-pdf-identity-confirmed")
         reportCheckpoint("11-pdf-pairing-available")
-        tap(request)
+        tap(request, atCenter: true)
+        reportCheckpoint("11-pdf-pairing-request-tapped")
         let pairing = try XCTUnwrap(pdfFixtureInput("ci-pdf-pairing-code", waitForCode: true))
+        reportCheckpoint("11-pdf-pairing-code-issued")
         let code = try XCTUnwrap(pairing["code"])
         let field = connectionPage.textFields["Pairing code"].firstMatch
         XCTAssertTrue(field.waitForExistence(timeout: 10))
         replace(field, with: code)
         tap(button("Pair this device"))
+        reportCheckpoint("11-pdf-pairing-submitted")
 
         let task = app.buttons["Open task Original workspace PDF task"].firstMatch
         XCTAssertTrue(task.waitForExistence(timeout: 35))
+        reportCheckpoint("11-pdf-paired-task-visible")
         tap(task)
-        let link = app.links["Reference PDF"].firstMatch
+        let title = app.descendants(matching: .any).matching(NSPredicate(
+            format: "label == %@", "Original workspace PDF task")).firstMatch
+        XCTAssertTrue(title.waitForExistence(timeout: 25), "The paired app must open the original task.")
+        reportCheckpoint("11-pdf-task-opened")
+        // This reply contains only the Workspace link. Fabric can expose its
+        // label on the native paragraph covering the full line.
+        let link = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", "Reference PDF")).firstMatch
         XCTAssertTrue(link.waitForExistence(timeout: 25), "The original task must display its Workspace PDF link.")
+        XCTAssertTrue(link.isHittable)
         reportCheckpoint("11-pdf-task-link-visible")
-        tap(link)
+        let leadingEdge = link.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5))
+        leadingEdge.withOffset(CGVector(dx: min(24, link.frame.width / 2), dy: 0)).tap()
         reportCheckpoint("11-pdf-task-link-tapped")
         let word = app.webViews.staticTexts["Quartz"].firstMatch
         XCTAssertTrue(word.waitForExistence(timeout: 35), "The actual PDF page must expose the Quartz text span.")
         XCTAssertTrue(word.isHittable)
         XCTAssertLessThan(word.frame.width, app.windows.firstMatch.frame.width / 2)
+        XCTAssertTrue(app.staticTexts["manual.pdf"].firstMatch.exists, "The preview must show the original Workspace file name.")
         XCTAssertTrue(app.buttons["Fit PDF pages to width"].firstMatch.exists)
         screenshot("11-original-workspace-pdf")
         let backToFiles = app.buttons["Back to Files"].firstMatch
@@ -524,10 +543,12 @@ final class JokoConnectionUITests: XCTestCase {
         reportCheckpoint("12-native-pdf-copy-tapped")
 
         tap(backToFiles, atCenter: true)
-        tap(app.buttons["Back to Task"].firstMatch, atCenter: true)
-        XCTAssertTrue(app.staticTexts["Original workspace PDF task"].firstMatch.waitForExistence(timeout: 10))
+        let backToTask = app.buttons["Back to Task"].firstMatch
+        XCTAssertTrue(backToTask.waitForExistence(timeout: 10))
+        tap(backToTask, atCenter: true)
+        XCTAssertTrue(title.waitForExistence(timeout: 10))
         let composer = app.webViews.textViews["Task message"].firstMatch
-        XCTAssertTrue(composer.waitForExistence(timeout: 10))
+        wait(composer, "exists == true AND enabled == true", timeout: 25)
         tap(composer, atCenter: true)
         composer.press(forDuration: 0.8)
         let paste = try XCTUnwrap(visibleTextMenuAction("Paste"), "The system text menu must offer Paste.")

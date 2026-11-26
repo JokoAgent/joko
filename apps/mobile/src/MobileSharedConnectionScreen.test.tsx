@@ -65,6 +65,30 @@ function ready(renderer: (typeof native.renderers)[number]): void {
 
 describe("native connection renderer ownership", () => {
   beforeEach(() => { native.renderers.length = 0; native.appState = 'active'; native.scanner = undefined; native.onAppState = undefined; });
+  it("reopens a silently blank first iOS document once in the foreground", async () => {
+    vi.useFakeTimers();
+    const root = createRoot(document.createElement("div"));
+    const state = { saved: [], nearby: [], status: "disconnected", connectionMode: "nearby", discoveryState: "idle", busy: false } as unknown as MobileState;
+    const cancel = vi.fn();
+    try {
+      await act(async () => root.render(createElement(MobileSharedConnectionScreen, { client: { state, cancel } as unknown as MobileClient,
+        state, locale: "en", dark: false, defaultDeviceName: "Phone", onThemeChange: async () => {}, onConnected() {} })));
+      const first = native.renderers[0]!;
+      await act(async () => { native.appState = "background"; native.onAppState!("background"); });
+      await act(async () => { vi.advanceTimersByTime(120_000); });
+      expect(native.renderers).toHaveLength(1);
+      await act(async () => { native.appState = "active"; native.onAppState!("active"); });
+      await act(async () => { vi.advanceTimersByTime(60_000); });
+      expect(native.renderers).toHaveLength(2);
+      const replacement = native.renderers[1]!;
+      await act(async () => { first.props.onError(); ready(first); vi.advanceTimersByTime(120_000); });
+      expect(native.renderers).toHaveLength(2);
+      expect(replacement.injectJavaScript).not.toHaveBeenCalled();
+      await act(async () => { ready(replacement); vi.advanceTimersByTime(120_000); });
+      expect(replacement.injectJavaScript).toHaveBeenCalledExactlyOnceWith(expect.stringContaining(instanceId(replacement)));
+      expect(cancel).not.toHaveBeenCalled();
+    } finally { await act(async () => root.unmount()); vi.useRealTimers(); }
+  });
   it('stops a background scan and rejects its delayed result after a new scan starts', async () => {
     const container = document.createElement('div'), root = createRoot(container);
     const state = { saved: [], nearby: [], status: 'disconnected', connectionMode: 'add', discoveryState: 'idle', busy: false } as unknown as MobileState;
