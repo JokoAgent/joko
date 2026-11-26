@@ -1,24 +1,21 @@
-import { useEffect, useRef, useState, useSyncExternalStore, type JSX } from "react";
-import { PartnerTaskOutputReadiness, partnerAutonomyMessages, partnerTodoDate, partnerTodoDue,
-  type PartnerAutonomyApi, type PartnerGlanceTodos, type PartnerTaskOutput, type PartnerTodo, type PartnerHomeApi, type PartnerHomeDestination, type ListPartnerHomeTargetsResponse } from "@joko/contracts";
+import { useEffect, useRef, useState, type JSX } from "react";
+import { PartnerTaskOutputReadiness, partnerAutonomyMessages, type PartnerAutonomyApi, type PartnerTaskOutput,
+  type PartnerHomeApi, type PartnerHomeDestination, type ListPartnerHomeTargetsResponse } from "@joko/contracts";
 import { usePartnerConversation } from "./PartnerConversation.js";
 import { Button } from "./ui.js";
 
-/** Final glance entry: home computer, the owner's affairs, and files from actual completed task Runs. */
-export function PartnerGlanceContents({ api, partnerId, editor, locale, enabled, close }: { readonly api: PartnerAutonomyApi;
-  readonly partnerId: string; readonly editor: PartnerGlanceTodos; readonly locale?: string; readonly enabled: boolean; readonly close: () => void }): JSX.Element {
-  const m = partnerAutonomyMessages(locale), conversation = usePartnerConversation(), state = useSyncExternalStore(editor.subscribe, editor.snapshot);
-  const [all, setAll] = useState(false), [done, setDone] = useState(false);
-  const [menu, setMenu] = useState<{ readonly todoId: string; readonly origin: HTMLButtonElement }>();
+export function PartnerGlanceContents({ api, partnerId, locale, enabled, close }: { readonly api: PartnerAutonomyApi;
+  readonly partnerId: string; readonly locale?: string; readonly enabled: boolean; readonly close: () => void }): JSX.Element {
+  const m = partnerAutonomyMessages(locale), conversation = usePartnerConversation();
+  const [all, setAll] = useState(false);
   const [outputs, setOutputs] = useState<readonly PartnerTaskOutput[]>([]), [outputFailed, setOutputFailed] = useState(false), [outputRefresh, setOutputRefresh] = useState(0);
-  const [checking, setChecking] = useState(false), [checkFailed, setCheckFailed] = useState(false);
   const alive = useRef(true), outputFlight = useRef<AbortController | undefined>(undefined);
   useEffect(() => { alive.current = true; return () => { alive.current = false; outputFlight.current?.abort(); }; }, []);
   useEffect(() => {
     if (!enabled) return; const abort = new AbortController(); outputFlight.current?.abort(); outputFlight.current = abort;
     void api.outputs(partnerId, abort.signal).then(value => { if (!abort.signal.aborted) { setOutputs(value); setOutputFailed(false); } })
       .catch(() => { if (!abort.signal.aborted) setOutputFailed(true); });
-    return () => { abort.abort(); setMenu(undefined); };
+    return () => { abort.abort(); outputFlight.current?.abort(); };
   }, [api, partnerId, enabled, outputRefresh]);
   const openOutput = async (source: PartnerTaskOutput, path: string) => {
     const abort = new AbortController(); outputFlight.current?.abort(); outputFlight.current = abort;
@@ -30,48 +27,14 @@ export function PartnerGlanceContents({ api, partnerId, editor, locale, enabled,
       close(); conversation?.openOutputFile?.(source.sessionId, path);
     } catch { if (alive.current && !abort.signal.aborted) setOutputFailed(true); }
   };
-  const quote = (todo: PartnerTodo) => { conversation?.quoteTodo?.(todo); close(); };
-  const row = (todo: PartnerTodo) => <li key={todo.id}><button type="button" aria-label={`${m.quote}: ${todo.title}`} onClick={() => quote(todo)}
-    onContextMenu={event => { event.preventDefault(); setMenu({ todoId: todo.id, origin: event.currentTarget }); }} onKeyDown={event => {
-      if (event.key === "ContextMenu" || event.shiftKey && event.key === "F10") {
-        event.preventDefault(); setMenu({ todoId: todo.id, origin: event.currentTarget });
-      }
-    }}><span>{partnerTodoDue(todo, state.now) && <span className="partner-todo-due" aria-label={locale === 'zh-CN' ? '已到期' : 'Due'} />}{todo.title}</span>
-      <small>{[todo.progress, partnerTodoDate(todo, locale), todo.sources[0]?.label].filter(Boolean).join(" · ")}</small></button>
-    {menu?.todoId === todo.id && <div role="menu" onKeyDown={event => {
-      if (event.key !== "Escape" || event.nativeEvent.isComposing) return;
-      event.preventDefault(); event.stopPropagation(); setMenu(undefined);
-      if (menu.origin.isConnected) menu.origin.focus();
-    }}>
-      <button type="button" role="menuitem" autoFocus disabled={state.saving || state.pending} onClick={() => { setMenu(undefined); void editor.mutate(todo, "delete"); }}>{m.remove}</button>
-    </div>}</li>;
   const files = outputs.filter(output => output.readiness === PartnerTaskOutputReadiness.READY).flatMap(output => output.files.map(file => ({ output, file })));
   return <>
     {conversation?.homeApi && conversation.openHomeSettings ? <PartnerGlanceComputers key={`${conversation.homeApi.ownerKey}:${partnerId}`} api={conversation.homeApi} partnerId={partnerId} locale={locale} enabled={enabled}
       onSelect={destination => { close(); conversation.openHomeSettings?.(destination); }} /> : <section><h3>{m.computers}</h3><span>{conversation?.homeLabel || m.here}</span></section>}
-    {(conversation?.checkTodosNow || state.dailyCheck || state.dailyCheckFailed || state.openTotal > 0 || state.doneTotal > 0 || state.failed || state.deleted || !state.loaded) && <section><h3>{m.todos}</h3>
-      {conversation?.checkTodosNow && <Button disabled={checking} onClick={() => {
-        setChecking(true); setCheckFailed(false);
-        void conversation.checkTodosNow!().then(() => { if (alive.current) close(); })
-          .catch(() => { if (alive.current) setCheckFailed(true); })
-          .finally(() => { if (alive.current) setChecking(false); });
-      }}>{m.checkNow}</Button>}
-      {checkFailed && <p role="alert">{m.checkFailed}</p>}
-      {state.dailyCheck && <Button role="switch" aria-checked={state.dailyCheck.enabled}
-        disabled={!state.dailyCheck.writable || state.dailyCheckSaving || state.dailyCheckFailed}
-        onClick={() => void editor.setDailyCheck(state.dailyCheck?.enabled !== true)}>{m.dailyCheck}</Button>}
-      {state.dailyCheckFailed && <><p role="alert">{m.dailyCheckFailed}</p><Button onClick={() => void editor.refreshDailyCheck()}>{m.refresh}</Button></>}
-      {state.failed && <p role="alert">{state.pending ? m.saveUnknown : m.failed}</p>}
-      {state.failed && <Button disabled={state.saving} onClick={() => state.pending ? void editor.mutate() : void editor.refresh()}>{state.pending ? m.retrySave : m.refresh}</Button>}
-      {!state.loaded && <p>{m.loading}</p>}<ul>{(all ? state.open : state.open.slice(0, 5)).map(row)}</ul>
-      {state.open.length > 5 && <Button aria-expanded={all} onClick={() => setAll(value => !value)}>{m.more} ({state.openTotal})</Button>}
-      {state.doneTotal > 0 && <><Button aria-expanded={done} onClick={() => setDone(value => !value)}>{m.completed} ({state.doneTotal})</Button>{done && <ul>{state.done.map(row)}</ul>}</>}
-      {state.deleted && <Button disabled={state.saving || state.pending} onClick={() => void editor.mutate(state.deleted, "restore")}>{m.undo}: {state.deleted.title}</Button>}
-    </section>}
     {(files.length > 0 || outputFailed) && <section><h3>{m.outputs}</h3>{outputFailed && <Button onClick={() => setOutputRefresh(value => value + 1)}>{m.failed} {m.refresh}</Button>}
       <ul>{files.slice(0, all ? 30 : 3).map(({ output, file }) => <li key={`${output.sourceKind}:${output.sourceId}:${file.path}`}>
         <button type="button" onClick={() => void openOutput(output, file.path)}><span>{file.path.split('/').at(-1)}</span><small>{output.title}</small></button>
-      </li>)}</ul>{files.length > 3 && <Button aria-expanded={all} onClick={() => setAll(value => !value)}>{m.more} ({files.length})</Button>}
+      </li>)}</ul>{files.length > 3 && <Button aria-expanded={all} onClick={() => setAll(value => !value)}>{all ? m.less : m.more} ({files.length})</Button>}
     </section>}
   </>;
 }

@@ -200,8 +200,12 @@ export class PartnerMemoryEditor {
         this.#set({ detail: next, draft, latest: undefined, pending: undefined, requiresRefresh: false, error: undefined, receipt: same(draft, next) ? "saved" : undefined }); return;
       }
       const changed = !!this.state.detail && next.revision !== this.state.detail.revision;
-      if (changed && (this.dirty || this.state.pending === "delete")) this.#set({ latest: next, error: "changed", pending: undefined, requiresRefresh: false });
-      else this.#set({ detail: next, latest: undefined, pending: undefined, requiresRefresh: false, error: undefined });
+      if (changed && (this.dirty || this.state.pending === "delete")) {
+        this.#set({ latest: next, error: "changed", pending: undefined, requiresRefresh: false });
+      } else {
+        const draft = changed && this.state.view === "edit" ? normalizedMemoryDraft(next) : this.state.draft;
+        this.#set({ detail: next, draft, latest: undefined, pending: undefined, requiresRefresh: false, error: undefined });
+      }
     });
     if (this.state.view === "list" && !this.state.catalog && !this.state.busy) { const receipt = this.state.receipt; await this.refresh(); if (receipt) this.#set({ receipt }); }
   }

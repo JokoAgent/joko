@@ -478,7 +478,7 @@ it("imports into the production HTTP/SQLite/published runtime, uses its full red
   const catalog = await clients.partnerRoutine.listPartnerRoutines({ partnerId: partner.partnerId });
   const imported = catalog.routines.filter(routine => !routine.builtin); expect(imported).toHaveLength(1);
   const routine = imported[0]!; expect(routine.definition).toMatchObject({ name: "Review", prompt: "Review the retained import context.", enabled: false });
-  const builtin = catalog.routines.filter(routine => routine.builtin === "follow-up"); expect(builtin).toHaveLength(1); expect(builtin[0]!.builtinVersion).toBe(1);
+  expect(catalog.routines).toEqual(imported);
   await clients.partnerRoutine.runPartnerRoutine({ partnerId: partner.partnerId, expectedPartnerRevision: catalog.partnerRevision, routineId: routine.id, expectedRevision: routine.revision, requestId: "product_import_routine_run" });
   const history = await waitFor(() => clients.partnerRoutine.listPartnerRoutineRuns({ partnerId: partner.partnerId, routineId: routine.id }), value => value.runs[0]?.status === RoutineRunStatus.SUCCESS || value.runs[0]?.status === RoutineRunStatus.FAILED, "the imported routine", 45000);
   expect(history.runs[0]?.status).toBe(RoutineRunStatus.SUCCESS);
@@ -499,7 +499,7 @@ it("imports into the production HTTP/SQLite/published runtime, uses its full red
   expect(restoredCatalog.routines).toEqual(beforeRestart.routines);
   expect(restoredCatalog.routines.filter(value => value.id === routine.id)).toHaveLength(1);
   expect(restoredCatalog.routines.find(value => value.id === routine.id)?.definition).toEqual(routine.definition);
-  expect(restoredCatalog.routines.filter(value => value.builtin === "follow-up")).toEqual(builtin);
+  expect(restoredCatalog.routines.filter(value => value.builtin)).toEqual([]);
   expect((await clients.partnerRoutine.listPartnerRoutineRuns({ partnerId: partner.partnerId, routineId: routine.id })).runs[0]?.id).toBe(history.runs[0]?.id);
   expect(fixture.application.store.getTarget(partner.homeTargetId).descriptor.workspaceRoot).toBe(home);
   const restoredConnections = await clients.partner.getPartnerConnections({ partnerId: partner.partnerId });

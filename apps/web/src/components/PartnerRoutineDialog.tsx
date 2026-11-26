@@ -73,7 +73,7 @@ function RoutineContent({ editor, connected, m, onClose, ownerDocument, locale, 
         <label className="check-row"><CheckboxControl checked={!!routine.definition?.enabled} disabled={locked || editor.dirty} onChange={() => void editor.toggle(routine)} /><span>{m.enabled}</span></label>
         {routine.activity !== undefined && <small>{m.states[routine.activity] ?? m.states[0]}</small>}
       </li>)}</ul>
-      {draft && !state.selected?.builtin && <fieldset disabled={locked || !!state.pendingId} style={{ border: 0, padding: 0, minWidth: 0 }}>
+      {draft && <fieldset disabled={locked || !!state.pendingId} style={{ border: 0, padding: 0, minWidth: 0 }}>
         <label className="field"><span>{m.name}</span><input value={draft.name} maxLength={200} required onChange={e => editor.edit({ name: e.target.value })} /></label>
         <label className="field"><span>{m.prompt}</span><textarea rows={7} value={draft.prompt} maxLength={100000} required onChange={e => editor.edit({ prompt: e.target.value })} /></label>
         <label className="check-row"><CheckboxControl checked={!!draft.enabled} onChange={e => editor.edit({ enabled: e.target.checked })} /><span>{m.enabled}</span></label>
@@ -87,15 +87,12 @@ function RoutineContent({ editor, connected, m, onClose, ownerDocument, locale, 
         <Button disabled={!editor.dirty || !validRoutineDraft(draft)} onClick={() => void editor.save()}>{m.save}</Button>
         {editor.dirty && <Button onClick={() => setConfirm({ body: m.discardBody, action: () => editor.discard() })}>{m.discard}</Button>}
       </fieldset>}
-      {draft && state.selected?.builtin !== "todo-check" && <fieldset disabled={locked || !!state.pendingId} className="partner-capabilities">
+      {draft && <fieldset disabled={locked || !!state.pendingId} className="partner-capabilities">
         <legend>{locale === "zh-CN" ? "执行方式" : "Execution"}</legend>
         <RoutineExecutionFields draft={draft} models={state.catalog?.models ?? []} locale={locale} onChange={patch => editor.edit(patch)} />
-        {state.selected?.builtin && <><Button disabled={!editor.dirty || !validRoutineDraft(draft)} onClick={() => void editor.save()}>{m.save}</Button>
-          {editor.dirty && <Button onClick={() => setConfirm({ body: m.discardBody, action: () => editor.discard() })}>{m.discard}</Button>}</>}
       </fieldset>}
-      {state.selected?.builtin && <p>{state.selected.definition?.prompt}</p>}
-      {state.selected && <><div className="toolbar-actions">{!state.selected.builtin && <><Button disabled={locked || editor.dirty} onClick={() => void editor.run()}>{m.run}</Button>
-        <Button disabled={locked || editor.dirty} onClick={() => setConfirm({ body: m.deleteBody, action: () => void editor.remove() })}>{m.remove}</Button></>}
+      {state.selected && <><div className="toolbar-actions"><Button disabled={locked || editor.dirty} onClick={() => void editor.run()}>{m.run}</Button>
+        <Button disabled={locked || editor.dirty} onClick={() => setConfirm({ body: m.deleteBody, action: () => void editor.remove() })}>{m.remove}</Button>
         <Button disabled={state.busy || state.requiresRefresh || !foreground || !connected} onClick={() => void editor.history()}>{m.history}</Button></div>
         <ul aria-label={m.history}>{state.runs.map(run => <li key={run.id}><strong>{m.states[run.status] ?? m.states[0]}</strong> · {new Date(routineTime(run.createdAt)).toLocaleString()}<p>{run.error ?? run.resultText}</p>
           {run.sessionId && <Button disabled={!foreground || !connected || state.requiresRefresh} onClick={() => onOpenSession(run.sessionId!)}>{locale === "zh-CN" ? "查看任务" : "View task"}</Button>}</li>)}</ul>

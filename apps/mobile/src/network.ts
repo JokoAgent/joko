@@ -35,7 +35,7 @@ import { createConnectTransport, createConnectionFetch, rememberEndpointTrust, t
 import { allowsUnpinnedEndpoint, assertTrustedEndpointServerId, EndpointTrustError, endpointTransportForNewDevice, formatTrustedNodeInvitation, irohTransportForRecipient, isLoopbackEndpoint, normalizeEndpointPublicKey, pairingVerificationOrigin, requireIrohRelayInvitationRequest, trustedEndpointTransport, trustedEndpointTransportKind, type NewDeviceAuthorizationOptions, type NodePairingInvitation, type EndpointTransportKind } from "@joko/connection-transport/trust";
 import type { MobilePushRetirementRoute } from "./mobile-push-device-store";
 import { createPartnerImportApi, PartnerImportService, type PartnerImportApi,
-  createPartnerAutonomyApi, createPartnerRoutineApi, createPartnerTodoCheckApi, createPartnerNightlyLearningApi, PartnerRoutineService, type PartnerAutonomyApi } from "@joko/contracts";
+  createPartnerAutonomyApi, createPartnerNightlyLearningApi, PartnerRoutineService, type PartnerAutonomyApi } from "@joko/contracts";
 import { createPartnerHomeApi, PartnerHomeService, type PartnerHomeApi } from "@joko/contracts";
 import { createPartnerGroupApi, PartnerGroupService, type PartnerGroupApi } from "@joko/contracts";
 import { createMobilePartnerNetworkApi, type MobilePartnerNetworkApi } from "./mobile-partner-network";
@@ -2031,13 +2031,10 @@ export const mobileNetwork: MobileNetwork = {
   },
   partnerAutonomyApi(credential, ownerKey, newOperationId, assertCurrent) {
     const transport = credentialTransport(credential);
-    return createPartnerAutonomyApi({ rpc: createClient(PartnerService, transport), ownerKey, newOperationId, assertCurrent,
+    return createPartnerAutonomyApi({ rpc: createClient(PartnerService, transport), ownerKey, assertCurrent,
       nightlyLearning: partnerId => createPartnerNightlyLearningApi({
         rpc: createClient(PartnerRoutineService, transport), partnerId, ownerKey, newRequestId: newOperationId, assertCurrent
-      }),
-      todoCheck: partnerId => createPartnerTodoCheckApi(createPartnerRoutineApi({
-        rpc: createClient(PartnerRoutineService, transport), partnerId, ownerKey, newRequestId: newOperationId, assertCurrent
-      })) });
+      }) });
   },
   mcpAppApi(credential, ownerKey) {
     const current = credentialTransport(credential);

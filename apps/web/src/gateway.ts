@@ -42,7 +42,7 @@ import type { AppDefaultModelUiPort } from "./app-default-model-ui.js";
 import { projectPartnerDeletion, type PartnerDeletionView, type PartnerDeletionResult } from "@joko/contracts";
 import { projectPartnerRestart, type PartnerRestartView, type PartnerRestartResult } from "@joko/contracts";
 import { projectPartnerSessionTaskReceipt } from "@joko/contracts";
-import { createPartnerRoutineApi, PartnerRoutineService, createPartnerImportApi, PartnerImportService, createPartnerAutonomyApi, createPartnerMessagingApi, createPartnerTodoCheckApi, createPartnerNightlyLearningApi } from "@joko/contracts";
+import { isValidCodeHostPullRequestReference, createPartnerRoutineApi, PartnerRoutineService, createPartnerImportApi, PartnerImportService, createPartnerAutonomyApi, createPartnerMessagingApi, createPartnerNightlyLearningApi } from "@joko/contracts";
 import { createPartnerHomeApi, PartnerHomeService } from "@joko/contracts";
 import { createPartnerGroupApi, PartnerGroupService } from "@joko/contracts";
 import { createPartnerMemoryApi } from "@joko/contracts";
@@ -6323,13 +6323,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const assertCurrent = (signal: AbortSignal) => {
       signal.throwIfAborted(); if (this.#transport !== transport || this.#abort !== owner || owner?.signal.aborted) throw new GatewayError("Task observation connection changed.");
     };
-    return createPartnerAutonomyApi({ rpc: createClient(PartnerService, transport), ownerKey, newOperationId: () => crypto.randomUUID(), assertCurrent,
+    return createPartnerAutonomyApi({ rpc: createClient(PartnerService, transport), ownerKey, assertCurrent,
       nightlyLearning: partnerId => createPartnerNightlyLearningApi({
         rpc: createClient(PartnerRoutineService, transport), partnerId, ownerKey, newRequestId: () => crypto.randomUUID(), assertCurrent
-      }),
-      todoCheck: partnerId => createPartnerTodoCheckApi(createPartnerRoutineApi({
-        rpc: createClient(PartnerRoutineService, transport), partnerId, ownerKey, newRequestId: () => crypto.randomUUID(), assertCurrent
-      })) });
+      }) });
   }
   partnerMessagingApi(ownerKey: string) {
     const transport = this.requireTransport(), owner = this.#abort;
@@ -15949,7 +15946,7 @@ function mapCodeHostPullRequest(
     throw new GatewayError("Orchestrator returned an invalid code-host pull request reference.");
   }
   const number = numberValue(reference.number);
-  assertCodeHostPullRequestReference(reference, number);
+  if (!isValidCodeHostPullRequestReference(reference, number)) throw new GatewayError("Orchestrator returned an invalid code-host pull request reference.");
   const projection = !value.observed
     ? undefined
     : validatedCodeHostPullRequestProjection(value);
@@ -15998,56 +15995,6 @@ function validatedCodeHostPullRequestProjection(
           ? {} : { checks: { total: checks.total, passed: checks.passed, failed: checks.failed, pending: checks.pending, skipped: checks.skipped } }),
         observedAt: timestampMs(value.observedAt)
   };
-}
-
-function assertCodeHostPullRequestReference(
-  reference: NonNullable<Session["codeHostPullRequests"][number]["reference"]>,
-  number: number
-): void {
-  const repositoryPart = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})$/u;
-  if (
-    reference.host.length === 0
-    || reference.host.length > 255
-    || reference.host !== reference.host.toLocaleLowerCase("en-US")
-    || /[\u0000-\u0020\u007f]/u.test(reference.host)
-    || !reference.repositoryOwner.split("/").every(part => repositoryPart.test(part))
-    || !repositoryPart.test(reference.repositoryName)
-    || !Number.isSafeInteger(number)
-    || number <= 0
-    || number > 2_147_483_647
-    || reference.referenceKey !== `${reference.host}/${reference.repositoryOwner}/${reference.repositoryName}#${number}`
-    || !isCanonicalCodeHostPullRequestWebUrl(reference.webUrl, reference.host, reference.repositoryOwner, reference.repositoryName, number)
-  ) throw new GatewayError("Orchestrator returned an invalid code-host pull request reference.");
-}
-
-function isCanonicalCodeHostPullRequestWebUrl(
-  value: string,
-  host: string,
-  repositoryOwner: string,
-  repositoryName: string,
-  number: number
-): boolean {
-  if (typeof value !== "string" || value.length === 0 || value.length > 2_048) return false;
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    return false;
-  }
-  if (
-    url.href !== value
-    || url.protocol !== "https:"
-    || url.host !== host
-    || url.username !== ""
-    || url.password !== ""
-    || url.search !== ""
-    || url.hash !== ""
-  ) return false;
-  const owner = repositoryOwner.split("/").map(encodeURIComponent).join("/");
-  const repository = encodeURIComponent(repositoryName);
-  return !repositoryOwner.includes("/") && url.pathname === `/${owner}/${repository}/pull/${number}`
-    || host !== "github.com" && /^[a-z\d](?:[a-z\d.-]*[a-z\d])?$/iu.test(host)
-      && url.pathname === `/${owner}/${repository}/-/merge_requests/${number}`;
 }
 
 function boundedCodeHostDisplayText(value: unknown, maximumLength: number): string | undefined {

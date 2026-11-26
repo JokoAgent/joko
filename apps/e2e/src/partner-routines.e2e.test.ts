@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { Code } from "@connectrpc/connect";
-import { NightlyLearningFrequency, PartnerDraftSchema, PermissionMode, RoutineRunStatus, SnapshotScopeSchema } from "@joko/contracts";
+import { NightlyLearningFrequency, PARTNER_TODO_CHECK_CREATION_REQUEST_ID, PartnerDraftSchema, PermissionMode, RoutineRunStatus, SnapshotScopeSchema } from "@joko/contracts";
 import { afterEach, expect, it } from "vitest";
 import { RealPiSystemFixture, REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID } from "./real-pi-fixture.js";
 import { waitFor } from "./fixture.js";
@@ -30,9 +30,14 @@ it("runs a durable Partner timer without a UI, hides its backing automation and 
   const nightlySaved = (await clients.partnerRoutine.updatePartnerNightlyLearning(nightlyUpdate)).state!;
   expect(nightlySaved.schedule).toMatchObject({ enabled: false, frequency: NightlyLearningFrequency.WEEKLY });
   await expect(clients.partnerRoutine.updatePartnerNightlyLearning(nightlyUpdate)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+  await expect(fixture.anonymous.partner.getPartnerAutonomySettings({})).rejects.toMatchObject({ code: Code.Unauthenticated });
+  await expect(clients.partner.updatePartnerAutonomySettings({})).rejects.toMatchObject({ code: Code.Unimplemented });
   const save = { partnerId: partner.partnerId, expectedPartnerRevision: partner.revision, intent: { case: "creationRequestId" as const, value: "routine-product-creation" },
     definition: { name: "Scheduled review", prompt: "ROUTINE_PRODUCT_CHAIN: report the current home status.", enabled: true, silentWhenIdle: true,
       triggers: [{ id: "once", kind: { case: "once" as const, value: { at: timestampFromDate(new Date(Date.now() + 4000)) } } }] } };
+  const retired = { partnerId: partner.partnerId, requestId: PARTNER_TODO_CHECK_CREATION_REQUEST_ID };
+  expect((await clients.partnerRoutine.getPartnerRoutineCreation(retired)).retired).toBe(true);
+  await expect(clients.partnerRoutine.savePartnerRoutine({ ...save, intent: { case: "creationRequestId", value: retired.requestId } })).rejects.toMatchObject({ code: Code.FailedPrecondition });
   const routine = (await clients.partnerRoutine.savePartnerRoutine(save)).routine!;
   const result = await waitFor(() => clients.partnerRoutine.listPartnerRoutineRuns({ partnerId: partner.partnerId, routineId: routine.id }),
     value => value.runs[0]?.status === RoutineRunStatus.SUCCESS || value.runs[0]?.status === RoutineRunStatus.FAILED, "the service-owned timer", 45000);
@@ -54,8 +59,7 @@ it("runs a durable Partner timer without a UI, hides its backing automation and 
   expect((await clients.partnerRoutine.retirePartnerRoutineCreation({ partnerId: partner.partnerId, requestId })).retired).toBe(true);
   await expect(clients.partnerRoutine.savePartnerRoutine({ ...save, intent: { case: "creationRequestId", value: requestId } })).rejects.toMatchObject({ code: Code.FailedPrecondition });
   const beforeRestart = await clients.partnerRoutine.listPartnerRoutines({ partnerId: partner.partnerId });
-  expect(beforeRestart.routines.filter(value => !value.builtin)).toEqual([disabled]);
-  const builtin = beforeRestart.routines.filter(value => value.builtin === "follow-up"); expect(builtin).toHaveLength(1); expect(builtin[0]!.builtinVersion).toBe(1);
+  expect(beforeRestart.routines).toEqual([disabled]);
   await fixture.close(); fixture = await RealPiSystemFixture.start({ rootDirectory: root, keepRoot: true, port });
   const reopened = fixture.clients(paired.authKey).partnerRoutine;
   expect(await reopened.getPartnerNightlyLearning({ partnerId: partner.partnerId })).toMatchObject({
@@ -66,6 +70,6 @@ it("runs a durable Partner timer without a UI, hides its backing automation and 
   expect((await reopened.listPartnerRoutineRuns({ partnerId: partner.partnerId, routineId: routine.id })).runs[0]?.id).toBe(result.runs[0]?.id);
   await reopened.deletePartnerRoutine({ partnerId: partner.partnerId, expectedPartnerRevision: catalog.partnerRevision, routineId: persisted.id, expectedRevision: persisted.revision });
   expect(fixture.application.store.findSchedule(backingId)).toBeUndefined();
-  expect((await reopened.listPartnerRoutines({ partnerId: partner.partnerId })).routines).toEqual(builtin);
+  expect((await reopened.listPartnerRoutines({ partnerId: partner.partnerId })).routines).toEqual([]);
   expect((await reopened.getPartnerRoutineCreation({ partnerId: partner.partnerId, requestId: save.intent.value })).retired).toBe(true);
 }, 120000);

@@ -287,7 +287,7 @@ import { PartnerRoutineStore } from "@joko/store";
 import { PartnerRoutineManager } from "./partner-routine-manager.js";
 import { PartnerNightlyLearning } from "./partner-nightly-learning.js";
 import { canSendFollowUpTaskMessage, PartnerAutonomyManager } from "./partner-autonomy.js";
-import { PartnerTodoManager, PartnerTodoTools } from "./partner-todos.js";
+import { PartnerTodoManager } from "./partner-todos.js";
 import { PartnerMessagingRuntime, PartnerMessagingTools } from './partner-messaging.js';
 import { PartnerRoutineTools } from "./partner-routine-tools.js";
 import { PartnerImportManager } from "./partner-import-manager.js";
@@ -1828,7 +1828,6 @@ export async function createOrchestratorApplication(
   let startupHistoryMaintenance: HistoryMaintenance | undefined;
   let startupCleanupHandled = false;
   let startupRoutineRuntime: ExtensionRoutineRuntime | undefined;
-  let startupPartnerAutonomy: PartnerAutonomyManager | undefined;
   let startupCardRuntime: ExtensionCardRuntime | undefined;
   let startupHostedAgents: HostedAgentRuntime | undefined;
   let startupExtensionCards: ExtensionCardsManager | undefined;
@@ -2550,10 +2549,8 @@ export async function createOrchestratorApplication(
   const unregisterPartnerTools = mcpRouter.registerBridgeToolProvider(
     new PartnerToolBridgeProvider({ store, partners })
   );
-  const unregisterPartnerWorkbenchTools = mcpRouter.registerBridgeToolProvider(new PartnerWorkbenchToolProvider({ store, partners, workbench: partnerWorkbenches,
-    autonomy: () => partnerAutonomy }));
+  const unregisterPartnerWorkbenchTools = mcpRouter.registerBridgeToolProvider(new PartnerWorkbenchToolProvider({ store, partners, workbench: partnerWorkbenches }));
   partnerTodos = new PartnerTodoManager(store, partnerStore, partners, Date.now, () => partnerHomeRuntime);
-  const unregisterPartnerTodoTools = mcpRouter.registerBridgeToolProvider(new PartnerTodoTools(partnerTodos, () => partnerRoutines));
   const unregisterPartnerMessagingTools = ['telegram', 'discord', 'dingtalk', 'feishu', 'lark', 'wecom', 'wechat', 'slack']
     .map(channel => mcpRouter.registerBridgeToolProvider(new PartnerMessagingTools(partnerMessaging!, channel)));
   let backendLifecycleTail: Promise<void> = Promise.resolve();
@@ -2860,9 +2857,8 @@ export async function createOrchestratorApplication(
   schedulerForBridgeTools = scheduler;
   partnerRoutines = new PartnerRoutineManager({ partners, store, scheduler,
     storage: new PartnerRoutineStore(join(config.dataDirectory, "partner-routines")) });
-  const partnerAutonomy = new PartnerAutonomyManager({ store, profiles: partnerStore, partners, routines: partnerRoutines, tasks: partnerSessionTasks });
-  startupPartnerAutonomy = partnerAutonomy;
-  partnerRoutines.setFollowUpRuntime(partnerAutonomy);
+  const partnerAutonomy = new PartnerAutonomyManager({ store, profiles: partnerStore, partners, tasks: partnerSessionTasks,
+    home: () => partnerHomeRuntime, peers: devicePeers });
   const extensionRoutineRuntime = new ExtensionRoutineRuntime({ catalog: extensionCatalog, resources: piResources, store,
     surfaces: extensionMainViews, engine: partnerRoutines.engine, ...(config.browser ? { executablePath: config.browser.executablePath } : {}) });
   startupRoutineRuntime = extensionRoutineRuntime;
@@ -3684,7 +3680,6 @@ export async function createOrchestratorApplication(
     mobilePush.start();
     scheduler.start();
     await partnerRoutines.start();
-    await partnerAutonomy.start();
     await partnerHomes.recover();
     await partnerImports.recover();
     await extensionRoutineRuntime.start();
@@ -3728,7 +3723,6 @@ export async function createOrchestratorApplication(
     await attempt(() => extensionLibraries.close());
     await attempt(() => extensionMainViews.close());
     await attempt(() => extensionPackagePublisher.close());
-    await attempt(() => partnerAutonomy.stop());
     await attempt(() => partnerRoutines?.stop());
     await attempt(() => scheduler.stop());
     await attempt(() => mobilePush.close());
@@ -3766,7 +3760,6 @@ export async function createOrchestratorApplication(
     await attempt(() => unregisterCollaborationGoalTools());
     await attempt(() => unregisterPartnerTools());
     await attempt(() => unregisterPartnerWorkbenchTools());
-    await attempt(() => unregisterPartnerTodoTools());
     for (const unregister of unregisterPartnerMessagingTools) await attempt(() => unregister());
     await attempt(() => unregisterPartnerSessionTaskTools());
     await attempt(() => unregisterPartnerProfileTools());
@@ -4044,7 +4037,6 @@ export async function createOrchestratorApplication(
         await attempt(() => extensionMainViews.close());
         await attempt(() => extensionPackagePublisher.close());
         if (maintenanceTimer !== undefined) clearInterval(maintenanceTimer);
-        await attempt(() => partnerAutonomy.stop());
         await attempt(() => partnerRoutines?.stop());
         await attempt(() => scheduler.stop());
         await attempt(() => mobilePush.close());
@@ -4099,7 +4091,6 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterCollaborationGoalTools());
         await attempt(() => unregisterPartnerTools());
         await attempt(() => unregisterPartnerWorkbenchTools());
-        await attempt(() => unregisterPartnerTodoTools());
         for (const unregister of unregisterPartnerMessagingTools) await attempt(() => unregister());
         await attempt(() => unregisterLspBridge());
         await attempt(() => unregisterRemoteHostTools());
@@ -4182,7 +4173,6 @@ export async function createOrchestratorApplication(
     await attempt(() => extensionOAuth.dispose());
     await attempt(() => extensionOAuthAccounts.dispose());
     await attempt(() => startupRoutineRuntime?.stop());
-    await attempt(() => startupPartnerAutonomy?.stop());
     await attempt(() => extensionLibraries.close());
     await attempt(() => extensionMainViews.close());
     await attempt(() => extensionPackagePublisher.close());

@@ -96,6 +96,18 @@ export class PartnerSkillsEditor {
   #owner(value: PersonalSkillsOwner) { if (value.partnerId !== this.initial.partnerId || value.homeTargetId !== this.initial.homeTargetId || value.canonicalSessionId !== this.initial.canonicalSessionId) throw new Error("Personal skill owner changed."); }
   #begin() { this.#request?.abort(); const request = new AbortController(); this.#request = request; this.#set({ busy: true, saved: false }); return request; }
   #current(request: AbortController) { return !this.#disposed && this.#active && this.#request === request && !request.signal.aborted; }
+  #finishRemoval(id: string) {
+    let page = this.state.page;
+    if (page) {
+      const skills = page.skills.filter(item => item.id !== id);
+      if (skills.length < page.skills.length) {
+        page = { ...page, skills, total: page.total - 1,
+          ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset - 1 }) };
+      }
+    }
+    this.#submitted = undefined;
+    this.#set({ view: "list", page, detail: undefined, draft: undefined, latest: undefined, error: undefined, requiresRefresh: false, saved: true });
+  }
   query(value: string) { if (!this.state.busy) this.#set({ query: value.slice(0, 1_024), page: undefined }); }
   async refresh(more = false): Promise<void> {
     if (!this.#active || this.#disposed || this.state.busy) return;
@@ -116,7 +128,7 @@ export class PartnerSkillsEditor {
     try {
       const value = await this.api.read(id, request.signal); if (!this.#current(request)) return;
       if (!value) {
-        if (this.#submitted && !this.#submitted.draft) { this.#submitted = undefined; this.#set({ view: "list", detail: undefined, draft: undefined, latest: undefined, error: undefined, requiresRefresh: false, saved: true }); }
+        if (this.#submitted?.base.summary.id === id && !this.#submitted.draft) this.#finishRemoval(id);
         else this.#set({ error: "missing", requiresRefresh: true });
         return;
       }
@@ -126,8 +138,10 @@ export class PartnerSkillsEditor {
       } else if (reconcile && this.dirty && this.state.detail && changed(this.state.detail, value)) {
         this.#submitted = undefined; this.#set({ latest: value, error: "changed", requiresRefresh: false });
       } else {
-        this.#submitted = undefined; this.#set({ detail: value, draft: reconcile && this.state.view === "edit" ? this.state.draft ?? draftOf(value) : undefined,
-          ...(reconcile ? {} : { view: "detail" as const }), latest: undefined, error: undefined, requiresRefresh: false });
+        const editing = reconcile && this.state.view === "edit" && !value.readOnly;
+        const draft = this.state.draft && this.state.detail && same(this.state.detail, value) ? this.state.draft : draftOf(value);
+        this.#submitted = undefined; this.#set({ detail: value, view: editing ? "edit" : "detail", draft: editing ? draft : undefined,
+          latest: undefined, error: undefined, requiresRefresh: false });
       }
     } catch { if (this.#current(request)) this.#set({ error: this.#submitted ? "unknown" : "failed", requiresRefresh: true }); }
     finally { if (this.#current(request)) this.#set({ busy: false }); }
@@ -163,8 +177,7 @@ export class PartnerSkillsEditor {
           ...(result.readOnly ? { view: "detail" as const } : {}), error: undefined, saved: true, requiresRefresh: false });
       } else {
         await this.api.remove(base, request.signal); if (!this.#current(request)) return false;
-        this.#submitted = undefined; this.#set({ view: "list", detail: undefined, draft: undefined, error: undefined, saved: true, requiresRefresh: false,
-          page: this.state.page ? { ...this.state.page, skills: this.state.page.skills.filter(item => item.id !== base.summary.id) } : undefined });
+        this.#finishRemoval(base.summary.id);
       }
       return true;
     } catch (error) {
@@ -176,8 +189,9 @@ export class PartnerSkillsEditor {
         try {
           const value = await this.api.read(base.summary.id, request.signal); if (!this.#current(request)) return false;
           if (value) this.#owner(value.owner);
-          if (draft && value && same(value, draft) || !draft && !value) {
-            this.#submitted = undefined; this.#set({ ...(value ? { detail: value, draft: draftOf(value) } : { view: "list" as const, detail: undefined, draft: undefined }),
+          if (!draft && !value) { this.#finishRemoval(base.summary.id); return true; }
+          if (draft && value && same(value, draft)) {
+            this.#submitted = undefined; this.#set({ detail: value, draft: draftOf(value),
               error: undefined, requiresRefresh: false, saved: true }); return true;
           }
           this.#submitted = undefined; this.#set({ latest: value, error: value ? "changed" : "missing", requiresRefresh: !value });

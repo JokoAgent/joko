@@ -42,7 +42,7 @@ export function createPartnerRoutineApi(input: { readonly rpc: RoutineRpc; reado
       const result = await rpc.listPartnerRoutines({ partnerId }, { signal });
       if (result.partnerId !== partnerId || !result.partnerRevision || result.partnerRevision.value < 1n) throw new Error("Routine catalog owner is invalid.");
       const ids = new Set<string>(); for (const item of result.routines) { routine(item); if (ids.has(item.id)) throw new Error("Routine catalog has duplicate identities."); ids.add(item.id); }
-      return result;
+      return { ...result, routines: result.routines.filter(item => !item.builtin) };
     }),
     save: (revision, definition, intent, signal) => invoke(signal, async () => routine((await rpc.savePartnerRoutine({
       partnerId, expectedPartnerRevision: { value: revision }, definition,

@@ -30,8 +30,9 @@ export function PartnerConversationHeader({ session, navigationOpen, onOpenNavig
         : <span className="partner-conversation-placeholder">{!failed && <Spinner />}{failed ? session.name : t("partners.loading")}</span>}
     </div>
     <div className="session-header__actions">
-      {conversation.autonomyApi && partner && <PartnerAutonomyPanel key={conversation.ownerKey} api={conversation.autonomyApi} partnerId={partner.id}
-        name={partner.displayName} locale={conversation.locale} engaged={!!conversation.engaged} onOpenTask={conversation.openObservedTask ?? (() => undefined)} />}
+      {conversation.autonomyApi && partner && <PartnerAutonomyPanel key={JSON.stringify([conversation.ownerKey, partner.id])} api={conversation.autonomyApi} partnerId={partner.id}
+        sessions={conversation.observedSessions ?? []} locale={conversation.locale} t={t} onOpenPullRequest={conversation.openObservedPullRequest}
+        onOpenTask={conversation.openObservedTask ?? (() => undefined)} />}
       {conversation.toggleReplyQuotes && <button type="button" aria-pressed={conversation.showReplyQuotes} onClick={conversation.toggleReplyQuotes}>{zh ? '显示引用' : 'Show reply quotes'}</button>}
       {conversation.quoteSettingFailed && <span role="alert">{zh ? '显示设置保存失败，请重试。' : 'The display setting could not be saved. Retry.'}</span>}
       {conversation.topicFailed && <span role="alert">{zh ? '打开话题失败，请在原消息上重试。' : 'The topic could not be opened. Retry from the original message.'}</span>}

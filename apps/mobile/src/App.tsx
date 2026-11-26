@@ -24,7 +24,7 @@ import * as Clipboard from "expo-clipboard";
 import { create } from "@bufbuild/protobuf";
 import {
   CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, InteractionState, ModelSourceKind, QueueItemState, QueueSourceKind, QueueTextEditSpliceSchema, RuntimeCommandInputMode, SessionState, TargetState, WorkspaceKind, capabilityNames, partnerResumeMessages, queueQuotaRetryAt,
-  PARTNER_TODO_CHECK_PROMPT, partnerSessionTaskMessages, partnerSessionTaskReceiptLabel,
+  partnerSessionTaskMessages, partnerSessionTaskReceiptLabel,
   type QueueItem, type QueueTextEditSplice, type Session
 } from "@joko/contracts";
 import type { PartnerLearningSettingsDestination } from "@joko/contracts";
@@ -8345,26 +8345,14 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       locale={locale} colors={colors} newRequestId={randomUUID} onClose={() => setPartnerHome(undefined)} onChanged={sessionId => {
         void client.refresh().then(() => client.select(sessionId)).then(() => setPartnerHome(undefined)).catch(() => setLocalError(mobileMessage(locale, "partnerProfile.failed")));
       }} />}
-    {partnerGlanceApi && partnerIdentity.partner && <MobilePartnerGlanceSheet key={partnerGlanceApi.ownerKey} api={partnerGlanceApi} partnerId={partnerIdentity.partner.partnerId}
+    {partnerGlanceApi && partnerIdentity.partner && <MobilePartnerGlanceSheet key={JSON.stringify([partnerGlanceApi.ownerKey, partnerIdentity.partner.partnerId])} api={partnerGlanceApi} partnerId={partnerIdentity.partner.partnerId}
       homeApi={partnerGlanceHomeApi}
-      name={partnerIdentity.partner.displayName} visible={partnerGlanceOwner === partnerConversationTransport?.ownerKey} engaged={messageRows.some(row => row.kind === 'user' && !!row.operationId)}
+      name={partnerIdentity.partner.displayName} visible={partnerGlanceOwner === partnerConversationTransport?.ownerKey} snapshot={state.owner}
       colors={colors} locale={locale} onClose={() => setPartnerGlanceOwner(undefined)}
-      onCheck={state.status === "connected" && composerOwnerReady && partnerIdentity.partner.canonicalSessionId === state.selectedId ? async () => {
-        if (client.partnerConversationTransport()?.ownerKey !== partnerGlanceApi.ownerKey
-          || client.state.status !== "connected" || client.state.selectedId !== partnerIdentity.partner?.canonicalSessionId) return false;
-        return client.send({ text: PARTNER_TODO_CHECK_PROMPT, mentions: [], atoms: [], slashCommands: [], attachments: [] }, { keepComposerDraft: true });
-      } : undefined}
       onHomeSettings={() => { const partner = partnerIdentity.partner, api = client.partnerHomeApi(); if (api && partner && client.partnerConversationTransport()?.ownerKey === partnerGlanceApi.ownerKey)
         setPartnerHome({ api, partnerId: partner.partnerId, revision: partner.revision, inputHandoff: partner.capabilities.inputHandoff ?? true }); }}
       onOpenTask={sessionId => { if (client.partnerConversationTransport()?.ownerKey === partnerGlanceApi.ownerKey) void client.select(sessionId).catch(failure => setLocalError(errorText(failure))); }}
-      onQuote={todo => {
-        const identity = draftIdentityRef.current, active = queueEditRef.current;
-        if (!identity || !composerOwnerReady || client.partnerConversationTransport()?.ownerKey !== partnerGlanceApi.ownerKey || voice.busy
-          || identity.profileId !== client.taskDraftProfileId() || identity.sessionId !== client.state.selectedId) return;
-        const next = { ...(active?.stashedDraft ?? composerDraftRef.current), todoQuote: { partnerId: partnerIdentity.partner!.partnerId, todoId: todo.id, revision: todo.revision.toString(), title: todo.title } };
-        if (active) { const updated = { ...active, stashedDraft: next }; queueEditRef.current = updated; setQueueEdit(updated); mobileComposerDrafts.save(identity, next); }
-        else { saveNormalDraft(next, identity); composerInputRef.current?.focus(); }
-      }} />}
+    />}
     <MobilePartnerProfileSheet visible={partnerSettingsVisible} partner={offlineOutputsShell?.partner ?? partnerRead.partner ?? client.partnerProfileContinuationPartner()}
       initialLearningDestination={partnerLearningEntry && partnerLearningEntry.owner === partnerSettingsOwner ? partnerLearningEntry.destination : undefined}
       transport={offlineOutputsShell?.transport ?? partnerProfileTransport} online={state.status === "connected"}

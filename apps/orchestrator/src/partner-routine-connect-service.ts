@@ -9,6 +9,7 @@ import { PartnerRoutineError, type NightlyAction, type PartnerRoutineManager } f
 export function createPartnerRoutineConnectService(manager: PartnerRoutineManager | undefined,
   authenticate: (context: HandlerContext) => unknown): ServiceImpl<typeof contract.PartnerRoutineService> {
   const owner = () => { if (!manager) throw new ConnectError("Partner routines are unavailable.", Code.Unimplemented); return manager; };
+  const current = (context: HandlerContext) => { context.signal.throwIfAborted(); authenticate(context); };
   const invoke = async <T>(context: HandlerContext, action: () => T | Promise<T>): Promise<T> => {
     authenticate(context);
     try { const result = await action(); authenticate(context); return result; }
@@ -27,27 +28,21 @@ export function createPartnerRoutineConnectService(manager: PartnerRoutineManage
     savePartnerRoutine: (request, context) => invoke(context, async () => {
       if (!request.definition || request.intent.case === undefined) throw new ConnectError("Definition and intent are required.", Code.InvalidArgument);
       if (request.intent.case === "creationRequestId" && request.intent.value === contract.PARTNER_TODO_CHECK_CREATION_REQUEST_ID) {
-        const definition = request.definition;
-        if (!definition.enabled || definition.name || definition.prompt || definition.triggers.length || definition.silentWhenIdle
-          || definition.sessionMode !== contract.RoutineSessionMode.UNSPECIFIED || definition.modelOverride || definition.preRunHook || request.expectedRevision) {
-          throw new ConnectError("The daily todo check uses its fixed definition.", Code.InvalidArgument);
-        }
-        const routine = await owner().enableDailyTodoCheck(request.partnerId, fromProtoRevision(request.expectedPartnerRevision), () => authenticate(context));
-        return create(contract.SavePartnerRoutineResponseSchema, { routine: toProtoRoutine(routine) });
+        throw new ConnectError("The daily todo check has been retired.", Code.FailedPrecondition);
       }
-      const routine = await owner().save({ partnerId: request.partnerId,
+      const routine = await owner().save({ partnerId: request.partnerId, assertCaller: () => current(context),
         partnerRevision: fromProtoRevision(request.expectedPartnerRevision), definition: fromProtoDefinition(request.definition),
         ...(request.intent.case === "creationRequestId" ? { requestId: request.intent.value }
           : { routineId: request.intent.value, revision: numberRevision(request.expectedRevision) }) });
       return create(contract.SavePartnerRoutineResponseSchema, { routine: toProtoRoutine(routine) });
     }),
     runPartnerRoutine: (request, context) => invoke(context, async () => {
-      await owner().run({ partnerId: request.partnerId, partnerRevision: fromProtoRevision(request.expectedPartnerRevision),
+      await owner().run({ partnerId: request.partnerId, assertCaller: () => current(context), partnerRevision: fromProtoRevision(request.expectedPartnerRevision),
         routineId: request.routineId, revision: numberRevision(request.expectedRevision), requestId: request.requestId });
       return create(contract.RunPartnerRoutineResponseSchema);
     }),
     deletePartnerRoutine: (request, context) => invoke(context, async () => {
-      await owner().remove({ partnerId: request.partnerId, partnerRevision: fromProtoRevision(request.expectedPartnerRevision),
+      await owner().remove({ partnerId: request.partnerId, assertCaller: () => current(context), partnerRevision: fromProtoRevision(request.expectedPartnerRevision),
         routineId: request.routineId, revision: numberRevision(request.expectedRevision) });
       return create(contract.DeletePartnerRoutineResponseSchema);
     }),

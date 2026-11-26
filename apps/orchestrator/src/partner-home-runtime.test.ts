@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { Code, createClient, createRouterTransport } from "@connectrpc/connect";
 import { PartnerHomeService, PartnerHomeBusyAction, PartnerHomeMovePhase, PartnerService, PartnerTodoUiAction, PartnerTodoView,
   PermissionMode, encodeModelSpeed } from "@joko/contracts";
+import { applyTodoPatch, emptyTodoState } from "@joko/core";
 import { createInProcessDevicePeerHarness } from "@joko/device-peer";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { OperationalStore, PartnerStore, PartnerWorkbenchStore, type PartnerCapabilitiesRecord } from "@joko/store";
@@ -24,7 +25,7 @@ import { PartnerHomeWorkbench } from "./partner-home-workbench.js";
 import { PartnerSessionTaskManager } from "./partner-session-tasks.js";
 import { createPartnerHomeConnectService } from "./partner-home-connect-service.js";
 import { createPartnerTodoConnectMethods } from "./partner-todo-connect-service.js";
-import { PartnerTodoManager, PartnerTodoTools } from "./partner-todos.js";
+import { PartnerTodoManager } from "./partner-todos.js";
 import type { RemoteExecutionRouter } from "./remote-execution-router.js";
 import { DevicePeerOwner } from "./device-peer-owner.js";
 import type { PartnerHomeFiles } from "./partner-home-files.js";
@@ -206,11 +207,12 @@ describe("Partner home native integration", () => {
   });
   it("keeps the original affair readable after a registered device Home move while fencing writes and revoked routes", async () => {
     const f = await fixture(), partnerId = f.profile.id;
-    const original = f.store.getSession(f.profile.canonicalSessionId!).descriptor;
-    const todos = new PartnerTodoManager(f.store, f.profiles, f.partners, Date.now, () => f.runtime), tools = new PartnerTodoTools(todos);
+    const todos = new PartnerTodoManager(f.store, f.profiles, f.partners, Date.now, () => f.runtime);
     const auth = () => f.store.authorizeConnection("phone-connection", "phone-key-digest");
     const rpc = createClient(PartnerService, createRouterTransport(router => router.service(PartnerService, createPartnerTodoConnectMethods(todos, auth))));
-    const todo = todos.patch(partnerId, { key: "owner:report", title: "Review the report", outcome: "A reviewed report" }, "save-original-affair", () => undefined);
+    const state = emptyTodoState();
+    const todo = applyTodoPatch(state, { key: "owner:report", title: "Review the report", outcome: "A reviewed report" }, "todo:original", new Date());
+    f.store.setSetting("service", "partner.todos.v1", partnerId, state);
     const ledger = () => f.store.findSetting("service", "partner.todos.v1", partnerId);
     const before = ledger();
     const read = () => rpc.listPartnerTodos({ partnerId, view: PartnerTodoView.OPEN });
@@ -225,20 +227,11 @@ describe("Partner home native integration", () => {
     await vi.waitFor(() => expect(["ready", "needs-attention"]).toContain(f.owner.get(requestId)?.phase));
     expect(f.failures).toEqual([]);
     expect(f.owner.get(requestId)?.phase).toBe("ready");
-    const profile = f.profiles.getPartner(partnerId), session = f.store.getSession(profile.canonicalSessionId!).descriptor;
+    const profile = f.profiles.getPartner(partnerId);
     await expect(read()).resolves.toMatchObject({ partnerRevision: { value: profile.revision }, total: 1, items: [expectedItem] });
-    const context = { sessionId: session.id, targetId: session.targetId, generation: session.binding.generation,
-      providerGeneration: tools.generation, effectIdentity: "a".repeat(64) };
-    const listTool = () => tools.callTool("todo_list", { view: "open" }, undefined, context);
-    const result = await listTool();
-    expect(result.isError).toBe(false);
-    expect(JSON.parse(result.content[0]!.text)).toMatchObject({ items: [{ id: todo.id, title: todo.title, revision: todo.revision }] });
-    await expect(tools.callTool("todo_list", { view: "open" }, undefined, { ...context, sessionId: original.id,
-      targetId: original.targetId, generation: original.binding.generation })).resolves.toMatchObject({ isError: true });
-    await expect(tools.callTool("todo_update", { id: todo.id, expectedRevision: todo.revision, operation: "delete" }, undefined, context)).resolves.toMatchObject({ isError: true });
     const write = { operationId: "denied-remote-affair-delete", partnerId, expectedPartnerRevision: { value: profile.revision }, todoId: todo.id,
       expectedRevision: BigInt(todo.revision), action: PartnerTodoUiAction.DELETE };
-    await expect(rpc.updatePartnerTodo(write)).rejects.toMatchObject({ code: Code.PermissionDenied });
+    await expect(rpc.updatePartnerTodo(write)).rejects.toMatchObject({ code: Code.Unimplemented });
     expect(f.store.findOperation(write.operationId)).toBeUndefined();
 
     const home = f.owner.current(partnerId), homeKey = `current.${partnerId}`;
@@ -255,7 +248,6 @@ describe("Partner home native integration", () => {
     f.store.setDeviceControlRelation({ controllerDeviceId: "phone", targetDeviceId: "computer", inboundAllowed: false });
     expect(auth().id).toBe("phone-connection");
     await expect(read()).rejects.toThrow();
-    await expect(listTool()).resolves.toMatchObject({ isError: true });
     expect(ledger()).toEqual(before);
     expect(f.peer.harness.acceptedRequests).toHaveLength(0);
     expect(replacement.harness.acceptedRequests).toHaveLength(0);

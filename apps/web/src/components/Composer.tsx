@@ -2215,7 +2215,6 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
           ...(quotaChoice ? { providerGroupRebalance: quotaChoice } : {}) });
         if (sourceReplyQuote) clearSentReplyQuote?.(sourceReplyQuote);
         if (sourceTodoQuote) clearSentTodoQuote?.(sourceTodoQuote);
-        partnerConversation?.userSent?.();
         revokeAttachments(sourceAttachments);
         revokeBrowserCommentPreviews(sourceBrowserComments);
       } catch (error) {

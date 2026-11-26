@@ -26,6 +26,42 @@ test("personal skill save/delete acknowledgement loss is read back without anoth
   assert.equal(await f.editor.save(), true); assert.equal(f.writes(), 1);
   assert.equal(await f.editor.remove(), true); assert.equal(f.writes(), 2); assert.equal(f.editor.state.view, "list"); f.editor.dispose();
 });
+test("removing a listed skill preserves the next result across immediate and recovered deletion receipts", async () => {
+  for (const receipt of ["confirmed", "lost", "offline"]) {
+    const f = fixture(), entry = f.current(), catalog = [entry.summary, { ...entry.summary, id: "second" }, { ...entry.summary, id: "third" }];
+    const remove = f.api.remove, read = f.api.read;
+    let offline = false;
+    f.api.list = async (_query, offset) => ({ owner, skills: catalog.slice(offset, offset + 2), total: catalog.length,
+      ...(offset + 2 < catalog.length ? { nextOffset: offset + 2 } : {}) });
+    f.api.remove = async (...args) => {
+      await remove(...args);
+      catalog.shift();
+      offline = receipt === "offline";
+      if (receipt !== "confirmed") throw Error("Lost deletion acknowledgement");
+    };
+    f.api.read = async (...args) => {
+      if (offline) throw Error("Disconnected");
+      return read(...args);
+    };
+    await f.editor.refresh();
+    await f.editor.open("skill");
+    assert.equal(await f.editor.remove(), receipt !== "offline");
+    if (receipt === "offline") {
+      assert.equal(f.editor.state.error, "unknown");
+      offline = false;
+      await f.editor.refresh();
+    }
+    assert.equal(f.editor.state.view, "list");
+    assert.deepEqual(f.editor.state.page.skills.map(item => item.id), ["second"]);
+    assert.equal(f.editor.state.page.total, 2);
+    assert.equal(f.editor.state.page.nextOffset, 1);
+    await f.editor.refresh(true);
+    assert.deepEqual(f.editor.state.page.skills.map(item => item.id), ["second", "third"]);
+    assert.equal(f.editor.state.page.nextOffset, undefined);
+    assert.equal(f.writes(), 1);
+    f.editor.dispose();
+  }
+});
 test("personal skill unknown writes and suspended owners preserve drafts until an authoritative read", async () => {
   const f = fixture(), read = f.api.read; let reads = 0;
   await f.editor.open("skill"); f.editor.edit(); f.editor.change({ body: "Keep this draft." });

@@ -14,14 +14,33 @@ function fixture(execute: RoutineEngineDeps["execute"] = async () => ({}), initi
 }
 async function idle(): Promise<void> { for (let i = 0; i < 30; i++) await Promise.resolve(); }
 describe("durable routine admission", () => {
-  it('lets built-in routines retain model and context choices while protecting their host instructions', async () => {
-    const f = fixture(); await f.engine.start();
-    const initial = await f.engine.ensureBuiltin('partner-one', definition, 'builtin-follow-up', 1);
-    const modelOverride = { backendId: 'pi', providerId: 'test', modelId: 'model', effort: 'high', fastMode: false } as const;
-    const edited = await f.engine.put('partner-one', { ...definition, sessionMode: 'fresh', modelOverride }, initial!.id, initial!.revision);
-    await expect(f.engine.put('partner-one', { ...edited, prompt: 'Replace host instructions' }, edited.id, edited.revision)).rejects.toThrow('instructions');
-    const ensured = await f.engine.ensureBuiltin('partner-one', definition, initial!.id, 1);
-    expect(ensured).toMatchObject({ prompt: definition.prompt, sessionMode: 'fresh', modelOverride });
+  it("retires both host rules before recovering a due cursor or a queued run and preserves the user's timer", async () => {
+    const first = fixture();
+    await first.engine.start();
+    const custom = await first.engine.createOnce("partner-one", definition, "custom-daily-review");
+    const saved = structuredClone(first.saved());
+    await first.engine.stop();
+    for (const builtin of ["follow-up", "todo-check"] as const) {
+      const routine = { ...custom, id: `builtin-${builtin}`, builtin, builtinVersion: 1, enabled: builtin === "todo-check" };
+      saved.routines.push(routine);
+      saved.next[`${routine.id}:interval`] = 99999;
+      for (const status of ["queued", "running", "success"] as const) saved.runs.push({
+        id: `${builtin}-${status}`, routineId: routine.id, revision: 1, triggerIds: ["interval"], events: [], status, createdAt: 90000, sessionId: "original-task"
+      });
+    }
+    const f = fixture(undefined, saved);
+    await f.engine.start();
+    for (const routine of f.engine.list().filter(item => item.builtin)) {
+      expect(routine.enabled).toBe(false);
+      expect(f.engine.nextRunAt(routine.id)).toBeUndefined();
+      expect(f.engine.history(routine.id).map(run => run.status).sort()).toEqual(["cancelled", "interrupted", "success"]);
+      expect(f.engine.history(routine.id).every(run => run.sessionId === "original-task")).toBe(true);
+      await expect(f.engine.put("partner-one", definition, routine.id, routine.revision)).rejects.toThrow("retired");
+      await expect(f.engine.runNow("partner-one", routine.id, routine.revision)).rejects.toThrow();
+    }
+    f.advance(60000); await f.engine.tick(); await idle();
+    expect(f.call).toHaveBeenCalledOnce();
+    expect(f.call.mock.calls[0]![0].id).toBe(custom.id);
     await f.engine.stop();
   });
   it("commits a running receipt before effects, coalesces matching triggers, deduplicates publications and keeps one lane", async () => {

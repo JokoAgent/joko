@@ -2,7 +2,7 @@
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { PartnerAutonomySettingsSchema, PartnerTodoSchema, ListPartnerTodosResponseSchema, ListPartnerHomeTargetsResponseSchema, type PartnerAutonomyApi, type PartnerHomeApi } from "@joko/contracts";
+import { GetPartnerGlanceResponseSchema, ListPartnerHomeTargetsResponseSchema, type PartnerAutonomyApi, type PartnerHomeApi } from "@joko/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobilePartnerGlanceSheet } from "./MobilePartnerGlanceSheet";
 
@@ -25,14 +25,13 @@ let root: Root | undefined;
 beforeEach(() => { native.state = "active"; native.alert.mockReset(); vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); });
 afterEach(async () => { await act(async () => root?.unmount()); root = undefined; native.listeners.clear(); native.dismiss = undefined; document.body.replaceChildren(); vi.unstubAllGlobals(); });
 async function fixture(homeApi?: PartnerHomeApi) {
-  const todo = create(PartnerTodoSchema, { id: "todo:review", revision: 1n, title: "Review report", outcome: "A reviewed report", status: "open", createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-01T00:00:00Z" });
-  const api: PartnerAutonomyApi = { ownerKey: "original-owner", newOperationId: () => "original-operation", settings: vi.fn(async () => create(PartnerAutonomySettingsSchema, { revision: { value: 1n }, customized: false })),
-    save: vi.fn(), glance: vi.fn(), todos: vi.fn(async (_partnerId, view) => create(ListPartnerTodosResponseSchema, { partnerId: "partner", partnerRevision: { value: 1n }, items: view === "open" ? [todo] : [], total: view === "open" ? 1 : 0 })), updateTodo: vi.fn(), outputs: vi.fn(async () => []) };
-  const close = vi.fn(), quote = vi.fn(), homeSettings = vi.fn(), host = document.createElement("div"); document.body.append(host); root = createRoot(host);
-  const render = async (visible = true) => { await act(async () => { root!.render(<MobilePartnerGlanceSheet api={api} homeApi={homeApi} partnerId="partner" name="Ada" visible={visible} engaged
+  const api: PartnerAutonomyApi = { ownerKey: "original-owner", glance: vi.fn(async () => create(GetPartnerGlanceResponseSchema,
+    { rows: [{ sessionId: "task-1", title: "Original review", online: true }] })), outputs: vi.fn(async () => []) };
+  const close = vi.fn(), openTask = vi.fn(), homeSettings = vi.fn(), host = document.createElement("div"); document.body.append(host); root = createRoot(host);
+  const render = async (visible = true) => { await act(async () => { root!.render(<MobilePartnerGlanceSheet api={api} homeApi={homeApi} partnerId="partner" name="Ada" visible={visible}
     colors={{ background: "#fff", surface: "#fff", ink: "#111", muted: "#666", border: "#ddd", accent: "#f90", negative: "#b00", brandBackground: "#ffe" }} locale="en"
-    onClose={close} onQuote={quote} onOpenTask={() => undefined} onHomeSettings={homeSettings} />); }); };
-  await render(); return { api, close, quote, render, todo, homeSettings };
+    onClose={close} onOpenTask={openTask} onHomeSettings={homeSettings} />); }); };
+  await render(); return { api, close, openTask, render, homeSettings };
 }
 function button(label: string): HTMLButtonElement { const value = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(item => item.textContent === label || item.getAttribute("aria-label") === label); expect(value).toBeDefined(); return value!; }
 describe("native Partner glance", () => {
@@ -43,55 +42,20 @@ describe("native Partner glance", () => {
     await act(async () => { button("Change main computer").click(); }); expect(f.close).toHaveBeenCalledOnce(); expect(f.homeSettings).not.toHaveBeenCalled();
     await f.render(false); await act(async () => { native.dismiss?.(); }); expect(f.homeSettings).toHaveBeenCalledOnce();
   });
-  it("quotes only after its native sheet closes and exposes only delete in the long-press menu", async () => {
-    const f = await fixture(); await act(async () => button("Discuss this affair: Review report").dispatchEvent(new MouseEvent("contextmenu", { bubbles: true })));
-    const actions = native.alert.mock.calls.at(-1)![2] as Array<{ text: string }>;
-    expect(actions.map(action => action.text)).toEqual(["Cancel", "Delete"]); expect(f.api.updateTodo).not.toHaveBeenCalled();
-    await act(async () => button("Discuss this affair: Review report").click()); expect(f.close).toHaveBeenCalledOnce(); expect(f.quote).not.toHaveBeenCalled();
-    await f.render(false); await act(async () => native.dismiss?.()); expect(f.quote).toHaveBeenCalledWith(f.todo);
-  });
-  it.each(["before", "after"])("recovers a deleted affair when iOS returns to active %s the original request settles", async timing => {
+  it("reads the original tasks again after foregrounding and opens one after dismissal", async () => {
     const f = await fixture();
-    const deleted = create(PartnerTodoSchema, { ...f.todo, revision: 2n });
-    const restored = create(PartnerTodoSchema, { ...f.todo, revision: 3n });
-    let completeReceipt!: (value: typeof deleted) => void;
-    const heldReceipt = new Promise<typeof deleted>(resolve => { completeReceipt = resolve; });
-    let open = [f.todo];
-    let partnerRevision = 1n;
-    vi.mocked(f.api.todos).mockImplementation(async (partnerId, view) => create(ListPartnerTodosResponseSchema, {
-      partnerId, partnerRevision: { value: partnerRevision }, items: view === "open" ? open : [], total: view === "open" ? open.length : 0
-    }));
-    vi.spyOn(f.api, "newOperationId").mockReturnValueOnce("original-operation").mockReturnValueOnce("undo-operation");
-    const update = vi.mocked(f.api.updateTodo);
-    update.mockImplementationOnce(() => { open = []; partnerRevision = 2n; return heldReceipt; })
-      .mockResolvedValueOnce(deleted)
-      .mockImplementationOnce(async () => { open = [restored]; return restored; });
-
-    await act(async () => button("Discuss this affair: Review report").dispatchEvent(new MouseEvent("contextmenu", { bubbles: true })));
-    const confirm = (native.alert.mock.calls.at(-1)![2] as Array<{ onPress?: () => void }>)[1]!.onPress!;
-    await act(async () => confirm());
-    expect(update).toHaveBeenCalledExactlyOnceWith("original-operation", "partner", 1n, f.todo, "delete", expect.any(AbortSignal));
-
+    const first = vi.mocked(f.api.glance).mock.calls[0]![1];
     const changeState = (value: string) => act(async () => { native.state = value; for (const callback of native.listeners) callback(value); });
-    await changeState("inactive");
-    expect(update.mock.calls[0]![5].aborted).toBe(true);
-    if (timing === "before") await changeState("active");
-    await act(async () => completeReceipt(deleted));
-    if (timing === "after") await changeState("active");
-
-    expect(update).toHaveBeenCalledOnce();
-    expect(document.querySelector('[aria-label="Discuss this affair: Review report"]')).toBeNull();
-    expect(document.querySelector('[role="alert"]')?.textContent).toContain("The save receipt was lost.");
-    await act(async () => button("Retry the original save").click());
-    expect(update).toHaveBeenNthCalledWith(2, "original-operation", "partner", 1n, f.todo, "delete", expect.any(AbortSignal));
-    await act(async () => button("Undo delete: Review report").click());
-    expect(update).toHaveBeenNthCalledWith(3, "undo-operation", "partner", 2n, deleted, "restore", expect.any(AbortSignal));
-    expect(button("Discuss this affair: Review report")).toBeDefined();
-  });
-  it("retires an old allowance confirmation after entering the background", async () => {
-    const f = await fixture(); await act(async () => button("Start following up").click());
-    const accept = (native.alert.mock.calls.at(-1)![2] as Array<{ onPress?: () => void }>)[1]!.onPress!;
-    await act(async () => { native.state = "background"; for (const callback of native.listeners) callback("background"); accept(); });
-    expect(f.api.save).not.toHaveBeenCalled();
+    await changeState("background");
+    expect(first.aborted).toBe(true);
+    await changeState("active");
+    expect(f.api.glance).toHaveBeenCalledTimes(2);
+    expect(document.body.textContent).not.toMatch(/daily todo|start following up/iu);
+    await act(async () => button("Original review").click());
+    expect(f.close).toHaveBeenCalledOnce();
+    expect(f.openTask).not.toHaveBeenCalled();
+    await f.render(false);
+    await act(async () => native.dismiss?.());
+    expect(f.openTask).toHaveBeenCalledExactlyOnceWith("task-1");
   });
 });

@@ -1,141 +1,54 @@
-import { create, type MessageInitShape } from "@bufbuild/protobuf";
-import type { GetPartnerGlanceResponse, GetPartnerAutonomySettingsResponse, PartnerAutonomySettings,
-  UpdatePartnerAutonomySettingsResponse, UpdatePartnerAutonomySettingsRequestSchema } from "./gen/joko/v1/partner_autonomy_pb.js";
-import { PartnerTodoView, PartnerTodoUiAction, type ListPartnerTodosResponse, type PartnerTodo, type UpdatePartnerTodoResponse } from "./gen/joko/v1/partner_todo_pb.js";
+import type { GetPartnerGlanceResponse } from "./gen/joko/v1/partner_autonomy_pb.js";
 import type { ListPartnerTaskOutputsResponse, PartnerTaskOutput } from "./gen/joko/v1/partner_pb.js";
-import { RoutineDefinitionSchema, type PartnerRoutine } from "./gen/joko/v1/partner_routine_pb.js";
-import type { PartnerRoutineApi } from "./partner-routines.js";
 import type { PartnerNightlyLearningApi } from "./partner-nightly-learning.js";
 
-export type PartnerAutonomySettingChoice = NonNullable<MessageInitShape<typeof UpdatePartnerAutonomySettingsRequestSchema>["choice"]>;
-export const PARTNER_TODO_CHECK_PROMPT = "Look for new items I need to handle in your authorized sources. Add verified discoveries to my todos with their source evidence, and tell me what needs my attention.";
 export const PARTNER_TODO_CHECK_CREATION_REQUEST_ID = "builtin-todo-check-v1";
-export interface PartnerTodoCheck {
-  readonly routine?: PartnerRoutine;
-  readonly enabled: boolean;
-  readonly partnerRevision: bigint;
-  readonly writable: boolean;
-}
-
-export interface PartnerTodoCheckApi {
-  read(signal: AbortSignal): Promise<PartnerTodoCheck>;
-  set(current: PartnerTodoCheck, enabled: boolean, signal: AbortSignal): Promise<PartnerTodoCheck>;
-}
-
-export function createPartnerTodoCheckApi(routines: Pick<PartnerRoutineApi, "list" | "save">): PartnerTodoCheckApi {
-  return {
-    async read(signal) {
-      const catalog = await routines.list(signal);
-      const checks = catalog.routines.filter(item => item.builtin === "todo-check");
-      if (checks.length > 1) throw new Error("The Partner has conflicting daily todo checks.");
-      const routine = checks[0];
-      return { routine, enabled: routine?.definition?.enabled === true, partnerRevision: catalog.partnerRevision!.value, writable: catalog.writable };
-    },
-    async set(current, enabled, signal) {
-      const { routine } = current;
-      if (!current.writable || routine && (routine.builtin !== "todo-check" || !routine.definition)) throw new Error("The daily todo check is unavailable.");
-      if (!routine && !enabled) return current;
-      const definition = routine?.definition ? create(RoutineDefinitionSchema, { ...routine.definition, enabled }) : create(RoutineDefinitionSchema, { enabled });
-      const updated = await routines.save(current.partnerRevision, definition,
-        routine ? { routine } : { requestId: PARTNER_TODO_CHECK_CREATION_REQUEST_ID }, signal);
-      if (routine && updated.id !== routine.id || updated.builtin !== "todo-check" || updated.definition?.enabled !== enabled) {
-        throw new Error("The daily todo check receipt is invalid.");
-      }
-      return { ...current, routine: updated, enabled };
-    }
-  };
-}
 export interface PartnerAutonomyApi {
   readonly ownerKey: string;
-  newOperationId(): string;
-  settings(signal: AbortSignal): Promise<PartnerAutonomySettings>;
-  save(operationId: string, revision: bigint, choice: PartnerAutonomySettingChoice, signal: AbortSignal): Promise<PartnerAutonomySettings>;
   glance(partnerId: string, signal: AbortSignal, page?: { readonly token: string; readonly offset: number }): Promise<GetPartnerGlanceResponse>;
-  todos(partnerId: string, view: "open" | "done", offset: number, signal: AbortSignal): Promise<ListPartnerTodosResponse>;
-  updateTodo(operationId: string, partnerId: string, partnerRevision: bigint, todo: PartnerTodo, action: "delete" | "restore", signal: AbortSignal): Promise<PartnerTodo>;
   outputs(partnerId: string, signal: AbortSignal): Promise<readonly PartnerTaskOutput[]>;
-  todoCheck?(partnerId: string): PartnerTodoCheckApi;
   nightlyLearning?(partnerId: string): PartnerNightlyLearningApi;
 }
 interface AutonomyRpc {
-  getPartnerAutonomySettings(request: object, options: { signal: AbortSignal }): Promise<GetPartnerAutonomySettingsResponse>;
-  updatePartnerAutonomySettings(request: MessageInitShape<typeof UpdatePartnerAutonomySettingsRequestSchema>, options: { signal: AbortSignal }): Promise<UpdatePartnerAutonomySettingsResponse>;
   getPartnerGlance(request: { partnerId: string; snapshotToken: string; offset: number }, options: { signal: AbortSignal }): Promise<GetPartnerGlanceResponse>;
-  listPartnerTodos(request: { partnerId: string; view: PartnerTodoView; offset: number }, options: { signal: AbortSignal }): Promise<ListPartnerTodosResponse>;
-  updatePartnerTodo(request: { operationId: string; partnerId: string; expectedPartnerRevision: { value: bigint }; todoId: string; expectedRevision: bigint; action: PartnerTodoUiAction }, options: { signal: AbortSignal }): Promise<UpdatePartnerTodoResponse>;
   listPartnerTaskOutputs(request: { partnerId: string }, options: { signal: AbortSignal }): Promise<ListPartnerTaskOutputsResponse>;
 }
 /** Web and Mobile share generated payloads and the same connection retirement fence. */
 export function createPartnerAutonomyApi(input: { readonly rpc: AutonomyRpc; readonly ownerKey: string;
-  readonly newOperationId: () => string; readonly assertCurrent: (signal: AbortSignal) => void;
-  readonly todoCheck?: (partnerId: string) => PartnerTodoCheckApi;
+  readonly assertCurrent: (signal: AbortSignal) => void;
   readonly nightlyLearning?: (partnerId: string) => PartnerNightlyLearningApi }): PartnerAutonomyApi {
   const check = (signal: AbortSignal) => { signal.throwIfAborted(); input.assertCurrent(signal); };
   const invoke = async <T>(signal: AbortSignal, action: () => Promise<T>): Promise<T> => { check(signal); const value = await action(); check(signal); return value; };
-  const settings = (value: PartnerAutonomySettings | undefined): PartnerAutonomySettings => {
-    if (!value?.revision || value.revision.value < 1n || value.schedulerPartnerId !== undefined && !value.schedulerPartnerId
-      || new Set(value.schedulerFallbackPartnerIds).size !== value.schedulerFallbackPartnerIds.length) throw new Error("Follow-up settings are invalid.");
-    return value;
-  };
-  return { ownerKey: input.ownerKey, newOperationId: input.newOperationId,
-    ...(input.todoCheck === undefined ? {} : { todoCheck: input.todoCheck }),
+  return { ownerKey: input.ownerKey,
     ...(input.nightlyLearning === undefined ? {} : { nightlyLearning: input.nightlyLearning }),
-    settings: signal => invoke(signal, async () => settings((await input.rpc.getPartnerAutonomySettings({}, { signal })).settings)),
-    save: (operationId, revision, choice, signal) => invoke(signal, async () => settings((await input.rpc.updatePartnerAutonomySettings({ operationId,
-      expectedRevision: { value: revision }, choice }, { signal })).settings)),
     glance: (partnerId, signal, page) => invoke(signal, async () => {
       const value = await input.rpc.getPartnerGlance({ partnerId, snapshotToken: page?.token ?? "", offset: page?.offset ?? 0 }, { signal });
       if (value.partnerId !== partnerId || !value.partnerRevision || !value.snapshotToken || value.rows.length > 50
         || page && value.snapshotToken !== page.token || value.nextOffset !== undefined && value.nextOffset !== (page?.offset ?? 0) + 50
-        || value.rows.some(row => !row.sessionId || !row.targetId || row.generation < 1n || row.phase === 0 || !row.phaseSince)) {
+        || value.rows.some(row => !row.sessionId || !row.targetId || row.generation < 1n || !row.phaseSince)) {
         throw new Error("The task observation page is invalid.");
       }
-      return value;
-    }),
-    todos: (partnerId, view, offset, signal) => invoke(signal, async () => {
-      const value = await input.rpc.listPartnerTodos({ partnerId, view: view === "open" ? PartnerTodoView.OPEN : PartnerTodoView.DONE, offset }, { signal });
-      if (value.partnerId !== partnerId || !value.partnerRevision || value.items.length > 25 || value.items.some(item => !item.id || item.revision < 1n || item.status !== view)) throw new Error("The affair page owner is invalid.");
       return value;
     }),
     outputs: (partnerId, signal) => invoke(signal, async () => {
       const value = await input.rpc.listPartnerTaskOutputs({ partnerId }, { signal });
       if (value.partnerId !== partnerId || value.outputs.some(item => !item.sessionId || !item.sourceId || !item.sourceRevision)) throw new Error("The output owner is invalid.");
       return value.outputs;
-    }),
-    updateTodo: (operationId, partnerId, partnerRevision, todo, action, signal) => invoke(signal, async () => {
-      const value = await input.rpc.updatePartnerTodo({ operationId, partnerId, expectedPartnerRevision: { value: partnerRevision }, todoId: todo.id,
-        expectedRevision: todo.revision, action: action === "delete" ? PartnerTodoUiAction.DELETE : PartnerTodoUiAction.RESTORE }, { signal });
-      if (value.partnerId !== partnerId || !value.todo || value.todo.id !== todo.id || value.todo.revision !== todo.revision + 1n) throw new Error("The affair save receipt is invalid.");
-      return value.todo;
     }) };
 }
 
 const english = {
-  glance: "At a glance", invite: "Let this Partner follow up on your tasks?", start: "Start following up", notNow: "Not now", cancel: "Cancel", close: "Close",
-  consent: "{name} will read the status, titles and pending questions of tasks on this Joko node and use your configured model allowance to summarize what needs your attention. Authorized remote tasks are displayed for you to open on their original computer. Observation does not allow answering questions, approving requests, sending task messages or changing task state. Other Partners keep responsibility for their own tasks unless you explicitly allow fallback.",
-  follow: "Automatic follow-up", enabled: "This Partner follows tasks on this node.", disabled: "Following all tasks is off for this Partner.", stop: "Stop following all tasks",
-  fallback: "Allow the scheduler Partner to observe my tasks while I am paused", reset: "Restore defaults", refresh: "Refresh", retrySave: "Retry the original save",
-  saveUnknown: "The save receipt was lost. Retry the same request to recover its result.", failed: "Task observation could not refresh. Retry.", loading: "Loading…", more: "Show more",
-  all: "All tasks on this node", own: "Tasks this Partner created or took over", waiting: "Waiting for you", working: "Working", done: "{count} done today",
-  empty: "None", permission: "Waiting for permission", limit: "Waiting for usage reset", task: "Open the original task", minutes: "min",
-  dailyCheck: "Daily todo check", checkNow: "Help me check", checkFailed: "The check could not start. Retry.",
-  dailyCheckFailed: "Refresh to see the current daily todo check setting.",
-  todos: "Your affairs", completed: "Completed", remove: "Delete", undo: "Undo delete", quote: "Discuss this affair", computers: "Computer", outputs: "Outputs", here: "Home computer", online: "Online", offline: "Offline", offlineCount: "{count} offline computers", computersFailed: "Computers could not refresh. Retry."
+  glance: "At a glance", close: "Close", refresh: "Refresh", failed: "Recent activity could not refresh.", loading: "Loading…",
+  recent: "Recent tasks", more: "Show more", less: "Show less", unread: "Unread", requests: "Pull requests", openFailed: "The pull request could not be opened.",
+  computers: "Computer", outputs: "Outputs", here: "Home computer", online: "Online", offline: "Offline", offlineCount: "{count} offline computers", computersFailed: "Computers could not refresh. Retry."
 };
 const chinese: typeof english = {
-  glance: "近况", invite: "让这位伙伴帮你跟进任务？", start: "开始跟进", notNow: "暂时不用", cancel: "取消", close: "关闭",
-  consent: "{name} 将读取此 Joko 节点任务的状态、标题和待答问题，并使用你配置的模型额度总结需要你关注的情况。已授权远端任务仅供你打开其原电脑查看。观察不授权回答问题、批准请求、向任务发消息或改变任务状态。其他伙伴仍负责自己的任务，除非你明确允许总调度代为观察。",
-  follow: "自动跟进", enabled: "这位伙伴正在跟进本节点任务。", disabled: "这位伙伴未开启全部任务跟进。", stop: "停止跟进全部任务",
-  fallback: "我暂停时，允许总调度伙伴观察我的任务", reset: "恢复默认", refresh: "刷新", retrySave: "重试原保存请求",
-  saveUnknown: "保存回执丢失，请重试原请求取回结果。", failed: "近况刷新失败，请重试。", loading: "加载中…", more: "查看更多",
-  all: "本节点全部任务", own: "这位伙伴创建或明确接手的任务", waiting: "等你", working: "在做", done: "今天完成 {count} 件",
-  empty: "暂无", permission: "等待权限确认", limit: "等待用量恢复", task: "打开原任务", minutes: "分钟",
-  dailyCheck: "每日检查待办", checkNow: "帮我查查", checkFailed: "无法开始检查，请重试。",
-  dailyCheckFailed: "请刷新以查看当前的每日检查设置。",
-  todos: "待办", completed: "已完成", remove: "删除", undo: "撤销删除", quote: "引用这条待办", computers: "电脑", outputs: "输出内容", here: "主力电脑", online: "在线", offline: "离线", offlineCount: "{count} 台电脑离线", computersFailed: "无法读取电脑，请重试。"
+  glance: "近况", close: "关闭", refresh: "刷新", failed: "近期活动刷新失败。", loading: "加载中…",
+  recent: "近期任务", more: "查看更多", less: "收起", unread: "未读", requests: "合并请求", openFailed: "无法打开合并请求。",
+  computers: "电脑", outputs: "输出内容", here: "主力电脑", online: "在线", offline: "离线", offlineCount: "{count} 台电脑离线", computersFailed: "无法读取电脑，请重试。"
 };
 export function partnerAutonomyMessages(locale?: string): typeof english { return locale === "zh-CN" ? chinese : english; }
-/** These RPC failures confirm rejection before a transactional settings/Todo commit. */
+/** RPC rejections that precede a transactional Partner mutation. */
 export function partnerMutationWasRejected(error: unknown): boolean {
   const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
   return typeof code === "number" && [3, 5, 6, 7, 9, 10, 11, 16].includes(code);

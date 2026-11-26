@@ -9,7 +9,6 @@ import { validatePartnerSourceSession } from "../partner-sources.js";
 import { taskSourceKey } from "../task-sharing.js";
 import { PartnerSettingsDialog } from "./PartnersPage.js";
 import type { PartnerHomeApi, PartnerHomeDestination, PartnerLearningSettingsDestination } from "@joko/contracts";
-import { PARTNER_TODO_CHECK_PROMPT } from "@joko/contracts";
 import type { Translator } from "./types.js";
 
 type ConversationIdentity =
@@ -59,16 +58,14 @@ export interface PartnerConversationView {
   readonly toggleReplyQuotes?: () => void;
   readonly quoteSettingFailed?: boolean;
   readonly autonomyApi?: import("@joko/contracts").PartnerAutonomyApi;
-  readonly engaged?: boolean;
-  readonly userSent?: () => void;
+  readonly observedSessions?: readonly SessionView[];
+  readonly openObservedPullRequest?: (sessionId: string, url: string) => Promise<void>;
   readonly openObservedTask?: (sessionId: string) => void;
   readonly openOutputFile?: (sessionId: string, path: string) => void;
   readonly homeLabel?: string;
   readonly homeApi?: PartnerHomeApi;
   readonly openHomeSettings?: (destination: PartnerHomeDestination) => void;
   readonly todoQuote?: PendingPartnerTodoQuote;
-  readonly quoteTodo?: (todo: import("@joko/contracts").PartnerTodo) => void;
-  readonly checkTodosNow?: () => Promise<void>;
   readonly clearTodoQuote?: () => void;
   readonly clearSentTodoQuote?: (value: PendingPartnerTodoQuote) => void;
   readonly workbenchAvailable: boolean;
@@ -109,7 +106,7 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
   const connected = controller.state.ready && controller.state.connectionState === "connected";
   const [refresh, setRefresh] = useState(0);
   const [documentActive, setDocumentActive] = useState(true);
-  const conversationOwner = useMemo(() => ({}), [ownerKey, connected, documentActive]);
+  const conversationOwner = useMemo(() => ({}), [ownerKey, profile?.deviceId, controller.state.connectionGeneration, connected, documentActive]);
   const conversationOwnerRef = useRef(conversationOwner);
   conversationOwnerRef.current = conversationOwner;
   const requestOwner = useMemo(() => ({}), [conversationOwner, refresh]);
@@ -130,15 +127,14 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
   const [workbenchOpenFailure, setWorkbenchOpenFailure] = useState<object>();
   const [topicAction, setTopicAction] = useState<{ readonly owner: object; readonly messageId: string; readonly failed: boolean }>();
   const [quoteSettingFailed, setQuoteSettingFailed] = useState(false);
-  const [engagedOwner, setEngagedOwner] = useState<string>();
   const autonomyApi = useMemo(() => {
-    if (!connected || sharedSource || !controller.partnerAutonomyApi) return undefined;
-    try { return controller.partnerAutonomyApi(ownerKey); } catch { return undefined; }
-  }, [controller, connected, sharedSource, ownerKey]);
+    if (!connected || !documentActive || sharedSource) return undefined;
+    try { return controllerRef.current.partnerAutonomyApi?.(ownerKey); } catch { return undefined; }
+  }, [conversationOwner, sharedSource]);
   const homeApi = useMemo(() => {
-    if (!connected || sharedSource || !controller.partnerHomeApi) return undefined;
-    try { return controller.partnerHomeApi(ownerKey); } catch { return undefined; }
-  }, [controller, connected, sharedSource, ownerKey]);
+    if (!connected || !documentActive || sharedSource) return undefined;
+    try { return controllerRef.current.partnerHomeApi?.(ownerKey); } catch { return undefined; }
+  }, [conversationOwner, sharedSource]);
   const topicAttempts = useRef(new Map<string, { readonly operationId: string; readonly revision: bigint }>());
   const readFlightRef = useRef<{ readonly owner: object; readonly abort: AbortController; pending: bigint; committed: bigint; running: boolean; failed: boolean } | undefined>(undefined);
   if (readFlightRef.current?.owner !== conversationOwner) {
@@ -356,24 +352,20 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
       void controllerRef.current.setPartnerReplyQuotesVisible?.(controller.state.preferences?.showPartnerReplyQuotes === false)
         .catch(() => { if (conversationOwnerRef.current === conversationOwner) setQuoteSettingFailed(true); }); } : undefined,
     quoteSettingFailed,
-    autonomyApi: partnerIdentity && !partnerIdentity.topic ? autonomyApi : undefined, engaged: engagedOwner === ownerKey,
-    userSent: () => { if (conversationOwnerRef.current === conversationOwner) setEngagedOwner(ownerKey); },
+    autonomyApi: partnerIdentity && !partnerIdentity.topic ? autonomyApi : undefined,
+    observedSessions: controller.state.snapshot.sessions,
+    openObservedPullRequest: async (sessionId, url) => {
+      const current = controllerRef.current;
+      if (conversationOwnerRef.current !== conversationOwner || !editable || !current.state.snapshot.sessions
+        .find(task => task.id === sessionId)?.codeHostPullRequests?.some(ref => ref.webUrl === url)) throw new Error("The task pull request changed.");
+      await current.openHttpLink(url, { forceExternal: true, sessionId });
+    },
     openObservedTask: sessionId => { if (conversationOwnerRef.current === conversationOwner && editable) void controller.navigate({ kind: "session", sessionId }); },
     openOutputFile: (sessionId, path) => { if (conversationOwnerRef.current === conversationOwner && editable) void controller.navigate({ kind: "files", sessionId, file: path }); },
     homeLabel: profile?.origin,
     homeApi: partnerIdentity && !partnerIdentity.topic && editable ? homeApi : undefined,
     openHomeSettings: destination => { if (editable && partnerIdentity && conversationOwnerRef.current === conversationOwner) setSettings({ owner: conversationOwner, section: "profile", homeDestination: destination }); },
     todoQuote: partnerIdentity ? pendingTodoQuote : undefined,
-    quoteTodo: todo => { if (editable && partnerIdentity && conversationOwnerRef.current === conversationOwner) setPendingPartnerTodoQuote(quoteOwner, partnerIdentity.partner.id, todo); },
-    checkTodosNow: editable && active && !sharedSource && !partnerIdentity?.topic && partnerIdentity?.partner.canonicalSessionId === session.id ? async () => {
-      if (conversationOwnerRef.current !== conversationOwner || !readContextRef.current.active || !readContextRef.current.editable
-        || controllerRef.current.state.connectionState !== "connected") {
-        throw new Error("The original Partner conversation changed.");
-      }
-      await controllerRef.current.send(session.id, { text: PARTNER_TODO_CHECK_PROMPT, deliveryMode: "prompt", mentions: [], attachments: [] },
-        { expectedGeneration: session.generation });
-      if (conversationOwnerRef.current === conversationOwner) setEngagedOwner(ownerKey);
-    } : undefined,
     clearTodoQuote: () => { if (partnerIdentity) setPendingPartnerTodoQuote(quoteOwner, partnerIdentity.partner.id); },
     clearSentTodoQuote: todo => clearSentPartnerTodoQuote(quoteOwner, todo),
     workbenchAvailable, workbenchRequest: workbenchRequest?.owner === ownerKey ? workbenchRequest.sequence : undefined,

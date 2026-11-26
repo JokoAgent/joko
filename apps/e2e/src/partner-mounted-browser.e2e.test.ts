@@ -15,10 +15,8 @@ import {
   CancelPartnerDelegationRequestSchema,
   CancelPartnerDelegationResponseSchema,
   OperationState,
-  PARTNER_TODO_CHECK_PROMPT,
   PermissionMode,
-  RunState,
-  SavePartnerRoutineResponseSchema
+  RunState
 } from "@joko/contracts";
 import { chromium, type Browser, type Page, type Request, type Response, type Route } from "playwright-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -87,20 +85,22 @@ describe("mounted Partner collaboration product chain", () => {
     fixture = undefined;
   });
 
-  mountedIt("changes the daily todo check from an empty Glance and sends the manual check to the original Partner", { timeout: 120_000 }, async () => {
+  mountedIt("opens read-only Partner activity before and after reconnect without creating a routine or sending a prompt", { timeout: 120_000 }, async () => {
     fixture = await RealPiSystemFixture.start({
-      webDirectory: requiredEnvironment("JOKO_MOUNTED_WEB_DIR"), enableInternalServer: true,
-      providerResponder: () => ({ kind: "text", text: "I checked the existing todos. There is nothing new to add." })
+      webDirectory: requiredEnvironment("JOKO_MOUNTED_WEB_DIR"), enableInternalServer: true
     });
     const manager = await fixture.pair("Glance owner");
     const partner = await createPartner(fixture, manager, "Elin", "orbit");
-    const read = async () => (await manager.clients.partnerRoutine.listPartnerRoutines({ partnerId: partner.partnerId }))
-      .routines.find(routine => routine.builtin === "todo-check");
-    expect(await read()).toBeUndefined();
+    const catalog = () => manager.clients.partnerRoutine.listPartnerRoutines({ partnerId: partner.partnerId });
     const device = "Glance Browser";
     const challenge = required((await fixture.anonymous.connection.beginPairing({ deviceDisplayName: device })).challenge, "the pairing challenge");
     browser = await chromium.launch({ executablePath: requiredEnvironment("JOKO_BROWSER_EXECUTABLE"), headless: true });
     const page = await browser.newPage({ viewport: { width: 1280, height: 800 }, locale: "en-US" });
+    const mutations: string[] = [];
+    page.on("request", request => {
+      const path = new URL(request.url()).pathname;
+      if (/\/(?:SavePartnerRoutine|UpdatePartnerAutonomySettings|UpdatePartnerTodo|SendInput)$/u.test(path)) mutations.push(path);
+    });
     const taskUrl = `${fixture.baseUrl}/#/tasks/${encodeURIComponent(partner.canonicalSessionId)}`;
     await page.goto(`${fixture.baseUrl}/#/partners`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
@@ -112,43 +112,30 @@ describe("mounted Partner collaboration product chain", () => {
     await page.locator(partnerCard(partner.partnerId)).waitFor({ state: "visible", timeout: 30_000 });
     await page.goto(taskUrl, { waitUntil: "domcontentloaded" });
 
-    const glance = page.locator("details.partner-glance > summary").filter({ hasText: "At a glance" });
-    const daily = page.getByRole("switch", { name: "Daily todo check", exact: true });
-    await glance.click();
-    expect(await daily.getAttribute("aria-checked")).toBe("false");
-    const saveReceipt = () => page.waitForResponse(response => response.url().endsWith("/joko.v1.PartnerRoutineService/SavePartnerRoutine"));
-    const creating = saveReceipt();
-    await daily.click();
-    const created = await creating;
-    expect(created.ok(), created.ok() ? undefined : await created.text()).toBe(true);
-    const enabled = fromBinary(SavePartnerRoutineResponseSchema, await created.body()).routine;
-    expect(enabled).toMatchObject({ builtinVersion: 1, definition: { enabled: true, silentWhenIdle: true,
-      triggers: [{ kind: { case: "cron", value: { expression: "0 9 * * 1-5" } } }] } });
-    expect((await read())?.id).toBe(enabled?.id);
+    const glance = page.locator("details.partner-glance > summary");
+    const openGlance = async () => {
+      const [response] = await Promise.all([
+        page.waitForResponse(value => value.url().endsWith("/joko.v1.PartnerService/GetPartnerGlance")),
+        glance.click()
+      ]);
+      expect(response.ok()).toBe(true);
+      await page.locator(".partner-glance__content").getByRole("heading", { name: "Computer", exact: true }).waitFor();
+      expect(await page.getByRole("switch", { name: "Daily todo check" }).count()).toBe(0);
+      expect(await page.getByRole("button", { name: /Help me check|Start following up/u }).count()).toBe(0);
+    };
+    await openGlance();
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.getByRole("button", { name: "Saved nodes", exact: true }).click();
     await page.locator(".connection-card .profile-card").filter({ hasText: device })
       .getByRole("button", { name: "Connect", exact: true }).click();
     const draft = page.locator(`.session-pane[data-input-session-id="${partner.canonicalSessionId}"] .composer-rich-editor__content`);
     await draft.fill("Keep this separate composer draft.");
-    await glance.click();
-    expect(await daily.getAttribute("aria-checked")).toBe("true");
-    const pausing = saveReceipt();
-    await daily.click();
-    const paused = await pausing;
-    expect(paused.ok(), paused.ok() ? undefined : await paused.text()).toBe(true);
-    expect(await read()).toMatchObject({ id: enabled?.id, definition: { enabled: false } });
-
-    const store = fixture.application.store;
-    const native = store.getSession(partner.canonicalSessionId).descriptor.binding.opaqueRef;
-    await page.getByRole("button", { name: "Help me check", exact: true }).click();
-    const item = await waitFor(async () => store.listQueueItems({ sessionId: partner.canonicalSessionId })
-      .find(queue => queue.body.text === PARTNER_TODO_CHECK_PROMPT),
-    value => value?.state === "completed", "the manual check in the original Partner conversation");
-    expect(item?.sessionId).toBe(partner.canonicalSessionId);
-    expect(store.getSession(partner.canonicalSessionId).descriptor.binding.opaqueRef).toBe(native);
-    expect(fixture.providerRequests.filter(request => latestUserText(request).includes(PARTNER_TODO_CHECK_PROMPT))).toHaveLength(1);
+    await openGlance();
     expect(await draft.innerText()).toBe("Keep this separate composer draft.");
+    expect((await catalog()).routines.filter(row => row.builtin)).toEqual([]);
+    expect(mutations).toEqual([]);
+    expect(fixture.application.store.listQueueItems({ sessionId: partner.canonicalSessionId })).toEqual([]);
+    expect(fixture.providerRequests).toHaveLength(0);
   });
 
   mountedIt("retains an independent Pi task result in the original Partner conversation after reload", async () => {
@@ -401,15 +388,8 @@ describe("mounted Partner collaboration product chain", () => {
       "the original package receipt runtime projection");
     const saved = required(packages.find(entry => entry.packageId === "engineer-bot")?.installation, "the durable installation receipt");
     expect(saved).toMatchObject({ saved: true, status: "complete", partnerId: row.partnerId });
-    const routines = await waitFor(async () => fixture!.application.partnerRoutines!.list(row.partnerId),
-      entries => entries.some(routine => routine.builtin === "follow-up"), "the Partner's host-owned follow-up routine");
-    const importedRoutines = routines.filter(routine => !routine.builtin), builtin = routines.filter(routine => routine.builtin === "follow-up");
-    expect(importedRoutines).toEqual(installedRoutines);
-    expect(builtin).toHaveLength(1); expect(builtin[0]).toMatchObject({
-      id: `builtin-follow-up-${createHash("sha256").update(row.partnerId).digest("hex").slice(0, 40)}`,
-      partnerId: row.partnerId, builtinVersion: 1, enabled: true
-    });
-    expect(routines).toHaveLength(importedRoutines.length + builtin.length);
+    const routines = fixture.application.partnerRoutines!.list(row.partnerId);
+    expect(routines).toEqual(installedRoutines);
     expect(fixture.application.store.listRuns({ sessionId: row.canonicalSessionId! })).toHaveLength(0);
     const welcomeId = `import-message-${createHash("sha256").update(JSON.stringify([row.canonicalSessionId, `package-welcome-${saved.requestId}`])).digest("hex")}`;
     await waitFor(async () => {
@@ -446,10 +426,9 @@ describe("mounted Partner collaboration product chain", () => {
     const recovered = await fixture.application.partnerImports!.packages("en", { ownerKey: "evidence-restart", assertCurrent() {} });
     expect(recovered.find(entry => entry.packageId === "engineer-bot")?.installation).toMatchObject({ requestId: saved.requestId, canonicalSessionId: row.canonicalSessionId });
     const restoredRoutines = fixture.application.partnerRoutines!.list(row.partnerId);
-    expect(restoredRoutines.filter(routine => !routine.builtin)).toEqual(importedRoutines);
-    expect(restoredRoutines.filter(routine => routine.builtin === "follow-up")).toEqual(builtin);
+    expect(restoredRoutines).toEqual(installedRoutines);
     expect(errors).toEqual([]);
-    if (evidence) await writeFile(join(evidence, "discovery-result.json"), JSON.stringify({ packages: packages.length, saved: saved.status, disabledRoutines: importedRoutines.length, builtinFollowUps: builtin.length, providersCalled: fixture.providerRequests.length, errors }, null, 2));
+    if (evidence) await writeFile(join(evidence, "discovery-result.json"), JSON.stringify({ packages: packages.length, saved: saved.status, disabledRoutines: installedRoutines.length, providersCalled: fixture.providerRequests.length, errors }, null, 2));
   }, 120_000);
 
   mountedIt("recovers a user-photo Partner after lost creation receipt, edits, service restart and narrow Web reload without duplicate initialization", async () => {

@@ -362,8 +362,11 @@ describe("MobilePartnerProfileSheet", () => {
     await act(async () => { body.value = "Keep the full template."; body.dispatchEvent(new Event("input", { bubbles: true })); }); await press("Save");
     expect(api.save).toHaveBeenCalledOnce(); expect(entry!.body).toBe("Keep the full template.");
     await act(async () => { native.state = "background"; for (const listener of native.listeners) listener(native.state); }); expect(editor.editable).toBe(false);
+    entry = { ...entry!, body: "Updated on another device.", summary: { ...entry!.summary, revision: entry!.summary.revision + 1n } };
     await act(async () => { native.state = "active"; for (const listener of native.listeners) listener(native.state); }); expect(editor.editable).toBe(true);
-    await press("Back"); await press("Reports"); await press("Delete"); expect(api.remove).not.toHaveBeenCalled();
+    expect(body.value).toBe("Updated on another device.");
+    await press("Back"); expect(api.save).toHaveBeenCalledOnce(); expect(entry.body).toBe("Updated on another device.");
+    await press("Reports"); await press("Delete"); expect(api.remove).not.toHaveBeenCalled();
     await act(async () => alerts.alert.mock.calls.at(-1)![2][1].onPress()); expect(api.remove).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("No matching skills.");
     await render(transport("next-task"), undefined, profilePartner, undefined, undefined, factory);
@@ -432,6 +435,11 @@ describe("MobilePartnerProfileSheet", () => {
     const body = container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Content"]')!;
     await act(async () => { body.value = "Keep clear headings."; body.dispatchEvent(new Event("input", { bubbles: true })); });
     await press("Done"); expect(api.save).toHaveBeenCalledOnce(); expect(entry?.body).toBe("Keep clear headings.");
+    await press("Edit");
+    entry = { ...entry!, body: "Updated on another device.", revision: entry!.revision + 1n };
+    await press("Refresh");
+    expect(container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Content"]')!.value).toBe(entry.body);
+    await press("Done"); expect(api.save).toHaveBeenCalledOnce(); expect(entry.body).toBe("Updated on another device.");
     await press("Delete memory"); expect(api.remove).not.toHaveBeenCalled();
     await act(async () => alerts.alert.mock.calls.at(-1)![2][1].onPress()); expect(api.remove).toHaveBeenCalledOnce();
     expect(container.textContent).toContain("No saved memories.");

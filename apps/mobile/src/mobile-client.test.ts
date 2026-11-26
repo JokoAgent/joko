@@ -36,7 +36,7 @@ import {
   FileKind, FilePreviewSchema, FileRevisionSchema, TextFilePreviewSchema, TargetSchema, WorkspaceDescriptorSchema, WorkspaceEntrySchema, WorkspaceFileChangeKind, WorkspaceFileChangeSchema,
   WorkspaceSearchMatchSchema, WorkspaceChangeSetSchema, WorkspaceRewindPreviewSchema, WorkspaceRewindResultSchema, RewindSafety, FileChangeKind,
   JOKO_API_VERSION, NativeEntryKind, NativeSessionBindingSchema, NativeSessionTreeNodeSchema, NativeSessionTreeSchema, OperationSchema,
-  ListPartnerSessionsResponseSchema, PartnerSessionRole, PARTNER_TODO_CHECK_PROMPT,
+  ListPartnerSessionsResponseSchema, PartnerSessionRole,
   InputCapabilityOptionsSchema, InputContentSchema, InputMentionRangeSchema, InteractionKind, InteractionSchema, InteractionState, PermissionDecisionKind, PermissionRisk,
   CustomToolPermissionSubjectSchema, PermissionRequestSchema, PermissionSubjectSchema, PlanReviewDecisionKind, ImageThumbnailSchema,
   EventCursorSchema, EventIdentitySchema, EventSchema, ImageRefSchema, MessageCompletedEventSchema, MessageDeletedEventSchema, MessageInputDelivery, MessageRole, MessageStartedEventSchema,
@@ -10704,7 +10704,7 @@ describe("native current-task message and Queue actions", () => {
     expect(JSON.stringify(saved.pending())).not.toContain("related");
   });
 
-  it("sends the manual todo check in the original task without replacing its saved composer draft", async () => {
+  it("sends an explicit message in the original task without replacing its saved composer draft", async () => {
     const network = projectedNetwork(sessionMentionSnapshot);
     const drafts = memoryDraftStores();
     const app = client(network, memoryStorage(credential).storage, undefined, undefined, ids(), undefined, drafts);
@@ -10716,7 +10716,7 @@ describe("native current-task message and Queue actions", () => {
     const retained = sessionMentionDraft();
     drafts.composer.save(identity, retained);
     await drafts.composer.flush(identity);
-    const text = PARTNER_TODO_CHECK_PROMPT;
+    const text = "Inspect the selected task.";
 
     expect(await app.send(plainTextMobileComposerDraft(text), { keepComposerDraft: true })).toBe(true);
 

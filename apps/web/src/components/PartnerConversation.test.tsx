@@ -7,10 +7,12 @@ import type { AppController } from "../controller.js";
 import { mapSnapshot } from "../gateway.js";
 import { emptySnapshot, type PartnerActivityView, type PartnerPrivateThreadDetailView, type PartnerPrivateThreadView, type PartnerProfileView, type SessionView, type TimelineItemView } from "../model.js";
 import { PartnerConversationProvider, usePartnerConversation } from "./PartnerConversation.js";
+import { PartnerConversationHeader } from "./PartnerConversationHeader.js";
 import { Timeline } from "./Timeline.js";
 import { setPendingPartnerReplyQuote } from '../partner-reply-quote.js';
 import { ListPartnerHomeTargetsResponseSchema, InspectPartnerHomeTargetResponseSchema, MovePartnerHomeResponseSchema,
-  GetPartnerHomeMoveResponseSchema, RetryPartnerHomeMoveResponseSchema, SnapshotSchema, ToolCallState,
+  GetPartnerHomeMoveResponseSchema, RetryPartnerHomeMoveResponseSchema, GetPartnerGlanceResponseSchema, PartnerTaskOutputSchema,
+  PartnerTaskOutputReadiness, SnapshotSchema, ToolCallState, type PartnerAutonomyApi,
   type PartnerHomeApi, type PartnerMemoryApi, type PartnerConnectionsApi, type ConnectionsDetail, type PartnerLearningFeedbackView } from "@joko/contracts";
 
 vi.mock("@tanstack/react-virtual", () => ({
@@ -56,6 +58,40 @@ afterEach(async () => {
 });
 
 describe("mounted Partner conversation", () => {
+  it.each([false, true])("opens a verified glance output only while its connection is current (reconnected=%s)", async reconnected => {
+    const host = document.body.appendChild(document.createElement("div")), root = createRoot(host); roots.push(root);
+    const session: SessionView = { id: "session", targetId: "home", backendId: "backend", name: "Task", state: "idle", generation: 1n,
+      pinned: false, archived: false, fastMode: false, planMode: false, permissionMode: "ask", updatedAt: 1 };
+    const file = "reports/result.md";
+    const rows = [create(PartnerTaskOutputSchema, { sourceId: "output", sessionId: "source-task", execution: 1n,
+      runIds: ["accepted-run"], sourceRevision: { value: 2n }, readiness: PartnerTaskOutputReadiness.READY, files: [{ path: file }] })];
+    const outputs = vi.fn<PartnerAutonomyApi["outputs"]>().mockResolvedValue(rows);
+    const home = controller().partnerHomeApi("home"), navigate = vi.fn();
+    const app = controller({ navigate, partnerHomeApi: ownerKey => ({ ...home, ownerKey }),
+      partnerAutonomyApi: ownerKey => ({ ownerKey, outputs, glance: async () => create(GetPartnerGlanceResponseSchema) }) });
+    const render = async (connectionGeneration: number) => act(async () => {
+      const current = { ...app, state: { ...app.state, connectionGeneration } };
+      root.render(<PartnerConversationProvider controller={current} session={session} active t={key => key}>
+        <PartnerConversationHeader session={session} navigationOpen onOpenNavigation={() => undefined} t={key => key}>{null}</PartnerConversationHeader>
+      </PartnerConversationProvider>); await settle();
+    });
+    await render(1);
+    const glance = host.querySelector<HTMLDetailsElement>("details.partner-glance")!;
+    await act(async () => { glance.open = true; glance.dispatchEvent(new Event("toggle")); });
+    const verified = deferred<typeof rows>();
+    outputs.mockImplementationOnce(() => verified.promise);
+    await act(async () => [...glance.querySelectorAll("button")].find(button => button.textContent?.includes("result.md"))!.click());
+    expect(outputs).toHaveBeenCalledTimes(2);
+    const signal = outputs.mock.calls[1]![1];
+    await render(reconnected ? 2 : 1);
+    expect(signal.aborted).toBe(reconnected);
+    await act(async () => verified.resolve(rows));
+    if (reconnected) expect(navigate).not.toHaveBeenCalled();
+    else {
+      expect(navigate).toHaveBeenCalledExactlyOnceWith({ kind: "files", sessionId: "source-task", file });
+      expect(home.list).toHaveBeenCalledOnce();
+    }
+  });
   it('retries opening the exact original topic operation and navigates only after its receipt', async () => {
     const root = { sessionId: 'session', generation: 1n, eventId: 'event-answer', messageId: 'answer' };
     const ensurePartnerTopic = vi.fn().mockRejectedValueOnce(new Error('Reply lost')).mockResolvedValueOnce({

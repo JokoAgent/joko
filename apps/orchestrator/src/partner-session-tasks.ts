@@ -91,6 +91,10 @@ export class PartnerSessionTaskManager {
   ownedSessions(partnerId: string): readonly string[] {
     return this.list(partnerId).flatMap(task => task.sessionId === undefined ? [] : [task.sessionId]);
   }
+  creatorForSession(sessionId: string): string | undefined {
+    const id = this.#sessions.get(sessionId);
+    return id === undefined ? undefined : this.#read(id).partnerId;
+  }
   forgetPartner(partnerId: string): void {
     for (const task of this.list(partnerId)) {
       if (task.sessionId) { const session = this.store.getSession(task.sessionId).descriptor; if (!session.archived && session.deletedAt === undefined) throw changed(); }
