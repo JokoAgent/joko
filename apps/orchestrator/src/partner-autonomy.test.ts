@@ -53,8 +53,13 @@ async function fixture(permissionMode: "ask" | "bypassPermissions" = "ask") {
   };
   const update = (operationId: string, choice: Parameters<PartnerAutonomyManager["update"]>[0]["choice"]) => autonomy.update({ operationId, connection,
     expectedRevision: autonomy.settings().revision, choice, assertCurrent: () => undefined });
-  cleanups.push(async () => { autonomy.stop(); await routines.stop(); await scheduler.stop(); await tasks.close(); await host.dispose(); profiles.close(); store.close(); await rm(directory, { recursive: true, force: true }); });
-  return { directory, store, profiles, partners, partner, adapter, routines, tasks, autonomy, host, connection, task, update, session, tick: (amount: number) => { now += amount; } };
+  let stopping: Promise<void> | undefined;
+  const stopRuntime = () => stopping ??= (async () => {
+    autonomy.stop(); await routines.stop(); await scheduler.stop(); await tasks.close(); await host.dispose(); store.close();
+  })();
+  cleanups.push(async () => { await stopRuntime(); profiles.close(); await rm(directory, { recursive: true, force: true }); });
+  return { directory, store, profiles, partners, partner, adapter, routines, tasks, autonomy, host, connection, task, update, session,
+    stopRuntime, tick: (amount: number) => { now += amount; } };
 }
 
 describe("Partner task observation", () => {
@@ -84,19 +89,21 @@ describe("Partner task observation", () => {
     expect(set(first.id, false, "owner-releases-first")).toEqual({ taskId: first.id, responsible: false });
     expect(set(first.id, false, "owner-releases-first")).toEqual({ taskId: first.id, responsible: false });
     expect(() => f.autonomy.glance(f.partner.id, before)).toThrow(/expired/u);
-    const readStore = new OperationalStore(join(f.directory, "operations.db"));
-    try {
-      const restored = new PartnerAutonomyManager({ ...f.autonomy.options, store: readStore });
-      const rows = restored.glance(f.partner.id).rows;
-      expect(rows.map(row => row.sessionId).sort()).toEqual([ordinary.id, second.id]);
-      expect(rows.find(row => row.sessionId === ordinary.id)).toMatchObject({ followerPartnerId: f.partner.id, responsiblePartnerId: f.partner.id });
-      expect(rows.find(row => row.sessionId === ordinary.id)?.creatorPartnerId).toBeUndefined();
-    } finally { readStore.close(); }
     expect(f.store.findSetting("service", "partner.workbench.background", first.id)?.value).toMatchObject({ partnerId: f.partner.id, sessionId: first.id });
     for (const task of [ordinary, other, first, second]) {
       expect(f.store.getRun(`run:${task.id}`).descriptor.state).toBe("running");
       expect(f.store.listQueueItems({ sessionId: task.id })).toEqual([]);
     }
+    await f.stopRuntime();
+    const readStore = new OperationalStore(join(f.directory, "operations.db"));
+    try {
+      const tasks = new PartnerSessionTaskManager(readStore, f.partners, f.host, f.tasks.workspaces, f.directory);
+      const restored = new PartnerAutonomyManager({ ...f.autonomy.options, store: readStore, tasks });
+      const rows = restored.glance(f.partner.id).rows;
+      expect(rows.map(row => row.sessionId).sort()).toEqual([ordinary.id, second.id]);
+      expect(rows.find(row => row.sessionId === ordinary.id)).toMatchObject({ followerPartnerId: f.partner.id, responsiblePartnerId: f.partner.id });
+      expect(rows.find(row => row.sessionId === ordinary.id)?.creatorPartnerId).toBeUndefined();
+    } finally { readStore.close(); }
   });
 
   it("runs the opt-in daily todo check in a private routine lane and keeps its builtin instructions fixed", async () => {

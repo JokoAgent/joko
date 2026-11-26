@@ -18,6 +18,72 @@ import type { LanDiscoveryService } from "./lan-discovery.js";
 const knowledgeStores = new Set<OperationalStore>();
 afterEach(() => { for (const store of knowledgeStores) store.close(); knowledgeStores.clear(); });
 
+it("runs the selected arXiv adapter on the read-only recipe and limits its public request", async () => {
+  const entry = `<feed><entry><id>http://arxiv.org/abs/1706.03762v7</id><title>Attention &amp; search</title>
+    <author><name>A. Researcher</name></author><author><name>B. Researcher</name></author>
+    <published>2017-06-12T00:00:00Z</published><arxiv:primary_category term="cs.CL"/></entry></feed>`;
+  const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(entry)).mockResolvedValueOnce(new Response(null, { status: 503 }));
+  const { bridge, start, actions } = fixture(undefined, undefined, { running: false, adapterFetch: fetcher });
+  const guide = await bridge.callTool("browser", { action: "siteguide", site: "arxiv.org" });
+  const recipes = (guide.structuredContent as { data: { recipes: readonly { id: string }[] } }).data.recipes;
+  expect.soft(recipes.find(recipe => recipe.id === "opencli:arxiv/search")).toMatchObject({
+    id: "opencli:arxiv/search", readOnly: true, required: ["query"], inputDetails: { limit: { default: 10 } }
+  });
+
+  const run = (inputs: Readonly<Record<string, unknown>>) => bridge.callTool("browser", { action: "recipe", recipeId: "opencli:arxiv/search", inputs });
+  const invalid = await run({ query: "attention", limit: 26 });
+  expect(invalid.structuredContent).toMatchObject({ ok: false, failureKind: "input", steps: [] });
+  expect(fetcher).not.toHaveBeenCalled();
+  const found = await run({ query: "attention & context" });
+  expect(found.structuredContent).toMatchObject({ ok: true, data: { steps: [{ action: "adapter", ok: true }], output: [{
+    id: "1706.03762", title: "Attention & search", authors: "A. Researcher, B. Researcher", published: "2017-06-12",
+    primary_category: "cs.CL", url: "https://arxiv.org/abs/1706.03762"
+  }] } });
+  const [url, options] = fetcher.mock.calls[0]!;
+  expect(new URL(String(url)).searchParams).toEqual(new URLSearchParams({ search_query: "all:attention & context", max_results: "10", sortBy: "relevance" }));
+  expect(options).toMatchObject({ method: "GET", credentials: "omit", redirect: "error" });
+  expect(start).not.toHaveBeenCalled();
+  expect(actions).toHaveLength(0);
+
+  const unavailable = await run({ query: "attention", limit: "3" });
+  expect(unavailable.structuredContent).toMatchObject({ ok: false, failureKind: "action", failedAction: "adapter",
+    steps: [{ action: "adapter", ok: false }] });
+  expect(new URL(String(fetcher.mock.calls[1]?.[0])).searchParams.get("max_results")).toBe("3");
+});
+
+it("runs the approved Stack Overflow search, observes backoff and reuses the same public result", async () => {
+  const url = "https://stackoverflow.com/questions/833/how-to-calculate-the-date-six-months-from-the-current-date-using-the-datetime-python-module";
+  const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json({ items: [{ question_id: 833, title: "A Python date question",
+    link: url, score: 5, answer_count: 3, view_count: 17, is_answered: true, tags: ["python", "date"], owner: { display_name: "A reader" },
+    creation_date: 1_743_302_450 }, { question_id: 834, title: "Other origin", link: "https://example.test/questions/834" }], backoff: 5 }));
+  const { bridge, start } = fixture(undefined, undefined, { running: false, adapterFetch: fetcher });
+  const guide = await bridge.callTool("browser", { action: "siteguide", site: "stackoverflow.com" });
+  const recipes = (guide.structuredContent as { data: { recipes: readonly { id: string }[] } }).data.recipes;
+  expect(recipes.find(recipe => recipe.id === "opencli:stackoverflow/search")).toMatchObject({
+    readOnly: true, required: ["query"], inputDetails: { limit: { default: 10 } }
+  });
+  const search = (query: string, limit = 10) => bridge.callTool("browser", {
+    action: "recipe", recipeId: "opencli:stackoverflow/search", inputs: { query, limit }
+  });
+  const invalid = await search("date", 101);
+  expect(invalid.structuredContent).toMatchObject({ ok: false, failureKind: "input" });
+  expect(fetcher).not.toHaveBeenCalled();
+  const first = await search("a date & python");
+  expect(first.structuredContent).toMatchObject({ ok: true, data: { output: [{
+    rank: 1, id: 833, title: "A Python date question", score: 5, answers: 3, views: 17, is_answered: true,
+    tags: "python, date", author: "A reader", creation_date: 1_743_302_450, url: "https://stackoverflow.com/questions/833"
+  }] } });
+  const [request, options] = fetcher.mock.calls[0]!;
+  expect(new URL(String(request)).searchParams).toEqual(new URLSearchParams({
+    order: "desc", sort: "relevance", q: "a date & python", site: "stackoverflow", pagesize: "10"
+  }));
+  expect(options).toMatchObject({ method: "GET", credentials: "omit", redirect: "error" });
+  expect((await search("a date & python")).structuredContent).toEqual(first.structuredContent);
+  expect((await search("new query")).structuredContent).toMatchObject({ ok: false, failedAction: "adapter" });
+  expect(fetcher).toHaveBeenCalledOnce();
+  expect(start).not.toHaveBeenCalled();
+});
+
 function fixture(
   remoteNodes?: BrowserRemoteNodeRouter,
   userKnowledge?: BrowserUserKnowledgeLayer,
@@ -29,6 +95,7 @@ function fixture(
     readonly localNodeId?: string;
     readonly setBackend?: (mode: "external" | "sidebar", assertCurrent: () => void) => Promise<"external" | "sidebar">;
     readonly recipes?: readonly Readonly<Record<string, unknown>>[];
+    readonly adapterFetch?: typeof fetch;
   } = {}
 ) {
   if (userKnowledge === undefined) {
@@ -156,6 +223,7 @@ function fixture(
     browser,
     transfers,
     artifacts: { get, ingestBytes } as unknown as ArtifactStore,
+    ...(options.adapterFetch === undefined ? {} : { adapterFetch: options.adapterFetch }),
     ...(options.state === undefined ? {} : { state: options.state }),
     ...(options.setBackend === undefined ? {} : { setBackend: options.setBackend }),
     ...(options.enabledForNewSessions === undefined

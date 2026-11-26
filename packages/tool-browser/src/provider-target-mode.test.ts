@@ -12,6 +12,7 @@ import {
   BrowserTargetModeConflictError,
   type BrowserProviderOptions
 } from "./provider.js";
+import * as uploadStaging from "./upload-staging.js";
 
 class TargetPage extends EventEmitter {
   readonly contextOwner: TargetContext;
@@ -471,6 +472,32 @@ describe("BrowserProvider target modes", () => {
       await value.provider.start();
       await expect(readFile(join(value.root, "profiles", "sidebar", "Local State"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
+      await value.cleanup();
+    }
+  });
+
+  it("waits for the context's background upload cache preparation before completing stop", async () => {
+    const value = await targetFixture({ targetMode: "sidebar" });
+    let releasePreparation!: () => void;
+    const preparation = new Promise<void>(resolve => { releasePreparation = resolve; });
+    const prepare = vi.spyOn(uploadStaging, "prepareBrowserUploadRoot").mockImplementation(async profile => {
+      await preparation;
+      return join(profile, "joko-upload-cache");
+    });
+    const stopped = vi.fn();
+    try {
+      await value.provider.start();
+      expect(prepare).toHaveBeenCalledWith(join(value.root, "profiles", "sidebar"));
+      const stopping = value.provider.stop().then(stopped);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(value.contexts[0]?.closed).toBe(true);
+      expect(stopped).not.toHaveBeenCalled();
+      releasePreparation();
+      await stopping;
+      expect(stopped).toHaveBeenCalledOnce();
+    } finally {
+      releasePreparation();
+      prepare.mockRestore();
       await value.cleanup();
     }
   });

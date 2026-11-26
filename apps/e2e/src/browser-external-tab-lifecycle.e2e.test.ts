@@ -125,7 +125,14 @@ it.skipIf(!existsSync(sidebarExecutable) || !mountedWebDirectory)(
         <title>Browser upload fixture</title>
         <style>label { display: block; margin: 22px } input { display: block; width: 300px }</style>
         <label>First document<input id="first" type="file"></label>
-        <label>Second document<input id="second" type="file"></label>` }));
+        <label>Second document<input id="second" type="file"></label>
+        <script>
+          document.addEventListener("click", event => {
+            document.body.dataset.lastClickTarget = event.target.id || event.target.tagName;
+            document.body.dataset.lastClickTrusted = String(event.isTrusted);
+            document.body.dataset.lastClickActive = String(navigator.userActivation.isActive);
+          }, true);
+        </script>` }));
       await native.goto(url);
       expect((await mutate({ case: "endBrowserTakeover", value: { takeoverId: initial.takeoverId } })).state)
         .toBe(OperationState.SUCCEEDED);
@@ -166,6 +173,7 @@ it.skipIf(!existsSync(sidebarExecutable) || !mountedWebDirectory)(
           const payload = body === null ? undefined : fromBinary(SubmitOperationRequestSchema, body).mutation?.payload;
           return payload?.case === "browserTakeoverAction" && payload.value.action.case === "mouseClick";
         });
+        const clickStartedAt = performance.now();
         await canvas.click({ position: {
           x: (field.x + 24) / (viewport.width - 1) * surface.width,
           y: (field.y + field.height / 2) / (viewport.height - 1) * surface.height
@@ -174,25 +182,48 @@ it.skipIf(!existsSync(sidebarExecutable) || !mountedWebDirectory)(
         expect(result.ok()).toBe(true);
         expect(fromBinary(SubmitOperationResponseSchema, await result.body()).operation?.state).toBe(OperationState.SUCCEEDED);
         await page.locator(".remote-browser.is-enabled[aria-busy=false]").waitFor({ state: "visible" });
+        return Math.round(performance.now() - clickStartedAt);
       };
       const bytes = Buffer.from("Original file contents for the second field.\n");
       const upload = async (name: string) => {
         const picker = page.waitForEvent("filechooser");
         await page.getByRole("button", { name: "Upload file", exact: true }).click();
+        const submitted = page.waitForResponse(response => {
+          if (!response.url().endsWith("/joko.v1.OperationService/SubmitOperation")) return false;
+          const body = response.request().postDataBuffer();
+          const payload = body === null ? undefined : fromBinary(SubmitOperationRequestSchema, body).mutation?.payload;
+          return payload?.case === "uploadBrowserFile" && payload.value.blob?.fileName === name;
+        });
         await (await picker).setFiles({ name, mimeType: "text/plain", buffer: bytes });
-        return waitFor(async () => (await owner.clients.browser.listBrowserTransfers({
+        const response = await submitted;
+        if (!response.ok()) throw new Error(`Browser upload ${response.status()} ${await response.text()}`);
+        const operation = fromBinary(SubmitOperationResponseSchema, await response.body()).operation;
+        expect(operation?.state, operation?.error?.message).toBe(OperationState.SUCCEEDED);
+        const receipt = operation?.result?.payload;
+        if (receipt?.case !== "browserTransfer") throw new Error("The Browser upload did not return a transfer receipt.");
+        const { transfers } = await owner.clients.browser.listBrowserTransfers({
           browserProviderId: provider.id, pageId: initial.pageId, direction: TransferDirection.UPLOAD
-        })).transfers.find(transfer => transfer.fileName === name),
-        transfer => transfer?.state === BrowserTransferState.COMPLETED || transfer?.state === BrowserTransferState.FAILED,
-        `the Browser transfer for ${name}`, 20_000);
+        });
+        expect(transfers.find(transfer => transfer.browserTransferId === receipt.value.browserTransferId)).toEqual(receipt.value);
+        return receipt.value;
       };
       const inputFiles = () => native.locator("input[type=file]").evaluateAll(async elements => Promise.all(
         elements.map(async element => Promise.all(Array.from((element as HTMLInputElement).files ?? [], async file =>
           ({ name: file.name, text: await file.text() }))))
       ));
 
-      await selectSecond();
-      expect(await upload("second.txt")).toMatchObject({ state: BrowserTransferState.COMPLETED,
+      const selectionDurationMs = await selectSecond();
+      const uploaded = await upload("second.txt");
+      const uploadFailure = uploaded.state === BrowserTransferState.COMPLETED ? undefined : JSON.stringify({
+        error: uploaded.error,
+        selectionDurationMs,
+        click: await native.locator("body").evaluate(element => ({
+          target: element.dataset.lastClickTarget,
+          trusted: element.dataset.lastClickTrusted,
+          userActive: element.dataset.lastClickActive
+        })).catch(() => undefined)
+      });
+      expect(uploaded, uploadFailure).toMatchObject({ state: BrowserTransferState.COMPLETED,
         blob: { fileName: "second.txt", sha256Hex: createHash("sha256").update(bytes).digest("hex") } });
       expect(await inputFiles()).toEqual([[], [{ name: "second.txt", text: bytes.toString() }]]);
 

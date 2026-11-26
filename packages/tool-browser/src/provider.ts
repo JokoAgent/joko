@@ -823,7 +823,8 @@ export class BrowserProvider {
     const gate = route.mode === "direct" ? undefined
       : (this.#options.createProxyRequestGate?.(context, route, () => this.proxyGateFailed(context, lifecycleEpoch))
         ?? new BrowserProxyRequestGate(context, route, () => this.proxyGateFailed(context, lifecycleEpoch)));
-    this.#nativeContexts.set(context, { route, ...(gate === undefined ? {} : { gate }), uploadCleanup: new Set() });
+    const uploadCleanup = new Set<Promise<void>>();
+    this.#nativeContexts.set(context, { route, ...(gate === undefined ? {} : { gate }), uploadCleanup });
     const onAbort = () => this.proxyGateFailed(context, lifecycleEpoch);
     options?.signal?.addEventListener("abort", onAbort, { once: true });
     try {
@@ -843,7 +844,11 @@ export class BrowserProvider {
       this.#routeBlocked = false;
       context.on("page", (page) => this.bindPage(page));
       for (const page of context.pages()) this.bindPage(page);
-      void this.prepareUploadRoot(profileDirectory).catch(() => undefined);
+      // A stopped context must finish preparing its profile cache before a
+      // caller can remove or switch the managed profile.
+      const uploadPreparation = this.prepareUploadRoot(profileDirectory).then(() => undefined, () => undefined);
+      uploadCleanup.add(uploadPreparation);
+      void uploadPreparation.then(() => uploadCleanup.delete(uploadPreparation));
       await this.emit({ at: Date.now(), type: "started", detail: `Browser generation ${this.#generation} started.` });
     } catch (error) {
       if (route.mode === "proxied") this.#routeBlocked = true;
@@ -2673,6 +2678,10 @@ export class BrowserProvider {
       () => undefined
     );
     try {
+      // Playwright sends the chooser subscription asynchronously. Give the
+      // renderer a round trip before dispatching the original trusted click.
+      await page.evaluate(() => document.readyState);
+      assertClickCurrent();
       await click();
       const input = await chooser;
       assertClickCurrent();
