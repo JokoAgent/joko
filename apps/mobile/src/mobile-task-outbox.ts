@@ -126,10 +126,22 @@ export class MobileTaskOutboxStore {
     return this.#mutate((records) => ({ records: records.filter((record) => record.owner.profileId !== profileId), result: undefined }), profileId);
   }
 
+  adoptVerifiedOrigin(profile: MobileTaskOutboxOwner, previousOrigins: ReadonlySet<string>): Promise<void> {
+    return this.#mutate(records => {
+      const matches = (record: MobileTaskOutboxRecord) => record.owner.origin !== profile.origin
+        && previousOrigins.has(record.owner.origin)
+        && mobileTaskOutboxOwnerMatches(record.owner, { ...profile, origin: record.owner.origin });
+      if (!records.some(matches)) return { records, result: undefined };
+      return { records: records.map(record => matches(record)
+        ? { ...record, owner: { ...record.owner, origin: profile.origin } } : record), result: undefined };
+    });
+  }
+
   async #mutate<T>(change: (records: readonly MobileTaskOutboxRecord[]) => { records: readonly MobileTaskOutboxRecord[]; result: T }, clearProfileId?: string): Promise<T> {
     await this.load();
     return this.#serialize(async () => {
       const next = change(this.#records);
+      if (next.records === this.#records && clearProfileId === undefined) return next.result;
       const unreadable = clearProfileId === undefined ? this.#unreadable
         : this.#unreadable.filter(record => record.profileId !== clearProfileId);
       if (next.records.length + unreadable.length > maximumRecords) throw new Error("The task outbox is full. Remove an unsent input before adding another.");

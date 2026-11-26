@@ -5241,6 +5241,7 @@ export class MobileClient {
       let savedEntries = profile.endpointPublicKey ? await this.storage.readConnectionEntries?.(profile) : undefined;
       const entryOwner = profile.endpointPublicKey ? { profileId, serverId: profile.serverId, deviceId: profile.deviceId, endpointPublicKey: profile.endpointPublicKey } : undefined;
       let savedCredential: PairedCredential | undefined;
+      let entryOutage: unknown;
       const resolved = savedEntries && entryOwner ? await entryApi.resolvePreparedConnection(entryOwner, savedEntries, async () => {
         savedCredential = await this.storage.loadCredential(profileId);
         if (savedCredential && !credentialMatchesProfile(savedCredential, originalProfile)) throw new CredentialIdentityError();
@@ -5248,6 +5249,10 @@ export class MobileClient {
       }, this.connectionEntrySupported, entryAttempt.signal, entryId, async next => {
         entryAttempt.signal.throwIfAborted(); if (!this.#current(originalEpoch)) throw new Error('The node connection changed.');
         await this.storage.writeConnectionEntries!(originalProfile, next); savedEntries = next;
+      }).catch((error: unknown) => {
+        if (!this.offlineCache || this.#hasActiveConnection() || !entryApi.entryTransportUnavailable(error)) throw error;
+        entryOutage = error;
+        return undefined;
       }) : undefined;
       if (entryAttempt.signal.aborted || this.#entryAttempt !== entryAttempt || this.#epoch !== originalEpoch || !this.#foreground || this.#disposed) return;
       if (resolved && entryOwner) {
@@ -5308,6 +5313,8 @@ export class MobileClient {
             controller.signal.removeEventListener("abort", abortCacheRead);
           }
         }
+        // A prepared route failed. Use only the original profile's cache until an entrance is verified.
+        if (entryOutage !== undefined) throw entryOutage;
         // Public identity proof must precede the protected credential read.
         if (!resolved) await this.storage.loadEndpointTransport?.(profile);
         rememberEndpointTrust(profile);
@@ -5375,6 +5382,14 @@ export class MobileClient {
           await this.storage.saveConnection(credential);
           this.#profiles = [...(await this.storage.loadConnectionIndex()).profiles];
           if (!this.#connectionAttemptCurrent(generation, controller)) return;
+          if (resolved && this.#taskOutbox) {
+            // Include the saved, permitted routes so a reopen can finish a previously interrupted switch.
+            const previousOrigins = new Set(entryApi.connectionEntryCandidates(savedEntries, this.connectionEntrySupported).map(entry => entry.origin));
+            previousOrigins.add(originalProfile.origin);
+            await this.#taskOutbox.adoptVerifiedOrigin(profile, previousOrigins);
+            if (!this.#connectionAttemptCurrent(generation, controller)) return;
+            this.#publishTaskOutbox();
+          }
           this.#set({ connectionEntries: { profileId, entries: entryApi.connectionEntryViews(next, profile, this.connectionEntrySupported), returnToPreferred: next.returnToPreferred,
             ...(resolved?.entry.id !== next.preferredId ? { notice: 'Using a prepared backup. Your preferred entrance has not changed.' } : {}) } });
         }
@@ -6551,21 +6566,25 @@ export class MobileClient {
     }
   }
 
-  async #persistPending(items: readonly PendingOperation[], epoch: number): Promise<boolean> {
-    const connectionId = this.#credential?.connectionId;
-    if (connectionId === undefined) return false;
+  async #persistPending(pending: PendingOperation, change: "add" | "accept" | "remove", epoch?: number): Promise<boolean> {
+    const ownsView = () => this.#credential?.connectionId === pending.connectionId
+      && this.#joinedTask?.source.joined.joinId === pending.taskJoinId;
+    const current = () => epoch === undefined || (this.#current(epoch) && ownsView());
+    const matches = (item: PendingOperation) => item.connectionId === pending.connectionId
+      && item.taskJoinId === pending.taskJoinId && item.operationId === pending.operationId;
+    const update = (items: readonly PendingOperation[]): PendingOperation[] => {
+      if (change === "remove") return items.filter(item => !matches(item));
+      if (change === "accept") return items.map(item => matches(item) ? { ...item, state: "accepted" } : item);
+      return items.some(matches) ? [...items] : [...items, pending];
+    };
     const write = this.#pendingWrite.then(async () => {
-      if (!this.#current(epoch) || this.#credential?.connectionId !== connectionId) return false;
-      const merged = [
-        ...this.#allPending.filter((item) => item.connectionId !== connectionId
-          || item.taskJoinId !== this.#joinedTask?.source.joined.joinId),
-        ...items
-      ];
+      if (!current()) return false;
+      const merged = update(this.#allPending);
       await this.storage.savePending(merged);
       this.#allPending = merged;
-      const current = this.#current(epoch) && this.#credential?.connectionId === connectionId;
-      if (current) this.#set({ saved: this.#savedViews() });
-      return current;
+      // Other submissions can acquire their UI locks while this write is in flight.
+      this.#set({ ...(ownsView() ? { pending: update(this.#state.pending) } : {}), saved: this.#savedViews() });
+      return current();
     });
     this.#pendingWrite = write.then(() => undefined, () => undefined);
     return write;
@@ -11426,8 +11445,8 @@ export class MobileClient {
         try { previous = await this.network.getOperation(credential, operationId, signal); }
         catch (error) { if (!(error instanceof ConnectError && error.code === Code.NotFound)) throw error; }
         if (!current()) return false;
+        const pending = this.#state.pending.find(value => value.operationId === operationId);
         if (previous) {
-          const pending = this.#state.pending.find(value => value.operationId === operationId);
           const identity: PendingOperation = pending ?? { operationId, connectionId: credential.connectionId, kind: "send", sessionId, state: "unknown",
             ...(this.#joinedTask ? { taskJoinId: this.#joinedTask.source.joined.joinId } : {}) };
           if (!this.#operationReceiptMatches(previous, identity)) throw new Error("The answer operation receipt does not match its owner.");
@@ -11442,11 +11461,7 @@ export class MobileClient {
         }
         // The authenticated lookup proved absence. Retire this local pending row
         // before explicitly trying the same ID; never invent a replacement ID.
-        if (this.#state.pending.some(value => value.operationId === operationId)) {
-          const rest = this.#state.pending.filter(value => value.operationId !== operationId);
-          if (!await this.#persistPending(rest, epoch) || !current()) return false;
-          this.#set({ pending: rest });
-        }
+        if (pending && (!await this.#persistPending(pending, "remove", epoch) || !current())) return false;
         const result = await this.#submitTracked(create(OperationMutationSchema, {
           preconditions: [{ entity: { kind: EntityKind.SESSION, id: sessionId }, expectedGeneration: generation }],
           payload: { case: "sendInput", value: { sessionId, deliveryMode: QueueDeliveryMode.PROMPT,
@@ -14227,24 +14242,23 @@ export class MobileClient {
   async #recordCollaborationEffect<T>(kind: Extract<PendingOperation["kind"], `collaboration-${string}`>, key: string,
     signal: AbortSignal, effect: (id: string, signal: AbortSignal) => Promise<T>): Promise<T> {
     this.#assertCollaborationOwner(key, signal);
-    const epoch = this.#epoch, credential = this.#ready(), requestId = this.newId(), before = this.#state.pending;
+    const epoch = this.#epoch, credential = this.#ready(), requestId = this.newId();
     const pending: PendingOperation = { kind, sessionId: this.#state.selectedId!, sourceGeneration: this.#selectedSession()!.nativeBinding!.runtimeGeneration.toString(),
       operationId: requestId, connectionId: credential.connectionId, state: "unknown" };
-    const next = [...before, pending]; this.#set({ pending: next });
-    try { if (!await this.#persistPending(next, epoch)) throw new Error("The collaboration connection changed while its receipt was saved."); }
-    catch (error) { if (this.#current(epoch)) this.#set({ pending: before }); throw error; }
+    this.#set({ pending: [...this.#state.pending, pending] });
+    try { if (!await this.#persistPending(pending, "add", epoch)) throw new Error("The collaboration connection changed while its receipt was saved."); }
+    catch (error) { if (this.#current(epoch)) this.#set({ pending: this.#state.pending.filter(item => item !== pending) }); throw error; }
     let dispatched = false;
     try {
       this.#assertCollaborationOwner(key, signal); dispatched = true;
       const result = await effect(requestId, signal); this.#assertCollaborationOwner(key, signal);
-      const rest = this.#state.pending.filter(value => value.operationId !== requestId);
-      if (await this.#persistPending(rest, epoch)) this.#set({ pending: rest }); return result;
+      await this.#persistPending(pending, "remove", epoch);
+      return result;
     } catch (error) {
       const capacityRejected = kind === "collaboration-create" && error instanceof ConnectError && error.code === Code.ResourceExhausted
         && error.findDetails(ErrorInfoSchema).some(detail => detail.code === COLLABORATION_WORKER_HARD_LIMIT_CODE);
       if ((!dispatched || capacityRejected) && this.#current(epoch)) {
-        const rest = this.#state.pending.filter(value => value.operationId !== requestId);
-        if (await this.#persistPending(rest, epoch)) this.#set({ pending: rest });
+        await this.#persistPending(pending, "remove", epoch);
       }
       throw error;
     }
@@ -14316,23 +14330,21 @@ export class MobileClient {
   async #recordObjectiveEffect<T>(kind: Extract<PendingOperation["kind"], `objective-${string}`>, sessionId: string,
     requestId: string, ownerKey: string, signal: AbortSignal, effect: (signal: AbortSignal) => Promise<T>): Promise<T> {
     this.#assertObjectiveOwner(ownerKey, signal);
-    const epoch = this.#epoch, credential = this.#ready(), before = this.#state.pending;
+    const epoch = this.#epoch, credential = this.#ready();
     const pending: PendingOperation = { kind, sessionId, sourceGeneration: this.#selectedSession()!.nativeBinding!.runtimeGeneration.toString(),
       operationId: requestId, connectionId: credential.connectionId, state: "unknown" };
-    const next = [...before, pending]; this.#set({ pending: next });
-    try { if (!await this.#persistPending(next, epoch)) throw new Error("The objective connection changed while its receipt was saved."); }
-    catch (error) { if (this.#current(epoch)) this.#set({ pending: before }); throw error; }
+    this.#set({ pending: [...this.#state.pending, pending] });
+    try { if (!await this.#persistPending(pending, "add", epoch)) throw new Error("The objective connection changed while its receipt was saved."); }
+    catch (error) { if (this.#current(epoch)) this.#set({ pending: this.#state.pending.filter(item => item !== pending) }); throw error; }
     let dispatched = false;
     try {
       this.#assertObjectiveOwner(ownerKey, signal); dispatched = true;
       const result = await effect(signal); this.#assertObjectiveOwner(ownerKey, signal);
-      const rest = this.#state.pending.filter(value => value.operationId !== requestId);
-      if (await this.#persistPending(rest, epoch)) this.#set({ pending: rest });
+      await this.#persistPending(pending, "remove", epoch);
       return result;
     } catch (error) {
       if (!dispatched && this.#current(epoch)) {
-        const rest = this.#state.pending.filter(value => value.operationId !== requestId);
-        if (await this.#persistPending(rest, epoch)) this.#set({ pending: rest });
+        await this.#persistPending(pending, "remove", epoch);
       }
       throw error;
     }
@@ -16584,9 +16596,7 @@ export class MobileClient {
     network = this.network
   ): Promise<void> {
     try {
-      await this.#writeDetachedPending((items) => items.some((item) => item.operationId === pending.operationId)
-        ? items
-        : [...items, pending]);
+      await this.#persistPending(pending, "add");
     } catch {
       return;
     }
@@ -16598,9 +16608,7 @@ export class MobileClient {
     }
     if (!isTerminal(operation.state)) {
       try {
-        await this.#writeDetachedPending((items) => items.map((item) => item.operationId === pending.operationId
-          ? { ...item, state: "accepted" as const }
-          : item));
+        await this.#persistPending(pending, "accept");
         operation = await network.waitOperation(credential, pending.operationId);
       } catch {
         return;
@@ -16608,31 +16616,12 @@ export class MobileClient {
     }
     if (!isTerminal(operation.state)) return;
     try {
-      await this.#writeDetachedPending((items) => items.filter((item) => item.operationId !== pending.operationId));
+      await this.#persistPending(pending, "remove");
     } catch {
       return;
     }
     if (this.#foreground && this.#credential?.connectionId === credential.connectionId
       && this.#joinedTask?.source.joined.joinId === pending.taskJoinId) void this.refresh();
-  }
-
-  async #writeDetachedPending(
-    update: (items: readonly PendingOperation[]) => readonly PendingOperation[]
-  ): Promise<void> {
-    const write = this.#pendingWrite.then(async () => {
-      const next = [...update(this.#allPending)].slice(-64);
-      await this.storage.savePending(next);
-      this.#allPending = next;
-      const connectionId = this.#credential?.connectionId;
-      if (connectionId) {
-        this.#set({
-          pending: next.filter((item) => item.connectionId === connectionId && item.taskJoinId === this.#joinedTask?.source.joined.joinId),
-          saved: this.#savedViews()
-        });
-      }
-    });
-    this.#pendingWrite = write.then(() => undefined, () => undefined);
-    await write;
   }
 
   async #releaseQueueInteractionLease(lease: MobileQueueInteractionLease): Promise<void> {
@@ -18203,18 +18192,16 @@ export class MobileClient {
     const epoch = this.#epoch;
     const pending: PendingOperation = { ...identity, connectionId: credential.connectionId, operationId, state: "unknown",
       ...(this.#joinedTask ? { taskJoinId: this.#joinedTask.source.joined.joinId } : {}) };
-    const before = this.#state.pending;
-    const next = [...before, pending];
     // Keep the request locked while its receipt is written, including during
     // a foreground reconnect. Server reconciliation starts at dispatch.
     if (authority?.retireUndispatched) this.#preparingInteractionReceipts.add(pending);
-    this.#set({ pending: next, ...(markBusy ? { busy: true } : {}), error: undefined });
+    this.#set({ pending: [...this.#state.pending, pending], ...(markBusy ? { busy: true } : {}), error: undefined });
     let persisted: boolean;
     try {
-      persisted = await this.#persistPending(next, epoch);
+      persisted = await this.#persistPending(pending, "add", epoch);
     } catch (error) {
       this.#preparingInteractionReceipts.delete(pending);
-      if (this.#current(epoch)) this.#set({ pending: before, ...(markBusy ? { busy: false } : {}) });
+      if (this.#current(epoch)) this.#set({ pending: this.#state.pending.filter(item => item !== pending), ...(markBusy ? { busy: false } : {}) });
       throw error;
     }
     let operation: Operation;
@@ -18311,8 +18298,7 @@ export class MobileClient {
       return;
     }
     if (operation.state === OperationState.FAILED || operation.state === OperationState.CONFLICT || operation.state === OperationState.CANCELLED) {
-      const next = this.#state.pending.filter((item) => item.operationId !== pending.operationId);
-      if (await this.#persistPending(next, epoch)) this.#set({ pending: next, error: operation.error?.message || "The operation was rejected." });
+      if (await this.#persistPending(pending, "remove", epoch)) this.#set({ error: operation.error?.message || "The operation was rejected." });
       return;
     }
     if (operation.state === OperationState.SUCCEEDED && pending.kind === "device-rename") {
@@ -18342,17 +18328,14 @@ export class MobileClient {
         }
       }
     }
-    const next = isTerminal(operation.state)
-      ? this.#state.pending.filter((item) => item.operationId !== pending.operationId)
-      : this.#state.pending.map((item) => item.operationId === pending.operationId ? { ...item, state: "accepted" as const } : item);
-    if (!await this.#persistPending(next, epoch)) return;
     const recoveredPackageRemoval = reconciled && pending.kind === "extension-package-remove" && operation.state === OperationState.SUCCEEDED
       && this.#state.pending.some(item => item.operationId === pending.operationId);
+    if (!await this.#persistPending(pending, isTerminal(operation.state) ? "remove" : "accept", epoch)) return;
     if (recoveredPackageRemoval) this.#extensionPackageReceiptRevision++;
     const error = this.#state.error, id = pending.operationId;
     const resolvedError = recoveredPackageRemoval && (error?.startsWith(`Operation ${id}:`)
       || error?.startsWith(`Could not confirm operation ${id}:`) || error?.startsWith(`Operation ${id} is not yet confirmed.`));
-    this.#set({ pending: next, ...(resolvedError ? { error: undefined } : {}) });
+    if (recoveredPackageRemoval) this.#set(resolvedError ? { error: undefined } : {});
     if (operation.state === OperationState.SUCCEEDED
       && (pending.kind === "interaction-resolve" || pending.kind === "interaction-dismiss")
       && pending.interactionDraftKind !== undefined && pending.sessionId !== undefined && pending.interactionId !== undefined
@@ -18480,9 +18463,9 @@ export class MobileClient {
                 sessionId: pending.sessionId!, generation: pending.sourceGeneration! });
               if (!this.#current(epoch)) return;
             }
-            const rest = this.#state.pending.filter(value => value.operationId !== pending.operationId);
-            if (await this.#persistPending(rest, epoch)) this.#set({ pending: rest,
-              ...(operation.state === OperationState.SUCCEEDED ? {} : { error: operation.error?.message || "The service operation was rejected." }) });
+            if (await this.#persistPending(pending, "remove", epoch) && operation.state !== OperationState.SUCCEEDED) {
+              this.#set({ error: operation.error?.message || "The service operation was rejected." });
+            }
           }
           continue;
         }
@@ -18668,9 +18651,7 @@ export class MobileClient {
         : { operationId, connectionId: submission.connectionId, kind: "send" as const,
             sessionId: submission.sessionId, state: "accepted" as const });
     if (!isTerminal(operation.state) && !this.#state.pending.some((item) => item.operationId === operationId)) {
-      const next = [...this.#state.pending, pending];
-      if (!await this.#persistPending(next, epoch)) return undefined;
-      this.#set({ pending: next });
+      if (!await this.#persistPending(pending, "add", epoch)) return undefined;
     }
     await this.#receipt(operation, pending, epoch);
     if (!this.#current(epoch) || isTerminal(operation.state)) return operation;
@@ -18713,9 +18694,8 @@ export class MobileClient {
       } else await this.#receipt(operation, pending, epoch);
       throw new Error("The Joko node has this operation; its durable result was refreshed instead of discarding it.");
     }
-    const next = this.#state.pending.filter((item) => item.operationId !== operationId);
-    if (await this.#persistPending(next, epoch)) {
-      this.#set({ pending: next, error: undefined });
+    if (await this.#persistPending(pending, "remove", epoch)) {
+      this.#set({ error: undefined });
       if (derivedTask) await this.#clearDerivedInput({ profileId: credential.profileId, sessionId: pending.sessionId! }, operationId, epoch);
       if (this.newTaskDrafts && this.#activeProfileId) {
         const identity = { profileId: this.#activeProfileId };

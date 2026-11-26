@@ -388,11 +388,11 @@ export function createMobileStorage(
       try { value = JSON.parse(raw); }
       catch { throw new Error("The local operation receipt index is invalid."); }
       if (!Array.isArray(value)) throw new Error("The local operation receipt index is invalid.");
-      return value.filter(isPending).slice(-64);
+      return value.filter(isPending);
     },
 
     savePending: (items) => serialized(async () => {
-      await plain.setItem(pendingKey, JSON.stringify(items.slice(-64)));
+      await plain.setItem(pendingKey, JSON.stringify(items));
     }),
 
     async loadSelection(profileId) {
@@ -526,7 +526,7 @@ function isPending(value: unknown): value is PendingOperation {
     || !["create", "send", "logout", "revoke", "device-rename", "rename", "pin", "archive", "delete", "snooze", "message-delete",
       "queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder", "queue-resume", "queue-retry",
       "interaction-resolve", "interaction-dismiss", "session-model", "session-permission", "session-plan", "session-compact", "session-stop",
-      "objective-set", "objective-pause", "objective-resume", "objective-clear",
+      "task-tag", "objective-set", "objective-pause", "objective-resume", "objective-clear",
       "collaboration-enable", "collaboration-create", "collaboration-release", "collaboration-archive", "collaboration-end",
       "session-branch", "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-side-chat", "session-rewind", "workspace-rewind", "schedule-run", "schedule-enable",
       "schedule-run-restart", "schedule-run-read", "schedule-runs-read", "schedule-all-read",
@@ -569,6 +569,7 @@ function isPending(value: unknown): value is PendingOperation {
     || record.interactionDraftKind !== undefined || record.targetConnectionId !== undefined
     || record.scheduleId !== undefined || record.triggerId !== undefined || record.targetId !== undefined)) return false;
   if (record.kind === "send" && typeof record.sessionId !== "string") return false;
+  if (record.kind === "task-tag" && !validReceiptIdentity(record.sessionId)) return false;
   if (["rename", "pin", "archive", "delete"].includes(String(record.kind)) && typeof record.sessionId !== "string") return false;
   if (record.kind === "message-delete" && (typeof record.sessionId !== "string" || typeof record.eventId !== "string")) return false;
   if (record.kind === "session-stop" || record.kind === "queue-retry") {

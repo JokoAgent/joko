@@ -220,10 +220,13 @@ export async function resolvePreparedConnection(owner: ConnectionEntryOwner, sav
   let next = saved;
   for (const entry of connectionEntryCandidates(saved, supported, selectedId)) {
     signal.throwIfAborted();
+    const identityDeadline = AbortSignal.timeout(entry.kind === 'webrtc' ? 20_000 : 6_000);
     try {
-      await verifyConnectionEntry(owner, entry, AbortSignal.any([signal, AbortSignal.timeout(entry.kind === 'webrtc' ? 20_000 : 6_000)]));
+      await verifyConnectionEntry(owner, entry, AbortSignal.any([signal, identityDeadline]));
     } catch (error) {
-      signal.throwIfAborted(); failures.push(error);
+      signal.throwIfAborted();
+      failures.push(identityDeadline.aborted && ConnectError.from(error).code === Code.Canceled && !isEndpointTrustError(error)
+        ? identityDeadline.reason : error);
       next = { ...next, entries: next.entries.map(item => item.id === entry.id ? { ...item,
         verification: isEndpointTrustError(error) ? 'identity-conflict' as const : 'unreachable' as const } : item) };
       await save?.(next); continue;
@@ -244,7 +247,7 @@ export async function resolvePreparedConnection(owner: ConnectionEntryOwner, sav
       // replies and trust failures must never be disguised as unavailable routes.
       if (isEndpointTrustError(error) || code === Code.Unauthenticated || code === Code.PermissionDenied
         || !timedOut && !entryTransportUnavailable(error)) throw error;
-      failures.push(error);
+      failures.push(timedOut ? authorizationDeadline.reason : error);
       next = { ...next, entries: next.entries.map(item => item.id === entry.id ? { ...item, verification: 'unreachable' as const } : item) };
       await save?.(next); continue;
     }
@@ -253,11 +256,13 @@ export async function resolvePreparedConnection(owner: ConnectionEntryOwner, sav
     await save?.(next);
     return { entry, authKey, failures, saved: next };
   }
-  if (failures.length) throw failures[0];
+  if (failures.length) throw failures.find(isEndpointTrustError) ?? failures.find(error => !entryTransportUnavailable(error)) ?? failures[0];
   throw new Error('No prepared, permitted entrance is available on this client.');
 }
-function entryTransportUnavailable(error: unknown): boolean {
-  if ([Code.Unavailable, Code.DeadlineExceeded].includes(ConnectError.from(error).code)) return true;
+export function entryTransportUnavailable(error: unknown): boolean {
+  const code = ConnectError.from(error).code;
+  if (isEndpointTrustError(error) || code === Code.Unauthenticated || code === Code.PermissionDenied) return false;
+  if (code === Code.Unavailable || code === Code.DeadlineExceeded) return true;
   const seen = new Set<unknown>();
   for (let depth = 0; depth < 16 && error instanceof Error && !seen.has(error); depth++) {
     const code = String((error as Error & { code?: unknown }).code);

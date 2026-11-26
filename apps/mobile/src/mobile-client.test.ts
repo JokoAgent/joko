@@ -64,7 +64,7 @@ import { MobilePartnerDeletionReceipts } from "./mobile-partner-deletion";
 import { MobilePartnerRestartReceipts } from "./mobile-partner-restart";
 import { mobilePartnerCreationDraft, MobilePartnerCreationRejected, type MobilePartnerCreationResult } from "./mobile-partner-creation";
 import { creationSnapshot } from "./test/mobile-partner-creation";
-import { MobileCredentialStorageError, profileFromCredential } from "./connection-storage";
+import { createMobileStorage, MobileCredentialStorageError, profileFromCredential } from "./connection-storage";
 import type { MobileObjective, MobileObjectiveRpc } from "./mobile-objective";
 import { producedArtifactEvent, producedImageEvent, toolMediaEvent } from "./test/timeline-media";
 import { animatedPngBytes, gifBytes, svgBytes, bmpBytes, tiffBytes, isoImageBytes, iconBytes, iconDibBytes } from "./test/image-formats";
@@ -1395,18 +1395,33 @@ function historyRetirementFixture(pi = false) {
   return { app, network, saved, offline, owner, detail, deleted, deletedText, neighbor, input, identity, rows, hits };
 }
 
-function memoryDraftStores() {
+function memoryPlainStorage() {
   const values = new Map<string, string>();
   const driver: MobilePlainStorageDriver = {
     async getItem(key) { return values.get(key) ?? null; },
     async setItem(key, value) { values.set(key, value); },
     async removeItem(key) { values.delete(key); }
   };
+  return { driver, values };
+}
+
+function memoryDraftStores() {
+  const { driver, values } = memoryPlainStorage();
   return {
     values,
     newTask: new MobileNewTaskDraftStore(driver),
     composer: new MobileComposerDraftStore(driver)
   };
+}
+
+async function storedReceiptFixture(...profiles: PairedCredential[]) {
+  const storage = createMobileStorage(memoryPlainStorage().driver, { ...memoryPlainStorage().driver, isAvailable: async () => true });
+  for (const profile of profiles) {
+    await storage.saveConnection(profile);
+    await storage.saveSelection(profile.profileId, "session");
+  }
+  await storage.saveAutomaticProfile(credential.profileId);
+  return storage;
 }
 
 function localAttachmentDraft(text = "", imageBytes?: Uint8Array): MobileComposerDraft {
@@ -9867,6 +9882,95 @@ describe("mobile Home search and task mutations", () => {
     await expect(deleting).resolves.toBe(true);
     expect(app.state).toMatchObject({ status: "offline", selectedId: undefined, detail: undefined, pending: [] });
     expect(app.state.owner?.sessions).toEqual([]);
+  });
+
+  it("reopens a lost task-tag receipt and queries the original operation before allowing another edit", async () => {
+    const storage = await storedReceiptFixture(credential), network = fakeNetwork();
+    const first = client(network, storage); await first.start();
+    vi.mocked(network.submit).mockRejectedValueOnce(new Error("Reply lost"));
+    expect(await first.createTaskTag("session", "Release", TaskTagColor.TEAL, 4n)).toBe(false);
+    const pending = { kind: "task-tag", operationId: "operation-1", connectionId: credential.connectionId, sessionId: "session", state: "unknown" };
+    expect(first.state.pending).toEqual([pending]);
+    expect(await storage.loadPending()).toEqual([pending]);
+    first.dispose();
+
+    const reopened = client(network, storage); await reopened.start();
+    expect(reopened.state.pending).toEqual([pending]);
+    expect(network.getOperation).toHaveBeenCalledWith(credential, pending.operationId, expect.any(AbortSignal));
+    await expect(reopened.createTaskTag("session", "Release", TaskTagColor.TEAL, 4n)).rejects.toThrow(/still pending/u);
+    vi.mocked(network.getOperation).mockResolvedValueOnce(create(OperationSchema, { operationId: pending.operationId,
+      connectionId: credential.connectionId, state: OperationState.SUCCEEDED }));
+    await reopened.reconcile();
+    expect(await storage.loadPending()).toEqual([]);
+    expect(network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("preserves all 64 outstanding receipts of another connection when the current rename loses its reply", async () => {
+    const storage = await storedReceiptFixture(credential, otherCredential), network = fakeNetwork();
+    const previous = Array.from({ length: 64 }, (_, i) => ({ operationId: `retained-${i}`, connectionId: otherCredential.connectionId,
+      kind: "rename" as const, sessionId: "session", state: "unknown" as const }));
+    await storage.savePending(previous);
+    const first = client(network, storage); await first.start();
+    vi.mocked(network.submit).mockRejectedValueOnce(new Error("Reply lost"));
+    expect(await first.renameSession("session", "New name")).toBe(false);
+    expect(await storage.loadPending()).toEqual([...previous, { connectionId: credential.connectionId, operationId: "operation-1",
+      kind: "rename", sessionId: "session", state: "unknown" }]);
+    expect(network.getOperation).not.toHaveBeenCalled();
+    first.dispose();
+
+    await storage.saveAutomaticProfile(otherCredential.profileId);
+    vi.mocked(network.readOwner).mockResolvedValue({ connection: otherConnection, device: otherDevice,
+      snapshot: create(SnapshotSchema, { ...snapshot, devices: [otherDevice], connections: [otherConnection] }) });
+    const reopened = client(network, storage); await reopened.start();
+    expect(reopened.state.pending).toEqual(previous);
+    expect(vi.mocked(network.getOperation).mock.calls.map(([owner, id]) => [owner.connectionId, id]))
+      .toEqual(previous.map(item => [item.connectionId, item.operationId]));
+    expect(network.submit).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the original tag receipt when its submission overlaps settlement of a lost rename", async () => {
+    const storage = await storedReceiptFixture(credential, otherCredential), network = fakeNetwork();
+    const rename = { connectionId: credential.connectionId, operationId: "operation-1",
+      kind: "rename" as const, sessionId: "session", state: "unknown" as const };
+    const others = [{ ...rename, taskJoinId: "joined-task" }, { ...rename, connectionId: otherCredential.connectionId }];
+    await storage.savePending(others);
+    let sequence = 0;
+    const first = client(network, storage, undefined, undefined, () => `operation-${++sequence}`);
+    await first.start();
+    vi.mocked(network.submit).mockRejectedValue(new Error("Reply lost"));
+    expect(await first.renameSession("session", "New name")).toBe(false);
+
+    let release!: () => void;
+    const savePending = storage.savePending.bind(storage);
+    vi.spyOn(storage, "savePending").mockImplementationOnce(async items => {
+      await new Promise<void>(resolve => { release = resolve; });
+      await savePending(items);
+    });
+    vi.mocked(network.getOperation).mockResolvedValueOnce(create(OperationSchema, {
+      connectionId: credential.connectionId, operationId: rename.operationId, state: OperationState.FAILED
+    }));
+    const settling = first.reconcile();
+    await vi.waitFor(() => expect(release).toBeDefined());
+    const tag = { ...rename, kind: "task-tag", operationId: "operation-2" };
+    const submitting = first.createTaskTag("session", "Release", TaskTagColor.TEAL, 4n);
+    await vi.waitFor(() => expect(first.state.pending).toEqual([rename, tag]));
+    release();
+    await settling;
+    expect(await submitting).toBe(false);
+    expect(first.state.pending).toEqual([tag]);
+    await expect(first.createTaskTag("session", "Release", TaskTagColor.TEAL, 4n)).rejects.toThrow(/still pending/u);
+    expect(await storage.loadPending()).toEqual([...others, tag]);
+    first.dispose();
+
+    vi.mocked(network.getOperation).mockClear();
+    const reopened = client(network, storage);
+    await reopened.start();
+    expect(reopened.state.pending).toEqual([tag]);
+    expect(vi.mocked(network.getOperation).mock.calls.map(([owner, id]) => [owner.connectionId, id]))
+      .toEqual([[credential.connectionId, tag.operationId]]);
+    await expect(reopened.createTaskTag("session", "Release", TaskTagColor.TEAL, 4n)).rejects.toThrow(/still pending/u);
+    expect(vi.mocked(network.submit).mock.calls.map(([, id]) => id)).toEqual([rename.operationId, tag.operationId]);
+    reopened.dispose();
   });
 
   it("submits the current host task-tag operations and preserves exact deletion fences", async () => {

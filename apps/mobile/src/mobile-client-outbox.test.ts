@@ -1,5 +1,8 @@
 import { clone, create, toBinary } from "@bufbuild/protobuf";
 import { createHash } from "node:crypto";
+import { Code, ConnectError } from "@connectrpc/connect";
+import { connectionEntryCandidates, initialConnectionEntries, resolvePreparedConnection } from "@joko/connection-transport/entries";
+import { EndpointTrustError } from "@joko/connection-transport/trust";
 import {
   BlobDisposition, BlobRefSchema, CapabilitySupport, ConnectionSchema, ConnectionState, DeviceKind, DeviceSchema,
   EventCursorSchema, EventSchema, InputContentSchema, JOKO_API_VERSION, MessageRole, OperationMutationSchema, OperationSchema, OperationState, PermissionMode,
@@ -28,6 +31,10 @@ const node: NodeIdentity = { serverId: credential.serverId, displayName: "Node",
 const serviceEpoch = 123n, nativeGeneration = 8n;
 const clients: MobileClient[] = [];
 afterEach(() => { for (const client of clients.splice(0)) client.dispose(); });
+vi.mock("@joko/connection-transport/entries", async original => {
+  const entries = await original<typeof import("@joko/connection-transport/entries")>();
+  return { ...entries, resolvePreparedConnection: vi.fn(entries.resolvePreparedConnection) };
+});
 
 function admittedQueue(operationId: string, input?: InputContent) {
   return create(QueueItemSchema, { queueItemId: `queue-${operationId}`, runId: `run-${operationId}`,
@@ -49,7 +56,7 @@ function acceptedHistory(operationId: string, input: InputContent, sequence: num
       userInputAccepted: true, userInput: input } } } });
 }
 
-async function fixture() {
+async function fixture(savedCredential = credential) {
   const values = new Map<string, string>(), protectedValues = new Map<string, string>();
   let rejectOutboxWrite = false;
   let beforeOutboxWrite: ((value: string) => Promise<void>) | undefined;
@@ -66,7 +73,7 @@ async function fixture() {
   const storage = createMobileStorage(plain, { async isAvailable() { return true; },
     async getItem(key) { return protectedValues.get(key) ?? null; },
     async setItem(key, value) { protectedValues.set(key, value); }, async removeItem(key) { protectedValues.delete(key); } });
-  await storage.saveConnection(credential);
+  await storage.saveConnection(savedCredential);
   await storage.saveSelection(credential.profileId, "session");
   await storage.saveAutomaticProfile(credential.profileId);
   const connection = create(ConnectionSchema, { connectionId: credential.connectionId, connectionProfileId: credential.profileId,
@@ -99,7 +106,7 @@ async function fixture() {
       await plain.setItem(key, value);
     }
   }, () => 1_500, () => `cache-${++sequence}`);
-  await cache.save(profileFromCredential(credential), node, owner, detail);
+  await cache.save(profileFromCredential(savedCredential), node, owner, detail);
   const blobs = new Map<string, Uint8Array>();
   const fileKey = (profile: string, id: string) => `${profile}/${id}`;
   const fileSnapshot = (key: string) => {
@@ -157,7 +164,68 @@ async function fixture() {
     interceptWrite(value?: (body: string) => Promise<void>) { beforeOutboxWrite = value; } };
 }
 
+async function preparedFixture() {
+  const pinned = { ...credential, origin: "https://preferred.example", endpointPublicKey: `ed25519:${"b".repeat(64)}` };
+  const f = await fixture(pinned);
+  const saved = initialConnectionEntries(pinned, pinned);
+  const backup = { ...saved.entries[0]!, id: "backup", origin: "https://backup.example" };
+  await f.storage.writeConnectionEntries!(pinned, { ...saved, entries: [...saved.entries, backup], backupIds: [backup.id] });
+  return { ...f, pinned, backup };
+}
+
 describe("durable ordinary mobile task inputs", () => {
+  it.each([false, true])("queues on cold prepared-route outage and recovers the original input on the verified backup (already saved=%s)", async alreadySaved => {
+    const f = await preparedFixture(), first = f.makeClient();
+    vi.mocked(resolvePreparedConnection).mockRejectedValueOnce(new ConnectError("Both prepared routes are offline", Code.Unavailable));
+    const loadCredential = vi.spyOn(f.storage, "loadCredential");
+    await first.client.start();
+    expect(first.client.state).toMatchObject({ status: "offline", selectedId: "session", origin: f.pinned.origin });
+    expect(loadCredential).not.toHaveBeenCalled();
+    expect(f.network.inspect).not.toHaveBeenCalled();
+    expect(first.client.canQueueTaskInput()).toBe(true);
+    await first.client.send(plainTextMobileComposerDraft("From the original task"), { operationId: "offline-backup" });
+    const [queued] = first.client.taskOutboxItems();
+    expect(queued).toMatchObject({ state: "queued", owner: { origin: f.pinned.origin } });
+    expect(f.network.submit).not.toHaveBeenCalled();
+    first.client.dispose();
+
+    const store = new MobileTaskOutboxStore(f.plain);
+    for (const owner of [{ ...queued!.owner, origin: "https://unauthorized.example" }, { ...queued!.owner, deviceId: "another-device" }]) {
+      const id = `foreign-${owner.deviceId}`;
+      await store.add({ ...queued!, owner, id, operationId: id });
+    }
+    if (alreadySaved) await f.storage.saveConnection({ ...f.pinned, origin: f.backup.origin, entryId: f.backup.id, transportKind: f.backup.kind });
+    vi.mocked(resolvePreparedConnection).mockImplementationOnce(async (owner, saved, readKey, supported) => {
+      expect(owner).toMatchObject({ profileId: credential.profileId, serverId: node.serverId, deviceId: credential.deviceId, endpointPublicKey: f.pinned.endpointPublicKey });
+      const entry = connectionEntryCandidates(saved, supported).find(entry => entry.id === f.backup.id)!;
+      const authKey = await readKey();
+      expect(authKey).toBe(credential.authKey);
+      return { entry, authKey: authKey!, failures: [], saved };
+    });
+    f.online(); f.publishHistory(false);
+    const reopened = f.makeClient();
+    vi.spyOn(reopened.client, "refreshConnectionEntries").mockResolvedValue(undefined);
+    await reopened.client.start();
+    expect(reopened.client.state).toMatchObject({ status: "connected", origin: f.backup.origin, selectedId: "session" });
+    expect(reopened.client.taskOutboxItems().map(record => [record.operationId, record.state])).toEqual([["offline-backup", "accepted"]]);
+    expect(f.network.submit.mock.calls.map(([cred, id, mutation]) => [cred.origin, id, mutation.preconditions[0]?.expectedGeneration]))
+      .toEqual([[f.backup.origin, "offline-backup", nativeGeneration]]);
+    const durable = new MobileTaskOutboxStore(f.plain); await durable.load();
+    expect(durable.records.filter(record => record.state === "queued").map(record => record.owner))
+      .toEqual([{ ...queued!.owner, origin: "https://unauthorized.example" }, { ...queued!.owner, deviceId: "another-device" }]);
+  });
+
+  it.each(["identity", "revoked"] as const)("retires the cached task when prepared-route verification reports %s", async failure => {
+    const f = await preparedFixture(), { client } = f.makeClient();
+    vi.mocked(resolvePreparedConnection).mockRejectedValueOnce(failure === "identity" ? new EndpointTrustError()
+      : new ConnectError("Device revoked", Code.Unauthenticated));
+    await client.start();
+    expect(client.state.status).toBe(failure === "identity" ? "unpaired" : "revoked");
+    expect(client.canQueueTaskInput()).toBe(false);
+    expect(await f.cache.load(f.pinned, "session")).toBeUndefined();
+    expect(f.network.submit).not.toHaveBeenCalled();
+  });
+
   it("retains multiple offline sends before clearing the composer, then restarts and dispatches their original operations in order", async () => {
     const f = await fixture(), first = f.makeClient(); await first.client.start();
     expect(first.client.state.status).toBe("offline"); expect(first.client.canQueueTaskInput()).toBe(true);

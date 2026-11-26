@@ -81,6 +81,17 @@ describe('saved node entrances', () => {
       } finally { probes.failures.clear(); }
     }
   });
+  it('reports the identity conflict when the preferred route is offline and the backup proves another node', async () => {
+    const { ConnectError, Code } = await import('@connectrpc/connect');
+    const { isEndpointTrustError } = await import('./trust.js');
+    probes.bad = new Set(['https://relay.example']);
+    probes.failures.set('https://home.example', new ConnectError('Connection reset', Code.Unavailable));
+    try {
+      const failure = await resolvePreparedConnection(owner, two(), async () => 'secret', () => true, new AbortController().signal)
+        .catch((error: unknown) => error);
+      expect(isEndpointTrustError(failure)).toBe(true);
+    } finally { probes.failures.clear(); probes.bad.clear(); }
+  });
   it('preserves the device owner across addresses and rejects another node or device cache', () => {
     expect(parseSavedConnectionEntries(two(), owner).owner).toBe(connectionEntryOwnerKey(owner));
     expect(() => parseSavedConnectionEntries(two(), { ...owner, deviceId: 'other' })).toThrow();
