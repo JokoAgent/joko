@@ -5,7 +5,7 @@ import { PartnerImportCategory, PartnerImportPreviewPageSchema, PartnerImportRes
   ListPartnerHomeTargetsResponseSchema, InspectPartnerHomeTargetResponseSchema, MovePartnerHomeResponseSchema,
   GetPartnerHomeMoveResponseSchema, RetryPartnerHomeMoveResponseSchema, PermissionMode, type PartnerHomeApi,
   type PartnerImportApi, type PartnerImportResult, type PartnerMemoryApi, type MemoryCatalog, type MemoryDetail } from "@joko/contracts";
-import { act, type JSX } from "react";
+import { act, StrictMode, type JSX } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -27,7 +27,7 @@ import {
 import { PartnersPage, PartnerSettingsDialog } from "./PartnersPage.js";
 import { translate } from "../i18n.js";
 import { ListPartnerGroupsResponseSchema, type PartnerGroupApi } from "@joko/contracts";
-import type { ConnectionsDetail, PartnerConnectionsApi } from "@joko/contracts";
+import type { ConnectionsDetail, PartnerConnectionsApi, PartnerSkillsApi, PersonalSkillDetail } from "@joko/contracts";
 import { requestPartnerNavigationLeave } from "../partner-navigation-leave.js";
 
 const roots: Root[] = [];
@@ -266,13 +266,69 @@ describe("PartnersPage", () => {
     const api: PartnerConnectionsApi = { ownerKey: "", read: vi.fn(async () => current),
       save: vi.fn(async (_base, draft) => current = { ...current, ...draft, revision: (current.revision ?? 0n) + 1n }) };
     const factory = vi.fn((_id: string, ownerKey: string) => ({ ...api, ownerKey }));
-    await mount({ partners: [selected], focusPartnerId: selected.id, controllerOverrides: { partnerConnectionsApi: factory } });
+    let personal: PersonalSkillDetail | undefined = { owner, summary: { id: "personal-report", slug: "report", name: "Learned report", description: "Weekly", enabled: true,
+      updatedAt: "", revision: 2n, contentRevision: "sha256:" + "a".repeat(64) }, name: "Learned report", description: "Weekly", body: "Original instructions", bodyBytes: 21n, readOnly: false };
+    const skills: PartnerSkillsApi = { ownerKey: "", list: vi.fn(), read: vi.fn(async id => id === "personal-report" ? personal : undefined),
+      save: vi.fn(async (base, draft) => personal = { ...base, ...draft, summary: { ...base.summary, revision: base.summary.revision + 1n } }),
+      remove: vi.fn(async () => { personal = undefined; }) };
+    const skillFactory = vi.fn((_id: string, ownerKey: string) => ({ ...skills, ownerKey }));
+    await mount({ strict: true, partners: [selected], focusPartnerId: selected.id, controllerOverrides: { partnerConnectionsApi: factory, partnerSkillsApi: skillFactory } });
     await act(async () => { button(document.body, "partners.profileSettings").click(); await settle(); });
     await act(async () => { button(document.body, "Skills & Connections").click(); await settle(); });
     expect(factory).toHaveBeenCalledWith(selected.id, expect.any(String)); expect(document.body.querySelector("fieldset")?.disabled).toBe(true);
     const modal = () => required([...document.body.querySelectorAll<HTMLElement>('[role="dialog"]')].at(-1));
     const check = (name: string) => required([...modal().querySelectorAll<HTMLLabelElement>("label")].find(label => label.textContent === name)?.querySelector<HTMLInputElement>("input"));
-    expect(check("Learned report · Personal skill").checked).toBe(true); expect(check("Learned report · Personal skill").disabled).toBe(true);
+    const openPersonal = () => button(modal(), "Learned report · Personal skill").click();
+    const done = () => required(modal().querySelector<HTMLButtonElement>('button[aria-label="Done"]')).click();
+    await act(async () => { openPersonal(); await settle(); });
+    expect(skillFactory).toHaveBeenCalledWith(selected.id, factory.mock.calls.at(-1)![1]);
+    expect(skills.read).toHaveBeenCalledWith("personal-report", expect.any(AbortSignal)); expect(modal().textContent).toContain("Original instructions");
+    await act(async () => button(modal(), "Edit").click());
+    await act(async () => { const input = required(modal().querySelector("textarea")); setNativeValue(input, "Updated instructions"); input.dispatchEvent(new Event("input", { bubbles: true })); });
+    await act(async () => { button(modal(), "Save").click(); await settle(); });
+    expect(skills.save).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ owner, summary: expect.objectContaining({ id: "personal-report", revision: 2n }) }),
+      expect.objectContaining({ body: "Updated instructions" }), expect.any(AbortSignal));
+    await act(async () => { done(); await settle(); });
+    const saved = personal!;
+    personal = { ...saved, readOnly: true };
+    await act(async () => { openPersonal(); await settle(); });
+    expect(modal().textContent).toContain("This skill is read-only.");
+    expect([...modal().querySelectorAll("button")].map(item => item.textContent)).not.toContain("Delete");
+    await act(async () => { done(); await settle(); });
+    personal = saved;
+    await act(async () => { openPersonal(); await settle(); });
+    await act(async () => button(modal(), "Edit").click());
+    personal = { ...saved, body: "Edited on another client", summary: { ...saved.summary, revision: saved.summary.revision + 1n } };
+    await act(async () => button(modal(), "Refresh").click());
+    expect(modal().querySelector("textarea")?.value).toBe("Edited on another client");
+    await act(async () => { done(); await settle(); });
+    expect(skills.save).toHaveBeenCalledOnce();
+
+    await act(async () => { openPersonal(); await settle(); });
+    await act(async () => button(modal(), "Edit").click());
+    await act(async () => { const field = required(modal().querySelector("textarea")); setNativeValue(field, "Saved just before archive"); field.dispatchEvent(new Event("input", { bubbles: true })); });
+    vi.mocked(skills.save).mockImplementationOnce(async (base, draft) => {
+      personal = { ...base, ...draft, bodyBytes: BigInt(new TextEncoder().encode(draft.body).byteLength), readOnly: true,
+        owner: { ...base.owner, readOnly: true }, summary: { ...base.summary, revision: base.summary.revision + 1n } };
+      throw new Error("Lost save acknowledgement");
+    });
+    await act(async () => button(modal(), "Save").click());
+    expect(modal().textContent).toContain("This skill is read-only.");
+    expect(modal().querySelector("pre")?.textContent).toBe("Saved just before archive");
+    expect(modal().querySelector("textarea")).toBeNull();
+    expect(skills.save).toHaveBeenCalledTimes(2);
+    await act(async () => { done(); await settle(); });
+
+    personal = saved;
+    await act(async () => { openPersonal(); await settle(); });
+    vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
+    await act(async () => { button(modal(), "Delete").click(); await settle(); }); expect(skills.remove).not.toHaveBeenCalled();
+    await act(async () => { button(modal(), "Delete").click(); await settle(); });
+    expect(skills.remove).toHaveBeenCalledExactlyOnceWith(saved, expect.any(AbortSignal));
+    await act(async () => { openPersonal(); await settle(); });
+    expect(modal().querySelector('[role="alert"]')?.textContent).toContain("This skill is no longer available.");
+    expect(modal().querySelector("textarea")).toBeNull(); expect(skills.list).not.toHaveBeenCalled(); expect(api.save).not.toHaveBeenCalled();
+    await act(async () => { done(); await settle(); });
     await act(async () => check("Shared report").click()); await act(async () => { await vi.advanceTimersByTimeAsync(800); await settle(); });
     expect(current.skills).toEqual({ mode: "allowlist", ids: ["shared-report"] });
     await act(async () => check("Server").click()); await act(async () => { await vi.advanceTimersByTimeAsync(800); await settle(); });
@@ -366,7 +422,7 @@ describe("PartnersPage", () => {
       savePreferences: vi.fn(async (base, patch) => { owner.memoryEnabled = patch.enabled ?? base.enabled; return { ...base, ...patch, owner, revision: 6n }; }) };
     const factory = vi.fn((_id: string, ownerKey: string) => ({ ...api, ownerKey }));
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
-    const view = await mount({ partners: [selected], focusPartnerId: selected.id, controllerOverrides: { partnerMemoryApi: factory } });
+    const view = await mount({ strict: true, partners: [selected], focusPartnerId: selected.id, controllerOverrides: { partnerMemoryApi: factory } });
     await act(async () => { button(document.body, "partners.profileSettings").click(); await settle(); });
     await act(async () => { button(document.body, "Saved memories").click(); await settle(); });
     expect(factory).toHaveBeenCalledWith(selected.id, expect.any(String));
@@ -380,6 +436,8 @@ describe("PartnersPage", () => {
     await act(async () => { button(modal(), "Edit").click(); await settle(); });
     const body = required(modal().querySelector<HTMLTextAreaElement>("textarea"));
     await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(body, "My release steps."); body.dispatchEvent(new Event("input", { bubbles: true })); });
+    await act(async () => { view.root.render(<StrictMode>{page({ ...view.app, state: { ...view.app.state } }, snapshot(), selected.id)}</StrictMode>); await settle(); });
+    expect(modal().querySelector("textarea")?.value).toBe("My release steps.");
     entry = { ...entry!, revision: 4n, body: "Updated by the partner." };
     await act(async () => { button(modal(), "Done").click(); await settle(); });
     expect(api.save).not.toHaveBeenCalled(); expect(modal().textContent).toContain("Updated by the partner.");
@@ -397,7 +455,7 @@ describe("PartnersPage", () => {
     await act(async () => { button(modal(), "Delete memory").click(); await settle(); }); expect(api.remove).not.toHaveBeenCalled();
     await act(async () => { button(modal(), "Delete memory").click(); await settle(); }); expect(api.remove).toHaveBeenCalledOnce();
     expect(modal().textContent).toContain("No saved memories."); expect(localStorage.length).toBe(0);
-    await act(async () => { view.root.render(page(controller({}, "next-node"), snapshot(), selected.id)); await settle(); });
+    await act(async () => { view.root.render(<StrictMode>{page(controller({}, "next-node"), snapshot(), selected.id)}</StrictMode>); await settle(); });
     expect(document.body.querySelector(".partner-memory")).toBeNull();
   });
   it("imports all paged categories from the actual directory entry and reopens the original saved task after closing an accepted request", async () => {
@@ -411,7 +469,7 @@ describe("PartnersPage", () => {
     let result: PartnerImportResult | undefined; let finish!: (value: PartnerImportResult) => void;
     const api: PartnerImportApi = { ownerKey: "", newRequestId: vi.fn(() => "directory_import_000001"), sources: vi.fn(async () => [create(PartnerImportSourceSchema, { id: "source", name: "Native analyst" })]),
       preview: vi.fn(async () => preview), status: vi.fn(async () => result), retry: vi.fn(), start: vi.fn(() => new Promise<PartnerImportResult>(resolve => { finish = resolve; })) };
-    const view = await mount({ partners: [], controllerOverrides: { partnerImportApi: (ownerKey: string) => ({ ...api, ownerKey }) } });
+    const view = await mount({ strict: true, partners: [], controllerOverrides: { partnerImportApi: (ownerKey: string) => ({ ...api, ownerKey }) } });
     await act(async () => { button(view.host, "Import a local agent").click(); await settle(); });
     await act(async () => { button(document.body, "Native analyst").click(); await settle(); });
     await act(async () => button(document.body, "Memory · 25 / 25").click());
@@ -434,7 +492,7 @@ describe("PartnersPage", () => {
   it("keeps paused partners in the roster and requires current confirmation before resuming", async () => {
     let current = partner({ lifecycle: "paused", pauseCleanupPending: false });
     const resume = vi.fn(async () => ({ partner: current = { ...current, lifecycle: "active", pauseCleanupPending: undefined, revision: current.revision + 1n }, directory: directory() }));
-    const view = await mount({ partners: [current], controllerOverrides: { getPartner: vi.fn(async () => current), setPartnerLifecycle: resume } });
+    const view = await mount({ strict: true, partners: [current], controllerOverrides: { getPartner: vi.fn(async () => current), setPartnerLifecycle: resume } });
     expect(view.host.textContent).toContain("Paused"); expect([...view.host.querySelectorAll("button")].some(value => value.textContent === "partners.restartAction")).toBe(false);
     await act(async () => { button(view.host, "Resume partner").click(); await settle(); });
     const modal = required(document.body.querySelector<HTMLElement>('[role="dialog"]'));
@@ -1069,6 +1127,7 @@ async function mountPermissionProfile() {
 }
 
 async function mount(overrides: {
+  readonly strict?: boolean;
   readonly partners: readonly PartnerProfileView[];
   readonly pageSnapshot?: AppSnapshot;
   readonly focusPartnerId?: string;
@@ -1090,7 +1149,8 @@ async function mount(overrides: {
     ...(overrides.setPartnerLifecycle === undefined ? {} : { setPartnerLifecycle: overrides.setPartnerLifecycle }),
     ...overrides.controllerOverrides
   });
-  await act(async () => { root.render(page(app, overrides.pageSnapshot ?? snapshot(), overrides.focusPartnerId)); await settle(); });
+  const content = page(app, overrides.pageSnapshot ?? snapshot(), overrides.focusPartnerId);
+  await act(async () => { root.render(overrides.strict ? <StrictMode>{content}</StrictMode> : content); await settle(); });
   return { host, navigate, root, app };
 }
 

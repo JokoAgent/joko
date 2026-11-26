@@ -47,7 +47,7 @@ import { createPartnerHomeApi, PartnerHomeService } from "@joko/contracts";
 import { createPartnerGroupApi, PartnerGroupService } from "@joko/contracts";
 import { createPartnerMemoryApi } from "@joko/contracts";
 import { projectPartnerLearningFeedback } from "@joko/contracts";
-import { createPartnerConnectionsApi } from "@joko/contracts";
+import { createPartnerConnectionsApi, createPartnerSkillsApi } from "@joko/contracts";
 import { base64Encode } from "@bufbuild/protobuf/wire";
 import { mapPartnerAvatar, protoPartnerAvatar, type PartnerAvatarImageView } from "./partner-avatar.js";
 import { mapPartnerWorkingStatus } from "./partner-working-status.js";
@@ -6311,6 +6311,14 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return createPartnerMemoryApi({ rpc: createClient(PartnerService, transport), partnerId, ownerKey, assertCurrent: signal => {
       signal.throwIfAborted();
       if (this.#transport !== transport || this.#abort?.signal.aborted) throw new GatewayError("Memory connection owner changed.");
+    } });
+  }
+
+  partnerSkillsApi(partnerId: string, ownerKey: string) {
+    const transport = this.requireTransport(), connection = this.#abort;
+    return createPartnerSkillsApi({ rpc: createClient(PartnerService, transport), partnerId, ownerKey, assertCurrent: signal => {
+      signal.throwIfAborted();
+      if (this.#transport !== transport || this.#abort !== connection || connection?.signal.aborted) throw new GatewayError("Skill connection owner changed.");
     } });
   }
 

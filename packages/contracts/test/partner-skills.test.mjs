@@ -90,3 +90,49 @@ test("a confirmed personal save may become read-only without saving the preview,
   assert.equal(await invalid.editor.save(), false); assert.equal(invalid.editor.state.error, "failed"); assert.equal(invalid.editor.editable, true);
   assert.equal(invalid.editor.state.draft.body, "Keep this rejected draft."); invalid.editor.dispose();
 });
+
+test("a lost personal skill save followed by a complete read-only readback leaves the editor in preview", async () => {
+  for (const disconnected of [false, true]) {
+    const f = fixture(), read = f.api.read, save = f.api.save;
+    await f.editor.open("skill"); f.editor.edit(); f.editor.change({ body: "Saved before archiving." });
+    let offline = false;
+    f.api.save = async (...args) => {
+      const result = await save(...args);
+      f.current({ ...result, owner: { ...result.owner, readOnly: true }, readOnly: true, bodyBytes: BigInt(Buffer.byteLength(result.body)) });
+      offline = disconnected;
+      throw Error("Lost save acknowledgement");
+    };
+    f.api.read = async (...args) => { if (offline) throw Error("Disconnected"); return read(...args); };
+    assert.equal(await f.editor.save(), !disconnected);
+    if (disconnected) {
+      assert.equal(f.editor.state.error, "unknown");
+      offline = false; await f.editor.refresh();
+    }
+    assert.equal(f.editor.state.saved, true);
+    assert.equal(f.editor.state.view, "detail");
+    assert.equal(f.editor.state.draft, undefined);
+    assert.equal(f.editor.state.detail.body, "Saved before archiving.");
+    assert.equal(f.editor.editable, false);
+    assert.equal(f.writes(), 1);
+    f.editor.dispose();
+  }
+});
+
+test("a read-only preview matching the visible draft cannot confirm an unknown file write", async () => {
+  const f = fixture(), preview = "x".repeat(12_000) + "\n…";
+  await f.editor.open("skill"); f.editor.edit(); f.editor.change({ body: preview });
+  f.api.save = async () => {
+    const entry = f.current();
+    f.current({ ...entry, body: preview, bodyBytes: 54_000n, readOnly: true, summary: { ...entry.summary, revision: 4n } });
+    throw Error("Lost save acknowledgement");
+  };
+  assert.equal(await f.editor.save(), false);
+  assert.equal(f.editor.state.error, "changed");
+  assert.equal(f.editor.state.saved, false);
+  assert.equal(f.editor.state.draft.body, preview);
+  assert.equal(f.editor.state.latest.bodyBytes, 54_000n);
+  f.editor.useLatest();
+  assert.equal(f.editor.state.view, "detail");
+  assert.equal(f.editor.state.draft, undefined);
+  f.editor.dispose();
+});

@@ -6975,6 +6975,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   partnerGroupApi(ownerKey: string): import("@joko/contracts").PartnerGroupApi;
   uploadPartnerGroupFile(file: File, signal: AbortSignal): Promise<import("@joko/contracts").BlobRef>;
   partnerMemoryApi(partnerId: string, ownerKey: string): import("@joko/contracts").PartnerMemoryApi;
+  partnerSkillsApi(partnerId: string, ownerKey: string): import("@joko/contracts").PartnerSkillsApi;
   partnerConnectionsApi(partnerId: string, ownerKey: string): import("@joko/contracts").PartnerConnectionsApi;
   partnerImportApi(ownerKey: string): import("@joko/contracts").PartnerImportApi;
   partnerHomeApi(ownerKey: string): import("@joko/contracts").PartnerHomeApi;

@@ -15,14 +15,16 @@ export function PartnerMemoryDialog({ controller, partner, ownerKey, onClose }: 
 }): JSX.Element {
   const editor = useMemo(() => new PartnerMemoryEditor(controller.partnerMemoryApi(partner.id, ownerKey), {
     partnerId: partner.id, homeTargetId: partner.homeTargetId, canonicalSessionId: partner.canonicalSessionId!
-  }), [controller, ownerKey, partner.id, partner.homeTargetId, partner.canonicalSessionId]);
+  }), [ownerKey, partner.id, partner.homeTargetId, partner.canonicalSessionId]);
   const state = useSyncExternalStore(editor.subscribe, editor.snapshot); const foreground = usePartnerDocumentForeground();
   const [composing, setComposing] = useState(false); const composingRef = useRef(false);
   const [compositionDraft, setCompositionDraft] = useState<MemoryDraft>(); const compositionDraftRef = useRef<MemoryDraft | undefined>(undefined);
   const connected = foreground && controller.state.connectionState === "connected";
   const m = partnerMemoryMessages(controller.state.effectiveLocale);
-  useEffect(() => { void editor.refresh(); return () => editor.dispose(); }, [editor]);
-  useEffect(() => { if (connected) editor.activate(); else editor.suspend(); }, [editor, connected]);
+  useEffect(() => {
+    if (connected) { editor.activate(); void editor.refresh(); } else editor.suspend();
+    return () => editor.suspend();
+  }, [editor, connected]);
   useEffect(() => {
     if (!connected || composing || state.view !== "edit" || !state.draft || !editor.dirty || !editor.writable || !validMemoryDraft(state.draft)) return;
     const timer = setTimeout(() => { if (!composingRef.current) void editor.save(); }, 800);

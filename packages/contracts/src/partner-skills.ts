@@ -73,10 +73,19 @@ const draftOf = (value: PersonalSkillDraft): PersonalSkillDraft => ({ name: valu
 const same = (a: PersonalSkillDraft, b: PersonalSkillDraft) => {
   const first = draftOf(a), second = draftOf(b); return first.name === second.name && first.description === second.description && first.body === second.body;
 };
-const acknowledged = (value: PersonalSkillDetail, draft: PersonalSkillDraft) => same(value, draft)
+const previewLimit = 12_000, previewSuffix = "\n…";
+function matchesReadback(value: PersonalSkillDetail, draft: PersonalSkillDraft): boolean {
+  if (!same(value, draft)) return false;
+  if (!value.readOnly) return true;
+  // A bounded preview can look exactly like a submitted body, including its suffix.
+  const possiblePreview = value.body.endsWith(previewSuffix) && value.body.length > previewLimit
+    && value.body.length <= previewLimit + previewSuffix.length;
+  return !possiblePreview && value.bodyBytes === BigInt(new TextEncoder().encode(value.body).byteLength);
+}
+const acknowledged = (value: PersonalSkillDetail, draft: PersonalSkillDraft) => matchesReadback(value, draft)
   || value.readOnly && value.name === draft.name.trim() && value.description === draft.description.trim()
     && value.bodyBytes === BigInt(new TextEncoder().encode(draft.body.trim()).byteLength)
-    && value.body === `${draft.body.trim().slice(0, 12_000).replace(/[\uD800-\uDBFF]$/u, "")}${draft.body.trim().length > 12_000 ? "\n…" : ""}`;
+    && value.body === `${draft.body.trim().slice(0, previewLimit).replace(/[\uD800-\uDBFF]$/u, "")}${draft.body.trim().length > previewLimit ? previewSuffix : ""}`;
 const changed = (a: PersonalSkillDetail, b: PersonalSkillDetail) => a.summary.id !== b.summary.id || a.owner.revision !== b.owner.revision
   || a.summary.revision !== b.summary.revision || a.summary.contentRevision !== b.summary.contentRevision || a.readOnly !== b.readOnly || !same(a, b);
 export interface PartnerSkillsState { readonly busy: boolean; readonly view: "list" | "detail" | "edit"; readonly query: string;
@@ -96,6 +105,11 @@ export class PartnerSkillsEditor {
   #owner(value: PersonalSkillsOwner) { if (value.partnerId !== this.initial.partnerId || value.homeTargetId !== this.initial.homeTargetId || value.canonicalSessionId !== this.initial.canonicalSessionId) throw new Error("Personal skill owner changed."); }
   #begin() { this.#request?.abort(); const request = new AbortController(); this.#request = request; this.#set({ busy: true, saved: false }); return request; }
   #current(request: AbortController) { return !this.#disposed && this.#active && this.#request === request && !request.signal.aborted; }
+  #finishSave(value: PersonalSkillDetail) {
+    this.#submitted = undefined;
+    this.#set({ detail: value, draft: value.readOnly ? undefined : draftOf(value), view: value.readOnly ? "detail" : "edit",
+      latest: undefined, error: undefined, requiresRefresh: false, saved: true });
+  }
   #finishRemoval(id: string) {
     let page = this.state.page;
     if (page) {
@@ -133,8 +147,8 @@ export class PartnerSkillsEditor {
         return;
       }
       this.#owner(value.owner);
-      if (this.#submitted?.draft && same(value, this.#submitted.draft)) {
-        this.#submitted = undefined; this.#set({ detail: value, draft: draftOf(value), latest: undefined, error: undefined, requiresRefresh: false, saved: true });
+      if (this.#submitted?.draft && this.#submitted.base.summary.id === id && matchesReadback(value, this.#submitted.draft)) {
+        this.#finishSave(value);
       } else if (reconcile && this.dirty && this.state.detail && changed(this.state.detail, value)) {
         this.#submitted = undefined; this.#set({ latest: value, error: "changed", requiresRefresh: false });
       } else {
@@ -173,8 +187,7 @@ export class PartnerSkillsEditor {
       if (draft) {
         const result = await this.api.save(base, draft, request.signal); if (!this.#current(request)) return false; this.#owner(result.owner);
         if (!acknowledged(result, draft)) throw new Error("Skill save acknowledgement changed.");
-        this.#submitted = undefined; this.#set({ detail: result, draft: result.readOnly ? undefined : draftOf(result),
-          ...(result.readOnly ? { view: "detail" as const } : {}), error: undefined, saved: true, requiresRefresh: false });
+        this.#finishSave(result);
       } else {
         await this.api.remove(base, request.signal); if (!this.#current(request)) return false;
         this.#finishRemoval(base.summary.id);
@@ -190,10 +203,7 @@ export class PartnerSkillsEditor {
           const value = await this.api.read(base.summary.id, request.signal); if (!this.#current(request)) return false;
           if (value) this.#owner(value.owner);
           if (!draft && !value) { this.#finishRemoval(base.summary.id); return true; }
-          if (draft && value && same(value, draft)) {
-            this.#submitted = undefined; this.#set({ detail: value, draft: draftOf(value),
-              error: undefined, requiresRefresh: false, saved: true }); return true;
-          }
+          if (draft && value && matchesReadback(value, draft)) { this.#finishSave(value); return true; }
           this.#submitted = undefined; this.#set({ latest: value, error: value ? "changed" : "missing", requiresRefresh: !value });
         } catch { if (this.#current(request)) this.#set({ error: "unknown", requiresRefresh: true }); }
       } else this.#set({ error: "failed", requiresRefresh: true });

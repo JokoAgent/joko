@@ -29,8 +29,10 @@ export function PartnerResumeDialog({ controller, ownerKey, foreground, partner,
   const online = foreground && controller.state.connectionState === "connected";
   const m = partnerResumeMessages(controller.state.effectiveLocale);
   const notified = useRef<bigint | undefined>(undefined);
-  useEffect(() => { if (online) editor.activate(); else editor.suspend(); }, [editor, online]);
-  useEffect(() => () => editor.dispose(), [editor]);
+  useEffect(() => {
+    if (online) editor.activate(); else editor.suspend();
+    return () => editor.suspend();
+  }, [editor, online]);
   useEffect(() => { current.current.onBusyChange?.(online && editor.busy); }, [online, state.phase]);
   useEffect(() => { if (online && state.phase === "completed" && state.profile && notified.current !== state.profile.revision) {
     notified.current = state.profile.revision; current.current.onChanged(state.profile);

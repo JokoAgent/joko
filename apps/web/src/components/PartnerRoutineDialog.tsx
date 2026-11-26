@@ -14,23 +14,24 @@ export function PartnerRoutineDialog({ controller, partnerId, ownerKey, onClose,
   readonly controller: AppController; readonly partnerId: string; readonly ownerKey: string; readonly onClose: () => void;
   readonly ownerDocument?: Document;
 }): JSX.Element {
-  const [editor, setEditor] = useState<PartnerRoutineEditor>();
+  const profile = controller.state.activeProfile;
+  const owner = JSON.stringify([ownerKey, partnerId, profile?.id, profile?.serverId, profile?.origin, profile?.deviceId, controller.state.connectionGeneration]);
+  const [binding, setBinding] = useState<{ readonly editor: PartnerRoutineEditor; readonly owner: string; readonly document: Document }>();
   const [nightly, setNightly] = useState<PartnerNightlyLearningEditor>();
   const [failed, setFailed] = useState(false);
   const m = routineMessages(controller.state.effectiveLocale);
   useEffect(() => {
     let current: PartnerRoutineEditor | undefined;
     try {
-      const profile = controller.state.activeProfile;
       if (!profile?.serverId || !profile.deviceId || !profile.id) throw new Error("Routine owner unavailable.");
       const ownerWindow = ownerDocument.defaultView;
       if (ownerWindow === null || ownerWindow.closed) throw new Error("Routine document unavailable.");
       current = new PartnerRoutineEditor(controller.partnerRoutineApi(partnerId, ownerKey),
         new RoutineCreationReceipts(ownerWindow.localStorage, JSON.stringify([profile.serverId, profile.id, profile.deviceId, new URL(profile.origin).href])), partnerId);
-      setEditor(current); setFailed(false);
-    } catch { setFailed(true); }
+      setBinding({ editor: current, owner, document: ownerDocument }); setFailed(false);
+    } catch { setBinding(undefined); setFailed(true); }
     return () => current?.dispose();
-  }, [controller, partnerId, ownerKey, ownerDocument]);
+  }, [owner, ownerDocument]);
   useEffect(() => {
     try {
       const api = controller.partnerAutonomyApi?.(ownerKey).nightlyLearning?.(partnerId);
@@ -38,7 +39,8 @@ export function PartnerRoutineDialog({ controller, partnerId, ownerKey, onClose,
       const next = new PartnerNightlyLearningEditor(api); setNightly(next);
       return () => next.dispose();
     } catch { setNightly(undefined); }
-  }, [controller, ownerKey, partnerId]);
+  }, [owner, ownerDocument]);
+  const editor = binding?.owner === owner && binding.document === ownerDocument ? binding.editor : undefined;
   const currentNightly = nightly?.api.ownerKey === ownerKey && nightly.api.partnerId === partnerId ? nightly : undefined;
   return editor ? <RoutineContent editor={editor} connected={controller.state.connectionState === "connected"} m={m} onClose={onClose} ownerDocument={ownerDocument}
     nightly={currentNightly} locale={controller.state.effectiveLocale} onOpenSession={sessionId => { onClose(); controller.navigate({ kind: "session", sessionId }); }} />

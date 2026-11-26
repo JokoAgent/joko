@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, createElement } from "react";
+import { act, createElement, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
 import { ListPartnerRoutinesResponseSchema, PartnerRoutineSchema, ListPartnerRoutineRunsResponseSchema,
@@ -24,10 +24,14 @@ function fixture(nightly?: PartnerNightlyLearningApi) {
       catalog = { ...catalog, routines: [routine] }; return routine;
     }), run: vi.fn(async () => {}), remove: vi.fn(async () => {}), history: vi.fn(async () => create(ListPartnerRoutineRunsResponseSchema)),
     lookup: vi.fn(async () => create(GetPartnerRoutineCreationResponseSchema)), retire: vi.fn(async () => create(RetirePartnerRoutineCreationResponseSchema, { retired: true })) };
-  const close = vi.fn(); const state = { effectiveLocale: "en", connectionState: "connected", activeProfile: { id: "profile", serverId: "server", deviceId: "device", origin: "http://127.0.0.1:7319" } };
-  const controller = { state, partnerRoutineApi: () => api, partnerAutonomyApi: () => ({ nightlyLearning: () => nightly }) } as unknown as AppController;
-  const render = async () => { if (!root) { host = document.createElement("div"); document.body.append(host); root = createRoot(host); }
-    await act(async () => root!.render(createElement(PartnerRoutineDialog, { controller, partnerId: "partner", ownerKey: "owner", onClose: close }))); };
+  const close = vi.fn(); const state = { effectiveLocale: "en", connectionState: "connected", connectionGeneration: 1, activeProfile: { id: "profile", serverId: "server", deviceId: "device", origin: "http://127.0.0.1:7319" } };
+  const render = async (ownerKey = "owner") => {
+    if (!root) { host = document.createElement("div"); document.body.append(host); root = createRoot(host); }
+    const controller = { state: { ...state }, partnerRoutineApi: () => ({ ...api, ownerKey }),
+      partnerAutonomyApi: () => ({ nightlyLearning: () => nightly && { ...nightly, ownerKey } }) } as unknown as AppController;
+    await act(async () => root!.render(createElement(StrictMode, null,
+      createElement(PartnerRoutineDialog, { controller, partnerId: "partner", ownerKey, onClose: close }))));
+  };
   return { api, state, close, render };
 }
 function button(label: string) { const value = [...document.querySelectorAll<HTMLButtonElement>("button")].find(item => item.textContent === label || item.getAttribute("aria-label") === label); expect(value, label).toBeTruthy(); return value!; }
@@ -41,6 +45,38 @@ async function fill(label: string, value: string) { const field = input(label);
     Object.getOwnPropertyDescriptor(prototype, "value")!.set!.call(field, value); field.dispatchEvent(new Event(field instanceof HTMLSelectElement ? "change" : "input", { bubbles: true })); }); }
 
 describe("Partner routine settings", () => {
+  it("keeps a routine draft and its in-flight nightly review across a same-owner controller update", async () => {
+    const nightly = create(GetPartnerNightlyLearningResponseSchema, { partnerId: "partner", writable: true,
+      schedule: { enabled: true, frequency: NightlyLearningFrequency.DAILY }, timezone: "Europe/Berlin" });
+    let finish!: () => void;
+    const review = new Promise<void>(resolve => { finish = resolve; });
+    const update = vi.fn<PartnerNightlyLearningApi["update"]>(async current => { await review; return { ...current, running: true }; });
+    const read = vi.fn(async () => nightly);
+    const f = fixture({ ownerKey: "owner", partnerId: "partner", read, update, newRequestId: () => "review-once" });
+    await f.render();
+    await fill("Name", "Draft routine"); await fill("Instructions", "Review the open tasks");
+    await press("Review now");
+    const signal = update.mock.calls[0]![2], reads = read.mock.calls.length;
+    await f.render();
+    expect(input("Name").value).toBe("Draft routine");
+    expect(input("Instructions").value).toBe("Review the open tasks");
+    expect(signal.aborted).toBe(false);
+    expect(read).toHaveBeenCalledTimes(reads);
+    expect(button("Review now").disabled).toBe(true);
+    await act(async () => finish());
+    expect(document.body.textContent).toContain("Reviewing");
+    expect(update).toHaveBeenCalledExactlyOnceWith(nightly, { case: "runRequestId", value: "review-once" }, signal);
+    await press("Save");
+    expect(f.api.save).toHaveBeenCalledExactlyOnceWith(3n, expect.objectContaining({ name: "Draft routine", prompt: "Review the open tasks" }),
+      { requestId: expect.any(String) }, expect.any(AbortSignal));
+    await fill("Name", "Previous owner's edit"); await press("Close");
+    expect(document.querySelector('[role="alertdialog"]')).toBeTruthy();
+    f.state.connectionGeneration++; await f.render();
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(input("Name").value).toBe("");
+    expect(button("Review now").disabled).toBe(false);
+    expect(f.api.save).toHaveBeenCalledTimes(1);
+  });
   it("updates the current Partner's nightly schedule and starts one review through the routines dialog", async () => {
     const nightly = create(GetPartnerNightlyLearningResponseSchema, { partnerId: "partner",
       partnerRevision: { value: 3n }, stateRevision: { value: 4n }, scheduleRevision: { value: 5n }, timezone: "Europe/Berlin",

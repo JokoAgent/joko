@@ -4624,6 +4624,7 @@ export function useAppController(): AppController {
     extensionTaskApi: () => catalogGateway().extensionTaskApi?.(),
     uploadPartnerGroupFile: (file, signal) => gateway().uploadPartnerGroupFile(file, signal),
     partnerMemoryApi: (partnerId, ownerKey) => gateway().partnerMemoryApi(partnerId, ownerKey),
+    partnerSkillsApi: (partnerId, ownerKey) => gateway().partnerSkillsApi(partnerId, ownerKey),
     partnerConnectionsApi: (partnerId, ownerKey) => gateway().partnerConnectionsApi(partnerId, ownerKey),
     partnerImportApi: ownerKey => gateway().partnerImportApi(ownerKey),
     partnerHomeApi: ownerKey => gateway().partnerHomeApi(ownerKey),

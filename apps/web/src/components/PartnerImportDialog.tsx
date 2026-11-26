@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { PartnerImportEditor, PartnerImportReceipts, PartnerImportCategory, PartnerImportStatus, PartnerImportCheckStatus,
   areImportEntriesSelected, partnerImportMessages, importCategoryLabel, importCheckLabel, importReasonLabel, type PartnerImportResult } from "@joko/contracts";
 import type { AppController } from "../controller.js";
@@ -9,22 +9,30 @@ import "./partner-import.css";
 
 const categories = [PartnerImportCategory.PERSONALITY, PartnerImportCategory.MEMORY, PartnerImportCategory.SKILLS,
   PartnerImportCategory.CONNECTIONS, PartnerImportCategory.AUTOMATIONS, PartnerImportCategory.BOTS];
-export function PartnerImportDialog({ controller, ownerKey, foreground, t, onClose, onCreated }: {
+interface PartnerImportDialogProps {
   readonly controller: AppController; readonly ownerKey: string; readonly foreground: boolean; readonly t: Translator;
   readonly onClose: () => void; readonly onCreated: (result: PartnerImportResult) => void;
-}) {
-  const m = partnerImportMessages(controller.state.effectiveLocale); const latest = useRef({ onClose, onCreated }); latest.current = { onClose, onCreated };
-  const editor = useMemo(() => {
+}
+export function PartnerImportDialog(props: PartnerImportDialogProps) {
+  const { controller, ownerKey, onClose } = props;
+  const [editor, setEditor] = useState<PartnerImportEditor>();
+  useEffect(() => {
     const node = controller.state.activeProfile;
     const nodeKey = JSON.stringify([node?.serverId, node?.id, node?.deviceId, node?.origin]);
-    return new PartnerImportEditor(controller.partnerImportApi(ownerKey), new PartnerImportReceipts({
+    const current = new PartnerImportEditor(controller.partnerImportApi(ownerKey), new PartnerImportReceipts({
       getItem: key => window.localStorage.getItem(key), setItem: (key, value) => window.localStorage.setItem(key, value), removeItem: key => window.localStorage.removeItem(key),
       exclusive: async (key, action) => await (navigator.locks ? navigator.locks.request(key, action) : action()),
     }, nodeKey));
+    setEditor(current);
+    return () => current.dispose();
   }, [ownerKey]);
+  return editor?.api.ownerKey === ownerKey ? <ImportContent {...props} editor={editor} />
+    : <Modal open title={partnerImportMessages(controller.state.effectiveLocale).title} onClose={onClose}><Spinner /></Modal>;
+}
+function ImportContent({ controller, ownerKey, foreground, t, onClose, onCreated, editor }: PartnerImportDialogProps & { readonly editor: PartnerImportEditor }) {
+  const m = partnerImportMessages(controller.state.effectiveLocale); const latest = useRef({ onClose, onCreated }); latest.current = { onClose, onCreated };
   const state = useSyncExternalStore(editor.subscribe, editor.snapshot); const [preparing, setPreparing] = useState(false);
   useEffect(() => { if (foreground) void editor.load(); else editor.suspend(); return () => editor.suspend(); }, [editor, foreground]);
-  useEffect(() => () => editor.dispose(), [editor]);
   const opened = useRef<string | undefined>(undefined);
   const result = state.result; const saved = new Set(result?.savedEntryIds);
   const incomplete = state.preview ? [...state.selected].some(id => !saved.has(id)) : result?.checks.some(check => check.status === PartnerImportCheckStatus.NEEDS_ATTENTION && !saved.has(check.entryId) && check.entryId !== "import");

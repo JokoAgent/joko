@@ -860,7 +860,7 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
       <div className="modal__actions"><Button onClick={() => finishLeave(false)}>{t("partners.leave.stay")}</Button><Button tone="danger" onClick={() => finishLeave(true)}>{t("partners.leave.discard")}</Button></div>
     </Modal>
     {permissionConfirmation.dialog}
-    {connectionsVisible && <PartnerConnectionsDialog key={`${ownerKey}:${partner.id}`} controller={controller} partner={baseline}
+    {connectionsVisible && <PartnerConnectionsDialog key={JSON.stringify([ownerKey, partner.id, baseline.homeTargetId, baseline.canonicalSessionId])} controller={controller} partner={baseline}
       ownerKey={ownerKey} focusSkills={initialLearningDestination === "skills"} onClose={() => setConnectionsVisible(false)} />}
     {memoryVisible && <PartnerMemoryDialog key={`${ownerKey}:${partner.id}`} controller={controller} partner={baseline} ownerKey={ownerKey} onClose={() => setMemoryVisible(false)} />}
     {resumeVisible && <PartnerResumeDialog controller={controller} ownerKey={ownerKey} foreground={restartForeground} partner={baseline}
