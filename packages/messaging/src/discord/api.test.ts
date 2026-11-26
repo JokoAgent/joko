@@ -29,7 +29,7 @@ describe("DiscordApi", () => {
       token: TOKEN,
       fetch: (async () => jsonResponse({ message: "slow down", retry_after: 2.5 }, 429)) as typeof globalThis.fetch
     });
-    await expect(limited.currentUser()).rejects.toMatchObject({
+    await expect(limited.sendMessage("123456789012345678", { content: "hello" })).rejects.toMatchObject({
       code: "rate_limited",
       options: { retryAfterMs: 2_500, effect: "none", retryable: true }
     });

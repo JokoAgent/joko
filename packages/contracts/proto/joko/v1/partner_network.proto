@@ -103,6 +103,7 @@ message PartnerNetworkRoom {
   string organizer_id = 18;
   bool single_speaker = 19;
   bool allow_mention_all_partners = 20;
+  bool supports_mention_audiences = 21;
 }
 message PartnerNetworkSnapshot {
   PartnerNetworkRoom room = 1;

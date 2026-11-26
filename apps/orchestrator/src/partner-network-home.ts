@@ -130,7 +130,9 @@ export class PartnerNetworkHome {
     return create(contract.ReadPartnerNetworkFailuresResponseSchema, { ...response, $typeName: undefined });
   }
   async send(request: contract.SendPartnerNetworkRequest, auth: PartnerNetworkAuthority): Promise<contract.PartnerNetworkMessage> {
-    const row = this.#room(request.joinId, request.roomId), response = await this.#client(row, auth).client.sendPartnerNetwork({ ...request, $typeName: undefined }, { signal: auth.signal }); this.#check(auth);
+    const row = this.#room(request.joinId, request.roomId);
+    if (request.mentionAllPartners && !contract.supportsNetworkMentionAudiences(this.#public(row))) throw new ConnectError("This room authority has not advertised companion broadcasts.", Code.FailedPrecondition);
+    const response = await this.#client(row, auth).client.sendPartnerNetwork({ ...request, $typeName: undefined }, { signal: auth.signal }); this.#check(auth);
     if (!response.message) throw invalid(); return response.message;
   }
   async plan(request: contract.PlanPartnerNetworkRequest, auth: PartnerNetworkAuthority): Promise<contract.PlanPartnerNetworkResponse> {
@@ -146,6 +148,7 @@ export class PartnerNetworkHome {
   }
   async manage(request: contract.ManagePartnerNetworkRequest, auth: PartnerNetworkAuthority): Promise<contract.PartnerNetworkRoom> {
     const row = this.#room(request.joinId, request.roomId);
+    if (request.action === "partner-broadcast" && !contract.supportsNetworkMentionAudiences(this.#public(row))) throw new ConnectError("This room authority has not advertised companion broadcasts.", Code.FailedPrecondition);
     let partner: contract.PartnerNetworkActor | undefined;
     if (request.action === "add-partner") { const local = this.options.partner(request.actorId); partner = create(contract.PartnerNetworkActorSchema,
       { partnerId: local.id, name: local.name, description: local.description }); }

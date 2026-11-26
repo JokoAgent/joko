@@ -16,7 +16,12 @@ vi.mock("react-native", async () => {
   return { View: box, ScrollView: box, Text: ({ children, accessibilityRole }: { children?: ReactNode; accessibilityRole?: string }) => createElement("span", { role: accessibilityRole }, children),
     ActivityIndicator: () => createElement("span", {}, "Loading"), StyleSheet: { create: (styles: unknown) => styles }, Linking: { openURL: native.openURL }, Alert: { alert: () => undefined },
     Pressable: ({ children, accessibilityRole, accessibilityState, disabled, onPress }: { children?: ReactNode; accessibilityRole?: string; accessibilityState?: { checked?: boolean }; disabled?: boolean; onPress(): void }) => createElement("button", { role: accessibilityRole, "aria-checked": accessibilityState?.checked, disabled, onClick: onPress }, children),
-    TextInput: ({ value, onChangeText, editable, accessibilityLabel }: { value: string; onChangeText(value: string): void; editable?: boolean; accessibilityLabel?: string }) => createElement("input", { value, disabled: editable === false, "aria-label": accessibilityLabel, onChange: () => {}, onInput: (event: { currentTarget: { value: string } }) => onChangeText(event.currentTarget.value) }),
+    TextInput: ({ value, onChangeText, onSelectionChange, editable, accessibilityLabel }: { value: string; onChangeText(value: string): void;
+      onSelectionChange?(event: { nativeEvent: { selection: { start: number; end: number } } }): void; editable?: boolean; accessibilityLabel?: string }) =>
+      createElement("input", { value, disabled: editable === false, "aria-label": accessibilityLabel, onChange: () => {},
+        onMouseUp: (event: { currentTarget: HTMLInputElement }) => onSelectionChange?.({ nativeEvent: {
+          selection: { start: event.currentTarget.selectionStart!, end: event.currentTarget.selectionEnd! } } }),
+        onInput: (event: { currentTarget: { value: string } }) => onChangeText(event.currentTarget.value) }),
     Modal: ({ visible, children }: { visible: boolean; children?: ReactNode }) => visible ? createElement("div", { role: "dialog" }, children) : null,
     FlatList: React.forwardRef(({ data, renderItem, ListEmptyComponent, ListFooterComponent, ListHeaderComponent }: { data?: readonly unknown[]; renderItem(value: { item: unknown }): ReactNode; ListEmptyComponent?: ReactNode; ListFooterComponent?: ReactNode; ListHeaderComponent?: ReactNode }, ref) => { React.useImperativeHandle(ref, () => ({ scrollToEnd() {} }));
       return createElement("div", {}, ListHeaderComponent, data?.length ? data.map((item, index) => createElement(React.Fragment, { key: index }, renderItem({ item }))) : ListEmptyComponent, ListFooterComponent); }) };
@@ -65,6 +70,16 @@ it("keeps owner settings reachable and hides last-owner leave until transfer or 
   expect(document.querySelector('[role="dialog"]')?.textContent).toContain("Invite my companion"); expect(Array.from(document.querySelectorAll("button")).some(button => button.textContent === "Leave group")).toBe(false);
   await fill("Renamed", "Group name"); await click("Save"); expect(f.manage).toHaveBeenCalledWith(expect.objectContaining({ action: "rename", value: "Renamed", roomId: "room", expectedRevision: 1n }), expect.anything());
 });
+it.each([0, 5])("preserves the remaining external room recipient when deleting the @all at offset %i", async start => {
+  const f = fixture();
+  f.room.members.push(create(contract.PartnerNetworkActorSchema, { id: "person", kind: "human", role: "member", state: "joined", name: "all" }));
+  await mount(f); await click("Shared room"); await fill("@all "); await click("@all");
+  const input = document.querySelector<HTMLInputElement>('[aria-label="Message"]')!;
+  expect(input.value).toBe("@all @all ");
+  await act(async () => { input.setSelectionRange(start, start + 5); input.dispatchEvent(new MouseEvent("mouseup", { bubbles: true })); });
+  await fill("@all "); await click("Send");
+  expect(f.send.mock.calls[0]![0]).toMatchObject({ mentions: start === 0 ? ["person"] : [], mentionAll: start === 5, mentionAllPartners: false });
+});
 it("uses the same people and companion audiences on native sends and retries", async () => {
   const f = fixture(); f.room.allowMentionAllPartners = true;
   f.send.mockRejectedValueOnce(new ConnectError("reply lost", Code.Unavailable));
@@ -75,6 +90,12 @@ it("uses the same people and companion audiences on native sends and retries", a
   expect(f.send.mock.calls[1]![0]).toEqual(original);
   await click("Group settings"); await click("Allow mentioning all companions");
   expect(f.manage).toHaveBeenCalledWith(expect.objectContaining({ action: "partner-broadcast", value: "false" }), expect.anything());
+});
+it.each([false, true])("shows the inactive companion audience switch only when the room supports it (%s)", async supported => {
+  const f = fixture(); f.room.supportsMentionAudiences = supported;
+  await mount(f); await click("Shared room"); await click("Group settings");
+  expect(document.querySelector('[role="dialog"]')?.textContent?.includes("Allow mentioning all companions")).toBe(supported);
+  expect(f.manage).not.toHaveBeenCalled();
 });
 it("opens files using only a current short-lived download URL and never hands a membership bearer to the system", async () => {
   const f = fixture(); f.rows.push(create(contract.PartnerNetworkMessageSchema, { id: "file-message", authorId: "partner", text: "A document", sequence: 1n, attachments: [{ id: "file", name: "report.txt", mediaType: "text/plain", sizeBytes: 12n }] }));

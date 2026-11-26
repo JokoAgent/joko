@@ -145,6 +145,14 @@ describe("Shared conversation UI receipts", () => {
     const original = f.api.sendPartnerNetwork.mock.calls[0]![0]; expect(original).toMatchObject({ mentionAll: true, forcePlan: true });
     await act(async () => { button("Edit", view.element).click(); await settle(); button("Send", view.element).click(); await settle(); }); expect(f.api.sendPartnerNetwork.mock.calls[1]![0]).toEqual(original);
   });
+  it.each([false, true])("shows the disabled-by-default companion audience setting only on a capable authority (%s)", async supported => {
+    const f = setup();
+    f.api.getPartnerNetwork.mockImplementation(async () => create(wire.GetPartnerNetworkResponseSchema, { snapshot: { room: { ...room, supportsMentionAudiences: supported } } }));
+    const view = await mount(<PartnerNetworkPage controller={f.controller} route="network:host:room" t={t} onOpenNavigation={() => {}} />);
+    await act(async () => { button("Group settings", view.element).click(); await settle(); });
+    expect(document.querySelector('[role="dialog"]')!.textContent?.includes("Allow mentioning all companions")).toBe(supported);
+    expect(f.api.managePartnerNetwork).not.toHaveBeenCalled();
+  });
   it("retains invitations on cancelled or failed revocation and invalidates copy only after acknowledgement", async () => {
     const f = setup(), view = await mount(<PartnerNetworkPage controller={f.controller} route="network:host:room" t={t} onOpenNavigation={() => {}} />);
     await act(async () => { button("Group settings", view.element).click(); await settle(); button("Invite people").click(); await settle(); });

@@ -347,7 +347,7 @@ function providerFailure(
     const retryAfterMs = retryAfter(body);
     return new MessagingTransportError("rate_limited", `Discord rate limited the request: ${description}`, {
       retryable: true,
-      effect,
+      effect: "none",
       providerStatus: status,
       ...(retryAfterMs === undefined ? {} : { retryAfterMs })
     });

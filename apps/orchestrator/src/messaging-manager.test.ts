@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  DiscordApi,
   MessagingTransportError,
   TelegramTransport,
   normalizeDiscordUpdates,
@@ -3065,6 +3066,46 @@ describe("MessagingManager", () => {
     expect(transport.sentText.some((entry) => entry.text === "Joko's Discord connection is being disabled.")).toBe(true);
     expect(fixture.store.listMessagingDeliveries().filter((delivery) => delivery.kind === "notice"))
       .toHaveLength(2);
+  });
+
+  it.each(["HTTP 429", "lost response"] as const)("recovers a Discord final delivery after %s according to its effect", async failure => {
+    const transport = new FakeDiscordTransport();
+    const adapter = new ControlledReplyAdapter();
+    let offset = 0;
+    const now = () => Date.now() + offset;
+    const fetcher = vi.fn<typeof fetch>()
+      .mockImplementationOnce(async () => {
+        if (failure === "lost response") throw new TypeError("Connection reset");
+        return Response.json({ retry_after: 60 }, { status: 429 });
+      })
+      .mockImplementation(async () => Response.json({ id: "111111111111111112" }));
+    const api = new DiscordApi({ token: "test-discord-token-for-delivery", fetch: fetcher });
+    const final = "The completed Discord answer";
+    const send = transport.sendTextPart.bind(transport);
+    vi.spyOn(transport, "sendTextPart").mockImplementation(async input => {
+      if (input.text !== final) return send(input);
+      const message = await api.sendMessage(input.address.providerConversationId, { content: input.text });
+      return { providerMessageId: message.id, address: input.address };
+    });
+    const fixture = await createFixture(undefined, () => adapter, () => transport, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, now);
+    const connection = await enableReplyStream(fixture, "discord");
+    await vi.waitFor(() => expect(adapter.context).toBeDefined());
+    const before = now();
+    await adapter.finish(final);
+    const delivery = () => fixture.store.listMessagingDeliveries({ connectionId: connection.id })
+      .find(item => item.dedupeKey.endsWith(":answer"));
+    await vi.waitFor(() => expect(delivery()).toMatchObject({ attempts: 1, status: failure === "HTTP 429" ? "pending" : "unknown" }));
+    const original = delivery()!;
+    if (failure === "HTTP 429") expect(original.availableAt).toBeGreaterThanOrEqual(before + 60_000);
+    await fixture.manager.close();
+    offset = 60_000;
+    const poll = vi.spyOn(transport, "poll");
+    await fixture.restartManager();
+    await vi.waitFor(() => expect(poll).toHaveBeenCalled());
+    expect(fixture.store.getMessagingDelivery(original.id)).toMatchObject(failure === "HTTP 429"
+      ? { status: "sent", attempts: 2, providerMessageId: "111111111111111112" } : { status: "unknown", attempts: 1 });
+    expect(fetcher).toHaveBeenCalledTimes(failure === "HTTP 429" ? 2 : 1);
   });
 
   it("delivers Discord lifecycle notices once per service lifetime on the same connection generation", async () => {

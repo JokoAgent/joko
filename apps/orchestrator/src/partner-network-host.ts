@@ -19,7 +19,7 @@ export function networkRoom(room: NetworkRoom, selfId: string, joinId = ""): con
     revision: BigInt(room.revision), state: room.state, members: room.members.map(networkActor), latestSequence: BigInt(room.latestSequence),
     readSequence: BigInt(self?.readSequence ?? 0), selfId, joinId, replyMode: room.replyMode, speakingMode: room.speakingMode,
     removedFromList: self?.removedFromList ?? false, availability: self?.state === "joined" ? "available" : "denied", updatedAtMs: BigInt(room.updatedAt), unread: self !== undefined && self.unreadSequence > self.readSequence,
-    organizerId: room.organizerId ?? "", singleSpeaker: room.singleSpeaker === true, allowMentionAllPartners: room.allowMentionAllPartners === true });
+    organizerId: room.organizerId ?? "", singleSpeaker: room.singleSpeaker === true, supportsMentionAudiences: true, allowMentionAllPartners: room.allowMentionAllPartners === true });
 }
 function networkActor(actor: NetworkActor): contract.PartnerNetworkActor {
   return create(contract.PartnerNetworkActorSchema, { id: actor.id, kind: actor.kind, name: actor.name, ownerId: actor.ownerId,

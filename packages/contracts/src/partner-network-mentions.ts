@@ -8,6 +8,11 @@
  */
 interface NetworkMention { readonly all: boolean; readonly allPartners: boolean; readonly actorIds: string[]; }
 
+/** Older room authorities could positively grant companion broadcasts before advertising support separately. */
+export function supportsNetworkMentionAudiences(room: { readonly supportsMentionAudiences: boolean; readonly allowMentionAllPartners: boolean }): boolean {
+  return room.supportsMentionAudiences || room.allowMentionAllPartners;
+}
+
 export interface NetworkMentionMember {
   actorId: string;
   name: string;

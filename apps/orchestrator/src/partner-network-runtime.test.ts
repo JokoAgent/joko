@@ -222,6 +222,8 @@ describe("Built-in conversation authority and execution", () => {
   });
   it("uses the generated HTTP owner/Home/guest path, keeps public chat images and file text, and never opens a private lane", async () => {
     const f = await fixture(), png = Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lN8AAAAASUVORK5CYII=", "base64"));
+    expect(f.room.supportsMentionAudiences).toBe(true);
+    expect(f.joined.supportsMentionAudiences).toBe(true);
     const image = await upload(f, png, "image/png", "pixel.png"), text = await upload(f, new TextEncoder().encode("The answer in this document is 42."), "text/plain", "note.txt");
     const source = await f.foreignSend("Read the image and document", [image, text]); await f.network.tick(); await finished(f);
     expect(f.adapter.infer).toHaveBeenCalledTimes(1); const input = f.adapter.infer.mock.calls[0]![0];
@@ -239,13 +241,23 @@ describe("Built-in conversation authority and execution", () => {
     const invitation = (await f.owner.invitePartnerNetwork({ operationId: "lost-invite", roomId: f.room.id, expectedRevision: BigInt(f.host.storage.get(f.room.id).revision), reusable: false, lifetimeMs: 86400_000n })).invitation;
     let lose = true; const requests: string[] = [], digests: string[] = [];
     const connect = (options: PartnerNetworkRemoteOptions) => { const remote = createPartnerNetworkRemote(options); return { ...remote, client: { ...remote.client,
-      acceptPartnerNetwork: async (...args: Parameters<typeof remote.client.acceptPartnerNetwork>) => { requests.push(args[0].operationId!); digests.push(args[0].credentialSha256!); const result = await remote.client.acceptPartnerNetwork(...args); if (lose) { lose = false; throw new ConnectError("reply lost", Code.Unavailable); } return result; } } }; };
+      acceptPartnerNetwork: async (...args: Parameters<typeof remote.client.acceptPartnerNetwork>) => {
+        requests.push(args[0].operationId!); digests.push(args[0].credentialSha256!);
+        const result = await remote.client.acceptPartnerNetwork(...args);
+        if (lose) { lose = false; throw new ConnectError("reply lost", Code.Unavailable); }
+        // A v1 room authority without the additive audience field decodes to false.
+        if (result.room) result.room.supportsMentionAudiences = false;
+        return result;
+      } } }; };
     const options = { ...f.foreignOptions, directory: join(f.root, "lost-home"), serverId: "lost-home", connect }, first = new PartnerNetworkHome(options); await first.initialize();
     const request = create(contract.JoinPartnerNetworkRequestSchema, { operationId: "join-same-after-restart", invitation, displayName: "Lost reply" });
     await expect(first.join(request, authority())).rejects.toMatchObject({ code: Code.Unavailable }); expect(first.directory()[0]?.availability).toBe("joining"); await first.close();
     const disk = await readFile(join(options.directory, "memberships.json"), "utf8"); expect(disk).not.toContain(invitation); expect(disk).not.toContain(parsePartnerNetworkInvitation(invitation).secret); expect(disk).not.toContain("joko-conversation-");
     const restarted = new PartnerNetworkHome(options); await restarted.initialize(); cleanups.push(() => restarted.close());
     const recovered = await restarted.join(request, authority()); expect(recovered.availability).toBe("available"); expect(requests).toEqual([request.operationId, request.operationId]); expect(new Set(digests).size).toBe(1);
+    const target = { roomId: recovered.id, joinId: recovered.joinId, operationId: "unsupported-audience" };
+    await expect(restarted.send(create(contract.SendPartnerNetworkRequestSchema, { ...target, text: "All companions", mentionAllPartners: true }), authority())).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    await expect(restarted.manage(create(contract.ManagePartnerNetworkRequestSchema, { ...target, action: "partner-broadcast", value: "true" }), authority())).rejects.toMatchObject({ code: Code.FailedPrecondition });
     expect(f.host.storage.get(f.room.id).members.filter(actor => actor.homeServerId === "lost-home")).toHaveLength(1);
     await expect(restarted.join({ ...request, displayName: "Changed" }, authority())).rejects.toMatchObject({ code: Code.AlreadyExists });
   });
