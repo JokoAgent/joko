@@ -1377,7 +1377,12 @@ export function useAppController(): AppController {
       // Validate the transport boundary before decrypting a persisted bearer
       // credential. A tampered profile must never redirect an Auth Key to
       // public plain HTTP.
-      const identity = await probeOrchestratorOrigin(safeProfile.origin);
+      // A reloaded Desktop document is opening a known managed node. Give its anonymous
+      // identity check the same deadline as a selected direct connection entry.
+      const identity = safeProfile.managedLocal === true
+        ? await probeOrchestratorOrigin(safeProfile.origin, AbortSignal.any([entryAttempt.signal, AbortSignal.timeout(6_000)]))
+        : await probeOrchestratorOrigin(safeProfile.origin);
+      entryAttempt.signal.throwIfAborted();
       if (gatewayGenerationRef.current !== generation) return false;
       if (safeProfile.serverId !== identity.serverId) {
         if (safeProfile.managedLocal === true) managedRecoveryReason = "identityConflict";

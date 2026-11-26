@@ -91,18 +91,29 @@ it("keeps the prepared backup when a preferred entrance probe finishes after ret
   } finally { directory.mockRestore(); resolve.mockRestore(); verify.mockRestore(); }
 });
 
-it.each(["matching owner", "mismatched owner", "main window"] as const)("chooses the Desktop startup node from the correct authority (%s)", async input => {
+it.each(["matching owner", "mismatched owner", "main window", "delayed managed node", "replaced managed node"] as const)("chooses the Desktop startup node from the correct authority (%s)", async input => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
   localStorage.clear();
   const mainWindow = input === "main window";
+  const managed = input === "delayed managed node" || input === "replaced managed node";
+  if (managed) {
+    vi.useFakeTimers();
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException("Identity probe timed out", "TimeoutError")), ms);
+      return controller.signal;
+    });
+  }
   window.history.replaceState(null, "", mainWindow ? "/#/settings" : "/?sessionWindow=1&bootSession=source-task#/tasks/source-task");
   type WindowOwner = { profileId: string; sessionId: string; draftSlot: number };
   let completeOwner!: (owner: WindowOwner) => void;
   const getOwner = vi.fn(() => new Promise<WindowOwner>(resolve => { completeOwner = resolve; }));
+  const source: ConnectionProfile = { id: "source", serverId: "source-node", deviceId: "source-device", name: "Source",
+    origin: managed ? "http://127.0.0.1:4391" : "https://task-source.example" };
   vi.stubGlobal("jokoDesktop", { sessionWindows: { getOwner }, appInfo: { get: async () => ({ persistentCredentialStorage: true }) },
+    ...(managed ? { managedOrchestrator: { getStatus: async () => ({ state: "ready", connection: { ...source, profileId: source.id } }) } } : {}),
     window: { setZoomFactor: async () => undefined }, discovery: { scan: async () => [] }, capabilities: [] });
-  const source: ConnectionProfile = { id: "source", serverId: "source-node", deviceId: "source-device", name: "Source", origin: "https://task-source.example" };
   const automatic: ConnectionProfile = { id: "automatic", serverId: "automatic-node", deviceId: "automatic-device", name: "Automatic", origin: "https://automatic-node.example" };
   const profiles = [source, automatic];
   const preferences = { ...DEFAULT_UI_PREFERENCES, automaticConnectionTarget: { kind: "profile" as const, profileId: automatic.id } };
@@ -110,9 +121,14 @@ it.each(["matching owner", "mismatched owner", "main window"] as const)("chooses
     readPreferences: async () => preferences, readAuthKey: async () => "credential", saveProfile: async () => undefined,
     loadEndpointTransport: LocalState.prototype.loadEndpointTransport, saveMachineCache: async () => undefined
   } as unknown as LocalState);
-  vi.mocked(probeOrchestratorOrigin).mockImplementation(async origin => {
+  vi.mocked(probeOrchestratorOrigin).mockImplementation(async (origin, signal = AbortSignal.timeout(2_000)) => {
     const profile = profiles.find(candidate => candidate.origin === origin)!;
-    return { serverId: profile.serverId, displayName: profile.name, version: "1", apiVersion: "1", pairingEnabled: false };
+    if (managed && origin === source.origin) {
+      await new Promise(resolve => setTimeout(resolve, 2_500));
+      signal.throwIfAborted();
+    }
+    const serverId = input === "replaced managed node" && origin === source.origin ? "replacement" : profile.serverId;
+    return { serverId, displayName: profile.name, version: "1", apiVersion: "1", pairingEnabled: false };
   });
   const activeProfiles: string[] = [];
   vi.mocked(createOrchestratorGateway).mockImplementation((profile, _key, callbacks) => {
@@ -130,15 +146,20 @@ it.each(["matching owner", "mismatched owner", "main window"] as const)("chooses
     expect(getOwner).toHaveBeenCalledOnce();
     expect(app.state.ready).toBe(false);
     expect(activeProfiles).toEqual([]);
-    await act(async () => completeOwner({ profileId: source.id, sessionId: input === "matching owner" ? "source-task" : "another-task", draftSlot: 0 }));
+    await act(async () => completeOwner({ profileId: source.id, sessionId: input === "mismatched owner" ? "another-task" : "source-task", draftSlot: 0 }));
+    if (managed) {
+      expect(activeProfiles).toEqual([]);
+      await act(async () => vi.advanceTimersByTimeAsync(2_500));
+    }
   } else expect(getOwner).not.toHaveBeenCalled();
-  const expected = mainWindow ? automatic.id : input === "matching owner" ? source.id : undefined;
+  const expected = mainWindow ? automatic.id : input === "matching owner" || input === "delayed managed node" ? source.id : undefined;
   await vi.waitFor(() => {
     expect(app.state.ready).toBe(true);
     expect(app.state.connectionState).toBe(expected === undefined ? "disconnected" : "connected");
   });
   expect(activeProfiles).toEqual(expected === undefined ? [] : [expected]);
   expect(app.state.activeProfile?.id).toBe(expected);
+  if (input === "replaced managed node") expect(app.state.managedOrchestratorStatus).toMatchObject({ state: "recoveryRequired", reason: "identityConflict" });
   expect(app.state.preferences.automaticConnectionTarget).toEqual(preferences.automaticConnectionTarget);
 });
 
