@@ -1218,6 +1218,20 @@ button.code-host-pull-request-summary:focus-visible { outline: 2px solid var(--a
 .timeline:focus-visible { outline: 2px solid var(--accent-edge); outline-offset: -2px; }
 .timeline--empty { display: grid; place-items: center; }
 .timeline__virtual { width: min(calc(100% - 100px), 914px); position: relative; margin: 0 auto; }
+[data-chat-layout="wide"] :is(.session-pane, .new-task-page, .partner-group-page) {
+  --chat-gutter: clamp(20px, calc(25cqw - 155px), 50px);
+  --chat-available: max(0px, calc(100cqw - 2 * var(--chat-gutter)));
+  --chat-column: min(var(--chat-available), max(660px, calc(var(--chat-available) * var(--chat-width-fraction))));
+  --chat-input: calc(var(--chat-column) + 20px);
+}
+[data-chat-layout="wide"] .session-pane .timeline__virtual { width: min(100%, var(--chat-column)); }
+[data-chat-layout="wide"] .session-pane .composer-region { padding-inline: 0; }
+[data-chat-layout="wide"] .session-pane :is(.composer-stack, .session-running-status) { width: min(100%, var(--chat-input)); }
+[data-chat-layout="wide"] .new-task-page .new-task-page__content { width: 100%; }
+[data-chat-layout="wide"] .new-task-page :is(.new-task-composer-wrap, .new-task-worktree) { width: min(100%, var(--chat-input)); }
+[data-chat-layout="wide"] .partner-group-page { container-type: inline-size; }
+[data-chat-layout="wide"] .partner-group-page .partner-group-timeline-content { max-width: var(--chat-column); }
+[data-chat-layout="wide"] .partner-group-page .partner-group-composer { width: min(100%, calc(var(--chat-input) + 40px)); }
 .message-nav-rail { width: 24px; position: absolute; z-index: 30; top: 0; bottom: 0; left: 8px; display: flex; flex-direction: column; align-items: stretch; justify-content: center; pointer-events: none; opacity: .4; transition: opacity .15s ease-out; }
 .message-nav-rail.is-awake, .message-nav-rail:focus-within { opacity: 1; }
 .message-nav-rail__tick, .message-nav-rail__hidden { width: 100%; height: var(--message-nav-pitch); min-height: var(--message-nav-pitch); display: flex; position: relative; flex: 0 0 var(--message-nav-pitch); align-items: center; border: 0; padding: 0; pointer-events: auto; background: transparent; color: var(--text-soft); }

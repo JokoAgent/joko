@@ -188,6 +188,8 @@ export const DEFAULT_UI_PREFERENCES: UiPreferences = {
 
 const UI_PREFERENCE_KEYS = [
   "appShortcutOverrides",
+  "chatLayout",
+  "chatWidthPercent",
   "codeFamily",
   "codeSize",
   "composerSendShortcut",
@@ -239,6 +241,8 @@ export function normalizeUiPreferences(value: unknown): UiPreferences {
     : undefined;
   if (
     !samePersistedValue(appearance, {
+      chatLayout: record["chatLayout"],
+      chatWidthPercent: record["chatWidthPercent"],
       uiFamily: record["uiFamily"],
       codeFamily: record["codeFamily"],
       terminalFamily: record["terminalFamily"],

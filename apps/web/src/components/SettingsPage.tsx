@@ -515,6 +515,9 @@ export function AppearanceSettings({ controller, locale, theme, onSuccess, onOpe
   const resetTerminalSize = useCallback(() => setTerminalSize(null), [setTerminalSize]);
   const localePreference = appearance.locale;
   const themeSave = useSettingsSaveFeedback(onSuccess);
+  const layoutSave = useSettingsSaveFeedback(onSuccess);
+  const setChatWidth = (mode: "standard" | "wide", percent: number) => layoutSave.commit(
+    () => controller.setChatLayout(mode, percent), { success: t("settings.saved"), failure: t("settings.chatLayoutFailed") });
   const themePickerRef = useRef<HTMLDivElement>(null);
   const restoreThemeKeyboardFocusRef = useRef(false);
   const localeControllerAction = controller.setLocale;
@@ -790,6 +793,19 @@ export function AppearanceSettings({ controller, locale, theme, onSuccess, onOpe
           onSuccess={onSuccess}
           t={t}
         />
+      </section>
+      <section className="settings-card">
+        <label className="setting-row"><strong>{t("settings.chatLayout")}</strong>
+          <select aria-label={t("settings.chatLayout")} value={appearance.chatLayout} disabled={layoutSave.pending}
+            onChange={event => void setChatWidth(event.target.value === "wide" ? "wide" : "standard", appearance.chatWidthPercent)}>
+            <option value="standard">{t("settings.standard")}</option><option value="wide">{t("settings.chatWide")}</option>
+          </select>
+        </label>
+        {appearance.chatLayout === "wide" && <label className="setting-row"><strong>{t("settings.chatWidth")}</strong>
+          <span><input type="range" aria-label={t("settings.chatWidth")} min="50" max="100" step="5" value={appearance.chatWidthPercent} aria-valuetext={`${appearance.chatWidthPercent}%`}
+            onChange={event => void setChatWidth("wide", Number(event.target.value))} /> {appearance.chatWidthPercent}%</span>
+        </label>}
+        {layoutSave.error && <ErrorBanner message={layoutSave.error} dismissLabel={t("common.dismiss")} onClose={layoutSave.dismissError} />}
       </section>
       <WallpaperSection t={t} />
       <section className="settings-card" aria-label={t("settings.layoutResetTitle")}>

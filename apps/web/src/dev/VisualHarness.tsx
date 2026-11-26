@@ -305,7 +305,8 @@ export function VisualHarness(): JSX.Element {
 
   useEffect(() => {
     applyAppearanceTypography(state.preferences, [document.documentElement, document.body]);
-  }, [state.preferences.codeFamily, state.preferences.codeSize, state.preferences.terminalFamily, state.preferences.terminalSize,
+    document.documentElement.dataset.chatLayout = state.preferences.chatLayout;
+  }, [state.preferences.chatLayout, state.preferences.chatWidthPercent, state.preferences.codeFamily, state.preferences.codeSize, state.preferences.terminalFamily, state.preferences.terminalSize,
     state.preferences.uiFamily, state.preferences.uiSize]);
 
   useEffect(() => {
@@ -1239,6 +1240,9 @@ export function VisualHarness(): JSX.Element {
       },
       setUiSize: async (uiSize: number): Promise<void> => {
         setState((current) => ({ ...current, preferences: { ...current.preferences, uiSize: clampUiSize(uiSize) } }));
+      },
+      setChatLayout: async (chatLayout: "standard" | "wide", chatWidthPercent: number): Promise<void> => {
+        setState(current => ({ ...current, preferences: { ...current.preferences, chatLayout, chatWidthPercent } }));
       },
       setCodeSize: async (codeSize: number): Promise<void> => {
         setState((current) => ({ ...current, preferences: { ...current.preferences, codeSize: clampCodeSize(codeSize) } }));

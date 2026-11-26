@@ -1,4 +1,6 @@
 export interface AppearancePreferences {
+  readonly chatLayout: "standard" | "wide";
+  readonly chatWidthPercent: number;
   readonly uiFamily: string;
   readonly codeFamily: string;
   readonly terminalFamily: string;
@@ -11,6 +13,8 @@ export interface AppearancePreferences {
 export type WindowZoomIntent = "increase" | "decrease" | "reset";
 
 export const DEFAULT_APPEARANCE_PREFERENCES: AppearancePreferences = {
+  chatLayout: "standard",
+  chatWidthPercent: 75,
   uiFamily: "",
   codeFamily: "",
   terminalFamily: "",
@@ -58,6 +62,9 @@ export function normalizeAppearancePreferences(value: unknown): AppearancePrefer
     ? value as Record<string, unknown>
     : {};
   return {
+    chatLayout: record["chatLayout"] === "wide" ? "wide" : "standard",
+    chatWidthPercent: typeof record["chatWidthPercent"] === "number" && record["chatWidthPercent"] >= 50
+      && record["chatWidthPercent"] <= 100 && record["chatWidthPercent"] % 5 === 0 ? record["chatWidthPercent"] : 75,
     uiFamily: normalizeFontFamily(record["uiFamily"]),
     codeFamily: normalizeFontFamily(record["codeFamily"]),
     terminalFamily: normalizeFontFamily(record["terminalFamily"]),
@@ -76,6 +83,7 @@ export function appearanceStyleProperties(settings: AppearancePreferences): Read
   const codeSize = clampCodeSize(settings.codeSize);
   const scale = uiSize / DEFAULT_APPEARANCE_PREFERENCES.uiSize;
   const properties: Record<string, string | undefined> = {
+    "--chat-width-fraction": settings.chatLayout === "wide" ? String(settings.chatWidthPercent / 100) : undefined,
     "--app-font-ui": uiFamily ? `${uiFamily}, var(--app-font-ui-default)` : undefined,
     "--app-font-code": codeFamily ? `${codeFamily}, var(--app-font-code-default)` : undefined,
     "--app-font-terminal": terminalFamily ? `${terminalFamily}, var(--font-mono)` : undefined,

@@ -333,6 +333,7 @@ export interface AppController extends OperationApi {
   setCodeFamily(family: string): Promise<void>;
   setTerminalFamily(family: string): Promise<void>;
   setUiSize(size: number): Promise<void>;
+  setChatLayout(mode: "standard" | "wide", percent: number): Promise<void>;
   setCodeSize(size: number): Promise<void>;
   setTerminalSize(size: number | null): Promise<void>;
   changeWindowZoom(intent: WindowZoomIntent): Promise<number>;
@@ -987,7 +988,8 @@ export function useAppController(): AppController {
 
   useEffect(() => {
     applyAppearanceTypography(state.preferences, [document.documentElement, document.body]);
-  }, [state.preferences.codeFamily, state.preferences.codeSize, state.preferences.terminalFamily, state.preferences.terminalSize,
+    document.documentElement.dataset.chatLayout = state.preferences.chatLayout;
+  }, [state.preferences.chatLayout, state.preferences.chatWidthPercent, state.preferences.codeFamily, state.preferences.codeSize, state.preferences.terminalFamily, state.preferences.terminalSize,
     state.preferences.uiFamily, state.preferences.uiSize]);
 
   useEffect(() => {
@@ -4108,6 +4110,7 @@ export function useAppController(): AppController {
     setLocale,
     setTheme,
     setUiFamily,
+    setChatLayout: (chatLayout, chatWidthPercent) => updatePreferences({ chatLayout, chatWidthPercent }),
     setCodeFamily,
     setTerminalFamily,
     setUiSize,

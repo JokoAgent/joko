@@ -27,6 +27,8 @@ export function subscribeAppearancePreferencesChange(onChange: () => void): () =
 
 export function sameAppearanceProjection(left: UiPreferences, right: UiPreferences): boolean {
   return left.theme === right.theme
+    && left.chatLayout === right.chatLayout
+    && left.chatWidthPercent === right.chatWidthPercent
     && left.uiFamily === right.uiFamily
     && left.codeFamily === right.codeFamily
     && left.terminalFamily === right.terminalFamily
@@ -41,6 +43,8 @@ export function withAppearanceProjection(current: UiPreferences, source: UiPrefe
   return {
     ...current,
     theme: source.theme,
+    chatLayout: source.chatLayout,
+    chatWidthPercent: source.chatWidthPercent,
     uiFamily: source.uiFamily,
     codeFamily: source.codeFamily,
     terminalFamily: source.terminalFamily,

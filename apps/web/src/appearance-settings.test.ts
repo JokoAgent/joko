@@ -19,6 +19,7 @@ describe("appearance preferences", () => {
       terminalSize: 18.2,
       windowZoom: 1.26
     })).toEqual({
+      chatLayout: "standard", chatWidthPercent: 75,
       uiFamily: "Inter",
       codeFamily: "",
       terminalFamily: "Terminal Mono",
@@ -28,6 +29,8 @@ describe("appearance preferences", () => {
       windowZoom: 1.3
     });
     expect(normalizeAppearancePreferences(null)).toEqual(DEFAULT_APPEARANCE_PREFERENCES);
+    expect(normalizeAppearancePreferences({ chatLayout: "wide", chatWidthPercent: 95 })).toMatchObject({ chatLayout: "wide", chatWidthPercent: 95 });
+    expect(normalizeAppearancePreferences({ chatWidthPercent: 56 }).chatWidthPercent).toBe(75);
     expect(clampWindowZoom(Number.NaN)).toBe(1);
     expect(windowZoomAfterIntent(1.2, "increase")).toBe(1.3);
     expect(windowZoomAfterIntent(0.5, "decrease")).toBe(0.5);
