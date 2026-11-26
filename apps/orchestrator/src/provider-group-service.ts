@@ -7,6 +7,7 @@ import { decideProviderGroupFailure, describeProviderGroupFailure, providerGroup
 import type { ProviderSharingDirectoryPort, ProviderSharingRecipient } from "./provider-sharing-ports.js";
 import { providerGroupRebalanceTarget, type ProviderGroupQuota } from "./provider-group-quota.js";
 import type { ProviderGroupMemberStatus } from "./provider-group-directory.js";
+import { isLocalOpenAiPool, localOpenAiPoolKey } from "./local-openai-pool.js";
 
 const REBALANCE_CHOICE_KEY = "provider.group-rebalance-choice.v1", REBALANCE_REMEMBER_KEY = "provider.group-rebalance-auto.v1", REBALANCE_BACKOFF_KEY = "provider.group-rebalance-backoff.v1";
 export interface ProviderGroupRebalanceChoice { readonly suggestionKey: string; readonly remember: boolean; }
@@ -42,7 +43,7 @@ export interface ProviderGroupSessionPort {
   /** This must perform and adopt the existing native runtime handoff. A staged
    * intent alone is not a successful switch and must not commit the binding. */
   handoff(sessionId: string, profile: SessionRuntimeProfile, options: {
-    readonly isCurrent: () => boolean; readonly beforeSend: boolean; readonly fresh?: boolean;
+    readonly isCurrent: () => boolean; readonly beforeSend: boolean; readonly fresh?: boolean; readonly localAccounts?: boolean;
     readonly recoverGeneration?: number; readonly onPrepared?: (generation: number) => void;
   }): Promise<"committed" | "unknown">;
   continue(sessionId: string, lease: ProviderGroupRecoveryLease, options: {
@@ -71,7 +72,11 @@ export class ProviderGroupService {
   constructor(readonly options: ProviderGroupServiceOptions) {}
   get router(): ProviderGroupRouter { return this.options.router; }
   snapshot(group: ProviderGroupKey): ProviderGroupSnapshot { return this.router.store.snapshot(group); }
-  list(): readonly ProviderGroupSnapshot[] { return this.router.store.list(); }
+  list(): readonly ProviderGroupSnapshot[] { return this.router.store.list().filter(group => !isLocalOpenAiPool(group)); }
+  configuredLocalAccountPool(route: ProviderGroupKey): ProviderGroupKey | undefined {
+    const pool = localOpenAiPoolKey(route);
+    return this.snapshot(pool).config ? pool : undefined;
+  }
   async rebalanceSuggestion(sessionId: string, generation: bigint, signal: AbortSignal): Promise<ProviderGroupRebalanceSuggestion | undefined> {
     const original = this.router.store.store.getSession(sessionId).descriptor;
     if (BigInt(original.binding.generation) !== generation) throw new Error("The task generation changed.");
@@ -101,7 +106,7 @@ export class ProviderGroupService {
   }
   async reconcileSharing(signal: AbortSignal): Promise<void> {
     const groups = new Map([...this.router.store.pendingCleanup(), ...this.router.store.list()].map(group => [groupKey(group), group]));
-    for (const group of groups.values()) await this.#syncReshares(group, [], group.config?.members ?? [], signal);
+    for (const group of groups.values()) if (!isLocalOpenAiPool(group)) await this.#syncReshares(group, [], group.config?.members ?? [], signal);
   }
   async candidates(group: ProviderGroupKey, signal: AbortSignal): Promise<ReturnType<ProviderGroupRouter["directory"]["candidates"]>> {
     await this.router.directory.refresh(signal); return this.router.directory.candidates(group);
@@ -126,9 +131,10 @@ export class ProviderGroupService {
   }
   async assignBeforeStart(input: ProviderGroupStartInput, signal: AbortSignal): Promise<ProviderGroupAssignment | undefined> {
     if (this.router.store.bindingRecord(input.sessionId)?.released) return undefined;
-    const group = input.group ?? { backendId: input.profile.backendId, providerId: input.profile.providerId };
-    await this.router.prepare(group, this.#signal(signal));
-    if (!this.snapshot(group).config) return undefined;
+    const route = input.group ?? { backendId: input.profile.backendId, providerId: input.profile.providerId };
+    await this.router.prepare(route, this.#signal(signal));
+    const group = this.snapshot(route).config ? route : !input.group ? this.configuredLocalAccountPool(route) : undefined;
+    if (!group) return undefined;
     return this.router.pick({ ...input, group, modelId: input.profile.modelId, ownTask: true }, this.#signal(signal));
   }
   async nextAfterStartFailure(input: ProviderGroupStartInput, previous: ProviderGroupAssignment, error: unknown, signal: AbortSignal): Promise<ProviderGroupAssignment | undefined> {
@@ -393,7 +399,7 @@ export class ProviderGroupService {
       || handoff.profile.effort !== undefined && !status.model.thinkingLevels.includes(handoff.profile.effort)) throw unknownEffect();
     status.assertCurrent();
     if (status.quota.limited) throw new ProviderGroupUnavailableError(status.quota.resetAt);
-    const result = await this.options.sessions.handoff(sessionId, handoff.profile, { beforeSend: false, isCurrent: () => isCurrent(current), recoverGeneration: handoff.generation });
+    const result = await this.options.sessions.handoff(sessionId, handoff.profile, { beforeSend: false, localAccounts: isLocalOpenAiPool(handoff.group), isCurrent: () => isCurrent(current), recoverGeneration: handoff.generation });
     current(); status.assertCurrent(); if (result !== "committed") throw unknownEffect();
     this.router.store.commitBinding(sessionId, { group: handoff.group, groupRevision: handoff.groupRevision, memberKey: member.key,
       backendId: handoff.profile.backendId, providerId: handoff.profile.providerId, modelId: handoff.profile.modelId }, snapshot.revision);
@@ -439,7 +445,7 @@ export class ProviderGroupService {
     let nativeCommitted = false;
     const binding = this.router.store.binding(sessionId), fresh = binding !== undefined && binding.memberKey !== assignment.member.key && sameRoute(session.profile, assignment.profile);
     if (fresh || !sameRoute(session.profile, assignment.profile)) {
-      const result = await this.options.sessions.handoff(sessionId, assignment.profile, { beforeSend, ...(fresh ? { fresh: true } : {}), isCurrent: () => isCurrent(current) && isCurrent(assignment.assertCurrent),
+      const result = await this.options.sessions.handoff(sessionId, assignment.profile, { beforeSend, localAccounts: isLocalOpenAiPool(assignment.group), ...(fresh ? { fresh: true } : {}), isCurrent: () => isCurrent(current) && isCurrent(assignment.assertCurrent),
         ...(recovery?.onHandoffPrepared === undefined ? {} : { onPrepared: (generation: number) => recovery.onHandoffPrepared!({ generation,
           group: assignment.group, groupRevision: assignment.snapshot.revision.toString(), memberKey: assignment.member.key, profile: assignment.profile }) }) });
       if (result === "unknown") throw unknownEffect();

@@ -22,6 +22,7 @@ import {
   type ScheduleTemplateId
 } from "../schedule-templates.js";
 import type { RunAction, Translator } from "./types.js";
+import { SavedModelGroupSelect } from "./SavedModelGroupSelect.js";
 import { Button, EmptyState, IconButton, Modal, Pill, StatusDot, TipSummary, formatDateTime, formatRelativeTime, CheckboxControl, SelectControl } from "./ui.js";
 import { CLIENT_LAYOUT_RESET_EVENT } from "../client-layout-reset.js";
 import {
@@ -1058,6 +1059,8 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
         </div>}
       </fieldset>}
       {draft.executionMode === "agent" ? <label className="interaction-input"><span>{t("scheduler.scheduledInput")}</span><textarea required rows={5} value={draft.inputText} onChange={(event) => setDraft((current) => ({ ...current, inputText: event.target.value }))} placeholder={t("scheduler.inputPlaceholder")} /></label> : <label className="interaction-input"><span>{t("scheduler.scriptCommand")}</span><textarea required rows={5} spellCheck={false} value={draft.scriptCommand} onChange={(event) => setDraft((current) => ({ ...current, scriptCommand: event.target.value }))} placeholder={t("scheduler.scriptCommandPlaceholder")} /></label>}
+      {draft.executionMode === "agent" && draft.modelId && <SavedModelGroupSelect controller={controller} value={draft.taskModelGroupId}
+        disabled={saving} t={t} onChange={taskModelGroupId => setDraft(current => ({ ...current, taskModelGroupId }))} />}
       {(worktreeCompatible || draft.useWorktree) && <section className="new-task-worktree" aria-label={t("worktree.title")}>
         <header>
           <span><GitBranch aria-hidden="true" /><strong>{t("worktree.title")}</strong></span>
@@ -1184,6 +1187,7 @@ export function scheduleDraft(schedule: ScheduleView | undefined, targets: reado
     permissionMode: schedule?.permissionMode ?? session?.permissionMode ?? "ask",
     planMode: schedule?.planMode ?? session?.planMode ?? false,
     useWorktree: schedule?.useWorktree ?? false,
+    ...(schedule?.taskModelGroupId ? { taskModelGroupId: schedule.taskModelGroupId } : {}),
     ...(schedule?.worktreeSourceRef === undefined ? {} : { worktreeSourceRef: schedule.worktreeSourceRef }),
     refreshWorktreeRemote: schedule?.refreshWorktreeRemote ?? false,
     extraDirectoryIds: [...(schedule?.extraDirectoryIds ?? [])],

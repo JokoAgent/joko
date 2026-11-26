@@ -5558,6 +5558,7 @@ function toProtoScheduleExecution(value: unknown): ScheduleExecutionSnapshot {
     ? record.extraDirectoryIds.filter((entry): entry is string => typeof entry === "string")
     : [];
   return message<ScheduleExecutionSnapshot>("joko.v1.ScheduleExecutionSnapshot", {
+    taskModelGroupId: stringField(record, "taskModelGroupId"),
     model: providerId === undefined || modelId === undefined
       ? undefined
       : toProtoModelSelection(providerId, modelId, stringField(record, "effort"), record["fastMode"] === "ultrafast" ? "ultrafast" : booleanField(record, "fastMode") ?? false),
@@ -5605,6 +5606,7 @@ function toProtoScheduleExecution(value: unknown): ScheduleExecutionSnapshot {
 function fromProtoScheduleExecution(value: ScheduleExecutionSnapshot | undefined): unknown {
   if (value === undefined) return {};
   const base = {
+    ...(value.taskModelGroupId === undefined ? {} : { taskModelGroupId: requiredProtoText(value.taskModelGroupId, "schedule.execution.task_model_group_id", 96) }),
     ...(value.model?.model?.providerId === undefined ? {} : { providerId: value.model.model.providerId }),
     ...(value.model?.model?.modelId === undefined ? {} : { modelId: value.model.model.modelId }),
     ...(value.model?.effortId === undefined || value.model.effortId === "" ? {} : { effort: value.model.effortId }),

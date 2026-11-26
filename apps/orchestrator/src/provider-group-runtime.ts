@@ -22,12 +22,14 @@ import type { ProviderGroupNativeCapture } from "./provider-group-hosted.js";
 import { ProviderGroupRemoteRouter } from "./provider-group-remote.js";
 import { ProviderGroupReporter } from "./provider-group-reporter.js";
 import { TaskModelGroups } from "./task-model-groups.js";
+import { LocalOpenAiPools, type LocalOpenAiAccountIdentity } from "./local-openai-pool.js";
 
 export interface ProviderGroupRuntimeOptions {
   readonly store: OperationalStore; readonly registry: BackendInstanceRegistry; readonly sources: HostedAgentSources;
   readonly nodeId: string; readonly nodeName: () => string; readonly sessions: ProviderGroupSessionPort;
   readonly ownerGeneration: () => string;
   readonly taskModelEnabled?: (backendId: string, providerId: string, modelId: string) => boolean;
+  readonly openAiAccount?: (backendId: string, providerId: string, modelId: string) => LocalOpenAiAccountIdentity | undefined;
   readonly readAccountUsage: (backendId: string, providerId: string, signal: AbortSignal) => Promise<ProviderAccountUsageSnapshot | undefined>;
   /** Count active turns on the native execution node, including direct and
    * hosted use. This is not the count of open native sessions. */
@@ -49,6 +51,7 @@ export class ProviderGroupRuntime {
   readonly remote: ProviderGroupRemoteRouter;
   readonly reporter: ProviderGroupReporter;
   readonly taskModels: TaskModelGroups;
+  readonly localOpenAiPools: LocalOpenAiPools;
   readonly #remoteRunning = new Map<string, number>();
   readonly #options: ProviderGroupRuntimeOptions;
   nodeName(): string { return this.#options.nodeName(); }
@@ -113,6 +116,7 @@ export class ProviderGroupRuntime {
     this.directory = new ProviderGroupDirectory({ sources: () => this.sources(), quotas, ownerGeneration: options.ownerGeneration,
       running: source => source.kind === "local" ? options.activeTurns(source.backendId, source.providerId) : this.#remoteRunning.get(source.key) ?? 0,
       ...(options.refreshSources ? { refresh: options.refreshSources } : {}), ...(options.sharing ? { sharing: options.sharing } : {}) });
+    this.localOpenAiPools = new LocalOpenAiPools(this.store, this.directory);
     this.taskModels = new TaskModelGroups({ store: options.store, ownerId: options.nodeId, directory: this.directory,
       ownerGeneration: options.ownerGeneration, modelEnabled: options.taskModelEnabled ?? (() => true), now });
     this.leases = new ProviderGroupLeases(now);
@@ -136,6 +140,7 @@ export class ProviderGroupRuntime {
           displayName: options.nodeName(), providerName: provider?.displayName ?? providerId, agentKind: backend.adapterKind,
           available: backend.health !== "unavailable" && models.length > 0 && (!provider || ["authenticated", "not_required"].includes(provider.authenticationState)), remotelyEnabled: true, models,
           ...providerBrand(provider?.accessKind, provider?.accessProduct),
+          ...(options.openAiAccount ? { openAiAccount: (modelId: string) => options.openAiAccount!(backend.id, providerId, modelId) } : {}),
           assertCurrent: () => { const current = options.registry.get(backend.id); if (current.generation !== generation || current.state !== "available") throw new Error("The Provider Backend incarnation changed."); } });
       }
     }
@@ -178,7 +183,7 @@ export class ProviderGroupRuntime {
       poller: first.pool.poller, assertCurrent: () => { assertCurrent(); first.assertCurrent(); }, close: async (runId, signal) => { const captured = captures.get(runId); if (!captured) throw new Error("The original group cleanup was not captured."); await captured.close(signal); } };
   }
   connectOptions(authenticate: ProviderGroupConnectOptions["authenticate"]): ProviderGroupConnectOptions {
-    return { service: this.service, usage: this.usage, taskModels: this.taskModels, authenticate, assertRemoteAllowed: this.#options.assertRemoteAllowed,
+    return { service: this.service, usage: this.usage, taskModels: this.taskModels, localOpenAiPools: this.localOpenAiPools, authenticate, assertRemoteAllowed: this.#options.assertRemoteAllowed,
       memberAccountUsage: (key, revision, memberKey, signal) => this.memberAccountUsage(key, revision, memberKey, signal),
       schedulingState: async (key, _modelId, signal) => {
         this.#options.assertRemoteAllowed(key);

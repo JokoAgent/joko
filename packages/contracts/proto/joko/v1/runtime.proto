@@ -922,6 +922,7 @@ message ScheduleExecutionSnapshot {
   bool refresh_worktree_remote = 13;
   // An empty message explicitly clears a previously configured trigger.
   SchedulePullRequestTrigger follow_pull_request = 14;
+  optional string task_model_group_id = 15;
 }
 
 enum ScheduleExecutionMode {

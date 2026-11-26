@@ -7,6 +7,8 @@ import "joko/v1/model.proto";
 // Provider guests use HostedAgentService with their server-owned share grant;
 // they cannot call management or declare a recipient in these messages.
 service ProviderGroupService {
+  rpc GetLocalOpenAiPool(GetLocalOpenAiPoolRequest) returns (GetLocalOpenAiPoolResponse);
+  rpc SetLocalOpenAiPoolMember(SetLocalOpenAiPoolMemberRequest) returns (SetLocalOpenAiPoolMemberResponse);
   rpc ListProviderGroups(ListProviderGroupsRequest) returns (ListProviderGroupsResponse);
   rpc GetProviderGroup(GetProviderGroupRequest) returns (GetProviderGroupResponse);
   rpc ListProviderGroupCandidates(ListProviderGroupCandidatesRequest) returns (ListProviderGroupCandidatesResponse);
@@ -113,6 +115,24 @@ message TaskModelGroupSwitch {
 message GetTaskModelGroupSwitchResponse { TaskModelGroupSwitch offer = 1; }
 
 message ProviderGroupKey { string backend_id = 1; string provider_id = 2; }
+message GetLocalOpenAiPoolRequest { ProviderGroupKey target = 1; }
+message LocalOpenAiAccount {
+  ProviderGroupKey key = 1;
+  string display_name = 2;
+  bool subscription = 3;
+  bool included = 4;
+}
+message GetLocalOpenAiPoolResponse {
+  uint64 revision = 1;
+  repeated LocalOpenAiAccount accounts = 2;
+}
+message SetLocalOpenAiPoolMemberRequest {
+  ProviderGroupKey target = 1;
+  ProviderGroupKey source = 2;
+  uint64 expected_revision = 3;
+  bool included = 4;
+}
+message SetLocalOpenAiPoolMemberResponse { GetLocalOpenAiPoolResponse pool = 1; }
 enum ProviderGroupStrategy {
   PROVIDER_GROUP_STRATEGY_UNSPECIFIED = 0;
   PROVIDER_GROUP_STRATEGY_LEAST_BUSY = 1;

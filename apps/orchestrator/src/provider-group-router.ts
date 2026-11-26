@@ -5,6 +5,7 @@ import { ProviderGroupLeases } from "./provider-group-leases.js";
 import { providerGroupMembersFull, selectProviderGroupMember } from "./provider-group-scheduler.js";
 import { ProviderGroupUnavailableError, type ProviderGroupFailureDecision, type ProviderGroupFailureSignals } from "./provider-group-failure-policy.js";
 import { providerGroupRebalanceTarget } from "./provider-group-quota.js";
+import { isLocalOpenAiPool } from "./local-openai-pool.js";
 
 export interface ProviderGroupAssignment {
   readonly group: ProviderGroupKey; readonly snapshot: ProviderGroupSnapshot; readonly member: ProviderGroupMember;
@@ -32,7 +33,7 @@ export class ProviderGroupRouter {
     readonly now: () => number = Date.now, readonly random: () => number = Math.random, readonly remote?: ProviderGroupRemoteRouterPort) {}
   async prepare(group: ProviderGroupKey, signal: AbortSignal): Promise<void> { if (this.remote?.owns(group)) await this.remote.prepare(group, signal); }
   readMember(group: ProviderGroupKey, member: ProviderGroupMember, request: ProviderGroupDirectoryRequest, signal: AbortSignal): Promise<ProviderGroupMemberStatus> {
-    return this.remote?.owns(group) ? this.remote.read(group, member, request, signal) : this.directory.read(member, request, signal);
+    return this.remote?.owns(group) ? this.remote.read(group, member, request, signal) : this.directory.read(member, { ...request, localAccounts: isLocalOpenAiPool(group) }, signal);
   }
   rememberRemoteSelection(deviceId: string, sessionId: string, assignment: ProviderGroupAssignment): void {
     for (const [key, value] of this.#remoteSelections) if (this.now() - value.at > 30_000) this.#remoteSelections.delete(key);
@@ -47,7 +48,8 @@ export class ProviderGroupRouter {
     if (this.remote?.owns(input.group)) return this.remote.pick({ ...input, exclude: new Set([...this.tried(input.sessionId), ...(input.exclude ?? [])]) }, signal);
     const snapshot = this.store.snapshot(input.group); if (!snapshot.config) throw new ProviderGroupUnavailableError();
     if (input.fresh) await this.directory.refresh(signal);
-    const members = await this.directory.members(snapshot.config.members, input, signal); signal.throwIfAborted();
+    const localAccounts = isLocalOpenAiPool(input.group);
+    const members = await this.directory.members(snapshot.config.members, { ...input, localAccounts }, signal); signal.throwIfAborted();
     const current = this.store.snapshot(input.group); if (current.revision !== snapshot.revision || !current.config) throw new ProviderGroupUnavailableError();
     const cooling = this.store.cooling(input.group, this.now()), tried = this.tried(input.sessionId);
     const candidates = snapshot.config.members.map(member => {
@@ -64,7 +66,7 @@ export class ProviderGroupRouter {
     });
     const excluded = new Set([...tried, ...(input.exclude ?? [])]);
     // No await between current load, selection and the provisional reservation.
-    const selected = selectProviderGroupMember(candidates, snapshot.config.strategy, { now: this.now(), random: this.random, exclude: excluded, keepUnknownQuota: true,
+    const selected = selectProviderGroupMember(candidates, snapshot.config.strategy, { now: this.now(), random: this.random, exclude: excluded, keepUnknownQuota: !localAccounts,
       ...(this.#lastPicked.has(groupKey(input.group)) ? { lastPicked: this.#lastPicked.get(groupKey(input.group))! } : {}) });
     const status = members.find(member => member.member.key === selected);
     if (!status?.model || !status.available) {

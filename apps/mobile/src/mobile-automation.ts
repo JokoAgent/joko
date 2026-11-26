@@ -100,6 +100,7 @@ export interface MobileAutomationSchedule {
   readonly planMode: boolean;
   readonly useWorktree: boolean;
   readonly worktreeSourceRef?: string;
+  readonly taskModelGroupId?: string;
   readonly refreshWorktreeRemote: boolean;
   readonly extraDirectoryIds: readonly string[];
   readonly silentWhenIdle: boolean;
@@ -461,7 +462,7 @@ function scheduleExecution(
   schedule: Schedule
 ): Pick<MobileAutomationSchedule,
   "executionMode" | "script" | "model" | "permissionMode" | "planMode" | "useWorktree"
-  | "worktreeSourceRef" | "refreshWorktreeRemote" | "extraDirectoryIds" | "silentWhenIdle"
+  | "worktreeSourceRef" | "taskModelGroupId" | "refreshWorktreeRemote" | "extraDirectoryIds" | "silentWhenIdle"
   | "notifyDesktop" | "expireAt" | "preRunHook"> {
   const execution = schedule.execution;
   if (execution === undefined) throw new Error("The Joko node returned an Automation without an execution snapshot.");
@@ -515,6 +516,7 @@ function scheduleExecution(
     permissionMode: schedulePermissionMode(execution.permissionMode),
     planMode: execution.planMode,
     useWorktree: execution.useWorktree,
+    ...(execution.taskModelGroupId ? { taskModelGroupId: execution.taskModelGroupId } : {}),
     ...(worktreeSourceRef === undefined ? {} : { worktreeSourceRef }),
     refreshWorktreeRemote: execution.refreshWorktreeRemote,
     extraDirectoryIds,

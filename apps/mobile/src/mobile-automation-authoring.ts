@@ -95,6 +95,7 @@ export interface MobileAutomationDraft {
   readonly planMode: boolean;
   readonly useWorktree: boolean;
   readonly worktreeSourceRef?: string;
+  readonly taskModelGroupId?: string;
   readonly refreshWorktreeRemote: boolean;
   readonly extraDirectoryIds: readonly string[];
   readonly silentWhenIdle: boolean;
@@ -359,6 +360,7 @@ export function createMobileAutomationDraft(
       ? backendSettings[0]!.defaultPlanMode : false),
     useWorktree: schedule?.useWorktree ?? false,
     ...(schedule?.worktreeSourceRef === undefined ? {} : { worktreeSourceRef: schedule.worktreeSourceRef }),
+    ...(schedule?.taskModelGroupId ? { taskModelGroupId: schedule.taskModelGroupId } : {}),
     refreshWorktreeRemote: schedule?.refreshWorktreeRemote ?? false,
     extraDirectoryIds: [...(schedule?.extraDirectoryIds ?? [])],
     silentWhenIdle: schedule?.silentWhenIdle ?? false,
@@ -588,6 +590,7 @@ export function buildMobileAutomationScheduleInput(
       } }),
       permissionMode,
       planMode: !scriptMode && draft.planMode,
+      ...(!scriptMode && model && draft.taskModelGroupId ? { taskModelGroupId: draft.taskModelGroupId } : {}),
       extraDirectoryIds: scriptMode ? [] : extraDirectoryIds,
       executionMode: scriptMode ? ScheduleExecutionMode.SCRIPT : ScheduleExecutionMode.AGENT,
       ...(scriptMode ? { script: {

@@ -229,6 +229,7 @@ export class PartnerSessionTaskManager {
           const current = this.store.getTarget(targetId); if (current.revision !== target.revision || !current.descriptor.trusted || !sameComputer(current.descriptor, home)) throw changed(); };
         assertScope();
         const created = await this.host.createServiceSession({ operationId: `${id}:create`, serviceKind: "partner", targetId, title: task.title,
+          savedModelGroupId: route.taskModelGroupId,
           providerId: route.providerId, modelId: route.modelId, ...(route.effort === undefined ? {} : { effort: route.effort }), fastMode: route.fastMode,
           permissionMode: task.permissionMode, planMode: task.planMode, originSessionId: sessionId,
           appendSystemPrompt: "You are running an independent Joko task started by a Partner. Work in this task's own workspace. The requester acts for the user: raise permissions, questions and plan reviews through the normal interaction tools when a decision is needed. Preserve useful deliverables through the normal Artifact boundary. Return a concise conclusion and explain how the work was verified; the result and adopted artifacts return to the requester automatically. Follow-ups continue this same task's history; do not repeat completed actions.",

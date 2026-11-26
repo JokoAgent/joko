@@ -105,18 +105,22 @@ export function partnerSessionRuntimeFallback(
     readonly current: SessionRuntimeProfile;
     readonly visitedRoutes: readonly string[];
     readonly currentHop: number;
-  }
+  },
+  groupRoutes?: (groupId: string) => readonly SessionRuntimeProfile[]
 ): { readonly owned: boolean; readonly candidate?: SessionRuntimeProfile } {
   const partner = store.findPartnerByCanonicalSession(input.sessionId);
   if (partner === undefined) return { owned: false };
   if (partner.lifecycle !== "active" || partner.initializationState !== "ready") return { owned: true };
-  const chain = partner.capabilities.modelChain;
-  if (input.currentHop >= chain.length - 1) return { owned: true };
   const key = (route: Pick<SessionRuntimeProfile, "backendId" | "providerId" | "modelId">) =>
     `${route.backendId}\0${route.providerId}\0${route.modelId}`;
+  const expanded = partner.capabilities.modelChain.flatMap(route => [
+    ...(route.taskModelGroupId ? groupRoutes?.(route.taskModelGroupId) ?? [] : []), route]);
+  const chain = expanded.filter((route, index) => expanded.findIndex(other => key(route) === key(other)) === index);
+  if (input.currentHop >= chain.length - 1) return { owned: true };
   const visited = new Set([...input.visitedRoutes, key(input.current)]);
   const currentIndex = chain.findIndex((route) => key(route) === key(input.current));
-  const candidate = (currentIndex < 0 ? chain : chain.slice(currentIndex + 1))
+  const grouped = partner.capabilities.modelChain.some(route => route.taskModelGroupId);
+  const candidate = (currentIndex < 0 ? chain : [...chain.slice(currentIndex + 1), ...(grouped ? chain.slice(0, currentIndex) : [])])
     .find((route) => !visited.has(key(route)));
   return candidate === undefined ? { owned: true } : {
     owned: true,
@@ -149,7 +153,7 @@ export interface PartnerManagerOptions {
     | "preparePartnerPauseQueue" | "pausePartnerSession" | "restorePartnerQueue" | "wakePartnerSession"
     | "retirePartnerPolicyRuntime" | "retryPartnerPolicyRetirement"
     | "isPrivateSessionCreationClosed" | "releasePrivateSessionCreationReceipt"
-  >;
+  > & Partial<Pick<SessionHost, "preparePartnerModelGroup">>;
   readonly workspaceService: Pick<WorkspaceService, "register" | "unregister">;
   readonly homesRoot: string;
   readonly appDefaultModel?: () => PartnerCapabilitiesRecord["modelChain"][number] | undefined;
@@ -549,7 +553,7 @@ export class PartnerManager {
         operationId = `partner-routine-session:${createHash('sha256').update(operationId).digest('hex')}`;
       }
       const result = await this.#sessionHost.createServiceSession({ operationId, serviceKind: 'partner', targetId: profile.homeTargetId,
-        runtimeBackendId: route.backendId, title, providerId: route.providerId, modelId: route.modelId,
+        runtimeBackendId: route.backendId, savedModelGroupId: route.taskModelGroupId, title, providerId: route.providerId, modelId: route.modelId,
         ...(route.effort === undefined ? {} : { effort: route.effort }), fastMode: route.fastMode,
         permissionMode: profile.capabilities.permissionMode, planMode: profile.capabilities.planMode, appendSystemPrompt: profile.identitySource,
         assertServiceScope: assertOwner, preparePrivateSession: async sessionId => {
@@ -639,7 +643,7 @@ export class PartnerManager {
     }
     const primary = profile.capabilities.modelChain[0]!;
     const result = await this.#sessionHost.createServiceSession({ operationId, serviceKind: 'partner', targetId: profile.homeTargetId, hidden: true,
-      runtimeBackendId: primary.backendId, title: `${profile.displayName}: ${input.title}`.slice(0, 200),
+      runtimeBackendId: primary.backendId, savedModelGroupId: primary.taskModelGroupId, title: `${profile.displayName}: ${input.title}`.slice(0, 200),
       providerId: primary.providerId, modelId: primary.modelId, ...(primary.effort === undefined ? {} : { effort: primary.effort }),
       fastMode: primary.fastMode, permissionMode: 'ask', planMode: profile.capabilities.planMode,
       appendSystemPrompt: profile.identitySource, assertServiceScope: assertOwner,
@@ -690,7 +694,7 @@ export class PartnerManager {
     const message = partnerTopicRootMessage(this.#operationalStore, root)!;
     const title = message.blocks.flatMap(block => block.kind === 'text' ? [block.text] : []).join(' ').replace(/\s+/gu, ' ').trim().slice(0, 60);
     const result = await this.#sessionHost.createServiceSession({ operationId, serviceKind: 'partner', targetId: profile.homeTargetId,
-      runtimeBackendId: primary.backendId, title: `${profile.displayName}: ${title || 'Topic'}`, providerId: primary.providerId, modelId: primary.modelId,
+      runtimeBackendId: primary.backendId, savedModelGroupId: primary.taskModelGroupId, title: `${profile.displayName}: ${title || 'Topic'}`, providerId: primary.providerId, modelId: primary.modelId,
       ...(primary.effort === undefined ? {} : { effort: primary.effort }), fastMode: primary.fastMode,
       permissionMode: profile.capabilities.permissionMode, planMode: profile.capabilities.planMode, appendSystemPrompt: profile.identitySource,
       assertServiceScope: assertOwner, preparePrivateSession: async sessionId => {
@@ -1363,6 +1367,7 @@ export class PartnerManager {
         const execution = await this.#sessionHost.createServiceSession({
           operationId: current.createOperationId,
           serviceKind: "partner",
+          savedModelGroupId: primary.taskModelGroupId,
           targetId: target.homeTargetId,
           ...(primary.backendId === this.#operationalStore.getTarget(target.homeTargetId).descriptor.backendId ? {} : { runtimeBackendId: primary.backendId }),
           title: `${target.displayName}: ${current.title}`,
@@ -1555,6 +1560,7 @@ export class PartnerManager {
           serviceKind: "partner",
           targetId: current.homeTargetId,
           runtimeBackendId: primary.backendId,
+          savedModelGroupId: primary.taskModelGroupId,
           title: current.displayName,
           providerId: primary.providerId,
           modelId: primary.modelId,
@@ -1666,7 +1672,12 @@ export class PartnerManager {
   }
 
   async #applyCanonicalSettings(profile: PartnerProfileRecord, sessionId: string, title = profile.displayName): Promise<void> {
-    const primary = profile.capabilities.modelChain[0]!;
+    const saved = profile.capabilities.modelChain[0]!;
+    const choice = saved.taskModelGroupId ? await this.#sessionHost.preparePartnerModelGroup?.(sessionId, saved.taskModelGroupId, route => {
+      try { this.#validateCapabilities({ ...profile.capabilities, modelChain: [route] }); return true; }
+      catch (error) { if (error instanceof PartnerManagerError) return false; throw error; }
+    }) : undefined;
+    const primary = choice?.profile ?? saved;
     await this.#sessionHost.updateServiceSessionPrompt(sessionId, profile.identitySource);
     const before = this.#operationalStore.getSession(sessionId);
     if (before.descriptor.backendId !== primary.backendId) {
@@ -1674,6 +1685,7 @@ export class PartnerManager {
         planMode: profile.capabilities.planMode }, before.revision);
       const runtime = this.#sessionHost.getSessionRuntimeControl(sessionId);
       await this.#sessionHost.setSessionRuntimeControl({ sessionId, expectedGeneration: runtime.generation, patch: { ...primary } });
+      choice?.adopt?.();
       return;
     }
     const runtime = this.#sessionHost.getSessionRuntimeControl(sessionId);
@@ -1715,6 +1727,7 @@ export class PartnerManager {
         permissionMode: profile.capabilities.permissionMode,
         planMode: profile.capabilities.planMode
       }, latest.revision);
+      choice?.adopt?.();
     } catch (error) {
       await this.#sessionHost.retirePartnerPolicyRuntime(sessionId, before.descriptor.binding, () => {
         const owner = this.#store.getPartner(profile.id);

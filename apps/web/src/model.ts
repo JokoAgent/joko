@@ -587,6 +587,7 @@ export type PartnerDelegationStatusView =
   | "unknown";
 
 export interface PartnerModelRouteView {
+  readonly taskModelGroupId?: string;
   readonly backendId: string;
   readonly providerId: string;
   readonly modelId: string;
@@ -2810,6 +2811,7 @@ export interface WorkspaceRewindPreviewView {
 }
 
 export interface ScheduleView {
+  readonly taskModelGroupId?: string;
   readonly id: string;
   readonly name: string;
   readonly source: "user" | "project";
@@ -2994,6 +2996,7 @@ export interface SchedulerRuntimeView {
 }
 
 export interface ScheduleDraft {
+  readonly taskModelGroupId?: string;
   readonly name: string;
   readonly backendId: string;
   readonly targetId: string;

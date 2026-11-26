@@ -117,6 +117,33 @@ export class TaskModelGroups {
       }) });
   }
 
+  savedSelection(groupId: string): contract.TaskModelGroupSelection | undefined {
+    const config = this.config;
+    return config.groups.some(group => group.groupId === groupId)
+      ? create(contract.TaskModelGroupSelectionSchema, { groupId, expectedRevision: config.revision }) : undefined;
+  }
+
+  localFallbacks(groupId: string): SessionRuntimeProfile[] {
+    const { groups } = this.config;
+    const original = groups.find(group => group.groupId === groupId);
+    if (!original) return [];
+    const effective = scheduledGroup(original, groups, new Date(this.options.now()).getHours());
+    const reachable = new Set([effective, original]);
+    for (const group of reachable) for (const window of group.schedules) {
+      const next = groups.find(item => item.groupId === window.useGroupId);
+      if (next) reachable.add(next);
+    }
+    const sources = this.options.directory.sources();
+    return [...reachable].flatMap(group => group.candidates.flatMap(candidate => {
+      const ref = candidate.source;
+      const source = sources.find(row => row.kind === "local" && row.key === ref.sourceKey && row.backendId === ref.backendId && row.providerId === ref.providerId);
+      const model = source?.models.find(row => row.modelId === ref.modelId);
+      return !candidate.disabled && source?.available && model && this.modelEnabled(source, model)
+        ? [{ backendId: ref.backendId, providerId: ref.providerId, modelId: ref.modelId, fastMode: false,
+          ...(model.thinkingLevels.includes(group.effortId) ? { effort: group.effortId } : {}) }] : [];
+    }));
+  }
+
   save(expectedRevision: bigint, input: readonly contract.TaskModelGroup[]): contract.TaskModelGroupConfig {
     const groups = parseGroups(input);
     return this.options.store.transaction(store => {

@@ -27,6 +27,7 @@ const SAFE_TEXT = /^[^\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u200e\u200f\u
 const MAX_PARTNERS = 1_000;
 
 export interface MobilePartnerModelRoute {
+  readonly taskModelGroupId?: string;
   readonly backendId: string;
   readonly providerId: string;
   readonly modelId: string;
@@ -273,7 +274,8 @@ function projectMobilePartnerModelRoute(route: NonNullable<PartnerCapabilities>[
     providerId: id(route.providerId, "Partner Provider ID"),
     modelId: label(route.modelId, 128, "Partner model ID"),
     ...(route.effort === undefined ? {} : { effort: label(route.effort, 64, "Partner effort") }),
-    fastMode: decodeModelSpeed(route)
+    fastMode: decodeModelSpeed(route),
+    ...(route.taskModelGroupId ? { taskModelGroupId: route.taskModelGroupId } : {})
   };
 }
 

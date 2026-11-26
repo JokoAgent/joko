@@ -29,6 +29,18 @@ function fixture(kind = contract.ProviderGroupMemberKind.LOCAL, available = true
 async function mount(f: ReturnType<typeof fixture>) { const container = document.createElement("div"); document.body.append(container); const root = createRoot(container); roots.push(root);
   await act(async () => root.render(<ProviderGroupSettings api={f.api} nodeName="Owner" providers={[{ ...f.key, displayName: "Native Provider" }]} t={t} />)); return { container, root }; }
 function button(container: HTMLElement, text: string) { const value = [...container.querySelectorAll("button")].find(button => button.textContent === text); if (!value) throw new Error("Missing " + text); return value; }
+it("persists only the selected local account against the displayed pool revision", async () => {
+  const f = fixture(), source = create(contract.ProviderGroupKeySchema, { backendId: "native", providerId: "official" });
+  const pool = (included: boolean, revision: bigint) => create(contract.GetLocalOpenAiPoolResponseSchema, { revision,
+    accounts: [{ key: f.key, displayName: "My subscription", subscription: true, included: true }, { key: source, displayName: "Work key", included }] });
+  const set = vi.fn(async () => pool(true, 8n));
+  const { container } = await mount({ ...f, api: { ...f.api, localOpenAiPool: { get: async () => pool(false, 7n), set } } });
+  const checkbox = container.querySelector<HTMLInputElement>('fieldset input[type="checkbox"]')!;
+  expect(checkbox.checked).toBe(false);
+  await act(async () => checkbox.click());
+  expect(set).toHaveBeenCalledExactlyOnceWith(f.key, source, true, 7n, expect.any(AbortSignal));
+  expect(checkbox.checked).toBe(true);
+});
 it('reads only the expanded original account and retires a late result when collapsed', async () => {
   const f = fixture(), { container } = await mount(f);
   expect(f.quota).not.toHaveBeenCalled();

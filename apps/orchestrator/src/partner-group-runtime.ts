@@ -119,6 +119,7 @@ export class PartnerGroupSessionRuntime implements PartnerGroupRuntime {
       if (lane.phase === "unknown" || this.store.findOperation(lane.operationId) !== undefined) throw unavailable();
       try {
         const created = await this.host.createServiceSession({ operationId: lane.operationId, serviceKind: "partner", targetId, runtimeBackendId: primary.backendId,
+          savedModelGroupId: primary.taskModelGroupId,
           title: `${group.name} · ${partner.displayName}`, providerId: primary.providerId, modelId: primary.modelId,
           ...(primary.effort === undefined ? {} : { effort: primary.effort }), fastMode: primary.fastMode,
           permissionMode: partner.capabilities.permissionMode, planMode: partner.capabilities.planMode, appendSystemPrompt: partner.identitySource,

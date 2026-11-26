@@ -74,6 +74,7 @@ export type PartnerDelegationStatus =
   | "unknown";
 
 export interface PartnerModelRouteRecord {
+  readonly taskModelGroupId?: string;
   readonly backendId: string;
   readonly providerId: string;
   readonly modelId: string;

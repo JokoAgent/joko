@@ -2488,7 +2488,8 @@ function modelRoute(value: PartnerModelRouteRecord): PartnerModelRouteRecord {
   if (typeof value.fastMode !== "boolean" && value.fastMode !== "ultrafast") {
     throw new PartnerStoreError("PARTNER_INVALID", "Partner route Fast mode must be boolean.");
   }
-  return { backendId, providerId, modelId, ...(effort === undefined ? {} : { effort }), fastMode: value.fastMode };
+  return { backendId, providerId, modelId, ...(effort === undefined ? {} : { effort }), fastMode: value.fastMode,
+    ...(value.taskModelGroupId === undefined ? {} : { taskModelGroupId: routeText(value.taskModelGroupId, "Partner route model group", 96) }) };
 }
 
 function capabilitiesFromRow(row: Row): PartnerCapabilitiesRecord {
@@ -2515,7 +2516,7 @@ function capabilitiesFromColumns(row: Row, prefix: string): PartnerCapabilitiesR
   const routes = parsed.map((value) => {
     if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("Partner model route is invalid.");
     const record = value as Record<string, unknown>;
-    const keys = Object.keys(record).sort().join(",");
+    const keys = Object.keys(record).filter(key => key !== "taskModelGroupId").sort().join(",");
     if (keys !== "backendId,fastMode,modelId,providerId" && keys !== "backendId,effort,fastMode,modelId,providerId") {
       throw new Error("Partner model route has unknown fields.");
     }
@@ -2523,6 +2524,7 @@ function capabilitiesFromColumns(row: Row, prefix: string): PartnerCapabilitiesR
       backendId: stringValue(record["backendId"], "Partner route Backend ID"),
       providerId: stringValue(record["providerId"], "Partner route Provider ID"),
       modelId: stringValue(record["modelId"], "Partner route model ID"),
+      ...(record["taskModelGroupId"] === undefined ? {} : { taskModelGroupId: stringValue(record["taskModelGroupId"], "Partner route model group") }),
       ...(record["effort"] === undefined ? {} : { effort: stringValue(record["effort"], "Partner route effort") }),
       fastMode: record["fastMode"] === "ultrafast" ? "ultrafast" : booleanInteger(record["fastMode"], "Partner route Fast mode")
     });
@@ -2538,6 +2540,7 @@ function capabilitiesFromColumns(row: Row, prefix: string): PartnerCapabilitiesR
 
 function modelChainJson(routes: readonly PartnerModelRouteRecord[]): string {
   return JSON.stringify(routes.map((route) => ({
+    ...(route.taskModelGroupId === undefined ? {} : { taskModelGroupId: route.taskModelGroupId }),
     backendId: route.backendId,
     providerId: route.providerId,
     modelId: route.modelId,

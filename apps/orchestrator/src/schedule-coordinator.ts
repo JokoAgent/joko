@@ -883,7 +883,8 @@ export class ScheduleCoordinator {
       return { runId, sessionId, status: "aborted" };
     }
     const boundBackendId = currentSession.backendId === schedule.backendId ? undefined : currentSession.backendId;
-    if (boundBackendId !== undefined && (!this.#store.scheduleMatchesSession(schedule, currentSession) || !this.#isPairedPiBackend(boundBackendId))) {
+    if (boundBackendId !== undefined && (!this.#store.scheduleMatchesSession(schedule, currentSession)
+      || !this.#store.scheduleOwnsModelGroupSession(schedule, currentSession) && !this.#isPairedPiBackend(boundBackendId))) {
       this.recordPreSessionOutcome({ schedule, operationId, runId, scheduledAt,
         ...(nextRunAt === undefined ? {} : { nextRunAt }), status: "failed",
         detail: { reason: "The adopted task Backend is no longer available as a paired Pi route.", costAttribution: "zero" } });
@@ -1433,8 +1434,7 @@ export class ScheduleCoordinator {
       const existing = this.#store.getSession(schedule.sessionId);
       if (
         existing.descriptor.deletedAt === undefined &&
-        existing.descriptor.backendId === schedule.backendId &&
-        existing.descriptor.targetId === schedule.targetId
+        this.#store.scheduleMatchesSession(schedule, existing.descriptor)
       ) {
         return { schedule, sessionId: this.requireUsableSession(schedule, existing.descriptor.id) };
       }
@@ -1445,6 +1445,7 @@ export class ScheduleCoordinator {
       operationId: `${operationId}-session`,
       assertServiceScope: assertSchedule,
       assertCreationAdoption,
+      savedModelGroupId: execution.taskModelGroupId,
       targetId: schedule.targetId,
       title: schedule.name,
       automationOrigin: { scheduleId: schedule.id, scheduleName: schedule.name, runId, scheduleRevision: schedule.revision },
@@ -1694,6 +1695,7 @@ function copyScheduleForCoordinator(
 }
 
 function scheduleCreationSnapshot(value: unknown): {
+  readonly taskModelGroupId?: string;
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
@@ -1719,6 +1721,7 @@ function scheduleCreationSnapshot(value: unknown): {
     : "ask";
   return {
     ...(providerId === undefined || modelId === undefined ? {} : { providerId, modelId }),
+    ...(typeof record["taskModelGroupId"] === "string" ? { taskModelGroupId: record["taskModelGroupId"] } : {}),
     ...(effort === undefined ? {} : { effort }),
     fastMode: record["fastMode"] === "ultrafast" ? "ultrafast" : record["fastMode"] === true,
     permissionMode,

@@ -3158,6 +3158,14 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       } });
   }
 
+  localOpenAiSubscriptionGeneration(providerId: string, modelId: string): string | undefined {
+    if (this.#hosted || this.#disposed || providerId !== this.#providerId || this.#nativeAuthenticationRevoked
+      || this.#accountUsageLoginRequests > 0 || this.#account?.authenticationState !== "authenticated"
+      || this.#account.authMode !== "chatgpt" || !this.#host.isActiveGeneration(this.#host.generation)
+      || !this.#models.some(model => model.providerId === providerId && model.modelId === modelId)) return undefined;
+    return [this.#instanceGeneration, this.#host.generation, this.#nativeAuthenticationEpoch, this.#accountUsageLoginEpoch].join("/");
+  }
+
   async captureNativeSubscriptionAuthority(providerId: string, signal?: AbortSignal): Promise<NativeSubscriptionAuthority | undefined> {
     if (this.#hosted !== undefined || providerId !== this.#providerId) return undefined;
     this.#assertOpen();

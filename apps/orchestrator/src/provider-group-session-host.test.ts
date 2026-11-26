@@ -13,18 +13,21 @@ import { BackendInstanceRegistry } from "./backend-instance-registry.js";
 import type { HostedAgentSources } from "./hosted-agent-sources.js";
 import { ProviderGroupRuntime, providerGroupDefaultMember } from "./provider-group-runtime.js";
 import { SessionHost } from "./session-host.js";
+import { ScheduleCoordinator } from "./schedule-coordinator.js";
 import { ProviderGroupService } from "./provider-group-service.js";
 import { providerGroupQuota } from "./provider-group-quota.js";
 import { createClient, createRouterTransport } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import { createProviderGroupConnectService } from "./provider-group-connect-service.js";
+import { isOfficialOpenAiKeyModel, localOpenAiPoolKey, type LocalOpenAiAccountIdentity } from "./local-openai-pool.js";
+import type { ProviderDescriptor } from "./credential-manager.js";
 import { ProviderGroupRemoteRouter } from "./provider-group-remote.js";
 import { toProtoQueueItem } from "./proto-mapper.js";
 import { mkdtemp } from "./test-paths.js";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanups.splice(0)) await close(); });
-async function fixture(taskModels = false) {
+async function fixture(taskModels = false, openAiAccount?: (backend: string, provider: string, model: string) => LocalOpenAiAccountIdentity | undefined) {
   const root = await mkdtemp(join(tmpdir(), "joko-group-host-")), store = new OperationalStore(join(root, "store.db"));
   const artifacts = new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] }); await artifacts.initialize();
   const profile = { ...PI_LIKE_PROFILE, capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes" ? { ...capability, options: ["ask", "auto", "bypassPermissions"] } : capability) };
@@ -35,7 +38,7 @@ async function fixture(taskModels = false) {
   const host = new SessionHost(store, artifacts, registry.availableAdapters(), { backendDescriptors: registry.descriptors(), backendDescriptorsAlreadyPublished: true }); await host.initialize();
   const sources = { groupCatalog: () => [], installGroupSwitch: () => {}, installGroupStore: () => {}, sourceKind: () => undefined } as unknown as HostedAgentSources;
   const groups = new ProviderGroupRuntime({ store, registry, sources, nodeId: "group-node", nodeName: () => "This node", ownerGeneration: () => "owner-1",
-    now: () => Date.now(),
+    now: () => Date.now(), ...(openAiAccount ? { openAiAccount } : {}),
     sessions: host.providerGroupSessionPort(), readAccountUsage: async () => undefined, activeTurns: (backend, provider) => host.activeProviderTurns(backend, provider), assertRemoteAllowed: () => {} }); host.installProviderGroupRuntime(groups);
   await host.registerTarget({ id: "target", backendId: first.id, displayName: "Workspace", workspaceRoot: root, managed: false, trusted: true });
   const connection = store.createConnection({ id: "controller", name: "Owner", authKeyDigest: "digest" });
@@ -46,6 +49,46 @@ async function fixture(taskModels = false) {
   return { root, store, host, groups, registry, first, second, key, members, create, send, connection };
 }
 const prompt = (text: string): PromptInput => ({ text, images: [], files: [], mentions: [], disposition: "prompt" });
+
+it("admits only authenticated official Responses API keys for the requested wire model", () => {
+  const key = { enabled: true, authenticationState: "authenticated", kind: "custom_endpoint", credentialOrigin: "https://api.openai.com",
+    provider: { id: "custom", baseUrl: "https://api.openai.com/v1/", api: "openai-responses", apiKeyEnv: "TEST_KEY", models: [{ id: "exact" }] } } as ProviderDescriptor;
+  expect(isOfficialOpenAiKeyModel(key, "exact")).toBe(true);
+  expect(isOfficialOpenAiKeyModel(key, "alias")).toBe(false);
+  for (const baseUrl of ["https://other.test/v1", "https://api.openai.com/v1?override=1", "https://api.openai.com/v2"]) {
+    expect(isOfficialOpenAiKeyModel({ ...key, provider: { ...key.provider, baseUrl } }, "exact")).toBe(false);
+  }
+  expect(isOfficialOpenAiKeyModel({ ...key, provider: { ...key.provider, models: [{ id: "exact", baseUrl: "https://other.test/v1" }] } }, "exact")).toBe(false);
+  expect(isOfficialOpenAiKeyModel({ ...key, requestPath: "/chat/completions" }, "exact")).toBe(false);
+});
+
+it("opts a local subscription into an exact account pool, switches its owned send and keeps the pool private", async () => {
+  let subscriptionReady = true;
+  const f = await fixture(false, (backend, provider, model) => provider !== "test" || model !== "text" ? undefined
+    : backend === "group-first" ? subscriptionReady ? { kind: "subscription", generation: "original" } : undefined : { kind: "key", generation: "key-1" });
+  const client = (management: boolean) => createClient(contract.ProviderGroupService, createRouterTransport(router => router.service(contract.ProviderGroupService,
+    createProviderGroupConnectService(f.groups.connectOptions(() => ({ id: "owner", management, trust: "owner", assertCurrent() {} }))))));
+  const owner = client(true), peer = client(false), source = { backendId: f.second.id, providerId: "test" };
+  expect((await owner.getLocalOpenAiPool({ target: f.key })).accounts.filter(account => account.included)).toHaveLength(1);
+  await expect(peer.setLocalOpenAiPoolMember({ target: f.key, source, included: true })).rejects.toThrow(/permission_denied/i);
+  await expect(owner.setLocalOpenAiPoolMember({ target: f.key, source: { ...source, providerId: "vision" }, included: true })).rejects.toThrow();
+  const saved = await owner.setLocalOpenAiPoolMember({ target: f.key, source, included: true });
+  expect(saved.pool?.accounts.filter(row => row.included)).toHaveLength(2);
+  await expect(owner.setLocalOpenAiPoolMember({ target: source, source: f.key, included: true })).rejects.toThrow();
+  expect((await owner.listProviderGroups({})).groups).toEqual([]);
+  await expect(peer.getProviderGroup({ key: localOpenAiPoolKey(f.key) })).rejects.toThrow(/permission_denied/i);
+  const sessionId = (await f.create("mixed-account-task")).value.sessionId;
+  expect(f.groups.store.binding(sessionId)).toMatchObject({ group: localOpenAiPoolKey(f.key), backendId: f.first.id });
+  const original = f.store.getSession(sessionId).descriptor.binding;
+  subscriptionReady = false;
+  const send = vi.spyOn(f.second, "send"), queued = f.send(sessionId, "send-via-key");
+  await until(() => f.store.getQueueItem(queued.queueItemId).state === "completed");
+  expect(send).toHaveBeenCalledOnce();
+  expect(f.store.getSession(sessionId).descriptor).toMatchObject({ id: sessionId, targetId: "target", backendId: f.second.id, modelId: "text" });
+  expect(f.store.getSession(sessionId).descriptor.binding.opaqueRef).not.toBe(original.opaqueRef);
+  await owner.setLocalOpenAiPoolMember({ target: f.key, source, included: false, expectedRevision: saved.pool!.revision });
+  expect(f.groups.store.bindingRecord(sessionId)?.released).toBe(true);
+});
 async function until(predicate: () => boolean): Promise<void> { await vi.waitFor(() => expect(predicate()).toBe(true), { timeout: 8000, interval: 10 }); }
 
 function taskModelGroup(f: Awaited<ReturnType<typeof fixture>>, strategy: contract.TaskModelGroupStrategy, firstWeight?: number) {
@@ -94,6 +137,40 @@ it("rotates across exact accounts and Backends after first input, and binds the 
   const exact = (await f.create("exact-outside-group")).value.sessionId;
   expect(f.groups.taskModels.binding(exact)).toBeUndefined();
   expect(f.store.getSession(exact).descriptor).toMatchObject({ backendId: f.first.id, providerId: "test", modelId: "text" });
+});
+
+it("resolves a saved Partner route and a persistent Schedule on their owner, retaining the adopted occurrence route", async () => {
+  const f = await fixture(true);
+  const group = taskModelGroup(f, contract.TaskModelGroupStrategy.ROUND_ROBIN);
+  const partner = { operationId: "partner-group-first", serviceKind: "partner" as const, targetId: "target", title: "Partner",
+    savedModelGroupId: "work", providerId: "test", modelId: "text", fastMode: false, planMode: false, permissionMode: "ask" as const };
+  const first = await f.host.createServiceSession(partner);
+  expect(f.groups.taskModels.binding(first.value.sessionId)?.source.backendId).toBe(f.first.id);
+  expect((await f.host.createServiceSession(partner)).replayed).toBe(true);
+  expect((await group.preview()).selected?.source).toEqual(group.image);
+  f.store.upsertSchedule({ id: "grouped-schedule", backendId: f.first.id, targetId: "target", sessionMode: "persistent",
+    name: "Grouped job", kind: "manual", timezone: "UTC", enabled: true, prompt: prompt("Run once"),
+    executionSnapshot: { taskModelGroupId: "work", providerId: "test", modelId: "text", permissionMode: "ask" },
+    overlapPolicy: "queue", misfirePolicy: "run_once" });
+  const scheduler = new ScheduleCoordinator(f.store, f.host);
+  try {
+    const result = await scheduler.runNowWithResult("grouped-schedule", "group-fire");
+    expect(result.status).toBe("queued");
+    const session = f.store.getSession(result.sessionId!).descriptor;
+    expect(session).toMatchObject({ targetId: "target", backendId: f.second.id, modelId: "multimodal", automationOrigin: { scheduleId: "grouped-schedule" } });
+    expect(f.store.getSchedule("grouped-schedule").sessionId).toBe(session.id);
+    expect((await group.preview()).selected?.source).toEqual(group.text);
+    await until(() => f.store.findQueueItemByRunId(session.id, result.runId, { includeCleared: true })?.state === "completed");
+    const next = await scheduler.runNowWithResult("grouped-schedule", "group-fire-next");
+    expect(next).toMatchObject({ status: "queued", sessionId: session.id });
+    expect(f.store.findQueueItemByRunId(session.id, next.runId, { includeCleared: true })?.executionOverrides).toMatchObject({ modelId: "multimodal" });
+    expect((await group.preview()).selected?.source).toEqual(group.text);
+    await until(() => f.store.findQueueItemByRunId(session.id, next.runId, { includeCleared: true })?.state === "completed");
+    f.groups.taskModels.save(group.config.revision, []);
+    const plain = await f.host.createServiceSession({ ...partner, operationId: "deleted-group-partner" });
+    expect(f.store.getSession(plain.value.sessionId).descriptor).toMatchObject({ backendId: f.first.id, modelId: "text" });
+    expect(f.groups.taskModels.binding(plain.value.sessionId)).toBeUndefined();
+  } finally { scheduler.stop(); }
 });
 
 it("applies smooth task-model weights once per adopted input and never advances them on previews", async () => {

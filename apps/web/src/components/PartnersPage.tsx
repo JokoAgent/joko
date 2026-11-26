@@ -79,6 +79,7 @@ import { NativeArtifactFileActionsMenu } from "./NativeFileCopyMenu.js";
 import { formatPartnerDuration, partnerDelegationActive } from "./PartnerDelegationInlineCard.js";
 import { Button, CheckboxControl, IconButton, Modal, Pill, SelectControl, Spinner, cx, formatBytes } from "./ui.js";
 import type { Translator } from "./types.js";
+import { SavedModelGroupSelect } from "./SavedModelGroupSelect.js";
 import "./partners-page.css";
 
 interface PartnerCatalogState {
@@ -651,7 +652,7 @@ function PartnerInviteDialog({ open, directory, snapshot, controller, ownerKey, 
       <label className="field"><span>{t("partners.description")}</span><textarea disabled={locked} rows={2} maxLength={12_000} value={draft.description ?? ""} onChange={(event) => setDraft((current) => ({ ...current, description: event.target.value }))} /></label>
       <label className="field"><span>{t("partners.identity")}</span><textarea required disabled={locked} rows={8} maxLength={8_000} value={draft.identitySource} onChange={(event) => setDraft((current) => ({ ...current, identitySource: event.target.value }))} /><small>{t("partners.identityHelp")}</small></label>
       {formDirectory.defaultCapabilities !== undefined && <label className="check-row"><CheckboxControl disabled={locked} checked={draft.usesDirectoryDefaults} onChange={(event) => setDraft((current) => ({ ...current, usesDirectoryDefaults: event.target.checked, capabilities: event.target.checked ? undefined : current.capabilities ?? formDirectory.defaultCapabilities }))} /><span><strong>{t("partners.useDefaults")}</strong><small>{t("partners.useDefaultsHelp")}</small></span></label>}
-      {!draft.usesDirectoryDefaults && draft.capabilities !== undefined && <CapabilitiesEditor value={draft.capabilities} snapshot={snapshot} disabled={locked} t={t} onChange={(capabilities) => setDraft((current) => ({ ...current, capabilities }))} />}
+      {!draft.usesDirectoryDefaults && draft.capabilities !== undefined && <CapabilitiesEditor controller={controller} value={draft.capabilities} snapshot={snapshot} disabled={locked} t={t} onChange={(capabilities) => setDraft((current) => ({ ...current, capabilities }))} />}
       {receipts.length > 0 && <p role="status">{t(resolution === "absent" ? "partners.creationAbsent" : resolution === "retired" ? "partners.creationRetired" : "partners.creationUnknown")}</p>}
       {!modelsAvailable && receipts.length === 0 && <p role="status">{t("partners.error.modelUnavailable")}</p>}
       {error !== undefined && <p className="partner-editor__error" role="alert">{error}</p>}
@@ -703,7 +704,7 @@ function PartnerDefaultsDialog({ open, directory, snapshot, controller, ownerKey
     if (value.permissionMode === "bypassPermissions") permissionConfirmation.request(() => { void saveConfirmed(); });
     else void saveConfirmed();
   };
-  return <Modal open={open} title={t("partners.defaultsTitle")} description={t("partners.defaultsBody")} size="large" onClose={saving ? () => undefined : onClose}>{permissionConfirmation.dialog}<div ref={(node) => { permissionConfirmation.rootRef.current = node; }} className="partner-editor"><CapabilitiesEditor value={value} snapshot={snapshot} disabled={saving} t={t} onChange={setValue} />{error !== undefined && <p className="partner-editor__error" role="alert">{error}</p>}<div className="modal__actions"><Button onClick={onClose} disabled={saving}>{t("common.cancel")}</Button><Button tone="primary" disabled={saving || !validPartnerCapabilities(value) || !partnerCapabilitiesAvailable(value, snapshot)} onClick={save}>{saving ? t("common.working") : t("common.save")}</Button></div></div></Modal>;
+  return <Modal open={open} title={t("partners.defaultsTitle")} description={t("partners.defaultsBody")} size="large" onClose={saving ? () => undefined : onClose}>{permissionConfirmation.dialog}<div ref={(node) => { permissionConfirmation.rootRef.current = node; }} className="partner-editor"><CapabilitiesEditor controller={controller} value={value} snapshot={snapshot} disabled={saving} t={t} onChange={setValue} />{error !== undefined && <p className="partner-editor__error" role="alert">{error}</p>}<div className="modal__actions"><Button onClick={onClose} disabled={saving}>{t("common.cancel")}</Button><Button tone="primary" disabled={saving || !validPartnerCapabilities(value) || !partnerCapabilitiesAvailable(value, snapshot)} onClick={save}>{saving ? t("common.working") : t("common.save")}</Button></div></div></Modal>;
 }
 
 export function PartnerSettingsDialog({ partner, partners, directory, snapshot, controller, ownerKey, t, initialSection = "activity", initialPrivateThreadId, initialLearningDestination, initialHomeDestination, showClose = false, onClose, onUpdated, onActivityUpdated }: {
@@ -908,8 +909,8 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
       <label className="field"><span>{t("partners.description")}</span><textarea rows={3} maxLength={12_000} value={draft.description} onChange={(event) => setDraft((current) => ({ ...current, description: event.target.value }))} /></label>
       <label className="field"><span>{t("partners.identity")}</span><textarea required rows={9} maxLength={8_000} value={draft.identitySource} onChange={(event) => setDraft((current) => ({ ...current, identitySource: event.target.value }))} /><small>{t("partners.autosaveHelp")}</small></label>
       <label className="check-row"><CheckboxControl checked={draft.usesDirectoryDefaults} disabled={!draft.usesDirectoryDefaults && directory.defaultCapabilities === undefined} onChange={(event) => setDraft((current) => ({ ...current, usesDirectoryDefaults: event.target.checked, capabilities: event.target.checked ? directory.defaultCapabilities ?? current.capabilities : current.capabilities }))} /><span><strong>{t("partners.useDefaults")}</strong><small>{directory.defaultCapabilities === undefined ? t("partners.defaultsMissing") : t("partners.useDefaultsHelp")}</small></span></label>
-      {!draft.usesDirectoryDefaults && <CapabilitiesEditor value={draft.capabilities} snapshot={snapshot} disabled={saving} t={t} onChange={(capabilities) => setDraft((current) => ({ ...current, capabilities }))} />}
-      <TaskModelEditor value={draft.taskModelOverride} capabilities={draft.usesDirectoryDefaults ? directory.defaultCapabilities ?? draft.capabilities : draft.capabilities}
+      {!draft.usesDirectoryDefaults && <CapabilitiesEditor controller={controller} value={draft.capabilities} snapshot={snapshot} disabled={saving} t={t} onChange={(capabilities) => setDraft((current) => ({ ...current, capabilities }))} />}
+      <TaskModelEditor controller={controller} t={t} value={draft.taskModelOverride} capabilities={draft.usesDirectoryDefaults ? directory.defaultCapabilities ?? draft.capabilities : draft.capabilities}
         snapshot={snapshot} disabled={saving} locale={controller.state.effectiveLocale} onChange={taskModelOverride => setDraft(current => {
           const { taskModelOverride: _previous, ...rest } = current;
           return taskModelOverride === undefined ? rest : { ...rest, taskModelOverride };
@@ -1274,7 +1275,8 @@ function partnerById(partners: readonly PartnerProfileView[], partnerId: string)
   return partners.find((partner) => partner.id === partnerId);
 }
 
-function TaskModelEditor({ value, capabilities, snapshot, disabled, locale, onChange }: {
+function TaskModelEditor({ controller, t, value, capabilities, snapshot, disabled, locale, onChange }: {
+  readonly controller: AppController; readonly t: Translator;
   readonly value?: PartnerModelRouteView; readonly capabilities: PartnerCapabilitiesView; readonly snapshot: AppSnapshot;
   readonly disabled: boolean; readonly locale: string; readonly onChange: (value: PartnerModelRouteView | undefined) => void;
 }): JSX.Element {
@@ -1298,12 +1300,15 @@ function TaskModelEditor({ value, capabilities, snapshot, disabled, locale, onCh
     {(fastSupported || ultrafastSupported || route.fastMode) && <ModelSpeedControl className="partner-route-check" value={route.fastMode}
       supportsFast={fastSupported} supportsUltrafast={ultrafastSupported} locale={locale} disabled={disabled}
       onChange={fastMode => onChange({ ...route, fastMode })} />}
+    <SavedModelGroupSelect controller={controller} value={route.taskModelGroupId} disabled={disabled} t={t}
+      onChange={taskModelGroupId => onChange({ ...route, taskModelGroupId })} />
     {value === undefined ? <p className="muted">{m.inheriting}</p> : <Button tone="ghost" onClick={() => onChange(undefined)}>{m.inherit}</Button>}
     <p className="muted">{m.help}</p>
   </fieldset>;
 }
 
-function CapabilitiesEditor({ value, snapshot, disabled = false, t, onChange }: {
+function CapabilitiesEditor({ controller, value, snapshot, disabled = false, t, onChange }: {
+  readonly controller: AppController;
   readonly value: PartnerCapabilitiesView;
   readonly snapshot: AppSnapshot;
   readonly disabled?: boolean;
@@ -1355,6 +1360,8 @@ function CapabilitiesEditor({ value, snapshot, disabled = false, t, onChange }: 
       const options = models;
       return <div className="partner-model-route" key={`${index}:${routeKey(route)}`}>
         <span className="partner-model-route__number">{index + 1}</span>
+        <SavedModelGroupSelect controller={controller} value={route.taskModelGroupId} disabled={disabled} t={t}
+          onChange={taskModelGroupId => replaceRoute(index, { ...route, taskModelGroupId })} />
         <label className="field"><span>{index === 0 ? t("partners.primaryModel") : t("partners.fallbackModel")}</span><SelectControl value={routeKey(route)} onChange={(event) => selectModel(index, event.target.value)}>{model === undefined && <option value={routeKey(route)}>{route.providerId} · {route.modelId}</option>}{options.map((candidate) => <option key={modelKey(candidate)} value={modelKey(candidate)} disabled={!canSelectModel(candidate, index) || value.modelChain.some((used, usedIndex) => usedIndex !== index && routeKey(used) === modelKey(candidate))}>{modelLabel(candidate)}</option>)}</SelectControl></label>
         {model !== undefined && model.efforts.length > 0 && <label className="field"><span>{t("controls.effort")}</span><SelectControl value={route.effort ?? ""} onChange={(event) => replaceRoute(index, { ...route, effort: event.target.value })}>{model.efforts.map((effort) => <option value={effort} key={effort}>{effort}</option>)}</SelectControl></label>}
         {model && (model.supportsFast || model.supportsUltrafast) && <ModelSpeedControl className="partner-route-check" value={route.fastMode}

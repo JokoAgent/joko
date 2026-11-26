@@ -110,6 +110,7 @@ import { InputHandoffTools, INPUT_HANDOFF_TOOL_PROVIDER_ID } from "./input-hando
 import { createProviderSharingRuntime, type ProviderSharingRuntime } from "./provider-sharing-runtime.js";
 import { ExtensionDeviceSync } from "./extension-device-sync.js";
 import { ProviderGroupRuntime } from "./provider-group-runtime.js";
+import { isOfficialOpenAiKeyModel } from "./local-openai-pool.js";
 import { createProviderGroupHostedEndpoint } from "./provider-group-hosted.js";
 import { createHostedNativeTextInference } from "./hosted-native-text-inference.js";
 import { DesktopVoiceConversationManager } from "./voice-conversation/manager.js";
@@ -2093,7 +2094,9 @@ export async function createOrchestratorApplication(
       const task = partnerSessionTasks?.fallback(input);
       const group = partnerGroupRuntime?.fallback(input);
       const routine = partners.routineFallback(input);
-      return task?.owned ? task : group?.owned ? group : routine.owned ? routine : partnerSessionRuntimeFallback(partnerStore, input);
+      return task?.owned ? task : group?.owned ? group : routine.owned ? routine : partnerSessionRuntimeFallback(partnerStore, input,
+        groupId => store.getTarget(store.getSession(input.sessionId).descriptor.targetId).descriptor.remoteWorkspace === undefined
+          ? providerGroups?.taskModels.localFallbacks(groupId) ?? [] : []);
     },
     partnerSessionRetiring: (sessionId) => partnerStore.isPartnerSessionRetiring(sessionId)
       || partners.isRoutineSessionRetiring(sessionId)
@@ -2250,6 +2253,20 @@ export async function createOrchestratorApplication(
   providerGroups = new ProviderGroupRuntime({ store, registry: backendInstances, sources: hostedAgentSources, nodeId: serverId,
     nodeName: () => hostname().trim() || "This computer", sessions: sessionHost.providerGroupSessionPort(),
     ownerGeneration: () => { if (closed) throw new Error("Provider groups have closed."); return providerGroupOwnerGeneration; },
+    openAiAccount: (backendId, providerId, modelId) => {
+      const backend = backendInstances.get(backendId);
+      if (backend.state !== "available" || !["pi", "codex"].includes(backend.descriptor.adapterKind)
+        || !modelRoutingEnabled(store, backendId, providerId, modelId) || !configuredProviderRouteEnabled(backendId, providerId)) return undefined;
+      if (providers.hasManagedProvider(backendId, providerId)) {
+        if (!isOfficialOpenAiKeyModel(providers.get(backendId, providerId), modelId)) return undefined;
+        const identity = providers.describeInferenceRoute(backendId, providerId, modelId);
+        return identity ? { kind: "key", generation: identity.generationId } : undefined;
+      }
+      const adapter = backendInstances.adapter(backendId);
+      const generation = adapter instanceof CodexBackendAdapter ? adapter.localOpenAiSubscriptionGeneration(providerId, modelId)
+        : providers.localPiOpenAiSubscriptionGeneration(backendId, providerId, modelId);
+      return generation ? { kind: "subscription", generation } : undefined;
+    },
     taskModelEnabled: (backendId, providerId, modelId) =>
       store.findSetting<{ readonly enabled?: boolean }>("service", "orchestrator", `settings.backend.${backendId}`)?.value.enabled !== false
       && modelRoutingEnabled(store, backendId, providerId, modelId) && configuredProviderRouteEnabled(backendId, providerId)

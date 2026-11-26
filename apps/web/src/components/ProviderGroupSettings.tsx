@@ -11,7 +11,7 @@ export const providerGroupSettingsMessageKeys = ["title", "body", "provider", "l
   "leastBusy", "roundRobin", "ordered", "weighted", "autoSwitch", "members", "noCandidates", "unavailable", "capacity", "weight", "paused", "localPause", "moveUp", "moveDown", "invalidNumbers",
   "usage", "period", "all", "last30Days", "last7Days", "today", "specificDay", "person", "node", "model", "turns", "tokens", "cost", "estimated", "incomplete", "noUsage",
   "accountQuota", "quotaShared", "quotaUnsupported", "quotaOffline", "primaryWindow", "secondaryWindow", "credits", "unlimited", "remaining", "resets", "observed", "extraUsage", "resetCredits",
-  "quotaExhausted", "creditsAvailable", "creditsNone", "extraDisabled", "windowMinutes"] as const;
+  "quotaExhausted", "creditsAvailable", "creditsNone", "extraDisabled", "windowMinutes", "localAccounts", "keyAccount", "subscriptionAccount"] as const;
 export type ProviderGroupSettingsMessage = typeof providerGroupSettingsMessageKeys[number];
 export type ProviderGroupSettingsTranslator = (key: `settings.providerGroups.${ProviderGroupSettingsMessage}`, values?: Readonly<Record<string, string | number>>) => string;
 export interface ProviderGroupSettingsProps {
@@ -33,7 +33,40 @@ export function ProviderGroupSettings({ api, nodeName, providers, t }: ProviderG
       {providers.map(provider => <option key={keyOf(provider)} value={keyOf(provider)}>{provider.displayName}</option>)}
     </select></label>
     {provider && <GroupPanel key={available} api={api} provider={provider} t={t} />}
+    {provider && api.localOpenAiPool && <LocalOpenAiPoolPanel key={available + ":accounts"} api={api.localOpenAiPool} provider={provider} t={t} />}
   </section>;
+}
+function LocalOpenAiPoolPanel({ api, provider, t }: { readonly api: NonNullable<ProviderGroupSettingsApi["localOpenAiPool"]>;
+  readonly provider: Pick<contract.ProviderGroupKey, "backendId" | "providerId">; readonly t: ProviderGroupSettingsTranslator }): JSX.Element | null {
+  const [pool, setPool] = useState<contract.GetLocalOpenAiPoolResponse>();
+  const [failed, setFailed] = useState(false), [busy, setBusy] = useState(false), [reload, setReload] = useState(0);
+  const owner = useRef<AbortController | undefined>(undefined);
+  const { backendId, providerId } = provider;
+  useEffect(() => {
+    const current = new AbortController(); owner.current = current;
+    setPool(undefined); setFailed(false); setBusy(false);
+    void api.get({ backendId, providerId }, current.signal).then(value => { if (!current.signal.aborted) setPool(value); })
+      .catch(error => { if (!current.signal.aborted && ConnectError.from(error).code !== Code.Unimplemented) setFailed(true); });
+    return () => { current.abort(); };
+  }, [api, backendId, providerId, reload]);
+  const update = async (source: contract.ProviderGroupKey, included: boolean) => {
+    const current = owner.current;
+    if (!current || current.signal.aborted || !pool || busy) return;
+    setBusy(true);
+    try {
+      const result = await api.set({ backendId, providerId }, source, included, pool.revision, current.signal);
+      if (!current.signal.aborted) setPool(result);
+    } catch { if (!current.signal.aborted) setFailed(true); }
+    finally { if (!current.signal.aborted) setBusy(false); }
+  };
+  const rows = pool?.accounts.filter(row => row.key && keyOf(row.key) !== keyOf(provider)) ?? [];
+  if (!rows.length && !failed) return null;
+  return <fieldset className="settings-card settings-card--content"><legend>{t("settings.providerGroups.localAccounts")}</legend>
+    {rows.map(row => <label key={keyOf(row.key!)} className="setting-row"><span>{row.displayName} · {t(row.subscription ? "settings.providerGroups.subscriptionAccount" : "settings.providerGroups.keyAccount")}</span>
+      <input type="checkbox" checked={row.included} disabled={busy || failed} onChange={event => void update(row.key!, event.target.checked)} /></label>)}
+    {failed && <><p role="alert">{t(pool ? "settings.providerGroups.saveFailed" : "settings.providerGroups.loadFailed")}</p>
+      <Button onClick={() => setReload(value => value + 1)}>{t("settings.providerGroups.refresh")}</Button></>}
+  </fieldset>;
 }
 function GroupPanel({ api, provider, t }: { readonly api: ProviderGroupSettingsApi; readonly provider: { readonly backendId: string; readonly providerId: string }; readonly t: ProviderGroupSettingsTranslator }): JSX.Element {
   const [snapshot, setSnapshot] = useState<contract.ProviderGroupSnapshot>();

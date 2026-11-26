@@ -1318,6 +1318,17 @@ export class ProviderCatalogManager {
     return this.#entries.has(managedProviderKey(backendId, providerId));
   }
 
+  localPiOpenAiSubscriptionGeneration(backendId: string, providerId: string, modelId: string): string | undefined {
+    if (backendId !== this.#nativeBackendId || providerId !== "openai-codex" || this.hasManagedProvider(backendId, providerId)
+      || !this.#providerEnabled(backendId, providerId) || !this.#modelEnabled(backendId, providerId, modelId)) return undefined;
+    const native = this.#nativeEntries.get(providerId);
+    if (native?.kind !== "subscription" || !native.accountUsageAvailable || !native.credentialReferenceId
+      || !native.runtimeProvider?.models.some(model => model.id === modelId)) return undefined;
+    const credential = this.#credentials.find(native.credentialReferenceId);
+    return credential?.configured && this.#nativeDescriptor(native).authenticationState === "authenticated"
+      ? [native.version, credential.generation].join("/") : undefined;
+  }
+
   listManaged(backendId: string): readonly ProviderDescriptor[] {
     this.#assertInitialized();
     return [...this.#entries.values()].filter((entry) => entry.backendId === backendId).map((entry) => this.#descriptor(entry, undefined));

@@ -12,6 +12,7 @@ import { providerGroupQuota } from "./provider-group-quota.js";
 import type { ProviderGroupTaskMember } from "./provider-group-runtime.js";
 import { ConnectionAuthenticationError } from "./connection-manager.js";
 import type { TaskModelGroups } from "./task-model-groups.js";
+import { isLocalOpenAiPool, type LocalOpenAiPools } from "./local-openai-pool.js";
 
 export interface ProviderGroupPrincipal {
   readonly id: string; readonly trust: "owner"; readonly management: boolean; assertCurrent(): void;
@@ -19,6 +20,7 @@ export interface ProviderGroupPrincipal {
 export interface ProviderGroupConnectOptions {
   readonly service: ProviderGroupService; readonly usage: ProviderGroupUsage;
   readonly taskModels?: TaskModelGroups;
+  readonly localOpenAiPools?: LocalOpenAiPools;
   readonly taskModelGroupSwitch?: (
     request: contract.GetTaskModelGroupSwitchRequest, signal: AbortSignal
   ) => ReturnType<import("./session-host.js").SessionHost["getTaskModelGroupSwitch"]>;
@@ -66,12 +68,26 @@ export function createProviderGroupConnectService(options: ProviderGroupConnectO
         : error instanceof ProviderGroupUnavailableError ? Code.Unavailable : Code.FailedPrecondition);
     }
   };
-  const key = (value: contract.ProviderGroupKey | undefined, principal: ProviderGroupPrincipal) => { const result = fromGroupKey(value); if (!principal.management) options.assertRemoteAllowed(result); return result; };
+  const key = (value: contract.ProviderGroupKey | undefined, principal: ProviderGroupPrincipal) => {
+    const result = fromGroupKey(value);
+    if (isLocalOpenAiPool(result)) throw new ConnectError("An actual Provider connection is required.", Code.PermissionDenied);
+    if (!principal.management) options.assertRemoteAllowed(result);
+    return result;
+  };
   const taskModels = (): TaskModelGroups => {
     if (!options.taskModels) throw new ConnectError("Task model groups are unavailable.", Code.Unimplemented);
     return options.taskModels;
   };
   return {
+    getLocalOpenAiPool: (request, context) => invoke(context, true, async principal => {
+      if (!options.localOpenAiPools) throw new ConnectError("Local account pooling is unavailable.", Code.Unimplemented);
+      return options.localOpenAiPools.get(key(request.target, principal));
+    }),
+    setLocalOpenAiPoolMember: (request, context) => invoke(context, true, async principal => {
+      if (!options.localOpenAiPools) throw new ConnectError("Local account pooling is unavailable.", Code.Unimplemented);
+      const pool = options.localOpenAiPools.set(key(request.target, principal), key(request.source, principal), request.included, request.expectedRevision);
+      return create(contract.SetLocalOpenAiPoolMemberResponseSchema, { pool });
+    }),
     listTaskModelGroups: (_request, context) => invoke(context, true, async () => taskModels().list()),
     saveTaskModelGroups: (request, context) => invoke(context, true, async () =>
       create(contract.SaveTaskModelGroupsResponseSchema, { config: taskModels().save(request.expectedRevision, request.groups) })),

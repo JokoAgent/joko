@@ -617,6 +617,7 @@ export interface CreateSessionInput {
 }
 
 export interface CreateScheduledSessionInput {
+  readonly savedModelGroupId?: string;
   /** Revalidate the private caller before effects and product adoption. */
   readonly assertServiceScope?: () => void;
   /** Called only after native creation returned its exact binding. A cancelled
@@ -656,6 +657,7 @@ export interface CreateScheduledSessionInput {
  * scheduled Session this has no ephemeral-worktree owner and survives after
  * its first queued message settles. */
 export interface CreateServiceSessionInput {
+  readonly savedModelGroupId?: string;
   readonly operationId: string;
   readonly serviceKind: "session_handoff" | "partner" | "collaboration" | "messaging" | "learning" | "personal_development" | "extension";
   /** Approved plugin ownership is adopted atomically with its normal Session. */
@@ -1257,8 +1259,8 @@ export class SessionHost {
             return injection?.generation === options.recoverGeneration && injection.binding.opaqueRef === session.binding.opaqueRef
               && injection.binding.nativeSessionId === session.binding.nativeSessionId && sameProfile(current.effective) ? "committed" : "unknown";
           }
-        } else if (options.fresh) this.#stageSessionRuntimeHandoff({ sessionId, expectedGeneration: current.generation, patch: profile, source: "fallback", fresh: true }, this.#store.getSession(sessionId), current);
-        else await this.setSessionRuntimeControl({ sessionId, expectedGeneration: current.generation, patch: profile, source: "fallback", assertAuthority: assertCurrent });
+        } else if (options.fresh) this.#stageSessionRuntimeHandoff({ sessionId, expectedGeneration: current.generation, patch: profile, source: "fallback", fresh: true, ...(options.localAccounts ? { nativeProvider: true } : {}) }, this.#store.getSession(sessionId), current);
+        else await this.setSessionRuntimeControl({ sessionId, expectedGeneration: current.generation, patch: profile, source: "fallback", assertAuthority: assertCurrent, ...(options.localAccounts ? { allowNativeProviderHandoff: true } : {}) });
         assertCurrent(); const pending = this.#runtimeHandoffs.read(sessionId)?.pending;
         if (pending) options.onPrepared?.(pending.generation);
         const applied = pending ? await this.#performSessionRuntimeHandoff(sessionId, assertCurrent) : await this.#applyPendingSessionRuntimeControl(sessionId, true, assertCurrent);
@@ -2953,6 +2955,21 @@ export class SessionHost {
       && this.#store.listCollaborationGoals({ leadSessionId: stored.descriptor.id }).length === 0;
   }
 
+  async preparePartnerModelGroup(sessionId: string, groupId: string, accept: (profile: SessionRuntimeProfile) => boolean):
+    Promise<{ profile: SessionRuntimeProfile; adopt?: () => void } | undefined> {
+    const models = this.#providerGroups?.taskModels, selection = models?.savedSelection(groupId);
+    const target = this.#store.getTarget(this.#store.getSession(sessionId).descriptor.targetId).descriptor;
+    if (!models || !selection || !target.trusted || target.remoteWorkspace) return undefined;
+    const effective = this.getSessionRuntimeControl(sessionId).effective, binding = models.binding(sessionId);
+    if (binding?.groupId === groupId && binding.revision === selection.expectedRevision.toString() && effective
+      && models.ownsRoute(sessionId, effective) && accept(effective)) return { profile: effective };
+    const choice = await models.resolve(selection, { signal: new AbortController().signal, accepts: (source, model) =>
+      source.kind === "local" && accept({ backendId: source.backendId, providerId: source.providerId, modelId: model.modelId, fastMode: false }) });
+    if (!choice) return undefined;
+    choice.assertCurrent();
+    return { profile: choice.profile, adopt: () => this.#store.transaction(() => { choice.bind(sessionId); models.commitBoundRotation(sessionId); }) };
+  }
+
   async selectTaskModelGroup(input: {
     readonly sessionId: string;
     readonly sessionGeneration: bigint;
@@ -4401,8 +4418,11 @@ export class SessionHost {
     this.assertMessageDeletionAdmission(sessionId);
     const savedOverrides = scheduleTurnOverrides(input.schedule.executionSnapshot);
     let overrides = savedOverrides;
-    if (input.boundBackendId !== undefined) {
-      if (session.backendId !== input.boundBackendId || !this.#store.scheduleMatchesSession(input.schedule, session)
+    const snapshot = input.schedule.executionSnapshot;
+    const useCurrentGroupModel = isRecord(snapshot) && typeof snapshot["taskModelGroupId"] === "string"
+      && this.#providerGroups?.taskModels.savedSelection(snapshot["taskModelGroupId"]) !== undefined;
+    if (input.boundBackendId !== undefined || useCurrentGroupModel) {
+      if (input.boundBackendId !== undefined && session.backendId !== input.boundBackendId || !this.#store.scheduleMatchesSession(input.schedule, session)
         || session.providerId === undefined || session.modelId === undefined) {
         throw new StoreError("The Schedule lost its adopted task Backend before admission.");
       }
@@ -7750,7 +7770,7 @@ export class SessionHost {
     if (groups.taskModels.ownsRoute(item.sessionId, session.profile)) return false;
     const binding = groups.store.binding(item.sessionId);
     return binding !== undefined || groups.remote.owns({ backendId: session.profile.backendId, providerId: session.profile.providerId })
-      || groups.store.snapshot({ backendId: session.profile.backendId, providerId: session.profile.providerId }).config !== undefined;
+      || groups.store.snapshot(session.profile).config !== undefined || groups.service.configuredLocalAccountPool(session.profile) !== undefined;
   }
   #taskModelGroupApplies(item: QueueItemRecord): boolean {
     const models = this.#providerGroups?.taskModels;
@@ -13589,7 +13609,10 @@ export class SessionHost {
       }
       let target = runtimeBackendId === undefined ? registeredTarget : { ...registeredTarget,
         descriptor: { ...registeredTarget.descriptor, backendId: runtimeBackendId } };
-      const taskModelGroup = authorized ? input.taskModelGroup : undefined;
+      const savedGroupId = !authorized && ("automationOrigin" in input && !input.frozenOccurrenceRouting && input.assertServiceScope
+        || "serviceKind" in input && input.serviceKind === "partner") ? input.savedModelGroupId : undefined;
+      const taskModelGroup = authorized ? input.taskModelGroup : savedGroupId && registeredTarget.descriptor.trusted
+        && !registeredTarget.descriptor.remoteWorkspace ? this.#providerGroups?.taskModels.savedSelection(savedGroupId) : undefined;
       if (taskModelGroup !== undefined) {
         if (!registeredTarget.descriptor.trusted || registeredTarget.descriptor.remoteWorkspace !== undefined || !this.#providerGroups) {
           throw new StoreError("Model groups require a trusted local task workspace.");
@@ -13597,6 +13620,7 @@ export class SessionHost {
         taskModelAssignment = await this.#providerGroups.taskModels.resolve(taskModelGroup, {
           signal: new AbortController().signal,
           accepts: (source, model) => {
+            if (!authorized && source.kind !== "local") return false;
             const backend = this.#store.getBackend(source.backendId).descriptor;
             if (input.permissionMode !== "ask" && !supportsPermissionMode(backend, input.permissionMode)) return false;
             if (input.planMode && backend.capabilities.get("plan_mode")?.supported !== true) return false;
@@ -13827,10 +13851,11 @@ export class SessionHost {
         this.#store.setSetting("service", sessionId, PRIVATE_CREATION_RECEIPT_KEY, { version: 1, operationId: claim.operation.id, phase: "prepared" } satisfies PrivateCreationReceipt);
         input.assertServiceScope(); await input.beforeNativeCreation(sessionId, runtimeTarget); input.assertServiceScope();
       }
-      const creationAuthority = authorized && (runtimeTarget.remoteWorkspace?.kind === "ssh" || taskModelAssignment !== undefined) ? {
+      const creationAuthority = (authorized && runtimeTarget.remoteWorkspace?.kind === "ssh") || taskModelAssignment !== undefined ? {
         assertNativeCreationCurrent: () => {
           this.#assertOpen();
-          this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+          if (authorized) this.#store.authorizeConnection(input.connection.id, input.connection.authKeyDigest);
+          else if ("assertServiceScope" in input) input.assertServiceScope?.();
           taskModelAssignment?.assertCurrent();
         }
       } : {};
@@ -14113,12 +14138,14 @@ export class SessionHost {
                 automationOccurrenceRouting: input.frozenOccurrenceRouting
               } : {}),
               localRuntimeBackendSelection: runtimeBackendId !== undefined || groupAssignment !== undefined || taskModelAssignment !== undefined,
+              ...(automationOrigin && taskModelAssignment && savedGroupId ? { scheduledModelGroupId: savedGroupId } : {}),
               nativeSessionBlank: nativeStart.kind === "new"
                 && nativeStart.parentNativeReference === undefined
             });
             if (workerWorkspace) store.setSetting("service", sessionId, WORKER_WORKSPACE_BINDING_KEY, workerWorkspace);
             groupAssignment?.commit();
             taskModelAssignment?.bind(sessionId);
+            if (savedGroupId && taskModelAssignment && !creationCancelled) this.#providerGroups!.taskModels.commitBoundRotation(sessionId);
             this.#runtimeHandoffs.finishCreation(claim.operation.id);
             if ("onAdmitted" in input && input.onAdmitted !== undefined) input.onAdmitted(store, created);
             if ("onMessagingAdmitted" in input) input.onMessagingAdmitted?.(store, created);
@@ -21863,6 +21890,7 @@ function createSessionOperationBody(input: SessionCreationInput): unknown {
   return {
     targetId: input.targetId,
     ...("runtimeBackendId" in input && input.runtimeBackendId !== undefined ? { runtimeBackendId: input.runtimeBackendId } : {}),
+    ...("savedModelGroupId" in input && input.savedModelGroupId ? { savedModelGroupId: input.savedModelGroupId } : {}),
     title: input.title,
     ...("provisionalDraftId" in input && input.provisionalDraftId !== undefined ? { provisionalDraftId: input.provisionalDraftId } : {}),
     ...("reuseProvisionalSessionId" in input && input.reuseProvisionalSessionId !== undefined ? { reuseProvisionalSessionId: input.reuseProvisionalSessionId } : {}),

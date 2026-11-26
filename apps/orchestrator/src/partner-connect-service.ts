@@ -710,6 +710,7 @@ function fromProtoCapabilities(value: contract.PartnerCapabilities): PartnerCapa
 
 function fromProtoRoute(value: contract.PartnerModelRoute): PartnerModelRouteRecord {
   return {
+    ...(value.taskModelGroupId === undefined ? {} : { taskModelGroupId: value.taskModelGroupId }),
     backendId: value.backendId,
     providerId: value.providerId,
     modelId: value.modelId,

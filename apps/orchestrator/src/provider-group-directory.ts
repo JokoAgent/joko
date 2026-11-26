@@ -2,8 +2,10 @@ import type { ProviderModel } from "@joko/core";
 import { groupKey, type ProviderGroupKey, type ProviderGroupMember } from "@joko/store";
 import type { ProviderSharingDirectoryPort, ProviderSharingRecipient } from "./provider-sharing-ports.js";
 import type { ProviderGroupQuota, ProviderGroupQuotaReader } from "./provider-group-quota.js";
+import type { LocalOpenAiAccountIdentity } from "./local-openai-pool.js";
 
 export interface ProviderGroupDirectorySource extends ProviderGroupKey {
+  readonly openAiAccount?: (modelId: string) => LocalOpenAiAccountIdentity | undefined;
   readonly key: string; readonly kind: ProviderGroupMember["kind"]; readonly nodeId: string; readonly displayName: string;
   readonly nativeBackendId: string;
   readonly nativeBackendInstanceGeneration?: number;
@@ -36,6 +38,7 @@ export interface ProviderGroupDirectoryOptions {
   readonly ownerGeneration: () => string;
 }
 export interface ProviderGroupDirectoryRequest {
+  readonly localAccounts?: boolean;
   readonly agentKind: string; readonly modelId: string; readonly logicalModelId?: string;
   readonly ownTask: boolean; readonly recipient?: ProviderSharingRecipient; readonly fresh?: boolean;
 }
@@ -60,11 +63,14 @@ export class ProviderGroupDirectory {
     if (source.agentKind !== request.agentKind || source.kind !== "local" && !source.remotelyEnabled) return unavailable("model");
     if (member.paused && !(member.kind === "local" && request.ownTask)) return unavailable("paused");
     const model = source.models.find(model => model.modelId === request.modelId)
-      ?? (request.logicalModelId === undefined ? undefined : source.models.find(model => (model.logicalId ?? model.modelId) === request.logicalModelId));
+      ?? (request.localAccounts || request.logicalModelId === undefined ? undefined : source.models.find(model => (model.logicalId ?? model.modelId) === request.logicalModelId));
     if (!model) return unavailable("model");
+    const account = request.localAccounts ? source.openAiAccount?.(model.modelId) : undefined;
+    if (request.localAccounts && (!account || !request.ownTask || source.kind !== "local")) return unavailable("authorization");
     const assertCurrent = () => {
       signal.throwIfAborted(); if (generation !== this.options.ownerGeneration()) throw new Error("Provider group owner changed.");
       source.assertCurrent();
+      if (account && source.openAiAccount?.(model.modelId)?.generation !== account.generation) throw new Error("Local OpenAI credential changed.");
       if (source.kind === "share") {
         if (!member.received || !this.options.sharing) throw new Error("Provider share authority is unavailable.");
         this.options.sharing.assertReceived(member.received);

@@ -25507,6 +25507,10 @@ function scheduleExecutionSnapshot(
     return withScheduleExtensionSnapshot(existing, scheduleExtensionSnapshot(existing));
   }
   const model = input.model?.model;
+  if (input.taskModelGroupId !== undefined && (input.executionMode === contract.ScheduleExecutionMode.SCRIPT
+    || !model || !input.taskModelGroupId.trim() || input.taskModelGroupId.trim() !== input.taskModelGroupId || input.taskModelGroupId.length > 96)) {
+    throw invalidArgument("A Schedule model group requires an agent, a group ID and a saved model.");
+  }
   if (model !== undefined && (model.providerId.trim() === "" || model.modelId.trim() === "")) {
     throw invalidArgument("schedule.execution.model requires both provider_id and model_id");
   }
@@ -25521,6 +25525,7 @@ function scheduleExecutionSnapshot(
   }
   const base = {
     ...(model === undefined ? {} : { providerId: model.providerId, modelId: model.modelId }),
+    ...(input.taskModelGroupId === undefined ? {} : { taskModelGroupId: input.taskModelGroupId }),
     ...(input.model?.effortId === undefined || input.model.effortId === "" ? {} : { effort: input.model.effortId }),
     ...(input.model === undefined ? {} : { fastMode: contract.decodeModelSpeed(input.model) }),
     permissionMode: corePermission(input.permissionMode),

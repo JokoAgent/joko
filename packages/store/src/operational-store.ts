@@ -3658,6 +3658,7 @@ export class OperationalStore {
     options: {
       readonly nativeSessionBlank?: boolean;
       readonly localRuntimeBackendSelection?: boolean;
+      readonly scheduledModelGroupId?: string;
       readonly derivationOperationId?: string;
       readonly piTreeForkEntryId?: string;
       readonly nativeCatalogAdoptionOperationId?: string;
@@ -3715,10 +3716,16 @@ export class OperationalStore {
         const schedule = this.getSchedule(automationOrigin.scheduleId);
         const routing = options.automationOccurrenceRouting ?? schedule;
         if (options.automationOccurrenceRouting) this.assertScheduleOccurrenceRouting(schedule.id, automationOrigin.runId, options.automationOccurrenceRouting);
-        if (routing.backendId !== descriptor.backendId || routing.targetId !== descriptor.targetId) {
+        if (options.scheduledModelGroupId && (options.automationOccurrenceRouting || !options.localRuntimeBackendSelection
+          || !isRecord(schedule.executionSnapshot) || schedule.executionSnapshot["taskModelGroupId"] !== options.scheduledModelGroupId
+          || isRecord(schedule.executionSnapshot["scheduler"]) && schedule.executionSnapshot["scheduler"]["executionMode"] === "script"
+          || target.descriptor.remoteWorkspace || !target.descriptor.trusted)) {
+          throw new StoreError("The scheduled model group no longer belongs to this occurrence.");
+        }
+        if (routing.targetId !== descriptor.targetId || routing.backendId !== descriptor.backendId && !options.scheduledModelGroupId) {
           throw new StoreError("Session automation owner does not match its backend and target.");
         }
-      } else if (options.automationOccurrenceRouting) {
+      } else if (options.automationOccurrenceRouting || options.scheduledModelGroupId) {
         throw new StoreError("A frozen occurrence route requires a Schedule owner.");
       }
       if (derivationOrigin !== undefined) {
@@ -3833,6 +3840,10 @@ export class OperationalStore {
       }
       if (options.nativeSessionBlank === true) {
         this.setSetting("session", descriptor.id, NATIVE_BLANK_RECOVERY_SETTING_KEY, true, descriptor.createdAt);
+      }
+      if (automationOrigin && options.scheduledModelGroupId) {
+        this.setSetting("service", descriptor.id, "schedule-model-group-route", { scheduleId: automationOrigin.scheduleId,
+          targetId: target.descriptor.id, targetBackendId: target.descriptor.backendId, runtimeBackendId: descriptor.backendId });
       }
       this.recordNativeBindingAdoption(descriptor.id, descriptor.backendId, descriptor.binding, descriptor.createdAt);
       if (derivation !== undefined) {
@@ -16124,6 +16135,14 @@ export class OperationalStore {
     });
   }
 
+  scheduleOwnsModelGroupSession(schedule: Pick<ScheduleRecord, "id" | "backendId" | "targetId">, session: SessionDescriptor): boolean {
+    if (session.automationOrigin?.scheduleId !== schedule.id || session.targetId !== schedule.targetId) return false;
+    const receipt = this.findSetting<{ scheduleId: string; targetId: string; targetBackendId: string; runtimeBackendId: string }>(
+      "service", session.id, "schedule-model-group-route")?.value;
+    return receipt?.scheduleId === schedule.id && receipt.targetId === schedule.targetId && receipt.targetBackendId === schedule.backendId
+      && receipt.runtimeBackendId === session.backendId && session.remoteWorkspace === undefined;
+  }
+
   /** A saved task-default Schedule belongs to its original project while
    * an admitted native handoff can change that same task's execution Backend. */
   scheduleMatchesSession(
@@ -16132,6 +16151,7 @@ export class OperationalStore {
   ): boolean {
     if (session.targetId !== schedule.targetId || (schedule.sessionId !== undefined && session.id !== schedule.sessionId)) return false;
     if (session.backendId === schedule.backendId) return true;
+    if (this.scheduleOwnsModelGroupSession(schedule, session)) return true;
     if (schedule.sessionId !== session.id || !isTaskDefaultOneShotSchedule(schedule)) return false;
     const saved = this.findSchedule(schedule.id);
     if (saved === undefined || saved.sessionId !== session.id || saved.targetId !== schedule.targetId
@@ -16269,8 +16289,8 @@ export class OperationalStore {
       const session = this.getSession(sessionId);
       if (
         session.descriptor.deletedAt !== undefined ||
-        session.descriptor.backendId !== schedule.backendId ||
-        session.descriptor.targetId !== schedule.targetId
+          session.descriptor.targetId !== schedule.targetId || session.descriptor.backendId !== schedule.backendId
+            && !this.scheduleOwnsModelGroupSession(schedule, session.descriptor)
       ) {
         throw new StoreError("Persistent Schedule Session does not match its live routing.");
       }
@@ -16488,7 +16508,8 @@ export class OperationalStore {
       if (input.sessionId !== undefined) {
         const session = this.getSession(input.sessionId);
         if (
-          routing.targetId !== session.descriptor.targetId || routing.backendId !== session.descriptor.backendId ||
+          routing.targetId !== session.descriptor.targetId || routing.backendId !== session.descriptor.backendId
+            && (input.occurrenceRouting !== undefined || !this.scheduleOwnsModelGroupSession(schedule, session.descriptor)) ||
           input.occurrenceRouting?.boundSessionId !== undefined && input.occurrenceRouting.boundSessionId !== session.descriptor.id
         ) throw new StoreError("Schedule occurrence Session does not match the schedule routing.");
       }

@@ -4553,6 +4553,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       input: { parts: draft.inputText.trim().length === 0 ? [] : [{ content: { case: "text", value: draft.inputText } }] },
       execution: {
         ...(!scriptMode && draft.providerId.length > 0 && draft.modelId.length > 0 ? { model: { model: { providerId: draft.providerId, modelId: draft.modelId }, effortId: draft.effort ?? "", ...encodeModelSpeed(draft.fastMode) } } : {}),
+        taskModelGroupId: !scriptMode && draft.providerId && draft.modelId ? draft.taskModelGroupId : undefined,
         permissionMode: protoPermission(draft.permissionMode),
         planMode: !scriptMode && draft.planMode,
         useWorktree: draft.useWorktree,
@@ -17347,6 +17348,7 @@ function mapSchedule(schedule: Schedule): ScheduleView {
       }
     }),
     permissionMode: uiPermission(schedule.execution?.permissionMode ?? ProtoPermissionMode.ASK),
+    ...(schedule.execution?.taskModelGroupId ? { taskModelGroupId: schedule.execution.taskModelGroupId } : {}),
     planMode: schedule.execution?.planMode ?? false,
     useWorktree: schedule.execution?.useWorktree ?? false,
     ...(schedule.execution?.worktreeSourceRef === undefined
@@ -23455,6 +23457,7 @@ function partnerInitializationError(value: PartnerInitializationErrorCode): Part
 
 function protoPartnerRoute(value: PartnerModelRouteView) {
   return {
+    ...(value.taskModelGroupId ? { taskModelGroupId: value.taskModelGroupId } : {}),
     backendId: value.backendId,
     providerId: value.providerId,
     modelId: value.modelId,
@@ -23508,6 +23511,7 @@ function mapPartnerRoute(route: ProtoPartnerCapabilities["modelChain"][number]):
       providerId: route.providerId,
       modelId: route.modelId,
       ...(route.effort === undefined ? {} : { effort: route.effort }),
+      ...(route.taskModelGroupId ? { taskModelGroupId: route.taskModelGroupId } : {}),
       fastMode: decodeModelSpeed(route)
     };
 }

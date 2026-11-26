@@ -4,6 +4,10 @@ import * as contract from "@joko/contracts";
 
 export interface ProviderGroupSettingsApi {
   readonly taskModels?: TaskModelGroupsApi;
+  readonly localOpenAiPool?: {
+    get(target: ProviderKey, signal?: AbortSignal): Promise<contract.GetLocalOpenAiPoolResponse>;
+    set(target: ProviderKey, source: ProviderKey, included: boolean, expectedRevision: bigint, signal?: AbortSignal): Promise<contract.GetLocalOpenAiPoolResponse>;
+  };
   getProviderGroup(key: { readonly backendId: string; readonly providerId: string }, signal?: AbortSignal): Promise<contract.ProviderGroupSnapshot>;
   listProviderGroupCandidates(key: { readonly backendId: string; readonly providerId: string }, signal?: AbortSignal): Promise<readonly contract.ProviderGroupCandidate[]>;
   updateProviderGroup(key: { readonly backendId: string; readonly providerId: string }, expectedRevision: bigint, config: contract.ProviderGroupConfig | undefined, signal?: AbortSignal): Promise<contract.ProviderGroupSnapshot>;
@@ -11,6 +15,7 @@ export interface ProviderGroupSettingsApi {
   getProviderGroupMemberAccountUsage(query: Omit<contract.GetProviderGroupMemberAccountUsageRequest, "$typeName">, signal?: AbortSignal): Promise<contract.GetProviderGroupMemberAccountUsageResponse>;
 }
 
+type ProviderKey = Pick<contract.ProviderGroupKey, "backendId" | "providerId">;
 export interface TaskModelGroupsApi {
   list(signal?: AbortSignal): Promise<contract.ListTaskModelGroupsResponse>;
   save(expectedRevision: bigint, groups: readonly contract.TaskModelGroup[], signal?: AbortSignal): Promise<contract.TaskModelGroupConfig>;
@@ -24,6 +29,14 @@ export interface TaskModelGroupsApi {
  * are never replayed after a transport failure or a configuration conflict. */
 export function createProviderGroupSettingsApi(client: Client<typeof contract.ProviderGroupService>): ProviderGroupSettingsApi {
   return {
+    localOpenAiPool: {
+      get: (target, signal) => client.getLocalOpenAiPool({ target }, { signal }),
+      set: async (target, source, included, expectedRevision, signal) => {
+        const result = await client.setLocalOpenAiPoolMember({ target, source, included, expectedRevision }, { signal });
+        if (!result.pool) throw new Error("The updated OpenAI account pool is unavailable.");
+        return result.pool;
+      }
+    },
     taskModels: {
       list: (signal) => client.listTaskModelGroups({}, { signal }),
       save: async (expectedRevision, groups, signal) => {
