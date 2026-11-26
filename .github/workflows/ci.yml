@@ -81,6 +81,46 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm codegen:check
           pnpm --filter @joko/orchestrator... -r --if-present build
+      - name: Check group image saves, routine edits, Telegram offsets and Claude output tails
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
+        shell: bash
+        run: |
+          pnpm --filter @joko/mobile exec vitest run --reporter=verbose src/mobile-partner-group-media.test.ts src/mobile-image-output.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/group-images.log"
+          pnpm --filter @joko/contracts exec node --test test/partner-routine-editor.test.mjs 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/routine-editor.log"
+          pnpm --filter @joko/web exec vitest run --reporter=verbose src/components/PartnerRoutineDialog.test.tsx 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/routine-dialog.log"
+          pnpm --filter @joko/messaging exec vitest run --reporter=verbose src/telegram/transport.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/telegram-offsets.log"
+          pnpm --filter @joko/e2e exec vitest run --reporter=verbose src/messaging.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/telegram-restart.log"
+          pnpm --filter @joko/adapter-claude-code exec vitest run --reporter=verbose src/background-task-output.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/claude-output.log"
+      - name: Check history retention, native receipts and Partner transcripts
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
+        shell: bash
+        run: |
+          pnpm --filter @joko/orchestrator exec vitest run --reporter=verbose src/history-maintenance.test.ts src/partner-workbench-manager.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/history.log"
+          pnpm --filter @joko/e2e exec vitest run --reporter=verbose src/maintenance.e2e.test.ts -t 'prunes archived and explicitly included active task history' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/history-http.log"
+      - name: Check busy SessionHost cleanup and Pi snapshot model identity
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
+        shell: bash
+        run: |
+          pnpm --filter @joko/orchestrator exec vitest run --reporter=verbose src/session-host.test.ts src/connect-services.audit.test.ts -t 'keeps the accepted run and its host resources|pages durable Pi history' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/session-lifecycle.log"
+      - name: Check Provider reservations, reports and bound merge request schedules
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
+        shell: bash
+        run: |
+          pnpm --filter @joko/orchestrator exec vitest run --reporter=verbose src/provider-group-reporter.test.ts src/provider-group-scheduler.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/provider-reports.log"
+          pnpm --filter @joko/code-host exec vitest run --reporter=verbose src/gitlab-provider.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/gitlab.log"
+          pnpm --filter @joko/e2e exec vitest run --reporter=verbose src/recovery-scheduler.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/scheduler.log"
+      - name: Check Mobile update rollback and Worker model selection
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
+        shell: bash
+        run: |
+          pnpm --filter @joko/mobile exec vitest run --reporter=verbose src/mobile-update-runtime.test.ts src/mobile-update-controller.test.ts src/mobile-collaboration.test.ts src/MobileCollaborationSheet.test.tsx src/mobile-history-disk-storage.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/mobile.log"
+      - name: Check edited file bytes, sheet column windows and refreshed usage periods
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
+        shell: bash
+        run: |
+          pnpm --filter @joko/web exec vitest run --reporter=verbose src/components/workspace-file-editor.test.ts src/components/WorkspaceFileBody.draft.test.tsx src/components/Inspector.workspace-discovery.test.tsx src/gateway.workspace-write.test.ts src/components/UsageHistorySection.test.tsx 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/web.log"
+          pnpm --filter @joko/e2e exec vitest run --reporter=verbose src/workspace-artifact-capability.e2e.test.ts -t 'saves a mixed-line-ending edit' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/file-save.log"
+          pnpm --filter @joko/tool-document exec vitest run --reporter=verbose src/readSheet.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/sheets.log"
       - name: Check the Partner contract and access to existing tasks after a Home move
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
         shell: bash
@@ -100,7 +140,10 @@ jobs:
       - name: Check persisted native binding ownership and replay
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
         shell: bash
-        run: pnpm --filter @joko/store exec vitest run src/hosted-agent-store.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/hosted-store.log"
+        run: |
+          pnpm --filter @joko/store exec vitest run src/hosted-agent-store.test.ts src/provider-group-store.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/hosted-store.log"
+          pnpm --filter @joko/runtime-governance exec vitest run src/native-transcript-window.test.ts
+          pnpm --filter @joko/adapter-pi exec vitest run src/native-session-preview.test.ts
       - name: Check immutable Side Chat activation and reconnection
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
         shell: bash
@@ -113,6 +156,14 @@ jobs:
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' && runner.os == 'Linux' }}
         shell: bash
         run: pnpm --filter @joko/adapter-pi exec vitest run src/adapter.test.ts -t 'keeps the configured npm symlink for the local probe and stages its published bundle for SSH|stages only selected Skills and their assets for an explicit paired Partner Home' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/pi-launcher.log"
+      - name: Check account-bound reference prices in the catalog and native model bindings
+        if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' && runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          pnpm --filter @joko/core exec vitest run src/model-pricing.test.ts 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/route-prices.log"
+          pnpm --filter @joko/adapter-pi exec vitest run src/config.test.ts src/adapter.test.ts -t 'reference price|projects each model' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/pi-catalog-prices.log"
+          pnpm --filter @joko/orchestrator exec vitest run src/managed-provider-proxy.test.ts -t 'qualifies the account tariff' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/proxy-prices.log"
+          pnpm --filter @joko/orchestrator exec vitest run src/session-host.test.ts -t 'tariffs using request time and observed usage' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/usage-tariffs.log"
       - name: Check the published Linux Pi executable staged for SSH
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' && runner.os == 'Linux' }}
         timeout-minutes: 5
@@ -140,12 +191,13 @@ jobs:
           pnpm exec vitest run
           src/artifact-store.test.ts src/browser-automation-node.test.ts src/collaboration-worker-workspace.test.ts
           src/mobile-push.test.ts src/apns-mobile-push-provider.test.ts
-          src/connect-services.audit.test.ts src/connect-services.extension-catalog.test.ts
+          src/connect-services.audit.test.ts src/connect-services.extension-catalog.test.ts src/connect-services.workspace-write.test.ts
           src/connect-services.features.test.ts src/connect-services.git-review.test.ts src/connect-services.test.ts
           src/extension-catalog.test.ts src/extension-device-sync.test.ts
           src/hosted-agent-executor.test.ts src/hosted-agent-host.test.ts src/hosted-agent-peer-port.test.ts src/hosted-agent-sources.test.ts
           src/model-favorite-settings.test.ts src/credential-manager.test.ts src/pi-provider-auth-supervisor.test.ts src/provider-account-usage.test.ts
           src/partner-autonomy.test.ts src/partner-messaging.test.ts src/partner-network-plan-runtime.test.ts
+          src/partner-manager.test.ts src/partner-group-runtime.test.ts src/partner-routine-manager.test.ts src/partner-session-tasks.test.ts
           src/hosted-agent-guest-peer-workflow.test.ts src/provider-group-hosted-lifecycle.test.ts src/provider-group-session-host.test.ts src/provider-group-source-native.test.ts src/provider-sharing-service.test.ts
           src/remote-pi-broker-source.test.ts src/remote-pi-process.test.ts src/remote-workspace-service.test.ts src/workspace-service.git-review.test.ts src/scheduler.test.ts
           src/remote-skill-input-system.test.ts
@@ -192,6 +244,7 @@ jobs:
           pnpm --filter @joko/connection-transport build
           pnpm --filter @joko/device-peer build
           pnpm --filter @joko/remote-desktop-sync build
+          pnpm --filter @joko/voice-speaker build
       - name: Check authorization storage and client recovery
         if: ${{ !cancelled() && steps.authorization_inputs.outcome == 'success' }}
         shell: bash
@@ -209,11 +262,11 @@ jobs:
       - name: Check Web approval and protected storage
         if: ${{ !cancelled() && steps.authorization_inputs.outcome == 'success' }}
         shell: bash
-        run: pnpm --filter @joko/web exec vitest run DeviceAuthorization DevicePairingInvitation ConnectionScreen local-state-credentials desktop-deep-link 2>&1 | tee "$RUNNER_TEMP/device-authorization/web.log"
+        run: pnpm --filter @joko/web exec vitest run DeviceAuthorization DevicePairingInvitation ConnectionScreen local-state-credentials desktop-deep-link controller.event-connection provider-presets ProviderSettings.model-visibility DesktopVoiceConversation SchedulesPage.worktree gateway.schedule 2>&1 | tee "$RUNNER_TEMP/device-authorization/web.log"
       - name: Check Mobile authority and connection lifecycle
         if: ${{ !cancelled() && steps.authorization_inputs.outcome == 'success' }}
         shell: bash
-        run: pnpm --filter @joko/mobile exec vitest run device-authorization network mobile-client connection-storage mobile-connection-protocol MobileSharedConnectionScreen MobileSettingsScreen mobile-native-intent 2>&1 | tee "$RUNNER_TEMP/device-authorization/mobile.log"
+        run: pnpm --filter @joko/mobile exec vitest run device-authorization network mobile-client connection-storage mobile-connection-protocol MobileSharedConnectionScreen MobileSettingsScreen mobile-theme-preference mobile-native-intent App.home-navigation App.runtime-resource-command MobileMarkdownMessage MobileAutomationsScreen mobile-automation-authoring 2>&1 | tee "$RUNNER_TEMP/device-authorization/mobile.log"
       - name: Check Desktop invitation delivery
         if: ${{ !cancelled() && steps.authorization_inputs.outcome == 'success' }}
         shell: bash
@@ -473,6 +526,11 @@ jobs:
         shell: bash
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
+            # Playwright also runs apt-get update under sudo. Use the same
+            # Ubuntu sources as the earlier Linux dependency installation.
+            apt_config=/etc/apt/apt.conf.d/99joko-playwright-sources
+            printf '%s\n' 'Dir::Etc::sourcelist "/etc/apt/sources.list.d/ubuntu.sources";' 'Dir::Etc::sourceparts "-";' | sudo tee "$apt_config" >/dev/null
+            trap 'sudo rm -f -- "$apt_config"' EXIT
             pnpm --filter @joko/e2e exec playwright-core install --with-deps chromium 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/chromium.log"
           else
             pnpm --filter @joko/e2e exec playwright-core install chromium 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/chromium.log"
@@ -599,7 +657,7 @@ jobs:
         if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' }}
         timeout-minutes: 3
         shell: bash
-        run: pnpm --filter @joko/web exec vitest run src/components/Timeline.viewport.test.tsx src/components/Timeline.test.ts src/components/timeline-follow-intent.test.ts src/dev/VisualHarness.artifact-storage.test.tsx src/components/ToolsPage.browser-new-session.test.tsx src/gateway.browser-ledger.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-owners.log"
+        run: pnpm --filter @joko/web exec vitest run src/components/Timeline.viewport.test.tsx src/components/Timeline.test.ts src/components/timeline-follow-intent.test.ts src/dev/VisualHarness.artifact-storage.test.tsx src/dev/VisualHarness.interaction.test.tsx src/components/ToolsPage.browser-new-session.test.tsx src/gateway.browser-ledger.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-owners.log"
 
       - name: Check Terminal screen recovery and live Web controls
         if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' }}
