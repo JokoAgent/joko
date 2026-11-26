@@ -276,6 +276,7 @@ const DESKTOP_CHANNELS = {
   discoveryScan: "joko:discovery:scan",
   managedOrchestratorGetConnection: "joko:managed-orchestrator:get-connection",
   managedOrchestratorGetStatus: "joko:managed-orchestrator:get-status",
+  managedOrchestratorDatabaseCorrupted: "joko:managed-orchestrator:database-corrupted",
   managedOrchestratorRetry: "joko:managed-orchestrator:retry",
   managedOrchestratorAdoptConnection: "joko:managed-orchestrator:adopt-connection",
   managedOrchestratorCompleteLogout: "joko:managed-orchestrator:complete-logout",
@@ -1219,6 +1220,11 @@ const desktopApi = Object.freeze({
       ipcRenderer.invoke(DESKTOP_CHANNELS.managedOrchestratorGetConnection),
     getStatus: (): Promise<DesktopManagedOrchestratorStatus> =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.managedOrchestratorGetStatus),
+    onDatabaseCorrupted: (callback: () => void): (() => void) => {
+      const observed = () => callback();
+      ipcRenderer.on(DESKTOP_CHANNELS.managedOrchestratorDatabaseCorrupted, observed);
+      return () => { ipcRenderer.removeListener(DESKTOP_CHANNELS.managedOrchestratorDatabaseCorrupted, observed); };
+    },
     retry: (): Promise<DesktopManagedOrchestratorStatus> =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.managedOrchestratorRetry),
     adoptConnection: (connection: DesktopManagedOrchestratorConnection): Promise<DesktopManagedOrchestratorStatus> =>

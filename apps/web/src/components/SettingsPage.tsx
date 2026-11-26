@@ -2261,10 +2261,21 @@ export function TaskHistoryMaintenanceCard({ controller, t }: {
   </>;
 }
 
-export function ArtifactStorageSettingsCard({ controller, snapshot, t }: {
+interface ArtifactStorageSettingsProps {
   readonly controller: AppController;
   readonly snapshot: AppSnapshot;
   readonly t: Translator;
+}
+
+export function ArtifactStorageSettingsCard(props: ArtifactStorageSettingsProps): JSX.Element {
+  const { activeProfile, connectionGeneration } = props.controller.state;
+  const storageKey = activeProfile && `joko.artifact-storage.maintenance-id.${JSON.stringify([activeProfile.serverId, activeProfile.deviceId])}`;
+  return <ArtifactStorageMaintenance key={JSON.stringify([storageKey, activeProfile?.id, connectionGeneration])}
+    {...props} storageKey={storageKey} />;
+}
+
+function ArtifactStorageMaintenance({ controller, snapshot, t, storageKey }: ArtifactStorageSettingsProps & {
+  readonly storageKey: string | undefined;
 }): JSX.Element {
   const [capability, setCapability] = useState<ArtifactStorageMaintenanceView>();
   const [scan, setScan] = useState<ArtifactStorageScanView>();
@@ -2279,14 +2290,21 @@ export function ArtifactStorageSettingsCard({ controller, snapshot, t }: {
   const snapshotRef = useRef(snapshot);
   controllerRef.current = controller;
   snapshotRef.current = snapshot;
+  const live = useRef(false);
+  useLayoutEffect(() => {
+    live.current = true;
+    return () => { live.current = false; };
+  }, []);
 
   const pollCleanup = async (first: ArtifactStorageCleanupView): Promise<void> => {
     const generation = ++progressGenerationRef.current;
     let next = first;
-    while (generation === progressGenerationRef.current) {
+    while (live.current && generation === progressGenerationRef.current) {
       setCleanup(next);
       if (next.status !== "running") {
-        try { window.sessionStorage.removeItem("joko.artifact-storage.maintenance-id"); } catch { /* Storage may be unavailable. */ }
+        try {
+          if (storageKey && window.sessionStorage.getItem(storageKey) === next.maintenanceId) window.sessionStorage.removeItem(storageKey);
+        } catch { /* Storage may be unavailable. */ }
         if (next.status === "completed") await loadStats();
         if (next.status === "scanExpired") setError(t("settings.artifactStorageScanExpired"));
         if (next.status === "storageChanged") setError(t("settings.artifactStorageChanged"));
@@ -2294,14 +2312,15 @@ export function ArtifactStorageSettingsCard({ controller, snapshot, t }: {
         return;
       }
       await new Promise<void>((resolveDelay) => window.setTimeout(resolveDelay, 250));
-      if (generation !== progressGenerationRef.current) return;
+      if (!live.current || generation !== progressGenerationRef.current) return;
       next = await controllerRef.current.getArtifactStorageCleanup(next.maintenanceId);
     }
   };
 
   const resumeCleanup = async (): Promise<boolean> => {
+    if (!live.current || !storageKey) return false;
     let maintenanceId: string | null = null;
-    try { maintenanceId = window.sessionStorage.getItem("joko.artifact-storage.maintenance-id"); } catch { /* Storage may be unavailable. */ }
+    try { maintenanceId = window.sessionStorage.getItem(storageKey); } catch { /* Storage may be unavailable. */ }
     if (maintenanceId === null || !/^[a-f0-9]{64}$/u.test(maintenanceId)) return false;
     await pollCleanup(await controllerRef.current.getArtifactStorageCleanup(maintenanceId));
     return true;
@@ -2312,6 +2331,7 @@ export function ArtifactStorageSettingsCard({ controller, snapshot, t }: {
     setError(undefined);
     try {
       const protectedSha256 = await activeDraftAttachmentSha256(controllerRef.current, snapshotRef.current);
+      if (!live.current) return;
       setCapability(await controllerRef.current.getArtifactStorageStats(protectedSha256));
     } catch {
       setError(t("settings.artifactStorageLoadFailed"));
@@ -2325,6 +2345,7 @@ export function ArtifactStorageSettingsCard({ controller, snapshot, t }: {
     void (async () => {
       try {
         const protectedSha256 = await activeDraftAttachmentSha256(controllerRef.current, snapshotRef.current);
+        if (!mounted) return;
         const next = await controllerRef.current.getArtifactStorageStats(protectedSha256);
         if (mounted) setCapability(next);
       } catch {
@@ -2366,6 +2387,7 @@ export function ArtifactStorageSettingsCard({ controller, snapshot, t }: {
     void runExclusive(async () => {
       try {
         const protectedSha256 = await activeDraftAttachmentSha256(controllerRef.current, snapshotRef.current);
+        if (!live.current) return;
         setCleanup(undefined);
         setScan(await controllerRef.current.scanArtifactStorage(protectedSha256));
       } catch {
@@ -2378,6 +2400,7 @@ export function ArtifactStorageSettingsCard({ controller, snapshot, t }: {
     void runExclusive(async () => {
       try {
         const protectedSha256 = await activeDraftAttachmentSha256(controllerRef.current, snapshotRef.current);
+        if (!live.current) return;
         setReconcile(await controllerRef.current.reconcileArtifactStorage(protectedSha256));
       } catch {
         setError(t("settings.artifactStorageReconcileFailed"));
@@ -2395,7 +2418,8 @@ export function ArtifactStorageSettingsCard({ controller, snapshot, t }: {
     void runExclusive(async () => {
       try {
         const protectedSha256 = await activeDraftAttachmentSha256(controllerRef.current, snapshotRef.current);
-        try { window.sessionStorage.setItem("joko.artifact-storage.maintenance-id", accepted.token); } catch { /* Storage may be unavailable. */ }
+        if (!live.current || !storageKey) return;
+        try { window.sessionStorage.setItem(storageKey, accepted.token); } catch { /* Storage may be unavailable. */ }
         const result = await controllerRef.current.beginArtifactStorageCleanup(accepted.token, protectedSha256);
         setScan(undefined);
         await pollCleanup(result);

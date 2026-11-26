@@ -110,7 +110,8 @@ describe("Artifact storage visual harness", () => {
     await click(button("Clean up 11 B"));
     expect(state()).toMatchObject({ phase: "running", cleanupRequests: 1,
       cleanup: { token: acceptedToken, maintenanceId: acceptedToken, protectedSha256: [draftSha256], status: "running", percent: 60 } });
-    expect(window.sessionStorage.getItem("joko.artifact-storage.maintenance-id")).toBe(acceptedToken);
+    const recoveryKey = 'joko.artifact-storage.maintenance-id.["visual-server","visual-desktop"]';
+    expect(window.sessionStorage.getItem(recoveryKey)).toBe(acceptedToken);
     expect(document.querySelector<HTMLProgressElement>('progress[value="60"]')).not.toBeNull();
     expect(health.disabled).toBe(true);
     expect(scan.disabled).toBe(true);
@@ -128,7 +129,7 @@ describe("Artifact storage visual harness", () => {
     expect(document.body.textContent).toContain("Cleanup completed.");
     expect(document.body.textContent).toContain("Freed 11 B; removed 1 expired references, 1 files, and 0 temporary uploads.");
     expect(document.querySelector(".artifact-storage-card")?.textContent).toContain("1 unique files (11 B) across 1 references.");
-    expect(window.sessionStorage.getItem("joko.artifact-storage.maintenance-id")).toBeNull();
+    expect(window.sessionStorage.getItem(recoveryKey)).toBeNull();
   }, 15_000);
 
   it("retires pending owner/token/progress reads and rejects mismatched draft protection without new cleanup effects", async () => {

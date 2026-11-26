@@ -1249,11 +1249,21 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
     expect(queued.state).toBe(OperationState.SUCCEEDED);
     const refused = (await clients.artifact.beginArtifactStorageCleanup({ scanToken: prior.token })).progress;
     expect(refused?.status).toBe(ArtifactStorageCleanupStatus.STORAGE_CHANGED);
-    const current = await scan();
-    expect(current).toMatchObject({ orphanBlobCount: 1n, orphanBlobBytes: BigInt(unreferenced.blob.byteLength) });
-    await clients.artifact.beginArtifactStorageCleanup({ scanToken: current.token });
+    let maintenanceId: string | undefined;
     const cleaned = await waitForRealSystem(
-      async () => (await clients.artifact.getArtifactStorageCleanup({ maintenanceId: current.token })).progress,
+      async () => {
+        if (maintenanceId !== undefined) {
+          return (await clients.artifact.getArtifactStorageCleanup({ maintenanceId })).progress;
+        }
+        const current = await scan();
+        expect(current).toMatchObject({ orphanBlobCount: 1n, orphanBlobBytes: BigInt(unreferenced.blob.byteLength) });
+        const { progress } = await clients.artifact.beginArtifactStorageCleanup({ scanToken: current.token });
+        if (progress === undefined) throw new Error("Artifact cleanup returned no admission receipt.");
+        // A concurrent store write can invalidate the scan before a job exists.
+        if (progress.status === ArtifactStorageCleanupStatus.STORAGE_CHANGED) return undefined;
+        maintenanceId = progress.maintenanceId;
+        return progress;
+      },
       (progress) => progress !== undefined && progress.status !== ArtifactStorageCleanupStatus.RUNNING,
       "original Pi storage cleanup receipt", 15_000
     );

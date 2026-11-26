@@ -86,7 +86,7 @@ export class ArtifactStore {
   readonly #maximumBlobBytes: number;
   readonly #ticketTtlMs: number;
   readonly #now: () => number;
-  readonly #permanentIngests = new Map<string, Promise<void>>();
+  readonly #blobPublications = new Map<string, Promise<void>>();
   readonly #nativeInputPublications = new Map<string, Promise<string>>();
   readonly #dispatchInputArtifacts = new AsyncLocalStorage<ActiveDispatchInputArtifacts>();
 
@@ -530,34 +530,12 @@ export class ArtifactStore {
       await rm(temporaryPath, { force: true });
       throw new Error("Artifact size does not match the declared value.");
     }
-    await input.beforeFinalize?.({ sha256, byteLength });
     const storagePath = join(this.#options.rootDirectory, "blobs", sha256.slice(0, 2), sha256.slice(2, 4), sha256);
-    await mkdir(dirname(storagePath), { recursive: true });
-    const existing = await lstat(storagePath).catch(ignoreMissingArtifactFile);
-    if (existing !== undefined && (!existing.isFile() || existing.isSymbolicLink() || existing.nlink !== 1)) {
-      throw new Error("Artifact storage entry is not a private regular file.");
-    }
-    input.assertCurrent?.();
-    let renamed = false;
-    let publicationError: unknown;
-    try {
-      await rename(temporaryPath, storagePath);
-      renamed = true;
-    } catch (error) {
-      publicationError = error;
-    }
-    const published = { storagePath, sha256, byteLength };
-    try {
-      await this.verifyPublishedContent(published);
-    } catch {
-      if (!renamed) throw publicationError;
-      // Another identical publisher may have replaced the path. Acquire fresh proof once.
-      await this.verifyPublishedContent(published);
-    }
-    if (!renamed) await rm(temporaryPath, { force: true });
     const fileName = input.fileName === undefined ? undefined : sanitizeFileName(input.fileName);
     const mimeType = input.mimeType ?? inferMediaType(fileName ?? "");
-    const persist = async (): Promise<ArtifactRecord> => {
+    const publish = async (): Promise<ArtifactRecord> => {
+      await input.beforeFinalize?.({ sha256, byteLength });
+      await this.publishIncoming(temporaryPath, { storagePath, sha256, byteLength }, input.assertCurrent);
       input.assertCurrent?.();
       if (input.expiresAt === undefined) {
         const existing = await this.#options.repository.findPermanentArtifact({
@@ -584,17 +562,48 @@ export class ArtifactStore {
       await this.#options.repository.putArtifact(record);
       return record;
     };
-    if (input.expiresAt !== undefined) return persist();
-    const identity = `${storagePath}\0${mimeType}\0${fileName ?? ""}`;
-    // Keep deduplication serialized while each caller checks its own authority.
-    const pending = this.#permanentIngests.get(identity);
-    const operation = pending === undefined ? persist() : pending.then(persist);
+    // A single Blob file can back staged and permanent references with different names.
+    // Serialize publication at that path while each caller checks its own authority.
+    const pending = this.#blobPublications.get(storagePath);
+    const operation = pending === undefined ? publish() : pending.then(publish);
     const settled = operation.then(() => undefined, () => undefined);
-    this.#permanentIngests.set(identity, settled);
+    this.#blobPublications.set(storagePath, settled);
     try {
       return await operation;
     } finally {
-      if (this.#permanentIngests.get(identity) === settled) this.#permanentIngests.delete(identity);
+      if (this.#blobPublications.get(storagePath) === settled) this.#blobPublications.delete(storagePath);
+    }
+  }
+
+  private async publishIncoming(temporaryPath: string, published: Pick<ArtifactRecord, "storagePath" | "sha256" | "byteLength">,
+    assertCurrent?: () => void): Promise<void> {
+    const { storagePath } = published;
+    await mkdir(dirname(storagePath), { recursive: true });
+    const existing = await lstat(storagePath).catch(ignoreMissingArtifactFile);
+    if (existing !== undefined) {
+      if (!existing.isFile() || existing.isSymbolicLink() || existing.nlink !== 1) {
+        throw new Error("Artifact storage entry is not a private regular file.");
+      }
+      // Reuse an authenticated Blob without changing the inode under active readers.
+      const verified = await this.verifyPublishedContent(published).then(() => true, () => false);
+      if (verified) {
+        await rm(temporaryPath, { force: true });
+        return;
+      }
+    }
+    assertCurrent?.();
+    try {
+      await rename(temporaryPath, storagePath);
+    } catch (error) {
+      try { await this.verifyPublishedContent(published); }
+      catch { throw error; }
+      await rm(temporaryPath, { force: true });
+      return;
+    }
+    try { await this.verifyPublishedContent(published); }
+    catch {
+      // Another identical publisher may have replaced the path. Acquire fresh proof once.
+      await this.verifyPublishedContent(published);
     }
   }
 

@@ -12,6 +12,15 @@ export class StoreClosedError extends StoreError {
   }
 }
 
+export class OperationalStoreCorruptionError extends StoreError {
+  constructor(readonly phase: "startup" | "operation" | "unavailable", options?: ErrorOptions) {
+    super(phase === "operation"
+      ? "SQLite reported corruption during the operation. Its result could not be confirmed."
+      : "The operational database requires recovery. Restore a verified copy and restart the local service.", options);
+    this.name = "OperationalStoreCorruptionError";
+  }
+}
+
 export class MessageSearchRevisionConflictError extends StoreError {
   constructor() {
     super("Message search page token is stale because durable state changed.");

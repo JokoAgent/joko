@@ -251,20 +251,40 @@ describe("ArtifactStorageSettingsCard", () => {
     await act(async () => vi.waitFor(() => expect(container.textContent).toContain("Cleanup completed")));
     expect(begin).toHaveBeenCalledWith(token, []);
     expect(get).toHaveBeenCalledWith(token);
-    expect(window.sessionStorage.getItem("joko.artifact-storage.maintenance-id")).toBeNull();
+    expect(window.sessionStorage.getItem('joko.artifact-storage.maintenance-id.["node-a","device"]')).toBeNull();
+  });
+
+  it("recovers a pending cleanup only on the node and device that accepted it", async () => {
+    const token = "c".repeat(64);
+    const key = 'joko.artifact-storage.maintenance-id.["node-a","device"]';
+    window.sessionStorage.setItem(key, token);
+    const controller = {
+      readNewSessionDraft: vi.fn(async () => undefined),
+      getArtifactStorageStats: vi.fn(async () => ({ support: "unsupported" })),
+      getArtifactStorageCleanup: vi.fn(async () => ({ maintenanceId: token, status: "failed", phase: "preparing" }))
+    } as unknown as AppController;
+    await render(controller, emptySnapshot(), "node-b");
+    await act(async () => vi.waitFor(() => expect(controller.getArtifactStorageStats).toHaveBeenCalled()));
+    expect(controller.getArtifactStorageCleanup).not.toHaveBeenCalled();
+    expect(window.sessionStorage.getItem(key)).toBe(token);
+    await render(controller);
+    await act(async () => vi.waitFor(() => expect(controller.getArtifactStorageCleanup).toHaveBeenCalledWith(token)));
+    expect(window.sessionStorage.getItem(key)).toBeNull();
   });
 });
 
 async function render(
   controller: AppController,
-  snapshot: ReturnType<typeof emptySnapshot> = emptySnapshot()
+  snapshot: ReturnType<typeof emptySnapshot> = emptySnapshot(),
+  serverId = "node-a"
 ): Promise<HTMLDivElement> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
   roots.push(root);
   await act(async () => root.render(<ArtifactStorageSettingsCard
-    controller={controller}
+    controller={{ ...controller, state: { ...controller.state, connectionGeneration: 1,
+      activeProfile: { id: "profile", deviceId: "device", serverId, name: "Browser", origin: "https://node.test" } } }}
     snapshot={snapshot}
     t={(key, values) => translate("en", key, values)}
   />));

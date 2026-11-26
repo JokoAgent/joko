@@ -171,7 +171,7 @@ describe("ArtifactStore publication", () => {
     }
   });
 
-  it("authenticates an existing Blob after a failed rename and reuses its permanent identity", async () => {
+  it("authenticates an existing Blob and reuses its permanent identity without a rename", async () => {
     const f = await publicationFixture();
     await writeFile(f.storagePath, f.data);
     publicationFaults.rename = (_source, destination) => destination === f.storagePath
@@ -182,6 +182,27 @@ describe("ArtifactStore publication", () => {
     expect(f.store.listArtifacts({ limit: 100 })).toHaveLength(1);
     expect(Buffer.from((await f.artifacts.readBlob(second)).data)).toEqual(f.data);
     expect(await readdir(join(f.directory, "artifacts", "incoming"))).toEqual([]);
+  });
+
+  it("publishes one Blob file for concurrent history images with independent Artifact references", async () => {
+    const f = await publicationFixture();
+    const publish = vi.fn();
+    publicationFaults.rename = (_source, destination) => {
+      if (destination === f.storagePath) publish();
+      return undefined;
+    };
+    const records = await Promise.all([
+      f.artifacts.ingestBytes(f.data, { fileName: "first.png", mimeType: "image/png", expiresAt: Date.now() + 60_000 }),
+      f.artifacts.ingestBytes(f.data, { fileName: "second.png", mimeType: "image/png", expiresAt: Date.now() + 60_000 }),
+      f.artifacts.ingestBytes(f.data, { fileName: "retained.png", mimeType: "image/png" })
+    ]);
+    expect(publish).toHaveBeenCalledOnce();
+    expect(records.map(record => record.fileName)).toEqual(["first.png", "second.png", "retained.png"]);
+    expect(new Set(records.map(record => record.id)).size).toBe(3);
+    for (const record of records) {
+      expect(record.storagePath).toBe(f.storagePath);
+      await expect(f.artifacts.readBlob(record)).resolves.toMatchObject({ data: f.data });
+    }
   });
 
   it("rejects a directory at the Blob identity without registering an unreadable Artifact or removing its contents", async () => {
