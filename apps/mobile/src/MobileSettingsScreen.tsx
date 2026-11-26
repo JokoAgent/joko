@@ -40,8 +40,10 @@ import type { MobileUpdateControllerState } from "./mobile-update-controller";
 import type { MobilePushControllerState } from "./mobile-push-controller";
 import type { MobileVoiceSettingsTransport } from "./mobile-voice-service-settings";
 import type { MobileVoiceServiceDraft } from "./MobileVoiceServiceSettings";
+import type { MobileWallpaperStore } from "./mobile-wallpaper";
 
 export interface MobileSettingsColors {
+  readonly canvas?: string;
   readonly background: string;
   readonly surface: string;
   readonly ink: string;
@@ -56,6 +58,7 @@ export type MobileSettingsClient = Pick<MobileClient,
   "renameCurrentDevice" | "resetCurrentDevice" | "reconcile" | "dismissUnconfirmed"> & Partial<Pick<MobileClient, "authorizeNewDevice" | "cancelDevicePairing" | 'deviceAuthorizationOwner' | 'serverAccess'>>;
 
 export interface MobileSettingsScreenProps {
+  readonly wallpaper?: MobileWallpaperStore;
   readonly colors: MobileSettingsColors;
   readonly state: MobileState;
   readonly foreground: boolean;
@@ -130,6 +133,18 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
   const resolvedAppVersion = appVersion || Constants.expoConfig?.version || t("common.unknown");
   const [editor, setEditor] = useState<{ readonly ownerKey: string; readonly original: string; readonly draft: string }>();
   const [savingName, setSavingName] = useState(false);
+  const [savingWallpaper, setSavingWallpaper] = useState(false);
+  const wallpaperInFlight = useRef(false);
+  const changeWallpaper = async (operation: () => Promise<void>) => {
+    if (wallpaperInFlight.current) return;
+    wallpaperInFlight.current = true;
+    setSavingWallpaper(true);
+    setLocalError("");
+    try { await operation(); }
+    catch (error) { setLocalError(t(error instanceof Error && error.message === "WALLPAPER_TOO_LARGE"
+      ? "settings.wallpaperSize" : "settings.wallpaperError")); }
+    finally { wallpaperInFlight.current = false; setSavingWallpaper(false); }
+  };
   const [renameUnknown, setRenameUnknown] = useState<"rename" | "reset">();
   const [localError, setLocalError] = useState("");
   const [notice, setNotice] = useState("");
@@ -324,7 +339,7 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
 
   if (editor) {
     const editable = canRename && editor.ownerKey === currentOwnerKey;
-    return <ScrollView contentContainerStyle={[styles.screen, { backgroundColor: colors.background }]}
+    return <ScrollView contentContainerStyle={[styles.screen, { backgroundColor: colors.canvas ?? colors.background }]}
       keyboardShouldPersistTaps="handled">
       <BackButton label={t("settings.title")} language={locale.effectiveLocale}
         disabled={savingName} onPress={requestCloseEditor} colors={colors} />
@@ -360,7 +375,7 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
   }
 
   return <ScrollView key={developerOpen ? "developer" : "settings"}
-    contentContainerStyle={[styles.screen, { backgroundColor: colors.background }]}>
+    contentContainerStyle={[styles.screen, { backgroundColor: colors.canvas ?? colors.background }]}>
     <BackButton label={developerOpen ? t("settings.title") : "Joko"} language={locale.effectiveLocale}
       onPress={developerOpen ? () => setDeveloperOpen(false) : onBack} colors={colors} />
     <Text style={[styles.title, { color: colors.ink }]}>{t(developerOpen ? "settings.developer.title" : "settings.title")}</Text>
@@ -373,6 +388,23 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
         onPress={() => void changeTheme(preference)} />)}
     </View>
     {theme.error && <ErrorNotice colors={colors} text={t("settings.theme.error")} />}
+    {props.wallpaper?.supported && <View style={styles.card}>
+      <Text style={[styles.section, { color: colors.muted }]}>{t("settings.wallpaper")}</Text>
+      <View style={styles.actionRow}>
+        <Button label={t("settings.wallpaperPick")} colors={colors} disabled={savingWallpaper} onPress={() => void changeWallpaper(async () => {
+          const picker = await import("expo-image-picker");
+          const result = await picker.launchImageLibraryAsync({ mediaTypes: ["images", "videos"], quality: 1 });
+          if (!result.canceled && result.assets[0]) await props.wallpaper!.importAsset(result.assets[0]);
+        })} />
+        {props.wallpaper.snapshot.file && <>
+          {(["off", "static", "dynamic"] as const).filter(mode => mode !== "dynamic" || props.wallpaper!.snapshot.file?.videoUri).map(mode =>
+            <Button key={mode} colors={colors} disabled={savingWallpaper || props.wallpaper!.snapshot.mode === mode}
+              label={t(mode === "off" ? "common.off" : mode === "static" ? "settings.wallpaperStatic" : "settings.wallpaperDynamic")}
+              onPress={() => void changeWallpaper(() => props.wallpaper!.select(mode))} />)}
+          <Button label={t("common.remove")} colors={colors} disabled={savingWallpaper} onPress={() => void changeWallpaper(() => props.wallpaper!.remove())} />
+        </>}
+      </View>
+    </View>}
 
     <Text style={[styles.section, { color: colors.muted }]}>{t("settings.language")}</Text>
     <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>

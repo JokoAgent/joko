@@ -37,7 +37,7 @@ export function MobilePartnerIdentityScreen({ api, directory, colors, locale, on
   };
   const action = (label: string, work: () => void, disabled = busy) => <Pressable accessibilityRole="button" accessibilityLabel={label} accessibilityState={{ disabled }} disabled={disabled} onPress={work} style={[styles.button, { borderColor: colors.border }]}><Text style={{ color: disabled ? colors.muted : colors.accent }}>{label}</Text></Pressable>;
   const field = { color: colors.ink, backgroundColor: colors.surface, borderColor: colors.border };
-  return <ScrollView style={{ flex: 1, backgroundColor: colors.background }} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+  return <ScrollView style={{ flex: 1, backgroundColor: colors.canvas ?? colors.background }} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
     <View style={styles.row}>{action(m.close, onBack, false)}<Text accessibilityRole="header" style={[styles.title, { color: colors.ink }]}>{m.title}</Text>{action(m.refresh, () => setReload(value => value + 1))}</View>
     <Text style={{ color: colors.muted }}>{m.description}</Text>
     <TextInput accessibilityLabel={m.invitation} placeholder={m.invitation} placeholderTextColor={colors.muted} secureTextEntry autoCapitalize="none" autoCorrect={false} value={invitation} onChangeText={setInvitation} style={[styles.field, field]} />

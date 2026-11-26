@@ -367,7 +367,7 @@ export function MobileExtensionMainView({ colors, extension, locale, onBack, tra
     return true;
   };
 
-  return <View style={[styles.root, { backgroundColor: colors.background }]} testID="extensions.mainView.surface">
+  return <View style={[styles.root, { backgroundColor: colors.canvas ?? colors.background }]} testID="extensions.mainView.surface">
     <View style={[styles.header, { borderColor: colors.border }]}>
       <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "extension.mainViewBack")}
         onPress={onBack} style={[styles.action, { borderColor: colors.border, backgroundColor: colors.surface }]}>

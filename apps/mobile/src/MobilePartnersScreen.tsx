@@ -24,6 +24,7 @@ import type {
 } from "./mobile-partner-private";
 
 export interface MobilePartnersColors {
+  readonly canvas?: string;
   readonly background: string;
   readonly surface: string;
   readonly ink: string;
@@ -505,10 +506,10 @@ export function MobilePartnersScreen({ colors, locale, view, onBack, onOpenPartn
             </>}
   </View>;
 
-  if (wide) return <View style={[styles.root, styles.wide, { backgroundColor: colors.background }]}>
+  if (wide) return <View style={[styles.root, styles.wide, { backgroundColor: colors.canvas ?? colors.background }]}>
     {directory}{threadList}{detailPane}
   </View>;
-  return <View style={[styles.root, { backgroundColor: colors.background }]}>
+  return <View style={[styles.root, { backgroundColor: colors.canvas ?? colors.background }]}>
     {route.kind === "directory" ? directory : route.kind === "threads" ? threadList : detailPane}
   </View>;
 }

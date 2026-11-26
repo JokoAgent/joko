@@ -410,6 +410,10 @@ import {
   type MobileIncomingShareSnapshot
 } from "./mobile-incoming-share";
 import { mobileIncomingShareTaskDestinations } from "./mobile-incoming-share-destinations";
+import { MobileWallpaperStore } from "./mobile-wallpaper";
+import { MobileWallpaperBackdrop } from "./MobileWallpaperBackdrop";
+
+const mobileWallpaper = new MobileWallpaperStore(mobilePlainStorage, Platform.OS === "ios");
 
 const client = new MobileClient(
   mobileNetwork,
@@ -762,23 +766,28 @@ export function App() {
   }, [offerNativeUrl]);
   const scheme = useColorScheme();
   const dark = resolveMobileDarkTheme(theme.preference, scheme);
+  const wallpaper = useSyncExternalStore(mobileWallpaper.subscribe, () => mobileWallpaper.snapshot);
+  const activeWallpaper = wallpaper.mode !== "off" && !updates.forced && !deviceReview && page !== "remote-desktop"
+    && !mobileConnectionStageRequired(state.activeProfileId, page) ? wallpaper.file : undefined;
   useLayoutEffect(() => {
     if (Platform.OS === "android" && theme.status !== "loading") {
       Appearance.setColorScheme(theme.preference === "system" ? "unspecified" : theme.preference);
     }
   }, [theme.preference, theme.status]);
   const colors = useMemo(() => ({
+    canvas: activeWallpaper ? "transparent" : undefined,
     background: dark ? "#15191d" : "#f7f6f3", surface: dark ? "#24292d" : "#ffffff",
     ink: dark ? "#f4f4f2" : "#242a2d", muted: dark ? "#adb6b7" : "#637073",
     border: dark ? "#394246" : "#e1e2df", accent: "#ff9800", negative: "#cc634e",
     positive: dark ? "#69c49f" : "#197451", warning: dark ? "#f4b84f" : "#925800",
     brandBackground: dark ? "#302920" : "#fff1db", dark
-  }), [dark]);
+  }), [dark, activeWallpaper]);
 
   useEffect(() => {
     appMountedRef.current = true;
     const lifecycle = new MobileAppLifecycleCoordinator(AppState.currentState);
     void mobileThemePreferences.hydrate();
+    void mobileWallpaper.hydrate().catch(() => undefined);
     void mobileLocalePreferences.hydrate();
     void mobileVoicePreferences.hydrate();
     void mobileHandheld()?.read().catch(() => undefined);
@@ -1070,6 +1079,8 @@ export function App() {
       <MobileExtensionCardsProvider ownerKey={JSON.stringify([state.activeProfileId, state.origin, state.node?.serverId, state.status, state.selectedId,
         state.detail?.sessions.find(session => session.sessionId === state.selectedId)?.nativeBinding?.runtimeGeneration.toString()])} bind={sessionId => client.extensionCardApi(sessionId)}>
       <View style={[styles.root, { backgroundColor: colors.background }]}>
+        {activeWallpaper && <MobileWallpaperBackdrop file={activeWallpaper} dynamic={foreground && wallpaper.mode === "dynamic"}
+          fill={colors.background} dark={dark} />}
         {Platform.OS === "android" && <StatusBar style={dark ? "light" : "dark"} />}
         <MobileTaskActivityBanner />
         {updates.forced ? <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
@@ -1220,7 +1231,7 @@ export function App() {
                   invitation={taskInvitation} onInvitationConsumed={consumeTaskInvitation} initialSessionId={sharingSessionId}
                   leaveJoinId={sharingLeaveJoinId} onLeavePromptConsumed={() => setSharingLeaveJoinId(undefined)}
                   onBack={() => { setSharingSessionId(undefined); void client.select().then(() => setPage("settings")); }} onOpenTask={() => setPage("task")} /> :
-                page === "settings" ? <MobileSettingsScreen colors={colors} state={state} foreground={foreground}
+                page === "settings" ? <MobileSettingsScreen colors={colors} state={state} foreground={foreground} wallpaper={mobileWallpaper}
                   onTaskSharing={() => { setSharingSessionId(undefined); setPage("task-sharing"); }}
                   theme={theme} locale={locale} diagnostics={diagnostics} voiceDictionary={voiceDictionary}
                   readOnlyDictionary={readOnlyDictionary}

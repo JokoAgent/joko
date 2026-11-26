@@ -64,6 +64,7 @@ import { resolveMobileNewTaskExecutionAuthority } from "./mobile-runtime-control
 import { mobileScheduleLocalDateTimeFromEpoch } from "./mobile-schedule-time";
 
 export interface MobileAutomationsColors {
+  readonly canvas?: string;
   readonly background: string;
   readonly surface: string;
   readonly ink: string;
@@ -200,17 +201,17 @@ export function MobileAutomationsScreen({ colors, state, locale, client, onBack,
     onBack={wide ? undefined : () => setNarrowDetail(false)} onOpenTask={onOpenTask}
     onEdit={openEditor} onDelete={setDeleting} />;
 
-  if (editor !== undefined) return <View style={[styles.root, { backgroundColor: colors.background }]}>
+  if (editor !== undefined) return <View style={[styles.root, { backgroundColor: colors.canvas ?? colors.background }]}>
     <AutomationEditor colors={colors} state={state} client={client} initialDraft={editor.draft} locale={locale}
       schedule={editor.schedule} onClose={() => setEditor(undefined)} />
   </View>;
-  if (deleting !== undefined) return <View style={[styles.root, { backgroundColor: colors.background }]}>
+  if (deleting !== undefined) return <View style={[styles.root, { backgroundColor: colors.canvas ?? colors.background }]}>
     <AutomationDeletePanel colors={colors} state={state} client={client} schedule={deleting} locale={locale}
       onClose={() => setDeleting(undefined)} />
   </View>;
 
-  if (!wide && narrowDetail && selected) return <View style={[styles.root, { backgroundColor: colors.background }]}>{detail}</View>;
-  return <View style={[styles.root, wide && styles.wide, { backgroundColor: colors.background }]}>
+  if (!wide && narrowDetail && selected) return <View style={[styles.root, { backgroundColor: colors.canvas ?? colors.background }]}>{detail}</View>;
+  return <View style={[styles.root, wide && styles.wide, { backgroundColor: colors.canvas ?? colors.background }]}>
     {list}
     {wide && <View style={[styles.detailPane, { borderColor: colors.border }]}>{detail}</View>}
   </View>;

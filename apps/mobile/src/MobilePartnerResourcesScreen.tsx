@@ -339,7 +339,7 @@ export function MobilePartnerResourcesScreen({ colors, locale, transport, onBack
           </ScrollView>}
   </View>;
 
-  return <View style={[styles.screen, { backgroundColor: colors.background }]}>
+  return <View style={[styles.screen, { backgroundColor: colors.canvas ?? colors.background }]}>
     {wide ? <View style={styles.wide}>{directoryPane}{detailPane}</View>
       : visibleDetail.partnerId ? detailPane : directoryPane}
   </View>;

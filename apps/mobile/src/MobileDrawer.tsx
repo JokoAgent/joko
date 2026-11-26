@@ -145,8 +145,8 @@ export function MobileDrawer({
   </Modal>;
 }
 
-export function useReducedMotion(): boolean {
-  const [reduced, setReduced] = useState(false);
+export function useReducedMotion(initiallyReduced = false): boolean {
+  const [reduced, setReduced] = useState(initiallyReduced);
   useEffect(() => {
     let current = true;
     void AccessibilityInfo.isReduceMotionEnabled().then((value) => { if (current) setReduced(value); });

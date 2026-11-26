@@ -895,7 +895,7 @@ export function MobileExtensionsScreen({
     && taskChoices.some((choice) => choice.sessionId === visibleUseSelection.command.sessionId);
 
   return <>
-    <View style={[styles.screen, { backgroundColor: colors.background }]}>
+    <View style={[styles.screen, { backgroundColor: colors.canvas ?? colors.background }]}>
       {wide ? <View style={styles.wide}>{directoryPane}{visibleLibrary && transport
         ? <MobileExtensionLibrary colors={colors} extension={visibleLibrary.extension} locale={locale}
           transport={transport} onBack={() => setLibraryView(undefined)} />

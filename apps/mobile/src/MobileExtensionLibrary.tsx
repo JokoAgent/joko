@@ -221,7 +221,7 @@ export function MobileExtensionLibrary({ colors, extension, locale, onBack, tran
     setValidationError(undefined);
   };
 
-  return <View style={[styles.root, { backgroundColor: colors.background }]} testID="extensions.library.surface">
+  return <View style={[styles.root, { backgroundColor: colors.canvas ?? colors.background }]} testID="extensions.library.surface">
     <View style={[styles.header, { borderColor: colors.border }]}>
       <Action label={mobileMessage(locale, "common.back")} colors={colors} onPress={onBack}
         testID="extensions.library.back" />

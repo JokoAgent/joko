@@ -10,6 +10,12 @@ type MobileTaskMessageRow = readonly [
 ];
 
 const mobileTaskMessageRows = [
+  ["settings.wallpaper", "Wallpaper", "壁纸", "桌布", "壁紙", "배경 화면"],
+  ["settings.wallpaperPick", "Choose photo or video", "选择照片或视频", "選擇照片或影片", "写真または動画を選択", "사진 또는 동영상 선택"],
+  ["settings.wallpaperStatic", "Static", "静态", "靜態", "静止画", "정지 화면"],
+  ["settings.wallpaperDynamic", "Animated", "动态", "動態", "動画", "동영상"],
+  ["settings.wallpaperSize", "Choose a photo up to 20 MiB or a video up to 100 MiB.", "请选择 20 MiB 以内的照片或 100 MiB 以内的视频。", "請選擇 20 MiB 以內的照片或 100 MiB 以內的影片。", "20 MiB 以下の写真または 100 MiB 以下の動画を選択してください。", "20 MiB 이하의 사진이나 100 MiB 이하의 동영상을 선택하세요."],
+  ["settings.wallpaperError", "The wallpaper could not be updated.", "无法更新壁纸。", "無法更新桌布。", "壁紙を更新できませんでした。", "배경 화면을 업데이트할 수 없습니다."],
   ["task.outbox", "On this device", "本机待发", "此裝置待傳送", "この端末の送信待ち", "이 기기의 전송 대기"],
   ["task.pendingPreparing", "Preparing to send", "正在准备发送", "正在準備傳送", "送信を準備中", "전송 준비 중"],
   ["task.pendingUploading", "Uploading", "正在上传", "正在上傳", "アップロード中", "업로드 중"],

@@ -35,16 +35,19 @@ import { MobileVoiceDictionaryReadOnlyController } from "./mobile-voice-dictiona
 import type { MobileVoicePreferencesStoreState } from "./mobile-voice-preferences-store";
 import type { MobileUpdateControllerState } from "./mobile-update-controller";
 import type { MobilePushControllerState } from "./mobile-push-controller";
+import { MobileWallpaperStore } from "./mobile-wallpaper";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const native = vi.hoisted(() => ({
   alert: vi.fn(),
+  pickWallpaper: vi.fn(),
   copied: vi.fn(async (_value: string) => undefined),
   hardwareBack: undefined as (() => boolean) | undefined
 }));
 
 vi.mock('expo-camera', () => ({ CameraView: () => null, useCameraPermissions: () => [undefined, vi.fn()] }));
+vi.mock("expo-image-picker", () => ({ launchImageLibraryAsync: native.pickWallpaper }));
 vi.mock("./mobile-handheld", () => ({ mobileHandheld: () => null }));
 vi.mock("./speaker-filter/native", () => ({ isSpeakerOnnxAvailable: () => false }));
 vi.mock("./MobileSpeakerFilterScreen", () => ({ MobileSpeakerFilterScreen: () => null }));
@@ -297,6 +300,7 @@ function mount(options: {
   state?: MobileState;
   foreground?: boolean;
   theme?: MobileThemePreferenceState;
+  wallpaper?: MobileWallpaperStore;
   locale?: MobileLocalePreferenceState;
   diagnostics?: MobileDiagnosticsState;
   voiceDictionary?: MobileVoicePreferencesStoreState;
@@ -335,6 +339,7 @@ function mount(options: {
     state,
     foreground,
     theme,
+    wallpaper: options.wallpaper,
     locale,
     diagnostics,
     voiceDictionary,
@@ -418,6 +423,29 @@ function deferred<T>() {
 }
 
 describe("MobileSettingsScreen", () => {
+  it("imports only the chosen system picker result and changes or removes its wallpaper through settings", async () => {
+    const asset = { uri: "file:///picker/owned.mov", type: "video", width: 120, height: 240 };
+    const file = { id: "imported", video: "mov" as const, width: 120, height: 240, imageUri: "file:///poster.jpg", videoUri: "file:///loop.mov" };
+    const storage = { getItem: vi.fn(async () => null), setItem: vi.fn(async () => {}), removeItem: vi.fn(async () => {}) };
+    const files = { prepareCustomWallpaper: vi.fn(async () => file), discardCustomWallpaper: vi.fn(async () => {}),
+      restoreCustomWallpaper: vi.fn(async () => null), cleanUnusedCustomWallpapers: vi.fn(async () => {}) };
+    const wallpaper = new MobileWallpaperStore(storage, true, async () => files);
+    const { container } = mount({ wallpaper });
+    const first = deferred<{ canceled: true; assets: null }>();
+    native.pickWallpaper.mockReset().mockReturnValueOnce(first.promise).mockResolvedValueOnce({ canceled: false, assets: [asset] });
+    const choose = button(container, "Choose photo or video");
+    await act(async () => { choose.click(); choose.click(); });
+    expect(native.pickWallpaper).toHaveBeenCalledTimes(1);
+    await act(async () => first.resolve({ canceled: true, assets: null }));
+    expect(files.prepareCustomWallpaper).not.toHaveBeenCalled(); expect(storage.setItem).not.toHaveBeenCalled();
+    await act(async () => button(container, "Choose photo or video").click());
+    expect(native.pickWallpaper).toHaveBeenCalledWith({ mediaTypes: ["images", "videos"], quality: 1 });
+    expect(native.pickWallpaper).toHaveBeenCalledTimes(2);
+    expect(files.prepareCustomWallpaper).toHaveBeenCalledWith(asset); expect(wallpaper.snapshot.mode).toBe("dynamic");
+    await act(async () => button(container, "Static").click()); expect(wallpaper.snapshot.mode).toBe("static");
+    await act(async () => button(container, "Remove").click());
+    expect(wallpaper.snapshot.mode).toBe("off"); expect(files.discardCustomWallpaper).toHaveBeenCalledWith(file.id);
+  });
   it("offers reply previews only on the supported task notification settings", async () => {
     const view = mount({ push: { status: "disabled", enabled: false, saving: false } });
     const preview = () => view.container.querySelector<HTMLInputElement>('input[aria-label="Show reply previews"]');
