@@ -1,7 +1,31 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { create } from "@bufbuild/protobuf";
-import { PartnerGroupViewController, GetPartnerGroupResponseSchema, ListPartnerGroupsResponseSchema } from "../dist/index.js";
+import { PartnerGroupViewController, GetPartnerGroupResponseSchema, ListPartnerGroupsResponseSchema,
+  insertPartnerGroupMention, retainPartnerGroupTrackedMentions, resolvePartnerGroupMentions } from "../dist/index.js";
+
+test("keeps a pick on its own occurrence as identical tokens move, are replaced or are deleted", () => {
+  const members = [{ partnerId: "person", name: "all" }];
+  const resolve = (text, tracked) => resolvePartnerGroupMentions(text, { members, allLabels: ["all"], tracked });
+  const first = insertPartnerGroupMention("@", { start: 0, end: 1 }, "all", [], "person");
+  const text = "@all @all ";
+  assert.deepEqual(resolve(text, first.tracked), { all: true, partnerIds: ["person"] });
+  const erasedFirst = retainPartnerGroupTrackedMentions(text, first.text, first.tracked, { start: 0, end: 5 });
+  assert.deepEqual(resolve(first.text, erasedFirst), { all: true, partnerIds: [] });
+  const shifted = retainPartnerGroupTrackedMentions(first.text, text, first.tracked, { start: 0, end: 0 });
+  assert.equal(shifted[0].start, 5);
+  const repicked = insertPartnerGroupMention(text, { start: 5, end: 9 }, "all", shifted);
+  assert.deepEqual(resolve(repicked.text, repicked.tracked), { all: true, partnerIds: [] });
+});
+
+test("retains a picked broadcast name while recognizing separate typed broadcast aliases", () => {
+  const pick = insertPartnerGroupMention("@", { start: 0, end: 1 }, "ALL", [], "person");
+  const input = { members: [{ partnerId: "person", name: "Writer" }], tracked: pick.tracked };
+  assert.deepEqual(resolvePartnerGroupMentions(pick.text, input), { all: false, partnerIds: ["person"] });
+  for (const label of ["ALL", "Everyone", "所有伙伴", "全員", "모두"]) {
+    assert.deepEqual(resolvePartnerGroupMentions(pick.text + "@" + label, input), { all: true, partnerIds: ["person"] });
+  }
+});
 
 const group = { id: "group-one", revision: { value: 1n }, name: "Project", members: [{ partnerId: "first", name: "First" }, { partnerId: "second", name: "Second" }] };
 function api() {

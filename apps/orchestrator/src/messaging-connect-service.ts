@@ -2,6 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import { reflect } from "@bufbuild/protobuf/reflect";
 import { Code, ConnectError, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
+import { parseIMessageConfiguration, type IMessageConfiguration } from "@joko/messaging/imessage";
 import type { CredentialManager } from "./credential-manager.js";
 import type {
   MessagingChannel as NativeMessagingChannel,
@@ -58,7 +59,8 @@ const CHANNELS: readonly NativeMessagingChannel[] = Object.freeze([
   "lark",
   "wecom",
   "wechat",
-  "slack"
+  "slack",
+  "imessage"
 ]);
 
 export function createMessagingConnectService(
@@ -96,6 +98,9 @@ export function createMessagingConnectService(
     createMessagingConnection: async (request, context) => messagingRpc(async () => {
       authenticate(context);
       const owner = requireManager(manager);
+      if (request.imessageConfiguration !== undefined && request.channel !== contract.MessagingChannel.IMESSAGE) {
+        throw new ConnectError("The BlueBubbles configuration requires iMessage.", Code.InvalidArgument);
+      }
       const connection = request.channel === contract.MessagingChannel.TELEGRAM
         ? (() => {
             if (
@@ -257,7 +262,17 @@ export function createMessagingConnectService(
                             : fromProtoSlackConfiguration(request.slackConfiguration)
                         });
                       })()
-                  : undefined;
+                  : request.channel === contract.MessagingChannel.IMESSAGE
+                    ? (() => {
+                        if (!request.imessageConfiguration || request.telegramConfiguration || request.discordConfiguration
+                          || request.dingtalkConfiguration || request.feishuConfiguration || request.wecomConfiguration
+                          || request.wechatConfiguration || request.slackConfiguration) {
+                          throw new ConnectError("Provide one iMessage configuration.", Code.InvalidArgument);
+                        }
+                        return owner.createIMessageConnection({ ownerProviderUserId: request.ownerProviderUserId,
+                          configuration: fromProtoIMessageConfiguration(request.imessageConfiguration) });
+                      })()
+                    : undefined;
       if (connection === undefined) {
         throw new ConnectError("This Messaging channel is not available yet.", Code.Unimplemented);
       }
@@ -418,6 +433,17 @@ export function createMessagingConnectService(
       return create(contract.UpdateSlackMessagingConfigurationResponseSchema, {
         connection: toProtoConnection(connection)
       });
+    }),
+
+    updateIMessageMessagingConfiguration: async (request, context) => messagingRpc(async () => {
+      authenticate(context);
+      if (request.configuration === undefined) throw new ConnectError("The iMessage configuration is required.", Code.InvalidArgument);
+      const connection = await requireManager(manager).replaceIMessageConfiguration({
+        connectionId: request.connectionId, expectedRevision: requiredRevision(request.expectedRevision, "expected_revision"),
+        expectedGeneration: generationNumber(request.expectedGeneration), ownerProviderUserId: request.ownerProviderUserId,
+        configuration: fromProtoIMessageConfiguration(request.configuration)
+      });
+      return create(contract.UpdateIMessageMessagingConfigurationResponseSchema, { connection: toProtoConnection(connection) });
     }),
 
     beginWeChatAuthorization: async (request, context) => messagingRpc(async () => {
@@ -1025,6 +1051,7 @@ function toProtoConnection(value: MessagingConnectionRecord): contract.Messaging
         decodeSlackMessagingConfiguration(value.configuration)
       )
     }),
+    ...(value.channel !== "imessage" ? {} : { imessageConfiguration: toProtoIMessageConfiguration(parseIMessageConfiguration(value.configuration)) }),
     ...(value.errorCode === undefined ? {} : { errorCode: value.errorCode }),
     ...(value.errorSummary === undefined ? {} : { errorSummary: value.errorSummary }),
     ...(value.lastConnectedAt === undefined ? {} : { lastConnectedAt: toProtoTimestamp(value.lastConnectedAt) }),
@@ -1062,13 +1089,39 @@ function toProtoChannel(value: NativeMessagingChannel): contract.MessagingChanne
     case "wecom": return contract.MessagingChannel.WECOM;
     case "wechat": return contract.MessagingChannel.WECHAT;
     case "slack": return contract.MessagingChannel.SLACK;
+    case "imessage": return contract.MessagingChannel.IMESSAGE;
   }
 }
 
 function isAvailableChannel(value: NativeMessagingChannel, weChatAuthorizationAvailable: boolean): boolean {
   return value === "telegram" || value === "discord" || value === "dingtalk"
     || value === "feishu" || value === "lark" || value === "wecom"
-    || value === "slack" || (value === "wechat" && weChatAuthorizationAvailable);
+    || value === "slack" || value === "imessage" || (value === "wechat" && weChatAuthorizationAvailable);
+}
+
+const iMessageActivation = {
+  mention: contract.IMessageGroupActivation.MENTION, always: contract.IMessageGroupActivation.ALWAYS,
+  disabled: contract.IMessageGroupActivation.DISABLED
+} as const;
+
+function fromProtoIMessageConfiguration(value: contract.IMessageMessagingConfiguration): IMessageConfiguration {
+  try {
+    return parseIMessageConfiguration({
+      serverOrigin: value.serverOrigin, aliases: value.aliases,
+      chats: value.chats.map(chat => ({
+        guid: chat.chatGuid, selfAddress: chat.selfAddress,
+        activation: (Object.keys(iMessageActivation) as (keyof typeof iMessageActivation)[])
+          .find(mode => iMessageActivation[mode] === chat.activation)
+      }))
+    });
+  } catch { throw new ConnectError("The BlueBubbles server or approved iMessage chats are invalid.", Code.InvalidArgument); }
+}
+
+function toProtoIMessageConfiguration(value: IMessageConfiguration) {
+  return create(contract.IMessageMessagingConfigurationSchema, {
+    serverOrigin: value.serverOrigin, aliases: [...value.aliases],
+    chats: value.chats.map(chat => ({ chatGuid: chat.guid, activation: iMessageActivation[chat.activation], selfAddress: chat.selfAddress }))
+  });
 }
 
 function toProtoRuntimeStatus(

@@ -9,6 +9,8 @@ export interface PartnerGroupMentionMember {
 export interface PartnerGroupTrackedMention {
   partnerId: string;
   label: string;
+  /** UTF-16 offset of this occurrence's `@` in the draft. */
+  start: number;
 }
 
 export interface PartnerGroupMentionQuery {
@@ -20,6 +22,8 @@ export interface PartnerGroupMentionQuery {
 
 /** 候选词最长这么多字；再长就当成普通正文，不再弹候选。 */
 const MAX_MENTION_QUERY_CHARS = 32;
+
+export const partnerGroupBroadcastLabels = ['所有人', '所有伙伴', '全員', '모두', 'everyone', 'all'] as const;
 
 /** `@` 紧跟在这些字符后面时是邮箱或标识符的一部分，不是点名。 */
 const WORD_BEFORE_AT = /[A-Za-z0-9._%+-]/;
@@ -55,15 +59,6 @@ function buildLabelEntries(
     const label = raw.trim();
     if (label) byLabel.set(label, { label, all: true, partnerIds: [] });
   }
-  const memberIds = new Set(members.map((member) => member.partnerId));
-  const trackedByLabel = new Map<string, string[]>();
-  for (const mention of tracked) {
-    const label = mention.label.trim();
-    if (!label || !memberIds.has(mention.partnerId)) continue;
-    const ids = trackedByLabel.get(label) ?? [];
-    if (!ids.includes(mention.partnerId)) ids.push(mention.partnerId);
-    trackedByLabel.set(label, ids);
-  }
   for (const member of members) {
     const label = member.name.trim();
     if (!label || byLabel.get(label)?.all) continue;
@@ -71,10 +66,9 @@ function buildLabelEntries(
     if (!entry.partnerIds.includes(member.partnerId)) entry.partnerIds.push(member.partnerId);
     byLabel.set(label, entry);
   }
-  // 重名时正文分辨不出是哪一位，才用选择候选时记下的 partnerId 收窄。
-  for (const [label, ids] of trackedByLabel) {
-    const entry = byLabel.get(label);
-    if (entry && !entry.all) entry.partnerIds = ids;
+  // A member's display name may have changed while the draft was open.
+  for (const { label } of tracked) {
+    if (!byLabel.has(label)) byLabel.set(label, { label, all: false, partnerIds: [] });
   }
   // 最长优先：`@小满满` 不能先被 `@小满` 截走。
   return [...byLabel.values()].sort((a, b) => b.label.length - a.label.length);
@@ -94,7 +88,8 @@ function scanMentionTokens(text: string, entries: readonly LabelEntry[]): Mentio
     if (isMentionStart(text, index)) {
       const entry = entries.find(
         (candidate) =>
-          text.startsWith(candidate.label, index + 1) &&
+          (text.startsWith(candidate.label, index + 1) || candidate.all &&
+            text.slice(index + 1, index + 1 + candidate.label.length).toLowerCase() === candidate.label.toLowerCase()) &&
           endsAtBoundary(candidate.label, text[index + 1 + candidate.label.length]),
       );
       if (entry) {
@@ -110,28 +105,48 @@ function scanMentionTokens(text: string, entries: readonly LabelEntry[]): Mentio
 
 /**
  * Resolve who a group message addresses. Mentions are re-derived from the text
- * at send time; a tracked pick only disambiguates members that share a name.
+ * at send time. Each intact candidate pick addresses its selected member.
  */
 export function resolvePartnerGroupMentions(
   text: string,
   input: {
     members: readonly PartnerGroupMentionMember[];
-    allLabels: readonly string[];
+    allLabels?: readonly string[];
     tracked?: readonly PartnerGroupTrackedMention[];
   },
 ): PartnerGroupMention {
-  const entries = buildLabelEntries(input.members, input.allLabels, input.tracked ?? []);
   const memberIds = new Set(input.members.map((member) => member.partnerId));
+  const tracked = (input.tracked ?? []).filter(pick => memberIds.has(pick.partnerId));
+  const entries = buildLabelEntries(input.members, input.allLabels ?? partnerGroupBroadcastLabels, tracked);
   const partnerIds: string[] = [];
   let all = false;
   for (const token of scanMentionTokens(text, entries)) {
-    if (token.entry.all) all = true;
-    for (const partnerId of token.entry.partnerIds) {
-      if (memberIds.has(partnerId) && !partnerIds.includes(partnerId)) partnerIds.push(partnerId);
+    const pick = tracked.find(item => item.start === token.start && item.label === text.slice(token.start + 1, token.end));
+    if (!pick && token.entry.all) all = true;
+    for (const partnerId of pick ? [pick.partnerId] : token.entry.partnerIds) {
+      if (!partnerIds.includes(partnerId)) partnerIds.push(partnerId);
     }
   }
   // 按正文里点名的先后输出：宿主直接按这个顺序轮流发言（group mention contract §4.1）。
   return { all, partnerIds };
+}
+
+/** Move picks outside the replaced range and retire a pick when its token is edited. */
+export function retainPartnerGroupTrackedMentions(
+  before: string, after: string, tracked: readonly PartnerGroupTrackedMention[], selection: { start: number; end: number },
+): PartnerGroupTrackedMention[] {
+  let prefix = 0;
+  while (prefix < selection.start && prefix < before.length && prefix < after.length && before[prefix] === after[prefix]) prefix++;
+  let oldEnd = before.length, newEnd = after.length;
+  while (oldEnd > selection.end && newEnd > prefix && before[oldEnd - 1] === after[newEnd - 1]) { oldEnd--; newEnd--; }
+  const delta = after.length - before.length;
+  return tracked.flatMap(pick => {
+    const end = pick.start + 1 + pick.label.length;
+    if (end > prefix && pick.start < oldEnd) return [];
+    const start = end <= prefix ? pick.start : pick.start + delta;
+    return isMentionStart(after, start) && endsAtBoundary(pick.label, after[start + 1 + pick.label.length])
+      ? [{ ...pick, start }] : [];
+  });
 }
 
 /** The `@query` being typed right before the caret, if any. */
@@ -166,11 +181,16 @@ export function insertPartnerGroupMention(
   text: string,
   range: { start: number; end: number },
   label: string,
-): { text: string; caret: number } {
+  tracked: readonly PartnerGroupTrackedMention[] = [],
+  partnerId?: string,
+): { text: string; caret: number; tracked: PartnerGroupTrackedMention[] } {
   const after = text.slice(range.end);
   const inserted = after.startsWith(' ') ? `@${label}` : `@${label} `;
   const caret = range.start + inserted.length + (after.startsWith(' ') ? 1 : 0);
-  return { text: text.slice(0, range.start) + inserted + after, caret };
+  const next = text.slice(0, range.start) + inserted + after;
+  const remaining = retainPartnerGroupTrackedMentions(text, next, tracked, range);
+  if (partnerId) remaining.push({ partnerId, label, start: range.start });
+  return { text: next, caret, tracked: remaining };
 }
 
 export interface PartnerGroupTextSegment {

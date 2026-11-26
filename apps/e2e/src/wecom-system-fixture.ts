@@ -1,7 +1,7 @@
 import { MessagingTransportError } from "@joko/messaging";
 import type { OrchestratorApplicationDependencies } from "@joko/orchestrator";
 
-type MessagingChannel = "telegram" | "discord" | "dingtalk" | "feishu" | "lark" | "wecom" | "wechat" | "slack";
+import type { MessagingChannel } from "@joko/messaging";
 
 type MessagingAddress = {
   readonly channel: MessagingChannel;

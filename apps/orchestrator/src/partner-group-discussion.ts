@@ -1,4 +1,5 @@
 import type { PartnerGroupMention } from "@joko/core";
+import { partnerGroupBroadcastLabels } from "@joko/contracts";
 import { untrustedJsonBlock } from "./partner-group-prompt-data.js";
 
 export function clampGroupText(text: string, maximum: number): string {
@@ -6,8 +7,6 @@ export function clampGroupText(text: string, maximum: number): string {
   return chars.length <= maximum ? text : `${chars.slice(0, maximum - 1).join("")}…`;
 }
 
-/** Every localized 「所有人」 label the composer can insert, plus common typed forms. */
-const EVERYONE_LABELS = ['所有人', '所有伙伴', '全員', '모두', 'everyone', 'all'];
 /** `@` right after these characters belongs to an e-mail or identifier, not a mention. */
 const WORD_BEFORE_AT = /[A-Za-z0-9._%+-]/;
 const LATIN_WORD_CHAR = /[A-Za-z0-9_]/;
@@ -39,9 +38,9 @@ export function resolveGroupMentions(
   // (group discussion contract §4.1). Text is parsed only without it.
   const structured = [...new Set((input?.partnerIds ?? []).filter((id) => memberIds.has(id)))];
   const ordered: string[] = [];
-  let all = input?.all === true;
+  let hasBroadcastToken = false;
   const labels = [
-    ...EVERYONE_LABELS.map((label) => ({ label, partnerId: null as string | null })),
+    ...partnerGroupBroadcastLabels.map((label) => ({ label, partnerId: null as string | null })),
     ...members.filter((member) => member.name).map((member) => ({ label: member.name, partnerId: member.partnerId })),
   ].sort((a, b) => b.label.length - a.label.length);
   const lower = text.toLocaleLowerCase();
@@ -52,9 +51,13 @@ export function resolveGroupMentions(
       return lower.startsWith(candidate, at + 1) && endsAtBoundary(candidate, lower[at + 1 + candidate.length]);
     });
     if (!match) continue;
-    if (!match.partnerId) all = true;
+    if (!match.partnerId) hasBroadcastToken = true;
     else if (!ordered.includes(match.partnerId)) ordered.push(match.partnerId);
   }
+  // Older composers may omit the broadcast bit for a typed alias. Infer it when the
+  // ordinary names account for the supplied IDs. An unmatched ID can be a picked
+  // "@all" even after the selected member has been renamed.
+  const all = input?.all === true || (hasBroadcastToken && structured.every(id => ordered.includes(id)));
   return { all, partnerIds: structured.length > 0 ? structured : ordered };
 }
 

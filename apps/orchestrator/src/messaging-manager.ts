@@ -1,4 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import {
+  beginWeChatNoticePreparation, delayedWeChatReply, finishWeChatNoticePreparation, hasWeChatNoticeReceipt,
+  recoverWeChatNoticePreparations, rememberWeChatQuestion, saveWeChatNoticeReceipt, weChatDelayedNotice
+} from "./wechat-delayed-reply.js";
 import { fileTypeFromBuffer } from "file-type";
 import {
   DISCORD_MAXIMUM_INBOUND_FILE_BYTES,
@@ -58,6 +62,10 @@ import {
   type WeChatRawMessage,
   type WeChatTransportOptions
 } from "@joko/messaging";
+import {
+  IMessageTransport, iMessageAddress, iMessageOutboundGuid, parseIMessageConfiguration, splitIMessageText,
+  type IMessageBatch, type IMessageConfiguration, type IMessageEcho, type IMessageTransportOptions
+} from "@joko/messaging/imessage";
 import { JokoError, redactSecrets, type BlobRef, type InteractionQuestionField, type MessageBlock, type PromptInput, type TurnExecutionOverrides } from "@joko/core";
 import {
   messagingConversationContextAad,
@@ -202,7 +210,7 @@ export const DEFAULT_SLACK_MESSAGING_CONFIGURATION: SlackMessagingConfiguration 
   groupActivation: Object.freeze({})
 });
 
-type SupportedMessagingChannel = "telegram" | "discord" | "dingtalk" | "feishu" | "lark" | "wecom" | "wechat" | "slack";
+type SupportedMessagingChannel = "telegram" | "discord" | "dingtalk" | "feishu" | "lark" | "wecom" | "wechat" | "slack" | "imessage";
 type SupportedMessagingConfiguration =
   | TelegramMessagingConfiguration
   | DiscordMessagingConfiguration
@@ -210,7 +218,8 @@ type SupportedMessagingConfiguration =
   | FeishuMessagingConfiguration
   | WeComMessagingConfiguration
   | WeChatMessagingConfiguration
-  | SlackMessagingConfiguration;
+  | SlackMessagingConfiguration
+  | IMessageConfiguration;
 
 export type MessagingConnectionTestResult =
   | {
@@ -252,6 +261,7 @@ interface MessagingTransportEffectsPort {
     readonly replyToMessageId?: string;
     /** Exact inbound callback identity; used only by callback-capable transports. */
     readonly callbackMessageId?: string;
+    readonly deliveryId?: string;
     readonly format?: "markdown";
     readonly assertCurrent?: () => void;
     readonly signal?: AbortSignal;
@@ -276,6 +286,8 @@ interface MessagingTransportEffectsPort {
       readonly mimeType: string;
     }[];
     readonly replyToMessageId?: string;
+    readonly deliveryId?: string;
+    readonly assertCurrent?: () => void;
     readonly signal?: AbortSignal;
   }): Promise<MessagingSendReceipt>;
   sendInteractionCard(input: {
@@ -283,6 +295,8 @@ interface MessagingTransportEffectsPort {
     readonly text: string;
     readonly buttons: readonly { readonly label: string; readonly actionValue: string }[];
     readonly context?: { readonly contextToken: string; readonly clientId: string };
+    readonly deliveryId?: string;
+    readonly assertCurrent?: () => void;
     readonly signal?: AbortSignal;
   }): Promise<MessagingSendReceipt>;
   clearInteractionCard(input: {
@@ -400,7 +414,13 @@ interface SlackTransportPort extends MessagingTransportEffectsPort {
   ownerAddress(): MessagingAddress;
 }
 
-type MessagingTransportPort = TelegramTransportPort | DiscordTransportPort | DingTalkTransportPort | FeishuTransportPort | WeComTransportPort | WeChatTransportPort | SlackTransportPort;
+interface IMessageTransportPort extends MessagingTransportEffectsPort {
+  readonly channel: "imessage";
+  poll(input: Parameters<IMessageTransport["poll"]>[0]): ReturnType<IMessageTransport["poll"]>;
+  ownerAddress(): MessagingAddress | undefined;
+}
+
+type MessagingTransportPort = TelegramTransportPort | DiscordTransportPort | DingTalkTransportPort | FeishuTransportPort | WeComTransportPort | WeChatTransportPort | SlackTransportPort | IMessageTransportPort;
 type MessagingNormalizationResult =
   | TelegramNormalizationResult
   | DiscordNormalizationResult
@@ -408,7 +428,8 @@ type MessagingNormalizationResult =
   | FeishuNormalizationResult
   | WeComNormalizationResult
   | WeChatNormalizationResult
-  | SlackNormalizationResult;
+  | SlackNormalizationResult
+  | IMessageBatch;
 
 interface CredentialTicketBinding {
   readonly clientConnectionId: string;
@@ -499,6 +520,7 @@ export interface MessagingManagerOptions {
   readonly createWeComTransport?: (options: WeComTransportOptions) => WeComTransportPort;
   readonly createWeChatTransport?: (options: WeChatTransportOptions) => WeChatTransportPort;
   readonly createSlackTransport?: (options: SlackTransportOptions) => SlackTransportPort;
+  readonly createIMessageTransport?: (options: IMessageTransportOptions) => IMessageTransportPort;
   /** Test-only transport seams. Production always uses the providers' official direct endpoints. */
   readonly telegramFetch?: typeof fetch;
   readonly telegramApiBaseUrl?: string;
@@ -546,6 +568,7 @@ export class MessagingManager {
   readonly #createWeComTransport: NonNullable<MessagingManagerOptions["createWeComTransport"]>;
   readonly #createWeChatTransport: NonNullable<MessagingManagerOptions["createWeChatTransport"]>;
   readonly #createSlackTransport: NonNullable<MessagingManagerOptions["createSlackTransport"]>;
+  readonly #createIMessageTransport: NonNullable<MessagingManagerOptions["createIMessageTransport"]>;
   readonly #pollTimeoutSeconds: number;
   readonly #retryDelayMs: number;
   readonly #weChatPresenceTiming: { readonly tickMs: number; readonly firstProgressMs: number; readonly repeatProgressMs: number };
@@ -633,6 +656,7 @@ export class MessagingManager {
     this.#createWeComTransport = options.createWeComTransport ?? ((input) => new WeComTransport(input));
     this.#createWeChatTransport = options.createWeChatTransport ?? ((input) => new WeChatTransport(input));
     this.#createSlackTransport = options.createSlackTransport ?? ((input) => new SlackTransport(input));
+    this.#createIMessageTransport = options.createIMessageTransport ?? ((input) => new IMessageTransport(input));
   }
 
   async initialize(): Promise<void> {
@@ -642,7 +666,9 @@ export class MessagingManager {
     for (const reference of this.#managedCredentialReferences()) {
       this.#credentials.reserveManagedSecret({ credentialReferenceId: reference, kind: "api_key" });
     }
-    this.#store.recoverClaimedMessagingDeliveries(this.#now());
+    const recoveredAt = this.#now();
+    recoverWeChatNoticePreparations(this.#store, recoveredAt);
+    this.#store.recoverClaimedMessagingDeliveries(recoveredAt);
     this.#store.recoverClaimedMessagingInteractions(this.#now());
     this.#unsubscribeProgress = this.#store.subscribe(event => { this.#observeFeishuProgress(event); this.#observeReplyStream(event); });
     await this.#cleanupCredentials();
@@ -726,7 +752,8 @@ export class MessagingManager {
           text: input.text || (images.length ? '' : 'Files delivered.'), files: images, feishuAnswer: true } });
       } else {
         const split = channel === 'telegram' ? splitTelegramMarkdown : channel === 'discord' ? splitDiscordText : channel === 'dingtalk' ? splitDingTalkText
-          : channel === 'slack' ? splitSlackText : channel === 'wechat' ? splitWeChatText : splitWeComText;
+          : channel === 'slack' ? splitSlackText : channel === 'wechat' ? splitWeChatText
+            : channel === 'imessage' ? splitIMessageText : splitWeComText;
         for (const text of split(input.text)) payloads.push({ kind: 'text', payload: { ...base, text } });
         const batch = channel === 'telegram' || channel === 'discord' ? 10 : 1;
         for (let index = 0; index < images.length; index += batch) payloads.push({ kind: 'file', payload: { ...base, files: images.slice(index, index + batch) } });
@@ -989,6 +1016,44 @@ export class MessagingManager {
       channel: "wechat",
       configuration: decodeWeChatConfiguration(input.configuration ?? { format: 1 })
     });
+  }
+
+  createIMessageConnection(input: { readonly configuration: IMessageConfiguration; readonly ownerProviderUserId: string }): MessagingConnectionRecord {
+    this.#assertReady();
+    const ownerProviderUserId = iMessageAddress(input.ownerProviderUserId);
+    if (!ownerProviderUserId) throw invalid("Enter the iMessage owner address.");
+    const configuration = decodeIMessageConfiguration(input.configuration);
+    this.#assertAvailableIMessageOrigin(configuration.serverOrigin);
+    return this.#store.createMessagingConnection({ channel: "imessage", configuration, ownerProviderUserId });
+  }
+
+  replaceIMessageConfiguration(input: {
+    readonly connectionId: string; readonly expectedRevision: bigint; readonly expectedGeneration: number;
+    readonly configuration: IMessageConfiguration; readonly ownerProviderUserId: string;
+  }): Promise<MessagingConnectionRecord> {
+    return this.#mutate(async () => {
+      const current = this.#store.getMessagingConnection(requiredIdentifier(input.connectionId, "connection"));
+      assertConnectionFence(current, input.expectedRevision, input.expectedGeneration);
+      if (current.channel !== "imessage") throw unavailableChannel();
+      const configuration = decodeIMessageConfiguration(input.configuration);
+      const ownerProviderUserId = iMessageAddress(input.ownerProviderUserId);
+      if (!ownerProviderUserId) throw invalid("Enter the iMessage owner address.");
+      this.#assertAvailableIMessageOrigin(configuration.serverOrigin, current.id);
+      if (configuration.serverOrigin !== decodeIMessageConfiguration(current.configuration).serverOrigin && current.credentialReferenceId !== undefined) {
+        throw invalid("Clear the current BlueBubbles password before changing the server.");
+      }
+      const updated = this.#store.replaceMessagingConfiguration({ connectionId: current.id, expectedRevision: current.revision,
+        expectedGeneration: current.generation, configuration, ownerProviderUserId, updatedAt: this.#now() });
+      this.#restartWorker(updated.id);
+      return updated;
+    });
+  }
+
+  #assertAvailableIMessageOrigin(origin: string, excludedId?: string): void {
+    if (this.#store.listMessagingConnections().some(row => row.channel === "imessage" && row.id !== excludedId
+      && decodeIMessageConfiguration(row.configuration).serverOrigin === origin)) {
+      throw new MessagingManagerError("conflict", "This BlueBubbles server already has a local connection.");
+    }
   }
 
   /** Consumes a confirmed provider authorization only inside the service. */
@@ -1374,14 +1439,20 @@ export class MessagingManager {
   /** Called only after SessionHost has made the open Interaction durable. */
   onInteractionOpened(input: { readonly sessionId: string; readonly interactionId: string }): void {
     if (!this.#initialized || this.#closed) return;
-    const conversation = this.#interactionConversation(input.sessionId, input.interactionId);
-    if (conversation === undefined || conversation.status !== "active") return;
-    const connection = this.#store.findMessagingConnection(conversation.connectionId);
-    if (connection === undefined || connection.generation !== conversation.channelGeneration || !connection.enabled) return;
+    const origin = this.#interactionConversation(input.sessionId, input.interactionId);
+    if (origin === undefined) return;
+    const connection = this.#store.findMessagingConnection(origin.connectionId);
+    if (connection === undefined || connection.generation !== origin.channelGeneration || !connection.enabled) return;
     const interaction = this.#store.getInteraction(input.interactionId);
     if (interaction.sessionId !== input.sessionId || interaction.status !== "open") return;
     const card = messagingInteractionCard(interaction, connection.channel);
     if (card === undefined) return;
+    let conversation = origin;
+    if (connection.channel === "imessage" && interaction.kind !== "question") {
+      const owner = this.#iMessageOwnerAddress(connection);
+      if (owner === undefined) return;
+      conversation = this.#ensureConversation(connection, owner, this.#now());
+    }
     const payload = {
       format: 1,
       action: "open",
@@ -1395,6 +1466,7 @@ export class MessagingManager {
       connectionId: connection.id,
       expectedChannelGeneration: connection.generation,
       conversationId: conversation.id,
+      ...(connection.channel === "imessage" && conversation.status === "observed" ? { allowObservedConversation: true } : {}),
       dedupeKey: `interaction:${interaction.id}:open`,
       kind: "interaction",
       partIndex: 0,
@@ -1434,6 +1506,23 @@ export class MessagingManager {
       || conversation.channelGeneration !== request.channelGeneration || conversation.connectionId !== request.connectionId
       || conversation.sessionGeneration !== interaction.generation) return undefined;
     return conversation;
+  }
+
+  #iMessageOwnerAddress(connection: MessagingConnectionRecord): MessagingAddress | undefined {
+    const worker = this.#workers.get(connection.id);
+    return worker?.generation === connection.generation && !worker.controller.signal.aborted
+      && worker.transport?.channel === "imessage" ? worker.transport.ownerAddress() : undefined;
+  }
+
+  #mayAnswerIMessageInteraction(connection: MessagingConnectionRecord, event: MessagingInboundMessage, pending: InteractionRecord): boolean {
+    const live = this.#store.findMessagingConnection(connection.id);
+    if (!live?.enabled || live.generation !== connection.generation || live.credentialGeneration !== connection.credentialGeneration) return false;
+    const origin = this.#interactionConversation(pending.sessionId, pending.id);
+    if (origin?.connectionId !== connection.id || origin.channelGeneration !== connection.generation) return false;
+    if (pending.kind === "question") return sameMessagingAddress(event.address, addressFor(connection, origin));
+    const owner = this.#iMessageOwnerAddress(connection);
+    return owner !== undefined && event.speaker.isOwner && event.speaker.providerUserId === live.ownerProviderUserId
+      && sameMessagingAddress(owner, event.address);
   }
 
   /** Called only after SessionHost has made Run/Attempt/Queue terminal state durable. */
@@ -1490,7 +1579,7 @@ export class MessagingManager {
                   ? splitWeComText(deliveryText)
                   : channel === "wechat"
                     ? splitWeChatText(deliveryText)
-                  : splitTelegramMarkdown(text);
+                    : channel === "imessage" ? splitIMessageText(text) : splitTelegramMarkdown(text);
           for (const part of parts) {
             const partIndex = deliveries.length;
             deliveries.push({
@@ -1513,7 +1602,7 @@ export class MessagingManager {
         const images = output.attachments.filter((attachment) => attachment.kind === "image");
         const files = output.attachments.filter((attachment) => attachment.kind === "file");
         const imageBatchSize = channel === "dingtalk" || channel === "feishu" || channel === "lark"
-          || channel === "wecom" || channel === "wechat" || channel === "slack" ? 1 : 10;
+          || channel === "wecom" || channel === "wechat" || channel === "slack" || channel === "imessage" ? 1 : 10;
         for (let index = 0; !feishu && index < images.length; index += imageBatchSize) {
           const partIndex = deliveries.length;
           deliveries.push({
@@ -1740,6 +1829,14 @@ export class MessagingManager {
         });
         const worker = this.#workers.get(connectionId);
         if (worker?.generation === generation) worker.transport = transport;
+        if (transport.channel === "imessage") {
+          for (const interaction of listAllInteractions(this.#store, { status: "open" })) {
+            const origin = this.#interactionConversation(interaction.sessionId, interaction.id);
+            if (origin?.connectionId === connectionId && origin.channelGeneration === generation) {
+              this.onInteractionOpened({ sessionId: interaction.sessionId, interactionId: interaction.id });
+            }
+          }
+        }
         if (transport.channel === "discord" || transport.channel === "feishu" || transport.channel === "lark"
           || transport.channel === "slack") {
           const connected = this.#requireWorkerConnection(connectionId, generation);
@@ -1812,6 +1909,10 @@ export class MessagingManager {
         });
         nextCursor = result.nextCursor;
         normalized = transport.normalize(result.updates);
+      } else if (transport.channel === "imessage") {
+        const result = await transport.poll({ cursor: connection.cursor ?? null, signal });
+        nextCursor = result.nextCursor;
+        normalized = result.batch;
       } else if (transport.channel === "slack") {
         const result = await transport.poll({
           cursor: connection.cursor ?? null,
@@ -1943,14 +2044,18 @@ export class MessagingManager {
         updatedAt: this.#now()
       });
     }
+    const isRecordedReply = (event: MessagingInboundMessage): boolean => activeConnection.channel === "imessage"
+      && this.#store.hasMessagingInteractionRequest(activeConnection.id, activeConnection.generation, event.providerRequestIds[0]!);
+    const recordedReplies = new Set(batch.events.flatMap(event => event.kind === "message" && isRecordedReply(event)
+      ? [event.messageId] : []));
     const events = batch.events.filter((event) =>
-      event.kind !== "message" || this.#slackMessageMayEnter(activeConnection, event));
+      event.kind !== "message" || (this.#slackMessageMayEnter(activeConnection, event) && !recordedReplies.has(event.messageId)));
     const admittedAddresses = new Set(events.filter((event) => event.kind === "message")
       .map((event) => messagingAddressKey(event.address)));
     const replyCandidates = "interactionReplyCandidates" in batch
       ? batch.interactionReplyCandidates
       : [];
-    const interactionReplyMessageIds = new Set<string>();
+    const interactionReplyMessageIds = new Set(recordedReplies);
     const taskCommands = new Map<string, MessagingTaskCommand>();
     for (const event of events) {
       if (event.kind !== "message") continue;
@@ -1962,7 +2067,7 @@ export class MessagingManager {
       }
     }
     for (const event of replyCandidates) {
-      if (this.#findTextInteractionDelivery(activeConnection, event) !== undefined) {
+      if (isRecordedReply(event) || this.#findTextInteractionDelivery(activeConnection, event) !== undefined) {
         interactionReplyMessageIds.add(event.messageId);
       }
     }
@@ -2012,6 +2117,7 @@ export class MessagingManager {
     }
     for (const event of replyCandidates) {
       signal.throwIfAborted();
+      if (isRecordedReply(event)) continue;
       const delivery = this.#findTextInteractionDelivery(activeConnection, event);
       if (delivery !== undefined) await this.#settleTextInteraction(activeConnection, event, delivery, undefined, acknowledge);
     }
@@ -2042,7 +2148,21 @@ export class MessagingManager {
   ): MessagingDeliveryRecord | undefined {
     if (connection.channel === "telegram" && event.address.conversationKind !== "direct"
       && event.text.trim() === "" && event.attachments.length === 0 && event.unsupported.length === 0) return undefined;
+    const imessage = connection.channel === "imessage";
+    if (imessage && (!event.text.trim() || event.attachments.length !== 0 || event.unsupported.length !== 0)) return undefined;
+    if (imessage && this.#store.findMessagingInboundRequestByProviderId({
+      connectionId: connection.id, channelGeneration: connection.generation, providerRequestId: event.providerRequestIds[0]!
+    })) return undefined;
     const conversation = this.#ensureConversation(connection, event.address, event.occurredAt);
+    const acceptsIMessageReply = (delivery: MessagingDeliveryRecord, exact: boolean): boolean => {
+      if (event.occurredAt < delivery.createdAt) return false;
+      const card = interactionDeliveryPayload(delivery.payload);
+      if (card.action !== "open") return false;
+      const pending = this.#store.findInteraction(card.interactionId);
+      return pending?.status === "open" && pending.generation === card.interactionGeneration
+        && this.#mayAnswerIMessageInteraction(connection, event, pending)
+        && (exact || parseMessagingTextInteraction(card, pending, event.text).submission !== undefined);
+    };
     if (event.replyContext !== null) {
       const exact = this.#store.findSentMessagingInteractionDelivery({
         connectionId: connection.id,
@@ -2050,11 +2170,12 @@ export class MessagingManager {
         conversationId: conversation.id,
         providerMessageId: event.replyContext.providerMessageId
       });
-      if (exact !== undefined) return exact;
+      if (exact !== undefined && (!imessage || acceptsIMessageReply(exact, true))) return exact;
+      if (imessage) return undefined;
     }
     if ((connection.channel !== "dingtalk" && connection.channel !== "wecom" && connection.channel !== "wechat"
-      && connection.channel !== "slack")
-      || (connection.channel !== "wechat" && !event.speaker.isOwner)) return undefined;
+      && connection.channel !== "slack" && connection.channel !== "imessage")
+      || (connection.channel !== "wechat" && !imessage && !event.speaker.isOwner)) return undefined;
     const open = this.#store.listMessagingDeliveries({
       connectionId: connection.id,
       statuses: ["sent"],
@@ -2063,6 +2184,7 @@ export class MessagingManager {
       if (delivery.channelGeneration !== connection.generation
         || delivery.conversationId !== conversation.id || delivery.kind !== "interaction") return false;
       try {
+        if (imessage) return acceptsIMessageReply(delivery, false);
         const card = interactionDeliveryPayload(delivery.payload);
         if (card.action !== "open") return false;
         const interaction = this.#store.findInteraction(card.interactionId);
@@ -2084,12 +2206,15 @@ export class MessagingManager {
     const delivery = knownDelivery ?? this.#findTextInteractionDelivery(connection, event);
     if (delivery === undefined) return false;
     const conversation = this.#store.getMessagingConversation(delivery.conversationId);
+    const imessage = connection.channel === "imessage";
+    const observed = imessage && conversation.status === "observed";
     const responseDigest = operationBodyHash({ text: event.text });
     const payload = { format: 1, responseDigest };
     const interaction = this.#store.createMessagingInteraction({
       connectionId: connection.id,
       expectedChannelGeneration: connection.generation,
       conversationId: conversation.id,
+      ...(observed ? { allowObservedConversation: true } : {}),
       providerRequestId: event.providerRequestIds[0]!,
       providerInteractionId: messagingReplyInteractionId(event),
       providerMessageId: event.messageId,
@@ -2125,13 +2250,14 @@ export class MessagingManager {
     try {
       const card = interactionDeliveryPayload(delivery.payload);
       const pending = this.#store.getInteraction(card.interactionId);
-      if (!event.speaker.isOwner && connection.channel !== "wechat") {
+      if (imessage ? !this.#mayAnswerIMessageInteraction(connection, event, pending)
+        : !event.speaker.isOwner && connection.channel !== "wechat") {
         outcomeCode = "unauthorized";
         notice = "Only the connection owner can answer this request.";
       } else if (
-        card.action === "open" && conversation.status === "active" && conversation.sessionId !== undefined
-        && pending.sessionId === conversation.sessionId && pending.status === "open"
+        card.action === "open" && pending.status === "open"
         && pending.generation === card.interactionGeneration
+        && (imessage || conversation.status === "active" && pending.sessionId === conversation.sessionId)
       ) {
         const parsed = parseMessagingTextInteraction(card, pending, event.text);
         if (parsed.submission === undefined) {
@@ -2165,6 +2291,7 @@ export class MessagingManager {
         connectionId: connection.id,
         expectedChannelGeneration: connection.generation,
         conversationId: conversation.id,
+        ...(observed ? { allowObservedConversation: true } : {}),
         dedupeKey: `interaction-reply:${claimed.id}:notice`,
         kind: "notice",
         partIndex: 0,
@@ -2892,6 +3019,12 @@ export class MessagingManager {
     acknowledge?: () => Promise<void>
   ): Promise<void> {
     const conversation = this.#ensureConversation(connection, event.address, event.occurredAt);
+    if (connection.channel === "imessage") {
+      const previous = this.#store.findMessagingInboundRequestByProviderId({
+        connectionId: connection.id, channelGeneration: connection.generation, providerRequestId: event.providerRequestIds[0]!
+      });
+      if (previous && previous.status !== "preparing") return;
+    }
     const creation = this.#store.createMessagingInboundRequest({
       connectionId: connection.id,
       expectedChannelGeneration: connection.generation,
@@ -3005,7 +3138,7 @@ export class MessagingManager {
     const artifacts = request.artifactIds.map((artifactId) => this.#store.getArtifact(artifactId).blob);
     const origin = this.#partnerRuntime?.origin(activeConversation, event, request.id);
     const configuration = decodeSupportedConnection(connection);
-    const overrides: TurnExecutionOverrides | undefined = origin
+    const overrides: TurnExecutionOverrides | undefined = origin || connection.channel === "imessage" && !event.speaker.isOwner
       ? { permissionMode: 'ask' }
       : activeConversation.conversationKind === "direct"
       ? undefined
@@ -3038,6 +3171,7 @@ export class MessagingManager {
         queueItemId: admitted.queueItemId,
         updatedAt: this.#now()
       });
+      if (connection.channel === "wechat" && !admittedRequest.protectedContent) rememberWeChatQuestion(store, request.id, event.text);
       if (connection.channel === "telegram" && groupHistory.messageIds.length > 0) {
         groupHistory.selections = this.#rememberTelegramHistorySelection(connection, request.id, event,
           groupHistory.messageIds, store.getQueueItem(admitted.queueItemId).bodyHash);
@@ -3620,6 +3754,8 @@ export class MessagingManager {
       const context: string[] = [];
       let size = 0;
       for (const entry of observations) {
+        if (event.address.channel === "imessage" && (entry.occurredAt > event.occurredAt
+          || entry.occurredAt === event.occurredAt && entry.providerMessageId.localeCompare(event.messageId) > 0)) continue;
         if (telegramTrigger !== undefined) {
           const messageId = Number(entry.providerMessageId);
           if (messageId >= telegramTrigger || lastAccepted !== undefined && messageId <= lastAccepted) continue;
@@ -3695,6 +3831,12 @@ export class MessagingManager {
       descriptor.generation !== connection.credentialGeneration
     ) throw credentialUnavailable();
     const token = this.#credentials.resolve(connection.credentialReferenceId);
+    if (connection.channel === "imessage") {
+      if (!connection.ownerProviderUserId) throw credentialUnavailable();
+      return this.#createIMessageTransport({ connectionId: connection.id, generation: connection.generation,
+        ownerAddress: connection.ownerProviderUserId, password: token, configuration: decodeIMessageConfiguration(connection.configuration),
+        now: this.#now, initialActivation: connection.updatedAt, isOutgoing: echo => this.#isIMessageDeliveryEcho(connection, echo) });
+    }
     if (connection.channel === "telegram") {
       const configuration = decodeTelegramConnection(connection);
       if (connection.ownerProviderUserId === undefined) throw credentialUnavailable();
@@ -3784,6 +3926,21 @@ export class MessagingManager {
       groupActivation: configuration.groupActivation,
       initialCursor: connection.cursor ?? null,
       now: this.#now
+    });
+  }
+
+  #isIMessageDeliveryEcho(connection: MessagingConnectionRecord, echo: IMessageEcho): boolean {
+    const latest = this.#requireWorkerConnection(connection.id, connection.generation);
+    const deliveries = this.#store.listMessagingDeliveries({ connectionId: latest.id, statuses: ["dispatching", "sent", "unknown"], limit: 1_000 });
+    return deliveries.some(delivery => {
+      if (!isRecord(delivery.payload) || !validAddress(delivery.payload["address"])
+        || delivery.payload["address"].providerConversationId !== echo.chatGuid) return false;
+      if (delivery.providerMessageId === echo.guid || echo.tempGuid === iMessageOutboundGuid(delivery.id)) return true;
+      if (echo.tempGuid !== undefined || delivery.status === "sent" || echo.occurredAt < delivery.createdAt - 30_000
+        || echo.occurredAt > delivery.updatedAt + 2 * 60_000) return false;
+      return echo.hasAttachments ? delivery.kind === "file"
+        : delivery.payload["text"] === echo.text
+          || (delivery.kind === "interaction" && typeof delivery.payload["text"] === "string" && echo.text.startsWith(delivery.payload["text"]));
     });
   }
 
@@ -4476,19 +4633,25 @@ export class MessagingManager {
       signal.throwIfAborted();
       const connection = this.#requireWorkerConnection(transport.connectionId, transport.generation);
       const claimToken = this.#idFactory();
-      const delivery = this.#store.claimNextMessagingDelivery({
-        connectionId: connection.id,
-        expectedChannelGeneration: connection.generation,
-        claimToken,
-        claimedAt: this.#now()
+      const claimed = this.#store.transaction(store => {
+        const claimedAt = this.#now();
+        const delivery = store.claimNextMessagingDelivery({ connectionId: connection.id, expectedChannelGeneration: connection.generation, claimToken, claimedAt });
+        if (!delivery) return undefined;
+        const delayed = delayedWeChatReply(store, connection, delivery, claimedAt);
+        if (delayed) beginWeChatNoticePreparation(store, delivery, claimToken);
+        return { delivery, delayed };
       });
-      if (delivery === undefined) return;
+      if (claimed === undefined) return;
+      const { delivery, delayed } = claimed;
+      let bodyMayHaveStarted = delayed === undefined;
+      const finishNotice = () => { if (delayed) finishWeChatNoticePreparation(this.#store, delivery.id); };
       try {
         const retiredLifecycle = connection.channel === "discord" && delivery.kind === "notice"
           && /^lifecycle:(?:connected|shutdown):generation:/u.test(delivery.dedupeKey)
           && !delivery.dedupeKey.endsWith(`:instance:${this.#discordLifecycleId}`);
         const streamPayload = isRecord(delivery.payload) && (delivery.payload["replyStream"] !== undefined || delivery.payload["streamFinalRequestId"] !== undefined);
         if (retiredLifecycle || this.#obsoleteInteractionDelivery(delivery) || streamPayload && !this.#streamDeliverySource(delivery)) {
+          finishNotice();
           this.#store.settleMessagingDelivery({
             deliveryId: delivery.id,
             expectedRevision: delivery.revision,
@@ -4533,7 +4696,36 @@ export class MessagingManager {
           if (source.start?.status === "sent" && !this.#store.hasUnknownMessagingDelivery({ connectionId: connection.id, channelGeneration: connection.generation,
             conversationId: delivery.conversationId, dedupeKeyPrefix: `request:${source.request.id}:progress:` })) streamCarrierMessageId = source.start.providerMessageId;
         }
-        const providerMessageId = await dispatchMessagingDelivery(transport, delivery, this.#artifacts, deliverySignal, context, fallbackProgressMessageId, assertDeliveryCurrent, streamCarrierMessageId);
+        const assertContext = () => {
+          assertDeliveryCurrent();
+          if (delayed && context && this.#weChatSendContext(connection, delivery).contextToken !== context.contextToken) {
+            throw new MessagingTransportError("provider_rejected", "The original WeChat reply context changed before dispatch.", { effect: "none", retryable: true });
+          }
+        };
+        const beforeWeChatReply = delayed && context && replyConversation ? async (address: MessagingAddress): Promise<void> => {
+          if (!sameMessagingAddress(address, addressFor(connection, replyConversation))) throw invalid("The delayed WeChat reply lost its recipient.");
+          assertContext();
+          const notice = weChatDelayedNotice(delivery, delayed, context.contextToken, this.#now());
+          if (!hasWeChatNoticeReceipt(this.#store, delivery.conversationId, notice.id)) {
+            try {
+              await transport.sendTextPart({ address, text: notice.text, context: { ...context, clientId: notice.id },
+                signal: deliverySignal, assertCurrent: assertContext });
+            } catch (error) {
+              // Only the notice may have reached WeChat. Its stable ID can be
+              // retried while the original body remains eligible for dispatch.
+              if (externalEffectUnknown(error)) throw new MessagingTransportError("provider_rejected",
+                "The delayed WeChat notice did not return a confirmation.", { effect: "none", retryable: true });
+              throw error;
+            }
+            assertDeliveryCurrent();
+            saveWeChatNoticeReceipt(this.#store, delivery.conversationId, notice.id);
+          }
+          assertContext();
+          finishNotice();
+          bodyMayHaveStarted = true;
+        } : undefined;
+        const providerMessageId = await dispatchMessagingDelivery(transport, delivery, this.#artifacts, deliverySignal, context, fallbackProgressMessageId,
+          assertContext, streamCarrierMessageId, beforeWeChatReply);
         const settled = this.#store.settleMessagingDelivery({
           deliveryId: delivery.id,
           expectedRevision: delivery.revision,
@@ -4561,14 +4753,17 @@ export class MessagingManager {
           if (request !== undefined) this.#finishSlackProgress(request);
         }
       } catch (error) {
-        const unknown = externalEffectUnknown(error);
-        const settled = this.#store.settleMessagingDelivery({
-          deliveryId: delivery.id,
-          expectedRevision: delivery.revision,
-          claimToken,
-          status: unknown ? "unknown" : "failed",
-          errorCode: transportErrorCode(error),
-          settledAt: this.#now()
+        const unknown = bodyMayHaveStarted && externalEffectUnknown(error);
+        const settled = this.#store.transaction(store => {
+          finishNotice();
+          return store.settleMessagingDelivery({
+            deliveryId: delivery.id,
+            expectedRevision: delivery.revision,
+            claimToken,
+            status: unknown ? "unknown" : "failed",
+            errorCode: transportErrorCode(error),
+            settledAt: this.#now()
+          });
         });
         const retryLimit = connection.channel === "telegram" && error instanceof MessagingTransportError
           && error.options.providerStatus === 429 ? 2 : 5;
@@ -4590,8 +4785,14 @@ export class MessagingManager {
     const payload = interactionDeliveryPayload(delivery.payload);
     if (payload.action !== "open") return false;
     const interaction = this.#store.findInteraction(payload.interactionId);
-    return interaction === undefined || interaction.status !== "open"
-      || interaction.generation !== payload.interactionGeneration;
+    if (interaction === undefined || interaction.status !== "open" || interaction.generation !== payload.interactionGeneration) return true;
+    if (payload.address.channel !== "imessage") return false;
+    const connection = this.#store.findMessagingConnection(delivery.connectionId);
+    const origin = this.#interactionConversation(interaction.sessionId, interaction.id);
+    if (!connection?.enabled || connection.generation !== delivery.channelGeneration
+      || origin?.connectionId !== connection.id || origin.channelGeneration !== connection.generation) return true;
+    const address = interaction.kind === "question" ? addressFor(connection, origin) : this.#iMessageOwnerAddress(connection);
+    return address === undefined || !sameMessagingAddress(address, payload.address);
   }
 
   #reconcileInteractionCards(connection: MessagingConnectionRecord): void {
@@ -4614,7 +4815,7 @@ export class MessagingManager {
     connection: MessagingConnectionRecord,
     delivery: MessagingDeliveryRecord
   ): void {
-    if (connection.channel === "wechat") return;
+    if (connection.channel === "wechat" || connection.channel === "imessage") return;
     if (delivery.providerMessageId === undefined) return;
     const payload = interactionDeliveryPayload(delivery.payload);
     if (payload.action !== "open") return;
@@ -4835,7 +5036,8 @@ async function dispatchMessagingDelivery(
   context?: { readonly contextToken: string; readonly clientId: string },
   fallbackProgressMessageId?: string,
   assertCurrent: () => void = () => signal.throwIfAborted(),
-  streamCarrierMessageId?: string
+  streamCarrierMessageId?: string,
+  beforeWeChatReply?: (address: MessagingAddress) => Promise<void>
 ): Promise<string> {
   assertCurrent();
   if ((transport.channel === "telegram" || transport.channel === "discord") && isRecord(delivery.payload) && isRecord(delivery.payload["replyStream"])) {
@@ -4912,6 +5114,7 @@ async function dispatchMessagingDelivery(
       text: interaction.text,
       buttons: interaction.buttons.map((button) => ({ label: button.label, actionValue: button.actionId })),
       ...(context === undefined ? {} : { context }),
+      ...(transport.channel === "imessage" ? { deliveryId: delivery.id, assertCurrent } : {}),
       signal
     });
     return receipt.providerMessageId;
@@ -4935,6 +5138,7 @@ async function dispatchMessagingDelivery(
       });
       return receipt.providerMessageId;
     }
+    if (beforeWeChatReply) await beforeWeChatReply(payload.address);
     const receipt = await transport.sendTextPart({
       address: payload.address,
       text: payload.text,
@@ -4942,7 +5146,7 @@ async function dispatchMessagingDelivery(
       ...(payload.replyToMessageId === undefined ? {} : { replyToMessageId: payload.replyToMessageId }),
       ...(payload.callbackMessageId === undefined ? {} : { callbackMessageId: payload.callbackMessageId }),
       ...(transport.channel === "telegram" && delivery.kind === "text" ? { format: "markdown" as const, assertCurrent } : {}),
-      ...(transport.channel === "wechat" ? { assertCurrent } : {}),
+      ...(transport.channel === "wechat" || transport.channel === "imessage" ? { assertCurrent, deliveryId: delivery.id } : {}),
       signal
     });
     return receipt.providerMessageId;
@@ -4976,11 +5180,13 @@ async function dispatchMessagingDelivery(
       });
     }
     assertCurrent();
+    if (beforeWeChatReply) await beforeWeChatReply(payload.address);
     const receipt = await transport.sendAttachments({
       address: payload.address,
       attachments,
       ...(context === undefined ? {} : { context }),
       ...(payload.replyToMessageId === undefined ? {} : { replyToMessageId: payload.replyToMessageId }),
+      ...(transport.channel === "wechat" || transport.channel === "imessage" ? { assertCurrent, deliveryId: delivery.id } : {}),
       signal
     });
     return receipt.providerMessageId;
@@ -5231,7 +5437,7 @@ function messagingInteractionCard(
   }
   if (buttons.length > 100 || (buttons.length < 1 && payload.kind !== "question")) return undefined;
   const visibleButtons = channel === "slack" ? buttons.slice(0, 6)
-    : channel === "wecom" || channel === "wechat" ? buttons.slice(0, 9)
+    : channel === "wecom" || channel === "wechat" || channel === "imessage" ? buttons.slice(0, 9)
     : channel === "discord" || channel === "dingtalk" ? buttons.slice(0, 25) : buttons;
   return {
     interactionId: interaction.id,
@@ -5501,7 +5707,13 @@ function decodeSupportedConnection(connection: MessagingConnectionRecord): Suppo
   if (connection.channel === "wecom") return decodeWeComConnection(connection);
   if (connection.channel === "wechat") return decodeWeChatConnection(connection);
   if (connection.channel === "slack") return decodeSlackConnection(connection);
+  if (connection.channel === "imessage") return decodeIMessageConfiguration(connection.configuration);
   throw unavailableChannel();
+}
+
+function decodeIMessageConfiguration(value: unknown): IMessageConfiguration {
+  try { return parseIMessageConfiguration(value); }
+  catch { throw invalid("The BlueBubbles server or approved iMessage chats are invalid."); }
 }
 
 function decodeTelegramConnection(connection: MessagingConnectionRecord): TelegramMessagingConfiguration {
@@ -6029,6 +6241,8 @@ function messagingAddressKey(address: MessagingAddress): string {
 
 function messagingTaskCommand(event: MessagingInboundMessage): MessagingTaskCommand | undefined {
   const { channel, conversationKind } = event.address;
+  if (channel === "imessage") return event.speaker.isOwner && event.attachments.length === 0 && event.unsupported.length === 0
+    && isMessagingStopCommand(event.text) ? "stop" : undefined;
   if (channel !== "telegram" && channel !== "discord" || event.attachments.length > 0 || event.unsupported.length > 0
     || event.telegramReplyParts !== undefined && (event.telegramReplyParts.attachments.length > 0 || event.telegramReplyParts.unsupported.length > 0)) return;
   if (isMessagingStopCommand(event.text)) return "stop";
@@ -6228,7 +6442,7 @@ function weChatProviderId(value: unknown, label: string): string {
 
 function isSupportedMessagingChannel(value: string): value is SupportedMessagingChannel {
   return value === "telegram" || value === "discord" || value === "dingtalk" || value === "feishu" || value === "lark"
-    || value === "wecom" || value === "wechat" || value === "slack";
+    || value === "wecom" || value === "wechat" || value === "slack" || value === "imessage";
 }
 
 function requiredSupportedMessagingChannel(value: string): SupportedMessagingChannel {
@@ -6245,6 +6459,7 @@ function channelDisplayName(value: string): string {
   if (value === "wecom") return "WeCom";
   if (value === "wechat") return "WeChat";
   if (value === "slack") return "Slack";
+  if (value === "imessage") return "iMessage";
   return "Messaging provider";
 }
 
@@ -6254,6 +6469,7 @@ function credentialDisplayName(channel: SupportedMessagingChannel): string {
       : channel === "wecom" ? "WeCom Bot Secret"
       : channel === "wechat" ? "WeChat authorization token"
       : channel === "slack" ? "Slack app and bot tokens"
+      : channel === "imessage" ? "BlueBubbles password"
       : `${channelDisplayName(channel)} bot token`;
 }
 
@@ -6299,7 +6515,7 @@ function isOneOf<const T extends readonly string[]>(value: unknown, options: T):
 
 function validAddress(value: unknown): value is MessagingAddress {
   if (!isRecord(value)) return false;
-  return isOneOf(value["channel"], ["telegram", "discord", "dingtalk", "feishu", "lark", "wecom", "wechat", "slack"] as const) && typeof value["connectionId"] === "string" &&
+  return isOneOf(value["channel"], ["telegram", "discord", "dingtalk", "feishu", "lark", "wecom", "wechat", "slack", "imessage"] as const) && typeof value["connectionId"] === "string" &&
     typeof value["providerConversationId"] === "string" &&
     (value["providerThreadId"] === null || typeof value["providerThreadId"] === "string") &&
     isOneOf(value["conversationKind"], ["direct", "group", "channel"] as const);

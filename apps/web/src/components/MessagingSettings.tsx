@@ -21,6 +21,7 @@ import type {
   DingTalkMessagingConfigurationView,
   DiscordMessagingConfigurationView,
   FeishuMessagingConfigurationView,
+  IMessageMessagingConfigurationView,
   MessagingChannelView,
   MessagingConnectionTestResultView,
   MessagingConnectionView,
@@ -80,6 +81,7 @@ type MessagingCreateChannel = "telegram" | "discord" | "dingtalk" | "feishu" | "
 
 type MessagingDialog =
   | { readonly kind: "create"; readonly channel: MessagingCreateChannel }
+  | { readonly kind: "imessageCreate"; readonly ownerKey: string }
   | { readonly kind: "credential"; readonly connectionId: string }
   | { readonly kind: "configuration"; readonly connectionId: string; readonly baseline: MessagingConnectionView;
       readonly readOwner: AppController["getMessagingSettings"] }
@@ -215,12 +217,48 @@ export function MessagingSettings({ controller, snapshot, t }: {
     capability.channel === "wechat" && capability.available) === true;
   const slackAvailable = settings?.channels.some((capability) =>
     capability.channel === "slack" && capability.available) === true;
+  const createIMessage = controller.createIMessageMessagingConnection;
+  const updateIMessage = controller.updateIMessageMessagingConfiguration;
+  const iMessageAvailable = createIMessage !== undefined && settings?.channels.some(capability =>
+    capability.channel === "imessage" && capability.available) === true;
 
   const createWeChatConnection = async (): Promise<void> => {
     const connection = await run("create:wechat", () => controller.createWeChatMessagingConnection());
     if (connection === undefined) return;
     replaceConnection(connection);
     setDialog({ kind: "wechatAuthorization", connectionId: connection.id });
+  };
+
+  const saveIMessageConfiguration = async (
+    ownerAddress: string,
+    configuration: IMessageMessagingConfigurationView,
+    connection?: MessagingConnectionView
+  ): Promise<void> => {
+    if (!connection) {
+      if (!createIMessage) return;
+      const added = await run("create:imessage", () => createIMessage(ownerAddress, configuration));
+      if (!added) return;
+      replaceConnection(added);
+      setDialog({ kind: "credential", connectionId: added.id });
+      return;
+    }
+    if (!updateIMessage) return;
+    const updated = await run(`configuration:${connection.id}`, async () => {
+      const save = (candidate: MessagingConnectionView) => {
+        if (candidate.generation !== connection.generation) throw new Error(t("messaging.connectionChanged"));
+        if (candidate.ownerProviderUserId === ownerAddress
+          && JSON.stringify(candidate.imessageConfiguration) === JSON.stringify(configuration)) return candidate;
+        return updateIMessage(candidate.id, candidate.revision, candidate.generation, ownerAddress, configuration);
+      };
+      try {
+        return await save(await refreshConnection(connection));
+      } catch (reason) {
+        return save(await refreshAfterRevisionConflict(reason, connection));
+      }
+    });
+    if (!updated) return;
+    replaceConnection(updated);
+    setDialog(undefined);
   };
 
   const createConnection = async (
@@ -594,6 +632,9 @@ export function MessagingSettings({ controller, snapshot, t }: {
         {slackAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "slack" })}>
           <Plus aria-hidden="true" />{t("messaging.addSlack")}
         </Button>}
+        {iMessageAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "imessageCreate", ownerKey })}>
+          <Plus aria-hidden="true" />{t("messaging.addIMessage")}
+        </Button>}
       </div>
     </header>
 
@@ -652,6 +693,9 @@ export function MessagingSettings({ controller, snapshot, t }: {
           {slackAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "create", channel: "slack" })}>
             <Plus aria-hidden="true" />{t("messaging.addSlack")}
           </Button>}
+          {iMessageAvailable && <Button tone="primary" onClick={() => setDialog({ kind: "imessageCreate", ownerKey })}>
+            <Plus aria-hidden="true" />{t("messaging.addIMessage")}
+          </Button>}
         </div>
       : <div className="messaging-connections">
           {settings!.connections.map((connection) => {
@@ -702,6 +746,7 @@ export function MessagingSettings({ controller, snapshot, t }: {
                 <span><strong>{t(connection.channel === "wechat" ? "messaging.wechatAccountId"
                   : connection.channel === "discord" ? "messaging.discordOwnerId"
                   : connection.channel === "slack" ? "messaging.slackOwnerId"
+                  : connection.channel === "imessage" ? "messaging.imessageOwner"
                   : connection.channel === "dingtalk" ? "messaging.dingtalkOwnerId"
                     : connection.channel === "feishu" || connection.channel === "lark"
                       ? "messaging.feishuOwnerId"
@@ -754,6 +799,7 @@ export function MessagingSettings({ controller, snapshot, t }: {
                       : connection.channel === "wecom" ? "messaging.wecomClearCredential"
                       : connection.channel === "slack" ? "messaging.slackClearCredential"
                       : connection.channel === "wechat" ? "messaging.wechatClearCredential"
+                      : connection.channel === "imessage" ? "messaging.imessageClearCredential"
                       : "messaging.clearCredential")}
                 </Button>}
               </footer>
@@ -769,6 +815,15 @@ export function MessagingSettings({ controller, snapshot, t }: {
       onClose={() => setDialog(undefined)}
       onSubmit={(channel, ownerId) => { void createConnection(channel, ownerId); }}
     />
+    {dialog?.kind === "imessageCreate" && dialog.ownerKey === ownerKey && iMessageAvailable && <IMessageConfigurationDialog
+      busy={busy === "create:imessage"} t={t} onClose={() => setDialog(undefined)}
+      onSubmit={(ownerAddress, configuration) => { void saveIMessageConfiguration(ownerAddress, configuration); }}
+    />}
+    {dialog?.kind === "configuration" && connectionForDialog?.imessageConfiguration !== undefined && updateIMessage !== undefined
+      && <IMessageConfigurationDialog connection={connectionForDialog} busy={busy === `configuration:${connectionForDialog.id}`}
+        t={t} onClose={() => setDialog(undefined)}
+        onSubmit={(ownerAddress, configuration) => { void saveIMessageConfiguration(ownerAddress, configuration, connectionForDialog); }}
+      />}
     {connectionForDialog !== undefined && connectionForDialog.channel === "wechat" && dialog?.kind === "wechatAuthorization" && <WeChatAuthorizationDialog
       key={`${ownerKey}:${connectionForDialog.id}`}
       connection={connectionForDialog}
@@ -981,16 +1036,18 @@ function CredentialDialog({ open, connection, busy, t, onClose, onSubmit }: {
   const credentialLabel = connection.channel === "dingtalk"
     ? "messaging.dingtalkAppSecret"
     : connection.channel === "wecom" ? "messaging.wecomBotSecret"
+      : connection.channel === "imessage" ? "messaging.imessagePassword"
       : appSecret ? "messaging.appSecret" : "messaging.botToken";
   const secretSafety = connection.channel === "dingtalk"
     ? "messaging.dingtalkSecretSafety"
     : connection.channel === "wecom" ? "messaging.wecomSecretSafety"
+      : connection.channel === "imessage" ? "messaging.imessagePasswordSafety"
       : appSecret ? "messaging.appSecretSafety" : "messaging.secretSafety";
   useEffect(() => { if (open) { setSecret(""); setSlackAppToken(""); setSlackBotToken(""); setEnable(true); } }, [open, connection.id]);
   const close = (): void => { setSecret(""); setSlackAppToken(""); setSlackBotToken(""); onClose(); };
   const valid = slack ? validSlackToken(slackAppToken, "xapp-") && validSlackToken(slackBotToken, "xoxb-")
     : secret.trim() !== "";
-  return <Modal open={open} title={messagingCredentialActionLabel(connection, t)} description={t(slack ? "messaging.slackCredentialBody" : connection.channel === "dingtalk" ? "messaging.dingtalkCredentialBody" : connection.channel === "feishu" || connection.channel === "lark" ? "messaging.feishuCredentialBody" : connection.channel === "wecom" ? "messaging.wecomCredentialBody" : "messaging.credentialBody")} closeLabel={t("common.close")} onClose={close} initialFocus={() => inputRef.current} showClose>
+  return <Modal open={open} title={messagingCredentialActionLabel(connection, t)} description={t(slack ? "messaging.slackCredentialBody" : connection.channel === "dingtalk" ? "messaging.dingtalkCredentialBody" : connection.channel === "feishu" || connection.channel === "lark" ? "messaging.feishuCredentialBody" : connection.channel === "wecom" ? "messaging.wecomCredentialBody" : connection.channel === "imessage" ? "messaging.imessageCredentialBody" : "messaging.credentialBody")} closeLabel={t("common.close")} onClose={close} initialFocus={() => inputRef.current} showClose>
     <form className="messaging-form" onSubmit={(event) => {
       event.preventDefault();
       if (!valid) return;
@@ -1444,6 +1501,88 @@ function WeComConfigurationDialog({ open, connection, busy, t, onClose, onSubmit
   </Modal>;
 }
 
+function IMessageConfigurationDialog({ connection, busy, t, onClose, onSubmit }: {
+  readonly connection?: MessagingConnectionView;
+  readonly busy: boolean;
+  readonly t: Translator;
+  readonly onClose: () => void;
+  readonly onSubmit: (ownerAddress: string, configuration: IMessageMessagingConfigurationView) => void;
+}): JSX.Element {
+  type Chat = IMessageMessagingConfigurationView["chats"][number];
+  type ChatDraft = Omit<Chat, "selfAddress"> & { readonly key: number; readonly selfAddress: string };
+  const initial = connection?.imessageConfiguration;
+  const [origin, setOrigin] = useState(initial?.serverOrigin ?? "");
+  const [owner, setOwner] = useState(connection?.ownerProviderUserId ?? "");
+  const [aliases, setAliases] = useState(initial?.aliases.join("\n") ?? "Joko");
+  const initialChats: readonly Chat[] = initial?.chats ?? [{ guid: "", activation: "mention" }];
+  const [drafts, setDrafts] = useState<readonly ChatDraft[]>(() => initialChats
+    .map((chat, key) => ({ ...chat, key, selfAddress: chat.selfAddress ?? "" })));
+  const nextKey = useRef(drafts.length);
+  const initialFocus = useRef<HTMLInputElement>(null);
+  const guidPattern = /^(?:iMessage|any);[-+];[^\s]{1,480}$/u;
+  const chats = drafts.map(draft => ({
+    guid: draft.guid.trim(),
+    activation: draft.guid.trim().split(";")[1] === "+" ? draft.activation : "always" as const,
+    ...(draft.selfAddress.trim() ? { selfAddress: draft.selfAddress.trim().toLowerCase() } : {})
+  }));
+  const mentions = [...new Set(aliases.split(/\r?\n/u).map(alias => alias.trim()).filter(Boolean))];
+  const canSave = !busy && origin.trim() !== "" && owner.trim() !== "" && drafts.length > 0
+    && chats.every(chat => guidPattern.test(chat.guid)) && new Set(chats.map(chat => chat.guid)).size === chats.length
+    && mentions.length <= 20 && mentions.every(alias => alias.length <= 100);
+  const updateChat = (key: number, patch: Partial<Omit<ChatDraft, "key">>) =>
+    setDrafts(current => current.map(row => row.key === key ? { ...row, ...patch } : row));
+  return <Modal open title={t(connection ? "messaging.imessageConfigureTitle" : "messaging.addIMessage")}
+    description={t("messaging.imessageConfigureBody")} closeLabel={t("common.close")} onClose={onClose}
+    initialFocus={() => initialFocus.current} showClose>
+    <form className="messaging-form" onSubmit={event => {
+      event.preventDefault();
+      if (canSave) onSubmit(owner.trim().toLowerCase(), { serverOrigin: origin.trim(), aliases: mentions, chats });
+    }}>
+      <label><span>{t("messaging.imessageOrigin")}</span>
+        <input ref={connection?.credentialConfigured ? undefined : initialFocus} type="url" value={origin}
+          readOnly={connection?.credentialConfigured === true} placeholder="https://bluebubbles.example"
+          onChange={event => setOrigin(event.target.value)} autoComplete="off" spellCheck={false} required />
+      </label>
+      {connection?.credentialConfigured && <p className="messaging-form__hint">{t("messaging.imessageOriginLocked")}</p>}
+      <label><span>{t("messaging.imessageOwner")}</span>
+        <input ref={connection?.credentialConfigured ? initialFocus : undefined} value={owner} maxLength={320}
+          onChange={event => setOwner(event.target.value)} autoComplete="off" spellCheck={false} required />
+      </label>
+      <label><span>{t("messaging.imessageAliases")}</span><textarea value={aliases} rows={2}
+        onChange={event => setAliases(event.target.value)} spellCheck={false} />
+      </label>
+      <p className="messaging-form__hint">{t("messaging.imessageChatsHint")}</p>
+      {drafts.map(draft => <fieldset className="messaging-imessage-chat" key={draft.key}>
+        <label><span>{t("messaging.imessageChatGuid")}</span><input value={draft.guid} maxLength={512} required
+          onChange={event => updateChat(draft.key, { guid: event.target.value })} autoComplete="off" spellCheck={false} />
+        </label>
+        {draft.guid.trim().split(";")[1] === "+" && <label>
+          <span>{t("messaging.groupActivation")}</span>
+          <SelectControl value={draft.activation} onChange={event => updateChat(draft.key, { activation: event.target.value as Chat["activation"] })}>
+            <option value="mention">{t("messaging.imessageActivationMention")}</option>
+            <option value="always">{t("messaging.imessageActivationAlways")}</option>
+            <option value="disabled">{t("common.disabled")}</option>
+          </SelectControl>
+        </label>}
+        <label><span>{t("messaging.imessageSelf")}</span><input value={draft.selfAddress} maxLength={320}
+          onChange={event => updateChat(draft.key, { selfAddress: event.target.value })} autoComplete="off" spellCheck={false} />
+        </label>
+        {drafts.length > 1 && <Button tone="ghost" onClick={() => setDrafts(current => current.filter(chat => chat.key !== draft.key))}>
+          <Trash2 aria-hidden="true" />{t("messaging.imessageRemoveChat")}
+        </Button>}
+      </fieldset>)}
+      <div><Button tone="secondary" disabled={drafts.length >= 100} onClick={() => {
+        const draft: ChatDraft = { key: nextKey.current++, guid: "", activation: "mention", selfAddress: "" };
+        setDrafts(current => [...current, draft]);
+      }}><Plus aria-hidden="true" />{t("messaging.imessageAddChat")}</Button></div>
+      <div className="modal__actions">
+        <Button onClick={onClose}>{t("common.cancel")}</Button>
+        <Button type="submit" tone="primary" disabled={!canSave}>{busy ? <Spinner /> : null}{t("common.save")}</Button>
+      </div>
+    </form>
+  </Modal>;
+}
+
 function ClearCredentialDialog({ open, connection, busy, t, onClose, onConfirm }: {
   readonly open: boolean;
   readonly connection: MessagingConnectionView;
@@ -1458,13 +1597,15 @@ function ClearCredentialDialog({ open, connection, busy, t, onClose, onConfirm }
     : connection.channel === "wechat" ? "messaging.wechatClearTitle"
     : connection.channel === "slack" ? "messaging.slackClearTitle"
     : connection.channel === "wecom" ? "messaging.wecomClearTitle"
+    : connection.channel === "imessage" ? "messaging.imessageClearCredential"
       : appSecret ? "messaging.appSecretClearTitle" : "messaging.clearTitle";
   const action = dingtalk ? "messaging.dingtalkClearCredential"
     : connection.channel === "wechat" ? "messaging.wechatClearCredential"
     : connection.channel === "slack" ? "messaging.slackClearCredential"
     : connection.channel === "wecom" ? "messaging.wecomClearCredential"
+    : connection.channel === "imessage" ? "messaging.imessageClearCredential"
       : appSecret ? "messaging.appSecretClearCredential" : "messaging.clearCredential";
-  return <Modal open={open} title={t(title)} description={t(connection.channel === "wechat" ? "messaging.wechatClearBody" : connection.channel === "slack" ? "messaging.slackClearBody" : "messaging.clearBody")} closeLabel={t("common.close")} onClose={onClose} dialogRole="alertdialog">
+  return <Modal open={open} title={t(title)} description={t(connection.channel === "wechat" ? "messaging.wechatClearBody" : connection.channel === "slack" ? "messaging.slackClearBody" : connection.channel === "imessage" ? "messaging.imessageClearBody" : "messaging.clearBody")} closeLabel={t("common.close")} onClose={onClose} dialogRole="alertdialog">
     <div className="modal__actions"><Button onClick={onClose}>{t("common.cancel")}</Button><Button tone="danger" disabled={busy} onClick={onConfirm}>{busy ? <Spinner /> : null}{t(action)}</Button></div>
   </Modal>;
 }
@@ -1552,6 +1693,7 @@ function channelLabel(channel: MessagingChannelView): string {
     case "wecom": return "WeCom";
     case "wechat": return "WeChat";
     case "slack": return "Slack";
+    case "imessage": return "iMessage";
   }
 }
 
@@ -1728,6 +1870,9 @@ function wecomConfigurationEqual(
 }
 
 function messagingCredentialActionLabel(connection: MessagingConnectionView, t: Translator): string {
+  if (connection.channel === "imessage") {
+    return t(connection.credentialConfigured ? "messaging.imessageReplacePassword" : "messaging.imessageAddPassword");
+  }
   if (connection.channel === "slack") {
     return t(connection.credentialConfigured ? "messaging.slackReplaceCredential" : "messaging.slackAddCredential");
   }

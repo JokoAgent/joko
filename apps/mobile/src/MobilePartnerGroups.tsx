@@ -228,14 +228,23 @@ function MobileGroupComposer({ view, group, colors, locale, transport, running, 
     finally { if (nativePick.current === abort && !abort.signal.aborted) { nativePick.current = undefined; setPicking(false); } }
   };
   const send = () => void view.action(async signal => {
-    const mentions = wire.resolvePartnerGroupMentions(text, { members: group.members, allLabels: ["all", "所有人"], tracked: tracked.current });
+    const mentions = wire.resolvePartnerGroupMentions(text, { members: group.members, tracked: tracked.current });
     const signature = JSON.stringify([text, division, files.map(file => [file.attachmentId, file.sha256Hex]), mentions]); if (attempt.current?.signature !== signature) attempt.current = { id: view.api.newRequestId(), signature };
     const attachments: wire.PartnerGroupAttachment[] = [];
     for (const file of files) { let uploaded = uploads.current.get(file.attachmentId); if (!uploaded) { if (!transport) throw new Error(m.unavailable); uploaded = await transport.upload(file, signal); uploads.current.set(file.attachmentId, uploaded); } attachments.push(uploaded); }
     await view.api.send(view.group() ?? group, { text, attachments, division, mentions }, attempt.current.id, signal); setText(""); setSelection({ start: 0, end: 0 }); setFiles([]); setDivision(false); uploads.current.clear(); attempt.current = undefined; tracked.current = [];
     if (transport) await Promise.all(files.map(file => transport.remove(file))); onSent();
   });
-  const mention = (name: string, partnerId?: string) => { if (!query) return; const result = wire.insertPartnerGroupMention(text, { start: query.start, end: caret }, name); if (partnerId) tracked.current.push({ partnerId, label: name }); setText(result.text); setSelection({ start: result.caret, end: result.caret }); input.current?.focus(); };
+  const editText = (next: string, range: MobileComposerSelection) => {
+    tracked.current = wire.retainPartnerGroupTrackedMentions(text, next, tracked.current, range);
+    setText(next);
+  };
+  const mention = (name: string, partnerId?: string) => {
+    if (!query) return;
+    const result = wire.insertPartnerGroupMention(text, { start: query.start, end: caret }, name, tracked.current, partnerId);
+    tracked.current = result.tracked;
+    setText(result.text); setSelection({ start: result.caret, end: result.caret }); input.current?.focus();
+  };
   return <View style={[styles.composer, { backgroundColor: colors.background }]}>
     {division && <View style={styles.divisionTagRow}><View style={[styles.divisionTag, { backgroundColor: colors.brandBackground }]}><Text style={[styles.caption, { color: colors.ink }]}>{m.divisionTag}</Text><GroupIconAction label={m.removeDivision} name="close" colors={colors} disabled={disabled} onPress={() => { setDivision(false); input.current?.focus(); }} /></View></View>}
     {files.length > 0 && <ScrollView horizontal keyboardShouldPersistTaps="handled"><View style={styles.choices}>{files.map(file => <View key={file.attachmentId} style={styles.choices}>
@@ -246,10 +255,12 @@ function MobileGroupComposer({ view, group, colors, locale, transport, running, 
     <View style={[styles.composerRow, { backgroundColor: colors.surface, borderColor: colors.border }]}><GroupIconAction label={m.more} name="plus" colors={colors} disabled={disabled} onPress={() => setMore(true)} /><View testID="partnerGroups.composer" style={styles.grow}><MobileComposerRichInput ref={input} draft={draft} selection={selection} locale={locale} editable={!disabled} ownerKey={`${view.api.ownerKey}:${group.id}:composer`}
       accessibilityLabel={m.placeholder} placeholder={m.placeholder} height={inputHeight} maxHeight={180} onHeightChange={setInputHeight} onError={setPickError}
       theme={{ background: colors.surface, border: colors.border, chip: colors.brandBackground, focus: colors.accent, placeholder: colors.muted, text: colors.ink, textSecondary: colors.muted }}
-      onEdit={(result, source) => { if (disabled || draftRef.current !== source) return; const next = result.draft.text.slice(0, 8000); setText(next); setSelection({ start: Math.min(next.length, result.selection.start), end: Math.min(next.length, result.selection.end) }); }}
+      onEdit={(result, source) => { if (disabled || draftRef.current !== source) return; const next = result.draft.text.slice(0, 8000);
+        editText(next, { start: Math.min(selection.start, result.selection.start), end: selection.end });
+        setSelection({ start: Math.min(next.length, result.selection.start), end: Math.min(next.length, result.selection.end) }); }}
       onSelectionChange={(next, source) => { if (draftRef.current === source) setSelection(next); }}
       onPasteText={request => { void (async () => { const value = request.text ?? await (await import("expo-clipboard")).getStringAsync();
-        if (disabled || draftRef.current !== request.draft) return; const result = replaceMobileComposerRange(request.draft, request.selection, value.slice(0, Math.max(0, 8000 - request.draft.text.length + request.selection.end - request.selection.start))); setText(result.draft.text); setSelection(result.selection);
+        if (disabled || draftRef.current !== request.draft) return; const result = replaceMobileComposerRange(request.draft, request.selection, value.slice(0, Math.max(0, 8000 - request.draft.text.length + request.selection.end - request.selection.start))); editText(result.draft.text, request.selection); setSelection(result.selection);
       })().catch(error => setPickError(String(error))); }}
       onPasteImagesStart={request => { if (disabled || !transport || paste.current || request.draft !== draftRef.current || request.count < 1 || files.length + request.count > 20) return false;
         const abort = nativePick.current = new AbortController(); paste.current = { draft: request.draft, count: request.count, transport, abort }; setPicking(true); setPickError(undefined); return true; }}

@@ -5076,7 +5076,8 @@ export type MessagingChannelView =
   | "lark"
   | "wecom"
   | "wechat"
-  | "slack";
+  | "slack"
+  | "imessage";
 
 export type MessagingConnectionRuntimeStatusView =
   | "idle"
@@ -5135,6 +5136,12 @@ export interface SlackMessagingConfigurationView {
   readonly groupActivation: Readonly<Record<string, "mention" | "always" | "disabled">>;
 }
 
+export interface IMessageMessagingConfigurationView {
+  readonly serverOrigin: string;
+  readonly aliases: readonly string[];
+  readonly chats: readonly { readonly guid: string; readonly activation: "mention" | "always" | "disabled"; readonly selfAddress?: string }[];
+}
+
 export type WeChatAuthorizationStatusView =
   | "waiting"
   | "scanned"
@@ -5178,6 +5185,7 @@ export interface MessagingConnectionView {
   readonly wecomConfiguration?: WeComMessagingConfigurationView;
   readonly wechatConfiguration?: WeChatMessagingConfigurationView;
   readonly slackConfiguration?: SlackMessagingConfigurationView;
+  readonly imessageConfiguration?: IMessageMessagingConfigurationView;
   readonly errorCode?: string;
   readonly errorSummary?: string;
   readonly lastConnectedAt?: number;
@@ -6863,6 +6871,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
     configuration?: SlackMessagingConfigurationView,
     signal?: AbortSignal
   ): Promise<MessagingConnectionView>;
+  createIMessageMessagingConnection?(ownerAddress: string, configuration: IMessageMessagingConfigurationView, signal?: AbortSignal): Promise<MessagingConnectionView>;
   beginWeChatAuthorization(
     connectionId: string,
     expectedRevision: bigint,
@@ -6948,6 +6957,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
     configuration: SlackMessagingConfigurationView,
     signal?: AbortSignal
   ): Promise<MessagingConnectionView>;
+  updateIMessageMessagingConfiguration?(connectionId: string, expectedRevision: bigint, expectedGeneration: bigint,
+    ownerAddress: string, configuration: IMessageMessagingConfigurationView, signal?: AbortSignal): Promise<MessagingConnectionView>;
   testMessagingConnection(connectionId: string, signal?: AbortSignal): Promise<MessagingConnectionTestResultView>;
   putMessagingRoute(draft: MessagingRouteDraftView, signal?: AbortSignal): Promise<MessagingRouteView>;
   getPartnerDirectory(signal?: AbortSignal): Promise<PartnerDirectoryView>;

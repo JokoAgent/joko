@@ -61,7 +61,7 @@ describe("mounted Slack Messaging Settings", () => {
     const settings = page.locator(".messaging-settings");
     await settings.getByRole("heading", { name: "Messaging", exact: true }).waitFor({ state: "visible", timeout: 30_000 });
     browserErrors.splice(0);
-    expect(await settings.locator(".messaging-channel.is-available").count()).toBe(8);
+    expect(await settings.locator(".messaging-channel.is-available").count()).toBe(9);
     await settings.getByRole("button", { name: "Add Slack", exact: true }).first().click();
     const create = page.getByRole("dialog", { name: "Add Slack" });
     const owner = create.getByLabel("Slack owner user ID");

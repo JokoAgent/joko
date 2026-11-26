@@ -43,6 +43,7 @@ import {
   type WeChatRawMessage,
   type WeChatTransportOptions
 } from "@joko/messaging";
+import { IMessageTransport } from "@joko/messaging/imessage";
 import type { AdapterContext, BlobRef, DurableNativeDispatchPreparation, EventPayload, InteractionDecision, MessageBlock, NativeHistoryProjection, PromptInput } from "@joko/core";
 import { ContactStore, OperationalStore, PartnerStore, operationBodyHash } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
@@ -68,6 +69,7 @@ import { SessionHost } from "./session-host.js";
 import { PartnerManager } from "./partner-manager.js";
 import { PartnerMessagingRuntime } from "./partner-messaging.js";
 import { mkdtempSync } from "./test-paths.js";
+import { beginWeChatNoticePreparation } from "./wechat-delayed-reply.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
 
@@ -76,6 +78,119 @@ afterEach(async () => {
 });
 
 describe("MessagingManager", () => {
+  it.each([false, true])("resumes bounded BlueBubbles history across chats and equal timestamps (deleted anchor: %s)", async deletedAnchor => {
+    const activation = 1_000_000, backlogTime = activation + 100, caughtUpAt = activation + 600_000;
+    let now = caughtUpAt;
+    const addresses = ["+12025550101", "+12025550102"];
+    const chats = addresses.map(address => ({ guid: `iMessage;-;${address}`, activation: "always" as const }));
+    const history = new Map(chats.map(({ guid }, chat) => [guid, Array.from({ length: 5100 }, (_, index) => ({
+      guid: `chat-${chat}-${index}`, text: "Approved message",
+      dateCreated: deletedAnchor && chat === 1 && index < 4_899 ? backlogTime - 1 : backlogTime, isFromMe: false,
+      handle: { address: addresses[chat], service: "iMessage" }, chats: [{ guid }]
+    }))]));
+    const response = (data: unknown) => Response.json({ status: 200, data });
+    const connect = async () => {
+      const transport = new IMessageTransport({ connectionId: "backlog", generation: 1, ownerAddress: addresses[0]!,
+        initialActivation: activation, password: token("imessage"), now: () => now, pollIntervalMs: 0,
+        configuration: { serverOrigin: "https://bluebubbles.example.test", aliases: [], chats },
+        fetch: async (input, init) => {
+          const url = new URL(String(input));
+          if (url.pathname === "/api/v1/server/info") return response({});
+          if (url.pathname.startsWith("/api/v1/chat/")) {
+            const guid = decodeURIComponent(url.pathname.split("/").at(-1)!);
+            return response({ guid, participants: [{ address: guid.split(";").at(-1), service: "iMessage" }] });
+          }
+          const query = JSON.parse(String(init?.body)) as { chatGuid: string; after: number; before: number; offset: number; limit: number };
+          return response(history.get(query.chatGuid)!.filter(row => row.dateCreated > query.after && row.dateCreated <= query.before)
+            .slice(query.offset, query.offset + query.limit));
+        }
+      });
+      await transport.probe();
+      return transport;
+    };
+    const first = await (await connect()).poll({ cursor: JSON.stringify([activation, activation]) });
+    expect(first.batch.events).toHaveLength(10_000);
+    now += 1_000;
+    const later = history.get(chats[1]!.guid)!;
+    if (deletedAnchor) later.splice(4_899, 1);
+    later.push({ ...later[0]!, dateCreated: now, guid: "new-arrival" });
+    const second = await (await connect()).poll({ cursor: first.nextCursor });
+    expect(second.batch.events).toHaveLength(200);
+    expect(second.batch.events.filter(event => event.messageId === "chat-1-4900")).toHaveLength(1);
+    expect(new Set([...first.batch.events, ...second.batch.events].map(event => event.messageId)).size).toBe(10_200);
+    expect(second.nextCursor).toBe(JSON.stringify([activation, caughtUpAt]));
+    const live = await (await connect()).poll({ cursor: second.nextCursor });
+    expect(live.batch.events.map(event => event.messageId)).toEqual(["new-arrival"]);
+  });
+
+  it("relays an iMessage guest permission to the verified owner direct chat without a second task", async () => {
+    const adapter = new PermissionFakeAdapter();
+    const owner = "+12025550101", guest = "+12025550102";
+    const direct = `iMessage;-;${owner}`, group = "any;+;chat-test-group";
+    const history: Array<{ readonly chatGuid: string; readonly row: Record<string, unknown> }> = [];
+    const sent: Array<{ readonly chatGuid: string; readonly message: string; readonly method: string }> = [];
+    const add = (chatGuid: string, guid: string, address: string, text: string, threadOriginatorGuid?: string) => {
+      history.push({ chatGuid, row: { guid, text, dateCreated: Date.now(), isFromMe: false, service: "iMessage",
+        handle: { address, service: "iMessage" }, chats: [{ guid: chatGuid }], threadOriginatorGuid } });
+    };
+    const response = (data: unknown) => Response.json({ status: 200, data });
+    const fixture = await createFixture(undefined, () => adapter, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, options => new IMessageTransport({
+        ...options, pollIntervalMs: 10, fetch: async (input, init) => {
+          const url = new URL(String(input));
+          expect(url.searchParams.get("password")).toBe(token("imessage"));
+          if (url.pathname === "/api/v1/server/info") return response({ private_api: true, helper_connected: true });
+          const chatGuid = decodeURIComponent(url.pathname.split("/").at(-1)!);
+          if (url.pathname.startsWith("/api/v1/chat/")) return response({
+            guid: chatGuid, participants: (chatGuid === direct ? [owner] : [owner, guest]).map(address => ({ address, service: "iMessage" }))
+          });
+          if (url.pathname === "/api/v1/message/query") {
+            const query = JSON.parse(String(init?.body)) as { readonly chatGuid: string; readonly after: number; readonly before: number };
+            return response(history.filter(item => item.chatGuid === query.chatGuid && Number(item.row["dateCreated"]) > query.after
+              && Number(item.row["dateCreated"]) <= query.before).map(item => item.row));
+          }
+          if (url.pathname === "/api/v1/message/text") {
+            const item = JSON.parse(String(init?.body)) as typeof sent[number];
+            sent.push(item);
+            const guid = `outbound-${sent.length}`;
+            history.push({ chatGuid: item.chatGuid, row: { guid, text: item.message, dateCreated: Date.now(), isFromMe: true,
+              service: "iMessage", chats: [{ guid: item.chatGuid }] } });
+            return response({ guid });
+          }
+          if (url.pathname.startsWith("/api/v1/message/")) {
+            return response(history.find(item => item.row["guid"] === chatGuid)?.row ?? null);
+          }
+          throw new Error("Unexpected BlueBubbles request");
+        }
+      }));
+    fixture.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const connection = await replaceCredential(fixture, fixture.manager.createIMessageConnection({
+      ownerProviderUserId: owner, configuration: { serverOrigin: "http://127.0.0.1:4300", aliases: ["Joko"],
+        chats: [{ guid: direct, activation: "always", selfAddress: owner }, { guid: group, activation: "mention" }] }
+    }), "imessage", true);
+    await vi.waitFor(() => expect(fixture.manager.getConnection(connection.id).runtimeStatus).toBe("connected"));
+    add(group, "ambient", guest, "Background discussion");
+    add(group, "invocation", guest, "@Joko check this");
+    await vi.waitFor(() => expect(sent.some(item => item.message.includes("Run command") && item.chatGuid === direct)).toBe(true));
+    expect(sent.filter(item => item.message.includes("Run command")).map(item => item.chatGuid)).toEqual([direct]);
+    const sentCard = fixture.store.listMessagingDeliveries().find(delivery => delivery.kind === "interaction");
+    expect(sentCard).toMatchObject({ providerMessageId: "outbound-1" });
+    expect(fixture.store.getMessagingConversation(sentCard!.conversationId)).toMatchObject({ status: "observed" });
+    add(group, "guest-answer", guest, "1", "outbound-1");
+    await vi.waitFor(() => {
+      const row = fixture.store.listMessagingInboundRequests()[0]!;
+      expect(fixture.store.findMessagingGroupObservation(row.conversationId!, "guest-answer")).toBeDefined();
+    });
+    expect(adapter.decision).toBeUndefined();
+    add(direct, "owner-answer", owner, "2", "outbound-1");
+    await vi.waitFor(() => expect(adapter.decision).toEqual({ kind: "selected", value: "deny_once" }));
+    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({ chatGuid: group, method: "private-api", message: "Decision: selected" })));
+    await fixture.restartManager();
+    await vi.waitFor(() => expect(fixture.manager.getConnection(connection.id).runtimeStatus).toBe("connected"));
+    expect(fixture.store.listMessagingInboundRequests().map(row => row.providerMessageId)).toEqual(["invocation"]);
+    expect(fixture.store.listMessagingInteractions()).toHaveLength(1);
+  });
+
   it.each(["reply", "permission"] as const)("recovers a %s made durable before Messaging initializes", async (outcome) => {
     const fixture = await createFixture(undefined, () => new ControlledReplyAdapter(), () => new StreamingDiscordTransport());
     const enqueue = fixture.store.enqueueQueueItem.bind(fixture.store);
@@ -1355,6 +1470,68 @@ describe("MessagingManager", () => {
       .toEqual(["private-context-a", "rotated-context-a"]);
     expect(fixture.store.getMessagingDelivery(otherPeer.id)).toEqual(otherPeer);
     expect(fixture.store.getMessagingDelivery(unknown.id)).toEqual(unknown);
+  });
+
+  it.each([30 * 60_000 - 1_000, 30 * 60_000])("attributes WeChat reply age %d against the original outbox timestamp after restart", async delayMs => {
+    let now = Math.floor(Date.now() / (30 * 60_000)) * (30 * 60_000) + 10_000;
+    const batch = weChatDirectBatch(), original = batch.events[0]!;
+    if (original.kind !== "message") throw new Error("Expected a WeChat message.");
+    const question = `First  question ${"😀".repeat(130)} Tail of original question`;
+    const transport = new FakeWeChatTransport({ ...batch, events: [{ ...original, text: question, occurredAt: now - 5_000 }],
+      privateContexts: [batch.privateContexts[0]!] });
+    const send = transport.sendTextPart.bind(transport);
+    const attempts = vi.spyOn(transport, "sendTextPart").mockImplementationOnce(async () => {
+      throw new MessagingTransportError("provider_rejected", "Temporary failure before sending.", { retryable: true, effect: "none", retryAfterMs: 30_000 });
+    });
+    const f = await createFixture(undefined, undefined, undefined, undefined, undefined, undefined, () => transport,
+      undefined, undefined, undefined, undefined, undefined, () => now);
+    f.manager.putRoute({ targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false });
+    const created = f.manager.createWeChatConnection();
+    const enabled = await f.manager.commitWeChatAuthorization({ clientConnectionId: "desktop-one", connectionId: created.id,
+      expectedRevision: created.revision, expectedGeneration: created.generation, expectedCredentialReferenceId: null, expectedCredentialGeneration: null,
+      expectedEnabled: false, credentials: { token: "weChat-private-token", botId: "wx-bot", userId: "wx-account", baseUrl: "https://ilinkai.weixin.qq.com" }, enable: true });
+    const replies = () => f.store.listMessagingDeliveries({ connectionId: enabled.id }).filter(row => row.kind === "text");
+    await vi.waitFor(() => expect(replies()).toMatchObject([{ status: "pending", attempts: 1 }]), { timeout: 5_000 });
+    const first = replies()[0]!;
+    await f.manager.close();
+    now = first.createdAt + delayMs;
+    const delayed = delayMs === 30 * 60_000;
+    if (delayed) {
+      f.store.transaction(store => {
+        const sleeping = store.claimNextMessagingDelivery({ connectionId: enabled.id, expectedChannelGeneration: enabled.generation,
+          claimToken: "notice-only-claim", claimedAt: now });
+        expect(sleeping?.id).toBe(first.id);
+        beginWeChatNoticePreparation(store, sleeping!, "notice-only-claim");
+      });
+      attempts.mockImplementationOnce(async input => {
+        expect(input.text).toMatch(/^Delayed reply/u);
+        await send(input);
+        throw new MessagingTransportError("malformed_response", "The notice confirmation was lost.", { retryable: false, effect: "unknown" });
+      });
+    }
+    await f.restartManager();
+    if (delayed) {
+      await vi.waitFor(() => expect(replies()[0]).toMatchObject({ status: "pending", attempts: 3 }), { timeout: 5_000 });
+      expect(transport.sentText).toHaveLength(1);
+      const notice = transport.sentText[0]!;
+      const excerpt = Array.from(question.replace(/\s+/gu, " ")).slice(0, 120).join("");
+      expect(notice.text).toContain(`“${excerpt}”`);
+      expect(notice.text).not.toContain("Tail of original question");
+      expect(notice.context?.clientId).not.toBe(first.id);
+      await f.manager.close();
+      now = replies()[0]!.availableAt;
+      attempts.mockImplementationOnce(async input => {
+        expect(input.context).toEqual(notice.context);
+        expect(input.text).toBe(notice.text);
+        return { providerMessageId: notice.context!.clientId, address: input.address };
+      });
+      await f.restartManager();
+    }
+    await vi.waitFor(() => expect(replies()[0]).toMatchObject({ status: "sent" }), { timeout: 5_000 });
+    expect(transport.sentText).toHaveLength(delayed ? 2 : 1);
+    expect(transport.sentText.at(-1)?.context).toEqual({ contextToken: "private-context-a", clientId: first.id });
+    expect(transport.sentText.every(row => row.address.providerConversationId === "wx-peer-a")).toBe(true);
+    expect(attempts.mock.calls.filter(([input]) => input.context?.clientId === first.id)).toHaveLength(2);
   });
 
   it("keeps the canonical Partner task open when its WeChat owner sends /new", async () => {
@@ -5250,7 +5427,9 @@ async function createFixture(
   slackTransportFactory?: (options: SlackTransportOptions) => FastFailureSlackTransport,
   replyStreamTiming?: MessagingManagerOptions["replyStreamTiming"],
   sessionRuntimeRecoveryDelayMs?: (attempt: number) => number,
-  contacts?: ContactManager
+  contacts?: ContactManager,
+  now?: () => number,
+  createIMessageTransport?: MessagingManagerOptions["createIMessageTransport"]
 ) {
   const root = mkdtempSync(join(tmpdir(), "joko-messaging-manager-"));
   const store = new OperationalStore(join(root, "operational.db"));
@@ -5292,6 +5471,8 @@ async function createFixture(
     contextVault: vault,
     sessionHost: host,
     artifacts,
+    ...(now === undefined ? {} : { now }),
+    ...(createIMessageTransport === undefined ? {} : { createIMessageTransport }),
     ...(contacts === undefined ? {} : { contacts }),
     retryDelayMs: 5,
     ...(weChatPresenceTiming === undefined ? {} : { weChatPresenceTiming }),

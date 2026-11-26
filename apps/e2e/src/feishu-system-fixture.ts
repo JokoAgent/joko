@@ -1,7 +1,7 @@
 import type { OrchestratorApplicationDependencies } from "@joko/orchestrator";
+import type { MessagingChannel } from "@joko/messaging";
 
 type FeishuService = "feishu" | "lark";
-type MessagingChannel = "telegram" | "discord" | "dingtalk" | "feishu" | "lark" | "wecom" | "wechat" | "slack";
 
 interface MessagingAddress {
   readonly channel: MessagingChannel;

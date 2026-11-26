@@ -134,6 +134,41 @@ it("keeps editable image vectors on the same original and reuses the burned uplo
   expect(vi.mocked(f.api.send).mock.calls[1]![1].attachments).toEqual(original[1].attachments);
 });
 
+it.each(["Alex", "all"])("sends only the newly picked %s after erasing a namesake and reconnecting", async name => {
+  const f = fixture();
+  const render = () => act(async () => {
+    root.render(<PartnerGroupPage controller={f.controller} groupId={f.group.id} t={t} onOpenNavigation={() => undefined} />);
+    await settle();
+  });
+  f.group.members[0]!.name = name;
+  f.group.members[1]!.name = "Reviewer";
+  await render();
+  const editor = host.querySelector("textarea")!;
+  const pick = async () => {
+    const choices = host.querySelectorAll<HTMLButtonElement>(".partner-group-mention-picker button");
+    // The broadcast option precedes the one matching member for "all".
+    expect(choices).toHaveLength(name === "all" ? 2 : 1);
+    await act(async () => choices[choices.length - 1]!.click());
+  };
+  await input(editor, `@${name}`); await pick();
+  await input(editor, "");
+  await input(editor, "draft ");
+  Object.assign(f.controller.state, { connectionState: "reconnecting" });
+  await render();
+  f.group.members[0]!.name = "Writer";
+  f.group.members[1]!.name = name;
+  vi.mocked(f.controller.partnerGroupApi).mockReturnValue({ ...f.api, ownerKey: "reconnected" });
+  Object.assign(f.controller.state, { connectionState: "connected", connectionGeneration: 2 });
+  await render();
+  expect(editor.value).toBe("draft ");
+  await input(editor, `draft @${name}`); await pick();
+  await act(async () => { button(m.send).click(); await settle(); });
+  expect(f.api.send).toHaveBeenCalledOnce();
+  expect(vi.mocked(f.api.send).mock.calls[0]![1]).toMatchObject({
+    text: `draft @${name} `, mentions: { all: false, partnerIds: ["second"] }
+  });
+});
+
 it("preserves the picked member and uploaded attachment across a lost send response without duplicate intent", async () => {
   const f = fixture(); await act(async () => { root.render(<PartnerGroupPage controller={f.controller} groupId={f.group.id} t={t} onOpenNavigation={() => undefined} />); await settle(); });
   const editor = host.querySelector("textarea")!; await input(editor, "@"); const choices = host.querySelectorAll<HTMLButtonElement>(".partner-group-mention-picker button");

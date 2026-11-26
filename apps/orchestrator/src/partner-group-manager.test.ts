@@ -63,12 +63,42 @@ describe("Partner group execution owner", () => {
     expect(f.decidePlan).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    ["Alex", "Alex"], ["all", "all"], ["all", "Editor"]
+  ])("dispatches a picked @%s only to its selected owner, now named %s", async (name, currentName) => {
+    const f = await fixture();
+    const [first, second] = f.members;
+    const original = f.profiles.updatePartner(first!.id, first!.revision, { displayName: name });
+    const writer = f.profiles.updatePartner(original.id, original.revision, { displayName: "Writer" });
+    let selected = f.profiles.updatePartner(second!.id, second!.revision, { displayName: name });
+    if (currentName !== name) selected = f.profiles.updatePartner(selected.id, selected.revision, { displayName: currentName });
+    f.profiles.markReady(writer.id, writer.revision);
+    f.profiles.markReady(selected.id, selected.revision);
+    const mentions = { all: false, partnerIds: [second!.id] };
+    const result = await f.manager.send({ groupId: f.group.id, expectedRevision: f.storage.get(f.group.id).revision,
+      clientId: "selected-new-partner", text: `draft @${name} `, mentions, division: false, attachments: [],
+      deviceId: "viewer", assertRequest: () => undefined });
+    await vi.waitFor(() => expect(f.calls).toHaveLength(1));
+    expect(f.calls[0]).toMatchObject({ partnerId: second!.id, prompt: expect.stringContaining("mentioned you") });
+    expect(f.storage.findMessage(f.group.id, result.id)?.mentions).toEqual(mentions);
+    expect(f.decidePlan).not.toHaveBeenCalled();
+  });
+
   it("records a human broadcast without waking the organizer in a reply-all group", async () => {
     const f = await fixture();
     await f.send("@all A note for people", "local-human-broadcast");
     expect(f.storage.messages(f.group.id).messages).toMatchObject([{ mentions: { all: true, partnerIds: [] } }]);
     expect(f.decidePlan).not.toHaveBeenCalled();
     expect(f.calls).toEqual([]);
+  });
+
+  it("keeps a separately typed broadcast from an older composer that only supplies the named ID", async () => {
+    const f = await fixture(), reviewer = f.members[1]!;
+    const result = await f.manager.send({ groupId: f.group.id, expectedRevision: f.storage.get(f.group.id).revision,
+      clientId: "legacy-typed-broadcast", text: "@Everyone @Reviewer", mentions: { all: false, partnerIds: [reviewer.id] },
+      division: false, attachments: [], deviceId: "viewer", assertRequest: () => undefined });
+    expect(f.storage.findMessage(f.group.id, result.id)?.mentions).toEqual({ all: true, partnerIds: [reviewer.id] });
+    await vi.waitFor(() => expect(f.calls.map(call => call.partnerId)).toEqual([reviewer.id]));
   });
 
   it("accepts a new note after the handoff commits while its outbox notification is still settling", async () => {

@@ -6,7 +6,8 @@ export const MESSAGING_CHANNELS = [
   "lark",
   "wecom",
   "wechat",
-  "slack"
+  "slack",
+  "imessage"
 ] as const;
 
 export type MessagingChannel = (typeof MESSAGING_CHANNELS)[number];

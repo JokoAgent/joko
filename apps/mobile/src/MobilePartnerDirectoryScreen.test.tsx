@@ -413,6 +413,32 @@ it("keeps the group draft through settings and reconnection while binding visibl
   await press(m.retry); expect(next.planAction).toHaveBeenCalledWith(f.group.id, expect.objectContaining({ id: f.plan.id }), groupWire.PartnerGroupPlanAction.RETRY, expect.any(AbortSignal));
   await press(`${m.reassign} 1`); await press("Pending"); expect(next.planEdit).toHaveBeenCalledWith(f.group.id, expect.objectContaining({ id: f.plan.id }), 0, groupWire.PartnerGroupPlanEditAction.REASSIGN, "pending", expect.any(AbortSignal));
 });
+it.each(["Alex", "all"])("sends only the newly picked %s from the reconnected group composer", async name => {
+  const f = groupFixture(), active = transport(), m = groupWire.partnerGroupMessages("en");
+  const mount = (groupApi: groupWire.PartnerGroupApi) =>
+    render(active, undefined, undefined, undefined, undefined, undefined, undefined, undefined, { ...f.props, groupApi });
+  const edit = (value: string) => act(async () => {
+    const field = container.querySelector<HTMLInputElement>('[data-testid="partnerGroups.composer"] input')!;
+    field.value = value; field.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  f.group.members[0]!.name = name;
+  f.group.members[1]!.name = "Reviewer";
+  await mount(f.api);
+  await press(`${f.group.name} · ${m.groups} · ${m.unread}`);
+  await edit(`@${name}`); await press(name);
+  await edit(""); await edit("draft ");
+  f.group.members[0]!.name = "Writer";
+  f.group.members[1]!.name = name;
+  await mount({ ...f.api, ownerKey: "reconnected" });
+  expect(native.composer?.draft.text).toBe("draft ");
+  await edit(`draft @${name}`); await press(name);
+  await press(m.send);
+  expect(f.api.send).toHaveBeenCalledOnce();
+  expect(vi.mocked(f.api.send).mock.calls[0]![1]).toMatchObject({
+    text: `draft @${name} `, mentions: { all: false, partnerIds: ["pending"] }
+  });
+});
+
 it("pastes an image into the mounted group composer and reuses its uploaded bytes and send receipt after a lost response", async () => {
   const f = groupFixture(), m = groupWire.partnerGroupMessages("en"), photoLibrary = new MobilePhotoLibrary(new MobileAttachmentFiles());
   vi.spyOn(photoLibrary, "directlyBrowsable").mockResolvedValue(false);

@@ -5707,7 +5707,7 @@ export class OperationalStore {
         UPDATE messaging_channels
         SET generation = ?, enabled = ?, runtime_status = ?,
             credential_reference_id = ?, credential_generation = ?, owner_provider_user_id = ?,
-            provider_account_id = NULL, provider_username = NULL, cursor = NULL,
+            provider_account_id = NULL, provider_username = NULL, cursor = ?,
             error_code = NULL, error_summary = NULL, last_connected_at = NULL,
             updated_at = ?, revision = ?
         WHERE id = ? AND revision = ? AND generation = ?
@@ -5718,6 +5718,7 @@ export class OperationalStore {
         referenceId,
         credentialGeneration,
         ownerId,
+        current.channel === "imessage" && input.enable ? JSON.stringify([at, at]) : null,
         at,
         asSqlInteger(this.requireActiveRevision()),
         current.id,
@@ -5792,12 +5793,15 @@ export class OperationalStore {
       const result = this.database.prepare(`
         UPDATE messaging_channels
         SET generation = ?, enabled = ?, runtime_status = ?, error_code = NULL, error_summary = NULL,
+            cursor = CASE WHEN channel = 'imessage' AND enabled = 0 AND ? = 1 THEN ? ELSE cursor END,
             updated_at = ?, revision = ?
         WHERE id = ? AND revision = ? AND generation = ?
       `).run(
         nextGeneration,
         input.enabled ? 1 : 0,
         input.enabled ? "connecting" : "offline",
+        input.enabled ? 1 : 0,
+        current.channel === "imessage" ? JSON.stringify([at, at]) : null,
         at,
         asSqlInteger(this.requireActiveRevision()),
         current.id,
@@ -5847,6 +5851,7 @@ export class OperationalStore {
       const result = this.database.prepare(`
         UPDATE messaging_channels
         SET generation = ?, configuration_json = ?, owner_provider_user_id = ?,
+            cursor = CASE WHEN channel = 'imessage' AND enabled = 1 THEN ? ELSE cursor END,
             runtime_status = CASE WHEN enabled = 1 THEN 'connecting' ELSE runtime_status END,
             error_code = NULL, error_summary = NULL, updated_at = ?, revision = ?
         WHERE id = ? AND revision = ? AND generation = ?
@@ -5854,6 +5859,7 @@ export class OperationalStore {
         nextGeneration,
         configurationJson,
         owner,
+        current.channel === "imessage" ? JSON.stringify([at, at]) : null,
         at,
         asSqlInteger(this.requireActiveRevision()),
         current.id,
@@ -7190,12 +7196,14 @@ export class OperationalStore {
         throw new StoreError("Messaging delivery requires a managed connection credential.");
       }
       const conversation = this.getMessagingConversation(input.conversationId);
-      const observedNotice = input.allowObservedConversation === true && input.kind === "notice"
-        && conversation.status === "observed" && (connection.channel === "telegram" || connection.channel === "discord");
+      const observedDelivery = input.allowObservedConversation === true && conversation.status === "observed" && (
+        input.kind === "notice" && (connection.channel === "telegram" || connection.channel === "discord" || connection.channel === "imessage")
+        || input.kind === "interaction" && connection.channel === "imessage" && conversation.conversationKind === "direct"
+      );
       if (
         conversation.connectionId !== connection.id ||
         conversation.channelGeneration !== connection.generation ||
-        (conversation.status !== "active" && !observedNotice)
+        (conversation.status !== "active" && !observedDelivery)
       ) {
         throw new StoreError("Messaging delivery conversation authority is stale.");
       }
@@ -7603,7 +7611,7 @@ export class OperationalStore {
       assertMessagingGeneration(connection, input.expectedChannelGeneration);
       const conversation = this.getMessagingConversation(input.conversationId);
       const observedCommand = input.allowObservedConversation === true && conversation.status === "observed"
-        && (connection.channel === "telegram" || connection.channel === "discord");
+        && (connection.channel === "telegram" || connection.channel === "discord" || connection.channel === "imessage");
       if (
         conversation.connectionId !== connection.id ||
         conversation.channelGeneration !== connection.generation ||
@@ -7668,6 +7676,13 @@ export class OperationalStore {
       );
       return this.getMessagingInteraction(id);
     });
+  }
+
+  hasMessagingInteractionRequest(connectionId: string, channelGeneration: number, providerRequestId: string): boolean {
+    this.assertOpen();
+    return this.database.prepare(`
+      SELECT 1 FROM messaging_interactions WHERE connection_id = ? AND channel_generation = ? AND provider_request_id = ?
+    `).get(connectionId, channelGeneration, providerRequestId) !== undefined;
   }
 
   findMessagingInteraction(id: string): MessagingInteractionRecord | undefined {
@@ -24580,7 +24595,7 @@ function collaborationDispatchStatus(value: string): CollaborationDispatchStatus
 
 function messagingChannel(value: unknown): MessagingConnectionRecord["channel"] {
   const channels: readonly MessagingConnectionRecord["channel"][] = [
-    "telegram", "discord", "dingtalk", "feishu", "lark", "wecom", "wechat", "slack"
+    "telegram", "discord", "dingtalk", "feishu", "lark", "wecom", "wechat", "slack", "imessage"
   ];
   if (!channels.includes(value as MessagingConnectionRecord["channel"])) {
     throw new StoreError("Messaging channel is invalid.");

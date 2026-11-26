@@ -276,11 +276,12 @@ function GroupComposer({ view, group, partners, controller, m, t, running, dropF
   const uploads = useRef(new Map<string, { readonly blob: groupWire.BlobRef; readonly name: string }>());
   const filesRef = useRef(files); filesRef.current = files;
   const tracked = useRef<groupWire.PartnerGroupTrackedMention[]>([]), [fileError, setFileError] = useState<string>();
+  const selection = useRef({ start: 0, end: 0 });
   const previews = useMemo(() => files.map(item => ({ ...item, kind: item.file.type.startsWith("image/") ? "image" as const : "file" as const, previewUrl: item.file.type.startsWith("image/") ? URL.createObjectURL(item.file) : undefined })), [files]);
   useEffect(() => () => { for (const item of previews) if (item.previewUrl) URL.revokeObjectURL(item.previewUrl); }, [previews]);
   useLayoutEffect(() => { const element = editor.current; if (element) { element.style.height = "auto"; element.style.height = `${Math.min(240, element.scrollHeight)}px`; } }, [text]);
   const send = () => { void view.action(async signal => {
-    const mentions = groupWire.resolvePartnerGroupMentions(text, { members: group.members, allLabels: ["all", "所有人"], tracked: tracked.current });
+    const mentions = groupWire.resolvePartnerGroupMentions(text, { members: group.members, tracked: tracked.current });
     const signature = JSON.stringify([text, division, files.map(item => [item.id, item.annotationStrokes]), mentions]);
     if (pending.current?.signature !== signature) pending.current = { id: view.api.newRequestId(), signature };
     const id = pending.current.id, attachments = [];
@@ -288,7 +289,14 @@ function GroupComposer({ view, group, partners, controller, m, t, running, dropF
       category: blob.mediaType.startsWith("image/") ? groupWire.PartnerGroupAttachmentCategory.IMAGE : blob.mediaType === "application/pdf" ? groupWire.PartnerGroupAttachmentCategory.PDF : blob.mediaType.startsWith("text/") ? groupWire.PartnerGroupAttachmentCategory.TEXT : groupWire.PartnerGroupAttachmentCategory.FILE, annotated: (item.annotationStrokes?.length ?? 0) > 0 }); }
     const result = await view.api.send(view.group() ?? group, { text, attachments, division, mentions }, id, signal); pending.current = undefined; uploads.current.clear(); tracked.current = []; setText(""); setFiles([]); setDivision(false); setQuery(null); onSent(); return result;
   }); };
-  const mention = (name: string, partnerId?: string) => { if (!query) return; const inserted = insertPartnerGroupMention(text, { start: query.start, end: query.end }, name); if (partnerId) tracked.current.push({ partnerId, label: name }); setText(inserted.text); setQuery(null); queueMicrotask(() => { editor.current?.focus(); editor.current?.setSelectionRange(inserted.caret, inserted.caret); }); };
+  const mention = (name: string, partnerId?: string) => {
+    if (!query) return;
+    const inserted = insertPartnerGroupMention(text, query, name, tracked.current, partnerId);
+    tracked.current = inserted.tracked;
+    selection.current = { start: inserted.caret, end: inserted.caret };
+    setText(inserted.text); setQuery(null);
+    queueMicrotask(() => { editor.current?.focus(); editor.current?.setSelectionRange(inserted.caret, inserted.caret); });
+  };
   const disabled = state.busy || state.status !== "ready" || state.detail?.detail?.group?.id !== group.id || group.deleting;
   const divisionBlocked = !!group.openPlan && group.openPlan.status !== groupWire.PartnerGroupPlanStatus.PROPOSED, showStop = running && !text.trim() && !files.length;
   const candidates = query ? [
@@ -305,8 +313,18 @@ function GroupComposer({ view, group, partners, controller, m, t, running, dropF
       onSaveImageAnnotations={(item, strokes) => { if (disabled) throw new Error(m.unavailable); const next = editImageAttachment(filesRef.current, item, strokes); if (next === filesRef.current) return; pending.current = undefined; uploads.current.delete(item.id); filesRef.current = next; setFiles(next); }} />
     {query && candidates.length > 0 && <div id={pickerId} className="partner-group-mention-picker" role="listbox">{candidates.map((member, index) => { const partner = partners.find(item => item.id === member.partnerId); return <button type="button" role="option" id={`${pickerId}-${index}`} aria-selected={index === activeIndex} key={member.partnerId ?? "all"} onMouseDown={event => event.preventDefault()} onMouseEnter={() => setHighlight(index)} onClick={() => mention(member.name, member.partnerId)}>
       {member.partnerId ? <PartnerAvatar preset={partner?.avatar ?? "orbit"} partner={partner} /> : <Users aria-hidden="true" />}<span>{member.partnerId ? member.name : "@all"}</span></button>; })}</div>}
-    <textarea ref={editor} value={text} rows={1} maxLength={8000} placeholder={m.placeholder} aria-label={m.placeholder} aria-autocomplete="list" aria-controls={query && candidates.length ? pickerId : undefined} aria-activedescendant={query && candidates.length ? `${pickerId}-${activeIndex}` : undefined} disabled={disabled} onChange={event => { setText(event.target.value); pending.current = undefined; syncQuery(event.target.value, event.target.selectionStart); }}
-      onSelect={event => syncQuery(event.currentTarget.value, event.currentTarget.selectionStart)}
+    <textarea ref={editor} value={text} rows={1} maxLength={8000} placeholder={m.placeholder} aria-label={m.placeholder} aria-autocomplete="list" aria-controls={query && candidates.length ? pickerId : undefined} aria-activedescendant={query && candidates.length ? `${pickerId}-${activeIndex}` : undefined} disabled={disabled} onChange={event => {
+      const { value, selectionStart, selectionEnd } = event.currentTarget;
+      tracked.current = groupWire.retainPartnerGroupTrackedMentions(text, value, tracked.current, {
+        start: Math.min(selection.current.start, selectionStart), end: selection.current.end
+      });
+      selection.current = { start: selectionStart, end: selectionEnd };
+      setText(value); pending.current = undefined; syncQuery(value, selectionStart);
+    }}
+      onSelect={event => {
+        const { value, selectionStart, selectionEnd } = event.currentTarget;
+        selection.current = { start: selectionStart, end: selectionEnd }; syncQuery(value, selectionStart);
+      }}
       onPaste={event => { const pasted = Array.from(event.clipboardData.files); if (pasted.length) { event.preventDefault(); addFiles(pasted); } }}
       onKeyDown={event => { if (event.nativeEvent.isComposing) return;
         if (query && candidates.length) { if (event.key === "ArrowDown" || event.key === "ArrowUp") { event.preventDefault(); setHighlight((activeIndex + (event.key === "ArrowDown" ? 1 : -1) + candidates.length) % candidates.length); return; }
