@@ -441,7 +441,8 @@ async function exportPreInputSetupFailure(screenshots, attachments, { expectedSh
   }
   const state = JSON.parse(stateBytes.toString("utf8"));
   const count = value => Number.isSafeInteger(value) && value >= 0;
-  const expectedRoles = { Nearby: ["buttons", "staticTexts", "allRoles"], "Saved nodes": ["buttons"], "Add Joko node": ["buttons"] };
+  const tabRoles = ["buttons", "switches", "enabledSwitches", "selectedSwitches"];
+  const expectedRoles = { Nearby: [...tabRoles, "staticTexts", "allRoles"], "Saved nodes": tabRoles, "Add Joko node": tabRoles };
   if (state.stage !== expectedStage || state.connectionInputNotStarted !== true
     || state.configuredBundleIdentifier !== bundleId || typeof state.configuredLaunchArgumentsMatchOwnedServers !== "boolean"
     || state.ownedMetroPortReceived !== true || state.ownedProbePortReceived !== true
@@ -584,7 +585,7 @@ async function runConnectionUiTests(app, metroLocation, expectedSha, expectedHas
     "06-inspection-pending", "07-cancelled-draft-retained", "08-returned-address-draft", "09-dark-theme", "10-light-theme",
     ...(sdkRuntime === 'http-connect-native' ? ['11-http-connect-invitation'] : []),
     ...(verifyWorkspacePdf ? ["11-original-workspace-pdf", "12-pdf-word-held", "12-native-pdf-selection", "13-pdf-word-pasted"] : [])];
-  const progressNames = new Set([...names, "04-https-selected", "04-address-tapped", "04-address-quickpath-dismissed",
+  const progressNames = new Set([...names, "01-saved-nodes-retapped", "04-https-selected", "04-address-tapped", "04-address-quickpath-dismissed",
     "04-address-typing", "04-address-typed", "04-address-input-restored", "04-address-value-observed",
     "11-pdf-address-and-key-confirmed", "11-pdf-identity-check-tapped", "11-pdf-identity-confirmed", "11-pdf-pairing-available",
     "11-pdf-pairing-request-tapped", "11-pdf-pairing-code-issued", "11-pdf-pairing-submitted", "11-pdf-paired-task-visible",

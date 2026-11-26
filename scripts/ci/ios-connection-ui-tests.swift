@@ -54,19 +54,24 @@ final class JokoConnectionUITests: XCTestCase {
         screenshot("\(prefix)-screen", reportProgress: false)
         let hierarchy = Data(app.debugDescription.utf8)
         let boundedHierarchy = Data(hierarchy.prefix(128 * 1024))
+        let labels = ["Nearby", "Saved nodes", "Add Joko node"]
+        var controls: [String: [String: Int]] = [:]
+        for label in labels {
+            let switches = tabQuery(label)
+            controls[label] = ["buttons": app.buttons.matching(identifier: label).count,
+                               "switches": switches.count,
+                               "enabledSwitches": switches.matching(NSPredicate(format: "enabled == true")).count,
+                               "selectedSwitches": switches.matching(NSPredicate(format: "value == %@", "1")).count]
+        }
+        controls["Nearby"]?["staticTexts"] = app.staticTexts.matching(identifier: "Nearby").count
+        controls["Nearby"]?["allRoles"] = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", "Nearby")).count
         let state: [String: Any] = [
             "stage": stage, "connectionInputNotStarted": true,
             "configuredBundleIdentifier": "app.joko.mobile",
             "configuredLaunchArgumentsMatchOwnedServers": app.launchArguments == launchArguments,
             "ownedMetroPortReceived": true, "ownedProbePortReceived": true,
             "applicationState": app.state.rawValue, "webViewCount": app.webViews.count,
-            "expectedControls": [
-                "Nearby": ["buttons": app.buttons.matching(identifier: "Nearby").count,
-                           "staticTexts": app.staticTexts.matching(identifier: "Nearby").count,
-                           "allRoles": app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", "Nearby")).count],
-                "Saved nodes": ["buttons": app.buttons.matching(identifier: "Saved nodes").count],
-                "Add Joko node": ["buttons": app.buttons.matching(identifier: "Add Joko node").count]
-            ],
+            "expectedControls": controls,
             "hierarchyBytes": boundedHierarchy.count, "hierarchyTruncated": hierarchy.count > boundedHierarchy.count
         ]
         let controlState = XCTAttachment(data: try JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]), uniformTypeIdentifier: "public.json")
@@ -562,7 +567,34 @@ final class JokoConnectionUITests: XCTestCase {
 
     func testConnectionPageInteractions() throws {
         screenshot("01-connection-page")
-        tap(tab("Saved nodes"), atCenter: true, beforeConnectionInput: true)
+        let saved = tab("Saved nodes")
+        let selected = tabQuery("Saved nodes").matching(NSPredicate(format: "value == %@", "1")).firstMatch
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            self.app.state == .runningForeground && saved.exists && saved.isEnabled && saved.isHittable
+        }, object: nil)
+        guard XCTWaiter.wait(for: [ready], timeout: 10) == .completed else {
+            try recordPreInputSetupFailure(launchArguments: ownedLaunchArguments)
+            XCTFail("The reopened connection page must enable the Saved nodes switch.")
+            return
+        }
+        tap(saved, beforeConnectionInput: true)
+        // A foreground WKWebView can still expose Nearby as selected after the
+        // first synthetic tap. Retry only this selection, at its measured window point.
+        if !selected.waitForExistence(timeout: 5), tab("Nearby").value as? String == "1",
+           saved.isEnabled, saved.isHittable {
+            let frame = saved.frame
+            let window = app.windows.firstMatch
+            let bounds = window.frame
+            XCTAssertTrue(bounds.contains(frame) && !frame.isEmpty)
+            reportCheckpoint("01-saved-nodes-retapped")
+            window.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(
+                dx: frame.midX - bounds.minX, dy: frame.midY - bounds.minY)).tap()
+        }
+        guard selected.waitForExistence(timeout: 10) else {
+            try recordPreInputSetupFailure(launchArguments: ownedLaunchArguments)
+            XCTFail("The real Saved nodes switch must become selected.")
+            return
+        }
         let savedNodesVisible = connectionPage.staticTexts["Connect a Joko node to begin."].firstMatch.waitForExistence(timeout: 10)
         if !savedNodesVisible { try? recordPreInputSetupFailure(launchArguments: ownedLaunchArguments) }
         XCTAssertTrue(savedNodesVisible, "The real Saved nodes tab did not activate.")
