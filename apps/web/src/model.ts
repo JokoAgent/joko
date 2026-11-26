@@ -1723,7 +1723,7 @@ export interface TimelineItemView {
   readonly sharedTaskAuthor?: import("@joko/contracts").SharedTaskAuthor;
   /** Exact operation identity supplied by the generated user-message event. */
   readonly inputOperationId?: string;
-  /** Renderer-memory proof that this user input was sent from the same connection scope. */
+  /** The accepted input carries this renderer's original scoped submission trace. */
   readonly localUserInput?: boolean;
   readonly inputMentions?: readonly TimelineInputMentionView[];
   readonly mentionRanges?: readonly TimelineInputMentionRangeView[];

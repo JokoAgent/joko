@@ -471,6 +471,8 @@ describe("remote connection auth and durable operations", () => {
     const targetId = fixture.targetId();
     const operationId = randomUUID();
     const mutation = createSessionMutation({ backendId, targetId, displayName: "Idempotent task" });
+    mutation.preconditions.push(create(OperationPreconditionSchema, { entity: { kind: EntityKind.TARGET, id: targetId },
+      expectedRevision: { value: fixture.application.store.getTarget(targetId).revision } }));
 
     const first = await submit(paired.clients.operation, paired.connectionId, mutation, operationId);
     const replay = await submit(paired.clients.operation, paired.connectionId, mutation, operationId);
@@ -489,7 +491,25 @@ describe("remote connection auth and durable operations", () => {
     });
 
     const fetched = await paired.clients.operation.getOperation({ operationId });
-    expect(fetched.operation?.mutation?.payload.case).toBe("createSession");
-    expect(fetched.operation?.state).toBe(OperationState.SUCCEEDED);
+    expect(fetched.operation?.mutation).toEqual(mutation);
+    const rootDirectory = fixture.rootDirectory;
+    await fixture.close({ removeRoot: false });
+    fixture = await OrchestratorE2eFixture.start({ rootDirectory });
+    const reconnected = fixture.clients(paired.authKey);
+    const observer = await fixture.pair("operation observer");
+    const cold = (await reconnected.operation.getOperation({ operationId })).operation;
+    const listed = (await observer.clients.operation.listOperations({})).operations.find(item => item.operationId === operationId);
+    const watched = [];
+    for await (const update of reconnected.operation.watchOperation({ operationId })) watched.push(update.operation);
+    expect(watched).toHaveLength(1);
+    for (const receipt of [cold, listed, watched[0], await submit(reconnected.operation, paired.connectionId, mutation, operationId)]) {
+      expect(receipt).toMatchObject({ operationId, connectionId: paired.connectionId, state: OperationState.SUCCEEDED,
+        requestSha256Hex: first.requestSha256Hex, mutation });
+      expect(sessionIdFrom(receipt!)).toBe(sessionIdFrom(first));
+    }
+    await expect(submit(observer.clients.operation, observer.connectionId, mutation, operationId)).rejects.toMatchObject({ code: Code.Unauthenticated });
+    await expect(submit(reconnected.operation, paired.connectionId, createSessionMutation({ backendId, targetId }), operationId))
+      .rejects.toMatchObject({ code: Code.AlreadyExists });
+    expect((await reconnected.session.listSessions({ targetId })).sessions).toHaveLength(1);
   });
 });

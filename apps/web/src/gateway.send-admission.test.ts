@@ -1,6 +1,8 @@
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, type Transport } from "@connectrpc/connect";
 import {
+  ActorKind,
+  ActorRefSchema,
   BeginBlobUploadResponseSchema,
   CompleteBlobUploadResponseSchema,
   EntityKind,
@@ -11,6 +13,7 @@ import {
   ListSessionTimelineResponseSchema,
   MessageRole,
   OperationState,
+  SharedTaskAuthorSchema,
   SnapshotSchema,
   StreamEventsResponseSchema,
   SubmitOperationResponseSchema,
@@ -169,12 +172,13 @@ describe("input preparation and admission", () => {
     const generation = 4n;
     const events: Event[] = [];
     const submissions: SubmitOperationRequest[] = [];
+    const traces: string[] = [];
     const attempts: { resolve: (value: unknown) => void; reject: (error: unknown) => void }[] = [];
     const feed = eventFeed();
     const gateways: ReturnType<typeof createOrchestratorGateway>[] = [];
     let snapshot: AppSnapshot | undefined;
     const transportFor = (history: readonly Event[], live = false): Transport => ({
-      unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
+      unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, headers: HeadersInit, input: any) => {
         let message: unknown;
         switch (method.localName) {
           case "getSnapshot": message = create(GetSnapshotResponseSchema, { snapshot: create(SnapshotSchema, {
@@ -186,10 +190,12 @@ describe("input preparation and admission", () => {
           }) }); break;
           case "listManagedModelRuntimes": message = create(ListManagedModelRuntimesResponseSchema); break;
           case "listSessionTimeline": message = create(ListSessionTimelineResponseSchema, {
-            events: history.filter(event => event.identity?.sessionId === input.sessionId)
+            events: history.filter(event => event.identity?.sessionId === input.sessionId
+              && (!input.beforeCursor || event.cursor!.sequence < input.beforeCursor.sequence))
           }); break;
           case "submitOperation":
             submissions.push(input);
+            traces.push(new Headers(headers).get("traceparent") ?? "");
             message = await new Promise((resolve, reject) => { attempts.push({ resolve, reject }); });
             break;
           default: throw new Error(`Unexpected RPC ${method.localName}`);
@@ -205,7 +211,8 @@ describe("input preparation and admission", () => {
     const userStarted = (operationId: string, sessionId = "task", eventGeneration = generation): Event => create(EventSchema, {
       eventId: `started-${sessionId}-${eventGeneration}`,
       cursor: { generation: 1n, sequence: 1n },
-      identity: { sessionId, generation: eventGeneration, operationId },
+      identity: { sessionId, generation: eventGeneration, operationId,
+        trace: { traceId: traces[0]?.slice(3, 35), parentSpanId: traces[0]?.slice(36, 52) } },
       payload: { kind: { case: "messageStarted", value: { messageId: "input", role: MessageRole.USER,
         userInputAccepted: true, userInput: { parts: [{ content: { case: "text", value: "Fixture input" } }] } } } }
     });
@@ -215,6 +222,7 @@ describe("input preparation and admission", () => {
         { expectedGeneration: generation });
       await vi.waitFor(() => expect(submissions).toHaveLength(1));
       const operationId = submissions[0]!.operationId;
+      expect(traces[0]).toMatch(/^00-[a-f0-9]{32}-[a-f0-9]{16}-00$/u);
       const started = userStarted(operationId);
       events.push(started);
       feed.push(started);
@@ -237,6 +245,7 @@ describe("input preparation and admission", () => {
       attempts[0]!.reject(new ConnectError("Accepted response was lost", Code.Unavailable));
       await vi.waitFor(() => expect(submissions).toHaveLength(2));
       expect(submissions[1]!.operationId).toBe(operationId);
+      expect(traces[1]).toBe(traces[0]);
       expect((await gateway.loadSessionTimelinePage("task")).items[0]).toMatchObject({ inputOperationId: operationId, localUserInput: true });
       attempts[1]!.resolve(create(SubmitOperationResponseSchema, { operation: { operationId, state: OperationState.SUCCEEDED } }));
       await pending;
@@ -245,6 +254,11 @@ describe("input preparation and admission", () => {
       const scopes = [
         { name: "same connection after reconnect", profile, sessionId: "task", generation, operationId, local: true },
         { name: "other profile", profile: { ...profile, id: "other-profile" }, sessionId: "task", generation, operationId, local: false },
+        { name: "other device", profile: { ...profile, deviceId: "other-device" }, sessionId: "task", generation, operationId, local: false },
+        { name: "foreign connection author", profile, sessionId: "task", generation, operationId, local: false },
+        { name: "shared guest author", profile, sessionId: "task", generation, operationId, local: false },
+        { name: "untraced history", profile, sessionId: "task", generation, operationId, local: false },
+        { name: "another window's admission", profile, sessionId: "task", generation, operationId, local: false },
         { name: "other server", profile: { ...profile, serverId: "other-server" }, sessionId: "task", generation, operationId, local: false },
         { name: "other origin", profile: { ...profile, origin: "http://127.0.0.1:4320" }, sessionId: "task", generation, operationId, local: false },
         { name: "other session", profile, sessionId: "other-task", generation, operationId, local: false },
@@ -252,7 +266,15 @@ describe("input preparation and admission", () => {
         { name: "foreign operation", profile, sessionId: "task", generation, operationId: "foreign-operation", local: false }
       ];
       for (const scope of scopes) {
-        const history = [userStarted(scope.operationId, scope.sessionId, scope.generation)];
+        const event = userStarted(scope.operationId, scope.sessionId, scope.generation);
+        if (scope.name === "untraced history") event.identity!.trace = undefined;
+        if (scope.name === "another window's admission") event.identity!.trace!.parentSpanId = "d2d870e4a6564b71";
+        if (scope.name === "foreign connection author") event.actor = create(ActorRefSchema, { kind: ActorKind.CONNECTION, id: "external" });
+        if (scope.name === "shared guest author" && event.payload?.kind.case === "messageStarted") {
+          event.payload.kind.value.sharedTaskAuthor = create(SharedTaskAuthorSchema, { shareId: "share", sessionId: "task",
+            shareGeneration: 1n, memberId: "guest", memberGeneration: 1n, displayName: "Guest" });
+        }
+        const history = [event];
         const scopedTransport = transportFor(history);
         let scopedSnapshot: AppSnapshot | undefined;
         const scopedGateway = createOrchestratorGateway(scope.profile, "test-key", {
@@ -261,7 +283,7 @@ describe("input preparation and admission", () => {
         gateways.push(scopedGateway);
         await scopedGateway.connect();
         const rows = [scopedSnapshot?.timelineBySession.get(scope.sessionId)?.[0],
-          (await scopedGateway.loadSessionTimelinePage(scope.sessionId)).items[0],
+          (await scopedGateway.loadSessionTimelinePage(scope.sessionId, { opaqueToken: "", generation: 1n, sequence: 2n })).items[0],
           (await scopedGateway.loadSessionTimelineAround(scope.sessionId, history[0]!.eventId))[0]];
         for (const row of rows) {
           expect(row?.inputOperationId, scope.name).toBe(scope.operationId);

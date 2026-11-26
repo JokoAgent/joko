@@ -10440,7 +10440,7 @@ export class SessionHost {
       readonly connection: ConnectionRecord;
       readonly operationId: string;
       readonly sourceMessage?: { readonly messageId: string; readonly eventId: string; readonly requireLatestUser?: boolean };
-      readonly editedInput?: Pick<QueuedInput, "prompt" | "overrides">;
+      readonly editedInput?: Pick<QueuedInput, "prompt" | "overrides"> & { readonly inputTraceparent?: string };
       readonly protocol: { readonly kind: "internal" }
         | { readonly kind: "connect"; readonly body: unknown; readonly precondition: (store: OperationalStore) => void };
     }
@@ -10653,7 +10653,8 @@ export class SessionHost {
           }
           if (editedInput !== undefined) {
             const queued = this.commitQueuedInput(store, { operationId: authority.operationId, sessionId, ...editedInput });
-            return { accepted: true, resultCase: "queueItem", entityId: queued.queueItemId } as const;
+            return { accepted: true, resultCase: "queueItem", entityId: queued.queueItemId,
+              ...(editedInput.inputTraceparent === undefined ? {} : { inputTraceparent: editedInput.inputTraceparent }) } as const;
           }
           return { accepted: true, resultCase: "acknowledgement" } as const;
         },

@@ -16,7 +16,8 @@ async function fixture(run: (f: { root: string; picker: ExtensionDirectoryPicker
   const files = new ExtensionFileDeposits(() => now), current = () => { if (!live) throw new Error("Original installation retired"); };
   const picker = new ExtensionDirectoryPicker({ roots: () => [root], now: () => now, runtime: {
     captureDirectorySelection: () => { current(); return { authorityKey: "installation", assertCurrent: current }; },
-    preparePickedDirectory: input => files.preparePickedDirectory({ ...input, assertCurrent: current })
+    preparePickedDirectory: input => files.preparePickedDirectory({ ...input, assertCurrent: current }),
+    pickedDirectoryToken: (extensionId, pickerId) => { current(); return files.pickedDirectoryToken(extensionId, "installation", pickerId); }
   } });
   try { await run({ root, picker, files, retire: () => { live = false; }, advance: ms => { now += ms; } }); }
   finally { await rm(root, { recursive: true, force: true }); }
@@ -29,7 +30,8 @@ describe("native author settings directory selection", () => {
     let release!: (value: Receipt) => void, captured: Input | undefined;
     const prepare = vi.fn((input: Omit<Input, "assertCurrent">) => { captured = { ...input, assertCurrent: () => {} }; return new Promise<Receipt>(resolve => { release = resolve; }); });
     const picker = new ExtensionDirectoryPicker({ roots: () => [f.root], runtime: {
-      captureDirectorySelection: () => ({ authorityKey: "installation", assertCurrent: () => {} }), preparePickedDirectory: prepare
+      captureDirectorySelection: () => ({ authorityKey: "installation", assertCurrent: () => {} }), preparePickedDirectory: prepare,
+      pickedDirectoryToken: () => undefined
     } });
     const opened = await picker.open(surface, "connection", () => {}), id = opened.picker.pickerId;
     const page = await picker.browse(id, "connection", { directoryPath: f.root });
@@ -53,6 +55,8 @@ describe("native author settings directory selection", () => {
     const page = await f.picker.browse(opened.picker.pickerId, "connection", { directoryPath: selected });
     const receipt = await f.picker.pick(opened.picker.pickerId, page.directory!.entryId, "plugin", "connection", () => {});
     expect(receipt).toMatchObject({ fileCount: 1, totalBytes: 12, relativePaths: ["read.txt"] });
+    expect(f.picker.tokenForSelection("plugin", opened.picker.pickerId)).toBe(receipt.token);
+    expect(f.picker.tokenForSelection("plugin", "other-picker")).toBeUndefined();
     expect(JSON.stringify(receipt)).not.toContain(selected); expect(JSON.stringify(receipt)).not.toContain("private-secret");
     expect(f.files.take({ ...scope, extensionId: "other" }, receipt.token)).toBeUndefined();
     expect(f.files.take({ ...scope, authorityKey: "replacement" }, receipt.token)).toBeUndefined();
@@ -86,6 +90,7 @@ describe("native author settings directory selection", () => {
     const request = { url: "https://files.example.test/upload", method: "POST", uploadDir: { token: receipt.token } };
     expect(await network.request({ ...networkScope, readOnly: true }, request)).toMatchObject({ ok: false }); expect(fetch).not.toHaveBeenCalled();
     expect(await network.request(networkScope, request)).toMatchObject({ ok: true }); expect(fetch).toHaveBeenCalledOnce();
+    expect(f.picker.tokenForSelection("plugin", opened.picker.pickerId)).toBeUndefined();
     expect(Buffer.from(fetch.mock.calls[0]![1]!.body as ArrayBuffer).toString()).toContain("actual report");
     expect(await network.request(networkScope, request)).toMatchObject({ ok: false }); expect(fetch).toHaveBeenCalledOnce();
     f.advance(3_001); const next = await f.picker.open(surface, "connection", () => {});

@@ -28,7 +28,7 @@ export function createTaskSharingRuntime(
         && host.canShareSession(sessionId)
         && dependencies.partnerGroupRuntime?.isGroupSession(sessionId) !== true;
     },
-    prepareOperation: (lease, request) => {
+    prepareOperation: (lease, request, inputTraceparent) => {
       const mutation = request.mutation;
       if (!mutation?.payload.case || !request.operationId || request.connectionId) throw denied();
       // A collision with an ordinary/service operation is never adopted as a guest receipt.
@@ -82,7 +82,8 @@ export function createTaskSharingRuntime(
           return transactional(transaction => {
             const queued = host.commitQueuedInput(transaction, { operationId: request.operationId, sessionId,
               prompt, ...(overrides === undefined ? {} : { overrides }) });
-            return { accepted: true, resultCase: "queueItem", entityId: queued.queueItemId };
+            return { accepted: true, resultCase: "queueItem", entityId: queued.queueItemId,
+              ...(inputTraceparent === undefined ? {} : { inputTraceparent }) };
           }, () => host.drainQueuedInput(sessionId));
         }
         case "resumeQueue":

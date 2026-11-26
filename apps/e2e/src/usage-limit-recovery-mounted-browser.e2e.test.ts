@@ -181,6 +181,7 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
       const editor = page.getByRole("dialog", { name: "Create schedule", exact: true });
       const triggerAt = editor.getByLabel("Trigger at", { exact: true });
       const before = { hash: new URL(page.url()).hash, generation: fixture.application.store.getSession(sessionId).descriptor.binding.generation,
+        paneGeneration: await pane.getAttribute("data-input-session-generation"),
         receiptReads: recoveryReads.length };
       try {
         await pane.getByRole("button", { name: "Continue after reset", exact: true }).click();
@@ -194,6 +195,7 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
         const visibleText = (await pane.textContent().catch(() => null))?.slice(-2_000);
         const attention = fixture.application.store.findSessionAttention(sessionId);
         const after = { hash: new URL(page.url()).hash, generation: fixture.application.store.getSession(sessionId).descriptor.binding.generation,
+          paneGeneration: await pane.getAttribute("data-input-session-generation", { timeout: 1000 }).catch(() => null),
           receiptStatusCodes: recoveryReads.slice(before.receiptReads), editorPresent: await editor.count() > 0 };
         console.info("Quota recovery fixture cold presentation", JSON.stringify({ before, after, events, attention, visibleText },
           (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value));

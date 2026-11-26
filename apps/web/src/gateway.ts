@@ -490,7 +490,9 @@ import {
   type DevicePeerRouteIdentity as ProtoDevicePeerRouteIdentity,
   type DisplayArgument,
   type ErrorInfo,
+  ActorKind,
   type Event,
+  type SharedTaskAuthor,
   type ExtraDirectory,
   type ExtensionStatus,
   type ExtensionCatalogEntry as ProtoExtensionCatalogEntry,
@@ -1015,7 +1017,7 @@ import { formatBrowserCommentsForSend, normalizeBrowserCommentTarget } from "./b
 import { normalizeResourceDraft } from "./resource-draft.js";
 import { isInsecureLanOrigin, isLoopbackHostname, normalizeOrchestratorOrigin } from "./connection-origin.js";
 import { scheduleEpochFromLocalDateTime } from "./schedule-time.js";
-import { randomUuid, sha256Hex } from "./web-crypto.js";
+import { randomUuid, sha256Hex, sha256HexSync } from "./web-crypto.js";
 import type { ModelWorkingContextView as ProtoModelWorkingContextView } from "@joko/contracts";
 import type { ModelWorkingContextRoute, ModelWorkingContextTarget, ModelWorkingContextView } from "./model.js";
 import { compareExtensionStateOrder } from "./extension-ui-presentation.js";
@@ -1135,6 +1137,7 @@ export type GatewayTransportFactory = (origin: string, authKey?: string) => Tran
 /** The only transport available to a joined task. It cannot reach ordinary Home RPCs. */
 export interface TaskSharingGatewayPort {
   readonly scopeKey: string;
+  readonly isInputAuthor?: (author: SharedTaskAuthor) => boolean;
   readonly operations: {
     pending(): Promise<readonly string[]>;
     begin(operationId: string): Promise<void>;
@@ -1198,20 +1201,18 @@ interface GatewayActionScope {
   readonly signal: AbortSignal;
 }
 
-interface LocalUserInputOperation {
-  readonly taskSharingScope?: string;
-  readonly profileId: string;
-  readonly serverId: string;
-  readonly origin: string;
-  readonly sessionId: string;
-  readonly generation: bigint;
-}
-
 type LocalUserInputMatcher = (event: Event) => boolean;
 
-// Retain exact attempts across reconnects and uncertain responses for this
-// renderer lifetime. Only operation and connection identities enter this map.
-const localUserInputOperations = new Map<string, LocalUserInputOperation>();
+// The renderer can recognize its own admission span in any history page.
+// Keep only its nonce across gateway replacement. Each request has a distinct trace.
+let inputRendererNonce: string | undefined;
+function localInputTraceparent(profile: ConnectionProfile, shareScope: string | undefined, sessionId: string,
+  generation: bigint, operationId: string): string {
+  inputRendererNonce ??= randomUuid();
+  const digest = sha256HexSync(new TextEncoder().encode(JSON.stringify([profile.id, profile.deviceId, profile.serverId,
+    profile.origin, shareScope, sessionId, generation.toString(), operationId, inputRendererNonce])));
+  return `00-${digest.slice(0, 32)}-${digest.slice(32, 48)}-00`;
+}
 // An uncertain device-name attempt keeps only its public receipt identity.
 // Reconnecting the same authenticated owner may read that receipt, never resend
 // a new business operation because a displayed name happens to match.
@@ -12388,24 +12389,18 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       signal?.throwIfAborted();
       await observeReceipt?.(operationId);
       signal?.throwIfAborted();
+      let traceparent: string | undefined;
       if (payload.case === "sendInput" && this.#profile !== undefined) {
         const generation = request.mutation.preconditions.find((precondition) =>
           precondition.entity?.kind === EntityKind.SESSION
           && precondition.entity.id === payload.value.sessionId
         )?.expectedGeneration;
         if (generation !== undefined && generation > 0n) {
-          localUserInputOperations.set(operationId, {
-            ...(this.#taskSharing === undefined ? {} : { taskSharingScope: this.#taskSharing.scopeKey }),
-            profileId: this.#profile.id,
-            serverId: this.#profile.serverId,
-            origin: this.#profile.origin,
-            sessionId: payload.value.sessionId ?? "",
-            generation
-          });
+          traceparent = localInputTraceparent(this.#profile, this.#taskSharing?.scopeKey, payload.value.sessionId ?? "", generation, operationId);
         }
       }
       submissionIssued = true;
-      return client.submitOperation(request, options);
+      return client.submitOperation(request, traceparent === undefined ? options : { ...options, headers: { traceparent } });
     };
     let response;
     try {
@@ -12476,15 +12471,14 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   private readonly isLocalUserInput: LocalUserInputMatcher = (event) => {
     const identity = event.identity;
     const profile = this.#profile;
-    if (identity === undefined || profile === undefined || identity.operationId === "") return false;
-    const local = localUserInputOperations.get(identity.operationId);
-    return local !== undefined
-      && local.taskSharingScope === this.#taskSharing?.scopeKey
-      && local.profileId === profile.id
-      && local.serverId === profile.serverId
-      && local.origin === profile.origin
-      && local.sessionId === identity.sessionId
-      && local.generation === identity.generation;
+    const kind = event.payload?.kind;
+    if (!inputRendererNonce || !profile || !identity?.operationId || !identity.trace?.parentSpanId
+      || kind?.case !== "messageStarted" || !kind.value.userInputAccepted) return false;
+    const author = kind.value.sharedTaskAuthor;
+    if (this.#taskSharing ? !author || !this.#taskSharing.isInputAuthor?.(author) : author !== undefined) return false;
+    if (event.actor?.kind === ActorKind.CONNECTION && event.actor.id !== profile.id) return false;
+    return `00-${identity.trace.traceId}-${identity.trace.parentSpanId}-00`
+      === localInputTraceparent(profile, this.#taskSharing?.scopeKey, identity.sessionId, identity.generation, identity.operationId);
   };
 
   private async uploadAttachment(file: File, scope: GatewayActionScope): Promise<Record<string, unknown>> {

@@ -246,6 +246,15 @@ export class ExtensionFileDeposits {
     return this.#currentDirectory(scope, token)?.files.length;
   }
 
+  pickedDirectoryToken(extensionId: string, authorityKey: string, selectionId: string): string | undefined {
+    this.#sweep();
+    const expected = owner({ kind: "user_pick", extensionId, authorityKey, selectionId });
+    for (const [token, entry] of this.#directories) {
+      if (entry.picked && entry.owner === expected) return token;
+    }
+    return undefined;
+  }
+
   take(scope: ExtensionCardScope, token: string): ExtensionDirectoryTransfer | undefined {
     const entry = this.#currentDirectory(scope, token);
     if (!entry) return;

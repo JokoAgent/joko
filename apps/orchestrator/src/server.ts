@@ -194,7 +194,7 @@ export async function createPublicServer(application: OrchestratorApplication, o
 
   await server.register(cors, {
     credentials: false,
-    allowedHeaders: ["authorization", "content-type", "connect-protocol-version", "connect-timeout-ms", "x-joko-client-version", "x-joko-isolated-document", "if-match", EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER],
+    allowedHeaders: ["authorization", "content-type", "connect-protocol-version", "connect-timeout-ms", "traceparent", "x-joko-client-version", "x-joko-isolated-document", "if-match", EXTENSION_MAIN_VIEW_KEEPALIVE_HEADER],
     exposedHeaders: ["connect-content-encoding", "connect-accept-encoding", "grpc-status", "grpc-message", "content-security-policy", "etag",
       PORTABLE_SESSION_LIMIT_BYTES_HEADER, PORTABLE_SESSION_MEDIA_BYTES_HEADER],
     methods: ["GET", "POST", "PUT", "OPTIONS"],

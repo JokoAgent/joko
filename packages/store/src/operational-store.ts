@@ -9645,6 +9645,18 @@ export class OperationalStore {
     return row === undefined ? undefined : operationFromRow<T>(row);
   }
 
+  getAcceptedInputTraceparent(operationId: string, sessionId: string): string | undefined {
+    this.assertOpen();
+    // History pages need only the admission span, even for a large rich input.
+    const row = this.database.prepare(`
+      SELECT json_extract(response_json, '$.inputTraceparent') AS parent FROM operations
+      WHERE id = ? AND kind = 'sendInput' AND status = 'completed'
+        AND json_extract(response_json, '$.resultCase') = 'queueItem' AND json_extract(response_json, '$.accepted') = 1
+        AND json_extract(body_json, '$.payload.value.sessionId') = ?
+    `).get(operationId, sessionId);
+    return typeof row?.["parent"] === "string" ? row["parent"] : undefined;
+  }
+
   listOperations<T = unknown>(options: OperationQuery = {}): OperationRecord<T>[] {
     this.assertOpen();
     const filter = operationSqlFilter(options);

@@ -2930,6 +2930,11 @@ describe("Connect security and protocol audit", () => {
       error: { code: storedError.code, message: storedError.message }
     });
     expect(mutate).toHaveBeenCalledTimes(1);
+    record = undefined;
+    const conflicting = create(contract.OperationMutationSchema, { payload: { case: "compactSession",
+      value: { sessionId: "session-compact-failure", customInstructions: "A different body" } } });
+    await expect(invoke(services.operation.submitOperation, { ...request, mutation: conflicting }, context()))
+      .rejects.toBeInstanceOf(OperationConflictError);
   });
 
   it("maps a missing durable entity to NOT_FOUND instead of framework INTERNAL", async () => {
@@ -3157,7 +3162,7 @@ describe("Connect security and protocol audit", () => {
     revokeOnParentRead = false; revoked = false;
     await expect(submit(true, 8n)).rejects.toMatchObject({ code: Code.Aborted });
     expect(files.mkdir).not.toHaveBeenCalled();
-    await submit(true);
+    const first = await submit(true) as contract.SubmitOperationResponse;
     expect(files.mkdir).toHaveBeenCalledOnce();
     expect(validateTarget).toHaveBeenCalledWith(expect.objectContaining({ remoteWorkspace: {
       kind: "ssh", hostTargetId: sourceDescriptor.id, hostId: "build-box", workspaceRoot: "/srv/new"
@@ -3385,12 +3390,12 @@ describe("Connect security and protocol audit", () => {
     }));
 
     const callsBeforeReplay = mutate.mock.calls.length;
-    await submit(true, {
+    const replay = await submit(true, {
       ...identity,
       targetDeviceRevision: 9n,
       relationRevision: 6n,
       routeGeneration: 5
-    });
+    }) as contract.SubmitOperationResponse;
     expect(mutate).toHaveBeenCalledTimes(callsBeforeReplay);
     await expect(submit(true, {
       ...identity,
@@ -3418,6 +3423,11 @@ describe("Connect security and protocol audit", () => {
     expect(restored.operation?.mutation?.payload.case === "createDevicePeerTarget"
       ? restored.operation.mutation.payload.value.peer
       : "wrong-payload").toBeUndefined();
+    expect(first.operation?.mutation?.payload).toMatchObject({ value: { peer: { routeGeneration: BigInt(identity.routeGeneration) } } });
+    expect(replay.operation?.mutation?.payload).toMatchObject({ value: { peer: { routeGeneration: 5n } } });
+    expect(replay.operation?.requestSha256Hex).toBe(first.operation?.requestSha256Hex);
+    const reread = await invoke(services.operation.getOperation, { operationId: "operation-device-peer-true" }, context()) as contract.GetOperationResponse;
+    expect(reread.operation?.mutation).toEqual(restored.operation?.mutation);
 
     const mutationCallsBeforeRebind = mutate.mock.calls.length;
     await expect(invoke(services.operation.submitOperation, {

@@ -30,7 +30,11 @@ export async function sha256Hex(bytes: ArrayBuffer, subtle: SubtleCrypto | undef
     const digest = await subtle.digest("SHA-256", bytes);
     return bytesToHex(new Uint8Array(digest));
   }
-  return bytesToHex(sha256(new Uint8Array(bytes)));
+  return sha256HexSync(new Uint8Array(bytes));
+}
+
+export function sha256HexSync(bytes: Uint8Array): string {
+  return bytesToHex(sha256(bytes));
 }
 
 export function persistentWebSecretEncryptionAvailable(): boolean {

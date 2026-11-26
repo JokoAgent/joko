@@ -167,7 +167,7 @@ export class TaskSharingHost {
     return create(contract.TaskShareEventBatchSchema, { events, generation,
       resumeCursor: toProtoEventCursor(resume, generation, Date.now()), resyncRequired: false });
   }
-  async invoke(lease: TaskShareLease, method: contract.TaskShareMethod, requestBytes: Uint8Array, signal: AbortSignal): Promise<Uint8Array> {
+  async invoke(lease: TaskShareLease, method: contract.TaskShareMethod, requestBytes: Uint8Array, signal: AbortSignal, inputTraceparent?: string): Promise<Uint8Array> {
     lease.assertCurrent(); signal.throwIfAborted();
     if (!Object.hasOwn(contract.TASK_SHARE_METHODS, method)) throw denied("This operation is not available to task guests.");
     if (requestBytes.byteLength > 4 * 1024 * 1024) throw new ConnectError("The shared task request is too large.", Code.ResourceExhausted);
@@ -180,7 +180,7 @@ export class TaskSharingHost {
       lease.assertCurrent(); this.assertMutation(lease, request);
       const receipt = this.shares.receipt(lease.proof, request.operationId, requestBytes);
       if (receipt) return { receipt };
-      const operation = this.options.runtime.prepareOperation(lease, request);
+      const operation = this.options.runtime.prepareOperation(lease, request, inputTraceparent);
       this.shares.recordAuthor(request.operationId, lease.author);
       this.shares.admit(lease.proof, request.operationId, requestBytes);
       if (operation.kind === "transactional") {

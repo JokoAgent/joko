@@ -97,7 +97,7 @@ export function assertTaskShareScope(scope: TaskShareScope, share: TaskShare, me
     || scope.shareGeneration !== share.shareGeneration || scope.memberId !== memberId || scope.memberGeneration !== memberGeneration) throw new Error("The shared task owner changed.");
 }
 type RpcMethod<M extends { readonly input: DescMessage; readonly output: DescMessage }> =
-  (request: MessageInitShape<M["input"]>, options: { readonly signal: AbortSignal }) => Promise<MessageShape<M["output"]>>;
+  (request: MessageInitShape<M["input"]>, options: { readonly signal: AbortSignal; readonly headers?: Record<string, string> }) => Promise<MessageShape<M["output"]>>;
 export type TaskSharingRpc = { readonly [K in keyof typeof TaskSharingService.method]: RpcMethod<(typeof TaskSharingService.method)[K]> };
 /** Generated-client-only facade shared by Web and Mobile. No credentials or DOM. */
 export function createTaskSharingApi(input: { readonly rpc: TaskSharingRpc; readonly assertCurrent: (signal: AbortSignal) => void }) {
@@ -133,10 +133,11 @@ export function createTaskSharingApi(input: { readonly rpc: TaskSharingRpc; read
     transfer: (request: MessageInitShape<(typeof TaskSharingService.method.transferJoinedTaskAttachment)["input"]>, signal: AbortSignal) =>
       call(signal, async () => { const response = await rpc.transferJoinedTaskAttachment(request, { signal }); if (!response.result) throw new Error("The shared task transfer is missing."); return response.result; }),
     invoke: <M extends TaskShareCallableMethod>(joinId: string, method: M,
-      request: MessageInitShape<(typeof TASK_SHARE_METHODS)[M]["input"]>, signal: AbortSignal): Promise<MessageShape<(typeof TASK_SHARE_METHODS)[M]["output"]>> =>
+      request: MessageInitShape<(typeof TASK_SHARE_METHODS)[M]["input"]>, signal: AbortSignal, traceparent?: string): Promise<MessageShape<(typeof TASK_SHARE_METHODS)[M]["output"]>> =>
       call(signal, async () => {
         const descriptor = TASK_SHARE_METHODS[method];
-        const response = await rpc.invokeJoinedTask({ joinId, method, requestBytes: toBinary(descriptor.input, create(descriptor.input, request)) }, { signal });
+        const response = await rpc.invokeJoinedTask({ joinId, method, requestBytes: toBinary(descriptor.input, create(descriptor.input, request)) },
+          { signal, ...(method === TaskShareMethod.SUBMIT_OPERATION && traceparent ? { headers: { traceparent } } : {}) });
         return fromBinary(descriptor.output, response.responseBytes) as MessageShape<(typeof TASK_SHARE_METHODS)[M]["output"]>;
       })
   };

@@ -1523,6 +1523,7 @@ describe("session host, durable events, and reconnect semantics", () => {
     const releaseAcknowledgement = browserGate();
     releaseBrowserRequest = () => { forwardRequest.release(); releaseAcknowledgement.release(); };
     let heldBrowserRequest = false;
+    let inputOperationId: string | undefined, admissionTrace: string | null = null;
     const localInputObservation: { inputMatches?: boolean; forwarded: boolean; responseStatus?: number;
       operationState?: OperationState; failed?: string } = { forwarded: false };
     await page.route("**/joko.v1.OperationService/SubmitOperation", async (route) => {
@@ -1534,6 +1535,8 @@ describe("session host, durable events, and reconnect semantics", () => {
         return;
       }
       heldBrowserRequest = true;
+      inputOperationId = body.operationId;
+      admissionTrace = await route.request().headerValue("traceparent");
       localInputObservation.inputMatches = body.mutation.payload.value.input?.parts
         .map(part => part.content.case === "text" ? part.content.value : "").join("") === MOUNTED_TIMELINE_LOCAL;
       requestEntered.release();
@@ -1590,6 +1593,11 @@ describe("session host, durable events, and reconnect semantics", () => {
     });
     if (localContext === undefined) throw new Error("The local input has no active Run.");
     await acceptedLocalInput.waitFor({ state: "attached" });
+    expect(admissionTrace).toMatch(/^00-[a-f0-9]{32}-[a-f0-9]{16}-00$/u);
+    const history = await manager.clients.session.listSessionTimeline({ sessionId, limit: 100 });
+    const admitted = history.events.find(event => event.identity?.operationId === inputOperationId
+      && event.payload?.kind.case === "messageStarted" && event.payload.kind.value.userInputAccepted);
+    expect(admissionTrace).toBe(`00-${admitted?.identity?.trace?.traceId}-${admitted?.identity?.trace?.parentSpanId}-00`);
     expect(await unreadCount(page)).toBe(0);
     const localMessage: NativeHistoryEventContext = { identity: { entryId: "mounted-local-answer" } };
     const localText = "One durable assistant answer with two content blocks.";

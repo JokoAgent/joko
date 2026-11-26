@@ -234,7 +234,7 @@ export class TaskSharingHome {
       return response.batch;
     });
   }
-  invoke(joinId: string, method: contract.TaskShareMethod, requestBytes: Uint8Array, auth: TaskSharingHomeAuthority): Promise<Uint8Array> {
+  invoke(joinId: string, method: contract.TaskShareMethod, requestBytes: Uint8Array, auth: TaskSharingHomeAuthority, traceparent?: string): Promise<Uint8Array> {
     contract.decodeTaskShareRequest(method, requestBytes);
     return this.#withRemote(joinId, auth, async (remote, scope, options) => {
       let write: StoredWrite | undefined;
@@ -253,7 +253,8 @@ export class TaskSharingHome {
         this.#writes.set(key, write); await this.#save(); auth.assertCurrent();
       }
       try {
-        const result = await remote.guest.invokeSharedTask({ scope, method, requestBytes }, options);
+        const result = await remote.guest.invokeSharedTask({ scope, method, requestBytes }, write && traceparent
+          ? { ...options, headers: { ...options.headers, traceparent } } : options);
         if (write) { write.status = "complete"; await this.#save(); }
         return result.responseBytes;
       } catch (error) { if (write) { write.status = "unknown"; await this.#save(); } throw error; }

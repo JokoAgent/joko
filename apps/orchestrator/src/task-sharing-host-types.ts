@@ -21,6 +21,6 @@ export interface TaskSharingRuntimePort {
   canShare(sessionId: string): boolean;
   snapshot(lease: TaskShareLease, signal: AbortSignal): Promise<contract.Snapshot>;
   read(lease: TaskShareLease, method: contract.TaskShareMethod, requestBytes: Uint8Array, signal: AbortSignal): Promise<Uint8Array>;
-  prepareOperation(lease: TaskShareLease, request: contract.SubmitOperationRequest): PreparedTaskShareOperation;
+  prepareOperation(lease: TaskShareLease, request: contract.SubmitOperationRequest, inputTraceparent?: string): PreparedTaskShareOperation;
   projectEvent(lease: TaskShareLease, event: import("@joko/store").PersistedEvent): contract.Event | undefined;
 }

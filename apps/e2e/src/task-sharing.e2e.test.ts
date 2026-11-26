@@ -14,13 +14,14 @@ function sharing(fixture: OrchestratorE2eFixture, paired: PairedClient): Sharing
   return createClient(contract.TaskSharingService, createConnectTransport({ baseUrl: fixture.baseUrl, httpVersion: "1.1", useBinaryFormat: true,
     defaultTimeoutMs: 10_000, interceptors: [next => request => { request.header.set("authorization", `Bearer ${paired.authKey}`); return next(request); }] }));
 }
-async function invoke<T>(api: SharingClient, joinId: string, method: contract.TaskShareMethod, request: object): Promise<T> {
+async function invoke<T>(api: SharingClient, joinId: string, method: contract.TaskShareMethod, request: object, traceparent?: string): Promise<T> {
   const descriptor = contract.taskShareMethodDescriptor(method);
-  const response = await api.invokeJoinedTask({ joinId, method, requestBytes: toBinary(descriptor.input, create(descriptor.input, request as never)) });
+  const response = await api.invokeJoinedTask({ joinId, method, requestBytes: toBinary(descriptor.input, create(descriptor.input, request as never)) },
+    traceparent === undefined ? undefined : { headers: { traceparent } });
   return fromBinary(descriptor.output, response.responseBytes) as T;
 }
-async function guestSubmit(api: SharingClient, joinId: string, mutation: contract.OperationMutation, operationId = randomUUID()): Promise<contract.Operation> {
-  const response = await invoke<contract.SubmitOperationResponse>(api, joinId, contract.TaskShareMethod.SUBMIT_OPERATION, { operationId, mutation });
+async function guestSubmit(api: SharingClient, joinId: string, mutation: contract.OperationMutation, operationId = randomUUID(), traceparent?: string): Promise<contract.Operation> {
+  const response = await invoke<contract.SubmitOperationResponse>(api, joinId, contract.TaskShareMethod.SUBMIT_OPERATION, { operationId, mutation }, traceparent);
   if (!response.operation) throw new Error("The shared Task returned no operation receipt.");
   return response.operation;
 }
@@ -104,9 +105,11 @@ it("keeps two-node shared Task, authors, receipts, attachments and joined direct
     const control = (await owner.clients.queue.getQueueControl({ sessionId })).queueControl!;
     await submit(owner.clients.operation, owner.connectionId, pauseQueueMutation(control));
     const requestId = randomUUID(), mutation = sendInputMutation(sessionId, generation, "Guest draft");
-    let item = queueItemFrom(await guestSubmit(visitorApi, joined.joinId, mutation, requestId));
+    const parentTrace = "00-6c515db677934f10a3fcac9cc44cd816-c705d1261f7a4487-00";
+    const retryTrace = "00-42e49c33f0bb4c1b914b478651273309-c4c4f6eb5e454ad8-00";
+    let item = queueItemFrom(await guestSubmit(visitorApi, joined.joinId, mutation, requestId, parentTrace));
     expect(item.sharedTaskAuthor?.memberId).toBe(joined.member?.memberId);
-    expect(queueItemFrom(await guestSubmit(visitorApi, joined.joinId, mutation, requestId)).queueItemId).toBe(item.queueItemId);
+    expect(queueItemFrom(await guestSubmit(visitorApi, joined.joinId, mutation, requestId, retryTrace)).queueItemId).toBe(item.queueItemId);
     const lockToken = randomUUID();
     item = queueItemFrom(await guestSubmit(visitorApi, joined.joinId, setQueueItemEditLockMutation(item, lockToken, true)));
     item = queueItemFrom(await guestSubmit(visitorApi, joined.joinId, editQueuedInputMutation(item, "Edited guest draft", contract.QueueDeliveryMode.PROMPT, lockToken)));
@@ -158,7 +161,10 @@ it("keeps two-node shared Task, authors, receipts, attachments and joined direct
     const batch = (await visitorApi.readJoinedTaskEvents({ joinId: joined.joinId, after: restored.resumeCursor, limit: 500 })).batch!;
     expect(batch.events.every(event => event.identity?.sessionId === sessionId)).toBe(true);
     expect(batch.resyncRequired).toBe(false);
-    expect(batch.events.some(event => event.payload?.kind.case === "messageStarted" && event.payload.kind.value.sharedTaskAuthor?.memberId === joined.member?.memberId)).toBe(true);
+    const input = batch.events.find(event => event.identity?.operationId === requestId && event.payload?.kind.case === "messageStarted"
+      && event.payload.kind.value.role === contract.MessageRole.USER);
+    expect(input?.payload?.kind.value).toMatchObject({ userInputAccepted: true, sharedTaskAuthor: { memberId: joined.member!.memberId } });
+    expect(input?.identity?.trace).toMatchObject({ traceId: parentTrace.slice(3, 35), parentSpanId: parentTrace.slice(36, 52) });
     await ownerApi.removeTaskShareMember({ operationId: randomUUID(), shareId: share.shareId, memberId: joined.member!.memberId, memberGeneration: joined.member!.memberGeneration });
     await expect(visitorApi.getJoinedTaskSnapshot({ joinId: joined.joinId })).rejects.toMatchObject({ code: Code.PermissionDenied });
     await ownerApi.endTaskShare({ operationId: randomUUID(), shareId: share.shareId });

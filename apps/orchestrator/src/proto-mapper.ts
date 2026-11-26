@@ -344,6 +344,7 @@ export class ProtoMappingError extends Error {
 }
 
 export interface EventMappingContext {
+  readonly inputTrace?: { readonly traceId: string; readonly parentSpanId: string };
   /** An inherited native record still advances stream cursors without becoming child-visible history. */
   readonly hideSideChatHistoryPrefix?: true;
   readonly sharedTaskAuthor?: import("@joko/store").SharedTaskAuthor;
@@ -3015,9 +3016,9 @@ export function toProtoEvent(event: PersistedEvent, context: EventMappingContext
     generation: unsignedBigInt(event.generation, "event.identity.generation"),
     sequence: event.sequence,
     trace: message<TraceContext>("joko.v1.TraceContext", {
-      traceId: event.traceId,
+      traceId: context.inputTrace?.traceId ?? event.traceId,
       spanId: "",
-      parentSpanId: ""
+      parentSpanId: context.inputTrace?.parentSpanId ?? ""
     })
   });
   return message<ProtoEvent>("joko.v1.Event", {

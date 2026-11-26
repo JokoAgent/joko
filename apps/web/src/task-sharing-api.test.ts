@@ -31,6 +31,11 @@ describe("shared task generated transport", () => {
     const api = { invoke: vi.fn().mockResolvedValue(create(GetOperationResponseSchema, { operation })) } as unknown as TaskSharingApi;
     const port = createJoinedTaskPort(api, joined, new AbortController().signal, journal());
     const client = createClient(OperationService, port.transport);
+    const author = operation.sharedTaskAuthor!;
+    expect(port.isInputAuthor!(author)).toBe(true);
+    for (const change of [{ memberId: "other" }, { memberGeneration: 4n }, { shareId: "another" }, { shareGeneration: 3n }, { sessionId: "other" }]) {
+      expect(port.isInputAuthor!({ ...author, ...change })).toBe(false);
+    }
     expect((await client.getOperation({ operationId: "op" })).operation?.operationId).toBe("op");
     for (const change of [ (value: typeof operation) => { value.connectionId = "home"; },
       (value: typeof operation) => { value.sharedTaskAuthor!.memberGeneration = 4n; },

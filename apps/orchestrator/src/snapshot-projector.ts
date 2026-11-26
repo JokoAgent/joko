@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { acceptedInputTrace } from "./input-trace.js";
 import { readWorkerWorkspaceBinding } from "./collaboration-worker-workspace.js";
 import { readProvisionalSession } from "./session-prewarm.js";
 import { sessionTaskActivity } from "./session-task-activity.js";
@@ -754,6 +755,7 @@ export class SnapshotProjector {
       const queueItem = eventQueueItem(event, queueById, input.queueItems);
       return toProtoEvent(event, {
         sharedTaskAuthor: taskShareEventAuthor(this.store, event),
+        inputTrace: acceptedInputTrace(this.store, event),
         learning: event.payload.type === "message_complete" && event.payload.role === "assistant"
           ? this.store.getPartnerLearningFeedback(event.id) : undefined,
         queueItem,

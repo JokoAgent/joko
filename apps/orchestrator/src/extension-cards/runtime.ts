@@ -159,6 +159,10 @@ export class ExtensionCardRuntime {
     if (captured.authorityKey !== input.authorityKey) throw new Error("Directory selection plugin authority changed.");
     return this.#files.preparePickedDirectory({ ...input, assertCurrent: captured.assertCurrent });
   }
+  pickedDirectoryToken(extensionId: string, selectionId: string): string | undefined {
+    const authority = this.captureDirectorySelection(extensionId);
+    return this.#files.pickedDirectoryToken(extensionId, authority.authorityKey, selectionId);
+  }
   async previewMail(request: ExtensionMailPreviewRequest, signal: AbortSignal, assertCaller: () => void): Promise<ExtensionMailPreview> {
     const { sessionId, url, read, opened, readerSelectionId } = request;
     const task = this.options.store.getSession(sessionId).descriptor;

@@ -90,6 +90,7 @@ import {
   stageUsageLimitScheduleIntent,
   usageLimitRecoveryHint,
   type FailedInputModel,
+  type FailedInputModelRead,
   type UsageLimitRecoveryHint
 } from "../usage-limit-recovery.js";
 import { SessionHeaderActionsMenu } from "./SessionHeaderActionsMenu.js";
@@ -1006,8 +1007,11 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const [pendingUsageLimitRecovery, setPendingUsageLimitRecovery] = useState<{
     readonly itemId: string;
     readonly input: FailedInputIdentity;
-    readonly previousGeneration: bigint;
+    readonly generation: bigint;
+    readonly selection: FailedInputModelRead | undefined;
+    readonly canRetry: boolean;
     readonly isOwnerCurrent: () => boolean;
+    readonly isBindingCurrent: () => boolean;
   }>();
   const stopAllBackgroundTasks = (): void => {
     if (!canStopBackgroundTasks || backgroundStopping || backgroundTaskIds.length === 0) return;
@@ -1414,32 +1418,34 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     });
   };
 
-  const scheduleUsageLimitRecovery = (item: TimelineItemView, hint: UsageLimitRecoveryHint, retryOwner?: () => boolean): void => {
-    if (usageLimitSourceRef.current?.id !== item.id || guest || reviewReadOnly) return;
+  const openUsageLimitScheduleDraft = (item: TimelineItemView, hint: UsageLimitRecoveryHint, selection: FailedInputModel | undefined): void => {
     const error = item.error;
     if (error === undefined) return;
-    const openDraft = (selection: FailedInputModel | undefined): void => {
-      const current = controllerRef.current;
-      const profile = current.state.activeProfile;
-      if (profile === undefined || current.state.connectionState !== "connected") return;
-      const useTaskModel = selection?.kind === "inherited";
-      const model = selection?.kind === "override" ? selection.model : undefined;
-      const providerId = model?.providerId ?? (useTaskModel ? session.model?.providerId : undefined);
-      const modelId = model?.modelId ?? (useTaskModel ? session.model?.modelId : undefined);
-      const now = Date.now();
-      const accountReset = useTaskModel && providerGroupUsage !== undefined ? providerGroupUsage.resetAt
-        : providerAccountUsageResetAt(current.state.snapshot.providers, providerId, now, { backendId: session.backendId, modelId });
-      const recovery = usageLimitRecoveryHint(error, now, accountReset) ?? hint;
-      stageUsageLimitScheduleIntent(session.id, { ...recovery, model: useTaskModel ? undefined : model ?? null }, {
-        serverId: profile.serverId, profileId: profile.id, connectionGeneration: current.state.connectionGeneration
-      });
-      current.navigate({ kind: "schedules" });
-      void current.setNavigationOpen(true);
-    };
+    const current = controllerRef.current;
+    const profile = current.state.activeProfile;
+    if (profile === undefined || current.state.connectionState !== "connected") return;
+    const useTaskModel = selection?.kind === "inherited";
+    const model = selection?.kind === "override" ? selection.model : undefined;
+    const providerId = model?.providerId ?? (useTaskModel ? session.model?.providerId : undefined);
+    const modelId = model?.modelId ?? (useTaskModel ? session.model?.modelId : undefined);
+    const now = Date.now();
+    const accountReset = useTaskModel && providerGroupUsage !== undefined ? providerGroupUsage.resetAt
+      : providerAccountUsageResetAt(current.state.snapshot.providers, providerId, now, { backendId: session.backendId, modelId });
+    const recovery = usageLimitRecoveryHint(error, now, accountReset) ?? hint;
+    stageUsageLimitScheduleIntent(session.id, { ...recovery, model: useTaskModel ? undefined : model ?? null }, {
+      serverId: profile.serverId, profileId: profile.id, connectionGeneration: current.state.connectionGeneration
+    });
+    current.navigate({ kind: "schedules" });
+    void current.setNavigationOpen(true);
+  };
+
+  const scheduleUsageLimitRecovery = (item: TimelineItemView, hint: UsageLimitRecoveryHint, retryOwner?: () => boolean): void => {
+    if (usageLimitSourceRef.current?.id !== item.id || item.error === undefined || guest || reviewReadOnly) return;
     const input = item.failedInput;
     const read = controller.readFailedInputModel;
     if (input === undefined || read === undefined) {
-      if (retryOwner === undefined) openDraft(item.runId === undefined || providerGroupUsage !== undefined ? { kind: "inherited" } : undefined);
+      if (retryOwner === undefined) openUsageLimitScheduleDraft(item, hint,
+        item.runId === undefined || providerGroupUsage !== undefined ? { kind: "inherited" } : undefined);
       return;
     }
     const isBindingCurrent = capturePaneMessageAction(true);
@@ -1449,32 +1455,32 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     runAction(`schedule-recovery:${input.runId}`, async () => {
       const selection = await read(session.id, session.generation, input).catch(() => undefined);
       if (!isOwnerCurrent()) return;
-      if (selection?.kind !== "runtimeChanged" && isBindingCurrent()) {
-        if (usageLimitSourceRef.current?.id === item.id) openDraft(selection);
-        return;
-      }
-      if (!canRetry) return;
-      // Cold Pi attach replaces the runtime while the read is in flight. Wait
-      // for the current history and read the original Operation again.
-      const current = controllerRef.current.state.snapshot.sessions.find(candidate => candidate.id === session.id);
-      if (selection?.kind === "runtimeChanged" || current !== undefined && current.generation > session.generation) {
-        setPendingUsageLimitRecovery({ itemId: item.id, input, previousGeneration: session.generation, isOwnerCurrent });
-      }
+      setPendingUsageLimitRecovery({ itemId: item.id, input, generation: session.generation, selection,
+        canRetry, isOwnerCurrent, isBindingCurrent });
     });
   };
   useEffect(() => {
     if (pendingUsageLimitRecovery === undefined) return;
-    const { itemId, input, previousGeneration, isOwnerCurrent } = pendingUsageLimitRecovery;
+    const { itemId, input, generation, selection, canRetry, isOwnerCurrent, isBindingCurrent } = pendingUsageLimitRecovery;
     const canRecover = isOwnerCurrent() && !guest && !reviewReadOnly && !session.archived && !running
       && !hasErrorTailQueueContinuation(queue, session.id);
-    if (canRecover && (session.generation <= previousGeneration || timelineHistoryLoading)) return;
+    const source = usageLimitSource?.id === itemId ? usageLimitSource : undefined;
+    const current = source?.failedInput;
+    const sameInput = current?.operationId === input.operationId && current.queueItemId === input.queueItemId
+      && current.runId === input.runId && current.backendId === input.backendId && current.targetId === input.targetId;
+    const runtimeChanged = selection?.kind === "runtimeChanged" || generation !== session.generation;
+    // A history refresh can temporarily remove the failure without changing its runtime.
+    if (canRecover && (timelineHistoryLoading && (runtimeChanged || !sameInput)
+      || canRetry && selection?.kind === "runtimeChanged" && session.generation <= generation)) return;
     setPendingUsageLimitRecovery(undefined);
-    if (!canRecover || timelineHistoryError !== undefined || usageLimitSource?.id !== itemId) return;
-    const current = usageLimitSource.failedInput;
     const hint = errorTailUsageLimitRecovery ?? historyUsageLimitRecovery?.hint;
-    if (current?.operationId !== input.operationId || current.queueItemId !== input.queueItemId || current.runId !== input.runId
-      || current.backendId !== input.backendId || current.targetId !== input.targetId || hint === undefined) return;
-    scheduleUsageLimitRecovery(usageLimitSource, hint, isOwnerCurrent);
+    if (!canRecover || !sameInput || source === undefined || hint === undefined) return;
+    if (selection?.kind !== "runtimeChanged" && generation === session.generation) {
+      if (isBindingCurrent()) openUsageLimitScheduleDraft(source, hint, selection);
+    } else if (canRetry && session.generation > generation && timelineHistoryError === undefined) {
+      // A cold Pi attach requires a new read of the same durable Operation.
+      scheduleUsageLimitRecovery(source, hint, isOwnerCurrent);
+    }
   });
 
   const setCompactConfirmation = (value: typeof compactConfirmation): void => {

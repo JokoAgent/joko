@@ -51,17 +51,23 @@ describe("guest gateway operation recovery", () => {
       .mockResolvedValue({ events: [], generation: 1n, resyncRequired: false, resumeCursor: cursor(23n) } as never);
     f.allowSubmit(); await f.gateway.connect();
     await f.gateway.send("task", { text: "Guest input", deliveryMode: "prompt", attachments: [], mentions: [] }, { expectedGeneration: 1n });
+    const submit = vi.mocked(f.api.invoke).mock.calls.find(call => call[1] === TaskShareMethod.SUBMIT_OPERATION)!;
+    const traceparent = submit[4]!;
+    expect(traceparent).toMatch(/^00-[a-f0-9]{32}-[a-f0-9]{16}-00$/u);
+    const identity = { sessionId: "task", generation: 1n, operationId: f.journal.begin.mock.calls[0]![0],
+      trace: { traceId: traceparent.slice(3, 35), parentSpanId: traceparent.slice(36, 52) } };
     const author = { shareId: "share", shareGeneration: 2n, sessionId: "task", memberId: "member", memberGeneration: 3n, displayName: "Guest" };
     const live = create(EventSchema, { eventId: "live", identity: { sessionId: "task", generation: 1n }, cursor: { generation: 1n, sequence: 11n },
       payload: { kind: { case: "messageStarted", value: { messageId: "live-message", role: MessageRole.USER, userInputAccepted: true, sharedTaskAuthor: author, userInput: { parts: [{ content: { case: "text", value: "Guest input" } }] } } } } });
-    f.fresh.snapshot!.timeline = [create(EventSchema, { eventId: "canonical", identity: { sessionId: "task", generation: 1n }, cursor: { generation: 1n, sequence: 21n },
-      payload: { kind: { case: "messageStarted", value: { messageId: "native-user", nativeIdentity: { entryId: "native-user" }, role: MessageRole.USER, sharedTaskAuthor: author,
+    f.fresh.snapshot!.timeline = [create(EventSchema, { eventId: "canonical", identity, cursor: { generation: 1n, sequence: 21n },
+      payload: { kind: { case: "messageStarted", value: { messageId: "native-user", nativeIdentity: { entryId: "native-user" }, role: MessageRole.USER, userInputAccepted: true, sharedTaskAuthor: author,
         userInput: { parts: [{ content: { case: "text", value: "Guest input" } }] } } } } }),
       create(EventSchema, { eventId: "reply", identity: { sessionId: "task", generation: 1n }, cursor: { generation: 1n, sequence: 23n },
         payload: { kind: { case: "messageCompleted", value: { messageId: "native-reply", role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: "Host reply" } }] } } } })];
     f.fresh.snapshot!.resumeCursor = create(EventCursorSchema, { generation: 1n, sequence: 23n });
     publish({ events: [live], generation: 1n, resyncRequired: true, resumeCursor: cursor(23n) } as never);
-    await vi.waitFor(() => expect(seen.at(-1)?.timelineBySession.get("task")?.find(item => item.id === "native-user")).toMatchObject({ text: "Guest input", sharedTaskAuthor: author }));
+    await vi.waitFor(() => expect(seen.at(-1)?.timelineBySession.get("task")?.find(item => item.id === "native-user")).toMatchObject({
+      text: "Guest input", sharedTaskAuthor: author, localUserInput: true }));
     expect(seen.at(-1)?.timelineBySession.get("task")?.find(item => item.messageId === "native-reply" && item.kind === "assistant")?.text).toBe("Host reply");
     expect(seen.some(snapshot => snapshot.timelineBySession.get("task")?.some(item => item.messageId === "live-message"))).toBe(false);
     expect(vi.mocked(f.api.invoke).mock.calls.filter(call => call[1] === TaskShareMethod.SUBMIT_OPERATION)).toHaveLength(1);

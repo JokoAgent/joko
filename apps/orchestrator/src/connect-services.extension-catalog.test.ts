@@ -185,27 +185,53 @@ describe("Connect Extension catalog boundary", () => {
 
   it("keeps a native directory choice in its original operation and returns the same typed receipt after a cold service read", async () => {
     let entry = extensionEntry();
-    const operations = new Map<string, OperationRecord<unknown>>();
-    const store = { findOperation: (id: string) => operations.get(id), getOperation: (id: string) => operations.get(id) };
+    const root = await mkdtemp(join(tmpdir(), "joko-picked-receipt-"));
+    const path = join(root, "store.db");
+    let store = new OperationalStore(path);
+    let host = new SessionHost(store, {} as never, []);
     const pick = vi.fn(async () => ({ token: "original-directory-receipt", fileCount: 1, totalBytes: 12, relativePaths: ["report.txt"], expiresAt: Date.now() + 600_000 }));
-    const application = stubApplication({ store, connections: { authenticate: () => connection, fence: vi.fn() },
-      extensionCatalog: { get: () => entry, reconcile: () => catalog(entry) }, extensionDirectoryPicker: { pick }, sessionHost: replayingHost(store, operations) });
-    const services = createConnectServices(application);
+    const tokenForSelection = vi.fn((): string | undefined => "original-directory-receipt");
+    const services = () => createConnectServices(stubApplication({ store, connections: new ConnectionManager(store),
+      extensionCatalog: { get: () => entry, reconcile: () => catalog(entry) }, extensionDirectoryPicker: { pick, tokenForSelection }, sessionHost: host }));
     const mutation = create(contract.OperationMutationSchema, { payload: { case: "pickExtensionDirectory", value: {
       extensionId: entry.id, expectedRevision: { value: entry.revision }, pickerId: "original-picker", entryId: "opaque-selection"
     } } });
     const request = { operationId: "original-native-pick", connectionId: connection.id, mutation };
-    const first = await invoke<contract.SubmitOperationResponse>(services.operation.submitOperation, request);
-    expect(first.operation?.result?.payload).toMatchObject({ case: "pickedDirectory", value: { token: "original-directory-receipt", fileCount: 1, totalBytes: 12n, relativePaths: ["report.txt"] } });
-    expect(pick).toHaveBeenCalledOnce();
-    const cold = createConnectServices(application);
-    const recovered = await invoke<contract.GetOperationResponse>(cold.operation.getOperation, { operationId: request.operationId });
-    expect(recovered.operation?.result?.payload).toEqual(first.operation?.result?.payload);
-    entry = { ...entry, revision: entry.revision + 1n, enabled: false };
-    const replayed = await invoke<contract.SubmitOperationResponse>(cold.operation.submitOperation, request);
-    expect(replayed.operation?.result?.payload).toEqual(first.operation?.result?.payload); expect(pick).toHaveBeenCalledOnce();
-    await expect(invoke(cold.operation.submitOperation, { ...request, operationId: "another-selection" })).rejects.toMatchObject({ code: Code.Aborted });
-    expect(pick).toHaveBeenCalledOnce();
+    try {
+      store.createConnection({ id: connection.id, name: connection.name, authKeyDigest: digestAuthKey("extension-test") });
+      store.createConnection({ id: "observer", name: "Observer", authKeyDigest: digestAuthKey("observer-key") });
+      const warm = services().operation;
+      const first = await invoke<contract.SubmitOperationResponse>(warm.submitOperation, request);
+      expect(first.operation?.result?.payload).toMatchObject({ case: "pickedDirectory", value: { token: "original-directory-receipt", fileCount: 1, totalBytes: 12n, relativePaths: ["report.txt"] } });
+      expect(store.getOperation(request.operationId).response).toMatchObject({ pickedDirectory: { token: "[REDACTED]" } });
+      expect(tokenForSelection).toHaveBeenCalledOnce();
+      tokenForSelection.mockClear();
+      const lookup = { operationId: request.operationId };
+      const foreign = await invoke<contract.GetOperationResponse>(warm.getOperation, lookup, context({ authorization: "Bearer observer-key" }));
+      expect(foreign.operation?.result?.payload).toMatchObject({ case: "pickedDirectory", value: { token: "" } });
+      expect(tokenForSelection).not.toHaveBeenCalled();
+      await host.dispose();
+      store.close();
+      store = new OperationalStore(path);
+      host = new SessionHost(store, {} as never, []);
+      const cold = services().operation;
+      const recovered = await invoke<contract.GetOperationResponse>(cold.getOperation, lookup);
+      expect(recovered.operation?.mutation).toEqual(first.operation?.mutation);
+      expect(recovered.operation?.result).toEqual(first.operation?.result);
+      expect(tokenForSelection).toHaveBeenCalledWith(entry.id, "original-picker");
+      const replayed = await invoke<contract.SubmitOperationResponse>(cold.submitOperation, request);
+      expect(replayed.operation?.result).toEqual(first.operation?.result);
+      tokenForSelection.mockReturnValue(undefined);
+      entry = { ...entry, revision: entry.revision + 1n, enabled: false };
+      const retired = await invoke<contract.GetOperationResponse>(cold.getOperation, lookup);
+      expect(retired.operation?.result?.payload).toMatchObject({ case: "pickedDirectory", value: { token: "", relativePaths: ["report.txt"] } });
+      await expect(invoke(cold.submitOperation, { ...request, operationId: "another-selection" })).rejects.toMatchObject({ code: Code.Aborted });
+      expect(pick).toHaveBeenCalledOnce();
+    } finally {
+      await host.dispose();
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
   });
   it("maps a filtered runtime-backed catalog and preserves its owner and revision identity", async () => {
     const base = extensionEntry({

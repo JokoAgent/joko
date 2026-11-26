@@ -4,6 +4,7 @@ import * as contract from "@joko/contracts";
 import type { ConnectionManager } from "./connection-manager.js";
 import type { TaskSharingHost, TaskShareLease } from "./task-sharing-host.js";
 import type { TaskSharingHome, TaskSharingHomeAuthority } from "./task-sharing-home.js";
+import { inputTraceparent } from "./input-trace.js";
 
 /** Ordinary paired-node ownership never becomes a foreign guest credential. */
 export function createTaskSharingConnectService(options: { readonly host: TaskSharingHost; readonly home: TaskSharingHome;
@@ -53,7 +54,7 @@ export function createTaskSharingConnectService(options: { readonly host: TaskSh
     readJoinedTaskEvents: (request, context) => authenticated(context, async auth => create(contract.ReadJoinedTaskEventsResponseSchema,
       { batch: await home.events(identity(request.joinId), request.after, request.limit || 200, auth) })),
     invokeJoinedTask: (request, context) => authenticated(context, async auth => create(contract.InvokeJoinedTaskResponseSchema,
-      { responseBytes: await home.invoke(identity(request.joinId), request.method, request.requestBytes, auth) })),
+      { responseBytes: await home.invoke(identity(request.joinId), request.method, request.requestBytes, auth, inputTraceparent(context.requestHeader.get("traceparent"))) })),
     transferJoinedTaskAttachment: (request, context) => authenticated(context, async auth => create(contract.TransferJoinedTaskAttachmentResponseSchema,
       { result: await home.transfer(identity(request.joinId), request.transfer, auth) }))
   };
@@ -91,7 +92,7 @@ export function createTaskSharingGuestConnectService(host: TaskSharingHost): Ser
     readSharedTaskEvents: (request, context) => guest(context, scope(request.scope), (lease, signal) =>
       create(contract.ReadSharedTaskEventsResponseSchema, { batch: host.readEvents(lease, request.after, request.limit || 200, signal) })),
     invokeSharedTask: (request, context) => guest(context, scope(request.scope), async (lease, signal) =>
-      create(contract.InvokeSharedTaskResponseSchema, { responseBytes: await host.invoke(lease, request.method, request.requestBytes, signal) })),
+      create(contract.InvokeSharedTaskResponseSchema, { responseBytes: await host.invoke(lease, request.method, request.requestBytes, signal, inputTraceparent(context.requestHeader.get("traceparent"))) })),
     leaveSharedTask: (request, context) => guest(context, scope(request.scope), lease =>
       create(contract.LeaveSharedTaskResponseSchema, host.leave(lease, identity(request.operationId))), true),
     getSharedTaskLeaveReceipt: (request, context) => {

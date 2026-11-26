@@ -38,10 +38,14 @@ export class ExtensionDirectoryPicker {
   #active?: Picker;
   readonly #lastAttempt = new Map<string, number>();
   constructor(private readonly options: {
-    readonly runtime: Pick<ExtensionCardRuntime, "captureDirectorySelection" | "preparePickedDirectory">;
+    readonly runtime: Pick<ExtensionCardRuntime, "captureDirectorySelection" | "preparePickedDirectory" | "pickedDirectoryToken">;
     readonly roots?: () => readonly string[]; readonly now?: () => number;
   }) {}
   #now() { return this.options.now?.() ?? Date.now(); }
+  tokenForSelection(extensionId: string, pickerId: string): string | undefined {
+    try { return this.options.runtime.pickedDirectoryToken(extensionId, pickerId); }
+    catch { return undefined; } // The original installation may have retired.
+  }
   #assert(picker: Picker) {
     if (this.#active !== picker || picker.lifetime.signal.aborted || picker.expiresAt <= this.#now()) throw new Error("Directory selection expired or closed.");
     picker.assertOwner(); picker.assertRuntime();

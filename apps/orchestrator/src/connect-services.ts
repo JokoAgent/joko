@@ -9,6 +9,7 @@ import { readWorkerWorkspaceBinding } from "./collaboration-worker-workspace.js"
 import { createServerAccessConnectService } from './server-access-connect-service.js';
 import { TaskShareStore } from "@joko/store";
 import { taskShareEventAuthor } from "./task-sharing-author.js";
+import { acceptedInputTrace, inputTraceparent } from "./input-trace.js";
 import { TaskSharingHost } from "./task-sharing-host.js";
 import { TaskSharingReads } from "./task-sharing-reads.js";
 import { createTaskSharingRuntime } from "./task-sharing-runtime.js";
@@ -45,7 +46,7 @@ import { workspaceMediaTypeForPath as mediaTypeForPath } from "./workspace-file-
 import { listProjectDirectories } from "./project-directory-browser.js";
 import type { ExtensionProjectPolicies, ExtensionProject } from "./extension-project-policy.js";
 import { inspectRemoteHostDirectory, validateRemoteHostDirectoryPath } from "./remote-host-directory-browser.js";
-import { create as createProtoMessage, equals, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { create as createProtoMessage, equals, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { Code, ConnectError, type ConnectRouter, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
 import { issueAuthorizedIrohRelayInvitation } from "./linkspan-iroh-lease.js";
 import {
@@ -1075,6 +1076,7 @@ function jokoConnectCode(error: import("@joko/core").PublicError): Code {
 
 interface OperationOutcome {
   readonly accepted: boolean;
+  readonly inputTraceparent?: string;
   readonly pickedDirectory?: PickedExtensionDirectory;
   readonly resultCase?: contract.OperationResult["payload"]["case"];
   readonly entityId?: string;
@@ -1569,8 +1571,6 @@ export function createConnectServices(application: OrchestratorApplication, proj
       }
     });
   }
-  const operationMutations = new Map<string, contract.OperationMutation>();
-  const operationOutcomes = new Map<string, OperationOutcome>();
   const extensionSurfaceRevocations = new Map<string, () => void>();
 
   const authenticate = (context: HandlerContext): ConnectionRecord => requireAuthentication(dependencies, context);
@@ -2159,6 +2159,17 @@ export function createConnectServices(application: OrchestratorApplication, proj
     }
   } satisfies ServiceImpl<typeof contract.TaskActivityService>;
 
+  const storedOperation = (record: OperationRecord<unknown>, readerId: string, mutation = mutationFromRecord(dependencies.store, record)) => {
+    const outcome = outcomeFromRecord(record);
+    if (outcome.pickedDirectory && mutation.payload.case === "pickExtensionDirectory") {
+      // SQLite retains the selection metadata. Only the original picker can
+      // recover a still-live file deposit for the connection that chose it.
+      const { extensionId, pickerId } = mutation.payload.value;
+      const token = record.connectionId === readerId ? dependencies.extensionDirectoryPicker?.tokenForSelection(extensionId, pickerId) : undefined;
+      return toProtoOperation(dependencies, record, mutation, { ...outcome, pickedDirectory: { ...outcome.pickedDirectory, token: token ?? "" } }, now());
+    }
+    return toProtoOperation(dependencies, record, mutation, outcome, now());
+  };
   const operation = {
     submitOperation: async (request, context) => {
       const authenticated = authenticate(context);
@@ -2172,36 +2183,35 @@ export function createConnectServices(application: OrchestratorApplication, proj
       const publicMutation = publicOperationMutation(request.mutation);
       const privateBody = privateBrowserOperationBody(request.mutation, publicMutation, request.operationId,
         context.requestHeader.get("authorization") ?? undefined);
-      const existing = dependencies.store.findOperation(request.operationId);
-      if (existing !== undefined) {
-        if (existing.connectionId !== authenticated.id) {
+      const mutation = request.mutation;
+      const checkReplay = (record: OperationRecord<unknown>) => {
+        if (record.connectionId !== authenticated.id) {
           throw new AuthorizationError("The operation belongs to a different connection.");
         }
         // Legacy operations use their original hash. New private fields stay
         // bound to the exact input without adding it to the public receipt.
-        const existingBody = asRecord(existing.body);
+        const existingBody = asRecord(record.body);
         const presentedBody = privateBody !== undefined && (Object.hasOwn(existingBody, "browserKeyboardFingerprint")
           || Object.hasOwn(existingBody, "browserNavigationFingerprint"))
-          ? privateBody : durableOperationBody(authenticated, request.mutation);
+          ? privateBody : durableOperationBody(authenticated, mutation);
         const presentedHash = operationBodyHash(presentedBody);
-        if (existing.bodyHash !== presentedHash) {
-          throw new OperationConflictError(request.operationId, existing.bodyHash, presentedHash);
+        if (record.bodyHash !== presentedHash) {
+          throw new OperationConflictError(request.operationId, record.bodyHash, presentedHash);
         }
+      };
+      const existing = dependencies.store.findOperation(request.operationId);
+      if (existing !== undefined) {
+        checkReplay(existing);
         if (existing.status === "started" && request.mutation.payload.case === "consumeProviderAccountReset" && dependencies.providerAccountResets) {
           const resumed = await consumeProviderAccountResetOperation(dependencies, request.operationId, stableConnection(authenticated), request.mutation, existing);
-          operationMutations.set(existing.id, publicMutation); operationOutcomes.set(existing.id, resumed.outcome);
           return { operation: toProtoOperation(dependencies, resumed.record, publicMutation, resumed.outcome, now()) };
         }
-        const existingOutcome = operationOutcomes.get(existing.id) ?? outcomeFromRecord(existing);
-        operationMutations.set(existing.id, publicMutation);
-        if (existing.status !== "started") operationOutcomes.set(existing.id, existingOutcome);
-        return {
-          operation: toProtoOperation(dependencies, existing, publicMutation, existingOutcome, now())
-        };
+        return { operation: storedOperation(existing, authenticated.id, publicMutation) };
       }
       let presented: PresentedOperation;
       try {
-        presented = await dispatchMutation(dependencies, request.operationId, stableConnection(authenticated), request.mutation, privateBody);
+        presented = await dispatchMutation(dependencies, request.operationId, stableConnection(authenticated), request.mutation, privateBody,
+          inputTraceparent(context.requestHeader.get("traceparent")));
       } catch (error) {
         if (
           !(error instanceof OperationPreviouslyFailedError)
@@ -2209,35 +2219,21 @@ export function createConnectServices(application: OrchestratorApplication, proj
         ) throw error;
         if (error.operationId !== request.operationId) throw error;
         const current = dependencies.store.getOperation(request.operationId);
-        if (current.connectionId !== authenticated.id) {
-          throw new AuthorizationError("The operation belongs to a different connection.");
-        }
-        const currentOutcome = outcomeFromRecord(current);
-        operationMutations.set(current.id, publicMutation);
-        if (current.status !== "started") operationOutcomes.set(current.id, currentOutcome);
-        return {
-          operation: toProtoOperation(dependencies, current, publicMutation, currentOutcome, now())
-        };
+        checkReplay(current);
+        return { operation: storedOperation(current, authenticated.id, publicMutation) };
       }
-      operationMutations.set(request.operationId, publicMutation);
-      operationOutcomes.set(request.operationId, presented.outcome);
+      if (mutation.payload.case === "pickExtensionDirectory") {
+        return { operation: storedOperation(presented.record, authenticated.id, publicMutation) };
+      }
       return { operation: toProtoOperation(dependencies, presented.record, publicMutation, presented.outcome, now()) };
     },
     getOperation: (request, context) => {
-      authenticate(context);
+      const authenticated = authenticate(context);
       const record = dependencies.store.getOperation(request.operationId);
-      return {
-        operation: toProtoOperation(
-          dependencies,
-          record,
-          operationMutations.get(record.id) ?? mutationFromRecord(dependencies.store, record),
-          operationOutcomes.get(record.id) ?? outcomeFromRecord(record),
-          now()
-        )
-      };
+      return { operation: storedOperation(record, authenticated.id) };
     },
     listOperations: (request, context) => {
-      authenticate(context);
+      const authenticated = authenticate(context);
       const status = operationRecordStatus(request.state);
       const window = storePageWindow(request.page);
       const query = {
@@ -2248,13 +2244,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
         offset: window.offset
       };
       const records = dependencies.store.listOperations(query);
-      const values = records.map((record) => toProtoOperation(
-        dependencies,
-        record,
-        operationMutations.get(record.id) ?? mutationFromRecord(dependencies.store, record),
-        operationOutcomes.get(record.id) ?? outcomeFromRecord(record),
-        now()
-      ));
+      const values = records.map(record => storedOperation(record, authenticated.id));
       const result = storePage(values, dependencies.store.countOperations(query), window);
       return { operations: result.values, page: result.page };
     },
@@ -2277,15 +2267,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
         const record = dependencies.store.getOperation(request.operationId);
         if (record.revision > observedRevision) {
           dependencies.connections.fence(authenticated);
-          yield {
-            operation: toProtoOperation(
-              dependencies,
-              record,
-              operationMutations.get(record.id) ?? mutationFromRecord(dependencies.store, record),
-              operationOutcomes.get(record.id) ?? outcomeFromRecord(record),
-              now()
-            )
-          };
+          yield { operation: storedOperation(record, authenticated.id) };
           observedRevision = record.revision;
         }
         // Store operations are atomically committed. Terminal records need no open stream.
@@ -2295,15 +2277,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
           const current = dependencies.store.getOperation(request.operationId);
           if (current.revision <= observedRevision) continue;
           dependencies.connections.fence(authenticated);
-          yield {
-            operation: toProtoOperation(
-              dependencies,
-              current,
-              operationMutations.get(current.id) ?? mutationFromRecord(dependencies.store, current),
-              operationOutcomes.get(current.id) ?? outcomeFromRecord(current),
-              now()
-            )
-          };
+          yield { operation: storedOperation(current, authenticated.id) };
           observedRevision = current.revision;
           if (current.status !== "started") return;
         }
@@ -7636,10 +7610,11 @@ export function mutationFromRecord(store: OperationalStore, record: OperationRec
   const body = asRecord(record.body);
   const storedPayload = asRecord(body["payload"]);
   if (typeof storedPayload["case"] === "string") {
-    return create(contract.OperationMutationSchema, {
-      preconditions: restoreOperationPreconditions(body["preconditions"]),
-      payload: storedPayload as unknown as contract.OperationMutation["payload"]
-    });
+    // SQLite stores sanitized JS message fields, with decimal strings for
+    // int64s. Let the v1 schema restore defaults, nested oneofs and bigint types.
+    const init = storedMessageInit(body) as MessageInitShape<typeof contract.OperationMutationSchema>;
+    const mutation = createProtoMessage(contract.OperationMutationSchema, init);
+    return fromBinary(contract.OperationMutationSchema, toBinary(contract.OperationMutationSchema, mutation));
   }
   const empty = (): contract.OperationMutation => create(contract.OperationMutationSchema, { preconditions: [], payload: { case: undefined } });
   if (record.kind === "createDevicePeerTarget" && body["version"] === 1
@@ -7735,6 +7710,16 @@ export function mutationFromRecord(store: OperationalStore, record: OperationRec
     }
   }
   return empty();
+}
+
+function storedMessageInit(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(storedMessageInit);
+  if (value === null || typeof value !== "object") return value;
+  // A retained $typeName would make protobuf treat a plain JSON object as an
+  // initialized message. Unknown wire bytes are not part of the stored v1 body.
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key, field]) => key !== "$typeName" && key !== "$unknown" && field != null)
+    .map(([key, field]) => [key, storedMessageInit(field)]));
 }
 
 function restoreOperationPreconditions(value: unknown): contract.OperationPrecondition[] {
@@ -8234,6 +8219,7 @@ function eventContext(
     ...(session?.descriptor.derivationOrigin?.sideChat === true && !sideChatHistoryEventVisible(session.descriptor, item,
       readSideChatHistoryBoundary(store, session.descriptor)) ? { hideSideChatHistoryPrefix: true as const } : {}),
     sharedTaskAuthor: dependencies.taskShares === undefined ? undefined : taskShareEventAuthor(store, item),
+    inputTrace: acceptedInputTrace(store, item),
     ...(item.payload.type !== "message_complete" || item.payload.role !== "assistant" ? {} : {
       learning: store.getPartnerLearningFeedback(item.id)
     }),
@@ -17051,7 +17037,8 @@ async function dispatchMutation(
   operationId: string,
   connection: ConnectionRecord,
   mutation: contract.OperationMutation,
-  privateBody?: unknown
+  privateBody?: unknown,
+  inputTraceparent?: string
 ): Promise<PresentedOperation> {
   const host = withOperationPreconditions(dependencies.sessionHost as ExtendedSessionHost, mutation, privateBody);
   dependencies = { ...dependencies, sessionHost: host };
@@ -18916,7 +18903,7 @@ async function dispatchMutation(
         return finish(await host.navigateTree(payload.value.sessionId, target, false, undefined, Number(generation), {
           connection, operationId,
           sourceMessage: { messageId, eventId, requireLatestUser: true },
-          editedInput: { prompt, ...(overrides === undefined ? {} : { overrides }) },
+          editedInput: { prompt, ...(overrides === undefined ? {} : { overrides }), inputTraceparent },
           protocol: { kind: "connect", body: mutation, precondition: store => validatePreconditions(store, mutation) }
         }));
       }
@@ -18992,7 +18979,8 @@ async function dispatchMutation(
             ...(payload.value.providerGroupRebalance === undefined ? {} : { providerGroupRebalance: payload.value.providerGroupRebalance }),
             ...(overrides === undefined ? {} : { overrides })
           });
-          return { accepted: true, resultCase: "queueItem", entityId: queued.queueItemId } satisfies OperationOutcome;
+          return { accepted: true, resultCase: "queueItem", entityId: queued.queueItemId,
+            ...(inputTraceparent === undefined ? {} : { inputTraceparent }) } satisfies OperationOutcome;
         }
       }).catch((error: unknown): OperationExecution<OperationOutcome> => {
         if (!(error instanceof JokoError)) throw error;

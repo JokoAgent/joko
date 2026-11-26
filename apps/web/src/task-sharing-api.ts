@@ -11,7 +11,8 @@ import { canOpenJoinedTask } from "./task-sharing.js";
 export function createWebTaskSharingApi(transport: Transport, lifetime: AbortSignal, current: () => boolean): TaskSharingApi {
   const client = createClient(TaskSharingService, transport);
   const rpc = Object.fromEntries(Object.entries(client).map(([key, method]) => [key,
-    (request: never, options: { readonly signal: AbortSignal }) => method(request, {
+    (request: never, options: { readonly signal: AbortSignal; readonly headers?: Record<string, string> }) => method(request, {
+      ...options,
       signal: AbortSignal.any([lifetime, options.signal])
     })
   ])) as TaskSharingRpc;
@@ -39,11 +40,12 @@ export function createJoinedTaskPort(api: TaskSharingApi, joined: JoinedTaskShar
     return snapshot;
   };
   const transport: Transport = {
-    async unary(method, signal, _timeout, _headers, input) {
+    async unary(method, signal, _timeout, headers, input) {
       const entry = Object.entries(TASK_SHARE_METHODS).find(([, descriptor]) =>
         descriptor.parent.typeName === method.parent.typeName && descriptor.name === method.name);
       if (!entry) throw new ConnectError("This action is unavailable for a shared task.", Code.PermissionDenied);
-      const message = await api.invoke(joined.joinId, Number(entry[0]) as TaskShareCallableMethod, input as never, signalFor(signal));
+      const message = await api.invoke(joined.joinId, Number(entry[0]) as TaskShareCallableMethod, input as never, signalFor(signal),
+        new Headers(headers).get("traceparent") ?? undefined);
       if ([TaskShareMethod.SUBMIT_OPERATION, TaskShareMethod.GET_OPERATION].includes(Number(entry[0]))) {
         const operation = (message as { readonly operation?: Operation }).operation;
         const expectedId = (input as { readonly operationId?: string }).operationId;
@@ -61,6 +63,8 @@ export function createJoinedTaskPort(api: TaskSharingApi, joined: JoinedTaskShar
   };
   return {
     operations,
+    isInputAuthor: author => author.shareId === share.shareId && author.shareGeneration === share.shareGeneration
+      && author.sessionId === share.sessionId && author.memberId === member.memberId && author.memberGeneration === member.memberGeneration,
     scopeKey: JSON.stringify([joined.joinId, share.hostServerId, share.shareId, share.shareGeneration.toString(), share.sessionId, member.memberId, member.memberGeneration.toString()]),
     transport,
     async snapshot(signal) {
