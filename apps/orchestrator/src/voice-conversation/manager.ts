@@ -11,16 +11,20 @@ import { SpeechModelCatalog, type SpeechSelection } from './models.js';
 import { SpeechSynthesisSession, type SpeechStartResult } from './speech.js';
 import { loadSpeechVoices } from './voices.js';
 import { classifyVoiceExit } from './semantic-exit.js';
+import { RealtimeVoiceSession, realtimeDial, type RealtimeDial } from './realtime-session.js';
+import { isRealtimeProtocol } from './realtime-protocol.js';
 
 const SCOPE = 'desktop.voice-conversation.v1';
 const CALL_SCOPE = 'runtime.desktop-voice-call:';
-interface Preference { readonly conversation?: SpeechSelection; readonly playback?: SpeechSelection; readonly sentencePlayback: boolean; readonly revision: number; }
-interface SavedCall { readonly format: 1; readonly sessionId: string; readonly generation: number; readonly kind: 'conversation' | 'playback'; readonly record: VoiceCallRecord; }
+interface Preference { readonly conversation?: SpeechSelection; readonly playback?: SpeechSelection; readonly realtime?: SpeechSelection; readonly sentencePlayback: boolean; readonly revision: number; }
+interface SavedCall { readonly format: 1; readonly sessionId: string; readonly generation: number; readonly kind: 'conversation' | 'playback' | 'realtime'; readonly record: VoiceCallRecord; }
 export interface DesktopVoiceAuthority { readonly connection: ConnectionRecord; readonly assertCurrent: () => void; }
 interface Call {
   readonly id: string; readonly operationId: string; readonly owner: string; readonly sessionId: string; readonly generation: number;
   readonly kind: SavedCall['kind']; readonly context: VoiceCallContext; readonly selection: SpeechSelection;
-  readonly authority: DesktopVoiceAuthority; readonly speech: SpeechSynthesisSession;
+  readonly authority: DesktopVoiceAuthority; readonly speech?: SpeechSynthesisSession;
+  realtime?: RealtimeVoiceSession;
+  opening?: Promise<void>;
   readonly assertCurrent: () => void; readonly speechIds: Map<string, string>;
   readonly dispatches: Map<string, { runId: string; queueItemId: string; cursor: bigint; text: string }>;
   readonly reads: Map<string, contract.ControlDesktopVoiceConversationResponse>;
@@ -39,7 +43,7 @@ export class DesktopVoiceConversationManager {
     readonly models: SpeechModelCatalog; readonly infer: (backendId: string, input: NativeTextInferenceInput) => Promise<string>;
     readonly companion: (sessionId: string) => { readonly identity: string; readonly token: string };
     readonly dictationActive?: (connectionId: string) => boolean;
-    readonly fetch: typeof fetch; readonly now?: () => number }) {
+    readonly fetch: typeof fetch; readonly dial?: RealtimeDial; readonly now?: () => number }) {
     // Recovered calls have no live mic/model owner. End their exact records;
     // accepted task work retains its independent Queue ownership.
     for (const value of options.store.listSettings().filter(value => value.scopeType === 'session' && value.key.startsWith(CALL_SCOPE))) {
@@ -53,6 +57,7 @@ export class DesktopVoiceConversationManager {
       if (!call) return;
       try {
         call.assertCurrent();
+        if (!call.opening) call.realtime?.check();
         if (call.touchedAt + 60_000 < this.#now()) { this.#end(call); return; }
         this.#collectResults(call);
       } catch { this.#end(call); }
@@ -69,8 +74,11 @@ export class DesktopVoiceConversationManager {
     const owner = JSON.stringify([authority.connection.id, request.windowId]);
     const action = request.action;
     if (action === contract.DesktopVoiceConversationAction.SNAPSHOT) {
-      const own = this.#call?.owner === owner && this.#call.sessionId === request.sessionId && (!request.callId || request.callId === this.#call.id) ? this.#call : undefined;
-      if (own) { own.assertCurrent(); own.touchedAt = this.#now(); this.#collectResults(own); }
+      let own = this.#call?.owner === owner && this.#call.sessionId === request.sessionId && (!request.callId || request.callId === this.#call.id) ? this.#call : undefined;
+      if (own) {
+        try { own.assertCurrent(); } catch { this.#end(own); own = undefined; authority.assertCurrent(); }
+        if (own) { own.touchedAt = this.#now(); this.#collectResults(own); }
+      }
       const saved = !own && request.callId ? this.options.store.findSetting<SavedCall>('session', request.sessionId, `${CALL_SCOPE}${identity(request.callId, 64)}`)?.value : undefined;
       return this.#snapshot(request.sessionId, generation, own, saved?.format === 1 && saved.record.endedAt !== undefined ? saved : undefined);
     }
@@ -78,9 +86,11 @@ export class DesktopVoiceConversationManager {
       const incoming = request.preference; if (!incoming) throw invalid();
       const previous = this.#preference(request.sessionId);
       const preference: Preference = { ...(incoming.conversation ? { conversation: selection(incoming.conversation) } : {}),
+        ...(incoming.realtime ? { realtime: selection(incoming.realtime) } : {}),
         ...(incoming.playback ? { playback: selection(incoming.playback) } : {}), sentencePlayback: incoming.sentencePlayback, revision: previous.revision + 1 };
       if (preference.conversation) this.options.models.resolve(preference.conversation);
       if (preference.playback) this.options.models.resolve(preference.playback);
+      if (preference.realtime) this.options.models.resolveRealtime(preference.realtime);
       this.options.store.runAuthorizedOperation(authority.connection.id, authority.connection.authKeyDigest,
         { id: identity(request.operationId), kind: 'desktop_voice_preference', body: { sessionId: request.sessionId, expectedRevision: incoming.revision.toString(), preference: { ...preference, revision: 0 } } }, () => {
           authority.assertCurrent();
@@ -107,12 +117,15 @@ export class DesktopVoiceConversationManager {
       if (previous?.id === callId) {
         if (previous.owner !== owner || previous.sessionId !== session.id || previous.generation !== generation || previous.operationId !== request.operationId
           || (previous.kind === 'playback') !== request.playbackOnly || JSON.stringify(previous.selection) !== JSON.stringify(chosen)) throw invalid();
-        previous.assertCurrent(); return this.#snapshot(session.id, generation, previous);
+        await previous.opening; previous.assertCurrent(); return this.#snapshot(session.id, generation, previous);
       }
       if (previous) throw new ConnectError('Another call or speech preview owns audio.', Code.ResourceExhausted);
       if (this.options.dictationActive?.(authority.connection.id)) throw new ConnectError('Dictation already owns audio.', Code.ResourceExhausted);
       if (this.options.store.findSetting('session', session.id, `${CALL_SCOPE}${callId}`)) throw new ConnectError('This call already ended. Start a new call explicitly.', Code.FailedPrecondition);
-      const binding = this.options.models.resolve(chosen);
+      const duplex = isRealtimeProtocol(chosen.protocol);
+      if (duplex && request.playbackOnly) throw invalid();
+      const realtimeBinding = duplex ? this.options.models.resolveRealtime(chosen) : undefined;
+      const synthesis = duplex ? undefined : this.options.models.resolve(chosen);
       const backend = this.options.store.getBackend(session.backendId).descriptor;
       const providerId = session.providerId, modelId = session.modelId;
       if (!request.playbackOnly && (!providerId || !modelId || !backend.models.some(model => model.providerId === providerId && model.modelId === modelId))) throw unavailable();
@@ -124,7 +137,7 @@ export class DesktopVoiceConversationManager {
           || this.options.companion(session.id).token !== companion.token
           || !request.playbackOnly && (current.backendId !== session.backendId || current.providerId !== providerId || current.modelId !== modelId
             || this.options.store.getBackend(session.backendId).descriptor.instanceGeneration !== backend.instanceGeneration)) throw unavailable();
-        binding.assertCurrent();
+        (realtimeBinding ?? synthesis)!.assertCurrent();
       };
       const context: VoiceCallContext = new VoiceCallContext({ callId, identity: `${companion.identity}\n${session.appendSystemPrompt ?? ''}`.slice(0, 32_000), reference: this.#reference(session.id),
         generate: async (user, system, signal) => {
@@ -149,11 +162,11 @@ export class DesktopVoiceConversationManager {
           // end() also saves after the live lease has been retired.
           try { authority.assertCurrent(); } catch { return; }
           if (this.options.store.getSession(session.id).descriptor.binding.generation !== generation) return;
-          this.#save({ format: 1, sessionId: session.id, generation, kind: request.playbackOnly ? 'playback' : 'conversation', record });
+          this.#save({ format: 1, sessionId: session.id, generation, kind: call.kind, record });
         } });
-      call = { id: callId, operationId: request.operationId, owner, sessionId: session.id, generation, kind: request.playbackOnly ? 'playback' : 'conversation', context, selection: chosen,
-        authority, assertCurrent, touchedAt: this.#now(), speech: new SpeechSynthesisSession({ connection: () => binding.connection,
-          fetch: this.options.fetch, assertCurrent }), speechIds: new Map(), dispatches: new Map(), reads: new Map(), readIds: new Set(), inputs: new Map(), exitJudgments: new Map(),
+      call = { id: callId, operationId: request.operationId, owner, sessionId: session.id, generation, kind: request.playbackOnly ? 'playback' : duplex ? 'realtime' : 'conversation', context, selection: chosen,
+        authority, assertCurrent, touchedAt: this.#now(), ...(synthesis ? { speech: new SpeechSynthesisSession({ connection: () => synthesis.connection,
+          fetch: this.options.fetch, assertCurrent }) } : {}), speechIds: new Map(), dispatches: new Map(), reads: new Map(), readIds: new Set(), inputs: new Map(), exitJudgments: new Map(),
         inferExit: text => {
           // No fallback to a native Agent, another model, or an auxiliary chain.
           const route = providerId && modelId ? this.options.models.routes.resolve({ backendId: session.backendId, providerId, modelId }) : undefined;
@@ -168,7 +181,20 @@ export class DesktopVoiceConversationManager {
         { id: identity(request.operationId), kind: 'desktop_voice_start', body: { callId, sessionId: session.id, generation, chosen, kind: call.kind } }, () => {
           authority.assertCurrent(); this.#save({ format: 1, sessionId: session.id, generation, kind: call.kind, record: context.record }); return true;
         });
-      this.#call = call; assertCurrent(); return this.#snapshot(session.id, generation, call);
+      this.#call = call;
+      try {
+        assertCurrent();
+        if (realtimeBinding) {
+          const instructions = ['Speak briefly in the user’s language as their companion. This call has no execution tools.',
+            companion.identity.slice(0, 8000), this.#reference(session.id)].join('\n');
+          call.realtime = new RealtimeVoiceSession(realtimeBinding.connection, chosen.voice, instructions, assertCurrent,
+            (id, role, text) => context.recordRealtimeTurn('voice-' + createHash('sha256').update(JSON.stringify([callId, role, id])).digest('hex'), role, text),
+            this.options.dial ?? realtimeDial());
+          call.opening = call.realtime.open();
+          await call.opening; delete call.opening; assertCurrent();
+        }
+        return this.#snapshot(session.id, generation, call);
+      } catch { this.#end(call); throw unavailable(); }
     }
     const call = this.#call;
     const ownerMatches = call !== undefined && call.owner === owner && call.id === request.callId && call.sessionId === session.id && call.generation === generation;
@@ -188,8 +214,16 @@ export class DesktopVoiceConversationManager {
       }
     }
     if (!call || !ownerMatches) throw unavailable();
-    call.assertCurrent(); call.touchedAt = this.#now();
+    try { call.assertCurrent(); } catch (error) { this.#end(call); throw error; }
+    call.touchedAt = this.#now();
     switch (action) {
+      case contract.DesktopVoiceConversationAction.REALTIME_INPUT:
+        if (!call.realtime) throw invalid();
+        call.realtime.input(request.audioSequence, request.microphonePcm);
+        return create(contract.ControlDesktopVoiceConversationResponseSchema, { accepted: true, audioSequence: request.audioSequence });
+      case contract.DesktopVoiceConversationAction.REALTIME_READ:
+        if (!call.realtime) throw invalid();
+        return create(contract.ControlDesktopVoiceConversationResponseSchema, await call.realtime.read(request.audioSequence));
       case contract.DesktopVoiceConversationAction.CLASSIFY_EXIT: {
         if (call.kind !== 'conversation') throw invalid();
         const inputId = identity(request.inputId, 128), text = bounded(request.text, 32_000);
@@ -219,10 +253,12 @@ export class DesktopVoiceConversationManager {
       case contract.DesktopVoiceConversationAction.PROMOTE:
         await call.context.promote(identity(request.inputId, 128)); call.assertCurrent(); return this.#snapshot(session.id, generation, call);
       case contract.DesktopVoiceConversationAction.INTERRUPT:
+        call.realtime?.interrupt(request.realtimePlayback, request.interruptThroughResponse);
         retireSpeech(call); call.context.interrupt(); return this.#snapshot(session.id, generation, call);
       case contract.DesktopVoiceConversationAction.END:
         this.#end(call); return this.#snapshot(session.id, generation);
       case contract.DesktopVoiceConversationAction.SPEAK: {
+        if (!call.speech) throw invalid();
         const id = identity(request.speechRequestId, 128), text = bounded(request.text, 32_000), digest = createHash('sha256').update(text).digest('hex');
         const previous = call.speechIds.get(id);
         if (previous && previous !== digest) throw new ConnectError('The original speech input changed.', Code.AlreadyExists);
@@ -250,6 +286,7 @@ export class DesktopVoiceConversationManager {
         }
       }
       case contract.DesktopVoiceConversationAction.READ_SPEECH: {
+        if (!call.speech) throw invalid();
         const speechId = identity(request.speechRequestId, 128), readId = identity(request.operationId);
         if (call.speechId !== speechId) throw unavailable();
         const previous = call.reads.get(readId);
@@ -281,13 +318,16 @@ export class DesktopVoiceConversationManager {
   #snapshot(sessionId: string, generation: number, call?: Call, selected?: SavedCall): contract.ControlDesktopVoiceConversationResponse {
     const preference = this.#preference(sessionId);
     const models = this.options.models.list();
+    const realtimeModels = this.options.models.realtimeModels();
+    const realtime = preference.realtime && realtimeModels.some(model => model.backendId === preference.realtime!.backendId && model.providerId === preference.realtime!.providerId
+      && model.modelId === preference.realtime!.modelId && (!model.protocol || model.protocol === preference.realtime!.protocol)) ? preference.realtime : undefined;
     const reconcile = (value: SpeechSelection | undefined) => contract.reconcileDesktopSpeechSelection(
       value === undefined ? undefined : create(contract.DesktopSpeechSelectionSchema, value), models);
     const history = this.options.store.listSettingsByKeyPrefix('session', sessionId, CALL_SCOPE).map(value => value.value as SavedCall)
       .filter(value => value.format === 1 && value.sessionId === sessionId).sort((a, b) => b.record.startedAt - a.record.startedAt).slice(0, 20);
     return create(contract.ControlDesktopVoiceConversationResponseSchema, { preference: { ...preference, conversation: reconcile(preference.conversation),
-      playback: reconcile(preference.playback), revision: BigInt(preference.revision) },
-      models, ...(call ? { call: publicRecord({ format: 1, sessionId, generation, kind: call.kind, record: call.context.record }) }
+      playback: reconcile(preference.playback), realtime, revision: BigInt(preference.revision) },
+      models, realtimeModels, ...(call ? { call: publicRecord({ format: 1, sessionId, generation, kind: call.kind, record: call.context.record }) }
         : selected ? { call: publicRecord(selected) } : {}),
       history: history.map(value => publicRecord({ ...value, record: { ...value.record, turns: [], handoffs: [] } })) });
   }
@@ -312,7 +352,7 @@ export class DesktopVoiceConversationManager {
   }
   #end(call: Call): void {
     if (this.#call !== call) return;
-    this.#call = undefined; retireSpeech(call); call.context.end();
+    this.#call = undefined; call.realtime?.close(); retireSpeech(call); call.context.end();
     this.#save({ format: 1, sessionId: call.sessionId, generation: call.generation, kind: call.kind, record: call.context.record });
   }
   #save(saved: SavedCall): void {
@@ -324,7 +364,7 @@ export class DesktopVoiceConversationManager {
   #now(): number { return this.options.now?.() ?? Date.now(); }
 }
 function retireSpeech(call: Call): void {
-  call.speech.cancel();
+  call.speech?.cancel();
   call.speechId = undefined;
   call.speechStart = undefined;
   call.reads.clear();

@@ -116,6 +116,7 @@ import { createHostedNativeTextInference } from "./hosted-native-text-inference.
 import { DesktopVoiceConversationManager } from "./voice-conversation/manager.js";
 import { SpeechModelCatalog } from "./voice-conversation/models.js";
 import { createSpeechFetch } from "./voice-conversation/fetch.js";
+import { realtimeDial } from "./voice-conversation/realtime-session.js";
 import { createHostedAgentCodexAdapter } from "./hosted-agent-codex-factory.js";
 import { createHostedAgentClaudeAdapter } from "./hosted-agent-claude-factory.js";
 import { policySnapshotFor } from "./policy-settings.js";
@@ -2211,6 +2212,10 @@ export async function createOrchestratorApplication(
       return { identity: `${profile.displayName}\n${profile.identitySource}`, token: JSON.stringify([profile.id, profile.revision.toString(), profile.homeTargetId, sessionId]) };
     },
     infer: createHostedNativeTextInference({ store, registry: backendInstances, routes: modelRoutes }),
+    dial: realtimeDial(async (url, signal) => {
+      const environment = environmentProxyForTarget(new URL(url), process.env);
+      return environment === undefined ? await dependencies.resolveOutboundProxy?.(url, { signal }) : environment;
+    }),
     fetch: createSpeechFetch(async (url, signal) => {
       const environment = environmentProxyForTarget(new URL(url), process.env);
       return environment === undefined ? await dependencies.resolveOutboundProxy?.(url, { signal }) : environment;

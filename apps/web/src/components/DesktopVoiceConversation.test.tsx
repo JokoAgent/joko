@@ -7,6 +7,7 @@ import { ControlDesktopVoiceConversationRequestSchema, ControlDesktopVoiceConver
 import { expect, it, vi } from 'vitest';
 import type { AppController } from '../controller.js';
 import type { SessionView } from '../model.js';
+import { WebAudioVoicePcmCapture } from '../voice-input-pcm.js';
 import { DesktopVoiceConversationPanel } from './DesktopVoiceConversation.js';
 
 it('keeps the original save operation after a lost reply and restores focus when its owning panel closes', async () => {
@@ -45,6 +46,88 @@ it('keeps the original save operation after a lost reply and restores focus when
   } finally {
     await act(async () => root.unmount()); container.remove(); trigger.remove();
     if (before) Object.defineProperty(window, 'jokoDesktop', before); else delete (window as { jokoDesktop?: unknown }).jokoDesktop;
+  }
+});
+
+it.each(['button', 'speech start'])('reports audible PCM on %s interruption and releases the original two-way call on window loss', async trigger => {
+  (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  const desktop = Object.getOwnPropertyDescriptor(window, 'jokoDesktop');
+  const devices = Object.getOwnPropertyDescriptor(navigator, 'mediaDevices');
+  const track = { enabled: true, addEventListener: vi.fn(), stop: vi.fn() };
+  const stream = { getTracks: () => [track], getAudioTracks: () => [track] };
+  const getUserMedia = vi.fn(async () => stream);
+  Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia } });
+  const decoded = new Float32Array(2400), pcm = new Uint8Array(4800);
+  pcm.set([0, 64]);
+  let audioTime = 0;
+  const allocateBuffer = vi.fn((_channels: number, length: number, rate: number) =>
+    ({ duration: length / rate, getChannelData: () => decoded }));
+  const output = { start: vi.fn(), stop: vi.fn(), connect: vi.fn(), disconnect: vi.fn() };
+  vi.stubGlobal('AudioContext', class {
+    state = 'running'; get currentTime() { return audioTime; } destination = {};
+    createBuffer = allocateBuffer;
+    createBufferSource() { return output; }
+    async resume() {}
+    async close() {}
+  });
+  const capture = vi.spyOn(WebAudioVoicePcmCapture.prototype, 'start').mockImplementation(async (_stream, publish) => {
+    publish({ audio: Uint8Array.of(42, 0), voiced: true, durationMs: 1 });
+  });
+  const selection = { backendId: 'pi', providerId: 'my-key', modelId: 'gpt-realtime', protocol: 'openai-realtime', voice: 'marin' };
+  const preference = create(DesktopVoiceConversationPreferenceSchema, { realtime: selection, revision: 1n });
+  const requests: ControlDesktopVoiceConversationRequest[] = [];
+  let callId = '', release = () => {}, finishRead = () => {};
+  const detach = vi.fn();
+  Object.defineProperty(window, 'jokoDesktop', { configurable: true, value: {
+    microphone: { onRelease: (listener: () => void) => { release = listener; return detach; } },
+    voiceConversation: { control: async (node: string, bytes: Uint8Array) => {
+      expect(node).toBe('original');
+      const request = fromBinary(ControlDesktopVoiceConversationRequestSchema, bytes); requests.push(request);
+      if (request.action === Action.START) callId = request.callId;
+      if (request.action === Action.END) { callId = ''; finishRead(); }
+      const firstAudio = request.action === Action.REALTIME_READ && request.audioSequence === 1n;
+      if (request.action === Action.REALTIME_READ && !firstAudio) await new Promise<void>(resolve => { finishRead = resolve; });
+      const speechStarted = trigger === 'speech start' && request.action === Action.REALTIME_READ && request.audioSequence === 2n;
+      return toBinary(ControlDesktopVoiceConversationResponseSchema, create(ControlDesktopVoiceConversationResponseSchema, {
+        preference, realtimeModels: [{ ...selection, protocolLocked: true, displayName: 'Realtime', providerName: 'My key' }],
+        ...(callId ? { call: { callId, kind: 'realtime' } } : {}), audioSequence: request.audioSequence,
+        ...(firstAudio ? { pcm, realtimePlayback: { itemId: 'speaking', contentIndex: 1, sampleOffset: 4800 } } : {}),
+        ...(speechStarted ? { audioInterrupted: true, interruptThroughResponse: 1 } : {}), sampleRate: 24_000, accepted: true
+      }));
+    } }
+  } });
+  const container = document.createElement('div'); document.body.append(container); const root = createRoot(container);
+  const button = (label: string) => {
+    const controls = document.querySelectorAll<HTMLButtonElement>('[role="dialog"][aria-label="Voice conversation"] button');
+    const match = [...controls].find(row => row.textContent === label);
+    expect(match, label).toBeDefined();
+    return match!;
+  };
+  try {
+    await act(async () => root.render(<DesktopVoiceConversationPanel controller={{ state: { effectiveLocale: 'en' } } as unknown as AppController}
+      session={{ id: 'owner-task', generation: 4n, name: 'Partner' } as SessionView} serverId="original" onClose={() => {}} />));
+    await act(async () => button('Start call').click());
+    expect(getUserMedia).toHaveBeenCalledOnce(); expect(capture).toHaveBeenCalledOnce();
+    const input = requests.find(row => row.action === Action.REALTIME_INPUT)!;
+    expect(input).toMatchObject({ callId, sessionId: 'owner-task', sessionGeneration: 4n, audioSequence: 1n });
+    expect(Array.from(input.microphonePcm)).toEqual([42, 0]);
+    expect(allocateBuffer).toHaveBeenCalledWith(1, 2400, 24_000);
+    expect(decoded[0]).toBe(0.5); expect(output.start).toHaveBeenCalledOnce();
+    await act(async () => button('Mute microphone').click()); expect(track.enabled).toBe(false);
+    audioTime = 0.05;
+    if (trigger === 'button') await act(async () => button('Interrupt reply').click());
+    else await act(async () => finishRead());
+    expect(output.stop).toHaveBeenCalledOnce();
+    expect(requests.find(row => row.action === Action.INTERRUPT)).toMatchObject({ callId: input.callId,
+      realtimePlayback: { itemId: 'speaking', contentIndex: 1, sampleOffset: 6000 } });
+    expect(requests.find(row => row.action === Action.INTERRUPT)?.interruptThroughResponse).toBe(trigger === 'button' ? undefined : 1);
+    await act(async () => release());
+    expect(track.stop).toHaveBeenCalledOnce(); expect(detach).toHaveBeenCalledOnce();
+    expect(requests.find(row => row.action === Action.END)?.callId).toBe(input.callId);
+  } finally {
+    await act(async () => root.unmount()); container.remove(); capture.mockRestore(); vi.unstubAllGlobals();
+    if (desktop) Object.defineProperty(window, 'jokoDesktop', desktop); else delete (window as { jokoDesktop?: unknown }).jokoDesktop;
+    if (devices) Object.defineProperty(navigator, 'mediaDevices', devices); else Reflect.deleteProperty(navigator, 'mediaDevices');
   }
 });
 

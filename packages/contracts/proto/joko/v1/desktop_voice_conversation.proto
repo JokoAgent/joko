@@ -20,6 +20,8 @@ enum DesktopVoiceConversationAction {
   DESKTOP_VOICE_CONVERSATION_ACTION_READ_SPEECH = 9;
   DESKTOP_VOICE_CONVERSATION_ACTION_VOICES = 10;
   DESKTOP_VOICE_CONVERSATION_ACTION_CLASSIFY_EXIT = 11;
+  DESKTOP_VOICE_CONVERSATION_ACTION_REALTIME_INPUT = 12;
+  DESKTOP_VOICE_CONVERSATION_ACTION_REALTIME_READ = 13;
 }
 
 message DesktopSpeechSelection {
@@ -53,6 +55,7 @@ message DesktopVoiceConversationPreference {
   DesktopSpeechSelection playback = 2;
   bool sentence_playback = 3;
   uint64 revision = 4;
+  DesktopSpeechSelection realtime = 5;
 }
 message DesktopVoiceCallTurn {
   string id = 1;
@@ -88,6 +91,12 @@ message DesktopSpeechVoiceCatalog {
   bool truncated = 3;
   bool custom_voices_unavailable = 4;
 }
+// An offset in one 24 kHz mono PCM item on the original realtime call.
+message DesktopRealtimePlaybackPosition {
+  string item_id = 1;
+  uint32 content_index = 2;
+  uint32 sample_offset = 3;
+}
 message ControlDesktopVoiceConversationRequest {
   // Assigned by Desktop Main from the trusted top-level WebContents.
   string window_id = 1;
@@ -103,6 +112,11 @@ message ControlDesktopVoiceConversationRequest {
   DesktopVoiceConversationPreference preference = 11;
   string speech_request_id = 12;
   bool playback_only = 13;
+  bytes microphone_pcm = 14;
+  uint64 audio_sequence = 15;
+  DesktopRealtimePlaybackPosition realtime_playback = 16;
+  // Set when acknowledging the provider's speech-start notification.
+  optional uint32 interrupt_through_response = 17;
 }
 enum DesktopSpeechEncoding {
   DESKTOP_SPEECH_ENCODING_UNSPECIFIED = 0;
@@ -124,4 +138,10 @@ message ControlDesktopVoiceConversationResponse {
   DesktopSpeechEncoding speech_encoding = 11;
   // One bounded byte chunk of the original encoded speech. Decode after speech_done.
   bytes encoded_speech = 12;
+  repeated DesktopSpeechModel realtime_models = 13;
+  uint64 audio_sequence = 14;
+  bool audio_interrupted = 15;
+  // The first sample of this PCM chunk, when identified by the provider.
+  DesktopRealtimePlaybackPosition realtime_playback = 16;
+  optional uint32 interrupt_through_response = 17;
 }

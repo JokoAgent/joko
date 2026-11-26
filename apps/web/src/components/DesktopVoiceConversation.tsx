@@ -9,6 +9,7 @@ import type { AppController } from '../controller.js';
 import type { SessionView } from '../model.js';
 import { ContinuousVoiceListener, DesktopSpeechPlayer, DesktopVoiceClient, spokenSentences, voiceExitIntent } from '../desktop-voice-conversation.js';
 import { currentVoiceQuestionTarget, type VoiceQuestionTarget } from '../voice-question-bridge.js';
+import { DesktopRealtimeAudio } from '../desktop-realtime-audio.js';
 import { Button, CheckboxControl, IconButton, SelectControl } from './ui.js';
 import { useDesktopMessageReadAloud, useDesktopPartnerVoiceTarget } from './DesktopMessageReadAloud.js';
 import './desktop-voice-conversation.css';
@@ -75,6 +76,8 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
   const [playbackFailed, setPlaybackFailed] = useState(false);
   const [microphoneLost, setMicrophoneLost] = useState(false);
   const [conversation, setConversation] = useState<DesktopSpeechSelection>(), [playback, setPlayback] = useState<DesktopSpeechSelection>();
+  const [realtime, setRealtime] = useState<DesktopSpeechSelection>();
+  const realtimeAudio = useRef<DesktopRealtimeAudio | undefined>(undefined);
   const [sentence, setSentence] = useState(true), [settings, setSettings] = useState(false), [message, setMessage] = useState(''), [reading, setReading] = useState('');
   const [mic, setMic] = useState(false), [micState, setMicState] = useState(''), [speaking, setSpeaking] = useState(false);
   const [historyDetails, setHistoryDetails] = useState<Readonly<Record<string, DesktopVoiceCallRecord>>>({});
@@ -119,7 +122,8 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
       const call = result.call?.kind === 'playback' && result.call.callId !== owner.callId ? undefined : result.call;
       setValue({ ...result, call }); setError(false);
       if (call?.endedAtMs === undefined && call) { owner.callId = call.callId; owner.kind = call.kind; }
-      if (!call && owner.callId) { listener.current?.stop(); player.stop(); owner.callId = undefined; owner.kind = undefined; setMic(false); }
+      if ((!call || call.endedAtMs !== undefined) && owner.callId) { realtimeAudio.current?.close(); realtimeAudio.current = undefined;
+        listener.current?.stop(); player.stop(); owner.callId = undefined; owner.kind = undefined; setMic(false); }
     } catch { if (owner.live) setError(true); }
     finally { owner.polling = false; }
   }, [client, player]);
@@ -129,7 +133,7 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
     startGeneration.current++;
     owner.readId++; owner.ending = true;
     speechGeneration.current++; semanticVersion.current++; exit.current = undefined; idleSince.current = undefined; setCountdown(undefined);
-    listener.current?.stop(); player.stop(); setMic(false); setSpeaking(false);
+    realtimeAudio.current?.close(); realtimeAudio.current = undefined; listener.current?.stop(); player.stop(); setMic(false); setSpeaking(false);
     owner.callId = undefined; owner.kind = undefined; owner.pendingPlayback = undefined;
     try { if (id) await client.control(Action.END, { callId: id,
       ...(pending?.callId === id ? { playbackOnly: true, operationId: pending.operationId } : {}) }).catch(() => undefined); }
@@ -154,6 +158,7 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
   useEffect(() => {
     if (!value?.preference || settings) return;
     setConversation(value.preference.conversation); setPlayback(value.preference.playback); setSentence(value.preference.sentencePlayback);
+    setRealtime(value.preference.realtime);
   }, [value?.preference?.revision, settings]);
   const action = async (work: () => Promise<unknown>) => {
     if (busy) return; current.current.readId++; setBusy(true); setError(false); setNotice('');
@@ -164,18 +169,19 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
     if (notify && current.current.kind === 'playback') return stop().then(read);
     speechGeneration.current++; semanticVersion.current++; exit.current = undefined; idleSince.current = undefined; setCountdown(undefined);
     for (const turn of latestValue.current?.call?.turns ?? []) if (turn.role === 'assistant') spoken.current.add(turn.id);
-    const id = current.current.callId; player.stop(); setSpeaking(false);
-    return id && notify ? client.control(Action.INTERRUPT, { callId: id }).catch(() => { if (current.current.live) setError(true); }) : Promise.resolve();
+    const id = current.current.callId, realtimePlayback = realtimeAudio.current?.interrupt(); player.stop(); setSpeaking(false);
+    return id && notify ? client.control(Action.INTERRUPT, { callId: id, realtimePlayback }).catch(() => { if (current.current.live) setError(true); }) : Promise.resolve();
   }, [client, player, read, stop]);
   useEffect(() => {
     if (!blocked) return;
+    if (current.current.kind === 'realtime') { void stop(); return; }
     const unfinished = listener.current?.draft;
     if (unfinished?.trim()) {
       if (capturedQuestion.current?.pending) { retainedQuestion.current = capturedQuestion.current.target; setQuestionDraft(unfinished); }
       else setMessage(unfinished);
     }
     listener.current?.stop(); speechCandidate.current = false; capturedQuestion.current = undefined; setDraft(''); setMic(false); interrupt();
-  }, [blocked, interrupt]);
+  }, [blocked, interrupt, stop]);
   useEffect(() => { if (question) player.pause(); else if (!speechCandidate.current && !exit.current) player.resume(); }, [question?.id, player]);
   const say = useCallback(async (body: string, id: string = crypto.randomUUID()) => {
     const owner = current.current, callId = owner.callId; if (!callId || !body.trim()) return;
@@ -296,7 +302,9 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
     try { await next.start(); } catch { next.stop(); if (current.current.live) { setMic(false); setError(true); } }
   };
   const start = async (playbackOnly: boolean, chosen: DesktopSpeechSelection | undefined): Promise<boolean> => {
-    chosen = reconcileDesktopSpeechSelection(chosen, value?.models ?? []);
+    const duplex = !playbackOnly && chosen !== undefined && (chosen.protocol === 'openai-realtime' || chosen.protocol === 'qwen-audio-realtime');
+    if (!duplex) chosen = reconcileDesktopSpeechSelection(chosen, value?.models ?? []);
+    else if (!value?.realtimeModels.some(model => key(model) === key(chosen!)) || !chosen?.voice.trim()) chosen = undefined;
     if (blockedNow.current || current.current.ending) return false;
     if (!chosen) { setSettings(true); return false; }
     const owner = current.current;
@@ -316,11 +324,20 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
         return false;
       }
       if (!result.call || result.call.callId !== callId || result.call.endedAtMs !== undefined) throw new Error('The voice call did not start.');
-      owner.callId = callId; owner.kind = playbackOnly ? 'playback' : 'conversation';
+      owner.callId = callId; owner.kind = result.call.kind;
       setValue(result); spoken.current.clear(); speechRequestIds.current.clear();
-      if (!playbackOnly) { setMicrophoneLost(false); await startMic(); }
+      if (duplex) {
+        const profileId = controller.state.activeProfile?.id, api = window.jokoDesktop?.voiceSpeaker;
+        const audio = new DesktopRealtimeAudio(client, callId, () => {
+          if (owner.live && owner.callId === callId) { setMicrophoneLost(true); setError(true); void stop(); }
+        }, profileId && api ? { profileId, api } : undefined);
+        realtimeAudio.current = audio; setMicrophoneLost(false);
+        await audio.start(); if (canStart()) { setMic(true); setMicState('listening'); }
+      } else if (!playbackOnly) { setMicrophoneLost(false); await startMic(); }
       return true;
     } catch (error) {
+      if (duplex) { realtimeAudio.current?.close(); realtimeAudio.current = undefined; await retire();
+        if (owner.callId === callId) { owner.callId = undefined; owner.kind = undefined; setMic(false); } }
       if (playbackOnly && owner.pendingPlayback?.callId === callId) await retire();
       if (canStart()) throw error;
       return false;
@@ -332,7 +349,7 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
   const save = (reset: boolean) => void action(async () => {
     if (!saveRequest.current) saveRequest.current = { operationId: crypto.randomUUID(), preference: create(DesktopVoiceConversationPreferenceSchema, {
       ...(reset ? {} : { conversation: reconcileDesktopSpeechSelection(conversation, value?.models ?? []),
-        playback: reconcileDesktopSpeechSelection(playback, value?.models ?? []) }), sentencePlayback: reset ? true : sentence, revision: value?.preference?.revision ?? 0n }) };
+        playback: reconcileDesktopSpeechSelection(playback, value?.models ?? []), realtime }), sentencePlayback: reset ? true : sentence, revision: value?.preference?.revision ?? 0n }) };
     const result = await client.control(Action.SAVE_PREFERENCE, saveRequest.current);
     if (current.current.live) { setValue(result); setSettings(false); setNotice(text.saved); saveRequest.current = undefined; }
   });
@@ -363,8 +380,11 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
     onKeyDown={event => { if (event.key === 'Escape' && !event.defaultPrevented && !event.repeat && !event.nativeEvent.isComposing) { event.stopPropagation(); void stop(); onClose(); } }}>
     <header className="desktop-voice-conversation__heading"><div><strong>{text.title}</strong><p>{session.name} · {text.body}</p></div><Button aria-label={text.close} onClick={() => { void stop(); onClose(); }}>{text.close}</Button></header>
     <div className="desktop-voice-conversation__actions">
-      <Button disabled={busy || active || blocked} tone="primary" onClick={() => void action(() => start(false, conversation))}>{text.start}</Button>
+      <Button disabled={busy || active || blocked} tone="primary" onClick={() => void action(() => start(false, realtime ?? conversation))}>{text.start}</Button>
       {active && <><Button disabled={busy} onClick={() => { void stop().then(read); }}>{text.end}</Button>
+        {current.current.kind === 'realtime' && <Button aria-pressed={mic} disabled={busy || blocked} onClick={() => {
+          realtimeAudio.current?.mute(mic); setMic(!mic);
+        }}>{mic ? text.mute : text.unmute}</Button>}
         {current.current.kind === 'conversation' && <Button aria-pressed={mic} disabled={busy || blocked} onClick={() => {
           cancelExit();
           if (mic) {
@@ -389,6 +409,17 @@ export function DesktopVoiceConversationPanel({ controller, session, serverId, o
     {microphoneLost && <p role="alert">{text.microphoneLost}</p>}
     {playbackFailed && <p role="alert">{text.readFailed}</p>}
     {settings && <div className="desktop-voice-conversation__settings">
+      {!!value?.realtimeModels.length && <fieldset disabled={busy || blocked}><legend>{controller.state.effectiveLocale === 'zh-CN' ? '双向实时语音' : 'Two-way realtime voice'}</legend>
+        <label>{text.model}<select value={realtime ? key(realtime) : ''} onChange={event => {
+          const model = value.realtimeModels.find(row => key(row) === event.target.value); changed();
+          setRealtime(model ? create(DesktopSpeechSelectionSchema, { backendId: model.backendId, providerId: model.providerId, modelId: model.modelId,
+            protocol: model.protocol ?? 'openai-realtime', voice: model.protocol === 'qwen-audio-realtime' ? model.modelId.startsWith('qwen-audio-3.1-') ? 'longanqian_v3.1' : 'longanqian' : 'marin' }) : undefined);
+        }}><option value="">{text.none}</option>{value.realtimeModels.map(model => <option key={key(model)} value={key(model)}>{model.providerName} · {model.displayName}</option>)}</select></label>
+        {realtime && <><label>{text.protocol}<select value={realtime.protocol} disabled={value.realtimeModels.find(row => key(row) === key(realtime))?.protocolLocked}
+          onChange={event => { changed(); setRealtime({ ...realtime, protocol: event.target.value }); }}>
+          <option value="openai-realtime">OpenAI Realtime</option><option value="qwen-audio-realtime">Qwen Audio Realtime</option></select></label>
+          <label>{text.voice}<input value={realtime.voice} maxLength={256} onChange={event => { changed(); setRealtime({ ...realtime, voice: event.target.value }); }} /></label></>}
+      </fieldset>}
       {!value?.models.length && <p>{text.empty}</p>}
       <SpeechChoice title={text.conversation} value={conversation} models={value?.models ?? []} client={client} disabled={busy || blocked} language={controller.state.effectiveLocale}
         onChange={next => { changed(); setConversation(next); }} onPreview={selection => playText(text.previewText, selection)} />

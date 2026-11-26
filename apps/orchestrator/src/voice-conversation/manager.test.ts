@@ -9,6 +9,7 @@ import { DESKTOP_HOST_AUTHORIZATION_HEADER } from '@joko/contracts/desktop-boots
 import { OperationalStore } from '@joko/store';
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from '@joko/testkit';
 import { expect, it, vi } from 'vitest';
+import { WebSocketServer, type WebSocket } from 'ws';
 import { ArtifactStore } from '../artifact-store.js';
 import { OperationalArtifactRepository } from '../artifact-repository.js';
 import { ConnectionManager } from '../connection-manager.js';
@@ -17,6 +18,7 @@ import type { ModelRouteCatalog } from '../personalization-inference.js';
 import { createDesktopVoiceConversationService } from './connect-service.js';
 import { DesktopVoiceConversationManager } from './manager.js';
 import { SpeechModelCatalog } from './models.js';
+import { officialRealtimeProtocol, realtimeModelAllowed } from './realtime-protocol.js';
 
 async function fixture(speechModelId?: string) {
   const root = await mkdtemp(join(tmpdir(), 'joko-voice-call-')), store = new OperationalStore(':memory:'), connections = new ConnectionManager(store);
@@ -54,6 +56,103 @@ async function fixture(speechModelId?: string) {
     restart: () => { manager.close(); manager = new DesktopVoiceConversationManager({ store, host, models: new SpeechModelCatalog(store, routes), companion, infer, fetch: fetcher }); },
     close: async () => { manager.close(); await host.dispose(); store.close(); await rm(root, { recursive: true, force: true }); } };
 }
+
+it('requires a conversational model on the original credential origin and both audio directions on a compatible endpoint', () => {
+  const base = 'https://api.openai.com/v1', model = { id: 'gpt-realtime-mini', mode: 'realtime' };
+  expect(realtimeModelAllowed(model, base, 'https://api.openai.com')).toBe(true);
+  expect(realtimeModelAllowed({ ...model, id: 'gpt-realtime-translate' }, base, 'https://api.openai.com')).toBe(false);
+  expect(realtimeModelAllowed({ ...model, baseUrl: 'https://elsewhere.test/v1' }, base, 'https://api.openai.com')).toBe(false);
+  expect(realtimeModelAllowed({ ...model, declaredInputModalities: ['text'] }, base, 'https://api.openai.com')).toBe(false);
+  expect(realtimeModelAllowed(model, 'https://byok.test/v1', 'https://byok.test')).toBe(false);
+  expect(realtimeModelAllowed({ ...model, declaredInputModalities: ['audio'], declaredOutputModalities: ['audio'] }, 'https://byok.test/v1', 'https://byok.test')).toBe(true);
+  expect(officialRealtimeProtocol(new URL('https://dashscope-intl.aliyuncs.com/compatible-mode/v1'), 'qwen-audio-3.1-realtime-plus')).toBe('qwen-audio-realtime');
+  expect(officialRealtimeProtocol(new URL('https://token-plan.cn-beijing.maas.aliyuncs.com/v1'), 'qwen-audio-3.1-realtime-plus')).toBeUndefined();
+});
+
+it.each(['openai-realtime', 'qwen-audio-realtime'])('streams PCM on an owned %s call, fences another window and retires the original key', async protocol => {
+  const f = await fixture('wire-audio');
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise<void>(done => server.once('listening', done));
+  const address = server.address(); if (!address || typeof address === 'string') throw new Error('Missing voice test port.');
+  f.speechRoute('http://127.0.0.1:' + address.port + '/v1');
+  let socket: WebSocket | undefined, auth: string | undefined, frames = 0, bytes = 0, cancelEventId = '';
+  const edits: { type: string; item_id: string; content_index?: number; audio_end_ms?: number }[] = [];
+  server.on('connection', (peer, request) => {
+    socket = peer; auth = request.headers.authorization;
+    peer.on('message', raw => {
+      const event = JSON.parse(raw.toString());
+      if (event.type === 'session.update') peer.send(JSON.stringify({ type: 'session.updated' }));
+      if (event.type === 'input_audio_buffer.append') { frames++; bytes = Buffer.from(event.audio, 'base64').length; }
+      if (event.type === 'response.cancel') cancelEventId = event.event_id;
+      if (event.type === 'conversation.item.truncate' || event.type === 'conversation.item.delete') edits.push(event);
+    });
+  });
+  try {
+    const selected = { ...f.speech, protocol, voice: 'voice-1' }, callId = 'duplex', A = contract.DesktopVoiceConversationAction;
+    const saved = await f.control(A.SAVE_PREFERENCE, { operationId: 'save-duplex-mode', preference: { realtime: selected } });
+    expect(saved.preference?.realtime).toMatchObject({ modelId: 'wire-audio', protocol });
+    expect((await f.control(A.START, { callId, operationId: 'start-duplex', selection: selected })).call?.kind).toBe('realtime');
+    expect(auth).toBe('Bearer private-speech-key');
+    const frame = { callId, audioSequence: 1n, microphonePcm: new Uint8Array(3200) };
+    await expect(f.control(A.REALTIME_INPUT, { ...frame, windowId: 'another-window' })).rejects.toBeDefined();
+    await expect(f.rpc().controlDesktopVoiceConversation({ ...f.base, ...frame, action: A.REALTIME_INPUT }, { headers: { authorization: f.headers.authorization } })).rejects.toBeDefined();
+    await f.control(A.REALTIME_INPUT, frame); await f.control(A.REALTIME_INPUT, frame);
+    await vi.waitFor(() => expect(frames).toBe(1)); expect(protocol === 'openai-realtime' ? bytes > 3200 : bytes === 3200).toBe(true);
+    await expect(f.control(A.REALTIME_INPUT, { ...frame, audioSequence: 3n })).rejects.toBeDefined();
+    const emit = (event: object) => socket!.send(JSON.stringify(event));
+    emit({ type: 'input_audio_buffer.committed', item_id: 'utterance' });
+    emit({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'utterance', transcript: 'Hello companion' });
+    emit({ type: 'response.created', response: { id: 'reply' } });
+    const answer = Buffer.alloc(60_000); answer.set([1, 2, 3, 4]);
+    emit({ type: 'response.output_audio.delta', response_id: 'reply', item_id: 'audio', content_index: 1, delta: answer.toString('base64') });
+    const reply = await f.control(A.REALTIME_READ, { callId, audioSequence: 1n });
+    expect([...reply.pcm.subarray(0, 4)]).toEqual([1, 2, 3, 4]);
+    expect(reply.pcm.byteLength).toBe(48_000); expect(reply.sampleRate).toBe(24000);
+    expect(reply.realtimePlayback).toMatchObject({ itemId: 'audio', contentIndex: 1, sampleOffset: 0 });
+    const replay = await f.control(A.REALTIME_READ, { callId, audioSequence: 1n });
+    expect(Buffer.from(replay.pcm).equals(Buffer.from(reply.pcm))).toBe(true);
+    expect(replay.realtimePlayback).toEqual(reply.realtimePlayback);
+    const interrupted = await f.control(A.INTERRUPT, { callId, realtimePlayback: { ...reply.realtimePlayback!, sampleOffset: 6000 } });
+    expect(interrupted.call?.turns[0]).toMatchObject({ role: 'user', text: 'Hello companion' });
+    await vi.waitFor(() => expect(cancelEventId).toMatch(/^cancel_/));
+    if (protocol === 'qwen-audio-realtime') expect(edits).toEqual([]);
+    emit({ type: 'response.done', response: { id: 'reply', status: 'completed' } });
+    emit({ type: 'error', error: protocol === 'openai-realtime' ? { code: 'response_cancel_not_active' }
+      : { type: 'invalid_request_error', event_id: cancelEventId } });
+    emit({ type: 'response.output_audio.delta', response_id: 'reply', delta: 'AQIDBA==' });
+    expect(await f.control(A.REALTIME_READ, { callId, audioSequence: 2n })).toMatchObject({ audioInterrupted: true, pcm: new Uint8Array() });
+    await vi.waitFor(() => expect(edits).toEqual([protocol === 'openai-realtime'
+      ? { type: 'conversation.item.truncate', item_id: 'audio', content_index: 1, audio_end_ms: 250 }
+      : { type: 'conversation.item.delete', item_id: 'audio' }]));
+    emit({ type: 'response.created', response: { id: 'next-reply' } });
+    emit({ type: 'response.output_audio.delta', response_id: 'next-reply', item_id: 'next-audio', delta: 'BQYHCA==' });
+    const next = await f.control(A.REALTIME_READ, { callId, audioSequence: 3n });
+    expect([...next.pcm]).toEqual([5, 6, 7, 8]);
+    emit({ type: 'input_audio_buffer.speech_started', item_id: 'speaking-again' });
+    emit({ type: 'response.done', response: { id: 'next-reply', status: 'cancelled' } });
+    emit({ type: 'response.created', response: { id: 'new-answer' } });
+    emit({ type: 'response.audio.delta', response_id: 'new-answer', item_id: 'new-audio', delta: 'CQo=' });
+    const barge = await f.control(A.REALTIME_READ, { callId, audioSequence: 4n });
+    expect(barge).toMatchObject({ audioInterrupted: true, interruptThroughResponse: 2 });
+    const fresh = barge.pcm.length ? barge : await f.control(A.REALTIME_READ, { callId, audioSequence: 5n });
+    expect([...fresh.pcm]).toEqual([9, 10]);
+    // The old interruption reaches the host after playback of the next answer has begun.
+    await f.control(A.INTERRUPT, { callId, realtimePlayback: next.realtimePlayback, interruptThroughResponse: barge.interruptThroughResponse });
+    emit({ type: 'response.audio.delta', response_id: 'new-answer', item_id: 'new-audio', delta: 'Cww=' });
+    const continued = await f.control(A.REALTIME_READ, { callId, audioSequence: fresh.audioSequence + 1n });
+    expect([...continued.pcm]).toEqual([11, 12]); expect(continued.realtimePlayback?.sampleOffset).toBe(1);
+    expect(edits.filter(item => item.item_id === 'new-audio')).toEqual([]);
+    f.rotate();
+    await expect(f.control(A.REALTIME_INPUT, { ...frame, audioSequence: 2n })).rejects.toBeDefined();
+    await vi.waitFor(() => expect(socket!.readyState).toBe(3), { timeout: 2500 });
+    expect(f.store.listRuns({ sessionId: f.base.sessionId })).toHaveLength(0);
+    expect((await f.control(A.SNAPSHOT)).history[0]?.endedAtMs).toBeDefined();
+    const newCallId = 'next-duplex';
+    await f.control(A.START, { callId: newCallId, operationId: 'start-next-duplex', selection: selected });
+    emit({ type: 'error', error: { type: 'invalid_request_error', event_id: cancelEventId, param: 'response.cancel' } });
+    await vi.waitFor(() => expect(socket!.readyState).toBe(3));
+  } finally { await f.close(); for (const peer of server.clients) peer.terminate(); await new Promise<void>(done => server.close(() => done())); }
+});
 
 it.each([false, true])('reconciles saved speed against the current route and sends provider defaults for playbackOnly=%s', async playbackOnly => {
   const f = await fixture();

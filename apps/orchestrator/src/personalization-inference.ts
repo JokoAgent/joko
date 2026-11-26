@@ -41,20 +41,21 @@ export interface CredentialModelRoute extends ProviderInferenceRoute {
 }
 
 export interface ModelRouteCatalog {
-  list(options?: { readonly purpose?: "audio_speech" }): readonly ModelRouteDescriptor[];
+  list(options?: { readonly purpose?: "audio_speech" | "audio_realtime" }): readonly ModelRouteDescriptor[];
+  realtimeGeneration?(reference: ModelRouteRef): string | undefined;
   resolve(
     reference: ModelRouteRef,
-    options?: { readonly requireImages?: boolean; readonly purpose?: "audio_speech" }
+    options?: { readonly requireImages?: boolean; readonly purpose?: "audio_speech" | "audio_realtime" }
   ): CredentialModelRoute | undefined;
 }
 
 export function createModelRouteCatalog(
   store: OperationalStore,
-  providers: Pick<ProviderCatalogManager, "hasInferenceModel" | "resolveInferenceRoute" | "listManaged">
+  providers: Pick<ProviderCatalogManager, "hasInferenceModel" | "resolveInferenceRoute" | "listManaged"> & Partial<Pick<ProviderCatalogManager, "describeInferenceRoute">>
 ): ModelRouteCatalog {
-  const list = (options: { readonly purpose?: "audio_speech" } = {}): readonly ModelRouteDescriptor[] => store.listBackends().flatMap((record): readonly ModelRouteDescriptor[] => {
+  const list = (options: { readonly purpose?: "audio_speech" | "audio_realtime" } = {}): readonly ModelRouteDescriptor[] => store.listBackends().flatMap((record): readonly ModelRouteDescriptor[] => {
     const managedCatalog = record.descriptor.capabilities.get(MANAGED_PROVIDER_CATALOG_CAPABILITY)?.supported === true;
-    if (options.purpose === "audio_speech") {
+    if (options.purpose === "audio_speech" || options.purpose === "audio_realtime") {
       return managedCatalog ? providers.listManaged(record.descriptor.id).flatMap(provider => provider.provider.models.map(model => ({
         backendId: record.descriptor.id, providerId: provider.provider.id, modelId: model.id,
         displayName: model.name ?? model.id, providerName: provider.displayName, supportsImages: false,
@@ -71,6 +72,11 @@ export function createModelRouteCatalog(
   }).sort(compareModelRoutes);
   return {
     list,
+    ...(providers.describeInferenceRoute ? { realtimeGeneration: (ref: ModelRouteRef) => {
+      const backend = store.getBackend(ref.backendId).descriptor;
+      if (backend.health === "unavailable" || !backend.capabilities.get(MANAGED_PROVIDER_CATALOG_CAPABILITY)?.supported) return undefined;
+      return providers.describeInferenceRoute!(ref.backendId, ref.providerId, ref.modelId, { purpose: "audio_realtime" })?.generationId;
+    } } : {}),
     resolve: (reference, options = {}) => {
       const descriptor = list(options).find((candidate) => sameModelRoute(candidate, reference));
       if (descriptor?.credentialRoute !== true || (options.requireImages === true && !descriptor.supportsImages)) return undefined;

@@ -6,6 +6,11 @@ import type { CredentialModelRoute, ModelRouteCatalog } from '../personalization
 import { SPEECH_PROTOCOLS, isCosyVoiceHttpModel, isQwenAudioHttpModel, isQwenHttpModel, isSpeechSpeedSupported, type SpeechProtocol } from './protocol.js';
 import type { SpeechConnection } from './speech.js';
 import { normalizeSpeechVoiceId } from './types.js';
+import { isRealtimeProtocol, officialRealtimeProtocol, type RealtimeProtocol } from './realtime-protocol.js';
+
+export interface RealtimeConnection {
+  readonly url: string; readonly headers: Readonly<Record<string, string>>; readonly protocol: RealtimeProtocol;
+}
 
 export interface SpeechSelection {
   readonly backendId: string; readonly providerId: string; readonly modelId: string;
@@ -54,6 +59,32 @@ function supportedEndpoint(route: CredentialModelRoute): boolean {
  * never execution proof; custom proxies require an explicit speech protocol. */
 export class SpeechModelCatalog {
   constructor(readonly store: OperationalStore, readonly routes: ModelRouteCatalog) {}
+  realtimeModels(): DesktopSpeechModel[] {
+    return this.routes.list({ purpose: 'audio_realtime' }).filter(row => row.credentialRoute).flatMap(row => {
+      const route = this.routes.resolve(row, { purpose: 'audio_realtime' });
+      if (!route?.authorization && !route?.headers['x-api-key']) return [];
+      const protocol = officialRealtimeProtocol(apiBase(route.baseUrl), row.modelId);
+      return [create(DesktopSpeechModelSchema, { ...row, displayName: row.displayName ?? row.modelId, providerName: row.providerName ?? row.providerId,
+        ...(protocol ? { protocol } : {}), protocolLocked: !!protocol, speedSupport: { case: 'speedUnsupported', value: true } })];
+    });
+  }
+  resolveRealtime(selection: SpeechSelection): { connection: RealtimeConnection; assertCurrent(): void } {
+    const route = this.routes.resolve(selection, { purpose: 'audio_realtime' });
+    if (!route || !isRealtimeProtocol(selection.protocol) || selection.speed !== undefined || !normalizeSpeechVoiceId(selection.voice)) throw new Error('model_unavailable');
+    const url = apiBase(route.baseUrl), fixed = officialRealtimeProtocol(url, selection.modelId);
+    if ((fixed && fixed !== selection.protocol) || !fixed && (url.hostname === 'api.openai.com' || url.hostname.endsWith('.aliyuncs.com'))) throw new Error('model_unavailable');
+    const authorization = route.authorization ?? (route.headers['x-api-key'] ? 'Bearer ' + route.headers['x-api-key'] : undefined);
+    if (!authorization) throw new Error('model_unavailable');
+    const headers = Object.fromEntries(Object.entries(route.headers).filter(([name]) =>
+      !/^(authorization|proxy-authorization|cookie|host|connection|content-type|content-length|upgrade|sec-websocket-.*|x-api-key|api-key|xi-api-key|openai-beta|chatgpt-account-id|openai-account-id|originator|session_id)$/i.test(name)));
+    url.pathname = fixed === 'qwen-audio-realtime' ? '/api-ws/v1/realtime' : (url.pathname.replace(/\/+$/, '') || '/v1') + '/realtime';
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'; url.searchParams.set('model', selection.modelId);
+    return { connection: { url: url.href, headers: { ...headers, authorization }, protocol: selection.protocol }, assertCurrent: () => {
+      const generation = this.routes.realtimeGeneration ? this.routes.realtimeGeneration(selection)
+        : this.routes.resolve(selection, { purpose: 'audio_realtime' })?.generationId;
+      if (generation !== route.generationId) throw new Error('connection_changed');
+    } };
+  }
   list(): DesktopSpeechModel[] {
     return this.routes.list({ purpose: 'audio_speech' }).filter(value => value.credentialRoute).flatMap(value => {
       const route = this.routes.resolve(value, { purpose: 'audio_speech' });

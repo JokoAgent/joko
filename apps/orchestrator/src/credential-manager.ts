@@ -26,6 +26,7 @@ import {
 } from "./provider-model-discovery.js";
 import { materializeDiscoveredModel, publicDiscoveryDefaults, refreshDiscoveredModel, saveDiscoveredModelConfiguration } from "./provider-model-metadata.js";
 import { videoGenerationBaseUrl } from "./video-generation-protocol.js";
+import { realtimeModelAllowed } from "./voice-conversation/realtime-protocol.js";
 import {
   PROVIDER_ACCOUNT_USAGE_CAPABILITY,
   type ProviderAccountUsageCredential,
@@ -1160,7 +1161,7 @@ export interface ProviderInferenceIdentity {
 
 interface ProviderInferenceOptions {
   readonly requireImages?: boolean;
-  readonly purpose?: "audio_speech" | "xai_video";
+  readonly purpose?: "audio_speech" | "audio_realtime" | "xai_video";
 }
 
 /** Public provider catalog plus an in-memory credential join for Pi spawning. */
@@ -1567,6 +1568,9 @@ export class ProviderCatalogManager {
     const api = model.api ?? entry.provider.api;
     if (api !== "anthropic-messages" && api !== "openai-responses" && api !== "openai-completions") return false;
     if (options.requireImages === true && model.input?.includes("image") !== true) return false;
+    if (options.purpose === "audio_realtime") return (entry.kind === "custom_endpoint" || entry.kind === "api_key")
+      && !!entry.provider.apiKeyEnv && !entry.provider.keyless && !entry.nativeCredentialReferenceId
+      && realtimeModelAllowed(model, entry.provider.baseUrl, entry.credentialOrigin);
     if (options.purpose === "xai_video") {
       if (entry.kind !== "api_key" && entry.kind !== "custom_endpoint" && entry.kind !== "local_keyless") return false;
       const base = videoGenerationBaseUrl(entry.provider.baseUrl);
@@ -1631,7 +1635,8 @@ export class ProviderCatalogManager {
     const configured = entry.provider.models.find((candidate) => candidate.id === normalizedModelId);
     if (configured === undefined) return undefined;
     const model = this.#publicModelDefaults(entry, configured);
-    if (!inferenceModelMatchesPurpose(model, options.purpose)) return undefined;
+    if (!inferenceModelMatchesPurpose(model, options.purpose)
+      || options.purpose === "audio_realtime" && !this.hasInferenceModel(backendId, providerId, modelId, options)) return undefined;
     const api = model.api ?? entry.provider.api;
     if (api !== "anthropic-messages" && api !== "openai-responses" && api !== "openai-completions") return undefined;
     const supportsImages = model.input?.includes("image") === true;
@@ -3090,6 +3095,7 @@ const VIDEO_CONNECTION_OMITTED_HEADERS = new Set(["authorization", "x-api-key", 
   "content-length", "connection", "proxy-authorization", "anthropic-beta", "openai-beta", "chatgpt-account-id", "openai-account-id", "session_id"]);
 
 function inferenceModelMatchesPurpose(model: PiManagedModel, purpose: ProviderInferenceOptions["purpose"]): boolean {
+  if (purpose === "audio_realtime") return ["realtime", "audio_realtime"].includes(model.mode ?? model.discoveredMetadata?.mode ?? "");
   if (purpose === "xai_video") return model.mode === "xai_video"
     && (model.discoveredMetadata === undefined || model.metadataOverrides?.includes("mode") === true);
   return purpose === "audio_speech" ? isManagedSpeechModel(model) : isManagedChatModel(model);

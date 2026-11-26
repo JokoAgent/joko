@@ -14,6 +14,7 @@ import type { HostedAgentSources } from "./hosted-agent-sources.js";
 import { ProviderGroupRuntime, providerGroupDefaultMember } from "./provider-group-runtime.js";
 import { SessionHost } from "./session-host.js";
 import { ScheduleCoordinator } from "./schedule-coordinator.js";
+import { defaultScheduleExtensionSnapshot, withScheduleExtensionSnapshot } from "./schedule-extensions.js";
 import { ProviderGroupService } from "./provider-group-service.js";
 import { providerGroupQuota } from "./provider-group-quota.js";
 import { createClient, createRouterTransport } from "@connectrpc/connect";
@@ -150,12 +151,13 @@ it("resolves a saved Partner route and a persistent Schedule on their owner, ret
   expect((await group.preview()).selected?.source).toEqual(group.image);
   f.store.upsertSchedule({ id: "grouped-schedule", backendId: f.first.id, targetId: "target", sessionMode: "persistent",
     name: "Grouped job", kind: "manual", timezone: "UTC", enabled: true, prompt: prompt("Run once"),
-    executionSnapshot: { taskModelGroupId: "work", providerId: "test", modelId: "text", permissionMode: "ask" },
+    executionSnapshot: withScheduleExtensionSnapshot({ taskModelGroupId: "work", providerId: "test", modelId: "text", permissionMode: "ask",
+      useWorktree: false, refreshWorktreeRemote: false }, defaultScheduleExtensionSnapshot()),
     overlapPolicy: "queue", misfirePolicy: "run_once" });
   const scheduler = new ScheduleCoordinator(f.store, f.host);
   try {
     const result = await scheduler.runNowWithResult("grouped-schedule", "group-fire");
-    expect(result.status).toBe("queued");
+    expect(result.status, JSON.stringify(f.store.findScheduleRunByRunId(result.runId)?.detail)).toBe("queued");
     const session = f.store.getSession(result.sessionId!).descriptor;
     expect(session).toMatchObject({ targetId: "target", backendId: f.second.id, modelId: "multimodal", automationOrigin: { scheduleId: "grouped-schedule" } });
     expect(f.store.getSchedule("grouped-schedule").sessionId).toBe(session.id);

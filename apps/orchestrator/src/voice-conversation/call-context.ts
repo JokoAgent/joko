@@ -98,6 +98,14 @@ export class VoiceCallContext {
     this.deps.changed(structuredClone(this.record));
   }
 
+  recordRealtimeTurn(id: string, role: VoiceCallTurn["role"], text: string): void {
+    if (this.stopped || !text.trim() || text.length > 32_000 || this.record.turns.length >= 2000
+      || this.record.turns.reduce((total, turn) => total + turn.text.length, 0) + text.length > 1_000_000) throw new Error("realtime_transcript_limit");
+    if (this.record.turns.some(turn => turn.id === id)) return;
+    this.record.turns.push({ id, role, text, createdAt: Date.now(), complete: true });
+    this.publish();
+  }
+
   /** The id belongs to the host's accepted ASR input, never to model output. */
   submit(id: string, text: string, forceHandoff = false): Promise<boolean> {
     const existing = this.sends.get(id);
