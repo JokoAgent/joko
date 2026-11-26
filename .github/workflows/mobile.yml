@@ -222,6 +222,15 @@ jobs:
           "$ANDROID_HOME/build-tools/36.0.0/aapt2" dump permissions "$JOKO_ANDROID_TEST_APK" > "$(dirname "$JOKO_ANDROID_TEST_APK")/android-permissions.txt"
           node -e "const fs=require('node:fs'); const path=require('node:path'); const text=fs.readFileSync(path.join(path.dirname(process.env.JOKO_ANDROID_TEST_APK), 'android-permissions.txt'), 'utf8'); if (!text.includes('android.permission.REQUEST_INSTALL_PACKAGES')) throw new Error('The actual APK is missing its configured package-installer permission.');"
 
+      - name: Verify both home widget receivers in the actual APK
+        env:
+          JOKO_ANDROID_TEST_APK: ${{ steps.native-artifact.outputs.apk-path }}
+        run: |
+          manifest="$RUNNER_TEMP/joko-android-widget-manifest.txt"
+          "$ANDROID_HOME/build-tools/36.0.0/aapt2" dump xmltree --file AndroidManifest.xml "$JOKO_ANDROID_TEST_APK" > "$manifest"
+          grep -Fq 'app.joko.homesurfaces.AccountQuotaWidget' "$manifest"
+          grep -Fq 'app.joko.homesurfaces.DailyUsageWidget' "$manifest"
+
       - name: Enable the hosted runner's KVM device
         run: |
           test -c /dev/kvm
@@ -468,6 +477,20 @@ jobs:
 
       - name: Verify the Simulator application's local signature
         run: codesign --verify --deep --strict "$RUNNER_TEMP/joko-ios-simulator/Build/Products/Debug-iphonesimulator/Joko.app"
+
+      - name: Verify the embedded WidgetKit target and its app group
+        run: |
+          app="$RUNNER_TEMP/joko-ios-simulator/Build/Products/Debug-iphonesimulator/Joko.app"
+          widget="$app/PlugIns/JokoHomeWidgets.appex"
+          test "$(plutil -extract NSSupportsLiveActivities raw -o - "$app/Info.plist")" = true
+          test "$(plutil -extract JokoHomeSurfaceGroup raw -o - "$app/Info.plist")" = group.app.joko.mobile.widgets
+          plutil -extract UIBackgroundModes json -o - "$app/Info.plist" | jq -e 'index("fetch") != null'
+          plutil -extract BGTaskSchedulerPermittedIdentifiers json -o - "$app/Info.plist" | jq -e 'index("app.joko.mobile.refresh-home-widgets") != null'
+          test "$(plutil -extract CFBundleIdentifier raw -o - "$widget/Info.plist")" = app.joko.mobile.home-widgets
+          test "$(plutil -extract NSExtension.NSExtensionPointIdentifier raw -o - "$widget/Info.plist")" = com.apple.widgetkit-extension
+          test "$(plutil -extract JokoHomeSurfaceGroup raw -o - "$widget/Info.plist")" = group.app.joko.mobile.widgets
+          test -s "$widget/$(plutil -extract CFBundleExecutable raw -o - "$widget/Info.plist")"
+          codesign --verify --strict "$widget"
 
       - name: Archive the compiled Simulator app
         id: ios-archive

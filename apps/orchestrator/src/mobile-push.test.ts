@@ -225,7 +225,7 @@ describe("mobile push Orchestrator boundary", () => {
     coordinator.notifyGroupStep(subject); coordinator.notifyGroupStep(subject);
     expect(fixture.store.listMobilePushDeliveries()).toHaveLength(1); expect(fixture.store.listMobilePushDeliveries()[0]?.status).toBe("pending");
     coordinator.start(); await vi.waitFor(() => expect(sends).toHaveLength(1));
-    expect(sends[0]).toMatchObject({ intent: "joko://partner-group/group-one", title: "Project group", kind: "awaiting" });
+    expect(sends[0]).toMatchObject({ intent: "joko://partner-group/group-one?server=server-1", title: "Project group", kind: "awaiting" });
     expect(fixture.store.listMobilePushDeliveries()[0]).toMatchObject({ groupId: "group-one", groupTitle: "Project group", status: "delivered" });
     const frozen = JSON.stringify(fixture.store.listEvents().map(event => event.payload)); expect(frozen).not.toContain("group-device-token");
   });

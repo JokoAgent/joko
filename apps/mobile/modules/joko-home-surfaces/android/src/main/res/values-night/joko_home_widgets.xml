@@ -1,0 +1,5 @@
+<resources>
+  <color name="joko_widget_surface">#24292d</color>
+  <color name="joko_widget_ink">#f4f4f2</color>
+  <color name="joko_widget_subtle">#adb6b7</color>
+</resources>

@@ -114,17 +114,17 @@ function entitlements(path) {
   return parsePlist(temporary);
 }
 
-function validateEntitlements(value, bundleIdentifier, identity, signing, extension) {
+function validateEntitlements(value, bundleIdentifier, expectedGroups, signing, mainApp = false) {
   const applicationIdentifier = value["application-identifier"] ?? value["com.apple.application-identifier"];
   if (applicationIdentifier !== `${signing.teamId}.${bundleIdentifier}`
     || value["com.apple.developer.team-identifier"] !== signing.teamId) {
-    throw new Error(`${extension ? "Share extension" : "App"} signing entitlement identity is invalid.`);
+    throw new Error(`${bundleIdentifier} signing entitlement identity is invalid.`);
   }
   const groups = value["com.apple.security.application-groups"];
-  if (!Array.isArray(groups) || groups.length !== 1 || groups[0] !== identity.appGroupId) {
-    throw new Error(`${extension ? "Share extension" : "App"} does not contain the exact Joko App Group entitlement.`);
+  if (!Array.isArray(groups) || groups.length !== expectedGroups.length || !expectedGroups.every(group => groups.includes(group))) {
+    throw new Error(`${bundleIdentifier} does not contain the expected Joko App Group entitlements.`);
   }
-  if (!extension) {
+  if (mainApp) {
     const expectedPush = signing.exportMethod === "debugging" ? "development" : "production";
     if (value["aps-environment"] !== expectedPush) throw new Error("App push entitlement does not match the export method.");
     if (value["com.apple.developer.networking.multicast"] !== true) throw new Error("App multicast entitlement is missing.");
@@ -134,27 +134,42 @@ function validateEntitlements(value, bundleIdentifier, identity, signing, extens
 function validateIpa(ipa, identity, signing, extractionDirectory) {
   run("ditto", ["-x", "-k", ipa, extractionDirectory]);
   const app = uniqueChild(join(extractionDirectory, "Payload"), ".app", "IPA");
-  const extension = uniqueChild(join(app, "PlugIns"), ".appex", "IPA share extension");
+  const plugins = join(app, "PlugIns");
+  const extensions = readdirSync(plugins, { withFileTypes: true }).filter(entry => entry.isDirectory() && entry.name.endsWith(".appex"))
+    .map(entry => {
+      const path = join(plugins, entry.name);
+      return { path, info: parsePlist(join(path, "Info.plist")) };
+    });
   run("codesign", ["--verify", "--deep", "--strict", app]);
-  run("codesign", ["--verify", "--strict", extension]);
   const appInfo = parsePlist(join(app, "Info.plist"));
-  const extensionInfo = parsePlist(join(extension, "Info.plist"));
   if (appInfo.CFBundleIdentifier !== identity.iosBundleIdentifier
     || appInfo.CFBundleShortVersionString !== identity.version
-    || String(appInfo.CFBundleVersion) !== identity.buildNumber) {
+    || String(appInfo.CFBundleVersion) !== identity.buildNumber || appInfo.NSSupportsLiveActivities !== true
+    || appInfo.JokoHomeSurfaceGroup !== identity.widgetAppGroupId) {
     throw new Error("IPA app identity or version does not match app.json.");
   }
-  if (extensionInfo.CFBundleIdentifier !== identity.shareExtensionBundleIdentifier
-    || extensionInfo.CFBundleShortVersionString !== identity.version
-    || String(extensionInfo.CFBundleVersion) !== identity.buildNumber) {
-    throw new Error("IPA share extension identity or version does not match app.json.");
-  }
-  validateEntitlements(entitlements(app), identity.iosBundleIdentifier, identity, signing, false);
-  validateEntitlements(entitlements(extension), identity.shareExtensionBundleIdentifier, identity, signing, true);
+  const expected = [
+    { id: identity.shareExtensionBundleIdentifier, group: identity.appGroupId, point: "com.apple.share-services" },
+    { id: identity.widgetExtensionBundleIdentifier, group: identity.widgetAppGroupId, point: "com.apple.widgetkit-extension" }
+  ];
+  if (extensions.length !== expected.length) throw new Error("The IPA must embed the two Joko extension targets.");
+  validateEntitlements(entitlements(app), identity.iosBundleIdentifier, [identity.appGroupId, identity.widgetAppGroupId], signing, true);
   const appCertificate = signingCertificate(app);
-  const extensionCertificate = signingCertificate(extension);
-  if (appCertificate !== signing.expectedCertificateSha256
-    || extensionCertificate !== signing.expectedCertificateSha256) {
+  for (const target of expected) {
+    const extension = extensions.find(item => item.info.CFBundleIdentifier === target.id);
+    if (extension === undefined || extension.info.CFBundleShortVersionString !== identity.version
+      || String(extension.info.CFBundleVersion) !== identity.buildNumber
+      || extension.info.NSExtension?.NSExtensionPointIdentifier !== target.point
+      || (target.id === identity.widgetExtensionBundleIdentifier && extension.info.JokoHomeSurfaceGroup !== target.group)) {
+      throw new Error(`IPA extension ${target.id} has an invalid identity, version, or purpose.`);
+    }
+    run("codesign", ["--verify", "--strict", extension.path]);
+    validateEntitlements(entitlements(extension.path), target.id, [target.group], signing);
+    if (signingCertificate(extension.path) !== signing.expectedCertificateSha256) {
+      throw new Error(`IPA extension ${target.id} uses a different signer.`);
+    }
+  }
+  if (appCertificate !== signing.expectedCertificateSha256) {
     throw new Error("IPA signer does not match the independently pinned iOS signing certificate.");
   }
   return appCertificate;
@@ -196,8 +211,8 @@ async function main() {
   const identity = loadMobileReleaseIdentity(MOBILE_DIRECTORY);
   process.stdout.write([
     "",
-    "target: signed iOS IPA with the Joko share extension",
-    `identity: ${identity.iosBundleIdentifier} + ${identity.shareExtensionBundleIdentifier}`,
+    "target: signed iOS IPA with the Joko share and widget extensions",
+    `identity: ${identity.iosBundleIdentifier} + ${identity.shareExtensionBundleIdentifier} + ${identity.widgetExtensionBundleIdentifier}`,
     `version: ${identity.version} (${identity.buildNumber})`,
     "steps: shared client inputs -> clean prebuild -> exact per-target signing -> archive/export -> identity/runtime/entitlement/signature verification",
     "signing: certificate and provisioning profiles remain outside the repository",
@@ -216,6 +231,7 @@ async function main() {
   const environment = { ...process.env, NODE_ENV: "production" };
   installProfileIfProvided(signing.appProfilePath, "JOKO_IOS_APP_PROFILE_PATH");
   installProfileIfProvided(signing.shareProfilePath, "JOKO_IOS_SHARE_PROFILE_PATH");
+  installProfileIfProvided(signing.widgetProfilePath, "JOKO_IOS_WIDGET_PROFILE_PATH");
 
   prepareMobileWorkspaceInputs();
   await prepareMobileLinkspanNative({ platform: "ios", environment });

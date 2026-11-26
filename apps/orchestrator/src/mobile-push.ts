@@ -238,7 +238,7 @@ export class MobilePushCoordinator {
             claimed.delivery.sessionId,
             claimed.delivery.messageId,
             claimed.delivery.messageEventId
-          ) : `joko://partner-group/${encodeURIComponent(boundedIdentity(claimed.delivery.groupId, "Push group ID"))}`
+          ) : `joko://partner-group/${encodeURIComponent(boundedIdentity(claimed.delivery.groupId, "Push group ID"))}?server=${encodeURIComponent(this.#serverId)}`
         }, signal, () => !signal.aborted && this.#store.mobilePushDeliveryIsCurrent(claimed, this.#now()));
       } catch (error) {
         result = signal.aborted || abortError(error)

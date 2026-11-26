@@ -18,7 +18,7 @@ export type MobileNativeIntent =
       readonly messageId?: string;
       readonly messageEventId?: string;
     }
-  | { readonly kind: "group"; readonly groupId: string; readonly profileId?: string }
+  | { readonly kind: "group"; readonly groupId: string; readonly profileId?: string; readonly serverId?: string }
   | { readonly kind: "settings" }
   | { readonly kind: "focus"; readonly source?: string };
 
@@ -137,10 +137,12 @@ export function parseMobileNativeIntent(value: unknown): MobileNativeIntent | un
   }
   if (url.hostname === "task") return parseSessionIntent(url);
   if (url.hostname === "partner-group") {
-    if (!exactQuery(url, ["profile"])) return undefined;
+    if (!exactQuery(url, ["profile", "server"])) return undefined;
     const groupId = oneEncodedPathComponent(url.pathname), profileId = optionalIdentityQuery(url, "profile");
-    if (!boundedIdentity(groupId) || profileId === false) return undefined;
-    return Object.freeze({ kind: "group", groupId, ...(profileId === undefined ? {} : { profileId }) });
+    const serverId = optionalIdentityQuery(url, "server");
+    if (!boundedIdentity(groupId) || profileId === false || serverId === false) return undefined;
+    return Object.freeze({ kind: "group", groupId, ...(profileId === undefined ? {} : { profileId }),
+      ...(serverId === undefined ? {} : { serverId }) });
   }
   if (url.hostname === "settings" && (url.pathname === "" || url.pathname === "/") && exactQuery(url, [])) {
     return Object.freeze({ kind: "settings" });
@@ -285,7 +287,7 @@ export async function executeMobileNativeIntent(
   }
 
   let snapshot = runtime.snapshot();
-  const serverId = intent.kind === "session" ? intent.serverId : undefined;
+  const { serverId } = intent;
   const profileId = resolveProfileId(snapshot, intent.profileId, serverId);
   if (profileId === undefined) {
     return recoverConnection(runtime, intent.profileId === undefined && serverId === undefined ? "connection-required" : "profile-unavailable");
@@ -310,7 +312,7 @@ export async function executeMobileNativeIntent(
     if (snapshot.status !== "connected" || !runtime.loadGroup || !runtime.showGroup) return unavailable();
     try { await runtime.loadGroup(intent.groupId); } catch { return current() ? unavailable() : "retired"; }
     if (!current()) return "retired";
-    const latest = runtime.snapshot(); if (latest.activeProfileId !== profileId || latest.status !== "connected") return unavailable();
+    const latest = runtime.snapshot(); if (!profileMatches(latest) || latest.status !== "connected") return unavailable();
     runtime.showGroup(intent.groupId); return "group";
   }
   if (snapshot.sessionIds.filter((sessionId) => sessionId === intent.sessionId).length !== 1) {
@@ -479,7 +481,7 @@ function boundedText(value: unknown, maximum: number): value is string {
 function mobileNativeIntentFingerprint(intent: MobileNativeIntent): string {
   if (intent.kind === "settings") return "settings";
   if (intent.kind === "focus") return `focus\u001f${intent.source ?? ""}`;
-  if (intent.kind === "group") return ["group", intent.groupId, intent.profileId ?? ""].join("\u001f");
+  if (intent.kind === "group") return ["group", intent.groupId, intent.profileId ?? "", intent.serverId ?? ""].join("\u001f");
   return ["session", intent.sessionId, intent.profileId ?? "", intent.messageId ?? "", intent.messageEventId ?? "", intent.serverId ?? ""]
     .join("\u001f");
 }

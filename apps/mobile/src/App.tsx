@@ -15,6 +15,7 @@ import { mobileTaskHeaderNotice } from "./mobile-task-header-notice";
 import { archiveMobileSession } from "./mobile-session-archive";
 import { mobileSideChatCopy } from "./mobile-side-chat";
 import { mobileTaskControlsRegion } from "./mobile-task-controls-region";
+import { useMobileHomeSurfaces } from "./mobile-home-surfaces";
 import { SvgXml } from "react-native-svg";
 import { StatusBar } from "expo-status-bar";
 import Constants from "expo-constants";
@@ -693,6 +694,7 @@ export function App() {
   const [deviceId, setDeviceId] = useState<string>();
   const [remoteDesktopEntry, setRemoteDesktopEntry] = useState<MobileRemoteDesktopEntry>();
   const [foreground, setForeground] = useState(AppState.currentState === "active");
+  useMobileHomeSurfaces(client, state, locale.effectiveLocale, foreground);
   const [remoteDesktopForeground, setRemoteDesktopForeground] = useState(AppState.currentState === "active");
   const remoteDesktopLifecycle = useRef<MobileRemoteDesktopLifecycleHandler | undefined>(undefined);
   const registerRemoteDesktopLifecycle = useCallback((handler: MobileRemoteDesktopLifecycleHandler) => {

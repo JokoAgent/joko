@@ -5136,6 +5136,45 @@ function mobileExtensionOwnerSnapshot(): Snapshot {
   });
 }
 
+it("reads a cold iOS widget refresh through the opted-in saved owner and fences a revoked response", async () => {
+  let currentDevice = create(DeviceSchema, { ...device, platform: "ios" });
+  const network = fakeNetwork();
+  network.readOwner = vi.fn(async () => ({ connection, device: currentDevice,
+    snapshot: create(SnapshotSchema, { ...snapshot, devices: [currentDevice] }) }));
+  network.getHomeUsage = vi.fn(async () => undefined);
+  const app = iosClient(network, memoryStorage(credential).storage);
+  app.setForeground(false);
+  await app.start();
+  expect(app.state).toMatchObject({ status: "connecting", automaticProfileId: credential.profileId });
+  expect(app.state.owner).toBeUndefined();
+  const signal = new AbortController().signal;
+  try {
+    const refresh = await app.homeSurfaceBackgroundUsage(signal);
+    expect(network.readOwner).toHaveBeenCalledExactlyOnceWith(credential, undefined, signal);
+    await refresh.source.readUsage(signal);
+    expect(network.getHomeUsage).toHaveBeenCalledExactlyOnceWith(credential, signal);
+    await expect(refresh.verify()).resolves.toBeUndefined();
+    currentDevice = create(DeviceSchema, { ...currentDevice, revoked: true });
+    await expect(refresh.verify()).rejects.toThrow();
+    expect(app.state.owner).toBeUndefined();
+  } finally { app.dispose(); }
+});
+
+it("lets the authorized Android home widgets read the current paired node and retires the source in the background", async () => {
+  const network = fakeNetwork();
+  network.getHomeUsage = vi.fn(async () => undefined);
+  const app = client(network, memoryStorage(credential).storage);
+  await app.start();
+  const source = app.homeSurfaceUsage();
+  expect(source).toBeDefined();
+  const signal = new AbortController().signal;
+  await source!.readUsage(signal);
+  expect(network.getHomeUsage).toHaveBeenCalledExactlyOnceWith(credential, signal);
+  app.setForeground(false);
+  expect(app.homeSurfaceUsage()).toBeUndefined();
+  await expect(source!.readUsage(signal)).rejects.toThrow(/source changed/u);
+});
+
 describe("native mobile push authority", () => {
   it("binds registration to the exact current iOS profile, Connection, Device revision, and late-response fence", async () => {
     const iosDevice = create(DeviceSchema, { ...device, platform: "ios" });

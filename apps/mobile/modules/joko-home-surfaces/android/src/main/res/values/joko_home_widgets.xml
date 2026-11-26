@@ -1,0 +1,7 @@
+<resources>
+  <string name="joko_quota_widget">Joko account quotas</string>
+  <string name="joko_usage_widget">Joko daily usage</string>
+  <color name="joko_widget_surface">#f7f6f3</color>
+  <color name="joko_widget_ink">#242a2d</color>
+  <color name="joko_widget_subtle">#637073</color>
+</resources>

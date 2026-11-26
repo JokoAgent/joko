@@ -77,6 +77,7 @@
         },
         "android": { "enabled": false }
       }],
+      "./with-joko-home-widgets.cjs",
       "expo-secure-store",
       ["expo-camera", { "cameraPermission": "Allow Joko to scan a device invitation or take a photo when you choose to use the camera.", "recordAudioAndroid": false }],
       ["expo-audio", {

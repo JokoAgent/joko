@@ -8,7 +8,7 @@ import { COLLABORATION_WORKER_HARD_LIMIT_CODE, ErrorInfoSchema } from "@joko/con
 import { projectProviderGroupRebalance, type ProviderGroupRebalanceSuggestion } from "@joko/contracts";
 import { assertMobileExtensionPackagePreview, type MobileExtensionPackagePreview } from "./mobile-extension-packages";
 import { currentQueueRetryInput, executeExtensionSettingsCall, ExtensionSettingsRejected, type ExtensionLibraryFileMatch } from "@joko/connection-transport";
-import type { SessionArchivePreview } from "@joko/contracts";
+import type { ProviderDescriptor, SessionArchivePreview } from "@joko/contracts";
 import { InteractionSchema, splitQuestionReferences } from "@joko/contracts";
 import { clipBareHttpAutolinkText } from "./mobile-markdown-url-boundary";
 import { clone, create, equals, fromJsonString, toBinary } from "@bufbuild/protobuf";
@@ -3952,6 +3952,97 @@ export class MobileClient {
     return mobilePushRetirementRoute(this.#ready(), current.endpointPublicKey);
   }
 
+  homeSurfaceUsage(): import("./mobile-home-surfaces").HomeSurfaceUsageSource | undefined {
+    const authority = this.mobilePushAuthority(), credential = this.#credential;
+    if (authority === undefined || credential === undefined || this.#joinedTask) return undefined;
+    const { providers, catalog } = this.#homeSurfaceProviders(this.#state.owner?.providers ?? []);
+    const assertCurrent = (signal: AbortSignal): void => {
+      signal.throwIfAborted();
+      if (this.#disposed || this.#credential !== credential || this.mobilePushAuthority()?.key !== authority.key
+        || this.#joinedTask || this.#homeSurfaceProviders(this.#state.owner?.providers ?? []).catalog !== catalog) {
+        throw new Error("The original widget usage source changed.");
+      }
+    };
+    return this.#homeSurfaceUsageSource(credential, authority.key, providers, catalog, assertCurrent);
+  }
+
+  async homeSurfaceBackgroundUsage(signal: AbortSignal): Promise<{
+    source: import("./mobile-home-surfaces").HomeSurfaceUsageSource;
+    verify: () => Promise<void>;
+  }> {
+    const selected = () => this.#activeProfileId ?? (this.#state.status === "connecting" ? this.#automaticProfileId : undefined);
+    const profile = this.#profiles.find(item => item.profileId === selected());
+    if (this.platform !== "ios" || profile === undefined) throw new Error("The widget connection is unavailable.");
+    const epoch = this.#epoch;
+    const assertCurrent = (request: AbortSignal): void => {
+      signal.throwIfAborted(); request.throwIfAborted();
+      if (this.#disposed || this.#foreground || this.#joinedTask || this.#epoch !== epoch || selected() !== profile.profileId
+        || this.#state.status === "revoked" || this.#state.status === "unpaired" || !this.#profiles.includes(profile)
+        || this.#state.saved.some(item => item.profileId === profile.profileId
+          && ["missing", "unreadable", "identity-conflict"].includes(item.credentialState))) {
+        throw new Error("The original widget usage source changed.");
+      }
+    };
+    assertCurrent(signal);
+    await this.storage.loadEndpointTransport?.(profile);
+    assertCurrent(signal);
+    rememberEndpointTrust(profile);
+    const node = await this.network.inspect(profile.origin, signal);
+    assertCurrent(signal);
+    if (node.serverId !== profile.serverId) throw new CredentialIdentityError();
+    const credential = await this.storage.loadCredential(profile.profileId);
+    assertCurrent(signal);
+    if (credential === undefined || !credentialMatchesProfile(credential, profile)) throw new CredentialIdentityError();
+    const inspectOwner = async () => {
+      assertCurrent(signal);
+      const owner = await this.network.readOwner(credential, undefined, signal);
+      assertCurrent(signal);
+      this.#assertOwner(credential, owner, node);
+      const deviceRevision = owner.device.version?.revision?.value ?? 0n;
+      if (owner.device.platform.trim().toLocaleLowerCase("en-US") !== "ios" || !owner.device.connectionIds.includes(credential.connectionId)
+        || deviceRevision < 1n) throw new CredentialIdentityError();
+      return { deviceRevision, ...this.#homeSurfaceProviders(owner.snapshot.providers) };
+    };
+    const original = await inspectOwner();
+    return {
+      source: this.#homeSurfaceUsageSource(credential, JSON.stringify([profile.profileId, epoch, original.deviceRevision.toString()]),
+        original.providers, original.catalog, assertCurrent),
+      verify: async () => {
+        const current = await inspectOwner();
+        if (current.deviceRevision !== original.deviceRevision || current.catalog !== original.catalog) {
+          throw new Error("The original widget usage source changed.");
+        }
+      }
+    };
+  }
+
+  #homeSurfaceProviders(catalogProviders: readonly ProviderDescriptor[]) {
+    const providers = this.network.getProviderUsage === undefined ? [] : catalogProviders.filter(mobileProviderUsageSupported)
+      .sort((left, right) => left.displayName.localeCompare(right.displayName) || left.providerId.localeCompare(right.providerId)).slice(0, 12);
+    return { providers, catalog: JSON.stringify(providers.map(mobileProviderUsageIdentity)) };
+  }
+
+  #homeSurfaceUsageSource(credential: PairedCredential, key: string, providers: readonly ProviderDescriptor[], catalog: string,
+    assertCurrent: (signal: AbortSignal) => void): import("./mobile-home-surfaces").HomeSurfaceUsageSource {
+    return {
+      key: JSON.stringify([key, catalog]), catalog, providers,
+      readQuota: async (provider, signal) => {
+        assertCurrent(signal);
+        if (!providers.includes(provider)) throw new Error("The original widget Provider is unavailable.");
+        const result = await this.network.getProviderUsage?.(credential, provider.backendId, provider.providerId, signal);
+        assertCurrent(signal);
+        if (result !== undefined && result.providerId !== provider.providerId) throw new Error("The widget Provider changed.");
+        return result;
+      },
+      readUsage: async signal => {
+        assertCurrent(signal);
+        const result = await this.network.getHomeUsage?.(credential, signal);
+        assertCurrent(signal);
+        return result;
+      }
+    };
+  }
+
   async getMobilePushCapability(
     authority: MobilePushAuthority,
     signal?: AbortSignal
@@ -4200,7 +4291,9 @@ export class MobileClient {
     return ++this.#epoch;
   }
 
-  #current(epoch: number): boolean { return !this.#disposed && this.#foreground && this.#epoch === epoch; }
+  #current(epoch: number, allowBackground = false): boolean {
+    return !this.#disposed && (allowBackground || this.#foreground) && this.#epoch === epoch;
+  }
 
   #partnerPrivateCredentialKey(credential: PairedCredential | undefined): string | undefined {
     return credential === undefined ? undefined : [credential.profileId, credential.origin, credential.serverId,
@@ -4714,7 +4807,8 @@ export class MobileClient {
         if (record.state === "staging") await this.#finishTaskOutboxHandoff(record);
         else if (record.state === "restoring") await this.#restoreTaskOutboxDraft(record);
       }
-      if (!this.#current(epoch)) return;
+      const automaticProfile = index.profiles.find((profile) => profile.profileId === index.automaticProfileId);
+      if (!this.#current(epoch, this.platform === "ios" && automaticProfile !== undefined)) return;
       this.#profiles = [...index.profiles];
       this.#automaticProfileId = index.automaticProfileId;
       this.#allPending = pending;
@@ -4731,14 +4825,15 @@ export class MobileClient {
         error: undefined
       });
       if (index.automaticProfileId === undefined) return;
-      if (!this.#profiles.some((profile) => profile.profileId === index.automaticProfileId)) {
+      if (automaticProfile === undefined) {
         this.#set({
           status: "unpaired",
           error: "The automatic Joko connection no longer exists on this device. Turn automatic entry off or choose another saved connection."
         });
         return;
       }
-      try { await this.connectSaved(index.automaticProfileId); }
+      if (!this.#foreground) return;
+      try { await this.connectSaved(automaticProfile.profileId); }
       catch { /* connectSaved owns the exact, actionable recovery state. */ }
     } catch (error) {
       if (this.#current(epoch)) this.#set({ status: "unpaired", error: message(error) });

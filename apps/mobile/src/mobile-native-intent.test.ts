@@ -89,7 +89,26 @@ describe("mobile public native intents", () => {
   it("parses the bounded group handoff and rejects task-only query fields", () => {
     expect(parseMobileNativeIntent("joko://partner-group/group-one")).toEqual({ kind: "group", groupId: "group-one" });
     expect(parseMobileNativeIntent("joko://partner-group/group-one?profile=node-one")).toEqual({ kind: "group", groupId: "group-one", profileId: "node-one" });
-    for (const suffix of ["/", "/one/two", "/one?message=two", "/one?profile=a&profile=b", "/one#two"]) expect(parseMobileNativeIntent(`joko://partner-group${suffix}`)).toBeUndefined();
+    for (const suffix of ["/", "/one/two", "/one?message=two", "/one?profile=a&profile=b", "/one?server=", "/one?server=a&server=b", "/one#two"]) expect(parseMobileNativeIntent(`joko://partner-group${suffix}`)).toBeUndefined();
+  });
+  it.each([true, false])("opens a delayed group notification on its source A when B has the same group ID (%s)", async collision => {
+    const sources = [{ profileId: "A", serverId: "server-1" }, { profileId: "B", serverId: "server-2" }];
+    const url = "joko://partner-group/group-one?server=server-1";
+    const intent = parseMobileNotificationResponseIntent({ notification: { request: { content: { data: { intent: url } } } } });
+    expect(intent).toBe(url);
+    const f = harness(intent!, snapshot({ status: "connected", activeProfileId: "B", savedProfileIds: ["A", "B"], savedSources: sources }));
+    f.fake.onConnect = profileId => { f.fake.state = { ...f.fake.state, activeProfileId: profileId }; };
+    const loads: string[] = [], opens: string[] = [];
+    f.runtime.loadGroup = async id => {
+      loads.push(`${f.fake.state.activeProfileId}/${id}`);
+      if (f.fake.state.activeProfileId === "B" && !collision) throw new Error("Group is missing on B");
+    };
+    f.runtime.showGroup = id => { opens.push(`${f.fake.state.activeProfileId}/${id}`); };
+    await expect(executeMobileNativeIntent(f.claim, f.delivery, f.runtime)).resolves.toBe("group");
+    expect(f.fake.connectProfile).toHaveBeenCalledExactlyOnceWith("A");
+    expect(loads).toEqual(["A/group-one"]); expect(opens).toEqual(["A/group-one"]);
+    expect(f.fake.recoveries).toEqual([]);
+    expect(f.delivery.offer("joko://partner-group/group-one?server=server-2")).toBe(true);
   });
   it("checks the group on the selected authenticated node without using the ordinary task directory", async () => {
     const f = harness("joko://partner-group/group-one", snapshot({ status: "connected", activeProfileId: "node-one", savedProfileIds: ["node-one"], sessionIds: [] }));

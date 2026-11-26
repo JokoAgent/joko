@@ -134,6 +134,8 @@ export function loadMobileReleaseIdentity(mobileDirectory) {
     iosBundleIdentifier,
     androidPackage,
     appGroupId,
+    widgetAppGroupId: `group.${iosBundleIdentifier}.widgets`,
+    widgetExtensionBundleIdentifier: `${iosBundleIdentifier}.home-widgets`,
     shareExtensionBundleIdentifier
   });
 }
@@ -294,6 +296,7 @@ export function resolveIosSigningConfiguration(environment) {
   const teamId = cleanEnvironmentValue(environment.JOKO_IOS_TEAM_ID, "JOKO_IOS_TEAM_ID");
   const appProfile = cleanEnvironmentValue(environment.JOKO_IOS_APP_PROFILE, "JOKO_IOS_APP_PROFILE");
   const shareProfile = cleanEnvironmentValue(environment.JOKO_IOS_SHARE_PROFILE, "JOKO_IOS_SHARE_PROFILE");
+  const widgetProfile = cleanEnvironmentValue(environment.JOKO_IOS_WIDGET_PROFILE, "JOKO_IOS_WIDGET_PROFILE");
   const identity = cleanEnvironmentValue(environment.JOKO_IOS_SIGNING_IDENTITY, "JOKO_IOS_SIGNING_IDENTITY");
   const expectedCertificateSha256 = cleanEnvironmentValue(
     environment.JOKO_IOS_SIGNING_CERT_SHA256,
@@ -305,6 +308,7 @@ export function resolveIosSigningConfiguration(environment) {
     ["JOKO_IOS_TEAM_ID", teamId],
     ["JOKO_IOS_APP_PROFILE", appProfile],
     ["JOKO_IOS_SHARE_PROFILE", shareProfile],
+    ["JOKO_IOS_WIDGET_PROFILE", widgetProfile],
     ["JOKO_IOS_SIGNING_IDENTITY", identity],
     ["JOKO_IOS_SIGNING_CERT_SHA256", expectedCertificateSha256]
   ].filter(([, value]) => !value).map(([name]) => name);
@@ -320,6 +324,7 @@ export function resolveIosSigningConfiguration(environment) {
     teamId,
     appProfile,
     shareProfile,
+    widgetProfile,
     identity,
     expectedCertificateSha256: normalizeCertificateSha256(
       expectedCertificateSha256,
@@ -327,7 +332,8 @@ export function resolveIosSigningConfiguration(environment) {
     ),
     exportMethod,
     appProfilePath: cleanEnvironmentValue(environment.JOKO_IOS_APP_PROFILE_PATH, "JOKO_IOS_APP_PROFILE_PATH"),
-    shareProfilePath: cleanEnvironmentValue(environment.JOKO_IOS_SHARE_PROFILE_PATH, "JOKO_IOS_SHARE_PROFILE_PATH")
+    shareProfilePath: cleanEnvironmentValue(environment.JOKO_IOS_SHARE_PROFILE_PATH, "JOKO_IOS_SHARE_PROFILE_PATH"),
+    widgetProfilePath: cleanEnvironmentValue(environment.JOKO_IOS_WIDGET_PROFILE_PATH, "JOKO_IOS_WIDGET_PROFILE_PATH")
   });
 }
 
@@ -335,7 +341,8 @@ export function patchIosManualSigning(source, identity, signing) {
   let patched = source;
   for (const target of [
     { bundleIdentifier: identity.iosBundleIdentifier, profile: signing.appProfile },
-    { bundleIdentifier: identity.shareExtensionBundleIdentifier, profile: signing.shareProfile }
+    { bundleIdentifier: identity.shareExtensionBundleIdentifier, profile: signing.shareProfile },
+    { bundleIdentifier: identity.widgetExtensionBundleIdentifier, profile: signing.widgetProfile }
   ]) {
     const sectionStart = patched.indexOf("/* Begin XCBuildConfiguration section */");
     const sectionEnd = patched.indexOf("/* End XCBuildConfiguration section */");
@@ -366,7 +373,8 @@ export function patchIosManualSigning(source, identity, signing) {
 export function buildIosExportOptionsPlist(identity, signing) {
   const profileEntries = [
     [identity.iosBundleIdentifier, signing.appProfile],
-    [identity.shareExtensionBundleIdentifier, signing.shareProfile]
+    [identity.shareExtensionBundleIdentifier, signing.shareProfile],
+    [identity.widgetExtensionBundleIdentifier, signing.widgetProfile]
   ].map(([bundleId, profile]) => `        <key>${xml(bundleId)}</key>\n        <string>${xml(profile)}</string>`).join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -451,7 +459,9 @@ export function createArtifactManifest({ platform, identity, source, runtimeVers
       } : {
         bundleIdentifier: identity.iosBundleIdentifier,
         shareExtensionBundleIdentifier: identity.shareExtensionBundleIdentifier,
+        widgetExtensionBundleIdentifier: identity.widgetExtensionBundleIdentifier,
         appGroupId: identity.appGroupId,
+        widgetAppGroupId: identity.widgetAppGroupId,
         buildNumber: identity.buildNumber
       })
     },
