@@ -123,8 +123,14 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
         .map(({ component, code, message }) => ({ component, code, message }));
       throw new Error(`The original native edit did not reach queue admission. ${JSON.stringify(diagnostics)}`, { cause });
     }
-    const resend = await waitFor(() => Promise.resolve(store.listQueueItems({ sessionId }).find(item => item.operationId === resendOperationId)),
-      item => item?.state === "completed", "the edit's original queue item completes");
+    const { item: resend } = await waitFor(async () => {
+      const item = store.listQueueItems({ sessionId }).find(item => item.operationId === resendOperationId);
+      const control = store.getQueueControl(sessionId);
+      return { item, paused: control.paused, interactionLocked: control.interactionLocked,
+        providerCallsSinceEdit: fixture!.providerRequests.length - requestCountBeforeEdit };
+    }, value => value.item?.state === "completed" || value.item?.state === "failed" || value.item?.state === "cancelled",
+      "the edit's original queue item to settle through native Pi", 30_000);
+    expect(resend?.state).toBe("completed");
     expect(resend?.body.text).toBe("My revised loaded input.");
     expect(store.getOperation(resendOperationId)).toMatchObject({ kind: "sendInput", status: "completed" });
     expect(store.findVisibleSessionMessageOrigin({ sessionId, eventId: editedSource.eventId })).toBeUndefined();

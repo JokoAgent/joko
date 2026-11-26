@@ -81,10 +81,12 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm codegen:check
           pnpm --filter @joko/orchestrator... -r --if-present build
-      - name: Check the formal Partner surface and exact retained todo receipts
+      - name: Check the Partner contract and access to existing tasks after a Home move
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
         shell: bash
-        run: pnpm --filter @joko/contracts exec node --test test/contract-surface.test.mjs test/partner-glance-todos.test.mjs 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/contracts.log"
+        run: |
+          pnpm --filter @joko/contracts exec node --test test/contract-surface.test.mjs 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/contracts.log"
+          pnpm --filter @joko/orchestrator exec vitest run src/partner-home-runtime.test.ts -t 'keeps the original affair readable' 2>&1 | tee "$RUNNER_TEMP/orchestrator-regressions/partner-home.log"
       - name: Check service and dependency types
         if: ${{ !cancelled() && steps.regression_inputs.outcome == 'success' }}
         shell: bash
@@ -585,7 +587,7 @@ jobs:
         run: pnpm --filter @joko/e2e test --shard=${{ matrix.workload == 'e2e-1' && '1/4' || matrix.workload == 'e2e-2' && '2/4' || matrix.workload == 'e2e-3' && '3/4' || '4/4' }} 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-e2e.log"
 
       - name: Upload completed Connect end-to-end test logs
-        if: ${{ startsWith(matrix.workload, 'e2e-') && !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ !cancelled() && (steps.workspace_e2e_linux.outcome == 'success' || steps.workspace_e2e_linux.outcome == 'failure' || steps.workspace_e2e_desktop.outcome == 'success' || steps.workspace_e2e_desktop.outcome == 'failure') }}
         uses: actions/upload-artifact@v4
         with:
           name: ci-workspace-e2e-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}-${{ matrix.workload }}
@@ -755,7 +757,7 @@ jobs:
         run: |
           pnpm --filter @joko/connection-transport test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/connection-transports.log"
           pnpm --filter @joko/orchestrator exec vitest run linkspan src/config.test.ts src/connection-manager.test.ts device-peer src/remote-desktop-coordinator.test.ts src/hosted-agent-desktop-service.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/connection-media-lifecycles.log"
-          pnpm --filter @joko/desktop exec vitest run linkspan src/connection-transport.test.ts test/remote-desktop-media.test.ts test/remote-desktop-native.test.ts test/secure-files.test.ts test/native-workspace-directory-download.test.ts test/distribution.test.ts test/mcp-app-host.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-sdk-connections.log"
+          pnpm --filter @joko/desktop exec vitest run linkspan src/connection-transport.test.ts test/remote-desktop-media- test/remote-desktop-native- test/secure-files.test.ts test/native-workspace-directory-download.test.ts test/distribution.test.ts test/mcp-app-host.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-sdk-connections.log"
           pnpm --filter @joko/web exec vitest run linkspan src/gateway.auth-context.test.ts src/local-state-credentials.test.ts DevicePairingInvitation ConnectionScreen 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/web-sdk-connections.log"
           pnpm --filter @joko/mobile exec vitest run linkspan network mobile-client mobile-iroh-native mobile-http-connect-native connection-storage mobile-connection-protocol mobile-workspace-inputs MobileDevicePairingInvitation MobileSharedConnectionScreen MobileSettingsScreen mobile-file-share.secure-transfer mobile-release-artifact 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/mobile-sdk-connections.log"
 

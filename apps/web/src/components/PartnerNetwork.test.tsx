@@ -222,6 +222,12 @@ async function editNetworkDraftImage(parent: ParentNode, draw: boolean): Promise
   act(() => { image.dispatchEvent(new Event("load")); button("workspace.imageAnnotate", overlay).click(); });
   if (draw) { for (const type of ["pointerdown", "pointerup"]) { const event = new Event(type, { bubbles: true }); Object.defineProperties(event, { pointerId: { value: 1 }, pointerType: { value: "pen" }, button: { value: 0 }, clientX: { value: 100 }, clientY: { value: 100 } }); act(() => (type === "pointerdown" ? wrap : overlay).dispatchEvent(event)); } }
   else { expect(overlay.querySelectorAll(".workspace-image-lightbox__image-wrap g")).toHaveLength(1); act(() => button("workspace.imageUndoAnnotation", overlay).click()); }
-  await act(async () => { button("Save", overlay).click(); await new Promise(resolve => setTimeout(resolve, 180)); });
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    await act(async () => { button("Save", overlay).click(); });
+    await act(async () => { await vi.runOnlyPendingTimersAsync(); });
+  } finally {
+    vi.useRealTimers();
+  }
   expect(document.querySelector(".workspace-image-lightbox")).toBeNull();
 }

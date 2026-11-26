@@ -74,10 +74,17 @@ export async function buildSourceConsumers(checkout, destination, pnpm) {
     await pnpm(args, checkout);
   } catch (error) {
     const stderr = error?.stderr;
-    if (typeof stderr !== 'string' || !/Command failed: rustup toolchain install \S+/u.test(stderr)
-      || !/https:\/\/static\.rust-lang\.org\/dist\/channel-rust-\S+.*dns error:/iu.test(stderr)
+    if (typeof stderr !== 'string') throw error;
+    const rustToolchainDnsFailure = /Command failed: rustup toolchain install \S+/u.test(stderr)
+      && /https:\/\/static\.rust-lang\.org\/dist\/channel-rust-\S+.*dns error:/iu.test(stderr);
+    const responseBodyReset = /^TypeError: terminated\r?\n[ \t]+at Fetch\.onAborted \(node:internal\/deps\/undici\/[^\r\n]+(?:\r?\n[ \t]+at [^\r\n]+)*\r?\n[ \t]+\[cause\]: Error: read ECONNRESET\r?$/mu;
+    const browserToolDownloadReset = /^Error: Command failed: .+ build:browser-runtimes\r?$/mu.test(stderr)
+      && (/^\[TypeError: fetch failed\] \{\r?\n[ \t]+\[cause\]: Error: read ECONNRESET\r?$/mu.test(stderr) || responseBodyReset.test(stderr));
+    if (!(rustToolchainDnsFailure || browserToolDownloadReset)
       || !(await readdir(destination).then(entries => entries.length === 0, () => false))) throw error;
-    console.warn('The fixed Rust download could not resolve its official host. Retrying the same Linkspan build once.');
+    console.warn(rustToolchainDnsFailure
+      ? 'The fixed Rust download could not resolve its official host. Retrying the same Linkspan build once.'
+      : 'A Linkspan browser build tool download was reset. Retrying the same build once.');
     await delay(1_000);
     await pnpm(args, checkout);
   }

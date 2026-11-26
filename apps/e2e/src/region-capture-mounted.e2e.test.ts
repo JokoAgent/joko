@@ -1,6 +1,7 @@
 import { chromium, type Browser } from "playwright-core";
 import { afterEach, expect, it } from "vitest";
 import { RealPiSystemFixture } from "./real-pi-fixture.js";
+import { conditionTimeoutMs } from "./test-deadlines.js";
 
 const executable = process.env.JOKO_BROWSER_EXECUTABLE?.trim();
 const directory = process.env.JOKO_MOUNTED_WEB_DIR?.trim();
@@ -52,7 +53,8 @@ mounted("applies mosaic and blur to the PNG sent for copy or attach and restores
   const evidence = () => page.evaluate(() => Reflect.get(window, "redactionTestResults") as { action: string; language?: string; signature: string; pixels: number[][] }[]);
   const exportPng = async (name: string, count: number) => {
     await page.getByRole("button", { name, exact: true }).click();
-    await expect.poll(async () => (await evidence()).length).toBe(count);
+    await expect.poll(async () => ({ count: (await evidence()).length, notice: await page.locator("#status").textContent() }),
+      { timeout: conditionTimeoutMs, message: `${name} must finish exporting its PNG` }).toEqual({ count, notice: "" });
     return (await evidence()).at(-1)!;
   };
   const original = await exportPng("Copy", 1);

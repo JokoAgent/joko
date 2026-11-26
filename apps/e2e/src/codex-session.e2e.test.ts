@@ -21,6 +21,7 @@ import {
   abortRunMutation, createManualScheduleMutation, createSessionMutation, navigateMutation, pauseQueueMutation, queueItemIdFrom, queueRunIdFrom, resumeQueueMutation,
   retryRunMutation, runIdFrom, scheduleIdFrom, sendInputMutation, sessionIdFrom, setQueueInteractionLockMutation, submit, triggerScheduleMutation
 } from "./operations.js";
+import { nativeRunTimeoutMs } from "./test-deadlines.js";
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim()
   ? it : it.skip;
@@ -1405,16 +1406,40 @@ mountedIt("shows a Codex turn, restores it after reload, and isolates another ta
     await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challenge.challengeId));
     await page.getByLabel("Device name").fill("Codex mounted Web");
     await page.locator("form.pair-form button[type=submit]").click();
-    const composer = page.locator(".composer-rich-editor__content");
-    await composer.waitFor({ state: "visible", timeout: 30_000 });
-    await composer.fill("Codex mounted input");
-    await page.getByRole("button", { name: "Send", exact: true }).click();
-    await waitFor(async () => native.transport?.requests.some((request) => request.method === "turn/start") ?? false,
-      (dispatched) => dispatched, "mounted Codex dispatch");
-    await waitFor(async () => fixture!.application.store.listQueueItems({ sessionId }),
-      items => items.some(item => item.state === "backend_accepted"), "the mounted original Codex turn");
+    const pane = page.locator(`.session-pane[data-input-session-id="${sessionId}"]`);
+    const composer = pane.locator(".composer-rich-editor__content[contenteditable='true']");
+    const send = pane.getByRole("button", { name: "Send", exact: true });
+    await pane.locator(`.timeline[data-timeline-session-id="${sessionId}"]:not([aria-busy="true"])`)
+      .waitFor({ state: "visible", timeout: 30_000 });
+    const input = "Codex mounted input";
+    await composer.fill(input);
+    const [response] = await Promise.all([page.waitForResponse(response => {
+      const bytes = response.request().postDataBuffer();
+      if (!response.url().endsWith("/joko.v1.OperationService/SubmitOperation") || bytes === null) return false;
+      const payload = fromBinary(SubmitOperationRequestSchema, bytes).mutation?.payload;
+      return payload?.case === "sendInput" && payload.value.sessionId === sessionId;
+    }, { timeout: 15_000 }), send.click()]).catch(async cause => {
+      const feedback = await page.locator(".app-banners").allTextContents();
+      throw new Error(`The mounted Codex task did not receive its Send response. Browser feedback: ${feedback.join(" ")}`, { cause });
+    });
+    const request = fromBinary(SubmitOperationRequestSchema, response.request().postDataBuffer()!);
+    expect(request.mutation?.payload).toMatchObject({ case: "sendInput", value: {
+      input: { parts: [{ content: { case: "text", value: input } }] }
+    } });
+    expect(response.ok(), response.ok() ? undefined : await response.text()).toBe(true);
+    const { operation } = fromBinary(SubmitOperationResponseSchema, await response.body());
+    expect(operation?.operationId).toBe(request.operationId);
+    expect(operation?.state, operation?.error?.message).toBe(OperationState.SUCCEEDED);
+    const queueId = queueItemIdFrom(operation!);
+    await waitFor(async () => {
+      const item = fixture!.application.store.getQueueItem(queueId);
+      return { state: item.state, error: item.error?.code };
+    }, item => item.state === "backend_accepted", "the original mounted Codex Queue item", nativeRunTimeoutMs);
+    const turns = native.threads.get(threadId)!.turns;
+    expect(turns).toMatchObject([{ items: [{ type: "userMessage", clientId: request.operationId,
+      content: [{ type: "text", text: input }] }] }]);
     const status = page.locator(".retry-status-indicator");
-    const samplingTurnId = native.threads.get(threadId)!.turns.at(-1)!["id"]!;
+    const samplingTurnId = turns[0]!["id"]!;
     await native.transport!.emitNotification("item/agentMessage/delta", { threadId, turnId: samplingTurnId, itemId: "interrupted-sample-A",
       delta: "Received text from the interrupted sample." });
     const samplingRow = page.locator('.message-assistant[data-message-client-id="interrupted-sample-A"]');
@@ -1468,7 +1493,7 @@ mountedIt("shows a Codex turn, restores it after reload, and isolates another ta
     await page.locator(".timeline").getByText("Codex mounted answer", { exact: true }).waitFor({ state: "visible", timeout: 20_000 });
 
     await composer.fill("Stop after the received native text");
-    await page.getByRole("button", { name: "Send", exact: true }).click();
+    await send.click();
     const partialQueue = await waitFor(async () => fixture!.application.store.listQueueItems({ sessionId }).find(item => item.state === "backend_accepted"),
       item => item !== undefined, "the second original Codex turn");
     const nativeTurn = native.threads.get(threadId)!.turns.at(-1)!;
@@ -1506,7 +1531,7 @@ mountedIt("shows a Codex turn, restores it after reload, and isolates another ta
 
     native.threads.delete(threadId);
     await composer.fill("Native identity is missing");
-    await page.getByRole("button", { name: "Send", exact: true }).click();
+    await send.click();
     await waitFor(async () => fixture!.application.store.listRuns({ sessionId }).map((run) => run.descriptor.state),
       (states) => states.length === 3 && states.includes("failed"), "missing native identity visible run");
     expect(native.threads.size).toBe(0);

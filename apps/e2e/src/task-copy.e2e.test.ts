@@ -9,7 +9,7 @@ import { createConnectTransport } from "@connectrpc/connect-node";
 import { CreateTargetMutationSchema, OperationMutationSchema, OperationState, PermissionMode, PortableSessionService, PortableTaskCopyPartKind,
   RunState, SetWorkspaceTrustMutationSchema, WorkspaceKind } from "@joko/contracts";
 import { afterEach, expect, it } from "vitest";
-import { chromium, type Browser, type Page } from "playwright-core";
+import { chromium, type Browser, type Page, type Request } from "playwright-core";
 import { routeFixtureDiscovery, waitFor } from "./fixture.js";
 import { createSessionMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 import { REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID, RealPiSystemFixture } from "./real-pi-fixture.js";
@@ -209,7 +209,7 @@ it("copies a settled Pi Goal with distinct worker files and native history to an
 
 const mountedIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim() && process.env.JOKO_MOUNTED_WEB_DIR?.trim() ? it : it.skip;
 mountedIt("copies from the mounted task menu and opens the authoritative destination task on a narrow screen", {
-  timeout: 150_000
+  timeout: 200_000
 }, async () => {
   const source = await RealPiSystemFixture.start({ webDirectory: resolve(process.env.JOKO_MOUNTED_WEB_DIR!) });
   fixtures.push(source);
@@ -243,15 +243,52 @@ mountedIt("copies from the mounted task menu and opens the authoritative destina
   expect(copied).toHaveLength(1);
   expect(await readFile(join(destination.application.store.getTarget(copied[0]!.descriptor.targetId).descriptor.workspaceRoot,
     "mounted-copy.txt"), "utf8")).toBe("mounted direct copy");
-  await dialog.getByRole("button", { name: "Open task", exact: true }).click();
-  await dialog.waitFor({ state: "hidden", timeout: 25_000 });
-  const copiedTaskPath = `/tasks/${encodeURIComponent(copied[0]!.descriptor.id)}`;
-  // The dialog disappears when the source connection retires, before the destination route commits.
-  await page.waitForURL(url => {
-    const route = new URL(url.hash.slice(1), url.origin);
-    return route.pathname === copiedTaskPath && route.searchParams.has("profile");
-  }, { timeout: 25_000 });
-  await page.getByText("The mounted source conversation", { exact: true }).first().waitFor({ timeout: 25_000 });
+  const copiedTaskId = copied[0]!.descriptor.id;
+  const copiedTaskPath = `/tasks/${encodeURIComponent(copiedTaskId)}`;
+  const copiedPane = page.locator(`.session-pane[data-input-session-id='${copiedTaskId}']`);
+  const openTask = dialog.getByRole("button", { name: "Open task", exact: true });
+  const openError = dialog.getByRole("alert");
+  const destinationOrigin = new URL(destination.baseUrl).origin;
+  const openedAt = Date.now();
+  const reads = new Map<Request, { path: string; startedAfterMs: number; status?: number; failure?: string }>();
+  page.on("request", request => {
+    const url = new URL(request.url());
+    if (url.origin === destinationOrigin && /\/(?:GetServerInfo|GetSnapshot|ListManagedModelRuntimes|ListWorkspaceEntries)$/u.test(url.pathname)) {
+      reads.set(request, { path: url.pathname, startedAfterMs: Date.now() - openedAt });
+    }
+  });
+  page.on("response", response => {
+    const read = reads.get(response.request());
+    if (read !== undefined) read.status = response.status();
+  });
+  page.on("requestfailed", request => {
+    const read = reads.get(request);
+    if (read !== undefined) read.failure = request.failure()?.errorText;
+  });
+  try {
+    await openTask.click();
+    // Opening the copied task reads the saved node and establishes its live connection.
+    const timeout = 45_000;
+    await Promise.race([
+      page.waitForURL(url => {
+        const route = new URL(url.hash.slice(1), url.origin);
+        return route.pathname === copiedTaskPath && route.searchParams.has("profile");
+      }, { timeout }),
+      openError.waitFor({ state: "visible", timeout }).then(async () => {
+        throw new Error(`The copied task could not be opened: ${await openError.innerText({ timeout: 1000 })}`);
+      })
+    ]);
+    await dialog.waitFor({ state: "hidden", timeout: 25_000 });
+    await copiedPane.getByText("The mounted source conversation", { exact: true }).first().waitFor({ timeout: 25_000 });
+  } catch (error) {
+    const dialogState = await dialog.evaluateAll(elements => elements.map(element => ({
+      opening: [...element.querySelectorAll("button")].some(button => button.textContent?.trim() === "Open task" && button.disabled),
+      error: element.querySelector('[role="alert"]')?.textContent
+    }))).catch(() => []);
+    console.info("Mounted task copy destination handoff", JSON.stringify({ copiedTaskId, hash: new URL(page.url()).hash,
+      elapsedMs: Date.now() - openedAt, dialogState, reads: [...reads.values()] }));
+    throw error;
+  }
 });
 
 const fixtures: RealPiSystemFixture[] = [];

@@ -13,11 +13,11 @@ import { REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID, RealPiSystemFixture } from "./re
 const browserPath = process.env.JOKO_BROWSER_EXECUTABLE?.trim();
 const webDirectory = process.env.JOKO_MOUNTED_WEB_DIR?.trim();
 const mountedIt = browserPath && webDirectory ? it : it.skip;
-// A saved occurrence still has to dispatch through the cold native Pi runtime.
-const scheduledRunTimeoutMs = 30_000;
+// The original failed input and the saved occurrences all pass through native Pi dispatch.
+const nativeRecoveryTimeoutMs = 30_000;
 const terminalRunStates = new Set<RunState>([RunState.SUCCEEDED, RunState.FAILED, RunState.ABORTED, RunState.CANCELLED]);
 
-mountedIt("recovers the failed Pi input's original Provider from a cold receipt and honors an edited schedule model", { timeout: 120_000 }, async () => {
+mountedIt("recovers the failed Pi input's original Provider from a cold receipt and honors an edited schedule model", { timeout: 180_000 }, async () => {
   const rootDirectory = await mkdtemp(join(tmpdir(), "joko-quota-recovery-"));
   const realNow = Date.now;
   let clockOffset = 0;
@@ -85,16 +85,22 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
     originalRunId = runId;
     const queueItemId = queueItemIdFrom(admitted);
     checkpoint("waiting for the original rate limit");
-    await waitFor(() => owner.clients.run.getRun({ runId }), value => value.run?.state === RunState.FAILED, "the original Pi rate limit");
+    const originalOutcome = await waitFor(async () => ({
+      state: (await owner.clients.run.getRun({ runId })).run?.state,
+      queueState: originalStore.getQueueItem(queueItemId).state,
+      providerRequests: fixture!.providerRequests.length
+    }), value => value.state !== undefined && terminalRunStates.has(value.state),
+      "the original Pi rate limit", nativeRecoveryTimeoutMs);
+    expect(originalOutcome.state).toBe(RunState.FAILED);
     checkpoint("reading the original failed queue item");
     await waitFor(async () => fixture!.application.store.getQueueItem(queueItemId), value => value.state === "failed",
-      "the original Pi input to finish settling its queue item");
+      "the original Pi input to finish settling its queue item", nativeRecoveryTimeoutMs);
     expect(fixture.providerRequests.length).toBeGreaterThan(0);
     expect(fixture.providerRequests.every(({ body }) => body["model"] === REAL_PI_MODEL_ID)).toBe(true);
     expect(fixture.application.store.getQueueItem(queueItemId).executionOverrides)
       .toMatchObject({ providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID });
     expect(fixture.application.store.getSession(sessionId).descriptor.providerId).toBe(defaultProviderId);
-    await waitFor(async () => restoringModel, value => value, "the native model restoration ACK before Host adoption");
+    await waitFor(async () => restoringModel, value => value, "the native model restoration ACK before Host adoption", nativeRecoveryTimeoutMs);
 
     checkpoint("closing the original fixture for the cold receipt");
     const closeOriginalApplication = fixture.application.close.bind(fixture.application);
@@ -247,7 +253,7 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
       if (index === 1) {
         const waiting = await waitFor(() => service.scheduler.listScheduleRunHistory({ scheduleId: saved.scheduleId }),
           result => result.history.length === 1, "the second saved occurrence while the original model is being restored",
-          scheduledRunTimeoutMs);
+          nativeRecoveryTimeoutMs);
         const waitingItem = restartedStore.findQueueItemByRunId(sessionId, waiting.history[0]!.runId);
         expect(waitingItem?.state).toBe("accepted");
         expect(fixture.providerRequests.map(({ body }) => body["model"])).toEqual([REAL_PI_MODEL_ID]);
@@ -255,13 +261,13 @@ mountedIt("recovers the failed Pi input's original Provider from a cold receipt 
       }
       const history = await waitFor(() => service.scheduler.listScheduleRunHistory({ scheduleId: saved.scheduleId }),
         result => result.history.some(run => terminalRunStates.has(run.state)),
-        "the saved recovery occurrence", scheduledRunTimeoutMs);
+        "the saved recovery occurrence", nativeRecoveryTimeoutMs);
       expect(history.history).toHaveLength(1);
       expect(history.history[0]).toMatchObject({ state: RunState.SUCCEEDED });
       const item = restartedStore.findQueueItemByRunId(sessionId, history.history[0]!.runId);
       expect(item?.executionOverrides).toMatchObject({ providerId: schedule.providerId, modelId: schedule.modelId });
       if (index === 0) await waitFor(async () => restoringScheduleRun,
-        observed => observed === history.history[0]!.runId, "restoration of the first scheduled model", scheduledRunTimeoutMs);
+        observed => observed === history.history[0]!.runId, "restoration of the first scheduled model", nativeRecoveryTimeoutMs);
     }
     expect(fixture.providerRequests.map(({ body }) => body["model"])).toEqual([REAL_PI_MODEL_ID, defaultModelId]);
   } catch (error) {

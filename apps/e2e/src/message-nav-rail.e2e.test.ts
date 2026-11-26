@@ -4,7 +4,7 @@ import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
+import { InstrumentedFakeAdapter, OrchestratorE2eFixture, routeFixtureDiscovery, waitFor } from "./fixture.js";
 import { createSessionMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 
 const mountedRailIt = process.env.JOKO_BROWSER_EXECUTABLE?.trim()
@@ -47,18 +47,34 @@ describe("mounted message navigation rail", () => {
       ? [event.payload.kind.value.messageId] : []);
     expect(messageIds).toHaveLength(14);
 
-    const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Mounted rail Web" });
-    if (challenge.challenge === undefined) throw new Error("Mounted rail pairing returned no challenge.");
     browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
     const page = await browser.newPage({ locale: "en-US", viewport: { width: 1600, height: 960 }, reducedMotion: "reduce" });
+    await routeFixtureDiscovery(page.context(), fixture.baseUrl);
     // Keep a stalled action's locator and call log inside the overall test deadline.
     page.setDefaultTimeout(20_000);
     const pageErrors: string[] = [];
-    page.on("pageerror", (error) => pageErrors.push(error.name));
-    await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
-    await page.locator(".connection-tabs > button").nth(2).click();
+    const assetErrors: { path: string; status?: number; failure?: string }[] = [];
+    page.on("pageerror", error => pageErrors.push(error.message));
+    page.on("requestfailed", request => {
+      if (request.resourceType() === "script") assetErrors.push({ path: new URL(request.url()).pathname, failure: request.failure()?.errorText });
+    });
+    page.on("response", response => {
+      if (response.request().resourceType() === "script" && !response.ok()) {
+        assetErrors.push({ path: new URL(response.url()).pathname, status: response.status() });
+      }
+    });
+    const response = await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
+    try {
+      expect(response?.status()).toBe(200);
+      await page.getByRole("button", { name: "Add Joko node", exact: true }).click({ timeout: 35_000 });
+    } catch (cause) {
+      const visibleText = (await page.locator("body").innerText({ timeout: 1000 }).catch(() => "")).slice(0, 1200);
+      throw new Error(`The production connection page did not mount: ${JSON.stringify({ status: response?.status(), visibleText, pageErrors, assetErrors })}`, { cause });
+    }
     await page.locator('details.device-authorization__manual > summary').click();
     await page.getByLabel("Joko node address").fill(fixture.baseUrl);
+    const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Mounted rail Web" });
+    if (challenge.challenge === undefined) throw new Error("Mounted rail pairing returned no challenge.");
     await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challenge.challengeId));
     await page.getByLabel("Device name").fill("Mounted rail Web");
     await page.locator("form.pair-form button[type=submit]").click();

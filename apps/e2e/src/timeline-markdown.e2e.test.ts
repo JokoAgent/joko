@@ -122,6 +122,13 @@ describe("mounted Timeline Markdown documents", () => {
     const liveTerminals = (await manager.clients.terminal.listTerminals({ sessionId })).terminals;
     expect(liveTerminals).toHaveLength(1);
     const native = liveTerminals[0]!;
+    // The external paste check leaves the terminal. Let the original view
+    // regain focus and become writable before sending a single real key.
+    await input.focus();
+    await waitFor(() => input.evaluate(element => ({
+      focused: element === element.ownerDocument.activeElement && element.ownerDocument.hasFocus(),
+      writable: element instanceof HTMLTextAreaElement && !element.readOnly
+    })), state => state.focused && state.writable, "the original terminal to accept input after the paste check");
     await input.press("x");
     const screen = await waitFor(async () => (await manager.clients.terminal.getTerminal({
       sessionId, terminalId: native.id, generation: native.generation
