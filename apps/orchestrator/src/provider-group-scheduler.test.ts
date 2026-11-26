@@ -27,9 +27,9 @@ it("keeps the original member order for rotation and applies weights only after 
   expect(selectProviderGroupMember([candidates[0]!, candidates[2]!], "weighted", { now, random: () => 0.25 })).toBe("b");
 });
 
-it("uses an eligible occupied member instead of rejecting saturation, while preserving pause and exclusion", () => {
+it("withholds saturated members after checking availability, pause and exclusion", () => {
   const candidates = [member("paused", { paused: true }), member("offline", { available: false }), member("excluded"),
     member("busy", { running: 8, capacity: 4 }), member("less-busy", { running: 4, capacity: 1 })];
-  expect(selectProviderGroupMember(candidates, "ordered", { now, exclude: new Set(["excluded"]) })).toBe("less-busy");
+  for (const strategy of strategies) expect(selectProviderGroupMember(candidates, strategy, { now, exclude: new Set(["excluded"]) })).toBeUndefined();
   expect(selectProviderGroupMember(candidates.slice(0, 3), "least_busy", { now, exclude: new Set(["excluded"]) })).toBeUndefined();
 });

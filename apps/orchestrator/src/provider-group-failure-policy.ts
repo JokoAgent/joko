@@ -10,8 +10,12 @@ export type ProviderGroupFailureDecision = { readonly action: "stay"; readonly w
   | { readonly action: "switch"; readonly cause: ProviderGroupFailureCause; readonly connection: "lost" | "check" | null; readonly cool: boolean };
 export const PROVIDER_GROUP_SUPERSEDED_ERROR = "Provider group was superseded by user action.";
 export class ProviderGroupUnavailableError extends Error {
-  readonly code = "PROVIDER_GROUP_UNAVAILABLE";
-  constructor(readonly retryAt?: number) { super("No computer in this Provider group can run the task right now."); this.name = "ProviderGroupUnavailableError"; }
+  readonly code: "PROVIDER_GROUP_UNAVAILABLE" | "PROVIDER_GROUP_FULL";
+  constructor(readonly retryAt?: number, readonly full = false) {
+    super(full ? "All eligible computers in this Provider group are at capacity." : "No computer in this Provider group can run the task right now.");
+    this.name = "ProviderGroupUnavailableError";
+    this.code = full ? "PROVIDER_GROUP_FULL" : "PROVIDER_GROUP_UNAVAILABLE";
+  }
 }
 const TASK_STATE = new Set(["SESSION_RUNNING", "NOT_FOUND", "INVALID_PARAMS", "INVALID_ARGUMENT", "UNSUPPORTED_CAPABILITY", "PRECONDITION_FAILED",
   "FAILED_PRECONDITION", "SEND_CANCELLED_BEFORE_DISPATCH", "OWNER_CHANGED", "ACCOUNT_BOUNDARY", "WORKDIR_MISSING", "TARGET_CHANGED"]);
@@ -38,7 +42,7 @@ export function decideProviderGroupFailure(signals: ProviderGroupFailureSignals 
   if (message === PROVIDER_GROUP_SUPERSEDED_ERROR) return stay("user");
   // An uncertain native effect must be inspected; switching must never replay it.
   if (phase !== "run" && signals.stateMayHaveChanged || code === "DISPATCH_UNKNOWN" || code === "NATIVE_DISPATCH_UNKNOWN" || code === "RUNTIME_HANDOFF_UNKNOWN") return stay("unknown-effect");
-  if (code === "PROVIDER_GROUP_UNAVAILABLE") return stay("group-unavailable");
+  if (code === "PROVIDER_GROUP_UNAVAILABLE" || code === "PROVIDER_GROUP_FULL") return stay("group-unavailable");
   if (code === "HOSTED_AGENT_CAPACITY_REJECTED" && signals.stateMayHaveChanged === false) return phase === "start" ? change("unavailable") : stay("local");
   if (code === "SESSION_CLOSED_MID_TURN" || code === "HOSTED_AGENT_LOCAL_ADMISSION") return stay("local");
   if (phase !== "run" && code && TASK_STATE.has(code)) return stay("task-state");

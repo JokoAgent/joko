@@ -48,12 +48,12 @@ async function fixture(taskModels = false) {
 const prompt = (text: string): PromptInput => ({ text, images: [], files: [], mentions: [], disposition: "prompt" });
 async function until(predicate: () => boolean): Promise<void> { await vi.waitFor(() => expect(predicate()).toBe(true), { timeout: 8000, interval: 10 }); }
 
-function taskModelGroup(f: Awaited<ReturnType<typeof fixture>>, strategy: contract.TaskModelGroupStrategy) {
+function taskModelGroup(f: Awaited<ReturnType<typeof fixture>>, strategy: contract.TaskModelGroupStrategy, firstWeight?: number) {
   const sources = f.groups.taskModels.list().sources;
   const text = sources.find(row => row.source?.backendId === f.first.id && row.source.modelId === "text")!.source!;
   const image = sources.find(row => row.source?.backendId === f.second.id && row.source.modelId === "multimodal")!.source!;
   const group = message(contract.TaskModelGroupSchema, { groupId: "work", name: "Work", strategy,
-    preferVisionWithImages: true, effortId: "high", candidates: [{ source: text }, { source: image }] });
+    preferVisionWithImages: true, effortId: "high", candidates: [{ source: text, weight: firstWeight }, { source: image }] });
   const config = f.groups.taskModels.save(0n, [group]);
   const selection = (hasImages = false) => message(contract.TaskModelGroupSelectionSchema, { groupId: "work", expectedRevision: config.revision, hasImages });
   const preview = (hasImages = false) => f.groups.taskModels.preview(selection(hasImages), new AbortController().signal);
@@ -94,6 +94,47 @@ it("rotates across exact accounts and Backends after first input, and binds the 
   const exact = (await f.create("exact-outside-group")).value.sessionId;
   expect(f.groups.taskModels.binding(exact)).toBeUndefined();
   expect(f.store.getSession(exact).descriptor).toMatchObject({ backendId: f.first.id, providerId: "test", modelId: "text" });
+});
+
+it("applies smooth task-model weights once per adopted input and never advances them on previews", async () => {
+  const f = await fixture(true), group = taskModelGroup(f, contract.TaskModelGroupStrategy.WEIGHTED, 3);
+  for (const [index, source] of [group.text, group.text, group.image, group.text].entries()) {
+    expect((await group.preview()).selected?.source).toEqual(source);
+    const id = (await group.create(`weighted-create-${index}`)).value.sessionId;
+    expect((await group.preview()).selected?.source).toEqual(source);
+    const queued = f.send(id, `weighted-input-${index}`);
+    await until(() => f.store.getQueueItem(queued.queueItemId).state === "completed");
+    f.groups.taskModels.commitBoundRotation(id);
+  }
+});
+
+it("retains the last usable drain member after an earlier account recovers", async () => {
+  const f = await fixture(true), group = taskModelGroup(f, contract.TaskModelGroupStrategy.DRAIN);
+  const read = f.groups.directory.read.bind(f.groups.directory);
+  let firstLimited = true;
+  vi.spyOn(f.groups.directory, "read").mockImplementation(async (...args) => {
+    const status = await read(...args);
+    return firstLimited && args[0].backendId === f.first.id ? { ...status, available: false, quota: { limited: true } } : status;
+  });
+  const id = (await group.create("drain-create")).value.sessionId, queued = f.send(id, "drain-input");
+  await until(() => f.store.getQueueItem(queued.queueItemId).state === "completed");
+  firstLimited = false;
+  expect((await group.preview()).selected?.source).toEqual(group.image);
+});
+
+it("uses the tightest live long window for headroom, keeping group order on ties", async () => {
+  const f = await fixture(true), group = taskModelGroup(f, contract.TaskModelGroupStrategy.HEADROOM);
+  let firstUsed: number | undefined;
+  vi.spyOn(f.groups.directory.options.quotas.options, "readLocal").mockImplementation(async member => {
+    const used = member.backendId === f.first.id ? firstUsed : 30;
+    return used === undefined ? undefined : { providerId: member.providerId, observedAt: Date.now(),
+      primaryWindow: { windowMinutes: 300, usedPercent: 96 }, secondaryWindow: { windowMinutes: 10_080, usedPercent: used } };
+  });
+  expect((await group.preview()).selected?.source).toEqual(group.image);
+  firstUsed = 30;
+  expect((await group.preview()).selected?.source).toEqual(group.text);
+  firstUsed = 31;
+  expect((await group.preview()).selected?.source).toEqual(group.image);
 });
 
 it("selects a model group on an existing task and holds a new input until the chosen Backend owns it", async () => {
@@ -485,6 +526,73 @@ it("keeps an admitted ask-only permission override while switching an unavailabl
   await until(() => f.store.getQueueItem(queued.queueItemId).state === "completed");
   expect(f.store.getSession(sessionId).descriptor.backendId).toBe(f.second.id);
   expect(f.store.getQueueItem(queued.queueItemId).executionOverrides?.permissionMode).toBe("ask");
+});
+
+it("reserves only open computer slots and reports saturation through the owner route until release", async () => {
+  const f = await fixture(), members = f.members.map(member => ({ ...member, capacity: 1 }));
+  f.groups.store.update(f.key, { strategy: "ordered", autoSwitch: true, members }, 0n);
+  const [a, b] = members.map(member => member.key) as [string, string];
+  const signal = new AbortController().signal;
+  const pick = (sessionId: string, exclude?: ReadonlySet<string>) => f.groups.router.pick({
+    sessionId, group: f.key, agentKind: "fake", modelId: "text", ownTask: true,
+    profile: { ...f.key, modelId: "text", fastMode: false }, ...(exclude ? { exclude } : {})
+  }, signal);
+  const [first, second] = await Promise.all([pick("first"), pick("second")]);
+  expect(new Set([first.member.key, second.member.key])).toEqual(new Set([a, b]));
+  const counts = () => members.map(member => f.groups.leases.count(member.key));
+  expect(counts()).toEqual([1, 1]);
+  await expect(pick("full")).rejects.toMatchObject({ full: true, code: "PROVIDER_GROUP_FULL", retryAt: undefined });
+  await expect(pick("excluded", new Set([a, b]))).rejects.toMatchObject({ full: false });
+  const transport = createRouterTransport(router => router.service(contract.ProviderGroupService, createProviderGroupConnectService({
+    service: f.groups.service, usage: f.groups.usage, schedulingState: async () => ({ activeTurns: 0 }),
+    authenticate: () => ({ id: "peer-owner", trust: "owner", management: false, assertCurrent: () => {} }), assertRemoteAllowed: () => {}
+  })));
+  const peer = { captureGroupPeer: () => ({ transport, nativeBackendId: f.first.id, ownerNodeId: "group-node", assertCurrent: () => {} }) } as unknown as HostedAgentSources;
+  const remote = new ProviderGroupRemoteRouter({ store: f.groups.store, sources: peer, directory: f.groups.directory,
+    leases: f.groups.leases, localNodeId: "receiver", ownerGeneration: () => "receiver-owner" });
+  await expect(remote.pick({ sessionId: "remote-full", group: f.key, agentKind: "fake", modelId: "text", ownTask: false,
+    profile: { ...f.key, modelId: "text", fastMode: false } }, signal)).rejects.toMatchObject({ code: "PROVIDER_GROUP_FULL", retryAt: undefined });
+  expect(counts()).toEqual([1, 1]);
+  second.release();
+  const reopened = await pick("after-release");
+  expect(reopened.member.key).toBe(second.member.key);
+  first.release(); reopened.release();
+  expect(counts()).toEqual([0, 0]);
+
+  // An independently running turn and a provisional group pick consume separate slots.
+  f.groups.store.update(f.key, { strategy: "ordered", autoSwitch: true, members: [{ ...members[0]!, capacity: 2 }, members[1]!] }, 1n);
+  vi.spyOn(f.groups.directory.options, "running").mockImplementation(source => source.key === a ? 1 : 0);
+  const remaining = await pick("remaining", new Set([b]));
+  await expect(pick("no-spare", new Set([b]))).rejects.toMatchObject({ full: true });
+  remaining.release();
+});
+
+it("keeps unknown computer quotas in order and filters measured pace, tight windows and exclusions before reserving", async () => {
+  const f = await fixture(), [a, b] = f.members.map(member => member.key) as [string, string];
+  f.groups.store.update(f.key, { strategy: "ordered", autoSwitch: true, members: f.members }, 0n);
+  const now = Date.now(), signal = new AbortController().signal;
+  let firstUsed: number | undefined, fiveHourUsed = 0;
+  vi.spyOn(f.groups.directory.options.quotas.options, "readLocal").mockImplementation(async member => {
+    const usedPercent = member.key === a ? firstUsed : 0;
+    return usedPercent === undefined ? undefined : { providerId: member.providerId, observedAt: now,
+      primaryWindow: { usedPercent: member.key === a ? fiveHourUsed : 0, windowMinutes: 300, resetAt: now + 2 * 3_600_000 },
+      secondaryWindow: { usedPercent, windowMinutes: 10_080, resetAt: now + 8 * 86_400_000 } };
+  });
+  const pick = async (exclude?: ReadonlySet<string>) => {
+    const assignment = await f.groups.router.pick({ sessionId: "ordered", group: f.key, agentKind: "fake", modelId: "text", ownTask: true,
+      profile: { ...f.key, modelId: "text", fastMode: false }, ...(exclude ? { exclude } : {}) }, signal);
+    assignment.release(); return assignment.member.key;
+  };
+  expect(await pick()).toBe(a);
+  expect(await pick(new Set([a]))).toBe(b);
+  firstUsed = 10;
+  expect(await pick()).toBe(a);
+  firstUsed = 10.01;
+  expect(await pick()).toBe(b);
+  firstUsed = 0; fiveHourUsed = 85;
+  expect(await pick()).toBe(b);
+  f.groups.router.markTried("ordered", b);
+  expect(await pick()).toBe(a);
 });
 
 it("selects members by the exact requested speed without substituting ordinary Fast for Ultrafast", async () => {

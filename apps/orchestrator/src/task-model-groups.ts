@@ -9,6 +9,7 @@ import type { SessionRuntimeProfile } from "./session-runtime-control.js";
 
 const CONFIG_KEY = "task-model-groups";
 const ROTATION_KEY = "task-model-group-rotation";
+const WEIGHTS_KEY = "task-model-group-weights";
 const BINDING_KEY = "task-model-group-binding";
 const MAX_GROUPS = 32;
 const MAX_CANDIDATES = 16;
@@ -26,6 +27,7 @@ export interface TaskModelGroupSource {
 interface Candidate {
   readonly source: TaskModelGroupSource;
   readonly disabled: boolean;
+  readonly weight?: number;
 }
 
 interface Schedule {
@@ -55,6 +57,8 @@ interface Choice {
   readonly status: ProviderGroupMemberStatus;
   readonly model: ProviderModel;
   readonly cost: number;
+  readonly weight: number;
+  readonly weightDelta?: Readonly<Record<string, number>>;
 }
 
 export interface TaskModelGroupAssignment {
@@ -74,6 +78,7 @@ interface TaskModelGroupBinding {
   readonly revision: string;
   readonly source: TaskModelGroupSource;
   readonly rotationCommitted: boolean;
+  readonly weightDelta?: Readonly<Record<string, number>>;
 }
 
 interface ResolveOptions {
@@ -119,6 +124,12 @@ export class TaskModelGroups {
       assertRevision(expectedRevision, current.revision);
       if (JSON.stringify(current.groups) === JSON.stringify(groups)) return wireConfig(current);
       const saved = store.setSetting("service", this.options.ownerId, CONFIG_KEY, groups);
+      const weights = this.weights();
+      if (weights) store.setSetting("service", this.options.ownerId, WEIGHTS_KEY, Object.fromEntries(groups.flatMap(group => {
+        const prior = current.groups.find(item => item.groupId === group.groupId);
+        return prior?.strategy === group.strategy && JSON.stringify(prior.candidates) === JSON.stringify(group.candidates) && weights[group.groupId]
+          ? [[group.groupId, weights[group.groupId]]] : [];
+      })));
       const rotation = store.findSetting<Record<string, string>>("service", this.options.ownerId, ROTATION_KEY)?.value;
       if (rotation) store.setSetting("service", this.options.ownerId, ROTATION_KEY, Object.fromEntries(
         groups.flatMap(group => {
@@ -169,12 +180,22 @@ export class TaskModelGroups {
   commitBoundRotation(sessionId: string): void {
     const binding = this.binding(sessionId);
     if (binding === undefined || binding.rotationCommitted) return;
-    const store = this.options.store;
-    if (this.config.revision.toString() === binding.revision) {
-      const current = store.findSetting<Record<string, string>>("service", this.options.ownerId, ROTATION_KEY)?.value ?? {};
-      store.setSetting("service", this.options.ownerId, ROTATION_KEY, { ...current, [binding.effectiveGroupId]: candidateKey(binding.source) });
-    }
-    store.setSetting("session", sessionId, BINDING_KEY, { ...binding, rotationCommitted: true });
+    this.options.store.transaction(store => {
+      if (this.config.revision.toString() === binding.revision) {
+        const current = store.findSetting<Record<string, string>>("service", this.options.ownerId, ROTATION_KEY)?.value ?? {};
+        store.setSetting("service", this.options.ownerId, ROTATION_KEY, { ...current, [binding.effectiveGroupId]: candidateKey(binding.source) });
+        if (binding.weightDelta) {
+          const groups = this.weights() ?? {}, counters = { ...groups[binding.effectiveGroupId] };
+          for (const [key, delta] of Object.entries(binding.weightDelta)) counters[key] = (counters[key] ?? 0) + delta;
+          store.setSetting("service", this.options.ownerId, WEIGHTS_KEY, { ...groups, [binding.effectiveGroupId]: counters });
+        }
+      }
+      store.setSetting("session", sessionId, BINDING_KEY, { ...binding, rotationCommitted: true });
+    });
+  }
+
+  private weights() {
+    return this.options.store.findSetting<Record<string, Record<string, number>>>("service", this.options.ownerId, WEIGHTS_KEY)?.value;
   }
 
   async resolve(selection: contract.TaskModelGroupSelection, options: ResolveOptions): Promise<TaskModelGroupAssignment | undefined> {
@@ -202,7 +223,7 @@ export class TaskModelGroups {
           agentKind: source.agentKind, modelId: reference.modelId, ownTask: true
         }, options.signal);
         if (!status.reachable || !status.model || (!status.available && !status.quota.limited)) return undefined;
-        return { source, reference, status, model, cost: group.strategy === contract.TaskModelGroupStrategy.LOWEST_COST
+        return { source, reference, status, model, weight: candidate.weight ?? 1, cost: group.strategy === contract.TaskModelGroupStrategy.LOWEST_COST
           ? this.cost(source, model, status, now) : Infinity } satisfies Choice;
       } catch {
         options.signal.throwIfAborted();
@@ -213,7 +234,8 @@ export class TaskModelGroups {
     const rotation = this.options.store.findSetting<Record<string, string>>("service", this.options.ownerId, ROTATION_KEY)?.value;
     // Keep positions of disabled or unavailable members so rotation resumes in list order.
     const last = options.lastPicked === undefined ? rotation?.[group.groupId] : candidateKey(options.lastPicked);
-    const picked = pickChoice(group, choices, now, last, selection.hasImages);
+    const counters = group.strategy === contract.TaskModelGroupStrategy.WEIGHTED ? this.weights()?.[group.groupId] : undefined;
+    const picked = pickChoice(group, choices, now, last, selection.hasImages, counters);
     if (!picked || options.requireReady === true && picked.status.quota.limited) return undefined;
     const effort = picked.model.thinkingLevels.includes(group.effortId) ? group.effortId : undefined;
     const assertChoice = () => {
@@ -234,7 +256,7 @@ export class TaskModelGroups {
         assertChoice();
         this.options.store.setSetting("session", sessionId, BINDING_KEY, {
           groupId: original.groupId, effectiveGroupId: group.groupId, revision: config.revision.toString(),
-          source: picked.reference, rotationCommitted: keepRotation
+          source: picked.reference, rotationCommitted: keepRotation, ...(picked.weightDelta ? { weightDelta: picked.weightDelta } : {})
         } satisfies TaskModelGroupBinding);
       }
     };
@@ -258,7 +280,8 @@ export class TaskModelGroups {
   }
 }
 
-function pickChoice(group: Group, choices: readonly (Choice | undefined)[], now: number, last: string | undefined, hasImages: boolean): Choice | undefined {
+function pickChoice(group: Group, choices: readonly (Choice | undefined)[], now: number, last: string | undefined, hasImages: boolean,
+  counters?: Readonly<Record<string, number>>): Choice | undefined {
   const useVision = hasImages && group.preferVisionWithImages && choices.some(choice => choice?.model.supportsImages);
   const eligible = choices.filter((choice): choice is Choice => choice !== undefined && (!useVision || choice.model.supportsImages));
   const ready = eligible.filter(choice => !choice.status.quota.limited);
@@ -267,8 +290,19 @@ function pickChoice(group: Group, choices: readonly (Choice | undefined)[], now:
   switch (group.strategy) {
     case contract.TaskModelGroupStrategy.LOWEST_COST:
       return ready.reduce((best, choice) => choice.cost < best.cost ? choice : best);
+    case contract.TaskModelGroupStrategy.HEADROOM:
+      return ready.reduce((best, choice) => (choice.status.quota.headroom ?? -1) > (best.status.quota.headroom ?? -1) ? choice : best);
+    case contract.TaskModelGroupStrategy.WEIGHTED: {
+      const score = (choice: Choice) => (counters?.[candidateKey(choice.reference)] ?? 0) + choice.weight;
+      const picked = ready.reduce((best, choice) => score(choice) > score(best) ? choice : best);
+      const total = ready.reduce((sum, choice) => sum + choice.weight, 0);
+      return { ...picked, weightDelta: Object.fromEntries(ready.map(choice =>
+        [candidateKey(choice.reference), choice === picked ? choice.weight - total : choice.weight])) };
+    }
+    case contract.TaskModelGroupStrategy.DRAIN:
     case contract.TaskModelGroupStrategy.ROUND_ROBIN: {
       const lastIndex = group.candidates.findIndex(candidate => candidateKey(candidate.source) === last);
+      if (group.strategy === contract.TaskModelGroupStrategy.DRAIN && lastIndex >= 0 && ready.some(choice => choice === choices[lastIndex])) return choices[lastIndex];
       return ready.find(choice => choices.indexOf(choice) > lastIndex) ?? ready[0];
     }
     case contract.TaskModelGroupStrategy.EXPIRING_QUOTA: {
@@ -321,14 +355,16 @@ function parseGroups(input: readonly contract.TaskModelGroup[]): Group[] {
   }
   return input.map(group => {
     if (group.candidates.length > MAX_CANDIDATES || group.schedules.length > MAX_SCHEDULES
-      || group.strategy < contract.TaskModelGroupStrategy.EXPIRING_QUOTA || group.strategy > contract.TaskModelGroupStrategy.LOWEST_COST) {
+      || group.strategy < contract.TaskModelGroupStrategy.EXPIRING_QUOTA || group.strategy > contract.TaskModelGroupStrategy.WEIGHTED) {
       throw new StoreError("Invalid model group configuration.");
     }
     const candidates = group.candidates.map(candidate => {
       const source = candidate.source;
       if (!source) throw new StoreError("A model group candidate requires an exact source.");
+      if (candidate.weight !== undefined && (!Number.isInteger(candidate.weight) || candidate.weight < 1 || candidate.weight > 1000)) throw new StoreError("Invalid model group weight.");
       return { source: { sourceKey: key(source.sourceKey), backendId: key(source.backendId),
-        providerId: key(source.providerId), modelId: key(source.modelId) }, disabled: candidate.disabled };
+        providerId: key(source.providerId), modelId: key(source.modelId) }, disabled: candidate.disabled,
+        ...(candidate.weight !== undefined && candidate.weight !== 1 ? { weight: candidate.weight } : {}) };
     });
     if (new Set(candidates.map(candidate => candidateKey(candidate.source))).size !== candidates.length) {
       throw new StoreError("Model group candidates must be unique.");

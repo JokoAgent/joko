@@ -31,6 +31,9 @@ enum TaskModelGroupStrategy {
   TASK_MODEL_GROUP_STRATEGY_ORDERED = 2;
   TASK_MODEL_GROUP_STRATEGY_ROUND_ROBIN = 3;
   TASK_MODEL_GROUP_STRATEGY_LOWEST_COST = 4;
+  TASK_MODEL_GROUP_STRATEGY_DRAIN = 5;
+  TASK_MODEL_GROUP_STRATEGY_HEADROOM = 6;
+  TASK_MODEL_GROUP_STRATEGY_WEIGHTED = 7;
 }
 message TaskModelGroupSourceRef {
   string source_key = 1;
@@ -41,6 +44,7 @@ message TaskModelGroupSourceRef {
 message TaskModelGroupCandidate {
   TaskModelGroupSourceRef source = 1;
   bool disabled = 2;
+  optional uint32 weight = 3;
 }
 message TaskModelGroupSchedule {
   uint32 start_hour = 1;

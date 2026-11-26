@@ -41,8 +41,9 @@ export class ProviderGroupRemoteRouter implements ProviderGroupRemoteRouterPort 
     catch (error) {
       owner.assertCurrent(); signal.throwIfAborted();
       if (error instanceof ConnectError && error.code === Code.Unavailable) {
-        const detail = error.findDetails(contract.ErrorInfoSchema).find(value => value.code === "PROVIDER_GROUP_UNAVAILABLE" && value.phase === "provider_group"
+        const detail = error.findDetails(contract.ErrorInfoSchema).find(value => (value.code === "PROVIDER_GROUP_UNAVAILABLE" || value.code === "PROVIDER_GROUP_FULL") && value.phase === "provider_group"
           && value.queueImpact === contract.StateImpact.UNCHANGED && value.nativeSessionImpact === contract.StateImpact.UNCHANGED);
+        if (detail?.code === "PROVIDER_GROUP_FULL") throw new ProviderGroupUnavailableError(undefined, true);
         const duration = detail?.recoveryActions.find(action => action.kind === contract.RecoveryActionKind.WAIT)?.retryAfter;
         if (duration && duration.seconds >= 0n && duration.seconds <= 8n * 24n * 60n * 60n && duration.nanos >= 0 && duration.nanos < 1_000_000_000) {
           const delay = Number(duration.seconds) * 1000 + Math.ceil(duration.nanos / 1_000_000);

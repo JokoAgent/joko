@@ -5,6 +5,7 @@ export interface ProviderGroupQuota {
   readonly limited: boolean; readonly resetAt?: number; readonly usagePercent?: number;
   readonly weeklyResetAt?: number; readonly fiveHourResetAt?: number;
   readonly urgency?: number; readonly fiveHourTight?: boolean;
+  readonly headroom?: number;
   readonly pacingWindow?: { readonly usedPercent: number; readonly windowMs: number; readonly resetAt?: number };
 }
 export const PROVIDER_GROUP_QUOTA_MAX_AGE_MS = 10 * 60_000;
@@ -33,6 +34,8 @@ export function providerGroupQuota(snapshot: ProviderAccountUsageSnapshot | unde
     ?? (family ? snapshot.modelWindows?.find(window => (subscriptionModelFamily(window.modelId) ?? (window.displayName.trim().toLowerCase().includes(family) ? family : undefined)) === family) : undefined);
   const scoped = current(scopedRaw?.window);
   const windows = [...all.map(current), scoped].filter((window): window is ProviderAccountUsageWindow => window !== undefined);
+  const longWindows = windows.filter(window => (window.windowMinutes ?? (window === scoped && family ? 10_080 : 0)) > 300);
+  const headroomWindows = longWindows.length ? longWindows : windows;
   const exhausted = windows.filter(window => window.usedPercent >= 100);
   const resetAt = exhausted.flatMap(window => window.resetAt === undefined ? [] : [window.resetAt]);
   const rawWindows = [...all, scopedRaw?.window].filter((window): window is ProviderAccountUsageWindow => window !== undefined);
@@ -49,6 +52,7 @@ export function providerGroupQuota(snapshot: ProviderAccountUsageSnapshot | unde
   const pace = paced.length && paced.every(value => value !== undefined)
     ? paced.reduce((slowest, candidate) => candidate!.urgency < slowest!.urgency ? candidate : slowest) : undefined;
   return { limited, ...(resetAt.length ? { resetAt: Math.max(...resetAt) } : {}),
+    ...(headroomWindows.length ? { headroom: Math.min(...headroomWindows.map(window => 100 - window.usedPercent)) } : {}),
     ...(pace ? { usagePercent: pace.pacingWindow.usedPercent, urgency: pace.urgency, pacingWindow: pace.pacingWindow } : {}),
     fiveHourTight: five !== undefined && five.usedPercent >= 85 && (five.resetAt === undefined || five.resetAt - now > 60 * 60_000),
     ...(weekly?.resetAt !== undefined && weekly.usedPercent < 100 ? { weeklyResetAt: weekly.resetAt } : {}),

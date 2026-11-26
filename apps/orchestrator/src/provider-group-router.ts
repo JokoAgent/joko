@@ -2,7 +2,7 @@ import { groupKey, ProviderGroupStore, type ProviderGroupKey, type ProviderGroup
 import type { SessionRuntimeProfile } from "./session-runtime-control.js";
 import { ProviderGroupDirectory, type ProviderGroupDirectoryRequest, type ProviderGroupMemberStatus } from "./provider-group-directory.js";
 import { ProviderGroupLeases } from "./provider-group-leases.js";
-import { selectProviderGroupMember } from "./provider-group-scheduler.js";
+import { providerGroupMembersFull, selectProviderGroupMember } from "./provider-group-scheduler.js";
 import { ProviderGroupUnavailableError, type ProviderGroupFailureDecision, type ProviderGroupFailureSignals } from "./provider-group-failure-policy.js";
 import { providerGroupRebalanceTarget } from "./provider-group-quota.js";
 
@@ -64,10 +64,11 @@ export class ProviderGroupRouter {
     });
     const excluded = new Set([...tried, ...(input.exclude ?? [])]);
     // No await between current load, selection and the provisional reservation.
-    const selected = selectProviderGroupMember(candidates, snapshot.config.strategy, { now: this.now(), random: this.random, exclude: excluded,
+    const selected = selectProviderGroupMember(candidates, snapshot.config.strategy, { now: this.now(), random: this.random, exclude: excluded, keepUnknownQuota: true,
       ...(this.#lastPicked.has(groupKey(input.group)) ? { lastPicked: this.#lastPicked.get(groupKey(input.group))! } : {}) });
     const status = members.find(member => member.member.key === selected);
     if (!status?.model || !status.available) {
+      if (input.quotaRebalanceFrom === undefined && providerGroupMembersFull(candidates, excluded)) throw new ProviderGroupUnavailableError(undefined, true);
       // A tried member becomes eligible again after its actual quota/cooling
       // boundary. The original Queue/Run owns the wait; this does not reserve
       // another member or authorize another native dispatch.

@@ -34,8 +34,10 @@ export class ProviderGroupLeases {
     this.#prune(); const seen = new Set<string>();
     for (const row of this.#active.values()) if (row.memberKey === memberKey) seen.add(row.sessionId);
     for (const report of this.#reports.values()) for (const row of report.leases) if (row.memberKey === memberKey) seen.add(row.sessionId);
+    const running = Math.max(seen.size, Number.isSafeInteger(actualRunning) && actualRunning >= 0 ? actualRunning : 0);
+    const reported = seen.size;
     for (const row of this.#reservations.values()) if (row.memberKey === memberKey) seen.add(row.sessionId);
-    return Math.max(seen.size, Number.isSafeInteger(actualRunning) && actualRunning >= 0 ? actualRunning : 0);
+    return running + (seen.size - reported);
   }
   active(): readonly ProviderGroupActiveLease[] { return [...this.#active.values()]; }
   clear(): void { this.#active.clear(); this.#reports.clear(); this.#reservations.clear(); }

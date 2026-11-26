@@ -15,19 +15,24 @@ export interface ProviderGroupCandidate {
   readonly fiveHourTight?: boolean;
 }
 
-/** Quota order applies to every strategy. Capacity distributes work but does
- * not itself reject a task when all eligible members are occupied. */
+function eligibleMembers(members: readonly ProviderGroupCandidate[], exclude?: ReadonlySet<string>) {
+  return members.filter(member => member.available && !member.paused && !exclude?.has(member.id));
+}
+
+export function providerGroupMembersFull(members: readonly ProviderGroupCandidate[], exclude?: ReadonlySet<string>): boolean {
+  const eligible = eligibleMembers(members, exclude);
+  return eligible.length > 0 && eligible.every(member => member.running >= member.capacity);
+}
+
 export function selectProviderGroupMember(
   members: readonly ProviderGroupCandidate[],
   strategy: ProviderGroupStrategy,
   options: { readonly exclude?: ReadonlySet<string>; readonly lastPicked?: string;
-    readonly random?: () => number; readonly now: number }
+    readonly random?: () => number; readonly now: number; readonly keepUnknownQuota?: boolean }
 ): string | undefined {
-  const eligible = members.filter(member => member.available && !member.paused && !options.exclude?.has(member.id));
-  if (!eligible.length) return;
-  const open = eligible.filter(member => member.running < member.capacity);
-  if (!open.length) return leastBusy(byQuota(eligible, options.now)).id;
-  const candidates = byQuota(open, options.now);
+  const open = eligibleMembers(members, options.exclude).filter(member => member.running < member.capacity);
+  if (!open.length) return;
+  const candidates = byQuota(open, options.keepUnknownQuota === true);
   switch (strategy) {
     case "ordered": return candidates[0]!.id;
     case "round_robin": {
@@ -47,12 +52,13 @@ export function selectProviderGroupMember(
   }
 }
 
-function byQuota(candidates: readonly ProviderGroupCandidate[], _now: number): readonly ProviderGroupCandidate[] {
+function byQuota(candidates: readonly ProviderGroupCandidate[], keepUnknown: boolean): readonly ProviderGroupCandidate[] {
   const roomy = candidates.filter(member => !member.fiveHourTight), pool = roomy.length ? roomy : candidates;
-  const known = pool.filter(member => typeof member.urgency === "number" && Number.isFinite(member.urgency) && member.urgency >= 0);
+  const hasUrgency = (member: ProviderGroupCandidate) => typeof member.urgency === "number" && Number.isFinite(member.urgency) && member.urgency >= 0;
+  const known = pool.filter(hasUrgency);
   if (!known.length) return pool;
   const highest = Math.max(...known.map(member => member.urgency!));
-  return known.filter(member => member.urgency! >= highest * 0.9);
+  return pool.filter(member => hasUrgency(member) ? member.urgency! >= highest * 0.9 : keepUnknown);
 }
 
 function leastBusy(candidates: readonly ProviderGroupCandidate[]): ProviderGroupCandidate {

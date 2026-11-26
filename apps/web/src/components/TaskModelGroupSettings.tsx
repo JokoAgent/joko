@@ -15,7 +15,10 @@ const strategies = [
   [contract.TaskModelGroupStrategy.EXPIRING_QUOTA, "modelGroups.expiring"],
   [contract.TaskModelGroupStrategy.ORDERED, "settings.providerGroups.ordered"],
   [contract.TaskModelGroupStrategy.ROUND_ROBIN, "settings.providerGroups.roundRobin"],
-  [contract.TaskModelGroupStrategy.LOWEST_COST, "modelGroups.cheapest"]
+  [contract.TaskModelGroupStrategy.LOWEST_COST, "modelGroups.cheapest"],
+  [contract.TaskModelGroupStrategy.DRAIN, "modelGroups.drain"],
+  [contract.TaskModelGroupStrategy.HEADROOM, "modelGroups.headroom"],
+  [contract.TaskModelGroupStrategy.WEIGHTED, "settings.providerGroups.weighted"]
 ] as const;
 
 export function TaskModelGroupSettings({ controller, t }: { readonly controller: AppController; readonly t: Translate }): JSX.Element | null {
@@ -146,6 +149,11 @@ function TaskModelGroupEditor({ api, backends, t }: { readonly api: TaskModelGro
             <strong>{label}</strong>{!source?.available && <span className="muted">{t("settings.providerGroups.unavailable")}</span>}
           </label>
           <div className="provider-group-settings__reorder">
+            {group.strategy === contract.TaskModelGroupStrategy.WEIGHTED && <label>{t("settings.providerGroups.weight")}
+              <input type="number" min="1" max="1000" value={candidate.weight ?? 1} disabled={busy} onChange={event => {
+                const weight = Math.min(1000, Math.max(1, Math.round(Number(event.target.value)) || 1));
+                change({ candidates: group.candidates.map((item, position) => position === index ? { ...item, weight } : item) });
+              }} /></label>}
             <Button disabled={busy || index === 0} onClick={() => moveCandidate(index, index - 1)} aria-label={`${t("settings.providerGroups.moveUp")} ${label}`}>↑</Button>
             <Button disabled={busy || index === group.candidates.length - 1} onClick={() => moveCandidate(index, index + 1)} aria-label={`${t("settings.providerGroups.moveDown")} ${label}`}>↓</Button>
             <Button disabled={busy} onClick={() => change({ candidates: group.candidates.filter(item => item !== candidate) })}>{t("common.remove")}</Button>

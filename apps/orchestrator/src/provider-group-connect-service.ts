@@ -44,6 +44,12 @@ export function createProviderGroupConnectService(options: ProviderGroupConnectO
     } catch (error) {
       if (error instanceof ConnectError) throw error;
       if (error instanceof ConnectionAuthenticationError) throw new ConnectError("Owner authentication is required.", Code.Unauthenticated);
+      if (error instanceof ProviderGroupUnavailableError && error.full) {
+        throw new ConnectError(error.message, Code.Unavailable, undefined, [{ desc: contract.ErrorInfoSchema,
+          value: create(contract.ErrorInfoSchema, { code: error.code, message: error.message, phase: "provider_group", retryable: true,
+            severity: contract.ErrorSeverity.RETRYABLE, queueImpact: contract.StateImpact.UNCHANGED,
+            workspaceImpact: contract.StateImpact.UNCHANGED, nativeSessionImpact: contract.StateImpact.UNCHANGED }) }]);
+      }
       if (error instanceof ProviderGroupUnavailableError && error.retryAt !== undefined) {
         const delay = Math.ceil(error.retryAt - (options.now?.() ?? Date.now()));
         if (Number.isSafeInteger(delay) && delay > 0 && delay <= 8 * 24 * 60 * 60_000) {
