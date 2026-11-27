@@ -57,22 +57,29 @@ function assertResponse(response: Response): void {
   }
 }
 
-async function fetchWithTimeout(
+async function fetchWithTimeout<T>(
   fetchImpl: RuntimeFetch,
   url: string,
   init: RequestInit,
   timeoutMs: number,
-  signal?: AbortSignal
-): Promise<Response> {
+  signal: AbortSignal | undefined,
+  consume: (response: Response) => T | Promise<T>
+): Promise<T> {
+  if (signal?.aborted) throw new LocalRuntimeError("OPERATION_CANCELLED", "The operation was cancelled.");
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const onAbort = () => controller.abort();
   signal?.addEventListener("abort", onAbort, { once: true });
   try {
-    return await fetchImpl(url, { ...init, redirect: "manual", signal: controller.signal });
+    const response = await fetchImpl(url, { ...init, redirect: "manual", signal: controller.signal });
+    assertResponse(response);
+    const result = await consume(response);
+    controller.signal.throwIfAborted();
+    return result;
   } catch (error) {
     if (signal?.aborted) throw new LocalRuntimeError("OPERATION_CANCELLED", "The operation was cancelled.");
     if (controller.signal.aborted) throw new LocalRuntimeError("RUNTIME_UNREACHABLE", "The local runtime did not respond in time.");
+    if (error instanceof LocalRuntimeError) throw error;
     const text = error instanceof Error ? error.message : String(error);
     if (/refused|fetch failed|econnreset/u.test(text.toLowerCase())) {
       throw new LocalRuntimeError("RUNTIME_UNREACHABLE", "The local runtime is not reachable.");
@@ -81,6 +88,7 @@ async function fetchWithTimeout(
   } finally {
     clearTimeout(timeout);
     signal?.removeEventListener("abort", onAbort);
+    controller.abort();
   }
 }
 
@@ -91,10 +99,10 @@ export class OllamaLoopbackClient {
   ) {}
 
   async version(signal?: AbortSignal): Promise<string> {
-    const response = await fetchWithTimeout(this.fetchImpl, endpoint("/api/version"), { method: "GET" }, PROBE_TIMEOUT_MS, signal);
-    assertResponse(response);
-    if (!response.ok) throw new LocalRuntimeError("PORT_CONFLICT", "The loopback port is not serving the expected runtime.");
-    const body = await readBoundedJson(response);
+    const body = await fetchWithTimeout(this.fetchImpl, endpoint("/api/version"), { method: "GET" }, PROBE_TIMEOUT_MS, signal, response => {
+      if (!response.ok) throw new LocalRuntimeError("PORT_CONFLICT", "The loopback port is not serving the expected runtime.");
+      return readBoundedJson(response);
+    });
     const version = body !== null && typeof body === "object" && typeof (body as { version?: unknown }).version === "string"
       ? (body as { version: string }).version.trim()
       : "";
@@ -105,10 +113,10 @@ export class OllamaLoopbackClient {
   }
 
   async tags(signal?: AbortSignal): Promise<readonly OllamaTag[]> {
-    const response = await fetchWithTimeout(this.fetchImpl, endpoint("/api/tags"), { method: "GET" }, API_TIMEOUT_MS, signal);
-    assertResponse(response);
-    if (!response.ok) throw new LocalRuntimeError("RUNTIME_ERROR", "The local runtime could not list models.");
-    const body = await readBoundedJson(response);
+    const body = await fetchWithTimeout(this.fetchImpl, endpoint("/api/tags"), { method: "GET" }, API_TIMEOUT_MS, signal, response => {
+      if (!response.ok) throw new LocalRuntimeError("RUNTIME_ERROR", "The local runtime could not list models.");
+      return readBoundedJson(response);
+    });
     const models = body !== null && typeof body === "object" && Array.isArray((body as { models?: unknown }).models)
       ? (body as { models: unknown[] }).models
       : [];
@@ -128,15 +136,15 @@ export class OllamaLoopbackClient {
 
   async show(name: string, signal?: AbortSignal): Promise<OllamaModelDetails> {
     if (!isOllamaModelName(name)) throw new LocalRuntimeError("MODEL_INVALID", "The model name is invalid.");
-    const response = await fetchWithTimeout(this.fetchImpl, endpoint("/api/show"), {
+    const body = await fetchWithTimeout(this.fetchImpl, endpoint("/api/show"), {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name })
-    }, API_TIMEOUT_MS, signal);
-    assertResponse(response);
-    if (response.status === 404) throw new LocalRuntimeError("MODEL_NOT_FOUND", "The selected model could not be found.");
-    if (!response.ok) throw new LocalRuntimeError("RUNTIME_ERROR", "The local runtime could not inspect the model.");
-    const body = await readBoundedJson(response);
+    }, API_TIMEOUT_MS, signal, response => {
+      if (response.status === 404) throw new LocalRuntimeError("MODEL_NOT_FOUND", "The selected model could not be found.");
+      if (!response.ok) throw new LocalRuntimeError("RUNTIME_ERROR", "The local runtime could not inspect the model.");
+      return readBoundedJson(response);
+    });
     const record = body !== null && typeof body === "object" ? body as Record<string, unknown> : {};
     const details = record["details"];
     const directContext = details !== null && typeof details === "object" ? (details as Record<string, unknown>)["context_length"] : undefined;
@@ -165,14 +173,13 @@ export class OllamaLoopbackClient {
 
   async delete(name: string, signal?: AbortSignal): Promise<void> {
     if (!isOllamaModelName(name)) throw new LocalRuntimeError("MODEL_INVALID", "The model name is invalid.");
-    const response = await fetchWithTimeout(this.fetchImpl, endpoint("/api/delete"), {
+    await fetchWithTimeout(this.fetchImpl, endpoint("/api/delete"), {
       method: "DELETE",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name, model: name })
-    }, API_TIMEOUT_MS, signal);
-    assertResponse(response);
-    if (response.status === 404) return;
-    if (!response.ok) throw new LocalRuntimeError("RUNTIME_ERROR", "The local runtime could not delete the model.");
+    }, API_TIMEOUT_MS, signal, response => {
+      if (!response.ok && response.status !== 404) throw new LocalRuntimeError("RUNTIME_ERROR", "The local runtime could not delete the model.");
+    });
   }
 
   pull(name: string, onEvent: (event: OllamaPullEvent) => void, signal?: AbortSignal): Promise<void> {
