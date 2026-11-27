@@ -124,8 +124,10 @@ async function publishLock(directory: string, nonce: string): Promise<boolean> {
 async function clearEmptyLegacyLock(directory: string): Promise<void> {
   try {
     const info = await lstat(directory);
+    // A releasing contender can retire the directory between these probes.
+    // Leave an unverified path alone and let acquisition retry within its deadline.
     if (!info.isDirectory() || info.isSymbolicLink() || !samePath(await realpath(directory), directory)
-      || (typeof process.getuid === "function" && info.uid !== process.getuid())) throw busy();
+      || (typeof process.getuid === "function" && info.uid !== process.getuid())) return;
     // An active or newly published claim contains owner.json. rmdir can only remove an empty directory.
     await removeEmptyLockDirectory(directory);
   } catch (error) {
