@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type { RunUsageSummary, UsageSnapshot } from "@joko/core";
 import { StoreError } from "./errors.js";
 import type { OperationalStore } from "./operational-store.js";
@@ -32,7 +33,9 @@ export class ProviderGroupUsageStore {
     text(runId); attributions.forEach(assertAttribution); if (attributions.length > 512) throw invalid();
     const key = this.#prefix + "run:" + hash(runId), previous = this.store.findSetting("service", SCOPE, key)?.value;
     if (previous !== undefined) {
-      const row = parseRun(previous); if (row.runId !== runId || JSON.stringify(row.attributions) !== JSON.stringify(attributions)) throw new StoreError("The Provider usage Run attribution changed."); return;
+      const row = parseRun(previous);
+      if (row.runId !== runId || !isDeepStrictEqual(row.attributions, attributions)) throw new StoreError("The Provider usage Run attribution changed.");
+      return;
     }
     this.store.setSetting("service", SCOPE, key, { format: 1, runId, attributions, completed: false });
   }

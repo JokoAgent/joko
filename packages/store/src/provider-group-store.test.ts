@@ -55,9 +55,13 @@ it("attributes actual SDK usage before dispatch and folds a completion once acro
   const root = mkdtempSync(join(tmpdir(), "joko-group-usage-")), path = join(root, "store.db"); let db = new OperationalStore(path);
   try {
     let usage = new ProviderGroupUsageStore(db, "owner"); usage.capture("run", [attribution]);
+    db.close(); db = new OperationalStore(path); usage = new ProviderGroupUsageStore(db, "owner");
+    usage.capture("run", [attribution]);
     expect(() => usage.capture("run", [{ ...attribution, memberKey: "later-member" }])).toThrow("changed");
     const at = Date.UTC(2026, 9, 22); expect(usage.finish("run", summary, at)).toBe(true);
-    db.close(); db = new OperationalStore(path); usage = new ProviderGroupUsageStore(db, "owner"); expect(usage.finish("run", summary, at + 1)).toBe(false);
+    db.close(); db = new OperationalStore(path); usage = new ProviderGroupUsageStore(db, "owner");
+    usage.capture("run", [attribution]);
+    expect(usage.finish("run", summary, at + 1)).toBe(false);
     expect(usage.rows({ group: key })).toEqual([{ ...attribution, ...summary, day: "2026-10-22", turns: 1, lastAt: at }]);
     expect(usage.rows({ group: key, partyId: "someone-else" })).toEqual([]);
   } finally { db.close(); rmSync(root, { recursive: true, force: true }); }
