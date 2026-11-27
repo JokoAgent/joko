@@ -732,7 +732,9 @@ export class PartnerWorkbenchManager {
 
   #transcript(sessionId: string): { readonly messages: readonly PartnerWorkbenchTranscriptItem[]; readonly truncated: boolean } {
     const head = this.#store.listEvents({ sessionId, order: "asc", limit: 120, activeNativeTimeline: true });
-    const tail = this.#store.listEvents({ sessionId, order: "desc", limit: 120, activeNativeTimeline: true }).reverse();
+    const tail = head.length < 120 ? [] : this.#store.listEvents({
+      sessionId, afterCursor: head[119]!.globalCursor, order: "desc", limit: 121, activeNativeTimeline: true
+    });
     const items = (events: readonly PersistedEvent[]): PartnerWorkbenchTranscriptItem[] => events.flatMap((event) => {
       const payload = event.payload;
       if (payload.type !== "message_complete" || payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined || payload.inputHandoffContinuation !== undefined
@@ -743,14 +745,8 @@ export class PartnerWorkbenchManager {
       const text = redactSecrets(payload.blocks.flatMap((block) => block.kind === "text" ? [block.text] : []).join("\n"));
       return [{ role: payload.role, text, at: event.emittedAt, ...(payload.partnerPrivateOrigin === undefined ? {} : { privateMessageOrigin: payload.partnerPrivateOrigin }) }];
     });
-    const heads = items(head);
-    const tails = items(tail);
-    const whole = head.length < 120 || head.at(-1)?.globalCursor === tail.at(-1)?.globalCursor;
-    const preview = boundNativeSessionPreview(heads, tails, whole);
-    return { ...preview, messages: preview.messages.map((item) => {
-      const privateMessageOrigin = [...heads, ...tails].find((row) => row.role === item.role && row.at === item.at)?.privateMessageOrigin;
-      return { ...item, ...(privateMessageOrigin === undefined ? {} : { privateMessageOrigin }) };
-    }) };
+    if (tail.length <= 120) return boundNativeSessionPreview(items([...head, ...tail.reverse()]), [], true);
+    return boundNativeSessionPreview(items(head), items(tail.slice(0, 120).reverse()), false);
   }
   #backgrounds(partnerId: string): readonly BackgroundRecord[] {
     return this.#store.listSettings("service", BACKGROUND_SCOPE).map((setting) => parseBackground(setting.value)).filter((item) => item.partnerId === partnerId);
@@ -802,7 +798,8 @@ export class PartnerWorkbenchManager {
       if (background === undefined && delegation === undefined) option(directory, "taskCount", session.worktree !== undefined);
       const project = background?.project ?? this.#projectFor(owner, directory, available) ?? (delegation === undefined && ownedTask === undefined ? undefined : "");
       if (project === undefined || project !== "" && !available.includes(project)) continue;
-      if (session.updatedAt < since && background === undefined && delegation === undefined && ownedTask === undefined) { olderCount += 1; continue; }
+      const updatedAt = Math.max(session.updatedAt, this.#store.latestSessionMessageAt(session.id) ?? 0);
+      if (updatedAt < since && background === undefined && delegation === undefined && ownedTask === undefined) { olderCount += 1; continue; }
       const id = `task:${session.id}`;
       const judgment = judgments.get(id);
       const actualState = this.#sessionState(session, delegation?.status);
@@ -818,7 +815,7 @@ export class PartnerWorkbenchManager {
       const withPurpose = digest.purpose === null && background !== undefined ? { ...digest, purpose: background.objective.slice(0, 200) }
         : digest.purpose === null && delegation !== undefined ? { ...digest, purpose: delegation.objective.slice(0, 200) } : digest;
       candidates.push({ id, kind: "session", project, title: judgment?.title ?? session.title, state: taskState,
-        group: partnerWorkbenchGroup(taskState, "session", judgment?.verdict), updatedAt: session.updatedAt, sessionId: session.id,
+        group: partnerWorkbenchGroup(taskState, "session", judgment?.verdict), updatedAt, sessionId: session.id,
         sourceLabel: background === undefined && delegation === undefined && ownedTask === undefined ? "Task" : "Background task", ownedBackground: background !== undefined || delegation !== undefined || ownedTask !== undefined,
         unread: session.attention?.unread === true, ...(startedAt === undefined ? {} : { startedAt }), ...(judgment === undefined ? {} : { judgment }), digest: withPurpose,
         ...(stopReason === undefined ? {} : { stopReason }), ...(pullRequest === undefined ? {} : { pullRequest }) });

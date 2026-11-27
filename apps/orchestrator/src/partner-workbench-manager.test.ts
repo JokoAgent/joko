@@ -59,6 +59,43 @@ class CatalogAdapter extends FakeBackendAdapter {
 }
 
 describe("Partner workbench service and Queue ownership", () => {
+  it("reads one question and answer across overlapping 120-event windows and flags a clipped message body", async () => {
+    const f = await fixture();
+    const { owner } = await grant(f);
+    const session = createProjectTask(f, Date.now());
+    const route = { sessionId: session.id, targetId: session.targetId, backendId: session.backendId, generation: session.binding.generation, traceId: "preview" };
+    const message = (role: "user" | "assistant", text: string) => f.store.appendEvent({ ...route,
+      payload: { type: "message_complete", role, blocks: [{ kind: "text", text }] } });
+    f.store.transaction(() => {
+      f.store.appendEvent({ ...route, payload: { type: "status", key: "started" } });
+      message("user", "Q".repeat(1100)); message("assistant", "A".repeat(1100));
+      for (let index = 0; index < 118; index++) f.store.appendEvent({ ...route, payload: { type: "status", key: "progress" } });
+    });
+    const detail = () => f.workbench.readDetail(owner, `task:${session.id}`);
+    const initial = await detail();
+    expect(initial.truncated).toBe(false);
+    expect(initial.transcript.map(item => item.role)).toEqual(["user", "assistant"]);
+    message("user", "q".repeat(1100)); message("assistant", "a".repeat(1100));
+    const clipped = await detail();
+    expect(clipped.transcript.map(item => item.text.length)).toEqual([200, 1100, 1100, 1100]);
+    expect(clipped.truncated).toBe(true);
+  });
+
+  it("lists an old project task by the time of its recent answer", async () => {
+    const now = Date.now();
+    const f = await fixture([], { now: () => now });
+    await grant(f);
+    const session = createProjectTask(f, now - 37 * 86_400_000);
+    const before = await f.workbench.readState(f.partner.id);
+    expect(before.tasks.some(task => task.sessionId === session.id)).toBe(false);
+    f.store.appendEvent({ sessionId: session.id, backendId: session.backendId, targetId: session.targetId,
+      generation: session.binding.generation, emittedAt: now, traceId: "recent-answer",
+      payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Recent answer" }] } });
+    const after = await f.workbench.readState(f.partner.id);
+    expect(after.tasks.find(task => task.sessionId === session.id)).toMatchObject({ updatedAt: now });
+    expect(after.olderCount).toBe(before.olderCount - 1);
+  });
+
   it("reads item pull requests through the original provider cache and retires a revoked grant during an outbound read", async () => {
     let now = Date.now(); let authorization!: CodeHostSessionAuthorizationPort;
     let finish!: (value: Awaited<ReturnType<CodeHostProvider["getPullRequest"]>>) => void;
@@ -640,6 +677,13 @@ async function fixture(additionalAdapters: readonly FakeBackendAdapter[] = [], o
     briefs: { read: async (path, assertScope) => { assertScope(); return { project: path, docs: [], recent: [], codeHost: { pullRequests: [], issues: [] } }; } }, sessionTasks: () => sessionTasks, routines: () => routines, ...options });
   cleanups.push(async () => { await routines.stop(); await scheduler.stop(); await sessionTasks.close(); await host.dispose(); partnerStore.close(); store.close(); rmSync(root, { recursive: true, force: true }); });
   return { root, managed, home, project, adapter, host, store, partnerStore, partners, partner, workspace, workbenches, workbench, sessionTasks, routines };
+}
+function createProjectTask(f: Awaited<ReturnType<typeof fixture>>, at: number) {
+  const target = f.store.upsertTarget({ id: "project-target", backendId: f.adapter.id, displayName: "Project",
+    workspaceRoot: f.project, managed: false, trusted: true }).descriptor;
+  return f.store.createSession({ id: "project-task", targetId: target.id, backendId: f.adapter.id, title: "Project task",
+    binding: { opaqueRef: "project-task-native", generation: 1 }, pinned: false, archived: false,
+    permissionMode: "ask", planMode: false, fastMode: false, createdAt: at, updatedAt: at }).descriptor;
 }
 async function grant(f: Awaited<ReturnType<typeof fixture>>) { const view = await f.workbench.readState(f.partner.id); return f.workbench.addProject(view.owner, view.state.revision, f.project); }
 function entry(project: string): NativeSessionCatalogEntry { return { nativeReference: "native:source", nativeSessionId: "native-source", title: "Original native task", workingDirectory: project, projectDirectory: project,
