@@ -32,6 +32,41 @@ jobs:
           cd "$RUNNER_TEMP/ignore-reference"
           printf '%s\n' 'generated**.ts' 'case[[:digit:]].ts' > .gitignore
           git -c core.quotepath=false check-ignore -v -n -- generated-file.ts generated-tools/visible.ts case1.ts caseA.ts case１.ts
+      - name: Observe competing lock holders and their original error stacks
+        shell: bash
+        run: |
+          node --enable-source-maps --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { mkdtemp, realpath, rmdir } from 'node:fs/promises';
+          import { tmpdir } from 'node:os';
+          import { join } from 'node:path';
+          import { setTimeout } from 'node:timers/promises';
+          import { withWorktreeSourceLock } from './packages/worktree/dist/source-use.js';
+          const root = await realpath(await mkdtemp(join(tmpdir(), 'joko-lock-handoff-')));
+          let active = 0, completed = 0;
+          try {
+            for (let round = 0; round < 48; round++) {
+              const results = await Promise.allSettled(Array.from({ length: 8 }, () =>
+                withWorktreeSourceLock(root, async () => {
+                  active++;
+                  try {
+                    assert.equal(active, 1);
+                    await setTimeout(5);
+                    assert.equal(active, 1);
+                    completed++;
+                  } finally { active--; }
+                })));
+              for (const result of results) {
+                if (result.status === 'rejected') {
+                  console.error('round', round, 'completed', completed, result.reason?.stack);
+                  throw result.reason;
+                }
+              }
+            }
+            assert.equal(completed, 384);
+            console.log('Exclusive lock callbacks completed:', completed);
+          } finally { await rmdir(root); }
+          NODE
       - name: Interrupted cleanup and workspace symbol filtering
         shell: bash
         run: |
