@@ -17,6 +17,10 @@ export interface HostedNativeSessionOwner {
 export interface HostedNativeProviderGrantOwner {
   readonly shareId: string; readonly memberId: string; readonly incarnation: number; readonly cleanupKey: string;
 }
+export function sameHostedProviderGrant(a: HostedNativeProviderGrantOwner | undefined, b: HostedNativeProviderGrantOwner | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.shareId === b.shareId && a.memberId === b.memberId && a.incarnation === b.incarnation && a.cleanupKey === b.cleanupKey;
+}
 export interface HostedNativeSessionRecord {
   readonly format: 1;
   readonly key: string;
@@ -65,7 +69,8 @@ export class HostedAgentStore {
     return this.store.transaction(() => {
       const prior = this.find(key);
       if (start === "create" && (prior || this.list().some(row => row.storageKey === key && row.derivation?.state !== "cleaned"))
-        || start === "resume" && (!prior?.binding || prior.state === "creating" || prior.state === "purging"
+        || start === "resume" && (!prior?.binding || !sameHostedProviderGrant(prior.owner.providerGrant, owner.providerGrant)
+          || prior.state === "creating" || prior.state === "purging"
           || prior.derivation && (!prior.derivation.adopted || prior.derivation.cleanupRequested || prior.derivation.state !== "settled"))) {
         throw new StoreError("The hosted native identity cannot be created or resumed with this request.");
       }
@@ -149,7 +154,7 @@ export class HostedAgentStore {
       if (!source.binding || source.state !== "ready" || this.find(key) || key === sourceKey
         || source.owner.authorityId !== owner.authorityId || source.owner.deviceId !== owner.deviceId || source.owner.trust !== owner.trust
         || source.owner.targetId !== owner.targetId || source.owner.backendId !== owner.backendId
-        || JSON.stringify(source.owner.providerGrant) !== JSON.stringify(owner.providerGrant)) throw new StoreError("The native derivation source or child owner conflicts.");
+        || !sameHostedProviderGrant(source.owner.providerGrant, owner.providerGrant)) throw new StoreError("The native derivation source or child owner conflicts.");
       const derivation: HostedNativeDerivationRecord = { ...input, sourceKey, sourceBinding: source.binding, state: "running", nativeAdopted: false, adopted: false, cleanupRequested: false };
       validateDerivation(derivation);
       const value: HostedNativeSessionRecord = { format: 1, key, owner, leaseId: `derive:${input.operationId}`, state: "creating",
@@ -176,7 +181,8 @@ export class HostedAgentStore {
     this.store.transaction(() => {
       const key = this.key(owner); if (this.find(key)) throw new StoreError("The native derivation cleanup owner changed.");
       if (!source.binding || source.owner.authorityId !== owner.authorityId || source.owner.deviceId !== owner.deviceId
-        || source.owner.trust !== owner.trust || source.owner.targetId !== owner.targetId || source.owner.backendId !== owner.backendId) throw new StoreError("The native derivation source owner conflicts.");
+        || source.owner.trust !== owner.trust || source.owner.targetId !== owner.targetId || source.owner.backendId !== owner.backendId
+        || !sameHostedProviderGrant(source.owner.providerGrant, owner.providerGrant)) throw new StoreError("The native derivation source owner conflicts.");
       const derivation: HostedNativeDerivationRecord = { operationId, kind, sourceKey: source.key, sourceBinding: source.binding,
         providerId: "cleanup-only", modelId: "cleanup-only", state: "cleaned", nativeAdopted: false, adopted: false, cleanupRequested: true };
       validateDerivation(derivation);

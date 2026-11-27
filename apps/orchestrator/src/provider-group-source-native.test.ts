@@ -224,14 +224,16 @@ it("tries another authorized group computer after a positively rejected native c
 
 it("relays guest C through B to isolated A, offers one native handoff and continues C on B", { timeout: 90_000 }, async () => {
   const f = await fixture(); let live = true, bodyFailed = false;
-  let phase: "setup" | "side-chat" | "side-chat-resume" | "side-chat-follow-up" | "clone" | "clone-follow-up" | "grant-retirement" | "completed" = "setup";
+  let phase: "setup" | "side-chat" | "side-chat-resume" | "side-chat-follow-up" | "fork" | "clone" | "clone-follow-up" | "grant-retirement" | "completed" = "setup";
   try {
     const a = await f.node("A"), b = await f.node("B"); await f.pair(b, a);
     const key = { backendId: "pi", providerId: "provider" }, memberA = providerGroupDefaultMember(b.groups.sources().find(source => source.nodeId === "A" && source.providerId === "provider")!), localB = providerGroupDefaultMember(b.groups.sources().find(source => source.kind === "local" && source.providerId === "provider")!);
     b.groups.store.update(key, { strategy: "ordered", autoSwitch: true, members: [memberA, localB] }, 0n);
     const recipient = { shareId: "share-B", memberId: "member-C", generation: 1, name: "Person C", avatarUrl: null };
     const principal: HostedAgentPrincipal = { id: "approved-C", deviceId: "device-C", trust: "guest", assertCurrent: () => { if (!live) throw new Error("Grant was withdrawn."); },
-      providerGrant: { ...key, modelIds: ["model"], cleanupKey: "a".repeat(64), recipient, assertCurrent: () => { if (!live) throw new Error("Grant was withdrawn."); } } };
+      providerGrant: { ...key, modelIds: ["model"], cleanupKey: "a".repeat(64), recipient,
+        cleanupOwner: { shareId: recipient.shareId, memberId: recipient.memberId, incarnation: 1, cleanupKey: "a".repeat(64) },
+        assertCurrent: () => { if (!live) throw new Error("Grant was withdrawn."); } } };
     const client = new HostedAgentConnectClient(createClient(contract.HostedAgentService, createRouterTransport(router => router.service(contract.HostedAgentService,
       createHostedAgentConnectService({ ...b.native.connectOptions(), authenticate: () => principal })))), principal.assertCurrent);
     const identity: ProviderSharingReceivedIdentity = { joinId: "join-C", shareId: recipient.shareId, memberId: recipient.memberId, generation: 1, hostServerId: "B", nativeBackendId: "pi", providerId: "provider" };
@@ -293,6 +295,23 @@ it("relays guest C through B to isolated A, offers one native handoff and contin
       prompt: { text: "Explain the prior completed answer in this side chat only", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
     await vi.waitFor(() => expect(c.store.getQueueItem(aside.queueItemId).state).toBe("completed"), { timeout: 30_000 });
     expect(f.calls.slice(callsBeforeSideChat).every(call => call.node === "B")).toBe(true);
+    phase = "fork";
+    // The handoff retained C's original input. Fork a user entry actually
+    // written to the current Pi history on B.
+    const forkTurn = c.host.enqueueInput({ operationId: "guest-fork-source", connection: c.connection, sessionId,
+      prompt: { text: "A user turn on the active native source", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+    await vi.waitFor(() => expect(c.store.getQueueItem(forkTurn.queueItemId).state).toBe("completed"), { timeout: 30_000 });
+    const selected = c.store.findVisibleSessionMessageOrigin({ sessionId, role: "user", includeRetainedContext: false });
+    const event = selected && c.store.findEvent(selected.eventId);
+    if (!selected || event?.payload.type !== "message_complete" || !event.payload.nativeHistory?.identity?.entryId) throw new Error("Missing guest Pi user entry.");
+    const callsBeforeFork = f.calls.length;
+    const forkId = (await c.host.deriveSession({ operationId: "guest-native-fork", sourceSessionId: sessionId, connection: c.connection,
+      title: "Native guest fork", kind: "fork", entryId: event.payload.nativeHistory.identity.entryId, sourceMessage: selected })).value.sessionId;
+    expect(c.store.getSession(forkId).descriptor.derivationOrigin).toEqual({ kind: "fork", sourceSessionId: sessionId,
+      sourceMessageId: selected.messageId, sourceEventId: selected.eventId });
+    expect(new HostedAgentStore(b.store).list().find(record => record.owner.sessionId === forkId)?.derivation)
+      .toMatchObject({ kind: "fork", adopted: true, state: "settled" });
+    expect(f.calls).toHaveLength(callsBeforeFork);
     phase = "clone";
     const callsBeforeClone = f.calls.length;
     const childId = (await c.host.deriveSession({ operationId: "guest-native-clone", sourceSessionId: sessionId, connection: c.connection,

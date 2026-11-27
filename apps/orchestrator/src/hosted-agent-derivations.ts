@@ -2,7 +2,7 @@ import { lstat, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { AdapterContext, BackendAdapter, HostedExecution, NativeSessionBinding, NativeSessionDerivationLifecycle } from "@joko/core";
 import type { HostedNativeDerivationLifecycle } from "@joko/adapter-hosted";
-import type { HostedAgentStore, HostedNativeSessionOwner, HostedNativeSessionRecord } from "@joko/store";
+import { sameHostedProviderGrant, type HostedAgentStore, type HostedNativeSessionOwner, type HostedNativeSessionRecord } from "@joko/store";
 import type { HostedAgentPrincipal } from "./hosted-agent-host.js";
 import { HostedAgentSessionSlots, type HostedAgentSlot } from "./hosted-agent-limits.js";
 import { createHostedAgentToolChannel, type HostedAgentToolChannel } from "./hosted-agent-tool-channel.js";
@@ -61,13 +61,13 @@ export class HostedAgentDerivations {
     if (!record) {
       if (command.action !== "cleanup") throw new Error("The original native derivation has not been confirmed.");
       const source = store.find(sourceKey);
-      if (!source || JSON.stringify(source.owner.providerGrant) !== JSON.stringify(owner.providerGrant)) throw new Error("The native derivation source owner is unavailable.");
+      if (!source) throw new Error("The native derivation source owner is unavailable.");
       // Fence even an as-yet undelivered original request. Absence alone must
       // never allow a late network delivery to create an unowned child.
       store.cancelUnstartedDerivation(owner, source, command.operationId, command.derivationKind); return;
     }
     const derivation = record.derivation;
-    if (JSON.stringify(record.owner.providerGrant) !== JSON.stringify(owner.providerGrant) || !derivation || derivation.sourceKey !== sourceKey
+    if (!sameHostedProviderGrant(record.owner.providerGrant, owner.providerGrant) || !derivation || derivation.sourceKey !== sourceKey
       || derivation.operationId !== command.operationId || derivation.kind !== command.derivationKind) throw new Error("The native derivation lifecycle owner conflicts.");
     if (command.action === "adopt") {
       this.options.assertAdoption(principal, record);

@@ -125,3 +125,22 @@ it("fences late derivation delivery after a confirmed unstarted cleanup and neve
     expect(() => store.claim(childOwner, "late-process", "create")).toThrow("cannot"); expect(store.find(store.key(childOwner))?.derivation?.state).toBe("cleaned");
   } finally { database.close(); }
 });
+
+it("checks the persisted Provider grant before resuming, deriving or cancelling an unstarted child", () => {
+  const database = new OperationalStore(":memory:");
+  try {
+    const store = new HostedAgentStore(database);
+    const grant = { shareId: "share", memberId: "member", incarnation: 1, cleanupKey: "a".repeat(64) };
+    const source = store.claim({ ...owner, providerGrant: grant }, "source-process", "create");
+    store.bind(source.key, source.leaseId, binding);
+    const receipt = { operationId: "guest-fork", kind: "fork" as const, providerId: "provider", modelId: "model" };
+    const child = { ...owner, sessionId: "child", nativeSessionId: "child-alias" };
+    for (const change of [{ shareId: "another" }, { memberId: "other" }, { incarnation: 2 }, { cleanupKey: "b".repeat(64) }]) {
+      const providerGrant = { ...grant, ...change };
+      expect(() => store.claim({ ...owner, providerGrant }, "replacement", "resume")).toThrow("cannot");
+      expect(() => store.prepareDerivation(source.key, source.leaseId, { ...child, providerGrant }, receipt)).toThrow("conflicts");
+      expect(() => store.cancelUnstartedDerivation({ ...child, providerGrant }, store.find(source.key)!, receipt.operationId, "fork")).toThrow("conflicts");
+    }
+    expect(store.prepareDerivation(source.key, source.leaseId, { ...child, providerGrant: grant }, receipt).owner.providerGrant).toEqual(grant);
+  } finally { database.close(); }
+});

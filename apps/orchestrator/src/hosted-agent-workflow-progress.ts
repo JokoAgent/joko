@@ -2,7 +2,7 @@ import { realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { BackgroundTaskOutputResult, BackgroundWorkflowReadInput } from "@joko/core";
 import type { HostedNativeCommand } from "@joko/adapter-hosted";
-import type { HostedAgentStore, HostedNativeSessionRecord, HostedNativeSessionOwner } from "@joko/store";
+import { sameHostedProviderGrant, type HostedAgentStore, type HostedNativeSessionRecord, type HostedNativeSessionOwner } from "@joko/store";
 import type { HostedAgentPrincipal } from "./hosted-agent-host.js";
 
 export type HostedWorkflowProgressCommand = Extract<HostedNativeCommand, { kind: "workflow_progress" }>;
@@ -29,8 +29,7 @@ export class HostedAgentWorkflowProgress {
     const store = this.options.store, key = store.key(owner), record = store.find(key);
     if (!record?.binding || record.state === "creating" || record.state === "purging"
       || record.derivation && (!record.derivation.adopted || record.derivation.cleanupRequested || record.derivation.state !== "settled")) return absent();
-    const grantIdentity = (grant: HostedNativeSessionOwner["providerGrant"]) => grant === undefined ? "" : JSON.stringify([grant.shareId, grant.memberId, grant.incarnation, grant.cleanupKey]);
-    if (grantIdentity(record.owner.providerGrant) !== grantIdentity(owner.providerGrant)) throw new Error("The native workflow grant changed.");
+    if (!sameHostedProviderGrant(record.owner.providerGrant, owner.providerGrant)) throw new Error("The native workflow grant changed.");
     const access = this.options.authorize(principal, command, record), observed = store.backgroundTaskBinding(key, command.taskId), binding = observed ?? record.binding;
     const bindingIdentity = (value: typeof binding | undefined) => value === undefined ? "" : JSON.stringify([value.opaqueRef, value.nativeSessionId, value.generation]);
     const originalBinding = bindingIdentity(binding);
