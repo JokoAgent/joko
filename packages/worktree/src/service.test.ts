@@ -14,7 +14,7 @@ import {
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { EphemeralWorktreeService } from "./service.js";
 import { acquireWorktreeSourceUse, withWorktreeSourceLock } from "./source-use.js";
@@ -93,6 +93,26 @@ describe("EphemeralWorktreeService", () => {
       expect(reopened.snapshot().active).toEqual([]);
       expect(reopened.listRecycleStatus()).toEqual([]);
     } finally { reopened.dispose(); }
+  });
+
+  test("releases an owned checkout when the OS temporary directory is an alias", { timeout: 30_000 }, async () => {
+    const fixture = await createRepositoryFixture();
+    const physical = join(fixture.root, "physical-temp");
+    const alias = join(fixture.root, "temp-alias");
+    await mkdir(physical);
+    await symlink(physical, alias, process.platform === "win32" ? "junction" : "dir");
+    const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
+    try {
+      unwrap(await service.initialize());
+      const { lease } = unwrap(await service.acquire({ sessionId: "temp-alias", cwd: fixture.repositoryRoot }));
+      for (const name of ["TMPDIR", "TMP", "TEMP"]) vi.stubEnv(name, alias);
+      expect(tmpdir()).toBe(alias);
+      expect(unwrap(await service.release("temp-alias"))).toMatchObject({ status: "destroyed", pathRemoved: true });
+      await expect(lstat(lease.path)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      vi.unstubAllEnvs();
+      service.dispose();
+    }
   });
 
   test("persists exact recycle controls without charging native and source writer waits", { timeout: 40_000 }, async () => {

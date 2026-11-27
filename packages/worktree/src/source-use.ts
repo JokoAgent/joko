@@ -80,7 +80,7 @@ export async function withWorktreeSourceLock<T>(value: string, task: () => Promi
   const inherited = heldResources.getStore();
   if (inherited?.get(key)?.active) { signal?.throwIfAborted(); return task(); }
   const user = typeof process.getuid === "function" ? process.getuid() : 0;
-  const directory = join(tmpdir(), `joko-worktree-${user}-${createHash("sha256").update(key).digest("hex")}.lock`);
+  const directory = join(await realpath(tmpdir()), `joko-worktree-${user}-${createHash("sha256").update(key).digest("hex")}.lock`);
   const gate = `${directory}.reclaim`;
   const deadline = Date.now() + 10_000;
   let nonce: string | undefined;
