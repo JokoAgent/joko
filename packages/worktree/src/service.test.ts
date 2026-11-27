@@ -117,10 +117,23 @@ describe("EphemeralWorktreeService", () => {
       }
       expect(unwrap(await service.release("temp-alias"))).toMatchObject({ status: "destroyed", pathRemoved: true });
       await expect(lstat(lease.path)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readdir(physical)).toEqual([]);
     } finally {
       vi.unstubAllEnvs();
       service.dispose();
     }
+  });
+
+  test("serializes concurrent resource lock publications for the same checkout", async () => {
+    const root = await createTemporaryRoot();
+    let active = 0;
+    await Promise.all(Array.from({ length: 8 }, () => withWorktreeSourceLock(root, async () => {
+      active += 1;
+      try {
+        await new Promise(resolveWait => setTimeout(resolveWait, 5));
+        expect(active).toBe(1);
+      } finally { active -= 1; }
+    })));
   });
 
   test("persists exact recycle controls without charging native and source writer waits", { timeout: 40_000 }, async () => {

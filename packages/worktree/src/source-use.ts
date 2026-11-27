@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, readdir, realpath, rename, rmdir, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, realpath, rename, rmdir, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { WorktreeServiceError } from "./errors.js";
@@ -70,8 +70,48 @@ async function pause(signal?: AbortSignal): Promise<void> {
 async function releaseLock(directory: string, nonce: string): Promise<void> {
   const owner = await boundedJson(join(directory, "owner.json"));
   if (!lockRecord(owner) || owner.nonce !== nonce || owner.pid !== process.pid) throw busy();
-  await unlink(join(directory, "owner.json"));
-  await rmdir(directory);
+  const retired = `${directory}.retired-${nonce}`;
+  await rename(directory, retired);
+  await unlink(join(retired, "owner.json"));
+  await rmdir(retired);
+}
+
+/** Publish the claim and its owner together, including for readers using the old directory protocol. */
+async function publishLock(directory: string, nonce: string): Promise<boolean> {
+  if (await exists(directory)) return false;
+  const pending = `${directory}.pending-${nonce}`;
+  await mkdir(pending, { mode: 0o700 });
+  let published = false;
+  try {
+    await validateOrdinaryDirectory(pending, "STORAGE_UNSAFE", "The worktree resource lock changed unsafely.");
+    await writeFile(join(pending, "owner.json"), JSON.stringify({ format: 1, pid: process.pid, nonce } satisfies LockRecord),
+      { flag: "wx", mode: 0o600, flush: true });
+    try { await rename(pending, directory); }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EEXIST" || code === "ENOTEMPTY" || await exists(directory)) return false;
+      throw error;
+    }
+    published = true;
+    return true;
+  } finally {
+    if (!published) {
+      await unlink(join(pending, "owner.json")).catch(error => { if (!missing(error)) throw error; });
+      await rmdir(pending);
+    }
+  }
+}
+
+async function clearEmptyLegacyLock(directory: string): Promise<void> {
+  try {
+    const info = await lstat(directory);
+    if (!info.isDirectory() || info.isSymbolicLink() || !samePath(await realpath(directory), directory)
+      || (typeof process.getuid === "function" && info.uid !== process.getuid())) throw busy();
+    // An active or newly published claim contains owner.json. rmdir can only remove an empty directory.
+    await rmdir(directory);
+  } catch (error) {
+    if (!missing(error) && !["ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+  }
 }
 
 /** A short deletion/selection lock. Its recovery never releases a source writer. */
@@ -89,21 +129,16 @@ export async function withWorktreeSourceLock<T>(value: string, task: () => Promi
     if (Date.now() > deadline) throw busy();
     if (await exists(gate)) { await pause(signal); continue; }
     const candidate = randomUUID();
-    let created = false;
-    try {
-      await mkdir(directory, { mode: 0o700 });
-      created = true;
-      await validateOrdinaryDirectory(directory, "STORAGE_UNSAFE", "The worktree resource lock changed unsafely.");
-      const handle = await open(join(directory, "owner.json"), "wx", 0o600);
-      try { await handle.writeFile(JSON.stringify({ format: 1, pid: process.pid, nonce: candidate } satisfies LockRecord)); await handle.sync(); }
-      finally { await handle.close(); }
+    if (await publishLock(directory, candidate)) {
       if (await exists(gate)) { await releaseLock(directory, candidate); await pause(signal); continue; }
       nonce = candidate;
-    } catch (error) {
-      if (created) throw error;
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    } else {
       let owner: unknown;
-      try { owner = await boundedJson(join(directory, "owner.json")); } catch { await pause(signal); continue; }
+      try { owner = await boundedJson(join(directory, "owner.json")); }
+      catch (error) {
+        if (missing(error)) await clearEmptyLegacyLock(directory);
+        await pause(signal); continue;
+      }
       if (!lockRecord(owner) || !processAbsent(owner.pid)) { await pause(signal); continue; }
       let heldGate = false;
       try {
