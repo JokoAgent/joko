@@ -15580,11 +15580,12 @@ function durablePiEntry(event: PersistedEvent, message: contract.PiNativeMessage
   if (message !== undefined) {
     payload = { case: "message", value: message };
   } else if (nativeType.includes("model") && event.payload.type === "status") {
-    const [providerId = "", modelId = ""] = (event.payload.text ?? "").split("/", 2);
+    const structured = event.pi?.payload.case === "modelUpdate" ? event.pi.payload.value.model : undefined;
+    const [providerId = "", ...modelParts] = (event.payload.text ?? "").split("/");
     payload = {
       case: "modelChange",
       value: create(contract.PiModelChangeEntrySchema, {
-        model: create(contract.ModelKeySchema, { providerId, modelId })
+        model: create(contract.ModelKeySchema, structured ?? { providerId, modelId: modelParts.join("/") })
       })
     };
   } else if (nativeType.includes("thinking") && event.payload.type === "status") {

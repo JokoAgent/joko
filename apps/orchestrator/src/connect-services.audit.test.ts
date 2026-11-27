@@ -2187,6 +2187,17 @@ describe("Connect security and protocol audit", () => {
         messagesComplete: false,
         entriesComplete: false
       });
+      listEvents.mockRestore();
+      const route = { sessionId: "session-pi-history", backendId: "pi", targetId: "target-pi-history", generation: 7, traceId: "model-history" };
+      const model = { providerId: "openrouter", modelId: "anthropic/claude-sonnet-4" };
+      store.appendEvent({ ...route, payload: { type: "status", key: "pi.history.model", text: "display only" },
+        pi: { rpcEventType: "model_update", entryId: "model-entry", payload: { case: "modelUpdate",
+          value: { model, thinkingLevel: "", scopedModel: false, contextWindowTokens: 0 } } },
+        metadata: { namespace: "pi.native_history", fields: { nativeReference: "opaque:pi-history", nativeEntryType: "model_change" } } });
+      store.appendEvent({ ...route, payload: { type: "native_session_changed", opaqueRef: "opaque:pi-history", leafId: "model-entry" } });
+      expect(await snapshotSession()).toMatchObject({ entriesComplete: true, entries: [
+        { entryId: "model-entry", payload: { case: "modelChange", value: { model } } }
+      ] });
     } finally {
       await adapter.dispose();
     }
