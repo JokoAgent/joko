@@ -1093,6 +1093,7 @@ const mobileTaskMessageRows = [
   ["files.shareResult", "Share {name}", "分享 {name}", "分享 {name}", "{name} を共有", "{name} 공유"],
   ["markdown.code", "Code", "代码", "程式碼", "コード", "코드"],
   ["markdown.table", "Table", "表格", "表格", "表", "표"],
+  ["markdown.copyTable", "Copy table", "复制表格", "複製表格", "表をコピー", "표 복사"],
   ["markdown.math", "Formula", "公式", "公式", "数式", "수식"],
   ["markdown.diagram", "Diagram", "图表", "圖表", "図", "다이어그램"],
   ["markdown.image", "Image", "图片", "圖片", "画像", "이미지"],

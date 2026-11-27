@@ -47,6 +47,14 @@ export interface MobileMarkdownTableRow {
   cells: MobileMarkdownInline[][];
 }
 
+export function mobileMarkdownTableToTsv(table: Extract<MobileMarkdownBlock, { type: 'table' }>): string {
+  const rows = [table.header, ...table.rows.map(row => row.cells)];
+  const columns = rows.reduce((width, row) => Math.max(width, row.length), 0);
+  return rows.map(row => Array.from({ length: columns }, (_, column) => (row[column] ?? [])
+    .map(inline => inline.type === 'image' ? inline.alt : inline.text).join('').replace(/[\t\r\n]+/gu, ' ')
+  ).join('\t')).join('\n');
+}
+
 export type MobileMarkdownBlock =
   | { type: 'paragraph'; key: string; srcLine?: number; inlines: MobileMarkdownInline[] }
   | { type: 'heading'; key: string; srcLine?: number; level: number; inlines: MobileMarkdownInline[] }

@@ -17,7 +17,7 @@ import { MobileRichAnswer } from "./MobileRichAnswer";
 import { MobileRichAnswerMedia } from "./MobileRichAnswerMedia";
 import type { MobileMarkdownResourceDescriptor } from "./mobile-markdown-resources";
 import {
-  groupMobileMarkdownSelectableBlocks, mobileMarkdownInlineHasMark, mobileMarkdownInlineImageSize, parseMobileMarkdownIncremental,
+  groupMobileMarkdownSelectableBlocks, mobileMarkdownInlineHasMark, mobileMarkdownInlineImageSize, mobileMarkdownTableToTsv, parseMobileMarkdownIncremental,
   type MobileMarkdownBlock, type MobileMarkdownInline, type MobileMarkdownParseResult
 } from "./mobile-markdown";
 import { latexToUnicodeApproximation } from "./mobile-markdown-math";
@@ -41,6 +41,7 @@ interface Props {
   readonly locale: MobileSupportedLocale;
   readonly ownerKey: string;
   readonly selectable?: boolean;
+  readonly tableCopyEnabled?: boolean;
   readonly quoteAction?: MobileMessageQuoteAction;
   readonly codeQuoteAction?: MobileMessageQuoteAction;
   readonly resourceClient?: MobileMarkdownResourceClient;
@@ -59,7 +60,7 @@ interface Props {
 interface MarkdownCopySource {
   readonly ownerKey: string;
   readonly key: string;
-  readonly type: "code" | "math" | "mermaid";
+  readonly type: "code" | "math" | "mermaid" | "table";
   readonly text: string;
 }
 
@@ -87,7 +88,7 @@ export const MobileMarkdownMessage = memo(function MobileMarkdownMessage(props: 
     : <MobilePlainMarkdownMessage {...plainProps} key={part.key} text={part.source} />)}</View>;
 });
 
-const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ text, colors, locale, ownerKey, selectable = true,
+const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ text, colors, locale, ownerKey, selectable = true, streaming, tableCopyEnabled = true,
   codeQuoteAction, preparedResources: resources, onOpenImage, onOpenPath, retryPath, onAnnotateDiagram }: Props & {
     readonly preparedResources?: MobileMarkdownResourceDescriptor;
     readonly retryPath?: (key: string) => void;
@@ -118,6 +119,7 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
   };
   for (const block of parsed.blocks) {
     if (block.type === "code" || block.type === "math" || block.type === "mermaid") registerCopySource(block.key, block.type, block.text);
+    if (block.type === "table" && !streaming && tableCopyEnabled) registerCopySource(block.key, block.type, mobileMarkdownTableToTsv(block));
   }
   const expandedCopySource = expanded === undefined ? undefined : registerCopySource(`expanded:${expanded.key}`, expanded.type, expanded.text);
   useLayoutEffect(() => { committedCopySources.current = copySources; });
@@ -211,9 +213,9 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
     <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{kind}</Text>
     {onExpand && <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "markdown.expand")}
       onPress={onExpand} style={styles.action}><Text style={{ color: colors.accent }}>{mobileMessage(locale, "markdown.expand")}</Text></Pressable>}
-    <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "markdown.copySource")}
+    <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, source.type === "table" ? "markdown.copyTable" : "markdown.copySource")}
       accessibilityState={{ disabled: copying }} disabled={copying} onPress={() => void copy(source)} style={styles.action}>
-      <Text style={{ color: colors.accent }}>{mobileMessage(locale, copying ? "markdown.copying" : "markdown.copySource")}</Text>
+      <Text style={{ color: colors.accent }}>{mobileMessage(locale, copying ? "markdown.copying" : source.type === "table" ? "markdown.copyTable" : "markdown.copySource")}</Text>
     </Pressable>
   </View>;
   const block = (value: MobileMarkdownBlock) => {
@@ -243,10 +245,14 @@ const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ te
       })}
       <MobileMarkdownRichBlock kind={value.type} source={value.text} colors={colors} locale={locale} ownerKey={`${ownerKey}/${value.key}`} />
     </View>;
-    if (value.type === "table") return <MobileMarkdownTable key={value.key}
-      table={value} colors={colors} label={mobileMessage(locale, "markdown.table")} rendersInlineImage={rendersInlineImage}
-      renderCell={(cell, header) => <Text selectable={textSelectable(cell)}
-        style={[bodyStyle(cell), { color: colors.ink }, header && styles.strong]}>{inlines(cell)}</Text>} />;
+    if (value.type === "table") {
+      const source = copySources.get(value.key);
+      return <MobileMarkdownTable key={value.key}
+        toolbar={source && toolbar(source, mobileMessage(locale, "markdown.table"))}
+        table={value} colors={colors} label={mobileMessage(locale, "markdown.table")} rendersInlineImage={rendersInlineImage}
+        renderCell={(cell, header) => <Text selectable={textSelectable(cell)}
+          style={[bodyStyle(cell), { color: colors.ink }, header && styles.strong]}>{inlines(cell)}</Text>} />;
+    }
     if (value.type === "blockquote") return <View key={value.key} style={[styles.quote, { borderColor: colors.accent }]}>
       <Text selectable={textSelectable(value.inlines)} style={[bodyStyle(value.inlines), { color: colors.muted }]}>{inlines(value.inlines)}</Text>
     </View>;
@@ -316,10 +322,11 @@ const TABLE_MIN_COLUMN_WIDTH = 96;
 const TABLE_MAX_TEXT_WIDTH = 220;
 const WIDE_TABLE_GLYPH = /[\p{Script=Han}\p{Script=Hangul}\p{Script=Hiragana}\p{Script=Katakana}\p{Extended_Pictographic}\uFF00-\uFFEF]/u;
 
-function MobileMarkdownTable({ table, colors, label, rendersInlineImage, renderCell }: {
+function MobileMarkdownTable({ table, colors, label, toolbar, rendersInlineImage, renderCell }: {
   readonly table: Extract<MobileMarkdownBlock, { type: "table" }>;
   readonly colors: MobileMarkdownColors;
   readonly label: string;
+  readonly toolbar: ReactNode;
   readonly rendersInlineImage: (inline: MobileMarkdownInline) => boolean;
   readonly renderCell: (cell: readonly MobileMarkdownInline[], header: boolean) => ReactNode;
 }) {
@@ -343,6 +350,7 @@ function MobileMarkdownTable({ table, colors, label, rendersInlineImage, renderC
   const widths = preferredWidths.map((width, column) =>
     width + extraPerColumn + (column < extraRemainder ? 1 : 0));
   return <View style={[styles.frame, { borderColor: colors.border }]}>
+    {toolbar}
     <ScrollView horizontal nestedScrollEnabled scrollEnabled={viewportWidth === 0 || minimumWidth > viewportWidth}
       onLayout={(event) => setViewportWidth(Math.floor(event.nativeEvent.layout.width))}>
       <View accessibilityLabel={label}>

@@ -108,6 +108,8 @@ describe("native message Markdown", () => {
       expect(widths(1)).toEqual(widths(0));
       expect(row(1).querySelectorAll('[data-selectable="true"]')).toHaveLength(3);
       expect(scrollView().dataset.scrollEnabled).toBe("false");
+      await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Copy table"]')!.click());
+      expect(copy).toHaveBeenLastCalledWith("A\tB\tC\nAA\tBB\tCC");
 
       await measure(280);
       expect(widths(0)).toEqual([96, 96, 96]);
@@ -117,7 +119,42 @@ describe("native message Markdown", () => {
       expect(widths(1)).toEqual([96, 96, 96, 96, 96]);
       expect(row(1).textContent).toBe("ABCDE");
       expect(scrollView().dataset.scrollEnabled).toBe("true");
+      await render("Before\n\n| Name | Value |\n| --- | --- |\n| **Alice** | [Shown](https://example.test) |\n| ![Photo](photo.png) | |\n\nAfter");
+      await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Copy table"]')!.click());
+      expect(copy).toHaveBeenLastCalledWith("Name\tValue\nAlice\tShown\nPhoto\t");
     } finally { await act(async () => root.unmount()); }
+  });
+
+  it("offers whole-table copy after streaming and retires it during share selection", async () => {
+    const container = document.createElement("div"), root = createRoot(container);
+    const colors = { surface: "#fff", background: "#fafafa", ink: "#111", muted: "#666", border: "#ccc", accent: "#f90", negative: "#c33" };
+    const header = "| Name | Value |\n| --- | --- |\n| First | 1 |";
+    const complete = header + "\n| Last | 2 |";
+    const render = (text: string, streaming: boolean, tableCopyEnabled: boolean) => act(async () => root.render(
+      <MobileMarkdownMessage text={text} colors={colors} locale="en" ownerKey="task-reply" streaming={streaming} tableCopyEnabled={tableCopyEnabled} />
+    ));
+    const button = () => container.querySelector<HTMLButtonElement>('button[aria-label="Copy table"]');
+    let finish: (() => void) | undefined;
+    copy.mockClear();
+    try {
+      await render(header, true, true);
+      expect(container.textContent).toContain("First");
+      expect(button()).toBeNull();
+      await render(complete, true, true);
+      expect(container.textContent).toContain("Last");
+      expect(button()).toBeNull();
+      await render(complete, false, true);
+      copy.mockImplementationOnce(() => new Promise(resolve => { finish = () => resolve(undefined); }));
+      await act(async () => button()!.click());
+      await render(complete, false, false);
+      expect(button()).toBeNull();
+      await act(async () => finish?.());
+      await render(complete, false, true);
+      expect(container.textContent).not.toContain("Source copied.");
+      await act(async () => button()!.click());
+      expect(copy.mock.calls).toEqual([["Name\tValue\nFirst\t1\nLast\t2"], ["Name\tValue\nFirst\t1\nLast\t2"]]);
+      expect(container.textContent).toContain("Source copied.");
+    } finally { finish?.(); await act(async () => root.unmount()); }
   });
 
   it("sends a previewed rich answer only on click and retains acceptance across native row remounts", async () => {

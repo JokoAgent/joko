@@ -7422,7 +7422,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           if (part.kind === "artifact") return renderTimelineArtifact(part.artifact);
           return <MobileMarkdownMessage key={`${markdownOwnerKey}/part/${part.contentIndex}`} text={part.text}
             colors={colors} locale={locale} ownerKey={`${markdownOwnerKey}/part/${part.contentIndex}`}
-            quoteAction={quoteAction}
+            quoteAction={quoteAction} tableCopyEnabled={!conversationShare.active}
             answerStateKey={JSON.stringify([client.answerStateOwnerKey(), item.id, part.contentIndex])} streaming={!item.completed && !item.samplingInterrupted}
             onSendRichAnswer={item.kind === "assistant" ? sendRichAnswer : undefined}
             resourceText={item.text}
@@ -7432,7 +7432,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         }) : item.tool ? <MobileToolCallCard key={markdownOwnerKey} call={item.tool} ownerKey={markdownOwnerKey} colors={colors} locale={locale}
           enabled={state.status === "connected" || state.status === "offline"} />
           : item.kind === "assistant" ? <MobileMarkdownMessage key={markdownOwnerKey} text={item.text} colors={colors} locale={locale}
-          quoteAction={quoteAction}
+          quoteAction={quoteAction} tableCopyEnabled={!conversationShare.active}
           answerStateKey={JSON.stringify([client.answerStateOwnerKey(), item.id])} streaming={!item.completed && !item.samplingInterrupted}
           onSendRichAnswer={sendRichAnswer}
           ownerKey={markdownOwnerKey} resourceClient={client} messageId={item.id}
