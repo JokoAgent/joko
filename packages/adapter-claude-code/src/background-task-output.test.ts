@@ -7,6 +7,9 @@ import { readRegisteredBackgroundTaskOutput } from "./background-task-output.js"
 it("reads only a bounded complete tail and preserves a single long UTF-8 line", async () => {
   const directory = await mkdtemp(join(tmpdir(), "joko-background-output-")), file = join(directory, "task.output");
   try {
+    await writeFile(file, "aaaa\nbbbb\ncccc\n");
+    expect(await readRegisteredBackgroundTaskOutput(file, 10)).toMatchObject({ status: "available", text: "bbbb\ncccc\n", totalBytes: 15, truncated: true });
+    expect(await readRegisteredBackgroundTaskOutput(file, 9)).toMatchObject({ status: "available", text: "cccc\n", totalBytes: 15, truncated: true });
     await writeFile(file, "older line\ncurrent line\n");
     expect(await readRegisteredBackgroundTaskOutput(file, 13)).toMatchObject({ status: "available", text: "current line\n", totalBytes: 24, truncated: true });
     await writeFile(file, "界".repeat(100));

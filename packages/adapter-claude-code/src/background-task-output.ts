@@ -33,13 +33,17 @@ export async function readRegisteredBackgroundTaskOutput(filePath: string, maxim
     if (!opened.isFile() || expected.ino === 0n || opened.dev !== expected.dev || opened.ino !== expected.ino) return absent("unavailable");
     const totalBytes = Number(opened.size);
     if (!Number.isSafeInteger(totalBytes)) return absent("failed");
-    const start = Math.max(0, totalBytes - maximumBytes), buffer = Buffer.alloc(totalBytes - start);
-    const bytesRead = buffer.length ? (await handle.read(buffer, 0, buffer.length, start)).bytesRead : 0;
-    let text = buffer.subarray(0, bytesRead).toString("utf8");
-    if (start > 0) {
-      const firstNewline = text.indexOf("\n"), remainder = firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
-      text = remainder.trim() ? remainder : text.replace(/^\uFFFD+/u, "");
+    const start = Math.max(0, totalBytes - maximumBytes);
+    const readFrom = Math.max(0, start - 1);
+    const buffer = Buffer.alloc(totalBytes - readFrom);
+    const bytesRead = buffer.length ? (await handle.read(buffer, 0, buffer.length, readFrom)).bytesRead : 0;
+    let first = start - readFrom;
+    if (start > 0 && buffer[0] !== 0x0a) {
+      const newline = buffer.subarray(0, bytesRead).indexOf(0x0a, first);
+      if (newline >= 0 && newline + 1 < bytesRead) first = newline + 1;
+      else while (first < bytesRead && (buffer[first]! & 0xc0) === 0x80) first++;
     }
+    const text = buffer.toString("utf8", first, bytesRead);
     return { status: "available", text, totalBytes, truncated: start > 0, modifiedAtMs: Number(opened.mtimeMs), capturedAtMs: Date.now() };
   } catch (error) {
     return absent(["ENOENT", "ENOTDIR", "ELOOP"].includes((error as NodeJS.ErrnoException).code ?? "") ? "unavailable" : "failed");
