@@ -32,8 +32,12 @@ export class TelegramSystemFixture {
   readonly baseUrl: string;
   readonly outboundMessages: TelegramSystemOutboundMessage[] = [];
   readonly methods: string[] = [];
+  onPoll?: (offset: number) => void;
   readonly #server: Server;
   readonly #updates: TelegramSystemUpdate[] = [];
+  #sequenceStart = 0;
+  #firstPageAfterIdle = false;
+  #redelivery?: TelegramSystemUpdate;
   readonly #files = new Map<string, TelegramSystemFile>();
   readonly #pollFailures: Array<{ readonly status: number; readonly body: Readonly<Record<string, unknown>> }> = [];
   #nextMessageId = 900;
@@ -86,7 +90,8 @@ export class TelegramSystemFixture {
     const file = input.fileId === undefined ? undefined : this.#files.get(input.fileId);
     if (input.fileId !== undefined && file === undefined) throw new Error("Telegram fixture file is not registered.");
     const replied = input.replyToMessageId === undefined ? undefined
-      : this.#updates.find(({ message }) => message["message_id"] === input.replyToMessageId)?.message;
+      : this.#updates.find(({ message }) => message["message_id"] === input.replyToMessageId
+        && recordField(message, "chat")?.["id"] === TELEGRAM_SYSTEM_OWNER_ID)?.message;
     if (input.replyToMessageId !== undefined && replied === undefined) throw new Error("Telegram fixture reply is not registered.");
     const { reply_to_message: _nestedReply, ...quoted } = replied ?? {};
     this.#updates.push({
@@ -114,7 +119,6 @@ export class TelegramSystemFixture {
         })
       }
     });
-    this.#updates.sort((left, right) => left.update_id - right.update_id);
   }
 
   enqueueGroupMessage(input: {
@@ -145,7 +149,17 @@ export class TelegramSystemFixture {
         })
       }
     });
-    this.#updates.sort((left, right) => left.update_id - right.update_id);
+  }
+
+  startNewUpdateSequence(): void {
+    this.#sequenceStart = this.#updates.length;
+    this.#firstPageAfterIdle = true;
+  }
+
+  redeliverOnNextPoll(id: number): void {
+    const previous = this.#updates.findLast(update => update.update_id === id);
+    if (!previous) throw new Error("The Telegram update to redeliver is missing.");
+    this.#redelivery = previous;
   }
 
   failNextPollWithConflict(): void {
@@ -207,9 +221,17 @@ export class TelegramSystemFixture {
         const failure = this.#pollFailures.shift();
         if (failure !== undefined) return json(response, failure.status, failure.body);
         const offset = typeof body["offset"] === "number" ? body["offset"] : 0;
-        const updates = this.#updates.filter((update) => update.update_id >= offset);
+        this.onPoll?.(offset);
+        const updates = this.#updates.slice(this.#sequenceStart)
+          .filter(update => this.#firstPageAfterIdle || update.update_id >= offset)
+          .sort((left, right) => left.update_id - right.update_id);
+        if (updates.length) this.#firstPageAfterIdle = false;
+        if (this.#redelivery) {
+          updates.unshift(this.#redelivery);
+          this.#redelivery = undefined;
+        }
         if (updates.length === 0) await delay(25);
-        return json(response, 200, { ok: true, result: updates });
+        return json(response, 200, { ok: true, result: updates.slice(0, 100) });
       }
       if (method === "getFile") {
         const fileId = typeof body["file_id"] === "string" ? body["file_id"] : "";

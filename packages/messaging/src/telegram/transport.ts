@@ -106,8 +106,10 @@ export class TelegramTransport {
         effect: "none"
       });
     }
-    const maximum = updates.reduce((value, update) => Math.max(value, update.update_id), offset === null ? 0 : offset - 1);
-    return { updates: [...updates].sort((left, right) => left.update_id - right.update_id), nextCursor: String(maximum + 1) };
+    const ordered = [...updates].sort((left, right) => left.update_id - right.update_id);
+    // After a week of inactivity Telegram can start a lower sequence.
+    const last = ordered.at(-1);
+    return { updates: ordered, nextCursor: String(last ? last.update_id + 1 : offset ?? 1) };
   }
 
   normalize(updates: readonly TelegramUpdate[]): TelegramNormalizationResult {

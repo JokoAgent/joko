@@ -100,6 +100,22 @@ describe("TelegramTransport", () => {
     expect(bodies[1]).toMatchObject({ offset: 17, timeout: 12, limit: 100 });
   });
 
+  it("acknowledges the returned page after an idle reset and keeps that offset across empty polls", async () => {
+    const pages = [Array.from({ length: 100 }, (_, index) => ({ update_id: 199 - index })), [{ update_id: 200 }], []];
+    const offsets: number[] = [];
+    const transport = createTransport(fakeFetch(async (_url, init) => {
+      offsets.push(JSON.parse(String(init.body)).offset);
+      return jsonResponse({ ok: true, result: pages.shift() });
+    }));
+    const first = await transport.poll({ cursor: "9001" });
+    expect(first.updates.map(update => update.update_id)).toEqual(Array.from({ length: 100 }, (_, index) => 100 + index));
+    expect(first.nextCursor).toBe("200");
+    const next = await transport.poll({ cursor: first.nextCursor });
+    expect(next.nextCursor).toBe("201");
+    await expect(transport.poll({ cursor: next.nextCursor })).resolves.toEqual({ updates: [], nextCursor: "201" });
+    expect(offsets).toEqual([9001, 200, 201]);
+  });
+
   it("keeps each outbound call to one externally uncertain effect", async () => {
     const calls: Array<{ readonly method: string; readonly body: Record<string, unknown> }> = [];
     const fetch = fakeFetch(async (url, init) => {

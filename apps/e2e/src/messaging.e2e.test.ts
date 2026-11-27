@@ -101,8 +101,22 @@ describe("Telegram Messaging production product chain", () => {
       15_000
     );
 
+    telegram.enqueueGroupMessage({ chatId: -700, updateId: 9000, messageId: 99, text: "Background before the bot went idle." });
+    await waitFor(async () => fixture!.application.store.getMessagingConnection(created.connectionId).cursor,
+      cursor => cursor === "9001", "the last offset before the idle sequence reset", 15_000);
+    telegram.startNewUpdateSequence();
+    let admittedAtAcknowledgement: boolean | undefined;
+    telegram.onPoll = offset => {
+      if (offset === 200 && admittedAtAcknowledgement === undefined) {
+        admittedAtAcknowledgement = fixture!.application.store.listMessagingInboundRequests()
+          .some(request => request.providerRequestIds.includes("telegram:update:199"));
+      }
+    };
+    for (let updateId = 100; updateId < 199; updateId++) {
+      telegram.enqueueGroupMessage({ chatId: -700, updateId, messageId: updateId, text: "Unaddressed group update." });
+    }
     telegram.enqueueDirectMessage({
-      updateId: 10,
+      updateId: 199,
       messageId: 100,
       text: "Inspect the attached product-chain note.",
       fileId: "telegram-note-1",
@@ -119,7 +133,7 @@ describe("Telegram Messaging production product chain", () => {
     const firstRequest = required(fixture.application.store.listMessagingInboundRequests()[0], "first Messaging request");
     expect(firstRequest).toMatchObject({
       status: "completed",
-      providerRequestIds: ["telegram:update:10"],
+      providerRequestIds: ["telegram:update:199"],
       providerMessageId: "100",
       protectedContent: false
     });
@@ -154,7 +168,9 @@ describe("Telegram Messaging production product chain", () => {
     );
 
     const firstCursor = fixture.application.store.getMessagingConnection(created.connectionId).cursor;
-    expect(firstCursor).toBe("11");
+    expect(firstCursor).toBe("200");
+    expect(admittedAtAcknowledgement).toBe(true);
+    telegram.onPoll = undefined;
     await fixture.close({ removeRoot: false });
     fixture = undefined;
 
@@ -170,8 +186,9 @@ describe("Telegram Messaging production product chain", () => {
       "the persisted Telegram connection to reconnect after restart",
       15_000
     );
+    telegram.redeliverOnNextPoll(199);
     telegram.enqueueDirectMessage({
-      updateId: 11,
+      updateId: 200,
       messageId: 101,
       text: "Continue in the same visible task after restart."
     });
@@ -185,22 +202,22 @@ describe("Telegram Messaging production product chain", () => {
     const requests = fixture.application.store.listMessagingInboundRequests();
     expect(requests).toHaveLength(2);
     expect(requests.flatMap((request) => request.providerRequestIds).sort()).toEqual([
-      "telegram:update:10",
-      "telegram:update:11"
+      "telegram:update:199",
+      "telegram:update:200"
     ]);
     const restartedConversation = required(
-      fixture.application.store.listMessagingConversations({ connectionId: created.connectionId })[0],
+      fixture.application.store.listMessagingConversations({ connectionId: created.connectionId }).find(item => item.id === conversation.id),
       "restarted Telegram conversation"
     );
     expect(restartedConversation.sessionId).toBe(sessionId);
-    expect(fixture.application.store.getMessagingConnection(created.connectionId).cursor).toBe("12");
+    expect(fixture.application.store.getMessagingConnection(created.connectionId).cursor).toBe("201");
     expect((await restartedClients.session.getSession({ sessionId })).session?.sessionId).toBe(sessionId);
     expect(fixture.providerRequests).toHaveLength(1);
 
     const audio = await readFile(new URL("../../desktop/resources/native-task-status-sounds/ring-chime.mp3", import.meta.url));
     telegram.addFile({ fileId: "native-audio-102", path: "music/chime.mp3", bytes: audio, mimeType: "audio/mpeg" });
     telegram.enqueueDirectMessage({
-      updateId: 12, messageId: 102, text: "Compare this native audio and the quoted note.",
+      updateId: 201, messageId: 102, text: "Compare this native audio and the quoted note.",
       fileId: "native-audio-102", attachmentKind: "audio", mimeType: "application/octet-stream", replyToMessageId: 100
     });
     await waitFor(
@@ -243,14 +260,14 @@ describe("Telegram Messaging production product chain", () => {
     const chatId = -100123;
     const threadId = 7;
     const groupPrompt = "Describe the earlier group photo.";
-    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 13, messageId: 103, text: "Photo from the group", photoFileId: "group-photo-103" });
+    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 202, messageId: 103, text: "Photo from the group", photoFileId: "group-photo-103" });
     await waitFor(
       async () => fixture?.application.store.getMessagingConnection(created.connectionId).cursor,
-      (cursor) => cursor === "14", "Telegram to observe the group photo", 15_000
+      (cursor) => cursor === "203", "Telegram to observe the group photo", 15_000
     );
     expect(telegram.methodCount("getFile")).toBe(3);
     expect(fixture.providerRequests).toHaveLength(2);
-    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 14, messageId: 104, text: `@joko_system_bot ${groupPrompt}` });
+    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 203, messageId: 104, text: `@joko_system_bot ${groupPrompt}` });
     await waitFor(
       async () => telegram?.outboundMessages ?? [],
       (replies) => replies.some((message) => message.chatId === chatId && message.threadId === threadId
@@ -279,17 +296,17 @@ describe("Telegram Messaging production product chain", () => {
     try {
       const store = fixture.application.store;
       const requestFor = (id: string) => store.listMessagingInboundRequests().find(request => request.providerMessageId === id);
-      telegram.enqueueDirectMessage({ updateId: 15, messageId: 105, text: "Keep this original turn running." });
+      telegram.enqueueDirectMessage({ updateId: 204, messageId: 105, text: "Keep this original turn running." });
       await waitFor(async () => fixture?.providerRequests.length ?? 0, count => count === 4, "the held Pi request", 15_000);
       const active = required(requestFor("105"), "active Telegram request");
       await waitFor(async () => store.getQueueItem(active.queueItemId!).state, state => state === "backend_accepted",
         "Pi to accept the original Telegram input", 15_000);
-      telegram.enqueueDirectMessage({ updateId: 16, messageId: 106, text: "This queued input must be cancelled." });
+      telegram.enqueueDirectMessage({ updateId: 205, messageId: 106, text: "This queued input must be cancelled." });
       const queued = required(await waitFor(async () => requestFor("106"), request => request?.status === "queued",
         "the next Telegram message to queue", 15_000), "queued Telegram request");
       expect(store.getQueueItem(queued.queueItemId!).state).toBe("accepted");
 
-      telegram.enqueueDirectMessage({ updateId: 17, messageId: 107, text: "!stop" });
+      telegram.enqueueDirectMessage({ updateId: 206, messageId: 107, text: "!stop" });
       const replies = await waitFor(async () => telegram?.outboundMessages ?? [],
         messages => messages.some(message => message.replyToMessageId === 107),
         "the stop receipt on the original Telegram message", 20_000);
@@ -306,7 +323,7 @@ describe("Telegram Messaging production product chain", () => {
       releaseProvider();
     }
 
-    telegram.enqueueDirectMessage({ updateId: 18, messageId: 108, text: "/new" });
+    telegram.enqueueDirectMessage({ updateId: 207, messageId: 108, text: "/new" });
     await waitFor(async () => telegram?.outboundMessages ?? [], messages => messages.some(message =>
       message.replyToMessageId === 108 && message.text === "A new conversation is ready. Previous task history was archived."),
     "the new direct Telegram conversation", 25_000);
@@ -317,7 +334,7 @@ describe("Telegram Messaging production product chain", () => {
     expect(fixture.providerRequests).toHaveLength(4);
 
     const freshPrompt = "Use only this fresh conversation.";
-    telegram.enqueueDirectMessage({ updateId: 19, messageId: 109, text: freshPrompt });
+    telegram.enqueueDirectMessage({ updateId: 208, messageId: 109, text: freshPrompt });
     await waitFor(async () => telegram?.outboundMessages ?? [], messages => messages.some(message =>
       message.replyToMessageId === 109 && message.text === SECOND_REPLY), "a reply from the fresh Telegram task", 25_000);
     const freshRequest = required(fixture.application.store.listMessagingInboundRequests()
@@ -333,13 +350,13 @@ describe("Telegram Messaging production product chain", () => {
     const topic = store.getMessagingConversation(groupRequest.conversationId!);
     const otherTopicText = "A message in the neighboring topic.";
     const newBackground = "An update since the last accepted topic message.";
-    telegram.enqueueGroupMessage({ chatId, threadId: 8, updateId: 20, messageId: 110, text: otherTopicText });
-    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 21, messageId: 111, text: newBackground });
-    await waitFor(async () => store.getMessagingConnection(created.connectionId).cursor, cursor => cursor === "22",
+    telegram.enqueueGroupMessage({ chatId, threadId: 8, updateId: 209, messageId: 110, text: otherTopicText });
+    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 210, messageId: 111, text: newBackground });
+    await waitFor(async () => store.getMessagingConnection(created.connectionId).cursor, cursor => cursor === "211",
       "the two topic observations", 15_000);
     const otherTopic = required(store.listMessagingConversations({ connectionId: created.connectionId })
       .find(conversation => conversation.providerThreadId === "8"), "the neighboring Telegram topic");
-    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 22, messageId: 112, text: "/new" });
+    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 211, messageId: 112, text: "/new" });
     await waitFor(async () => telegram?.outboundMessages ?? [], messages => messages.some(message =>
       message.chatId === chatId && message.threadId === threadId && message.replyToMessageId === 112
       && message.text === "A new conversation is ready. Previous task history was archived."), "the new Telegram topic task", 25_000);
@@ -352,7 +369,7 @@ describe("Telegram Messaging production product chain", () => {
     expect(fixture.providerRequests).toHaveLength(5);
 
     const newTopicPrompt = "Summarize the new topic update.";
-    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 23, messageId: 113, text: `@joko_system_bot ${newTopicPrompt}` });
+    telegram.enqueueGroupMessage({ chatId, threadId, updateId: 212, messageId: 113, text: `@joko_system_bot ${newTopicPrompt}` });
     await waitFor(async () => telegram?.outboundMessages ?? [], messages => messages.some(message =>
       message.chatId === chatId && message.threadId === threadId && message.replyToMessageId === 113
       && message.text === SECOND_REPLY), "the reply from the replacement Telegram topic task", 25_000);
