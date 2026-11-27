@@ -21,8 +21,10 @@ jobs:
         shell: bash
         run: |
           git rev-parse HEAD 'HEAD^{tree}'
-          npm install --prefix "$RUNNER_TEMP/audit-tools" --no-audit --no-fund vitest@4.1.9 typescript@5.9.3 minimatch@10.2.6
+          npm install --prefix "$RUNNER_TEMP/audit-tools" --no-audit --no-fund vitest@4.1.9 typescript@5.9.3 minimatch@10.2.6 @types/node@24.12.4
           node -e "require('node:fs').symlinkSync(require('node:path').join(process.env.RUNNER_TEMP,'audit-tools','node_modules'),'node_modules',process.platform==='win32'?'junction':'dir')"
+          node -e "const p=require('node:os').tmpdir(); console.log('process temp directory',p,'physical',require('node:fs').realpathSync.native(p))"
+          node node_modules/typescript/bin/tsc -p packages/worktree/tsconfig.build.json
       - name: Observe Git's filename decisions
         shell: bash
         run: |
@@ -33,7 +35,7 @@ jobs:
       - name: Interrupted cleanup and workspace symbol filtering
         shell: bash
         run: |
-          node node_modules/vitest/vitest.mjs run --reporter=verbose packages/worktree/src/service.test.ts packages/tool-lsp/src/safety.test.ts -t 'while checkout cleanup was interrupted|post-reset crash boundary|Git wildcard components'
+          node node_modules/vitest/vitest.mjs run --reporter=verbose packages/worktree/src/service.test.ts packages/tool-lsp/src/safety.test.ts -t 'while checkout cleanup was interrupted|post-reset crash boundary|Git wildcard components|temporary directory is an alias'
       - name: Exercise the complete worktree and LSP package suites
         shell: bash
         run: node node_modules/vitest/vitest.mjs run --reporter=verbose packages/worktree/src packages/tool-lsp/src
