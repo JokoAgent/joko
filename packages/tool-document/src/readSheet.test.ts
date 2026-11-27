@@ -5,6 +5,22 @@ import JSZip from "jszip";
 import { expect, it } from "vitest";
 import { createXlsxBuffer, readSheet } from "./index.js";
 
+it("reads false and zero cached results and expands uncached shared formulas from XLSX", async () => {
+  const root = await mkdtemp(join(tmpdir(), "joko-formula-sheet-"));
+  try {
+    const generated = await createXlsxBuffer({ sheets: [{ name: "Formulas", rows: [[1]] }] });
+    const zip = await JSZip.loadAsync(generated.buffer);
+    zip.file("xl/worksheets/sheet1.xml", [
+      '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>',
+      '<row r="1"><c r="A1"><f>1-1</f><v>0</v></c><c r="B1" t="b"><f>1=2</f><v>0</v></c></row>',
+      '<row r="2"><c r="A2"><f t="shared" ref="A2:B2" si="0">A1+1</f></c><c r="B2"><f t="shared" si="0"/></c></row>',
+      '</sheetData></worksheet>'
+    ].join(""));
+    await writeFile(join(root, "formulas.xlsx"), await zip.generateAsync({ type: "nodebuffer" }));
+    expect((await readSheet({ path: "formulas.xlsx" }, root)).rows).toEqual([[0, false], ["=A1+1", "=B1+1"]]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+}, 30_000);
+
 it("reads bounded workbook and delimited windows with explicit row and column continuation", async () => {
   // This chain starts several real parser Workers; allow cold Windows startup.
   const root = await mkdtemp(join(tmpdir(), "joko-read-sheet-"));
@@ -32,6 +48,12 @@ it("reads bounded workbook and delimited windows with explicit row and column co
       .toMatchObject({ rows: [["line one\nline two"]], totalRows: 3, totalColumns: 3,
         truncated: true, nextStartRow: 3, nextStartColumn: 3 });
     const utf16 = Buffer.from("A\tB\r\n1\t2", "utf16le");
+    await writeFile(join(root, "wide.csv"), Array.from({ length: 65 }, (_, index) => `cell-${index + 1}`).join(","));
+    const wide = await readSheet({ path: "wide.csv" }, root);
+    expect(wide).toMatchObject({ returnedRows: 1, totalColumns: 65, endColumn: 64, truncated: true, nextStartColumn: 65 });
+    expect(wide.nextStartRow).toBeUndefined();
+    expect(await readSheet({ path: "wide.csv", startColumn: wide.nextStartColumn }, root))
+      .toMatchObject({ rows: [["cell-65"]], truncated: false });
     await writeFile(join(root, "data.tsv"), Buffer.concat([Buffer.from([0xff, 0xfe]), utf16]));
     expect((await readSheet({ path: "data.tsv" }, root)).rows).toEqual([["A", "B"], ["1", "2"]]);
     await writeFile(join(root, "broken.csv"), Buffer.from([0xff, 0xfe, 0x00]));

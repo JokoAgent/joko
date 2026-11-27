@@ -88,8 +88,6 @@ function normalizeCell(value: unknown): SheetCell {
   if (value instanceof Date) return value.toISOString();
   if (typeof value === "object") {
     const cell = value as Record<string, unknown>;
-    if ("result" in cell) return normalizeCell(cell["result"]);
-    if ("formula" in cell) return `=${String(cell["formula"])}`;
     if (typeof cell["text"] === "string") return cell["text"];
     if (typeof cell["hyperlink"] === "string") return cell["hyperlink"];
     if (Array.isArray(cell["richText"])) return cell["richText"].map(part => String((part as { text?: unknown }).text ?? "")).join("");
@@ -115,7 +113,11 @@ async function read(request: ReadRequest): Promise<Readonly<Record<string, unkno
   const rows: SheetCell[][] = [];
   for (let row = request.startRow; row <= endRow; row += 1) {
     const cells: SheetCell[] = [];
-    for (let column = request.startColumn; column <= endColumn; column += 1) cells.push(normalizeCell(worksheet.getRow(row).getCell(column).value));
+    for (let column = request.startColumn; column <= endColumn; column += 1) {
+      const cell = worksheet.getCell(row, column).master;
+      const value = cell.type === ExcelJS.ValueType.Formula ? cell.result ?? `=${cell.formula}` : cell.value;
+      cells.push(normalizeCell(value));
+    }
     rows.push(cells);
   }
   return { rows, totalRows, totalColumns, startColumn: request.startColumn,

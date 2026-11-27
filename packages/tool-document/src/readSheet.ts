@@ -136,13 +136,14 @@ export async function readSheet(input: unknown, root: string, signal?: AbortSign
   }
   signal?.throwIfAborted();
   const endRow = window.rows.length > 0 ? request.startRow + window.rows.length - 1 : request.startRow - 1;
-  const truncated = endRow < window.totalRows;
+  const moreRows = endRow < window.totalRows;
+  const moreColumns = window.endColumn < window.totalColumns;
   return {
     path: resolve(root, request.path), format: extension.slice(1),
     ...window,
     ...(window.sheetName === undefined ? {} : { sheet: window.sheetName }),
-    startRow: request.startRow, endRow, returnedRows: window.rows.length, truncated,
-    ...(truncated ? { nextStartRow: endRow + 1 } : {}),
-    ...(window.endColumn < window.totalColumns ? { nextStartColumn: window.endColumn + 1 } : {})
+    startRow: request.startRow, endRow, returnedRows: window.rows.length, truncated: moreRows || moreColumns,
+    ...(moreRows ? { nextStartRow: endRow + 1 } : {}),
+    ...(moreColumns ? { nextStartColumn: window.endColumn + 1 } : {})
   };
 }
