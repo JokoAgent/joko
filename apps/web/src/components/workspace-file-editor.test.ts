@@ -41,13 +41,20 @@ describe("workspace file editor state", () => {
     expect(prepareWorkspaceFileSave(baseline, "first\nchanged\n")).toEqual({
       path: baseline.path,
       text: "first\r\nchanged\r\n",
-      expectedRevision: baseline.revision
+      expectedRevision: baseline.revision, operationId: expect.any(String)
     });
     expect(applyWorkspaceFileSave(baseline, "first\nchanged\n", "sha256:after:16")).toEqual({
       path: baseline.path,
       text: "first\r\nchanged\r\n",
       revision: "sha256:after:16"
     });
+  });
+
+  it("reuses the operation only for the exact pending editor save", () => {
+    const first = prepareWorkspaceFileSave(baseline, "edit")!;
+    expect(prepareWorkspaceFileSave(baseline, "edit", first)).toBe(first);
+    expect(prepareWorkspaceFileSave(baseline, "later", first)?.operationId).not.toBe(first.operationId);
+    expect(prepareWorkspaceFileSave({ ...baseline, revision: "new" }, "edit", first)?.operationId).not.toBe(first.operationId);
   });
 
   it("advances the saved revision without losing edits typed while the write is in flight", () => {

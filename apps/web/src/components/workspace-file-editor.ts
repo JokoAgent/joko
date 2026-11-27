@@ -2,6 +2,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { diffArrays } from "diff";
 
 import type { WorkspaceFilePreviewView } from "../model.js";
+import { randomUuid } from "../web-crypto.js";
 
 export interface WorkspaceFileEditorBaseline {
   readonly path: string;
@@ -11,10 +12,11 @@ export interface WorkspaceFileEditorBaseline {
 
 /** In-memory buffer owned by the current Files route across a connection rebuild. */
 export interface WorkspaceFileReconnectDraft {
-  current: { readonly baseline: WorkspaceFileEditorBaseline; readonly editorText: string } | undefined;
+  current: { readonly baseline: WorkspaceFileEditorBaseline; readonly editorText: string; readonly pendingSave?: WorkspaceFileSaveDraft } | undefined;
 }
 
 export interface WorkspaceFileSaveDraft {
+  readonly operationId: string;
   readonly path: string;
   readonly text: string;
   readonly expectedRevision: string;
@@ -87,12 +89,16 @@ export function workspaceFileEditorDirty(
 
 export function prepareWorkspaceFileSave(
   baseline: WorkspaceFileEditorBaseline,
-  editorText: string
+  editorText: string,
+  pending?: WorkspaceFileSaveDraft
 ): WorkspaceFileSaveDraft | undefined {
   if (!workspaceFileEditorDirty(baseline, editorText)) return undefined;
+  const text = restoreWorkspaceLineEndings(editorText, baseline.text);
+  if (pending?.path === baseline.path && pending.expectedRevision === baseline.revision && pending.text === text) return pending;
   return {
+    operationId: randomUuid(),
     path: baseline.path,
-    text: restoreWorkspaceLineEndings(editorText, baseline.text),
+    text,
     expectedRevision: baseline.revision
   };
 }

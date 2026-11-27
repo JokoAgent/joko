@@ -2058,12 +2058,8 @@ message WriteWorkspaceTextFileRequest {
   string relative_path = 2;
   string utf8_text = 3;
   FileRevision expected_revision = 4;
-}
-
-message WriteWorkspaceTextFileResponse {
-  WorkspaceEntry entry = 1;
-  FileRevision previous_revision = 2;
-  FileRevision new_revision = 3;
+  // Client-owned ID for this save, retained across response loss.
+  string operation_id = 5;
 }
 
 message SearchWorkspaceRequest {

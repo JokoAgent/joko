@@ -1,5 +1,6 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { AlertTriangle, RotateCcw, Save, Table2 } from "lucide-react";
 
 import type { ComposerFileSelectionQuoteDraft, ComposerSelectionQuoteDraft } from "../model.js";
@@ -146,12 +147,13 @@ export const WorkspaceFileEditorPane = forwardRef<WorkspaceFileEditorPaneHandle,
   const baselineRef = useRef(baseline);
   const editorTextRef = useRef(editorText);
   const savingRef = useRef(false);
+  const pendingSave = useRef(recovered?.pendingSave);
   baselineRef.current = baseline;
   editorTextRef.current = editorText;
 
   const dirty = workspaceFileEditorDirty(baseline, editorText);
   useLayoutEffect(() => {
-    if (reconnectDraft) reconnectDraft.current = dirty ? { baseline, editorText } : undefined;
+    if (reconnectDraft) reconnectDraft.current = dirty ? { baseline, editorText, pendingSave: pendingSave.current } : undefined;
   }, [baseline, dirty, editorText, reconnectDraft]);
   useEffect(() => onDirtyChange?.(dirty), [dirty, onDirtyChange]);
 
@@ -183,16 +185,19 @@ export const WorkspaceFileEditorPane = forwardRef<WorkspaceFileEditorPaneHandle,
     if (saveDisabled || savingRef.current) return false;
     const currentBaseline = baselineRef.current;
     const currentText = editorTextRef.current;
-    const draft = prepareWorkspaceFileSave(currentBaseline, currentText);
+    const draft = prepareWorkspaceFileSave(currentBaseline, currentText, pendingSave.current);
     if (draft === undefined) {
       setSaveError(undefined);
       return true;
     }
+    pendingSave.current = draft;
+    if (reconnectDraft) reconnectDraft.current = { baseline: currentBaseline, editorText: currentText, pendingSave: draft };
     savingRef.current = true;
     setSaving(true);
     setSaveError(undefined);
     try {
       const result = await onSave(draft);
+      pendingSave.current = undefined;
       const reconciled = reconcileWorkspaceFileSaveSuccess(
         currentBaseline,
         currentText,
@@ -209,6 +214,10 @@ export const WorkspaceFileEditorPane = forwardRef<WorkspaceFileEditorPaneHandle,
       onTextChange?.(reconciled.editorText, workspaceFileEditorDirty(reconciled.baseline, reconciled.editorText));
       return true;
     } catch (error) {
+      if (error instanceof ConnectError && ![Code.Unavailable, Code.DeadlineExceeded, Code.Canceled, Code.Unknown, Code.NotFound].includes(error.code)) {
+        pendingSave.current = undefined;
+        if (reconnectDraft?.current) reconnectDraft.current = { baseline: baselineRef.current, editorText: editorTextRef.current };
+      }
       setSaveError(isWorkspaceFileStaleError(error)
         ? labels.externalChange
         : `${labels.saveFailed}: ${messageOf(error)}`);
@@ -217,9 +226,10 @@ export const WorkspaceFileEditorPane = forwardRef<WorkspaceFileEditorPaneHandle,
       savingRef.current = false;
       setSaving(false);
     }
-  }, [labels.externalChange, labels.saveFailed, onSave, onTextChange, saveDisabled]);
+  }, [labels.externalChange, labels.saveFailed, onSave, onTextChange, reconnectDraft, saveDisabled]);
 
   const discardLocalChanges = useCallback((): void => {
+    pendingSave.current = undefined;
     const next = incomingConflict ?? baselineRef.current;
     baselineRef.current = next;
     editorTextRef.current = normalizeWorkspaceEditorText(next.text);

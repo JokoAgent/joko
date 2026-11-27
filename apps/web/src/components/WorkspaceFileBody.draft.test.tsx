@@ -55,7 +55,7 @@ it("restores the original draft and disk baseline after the Files editor remount
     const overwrite = [...host.querySelectorAll("button")].find(button => button.textContent === "Overwrite confirmed disk")!;
     await act(async () => overwrite.click());
     expect(write).toHaveBeenCalledExactlyOnceWith(identity.workspaceId, {
-      path: identity.path, text: "Unsaved edits", expectedRevision: "after"
+      path: identity.path, text: "Unsaved edits", expectedRevision: "after", operationId: expect.any(String)
     });
     expect(reconnectDraft.current).toBeUndefined();
   } finally {
@@ -107,7 +107,7 @@ it("keeps the same dirty document through a truncated refresh and waits for an e
     expect(write).not.toHaveBeenCalled();
     const overwrite = [...host.querySelectorAll("button")].find((button) => button.textContent === "Overwrite confirmed disk")!;
     await act(async () => overwrite.click());
-    expect(write).toHaveBeenCalledExactlyOnceWith(identity.workspaceId, { path: identity.path, text: "My unsaved draft", expectedRevision: "recovered" });
+    expect(write).toHaveBeenCalledExactlyOnceWith(identity.workspaceId, { path: identity.path, text: "My unsaved draft", expectedRevision: "recovered", operationId: expect.any(String) });
     expect(workspaceDocumentController.dirtyDocuments()).not.toContainEqual(identity);
   } finally {
     await act(async () => root.unmount());

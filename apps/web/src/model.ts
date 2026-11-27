@@ -2545,6 +2545,7 @@ export interface WorkspaceFilePreviewView {
 }
 
 export interface WorkspaceTextFileWriteDraft {
+  readonly operationId?: string;
   readonly path: string;
   readonly text: string;
   readonly expectedRevision: string;

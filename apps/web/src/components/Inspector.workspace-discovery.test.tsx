@@ -101,7 +101,7 @@ describe("Inspector workspace discovery", () => {
       editor.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
     });
     await act(async () => document.querySelector<HTMLButtonElement>(".workspace-file-editor-menu button[role=menuitem]")!.click());
-    expect(writeWorkspaceTextFile).toHaveBeenCalledExactlyOnceWith("workspace-one", { path, text: "My unsaved text", expectedRevision: "r1" });
+    expect(writeWorkspaceTextFile).toHaveBeenCalledExactlyOnceWith("workspace-one", { path, text: "My unsaved text", expectedRevision: "r1", operationId: expect.any(String) });
     expect(readWorkspaceFile).toHaveBeenCalledTimes(2);
     expect(container.querySelector("textarea")?.value).toBe("My unsaved text");
     const reload = [...container.querySelectorAll<HTMLButtonElement>(".workspace-file-editor-alert button")]

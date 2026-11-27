@@ -69,6 +69,13 @@ message WorkspaceEntry {
   string media_type = 9;
 }
 
+message WriteWorkspaceTextFileResponse {
+  WorkspaceEntry entry = 1;
+  FileRevision previous_revision = 2;
+  FileRevision new_revision = 3;
+  string operation_id = 4;
+}
+
 message FilePreview {
   WorkspaceEntry entry = 1;
   oneof content {

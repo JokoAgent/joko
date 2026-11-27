@@ -1,16 +1,20 @@
 import { create } from "@bufbuild/protobuf";
-import type { Transport } from "@connectrpc/connect";
+import { Code, ConnectError, type Transport } from "@connectrpc/connect";
 import {
   GetSnapshotResponseSchema,
+  GetOperationResponseSchema,
+  OperationState,
   ReadWorkspaceFileResponseSchema,
   SnapshotSchema,
-  WriteWorkspaceTextFileResponseSchema
+  WriteWorkspaceTextFileResponseSchema,
+  type WriteWorkspaceTextFileResponse
 } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
 
 describe("workspace text editor gateway", () => {
-  it("reads the 2 MiB editor window and writes with an opaque revision fence", async () => {
+  it.each([false, true])("reads the editor and recovers the exact write receipt (response lost: %s)", async lost => {
+    let committed: WriteWorkspaceTextFileResponse | undefined;
     const transport = {
       unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
         if (method.localName === "getSnapshot") {
@@ -42,13 +46,15 @@ describe("workspace text editor gateway", () => {
           }));
         }
         if (method.localName === "writeWorkspaceTextFile") {
+          expect(committed).toBeUndefined();
           expect(input).toMatchObject({
             workspaceId: "workspace-1",
             relativePath: "src/main.ts",
             utf8Text: "export const value = 1;\r\n",
             expectedRevision: { opaqueRevision: "revision-before" }
           });
-          return response(method, create(WriteWorkspaceTextFileResponseSchema, {
+          committed = create(WriteWorkspaceTextFileResponseSchema, {
+            operationId: input.operationId, previousRevision: input.expectedRevision,
             entry: {
               workspaceId: "workspace-1",
               relativePath: "src/main.ts",
@@ -56,7 +62,16 @@ describe("workspace text editor gateway", () => {
               revision: { sha256Hex: "b".repeat(64), byteSize: 25n, opaqueRevision: "revision-after" }
             },
             newRevision: { sha256Hex: "b".repeat(64), byteSize: 25n, opaqueRevision: "revision-after" }
-          }));
+          });
+          if (lost) throw new ConnectError("Response lost", Code.Unavailable);
+          return response(method, committed);
+        }
+        if (method.localName === "getOperation" && lost && committed) {
+          expect(input.operationId).toBe(committed.operationId);
+          return response(method, create(GetOperationResponseSchema, { operation: {
+            operationId: input.operationId, connectionId: "connection-workspace", state: OperationState.SUCCEEDED,
+            result: { payload: { case: "workspaceTextFileWrite", value: committed } }
+          } }));
         }
         throw new Error(`Unexpected RPC ${method.localName}`);
       }),

@@ -8094,16 +8094,22 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     draft: WorkspaceTextFileWriteDraft
   ): Promise<WorkspaceTextFileWriteResultView> {
     this.#workspaceTextPreviews.invalidate(workspaceId, draft.path);
-    const client = createClient(WorkspaceService, this.requireTransport());
-    const response = await client.writeWorkspaceTextFile({
-      workspaceId,
-      relativePath: draft.path,
-      utf8Text: draft.text,
-      expectedRevision: { opaqueRevision: draft.expectedRevision }
-    }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
+    const scope = this.captureActionScope();
+    const operationId = draft.operationId ?? randomUuid();
+    const request = { operationId, workspaceId, relativePath: draft.path, utf8Text: draft.text, expectedRevision: { opaqueRevision: draft.expectedRevision } };
+    const response = await createClient(WorkspaceService, scope.transport).writeWorkspaceTextFile(request, { signal: scope.signal }).catch(async error => {
+      if (scope.signal.aborted || !isUncertainOperationSubmissionError(error)) throw error;
+      const { operation } = await createClient(OperationService, scope.transport).getOperation({ operationId }, { signal: scope.signal });
+      const result = operation?.result?.payload;
+      if (operation?.operationId !== operationId || operation.connectionId !== this.#profile?.id || operation.state !== OperationState.SUCCEEDED
+        || result?.case !== "workspaceTextFileWrite") throw error;
+      return result.value;
+    });
+    scope.signal.throwIfAborted();
     const entry = response.entry;
     const revision = response.newRevision?.opaqueRevision ?? entry?.revision?.opaqueRevision ?? "";
-    if (entry === undefined || revision === "") {
+    if (response.operationId !== operationId || entry?.workspaceId !== workspaceId || entry.relativePath !== draft.path
+      || response.previousRevision?.opaqueRevision !== draft.expectedRevision || revision === "") {
       throw new GatewayError("Orchestrator returned no saved workspace file revision.");
     }
     return {

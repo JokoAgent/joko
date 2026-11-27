@@ -1776,6 +1776,7 @@ message OperationResult {
     WorkspaceGitCommitResult workspace_git_commit = 37;
     ProviderAccountResetResult provider_account_reset = 38;
     ProviderModelWithdrawalReview provider_model_withdrawal_review = 39;
+    WriteWorkspaceTextFileResponse workspace_text_file_write = 40;
   }
 }
 

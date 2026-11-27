@@ -68,8 +68,8 @@ describe("workspace, artifact, and capability boundaries", () => {
     { edit: "change the first line", original: "one\r\ntwo\nthree\n", from: "one", to: "ONE", expected: "ONE\r\ntwo\nthree\n" },
     { edit: "clear the line between CR and LF", original: "one\rtwo\nthree\r\n", from: "two", to: "", expected: "one\r\r\nthree\r\n" }
   ])("saves a mixed-line-ending edit against the preview revision: $edit", async ({ original, from, to, expected }) => {
-    fixture = await OrchestratorE2eFixture.start({ profiles: [WORKSPACE_WATCH_PROFILE] });
-    const { clients } = await fixture.pair("Files editor");
+    const host = fixture = await OrchestratorE2eFixture.start({ profiles: [WORKSPACE_WATCH_PROFILE] });
+    const { clients } = await host.pair("Files editor");
     const workspaceId = "workspace-main", relativePath = "mixed.txt";
     const path = join(fixture.workspaceDirectory, relativePath);
     await writeFile(path, original);
@@ -80,13 +80,32 @@ describe("workspace, artifact, and capability boundaries", () => {
     const edited = normalizeWorkspaceEditorText(text).replace(from, to);
     const draft = prepareWorkspaceFileSave({ path: relativePath, revision: preview.entry.revision.opaqueRevision, text }, edited);
     if (!draft) throw new Error("Expected the edit to produce a save.");
-    const saved = await clients.workspace.writeWorkspaceTextFile({
-      workspaceId, relativePath: draft.path, utf8Text: draft.text, expectedRevision: { opaqueRevision: draft.expectedRevision }
+    const request = { operationId: draft.operationId, workspaceId, relativePath: draft.path, utf8Text: draft.text,
+      expectedRevision: { opaqueRevision: draft.expectedRevision } };
+    const other = await fixture.pair("Another editor");
+    const before = fixture.application.store.countOperations({});
+    const write = host.application.workspaces.writeTextFile.bind(host.application.workspaces);
+    const writes = vi.spyOn(host.application.workspaces, "writeTextFile").mockImplementationOnce(async (...args) => {
+      const result = await write(...args);
+      host.dropPublicConnections();
+      return result;
     });
+    await expect(clients.workspace.writeWorkspaceTextFile(request)).rejects.toBeInstanceOf(ConnectError);
     const bytes = await readFile(path);
     expect(bytes).toEqual(Buffer.from(expected));
     expect(normalizeWorkspaceEditorText(bytes.toString("utf8"))).toBe(edited);
+    const getReceipt = async () => (await clients.operation.getOperation({ operationId: request.operationId })).operation!;
+    await expect.poll(async () => (await getReceipt()).state).toBe(OperationState.SUCCEEDED);
+    const receipt = await getReceipt();
+    const saved = await clients.workspace.writeWorkspaceTextFile(request);
+    expect(receipt.result?.payload).toEqual({ case: "workspaceTextFileWrite", value: saved });
     expect(saved.newRevision?.sha256Hex).toBe(sha256(bytes));
+    await expect(clients.workspace.writeWorkspaceTextFile({ ...request, utf8Text: "changed request" })).rejects.toMatchObject({ code: Code.AlreadyExists });
+    await expect(other.clients.workspace.writeWorkspaceTextFile(request)).rejects.toMatchObject({ code: Code.Unauthenticated });
+    expect((await other.clients.operation.getOperation({ operationId: request.operationId })).operation?.result?.payload.case).toBe("acknowledgement");
+    expect(writes).toHaveBeenCalledTimes(1);
+    expect(fixture.application.store.countOperations({})).toBe(before + 1);
+    await expect(clients.workspace.writeWorkspaceTextFile({ ...request, operationId: randomUUID() })).rejects.toMatchObject({ code: Code.Aborted });
   });
 
   it("lists, reads, searches, and diffs a workspace while rejecting path and Git-boundary escapes", async () => {
@@ -641,7 +660,7 @@ describe("workspace, artifact, and capability boundaries", () => {
       const initialRevision = emptyPreview.preview!.entry!.revision!;
       const contents = "joko-files-chain-marker\n";
       const saved = await paired.clients.workspace.writeWorkspaceTextFile({
-        workspaceId, relativePath: file!.relativePath, utf8Text: contents, expectedRevision: initialRevision
+        operationId: randomUUID(), workspaceId, relativePath: file!.relativePath, utf8Text: contents, expectedRevision: initialRevision
       });
       expect(saved.newRevision?.opaqueRevision).not.toBe(initialRevision.opaqueRevision);
       expect(saved.entry?.relativePath).toBe(file!.relativePath);
@@ -656,7 +675,7 @@ describe("workspace, artifact, and capability boundaries", () => {
         }
       });
       await expect(paired.clients.workspace.writeWorkspaceTextFile({
-        workspaceId, relativePath: file!.relativePath, utf8Text: "stale overwrite\n", expectedRevision: initialRevision
+        operationId: randomUUID(), workspaceId, relativePath: file!.relativePath, utf8Text: "stale overwrite\n", expectedRevision: initialRevision
       })).rejects.toMatchObject({ code: Code.Aborted });
       const current = await paired.clients.workspace.readWorkspaceFile({
         workspaceId, relativePath: file!.relativePath, expectedRevision: saved.newRevision

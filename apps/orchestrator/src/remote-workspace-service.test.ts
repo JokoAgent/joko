@@ -223,7 +223,7 @@ describe("RemoteWorkspaceService", () => {
       const readRequest = create(contract.ReadWorkspaceFileRequestSchema, { ...fields, maximumBytes: 1024n });
       const preview = await services.workspace.readWorkspaceFile(readRequest, observer.context);
       const writeRequest = create(contract.WriteWorkspaceTextFileRequestSchema, {
-        ...fields, utf8Text: "Replacement text", expectedRevision: preview.preview!.entry!.revision
+        ...fields, operationId: "original-write", utf8Text: "Replacement text", expectedRevision: preview.preview!.entry!.revision
       });
       const readFile = f.files.read.bind(f.files);
       const read = vi.spyOn(f.files, "read");
@@ -256,7 +256,7 @@ describe("RemoteWorkspaceService", () => {
       expect(write).not.toHaveBeenCalled();
       expect(Buffer.from(await readFile({ path, maximumBytes: 1024 })).toString()).toBe("Original text");
 
-      if (stage === "write") await expect(services.workspace.writeWorkspaceTextFile(writeRequest, observer.context))
+      if (stage === "write") await expect(services.workspace.writeWorkspaceTextFile({ ...writeRequest, operationId: "observer-write" }, observer.context))
         .resolves.toMatchObject({ newRevision: { opaqueRevision: expect.stringContaining("sha256:") } });
       else await expect(services.workspace.readWorkspaceFile(readRequest, observer.context)).resolves.toEqual(preview);
     } finally {

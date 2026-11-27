@@ -46,7 +46,7 @@ import { workspaceMediaTypeForPath as mediaTypeForPath } from "./workspace-file-
 import { listProjectDirectories } from "./project-directory-browser.js";
 import type { ExtensionProjectPolicies, ExtensionProject } from "./extension-project-policy.js";
 import { inspectRemoteHostDirectory, validateRemoteHostDirectoryPath } from "./remote-host-directory-browser.js";
-import { create as createProtoMessage, equals, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
+import { create as createProtoMessage, equals, fromBinary, fromJsonString, toBinary, toJsonString, type MessageInitShape } from "@bufbuild/protobuf";
 import { Code, ConnectError, type ConnectRouter, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
 import { issueAuthorizedIrohRelayInvitation } from "./linkspan-iroh-lease.js";
 import {
@@ -1076,6 +1076,7 @@ function jokoConnectCode(error: import("@joko/core").PublicError): Code {
 
 interface OperationOutcome {
   readonly accepted: boolean;
+  readonly workspaceTextFileWriteJson?: string;
   readonly inputTraceparent?: string;
   readonly pickedDirectory?: PickedExtensionDirectory;
   readonly resultCase?: contract.OperationResult["payload"]["case"];
@@ -2161,6 +2162,9 @@ export function createConnectServices(application: OrchestratorApplication, proj
 
   const storedOperation = (record: OperationRecord<unknown>, readerId: string, mutation = mutationFromRecord(dependencies.store, record)) => {
     const outcome = outcomeFromRecord(record);
+    if (outcome.workspaceTextFileWriteJson !== undefined && record.connectionId !== readerId) {
+      return toProtoOperation(dependencies, record, mutation, { accepted: outcome.accepted }, now());
+    }
     if (outcome.pickedDirectory && mutation.payload.case === "pickExtensionDirectory") {
       // SQLite retains the selection metadata. Only the original picker can
       // recover a still-live file deposit for the connection that chose it.
@@ -3831,7 +3835,11 @@ export function createConnectServices(application: OrchestratorApplication, proj
     },
     writeWorkspaceTextFile: async (request, context) => {
       const connection = authenticate(context);
-      const owner = captureWorkspaceFileRequest(dependencies.connections, connection, context.signal);
+      const operationId = nonBlankRequest(request.operationId, "operation_id");
+      context.signal.throwIfAborted();
+      // Once claimed, the save belongs to the original connection and can finish
+      // even when its HTTP response is lost.
+      const owner = captureWorkspaceFileRequest(dependencies.connections, connection);
       try {
         const target = targetForWorkspace(dependencies.store, request.workspaceId);
         if (target === undefined) {
@@ -3841,20 +3849,42 @@ export function createConnectServices(application: OrchestratorApplication, proj
         if (backend.capabilities.get("workspace.files.write")?.supported !== true) {
           throw new ConnectError("Backend does not support workspace.files.write.", Code.FailedPrecondition);
         }
-        const result = await dependencies.workspaceService.writeTextFile(request.workspaceId, {
-          path: request.relativePath,
-          text: request.utf8Text,
-          expectedRevision: request.expectedRevision?.opaqueRevision ?? ""
-        }, owner);
-        owner.assertCurrent();
-        return {
-          entry: mapWorkspaceEntry(request.workspaceId, result.entry, result.mediaType),
-          previousRevision: preserveFileRevision(request.expectedRevision, result.previousRevision),
-          newRevision: fileRevision(result.entry)
-        };
+        const kind = "writeWorkspaceTextFile";
+        const claim = dependencies.store.claimAuthorizedDeferredEffectOperation<{ workspaceTextFileWriteJson: string }>(
+          connection.id, connection.authKeyDigest, { id: operationId, kind, body: { kind, targetId: target.descriptor.id,
+            requestDigest: createHash("sha256").update(toBinary(contract.WriteWorkspaceTextFileRequestSchema, request)).digest("hex") } }
+        );
+        if (!claim.claimed) return fromJsonString(contract.WriteWorkspaceTextFileResponseSchema, claim.value.workspaceTextFileWriteJson);
+        try {
+          const result = await dependencies.workspaceService.writeTextFile(request.workspaceId, {
+            path: request.relativePath, text: request.utf8Text, expectedRevision: request.expectedRevision?.opaqueRevision ?? ""
+          }, owner);
+          owner.assertCurrent();
+          const response = create(contract.WriteWorkspaceTextFileResponseSchema, {
+            operationId, entry: mapWorkspaceEntry(request.workspaceId, result.entry, result.mediaType),
+            previousRevision: preserveFileRevision(request.expectedRevision, result.previousRevision), newRevision: fileRevision(result.entry)
+          });
+          dependencies.store.completeAuthorizedDeferredEffectOperation(connection.id, connection.authKeyDigest, operationId, claim.operation.bodyHash,
+            () => ({ accepted: true, workspaceTextFileWriteJson: toJsonString(contract.WriteWorkspaceTextFileResponseSchema, response) }));
+          return response;
+        } catch (error) {
+          let failure = workspaceTextFileConnectError(error);
+          try { owner.assertCurrent(); } catch (revoked) { failure = toConnectError(revoked); }
+          dependencies.store.failEffectOperation(operationId, claim.operation.bodyHash, new JokoError({
+            code: `WORKSPACE_TEXT_WRITE_${failure.code}`, phase: kind, message: failure.rawMessage,
+            retryable: false, stateMayHaveChanged: failure.code === Code.Internal || owner.signal.aborted,
+            recovery: "Read the original file and its save receipt."
+          }));
+          throw failure;
+        }
       } catch (error) {
-        owner.assertCurrent();
-        throw workspaceTextFileConnectError(error);
+        if (error instanceof OperationPreviouslyFailedError) {
+          const stored = asRecord(error.storedError);
+          const match = /^WORKSPACE_TEXT_WRITE_(\d+)$/u.exec(String(stored["code"]));
+          if (match && typeof stored["message"] === "string") throw new ConnectError(stored["message"], Number(match[1]) as Code);
+        }
+        if (error instanceof OperationInProgressError) throw new ConnectError(error.message, Code.Unavailable);
+        throw toConnectError(error);
       } finally { owner.dispose(); }
     },
     searchWorkspace: async (request, context) => {
@@ -7173,6 +7203,9 @@ function operationResult(
     case: "acknowledgement",
     value: create(contract.AcknowledgementSchema, { accepted: outcome.accepted })
   };
+  if (outcome.accepted && outcome.workspaceTextFileWriteJson !== undefined) return create(contract.OperationResultSchema, {
+    payload: { case: "workspaceTextFileWrite", value: fromJsonString(contract.WriteWorkspaceTextFileResponseSchema, outcome.workspaceTextFileWriteJson) }
+  });
   if (outcome.accepted && outcome.providerAccountReset) return create(contract.OperationResultSchema, {
     payload: { case: "providerAccountReset", value: toProtoAccountResetResult(outcome.providerAccountReset) }
   });
@@ -7761,6 +7794,7 @@ export function outcomeFromRecord(record: OperationRecord<unknown>): OperationOu
     const withdrawal = asRecord(response["providerModelWithdrawalReview"]);
     return {
       accepted: response["accepted"],
+      ...(typeof response["workspaceTextFileWriteJson"] === "string" ? { workspaceTextFileWriteJson: response["workspaceTextFileWriteJson"] } : {}),
       ...(response["providerAccountReset"] === undefined ? {} : { providerAccountReset: accountResetResultFromRecord(response["providerAccountReset"]) }),
       ...(typeof withdrawal["reviewId"] === "string" && typeof withdrawal["backendId"] === "string"
         && typeof withdrawal["providerId"] === "string" && typeof withdrawal["providerName"] === "string"
@@ -25957,9 +25991,9 @@ function captureConnectionRevocation(connections: ConnectionManager, connection:
   return { signal: abort.signal, dispose };
 }
 
-function captureWorkspaceFileRequest(connections: ConnectionManager, connection: ConnectionRecord, requestSignal: AbortSignal) {
+function captureWorkspaceFileRequest(connections: ConnectionManager, connection: ConnectionRecord, requestSignal?: AbortSignal) {
   const owner = captureConnectionRevocation(connections, connection);
-  const signal = AbortSignal.any([owner.signal, requestSignal]);
+  const signal = requestSignal === undefined ? owner.signal : AbortSignal.any([owner.signal, requestSignal]);
   const assertCurrent = (): void => {
     try { connections.fence(connection); } catch (error) { throw toConnectError(error); }
     if (signal.aborted) throw new ConnectError("The workspace file request was cancelled.", Code.Canceled);

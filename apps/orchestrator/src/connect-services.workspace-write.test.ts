@@ -2,6 +2,8 @@ import { create } from "@bufbuild/protobuf";
 import { TimestampSchema } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
+import { OperationalStore } from "@joko/store";
+import { randomUUID } from "node:crypto";
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
@@ -31,23 +33,16 @@ function context(): unknown {
   };
 }
 
-function application(workspaces: unknown, workspaceId: string, supportsWrite: boolean): OrchestratorApplication {
+function application(store: OperationalStore, workspaces: unknown, workspaceId: string, supportsWrite: boolean): OrchestratorApplication {
+  store.createConnection(connection);
+  store.upsertBackend({ id: "backend", displayName: "Backend", version: "test", health: "healthy", adapterKind: "fixture",
+    instanceGeneration: 1, installationState: "installed", authenticationState: "authenticated", models: [], tools: [], diagnostics: [],
+    capabilities: new Map([["workspace.files.write", { key: "workspace.files.write", supported: supportsWrite }]]) });
+  store.upsertTarget({ id: "target", backendId: "backend", displayName: "Write", workspaceRoot: tmpdir(),
+    managed: false, trusted: true }, { workspaceId });
   return {
     config: { publicOrigin: "https://orchestrator.example.test" },
-    store: {
-      listTargets: () => [{
-        descriptor: { id: "target-workspace-write", backendId: "backend-workspace-write" },
-        metadata: { workspaceId }
-      }],
-      getBackend: () => ({
-        descriptor: {
-          capabilities: new Map([["workspace.files.write", {
-            key: "workspace.files.write",
-            supported: supportsWrite
-          }]])
-        }
-      })
-    },
+    store,
     connections: { authenticate: () => connection, fence: () => connection, onRevoked: () => () => undefined },
     sessionHost: {},
     workspaces,
@@ -67,11 +62,12 @@ async function invoke(
   request: contract.WriteWorkspaceTextFileRequest,
   supportsWrite = true
 ): Promise<contract.WriteWorkspaceTextFileResponse> {
-  const handler = createConnectServices(application(workspaces, request.workspaceId, supportsWrite)).workspace.writeWorkspaceTextFile as unknown as (
+  const store = new OperationalStore(":memory:");
+  const handler = createConnectServices(application(store, workspaces, request.workspaceId, supportsWrite)).workspace.writeWorkspaceTextFile as unknown as (
     value: contract.WriteWorkspaceTextFileRequest,
     handlerContext: unknown
   ) => Promise<contract.WriteWorkspaceTextFileResponse>;
-  return handler(request, context());
+  try { return await handler(request, context()); } finally { store.close(); }
 }
 
 function request(
@@ -81,6 +77,7 @@ function request(
   opaqueRevision: string
 ): contract.WriteWorkspaceTextFileRequest {
   return create(contract.WriteWorkspaceTextFileRequestSchema, {
+    operationId: randomUUID(),
     workspaceId,
     relativePath,
     utf8Text,
@@ -105,6 +102,7 @@ describe("Connect Workspace text writes", () => {
     });
 
     const response = await invoke(workspaces, create(contract.WriteWorkspaceTextFileRequestSchema, {
+      operationId: "write-makefile",
       workspaceId: "workspace-write",
       relativePath: "Makefile",
       utf8Text: "first\r\nsecond",

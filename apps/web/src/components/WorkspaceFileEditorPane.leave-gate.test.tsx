@@ -46,7 +46,7 @@ it.each(["cancel", "save", "discard"] as const)("respects %s after an external f
     expect(ref.current?.isDirty()).toBe(true);
     expect(save).not.toHaveBeenCalled();
   } else if (choice === "save") {
-    expect(save).toHaveBeenCalledExactlyOnceWith({ path: "note.txt", text: "My unsaved text", expectedRevision: "original" });
+    expect(save).toHaveBeenCalledExactlyOnceWith({ path: "note.txt", text: "My unsaved text", expectedRevision: "original", operationId: expect.any(String) });
     expect(ref.current?.getValue()).toBe("My unsaved text");
     expect(ref.current?.isDirty()).toBe(true);
   } else {
