@@ -5,11 +5,11 @@ const native = vi.hoisted(() => ({
   googlePlay: false,
   startInstaller: vi.fn(() => false),
   configure: vi.fn(),
-  check: vi.fn(async () => ({
+  check: vi.fn<() => Promise<{ isAvailable: boolean; isRollBackToEmbedded?: boolean; manifest?: { id: string } }>>(async () => ({
     isAvailable: true,
     manifest: { id: "ABCDEF12-3456-7890-ABCD-EF1234567890" }
   })),
-  fetch: vi.fn(async () => ({
+  fetch: vi.fn<() => Promise<{ isNew: boolean; isRollBackToEmbedded?: boolean; manifest?: { id: string } }>>(async () => ({
     isNew: true,
     manifest: { id: "22222222-2222-4222-8222-222222222222" }
   })),
@@ -98,6 +98,14 @@ describe("ExpoMobileUpdateRuntime", () => {
       isNew: true,
       manifestId: "22222222-2222-4222-8222-222222222222"
     });
+  });
+
+  it("retains Expo's rollback directive without a manifest at check and fetch", async () => {
+    const runtime = new ExpoMobileUpdateRuntime();
+    native.check.mockResolvedValueOnce({ isAvailable: false, isRollBackToEmbedded: true });
+    native.fetch.mockResolvedValueOnce({ isNew: false, isRollBackToEmbedded: true });
+    await expect(runtime.checkOta()).resolves.toEqual({ isAvailable: false, isRollBackToEmbedded: true });
+    await expect(runtime.fetchOta()).resolves.toEqual({ isNew: false, isRollBackToEmbedded: true });
   });
 
   it("fetches releases anonymously with platform, channel, cache-buster, and a bounded abort", async () => {

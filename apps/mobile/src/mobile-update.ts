@@ -27,11 +27,13 @@ export interface MobileBundleUpdateEvaluation {
 
 export interface MobileOtaCheckResult {
   readonly isAvailable: boolean;
+  readonly isRollBackToEmbedded?: boolean;
   readonly manifestId?: string;
 }
 
 export interface MobileOtaFetchResult {
   readonly isNew: boolean;
+  readonly isRollBackToEmbedded?: boolean;
   readonly manifestId?: string;
 }
 

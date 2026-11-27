@@ -87,6 +87,29 @@ describe("MobileUpdateController", () => {
     expect(harness.controller.snapshot.startup).toBe("ready");
   });
 
+  it.each(["startup", "manual"])("fetches and reloads the embedded rollback on %s and clears its guard on embedded launch", async entry => {
+    const rollback = { isAvailable: false, isRollBackToEmbedded: true };
+    const checkOta = vi.fn<MobileUpdateRuntime["checkOta"]>().mockResolvedValue(rollback);
+    if (entry === "manual") checkOta.mockResolvedValueOnce({ isAvailable: false });
+    const harness = createHarness({ configuration: otaConfiguration, runtimePatch: {
+      info: runtimeInfo({ isEmbeddedLaunch: false, updateId: otaId }), checkOta,
+      fetchOta: vi.fn(async () => ({ isNew: false, isRollBackToEmbedded: true }))
+    } });
+    await harness.controller.start(true);
+    if (entry === "manual") {
+      await harness.controller.manualCheck();
+      expect(harness.controller.snapshot.manualOutcome).toBe("reloading");
+    }
+    expect(harness.runtime.fetchOta).toHaveBeenCalledOnce();
+    expect(harness.runtime.reload).toHaveBeenCalledOnce();
+    const initialRecord = harness.storage.value()!;
+    expect(JSON.parse(initialRecord)).toMatchObject({ reloadCount: 1 });
+    const embedded = createHarness({ configuration: otaConfiguration, initialRecord, runtimePatch: { checkOta } });
+    await embedded.controller.start(true);
+    expect(embedded.runtime.fetchOta).not.toHaveBeenCalled();
+    expect(JSON.parse(embedded.storage.value()!)).toMatchObject({ reloadTargetId: null, reloadCount: 0 });
+  });
+
   it("clears a reload guard only when its target is the update now running", async () => {
     const harness = createHarness({
       configuration: otaConfiguration,

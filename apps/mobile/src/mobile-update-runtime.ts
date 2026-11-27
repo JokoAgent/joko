@@ -70,6 +70,7 @@ export class ExpoMobileUpdateRuntime implements MobileUpdateRuntime {
     const result = await Updates.checkForUpdateAsync();
     return Object.freeze({
       isAvailable: result.isAvailable,
+      ...(result.isRollBackToEmbedded ? { isRollBackToEmbedded: true } : {}),
       ...(result.isAvailable ? optionalManifestId(result.manifest) : {})
     });
   }
@@ -78,6 +79,7 @@ export class ExpoMobileUpdateRuntime implements MobileUpdateRuntime {
     const result = await Updates.fetchUpdateAsync();
     return Object.freeze({
       isNew: result.isNew,
+      ...(result.isRollBackToEmbedded ? { isRollBackToEmbedded: true } : {}),
       ...(result.isNew ? optionalManifestId(result.manifest) : {})
     });
   }

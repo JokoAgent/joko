@@ -5,6 +5,8 @@ import {
   isMobileUpdateVersion,
   parseMobileUpdateRelease,
   withMobileUpdateTimeout,
+  type MobileOtaCheckResult,
+  type MobileOtaFetchResult,
   type MobileOtaRequestClient,
   type MobileUpdateChannel,
   type MobileUpdateConfiguration,
@@ -13,6 +15,17 @@ import {
   type MobileUpdateRuntime,
   type MobileUpdateRuntimeInfo
 } from "./mobile-update";
+
+const embeddedTarget = "expo:embedded";
+
+function checkedTarget(check: MobileOtaCheckResult): string | undefined {
+  return check.isRollBackToEmbedded ? embeddedTarget : check.isAvailable ? check.manifestId : undefined;
+}
+
+function fetchedTarget(fetched: MobileOtaFetchResult, checked: string): string | undefined {
+  if (fetched.isRollBackToEmbedded) return embeddedTarget;
+  return fetched.isNew ? fetched.manifestId ?? (checked === embeddedTarget ? undefined : checked) : undefined;
+}
 
 export type MobileUpdateManualPhase = "idle" | "checking" | "downloading" | "reloading";
 export type MobileUpdateManualOutcome =
@@ -278,6 +291,7 @@ export class MobileUpdateController {
         channel = "stable";
       }
       await this.#deviceStore.clearReloadIfLaunched(this.#runtime.info.updateId);
+      if (this.#runtime.info.isEmbeddedLaunch) await this.#deviceStore.clearReloadIfLaunched(embeddedTarget);
       this.#patch({
         status: "ready",
         channel,
@@ -310,13 +324,11 @@ export class MobileUpdateController {
     try {
       await this.#coordinator.run(channel, async (client) => {
         const check = await withMobileUpdateTimeout(client.check(), this.#startupCheckTimeoutMs);
-        if (!check.isAvailable) return;
-        const checkId = check.manifestId;
-        if (!checkId || checkId === this.#runtime.info.updateId || this.#deviceStore.isReloadBlocked(checkId)) return;
+        const checkId = checkedTarget(check);
+        if (!checkId || this.#isRunningTarget(checkId) || this.#deviceStore.isReloadBlocked(checkId)) return;
         const fetched = await withMobileUpdateTimeout(client.fetch(), this.#startupFetchTimeoutMs);
-        if (!fetched.isNew) return;
-        const targetId = fetched.manifestId ?? checkId;
-        if (!targetId || targetId === this.#runtime.info.updateId || this.#deviceStore.isReloadBlocked(targetId)) return;
+        const targetId = fetchedTarget(fetched, checkId);
+        if (!targetId || this.#isRunningTarget(targetId) || this.#deviceStore.isReloadBlocked(targetId)) return;
         if (generation !== this.#generation || !this.#foreground) {
           if (generation === this.#generation) this.#patch({ pendingRestart: true });
           return;
@@ -341,10 +353,11 @@ export class MobileUpdateController {
     try {
       await this.#coordinator.run(channel, async (client) => {
         const check = await withMobileUpdateTimeout(client.check(), this.#startupCheckTimeoutMs);
-        if (!check.isAvailable || !check.manifestId || this.#deviceStore.isReloadBlocked(check.manifestId)) return;
+        const checkId = checkedTarget(check);
+        if (!checkId || this.#isRunningTarget(checkId) || this.#deviceStore.isReloadBlocked(checkId)) return;
         const fetched = await withMobileUpdateTimeout(client.fetch(), this.#startupFetchTimeoutMs);
-        const targetId = fetched.manifestId ?? check.manifestId;
-        if (fetched.isNew && targetId && !this.#deviceStore.isReloadBlocked(targetId)
+        const targetId = fetchedTarget(fetched, checkId);
+        if (targetId && !this.#isRunningTarget(targetId) && !this.#deviceStore.isReloadBlocked(targetId)
           && generation === this.#generation) {
           this.#patch({ pendingRestart: true });
         }
@@ -389,17 +402,16 @@ export class MobileUpdateController {
 
   async #manualOta(client: MobileOtaRequestClient, generation: number): Promise<MobileUpdateManualOutcome> {
     const check = await withMobileUpdateTimeout(client.check(), this.#manualCheckTimeoutMs);
-    if (!check.isAvailable) return "up-to-date";
-    const checkId = check.manifestId;
-    if (!checkId) return "error";
-    if (checkId === this.#runtime.info.updateId) return "up-to-date";
+    const checkId = checkedTarget(check);
+    if (!checkId) return check.isAvailable ? "error" : "up-to-date";
+    if (this.#isRunningTarget(checkId)) return "up-to-date";
     if (this.#deviceStore.isReloadBlocked(checkId)) return "reload-blocked";
     if (generation !== this.#generation) return "unavailable";
     this.#patch({ manualPhase: "downloading" });
     const fetched = await withMobileUpdateTimeout(client.fetch(), this.#manualFetchTimeoutMs);
-    if (!fetched.isNew) return "up-to-date";
-    const targetId = fetched.manifestId ?? checkId;
-    if (!targetId) return "error";
+    const targetId = fetchedTarget(fetched, checkId);
+    if (!targetId) return fetched.isNew ? "error" : "up-to-date";
+    if (this.#isRunningTarget(targetId)) return "up-to-date";
     if (this.#deviceStore.isReloadBlocked(targetId)) return "reload-blocked";
     if (generation !== this.#generation || !this.#foreground || this.#runtime.info.isEmergencyLaunch) {
       if (generation === this.#generation) this.#patch({ pendingRestart: true });
@@ -433,17 +445,21 @@ export class MobileUpdateController {
     if (this.#effectiveOtaEnabled() && !this.#coordinator.busy) {
       work.push(this.#coordinator.run(channel, async (client) => {
         const check = await withMobileUpdateTimeout(client.check(), this.#manualCheckTimeoutMs);
-        if (!check.isAvailable || !check.manifestId || check.manifestId === this.#runtime.info.updateId
-          || this.#deviceStore.isReloadBlocked(check.manifestId)) return;
+        const checkId = checkedTarget(check);
+        if (!checkId || this.#isRunningTarget(checkId) || this.#deviceStore.isReloadBlocked(checkId)) return;
         const fetched = await withMobileUpdateTimeout(client.fetch(), this.#manualFetchTimeoutMs);
-        const targetId = fetched.manifestId ?? check.manifestId;
-        if (fetched.isNew && targetId && !this.#deviceStore.isReloadBlocked(targetId)
+        const targetId = fetchedTarget(fetched, checkId);
+        if (targetId && !this.#isRunningTarget(targetId) && !this.#deviceStore.isReloadBlocked(targetId)
           && generation === this.#generation) {
           this.#patch({ pendingRestart: true });
         }
       }));
     }
     await Promise.allSettled(work);
+  }
+
+  #isRunningTarget(target: string): boolean {
+    return target === embeddedTarget ? this.#runtime.info.isEmbeddedLaunch : target === this.#runtime.info.updateId;
   }
 
   async #checkBundle(mode: BundleCheckMode, generation: number): Promise<BundleCheckOutcome> {
