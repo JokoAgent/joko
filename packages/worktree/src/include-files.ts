@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { lstat, mkdir, open, readlink, realpath, symlink } from "node:fs/promises";
+import { constants, type BigIntStats } from "node:fs";
+import { lstat, mkdir, mkdtemp, open, readlink, realpath, rm, rmdir, symlink, unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { WorktreeServiceError } from "./errors.js";
@@ -155,34 +155,58 @@ export async function copyWorktreeIncludeFiles(source: string, destination: stri
   }
 }
 
-/** Only ignored content already stored in the durable Git recovery tree may be removed. */
-export async function cleanCapturedIgnoredIncludes(root: string, snapshot: string, control: WorktreeOperationControl): Promise<void> {
-  const ignored = (await runGit(["ls-files", "--others", "--ignored", "--exclude-standard", "-z"], root, control)).stdout.split("\0").filter(Boolean);
-  if (ignored.length === 0) return;
-  const tree = (await runGit(["ls-tree", "-r", "-z", `${snapshot}^3`], root, control)).stdout;
-  const captured = new Map(tree.split("\0").filter(Boolean).map(entry => {
-    const tab = entry.indexOf("\t"), metadata = entry.slice(0, tab).split(" ");
-    return [entry.slice(tab + 1), { mode: metadata[0], oid: metadata[2] }] as const;
-  }));
-  const algorithm = (await runGit(["rev-parse", "--show-object-format"], root, control)).stdout.trim();
-  if (algorithm !== "sha1" && algorithm !== "sha256") throw new WorktreeServiceError("STATE_CORRUPT", "The repository object format is invalid.");
-  for (const path of ignored) {
-    control.check();
-    const saved = captured.get(path);
-    if (!safeRelativePath(path) || saved === undefined) throw new WorktreeServiceError("SESSION_CONFLICT", "An ignored file has no captured recovery authority.");
-    const absolute = resolve(root, path);
-    await ordinaryParents(root, absolute, false);
-    const info = await lstat(absolute);
-    let oid: string;
-    if (info.isSymbolicLink() && saved.mode === "120000") {
-      const bytes = Buffer.from(await readlink(absolute));
-      oid = createHash(algorithm).update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
-    } else if (info.isFile() && (saved.mode === "100644" || saved.mode === "100755")) {
-      oid = (await runGit(["--literal-pathspecs", "hash-object", "--", path], root, control)).stdout.trim();
-    } else throw new WorktreeServiceError("SESSION_CONFLICT", "An ignored recovery file changed type.");
-    if (oid !== saved.oid) throw new WorktreeServiceError("SESSION_CONFLICT", "An ignored recovery file changed after capture.");
+/** A restart can leave any subset of the archived untracked files on disk. */
+export async function cleanCapturedUntrackedFiles(root: string, snapshot: string, control: WorktreeOperationControl): Promise<void> {
+  const paths = (await runGit(["ls-files", "--others", "-z"], root, control)).stdout.split("\0").filter(Boolean);
+  const changed = () => new WorktreeServiceError("SESSION_CONFLICT", "Untracked work changed after archive capture.");
+  const parents = (await runGit(["rev-list", "-n", "1", "--parents", snapshot], root, control)).stdout.trim().split(/\s+/u);
+  if (parents.length !== 4) {
+    if (paths.length !== 0) throw changed();
+    return;
   }
-  for (let offset = 0; offset < ignored.length; offset += 100) {
-    await runGit(["--literal-pathspecs", "clean", "-fdx", "--", ...ignored.slice(offset, offset + 100)], root, control);
+  const captured = (await runGit(["rev-parse", `${snapshot}^3^{tree}`], root, control)).stdout.trim();
+  const files = new Map<string, BigIntStats>();
+  for (const key of paths) {
+    if (!safeRelativePath(key)) throw changed();
+    const path = resolve(root, key);
+    await ordinaryParents(root, path, false);
+    const info = await lstat(path, { bigint: true });
+    if (!info.isFile() && !info.isSymbolicLink()) throw changed();
+    files.set(path, info);
+  }
+
+  // Seed a private index with the whole captured tree. Adding only the files
+  // still present allows an interrupted removal while detecting new paths,
+  // changed bytes, file types and executable modes under Git's own rules.
+  const temp = await mkdtemp(join(tmpdir(), "joko-worktree-cleanup-"));
+  try {
+    const indexFile = join(temp, "index");
+    await runGit(["read-tree", captured], root, control, { indexFile });
+    for (let offset = 0; offset < paths.length; offset += 100) {
+      await runGit(["--literal-pathspecs", "add", "-f", "--", ...paths.slice(offset, offset + 100)], root, control, { indexFile });
+    }
+    if ((await runGit(["write-tree"], root, control, { indexFile })).stdout.trim() !== captured) throw changed();
+  } finally { await rm(temp, { recursive: true, force: true, maxRetries: 3 }); }
+
+  for (const [path, original] of files) {
+    await ordinaryParents(root, path, false);
+    const current = await lstat(path, { bigint: true });
+    if (current.dev !== original.dev || current.ino !== original.ino || current.mode !== original.mode ||
+      current.size !== original.size || current.mtimeNs !== original.mtimeNs || current.ctimeNs !== original.ctimeNs) throw changed();
+    control.check();
+    await unlink(path);
+  }
+  // Resume even if the last file was unlinked just before the process stopped.
+  const directories = (await runGit(["ls-tree", "-rdz", "--name-only", captured], root, control)).stdout.split("\0").filter(Boolean);
+  for (const key of directories.sort((a, b) => b.length - a.length)) {
+    if (!safeRelativePath(key)) throw changed();
+    const path = resolve(root, key);
+    control.check();
+    try {
+      await ordinaryParents(root, path, false);
+      await rmdir(path);
+    } catch (error) {
+      if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+    }
   }
 }
