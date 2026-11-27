@@ -5,7 +5,7 @@ import { promisify } from "node:util";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { chromium, type Browser } from "playwright-core";
 import { afterEach, expect, it } from "vitest";
-import { OrchestratorE2eFixture } from "./fixture.js";
+import { OrchestratorE2eFixture, selectSystemTheme, setBrowserColorScheme } from "./fixture.js";
 
 const execute = promisify(execFile), browserPath = process.env.JOKO_BROWSER_EXECUTABLE?.trim(), webDirectory = process.env.JOKO_MOUNTED_WEB_DIR?.trim();
 const mountedIt = browserPath && webDirectory ? it : it.skip;
@@ -38,13 +38,14 @@ mountedIt("updates the selected branch through the production page and recovers 
   await page.getByLabel("Joko node address").fill(fixture.baseUrl); await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challenge.challengeId));
   await page.getByLabel("Device name").fill("Branch Web"); await page.locator("form.pair-form button[type=submit]").click();
   await page.getByRole("button", { name: "Update selected branch", exact: true }).waitFor({ state: "visible" });
+  await selectSystemTheme(page);
   await page.locator(".new-task-page [contenteditable=true]").first().fill("Continue independently while the source branch updates.");
   await page.waitForFunction(() => document.querySelector<HTMLButtonElement>(".new-task-page .send-button")?.disabled === false);
   expect(await git(repository, "rev-parse", "origin/main")).toBe(original); expect(mutations).toBe(0);
   const evidence = process.env.RUNNER_TEMP ? resolve(process.env.RUNNER_TEMP, "joko-web-evidence/worktree-branch-sync") : undefined;
   if (evidence) await mkdir(evidence, { recursive: true });
   for (const theme of ["light", "dark"] as const) {
-    await page.emulateMedia({ colorScheme: theme, reducedMotion: "reduce" });
+    await setBrowserColorScheme(page, theme);
     for (const width of [1280, 390]) {
       await page.setViewportSize({ width, height: 900 });
       const navigationScrim = page.locator(".panel-scrim--navigation");

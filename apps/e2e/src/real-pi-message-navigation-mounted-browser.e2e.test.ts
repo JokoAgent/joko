@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { expect, it, vi } from "vitest";
 
-import { closeCompactNavigationDrawer, waitFor } from "./fixture.js";
+import { closeCompactNavigationDrawer, selectSystemTheme, setBrowserColorScheme, waitFor } from "./fixture.js";
 import { cancelQueuedInputMutation, createSessionMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 import { REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID, RealPiSystemFixture } from "./real-pi-fixture.js";
 
@@ -75,6 +75,7 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
     await page.locator("form.pair-form button[type=submit]").click();
     const pane = page.locator(`.session-pane[data-input-session-id='${sessionId}']`);
     await pane.waitFor({ state: "visible", timeout: 30_000 });
+    await selectSystemTheme(page);
     const reload = async () => {
       await page!.reload({ waitUntil: "domcontentloaded" });
       const expires = Date.now() + 30_000;
@@ -85,6 +86,7 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
       await pane.waitFor({ state: "visible", timeout: timeLeft() });
     };
     await reload();
+    await setBrowserColorScheme(page, "light", "no-preference");
     const originalNavigate = host.navigateTree.bind(host);
     let holdNextNavigation = false;
     const gate = new Promise<void>(resolve => { releaseNavigation = resolve; });
@@ -153,7 +155,7 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
 
     const rewindSource = await send("Rewind this loaded original input.");
     await reload();
-    await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
+    await setBrowserColorScheme(page, "dark");
     await page.setViewportSize({ width: 430, height: 900 });
     await closeCompactNavigationDrawer(page);
     const closeDetails = page.locator(".inspector-dock-group[data-edge]")
@@ -176,7 +178,7 @@ mountedIt("rewinds and edits original real Pi rows, rejects stale edits and stop
     const editedText = "Preserve this attempted edit.";
     const newerText = "New input from the other paired client.";
     const delayedSource = await send(delayedText);
-    await page.setViewportSize({ width: 1440, height: 960 }); await page.emulateMedia({ colorScheme: "light" });
+    await page.setViewportSize({ width: 1440, height: 960 }); await setBrowserColorScheme(page, "light");
     await reload();
     const delayedRow = row(delayedSource.messageId);
     await delayedRow.hover(); await delayedRow.getByRole("button", { name: "Edit message", exact: true }).click();

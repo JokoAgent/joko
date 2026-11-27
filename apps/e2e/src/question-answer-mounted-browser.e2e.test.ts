@@ -5,7 +5,7 @@ import type { AdapterContext, PromptInput } from "@joko/core";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { chromium, type Browser } from "playwright-core";
 import { afterEach, expect, it } from "vitest";
-import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
+import { InstrumentedFakeAdapter, OrchestratorE2eFixture, selectSystemTheme, setBrowserColorScheme, waitFor } from "./fixture.js";
 import { createSessionMutation, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
 
 const browserPath = process.env["JOKO_BROWSER_EXECUTABLE"]?.trim();
@@ -53,13 +53,14 @@ mountedIt("keeps question references read-only and answers explicit in the produ
   await page.locator("form.pair-form button[type=submit]").click();
   const question = page.locator(".interaction-dialog"), answer = question.getByLabel("Answer", { exact: true });
   await answer.waitFor({ state: "visible", timeout: 20_000 });
+  await selectSystemTheme(page);
   await answer.fill("The original answer");
   const file = question.getByRole("link", { name: "workspace evidence", exact: true });
   expect(await file.getAttribute("href")).toContain("README.md");
   const evidenceDirectory = process.env["JOKO_QUESTION_EVIDENCE_DIR"]?.trim();
   if (evidenceDirectory) await mkdir(evidenceDirectory, { recursive: true });
   for (const theme of ["light", "dark"] as const) {
-    await page.emulateMedia({ colorScheme: theme, reducedMotion: "reduce" });
+    await setBrowserColorScheme(page, theme);
     for (const width of [1280, 390]) {
       await page.setViewportSize({ width, height: 900 });
       if (await page.locator(".panel-scrim--navigation").isVisible()) await page.locator(".sidebar").getByRole("button", { name: "Close navigation", exact: true }).click();

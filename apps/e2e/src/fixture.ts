@@ -862,6 +862,22 @@ export async function closeCompactNavigationDrawer(page: Page): Promise<void> {
   await scrim.waitFor({ state: "hidden", timeout: 15_000 });
 }
 
+export async function selectSystemTheme(page: Page): Promise<void> {
+  const previousRoute = await page.evaluate(() => {
+    const previous = location.hash;
+    location.hash = "#/settings/general";
+    return previous;
+  });
+  await page.getByRole("radiogroup", { name: "Theme", exact: true }).getByRole("radio", { name: "System", exact: true }).click();
+  await page.waitForFunction(() => document.documentElement.dataset.theme === "system");
+  await page.evaluate(route => { location.hash = route; }, previousRoute);
+}
+
+export async function setBrowserColorScheme(page: Page, colorScheme: "light" | "dark", reducedMotion: "reduce" | "no-preference" = "reduce"): Promise<void> {
+  await page.emulateMedia({ colorScheme, reducedMotion });
+  await page.waitForFunction(expected => getComputedStyle(document.documentElement).colorScheme === expected, colorScheme);
+}
+
 export async function routeFixtureDiscovery(context: BrowserContext, baseUrl: string): Promise<void> {
   // Keep the browser's optional default-node probes inside the test fixture.
   await context.route(/^http:\/\/(?:127\.0\.0\.1|localhost):4318\/joko\.v1\.ConnectionService\/(?:GetServerInfo|ListDiscoveredNodes)$/u, async route => {

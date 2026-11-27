@@ -5,7 +5,7 @@ import { OperationMutationSchema, OperationState, TaskTagColor } from "@joko/con
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { chromium, type Browser } from "playwright-core";
 import { afterEach, expect, it } from "vitest";
-import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
+import { OrchestratorE2eFixture, selectSystemTheme, setBrowserColorScheme, waitFor } from "./fixture.js";
 import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
 
 const browserPath = process.env["JOKO_BROWSER_EXECUTABLE"]?.trim(), webDirectory = process.env["JOKO_MOUNTED_WEB_DIR"]?.trim();
@@ -30,6 +30,8 @@ mountedIt("edits and drags tags through the production task page and retains the
   await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challenge.challengeId));
   await page.getByLabel("Device name").fill("Tags Web");
   await page.locator("form.pair-form button[type=submit]").click();
+  await page.locator(".session-header-menu > summary").waitFor({ state: "visible" });
+  await selectSystemTheme(page);
   const open = async () => {
     await page.locator(".session-header-menu > summary").click();
     expect(await page.locator(".session-header-menu .task-tag-menu-swatch").count()).toBe(7);
@@ -56,7 +58,7 @@ mountedIt("edits and drags tags through the production task page and retains the
   const evidence = process.env["RUNNER_TEMP"] ? resolve(process.env["RUNNER_TEMP"], "joko-web-evidence/task-tags") : undefined;
   if (evidence) await mkdir(evidence, { recursive: true });
   for (const theme of ["light", "dark"] as const) {
-    await page.emulateMedia({ colorScheme: theme, reducedMotion: "reduce" });
+    await setBrowserColorScheme(page, theme);
     for (const width of [1280, 390]) {
       await page.setViewportSize({ width, height: 900 });
       const field = page.getByRole("textbox", { name: "Tag name", exact: true });
