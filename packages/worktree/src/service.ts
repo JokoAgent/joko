@@ -5,7 +5,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { isWorktreeServiceError, WorktreeServiceError } from "./errors.js";
 import { restoreMissingWorktreeBranch, runGit } from "./git.js";
-import { cleanCapturedIgnoredIncludes, copyWorktreeIncludeFiles, readWorktreeIncludeMatcher } from "./include-files.js";
+import { cleanCapturedUntrackedFiles, copyWorktreeIncludeFiles, readWorktreeIncludeMatcher } from "./include-files.js";
 import { cancelWorktreeSourceUses, withWorktreeSourceLock } from "./source-use.js";
 import { deferRecycle, newRecyclePolicy, recycleFailureReason } from "./recycle-policy.js";
 import { captureWorktreeRemovalEvidence, removeCoveredWorktreeFiles } from "./removal-evidence.js";
@@ -1303,7 +1303,7 @@ export class EphemeralWorktreeService {
       await runGit(["read-tree", "--empty"], entry.path, control, { indexFile });
       for (let offset = 0; offset < untracked.length; offset += 100) {
         await runGit(
-          ["add", "-f", "--", ...untracked.slice(offset, offset + 100)],
+          ["--literal-pathspecs", "add", "-f", "--", ...untracked.slice(offset, offset + 100)],
           entry.path,
           control,
           { indexFile }
@@ -1669,9 +1669,32 @@ export class EphemeralWorktreeService {
       throw new WorktreeServiceError("SESSION_CONFLICT", "The checkout cleanup branch changed.");
     }
     await this.#assertRecordedBranchTip(current, control);
-    await runGit(["reset", "--hard", "HEAD"], current.path, control);
-    await cleanCapturedIgnoredIncludes(current.path, snapshotSha, control);
-    await runGit(["clean", "-fd"], current.path, control);
+    // On restart the tracked files and index may already be at HEAD. Otherwise
+    // both must still match the captured edits before resetting either one.
+    const needsReset = async (): Promise<boolean> => {
+      if (await hasUnsafeTrackedIndexFlags(current.path, control)) {
+        throw new WorktreeServiceError("SESSION_CONFLICT", "The checkout index can no longer be verified for cleanup.");
+      }
+      const tracked = optionalGitObjectId((await runGit(["stash", "create"], current.path, control,
+        { environment: SNAPSHOT_IDENTITY_ENVIRONMENT })).stdout, "The cleanup worktree snapshot is invalid.");
+      if (tracked === undefined) return false;
+      const trees = (await runGit(["rev-parse", `${tracked}^{tree}`, `${snapshotSha}^{tree}`,
+        `${tracked}^2^{tree}`, `${snapshotSha}^2^{tree}`], current.path, control)).stdout.trim().split(/\s+/u);
+      if (trees.length !== 4 || trees[0] !== trees[1] || trees[2] !== trees[3]) {
+        throw new WorktreeServiceError("SESSION_CONFLICT", "Tracked work or its index changed after archive capture.");
+      }
+      return true;
+    };
+    const reset = await needsReset();
+    await cleanCapturedUntrackedFiles(current.path, snapshotSha, control);
+    if (reset && await needsReset()) {
+      await this.#assertRecordedBranchTip(current, control);
+      if (await attachedWorktreeBranch(current.path, control) !== current.branch ||
+        (await runGit(["ls-files", "--others", "-z"], current.path, control)).stdout !== "") {
+        throw new WorktreeServiceError("SESSION_CONFLICT", "The checkout changed before its tracked files could be reset.");
+      }
+      await runGit(["reset", "--hard", "HEAD"], current.path, control);
+    }
     if (!(await isWorktreeCompletelyClean(current.path, control))) {
       throw new WorktreeServiceError("SESSION_CONFLICT", "The checkout could not be cleaned without losing recovery authority.");
     }

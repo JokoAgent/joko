@@ -12,6 +12,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "minimatch": "10.2.6",
     "typescript": "5.9.3"
   },
   "devDependencies": {
