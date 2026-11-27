@@ -5,7 +5,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { isWorktreeServiceError, WorktreeServiceError } from "./errors.js";
 import { restoreMissingWorktreeBranch, runGit } from "./git.js";
-import { cleanCapturedUntrackedFiles, copyWorktreeIncludeFiles, readWorktreeIncludeMatcher } from "./include-files.js";
+import { assertTrackedCheckoutBytes, cleanCapturedUntrackedFiles, copyWorktreeIncludeFiles, readWorktreeIncludeMatcher } from "./include-files.js";
 import { cancelWorktreeSourceUses, withWorktreeSourceLock } from "./source-use.js";
 import { deferRecycle, newRecyclePolicy, recycleFailureReason } from "./recycle-policy.js";
 import { captureWorktreeRemovalEvidence, removeCoveredWorktreeFiles } from "./removal-evidence.js";
@@ -846,7 +846,7 @@ export class EphemeralWorktreeService {
       if (snapshotSha === undefined || current.checkoutCleanup.sha !== snapshotSha) {
         throw new WorktreeServiceError("STATE_CORRUPT", "The checkout cleanup lost its exact owner snapshot.");
       }
-      await this.#finishCheckoutCleanup(current, snapshotSha, control);
+      await this.#finishCheckoutCleanup(current, snapshotSha, control, "resume");
       current = store.get(entry.id) ?? current;
     }
 
@@ -951,7 +951,7 @@ export class EphemeralWorktreeService {
     // state and the owner ref before reset/clean mutates the checkout. No
     // temporary entry is added to the repository's shared stash.
     await this.#recordCheckoutCleanup(entry, snapshotSha, control);
-    await this.#finishCheckoutCleanup(entry, snapshotSha, control);
+    await this.#finishCheckoutCleanup(entry, snapshotSha, control, "capture");
     return { snapshotSha };
   }
 
@@ -1017,7 +1017,7 @@ export class EphemeralWorktreeService {
         throw new WorktreeServiceError("STATE_CORRUPT", "The checkout cleanup lost its exact owner snapshot.");
       }
       if (await pathExists(current.path)) {
-        await this.#finishCheckoutCleanup(current, snapshotSha, control);
+        await this.#finishCheckoutCleanup(current, snapshotSha, control, "resume");
       } else {
         await this.#clearCheckoutCleanup(current, control);
       }
@@ -1657,7 +1657,8 @@ export class EphemeralWorktreeService {
   async #finishCheckoutCleanup(
     entry: ManagedWorktreeEntry,
     snapshotSha: string,
-    control: WorktreeOperationControl
+    control: WorktreeOperationControl,
+    phase: "capture" | "resume"
   ): Promise<void> {
     const current = this.#requireStore().get(entry.id) ?? entry;
     if (current.checkoutCleanup?.sha !== snapshotSha
@@ -1686,7 +1687,8 @@ export class EphemeralWorktreeService {
       return true;
     };
     const reset = await needsReset();
-    await cleanCapturedUntrackedFiles(current.path, snapshotSha, control);
+    if (phase === "resume") await assertTrackedCheckoutBytes(current.path, reset ? snapshotSha : `${snapshotSha}^1`, control);
+    await cleanCapturedUntrackedFiles(current.path, snapshotSha, control, phase === "resume");
     if (reset && await needsReset()) {
       await this.#assertRecordedBranchTip(current, control);
       if (await attachedWorktreeBranch(current.path, control) !== current.branch ||
