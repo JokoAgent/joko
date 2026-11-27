@@ -1,4 +1,5 @@
 import { Code, ConnectError } from "@connectrpc/connect";
+import { diffArrays } from "diff";
 
 import type { WorkspaceFilePreviewView } from "../model.js";
 
@@ -47,14 +48,34 @@ export function normalizeWorkspaceEditorText(value: string): string {
   return value.replace(/\r\n|\r/gu, "\n");
 }
 
-/**
- * Preserve CRLF when the file was originally CRLF. The editor's LF
- * document is converted only at the persistence boundary so a no-op save does
- * not turn the whole file into a Git diff on Windows.
- */
+/** Match edited lines to the baseline so surviving lines keep their terminators. */
 export function restoreWorkspaceLineEndings(editorText: string, originalText: string): string {
   const normalized = normalizeWorkspaceEditorText(editorText);
-  return originalText.includes("\r\n") ? normalized.replace(/\n/gu, "\r\n") : normalized;
+  const endings = originalText.match(/\r\n|\r|\n/gu) ?? [];
+  const first = endings[0] ?? "\n";
+  if (endings.every(ending => ending === first)) return normalized.replace(/\n/gu, first);
+
+  const lines = normalized.split("\n");
+  const restored: string[] = [];
+  let oldIndex = 0, replaced = 0;
+  for (const change of diffArrays(normalizeWorkspaceEditorText(originalText).split("\n"), lines)) {
+    if (change.removed) {
+      replaced = change.count;
+      oldIndex += replaced;
+      continue;
+    }
+    for (const [offset, line] of change.value.entries()) {
+      // Replacements inherit the corresponding old endings. Insertions use the nearest preceding one.
+      const index = change.added ? Math.min(oldIndex - 1, oldIndex - replaced + offset) : oldIndex + offset;
+      let ending = endings[Math.max(0, index)] ?? endings.at(-1)!;
+      // An empty LF line after a bare CR needs its own terminator when the file is read back.
+      if (line === "" && ending === "\n" && restored.at(-1)?.endsWith("\r")) ending = "\r\n";
+      restored.push(restored.length + 1 === lines.length ? line : line + ending);
+    }
+    if (!change.added) oldIndex += change.count;
+    replaced = 0;
+  }
+  return restored.join("");
 }
 
 export function workspaceFileEditorDirty(

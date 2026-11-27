@@ -23,6 +23,15 @@ describe("workspace file editor state", () => {
     expect(restoreWorkspaceLineEndings("first\r\nchanged\r\n", "first\nsecond\n")).toBe("first\nchanged\n");
   });
 
+  it("retains each surviving CRLF, LF and CR through replacements, insertions and deletions", () => {
+    const text = "one\r\ntwo\nthree\rfour\n";
+    const save = (edited: string) => prepareWorkspaceFileSave({ ...baseline, text }, edited)?.text;
+    expect(save("ONE\ntwo\nthree\nfour\n")).toBe("ONE\r\ntwo\nthree\rfour\n");
+    expect(save("one\ninserted\ntwo\nTHREE\nfour\n")).toBe("one\r\ninserted\r\ntwo\nTHREE\rfour\n");
+    expect(save("two\nthree\nfour")).toBe("two\nthree\rfour");
+    expect(restoreWorkspaceLineEndings("a\nb\nc", "a\rb\rc")).toBe("a\rb\rc");
+  });
+
   it("does not write when only the editor's line-ending representation differs", () => {
     expect(workspaceFileEditorDirty(baseline, "first\nsecond\n")).toBe(false);
     expect(prepareWorkspaceFileSave(baseline, "first\nsecond\n")).toBeUndefined();

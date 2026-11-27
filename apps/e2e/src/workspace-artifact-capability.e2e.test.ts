@@ -1,6 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
@@ -62,6 +62,31 @@ describe("workspace, artifact, and capability boundaries", () => {
   afterEach(async () => {
     await fixture?.close();
     fixture = undefined;
+  });
+
+  it.each([
+    { edit: "change the first line", original: "one\r\ntwo\nthree\n", from: "one", to: "ONE", expected: "ONE\r\ntwo\nthree\n" },
+    { edit: "clear the line between CR and LF", original: "one\rtwo\nthree\r\n", from: "two", to: "", expected: "one\r\r\nthree\r\n" }
+  ])("saves a mixed-line-ending edit against the preview revision: $edit", async ({ original, from, to, expected }) => {
+    fixture = await OrchestratorE2eFixture.start({ profiles: [WORKSPACE_WATCH_PROFILE] });
+    const { clients } = await fixture.pair("Files editor");
+    const workspaceId = "workspace-main", relativePath = "mixed.txt";
+    const path = join(fixture.workspaceDirectory, relativePath);
+    await writeFile(path, original);
+    const { preview } = await clients.workspace.readWorkspaceFile({ workspaceId, relativePath });
+    if (preview?.content.case !== "text" || !preview.entry?.revision) throw new Error("Expected an editable text preview.");
+    const { prepareWorkspaceFileSave, normalizeWorkspaceEditorText } = await import(new URL("../../web/src/components/workspace-file-editor.ts", import.meta.url).href);
+    const text = preview.content.value.utf8Text;
+    const edited = normalizeWorkspaceEditorText(text).replace(from, to);
+    const draft = prepareWorkspaceFileSave({ path: relativePath, revision: preview.entry.revision.opaqueRevision, text }, edited);
+    if (!draft) throw new Error("Expected the edit to produce a save.");
+    const saved = await clients.workspace.writeWorkspaceTextFile({
+      workspaceId, relativePath: draft.path, utf8Text: draft.text, expectedRevision: { opaqueRevision: draft.expectedRevision }
+    });
+    const bytes = await readFile(path);
+    expect(bytes).toEqual(Buffer.from(expected));
+    expect(normalizeWorkspaceEditorText(bytes.toString("utf8"))).toBe(edited);
+    expect(saved.newRevision?.sha256Hex).toBe(sha256(bytes));
   });
 
   it("lists, reads, searches, and diffs a workspace while rejecting path and Git-boundary escapes", async () => {
