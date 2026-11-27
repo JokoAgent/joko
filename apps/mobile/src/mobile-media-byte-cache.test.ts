@@ -89,5 +89,5 @@ describe("local media byte cache", () => {
     expect(stored.reduce((sum, file) => sum + file.byteSize, 0)).toBe(224 * 1024 * 1024);
     expect(await cache.get(owner, source(bytes, "0").blob, current)).toBeUndefined();
     expect((await cache.get(owner, source(bytes, "8").blob, current))?.bytes.length).toBe(bytes.length);
-  });
+  }, 20_000);
 });

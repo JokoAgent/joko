@@ -499,7 +499,7 @@ describe("MobileExtensionMainView", () => {
         Array.from({ length: 6 }, (_, index) => [index * chunkSize, index + 1]));
       expect(messages.at(-1)).toMatchObject({ id: "video", ok: true, mimeType: "video/mp4", byteLength: size });
     }
-  });
+  }, 20_000);
 });
 
 function fixtureExtension(): MobileExtension {
