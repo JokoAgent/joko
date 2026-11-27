@@ -50,11 +50,14 @@ export function createExpoMobileHistoryDiskIO(load: () => Promise<Pick<typeof im
   async function location(parts: readonly string[]) {
     const { Directory, File } = await load();
     const directory = new Directory(await root(), ...parts.slice(0, -1));
-    return { directory, file: new File(directory, parts.at(-1)! + ".json") };
+    const name = parts.at(-1)! + ".json";
+    return { directory, name, file: new File(directory, name), previous: new File(directory, name + ".prev") };
   }
   return {
   async read(parts) {
-    const { file } = await location(parts); if (!file.exists) return null;
+    const { file: current, previous } = await location(parts);
+    const file = current.exists ? current : previous;
+    if (!file.exists) return null;
     if (file.size > MAXIMUM_BYTES) throw new Error("The saved history record exceeds its size limit.");
     const text = await file.text();
     if (new TextEncoder().encode(text).byteLength > MAXIMUM_BYTES) throw new Error("The saved history grew during reading.");
@@ -64,16 +67,28 @@ export function createExpoMobileHistoryDiskIO(load: () => Promise<Pick<typeof im
     const key = parts.join("."); writing.add(key);
     try {
       const { File } = await load();
-      const { directory, file } = await location(parts); directory.create({ intermediates: true, idempotent: true });
+      const { directory, name, file, previous } = await location(parts); directory.create({ intermediates: true, idempotent: true });
       const stage = new File(directory, parts.at(-1)! + ".tmp");
       try {
         stage.create({ overwrite: true }); stage.write(text);
         if (await stage.text() !== text) throw new Error("The saved history write could not be verified.");
-        if (file.exists) file.delete(); stage.moveSync(file);
+        // Expo's overwrite move deletes the destination first on iOS and Android.
+        // Keep the last commit readable even if the app exits between these moves.
+        if (file.exists) {
+          if (previous.exists) previous.delete();
+          file.moveSync(previous);
+        }
+        stage.moveSync(new File(directory, name));
+        // The new record is committed. A stale predecessor can be retired on the next write.
+        try { if (previous.exists) previous.delete(); } catch { /* Retried by write/remove. */ }
       } finally { const remaining = new File(directory, parts.at(-1)! + ".tmp"); if (remaining.exists) remaining.delete(); }
     } finally { writing.delete(key); }
   },
-  async remove(parts) { const { file } = await location(parts); if (file.exists) file.delete(); },
+  async remove(parts) {
+    const { file, previous } = await location(parts);
+    if (previous.exists) previous.delete();
+    if (file.exists) file.delete();
+  },
   async list() {
     const { Directory, File } = await load(); const directory = await root(); if (!directory.exists) return [];
     const result: string[][] = [];
@@ -81,6 +96,9 @@ export function createExpoMobileHistoryDiskIO(load: () => Promise<Pick<typeof im
       for (const entry of parent.list()) {
         if (entry instanceof Directory && parts.length < 3 && (ID.test(entry.name) || parts.length === 1 && entry.name === "detail")) visit(entry, [...parts, entry.name]);
         else if (entry instanceof File && entry.name.endsWith(".json")) result.push([...parts, entry.name.slice(0, -5)]);
+        else if (entry instanceof File && entry.name.endsWith(".json.prev") && !new File(parent, entry.name.slice(0, -5)).exists) {
+          result.push([...parts, entry.name.slice(0, -10)]);
+        }
         else if (entry instanceof File && entry.name.endsWith(".tmp") && !writing.has([...parts, entry.name.slice(0, -4)].join("."))) entry.delete();
       }
     };
