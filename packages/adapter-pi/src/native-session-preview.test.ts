@@ -24,3 +24,14 @@ it("discovers only granted projects and reads current exact entries without star
   await appendFile(path, "{}\n");
   await expect(catalog.read(entry)).rejects.toThrow();
 });
+
+it.each([true, false])("uses only complete assistant records at the 64 KiB tail boundary (line start: %s)", async (lineStart) => {
+  const root = await mkdtemp(join(tmpdir(), "joko-pi-preview-")); roots.push(root);
+  const header = JSON.stringify({ type: "session", id: "boundary", cwd: root });
+  const message = JSON.stringify({ type: "message", message: { role: "assistant", content: "Last reply" } });
+  const tail = (message + "\n").padEnd(64 * 1024);
+  await writeFile(join(root, "session.jsonl"), header + "\n" + " ".repeat(70_000) + (lineStart ? "\n" : " ") + tail);
+  const catalog = new PiNativePreviewCatalog([root]);
+  const [entry] = (await catalog.scan([root])).entries;
+  expect((await catalog.read(entry!)).messages.map(item => item.text)).toEqual(lineStart ? ["Last reply"] : []);
+});

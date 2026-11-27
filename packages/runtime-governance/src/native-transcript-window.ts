@@ -47,7 +47,8 @@ export async function readNativeTranscriptWindow(path: string, expected?: Native
       }
       if (head === first) head = Buffer.alloc(0);
     }
-    const tail = whole ? first : await read(Math.max(0, size - WINDOW_BYTES), WINDOW_BYTES);
+    // Include the preceding byte so the first record survives an exact line boundary.
+    const tail = whole ? first : await read(size - WINDOW_BYTES - 1, WINDOW_BYTES + 1);
     if (!matches(before, await handle.stat({ bigint: true })) || !matches(before, await lstat(path, { bigint: true }))) throw unavailable();
     const complete = (bytes: Buffer, trimFirst: boolean, trimLast: boolean): readonly string[] => {
       const lines = bytes.toString("utf8").split(/\r?\n/u);
@@ -56,7 +57,7 @@ export async function readNativeTranscriptWindow(path: string, expected?: Native
       return lines.filter((line) => line.trim() !== "");
     };
     return { identity, whole, headText: first.toString("utf8"),
-      head: complete(head, false, !whole), tail: complete(tail, !whole, false) };
+      head: complete(head, false, !whole), tail: complete(whole ? tail : tail.subarray(1), !whole && tail[0] !== 0x0a, false) };
   } finally { await handle.close(); }
 }
 
