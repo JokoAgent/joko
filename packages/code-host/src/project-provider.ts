@@ -18,6 +18,7 @@ export class CodeHostProjectProvider {
   }
   async read(repository: string, assertScope: () => void): Promise<CodeHostProjectItems> {
     if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/u.test(repository)) throw new TypeError("Invalid code-host repository.");
+    const repositoryPath = `/${repository.toLowerCase()}/`;
     assertScope();
     const credential = await this.#credentials.readCredential();
     assertScope();
@@ -61,7 +62,7 @@ export class CodeHostProjectProvider {
         return result["items"].slice(0, 10).flatMap((item: unknown) => {
           if (!record(item) || !Number.isSafeInteger(item["number"]) || Number(item["number"]) < 1 || typeof item["title"] !== "string" || typeof item["html_url"] !== "string") return [];
           const url = new URL(item["html_url"]);
-          if (url.protocol !== "https:" || url.hostname !== "github.com" || url.username || url.password || !url.pathname.startsWith(`/${repository}/`) || url.toString().includes(credential.token)) return [];
+          if (url.protocol !== "https:" || url.hostname !== "github.com" || url.username || url.password || !url.pathname.toLowerCase().startsWith(repositoryPath) || url.toString().includes(credential.token)) return [];
           const at = typeof item["updated_at"] === "string" ? Date.parse(item["updated_at"]) : NaN;
           return [{ number: Number(item["number"]), title: item["title"].replaceAll(credential.token, "[redacted]").slice(0, 200), url: url.toString(), updatedAt: Number.isFinite(at) ? at : 0 }];
         });
