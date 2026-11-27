@@ -9,12 +9,20 @@ export interface GitIgnoreRule {
 
 const HARD_EXCLUDED_DIRECTORIES = new Set([".git", ".hg", ".svn", "node_modules"]);
 
+// Git wildmatch consumes UTF-8 bytes. Give each non-ASCII byte one unit
+// outside Unicode letter and digit classes while preserving literal matches.
+function wildmatchBytes(value: string): string {
+  return value.replace(/[^\x00-\x7f]+/gu, part =>
+    Array.from(Buffer.from(part), byte => String.fromCharCode(0xe000 + byte)).join(""));
+}
+
 export function isHardExcludedDirectory(name: string): boolean {
   return HARD_EXCLUDED_DIRECTORIES.has(name);
 }
 
 export function parseGitIgnore(source: string, base: string): readonly GitIgnoreRule[] {
   const rules: GitIgnoreRule[] = [];
+  const baseBytes = wildmatchBytes(base);
   for (const rawLine of source.replaceAll("\r\n", "\n").split("\n")) {
     let line = trimUnescapedTrailingSpaces(rawLine);
     if (line === "") continue;
@@ -35,10 +43,10 @@ export function parseGitIgnore(source: string, base: string): readonly GitIgnore
     if (anchored) line = line.slice(1);
     if (line === "") continue;
     rules.push(Object.freeze({
-      base,
+      base: baseBytes,
       negated,
       directoryOnly,
-      matcher: new Minimatch(line, {
+      matcher: new Minimatch(wildmatchBytes(line), {
         platform: "linux", dot: true, nocomment: true, nonegate: true, nobrace: true, noext: true,
         matchBase: !anchored && !line.includes("/"), optimizationLevel: 0
       })
@@ -53,9 +61,10 @@ export function isGitIgnored(
   rules: readonly GitIgnoreRule[]
 ): boolean {
   let ignored = false;
+  const pathBytes = wildmatchBytes(relativePath);
   for (const rule of rules) {
-    if (rule.base !== "" && !relativePath.startsWith(`${rule.base}/`)) continue;
-    const path = rule.base === "" ? relativePath : relativePath.slice(rule.base.length + 1);
+    if (rule.base !== "" && !pathBytes.startsWith(`${rule.base}/`)) continue;
+    const path = rule.base === "" ? pathBytes : pathBytes.slice(rule.base.length + 1);
     if ((!rule.directoryOnly || isDirectory) && rule.matcher.match(path)
       || rule.directoryOnly && matchesDirectoryDescendant(path, rule)) ignored = !rule.negated;
   }

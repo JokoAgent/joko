@@ -45,14 +45,14 @@ describe("TypeScript LSP safety boundaries", () => {
     await writeFile(join(root, "tsconfig.json"), '{"include":["**/*.ts"]}');
     await writeFile(join(root, ".gitignore"), "generated**.ts\ncase[[:digit:]].ts\n");
     await mkdir(join(root, "generated-tools"));
-    const files = ["anchor.ts", "generated-file.ts", "generated-tools/visible.ts", "case1.ts", "caseA.ts"];
+    const files = ["anchor.ts", "generated-file.ts", "generated-tools/visible.ts", "case1.ts", "caseA.ts", "case１.ts"];
     for (const [index, name] of files.entries()) {
       await writeFile(join(root, name), `export const lookupSymbol${index} = ${index};\n`);
     }
     const bridge = new TypeScriptLspBridge();
     try {
       const result = await bridge.workspaceSymbol({ workspaceRoot: root, anchorFile: "anchor.ts", query: "lookupSymbol" });
-      expect(result.items.map(item => item.location.path).sort()).toEqual(["anchor.ts", "caseA.ts", "generated-tools/visible.ts"]);
+      expect(result.items.map(item => item.location.path).sort()).toEqual(["anchor.ts", "caseA.ts", "case１.ts", "generated-tools/visible.ts"]);
     } finally { bridge.dispose(); }
   });
 
