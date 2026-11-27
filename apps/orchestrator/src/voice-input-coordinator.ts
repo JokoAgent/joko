@@ -281,6 +281,12 @@ export class VoiceInputCoordinator {
     if (input.signal?.aborted) throw new VoiceInputControlError("provider_unavailable");
     const fingerprint = voiceRequestFingerprint({ mimeType, locale, refinementInstructions, dictionaryTerms, recognitionContext });
     const requestKey = `${ownerConnectionId}\u0000${requestId}`;
+    const pending = this.pendingByOwner.get(ownerConnectionId);
+    // The provisional record exists while the provider is still opening its audio route.
+    if (pending?.requestKey === requestKey) {
+      if (pending.fingerprint !== fingerprint) throw new VoiceInputControlError("conflict");
+      return pending.promise;
+    }
     const priorId = this.requests.get(requestKey);
     if (priorId !== undefined) {
       const prior = this.sessions.get(priorId);
@@ -290,11 +296,7 @@ export class VoiceInputCoordinator {
         return Promise.resolve(snapshot(prior));
       }
     }
-    const pending = this.pendingByOwner.get(ownerConnectionId);
-    if (pending !== undefined) {
-      if (pending.requestKey === requestKey && pending.fingerprint === fingerprint) return pending.promise;
-      throw new VoiceInputControlError("conflict");
-    }
+    if (pending !== undefined) throw new VoiceInputControlError("conflict");
     const activeId = this.activeByOwner.get(ownerConnectionId);
     if (activeId !== undefined && this.sessions.get(activeId)?.outcome === undefined) {
       throw new VoiceInputControlError("conflict");
@@ -427,10 +429,8 @@ export class VoiceInputCoordinator {
     if (input.locale !== undefined && capability.supportedLocales.length > 0
       && !capability.supportedLocales.includes(input.locale)) throw new VoiceInputControlError("not_supported");
     if (input.recognitionContext !== undefined && !capability.supportsRecognitionContext) throw new VoiceInputControlError("not_supported");
-    if (
-      [...this.sessions.values()].filter(({ outcome }) => outcome === undefined).length +
-      this.pendingByOwner.size >= this.maximumConcurrentSessions
-    ) {
+    const occupiedOwners = new Set([...this.pendingByOwner.keys(), ...this.activeByOwner.keys()]);
+    if (occupiedOwners.size >= this.maximumConcurrentSessions) {
       throw new VoiceInputControlError("resource_exhausted");
     }
 
