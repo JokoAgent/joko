@@ -529,6 +529,7 @@ it("activates the already installed engineer Partner after the Owner configures 
   const api = importApi(clients.partnerImport);
   expect((await clients.partner.getPartnerDirectory({})).directory?.defaultCapabilities).toBeUndefined();
   const entry = (await api.packages!("en", signal)).find(item => item.packageId === "engineer-bot")!;
+  expect(entry).toMatchObject({ packageVersion: "0.1.0", packageHash: expect.stringMatching(/^[a-f0-9]{64}$/u) });
   const admitted = await api.invitePackage!(entry, "en", signal);
   const saved = await application.partnerImports!.waitForRequest(admitted.requestId);
   expect(saved).toMatchObject({ saved: true, status: "complete" });

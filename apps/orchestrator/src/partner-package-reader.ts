@@ -11,7 +11,7 @@ import { AgentImportError, type ImportItem, type ImportSnapshot } from '@joko/ag
 export const PARTNER_PACKAGE_IDS = ['engineer-bot', 'nightly-audit-engineer', 'startup-qa-bot',
   'seo-aeo-desk', 'cooper', 'video-editor', 'proto-bot',
   'ad-spend-watch', 'apple-search-ads-review', 'sable-game-art'] as const;
-export const PARTNER_PACKAGE_VERSION = '0.1.1';
+export const PARTNER_PACKAGE_VERSION = '0.1.0';
 const MAX_FILE = 2 * 1024 * 1024;
 const MAX_TOTAL = 16 * 1024 * 1024;
 const invalid = (): never => { throw new AgentImportError('INVALID_PACKAGE'); };

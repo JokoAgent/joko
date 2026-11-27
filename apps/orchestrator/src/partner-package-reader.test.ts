@@ -1,7 +1,8 @@
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import { deserializeImportSnapshotAsync, serializeImportSnapshotAsync } from "@joko/agent-import";
-import { PARTNER_PACKAGE_IDS, applyNativeLocale, readNativePartnerPackage } from "./partner-package-reader.js";
+import { PARTNER_PACKAGE_IDS, applyNativeLocale, canonicalPackageJson, readNativePartnerPackage } from "./partner-package-reader.js";
 import { packageFiles } from "./partner-packages/index.js";
 
 describe("bundled partner packages", () => {
@@ -21,7 +22,7 @@ describe("bundled partner packages", () => {
     const noAccount = new Set(["web-search", "opendesign-trial", "art"]);
     for (const id of PARTNER_PACKAGE_IDS) {
       const { entry } = await readNativePartnerPackage(tmpdir(), id);
-      expect(entry.packageVersion).toBe("0.1.1");
+      expect(entry.packageVersion).toBe("0.1.0");
       for (const copy of [entry, ...Object.values(entry.locales)]) {
         expect(copy.tools.map(tool => [tool.id, tool.requiresUserAuthorization])).toEqual(
           expected[id]!.map(toolId => [toolId, !noAccount.has(toolId)])
@@ -35,8 +36,18 @@ describe("bundled partner packages", () => {
 
   it("validates all ten packages and preserves full skills and disabled routines through the current checkpoint", async () => {
     let skills = 0; let routines = 0;
+    const hashes = new Set<string>();
     for (const id of PARTNER_PACKAGE_IDS) {
       const pkg = await readNativePartnerPackage(tmpdir(), id);
+      const manifest = JSON.parse(packageFiles[id]!["manifest.json"]!);
+      const hash = createHash("sha256").update(canonicalPackageJson(manifest)).digest("hex");
+      const identity = { packageId: id, packageVersion: "0.1.0", packageHash: hash };
+      expect(manifest).toMatchObject({ packageId: id, packageVersion: "0.1.0" });
+      expect(pkg.identity).toEqual(identity);
+      expect(pkg.entry).toMatchObject(identity);
+      expect(pkg.snapshot.nativePackage).toMatchObject(identity);
+      expect(pkg.snapshot.fingerprint).toBe(hash);
+      hashes.add(hash);
       expect(pkg.entry.capabilities).toHaveLength(3);
       expect(pkg.snapshot.items.find(item => item.role === "identity")?.view.category).toBe("personality");
       expect(pkg.snapshot.items.filter(item => item.view.category === "skills")).toHaveLength(3);
@@ -49,7 +60,7 @@ describe("bundled partner packages", () => {
       expect(restored.nativePackage).toEqual(pkg.snapshot.nativePackage);
       expect(restored.items.map(item => item.files?.map(file => file.bytes))).toEqual(pkg.snapshot.items.map(item => item.files?.map(file => file.bytes)));
     }
-    expect(skills).toBe(30); expect(routines).toBe(18);
+    expect(hashes.size).toBe(10); expect(skills).toBe(30); expect(routines).toBe(18);
   });
   it("refuses any changed byte and identities outside the bundled catalog", async () => {
     await expect(readNativePartnerPackage(tmpdir(), "../outside")).rejects.toMatchObject({ code: "INVALID_PACKAGE" });

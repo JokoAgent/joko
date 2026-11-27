@@ -676,12 +676,15 @@ describe("native import service and owning effects", () => {
     const f = await fixture({ resourceFiles: 20, currentCanonicalSession: () => canonical }); const signal = new AbortController().signal;
     const catalog = await f.api.packages!("en", signal);
     expect(catalog).toHaveLength(10); const entry = catalog.find(row => row.packageId === "engineer-bot")!;
+    expect(catalog.every(row => row.packageVersion === "0.1.0")).toBe(true);
+    const identity = { packageId: entry.packageId, packageVersion: "0.1.0", packageHash: entry.packageHash };
     expect(entry.skills).toHaveLength(2); expect(entry.knowledge).toHaveLength(1); expect(entry.routines).toHaveLength(1);
     expect(entry.tools.map(tool => [tool.id, tool.requiresUserAuthorization])).toEqual([["github", true], ["gitlab", true], ["notion", true]]);
     expect(catalog.find(row => row.packageId === "ad-spend-watch")?.routines[0]?.optionalToolIds)
       .toEqual(["google-sheets", "google-gmail", "outlook-mail"]);
     await expect(f.api.invitePackage!({ ...entry, packageHash: "0".repeat(64) }, "en", signal)).rejects.toMatchObject({ code: Code.FailedPrecondition });
-    const [first, second] = await Promise.all([f.api.invitePackage!(entry, "en", signal), f.api.invitePackage!(entry, "en", signal)]);
+    await expect(f.api.invitePackage!({ ...identity, packageVersion: "0.1.1" }, "en", signal)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    const [first, second] = await Promise.all([f.api.invitePackage!(identity, "en", signal), f.api.invitePackage!(identity, "en", signal)]);
     expect(second.requestId).toBe(first.requestId);
     const result = await f.imports.waitForRequest(first.requestId);
     expect(result).toMatchObject({ saved: true, status: "complete" });
@@ -691,24 +694,45 @@ describe("native import service and owning effects", () => {
     expect(f.resources.list({ targetId: profile.homeTargetId })).toHaveLength(3);
     expect(f.routines.list(profile.id)).toHaveLength(1); expect(f.routines.list(profile.id)[0]!.enabled).toBe(false);
     const receipt = f.storage.readReceipt(result.requestId)!;
-    expect(receipt.nativePackage?.packageId).toBe(entry.packageId); expect(receipt.checkpointCleared).toBe(true);
+    expect(receipt.nativePackage).toMatchObject(identity); expect(receipt.checkpointCleared).toBe(true);
     const restored = new PartnerImportStorage(f.store, await CredentialVault.open(join(f.root, "credentials", "master.key")), f.root);
-    expect(restored.readReceipt(result.requestId)?.nativePackage?.packageHash).toBe(entry.packageHash);
+    expect(restored.readReceipt(result.requestId)?.nativePackage).toMatchObject(identity);
     expect((await f.api.packages!("en", signal)).find(row => row.packageId === entry.packageId)?.installation?.partnerId).toBe(profile.id);
     canonical = "new-main-canonical-session";
     expect((await f.api.packages!("en", signal)).find(row => row.packageId === entry.packageId)?.installation?.canonicalSessionId).toBe(canonical);
     expect((await f.api.invitePackage!(entry, "en", signal)).canonicalSessionId).toBe(canonical);
     expect((await f.api.status(result.requestId, signal))?.canonicalSessionId).toBe(canonical);
     expect(f.storage.readReceipt(result.requestId)?.result.canonicalSessionId).toBe(profile.canonicalSessionId);
-    const legacy = { ...receipt.nativePackage!, packageVersion: "0.1.0",
-      packageHash: "fc5d20a857ec05b1aa9a87ba0a2ca00e63f3d8cbeac878885dc50862e5c8b8ab" };
+    const differentContent = { ...receipt.nativePackage!, packageHash: "fc5d20a857ec05b1aa9a87ba0a2ca00e63f3d8cbeac878885dc50862e5c8b8ab" };
+    f.storage.saveReceipt({ ...receipt, nativePackage: differentContent });
+    await expect(f.api.invitePackage!(entry, "en", signal)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    expect(f.storage.readReceipt(result.requestId)?.nativePackage).toEqual(differentContent);
+    const legacy = { ...receipt.nativePackage!, packageVersion: "0.1.1",
+      packageHash: "dfb8576916c72509bce20ce1b6284cf3381b5f85fa0d9e193b89f96187743f8b" };
     f.storage.saveReceipt({ ...receipt, nativePackage: legacy });
-    expect((await f.api.invitePackage!(entry, "en", signal))).toMatchObject({ requestId: result.requestId, partnerId: profile.id });
+    expect(await f.api.invitePackage!(entry, "en", signal)).toMatchObject({ requestId: result.requestId, partnerId: profile.id });
     expect(f.storage.readReceipt(result.requestId)?.nativePackage).toEqual(legacy);
     const deletion = await f.partners.deletePartner({ requestId: "package_install_delete_0001", partnerId: profile.id, expectedRevision: profile.revision, confirmName: profile.displayName });
     expect(deletion.phase).toBe("completed");
     expect((await f.api.packages!("en", signal)).find(row => row.packageId === entry.packageId)?.installation).toBeUndefined();
   }, 20_000);
+  it("installs every bundled package using the version and hash read from the v1 catalog", async () => {
+    const f = await fixture({ resourceFiles: 20 });
+    const signal = new AbortController().signal;
+    const catalog = await f.api.packages!("en", signal);
+    expect(catalog).toHaveLength(10);
+    const partners = new Set<string>();
+    for (const { packageId, packageVersion, packageHash } of catalog) {
+      expect(packageVersion).toBe("0.1.0");
+      const identity = { packageId, packageVersion, packageHash };
+      const invited = await f.api.invitePackage!(identity, "en", signal);
+      const saved = await f.imports.waitForRequest(invited.requestId);
+      expect(saved).toMatchObject({ status: "complete", saved: true });
+      expect(f.storage.readReceipt(invited.requestId)?.nativePackage).toMatchObject(identity);
+      partners.add(saved.partnerId);
+    }
+    expect(partners.size).toBe(10);
+  }, 60_000);
   it("saves the complete five-category selection through the generated boundary and retains usable full originals after cold recovery", async ({ signal: testSignal, onTestFailed, onTestFinished }) => {
     type Phase = "fixture" | "sources" | "preview" | "start" | "completion" | "environment"
       | "published-tree" | "resources" | "resource-recovery" | "receipt-recovery" | "persistence" | "idempotency" | "complete";
