@@ -1679,8 +1679,7 @@ async function createRepositoryFixture(): Promise<RepositoryFixture> {
 }
 
 async function createTemporaryRoot(): Promise<string> {
-  const requestedRoot = await mkdtemp(join(tmpdir(), "joko-worktree-test-"));
-  const root = process.env.GITHUB_ACTIONS === "true" ? await realpath(requestedRoot) : requestedRoot;
+  const root = await realpath(await mkdtemp(join(tmpdir(), "joko-worktree-test-")));
   temporaryRoots.push(root);
   return root;
 }
