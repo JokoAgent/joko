@@ -1,8 +1,10 @@
+import { Minimatch } from "minimatch";
+
 export interface GitIgnoreRule {
   readonly base: string;
   readonly negated: boolean;
   readonly directoryOnly: boolean;
-  readonly expression: RegExp;
+  readonly matcher: Minimatch;
 }
 
 const HARD_EXCLUDED_DIRECTORIES = new Set([".git", ".hg", ".svn", "node_modules"]);
@@ -32,17 +34,14 @@ export function parseGitIgnore(source: string, base: string): readonly GitIgnore
     const anchored = line.startsWith("/");
     if (anchored) line = line.slice(1);
     if (line === "") continue;
-    const containsSlash = line.includes("/");
-    const glob = globExpression(line);
-    const prefix = base === "" ? "" : `${escapeRegularExpression(base)}/`;
-    const body = anchored || containsSlash
-      ? `${prefix}${glob}`
-      : `${prefix}(?:.*/)?${glob}`;
     rules.push(Object.freeze({
       base,
       negated,
       directoryOnly,
-      expression: new RegExp(`^${body}${directoryOnly ? "(?:/.*)?" : ""}$`, "u")
+      matcher: new Minimatch(line, {
+        platform: "linux", dot: true, nocomment: true, nonegate: true, nobrace: true, noext: true,
+        matchBase: !anchored && !line.includes("/"), optimizationLevel: 0
+      })
     }));
   }
   return Object.freeze(rules);
@@ -55,70 +54,19 @@ export function isGitIgnored(
 ): boolean {
   let ignored = false;
   for (const rule of rules) {
-    if (!rule.expression.test(relativePath)) continue;
-    if (rule.directoryOnly && !isDirectory && !matchesDirectoryDescendant(relativePath, rule)) continue;
-    ignored = !rule.negated;
+    if (rule.base !== "" && !relativePath.startsWith(`${rule.base}/`)) continue;
+    const path = rule.base === "" ? relativePath : relativePath.slice(rule.base.length + 1);
+    if ((!rule.directoryOnly || isDirectory) && rule.matcher.match(path)
+      || rule.directoryOnly && matchesDirectoryDescendant(path, rule)) ignored = !rule.negated;
   }
   return ignored;
 }
 
 function matchesDirectoryDescendant(relativePath: string, rule: GitIgnoreRule): boolean {
   for (let separator = relativePath.indexOf("/"); separator >= 0; separator = relativePath.indexOf("/", separator + 1)) {
-    if (rule.expression.test(relativePath.slice(0, separator))) return true;
+    if (rule.matcher.match(relativePath.slice(0, separator))) return true;
   }
   return false;
-}
-
-function globExpression(pattern: string): string {
-  let expression = "";
-  for (let index = 0; index < pattern.length; index += 1) {
-    const character = pattern[index] as string;
-    if (character === "\\" && index + 1 < pattern.length) {
-      expression += escapeRegularExpression(pattern[index + 1] as string);
-      index += 1;
-      continue;
-    }
-    if (character === "*") {
-      if (pattern[index + 1] === "*") {
-        while (pattern[index + 1] === "*") index += 1;
-        if (pattern[index + 1] === "/") {
-          expression += "(?:.*/)?";
-          index += 1;
-        } else {
-          expression += ".*";
-        }
-      } else {
-        expression += "[^/]*";
-      }
-      continue;
-    }
-    if (character === "?") {
-      expression += "[^/]";
-      continue;
-    }
-    if (character === "[") {
-      const closing = findCharacterClassEnd(pattern, index + 1);
-      if (closing !== -1) {
-        const contents = pattern.slice(index + 1, closing);
-        const negation = contents.startsWith("!") ? "^" : "";
-        const body = (contents.startsWith("!") ? contents.slice(1) : contents)
-          .replaceAll("\\", "\\\\")
-          .replaceAll("]", "\\]");
-        expression += `[${negation}${body}]`;
-        index = closing;
-        continue;
-      }
-    }
-    expression += escapeRegularExpression(character);
-  }
-  return expression;
-}
-
-function findCharacterClassEnd(pattern: string, start: number): number {
-  for (let index = start; index < pattern.length; index += 1) {
-    if (pattern[index] === "]" && pattern[index - 1] !== "\\") return index;
-  }
-  return -1;
 }
 
 function trimUnescapedTrailingSpaces(value: string): string {
@@ -137,8 +85,4 @@ function endsWithUnescapedSlash(value: string): boolean {
   let escapes = 0;
   for (let index = value.length - 2; index >= 0 && value[index] === "\\"; index -= 1) escapes += 1;
   return escapes % 2 === 0;
-}
-
-function escapeRegularExpression(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
