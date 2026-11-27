@@ -26,6 +26,21 @@ export class PartnerWorkbenchBriefReader {
         return redactSecrets(result.stdout).trim();
       } catch { assertScope(); return undefined; }
     };
+    const local = await this.#localBrief(project, git, assertScope);
+    assertScope();
+    if (local.git === undefined) return local;
+    const [upstream, origin] = await Promise.all([git(["remote", "get-url", "upstream"]), git(["remote", "get-url", "origin"])]);
+    const repository = (raw: string | undefined): string | undefined =>
+      /^(?:https:\/\/github\.com\/|git@github\.com:)([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+?)(?:\.git)?\/?$/u.exec(raw ?? "")?.[1];
+    const remotes = [...new Set([repository(upstream), repository(origin)].filter((value): value is string => value !== undefined))];
+    const remote = remotes[0];
+    const codeHost = remote === undefined ? local.codeHost : { repository: remote, ...await this.codeHost.read(remote, assertScope) };
+    assertScope();
+    return { ...local, git: { ...local.git, remotes }, codeHost };
+  }
+
+  // Files and Git history can share this cache. Remote selection and account data have separate owners.
+  async #localBrief(project: string, git: (args: readonly string[]) => Promise<string | undefined>, assertScope: () => void): Promise<PartnerWorkbenchProjectBrief> {
     const fingerprint = `${(await lstat(project)).mtimeMs}|${await git(["rev-parse", "HEAD"])}|${(await lstat(join(project, ".git", "index")).catch(() => undefined))?.mtimeMs ?? 0}`;
     assertScope();
     const cached = this.#cache.get(project);
@@ -66,19 +81,11 @@ export class PartnerWorkbenchBriefReader {
       brief = { project, docs: docs.slice(0, 30), recent: recent.sort((left, right) => right.modifiedAt - left.modifiedAt).slice(0, 20),
         codeHost: { pullRequests: [], issues: [], unavailable: "not_supported" } };
     } else {
-      const [branch, status, log, refs, upstream, origin] = await Promise.all([
+      const [branch, status, log, refs] = await Promise.all([
         git(["rev-parse", "--abbrev-ref", "HEAD"]), git(["status", "--porcelain"]),
         git(["log", `--since=${new Date(this.now() - RECENT_MS).toISOString()}`, "--max-count=30", "--format=%h%x00%cI%x00%an%x00%s"]),
-        git(["for-each-ref", "--sort=-committerdate", "--count=10", "--format=%(refname:short)%00%(committerdate:iso-strict)", "refs/heads"]),
-        git(["remote", "get-url", "upstream"]), git(["remote", "get-url", "origin"])
+        git(["for-each-ref", "--sort=-committerdate", "--count=10", "--format=%(refname:short)%00%(committerdate:iso-strict)", "refs/heads"])
       ]);
-      const repository = (raw: string | undefined): string | undefined => {
-        const match = /^(?:https:\/\/github\.com\/|git@github\.com:)([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+?)(?:\.git)?\/?$/u.exec(raw ?? "");
-        return match?.[1];
-      };
-      const remotes = [...new Set([repository(upstream), repository(origin)].filter((value): value is string => value !== undefined))];
-      const remote = remotes[0];
-      const codeHost = remote === undefined ? { pullRequests: [], issues: [], unavailable: "not_supported" as const } : { repository: remote, ...await this.codeHost.read(remote, assertScope) };
       brief = { project, docs: docs.slice(0, 30), recent: [], git: {
         ...(branch === undefined || branch === "HEAD" ? {} : { branch }), ...(status === undefined ? {} : { changes: status.split("\n").filter(Boolean).length }),
         commits: (log ?? "").split("\n").filter(Boolean).slice(0, 30).map((line) => {
@@ -86,8 +93,8 @@ export class PartnerWorkbenchBriefReader {
           return { sha, date, author: author.slice(0, 80), subject: subject.slice(0, 200) };
         }), branches: (refs ?? "").split("\n").filter(Boolean).slice(0, 10).map((line) => {
           const [name = "", date = ""] = line.split("\0"); return { name, date };
-        }), remotes
-      }, codeHost };
+        }), remotes: []
+      }, codeHost: { pullRequests: [], issues: [], unavailable: "not_supported" } };
     }
     assertScope();
     if (this.#cache.size > 64) this.#cache.clear();
