@@ -4,6 +4,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   realpath,
   rm,
@@ -95,7 +96,7 @@ describe("EphemeralWorktreeService", () => {
     } finally { reopened.dispose(); }
   });
 
-  test("releases an owned checkout when the OS temporary directory is an alias", { timeout: 30_000 }, async () => {
+  test.each(["fresh", "interrupted"] as const)("releases a %s checkout when the OS temporary directory is an alias", { timeout: 30_000 }, async state => {
     const fixture = await createRepositoryFixture();
     const physical = join(fixture.root, "physical-temp");
     const alias = join(fixture.root, "temp-alias");
@@ -107,12 +108,32 @@ describe("EphemeralWorktreeService", () => {
       const { lease } = unwrap(await service.acquire({ sessionId: "temp-alias", cwd: fixture.repositoryRoot }));
       for (const name of ["TMPDIR", "TMP", "TEMP"]) vi.stubEnv(name, alias);
       expect(tmpdir()).toBe(alias);
+      if (state === "interrupted") {
+        const lockNames = await withWorktreeSourceLock(lease.path, () => readdir(physical));
+        expect(lockNames).toHaveLength(1);
+        expect(lockNames[0]).toMatch(/^joko-worktree-\d+-[0-9a-f]{64}\.lock$/u);
+        // Older versions could stop after creating this directory, before publishing owner.json.
+        await mkdir(join(physical, lockNames[0]!), { mode: 0o700 });
+      }
       expect(unwrap(await service.release("temp-alias"))).toMatchObject({ status: "destroyed", pathRemoved: true });
       await expect(lstat(lease.path)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readdir(physical)).toEqual([]);
     } finally {
       vi.unstubAllEnvs();
       service.dispose();
     }
+  });
+
+  test("serializes concurrent resource lock publications for the same checkout", async () => {
+    const root = await createTemporaryRoot();
+    let active = 0;
+    await Promise.all(Array.from({ length: 8 }, () => withWorktreeSourceLock(root, async () => {
+      active += 1;
+      try {
+        await new Promise(resolveWait => setTimeout(resolveWait, 5));
+        expect(active).toBe(1);
+      } finally { active -= 1; }
+    })));
   });
 
   test("persists exact recycle controls without charging native and source writer waits", { timeout: 40_000 }, async () => {
