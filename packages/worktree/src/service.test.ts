@@ -792,6 +792,38 @@ describe("EphemeralWorktreeService", () => {
     expect(await git(fixture.repositoryRoot, ["stash", "list", "--format=%H%x09%gs"])).toBe(stashAfterExit);
   });
 
+  test.each(["tracked", "staged", "new", "rewritten"] as const)(
+    "preserves a %s edit made while checkout cleanup was interrupted",
+    { timeout: 30_000 }, async (edit) => {
+      const fixture = await createRepositoryFixture();
+      const sessionId = "interrupted-cleanup";
+      const first = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
+      unwrap(await first.initialize());
+      const { lease } = unwrap(await first.acquire({ sessionId, cwd: fixture.repositoryRoot }));
+      await writeFile(join(lease.path, "tracked.txt"), "archived tracked edit\n");
+      await writeFile(join(lease.path, "notes.txt"), "archived notes\n");
+      unwrap(await first.release(sessionId, { retainForRestore: true }));
+      const sha = await snapshotRefSha(fixture.repositoryRoot, sessionId);
+      await git(fixture.repositoryRoot, ["worktree", "add", lease.path, lease.branch]);
+      await git(lease.path, ["stash", "apply", "--index", sha]);
+      await rewriteOnlyEntry(fixture.storageRoot, entry => ({ ...entry, checkoutCleanup: { sha } }));
+      first.dispose();
+
+      await git(lease.path, ["reset", "--hard", "HEAD"]);
+      const file = edit === "new" ? "new.txt" : edit === "rewritten" ? "notes.txt" : "tracked.txt";
+      await writeFile(join(lease.path, file), "written while stopped\n");
+      if (edit === "staged") await git(lease.path, ["add", file]);
+      const restarted = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
+      try {
+        const sweep = unwrap(await restarted.initialize({ retainSessionIds: [sessionId] }));
+        expect(await readFile(join(lease.path, file), "utf8")).toBe("written while stopped\n");
+        if (edit === "staged") expect(await git(lease.path, ["show", `:${file}`])).toBe("written while stopped\n");
+        expect(sweep.records).toMatchObject([{ status: "preserved", reason: "SESSION_CONFLICT" }]);
+        expect(await snapshotRefSha(fixture.repositoryRoot, sessionId)).toBe(sha);
+      } finally { restarted.dispose(); }
+    }
+  );
+
   test("finishes an exact deletion transfer from the post-owner-ref-retirement crash boundary", { timeout: 30_000 }, async () => {
     const fixture = await createRepositoryFixture();
     const first = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });

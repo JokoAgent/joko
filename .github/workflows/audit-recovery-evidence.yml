@@ -1,0 +1,32 @@
+name: Audit recovery and discovery assertions
+on:
+  push:
+    branches: [codex/audit-51648991-evidence]
+permissions:
+  contents: read
+jobs:
+  evidence:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+      - name: Prepare the two packages' test runtime
+        shell: bash
+        run: |
+          git rev-parse HEAD 'HEAD^{tree}'
+          npm install --prefix "$RUNNER_TEMP/audit-tools" --no-audit --no-fund vitest@4.1.9 typescript@5.9.3 minimatch@10.2.6
+          ln -s "$RUNNER_TEMP/audit-tools/node_modules" node_modules
+      - name: Observe Git's filename decisions
+        shell: bash
+        run: |
+          git init -q "$RUNNER_TEMP/ignore-reference"
+          cd "$RUNNER_TEMP/ignore-reference"
+          printf '%s\n' 'generated**.ts' 'case[[:digit:]].ts' > .gitignore
+          git check-ignore -v -n -- generated-file.ts generated-tools/visible.ts case1.ts caseA.ts
+      - name: Interrupted cleanup and workspace symbol filtering
+        shell: bash
+        run: |
+          node node_modules/vitest/vitest.mjs run --reporter=verbose packages/worktree/src/service.test.ts packages/tool-lsp/src/safety.test.ts -t 'while checkout cleanup was interrupted|post-reset crash boundary|Git wildcard components'
