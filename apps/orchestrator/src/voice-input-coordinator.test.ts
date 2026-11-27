@@ -254,6 +254,54 @@ describe("VoiceInputCoordinator", () => {
     })).rejects.toMatchObject({ code: "not_supported" });
   });
 
+  it("waits for the original transcription handshake before a duplicate start can send its first audio", async () => {
+    const provider = new FakeAsrProvider();
+    const handshake = deferred<void>();
+    let ready = false;
+    const start = vi.spyOn(provider, "start").mockImplementation(async () => {
+      await handshake.promise;
+      ready = true;
+    });
+    const observed: number[] = [];
+    vi.spyOn(provider, "appendAudio").mockImplementation(chunk => {
+      if (ready) observed.push(...new Uint8Array(chunk.data));
+    });
+    const coordinator = createCoordinator(factory(provider));
+    const input = { ownerConnectionId: "connection-a", requestId: "same-request", mimeType: "audio/webm" };
+    const first = coordinator.start(input);
+    await vi.waitFor(() => expect(start).toHaveBeenCalledOnce());
+    const duplicate = coordinator.start(input).then(session => {
+      coordinator.append({ ownerConnectionId: input.ownerConnectionId, voiceInputId: session.id,
+        chunkSequence: 1n, audio: Uint8Array.of(5, 6), durationMs: 1, voiced: true });
+      return session.id;
+    });
+    await settlePromises();
+    handshake.resolve();
+    expect(await duplicate).toBe((await first).id);
+    expect(start).toHaveBeenCalledOnce();
+    expect(observed).toEqual([5, 6]);
+  });
+
+  it("counts a connection handshaking with its provider as one concurrent session", async () => {
+    const provider = new FakeAsrProvider();
+    const handshake = deferred<void>();
+    const start = vi.spyOn(provider, "start").mockReturnValue(handshake.promise);
+    const providers = factory(new FakeAsrProvider());
+    vi.spyOn(providers, "create").mockReturnValueOnce(provider);
+    const coordinator = createCoordinator(providers, { maximumConcurrentSessions: 2 });
+    const first = coordinator.start({ ownerConnectionId: "connection-a", requestId: "first", mimeType: "audio/webm" });
+    try {
+      await vi.waitFor(() => expect(start).toHaveBeenCalledOnce());
+      const second = await coordinator.start({ ownerConnectionId: "connection-b", requestId: "second", mimeType: "audio/webm" });
+      expect(second.state).toBe("listening");
+      await expect(coordinator.start({ ownerConnectionId: "connection-c", requestId: "third", mimeType: "audio/webm" }))
+        .rejects.toMatchObject({ code: "resource_exhausted" });
+    } finally {
+      handshake.resolve();
+      await first;
+    }
+  });
+
   it("counts pending factories against the concurrent session bound", async () => {
     const provider = new FakeAsrProvider();
     const pending = deferred<AsrProvider>();

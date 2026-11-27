@@ -1,0 +1,27 @@
+name: Project brief and voice admission assertions
+on:
+  push:
+    branches: [codex/audit-0e3ba3a6-evidence]
+permissions:
+  contents: read
+jobs:
+  assertions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+      - name: Prepare the focused source-test dependencies
+        shell: bash
+        run: |
+          git rev-parse HEAD 'HEAD^{tree}'
+          npm install --prefix "$RUNNER_TEMP/audit-tools" --no-audit --no-fund vitest@4.1.9 @noble/hashes@2.3.0
+          ln -s "$RUNNER_TEMP/audit-tools/node_modules" node_modules
+          mkdir -p node_modules/@joko
+          ln -s "$GITHUB_WORKSPACE/packages/core" node_modules/@joko/core
+          ln -s "$GITHUB_WORKSPACE/packages/voice-input" node_modules/@joko/voice-input
+      - name: Run project identity, refresh and voice handshake assertions
+        run: |
+          node_modules/.bin/vitest run --reporter=verbose packages/code-host/src/project-provider.test.ts apps/orchestrator/src/partner-workbench-brief.test.ts apps/orchestrator/src/voice-input-coordinator.test.ts

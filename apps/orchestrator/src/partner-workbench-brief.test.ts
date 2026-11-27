@@ -28,3 +28,22 @@ it("reads existing repository facts and retires an external project result after
   const reader = new PartnerWorkbenchBriefReader({ read: vi.fn(async () => { live = false; return { pullRequests: [], issues: [] }; }) });
   await expect(reader.read(root, () => { if (!live) throw new Error("Scope withdrawn"); })).rejects.toThrow("Scope withdrawn");
 });
+
+it("refreshes the current code-host account and remote within the local project cache interval", async () => {
+  const root = await project();
+  const git = promisify(execFile);
+  await git("git", ["-C", root, "init"]);
+  await git("git", ["-C", root, "remote", "add", "origin", "https://github.com/owner/first.git"]);
+  let signedIn = false;
+  const read = vi.fn(async (repository: string) => signedIn
+    ? { pullRequests: [], issues: [{ number: 1, title: repository, url: `https://github.com/${repository}/issues/1`, updatedAt: 0 }] }
+    : { pullRequests: [], issues: [], unavailable: "no_credential" as const });
+  const reader = new PartnerWorkbenchBriefReader({ read }, () => 1_000);
+  expect((await reader.read(root, () => {})).codeHost.unavailable).toBe("no_credential");
+  signedIn = true;
+  expect((await reader.read(root, () => {})).codeHost.issues.map(issue => issue.title)).toEqual(["owner/first"]);
+  await git("git", ["-C", root, "remote", "set-url", "origin", "https://github.com/owner/second.git"]);
+  const updated = await reader.read(root, () => {});
+  expect(updated.git?.remotes).toEqual(["owner/second"]);
+  expect(updated.codeHost.issues.map(issue => issue.title)).toEqual(["owner/second"]);
+});

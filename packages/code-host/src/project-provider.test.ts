@@ -7,7 +7,8 @@ it("uses the configured memory lease and projects only this repository's own wor
   const fetch = vi.fn(async (input: URL | RequestInfo) => {
     const url = String(input);
     return Response.json(url.endsWith("/user") ? { login: "fixture-owner" } : { items: [
-      { number: 1, title: `Work ${lease.token}`, html_url: "https://github.com/owner/project/issues/1", updated_at: "2026-10-09T00:00:00Z" },
+      { number: 1, title: `Work ${lease.token}`, html_url: "https://github.com/Owner/Project/issues/1", updated_at: "2026-10-09T00:00:00Z" },
+      { number: 3, title: "Similar repository", html_url: "https://github.com/Owner/Project-tools/issues/3" },
       { number: 2, title: "Another repository", html_url: "https://github.com/other/project/issues/2" }
     ] });
   });
