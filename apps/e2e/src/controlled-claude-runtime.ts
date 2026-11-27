@@ -179,7 +179,10 @@ export class ControlledClaudeQuery implements ClaudeSdkQuery {
     }
   }
 
-  complete(result: string): void {
+  complete(result: string, accounting = {
+    usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    modelUsage: {}
+  }): void {
     const userMessageUuid = this.receivedInputs.at(-1)?.uuid;
     this.#output.push({
       type: "result",
@@ -191,13 +194,7 @@ export class ControlledClaudeQuery implements ClaudeSdkQuery {
       result,
       stop_reason: "end_turn",
       total_cost_usd: 0,
-      usage: {
-        input_tokens: 10,
-        output_tokens: 5,
-        cache_read_input_tokens: 0,
-        cache_creation_input_tokens: 0
-      },
-      modelUsage: {},
+      ...accounting,
       permission_denials: [],
       terminal_reason: "completed",
       uuid: randomUUID(),

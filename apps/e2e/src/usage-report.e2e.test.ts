@@ -1,8 +1,37 @@
 import { Code } from "@connectrpc/connect";
-import { UsageReportGroup } from "@joko/contracts";
+import { ClaudeCodeAdapter } from "@joko/adapter-claude-code";
+import { RunState, UsageReportGroup } from "@joko/contracts";
 import { expect, it } from "vitest";
-import { OrchestratorE2eFixture } from "./fixture.js";
-import { createSessionMutation, deleteMutation, sessionIdFrom, submit } from "./operations.js";
+import { ControlledClaudeRuntime } from "./controlled-claude-runtime.js";
+import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
+import { createSessionMutation, deleteMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
+
+it("reports all four Claude Code token counts from the settled run and its actual model", async () => {
+  const runtime = new ControlledClaudeRuntime();
+  const backendId = "claude-usage", modelId = "claude-remote-fixture";
+  const fixture = await OrchestratorE2eFixture.start({ serverId: "orchestrator", profiles: [], backendFactories: [{
+    instanceId: backendId, adapterKind: "claude-agent-sdk-stdio", displayName: "Controlled Claude usage",
+    create: ({ generation }) => new ClaudeCodeAdapter({ id: backendId, instanceGeneration: generation, runtime, environment: {} })
+  }] });
+  try {
+    const { clients, connectionId } = await fixture.pair("Usage history");
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId,
+      createSessionMutation({ backendId, targetId: fixture.targetId(backendId) })));
+    const generation = fixture.application.store.getSession(sessionId).descriptor.binding.generation;
+    const runId = queueRunIdFrom(await submit(clients.operation, connectionId, sendInputMutation(sessionId, BigInt(generation), "Measure this reply")));
+    await waitFor(() => clients.run.getRun({ runId }), ({ run }) => run?.state === RunState.RUNNING, "Claude input admission");
+    runtime.queries[0]!.complete("Measured reply", {
+      usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 1000, cache_creation_input_tokens: 200 },
+      modelUsage: { [modelId]: { inputTokens: 10, outputTokens: 5, cacheReadInputTokens: 1000, cacheCreationInputTokens: 200, costUSD: 0 } }
+    });
+    const { run } = await waitFor(() => clients.run.getRun({ runId }), ({ run }) => run?.state === RunState.SUCCEEDED, "Claude usage settlement");
+    const counts = { inputTokens: 10n, outputTokens: 5n, cacheReadTokens: 1000n, cacheWriteTokens: 200n, totalTokens: 1215n };
+    expect(run?.usage?.usage).toMatchObject(counts);
+    const report = await clients.backend.getUsageReport({ group: UsageReportGroup.MODEL, backendId, sessionId });
+    expect(report.summary?.usage).toMatchObject(counts);
+    expect(report.entries).toMatchObject([{ modelId, summary: { usage: counts } }]);
+  } finally { await fixture.close(); }
+});
 
 it("keeps authenticated history pages stable through unrelated client activity and retires changed usage", async () => {
   const fixture = await OrchestratorE2eFixture.start();

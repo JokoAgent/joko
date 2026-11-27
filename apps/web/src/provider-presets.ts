@@ -19,6 +19,7 @@ interface PresetModel extends PresetModelOptions {
   readonly id: string;
   readonly name: string;
   readonly engines?: readonly string[];
+  readonly defaultEnabled?: boolean;
   readonly contextWindow?: number;
   readonly maxOutputTokens?: number;
   readonly maxOutput?: number;
@@ -29,6 +30,7 @@ interface PresetRuntime {
   readonly baseUrl: string;
   readonly wireProtocol?: string;
   readonly modelsUrl?: string;
+  readonly modelSource?: PresetBackend;
 }
 
 export interface ProviderPreset {
@@ -89,7 +91,19 @@ function globalRegionRank(preset: ProviderPreset): number {
   return preset.regionHint === "global" ? 0 : preset.regionHint === "cn" ? 2 : 1;
 }
 
-export const providerPresets: readonly ProviderPreset[] = [...presets,
+function withPortableClaudeRuntime(preset: ProviderPreset): ProviderPreset {
+  if (preset.runtimes["claude-code"] !== undefined) return preset;
+  const modelSource = preset.runtimes.codex === undefined ? "pi" : "codex";
+  const portable = preset.runtimes[modelSource];
+  if (portable === undefined) return preset;
+  const profiles = publicProviderInterfaces(preset.id, portable.baseUrl);
+  const route = preferredPublicProviderInterface(profiles, portable.baseUrl, "claude-code");
+  return { ...preset, runtimes: { ...preset.runtimes, "claude-code": {
+    ...portable, baseUrl: route?.baseUrl ?? portable.baseUrl, wireProtocol: route?.api ?? portable.wireProtocol ?? "openai-responses", modelSource
+  } } };
+}
+
+export const providerPresets: readonly ProviderPreset[] = [...presets.map(withPortableClaudeRuntime),
   ...[...modelCatalog].flatMap(([source, [first]]) => {
     const id = connectionIds[source] ?? source;
     return first && !staticPresetIds.has(id) ? [{ id, name: catalogNames[id] ?? id, regionHint: "global",
@@ -181,17 +195,18 @@ export function providerPresetRuntime(preset: ProviderPreset, backend: BackendVi
   const runtime = supportedPresetRuntime(preset, backend);
   if (runtime === undefined) return undefined;
   const { backendId, spec, compatibility, keyless } = runtime;
-  const models = preset.models.filter(model => (model.engines === undefined || model.engines.includes(backendId))
+  const models = preset.models.filter(model => (model.engines === undefined || model.engines.includes(spec.modelSource ?? backendId))
     && publicProviderModel(preset.id, model.id)?.status !== "retired");
   return {
     ...emptyProviderRuntime(backend),
+    catalogPresetId: preset.id,
     compatibility,
     endpoint: spec.baseUrl === selfHostedEndpoint ? "" : spec.baseUrl,
     ...(spec.modelsUrl !== undefined && spec.baseUrl !== selfHostedEndpoint && supportsProviderField(backend, "modelsEndpoint")
       ? { modelsEndpoint: spec.modelsUrl } : {}),
     keyless,
     authHeader: !keyless && supportsProviderField(backend, "authHeader") && compatibility !== "anthropic",
-    models: [...models.map(model => presetModel(model, preset.id, spec.baseUrl, compatibility, backend, backendId)),
+    models: [...models.map(model => presetModel(model, preset.id, spec.baseUrl, compatibility, backend, backendId, spec.modelSource)),
       ...catalogSuggestions(preset.id, spec.baseUrl, compatibility, backend, backendId, new Set(preset.models.map(model => model.id)))]
   };
 }
@@ -223,9 +238,9 @@ function catalogSuggestions(id: string, endpoint: string, compatibility: Provide
   return suggestions;
 }
 
-function presetModel(model: PresetModel, catalogId: string, endpoint: string, compatibility: ProviderCompatibilityView, backend: BackendView, kind: PresetBackend): ProviderModelConfigurationView {
+function presetModel(model: PresetModel, catalogId: string, endpoint: string, compatibility: ProviderCompatibilityView, backend: BackendView, kind: PresetBackend, modelSource = kind): ProviderModelConfigurationView {
   const defaults = emptyProviderModel(backend);
-  const options = { ...model, ...model.engineOverrides?.[kind] };
+  const options = { ...model, ...model.engineOverrides?.[modelSource] };
   const declaration = publicProviderModel(catalogId, model.id);
   const interfaces = providerModelInterfaceOptions(backend, endpoint, model.id, catalogId);
   const api = compatibilityForWireProtocol(options.piApi);
@@ -268,7 +283,7 @@ function presetModel(model: PresetModel, catalogId: string, endpoint: string, co
       && (kind !== "claude-code" || (defaultEffort !== "off" && defaultEffort !== "minimal")) ? defaultEffort : undefined,
     supportsFastMode: supportsProviderField(backend, "modelFastMode") && declared.supportsFastMode === true,
     supportsTools: declared.supportsToolCalls,
-    defaultVisible: declared.defaultEnabled,
+    defaultVisible: declared.defaultEnabled ?? model.defaultEnabled,
     compatibility: selected.compatibility === compatibility ? undefined : selected.compatibility,
     endpoint: selected.endpoint
   };

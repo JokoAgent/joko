@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { PermissionMode, PolicySubjectKind, ProviderModel } from "@joko/core";
-import { isSameOriginModelEndpoint } from "@joko/core";
+import { isSameOriginModelEndpoint, providerRouteReferencePricing } from "@joko/core";
 import { piError } from "./errors.js";
-import { createPiModelCatalogAdditions, openAiDefaultWorkingContext } from "./model-catalog-additions.js";
+import { openAiDefaultWorkingContext } from "./model-catalog-additions.js";
 import { isManagedChatModel, isManagedSpeechModel } from "./model-purpose.js";
 
 export type PiSupportedApi =
@@ -83,7 +83,11 @@ export interface PiManagedModel {
 
 export interface PiManagedProvider {
   readonly id: string;
+  /** Public billing product selected by the owner, independent of the account ID. */
+  readonly catalogPresetId?: string;
   readonly baseUrl?: string;
+  /** Host route used to qualify pricing. The native models.json has no request-path field. */
+  readonly requestPath?: string;
   readonly api?: PiSupportedApi;
   /** Name only. The secret value is supplied to the child through the managed credential channel. */
   readonly apiKeyEnv?: string;
@@ -326,15 +330,7 @@ export async function provisionManagedCatalog(
       modelOverrides: materializeModelOverrides(provider.modelOverrides, secretEnvironmentNames)
     });
 
-    for (const model of chatModels) {
-      const projected = piProviderModel(provider, model);
-      const reference = provider.id !== "xiaomi-token-plan-cn" && provider.apiKeyEnv !== undefined && provider.keyless !== true
-        && model.cost === undefined && model.id === "mimo-v2.6-pro" && projected.api === "openai-completions"
-        ? createPiModelCatalogAdditions().referenceCatalogMetadata({ id: model.id, provider: "xiaomi-token-plan-cn", baseUrl: provider.baseUrl })
-        : undefined;
-      coreModels.push(reference?.cost === undefined || reference.pricing === undefined
-        ? projected : { ...projected, cost: reference.cost, pricing: reference.pricing });
-    }
+    for (const model of chatModels) coreModels.push(piProviderModel(provider, model));
   }
 
   const managedSettings = compactObject({
@@ -636,6 +632,13 @@ function isLoopbackHostname(hostname: string): boolean {
 
 export function piProviderModel(provider: PiManagedProvider, model: PiManagedModel, clientProtocol?: PiSupportedApi): ProviderModel {
   const api = model.api ?? provider.api ?? "openai-completions";
+  const pricing = model.cost !== undefined ? {
+    source: "upstream" as const, currencyCode: "USD", cacheReadAvailable: true, cacheWriteAvailable: true
+  } : provider.apiKeyEnv === undefined || provider.keyless === true ? undefined : providerRouteReferencePricing({
+    baseUrl: model.baseUrl ?? provider.baseUrl, api, requestPath: provider.requestPath, modelId: model.id, catalogPresetId: provider.catalogPresetId,
+    backend: clientProtocol === "anthropic-messages" ? "claude-code" : clientProtocol === "openai-responses" ? "codex" : "pi",
+    selectedModelRoute: model.api !== undefined || model.baseUrl !== undefined
+  });
   const thinkingLevels = supportedPiThinkingLevels(model.reasoning, model.thinkingLevelMap);
   const contextWindow = model.contextWindow ?? 128_000;
   const explicitWindow = model.contextWindow !== undefined
@@ -674,14 +677,7 @@ export function piProviderModel(provider: PiManagedProvider, model: PiManagedMod
     supportsFastMode: model.supportsFastMode === true,
     thinkingLevels,
     cost: model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    ...(model.cost === undefined ? {} : {
-      pricing: {
-        source: "upstream" as const,
-        currencyCode: "USD",
-        cacheReadAvailable: true,
-        cacheWriteAvailable: true
-      }
-    })
+    ...(pricing === undefined ? {} : { pricing })
   };
 }
 

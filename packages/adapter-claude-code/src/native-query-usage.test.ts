@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { parseNativeModelUsage, parseNativeUsageRequests } from "@joko/core";
 import { NativeQueryUsage } from "./native-query-usage.js";
 
 const model = (inputTokens: number, outputTokens: number, costUSD: number) =>
@@ -8,6 +9,22 @@ const assistant = (id: string, name: string, input: number, output: number) => (
 } });
 
 describe("native Query accounting", () => {
+  it("counts cache reads and writes once in the closed request, model partition and Query total", () => {
+    const query = new NativeQueryUsage(true);
+    const context = { fastMode: false, requestedAt: () => 100 };
+    query.observeStream({ event: { type: "message_start", message: { id: "cached", model: "root",
+      usage: { input_tokens: 10, output_tokens: 0, cache_read_input_tokens: 1000, cache_creation_input_tokens: 200 }
+    } } }, context);
+    query.observeStream({ event: { type: "message_delta", usage: { output_tokens: 5 } } }, context);
+    query.observeStream({ event: { type: "message_stop" } }, context);
+    const result = query.observeResult({ modelUsage: { root: { ...model(10, 5, 0), cacheReadInputTokens: 1000, cacheCreationInputTokens: 200 } } })!;
+    const counts = { inputTokens: 10, outputTokens: 5, cacheReadTokens: 1000, cacheWriteTokens: 200, totalTokens: 1215 };
+    expect(result).toMatchObject(counts);
+    const models = parseNativeModelUsage(result.nativeAccounting?.models, result);
+    expect(models).toMatchObject([{ ...counts, modelId: "root" }]);
+    expect(parseNativeUsageRequests(result.nativeAccounting?.requests, models!)).toMatchObject([{ ...counts, requestId: "cached" }]);
+  });
+
   it("joins closed root and child requests to actual models, uses final streamed output, and deduplicates cumulative replays", () => {
     const query = new NativeQueryUsage(true);
     const close = (id: string, name: string, input: number, output: number, parent: string | null, fastMode: boolean, cache = false) => {
@@ -23,10 +40,10 @@ describe("native Query accounting", () => {
     close("child-request", "child", 2, 1, "owned-tool", true);
     const native = { modelUsage: { "root[1m]": { ...model(10, 5, 0), cacheReadInputTokens: 2, cacheCreationInputTokens: 3 }, child: model(2, 1, 0) }, total_cost_usd: 0 };
     const first = query.observeResult(native)!;
-    expect(first).toMatchObject({ inputTokens: 12, outputTokens: 6, cacheReadTokens: 2, cacheWriteTokens: 3, totalTokens: 18 });
+    expect(first).toMatchObject({ inputTokens: 12, outputTokens: 6, cacheReadTokens: 2, cacheWriteTokens: 3, totalTokens: 23 });
     expect(first.nativeAccounting?.requests).toEqual([
       { requestId: "root-request", modelId: "root[1m]", inputTokens: 10, outputTokens: 5, cacheReadTokens: 2, cacheWriteTokens: 3,
-        totalTokens: 15, fastMode: false, requestedAt: 100, cacheWrite1hTokens: 1 },
+        totalTokens: 20, fastMode: false, requestedAt: 100, cacheWrite1hTokens: 1 },
       { requestId: "child-request", modelId: "child", inputTokens: 2, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0,
         totalTokens: 3, fastMode: true, requestedAt: 100, cacheWrite1hTokens: 0 }
     ]);
@@ -34,7 +51,7 @@ describe("native Query accounting", () => {
     expect(query.observeResult(native)).toEqual(first);
     close("later-request", "root", 10, 7, null, true, true);
     const later = query.observeResult({ modelUsage: { "root[1m]": { ...model(20, 12, 0), cacheReadInputTokens: 4, cacheCreationInputTokens: 6 }, child: model(2, 1, 0) }, total_cost_usd: 0 })!;
-    expect(later).toMatchObject({ inputTokens: 22, outputTokens: 13, totalTokens: 35, nativeAccounting: { tokensComplete: true } });
+    expect(later).toMatchObject({ inputTokens: 22, outputTokens: 13, totalTokens: 45, nativeAccounting: { tokensComplete: true } });
     expect(later.nativeAccounting?.requests).toHaveLength(3);
   });
 

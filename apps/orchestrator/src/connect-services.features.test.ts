@@ -1947,6 +1947,7 @@ describe("Connect typed feature boundaries", () => {
         apiCompatibility: contract.ProviderApiCompatibility.GOOGLE_GENERATIVE_AI,
         endpoint: "https://models.example.test/v1",
         credentialReferenceId: "credential-reference-1234",
+        catalogPresetId: "google-gemini-api",
         apiKeyEnvironment: "CUSTOM_API_KEY",
         keyless: false,
         authHeader: true,
@@ -1991,6 +1992,7 @@ describe("Connect typed feature boundaries", () => {
     expect(providerUpsert).toHaveBeenCalledOnce();
     expect(provider.runtimes[0].backendId).toBe("pi");
     expect(provider.runtimes[0].provider.api).toBe("google-generative-ai");
+    expect(provider.runtimes[0].provider.catalogPresetId).toBe("google-gemini-api");
     expect(provider.runtimes[0].provider.models[0]).toMatchObject({
       id: "reasoner-1",
       contextWindow: 200_000,
@@ -2073,6 +2075,7 @@ describe("Connect typed feature boundaries", () => {
     const settings = fromBinary(contract.SettingsSnapshotSchema, toBinary(contract.SettingsSnapshotSchema, settingsResponse.settings!));
     expect(settings.providers[0]?.version?.revision?.value).toBe(3n);
     expect(settings.providers[0]?.runtimes[0]?.backendId).toBe("pi");
+    expect(settings.providers[0]?.runtimes[0]?.catalogPresetId).toBe("google-gemini-api");
     expect(settings.providers[0]?.runtimes[0]?.models[0]?.sampling?.seed).toBe(42n);
     expect(settings.providers[0]?.runtimes[0]?.models[0]?.supportsFastMode).toBe(true);
     expect(settings.providers[0]?.runtimes[0]?.headers[0]).toMatchObject({ headerName: "X-Tenant", environmentName: "CUSTOM_TENANT" });

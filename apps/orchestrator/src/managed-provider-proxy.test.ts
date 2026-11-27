@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { OperationalStore } from "@joko/store";
 import { createCodexAdapter } from "@joko/adapter-codex";
+import { modelTokenPricesAt } from "@joko/core";
 import type { AdapterContext, EventPayload, ManagedProviderRouteOwner, NativeSessionBinding, SessionDescriptor, TargetDescriptor } from "@joko/core";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { mkdir, readFile, readdir } from "node:fs/promises";
@@ -205,6 +206,25 @@ function responsesEvents(body: string): Record<string, unknown>[] {
 }
 
 describe("Managed Provider native proxy", () => {
+  it.each([
+    { protocol: "anthropic-messages" as const, client: "anthropic-messages" as const, baseUrl: "https://tokenrhythm.studio", path: "/v1/messages", priced: true },
+    { protocol: "anthropic-messages" as const, client: "anthropic-messages" as const, baseUrl: "https://tokenrhythm.studio", path: "/private/messages", priced: false },
+    { protocol: "openai-responses" as const, client: undefined, baseUrl: "https://tokenrhythm.studio/v1", path: "/v1/responses", priced: false }
+  ])("qualifies the account tariff against the actual $protocol Backend binding at $path", async ({ protocol, client, baseUrl, path, priced }) => {
+    const f = await fixture(false, protocol, "account-local-name", path, client, { baseUrl, modelId: "glm-5.1" });
+    try {
+      const binding = await f.port.prepare(f.owner);
+      const catalog = f.port.listModels().find(model => model.modelId === f.owner.modelId)!;
+      const at = Date.UTC(2026, 10, 24);
+      for (const model of [catalog, binding.model]) {
+        expect(model.providerId).toBe(f.owner.providerId);
+        expect(modelTokenPricesAt(model, { at: at - 1 })).toBeUndefined();
+        expect(modelTokenPricesAt(model, { at })).toEqual(priced ? { currencyCode: "CNY", cost: { input: 8, output: 28, cacheRead: 2 } } : undefined);
+      }
+      binding.dispose();
+    } finally { await f.dispose(); }
+  });
+
   it.each([
     { baseUrl: "https://api.anthropic.com/v1", expected: true },
     { baseUrl: "https://api.anthropic.com.example.test/v1", expected: undefined },

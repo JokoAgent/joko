@@ -43,7 +43,7 @@ describe("ProviderSettings model visibility", () => {
     const backends: BackendView[] = [
       { id: "claude-code", name: "Claude Code", version: "1", health: "healthy",
         capabilities: new Map([["provider.managed_catalog", { name: "provider.managed_catalog", supported: true, options: [] }]]),
-        providerRuntimeSupport: { protocols: ["anthropic", "openaiResponses"], fields: ["modelsEndpoint"] } },
+        providerRuntimeSupport: { protocols: ["anthropic", "openaiResponses", "openaiCompletions"], fields: ["modelsEndpoint"] } },
       { id: "codex", name: "Codex", version: "1", health: "healthy",
         capabilities: new Map([["provider.managed_catalog", { name: "provider.managed_catalog", supported: true, options: [] }]]),
         providerRuntimeSupport: { protocols: ["openaiResponses", "openaiCompletions"], fields: ["modelsEndpoint", "modelInputModalities"] } }
@@ -74,8 +74,21 @@ describe("ProviderSettings model visibility", () => {
     const configure = [...document.body.querySelectorAll<HTMLButtonElement>(".provider-editor button")].find(button => button.textContent === "Configure Codex");
     await act(async () => required(configure).click());
     expect(endpoint().value).toBe("https://opencode.ai/zen/go/v1");
-    const back = required(document.body.querySelector<HTMLButtonElement>('.provider-editor-modal .modal__header button[aria-label="Back"]'));
-    await act(async () => back.click());
+    const back = () => required(document.body.querySelector<HTMLButtonElement>('.provider-editor-modal .modal__header button[aria-label="Back"]')).click();
+    await act(async () => back());
+    const token = (await searchFor("Token Rhythm")).find(button => button.textContent?.includes("Token Rhythm"));
+    await act(async () => required(token).click());
+    expect(endpoint().value).toBe("https://tokenrhythm.studio");
+    await setControlValue(required(document.body.querySelector<HTMLInputElement>('.provider-editor input[type="password"]')), "test-discovery-key");
+    await act(async () => required(document.body.querySelector<HTMLButtonElement>(".provider-model-preview > button")).click());
+    expect(previewProviderModels).toHaveBeenCalledWith(expect.objectContaining({ backendId: "claude-code", compatibility: "anthropic",
+      endpoint: "https://tokenrhythm.studio", modelsEndpoint: "https://tokenrhythm.studio/v1/models", models: [] }), "test-discovery-key", expect.any(AbortSignal));
+    await act(async () => back());
+    const google = (await searchFor("google-gemini-api"))[0];
+    await act(async () => required(google).click());
+    expect(required(document.body.querySelector('.provider-editor [role="tab"][aria-selected="true"]')).textContent).toContain("Claude Code");
+    expect(endpoint().value).toBe("https://generativelanguage.googleapis.com/v1beta/openai");
+    await act(async () => back());
     const sub2api = (await searchFor("Sub2API")).find(button => button.textContent?.includes("Sub2API"));
     await act(async () => required(sub2api).click());
     await setControlValue(endpoint(), "https://gateway.example.test/custom");
@@ -99,7 +112,7 @@ describe("ProviderSettings model visibility", () => {
     expect(save.disabled).toBe(false);
     await act(async () => save.click());
     expect(saveProvider).toHaveBeenCalledWith(expect.objectContaining({ id: "sub2api", runtimes: [expect.objectContaining({
-      endpoint: "https://gateway.example.test/custom/v1", credentialOrigin: "https://gateway.example.test",
+      endpoint: "https://gateway.example.test/custom/v1", credentialOrigin: "https://gateway.example.test", catalogPresetId: "sub2api",
       models: [expect.objectContaining({ modelId: "discovered-model" })]
     })] }), expect.any(AbortSignal));
   });

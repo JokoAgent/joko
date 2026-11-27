@@ -3995,6 +3995,7 @@ export type ProviderConfigurationFieldView = "requestPath" | "modelsEndpoint" | 
 
 export interface ProviderRuntimeConfigurationView {
   readonly backendId: string;
+  readonly catalogPresetId?: string;
   readonly compatibility: ProviderCompatibilityView;
   readonly endpoint: string;
   readonly credentialId: string;

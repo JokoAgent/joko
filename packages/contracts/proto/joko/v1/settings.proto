@@ -176,6 +176,9 @@ message ProviderRuntimeConfiguration {
   // Explicit credential authority; must match endpoint origin when any key is bound.
   // Changing endpoint origin never updates this field implicitly.
   string credential_origin = 12;
+  // Public preset selected for this runtime. Used only to qualify published rates.
+  // Older clients may omit it when updating an existing configuration.
+  optional string catalog_preset_id = 13;
 }
 
 message ProviderHeaderConfiguration {

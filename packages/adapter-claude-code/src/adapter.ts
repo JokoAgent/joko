@@ -6775,7 +6775,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       outputTokens,
       cacheReadTokens,
       cacheWriteTokens,
-      totalTokens: inputTokens + outputTokens,
+      totalTokens: inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens,
       cost: 0
     };
   }

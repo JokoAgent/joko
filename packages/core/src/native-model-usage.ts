@@ -5,6 +5,14 @@ const fields = new Set<string>(["modelId", ...counters, "cost", "tokensComplete"
 const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 const integer = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
+type TokenCounts = Pick<UsageSnapshot, typeof counters[number]>;
+
+// A partition uses the same convention for cache tokens as its enclosing observation.
+function matchesNativeTotal(part: TokenCounts, owner: TokenCounts): boolean {
+  const separateCache = owner.totalTokens === owner.inputTokens + owner.outputTokens + owner.cacheReadTokens + owner.cacheWriteTokens;
+  return part.totalTokens === part.inputTokens + part.outputTokens + (separateCache ? part.cacheReadTokens + part.cacheWriteTokens : 0);
+}
+
 /** A bounded partition of native totals. Missing portions keep an unknown model;
  * they can never be assigned to the user's selected model by inference. */
 export function parseNativeModelUsage(value: unknown, total: UsageSnapshot): readonly NativeModelUsage[] | undefined {
@@ -17,7 +25,7 @@ export function parseNativeModelUsage(value: unknown, total: UsageSnapshot): rea
       || counters.some(key => !integer(row[key])) || typeof row["cost"] !== "number" || !Number.isFinite(row["cost"]) || row["cost"] < 0
       || typeof row["tokensComplete"] !== "boolean" || typeof row["costComplete"] !== "boolean") return undefined;
     const item = row as unknown as NativeModelUsage;
-    if (item.totalTokens !== item.inputTokens + item.outputTokens) return undefined;
+    if (!matchesNativeTotal(item, total)) return undefined;
     for (const key of counters) { sums[key] += item[key]; if (!integer(sums[key]) || sums[key] > total[key]) return undefined; }
     costMicros += Math.round(item.cost * 1_000_000);
     if (!integer(costMicros) || costMicros > Math.round(total.cost * 1_000_000)) return undefined;
@@ -42,7 +50,7 @@ export function parseNativeUsageRequests(value: unknown, models: readonly Native
       || typeof row["fastMode"] !== "boolean" || !integer(row["requestedAt"]) || row["requestedAt"] > 8_640_000_000_000_000
       || row["cacheWrite1hTokens"] !== undefined && (!integer(row["cacheWrite1hTokens"]) || row["cacheWrite1hTokens"] > (row["cacheWriteTokens"] as number))) return undefined;
     const item = row as unknown as NativeUsageRequest, model = models.find(model => model.modelId === item.modelId);
-    if (!model || item.totalTokens !== item.inputTokens + item.outputTokens
+    if (!model || !matchesNativeTotal(item, model)
       || !integer(item.inputTokens + item.cacheReadTokens + item.cacheWriteTokens)) return undefined;
     const sum = sums.get(item.modelId) ?? { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0 };
     for (const key of counters) { sum[key] += item[key]; if (!integer(sum[key]) || sum[key] > model[key]) return undefined; }

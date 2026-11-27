@@ -4696,11 +4696,21 @@ describe("PiBackendAdapter", () => {
         api: "openai-completions",
         keyless: true,
         models: [{ id: "test-model", reasoning: true, contextWindow: 32_768, contextWindowMax: 262_144, maxTokens: 4_096 }]
+      }, {
+        id: "route-account", baseUrl: "https://tokenrhythm.studio/v1", api: "openai-completions", apiKeyEnv: "ROUTE_ACCOUNT_KEY",
+        models: [{ id: "glm-5.1" }, { id: "unpriced" }]
+      }, {
+        id: "openai", catalogPresetId: "openai-api", baseUrl: "https://api.openai.com/v1", api: "openai-responses",
+        requestPath: "/alternate/responses", apiKeyEnv: "CUSTOM_OPENAI_TEST_KEY", models: [{ id: "gpt-6.2-sol" }]
       }],
+      environment: { ROUTE_ACCOUNT_KEY: "catalog-test-key", CUSTOM_OPENAI_TEST_KEY: "alternate-test-key" },
       processFactory: (spec) => {
         scripted = new ScriptedPiProcess(spec, {
           availableThinkingLevels: ["max", "future", "off", "high", "off"],
           availableModels: [
+            ...["glm-5.1", "unpriced"].map(id => ({ ...commonModel, provider: "route-account", id,
+              api: "openai-completions", baseUrl: "https://tokenrhythm.studio/v1" })),
+            { ...commonModel, provider: "openai", id: "gpt-6.2-sol", baseUrl: "https://api.openai.com/v1" },
             {
               ...commonModel,
               provider: "local",
@@ -4762,12 +4772,22 @@ describe("PiBackendAdapter", () => {
       for (const model of models.filter(model => model.providerId !== "local")) expect(model.contextWindowMax).toBeUndefined();
 
       expect(byIdentity).toEqual({
+        "openai/gpt-6.2-sol": [],
+        "route-account/glm-5.1": [],
+        "route-account/unpriced": [],
         "local/test-model": ["off", "high", "max"],
         "remote/test-model": ["off", "minimal", "low", "medium", "high"],
         "remote/mapped": ["minimal", "high", "xhigh"],
         "remote/plain": []
       });
       expect(scripted.commands.filter((command) => command.type === "get_state")).toHaveLength(stateRequestsBefore + 2);
+      expect(models.find(model => model.providerId === "route-account" && model.modelId === "glm-5.1")?.pricing).toMatchObject({
+        source: "providerReference", currencyCode: "CNY", tariffs: [{ effectiveFrom: "2026-11-24", cost: { input: 8, output: 28, cacheRead: 2 } }]
+      });
+      expect(models.find(model => model.providerId === "route-account" && model.modelId === "unpriced")?.pricing).toBeUndefined();
+      const alternate = models.find(model => model.providerId === "openai" && model.modelId === "gpt-6.2-sol")!;
+      expect(alternate.cost).toEqual({});
+      expect(alternate.pricing).toBeUndefined();
     } finally {
       await adapter.dispose();
     }

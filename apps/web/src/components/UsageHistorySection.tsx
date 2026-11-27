@@ -23,7 +23,8 @@ export function UsageHistoryContent({ api, connected, locale, t }: {
   readonly api: AppController["getUsageReport"]; readonly connected: boolean; readonly locale: Locale; readonly t: Translator;
 }): JSX.Element {
   const [filters, setFilters] = useState<Filters>(defaults);
-  const [query, setQuery] = useState<UsageReportQueryView>(() => makeQuery(defaults));
+  const [applied, setApplied] = useState(() => ({ filters: defaults, query: makeQuery(defaults) }));
+  const { query } = applied;
   const [load, setLoad] = useState({ api, pageToken: "", revision: 0 });
   const [result, setResult] = useState<{ query: UsageReportQueryView; api: typeof api; pages: readonly ReportPage[] }>();
   const [error, setError] = useState<{ readonly message?: string }>();
@@ -40,7 +41,8 @@ export function UsageHistoryContent({ api, connected, locale, t }: {
   const showingPrevious = visibleResult !== undefined && visibleResult.query !== query;
   const shownQuery = visibleResult?.query ?? query;
   const invalidRange = filters.range === "custom" && filters.from !== "" && filters.through !== "" && filters.from > filters.through;
-  const unapplied = JSON.stringify(makeQuery(filters)) !== JSON.stringify(query);
+  const unapplied = filters !== applied.filters && (filters.range !== applied.filters.range
+    || JSON.stringify(makeQuery(filters)) !== JSON.stringify(makeQuery(applied.filters)));
   useLayoutEffect(() => {
     const focus = completedFocus.current;
     if (focus === undefined) return;
@@ -83,9 +85,18 @@ export function UsageHistoryContent({ api, connected, locale, t }: {
   }, [api, connected, load, query]);
   const apply = (next: Filters): void => {
     if (!connected || next.range === "custom" && next.from !== "" && next.through !== "" && next.from > next.through) return;
-    request.current?.abort(); setError(undefined); setLoad({ api, pageToken: "", revision: 0 }); setQuery(makeQuery(next));
+    request.current?.abort(); setError(undefined); setLoad({ api, pageToken: "", revision: 0 });
+    setApplied({ filters: next, query: makeQuery(next) });
   };
-  const reload = (): void => { if (connected) { request.current?.abort(); setLoad((value) => ({ api, pageToken: "", revision: value.revision + 1 })); } };
+  const reload = (): void => {
+    if (!connected) return;
+    request.current?.abort();
+    const refreshed = makeQuery(applied.filters);
+    if (refreshed.fromDay !== query.fromDay || refreshed.throughDay !== query.throughDay) {
+      setApplied({ filters: applied.filters, query: refreshed });
+    }
+    setLoad((value) => ({ api, pageToken: "", revision: value.revision + 1 }));
+  };
   const retry = (trigger: HTMLButtonElement): void => {
     if (!connected || pending) return;
     const nextLoad = { api, pageToken: load.api === api ? load.pageToken : "", revision: load.revision + 1 };

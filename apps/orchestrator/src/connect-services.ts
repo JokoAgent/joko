@@ -10778,6 +10778,7 @@ function mapProviderRuntimeConfiguration(item: NativeProviderDescriptor): contra
   const provider = item.provider;
   return create(contract.ProviderRuntimeConfigurationSchema, {
     backendId: item.backendId,
+    catalogPresetId: provider.catalogPresetId,
     apiCompatibility: protoProviderApi(provider.api),
     endpoint: provider.baseUrl ?? "",
     credentialReferenceId: provider.apiKeyEnv === undefined ? "" : bindings[provider.apiKeyEnv] ?? "",
@@ -10959,6 +10960,7 @@ function providerRuntimeFromProto(input: contract.ProviderRuntimeConfiguration, 
   }
   const provider: PiManagedProvider = {
     id: providerId,
+    ...(input.catalogPresetId === undefined ? {} : { catalogPresetId: input.catalogPresetId }),
     ...(input.endpoint === "" ? {} : { baseUrl: input.endpoint }),
     ...(api === undefined ? {} : { api }),
     ...(input.apiKeyEnvironment === "" ? {} : { apiKeyEnv: input.apiKeyEnvironment }),

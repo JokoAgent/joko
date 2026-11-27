@@ -118,6 +118,7 @@ import {
   managedEnvironmentReferenceName,
   keylessEnvName,
   provisionManagedCatalog,
+  piProviderModel,
   piModelOutputTokenLimit,
   supportedPiThinkingLevels,
   writeMcpDescriptor,
@@ -2223,8 +2224,7 @@ export class PiBackendAdapter implements
         }
         await this.#advanceRuntimePolicy(runtime);
         const levels = await this.getAvailableThinkingLevels(context);
-        const projected = modelFromRpc(responseData(response) as PiRpcModel, levels, supportsFastMode,
-          this.#runtimeModelMaximumContext(runtime, providerId, modelId));
+        const projected = this.#projectRuntimeModel(runtime, responseData(response) as PiRpcModel, levels, supportsFastMode);
         const profile = this.#spawnProfiles.get(context.sessionId);
         if (profile) this.#spawnProfiles.set(context.sessionId, { ...profile, providerId, modelId });
         return projected;
@@ -4360,11 +4360,10 @@ export class PiBackendAdapter implements
       ? currentModelBefore
       : undefined;
     return Promise.all((data.models as PiRpcModel[]).map(async (model) =>
-      modelFromRpc(
-        model,
+      this.#projectRuntimeModel(
+        runtime, model,
         samePiRpcModelIdentity(piRpcModelIdentity(model), stableCurrentModel) ? levels : undefined,
-        await this.#runtimeModelSupportsFastMode(runtime, model.provider, model.id),
-        this.#runtimeModelMaximumContext(runtime, model.provider, model.id)
+        await this.#runtimeModelSupportsFastMode(runtime, model.provider, model.id)
       )));
   }
 
@@ -4407,8 +4406,7 @@ export class PiBackendAdapter implements
         }
         if (!policyAdvanced) await this.#advanceRuntimePolicy(runtime);
         const levels = await this.getAvailableThinkingLevels(context);
-        const projected = modelFromRpc(rpcModel, levels, supportsFastMode,
-          this.#runtimeModelMaximumContext(runtime, identity.provider, identity.id));
+        const projected = this.#projectRuntimeModel(runtime, rpcModel, levels, supportsFastMode);
         const responseEffort = typeof data.thinkingLevel === "string"
           && canonicalPiThinkingLevels([data.thinkingLevel]).length === 1
           ? data.thinkingLevel
@@ -4941,17 +4939,23 @@ export class PiBackendAdapter implements
 
   async #runtimeModelSupportsFastMode(runtime: PiRuntime, providerId: string, modelId: string): Promise<boolean> {
     const initialized = await this.#initialize(runtime.generationLease.generation);
-    return mergeProviderModels(
-      initialized.catalog.models,
-      runtime.generationLease.generation.options.nativeModels ?? []
-    ).some((model) =>
-      model.providerId === providerId && model.modelId === modelId && model.supportsFastMode === true);
+    const matches = (model: ProviderModel) => model.providerId === providerId && model.modelId === modelId;
+    const declared = initialized.catalog.models.find(matches) ?? runtime.generationLease.generation.options.nativeModels?.find(matches);
+    return declared?.supportsFastMode === true;
   }
 
-  #runtimeModelMaximumContext(runtime: PiRuntime, providerId: string, modelId: string): number | undefined {
+  #projectRuntimeModel(runtime: PiRuntime, model: PiRpcModel, levels: readonly string[] | undefined, supportsFastMode: boolean): ProviderModel {
     const options = runtime.generationLease.generation.options;
-    return options.providers?.find(provider => provider.id === providerId)?.models.find(model => model.id === modelId)?.contextWindowMax
-      ?? options.nativeModels?.find(model => model.providerId === providerId && model.modelId === modelId)?.contextWindowMax;
+    const provider = options.providers?.find(candidate => candidate.id === model.provider);
+    const configured = provider?.models.find(candidate => candidate.id === model.id);
+    const maximum = configured?.contextWindowMax
+      ?? options.nativeModels?.find(candidate => candidate.providerId === model.provider && candidate.modelId === model.id)?.contextWindowMax;
+    const projected = modelFromRpc(model, levels, supportsFastMode, maximum, configured === undefined);
+    if (provider === undefined || configured === undefined || typeof model["baseUrl"] !== "string"
+      || model["baseUrl"].replace(/\/+$/u, "") !== (configured.baseUrl ?? provider.baseUrl)?.replace(/\/+$/u, "")
+      || model.api !== (configured.api ?? provider.api ?? "openai-completions")) return projected;
+    const declared = piProviderModel(provider, configured);
+    return declared.pricing === undefined ? projected : { ...projected, cost: declared.cost, pricing: declared.pricing };
   }
 
   async #initializeSessionStore(): Promise<void> {
@@ -7890,7 +7894,8 @@ function usageFromStats(
   };
 }
 
-function modelFromRpc(model: PiRpcModel, authoritativeLevels?: readonly string[], supportsFastMode = false, contextWindowMax?: number): ProviderModel {
+function modelFromRpc(model: PiRpcModel, authoritativeLevels: readonly string[] | undefined, supportsFastMode: boolean,
+  contextWindowMax: number | undefined, nativeCatalogPrices: boolean): ProviderModel {
   const metadata = createPiModelCatalogAdditions().referenceCatalogMetadata({ id: model.id, provider: model.provider, api: model.api,
     ...(typeof model["baseUrl"] === "string" ? { baseUrl: model["baseUrl"] } : {}) });
   const thinkingLevelMap = isRecord(model.thinkingLevelMap)
@@ -7903,6 +7908,10 @@ function modelFromRpc(model: PiRpcModel, authoritativeLevels?: readonly string[]
   const defaultWorkingContextTokens = openAiDefaultWorkingContext({ id: model.id, api: model.api,
     baseUrl: typeof model["baseUrl"] === "string" ? model["baseUrl"] : undefined }, contextWindow);
   const nativeCost = knownModelTokenPrices(model.cost);
+  // A managed account can share a built-in Provider ID. Its public rates are qualified separately.
+  const priceMetadata = nativeCatalogPrices ? metadata : undefined;
+  const hasNativeCost = nativeCatalogPrices ? Object.keys(nativeCost).length > 0
+    : Object.values(nativeCost).some(value => value !== undefined && value > 0); // Pi fills missing managed rates with zero.
   return {
     providerId: model.provider,
     modelId: model.id,
@@ -7920,9 +7929,9 @@ function modelFromRpc(model: PiRpcModel, authoritativeLevels?: readonly string[]
     supportsImages: Array.isArray(model.input) && model.input.includes("image"),
     supportsFastMode,
     thinkingLevels,
-    cost: metadata?.cost ?? nativeCost,
-    ...(metadata?.pricing === undefined && (metadata?.cost !== undefined || Object.keys(nativeCost).length === 0) ? {} : {
-      pricing: metadata?.pricing ?? {
+    cost: priceMetadata?.cost ?? (hasNativeCost ? nativeCost : {}),
+    ...(priceMetadata?.pricing === undefined && (priceMetadata?.cost !== undefined || !hasNativeCost) ? {} : {
+      pricing: priceMetadata?.pricing ?? {
         source: "upstream" as const,
         currencyCode: "USD",
         cacheReadAvailable: nativeCost.cacheRead !== undefined,

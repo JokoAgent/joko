@@ -10,7 +10,7 @@ export function catalogModelReferencePricing(modelId: string, groupId = "global"
   const alias = separator < 0 ? modelId : modelId.slice(separator + 1);
   const matches = referencePrices.models.filter(model => model.id === modelId
     || (family === undefined || model.id.startsWith(family))
-      && (model.aliases.includes(modelId) || model.aliases.includes(alias)));
+      && model.aliases.some(value => value === modelId || value === alias));
   if (matches.length !== 1) return undefined;
   const tariffs = matches[0]!.groups.find(group => group.id === groupId)?.tariffs as readonly ModelReferenceTariff[] | undefined;
   if (tariffs === undefined || tariffs.length === 0) return undefined;
@@ -55,8 +55,11 @@ export function modelTokenPricesAt(model: Pick<ProviderModel, "cost" | "pricing"
   if (input.fastMode === "ultrafast") return undefined;
   const pricing = model.pricing;
   if (pricing?.tariffs !== undefined) {
-    const tariff = selectModelReferenceTariff(pricing.tariffs, { at: input.at, inputTokens: input.inputTokens,
-      variant: input.fastMode === true ? "fast" : "standard", currencyCode: pricing.currencyCode });
+    const selection = { at: input.at, inputTokens: input.inputTokens, currencyCode: pricing.currencyCode };
+    const tariff = input.fastMode === true
+      ? selectModelReferenceTariff(pricing.tariffs, { ...selection, variant: "fast" })
+        ?? selectModelReferenceTariff(pricing.tariffs, { ...selection, variant: "priority" })
+      : selectModelReferenceTariff(pricing.tariffs, { ...selection, variant: "standard" });
     if (tariff === undefined) return undefined;
     return { currencyCode: tariff.currencyCode, cost: { ...tariff.cost,
       ...(input.cacheWriteTtl === "1h" ? { cacheWrite: tariff.cost.cacheWrite1h } : {}) } };

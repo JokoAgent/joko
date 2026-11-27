@@ -8720,6 +8720,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (new Set(models.map((model) => model.modelId)).size !== models.length) throw new GatewayError("Model IDs must be unique within a provider.");
     return create(ProviderRuntimeConfigurationSchema, {
       backendId: runtime.backendId,
+      catalogPresetId: runtime.catalogPresetId,
       apiCompatibility: protoProviderCompatibility(runtime.compatibility),
       endpoint: canonicalProviderEndpoint(runtime.endpoint),
       credentialReferenceId: runtime.credentialId,
@@ -21081,6 +21082,7 @@ function mapProviderConfiguration(provider: ProviderConfiguration): SettingsView
 function mapProviderRuntimeConfiguration(provider: ProviderRuntimeConfiguration): SettingsView["providers"][number]["runtimes"][number] {
   return {
     backendId: provider.backendId,
+    ...(provider.catalogPresetId === undefined ? {} : { catalogPresetId: provider.catalogPresetId }),
     compatibility: providerCompatibility(provider.apiCompatibility),
     endpoint: provider.endpoint,
     credentialId: provider.credentialReferenceId,

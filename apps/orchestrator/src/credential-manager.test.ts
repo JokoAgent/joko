@@ -333,23 +333,26 @@ describe("ProviderCatalogManager", () => {
     credentials.upload(ticket.credentialUploadTicketId, "first-google-studio-key");
     await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: reference,
       displayName: "Google AI Studio", kind: "api_key" });
-    const input = (providerId: string, endpoint = GEMINI_CHAT_ENDPOINT) => ({
+    const input = (providerId: string, endpoint = GEMINI_CHAT_ENDPOINT, catalogPresetId?: string) => ({
       providerId, displayName: "Google AI Studio", kind: "custom_endpoint" as const, enabled: true, expectedVersion: 0n,
       runtimes: [{ backendId: "pi", credentialOrigin: new URL(endpoint).origin, credentialBindings: { GOOGLE_KEY: reference },
-        provider: { id: providerId, baseUrl: endpoint, api: "openai-completions" as const, apiKeyEnv: "GOOGLE_KEY", models: [{ id: "gemini-chat" }] } }]
+        provider: { id: providerId, ...(catalogPresetId === undefined ? {} : { catalogPresetId }), baseUrl: endpoint,
+          api: "openai-completions" as const, apiKeyEnv: "GOOGLE_KEY", models: [{ id: "gemini-chat" }] } }]
     });
     try {
       let catalog = open();
       expect(catalog.geminiImageChatCredential()).toBeUndefined();
       await expect(catalog.upsertConfiguration({ ...input("proxy", "https://provider.example.test/v1beta/openai"), geminiImageBackendId: "pi" }))
         .rejects.toThrow("Google AI Studio API key");
-      await catalog.upsertConfiguration({ ...input("first-account"), geminiImageBackendId: "pi" });
+      await catalog.upsertConfiguration({ ...input("first-account", GEMINI_CHAT_ENDPOINT, "google-gemini-api"), geminiImageBackendId: "pi" });
       const selected = catalog.geminiImageChatCredential();
       expect(selected).toMatchObject({ backendId: "pi", providerId: "first-account", credential: { credentialReferenceId: reference } });
       await catalog.upsertConfiguration(input("second-account"));
       await catalog.upsertConfiguration({ ...input("first-account"), displayName: "Renamed account", expectedVersion: catalog.get("pi", "first-account").version });
       catalog = open();
       expect(catalog.geminiImageChatCredential()).toEqual(selected);
+      expect(catalog.get("pi", "first-account").provider.catalogPresetId).toBe("google-gemini-api");
+      expect(catalog.get("pi", "second-account").provider.catalogPresetId).toBeUndefined();
 
       await credentials.replaceSecret(reference, "replacement-google-studio-key");
       expect(catalog.geminiImageChatCredential()).toBeNull();
@@ -358,6 +361,7 @@ describe("ProviderCatalogManager", () => {
       await catalog.delete("first-account");
       await catalog.upsertConfiguration(input("first-account"));
       catalog = open();
+      expect(catalog.get("pi", "first-account").provider.catalogPresetId).toBeUndefined();
       expect(catalog.geminiImageChatCredential()).toBeNull();
       await catalog.useStandaloneGeminiImageCredential(() => {});
       expect(open().geminiImageChatCredential()).toBeUndefined();

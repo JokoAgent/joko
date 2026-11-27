@@ -5706,11 +5706,17 @@ describe("SessionHost", () => {
     { model: "google/gemini-3.8-flash", at: Date.UTC(2027, 0, 1), fastMode: false, costMicros: 339_000, complete: false },
     { model: "openai/gpt-6.2-sol", at: Date.UTC(2026, 10, 17), requestInput: 272_000, fastMode: false, costMicros: 730_000, complete: true },
     { model: "openai/gpt-6.2-sol", at: Date.UTC(2026, 10, 17), requestInput: 272_001, fastMode: false, costMicros: 1_450_008, complete: true },
-    { model: "openai/gpt-6.2-sol", at: Date.UTC(2026, 10, 17), requestInput: 272_001, fastMode: false, override: { input: 3 }, costMicros: 2_130_012, complete: true }
+    { model: "openai/gpt-6.2-sol", at: Date.UTC(2026, 10, 17), requestInput: 272_001, fastMode: false, override: { input: 3 }, costMicros: 2_130_012, complete: true },
+    { model: "google/gemini-4-neon", at: Date.UTC(2026, 10, 20) - 1, fastMode: true, costMicros: 0, complete: false },
+    { model: "google/gemini-4-neon", at: Date.UTC(2026, 10, 20), fastMode: true, costMicros: 1_166_400, complete: false },
+    { model: "glm-5.1", baseUrl: "https://tokenrhythm.studio/v1", at: Date.UTC(2026, 10, 24), fastMode: false, costMicros: 2_024_000, currencyCode: "CNY", complete: false }
   ])("records $model tariffs using request time and observed usage as $costMicros micros", async testCase => {
-    const { catalogModelReferencePricing, captureModelPriceReference } = await import("@joko/core");
+    const { catalogModelReferencePricing, captureModelPriceReference, providerRouteReferencePricing } = await import("@joko/core");
+    const pricing = testCase.baseUrl === undefined ? catalogModelReferencePricing(testCase.model) : providerRouteReferencePricing({
+      baseUrl: testCase.baseUrl, modelId: testCase.model, backend: "pi", api: "openai-completions"
+    });
     const fixture = await createFixture(new TieredUsageFakeAdapter({ requestInput: testCase.requestInput ?? 200_000, fastMode: testCase.fastMode,
-      requestedAt: testCase.at, cacheWrite1hTokens: testCase.cacheWrite1hTokens, pricing: catalogModelReferencePricing(testCase.model) }),
+      requestedAt: testCase.at, cacheWrite1hTokens: testCase.cacheWrite1hTokens, pricing }),
     { usageMoneyKind: () => "reference-value" });
     if (testCase.override !== undefined) fixture.store.upsertModelPriceOverride({
       ownerId: "orchestrator", backendId: fixture.adapter.id, providerId: "test", modelId: "text",
@@ -5724,7 +5730,7 @@ describe("SessionHost", () => {
       prompt: { text: "measure", images: [], files: [], mentions: [], disposition: "prompt" } });
     await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
     expect(fixture.store.listUsageLedger({ ownerId: "orchestrator" })).toEqual([
-      expect.objectContaining({ costMicros: testCase.costMicros, currencyCode: "USD", costComplete: testCase.complete, estimated: true })
+      expect.objectContaining({ costMicros: testCase.costMicros, currencyCode: testCase.currencyCode ?? "USD", costComplete: testCase.complete, estimated: true })
     ]);
   });
 

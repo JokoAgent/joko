@@ -13,10 +13,31 @@ type ReportApi = AppController["getUsageReport"];
 beforeEach(() => { vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); });
 afterEach(async () => {
   await act(async () => { for (const root of roots.splice(0)) root.unmount(); });
-  document.body.replaceChildren(); vi.restoreAllMocks(); vi.unstubAllGlobals();
+  document.body.replaceChildren(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers();
 });
 
 describe("usage history requests and filters", () => {
+  it.each([
+    ["today", "2026-11-26", "2026-11-27"],
+    ["7", "2026-11-20", "2026-11-21"],
+    ["30", "2026-10-28", "2026-10-29"]
+  ])("refreshes the applied %s range across UTC midnight without submitting draft filters", async (range, before, after) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-26T23:59:59Z"));
+    const api = vi.fn<ReportApi>().mockResolvedValue(report([entry("first")], "yesterday-page"));
+    const view = await mount(api);
+    await change(field<HTMLSelectElement>(view.host, "usage.report.range"), range);
+    await click(view.host, "usage.report.apply");
+    expect(api.mock.calls.at(-1)?.[0]).toEqual({ group: "task", fromDay: before, throughDay: "2026-11-26" });
+    await click(view.host, "common.more");
+    await change(field<HTMLInputElement>(view.host, "usage.report.providerId"), "draft-provider");
+    vi.setSystemTime(new Date("2026-11-27T00:00:01Z"));
+    await click(view.host, "usage.refresh");
+    expect(api.mock.calls.at(-1)?.[0]).toEqual({ group: "task", fromDay: after, throughDay: "2026-11-27" });
+    expect(view.host.querySelector(".usage-history-scope")?.textContent).toContain(after);
+    expect(view.host.textContent).toContain("usage.report.pendingFilters");
+  });
+
   it.each(["rows", "empty"])("keeps a focused Retry and its error while pending, then focuses the successful %s result", async (kind) => {
     const response = deferred<UsageReportView>();
     const api = vi.fn<ReportApi>().mockRejectedValueOnce(new Error("Report unavailable"))

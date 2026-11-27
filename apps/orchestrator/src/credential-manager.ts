@@ -1442,9 +1442,12 @@ export class ProviderCatalogManager {
       const updatedAt = this.#now();
       const runtimes = input.runtimes.map(runtime => {
         const previous = existing.find(([, entry]) => entry.backendId === runtime.backendId)?.[1];
-        const sameSource = previous?.provider.baseUrl === runtime.provider.baseUrl
-          && previous?.provider.api === runtime.provider.api && previous?.modelsEndpoint === runtime.modelsEndpoint;
-        return { ...runtime, upstreamListing: sameSource ? previous?.upstreamListing : undefined, provider: { ...runtime.provider, models: runtime.provider.models.map(model =>
+        const sameEndpoint = previous?.provider.baseUrl === runtime.provider.baseUrl && previous?.provider.api === runtime.provider.api;
+        const sameSource = sameEndpoint && previous?.modelsEndpoint === runtime.modelsEndpoint;
+        const catalogPresetId = runtime.provider.catalogPresetId
+          ?? (sameEndpoint && previous?.requestPath === runtime.requestPath ? previous?.provider.catalogPresetId : undefined);
+        return { ...runtime, upstreamListing: sameSource ? previous?.upstreamListing : undefined, provider: { ...runtime.provider,
+          ...(catalogPresetId === undefined ? {} : { catalogPresetId }), models: runtime.provider.models.map(model =>
           saveDiscoveredModelConfiguration(sameSource ? previous?.provider.models.find(candidate => candidate.id === model.id) : undefined, model)) } };
       });
       for (const [key] of existing) { this.#entries.delete(key); this.#modelDiscoveries.delete(key); }
@@ -2418,7 +2421,7 @@ export class ProviderCatalogManager {
             usesOpenCodeGoResponses = true;
             return [{ ...projected, api: "openai-responses" }];
           });
-        return models.length === 0 ? [] : [{ ...entry, provider: { ...entry.provider, models } }];
+        return models.length === 0 ? [] : [{ ...entry, provider: { ...entry.provider, requestPath: entry.requestPath, models } }];
       });
       const environment: Record<string, string> = {};
       for (const entry of entries) {
@@ -2514,7 +2517,7 @@ export class ProviderCatalogManager {
     const kind = this.#catalogBackendKind(entry.backendId);
     return {
       ...descriptor,
-      provider: { ...entry.provider, models: entry.provider.models.map(model => this.#publicModelDefaults(entry, model, kind)) },
+      provider: { ...entry.provider, requestPath: entry.requestPath, models: entry.provider.models.map(model => this.#publicModelDefaults(entry, model, kind)) },
       ...(native === undefined ? {} : {
         kind: native.kind,
         supportsLogin: native.kind === "api_key" || native.kind === "oauth" || native.kind === "subscription",
@@ -2995,6 +2998,8 @@ function validateProviderEntry(entry: ManagedProviderEntry): void {
     throw new Error("Provider model listing is malformed.");
   }
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(entry.provider.id)) throw new Error("Provider ID is invalid.");
+  if (entry.provider.catalogPresetId !== undefined && (typeof entry.provider.catalogPresetId !== "string"
+    || !/^[a-z0-9][a-z0-9._-]{0,127}$/u.test(entry.provider.catalogPresetId))) throw new Error("Public Provider preset ID is invalid.");
   nonBlank(entry.displayName, "Provider display name");
   if (!(["managed", "api_key", "oauth", "subscription", "local_keyless", "custom_endpoint"] as const).includes(entry.kind)) {
     throw new Error("Provider kind is invalid.");

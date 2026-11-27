@@ -5052,7 +5052,7 @@ describe("ClaudeCodeAdapter", () => {
         outputTokens: 7,
         cacheReadTokens: 3,
         cacheWriteTokens: 2,
-        totalTokens: 18,
+        totalTokens: 23,
         cost: 0
       },
       generationDurationMs: 100,

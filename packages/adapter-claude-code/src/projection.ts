@@ -457,7 +457,7 @@ function usageFromNative(value: unknown, cost: number): UsageSnapshot {
     outputTokens,
     cacheReadTokens,
     cacheWriteTokens,
-    totalTokens: inputTokens + outputTokens,
+    totalTokens: inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens,
     cost
   };
 }

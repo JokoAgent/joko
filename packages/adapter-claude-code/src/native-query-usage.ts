@@ -122,7 +122,7 @@ export class NativeQueryUsage {
     const cacheWrite1hTokens = tokens.cacheWriteTokens === 0 ? 0
       : oneHour !== undefined && fiveMinutes !== undefined && oneHour + fiveMinutes === tokens.cacheWriteTokens ? oneHour : undefined;
     this.#closed.set(request.requestId, { requestId: request.requestId, modelId: request.modelId, ...tokens,
-      totalTokens: safeAdd(tokens.inputTokens, tokens.outputTokens), fastMode, requestedAt: request.requestedAt,
+      totalTokens: totalTokens(tokens), fastMode, requestedAt: request.requestedAt,
       ...(cacheWrite1hTokens === undefined ? {} : { cacheWrite1hTokens }) });
   }
 
@@ -274,12 +274,12 @@ export class NativeQueryUsage {
     this.#costMicros = safeAdd(this.#costMicros, deltaCost);
     this.#hasContribution ||= tokenKeys.some(key => delta[key] > 0) || deltaCost > 0;
     if (!this.#hasContribution) return undefined;
-    return { ...this.#total, totalTokens: safeAdd(this.#total.inputTokens, this.#total.outputTokens), cost: this.#costMicros / 1_000_000,
+    return { ...this.#total, totalTokens: totalTokens(this.#total), cost: this.#costMicros / 1_000_000,
       nativeAccounting: { sourceId: this.sourceId, tokensComplete, costComplete, costEstimated: true,
         ...(this.#referenceRequests.size === 0 ? {} : { requests: [...this.#referenceRequests.values()] }),
         models: [...this.#modelTotals].map(([modelId, totals]) => ({ modelId, inputTokens: totals.inputTokens, outputTokens: totals.outputTokens,
           cacheReadTokens: totals.cacheReadTokens, cacheWriteTokens: totals.cacheWriteTokens,
-          totalTokens: safeAdd(totals.inputTokens, totals.outputTokens), cost: (totals.costMicros ?? 0) / 1_000_000,
+          totalTokens: totalTokens(totals), cost: (totals.costMicros ?? 0) / 1_000_000,
           tokensComplete: modelDeltas.get(modelId)?.tokensComplete ?? true,
           costComplete: modelDeltas.has(modelId) ? namedMoneyProven && modelDeltas.get(modelId)!.costComplete : true
         })) } };
@@ -322,6 +322,10 @@ function difference(current: Tokens, previous: Tokens): Tokens {
 function add(left: Tokens, right: Tokens): Tokens {
   return { inputTokens: safeAdd(left.inputTokens, right.inputTokens), outputTokens: safeAdd(left.outputTokens, right.outputTokens),
     cacheReadTokens: safeAdd(left.cacheReadTokens, right.cacheReadTokens), cacheWriteTokens: safeAdd(left.cacheWriteTokens, right.cacheWriteTokens) };
+}
+
+function totalTokens(tokens: Tokens): number {
+  return tokenKeys.reduce((sum, key) => safeAdd(sum, tokens[key]), 0);
 }
 
 function safeAdd(left: number, right: number): number {
