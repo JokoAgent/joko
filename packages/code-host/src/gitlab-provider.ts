@@ -12,8 +12,8 @@ const query = (follow: boolean) => `query MergeRequest($path: ID!, $iid: String!
   project(fullPath: $path) {
     mergeRequest(iid: $iid) {
       state draft title sourceBranch diffHeadSha resolvableDiscussionsCount resolvedDiscussionsCount conflicts
-      ${follow ? "mergedAt approved userNotesCount" : ""}
-      headPipeline { jobs(retried: false, first: 100) { count nodes { status allowFailure } pageInfo { hasNextPage } } }
+      ${follow ? "mergedAt closedAt approved userNotesCount" : ""}
+      headPipeline { ${follow ? "id finishedAt status" : ""} jobs(retried: false, first: 100) { count nodes { status allowFailure } pageInfo { hasNextPage } } }
     }
   }
 }`;
@@ -91,10 +91,18 @@ function parseMergeRequest(value: unknown, follow: boolean): CodeHostProviderRes
   const checks = gitlabChecks(mr);
   const headSha = mr["diffHeadSha"], approved = mr["approved"], comments = mr["userNotesCount"];
   const mergedAt = typeof mr["mergedAt"] === "string" ? Date.parse(mr["mergedAt"]) : NaN;
+  const closedAt = typeof mr["closedAt"] === "string" ? Date.parse(mr["closedAt"]) : NaN;
+  const pipeline = record(mr["headPipeline"]);
+  const pipelineId = pipeline?.["id"], pipelineStatus = pipeline?.["status"], finishedAt = pipeline?.["finishedAt"];
+  const pipelineFinishedAt = typeof finishedAt === "string" ? Date.parse(finishedAt) : NaN;
   return { state, draft: mr["draft"], title, headBranch,
     ...(follow ? { activity: {
       ...(typeof headSha === "string" && /^[0-9a-f]{40,64}$/iu.test(headSha) ? { headSha } : {}),
       ...(state === "merged" && Number.isSafeInteger(mergedAt) ? { mergedAt } : {}),
+      ...(state === "closed" && Number.isSafeInteger(closedAt) ? { closedAt } : {}),
+      ...(typeof pipelineId === "string" && /^[!-~]{1,256}$/u.test(pipelineId) ? { pipelineId } : {}),
+      ...(typeof pipelineStatus === "string" && /^[A-Z_]{1,64}$/u.test(pipelineStatus) ? { pipelineStatus } : {}),
+      ...(Number.isSafeInteger(pipelineFinishedAt) ? { pipelineFinishedAt } : {}),
       ...(typeof approved === "boolean" ? { reviewDecision: approved ? "approved" : "not_approved" } : {}),
       ...(typeof comments === "number" && Number.isSafeInteger(comments) && comments >= 0 ? { commentCount: comments } : {}),
       ...(checks ? { checks: Object.entries(checks).map(([status, count]) => `${status}:${count}`) } : {}),

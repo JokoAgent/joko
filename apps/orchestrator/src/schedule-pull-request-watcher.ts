@@ -33,6 +33,9 @@ interface Observation {
   readonly draft: boolean;
   readonly headSha?: string;
   readonly checks?: string;
+  readonly pipelineId?: string;
+  readonly pipelineFinishedAt?: number;
+  readonly pipelineStatus?: string;
   readonly mergeState?: string;
   readonly reviewDecision?: string;
   readonly threads?: number;
@@ -177,10 +180,12 @@ export class SchedulePullRequestWatcher {
         const current = observe(read.result);
         const previous: Observation | undefined = state?.baseline;
         const baseline = { ...previous, ...current };
-        const mergedAt = read.result.activity?.mergedAt;
+        const followsGitLabState = watched.rule.change === "any" && watched.reference.webUrl.includes("/-/merge_requests/");
+        const terminalAt = current.state === "merged" && (watched.rule.change === "merged" || followsGitLabState)
+          ? read.result.activity?.mergedAt
+          : current.state === "closed" && followsGitLabState ? read.result.activity?.closedAt : undefined;
         const changed = previous === undefined
-          ? watched.rule.change === "merged" && current.state === "merged" && mergedAt !== undefined &&
-            mergedAt > watched.schedule.createdAt && mergedAt > (watched.schedule.lastRunAt ?? 0)
+          ? terminalAt !== undefined && terminalAt > watched.schedule.createdAt && terminalAt > (watched.schedule.lastRunAt ?? 0)
           : matchesChange(watched.rule, previous, current);
         const pending = changed ? { operationId: `pull-request-schedule-${randomUUID()}`, observedAt: now(), url: watched.rule.url } : state?.pending;
         if (state === undefined || changed || !equalObservation(baseline, state.baseline)) {
@@ -233,6 +238,9 @@ function observe(result: CodeHostProviderResult): Observation {
     state: result.state, draft: result.draft,
     ...(activity?.headSha === undefined ? {} : { headSha: activity.headSha }),
     ...(activity?.checks === undefined ? {} : { checks: JSON.stringify([...activity.checks].sort()) }),
+    ...(activity?.pipelineId === undefined ? {} : { pipelineId: activity.pipelineId }),
+    ...(activity?.pipelineFinishedAt === undefined ? {} : { pipelineFinishedAt: activity.pipelineFinishedAt }),
+    ...(activity?.pipelineStatus === undefined ? {} : { pipelineStatus: activity.pipelineStatus }),
     ...(activity?.mergeState === undefined ? {} : { mergeState: activity.mergeState }),
     ...(activity?.reviewDecision === undefined ? {} : { reviewDecision: activity.reviewDecision }),
     ...(result.unresolvedReviewThreadCount === undefined ? {} : { threads: result.unresolvedReviewThreadCount }),
@@ -243,7 +251,8 @@ function observe(result: CodeHostProviderResult): Observation {
 
 function matchesChange(rule: SchedulePullRequestRule, previous: Observation, current: Observation): boolean {
   const changed = (key: keyof Observation) => previous[key] !== undefined && current[key] !== undefined && previous[key] !== current[key];
-  const checksChanged = current.checks !== undefined && previous.checks !== current.checks;
+  const checksChanged = (["checks", "pipelineId", "pipelineFinishedAt", "pipelineStatus"] as const)
+    .some(key => current[key] !== undefined && previous[key] !== current[key]);
   const reviewDecisionChanged = current.reviewDecision !== undefined && previous.reviewDecision !== current.reviewDecision;
   const review = reviewDecisionChanged || changed("threads") || changed("comments") || changed("reviewComments");
   switch (rule.change) {

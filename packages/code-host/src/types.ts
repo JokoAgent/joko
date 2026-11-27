@@ -67,6 +67,10 @@ export interface CodeHostProviderResult {
 export interface CodeHostPullRequestActivity {
   readonly headSha?: string;
   readonly mergedAt?: number;
+  readonly closedAt?: number;
+  readonly pipelineId?: string;
+  readonly pipelineFinishedAt?: number;
+  readonly pipelineStatus?: string;
   readonly checks?: readonly string[];
   readonly mergeState?: string;
   readonly reviewDecision?: string;

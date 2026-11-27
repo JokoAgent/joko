@@ -96,6 +96,93 @@ describe("Orchestrator restart recovery and unattended schedules", () => {
     } finally { editor.gateway.disconnect(); }
   });
 
+  it.each([
+    ["merged", "any", "creation", -1, 0], ["merged", "any", "creation", 0, 0], ["merged", "any", "creation", 1, 1],
+    ["merged", "any", "last run", -1, 0], ["merged", "any", "last run", 0, 0], ["merged", "any", "last run", 1, 1],
+    ["merged", "merged", "last run", 1, 1],
+    ["closed", "any", "creation", -1, 0], ["closed", "any", "creation", 0, 0], ["closed", "any", "creation", 1, 1],
+    ["closed", "any", "last run", -1, 0], ["closed", "any", "last run", 0, 0], ["closed", "any", "last run", 1, 1],
+    ["closed", "merged", "last run", 1, 0]
+  ] as const)(
+    "reconciles the first authorized GitLab %s observation for %s at %s offset %i exactly %i time(s)", async (state, change, boundary, offset, count) => {
+    let clock = Date.now(), reads = 0, terminalAt: number | undefined;
+    const url = "https://git.team.example/group/Sub/project/-/merge_requests/7";
+    const host = fixture = await OrchestratorE2eFixture.start({ scheduler: { now: () => clock, heartbeatLeaseMs: 20 * 60_000,
+      pullRequestProviders: authority => [{ capability: "code-host.pull-request", minimumTimeToLiveMs: 5_000,
+        supports: reference => reference.webUrl === url,
+        getPullRequest: async (reference, options) => {
+          const grant = authority.authorize(options.sessionOwnerId, reference);
+          if (!grant || !authority.isCurrent(grant, reference) || options.purpose !== "follow") throw new Error("Missing follow grant");
+          if (terminalAt === undefined) throw new Error("MR metadata is not yet readable");
+          reads++;
+          return { state, draft: false, title: "Watched MR", headBranch: "feature", observedAt: clock,
+            activity: state === "merged" ? { mergedAt: terminalAt } : { closedAt: terminalAt } };
+        } }] } });
+    const { clients, connectionId } = await host.pair("Merge request follower");
+    const backendId = host.adapter().id, targetId = host.targetId();
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId, createSessionMutation({ backendId, targetId })));
+    const scheduleId = scheduleIdFrom(await submit(clients.operation, connectionId, createManualScheduleMutation({ backendId, targetId, sessionId,
+      sessionMode: ScheduleSessionMode.BOUND, text: "Follow this merge.", execution: { followPullRequest: schedulePullRequestRuleToProto({ url, change }) } })));
+    const createdAt = host.application.store.getSchedule(scheduleId).createdAt;
+    const history = async () => (await clients.scheduler.listScheduleRunHistory({ scheduleId })).history;
+    if (boundary === "last run") {
+      clock = createdAt + 10_000;
+      expect((await submit(clients.operation, connectionId, triggerScheduleMutation(scheduleId))).state).toBe(OperationState.SUCCEEDED);
+      await expect.poll(async () => (await history())[0]?.state).toBe(RunState.SUCCEEDED);
+      expect(host.application.store.getSchedule(scheduleId).lastRunAt).toBe(clock);
+    }
+    const originalRuns = new Set((await history()).map(run => run.runId));
+    const followedRuns = async () => (await history()).filter(run => !originalRuns.has(run.runId));
+    terminalAt = (boundary === "last run" ? clock : createdAt) + offset;
+    clock = Math.max(clock, createdAt) + 60_001;
+    await expect.poll(() => reads).toBe(1);
+    await expect.poll(async () => (await followedRuns()).length).toBe(count);
+    clock += 60_001;
+    await expect.poll(() => reads).toBe(2);
+    expect((await followedRuns()).map(run => run.sessionId)).toEqual(count ? [sessionId] : []);
+  });
+
+  it("follows the current GitLab pipeline across identical job counts, partial fields and repeated polls", async () => {
+    let clock = Date.now(), reads = 0;
+    const url = "https://git.team.example/group/project/-/merge_requests/7";
+    let pipeline: { pipelineId?: string; pipelineStatus?: string; pipelineFinishedAt?: number } = {
+      pipelineId: "gid://gitlab/Ci::Pipeline/10", pipelineStatus: "SUCCESS", pipelineFinishedAt: clock
+    };
+    const host = fixture = await OrchestratorE2eFixture.start({ scheduler: { now: () => clock, heartbeatLeaseMs: 20 * 60_000,
+      pullRequestProviders: authority => [{ capability: "code-host.pull-request", supports: reference => reference.webUrl === url,
+        getPullRequest: async (reference, options) => {
+          const grant = authority.authorize(options.sessionOwnerId, reference);
+          if (!grant || !authority.isCurrent(grant, reference) || options.purpose !== "follow") throw new Error("Missing follow grant");
+          reads++;
+          return { state: "open", draft: false, title: "Pipeline rerun", headBranch: "feature",
+            activity: { headSha: "a".repeat(40), checks: ["passed:1", "failed:0", "total:1", "pending:0", "skipped:0"], ...pipeline } };
+        } }] } });
+    const { clients, connectionId } = await host.pair("Pipeline follower");
+    const backendId = host.adapter().id, targetId = host.targetId();
+    const sessionId = sessionIdFrom(await submit(clients.operation, connectionId, createSessionMutation({ backendId, targetId })));
+    const scheduleId = scheduleIdFrom(await submit(clients.operation, connectionId, createManualScheduleMutation({ backendId, targetId, sessionId,
+      sessionMode: ScheduleSessionMode.BOUND, text: "Check this pipeline.", execution: { followPullRequest: schedulePullRequestRuleToProto({ url, change: "checks" }) } })));
+    const poll = async (expectedReads: number, expectedRuns: number) => {
+      clock += 60_001;
+      await expect.poll(() => reads).toBe(expectedReads);
+      await expect.poll(async () => (await clients.scheduler.listScheduleRunHistory({ scheduleId })).history.map(run => run.state))
+        .toEqual(Array(expectedRuns).fill(RunState.SUCCEEDED));
+    };
+    await poll(1, 0);
+    pipeline.pipelineId = "gid://gitlab/Ci::Pipeline/11";
+    await poll(2, 1);
+    const rerun = pipeline;
+    pipeline = {};
+    await poll(3, 1);
+    pipeline = rerun;
+    await poll(4, 1);
+    pipeline.pipelineFinishedAt = clock;
+    await poll(5, 2);
+    pipeline.pipelineStatus = "FAILED";
+    await poll(6, 3);
+    await poll(7, 3);
+  });
+
   it.each([["checks", "github.com"], ["review", "github.com"], ["checks", "git.team.example"]] as const)(
     "wakes only the authorized bound task for newly readable PR %s on %s and coalesces busy changes", { timeout: 45_000 }, async (change, host) => {
     let clock = Date.now() - 10 * 60_000;
