@@ -2,6 +2,7 @@
 import { act, createElement, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
+import { locks } from "node:worker_threads";
 import { ListPartnerRoutinesResponseSchema, PartnerRoutineSchema, ListPartnerRoutineRunsResponseSchema,
   GetPartnerRoutineCreationResponseSchema, RetirePartnerRoutineCreationResponseSchema, RoutineFilterOperator, RoutineSourceStatus,
   GetPartnerNightlyLearningResponseSchema, NightlyLearningFrequency, RoutineSessionMode, type PartnerNightlyLearningApi, type PartnerRoutineApi } from "@joko/contracts";
@@ -11,6 +12,7 @@ import { PartnerRoutineDialog } from "./PartnerRoutineDialog.js";
 
 let root: Root | undefined; let host: HTMLDivElement;
 beforeEach(() => { vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); localStorage.clear();
+  Object.defineProperty(navigator, "locks", { configurable: true, value: locks });
   Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" }); });
 afterEach(async () => { await act(async () => root?.unmount()); root = undefined; document.body.replaceChildren(); vi.restoreAllMocks(); vi.unstubAllGlobals(); localStorage.clear(); });
 function fixture(nightly?: PartnerNightlyLearningApi) {
@@ -125,7 +127,9 @@ describe("Partner routine settings", () => {
     expect(f.close).not.toHaveBeenCalled(); expect(document.querySelector('[role="alertdialog"]')).toBeTruthy(); await press("Back");
     f.state.connectionState = "offline"; await f.render(); expect(input("Name").closest("fieldset")?.disabled).toBe(true);
     f.state.connectionState = "connected"; await f.render(); expect(document.body.textContent).toContain("Refresh to use the current Partner");
-    expect(input("Name").value).toBe("Unsaved"); await press("Refresh"); expect(f.api.list).toHaveBeenCalledOnce();
-    await press("Confirm"); expect(f.api.list).toHaveBeenCalledTimes(2); expect(input("Name").value).toBe(""); expect(f.api.save).not.toHaveBeenCalled();
+    expect(input("Name").value).toBe("Unsaved"); await press("Refresh"); expect(f.api.list).toHaveBeenCalledTimes(2);
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(input("Name").closest("fieldset")?.disabled).toBe(false);
+    expect(input("Name").value).toBe("Unsaved"); expect(f.api.save).not.toHaveBeenCalled();
   });
 });

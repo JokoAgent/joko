@@ -85,6 +85,89 @@ describe("mounted Partner collaboration product chain", () => {
     fixture = undefined;
   });
 
+  for (const lock of ["Web Locks", "IndexedDB"]) {
+    mountedIt(`recovers overlapping routine creations in two Chromium windows using ${lock}`, { timeout: 120_000 }, async () => {
+      fixture = await RealPiSystemFixture.start({ webDirectory: requiredEnvironment("JOKO_MOUNTED_WEB_DIR"), enableInternalServer: true });
+      const node = fixture;
+      const manager = await node.pair("Routine inspector");
+      const partner = await createPartner(node, manager, "Rowan", "orbit");
+      const device = "Routine Web";
+      const challenge = required((await node.anonymous.connection.beginPairing({ deviceDisplayName: device })).challenge, "pairing challenge");
+      browser = await chromium.launch({ executablePath: requiredEnvironment("JOKO_BROWSER_EXECUTABLE"), headless: true });
+      const context = await browser.newContext({ locale: "en-US" });
+      const first = await context.newPage(), second = await context.newPage();
+      const directoryUrl = `${node.baseUrl}/#/partners`;
+      const openRoutines = async (page: Page) => {
+        if (lock === "IndexedDB") await page.evaluate(() => { Object.defineProperty(navigator, "locks", { value: undefined, configurable: true }); });
+        else expect(await page.evaluate(() => typeof navigator.locks?.request)).toBe("function");
+        await page.locator(partnerCard(partner.partnerId)).getByRole("button", { name: "Edit", exact: true }).click();
+        await page.getByRole("tab", { name: "Profile settings", exact: true }).click();
+        await page.getByRole("button", { name: "Routines", exact: true }).click();
+        const dialog = page.getByRole("dialog", { name: "Routines", exact: true });
+        await dialog.getByLabel("Name", { exact: true }).waitFor();
+        return dialog;
+      };
+      const connectSaved = async (page: Page) => {
+        await page.goto(directoryUrl, { waitUntil: "domcontentloaded" });
+        await page.getByRole("button", { name: "Saved nodes", exact: true }).click();
+        await page.locator(".profile-card", { hasText: device }).getByRole("button", { name: "Connect", exact: true }).click();
+      };
+      const receipts = () => first.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith("joko.partner-routine-creation.v1:"))
+        .map(key => localStorage.getItem(key)));
+      await first.goto(directoryUrl, { waitUntil: "domcontentloaded" });
+      await first.locator(".connection-tabs > button").nth(2).click();
+      await first.locator("details.device-authorization__manual > summary").click();
+      await first.getByLabel("Joko node address").fill(node.baseUrl);
+      await first.getByLabel("Pairing code").fill(node.pairingCode(challenge.challengeId));
+      await first.getByLabel("Device name").fill(device);
+      await first.locator("form.pair-form button[type=submit]").click();
+      const original = await openRoutines(first);
+      await connectSaved(second);
+      const other = await openRoutines(second);
+      const submitRoutine = async (dialog: typeof original, name: string) => {
+        await dialog.getByRole("button", { name: "New routine", exact: true }).click();
+        await dialog.getByLabel("Name", { exact: true }).fill(name);
+        await dialog.getByLabel("Instructions", { exact: true }).fill("Review the project.");
+        await dialog.getByRole("button", { name: "Save", exact: true }).click();
+      };
+      let release!: () => void;
+      const holdResponse = new Promise<void>(resolve => { release = resolve; });
+      const saveRoute = "**/joko.v1.PartnerRoutineService/SavePartnerRoutine";
+      const storedNames = async () => (await manager.clients.partnerRoutine.listPartnerRoutines({ partnerId: partner.partnerId }))
+        .routines.filter(routine => !routine.builtin).map(routine => routine.definition?.name).sort();
+      await first.route(saveRoute, async route => {
+        const response = await route.fetch();
+        await holdResponse;
+        await route.fulfill({ response });
+      });
+      await second.route(saveRoute, async route => { await route.fetch(); await route.abort("failed"); });
+      try {
+        await submitRoutine(original, "First routine");
+        await expect.poll(storedNames, { timeout: 10_000 }).toEqual(["First routine"]);
+        const initial = await receipts();
+        expect(initial).toEqual([expect.any(String)]);
+        await other.getByRole("button", { name: "Refresh", exact: true }).click();
+        await expect.poll(() => other.getByLabel("Name", { exact: true }).inputValue(), { timeout: 10_000 }).toBe("First routine");
+        await submitRoutine(other, "Second routine");
+        await other.getByRole("alert").filter({ hasText: "could not be confirmed" }).waitFor();
+        const successor = await receipts();
+        expect(successor).toEqual([expect.any(String)]);
+        expect(successor).not.toEqual(initial);
+        release();
+        await expect.poll(() => original.getByRole("button", { name: "First routine", exact: true }).getAttribute("aria-pressed"), { timeout: 10_000 }).toBe("true");
+        expect(await original.getByRole("alert").filter({ hasText: "could not be confirmed" }).count()).toBe(0);
+        expect(await receipts()).toEqual(successor);
+        await second.close();
+        const reopened = await context.newPage();
+        await connectSaved(reopened);
+        const recovered = await openRoutines(reopened);
+        await expect.poll(() => recovered.getByLabel("Name", { exact: true }).inputValue(), { timeout: 10_000 }).toBe("Second routine");
+        expect(await receipts()).toEqual([]);
+        expect(await storedNames()).toEqual(["First routine", "Second routine"]);
+      } finally { release(); }
+    });
+  }
+
   mountedIt("opens read-only Partner activity before and after reconnect without creating a routine or sending a prompt", { timeout: 120_000 }, async () => {
     fixture = await RealPiSystemFixture.start({
       webDirectory: requiredEnvironment("JOKO_MOUNTED_WEB_DIR"), enableInternalServer: true

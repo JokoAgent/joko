@@ -54,7 +54,8 @@ export function createPartnerRoutineApi(input: { readonly rpc: RoutineRpc; reado
       expectedPartnerRevision: { value: revision }, routineId: routine(selected).id, expectedRevision: selected.revision }, { signal }); }),
     history: (routineId, offset, signal) => invoke(signal, async () => {
       const result = await rpc.listPartnerRoutineRuns({ partnerId, routineId, offset }, { signal });
-      if (result.runs.length > 20 || result.runs.some(run => run.routineId !== routineId || !run.id || !run.definitionRevision || run.status === 0)) throw new Error("Routine history owner is invalid.");
+      if (result.runs.length > 20 || result.runs.some(run => run.routineId !== routineId || !run.id || !run.definitionRevision || run.status === 0)
+        || result.nextOffset !== undefined && (!result.runs.length || result.nextOffset !== offset + result.runs.length)) throw new Error("Routine history page is invalid.");
       return result;
     }),
     lookup: (requestId, signal) => invoke(signal, async () => { const result = await rpc.getPartnerRoutineCreation({ partnerId, requestId }, { signal });
@@ -74,42 +75,48 @@ export interface RoutineReceiptStorage {
   setItem(key: string, value: string): void | Promise<void>;
   removeItem(key: string): void | Promise<void>;
 }
-/** Client-only, body-free receipts make lost creation acknowledgements recoverable after reload. */
+
+const localReceiptUpdates = new Map<string, Promise<void>>();
+function serializeLocalReceipt(key: string, update: () => Promise<void>): Promise<void> {
+  const previous = localReceiptUpdates.get(key) ?? Promise.resolve();
+  const next = previous.then(update, update);
+  localReceiptUpdates.set(key, next);
+  return next.finally(() => {
+    if (localReceiptUpdates.get(key) === next) localReceiptUpdates.delete(key);
+  });
+}
+
+/** The original request ID is durable before dispatch. All windows serialize changes to the same slot. */
 export class RoutineCreationReceipts {
-  #tail = Promise.resolve();
-  constructor(private readonly storage: RoutineReceiptStorage, private readonly ownerKey: string) {}
+  constructor(private readonly storage: RoutineReceiptStorage, private readonly ownerKey: string,
+    private readonly exclusive: (key: string, update: () => Promise<void>) => Promise<void> = serializeLocalReceipt) {}
   #key(partnerId: string): string { return `joko.partner-routine-creation.v1:${encodeURIComponent(JSON.stringify([this.ownerKey, partnerId]))}`; }
-  async read(partnerId: string): Promise<string | undefined> {
-    const raw = await this.storage.getItem(this.#key(partnerId)); if (raw === null) return undefined;
-    if (!/^[A-Za-z0-9_-]{16,100}$/u.test(raw)) throw new Error("The routine creation receipt requires recovery.");
+  #runKey(partnerId: string, routineId: string): string { return `${this.#key(partnerId)}:run:${encodeURIComponent(routineId)}`; }
+  async #read(key: string): Promise<string | undefined> {
+    const raw = await this.storage.getItem(key);
+    if (raw === null) return undefined;
+    if (!/^[A-Za-z0-9_-]{16,100}$/u.test(raw)) throw new Error("The routine receipt requires recovery.");
     return raw;
   }
-  claim(partnerId: string, id: string): Promise<void> { return this.#serialize(async () => {
-    if (!/^[A-Za-z0-9_-]{16,100}$/u.test(id) || await this.read(partnerId)) throw new Error("Recover the pending routine before creating another.");
-    await this.storage.setItem(this.#key(partnerId), id);
-    if (await this.read(partnerId) !== id) throw new Error("The creation receipt was not saved.");
-  }); }
-  resolve(partnerId: string, id: string): Promise<void> { return this.#serialize(async () => {
-    const current = await this.read(partnerId); if (current !== undefined && current !== id) throw new Error("Creation receipt changed.");
-    await this.storage.removeItem(this.#key(partnerId)); if (await this.read(partnerId)) throw new Error("The creation receipt is still pending.");
-  }); }
-  #serialize(action: () => Promise<void>): Promise<void> { const next = this.#tail.then(action); this.#tail = next.catch(() => undefined); return next; }
-  #runKey(partnerId: string, routineId: string): string { return `${this.#key(partnerId)}:run:${encodeURIComponent(routineId)}`; }
-  async readRun(partnerId: string, routineId: string): Promise<string | undefined> {
-    const id = await this.storage.getItem(this.#runKey(partnerId, routineId));
-    if (id === null) return undefined;
-    if (!/^[A-Za-z0-9_-]{16,100}$/u.test(id)) throw new Error("Run receipt requires recovery.");
-    return id;
+  #claim(key: string, id: string): Promise<void> {
+    return this.exclusive(key, async () => {
+      if (!/^[A-Za-z0-9_-]{16,100}$/u.test(id) || await this.#read(key)) throw new Error("Recover the pending routine request first.");
+      await this.storage.setItem(key, id);
+      if (await this.#read(key) !== id) throw new Error("The routine receipt was not saved.");
+    });
   }
-  claimRun(partnerId: string, routineId: string, id: string): Promise<void> { return this.#serialize(async () => {
-    if (!/^[A-Za-z0-9_-]{16,100}$/u.test(id) || await this.readRun(partnerId, routineId)) throw new Error("Recover the pending run first.");
-    await this.storage.setItem(this.#runKey(partnerId, routineId), id);
-    if (await this.readRun(partnerId, routineId) !== id) throw new Error("Run receipt was not saved.");
-  }); }
-  resolveRun(partnerId: string, routineId: string, id: string): Promise<void> { return this.#serialize(async () => {
-    const current = await this.readRun(partnerId, routineId);
-    if (current !== undefined && current !== id) throw new Error("Run receipt changed.");
-    await this.storage.removeItem(this.#runKey(partnerId, routineId));
-    if (await this.readRun(partnerId, routineId)) throw new Error("Run receipt is still pending.");
-  }); }
+  #resolve(key: string, id: string): Promise<void> {
+    return this.exclusive(key, async () => {
+      // Another window may have recovered this request and started its successor.
+      if (await this.#read(key) !== id) return;
+      await this.storage.removeItem(key);
+      if (await this.#read(key) !== undefined) throw new Error("The routine receipt is still pending.");
+    });
+  }
+  read(partnerId: string): Promise<string | undefined> { return this.#read(this.#key(partnerId)); }
+  claim(partnerId: string, id: string): Promise<void> { return this.#claim(this.#key(partnerId), id); }
+  resolve(partnerId: string, id: string): Promise<void> { return this.#resolve(this.#key(partnerId), id); }
+  readRun(partnerId: string, routineId: string): Promise<string | undefined> { return this.#read(this.#runKey(partnerId, routineId)); }
+  claimRun(partnerId: string, routineId: string, id: string): Promise<void> { return this.#claim(this.#runKey(partnerId, routineId), id); }
+  resolveRun(partnerId: string, routineId: string, id: string): Promise<void> { return this.#resolve(this.#runKey(partnerId, routineId), id); }
 }

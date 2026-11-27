@@ -5,6 +5,7 @@ import { PartnerNightlyLearningEditor, PartnerRoutineEditor, RoutineCreationRece
   RoutineSessionMode, RoutineModelSchema, decodeModelSpeed, encodeModelSpeed,
   type RoutineDefinition, type RoutineModelChoice, type RoutineTrigger, type RoutineMessages } from "@joko/contracts";
 import type { AppController } from "../controller.js";
+import { withRoutineReceiptLock } from "../local-state.js";
 import { usePartnerDocumentForeground } from "./use-partner-working-status.js";
 import { Button, Modal, CheckboxControl } from "./ui.js";
 import { ModelSpeedControl } from "./ModelSpeedControl.js";
@@ -27,7 +28,8 @@ export function PartnerRoutineDialog({ controller, partnerId, ownerKey, onClose,
       const ownerWindow = ownerDocument.defaultView;
       if (ownerWindow === null || ownerWindow.closed) throw new Error("Routine document unavailable.");
       current = new PartnerRoutineEditor(controller.partnerRoutineApi(partnerId, ownerKey),
-        new RoutineCreationReceipts(ownerWindow.localStorage, JSON.stringify([profile.serverId, profile.id, profile.deviceId, new URL(profile.origin).href])), partnerId);
+        new RoutineCreationReceipts(ownerWindow.localStorage, JSON.stringify([profile.serverId, profile.id, profile.deviceId, new URL(profile.origin).href]),
+          (key, update) => withRoutineReceiptLock(ownerWindow, key, update)), partnerId);
       setBinding({ editor: current, owner, document: ownerDocument }); setFailed(false);
     } catch { setBinding(undefined); setFailed(true); }
     return () => current?.dispose();
@@ -56,7 +58,7 @@ function RoutineContent({ editor, connected, m, onClose, ownerDocument, locale, 
   useEffect(() => { if (!foreground || !connected) editor.suspend(); else if (!editor.state.catalog) void editor.refresh(); }, [editor, foreground, connected]);
   useEffect(() => { const ownerWindow = ownerDocument.defaultView; if (!foreground || !connected || ownerWindow === null) return; const timer = ownerWindow.setInterval(() => { void editor.observe(); }, 3000); return () => ownerWindow.clearInterval(timer); }, [editor, foreground, connected, ownerDocument]);
   const close = () => { if (state.busy) return; if (editor.dirty) setConfirm({ body: m.discardBody, action: onClose }); else onClose(); };
-  const refresh = () => { if (editor.dirty) setConfirm({ body: m.discardBody, action: () => { editor.discard(); void editor.refresh(); } }); else void editor.refresh(); };
+  const refresh = () => { if (editor.dirty && state.draftConflict) setConfirm({ body: m.discardBody, action: () => { editor.discard(); void editor.refresh(); } }); else void editor.refresh(); };
   const locked = !foreground || !connected || !editor.writable;
   const draft = state.draft;
   return <Modal open ownerDocument={ownerDocument} title={m.title} description={m.body} size="large" onClose={close} showClose closeLabel={m.close}>
