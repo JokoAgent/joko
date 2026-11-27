@@ -124,16 +124,21 @@ describe("EphemeralWorktreeService", () => {
     }
   });
 
-  test("serializes concurrent resource lock publications for the same checkout", async () => {
+  test("serializes concurrent resource lock publications for the same checkout", { timeout: 30_000 }, async () => {
     const root = await createTemporaryRoot();
-    let active = 0;
-    await Promise.all(Array.from({ length: 8 }, () => withWorktreeSourceLock(root, async () => {
-      active += 1;
-      try {
-        await new Promise(resolveWait => setTimeout(resolveWait, 5));
-        expect(active).toBe(1);
-      } finally { active -= 1; }
-    })));
+    let active = 0, completed = 0;
+    for (let round = 0; round < 16; round++) {
+      await Promise.all(Array.from({ length: 8 }, () => withWorktreeSourceLock(root, async () => {
+        active += 1;
+        try {
+          expect(active).toBe(1);
+          await new Promise(resolveWait => setTimeout(resolveWait, 5));
+          expect(active).toBe(1);
+          completed++;
+        } finally { active -= 1; }
+      })));
+    }
+    expect(completed).toBe(128);
   });
 
   test("persists exact recycle controls without charging native and source writer waits", { timeout: 40_000 }, async () => {
