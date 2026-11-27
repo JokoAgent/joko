@@ -4463,6 +4463,14 @@ async function writePackagedSmokeTaskDraft(
   text: string
 ): Promise<void> {
   assertPackagedSmokeTaskWindowOwner(window, { profileId: connection.profileId, sessionId });
+  // Opening the peer made it the key window. Edit each composer in its own
+  // foreground Document, just as a user switching between windows would.
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
+  const focusDeadline = Date.now() + 5_000;
+  while (!window.isFocused() && Date.now() < focusDeadline) await waitForPackagedSmokePoll();
+  if (!window.isFocused()) throw new Error("Packaged smoke Task draft window did not receive focus.");
   const nativeOwner = await window.webContents.executeJavaScript(
     "window.jokoDesktop?.sessionWindows?.getOwner()",
     true
@@ -4516,7 +4524,7 @@ async function waitForPackagedSmokeTaskDraft(window: BrowserWindow, text: string
       "  const editor = pane?.querySelector('.composer-rich-editor__content');",
       "  return { text: editor?.textContent ?? '', saved: Boolean(pane?.querySelector('.draft-saved')) };",
       "})()"
-    ].join("\n"), true), Math.min(2_000, Math.max(1, deadline - Date.now())), "Task draft probe");
+    ].join("\n"), true), Math.max(1, deadline - Date.now()), "Task draft probe");
     if (typeof observation === "object" && observation !== null && !Array.isArray(observation)) {
       const result = observation as { readonly text?: unknown; readonly saved?: unknown };
       if (result.text === text && (!requireSaved || result.saved === true)) return;
